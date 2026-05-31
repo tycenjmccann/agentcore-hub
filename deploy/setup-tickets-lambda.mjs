@@ -2,11 +2,14 @@
 /**
  * setup-tickets-lambda.mjs
  *
- * Deploys the DynamoDB-backed ticket tools Lambda:
- *   1. Creates DynamoDB table (agentcore-hub-tickets)
- *   2. Creates IAM role for the Lambda
- *   3. Deploys the Lambda function (agentcore-hub-tickets)
- *   4. Prints gateway target definitions to register
+ * Deploys the ticket-tools Lambda. Branches on TICKET_PROVIDER:
+ *   - "dynamodb" (default) — deploys lambda/agentcore-hub-tickets/ +
+ *     creates the agentcore-hub-tickets DynamoDB table.
+ *   - "jira" — deploys lambda/agentcore-hub-jira/ with JIRA_* env vars.
+ *     No tickets table is created (Jira Cloud is the store).
+ *
+ * Both Lambdas expose the identical tool interface (Tickets___create_ticket,
+ * etc.) so agents don't know or care which backend is in use.
  *
  * Usage:
  *   node deploy/setup-tickets-lambda.mjs \
@@ -15,8 +18,11 @@
  *     [--table-name agentcore-hub-tickets] \
  *     [--project-key TEAM]
  *
- * Prerequisites:
- *   - AWS credentials configured
+ * Reads from environment:
+ *   TICKET_PROVIDER         — "dynamodb" or "jira"
+ *   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY
+ *                           — required when TICKET_PROVIDER=jira
+ *   ARTIFACT_BUCKET         — passed to the Lambda for the shared agent roster
  */
 
 import { readFileSync } from "fs";
@@ -35,10 +41,40 @@ function getArg(name) {
 
 const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
 const GATEWAY_ID = getArg("gateway-id");
+const TICKET_PROVIDER = (process.env.TICKET_PROVIDER || "dynamodb").toLowerCase();
+if (!["dynamodb", "jira"].includes(TICKET_PROVIDER)) {
+  console.error(`✗ TICKET_PROVIDER must be "dynamodb" or "jira" (got "${TICKET_PROVIDER}")`);
+  process.exit(1);
+}
+
 const TABLE_NAME = getArg("table-name") || "agentcore-hub-tickets";
-const PROJECT_KEY = getArg("project-key") || "TEAM";
-const LAMBDA_NAME = "agentcore-hub-tickets";
-const ROLE_NAME = "AgentCoreHubTicketsLambdaRole";
+const PROJECT_KEY =
+  getArg("project-key") || process.env.JIRA_PROJECT_KEY || "TEAM";
+
+// Per-provider Lambda config
+const LAMBDA_NAME =
+  TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets";
+const LAMBDA_SOURCE_DIR = LAMBDA_NAME; // matches lambda/<dir>
+const ROLE_NAME =
+  TICKET_PROVIDER === "jira"
+    ? "AgentCoreHubJiraLambdaRole"
+    : "AgentCoreHubTicketsLambdaRole";
+
+// Jira creds (only required when TICKET_PROVIDER=jira)
+const JIRA_SITE_URL = process.env.JIRA_SITE_URL || "";
+const JIRA_EMAIL = process.env.JIRA_EMAIL || "";
+const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN || "";
+if (TICKET_PROVIDER === "jira") {
+  const missing = [];
+  if (!JIRA_SITE_URL) missing.push("JIRA_SITE_URL");
+  if (!JIRA_EMAIL) missing.push("JIRA_EMAIL");
+  if (!JIRA_API_TOKEN) missing.push("JIRA_API_TOKEN");
+  if (missing.length) {
+    console.error(`✗ TICKET_PROVIDER=jira but missing env vars: ${missing.join(", ")}`);
+    console.error("  Set them in .env.local (or your shell) and re-run.");
+    process.exit(1);
+  }
+}
 
 // Derive artifact bucket (same convention as deploy/config.sh)
 const ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || "";
@@ -59,10 +95,20 @@ const lambda = new LambdaClient({ region: REGION });
 const accountId = execSync("aws sts get-caller-identity --query Account --output text").toString().trim();
 
 console.log("\n" + "═".repeat(60));
-console.log("🎫 Deploying Mock Jira MCP Server");
+console.log(
+  TICKET_PROVIDER === "jira"
+    ? "🎫 Deploying Jira Cloud Ticket Lambda"
+    : "🎫 Deploying DynamoDB Ticket Lambda"
+);
 console.log("═".repeat(60));
+console.log(`   Provider:    ${TICKET_PROVIDER}`);
 console.log(`   Region:      ${REGION}`);
-console.log(`   Table:       ${TABLE_NAME}`);
+if (TICKET_PROVIDER === "dynamodb") {
+  console.log(`   Table:       ${TABLE_NAME}`);
+}
+if (TICKET_PROVIDER === "jira") {
+  console.log(`   Jira site:   ${JIRA_SITE_URL}`);
+}
 console.log(`   Project Key: ${PROJECT_KEY}`);
 console.log(`   Lambda:      ${LAMBDA_NAME}`);
 console.log(`   Gateway:     ${GATEWAY_ID}`);
@@ -70,54 +116,58 @@ console.log(`   Account:     ${accountId}`);
 console.log("");
 
 // ============================================================
-// Step 1: Create DynamoDB Table
+// Step 1: Create DynamoDB Table  (DynamoDB provider only)
 // ============================================================
-console.log("1/5 Creating DynamoDB table...");
+if (TICKET_PROVIDER === "dynamodb") {
+  console.log("1/5 Creating DynamoDB table...");
 
-try {
-  await ddb.send(new DescribeTableCommand({ TableName: TABLE_NAME }));
-  console.log(`   ✓ Table "${TABLE_NAME}" already exists`);
-} catch (err) {
-  if (err.name === "ResourceNotFoundException") {
-    await ddb.send(
-      new CreateTableCommand({
-        TableName: TABLE_NAME,
-        KeySchema: [{ AttributeName: "ticketId", KeyType: "HASH" }],
-        AttributeDefinitions: [
-          { AttributeName: "ticketId", AttributeType: "S" },
-          { AttributeName: "parentId", AttributeType: "S" },
-          { AttributeName: "assignee", AttributeType: "S" },
-        ],
-        GlobalSecondaryIndexes: [
-          {
-            IndexName: "parentId-index",
-            KeySchema: [{ AttributeName: "parentId", KeyType: "HASH" }],
-            Projection: { ProjectionType: "ALL" },
-          },
-          {
-            IndexName: "assignee-index",
-            KeySchema: [{ AttributeName: "assignee", KeyType: "HASH" }],
-            Projection: { ProjectionType: "ALL" },
-          },
-        ],
-        BillingMode: "PAY_PER_REQUEST",
-      })
-    );
-    console.log(`   ✓ Table "${TABLE_NAME}" created (pay-per-request)`);
+  try {
+    await ddb.send(new DescribeTableCommand({ TableName: TABLE_NAME }));
+    console.log(`   ✓ Table "${TABLE_NAME}" already exists`);
+  } catch (err) {
+    if (err.name === "ResourceNotFoundException") {
+      await ddb.send(
+        new CreateTableCommand({
+          TableName: TABLE_NAME,
+          KeySchema: [{ AttributeName: "ticketId", KeyType: "HASH" }],
+          AttributeDefinitions: [
+            { AttributeName: "ticketId", AttributeType: "S" },
+            { AttributeName: "parentId", AttributeType: "S" },
+            { AttributeName: "assignee", AttributeType: "S" },
+          ],
+          GlobalSecondaryIndexes: [
+            {
+              IndexName: "parentId-index",
+              KeySchema: [{ AttributeName: "parentId", KeyType: "HASH" }],
+              Projection: { ProjectionType: "ALL" },
+            },
+            {
+              IndexName: "assignee-index",
+              KeySchema: [{ AttributeName: "assignee", KeyType: "HASH" }],
+              Projection: { ProjectionType: "ALL" },
+            },
+          ],
+          BillingMode: "PAY_PER_REQUEST",
+        })
+      );
+      console.log(`   ✓ Table "${TABLE_NAME}" created (pay-per-request)`);
 
-    // Wait for table to be active
-    console.log("   ⏳ Waiting for table to become ACTIVE...");
-    for (let i = 0; i < 30; i++) {
-      await sleep(2000);
-      const desc = await ddb.send(new DescribeTableCommand({ TableName: TABLE_NAME }));
-      if (desc.Table?.TableStatus === "ACTIVE") {
-        console.log("   ✓ Table is ACTIVE");
-        break;
+      // Wait for table to be active
+      console.log("   ⏳ Waiting for table to become ACTIVE...");
+      for (let i = 0; i < 30; i++) {
+        await sleep(2000);
+        const desc = await ddb.send(new DescribeTableCommand({ TableName: TABLE_NAME }));
+        if (desc.Table?.TableStatus === "ACTIVE") {
+          console.log("   ✓ Table is ACTIVE");
+          break;
+        }
       }
+    } else {
+      throw err;
     }
-  } else {
-    throw err;
   }
+} else {
+  console.log("1/5 DynamoDB table — SKIPPED (TICKET_PROVIDER=jira; tickets live in Jira Cloud)");
 }
 
 // ============================================================
@@ -158,64 +208,104 @@ try {
   }
 }
 
-// Attach inline policy for DynamoDB + CloudWatch Logs
-const policy = JSON.stringify({
-  Version: "2012-10-17",
-  Statement: [
-    {
-      Effect: "Allow",
-      Action: [
-        "dynamodb:PutItem",
-        "dynamodb:GetItem",
-        "dynamodb:UpdateItem",
-        "dynamodb:Query",
-        "dynamodb:Scan",
-      ],
-      Resource: [
-        `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLE_NAME}`,
-        `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLE_NAME}/index/*`,
-      ],
-    },
-    {
-      Effect: "Allow",
-      Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-      Resource: `arn:aws:logs:${REGION}:${accountId}:*`,
-    },
-  ],
-});
+// Attach inline policy. DynamoDB statement is only needed for the dynamodb
+// provider; both providers need CloudWatch Logs and S3 read for the agent
+// roster artifact.
+const policyStatements = [
+  {
+    Effect: "Allow",
+    Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+    Resource: `arn:aws:logs:${REGION}:${accountId}:*`,
+  },
+];
+if (TICKET_PROVIDER === "dynamodb") {
+  policyStatements.push({
+    Effect: "Allow",
+    Action: [
+      "dynamodb:PutItem",
+      "dynamodb:GetItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:Query",
+      "dynamodb:Scan",
+    ],
+    Resource: [
+      `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLE_NAME}`,
+      `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLE_NAME}/index/*`,
+    ],
+  });
+}
+if (ARTIFACT_BUCKET) {
+  policyStatements.push({
+    Effect: "Allow",
+    Action: ["s3:GetObject"],
+    Resource: `arn:aws:s3:::${ARTIFACT_BUCKET}/*`,
+  });
+}
 
 await iam.send(
   new PutRolePolicyCommand({
     RoleName: ROLE_NAME,
-    PolicyName: "JiraMockAccess",
-    PolicyDocument: policy,
+    PolicyName: "TicketsLambdaAccess",
+    PolicyDocument: JSON.stringify({ Version: "2012-10-17", Statement: policyStatements }),
   })
 );
-console.log(`   ✓ Policy attached (DynamoDB + CloudWatch Logs)`);
+console.log(
+  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs${ARTIFACT_BUCKET ? " + S3 read" : ""})`
+);
 
 // ============================================================
 // Step 3: Deploy Lambda
 // ============================================================
 console.log("\n3/5 Deploying Lambda function...");
 
-// Zip the Lambda code
-const lambdaDir = join(__dirname, "..", "lambda", "agentcore-hub-tickets");
-const zipPath = "/tmp/agentcore-hub-tickets.zip";
+// Zip the Lambda code (per-provider source dir)
+const lambdaDir = join(__dirname, "..", "lambda", LAMBDA_SOURCE_DIR);
+const zipPath = `/tmp/${LAMBDA_NAME}.zip`;
 execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs`, { stdio: "pipe" });
 const zipBuffer = readFileSync(zipPath);
+
+const lambdaEnvVars =
+  TICKET_PROVIDER === "jira"
+    ? {
+        JIRA_SITE_URL,
+        JIRA_EMAIL,
+        JIRA_API_TOKEN,
+        JIRA_PROJECT_KEY: PROJECT_KEY,
+        AWS_REGION_OVERRIDE: REGION,
+        ...(ARTIFACT_BUCKET && { ARTIFACT_BUCKET }),
+      }
+    : {
+        TICKETS_TABLE: TABLE_NAME,
+        PROJECT_KEY,
+        AWS_REGION_OVERRIDE: REGION,
+        ...(ARTIFACT_BUCKET && { ARTIFACT_BUCKET }),
+      };
+
+const lambdaDescription =
+  TICKET_PROVIDER === "jira"
+    ? "Ticket tools Lambda — Jira Cloud-backed for AgentCore Hub pipeline"
+    : "Ticket tools Lambda — DynamoDB-backed for AgentCore Hub pipeline";
 
 let lambdaArn;
 try {
   const existing = await lambda.send(new GetFunctionCommand({ FunctionName: LAMBDA_NAME }));
   lambdaArn = existing.Configuration.FunctionArn;
-  console.log(`   ℹ Lambda exists, updating code...`);
+  console.log(`   ℹ Lambda exists, updating code + env...`);
   await lambda.send(
     new UpdateFunctionCodeCommand({
       FunctionName: LAMBDA_NAME,
       ZipFile: zipBuffer,
     })
   );
-  console.log(`   ✓ Lambda code updated`);
+  // Update env vars too — they may have changed between runs (e.g., new Jira token)
+  const { UpdateFunctionConfigurationCommand } = await import("@aws-sdk/client-lambda");
+  await lambda.send(
+    new UpdateFunctionConfigurationCommand({
+      FunctionName: LAMBDA_NAME,
+      Environment: { Variables: lambdaEnvVars },
+    })
+  );
+  console.log(`   ✓ Lambda code + env updated`);
 } catch (err) {
   if (err.name === "ResourceNotFoundException") {
     const createResult = await lambda.send(
@@ -227,15 +317,8 @@ try {
         Code: { ZipFile: zipBuffer },
         Timeout: 30,
         MemorySize: 256,
-        Environment: {
-          Variables: {
-            TICKETS_TABLE: TABLE_NAME,
-            PROJECT_KEY: PROJECT_KEY,
-            AWS_REGION_OVERRIDE: REGION,
-            ...(ARTIFACT_BUCKET && { ARTIFACT_BUCKET }),
-          },
-        },
-        Description: "Mock Jira MCP server — DynamoDB-backed ticket management for AgentCore Hub pipeline",
+        Environment: { Variables: lambdaEnvVars },
+        Description: lambdaDescription,
       })
     );
     lambdaArn = createResult.FunctionArn;
@@ -293,7 +376,7 @@ if (!GATEWAY_ID) {
   console.log("═".repeat(60));
   console.log(`
 Next steps:
-  1. Set TICKET_TOOLS_LAMBDA=agentcore-hub-tickets in .env.local (or on your agents)
+  1. Set TICKET_TOOLS_LAMBDA=${LAMBDA_NAME} in .env.local (or on your agents)
   2. The Workflow tab will use this Lambda for ticket operations
 `);
   process.exit(0);

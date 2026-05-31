@@ -52,19 +52,44 @@ If the user picks "Custom", do a free-text follow-up. Save as `brand_name` in th
 
 > **The user has confirmed this is the contract:** the brand var only affects display text. AWS resource names (DynamoDB tables, Lambdas, IAM roles, S3 bucket prefix, AgentCore runtimes) are part of the application contract and are *always* created with the canonical `agentcore-hub-*` prefix. Do not offer to rename them. If a user asks, point them at the design-lock section in `.claude-plugin/README.md`.
 
-## Q2 — Use case
+## Q2 — Modules
 
-Ask via `AskUserQuestion`:
+**Before asking, print a short module overview** so the user can answer with eyes open. Read counts/lambdas from `docs/MODULES.md` and `src/config/agents.json`; do not hard-code them in the skill output if they've drifted. Format:
 
-- **question:** "What do you want to do with this install?"
-- **header:** "Use case"
+```
+This install can deploy four modules. You'll always get Core; the rest are optional.
+
+  Core           — always installed. Dashboard, Agents browser, Invoke console.
+                   No new AWS resources beyond credentials.
+  Builder        — adds /build (chat-driven agent creation). Deploys 1 AgentCore
+                   harness runtime (agentcore_hub_builder) + 1 Lambda
+                   (builder-tools). ~3–5 min.
+  Workflow       — adds the multi-agent pipeline (intake → requirements → design
+                   → development → QA). Deploys 14 AgentCore Runtime agents
+                   (1 Requirements + 8 Design + 3 Development + 1 QA + 1 Review),
+                   3 DynamoDB tables, 1 S3 bucket, 4 Lambdas (orchestrator,
+                   tickets, jira, workflow-output), and an ECR image. ~10–15 min.
+                   Depends on: Core. Optionally uses Jira Cloud for tickets.
+  Evaluations    — adds the self-improvement loop. Deploys 3 Lambdas
+                   (eval-packager, token-aggregator, prd-submitter), 1 DynamoDB
+                   table (agentcore-hub-eval-config), and CloudWatch
+                   subscription filters. ~5 min.
+                   Depends on: Workflow (it watches Workflow agents' eval logs).
+```
+
+Then ask via `AskUserQuestion`:
+
+- **question:** "Which modules should this install deploy? (You can re-run /setup later to add more.)"
+- **header:** "Modules"
 - **options** (single-select):
-  1. *Run a multi-agent pipeline that turns Jira tickets into PRs* (Recommended) — Core + Builder + Workflow
-  2. *Build new agents from a chat prompt* — Core + Builder
-  3. *Just explore agents I've already deployed* — Core only
-  4. *Everything, including the self-improvement eval loop* — all four modules
+  1. *Core only — explore agents I've already deployed* — `{core}`. No new AWS deploys beyond credentials check.
+  2. *Core + Builder — chat-driven agent creation only* — `{core, builder}`. 1 runtime + 1 Lambda.
+  3. *Core + Builder + Workflow — full pipeline (Recommended)* — `{core, builder, workflow}`. 15 runtimes + 5 Lambdas + 3 tables + S3 bucket. ~15–20 min.
+  4. *Everything — pipeline + self-improvement eval loop* — `{core, builder, workflow, evaluations}`. Adds the eval loop on top of #3.
 
-Map the answer to a `MODULES` set: `{core}`, `{core,builder}`, `{core,builder,workflow}`, or `{core,builder,workflow,evaluations}`.
+Map the answer to a `MODULES` set in the canonical order `core → builder → workflow → evaluations`. Enforce dependency order: if the user picks Evaluations they must also have Workflow; if they pick Workflow they must also have Core. The four presets above already encode this — if you ever offer a custom selection, validate before continuing.
+
+> **Hard rule:** never reorder the modules. `run-module.sh` runs them in the order you give it, and downstream modules read state written by earlier ones (e.g., Evaluations subscribes to log groups created by Workflow's runtime fleet).
 
 ## Q3 — Ticket store *(skip if Workflow not in MODULES)*
 
