@@ -12,6 +12,15 @@ FULL_IMAGE_NAME="${ECR_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
 echo "Building ARM64 container image..."
 echo "Image: ${FULL_IMAGE_NAME}"
 
+# Ensure ECR repo exists (idempotent — first-time setup creates it)
+if ! aws ecr describe-repositories --repository-names "${IMAGE_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+  echo "Creating ECR repository ${IMAGE_NAME}..."
+  aws ecr create-repository \
+    --repository-name "${IMAGE_NAME}" \
+    --region "${REGION}" \
+    --image-scanning-configuration scanOnPush=true >/dev/null
+fi
+
 # Ensure we're logged into ECR
 echo "Logging into ECR..."
 aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}

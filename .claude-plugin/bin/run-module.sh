@@ -83,8 +83,10 @@ case "$MODULE" in
       ./scripts/create-dynamodb-tables.sh
     fi
 
-    echo "→ Ensuring artifact bucket exists"
     ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    export AWS_ACCOUNT_ID="$ACCOUNT_ID"
+
+    echo "→ Ensuring artifact bucket exists"
     BUCKET="agentcore-hub-artifacts-${ACCOUNT_ID}-${AWS_REGION}"
     if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
       echo "  Bucket $BUCKET already exists, skipping"
