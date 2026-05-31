@@ -1,0 +1,1624 @@
+/**
+ * Orchestration Lambda — Event-Driven Workflow Engine
+ *
+ * Triggered by DynamoDB Streams on the `agentcore-hub-tickets` table.
+ * Reacts to ticket status changes and drives the workflow forward:
+ *
+ *   ticket → "done"  → unblock dependents, check QA gate, check completion
+ *   ticket → "ready" → invoke the assigned agent via AgentCore Harness
+ *   ticket → "in_progress" → publish status event (UI notification)
+ *
+ * The Next.js app is read-only. It just visualizes state.
+ * This Lambda is the SOLE orchestrator.
+ */
+
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  UpdateCommand,
+  QueryCommand,
+} from "@aws-sdk/lib-dynamodb";
+import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
+import {
+  BedrockAgentRuntimeClient,
+  InvokeAgentCommand,
+} from "@aws-sdk/client-bedrock-agent-runtime";
+
+// ─── Config ────────────────────────────────────────────────────────────────────
+
+const REGION = process.env.AWS_REGION || "us-east-1";
+const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
+const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
+const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
+const GITHUB_LAMBDA = process.env.GITHUB_LAMBDA || "agentcore-hub-github-mcp";
+const EVENT_BUS = process.env.EVENT_BUS || "default";
+const MAX_QA_RETRIES = 3;
+const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
+
+// Jira config (only used when TICKET_PROVIDER=jira)
+const JIRA_SITE_URL = process.env.JIRA_SITE_URL || "";
+const JIRA_EMAIL = process.env.JIRA_EMAIL || "";
+const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN || "";
+const JIRA_AUTH = JIRA_EMAIL && JIRA_API_TOKEN
+  ? `Basic ${Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString("base64")}`
+  : "";
+
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
+  marshallOptions: { removeUndefinedValues: true },
+});
+const lambda = new LambdaClient({ region: REGION });
+const s3 = new S3Client({ region: REGION });
+const events = new EventBridgeClient({ region: REGION });
+const bedrockAgent = new BedrockAgentRuntimeClient({ region: REGION });
+
+// ─── Agent Roster (config-driven from S3, falls back to hardcoded) ────────────
+
+const FALLBACK_ROSTER = [
+  { agentId: "agentcore_hub_requirements_analyst", phase: "requirements" },
+  { agentId: "agentcore_hub_frontend_designer", phase: "design" },
+  { agentId: "agentcore_hub_ios_designer", phase: "design" },
+  { agentId: "agentcore_hub_backend_designer", phase: "design" },
+  { agentId: "agentcore_hub_android_designer", phase: "design" },
+  { agentId: "agentcore_hub_security_reviewer", phase: "design" },
+  { agentId: "agentcore_hub_legal_compliance", phase: "design" },
+  { agentId: "agentcore_hub_localization", phase: "design" },
+  { agentId: "agentcore_hub_analytics_designer", phase: "design" },
+  { agentId: "agentcore_hub_backend_dev", phase: "development" },
+  { agentId: "agentcore_hub_api_dev", phase: "development" },
+  { agentId: "agentcore_hub_frontend_dev", phase: "development" },
+  { agentId: "agentcore_hub_qa_verifier", phase: "verification" },
+  { agentId: "agentcore_hub_ci_agent", phase: "review" },
+];
+
+let _agentRoster = null;
+
+async function loadAgentRoster() {
+  if (_agentRoster) return _agentRoster;
+  if (!ARTIFACT_BUCKET) {
+    console.warn("[orchestrator] No ARTIFACT_BUCKET — using fallback roster");
+    _agentRoster = FALLBACK_ROSTER;
+    return _agentRoster;
+  }
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: "config/agents.json",
+    }));
+    const config = JSON.parse(await res.Body.transformToString());
+    _agentRoster = config.agents.map((a) => ({
+      agentId: a.agentId,
+      phase: a.phase,
+      runtimeArn: a.runtimeArn || null,
+    }));
+    console.log(`[orchestrator] Loaded ${_agentRoster.length} agents from S3 config`);
+  } catch (err) {
+    console.warn(`[orchestrator] Failed to load roster from S3: ${err.message} — using fallback`);
+    _agentRoster = FALLBACK_ROSTER;
+  }
+  return _agentRoster;
+}
+
+function getAgentDef(id) {
+  const roster = _agentRoster || FALLBACK_ROSTER;
+  return roster.find((a) => a.agentId === id);
+}
+
+// ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
+
+export const handler = async (event) => {
+  // Load roster from S3 on first invocation (cached for warm starts)
+  await loadAgentRoster();
+
+  // Direct invocation from Jira webhook (TICKET_PROVIDER=jira ONLY)
+  if (event.source === "jira-webhook") {
+    if (TICKET_PROVIDER !== "jira") {
+      console.log(`[orchestrator] Ignoring Jira webhook — TICKET_PROVIDER=${TICKET_PROVIDER}, using DDB stream`);
+      return;
+    }
+    console.log(`[orchestrator] Jira webhook: ${event.ticketId} → ${event.newStatus}`);
+    await processStatusChange(event.ticketId, event.newStatus, event.oldStatus);
+    return;
+  }
+
+  // DDB Stream invocation (TICKET_PROVIDER=dynamodb only)
+  if (TICKET_PROVIDER === "jira") {
+    console.log(`[orchestrator] Ignoring DDB stream — TICKET_PROVIDER=jira, using webhooks`);
+    return;
+  }
+
+  console.log(`[orchestrator] Received ${event.Records.length} stream records`);
+
+  for (const record of event.Records) {
+    try {
+      await processRecord(record);
+    } catch (err) {
+      console.error(`[orchestrator] Error processing record:`, err);
+    }
+  }
+};
+
+/**
+ * Unified status change handler — called from both DDB stream and Jira webhook paths.
+ */
+async function processStatusChange(ticketId, newStatus, oldStatus) {
+  if (newStatus === oldStatus) return;
+
+  console.log(`[orchestrator] ${ticketId}: ${oldStatus || "NEW"} → ${newStatus}`);
+
+  switch (newStatus) {
+    case "done":
+      await handleTicketDoneUnified(ticketId);
+      break;
+    case "todo": {
+      // Ticket created — track it immediately, then route accordingly
+      const todoTicket = await getTicket(ticketId);
+      if (!todoTicket) return;
+
+      // Bug bootstrap: a top-level Bug filed directly in Jira (no parent, no workflow row)
+      // is a workflow root. Provision the workflow + analyst sub-task here, mirroring
+      // what /api/workflow/start does for the in-app/programmatic intake path.
+      if (
+        TICKET_PROVIDER === "jira" &&
+        todoTicket.issueType === "Bug" &&
+        !todoTicket.parentId &&
+        !todoTicket.workflowId
+      ) {
+        await bootstrapBugWorkflow(todoTicket);
+        return;
+      }
+
+      // Track in agentTasks at creation time (both paths)
+      await trackTicketCreation(ticketId, todoTicket.assignee, todoTicket.workflowId, todoTicket.parentId);
+
+      if (TICKET_PROVIDER === "jira") {
+        // Jira mode: the agentcore-hub-jira Lambda handles initial routing by transitioning
+        // to "Ready" (no blockers) or "Blocked" (has blockers) AFTER creating links.
+        // We do NOT auto-transition here — doing so races with the Lambda's link creation.
+        // The "ready" webhook will arrive when the Lambda transitions the ticket.
+        console.log(`[orchestrator] ${ticketId} → todo (Jira mode: waiting for Lambda to route)`);
+      } else {
+        // DynamoDB mode — todo with all blockers resolved means ready to go
+        const blockers = todoTicket.blockedBy || [];
+        const allBlockersResolved = blockers.length === 0 || await checkAllBlockersResolved(blockers);
+        if (allBlockersResolved) {
+          // ─── CANCEL GUARD (todo with no blockers) ───
+          let guardWorkflow;
+          try {
+            guardWorkflow = await resolveWorkflow(todoTicket.workflowId, todoTicket.parentId);
+          } catch (err) {
+            console.error(`[orchestrator] GUARD: Failed to resolve workflow for ticket ${ticketId}:`, err);
+            return; // Fail closed
+          }
+          if (!guardWorkflow || guardWorkflow.phase === "cancelled") {
+            console.log(`[orchestrator] GUARD: ${ticketId} unblocked but workflow ${guardWorkflow?.id || "unknown"} is cancelled — skipping`);
+            return;
+          }
+          // ─── END CANCEL GUARD ───
+          await handleTicketReadyUnified(ticketId, todoTicket);
+        }
+      }
+      break;
+    }
+    case "ready": {
+      // Ticket is ready — invoke the agent
+      const ticket = await getTicket(ticketId);
+      if (!ticket) return;
+      // ─── CANCEL GUARD (Jira webhook path) ───
+      let guardWorkflow;
+      try {
+        guardWorkflow = await resolveWorkflow(ticket.workflowId, ticket.parentId);
+      } catch (err) {
+        console.error(`[orchestrator] GUARD: Failed to resolve workflow for ticket ${ticketId}:`, err);
+        return; // Fail closed
+      }
+      if (!guardWorkflow || guardWorkflow.phase === "cancelled") {
+        console.log(`[orchestrator] GUARD: Jira webhook for ${ticketId} ignored — workflow ${guardWorkflow?.id || "unknown"} is cancelled`);
+        return;
+      }
+      // ─── END CANCEL GUARD ───
+      await handleTicketReadyUnified(ticketId, ticket);
+      break;
+    }
+    case "in_progress": {
+      const ticket = await getTicket(ticketId);
+      const assignee = ticket?.assignee;
+      await publishEvent(ticketId, "agent.started", { ticketId, assignee, agentId: assignee });
+      break;
+    }
+  }
+}
+
+/**
+ * Unified "ticket done" handler — works with both DynamoDB and Jira backends.
+ * Called from processStatusChange (Jira webhook path).
+ */
+async function handleTicketDoneUnified(ticketId) {
+  const ticket = await getTicket(ticketId);
+  if (!ticket) return;
+
+  const parentId = ticket.parentId;
+  const workflowId = ticket.workflowId;
+  const assignee = ticket.assignee;
+
+  if (!parentId) {
+    console.log(`[orchestrator] ${ticketId} has no parent — likely an epic. Skipping cascade.`);
+    return;
+  }
+
+  const workflow = await resolveWorkflow(workflowId, parentId);
+  if (!workflow) {
+    console.warn(`[orchestrator] No workflow found for ${ticketId}`);
+    return;
+  }
+
+  // Dedup guard: if we already processed this ticket's completion, skip cascade.
+  // Protects against double-transition (agent calls transition_ticket AND report_completion).
+  if (workflow.agentTasks?.[ticketId]?.status === "complete") {
+    console.log(`[orchestrator] ${ticketId} already marked complete — skipping duplicate cascade.`);
+    return;
+  }
+
+  // Update agent task status (create entry if missing — belt & suspenders)
+  if (!workflow.agentTasks) workflow.agentTasks = {};
+  if (!workflow.agentTasks[ticketId]) {
+    workflow.agentTasks[ticketId] = {
+      id: `task_${Date.now()}_${assignee}`,
+      agentId: assignee,
+      ticketId,
+      createdAt: new Date().toISOString(),
+    };
+  }
+  workflow.agentTasks[ticketId].status = "complete";
+  workflow.agentTasks[ticketId].completedAt = new Date().toISOString();
+  await saveWorkflow(workflow);
+
+  // Unblock dependents
+  const siblings = await getChildTickets(parentId);
+  const unblocked = [];
+
+  for (const sibling of siblings) {
+    if (sibling.ticketId === ticketId) continue;
+    const blockers = sibling.blockedBy || [];
+    if (blockers.includes(ticketId)) {
+      // Check if all blockers are now resolved (done) — keep blockedBy intact like Jira does
+      const allResolved = blockers.every(bid => {
+        if (bid === ticketId) return true; // this one is done
+        const blocker = siblings.find(s => s.ticketId === bid);
+        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
+      });
+      if (allResolved && (sibling.status === "blocked" || sibling.status === "todo")) {
+        // All blockers resolved — transition to ready (keep blockedBy as historical record)
+        if (TICKET_PROVIDER === "jira") {
+          await jiraTransition(sibling.ticketId, "Ready");
+        } else {
+          await ddb.send(new UpdateCommand({
+            TableName: TICKETS_TABLE,
+            Key: { ticketId: sibling.ticketId },
+            UpdateExpression: "SET #s = :s, #u = :u",
+            ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+            ExpressionAttributeValues: { ":s": "todo", ":u": new Date().toISOString() },
+          }));
+        }
+        unblocked.push(sibling.ticketId);
+      }
+      // blockedBy array is never modified — it's a permanent record of dependencies
+    }
+  }
+
+  console.log(`[orchestrator] ${ticketId} done. Unblocked: [${unblocked.join(", ")}]`);
+  await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
+
+  // Journey log: record each unblock for at-a-glance traceability
+  for (const unblockedId of unblocked) {
+    await publishEvent(unblockedId, "orchestrator.unblocked", {
+      ticketId: unblockedId, unblockedBy: ticketId, workflowId: workflow?.id,
+    });
+  }
+
+  // Always check workflow completion — the last ticket to close triggers this
+  if (await isWorkflowComplete(parentId)) {
+    await completeWorkflow(workflow);
+  }
+}
+
+/**
+ * Unified "ticket ready" handler — works with both backends.
+ * Called from processStatusChange (Jira webhook path).
+ */
+async function handleTicketReadyUnified(ticketId, ticket) {
+  const assignee = ticket.assignee;
+  const parentId = ticket.parentId;
+  const workflowId = ticket.workflowId;
+
+  console.log(`[orchestrator] handleTicketReady: ${ticketId} assignee=${assignee} parentId=${parentId} workflowId=${workflowId}`);
+
+  if (!assignee || ticket.type === "epic") return;
+
+  const agentDef = getAgentDef(assignee);
+  if (!agentDef) {
+    console.warn(`[orchestrator] Unknown agent: ${assignee}`);
+    return;
+  }
+
+  const workflow = await resolveWorkflow(workflowId, parentId);
+  if (!workflow) {
+    console.warn(`[orchestrator] No workflow for ticket ${ticketId}`);
+    return;
+  }
+
+  // ─── CANCEL GUARD (defense-in-depth) ───
+  if (workflow.phase === "cancelled") {
+    console.log(`[orchestrator] GUARD (handleTicketReadyUnified): workflow ${workflow.id} is cancelled — not invoking ${assignee}`);
+    return;
+  }
+  // ─── END CANCEL GUARD ───
+
+  // Idempotency guard: atomic claim via conditional write (DynamoDB path).
+  // For Jira path, Jira's own transition logic prevents double-transitions.
+  if (TICKET_PROVIDER === "jira") {
+    // Jira transitions are inherently idempotent — if already In Progress,
+    // the transition won't be available and jiraTransition logs a warning.
+    await jiraTransition(ticketId, "In Progress");
+  } else {
+    try {
+      await ddb.send(new UpdateCommand({
+        TableName: TICKETS_TABLE,
+        Key: { ticketId },
+        UpdateExpression: "SET #s = :s, #u = :u",
+        ConditionExpression: "#s <> :inprog",
+        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+        ExpressionAttributeValues: { ":s": "in_progress", ":inprog": "in_progress", ":u": new Date().toISOString() },
+      }));
+    } catch (err) {
+      if (err.name === "ConditionalCheckFailedException") {
+        console.log(`[orchestrator] ${ticketId} already in_progress — skipping duplicate invocation`);
+        return;
+      }
+      throw err;
+    }
+  }
+
+  // Initialize manifest if needed
+  try { await initManifestIfNeeded(workflow); } catch (err) {
+    console.warn(`[orchestrator] Manifest init failed (non-fatal): ${err.message}`);
+  }
+
+  // Phase advancement
+  const phaseOrder = ["intake", "requirements", "design", "development", "verification", "review", "complete"];
+  const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
+  const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
+  if (agentPhaseIdx > currentPhaseIdx) {
+    workflow.phase = agentDef.phase;
+    await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
+
+    // Feature branch on dev phase entry
+    if (agentDef.phase === "development" && !workflow.featureBranch) {
+      try {
+        const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+        const baseBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+        const slug = workflow.input.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40).replace(/-$/, "");
+        const branchName = `feature/${workflow.epicId}-${slug}`;
+        await callGitHub("create_branch", { owner, repo, branch_name: branchName, from_branch: baseBranch });
+        workflow.featureBranch = branchName;
+        console.log(`[orchestrator] Created shared feature branch: ${branchName}`);
+      } catch (err) {
+        console.warn(`[orchestrator] Failed to create branch: ${err.message}`);
+      }
+    }
+  }
+
+  // Update agent task status to "running" (may already exist from trackTicketCreation)
+  if (!workflow.agentTasks) workflow.agentTasks = {};
+  const existingTask = workflow.agentTasks[ticketId];
+  workflow.agentTasks[ticketId] = {
+    ...(existingTask || {}),
+    id: existingTask?.id || `task_${Date.now()}_${assignee}`,
+    agentId: assignee,
+    ticketId,
+    status: "running",
+    startedAt: new Date().toISOString(),
+  };
+  await saveWorkflow(workflow);
+
+  // Build context and invoke — SAME buildAgentContext for both paths
+  let context = await buildAgentContext(ticket, workflow);
+
+  // If ticket has resumeContext (from retry endpoint), prepend it so the agent knows it's resuming
+  if (ticket.resumeContext) {
+    context = `${ticket.resumeContext}\n\n---\n\n${context}`;
+    // Clear resumeContext after consuming it (one-time use)
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId },
+      UpdateExpression: "REMOVE #rc",
+      ExpressionAttributeNames: { "#rc": "resumeContext" },
+    }));
+  }
+
+  console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${ticket.resumeContext ? " (SESSION RESUME)" : ""}`);
+  await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: agentDef.phase, workflowId: workflow.id });
+
+  await invokeAgent(agentDef, context, workflow);
+}
+
+/**
+ * Transition a Jira issue to a target status.
+ */
+async function jiraTransition(issueKey, targetStatusName) {
+  try {
+    const data = await jiraFetch(`/rest/api/3/issue/${issueKey}/transitions`);
+    const match = data.transitions.find(
+      t => t.name.toLowerCase() === targetStatusName.toLowerCase() ||
+           t.to.name.toLowerCase() === targetStatusName.toLowerCase()
+    );
+    if (!match) {
+      console.warn(`[orchestrator] No transition to "${targetStatusName}" for ${issueKey}`);
+      return;
+    }
+    const url = `https://${JIRA_SITE_URL}/rest/api/3/issue/${issueKey}/transitions`;
+    await fetch(url, {
+      method: "POST",
+      headers: { Authorization: JIRA_AUTH, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ transition: { id: match.id } }),
+    });
+  } catch (err) {
+    console.warn(`[orchestrator] Jira transition failed for ${issueKey}: ${err.message}`);
+  }
+}
+
+// ─── DynamoDB Stream Processing (legacy DynamoDB path) ────────────────────────
+
+async function processRecord(record) {
+  const eventName = record.eventName; // INSERT, MODIFY, REMOVE
+  if (eventName === "REMOVE") return;
+
+  const newImage = record.dynamodb?.NewImage;
+  const oldImage = record.dynamodb?.OldImage;
+  if (!newImage) return;
+
+  const ticketId = unwrapDdbValue(newImage.ticketId);
+  const newStatus = unwrapDdbValue(newImage.status);
+  const oldStatus = oldImage ? unwrapDdbValue(oldImage.status) : null;
+
+  // Skip counter item
+  if (ticketId === "__COUNTER__") return;
+
+  // Only react to status changes (or new inserts with actionable status)
+  if (eventName === "MODIFY" && newStatus === oldStatus) return;
+
+  console.log(`[orchestrator] ${ticketId}: ${oldStatus || "NEW"} → ${newStatus}`);
+
+  // Track ticket in workflow.agentTasks at creation time (INSERT = new ticket)
+  if (eventName === "INSERT") {
+    const insertAssignee = unwrapDdbValue(newImage.assignee);
+    const insertWorkflowId = unwrapDdbValue(newImage.workflowId);
+    const insertParentId = unwrapDdbValue(newImage.parentId);
+    await trackTicketCreation(ticketId, insertAssignee, insertWorkflowId, insertParentId);
+  }
+
+  switch (newStatus) {
+    case "done":
+      await handleTicketDone(ticketId, newImage);
+      break;
+    case "ready":
+    case "todo":
+      // "todo" with all blockers resolved = ready to invoke
+      const blockedBy = unwrapDdbValue(newImage.blockedBy) || [];
+      const streamBlockersResolved = blockedBy.length === 0 || await checkAllBlockersResolved(blockedBy);
+      if (streamBlockersResolved) {
+        // ─── CANCEL GUARD (DDB Stream path) ───
+        const guardTicket = await getTicket(ticketId);
+        if (guardTicket) {
+          let guardWorkflow;
+          try {
+            guardWorkflow = await resolveWorkflow(guardTicket.workflowId, guardTicket.parentId);
+          } catch (err) {
+            console.error(`[orchestrator] GUARD: Failed to resolve workflow for ticket ${ticketId}:`, err);
+            return; // Fail closed — do not invoke if we can't verify state
+          }
+          if (!guardWorkflow || guardWorkflow.phase === "cancelled") {
+            console.log(`[orchestrator] GUARD: Skipping invocation for ${ticketId} — workflow ${guardWorkflow?.id || "unknown"} is cancelled or not found`);
+            return;
+          }
+        }
+        // ─── END CANCEL GUARD ───
+        await handleTicketReady(ticketId, newImage);
+      }
+      break;
+    case "in_progress":
+      const startedAssignee = unwrapDdbValue(newImage.assignee);
+      await publishEvent(ticketId, "agent.started", { ticketId, assignee: startedAssignee, agentId: startedAssignee });
+      break;
+  }
+}
+
+// ─── Ticket Tracking at Creation ────────────────────────────────────────────────
+
+/**
+ * Track a ticket in workflow.agentTasks as soon as it's created.
+ * This ensures the orchestrator knows about ALL tickets in a workflow from the start,
+ * not just when they're invoked. Prevents invisible tickets blocking completion.
+ *
+ * Called from both Jira and DynamoDB paths when a ticket first appears.
+ */
+async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
+  if (!assignee || !parentId) return;
+
+  // Skip epics — they're containers, not agent tasks
+  const agentDef = getAgentDef(assignee);
+  if (!agentDef) return;
+
+  const workflow = await resolveWorkflow(workflowId, parentId);
+  if (!workflow) return;
+
+  // Already tracked (e.g., from a retry/re-delivery) — don't overwrite
+  if (workflow.agentTasks?.[ticketId]) return;
+
+  if (!workflow.agentTasks) workflow.agentTasks = {};
+  workflow.agentTasks[ticketId] = {
+    id: `task_${Date.now()}_${assignee}`,
+    agentId: assignee,
+    ticketId,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+  };
+  await saveWorkflow(workflow);
+  console.log(`[orchestrator] Tracked new ticket ${ticketId} (${assignee}) in workflow ${workflow.id}`);
+
+  // Fan out a ticket.created event so the UI can render the badge without polling.
+  // Keep the publish best-effort — failure here must not block tracking.
+  try {
+    const t = await getTicket(ticketId);
+    await publishEvent(ticketId, "ticket.created", {
+      workflowId: workflow.id,
+      ticket: {
+        id: ticketId,
+        title: t?.title || ticketId,
+        status: t?.status || "todo",
+        assignee,
+        parent: parentId,
+        type: t?.type || "task",
+        updatedAt: t?.updatedAt || new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    console.warn(`[orchestrator] ticket.created publish failed for ${ticketId}:`, err.message);
+  }
+}
+
+// ─── Core Handlers ─────────────────────────────────────────────────────────────
+
+/**
+ * A ticket was marked "done". Unblock dependents, check QA gate, check completion.
+ */
+async function handleTicketDone(ticketId, image) {
+  const parentId = unwrapDdbValue(image.parentId);
+  const workflowId = unwrapDdbValue(image.workflowId);
+  const assignee = unwrapDdbValue(image.assignee);
+
+  if (!parentId) {
+    console.log(`[orchestrator] ${ticketId} has no parent — likely an epic. Skipping cascade.`);
+    return;
+  }
+
+  // Get the workflow metadata (resilient to bad workflowId from agent-created tickets)
+  const workflow = await resolveWorkflow(workflowId, parentId);
+  if (!workflow) {
+    console.warn(`[orchestrator] No workflow found for ${ticketId} (parent: ${parentId}, wf: ${workflowId})`);
+    return;
+  }
+
+  // Update agent task status in workflow metadata (create entry if missing — belt & suspenders)
+  if (!workflow.agentTasks) workflow.agentTasks = {};
+  if (!workflow.agentTasks[ticketId]) {
+    workflow.agentTasks[ticketId] = {
+      id: `task_${Date.now()}_${assignee}`,
+      agentId: assignee,
+      ticketId,
+      createdAt: new Date().toISOString(),
+    };
+  }
+  workflow.agentTasks[ticketId].status = "complete";
+  workflow.agentTasks[ticketId].completedAt = new Date().toISOString();
+  await saveWorkflow(workflow);
+
+  // Unblock dependents: find tickets blocked by this one
+  const siblings = await getChildTickets(parentId);
+  const unblocked = [];
+
+  for (const sibling of siblings) {
+    if (sibling.ticketId === ticketId) continue;
+    const blockers = sibling.blockedBy || [];
+    if (blockers.includes(ticketId)) {
+      // Check if all blockers are now resolved — keep blockedBy intact (like Jira issue links)
+      const allResolved = blockers.every(bid => {
+        if (bid === ticketId) return true; // this one is done
+        const blocker = siblings.find(s => s.ticketId === bid);
+        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
+      });
+      if (allResolved && sibling.status === "blocked") {
+        // All blockers resolved — transition to todo (keep blockedBy as historical record)
+        await ddb.send(new UpdateCommand({
+          TableName: TICKETS_TABLE,
+          Key: { ticketId: sibling.ticketId },
+          UpdateExpression: "SET #s = :s, #u = :u",
+          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+          ExpressionAttributeValues: { ":s": "todo", ":u": new Date().toISOString() },
+        }));
+        unblocked.push(sibling.ticketId);
+      }
+      // blockedBy array is never modified — it's a permanent record of dependencies
+    }
+  }
+
+  console.log(`[orchestrator] ${ticketId} done. Unblocked: [${unblocked.join(", ")}]`);
+
+  // Publish event for UI
+  await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
+
+  // Check if workflow is complete (all tickets done)
+  if (unblocked.length === 0) {
+    if (await isWorkflowComplete(parentId)) {
+      await completeWorkflow(workflow);
+    }
+  }
+
+}
+
+/**
+ * A ticket is ready (status=todo/ready, no blockers). Invoke the assigned agent.
+ */
+async function handleTicketReady(ticketId, image) {
+  const assignee = unwrapDdbValue(image.assignee);
+  const parentId = unwrapDdbValue(image.parentId);
+  const workflowId = unwrapDdbValue(image.workflowId);
+  const ticketType = unwrapDdbValue(image.type);
+
+  if (!assignee || ticketType === "epic") return;
+
+  const agentDef = getAgentDef(assignee);
+  if (!agentDef) {
+    console.warn(`[orchestrator] Unknown agent: ${assignee}`);
+    return;
+  }
+
+  // Get workflow metadata (resilient to bad workflowId from agent-created tickets)
+  const workflow = await resolveWorkflow(workflowId, parentId);
+  if (!workflow) {
+    console.warn(`[orchestrator] No workflow for ticket ${ticketId} (workflowId=${workflowId}, parent=${parentId})`);
+    return;
+  }
+
+  // Idempotency guard: atomic claim via conditional write.
+  // If another invocation already set this ticket to in_progress, bail out.
+  // This prevents duplicate agent sessions from nudges or stream re-deliveries.
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId },
+      UpdateExpression: "SET #s = :s, #u = :u",
+      ConditionExpression: "#s <> :inprog",
+      ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+      ExpressionAttributeValues: { ":s": "in_progress", ":inprog": "in_progress", ":u": new Date().toISOString() },
+    }));
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") {
+      console.log(`[orchestrator] ${ticketId} already in_progress — skipping duplicate invocation`);
+      return;
+    }
+    throw err; // unexpected error — re-throw
+  }
+
+  // Ensure manifest exists (initializes on first agent invocation)
+  try { await initManifestIfNeeded(workflow); } catch (err) {
+    console.warn(`[orchestrator] Manifest init failed (non-fatal): ${err.message}`);
+  }
+
+  // Advance phase if needed
+  const phaseOrder = ["intake", "requirements", "design", "development", "verification", "review", "complete"];
+  const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
+  const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
+  if (agentPhaseIdx > currentPhaseIdx) {
+    workflow.phase = agentDef.phase;
+    await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
+
+    // Create shared feature branch when entering development
+    if (agentDef.phase === "development" && !workflow.featureBranch) {
+      try {
+        const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+        const baseBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+        const slug = workflow.input.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40).replace(/-$/, "");
+        const branchName = `feature/${workflow.epicId}-${slug}`;
+        await callGitHub("create_branch", { owner, repo, branch_name: branchName, from_branch: baseBranch });
+        workflow.featureBranch = branchName;
+        console.log(`[orchestrator] Created shared feature branch: ${branchName}`);
+      } catch (err) {
+        console.warn(`[orchestrator] Failed to create branch: ${err.message}`);
+      }
+    }
+  }
+
+  // Update agent task status to "running" (may already exist from trackTicketCreation)
+  if (!workflow.agentTasks) workflow.agentTasks = {};
+  const existingTask = workflow.agentTasks[ticketId];
+  workflow.agentTasks[ticketId] = {
+    ...(existingTask || {}),
+    id: existingTask?.id || `task_${Date.now()}_${assignee}`,
+    agentId: assignee,
+    ticketId,
+    status: "running",
+    startedAt: new Date().toISOString(),
+  };
+  await saveWorkflow(workflow);
+
+  // Build context and invoke agent
+  const ticket = await getTicket(ticketId);
+  const context = await buildAgentContext(ticket, workflow);
+
+  console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}`);
+  await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: agentDef.phase, workflowId: workflow.id });
+
+  // Fire-and-forget: invoke agent via AgentCore Harness
+  // The agent will call report_completion when done → writes "done" to DynamoDB → triggers this Lambda again
+  await invokeAgent(agentDef, context, workflow);
+}
+
+// ─── QA Gate ───────────────────────────────────────────────────────────────────
+
+async function shouldCreateQaTicket(epicId, workflow) {
+  const children = await getChildTickets(epicId);
+
+  // Check if QA ticket already exists (active OR done — never create more than one)
+  const hasQaTicket = children.some(
+    (t) => t.assignee === "agentcore_hub_qa_verifier" && t.status !== "blocked"
+  );
+  if (hasQaTicket) return false;
+
+  // Check if all dev tickets are done
+  const devTickets = children.filter(
+    (t) => t.assignee && (t.assignee.endsWith("_dev") || t.assignee.endsWith("_frontend"))
+  );
+  if (devTickets.length === 0) return false;
+  const allDevsDone = devTickets.every((t) => t.status === "done");
+  if (!allDevsDone) return false;
+
+  // Check if design tickets are done
+  const designTickets = children.filter((t) => t.assignee && t.assignee.endsWith("_designer"));
+  const allDesignDone = designTickets.every((t) => t.status === "done");
+
+  return allDevsDone && allDesignDone;
+}
+
+async function isWorkflowComplete(epicId) {
+  const children = await getChildTickets(epicId);
+  if (children.length === 0) return false;
+  // Must have at least one dev or QA ticket done (not just requirements/design)
+  const hasDevOrQaDone = children.some((t) => {
+    const assignee = t.assignee || "";
+    const isDevOrQa = assignee.endsWith("_dev") || assignee.includes("_qa") || assignee.includes("_ci");
+    return isDevOrQa && t.status === "done";
+  });
+  if (!hasDevOrQaDone) return false;
+  return children.every((t) => t.status === "done");
+}
+
+async function createQaVerificationTicket(workflow) {
+  console.log(`[orchestrator] All dev agents complete. Creating QA ticket...`);
+
+  workflow.phase = "verification";
+  await saveWorkflow(workflow);
+  await publishEvent(workflow.epicId, "workflow.phase_change", { phase: "verification", workflowId: workflow.id });
+
+  const children = await getChildTickets(workflow.epicId);
+  const devTickets = children.filter((t) => t.assignee && t.assignee.endsWith("_dev"));
+  const devSummaries = devTickets.map((t) => `- ${t.title} (${t.assignee}): ${t.status}`).join("\n");
+  const inputSources = (workflow.input?.sources || []).map((s) => `- ${s.type}: ${s.value}`).join("\n");
+
+  const qaDescription = `## QA Verification: ${workflow.input.title}
+
+### What was built:
+${devSummaries}
+
+### Feature branch: \`${workflow.featureBranch || "unknown"}\`
+
+### Original input/mockups:
+${inputSources}
+
+### Your job:
+1. Build and run the app on the feature branch
+2. Visually compare EVERY affected page against the original mockups
+3. Run functional tests
+4. Run regression tests
+5. If all passes → report_completion
+6. If anything fails → request_fix back to the dev agent with evidence`;
+
+  // Create QA ticket (status=todo, no blockers → stream will fire handleTicketReady)
+  const ticketId = await nextTicketId();
+  await ddb.send(new PutCommand({
+    TableName: TICKETS_TABLE,
+    Item: {
+      ticketId,
+      type: "task",
+      title: "QA: Visual & functional verification",
+      description: qaDescription,
+      status: "todo",
+      assignee: "agentcore_hub_qa_verifier",
+      parentId: workflow.epicId,
+      workflowId: workflow.id,
+      comments: [],
+      artifacts: [],
+      blockedBy: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  }));
+
+  console.log(`[orchestrator] Created QA ticket ${ticketId}`);
+}
+
+async function completeWorkflow(workflow) {
+  if (workflow.phase === "complete") return;
+  console.log(`[orchestrator] Workflow ${workflow.id} complete!`);
+
+  workflow.phase = "complete";
+  workflow.completedAt = new Date().toISOString();
+
+  // Create unified PR if feature branch exists
+  let prUrl = "";
+  if (workflow.featureBranch && workflow.repoConfig) {
+    try {
+      const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+      const baseBranch = workflow.repoConfig.repos?.[0]?.defaultBranch || "main";
+      const prResult = await callGitHub("create_pr", {
+        owner,
+        repo,
+        title: `feat: ${workflow.input.title} (${workflow.epicId})`,
+        body: `Automated implementation by agentic team workflow (${workflow.epicId}).`,
+        head: workflow.featureBranch,
+        base: baseBranch,
+      });
+      prUrl = prResult?.html_url || "";
+      console.log(`[orchestrator] Created PR: ${prUrl}`);
+    } catch (err) {
+      console.warn(`[orchestrator] PR creation failed: ${err.message}`);
+    }
+  }
+
+  await saveWorkflow(workflow);
+  await publishEvent(workflow.epicId, "workflow.complete", {
+    workflowId: workflow.id,
+    featureBranch: workflow.featureBranch,
+    prUrl,
+  });
+}
+
+// ─── Agent Invocation ──────────────────────────────────────────────────────────
+
+/**
+ * Discover harness ARN and invoke the agent.
+ * Fire-and-forget: agent runs asynchronously. When done, it calls report_completion
+ * which writes "done" to DynamoDB, triggering this Lambda again via the stream.
+ */
+async function invokeAgent(agentDef, context, workflow) {
+  // Discover agent ARN — prefer runtimeArn from roster, then env var lookup
+  const runtimeEnvKey = `RUNTIME_ARN_${agentDef.agentId.toUpperCase()}`;
+  const harnessEnvKey = `HARNESS_ARN_${agentDef.agentId.toUpperCase()}`;
+  const harnessArn = agentDef.runtimeArn || process.env[runtimeEnvKey] || process.env[harnessEnvKey];
+  if (!harnessArn) {
+    console.error(`[orchestrator] No ARN for agent: ${agentDef.agentId}. Tried ${runtimeEnvKey} and ${harnessEnvKey}. Marking ticket blocked.`);
+    // Mark ticket blocked instead of silently returning — prevents stuck workflows
+    const task = Object.values(workflow.agentTasks || {}).find(t => t.agentId === agentDef.agentId && t.status === "running");
+    if (task?.ticketId) {
+      await ddb.send(new UpdateCommand({
+        TableName: TICKETS_TABLE,
+        Key: { ticketId: task.ticketId },
+        UpdateExpression: "SET #s = :s, #u = :u",
+        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+        ExpressionAttributeValues: { ":s": "blocked", ":u": new Date().toISOString() },
+      }));
+    }
+    await publishEvent(workflow.epicId, "agent.error", {
+      agentId: agentDef.agentId,
+      workflowId: workflow.id,
+      error: `No runtime ARN configured. Set ${runtimeEnvKey} env var on orchestrator Lambda.`,
+    });
+    return;
+  }
+  console.log(`[orchestrator] Using ${harnessArn.includes("/runtime/") ? "Runtime" : "Harness"} for ${agentDef.agentId}`);
+
+  // Determine model override
+  let modelConfig = undefined;
+  if (workflow.input?.modelOverride) {
+    let override = workflow.input.modelOverride;
+    if (typeof override === "string") {
+      const modelMap = {
+        "opus": "us.anthropic.claude-opus-4-6-v1",
+        "sonnet": "us.anthropic.claude-sonnet-4-6",
+        "claude-opus-47": "us.anthropic.claude-opus-4-7",
+        "claude-opus-46": "us.anthropic.claude-opus-4-6-v1",
+        "claude-sonnet-46": "us.anthropic.claude-sonnet-4-6",
+        "claude-sonnet-45": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+      };
+      override = { bedrockModelConfig: { modelId: modelMap[override] || override } };
+    }
+    modelConfig = override;
+  }
+
+  try {
+    // Use BedrockAgentRuntime InvokeAgent — fire and forget
+    // The agent stream will run to completion. When done, the agent's report_completion
+    // tool writes "done" status to DynamoDB, which triggers this Lambda via stream.
+    // Prefix with ticketId so OTEL traces are discoverable by Jira ticket in the Ticket History page
+    const task = Object.values(workflow.agentTasks || {}).find(t => t.agentId === agentDef.agentId && t.status === "running");
+    const ticketPrefix = task?.ticketId ? `${task.ticketId}_` : "";
+    const sessionId = `${ticketPrefix}${workflow.id}-${agentDef.agentId}-${Date.now()}`;
+
+    const command = new InvokeAgentCommand({
+      agentAliasId: "TSTALIASID", // placeholder — real ARN used via agentId
+      agentId: harnessArn.split("/").pop(),
+      sessionId,
+      inputText: context,
+      ...(modelConfig?.bedrockModelConfig ? { bedrockModelArn: modelConfig.bedrockModelConfig.modelId } : {}),
+    });
+
+    // Note: In production, we'd use the AgentCore Harness SDK's invokeHarnessAgent
+    // For now, invoke as a separate async Lambda that handles the streaming
+    await lambda.send(new InvokeCommand({
+      FunctionName: "agentcore-hub-agent-invoker",
+      InvocationType: "Event", // async — don't wait for response
+      Payload: JSON.stringify({
+        harnessArn,
+        sessionId,
+        prompt: context,
+        workflowId: workflow.id,
+        agentId: agentDef.agentId,
+        ticketId: task?.ticketId || "",
+        modelOverride: modelConfig,
+      }),
+    }));
+
+    console.log(`[orchestrator] Async invoke sent for ${agentDef.agentId} (session: ${sessionId})`);
+
+    // Journey log: agent invocation dispatched
+    await publishEvent(task?.ticketId || agentDef.agentId, "orchestrator.agent_invoked", {
+      ticketId: task?.ticketId || "", agentId: agentDef.agentId, sessionId,
+      workflowId: workflow.id, runtimeArn: harnessArn,
+    });
+
+    // Persist session info to the workflow manifest (S3) for health probes and traceability
+    try {
+      await updateManifestSession(workflow.id, agentDef.agentId, {
+        sessionId,
+        runtimeArn: harnessArn,
+        invokedAt: new Date().toISOString(),
+        ticketId: Object.values(workflow.agentTasks || {}).find(t => t.agentId === agentDef.agentId && t.status === "running")?.ticketId,
+      });
+    } catch (err) {
+      console.warn(`[orchestrator] Manifest session write failed (non-fatal): ${err.message}`);
+    }
+  } catch (err) {
+    console.error(`[orchestrator] Failed to invoke ${agentDef.agentId}:`, err);
+    // Mark ticket as blocked
+    const task = workflow.agentTasks?.[agentDef.agentId];
+    if (task) {
+      await ddb.send(new UpdateCommand({
+        TableName: TICKETS_TABLE,
+        Key: { ticketId: task.ticketId },
+        UpdateExpression: "SET #s = :s, #u = :u",
+        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+        ExpressionAttributeValues: { ":s": "blocked", ":u": new Date().toISOString() },
+      }));
+    }
+  }
+}
+
+// ─── Context Builder ───────────────────────────────────────────────────────────
+
+async function buildAgentContext(ticket, workflow) {
+  let context = `# Your Assignment: ${ticket.title}\n\n`;
+  context += `## Ticket\nID: ${ticket.ticketId}\nDescription: ${ticket.description}\n\n`;
+
+  // Workflow identifiers
+  context += `## Workflow Context\n`;
+  context += `workflow_id: ${workflow.id}\n`;
+  context += `epic_id: ${workflow.epicId}\n`;
+  context += `ticket_id: ${ticket.ticketId}\n\n`;
+
+  // For requirements analyst only: provide the valid agent roster (registry data).
+  if (ticket.assignee === "agentcore_hub_requirements_analyst") {
+    const roster = (_agentRoster || FALLBACK_ROSTER)
+      .filter(a => a.agentId !== "agentcore_hub_requirements_analyst")
+      .map(a => `  - "${a.agentId}" (${a.phase})`)
+      .join("\n");
+    context += `## Available Agents\n${roster}\n\n`;
+
+    // Bug-fix is a SCOPE distinction (different blueprint), not a HOW.
+    try {
+      const epic = await getTicket(workflow.epicId);
+      if ((epic?.issueType || "").toLowerCase() === "bug") {
+        context += `## Workflow Type\nbug-fix (workflow root ${workflow.epicId} is a Jira Bug)\n\n`;
+      }
+    } catch (err) {
+      console.warn(`[orchestrator] could not check epic issue type: ${err.message}`);
+    }
+  }
+
+  // Requirements artifact (from epic) — scope, not HOW
+  try {
+    const epic = await getTicket(workflow.epicId);
+    const reqArtifact = (epic?.artifacts || []).find((a) => a.type === "requirements");
+    if (reqArtifact) {
+      context += `## Requirements\n${reqArtifact.content}\n\n`;
+    }
+  } catch { /* no requirements yet */ }
+
+  // Repo identity — scope only
+  if (workflow.repoConfig?.repos?.length > 0) {
+    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+    const defaultBranch = workflow.repoConfig.repos[0]?.defaultBranch || "main";
+    context += `## Repository\nowner: ${owner}\nrepo: ${repo}\ndefault_branch: ${defaultBranch}\n\n`;
+  }
+
+  // S3 workspace paths (scope)
+  const agentDef = getAgentDef(ticket.assignee);
+  context += `## S3 Workspace\n`;
+  context += `shared: workflows/${workflow.id}/shared/\n`;
+  context += `your_workspace: workflows/${workflow.id}/agents/${ticket.assignee}/\n\n`;
+
+  // Manifest — upstream artifacts (scope only)
+  try {
+    const manifest = await readManifest(workflow.id);
+    if (manifest) {
+      context += buildManifestContext(manifest, agentDef?.phase || "development", workflow, ticket);
+    }
+  } catch { /* manifest read failed — non-fatal */ }
+
+  // Dev agents: branch identity (scope, not HOW)
+  if (agentDef?.phase === "development") {
+    const baseBranch = workflow.featureBranch || workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    context += `## Branch\n`;
+    context += `feature_branch: feature/${ticket.ticketId}-${agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-")}\n`;
+    context += `base_branch: ${baseBranch}\n\n`;
+
+    // Design artifacts content (scope)
+    try {
+      const designDoc = await readS3Artifact(workflow.id, "shared/output.md");
+      if (designDoc) {
+        context += `## Design Artifacts\n${designDoc.slice(0, 8000)}\n\n`;
+      }
+    } catch { /* no design docs yet */ }
+  }
+
+  // Feature request input (for analyst — scope)
+  if (agentDef?.phase === "requirements" && workflow.input) {
+    context += `## Feature Request\nTitle: ${workflow.input.title}\nDescription: ${workflow.input.description}\n\n`;
+    if (workflow.input.sources?.length > 0) {
+      context += `## Input Sources\n`;
+      for (const src of workflow.input.sources) {
+        context += `- [${src.type}] ${src.label || src.value}\n`;
+      }
+      context += "\n";
+    }
+  }
+
+  return context;
+}
+
+// ─── DynamoDB Helpers ──────────────────────────────────────────────────────────
+
+async function getWorkflow(id) {
+  if (!id || typeof id !== "string") return null;
+  const result = await ddb.send(new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: id }, ConsistentRead: true }));
+  return result.Item || null;
+}
+
+/**
+ * Resolve workflow for a ticket — handles cases where workflowId is missing/invalid.
+ * Falls back to looking up the parent epic's workflowId.
+ */
+async function resolveWorkflow(workflowId, parentId) {
+  // Try direct lookup if workflowId is a valid string
+  if (typeof workflowId === "string" && workflowId.startsWith("wf_")) {
+    const wf = await getWorkflow(workflowId);
+    if (wf) return wf;
+  }
+
+  // Fallback: look up the parent (epic) ticket to get the workflowId
+  if (parentId) {
+    const parent = await getTicket(parentId);
+    if (parent && typeof parent.workflowId === "string" && parent.workflowId.startsWith("wf_")) {
+      return await getWorkflow(parent.workflowId);
+    }
+    // If parent itself has a parentId, go one level up (task → story → epic)
+    if (parent && parent.parentId) {
+      const grandparent = await getTicket(parent.parentId);
+      if (grandparent && typeof grandparent.workflowId === "string") {
+        return await getWorkflow(grandparent.workflowId);
+      }
+    }
+  }
+
+  // Jira fallback: scan workflows table for epicId match
+  // (Jira epics don't store workflowId — it lives in our workflows table)
+  if (parentId && TICKET_PROVIDER === "jira") {
+    try {
+      const result = await ddb.send(new QueryCommand({
+        TableName: WORKFLOWS_TABLE,
+        IndexName: "epicId-index",
+        KeyConditionExpression: "epicId = :eid",
+        ExpressionAttributeValues: { ":eid": parentId },
+      }));
+      if (result.Items?.length > 0) return result.Items[0];
+    } catch {
+      // epicId-index may not exist — fall through
+    }
+  }
+
+  return null;
+}
+
+async function saveWorkflow(workflow) {
+  await ddb.send(new PutCommand({ TableName: WORKFLOWS_TABLE, Item: { ...workflow, workflowId: workflow.id } }));
+}
+
+/**
+ * Bootstrap a workflow when a Bug is filed directly in Jira (not via /api/workflow/start).
+ * The Bug ticket itself is the workflow root — there is no separate Epic wrapper.
+ * Mirrors startWithJira() in src/app/api/workflow/start/route.ts.
+ *
+ * Steps:
+ *   1. Idempotency check: if a workflow already exists for this bug key, do nothing.
+ *   2. Create workflow row in DDB (epicId = bug.key).
+ *   3. Label the Bug with `wf:<workflow_id>` and `agentcore-hub-workflow` so the analyst sub-task
+ *      will inherit the workflow context via the same labels.
+ *   4. Create a requirements-analyst sub-task under the Bug.
+ *   5. The analyst sub-task is created without blockers, so the agentcore-hub-jira Lambda
+ *      transitions it to Ready on creation, which fires the orchestrator's normal
+ *      "ready" path → invokes the analyst → bug-fix blueprint.
+ */
+async function bootstrapBugWorkflow(bugTicket) {
+  const bugKey = bugTicket.ticketId;
+
+  // Idempotency: scan workflows table for an existing workflow with this epicId
+  try {
+    const existing = await ddb.send(new QueryCommand({
+      TableName: WORKFLOWS_TABLE,
+      IndexName: "epicId-index",
+      KeyConditionExpression: "epicId = :eid",
+      ExpressionAttributeValues: { ":eid": bugKey },
+    }));
+    if (existing.Items?.length > 0) {
+      console.log(`[orchestrator] Bug ${bugKey} already has workflow ${existing.Items[0].id} — skipping bootstrap`);
+      return;
+    }
+  } catch (err) {
+    console.warn(`[orchestrator] Bootstrap idempotency check failed (continuing): ${err.message}`);
+  }
+
+  const workflowId = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  console.log(`[orchestrator] Bootstrapping bug workflow ${workflowId} for ${bugKey}`);
+
+  // 1. Create workflow row
+  const repoUrl = process.env.DEFAULT_BUG_REPO_URL || "https://github.com/your-org/your-repo";
+  const repoConfig = {
+    repos: [{ platform: "github", url: repoUrl, defaultBranch: "main" }],
+  };
+  const workflow = {
+    id: workflowId,
+    workflowId,
+    phase: "requirements",
+    epicId: bugKey,
+    repoConfig,
+    input: {
+      title: bugTicket.title || `Bug fix: ${bugKey}`,
+      description: bugTicket.description || "",
+      sources: [],
+      repoConfig,
+    },
+    agentTasks: {},
+    messages: [],
+    humanNotifications: [],
+    startedAt: new Date().toISOString(),
+    ticketProvider: "jira",
+    intakeChannel: "jira-webhook",
+    workflowType: "bug",
+  };
+  await saveWorkflow(workflow);
+
+  // 2. Label the Bug ticket itself with `wf:<id>` so future webhooks can resolve the workflow
+  try {
+    await jiraFetch(`/rest/api/3/issue/${bugKey}`, "PUT", {
+      update: {
+        labels: [{ add: `wf:${workflowId}` }, { add: "agentcore-hub-workflow" }],
+      },
+    });
+  } catch (err) {
+    console.warn(`[orchestrator] Could not label Bug ${bugKey}: ${err.message}`);
+  }
+
+  // 3. Create requirements-analyst sub-task under the Bug
+  const analystSummary = `Requirements: requirements analyst — ${bugTicket.title || bugKey}`;
+  const analystDescription = `Analyze the bug report (${bugKey}) and create the bug-fix sub-task chain (Fix → QA → CI). The orchestrator has injected a "THIS IS A BUG REPORT" directive — load the bug-fix-requirements blueprint.\n\n${bugTicket.description || ""}`;
+
+  const subtaskFields = {
+    project: { key: process.env.JIRA_PROJECT_KEY || "TEAM" },
+    summary: analystSummary,
+    issuetype: { name: "Subtask" },
+    parent: { key: bugKey },
+    labels: ["agentcore-hub-workflow", `wf:${workflowId}`, "agent:agentcore_hub_requirements_analyst"],
+    description: {
+      type: "doc",
+      version: 1,
+      content: [{ type: "paragraph", content: [{ type: "text", text: analystDescription }] }],
+    },
+  };
+
+  let analystKey;
+  try {
+    const created = await jiraFetch(`/rest/api/3/issue`, "POST", { fields: subtaskFields });
+    analystKey = created.key;
+    console.log(`[orchestrator] Created analyst sub-task ${analystKey} under bug ${bugKey}`);
+  } catch (err) {
+    console.error(`[orchestrator] Failed to create analyst sub-task for bug ${bugKey}: ${err.message}`);
+    return;
+  }
+
+  // 4. Transition analyst sub-task to Ready (no blockers) — this fires the webhook → orchestrator → invoke
+  try {
+    await jiraTransition(analystKey, "Ready");
+  } catch (err) {
+    console.warn(`[orchestrator] Could not transition ${analystKey} to Ready (will rely on Jira webhook fallback): ${err.message}`);
+  }
+}
+
+async function checkAllBlockersResolved(blockerIds) {
+  // Check if all tickets in the blockedBy list are done/cancelled
+  for (const bid of blockerIds) {
+    const blocker = await getTicket(bid);
+    if (!blocker || (blocker.status !== "done" && blocker.status !== "cancelled")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function getTicket(ticketId) {
+  if (TICKET_PROVIDER === "jira") {
+    return await getTicketFromJira(ticketId);
+  }
+  const result = await ddb.send(new GetCommand({ TableName: TICKETS_TABLE, Key: { ticketId } }));
+  if (!result.Item) return null;
+  // Normalize: DDB tickets store the raw Jira issue type as `type` (e.g., "Bug", "Task").
+  // Mirror it onto `issueType` so callers can branch on it the same way as the Jira path.
+  if (result.Item.type && !result.Item.issueType) {
+    result.Item.issueType = result.Item.type;
+  }
+  return result.Item;
+}
+
+async function getChildTickets(parentId) {
+  if (TICKET_PROVIDER === "jira") {
+    return await getChildTicketsFromJira(parentId);
+  }
+  const result = await ddb.send(new QueryCommand({
+    TableName: TICKETS_TABLE,
+    IndexName: "parentId-index",
+    KeyConditionExpression: "parentId = :pid",
+    ExpressionAttributeValues: { ":pid": parentId },
+  }));
+  return result.Items || [];
+}
+
+// ─── Jira Ticket Provider ─────────────────────────────────────────────────────
+
+async function jiraFetch(path, method = "GET", body = null) {
+  const url = `https://${JIRA_SITE_URL}${path}`;
+  const headers = {
+    Authorization: JIRA_AUTH,
+    Accept: "application/json",
+  };
+  if (body) headers["Content-Type"] = "application/json";
+  const resp = await fetch(url, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (resp.status === 204) return null;
+  if (!resp.ok) throw new Error(`Jira API ${method} ${path} ${resp.status}: ${await resp.text()}`);
+  if (resp.status === 201 || resp.status === 200) {
+    const text = await resp.text();
+    try { return JSON.parse(text); } catch { return text; }
+  }
+  return null;
+}
+
+function mapJiraStatus(name) {
+  const map = { "to do": "todo", "ready": "ready", "in progress": "in_progress", "in review": "in_review", "blocked": "blocked", "done": "done", "backlog": "backlog" };
+  return map[name.toLowerCase()] || name.toLowerCase().replace(/\s+/g, "_");
+}
+
+function mapJiraIssueToTicket(issue) {
+  const f = issue.fields || {};
+  const labels = f.labels || [];
+  const agentLabel = labels.find(l => l.startsWith("agent:"));
+  const wfLabel = labels.find(l => l.startsWith("wf:"));
+
+  // Extract blockedBy from issue links
+  // From this ticket's perspective: if it has an inwardIssue with type "is blocked by",
+  // that inwardIssue is what blocks this ticket.
+  const blockedBy = [];
+  for (const link of (f.issuelinks || [])) {
+    if (link.type?.inward === "is blocked by" && link.inwardIssue) {
+      blockedBy.push(link.inwardIssue.key);
+    }
+  }
+
+  const rawIssueType = f.issuetype?.name || "Task";
+  return {
+    ticketId: issue.key,
+    title: f.summary || "",
+    description: extractAdfText(f.description),
+    status: mapJiraStatus(f.status?.name || "To Do"),
+    assignee: agentLabel ? agentLabel.replace("agent:", "") : null,
+    parentId: f.parent?.key || null,
+    workflowId: wfLabel ? wfLabel.replace("wf:", "") : null,
+    type: rawIssueType.toLowerCase() === "epic" ? "epic" : "task",
+    issueType: rawIssueType,
+    blockedBy,
+    comments: [],
+    artifacts: [],
+  };
+}
+
+function extractAdfText(adf) {
+  if (!adf || !adf.content) return "";
+  return adf.content.map(block => {
+    if (block.content) return block.content.map(n => n.text || "").join("");
+    return "";
+  }).join("\n");
+}
+
+async function getTicketFromJira(ticketId) {
+  const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=summary,description,status,issuetype,parent,labels,issuelinks,assignee`);
+  if (!issue) return null;
+  return mapJiraIssueToTicket(issue);
+}
+
+async function getChildTicketsFromJira(parentId) {
+  const jql = encodeURIComponent(`parent = ${parentId} ORDER BY created ASC`);
+  const data = await jiraFetch(`/rest/api/3/search/jql?jql=${jql}&fields=summary,status,labels,issuetype,parent,issuelinks,assignee,description&maxResults=100`);
+  return (data?.issues || []).map(mapJiraIssueToTicket);
+}
+
+async function nextTicketId() {
+  const projectKey = process.env.PROJECT_KEY || "TEAM";
+  const result = await ddb.send(new UpdateCommand({
+    TableName: TICKETS_TABLE,
+    Key: { ticketId: "__COUNTER__" },
+    UpdateExpression: "SET #n = if_not_exists(#n, :zero) + :one",
+    ExpressionAttributeNames: { "#n": "nextNum" },
+    ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
+    ReturnValues: "UPDATED_NEW",
+  }));
+  return `${projectKey}-${result.Attributes.nextNum}`;
+}
+
+// ─── S3 Helpers ────────────────────────────────────────────────────────────────
+
+async function readS3Artifact(workflowId, path) {
+  if (!ARTIFACT_BUCKET) return null;
+  try {
+    const result = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: `workflows/${workflowId}/${path}`,
+    }));
+    return await result.Body.transformToString();
+  } catch {
+    return null;
+  }
+}
+
+// ─── Manifest Helpers ──────────────────────────────────────────────────────────
+
+async function readManifest(workflowId) {
+  const raw = await readS3Artifact(workflowId, "shared/manifest.json");
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+async function initManifestIfNeeded(workflow) {
+  if (!ARTIFACT_BUCKET) return;
+  const existing = await readManifest(workflow.id);
+  if (existing) return; // Already initialized
+
+  const manifest = {
+    workflowId: workflow.id,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    repoConfig: workflow.repoConfig,
+    phases: { intake: [], requirements: [], design: [], development: [], verification: [] },
+  };
+
+  // Seed intake entries from workflow input sources (if any)
+  if (workflow.input?.sources?.length > 0) {
+    manifest.phases.intake = workflow.input.sources
+      .filter(s => s.s3Key)
+      .map((src, i) => ({
+        id: `intake-${i}-${Date.now().toString(36)}`,
+        type: "source",
+        format: src.contentType?.includes("html") ? "html" : "text",
+        description: src.label || src.value || `Source ${i}`,
+        s3Key: src.s3Key,
+        addedBy: "intake-processor",
+        addedAt: manifest.createdAt,
+        critical: true,
+      }));
+  }
+
+  await s3.send(new PutObjectCommand({
+    Bucket: ARTIFACT_BUCKET,
+    Key: `workflows/${workflow.id}/shared/manifest.json`,
+    Body: JSON.stringify(manifest, null, 2),
+    ContentType: "application/json",
+  }));
+  console.log(`[orchestrator] Initialized manifest for ${workflow.id}`);
+}
+
+async function updateManifestSession(workflowId, agentId, sessionInfo) {
+  if (!ARTIFACT_BUCKET) return;
+  const manifestKey = `workflows/${workflowId}/shared/manifest.json`;
+  let manifest;
+  try {
+    const result = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: manifestKey }));
+    manifest = JSON.parse(await result.Body.transformToString());
+  } catch {
+    // Manifest doesn't exist yet — create minimal one
+    manifest = { workflowId, createdAt: new Date().toISOString(), sessions: {} };
+  }
+  if (!manifest.sessions) manifest.sessions = {};
+  manifest.sessions[agentId] = sessionInfo;
+  manifest.updatedAt = new Date().toISOString();
+  await s3.send(new PutObjectCommand({
+    Bucket: ARTIFACT_BUCKET,
+    Key: manifestKey,
+    Body: JSON.stringify(manifest, null, 2),
+    ContentType: "application/json",
+  }));
+  console.log(`[orchestrator] Recorded session for ${agentId} in manifest`);
+}
+
+function buildManifestContext(manifest, agentPhase, workflow, ticket) {
+  if (!manifest) return "";
+
+  const phaseOrder = ["intake", "requirements", "design", "development", "verification"];
+  const currentIdx = phaseOrder.indexOf(agentPhase);
+  if (currentIdx < 0) return "";
+
+  let ctx = `## Workflow Manifest — Upstream Artifacts\n\n`;
+
+  // Canonical repo info from manifest (single source of truth)
+  if (manifest.repoConfig?.repos?.length > 0) {
+    const url = manifest.repoConfig.repos[0].url || "";
+    const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
+    if (match) {
+      ctx += `### Repository\n`;
+      ctx += `- owner: "${match[1]}"\n- repo: "${match[2]}"\n`;
+      ctx += `- default_branch: "${manifest.repoConfig.repos[0].defaultBranch || "main"}"\n\n`;
+    }
+  }
+
+  // List upstream artifacts by phase
+  for (const phase of phaseOrder) {
+    if (phaseOrder.indexOf(phase) >= currentIdx) break;
+    const entries = manifest.phases?.[phase] || [];
+    if (entries.length === 0) continue;
+
+    ctx += `### ${phase.charAt(0).toUpperCase() + phase.slice(1)} Phase Outputs\n`;
+    for (const entry of entries) {
+      const tag = entry.critical ? "★ " : "";
+      ctx += `- ${tag}${entry.description}`;
+      if (entry.s3Key) ctx += ` → s3://${ARTIFACT_BUCKET}/${entry.s3Key}`;
+      ctx += `\n`;
+    }
+    ctx += `\n`;
+  }
+
+  // For QA/CI agents: inject upstream dev agent PR/branch info directly
+  if (agentPhase === "verification" || agentPhase === "review") {
+    const devEntries = manifest.phases?.development || [];
+    const prEntries = devEntries.filter(e => e.description?.includes("Pull Request"));
+    const branchEntries = devEntries.filter(e => e.description?.includes("Branch:"));
+    if (prEntries.length > 0 || branchEntries.length > 0) {
+      ctx += `### Code to Review (from Development Phase)\n`;
+      for (const e of prEntries) ctx += `- ${e.description}\n`;
+      for (const e of branchEntries) ctx += `- ${e.description}\n`;
+      ctx += `\n`;
+    }
+  }
+
+  return ctx;
+}
+
+// ─── GitHub Lambda Helper ──────────────────────────────────────────────────────
+
+async function callGitHub(toolName, args) {
+  const result = await lambda.send(new InvokeCommand({
+    FunctionName: GITHUB_LAMBDA,
+    Payload: JSON.stringify({ name: toolName, arguments: args }),
+  }));
+  const payload = JSON.parse(new TextDecoder().decode(result.Payload));
+  if (payload.content?.[0]?.text) {
+    return JSON.parse(payload.content[0].text);
+  }
+  return payload;
+}
+
+// ─── EventBridge Publishing ────────────────────────────────────────────────────
+
+async function publishEvent(ticketId, detailType, detail) {
+  try {
+    await events.send(new PutEventsCommand({
+      Entries: [{
+        Source: "agentcore-hub.orchestrator",
+        DetailType: detailType,
+        Detail: JSON.stringify({ ...detail, ticketId, timestamp: new Date().toISOString() }),
+        EventBusName: EVENT_BUS,
+      }],
+    }));
+  } catch (err) {
+    console.warn(`[orchestrator] Failed to publish event:`, err.message);
+  }
+
+  // Also write to events table for dashboard polling
+  if (EVENTS_TABLE) {
+    try {
+      await ddb.send(new PutCommand({
+        TableName: EVENTS_TABLE,
+        Item: {
+          workflowId: detail.workflowId || ticketId,
+          eventId: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          type: detailType,
+          detail,
+          timestamp: new Date().toISOString(),
+        },
+      }));
+    } catch { /* non-fatal */ }
+  }
+}
+
+// ─── Utilities ─────────────────────────────────────────────────────────────────
+
+function parseRepoUrl(repoConfig) {
+  const url = repoConfig?.repos?.[0]?.url || "";
+  const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
+  return match ? { owner: match[1], repo: match[2] } : { owner: "", repo: "" };
+}
+
+/**
+ * Unwrap DynamoDB AttributeValue from stream format.
+ * Stream records use {"S": "value"}, {"N": "123"}, {"L": [...]}, etc.
+ */
+function unwrapDdbValue(attr) {
+  if (!attr) return undefined;
+  if (attr.S !== undefined) return attr.S;
+  if (attr.N !== undefined) return Number(attr.N);
+  if (attr.BOOL !== undefined) return attr.BOOL;
+  if (attr.NULL) return null;
+  if (attr.L) return attr.L.map(unwrapDdbValue);
+  if (attr.M) {
+    const obj = {};
+    for (const [k, v] of Object.entries(attr.M)) {
+      obj[k] = unwrapDdbValue(v);
+    }
+    return obj;
+  }
+  // Already unwrapped (e.g., from DocumentClient format)
+  if (typeof attr === "string" || typeof attr === "number" || typeof attr === "boolean") return attr;
+  if (Array.isArray(attr)) return attr;
+  return attr;
+}

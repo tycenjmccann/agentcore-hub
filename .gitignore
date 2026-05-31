@@ -1,0 +1,62 @@
+# Dependencies
+node_modules/
+
+# Next.js
+.next/
+out/
+
+# Environment (secrets)
+.env
+.env.local
+.env.*.local
+*.local
+
+# Build artifacts
+*.tsbuildinfo
+next-env.d.ts
+.aws-sam/
+lambda/orchestrator/.aws-sam/
+lambda/orchestrator/function.zip
+lambda/skill-loader/function.zip
+lambda/eval-packager/function.zip
+
+# Deploy artifacts (account-specific)
+deploy/runtime-agent/fleet-runtime-ids.json
+deploy/runtime-agent/fleet-health-results.json
+deploy/runtime-agent/repl_state
+deploy/runtime-agent/.bedrock_agentcore/
+deploy/runtime-agent/.bedrock_agentcore.yaml
+deploy/runtime-agent/test-streaming/.bedrock_agentcore.yaml
+deploy/runtime-agent/test-streaming/.bedrock_agentcore/
+repl_state
+
+# Agent state
+.memory-mappings.json
+.payload-formats.json
+
+# Traces (debug logs)
+traces/
+
+# Lambda zips (built artifacts)
+lambda/agentcore-hub-jira/function.zip
+lambda/agentcore-hub-tickets/function.zip
+
+# Test results
+test-results/
+playwright-screenshots/
+scripts/tool-test-results.json
+
+# Demo output (large binaries)
+demo/output/
+demo/recordings/
+*.mp4
+*.webm
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Claude Code
+.claude/

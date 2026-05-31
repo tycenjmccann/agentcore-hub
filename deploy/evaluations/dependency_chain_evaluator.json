@@ -1,0 +1,32 @@
+{
+  "llmAsAJudge": {
+    "modelConfig": {
+      "bedrockEvaluatorModelConfig": {
+        "modelId": "us.anthropic.claude-opus-4-7",
+        "inferenceConfig": {
+          "maxTokens": 1000
+        }
+      }
+    },
+    "ratingScale": {
+      "numerical": [
+        {
+          "value": 0.0,
+          "label": "Failed",
+          "definition": "Agent did not correctly establish blocking relationships, missed dependencies, or created incorrect dependency chains"
+        },
+        {
+          "value": 0.5,
+          "label": "Partial",
+          "definition": "Agent established some correct blocking relationships but missed others or had minor ordering issues"
+        },
+        {
+          "value": 1.0,
+          "label": "Correct",
+          "definition": "Agent correctly established all blocking relationships following the dependency chain: design tickets have no blockers, dev tickets blocked by design, QA blocked by dev, CI blocked by QA"
+        }
+      ]
+    },
+    "instructions": "You are evaluating an AI agent that creates Jira tickets as part of a software development pipeline. The agent must establish correct blocking/dependency relationships between tickets.\n\nThe correct dependency chain is:\n1. Design tickets (ios_designer, frontend_designer, backend_designer, android_designer, analytics_designer) - should have NO blockers\n2. Development tickets (api_dev, backend_dev, frontend_dev) - should be BLOCKED BY their corresponding design ticket(s)\n3. QA verification ticket (qa_verifier) - should be BLOCKED BY all development tickets\n4. CI/Security tickets (ci_agent, security_reviewer) - should be BLOCKED BY the QA ticket\n\nEvaluate whether the agent correctly set up these blocking relationships when creating tickets. Look at tool calls for create_ticket or Tickets___create_ticket and check the blocked_by parameter in the session context.\n\nContext: {context}"
+  }
+}

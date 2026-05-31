@@ -1,0 +1,143 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===== CSS Variables for Theme System ===== */
+
+:root {
+  /* Light Theme (Default) */
+  --color-background: #ffffff;
+  --color-foreground: #0a0a0f;
+  --color-surface-0: #f8f9fa;
+  --color-surface-1: #f1f3f5;
+  --color-surface-2: #e9ecef;
+  --color-surface-3: #dee2e6;
+  --color-surface-4: #ced4da;
+  
+  --color-text-primary: #212529;
+  --color-text-secondary: #495057;
+  --color-text-muted: #6c757d;
+  
+  --color-border: #dee2e6;
+  --color-border-hover: rgba(2, 132, 199, 0.5);
+  
+  /* Brand colors stay consistent */
+  --color-brand-50: #f0f9ff;
+  --color-brand-100: #e0f2fe;
+  --color-brand-200: #bae6fd;
+  --color-brand-300: #7dd3fc;
+  --color-brand-400: #38bdf8;
+  --color-brand-500: #0ea5e9;
+  --color-brand-600: #0284c7;
+  --color-brand-700: #0369a1;
+  --color-brand-800: #075985;
+  --color-brand-900: #0c4a6e;
+}
+
+[data-theme="dark"] {
+  /* Dark Theme */
+  --color-background: #0a0a0f;
+  --color-foreground: #f8f9fa;
+  --color-surface-0: #0a0a0f;
+  --color-surface-1: #12121a;
+  --color-surface-2: #1a1a25;
+  --color-surface-3: #222230;
+  --color-surface-4: #2a2a3a;
+  
+  --color-text-primary: #f8f9fa;
+  --color-text-secondary: #d1d5db;
+  --color-text-muted: #9ca3af;
+  
+  --color-border: #2a2a3a;
+  --color-border-hover: rgba(2, 132, 199, 0.5);
+}
+
+/* Apply smooth transitions to theme-aware properties */
+* {
+  transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+@layer base {
+  body {
+    @apply antialiased;
+    background-color: var(--color-surface-0);
+    color: var(--color-text-primary);
+  }
+}
+
+@layer components {
+  .card {
+    background-color: var(--color-surface-2);
+    border-color: var(--color-surface-4);
+    @apply border rounded-xl p-6;
+  }
+
+  .card-hover {
+    background-color: var(--color-surface-2);
+    border-color: var(--color-surface-4);
+    @apply border rounded-xl p-6 cursor-pointer;
+  }
+  
+  .card-hover:hover {
+    border-color: var(--color-border-hover);
+  }
+
+  .btn-primary {
+    @apply bg-brand-600 hover:bg-brand-500 text-white px-4 py-2 rounded-lg font-medium transition-colors;
+  }
+
+  .btn-secondary {
+    background-color: var(--color-surface-3);
+    color: var(--color-text-secondary);
+    border-color: var(--color-surface-4);
+    @apply px-4 py-2 rounded-lg font-medium transition-colors border;
+  }
+  
+  .btn-secondary:hover {
+    background-color: var(--color-surface-4);
+  }
+
+  .status-dot {
+    @apply w-2 h-2 rounded-full;
+  }
+
+  .status-running {
+    @apply status-dot bg-green-400 animate-pulse;
+  }
+
+  .status-stopped {
+    @apply status-dot bg-gray-500;
+  }
+
+  .status-error {
+    @apply status-dot bg-red-400;
+  }
+
+  .status-pending {
+    @apply status-dot bg-yellow-400 animate-pulse;
+  }
+}
+
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-surface-4) transparent;
+  }
+}
+
+/* Prevent prose code blocks from expanding containers */
+.prose pre {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.prose code {
+  word-break: break-all;
+}
+
+.prose p,
+.prose li,
+.prose td {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}

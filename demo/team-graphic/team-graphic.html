@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AgentCore Hub — Your Team, Augmented</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  background:#faf6f0;
+  color:#1a1410;
+  font-family:'Inter',-apple-system,system-ui,sans-serif;
+  min-height:100vh;
+  padding:48px 28px 60px;
+  -webkit-font-smoothing:antialiased;
+  zoom:1.15;
+}
+
+/* HEADER */
+.header{text-align:center;margin-bottom:44px}
+.eyebrow{font-size:11px;font-weight:600;letter-spacing:3px;text-transform:uppercase;color:#ea580c;margin-bottom:10px}
+.title{font-size:38px;font-weight:800;color:#1a1410;letter-spacing:-0.8px;line-height:1.1;margin-bottom:10px}
+.subtitle{font-size:17px;color:#6b5d52;font-weight:400;line-height:1.5;margin:0 auto}
+.subtitle .line1{display:block;white-space:nowrap;margin-bottom:6px}
+.subtitle .line2{display:block;white-space:nowrap}
+
+/* LAYOUT */
+.layout{
+  display:grid;
+  grid-template-columns:1.05fr 1fr;
+  gap:32px;
+  max-width:1480px;
+  margin:0 auto;
+  align-items:stretch;
+}
+.panel{
+  background:#ffffff;
+  border-radius:22px;
+  padding:32px 30px 36px;
+  box-shadow:0 2px 24px rgba(26,20,16,0.05);
+  border:1px solid #efe7dc;
+  position:relative;
+}
+.panel-label{font-size:11px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:#ea580c;margin-bottom:6px}
+.panel-title{font-size:22px;font-weight:700;color:#1a1410;margin-bottom:6px;letter-spacing:-0.3px}
+.panel-desc{font-size:15.5px;color:#6b5d52;line-height:1.55}
+
+/* === ROUND TABLE === */
+.circle-wrap{
+  position:relative;
+  width:560px;
+  height:560px;
+  margin:24px auto 0;
+}
+.table-center{
+  position:absolute;
+  top:50%;left:50%;
+  width:200px;height:200px;
+  transform:translate(-50%,-50%);
+  background:radial-gradient(circle at 30% 30%,#fef3e8 0%,#fbe4cc 60%,#f9d3a8 100%);
+  border-radius:50%;
+  border:2px dashed #f9a872;
+  display:flex;align-items:center;justify-content:center;
+  flex-direction:column;
+  text-align:center;
+  box-shadow:inset 0 4px 12px rgba(234,88,12,0.08);
+}
+.table-center .work-eyebrow{font-size:10px;letter-spacing:2.5px;text-transform:uppercase;color:#c2410c;font-weight:700;margin-bottom:6px}
+.table-center .work-main{font-size:14px;color:#7c2d12;font-weight:600;line-height:1.35;padding:0 16px}
+.table-center .work-meta{font-size:10px;color:#a16207;margin-top:8px;letter-spacing:0.5px}
+
+.seat{
+  position:absolute;
+  width:140px;
+  display:flex;flex-direction:column;align-items:center;
+}
+.photo-wrap{
+  position:relative;
+  width:108px;height:72px;
+  display:flex;justify-content:center;align-items:center;
+}
+.photo{
+  width:66px;height:66px;
+  border-radius:50%;
+  object-fit:cover;
+  border:3px solid #ffffff;
+  box-shadow:0 6px 16px rgba(26,20,16,0.12);
+  display:block;
+  background:#e7e2da;
+  position:relative;
+}
+.photo + .photo{margin-left:-22px}
+.photo:nth-child(1){z-index:2}
+.photo:nth-child(2){z-index:1}
+.agent-bot{
+  position:absolute;
+  bottom:-4px;right:-6px;
+  width:36px;height:36px;
+  border-radius:50%;
+  background:linear-gradient(135deg,#14b8a6,#0f766e);
+  display:flex;align-items:center;justify-content:center;
+  border:3px solid #ffffff;
+  box-shadow:0 3px 10px rgba(15,118,110,0.4);
+  color:#fff;
+  z-index:5;
+}
+.agent-bot svg{width:16px;height:16px}
+.seat .role{
+  margin-top:11px;
+  font-size:13px;font-weight:700;color:#1a1410;
+  text-align:center;line-height:1.2;
+}
+.seat .agent-pair{
+  font-size:10px;font-weight:600;color:#0f766e;
+  letter-spacing:0.3px;
+  text-align:center;
+  margin-top:3px;
+}
+
+/* 6 seats positioned around a circle (radius ~220, container 560x560 -> center 280,280) */
+/* For 60° increments, offsets from center: */
+/*   0°  (top)         ( 0, -220)  */
+/*   60° (upper right) ( +190, -110) */
+/*  120° (lower right) ( +190, +110) */
+/*  180° (bottom)      ( 0, +220)  */
+/*  240° (lower left)  ( -190, +110) */
+/*  300° (upper left)  ( -190, -110) */
+/* Seat is 140 wide x ~150 tall — top-left = (centerX + offsetX - 70, centerY + offsetY - 60) */
+.seat-1{ left:210px; top:0px; }      /* PM — top */
+.seat-2{ left:400px; top:110px; }    /* UX */
+.seat-3{ left:400px; top:340px; }    /* TL */
+.seat-4{ left:210px; top:450px; }    /* BE — bottom */
+.seat-5{ left:20px;  top:340px; }    /* FE */
+.seat-6{ left:20px;  top:110px; }    /* QA */
+
+/* === ANATOMY PANEL === */
+.anatomy{
+  position:relative;
+  width:100%;
+  height:420px;
+  margin-top:18px;
+}
+.anatomy-svg{
+  position:absolute;
+  top:0;left:0;
+  width:100%;height:100%;
+  pointer-events:none;
+  z-index:1;
+}
+.actor{
+  position:absolute;
+  width:140px;
+  display:flex;flex-direction:column;align-items:center;
+  z-index:3;
+}
+.actor-human{ left:8px; top:50%; transform:translateY(-50%); }
+.actor-agent{ right:8px; top:50%; transform:translateY(-50%); }
+
+.actor .photo{
+  width:88px;height:88px;
+  border:4px solid #ffffff;
+  box-shadow:0 8px 24px rgba(26,20,16,0.14);
+}
+.actor .team-photos{
+  display:flex;align-items:center;justify-content:center;
+  width:160px;
+}
+.actor .team-photos .photo + .photo{margin-left:-28px}
+.actor .team-photos .photo:nth-child(1){z-index:2}
+.actor .team-photos .photo:nth-child(2){z-index:1}
+.actor .agent-shape{
+  width:104px;height:104px;
+  border-radius:50%;
+  background:linear-gradient(135deg,#14b8a6,#0d9488);
+  display:flex;align-items:center;justify-content:center;
+  border:4px solid #ffffff;
+  box-shadow:0 8px 24px rgba(15,118,110,0.32);
+}
+.actor .agent-shape svg{width:44px;height:44px;color:#fff}
+.actor .name{margin-top:14px;font-size:14px;font-weight:700;color:#1a1410}
+.actor .role{font-size:10px;color:#6b5d52;letter-spacing:1.5px;text-transform:uppercase;margin-top:3px;text-align:center}
+
+.tools-col{
+  position:absolute;
+  left:50%;top:50%;
+  transform:translate(-50%,-50%);
+  display:flex;flex-direction:column;gap:12px;
+  z-index:2;
+}
+.tool{
+  background:#ffffff;
+  border:1.5px solid #efe7dc;
+  border-radius:12px;
+  padding:11px 14px;
+  display:flex;align-items:center;gap:11px;
+  box-shadow:0 2px 8px rgba(26,20,16,0.04);
+  width:210px;
+  transition:transform .2s,box-shadow .2s,border-color .2s;
+}
+.tool:hover{
+  transform:translateY(-2px);
+  box-shadow:0 6px 18px rgba(26,20,16,0.08);
+  border-color:#f9a872;
+}
+.tool-icon{
+  width:34px;height:34px;
+  border-radius:8px;
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+  font-size:10px;font-weight:700;letter-spacing:0.5px;
+  color:#fff;
+}
+.tool-icon.jira{background:#0052cc}
+.tool-icon.cc{background:linear-gradient(135deg,#ea580c,#c2410c)}
+.tool-icon.git{background:#1a1410;font-size:16px}
+.tool-icon.s3{background:#7AA116}
+.tool-text{display:flex;flex-direction:column;line-height:1.2}
+.tool-name{font-size:12.5px;font-weight:700;color:#1a1410}
+.tool-sub{font-size:10px;color:#6b5d52;margin-top:2px}
+
+.share-card{
+  margin-top:22px;
+  background:#fef3e8;
+  border-radius:14px;
+  border-left:3px solid #ea580c;
+  padding:18px 22px 16px;
+}
+.share-card .share-title{
+  font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;
+  color:#c2410c;margin-bottom:12px;
+}
+.share-card ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.share-card ul li{
+  display:flex;align-items:flex-start;gap:10px;
+  font-size:14px;color:#3a1f0e;line-height:1.5;
+}
+.share-card ul li::before{
+  content:"";
+  flex-shrink:0;
+  width:6px;height:6px;border-radius:50%;
+  background:#ea580c;
+  margin-top:8px;
+}
+.share-card ul li strong{color:#c2410c;font-weight:700;white-space:nowrap}
+.share-card .closer{
+  margin-top:14px;padding-top:13px;
+  border-top:1px dashed #f9a87280;
+  font-size:14px;color:#3a1f0e;line-height:1.5;
+  text-align:center;font-style:italic;
+}
+.share-card .closer strong{color:#c2410c;font-weight:700;font-style:normal}
+
+/* footer band */
+.footer-band{
+  max-width:1480px;
+  margin:30px auto 0;
+  text-align:center;
+  font-size:15px;
+  color:#6b5d52;
+  line-height:1.6;
+  padding:0 30px;
+}
+.footer-band strong{color:#1a1410;font-weight:600}
+
+@media (max-width:1280px){
+  .layout{grid-template-columns:1fr;gap:28px}
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="eyebrow">AgentCore Hub</div>
+  <div class="title">Your Team, Augmented</div>
+  <div class="subtitle"><span class="line1">Each team has a paired agent scoped to the same role.</span><span class="line2">They share the same tools, the same backlog, the same definition of done — so the team's workflow doesn't change.</span></div>
+</div>
+
+<div class="layout">
+
+  <!-- ====== LEFT: ROUND TABLE ====== -->
+  <div class="panel">
+    <div class="panel-label">The Teams</div>
+    <div class="panel-title">Six teams, six paired agents</div>
+    <div class="panel-desc">Every team gathers around the same backlog. Each team at the table has a small ✦ agent attached — scoped to that team's role.</div>
+
+    <div class="circle-wrap">
+
+      <svg class="circle-connectors" viewBox="0 0 560 560" preserveAspectRatio="none" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0">
+        <defs>
+          <linearGradient id="seatToWorkV" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#ea580c" stop-opacity="0.5"/>
+            <stop offset="100%" stop-color="#ea580c" stop-opacity="0.15"/>
+          </linearGradient>
+          <linearGradient id="seatToWorkR" x1="100%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#ea580c" stop-opacity="0.5"/>
+            <stop offset="100%" stop-color="#ea580c" stop-opacity="0.15"/>
+          </linearGradient>
+          <linearGradient id="seatToWorkL" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#ea580c" stop-opacity="0.5"/>
+            <stop offset="100%" stop-color="#ea580c" stop-opacity="0.15"/>
+          </linearGradient>
+        </defs>
+        <!-- Each seat center to center of work disk (280,280) -->
+        <line x1="280" y1="36"  x2="280" y2="280" stroke="url(#seatToWorkV)" stroke-width="1.6" stroke-dasharray="4 4"/>
+        <line x1="470" y1="146" x2="280" y2="280" stroke="url(#seatToWorkR)" stroke-width="1.6" stroke-dasharray="4 4"/>
+        <line x1="470" y1="376" x2="280" y2="280" stroke="url(#seatToWorkR)" stroke-width="1.6" stroke-dasharray="4 4"/>
+        <line x1="280" y1="486" x2="280" y2="280" stroke="url(#seatToWorkV)" stroke-width="1.6" stroke-dasharray="4 4"/>
+        <line x1="90"  y1="376" x2="280" y2="280" stroke="url(#seatToWorkL)" stroke-width="1.6" stroke-dasharray="4 4"/>
+        <line x1="90"  y1="146" x2="280" y2="280" stroke="url(#seatToWorkL)" stroke-width="1.6" stroke-dasharray="4 4"/>
+      </svg>
+
+      <div class="table-center">
+        <div class="work-eyebrow">The Work</div>
+        <div class="work-main">One shared backlog</div>
+        <div class="work-meta">Jira · Git · S3</div>
+      </div>
+
+      <!-- Product Team — top -->
+      <div class="seat seat-1">
+        <div class="photo-wrap">
+          <img class="photo" src="https://i.pravatar.cc/200?img=47" alt="">
+          <img class="photo" src="https://i.pravatar.cc/200?img=5" alt="">
+          <div class="agent-bot"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 6.5L21 11l-6.5 2.5L12 20l-2.5-6.5L3 11l6.5-2.5L12 2z"/></svg></div>
+        </div>
+        <div class="role">Product Team</div>
+        <div class="agent-pair">+ Product Agent</div>
+      </div>
+
+      <!-- Design Team — upper right -->
+      <div class="seat seat-2">
+        <div class="photo-wrap">
+          <img class="photo" src="https://i.pravatar.cc/200?img=23" alt="">
+          <img class="photo" src="https://i.pravatar.cc/200?img=49" alt="">
+          <div class="agent-bot"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 6.5L21 11l-6.5 2.5L12 20l-2.5-6.5L3 11l6.5-2.5L12 2z"/></svg></div>
+        </div>
+        <div class="role">Design Team</div>
+        <div class="agent-pair">+ Design Agent</div>
+      </div>
+
+      <!-- Architecture Team — lower right -->
+      <div class="seat seat-3">
+        <div class="photo-wrap">
+          <img class="photo" src="https://i.pravatar.cc/200?img=33" alt="">
+          <img class="photo" src="https://i.pravatar.cc/200?img=15" alt="">
+          <div class="agent-bot"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 6.5L21 11l-6.5 2.5L12 20l-2.5-6.5L3 11l6.5-2.5L12 2z"/></svg></div>
+        </div>
+        <div class="role">Architecture Team</div>
+        <div class="agent-pair">+ Architect Agent</div>
+      </div>
+
+      <!-- Backend Team — bottom -->
+      <div class="seat seat-4">
+        <div class="photo-wrap">
+          <img class="photo" src="https://i.pravatar.cc/200?img=53" alt="">
+          <img class="photo" src="https://i.pravatar.cc/200?img=60" alt="">
+          <div class="agent-bot"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 6.5L21 11l-6.5 2.5L12 20l-2.5-6.5L3 11l6.5-2.5L12 2z"/></svg></div>
+        </div>
+        <div class="role">Backend Team</div>
+        <div class="agent-pair">+ Backend Agent</div>
+      </div>
+
+      <!-- Frontend Team — lower left -->
+      <div class="seat seat-5">
+        <div class="photo-wrap">
+          <img class="photo" src="https://i.pravatar.cc/200?img=12" alt="">
+          <img class="photo" src="https://i.pravatar.cc/200?img=26" alt="">
+          <div class="agent-bot"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 6.5L21 11l-6.5 2.5L12 20l-2.5-6.5L3 11l6.5-2.5L12 2z"/></svg></div>
+        </div>
+        <div class="role">Frontend Team</div>
+        <div class="agent-pair">+ Frontend Agent</div>
+      </div>
+
+      <!-- QA Team — upper left -->
+      <div class="seat seat-6">
+        <div class="photo-wrap">
+          <img class="photo" src="https://i.pravatar.cc/200?img=44" alt="">
+          <img class="photo" src="https://i.pravatar.cc/200?img=32" alt="">
+          <div class="agent-bot"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 6.5L21 11l-6.5 2.5L12 20l-2.5-6.5L3 11l6.5-2.5L12 2z"/></svg></div>
+        </div>
+        <div class="role">QA Team</div>
+        <div class="agent-pair">+ QA Agent</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ====== RIGHT: ANATOMY OF A PAIRING ====== -->
+  <div class="panel">
+    <div class="panel-label">Anatomy of a Pairing</div>
+    <div class="panel-title">The same tools, two ways</div>
+    <div class="panel-desc">Zoom into a single team-agent pair. They're connected by shared infrastructure — not by handoff.</div>
+
+    <div class="anatomy">
+      <svg class="anatomy-svg" viewBox="0 0 700 420" preserveAspectRatio="none">
+        <defs>
+          <linearGradient id="gradL" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#ea580c" stop-opacity="0.55"/>
+            <stop offset="100%" stop-color="#ea580c" stop-opacity="0.15"/>
+          </linearGradient>
+          <linearGradient id="gradR" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#0f766e" stop-opacity="0.15"/>
+            <stop offset="100%" stop-color="#0f766e" stop-opacity="0.55"/>
+          </linearGradient>
+        </defs>
+
+        <!-- Container 700x420; actors top:50% so photo center y≈188; tools-col top:50% center y=210 -->
+        <!-- Human photo right edge x≈130, y=188 -->
+        <!-- Agent shape left edge x≈570, y=188 -->
+        <!-- Tools: x left=245, right=455; y centers 108, 176, 244, 312 -->
+
+        <!-- LEFT lines: human → tool midpoints (left edge of each tool) -->
+        <path d="M 130 188 C 190 188, 190 108, 245 108" stroke="url(#gradL)" stroke-width="1.8" fill="none"/>
+        <path d="M 130 188 C 190 188, 190 176, 245 176" stroke="url(#gradL)" stroke-width="1.8" fill="none"/>
+        <path d="M 130 188 C 190 188, 190 244, 245 244" stroke="url(#gradL)" stroke-width="1.8" fill="none"/>
+        <path d="M 130 188 C 190 188, 190 312, 245 312" stroke="url(#gradL)" stroke-width="1.8" fill="none"/>
+
+        <!-- RIGHT lines: tool right edge → agent -->
+        <path d="M 455 108 C 510 108, 510 188, 570 188" stroke="url(#gradR)" stroke-width="1.8" fill="none"/>
+        <path d="M 455 176 C 510 176, 510 188, 570 188" stroke="url(#gradR)" stroke-width="1.8" fill="none"/>
+        <path d="M 455 244 C 510 244, 510 188, 570 188" stroke="url(#gradR)" stroke-width="1.8" fill="none"/>
+        <path d="M 455 312 C 510 312, 510 188, 570 188" stroke="url(#gradR)" stroke-width="1.8" fill="none"/>
+
+        <!-- subtle dots at endpoints -->
+        <circle cx="130" cy="188" r="3.5" fill="#ea580c"/>
+        <circle cx="570" cy="188" r="3.5" fill="#0f766e"/>
+      </svg>
+
+      <!-- TEAM -->
+      <div class="actor actor-human">
+        <div class="team-photos">
+          <img class="photo" src="https://i.pravatar.cc/200?img=12" alt="">
+          <img class="photo" src="https://i.pravatar.cc/200?img=26" alt="">
+        </div>
+        <div class="name">Frontend Team</div>
+        <div class="role">Ships the UI</div>
+      </div>
+
+      <!-- TOOLS COLUMN -->
+      <div class="tools-col">
+        <div class="tool">
+          <div class="tool-icon jira">JIRA</div>
+          <div class="tool-text"><div class="tool-name">Jira</div><div class="tool-sub">Tickets, status, assignees</div></div>
+        </div>
+        <div class="tool">
+          <div class="tool-icon cc">CC</div>
+          <div class="tool-text"><div class="tool-name">Claude Code</div><div class="tool-sub">Loaded skills per role</div></div>
+        </div>
+        <div class="tool">
+          <div class="tool-icon git">⎇</div>
+          <div class="tool-text"><div class="tool-name">Git Repo</div><div class="tool-sub">Branches, PRs, reviews</div></div>
+        </div>
+        <div class="tool">
+          <div class="tool-icon s3">S3</div>
+          <div class="tool-text"><div class="tool-name">Artifact Store</div><div class="tool-sub">PRDs, mockups, traces</div></div>
+        </div>
+      </div>
+
+      <!-- AGENT -->
+      <div class="actor actor-agent">
+        <div class="agent-shape">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 6.5L21 11l-6.5 2.5L12 20l-2.5-6.5L3 11l6.5-2.5L12 2z"/></svg>
+        </div>
+        <div class="name">Frontend Agent</div>
+        <div class="role">Same scope as the team</div>
+      </div>
+    </div>
+
+    <div class="share-card">
+      <div class="share-title">What they share</div>
+      <ul>
+        <li><strong>Same Jira tickets</strong> — one backlog, one definition of done.</li>
+        <li><strong>Same Git repo</strong> — branches and PRs go through your existing process.</li>
+        <li><strong>Same S3 bucket</strong> — PRDs, mockups, and traces shared across the team.</li>
+        <li><strong>Same Claude Code stack</strong> — pick up work and hand back results the same way.</li>
+      </ul>
+      <div class="closer">The agent <strong>isn't a black box on the side</strong> — it's a teammate inside the same system.</div>
+    </div>
+
+  </div>
+
+</div>
+
+</body>
+</html>

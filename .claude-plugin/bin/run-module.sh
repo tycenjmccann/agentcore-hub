@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Idempotent dispatcher for AgentCore Hub modules.
+# Knows the script order and required env vars per module.
+# Underlying scripts already exist in deploy/ and scripts/ — this only sequences them.
+#
+# Usage: run-module.sh <core|builder|workflow|evaluations>
+#
+# Reads from environment:
+#   AWS_PROFILE, AWS_REGION (required)
+#   TICKET_PROVIDER ("dynamodb" or "jira") — required for workflow
+
+set -euo pipefail
+
+MODULE="${1:-}"
+if [[ -z "$MODULE" ]]; then
+  echo "Usage: $0 <core|builder|workflow|evaluations>" >&2
+  exit 2
+fi
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+# Load values written by apply-env.sh (TICKET_PROVIDER, BUILDER_AGENT_ID, etc.)
+# so the deploy steps below see them without the parent shell having to export.
+if [[ -f .env.local ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env.local
+  set +a
+fi
+
+: "${AWS_REGION:?AWS_REGION must be set}"
+: "${AWS_PROFILE:=default}"
+export AWS_PROFILE AWS_REGION
+
+echo "── Running module: $MODULE ────────────────────────────────"
+
+case "$MODULE" in
+  core)
+    if [[ ! -d node_modules ]]; then
+      echo "→ npm install"
+      npm install
+    else
+      echo "→ node_modules already present, skipping npm install"
+    fi
+    echo "→ Verifying AWS credentials"
+    aws sts get-caller-identity --output text >/dev/null
+    ;;
+
+  builder)
+    echo "→ node deploy/setup-builder-agent.mjs"
+    # Capture stdout so we can extract BUILDER_AGENT_ID and append it to .env.local.
+    # The Build API reads process.env.BUILDER_AGENT_ID; without persisting it the
+    # /build page returns 503 even after a successful deploy.
+    BUILDER_LOG=$(mktemp)
+    trap 'rm -f "$BUILDER_LOG"' EXIT
+    node deploy/setup-builder-agent.mjs | tee "$BUILDER_LOG"
+    BUILDER_ID=$(grep -E '^[[:space:]]*BUILDER_AGENT_ID=' "$BUILDER_LOG" | head -1 | sed -E 's/^[[:space:]]*BUILDER_AGENT_ID=//' | tr -d '[:space:]')
+    if [[ -n "$BUILDER_ID" ]]; then
+      if grep -q '^BUILDER_AGENT_ID=' .env.local 2>/dev/null; then
+        # macOS sed compat: write through a temp file
+        sed "s|^BUILDER_AGENT_ID=.*|BUILDER_AGENT_ID=$BUILDER_ID|" .env.local > .env.local.tmp && mv .env.local.tmp .env.local
+      else
+        echo "BUILDER_AGENT_ID=$BUILDER_ID" >> .env.local
+      fi
+      chmod 600 .env.local
+      echo "→ Persisted BUILDER_AGENT_ID=$BUILDER_ID to .env.local"
+    else
+      echo "✗ Could not parse BUILDER_AGENT_ID from setup-builder-agent.mjs output" >&2
+      echo "  /build will return 503 until BUILDER_AGENT_ID is set in .env.local" >&2
+      exit 1
+    fi
+    ;;
+
+  workflow)
+    : "${TICKET_PROVIDER:?TICKET_PROVIDER must be 'dynamodb' or 'jira'}"
+
+    if [[ "$TICKET_PROVIDER" == "dynamodb" ]]; then
+      echo "→ ./scripts/create-dynamodb-tables.sh --with-tickets"
+      ./scripts/create-dynamodb-tables.sh --with-tickets
+    else
+      echo "→ ./scripts/create-dynamodb-tables.sh"
+      ./scripts/create-dynamodb-tables.sh
+    fi
+
+    echo "→ Ensuring artifact bucket exists"
+    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    BUCKET="agentcore-hub-artifacts-${ACCOUNT_ID}-${AWS_REGION}"
+    if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+      echo "  Bucket $BUCKET already exists, skipping"
+    else
+      aws s3 mb "s3://$BUCKET" --region "$AWS_REGION"
+    fi
+
+    echo "→ bash deploy/setup-runtime-role.sh"
+    bash deploy/setup-runtime-role.sh
+
+    echo "→ node deploy/setup-tickets-lambda.mjs"
+    node deploy/setup-tickets-lambda.mjs
+
+    echo "→ deploy/runtime-agent/build-and-push.sh"
+    (cd deploy/runtime-agent && ./build-and-push.sh)
+
+    echo "→ deploy/runtime-agent/deploy-fleet.sh"
+    (cd deploy/runtime-agent && ./deploy-fleet.sh)
+    ;;
+
+  evaluations)
+    echo "→ deploy/evaluations/setup-evaluations.sh"
+    bash deploy/evaluations/setup-evaluations.sh
+
+    echo "→ deploy/continuous-improvement/deploy-all.sh"
+    bash deploy/continuous-improvement/deploy-all.sh
+    ;;
+
+  *)
+    echo "Unknown module: $MODULE" >&2
+    echo "Valid: core, builder, workflow, evaluations" >&2
+    exit 2
+    ;;
+esac
+
+echo "── Module $MODULE: deploy steps complete ───────────────────"

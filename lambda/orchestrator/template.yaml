@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AgentCore Hub Orchestrator — Event-driven workflow engine via DynamoDB Streams.
+  Replaces the in-process Next.js orchestration with Lambda + Streams.
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 900  # 15 min max for long agent invocations
+    MemorySize: 512
+    Environment:
+      Variables:
+        AWS_REGION_OVERRIDE: !Ref AWS::Region
+        TICKETS_TABLE: !Ref TicketsTableName
+        WORKFLOWS_TABLE: !Ref WorkflowsTableName
+        EVENTS_TABLE: !Ref EventsTableName
+        ARTIFACT_BUCKET: !Ref ArtifactBucket
+        GITHUB_LAMBDA: !Ref GitHubLambdaName
+        EVENT_BUS: !Ref EventBus
+        PROJECT_KEY: TEAM
+
+Parameters:
+  TicketsTableName:
+    Type: String
+    Default: agentcore-hub-tickets
+    Description: Existing DynamoDB table for tickets (must have Streams enabled)
+
+  WorkflowsTableName:
+    Type: String
+    Default: agentcore-hub-workflows
+    Description: Existing DynamoDB table for workflow metadata
+
+  EventsTableName:
+    Type: String
+    Default: agentcore-hub-events
+    Description: Existing DynamoDB table for events (dashboard polling)
+
+  ArtifactBucket:
+    Type: String
+    Default: your-artifact-bucket-name
+    Description: S3 bucket for workflow artifacts
+
+  GitHubLambdaName:
+    Type: String
+    Default: agentcore-hub-github-mcp
+    Description: Lambda function name for GitHub API calls
+
+  EventBus:
+    Type: String
+    Default: default
+    Description: EventBridge bus name for publishing workflow events
+
+Resources:
+  # ─── Tables are pre-existing (not managed by this stack) ───────────────────────
+  # Create with: scripts/create-dynamodb-tables.sh
+  # agentcore-hub-tickets: PK=ticketId (S), GSI: parentId-index, assignee-index, Streams=NEW_AND_OLD_IMAGES
+  # agentcore-hub-workflows: PK=workflowId (S), GSI: epicId-index — MUST be "workflowId" not "id"
+  # agentcore-hub-events: PK=workflowId (S), SK=eventId (S), TTL on "ttl"
+  #
+  # ─── CRITICAL: Dependencies ────────────────────────────────────────────────────
+  # agent-invoker.mjs requires @smithy/signature-v4 and @aws-crypto/sha256-js for
+  # Runtime agent invocation (SigV4 signing). These MUST be in node_modules when
+  # deploying. Run: npm install --omit=dev BEFORE creating the zip.
+  # Deploy script: ./deploy.sh (handles install + zip + upload)
+
+  # ─── Orchestration Lambda ──────────────────────────────────────────────────────
+  OrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agentcore-hub-orchestrator
+      Handler: index.handler
+      CodeUri: .
+      Timeout: 60  # Orchestrator is fast — just DynamoDB reads/writes + async invoke
+      MemorySize: 256
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TicketsTableName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WorkflowsTableName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTableName
+        - DynamoDBStreamReadPolicy:
+            TableName: !Ref TicketsTableName
+            StreamName: "*"
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GitHubLambdaName
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AgentInvokerFunction
+        - S3ReadPolicy:
+            BucketName: !Ref ArtifactBucket
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBus
+      Events:
+        DynamoDBStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TicketsTableName}/stream/*"
+            StartingPosition: LATEST
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 1
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName":["INSERT","MODIFY"]}'
+
+  # ─── Agent Invoker Lambda (async, long-running) ────────────────────────────────
+  AgentInvokerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agentcore-hub-agent-invoker
+      Handler: agent-invoker.handler
+      CodeUri: .
+      Timeout: 900  # 15 min for long agent runs
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TicketsTableName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WorkflowsTableName
+        - S3CrudPolicy:
+            BucketName: !Ref ArtifactBucket
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBus
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock-agent-runtime:*
+                - bedrock-agentcore:*
+              Resource: "*"
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GitHubLambdaName
+
+  # ─── EventBridge Rule (route events to dashboard) ──────────────────────────────
+  WorkflowEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: agentcore-hub-workflow-events
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source:
+          - agentcore-hub.orchestrator
+          - agentcore-hub.agent-invoker
+      State: ENABLED
+      Targets:
+        - Id: EventsTableWriter
+          Arn: !GetAtt EventsWriterFunction.Arn
+
+  # ─── Lightweight Lambda to write EventBridge events to DynamoDB for polling ────
+  EventsWriterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agentcore-hub-events-writer
+      Handler: events-writer.handler
+      CodeUri: .
+      Timeout: 10
+      MemorySize: 128
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTableName
+
+  EventsWriterPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventsWriterFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WorkflowEventsRule.Arn
+
+Outputs:
+  OrchestratorFunctionArn:
+    Description: Orchestrator Lambda ARN
+    Value: !GetAtt OrchestratorFunction.Arn
+
+  AgentInvokerFunctionArn:
+    Description: Agent Invoker Lambda ARN
+    Value: !GetAtt AgentInvokerFunction.Arn

@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AgentCore Hub — Architecture</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  background:#ffffff;
+  color:#232F3E;
+  font-family:'Inter',-apple-system,'Segoe UI','Helvetica Neue',Arial,sans-serif;
+  min-height:100vh;
+  padding:48px 32px 64px;
+  -webkit-font-smoothing:antialiased;
+}
+
+/* HEADER */
+.header{text-align:center;margin-bottom:36px}
+.eyebrow{font-size:11px;font-weight:600;letter-spacing:3px;text-transform:uppercase;color:#FF9900;margin-bottom:10px}
+.title{font-size:32px;font-weight:700;color:#232F3E;letter-spacing:-0.4px;line-height:1.1;margin-bottom:8px}
+.subtitle{font-size:15px;color:#545B64;font-weight:400;line-height:1.5}
+
+/* STAGE — full-bleed area for laying out items absolutely */
+.stage{
+  position:relative;
+  max-width:1320px;
+  margin:60px auto 0;
+  /* Big enough to hold everything */
+  height:760px;
+}
+
+/* AWS Cloud boundary */
+.aws-cloud{
+  position:absolute;
+  left:130px;right:130px;
+  top:60px;bottom:80px;
+  border:1.5px solid #232F3E;
+  border-radius:8px;
+  background:#fff;
+}
+.aws-cloud-label{
+  position:absolute;
+  top:10px;left:14px;
+  display:flex;align-items:center;gap:8px;
+  font-size:12px;font-weight:600;color:#232F3E;
+}
+.aws-cloud-label img{width:22px;height:22px}
+
+/* Region inside AWS Cloud */
+.region{
+  position:absolute;
+  left:18px;right:18px;
+  top:42px;bottom:18px;
+  border:1.5px dashed #00A4A6;
+  border-radius:8px;
+}
+.region-label{
+  position:absolute;
+  top:8px;left:14px;
+  font-size:11px;font-weight:600;color:#00A4A6;
+}
+
+/* Subgroup containers (Hub + Fleet) */
+.subgroup{
+  position:absolute;
+  border:1px dashed #879196;
+  border-radius:6px;
+  background:#FAFBFC;
+}
+.subgroup-label{
+  position:absolute;
+  top:8px;left:12px;
+  font-size:10px;font-weight:700;color:#545B64;
+  letter-spacing:1.5px;text-transform:uppercase;
+}
+
+/* Hub on the left, Fleet on the right */
+.hub-group{
+  left:36px;top:52px;
+  width:300px;bottom:30px;
+  padding:26px 16px 16px;
+}
+.nextjs-icon{
+  width:60px;height:60px;
+  display:flex;align-items:center;justify-content:center;
+}
+.nextjs-icon svg{width:60px;height:60px;display:block}
+.fleet-group{
+  right:36px;top:52px;
+  width:430px;bottom:30px;
+  padding:30px 14px 14px;
+}
+
+/* Resource layouts */
+.hub-stack{
+  display:flex;flex-direction:column;align-items:center;gap:24px;
+  height:100%;justify-content:center;
+}
+.hub-row{
+  display:flex;gap:24px;justify-content:center;
+}
+.fleet-grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:18px 16px;
+  justify-items:center;
+  align-content:center;
+  height:100%;
+}
+
+/* Resource = icon + caption */
+.resource{
+  display:flex;flex-direction:column;align-items:center;
+  text-align:center;
+  width:120px;
+}
+.resource img{width:60px;height:60px;display:block}
+.resource .res-name{
+  margin-top:6px;
+  font-size:12px;font-weight:600;color:#232F3E;line-height:1.25;
+}
+.resource .res-sub{
+  font-size:10.5px;color:#545B64;line-height:1.3;margin-top:1px;
+}
+
+/* User (left of cloud) */
+.user-block{
+  position:absolute;
+  left:8px;top:50%;transform:translateY(-50%);
+  display:flex;flex-direction:column;align-items:center;
+  width:96px;z-index:5;
+}
+.user-block img{width:56px;height:56px}
+.user-block .res-name{margin-top:6px;font-size:12px;font-weight:600;color:#232F3E}
+.user-block .res-sub{font-size:10.5px;color:#545B64;margin-top:2px;text-align:center}
+
+/* Jira (right of cloud) */
+.external-block{
+  position:absolute;
+  right:8px;top:50%;transform:translateY(-50%);
+  display:flex;flex-direction:column;align-items:center;
+  width:104px;z-index:5;
+}
+.external-block .ext-icon{
+  width:64px;height:64px;
+  border-radius:8px;
+  background:#0052CC;
+  display:flex;align-items:center;justify-content:center;
+  color:#fff;font-weight:800;font-size:16px;letter-spacing:1px;
+}
+.external-block .res-name{margin-top:6px;font-size:12px;font-weight:600;color:#232F3E}
+.external-block .res-sub{font-size:10.5px;color:#545B64;margin-top:2px;text-align:center}
+.external-block .ext-tag{
+  font-size:9px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;
+  color:#545B64;background:#F2F3F3;border:1px solid #D5DBDB;
+  padding:2px 6px;border-radius:3px;margin-top:6px;
+}
+
+/* CONNECTOR overlay */
+.connectors{
+  position:absolute;top:0;left:0;
+  width:100%;height:100%;
+  pointer-events:none;
+  z-index:3;
+}
+.conn-label{
+  font-family:'Inter',sans-serif;
+  font-size:11px;font-weight:600;
+  fill:#232F3E;
+}
+
+/* Bottom legend + summary */
+.legend{
+  margin:28px auto 0;
+  max-width:1100px;
+  display:flex;justify-content:center;gap:36px;flex-wrap:wrap;
+  font-size:12px;color:#545B64;
+}
+.legend-item{display:flex;align-items:center;gap:10px}
+.legend-line{width:42px;height:2px}
+.legend-line.solid{background:#232F3E}
+.legend-line.dashed{
+  background:repeating-linear-gradient(90deg,#232F3E 0 6px,transparent 6px 11px);
+  height:2px;
+}
+
+.notes{
+  margin:24px auto 0;
+  max-width:1100px;
+  background:#F8F9FA;
+  border-left:3px solid #FF9900;
+  border-radius:4px;
+  padding:18px 24px;
+}
+.notes-title{
+  font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
+  color:#232F3E;margin-bottom:10px;
+}
+.notes ul{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:6px}
+.notes li{
+  font-size:13px;color:#3B4750;line-height:1.5;
+  display:flex;align-items:flex-start;gap:8px;
+}
+.notes li::before{
+  content:"";flex-shrink:0;
+  width:5px;height:5px;border-radius:50%;
+  background:#FF9900;margin-top:8px;
+}
+.notes li strong{color:#232F3E;font-weight:700}
+.notes li code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:#fff;border:1px solid #E5E7EB;padding:1px 5px;border-radius:3px;color:#232F3E}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="eyebrow">AgentCore Hub · Architecture</div>
+  <div class="title">What's in the box</div>
+  <div class="subtitle">A small Next.js + Lambda app, an agent fleet on Bedrock AgentCore, and Jira as the workflow bus.</div>
+</div>
+
+<div class="stage" id="stage">
+
+  <!-- USER (left, outside cloud) -->
+  <div class="user-block" id="user-block">
+    <img src="aws-icons/user.svg" alt="User">
+    <div class="res-name">User</div>
+    <div class="res-sub">Submits request</div>
+  </div>
+
+  <!-- JIRA (right, outside cloud) -->
+  <div class="external-block" id="external-block">
+    <div class="ext-icon">JIRA</div>
+    <div class="res-name">Jira</div>
+    <div class="res-sub">Workflow bus</div>
+    <div class="ext-tag">External</div>
+  </div>
+
+  <!-- AWS CLOUD -->
+  <div class="aws-cloud" id="aws-cloud">
+    <div class="aws-cloud-label">
+      <img src="aws-icons/aws-cloud.svg" alt="AWS Cloud">
+      <span>AWS Cloud</span>
+    </div>
+
+    <div class="region">
+      <div class="region-label">Region · us-east-1</div>
+
+      <!-- HUB SUBGROUP -->
+      <div class="subgroup hub-group" id="hub-group">
+        <div class="subgroup-label">AgentCore Hub · the app</div>
+        <div class="hub-stack">
+          <div class="resource" id="res-lambda">
+            <img src="aws-icons/lambda.svg" alt="AWS Lambda">
+            <div class="res-name">Orchestrator</div>
+            <div class="res-sub">AWS Lambda</div>
+          </div>
+          <div class="hub-row">
+            <div class="resource" id="res-workflows">
+              <img src="aws-icons/dynamodb.svg" alt="DynamoDB">
+              <div class="res-name">workflows</div>
+              <div class="res-sub">DynamoDB</div>
+            </div>
+            <div class="resource" id="res-events">
+              <img src="aws-icons/dynamodb.svg" alt="DynamoDB">
+              <div class="res-name">events</div>
+              <div class="res-sub">DynamoDB</div>
+            </div>
+          </div>
+          <div class="resource" id="res-nextjs">
+            <div class="nextjs-icon">
+              <svg viewBox="0 0 180 180" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <mask id="m" style="mask-type:alpha" maskUnits="userSpaceOnUse" x="0" y="0" width="180" height="180">
+                  <circle cx="90" cy="90" r="90" fill="black"/>
+                </mask>
+                <g mask="url(#m)">
+                  <circle cx="90" cy="90" r="90" fill="black"/>
+                  <path d="M149.508 157.52L69.142 54H54v71.97h12.114V69.384l73.85 95.461a90.92 90.92 0 0 0 9.544-7.325z" fill="url(#g1)"/>
+                  <rect x="115" y="54" width="12" height="72" fill="url(#g2)"/>
+                </g>
+                <defs>
+                  <linearGradient id="g1" x1="109" y1="116.5" x2="144.5" y2="160.5" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="white"/>
+                    <stop offset="1" stop-color="white" stop-opacity="0"/>
+                  </linearGradient>
+                  <linearGradient id="g2" x1="121" y1="54" x2="120.799" y2="106.875" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="white"/>
+                    <stop offset="1" stop-color="white" stop-opacity="0"/>
+                  </linearGradient>
+                </defs>
+              </svg>
+            </div>
+            <div class="res-name">Web UI</div>
+            <div class="res-sub">Next.js · App Runner</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- FLEET SUBGROUP -->
+      <div class="subgroup fleet-group" id="fleet-group">
+        <div class="subgroup-label">Agent Fleet · Bedrock AgentCore Runtime</div>
+        <div class="fleet-grid">
+          <div class="resource"><img src="aws-icons/bedrock-agentcore.svg" alt=""><div class="res-name">Requirements</div></div>
+          <div class="resource"><img src="aws-icons/bedrock-agentcore.svg" alt=""><div class="res-name">Product</div></div>
+          <div class="resource"><img src="aws-icons/bedrock-agentcore.svg" alt=""><div class="res-name">Design</div></div>
+          <div class="resource"><img src="aws-icons/bedrock-agentcore.svg" alt=""><div class="res-name">Architect</div></div>
+          <div class="resource"><img src="aws-icons/bedrock-agentcore.svg" alt=""><div class="res-name">Frontend</div></div>
+          <div class="resource"><img src="aws-icons/bedrock-agentcore.svg" alt=""><div class="res-name">Backend</div></div>
+          <div class="resource" style="grid-column:1 / -1"><img src="aws-icons/bedrock-agentcore.svg" alt=""><div class="res-name">QA</div></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- CONNECTORS -->
+  <svg class="connectors" id="connectors"></svg>
+
+</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-line solid"></div><span>Synchronous request / invoke / write</span></div>
+  <div class="legend-item"><div class="legend-line dashed"></div><span>Asynchronous webhook</span></div>
+</div>
+
+<div class="notes">
+  <div class="notes-title">How it fits together</div>
+  <ul>
+    <li><strong>The Hub is small</strong> — a Next.js web UI, one Lambda (orchestrator), and two DynamoDB tables: <code>workflows</code> for state, <code>events</code> for traces.</li>
+    <li><strong>The fleet is stateless</strong> — agents on Bedrock AgentCore Runtime are invoked on demand with a payload; they read and write through Jira.</li>
+    <li><strong>Jira is the bus</strong> — every state change flows through tickets. Jira webhooks fire back into the Lambda to drive the next step.</li>
+  </ul>
+</div>
+
+<script>
+(function(){
+  const svg   = document.getElementById('connectors');
+  const stage = document.getElementById('stage');
+
+  function rect(el){
+    const r = el.getBoundingClientRect();
+    const c = stage.getBoundingClientRect();
+    return { x:r.left-c.left, y:r.top-c.top, w:r.width, h:r.height,
+             cx:r.left-c.left+r.width/2, cy:r.top-c.top+r.height/2,
+             right:r.right-c.left, bottom:r.bottom-c.top };
+  }
+
+  function makeMarker(){
+    const m = document.createElementNS('http://www.w3.org/2000/svg','marker');
+    m.setAttribute('id','arrow');
+    m.setAttribute('viewBox','0 0 10 10');
+    m.setAttribute('refX','8');
+    m.setAttribute('refY','5');
+    m.setAttribute('markerWidth','6');
+    m.setAttribute('markerHeight','6');
+    m.setAttribute('orient','auto-start-reverse');
+    const p = document.createElementNS('http://www.w3.org/2000/svg','path');
+    p.setAttribute('d','M 0 0 L 10 5 L 0 10 z');
+    p.setAttribute('fill','#232F3E');
+    m.appendChild(p);
+    const defs = document.createElementNS('http://www.w3.org/2000/svg','defs');
+    defs.appendChild(m);
+    svg.appendChild(defs);
+  }
+
+  function path(d, dashed){
+    const p = document.createElementNS('http://www.w3.org/2000/svg','path');
+    p.setAttribute('d', d);
+    p.setAttribute('stroke', '#232F3E');
+    p.setAttribute('stroke-width','1.5');
+    p.setAttribute('fill','none');
+    p.setAttribute('marker-end','url(#arrow)');
+    p.setAttribute('stroke-linejoin','round');
+    if(dashed) p.setAttribute('stroke-dasharray','6 5');
+    svg.appendChild(p);
+  }
+
+  function label(x, y, text, opts={}){
+    const padding = 8;
+    const charW = 6.2;
+    const w = text.length * charW + padding*2;
+    const h = 18;
+    const bg = document.createElementNS('http://www.w3.org/2000/svg','rect');
+    bg.setAttribute('x', x - w/2);
+    bg.setAttribute('y', y - h/2);
+    bg.setAttribute('width', w);
+    bg.setAttribute('height', h);
+    bg.setAttribute('fill','#ffffff');
+    if(opts.box){
+      bg.setAttribute('stroke','#D5DBDB');
+      bg.setAttribute('rx','3');
+    }
+    svg.appendChild(bg);
+    const t = document.createElementNS('http://www.w3.org/2000/svg','text');
+    t.setAttribute('class','conn-label');
+    t.setAttribute('x', x);
+    t.setAttribute('y', y + 1);
+    t.setAttribute('text-anchor','middle');
+    t.setAttribute('dominant-baseline','middle');
+    t.textContent = text;
+    svg.appendChild(t);
+  }
+
+  function draw(){
+    while(svg.firstChild) svg.removeChild(svg.firstChild);
+    makeMarker();
+
+    svg.setAttribute('viewBox', `0 0 ${stage.clientWidth} ${stage.clientHeight}`);
+    svg.setAttribute('width', stage.clientWidth);
+    svg.setAttribute('height', stage.clientHeight);
+
+    const user   = rect(document.getElementById('user-block'));
+    const ext    = rect(document.getElementById('external-block'));
+    const lambda = rect(document.getElementById('res-lambda'));
+    const fleet  = rect(document.getElementById('fleet-group'));
+    const cloud  = rect(document.getElementById('aws-cloud'));
+
+    // Vertical center of the row Lambda sits on
+    const lambdaIconCY = lambda.y + 30; // approx icon center
+
+    // 1) USER -> LAMBDA — orthogonal: right from user, up to lambda icon row, into lambda left edge
+    {
+      const x1 = user.right + 4, y1 = user.cy;
+      const x2 = lambda.x + 28, y2 = lambdaIconCY; // enter at left edge of icon
+      // elbow: x1,y1 -> midX, y1 -> midX, y2 -> x2,y2
+      const midX = (x1 + x2) / 2;
+      path(`M ${x1} ${y1} H ${midX} V ${y2} H ${x2 - 6}`);
+      label(midX, y1 - 12, 'submit request');
+    }
+
+    // 2) LAMBDA -> FLEET — clean horizontal from lambda's right edge to fleet's left edge
+    {
+      const x1 = lambda.x + lambda.w - 28, y1 = lambdaIconCY;
+      const x2 = fleet.x - 2, y2 = lambdaIconCY;
+      // route: out of lambda right, across to fleet left
+      // since lambda is in a stack inside hub, go right across the gap
+      const hub = rect(document.getElementById('hub-group'));
+      const startX = hub.x + hub.w + 4;
+      path(`M ${startX - 6} ${y1} H ${x2 - 6}`);
+      // small stub from lambda icon to hub edge
+      path(`M ${x1 + 6} ${y1} H ${startX - 6}`);
+      label((startX + x2) / 2, y1 - 12, 'invoke');
+    }
+
+    // 3) FLEET -> JIRA — horizontal, fleet's right edge to jira's left edge
+    {
+      const y = lambdaIconCY;
+      const x1 = fleet.x + fleet.w + 2;
+      // need to exit fleet group, then exit aws-cloud right edge, then arrive at ext
+      const cloudRight = cloud.x + cloud.w;
+      const x2 = ext.x - 4;
+      path(`M ${x1} ${y} H ${x2 - 6}`);
+      label((x1 + x2) / 2, y - 12, 'create / update tickets');
+    }
+
+    // 4) JIRA -> LAMBDA  webhook (dashed) — clean over-the-top arc
+    //    From Jira top to AWS Cloud top, across, down into Lambda top
+    {
+      const startX = ext.cx;
+      const startY = ext.y - 4;                 // exit top of Jira
+      const topY   = cloud.y - 26;               // route line above the cloud
+      const endX   = lambda.x + lambda.w / 2;    // lambda icon center X
+      const endY   = lambda.y - 4;               // enter top of lambda
+      path(`M ${startX} ${startY} V ${topY} H ${endX} V ${endY - 6}`, true);
+      label((startX + endX) / 2, topY - 12, 'webhook · drives next step');
+    }
+  }
+
+  window.addEventListener('load', draw);
+  window.addEventListener('resize', draw);
+  setTimeout(draw, 100);
+  setTimeout(draw, 400);
+})();
+</script>
+
+</body>
+</html>

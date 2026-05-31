@@ -1,0 +1,43 @@
+{
+  "created": "2026-05-22",
+  "sampling_rate": "100%",
+  "judge_model": "us.anthropic.claude-opus-4-7",
+  "evaluators": [
+    "Builtin.ToolSelectionAccuracy (TOOL_CALL)",
+    "Builtin.ToolParameterAccuracy (TOOL_CALL)",
+    "Builtin.InstructionFollowing (TRACE)",
+    "Builtin.GoalSuccessRate (SESSION)",
+    "Builtin.Correctness (TRACE)",
+    "Builtin.Coherence (TRACE)",
+    "Builtin.Faithfulness (TRACE)",
+    "Builtin.Helpfulness (TRACE)",
+    "Builtin.Conciseness (TRACE)",
+    "dependency_chain_compliance_online-mbLh2kEFhw (SESSION, custom)"
+  ],
+  "custom_evaluators": {
+    "dependency_chain_compliance_online": "dependency_chain_compliance_online-mbLh2kEFhw",
+    "dependency_chain_compliance_ondemand": "dependency_chain_compliance-VyBv7H2bCi"
+  },
+  "configs": {
+    "eval_analytics_designer": "eval_analytics_designer-BUOZCyDSf6",
+    "eval_android_designer": "eval_android_designer-4ywi426Wu4",
+    "eval_api_dev": "eval_api_dev-jZGdJO2DhI",
+    "eval_backend_designer": "eval_backend_designer-dlukek6JFK",
+    "eval_backend_dev": "eval_backend_dev-LN6zQzBMWf",
+    "eval_ci_agent": "eval_ci_agent-Z9ekM25zyL",
+    "eval_frontend_designer": "eval_frontend_designer-pTrhXF97Vr",
+    "eval_frontend_dev": "eval_frontend_dev-zocWDHHT12",
+    "eval_ios_designer": "eval_ios_designer-wvJrH0C01G",
+    "eval_legal_compliance": "eval_legal_compliance-oWPIof4raR",
+    "eval_localization": "eval_localization-YNl3ATHX6y",
+    "eval_qa_verifier": "eval_qa_verifier-l0AjstEU79",
+    "eval_requirements_analyst": "eval_requirements_analyst-PxIGC163VI",
+    "eval_security_reviewer": "eval_security_reviewer-z8G9tRApm8"
+  },
+  "notes": {
+    "trajectory_evaluators": "TrajectoryInOrderMatch/ExactOrderMatch/AnyOrderMatch require reference inputs — only usable in on-demand evaluations, not online",
+    "custom_evaluator_note": "dependency_chain_compliance (on-demand version) uses {actual_tool_trajectory} placeholder — use for scheduled batch evaluations",
+    "dependency_chain_agents": "Only requirements_analyst, qa_verifier, and ci_agent have the custom evaluator (they create/reassign tickets). Other agents have 10 built-in evaluators instead.",
+    "max_evaluators": "API limit is 10 evaluators per config. Agents with custom evaluator drop Conciseness to stay at 10."
+  }
+}
