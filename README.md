@@ -23,6 +23,27 @@ deploy checklists, and exact removal steps.
 
 - Node.js 18+
 - AWS credentials configured (via `~/.aws/credentials`, env vars, or IAM role)
+- [Claude Code](https://claude.com/claude-code) (only for the guided `/setup` quick start below)
+
+## Quick start with `/setup` (recommended)
+
+This repo ships a Claude Code plugin that turns the manual stages below into a guided conversation. From inside Claude Code:
+
+```bash
+git clone https://github.com/tycenjmccann/agentcore-hub.git
+cd agentcore-hub
+```
+
+Then in Claude Code:
+
+```
+/plugin install .
+/setup
+```
+
+`/setup` asks 4–6 questions, detects your AWS account/region, writes `.env.local`, and runs only the deploy scripts the modules you picked actually need — verifying each phase before moving on. Safe to re-run; never overwrites `.env.local` (backs up to `.env.local.bak` first). See [`.claude-plugin/README.md`](.claude-plugin/README.md) for the full plugin design.
+
+If you'd rather drive the install by hand (or you're not using Claude Code), follow the progressive stages below.
 
 ## Setup (Progressive Stages)
 
