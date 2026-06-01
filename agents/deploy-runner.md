@@ -1,6 +1,6 @@
 ---
 name: deploy-runner
-description: Runs a long-lived AgentCore Hub deploy script (5–15 min) and reports a short summary. Use this from the /setup skill so multi-MB CloudFormation/ECR output doesn't pollute the parent conversation.
+description: Runs a long-lived AgentCore Hub deploy script (5–15 min) and reports a short summary. Use this from the /agentcore-hub:setup skill so multi-MB CloudFormation/ECR output doesn't pollute the parent conversation.
 tools: Bash, Read
 ---
 

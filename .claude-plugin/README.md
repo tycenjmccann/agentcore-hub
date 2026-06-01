@@ -4,7 +4,7 @@ A Claude Code plugin that turns AgentCore Hub setup from "read a 900-line README
 
 ## What it does
 
-Run `/setup` from inside an `agentcore-hub` clone. The plugin:
+Run `/agentcore-hub:setup` from inside an `agentcore-hub` clone. The plugin:
 
 1. Asks 4–6 questions to figure out which modules you want.
 2. Detects your AWS account/region from existing credentials.
@@ -25,16 +25,18 @@ The plugin reasons about four modules (see `docs/MODULES.md` for the full breakd
 
 ```
 .claude-plugin/
-├── plugin.json                # plugin manifest
-├── skills/
-│   └── setup/
-│       └── SKILL.md           # the /setup conversation flow
-├── agents/
-│   └── deploy-runner.md       # subagent for long-running deploys (5–15 min)
-└── bin/
-    ├── apply-env.sh           # writes .env.local from a JSON answer blob
-    ├── run-module.sh <module> # the one place that knows script order per module
-    └── verify-module.sh <module>
+└── plugin.json                # plugin manifest (must live here)
+
+# The following live at the *plugin root*, not inside .claude-plugin/:
+skills/
+└── setup/
+    └── SKILL.md               # the /agentcore-hub:setup conversation flow
+agents/
+└── deploy-runner.md           # subagent for long-running deploys (5–15 min)
+.claude-plugin/bin/
+├── apply-env.sh               # writes .env.local from a JSON answer blob
+├── run-module.sh <module>     # the one place that knows script order per module
+└── verify-module.sh <module>
 ```
 
 `bin/run-module.sh` is the single source of truth for "to deploy module X, run scripts A, B, C." If a script is added or removed, this file is the only one to update.
@@ -49,7 +51,7 @@ claude plugin validate . --strict
 claude --plugin-dir .
 ```
 
-Once Claude Code starts, type `/setup` at the prompt. The skill at `skills/setup/SKILL.md` and the agent at `agents/deploy-runner.md` are auto-discovered from their default directories — `plugin.json` only carries metadata.
+Once Claude Code starts, type `/agentcore-hub:setup` at the prompt. The skill at `skills/setup/SKILL.md` and the agent at `agents/deploy-runner.md` are auto-discovered from their default directories at the plugin root (Claude Code refuses to load components nested under `.claude-plugin/` itself) — `plugin.json` only carries metadata.
 
 **Iterating on the plugin during development:** edits to `SKILL.md` take effect immediately in the running session. Edits to `agents/`, `bin/*.sh`, or `plugin.json` require `/reload-plugins` (or restarting `claude --plugin-dir .`).
 
@@ -63,7 +65,7 @@ Once Claude Code starts, type `/setup` at the prompt. The skill at `skills/setup
 
 ## Re-runs
 
-`/setup` is safe to re-run. Underlying scripts are idempotent and the plugin checks for existing resources before creating new ones.
+`/agentcore-hub:setup` is safe to re-run. Underlying scripts are idempotent and the plugin checks for existing resources before creating new ones.
 
 ---
 

@@ -52,7 +52,19 @@ aws s3 sync "$PROMPTS_DIR" "s3://${ARTIFACT_BUCKET}/prompts/" \
   --only-show-errors
 
 if [[ "$COUNT" == "14" ]]; then
-  exec "$SCRIPT_DIR/deploy-fleet.sh"
+  # deploy-fleet.sh refreshes the local agents.json (via refresh-agents-json.sh)
+  # but does not upload it to S3. We do that ourselves so the orchestrator/Jira
+  # Lambdas (DL-023) can resolve the new runtime ARNs at next cold start.
+  "$SCRIPT_DIR/deploy-fleet.sh"
+  echo ""
+  echo "→ Uploading agents.json to s3://${ARTIFACT_BUCKET}/config/agents.json"
+  aws s3 cp "$AGENTS_JSON" "s3://${ARTIFACT_BUCKET}/config/agents.json" \
+    --region "$AWS_REGION" \
+    --content-type application/json \
+    --only-show-errors
+  echo ""
+  echo "── Topology deploy complete (14 runtime mode) ──────────"
+  exit 0
 fi
 
 # ── 1- and 4-runtime modes: deploy anchors, then remap agents.json ──────────

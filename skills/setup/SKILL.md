@@ -3,7 +3,7 @@ name: setup
 description: Guided AgentCore Hub setup. Asks the user which modules they want, generates .env.local, and runs only the deploy scripts those modules need — with a verification gate between phases.
 ---
 
-# /setup — AgentCore Hub guided installer
+# /agentcore-hub:setup — AgentCore Hub guided installer
 
 You are running this skill from the root of an `agentcore-hub` clone. Your job is to install AgentCore Hub for the user by:
 
@@ -79,7 +79,7 @@ This install can deploy four modules. You'll always get Core; the rest are optio
 
 Then ask via `AskUserQuestion`:
 
-- **question:** "Which modules should this install deploy? (You can re-run /setup later to add more.)"
+- **question:** "Which modules should this install deploy? (You can re-run /agentcore-hub:setup later to add more.)"
 - **header:** "Modules"
 - **options** (single-select):
   1. *Core only — explore agents I've already deployed* — `{core}`. No new AWS deploys beyond credentials check.
@@ -119,8 +119,8 @@ runtime loads the right one per invocation, caching it for the life of the
 microVM. Edit a prompt in S3 and the next session picks it up — no redeploy.
 
 The setup is designed to grow. When a team is ready to own their agent —
-different model, separate scaling, isolated logs and metrics — re-run /setup
-and split that persona out. The end-state most teams reach is one runtime per
+different model, separate scaling, isolated logs and metrics — re-run
+/agentcore-hub:setup and split that persona out. The end-state most teams reach is one runtime per
 team-owned agent. You don't have to start there.
 ```
 
@@ -256,7 +256,7 @@ After this step, run Evaluations (if selected) so it picks up the freshly writte
 
 ## Re-runs
 
-The user may run `/setup` more than once. Before any module runs, `run-module.sh` should detect what already exists and skip steps that are already done (the underlying scripts are idempotent — they exit 0 if the resource exists). Never wipe `.env.local`. Never delete AWS resources.
+The user may run `/agentcore-hub:setup` more than once. Before any module runs, `run-module.sh` should detect what already exists and skip steps that are already done (the underlying scripts are idempotent — they exit 0 if the resource exists). Never wipe `.env.local`. Never delete AWS resources.
 
 ---
 

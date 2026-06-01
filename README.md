@@ -23,9 +23,9 @@ deploy checklists, and exact removal steps.
 
 - Node.js 18+
 - AWS credentials configured (via `~/.aws/credentials`, env vars, or IAM role)
-- [Claude Code](https://claude.com/claude-code) (only for the guided `/setup` quick start below)
+- [Claude Code](https://claude.com/claude-code) (only for the guided `/agentcore-hub:setup` quick start below)
 
-## Quick start with `/setup` (recommended)
+## Quick start with `/agentcore-hub:setup` (recommended)
 
 This repo ships a Claude Code plugin that turns the manual stages below into a guided conversation. There's no install step — `--plugin-dir .` loads the plugin for that one session.
 
@@ -41,12 +41,12 @@ claude --plugin-dir .
 Then at the Claude Code prompt:
 
 ```
-/setup
+/agentcore-hub:setup
 ```
 
-That's it — no exit, no restart. `/setup` asks 4–6 questions, detects your AWS account/region, writes `.env.local`, and runs only the deploy scripts the modules you picked actually need — verifying each phase before moving on. Safe to re-run (Ctrl-C, then `/setup` again in a fresh `claude --plugin-dir .` session); never overwrites `.env.local` (backs up to `.env.local.bak` first). See [`.claude-plugin/README.md`](.claude-plugin/README.md) for the full plugin design.
+That's it — no exit, no restart. `/agentcore-hub:setup` asks 4–6 questions, detects your AWS account/region, writes `.env.local`, and runs only the deploy scripts the modules you picked actually need — verifying each phase before moving on. Safe to re-run (Ctrl-C, then `/agentcore-hub:setup` again in a fresh `claude --plugin-dir .` session); never overwrites `.env.local` (backs up to `.env.local.bak` first). See [`.claude-plugin/README.md`](.claude-plugin/README.md) for the full plugin design.
 
-> **Want it permanently?** Once a marketplace entry is published, `claude plugin install agentcore-hub-setup@<marketplace>` installs it across all sessions. Until then, use `--plugin-dir .` per session.
+> **Want it permanently?** Once a marketplace entry is published, `claude plugin install agentcore-hub@<marketplace>` installs it across all sessions. Until then, use `--plugin-dir .` per session.
 
 If you'd rather drive the install by hand (or you're not using Claude Code), follow the progressive stages below.
 
