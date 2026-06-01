@@ -12,7 +12,7 @@ Key advantages over Harness:
   - We control botocore read_timeout (1200s) so Opus can think without being killed
   - OTel auto-instrumentation is enabled via the CMD in deployment
   - Streaming responses via async generator entrypoint
-  - All gateway tools (S3, Jira, GitHub, SkillLoader, WorkflowOutput) via Lambda invocation
+  - All gateway tools (Tickets, GitHub MCP, WorkflowOutput) via Lambda invocation
 """
 
 import os
@@ -245,11 +245,9 @@ model = BedrockModel(
 lambda_client = boto3.client("lambda", region_name=REGION)
 
 # Tool Lambda function names (the gateway targets are backed by these)
-S3_TOOLS_LAMBDA = os.getenv("S3_TOOLS_LAMBDA", "agentcore-hub-s3-tools")
 TICKET_TOOLS_LAMBDA = os.getenv("TICKET_TOOLS_LAMBDA", "agentcore-hub-tickets")
 BUILDER_TOOLS_LAMBDA = os.getenv("BUILDER_TOOLS_LAMBDA", "agentcore-hub-builder-tools")
 WORKFLOW_OUTPUT_LAMBDA = os.getenv("WORKFLOW_OUTPUT_LAMBDA", "agentcore-hub-workflow-output")
-SKILL_LOADER_LAMBDA = os.getenv("SKILL_LOADER_LAMBDA", "agentcore-hub-skill-loader")
 
 # Set per-invocation by agent_invocation() — used by tools to pass context to Lambdas
 _CURRENT_WORKFLOW_ID = "unknown"
@@ -358,7 +356,7 @@ def S3Storage___read_object(key: str, bucket: str = "") -> str:
         key: Object key/path in the bucket
         bucket: S3 bucket name (defaults to the team artifact bucket)
     """
-    return _invoke_lambda(S3_TOOLS_LAMBDA, "S3Storage___read_object", {"bucket": bucket or ARTIFACT_BUCKET, "key": key})
+    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "S3Storage___read_object", {"bucket": bucket or ARTIFACT_BUCKET, "key": key})
 
 
 @tool
@@ -371,7 +369,7 @@ def S3Storage___write_object(key: str, content: str, bucket: str = "", content_t
         bucket: S3 bucket name (defaults to the team artifact bucket)
         content_type: MIME type of the content
     """
-    return _invoke_lambda(S3_TOOLS_LAMBDA, "S3Storage___write_object", {
+    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "S3Storage___write_object", {
         "bucket": bucket or ARTIFACT_BUCKET, "key": key, "content": content, "content_type": content_type
     })
 
@@ -384,7 +382,7 @@ def S3Storage___list_objects(prefix: str = "", bucket: str = "") -> str:
         prefix: Key prefix to filter by
         bucket: S3 bucket name (defaults to the team artifact bucket)
     """
-    return _invoke_lambda(S3_TOOLS_LAMBDA, "S3Storage___list_objects", {"bucket": bucket or ARTIFACT_BUCKET, "prefix": prefix})
+    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "S3Storage___list_objects", {"bucket": bucket or ARTIFACT_BUCKET, "prefix": prefix})
 
 
 # ─── Ticket Tools ────────────────────────────────────────────────────────────

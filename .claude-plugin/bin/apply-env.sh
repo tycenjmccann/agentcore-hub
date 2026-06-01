@@ -12,7 +12,7 @@
 #   "aws_account": "123456789012",
 #   "aws_region": "us-east-1",
 #   "aws_profile": "default",
-#   "deploy_target": "local" | "apprunner" | "skip",
+#   "deploy_target": "local" | "apprunner" | "byo" | "skip",
 #   "github": { "mode": "pat" | "mcp" | "skip", "pat": "...", "mcp_servers": "..." },
 #   "jira": { "site_url": "...", "email": "...", "api_token": "...", "project_key": "..." } | null
 # }

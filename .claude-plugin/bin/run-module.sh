@@ -114,6 +114,21 @@ case "$MODULE" in
     echo "→ Persisted AGENTCORE_ROLE_ARN to .env.local"
     export AGENTCORE_ROLE_ARN
 
+    echo "→ source deploy/setup-lambda-role.sh"
+    # Same source-not-bash pattern — orchestrator/deploy.sh and
+    # workflow-output/deploy.sh both read $LAMBDA_ROLE_ARN via deploy/config.sh.
+    # shellcheck disable=SC1091
+    source deploy/setup-lambda-role.sh
+    : "${LAMBDA_ROLE_ARN:?setup-lambda-role.sh did not export LAMBDA_ROLE_ARN}"
+    if grep -q '^LAMBDA_ROLE_ARN=' .env.local 2>/dev/null; then
+      sed "s|^LAMBDA_ROLE_ARN=.*|LAMBDA_ROLE_ARN=\"$LAMBDA_ROLE_ARN\"|" .env.local > .env.local.tmp && mv .env.local.tmp .env.local
+    else
+      echo "LAMBDA_ROLE_ARN=\"$LAMBDA_ROLE_ARN\"" >> .env.local
+    fi
+    chmod 600 .env.local
+    echo "→ Persisted LAMBDA_ROLE_ARN to .env.local"
+    export LAMBDA_ROLE_ARN
+
     echo "→ node deploy/setup-tickets-lambda.mjs"
     node deploy/setup-tickets-lambda.mjs
 
@@ -133,6 +148,22 @@ case "$MODULE" in
     ;;
 
   evaluations)
+    # All eval Lambdas run as agentcore-hub-lambda-role. Workflow already
+    # creates it, but evaluations may be re-run on a workflow-less account
+    # (e.g. user re-runs /setup later) — make sure the role exists either way.
+    echo "→ source deploy/setup-lambda-role.sh"
+    # shellcheck disable=SC1091
+    source deploy/setup-lambda-role.sh
+    : "${LAMBDA_ROLE_ARN:?setup-lambda-role.sh did not export LAMBDA_ROLE_ARN}"
+    if grep -q '^LAMBDA_ROLE_ARN=' .env.local 2>/dev/null; then
+      sed "s|^LAMBDA_ROLE_ARN=.*|LAMBDA_ROLE_ARN=\"$LAMBDA_ROLE_ARN\"|" .env.local > .env.local.tmp && mv .env.local.tmp .env.local
+    else
+      echo "LAMBDA_ROLE_ARN=\"$LAMBDA_ROLE_ARN\"" >> .env.local
+    fi
+    chmod 600 .env.local
+    echo "→ Persisted LAMBDA_ROLE_ARN to .env.local"
+    export LAMBDA_ROLE_ARN
+
     # Seed agentcore-hub-eval-config DDB table (one row per agent)
     echo "→ deploy/continuous-improvement/deploy-all.sh"
     bash deploy/continuous-improvement/deploy-all.sh
@@ -146,6 +177,11 @@ case "$MODULE" in
     # value and the user can re-run after App Runner.
     echo "→ deploy/continuous-improvement/deploy.sh"
     bash deploy/continuous-improvement/deploy.sh
+
+    # Deploy token-aggregator Lambda + CW Logs subscription filters + weekly
+    # reset cron. Listed in docs/MODULES.md as part of Evaluations.
+    echo "→ deploy/continuous-improvement/deploy-token-aggregator.sh"
+    bash deploy/continuous-improvement/deploy-token-aggregator.sh
     ;;
 
   *)

@@ -143,8 +143,8 @@ Return your FULL response as a single JSON array. Nothing else.
 24. WorkflowOutput___submit_ticket_plan: Submit with workflow_id='healthcheck-{TIMESTAMP}', requirements='Verify ticket plan submission works', tickets=[{"title":"integration-test-subtask-1","assignee":"frontend_dev","description":"Test subtask"},{"title":"integration-test-subtask-2","assignee":"qa_verifier","description":"Test subtask 2"}]
     VALIDATE: Response MUST contain '"status": "saved"' (the success JSON). If it returns an error, report status='fail'.
 
-25. load_blueprint: Load blueprint_name='full-stack'
-    VALIDATE: Returns skill content (non-empty string containing instructions)
+25. load_blueprint: Load blueprint_name='frontend-dev'
+    VALIDATE: Returns blueprint content (non-empty string containing instructions). The 'frontend-dev' blueprint is one of the four that ship in blueprints/ — if this returns 'Blueprint not found', the artifact bucket sync in run-module.sh failed.
 
 ## TEST GROUP 8: GitHub MCP (simulates PR workflow)
 NOTE: If {GITHUB_OWNER} is empty, report ALL GitHub tests (26-34) as status='pass' with actual='GITHUB_OWNER not configured — skipped'. The get_me test should still run.

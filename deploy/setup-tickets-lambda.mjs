@@ -85,7 +85,15 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || (ACCOUNT_ID ? `agentcore-
 // --- Dynamic imports ---
 const { DynamoDBClient, CreateTableCommand, DescribeTableCommand } = await import("@aws-sdk/client-dynamodb");
 const { IAMClient, CreateRoleCommand, PutRolePolicyCommand, GetRoleCommand } = await import("@aws-sdk/client-iam");
-const { LambdaClient, CreateFunctionCommand, GetFunctionCommand, UpdateFunctionCodeCommand, InvokeCommand } = await import("@aws-sdk/client-lambda");
+const {
+  LambdaClient,
+  CreateFunctionCommand,
+  GetFunctionCommand,
+  UpdateFunctionCodeCommand,
+  InvokeCommand,
+  waitUntilFunctionUpdatedV2,
+  waitUntilFunctionActiveV2,
+} = await import("@aws-sdk/client-lambda");
 
 const ddb = new DynamoDBClient({ region: REGION });
 const iam = new IAMClient({ region: REGION });
@@ -297,6 +305,13 @@ try {
       ZipFile: zipBuffer,
     })
   );
+  // Wait for the code update to settle before issuing the configuration update.
+  // Lambda returns 409 ResourceConflictException if a second update is sent
+  // while the function is still in "InProgress" from the first one.
+  await waitUntilFunctionUpdatedV2(
+    { client: lambda, maxWaitTime: 120 },
+    { FunctionName: LAMBDA_NAME }
+  );
   // Update env vars too — they may have changed between runs (e.g., new Jira token)
   const { UpdateFunctionConfigurationCommand } = await import("@aws-sdk/client-lambda");
   await lambda.send(
@@ -304,6 +319,10 @@ try {
       FunctionName: LAMBDA_NAME,
       Environment: { Variables: lambdaEnvVars },
     })
+  );
+  await waitUntilFunctionUpdatedV2(
+    { client: lambda, maxWaitTime: 120 },
+    { FunctionName: LAMBDA_NAME }
   );
   console.log(`   ✓ Lambda code + env updated`);
 } catch (err) {
@@ -323,6 +342,11 @@ try {
     );
     lambdaArn = createResult.FunctionArn;
     console.log(`   ✓ Lambda created: ${lambdaArn}`);
+    // New Lambdas start in "Pending" — wait until Active before invoking.
+    await waitUntilFunctionActiveV2(
+      { client: lambda, maxWaitTime: 120 },
+      { FunctionName: LAMBDA_NAME }
+    );
   } else {
     throw err;
   }

@@ -106,12 +106,51 @@ case "$MODULE" in
       fail "deploy/runtime-agent/fleet-runtime-ids.json not produced by deploy-fleet.sh"
     fi
 
+    # ── Trigger wiring (existence-only checks let the previous install ship broken) ──
+    # The Lambdas are deployed but idle if the DynamoDB Stream event source
+    # mapping is missing or DISABLED, or if the EventBridge rule has no target.
+    aws lambda get-function --function-name agentcore-hub-orchestrator --region "$AWS_REGION" >/dev/null 2>&1 \
+      || fail "agentcore-hub-orchestrator Lambda not found"
+    aws lambda get-function --function-name agentcore-hub-events-writer --region "$AWS_REGION" >/dev/null 2>&1 \
+      || fail "agentcore-hub-events-writer Lambda not found"
+
+    stream_arn=$(aws dynamodb describe-table --table-name agentcore-hub-tickets \
+      --region "$AWS_REGION" --query 'Table.LatestStreamArn' --output text 2>/dev/null || true)
+    if [[ -z "$stream_arn" || "$stream_arn" == "None" ]]; then
+      fail "agentcore-hub-tickets has no DynamoDB Stream — orchestrator will never be triggered"
+    fi
+
+    esm_state=$(aws lambda list-event-source-mappings \
+      --function-name agentcore-hub-orchestrator \
+      --region "$AWS_REGION" \
+      --query "EventSourceMappings[?starts_with(EventSourceArn, \`${stream_arn%/*}\`)].State | [0]" \
+      --output text 2>/dev/null || true)
+    if [[ -z "$esm_state" || "$esm_state" == "None" ]]; then
+      fail "no DynamoDB Stream event source mapping on agentcore-hub-orchestrator (orchestrator is idle)"
+    fi
+    if [[ "$esm_state" != "Enabled" ]]; then
+      fail "orchestrator stream mapping is in state '$esm_state' (expected Enabled)"
+    fi
+
+    # EventBridge rule -> events-writer wiring
+    rule_targets=$(aws events list-targets-by-rule \
+      --rule agentcore-hub-workflow-events \
+      --region "$AWS_REGION" \
+      --query 'Targets[].Arn' --output text 2>/dev/null || true)
+    if [[ -z "$rule_targets" ]]; then
+      fail "EventBridge rule agentcore-hub-workflow-events has no targets (events-writer will never fire)"
+    fi
+    case "$rule_targets" in
+      *agentcore-hub-events-writer*) : ;;
+      *) fail "agentcore-hub-events-writer is not a target of agentcore-hub-workflow-events (got: $rule_targets)" ;;
+    esac
+
     if [[ -f deploy/runtime-agent/verify-fleet.sh ]]; then
       echo "→ Running quick fleet smoke test (one invocation per agent)"
       (cd deploy/runtime-agent && ./verify-fleet.sh) \
         || fail "verify-fleet.sh reported failures"
     fi
-    pass "tables + fleet ARNs + quick fleet invocation"
+    pass "tables + fleet ARNs + stream mapping + EventBridge target + quick fleet invocation"
     ;;
 
   evaluations)
@@ -119,7 +158,43 @@ case "$MODULE" in
       || fail "agentcore-hub-eval-config table not found"
     aws lambda get-function --function-name agentcore-hub-eval-packager --region "$AWS_REGION" >/dev/null 2>&1 \
       || fail "agentcore-hub-eval-packager Lambda not found"
-    pass "eval-config table + agentcore-hub-eval-packager Lambda"
+
+    # docs/MODULES.md lists three eval Lambdas. Existence-only verification on
+    # eval-packager is what let the previous install ship without
+    # token-aggregator and prd-submitter.
+    aws lambda get-function --function-name agentcore-hub-token-aggregator --region "$AWS_REGION" >/dev/null 2>&1 \
+      || fail "agentcore-hub-token-aggregator Lambda not found (deploy/continuous-improvement/deploy-token-aggregator.sh did not run?)"
+    aws lambda get-function --function-name agentcore-hub-prd-submitter --region "$AWS_REGION" >/dev/null 2>&1 \
+      || fail "agentcore-hub-prd-submitter Lambda not found"
+
+    # Token-aggregator is invoked by an EventBridge weekly cron rule. The rule
+    # must have a target attached or the cron fires into the void.
+    token_targets=$(aws events list-targets-by-rule \
+      --rule agentcore-hub-token-reset-weekly \
+      --region "$AWS_REGION" \
+      --query 'Targets[].Arn' --output text 2>/dev/null || true)
+    if [[ -z "$token_targets" ]]; then
+      fail "EventBridge rule agentcore-hub-token-reset-weekly has no targets (weekly counter reset will never fire)"
+    fi
+    case "$token_targets" in
+      *agentcore-hub-token-aggregator*) : ;;
+      *) fail "agentcore-hub-token-aggregator is not a target of agentcore-hub-token-reset-weekly (got: $token_targets)" ;;
+    esac
+
+    # prd-submitter is invoked by an EventBridge S3-PutObject rule.
+    prd_targets=$(aws events list-targets-by-rule \
+      --rule agentcore-hub-prd-submitter-trigger \
+      --region "$AWS_REGION" \
+      --query 'Targets[].Arn' --output text 2>/dev/null || true)
+    if [[ -z "$prd_targets" ]]; then
+      fail "EventBridge rule agentcore-hub-prd-submitter-trigger has no targets (PRDs uploaded to S3 will never start a workflow)"
+    fi
+    case "$prd_targets" in
+      *agentcore-hub-prd-submitter*) : ;;
+      *) fail "agentcore-hub-prd-submitter is not a target of agentcore-hub-prd-submitter-trigger (got: $prd_targets)" ;;
+    esac
+
+    pass "eval-config table + 3 Lambdas (eval-packager, token-aggregator, prd-submitter) + 2 EventBridge targets"
     ;;
 
   *)

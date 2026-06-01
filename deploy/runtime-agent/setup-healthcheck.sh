@@ -60,38 +60,44 @@ fi
 echo ""
 
 # ─── Step 2: Discover deployed agents → fleet-runtime-ids.json ──────────────
+#
+# Use the AgentCore control plane as source of truth. We previously read
+# CloudWatch log groups, but those persist long after a runtime is deleted —
+# producing phantom ARNs that the verify script then tries to invoke.
 
 echo "  [2/5] Discovering deployed agents..."
 
-# List all agentcore-hub runtime log groups to find agent IDs
-AGENT_ARNS=$(aws logs describe-log-groups \
-  --log-group-name-prefix "/aws/bedrock-agentcore/runtimes/agentcore_hub_" \
+AGENT_ARNS=$(aws bedrock-agentcore-control list-agent-runtimes \
   --region "$REGION" \
-  --query 'logGroups[*].logGroupName' \
   --output json 2>/dev/null | python3 -c "
-import json, sys, re
-log_groups = json.load(sys.stdin)
+import json, sys
+data = json.load(sys.stdin)
 fleet = {}
-for lg in log_groups:
-    # Pattern: /aws/bedrock-agentcore/runtimes/{name}-{id}-DEFAULT
-    match = re.search(r'/runtimes/(agentcore_hub_[a-z_]+)-([a-zA-Z0-9]+)-DEFAULT', lg)
-    if match:
-        name = match.group(1)
-        runtime_id = f'{name}-{match.group(2)}'
-        arn = f'arn:aws:bedrock-agentcore:us-east-1:$(aws sts get-caller-identity --query Account --output text 2>/dev/null):runtime/{runtime_id}'
+# Different CLI versions return either 'agentRuntimes' or 'agentRuntimeSummaries'
+runtimes = data.get('agentRuntimes') or data.get('agentRuntimeSummaries') or []
+for r in runtimes:
+    name = r.get('agentRuntimeName') or r.get('name') or ''
+    if not name.startswith('agentcore_hub_'):
+        continue
+    status = (r.get('status') or '').upper()
+    if status and status != 'READY':
+        continue
+    arn = r.get('agentRuntimeArn') or r.get('arn')
+    if name and arn:
         fleet[name] = arn
 print(json.dumps(fleet, indent=2))
 ")
 
 if [ -z "$AGENT_ARNS" ] || [ "$AGENT_ARNS" = "{}" ]; then
-  echo "  ERROR: No agentcore-hub agents found in $REGION."
-  echo "         Deploy agents first: ./deploy-fleet.sh"
+  echo "  ERROR: No READY agentcore-hub runtimes found in $REGION."
+  echo "         Deploy agents first: ./deploy-topology.sh (or ./deploy-fleet.sh)"
+  echo "         If list-agent-runtimes is missing, upgrade the AWS CLI."
   exit 1
 fi
 
 echo "$AGENT_ARNS" > "$FLEET_FILE"
 AGENT_COUNT=$(echo "$AGENT_ARNS" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
-echo "        Found $AGENT_COUNT agents → $FLEET_FILE"
+echo "        Found $AGENT_COUNT READY agents → $FLEET_FILE"
 echo ""
 
 # ─── Step 3: Create and upload S3 test fixtures ─────────────────────────────
@@ -191,7 +197,11 @@ cat > "$FIXTURES_DIR/test-page.html" << 'HTML'
 HTML
 
 # test-logo.png — Generate a simple blue circle with "AGENTCORE" text using Python
-python3 << 'PYIMG'
+# We write directly into $FIXTURES_DIR (already mkdir'd above) and pass the path
+# via env var so the quoted heredoc keeps its literal Python.
+HEALTHCHECK_LOGO_PATH="$FIXTURES_DIR/test-logo.png" python3 << 'PYIMG'
+import os
+out_path = os.environ["HEALTHCHECK_LOGO_PATH"]
 try:
     from PIL import Image, ImageDraw, ImageFont
     img = Image.new("RGB", (400, 400), color=(15, 23, 42))
@@ -204,7 +214,7 @@ try:
     except (OSError, IOError):
         font = ImageFont.load_default()
     draw.text((120, 280), "AGENTCORE", fill=(226, 232, 240), font=font)
-    img.save("/tmp/healthcheck-fixtures/test-logo.png")
+    img.save(out_path)
     print("        Generated test-logo.png (PIL)")
 except ImportError:
     # Fallback: create a minimal valid PNG without PIL
@@ -232,13 +242,10 @@ except ImportError:
     png += make_chunk(b"IDAT", zlib.compress(raw))
     png += make_chunk(b"IEND", b"")
 
-    with open("/tmp/healthcheck-fixtures/test-logo.png", "wb") as f:
+    with open(out_path, "wb") as f:
         f.write(png)
     print("        Generated test-logo.png (raw PNG fallback)")
 PYIMG
-
-# Copy fixtures to the script-local dir
-cp /tmp/healthcheck-fixtures/test-logo.png "$FIXTURES_DIR/" 2>/dev/null || true
 
 # Upload all fixtures to S3
 echo "        Uploading fixtures to s3://$BUCKET/healthcheck/fixtures/..."
