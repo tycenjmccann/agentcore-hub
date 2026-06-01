@@ -162,7 +162,7 @@ export default function WorkflowPage() {
           description: E2E_TEST_DESCRIPTION,
           sources: [],
           repoConfig: {
-            repos: [{ url: "https://github.com/tycenjmccann/agentcore-console", defaultBranch: "clean-main" }],
+            repos: [{ url: TEST_REPO_URL, defaultBranch: "main" }],
           },
         }),
       });
@@ -452,6 +452,9 @@ function formatRelativeTime(isoString: string): string {
 // Mirror of scripts/test-ticket-flow.sh DESC. Keep in sync — the button is the
 // in-app version of that curl call.
 
+const TEST_REPO_URL =
+  process.env.NEXT_PUBLIC_TEST_REPO_URL || "https://github.com/octocat/Hello-World";
+
 const E2E_TEST_DESCRIPTION = `## Workflow End-to-End Connectivity Test
 
 This is a workflow end-to-end test. Each agent is being given a minimal task to prove connectivity and access to their tools. Run your task, save a short artifact to S3 confirming success, then complete.
@@ -482,7 +485,7 @@ This is a workflow end-to-end test. Each agent is being given a minimal task to 
 \`\`\`
 Connectivity check — Frontend Designer:
 1. Load skill \`frontend-design\`
-2. Confirm GitHub access: run \`git ls-remote https://github.com/tycenjmccann/agentcore-console\` (or any equivalent gh/git command) and capture the first few refs as proof
+2. Confirm GitHub access: run \`git ls-remote ${TEST_REPO_URL}\` (or any equivalent gh/git command) and capture the first few refs as proof
 3. Save to S3: workflows/{workflowId}/agents/agentcore_hub_frontend_designer/test-pass.md — include the ref output and "GitHub access confirmed"
 4. Call WorkflowOutput___report_completion
 Do not write code. Do not clone repos.
@@ -492,7 +495,7 @@ Do not write code. Do not clone repos.
 \`\`\`
 Connectivity check — Security Reviewer:
 1. Load skill \`code-review\`
-2. Confirm GitHub access: run \`git ls-remote https://github.com/tycenjmccann/agentcore-console\` and capture the first few refs
+2. Confirm GitHub access: run \`git ls-remote ${TEST_REPO_URL}\` and capture the first few refs
 3. Save to S3: workflows/{workflowId}/agents/agentcore_hub_security_reviewer/test-pass.md — include the ref output and "GitHub access confirmed"
 4. Call WorkflowOutput___report_completion
 Do not write code. Do not clone repos.
@@ -502,7 +505,7 @@ Do not write code. Do not clone repos.
 \`\`\`
 Connectivity check — Legal Compliance:
 1. Load skill \`privacy-compliance\`
-2. Confirm GitHub access: run \`git ls-remote https://github.com/tycenjmccann/agentcore-console\` and capture the first few refs
+2. Confirm GitHub access: run \`git ls-remote ${TEST_REPO_URL}\` and capture the first few refs
 3. Save to S3: workflows/{workflowId}/agents/agentcore_hub_legal_compliance/test-pass.md — include the ref output and "GitHub access confirmed"
 4. Call WorkflowOutput___report_completion
 Do not write code. Do not clone repos.

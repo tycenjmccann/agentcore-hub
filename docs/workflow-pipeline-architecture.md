@@ -1530,7 +1530,7 @@ If S3 read fails → falls back to hardcoded FALLBACK_ROSTER (no outage)
 |--------|----------------|---------------|-----------------|
 | `agentcore-hub-orchestrator` | `loadAgentRoster()` | `_agentRoster` | `{agentId, phase, runtimeArn}` per agent |
 | `agentcore-hub-tickets` | `loadValidAgents()` | `VALID_AGENTS` | `Set` of agent IDs |
-| `agentcore-hub-jira-real` | `loadValidAssignees()` | `VALID_ASSIGNEES` | `Set` of agent IDs |
+| `agentcore-hub-jira` | `loadValidAssignees()` | `VALID_ASSIGNEES` | `Set` of agent IDs |
 
 **S3 path**: `config/agents.json` (synced by `deploy-all.sh` alongside prompts)
 
@@ -1538,7 +1538,7 @@ If S3 read fails → falls back to hardcoded FALLBACK_ROSTER (no outage)
 
 **IAM**: All three Lambdas need `s3:GetObject` on `arn:aws:s3:::{BUCKET}/config/*`. The orchestrator's role already had this. The ticket Lambdas' shared role (`agentcore-hub-jira-JiraFunctionRole-*`) got an inline policy `s3-config-read` added.
 
-**Env var**: `ARTIFACT_BUCKET` added to `agentcore-hub-tickets` and `agentcore-hub-jira-real` Lambda configurations.
+**Env var**: `ARTIFACT_BUCKET` added to `agentcore-hub-tickets` and `agentcore-hub-jira` Lambda configurations.
 
 **Multi-fleet path**: When running multiple fleets, use different S3 keys per fleet (e.g., `config/fleet-a/agents.json`) and pass `FLEET_ID` env var to select the right config path.
 

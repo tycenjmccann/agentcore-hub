@@ -18,7 +18,7 @@ You are running this skill from the root of an `agentcore-hub` clone. Your job i
 - `README.md` Stages 1–6 — the manual setup this skill automates
 - `.env.example` — every env var that may need a value
 
-You are a runner over scripts that already exist in the repo. **Never invent new infra or new scripts.** If something the user wants isn't covered by an existing script in `deploy/` or `scripts/`, tell them and link to the README section instead.
+You are a runner over scripts that already exist in the repo. **Never invent new infra or new scripts.** If something the user wants isn't covered by an existing script in `deploy/`, `scripts/`, or alongside Lambda source under `lambda/<name>/deploy.sh`, tell them and link to the README section instead.
 
 ---
 
@@ -101,7 +101,43 @@ Map the answer to a `MODULES` set in the canonical order `core → builder → w
 
 If they pick Jira, do a follow-up `AskUserQuestion` (or accept free text via "Other") for `JIRA_SITE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY`. Treat these as secrets — do not echo them back, do not write them anywhere except `.env.local`.
 
-## Q4 — AWS target
+## Q4 — Workflow runtime topology *(skip if Workflow not in MODULES)*
+
+Before asking, print this framing so the user understands what's happening and where it can go:
+
+```
+The Workflow module ships 14 personas — intake, requirements, 8 design specialists,
+3 development specialists, QA, and review. How those personas map to AgentCore
+runtimes is up to you.
+
+We default to ONE runtime that hosts all 14 personas. Each persona has its own
+prompt and blueprint in S3; the orchestrator routes to the right one per
+invocation. This is the fastest install and the easiest to iterate on — change a
+prompt in S3 and the next invocation picks it up, no redeploy.
+
+The setup is designed to grow: when a team is ready to own their agent — a
+different model, separate scaling, isolated logs and metrics — you re-run /setup
+and split that persona into its own runtime. The end-state most teams reach is
+one runtime per team-owned agent. You don't have to start there.
+```
+
+Then ask via `AskUserQuestion`:
+
+- **question:** "How should the 14 workflow personas be deployed?"
+- **header:** "Runtimes"
+- **options:**
+  1. *One runtime, all 14 personas (Recommended)* — ~3 min. Single AgentCore runtime; personas differentiated by prompt + blueprint in S3. Best place to start.
+  2. *Three runtimes, grouped by phase* — ~5 min. One for intake/requirements/review, one for design, one for dev/QA. Phase-level isolation without going all-in.
+  3. *Fourteen runtimes, one per persona* — ~10–15 min. Full isolation, per-agent model/config, separate log groups. Choose this when teams already own individual agents.
+
+Save the answer as `workflow_runtimes` (`1`, `3`, or `14`) in the answers blob. `apply-env.sh` writes it to `.env.local` as `WORKFLOW_RUNTIME_COUNT`. `run-module.sh workflow` invokes `deploy/runtime-agent/deploy-topology.sh`, which branches on this value:
+  - `1` → deploy `agentcore_hub_requirements_analyst` as the shared runtime; write its ARN into all 14 `runtimeArn` fields in `src/config/agents.json`.
+  - `3` → deploy `requirements_analyst`, `backend_designer`, `backend_dev` as anchors; map each persona to its phase's anchor.
+  - `14` → delegate to the existing `deploy-fleet.sh` (one runtime per persona).
+
+> **No application code changes are required across these three modes** — the orchestrator already resolves per-agent via `agents.json` `runtimeArn`. Topology is purely a deploy + mapping concern.
+
+## Q5 — AWS target
 
 Use the pre-flight detection result:
 
@@ -117,7 +153,7 @@ Use the pre-flight detection result:
 
 Set `AWS_PROFILE` and `AWS_REGION` for every subsequent shell call.
 
-## Q5 — Deploy target
+## Q6 — Deploy target
 
 - **question:** "Where should the Next.js app run?"
 - **header:** "Deploy target"
@@ -126,7 +162,7 @@ Set `AWS_PROFILE` and `AWS_REGION` for every subsequent shell call.
   2. *App Runner* (Recommended for sharing) — auto-build + push via ECR
   3. *Skip app deploy* — only create AWS infra; don't touch the Next.js app
 
-## Q6 — GitHub integration *(skip if Workflow not in MODULES)*
+## Q7 — GitHub integration *(skip if Workflow not in MODULES)*
 
 - **question:** "How should agents push code and open PRs?"
 - **header:** "GitHub"
@@ -135,7 +171,7 @@ Set `AWS_PROFILE` and `AWS_REGION` for every subsequent shell call.
   2. *Custom MCP server* — set `MCP_SERVERS` JSON. Follow up for the JSON blob.
   3. *Skip — agents will stop at "ready for PR"* (the workflow still runs, just no PRs created)
 
-## Q7 — Confirm
+## Q8 — Confirm
 
 Print a recap of every choice plus the exact list of scripts that will run, then ask:
 
@@ -158,6 +194,7 @@ cat > /tmp/agentcore-hub-answers.json <<'EOF'
   "brand_name": "Bob's AI Hub",
   "modules": ["core", "workflow"],
   "ticket_provider": "dynamodb",
+  "workflow_runtimes": 1,
   "aws_account": "...",
   "aws_region": "us-east-1",
   "aws_profile": "default",
@@ -176,15 +213,18 @@ rm /tmp/agentcore-hub-answers.json
 
 ## Run modules in order
 
-For each module in `MODULES` (core → builder → workflow → evaluations), run:
+Evaluations is deferred until **after** the deploy-target step because its
+`prd-submitter` Lambda needs `DEPLOYMENT_URL` (the App Runner URL) to know where
+to POST workflow-start requests. Run modules in this order:
+
+1. `core` → `builder` → `workflow` (skip whichever the user didn't pick)
+2. Deploy target step (App Runner / Local dev / Skip)
+3. `evaluations` (if selected)
+
+For each module run:
 
 ```bash
 .claude-plugin/bin/run-module.sh <module>
-```
-
-then immediately:
-
-```bash
 .claude-plugin/bin/verify-module.sh <module>
 ```
 
@@ -197,13 +237,15 @@ Long-running deploys (`build-and-push.sh`, `deploy-fleet.sh`, App Runner deploy)
 
 ---
 
-## Final step: deploy target
+## Deploy target step (between workflow and evaluations)
 
-After all modules verify clean:
+After Core/Builder/Workflow verify clean and **before** running Evaluations:
 
-- **Local dev:** print "Setup complete. Run `npm run dev` to start the app at http://localhost:3000."
-- **App Runner:** run the App Runner deploy (use the workflow in `.github/workflows/` if present, otherwise the existing `deploy/` script for App Runner if one exists; if neither exists, tell the user honestly and link to the README section). Verify with the App Runner service status + a `curl` to the health endpoint.
-- **Skip app deploy:** print a one-screen summary of what was created (tables, Lambdas, runtimes) and exit.
+- **Local dev:** print "Run `npm run dev` to start the app at http://localhost:3000." Set `DEPLOYMENT_URL=http://localhost:3000` in `.env.local` so prd-submitter can be deployed in the next step (note: this only matters if the user starts the dev server before triggering an improvement loop).
+- **App Runner:** run the App Runner deploy (use the workflow in `.github/workflows/` if present, otherwise the existing `deploy/` script for App Runner if one exists; if neither exists, tell the user honestly and link to the README section). Once the service is healthy, capture the App Runner URL and persist it as `DEPLOYMENT_URL` in `.env.local` (use the same sed-or-append pattern as `BUILDER_AGENT_ID`).
+- **Skip app deploy:** skip both the deploy and the `DEPLOYMENT_URL` write. If Evaluations was selected, warn the user that prd-submitter will be deployed with a placeholder URL and they must update it manually.
+
+After this step, run Evaluations (if selected) so it picks up the freshly written `DEPLOYMENT_URL`.
 
 ---
 
@@ -217,6 +259,6 @@ The user may run `/setup` more than once. Before any module runs, `run-module.sh
 
 - **AWS_PROFILE / AWS_REGION:** every `aws` call must pass them through. Never assume `default`.
 - **Secrets:** Jira tokens / GitHub PATs go from the prompt straight into `.env.local`. Do not log them, do not echo them, do not write them to a temp file that lingers.
-- **No new infra:** if a user request would require a script that doesn't exist in `deploy/` or `scripts/`, refuse and link to `README.md` / `docs/MODULES.md`.
+- **No new infra:** if a user request would require a script that doesn't exist in `deploy/`, `scripts/`, or `lambda/<name>/deploy.sh`, refuse and link to `README.md` / `docs/MODULES.md`.
 - **Real errors only:** if a script fails, show the user the actual stderr and the script that produced it. No "something went wrong, check logs."
 - **No README duplication:** "next steps" output should link to `README.md` and `docs/MODULES.md` rather than restating them.

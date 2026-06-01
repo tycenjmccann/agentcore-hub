@@ -27,7 +27,8 @@ The plugin reasons about four modules (see `docs/MODULES.md` for the full breakd
 .claude-plugin/
 ├── plugin.json                # plugin manifest
 ├── skills/
-│   └── setup.md               # the /setup conversation flow
+│   └── setup/
+│       └── SKILL.md           # the /setup conversation flow
 ├── agents/
 │   └── deploy-runner.md       # subagent for long-running deploys (5–15 min)
 └── bin/
@@ -38,9 +39,23 @@ The plugin reasons about four modules (see `docs/MODULES.md` for the full breakd
 
 `bin/run-module.sh` is the single source of truth for "to deploy module X, run scripts A, B, C." If a script is added or removed, this file is the only one to update.
 
+## Validating and installing
+
+```bash
+# Validate the manifest (run from repo root)
+claude plugin validate . --strict
+
+# Load the plugin for one session — no install, no restart needed
+claude --plugin-dir .
+```
+
+Once Claude Code starts, type `/setup` at the prompt. The skill at `skills/setup/SKILL.md` and the agent at `agents/deploy-runner.md` are auto-discovered from their default directories — `plugin.json` only carries metadata.
+
+**Iterating on the plugin during development:** edits to `SKILL.md` take effect immediately in the running session. Edits to `agents/`, `bin/*.sh`, or `plugin.json` require `/reload-plugins` (or restarting `claude --plugin-dir .`).
+
 ## Hard rules the plugin follows
 
-- Never adds new infra — only orchestrates scripts that already exist in `deploy/` and `scripts/`.
+- Never adds new infra — only orchestrates scripts that already exist in the repo (`deploy/`, `scripts/`, or alongside Lambda source under `lambda/<name>/deploy.sh`).
 - Never overwrites `.env.local` — backs up to `.env.local.bak` first.
 - Always passes `AWS_PROFILE` + `AWS_REGION` through to every `aws` call. Never assumes `default`.
 - Never logs secrets (Jira API token, GitHub PAT). They go straight from the prompt into `.env.local` mode 600.

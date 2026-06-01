@@ -49,8 +49,8 @@ The orchestration pipeline. Self-contained surface.
 
 **Lambdas** (`lambda/`)
 - `orchestrator` — drives the pipeline state machine
-- `agentcore-hub-jira`, `jira-real` — Jira integration / MCP
-- `agentcore-hub-tickets` — ticket CRUD
+- `agentcore-hub-jira` — Jira Cloud ticket tools (deployed when `TICKET_PROVIDER=jira`)
+- `agentcore-hub-tickets` — DynamoDB-backed ticket tools (deployed when `TICKET_PROVIDER=dynamodb`)
 - `workflow-output` — collects agent artifacts
 
 **DynamoDB tables** (defaults in `deploy/config.sh`)
@@ -114,6 +114,8 @@ The continuous-improvement loop. Self-contained surface.
 - **Lambda:** `builder-tools`
 - **Deploy:** `deploy/setup-builder-agent.mjs`
 
+> **Heads-up — harness vs runtime.** The builder is an AgentCore *harness*, not a runtime. When the harness is created, AgentCore auto-provisions a runtime sibling named `harness_agentcore_hub_builder-…` under the hood. If you list runtimes (`aws bedrock-agentcore-control list-agent-runtimes` or the AgentCore MCP `list_agent_runtimes`), you'll see it — but `/build` only ever invokes the harness ARN, built from `BUILDER_AGENT_ID` in `.env.local`. The runtime sibling is irrelevant to `/build`. To verify the builder, query `list-harnesses` / `GetHarness`, not the runtime APIs.
+
 ---
 
 ## Shared seams
@@ -152,7 +154,7 @@ rm -rf src/app/workflow src/app/tickets \
        src/components/workflow src/lib/workflow src/lib/pipeline-config.ts
 
 # 2. Lambdas (if already deployed, also delete the AWS functions/tables)
-rm -rf lambda/orchestrator lambda/agentcore-hub-jira lambda/jira-real \
+rm -rf lambda/orchestrator lambda/agentcore-hub-jira \
        lambda/agentcore-hub-tickets lambda/workflow-output
 
 # 3. Nav: delete the two entries tagged module: "workflow" in src/config/modules.ts

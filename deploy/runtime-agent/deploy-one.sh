@@ -84,25 +84,39 @@ fi
 # Build prompt env args — always S3
 PROMPT_ENV="--env SYSTEM_PROMPT_S3_KEY=${PROMPT_S3_KEY}"
 
-OUTPUT=$(agentcore deploy \
-  --auto-update-on-conflict \
-  --env "BYPASS_TOOL_CONSENT=true" \
-  ${GATEWAY_ARN:+--env "GATEWAY_ARN=${GATEWAY_ARN}"} \
-  --env "MODEL_ID=us.anthropic.claude-opus-4-6-v1" \
-  --env "READ_TIMEOUT=1200" \
-  --env "AWS_REGION=us-east-1" \
-  --env "EVENTS_TABLE=agentcore-hub-events" \
-  --env "TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA:-agentcore-hub-jira}" \
-  --env "AGENTCORE_HUB_ARTIFACT_BUCKET=${ARTIFACT_BUCKET}" \
-  --env "CLAUDE_CODE_USE_BEDROCK=1" \
-  --env "CLAUDE_MODEL=us.anthropic.claude-opus-4-6-v1" \
-  --env "ANTHROPIC_MODEL=us.anthropic.claude-opus-4-6-v1" \
-  --env "PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers" \
-  --env "HOME=/tmp" \
-  --env "TMPDIR=/tmp" \
-  ${PROMPT_ENV} \
-  ${MCP_ENV} 2>&1)
+# Run `agentcore deploy`, retrying once if S3 races with another concurrent
+# fleet deploy (the toolkit creates a shared codebuild bucket internally).
+run_deploy() {
+  agentcore deploy \
+    --auto-update-on-conflict \
+    --env "BYPASS_TOOL_CONSENT=true" \
+    ${GATEWAY_ARN:+--env "GATEWAY_ARN=${GATEWAY_ARN}"} \
+    --env "MODEL_ID=us.anthropic.claude-opus-4-6-v1" \
+    --env "READ_TIMEOUT=1200" \
+    --env "AWS_REGION=us-east-1" \
+    --env "EVENTS_TABLE=agentcore-hub-events" \
+    --env "TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA:-agentcore-hub-jira}" \
+    --env "AGENTCORE_HUB_ARTIFACT_BUCKET=${ARTIFACT_BUCKET}" \
+    --env "CLAUDE_CODE_USE_BEDROCK=1" \
+    --env "CLAUDE_MODEL=us.anthropic.claude-opus-4-6-v1" \
+    --env "ANTHROPIC_MODEL=us.anthropic.claude-opus-4-6-v1" \
+    --env "PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers" \
+    --env "HOME=/tmp" \
+    --env "TMPDIR=/tmp" \
+    ${PROMPT_ENV} \
+    ${MCP_ENV} 2>&1
+}
+
+OUTPUT=$(run_deploy)
 DEPLOY_EXIT=$?
+
+if [ $DEPLOY_EXIT -ne 0 ] && echo "$OUTPUT" | grep -qE "OperationAborted|conflicting conditional operation"; then
+  # Concurrent toolkit bucket-create race; back off and retry once.
+  sleep $((RANDOM % 5 + 3))
+  echo "  Retrying $AGENT_NAME after S3 bucket-create race..." >&2
+  OUTPUT=$(run_deploy)
+  DEPLOY_EXIT=$?
+fi
 
 # Check deploy exit code first, then verify via agentcore status
 if [ $DEPLOY_EXIT -ne 0 ]; then
@@ -123,6 +137,29 @@ if echo "$STATUS_OUTPUT" | grep -q "READY\|CREATE_COMPLETE\|UPDATE_COMPLETE"; th
   if [ -z "$ARN" ]; then
     ARN=$(echo "$STATUS_OUTPUT" | grep -o 'arn:aws:bedrock-agentcore:[^"]*runtime/[^"[:space:]]*' | head -1)
   fi
+
+  # Merge ARN into fleet-runtime-ids.json so re-runs are first-class.
+  # During a parallel fleet deploy, deploy-fleet.sh overwrites this at the
+  # end anyway — these writes are redundant but harmless. Use mkdir as a
+  # POSIX-portable lock to serialize concurrent jq merges.
+  if [ -n "${ARN:-}" ] && command -v jq >/dev/null 2>&1; then
+    FLEET_FILE="$SCRIPT_DIR/fleet-runtime-ids.json"
+    LOCK_DIR="$SCRIPT_DIR/.fleet-file.lock"
+    for _ in $(seq 1 50); do
+      if mkdir "$LOCK_DIR" 2>/dev/null; then
+        if [ -f "$FLEET_FILE" ]; then
+          jq --arg name "$AGENT_NAME" --arg arn "$ARN" '. + {($name): $arn}' "$FLEET_FILE" > "$FLEET_FILE.tmp" \
+            && mv "$FLEET_FILE.tmp" "$FLEET_FILE"
+        else
+          jq -n --arg name "$AGENT_NAME" --arg arn "$ARN" '{($name): $arn}' > "$FLEET_FILE"
+        fi
+        rmdir "$LOCK_DIR"
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+
   echo "OK $AGENT_NAME ${ARN:-deployed}"
 else
   echo "FAIL $AGENT_NAME (status check failed)"

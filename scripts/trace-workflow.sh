@@ -213,20 +213,20 @@ echo "$TICKET_IDS" | while read -r tid; do
 done
 echo "  Orchestrator (per-ticket): $(wc -l < "$OUTPUT_DIR/orchestrator_tickets.log" | tr -d ' ') entries"
 
-# ─── 3b: Jira-real logs ─────────────────────────────────────────────────────
+# ─── 3b: Ticket tools logs ───────────────────────────────────────────────────
 
-> "$OUTPUT_DIR/jira_real.log"
+> "$OUTPUT_DIR/tickets.log"
 echo "$TICKET_IDS" | while read -r tid; do
   [ -z "$tid" ] && continue
   aws logs filter-log-events \
     --region "$REGION" \
-    --log-group-name "$LOG_JIRA_REAL" \
+    --log-group-name "$LOG_TICKET_TOOLS" \
     --start-time "$START_MS" \
     --end-time "$NOW_MS" \
     --filter-pattern "\"$tid\"" \
-    --output json 2>/dev/null | jq -r '.events[] | "\(.timestamp)\t\(.message)"' >> "$OUTPUT_DIR/jira_real.log" 2>/dev/null || true
+    --output json 2>/dev/null | jq -r '.events[] | "\(.timestamp)\t\(.message)"' >> "$OUTPUT_DIR/tickets.log" 2>/dev/null || true
 done
-echo "  Jira-real: $(wc -l < "$OUTPUT_DIR/jira_real.log" | tr -d ' ') entries"
+echo "  Ticket tools: $(wc -l < "$OUTPUT_DIR/tickets.log" | tr -d ' ') entries"
 
 # ─── 3c: Workflow-output logs ────────────────────────────────────────────────
 
@@ -276,9 +276,9 @@ echo ""
     awk -F'\t' '{print $1 "\t[ORCH] " $2}' "$OUTPUT_DIR/orchestrator_tickets.log"
   fi
 
-  # Jira-real logs
-  if [ -s "$OUTPUT_DIR/jira_real.log" ]; then
-    awk -F'\t' '{print $1 "\t[JIRA] " $2}' "$OUTPUT_DIR/jira_real.log"
+  # Ticket tools logs
+  if [ -s "$OUTPUT_DIR/tickets.log" ]; then
+    awk -F'\t' '{print $1 "\t[TICKETS] " $2}' "$OUTPUT_DIR/tickets.log"
   fi
 
   # Workflow-output logs
@@ -308,7 +308,7 @@ echo ""
 
 # Ticket creations
 echo "  ┌─ Ticket Creations ──────────────────────────────────"
-grep -i "Created\|create_ticket" "$OUTPUT_DIR/jira_real.log" 2>/dev/null | \
+grep -i "Created\|create_ticket" "$OUTPUT_DIR/tickets.log" 2>/dev/null | \
   awk -F'\t' '{
     # Convert ms timestamp to readable
     ts = $1 / 1000
@@ -369,7 +369,7 @@ echo ""
 
 # Check for "blocked" tickets that received "ready" webhooks
 echo "  Checking for blocked→ready race conditions..."
-BLOCKED_TICKETS=$(grep -i "Status: blocked\|status.*blocked" "$OUTPUT_DIR/jira_real.log" 2>/dev/null | \
+BLOCKED_TICKETS=$(grep -i "Status: blocked\|status.*blocked" "$OUTPUT_DIR/tickets.log" 2>/dev/null | \
   grep -oE "TEAM-[0-9]+" | sort -u)
 
 if [ -n "$BLOCKED_TICKETS" ]; then
@@ -391,10 +391,10 @@ fi
 
 # Check for ghost tickets (tickets in orchestrator not in ticket tools)
 ORCH_TICKETS=$(grep -oE "TEAM-[0-9]+" "$OUTPUT_DIR/orchestrator_wf.log" "$OUTPUT_DIR/orchestrator_tickets.log" 2>/dev/null | sort -u)
-JIRA_TICKETS=$(grep -oE "TEAM-[0-9]+" "$OUTPUT_DIR/jira_real.log" 2>/dev/null | sort -u)
+TICKET_TOOL_TICKETS=$(grep -oE "TEAM-[0-9]+" "$OUTPUT_DIR/tickets.log" 2>/dev/null | sort -u)
 
-if [ -n "$ORCH_TICKETS" ] && [ -n "$JIRA_TICKETS" ]; then
-  GHOSTS=$(comm -23 <(echo "$ORCH_TICKETS") <(echo "$JIRA_TICKETS") 2>/dev/null)
+if [ -n "$ORCH_TICKETS" ] && [ -n "$TICKET_TOOL_TICKETS" ]; then
+  GHOSTS=$(comm -23 <(echo "$ORCH_TICKETS") <(echo "$TICKET_TOOL_TICKETS") 2>/dev/null)
   if [ -n "$GHOSTS" ]; then
     GHOST_COUNT=$(echo "$GHOSTS" | wc -l | tr -d ' ')
     echo "  ⚠️  GHOST TICKETS: $GHOST_COUNT ticket(s) in orchestrator but NOT in ticket tools logs:"
@@ -419,7 +419,7 @@ echo "  Full output saved to: $OUTPUT_DIR/"
 echo "  Key files:"
 echo "    unified_timeline.log   — all sources merged by timestamp"
 echo "    orchestrator_wf.log    — orchestrator logs"
-echo "    jira_real.log          — ticket creation logs"
+echo "    tickets.log            — ticket tools logs"
 echo "    workflow_output.log    — agent completion logs"
 echo "    events_timeline.tsv    — DDB events"
 echo ""

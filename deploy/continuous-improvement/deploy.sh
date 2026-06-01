@@ -8,8 +8,18 @@ source "${REPO_ROOT}/deploy/config.sh"
 BUCKET="$ARTIFACT_BUCKET"
 ROLE_ARN="$LAMBDA_ROLE_ARN"
 AGENT_ID="${IMPROVEMENT_AGENT_ID:-agentcore_hub_fleet_improver-k5W5Vb9GhE}"
-WORKFLOW_API="${DEPLOYMENT_URL:?ERROR: DEPLOYMENT_URL must be set}"
+WORKFLOW_API="${DEPLOYMENT_URL:-}"
 FLEET_REPO="$FLEET_REPO_URL"
+
+# DEPLOYMENT_URL is consumed only by prd-submitter. If it isn't set yet (e.g.
+# when /setup runs evaluations before App Runner), deploy with a placeholder
+# and remind the user to re-run after the URL is known.
+if [ -z "$WORKFLOW_API" ]; then
+  echo "⚠ DEPLOYMENT_URL not set — deploying prd-submitter with a placeholder."
+  echo "  Re-run this script after App Runner is deployed, or update the prd-submitter"
+  echo "  Lambda's WORKFLOW_API_URL env var manually."
+  WORKFLOW_API="http://placeholder-update-after-apprunner"
+fi
 
 echo "═══════════════════════════════════════════════════════════"
 echo "  Continuous Improvement Loop"
