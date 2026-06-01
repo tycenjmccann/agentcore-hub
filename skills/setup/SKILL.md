@@ -3,7 +3,7 @@ name: setup
 description: Guided AgentCore Hub setup. Asks the user which modules they want, generates .env.local, and runs only the deploy scripts those modules need — with a verification gate between phases.
 ---
 
-# /setup — AgentCore Hub guided installer
+# /agentcore-hub:setup — AgentCore Hub guided installer
 
 You are running this skill from the root of an `agentcore-hub` clone. Your job is to install AgentCore Hub for the user by:
 
@@ -79,7 +79,7 @@ This install can deploy four modules. You'll always get Core; the rest are optio
 
 Then ask via `AskUserQuestion`:
 
-- **question:** "Which modules should this install deploy? (You can re-run /setup later to add more.)"
+- **question:** "Which modules should this install deploy? (You can re-run /agentcore-hub:setup later to add more.)"
 - **header:** "Modules"
 - **options** (single-select):
   1. *Core only — explore agents I've already deployed* — `{core}`. No new AWS deploys beyond credentials check.
@@ -106,19 +106,22 @@ If they pick Jira, do a follow-up `AskUserQuestion` (or accept free text via "Ot
 Before asking, print this framing so the user understands what's happening and where it can go:
 
 ```
-The Workflow module ships 14 personas — intake, requirements, 8 design specialists,
-3 development specialists, QA, and review. How those personas map to AgentCore
-runtimes is up to you.
+The Workflow module ships 14 personas across four pipeline phases:
+  • requirements (1)  – analyst that scopes the work and creates tickets
+  • design        (8) – iOS, Android, frontend, backend, security, legal,
+                        localization, analytics
+  • development   (3) – frontend, backend, API
+  • verification + review (2) – QA, CI
 
-We default to ONE runtime that hosts all 14 personas. Each persona has its own
-prompt and blueprint in S3; the orchestrator routes to the right one per
-invocation. This is the fastest install and the easiest to iterate on — change a
-prompt in S3 and the next invocation picks it up, no redeploy.
+How those personas map to AgentCore runtimes is up to you. We default to ONE
+runtime that hosts all 14 personas: per-persona prompts live in S3 and the
+runtime loads the right one per invocation, caching it for the life of the
+microVM. Edit a prompt in S3 and the next session picks it up — no redeploy.
 
-The setup is designed to grow: when a team is ready to own their agent — a
-different model, separate scaling, isolated logs and metrics — you re-run /setup
-and split that persona into its own runtime. The end-state most teams reach is
-one runtime per team-owned agent. You don't have to start there.
+The setup is designed to grow. When a team is ready to own their agent —
+different model, separate scaling, isolated logs and metrics — re-run
+/agentcore-hub:setup and split that persona out. The end-state most teams reach is one runtime per
+team-owned agent. You don't have to start there.
 ```
 
 Then ask via `AskUserQuestion`:
@@ -126,16 +129,18 @@ Then ask via `AskUserQuestion`:
 - **question:** "How should the 14 workflow personas be deployed?"
 - **header:** "Runtimes"
 - **options:**
-  1. *One runtime, all 14 personas (Recommended)* — ~3 min. Single AgentCore runtime; personas differentiated by prompt + blueprint in S3. Best place to start.
-  2. *Three runtimes, grouped by phase* — ~5 min. One for intake/requirements/review, one for design, one for dev/QA. Phase-level isolation without going all-in.
+  1. *One runtime, all 14 personas (Recommended)* — ~3 min. Single AgentCore runtime; persona prompt resolved per invocation from S3, cached for the microVM's lifetime. Best place to start.
+  2. *Four runtimes, one per pipeline phase* — ~6 min. Separate runtimes for requirements, design, development, and QA+CI. Matches the phases in the orchestrator and lets each phase scale, log, and (eventually) run a different model independently.
   3. *Fourteen runtimes, one per persona* — ~10–15 min. Full isolation, per-agent model/config, separate log groups. Choose this when teams already own individual agents.
 
-Save the answer as `workflow_runtimes` (`1`, `3`, or `14`) in the answers blob. `apply-env.sh` writes it to `.env.local` as `WORKFLOW_RUNTIME_COUNT`. `run-module.sh workflow` invokes `deploy/runtime-agent/deploy-topology.sh`, which branches on this value:
+Save the answer as `workflow_runtimes` (`1`, `4`, or `14`) in the answers blob. `apply-env.sh` writes it to `.env.local` as `WORKFLOW_RUNTIME_COUNT`. `run-module.sh workflow` invokes `deploy/runtime-agent/deploy-topology.sh`, which branches on this value:
   - `1` → deploy `agentcore_hub_requirements_analyst` as the shared runtime; write its ARN into all 14 `runtimeArn` fields in `src/config/agents.json`.
-  - `3` → deploy `requirements_analyst`, `backend_designer`, `backend_dev` as anchors; map each persona to its phase's anchor.
+  - `4` → deploy `requirements_analyst`, `backend_designer`, `backend_dev`, and `qa_verifier` as anchors; map each persona to its phase's anchor (verification + review both go to the QA anchor).
   - `14` → delegate to the existing `deploy-fleet.sh` (one runtime per persona).
 
-> **No application code changes are required across these three modes** — the orchestrator already resolves per-agent via `agents.json` `runtimeArn`. Topology is purely a deploy + mapping concern.
+In every mode `deploy-topology.sh` syncs all 14 prompts to `s3://$ARTIFACT_BUCKET/prompts/` and uploads the rewritten `agents.json` to `s3://$ARTIFACT_BUCKET/config/agents.json` — that's how the runtime resolves per-persona prompts and how the orchestrator/Jira Lambdas (DL-023) discover the right `runtimeArn` at cold start.
+
+> **No application code changes are required across these three modes** — the orchestrator resolves per-agent via `agents.json` `runtimeArn`, and the runtime resolves per-persona prompts via `prompts/{agentId}.txt`. Topology is purely a deploy + mapping concern.
 
 ## Q5 — AWS target
 
@@ -251,7 +256,7 @@ After this step, run Evaluations (if selected) so it picks up the freshly writte
 
 ## Re-runs
 
-The user may run `/setup` more than once. Before any module runs, `run-module.sh` should detect what already exists and skip steps that are already done (the underlying scripts are idempotent — they exit 0 if the resource exists). Never wipe `.env.local`. Never delete AWS resources.
+The user may run `/agentcore-hub:setup` more than once. Before any module runs, `run-module.sh` should detect what already exists and skip steps that are already done (the underlying scripts are idempotent — they exit 0 if the resource exists). Never wipe `.env.local`. Never delete AWS resources.
 
 ---
 

@@ -94,5 +94,89 @@ deploy_function "agentcore-hub-orchestrator" "index.handler" 60 256 "$ENV_VARS_O
 deploy_function "agentcore-hub-agent-invoker" "agent-invoker.handler" 900 512 "$ENV_VARS_INVOKER"
 deploy_function "agentcore-hub-events-writer" "events-writer.handler" 10 128 "$ENV_VARS_EVENTS"
 
+# ── DynamoDB Streams trigger: tickets table → orchestrator ────────────────────
+# Mirrors the DynamoDBStream event in template.yaml. Idempotent: skips when an
+# event source mapping already targets this stream.
+echo "=== Wiring orchestrator trigger (DynamoDB Stream) ==="
+TICKETS_STREAM_ARN=$(
+  aws dynamodb describe-table \
+    --table-name "$TICKETS_TABLE" \
+    --region "$AWS_REGION" \
+    --query 'Table.LatestStreamArn' \
+    --output text 2>/dev/null || true
+)
+if [ -z "$TICKETS_STREAM_ARN" ] || [ "$TICKETS_STREAM_ARN" = "None" ]; then
+  echo "  ! $TICKETS_TABLE has no DynamoDB stream — orchestrator will not be triggered."
+  echo "    Recreate the table with streams enabled: ./scripts/create-dynamodb-tables.sh --with-tickets"
+else
+  EXISTING_UUID=$(
+    aws lambda list-event-source-mappings \
+      --function-name "agentcore-hub-orchestrator" \
+      --region "$AWS_REGION" \
+      --query "EventSourceMappings[?starts_with(EventSourceArn, \`${TICKETS_STREAM_ARN%/*}\`)].UUID | [0]" \
+      --output text 2>/dev/null || true
+  )
+  if [ -z "$EXISTING_UUID" ] || [ "$EXISTING_UUID" = "None" ]; then
+    aws lambda create-event-source-mapping \
+      --function-name "agentcore-hub-orchestrator" \
+      --event-source-arn "$TICKETS_STREAM_ARN" \
+      --starting-position LATEST \
+      --batch-size 10 \
+      --maximum-batching-window-in-seconds 1 \
+      --filter-criteria '{"Filters":[{"Pattern":"{\"eventName\":[\"INSERT\",\"MODIFY\"]}"}]}' \
+      --region "$AWS_REGION" \
+      --output text --query 'UUID' >/dev/null
+    echo "  ✓ Stream → orchestrator mapping created"
+  else
+    echo "  ✓ Stream → orchestrator mapping already exists ($EXISTING_UUID)"
+  fi
+fi
+
+# ── EventBridge: orchestrator/agent-invoker events → events-writer Lambda ─────
+# Mirrors WorkflowEventsRule + EventsWriterPermission in template.yaml.
+echo "=== Wiring events-writer trigger (EventBridge) ==="
+RULE_NAME="agentcore-hub-workflow-events"
+EVENT_BUS="${EVENT_BUS:-default}"
+EVENTS_WRITER_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-events-writer"
+
+aws events put-rule \
+  --name "$RULE_NAME" \
+  --event-bus-name "$EVENT_BUS" \
+  --event-pattern '{"source":["agentcore-hub.orchestrator","agentcore-hub.agent-invoker"]}' \
+  --state ENABLED \
+  --region "$AWS_REGION" \
+  --output text --query 'RuleArn' >/dev/null
+echo "  ✓ Rule $RULE_NAME upserted on bus $EVENT_BUS"
+
+aws events put-targets \
+  --rule "$RULE_NAME" \
+  --event-bus-name "$EVENT_BUS" \
+  --targets "Id=EventsTableWriter,Arn=$EVENTS_WRITER_ARN" \
+  --region "$AWS_REGION" \
+  --output text --query 'FailedEntryCount' >/dev/null
+echo "  ✓ Target events-writer attached to $RULE_NAME"
+
+RULE_ARN="arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:rule/${EVENT_BUS}/${RULE_NAME}"
+if [ "$EVENT_BUS" = "default" ]; then
+  RULE_ARN="arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}"
+fi
+PERM_SID="agentcore-hub-events-writer-eventbridge"
+if aws lambda get-policy \
+     --function-name agentcore-hub-events-writer \
+     --region "$AWS_REGION" \
+     --output text --query 'Policy' 2>/dev/null | grep -q "\"Sid\":\"$PERM_SID\""; then
+  echo "  ✓ events-writer EventBridge invoke permission already present"
+else
+  aws lambda add-permission \
+    --function-name agentcore-hub-events-writer \
+    --statement-id "$PERM_SID" \
+    --action lambda:InvokeFunction \
+    --principal events.amazonaws.com \
+    --source-arn "$RULE_ARN" \
+    --region "$AWS_REGION" \
+    --output text --query 'Statement' >/dev/null
+  echo "  ✓ events-writer EventBridge invoke permission added"
+fi
+
 rm -f function.zip
 echo "=== Done ==="
