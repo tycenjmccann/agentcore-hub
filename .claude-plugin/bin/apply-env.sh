@@ -52,6 +52,11 @@ fi
 brand_name=$(jq -r '.brand_name // "AgentCore Hub"' "$ANSWERS")
 modules=$(jq -r '.modules | join(",")' "$ANSWERS")
 ticket_provider=$(jq -r '.ticket_provider // "dynamodb"' "$ANSWERS")
+workflow_runtimes=$(jq -r '.workflow_runtimes // 1' "$ANSWERS")
+case "$workflow_runtimes" in
+  1|3|14) ;;
+  *) echo "Invalid workflow_runtimes: $workflow_runtimes (must be 1, 3, or 14)" >&2; exit 2 ;;
+esac
 aws_account=$(jq -r '.aws_account' "$ANSWERS")
 aws_region=$(jq -r '.aws_region' "$ANSWERS")
 github_mode=$(jq -r '.github.mode // "skip"' "$ANSWERS")
@@ -87,6 +92,7 @@ emit() {
   if [[ "$has_workflow" == "true" ]]; then
     echo "# --- Workflow module ---"
     emit TICKET_PROVIDER "$ticket_provider"
+    emit WORKFLOW_RUNTIME_COUNT "$workflow_runtimes"
     emit WORKFLOWS_TABLE "agentcore-hub-workflows"
     emit EVENTS_TABLE "agentcore-hub-events"
     emit ARTIFACT_BUCKET "agentcore-hub-artifacts-$aws_account-$aws_region"

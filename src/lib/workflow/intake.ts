@@ -467,8 +467,9 @@ export async function validateIntakeSources(
         await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
         return null; // OK
       } else if (value.startsWith("http://") || value.startsWith("https://")) {
-        // GitHub URLs from our own repos — trust them (SI loop references)
-        if (value.includes("github.com/tycenjmccann/")) {
+        // Trust GitHub URLs under the configured owner (SI loop references)
+        const trustedOwner = process.env.GITHUB_OWNER;
+        if (trustedOwner && value.includes(`github.com/${trustedOwner}/`)) {
           return null;
         }
         // HTTP URL — HEAD check

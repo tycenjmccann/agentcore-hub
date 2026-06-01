@@ -22,8 +22,8 @@
 set -e
 
 BASE_URL="${BASE_URL:-http://localhost:3000}"
-REPO_URL="${REPO_URL:-https://github.com/tycenjmccann/agentcore-console}"
-DEFAULT_BRANCH="${DEFAULT_BRANCH:-clean-main}"
+REPO_URL="${REPO_URL:-${TEST_REPO_URL:-https://github.com/octocat/Hello-World}}"
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
 
 # ─── Parse args ──────────────────────────────────────────────────────────────
 

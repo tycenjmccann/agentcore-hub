@@ -473,6 +473,10 @@ function printDone(id) {
   console.log(`  BUILDER_AGENT_ID=${id}`);
   console.log(`\n  Add to .env.local:`);
   console.log(`    BUILDER_AGENT_ID=${id}`);
-  console.log("\n  The Build page will now use this harness for agent creation.");
+  console.log("\n  This is the HARNESS ID. /build builds a harness ARN from it:");
+  console.log(`    arn:aws:bedrock-agentcore:${REGION}:<account>:harness/${id}`);
+  console.log("\n  Note: AgentCore also auto-provisions a runtime sibling named");
+  console.log(`  harness_agentcore_hub_builder-… If you see it via list-agent-runtimes,`);
+  console.log("  ignore it — /build uses the harness, not that runtime.");
   console.log("=".repeat(56) + "\n");
 }

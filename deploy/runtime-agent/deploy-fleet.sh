@@ -24,6 +24,8 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 REGION="${AWS_REGION:-us-east-1}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BASE_DIR="$SCRIPT_DIR"
 
 # Create runtime role if not already set
 if [ -z "${AGENTCORE_ROLE_ARN:-}" ]; then
@@ -36,8 +38,6 @@ fi
 ROLE_ARN="${AGENTCORE_ROLE_ARN}"
 GATEWAY_ARN="${GATEWAY_ARN:-}"  # Optional: AgentCore MCP gateway ARN
 MODEL_ID="us.anthropic.claude-opus-4-6-v1"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BASE_DIR="$SCRIPT_DIR"
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -145,5 +145,11 @@ echo ""
 "$SCRIPT_DIR/refresh-agents-json.sh" --region "$REGION"
 
 echo ""
+if [ "$FAIL" -gt 0 ]; then
+  echo "✗ $FAIL/${#AGENTS[@]} agents failed to deploy."
+  echo "  Re-run individually with: ./deploy-one.sh <agent-name>"
+  exit 1
+fi
+
 echo "Running post-deploy health check..."
 "$SCRIPT_DIR/verify-fleet.sh"

@@ -180,7 +180,7 @@ src/config/agents.json (repo)
     ↓ synced by deploy-all.sh
 s3://{ARTIFACT_BUCKET}/config/agents.json
     ↓ loaded on Lambda cold start
-orchestrator / agentcore-hub-tickets / agentcore-hub-jira-real
+orchestrator / agentcore-hub-tickets / agentcore-hub-jira
 ```
 
 All 3 Lambdas load the roster from S3 at cold start and cache it in memory. If S3 is unreachable, they fall back to a hardcoded copy (last known good).
@@ -229,7 +229,7 @@ All 3 Lambdas load the roster from S3 at cold start and cache it in memory. If S
 | Frontend (`pipeline-config.ts`) | Direct import at build time | All fields (renders UI) |
 | Orchestrator Lambda | S3 read at cold start | `agentId`, `phase`, `runtimeArn` |
 | agentcore-hub-tickets Lambda | S3 read at cold start | `id` only (validation Set) |
-| agentcore-hub-jira-real Lambda | S3 read at cold start | `id` only (validation Set) |
+| agentcore-hub-jira Lambda | S3 read at cold start | `id` only (validation Set) |
 | `deploy/runtime-agent/deploy-fleet.sh` | Reads agent list to deploy each runtime | All fields (deploys agents) |
 
 ---

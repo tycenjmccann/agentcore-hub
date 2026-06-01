@@ -47,21 +47,43 @@ case "$MODULE" in
       fail "BUILDER_AGENT_ID not in .env.local — run 'run-module.sh builder' first"
     fi
 
-    list_output=$(aws bedrock-agentcore-control list-agent-runtimes \
+    # The builder is a HARNESS, not a runtime. AgentCore auto-provisions a
+    # runtime sibling (harness_agentcore_hub_builder-…) under the hood — that's
+    # not what /build invokes, so we don't probe for it here.
+    list_output=$(aws bedrock-agentcore-control list-harnesses \
       --region "$AWS_REGION" 2>&1) || list_status=$?
     if [[ "${list_status:-0}" -ne 0 ]]; then
-      if echo "$list_output" | grep -q "Invalid choice"; then
+      if echo "$list_output" | grep -qE "Invalid choice|valid choices are"; then
+        # CLI lacks bedrock-agentcore-control. Fall back to a positive check
+        # via the SDK using the persisted BUILDER_AGENT_ID — this actually
+        # verifies the harness exists and is READY, instead of trusting the
+        # deploy script's earlier output.
         echo "  AWS CLI ($(aws --version 2>&1)) lacks bedrock-agentcore-control;" \
-             "trusting deploy-script-emitted BUILDER_AGENT_ID."
-        pass "BUILDER_AGENT_ID=$BUILDER_AGENT_ID persisted by deploy script"
+             "verifying via SDK GetHarness instead."
+        sdk_output=$(BUILDER_AGENT_ID="$BUILDER_AGENT_ID" AWS_REGION="$AWS_REGION" \
+          node --input-type=module -e '
+            import("@aws-sdk/client-bedrock-agentcore-control").then(async ({ BedrockAgentCoreControlClient, GetHarnessCommand }) => {
+              const c = new BedrockAgentCoreControlClient({ region: process.env.AWS_REGION });
+              const r = await c.send(new GetHarnessCommand({ harnessId: process.env.BUILDER_AGENT_ID }));
+              const status = r.harness?.status || "UNKNOWN";
+              const name = r.harness?.harnessName || "";
+              if (status !== "READY") { console.error(`status=${status} name=${name}`); process.exit(2); }
+              console.log(`status=READY name=${name}`);
+            }).catch(e => { console.error(e.name + ": " + e.message); process.exit(3); });
+          ' 2>&1) || sdk_status=$?
+        if [[ "${sdk_status:-0}" -ne 0 ]]; then
+          echo "$sdk_output" >&2
+          fail "GetHarness check failed for BUILDER_AGENT_ID=$BUILDER_AGENT_ID"
+        fi
+        pass "harness $BUILDER_AGENT_ID READY ($sdk_output)"
       else
         echo "$list_output" >&2
-        fail "list-agent-runtimes returned non-zero"
+        fail "list-harnesses returned non-zero"
       fi
     elif echo "$list_output" | grep -q "agentcore_hub_builder"; then
-      pass "agentcore_hub_builder runtime is registered"
+      pass "agentcore_hub_builder harness is registered"
     else
-      fail "agentcore_hub_builder runtime not found via list-agent-runtimes"
+      fail "agentcore_hub_builder harness not found via list-harnesses"
     fi
     ;;
 
@@ -84,10 +106,10 @@ case "$MODULE" in
       fail "deploy/runtime-agent/fleet-runtime-ids.json not produced by deploy-fleet.sh"
     fi
 
-    if [[ -f deploy/runtime-agent/verify-fleet-invoke.py ]]; then
+    if [[ -f deploy/runtime-agent/verify-fleet.sh ]]; then
       echo "→ Running quick fleet smoke test (one invocation per agent)"
-      (cd deploy/runtime-agent && python3 verify-fleet-invoke.py --fleet-file fleet-runtime-ids.json --quick) \
-        || fail "verify-fleet-invoke.py --quick reported failures"
+      (cd deploy/runtime-agent && ./verify-fleet.sh) \
+        || fail "verify-fleet.sh reported failures"
     fi
     pass "tables + fleet ARNs + quick fleet invocation"
     ;;
@@ -95,9 +117,9 @@ case "$MODULE" in
   evaluations)
     aws dynamodb describe-table --table-name agentcore-hub-eval-config --region "$AWS_REGION" >/dev/null 2>&1 \
       || fail "agentcore-hub-eval-config table not found"
-    aws lambda get-function --function-name eval-packager --region "$AWS_REGION" >/dev/null 2>&1 \
-      || fail "eval-packager Lambda not found"
-    pass "eval-config table + eval-packager Lambda"
+    aws lambda get-function --function-name agentcore-hub-eval-packager --region "$AWS_REGION" >/dev/null 2>&1 \
+      || fail "agentcore-hub-eval-packager Lambda not found"
+    pass "eval-config table + agentcore-hub-eval-packager Lambda"
     ;;
 
   *)

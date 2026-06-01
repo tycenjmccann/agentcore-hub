@@ -1,8 +1,10 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "agentcore-hub-setup",
+  "displayName": "AgentCore Hub Setup",
   "version": "0.1.0",
   "description": "Guided setup for AgentCore Hub. Asks which modules you want, then runs only the deploy scripts those modules need, with a verification gate between each phase.",
-  "author": "AgentCore Hub",
-  "skills": ["skills/setup.md"],
-  "agents": ["agents/deploy-runner.md"]
+  "author": {
+    "name": "AgentCore Hub"
+  }
 }

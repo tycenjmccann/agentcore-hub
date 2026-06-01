@@ -94,8 +94,25 @@ case "$MODULE" in
       aws s3 mb "s3://$BUCKET" --region "$AWS_REGION"
     fi
 
-    echo "→ bash deploy/setup-runtime-role.sh"
-    bash deploy/setup-runtime-role.sh
+    if [[ -d blueprints ]]; then
+      echo "→ Syncing blueprints/ → s3://$BUCKET/blueprints/"
+      aws s3 cp blueprints/ "s3://$BUCKET/blueprints/" --recursive --exclude "*" --include "*.md" --region "$AWS_REGION"
+    fi
+
+    echo "→ source deploy/setup-runtime-role.sh"
+    # Source (not bash) so AGENTCORE_ROLE_ARN survives into this shell and the
+    # subshell calls below — and gets persisted to .env.local for re-runs.
+    # shellcheck disable=SC1091
+    source deploy/setup-runtime-role.sh
+    : "${AGENTCORE_ROLE_ARN:?setup-runtime-role.sh did not export AGENTCORE_ROLE_ARN}"
+    if grep -q '^AGENTCORE_ROLE_ARN=' .env.local 2>/dev/null; then
+      sed "s|^AGENTCORE_ROLE_ARN=.*|AGENTCORE_ROLE_ARN=\"$AGENTCORE_ROLE_ARN\"|" .env.local > .env.local.tmp && mv .env.local.tmp .env.local
+    else
+      echo "AGENTCORE_ROLE_ARN=\"$AGENTCORE_ROLE_ARN\"" >> .env.local
+    fi
+    chmod 600 .env.local
+    echo "→ Persisted AGENTCORE_ROLE_ARN to .env.local"
+    export AGENTCORE_ROLE_ARN
 
     echo "→ node deploy/setup-tickets-lambda.mjs"
     node deploy/setup-tickets-lambda.mjs
@@ -103,16 +120,32 @@ case "$MODULE" in
     echo "→ deploy/runtime-agent/build-and-push.sh"
     (cd deploy/runtime-agent && ./build-and-push.sh)
 
-    echo "→ deploy/runtime-agent/deploy-fleet.sh"
-    (cd deploy/runtime-agent && ./deploy-fleet.sh)
+    : "${WORKFLOW_RUNTIME_COUNT:=1}"
+    export WORKFLOW_RUNTIME_COUNT
+    echo "→ deploy/runtime-agent/deploy-topology.sh (count=$WORKFLOW_RUNTIME_COUNT)"
+    (cd deploy/runtime-agent && ./deploy-topology.sh)
+
+    echo "→ lambda/orchestrator/deploy.sh"
+    ./lambda/orchestrator/deploy.sh
+
+    echo "→ lambda/workflow-output/deploy.sh"
+    ./lambda/workflow-output/deploy.sh
     ;;
 
   evaluations)
+    # Seed agentcore-hub-eval-config DDB table (one row per agent)
+    echo "→ deploy/continuous-improvement/deploy-all.sh"
+    bash deploy/continuous-improvement/deploy-all.sh
+
+    # Attach AgentCore online evaluations to each runtime
     echo "→ deploy/evaluations/setup-evaluations.sh"
     bash deploy/evaluations/setup-evaluations.sh
 
-    echo "→ deploy/continuous-improvement/deploy-all.sh"
-    bash deploy/continuous-improvement/deploy-all.sh
+    # Deploy continuous-improvement Lambdas (eval-packager + prd-submitter).
+    # prd-submitter needs DEPLOYMENT_URL — deploy.sh now tolerates a missing
+    # value and the user can re-run after App Runner.
+    echo "→ deploy/continuous-improvement/deploy.sh"
+    bash deploy/continuous-improvement/deploy.sh
     ;;
 
   *)

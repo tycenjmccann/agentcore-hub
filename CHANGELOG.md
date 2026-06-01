@@ -7,12 +7,12 @@ All notable changes to the agent fleet, orchestrator, and deployment system.
 ### 2026-05-25 — Config-Driven Roster, Assignee Validation, SI Loop Fixes
 
 **Config-Driven Agent Roster (DL-023):**
-- All 3 Lambdas (orchestrator, agentcore-hub-tickets, agentcore-hub-jira-real) now load roster from `s3://{BUCKET}/config/agents.json` on cold start
+- All 3 Lambdas (orchestrator, agentcore-hub-tickets, agentcore-hub-jira) now load roster from `s3://{BUCKET}/config/agents.json` on cold start
 - Hardcoded roster lists retained as fallback only (if S3 unreachable)
 - `deploy-all.sh` syncs `src/config/agents.json` to S3 alongside prompts
 - Adding/removing agents no longer requires Lambda redeployment — just sync the JSON to S3
 - IAM: added `s3-config-read` inline policy to ticket Lambda role
-- Env var `ARTIFACT_BUCKET` added to `agentcore-hub-tickets` and `agentcore-hub-jira-real`
+- Env var `ARTIFACT_BUCKET` added to `agentcore-hub-tickets` and `agentcore-hub-jira`
 
 **Assignee Validation (agentcore-hub-tickets):**
 - Added `VALID_AGENTS` validation to `agentcore-hub-tickets` Lambda (was already in `agentcore-hub-jira`)
@@ -33,7 +33,7 @@ All notable changes to the agent fleet, orchestrator, and deployment system.
 |--------|-------------|
 | `agentcore-hub-orchestrator` | Config-driven roster from S3 |
 | `agentcore-hub-tickets` | S3 roster + assignee validation |
-| `agentcore-hub-jira-real` | S3 roster loading |
+| `agentcore-hub-jira` | S3 roster loading |
 | `agentcore-hub-eval-packager` | Fixed CONFIG_TO_AGENT key names |
 | `agentcore-hub-skill-loader` | iOS dev guidance in requirements blueprint |
 
