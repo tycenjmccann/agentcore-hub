@@ -54,8 +54,8 @@ modules=$(jq -r '.modules | join(",")' "$ANSWERS")
 ticket_provider=$(jq -r '.ticket_provider // "dynamodb"' "$ANSWERS")
 workflow_runtimes=$(jq -r '.workflow_runtimes // 1' "$ANSWERS")
 case "$workflow_runtimes" in
-  1|3|14) ;;
-  *) echo "Invalid workflow_runtimes: $workflow_runtimes (must be 1, 3, or 14)" >&2; exit 2 ;;
+  1|4|14) ;;
+  *) echo "Invalid workflow_runtimes: $workflow_runtimes (must be 1, 4, or 14)" >&2; exit 2 ;;
 esac
 aws_account=$(jq -r '.aws_account' "$ANSWERS")
 aws_region=$(jq -r '.aws_region' "$ANSWERS")

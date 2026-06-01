@@ -159,6 +159,43 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentcore-hub-pipeline-agent")
 
+# Per-invocation prompt cache for shared-runtime topologies (1 or 4 runtimes
+# hosting many personas). First call for an agent_id reads
+# s3://{ARTIFACT_BUCKET}/prompts/{agent_id}.txt; subsequent calls in the same
+# microVM are dict lookups. A new runtimeSessionId starts a new microVM with
+# an empty cache, so prompt edits in S3 propagate on the next session without
+# redeploying the runtime. In 14-runtime mode, the deploy-time SYSTEM_PROMPT
+# already matches the requested agent_id and the cache is bypassed.
+_PROMPT_CACHE: dict[str, str] = {}
+
+
+def _load_prompt_for_agent(agent_id: str) -> str:
+    if not agent_id or agent_id == "unknown":
+        return SYSTEM_PROMPT
+    if _agent_name_from_prompt_key and agent_id == _agent_name_from_prompt_key:
+        return SYSTEM_PROMPT
+    cached = _PROMPT_CACHE.get(agent_id)
+    if cached is not None:
+        return cached
+    if not ARTIFACT_BUCKET:
+        return SYSTEM_PROMPT
+    key = f"prompts/{agent_id}.txt"
+    try:
+        body = (
+            boto3.client("s3", region_name=REGION)
+            .get_object(Bucket=ARTIFACT_BUCKET, Key=key)["Body"]
+            .read()
+            .decode("utf-8")
+        )
+        _PROMPT_CACHE[agent_id] = body
+        logger.info(f"[{agent_id}] Loaded prompt from s3://{ARTIFACT_BUCKET}/{key}")
+        return body
+    except Exception as e:
+        logger.warning(
+            f"[{agent_id}] Prompt load failed (s3://{ARTIFACT_BUCKET}/{key}): {e} — falling back to deployed SYSTEM_PROMPT"
+        )
+        return SYSTEM_PROMPT
+
 # --- Load Claude Code skills from S3 at cold start ---
 # Skills are stored as SKILL.md files in S3 under skills/{role}/.
 # We sync them to /tmp/.claude/skills/ so claude_code auto-discovers them.
@@ -917,11 +954,15 @@ async def agent_invocation(payload, context):
                     "workflowId": workflow_id,
                 })
 
-    # Create agent — we publish events from stream_async loop directly
+    # Create agent — we publish events from stream_async loop directly.
+    # Prompt resolves per-invocation: shared-runtime topologies (1 or 4 runtimes)
+    # need the right persona prompt for the agent_id in this payload; 14-runtime
+    # mode short-circuits to the deployed SYSTEM_PROMPT.
     tracker = ToolTrackingHandler()
+    persona_prompt = _load_prompt_for_agent(agent_id)
     agent = Agent(
         model=active_model,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=persona_prompt,
         tools=all_tools,
         callback_handler=None,
     )

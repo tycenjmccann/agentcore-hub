@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # ─── Deploy AgentCore runtimes per topology choice (Q4 in /setup) ───────────
 #
-# Reads WORKFLOW_RUNTIME_COUNT from the environment (1, 3, or 14) and:
-#   1  → deploy ONE shared runtime; map all 14 personas' runtimeArn to it
-#   3  → deploy THREE phase-grouped runtimes; map personas by phase
-#   14 → delegate to deploy-fleet.sh (existing one-runtime-per-persona path)
+# Reads WORKFLOW_RUNTIME_COUNT from the environment (1, 4, or 14):
+#   1  → ONE shared runtime hosting all 14 personas (mono-agent).
+#   4  → FOUR runtimes grouped by pipeline phase:
+#          - requirements_analyst   (intake/requirements)
+#          - backend_designer       (design — 8 personas)
+#          - backend_dev            (development — 3 personas)
+#          - qa_verifier            (verification + review — qa + ci)
+#   14 → ONE runtime per persona (delegates to deploy-fleet.sh).
 #
-# In the 1- and 3-runtime modes, the personas are differentiated only by their
-# routing in src/config/agents.json. Per-persona prompts and blueprints stay in
-# S3 (agentcore-hub-artifacts-…/prompts/{agentId}.txt) — runtime selection is
-# purely a deploy + mapping concern, no app code changes.
+# In 1- and 4-runtime modes, the runtime resolves the right per-persona
+# system prompt at invocation time from s3://${ARTIFACT_BUCKET}/prompts/{agentId}.txt
+# (see _load_prompt_for_agent in deploy/runtime-agent/main.py). Persona
+# differentiation is the runtime's responsibility; topology only controls how
+# many runtimes exist and what runtimeArn each persona points at.
 #
 # Required env (from .env.local / config.sh):
 #   AWS_REGION, AGENTCORE_ROLE_ARN, ARTIFACT_BUCKET
@@ -23,34 +28,47 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 AGENTS_JSON="$REPO_ROOT/src/config/agents.json"
+PROMPTS_DIR="$SCRIPT_DIR/prompts"
+
+: "${AWS_REGION:?AWS_REGION must be set}"
+: "${ARTIFACT_BUCKET:?ARTIFACT_BUCKET must be set}"
 
 COUNT="${WORKFLOW_RUNTIME_COUNT:-14}"
 case "$COUNT" in
-  1|3|14) ;;
-  *) echo "ERROR: WORKFLOW_RUNTIME_COUNT must be 1, 3, or 14 (got: $COUNT)" >&2; exit 2 ;;
+  1|4|14) ;;
+  *) echo "ERROR: WORKFLOW_RUNTIME_COUNT must be 1, 4, or 14 (got: $COUNT)" >&2; exit 2 ;;
 esac
 
 echo "── Runtime topology: $COUNT runtime(s) ─────────────────────"
+
+# ── Always sync per-persona prompts to S3 ───────────────────────────────────
+# In 1- and 4-mode the shared runtime fetches prompts/{agentId}.txt at invoke
+# time. In 14-mode deploy-one.sh uploads each persona's prompt anyway, so this
+# pre-sync is harmless and keeps S3 authoritative regardless of topology.
+echo "→ Syncing 14 persona prompts to s3://${ARTIFACT_BUCKET}/prompts/"
+aws s3 sync "$PROMPTS_DIR" "s3://${ARTIFACT_BUCKET}/prompts/" \
+  --region "$AWS_REGION" \
+  --exclude "*" --include "*.txt" \
+  --only-show-errors
 
 if [[ "$COUNT" == "14" ]]; then
   exec "$SCRIPT_DIR/deploy-fleet.sh"
 fi
 
-# ── 1- and 3-runtime modes ──────────────────────────────────────────────────
-# Pick representative personas to actually deploy; the rest get their ARN
-# rewritten in agents.json to point at one of the deployed runtimes.
-
+# ── 1- and 4-runtime modes: deploy anchors, then remap agents.json ──────────
 if [[ "$COUNT" == "1" ]]; then
   ANCHORS=("agentcore_hub_requirements_analyst")
 else
-  # 3 runtimes — one per phase group:
-  #   intake/requirements/review → requirements_analyst
-  #   design                     → backend_designer
-  #   development/verification   → backend_dev
+  # 4-runtime mode — one anchor per pipeline phase:
+  #   requirements (1)              → requirements_analyst
+  #   design (8)                    → backend_designer
+  #   development (3)               → backend_dev
+  #   verification + review (1 + 1) → qa_verifier
   ANCHORS=(
     "agentcore_hub_requirements_analyst"
     "agentcore_hub_backend_designer"
     "agentcore_hub_backend_dev"
+    "agentcore_hub_qa_verifier"
   )
 fi
 
@@ -92,11 +110,13 @@ echo "→ Mapping ${#ANCHORS[@]} anchor ARN(s) onto 14 personas in agents.json"
 ANCHOR_REQ="${ANCHOR_ARN[agentcore_hub_requirements_analyst]:-}"
 ANCHOR_DESIGN="${ANCHOR_ARN[agentcore_hub_backend_designer]:-}"
 ANCHOR_DEV="${ANCHOR_ARN[agentcore_hub_backend_dev]:-}"
+ANCHOR_QA="${ANCHOR_ARN[agentcore_hub_qa_verifier]:-}"
 
 COUNT="$COUNT" \
 ANCHOR_REQ="$ANCHOR_REQ" \
 ANCHOR_DESIGN="$ANCHOR_DESIGN" \
 ANCHOR_DEV="$ANCHOR_DEV" \
+ANCHOR_QA="$ANCHOR_QA" \
 AGENTS_JSON="$AGENTS_JSON" \
 python3 <<'PYEOF'
 import json
@@ -108,6 +128,7 @@ agents_path = os.environ["AGENTS_JSON"]
 anchor_req = os.environ.get("ANCHOR_REQ", "")
 anchor_design = os.environ.get("ANCHOR_DESIGN", "")
 anchor_dev = os.environ.get("ANCHOR_DEV", "")
+anchor_qa = os.environ.get("ANCHOR_QA", "")
 
 with open(agents_path) as f:
     text = f.read()
@@ -118,13 +139,15 @@ def arn_for(agent):
     phase = agent["phase"]
     if count == "1":
         return anchor_req
-    # 3-runtime mode: phase → anchor
-    if phase in ("requirements", "review"):
+    # 4-runtime mode: phase → anchor
+    if phase == "requirements":
         return anchor_req
     if phase == "design":
         return anchor_design
-    if phase in ("development", "verification"):
+    if phase == "development":
         return anchor_dev
+    if phase in ("verification", "review"):
+        return anchor_qa
     return anchor_req  # fallback for unknown phases
 
 updated = 0
@@ -159,6 +182,15 @@ with open(agents_path, "w") as f:
 
 print(f"  Updated runtimeArn on {updated}/14 personas")
 PYEOF
+
+# ── Upload the rewritten agents.json so Lambdas pick it up at next cold start ─
+# (DL-023: the orchestrator, agentcore-hub-tickets, and agentcore-hub-jira
+# Lambdas all read s3://${ARTIFACT_BUCKET}/config/agents.json on cold start.)
+echo "→ Uploading agents.json to s3://${ARTIFACT_BUCKET}/config/agents.json"
+aws s3 cp "$AGENTS_JSON" "s3://${ARTIFACT_BUCKET}/config/agents.json" \
+  --region "$AWS_REGION" \
+  --content-type application/json \
+  --only-show-errors
 
 echo ""
 echo "── Topology deploy complete ($COUNT runtime mode) ──────────"
