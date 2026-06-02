@@ -15,7 +15,7 @@
 #   "aws_region": "us-east-1",
 #   "aws_profile": "default",
 #   "deploy_target": "local" | "apprunner" | "byo" | "skip",
-#   "github": { "mode": "pat" | "mcp" | "skip", "pat": "...", "mcp_servers": "..." },
+#   "github": { "mode": "pat" | "mcp" | "skip", "pat": "...", "mcp_servers": "...", "owner": "octocat", "repo": "my-project" },
 #   "jira": { "site_url": "...", "email": "...", "api_token": "...", "project_key": "..." } | null
 # }
 #
@@ -69,6 +69,8 @@ aws_region=$(jq -r '.aws_region' "$ANSWERS")
 github_mode=$(jq -r '.github.mode // "skip"' "$ANSWERS")
 github_pat=$(jq -r '.github.pat // ""' "$ANSWERS")
 mcp_servers=$(jq -r '.github.mcp_servers // ""' "$ANSWERS")
+github_owner=$(jq -r '.github.owner // ""' "$ANSWERS")
+github_repo=$(jq -r '.github.repo // ""' "$ANSWERS")
 
 has_workflow=false
 has_evals=false
@@ -123,6 +125,12 @@ emit() {
       emit GITHUB_PAT "$github_pat"
     elif [[ "$github_mode" == "mcp" && -n "$mcp_servers" ]]; then
       emit MCP_SERVERS "$mcp_servers"
+    fi
+    if [[ -n "$github_owner" ]]; then
+      emit GITHUB_OWNER "$github_owner"
+    fi
+    if [[ -n "$github_repo" ]]; then
+      emit GITHUB_REPO "$github_repo"
     fi
     echo ""
   fi
