@@ -90,10 +90,105 @@ if (!HARNESS_ROLE_ARN) {
     }],
   });
 
+  // Re-applying policies on every run is intentional: PutRole/AttachRolePolicy
+  // are idempotent, and a previous /setup teardown can leave the role as an
+  // empty shell (e.g. session policy denies iam:DeleteRole, so the role
+  // survives but its inline policies were stripped). Without this, a fresh
+  // install over a stale role silently produces a builder that 500s on
+  // bedrock:InvokeModelWithResponseStream.
+  const attachAllPolicies = async () => {
+    await iam.send(new AttachRolePolicyCommand({
+      RoleName: ROLE_NAME,
+      PolicyArn: "arn:aws:iam::aws:policy/BedrockAgentCoreFullAccess",
+    }));
+    console.log(`   ✓ Attached BedrockAgentCoreFullAccess managed policy`);
+
+    await iam.send(new PutRolePolicyCommand({
+      RoleName: ROLE_NAME,
+      PolicyName: "HarnessCodeInterpreterAndBrowser",
+      PolicyDocument: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+          Sid: "CodeInterpreterAndBrowser",
+          Effect: "Allow",
+          Action: [
+            "bedrock-agentcore:StartCodeInterpreterSession",
+            "bedrock-agentcore:StopCodeInterpreterSession",
+            "bedrock-agentcore:GetCodeInterpreterSession",
+            "bedrock-agentcore:ListCodeInterpreterSessions",
+            "bedrock-agentcore:ExecuteCode",
+            "bedrock-agentcore:ExecuteCommand",
+            "bedrock-agentcore:InstallPackages",
+            "bedrock-agentcore:UploadFile",
+            "bedrock-agentcore:DownloadFile",
+            "bedrock-agentcore:StartBrowserSession",
+            "bedrock-agentcore:StopBrowserSession",
+            "bedrock-agentcore:GetBrowserSession",
+            "bedrock-agentcore:ListBrowserSessions",
+          ],
+          Resource: "*",
+        }],
+      }),
+    }));
+    console.log(`   ✓ Attached CodeInterpreter + Browser inline policy`);
+
+    await iam.send(new PutRolePolicyCommand({
+      RoleName: ROLE_NAME,
+      PolicyName: "BedrockModelInvoke",
+      PolicyDocument: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+          Sid: "InvokeModels",
+          Effect: "Allow",
+          Action: [
+            "bedrock:InvokeModel",
+            "bedrock:InvokeModelWithResponseStream",
+          ],
+          Resource: "*",
+        }],
+      }),
+    }));
+    console.log(`   ✓ Attached Bedrock model invoke inline policy`);
+
+    await iam.send(new PutRolePolicyCommand({
+      RoleName: ROLE_NAME,
+      PolicyName: "HarnessInvokeGateway",
+      PolicyDocument: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+          Sid: "GatewayInvoke",
+          Effect: "Allow",
+          Action: "bedrock-agentcore:InvokeGateway",
+          Resource: `arn:aws:bedrock-agentcore:${REGION}:${accountId}:gateway/*`,
+        }],
+      }),
+    }));
+    console.log(`   ✓ Attached Gateway invoke inline policy`);
+
+    await iam.send(new PutRolePolicyCommand({
+      RoleName: ROLE_NAME,
+      PolicyName: "PassRoleForChildAgents",
+      PolicyDocument: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+          Sid: "PassRole",
+          Effect: "Allow",
+          Action: "iam:PassRole",
+          Resource: `arn:aws:iam::${accountId}:role/${ROLE_NAME}`,
+          Condition: {
+            StringEquals: { "iam:PassedToService": "bedrock-agentcore.amazonaws.com" },
+          },
+        }],
+      }),
+    }));
+    console.log(`   ✓ Attached PassRole inline policy (for child agent creation)`);
+  };
+
+  let createdNewRole = false;
   try {
     const existing = await iam.send(new GetRoleCommand({ RoleName: ROLE_NAME }));
     HARNESS_ROLE_ARN = existing.Role.Arn;
-    console.log(`   ✓ Role "${ROLE_NAME}" already exists`);
+    console.log(`   ✓ Role "${ROLE_NAME}" already exists — re-applying policies`);
   } catch (err) {
     if (err.name === "NoSuchEntityException") {
       await iam.send(new CreateRoleCommand({
@@ -103,104 +198,17 @@ if (!HARNESS_ROLE_ARN) {
       }));
       HARNESS_ROLE_ARN = `arn:aws:iam::${accountId}:role/${ROLE_NAME}`;
       console.log(`   ✓ Role "${ROLE_NAME}" created`);
-
-      // Attach AWS managed policy for AgentCore access
-      await iam.send(new AttachRolePolicyCommand({
-        RoleName: ROLE_NAME,
-        PolicyArn: "arn:aws:iam::aws:policy/BedrockAgentCoreFullAccess",
-      }));
-      console.log(`   ✓ Attached BedrockAgentCoreFullAccess managed policy`);
-
-      // Inline policy: code interpreter + browser
-      await iam.send(new PutRolePolicyCommand({
-        RoleName: ROLE_NAME,
-        PolicyName: "HarnessCodeInterpreterAndBrowser",
-        PolicyDocument: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [{
-            Sid: "CodeInterpreterAndBrowser",
-            Effect: "Allow",
-            Action: [
-              "bedrock-agentcore:StartCodeInterpreterSession",
-              "bedrock-agentcore:StopCodeInterpreterSession",
-              "bedrock-agentcore:GetCodeInterpreterSession",
-              "bedrock-agentcore:ListCodeInterpreterSessions",
-              "bedrock-agentcore:ExecuteCode",
-              "bedrock-agentcore:ExecuteCommand",
-              "bedrock-agentcore:InstallPackages",
-              "bedrock-agentcore:UploadFile",
-              "bedrock-agentcore:DownloadFile",
-              "bedrock-agentcore:StartBrowserSession",
-              "bedrock-agentcore:StopBrowserSession",
-              "bedrock-agentcore:GetBrowserSession",
-              "bedrock-agentcore:ListBrowserSessions",
-            ],
-            Resource: "*",
-          }],
-        }),
-      }));
-      console.log(`   ✓ Attached CodeInterpreter + Browser inline policy`);
-
-      // Inline policy: Bedrock model invoke
-      await iam.send(new PutRolePolicyCommand({
-        RoleName: ROLE_NAME,
-        PolicyName: "BedrockModelInvoke",
-        PolicyDocument: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [{
-            Sid: "InvokeModels",
-            Effect: "Allow",
-            Action: [
-              "bedrock:InvokeModel",
-              "bedrock:InvokeModelWithResponseStream",
-            ],
-            Resource: "*",
-          }],
-        }),
-      }));
-      console.log(`   ✓ Attached Bedrock model invoke inline policy`);
-
-      // Inline policy: Gateway invoke
-      await iam.send(new PutRolePolicyCommand({
-        RoleName: ROLE_NAME,
-        PolicyName: "HarnessInvokeGateway",
-        PolicyDocument: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [{
-            Sid: "GatewayInvoke",
-            Effect: "Allow",
-            Action: "bedrock-agentcore:InvokeGateway",
-            Resource: `arn:aws:bedrock-agentcore:${REGION}:${accountId}:gateway/*`,
-          }],
-        }),
-      }));
-      console.log(`   ✓ Attached Gateway invoke inline policy`);
-
-      // Inline policy: IAM PassRole (so builder can create child harnesses)
-      await iam.send(new PutRolePolicyCommand({
-        RoleName: ROLE_NAME,
-        PolicyName: "PassRoleForChildAgents",
-        PolicyDocument: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [{
-            Sid: "PassRole",
-            Effect: "Allow",
-            Action: "iam:PassRole",
-            Resource: `arn:aws:iam::${accountId}:role/${ROLE_NAME}`,
-            Condition: {
-              StringEquals: { "iam:PassedToService": "bedrock-agentcore.amazonaws.com" },
-            },
-          }],
-        }),
-      }));
-      console.log(`   ✓ Attached PassRole inline policy (for child agent creation)`);
-
-      // Wait for IAM propagation
-      console.log(`   ⏳ Waiting 10s for IAM role propagation...`);
-      await sleep(10000);
+      createdNewRole = true;
     } else {
       throw err;
     }
+  }
+
+  await attachAllPolicies();
+
+  if (createdNewRole) {
+    console.log(`   ⏳ Waiting 10s for IAM role propagation...`);
+    await sleep(10000);
   }
 } else {
   console.log(`\n   Using provided role: ${HARNESS_ROLE_ARN}\n`);
