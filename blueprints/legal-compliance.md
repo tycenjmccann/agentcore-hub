@@ -22,10 +22,10 @@ claude_code(
 ### Step 3: Review & Deliver
 - Validate findings against applicable regulations
 - Determine blocking vs advisory
-- Save compliance review
-- Create tickets for required changes
-- `WorkflowOutput___report_completion`
+- Save compliance review with all findings and required changes
+- `WorkflowOutput___report_completion` — blocking findings make the verdict FAIL
 
 ## Rules
 - Always delegate to `claude_code`
-- Missing consent flows or undocumented data collection are BLOCKING
+- Missing consent flows or undocumented data collection are BLOCKING — report them as a FAIL verdict in the review document
+- Do NOT create tickets for required changes. Report findings in your review document; the verdict and findings are your deliverable.

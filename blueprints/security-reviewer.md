@@ -24,11 +24,11 @@ claude_code(
 - Determine if any are blocking vs advisory
 
 ### Step 4: Deliver
-- Save security review document
-- If blocking findings: create fix tickets with clear remediation
-- `WorkflowOutput___report_completion` with pass/fail verdict
+- Save security review document with all findings and remediation guidance
+- `WorkflowOutput___report_completion` with pass/fail verdict — Critical/High findings make the verdict FAIL
 
 ## Rules
 - Always delegate analysis to `claude_code`
-- Critical/High findings are BLOCKING — create fix tickets
+- Critical/High findings are BLOCKING — report them as a FAIL verdict in the review document; do NOT create tickets
 - Medium/Low are advisory — note in review, don't block
+- Do NOT create fix/remediation tickets. Report findings in your review document; the verdict and findings are your deliverable.
