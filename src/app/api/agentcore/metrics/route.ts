@@ -161,7 +161,14 @@ async function getTokenUsageFromSpans(region: string): Promise<Record<string, { 
     const endTime = Math.floor(Date.now() / 1000);
     const startTime = endTime - 30 * 24 * 60 * 60; // Last 30 days
 
-    const query = `fields @message | filter name like /^chat / | limit 10000`;
+    // Aggregate token usage server-side. Pulling raw @message blobs (limit
+    // 10000) and JSON.parsing each one client-side took 80s+; a stats query
+    // returns one small row per service in ~1s.
+    const query = `
+      fields \`attributes.gen_ai.usage.input_tokens\` as inp, \`attributes.gen_ai.usage.output_tokens\` as outp, \`resource.attributes.service.name\` as svc
+      | filter name like /^chat /
+      | stats sum(inp) as inputTokens, sum(outp) as outputTokens, count(*) as calls by svc
+    `;
 
     const startRes = await client.send(
       new StartQueryCommand({
@@ -180,25 +187,12 @@ async function getTokenUsageFromSpans(region: string): Promise<Record<string, { 
     const agents: Record<string, { input: number; output: number; calls: number }> = {};
 
     for (const row of results) {
-      const msg = row["@message"];
-      if (!msg) continue;
-
-      try {
-        const obj = JSON.parse(msg);
-        const attrs = obj.attributes || {};
-        const svc = obj.resource?.attributes?.["service.name"] || "unknown";
-        const inp = Number(attrs["gen_ai.usage.input_tokens"] || 0);
-        const outp = Number(attrs["gen_ai.usage.output_tokens"] || 0);
-
-        if (inp > 0 || outp > 0) {
-          if (!agents[svc]) agents[svc] = { input: 0, output: 0, calls: 0 };
-          agents[svc].input += inp;
-          agents[svc].output += outp;
-          agents[svc].calls += 1;
-        }
-      } catch {
-        // Skip unparseable entries
-      }
+      const svc = row.svc;
+      if (!svc) continue;
+      const input = Number(row.inputTokens || 0);
+      const output = Number(row.outputTokens || 0);
+      const calls = Number(row.calls || 0);
+      agents[svc] = { input, output, calls };
     }
 
     return agents;
