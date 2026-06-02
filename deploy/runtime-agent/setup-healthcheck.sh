@@ -67,31 +67,60 @@ echo ""
 
 echo "  [2/5] Discovering deployed agents..."
 
-AGENT_ARNS=$(aws bedrock-agentcore-control list-agent-runtimes \
-  --region "$REGION" \
-  --output json 2>/dev/null | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
+# Use boto3 directly rather than `aws bedrock-agentcore-control list-agent-runtimes`.
+# That control-plane API is in preview: it ships in the AWS SDKs (boto3) but is
+# NOT yet exposed by the AWS CLI, so the CLI call fails on stock installs. boto3
+# is already a dependency of the fleet tooling, so this works everywhere the
+# health check runs. Errors are surfaced, not swallowed.
+AGENT_ARNS=$(REGION="$REGION" python3 <<'PY'
+import json, os, sys
+try:
+    import boto3
+except ImportError:
+    sys.stderr.write("ERROR: boto3 not installed. pip install boto3\n")
+    sys.exit(2)
+
+region = os.environ["REGION"]
+try:
+    client = boto3.client("bedrock-agentcore-control", region_name=region)
+except Exception as e:
+    sys.stderr.write(f"ERROR: could not create bedrock-agentcore-control client: {e}\n")
+    sys.exit(2)
+
 fleet = {}
-# Different CLI versions return either 'agentRuntimes' or 'agentRuntimeSummaries'
-runtimes = data.get('agentRuntimes') or data.get('agentRuntimeSummaries') or []
-for r in runtimes:
-    name = r.get('agentRuntimeName') or r.get('name') or ''
-    if not name.startswith('agentcore_hub_'):
-        continue
-    status = (r.get('status') or '').upper()
-    if status and status != 'READY':
-        continue
-    arn = r.get('agentRuntimeArn') or r.get('arn')
-    if name and arn:
-        fleet[name] = arn
+next_token = None
+try:
+    while True:
+        kwargs = {"nextToken": next_token} if next_token else {}
+        resp = client.list_agent_runtimes(**kwargs)
+        runtimes = resp.get("agentRuntimes") or resp.get("agentRuntimeSummaries") or []
+        for r in runtimes:
+            name = r.get("agentRuntimeName") or r.get("name") or ""
+            if not name.startswith("agentcore_hub_"):
+                continue
+            status = (r.get("status") or "").upper()
+            if status and status != "READY":
+                continue
+            arn = r.get("agentRuntimeArn") or r.get("arn")
+            if name and arn:
+                fleet[name] = arn
+        next_token = resp.get("nextToken")
+        if not next_token:
+            break
+except Exception as e:
+    sys.stderr.write(f"ERROR: list_agent_runtimes failed: {e}\n")
+    sys.exit(2)
+
 print(json.dumps(fleet, indent=2))
-")
+PY
+) || {
+  echo "  ERROR: Failed to list agent runtimes in $REGION (see error above)."
+  exit 1
+}
 
 if [ -z "$AGENT_ARNS" ] || [ "$AGENT_ARNS" = "{}" ]; then
   echo "  ERROR: No READY agentcore-hub runtimes found in $REGION."
   echo "         Deploy agents first: ./deploy-topology.sh (or ./deploy-fleet.sh)"
-  echo "         If list-agent-runtimes is missing, upgrade the AWS CLI."
   exit 1
 fi
 
