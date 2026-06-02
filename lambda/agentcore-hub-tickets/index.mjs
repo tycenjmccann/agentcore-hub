@@ -142,6 +142,7 @@ export const handler = async (event) => {
       case "list_tickets":
         return await listTickets(args);
       case "transition_issue":
+      case "transition_ticket":
         return await transitionIssue(args);
       case "get_transitions":
         return await getTransitions(args);
@@ -153,10 +154,13 @@ export const handler = async (event) => {
         return await getProjectIssueTypes(args);
       case "lookup_user":
         return await lookupUser(args);
-      default:
-        return textResult(
-          `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue, get_transitions, add_comment, list_projects, get_project_issue_types, lookup_user`
-        );
+      default: {
+        // Return an `error` field so callers (e.g. workflow-output) can tell a
+        // no-op from a real result. Without this, an unrecognized tool name
+        // looked like success and silently stalled the pipeline.
+        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, list_projects, get_project_issue_types, lookup_user`;
+        return { error: message, content: [{ text: message }] };
+      }
     }
   } catch (err) {
     console.error("Tool execution error:", err);

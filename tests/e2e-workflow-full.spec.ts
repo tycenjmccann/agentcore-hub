@@ -2,69 +2,51 @@ import { test, expect } from "@playwright/test";
 
 /**
  * Full end-to-end workflow test against the DEPLOYED site.
- * Starts a new workflow, then polls the state API until the pipeline
- * reaches "complete" or times out.
  *
- * This test triggers REAL agent execution and takes 5-10+ minutes.
+ * Drives the built-in "Test Workflow" button on /workflow, which fires the same
+ * connectivity-check pipeline as scripts/test-ticket-flow.sh: each of the 14
+ * agents loads its skill, touches its tools (git ls-remote, a tiny S3 write),
+ * and reports completion — no code is written and no repos are cloned. That is
+ * the intended e2e path: it exercises real orchestration + every agent's tool
+ * access while finishing far faster than a feature build. We then poll the
+ * state API until the pipeline reaches "complete".
+ *
+ * This test triggers REAL agent execution and takes several minutes.
  * Run with: npx playwright test tests/e2e-workflow-full.spec.ts --timeout 600000
  */
 test.describe("End-to-End Workflow", () => {
   test.setTimeout(600_000); // 10 minutes
 
-  test("submit workflow and verify pipeline reaches complete", async ({ page, request }) => {
-    // 1. Navigate to workflow page
+  test("run built-in Test Workflow and verify pipeline reaches complete", async ({ page, request }) => {
+    // 1. Navigate to workflow page — fresh load shows the empty-state panel
+    //    with the amber "Test Workflow" button (it only renders when no
+    //    workflow is selected and the intake form is closed).
     await page.goto("/workflow");
-    await page.waitForTimeout(2000);
 
-    // Click "New Workflow" button to open intake form
-    const newWorkflowBtn = page.getByRole("button", { name: "New Workflow" });
-    if (await newWorkflowBtn.isVisible().catch(() => false)) {
-      await newWorkflowBtn.click();
-      await page.waitForTimeout(1000);
-    }
+    // 2. Click the built-in Test Workflow button. handleTestWorkflow POSTs to
+    //    /api/workflow/start with the connectivity-check description, then
+    //    pushState's the new id into the URL as ?id=<workflowId>.
+    const testBtn = page.getByRole("button", { name: "Test Workflow" });
+    await expect(testBtn).toBeVisible({ timeout: 10_000 });
+    await testBtn.click();
+    await page.screenshot({ path: "test-results/workflow-01-test-clicked.png" });
 
-    // 2. Fill intake form
-    const titleInput = page.locator("input[placeholder*='profile photo carousel']");
-    await expect(titleInput).toBeVisible({ timeout: 5000 });
-    await titleInput.fill("E2E Test: Add dark mode toggle");
-
-    const descInput = page.locator("textarea[placeholder*='Describe the feature']");
-    await descInput.fill(
-      "Users should be able to toggle between light and dark mode from the settings page. " +
-      "The preference should persist across sessions using local storage. " +
-      "All components should respect the theme choice."
-    );
-
-    await page.screenshot({ path: "test-results/workflow-01-intake-filled.png" });
-
-    // 3. Submit the workflow
-    const submitBtn = page.getByRole("button", { name: "Start Team Workflow" });
-    await expect(submitBtn).toBeVisible();
-    await submitBtn.click();
-
-    // Wait for submit to complete — button should change or page should navigate
-    await page.waitForTimeout(5000);
-    await page.screenshot({ path: "test-results/workflow-02-started.png" });
-
-    // 4. Extract workflow ID from URL or page content
+    // 3. Extract the workflow ID from the URL once handleTestWorkflow navigates.
     let workflowId: string | null = null;
+    await expect
+      .poll(async () => {
+        const m = page.url().match(/[?&]id=([^&]+)/);
+        workflowId = m ? m[1] : null;
+        return workflowId;
+      }, { timeout: 30_000, message: "Test Workflow did not produce a workflow id in the URL" })
+      .toBeTruthy();
 
-    // Check URL for id param
-    const url = page.url();
-    const urlMatch = url.match(/[?&]id=([^&]+)/);
-    if (urlMatch) {
-      workflowId = urlMatch[1];
-    }
-
-    // If not in URL, try to get it from the workflow list API
+    // Fallback: if pushState didn't land, take the most recent workflow.
     if (!workflowId) {
       const listRes = await request.get("/api/workflow/list");
       if (listRes.ok()) {
         const data = await listRes.json();
-        if (data.workflows?.length > 0) {
-          // Get the most recent workflow
-          workflowId = data.workflows[0].id;
-        }
+        if (data.workflows?.length > 0) workflowId = data.workflows[0].id;
       }
     }
 
@@ -120,34 +102,20 @@ test.describe("End-to-End Workflow", () => {
         console.log(`Pipeline COMPLETE after ${i * 5}s — ${ticketsDone}/${totalTickets} tickets done`);
         break;
       }
-
-      // Early exit: if we've reached design+ and at least one agent completed,
-      // the orchestration cascade is proven working. Full pipeline takes 15-20 min
-      // which exceeds reasonable CI timeout.
-      const currentIdx = phaseOrder.indexOf(currentPhase);
-      if (currentIdx >= 1 && ticketsDone >= 1) {
-        console.log(`Pipeline VERIFIED after ${i * 5}s — reached "${currentPhase}" with ${ticketsDone}/${totalTickets} done. Orchestration cascade confirmed.`);
-        break;
-      }
     }
 
     // 6. Final validation
     await page.screenshot({ path: "test-results/workflow-03-final-state.png" });
 
-    // We must have progressed past the initial phase
+    // The connectivity check is designed to finish — each agent does a tiny,
+    // bounded task. Hold the full bar: the pipeline must reach "complete".
     const phaseIdx = phaseOrder.indexOf(lastPhase);
-    expect(phaseIdx).toBeGreaterThan(0); // Must get past "requirements" at minimum
-
-    if (reachedComplete) {
-      // All tickets should be done
-      expect(ticketsDone).toBe(totalTickets);
-    } else {
-      // Full pipeline takes 15-20 min (14 agents across 5 phases).
-      // Within 10 min timeout, reaching "design" proves orchestration works:
-      // requirements agent completed → created tickets → cascade triggered design agents.
+    if (!reachedComplete) {
       console.log(`Pipeline did not reach "complete" within timeout. Last phase: ${lastPhase} (${ticketsDone}/${totalTickets} done)`);
-      expect(phaseIdx).toBeGreaterThanOrEqual(1); // At least reached "design" (orchestrator cascade works)
     }
+    expect(reachedComplete, `pipeline should reach "complete"; last phase was "${lastPhase}" with ${ticketsDone}/${totalTickets} tickets done`).toBe(true);
+    expect(phaseIdx).toBe(phaseOrder.length - 1);
+    expect(ticketsDone).toBe(totalTickets);
   });
 
   test("verify workflow state API returns data for existing workflows", async ({ request }) => {
