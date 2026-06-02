@@ -84,6 +84,16 @@ else
   )
 fi
 
+# In robust mode, deploy-one.sh → deploy-one-robust.py needs IMAGE_URI.
+# run-module.sh invokes build-and-push.sh with no tag arg, which always pushes
+# runtime-agent:latest, so pin :latest here to match the image that was built.
+if [[ "${DEPLOY_MODE:-lightweight}" == "robust" && -z "${IMAGE_URI:-}" ]]; then
+  : "${AWS_ACCOUNT_ID:=$(aws sts get-caller-identity --query Account --output text)}"
+  IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/runtime-agent:latest"
+  export IMAGE_URI
+  echo "→ IMAGE_URI=$IMAGE_URI"
+fi
+
 echo "→ Deploying ${#ANCHORS[@]} anchor runtime(s):"
 for a in "${ANCHORS[@]}"; do echo "    - $a"; done
 echo ""
