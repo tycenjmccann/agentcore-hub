@@ -1,0 +1,536 @@
+{
+  "_comment": "Curated Claude Code skills/plugins per fleet persona. Sourced from 14 parallel research agents (see docs/skills-research-report.md). Edit freely. License followups must be resolved before baking into the redistributed Docker image.",
+  "_schema_version": "0.1.0",
+  "_install_methods": {
+    "marketplace_plugin": "/plugin marketplace add <owner>/<repo>; /plugin install <name>@<marketplace>",
+    "skills_cli": "npx skills add github:<owner>/<repo>[/<subdir>] --agent claude-code -g -y",
+    "git_clone": "git clone <repo> ~/.claude/plugins/marketplaces/<name> && enable in settings.json"
+  },
+
+  "shared_baseline": {
+    "_note": "Recommended for ALL personas — code intelligence, PR workflow, browser automation. These show up in many persona reports and provide cross-cutting value.",
+    "recommended": [
+      {
+        "name": "github",
+        "source": "https://github.com/anthropics/claude-plugins-official",
+        "subdir": "external_plugins/github",
+        "license": "Apache-2.0",
+        "official": true,
+        "why": "Official GitHub MCP server — required for any persona that opens PRs or queries Actions/issues."
+      },
+      {
+        "name": "commit-commands",
+        "source": "https://github.com/anthropics/claude-plugins-official",
+        "subdir": "plugins/commit-commands",
+        "license": "Apache-2.0",
+        "official": true,
+        "why": "Anthropic-curated /commit, /commit-push-pr, /clean_gone with safe tool allowlists."
+      }
+    ]
+  },
+
+  "requirements_analyst": {
+    "recommended": [
+      {
+        "name": "atlassian",
+        "source": "https://github.com/atlassian/atlassian-mcp-server",
+        "subdir": null,
+        "license": "Apache-2.0",
+        "stars": 747,
+        "official": true,
+        "why": "Ships spec-to-backlog skill that encodes this persona's algorithm: fetch spec → analyze → break into Epic+children → create tickets."
+      },
+      {
+        "name": "feature-dev",
+        "source": "https://github.com/anthropics/claude-plugins-official",
+        "subdir": "plugins/feature-dev",
+        "license": "Apache-2.0",
+        "official": true,
+        "why": "7-phase workflow (Discovery → Codebase Exploration → Clarifying Questions → Architecture → Task Breakdown). Discovery + Task Breakdown phases match this persona 1:1."
+      },
+      {
+        "name": "agent-skills (planning-and-task-breakdown + spec-driven-development)",
+        "source": "https://github.com/addyosmani/agent-skills",
+        "subdir": "skills/planning-and-task-breakdown",
+        "license": "MIT",
+        "stars": 47620,
+        "official": false,
+        "why": "Cleanest first-principles task-decomposition skill: decompose into verifiable tasks with explicit acceptance criteria, map dependency graphs, plan-mode discipline."
+      }
+    ],
+    "consider": [
+      {
+        "name": "pm-execution",
+        "source": "https://github.com/phuryn/pm-skills",
+        "subdir": "pm-execution",
+        "license": "MIT",
+        "stars": 11823,
+        "why": "PRD/user-story templates as fallback when input PRDs are weak."
+      },
+      {
+        "name": "linear",
+        "source": "https://github.com/anthropics/claude-plugins-official",
+        "subdir": "external_plugins/linear",
+        "license": "Apache-2.0",
+        "why": "Only if/when fleet switches off Jira to Linear."
+      }
+    ],
+    "license_blocked": [
+      {
+        "name": "Product-Manager-Skills (epic-breakdown-advisor)",
+        "source": "https://github.com/deanpeters/Product-Manager-Skills",
+        "license": "CC BY-NC-SA 4.0",
+        "blocker": "NonCommercial clause — cannot bake into commercial open-source product. Best content for vertical-slice splitting (Humanizing Work patterns); paraphrase or request license carve-out."
+      }
+    ]
+  },
+
+  "frontend_designer": {
+    "recommended": [
+      {
+        "name": "frontend-design",
+        "source": "https://github.com/anthropics/claude-plugins-official",
+        "subdir": "plugins/frontend-design",
+        "license": "Apache-2.0",
+        "official": true,
+        "why": "Anthropic's canonical 'distinctive, production-grade UI' skill. Aesthetic vocabulary, anti-AI-slop heuristics, design thinking framework."
+      },
+      {
+        "name": "react-best-practices (Vercel)",
+        "source": "https://github.com/vercel-labs/agent-skills",
+        "subdir": "skills/react-best-practices",
+        "license": "MIT (per SKILL.md frontmatter)",
+        "stars": 27422,
+        "official": true,
+        "why": "70 prioritized React/Next.js performance rules — bundle size, waterfalls, re-render, server perf."
+      },
+      {
+        "name": "web-design-guidelines (Vercel)",
+        "source": "https://github.com/vercel-labs/agent-skills",
+        "subdir": "skills/web-design-guidelines",
+        "license": "MIT (per README, no top-level LICENSE)",
+        "official": true,
+        "why": "100+ rule audit rubric: a11y, focus states, forms, animation (prefers-reduced-motion), typography, dark mode, touch."
+      }
+    ],
+    "consider": [
+      {
+        "name": "composition-patterns (Vercel)",
+        "source": "https://github.com/vercel-labs/agent-skills",
+        "subdir": "skills/composition-patterns",
+        "license": "MIT (per README)",
+        "why": "Compound components, lifting state, avoiding boolean prop proliferation."
+      },
+      {
+        "name": "chrome-devtools-mcp",
+        "source": "https://github.com/ChromeDevTools/chrome-devtools-mcp",
+        "license": "Apache-2.0",
+        "stars": 42512,
+        "why": "Inspect reference sites for layout/perf/a11y observations."
+      }
+    ],
+    "license_followups": [
+      "vercel-labs/agent-skills declares MIT in README + SKILL.md frontmatter but ships no top-level LICENSE file. File an issue asking them to add one before redistributing in a Docker image."
+    ]
+  },
+
+  "ios_designer": {
+    "recommended": [
+      {
+        "name": "SwiftUI Pro",
+        "source": "https://github.com/twostraws/SwiftUI-Agent-Skill",
+        "license": "MIT",
+        "stars": 4022,
+        "official": false,
+        "author": "Paul Hudson (Hacking with Swift)",
+        "why": "Navigation, layout, animations, state management, accessibility, VoiceOver for iOS 26 / Swift 6.2+. Scoped to 'mistakes LLMs make'."
+      },
+      {
+        "name": "apple-skills",
+        "source": "https://github.com/vabole/apple-skills",
+        "license": "MIT",
+        "stars": 248,
+        "why": "Only candidate with dedicated `hig` skill plus `ios-design-consultant`, `ios-ui-craft`, `ios-liquid-glass`."
+      },
+      {
+        "name": "swiftui-design-skill",
+        "source": "https://github.com/Wholiver/swiftui-design-skill",
+        "license": "MIT",
+        "stars": 129,
+        "why": "Visual-design oriented (typography, color systems, layout patterns, anti-AI-slop)."
+      }
+    ],
+    "consider": [
+      {
+        "name": "Swift Concurrency Pro",
+        "source": "https://github.com/twostraws/Swift-Concurrency-Agent-Skill",
+        "license": "MIT",
+        "stars": 438,
+        "why": "Pair with SwiftUI Pro when design docs specify async/await, MainActor, Sendable boundaries."
+      },
+      {
+        "name": "Axiom",
+        "source": "https://github.com/CharlesWiltgen/Axiom",
+        "subdir": ".claude-plugin/plugins/axiom",
+        "license": "MIT",
+        "stars": 944,
+        "why": "237 skills incl. axiom-swiftui/axiom-design/axiom-accessibility. Heavyweight; tooling features (xclog, xcsym) won't run in container."
+      }
+    ],
+    "license_blocked": [
+      {
+        "name": "swift-ios-skills",
+        "source": "https://github.com/dpearson2699/swift-ios-skills",
+        "license": "PolyForm Perimeter 1.0.0",
+        "blocker": "Source-available, NOT OSI-approved. Forbids competing products. Technically allowed if Hub doesn't compete, but legal review required before bundling in public Docker image."
+      }
+    ]
+  },
+
+  "android_designer": {
+    "recommended": [
+      {
+        "name": "android-skills (Google)",
+        "source": "https://github.com/android/skills",
+        "license": "Apache-2.0",
+        "stars": 5526,
+        "official": true,
+        "why": "Google-authored skills for jetpack-compose/adaptive (NavigationSuiteScaffold, Navigation 3, list-detail/supporting pane), theming, navigation-3. Highest authority."
+      },
+      {
+        "name": "android-skills (rcosteira79)",
+        "source": "https://github.com/rcosteira79/android-skills",
+        "subdir": "plugins/android-skills",
+        "license": "MIT",
+        "stars": 65,
+        "official": false,
+        "why": "Fills gaps Google leaves: state management, UX patterns, kotlin-coroutines/flows."
+      }
+    ],
+    "skipped_dangerous": [
+      {
+        "name": "aihip/android-claude-code-skills",
+        "reason": "No LICENSE, and figma-to-android skill explicitly forbids Jetpack Compose — actively contradicts the persona's mandate."
+      },
+      {
+        "name": "ChrisWW/claude-code-android-skills",
+        "reason": "No LICENSE."
+      }
+    ]
+  },
+
+  "backend_designer": {
+    "recommended": [
+      {
+        "name": "aws-core",
+        "source": "https://github.com/aws/agent-toolkit-for-aws",
+        "subdir": "plugins/aws-core",
+        "license": "Apache-2.0",
+        "stars": 770,
+        "official": true,
+        "why": "aws-messaging-and-streaming (SQS/SNS/EventBridge/Kinesis pattern selection) + CDK/CloudFormation/IAM/observability. Anchors AWS-centric backend design."
+      },
+      {
+        "name": "feature-dev (code-architect agent)",
+        "source": "https://github.com/anthropics/claude-plugins-official",
+        "subdir": "plugins/feature-dev",
+        "license": "Apache-2.0",
+        "official": true,
+        "why": "code-architect subagent prompt is a working spec for backend design docs (component design, data flow, build sequence, trade-offs)."
+      },
+      {
+        "name": "mongodb",
+        "source": "https://github.com/mongodb/agent-skills",
+        "license": "Apache-2.0",
+        "stars": 127,
+        "official": true,
+        "why": "mongodb-schema-design (embed vs reference, polymorphic, time-series, anti-patterns) + query-optimizer + atlas-stream-processing."
+      },
+      {
+        "name": "clickhouse-best-practices + architecture-advisor",
+        "source": "https://github.com/ClickHouse/agent-skills",
+        "license": "Apache-2.0",
+        "stars": 451,
+        "official": true,
+        "why": "Architecture decision-framework skill + 28 prioritized rules. Pick this OR mongodb based on workload (OLTP-document vs OLAP-columnar)."
+      }
+    ],
+    "consider": [
+      {"name": "azure", "source": "https://github.com/microsoft/azure-skills", "license": "MIT", "stars": 1127, "why": "27 skills incl. enterprise-infra-planner, messaging, reliability. Promote to recommended if Azure is primary target."},
+      {"name": "redis-development", "source": "https://github.com/redis/agent-skills", "subdir": "plugins/redis-development", "license": "MIT", "stars": 65, "why": "Caching strategy section of design docs."},
+      {"name": "neon-postgres", "source": "https://github.com/neondatabase/agent-skills", "subdir": "plugins/neon-postgres", "license": "Apache-2.0", "stars": 65},
+      {"name": "cosmosdb-best-practices", "source": "https://github.com/AzureCosmosDB/cosmosdb-claude-code-plugin", "license": "MIT", "stars": 1, "why": "73 best-practice rules; data modeling, partition-key design."}
+    ]
+  },
+
+  "security_reviewer": {
+    "recommended": [
+      {
+        "name": "security-guidance",
+        "source": "https://github.com/anthropics/claude-plugins-official",
+        "subdir": "plugins/security-guidance",
+        "license": "Apache-2.0",
+        "official": true,
+        "why": "Curated catalog of ~25 vulnerability classes mapped to OWASP — injection, XSS, SSRF, IDOR, auth bypass, unsafe deserialization, hardcoded secrets, GH Actions injection. Authored by Anthropic security team. NOTE: hooks fire on Edit/Stop/git-commit; set SECURITY_GUIDANCE_DISABLE=1 if hook noise on doc edits is a problem. Bake for the embedded knowledge."
+      }
+    ],
+    "consider": [
+      {
+        "name": "claude-skill-security-check",
+        "source": "https://github.com/rioscthiago/claude-skill-security-check",
+        "license": "MIT",
+        "stars": 2,
+        "why": "Single SKILL.md is 'review pending changes against OWASP, do not modify code, report findings' — closest match to persona's job. Caveat: prose is in Portuguese."
+      },
+      {
+        "name": "auth0",
+        "source": "https://github.com/auth0/agent-skills",
+        "subdir": "plugins/auth0",
+        "license": "Apache-2.0",
+        "stars": 26,
+        "official": true,
+        "why": "Only when reviewed feature involves login/sessions/protected routes."
+      }
+    ],
+    "skipped_with_reason": [
+      "All vendor SAST plugins (semgrep, aikido, sonarqube, snyk, sonatype, jfrog, 42crunch, nightvision) — they wrap MCP servers requiring vendor accounts AND a code artifact to scan. Useless for a persona that reviews narrative design docs."
+    ]
+  },
+
+  "legal_compliance": {
+    "recommended": [
+      {
+        "name": "claude-wcag-accessibility-skill",
+        "source": "https://github.com/mrKanoh/claude-wcag-accessibility-skill",
+        "license": "MIT",
+        "stars": 1,
+        "why": "Triggers on legal accessibility regimes (ADA, EAA 2025, EN 301 549, Section 508, AODA, VPAT/ACR). Covers WCAG 2.1/2.2 AA. Caveat: low star count — verify SKILL.md depth before baking."
+      },
+      {
+        "name": "twilio-developer-kit (compliance subskills only)",
+        "source": "https://github.com/twilio/ai",
+        "subdir": "skills/twilio/twilio-compliance-traffic + twilio-security-compliance-hipaa + twilio-regulatory-compliance-bundles + twilio-compliance-onboarding",
+        "license": "MIT",
+        "stars": 16,
+        "official": true,
+        "why": "Best vendor-authored coverage of GDPR consent, HIPAA BAA/PHI, PCI DSS, TCPA, FDCPA, CAN-SPAM. Pull only the 4 compliance subdirs."
+      }
+    ],
+    "consider": [
+      {
+        "name": "soc2-startup",
+        "source": "https://github.com/fsch/compliance-tools",
+        "subdir": "plugins/soc2-startup",
+        "license": "MIT",
+        "stars": 0,
+        "why": "7 named roles (Lean Guardian, Policy Writer, Gap Analyzer, Evidence Collector, Risk Assessor) + CC1-CC9 reference. Self-contained, no external services. Caveat: single-author repo."
+      }
+    ],
+    "honest_caveat": "Niche space. Anthropic marketplace has only 2 compliance plugins (legalzoom, vanta) and both are MCP-server-dependent. The persona's prompt + these 3 picks is probably stronger than chasing more plugins of marginal quality."
+  },
+
+  "localization": {
+    "recommended": [
+      {
+        "name": "flutter-localization-audit-skill",
+        "source": "https://github.com/NoaTubic/flutter-localization-audit-skill",
+        "license": "MIT",
+        "stars": 0,
+        "why": "Closest direct analogue to the persona's job: multi-category audit producing markdown report. references/localization_checks.md is reusable beyond Flutter."
+      },
+      {
+        "name": "crowdin/skills (context-extraction)",
+        "source": "https://github.com/crowdin/skills",
+        "subdir": "context-extraction",
+        "license": "UNKNOWN — no LICENSE file",
+        "stars": 3,
+        "official": true,
+        "why": "Only vendor-official skill set in this space. Teaches translator-quality ai_context for ambiguous strings (short verbs, color/status names, ICU plurals). LICENSE FOLLOWUP REQUIRED."
+      },
+      {
+        "name": "xcstrings-localizer",
+        "source": "https://github.com/nevinchanyi/claude-code-xcstrings-localizer",
+        "subdir": "skills/xcstrings-localizer",
+        "license": "MIT",
+        "stars": 6,
+        "why": "Best CLDR-plurals + cross-language grammar/terminology-consistency reference. references/cldr-plural-rules.md covers 40+ languages. Reusable beyond iOS."
+      }
+    ],
+    "honest_caveat": "Niche, immature space. All top picks are <10 stars, <6 months old. Plan to fork+harden one, or treat as starter scaffolding."
+  },
+
+  "analytics_designer": {
+    "recommended": [
+      {
+        "name": "amplitude",
+        "source": "https://github.com/amplitude/mcp-marketplace",
+        "subdir": "plugins/amplitude",
+        "license": "MIT (per README, no LICENSE file)",
+        "stars": 26,
+        "official": true,
+        "why": "27 skills covering instrument-events, taxonomy, discover-event-surfaces, create-chart, create-dashboard, monitor-experiments, monitor-reliability — entire event-schema → dashboard → KPI loop."
+      },
+      {
+        "name": "posthog",
+        "source": "https://github.com/PostHog/ai-plugin",
+        "license": "MIT (per README, no LICENSE file)",
+        "stars": 47,
+        "official": true,
+        "why": "Broadest single plugin: instrument-product-analytics, error-tracking, llm-analytics, feature-flags, log-alerts, experiments, RUM autocapture, APM/LLM trace exploration."
+      },
+      {
+        "name": "sentry-for-claude",
+        "source": "https://github.com/getsentry/sentry-for-claude",
+        "license": "MIT",
+        "stars": 192,
+        "official": true,
+        "why": "Strongest skills for alerting + frontend RUM + AI observability. 20+ SDK-specific instrumentation skills."
+      },
+      {
+        "name": "honeycomb",
+        "source": "https://github.com/honeycombio/agent-skill",
+        "subdir": "honeycomb",
+        "license": "MIT",
+        "stars": 12,
+        "official": true,
+        "why": "Best for distributed-tracing + SLO design. otel-instrumentation, slos-and-triggers, query-patterns, production-investigation."
+      }
+    ],
+    "license_followups": [
+      "amplitude/mcp-marketplace and PostHog/ai-plugin both declare MIT in README but ship no LICENSE file. File issues asking vendors to add one before bundling."
+    ]
+  },
+
+  "frontend_dev": {
+    "recommended": [
+      {"name": "react-best-practices (Vercel)", "source": "https://github.com/vercel-labs/agent-skills", "subdir": "skills/react-best-practices", "license": "MIT (per frontmatter)", "stars": 27422, "official": true},
+      {"name": "web-design-guidelines (Vercel)", "source": "https://github.com/vercel-labs/agent-skills", "subdir": "skills/web-design-guidelines", "license": "MIT (per README)", "official": true},
+      {"name": "chrome-devtools-mcp", "source": "https://github.com/ChromeDevTools/chrome-devtools-mcp", "license": "Apache-2.0", "stars": 42512, "official": true, "why": "Browser-tested components: perf traces, network, console with sourcemaps, Lighthouse, screenshots."},
+      {"name": "frontend-design", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "plugins/frontend-design", "license": "Apache-2.0", "official": true},
+      {"name": "context7", "source": "https://github.com/upstash/context7", "license": "MIT", "stars": 56547, "official": true, "why": "Version-pinned framework docs — counters Claude hallucinating outdated React/Next/Tailwind APIs."},
+      {"name": "typescript-lsp", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "plugins/typescript-lsp", "license": "Apache-2.0", "official": true, "why": "Go-to-def, find-refs, type errors. Requires npm install -g typescript-language-server typescript in image."},
+      {"name": "code-review", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "plugins/code-review", "license": "Apache-2.0", "official": true, "why": "Self-review pass before opening PR."},
+      {"name": "pr-review-toolkit", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "plugins/pr-review-toolkit", "license": "Apache-2.0", "official": true},
+      {"name": "playwright", "source": "https://github.com/microsoft/playwright-mcp", "license": "Apache-2.0", "stars": 33313, "official": true}
+    ],
+    "consider": [
+      {"name": "composition-patterns (Vercel)", "license": "MIT (per README)"},
+      {"name": "react-view-transitions (Vercel)", "license": "MIT (per README)"}
+    ]
+  },
+
+  "backend_dev": {
+    "recommended": [
+      {"name": "aws-core", "source": "https://github.com/aws/agent-toolkit-for-aws", "subdir": "plugins/aws-core", "license": "Apache-2.0", "stars": 770, "official": true},
+      {"name": "aws-serverless", "source": "https://github.com/awslabs/agent-plugins", "subdir": "plugins/aws-serverless", "license": "Apache-2.0", "stars": 765, "official": true, "why": "api-gateway + aws-lambda + durable-functions. Direct fit for 'writes Lambdas, API handlers'."},
+      {"name": "databases-on-aws", "source": "https://github.com/awslabs/agent-plugins", "subdir": "plugins/databases-on-aws", "license": "Apache-2.0", "stars": 765, "official": true},
+      {"name": "aws-dev-toolkit", "source": "https://github.com/aws-samples/sample-claude-code-plugins-for-startups", "subdir": "plugins/aws-dev-toolkit", "license": "MIT-0", "stars": 7, "official": true, "why": "34 service-specific skills. MIT-0 cleanest possible license. Pin to specific commit SHA — only 7 stars."},
+      {"name": "deploy-on-aws", "source": "https://github.com/awslabs/agent-plugins", "subdir": "plugins/deploy-on-aws", "license": "Apache-2.0", "official": true},
+      {"name": "pyright-lsp", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "plugins/pyright-lsp", "license": "Apache-2.0", "official": true},
+      {"name": "feature-dev", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "plugins/feature-dev", "license": "Apache-2.0", "official": true}
+    ],
+    "consider": [
+      {"name": "logfire", "source": "https://github.com/pydantic/skills", "subdir": "plugins/logfire", "license": "MIT", "stars": 63, "why": "FastAPI/httpx/asyncpg/SQLAlchemy auto-instrumentation."},
+      {"name": "mongodb", "source": "https://github.com/mongodb/agent-skills", "license": "Apache-2.0", "stars": 127, "official": true},
+      {"name": "redis-development", "source": "https://github.com/redis/agent-skills", "subdir": "plugins/redis-development", "license": "MIT", "stars": 65}
+    ]
+  },
+
+  "api_dev": {
+    "recommended": [
+      {
+        "name": "apollo-skills",
+        "source": "https://github.com/apollographql/skills",
+        "license": "MIT",
+        "stars": 77,
+        "official": true,
+        "why": "GraphQL schema design, federation, Apollo Server/Router, Connectors, graphql-operations."
+      },
+      {
+        "name": "aws-serverless",
+        "source": "https://github.com/awslabs/agent-plugins",
+        "subdir": "plugins/aws-serverless",
+        "license": "Apache-2.0",
+        "stars": 765,
+        "official": true,
+        "why": "api-gateway skill: REST scaffolding, throttling, request/response models, authorizers."
+      },
+      {
+        "name": "42crunch-api-security-testing",
+        "source": "https://github.com/42Crunch-AI/claude-plugins",
+        "subdir": "plugins/api-security-testing",
+        "license": "Apache-2.0 (subdir; root LICENSE missing)",
+        "stars": 1,
+        "official": true,
+        "why": "OpenAPI-first audit/scan/remediate aligned with OWASP API Top 10 (BOLA/BFLA)."
+      },
+      {
+        "name": "postman",
+        "source": "https://github.com/Postman-Devrel/postman-claude-code-plugin",
+        "license": "Apache-2.0",
+        "stars": 23,
+        "official": true,
+        "why": "agent-ready-apis, generate-spec, run-collection — OpenAPI gen + contract testing."
+      }
+    ],
+    "consider": [
+      {"name": "auth0", "source": "https://github.com/auth0/agent-skills", "subdir": "plugins/auth0", "license": "Apache-2.0", "stars": 26, "why": "Only if Auth0 is the IdP."},
+      {"name": "stripe", "source": "https://github.com/stripe/ai", "subdir": "providers/claude/plugin", "license": "MIT", "stars": 1585, "why": "Industry-leading webhook/idempotency reference. Stripe-specific."}
+    ]
+  },
+
+  "qa_verifier": {
+    "recommended": [
+      {"name": "pr-review-toolkit", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "plugins/pr-review-toolkit", "license": "Apache-2.0", "official": true, "why": "6 specialist agents: pr-test-analyzer, silent-failure-hunter, code-reviewer, comment-analyzer, type-design-analyzer, code-simplifier. Purpose-built for verification."},
+      {"name": "superpowers", "source": "https://github.com/obra/superpowers", "license": "MIT", "stars": 214698, "why": "verification-before-completion, systematic-debugging ('NO FIXES WITHOUT ROOT CAUSE'), test-driven-development. Procedural gates that match verifier discipline."},
+      {"name": "playwright", "source": "https://github.com/microsoft/playwright-mcp", "license": "Apache-2.0", "stars": 33313, "official": true, "why": "Standard browser-driving MCP for E2E verification."},
+      {"name": "code-review", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "plugins/code-review", "license": "Apache-2.0", "official": true, "why": "5-parallel-Sonnet review with confidence scoring ≥80 gating."}
+    ],
+    "consider": [
+      {"name": "chrome-devtools-mcp", "source": "https://github.com/ChromeDevTools/chrome-devtools-mcp", "license": "Apache-2.0", "stars": 42512, "why": "Perf traces, console with sourcemaps. Complementary to Playwright."}
+    ]
+  },
+
+  "ci_agent": {
+    "recommended": [
+      {"name": "commit-commands", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "plugins/commit-commands", "license": "Apache-2.0", "official": true, "why": "/commit, /commit-push-pr, /clean_gone with curated tool allowlists."},
+      {"name": "pr-review-toolkit", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "plugins/pr-review-toolkit", "license": "Apache-2.0", "official": true},
+      {"name": "code-review", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "plugins/code-review", "license": "Apache-2.0", "official": true},
+      {"name": "github (MCP)", "source": "https://github.com/anthropics/claude-plugins-official", "subdir": "external_plugins/github", "license": "Apache-2.0", "official": true, "why": "Beyond gh CLI: Actions API for workflow runs, jobs, logs."},
+      {"name": "aws-core", "source": "https://github.com/aws/agent-toolkit-for-aws", "subdir": "plugins/aws-core", "license": "Apache-2.0", "stars": 770, "official": true, "why": "CDK + CloudFormation + IAM for deployment."}
+    ],
+    "consider": [
+      {"name": "deploy-on-aws", "source": "https://github.com/awslabs/agent-plugins", "subdir": "plugins/deploy-on-aws", "license": "Apache-2.0"},
+      {"name": "buildkite", "source": "https://github.com/buildkite/skills", "license": "MIT", "stars": 11, "why": "Only if Buildkite is the CI."},
+      {"name": "cloudflare/vercel/netlify", "why": "Add per deploy target."}
+    ],
+    "honest_gap": "No popular GitHub Actions YAML authoring plugin exists yet. Closest unofficial matches are 0 stars. Persona can encode workflow conventions in CLAUDE.md."
+  },
+
+  "license_blocked_global": [
+    {
+      "name": "vercel-labs/skills (parent CLI repo)",
+      "license": "UNKNOWN — no LICENSE file",
+      "blocker": "Different from vercel-labs/agent-skills. This is the npx skills CLI itself. Has only ThirdPartyNoticeText.txt for bundled deps."
+    },
+    {
+      "name": "figma/mcp-server-guide",
+      "license": "Figma Developer Terms (NOT OSS)",
+      "blocker": "Beta, governed by commercial T&Cs. License blocks redistribution in a public open-source product Docker image."
+    },
+    {
+      "name": "grafana/pyroscope-skills",
+      "license": "AGPL-3.0",
+      "blocker": "Strong copyleft. Skip for closed-source Docker image without legal review."
+    }
+  ],
+
+  "license_followups_global": [
+    "vercel-labs/agent-skills — README + SKILL.md frontmatter say MIT but no top-level LICENSE file. File issue asking for one.",
+    "amplitude/mcp-marketplace — README declares MIT, no LICENSE file.",
+    "PostHog/ai-plugin — README declares MIT, no LICENSE file.",
+    "crowdin/skills — no LICENSE detected.",
+    "42crunch root repo — plugin subdir is Apache-2.0 but root has no LICENSE.",
+    "honeycombio/agent-skill, sentry-for-claude — confirmed proper LICENSE files (MIT). Clean."
+  ]
+}

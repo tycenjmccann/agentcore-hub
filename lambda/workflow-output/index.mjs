@@ -5,7 +5,7 @@
  * Tools: submit_ticket_plan, save_design_doc, report_completion
  */
 
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
@@ -188,6 +188,43 @@ async function updateManifest(workflowId, agentId, entries) {
   console.log(`[manifest] Added ${newEntries.length} entries to ${phase} for ${workflowId}`);
 }
 
+// ─── S3 Storage tools ──────────────────────────────────────────────────────────
+// Folded in from the (no-longer-shipped) agentcore-hub-s3-tools Lambda. Runtime
+// agents call these via S3Storage___read_object / write_object / list_objects.
+
+async function s3ReadObject({ bucket, key }) {
+  const targetBucket = bucket || BUCKET;
+  if (!targetBucket) throw new Error("bucket is required (no ARTIFACT_BUCKET configured)");
+  if (!key) throw new Error("key is required");
+  const r = await s3.send(new GetObjectCommand({ Bucket: targetBucket, Key: key }));
+  const body = await r.Body.transformToString();
+  return { status: "ok", bucket: targetBucket, key, content: body };
+}
+
+async function s3WriteObject({ bucket, key, content, content_type }) {
+  const targetBucket = bucket || BUCKET;
+  if (!targetBucket) throw new Error("bucket is required (no ARTIFACT_BUCKET configured)");
+  if (!key) throw new Error("key is required");
+  await s3.send(new PutObjectCommand({
+    Bucket: targetBucket,
+    Key: key,
+    Body: content || "",
+    ContentType: content_type || "text/plain",
+  }));
+  return { status: "saved", location: `s3://${targetBucket}/${key}` };
+}
+
+async function s3ListObjects({ bucket, prefix }) {
+  const targetBucket = bucket || BUCKET;
+  if (!targetBucket) throw new Error("bucket is required (no ARTIFACT_BUCKET configured)");
+  const r = await s3.send(new ListObjectsV2Command({
+    Bucket: targetBucket,
+    Prefix: prefix || "",
+  }));
+  const keys = (r.Contents || []).map((o) => ({ key: o.Key, size: o.Size, last_modified: o.LastModified }));
+  return { status: "ok", bucket: targetBucket, prefix: prefix || "", count: keys.length, objects: keys };
+}
+
 const TOOLS = {
   submit_ticket_plan: submitTicketPlan,
   save_design_doc: saveDesignDoc,
@@ -196,6 +233,10 @@ const TOOLS = {
   "WorkflowOutput___submit_ticket_plan": submitTicketPlan,
   "WorkflowOutput___save_design_doc": saveDesignDoc,
   "WorkflowOutput___report_completion": reportCompletion,
+  // S3 storage tools (folded in from defunct agentcore-hub-s3-tools)
+  "S3Storage___read_object": s3ReadObject,
+  "S3Storage___write_object": s3WriteObject,
+  "S3Storage___list_objects": s3ListObjects,
 };
 
 /**

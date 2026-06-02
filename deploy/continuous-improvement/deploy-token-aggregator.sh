@@ -5,25 +5,48 @@
 # on all runtime log groups to pipe token usage metrics into DDB.
 # Also sets up a weekly EventBridge cron to reset counters.
 #
+# Idempotent: re-runs update the Lambda code/config and skip resources that
+# already exist.
+#
 # Usage: bash deploy-token-aggregator.sh [--region us-east-1]
+#
+# Required env (loaded from .env.local if present):
+#   AWS_REGION
+#   LAMBDA_ROLE_ARN  (set by deploy/setup-lambda-role.sh)
+#   ARTIFACT_BUCKET  (defaults to agentcore-hub-artifacts-<ACCOUNT>-<REGION>)
 
 set -euo pipefail
 
-REGION="${AWS_REGION:-us-east-1}"
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-LAMBDA_NAME="agentcore-hub-token-aggregator"
-LAMBDA_ROLE="arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-lambda-role"
-TABLE_NAME="agentcore-hub-eval-config"
-BUCKET="agentcore-hub-artifacts-${ACCOUNT_ID}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAMBDA_DIR="${SCRIPT_DIR}/../../lambda/token-aggregator"
+SCRIPT_DIR_BOOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT_BOOT="$(cd "${SCRIPT_DIR_BOOT}/../.." && pwd)"
+if [[ -f "${REPO_ROOT_BOOT}/.env.local" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT_BOOT}/.env.local"
+  set +a
+fi
 
+REGION="${AWS_REGION:-us-east-1}"
+
+# Parse args before deriving REGION-dependent values (e.g. BUCKET) so that
+# `--region` is honoured rather than baking in the default/AWS_REGION region.
 while [[ $# -gt 0 ]]; do
   case $1 in
     --region) REGION="$2"; shift 2 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
+
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+LAMBDA_NAME="agentcore-hub-token-aggregator"
+LAMBDA_ROLE="${LAMBDA_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-lambda-role}"
+TABLE_NAME="agentcore-hub-eval-config"
+# Artifact bucket convention (matches deploy/config.sh): agentcore-hub-artifacts-<ACCOUNT>-<REGION>.
+# The previous version dropped the region suffix and pointed the Lambda at a
+# bucket that does not exist on first install.
+BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAMBDA_DIR="${SCRIPT_DIR}/../../lambda/token-aggregator"
 
 echo "=== Deploy Token Aggregator ==="
 echo "Region:  ${REGION}"
@@ -123,25 +146,43 @@ echo ""
 echo "--- Step 4: Weekly reset cron ---"
 
 RULE_NAME="agentcore-hub-token-reset-weekly"
+
+# put-rule is idempotent — upsert and capture stderr so a failure surfaces
+# instead of leaving a half-configured rule with no target.
 aws events put-rule \
   --name "${RULE_NAME}" \
   --schedule-expression "cron(0 0 ? * MON *)" \
   --state ENABLED \
-  --region "${REGION}" --output text --query 'RuleArn' 2>/dev/null || true
+  --region "${REGION}" --output text --query 'RuleArn' >/dev/null
 
-# Allow EventBridge to invoke Lambda
+# Allow EventBridge to invoke Lambda. add-permission errors with
+# ResourceConflictException on re-runs; that's the only error we ignore.
 aws lambda add-permission \
   --function-name "${LAMBDA_NAME}" \
   --statement-id "eventbridge-weekly-reset" \
   --action "lambda:InvokeFunction" \
   --principal "events.amazonaws.com" \
   --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}" \
-  --region "${REGION}" 2>/dev/null || echo "(permission already exists)"
+  --region "${REGION}" >/dev/null 2>&1 || echo "(permission already exists)"
+
+# put-targets accepts a JSON file via file:// to avoid quoting bugs in the
+# inline --targets JSON (the previous version embedded literal {} in a string
+# argument, which silently dropped the Input on some shells and left the rule
+# without a target — the cron fired but the Lambda never received "action:reset").
+TARGETS_JSON="$(mktemp)"
+trap 'rm -f "$TARGETS_JSON"' EXIT
+cat > "${TARGETS_JSON}" <<EOF
+[{
+  "Id": "token-reset",
+  "Arn": "${LAMBDA_ARN}",
+  "Input": "{\"action\":\"reset\"}"
+}]
+EOF
 
 aws events put-targets \
   --rule "${RULE_NAME}" \
-  --targets "Id=token-reset,Arn=${LAMBDA_ARN},Input={\"action\":\"reset\"}" \
-  --region "${REGION}" --output text 2>/dev/null
+  --targets "file://${TARGETS_JSON}" \
+  --region "${REGION}" --output text --query 'FailedEntryCount' >/dev/null
 
 echo "✓ Weekly reset cron configured (Mondays 00:00 UTC)"
 

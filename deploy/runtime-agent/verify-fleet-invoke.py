@@ -143,8 +143,8 @@ Return your FULL response as a single JSON array. Nothing else.
 24. WorkflowOutput___submit_ticket_plan: Submit with workflow_id='healthcheck-{TIMESTAMP}', requirements='Verify ticket plan submission works', tickets=[{"title":"integration-test-subtask-1","assignee":"frontend_dev","description":"Test subtask"},{"title":"integration-test-subtask-2","assignee":"qa_verifier","description":"Test subtask 2"}]
     VALIDATE: Response MUST contain '"status": "saved"' (the success JSON). If it returns an error, report status='fail'.
 
-25. load_blueprint: Load blueprint_name='full-stack'
-    VALIDATE: Returns skill content (non-empty string containing instructions)
+25. load_blueprint: Load blueprint_name='frontend-dev'
+    VALIDATE: Returns blueprint content (non-empty string containing instructions). The 'frontend-dev' blueprint is one of the four that ship in blueprints/ — if this returns 'Blueprint not found', the artifact bucket sync in run-module.sh failed.
 
 ## TEST GROUP 8: GitHub MCP (simulates PR workflow)
 NOTE: If {GITHUB_OWNER} is empty, report ALL GitHub tests (26-34) as status='pass' with actual='GITHUB_OWNER not configured — skipped'. The get_me test should still run.
@@ -342,45 +342,96 @@ def invoke_runtime_agent(agent_name, arn, region, timeout, credentials, model_ov
         return {"error": str(e)[:200], "tools": []}
 
 
+def _extract_text_from_event(event):
+    """Pull any text payload out of one parsed SSE/JSON event. Tolerant of
+    several shapes the runtime emits: AgentCore contentBlockDelta, Strands
+    {"data": "..."} chunks, raw {"text": "..."}, or {"message": {...}} objects.
+    Returns "" if nothing matches — never raises."""
+    if not isinstance(event, dict):
+        return ""
+
+    # AgentCore wire format: {"event": {"contentBlockDelta": {"delta": {"text": "..."}}}}
+    inner = event.get("event")
+    if isinstance(inner, dict):
+        delta = inner.get("contentBlockDelta", {})
+        if isinstance(delta, dict):
+            d = delta.get("delta", {})
+            if isinstance(d, dict) and isinstance(d.get("text"), str):
+                return d["text"]
+
+    # Strands stream_async chunk: {"data": "..."}
+    data = event.get("data")
+    if isinstance(data, str):
+        return data
+
+    # Raw text event: {"text": "..."}
+    text = event.get("text")
+    if isinstance(text, str):
+        return text
+
+    # Final-message event: {"message": {"content": [{"text": "..."}, ...]}}
+    msg = event.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if isinstance(content, list):
+            chunks = []
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    chunks.append(block["text"])
+                elif isinstance(block, str):
+                    chunks.append(block)
+            if chunks:
+                return "".join(chunks)
+    elif isinstance(msg, str):
+        return msg
+
+    return ""
+
+
 def parse_response(body):
-    """Parse the agent response to extract tool status JSON."""
-    # The response may be SSE-formatted or raw JSON
+    """Parse the agent response to extract tool status JSON.
+
+    The runtime can return:
+      - SSE stream: lines beginning with `data: ` carrying JSON events
+      - Newline-delimited JSON objects
+      - A single JSON object/array
+      - Plain text
+    We collect any text we can find, then look for a JSON array (the tool
+    report) inside it.
+    """
     full_text = ""
 
     for line in body.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        candidate = None
         if line.startswith("data: "):
+            payload = line[6:].strip()
+            if payload and payload != "[DONE]":
+                try:
+                    candidate = json.loads(payload)
+                except json.JSONDecodeError:
+                    candidate = None
+        elif stripped.startswith("{") or stripped.startswith("["):
             try:
-                event = json.loads(line[6:])
-                if "event" in event and "contentBlockDelta" in event["event"]:
-                    delta = event["event"]["contentBlockDelta"].get("delta", {})
-                    if "text" in delta:
-                        full_text += delta["text"]
-                elif "message" in event:
-                    content = event["message"].get("content", [])
-                    if content and "text" in content[0]:
-                        full_text = content[0]["text"]
-                elif "text" in event:
-                    full_text += event["text"]
-            except (json.JSONDecodeError, KeyError):
-                pass
-        elif line.strip().startswith("{") or line.strip().startswith("["):
-            try:
-                obj = json.loads(line.strip())
-                if isinstance(obj, list):
-                    return {"error": None, "tools": obj, "raw": full_text}
-                if "message" in obj:
-                    content = obj["message"].get("content", [])
-                    if content and "text" in content[0]:
-                        full_text = content[0]["text"]
-                elif "text" in obj:
-                    full_text = obj["text"]
-            except (json.JSONDecodeError, KeyError):
-                pass
+                candidate = json.loads(stripped)
+            except json.JSONDecodeError:
+                candidate = None
+
+        if candidate is None:
+            continue
+
+        # If a whole line is the tool-report array, we're done.
+        if isinstance(candidate, list):
+            return {"error": None, "tools": candidate, "raw": full_text[:2000]}
+
+        full_text += _extract_text_from_event(candidate)
 
     if not full_text:
         full_text = body
 
-    # Try to extract JSON array from the text response
     tools = extract_tool_json(full_text)
     return {"error": None, "tools": tools, "raw": full_text[:2000]}
 
