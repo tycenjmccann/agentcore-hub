@@ -12,7 +12,8 @@
 #   source deploy/setup-runtime-role.sh
 #   # Sets AGENTCORE_ROLE_ARN for use by deploy-fleet.sh
 #
-# If the role already exists, this script just exports the ARN.
+# If the role already exists this script ensures the trust policy + every inline
+# policy is up-to-date and exports the ARN. Idempotent.
 
 set -e
 
@@ -20,15 +21,6 @@ REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ROLE_NAME="agentcore-hub-agentcore-role"
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
-
-# Check if role exists
-if aws iam get-role --role-name "$ROLE_NAME" > /dev/null 2>&1; then
-  echo "   ✓ Role \"$ROLE_NAME\" already exists"
-  export AGENTCORE_ROLE_ARN="$ROLE_ARN"
-  return 0 2>/dev/null || exit 0
-fi
-
-echo "   Creating IAM role: $ROLE_NAME"
 
 # Trust policy — AgentCore can assume this role
 TRUST_POLICY=$(cat <<EOF
@@ -47,13 +39,21 @@ TRUST_POLICY=$(cat <<EOF
 EOF
 )
 
-aws iam create-role \
-  --role-name "$ROLE_NAME" \
-  --assume-role-policy-document "$TRUST_POLICY" \
-  --description "Execution role for AgentCore Hub fleet runtime agents (all built-in tools)" \
-  --output text > /dev/null
-
-echo "   ✓ Role created"
+if aws iam get-role --role-name "$ROLE_NAME" > /dev/null 2>&1; then
+  echo "   ✓ Role \"$ROLE_NAME\" already exists — refreshing policies"
+  # Update trust in case it drifted.
+  aws iam update-assume-role-policy \
+    --role-name "$ROLE_NAME" \
+    --policy-document "$TRUST_POLICY" >/dev/null
+else
+  echo "   Creating IAM role: $ROLE_NAME"
+  aws iam create-role \
+    --role-name "$ROLE_NAME" \
+    --assume-role-policy-document "$TRUST_POLICY" \
+    --description "Execution role for AgentCore Hub fleet runtime agents (all built-in tools)" \
+    --output text > /dev/null
+  echo "   ✓ Role created"
+fi
 
 # ─── Managed Policy ───────────────────────────────────────────────────────────
 aws iam attach-role-policy \

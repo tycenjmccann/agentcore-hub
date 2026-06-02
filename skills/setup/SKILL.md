@@ -257,6 +257,16 @@ same either way. The only question is where the Next.js front-end runs.
   2. *Custom MCP server* — Point us at a GitHub MCP server JSON config (e.g., your org runs one with SSO). Use this if a raw PAT isn't allowed by policy.
   3. *Skip* — The workflow still runs, but stops at "ready for PR" without pushing. Use this to do a dry run before committing real GitHub credentials.
 
+## Q7b — GitHub workspace repo *(skip if Workflow not in MODULES or Q7 was Skip)*
+
+- **question:** "Which GitHub repo should AgentCore use as its workspace? This is where agents push branches and open PRs during the workflow pipeline."
+- **header:** "GitHub repo"
+- **options:**
+  1. *Type `owner/repo`* — I'll enter the GitHub owner and repository name (e.g., `myorg/my-project`).
+  2. *Skip for now* — Use the default test repo (`octocat/Hello-World`). You can update `GITHUB_OWNER` and `GITHUB_REPO` in `.env.local` later.
+
+If the user provides `owner/repo`, split on `/` and save as `github.owner` and `github.repo` in the answers blob. `apply-env.sh` writes them to `.env.local` as `GITHUB_OWNER` and `GITHUB_REPO`. These are read by `deploy/config.sh` to build `FLEET_REPO_URL` and by `deploy/runtime-agent/verify-fleet-invoke.py` for GitHub MCP tool tests.
+
 ## Q8 — Confirm
 
 Print a recap of every choice plus the exact list of scripts that will run, then ask:
@@ -285,7 +295,7 @@ cat > /tmp/agentcore-hub-answers.json <<'EOF'
   "aws_region": "us-east-1",
   "aws_profile": "default",
   "deploy_target": "local",
-  "github": { "mode": "pat", "pat": "..." },
+  "github": { "mode": "pat", "pat": "...", "owner": "myorg", "repo": "my-project" },
   "jira": null
 }
 EOF
@@ -328,9 +338,21 @@ Long-running deploys (`build-and-push.sh`, `deploy-fleet.sh`, App Runner deploy)
 After Core/Builder/Workflow verify clean and **before** running Evaluations:
 
 - **Local (`local`):** print "Run `npm run dev` to start the app at http://localhost:3000." Set `DEPLOYMENT_URL=http://localhost:3000` in `.env.local`. If the user picked Jira tickets, also remind them: "Jira webhooks can't reach `localhost` — expose port 3000 with ngrok / Cloudflare Tunnel, then update `DEPLOYMENT_URL` to the public URL or your ticket transitions won't trigger workflows."
-- **App Runner (`apprunner`):** run the App Runner deploy (use the workflow in `.github/workflows/` if present, otherwise the existing `deploy/` script for App Runner if one exists; if neither exists, tell the user honestly and link to the README section). Once the service is healthy, capture the App Runner URL and persist it as `DEPLOYMENT_URL` in `.env.local` (use the same sed-or-append pattern as `BUILDER_AGENT_ID`).
+- **App Runner (`apprunner`):** run `./deploy/apprunner/deploy.sh`. This script idempotently creates the ECR repository, the `AppRunnerECRAccessRole` and `agentcore-hub-apprunner-instance` IAM roles, builds and pushes the Docker image, and creates (or updates) the App Runner service. It sets `HOSTNAME=0.0.0.0` and `PORT=8080` as runtime env vars to prevent the health-check bind issue (see Dockerfile comment). Once the service is RUNNING, the script captures the App Runner URL and persists it as `DEPLOYMENT_URL` in `.env.local` (same sed-or-append pattern as `BUILDER_AGENT_ID`). Requires Docker running locally.
 - **Bring-your-own (`byo`):** don't build or push anything. Write `DEPLOYMENT_URL=https://placeholder.example` to `.env.local` and tell the user: "Update `DEPLOYMENT_URL` in `.env.local` once your service is live so prd-submitter and Jira webhooks know where to reach the app." If Evaluations was selected, surface this warning prominently — prd-submitter is being deployed with a placeholder URL.
 - **Skip (`skip`):** skip both the deploy and the `DEPLOYMENT_URL` write. If Evaluations was selected, warn the user that prd-submitter will be deployed with a placeholder URL and they must update it manually.
+
+### Jira webhook setup (after deploy-target, if `TICKET_PROVIDER=jira` and `deploy_target` is NOT `local`)
+
+When the ticket provider is Jira and the app is deployed to a publicly reachable URL (App Runner or BYO), automate the Jira webhook by running:
+
+```bash
+./deploy/apprunner/setup-jira-webhook.sh
+```
+
+This script uses the Jira legacy admin endpoint (`/rest/webhooks/1.0/webhook`) which accepts PAT-based basic auth. It idempotently deletes any stale `agentcore-hub-workflow` webhooks and creates a new one pointing at `DEPLOYMENT_URL/api/workflow/jira-webhook` filtered to `JIRA_PROJECT_KEY`. All credentials are read from `.env.local`.
+
+For `deploy_target=local`, skip the automated webhook and remind the user: "Jira webhooks need a public URL. Once you expose localhost via ngrok/Cloudflare Tunnel, update `DEPLOYMENT_URL` in `.env.local` and run `./deploy/apprunner/setup-jira-webhook.sh`."
 
 After this step, run Evaluations (if selected) so it picks up the freshly written `DEPLOYMENT_URL`.
 

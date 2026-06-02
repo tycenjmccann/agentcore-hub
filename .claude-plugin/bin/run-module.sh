@@ -145,6 +145,14 @@ case "$MODULE" in
 
     echo "→ lambda/workflow-output/deploy.sh"
     ./lambda/workflow-output/deploy.sh
+
+    echo "→ deploy/runtime-agent/setup-healthcheck.sh (S3 fixtures for smoke test)"
+    # Upload test fixtures so verify-fleet-invoke.py's S3 tool tests pass on
+    # first run. Without this, 4 tests fail with 404s on missing fixtures.
+    (cd deploy/runtime-agent && ./setup-healthcheck.sh --region "$AWS_REGION" --bucket "$BUCKET") || {
+      echo "⚠ setup-healthcheck.sh failed (non-fatal) — smoke test fixture upload skipped"
+      echo "  Run manually: (cd deploy/runtime-agent && ./setup-healthcheck.sh)"
+    }
     ;;
 
   evaluations)

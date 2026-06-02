@@ -22,6 +22,12 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=8080
+# IMPORTANT: App Runner (and some ECS/Fargate configs) inject their own HOSTNAME
+# env var at container launch, overriding this value. Next.js standalone binds to
+# whatever HOSTNAME is set, so the health check on 127.0.0.1:8080 will fail if
+# HOSTNAME resolves to the instance's internal hostname instead of 0.0.0.0.
+# Fix: always set HOSTNAME=0.0.0.0 as a runtime env var in the service config.
+# deploy/apprunner/deploy.sh does this automatically.
 ENV HOSTNAME=0.0.0.0
 
 RUN addgroup --system --gid 1001 nodejs
