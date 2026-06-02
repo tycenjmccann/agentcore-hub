@@ -5,7 +5,7 @@
 # Uses the legacy admin endpoint (/rest/webhooks/1.0/webhook) which accepts
 # PAT-based basic auth, unlike /rest/api/3/webhook which requires OAuth/Connect.
 #
-# Creates a webhook pointing at DEPLOYMENT_URL/api/workflow/jira-webhook
+# Creates a webhook pointing at DEPLOYMENT_URL/api/jira/webhook
 # filtered to the configured JIRA_PROJECT_KEY. Deletes stale webhooks with
 # the same name before creating a new one.
 #
@@ -34,7 +34,7 @@ fi
 : "${DEPLOYMENT_URL:?DEPLOYMENT_URL must be set}"
 
 WEBHOOK_NAME="agentcore-hub-workflow"
-WEBHOOK_URL="${DEPLOYMENT_URL}/api/workflow/jira-webhook"
+WEBHOOK_URL="${DEPLOYMENT_URL}/api/jira/webhook"
 JIRA_BASE="https://${JIRA_SITE_URL}"
 AUTH="${JIRA_EMAIL}:${JIRA_API_TOKEN}"
 

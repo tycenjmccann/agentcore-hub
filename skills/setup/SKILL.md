@@ -350,7 +350,7 @@ When the ticket provider is Jira and the app is deployed to a publicly reachable
 ./deploy/apprunner/setup-jira-webhook.sh
 ```
 
-This script uses the Jira legacy admin endpoint (`/rest/webhooks/1.0/webhook`) which accepts PAT-based basic auth. It idempotently deletes any stale `agentcore-hub-workflow` webhooks and creates a new one pointing at `DEPLOYMENT_URL/api/workflow/jira-webhook` filtered to `JIRA_PROJECT_KEY`. All credentials are read from `.env.local`.
+This script uses the Jira legacy admin endpoint (`/rest/webhooks/1.0/webhook`) which accepts PAT-based basic auth. It idempotently deletes any stale `agentcore-hub-workflow` webhooks and creates a new one pointing at `DEPLOYMENT_URL/api/jira/webhook` filtered to `JIRA_PROJECT_KEY`. All credentials are read from `.env.local`.
 
 For `deploy_target=local`, skip the automated webhook and remind the user: "Jira webhooks need a public URL. Once you expose localhost via ngrok/Cloudflare Tunnel, update `DEPLOYMENT_URL` in `.env.local` and run `./deploy/apprunner/setup-jira-webhook.sh`."
 
