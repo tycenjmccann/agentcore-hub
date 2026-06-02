@@ -51,7 +51,29 @@ zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs package.json 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
+# Forward Jira creds when the install is in Jira mode. Only the orchestrator
+# (lambda/orchestrator/index.mjs: jiraFetch, getTicketFromJira,
+# transitionTicket, etc) calls Jira. Without these env vars every webhook
+# crashes with `TypeError: fetch failed` on `https:///rest/api/3/...` and no
+# workflow ever advances past phase=requirements. agent-invoker.mjs does NOT
+# read them, so they are kept off that function (least privilege — see below).
+JIRA_VARS=""
+if [ "$TICKET_PROVIDER" = "jira" ]; then
+  JIRA_VARS=",JIRA_SITE_URL=${JIRA_SITE_URL:-},JIRA_EMAIL=${JIRA_EMAIL:-},JIRA_API_TOKEN=${JIRA_API_TOKEN:-},JIRA_PROJECT_KEY=${JIRA_PROJECT_KEY:-}"
+fi
+
+# Forward GitHub creds when present so dev/QA agents can clone, push branches,
+# and open PRs against the workspace repo (FLEET_REPO_URL / GITHUB_OWNER/REPO).
+GITHUB_VARS=""
+if [ -n "${GITHUB_PAT:-}" ]; then
+  GITHUB_VARS=",GITHUB_PAT=${GITHUB_PAT},GITHUB_OWNER=${GITHUB_OWNER:-},GITHUB_REPO=${GITHUB_REPO:-}"
+fi
+
+# Only the orchestrator gets the Jira/GitHub secrets — it is the sole consumer.
+# agent-invoker reads just the table/bucket/provider vars, so it deliberately
+# omits ${JIRA_VARS}${GITHUB_VARS}: keeping a long-lived JIRA_API_TOKEN/GITHUB_PAT
+# off a function that never uses them limits where those credentials are exposed.
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}}"
 
