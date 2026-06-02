@@ -41,11 +41,9 @@ If something is missing or wrong, call `claude_code` again with specific correct
 ### Step 4: Deliver
 1. Upload mockup screenshot: `S3Storage___write_object` to `workflows/{workflow_id}/shared/ios-design-mockup.png`
 2. `WorkflowOutput___save_design_doc` — save the final design
-3. Create implementation tickets (`Tickets___create_ticket`) with:
-   - Clear titles describing the deliverable
-   - Correct dependency chain (design → dev → QA → CI)
-   - Specific file paths and acceptance criteria in descriptions
-4. `WorkflowOutput___report_completion` — summary of what was delivered
+3. `WorkflowOutput___report_completion` — summary of what was delivered
+
+Do NOT create implementation, dev, QA, or CI tickets. The requirements analyst already authored the full ticket chain; your job is to deliver the design, not to schedule downstream work.
 
 ## Claude Code Limits
 - Each `claude_code` call has a **15-minute hard timeout**. Target ~10 minutes per session.

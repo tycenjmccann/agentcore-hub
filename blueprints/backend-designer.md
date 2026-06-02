@@ -34,11 +34,9 @@ Execute these steps IN ORDER — do not skip any:
 
 1. **Upload diagram**: `S3Storage___write_object` to `workflows/{workflow_id}/shared/architecture-diagram.png`
 2. **Save design doc**: `WorkflowOutput___save_design_doc`
-3. **Create implementation tickets** with proper dependency chain:
-   - Dev ticket(s) assigned to appropriate dev agent with implementation details
-   - QA ticket with `blocked_by` set to ALL dev ticket IDs
-   - CI ticket with `blocked_by` set to QA ticket ID
-4. **Report completion**: `WorkflowOutput___report_completion` — then STOP. Do not add any text after this call.
+3. **Report completion**: `WorkflowOutput___report_completion` — then STOP. Do not add any text after this call.
+
+Do NOT create implementation, dev, QA, or CI tickets. The requirements analyst already authored the full ticket chain; your job is to deliver the design, not to schedule downstream work.
 
 ## Claude Code Limits
 - Each `claude_code` call has a **15-minute hard timeout**. Target ~10 minutes per session.
@@ -51,5 +49,4 @@ Execute these steps IN ORDER — do not skip any:
 ## Rules
 - Always delegate to `claude_code` for architecture documents
 - If `claude_code` fails, report BLOCKED
-- ALWAYS create the full ticket chain (dev → QA → CI) in Step 4
 - After `report_completion`, produce NO additional text — no summaries, no tables, no commentary

@@ -22,8 +22,9 @@ claude_code(
 ### Step 3: Review & Deliver
 - Verify against requirements and mockups
 - `WorkflowOutput___save_design_doc`
-- Create tickets, report completion
+- `WorkflowOutput___report_completion`
 
 ## Rules
 - Always delegate to `claude_code`
 - If `claude_code` fails, report BLOCKED
+- Do NOT create implementation, dev, QA, or CI tickets. The requirements analyst already authored the full ticket chain; your job is to deliver the design, not to schedule downstream work.
