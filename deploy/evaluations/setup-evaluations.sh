@@ -35,6 +35,25 @@ fi
 
 echo "Reading agent IDs from: $FLEET_FILE"
 
+# The custom dependency-chain evaluator is created per-account and is NOT
+# provisioned by any deploy step in this repo (its ID is account-specific).
+# Probe for it once. If it's missing, ticket agents gracefully fall back to
+# 10 built-in evaluators (adding Conciseness) instead of emitting a config
+# that the API rejects with "Evaluators not found".
+CUSTOM_EVALUATOR_AVAILABLE=false
+if AGENTCORE_SUPPRESS_RECOMMENDATION=1 agentcore eval evaluator list --max-results 100 2>/dev/null \
+     | grep -q "$CUSTOM_EVALUATOR"; then
+  CUSTOM_EVALUATOR_AVAILABLE=true
+  echo "Custom evaluator present: $CUSTOM_EVALUATOR"
+else
+  echo ""
+  echo "⚠️  WARNING: custom evaluator '$CUSTOM_EVALUATOR' not found in this account."
+  echo "    Ticket agents will use 10 built-in evaluators (Conciseness substituted"
+  echo "    for the dependency-chain check). To enable the custom evaluator, create"
+  echo "    it with 'agentcore eval evaluator create' and re-run this script."
+  echo ""
+fi
+
 AGENTS=$(python3 -c "
 import json
 with open('$FLEET_FILE') as f:
@@ -46,57 +65,71 @@ for name, arn in data.items():
 
 AGENT_COUNT=$(echo "$AGENTS" | wc -l | tr -d ' ')
 echo "Creating online evaluation configs for ${AGENT_COUNT} agents..."
-echo "Evaluators: 10 per agent (ticket agents get custom dependency_chain evaluator)"
+if [ "$CUSTOM_EVALUATOR_AVAILABLE" = true ]; then
+  echo "Evaluators: 10 per agent (ticket agents get custom dependency_chain evaluator)"
+else
+  echo "Evaluators: 10 built-in per agent (custom evaluator unavailable — see warning above)"
+fi
 echo "Sampling: 100%"
 echo "Judge model: Opus 4.7"
 echo ""
 
-echo "$AGENTS" | while read name agent_id; do
+# Loop via process substitution (not a pipe) so FAILED_CONFIGS set inside the
+# loop survives into the parent shell for the final summary / exit code.
+FAILED_CONFIGS=""
+while read name agent_id; do
   config_name="eval_${name}"
 
   echo "→ Creating config for ${name} (${agent_id})..."
 
-  # Determine evaluator set based on whether agent creates tickets
-  if echo "$TICKET_AGENTS" | grep -qw "$name"; then
-    # 9 built-in + 1 custom (drop Conciseness to stay at 10)
-    agentcore eval online create \
-      --agent-id "${agent_id}" \
-      --name "${config_name}" \
-      --sampling-rate 100.0 \
-      -e "Builtin.ToolSelectionAccuracy" \
-      -e "Builtin.ToolParameterAccuracy" \
-      -e "Builtin.InstructionFollowing" \
-      -e "Builtin.GoalSuccessRate" \
-      -e "Builtin.Correctness" \
-      -e "Builtin.Coherence" \
-      -e "Builtin.Faithfulness" \
-      -e "Builtin.Helpfulness" \
-      -e "Builtin.ResponseRelevance" \
-      -e "${CUSTOM_EVALUATOR}" \
-      --description "Full evaluation suite for ${name} - 100% sampling with Opus 4.7 judge" \
-      2>&1 | grep -E "(✓|Config ID|Status|Error)" || true
+  # Build the evaluator argument list. Ticket agents get the custom
+  # dependency-chain evaluator (9 built-in + 1 custom) when it's available;
+  # otherwise everyone gets the same 10 built-in evaluators.
+  eval_args=(
+    -e "Builtin.ToolSelectionAccuracy"
+    -e "Builtin.ToolParameterAccuracy"
+    -e "Builtin.InstructionFollowing"
+    -e "Builtin.GoalSuccessRate"
+    -e "Builtin.Correctness"
+    -e "Builtin.Coherence"
+    -e "Builtin.Faithfulness"
+    -e "Builtin.Helpfulness"
+    -e "Builtin.ResponseRelevance"
+  )
+  if echo "$TICKET_AGENTS" | grep -qw "$name" && [ "$CUSTOM_EVALUATOR_AVAILABLE" = true ]; then
+    eval_args+=(-e "${CUSTOM_EVALUATOR}")
   else
-    # 10 built-in (no custom evaluator needed)
-    agentcore eval online create \
-      --agent-id "${agent_id}" \
-      --name "${config_name}" \
-      --sampling-rate 100.0 \
-      -e "Builtin.ToolSelectionAccuracy" \
-      -e "Builtin.ToolParameterAccuracy" \
-      -e "Builtin.InstructionFollowing" \
-      -e "Builtin.GoalSuccessRate" \
-      -e "Builtin.Correctness" \
-      -e "Builtin.Coherence" \
-      -e "Builtin.Faithfulness" \
-      -e "Builtin.Helpfulness" \
-      -e "Builtin.Conciseness" \
-      -e "Builtin.ResponseRelevance" \
-      --description "Full evaluation suite for ${name} - 100% sampling with Opus 4.7 judge" \
-      2>&1 | grep -E "(✓|Config ID|Status|Error)" || true
+    eval_args+=(-e "Builtin.Conciseness")
+  fi
+
+  # Capture output and exit status. Show the success/error lines, and on a
+  # non-zero exit surface the full output and record the failure (do NOT
+  # swallow it with `|| true` — a silent failure here is exactly the bug
+  # this script previously had).
+  create_out=$(agentcore eval online create \
+    --agent-id "${agent_id}" \
+    --name "${config_name}" \
+    --sampling-rate 100.0 \
+    "${eval_args[@]}" \
+    --description "Full evaluation suite for ${name} - 100% sampling with Opus 4.7 judge" \
+    2>&1) && create_rc=0 || create_rc=$?
+
+  echo "$create_out" | grep -E "(✓|Config ID|Status|Error)" || true
+  if [ "$create_rc" -ne 0 ]; then
+    echo "  ✗ FAILED to create eval config for ${name} (exit ${create_rc}):"
+    echo "$create_out" | sed 's/^/      /'
+    FAILED_CONFIGS="${FAILED_CONFIGS} ${name}"
   fi
 
   echo ""
-done
+done < <(echo "$AGENTS")
 
 echo "Done! Listing all configs:"
 agentcore eval online list
+
+if [ -n "$FAILED_CONFIGS" ]; then
+  echo ""
+  echo "✗ Online eval config creation FAILED for:${FAILED_CONFIGS}"
+  echo "  (See per-agent errors above.) This step did not fully succeed."
+  exit 1
+fi

@@ -68,9 +68,9 @@ aws_account=$(jq -r '.aws_account' "$ANSWERS")
 aws_region=$(jq -r '.aws_region' "$ANSWERS")
 github_mode=$(jq -r '.github.mode // "skip"' "$ANSWERS")
 github_pat=$(jq -r '.github.pat // ""' "$ANSWERS")
-mcp_servers=$(jq -r '.github.mcp_servers // ""' "$ANSWERS")
 github_owner=$(jq -r '.github.owner // ""' "$ANSWERS")
 github_repo=$(jq -r '.github.repo // ""' "$ANSWERS")
+mcp_servers=$(jq -r '.github.mcp_servers // ""' "$ANSWERS")
 
 has_workflow=false
 has_evals=false
@@ -126,6 +126,8 @@ emit() {
     elif [[ "$github_mode" == "mcp" && -n "$mcp_servers" ]]; then
       emit MCP_SERVERS "$mcp_servers"
     fi
+    # GITHUB_OWNER/REPO identify the target repo for agent PRs and the fleet
+    # health check. Emit whenever provided, independent of auth mode.
     if [[ -n "$github_owner" ]]; then
       emit GITHUB_OWNER "$github_owner"
     fi

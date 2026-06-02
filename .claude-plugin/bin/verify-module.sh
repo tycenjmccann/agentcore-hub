@@ -204,7 +204,40 @@ case "$MODULE" in
       *) fail "agentcore-hub-prd-submitter is not a target of agentcore-hub-prd-submitter-trigger (got: $prd_targets)" ;;
     esac
 
-    pass "eval-config table + 3 Lambdas (eval-packager, token-aggregator, prd-submitter) + 2 EventBridge targets"
+    # Online evaluation configs must actually be healthy. Existence-only checks
+    # on the Lambdas/tables previously let the install report ✓ while
+    # setup-evaluations.sh silently failed to create the configs (it swallowed
+    # the API error). Inspect config status via the agentcore CLI (the AWS CLI
+    # lacks bedrock-agentcore-control). Non-fatal if the CLI isn't installed,
+    # since the eval Lambdas/tables above are the load-bearing infra.
+    if command -v agentcore >/dev/null 2>&1; then
+      eval_json=$(mktemp)
+      if AGENTCORE_SUPPRESS_RECOMMENDATION=1 agentcore eval online list \
+           --max-results 100 --output "$eval_json" >/dev/null 2>&1; then
+        error_configs=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$eval_json'))
+except Exception:
+    sys.exit(0)
+configs = d.get('onlineEvaluationConfigs', d) if isinstance(d, dict) else d
+bad = [c.get('onlineEvaluationConfigName', c.get('onlineEvaluationConfigId', '?'))
+       for c in configs if str(c.get('status', '')).upper() == 'ERROR']
+print(' '.join(bad))
+" 2>/dev/null || true)
+        rm -f "$eval_json"
+        if [[ -n "$error_configs" ]]; then
+          fail "online eval config(s) in ERROR status: $error_configs (setup-evaluations.sh did not complete cleanly — check the custom evaluator and re-run)"
+        fi
+      else
+        rm -f "$eval_json"
+        echo "  (could not list online eval configs via agentcore CLI; skipping status check)"
+      fi
+    else
+      echo "  (agentcore CLI not found; skipping online eval config status check)"
+    fi
+
+    pass "eval-config table + 3 Lambdas (eval-packager, token-aggregator, prd-submitter) + 2 EventBridge targets + online eval configs healthy"
     ;;
 
   *)
