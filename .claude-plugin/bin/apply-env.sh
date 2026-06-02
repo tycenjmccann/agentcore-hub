@@ -9,6 +9,8 @@
 #   "brand_name": "Bob's AI Hub",
 #   "modules": ["core", "builder", "workflow", "evaluations"],
 #   "ticket_provider": "dynamodb" | "jira",
+#   "workflow_runtimes": 1 | 4 | 14,
+#   "deploy_mode": "lightweight" | "robust",
 #   "aws_account": "123456789012",
 #   "aws_region": "us-east-1",
 #   "aws_profile": "default",
@@ -57,6 +59,11 @@ case "$workflow_runtimes" in
   1|4|14) ;;
   *) echo "Invalid workflow_runtimes: $workflow_runtimes (must be 1, 4, or 14)" >&2; exit 2 ;;
 esac
+deploy_mode=$(jq -r '.deploy_mode // "lightweight"' "$ANSWERS")
+case "$deploy_mode" in
+  lightweight|robust) ;;
+  *) echo "Invalid deploy_mode: $deploy_mode (must be lightweight or robust)" >&2; exit 2 ;;
+esac
 aws_account=$(jq -r '.aws_account' "$ANSWERS")
 aws_region=$(jq -r '.aws_region' "$ANSWERS")
 github_mode=$(jq -r '.github.mode // "skip"' "$ANSWERS")
@@ -93,6 +100,7 @@ emit() {
     echo "# --- Workflow module ---"
     emit TICKET_PROVIDER "$ticket_provider"
     emit WORKFLOW_RUNTIME_COUNT "$workflow_runtimes"
+    emit DEPLOY_MODE "$deploy_mode"
     emit WORKFLOWS_TABLE "agentcore-hub-workflows"
     emit EVENTS_TABLE "agentcore-hub-events"
     emit ARTIFACT_BUCKET "agentcore-hub-artifacts-$aws_account-$aws_region"

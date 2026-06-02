@@ -142,6 +142,54 @@ In every mode `deploy-topology.sh` syncs all 14 prompts to `s3://$ARTIFACT_BUCKE
 
 > **No application code changes are required across these three modes** — the orchestrator resolves per-agent via `agents.json` `runtimeArn`, and the runtime resolves per-persona prompts via `prompts/{agentId}.txt`. Topology is purely a deploy + mapping concern.
 
+## Q4b — Deploy mode *(skip if Workflow not in MODULES)*
+
+Before asking, print this framing so the user understands what each mode contains and the tradeoff:
+
+```
+Workflow agents need a Linux container to run in. Two modes are available:
+
+  Lightweight (default) — Stock python:3.10 container provided by AgentCore.
+                          On cold start each agent downloads Node.js and the
+                          Claude Code CLI into /tmp (3–10s tax). No Playwright
+                          browser, no curated skills/plugins. ~3 min to deploy.
+                          Best for first-time setup, demos, and any persona
+                          that doesn't need browser automation or pre-loaded
+                          domain expertise.
+
+  Robust                 — Custom container baked from this repo's Dockerfile.
+                          Pre-installs Node.js, Claude Code CLI, Playwright +
+                          Chromium (~150MB), and ~262 curated SKILL.md files
+                          across 10 personas (frontend, iOS, Android, backend,
+                          API, analytics, QA, etc.). Faster cold starts, full
+                          browser automation, persona-matched skills auto-load
+                          on description match. Adds a one-time ~6 min Docker
+                          build + ECR push before the agent loop runs.
+
+You can switch modes later by re-running /agentcore-hub:setup — it's just an
+env var (DEPLOY_MODE=lightweight|robust) read by deploy-fleet.sh.
+```
+
+Then ask via `AskUserQuestion`:
+
+- **question:** "Which deploy mode do you want for the Workflow agents? Lightweight is the smallest install and works for most personas; Robust gives every agent Playwright Chromium and curated skill packs but adds a Docker build step."
+- **header:** "Deploy mode"
+- **options:**
+  1. *Lightweight (Recommended)* — Stock container, fast deploy, no extra tooling baked in. Cold-start tax of 3–10s as Node + claude-code self-install on first invocation per microVM.
+  2. *Robust* — Custom Docker image with Playwright Chromium + 262 curated skills baked in. Adds ~6 min for the one-time Docker build & ECR push. Requires Docker running locally (Colima or Docker Desktop).
+
+Save as `deploy_mode` (`lightweight` or `robust`) in the answers blob. `apply-env.sh` writes it to `.env.local` as `DEPLOY_MODE`. `deploy-fleet.sh` reads `DEPLOY_MODE`; in `robust` mode it builds the Dockerfile (`deploy/runtime-agent/Dockerfile` + `install-skills.sh`), pushes to ECR (repo `runtime-agent`), and points `CreateAgentRuntime`/`UpdateAgentRuntime` at the resulting `containerUri` directly.
+
+If the user picks **Robust**, do a quick pre-flight check:
+
+```bash
+docker info >/dev/null 2>&1 || echo "DOCKER_NOT_RUNNING"
+```
+
+If Docker isn't running, surface this immediately and ask the user to start Docker Desktop or Colima before continuing — the build step will fail otherwise.
+
+> **AWS MCP server tip:** if the user has Claude Code's AWS MCP server installed (the `aws-core` plugin in the `agent-toolkit-for-aws` marketplace), most of the AWS troubleshooting here is one tool call away (`aws___call_aws`, `search_documentation`, etc.). It's not required, but it's the smoothest path. If they haven't installed it, point them at `agentcore` plugin install instructions in the README and continue without it.
+
 ## Q5 — AWS target
 
 Use the pre-flight detection result:

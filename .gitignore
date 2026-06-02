@@ -8,6 +8,7 @@ out/
 # Environment (secrets)
 .env
 .env.local
+.env.local.bak
 .env.*.local
 *.local
 
@@ -51,6 +52,10 @@ demo/output/
 demo/recordings/
 *.mp4
 *.webm
+
+# Python
+__pycache__/
+*.pyc
 
 # IDE / OS
 .DS_Store

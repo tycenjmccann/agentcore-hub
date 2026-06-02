@@ -196,36 +196,9 @@ def _load_prompt_for_agent(agent_id: str) -> str:
         )
         return SYSTEM_PROMPT
 
-# --- Load Claude Code skills from S3 at cold start ---
-# Skills are stored as SKILL.md files in S3 under skills/{role}/.
-# We sync them to /tmp/.claude/skills/ so claude_code auto-discovers them.
-# Mapping from agent name → skill folder in S3 (multiple agents can share a skill set)
-_AGENT_SKILL_MAP = {
-    "agentcore_hub_ios_designer": "ios-designer",
-    # Future: "agentcore_hub_frontend_dev": "frontend-dev", etc.
-}
+# Claude Code skills/plugins are baked into the image at build time
+# (deploy/runtime-agent/install-skills.sh) — no runtime sync needed.
 _agent_name_from_prompt_key = os.path.basename(_prompt_s3_key).replace(".txt", "") if _prompt_s3_key else ""
-_skill_set = _AGENT_SKILL_MAP.get(_agent_name_from_prompt_key, "")
-
-if _skill_set and ARTIFACT_BUCKET:
-    import pathlib
-    _skills_prefix = f"skills/{_skill_set}/"
-    _skills_dir = pathlib.Path("/tmp/.claude/skills")
-    try:
-        _s3_skills = boto3.client("s3", region_name=REGION)
-        _paginator = _s3_skills.get_paginator("list_objects_v2")
-        _count = 0
-        for page in _paginator.paginate(Bucket=ARTIFACT_BUCKET, Prefix=_skills_prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                rel_path = key[len(_skills_prefix):]  # e.g., "swiftui-patterns/SKILL.md"
-                local_path = _skills_dir / rel_path
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                _s3_skills.download_file(ARTIFACT_BUCKET, key, str(local_path))
-                _count += 1
-        logger.info(f"Loaded {_count} Claude Code skill files for role '{_skill_set}' → /tmp/.claude/skills/")
-    except Exception as _e:
-        logger.warning(f"Failed to load Claude Code skills from S3: {_e}")
 
 # --- Model with custom timeout (THE FIX) ---
 boto_config = BotocoreConfig(

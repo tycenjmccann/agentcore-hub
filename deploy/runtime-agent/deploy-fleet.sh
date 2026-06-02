@@ -26,6 +26,7 @@ fi
 REGION="${AWS_REGION:-us-east-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$SCRIPT_DIR"
+DEPLOY_MODE="${DEPLOY_MODE:-lightweight}"
 
 # Create runtime role if not already set
 if [ -z "${AGENTCORE_ROLE_ARN:-}" ]; then
@@ -38,6 +39,34 @@ fi
 ROLE_ARN="${AGENTCORE_ROLE_ARN}"
 GATEWAY_ARN="${GATEWAY_ARN:-}"  # Optional: AgentCore MCP gateway ARN
 MODEL_ID="us.anthropic.claude-opus-4-6-v1"
+
+# Robust mode: build & push the image ONCE before the parallel agent loop.
+# All 14 agents share the same image; deploy-one-robust.py just points
+# CreateAgentRuntime/UpdateAgentRuntime at IMAGE_URI.
+if [ "$DEPLOY_MODE" = "robust" ]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: DEPLOY_MODE=robust requires Docker, but 'docker' is not on PATH." >&2
+    echo "  Install Docker Desktop (or another OCI runtime) and retry," >&2
+    echo "  or re-run /setup and choose the lightweight deploy mode." >&2
+    exit 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo "ERROR: DEPLOY_MODE=robust requires a running Docker daemon." >&2
+    echo "  Start Docker Desktop and retry," >&2
+    echo "  or re-run /setup and choose the lightweight deploy mode." >&2
+    exit 1
+  fi
+  : "${AWS_ACCOUNT_ID:=$(aws sts get-caller-identity --query Account --output text)}"
+  IMAGE_TAG="${IMAGE_TAG:-$(date -u +%Y%m%d-%H%M%S)}"
+  IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/runtime-agent:${IMAGE_TAG}"
+  export IMAGE_URI
+
+  echo "Robust mode — building & pushing custom image..."
+  echo "  IMAGE_URI=$IMAGE_URI"
+  AWS_ACCOUNT_ID="$AWS_ACCOUNT_ID" AWS_REGION="$REGION" \
+    "$SCRIPT_DIR/build-and-push.sh" "$IMAGE_TAG"
+  echo ""
+fi
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -57,7 +86,10 @@ echo "  Role ARN:    $ROLE_ARN"
 echo "  Gateway ARN: $GATEWAY_ARN"
 echo "  Model:       $MODEL_ID"
 echo "  Source:      $BASE_DIR/main.py"
-echo "  Deploy Type: direct_code_deploy (CodeZip, no Docker)"
+echo "  Deploy Mode: $DEPLOY_MODE"
+if [ "$DEPLOY_MODE" = "robust" ]; then
+  echo "  Image URI:   $IMAGE_URI"
+fi
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 

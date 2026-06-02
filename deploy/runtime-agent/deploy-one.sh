@@ -7,6 +7,27 @@ ROLE_ARN="${AGENTCORE_ROLE_ARN:?Set AGENTCORE_ROLE_ARN to your AgentCore executi
 REGION="${AWS_REGION:-us-east-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# DEPLOY_MODE selects between two deploy paths:
+#   lightweight (default) — CodeZip via the bedrock-agentcore-starter-toolkit.
+#                           Stock python:3.10 container; main.py downloads Node
+#                           + claude-code into /tmp on cold start. No Playwright
+#                           browser, no curated skills.
+#   robust                 — Custom container built from Dockerfile (baked Node,
+#                           claude-code, Playwright Chromium, ~262 SKILL.md).
+#                           Uses bedrock-agentcore-control API directly because
+#                           neither the legacy toolkit nor @aws/agentcore CLI
+#                           accepts a pre-built ECR image URI.
+DEPLOY_MODE="${DEPLOY_MODE:-lightweight}"
+
+if [ "$DEPLOY_MODE" = "robust" ]; then
+  exec python3 "$SCRIPT_DIR/deploy-one-robust.py" "$AGENT_NAME"
+fi
+
+if [ "$DEPLOY_MODE" != "lightweight" ]; then
+  echo "FAIL $AGENT_NAME (unknown DEPLOY_MODE=$DEPLOY_MODE — expected 'lightweight' or 'robust')"
+  exit 1
+fi
+
 
 # Source GITHUB_PAT from .env.local if not already set (needed for MCP access).
 # IMPORTANT: Do NOT source the full .env.local — it contains dev-account values
