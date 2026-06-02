@@ -504,7 +504,11 @@ def WorkflowOutput___save_design_doc(workflow_id: str, agent_id: str, content: s
 
 @tool
 def WorkflowOutput___submit_ticket_plan(workflow_id: str, epic_id: str, tickets: str) -> str:
-    """Submit a plan of tickets to create for the workflow.
+    """Persist your ticket plan as a record. This does NOT create tickets.
+
+    After calling this, you MUST call Tickets___create_ticket once per ticket
+    in the plan to actually create them under the epic. The orchestration
+    engine reacts to ticket status changes — it does not expand plans.
 
     Args:
         workflow_id: Workflow ID
