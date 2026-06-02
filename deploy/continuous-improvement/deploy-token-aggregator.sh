@@ -27,6 +27,16 @@ if [[ -f "${REPO_ROOT_BOOT}/.env.local" ]]; then
 fi
 
 REGION="${AWS_REGION:-us-east-1}"
+
+# Parse args before deriving REGION-dependent values (e.g. BUCKET) so that
+# `--region` is honoured rather than baking in the default/AWS_REGION region.
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --region) REGION="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1"; exit 1 ;;
+  esac
+done
+
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 LAMBDA_NAME="agentcore-hub-token-aggregator"
 LAMBDA_ROLE="${LAMBDA_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-lambda-role}"
@@ -37,13 +47,6 @@ TABLE_NAME="agentcore-hub-eval-config"
 BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAMBDA_DIR="${SCRIPT_DIR}/../../lambda/token-aggregator"
-
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --region) REGION="$2"; shift 2 ;;
-    *) echo "Unknown arg: $1"; exit 1 ;;
-  esac
-done
 
 echo "=== Deploy Token Aggregator ==="
 echo "Region:  ${REGION}"

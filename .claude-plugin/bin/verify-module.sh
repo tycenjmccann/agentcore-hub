@@ -114,22 +114,32 @@ case "$MODULE" in
     aws lambda get-function --function-name agentcore-hub-events-writer --region "$AWS_REGION" >/dev/null 2>&1 \
       || fail "agentcore-hub-events-writer Lambda not found"
 
-    stream_arn=$(aws dynamodb describe-table --table-name agentcore-hub-tickets \
-      --region "$AWS_REGION" --query 'Table.LatestStreamArn' --output text 2>/dev/null || true)
-    if [[ -z "$stream_arn" || "$stream_arn" == "None" ]]; then
-      fail "agentcore-hub-tickets has no DynamoDB Stream — orchestrator will never be triggered"
-    fi
+    # The DynamoDB Stream → orchestrator wiring only exists for the dynamodb
+    # ticket provider. With TICKET_PROVIDER=jira, run-module.sh skips the
+    # tickets table (--with-tickets) and the orchestrator is driven by the
+    # Jira webhook instead (lambda/orchestrator/index.mjs handles
+    # source === "jira-webhook"), so requiring the stream here would fail a
+    # valid Jira install.
+    if [[ "${TICKET_PROVIDER:-dynamodb}" == "dynamodb" ]]; then
+      stream_arn=$(aws dynamodb describe-table --table-name agentcore-hub-tickets \
+        --region "$AWS_REGION" --query 'Table.LatestStreamArn' --output text 2>/dev/null || true)
+      if [[ -z "$stream_arn" || "$stream_arn" == "None" ]]; then
+        fail "agentcore-hub-tickets has no DynamoDB Stream — orchestrator will never be triggered"
+      fi
 
-    esm_state=$(aws lambda list-event-source-mappings \
-      --function-name agentcore-hub-orchestrator \
-      --region "$AWS_REGION" \
-      --query "EventSourceMappings[?starts_with(EventSourceArn, \`${stream_arn%/*}\`)].State | [0]" \
-      --output text 2>/dev/null || true)
-    if [[ -z "$esm_state" || "$esm_state" == "None" ]]; then
-      fail "no DynamoDB Stream event source mapping on agentcore-hub-orchestrator (orchestrator is idle)"
-    fi
-    if [[ "$esm_state" != "Enabled" ]]; then
-      fail "orchestrator stream mapping is in state '$esm_state' (expected Enabled)"
+      esm_state=$(aws lambda list-event-source-mappings \
+        --function-name agentcore-hub-orchestrator \
+        --region "$AWS_REGION" \
+        --query "EventSourceMappings[?starts_with(EventSourceArn, \`${stream_arn%/*}\`)].State | [0]" \
+        --output text 2>/dev/null || true)
+      if [[ -z "$esm_state" || "$esm_state" == "None" ]]; then
+        fail "no DynamoDB Stream event source mapping on agentcore-hub-orchestrator (orchestrator is idle)"
+      fi
+      if [[ "$esm_state" != "Enabled" ]]; then
+        fail "orchestrator stream mapping is in state '$esm_state' (expected Enabled)"
+      fi
+    else
+      echo "  TICKET_PROVIDER=$TICKET_PROVIDER — skipping DynamoDB Stream checks (orchestrator is driven by the Jira webhook)"
     fi
 
     # EventBridge rule -> events-writer wiring
@@ -150,7 +160,7 @@ case "$MODULE" in
       (cd deploy/runtime-agent && ./verify-fleet.sh) \
         || fail "verify-fleet.sh reported failures"
     fi
-    pass "tables + fleet ARNs + stream mapping + EventBridge target + quick fleet invocation"
+    pass "tables + fleet ARNs + trigger wiring (TICKET_PROVIDER=${TICKET_PROVIDER:-dynamodb}) + EventBridge target + quick fleet invocation"
     ;;
 
   evaluations)
