@@ -69,18 +69,12 @@ export default function AgentsPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Fetch agents and metrics in parallel
-    Promise.all([
-      cachedFetch<AgentDetail[] | { error: string }>(cacheKey),
-      cachedFetch<MetricsResponse>(metricsCacheKey),
-    ])
-      .then(async ([data, metricsData]) => {
-        // Process metrics
-        if (metricsData?.agentMetrics) {
-          setMetricsMap(Object.fromEntries(metricsData.agentMetrics.map((m) => [m.id, m])));
-        }
-
-        // Process agents
+    // Agent discovery is fast; per-agent detail enrichment and the metrics
+    // endpoint (slow CloudWatch Logs Insights queries, ~15s cold) are not.
+    // Render the cards as soon as discovery returns, then enrich + fill in
+    // metrics independently so neither blocks the initial paint.
+    cachedFetch<AgentDetail[] | { error: string }>(cacheKey)
+      .then((data) => {
         if (data && typeof data === "object" && "error" in data) {
           setError((data as { error: string }).error);
           setAgents([]);
@@ -88,24 +82,30 @@ export default function AgentsPage() {
         }
         const list = Array.isArray(data) ? data : [];
         setAgents(list);
+        setLoading(false);
 
-        // Enrich each agent with detail (model, tools, description) in parallel
-        const enriched = await Promise.all(
-          list.map(async (agent: AgentDetail) => {
-            try {
-              const detail = await cachedFetch<AgentDetail>(`/api/agentcore/agents?id=${agent.id}`);
-              return { ...agent, ...detail };
-            } catch { /* keep basic info */ }
-            return agent;
-          })
-        );
-        setAgents(enriched);
+        // Enrich each agent with detail (model, tools, description) in the
+        // background — cards are already visible by now.
+        list.forEach(async (agent: AgentDetail) => {
+          try {
+            const detail = await cachedFetch<AgentDetail>(`/api/agentcore/agents?id=${agent.id}`);
+            setAgents((prev) => prev.map((a) => (a.id === agent.id ? { ...a, ...detail } : a)));
+          } catch { /* keep basic info */ }
+        });
       })
       .catch((err) => {
         setError(err.message);
         setAgents([]);
+        setLoading(false);
+      });
+
+    cachedFetch<MetricsResponse>(metricsCacheKey)
+      .then((metricsData) => {
+        if (metricsData?.agentMetrics) {
+          setMetricsMap(Object.fromEntries(metricsData.agentMetrics.map((m) => [m.id, m])));
+        }
       })
-      .finally(() => setLoading(false));
+      .catch(() => {});
   }, []);
 
   if (loading) {

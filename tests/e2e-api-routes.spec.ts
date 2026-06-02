@@ -64,7 +64,11 @@ test.describe("E2E: API Routes", () => {
   });
 
   test("Metrics API returns usage data", async ({ request }) => {
-    const res = await request.get("/api/agentcore/metrics");
+    // The metrics route runs CloudWatch Logs Insights queries (each polls up to
+    // 15s) plus CW metric stats, so a cold call can take ~30s+. Give it a
+    // realistic budget instead of the default 30s; results are cached 2min after.
+    test.setTimeout(90_000);
+    const res = await request.get("/api/agentcore/metrics", { timeout: 80_000 });
     expect(res.status()).toBe(200);
     const data = await res.json();
     expect(data).toHaveProperty("usage");

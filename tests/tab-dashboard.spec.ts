@@ -5,8 +5,12 @@ test.describe("Dashboard Tab", () => {
     await page.goto("/");
   });
 
-  test("renders header with AgentCore Hub branding", async ({ page }) => {
-    await expect(page.locator("h1")).toContainText("AgentCore Hub");
+  test("renders header with configured branding", async ({ page }) => {
+    // The sidebar h1 renders NEXT_PUBLIC_BRAND_NAME (installer-configurable),
+    // falling back to "AgentCore Hub". Read the same source the app does rather
+    // than hardcoding the default — a custom brand is a healthy app, not a bug.
+    const expectedBrand = process.env.NEXT_PUBLIC_BRAND_NAME || "AgentCore Hub";
+    await expect(page.locator("h1")).toContainText(expectedBrand);
   });
 
   test("shows all navigation items", async ({ page }) => {
@@ -18,7 +22,10 @@ test.describe("Dashboard Tab", () => {
   });
 
   test("displays agent activity metrics", async ({ page }) => {
-    await expect(page.getByText("Invocations")).toBeVisible();
+    // "Invocations" also appears as an Agent Performance table column header;
+    // scope to the metric-card label (a paragraph) to avoid a strict-mode
+    // ambiguity once the table renders.
+    await expect(page.getByRole("paragraph").filter({ hasText: /^Invocations$/ })).toBeVisible();
     await expect(page.getByText("Tokens", { exact: true })).toBeVisible();
     await expect(page.getByText("Active Agents")).toBeVisible();
   });

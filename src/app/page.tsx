@@ -114,20 +114,24 @@ export default function DashboardPage() {
   const [agents, setAgents] = useState<Agent[]>(() => getCached<Agent[]>("/api/agentcore/agents") || []);
   const [metrics, setMetrics] = useState<MetricsData | null>(() => getCached<MetricsData>("/api/agentcore/metrics"));
   const [loading, setLoading] = useState(!getCached("/api/agentcore/agents"));
+  const [metricsLoading, setMetricsLoading] = useState(!getCached("/api/agentcore/metrics"));
   const jira = useJiraMetrics();
 
   useEffect(() => {
-    // Fetch with cache — returns instantly if cached, revalidates in background
-    Promise.all([
-      cachedFetch<Agent[]>("/api/agentcore/agents"),
-      cachedFetch<MetricsData>("/api/agentcore/metrics"),
-    ])
-      .then(([agentsData, metricsData]) => {
-        setAgents(Array.isArray(agentsData) ? agentsData : []);
-        if (metricsData && !(metricsData as any).error) setMetrics(metricsData);
-      })
+    // Agent discovery is fast (~0.5s); metrics runs slow CloudWatch Logs
+    // Insights queries (~15s cold). Fetch them independently so the agent
+    // table renders as soon as discovery returns instead of waiting on metrics.
+    cachedFetch<Agent[]>("/api/agentcore/agents")
+      .then((agentsData) => setAgents(Array.isArray(agentsData) ? agentsData : []))
       .catch(() => setAgents([]))
       .finally(() => setLoading(false));
+
+    cachedFetch<MetricsData>("/api/agentcore/metrics")
+      .then((metricsData) => {
+        if (metricsData && !(metricsData as any).error) setMetrics(metricsData);
+      })
+      .catch(() => {})
+      .finally(() => setMetricsLoading(false));
   }, []);
 
   return (
@@ -138,35 +142,35 @@ export default function DashboardPage() {
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
           <BigMetric
             label="Invocations"
-            value={loading ? "—" : (metrics?.usage.totalInvocations ?? 0).toString()}
+            value={metricsLoading ? "—" : (metrics?.usage.totalInvocations ?? 0).toString()}
             sub={`${metrics?.usage.totalSessions ?? 0} sessions`}
             icon={MessageSquare}
             color="text-brand-400"
           />
           <BigMetric
             label="Tokens"
-            value={loading ? "—" : `${formatNumber(metrics?.usage.totalTokensIn ?? 0)} / ${formatNumber(metrics?.usage.totalTokensOut ?? 0)}`}
+            value={metricsLoading ? "—" : `${formatNumber(metrics?.usage.totalTokensIn ?? 0)} / ${formatNumber(metrics?.usage.totalTokensOut ?? 0)}`}
             sub="in / out"
             icon={Zap}
             color="text-cyan-400"
           />
           <BigMetric
             label="Avg Duration"
-            value={loading ? "—" : formatDuration(metrics?.usage.avgSessionDuration ?? 0)}
+            value={metricsLoading ? "—" : formatDuration(metrics?.usage.avgSessionDuration ?? 0)}
             sub="per session"
             icon={Timer}
             color="text-yellow-400"
           />
           <BigMetric
             label="Total Duration"
-            value={loading ? "—" : formatDuration(metrics?.usage.totalDuration ?? 0)}
+            value={metricsLoading ? "—" : formatDuration(metrics?.usage.totalDuration ?? 0)}
             sub="autonomous work time"
             icon={Clock}
             color="text-emerald-400"
           />
           <BigMetric
             label="Active Agents"
-            value={loading ? "—" : (metrics?.usage.activeAgents ?? agents.filter((a) => a.status === "ACTIVE" || a.status === "READY").length).toString()}
+            value={metricsLoading ? "—" : (metrics?.usage.activeAgents ?? agents.filter((a) => a.status === "ACTIVE" || a.status === "READY").length).toString()}
             sub={`of ${metrics?.usage.totalAgents ?? agents.length} total`}
             icon={Bot}
             color="text-brand-400"
