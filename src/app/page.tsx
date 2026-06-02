@@ -114,20 +114,24 @@ export default function DashboardPage() {
   const [agents, setAgents] = useState<Agent[]>(() => getCached<Agent[]>("/api/agentcore/agents") || []);
   const [metrics, setMetrics] = useState<MetricsData | null>(() => getCached<MetricsData>("/api/agentcore/metrics"));
   const [loading, setLoading] = useState(!getCached("/api/agentcore/agents"));
+  const [metricsLoading, setMetricsLoading] = useState(!getCached("/api/agentcore/metrics"));
   const jira = useJiraMetrics();
 
   useEffect(() => {
-    // Fetch with cache — returns instantly if cached, revalidates in background
-    Promise.all([
-      cachedFetch<Agent[]>("/api/agentcore/agents"),
-      cachedFetch<MetricsData>("/api/agentcore/metrics"),
-    ])
-      .then(([agentsData, metricsData]) => {
-        setAgents(Array.isArray(agentsData) ? agentsData : []);
-        if (metricsData && !(metricsData as any).error) setMetrics(metricsData);
-      })
+    // Agent discovery is fast (~0.5s); metrics runs slow CloudWatch Logs
+    // Insights queries (~15s cold). Fetch them independently so the agent
+    // table renders as soon as discovery returns instead of waiting on metrics.
+    cachedFetch<Agent[]>("/api/agentcore/agents")
+      .then((agentsData) => setAgents(Array.isArray(agentsData) ? agentsData : []))
       .catch(() => setAgents([]))
       .finally(() => setLoading(false));
+
+    cachedFetch<MetricsData>("/api/agentcore/metrics")
+      .then((metricsData) => {
+        if (metricsData && !(metricsData as any).error) setMetrics(metricsData);
+      })
+      .catch(() => {})
+      .finally(() => setMetricsLoading(false));
   }, []);
 
   return (
@@ -138,35 +142,35 @@ export default function DashboardPage() {
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
           <BigMetric
             label="Invocations"
-            value={loading ? "—" : (metrics?.usage.totalInvocations ?? 0).toString()}
+            value={metricsLoading ? "—" : (metrics?.usage.totalInvocations ?? 0).toString()}
             sub={`${metrics?.usage.totalSessions ?? 0} sessions`}
             icon={MessageSquare}
             color="text-brand-400"
           />
           <BigMetric
             label="Tokens"
-            value={loading ? "—" : `${formatNumber(metrics?.usage.totalTokensIn ?? 0)} / ${formatNumber(metrics?.usage.totalTokensOut ?? 0)}`}
+            value={metricsLoading ? "—" : `${formatNumber(metrics?.usage.totalTokensIn ?? 0)} / ${formatNumber(metrics?.usage.totalTokensOut ?? 0)}`}
             sub="in / out"
             icon={Zap}
             color="text-cyan-400"
           />
           <BigMetric
             label="Avg Duration"
-            value={loading ? "—" : formatDuration(metrics?.usage.avgSessionDuration ?? 0)}
+            value={metricsLoading ? "—" : formatDuration(metrics?.usage.avgSessionDuration ?? 0)}
             sub="per session"
             icon={Timer}
             color="text-yellow-400"
           />
           <BigMetric
             label="Total Duration"
-            value={loading ? "—" : formatDuration(metrics?.usage.totalDuration ?? 0)}
+            value={metricsLoading ? "—" : formatDuration(metrics?.usage.totalDuration ?? 0)}
             sub="autonomous work time"
             icon={Clock}
             color="text-emerald-400"
           />
           <BigMetric
             label="Active Agents"
-            value={loading ? "—" : (metrics?.usage.activeAgents ?? agents.filter((a) => a.status === "ACTIVE" || a.status === "READY").length).toString()}
+            value={metricsLoading ? "—" : (metrics?.usage.activeAgents ?? agents.filter((a) => a.status === "ACTIVE" || a.status === "READY").length).toString()}
             sub={`of ${metrics?.usage.totalAgents ?? agents.length} total`}
             icon={Bot}
             color="text-brand-400"
@@ -289,6 +293,10 @@ export default function DashboardPage() {
               <tbody>
                 {agents.map((agent) => {
                   const am = metrics?.agentMetrics.find((m) => m.id === agent.id);
+                  // Metrics load separately from agent discovery; show a
+                  // placeholder rather than real-looking zeros until the slow
+                  // metrics fetch resolves.
+                  const pending = metricsLoading && !am;
                   return (
                     <tr key={agent.id} className="border-b border-surface-4/50 hover:bg-surface-3/30 transition-colors">
                       <td className="py-4 px-3">
@@ -306,21 +314,27 @@ export default function DashboardPage() {
                         </Link>
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-lg font-bold text-[var(--color-text-primary)]">{am?.sessions || 0}</span>
+                        <span className="text-lg font-bold text-[var(--color-text-primary)]">{pending ? "—" : (am?.sessions || 0)}</span>
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-base font-semibold text-cyan-500">{formatNumber(am?.tokensIn || 0)}</span>
-                        <span className="text-[var(--color-text-muted)] mx-1.5">|</span>
-                        <span className="text-base font-semibold text-purple-500">{formatNumber(am?.tokensOut || 0)}</span>
+                        {pending ? (
+                          <span className="text-base font-semibold text-[var(--color-text-muted)]">—</span>
+                        ) : (
+                          <>
+                            <span className="text-base font-semibold text-cyan-500">{formatNumber(am?.tokensIn || 0)}</span>
+                            <span className="text-[var(--color-text-muted)] mx-1.5">|</span>
+                            <span className="text-base font-semibold text-purple-500">{formatNumber(am?.tokensOut || 0)}</span>
+                          </>
+                        )}
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-lg font-bold text-green-400">{am?.invocations || 0}</span>
+                        <span className="text-lg font-bold text-green-400">{pending ? "—" : (am?.invocations || 0)}</span>
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-base font-semibold text-[var(--color-text-primary)]">{formatDuration(am?.avgDuration || 0)}</span>
+                        <span className="text-base font-semibold text-[var(--color-text-primary)]">{pending ? "—" : formatDuration(am?.avgDuration || 0)}</span>
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-lg font-bold text-emerald-500">{formatDuration(am?.totalDuration || 0)}</span>
+                        <span className="text-lg font-bold text-emerald-500">{pending ? "—" : formatDuration(am?.totalDuration || 0)}</span>
                       </td>
                       <td className="text-right py-4 px-3">
                         <span className={`px-2 py-1 rounded-full border text-xs font-medium ${

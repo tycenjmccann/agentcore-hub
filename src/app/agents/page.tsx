@@ -66,21 +66,16 @@ export default function AgentsPage() {
     return {};
   });
   const [loading, setLoading] = useState(!getCached(cacheKey));
+  const [metricsLoading, setMetricsLoading] = useState(!getCached(metricsCacheKey));
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Fetch agents and metrics in parallel
-    Promise.all([
-      cachedFetch<AgentDetail[] | { error: string }>(cacheKey),
-      cachedFetch<MetricsResponse>(metricsCacheKey),
-    ])
-      .then(async ([data, metricsData]) => {
-        // Process metrics
-        if (metricsData?.agentMetrics) {
-          setMetricsMap(Object.fromEntries(metricsData.agentMetrics.map((m) => [m.id, m])));
-        }
-
-        // Process agents
+    // Agent discovery is fast; per-agent detail enrichment and the metrics
+    // endpoint (slow CloudWatch Logs Insights queries, ~15s cold) are not.
+    // Render the cards as soon as discovery returns, then enrich + fill in
+    // metrics independently so neither blocks the initial paint.
+    cachedFetch<AgentDetail[] | { error: string }>(cacheKey)
+      .then((data) => {
         if (data && typeof data === "object" && "error" in data) {
           setError((data as { error: string }).error);
           setAgents([]);
@@ -89,23 +84,29 @@ export default function AgentsPage() {
         const list = Array.isArray(data) ? data : [];
         setAgents(list);
 
-        // Enrich each agent with detail (model, tools, description) in parallel
-        const enriched = await Promise.all(
-          list.map(async (agent: AgentDetail) => {
-            try {
-              const detail = await cachedFetch<AgentDetail>(`/api/agentcore/agents?id=${agent.id}`);
-              return { ...agent, ...detail };
-            } catch { /* keep basic info */ }
-            return agent;
-          })
-        );
-        setAgents(enriched);
+        // Enrich each agent with detail (model, tools, description) in the
+        // background — cards are already visible by now.
+        list.forEach(async (agent: AgentDetail) => {
+          try {
+            const detail = await cachedFetch<AgentDetail>(`/api/agentcore/agents?id=${agent.id}`);
+            setAgents((prev) => prev.map((a) => (a.id === agent.id ? { ...a, ...detail } : a)));
+          } catch { /* keep basic info */ }
+        });
       })
       .catch((err) => {
         setError(err.message);
         setAgents([]);
       })
       .finally(() => setLoading(false));
+
+    cachedFetch<MetricsResponse>(metricsCacheKey)
+      .then((metricsData) => {
+        if (metricsData?.agentMetrics) {
+          setMetricsMap(Object.fromEntries(metricsData.agentMetrics.map((m) => [m.id, m])));
+        }
+      })
+      .catch(() => {})
+      .finally(() => setMetricsLoading(false));
   }, []);
 
   if (loading) {
@@ -155,6 +156,10 @@ export default function AgentsPage() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           {agents.map((agent) => {
             const m = metricsMap[agent.id] || { sessions: 0, tokensIn: 0, tokensOut: 0, avgDuration: 0, totalDuration: 0, invocations: 0 };
+            // While the slow metrics fetch is still in flight and this agent
+            // has no metrics yet, show a placeholder instead of real-looking
+            // zeros so users can tell "no data yet" from "genuinely zero".
+            const pending = metricsLoading && !metricsMap[agent.id];
             return (
               <Link
                 key={agent.id}
@@ -235,39 +240,43 @@ export default function AgentsPage() {
                       <MessageSquare className="w-3 h-3 text-brand-400" />
                       <span className="text-[10px] text-gray-500">Sessions</span>
                     </div>
-                    <p className="text-lg font-bold text-white">{m.sessions}</p>
+                    <p className="text-lg font-bold text-white">{pending ? "—" : m.sessions}</p>
                   </div>
                   <div className="text-center">
                     <div className="flex items-center justify-center gap-1 mb-0.5">
                       <Zap className="w-3 h-3 text-cyan-400" />
                       <span className="text-[10px] text-gray-500">Tokens</span>
                     </div>
-                    <p className="text-sm font-semibold">
-                      <span className="text-cyan-300">{formatNumber(m.tokensIn)}</span>
-                      <span className="text-gray-600 mx-0.5">/</span>
-                      <span className="text-purple-300">{formatNumber(m.tokensOut)}</span>
-                    </p>
+                    {pending ? (
+                      <p className="text-sm font-semibold text-gray-500">—</p>
+                    ) : (
+                      <p className="text-sm font-semibold">
+                        <span className="text-cyan-300">{formatNumber(m.tokensIn)}</span>
+                        <span className="text-gray-600 mx-0.5">/</span>
+                        <span className="text-purple-300">{formatNumber(m.tokensOut)}</span>
+                      </p>
+                    )}
                   </div>
                   <div className="text-center">
                     <div className="flex items-center justify-center gap-1 mb-0.5">
                       <CheckCircle2 className="w-3 h-3 text-green-400" />
                       <span className="text-[10px] text-gray-500">Invocations</span>
                     </div>
-                    <p className="text-lg font-bold text-green-400">{m.invocations}</p>
+                    <p className="text-lg font-bold text-green-400">{pending ? "—" : m.invocations}</p>
                   </div>
                   <div className="text-center">
                     <div className="flex items-center justify-center gap-1 mb-0.5">
                       <Timer className="w-3 h-3 text-yellow-400" />
                       <span className="text-[10px] text-gray-500">Avg</span>
                     </div>
-                    <p className="text-sm font-semibold text-gray-200">{formatDuration(m.avgDuration)}</p>
+                    <p className="text-sm font-semibold text-gray-200">{pending ? "—" : formatDuration(m.avgDuration)}</p>
                   </div>
                   <div className="text-center">
                     <div className="flex items-center justify-center gap-1 mb-0.5">
                       <Clock className="w-3 h-3 text-emerald-400" />
                       <span className="text-[10px] text-gray-500">Total</span>
                     </div>
-                    <p className="text-lg font-bold text-emerald-300">{formatDuration(m.totalDuration)}</p>
+                    <p className="text-lg font-bold text-emerald-300">{pending ? "—" : formatDuration(m.totalDuration)}</p>
                   </div>
                   <div className="text-center">
                     <div className="flex items-center justify-center gap-1 mb-0.5">
