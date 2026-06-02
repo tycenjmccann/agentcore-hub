@@ -293,6 +293,10 @@ export default function DashboardPage() {
               <tbody>
                 {agents.map((agent) => {
                   const am = metrics?.agentMetrics.find((m) => m.id === agent.id);
+                  // Metrics load separately from agent discovery; show a
+                  // placeholder rather than real-looking zeros until the slow
+                  // metrics fetch resolves.
+                  const pending = metricsLoading && !am;
                   return (
                     <tr key={agent.id} className="border-b border-surface-4/50 hover:bg-surface-3/30 transition-colors">
                       <td className="py-4 px-3">
@@ -310,21 +314,27 @@ export default function DashboardPage() {
                         </Link>
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-lg font-bold text-[var(--color-text-primary)]">{am?.sessions || 0}</span>
+                        <span className="text-lg font-bold text-[var(--color-text-primary)]">{pending ? "—" : (am?.sessions || 0)}</span>
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-base font-semibold text-cyan-500">{formatNumber(am?.tokensIn || 0)}</span>
-                        <span className="text-[var(--color-text-muted)] mx-1.5">|</span>
-                        <span className="text-base font-semibold text-purple-500">{formatNumber(am?.tokensOut || 0)}</span>
+                        {pending ? (
+                          <span className="text-base font-semibold text-[var(--color-text-muted)]">—</span>
+                        ) : (
+                          <>
+                            <span className="text-base font-semibold text-cyan-500">{formatNumber(am?.tokensIn || 0)}</span>
+                            <span className="text-[var(--color-text-muted)] mx-1.5">|</span>
+                            <span className="text-base font-semibold text-purple-500">{formatNumber(am?.tokensOut || 0)}</span>
+                          </>
+                        )}
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-lg font-bold text-green-400">{am?.invocations || 0}</span>
+                        <span className="text-lg font-bold text-green-400">{pending ? "—" : (am?.invocations || 0)}</span>
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-base font-semibold text-[var(--color-text-primary)]">{formatDuration(am?.avgDuration || 0)}</span>
+                        <span className="text-base font-semibold text-[var(--color-text-primary)]">{pending ? "—" : formatDuration(am?.avgDuration || 0)}</span>
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-lg font-bold text-emerald-500">{formatDuration(am?.totalDuration || 0)}</span>
+                        <span className="text-lg font-bold text-emerald-500">{pending ? "—" : formatDuration(am?.totalDuration || 0)}</span>
                       </td>
                       <td className="text-right py-4 px-3">
                         <span className={`px-2 py-1 rounded-full border text-xs font-medium ${
