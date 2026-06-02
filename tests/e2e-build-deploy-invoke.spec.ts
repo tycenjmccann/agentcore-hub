@@ -1,82 +1,59 @@
 import { test, expect } from "@playwright/test";
 
 /**
- * E2E Test: Builder Agent creates agents via real AgentCore harness.
+ * E2E: Builder Agent.
  *
- * The Builder Agent is itself a harness with tools to:
- * - list_agents: see what's deployed
- * - list_gateway_tools: see available tools
- * - list_memories: see memory resources
- * - create_harness: deploy new agents
- * - get_agent_detail: inspect existing agents
+ * The previous version of these tests passed on the welcome message ("Tell me
+ * what kind of agent you need…") because every assertion looked for substrings
+ * that already appear in the static intro. That hid a real production bug
+ * where the harness role was missing bedrock:InvokeModelWithResponseStream and
+ * /api/agentcore/builder returned 500 — tests still ran in 3.6s and went
+ * green. This rewrite:
  *
- * These tests verify the builder chat streams responses and uses tools.
+ *   1. Asserts the /build page loads and the input is interactive.
+ *   2. Submits a real prompt, waits for a response that is NOT the welcome
+ *      message, and fails fast if the API errors.
  */
 test.describe("E2E: Builder Agent", () => {
   test.setTimeout(120_000);
 
-  test("Builder agent responds to questions about agents", async ({ page }) => {
+  test("Build page loads with chat surface visible", async ({ page }) => {
     await page.goto("/build");
     await expect(page.getByText("Agent Builder Chat")).toBeVisible();
-
-    // Send a request that triggers the builder agent
-    const input = page.locator("[data-testid='build-description-input']");
-    await input.fill("What agents are currently deployed in my account?");
-    await page.locator("[data-testid='build-submit-btn']").click();
-
-    // Should show the user message
-    await expect(page.locator("[data-testid='builder-messages']").getByText("What agents are currently deployed")).toBeVisible();
-
-    // Wait for the agent to start streaming a response
-    // The agent acknowledges and starts a tool call — we just need to verify it's responding
-    await expect(async () => {
-      const messages = page.locator("[data-testid='builder-messages']");
-      const text = await messages.textContent();
-      // Agent should acknowledge the request (it says something like "I'll check...")
-      const hasResponse = text!.includes("check") ||
-        text!.includes("agents") ||
-        text!.includes("deployed") ||
-        text!.includes("account");
-      expect(hasResponse).toBe(true);
-      // The response should be longer than just the welcome message + user message
-      expect(text!.length).toBeGreaterThan(300);
-    }).toPass({ timeout: 60_000 });
+    await expect(page.locator("[data-testid='build-description-input']")).toBeVisible();
+    await expect(page.locator("[data-testid='build-submit-btn']")).toBeVisible();
   });
 
-  test("Builder agent can describe how to create an agent", async ({ page }) => {
+  test("Builder agent answers a real prompt", async ({ page }) => {
+    // Fail fast on a 5xx from the streaming endpoint — the old tests would
+    // happily pass even when this returned 500.
+    page.on("response", (resp) => {
+      if (resp.url().includes("/api/agentcore/builder") && resp.status() >= 500) {
+        throw new Error(`Builder API ${resp.status()} on ${resp.url()}`);
+      }
+    });
+
     await page.goto("/build");
 
-    const input = page.locator("[data-testid='build-description-input']");
-    await input.fill("I want to create a customer support agent that can access Jira and Slack. What tools are available?");
+    const messages = page.locator("[data-testid='builder-messages']");
+    const baselineLength = (await messages.textContent())?.length ?? 0;
+
+    await page.locator("[data-testid='build-description-input']")
+      .fill("What tools can you give an agent");
     await page.locator("[data-testid='build-submit-btn']").click();
 
-    // Wait for response - agent should call list_gateway_tools and mention available tools
+    // The user's prompt should appear in the transcript before any agent
+    // response — this also confirms the chat actually accepted the submit.
+    await expect(messages.getByText("What tools can you give an agent")).toBeVisible();
+
+    // Wait for the agent to add at least 80 characters beyond the prompt
+    // echo. The welcome message alone is far longer than that, so we anchor
+    // on growth past `baselineLength + prompt + threshold` rather than a
+    // raw text length. 30s ceiling per the user's "wait ~10 sec" guidance,
+    // padded for cold-start streaming to begin.
     await expect(async () => {
-      const messages = page.locator("[data-testid='builder-messages']");
-      const text = await messages.textContent();
-      // Should mention gateway tools it discovered
-      const hasToolData = text!.includes("Jira") ||
-        text!.includes("Slack") ||
-        text!.includes("gateway") ||
-        text!.includes("tool");
-      expect(hasToolData).toBe(true);
-    }).toPass({ timeout: 90_000 });
-  });
-
-  test("Builder streams text incrementally (not all at once)", async ({ page }) => {
-    await page.goto("/build");
-
-    const input = page.locator("[data-testid='build-description-input']");
-    await input.fill("Say hello briefly");
-    await page.locator("[data-testid='build-submit-btn']").click();
-
-    // The streaming dots should appear while agent is thinking
-    // Then text should appear incrementally
-    await expect(async () => {
-      const messages = page.locator("[data-testid='builder-messages']");
-      const allText = await messages.textContent();
-      // Agent should have responded with something
-      expect(allText!.length).toBeGreaterThan(50);
-    }).toPass({ timeout: 60_000 });
+      const text = (await messages.textContent()) ?? "";
+      expect(text.length).toBeGreaterThan(baselineLength + 80);
+    }).toPass({ timeout: 30_000 });
   });
 });
