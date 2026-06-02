@@ -50,7 +50,7 @@ async function submitTicketPlan({ workflow_id, requirements, tickets }) {
     status: "saved",
     location: `s3://${BUCKET}/${key}`,
     ticket_count: tickets.length,
-    message: `Ticket plan saved with ${tickets.length} tickets. The orchestration engine will create these tickets.`,
+    message: `Ticket plan saved with ${tickets.length} tickets as a record. NEXT: you must call Tickets___create_ticket once per ticket to actually create them under the epic in the ticket system. submit_ticket_plan only persists the plan — it does not create tickets.`,
   };
 }
 
