@@ -13,10 +13,12 @@ test.describe("Agents Tab", () => {
   });
 
   test("shows agent cards when discovery completes", async ({ page }) => {
-    // Wait up to 30s for agent discovery (depends on AWS connectivity)
+    // Bound the wait below the 30s test timeout so the catch/skip fallback can
+    // actually run. A full-timeout expect() leaves no time for the fallback and
+    // dies with "page closed" instead of skipping on slow AWS connectivity.
     const cards = page.locator("[data-testid^='agent-card-']");
     try {
-      await expect(cards.first()).toBeVisible({ timeout: 30000 });
+      await expect(cards.first()).toBeVisible({ timeout: 20000 });
       const count = await cards.count();
       expect(count).toBeGreaterThan(0);
       console.log(`Found ${count} agent cards`);
@@ -30,7 +32,7 @@ test.describe("Agents Tab", () => {
   test("agent card is clickable", async ({ page }) => {
     const cards = page.locator("[data-testid^='agent-card-']");
     try {
-      await expect(cards.first()).toBeVisible({ timeout: 30000 });
+      await expect(cards.first()).toBeVisible({ timeout: 20000 });
     } catch {
       test.skip(true, "Agent discovery did not complete");
       return;
@@ -42,16 +44,21 @@ test.describe("Agents Tab", () => {
   test("agent detail page shows chat interface", async ({ page }) => {
     const cards = page.locator("[data-testid^='agent-card-']");
     try {
-      await expect(cards.first()).toBeVisible({ timeout: 30000 });
+      await expect(cards.first()).toBeVisible({ timeout: 20000 });
     } catch {
       test.skip(true, "Agent discovery did not complete");
       return;
     }
     await cards.first().click();
+    // "Agent Detail" lives in the banner and renders before the inner page
+    // resolves its own /agents?id= fetch. The chat input + trace panel only
+    // appear once that fetch lands, so give them a real budget — under full
+    // suite load (the parallel metrics test is slow) the default 5s starves
+    // the render and flakes.
     await expect(page.getByText("Agent Detail")).toBeVisible({ timeout: 10000 });
     await expect(
       page.locator("input[placeholder*='Message'], textarea[placeholder*='Message']").first()
-    ).toBeVisible();
-    await expect(page.getByText("EXECUTION TRACE")).toBeVisible();
+    ).toBeVisible({ timeout: 10000 });
+    await expect(page.getByText("EXECUTION TRACE")).toBeVisible({ timeout: 10000 });
   });
 });
