@@ -42,6 +42,12 @@ if [ -z "${GITHUB_PAT:-}" ]; then
     "$PWD/.env.local"; do
     if [ -f "$candidate" ]; then
       GITHUB_PAT=$(grep "^GITHUB_PAT=" "$candidate" | cut -d= -f2-)
+      # apply-env.sh writes values double-quoted (GITHUB_PAT="ghp_..."). cut keeps
+      # the quotes, which would bake a literal Bearer "ghp_..." header → GitHub MCP
+      # 400. Strip one layer of surrounding single/double quotes to match what a
+      # shell `source` would yield.
+      GITHUB_PAT="${GITHUB_PAT%\"}"; GITHUB_PAT="${GITHUB_PAT#\"}"
+      GITHUB_PAT="${GITHUB_PAT%\'}"; GITHUB_PAT="${GITHUB_PAT#\'}"
       if [ -n "$GITHUB_PAT" ]; then
         export GITHUB_PAT
         echo "Loaded GITHUB_PAT from $candidate" >&2
