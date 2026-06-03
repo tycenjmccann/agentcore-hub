@@ -68,19 +68,23 @@ if [[ "$COUNT" == "14" ]]; then
 fi
 
 # ── 1- and 4-runtime modes: deploy anchors, then remap agents.json ──────────
+# Anchor names are NEUTRAL (not a persona name) because the runtime hosts many
+# personas — its prompt is resolved per-invocation from S3. Naming the 1-mode
+# runtime after one persona ("requirements_analyst") misrepresented what it is.
 if [[ "$COUNT" == "1" ]]; then
-  ANCHORS=("agentcore_hub_requirements_analyst")
+  # One runtime hosting all 14 personas.
+  ANCHORS=("agentcore_hub_agent")
 else
   # 4-runtime mode — one anchor per pipeline phase:
-  #   requirements (1)              → requirements_analyst
-  #   design (8)                    → backend_designer
-  #   development (3)               → backend_dev
-  #   verification + review (1 + 1) → qa_verifier
+  #   requirements (1)              → agentcore_hub_requirements
+  #   design (8)                    → agentcore_hub_design
+  #   development (3)               → agentcore_hub_development
+  #   verification + review (1 + 1) → agentcore_hub_qaci
   ANCHORS=(
-    "agentcore_hub_requirements_analyst"
-    "agentcore_hub_backend_designer"
-    "agentcore_hub_backend_dev"
-    "agentcore_hub_qa_verifier"
+    "agentcore_hub_requirements"
+    "agentcore_hub_design"
+    "agentcore_hub_development"
+    "agentcore_hub_qaci"
   )
 fi
 
@@ -129,10 +133,19 @@ done
 echo ""
 echo "→ Mapping ${#ANCHORS[@]} anchor ARN(s) onto 14 personas in agents.json"
 
-ANCHOR_REQ="${ANCHOR_ARN[agentcore_hub_requirements_analyst]:-}"
-ANCHOR_DESIGN="${ANCHOR_ARN[agentcore_hub_backend_designer]:-}"
-ANCHOR_DEV="${ANCHOR_ARN[agentcore_hub_backend_dev]:-}"
-ANCHOR_QA="${ANCHOR_ARN[agentcore_hub_qa_verifier]:-}"
+# In 1-mode only ANCHOR_REQ (agentcore_hub_agent) is populated and arn_for()
+# returns it for every persona. In 4-mode each phase anchor is populated.
+if [[ "$COUNT" == "1" ]]; then
+  ANCHOR_REQ="${ANCHOR_ARN[agentcore_hub_agent]:-}"
+  ANCHOR_DESIGN=""
+  ANCHOR_DEV=""
+  ANCHOR_QA=""
+else
+  ANCHOR_REQ="${ANCHOR_ARN[agentcore_hub_requirements]:-}"
+  ANCHOR_DESIGN="${ANCHOR_ARN[agentcore_hub_design]:-}"
+  ANCHOR_DEV="${ANCHOR_ARN[agentcore_hub_development]:-}"
+  ANCHOR_QA="${ANCHOR_ARN[agentcore_hub_qaci]:-}"
+fi
 
 COUNT="$COUNT" \
 ANCHOR_REQ="$ANCHOR_REQ" \
