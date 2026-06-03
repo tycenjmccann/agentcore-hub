@@ -184,7 +184,6 @@ if (!HARNESS_ROLE_ARN) {
     console.log(`   ✓ Attached PassRole inline policy (for child agent creation)`);
   };
 
-  let createdNewRole = false;
   try {
     const existing = await iam.send(new GetRoleCommand({ RoleName: ROLE_NAME }));
     HARNESS_ROLE_ARN = existing.Role.Arn;
@@ -198,7 +197,6 @@ if (!HARNESS_ROLE_ARN) {
       }));
       HARNESS_ROLE_ARN = `arn:aws:iam::${accountId}:role/${ROLE_NAME}`;
       console.log(`   ✓ Role "${ROLE_NAME}" created`);
-      createdNewRole = true;
     } else {
       throw err;
     }
@@ -206,10 +204,15 @@ if (!HARNESS_ROLE_ARN) {
 
   await attachAllPolicies();
 
-  if (createdNewRole) {
-    console.log(`   ⏳ Waiting 10s for IAM role propagation...`);
-    await sleep(10000);
-  }
+  // Wait for IAM propagation whether the role was just created OR its inline
+  // policies were just (re)applied. The stale-empty-shell case (prior teardown
+  // stripped policies but couldn't delete the role) is exactly the scenario
+  // this fix targets, and there the role exists but the freshly attached
+  // bedrock:InvokeModelWithResponseStream / PassRole permissions are still
+  // propagating — skipping the wait would leave us back where we started, with
+  // a builder that 500s on first invoke.
+  console.log(`   ⏳ Waiting 10s for IAM role propagation...`);
+  await sleep(10000);
 } else {
   console.log(`\n   Using provided role: ${HARNESS_ROLE_ARN}\n`);
 }
