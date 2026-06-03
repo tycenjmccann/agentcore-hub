@@ -174,7 +174,24 @@ export default function EvaluationsPage() {
     fetchAgentConfigs();
   }, [fetchData, fetchAgentConfigs]);
 
-  const agents = data?.agents?.length ? data.agents : agentsConfig.agents.map((a) => a.displayName);
+  // One column per REAL deployed runtime, not per persona. Personas sharing a
+  // runtimeArn collapse to a single column labeled by the "anchor" persona —
+  // the one whose agentId is embedded in the ARN (that's the runtime's actual
+  // name and where token-aggregator/eval-packager attribute data). So 1-runtime
+  // mode shows 1 column, 4-runtime shows 4, 14-runtime shows 14. Personas with
+  // no runtimeArn (undeployed) are dropped.
+  const agents = (() => {
+    const seen = new Set<string>();
+    const cols: string[] = [];
+    for (const a of agentsConfig.agents) {
+      if (!a.evaluationsEnabled || !a.runtimeArn || seen.has(a.runtimeArn)) continue;
+      seen.add(a.runtimeArn);
+      const arn = a.runtimeArn;
+      const anchor = agentsConfig.agents.find((p) => arn.includes(p.agentId)) ?? a;
+      cols.push(anchor.displayName);
+    }
+    return cols;
+  })();
   const hasScores = !!(data?.scorecard && Object.keys(data.scorecard).length > 0);
 
   // Compute totals for operational metrics
@@ -185,8 +202,7 @@ export default function EvaluationsPage() {
     cost: agents.reduce((s, a) => s + (data?.metrics[a]?.cost || 0), 0),
     costPerSession: 0,
   };
-  const totalSessions = totals.sessions || 1;
-  totals.costPerSession = totals.cost / totalSessions;
+  totals.costPerSession = totals.sessions > 0 ? totals.cost / totals.sessions : 0;
 
   // Compute per-model totals across all agents
   const modelTotals: Record<string, number> = {};
@@ -238,10 +254,10 @@ export default function EvaluationsPage() {
       {agents.map((agent) => (
         <th
           key={agent}
-          className="text-center px-2 py-3 font-bold"
+          className="text-center px-2 py-3 font-bold w-[140px]"
           style={{ color: AGENT_COLORS[agent] || "#94a3b8" }}
         >
-          <span className="block text-[11px] leading-snug min-w-[70px]">
+          <span className="block text-[11px] leading-snug">
             {agent}
           </span>
         </th>
@@ -259,7 +275,7 @@ export default function EvaluationsPage() {
             Evaluations
           </h1>
           <p className="text-[11px] font-semibold text-blue-400 uppercase tracking-[0.15em] mt-1.5">
-            14 agents &nbsp;·&nbsp; 10 evaluators &nbsp;·&nbsp; Opus 4.7 judge &nbsp;·&nbsp; 100% sampling &nbsp;·&nbsp; last 7 days
+            {agents.length} {agents.length === 1 ? "agent" : "agents"} &nbsp;·&nbsp; {(data?.evaluators?.length ?? 0)} evaluators &nbsp;·&nbsp; Opus 4.7 judge &nbsp;·&nbsp; 100% sampling &nbsp;·&nbsp; last 7 days
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -294,9 +310,9 @@ export default function EvaluationsPage() {
       )}
 
       {agents.length > 0 && (
-        <div className="bg-surface-2 border border-surface-4 rounded-xl overflow-hidden">
+        <div className="bg-surface-2 border border-surface-4 rounded-xl overflow-hidden w-fit max-w-full">
           <div className="overflow-x-auto">
-            <table className="w-full" style={{ tableLayout: "auto" }}>
+            <table style={{ tableLayout: "fixed", width: "max-content" }}>
               <colgroup>
                 <col style={{ width: "160px", minWidth: "160px" }} />
                 <col style={{ width: "65px", minWidth: "65px" }} />
@@ -459,10 +475,10 @@ export default function EvaluationsPage() {
                       {agents.map((agent) => (
                         <th
                           key={agent}
-                          className="text-center px-2 py-3 font-bold"
+                          className="text-center px-2 py-3 font-bold w-[140px]"
                           style={{ color: AGENT_COLORS[agent] || "#94a3b8" }}
                         >
-                          <span className="block text-[11px] leading-snug min-w-[70px]">
+                          <span className="block text-[11px] leading-snug">
                             {agent}
                           </span>
                         </th>
