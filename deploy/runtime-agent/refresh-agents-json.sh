@@ -188,9 +188,10 @@ missing = []
 for agent in config["agents"]:
     # Convention: agentId IS the runtime name (e.g. "agentcore_hub_requirements_analyst")
     runtime_name = agent["agentId"]
-    # Eval config name strips the "agentcore_hub_" prefix, e.g.
-    # agentcore_hub_requirements_analyst -> eval_requirements_analyst.
-    eval_short = "eval_" + agent["agentId"].replace("agentcore_hub_", "")
+    # Eval config name is "eval_" + the full agentId, matching what
+    # setup-evaluations.sh creates (config_name="eval_${name}", name=agentId)
+    # and the resulting CW log group eval_agentcore_hub_requirements_analyst-XXXX.
+    eval_short = "eval_" + agent["agentId"]
     eval_name = eval_configs.get(eval_short)
     if runtime_name in deployed:
         plans.append((agent["agentId"], runtime_name, deployed[runtime_name], eval_name))
