@@ -2,8 +2,10 @@
 # Run the full Playwright test suite
 # Usage: ./tests/run-all.sh [--full]
 #
-# Without --full: runs UI tab tests only (fast, ~30s)
-# With --full: also runs the end-to-end workflow test (slow, 5-10min)
+# Without --full: runs UI tab tests + API smoke tests (fast, ~30s, no live harness)
+# With --full: also runs the builder e2e (live /api/agentcore/builder) and the
+#              end-to-end workflow test (slow, 5-10min, requires BUILDER_AGENT_ID
+#              and a working harness role)
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -29,16 +31,7 @@ npx playwright test \
 echo ""
 echo "--- Tab tests complete ---"
 
-# Step 2: Builder E2E — exercises /api/agentcore/builder against the real
-# harness so IAM/role drift surfaces here instead of as a 500 in the UI.
-echo ""
-echo "--- Running Builder E2E ---"
-npx playwright test tests/e2e-build-deploy-invoke.spec.ts --reporter=list
-
-echo ""
-echo "--- Builder e2e complete ---"
-
-# Step 3: API smoke tests
+# Step 2: API smoke tests
 echo ""
 echo "--- Running API Route Tests ---"
 npx playwright test tests/e2e-api-routes.spec.ts --reporter=list
@@ -46,8 +39,14 @@ npx playwright test tests/e2e-api-routes.spec.ts --reporter=list
 echo ""
 echo "--- API tests complete ---"
 
-# Step 4: Full E2E (only with --full flag)
+# Step 3: Full E2E (only with --full flag) — exercises real harness/IAM
 if [ "$1" = "--full" ]; then
+  echo ""
+  echo "--- Running Builder E2E (real /api/agentcore/builder harness) ---"
+  npx playwright test tests/e2e-build-deploy-invoke.spec.ts --reporter=list
+  echo ""
+  echo "--- Builder e2e complete ---"
+
   echo ""
   echo "--- Running Full E2E Workflow Test (this takes 5-10 minutes) ---"
   npx playwright test tests/e2e-workflow-full.spec.ts --timeout 600000 --reporter=list
