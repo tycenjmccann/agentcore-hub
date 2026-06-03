@@ -178,20 +178,27 @@ export default function EvaluationsPage() {
   // runtimeArn collapse to a single column labeled by the "anchor" persona —
   // the one whose agentId is embedded in the ARN (that's the runtime's actual
   // name and where token-aggregator/eval-packager attribute data). So 1-runtime
-  // mode shows 1 column, 4-runtime shows 4, 14-runtime shows 14. Personas with
-  // no runtimeArn (undeployed) are dropped.
-  const agents = (() => {
+  // mode shows 1 column, 4-runtime shows 4, 14-runtime shows 14.
+  //
+  // The checked-in agents.json ships runtimeArn: null by contract — those values
+  // are only populated post-deploy (in the S3 copy the Lambdas read, or in a
+  // bundle rebuilt after deploy-topology). When no runtimeArn is present we fall
+  // back to the API's agent list, which is already real: /api/evaluations only
+  // returns personas that have a DynamoDB eval-config row, so this is NOT the old
+  // "14 fictional personas" fallback.
+  const runtimeCols = (() => {
     const seen = new Set<string>();
     const cols: string[] = [];
     for (const a of agentsConfig.agents) {
-      if (!a.evaluationsEnabled || !a.runtimeArn || seen.has(a.runtimeArn)) continue;
-      seen.add(a.runtimeArn);
-      const arn = a.runtimeArn;
+      const arn = a.runtimeArn as string | null;
+      if (!a.evaluationsEnabled || !arn || seen.has(arn)) continue;
+      seen.add(arn);
       const anchor = agentsConfig.agents.find((p) => arn.includes(p.agentId)) ?? a;
       cols.push(anchor.displayName);
     }
     return cols;
   })();
+  const agents = runtimeCols.length ? runtimeCols : (data?.agents ?? []);
   const hasScores = !!(data?.scorecard && Object.keys(data.scorecard).length > 0);
 
   // Compute totals for operational metrics

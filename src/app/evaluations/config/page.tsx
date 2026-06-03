@@ -53,14 +53,19 @@ function resolveAgentName(agentId: string): string {
 // One row per REAL deployed runtime, not per persona — mirrors the scorecard
 // (src/app/evaluations/page.tsx). Personas sharing a runtimeArn collapse to the
 // "anchor" persona whose agentId is embedded in the ARN (the runtime's actual
-// name, where eval data is attributed). Personas with no runtimeArn (undeployed)
-// are dropped. So 1-runtime mode shows 1 row, 4-runtime 4, 14-runtime 14.
+// name, where eval data is attributed). So 1-runtime mode shows 1 row, 4-runtime
+// 4, 14-runtime 14.
+//
+// The checked-in agents.json ships runtimeArn: null by contract — populated only
+// post-deploy. When none are present, RUNTIME_ANCHOR_IDS is empty and we skip the
+// filter entirely (show every API agent), so the page never goes blank just
+// because the bundle predates a topology deploy.
 const RUNTIME_ANCHOR_IDS = new Set<string>(
   (() => {
     const seen = new Set<string>();
     const ids: string[] = [];
     for (const a of agentsConfig.agents) {
-      const arn = a.runtimeArn;
+      const arn = a.runtimeArn as string | null;
       if (!a.evaluationsEnabled || !arn || seen.has(arn)) continue;
       seen.add(arn);
       const anchor = agentsConfig.agents.find((p) => arn.includes(p.agentId)) ?? a;
@@ -110,7 +115,7 @@ export default function EvaluationsPage() {
       const data = await res.json();
       const agentList: AgentEvalApiResponse[] = data.agents || [];
       const enriched: AgentEvalConfig[] = agentList
-        .filter((a) => RUNTIME_ANCHOR_IDS.has(a.agentId))
+        .filter((a) => RUNTIME_ANCHOR_IDS.size === 0 || RUNTIME_ANCHOR_IDS.has(a.agentId))
         .map((a) => ({
           ...a,
           name: resolveAgentName(a.agentId),
