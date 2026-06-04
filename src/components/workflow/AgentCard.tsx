@@ -66,7 +66,7 @@ export default function AgentCard({
     >
       <div className="flex items-center justify-between mb-1">
         <span className="text-sm font-medium text-primary">{name}</span>
-        <span className={`text-xs px-2 py-0.5 rounded-full ${style.text} bg-surface-0/50`}>
+        <span className={`text-xs px-2 py-0.5 rounded-full ${style.text} bg-[color-mix(in_srgb,var(--color-surface-0)_50%,transparent)]`}>
           {style.label}
         </span>
       </div>

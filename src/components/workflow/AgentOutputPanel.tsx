@@ -292,8 +292,8 @@ export default function AgentOutputPanel({
           {isLoading && (
             <div className="absolute inset-0 z-10 flex items-center justify-center" style={{ background: "rgba(15, 15, 20, 0.85)", backdropFilter: "blur(2px)" }}>
               <div className="flex flex-col items-center gap-3">
-                <div className="w-6 h-6 border-2 border-surface-4 border-t-[var(--color-text-primary)] rounded-full animate-spin" />
-                <span className="text-xs text-secondary">Loading output...</span>
+                <div className="w-6 h-6 border-2 border-[var(--pipeline-text-dim)] border-t-[var(--pipeline-text)] rounded-full animate-spin" />
+                <span className="text-xs text-[var(--pipeline-text-secondary)]">Loading output...</span>
               </div>
             </div>
           )}
@@ -327,8 +327,8 @@ export default function AgentOutputPanel({
                 return (
                   <>
                     {streamPart && <MarkdownRenderer content={streamPart} />}
-                    <div ref={summaryRef} className="mt-4 pt-4 border-t border-theme">
-                      <h3 className="text-lg font-semibold text-primary mb-2">Summary</h3>
+                    <div ref={summaryRef} className="mt-4 pt-4 border-t border-[var(--pipeline-border)]">
+                      <h3 className="text-lg font-semibold text-[var(--pipeline-text)] mb-2">Summary</h3>
                       <MarkdownRenderer content={summaryPart} />
                     </div>
                   </>

@@ -122,7 +122,7 @@ function TicketDag({ tickets, currentTicketId }: { tickets: DagNode[]; currentTi
                 className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10px] font-mono ${
                   isCurrent
                     ? "border-blue-500/60 bg-blue-500/10 text-blue-300"
-                    : "border-surface-4 bg-surface-1/60 text-secondary"
+                    : "border-surface-4 bg-[color-mix(in_srgb,var(--color-surface-1)_60%,transparent)] text-secondary"
                 }`}
               >
                 <span
