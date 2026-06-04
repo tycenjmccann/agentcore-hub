@@ -106,7 +106,7 @@ function TicketDag({ tickets, currentTicketId }: { tickets: DagNode[]; currentTi
             />
             {epic.id}
           </span>
-          <span className="text-[9px] text-zinc-600">Epic</span>
+          <span className="text-[9px] text-muted">Epic</span>
         </div>
       )}
 
@@ -122,7 +122,7 @@ function TicketDag({ tickets, currentTicketId }: { tickets: DagNode[]; currentTi
                 className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10px] font-mono ${
                   isCurrent
                     ? "border-blue-500/60 bg-blue-500/10 text-blue-300"
-                    : "border-zinc-700/60 bg-zinc-800/60 text-zinc-400"
+                    : "border-surface-4 bg-surface-1/60 text-secondary"
                 }`}
               >
                 <span
@@ -427,7 +427,7 @@ export default function TicketDetailModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="ticket-modal-title"
-        className={`relative z-[201] w-full max-w-2xl mx-4 max-h-[85vh] bg-[#1a2332] border border-[#1e293b] rounded-xl shadow-2xl flex flex-col overflow-hidden ${isClosing ? "modal-card-exit" : "modal-card-enter"}`}
+        className={`relative z-[201] w-full max-w-2xl mx-4 max-h-[85vh] bg-surface-1 border border-theme rounded-xl shadow-2xl flex flex-col overflow-hidden ${isClosing ? "modal-card-exit" : "modal-card-enter"}`}
       >
         {/* ARIA live */}
         <div aria-live="polite" aria-atomic="true" className="sr-only">{announcement}</div>
@@ -436,7 +436,7 @@ export default function TicketDetailModal({
         <button
           ref={closeButtonRef}
           onClick={handleClose}
-          className="absolute top-3 right-3 p-1.5 rounded-md hover:bg-[rgba(100,116,139,0.2)] text-zinc-400 hover:text-zinc-200 transition-colors z-10"
+          className="absolute top-3 right-3 p-1.5 rounded-md hover:bg-surface-3 text-secondary hover:text-primary transition-colors z-10"
           aria-label="Close"
           type="button"
         >
@@ -448,7 +448,7 @@ export default function TicketDetailModal({
           {/* Loading */}
           {isLoading && (
             <div className="flex items-center justify-center h-48">
-              <Loader2 size={24} className="animate-spin text-zinc-500" />
+              <Loader2 size={24} className="animate-spin text-muted" />
             </div>
           )}
 
@@ -456,7 +456,7 @@ export default function TicketDetailModal({
           {!isLoading && error && (
             <div className="flex flex-col items-center justify-center h-48 text-center p-6">
               <AlertCircle size={20} className="text-red-400 mb-2" />
-              <p className="text-[13px] text-zinc-400">{error}</p>
+              <p className="text-[13px] text-secondary">{error}</p>
             </div>
           )}
 
@@ -465,22 +465,22 @@ export default function TicketDetailModal({
             <div className="flex flex-col">
               {/* ─── DAG Section ─── */}
               {dagNodes.length > 1 && (
-                <div className="px-5 pt-4 pb-3 border-b border-[#1e293b]">
-                  <p className="text-[9px] uppercase tracking-wider text-zinc-600 mb-2">Ticket Flow</p>
+                <div className="px-5 pt-4 pb-3 border-b border-theme">
+                  <p className="text-[9px] uppercase tracking-wider text-muted mb-2">Ticket Flow</p>
                   <TicketDag tickets={dagNodes} currentTicketId={ticketId} />
                 </div>
               )}
 
               {/* ─── Header: Status | ID | Title ─── */}
-              <div className="px-5 pt-4 pb-3 border-b border-[#1e293b] flex items-center gap-3">
+              <div className="px-5 pt-4 pb-3 border-b border-theme flex items-center gap-3">
                 {/* Status with dropdown */}
                 <div ref={statusRef} className="relative">
                   <button
                     onClick={() => validTransitions.length > 0 && setStatusOpen(!statusOpen)}
                     disabled={isTransitioning || validTransitions.length === 0}
-                    className={`inline-flex items-center gap-1.5 rounded-full border border-zinc-700 px-2.5 py-1 text-[11px] font-medium transition-colors ${
-                      STATUS_STYLES[ticket.status]?.text ?? "text-zinc-400"
-                    } ${validTransitions.length > 0 ? "cursor-pointer hover:border-zinc-500" : "cursor-default"}`}
+                    className={`inline-flex items-center gap-1.5 rounded-full border border-theme px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                      STATUS_STYLES[ticket.status]?.text ?? "text-secondary"
+                    } ${validTransitions.length > 0 ? "cursor-pointer hover:border-brand-500/50" : "cursor-default"}`}
                     type="button"
                     aria-expanded={statusOpen}
                     aria-haspopup="listbox"
@@ -495,12 +495,12 @@ export default function TicketDetailModal({
 
                   {/* Dropdown */}
                   {statusOpen && (
-                    <div className="absolute top-full left-0 mt-1 bg-[#0f1419] border border-[#1e293b] rounded-lg shadow-xl py-1 z-10 min-w-[140px]">
+                    <div className="absolute top-full left-0 mt-1 bg-surface-0 border border-theme rounded-lg shadow-xl py-1 z-10 min-w-[140px]">
                       {validTransitions.map((s) => (
                         <button
                           key={s}
                           onClick={() => handleTransition(s)}
-                          className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-zinc-300 hover:bg-zinc-800 transition-colors"
+                          className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-secondary hover:bg-surface-2 transition-colors"
                           type="button"
                         >
                           <span className={`w-2 h-2 rounded-full ${STATUS_STYLES[s]?.dot ?? "bg-zinc-500"}`} />
@@ -523,11 +523,11 @@ export default function TicketDetailModal({
                     <ExternalLink size={10} />
                   </a>
                 ) : (
-                  <span className="font-mono text-[12px] text-zinc-500 shrink-0">{ticket.id}</span>
+                  <span className="font-mono text-[12px] text-muted shrink-0">{ticket.id}</span>
                 )}
 
                 {/* Title */}
-                <h2 id="ticket-modal-title" className="text-[14px] font-semibold text-[#e2e8f0] truncate flex-1">
+                <h2 id="ticket-modal-title" className="text-[14px] font-semibold text-primary truncate flex-1">
                   {ticket.title}
                 </h2>
               </div>
@@ -542,16 +542,16 @@ export default function TicketDetailModal({
               {/* ─── Assignee ─── */}
               {ticket.assignee && (
                 <div className="px-5 pt-3 pb-2 flex items-center gap-2 text-[11px]">
-                  <span className="text-zinc-500">Assigned to</span>
-                  <span className="text-zinc-300 font-medium">{formatAgentName(ticket.assignee)}</span>
+                  <span className="text-muted">Assigned to</span>
+                  <span className="text-secondary font-medium">{formatAgentName(ticket.assignee)}</span>
                 </div>
               )}
 
               {/* ─── Description ─── */}
               {ticket.description && (
-                <div className="px-5 py-3 border-b border-[#1e293b]">
-                  <p className="text-[10px] uppercase tracking-wider text-zinc-600 mb-1.5">Description</p>
-                  <div className="text-[12px] text-[#94a3b8] whitespace-pre-wrap max-h-48 overflow-y-auto leading-relaxed">
+                <div className="px-5 py-3 border-b border-theme">
+                  <p className="text-[10px] uppercase tracking-wider text-muted mb-1.5">Description</p>
+                  <div className="text-[12px] text-secondary whitespace-pre-wrap max-h-48 overflow-y-auto leading-relaxed">
                     {ticket.description}
                   </div>
                 </div>
@@ -559,10 +559,10 @@ export default function TicketDetailModal({
 
               {/* ─── Notes / Comments ─── */}
               <div className="px-5 py-3">
-                <p className="text-[10px] uppercase tracking-wider text-zinc-600 mb-2">Notes</p>
+                <p className="text-[10px] uppercase tracking-wider text-muted mb-2">Notes</p>
 
                 {ticket.comments.length === 0 && (
-                  <p className="text-[12px] text-zinc-600 italic mb-3">No notes yet</p>
+                  <p className="text-[12px] text-muted italic mb-3">No notes yet</p>
                 )}
 
                 {ticket.comments.length > 0 && (
@@ -570,14 +570,14 @@ export default function TicketDetailModal({
                     {ticket.comments.map((comment) => (
                       <div key={comment.id} className="text-[12px]">
                         <div className="flex items-center gap-2 mb-0.5">
-                          <span className="font-medium text-zinc-300">
+                          <span className="font-medium text-secondary">
                             {formatAgentName(comment.author)}
                           </span>
-                          <span className="text-zinc-600 text-[10px]">
+                          <span className="text-muted text-[10px]">
                             {formatRelativeTime(comment.timestamp)}
                           </span>
                         </div>
-                        <p className="text-[#94a3b8] leading-relaxed">{comment.content}</p>
+                        <p className="text-secondary leading-relaxed">{comment.content}</p>
                       </div>
                     ))}
                   </div>
@@ -591,13 +591,13 @@ export default function TicketDetailModal({
                     onChange={(e) => setNewNote(e.target.value)}
                     onKeyDown={(e) => { if (e.key === "Enter" && newNote.trim()) handleAddNote(); }}
                     placeholder="Add a note..."
-                    className="flex-1 bg-[#0f1419] border border-[#1e293b] rounded-md px-3 py-1.5 text-[12px] text-[#e2e8f0] placeholder:text-zinc-600 focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                    className="flex-1 bg-surface-0 border border-theme rounded-md px-3 py-1.5 text-[12px] text-primary placeholder:text-muted focus:outline-none focus:ring-1 focus:ring-blue-500/50"
                     disabled={isAddingNote}
                   />
                   <button
                     onClick={handleAddNote}
                     disabled={!newNote.trim() || isAddingNote}
-                    className="p-1.5 rounded-md text-zinc-400 hover:text-blue-400 disabled:opacity-30 disabled:cursor-default transition-colors"
+                    className="p-1.5 rounded-md text-secondary hover:text-blue-400 disabled:opacity-30 disabled:cursor-default transition-colors"
                     type="button"
                     aria-label="Send note"
                   >

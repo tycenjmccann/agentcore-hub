@@ -103,7 +103,7 @@ export default function PipelineAgentCard({
         {/* Agent info */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between gap-2">
-            <span className="text-xs font-medium text-zinc-100 truncate">
+            <span className="text-xs font-medium text-primary truncate">
               {name}
             </span>
             {/* S3 artifacts button — only for non-idle agents */}
@@ -113,7 +113,7 @@ export default function PipelineAgentCard({
                   e.stopPropagation();
                   onViewArtifacts();
                 }}
-                className="p-0.5 rounded hover:bg-surface-3 text-zinc-500 hover:text-brand-400 transition-colors shrink-0"
+                className="p-0.5 rounded hover:bg-surface-3 text-muted hover:text-brand-400 transition-colors shrink-0"
                 aria-label={`View S3 artifacts for ${name}`}
                 title="View artifacts"
                 type="button"
@@ -128,12 +128,12 @@ export default function PipelineAgentCard({
                 ? "bg-green-500/20 text-green-400"
                 : isError
                 ? "bg-red-500/20 text-red-400"
-                : "bg-surface-3 text-zinc-500"
+                : "bg-surface-3 text-muted"
             }`}>
               {config.label}
             </span>
           </div>
-          <p className="text-[10px] text-zinc-500 truncate mt-0.5">{role}</p>
+          <p className="text-[10px] text-muted truncate mt-0.5">{role}</p>
         </div>
       </div>
 
@@ -149,7 +149,7 @@ export default function PipelineAgentCard({
               onClick={onOpenTicketModal ? () => onOpenTicketModal(ticketId) : undefined}
             />
           ) : (
-            <span className="text-[10px] text-zinc-600 font-mono">{ticketId}</span>
+            <span className="text-[10px] text-muted font-mono">{ticketId}</span>
           )}
         </div>
       )}
@@ -170,7 +170,7 @@ export default function PipelineAgentCard({
 
       {/* Output preview */}
       {isDone && outputPreview && (
-        <p className="text-[10px] text-zinc-500 mt-1.5 line-clamp-1 italic">
+        <p className="text-[10px] text-muted mt-1.5 line-clamp-1 italic">
           {outputPreview.slice(0, 80)}...
         </p>
       )}

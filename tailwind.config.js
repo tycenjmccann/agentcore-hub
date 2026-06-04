@@ -28,6 +28,17 @@ module.exports = {
           4: "var(--color-surface-4)",
         },
       },
+      textColor: {
+        primary: "var(--color-text-primary)",
+        secondary: "var(--color-text-secondary)",
+        muted: "var(--color-text-muted)",
+      },
+      borderColor: {
+        theme: "var(--color-border)",
+      },
+      placeholderColor: {
+        muted: "var(--color-text-muted)",
+      },
     },
   },
   plugins: [require("@tailwindcss/typography")],

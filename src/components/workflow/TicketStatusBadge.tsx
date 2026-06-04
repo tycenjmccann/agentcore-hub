@@ -10,6 +10,7 @@ interface TicketStatusBadgeProps {
   size?: "sm" | "md";
 }
 
+// Status-specific colors: these are semantic and intentionally hardcoded
 const STATUS_CONFIG: Record<TicketStatus, { dot: string; label: string; pulse: boolean }> = {
   backlog: { dot: "bg-zinc-500", label: "Backlog", pulse: false },
   todo: { dot: "bg-zinc-400", label: "To Do", pulse: false },
@@ -21,6 +22,7 @@ const STATUS_CONFIG: Record<TicketStatus, { dot: string; label: string; pulse: b
   cancelled: { dot: "bg-zinc-600", label: "Cancelled", pulse: false },
 };
 
+// Status-specific border colors: semantic, intentionally hardcoded
 const BORDER_COLOR: Record<TicketStatus, string> = {
   backlog: "border-zinc-500/30",
   todo: "border-zinc-400/30",
@@ -32,6 +34,7 @@ const BORDER_COLOR: Record<TicketStatus, string> = {
   cancelled: "border-zinc-600/30",
 };
 
+// Status-specific text colors: semantic, intentionally hardcoded
 const TEXT_COLOR: Record<TicketStatus, string> = {
   backlog: "text-zinc-400",
   todo: "text-zinc-300",

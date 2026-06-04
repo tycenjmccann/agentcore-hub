@@ -244,7 +244,7 @@ export default function S3ArtifactsModal({
           <button
             ref={closeButtonRef}
             onClick={handleClose}
-            className="p-1 rounded-md hover:bg-[rgba(100,116,139,0.2)] text-zinc-400 hover:text-zinc-200 transition-colors"
+            className="p-1 rounded-md hover:bg-surface-3 text-secondary hover:text-primary transition-colors"
             aria-label="Close artifacts panel"
             type="button"
           >
@@ -265,7 +265,7 @@ export default function S3ArtifactsModal({
           {isLoading && (
             <div className="flex flex-col items-center justify-center h-48">
               <Loader2 size={24} className="text-brand-400 animate-spin" />
-              <p className="text-[12px] text-zinc-500 mt-3">Loading artifacts...</p>
+              <p className="text-[12px] text-muted mt-3">Loading artifacts...</p>
             </div>
           )}
 
@@ -275,8 +275,8 @@ export default function S3ArtifactsModal({
               <div className="w-10 h-10 rounded-full bg-red-500/10 flex items-center justify-center mb-3">
                 <AlertCircle size={20} className="text-red-400" />
               </div>
-              <p className="text-[13px] text-zinc-400">Failed to load artifacts</p>
-              <p className="text-[11px] text-zinc-600 mt-1">{error}</p>
+              <p className="text-[13px] text-secondary">Failed to load artifacts</p>
+              <p className="text-[11px] text-muted mt-1">{error}</p>
               <button
                 onClick={retry}
                 className="mt-3 text-[11px] text-brand-400 hover:text-brand-300 underline underline-offset-2"
@@ -291,10 +291,10 @@ export default function S3ArtifactsModal({
           {!isLoading && !error && artifacts.length === 0 && (
             <div className="flex flex-col items-center justify-center h-48 text-center">
               <div className="w-10 h-10 rounded-full bg-surface-3 flex items-center justify-center mb-3">
-                <FolderOpen size={20} className="text-zinc-500" />
+                <FolderOpen size={20} className="text-muted" />
               </div>
-              <p className="text-[13px] text-zinc-400">No artifacts yet</p>
-              <p className="text-[11px] text-zinc-600 mt-1">
+              <p className="text-[13px] text-secondary">No artifacts yet</p>
+              <p className="text-[11px] text-muted mt-1">
                 Artifacts will appear here as the agent produces output.
               </p>
             </div>
@@ -350,11 +350,11 @@ export default function S3ArtifactsModal({
                   return (
                     <div key={folder}>
                       <div className="flex items-center gap-2 mb-1 px-1">
-                        <FolderOpen size={12} className="text-zinc-500" />
-                        <span className="text-[11px] font-medium text-zinc-400 uppercase tracking-wider">
+                        <FolderOpen size={12} className="text-muted" />
+                        <span className="text-[11px] font-medium text-secondary uppercase tracking-wider">
                           {folderLabel}
                         </span>
-                        <span className="text-[10px] text-zinc-600">
+                        <span className="text-[10px] text-muted">
                           ({groups[folder].length})
                         </span>
                       </div>
@@ -364,15 +364,15 @@ export default function S3ArtifactsModal({
                           const isDownloading = downloadingFile === artifact.key;
                           return (
                             <li key={artifact.key} className="s3-file-row group">
-                              <IconComponent size={16} className="text-zinc-500 shrink-0" />
+                              <IconComponent size={16} className="text-muted shrink-0" />
                               <div className="flex-1 min-w-0">
                                 <p
-                                  className="text-[12px] font-medium text-zinc-200 truncate"
+                                  className="text-[12px] font-medium text-primary truncate"
                                   title={artifact.key}
                                 >
                                   {artifact.filename}
                                 </p>
-                                <p className="text-[10px] text-zinc-500 mt-0.5">
+                                <p className="text-[10px] text-muted mt-0.5">
                                   <span className="font-mono">{formatFileSize(artifact.size)}</span>
                                   {artifact.lastModified && (
                                     <> · {formatRelativeTime(artifact.lastModified)}</>
@@ -407,7 +407,7 @@ export default function S3ArtifactsModal({
         {/* Footer */}
         {!isLoading && !error && artifacts.length > 0 && (
           <div className="s3-modal-footer">
-            <span className="text-[11px] text-zinc-500">
+            <span className="text-[11px] text-muted">
               Total: <span className="font-mono">{formatFileSize(totalSize)}</span>
             </span>
             <button

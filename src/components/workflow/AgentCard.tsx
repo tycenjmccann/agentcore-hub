@@ -20,7 +20,7 @@ interface AgentCardProps {
 }
 
 const STATUS_STYLES: Record<string, { bg: string; text: string; label: string }> = {
-  idle: { bg: "bg-zinc-800", text: "text-zinc-400", label: "Idle" },
+  idle: { bg: "bg-surface-1", text: "text-secondary", label: "Idle" },
   pending: { bg: "bg-yellow-900/30", text: "text-yellow-400", label: "Pending" },
   running: { bg: "bg-blue-900/30", text: "text-blue-400", label: "Running" },
   waiting_response: { bg: "bg-purple-900/30", text: "text-purple-400", label: "Waiting" },
@@ -61,20 +61,20 @@ export default function AgentCard({
 
   return (
     <div
-      className={`rounded-lg border border-zinc-700 p-3 ${style.bg} cursor-pointer hover:border-zinc-500 transition-colors`}
+      className={`rounded-lg border border-theme p-3 ${style.bg} cursor-pointer hover:border-brand-500/50 transition-colors`}
       onClick={onExpand}
     >
       <div className="flex items-center justify-between mb-1">
-        <span className="text-sm font-medium text-zinc-100">{name}</span>
-        <span className={`text-xs px-2 py-0.5 rounded-full ${style.text} bg-zinc-900/50`}>
+        <span className="text-sm font-medium text-primary">{name}</span>
+        <span className={`text-xs px-2 py-0.5 rounded-full ${style.text} bg-surface-0/50`}>
           {style.label}
         </span>
       </div>
 
-      <p className="text-xs text-zinc-400 mb-2">{role}</p>
+      <p className="text-xs text-secondary mb-2">{role}</p>
 
       {ticketId && (
-        <div className="text-xs text-zinc-500 mb-1 flex items-center gap-1.5">
+        <div className="text-xs text-muted mb-1 flex items-center gap-1.5">
           <span>Ticket:</span>
           {ticketStatus ? (
             <TicketStatusBadge
@@ -85,7 +85,7 @@ export default function AgentCard({
               onClick={onOpenTicketModal ? () => onOpenTicketModal(ticketId) : undefined}
             />
           ) : (
-            <span className="text-zinc-300 font-mono">{ticketId}</span>
+            <span className="text-secondary font-mono">{ticketId}</span>
           )}
         </div>
       )}
@@ -112,7 +112,7 @@ export default function AgentCard({
       )}
 
       {outputPreview && status === "complete" && (
-        <p className="text-xs text-zinc-400 mt-2 line-clamp-2 italic">
+        <p className="text-xs text-secondary mt-2 line-clamp-2 italic">
           {outputPreview.slice(0, 120)}...
         </p>
       )}

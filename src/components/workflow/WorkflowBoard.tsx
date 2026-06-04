@@ -998,7 +998,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
   if (!state) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-zinc-400">Loading pipeline...</div>
+        <div className="text-secondary">Loading pipeline...</div>
       </div>
     );
   }
@@ -1468,7 +1468,7 @@ const PIPELINE_STYLES = `
 @keyframes shimmer{to{background-position:200% center}}
 
 .pipeline-top-bar{display:flex;align-items:center;width:1720px;margin-bottom:10px;position:relative}
-.pipeline-status-header{position:absolute;left:50%;transform:translateX(-50%);font-size:16px;font-weight:700;color:#e2e8f0;letter-spacing:0.5px;text-transform:capitalize;transition:color .4s;white-space:nowrap}
+.pipeline-status-header{position:absolute;left:50%;transform:translateX(-50%);font-size:16px;font-weight:700;color:var(--color-text-primary);letter-spacing:0.5px;text-transform:capitalize;transition:color .4s;white-space:nowrap}
 .pipeline-status-header.settled{color:#f97316;animation:settledHeaderGlow 6s ease-in-out infinite}
 .pipeline-status-header.cancelled{color:#f59e0b}
 
