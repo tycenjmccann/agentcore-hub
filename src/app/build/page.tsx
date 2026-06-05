@@ -126,7 +126,7 @@ export default function BuildPage() {
       <div className="flex-1 flex flex-col min-w-0 w-0">
         <div className="flex items-center gap-2 mb-3">
           <Bot className="w-4 h-4 text-brand-400" />
-          <h2 className="text-sm font-semibold text-gray-300">Agent Builder Chat</h2>
+          <h2 className="text-sm font-semibold text-secondary">Agent Builder Chat</h2>
           <span className="text-xs bg-brand-600/20 text-brand-400 px-2 py-0.5 rounded-full">
             Harness Mode
           </span>
@@ -145,15 +145,15 @@ export default function BuildPage() {
                 className={`max-w-[85%] overflow-hidden ${
                   msg.role === "user"
                     ? "bg-brand-600/20 border border-brand-600/30 rounded-2xl rounded-tr-sm"
-                    : "bg-surface-2 border border-surface-4 rounded-2xl rounded-tl-sm"
+                    : "bg-surface-2 border border-theme rounded-2xl rounded-tl-sm"
                 } px-3 py-2`}
               >
                 {msg.role === "agent" ? (
-                  <div className="text-sm text-gray-200 prose prose-invert prose-sm max-w-none prose-p:my-1 prose-headings:my-2 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 prose-pre:my-2 prose-pre:overflow-x-auto prose-code:text-cyan-300 prose-code:bg-surface-1 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-surface-1 prose-pre:border prose-pre:border-surface-4 prose-a:text-brand-400 break-words">
+                  <div className="text-sm text-primary prose prose-sm max-w-none prose-headings:text-primary prose-p:text-primary prose-li:text-primary prose-strong:text-primary prose-p:my-1 prose-headings:my-2 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 prose-pre:my-2 prose-pre:overflow-x-auto prose-code:text-info-fg prose-code:bg-surface-1 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-surface-1 prose-pre:border prose-pre:border-theme prose-a:text-accent-fg break-words">
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
                   </div>
                 ) : (
-                  <p className="text-sm text-gray-200 whitespace-pre-wrap">{msg.content}</p>
+                  <p className="text-sm text-primary whitespace-pre-wrap">{msg.content}</p>
                 )}
                 {msg.role === "agent" && isStreaming && msg.id === messages[messages.length - 1]?.id && (
                   <div className="flex items-center gap-1 mt-1.5">
@@ -165,7 +165,7 @@ export default function BuildPage() {
               </div>
               {msg.role === "user" && (
                 <div className="w-7 h-7 bg-surface-3 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5">
-                  <User className="w-3.5 h-3.5 text-gray-400" />
+                  <User className="w-3.5 h-3.5 text-muted" />
                 </div>
               )}
             </div>
@@ -174,7 +174,7 @@ export default function BuildPage() {
         </div>
 
         {/* Input */}
-        <div className="border-t border-surface-4 pt-3">
+        <div className="border-t border-theme pt-3">
           <div className="flex items-end gap-2">
             <textarea
               value={input}
@@ -191,7 +191,7 @@ export default function BuildPage() {
               }}
               placeholder="Describe the agent you want to build..."
               rows={1}
-              className="flex-1 bg-surface-2 border border-surface-4 rounded-xl px-3 py-2.5 text-sm text-gray-300 placeholder-gray-600 focus:outline-none focus:border-brand-500/50 resize-none overflow-y-auto"
+              className="flex-1 bg-surface-2 border border-theme rounded-xl px-3 py-2.5 text-sm text-primary placeholder-muted focus:outline-none focus:border-brand-500/50 resize-none overflow-y-auto"
               style={{ maxHeight: "120px" }}
               data-testid="build-description-input"
               disabled={isStreaming}
@@ -205,20 +205,20 @@ export default function BuildPage() {
               <Send className="w-4 h-4" />
             </button>
           </div>
-          <p className="text-[10px] text-gray-600 mt-1">Shift+Enter for new line</p>
+          <p className="text-[10px] text-muted mt-1">Shift+Enter for new line</p>
         </div>
       </div>
 
       {/* Right Panel - Live Config Preview */}
-      <div className="w-[420px] flex flex-col border-l border-surface-4 pl-4">
+      <div className="w-[420px] flex flex-col border-l border-theme pl-4">
         <div className="flex items-center justify-between mb-3">
-          <h2 className="text-sm font-semibold text-gray-300">Harness Configuration</h2>
+          <h2 className="text-sm font-semibold text-secondary">Harness Configuration</h2>
           {config && (
             <button
               onClick={handleCopy}
-              className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1"
+              className="text-xs text-muted hover:text-secondary flex items-center gap-1"
             >
-              {copied ? <Check className="w-3 h-3 text-green-400" /> : <Copy className="w-3 h-3" />}
+              {copied ? <Check className="w-3 h-3 text-success-fg" /> : <Copy className="w-3 h-3" />}
               {copied ? "Copied" : "Copy"}
             </button>
           )}
@@ -227,20 +227,20 @@ export default function BuildPage() {
         {/* Config Display */}
         <div className="flex-1 overflow-y-auto">
           {config ? (
-            <div className="bg-surface-1 border border-surface-4 rounded-lg p-3 font-mono text-xs">
-              <pre className="text-gray-300 whitespace-pre-wrap overflow-x-auto" data-testid="config-preview">
+            <div className="bg-surface-1 border border-theme rounded-lg p-3 font-mono text-xs">
+              <pre className="text-secondary whitespace-pre-wrap overflow-x-auto" data-testid="config-preview">
                 {JSON.stringify(config, null, 2)}
               </pre>
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center h-full text-center px-4">
               <div className="w-12 h-12 bg-surface-2 rounded-xl flex items-center justify-center mb-3">
-                <RefreshCw className="w-5 h-5 text-gray-600" />
+                <RefreshCw className="w-5 h-5 text-muted" />
               </div>
-              <p className="text-sm text-gray-500">
+              <p className="text-sm text-muted">
                 Chat with the builder agent to generate your agent&apos;s harness configuration.
               </p>
-              <p className="text-xs text-gray-600 mt-2">
+              <p className="text-xs text-muted mt-2">
                 The config will appear here as the agent creates it.
               </p>
             </div>
@@ -248,12 +248,12 @@ export default function BuildPage() {
         </div>
 
         {/* Deploy Button */}
-        <div className="border-t border-surface-4 pt-3 mt-3">
+        <div className="border-t border-theme pt-3 mt-3">
           {deployResult ? (
-            <div className="bg-green-400/10 border border-green-400/30 rounded-lg p-3">
-              <p className="text-xs text-green-400 font-medium">Agent Deployed!</p>
-              <p className="text-xs text-gray-400 mt-1">ID: {deployResult.agentId}</p>
-              <p className="text-xs text-gray-500 mt-0.5">Status: {deployResult.status}</p>
+            <div className="bg-success-subtle border border-success-fg/30 rounded-lg p-3">
+              <p className="text-xs text-success-fg font-medium">Agent Deployed!</p>
+              <p className="text-xs text-secondary mt-1">ID: {deployResult.agentId}</p>
+              <p className="text-xs text-muted mt-0.5">Status: {deployResult.status}</p>
               <div className="flex items-center gap-3 mt-2">
                 <button
                   onClick={() => router.push(`/invoke?agent=${deployResult.agentId}`)}
@@ -264,7 +264,7 @@ export default function BuildPage() {
                 </button>
                 <button
                   onClick={() => { setDeployResult(null); setConfig(null); }}
-                  className="text-xs text-gray-500 hover:underline"
+                  className="text-xs text-muted hover:underline"
                 >
                   Build another
                 </button>

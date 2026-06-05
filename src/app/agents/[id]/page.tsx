@@ -81,11 +81,11 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
   if (!agent) {
     return (
       <div className="space-y-4">
-        <Link href="/agents" className="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-300">
+        <Link href="/agents" className="flex items-center gap-2 text-sm text-muted hover:text-secondary">
           <ArrowLeft className="w-4 h-4" /> Back to Agents
         </Link>
         <div className="card text-center py-8">
-          <p className="text-sm text-gray-400">Agent not found.</p>
+          <p className="text-sm text-secondary">Agent not found.</p>
         </div>
       </div>
     );
@@ -93,7 +93,7 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
 
   return (
     <div className="space-y-4">
-      <Link href="/agents" className="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-300">
+      <Link href="/agents" className="flex items-center gap-2 text-sm text-muted hover:text-secondary">
         <ArrowLeft className="w-4 h-4" /> Back to Agents
       </Link>
 
@@ -117,39 +117,39 @@ function AgentInfoHeader({ agent }: { agent: AgentDetail }) {
     <div className="card !py-3 !px-4">
       <div className="flex items-center gap-4">
         <div className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 ${
-          agent.type === "harness" ? "bg-brand-600/20" : "bg-purple-600/20"
+          agent.type === "harness" ? "bg-accent-subtle" : "bg-violet-subtle"
         }`}>
           {agent.type === "harness" ? (
-            <Brain className="w-5 h-5 text-brand-400" />
+            <Brain className="w-5 h-5 text-accent-fg" />
           ) : (
-            <Cpu className="w-5 h-5 text-purple-400" />
+            <Cpu className="w-5 h-5 text-violet-fg" />
           )}
         </div>
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h2 className="text-base font-semibold text-white">{agent.name}</h2>
+            <h2 className="text-base font-semibold text-primary">{agent.name}</h2>
             <span className={`text-[10px] px-1.5 py-0.5 rounded border ${
               agent.type === "harness"
-                ? "bg-brand-600/10 text-brand-400 border-brand-600/30"
-                : "bg-purple-600/10 text-purple-400 border-purple-600/30"
+                ? "bg-accent-subtle text-accent-fg border-accent-fg/30"
+                : "bg-violet-subtle text-violet-fg border-violet-fg/30"
             }`}>
               {agent.type.toUpperCase()}
             </span>
             <span className={`text-xs px-2 py-0.5 rounded-full border ${
               agent.status === "ACTIVE" || agent.status === "READY"
-                ? "bg-green-400/10 text-green-400 border-green-400/30"
-                : "bg-gray-400/10 text-gray-400 border-gray-400/30"
+                ? "bg-success-subtle text-success-fg border-success-fg/30"
+                : "bg-surface-3 text-muted border-theme"
             }`}>
               {agent.status}
             </span>
           </div>
-          <p className="text-[10px] text-gray-600 font-mono">{agent.arn}</p>
+          <p className="text-[10px] text-muted font-mono">{agent.arn}</p>
         </div>
 
         <button
           onClick={() => setExpanded(!expanded)}
-          className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1"
+          className="text-xs text-muted hover:text-secondary flex items-center gap-1"
         >
           {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
           Details
@@ -158,37 +158,37 @@ function AgentInfoHeader({ agent }: { agent: AgentDetail }) {
 
 
       {expanded && (
-        <div className="mt-3 pt-3 border-t border-surface-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+        <div className="mt-3 pt-3 border-t border-theme grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
           {agent.model && (
             <div>
-              <span className="text-gray-500 flex items-center gap-1"><Bot className="w-3 h-3" /> Model</span>
-              <p className="text-gray-300 mt-0.5 font-mono text-[10px]">{agent.model}</p>
+              <span className="text-muted flex items-center gap-1"><Bot className="w-3 h-3" /> Model</span>
+              <p className="text-secondary mt-0.5 font-mono text-[10px]">{agent.model}</p>
             </div>
           )}
           {agent.memoryId && (
             <div>
-              <span className="text-gray-500 flex items-center gap-1"><Database className="w-3 h-3" /> Memory</span>
-              <p className="text-gray-300 mt-0.5 font-mono text-[10px] truncate">{agent.memoryId}</p>
+              <span className="text-muted flex items-center gap-1"><Database className="w-3 h-3" /> Memory</span>
+              <p className="text-secondary mt-0.5 font-mono text-[10px] truncate">{agent.memoryId}</p>
             </div>
           )}
           {agent.logGroup && (
             <div>
-              <span className="text-gray-500 flex items-center gap-1"><Terminal className="w-3 h-3" /> Log Group</span>
-              <p className="text-gray-300 mt-0.5 font-mono text-[10px] truncate">{agent.logGroup}</p>
+              <span className="text-muted flex items-center gap-1"><Terminal className="w-3 h-3" /> Log Group</span>
+              <p className="text-secondary mt-0.5 font-mono text-[10px] truncate">{agent.logGroup}</p>
             </div>
           )}
           {agent.createdAt && (
             <div>
-              <span className="text-gray-500">Created</span>
-              <p className="text-gray-300 mt-0.5">{new Date(agent.createdAt).toLocaleDateString()}</p>
+              <span className="text-muted">Created</span>
+              <p className="text-secondary mt-0.5">{new Date(agent.createdAt).toLocaleDateString()}</p>
             </div>
           )}
           {agent.tools && agent.tools.length > 0 && (
             <div className="col-span-full">
-              <span className="text-gray-500 flex items-center gap-1 mb-1.5"><Wrench className="w-3 h-3" /> Tools ({agent.tools.length})</span>
+              <span className="text-muted flex items-center gap-1 mb-1.5"><Wrench className="w-3 h-3" /> Tools ({agent.tools.length})</span>
               <div className="flex flex-wrap gap-1.5">
                 {agent.tools.map((tool, i) => (
-                  <span key={i} className="text-[10px] px-2 py-0.5 bg-surface-3 rounded border border-surface-4 text-gray-300">
+                  <span key={i} className="text-[10px] px-2 py-0.5 bg-surface-3 rounded border border-theme text-secondary">
                     <Server className="w-2.5 h-2.5 inline mr-0.5" />
                     {tool.name || tool.type}
                   </span>
@@ -198,8 +198,8 @@ function AgentInfoHeader({ agent }: { agent: AgentDetail }) {
           )}
           {agent.systemPrompt && (
             <div className="col-span-full">
-              <span className="text-gray-500">System Prompt</span>
-              <pre className="text-[10px] text-gray-400 mt-1 bg-surface-0 rounded p-2 font-mono whitespace-pre-wrap max-h-24 overflow-y-auto">
+              <span className="text-muted">System Prompt</span>
+              <pre className="text-[10px] text-muted mt-1 bg-surface-0 rounded p-2 font-mono whitespace-pre-wrap max-h-24 overflow-y-auto">
                 {agent.systemPrompt}
               </pre>
             </div>
@@ -692,30 +692,30 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
 
   const traceEventConfig: Record<string, { icon: typeof Terminal; color: string; label: string }> = {
     // Real OTEL span events from aws/spans
-    agent_invoke: { icon: Bot, color: "text-brand-400", label: "Agent Invoke" },
-    model_call: { icon: Brain, color: "text-purple-400", label: "LLM Call" },
-    tool_call: { icon: Wrench, color: "text-yellow-400", label: "Tool" },
-    cycle: { icon: Activity, color: "text-cyan-400", label: "Cycle" },
-    request: { icon: Zap, color: "text-brand-400", label: "Request" },
-    service_call: { icon: Database, color: "text-gray-400", label: "Service" },
-    http: { icon: Server, color: "text-gray-500", label: "HTTP" },
-    internal: { icon: Cpu, color: "text-gray-600", label: "Internal" },
-    span: { icon: Activity, color: "text-gray-400", label: "Span" },
+    agent_invoke: { icon: Bot, color: "text-accent-fg", label: "Agent Invoke" },
+    model_call: { icon: Brain, color: "text-violet-fg", label: "LLM Call" },
+    tool_call: { icon: Wrench, color: "text-warning-fg", label: "Tool" },
+    cycle: { icon: Activity, color: "text-info-fg", label: "Cycle" },
+    request: { icon: Zap, color: "text-accent-fg", label: "Request" },
+    service_call: { icon: Database, color: "text-muted", label: "Service" },
+    http: { icon: Server, color: "text-muted", label: "HTTP" },
+    internal: { icon: Cpu, color: "text-muted", label: "Internal" },
+    span: { icon: Activity, color: "text-muted", label: "Span" },
     // Streaming / real-time events
-    user_input: { icon: User, color: "text-blue-400", label: "User Input" },
-    message_start: { icon: Brain, color: "text-purple-400", label: "Thinking" },
-    tool_start: { icon: Terminal, color: "text-yellow-400", label: "Tool Call" },
-    block_stop: { icon: Zap, color: "text-gray-500", label: "Block Complete" },
-    response: { icon: Bot, color: "text-green-400", label: "Response" },
-    usage: { icon: Cpu, color: "text-cyan-400", label: "Token Usage" },
-    error: { icon: Terminal, color: "text-red-400", label: "Error" },
-    trace: { icon: Activity, color: "text-gray-400", label: "Trace" },
+    user_input: { icon: User, color: "text-info-fg", label: "User Input" },
+    message_start: { icon: Brain, color: "text-violet-fg", label: "Thinking" },
+    tool_start: { icon: Terminal, color: "text-warning-fg", label: "Tool Call" },
+    block_stop: { icon: Zap, color: "text-muted", label: "Block Complete" },
+    response: { icon: Bot, color: "text-success-fg", label: "Response" },
+    usage: { icon: Cpu, color: "text-info-fg", label: "Token Usage" },
+    error: { icon: Terminal, color: "text-danger-fg", label: "Error" },
+    trace: { icon: Activity, color: "text-muted", label: "Trace" },
   };
 
   return (
     <div className="flex h-[calc(100vh-16rem)] gap-4 overflow-hidden">
       {/* Left — Sessions */}
-      <div className="w-52 flex-shrink-0 flex flex-col border-r border-surface-4 pr-3">
+      <div className="w-52 flex-shrink-0 flex flex-col border-r border-theme pr-3">
         <button
           onClick={startNewSession}
           className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-brand-600/20 border border-brand-600/30 text-brand-400 text-xs font-medium hover:bg-brand-600/30 transition-colors mb-3"
@@ -731,7 +731,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
             className={`flex-1 flex items-center justify-center gap-1 px-2 py-1 rounded-md text-[10px] font-medium transition-colors ${
               sessionSource === "memory"
                 ? "bg-surface-1 text-brand-400 shadow-sm"
-                : "text-gray-500 hover:text-gray-300"
+                : "text-muted hover:text-secondary"
             }`}
           >
             <Database className="w-2.5 h-2.5" />
@@ -742,7 +742,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
             className={`flex-1 flex items-center justify-center gap-1 px-2 py-1 rounded-md text-[10px] font-medium transition-colors ${
               sessionSource === "traces"
                 ? "bg-surface-1 text-brand-400 shadow-sm"
-                : "text-gray-500 hover:text-gray-300"
+                : "text-muted hover:text-secondary"
             }`}
           >
             <Terminal className="w-2.5 h-2.5" />
@@ -751,15 +751,15 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
         </div>
 
         <div className="flex-1 overflow-y-auto space-y-1">
-          <p className="text-[10px] text-gray-500 uppercase tracking-wide font-medium mb-1">
+          <p className="text-[10px] text-muted uppercase tracking-wide font-medium mb-1">
             {sessionSource === "memory" ? "History" : "Trace Sessions"}
           </p>
           {loadingSessions ? (
-            <div className="flex items-center gap-2 text-xs text-gray-500 py-2">
+            <div className="flex items-center gap-2 text-xs text-muted py-2">
               <Loader2 className="w-3 h-3 animate-spin" /> Loading...
             </div>
           ) : (sessionSource === "memory" ? sessions : traceSessions).length === 0 ? (
-            <p className="text-xs text-gray-600 py-2">
+            <p className="text-xs text-muted py-2">
               {sessionSource === "memory" ? "No previous sessions" : "No trace sessions found"}
             </p>
           ) : (
@@ -770,7 +770,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
                 className={`w-full text-left px-2 py-1.5 rounded-lg text-xs transition-colors ${
                   sessionId === session.sessionId
                     ? "bg-brand-600/20 border border-brand-600/30 text-brand-300"
-                    : "hover:bg-surface-3 text-gray-400"
+                    : "hover:bg-surface-3 text-secondary"
                 }`}
               >
                 <div className="flex items-center gap-1.5">
@@ -782,7 +782,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
                     {session.sessionId.length > 16 ? session.sessionId.slice(0, 16) + "..." : session.sessionId}
                   </span>
                 </div>
-                <div className="flex items-center gap-1 mt-0.5 text-gray-600 text-[10px]">
+                <div className="flex items-center gap-1 mt-0.5 text-muted text-[10px]">
                   <Clock className="w-2 h-2" />
                   <span>{timeAgo(session.createdAt)}</span>
                 </div>
@@ -792,14 +792,14 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
         </div>
 
         {/* Memory Selector */}
-        <div className="mt-3 pt-3 border-t border-surface-4">
-          <label className="text-[10px] text-gray-500 uppercase tracking-wide font-medium flex items-center gap-1 mb-1.5">
+        <div className="mt-3 pt-3 border-t border-theme">
+          <label className="text-[10px] text-muted uppercase tracking-wide font-medium flex items-center gap-1 mb-1.5">
             <Database className="w-3 h-3" /> Memory
           </label>
           <select
             value={linkedMemory}
             onChange={(e) => handleMemoryChange(e.target.value)}
-            className="w-full bg-surface-3 border border-surface-4 rounded-lg px-2 py-1.5 text-[10px] text-gray-300 font-mono focus:outline-none focus:border-brand-600/50"
+            className="w-full bg-surface-3 border border-theme rounded-lg px-2 py-1.5 text-[10px] text-secondary font-mono focus:outline-none focus:border-brand-600/50"
           >
             <option value="">None</option>
             {availableMemories.map((mem) => (
@@ -809,7 +809,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
             ))}
           </select>
           {linkedMemory && (
-            <p className="text-[9px] text-gray-600 mt-1 truncate">{linkedMemory}</p>
+            <p className="text-[9px] text-muted mt-1 truncate">{linkedMemory}</p>
           )}
         </div>
       </div>
@@ -817,7 +817,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
       {/* Center — Chat / Playground */}
       <div className="flex-1 flex flex-col min-w-0">
         {/* Header with mode toggle */}
-        <div className="flex items-center justify-between mb-2 pb-2 border-b border-surface-4">
+        <div className="flex items-center justify-between mb-2 pb-2 border-b border-theme">
           <div className="flex items-center gap-3">
             {/* Mode toggle */}
             <div className="flex items-center gap-0.5 p-0.5 bg-surface-3 rounded-lg">
@@ -826,7 +826,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
                 className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
                   invokeMode === "chat"
                     ? "bg-surface-1 text-brand-400 shadow-sm"
-                    : "text-gray-500 hover:text-gray-300"
+                    : "text-muted hover:text-secondary"
                 }`}
               >
                 <MessageSquare className="w-3 h-3" />
@@ -837,31 +837,31 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
                 className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
                   invokeMode === "playground"
                     ? "bg-surface-1 text-brand-400 shadow-sm"
-                    : "text-gray-500 hover:text-gray-300"
+                    : "text-muted hover:text-secondary"
                 }`}
               >
                 <Code2 className="w-3 h-3" />
                 Playground
               </button>
             </div>
-            <p className="text-[10px] text-gray-600 font-mono">{sessionId ? sessionId.slice(0, 24) + "..." : "..."}</p>
+            <p className="text-[10px] text-muted font-mono">{sessionId ? sessionId.slice(0, 24) + "..." : "..."}</p>
           </div>
           <div className="flex items-center gap-2">
             {sessionStatus === "active" && (
-              <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-green-600/10 border border-green-600/30">
-                <Activity className="w-3 h-3 text-green-400 animate-pulse" />
-                <span className="text-[10px] text-green-400 font-medium">Active</span>
+              <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-success-subtle border border-success-fg/30">
+                <Activity className="w-3 h-3 text-success-fg animate-pulse" />
+                <span className="text-[10px] text-success-fg font-medium">Active</span>
                 {elapsedTime > 0 && (
-                  <span className="text-[10px] text-green-500/70 font-mono">
+                  <span className="text-[10px] text-success-fg/70 font-mono">
                     {elapsedTime >= 60 ? `${Math.floor(elapsedTime / 60)}m ${elapsedTime % 60}s` : `${elapsedTime}s`}
                   </span>
                 )}
               </span>
             )}
             {sessionStatus === "complete" && (
-              <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface-3 border border-surface-4">
-                <CheckCircle2 className="w-3 h-3 text-gray-500" />
-                <span className="text-[10px] text-gray-500 font-medium">Complete</span>
+              <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface-3 border border-theme">
+                <CheckCircle2 className="w-3 h-3 text-muted" />
+                <span className="text-[10px] text-muted font-medium">Complete</span>
               </span>
             )}
           </div>
@@ -874,12 +874,12 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
               {loadingHistory ? (
                 <div className="flex flex-col items-center justify-center h-full">
                   <Loader2 className="w-6 h-6 text-brand-400 animate-spin mb-2" />
-                  <p className="text-sm text-gray-500">Loading session history...</p>
+                  <p className="text-sm text-muted">Loading session history...</p>
                 </div>
               ) : messages.length === 0 ? (
                 <div className="flex flex-col items-center justify-center h-full text-center">
-                  <Bot className="w-10 h-10 text-gray-600 mb-3" />
-                  <p className="text-sm text-gray-500">Send a message to start chatting with {agent.name}.</p>
+                  <Bot className="w-10 h-10 text-muted mb-3" />
+                  <p className="text-sm text-muted">Send a message to start chatting with {agent.name}.</p>
                 </div>
               ) : (
                 messages.map((msg) => (
@@ -892,12 +892,12 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
                     <div className={`max-w-[80%] min-w-0 overflow-hidden ${
                       msg.role === "user"
                         ? "bg-brand-600/20 border border-brand-600/30 rounded-2xl rounded-tr-sm"
-                        : "bg-surface-2 border border-surface-4 rounded-2xl rounded-tl-sm"
+                        : "bg-surface-2 border border-theme rounded-2xl rounded-tl-sm"
                     } px-4 py-3`}>
                       {msg.role === "agent" && msg.agent_name && (
                         <p className="text-xs text-brand-400 mb-1 font-medium">{msg.agent_name}</p>
                       )}
-                      <div className="text-sm text-gray-200 prose prose-invert prose-sm max-w-none prose-p:my-1 prose-headings:my-2 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 prose-pre:my-2 prose-pre:overflow-x-auto prose-code:text-cyan-300 prose-code:bg-surface-1 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-surface-1 prose-pre:border prose-pre:border-surface-4 prose-a:text-brand-400 break-words [overflow-wrap:anywhere]">
+                      <div className="text-sm text-primary prose prose-sm max-w-none prose-headings:text-primary prose-p:text-primary prose-li:text-primary prose-strong:text-primary prose-p:my-1 prose-headings:my-2 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 prose-pre:my-2 prose-pre:overflow-x-auto prose-code:text-info-fg prose-code:bg-surface-1 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-surface-1 prose-pre:border prose-pre:border-theme prose-a:text-accent-fg break-words [overflow-wrap:anywhere]">
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
                       </div>
                       {msg.role === "agent" && isStreaming && msg.id === messages[messages.length - 1]?.id && (
@@ -910,7 +910,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
                     </div>
                     {msg.role === "user" && (
                       <div className="w-7 h-7 bg-surface-3 rounded-lg flex items-center justify-center flex-shrink-0 mt-1">
-                        <User className="w-3.5 h-3.5 text-gray-400" />
+                        <User className="w-3.5 h-3.5 text-muted" />
                       </div>
                     )}
                   </div>
@@ -920,15 +920,15 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
             </div>
 
             {/* Input — auto-expanding textarea */}
-            <div className="border-t border-surface-4 pt-3">
+            <div className="border-t border-theme pt-3">
               {isReadOnly && (
-                <div className="mb-2 flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-yellow-600/10 border border-yellow-600/30">
-                  <p className="text-[11px] text-yellow-300/90 leading-tight">
+                <div className="mb-2 flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-warning-subtle border border-warning-fg/30">
+                  <p className="text-[11px] text-warning-fg leading-tight">
                     Read-only — this session ID is too short to continue (AgentCore requires ≥33 chars). Start a new session to chat.
                   </p>
                   <button
                     onClick={startNewSession}
-                    className="text-[10px] px-2 py-1 rounded-md bg-yellow-600/20 border border-yellow-600/40 text-yellow-200 hover:bg-yellow-600/30 flex-shrink-0"
+                    className="text-[10px] px-2 py-1 rounded-md bg-warning-subtle border border-warning-fg/40 text-warning-fg hover:bg-warning-subtle/70 flex-shrink-0"
                   >
                     New Session
                   </button>
@@ -947,7 +947,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
                   }}
                   placeholder={isReadOnly ? "Read-only — start a new session to chat" : `Message ${agent.name}...`}
                   rows={1}
-                  className="flex-1 bg-surface-2 border border-surface-4 rounded-xl px-4 py-2.5 text-sm text-gray-300 placeholder-gray-600 focus:outline-none focus:border-brand-500/50 resize-none overflow-y-auto disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="flex-1 bg-surface-2 border border-theme rounded-xl px-4 py-2.5 text-sm text-primary placeholder-muted focus:outline-none focus:border-brand-500/50 resize-none overflow-y-auto disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{ maxHeight: "120px" }}
                   disabled={isStreaming || isReadOnly}
                 />
@@ -959,7 +959,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
                   <Send className="w-4 h-4" />
                 </button>
               </div>
-              <p className="text-[10px] text-gray-600 mt-1">Shift+Enter for new line</p>
+              <p className="text-[10px] text-muted mt-1">Shift+Enter for new line</p>
             </div>
           </>
         ) : (
@@ -969,15 +969,15 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
               {/* Payload editor */}
               <div className="flex-1 flex flex-col min-h-0">
                 <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-[10px] text-gray-500 uppercase tracking-wide font-medium">Request Payload</span>
-                  <span className="text-[10px] text-gray-600">
+                  <span className="text-[10px] text-muted uppercase tracking-wide font-medium">Request Payload</span>
+                  <span className="text-[10px] text-muted">
                     POST /api/agentcore/invoke • agent: {agent.name}
                   </span>
                 </div>
                 <textarea
                   value={playgroundPayload}
                   onChange={(e) => setPlaygroundPayload(e.target.value)}
-                  className="flex-1 bg-surface-1 border border-surface-4 rounded-lg px-3 py-2.5 text-xs text-gray-300 font-mono focus:outline-none focus:border-brand-500/50 resize-none"
+                  className="flex-1 bg-surface-1 border border-theme rounded-lg px-3 py-2.5 text-xs text-secondary font-mono focus:outline-none focus:border-brand-500/50 resize-none"
                   spellCheck={false}
                   disabled={isStreaming}
                 />
@@ -986,28 +986,28 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
               {/* Response viewer */}
               <div className="flex-1 flex flex-col min-h-0">
                 <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-[10px] text-gray-500 uppercase tracking-wide font-medium">Response</span>
+                  <span className="text-[10px] text-muted uppercase tracking-wide font-medium">Response</span>
                   {isStreaming && <Loader2 className="w-3 h-3 text-brand-400 animate-spin" />}
                 </div>
-                <div className="flex-1 bg-surface-1 border border-surface-4 rounded-lg px-3 py-2.5 overflow-y-auto overflow-x-hidden">
+                <div className="flex-1 bg-surface-1 border border-theme rounded-lg px-3 py-2.5 overflow-y-auto overflow-x-hidden">
                   {playgroundResponse ? (
-                    <pre className="text-xs text-gray-300 font-mono whitespace-pre-wrap break-words">{playgroundResponse}</pre>
+                    <pre className="text-xs text-secondary font-mono whitespace-pre-wrap break-words">{playgroundResponse}</pre>
                   ) : (
-                    <p className="text-xs text-gray-600 italic">Response will appear here after invoking...</p>
+                    <p className="text-xs text-muted italic">Response will appear here after invoking...</p>
                   )}
                 </div>
               </div>
 
               {/* Send button */}
-              <div className="border-t border-surface-4 pt-3">
+              <div className="border-t border-theme pt-3">
                 {isReadOnly && (
-                  <div className="mb-2 flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-yellow-600/10 border border-yellow-600/30">
-                    <p className="text-[11px] text-yellow-300/90 leading-tight">
+                  <div className="mb-2 flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-warning-subtle border border-warning-fg/30">
+                    <p className="text-[11px] text-warning-fg leading-tight">
                       Read-only — this session ID is too short to continue (AgentCore requires ≥33 chars). Start a new session to invoke.
                     </p>
                     <button
                       onClick={startNewSession}
-                      className="text-[10px] px-2 py-1 rounded-md bg-yellow-600/20 border border-yellow-600/40 text-yellow-200 hover:bg-yellow-600/30 flex-shrink-0"
+                      className="text-[10px] px-2 py-1 rounded-md bg-warning-subtle border border-warning-fg/40 text-warning-fg hover:bg-warning-subtle/70 flex-shrink-0"
                     >
                       New Session
                     </button>
@@ -1037,10 +1037,10 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
       </div>
 
       {/* Right — Execution Trace */}
-      <div className="w-64 flex-shrink-0 flex flex-col border-l border-surface-4 pl-3">
-        <div className="flex items-center gap-2 mb-3 pb-2 border-b border-surface-4">
-          <Terminal className="w-4 h-4 text-gray-500" />
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Execution Trace</h3>
+      <div className="w-64 flex-shrink-0 flex flex-col border-l border-theme pl-3">
+        <div className="flex items-center gap-2 mb-3 pb-2 border-b border-theme">
+          <Terminal className="w-4 h-4 text-muted" />
+          <h3 className="text-xs font-semibold text-secondary uppercase tracking-wide">Execution Trace</h3>
           {isStreaming && <span className="ml-auto w-2 h-2 bg-green-400 rounded-full animate-pulse" />}
         </div>
 
@@ -1049,8 +1049,8 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
         <div className="flex-1 overflow-y-auto space-y-1">
           {traceSteps.length === 0 ? (
             <div className="text-center py-8">
-              <Terminal className="w-6 h-6 text-gray-700 mx-auto mb-2" />
-              <p className="text-xs text-gray-600">Trace events will appear here.</p>
+              <Terminal className="w-6 h-6 text-muted mx-auto mb-2" />
+              <p className="text-xs text-muted">Trace events will appear here.</p>
             </div>
           ) : (
             traceSteps.map((step, idx) => {
@@ -1062,32 +1062,32 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
               const tokensOut = step.details?.tokensOut as number | undefined;
 
               return (
-                <div key={step.id} className="rounded-md overflow-hidden bg-surface-2/50 border border-surface-4/50">
+                <div key={step.id} className="rounded-md overflow-hidden bg-surface-2/50 border border-theme">
                   <button
                     onClick={() => setExpandedTrace(isExpanded ? null : step.id)}
                     className="w-full flex items-start gap-2 px-2 py-1.5 hover:bg-surface-3/50 transition-colors text-left"
                   >
                     {step.details ? (
-                      isExpanded ? <ChevronDown className="w-3 h-3 text-gray-600 mt-0.5" /> : <ChevronRight className="w-3 h-3 text-gray-600 mt-0.5" />
+                      isExpanded ? <ChevronDown className="w-3 h-3 text-muted mt-0.5" /> : <ChevronRight className="w-3 h-3 text-muted mt-0.5" />
                     ) : (
-                      <span className="w-3 h-3 flex items-center justify-center text-gray-700 text-[9px] mt-0.5">{idx + 1}</span>
+                      <span className="w-3 h-3 flex items-center justify-center text-muted text-[9px] mt-0.5">{idx + 1}</span>
                     )}
                     <Icon className={`w-3 h-3 flex-shrink-0 mt-0.5 ${config.color}`} />
                     <div className="flex-1 min-w-0">
-                      <span className="text-[11px] text-gray-300 block truncate">{step.name || config.label}</span>
+                      <span className="text-[11px] text-secondary block truncate">{step.name || config.label}</span>
                       {(dur !== undefined || tokensIn !== undefined) && (
-                        <span className="text-[9px] text-gray-500 block">
+                        <span className="text-[9px] text-muted block">
                           {dur !== undefined && dur > 0 ? `${dur.toFixed(1)}s` : ""}
                           {tokensIn !== undefined && tokensIn > 0 && (
-                            <span className="ml-1 text-purple-400/70">{tokensIn.toLocaleString()}→{(tokensOut || 0).toLocaleString()} tok</span>
+                            <span className="ml-1 text-violet-fg/80">{tokensIn.toLocaleString()}→{(tokensOut || 0).toLocaleString()} tok</span>
                           )}
                         </span>
                       )}
                     </div>
                   </button>
                   {isExpanded && step.details && (
-                    <div className="px-2 pb-2 border-t border-surface-4/30">
-                      <pre className="text-[10px] text-gray-500 mt-1 font-mono whitespace-pre-wrap">
+                    <div className="px-2 pb-2 border-t border-theme">
+                      <pre className="text-[10px] text-muted mt-1 font-mono whitespace-pre-wrap">
                         {JSON.stringify(step.details, null, 2)}
                       </pre>
                     </div>
@@ -1151,9 +1151,9 @@ function TraceHealthBanner() {
 
   const hasError = health.issues.some((i) => i.severity === "error");
   const accent = hasError
-    ? "bg-red-600/10 border-red-600/30 text-red-200"
-    : "bg-yellow-600/10 border-yellow-600/30 text-yellow-200";
-  const iconColor = hasError ? "text-red-400" : "text-yellow-400";
+    ? "bg-danger-subtle border-danger-fg/30 text-danger-fg"
+    : "bg-warning-subtle border-warning-fg/30 text-warning-fg";
+  const iconColor = hasError ? "text-danger-fg" : "text-warning-fg";
 
   const onRefresh = async () => {
     setRefreshing(true);
@@ -1255,8 +1255,8 @@ function TraceDiagnosticBanner({
     return null;
   }
 
-  const bg = tone === "warning" ? "bg-yellow-600/10 border-yellow-600/30" : "bg-surface-3/70 border-surface-4";
-  const text = tone === "warning" ? "text-yellow-300/90" : "text-gray-400";
+  const bg = tone === "warning" ? "bg-warning-subtle border-warning-fg/30" : "bg-surface-3/70 border-theme";
+  const text = tone === "warning" ? "text-warning-fg" : "text-secondary";
 
   return (
     <div className={`mb-3 px-2.5 py-2 rounded-lg border ${bg}`}>

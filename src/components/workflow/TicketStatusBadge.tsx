@@ -10,6 +10,7 @@ interface TicketStatusBadgeProps {
   size?: "sm" | "md";
 }
 
+// Status-specific colors: these are semantic and intentionally hardcoded
 const STATUS_CONFIG: Record<TicketStatus, { dot: string; label: string; pulse: boolean }> = {
   backlog: { dot: "bg-zinc-500", label: "Backlog", pulse: false },
   todo: { dot: "bg-zinc-400", label: "To Do", pulse: false },
@@ -21,6 +22,7 @@ const STATUS_CONFIG: Record<TicketStatus, { dot: string; label: string; pulse: b
   cancelled: { dot: "bg-zinc-600", label: "Cancelled", pulse: false },
 };
 
+// Status-specific border colors: semantic, intentionally hardcoded
 const BORDER_COLOR: Record<TicketStatus, string> = {
   backlog: "border-zinc-500/30",
   todo: "border-zinc-400/30",
@@ -32,14 +34,17 @@ const BORDER_COLOR: Record<TicketStatus, string> = {
   cancelled: "border-zinc-600/30",
 };
 
+// Status-specific text colors use dark: prefixes rather than CSS-variable tokens
+// because each status needs a unique color pair that doesn't map to the 6 intent
+// tokens (accent/info/success/warning/danger/violet). This is an accepted trade-off.
 const TEXT_COLOR: Record<TicketStatus, string> = {
-  backlog: "text-zinc-400",
-  todo: "text-zinc-300",
-  ready: "text-yellow-300",
-  in_progress: "text-blue-300",
-  in_review: "text-purple-300",
-  done: "text-green-300",
-  blocked: "text-red-300",
+  backlog: "text-zinc-600 dark:text-zinc-400",
+  todo: "text-zinc-600 dark:text-zinc-300",
+  ready: "text-yellow-700 dark:text-yellow-300",
+  in_progress: "text-blue-700 dark:text-blue-300",
+  in_review: "text-purple-700 dark:text-purple-300",
+  done: "text-green-700 dark:text-green-300",
+  blocked: "text-red-700 dark:text-red-300",
   cancelled: "text-zinc-500",
 };
 

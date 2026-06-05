@@ -19,14 +19,14 @@ function InvokeRedirect() {
 
   return (
     <div className="flex items-center justify-center h-64">
-      <p className="text-sm text-gray-500">Redirecting...</p>
+      <p className="text-sm text-muted">Redirecting...</p>
     </div>
   );
 }
 
 export default function InvokePage() {
   return (
-    <Suspense fallback={<div className="flex items-center justify-center h-64"><span className="text-gray-500 text-sm">Loading...</span></div>}>
+    <Suspense fallback={<div className="flex items-center justify-center h-64"><span className="text-muted text-sm">Loading...</span></div>}>
       <InvokeRedirect />
     </Suspense>
   );
