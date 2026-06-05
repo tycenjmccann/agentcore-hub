@@ -2,6 +2,10 @@
  * Matches exact specs from design mockup */
 
 /* ─── Color Variables ─────────────────────────────────────────────────────── */
+/* These --pipeline-* vars are the single source of truth for shared pipeline
+   colors. The inline --pl-* vars in WorkflowBoard.tsx PIPELINE_STYLES derive
+   from these via var(--pipeline-*), so updating values here automatically
+   propagates to both systems. */
 :root {
   --pipeline-bg: #0f1419;
   --pipeline-text: #e2e8f0;
