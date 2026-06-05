@@ -152,21 +152,21 @@ export default function DashboardPage() {
             value={metricsLoading ? "—" : `${formatNumber(metrics?.usage.totalTokensIn ?? 0)} / ${formatNumber(metrics?.usage.totalTokensOut ?? 0)}`}
             sub="in / out"
             icon={Zap}
-            color="text-cyan-400"
+            color="text-info-fg"
           />
           <BigMetric
             label="Avg Duration"
             value={metricsLoading ? "—" : formatDuration(metrics?.usage.avgSessionDuration ?? 0)}
             sub="per session"
             icon={Timer}
-            color="text-yellow-400"
+            color="text-warning-fg"
           />
           <BigMetric
             label="Total Duration"
             value={metricsLoading ? "—" : formatDuration(metrics?.usage.totalDuration ?? 0)}
             sub="autonomous work time"
             icon={Clock}
-            color="text-emerald-400"
+            color="text-success-fg"
           />
           <BigMetric
             label="Active Agents"
@@ -199,35 +199,35 @@ export default function DashboardPage() {
             value={jira.loading ? "—" : jira.ticketsResolved.toString()}
             sub={`${jira.ticketsInProgress} in progress`}
             icon={CheckCircle2}
-            color="text-green-400"
+            color="text-success-fg"
           />
           <BigMetric
             label="Active Epics"
             value={jira.loading ? "—" : jira.epicsActive.toString()}
             sub="in progress"
             icon={Layers}
-            color="text-orange-400"
+            color="text-warning-fg"
           />
           <BigMetric
             label="Stories Done"
             value={jira.loading ? "—" : jira.storiesCompleted.toString()}
             sub={`${jira.storiesInProgress} active`}
             icon={Ticket}
-            color="text-blue-400"
+            color="text-info-fg"
           />
           <BigMetric
             label="Avg Resolution"
             value={jira.loading ? "—" : `${jira.avgResolutionTime}m`}
             sub="per ticket"
             icon={Timer}
-            color="text-emerald-400"
+            color="text-success-fg"
           />
           <BigMetric
             label="Throughput"
             value={jira.loading ? "—" : `${jira.throughput}/day`}
             sub={`avg this ${jira.timeframe}`}
             icon={TrendingUp}
-            color="text-purple-400"
+            color="text-violet-fg"
           />
           <BigMetric
             label="Automation Rate"
@@ -302,12 +302,12 @@ export default function DashboardPage() {
                       <td className="py-4 px-3">
                         <Link href={`/agents/${agent.id}`} className="flex items-center gap-3 hover:text-[var(--color-text-primary)]">
                           <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-                            agent.type === "harness" ? "bg-brand-600/20" : "bg-purple-600/20"
+                            agent.type === "harness" ? "bg-accent-subtle" : "bg-violet-subtle"
                           }`}>
                             {agent.type === "harness" ? (
-                              <Brain className="w-4 h-4 text-brand-400" />
+                              <Brain className="w-4 h-4 text-accent-fg" />
                             ) : (
-                              <Cpu className="w-4 h-4 text-purple-400" />
+                              <Cpu className="w-4 h-4 text-violet-fg" />
                             )}
                           </div>
                           <span className="text-sm text-[var(--color-text-primary)] font-semibold truncate max-w-[200px]">{agent.name}</span>
@@ -321,26 +321,26 @@ export default function DashboardPage() {
                           <span className="text-base font-semibold text-[var(--color-text-muted)]">—</span>
                         ) : (
                           <>
-                            <span className="text-base font-semibold text-cyan-500">{formatNumber(am?.tokensIn || 0)}</span>
+                            <span className="text-base font-semibold text-info-fg">{formatNumber(am?.tokensIn || 0)}</span>
                             <span className="text-[var(--color-text-muted)] mx-1.5">|</span>
-                            <span className="text-base font-semibold text-purple-500">{formatNumber(am?.tokensOut || 0)}</span>
+                            <span className="text-base font-semibold text-violet-fg">{formatNumber(am?.tokensOut || 0)}</span>
                           </>
                         )}
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-lg font-bold text-green-400">{pending ? "—" : (am?.invocations || 0)}</span>
+                        <span className="text-lg font-bold text-success-fg">{pending ? "—" : (am?.invocations || 0)}</span>
                       </td>
                       <td className="text-right py-4 px-3">
                         <span className="text-base font-semibold text-[var(--color-text-primary)]">{pending ? "—" : formatDuration(am?.avgDuration || 0)}</span>
                       </td>
                       <td className="text-right py-4 px-3">
-                        <span className="text-lg font-bold text-emerald-500">{pending ? "—" : formatDuration(am?.totalDuration || 0)}</span>
+                        <span className="text-lg font-bold text-success-fg">{pending ? "—" : formatDuration(am?.totalDuration || 0)}</span>
                       </td>
                       <td className="text-right py-4 px-3">
                         <span className={`px-2 py-1 rounded-full border text-xs font-medium ${
                           agent.status === "ACTIVE" || agent.status === "READY"
-                            ? "bg-green-400/10 text-green-400 border-green-400/30"
-                            : "bg-gray-400/10 text-gray-400 border-gray-400/30"
+                            ? "bg-success-subtle text-success-fg border-success-fg/30"
+                            : "bg-surface-3 text-muted border-theme"
                         }`}>
                           {agent.status}
                         </span>

@@ -17,6 +17,16 @@
   --pipeline-skill: #a855f7;
 }
 
+[data-theme="light"] {
+  --pipeline-bg: #f1f5f9;
+  --pipeline-text: #0f172a;
+  --pipeline-text-secondary: #475569;
+  --pipeline-text-muted: #64748b;
+  --pipeline-text-dim: #94a3b8;
+  --pipeline-card-bg: #ffffff;
+  --pipeline-border: #e2e8f0;
+}
+
 /* ─── Canvas ──────────────────────────────────────────────────────────────── */
 .pipeline-canvas {
   background: var(--pipeline-bg);

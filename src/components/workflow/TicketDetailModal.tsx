@@ -24,13 +24,13 @@ interface TicketDetailModalProps {
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const STATUS_STYLES: Record<string, { dot: string; text: string; label: string }> = {
-  backlog:     { dot: "bg-zinc-500", text: "text-zinc-400", label: "Backlog" },
-  todo:        { dot: "bg-zinc-400", text: "text-zinc-300", label: "To Do" },
-  ready:       { dot: "bg-yellow-400", text: "text-yellow-300", label: "Ready" },
-  in_progress: { dot: "bg-blue-400", text: "text-blue-300", label: "In Progress" },
-  in_review:   { dot: "bg-purple-400", text: "text-purple-300", label: "In Review" },
-  done:        { dot: "bg-green-400", text: "text-green-300", label: "Done" },
-  blocked:     { dot: "bg-red-400", text: "text-red-300", label: "Blocked" },
+  backlog:     { dot: "bg-zinc-500", text: "text-zinc-600 dark:text-zinc-400", label: "Backlog" },
+  todo:        { dot: "bg-zinc-400", text: "text-zinc-600 dark:text-zinc-300", label: "To Do" },
+  ready:       { dot: "bg-yellow-400", text: "text-yellow-700 dark:text-yellow-300", label: "Ready" },
+  in_progress: { dot: "bg-blue-400", text: "text-blue-700 dark:text-blue-300", label: "In Progress" },
+  in_review:   { dot: "bg-purple-400", text: "text-purple-700 dark:text-purple-300", label: "In Review" },
+  done:        { dot: "bg-green-400", text: "text-green-700 dark:text-green-300", label: "Done" },
+  blocked:     { dot: "bg-red-400", text: "text-red-700 dark:text-red-300", label: "Blocked" },
   cancelled:   { dot: "bg-zinc-600", text: "text-zinc-500", label: "Cancelled" },
 };
 
@@ -96,8 +96,8 @@ function TicketDag({ tickets, currentTicketId }: { tickets: DagNode[]; currentTi
           <span
             className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[10px] font-mono ${
               epic.id === currentTicketId
-                ? "border-blue-500/60 bg-blue-500/10 text-blue-300"
-                : "border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-300"
+                ? "border-blue-500/60 bg-blue-500/10 text-blue-700 dark:text-blue-300"
+                : "border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-700 dark:text-fuchsia-300"
             }`}
           >
             <span
@@ -121,7 +121,7 @@ function TicketDag({ tickets, currentTicketId }: { tickets: DagNode[]; currentTi
                 key={t.id}
                 className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10px] font-mono ${
                   isCurrent
-                    ? "border-blue-500/60 bg-blue-500/10 text-blue-300"
+                    ? "border-blue-500/60 bg-blue-500/10 text-blue-700 dark:text-blue-300"
                     : "border-surface-4 bg-[color-mix(in_srgb,var(--color-surface-1)_60%,transparent)] text-secondary"
                 }`}
               >

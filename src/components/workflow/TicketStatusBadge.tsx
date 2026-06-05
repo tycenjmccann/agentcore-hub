@@ -36,13 +36,13 @@ const BORDER_COLOR: Record<TicketStatus, string> = {
 
 // Status-specific text colors: semantic, intentionally hardcoded
 const TEXT_COLOR: Record<TicketStatus, string> = {
-  backlog: "text-zinc-400",
-  todo: "text-zinc-300",
-  ready: "text-yellow-300",
-  in_progress: "text-blue-300",
-  in_review: "text-purple-300",
-  done: "text-green-300",
-  blocked: "text-red-300",
+  backlog: "text-zinc-600 dark:text-zinc-400",
+  todo: "text-zinc-600 dark:text-zinc-300",
+  ready: "text-yellow-700 dark:text-yellow-300",
+  in_progress: "text-blue-700 dark:text-blue-300",
+  in_review: "text-purple-700 dark:text-purple-300",
+  done: "text-green-700 dark:text-green-300",
+  blocked: "text-red-700 dark:text-red-300",
   cancelled: "text-zinc-500",
 };
 

@@ -292,21 +292,21 @@ export default function EvaluationsPage() {
   // Buffer color helper
   function getBufferColor(currentBufferLen: number, batchSize: number): string {
     if (currentBufferLen === 0)
-      return "bg-green-400/20 text-green-400 border-green-400/30";
+      return "bg-success-subtle text-success-fg border-success-fg/30";
     const ratio = currentBufferLen / batchSize;
     if (ratio >= 0.8)
-      return "bg-amber-400/20 text-amber-400 border-amber-400/30";
+      return "bg-warning-subtle text-warning-fg border-warning-fg/30";
     if (ratio >= 0.5)
-      return "bg-yellow-400/20 text-yellow-400 border-yellow-400/30";
-    return "bg-green-400/20 text-green-400 border-green-400/30";
+      return "bg-warning-subtle text-warning-fg border-warning-fg/30";
+    return "bg-success-subtle text-success-fg border-success-fg/30";
   }
 
   // Loading state
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <Loader2 className="w-6 h-6 text-brand-400 animate-spin" />
-        <span className="ml-2 text-sm text-gray-500">
+        <Loader2 className="w-6 h-6 text-accent-fg animate-spin" />
+        <span className="ml-2 text-sm text-muted">
           Loading evaluation config...
         </span>
       </div>
@@ -348,23 +348,23 @@ export default function EvaluationsPage() {
         <div className="flex items-center gap-3">
           <Link
             href="/evaluations"
-            className="flex items-center justify-center w-8 h-8 rounded-lg bg-surface-2 border border-surface-4 hover:border-brand-500/50 hover:text-brand-400 transition-colors text-[var(--color-text-muted)]"
+            className="flex items-center justify-center w-8 h-8 rounded-lg bg-surface-2 border border-theme hover:border-brand-500/50 hover:text-brand-400 transition-colors text-muted"
           >
             <ArrowLeft className="w-4 h-4" />
           </Link>
           <div>
-            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+            <h2 className="text-lg font-semibold text-primary flex items-center gap-2">
               <Activity className="w-5 h-5 text-brand-400" />
               Self-Improvement Settings
             </h2>
-            <p className="text-xs text-gray-500 mt-0.5">
+            <p className="text-xs text-muted mt-0.5">
               Configure per-agent evaluation settings for the improvement loop
             </p>
           </div>
         </div>
         <button
           onClick={() => fetchAgents(false)}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-gray-400 hover:text-white bg-surface-2 border border-surface-4 rounded-lg transition-colors"
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-secondary hover:text-primary bg-surface-2 border border-theme rounded-lg transition-colors"
         >
           <RefreshCw className="w-3 h-3" />
           Refresh
@@ -373,12 +373,12 @@ export default function EvaluationsPage() {
 
       {/* Error State */}
       {error && (
-        <div className="card border-red-500/20 text-center py-8">
-          <AlertCircle className="w-8 h-8 text-red-400/60 mx-auto mb-3" />
-          <p className="text-sm text-red-400">
+        <div className="card border-danger-subtle text-center py-8">
+          <AlertCircle className="w-8 h-8 text-danger-fg mx-auto mb-3" />
+          <p className="text-sm text-danger-fg">
             Failed to load evaluation config
           </p>
-          <p className="text-xs text-gray-500 mt-1">{error}</p>
+          <p className="text-xs text-muted mt-1">{error}</p>
           <button
             onClick={() => fetchAgents(true)}
             className="mt-4 btn-primary text-sm"
@@ -393,10 +393,10 @@ export default function EvaluationsPage() {
         <div className="card">
           <div className="flex items-center justify-between">
             <div>
-              <h3 className="text-sm font-medium text-white">
+              <h3 className="text-sm font-medium text-primary">
                 Self-Improvement Loop
               </h3>
-              <p className="text-xs text-gray-500 mt-0.5">
+              <p className="text-xs text-muted mt-0.5">
                 Master toggle — enable or disable evaluations for all agents at
                 once
               </p>
@@ -414,12 +414,12 @@ export default function EvaluationsPage() {
               ) : bulkEnabled ? (
                 <ToggleRight className="w-8 h-8 text-brand-400" />
               ) : (
-                <ToggleLeft className="w-8 h-8 text-gray-500" />
+                <ToggleLeft className="w-8 h-8 text-muted" />
               )}
               <span
                 className={cn(
                   "text-sm font-medium",
-                  bulkEnabled ? "text-brand-400" : "text-gray-500"
+                  bulkEnabled ? "text-brand-400" : "text-muted"
                 )}
               >
                 {bulkEnabled ? "All Enabled" : "All Disabled"}
@@ -435,28 +435,28 @@ export default function EvaluationsPage() {
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="border-b border-surface-4">
-                  <th className="text-left px-6 py-4 text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                <tr className="border-b border-theme">
+                  <th className="text-left px-6 py-4 text-xs font-semibold text-secondary uppercase tracking-wider">
                     Agent
                   </th>
-                  <th className="text-center px-4 py-4 text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                  <th className="text-center px-4 py-4 text-xs font-semibold text-secondary uppercase tracking-wider">
                     Enabled
                   </th>
-                  <th className="text-center px-4 py-4 text-xs font-semibold text-gray-400 uppercase tracking-wider min-w-[180px]">
+                  <th className="text-center px-4 py-4 text-xs font-semibold text-secondary uppercase tracking-wider min-w-[180px]">
                     Sample Rate
                   </th>
-                  <th className="text-center px-4 py-4 text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                  <th className="text-center px-4 py-4 text-xs font-semibold text-secondary uppercase tracking-wider">
                     Batch Size
                   </th>
-                  <th className="text-center px-4 py-4 text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                  <th className="text-center px-4 py-4 text-xs font-semibold text-secondary uppercase tracking-wider">
                     Buffer
                   </th>
-                  <th className="text-center px-4 py-4 text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                  <th className="text-center px-4 py-4 text-xs font-semibold text-secondary uppercase tracking-wider">
                     Actions
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-surface-4">
+              <tbody className="divide-y divide-[color:var(--color-border)]">
                 {agents.map((agent) => (
                   <AgentRow
                     key={agent.agentId}
@@ -479,11 +479,11 @@ export default function EvaluationsPage() {
       {/* Empty state */}
       {!error && !loading && agents.length === 0 && (
         <div className="card text-center py-12">
-          <Activity className="w-10 h-10 text-gray-600 mx-auto mb-3" />
-          <p className="text-sm text-gray-400">
+          <Activity className="w-10 h-10 text-muted mx-auto mb-3" />
+          <p className="text-sm text-secondary">
             No agents configured for evaluation.
           </p>
-          <p className="text-xs text-gray-600 mt-1">
+          <p className="text-xs text-muted mt-1">
             Agents will appear here once the evaluation system is initialized.
           </p>
         </div>
@@ -553,8 +553,8 @@ function AgentRow({
             <Activity className="w-4 h-4 text-brand-400" />
           </div>
           <div>
-            <p className="font-medium text-white text-sm">{agent.name}</p>
-            <p className="text-xs text-gray-500 font-mono">
+            <p className="font-medium text-primary text-sm">{agent.name}</p>
+            <p className="text-xs text-muted font-mono">
               {agent.agentId}
             </p>
           </div>
@@ -578,7 +578,7 @@ function AgentRow({
           ) : agent.enabled ? (
             <ToggleRight className="w-7 h-7 text-brand-400 cursor-pointer" />
           ) : (
-            <ToggleLeft className="w-7 h-7 text-gray-500 cursor-pointer" />
+            <ToggleLeft className="w-7 h-7 text-muted cursor-pointer" />
           )}
         </button>
       </td>
@@ -600,7 +600,7 @@ function AgentRow({
             disabled={!agent.enabled}
             className="flex-1 h-1.5 bg-surface-4 rounded-lg appearance-none cursor-pointer accent-brand-500 disabled:opacity-50 disabled:cursor-not-allowed"
           />
-          <span className="text-xs font-mono text-gray-300 w-10 text-right">
+          <span className="text-xs font-mono text-secondary w-10 text-right">
             {agent.sampleRate}%
           </span>
         </div>
@@ -617,7 +617,7 @@ function AgentRow({
           onBlur={handleBatchBlur}
           onKeyDown={handleBatchKeyDown}
           disabled={!agent.enabled}
-          className="w-16 bg-surface-1 border border-surface-4 rounded-md px-2 py-1 text-center text-sm text-white font-mono focus:outline-none focus:ring-2 focus:ring-brand-500/50 focus:border-brand-500 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="w-16 bg-surface-1 border border-theme rounded-md px-2 py-1 text-center text-sm text-primary font-mono focus:outline-none focus:ring-2 focus:ring-brand-500/50 focus:border-brand-500 disabled:opacity-50 disabled:cursor-not-allowed"
         />
       </td>
 
@@ -643,8 +643,8 @@ function AgentRow({
           className={cn(
             "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors",
             agent.currentBufferLen === 0 || !agent.enabled
-              ? "bg-surface-3 text-gray-600 cursor-not-allowed"
-              : "bg-red-600/20 text-red-300 border border-red-500/30 hover:bg-red-600/30 cursor-pointer"
+              ? "bg-surface-3 text-muted cursor-not-allowed"
+              : "bg-danger-subtle text-danger-fg border border-danger-fg/30 hover:bg-danger-subtle/70 cursor-pointer"
           )}
         >
           {isFlushing ? (

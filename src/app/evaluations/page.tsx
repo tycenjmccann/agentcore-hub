@@ -281,7 +281,7 @@ export default function EvaluationsPage() {
             <BarChart3 className="w-5 h-5 text-brand-400" />
             Evaluations
           </h1>
-          <p className="text-[11px] font-semibold text-blue-400 uppercase tracking-[0.15em] mt-1.5">
+          <p className="text-[11px] font-semibold text-info-fg uppercase tracking-[0.15em] mt-1.5">
             {agents.length} {agents.length === 1 ? "agent" : "agents"} &nbsp;·&nbsp; {(data?.evaluators?.length ?? 0)} evaluators &nbsp;·&nbsp; Opus 4.7 judge &nbsp;·&nbsp; 100% sampling &nbsp;·&nbsp; last 7 days
           </p>
         </div>
@@ -305,7 +305,7 @@ export default function EvaluationsPage() {
       </div>
 
       {error && (
-        <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 text-red-400 text-xs">
+        <div className="bg-danger-subtle border border-danger-fg/30 rounded-lg px-3 py-2 text-danger-fg text-xs">
           {error}
         </div>
       )}
@@ -329,7 +329,7 @@ export default function EvaluationsPage() {
               <thead>
                 <tr>
                   <td colSpan={agents.length + 2} className="px-3 pt-4 pb-2">
-                    <span className="text-sm font-bold text-emerald-400 uppercase tracking-wider">Self-Improvement Loop</span>
+                    <span className="text-sm font-bold text-success-fg uppercase tracking-wider">Self-Improvement Loop</span>
                   </td>
                 </tr>
               </thead>
@@ -384,7 +384,7 @@ export default function EvaluationsPage() {
               <thead>
                 <tr>
                   <td colSpan={agents.length + 2} className="px-3 pt-6 pb-2">
-                    <span className="text-sm font-bold text-blue-400 uppercase tracking-wider">Operational Metrics</span>
+                    <span className="text-sm font-bold text-info-fg uppercase tracking-wider">Operational Metrics</span>
                   </td>
                 </tr>
                 {columnHeaders}
@@ -469,7 +469,7 @@ export default function EvaluationsPage() {
                   <thead>
                     <tr>
                       <td colSpan={agents.length + 2} className="px-3 pt-6 pb-2">
-                        <span className="text-sm font-bold text-emerald-400 uppercase tracking-wider">Evaluator Scores</span>
+                        <span className="text-sm font-bold text-success-fg uppercase tracking-wider">Evaluator Scores</span>
                       </td>
                     </tr>
                     <tr className="border-b border-white/[0.06]">
@@ -576,7 +576,7 @@ export default function EvaluationsPage() {
           {/* Footer */}
           <div className="px-3 py-2 border-t border-white/[0.06] flex items-center justify-between text-[11px] text-[var(--color-text-muted)]">
             <span>Updated: {data?.lastUpdated ? new Date(data.lastUpdated).toLocaleTimeString() : "—"}</span>
-            <span>Scores: <span className="text-emerald-400">≥90%</span> · <span className="text-amber-400">≥75%</span> · <span className="text-red-400">&lt;75%</span></span>
+            <span>Scores: <span className="text-success-fg">≥90%</span> · <span className="text-warning-fg">≥75%</span> · <span className="text-danger-fg">&lt;75%</span></span>
           </div>
         </div>
       )}

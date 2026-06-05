@@ -1,5 +1,6 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
+  darkMode: ['selector', '[data-theme="dark"]'],
   content: [
     "./src/pages/**/*.{js,ts,jsx,tsx,mdx}",
     "./src/components/**/*.{js,ts,jsx,tsx,mdx}",
@@ -27,6 +28,18 @@ module.exports = {
           3: "var(--color-surface-3)",
           4: "var(--color-surface-4)",
         },
+        "accent-fg": "var(--accent-fg)",
+        "accent-subtle": "var(--accent-subtle)",
+        "info-fg": "var(--info-fg)",
+        "info-subtle": "var(--info-subtle)",
+        "success-fg": "var(--success-fg)",
+        "success-subtle": "var(--success-subtle)",
+        "warning-fg": "var(--warning-fg)",
+        "warning-subtle": "var(--warning-subtle)",
+        "danger-fg": "var(--danger-fg)",
+        "danger-subtle": "var(--danger-subtle)",
+        "violet-fg": "var(--violet-fg)",
+        "violet-subtle": "var(--violet-subtle)",
       },
       textColor: {
         primary: "var(--color-text-primary)",
