@@ -34,7 +34,9 @@ const BORDER_COLOR: Record<TicketStatus, string> = {
   cancelled: "border-zinc-600/30",
 };
 
-// Status-specific text colors: semantic, intentionally hardcoded
+// Status-specific text colors use dark: prefixes rather than CSS-variable tokens
+// because each status needs a unique color pair that doesn't map to the 6 intent
+// tokens (accent/info/success/warning/danger/violet). This is an accepted trade-off.
 const TEXT_COLOR: Record<TicketStatus, string> = {
   backlog: "text-zinc-600 dark:text-zinc-400",
   todo: "text-zinc-600 dark:text-zinc-300",

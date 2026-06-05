@@ -1460,10 +1460,14 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
 }
 
 // ─── Styles ──────────────────────────────────────────────────────────────────
+// Shared base colors (--pl-bg, --pl-card, --pl-border, --pl-text, --pl-text-2/3/4)
+// are derived from --pipeline-* variables defined in pipeline.css, so they
+// automatically track light/dark theme. Only pipeline-viz-specific tokens are
+// duplicated here.
 
 const PIPELINE_STYLES = `
-:root{--pl-bg:#0f1419;--pl-card:#1a2332;--pl-item-bg:rgba(26,35,50,0.4);--pl-border:#1e293b;--pl-border-strong:#334155;--pl-text:#e2e8f0;--pl-text-strong:#ffffff;--pl-text-2:#94a3b8;--pl-text-3:#64748b;--pl-text-4:#475569;--pl-dim-inactive:0.35;--pl-dim-done:0.8;--pl-active-bg:rgba(14,165,233,0.06);--pl-active-border:rgba(14,165,233,0.25);--pl-hover-bg:rgba(14,165,233,0.09);--pl-working-bg:rgba(14,165,233,0.05);--pl-item-active-label:#cbd5e1;--pl-flow-show:0.6}
-[data-theme="light"]{--pl-bg:#f1f5f9;--pl-card:#ffffff;--pl-item-bg:rgba(148,163,184,0.13);--pl-border:#e2e8f0;--pl-border-strong:#cbd5e1;--pl-text:#0f172a;--pl-text-strong:#0f172a;--pl-text-2:#475569;--pl-text-3:#64748b;--pl-text-4:#94a3b8;--pl-dim-inactive:0.55;--pl-dim-done:0.9;--pl-active-bg:rgba(14,165,233,0.14);--pl-active-border:rgba(14,165,233,0.5);--pl-hover-bg:rgba(14,165,233,0.18);--pl-working-bg:rgba(14,165,233,0.12);--pl-item-active-label:#0f172a;--pl-flow-show:0.85}
+:root{--pl-bg:var(--pipeline-bg);--pl-card:var(--pipeline-card-bg);--pl-item-bg:rgba(26,35,50,0.4);--pl-border:var(--pipeline-border);--pl-border-strong:#334155;--pl-text:var(--pipeline-text);--pl-text-strong:#ffffff;--pl-text-2:var(--pipeline-text-secondary);--pl-text-3:var(--pipeline-text-muted);--pl-text-4:var(--pipeline-text-dim);--pl-dim-inactive:0.35;--pl-dim-done:0.8;--pl-active-bg:rgba(14,165,233,0.06);--pl-active-border:rgba(14,165,233,0.25);--pl-hover-bg:rgba(14,165,233,0.09);--pl-working-bg:rgba(14,165,233,0.05);--pl-item-active-label:#cbd5e1;--pl-flow-show:0.6}
+[data-theme="light"]{--pl-item-bg:rgba(148,163,184,0.13);--pl-border-strong:#cbd5e1;--pl-text-strong:#0f172a;--pl-dim-inactive:0.55;--pl-dim-done:0.9;--pl-active-bg:rgba(14,165,233,0.14);--pl-active-border:rgba(14,165,233,0.5);--pl-hover-bg:rgba(14,165,233,0.18);--pl-working-bg:rgba(14,165,233,0.12);--pl-item-active-label:#0f172a;--pl-flow-show:0.85}
 .pipeline-viz{display:flex;flex-direction:column;align-items:center;min-height:100vh;overflow-x:auto;padding:14px 20px;background:var(--pl-bg);color:var(--pl-text);font-family:"Segoe UI",system-ui,sans-serif}
 .pipeline-title{display:none}
 .pipeline-subtitle{display:none}
@@ -1502,10 +1506,10 @@ const PIPELINE_STYLES = `
 .card-stats .stat-row{font-size:11px;color:var(--pl-text-2);line-height:1.6}
 .card-eval{font-size:11px;color:var(--pl-text-3);padding-top:6px;border-top:1px solid var(--pl-border)}
 .eval-active{color:#22c55e;font-weight:500}
-.eval-inactive{color:#64748b}
+.eval-inactive{color:var(--pl-text-3)}
 .eval-dot{margin-left:4px}
 .eval-dot.active{color:#22c55e}
-.eval-dot.inactive{color:#475569}
+.eval-dot.inactive{color:var(--pl-text-4)}
 
 .work-area{width:100%;margin-top:8px;display:flex;flex-direction:column;gap:3px}
 .sec-label{font-size:7px;color:var(--pl-text-4);letter-spacing:1.5px;text-transform:uppercase;margin-top:6px;margin-bottom:2px;padding-left:3px}
@@ -1534,7 +1538,7 @@ const PIPELINE_STYLES = `
 .svc-icon{width:16px;height:16px;border-radius:2px;object-fit:contain;flex-shrink:0}
 .item-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .item-dot.skill{background:#a855f7}
-.item-dot.ext{background:#64748b}
+.item-dot.ext{background:var(--pl-text-3)}
 
 .item-label{font-size:10px;font-weight:500;color:var(--pl-text-2);line-height:1.15;transition:color .3s}
 .item.active .item-label{color:var(--pl-text)}

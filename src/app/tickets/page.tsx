@@ -87,8 +87,8 @@ function formatAgentName(raw: string | undefined): string {
 
 const traceEventConfig: Record<string, { icon: typeof Terminal; color: string; label: string }> = {
   agent_invoke: { icon: Bot, color: "text-accent-fg", label: "Agent Invoke" },
-  model_call: { icon: Brain, color: "text-info-fg", label: "LLM Call" },
-  tool_call: { icon: Wrench, color: "text-violet-fg", label: "Tool Call" },
+  model_call: { icon: Brain, color: "text-violet-fg", label: "LLM Call" },
+  tool_call: { icon: Wrench, color: "text-warning-fg", label: "Tool Call" },
   cycle: { icon: Activity, color: "text-info-fg", label: "Cycle" },
   request: { icon: Zap, color: "text-accent-fg", label: "Request" },
   service_call: { icon: Database, color: "text-muted", label: "Service Call" },
@@ -96,8 +96,8 @@ const traceEventConfig: Record<string, { icon: typeof Terminal; color: string; l
   internal: { icon: Cpu, color: "text-muted", label: "Internal" },
   span: { icon: Activity, color: "text-muted", label: "Span" },
   user_input: { icon: Terminal, color: "text-info-fg", label: "User Input" },
-  message_start: { icon: Brain, color: "text-info-fg", label: "Thinking" },
-  tool_start: { icon: Terminal, color: "text-violet-fg", label: "Tool Call" },
+  message_start: { icon: Brain, color: "text-violet-fg", label: "Thinking" },
+  tool_start: { icon: Terminal, color: "text-warning-fg", label: "Tool Call" },
   block_stop: { icon: Zap, color: "text-muted", label: "Block Complete" },
   response: { icon: Bot, color: "text-success-fg", label: "Response" },
   usage: { icon: Cpu, color: "text-info-fg", label: "Token Usage" },
@@ -106,8 +106,8 @@ const traceEventConfig: Record<string, { icon: typeof Terminal; color: string; l
 };
 
 function getSpanColor(event: string): string {
-  if (event === "tool_call" || event === "tool_start") return "border-l-purple-500";
-  if (event === "model_call" || event === "message_start") return "border-l-blue-500";
+  if (event === "tool_call" || event === "tool_start") return "border-l-amber-500";
+  if (event === "model_call" || event === "message_start") return "border-l-violet-500";
   if (event === "service_call" || event === "http") return "border-l-gray-500";
   if (event === "error") return "border-l-red-500";
   return "border-l-gray-700";

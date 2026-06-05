@@ -23,6 +23,7 @@ interface TicketDetailModalProps {
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
+// Status-specific colors use dark: prefixes — see TicketStatusBadge.tsx for rationale.
 const STATUS_STYLES: Record<string, { dot: string; text: string; label: string }> = {
   backlog:     { dot: "bg-zinc-500", text: "text-zinc-600 dark:text-zinc-400", label: "Backlog" },
   todo:        { dot: "bg-zinc-400", text: "text-zinc-600 dark:text-zinc-300", label: "To Do" },
