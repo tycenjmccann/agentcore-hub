@@ -3,7 +3,11 @@ import { test, expect } from "@playwright/test";
 test.describe("AgentCore Hub - UI Smoke Tests", () => {
   test("Dashboard renders with agent activity metrics", async ({ page }) => {
     await page.goto("/");
-    await expect(page.locator("h1")).toContainText("AgentCore Hub");
+    // h1 renders NEXT_PUBLIC_BRAND_NAME (installer-configurable), falling back
+    // to "AgentCore Hub". Read the same source the app does — a custom brand is
+    // a healthy app, not a bug.
+    const expectedBrand = process.env.NEXT_PUBLIC_BRAND_NAME || "AgentCore Hub";
+    await expect(page.locator("h1")).toContainText(expectedBrand);
     // Navigation
     await expect(page.locator("[data-testid='nav-dashboard']")).toBeVisible();
     await expect(page.locator("[data-testid='nav-agents']")).toBeVisible();
