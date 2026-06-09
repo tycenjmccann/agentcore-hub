@@ -4,6 +4,8 @@ import { getWorkflowFromDynamo, getTicketsForWorkflowFromDynamo } from "@/lib/wo
 
 export const dynamic = "force-dynamic";
 
+const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
+
 const VALID_STATUSES = ["todo", "ready", "in_progress", "done", "blocked"];
 
 // Simplified flow: todo → ready → in_progress → done  (+blocked as escape hatch)
@@ -51,31 +53,35 @@ export async function POST(
     return NextResponse.json({ error: "Workflow not found" }, { status: 404 });
   }
 
-  // Look up ticket and its current status
-  const tickets = await getTicketsForWorkflowFromDynamo(params.id);
-  const ticket = tickets.find((t) => (t as Record<string, unknown>).ticketId === ticketId);
-  if (!ticket) {
-    return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
-  }
-
-  // Validate transition is legal
-  const currentStatus = ticket.status as string;
-  const allowedTransitions = VALID_TRANSITIONS[currentStatus] || [];
-  if (!allowedTransitions.includes(targetStatus)) {
-    return NextResponse.json(
-      { error: `Invalid transition from ${currentStatus} to ${targetStatus}` },
-      { status: 400 }
-    );
+  // In jira mode tickets live in Jira (no DynamoDB tickets table). The ticket
+  // Lambda validates transition legality against Jira's live transitions, so we
+  // skip the DDB pre-check here. In dynamodb mode we still validate locally.
+  if (TICKET_PROVIDER !== "jira") {
+    const tickets = await getTicketsForWorkflowFromDynamo(params.id);
+    const ticket = tickets.find((t) => (t as Record<string, unknown>).ticketId === ticketId);
+    if (!ticket) {
+      return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
+    }
+    const currentStatus = ticket.status as string;
+    const allowedTransitions = VALID_TRANSITIONS[currentStatus] || [];
+    if (!allowedTransitions.includes(targetStatus)) {
+      return NextResponse.json(
+        { error: `Invalid transition from ${currentStatus} to ${targetStatus}` },
+        { status: 400 }
+      );
+    }
   }
 
   // Invoke the agentcore-hub-tickets Lambda
   const lambda = new LambdaClient({ region: process.env.AWS_REGION || "us-east-1" });
 
   const payload = {
-    action: "Tickets___transition_ticket",
-    ticket_id: ticketId,
-    transition_id: targetStatus,
-    reason: comment || "Manual override from console",
+    tool_name: "Tickets___transition_ticket",
+    parameters: {
+      ticket_id: ticketId,
+      transition_id: targetStatus,
+      reason: comment || "Manual override from console",
+    },
   };
 
   try {

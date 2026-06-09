@@ -10,9 +10,52 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_requirements_analyst",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["requirements-engineering"],
-      "blueprints": ["requirements-analyst", "bug-fix-requirements"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "requirements-engineering"
+      ],
+      "blueprints": [
+        "requirements-analyst",
+        "bug-fix-requirements"
+      ]
     },
     {
       "agentId": "agentcore_hub_ios_designer",
@@ -24,9 +67,51 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_ios_designer",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["apple-hig-expert"],
-      "blueprints": ["ios-designer"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "apple-hig-expert"
+      ],
+      "blueprints": [
+        "ios-designer"
+      ]
     },
     {
       "agentId": "agentcore_hub_backend_designer",
@@ -38,9 +123,52 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_backend_designer",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["backend-architecture", "aws-serverless-backend"],
-      "blueprints": ["backend-designer"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "backend-architecture",
+        "aws-serverless-backend"
+      ],
+      "blueprints": [
+        "backend-designer"
+      ]
     },
     {
       "agentId": "agentcore_hub_frontend_designer",
@@ -52,9 +180,51 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_frontend_designer",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["frontend-design"],
-      "blueprints": ["frontend-designer"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "frontend-design"
+      ],
+      "blueprints": [
+        "frontend-designer"
+      ]
     },
     {
       "agentId": "agentcore_hub_android_designer",
@@ -66,9 +236,51 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_android_designer",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["android-jetpack-compose"],
-      "blueprints": ["android-designer"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "android-jetpack-compose"
+      ],
+      "blueprints": [
+        "android-designer"
+      ]
     },
     {
       "agentId": "agentcore_hub_security_reviewer",
@@ -80,9 +292,51 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_security_reviewer",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["security-review"],
-      "blueprints": ["security-reviewer"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "security-review"
+      ],
+      "blueprints": [
+        "security-reviewer"
+      ]
     },
     {
       "agentId": "agentcore_hub_legal_compliance",
@@ -94,9 +348,51 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_legal_compliance",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["governance-risk-compliance"],
-      "blueprints": ["legal-compliance"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "governance-risk-compliance"
+      ],
+      "blueprints": [
+        "legal-compliance"
+      ]
     },
     {
       "agentId": "agentcore_hub_localization",
@@ -108,9 +404,51 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_localization",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["i18n-localization"],
-      "blueprints": ["localization"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "i18n-localization"
+      ],
+      "blueprints": [
+        "localization"
+      ]
     },
     {
       "agentId": "agentcore_hub_analytics_designer",
@@ -122,9 +460,51 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_analytics_designer",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["analytics-observability"],
-      "blueprints": ["analytics-designer"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "analytics-observability"
+      ],
+      "blueprints": [
+        "analytics-designer"
+      ]
     },
     {
       "agentId": "agentcore_hub_backend_dev",
@@ -136,9 +516,52 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_backend_dev",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["backend-architecture", "aws-serverless-backend"],
-      "blueprints": ["backend-dev"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "backend-architecture",
+        "aws-serverless-backend"
+      ],
+      "blueprints": [
+        "backend-dev"
+      ]
     },
     {
       "agentId": "agentcore_hub_api_dev",
@@ -150,9 +573,51 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_api_dev",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["api-design-reviewer"],
-      "blueprints": ["api-dev"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "api-design-reviewer"
+      ],
+      "blueprints": [
+        "api-dev"
+      ]
     },
     {
       "agentId": "agentcore_hub_frontend_dev",
@@ -164,9 +629,52 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_frontend_dev",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["typescript-react-patterns", "frontend-design"],
-      "blueprints": ["frontend-dev"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "typescript-react-patterns",
+        "frontend-design"
+      ],
+      "blueprints": [
+        "frontend-dev"
+      ]
     },
     {
       "agentId": "agentcore_hub_qa_verifier",
@@ -178,9 +686,51 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_qa_verifier",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["qa-test-coverage"],
-      "blueprints": ["qa-verifier"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "qa-test-coverage"
+      ],
+      "blueprints": [
+        "qa-verifier"
+      ]
     },
     {
       "agentId": "agentcore_hub_ci_agent",
@@ -192,9 +742,715 @@
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_ci_agent",
       "runtimeArn": null,
-      "tools": ["S3Storage___list_objects", "S3Storage___read_object", "S3Storage___write_object", "Tickets___add_comment", "Tickets___create_ticket", "Tickets___list_tickets", "Tickets___search_issues", "Tickets___transition_ticket", "Tickets___update_ticket", "WorkflowOutput___report_completion", "WorkflowOutput___save_design_doc", "WorkflowOutput___submit_ticket_plan", "browser", "calculator", "claude_code", "code_interpreter", "create_branch", "create_or_update_file", "create_pull_request", "current_time", "download_s3_file", "editor", "environment", "file_read", "file_write", "get_file_contents", "get_me", "http_request", "image_reader", "list_branches", "load_blueprint", "push_files", "python_repl", "retrieve", "search_code", "search_repositories", "shell"],
-      "skills": ["ci-cd-pipelines"],
-      "blueprints": ["ci-agent"]
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "calculator",
+        "claude_code",
+        "code_interpreter",
+        "create_branch",
+        "create_or_update_file",
+        "create_pull_request",
+        "current_time",
+        "download_s3_file",
+        "editor",
+        "environment",
+        "file_read",
+        "file_write",
+        "get_file_contents",
+        "get_me",
+        "http_request",
+        "image_reader",
+        "list_branches",
+        "load_blueprint",
+        "push_files",
+        "python_repl",
+        "retrieve",
+        "search_code",
+        "search_repositories",
+        "shell"
+      ],
+      "skills": [
+        "ci-cd-pipelines"
+      ],
+      "blueprints": [
+        "ci-agent"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_marketing_strategist",
+      "displayName": "Marketing Strategist",
+      "description": "Turn a raw idea into a campaign brief: audience, channels, positioning, and the ticket plan for the creative team",
+      "phase": "strategy",
+      "workflowDefId": "marketing",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_marketing_strategist",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "content-strategy"
+      ],
+      "blueprints": [
+        "marketing-strategist"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_social_copywriter",
+      "displayName": "Social Copywriter",
+      "description": "Write platform-native social posts, captions, hooks, and CTAs from the campaign brief",
+      "phase": "creative",
+      "workflowDefId": "marketing",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_social_copywriter",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "copywriting"
+      ],
+      "blueprints": [
+        "social-copywriter"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_blog_writer",
+      "displayName": "Blog Writer",
+      "description": "Write the long-form blog/article content (SEO-aware) supporting the campaign",
+      "phase": "creative",
+      "workflowDefId": "marketing",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_blog_writer",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "copywriting"
+      ],
+      "blueprints": [
+        "blog-writer"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_ad_copywriter",
+      "displayName": "Ad Copywriter",
+      "description": "Write paid-ad variants (headlines, primary text, CTAs) for the campaign's ad channels",
+      "phase": "creative",
+      "workflowDefId": "marketing",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_ad_copywriter",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "copywriting"
+      ],
+      "blueprints": [
+        "ad-copywriter"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_content_designer",
+      "displayName": "Content Designer",
+      "description": "Generate the visual/media assets (images, thumbnails, ad creative) to accompany approved copy",
+      "phase": "generation",
+      "workflowDefId": "marketing",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_content_designer",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "browser",
+        "code_interpreter",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "python_repl",
+        "retrieve"
+      ],
+      "skills": [
+        "content-generation"
+      ],
+      "blueprints": [
+        "content-designer"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_brand_qa",
+      "displayName": "Brand QA Reviewer",
+      "description": "Brand/voice, factual, and compliance review of copy + assets across all channels before scheduling",
+      "phase": "verification",
+      "workflowDefId": "marketing",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_brand_qa",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "content-qa"
+      ],
+      "blueprints": [
+        "brand-qa"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_campaign_scheduler",
+      "displayName": "Campaign Scheduler",
+      "description": "Schedule approved content to each channel at optimal times and record the publishing plan",
+      "phase": "scheduling",
+      "workflowDefId": "marketing",
+      "type": "runtime",
+      "model": "Claude Sonnet 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_campaign_scheduler",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "current_time",
+        "http_request",
+        "load_blueprint"
+      ],
+      "skills": [
+        "social-scheduling"
+      ],
+      "blueprints": [
+        "campaign-scheduler"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_deal_qualifier",
+      "displayName": "Deal Qualifier",
+      "description": "Qualify an inbound RFP/opportunity (fit, scope, requirements) and plan the proposal tickets",
+      "phase": "qualification",
+      "workflowDefId": "sales",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_deal_qualifier",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "deal-qualification"
+      ],
+      "blueprints": [
+        "deal-qualifier"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_proposal_writer",
+      "displayName": "Proposal Writer",
+      "description": "Draft the proposal narrative: executive summary, scope, value proposition, and terms",
+      "phase": "drafting",
+      "workflowDefId": "sales",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_proposal_writer",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "proposal-writing"
+      ],
+      "blueprints": [
+        "proposal-writer"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_solution_engineer",
+      "displayName": "Solution Engineer",
+      "description": "Draft the technical solution / SOW: architecture, deliverables, timeline, and assumptions",
+      "phase": "drafting",
+      "workflowDefId": "sales",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_solution_engineer",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "solution-design"
+      ],
+      "blueprints": [
+        "solution-engineer"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_pricing_analyst",
+      "displayName": "Pricing Analyst",
+      "description": "Build and review pricing: cost model, discounting, margin check against guardrails",
+      "phase": "review",
+      "workflowDefId": "sales",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_pricing_analyst",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "pricing-analysis"
+      ],
+      "blueprints": [
+        "pricing-analyst"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_deal_desk_reviewer",
+      "displayName": "Deal Desk Reviewer",
+      "description": "Review the full proposal for completeness, risk, and policy compliance before approval",
+      "phase": "review",
+      "workflowDefId": "sales",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_deal_desk_reviewer",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "deal-review"
+      ],
+      "blueprints": [
+        "deal-desk-reviewer"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_sales_approver",
+      "displayName": "Sales Approver",
+      "description": "Final approval gate: confirm the proposal meets policy and record the approval/publishing decision",
+      "phase": "approval",
+      "workflowDefId": "sales",
+      "type": "runtime",
+      "model": "Claude Sonnet 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_sales_approver",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "current_time",
+        "http_request",
+        "load_blueprint"
+      ],
+      "skills": [
+        "deal-approval"
+      ],
+      "blueprints": [
+        "sales-approver"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_legal_intake",
+      "displayName": "Legal Intake",
+      "description": "Triage an inbound contract: classify type/risk, extract key terms, and plan the review tickets",
+      "phase": "triage",
+      "workflowDefId": "legal",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_legal_intake",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___search_issues",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "WorkflowOutput___submit_ticket_plan",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "legal-triage"
+      ],
+      "blueprints": [
+        "legal-intake"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_contract_reviewer",
+      "displayName": "Contract Reviewer",
+      "description": "Review contractual terms (liability, indemnity, termination, IP) and flag issues",
+      "phase": "review",
+      "workflowDefId": "legal",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_contract_reviewer",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "contract-review"
+      ],
+      "blueprints": [
+        "contract-reviewer"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_risk_analyst",
+      "displayName": "Risk Analyst",
+      "description": "Assess commercial and operational risk in the contract and rate severity",
+      "phase": "review",
+      "workflowDefId": "legal",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_risk_analyst",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "risk-analysis"
+      ],
+      "blueprints": [
+        "risk-analyst"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_privacy_reviewer",
+      "displayName": "Privacy Reviewer",
+      "description": "Review data-protection and privacy clauses (GDPR/CCPA, DPAs) and flag gaps",
+      "phase": "review",
+      "workflowDefId": "legal",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_privacy_reviewer",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___create_ticket",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "privacy-compliance"
+      ],
+      "blueprints": [
+        "privacy-reviewer"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_redline_drafter",
+      "displayName": "Redline Drafter",
+      "description": "Draft redlines and fallback language resolving the issues raised in review",
+      "phase": "redline",
+      "workflowDefId": "legal",
+      "type": "runtime",
+      "model": "Claude Opus 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_redline_drafter",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "WorkflowOutput___save_design_doc",
+        "browser",
+        "current_time",
+        "http_request",
+        "image_reader",
+        "load_blueprint",
+        "retrieve"
+      ],
+      "skills": [
+        "contract-redlining"
+      ],
+      "blueprints": [
+        "redline-drafter"
+      ]
+    },
+    {
+      "agentId": "agentcore_hub_legal_approver",
+      "displayName": "Legal Approver",
+      "description": "Final sign-off gate: confirm all issues are resolved and record the approval decision",
+      "phase": "signoff",
+      "workflowDefId": "legal",
+      "type": "runtime",
+      "model": "Claude Sonnet 4.6",
+      "evaluationsEnabled": false,
+      "evalConfigName": "eval_agentcore_hub_legal_approver",
+      "runtimeArn": null,
+      "tools": [
+        "S3Storage___list_objects",
+        "S3Storage___read_object",
+        "S3Storage___write_object",
+        "Tickets___add_comment",
+        "Tickets___list_tickets",
+        "Tickets___transition_ticket",
+        "Tickets___update_ticket",
+        "WorkflowOutput___report_completion",
+        "current_time",
+        "http_request",
+        "load_blueprint"
+      ],
+      "skills": [
+        "legal-signoff"
+      ],
+      "blueprints": [
+        "legal-approver"
+      ]
     }
   ],
   "defaults": {

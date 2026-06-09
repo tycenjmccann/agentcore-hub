@@ -5,6 +5,15 @@ import type { WorkflowInput, IntakeSource, RepoConfig, RepoLayout } from "@/lib/
 import type { ModelOption, ModelsApiResponse } from "@/lib/workflow/model-config";
 import { modelOptionToOverride } from "@/lib/workflow/model-config";
 
+interface WorkflowDefOption {
+  id: string;
+  name: string;
+  description: string;
+  icon: string;
+  requiresRepo: boolean;
+  phases: { id: string; name: string; type: string }[];
+}
+
 interface IntakeFormProps {
   onSubmit: (input: WorkflowInput) => void;
   isLoading?: boolean;
@@ -18,6 +27,24 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
   const [repoLayout, setRepoLayout] = useState<RepoLayout>("monorepo");
   const [repoUrl, setRepoUrl] = useState("");
   const [defaultBranch, setDefaultBranch] = useState("main");
+
+  // Workflow definition (shape) selection
+  const [workflowDefs, setWorkflowDefs] = useState<WorkflowDefOption[]>([]);
+  const [selectedDefId, setSelectedDefId] = useState<string>("");
+
+  useEffect(() => {
+    fetch("/api/workflow/definitions")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!data?.workflows) return;
+        setWorkflowDefs(data.workflows);
+        setSelectedDefId(data.defaultWorkflowDefId || data.workflows[0]?.id || "");
+      })
+      .catch(() => { /* selector hidden on failure → default workflow used */ });
+  }, []);
+
+  const selectedDef = workflowDefs.find((w) => w.id === selectedDefId);
+  const requiresRepo = selectedDef?.requiresRepo ?? true;
 
   // Model selection state
   const [models, setModels] = useState<ModelOption[]>([]);
@@ -91,6 +118,7 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
       sources,
       // Only include modelOverride if a non-default model is selected
       ...(modelOverride && { modelOverride }),
+      ...(selectedDefId && { workflowDefId: selectedDefId }),
     });
   };
 
@@ -107,6 +135,45 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
           Provide product input and the agent team will handle requirements, design, and implementation.
         </p>
       </div>
+
+      {/* Workflow Definition (shape) selector — only when >1 definition exists */}
+      {workflowDefs.length > 1 && (
+        <div>
+          <label className="block text-sm font-medium text-secondary mb-1">
+            Workflow
+          </label>
+          <p className="text-xs text-muted mb-2">
+            Choose which agent pipeline runs this request.
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {workflowDefs.map((def) => {
+              const active = def.id === selectedDefId;
+              return (
+                <button
+                  key={def.id}
+                  type="button"
+                  onClick={() => setSelectedDefId(def.id)}
+                  data-testid={`workflow-def-${def.id}`}
+                  className={`text-left px-3 py-2.5 rounded-lg border transition-colors ${
+                    active
+                      ? "border-brand-500 bg-blue-600/10"
+                      : "border-theme bg-surface-1 hover:border-brand-500/40"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-sm font-medium text-primary">{def.name}</span>
+                    {active && <span className="text-[10px] text-blue-400 font-semibold uppercase">Selected</span>}
+                  </div>
+                  <p className="text-xs text-muted mt-0.5 line-clamp-2">{def.description}</p>
+                  <p className="text-[10px] text-secondary mt-1.5 font-mono">
+                    {def.phases.map((p) => p.name).join(" → ")}
+                  </p>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Title */}
       <div>
@@ -183,7 +250,8 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
         )}
       </div>
 
-      {/* Repo Config */}
+      {/* Repo Config — only for workflows that touch a git repo */}
+      {requiresRepo && (
       <div>
         <label className="block text-sm font-medium text-secondary mb-1">
           Target Repository
@@ -231,6 +299,7 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
           />
         </div>
       </div>
+      )}
 
       {/* Model Selection - only show if models loaded successfully */}
       {!modelsError && (

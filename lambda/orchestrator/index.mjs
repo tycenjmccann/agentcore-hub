@@ -94,6 +94,7 @@ async function loadAgentRoster() {
       agentId: a.agentId,
       phase: a.phase,
       runtimeArn: a.runtimeArn || null,
+      workflowDefId: a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID,
     }));
     console.log(`[orchestrator] Loaded ${_agentRoster.length} agents from S3 config`);
   } catch (err) {
@@ -108,11 +109,70 @@ function getAgentDef(id) {
   return roster.find((a) => a.agentId === id);
 }
 
+// ─── Workflow Definitions (config-driven shapes, from S3) ─────────────────────
+
+const DEFAULT_WORKFLOW_DEF_ID = "software-delivery";
+
+// Reproduces the original hardcoded 14-agent pipeline exactly. Used as fallback
+// and whenever a workflow has no (or an unknown) workflowDefId.
+const FALLBACK_WORKFLOW_DEF = {
+  id: DEFAULT_WORKFLOW_DEF_ID,
+  intakeAgentId: "agentcore_hub_requirements_analyst",
+  featureBranchPhase: "development",
+  createsPullRequest: true,
+  completionRequiresAgentPhases: ["development", "verification", "review"],
+  phaseOrder: ["intake", "requirements", "design", "development", "verification", "review", "complete"],
+};
+
+let _workflowDefs = null;
+
+async function loadWorkflowDefs() {
+  if (_workflowDefs) return _workflowDefs;
+  _workflowDefs = { [DEFAULT_WORKFLOW_DEF_ID]: FALLBACK_WORKFLOW_DEF };
+  if (!ARTIFACT_BUCKET) return _workflowDefs;
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: "config/workflows.json",
+    }));
+    const config = JSON.parse(await res.Body.transformToString());
+    for (const w of config.workflows || []) {
+      // Derive the monotonic phase-advancement order from the def's phases.
+      const order = ["intake"];
+      for (const p of w.phases || []) {
+        if (p.agentPhase && p.agentPhase !== "intake" && !order.includes(p.agentPhase)) {
+          order.push(p.agentPhase);
+        }
+      }
+      order.push("complete");
+      _workflowDefs[w.id] = {
+        id: w.id,
+        intakeAgentId: w.intakeAgentId,
+        featureBranchPhase: w.featureBranchPhase ?? null,
+        createsPullRequest: w.createsPullRequest ?? false,
+        completionRequiresAgentPhases: w.completionRequiresAgentPhases || [],
+        phaseOrder: order,
+      };
+    }
+    console.log(`[orchestrator] Loaded ${Object.keys(_workflowDefs).length} workflow definitions from S3`);
+  } catch (err) {
+    console.warn(`[orchestrator] Failed to load workflow defs from S3: ${err.message} — using fallback only`);
+  }
+  return _workflowDefs;
+}
+
+/** Resolve a workflow def by id with fallback to the default (software-delivery). */
+function getWorkflowDef(id) {
+  const defs = _workflowDefs || { [DEFAULT_WORKFLOW_DEF_ID]: FALLBACK_WORKFLOW_DEF };
+  return defs[id] || defs[DEFAULT_WORKFLOW_DEF_ID] || FALLBACK_WORKFLOW_DEF;
+}
+
 // ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
 
 export const handler = async (event) => {
-  // Load roster from S3 on first invocation (cached for warm starts)
+  // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
+  await loadWorkflowDefs();
 
   // Direct invocation from Jira webhook (TICKET_PROVIDER=jira ONLY)
   if (event.source === "jira-webhook") {
@@ -321,7 +381,7 @@ async function handleTicketDoneUnified(ticketId) {
   }
 
   // Always check workflow completion — the last ticket to close triggers this
-  if (await isWorkflowComplete(parentId)) {
+  if (await isWorkflowComplete(parentId, workflow)) {
     await completeWorkflow(workflow);
   }
 }
@@ -388,16 +448,17 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     console.warn(`[orchestrator] Manifest init failed (non-fatal): ${err.message}`);
   }
 
-  // Phase advancement
-  const phaseOrder = ["intake", "requirements", "design", "development", "verification", "review", "complete"];
+  // Phase advancement (workflow-def driven, with software-delivery fallback)
+  const wfDef = getWorkflowDef(workflow.workflowDefId);
+  const phaseOrder = wfDef.phaseOrder;
   const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
   if (agentPhaseIdx > currentPhaseIdx) {
     workflow.phase = agentDef.phase;
     await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
 
-    // Feature branch on dev phase entry
-    if (agentDef.phase === "development" && !workflow.featureBranch) {
+    // Feature branch on the def's branch phase entry (repo-backed workflows only)
+    if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
       try {
         const { owner, repo } = parseRepoUrl(workflow.repoConfig);
         const baseBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
@@ -663,7 +724,7 @@ async function handleTicketDone(ticketId, image) {
 
   // Check if workflow is complete (all tickets done)
   if (unblocked.length === 0) {
-    if (await isWorkflowComplete(parentId)) {
+    if (await isWorkflowComplete(parentId, workflow)) {
       await completeWorkflow(workflow);
     }
   }
@@ -719,16 +780,17 @@ async function handleTicketReady(ticketId, image) {
     console.warn(`[orchestrator] Manifest init failed (non-fatal): ${err.message}`);
   }
 
-  // Advance phase if needed
-  const phaseOrder = ["intake", "requirements", "design", "development", "verification", "review", "complete"];
+  // Advance phase if needed (workflow-def driven, with software-delivery fallback)
+  const wfDef = getWorkflowDef(workflow.workflowDefId);
+  const phaseOrder = wfDef.phaseOrder;
   const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
   if (agentPhaseIdx > currentPhaseIdx) {
     workflow.phase = agentDef.phase;
     await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
 
-    // Create shared feature branch when entering development
-    if (agentDef.phase === "development" && !workflow.featureBranch) {
+    // Create shared feature branch on the def's branch phase (repo-backed workflows only)
+    if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
       try {
         const { owner, repo } = parseRepoUrl(workflow.repoConfig);
         const baseBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
@@ -794,16 +856,32 @@ async function shouldCreateQaTicket(epicId, workflow) {
   return allDevsDone && allDesignDone;
 }
 
-async function isWorkflowComplete(epicId) {
+async function isWorkflowComplete(epicId, workflow) {
   const children = await getChildTickets(epicId);
   if (children.length === 0) return false;
-  // Must have at least one dev or QA ticket done (not just requirements/design)
-  const hasDevOrQaDone = children.some((t) => {
-    const assignee = t.assignee || "";
-    const isDevOrQa = assignee.endsWith("_dev") || assignee.includes("_qa") || assignee.includes("_ci");
-    return isDevOrQa && t.status === "done";
-  });
-  if (!hasDevOrQaDone) return false;
+
+  // Gate: at least one ticket in a "terminal" agent phase must be done — so a
+  // workflow isn't declared complete after only requirements/design finish.
+  const wfDef = getWorkflowDef(workflow?.workflowDefId);
+  const terminalPhases = wfDef.completionRequiresAgentPhases || [];
+
+  let hasTerminalDone;
+  if (terminalPhases.length > 0) {
+    // Config-driven: map each ticket's assignee → agent phase via the roster.
+    hasTerminalDone = children.some((t) => {
+      if (t.status !== "done" || !t.assignee) return false;
+      const def = getAgentDef(t.assignee);
+      return def && terminalPhases.includes(def.phase);
+    });
+  } else {
+    // Legacy suffix heuristic (software-delivery shape) — preserved as fallback.
+    hasTerminalDone = children.some((t) => {
+      const assignee = t.assignee || "";
+      const isDevOrQa = assignee.endsWith("_dev") || assignee.includes("_qa") || assignee.includes("_ci");
+      return isDevOrQa && t.status === "done";
+    });
+  }
+  if (!hasTerminalDone) return false;
   return children.every((t) => t.status === "done");
 }
 
@@ -1029,10 +1107,13 @@ async function buildAgentContext(ticket, workflow) {
   context += `epic_id: ${workflow.epicId}\n`;
   context += `ticket_id: ${ticket.ticketId}\n\n`;
 
-  // For requirements analyst only: provide the valid agent roster (registry data).
-  if (ticket.assignee === "agentcore_hub_requirements_analyst") {
+  // For the intake agent only: provide the valid agent roster (registry data),
+  // scoped to agents belonging to this workflow definition.
+  const wfDef = getWorkflowDef(workflow.workflowDefId);
+  if (ticket.assignee === wfDef.intakeAgentId) {
     const roster = (_agentRoster || FALLBACK_ROSTER)
-      .filter(a => a.agentId !== "agentcore_hub_requirements_analyst")
+      .filter(a => a.agentId !== wfDef.intakeAgentId)
+      .filter(a => (a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID) === wfDef.id)
       .map(a => `  - "${a.agentId}" (${a.phase})`)
       .join("\n");
     context += `## Available Agents\n${roster}\n\n`;
