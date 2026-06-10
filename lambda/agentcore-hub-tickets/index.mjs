@@ -494,6 +494,14 @@ async function transitionIssue(args) {
     exprValues[":sr"] = reason;
   }
 
+  // Persist the reason as reviewComment when leaving a review gate, so the
+  // orchestrator can feed "request changes" feedback back to the reworked agent.
+  if (currentStatus === "in_review" && reason) {
+    updateExpr += ", #rvc = :rvc";
+    exprNames["#rvc"] = "reviewComment";
+    exprValues[":rvc"] = reason;
+  }
+
   // Support setting blockedBy (e.g., QA blocks itself on a fix ticket)
   const blockers = args.blocked_by;
   if (blockers) {
