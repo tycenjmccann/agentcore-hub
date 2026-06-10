@@ -370,9 +370,15 @@ export class JiraCloudProvider implements TicketProvider {
     if (issueTypeName === "epic") ticketType = "epic";
     else if (issueTypeName === "story") ticketType = "story";
 
-    // Extract assignee from labels (agent-<name>)
+    // Extract assignee from labels. Agent tickets: "agent:<id>". Human-review
+    // gates: "reviewer:<who>" → surfaced as "human:<who>".
     const agentLabel = labels.find((l) => l.startsWith("agent:"));
-    const assignee = agentLabel ? agentLabel.replace("agent:", "") : undefined;
+    const reviewerLabel = labels.find((l) => l.startsWith("reviewer:"));
+    const assignee = agentLabel
+      ? agentLabel.replace("agent:", "")
+      : reviewerLabel
+      ? `human:${reviewerLabel.replace("reviewer:", "")}`
+      : undefined;
 
     return {
       id: issue.key as string,
