@@ -141,7 +141,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
   const [cancelError, setCancelError] = useState<string | null>(null);
 
   // Ticket status map — seeded from fetch, updated via SSE
-  const [ticketStatusMap, setTicketStatusMap] = useState<Record<string, { status: TicketStatus; title: string; updatedAt: string }>>({});
+  const [ticketStatusMap, setTicketStatusMap] = useState<Record<string, { status: TicketStatus; title: string; updatedAt: string; assignee?: string }>>({});
 
   // Modal open state for future TicketDetailModal
   const [openTicketModal, setOpenTicketModal] = useState<{ ticketId: string; workflowId: string } | null>(null);
@@ -312,13 +312,14 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
         .then((r) => r.json())
         .then((data) => {
           if (data.tickets && Array.isArray(data.tickets)) {
-            const map: Record<string, { status: TicketStatus; title: string; updatedAt: string }> = {};
+            const map: Record<string, { status: TicketStatus; title: string; updatedAt: string; assignee?: string }> = {};
             for (const ticket of data.tickets) {
               const id = ticket.ticketId || ticket.id;
               map[id] = {
                 status: ticket.status,
                 title: ticket.title || ticket.summary || id,
                 updatedAt: ticket.updatedAt || new Date().toISOString(),
+                assignee: ticket.assignee,
               };
             }
             // Override with DDB agentTasks — Jira search index can lag behind actual status
@@ -1017,13 +1018,50 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
     );
   }
 
+  // Human-review gates currently awaiting a person: tickets parked in_review
+  // with a human:* assignee. Surfaced as a prominent banner so the run doesn't
+  // look silently stuck.
+  const pendingReviews = Object.entries(ticketStatusMap)
+    .filter(([, t]) => t.status === "in_review" && (t.assignee || "").startsWith("human:"))
+    .map(([ticketId, t]) => {
+      const who = (t.assignee || "").slice("human:".length);
+      const initials = who
+        .split(/[\s._-]+/)
+        .filter(Boolean)
+        .slice(0, 2)
+        .map((p) => p[0]?.toUpperCase() || "")
+        .join("") || "?";
+      return { ticketId, title: t.title, reviewer: who, initials };
+    });
+
   return (
     <div className={celebrating ? "celebrate-wrapper" : ""}>
-      <style dangerouslySetInnerHTML={{ __html: PIPELINE_STYLES }} />
+      <style dangerouslySetInnerHTML={{ __html: PIPELINE_STYLES + REVIEW_BANNER_STYLES }} />
 
       {/* Nudge pulse overlay — hot pink full-screen flash during replay */}
       {nudgePulse && (
         <div className="nudge-pulse-overlay" />
+      )}
+
+      {/* Pending human-review banner — clicking opens the gate ticket to act. */}
+      {pendingReviews.length > 0 && (
+        <div className="review-banner" role="status">
+          {pendingReviews.map((r) => (
+            <button
+              key={r.ticketId}
+              className="review-banner-item"
+              onClick={() => handleOpenTicketModal(r.ticketId)}
+              title={`Open ${r.ticketId} to approve or request changes`}
+            >
+              <span className="review-avatar" aria-hidden>{r.initials}</span>
+              <span className="review-banner-text">
+                <span className="review-banner-label">Pending human review</span>
+                <span className="review-banner-detail">{r.title} · {r.reviewer} · {r.ticketId}</span>
+              </span>
+              <span className="review-banner-cta">Review →</span>
+            </button>
+          ))}
+        </div>
       )}
 
       <div className="pipeline-viz">
@@ -1478,6 +1516,24 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
 // are derived from --pipeline-* variables defined in pipeline.css, so they
 // automatically track light/dark theme. Only pipeline-viz-specific tokens are
 // duplicated here.
+
+const REVIEW_BANNER_STYLES = `
+.review-banner{display:flex;flex-direction:column;gap:8px;margin:0 0 16px}
+.review-banner-item{display:flex;align-items:center;gap:12px;width:100%;text-align:left;cursor:pointer;
+  padding:12px 14px;border-radius:12px;border:1px solid rgba(14,165,233,0.45);
+  background:rgba(14,165,233,0.08);color:var(--pipeline-text,#e2e8f0);
+  animation:reviewGlow 2s ease-in-out infinite;transition:background .15s ease}
+.review-banner-item:hover{background:rgba(14,165,233,0.16)}
+@keyframes reviewGlow{0%,100%{box-shadow:0 0 0 0 rgba(14,165,233,0.0)}50%{box-shadow:0 0 0 4px rgba(14,165,233,0.18)}}
+.review-avatar{flex-shrink:0;width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:12px;font-weight:700;letter-spacing:.5px;color:#fff;background:linear-gradient(135deg,#0ea5e9,#6366f1);
+  animation:avatarPulse 2s ease-in-out infinite}
+@keyframes avatarPulse{0%,100%{box-shadow:0 0 0 0 rgba(14,165,233,0.5)}50%{box-shadow:0 0 0 6px rgba(14,165,233,0)}}
+.review-banner-text{display:flex;flex-direction:column;min-width:0;flex:1}
+.review-banner-label{font-size:13px;font-weight:600;color:#38bdf8}
+.review-banner-detail{font-size:12px;color:var(--pipeline-text-muted,#94a3b8);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.review-banner-cta{flex-shrink:0;font-size:12px;font-weight:600;color:#38bdf8}
+`;
 
 const PIPELINE_STYLES = `
 :root{--pl-bg:var(--pipeline-bg);--pl-card:var(--pipeline-card-bg);--pl-item-bg:rgba(26,35,50,0.4);--pl-border:var(--pipeline-border);--pl-border-strong:#334155;--pl-text:var(--pipeline-text);--pl-text-strong:#ffffff;--pl-text-2:var(--pipeline-text-secondary);--pl-text-3:var(--pipeline-text-muted);--pl-text-4:var(--pipeline-text-dim);--pl-dim-inactive:0.35;--pl-dim-done:0.8;--pl-active-bg:rgba(14,165,233,0.06);--pl-active-border:rgba(14,165,233,0.25);--pl-hover-bg:rgba(14,165,233,0.09);--pl-working-bg:rgba(14,165,233,0.05);--pl-item-active-label:#cbd5e1;--pl-flow-show:0.6}

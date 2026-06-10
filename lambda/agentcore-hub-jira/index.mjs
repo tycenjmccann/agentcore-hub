@@ -432,13 +432,22 @@ function mapIssue(issue) {
   const fields = issue.fields || {};
   const labels = fields.labels || [];
   const agentLabel = labels.find((l) => l.startsWith("agent:"));
+  const reviewerLabel = labels.find((l) => l.startsWith("reviewer:"));
   const wfLabel = labels.find((l) => l.startsWith("wf:"));
+
+  // Agent tickets: "agent:<id>". Human-review gates: "reviewer:<who>" →
+  // "human:<who>" (matches the orchestrator + TS mappers).
+  const assignee = agentLabel
+    ? agentLabel.replace("agent:", "")
+    : reviewerLabel
+    ? `human:${reviewerLabel.replace("reviewer:", "")}`
+    : fields.assignee?.displayName || null;
 
   return {
     ticketId: issue.key,
     title: fields.summary || "",
     status: mapStatusToInternal(fields.status?.name || "To Do"),
-    assignee: agentLabel ? agentLabel.replace("agent:", "") : fields.assignee?.displayName || null,
+    assignee,
     issueType: fields.issuetype?.name || "Task",
     parentKey: fields.parent?.key || null,
     workflowId: wfLabel ? wfLabel.replace("wf:", "") : null,
