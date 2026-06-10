@@ -151,6 +151,56 @@ async function resolveReviewerAccountId(ref) {
   }
 }
 
+/**
+ * List human reviewers available in the project, each tagged with the Jira
+ * project ROLES they hold (Designer, Developer, QA & CI, ...). Roles are the
+ * domain mapping: the orchestrator filters this roster to a gate's phase so the
+ * intake agent picks a real, domain-appropriate person. 100% API-driven — no
+ * config of names. Returns [{ accountId, displayName, email, roles[] }].
+ */
+async function listReviewers(params = {}) {
+  // 1. Assignable users in the project (only people who can actually own a ticket).
+  const users = await jiraFetch(
+    `/rest/api/3/user/assignable/search?project=${PROJECT_KEY}&maxResults=200`
+  );
+  const byId = new Map();
+  for (const u of Array.isArray(users) ? users : []) {
+    if (u.accountType && u.accountType !== "atlassian") continue; // skip app/customer accts
+    byId.set(u.accountId, {
+      accountId: u.accountId,
+      displayName: u.displayName,
+      email: u.emailAddress || null,
+      roles: [],
+    });
+  }
+
+  // 2. Tag each user with the project roles they belong to (= their domains).
+  try {
+    const roleMap = await jiraFetch(`/rest/api/3/project/${PROJECT_KEY}/role`);
+    for (const [roleName, roleUrl] of Object.entries(roleMap || {})) {
+      const roleId = String(roleUrl).split("/").pop();
+      try {
+        const detail = await jiraFetch(`/rest/api/3/project/${PROJECT_KEY}/role/${roleId}`);
+        for (const actor of detail.actors || []) {
+          const accId = actor.actorUser?.accountId;
+          if (accId && byId.has(accId)) byId.get(accId).roles.push(roleName);
+        }
+      } catch { /* skip unreadable role */ }
+    }
+  } catch (err) {
+    console.log(`[jira-tools] role tagging failed: ${err.message}`);
+  }
+
+  let reviewers = [...byId.values()];
+
+  // Optional role filter (orchestrator passes the gate's domain → e.g. "Designer").
+  if (params.role) {
+    const want = String(params.role).toLowerCase();
+    reviewers = reviewers.filter((r) => r.roles.some((rn) => rn.toLowerCase().includes(want)));
+  }
+  return { reviewers };
+}
+
 // ─── Tool Implementations ────────────────────────────────────────────────────
 
 async function createTicket(params) {
@@ -513,6 +563,7 @@ const TOOLS = {
   Tickets___list_projects: listProjects,
   Tickets___get_project_issue_types: getProjectIssueTypes,
   Tickets___lookup_user: lookupUser,
+  Tickets___list_reviewers: listReviewers,
   // Backward compat: accept old prefix during transition
   JiraIntegration___create_ticket: createTicket,
   JiraIntegration___transition_ticket: transitionTicket,
@@ -525,6 +576,7 @@ const TOOLS = {
   JiraIntegration___list_projects: listProjects,
   JiraIntegration___get_project_issue_types: getProjectIssueTypes,
   JiraIntegration___lookup_user: lookupUser,
+  JiraIntegration___list_reviewers: listReviewers,
 };
 
 export const handler = async (event) => {

@@ -12,7 +12,7 @@
       "createsPullRequest": true,
       "completionRequiresAgentPhases": ["development", "verification", "review"],
       "reviewGates": [
-        { "afterPhase": "design", "name": "Design Review", "blocking": true, "condition": "flagged", "onReject": "rework", "assignee": "human:tycenjmccann@gmail.com" }
+        { "afterPhase": "design", "name": "Design Review", "blocking": true, "condition": "flagged", "onReject": "rework", "reviewerRole": "Designer" }
       ],
       "phases": [
         { "id": "intake", "name": "Intake", "type": "app", "agentPhase": "intake" },

@@ -39,6 +39,7 @@ const GITHUB_LAMBDA = process.env.GITHUB_LAMBDA || "agentcore-hub-github-mcp";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const MAX_QA_RETRIES = 3;
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
+const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 
 // Jira config (only used when TICKET_PROVIDER=jira)
 const JIRA_SITE_URL = process.env.JIRA_SITE_URL || "";
@@ -1349,14 +1350,29 @@ async function buildAgentContext(ticket, workflow) {
       (g) => g.condition === "always" || requestedGates.includes(g.afterPhase)
     );
     if (activeGates.length > 0) {
-      const gateLines = activeGates
-        .map((g) => {
+      const gateLines = [];
+      for (const g of activeGates) {
+        const block = g.blocking ? "BLOCKING (next phase waits for approval)" : "advisory (non-blocking)";
+        // Pull the domain-appropriate reviewer roster from Jira (by project role).
+        // The agent CHOOSES one — like it chooses agents from ## Available Agents.
+        const reviewers = await listReviewers(g.reviewerRole);
+        if (reviewers.length > 0) {
+          const choices = reviewers
+            .map((r) => `      • assignee "human:${r.email || r.accountId}" — ${r.displayName}${r.roles?.length ? ` [${r.roles.join(", ")}]` : ""}`)
+            .join("\n");
+          gateLines.push(
+            `  - After phase "${g.afterPhase}": create a "${g.name || "Review"}" ticket, blocked_by ALL "${g.afterPhase}" agent tickets. ${block}.\n` +
+            `    Assign it to ONE of these reviewers (pick the best fit for the work; honor any reviewer named in the request):\n${choices}`
+          );
+        } else {
+          // No roster (DynamoDB mode, or no users) → fall back to the config ref.
           const who = g.assignee || "human:reviewer";
-          const block = g.blocking ? "BLOCKING (next phase waits for approval)" : "advisory (non-blocking)";
-          return `  - After phase "${g.afterPhase}": create a "${g.name || "Review"}" ticket assigned to "${who}", blocked_by ALL "${g.afterPhase}" agent tickets. ${block}.`;
-        })
-        .join("\n");
-      context += `## Human Review Gates (REQUIRED)\nInsert these human-review tickets into your ticket plan:\n${gateLines}\nFor BLOCKING gates, the downstream phase's tickets must list the gate ticket in their blocked_by. A human approves (status → done) or requests changes (status → blocked).\n\n`;
+          gateLines.push(
+            `  - After phase "${g.afterPhase}": create a "${g.name || "Review"}" ticket assigned to "${who}", blocked_by ALL "${g.afterPhase}" agent tickets. ${block}.`
+          );
+        }
+      }
+      context += `## Human Review Gates (REQUIRED)\nInsert these human-review tickets into your ticket plan:\n${gateLines.join("\n")}\nUse the EXACT "human:<…>" assignee string shown. For BLOCKING gates, the downstream phase's tickets must list the gate ticket in their blocked_by. A human approves (status → done) or requests changes (status → blocked).\n\n`;
     }
 
     // Bug-fix is a SCOPE distinction (different blueprint), not a HOW.
@@ -1883,6 +1899,28 @@ function buildManifestContext(manifest, agentPhase, workflow, ticket) {
   }
 
   return ctx;
+}
+
+// ─── Ticket-tools Lambda helper (reviewer roster) ──────────────────────────────
+
+/**
+ * Fetch the human-reviewer roster from the ticket-tools Lambda, optionally
+ * filtered to a Jira project role (= domain). Returns [] on any failure or in
+ * DynamoDB mode (no real users) so gate injection degrades gracefully.
+ */
+async function listReviewers(role) {
+  if (TICKET_PROVIDER !== "jira") return [];
+  try {
+    const res = await lambda.send(new InvokeCommand({
+      FunctionName: TICKET_TOOLS_LAMBDA,
+      Payload: JSON.stringify({ tool_name: "Tickets___list_reviewers", parameters: role ? { role } : {} }),
+    }));
+    const payload = JSON.parse(new TextDecoder().decode(res.Payload));
+    return payload?.reviewers || [];
+  } catch (err) {
+    console.warn(`[orchestrator] listReviewers(${role}) failed: ${err.message}`);
+    return [];
+  }
 }
 
 // ─── GitHub Lambda Helper ──────────────────────────────────────────────────────
