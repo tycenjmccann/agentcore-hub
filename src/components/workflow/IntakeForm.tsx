@@ -5,6 +5,13 @@ import type { WorkflowInput, IntakeSource, RepoConfig, RepoLayout } from "@/lib/
 import type { ModelOption, ModelsApiResponse } from "@/lib/workflow/model-config";
 import { modelOptionToOverride } from "@/lib/workflow/model-config";
 
+interface ReviewGateOption {
+  afterPhase: string;
+  name?: string;
+  blocking: boolean;
+  condition: "always" | "flagged";
+}
+
 interface WorkflowDefOption {
   id: string;
   name: string;
@@ -12,6 +19,7 @@ interface WorkflowDefOption {
   icon: string;
   requiresRepo: boolean;
   phases: { id: string; name: string; type: string }[];
+  reviewGates?: ReviewGateOption[];
 }
 
 interface IntakeFormProps {
@@ -31,6 +39,8 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
   // Workflow definition (shape) selection
   const [workflowDefs, setWorkflowDefs] = useState<WorkflowDefOption[]>([]);
   const [selectedDefId, setSelectedDefId] = useState<string>("");
+  // Phases the requester opted into a human-review gate for (flagged gates).
+  const [enabledGatePhases, setEnabledGatePhases] = useState<string[]>([]);
 
   useEffect(() => {
     fetch("/api/workflow/definitions")
@@ -119,6 +129,7 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
       // Only include modelOverride if a non-default model is selected
       ...(modelOverride && { modelOverride }),
       ...(selectedDefId && { workflowDefId: selectedDefId }),
+      ...(enabledGatePhases.length > 0 && { reviewGates: enabledGatePhases }),
     });
   };
 
@@ -152,7 +163,7 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
                 <button
                   key={def.id}
                   type="button"
-                  onClick={() => setSelectedDefId(def.id)}
+                  onClick={() => { setSelectedDefId(def.id); setEnabledGatePhases([]); }}
                   data-testid={`workflow-def-${def.id}`}
                   className={`text-left px-3 py-2.5 rounded-lg border transition-colors ${
                     active
@@ -174,6 +185,48 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
           </div>
         </div>
       )}
+
+      {/* Human review gates — opt-in for any "flagged" gates the selected def offers */}
+      {(() => {
+        const flaggedGates = (selectedDef?.reviewGates || []).filter((g) => g.condition === "flagged");
+        if (flaggedGates.length === 0) return null;
+        return (
+          <div>
+            <label className="block text-sm font-medium text-secondary mb-1">
+              Human review gates
+            </label>
+            <p className="text-xs text-muted mb-2">
+              Pause for a person to approve before the next phase starts.
+            </p>
+            <div className="space-y-1.5">
+              {flaggedGates.map((g) => {
+                const checked = enabledGatePhases.includes(g.afterPhase);
+                return (
+                  <label
+                    key={g.afterPhase}
+                    className="flex items-center gap-2 text-sm text-secondary cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={(e) =>
+                        setEnabledGatePhases((prev) =>
+                          e.target.checked
+                            ? [...prev, g.afterPhase]
+                            : prev.filter((p) => p !== g.afterPhase)
+                        )
+                      }
+                      className="rounded border-theme"
+                    />
+                    {g.name || `Review after ${g.afterPhase}`}
+                    {g.blocking && <span className="text-[10px] text-muted">(blocking)</span>}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Title */}
       <div>
