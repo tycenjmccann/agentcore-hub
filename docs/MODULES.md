@@ -20,6 +20,7 @@ with the Evaluations surface removed), the remaining app still passes
 | **Builder** | Optional | The `/build` page + builder-tools Lambda for scaffolding agents. |
 | **Workflow** | Optional | Multi-agent orchestration pipeline: intake → requirements → design → development → verification → review, with Jira + ticket tracking. |
 | **Evaluations** | Optional | Self-improvement loop: ingests AgentCore evaluation results from CloudWatch Logs, buffers them, and feeds an improver agent. |
+| **Registry** | Optional | Browse/manage the Amazon Bedrock AgentCore Registry — catalogs of registries and their records (MCP servers, A2A agents, custom resources, agent skills) with an approval lifecycle. |
 
 The core never imports from an optional module. Optional modules may share core
 libraries (`src/lib/agentcore-sdk.ts`, `src/lib/client-cache.ts`, etc.) and the
@@ -115,6 +116,47 @@ The continuous-improvement loop. Self-contained surface.
 - **Deploy:** `deploy/setup-builder-agent.mjs`
 
 > **Heads-up — harness vs runtime.** The builder is an AgentCore *harness*, not a runtime. When the harness is created, AgentCore auto-provisions a runtime sibling named `harness_agentcore_hub_builder-…` under the hood. If you list runtimes (`aws bedrock-agentcore-control list-agent-runtimes` or the AgentCore MCP `list_agent_runtimes`), you'll see it — but `/build` only ever invokes the harness ARN, built from `BUILDER_AGENT_ID` in `.env.local`. The runtime sibling is irrelevant to `/build`. To verify the builder, query `list-harnesses` / `GetHarness`, not the runtime APIs.
+
+---
+
+## Module: Registry (optional)
+
+A console over the **Amazon Bedrock AgentCore Registry** service. Two-level data
+model: a *registry* (catalog) holds *registry records* (MCP servers, A2A agents,
+custom resources, agent skills) that move through a DRAFT → PENDING_APPROVAL →
+APPROVED/REJECTED → DEPRECATED lifecycle.
+
+Unlike the other modules, Registry is **pure AWS-service-backed** — it has **no
+DynamoDB tables and no Lambdas**. All reads and writes go straight through the
+AWS SDK to the AgentCore Registry APIs.
+
+**UI routes**
+- `src/app/registry/` — registries list + records browser + record detail/approval
+
+**API routes** (all under `src/app/api/agentcore/registry/`)
+- `/api/agentcore/registry` — list/create/get/update/delete registries
+- `/api/agentcore/registry/records` — list/create/get/update/delete records
+- `/api/agentcore/registry/search` — data-plane record search
+- `/api/agentcore/registry/approval` — submit-for-approval / approve / reject / deprecate (status transitions)
+
+**AWS services**
+- `bedrock-agentcore-control` (control plane) — registry + record CRUD and status transitions
+- `bedrock-agentcore` (data plane) — `SearchRegistryRecords`
+
+Both clients are constructed in `src/lib/agentcore-sdk.ts` (region only, ambient
+credentials) — no module-specific credentials config.
+
+**Lambdas** — none.
+
+**DynamoDB tables** — none.
+
+**Seed/demo data**
+- `scripts/seed-registry.sh` — creates a demo registry plus a few example records (idempotent, re-runnable)
+
+**Removing the module**
+- Delete the `/registry` nav entry tagged `module: "registry"` in `src/config/modules.ts`
+- `rm -rf src/app/registry src/app/api/agentcore/registry`
+- Nothing else to tear down (no Lambdas/tables); then `npx tsc --noEmit && npm run build`
 
 ---
 

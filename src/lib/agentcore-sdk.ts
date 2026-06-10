@@ -9,6 +9,7 @@ import {
 import {
   BedrockAgentCoreClient,
   InvokeAgentRuntimeCommand,
+  SearchRegistryRecordsCommand,
 } from "@aws-sdk/client-bedrock-agentcore";
 import {
   BedrockAgentCoreControlClient,
@@ -17,6 +18,18 @@ import {
   ListMemoriesCommand,
   GetHarnessCommand,
   GetAgentRuntimeCommand,
+  CreateRegistryCommand,
+  GetRegistryCommand,
+  ListRegistriesCommand,
+  UpdateRegistryCommand,
+  DeleteRegistryCommand,
+  CreateRegistryRecordCommand,
+  GetRegistryRecordCommand,
+  ListRegistryRecordsCommand,
+  UpdateRegistryRecordCommand,
+  DeleteRegistryRecordCommand,
+  SubmitRegistryRecordForApprovalCommand,
+  UpdateRegistryRecordStatusCommand,
 } from "@aws-sdk/client-bedrock-agentcore-control";
 import {
   CloudWatchLogsClient,
@@ -863,4 +876,368 @@ export async function invokeHarnessAgent(params: {
       }
     },
   });
+}
+
+// ─── AgentCore Registry ──────────────────────────────────────────────────────
+// Two-level model:
+//   Registry (catalog) ── Registry Record (entry, e.g. MCP server, A2A card)
+// Control-plane CRUDL + approval via getControlClient(region); search via the
+// data-plane agentcore client. Writes are async — create/update return HTTP 202
+// with a CREATING/UPDATING status; poll get* until terminal.
+
+export type RegistryDescriptorType = "MCP" | "A2A" | "CUSTOM" | "AGENT_SKILLS";
+
+export type RegistryStatus =
+  | "CREATING"
+  | "READY"
+  | "UPDATING"
+  | "CREATE_FAILED"
+  | "UPDATE_FAILED"
+  | "DELETING"
+  | "DELETE_FAILED";
+
+export type RecordStatus =
+  | "CREATING"
+  | "DRAFT"
+  | "PENDING_APPROVAL"
+  | "APPROVED"
+  | "REJECTED"
+  | "DEPRECATED"
+  | "UPDATING"
+  | "CREATE_FAILED"
+  | "UPDATE_FAILED";
+
+export type RegistryAuthorizerType = "AWS_IAM" | "CUSTOM_JWT";
+
+export interface Registry {
+  name: string;
+  description?: string;
+  registryId: string;
+  registryArn: string;
+  authorizerType?: RegistryAuthorizerType;
+  approvalConfiguration?: { autoApproval?: boolean };
+  status: string;
+  statusReason?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface RegistryRecord {
+  recordId: string;
+  recordArn: string;
+  registryArn?: string;
+  name: string;
+  description?: string;
+  descriptorType: RegistryDescriptorType;
+  recordVersion?: string;
+  status: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+// Full record incl. descriptors payload (from GetRegistryRecord).
+export interface RegistryRecordDetail extends RegistryRecord {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  descriptors?: any;
+  statusReason?: string;
+  synchronizationType?: string;
+}
+
+export interface CreateRegistryInput {
+  name: string;
+  description?: string;
+  authorizerType?: RegistryAuthorizerType;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  authorizerConfiguration?: any;
+  approvalConfiguration?: { autoApproval?: boolean };
+}
+
+export interface CreateRegistryRecordInput {
+  name: string;
+  description?: string;
+  descriptorType: RegistryDescriptorType;
+  // Union keyed by lowercased type — see API docs in CLAUDE context.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  descriptors?: any;
+  recordVersion?: string;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapRegistrySummary(r: any): Registry {
+  return {
+    name: r.name,
+    description: r.description,
+    registryId: r.registryId,
+    registryArn: r.registryArn,
+    authorizerType: r.authorizerType,
+    approvalConfiguration: r.approvalConfiguration,
+    status: r.status || "UNKNOWN",
+    statusReason: r.statusReason,
+    createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt,
+    updatedAt: r.updatedAt instanceof Date ? r.updatedAt.toISOString() : r.updatedAt,
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapRecordSummary(r: any): RegistryRecord {
+  return {
+    recordId: r.recordId,
+    recordArn: r.recordArn,
+    registryArn: r.registryArn,
+    name: r.name,
+    description: r.description,
+    descriptorType: r.descriptorType,
+    // control-plane summary uses recordVersion; data-plane summary uses version
+    recordVersion: r.recordVersion ?? r.version,
+    status: r.status || "UNKNOWN",
+    createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt,
+    updatedAt: r.updatedAt instanceof Date ? r.updatedAt.toISOString() : r.updatedAt,
+  };
+}
+
+/** List all registries in the account (paginated). */
+export async function listRegistries(region: string = DEFAULT_REGION): Promise<Registry[]> {
+  const client = getControlClient(region);
+  const out: Registry[] = [];
+  let nextToken: string | undefined;
+  do {
+    const res = await client.send(new ListRegistriesCommand({ maxResults: 100, nextToken }));
+    for (const r of res.registries || []) out.push(mapRegistrySummary(r));
+    nextToken = res.nextToken;
+  } while (nextToken);
+  return out;
+}
+
+/** Get a single registry (full detail). */
+export async function getRegistry(registryId: string, region: string = DEFAULT_REGION): Promise<Registry> {
+  const client = getControlClient(region);
+  const res = await client.send(new GetRegistryCommand({ registryId }));
+  return mapRegistrySummary({ ...res, registryId });
+}
+
+/** Create a registry. Returns the new registry's arn/id (status CREATING). */
+export async function createRegistry(input: CreateRegistryInput, region: string = DEFAULT_REGION): Promise<Registry> {
+  const client = getControlClient(region);
+  const res = await client.send(
+    new CreateRegistryCommand({
+      name: input.name,
+      description: input.description,
+      authorizerType: input.authorizerType,
+      authorizerConfiguration: input.authorizerConfiguration,
+      approvalConfiguration: input.approvalConfiguration,
+    })
+  );
+  const registryArn = res.registryArn || "";
+  // CreateRegistry only returns the ARN; derive the id from the ARN tail.
+  const registryId = registryArn.split("/").pop() || registryArn;
+  return {
+    name: input.name,
+    description: input.description,
+    registryId,
+    registryArn,
+    authorizerType: input.authorizerType,
+    approvalConfiguration: input.approvalConfiguration,
+    status: "CREATING",
+  };
+}
+
+/** Update a registry (name and/or description). PATCH semantics. */
+export async function updateRegistry(
+  registryId: string,
+  patch: { name?: string; description?: string },
+  region: string = DEFAULT_REGION
+): Promise<void> {
+  const client = getControlClient(region);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const input: any = { registryId };
+  if (patch.name !== undefined) input.name = patch.name;
+  if (patch.description !== undefined) input.description = { optionalValue: patch.description };
+  await client.send(new UpdateRegistryCommand(input));
+}
+
+/** Delete a registry (async — status transitions to DELETING). */
+export async function deleteRegistry(registryId: string, region: string = DEFAULT_REGION): Promise<void> {
+  const client = getControlClient(region);
+  await client.send(new DeleteRegistryCommand({ registryId }));
+}
+
+/** List records in a registry (paginated), with optional filters. */
+export async function listRegistryRecords(
+  params: { registryId: string; status?: RecordStatus; descriptorType?: RegistryDescriptorType; name?: string },
+  region: string = DEFAULT_REGION
+): Promise<RegistryRecord[]> {
+  const client = getControlClient(region);
+  const out: RegistryRecord[] = [];
+  let nextToken: string | undefined;
+  do {
+    const res = await client.send(
+      new ListRegistryRecordsCommand({
+        registryId: params.registryId,
+        status: params.status,
+        descriptorType: params.descriptorType,
+        name: params.name,
+        maxResults: 100,
+        nextToken,
+      })
+    );
+    for (const r of res.registryRecords || []) out.push(mapRecordSummary(r));
+    nextToken = res.nextToken;
+  } while (nextToken);
+  return out;
+}
+
+/** Get a single record incl. its full descriptors payload. */
+export async function getRegistryRecord(
+  registryId: string,
+  recordId: string,
+  region: string = DEFAULT_REGION
+): Promise<RegistryRecordDetail> {
+  const client = getControlClient(region);
+  const res = await client.send(new GetRegistryRecordCommand({ registryId, recordId }));
+  return {
+    ...mapRecordSummary(res),
+    descriptors: res.descriptors,
+    statusReason: res.statusReason,
+    synchronizationType: res.synchronizationType,
+  };
+}
+
+/** Create a record in a registry. Returns id/arn/status (async, CREATING). */
+export async function createRegistryRecord(
+  registryId: string,
+  input: CreateRegistryRecordInput,
+  region: string = DEFAULT_REGION
+): Promise<{ recordId: string; recordArn: string; status: string }> {
+  const client = getControlClient(region);
+  const res = await client.send(
+    new CreateRegistryRecordCommand({
+      registryId,
+      name: input.name,
+      description: input.description,
+      descriptorType: input.descriptorType,
+      descriptors: input.descriptors,
+      recordVersion: input.recordVersion,
+    })
+  );
+  const recordArn = res.recordArn || "";
+  // CreateRegistryRecord only returns recordArn + status; derive id from arn tail.
+  const recordId = recordArn.split("/").pop() || recordArn;
+  return { recordId, recordArn, status: res.status || "CREATING" };
+}
+
+/**
+ * Update a record (name + descriptors inline content). PATCH semantics —
+ * descriptors are wrapped per the UpdatedDescriptors / optionalValue shapes.
+ * `descriptorType` is required to know which descriptor union branch to build.
+ */
+export async function updateRegistryRecord(
+  registryId: string,
+  recordId: string,
+  patch: { name?: string; descriptorType?: RegistryDescriptorType; inlineContent?: string },
+  region: string = DEFAULT_REGION
+): Promise<void> {
+  const client = getControlClient(region);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const input: any = { registryId, recordId };
+  if (patch.name !== undefined) input.name = patch.name;
+
+  if (patch.inlineContent !== undefined && patch.descriptorType) {
+    // Build UpdatedDescriptors -> optionalValue (UpdatedDescriptorsUnion) ->
+    // per-type wrapper -> optionalValue -> field wrapper -> optionalValue.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let union: any;
+    switch (patch.descriptorType) {
+      case "MCP":
+        union = {
+          mcp: {
+            optionalValue: {
+              server: { optionalValue: { inlineContent: patch.inlineContent } },
+            },
+          },
+        };
+        break;
+      case "A2A":
+        union = {
+          a2a: { optionalValue: { agentCard: { inlineContent: patch.inlineContent } } },
+        };
+        break;
+      case "CUSTOM":
+        union = {
+          custom: { optionalValue: { inlineContent: patch.inlineContent } },
+        };
+        break;
+      case "AGENT_SKILLS":
+        union = {
+          agentSkills: {
+            optionalValue: {
+              skillMd: { optionalValue: { inlineContent: patch.inlineContent } },
+            },
+          },
+        };
+        break;
+    }
+    input.descriptors = { optionalValue: union };
+  }
+
+  await client.send(new UpdateRegistryRecordCommand(input));
+}
+
+/** Delete a record. */
+export async function deleteRegistryRecord(
+  registryId: string,
+  recordId: string,
+  region: string = DEFAULT_REGION
+): Promise<void> {
+  const client = getControlClient(region);
+  await client.send(new DeleteRegistryRecordCommand({ registryId, recordId }));
+}
+
+/** Submit a DRAFT record for approval (-> PENDING_APPROVAL). */
+export async function submitRecordForApproval(
+  registryId: string,
+  recordId: string,
+  region: string = DEFAULT_REGION
+): Promise<{ status: string }> {
+  const client = getControlClient(region);
+  const res = await client.send(new SubmitRegistryRecordForApprovalCommand({ registryId, recordId }));
+  return { status: res.status || "PENDING_APPROVAL" };
+}
+
+/**
+ * Set a record's status. Used for approve (APPROVED), reject (REJECTED),
+ * deprecate (DEPRECATED). statusReason is required by the API — a sensible
+ * default is supplied when the caller omits one.
+ */
+export async function setRecordStatus(
+  registryId: string,
+  recordId: string,
+  status: RecordStatus,
+  statusReason: string | undefined,
+  region: string = DEFAULT_REGION
+): Promise<{ status: string }> {
+  const client = getControlClient(region);
+  const reason = statusReason && statusReason.trim() ? statusReason : `Status set to ${status} via AgentCore Hub`;
+  const res = await client.send(
+    new UpdateRegistryRecordStatusCommand({ registryId, recordId, status, statusReason: reason })
+  );
+  return { status: res.status || status };
+}
+
+/** Full-text search records in a registry (data plane). */
+export async function searchRegistryRecords(
+  params: { registryId: string; query: string; descriptorType?: RegistryDescriptorType; maxResults?: number },
+  region: string = DEFAULT_REGION
+): Promise<RegistryRecord[]> {
+  const client = getAgentCoreClient(region);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const filters: any = params.descriptorType ? { descriptorType: { $eq: params.descriptorType } } : undefined;
+  const res = await client.send(
+    new SearchRegistryRecordsCommand({
+      registryIds: [params.registryId],
+      searchQuery: params.query,
+      maxResults: params.maxResults,
+      filters,
+    })
+  );
+  return (res.registryRecords || []).map(mapRecordSummary);
 }
