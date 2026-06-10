@@ -1,13 +1,14 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import type {
   WorkflowState,
   WorkflowEvent,
   TicketStatus,
 } from "@/lib/workflow/types";
 import awsIcons from "@/lib/aws-icons.json";
-import { PIPELINE_PHASES, PHASE_DISPLAY_META, resolveToolIcon, getPhaseToolCount } from "@/lib/pipeline-config";
+import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePhaseConfig } from "@/lib/pipeline-config";
+import { DEFAULT_WORKFLOW_DEF_ID } from "@/lib/workflow/workflow-defs";
 import { Square } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
@@ -20,25 +21,26 @@ interface WorkflowBoardProps {
   workflowId: string;
 }
 
-// ─── Phase Order (derived from config) ──────────────────────────────────────
+// ─── Phase Order (derived from the running workflow's def) ───────────────────
 
-// Map WorkflowPhase / agentPhase strings to index in the pipeline
-const PHASE_ORDER: Record<string, number> = (() => {
+// Map WorkflowPhase / agentPhase strings to index in the given pipeline phases.
+function buildPhaseOrder(phases: PipelinePhaseConfig[]): Record<string, number> {
   const order: Record<string, number> = {};
-  PIPELINE_PHASES.forEach((phase, idx) => {
+  phases.forEach((phase, idx) => {
     order[phase.id] = idx;
     // Also map agentPhase if it differs from id (e.g. qa phase has agentPhase "verification")
     if (phase.agentPhase !== phase.id) {
       order[phase.agentPhase] = idx;
     }
   });
-  // Special states
-  order["review"] = PIPELINE_PHASES.length - 1;
-  order["complete"] = PIPELINE_PHASES.length;
+  // Special states. (No hardcoded "review" override — the loop above already
+  // maps every phase id and agentPhase to its correct index per the running
+  // workflow's def; legacy software-delivery-only override clobbered legal/sales.)
+  order["complete"] = phases.length;
   order["error"] = -1;
   order["cancelled"] = -1;
   return order;
-})();
+}
 
 // ─── Replay helper: apply a single event to state (pure function) ───────────
 
@@ -84,6 +86,18 @@ function applyEventToState(s: WorkflowState, event: WorkflowEvent): WorkflowStat
 
 export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
   const [state, setState] = useState<WorkflowState | null>(null);
+
+  // Phases + ordering are derived from the running workflow's definition so the
+  // board reflects the actual workflow (e.g. social-media) instead of the
+  // hardcoded software-delivery pipeline.
+  const workflowDefId = state?.input?.workflowDefId;
+  const pipelinePhases = useMemo(() => getPipelinePhases(workflowDefId), [workflowDefId]);
+  const phaseOrder = useMemo(() => buildPhaseOrder(pipelinePhases), [pipelinePhases]);
+  // Refs so stable useCallback event handlers always see the current def's phases/order.
+  const pipelinePhasesRef = useRef(pipelinePhases);
+  pipelinePhasesRef.current = pipelinePhases;
+  const phaseOrderRef = useRef(phaseOrder);
+  phaseOrderRef.current = phaseOrder;
   const [celebrating, setCelebrating] = useState(false);
   const [expandedAgent, setExpandedAgent] = useState<string | null>(null);
   // Full agent output fetched directly from DDB (independent of replay scrubber)
@@ -418,7 +432,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
   const replayPhaseHighWaterRef = useRef(0);
   const fireReplayVisuals = useCallback((event: WorkflowEvent) => {
     if (event.type === "phase_change") {
-      const newPhaseIndex = PHASE_ORDER[event.phase] ?? -1;
+      const newPhaseIndex = phaseOrderRef.current[event.phase] ?? -1;
       if (newPhaseIndex > 0 && newPhaseIndex > replayPhaseHighWaterRef.current) {
         replayPhaseHighWaterRef.current = newPhaseIndex;
         setActiveConnector(newPhaseIndex - 1);
@@ -426,7 +440,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
       }
     } else if (event.type === "agent_status" && event.status === "running") {
       // If an agent starts in a new phase we haven't animated yet, fire the connector
-      const agentPhaseIdx = PIPELINE_PHASES.findIndex((p) =>
+      const agentPhaseIdx = pipelinePhasesRef.current.findIndex((p) =>
         p.agents.some((a) => a.agentId === event.agentId)
       );
       if (agentPhaseIdx > 0 && agentPhaseIdx > replayPhaseHighWaterRef.current) {
@@ -437,7 +451,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
     } else if (event.type === "tool_use") {
       const resolved = resolveToolIcon(event.toolName);
       if (resolved) {
-        const agentPhase = PIPELINE_PHASES.find((p) => p.agents.some((a) => a.agentId === event.agentId));
+        const agentPhase = pipelinePhasesRef.current.find((p) => p.agents.some((a) => a.agentId === event.agentId));
         if (agentPhase) {
           const flashKey = `${agentPhase.id}:${resolved.icon}`;
           setToolFlashes((prev) => ({ ...prev, [flashKey]: true }));
@@ -542,7 +556,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
 
     switch (event.type) {
       case "phase_change": {
-        const newPhaseIndex = PHASE_ORDER[event.phase] ?? -1;
+        const newPhaseIndex = phaseOrderRef.current[event.phase] ?? -1;
         // Animate the connector FROM the previous phase TO the new phase
         if (newPhaseIndex > 0) {
           const connectorIndex = newPhaseIndex - 1;
@@ -555,12 +569,12 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
       case "agent_status":
         // If an agent starts running in a phase beyond current, animate the connector
         if (event.status === "running") {
-          const agentPhase = PIPELINE_PHASES.findIndex((p) =>
+          const agentPhase = pipelinePhasesRef.current.findIndex((p) =>
             p.agents.some((a) => a.agentId === event.agentId)
           );
           if (agentPhase > 0 && activeConnector === null) {
             setState((s) => {
-              const curIdx = s ? (PHASE_ORDER[s.phase] ?? -1) : -1;
+              const curIdx = s ? (phaseOrderRef.current[s.phase] ?? -1) : -1;
               if (agentPhase > curIdx) {
                 setActiveConnector(agentPhase - 1);
                 setTimeout(() => setActiveConnector(null), 1200);
@@ -609,7 +623,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
         const resolved = resolveToolIcon(event.toolName);
         if (resolved) {
           // Find which phase this agent belongs to
-          const agentPhase = PIPELINE_PHASES.find((p) =>
+          const agentPhase = pipelinePhasesRef.current.find((p) =>
             p.agents.some((a) => a.agentId === event.agentId)
           );
           if (agentPhase) {
@@ -746,7 +760,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
   }, []);
 
   // Derive visual states from workflow state
-  const currentPhaseIndex = state ? (PHASE_ORDER[state.phase] ?? -1) : -1;
+  const currentPhaseIndex = state ? (phaseOrder[state.phase] ?? -1) : -1;
   const isComplete = state?.phase === "complete";
   const isSettled = isComplete && !celebrating;
 
@@ -933,7 +947,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
   // Derive phase status from ticket data (agent task statuses)
   const getPhaseStatus = (phaseIndex: number): "inactive" | "active" | "done" => {
     if (!state) return "inactive";
-    const phase = PIPELINE_PHASES[phaseIndex];
+    const phase = pipelinePhases[phaseIndex];
     if (!phase) return "inactive";
 
     // Intake phase (no agents) — done once any agent task exists
@@ -1082,7 +1096,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
           )}
 
           <div className={`pipeline-status-header ${isComplete ? "settled" : ""} ${state.phase === "cancelled" ? "cancelled" : ""}`}>
-            {isComplete ? "Complete" : state.phase === "cancelled" ? "Cancelled" : state.phase === "error" ? "Error" : `In Progress: ${PIPELINE_PHASES[currentPhaseIndex]?.name || state.phase}`}
+            {isComplete ? "Complete" : state.phase === "cancelled" ? "Cancelled" : state.phase === "error" ? "Error" : `In Progress: ${pipelinePhases[currentPhaseIndex]?.name || state.phase}`}
           </div>
 
 
@@ -1170,7 +1184,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
 
           {/* Pipeline phases */}
           <div className="pipeline-phases">
-            {PIPELINE_PHASES.map((phase, idx) => (
+            {pipelinePhases.map((phase, idx) => (
               <div
                 key={phase.id}
                 className={`phase ${getPhaseClass(idx)}`}
@@ -1192,7 +1206,7 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
                   )}
 
                   <div className="card-stats">
-                    <div className="stat-row">{getPhaseToolCount(phase.id)} Tools</div>
+                    <div className="stat-row">{getPhaseToolCount(phase.id, workflowDefId || DEFAULT_WORKFLOW_DEF_ID)} Tools</div>
                     <div className="stat-row">{phase.skills.length} Skills</div>
                   </div>
 

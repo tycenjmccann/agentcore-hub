@@ -186,6 +186,11 @@ export interface WorkflowInput {
   modelOverride?: ModelOverride;
   /** Workflow classification — "feature" (default) or "bug" */
   workflowType?: WorkflowType;
+  /**
+   * Which workflow definition (shape) to run. Resolved against workflows.json.
+   * Absent → default ("software-delivery"), preserving legacy behavior.
+   */
+  workflowDefId?: string;
 }
 
 // ─── Human Notifications ─────────────────────────────────────────────────────

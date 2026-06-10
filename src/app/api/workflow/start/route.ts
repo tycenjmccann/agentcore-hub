@@ -15,6 +15,7 @@ import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { validateIntakeSources } from "@/lib/workflow/intake";
 import type { WorkflowInput } from "@/lib/workflow/types";
+import { getWorkflowDef } from "@/lib/workflow/workflow-defs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -64,6 +65,8 @@ async function startWithJira(body: WorkflowInput) {
   const { JiraCloudProvider } = await import("@/lib/workflow/ticket-provider-jira");
   const jira = new JiraCloudProvider();
 
+  const def = getWorkflowDef(body.workflowDefId);
+  const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
   const workflowId = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
   // 1. Create epic in Jira
@@ -77,7 +80,7 @@ async function startWithJira(body: WorkflowInput) {
     Item: {
       workflowId,
       id: workflowId,
-      phase: "requirements",
+      phase: intakePhase,
       epicId,
       repoConfig: body.repoConfig,
       input: body,
@@ -87,15 +90,16 @@ async function startWithJira(body: WorkflowInput) {
       startedAt: new Date().toISOString(),
       ticketProvider: "jira",
       workflowType: body.workflowType || "feature",
+      workflowDefId: def.id,
     },
   }));
 
-  // 3. Create requirements ticket in Jira
+  // 3. Create the intake ticket in Jira (assigned to the workflow's intake agent)
   const reqTicket = await jira.createTicket({
     parentId: epicId,
-    title: `Requirements: requirements analyst — ${body.title}`,
-    description: `Analyze the feature request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
-    assignee: "agentcore_hub_requirements_analyst",
+    title: `${def.phases.find((p) => p.type === "agent")?.name || "Intake"}: ${def.intakeAgentId} — ${body.title}`,
+    description: `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
+    assignee: def.intakeAgentId,
     blockedBy: [],
   }, workflowId);
 
@@ -110,6 +114,9 @@ async function startWithJira(body: WorkflowInput) {
 // ─── DynamoDB Backend (via ticket tools Lambda) ──────────────────────────────
 
 async function startWithDynamoDB(body: WorkflowInput) {
+  const def = getWorkflowDef(body.workflowDefId);
+  const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
+  const intakePhaseName = def.phases.find((p) => p.type === "agent")?.name || "Intake";
   const workflowId = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
   // 1. Create the epic via ticket tools Lambda
@@ -138,7 +145,7 @@ async function startWithDynamoDB(body: WorkflowInput) {
     Item: {
       workflowId,
       id: workflowId,
-      phase: "requirements",
+      phase: intakePhase,
       epicId,
       repoConfig: body.repoConfig,
       input: body,
@@ -147,17 +154,18 @@ async function startWithDynamoDB(body: WorkflowInput) {
       humanNotifications: [],
       startedAt: new Date().toISOString(),
       workflowType: body.workflowType || "feature",
+      workflowDefId: def.id,
     },
   }));
 
-  // 4. Create requirements ticket via ticket tools Lambda
+  // 4. Create the intake ticket via ticket tools Lambda
   //    DDB write triggers Stream → orchestrator Lambda picks it up
   const reqResult = await invokeTicketLambda("Tickets___create_ticket", {
-    summary: `Requirements: requirements analyst — ${body.title}`,
-    description: `Analyze the feature request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
+    summary: `${intakePhaseName}: ${def.intakeAgentId} — ${body.title}`,
+    description: `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
     issue_type: "Task",
     parent_key: epicId,
-    assignee: "agentcore_hub_requirements_analyst",
+    assignee: def.intakeAgentId,
     workflow_id: workflowId,
   });
 

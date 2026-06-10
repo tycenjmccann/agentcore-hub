@@ -5,6 +5,7 @@ import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical
 import WorkflowBoard from "@/components/workflow/WorkflowBoard";
 import IntakeForm from "@/components/workflow/IntakeForm";
 import type { WorkflowState, WorkflowInput } from "@/lib/workflow/types";
+import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID } from "@/lib/workflow/workflow-defs";
 
 interface WorkflowSummary {
   id: string;
@@ -34,6 +35,7 @@ export default function WorkflowPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [nudgeToast, setNudgeToast] = useState<{ message: string; type: "success" | "info" | "error" } | null>(null);
   const [historyCollapsed, setHistoryCollapsed] = useState(true);
+  const [testDefId, setTestDefId] = useState<string>(DEFAULT_WORKFLOW_DEF_ID);
 
   useEffect(() => {
     const stored = localStorage.getItem('workflow-history-collapsed');
@@ -154,12 +156,14 @@ export default function WorkflowPage() {
     try {
       const now = new Date();
       const hhmm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+      const def = WORKFLOW_DEFS.find((w) => w.id === testDefId) ?? WORKFLOW_DEFS[0];
       const res = await fetch("/api/workflow/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          title: `Pipeline Connectivity Check ${hhmm}`,
+          title: `${def.name} Connectivity Check ${hhmm}`,
           description: E2E_TEST_DESCRIPTION,
+          workflowDefId: def.id,
           sources: [],
           repoConfig: {
             repos: [{ url: TEST_REPO_URL, defaultBranch: "main" }],
@@ -317,14 +321,27 @@ export default function WorkflowPage() {
               >
                 New Workflow
               </button>
-              <button
-                onClick={handleTestWorkflow}
-                disabled={isSubmitting}
-                className="flex items-center gap-2 px-4 py-2 bg-amber-600/80 text-white text-sm font-medium rounded-lg hover:bg-amber-500 transition-colors disabled:opacity-50"
-              >
-                <FlaskConical className="w-4 h-4" />
-                Test Workflow
-              </button>
+              <div className="flex items-center rounded-lg overflow-hidden border border-amber-600/40">
+                <select
+                  value={testDefId}
+                  onChange={(e) => setTestDefId(e.target.value)}
+                  disabled={isSubmitting}
+                  aria-label="Workflow to test"
+                  className="px-3 py-2 bg-[var(--color-bg-tertiary)] text-[var(--color-text-primary)] text-sm font-medium border-r border-amber-600/40 focus:outline-none disabled:opacity-50"
+                >
+                  {WORKFLOW_DEFS.map((w) => (
+                    <option key={w.id} value={w.id}>{w.name}</option>
+                  ))}
+                </select>
+                <button
+                  onClick={handleTestWorkflow}
+                  disabled={isSubmitting}
+                  className="flex items-center gap-2 px-4 py-2 bg-amber-600/80 text-white text-sm font-medium hover:bg-amber-500 transition-colors disabled:opacity-50"
+                >
+                  <FlaskConical className="w-4 h-4" />
+                  Test Workflow
+                </button>
+              </div>
             </div>
           </div>
         )}
@@ -457,91 +474,42 @@ const TEST_REPO_URL =
 
 const E2E_TEST_DESCRIPTION = `## Workflow End-to-End Connectivity Test
 
-This is a workflow end-to-end test. Each agent is being given a minimal task to prove connectivity and access to their tools. Run your task, save a short artifact to S3 confirming success, then complete.
+This is a workflow end-to-end test. Do NOT do any real work for the workflow's normal purpose — the only goal is to prove every agent in THIS workflow can be reached, can load its skill, can touch its tools, and can complete its ticket.
+
+You are the intake agent. Look at the \`## Available Agents\` list in your context — those are the agents in this workflow, each with its phase. Design and run a connectivity check FOR THIS WORKFLOW using exactly that roster. Do not assume any specific set of agents; use the ones you were actually given.
 
 ---
 
-## REQUIREMENTS AGENT — YOUR STEPS:
+## YOUR STEPS (intake agent):
 
-1. Load skill \`requirements-analysis\`
-2. Create EXACTLY these 5 tickets using \`Tickets___create_ticket\`. Each ticket's description must contain the exact instructions for that agent shown in the section below — copy-paste the relevant block.
+1. Load your own skill.
+2. For EACH agent in \`## Available Agents\`, create one ticket with \`Tickets___create_ticket\`:
+   - summary = "<phase>: <agentId> — connectivity check"
+   - assignee = that agentId
+   - blocked_by = wire the dependency graph by phase order: the earliest phase's tickets are blocked only by YOUR intake ticket; each later phase's tickets are blocked by the ticket(s) of the immediately preceding phase. (This recreates the natural pipeline order for whatever workflow this is.)
+   - description = the per-agent connectivity instructions below (fill in {agentId} and {skill}).
+3. Save artifact to S3: \`workflows/{workflowId}/agents/{yourAgentId}/test-pass.md\` with content "Intake connectivity check — created N tickets".
+4. Call \`WorkflowOutput___report_completion\`.
 
-   **Ticket 1:** summary="Design: Frontend Designer", assignee="agentcore_hub_frontend_designer", blocked_by=[YOUR_TICKET_ID]
-   **Ticket 2:** summary="Review: Security Reviewer", assignee="agentcore_hub_security_reviewer", blocked_by=[YOUR_TICKET_ID]
-   **Ticket 3:** summary="Review: Legal Compliance", assignee="agentcore_hub_legal_compliance", blocked_by=[YOUR_TICKET_ID]
-   **Ticket 4:** summary="Dev: Frontend Dev", assignee="agentcore_hub_frontend_dev", blocked_by=[TICKET_1, TICKET_2, TICKET_3]
-   **Ticket 5:** summary="QA: Verifier", assignee="agentcore_hub_qa_verifier", blocked_by=[TICKET_4]
-
-   Do NOT create a CI ticket — QA will create it.
-
-3. Save artifact to S3: \`workflows/{workflowId}/agents/agentcore_hub_requirements_analyst/test-pass.md\` with content "Requirements connectivity check — created 5 tickets"
-4. Call \`WorkflowOutput___report_completion\`
+If a downstream agent's normal job is to CREATE tickets for a later phase (e.g. a QA/verifier that opens a follow-up ticket), instruct it to do that small ticket-creation as its task rather than skipping the phase.
 
 ---
 
-## INSTRUCTIONS TO PUT IN EACH TICKET DESCRIPTION:
+## PER-AGENT TICKET DESCRIPTION TEMPLATE (put this in each ticket you create):
 
-### For Frontend Designer (Ticket 1):
 \`\`\`
-Connectivity check — Frontend Designer:
-1. Load skill \`frontend-design\`
-2. Confirm GitHub access: run \`git ls-remote ${TEST_REPO_URL}\` (or any equivalent gh/git command) and capture the first few refs as proof
-3. Save to S3: workflows/{workflowId}/agents/agentcore_hub_frontend_designer/test-pass.md — include the ref output and "GitHub access confirmed"
-4. Call WorkflowOutput___report_completion
-Do not write code. Do not clone repos.
-\`\`\`
-
-### For Security Reviewer (Ticket 2):
-\`\`\`
-Connectivity check — Security Reviewer:
-1. Load skill \`code-review\`
-2. Confirm GitHub access: run \`git ls-remote ${TEST_REPO_URL}\` and capture the first few refs
-3. Save to S3: workflows/{workflowId}/agents/agentcore_hub_security_reviewer/test-pass.md — include the ref output and "GitHub access confirmed"
-4. Call WorkflowOutput___report_completion
-Do not write code. Do not clone repos.
-\`\`\`
-
-### For Legal Compliance (Ticket 3):
-\`\`\`
-Connectivity check — Legal Compliance:
-1. Load skill \`privacy-compliance\`
-2. Confirm GitHub access: run \`git ls-remote ${TEST_REPO_URL}\` and capture the first few refs
-3. Save to S3: workflows/{workflowId}/agents/agentcore_hub_legal_compliance/test-pass.md — include the ref output and "GitHub access confirmed"
-4. Call WorkflowOutput___report_completion
-Do not write code. Do not clone repos.
-\`\`\`
-
-### For Frontend Dev (Ticket 4):
-\`\`\`
-Connectivity check — Frontend Dev:
-1. Load skill \`full-stack\`
-2. Confirm Claude Code is available: run a simple \`claude --version\` (or equivalent) and a one-shot ping prompt like \`claude -p "reply with the single word: pong"\` and capture both outputs
-3. Save to S3: workflows/{workflowId}/agents/agentcore_hub_frontend_dev/test-pass.md — include the version + ping output and "Claude Code access confirmed"
-4. Call WorkflowOutput___report_completion
-Do not write code. Do not clone repos.
-\`\`\`
-
-### For QA Verifier (Ticket 5):
-\`\`\`
-Connectivity check — QA Verifier:
-1. Load skill \`qa-verification\`
-2. Create the CI ticket using Tickets___create_ticket:
-   - summary: "CI: Agent — connectivity check"
-   - assignee: "agentcore_hub_ci_agent"
-   - blocked_by: [YOUR_TICKET_ID]
-   - description: |
-     Connectivity check — CI Agent:
-     1. Load skill \`ci-verification\`
-     2. Save to S3: workflows/{workflowId}/agents/agentcore_hub_ci_agent/test-pass.md — content: "CI connectivity check passed"
-     3. Call WorkflowOutput___report_completion
-     Do not write code. Do not clone repos.
-3. Save to S3: workflows/{workflowId}/agents/agentcore_hub_qa_verifier/test-pass.md — content: "QA connectivity check passed — CI ticket created"
-4. Call WorkflowOutput___report_completion
-Do not write code. Do not clone repos.
+Connectivity check — {agentId}:
+1. Load your skill ({skill}).
+2. Touch ONE of your tools to prove access and capture a short proof:
+   - If you have GitHub/git tools: run \`git ls-remote ${TEST_REPO_URL}\` and capture the first few refs.
+   - Otherwise touch any one tool you have (e.g. current_time, http_request, an S3 list) and capture its output.
+3. Save to S3: workflows/{workflowId}/agents/{agentId}/test-pass.md — include the proof output and "connectivity confirmed".
+4. Call WorkflowOutput___report_completion.
+Do not do real work. Do not write code. Do not clone repos. Keep it to one tiny task.
 \`\`\`
 
 ---
 
 ## EXPECTED FLOW:
-Requirements → Design + Security + Legal (parallel) → Dev → QA → CI → Complete`;
+Intake → (each phase in order, fanned out per the roster) → final phase → Complete`;
 

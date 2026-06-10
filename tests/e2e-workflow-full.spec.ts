@@ -1,122 +1,117 @@
 import { test, expect } from "@playwright/test";
+import { WORKFLOW_DEFS, getPhaseOrder } from "../src/lib/workflow/workflow-defs";
 
 /**
- * Full end-to-end workflow test against the DEPLOYED site.
+ * Full end-to-end workflow test against the DEPLOYED site — for EVERY workflow def.
  *
- * Drives the built-in "Test Workflow" button on /workflow, which fires the same
- * connectivity-check pipeline as scripts/test-ticket-flow.sh: each of the 14
- * agents loads its skill, touches its tools (git ls-remote, a tiny S3 write),
- * and reports completion — no code is written and no repos are cloned. That is
- * the intended e2e path: it exercises real orchestration + every agent's tool
- * access while finishing far faster than a feature build. We then poll the
- * state API until the pipeline reaches "complete".
+ * The /workflow empty-state has a def selector + "Test Workflow" button. Picking a
+ * def and clicking the button POSTs to /api/workflow/start with that workflowDefId
+ * and a generic connectivity-check description: the intake agent reads its own
+ * `## Available Agents` roster, fans out one tiny ticket per downstream agent, each
+ * agent loads its skill + touches one tool + reports completion. No real work, no
+ * code written. Same lightweight flow works for any workflow shape.
  *
- * This test triggers REAL agent execution and takes several minutes.
+ * One test is generated per workflow def. Each polls the state API until the
+ * pipeline reaches "complete", validating against that def's own phase order.
+ *
+ * Triggers REAL agent execution — slow (several minutes each).
  * Run with: npx playwright test tests/e2e-workflow-full.spec.ts --timeout 600000
  */
-test.describe("End-to-End Workflow", () => {
-  test.setTimeout(600_000); // 10 minutes
+test.describe("End-to-End Workflow (all defs)", () => {
+  test.setTimeout(600_000); // 10 minutes per def
 
-  test("run built-in Test Workflow and verify pipeline reaches complete", async ({ page, request }) => {
-    // 1. Navigate to workflow page — fresh load shows the empty-state panel
-    //    with the amber "Test Workflow" button (it only renders when no
-    //    workflow is selected and the intake form is closed).
-    await page.goto("/workflow");
+  for (const def of WORKFLOW_DEFS) {
+    const phaseOrder = getPhaseOrder(def); // ["intake", ...phases, "complete"]
 
-    // 2. Click the built-in Test Workflow button. handleTestWorkflow POSTs to
-    //    /api/workflow/start with the connectivity-check description, then
-    //    pushState's the new id into the URL as ?id=<workflowId>.
-    const testBtn = page.getByRole("button", { name: "Test Workflow" });
-    await expect(testBtn).toBeVisible({ timeout: 10_000 });
-    await testBtn.click();
-    await page.screenshot({ path: "test-results/workflow-01-test-clicked.png" });
+    test(`[${def.id}] run Test Workflow and verify pipeline reaches complete`, async ({ page, request }) => {
+      // 1. Fresh load shows the empty-state panel with the def selector + button.
+      await page.goto("/workflow");
 
-    // 3. Extract the workflow ID from the URL once handleTestWorkflow navigates.
-    let workflowId: string | null = null;
-    await expect
-      .poll(async () => {
-        const m = page.url().match(/[?&]id=([^&]+)/);
-        workflowId = m ? m[1] : null;
-        return workflowId;
-      }, { timeout: 30_000, message: "Test Workflow did not produce a workflow id in the URL" })
-      .toBeTruthy();
+      // 2. Select this workflow def, then click Test Workflow. handleTestWorkflow
+      //    POSTs to /api/workflow/start with workflowDefId and pushState's ?id=.
+      await page.getByLabel("Workflow to test").selectOption(def.id);
+      const testBtn = page.getByRole("button", { name: "Test Workflow" });
+      await expect(testBtn).toBeVisible({ timeout: 10_000 });
+      await testBtn.click();
+      await page.screenshot({ path: `test-results/workflow-${def.id}-01-clicked.png` });
 
-    // Fallback: if pushState didn't land, take the most recent workflow.
-    if (!workflowId) {
-      const listRes = await request.get("/api/workflow/list");
-      if (listRes.ok()) {
-        const data = await listRes.json();
-        if (data.workflows?.length > 0) workflowId = data.workflows[0].id;
-      }
-    }
+      // 3. Extract the workflow ID from the URL.
+      let workflowId: string | null = null;
+      await expect
+        .poll(async () => {
+          const m = page.url().match(/[?&]id=([^&]+)/);
+          workflowId = m ? m[1] : null;
+          return workflowId;
+        }, { timeout: 30_000, message: "Test Workflow did not produce a workflow id in the URL" })
+        .toBeTruthy();
 
-    console.log(`Workflow ID: ${workflowId}`);
-    expect(workflowId).toBeTruthy();
-
-    // 5. Poll the state API for real phase progression
-    const phaseOrder = ["requirements", "design", "development", "qa", "review", "complete"];
-    let lastPhase = "";
-    let ticketsDone = 0;
-    let totalTickets = 0;
-    let reachedComplete = false;
-
-    for (let i = 0; i < 120; i++) { // 120 * 5s = 10 minutes max
-      await new Promise((r) => setTimeout(r, 5000));
-
-      // Poll state API
-      const stateRes = await request.get(`/api/workflow/${workflowId}/state`);
-      if (!stateRes.ok()) {
-        console.log(`State API returned ${stateRes.status()} — retrying...`);
-        continue;
+      // Fallback: most recent workflow if pushState didn't land.
+      if (!workflowId) {
+        const listRes = await request.get("/api/workflow/list");
+        if (listRes.ok()) {
+          const data = await listRes.json();
+          if (data.workflows?.length > 0) workflowId = data.workflows[0].id;
+        }
       }
 
-      const state = await stateRes.json();
-      const currentPhase = state.phase || "";
-      // agentTasks is an object keyed by agent ID, tickets is an array
-      const tasksRaw = state.agentTasks || state.tickets || {};
-      const tasks = Array.isArray(tasksRaw) ? tasksRaw : Object.values(tasksRaw) as { status?: string }[];
-      totalTickets = tasks.length;
-      ticketsDone = tasks.filter((t: { status?: string }) =>
-        t.status === "done" || t.status === "Done" || t.status === "closed" || t.status === "complete"
-      ).length;
+      console.log(`[${def.id}] Workflow ID: ${workflowId}`);
+      expect(workflowId).toBeTruthy();
 
-      // Log phase transitions
-      if (currentPhase !== lastPhase) {
-        console.log(`Phase transition: ${lastPhase || "(start)"} → ${currentPhase} (${ticketsDone}/${totalTickets} tickets done, elapsed: ${i * 5}s)`);
-        lastPhase = currentPhase;
+      // 4. Poll the state API for real phase progression against THIS def's order.
+      let lastPhase = "";
+      let ticketsDone = 0;
+      let totalTickets = 0;
+      let reachedComplete = false;
 
-        // Screenshot on phase change
-        await page.reload();
-        await page.waitForTimeout(2000);
-        await page.screenshot({ path: `test-results/workflow-phase-${currentPhase}.png` });
+      for (let i = 0; i < 120; i++) { // 120 * 5s = 10 minutes max
+        await new Promise((r) => setTimeout(r, 5000));
+
+        const stateRes = await request.get(`/api/workflow/${workflowId}/state`);
+        if (!stateRes.ok()) {
+          console.log(`[${def.id}] State API returned ${stateRes.status()} — retrying...`);
+          continue;
+        }
+
+        const state = await stateRes.json();
+        const currentPhase = state.phase || "";
+        const tasksRaw = state.agentTasks || state.tickets || {};
+        const tasks = Array.isArray(tasksRaw) ? tasksRaw : Object.values(tasksRaw) as { status?: string }[];
+        totalTickets = tasks.length;
+        ticketsDone = tasks.filter((t: { status?: string }) =>
+          t.status === "done" || t.status === "Done" || t.status === "closed" || t.status === "complete"
+        ).length;
+
+        if (currentPhase !== lastPhase) {
+          console.log(`[${def.id}] Phase: ${lastPhase || "(start)"} → ${currentPhase} (${ticketsDone}/${totalTickets} done, ${i * 5}s)`);
+          lastPhase = currentPhase;
+          await page.reload();
+          await page.waitForTimeout(2000);
+          await page.screenshot({ path: `test-results/workflow-${def.id}-phase-${currentPhase}.png` });
+        }
+
+        if (i % 12 === 0 && i > 0) {
+          console.log(`[${def.id}]   ... still in "${currentPhase}" (${ticketsDone}/${totalTickets}, ${i * 5}s)`);
+        }
+
+        if (currentPhase === "complete" || currentPhase === "completed") {
+          reachedComplete = true;
+          console.log(`[${def.id}] COMPLETE after ${i * 5}s — ${ticketsDone}/${totalTickets} tickets done`);
+          break;
+        }
       }
 
-      // Log progress periodically
-      if (i % 12 === 0 && i > 0) {
-        console.log(`  ... still in phase "${currentPhase}" (${ticketsDone}/${totalTickets} done, ${i * 5}s elapsed)`);
+      // 5. Final validation against this def's phase order.
+      await page.screenshot({ path: `test-results/workflow-${def.id}-03-final.png` });
+
+      if (!reachedComplete) {
+        console.log(`[${def.id}] Did not reach "complete". Last phase: ${lastPhase} (${ticketsDone}/${totalTickets})`);
       }
-
-      // Success: pipeline completed
-      if (currentPhase === "complete" || currentPhase === "completed") {
-        reachedComplete = true;
-        console.log(`Pipeline COMPLETE after ${i * 5}s — ${ticketsDone}/${totalTickets} tickets done`);
-        break;
-      }
-    }
-
-    // 6. Final validation
-    await page.screenshot({ path: "test-results/workflow-03-final-state.png" });
-
-    // The connectivity check is designed to finish — each agent does a tiny,
-    // bounded task. Hold the full bar: the pipeline must reach "complete".
-    const phaseIdx = phaseOrder.indexOf(lastPhase);
-    if (!reachedComplete) {
-      console.log(`Pipeline did not reach "complete" within timeout. Last phase: ${lastPhase} (${ticketsDone}/${totalTickets} done)`);
-    }
-    expect(reachedComplete, `pipeline should reach "complete"; last phase was "${lastPhase}" with ${ticketsDone}/${totalTickets} tickets done`).toBe(true);
-    expect(phaseIdx).toBe(phaseOrder.length - 1);
-    expect(ticketsDone).toBe(totalTickets);
-  });
+      const phaseIdx = phaseOrder.indexOf(lastPhase);
+      expect(reachedComplete, `[${def.id}] pipeline should reach "complete"; last phase was "${lastPhase}" with ${ticketsDone}/${totalTickets} tickets done`).toBe(true);
+      expect(phaseIdx, `[${def.id}] last phase "${lastPhase}" not in def phase order ${JSON.stringify(phaseOrder)}`).toBe(phaseOrder.length - 1);
+      expect(ticketsDone).toBe(totalTickets);
+    });
+  }
 
   test("verify workflow state API returns data for existing workflows", async ({ request }) => {
     const listRes = await request.get("/api/workflow/list");

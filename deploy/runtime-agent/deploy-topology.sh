@@ -28,6 +28,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 AGENTS_JSON="$REPO_ROOT/src/config/agents.json"
+WORKFLOWS_JSON="$REPO_ROOT/src/config/workflows.json"
 PROMPTS_DIR="$SCRIPT_DIR/prompts"
 
 : "${AWS_REGION:?AWS_REGION must be set}"
@@ -59,6 +60,11 @@ if [[ "$COUNT" == "14" ]]; then
   echo ""
   echo "→ Uploading agents.json to s3://${ARTIFACT_BUCKET}/config/agents.json"
   aws s3 cp "$AGENTS_JSON" "s3://${ARTIFACT_BUCKET}/config/agents.json" \
+    --region "$AWS_REGION" \
+    --content-type application/json \
+    --only-show-errors
+  echo "→ Uploading workflows.json to s3://${ARTIFACT_BUCKET}/config/workflows.json"
+  aws s3 cp "$WORKFLOWS_JSON" "s3://${ARTIFACT_BUCKET}/config/workflows.json" \
     --region "$AWS_REGION" \
     --content-type application/json \
     --only-show-errors
@@ -220,9 +226,16 @@ PYEOF
 
 # ── Upload the rewritten agents.json so Lambdas pick it up at next cold start ─
 # (DL-023: the orchestrator, agentcore-hub-tickets, and agentcore-hub-jira
-# Lambdas all read s3://${ARTIFACT_BUCKET}/config/agents.json on cold start.)
+# Lambdas all read s3://${ARTIFACT_BUCKET}/config/agents.json on cold start.
+# The orchestrator also reads config/workflows.json for per-def intake agent,
+# phase order, and completion phases — without it, only software-delivery works.)
 echo "→ Uploading agents.json to s3://${ARTIFACT_BUCKET}/config/agents.json"
 aws s3 cp "$AGENTS_JSON" "s3://${ARTIFACT_BUCKET}/config/agents.json" \
+  --region "$AWS_REGION" \
+  --content-type application/json \
+  --only-show-errors
+echo "→ Uploading workflows.json to s3://${ARTIFACT_BUCKET}/config/workflows.json"
+aws s3 cp "$WORKFLOWS_JSON" "s3://${ARTIFACT_BUCKET}/config/workflows.json" \
   --region "$AWS_REGION" \
   --content-type application/json \
   --only-show-errors

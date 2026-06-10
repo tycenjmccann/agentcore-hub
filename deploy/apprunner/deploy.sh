@@ -188,9 +188,10 @@ aws iam put-role-policy \
         \"Sid\": \"CloudWatch\",
         \"Effect\": \"Allow\",
         \"Action\": [
-          \"cloudwatch:GetMetricData\", \"cloudwatch:ListMetrics\",
+          \"cloudwatch:GetMetricData\", \"cloudwatch:GetMetricStatistics\", \"cloudwatch:ListMetrics\",
           \"logs:DescribeLogGroups\", \"logs:DescribeLogStreams\",
-          \"logs:GetLogEvents\", \"logs:FilterLogEvents\"
+          \"logs:GetLogEvents\", \"logs:FilterLogEvents\",
+          \"logs:StartQuery\", \"logs:StopQuery\", \"logs:GetQueryResults\"
         ],
         \"Resource\": \"*\"
       },
@@ -277,7 +278,7 @@ if [[ -n "$EXISTING_ARN" ]]; then
         \"AccessRoleArn\": \"${ECR_ACCESS_ROLE_ARN}\"
       },
       \"ImageRepository\": {
-        \"ImageIdentifier\": \"${LATEST_TAG}\",
+        \"ImageIdentifier\": \"${FULL_TAG}\",
         \"ImageRepositoryType\": \"ECR\",
         \"ImageConfiguration\": {
           \"Port\": \"8080\",
@@ -290,6 +291,14 @@ if [[ -n "$EXISTING_ARN" ]]; then
     }" \
     --output text >/dev/null
   echo "        Update started"
+  # update-service is a no-op when the image tag is unchanged (content-only
+  # changes reuse the same git-SHA tag). Force a fresh pull so the new image
+  # is actually deployed.
+  aws apprunner start-deployment \
+    --service-arn "$EXISTING_ARN" \
+    --region "$AWS_REGION" \
+    --output text >/dev/null 2>&1 || true
+  echo "        Forced fresh deployment"
 else
   echo "        Creating new service..."
   aws apprunner create-service \

@@ -14,6 +14,16 @@
  */
 
 import agentsConfig from "@/config/agents.json";
+import {
+  getWorkflowDef,
+  DEFAULT_WORKFLOW_DEF_ID,
+  type WorkflowDef,
+} from "@/lib/workflow/workflow-defs";
+
+/** agents.json entries are tagged with workflowDefId; missing → default workflow. */
+function agentWorkflowDefId(a: { workflowDefId?: string }): string {
+  return a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID;
+}
 
 // ─── Tool → Icon Mapping ────────────────────────────────────────────────────
 // Derived from agents.json tool arrays. Maps tool names to icon categories.
@@ -249,7 +259,7 @@ export interface PipelineAgentConfig {
 // ─── Pipeline Phase Config (derived) ────────────────────────────────────────
 
 export interface PipelinePhaseConfig {
-  id: PipelinePhaseId;
+  id: string;
   name: string;
   num: number;
   type: "app" | "agent";
@@ -279,20 +289,36 @@ const AGENT_PHASE_TO_PIPELINE_PHASE: Record<string, PipelinePhaseId> = {
   review: "qa",
 };
 
+/**
+ * Build the agentPhase → pipeline-phase-id map for a workflow definition.
+ * For software-delivery this reproduces AGENT_PHASE_TO_PIPELINE_PHASE; for other
+ * workflows each phase's agentPhase maps to its own phase id.
+ */
+function phaseMapForDef(def: WorkflowDef): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const phase of def.phases) {
+    map[phase.agentPhase] = phase.id;
+  }
+  return map;
+}
+
 // ─── Helper: Phase-level counts ─────────────────────────────────────────────
 
 const EXCLUDED_TOOLS = new Set(["gateway", "browser", "invoke_team_agent"]);
 
+/** Agents belonging to a workflow definition (by workflowDefId tag). */
+function agentsForDef(defId: string) {
+  return agentsConfig.agents.filter((a) => agentWorkflowDefId(a) === defId);
+}
+
 /** Count unique tools for a phase, excluding "gateway", "browser", "invoke_team_agent" */
-export function getPhaseToolCount(phaseId: PipelinePhaseId): number {
+export function getPhaseToolCount(phaseId: string, defId: string = DEFAULT_WORKFLOW_DEF_ID): number {
+  const map = phaseMapForDef(getWorkflowDef(defId));
   const tools = new Set<string>();
-  for (const agent of agentsConfig.agents) {
-    const mappedPhase = AGENT_PHASE_TO_PIPELINE_PHASE[agent.phase];
-    if (mappedPhase === phaseId) {
+  for (const agent of agentsForDef(defId)) {
+    if (map[agent.phase] === phaseId) {
       for (const tool of agent.tools) {
-        if (!EXCLUDED_TOOLS.has(tool)) {
-          tools.add(tool);
-        }
+        if (!EXCLUDED_TOOLS.has(tool)) tools.add(tool);
       }
     }
   }
@@ -300,19 +326,15 @@ export function getPhaseToolCount(phaseId: PipelinePhaseId): number {
 }
 
 /** Count runtime agents (total agents in this phase) */
-export function getPhaseRuntimeAgentCount(phaseId: PipelinePhaseId): number {
-  return agentsConfig.agents.filter((a) => {
-    const mappedPhase = AGENT_PHASE_TO_PIPELINE_PHASE[a.phase];
-    return mappedPhase === phaseId;
-  }).length;
+export function getPhaseRuntimeAgentCount(phaseId: string, defId: string = DEFAULT_WORKFLOW_DEF_ID): number {
+  const map = phaseMapForDef(getWorkflowDef(defId));
+  return agentsForDef(defId).filter((a) => map[a.phase] === phaseId).length;
 }
 
 /** Count harness agents (agents with type === "harness") */
-export function getPhaseHarnessAgentCount(phaseId: PipelinePhaseId): number {
-  return agentsConfig.agents.filter((a) => {
-    const mappedPhase = AGENT_PHASE_TO_PIPELINE_PHASE[a.phase];
-    return mappedPhase === phaseId && a.type === "harness";
-  }).length;
+export function getPhaseHarnessAgentCount(phaseId: string, defId: string = DEFAULT_WORKFLOW_DEF_ID): number {
+  const map = phaseMapForDef(getWorkflowDef(defId));
+  return agentsForDef(defId).filter((a) => map[a.phase] === phaseId && a.type === "harness").length;
 }
 
 // ─── Derive PIPELINE_PHASES from agents.json + display metadata ─────────────
@@ -331,16 +353,38 @@ function humanizeSkillSlug(slug: string): string {
     .join(" ");
 }
 
-function buildPipelinePhases(): PipelinePhaseConfig[] {
-  return PHASE_DISPLAY_ORDER.map((phaseId, idx) => {
-    const meta = PHASE_DISPLAY_META[phaseId];
+/** Generic display meta for workflows that have no bespoke PHASE_DISPLAY_META entry. */
+function genericPhaseMeta(phase: { id: string; name: string; type: "app" | "agent"; agentPhase: string }): PhaseDisplayMeta {
+  return {
+    name: phase.name,
+    type: phase.type,
+    agentPhase: phase.agentPhase,
+    identity: phase.type === "app"
+      ? [{ icon: "", label: "Next.js 14 / App Router" }]
+      : [{ icon: "agentcore", label: "AgentCore Runtime" }, { icon: "bedrock", label: "Claude (via Bedrock)" }],
+    config: [],
+    tools: phase.type === "app"
+      ? [{ dot: "ext", label: "Submit Idea / Brief" }, { icon: "s3", label: "S3 Artifact Storage" }]
+      : [],
+    outputs: phase.type === "app"
+      ? [{ icon: "eventbridge", label: "Workflow Started" }]
+      : [{ icon: "s3", label: "S3 Artifacts" }, { icon: "agentcore", label: "report_completion" }],
+  };
+}
 
-    // Derive agents for this phase from agents.json
-    const agents: PipelineAgentConfig[] = agentsConfig.agents
-      .filter((a) => {
-        const mappedPhase = AGENT_PHASE_TO_PIPELINE_PHASE[a.phase];
-        return mappedPhase === phaseId;
-      })
+function buildPipelinePhasesForDef(def: WorkflowDef): PipelinePhaseConfig[] {
+  const map = phaseMapForDef(def);
+  const isDefault = def.id === DEFAULT_WORKFLOW_DEF_ID;
+  return def.phases.map((defPhase, idx) => {
+    const phaseId = defPhase.id;
+    // Reuse bespoke display meta for the default workflow; generate it otherwise.
+    const meta: PhaseDisplayMeta = isDefault && PHASE_DISPLAY_META[phaseId as PipelinePhaseId]
+      ? PHASE_DISPLAY_META[phaseId as PipelinePhaseId]
+      : genericPhaseMeta(defPhase);
+
+    // Derive agents for this phase from agents.json (scoped to this workflow def)
+    const agents: PipelineAgentConfig[] = agentsForDef(def.id)
+      .filter((a) => map[a.phase] === phaseId)
       .map((a) => ({
         agentId: a.agentId,
         displayName: a.displayName,
@@ -406,7 +450,13 @@ function buildPipelinePhases(): PipelinePhaseConfig[] {
   });
 }
 
-export const PIPELINE_PHASES: PipelinePhaseConfig[] = buildPipelinePhases();
+/** Build the pipeline phases for a given workflow definition id. */
+export function getPipelinePhases(defId: string = DEFAULT_WORKFLOW_DEF_ID): PipelinePhaseConfig[] {
+  return buildPipelinePhasesForDef(getWorkflowDef(defId));
+}
+
+/** Default workflow pipeline (software-delivery) — preserves the original export. */
+export const PIPELINE_PHASES: PipelinePhaseConfig[] = getPipelinePhases();
 
 // ─── Helper: Resolve tool name to icon ──────────────────────────────────────
 
