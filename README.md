@@ -7,13 +7,14 @@ A web console for Amazon Bedrock AgentCore that dynamically discovers and intera
 - **Dashboard** — Real metrics from CloudWatch and OTEL traces: invocations, per-agent token usage, latency, sessions
 - **Agents** — Card grid of harnesses and runtimes; click for detail + invoke
 - **Agent Detail** — Model, tools, memory, logs + live chat with sessions and full OTEL execution trace
+- **Registry** — Browse, search, and manage records in the Amazon Bedrock AgentCore Registry (MCP servers, A2A agents, custom resources, agent skills): full CRUD, semantic search, and the approval lifecycle
 - **Builder** — Chat-based agent creation (harness with code_interpreter + MCP)
-- **Workflow** — Autonomous development pipeline: submit a feature request, 14 agents produce a PR. Real-time pipeline visualization with animated phases, timeline replay/scrubber, S3 artifact browsing, and dynamic header titles
+- **Workflow** — Config-driven multi-agent pipelines: submit a request and a roster of agents produce the deliverable. Ships four workflows (Software Delivery → a PR; Marketing; Sales; Legal), each defined in `src/config/workflows.json`. Real-time pipeline visualization with animated phases, timeline replay/scrubber, S3 artifact browsing, optional **human review gates**, and dynamic header titles
 
 ### Modular by design
 
 The console is a small always-on **core** (Dashboard, Agents, Invoke) plus
-optional **bolt-on modules** (Workflow, Evaluations, Builder). Each
+optional **bolt-on modules** (Workflow, Registry, Evaluations, Builder). Each
 module's UI, API routes, Lambdas, and DynamoDB tables are namespaced, so you can
 deploy only what you need and cherry-pick the rest out. See
 [`docs/MODULES.md`](docs/MODULES.md) for the core-vs-optional breakdown, per-module
@@ -342,16 +343,56 @@ Without `BUILDER_AGENT_ID`, the Build page falls back to a direct Converse API c
 
 ---
 
-## Development Pipeline (14 Agents)
+## Workflow Pipelines (config-driven)
 
-The Workflow tab runs an autonomous software development pipeline. Submit a feature request and 14 specialized agents (requirements, design, development, QA, review) produce a pull request.
+The Workflow tab runs config-driven multi-agent pipelines. A pipeline's **shape**
+(ordered phases, intake agent, completion criteria, review gates) is defined in
+`src/config/workflows.json`; the **agent roster** is derived from
+`src/config/agents.json` (each agent tagged with `workflowDefId` + `phase`). Four
+workflows ship by default:
+
+| Workflow | Intake → phases | Output |
+|----------|-----------------|--------|
+| **Software Delivery** | requirements → design → development → QA | a pull request |
+| **Marketing Campaign** | strategy → creative (social/blog/ads) → assets → brand QA → scheduling | a launched campaign |
+| **Sales Proposal** | qualification → drafting → deal review → approval | a routed proposal |
+| **Legal Contract Review** | triage → review → redline → sign-off | redlined contract |
+
+Adding a workflow is a config edit (a new `workflows.json` def + agents tagged
+with its `workflowDefId`) — no orchestration code changes. The intake agent reads
+its `## Available Agents` roster at runtime and fans out the ticket graph.
 
 ### Architecture
 
-- **Agents:** 14 Strands agents deployed on AgentCore Runtime (configurable 600s timeout)
-- **Orchestration:** DynamoDB Streams cascade — ticket status changes trigger the next phase
+- **Agents:** Strands agents on AgentCore Runtime (configurable 600s timeout); the software-delivery fleet is 14 agents
+- **Orchestration:** ticket-status cascade — DynamoDB Streams (dynamodb mode) or Jira webhooks (jira mode) trigger the next phase
 - **Tools:** Agents connect to external tools via MCP (GitHub, GitLab, Jira, etc.) — configurable per deployment
 - **Model:** Claude Opus 4.6 (default, configurable via `MODEL_ID` env var)
+
+### Human Review Gates (optional)
+
+Any phase can require human approval before the next phase proceeds. Gates are
+declared per workflow in `src/config/workflows.json`:
+
+```jsonc
+"reviewGates": [
+  {
+    "afterPhase": "design",        // gate fires when this phase's agent tickets are all done
+    "name": "Design Review",
+    "blocking": true,               // true → downstream waits; false → advisory
+    "condition": "flagged",         // "always" → always on; "flagged" → opt-in per run (intake form)
+    "onReject": "rework",           // "rework" re-opens the reviewed work; "hold" just pauses
+    "assignee": "human:design-lead" // a person, not an agent
+  }
+]
+```
+
+How it works (reuses the existing ticket cascade — no new engine):
+- The intake agent inserts a review ticket assigned to `human:<who>`, blocked by the phase's agent tickets.
+- The orchestrator recognizes `human:*` assignees: it parks the ticket in **in_review** and records a `review_needed` notification instead of invoking an agent. Downstream tickets stay blocked.
+- In the UI ticket modal, the reviewer clicks **Approve** (→ done, the cascade resumes) or **Request changes** (→ blocked; a required note is fed back to the reworked agents).
+- Works in both backends: Jira shows the **In Review** column with a `reviewer:<who>` label; DynamoDB uses the `in_review` status.
+- `flagged` gates are opt-in checkboxes on the intake form; `always` gates apply to every run.
 
 ### Jira Integration (Real Jira Cloud)
 
@@ -463,7 +504,7 @@ Each customer plugs in their own tooling via the `MCP_SERVERS` environment varia
 
 `GITHUB_PAT` is supported as a shorthand for the common GitHub case.
 
-### Pipeline Phases
+### Pipeline Phases (Software Delivery workflow)
 
 | Phase | Agents | Function |
 |-------|--------|----------|
@@ -471,6 +512,9 @@ Each customer plugs in their own tooling via the `MCP_SERVERS` environment varia
 | Design | 8 (Frontend, iOS, Android, Backend, Security, Legal, Localization, Analytics) | Parallel design docs |
 | Development | 3 (Backend Dev, API Dev, Frontend Dev) | Parallel code generation + PR |
 | QA | 2 (QA Verifier, CI Agent) | Test verification + code review |
+
+The Marketing, Sales, and Legal workflows have their own phase/agent rosters —
+see `src/config/workflows.json` and `src/config/agents.json`.
 
 ### Why the workflow fleet uses Runtime agents
 
