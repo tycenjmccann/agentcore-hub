@@ -415,43 +415,32 @@ function isHumanAssignee(assignee) {
 async function handleHumanReviewGate(ticketId, assignee, workflow) {
   const reviewer = assignee.slice("human:".length);
 
-  // Idempotency: only park + notify on the FIRST transition into in_review.
-  // DDB stream re-deliveries / duplicate Jira webhooks must not push duplicate
-  // notifications. DDB uses a conditional write; Jira reads current status.
+  // Park the ticket in "in_review" (idempotent — setting it again is a no-op).
   if (TICKET_PROVIDER === "jira") {
-    const current = await getTicket(ticketId);
-    if (current?.status === "in_review") {
-      console.log(`[orchestrator] ${ticketId} already in_review — skipping duplicate gate handling.`);
-      return;
-    }
     await jiraTransition(ticketId, "In Review");
   } else {
-    try {
-      await ddb.send(new UpdateCommand({
-        TableName: TICKETS_TABLE,
-        Key: { ticketId },
-        UpdateExpression: "SET #s = :s, #u = :u",
-        ConditionExpression: "#s <> :inreview",
-        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-        ExpressionAttributeValues: { ":s": "in_review", ":inreview": "in_review", ":u": new Date().toISOString() },
-      }));
-    } catch (err) {
-      if (err.name === "ConditionalCheckFailedException") {
-        console.log(`[orchestrator] ${ticketId} already in_review — skipping duplicate gate handling.`);
-        return;
-      }
-      throw err;
-    }
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId },
+      UpdateExpression: "SET #s = :s, #u = :u",
+      ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+      ExpressionAttributeValues: { ":s": "in_review", ":u": new Date().toISOString() },
+    }));
   }
 
-  // Record a human notification on the workflow so the UI can surface it.
-  // Replace any prior unacknowledged notification for this ticket (a new review
-  // cycle supersedes the last) rather than appending a duplicate id.
+  // Idempotency is tracked on the SIDE EFFECT (the notification), not the ticket
+  // status — the status write and the notification aren't atomic, so a redelivery
+  // after a status-write-but-save-failure must still create the missing one.
+  // Only skip when an unacknowledged review_needed notification already exists.
   if (workflow) {
     if (!Array.isArray(workflow.humanNotifications)) workflow.humanNotifications = [];
-    workflow.humanNotifications = workflow.humanNotifications.filter(
-      (n) => !(n.ticketId === ticketId && n.type === "review_needed" && !n.acknowledged)
+    const alreadyNotified = workflow.humanNotifications.some(
+      (n) => n.ticketId === ticketId && n.type === "review_needed" && !n.acknowledged
     );
+    if (alreadyNotified) {
+      console.log(`[orchestrator] ${ticketId} already has an open review notification — skipping duplicate.`);
+      return;
+    }
     workflow.humanNotifications.push({
       id: `notif_${ticketId}_${new Date().toISOString()}`,
       type: "review_needed",
@@ -480,6 +469,14 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
 async function handleReviewRejection(gateTicket) {
   const workflow = await resolveWorkflow(gateTicket.workflowId, gateTicket.parentId);
   if (!workflow) return;
+
+  // Acknowledge this gate's open review notification — the review concluded, and
+  // clearing it lets a later cycle (after rework) create a fresh notification.
+  if (Array.isArray(workflow.humanNotifications)) {
+    for (const n of workflow.humanNotifications) {
+      if (n.ticketId === gateTicket.ticketId && n.type === "review_needed") n.acknowledged = true;
+    }
+  }
 
   // The gate's blockedBy lists the agent tickets it reviewed. Their shared agent
   // phase is the gate's `afterPhase` — match the SPECIFIC gate by phase (a

@@ -260,6 +260,23 @@ async function transitionTicket(params) {
   const isSkip = targetStatus === "skip";
   const effectiveStatus = isSkip ? "Done" : jiraStatusName;
 
+  // in_review is reserved for human-review-gate tickets (reviewer:<who> label).
+  // An agent ticket parked there is never invoked → the workflow stalls. Reject.
+  if (jiraStatusName.toLowerCase() === "in review") {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels`);
+    const labels = issue?.fields?.labels || [];
+    if (!labels.some((l) => l.startsWith("reviewer:"))) {
+      throw new Error(`Cannot move ${ticket_id} to In Review: only human-review tickets can be sent to review.`);
+    }
+  }
+
+  // Add the reason as a comment BEFORE the transition. The transition fires the
+  // status webhook → orchestrator rejection handler reads the latest comment;
+  // commenting first avoids a race where rework starts before the feedback lands.
+  if (reason) {
+    await addComment({ ticket_id, comment: isSkip ? `Skipped: ${reason}` : reason });
+  }
+
   // Transition in Jira
   const data = await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`);
   const match = data.transitions.find(
@@ -276,13 +293,6 @@ async function transitionTicket(params) {
     method: "POST",
     body: JSON.stringify({ transition: { id: match.id } }),
   });
-
-  // Add reason as comment in Jira
-  if (isSkip && reason) {
-    await addComment({ ticket_id, comment: `Skipped: ${reason}` });
-  } else if (reason) {
-    await addComment({ ticket_id, comment: reason });
-  }
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira`);
