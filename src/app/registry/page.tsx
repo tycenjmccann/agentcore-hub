@@ -69,6 +69,12 @@ function extractInlineContent(
   }
 }
 
+/** Pull the optional AGENT_SKILLS skillDefinition inlineContent (for PATCH). */
+function extractSkillDefinitionContent(descriptors: Record<string, unknown>): string | undefined {
+  const d = descriptors as Record<string, any>;
+  return d?.agentSkills?.skillDefinition?.inlineContent || undefined;
+}
+
 type TabValue = "ALL" | DescriptorType;
 
 export default function RegistryPage() {
@@ -188,15 +194,22 @@ export default function RegistryPage() {
   async function handleSubmitRecord(payload: RecordSubmitPayload) {
     if (!selectedRegistryId) throw new Error("No registry selected.");
     if (editTarget) {
-      // PATCH route updates name + descriptors.inlineContent only; it needs the
-      // descriptorType + the raw inlineContent string (not the nested union).
+      // PATCH route updates name, description, and descriptors content. It needs
+      // the descriptorType + the raw inlineContent string (not the nested union),
+      // plus the optional AGENT_SKILLS skill-definition content. recordVersion is
+      // an optimistic-lock token the service auto-increments, so it is not sent.
       await apiSend(
         `${REGISTRY_PREFIX}/${selectedRegistryId}/records/${editTarget.recordId}`,
         "PATCH",
         {
           name: payload.name,
+          description: payload.description || "",
           descriptorType: payload.descriptorType,
           inlineContent: extractInlineContent(payload.descriptorType, payload.descriptors),
+          skillDefinitionContent:
+            payload.descriptorType === "AGENT_SKILLS"
+              ? extractSkillDefinitionContent(payload.descriptors)
+              : undefined,
         }
       );
     } else {

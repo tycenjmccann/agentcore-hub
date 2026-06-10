@@ -1133,13 +1133,15 @@ export async function createRegistryRecord(
 export async function updateRegistryRecord(
   registryId: string,
   recordId: string,
-  patch: { name?: string; descriptorType?: RegistryDescriptorType; inlineContent?: string },
+  patch: { name?: string; description?: string; descriptorType?: RegistryDescriptorType; inlineContent?: string; skillDefinitionContent?: string },
   region: string = DEFAULT_REGION
 ): Promise<void> {
   const client = getControlClient(region);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const input: any = { registryId, recordId };
   if (patch.name !== undefined) input.name = patch.name;
+  // Description uses the UpdatedDescription wrapper: { optionalValue: <text> }.
+  if (patch.description !== undefined) input.description = { optionalValue: patch.description };
 
   if (patch.inlineContent !== undefined && patch.descriptorType) {
     // Build UpdatedDescriptors -> optionalValue (UpdatedDescriptorsUnion) ->
@@ -1166,15 +1168,17 @@ export async function updateRegistryRecord(
           custom: { optionalValue: { inlineContent: patch.inlineContent } },
         };
         break;
-      case "AGENT_SKILLS":
-        union = {
-          agentSkills: {
-            optionalValue: {
-              skillMd: { optionalValue: { inlineContent: patch.inlineContent } },
-            },
-          },
+      case "AGENT_SKILLS": {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const fields: any = {
+          skillMd: { optionalValue: { inlineContent: patch.inlineContent } },
         };
+        if (patch.skillDefinitionContent !== undefined && patch.skillDefinitionContent.trim()) {
+          fields.skillDefinition = { optionalValue: { inlineContent: patch.skillDefinitionContent } };
+        }
+        union = { agentSkills: { optionalValue: fields } };
         break;
+      }
     }
     input.descriptors = { optionalValue: union };
   }

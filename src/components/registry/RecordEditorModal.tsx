@@ -312,15 +312,6 @@ export default function RecordEditorModal({
                   onChange={(e) => setMcpForm({ ...mcpForm, version: e.target.value })}
                 />
               </FormRow>
-              <FormRow label="Tools JSON (optional)">
-                <textarea
-                  className={inputCls + " font-mono text-xs min-h-[80px]"}
-                  value={mcpForm.toolsJson}
-                  onChange={(e) => setMcpForm({ ...mcpForm, toolsJson: e.target.value })}
-                  placeholder="[]"
-                  spellCheck={false}
-                />
-              </FormRow>
             </div>
           ) : descriptorType === "A2A" ? (
             <div className="space-y-3">

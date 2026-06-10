@@ -44,7 +44,13 @@ export async function PATCH(req: NextRequest, { params }: Ctx) {
     await updateRegistryRecord(
       params.registryId,
       params.recordId,
-      { name: body?.name, descriptorType: body?.descriptorType, inlineContent: body?.inlineContent },
+      {
+        name: body?.name,
+        description: body?.description,
+        descriptorType: body?.descriptorType,
+        inlineContent: body?.inlineContent,
+        skillDefinitionContent: body?.skillDefinitionContent,
+      },
       region
     );
     return NextResponse.json({ updated: true }, { status: 202 });

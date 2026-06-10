@@ -60,7 +60,6 @@ export interface McpForm {
   name: string;
   description: string;
   version: string;
-  toolsJson: string; // optional raw tools JSON
 }
 export interface A2aForm {
   name: string;
@@ -79,7 +78,7 @@ export interface SkillsForm {
 }
 
 export function emptyMcpForm(): McpForm {
-  return { name: "", description: "", version: "1.0.0", toolsJson: "" };
+  return { name: "", description: "", version: "1.0.0" };
 }
 export function emptyA2aForm(): A2aForm {
   return { name: "", description: "", version: "1.0.0", skills: "" };

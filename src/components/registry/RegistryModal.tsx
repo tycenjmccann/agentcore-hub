@@ -9,6 +9,14 @@ export interface RegistrySubmitPayload {
   description: string;
   authorizerType: AuthorizerType;
   autoApproval: boolean;
+  // Required by the API when authorizerType is CUSTOM_JWT.
+  authorizerConfiguration?: {
+    customJWTAuthorizer: {
+      discoveryUrl: string;
+      allowedAudience?: string[];
+      allowedClients?: string[];
+    };
+  };
 }
 
 const inputCls =
@@ -26,6 +34,8 @@ export default function RegistryModal({
   const [description, setDescription] = useState("");
   const [authorizerType, setAuthorizerType] = useState<AuthorizerType>("AWS_IAM");
   const [autoApproval, setAutoApproval] = useState(false);
+  const [discoveryUrl, setDiscoveryUrl] = useState("");
+  const [allowedAudience, setAllowedAudience] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -35,6 +45,25 @@ export default function RegistryModal({
       setError("Name is required.");
       return;
     }
+    // CUSTOM_JWT registries require an authorizer configuration — the API rejects
+    // the create otherwise, so collect (at minimum) the OIDC discovery URL here.
+    let authorizerConfiguration: RegistrySubmitPayload["authorizerConfiguration"];
+    if (authorizerType === "CUSTOM_JWT") {
+      if (!discoveryUrl.trim()) {
+        setError("Discovery URL is required for CUSTOM_JWT registries.");
+        return;
+      }
+      const audience = allowedAudience
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      authorizerConfiguration = {
+        customJWTAuthorizer: {
+          discoveryUrl: discoveryUrl.trim(),
+          ...(audience.length ? { allowedAudience: audience } : {}),
+        },
+      };
+    }
     setSubmitting(true);
     try {
       await onSubmit({
@@ -42,6 +71,7 @@ export default function RegistryModal({
         description: description.trim(),
         authorizerType,
         autoApproval,
+        authorizerConfiguration,
       });
       onClose();
     } catch (e) {
@@ -91,6 +121,28 @@ export default function RegistryModal({
               <option value="CUSTOM_JWT">CUSTOM_JWT</option>
             </select>
           </div>
+          {authorizerType === "CUSTOM_JWT" && (
+            <>
+              <div>
+                <label className={labelCls}>OIDC discovery URL</label>
+                <input
+                  className={inputCls}
+                  value={discoveryUrl}
+                  onChange={(e) => setDiscoveryUrl(e.target.value)}
+                  placeholder="https://issuer.example.com/.well-known/openid-configuration"
+                />
+              </div>
+              <div>
+                <label className={labelCls}>Allowed audience (comma-separated, optional)</label>
+                <input
+                  className={inputCls}
+                  value={allowedAudience}
+                  onChange={(e) => setAllowedAudience(e.target.value)}
+                  placeholder="my-api, another-audience"
+                />
+              </div>
+            </>
+          )}
           <label className="flex items-center gap-2 text-sm text-secondary cursor-pointer">
             <input
               type="checkbox"
