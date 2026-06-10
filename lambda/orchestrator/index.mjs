@@ -414,24 +414,46 @@ function isHumanAssignee(assignee) {
  */
 async function handleHumanReviewGate(ticketId, assignee, workflow) {
   const reviewer = assignee.slice("human:".length);
-  // Park the ticket in "in_review" (DDB path; Jira shows the In Review column).
+
+  // Idempotency: only park + notify on the FIRST transition into in_review.
+  // DDB stream re-deliveries / duplicate Jira webhooks must not push duplicate
+  // notifications. DDB uses a conditional write; Jira reads current status.
   if (TICKET_PROVIDER === "jira") {
+    const current = await getTicket(ticketId);
+    if (current?.status === "in_review") {
+      console.log(`[orchestrator] ${ticketId} already in_review — skipping duplicate gate handling.`);
+      return;
+    }
     await jiraTransition(ticketId, "In Review");
   } else {
-    await ddb.send(new UpdateCommand({
-      TableName: TICKETS_TABLE,
-      Key: { ticketId },
-      UpdateExpression: "SET #s = :s, #u = :u",
-      ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-      ExpressionAttributeValues: { ":s": "in_review", ":u": new Date().toISOString() },
-    }));
+    try {
+      await ddb.send(new UpdateCommand({
+        TableName: TICKETS_TABLE,
+        Key: { ticketId },
+        UpdateExpression: "SET #s = :s, #u = :u",
+        ConditionExpression: "#s <> :inreview",
+        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+        ExpressionAttributeValues: { ":s": "in_review", ":inreview": "in_review", ":u": new Date().toISOString() },
+      }));
+    } catch (err) {
+      if (err.name === "ConditionalCheckFailedException") {
+        console.log(`[orchestrator] ${ticketId} already in_review — skipping duplicate gate handling.`);
+        return;
+      }
+      throw err;
+    }
   }
 
   // Record a human notification on the workflow so the UI can surface it.
+  // Replace any prior unacknowledged notification for this ticket (a new review
+  // cycle supersedes the last) rather than appending a duplicate id.
   if (workflow) {
     if (!Array.isArray(workflow.humanNotifications)) workflow.humanNotifications = [];
+    workflow.humanNotifications = workflow.humanNotifications.filter(
+      (n) => !(n.ticketId === ticketId && n.type === "review_needed" && !n.acknowledged)
+    );
     workflow.humanNotifications.push({
-      id: `notif_${ticketId}`,
+      id: `notif_${ticketId}_${new Date().toISOString()}`,
       type: "review_needed",
       title: `Review needed: ${ticketId}`,
       details: `Ticket ${ticketId} is awaiting review by ${reviewer}.`,

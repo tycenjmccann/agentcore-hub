@@ -72,6 +72,14 @@ export async function POST(
         { status: 400 }
       );
     }
+    // in_review is reserved for human-review-gate tickets (assignee "human:*").
+    const assignee = String((ticket as Record<string, unknown>).assignee || "");
+    if (targetStatus === "in_review" && !assignee.startsWith("human:")) {
+      return NextResponse.json(
+        { error: "Only human-review tickets can be sent to in_review" },
+        { status: 400 }
+      );
+    }
   }
 
   // Invoke the agentcore-hub-tickets Lambda
