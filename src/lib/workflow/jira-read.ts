@@ -124,9 +124,16 @@ function mapIssueToTicket(issue: Record<string, unknown>) {
     }
   }
 
-  // Extract assignee from labels (agent:<name>)
+  // Extract assignee from labels. Agent tickets use "agent:<id>"; human-review
+  // gates use "reviewer:<who>" → surface as "human:<who>" so the UI shows the
+  // Approve / Request-changes actions and gates the in_review transition.
   const agentLabel = labels.find((l) => l.startsWith("agent:"));
-  const assignee = agentLabel ? agentLabel.replace("agent:", "") : undefined;
+  const reviewerLabel = labels.find((l) => l.startsWith("reviewer:"));
+  const assignee = agentLabel
+    ? agentLabel.replace("agent:", "")
+    : reviewerLabel
+    ? `human:${reviewerLabel.replace("reviewer:", "")}`
+    : undefined;
 
   // Extract workflowId from labels
   const wfLabel = labels.find((l) => l.startsWith("wf:"));
