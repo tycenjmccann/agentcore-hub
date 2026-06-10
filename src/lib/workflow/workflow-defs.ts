@@ -43,9 +43,15 @@ export interface ReviewGate {
   /** true → downstream phases block until approved; false → advisory, non-blocking. */
   blocking: boolean;
   /**
-   * Reviewer reference. "human:<who>" parks the ticket for a person. In Jira
-   * mode <who> may be an accountId; in DynamoDB mode it is a free label and any
-   * board user can act. Omitted → "human:reviewer" (anyone watching the board).
+   * Jira project ROLE that defines this gate's reviewer pool (e.g. "Designer",
+   * "QA & CI"). The orchestrator fetches assignable users in that role from Jira
+   * and the intake agent picks one — fully API-driven, no names in config.
+   */
+  reviewerRole?: string;
+  /**
+   * Fallback reviewer reference when no role roster is available (DynamoDB mode
+   * or empty role). "human:<who>" — <who> may be an email/accountId (Jira) or a
+   * free label. Omitted → "human:reviewer" (anyone watching the board).
    */
   assignee?: string;
   /** "always" → gate always inserted; "flagged" → only when the run requests it. */
