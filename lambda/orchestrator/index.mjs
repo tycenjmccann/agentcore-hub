@@ -459,14 +459,21 @@ async function handleReviewRejection(gateTicket) {
   const workflow = await resolveWorkflow(gateTicket.workflowId, gateTicket.parentId);
   if (!workflow) return;
 
+  // The gate's blockedBy lists the agent tickets it reviewed. Their shared agent
+  // phase is the gate's `afterPhase` — match the SPECIFIC gate by phase (a
+  // reviewer may guard multiple phases with different onReject policies).
+  const upstreamIds = gateTicket.blockedBy || [];
+  const upstream = [];
+  for (const upId of upstreamIds) {
+    const up = await getTicket(upId);
+    if (up && getAgentDef(up.assignee)) upstream.push(up); // agent tickets only
+  }
+  const gatePhase = upstream.length ? getAgentDef(upstream[0].assignee)?.phase : undefined;
+
   const wfDef = getWorkflowDef(workflow.workflowDefId);
-  // Match the gate by its reviewer assignee to find its onReject policy. Fall
-  // back to "rework" so a misconfigured gate still drives the work forward.
-  const reviewer = (gateTicket.assignee || "").slice("human:".length);
-  const gateCfg = (wfDef.reviewGates || []).find(
-    (g) => (g.assignee || "human:reviewer").slice("human:".length) === reviewer
-  );
-  const onReject = gateCfg?.onReject || "rework";
+  const gateCfg =
+    (wfDef.reviewGates || []).find((g) => g.afterPhase === gatePhase) || null;
+  const onReject = gateCfg?.onReject || "rework"; // default keeps work moving
 
   if (onReject !== "rework") {
     console.log(`[orchestrator] Review gate ${gateTicket.ticketId} rejected (hold) — workflow paused.`);
@@ -476,36 +483,57 @@ async function handleReviewRejection(gateTicket) {
     return;
   }
 
-  // Re-open the upstream tickets this gate reviewed. The gate's blockedBy lists
-  // the phase tickets that fed into it; send each back to "todo" so the agent
-  // re-runs, carrying the reviewer's last comment as resume context.
-  const upstreamIds = gateTicket.blockedBy || [];
-  const lastComment = (gateTicket.comments || []).slice(-1)[0]?.content || "Reviewer requested changes.";
+  // Reviewer feedback: persisted reviewComment (set at transition time) → latest
+  // comment → generic fallback. Stash it in workflow.resumeContexts keyed by
+  // ticket so BOTH backends surface it on re-invocation (Jira tickets can't carry
+  // arbitrary columns; the workflow row always lives in DynamoDB).
+  const feedback =
+    gateTicket.reviewComment ||
+    (gateTicket.comments || []).slice(-1)[0]?.content ||
+    "Reviewer requested changes.";
+  const resumeNote = `## Review feedback (changes requested)\n${feedback}\n\nAddress this feedback and redo your work.`;
+
+  if (!workflow.resumeContexts) workflow.resumeContexts = {};
   const reopened = [];
-  for (const upId of upstreamIds) {
-    const up = await getTicket(upId);
-    if (!up || !getAgentDef(up.assignee)) continue; // only re-open agent tickets
+  for (const up of upstream) {
+    workflow.resumeContexts[up.ticketId] = resumeNote;
+    reopened.push(up.ticketId);
+  }
+  await saveWorkflow(workflow);
+
+  // Re-open each upstream ticket so its agent re-runs. Done has no direct path to
+  // Ready — in Jira it must hop Done → To Do (Reopen) → Ready.
+  for (const up of upstream) {
     if (TICKET_PROVIDER === "jira") {
-      await jiraTransition(upId, "Ready");
+      await jiraTransition(up.ticketId, "To Do");
+      await jiraTransition(up.ticketId, "Ready");
     } else {
       await ddb.send(new UpdateCommand({
         TableName: TICKETS_TABLE,
-        Key: { ticketId: upId },
-        UpdateExpression: "SET #s = :s, #u = :u, resumeContext = :rc",
+        Key: { ticketId: up.ticketId },
+        UpdateExpression: "SET #s = :s, #u = :u",
         ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-        ExpressionAttributeValues: {
-          ":s": "todo",
-          ":u": new Date().toISOString(),
-          ":rc": `## Review feedback (changes requested)\n${lastComment}\n\nAddress this feedback and redo your work.`,
-        },
+        ExpressionAttributeValues: { ":s": "todo", ":u": new Date().toISOString() },
       }));
     }
-    reopened.push(upId);
   }
   console.log(`[orchestrator] Review gate ${gateTicket.ticketId} rejected (rework) — re-opened: [${reopened.join(", ")}]`);
   await publishEvent(gateTicket.ticketId, "review.rejected", {
     ticketId: gateTicket.ticketId, onReject, reopened, workflowId: workflow.id,
   });
+}
+
+/**
+ * Consume any pending rework feedback for a ticket: returns the resume note and
+ * clears it from the workflow's resumeContexts map. Backend-agnostic — the
+ * workflow row lives in DynamoDB regardless of TICKET_PROVIDER.
+ */
+async function consumeResumeContext(workflow, ticketId) {
+  const note = workflow.resumeContexts?.[ticketId];
+  if (!note) return null;
+  delete workflow.resumeContexts[ticketId];
+  await saveWorkflow(workflow);
+  return note;
 }
 
 /**
@@ -619,10 +647,14 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   // Build context and invoke — SAME buildAgentContext for both paths
   let context = await buildAgentContext(ticket, workflow);
 
-  // If ticket has resumeContext (from retry endpoint), prepend it so the agent knows it's resuming
+  // Prepend resume context if the agent is re-running: either from the retry
+  // endpoint (ticket.resumeContext, DDB-only) or a review-gate rework (workflow
+  // resumeContexts map, backend-agnostic). Both are one-time use.
+  const reworkNote = await consumeResumeContext(workflow, ticketId);
+  let resumed = false;
   if (ticket.resumeContext) {
     context = `${ticket.resumeContext}\n\n---\n\n${context}`;
-    // Clear resumeContext after consuming it (one-time use)
+    resumed = true;
     await ddb.send(new UpdateCommand({
       TableName: TICKETS_TABLE,
       Key: { ticketId },
@@ -630,8 +662,12 @@ async function handleTicketReadyUnified(ticketId, ticket) {
       ExpressionAttributeNames: { "#rc": "resumeContext" },
     }));
   }
+  if (reworkNote) {
+    context = `${reworkNote}\n\n---\n\n${context}`;
+    resumed = true;
+  }
 
-  console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${ticket.resumeContext ? " (SESSION RESUME)" : ""}`);
+  console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
   await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: agentDef.phase, workflowId: workflow.id });
 
   await invokeAgent(agentDef, context, workflow);
@@ -967,9 +1003,28 @@ async function handleTicketReady(ticketId, image) {
 
   // Build context and invoke agent
   const ticket = await getTicket(ticketId);
-  const context = await buildAgentContext(ticket, workflow);
+  let context = await buildAgentContext(ticket, workflow);
 
-  console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}`);
+  // Prepend resume context on re-run: retry endpoint (ticket.resumeContext) or
+  // review-gate rework (workflow.resumeContexts map). Both one-time use.
+  const reworkNote = await consumeResumeContext(workflow, ticketId);
+  let resumed = false;
+  if (ticket?.resumeContext) {
+    context = `${ticket.resumeContext}\n\n---\n\n${context}`;
+    resumed = true;
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId },
+      UpdateExpression: "REMOVE #rc",
+      ExpressionAttributeNames: { "#rc": "resumeContext" },
+    }));
+  }
+  if (reworkNote) {
+    context = `${reworkNote}\n\n---\n\n${context}`;
+    resumed = true;
+  }
+
+  console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
   await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: agentDef.phase, workflowId: workflow.id });
 
   // Fire-and-forget: invoke agent via AgentCore Harness
@@ -1610,6 +1665,15 @@ function mapJiraIssueToTicket(issue) {
     }
   }
 
+  // Latest comment (when the comment field was requested) — carries reviewer
+  // "request changes" feedback for the rework flow in Jira mode.
+  const jiraComments = (f.comment?.comments || []).map((c) => ({
+    author: c.author?.displayName || "human",
+    content: extractAdfText(c.body),
+    timestamp: c.created,
+  }));
+  const reviewComment = jiraComments.length ? jiraComments[jiraComments.length - 1].content : undefined;
+
   const rawIssueType = f.issuetype?.name || "Task";
   return {
     ticketId: issue.key,
@@ -1627,7 +1691,8 @@ function mapJiraIssueToTicket(issue) {
     type: rawIssueType.toLowerCase() === "epic" ? "epic" : "task",
     issueType: rawIssueType,
     blockedBy,
-    comments: [],
+    comments: jiraComments,
+    ...(reviewComment ? { reviewComment } : {}),
     artifacts: [],
   };
 }
@@ -1641,7 +1706,7 @@ function extractAdfText(adf) {
 }
 
 async function getTicketFromJira(ticketId) {
-  const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=summary,description,status,issuetype,parent,labels,issuelinks,assignee`);
+  const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=summary,description,status,issuetype,parent,labels,issuelinks,assignee,comment`);
   if (!issue) return null;
   return mapJiraIssueToTicket(issue);
 }

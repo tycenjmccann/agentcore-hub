@@ -416,7 +416,14 @@ export default function TicketDetailModal({
     parent: t.parent || "",
   }));
 
-  const validTransitions = ticket ? (VALID_TRANSITIONS[ticket.status] ?? []) : [];
+  // "in_review" is a human-review-gate state: only offer it for human:* tickets,
+  // otherwise an agent ticket could be parked there and never invoked.
+  const isHumanReview = !!ticket?.assignee?.startsWith("human:");
+  const validTransitions = ticket
+    ? (VALID_TRANSITIONS[ticket.status] ?? []).filter(
+        (s) => s !== "in_review" || isHumanReview
+      )
+    : [];
 
   if (!mounted || !isOpen) return null;
 
