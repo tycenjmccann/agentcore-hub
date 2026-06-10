@@ -191,6 +191,11 @@ export interface WorkflowInput {
    * Absent → default ("software-delivery"), preserving legacy behavior.
    */
   workflowDefId?: string;
+  /**
+   * Agent phases the requester wants a human-review gate after. Activates any
+   * def reviewGates whose condition is "flagged". "always" gates apply regardless.
+   */
+  reviewGates?: string[];
 }
 
 // ─── Human Notifications ─────────────────────────────────────────────────────

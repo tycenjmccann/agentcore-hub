@@ -11,6 +11,9 @@
       "featureBranchPhase": "development",
       "createsPullRequest": true,
       "completionRequiresAgentPhases": ["development", "verification", "review"],
+      "reviewGates": [
+        { "afterPhase": "design", "name": "Design Review", "blocking": true, "condition": "flagged", "onReject": "rework", "assignee": "human:design-lead" }
+      ],
       "phases": [
         { "id": "intake", "name": "Intake", "type": "app", "agentPhase": "intake" },
         { "id": "requirements", "name": "Requirements", "type": "agent", "agentPhase": "requirements" },

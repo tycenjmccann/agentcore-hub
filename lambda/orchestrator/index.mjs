@@ -121,6 +121,7 @@ const FALLBACK_WORKFLOW_DEF = {
   featureBranchPhase: "development",
   createsPullRequest: true,
   completionRequiresAgentPhases: ["development", "verification", "review"],
+  reviewGates: [],
   // Mirror the config-derived order (agentPhases only). The CI agent's "review"
   // phase is not a pipeline phase, so it is intentionally absent — keeps the
   // fallback identical to the S3-config path for software-delivery.
@@ -154,6 +155,7 @@ async function loadWorkflowDefs() {
         featureBranchPhase: w.featureBranchPhase ?? null,
         createsPullRequest: w.createsPullRequest ?? false,
         completionRequiresAgentPhases: w.completionRequiresAgentPhases || [],
+        reviewGates: w.reviewGates || [],
         phaseOrder: order,
       };
     }
@@ -217,6 +219,15 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
     case "done":
       await handleTicketDoneUnified(ticketId);
       break;
+    case "blocked": {
+      // A human-review gate moved to "blocked" = "Request changes". If the gate
+      // is configured onReject:"rework", re-open the upstream work it reviewed.
+      const rejected = await getTicket(ticketId);
+      if (rejected && isHumanAssignee(rejected.assignee)) {
+        await handleReviewRejection(rejected);
+      }
+      break;
+    }
     case "todo": {
       // Ticket created — track it immediately, then route accordingly
       const todoTicket = await getTicket(ticketId);
@@ -389,6 +400,114 @@ async function handleTicketDoneUnified(ticketId) {
   }
 }
 
+/** Whether an assignee refers to a human reviewer (review gate) vs an agent. */
+function isHumanAssignee(assignee) {
+  return typeof assignee === "string" && assignee.startsWith("human:");
+}
+
+/**
+ * A review-gate ticket became ready (its upstream work is done). Instead of
+ * invoking an agent, park it for a human and emit a review_needed notification.
+ * The ticket sits in "in_review"; downstream tickets that list it in blockedBy
+ * stay blocked until a person transitions it to "done" (approve) — the existing
+ * cascade then continues. Returns true if the ticket was handled as a gate.
+ */
+async function handleHumanReviewGate(ticketId, assignee, workflow) {
+  const reviewer = assignee.slice("human:".length);
+  // Park the ticket in "in_review" (DDB path; Jira shows the In Review column).
+  if (TICKET_PROVIDER === "jira") {
+    await jiraTransition(ticketId, "In Review");
+  } else {
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId },
+      UpdateExpression: "SET #s = :s, #u = :u",
+      ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+      ExpressionAttributeValues: { ":s": "in_review", ":u": new Date().toISOString() },
+    }));
+  }
+
+  // Record a human notification on the workflow so the UI can surface it.
+  if (workflow) {
+    if (!Array.isArray(workflow.humanNotifications)) workflow.humanNotifications = [];
+    workflow.humanNotifications.push({
+      id: `notif_${ticketId}`,
+      type: "review_needed",
+      title: `Review needed: ${ticketId}`,
+      details: `Ticket ${ticketId} is awaiting review by ${reviewer}.`,
+      ticketId,
+      reviewer,
+      timestamp: new Date().toISOString(),
+      acknowledged: false,
+    });
+    await saveWorkflow(workflow);
+  }
+
+  await publishEvent(ticketId, "review.needed", {
+    ticketId, reviewer, workflowId: workflow?.id,
+  });
+  console.log(`[orchestrator] ${ticketId} parked for human review (${reviewer}) — not invoking an agent.`);
+}
+
+/**
+ * A human "requested changes" on a review-gate ticket (moved it to blocked).
+ * Look up the gate's config for the run; if onReject is "rework", re-open the
+ * upstream agent tickets this gate reviewed (its blockedBy) so the agents redo
+ * the work with the reviewer's comment as resume context. "hold" → just pause.
+ */
+async function handleReviewRejection(gateTicket) {
+  const workflow = await resolveWorkflow(gateTicket.workflowId, gateTicket.parentId);
+  if (!workflow) return;
+
+  const wfDef = getWorkflowDef(workflow.workflowDefId);
+  // Match the gate by its reviewer assignee to find its onReject policy. Fall
+  // back to "rework" so a misconfigured gate still drives the work forward.
+  const reviewer = (gateTicket.assignee || "").slice("human:".length);
+  const gateCfg = (wfDef.reviewGates || []).find(
+    (g) => (g.assignee || "human:reviewer").slice("human:".length) === reviewer
+  );
+  const onReject = gateCfg?.onReject || "rework";
+
+  if (onReject !== "rework") {
+    console.log(`[orchestrator] Review gate ${gateTicket.ticketId} rejected (hold) — workflow paused.`);
+    await publishEvent(gateTicket.ticketId, "review.rejected", {
+      ticketId: gateTicket.ticketId, onReject, workflowId: workflow.id,
+    });
+    return;
+  }
+
+  // Re-open the upstream tickets this gate reviewed. The gate's blockedBy lists
+  // the phase tickets that fed into it; send each back to "todo" so the agent
+  // re-runs, carrying the reviewer's last comment as resume context.
+  const upstreamIds = gateTicket.blockedBy || [];
+  const lastComment = (gateTicket.comments || []).slice(-1)[0]?.content || "Reviewer requested changes.";
+  const reopened = [];
+  for (const upId of upstreamIds) {
+    const up = await getTicket(upId);
+    if (!up || !getAgentDef(up.assignee)) continue; // only re-open agent tickets
+    if (TICKET_PROVIDER === "jira") {
+      await jiraTransition(upId, "Ready");
+    } else {
+      await ddb.send(new UpdateCommand({
+        TableName: TICKETS_TABLE,
+        Key: { ticketId: upId },
+        UpdateExpression: "SET #s = :s, #u = :u, resumeContext = :rc",
+        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+        ExpressionAttributeValues: {
+          ":s": "todo",
+          ":u": new Date().toISOString(),
+          ":rc": `## Review feedback (changes requested)\n${lastComment}\n\nAddress this feedback and redo your work.`,
+        },
+      }));
+    }
+    reopened.push(upId);
+  }
+  console.log(`[orchestrator] Review gate ${gateTicket.ticketId} rejected (rework) — re-opened: [${reopened.join(", ")}]`);
+  await publishEvent(gateTicket.ticketId, "review.rejected", {
+    ticketId: gateTicket.ticketId, onReject, reopened, workflowId: workflow.id,
+  });
+}
+
 /**
  * Unified "ticket ready" handler — works with both backends.
  * Called from processStatusChange (Jira webhook path).
@@ -401,6 +520,14 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   console.log(`[orchestrator] handleTicketReady: ${ticketId} assignee=${assignee} parentId=${parentId} workflowId=${workflowId}`);
 
   if (!assignee || ticket.type === "epic") return;
+
+  // Human-review gate: park for a person instead of invoking an agent.
+  if (isHumanAssignee(assignee)) {
+    const gateWorkflow = await resolveWorkflow(workflowId, parentId);
+    if (gateWorkflow && gateWorkflow.phase === "cancelled") return;
+    await handleHumanReviewGate(ticketId, assignee, gateWorkflow);
+    return;
+  }
 
   const agentDef = getAgentDef(assignee);
   if (!agentDef) {
@@ -598,6 +725,15 @@ async function processRecord(record) {
       const startedAssignee = unwrapDdbValue(newImage.assignee);
       await publishEvent(ticketId, "agent.started", { ticketId, assignee: startedAssignee, agentId: startedAssignee });
       break;
+    case "blocked": {
+      // Human-review gate "Request changes" → re-open upstream work if configured.
+      const blockedAssignee = unwrapDdbValue(newImage.assignee);
+      if (isHumanAssignee(blockedAssignee)) {
+        const rejected = await getTicket(ticketId);
+        if (rejected) await handleReviewRejection(rejected);
+      }
+      break;
+    }
   }
 }
 
@@ -744,6 +880,14 @@ async function handleTicketReady(ticketId, image) {
   const ticketType = unwrapDdbValue(image.type);
 
   if (!assignee || ticketType === "epic") return;
+
+  // Human-review gate: park for a person instead of invoking an agent.
+  if (isHumanAssignee(assignee)) {
+    const gateWorkflow = await resolveWorkflow(workflowId, parentId);
+    if (gateWorkflow && gateWorkflow.phase === "cancelled") return;
+    await handleHumanReviewGate(ticketId, assignee, gateWorkflow);
+    return;
+  }
 
   const agentDef = getAgentDef(assignee);
   if (!agentDef) {
@@ -1121,6 +1265,26 @@ async function buildAgentContext(ticket, workflow) {
       .join("\n");
     context += `## Available Agents\n${roster}\n\n`;
 
+    // Human-review gates active for this run. The intake agent must insert one
+    // review ticket per gate (assignee "human:<who>"), blocked by all the agent
+    // tickets of the gate's afterPhase, and — for blocking gates — make the next
+    // phase's tickets blockedBy the gate ticket. The orchestrator parks human
+    // tickets for a person instead of invoking an agent.
+    const requestedGates = workflow.input?.reviewGates || [];
+    const activeGates = (wfDef.reviewGates || []).filter(
+      (g) => g.condition === "always" || requestedGates.includes(g.afterPhase)
+    );
+    if (activeGates.length > 0) {
+      const gateLines = activeGates
+        .map((g) => {
+          const who = g.assignee || "human:reviewer";
+          const block = g.blocking ? "BLOCKING (next phase waits for approval)" : "advisory (non-blocking)";
+          return `  - After phase "${g.afterPhase}": create a "${g.name || "Review"}" ticket assigned to "${who}", blocked_by ALL "${g.afterPhase}" agent tickets. ${block}.`;
+        })
+        .join("\n");
+      context += `## Human Review Gates (REQUIRED)\nInsert these human-review tickets into your ticket plan:\n${gateLines}\nFor BLOCKING gates, the downstream phase's tickets must list the gate ticket in their blocked_by. A human approves (status → done) or requests changes (status → blocked).\n\n`;
+    }
+
     // Bug-fix is a SCOPE distinction (different blueprint), not a HOW.
     try {
       const epic = await getTicket(workflow.epicId);
@@ -1433,6 +1597,7 @@ function mapJiraIssueToTicket(issue) {
   const f = issue.fields || {};
   const labels = f.labels || [];
   const agentLabel = labels.find(l => l.startsWith("agent:"));
+  const reviewerLabel = labels.find(l => l.startsWith("reviewer:"));
   const wfLabel = labels.find(l => l.startsWith("wf:"));
 
   // Extract blockedBy from issue links
@@ -1451,7 +1616,12 @@ function mapJiraIssueToTicket(issue) {
     title: f.summary || "",
     description: extractAdfText(f.description),
     status: mapJiraStatus(f.status?.name || "To Do"),
-    assignee: agentLabel ? agentLabel.replace("agent:", "") : null,
+    // Human-review gates carry a reviewer:<who> label → assignee "human:<who>".
+    assignee: agentLabel
+      ? agentLabel.replace("agent:", "")
+      : reviewerLabel
+      ? `human:${reviewerLabel.replace("reviewer:", "")}`
+      : null,
     parentId: f.parent?.key || null,
     workflowId: wfLabel ? wfLabel.replace("wf:", "") : null,
     type: rawIssueType.toLowerCase() === "epic" ? "epic" : "task",
