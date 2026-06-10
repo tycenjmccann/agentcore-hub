@@ -101,12 +101,19 @@ const TRANSITIONS = {
   ],
   in_progress: [
     { id: "done", name: "Done", to: "done" },
+    { id: "in_review", name: "Send to Review", to: "in_review" },
     { id: "block", name: "Block", to: "blocked" },
+  ],
+  // Human-review gate states: approve (→done) or request changes (→blocked).
+  in_review: [
+    { id: "done", name: "Approve", to: "done" },
+    { id: "block", name: "Request Changes", to: "blocked" },
   ],
   blocked: [
     { id: "unblock", name: "Unblock", to: "todo" },
     { id: "ready", name: "Mark Ready", to: "ready" },
     { id: "start", name: "Start Progress", to: "in_progress" },
+    { id: "in_review", name: "Send to Review", to: "in_review" },
     { id: "skip", name: "Skip", to: "done" },
   ],
   done: [
@@ -174,8 +181,11 @@ async function createTicket(args) {
   const { summary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id } = args;
   if (!summary) return textResult("Error: 'summary' is required");
 
-  // Validate assignee against known agent roster
-  if (assignee && !VALID_AGENTS.has(assignee)) {
+  // Validate assignee against known agent roster. "human:<who>" assignees are
+  // human-review gates — not agents — and are always allowed (the orchestrator
+  // parks them for a person instead of invoking an agent).
+  const isHumanReviewer = typeof assignee === "string" && assignee.startsWith("human:");
+  if (assignee && !isHumanReviewer && !VALID_AGENTS.has(assignee)) {
     return textResult(
       `Error: Invalid assignee "${assignee}". Valid agents are: ${[...VALID_AGENTS].join(", ")}. ` +
       `Note: There is NO "agentcore_hub_ios_dev" agent. iOS/SwiftUI development goes to "agentcore_hub_frontend_dev".`

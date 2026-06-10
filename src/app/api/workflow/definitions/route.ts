@@ -15,6 +15,13 @@ export async function GET() {
       icon: w.icon,
       requiresRepo: w.requiresRepo,
       phases: w.phases.map((p) => ({ id: p.id, name: p.name, type: p.type })),
+      // Surface flagged review gates so the intake form can offer them as opt-ins.
+      reviewGates: (w.reviewGates || []).map((g) => ({
+        afterPhase: g.afterPhase,
+        name: g.name,
+        blocking: g.blocking,
+        condition: g.condition,
+      })),
     })),
   });
 }

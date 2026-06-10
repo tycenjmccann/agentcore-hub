@@ -6,14 +6,16 @@ export const dynamic = "force-dynamic";
 
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 
-const VALID_STATUSES = ["todo", "ready", "in_progress", "done", "blocked"];
+const VALID_STATUSES = ["todo", "ready", "in_progress", "in_review", "done", "blocked"];
 
-// Simplified flow: todo → ready → in_progress → done  (+blocked as escape hatch)
+// Simplified flow: todo → ready → in_progress → done  (+blocked as escape hatch).
+// in_review is the human-review gate state: approve (→done) or request changes (→blocked).
 const VALID_TRANSITIONS: Record<string, string[]> = {
   todo: ["ready", "blocked"],
-  ready: ["in_progress", "blocked"],
-  in_progress: ["done", "blocked"],
-  blocked: ["todo", "ready", "in_progress", "done"],
+  ready: ["in_progress", "in_review", "blocked"],
+  in_progress: ["done", "in_review", "blocked"],
+  in_review: ["done", "blocked"],
+  blocked: ["todo", "ready", "in_progress", "in_review", "done"],
   done: ["todo"],
 };
 

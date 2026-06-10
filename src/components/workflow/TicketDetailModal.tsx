@@ -37,10 +37,17 @@ const STATUS_STYLES: Record<string, { dot: string; text: string; label: string }
 
 const VALID_TRANSITIONS: Record<string, string[]> = {
   todo: ["ready", "blocked"],
-  ready: ["in_progress", "blocked"],
-  in_progress: ["done", "blocked"],
-  blocked: ["todo", "ready", "in_progress", "done"],
+  ready: ["in_progress", "in_review", "blocked"],
+  in_progress: ["done", "in_review", "blocked"],
+  in_review: ["done", "blocked"],
+  blocked: ["todo", "ready", "in_progress", "in_review", "done"],
   done: ["todo"],
+};
+
+// Human-friendly labels for the review-gate transitions (in_review → done/blocked).
+const TRANSITION_LABELS: Record<string, string> = {
+  done: "Approve",
+  blocked: "Request changes",
 };
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -505,7 +512,10 @@ export default function TicketDetailModal({
                           type="button"
                         >
                           <span className={`w-2 h-2 rounded-full ${STATUS_STYLES[s]?.dot ?? "bg-zinc-500"}`} />
-                          {STATUS_STYLES[s]?.label ?? s}
+                          {/* At a review gate, label the choices Approve / Request changes. */}
+                          {ticket.status === "in_review"
+                            ? TRANSITION_LABELS[s] ?? STATUS_STYLES[s]?.label ?? s
+                            : STATUS_STYLES[s]?.label ?? s}
                         </button>
                       ))}
                     </div>

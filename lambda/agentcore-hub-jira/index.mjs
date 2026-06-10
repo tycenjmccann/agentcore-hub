@@ -127,8 +127,11 @@ async function jiraSearch(jql, fields = ["summary", "status", "labels", "assigne
 async function createTicket(params) {
   const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id } = params;
 
-  // Validate assignee against known roster — reject hallucinated agent names
-  if (assignee && !VALID_ASSIGNEES.has(assignee)) {
+  // Validate assignee against known roster — reject hallucinated agent names.
+  // "human:<who>" assignees are human-review gates, not agents, and are always
+  // allowed (the orchestrator parks them for a person instead of invoking).
+  const isHumanReviewer = typeof assignee === "string" && assignee.startsWith("human:");
+  if (assignee && !isHumanReviewer && !VALID_ASSIGNEES.has(assignee)) {
     const valid = [...VALID_ASSIGNEES].join(", ");
     throw new Error(
       `Invalid assignee "${assignee}". Valid agents: ${valid}. ` +
@@ -136,8 +139,16 @@ async function createTicket(params) {
     );
   }
 
+  // Assignee is carried as a label (Jira's assignee field needs an accountId).
+  // Human-review gates use a "reviewer:<who>" label + a "human-review" marker so
+  // the orchestrator recognizes them and parks instead of invoking an agent.
   const labels = [];
-  if (assignee) labels.push(`agent:${assignee}`);
+  if (isHumanReviewer) {
+    labels.push("human-review");
+    labels.push(`reviewer:${assignee.slice("human:".length)}`);
+  } else if (assignee) {
+    labels.push(`agent:${assignee}`);
+  }
   if (workflow_id) labels.push(`wf:${workflow_id}`);
 
   // Normalize common LLM variations of issue type names to Jira's canonical form

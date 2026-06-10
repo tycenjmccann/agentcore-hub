@@ -30,6 +30,30 @@ export interface WorkflowDefPhase {
   agentPhase: string;
 }
 
+/**
+ * A human-review gate. When the named agent phase finishes, a review ticket
+ * (assignee `human:<reviewer>`) is inserted into the dependency graph and the
+ * next phase waits on it (blocking) or runs alongside it (advisory).
+ */
+export interface ReviewGate {
+  /** Agent phase this gate guards — the gate fires once this phase's work is done. */
+  afterPhase: string;
+  /** Display name for the review ticket, e.g. "Design Review". */
+  name?: string;
+  /** true → downstream phases block until approved; false → advisory, non-blocking. */
+  blocking: boolean;
+  /**
+   * Reviewer reference. "human:<who>" parks the ticket for a person. In Jira
+   * mode <who> may be an accountId; in DynamoDB mode it is a free label and any
+   * board user can act. Omitted → "human:reviewer" (anyone watching the board).
+   */
+  assignee?: string;
+  /** "always" → gate always inserted; "flagged" → only when the run requests it. */
+  condition: "always" | "flagged";
+  /** On "Request changes": "rework" re-opens the upstream work, "hold" just pauses. */
+  onReject: "rework" | "hold";
+}
+
 export interface WorkflowDef {
   id: string;
   name: string;
@@ -46,6 +70,8 @@ export interface WorkflowDef {
   createsPullRequest: boolean;
   /** Agent phases that must have a "done" ticket for the run to complete */
   completionRequiresAgentPhases: string[];
+  /** Optional human-review gates keyed by the agent phase they guard. */
+  reviewGates?: ReviewGate[];
   phases: WorkflowDefPhase[];
 }
 
@@ -67,6 +93,26 @@ export const WORKFLOW_DEFS: WorkflowDef[] = CONFIG.workflows;
 export function getWorkflowDef(id?: string | null): WorkflowDef {
   const found = id ? WORKFLOW_DEFS.find((w) => w.id === id) : undefined;
   return found || WORKFLOW_DEFS.find((w) => w.id === DEFAULT_WORKFLOW_DEF_ID) || WORKFLOW_DEFS[0];
+}
+
+/**
+ * Resolve which review gates are active for a run. "always" gates always apply;
+ * "flagged" gates apply only when the run requested that phase (requestedPhases,
+ * from the intake form). Returns gates keyed by the phase they guard.
+ */
+export function resolveActiveGates(
+  def: WorkflowDef,
+  requestedPhases?: string[]
+): ReviewGate[] {
+  const requested = new Set(requestedPhases || []);
+  return (def.reviewGates || []).filter(
+    (g) => g.condition === "always" || requested.has(g.afterPhase)
+  );
+}
+
+/** Whether a ticket assignee refers to a human reviewer rather than an agent. */
+export function isHumanAssignee(assignee?: string | null): boolean {
+  return !!assignee && assignee.startsWith("human:");
 }
 
 /** The agentPhase ordering for a workflow, including terminal "complete". */
