@@ -948,8 +948,10 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
       setSkipConnectors(skips);
     }, 150);
     return () => clearTimeout(timer);
+  // ticketStatusMap is included so connectors re-measure when an inline review
+  // card appears/disappears (it shifts the phase's .item elements).
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state?.phase, celebrating, state?.agentTasks]);
+  }, [state?.phase, celebrating, state?.agentTasks, ticketStatusMap]);
 
   // Derive phase status from ticket data (agent task statuses)
   const getPhaseStatus = (phaseIndex: number): "inactive" | "active" | "done" => {
