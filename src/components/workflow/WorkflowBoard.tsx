@@ -8,7 +8,7 @@ import type {
 } from "@/lib/workflow/types";
 import awsIcons from "@/lib/aws-icons.json";
 import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePhaseConfig } from "@/lib/pipeline-config";
-import { DEFAULT_WORKFLOW_DEF_ID } from "@/lib/workflow/workflow-defs";
+import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { Square } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
@@ -948,8 +948,10 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
       setSkipConnectors(skips);
     }, 150);
     return () => clearTimeout(timer);
+  // ticketStatusMap is included so connectors re-measure when an inline review
+  // card appears/disappears (it shifts the phase's .item elements).
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state?.phase, celebrating, state?.agentTasks]);
+  }, [state?.phase, celebrating, state?.agentTasks, ticketStatusMap]);
 
   // Derive phase status from ticket data (agent task statuses)
   const getPhaseStatus = (phaseIndex: number): "inactive" | "active" | "done" => {
@@ -1025,8 +1027,11 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
   }
 
   // Human-review gates currently awaiting a person: tickets parked in_review
-  // with a human:* assignee. Surfaced as a prominent banner so the run doesn't
-  // look silently stuck.
+  // with a human:* assignee. Rendered as a small card inside the phase the gate
+  // guards (def.reviewGates.afterPhase → pipeline phase id), so the signal is
+  // local to the step. Any gate we can't map to a visible phase falls back to a
+  // top banner so it's never hidden.
+  const reviewGates = getWorkflowDef(workflowDefId).reviewGates || [];
   const pendingReviews = Object.entries(ticketStatusMap)
     .filter(([, t]) => t.status === "in_review" && (t.assignee || "").startsWith("human:"))
     .map(([ticketId, t]) => {
@@ -1037,8 +1042,19 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
         .slice(0, 2)
         .map((p) => p[0]?.toUpperCase() || "")
         .join("") || "?";
-      return { ticketId, title: t.title, reviewer: who, initials };
+      // Map the gate ticket → the phase it guards. Match the gate config whose
+      // name appears in the ticket title (the agent names the ticket after the
+      // gate, e.g. "Design Review"); fall back to the first gate's afterPhase.
+      const title = t.title || "";
+      const gate =
+        reviewGates.find((g) => g.name && title.toLowerCase().includes(g.name.toLowerCase())) ||
+        (reviewGates.length === 1 ? reviewGates[0] : undefined);
+      const phaseId = gate
+        ? pipelinePhases.find((p) => p.agentPhase === gate.afterPhase || p.id === gate.afterPhase)?.id
+        : undefined;
+      return { ticketId, title: t.title, reviewer: who, initials, phaseId };
     });
+  const unplacedReviews = pendingReviews.filter((r) => !r.phaseId);
 
   return (
     <div className={celebrating ? "celebrate-wrapper" : ""}>
@@ -1049,10 +1065,10 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
         <div className="nudge-pulse-overlay" />
       )}
 
-      {/* Pending human-review banner — clicking opens the gate ticket to act. */}
-      {pendingReviews.length > 0 && (
+      {/* Fallback top banner — only for gates we couldn't place on a phase card. */}
+      {unplacedReviews.length > 0 && (
         <div className="review-banner" role="status">
-          {pendingReviews.map((r) => (
+          {unplacedReviews.map((r) => (
             <button
               key={r.ticketId}
               className="review-banner-item"
@@ -1265,6 +1281,23 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
 
                 {/* Work area */}
                 <div className="work-area">
+                  {/* Pending human-review gate(s) for THIS phase — local signal. */}
+                  {pendingReviews.filter((r) => r.phaseId === phase.id).map((r) => (
+                    <button
+                      key={r.ticketId}
+                      className="review-inline"
+                      onClick={() => handleOpenTicketModal(r.ticketId)}
+                      title={`Open ${r.ticketId} to approve or request changes`}
+                    >
+                      <span className="review-avatar sm" aria-hidden>{r.initials}</span>
+                      <span className="review-inline-text">
+                        <span className="review-inline-label">Pending review</span>
+                        <span className="review-inline-detail">{r.reviewer} · {r.ticketId}</span>
+                      </span>
+                      <span className="review-inline-cta">Review →</span>
+                    </button>
+                  ))}
+
                   {/* Agents */}
                   {phase.type === "agent" && phase.agents.length > 0 && (() => {
                     return (
@@ -1539,6 +1572,17 @@ const REVIEW_BANNER_STYLES = `
 .review-banner-label{font-size:13px;font-weight:600;color:#38bdf8}
 .review-banner-detail{font-size:12px;color:var(--pipeline-text-muted,#94a3b8);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .review-banner-cta{flex-shrink:0;font-size:12px;font-weight:600;color:#38bdf8}
+.review-avatar.sm{width:26px;height:26px;font-size:10px}
+/* Inline per-phase review card — sits in the phase work-area above Agents */
+.review-inline{display:flex;align-items:center;gap:8px;width:100%;text-align:left;cursor:pointer;
+  padding:7px 9px;margin-bottom:5px;border-radius:9px;border:1px solid rgba(14,165,233,0.5);
+  background:rgba(14,165,233,0.10);color:var(--pipeline-text,#e2e8f0);
+  animation:reviewGlow 2s ease-in-out infinite;transition:background .15s ease}
+.review-inline:hover{background:rgba(14,165,233,0.18)}
+.review-inline-text{display:flex;flex-direction:column;min-width:0;flex:1}
+.review-inline-label{font-size:11px;font-weight:700;color:#38bdf8;line-height:1.2}
+.review-inline-detail{font-size:10px;color:var(--pipeline-text-muted,#94a3b8);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.review-inline-cta{flex-shrink:0;font-size:10px;font-weight:600;color:#38bdf8}
 `;
 
 const PIPELINE_STYLES = `
