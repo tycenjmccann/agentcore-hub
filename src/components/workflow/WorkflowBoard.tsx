@@ -678,6 +678,9 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
             status: event.status,
             title: prev[event.ticketId]?.title || event.ticketId,
             updatedAt: event.timestamp || new Date().toISOString(),
+            // ticket_update carries no assignee — preserve the stored one so the
+            // pending-review banner still matches human:* gates on live updates.
+            assignee: prev[event.ticketId]?.assignee,
           },
         }));
         break;
@@ -688,6 +691,9 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
             status: event.ticket.status,
             title: event.ticket.title,
             updatedAt: event.ticket.updatedAt || event.timestamp || new Date().toISOString(),
+            // Carry assignee so a human:* gate lights the banner immediately,
+            // not only on the next /tickets poll.
+            assignee: event.ticket.assignee,
           },
         }));
         // Wire the agent → ticket mapping so the badge renders on the agent's slot
