@@ -5,6 +5,7 @@ import {
   GitPullRequest,
   History,
   BarChart3,
+  Boxes,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -24,7 +25,8 @@ export type ModuleId =
   | "core"
   | "builder"
   | "workflow"
-  | "evaluations";
+  | "evaluations"
+  | "registry";
 
 export interface NavItem {
   href: string;
@@ -37,6 +39,7 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard, module: "core" },
   { href: "/agents", label: "Agents", icon: Bot, module: "core" },
+  { href: "/registry", label: "Registry", icon: Boxes, module: "registry" },
   { href: "/build", label: "Build", icon: Hammer, module: "builder" },
   { href: "/workflow", label: "Workflow", icon: GitPullRequest, module: "workflow" },
   { href: "/evaluations", label: "Evaluations", icon: BarChart3, module: "evaluations" },

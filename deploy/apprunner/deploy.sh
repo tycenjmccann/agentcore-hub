@@ -174,7 +174,20 @@ aws iam put-role-policy \
           \"bedrock-agentcore:GetAgentRuntime\",
           \"bedrock-agentcore:GetHarness\",
           \"bedrock-agentcore:ListAgentRuntimes\",
-          \"bedrock-agentcore:ListHarnesses\"
+          \"bedrock-agentcore:ListHarnesses\",
+          \"bedrock-agentcore:ListRegistries\",
+          \"bedrock-agentcore:GetRegistry\",
+          \"bedrock-agentcore:CreateRegistry\",
+          \"bedrock-agentcore:UpdateRegistry\",
+          \"bedrock-agentcore:DeleteRegistry\",
+          \"bedrock-agentcore:ListRegistryRecords\",
+          \"bedrock-agentcore:GetRegistryRecord\",
+          \"bedrock-agentcore:CreateRegistryRecord\",
+          \"bedrock-agentcore:UpdateRegistryRecord\",
+          \"bedrock-agentcore:DeleteRegistryRecord\",
+          \"bedrock-agentcore:SubmitRegistryRecordForApproval\",
+          \"bedrock-agentcore:UpdateRegistryRecordStatus\",
+          \"bedrock-agentcore:SearchRegistryRecords\"
         ],
         \"Resource\": \"*\"
       },
