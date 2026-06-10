@@ -513,20 +513,19 @@ async function handleReviewRejection(gateTicket) {
     "Reviewer requested changes.";
   const resumeNote = `## Review feedback (changes requested)\n${feedback}\n\nAddress this feedback and redo your work.`;
 
-  if (!workflow.resumeContexts) workflow.resumeContexts = {};
+  // Persist each ticket's feedback atomically (per-key, no full-row put) BEFORE
+  // reopening, so a fast re-invocation always finds its resume context.
   const reopened = [];
   for (const up of upstream) {
-    workflow.resumeContexts[up.ticketId] = resumeNote;
+    await setResumeContext(workflow.id, up.ticketId, resumeNote);
     reopened.push(up.ticketId);
   }
-  await saveWorkflow(workflow);
 
   // Re-open each upstream ticket so its agent re-runs. Done has no direct path to
   // Ready — in Jira it must hop Done → To Do (Reopen) → Ready.
   for (const up of upstream) {
     if (TICKET_PROVIDER === "jira") {
-      await jiraTransition(up.ticketId, "To Do");
-      await jiraTransition(up.ticketId, "Ready");
+      await jiraReopenToReady(up.ticketId);
     } else {
       await ddb.send(new UpdateCommand({
         TableName: TICKETS_TABLE,
@@ -551,9 +550,42 @@ async function handleReviewRejection(gateTicket) {
 async function consumeResumeContext(workflow, ticketId) {
   const note = workflow.resumeContexts?.[ticketId];
   if (!note) return null;
+  // Atomic per-key REMOVE on the resumeContexts map — NOT a full-object put.
+  // Multiple reworked tickets re-run concurrently; a full put here would clobber
+  // sibling updates. Scoping the write to one map key keeps them independent.
   delete workflow.resumeContexts[ticketId];
-  await saveWorkflow(workflow);
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId: workflow.id },
+      UpdateExpression: "REMOVE resumeContexts.#k",
+      ExpressionAttributeNames: { "#k": ticketId },
+    }));
+  } catch (err) {
+    // Fall back to a full save if the map attribute doesn't exist yet.
+    console.warn(`[orchestrator] atomic resumeContext remove failed (${ticketId}): ${err.message}`);
+    await saveWorkflow(workflow);
+  }
   return note;
+}
+
+/** Atomically set resumeContexts[ticketId] without overwriting the whole row. */
+async function setResumeContext(workflowId, ticketId, note) {
+  // Ensure the map exists (no-op if already present), then set just our key.
+  // Two scoped updates avoid clobbering concurrent sibling writes.
+  await ddb.send(new UpdateCommand({
+    TableName: WORKFLOWS_TABLE,
+    Key: { workflowId },
+    UpdateExpression: "SET resumeContexts = if_not_exists(resumeContexts, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  await ddb.send(new UpdateCommand({
+    TableName: WORKFLOWS_TABLE,
+    Key: { workflowId },
+    UpdateExpression: "SET resumeContexts.#k = :note",
+    ExpressionAttributeNames: { "#k": ticketId },
+    ExpressionAttributeValues: { ":note": note },
+  }));
 }
 
 /**
@@ -694,7 +726,9 @@ async function handleTicketReadyUnified(ticketId, ticket) {
 }
 
 /**
- * Transition a Jira issue to a target status.
+ * Transition a Jira issue to a target status. Returns true if the transition
+ * was applied (HTTP ok), false otherwise — callers that chain transitions rely
+ * on this to avoid leaving a ticket stranded mid-hop.
  */
 async function jiraTransition(issueKey, targetStatusName) {
   try {
@@ -705,17 +739,54 @@ async function jiraTransition(issueKey, targetStatusName) {
     );
     if (!match) {
       console.warn(`[orchestrator] No transition to "${targetStatusName}" for ${issueKey}`);
-      return;
+      return false;
     }
     const url = `https://${JIRA_SITE_URL}/rest/api/3/issue/${issueKey}/transitions`;
-    await fetch(url, {
+    const resp = await fetch(url, {
       method: "POST",
       headers: { Authorization: JIRA_AUTH, "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ transition: { id: match.id } }),
     });
+    if (!resp.ok) {
+      console.warn(`[orchestrator] Jira transition to "${targetStatusName}" for ${issueKey} returned ${resp.status}`);
+      return false;
+    }
+    return true;
   } catch (err) {
     console.warn(`[orchestrator] Jira transition failed for ${issueKey}: ${err.message}`);
+    return false;
   }
+}
+
+/**
+ * Reopen a Done Jira ticket to Ready as a verified two-hop (Done → To Do →
+ * Ready). Jira fires a webhook per hop and ordering isn't guaranteed, so we only
+ * proceed to Ready after To Do is confirmed, and retry Ready briefly. Returns
+ * true once the ticket is Ready. Avoids a silent stall when the 2nd hop fails.
+ */
+async function jiraReopenToReady(issueKey) {
+  // Hop 1: Done → To Do. Retry a couple times in case the transition list is
+  // momentarily stale right after the gate's own transition.
+  let toTodo = false;
+  for (let i = 0; i < 3 && !toTodo; i++) {
+    toTodo = await jiraTransition(issueKey, "To Do");
+    if (!toTodo) await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (!toTodo) {
+    console.error(`[orchestrator] Reopen ${issueKey}: could not reach To Do — ticket left as-is.`);
+    return false;
+  }
+  // Hop 2: To Do → Ready. This fires the "ready" webhook that re-invokes the agent.
+  let toReady = false;
+  for (let i = 0; i < 3 && !toReady; i++) {
+    toReady = await jiraTransition(issueKey, "Ready");
+    if (!toReady) await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (!toReady) {
+    console.error(`[orchestrator] Reopen ${issueKey}: reached To Do but not Ready — STALLED, manual nudge needed.`);
+    return false;
+  }
+  return true;
 }
 
 // ─── DynamoDB Stream Processing (legacy DynamoDB path) ────────────────────────
