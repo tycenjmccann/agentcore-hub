@@ -481,6 +481,15 @@ async function transitionIssue(args) {
     );
   }
 
+  // "in_review" is a human-review-gate state. Only tickets assigned to a human
+  // reviewer (assignee "human:*") may enter it — an agent ticket parked there
+  // would never be invoked and would stall forever.
+  if (transition.to === "in_review" && !String(current.Item.assignee || "").startsWith("human:")) {
+    return textResult(
+      `Cannot move ${issueKey} to in_review: only human-review tickets (assignee "human:*") can be sent to review.`
+    );
+  }
+
   // Build update expression — include skipReason if "skip" transition with a reason
   const now = new Date().toISOString();
   const reason = args.reason || args.skip_reason;

@@ -226,7 +226,35 @@ echo "  [4/5] Docker build + ECR push"
 aws ecr get-login-password --region "$AWS_REGION" \
   | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-IMAGE_TAG="$(git rev-parse --short HEAD 2>/dev/null || echo 'latest')"
+# The tracked src/config/agents.json ships runtimeArn:null (open-source contract).
+# The frontend bundles this file at build time and uses runtimeArn to collapse
+# personas that share a runtime into one column (e.g. Evaluations). Without real
+# ARNs the page can't collapse and shows every persona. Pull the deployed copy
+# from S3 for the build only, then restore the null version so git stays clean.
+RESTORE_AGENTS_JSON=""
+AGENTS_JSON_PATH="$REPO_ROOT/src/config/agents.json"
+if [[ -n "${ARTIFACT_BUCKET:-}" ]]; then
+  if aws s3 cp "s3://${ARTIFACT_BUCKET}/config/agents.json" /tmp/agents.s3.json \
+       --region "$AWS_REGION" --only-show-errors 2>/dev/null; then
+    cp "$AGENTS_JSON_PATH" /tmp/agents.git.json
+    cp /tmp/agents.s3.json "$AGENTS_JSON_PATH"
+    RESTORE_AGENTS_JSON=1
+    echo "        Bundling deployed agents.json (real runtime ARNs) from S3"
+  fi
+fi
+restore_agents_json() {
+  if [[ -n "$RESTORE_AGENTS_JSON" && -f /tmp/agents.git.json ]]; then
+    cp /tmp/agents.git.json "$AGENTS_JSON_PATH"
+    echo "        Restored tracked agents.json (runtimeArn:null)"
+  fi
+}
+trap restore_agents_json EXIT
+
+# Tag by content (git SHA + agents.json hash) so a config-only change still
+# produces a new tag — update-service is a no-op when the tag is unchanged.
+GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo 'nogit')"
+CONFIG_HASH="$(shasum "$AGENTS_JSON_PATH" 2>/dev/null | cut -c1-8 || echo '00000000')"
+IMAGE_TAG="${GIT_SHA}-${CONFIG_HASH}"
 FULL_TAG="${ECR_URI}:${IMAGE_TAG}"
 LATEST_TAG="${ECR_URI}:latest"
 

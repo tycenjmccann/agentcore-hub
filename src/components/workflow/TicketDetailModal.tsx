@@ -365,6 +365,18 @@ export default function TicketDetailModal({
 
   const handleTransition = useCallback(async (targetStatus: string) => {
     if (!ticket) return;
+
+    // "Request changes" at a review gate (in_review → blocked) must carry the
+    // reviewer's feedback — it's passed as the transition comment so the
+    // reworked agents actually receive it. Require the Notes field.
+    const isRequestChanges = ticket.status === "in_review" && targetStatus === "blocked";
+    const feedback = newNote.trim();
+    if (isRequestChanges && !feedback) {
+      setStatusOpen(false);
+      setTransitionError("Add a note with the requested changes before rejecting.");
+      return;
+    }
+
     setIsTransitioning(true);
     setTransitionError(null);
     setStatusOpen(false);
@@ -373,20 +385,25 @@ export default function TicketDetailModal({
       const res = await fetch(`/api/workflow/${workflowId}/tickets/transition`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ticketId: ticket.id, targetStatus }),
+        body: JSON.stringify({
+          ticketId: ticket.id,
+          targetStatus,
+          ...(isRequestChanges ? { comment: feedback } : {}),
+        }),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || `HTTP ${res.status}`);
       }
       setTicket((prev) => prev ? { ...prev, status: targetStatus as TicketStatus } : prev);
+      if (isRequestChanges) setNewNote("");
       setAnnouncement(`Status changed to ${STATUS_STYLES[targetStatus]?.label ?? targetStatus}`);
     } catch (err: unknown) {
       setTransitionError(err instanceof Error ? err.message : "Transition failed");
     } finally {
       setIsTransitioning(false);
     }
-  }, [ticket, workflowId]);
+  }, [ticket, workflowId, newNote]);
 
   const handleAddNote = useCallback(async () => {
     if (!ticket || !newNote.trim()) return;
