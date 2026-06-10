@@ -121,7 +121,10 @@ const FALLBACK_WORKFLOW_DEF = {
   featureBranchPhase: "development",
   createsPullRequest: true,
   completionRequiresAgentPhases: ["development", "verification", "review"],
-  phaseOrder: ["intake", "requirements", "design", "development", "verification", "review", "complete"],
+  // Mirror the config-derived order (agentPhases only). The CI agent's "review"
+  // phase is not a pipeline phase, so it is intentionally absent — keeps the
+  // fallback identical to the S3-config path for software-delivery.
+  phaseOrder: ["intake", "requirements", "design", "development", "verification", "complete"],
 };
 
 let _workflowDefs = null;
@@ -1175,9 +1178,12 @@ async function buildAgentContext(ticket, workflow) {
     } catch { /* no design docs yet */ }
   }
 
-  // Feature request input (for analyst — scope)
-  if (agentDef?.phase === "requirements" && workflow.input) {
-    context += `## Feature Request\nTitle: ${workflow.input.title}\nDescription: ${workflow.input.description}\n\n`;
+  // Original request + input sources for the workflow's intake agent (any def).
+  // Scoped by intakeAgentId, not phase: non-software intakes use strategy /
+  // qualification / triage phases, so a "requirements"-only check starved them
+  // of the URLs and uploaded contract/RFP inputs.
+  if (ticket.assignee === wfDef.intakeAgentId && workflow.input) {
+    context += `## Request\nTitle: ${workflow.input.title}\nDescription: ${workflow.input.description}\n\n`;
     if (workflow.input.sources?.length > 0) {
       context += `## Input Sources\n`;
       for (const src of workflow.input.sources) {

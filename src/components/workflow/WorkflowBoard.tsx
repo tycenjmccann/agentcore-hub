@@ -33,8 +33,9 @@ function buildPhaseOrder(phases: PipelinePhaseConfig[]): Record<string, number> 
       order[phase.agentPhase] = idx;
     }
   });
-  // Special states
-  order["review"] = phases.length - 1;
+  // Special states. (No hardcoded "review" override — the loop above already
+  // maps every phase id and agentPhase to its correct index per the running
+  // workflow's def; legacy software-delivery-only override clobbered legal/sales.)
   order["complete"] = phases.length;
   order["error"] = -1;
   order["cancelled"] = -1;
