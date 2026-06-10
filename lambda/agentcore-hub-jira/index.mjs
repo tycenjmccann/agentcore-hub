@@ -122,6 +122,35 @@ async function jiraSearch(jql, fields = ["summary", "status", "labels", "assigne
   return jiraFetch(`/rest/api/3/search/jql?${params.toString()}`);
 }
 
+/**
+ * Resolve a human-review reviewer reference ("<email | display name | accountId>")
+ * to a real Jira accountId so the gate ticket can be assigned to that person —
+ * which makes Jira notify them natively. Returns null if no assignable user
+ * matches (caller falls back to label-only). Matches against users assignable in
+ * the project so we never assign someone who can't act on the ticket.
+ */
+async function resolveReviewerAccountId(ref) {
+  if (!ref) return null;
+  // Already an accountId (Jira account ids contain a ':' or are 24-hex)?
+  if (ref.includes(":")) return ref;
+  try {
+    const q = encodeURIComponent(ref);
+    const users = await jiraFetch(
+      `/rest/api/3/user/assignable/search?project=${PROJECT_KEY}&query=${q}&maxResults=5`
+    );
+    if (!Array.isArray(users) || users.length === 0) return null;
+    const lref = ref.toLowerCase();
+    const exact = users.find(
+      (u) => (u.emailAddress || "").toLowerCase() === lref ||
+             (u.displayName || "").toLowerCase() === lref
+    );
+    return (exact || users[0]).accountId || null;
+  } catch (err) {
+    console.log(`[jira-tools] reviewer resolve failed for "${ref}": ${err.message}`);
+    return null;
+  }
+}
+
 // ─── Tool Implementations ────────────────────────────────────────────────────
 
 async function createTicket(params) {
@@ -170,6 +199,21 @@ async function createTicket(params) {
     issuetype: { name: canonicalType },
     labels,
   };
+
+  // Human-review gate: assign the ticket to a REAL Jira user so they're notified
+  // natively. The reviewer:<who> label still drives the orchestrator/UI; this
+  // additionally sets Jira's assignee field when <who> resolves to a project
+  // user. Unresolvable → label-only (no hard failure).
+  if (isHumanReviewer) {
+    const reviewerRef = assignee.slice("human:".length);
+    const accountId = await resolveReviewerAccountId(reviewerRef);
+    if (accountId) {
+      fields.assignee = { accountId };
+      console.log(`[jira-tools] review gate assigned to ${reviewerRef} (${accountId})`);
+    } else {
+      console.log(`[jira-tools] reviewer "${reviewerRef}" not assignable in ${PROJECT_KEY} — label-only`);
+    }
+  }
 
   if (description) {
     fields.description = {
