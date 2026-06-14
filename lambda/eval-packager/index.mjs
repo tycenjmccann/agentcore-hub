@@ -6,9 +6,19 @@
  * sessions in DynamoDB, and flushes batches to S3 when the buffer reaches
  * the configured batchSize.
  *
+ * On flush it ALSO invokes the Fleet Improver runtime to synthesize an
+ * improvement PRD from the batch, then writes that PRD to the prd/ prefix —
+ * which triggers prd-submitter → the 14-agent workflow → a fix PR. This is the
+ * synthesis step the loop was missing: without it, raw batches reached
+ * prd-submitter with no title/description and produced "[SI] undefined" runs.
+ *
  * Environment Variables:
- *   EVAL_CONFIG_TABLE  — DynamoDB table name (default: agentcore-hub-eval-config)
- *   ARTIFACTS_BUCKET   — S3 bucket for batch output
+ *   EVAL_CONFIG_TABLE       — DynamoDB table name (default: agentcore-hub-eval-config)
+ *   ARTIFACTS_BUCKET        — S3 bucket for batch + PRD output
+ *   IMPROVEMENT_AGENT_ARN   — Fleet Improver runtime ARN (preferred). If unset,
+ *                             flush archives the raw batch but skips synthesis.
+ *   IMPROVEMENT_AGENT_ID    — legacy name-only fallback (combined with
+ *                             AWS_ACCOUNT_ID + region to build an ARN)
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
@@ -36,8 +46,21 @@ if (!BUCKET) {
       'Convention: agentcore-hub-artifacts-{ACCOUNT_ID}-{REGION}'
   );
 }
-const S3_PREFIX = 'fleet-imp-agent/prd';
+// Raw eval batches are archived here (NOT the prd/ prefix that prd-submitter
+// watches — keeping them separate stops un-synthesized batches from triggering
+// a workflow). The synthesized PRD goes to PRD_PREFIX.
+const BATCH_PREFIX = 'fleet-imp-agent/batches';
+const PRD_PREFIX = 'fleet-imp-agent/prd';
 const AGENTS_CONFIG_KEY = 'config/agents.json';
+const REGION = process.env.AWS_REGION || 'us-east-1';
+
+// Fleet Improver runtime: prefer an explicit ARN, else build one from the
+// legacy name + account id. Empty → synthesis is skipped (batch archived only).
+const IMPROVER_ARN =
+  process.env.IMPROVEMENT_AGENT_ARN ||
+  (process.env.IMPROVEMENT_AGENT_ID && process.env.AWS_ACCOUNT_ID
+    ? `arn:aws:bedrock-agentcore:${REGION}:${process.env.AWS_ACCOUNT_ID}:runtime/${process.env.IMPROVEMENT_AGENT_ID}`
+    : '');
 
 // ─── Agent ID Resolution (loaded from S3, cached for warm starts) ───────────
 let agents = null;
@@ -329,11 +352,12 @@ async function aggregateScoresToDdb(agentId, parsed) {
 }
 
 /**
- * Flush the session buffer to S3 and reset the DDB buffer.
+ * Flush the session buffer: archive the raw batch, synthesize a PRD via the
+ * Fleet Improver runtime, write that PRD to the prd/ prefix (→ prd-submitter →
+ * workflow → fix PR), then reset the DDB buffer.
  */
 async function flushBuffer(agentId, buffer, batchSize) {
   const timestamp = new Date().toISOString();
-  const s3Key = `${S3_PREFIX}/batch-${agentId}-${timestamp}.json`;
 
   const batchPayload = {
     agentId,
@@ -342,21 +366,33 @@ async function flushBuffer(agentId, buffer, batchSize) {
     sessions: buffer,
   };
 
-  // Write batch to S3
+  // 1. Archive the raw batch (batches/ prefix — does NOT trigger prd-submitter)
+  const batchKey = `${BATCH_PREFIX}/batch-${agentId}-${timestamp}.json`;
   await s3.send(
     new PutObjectCommand({
       Bucket: BUCKET,
-      Key: s3Key,
+      Key: batchKey,
       Body: JSON.stringify(batchPayload, null, 2),
       ContentType: 'application/json',
     })
   );
-
   console.log(
-    `[eval-packager] FLUSHED | agent=${agentId} | batchSize=${buffer.length} | s3Key=${s3Key}`
+    `[eval-packager] FLUSHED | agent=${agentId} | batchSize=${buffer.length} | archived=${batchKey}`
   );
 
-  // Reset sessionBuffer in DDB
+  // 2. Synthesize a PRD from the batch and write it to prd/ (triggers the loop).
+  //    Reset the buffer regardless of synthesis success so a transient improver
+  //    failure can't wedge the buffer permanently full.
+  try {
+    await synthesizeAndWritePrd(agentId, batchPayload, timestamp);
+  } catch (err) {
+    console.error(
+      `[eval-packager] ${agentId}: PRD synthesis failed (batch archived at ${batchKey}, no workflow triggered):`,
+      err.message
+    );
+  }
+
+  // 3. Reset sessionBuffer in DDB
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE,
@@ -370,4 +406,210 @@ async function flushBuffer(agentId, buffer, batchSize) {
   );
 
   console.log(`[eval-packager] Agent ${agentId}: buffer reset after flush.`);
+}
+
+/**
+ * Invoke the Fleet Improver runtime with the batch, parse its markdown PRD into
+ * { title, description }, and write the result to the prd/ prefix. prd-submitter
+ * (S3 → EventBridge) picks it up and enters the 14-agent pipeline.
+ */
+async function synthesizeAndWritePrd(agentId, batchPayload, timestamp) {
+  if (!IMPROVER_ARN) {
+    console.warn(
+      `[eval-packager] ${agentId}: IMPROVEMENT_AGENT_ARN/ID not set — skipping PRD synthesis. ` +
+        `Set it so flush can invoke the improver.`
+    );
+    return;
+  }
+
+  const prompt =
+    'Analyze this batch of agent evaluation sessions and produce an improvement PRD ' +
+    'following your output format.\n\nBatch:\n' +
+    JSON.stringify(batchPayload);
+
+  console.log(`[eval-packager] ${agentId}: invoking improver ${IMPROVER_ARN.split('/').pop()}`);
+  const markdown = await invokeImprover(IMPROVER_ARN, prompt, agentId);
+
+  if (!markdown || markdown.trim().length === 0) {
+    throw new Error('improver returned empty output');
+  }
+
+  const { title, description } = parsePrd(markdown, agentId);
+  const prd = {
+    title,
+    description,
+    agentId,
+    generatedAt: timestamp,
+    // IntakeSource shape: { type, value, label } — NOT a bare string. The
+    // workflow-start validator reads source.value; a string crashes it.
+    sources: [
+      {
+        type: 's3',
+        value: `s3://${BUCKET}/${BATCH_PREFIX}/batch-${agentId}-${timestamp}.json`,
+        label: `eval batch for ${agentId}`,
+      },
+    ],
+  };
+
+  const prdKey = `${PRD_PREFIX}/prd-${agentId}-${timestamp}.json`;
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: prdKey,
+      Body: JSON.stringify(prd, null, 2),
+      ContentType: 'application/json',
+    })
+  );
+  console.log(
+    `[eval-packager] ${agentId}: PRD synthesized (${description.length} chars) → ${prdKey}`
+  );
+}
+
+/**
+ * Parse the improver's markdown PRD into a PR-ready { title, description }.
+ * Title precedence: explicit "TITLE: ..." line (the prompt contract) → first
+ * "Improvement N:" action item → document H1 → generic fallback.
+ * The TITLE line is stripped from the body; the rest of the markdown is the PRD.
+ */
+function parsePrd(markdown, agentId) {
+  let title = '';
+  let body = markdown;
+
+  // 1. Preferred: the explicit "TITLE: ..." contract line.
+  const titleLine = markdown.match(/^\s*TITLE:\s*(.+)$/im);
+  if (titleLine) {
+    title = titleLine[1].trim();
+    body = markdown.replace(titleLine[0], '').replace(/^\s+/, '');
+  } else {
+    // 2. First recommended improvement title — the actionable change.
+    const improvement =
+      markdown.match(/^#{2,4}\s*(?:Improvement\s*\d+\s*[:\-]\s*)(.+)$/im) ||
+      markdown.match(/\*\*Title\*\*\s*:?\s*(.+)/i);
+    if (improvement) {
+      title = improvement[1].trim();
+    } else {
+      // 3. Document H1.
+      const h1 = markdown.match(/^#\s+(.+)$/m);
+      if (h1) title = h1[1].trim();
+    }
+  }
+
+  // 4. Generic fallback.
+  if (!title) title = `Improve ${agentId} based on evaluation findings`;
+
+  // Strip markdown decorations the workflow title doesn't need.
+  title = title.replace(/`/g, '').replace(/\*\*/g, '').slice(0, 120).trim();
+
+  return { title, description: body };
+}
+
+/**
+ * Invoke an AgentCore Runtime via SigV4-signed HTTPS and return the assembled
+ * text. The runtime streams SSE "data: {event:{contentBlockDelta:{delta:{text}}}}"
+ * frames; we concatenate every delta.text. Mirrors the orchestrator's invoker.
+ */
+async function invokeImprover(runtimeArn, prompt, agentId) {
+  const https = await import('https');
+  const { SignatureV4 } = await import('@smithy/signature-v4');
+  const { Sha256 } = await import('@aws-crypto/sha256-js');
+  const { defaultProvider } = await import('@aws-sdk/credential-provider-node');
+
+  const payload = JSON.stringify({
+    prompt,
+    workflow_id: 'self-improvement',
+    agent_id: agentId,
+  });
+
+  const runtimeId = runtimeArn.split('/').pop();
+  const accountId = runtimeArn.split(':')[4];
+  const host = `bedrock-agentcore.${REGION}.amazonaws.com`;
+  const urlPath = `/runtimes/${encodeURIComponent(runtimeId)}/invocations`;
+  // Session id must be >= 33 chars per AgentCore; pad deterministically.
+  const sessionId = `si-${agentId}-${Date.now()}`.padEnd(33, '-').slice(0, 80);
+
+  const signer = new SignatureV4({
+    service: 'bedrock-agentcore',
+    region: REGION,
+    credentials: defaultProvider(),
+    sha256: Sha256,
+  });
+
+  const signed = await signer.sign({
+    method: 'POST',
+    protocol: 'https:',
+    hostname: host,
+    path: urlPath,
+    query: { accountId },
+    headers: {
+      host,
+      'content-type': 'application/json',
+      'x-amzn-bedrock-agentcore-runtime-session-id': sessionId,
+    },
+    body: payload,
+  });
+
+  return new Promise((resolve, reject) => {
+    // Improver runs ~60-90s; allow 240s (under the Lambda's 300s ceiling).
+    const timer = setTimeout(() => reject(new Error('improver invoke timed out after 240s')), 240_000);
+
+    const req = https.default.request(
+      {
+        hostname: host,
+        path: `${urlPath}?accountId=${accountId}`,
+        method: 'POST',
+        headers: { ...signed.headers },
+        timeout: 240_000,
+      },
+      (res) => {
+        let buffer = '';
+        let text = '';
+
+        const consume = (line) => {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) return;
+          try {
+            const ev = JSON.parse(trimmed.slice(5).trim());
+            const t = ev?.event?.contentBlockDelta?.delta?.text;
+            if (t) text += t;
+            // Non-SSE fallback shapes
+            if (!t && ev?.text) text += ev.text;
+          } catch {
+            /* non-JSON frame */
+          }
+        };
+
+        res.on('data', (chunk) => {
+          buffer += chunk.toString();
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          for (const line of lines) consume(line);
+        });
+
+        res.on('end', () => {
+          clearTimeout(timer);
+          if (buffer) consume(buffer);
+          if (res.statusCode >= 400) {
+            reject(new Error(`improver returned ${res.statusCode}: ${text.slice(0, 300)}`));
+          } else {
+            resolve(text);
+          }
+        });
+
+        res.on('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      }
+    );
+
+    req.on('socket', (socket) => {
+      socket.setKeepAlive(true, 30_000);
+    });
+    req.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    req.write(payload);
+    req.end();
+  });
 }

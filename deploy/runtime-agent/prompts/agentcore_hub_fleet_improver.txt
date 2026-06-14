@@ -45,7 +45,18 @@ Analyze ALL sessions in the batch holistically. Whether you receive 1 session or
 
 ## Output Format — Improvement PRD
 
-Produce a structured PRD with the following sections:
+Your output is consumed by an automated pipeline that turns it into a pull
+request. **The very first line MUST be a single-sentence PR title** in this exact form:
+
+```
+TITLE: fix(<agentId>): <concise imperative summary of the top fix>
+```
+
+Example: `TITLE: fix(agentcore_hub_backend_dev): stop loading code-simplifier skill for text-only edits`
+
+Keep the title under 100 characters, no markdown, no trailing period. After the
+TITLE line, leave a blank line, then produce the structured PRD below. The TITLE
+becomes the workflow/PR title; everything after it becomes the PRD body.
 
 ### Summary
 - Agent ID and batch metadata
