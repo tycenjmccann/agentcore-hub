@@ -17,9 +17,12 @@ FLEET_REPO="$FLEET_REPO_URL"
 # synthesis (and logs a warning) rather than failing the flush.
 IMPROVER_ARN="${IMPROVEMENT_AGENT_ARN:-}"
 if [ -z "$IMPROVER_ARN" ]; then
+  # Discovery is best-effort: an old AWS CLI without this AgentCore command, or
+  # credentials that can't list runtimes, must NOT abort the deploy under `set -e`.
+  # `|| true` swallows the nonzero exit so the empty-ARN fallback below runs.
   IMPROVER_ARN=$(aws bedrock-agentcore-control list-agent-runtimes --region "$AWS_REGION" \
     --query "agentRuntimes[?contains(agentRuntimeName,'fleet_improver')].agentRuntimeArn | [0]" \
-    --output text 2>/dev/null)
+    --output text 2>/dev/null || true)
   [ "$IMPROVER_ARN" = "None" ] && IMPROVER_ARN=""
 fi
 if [ -z "$IMPROVER_ARN" ]; then
@@ -82,7 +85,10 @@ deploy_lambda() {
   rm -rf function.zip node_modules
 }
 
-deploy_lambda "eval-packager" "eval-packager" 300 512 \
+# 600s timeout: invokeImprover allows up to 240s, and the handleOverflow path can
+# chain a second flush (its own synthesis) before retrying the append. 300s left
+# no margin for that worst case; 600s clears it plus DDB/S3/CW Logs overhead.
+deploy_lambda "eval-packager" "eval-packager" 600 512 \
   "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ARN=${IMPROVER_ARN},AWS_ACCOUNT_ID=${ACCOUNT_ID}}"
 
 deploy_lambda "prd-submitter" "prd-submitter" 30 256 \

@@ -352,9 +352,17 @@ async function aggregateScoresToDdb(agentId, parsed) {
 }
 
 /**
- * Flush the session buffer: archive the raw batch, synthesize a PRD via the
- * Fleet Improver runtime, write that PRD to the prd/ prefix (→ prd-submitter →
- * workflow → fix PR), then reset the DDB buffer.
+ * Flush the session buffer. ORDER MATTERS:
+ *   1. Reset the DDB buffer FIRST (the batch is already captured in memory).
+ *   2. Archive the raw batch to batches/.
+ *   3. Synthesize a PRD via the Fleet Improver and write it to prd/.
+ *
+ * The reset must happen before the (60–240s) synthesis call, not after. If it
+ * came last, the buffer would stay full for the whole synthesis window — any
+ * concurrent invocation for the same agent would hit the size-guard, fall into
+ * handleOverflow, re-read the SAME batch, and flush it again → duplicate PRD +
+ * duplicate workflow. Resetting first keeps the duplicate window at one DDB
+ * write (~100ms), matching the pre-synthesis behavior.
  */
 async function flushBuffer(agentId, buffer, batchSize) {
   const timestamp = new Date().toISOString();
@@ -366,7 +374,22 @@ async function flushBuffer(agentId, buffer, batchSize) {
     sessions: buffer,
   };
 
-  // 1. Archive the raw batch (batches/ prefix — does NOT trigger prd-submitter)
+  // 1. Reset sessionBuffer in DDB FIRST — claim the batch so concurrent
+  //    invocations append into a fresh buffer instead of re-flushing this one.
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { agentId },
+      UpdateExpression: 'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts',
+      ExpressionAttributeValues: {
+        ':empty': [],
+        ':ts': timestamp,
+      },
+    })
+  );
+  console.log(`[eval-packager] Agent ${agentId}: buffer reset (batch claimed for flush).`);
+
+  // 2. Archive the raw batch (batches/ prefix — does NOT trigger prd-submitter)
   const batchKey = `${BATCH_PREFIX}/batch-${agentId}-${timestamp}.json`;
   await s3.send(
     new PutObjectCommand({
@@ -380,9 +403,9 @@ async function flushBuffer(agentId, buffer, batchSize) {
     `[eval-packager] FLUSHED | agent=${agentId} | batchSize=${buffer.length} | archived=${batchKey}`
   );
 
-  // 2. Synthesize a PRD from the batch and write it to prd/ (triggers the loop).
-  //    Reset the buffer regardless of synthesis success so a transient improver
-  //    failure can't wedge the buffer permanently full.
+  // 3. Synthesize a PRD from the batch and write it to prd/ (triggers the loop).
+  //    Best-effort: a transient improver failure leaves the batch archived and
+  //    the buffer already reset, so the flush never wedges.
   try {
     await synthesizeAndWritePrd(agentId, batchPayload, timestamp);
   } catch (err) {
@@ -391,21 +414,6 @@ async function flushBuffer(agentId, buffer, batchSize) {
       err.message
     );
   }
-
-  // 3. Reset sessionBuffer in DDB
-  await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE,
-      Key: { agentId },
-      UpdateExpression: 'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts',
-      ExpressionAttributeValues: {
-        ':empty': [],
-        ':ts': timestamp,
-      },
-    })
-  );
-
-  console.log(`[eval-packager] Agent ${agentId}: buffer reset after flush.`);
 }
 
 /**
