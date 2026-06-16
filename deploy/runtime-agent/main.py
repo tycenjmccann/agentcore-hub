@@ -602,12 +602,16 @@ def _create_mcp_clients():
 
 
 def _slugify_repo(task_or_url: str) -> str:
-    """Derive a per-repo session slug from a task/URL so /mnt/workspace persists
-    per repo across invocations. Falls back to 'default' when no repo is found."""
+    """Derive a per-repo session slug ("owner-repo") from a task/URL so
+    /mnt/workspace persists per repo across invocations. Includes the owner so
+    same-named repos under different owners don't share a workspace. Falls back
+    to 'default' when no repo is found."""
     import re
-    m = re.search(r"github\.com[/:][\w.-]+/([\w.-]+)", task_or_url or "")
+    m = re.search(r"github\.com[/:]([\w.-]+)/([\w.-]+)", task_or_url or "")
     if m:
-        return m.group(1)[:-4] if m.group(1).endswith(".git") else m.group(1)
+        owner, repo = m.group(1), m.group(2)
+        repo = repo[:-4] if repo.endswith(".git") else repo
+        return f"{owner}-{repo}"
     return "default"
 
 

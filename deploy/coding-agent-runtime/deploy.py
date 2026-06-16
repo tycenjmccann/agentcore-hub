@@ -106,6 +106,9 @@ def main() -> None:
         "BEDROCK_MANTLE_REGION": os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2"),
         "CODEX_MODEL": os.environ.get("CODEX_MODEL", "openai.gpt-5.5"),
     }
+    # GitHub auth for private repo clone/push (launchers configure git from it).
+    if gh_pat := os.environ.get("GITHUB_PAT"):
+        env_vars["GITHUB_PAT"] = gh_pat
 
     print("=" * 63)
     print(f"  Deploying {RUNTIME_NAME}")

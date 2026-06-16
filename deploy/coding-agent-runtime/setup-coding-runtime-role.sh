@@ -57,10 +57,16 @@ aws iam put-role-policy \
     \"Version\": \"2012-10-17\",
     \"Statement\": [
       {
-        \"Sid\": \"Logs\",
+        \"Sid\": \"LogsGroup\",
         \"Effect\": \"Allow\",
-        \"Action\": [\"logs:CreateLogGroup\", \"logs:CreateLogStream\", \"logs:PutLogEvents\", \"logs:DescribeLogGroups\", \"logs:DescribeLogStreams\"],
+        \"Action\": [\"logs:CreateLogGroup\", \"logs:DescribeLogGroups\", \"logs:DescribeLogStreams\"],
         \"Resource\": [\"arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/*\"]
+      },
+      {
+        \"Sid\": \"LogsStreamWrite\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"logs:CreateLogStream\", \"logs:PutLogEvents\"],
+        \"Resource\": [\"arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/*:log-stream:*\"]
       },
       {
         \"Sid\": \"XRay\",

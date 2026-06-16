@@ -27,6 +27,13 @@ WORKSPACE_DIR="${WORKSPACE_DIR:-/mnt/workspace}"
 mkdir -p "$WORKSPACE_DIR"
 cd "$WORKSPACE_DIR"
 
+# GitHub auth for private clone/push (mirrors the fleet container's git setup).
+if [ -n "${GITHUB_PAT:-}" ]; then
+  git config --global "url.https://x-access-token:${GITHUB_PAT}@github.com/.insteadOf" "https://github.com/"
+  git config --global user.email "${GIT_AUTHOR_EMAIL:-agent@agentcore-hub.example.com}"
+  git config --global user.name "${GIT_AUTHOR_NAME:-AgentCore Hub Agent}"
+fi
+
 MODEL="${ANTHROPIC_MODEL:-${CLAUDE_MODEL:-us.anthropic.claude-opus-4-6-v1}}"
 PROMPT="${1:?run-claude.sh requires a task prompt}"
 
