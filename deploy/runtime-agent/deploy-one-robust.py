@@ -58,6 +58,7 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         "CLAUDE_CODE_USE_BEDROCK": "1",
         "CLAUDE_MODEL": "us.anthropic.claude-opus-4-6-v1",
         "ANTHROPIC_MODEL": "us.anthropic.claude-opus-4-6-v1",
+        "BEDROCK_MANTLE_REGION": os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2"),
         # In the baked image Playwright Chromium lives under /root/.cache/ms-playwright.
         # Override only if the caller explicitly sets it.
         "HOME": "/root",
@@ -66,6 +67,8 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
     }
     if gw := os.environ.get("GATEWAY_ARN"):
         env["GATEWAY_ARN"] = gw
+    if cc_arn := os.environ.get("CODING_AGENT_RUNTIME_ARN"):
+        env["CODING_AGENT_RUNTIME_ARN"] = cc_arn
     if mcp := os.environ.get("MCP_SERVERS"):
         env["MCP_SERVERS"] = mcp
     elif pat := os.environ.get("GITHUB_PAT"):

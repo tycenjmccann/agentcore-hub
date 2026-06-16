@@ -30,6 +30,14 @@ export EVENTS_TABLE="${EVENTS_TABLE:-agentcore-hub-events}"
 export TICKETS_TABLE="${TICKETS_TABLE:-agentcore-hub-tickets}"
 export WORKFLOWS_TABLE="${WORKFLOWS_TABLE:-agentcore-hub-workflows}"
 
+# Coding-agent runtime (Claude Code + Codex on a dedicated runtime)
+# CODING_AGENT_RUNTIME_ARN is set after `deploy/coding-agent-runtime/deploy.py`.
+# When empty, fleet agents fall back to the in-container claude_code subprocess.
+export CODING_AGENT_RUNTIME_ARN="${CODING_AGENT_RUNTIME_ARN:-}"
+export CODING_RUNTIME_ROLE_ARN="${CODING_RUNTIME_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-coding-runtime-role}"
+# Codex GPT-5.5 on Bedrock Mantle is us-east-2 only.
+export BEDROCK_MANTLE_REGION="${BEDROCK_MANTLE_REGION:-us-east-2}"
+
 # Validation
 if [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "None" ]; then
   echo "ERROR: Could not determine AWS account ID. Check your credentials." >&2

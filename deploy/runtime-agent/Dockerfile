@@ -4,8 +4,11 @@ RUN apt-get update && apt-get install -y gcc g++ git curl && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
-RUN npm install -g @anthropic-ai/claude-code && \
-    npx playwright install --with-deps chromium
+# Claude Code CLI now lives on the dedicated coding-agent runtime
+# (deploy/coding-agent-runtime/). The fleet agent invokes it via the AgentCore
+# commands API; it only installs the CLI on demand for the subprocess fallback
+# used when CODING_AGENT_RUNTIME_ARN is unset. Playwright stays for output validation.
+RUN npx playwright install --with-deps chromium
 
 # Bake curated Claude Code skills/plugins into the image so each fleet agent
 # starts with domain expertise pre-loaded. See install-skills.sh for the full

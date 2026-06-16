@@ -229,6 +229,27 @@ aws iam put-role-policy \
   }"
 echo "   ✓ Attached Gateway invoke"
 
+# ─── Coding Runtime Invoke (commands API → dedicated coding-agent runtime) ────
+# Lets the fleet agent shell the coding CLIs (claude_code / codex) into the
+# dedicated coding runtime via InvokeAgentRuntime. Covered by
+# BedrockAgentCoreFullAccess too; declared explicitly for least-privilege clarity.
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name "CodingRuntimeInvoke" \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Sid\": \"InvokeCodingRuntime\",
+      \"Effect\": \"Allow\",
+      \"Action\": [\"bedrock-agentcore:InvokeAgentRuntime\"],
+      \"Resource\": [
+        \"arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:runtime/*\",
+        \"arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:runtime/*/runtime-endpoint/*\"
+      ]
+    }]
+  }"
+echo "   ✓ Attached Coding Runtime invoke"
+
 # ─── Workload Identity + API Key Access (for gateway OAuth/API key tools) ─────
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \

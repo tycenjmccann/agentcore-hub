@@ -41,8 +41,11 @@ if os.path.exists(_pw_node) and not os.access(_pw_node, os.X_OK):
         os.environ["PLAYWRIGHT_NODEJS_PATH"] = "/tmp/playwright-node"
 
 # --- Install Node.js at startup (once per session) ---
-# direct_code_deploy runtimes don't have Node.js pre-installed.
-# This installs a standalone Node.js binary to /tmp so shell, claude_code, and npm work.
+# direct_code_deploy runtimes don't have Node.js pre-installed. Node is still
+# needed for Playwright (output validation) and the claude_code subprocess
+# fallback used when CODING_AGENT_RUNTIME_ARN is unset. The Claude Code CLI
+# itself now lives on the dedicated coding-agent runtime, so it is NOT installed
+# here anymore — it is installed on demand only in the subprocess fallback path.
 _node_marker = "/tmp/.node_installed"
 if not os.path.exists(_node_marker):
     try:
@@ -53,8 +56,6 @@ if not os.path.exists(_node_marker):
             ln -sf /tmp/node-v20.18.0-linux-arm64/bin/node /tmp/node && \
             ln -sf /tmp/node-v20.18.0-linux-arm64/bin/npm /tmp/npm && \
             ln -sf /tmp/node-v20.18.0-linux-arm64/bin/npx /tmp/npx && \
-            export PATH="/tmp/node-v20.18.0-linux-arm64/bin:$PATH" && \
-            npm install -g @anthropic-ai/claude-code 2>/dev/null && \
             touch /tmp/.node_installed
             """],
             capture_output=True, text=True, timeout=180,
@@ -62,7 +63,7 @@ if not os.path.exists(_node_marker):
         )
         os.environ["PATH"] = f"/tmp/node-v20.18.0-linux-arm64/bin:/tmp/.npm-global/bin:{os.environ.get('PATH', '')}"
     except Exception as e:
-        print(f"[WARN] Node.js install failed: {e} — shell/claude_code may not work")
+        print(f"[WARN] Node.js install failed: {e} — Playwright/subprocess fallback may not work")
 else:
     os.environ["PATH"] = f"/tmp/node-v20.18.0-linux-arm64/bin:/tmp/.npm-global/bin:{os.environ.get('PATH', '')}"
 
@@ -141,6 +142,14 @@ GATEWAY_ARN = os.getenv("GATEWAY_ARN", "")
 # NOTE: AgentCore reserves "ARTIFACT_BUCKET" as a system env var (points to CodeBuild source bucket).
 # We use AGENTCORE_HUB_ARTIFACT_BUCKET to avoid the collision.
 ARTIFACT_BUCKET = os.getenv("AGENTCORE_HUB_ARTIFACT_BUCKET", os.getenv("ARTIFACT_BUCKET", ""))
+
+# Dedicated coding-agent runtime — when set, the coding CLIs (Claude Code, Codex)
+# run on a separate observable runtime with a persistent workspace, invoked
+# via the AgentCore commands API. When unset, claude_code falls back to an
+# in-container subprocess (dev/local + legacy behavior preserved).
+CODING_AGENT_RUNTIME_ARN = os.getenv("CODING_AGENT_RUNTIME_ARN", "")
+# Codex GPT-5.5 on Bedrock Mantle is us-east-2 only — route there regardless of REGION.
+BEDROCK_MANTLE_REGION = os.getenv("BEDROCK_MANTLE_REGION", "us-east-2")
 
 # System prompt: prefer S3 (for large prompts), fall back to env var
 _prompt_s3_key = os.getenv("SYSTEM_PROMPT_S3_KEY", "")
@@ -580,45 +589,251 @@ def _create_mcp_clients():
     return clients
 
 
-# ─── Claude Code SDK Tool ────────────────────────────────────────────────────
-# Agents that write code delegate to Claude Code for higher-quality implementation.
-# Claude Code reads CLAUDE.md in the repo, follows project conventions, and handles
-# complex multi-file edits better than raw shell/editor tool usage.
+# ─── Coding CLI Tools (Claude Code / Codex) ──────────────────────────────────
+# Agents that write code delegate to a coding CLI for higher-quality
+# implementation. When CODING_AGENT_RUNTIME_ARN is set, the CLI runs on a
+# dedicated, observable AgentCore Runtime with a persistent /mnt/workspace
+# (repos stay cloned, deps installed) and full OTel tracing — invoked via the
+# AgentCore commands API. When unset, claude_code falls back to an in-container
+# subprocess (dev/local + legacy behavior). Codex has no subprocess fallback —
+# it requires the runtime.
+#
+# Transport + launchers mirror aws-samples/sample-agent-assisted-sdlc.
 
-# All agents get claude_code — even non-dev agents benefit from it for
-# reading repos, analyzing code structure, generating docs from source, etc.
 
-@tool
-def claude_code(task: str, working_directory: str = "/tmp") -> str:
-    """Delegate a coding task to Claude Code — a specialized AI coding agent.
+def _slugify_repo(task_or_url: str) -> str:
+    """Derive a per-repo session slug from a task/URL so /mnt/workspace persists
+    per repo across invocations. Falls back to 'default' when no repo is found."""
+    import re
+    m = re.search(r"github\.com[/:][\w.-]+/([\w.-]+)", task_or_url or "")
+    if m:
+        return m.group(1)[:-4] if m.group(1).endswith(".git") else m.group(1)
+    return "default"
 
-    Claude Code excels at:
-    - Cloning repos and understanding existing codebases (reads CLAUDE.md automatically)
-    - Multi-file code implementation with proper imports and types
-    - Running tests and iteratively fixing failures
-    - Git operations (branch, commit, push)
-    - Following project conventions from CLAUDE.md
 
-    WHEN TO USE: Any time you need to write/edit code, run tests, or interact with a git repo.
-    Let Claude Code handle the HOW while you handle the WHAT and WHY.
+def _coding_runtime_execute_command(session_id: str, command: str, timeout: int = 600):
+    """Run a shell command in the coding runtime session via the AgentCore
+    commands API, yielding output incrementally as it streams back.
 
-    Args:
-        task: Complete description of what to implement. Include:
-              - Repo URL and branch name
-              - What to build (specific files, endpoints, features)
-              - Acceptance criteria (what success looks like)
-              - Any constraints (don't modify X, use library Y)
-        working_directory: Directory to operate in (default: /tmp)
+    Yields tuples: ("stdout", text) | ("stderr", text) | ("exit", code).
+    Mirrors aws-samples shared/pipeline.py execute_command, but as a generator so
+    callers can publish live events as each EventStream frame is parsed (rather
+    than accumulating and returning only at the end).
     """
+    import urllib.parse
+    import requests
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.session import get_session as _bc_get_session
+    from botocore.eventstream import EventStreamBuffer
+
+    encoded_arn = urllib.parse.quote(CODING_AGENT_RUNTIME_ARN, safe="")
+    host = f"bedrock-agentcore.{REGION}.amazonaws.com"
+    url = f"https://{host}/runtimes/{encoded_arn}/commands?qualifier=DEFAULT"
+
+    body = json.dumps({"command": command, "timeout": timeout}).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/vnd.amazon.eventstream",
+        "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id,
+        "Host": host,
+    }
+
+    creds = _bc_get_session().get_credentials().get_frozen_credentials()
+    req = AWSRequest(method="POST", url=url, data=body, headers=headers)
+    SigV4Auth(creds, "bedrock-agentcore", REGION).add_auth(req)
+    signed = dict(req.headers)
+
+    try:
+        resp = requests.post(url, data=body, headers=signed, timeout=timeout + 30, stream=True)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.error(f"[coding_runtime] commands API HTTP failure: {e}")
+        yield ("stderr", f"HTTP error invoking coding runtime: {e}")
+        yield ("exit", -1)
+        return
+
+    buf = EventStreamBuffer()
+    for chunk in resp.iter_content(chunk_size=4096):
+        if not chunk:
+            continue
+        buf.add_data(chunk)
+        for ev in buf:
+            if not ev.payload:
+                continue
+            try:
+                decoded = json.loads(ev.payload)
+                inner = decoded.get("chunk") if isinstance(decoded, dict) else None
+                event = inner if isinstance(inner, dict) else decoded
+                if "contentDelta" in event:
+                    d = event["contentDelta"]
+                    if "stdout" in d:
+                        yield ("stdout", d["stdout"])
+                    if "stderr" in d:
+                        yield ("stderr", d["stderr"])
+                elif "contentStop" in event:
+                    yield ("exit", int(event["contentStop"].get("exitCode", -1)))
+            except (json.JSONDecodeError, KeyError):
+                # Frame may straddle a chunk boundary or be a non-JSON keep-alive.
+                continue
+
+
+def _extract_cli_events(obj):
+    """Map a parsed stream-json/JSONL line (Claude Code or Codex) to UI events.
+
+    Returns a list of ("trace", tool_name) and ("text", content) tuples. Tolerant
+    of both Claude Code's `{type:"assistant", message:{content:[...]}}` shape and
+    Codex's `{msg:{type:...}}` / flat shapes; unknown shapes return [].
+    """
+    out = []
+    if not isinstance(obj, dict):
+        return out
+    # Claude Code stream-json: assistant message with content blocks.
+    msg = obj.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+        for block in msg["content"]:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name"):
+                out.append(("trace", str(block["name"])))
+            elif block.get("type") == "text" and block.get("text"):
+                out.append(("text", str(block["text"])))
+        return out
+    # Codex exec --json (0.x): events are {type:"item.completed", item:{type,...}}
+    # for tool/message items, plus older {msg:{type}} / flat shapes.
+    item = obj.get("item")
+    if isinstance(item, dict):
+        itype = item.get("type")
+        if itype in ("agent_message", "assistant_message", "message"):
+            txt = item.get("text") or item.get("message")
+            if isinstance(txt, str) and txt:
+                out.append(("text", txt))
+        elif itype in ("command_execution", "tool_call", "function_call", "patch_apply", "file_change"):
+            name = item.get("command") or item.get("name") or item.get("tool") or itype
+            out.append(("trace", str(name)))
+        return out
+    ev = obj.get("msg") if isinstance(obj.get("msg"), dict) else obj
+    etype = ev.get("type") or obj.get("type")
+    if etype in ("tool_use", "function_call", "exec_command_begin", "command", "patch_apply_begin"):
+        name = ev.get("name") or ev.get("tool") or ev.get("command") or etype
+        out.append(("trace", str(name)))
+    elif etype in ("agent_message", "assistant_message", "text", "message"):
+        content = ev.get("text") or ev.get("message") or ev.get("content")
+        if isinstance(content, str) and content:
+            out.append(("text", content))
+    return out
+
+
+def _invoke_coding_runtime(cli: str, task: str, working_directory: str = "/tmp", repo_slug: str = "") -> str:
+    """Shared implementation for the claude_code / codex tools.
+
+    Runs the chosen CLI on the dedicated coding runtime (when configured),
+    streaming per-tool live events to the events table while accumulating the
+    full output to return to the calling agent (preserving the validate-and-retry
+    contract). Falls back to the in-container subprocess for `claude` when no
+    runtime ARN is set.
+    """
+    import time as _time
+
+    logger.info(f"[{cli}] Delegating task: {task[:150]}...")
+
+    if not CODING_AGENT_RUNTIME_ARN:
+        if cli == "claude":
+            return _subprocess_claude_fallback(task, working_directory)
+        return (
+            f"ERROR: {cli} requires the dedicated coding runtime, but "
+            "CODING_AGENT_RUNTIME_ARN is not set. Deploy deploy/coding-agent-runtime/ "
+            "and set the ARN, or use claude_code (which has a subprocess fallback)."
+        )
+
+    # Sanitize the slug — it flows into a shell command and a session id, so allow
+    # only safe path/identifier chars regardless of whether it was parsed or passed.
+    import re as _re
+    slug = _re.sub(r"[^A-Za-z0-9._-]", "-", (repo_slug or _slugify_repo(task)))[:64] or "default"
+    session_id = f"env-{slug}".ljust(33, "0")  # AgentCore session ids must be >= 33 chars
+    wf_id = _CURRENT_WORKFLOW_ID
+    ag_id = _CURRENT_AGENT_ID
+
+    # base64 the task so no shell metachar in the prompt can break the command.
+    import base64
+    task_b64 = base64.b64encode(task.encode()).decode()
+    command = (
+        f"echo {task_b64} | base64 -d > /tmp/coding_task.txt && "
+        f'WORKSPACE_DIR=/mnt/workspace/{slug} /app/run-{cli}.sh "$(cat /tmp/coding_task.txt)"'
+    )
+
+    logger.info(f"[{cli}] Invoking coding runtime (session={session_id}, repo={slug})")
+
+    stdout_parts: list = []
+    stderr_parts: list = []
+    exit_code = -1
+    line_buf = ""
+    last_event = _time.monotonic()
+    HEARTBEAT_SECS = 15
+
+    def _emit(kind: str, value: str):
+        if kind == "trace":
+            _publish_cli_event(wf_id, ag_id, {"type": "trace", "toolName": value, "source": cli})
+        else:
+            _publish_cli_event(wf_id, ag_id, {"type": "text", "content": value, "source": cli})
+
+    try:
+        for kind, payload in _coding_runtime_execute_command(session_id, command, timeout=900):
+            now = _time.monotonic()
+            if kind == "exit":
+                exit_code = payload
+                continue
+            if kind == "stderr":
+                stderr_parts.append(payload)
+                continue
+            # stdout — accumulate for the return value and parse for live events.
+            stdout_parts.append(payload)
+            line_buf += payload
+            parsed_any = False
+            while "\n" in line_buf:
+                line, line_buf = line_buf.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for kind2, value2 in _extract_cli_events(obj):
+                    _emit(kind2, value2)
+                    parsed_any = True
+            # Graceful degradation: if we're getting output but no parseable
+            # JSONL events, keep the UI pulsing with a throttled heartbeat.
+            if parsed_any:
+                last_event = now
+            elif now - last_event >= HEARTBEAT_SECS:
+                _emit("trace", f"{cli}:working")
+                last_event = now
+    except Exception as e:
+        logger.error(f"[{cli}] runtime invocation error: {e}")
+        return f"ERROR invoking {cli} on coding runtime: {e}"
+
+    output = "".join(stdout_parts).strip()
+    stderr = "".join(stderr_parts).strip()
+    if exit_code != 0 and stderr:
+        output += f"\n\nSTDERR: {stderr[-500:]}"
+
+    logger.info(f"[{cli}] Runtime complete. {len(output)} chars, exit={exit_code}")
+    if exit_code != 0:
+        logger.warning(f"[{cli}] FAILED — output head: {output[:200]!r}")
+    return output if output else f"{cli} exited with code {exit_code}. Stderr: {stderr[-300:]}"
+
+
+def _subprocess_claude_fallback(task: str, working_directory: str = "/tmp") -> str:
+    """In-container Claude Code subprocess — used only when CODING_AGENT_RUNTIME_ARN
+    is unset (dev/local + legacy). Installs the CLI on first use, runs it under a
+    watchdog that kills the whole process group on the deadline."""
     import subprocess
     import shutil
 
-    logger.info(f"[claude_code] Delegating task: {task[:150]}...")
-
-    # Ensure claude CLI is available (install if needed — first invocation only)
     claude_bin = shutil.which("claude")
     if not claude_bin:
-        logger.info("[claude_code] Installing Claude Code CLI...")
+        logger.info("[claude_code] Installing Claude Code CLI (subprocess fallback)...")
         try:
             subprocess.run(
                 ["npm", "install", "-g", "@anthropic-ai/claude-code"],
@@ -629,14 +844,12 @@ def claude_code(task: str, working_directory: str = "/tmp") -> str:
         except Exception as e:
             return f"ERROR: Failed to install Claude Code CLI: {e}. Use shell/editor tools directly instead."
 
-    # Determine model for Claude Code (check both env vars Claude Code recognizes)
     cc_model = os.environ.get("ANTHROPIC_MODEL") or os.environ.get("CLAUDE_MODEL") or "us.anthropic.claude-opus-4-6-v1"
 
     try:
-        # Use Popen + start_new_session to create a new process group.
-        # This ensures we can kill claude AND all its grandchildren (Node, git, LSP)
-        # on timeout. Without this, grandchildren inherit pipe FDs and keep them open,
-        # causing communicate() to block forever even after timeout fires.
+        # Popen + start_new_session creates a new process group so we can kill
+        # claude AND its grandchildren (Node, git, LSP) on timeout — otherwise
+        # grandchildren keep pipe FDs open and communicate() blocks forever.
         proc = subprocess.Popen(
             [
                 claude_bin,
@@ -651,7 +864,7 @@ def claude_code(task: str, working_directory: str = "/tmp") -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,  # New process group — enables killpg
+            start_new_session=True,
             env={
                 **os.environ,
                 "CLAUDE_CODE_ENTRYPOINT": "agentcore-hub-pipeline",
@@ -659,20 +872,15 @@ def claude_code(task: str, working_directory: str = "/tmp") -> str:
             },
         )
 
-        # Independent watchdog thread enforces the deadline. We can't rely on
-        # proc.communicate(timeout=...) alone because on AgentCore the calling
-        # thread can wedge in the selector (OTEL + asyncio + tool wrapper) and
-        # never raise TimeoutExpired. threading.Event.wait sits on a pthread
-        # condvar that wakes regardless of selector state, so it always fires.
-        # Once we killpg the process group, pipe EOF unblocks communicate().
-        # Deadline kept under AgentCore's 900s idleSessionTimeout.
+        # Independent watchdog thread enforces the deadline — proc.communicate
+        # alone can wedge in the selector on AgentCore. threading.Event.wait sits
+        # on a pthread condvar that wakes regardless of selector state.
         DEADLINE_SECS = 600
         watchdog_done = threading.Event()
         watchdog_fired = {"value": False}
 
         def _watchdog():
             if not watchdog_done.wait(timeout=DEADLINE_SECS):
-                # Deadline expired — kill the whole process group.
                 watchdog_fired["value"] = True
                 try:
                     pgid = os.getpgid(proc.pid)
@@ -688,11 +896,8 @@ def claude_code(task: str, working_directory: str = "/tmp") -> str:
         watchdog.start()
 
         try:
-            # Belt-and-suspenders: also pass a timeout slightly past the
-            # watchdog so if communicate ever DOES wake, we don't hang here.
             stdout, stderr = proc.communicate(timeout=DEADLINE_SECS + 30)
         except subprocess.TimeoutExpired:
-            # Watchdog should have killed it; force-kill in case it didn't.
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, OSError):
@@ -715,7 +920,7 @@ def claude_code(task: str, working_directory: str = "/tmp") -> str:
         if proc.returncode != 0 and stderr:
             output += f"\n\nSTDERR: {stderr[-500:]}"
 
-        logger.info(f"[claude_code] Complete. {len(output)} chars, exit code: {proc.returncode}")
+        logger.info(f"[claude_code] Complete (subprocess). {len(output)} chars, exit code: {proc.returncode}")
         if proc.returncode != 0:
             logger.warning(f"[claude_code] FAILED — stdout: {stdout[:200]!r}")
             logger.warning(f"[claude_code] FAILED — stderr: {stderr[:200]!r}")
@@ -724,6 +929,53 @@ def claude_code(task: str, working_directory: str = "/tmp") -> str:
         return "ERROR: 'claude' CLI not found in this environment. Falling back — use shell, editor, and file_write tools directly."
     except Exception as e:
         return f"ERROR invoking Claude Code: {str(e)}"
+
+
+# All agents get these — even non-dev agents benefit for reading repos, analyzing
+# code structure, generating docs from source, etc.
+
+@tool
+def claude_code(task: str, working_directory: str = "/tmp", repo_slug: str = "") -> str:
+    """Delegate a coding task to Claude Code — a specialized AI coding agent.
+
+    Claude Code excels at:
+    - Cloning repos and understanding existing codebases (reads CLAUDE.md automatically)
+    - Multi-file code implementation with proper imports and types
+    - Running tests and iteratively fixing failures
+    - Git operations (branch, commit, push)
+    - Following project conventions from CLAUDE.md
+
+    WHEN TO USE: Any time you need to write/edit code, run tests, or interact with a git repo.
+    Let Claude Code handle the HOW while you handle the WHAT and WHY.
+
+    Args:
+        task: Complete description of what to implement. Include:
+              - Repo URL and branch name
+              - What to build (specific files, endpoints, features)
+              - Acceptance criteria (what success looks like)
+              - Any constraints (don't modify X, use library Y)
+        working_directory: Directory to operate in (default: /tmp)
+        repo_slug: Optional repo key for the persistent workspace session
+                   (defaults to the repo parsed from the task URL).
+    """
+    return _invoke_coding_runtime("claude", task, working_directory, repo_slug)
+
+
+@tool
+def codex(task: str, working_directory: str = "/tmp", repo_slug: str = "") -> str:
+    """Delegate a coding task to OpenAI Codex (GPT-5.5 via Amazon Bedrock).
+
+    Runs on the dedicated coding runtime — no OpenAI API key needed; inference
+    routes through Amazon Bedrock Mantle using the runtime's IAM role. Same task
+    contract as claude_code. Requires CODING_AGENT_RUNTIME_ARN to be set.
+
+    Args:
+        task: Complete description of what to implement (repo URL, what to build,
+              acceptance criteria, constraints).
+        working_directory: Directory to operate in (default: /tmp).
+        repo_slug: Optional repo key for the persistent workspace session.
+    """
+    return _invoke_coding_runtime("codex", task, working_directory, repo_slug)
 
 
 # ─── All pipeline tools ───────────────────────────────────────────────────────
@@ -756,6 +1008,44 @@ logger.info(f"Loaded {len(LAMBDA_TOOLS)} Lambda-backed tools + GitHub MCP (built
 # --- DynamoDB client for real-time event publishing ---
 _ddb_events_client = boto3.client("dynamodb", region_name=REGION)
 _EVENTS_TABLE = os.getenv("EVENTS_TABLE", "agentcore-hub-events")
+
+# Monotonic sequence so coding-runtime live events get unique sort keys even when
+# many arrive within the same wall-clock second (the events table sort key is
+# `timestamp` and must never collide).
+_cli_event_seq = 0
+
+
+def _publish_cli_event(workflow_id: str, agent_id: str, detail: dict):
+    """Publish a live coding-CLI event to the events table (fire-and-forget).
+
+    Reuses the exact `agent.streaming` schema the UI consumes
+    (src/lib/workflow/transform-event.ts): detail.type "trace"+toolName → tool_use
+    (pulsing/flash); detail.type "text"+content → agent_output (streamed text).
+    Skips writing when there's no workflow context (chat/ad-hoc invocations)."""
+    global _cli_event_seq
+    if not workflow_id or workflow_id == "unknown":
+        return
+    try:
+        import time
+        _cli_event_seq += 1
+        event_id = f"{int(time.time() * 1000)}-cli{_cli_event_seq:06d}"
+        unique_ts = f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())}.{_cli_event_seq % 10000:04d}Z"
+        detail_map = {"agentId": {"S": agent_id}, "workflowId": {"S": workflow_id}}
+        for k, v in detail.items():
+            if v is not None:
+                detail_map[k] = {"S": str(v)}
+        _ddb_events_client.put_item(
+            TableName=_EVENTS_TABLE,
+            Item={
+                "workflowId": {"S": workflow_id},
+                "eventId": {"S": event_id},
+                "type": {"S": "agent.streaming"},
+                "detail": {"M": detail_map},
+                "timestamp": {"S": unique_ts},
+            },
+        )
+    except Exception as e:
+        logger.warning(f"[{agent_id}] Failed to publish CLI event: {e}")
 
 
 def _publish_agent_started(workflow_id: str, agent_id: str):
@@ -842,7 +1132,7 @@ async def agent_invocation(payload, context):
 
     # Load built-in tools (lazy — avoids 30s init timeout)
     builtin_tools = _load_builtin_tools()
-    all_tools = builtin_tools + LAMBDA_TOOLS + [claude_code]
+    all_tools = builtin_tools + LAMBDA_TOOLS + [claude_code, codex]
 
     # External tools via MCP (GitHub, GitLab, Jira, Asana, etc.)
     # Strands Agent manages MCPClient lifecycle internally (start/stop)

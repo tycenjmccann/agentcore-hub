@@ -62,6 +62,16 @@ The orchestration pipeline. Self-contained surface.
 **Deploy scripts**
 - `deploy/setup-tickets-lambda.mjs` and the orchestrator/Jira/output Lambdas
 
+**Coding-agent runtime** (`deploy/coding-agent-runtime/`)
+- Dedicated AgentCore Runtime hosting Claude Code + Codex on one ARM64 image,
+  with persistent `/mnt/workspace` session storage and OTel → CloudWatch tracing.
+  The fleet's `claude_code` / `codex` tools invoke it via the AgentCore commands API.
+- ECR repo: `coding-agent-runtime`. Execution role: `agentcore-hub-coding-runtime-role`.
+- Deploy: `setup-coding-runtime-role.sh` → `build-and-push.sh` → `deploy.py`.
+- Env vars: `CODING_AGENT_RUNTIME_ARN` (set on the fleet after deploy),
+  `BEDROCK_MANTLE_REGION`. When `CODING_AGENT_RUNTIME_ARN` is unset, `claude_code`
+  falls back to an in-container subprocess.
+
 **`agents.json` fields it reads**
 - `harnessName` — maps an agent to its AgentCore runtime via the `RUNTIME_ARN_<HARNESS_NAME_UPPER>` convention
 - `runtimeArn` — optional explicit ARN; when `null`, the orchestrator resolves the runtime from the env var above

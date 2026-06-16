@@ -6,6 +6,24 @@
 2. `agentcore` CLI installed
 3. Environment variables set (see below)
 
+## Deploy the coding-agent runtime first (recommended)
+
+The fleet's `claude_code` / `codex` tools delegate to a dedicated coding
+runtime. Deploy it before the fleet so `CODING_AGENT_RUNTIME_ARN` is set at
+fleet-deploy time. (Skip this to keep the legacy in-container subprocess for
+`claude_code`; `codex` then returns "runtime not configured".)
+
+```bash
+source ../config.sh
+source ../coding-agent-runtime/setup-coding-runtime-role.sh   # exports CODING_RUNTIME_ROLE_ARN
+../coding-agent-runtime/build-and-push.sh                     # prints IMAGE_URI
+export IMAGE_URI=<printed value>
+python ../coding-agent-runtime/deploy.py                      # prints CODING_AGENT_RUNTIME_ARN
+export CODING_AGENT_RUNTIME_ARN=<printed value>
+```
+
+See `deploy/coding-agent-runtime/README.md` for details.
+
 ## Quick Deploy (all 14 agents)
 
 ```bash
@@ -71,6 +89,8 @@ These are passed via `--env` in deploy-one.sh and available inside the runtime a
 | `CLAUDE_CODE_USE_BEDROCK` | `1` | Claude Code uses Bedrock |
 | `CLAUDE_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Claude Code model |
 | `ANTHROPIC_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Claude Code model (alt) |
+| `CODING_AGENT_RUNTIME_ARN` | *(from coding-agent-runtime/deploy.py)* | Dedicated coding runtime; unset → claude_code subprocess fallback |
+| `BEDROCK_MANTLE_REGION` | `us-east-2` | Codex GPT-5.5 region on Bedrock Mantle |
 | `GITHUB_PAT` | *(token)* | GitHub MCP access |
 
 ## Known Gotchas
