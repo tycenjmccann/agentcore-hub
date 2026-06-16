@@ -182,6 +182,58 @@ if (!HARNESS_ROLE_ARN) {
       }),
     }));
     console.log(`   ✓ Attached PassRole inline policy (for child agent creation)`);
+
+    // Observability — REQUIRED for the harness microVM's OTEL collector to export
+    // traces/spans. Without it, aws/spans gets no spans, so the UI shows 0 sessions
+    // and 0 tokens for this agent (CloudWatch invocations/duration still work, since
+    // the Runtime service publishes those independently). Matches the AWS sample
+    // harness execution-role policy (harness-security docs).
+    await iam.send(new PutRolePolicyCommand({
+      RoleName: ROLE_NAME,
+      PolicyName: "HarnessObservability",
+      PolicyDocument: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Sid: "XRayTracingAccess",
+            Effect: "Allow",
+            Action: [
+              "xray:PutTraceSegments",
+              "xray:PutTelemetryRecords",
+              "xray:GetSamplingRules",
+              "xray:GetSamplingTargets",
+            ],
+            Resource: "*",
+          },
+          {
+            Sid: "CloudWatchLogsGroup",
+            Effect: "Allow",
+            Action: ["logs:CreateLogGroup", "logs:DescribeLogStreams"],
+            Resource: `arn:aws:logs:${REGION}:${accountId}:log-group:/aws/bedrock-agentcore/runtimes/*`,
+          },
+          {
+            Sid: "CloudWatchLogsDescribeGroups",
+            Effect: "Allow",
+            Action: ["logs:DescribeLogGroups"],
+            Resource: `arn:aws:logs:${REGION}:${accountId}:log-group:*`,
+          },
+          {
+            Sid: "CloudWatchLogsStream",
+            Effect: "Allow",
+            Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
+            Resource: `arn:aws:logs:${REGION}:${accountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*`,
+          },
+          {
+            Sid: "CloudWatchMetricsPublish",
+            Effect: "Allow",
+            Action: "cloudwatch:PutMetricData",
+            Resource: "*",
+            Condition: { StringEquals: { "cloudwatch:namespace": "bedrock-agentcore" } },
+          },
+        ],
+      }),
+    }));
+    console.log(`   ✓ Attached Observability inline policy (X-Ray + CloudWatch Logs/Metrics)`);
   };
 
   try {
