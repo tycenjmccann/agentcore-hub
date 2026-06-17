@@ -1,9 +1,10 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical } from "lucide-react";
+import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical, Trash2 } from "lucide-react";
 import WorkflowBoard from "@/components/workflow/WorkflowBoard";
 import IntakeForm from "@/components/workflow/IntakeForm";
+import DeleteConfirmationModal from "@/components/workflow/DeleteConfirmationModal";
 import type { WorkflowState, WorkflowInput } from "@/lib/workflow/types";
 import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID } from "@/lib/workflow/workflow-defs";
 
@@ -36,6 +37,9 @@ export default function WorkflowPage() {
   const [nudgeToast, setNudgeToast] = useState<{ message: string; type: "success" | "info" | "error" } | null>(null);
   const [historyCollapsed, setHistoryCollapsed] = useState(true);
   const [testDefId, setTestDefId] = useState<string>(DEFAULT_WORKFLOW_DEF_ID);
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     const stored = localStorage.getItem('workflow-history-collapsed');
@@ -201,6 +205,63 @@ export default function WorkflowPage() {
     setTimeout(() => setNudgeToast(null), 4000);
   };
 
+  const handleDelete = async (id: string) => {
+    setDeleteTarget(id);
+    setDeleteError(null);
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleteLoading(true);
+    setDeleteError(null);
+
+    // Optimistic removal
+    const removedWorkflow = workflows.find(w => w.id === deleteTarget);
+    setWorkflows(prev => prev.filter(w => w.id !== deleteTarget));
+
+    try {
+      const res = await fetch(`/api/workflow/${deleteTarget}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || "Delete failed");
+      }
+      // Success
+      if (selectedId === deleteTarget) {
+        setSelectedId(null);
+        window.history.pushState({}, "", "/workflow");
+      }
+      setDeleteTarget(null);
+      setNudgeToast({ message: "Workflow deleted", type: "success" });
+      setTimeout(() => setNudgeToast(null), 4000);
+    } catch (err) {
+      // Rollback
+      if (removedWorkflow) {
+        setWorkflows(prev => {
+          const restored = [...prev, removedWorkflow];
+          restored.sort((a, b) => {
+            const aActive = a.phase !== "complete" && a.phase !== "error" && a.phase !== "cancelled";
+            const bActive = b.phase !== "complete" && b.phase !== "error" && b.phase !== "cancelled";
+            if (aActive && !bActive) return -1;
+            if (!aActive && bActive) return 1;
+            return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime();
+          });
+          return restored;
+        });
+      }
+      setDeleteError((err as Error).message || "Delete failed — check connection");
+      setNudgeToast({ message: "Delete failed — check connection", type: "error" });
+      setTimeout(() => setNudgeToast(null), 4000);
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+
+  const cancelDelete = () => {
+    if (deleteLoading) return;
+    setDeleteTarget(null);
+    setDeleteError(null);
+  };
+
   return (
     <div className="flex h-[calc(100vh-64px)] -m-6">
       {/* Left Sidebar — Epic History */}
@@ -280,6 +341,7 @@ export default function WorkflowPage() {
                       workflow={w}
                       isSelected={selectedId === w.id}
                       onClick={() => handleSelectWorkflow(w.id)}
+                      onDelete={handleDelete}
                     />
                   ))}
                 </div>
@@ -358,6 +420,14 @@ export default function WorkflowPage() {
           {nudgeToast.message}
         </div>
       )}
+
+      <DeleteConfirmationModal
+        isOpen={deleteTarget !== null}
+        onClose={cancelDelete}
+        onConfirm={confirmDelete}
+        isLoading={deleteLoading}
+        error={deleteError}
+      />
     </div>
   );
 }
@@ -370,12 +440,14 @@ function WorkflowListItem({
   isActive,
   onClick,
   onNudge,
+  onDelete,
 }: {
   workflow: WorkflowSummary;
   isSelected: boolean;
   isActive?: boolean;
   onClick: () => void;
   onNudge?: (id: string) => void;
+  onDelete?: (id: string) => void;
 }) {
   const isBug = workflow.workflowType === "bug";
   const isRunning = workflow.phase !== "complete" && workflow.phase !== "error" && workflow.phase !== "cancelled";
@@ -384,7 +456,7 @@ function WorkflowListItem({
   return (
     <div
       onClick={onClick}
-      className={`w-full text-left px-3 py-2.5 rounded-lg mb-1 transition-all cursor-pointer ${
+      className={`group w-full text-left px-3 py-2.5 rounded-lg mb-1 transition-all cursor-pointer ${
         isSelected
           ? "bg-blue-600/15 border border-blue-500/30"
           : "hover:bg-[var(--color-bg-tertiary)] border border-transparent"
@@ -444,6 +516,18 @@ function WorkflowListItem({
             </div>
           )}
         </div>
+
+        {/* Delete button — terminal only */}
+        {!isRunning && onDelete && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onDelete(workflow.id); }}
+            className="p-1 rounded hover:bg-red-500/20 text-[var(--color-text-muted)] hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100 flex-shrink-0 mt-0.5"
+            title="Delete workflow"
+            aria-label="Delete workflow"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        )}
       </div>
     </div>
   );
