@@ -1,3 +1,10 @@
+/**
+ * DELETE /api/workflow/[id]
+ *
+ * Deletes a workflow record and all its associated events from DynamoDB.
+ * Only workflows in terminal states (complete, error, cancelled) can be deleted.
+ */
+
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
@@ -53,22 +60,41 @@ export async function DELETE(
     }
 
     try {
-      const eventsResult = await ddb.send(
-        new QueryCommand({
-          TableName: EVENTS_TABLE,
-          KeyConditionExpression: "workflowId = :wid",
-          ExpressionAttributeValues: { ":wid": workflowId },
-        })
-      );
-      const events = eventsResult.Items || [];
-      for (let i = 0; i < events.length; i += 25) {
-        const batch = events.slice(i, i + 25);
+      const eventKeys: Array<{ workflowId: string; eventId: string }> = [];
+      let exclusiveStartKey: Record<string, unknown> | undefined = undefined;
+
+      do {
+        const queryResult = await ddb.send(
+          new QueryCommand({
+            TableName: EVENTS_TABLE,
+            KeyConditionExpression: "workflowId = :wid",
+            ExpressionAttributeValues: { ":wid": workflowId },
+            ExclusiveStartKey: exclusiveStartKey,
+            ProjectionExpression: "workflowId, eventId",
+          })
+        );
+
+        if (queryResult.Items) {
+          for (const item of queryResult.Items) {
+            eventKeys.push({
+              workflowId: item.workflowId,
+              eventId: item.eventId,
+            });
+          }
+        }
+
+        exclusiveStartKey = queryResult.LastEvaluatedKey as Record<string, unknown> | undefined;
+      } while (exclusiveStartKey);
+
+      const BATCH_SIZE = 25;
+      for (let i = 0; i < eventKeys.length; i += BATCH_SIZE) {
+        const batch = eventKeys.slice(i, i + BATCH_SIZE);
         await ddb.send(
           new BatchWriteCommand({
             RequestItems: {
-              [EVENTS_TABLE]: batch.map((e) => ({
+              [EVENTS_TABLE]: batch.map((key) => ({
                 DeleteRequest: {
-                  Key: { workflowId: e.workflowId, eventId: e.eventId },
+                  Key: key,
                 },
               })),
             },
