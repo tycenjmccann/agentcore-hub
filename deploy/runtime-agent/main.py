@@ -802,9 +802,12 @@ def codex(task: str, working_directory: str = "/tmp") -> str:
         return cfg_err
 
     # GPT-5.5 on Mantle (preview) intermittently 404s "Engine not found" when its
-    # on-demand engine is cold — retry the run on that signal.
+    # on-demand engine is cold — retry the run on that signal, with backoff to
+    # give the engine time to warm (it can take several attempts over ~30-60s).
+    import time as _time
     DEADLINE_SECS = 600
-    ATTEMPTS = int(os.getenv("CODEX_ENGINE_RETRIES", "4"))
+    ATTEMPTS = int(os.getenv("CODEX_ENGINE_RETRIES", "10"))
+    BACKOFF_SECS = int(os.getenv("CODEX_ENGINE_BACKOFF", "6"))
     last_output = ""
     for attempt in range(1, ATTEMPTS + 1):
         try:
@@ -866,8 +869,10 @@ def codex(task: str, working_directory: str = "/tmp") -> str:
             output = (answer or stdout).strip()
             last_output = output
 
-            if "Engine not found" in output and attempt < ATTEMPTS:
-                logger.warning(f"[codex] cold engine (attempt {attempt}/{ATTEMPTS}) — retrying...")
+            cold = "Engine not found" in stdout or "Engine not found" in (stderr or "")
+            if cold and attempt < ATTEMPTS:
+                logger.warning(f"[codex] cold engine (attempt {attempt}/{ATTEMPTS}) — backing off {BACKOFF_SECS}s...")
+                _time.sleep(BACKOFF_SECS)
                 continue
 
             logger.info(f"[codex] Complete. {len(output)} chars, exit code: {proc.returncode}")
