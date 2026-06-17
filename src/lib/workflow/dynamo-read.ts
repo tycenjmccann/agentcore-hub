@@ -14,7 +14,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
   marshallOptions: { removeUndefinedValues: true },
 });
 
-export async function listWorkflowsFromDynamo() {
+export async function listWorkflowsFromDynamo(options?: { includeArchived?: boolean }) {
   // Paginate to get all workflows (table is small, <200 items)
   let items: Record<string, unknown>[] = [];
   let lastKey: Record<string, unknown> | undefined;
@@ -27,8 +27,14 @@ export async function listWorkflowsFromDynamo() {
     lastKey = result.LastEvaluatedKey;
   } while (lastKey);
 
-  // Sort by startedAt descending, return latest 50
+  // Sort by startedAt descending
   items.sort((a, b) => new Date(b.startedAt as string).getTime() - new Date(a.startedAt as string).getTime());
+
+  // Filter out archived workflows unless includeArchived is true
+  if (!options?.includeArchived) {
+    items = items.filter(item => item.archived !== true);
+  }
+
   return items.slice(0, 50);
 }
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical } from "lucide-react";
+import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical, Archive } from "lucide-react";
 import WorkflowBoard from "@/components/workflow/WorkflowBoard";
 import IntakeForm from "@/components/workflow/IntakeForm";
 import type { WorkflowState, WorkflowInput } from "@/lib/workflow/types";
@@ -201,6 +201,17 @@ export default function WorkflowPage() {
     setTimeout(() => setNudgeToast(null), 4000);
   };
 
+  const handleArchive = async (id: string) => {
+    try {
+      const res = await fetch(`/api/workflow/${id}/archive`, { method: "PATCH" });
+      if (res.ok) {
+        await fetchWorkflows();
+      }
+    } catch {
+      /* silent */
+    }
+  };
+
   return (
     <div className="flex h-[calc(100vh-64px)] -m-6">
       {/* Left Sidebar — Epic History */}
@@ -263,6 +274,7 @@ export default function WorkflowPage() {
                       isActive
                       onClick={() => handleSelectWorkflow(w.id)}
                       onNudge={handleNudge}
+                      onArchive={handleArchive}
                     />
                   ))}
                 </div>
@@ -280,6 +292,7 @@ export default function WorkflowPage() {
                       workflow={w}
                       isSelected={selectedId === w.id}
                       onClick={() => handleSelectWorkflow(w.id)}
+                      onArchive={handleArchive}
                     />
                   ))}
                 </div>
@@ -370,12 +383,14 @@ function WorkflowListItem({
   isActive,
   onClick,
   onNudge,
+  onArchive,
 }: {
   workflow: WorkflowSummary;
   isSelected: boolean;
   isActive?: boolean;
   onClick: () => void;
   onNudge?: (id: string) => void;
+  onArchive?: (id: string) => void;
 }) {
   const isBug = workflow.workflowType === "bug";
   const isRunning = workflow.phase !== "complete" && workflow.phase !== "error" && workflow.phase !== "cancelled";
@@ -434,13 +449,42 @@ function WorkflowListItem({
                   <Zap className="w-3 h-3" />
                 </button>
               )}
+              {onArchive && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); onArchive(workflow.id); }}
+                  className="p-0.5 rounded hover:bg-orange-500/20 text-[var(--color-text-muted)] hover:text-orange-400 transition-colors"
+                  title="Archive workflow"
+                >
+                  <Archive className="w-3 h-3" />
+                </button>
+              )}
             </div>
           )}
           {!isRunning && workflow.phase === "cancelled" && (
-            <div className="mt-1">
+            <div className="mt-1 flex items-center gap-1.5">
               <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 font-medium uppercase tracking-wider">
                 Cancelled
               </span>
+              {onArchive && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); onArchive(workflow.id); }}
+                  className="p-0.5 rounded hover:bg-orange-500/20 text-[var(--color-text-muted)] hover:text-orange-400 transition-colors"
+                  title="Archive workflow"
+                >
+                  <Archive className="w-3 h-3" />
+                </button>
+              )}
+            </div>
+          )}
+          {!isRunning && workflow.phase !== "cancelled" && onArchive && (
+            <div className="mt-1 flex items-center gap-1.5">
+              <button
+                onClick={(e) => { e.stopPropagation(); onArchive(workflow.id); }}
+                className="p-0.5 rounded hover:bg-orange-500/20 text-[var(--color-text-muted)] hover:text-orange-400 transition-colors"
+                title="Archive workflow"
+              >
+                <Archive className="w-3 h-3" />
+              </button>
             </div>
           )}
         </div>
