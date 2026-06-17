@@ -656,6 +656,9 @@ def claude_code(task: str, working_directory: str = "/tmp") -> str:
                 **os.environ,
                 "CLAUDE_CODE_ENTRYPOINT": "agentcore-hub-pipeline",
                 "HOME": "/tmp",
+                # The robust container runs as root; Claude Code refuses
+                # --dangerously-skip-permissions as root unless IS_SANDBOX=1.
+                "IS_SANDBOX": "1",
             },
         )
 
@@ -806,8 +809,8 @@ def codex(task: str, working_directory: str = "/tmp") -> str:
     # give the engine time to warm (it can take several attempts over ~30-60s).
     import time as _time
     DEADLINE_SECS = 600
-    ATTEMPTS = int(os.getenv("CODEX_ENGINE_RETRIES", "10"))
-    BACKOFF_SECS = int(os.getenv("CODEX_ENGINE_BACKOFF", "6"))
+    ATTEMPTS = int(os.getenv("CODEX_ENGINE_RETRIES", "20"))
+    BACKOFF_SECS = int(os.getenv("CODEX_ENGINE_BACKOFF", "8"))
     last_output = ""
     for attempt in range(1, ATTEMPTS + 1):
         try:
