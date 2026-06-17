@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical } from "lucide-react";
+import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical, Trash2 } from "lucide-react";
 import WorkflowBoard from "@/components/workflow/WorkflowBoard";
 import IntakeForm from "@/components/workflow/IntakeForm";
 import type { WorkflowState, WorkflowInput } from "@/lib/workflow/types";
@@ -36,11 +36,25 @@ export default function WorkflowPage() {
   const [nudgeToast, setNudgeToast] = useState<{ message: string; type: "success" | "info" | "error" } | null>(null);
   const [historyCollapsed, setHistoryCollapsed] = useState(true);
   const [testDefId, setTestDefId] = useState<string>(DEFAULT_WORKFLOW_DEF_ID);
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteToast, setDeleteToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
 
   useEffect(() => {
     const stored = localStorage.getItem('workflow-history-collapsed');
     if (stored !== null) setHistoryCollapsed(stored === 'true');
   }, []);
+
+  useEffect(() => {
+    if (!deleteTarget) return;
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !isDeleting) {
+        setDeleteTarget(null);
+      }
+    };
+    document.addEventListener("keydown", handleEsc);
+    return () => document.removeEventListener("keydown", handleEsc);
+  }, [deleteTarget, isDeleting]);
 
   const toggleHistory = () => {
     const next = !historyCollapsed;
@@ -201,6 +215,55 @@ export default function WorkflowPage() {
     setTimeout(() => setNudgeToast(null), 4000);
   };
 
+  const handleDeleteClick = (id: string) => {
+    setDeleteTarget(id);
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!deleteTarget) return;
+    const id = deleteTarget;
+    setIsDeleting(true);
+
+    // Optimistic removal
+    const removedWorkflow = workflows.find((w) => w.id === id);
+    setWorkflows((prev) => prev.filter((w) => w.id !== id));
+    setDeleteTarget(null);
+
+    try {
+      const res = await fetch(`/api/workflow/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Delete failed");
+      // Clear selection if deleted workflow was selected
+      if (selectedId === id) {
+        setSelectedId(null);
+        window.history.pushState({}, "", "/workflow");
+      }
+      setDeleteToast({ message: "Workflow deleted", type: "success" });
+    } catch {
+      // Rollback
+      if (removedWorkflow) {
+        setWorkflows((prev) => {
+          const restored = [...prev, removedWorkflow];
+          restored.sort((a, b) => {
+            const aActive = a.phase !== "complete" && a.phase !== "error" && a.phase !== "cancelled";
+            const bActive = b.phase !== "complete" && b.phase !== "error" && b.phase !== "cancelled";
+            if (aActive && !bActive) return -1;
+            if (!aActive && bActive) return 1;
+            return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime();
+          });
+          return restored;
+        });
+      }
+      setDeleteToast({ message: "Delete failed — please try again", type: "error" });
+    } finally {
+      setIsDeleting(false);
+    }
+    setTimeout(() => setDeleteToast(null), 4000);
+  };
+
+  const handleDeleteCancel = () => {
+    if (!isDeleting) setDeleteTarget(null);
+  };
+
   return (
     <div className="flex h-[calc(100vh-64px)] -m-6">
       {/* Left Sidebar — Epic History */}
@@ -263,6 +326,7 @@ export default function WorkflowPage() {
                       isActive
                       onClick={() => handleSelectWorkflow(w.id)}
                       onNudge={handleNudge}
+                      onDelete={handleDeleteClick}
                     />
                   ))}
                 </div>
@@ -280,6 +344,7 @@ export default function WorkflowPage() {
                       workflow={w}
                       isSelected={selectedId === w.id}
                       onClick={() => handleSelectWorkflow(w.id)}
+                      onDelete={handleDeleteClick}
                     />
                   ))}
                 </div>
@@ -347,6 +412,57 @@ export default function WorkflowPage() {
         )}
       </div>
 
+      {/* Delete Confirmation Modal */}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-[200]" onClick={handleDeleteCancel}>
+          <div className="fixed inset-0 bg-black/60" />
+          <div className="fixed inset-0 grid place-items-center">
+            <div
+              role="alertdialog"
+              aria-labelledby="delete-modal-title"
+              aria-describedby="delete-modal-desc"
+              aria-busy={isDeleting}
+              aria-modal="true"
+              onClick={(e) => e.stopPropagation()}
+              className="bg-[var(--pipeline-card-bg,#1a2332)] border border-[var(--pipeline-border,#1e293b)] rounded-xl p-6 max-w-md w-full mx-4 shadow-2xl z-[201]"
+            >
+              {/* Warning icon */}
+              <div className="w-12 h-12 rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center mx-auto mb-4">
+                <Trash2 className="w-6 h-6 text-red-400" />
+              </div>
+
+              <h2 id="delete-modal-title" className="text-base font-semibold text-center text-[var(--pipeline-text,#e2e8f0)]">
+                Delete Workflow?
+              </h2>
+              <p id="delete-modal-desc" className="text-[13px] text-[var(--pipeline-text-secondary,#94a3b8)] text-center mt-2 leading-relaxed">
+                Delete this workflow run? This removes its events and cannot be undone.
+              </p>
+              <p className="text-[13px] text-[var(--pipeline-text-secondary,#94a3b8)] text-center mt-1 italic">
+                Jira tickets and epics are not affected.
+              </p>
+
+              <div className="border-t border-[var(--pipeline-border,#1e293b)] mt-6 pt-4 flex justify-end gap-3">
+                <button
+                  onClick={handleDeleteCancel}
+                  disabled={isDeleting}
+                  autoFocus
+                  className="px-4 py-2 text-sm font-medium rounded-lg border border-[var(--pipeline-border,#1e293b)] bg-transparent text-[var(--pipeline-text-secondary,#94a3b8)] hover:border-[var(--pipeline-text-muted,#64748b)] hover:text-[var(--pipeline-text,#e2e8f0)] transition-all disabled:opacity-50 disabled:pointer-events-none"
+                >
+                  Keep
+                </button>
+                <button
+                  onClick={handleDeleteConfirm}
+                  disabled={isDeleting}
+                  className="px-4 py-2 text-sm font-medium rounded-lg bg-red-500 text-white hover:bg-red-600 active:bg-red-700 transition-all disabled:opacity-80 disabled:cursor-not-allowed flex items-center gap-2"
+                >
+                  {isDeleting ? "Deleting..." : "Delete"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Nudge Toast — positioned in the sidebar near the nudge buttons */}
       {nudgeToast && (
         <div className={`absolute left-4 bottom-4 px-3 py-2 rounded-lg shadow-lg text-xs font-medium z-50 max-w-[260px] ${
@@ -356,6 +472,16 @@ export default function WorkflowPage() {
         }`}>
           {nudgeToast.type === "success" && "⚡ "}
           {nudgeToast.message}
+        </div>
+      )}
+
+      {/* Delete Toast */}
+      {deleteToast && (
+        <div className={`absolute left-4 bottom-4 px-3 py-2 rounded-lg shadow-lg text-xs font-medium z-50 max-w-[260px] ${
+          deleteToast.type === "success" ? "bg-green-600 text-white" : "bg-red-600 text-white"
+        }`} role="status" aria-live="polite">
+          {deleteToast.type === "success" && "🗑️ "}
+          {deleteToast.message}
         </div>
       )}
     </div>
@@ -370,15 +496,18 @@ function WorkflowListItem({
   isActive,
   onClick,
   onNudge,
+  onDelete,
 }: {
   workflow: WorkflowSummary;
   isSelected: boolean;
   isActive?: boolean;
   onClick: () => void;
   onNudge?: (id: string) => void;
+  onDelete?: (id: string) => void;
 }) {
   const isBug = workflow.workflowType === "bug";
   const isRunning = workflow.phase !== "complete" && workflow.phase !== "error" && workflow.phase !== "cancelled";
+  const isTerminal = ["complete", "error", "cancelled"].includes(workflow.phase);
   const timeStr = formatRelativeTime(workflow.startedAt);
 
   return (
@@ -444,6 +573,25 @@ function WorkflowListItem({
             </div>
           )}
         </div>
+
+        {/* Delete button */}
+        {onDelete && (
+          <button
+            type="button"
+            onClick={isTerminal ? (e: React.MouseEvent) => { e.stopPropagation(); onDelete(workflow.id); } : undefined}
+            disabled={!isTerminal}
+            aria-disabled={!isTerminal}
+            aria-label={`Delete workflow ${workflow.input.title}`}
+            title={!isTerminal ? "Cannot delete while workflow is running" : "Delete workflow"}
+            className={`p-1 rounded transition-colors flex-shrink-0 mt-1 ${
+              isTerminal
+                ? "text-[var(--color-text-muted)] hover:bg-red-500/20 hover:text-red-400 focus:outline-none focus-visible:ring-1 focus-visible:ring-red-400"
+                : "opacity-25 cursor-not-allowed text-[var(--color-text-muted)]"
+            }`}
+          >
+            <Trash2 className="w-3 h-3" />
+          </button>
+        )}
       </div>
     </div>
   );
