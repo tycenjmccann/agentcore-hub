@@ -2,6 +2,8 @@ strands-agents>=0.3.0
 bedrock-agentcore>=0.2.0
 strands-agents-tools>=0.2.0
 boto3>=1.35.0
+# Codex routes through Bedrock Mantle using a short-term bearer token.
+aws-bedrock-token-generator>=1.0.0
 mcp>=1.0.0
 playwright>=1.40.0
 nest-asyncio>=1.5.0

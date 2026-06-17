@@ -54,7 +54,7 @@ if not os.path.exists(_node_marker):
             ln -sf /tmp/node-v20.18.0-linux-arm64/bin/npm /tmp/npm && \
             ln -sf /tmp/node-v20.18.0-linux-arm64/bin/npx /tmp/npx && \
             export PATH="/tmp/node-v20.18.0-linux-arm64/bin:$PATH" && \
-            npm install -g @anthropic-ai/claude-code 2>/dev/null && \
+            npm install -g @anthropic-ai/claude-code @openai/codex 2>/dev/null && \
             touch /tmp/.node_installed
             """],
             capture_output=True, text=True, timeout=180,
@@ -726,6 +726,161 @@ def claude_code(task: str, working_directory: str = "/tmp") -> str:
         return f"ERROR invoking Claude Code: {str(e)}"
 
 
+# ─── Codex CLI Tool ──────────────────────────────────────────────────────────
+# OpenAI Codex as an alternative coding agent, running GPT-5.5 via Amazon Bedrock
+# "Mantle" (OpenAI-compatible endpoint) — no OpenAI key. Auth is a short-term
+# Bedrock bearer token minted from the runtime IAM role. Mirrors claude_code's
+# subprocess + watchdog pattern so it's a drop-in peer.
+
+# Bedrock Mantle config — GPT-5.5 is served on the /openai/v1 path in us-east-2
+# and requires the OpenAI-Project header (its absence yields "Engine not found").
+_MANTLE_REGION = os.getenv("BEDROCK_MANTLE_REGION", "us-east-2")
+_CODEX_MODEL = os.getenv("CODEX_MODEL", "openai.gpt-5.5")
+_MANTLE_PROJECT = os.getenv("BEDROCK_MANTLE_PROJECT", "default")
+
+
+def _ensure_codex_config() -> str | None:
+    """Write ~/.codex/config.toml pointing at Bedrock Mantle and mint a bearer
+    token into OPENAI_API_KEY. Returns an error string on failure, else None."""
+    codex_home = os.path.join(os.environ.get("HOME", "/tmp"), ".codex")
+    os.makedirs(codex_home, exist_ok=True)
+    base_url = f"https://bedrock-mantle.{_MANTLE_REGION}.api.aws/openai/v1"
+    with open(os.path.join(codex_home, "config.toml"), "w") as f:
+        f.write(
+            f'model = "{_CODEX_MODEL}"\n'
+            'model_provider = "bedrock-mantle"\n\n'
+            "[model_providers.bedrock-mantle]\n"
+            'name = "Amazon Bedrock Mantle (OpenAI-compatible)"\n'
+            f'base_url = "{base_url}"\n'
+            'env_key = "OPENAI_API_KEY"\n'
+            'wire_api = "responses"\n\n'
+            "[model_providers.bedrock-mantle.http_headers]\n"
+            f'OpenAI-Project = "{_MANTLE_PROJECT}"\n'
+        )
+    if not os.environ.get("OPENAI_API_KEY"):
+        try:
+            from aws_bedrock_token_generator import provide_token
+            os.environ["OPENAI_API_KEY"] = provide_token(region=_MANTLE_REGION)
+        except Exception as e:
+            return f"ERROR: could not mint Bedrock token for Codex: {e}"
+    return None
+
+
+@tool
+def codex(task: str, working_directory: str = "/tmp") -> str:
+    """Delegate a coding task to OpenAI Codex (GPT-5.5 via Amazon Bedrock).
+
+    A peer to claude_code — same contract, different engine. Useful for a second
+    opinion, code review, or when you want GPT-5.5 to implement/verify. No OpenAI
+    key required; inference routes through Amazon Bedrock using the runtime role.
+
+    Args:
+        task: Complete description of what to do (repo URL/branch, what to build
+              or review, acceptance criteria, constraints).
+        working_directory: Directory to operate in (default: /tmp)
+    """
+    import subprocess
+    import shutil
+
+    logger.info(f"[codex] Delegating task: {task[:150]}...")
+
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        logger.info("[codex] Installing Codex CLI...")
+        try:
+            subprocess.run(
+                ["npm", "install", "-g", "@openai/codex"],
+                capture_output=True, text=True, timeout=180,
+                env={**os.environ, "HOME": "/tmp"},
+            )
+            codex_bin = shutil.which("codex") or "/tmp/.npm-global/bin/codex"
+        except Exception as e:
+            return f"ERROR: Failed to install Codex CLI: {e}. Use claude_code or shell tools instead."
+
+    cfg_err = _ensure_codex_config()
+    if cfg_err:
+        return cfg_err
+
+    # GPT-5.5 on Mantle (preview) intermittently 404s "Engine not found" when its
+    # on-demand engine is cold — retry the run on that signal.
+    DEADLINE_SECS = 600
+    ATTEMPTS = int(os.getenv("CODEX_ENGINE_RETRIES", "4"))
+    last_output = ""
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            proc = subprocess.Popen(
+                [codex_bin, "exec", "--json", "--model", _CODEX_MODEL,
+                 "--yolo", "--skip-git-repo-check", task],
+                cwd=working_directory,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
+                env={**os.environ, "HOME": os.environ.get("HOME", "/tmp")},
+            )
+            watchdog_done = threading.Event()
+            watchdog_fired = {"value": False}
+
+            def _watchdog():
+                if not watchdog_done.wait(timeout=DEADLINE_SECS):
+                    watchdog_fired["value"] = True
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+
+            wd = threading.Thread(target=_watchdog, daemon=True)
+            wd.start()
+            try:
+                stdout, stderr = proc.communicate(timeout=DEADLINE_SECS + 30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    proc.kill()
+                stdout, stderr = proc.communicate(timeout=5)
+            finally:
+                watchdog_done.set()
+
+            if watchdog_fired["value"]:
+                return (f"ERROR: Codex timed out after {DEADLINE_SECS}s. Break the task "
+                        "into smaller, focused codex calls.")
+
+            # codex exec --json emits JSONL; the final answer is the last
+            # agent_message item. Fall back to raw stdout if nothing parses.
+            answer = ""
+            for line in stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                item = obj.get("item") if isinstance(obj, dict) else None
+                if isinstance(item, dict) and item.get("type") in ("agent_message", "assistant_message", "message"):
+                    txt = item.get("text") or item.get("message")
+                    if isinstance(txt, str) and txt:
+                        answer = txt
+            output = (answer or stdout).strip()
+            last_output = output
+
+            if "Engine not found" in output and attempt < ATTEMPTS:
+                logger.warning(f"[codex] cold engine (attempt {attempt}/{ATTEMPTS}) — retrying...")
+                continue
+
+            logger.info(f"[codex] Complete. {len(output)} chars, exit code: {proc.returncode}")
+            if proc.returncode != 0 and stderr:
+                output += f"\n\nSTDERR: {stderr[-500:]}"
+            return output if output else f"Codex exited with code {proc.returncode}. Stderr: {stderr[-300:]}"
+        except FileNotFoundError:
+            return "ERROR: 'codex' CLI not found. Use claude_code or shell tools instead."
+        except Exception as e:
+            return f"ERROR invoking Codex: {str(e)}"
+    return last_output or "ERROR: Codex engine stayed cold after retries (Bedrock Mantle preview)."
+
+
 # ─── All pipeline tools ───────────────────────────────────────────────────────
 
 LAMBDA_TOOLS = [
@@ -842,7 +997,7 @@ async def agent_invocation(payload, context):
 
     # Load built-in tools (lazy — avoids 30s init timeout)
     builtin_tools = _load_builtin_tools()
-    all_tools = builtin_tools + LAMBDA_TOOLS + [claude_code]
+    all_tools = builtin_tools + LAMBDA_TOOLS + [claude_code, codex]
 
     # External tools via MCP (GitHub, GitLab, Jira, Asana, etc.)
     # Strands Agent manages MCPClient lifecycle internally (start/stop)

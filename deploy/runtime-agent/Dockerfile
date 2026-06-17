@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y gcc g++ git curl && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
-RUN npm install -g @anthropic-ai/claude-code && \
+RUN npm install -g @anthropic-ai/claude-code @openai/codex && \
     npx playwright install --with-deps chromium
 
 # Bake curated Claude Code skills/plugins into the image so each fleet agent
