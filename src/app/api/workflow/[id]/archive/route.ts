@@ -42,7 +42,19 @@ export async function PATCH(
       return NextResponse.json({ error: "Workflow not found" }, { status: 404 });
     }
 
-    // 2. Set archived = true, archivedAt = ISO timestamp (idempotent)
+    // 2. Refuse to archive a still-running workflow — archiving hides it while
+    //    its agents keep working. Only terminal states may be archived.
+    const phase = wfResult.Item.phase as string | undefined;
+    const TERMINAL = ["complete", "error", "cancelled"];
+    const alreadyArchived = wfResult.Item.archived === true;
+    if (phase && !TERMINAL.includes(phase) && !alreadyArchived) {
+      return NextResponse.json(
+        { error: `Cannot archive a running workflow (phase: ${phase}). Cancel it first.` },
+        { status: 409 }
+      );
+    }
+
+    // 3. Set archived = true, archivedAt = ISO timestamp (idempotent)
     const archivedAt = new Date().toISOString();
     await ddb.send(
       new UpdateCommand({

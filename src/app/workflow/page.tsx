@@ -449,15 +449,8 @@ function WorkflowListItem({
                   <Zap className="w-3 h-3" />
                 </button>
               )}
-              {onArchive && (
-                <button
-                  onClick={(e) => { e.stopPropagation(); onArchive(workflow.id); }}
-                  className="p-0.5 rounded hover:bg-orange-500/20 text-[var(--color-text-muted)] hover:text-orange-400 transition-colors"
-                  title="Archive workflow"
-                >
-                  <Archive className="w-3 h-3" />
-                </button>
-              )}
+              {/* No archive while running — archiving hides a workflow mid-flight
+                  while its agents keep working. Cancel it first, then archive. */}
             </div>
           )}
           {!isRunning && workflow.phase === "cancelled" && (
