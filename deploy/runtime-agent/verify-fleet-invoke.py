@@ -98,6 +98,9 @@ Return your FULL response as a single JSON array. Nothing else.
 11. claude_code: Invoke with task='Create a file /tmp/cc-test.txt containing exactly "claude_code_write_ok", then read it back and print the contents, then delete it.' and working_directory='/tmp'
     VALIDATE: Response must contain "claude_code_write_ok". This proves Claude Code can authenticate with Bedrock AND execute file operations (Write, Read, Bash). If it fails with permission/auth errors, report status='fail' with the error.
 
+11b. codex: Invoke with task='Reply with exactly: codex_invoke_ok' and working_directory='/tmp'
+    VALIDATE: Response must contain "codex_invoke_ok". This proves Codex authenticates with Bedrock Mantle (GPT-5.5) and survives cold-engine warm-up. If it reports "Engine not found" report status='fail' (Mantle engine not warming — increase CODEX_ENGINE_RETRIES).
+
 ## TEST GROUP 5: S3 Round-Trip (simulates artifact storage)
 
 12. S3Storage___write_object: Write key='healthcheck/results/{TIMESTAMP}.json', content='{"test":"integration","status":"running","timestamp":{TIMESTAMP}}'
@@ -213,8 +216,9 @@ ALL_EXPECTED_TOOLS = [
     "shell", "file_read", "file_write", "editor", "python_repl",
     "calculator", "http_request", "image_reader", "current_time",
     "environment", "retrieve", "code_interpreter", "browser",
-    # Claude Code (1)
+    # Coding CLIs (2)
     "claude_code",
+    "codex",
     # Lambda-backed (15)
     "download_s3_file",
     "s3storage___read_object", "s3storage___write_object", "s3storage___list_objects",
@@ -517,7 +521,7 @@ def print_results(results):
         "Built-in": ["shell", "file_read", "file_write", "editor", "python_repl",
                      "calculator", "http_request", "image_reader", "current_time",
                      "environment", "retrieve", "code_interpreter", "browser"],
-        "SDK": ["claude_code"],
+        "SDK": ["claude_code", "codex"],
         "Lambda": ["download_s3_file", "s3storage___read_object", "s3storage___write_object",
                    "s3storage___list_objects", "tickets___search_issues",
                    "tickets___list_tickets", "tickets___add_comment",
