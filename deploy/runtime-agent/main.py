@@ -808,6 +808,7 @@ def codex(task: str, working_directory: str = "/tmp") -> str:
     # on-demand engine is cold — retry the run on that signal, with backoff to
     # give the engine time to warm (it can take several attempts over ~30-60s).
     import time as _time
+    import re as _re_codex
     DEADLINE_SECS = 600
     ATTEMPTS = int(os.getenv("CODEX_ENGINE_RETRIES", "20"))
     BACKOFF_SECS = int(os.getenv("CODEX_ENGINE_BACKOFF", "8"))
@@ -872,10 +873,22 @@ def codex(task: str, working_directory: str = "/tmp") -> str:
             output = (answer or stdout).strip()
             last_output = output
 
-            cold = "Engine not found" in stdout or "Engine not found" in (stderr or "")
-            if cold and attempt < ATTEMPTS:
-                logger.warning(f"[codex] cold engine (attempt {attempt}/{ATTEMPTS}) — backing off {BACKOFF_SECS}s...")
-                _time.sleep(BACKOFF_SECS)
+            # GPT-5.5 on Mantle (preview) returns two transient, retryable signals
+            # that Codex surfaces as turn errors without retrying itself:
+            #   - "Engine not found" — on-demand engine is cold (warming up)
+            #   - "rate limit exceeded. Retry after Ns." — throttled; honor the hint
+            blob = stdout + "\n" + (stderr or "")
+            cold = "Engine not found" in blob
+            rl = _re_codex.search(r"[Rr]ate limit exceeded\.?\s*Retry after\s*(\d+)", blob)
+            if (cold or rl) and attempt < ATTEMPTS:
+                if rl:
+                    # Respect the server's backoff hint (+1s slack), capped.
+                    wait = min(int(rl.group(1)) + 1, 60)
+                    logger.warning(f"[codex] rate limited (attempt {attempt}/{ATTEMPTS}) — waiting {wait}s...")
+                else:
+                    wait = BACKOFF_SECS
+                    logger.warning(f"[codex] cold engine (attempt {attempt}/{ATTEMPTS}) — backing off {wait}s...")
+                _time.sleep(wait)
                 continue
 
             logger.info(f"[codex] Complete. {len(output)} chars, exit code: {proc.returncode}")
@@ -886,7 +899,7 @@ def codex(task: str, working_directory: str = "/tmp") -> str:
             return "ERROR: 'codex' CLI not found. Use claude_code or shell tools instead."
         except Exception as e:
             return f"ERROR invoking Codex: {str(e)}"
-    return last_output or "ERROR: Codex engine stayed cold after retries (Bedrock Mantle preview)."
+    return last_output or "ERROR: Codex unavailable after retries (Bedrock Mantle preview — cold engine or rate limit)."
 
 
 # ─── All pipeline tools ───────────────────────────────────────────────────────
