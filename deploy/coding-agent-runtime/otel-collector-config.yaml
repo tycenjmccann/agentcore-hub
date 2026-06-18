@@ -1,0 +1,102 @@
+# OTel collector sidecar config for the coding-agent runtime.
+#
+# Listens on 127.0.0.1:4318 (OTLP/HTTP) and 127.0.0.1:4317 (OTLP/gRPC) for
+# unauthenticated telemetry from the coding CLIs (Claude Code / Codex are
+# Node.js) running in the same container, then SigV4-signs and forwards to
+# AgentCore Observability:
+#
+#   traces -> https://xray.<region>.amazonaws.com/v1/traces  (sigv4 service "xray")
+#   logs   -> https://logs.<region>.amazonaws.com/v1/logs    (sigv4 service "logs")
+#
+# AgentCore injects OTEL_EXPORTER_OTLP_LOGS_HEADERS at container boot; main.py
+# parses x-aws-log-group / x-aws-log-stream out of it and re-exports them as
+# AWS_OTEL_LOG_GROUP / AWS_OTEL_LOG_STREAM for ${env:...} below.
+#
+# Copied verbatim from aws-samples/sample-agent-assisted-sdlc — the
+# resource/agentcore + transform/normalize processors make CLI traces appear in
+# the AgentCore Observability dashboard alongside the fleet agents' traces.
+
+extensions:
+  sigv4auth/xray:
+    region: ${env:AWS_REGION}
+    service: xray
+  sigv4auth/logs:
+    region: ${env:AWS_REGION}
+    service: logs
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+      grpc:
+        endpoint: 127.0.0.1:4317
+
+processors:
+  # Stamp the AgentCore-recognizable resource attributes the dashboard filters
+  # on. The CLIs' Node.js OTel SDK doesn't auto-detect it's inside an AgentCore
+  # Runtime (the way the Python aws_distro does), so without this the dashboard
+  # filter `resource.attributes.aws.service.type = "gen_ai_agent"` drops them.
+  resource/agentcore:
+    attributes:
+      - key: aws.service.type
+        value: gen_ai_agent
+        action: upsert
+      - key: aws.local.service
+        from_attribute: service.name
+        action: upsert
+  # Normalize each CLI's custom attribute names to OTel GenAI semconv and copy
+  # the resource-level session.id down so the dashboard groups by runtime
+  # session rather than the CLI's per-invocation UUID.
+  transform/normalize:
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["session.id"], resource.attributes["session.id"]) where resource.attributes["session.id"] != nil
+          - set(attributes["gen_ai.conversation.id"], resource.attributes["gen_ai.conversation.id"]) where resource.attributes["gen_ai.conversation.id"] != nil
+          - set(attributes["gen_ai.usage.input_tokens"], attributes["input_tokens"]) where attributes["input_tokens"] != nil
+          - set(attributes["gen_ai.usage.output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil
+          - set(attributes["gen_ai.request.model"], attributes["model"]) where attributes["model"] != nil
+          - set(attributes["gen_ai.usage.cost"], attributes["cost_usd"]) where attributes["cost_usd"] != nil
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["session.id"], resource.attributes["session.id"]) where resource.attributes["session.id"] != nil
+          - set(attributes["gen_ai.conversation.id"], resource.attributes["gen_ai.conversation.id"]) where resource.attributes["gen_ai.conversation.id"] != nil
+          - set(attributes["gen_ai.usage.input_tokens"], attributes["input_tokens"]) where attributes["input_tokens"] != nil
+          - set(attributes["gen_ai.usage.output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil
+          - set(attributes["gen_ai.request.model"], attributes["model"]) where attributes["model"] != nil
+          - set(attributes["gen_ai.usage.cost"], attributes["cost_usd"]) where attributes["cost_usd"] != nil
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  otlphttp/xray:
+    endpoint: https://xray.${env:AWS_REGION}.amazonaws.com
+    auth:
+      authenticator: sigv4auth/xray
+    compression: gzip
+  otlphttp/logs:
+    endpoint: https://logs.${env:AWS_REGION}.amazonaws.com
+    auth:
+      authenticator: sigv4auth/logs
+    compression: gzip
+    headers:
+      x-aws-log-group: ${env:AWS_OTEL_LOG_GROUP}
+      x-aws-log-stream: ${env:AWS_OTEL_LOG_STREAM}
+
+service:
+  extensions: [sigv4auth/xray, sigv4auth/logs]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resource/agentcore, transform/normalize, batch]
+      exporters: [otlphttp/xray]
+    logs:
+      receivers: [otlp]
+      processors: [resource/agentcore, transform/normalize, batch]
+      exporters: [otlphttp/logs]
+  telemetry:
+    logs:
+      level: warn
