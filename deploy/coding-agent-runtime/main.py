@@ -139,6 +139,17 @@ def _slugify_repo(repo: str) -> str:
 
 
 def _configure_git() -> None:
+    # Session storage mounts under a uid that may differ from the runtime user,
+    # so Git refuses to operate ("dubious ownership"). Trust the workspace tree.
+    subprocess.run(
+        ["git", "config", "--global", "--replace-all",
+         "safe.directory", WORKSPACE_ROOT],
+        check=False,
+    )
+    subprocess.run(
+        ["git", "config", "--global", "--add", "safe.directory", "*"],
+        check=False,
+    )
     pat = os.environ.get("GITHUB_PAT")
     if not pat:
         return
