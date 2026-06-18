@@ -417,9 +417,9 @@ async function flushBuffer(agentId, buffer, batchSize) {
 }
 
 /**
- * Invoke the Fleet Improver runtime with the batch, parse its markdown PRD into
- * { title, description }, and write the result to the prd/ prefix. prd-submitter
- * (S3 → EventBridge) picks it up and enters the 14-agent pipeline.
+ * Invoke the Fleet Improver runtime with the batch, read its JSON PRD
+ * ({ title, description }), and write the result to the prd/ prefix.
+ * prd-submitter (S3 → EventBridge) picks it up and enters the 14-agent pipeline.
  */
 async function synthesizeAndWritePrd(agentId, batchPayload, timestamp) {
   if (!IMPROVER_ARN) {
@@ -436,13 +436,13 @@ async function synthesizeAndWritePrd(agentId, batchPayload, timestamp) {
     JSON.stringify(batchPayload);
 
   console.log(`[eval-packager] ${agentId}: invoking improver ${IMPROVER_ARN.split('/').pop()}`);
-  const markdown = await invokeImprover(IMPROVER_ARN, prompt, agentId);
+  const raw = await invokeImprover(IMPROVER_ARN, prompt, agentId);
 
-  if (!markdown || markdown.trim().length === 0) {
+  if (!raw || raw.trim().length === 0) {
     throw new Error('improver returned empty output');
   }
 
-  const { title, description } = parsePrd(markdown, agentId);
+  const { title, description } = extractPrd(raw, agentId);
   const prd = {
     title,
     description,
@@ -474,41 +474,40 @@ async function synthesizeAndWritePrd(agentId, batchPayload, timestamp) {
 }
 
 /**
- * Parse the improver's markdown PRD into a PR-ready { title, description }.
- * Title precedence: explicit "TITLE: ..." line (the prompt contract) → first
- * "Improvement N:" action item → document H1 → generic fallback.
- * The TITLE line is stripped from the body; the rest of the markdown is the PRD.
+ * Read the improver's JSON PRD into a PR-ready { title, description }.
+ * The improver is instructed to return a single JSON object {title, description}.
+ * We tolerate a leading/trailing code fence or stray prose by extracting the
+ * outermost {...} before parsing. Title/description fall back to safe defaults
+ * so a malformed response degrades gracefully instead of wedging the flush.
  */
-function parsePrd(markdown, agentId) {
-  let title = '';
-  let body = markdown;
-
-  // 1. Preferred: the explicit "TITLE: ..." contract line.
-  const titleLine = markdown.match(/^\s*TITLE:\s*(.+)$/im);
-  if (titleLine) {
-    title = titleLine[1].trim();
-    body = markdown.replace(titleLine[0], '').replace(/^\s+/, '');
-  } else {
-    // 2. First recommended improvement title — the actionable change.
-    const improvement =
-      markdown.match(/^#{2,4}\s*(?:Improvement\s*\d+\s*[:\-]\s*)(.+)$/im) ||
-      markdown.match(/\*\*Title\*\*\s*:?\s*(.+)/i);
-    if (improvement) {
-      title = improvement[1].trim();
-    } else {
-      // 3. Document H1.
-      const h1 = markdown.match(/^#\s+(.+)$/m);
-      if (h1) title = h1[1].trim();
+function extractPrd(raw, agentId) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // Strip a ```json fence or surrounding prose, then take the outermost object.
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+      try {
+        parsed = JSON.parse(raw.slice(start, end + 1));
+      } catch {
+        /* fall through to defaults */
+      }
     }
   }
 
-  // 4. Generic fallback.
+  let title = (parsed?.title || '').toString().trim();
+  let description = (parsed?.description || '').toString().trim();
+
+  // Graceful degradation: never drop the batch just because the model drifted
+  // from the JSON contract. Use the raw text as the body, derive a generic title.
+  if (!description) description = raw.trim();
   if (!title) title = `Improve ${agentId} based on evaluation findings`;
 
-  // Strip markdown decorations the workflow title doesn't need.
   title = title.replace(/`/g, '').replace(/\*\*/g, '').slice(0, 120).trim();
 
-  return { title, description: body };
+  return { title, description };
 }
 
 /**

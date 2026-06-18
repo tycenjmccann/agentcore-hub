@@ -531,7 +531,7 @@ The platform includes an optional **self-improvement loop** that automatically e
 ```
 Agent runs → OTEL traces → XRay → Online Evaluation (10 evaluators)
     → eval-packager Lambda buffers sessions; on flush it
-    → invokes the Fleet Improver runtime → root-cause analysis → markdown PRD
+    → invokes the Fleet Improver runtime → root-cause analysis → JSON PRD {title, description}
     → writes PRD to s3 prd/ → prd-submitter → [SI] Workflow Run → PR
 ```
 

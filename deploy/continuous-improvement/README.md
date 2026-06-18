@@ -39,8 +39,8 @@ CloudWatch Logs → eval-packager Lambda → DynamoDB buffer
 
 5. **Fleet Improver synthesis** (in `flushBuffer`, env `IMPROVEMENT_AGENT_ARN`):
    - eval-packager SigV4-invokes the Fleet Improver runtime with the batch
-   - The runtime returns a markdown PRD (first line is a `TITLE:` contract line)
-   - `parsePrd` splits it into `{ title, description }`
+   - The runtime returns a JSON object `{ title, description }` (description is the markdown PRD)
+   - `extractPrd` JSON-parses it (tolerates a stray code fence / prose; falls back to a generic title + raw body)
    - The PRD is written to `fleet-imp-agent/prd/prd-<agentId>-<timestamp>.json`
    - That `prd/` write is what triggers prd-submitter → workflow → PR
    - If the improver ARN is unset or the call fails, the batch is still archived
@@ -93,8 +93,8 @@ Each session in the S3 batch `sessions[]` array contains **parsed evaluator resu
 ```
 
 This structure (archived under `batches/`) is what eval-packager sends to the
-Fleet Improver runtime. The improver returns a markdown PRD, which `parsePrd`
-turns into the object written to `prd/`:
+Fleet Improver runtime. The improver returns a JSON `{ title, description }`,
+which `extractPrd` reads into the object written to `prd/`:
 
 ```json
 {

@@ -46,17 +46,22 @@ Analyze ALL sessions in the batch holistically. Whether you receive 1 session or
 ## Output Format — Improvement PRD
 
 Your output is consumed by an automated pipeline that turns it into a pull
-request. **The very first line MUST be a single-sentence PR title** in this exact form:
+request. **Output a single JSON object and nothing else** — no prose before or
+after, no markdown code fences. The object has exactly two fields:
 
+```json
+{
+  "title": "fix(<agentId>): <concise imperative summary of the top fix>",
+  "description": "<the full improvement PRD as markdown — the sections below>"
+}
 ```
-TITLE: fix(<agentId>): <concise imperative summary of the top fix>
-```
 
-Example: `TITLE: fix(agentcore_hub_backend_dev): stop loading code-simplifier skill for text-only edits`
+- `title` — under 100 characters, no markdown, no trailing period. Becomes the
+  workflow/PR title. Example: `fix(agentcore_hub_backend_dev): stop loading code-simplifier skill for text-only edits`
+- `description` — the complete PRD body in markdown (the sections defined below).
+  Becomes the PRD/ticket body. Newlines must be escaped as `\n` per JSON string rules.
 
-Keep the title under 100 characters, no markdown, no trailing period. After the
-TITLE line, leave a blank line, then produce the structured PRD below. The TITLE
-becomes the workflow/PR title; everything after it becomes the PRD body.
+The description markdown should contain these sections:
 
 ### Summary
 - Agent ID and batch metadata
@@ -97,4 +102,4 @@ For each recommendation:
 - When batch contains a single session (N=1), treat it as a single data point — note limited confidence but still extract actionable insights
 - When batch is large (N>20), focus on statistical patterns rather than individual anomalies
 - Always distinguish between agent-level issues (fixable by us) and external issues (API failures, user errors)
-- Output valid markdown suitable for automated processing
+- Output a single valid JSON object with `title` and `description` — nothing else, no code fences
