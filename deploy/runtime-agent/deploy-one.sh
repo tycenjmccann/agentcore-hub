@@ -127,6 +127,8 @@ run_deploy() {
     --env "CLAUDE_CODE_USE_BEDROCK=1" \
     --env "CLAUDE_MODEL=us.anthropic.claude-opus-4-6-v1" \
     --env "ANTHROPIC_MODEL=us.anthropic.claude-opus-4-6-v1" \
+    --env "BEDROCK_MANTLE_REGION=${BEDROCK_MANTLE_REGION:-us-east-2}" \
+    --env "CODEX_MODEL=${CODEX_MODEL:-openai.gpt-5.5}" \
     --env "PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers" \
     --env "HOME=/tmp" \
     --env "TMPDIR=/tmp" \

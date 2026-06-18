@@ -105,22 +105,34 @@ aws iam put-role-policy \
 echo "   ✓ Attached Observability (Logs + X-Ray + Metrics)"
 
 # ─── Bedrock Model Invocation ─────────────────────────────────────────────────
+# Claude Code uses bedrock:InvokeModel. The codex tool routes GPT-5.5 through
+# Bedrock Mantle (OpenAI-compatible) with a short-term bearer token, which needs
+# bedrock-mantle:* and bedrock:CallWithBearerToken (Resource:* — the bearer-token
+# actions don't support resource-level scoping).
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "BedrockModelInvoke" \
   --policy-document "{
     \"Version\": \"2012-10-17\",
-    \"Statement\": [{
-      \"Sid\": \"InvokeModels\",
-      \"Effect\": \"Allow\",
-      \"Action\": [\"bedrock:InvokeModel\", \"bedrock:InvokeModelWithResponseStream\"],
-      \"Resource\": [
-        \"arn:aws:bedrock:*::foundation-model/*\",
-        \"arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:*\"
-      ]
-    }]
+    \"Statement\": [
+      {
+        \"Sid\": \"InvokeModels\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"bedrock:InvokeModel\", \"bedrock:InvokeModelWithResponseStream\"],
+        \"Resource\": [
+          \"arn:aws:bedrock:*::foundation-model/*\",
+          \"arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:*\"
+        ]
+      },
+      {
+        \"Sid\": \"BedrockMantleForCodex\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"bedrock-mantle:*\", \"bedrock:CallWithBearerToken\"],
+        \"Resource\": \"*\"
+      }
+    ]
   }"
-echo "   ✓ Attached Bedrock model invoke"
+echo "   ✓ Attached Bedrock model invoke (+ Mantle for Codex)"
 
 # ─── ECR Pull (container deploy) ─────────────────────────────────────────────
 aws iam put-role-policy \

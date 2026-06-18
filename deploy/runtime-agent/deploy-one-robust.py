@@ -58,6 +58,9 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         "CLAUDE_CODE_USE_BEDROCK": "1",
         "CLAUDE_MODEL": "us.anthropic.claude-opus-4-6-v1",
         "ANTHROPIC_MODEL": "us.anthropic.claude-opus-4-6-v1",
+        # Codex via Bedrock Mantle (GPT-5.5, us-east-2) — no OpenAI key.
+        "BEDROCK_MANTLE_REGION": os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2"),
+        "CODEX_MODEL": os.environ.get("CODEX_MODEL", "openai.gpt-5.5"),
         # In the baked image Playwright Chromium lives under /root/.cache/ms-playwright.
         # Override only if the caller explicitly sets it.
         "HOME": "/root",
