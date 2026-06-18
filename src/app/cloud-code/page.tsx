@@ -1,7 +1,11 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio } from "lucide-react";
+import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare } from "lucide-react";
+import dynamic from "next/dynamic";
+
+// xterm touches the DOM/window — load only in the browser.
+const ShellTerminal = dynamic(() => import("@/components/cloud-code/ShellTerminal"), { ssr: false });
 import type {
   CloudCodeSession,
   CloudCodeSessionSummary,
@@ -28,6 +32,7 @@ export default function CloudCodePage() {
   const [sending, setSending] = useState(false);
   const [showNew, setShowNew] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [view, setView] = useState<"chat" | "terminal">("chat");
   const streamEnd = useRef<HTMLDivElement>(null);
 
   const fetchSessions = useCallback(async () => {
@@ -43,6 +48,7 @@ export default function CloudCodePage() {
 
   // Load full session when selected
   useEffect(() => {
+    setView("chat");
     if (!selectedId) {
       setActive(null);
       return;
@@ -216,8 +222,37 @@ export default function CloudCodePage() {
                   )}
                 </div>
               </div>
+              {/* Chat ⇄ Terminal toggle */}
+              <div className="flex items-center rounded-lg border border-[var(--color-border)] overflow-hidden flex-shrink-0">
+                <button
+                  onClick={() => setView("chat")}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
+                    view === "chat"
+                      ? "bg-brand-600/15 text-brand-300"
+                      : "text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)]"
+                  }`}
+                >
+                  <MessageSquare className="w-3.5 h-3.5" /> Chat
+                </button>
+                <button
+                  onClick={() => setView("terminal")}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
+                    view === "terminal"
+                      ? "bg-brand-600/15 text-brand-300"
+                      : "text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)]"
+                  }`}
+                  title="Live terminal into the session microVM"
+                >
+                  <TerminalSquare className="w-3.5 h-3.5" /> Terminal
+                </button>
+              </div>
             </div>
 
+            {view === "terminal" ? (
+              <div className="flex-1 min-h-0">
+                <ShellTerminal sessionId={active.sessionId} />
+              </div>
+            ) : (
             <div className="flex-1 overflow-y-auto px-5 py-5 flex flex-col gap-3.5">
               {active.turns.length === 0 && (
                 <p className="text-xs text-[var(--color-text-muted)] text-center mt-4">
@@ -247,7 +282,9 @@ export default function CloudCodePage() {
               )}
               <div ref={streamEnd} />
             </div>
+            )}
 
+            {view === "chat" && (
             <div className="px-5 py-3.5 border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
               <div className="flex items-end gap-2 bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] rounded-xl px-3.5 py-2">
                 <textarea
@@ -274,6 +311,7 @@ export default function CloudCodePage() {
                 </button>
               </div>
             </div>
+            )}
           </>
         )}
       </main>
@@ -339,8 +377,12 @@ function NewSessionModal({
           value={repo}
           onChange={(e) => setRepo(e.target.value)}
           placeholder="owner/name"
-          className="w-full px-3 py-2 rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] text-sm outline-none focus:border-brand-500/50 mb-5 font-mono"
+          className="w-full px-3 py-2 rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] text-sm outline-none focus:border-brand-500/50 mb-1.5 font-mono"
         />
+        <p className="text-[11px] text-[var(--color-text-muted)] mb-5 leading-relaxed">
+          Needs the full <span className="font-mono">owner/name</span>. Leave empty and ask
+          “list my repos” — the agent has <span className="font-mono">gh</span> access.
+        </p>
 
         <div className="flex justify-end gap-2">
           <button

@@ -15,6 +15,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl ca-certificates bash nodejs npm openssh-client jq unzip \
     && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI — lets the agent enumerate/inspect repos it has access to
+# (authenticated via GH_TOKEN, which the server exports from GITHUB_PAT).
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
 # OpenTelemetry Collector Contrib — sidecar that SigV4-signs the CLIs' OTLP
 # telemetry and forwards it to CloudWatch. Includes sigv4auth + transform (OTTL)
 # processors that ADOT lacks.

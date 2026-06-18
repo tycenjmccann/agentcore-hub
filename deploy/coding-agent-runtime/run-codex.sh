@@ -41,6 +41,8 @@ MODEL="${CODEX_MODEL:-openai.gpt-5.5}"
 PROJECT="${BEDROCK_MANTLE_PROJECT:-default}"
 BASE_URL="https://bedrock-mantle.${BEDROCK_MANTLE_REGION}.api.aws/openai/v1"
 PROMPT="${1:?run-codex.sh requires a task prompt}"
+# Optional: a prior codex session id (thread_id) to resume the conversation.
+RESUME_ID="${2:-}"
 
 # ── Mint a short-term Bedrock bearer token from the IAM role ──
 if [ -z "${OPENAI_API_KEY:-}" ]; then
@@ -61,7 +63,9 @@ PYEOF
 fi
 
 # ── Codex config: explicit OpenAI-compatible provider → Bedrock Mantle ───────
-CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+# Persist CODEX_HOME on session storage so recorded sessions (under
+# $CODEX_HOME/sessions) survive microVM stop/restart and can be resumed.
+export CODEX_HOME="${CODEX_HOME:-$WORKSPACE_DIR/.codex}"
 mkdir -p "$CODEX_HOME"
 cat > "$CODEX_HOME/config.toml" <<EOF
 model = "${MODEL}"
@@ -77,7 +81,18 @@ wire_api = "responses"
 OpenAI-Project = "${PROJECT}"
 EOF
 
-echo "[codex] base_url=${BASE_URL} model=${MODEL} project=${PROJECT}" >&2
+echo "[codex] base_url=${BASE_URL} model=${MODEL} project=${PROJECT} resume=${RESUME_ID:-no}" >&2
+
+# Build the codex invocation. With a RESUME_ID we continue that recorded session
+# (`codex exec resume <id> <prompt>`); otherwise start a fresh one. --skip-git-repo-check
+# lets it run outside a git repo (and resume doesn't accept --yolo, so pass the
+# sandbox/approval bypass explicitly for parity with the fresh-run --yolo).
+if [ -n "$RESUME_ID" ]; then
+  set -- exec resume "$RESUME_ID" --json --model "$MODEL" \
+    --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$PROMPT"
+else
+  set -- exec --json --model "$MODEL" --yolo --skip-git-repo-check "$PROMPT"
+fi
 
 # GPT-5.5 on Mantle (preview) intermittently returns "Engine not found" (the
 # on-demand engine is cold). Codex surfaces it as a turn error and exits without
@@ -88,8 +103,7 @@ ATTEMPTS="${CODEX_ENGINE_RETRIES:-6}"
 TMP_OUT="$(mktemp)"
 for i in $(seq 1 "$ATTEMPTS"); do
   set +e
-  codex exec --json --model "$MODEL" --yolo --skip-git-repo-check "$PROMPT" < /dev/null \
-    | tee "$TMP_OUT"
+  codex "$@" < /dev/null | tee "$TMP_OUT"
   rc=${PIPESTATUS[0]}
   set -e
   if [ "$rc" -eq 0 ] && ! grep -q "Engine not found" "$TMP_OUT"; then

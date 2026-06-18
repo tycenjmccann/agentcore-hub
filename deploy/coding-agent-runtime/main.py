@@ -163,6 +163,20 @@ def _configure_git() -> None:
                     os.environ.get("GIT_AUTHOR_EMAIL", "agent@agentcore-hub.example.com")], check=False)
     subprocess.run(["git", "config", "--global", "user.name",
                     os.environ.get("GIT_AUTHOR_NAME", "AgentCore Hub Agent")], check=False)
+    # Expose the PAT to the GitHub CLI so the agent can enumerate/inspect repos
+    # (e.g. `gh repo list`, `gh api`) — not just clone a known URL.
+    os.environ.setdefault("GH_TOKEN", pat)
+    os.environ.setdefault("GITHUB_TOKEN", pat)
+
+
+def _valid_repo(repo: str) -> bool:
+    """A clonable target: a full URL, or owner/name (>= 2 path segments).
+    A bare owner like 'tycenjmccann' is NOT clonable — reject it early so we
+    return a clean error instead of a 404 git clone."""
+    r = repo.strip()
+    if r.startswith(("http://", "https://", "git@")):
+        return True
+    return len([p for p in r.split("/") if p]) >= 2
 
 
 def _ensure_workspace(repo: str | None) -> str:
@@ -173,6 +187,12 @@ def _ensure_workspace(repo: str | None) -> str:
         wd = WORKSPACE_ROOT
         os.makedirs(wd, exist_ok=True)
         return wd
+    if not _valid_repo(repo):
+        raise ValueError(
+            f"'{repo}' is not a valid repository. Use 'owner/name' or a full "
+            f"clone URL. (A bare owner can't be cloned — leave repo empty and "
+            f"ask the agent to 'gh repo list {repo}' instead.)"
+        )
     slug = _slugify_repo(repo)
     wd = os.path.join(WORKSPACE_ROOT, slug)
     if os.path.isdir(os.path.join(wd, ".git")):
@@ -218,32 +238,44 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None) -> dic
         return {"response": proc.stdout.strip(), "claude_session_id": None}
 
 
-def _run_codex(prompt: str, workdir: str) -> dict:
-    """Run one Codex turn via the Mantle launcher (GPT-5.5). Codex resume is not
-    yet wired — each turn is independent for now."""
+def _run_codex(prompt: str, workdir: str, codex_session_id: str | None) -> dict:
+    """Run one Codex turn via the Mantle launcher (GPT-5.5). Resumes the prior
+    conversation when codex_session_id (a codex thread_id) is supplied.
+
+    We surface codex's thread_id through the same `claude_session_id` field the
+    server returns, so the caller's resume handle is CLI-agnostic."""
     env = {**os.environ, "WORKSPACE_DIR": workdir}
-    proc = subprocess.run(["/app/run-codex.sh", prompt], cwd=workdir, env=env,
-                          capture_output=True, text=True, timeout=TURN_TIMEOUT_S,
-                          stdin=subprocess.DEVNULL)
+    args = ["/app/run-codex.sh", prompt]
+    if codex_session_id:
+        args.append(codex_session_id)
+    proc = subprocess.run(args, cwd=workdir, env=env, capture_output=True,
+                          text=True, timeout=TURN_TIMEOUT_S, stdin=subprocess.DEVNULL)
     if proc.returncode != 0:
         raise RuntimeError(f"codex exited {proc.returncode}: {proc.stderr.strip()[:600]}")
-    # codex exec --json emits JSONL. The final assistant text arrives as
+    # codex exec --json emits JSONL. Pull the thread_id (resume handle) and the
+    # final assistant text. New shape:
+    #   {"type":"thread.started","thread_id":"..."}
     #   {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
-    # (older builds used {"msg":{"type":"agent_message","message":"..."}}).
-    # Take the last agent_message; fall back to raw stdout.
+    # Older builds: {"msg":{"type":"agent_message","message":"..."}}.
     text = proc.stdout.strip()
-    for line in reversed(proc.stdout.splitlines()):
+    thread_id: str | None = codex_session_id
+    found_text = False
+    for line in proc.stdout.splitlines():
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if obj.get("type") == "thread.started" and obj.get("thread_id"):
+            thread_id = obj["thread_id"]
         item = obj.get("item") or obj.get("msg") or obj
         if item.get("type") == "agent_message":
             msg = item.get("text") or item.get("message")
             if msg:
                 text = msg
-                break
-    return {"response": text, "claude_session_id": None}
+                found_text = True
+    if not found_text:
+        text = proc.stdout.strip()
+    return {"response": text, "claude_session_id": thread_id}
 
 
 # ─── Server ───────────────────────────────────────────────────────────────────
@@ -309,9 +341,12 @@ async def invocations(request: Request):
 
     try:
         _configure_git()
-        workdir = _ensure_workspace(repo)
+        try:
+            workdir = _ensure_workspace(repo)
+        except ValueError as ve:  # bad repo field — caller error, not a 500
+            return JSONResponse({"error": str(ve)}, status_code=400)
         if cli == "codex":
-            result = _run_codex(prompt, workdir)
+            result = _run_codex(prompt, workdir, claude_session_id)
         elif cli == "claude":
             result = _run_claude(prompt, workdir, claude_session_id)
         else:

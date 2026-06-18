@@ -170,6 +170,7 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": [
           \"bedrock-agentcore:InvokeAgentRuntime\",
+          \"bedrock-agentcore:InvokeAgentRuntimeCommandShell\",
           \"bedrock-agentcore:InvokeHarness\",
           \"bedrock-agentcore:GetAgentRuntime\",
           \"bedrock-agentcore:GetHarness\",
