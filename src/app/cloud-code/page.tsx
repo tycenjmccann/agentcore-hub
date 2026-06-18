@@ -34,6 +34,7 @@ export default function CloudCodePage() {
   const [showConfig, setShowConfig] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [view, setView] = useState<"chat" | "terminal">("chat");
+  const [sessionsOpen, setSessionsOpen] = useState(false); // mobile session drawer
   const streamEnd = useRef<HTMLDivElement>(null);
 
   const fetchSessions = useCallback(async () => {
@@ -129,9 +130,13 @@ export default function CloudCodePage() {
   };
 
   return (
-    <div className="flex h-[calc(100vh-56px)] -m-6">
-      {/* Sidebar — session history */}
-      <aside className="w-72 bg-[var(--color-bg-secondary)] border-r border-[var(--color-border)] flex flex-col flex-shrink-0">
+    <div className="flex h-[calc(100vh-56px)] -m-4 md:-m-6 relative">
+      {/* Mobile backdrop for the session drawer */}
+      {sessionsOpen && (
+        <div className="fixed inset-0 z-30 bg-black/50 md:hidden" onClick={() => setSessionsOpen(false)} aria-hidden="true" />
+      )}
+      {/* Sidebar — session history. Off-canvas drawer on mobile, in-flow on desktop. */}
+      <aside className={`fixed md:static z-40 top-0 left-0 h-full w-72 bg-[var(--color-bg-secondary)] border-r border-[var(--color-border)] flex flex-col flex-shrink-0 transition-transform duration-300 ${sessionsOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"}`}>
         <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--color-border)]">
           <span className="text-sm font-semibold flex items-center gap-2">
             <Cloud className="w-4 h-4 text-brand-400" /> Cloud Code
@@ -153,7 +158,7 @@ export default function CloudCodePage() {
           {sessions.map((s) => (
             <div
               key={s.sessionId}
-              onClick={() => setSelectedId(s.sessionId)}
+              onClick={() => { setSelectedId(s.sessionId); setSessionsOpen(false); }}
               className={`group px-2.5 py-2 rounded-lg mb-1 cursor-pointer border ${
                 selectedId === s.sessionId
                   ? "bg-brand-600/15 border-brand-500/30"
@@ -198,6 +203,21 @@ export default function CloudCodePage() {
 
       {/* Main — chat */}
       <main className="flex-1 flex flex-col min-w-0">
+        {/* Mobile-only bar: open the session drawer + quick New */}
+        <div className="md:hidden flex items-center justify-between px-3 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
+          <button
+            onClick={() => setSessionsOpen(true)}
+            className="flex items-center gap-1.5 text-xs font-medium text-[var(--color-text-secondary)]"
+          >
+            <Cloud className="w-4 h-4 text-brand-400" /> Sessions
+          </button>
+          <button
+            onClick={() => setShowNew(true)}
+            className="flex items-center gap-1 px-2 py-1 rounded-lg bg-brand-600 text-white text-xs font-semibold"
+          >
+            <Plus className="w-3.5 h-3.5" /> New
+          </button>
+        </div>
         {!active ? (
           <div className="flex flex-col items-center justify-center h-full text-center p-8">
             <div className="w-16 h-16 rounded-full bg-brand-600/10 flex items-center justify-center mb-4">
@@ -217,7 +237,7 @@ export default function CloudCodePage() {
           </div>
         ) : (
           <>
-            <div className="px-5 py-3 border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)] flex items-center justify-between">
+            <div className="px-3 md:px-5 py-3 border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)] flex items-center justify-between gap-2">
               <div className="min-w-0">
                 <div className="font-semibold text-[13.5px] truncate">{active.title}</div>
                 <div className="text-[11px] text-[var(--color-text-muted)] font-mono flex items-center gap-2">

@@ -1,15 +1,17 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Globe, ChevronDown } from "lucide-react";
+import { Globe, ChevronDown, Menu } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { invalidateCachePrefix } from "@/lib/client-cache";
 import { PAGE_TITLES as pageTitles } from "@/config/modules";
 import { BRAND_NAME } from "@/config/brand";
+import { useSidebar } from "@/components/layout/sidebar/SidebarContext";
 import ThemeToggle from "./ThemeToggle";
 
 export default function Header() {
   const pathname = usePathname();
+  const { setMobileOpen } = useSidebar();
   const [dynamicTitle, setDynamicTitle] = useState<string | null>(null);
 
   const baseTitle = pathname.startsWith("/agents/") && pathname !== "/agents"
@@ -77,8 +79,18 @@ export default function Header() {
   };
 
   return (
-    <header className="h-14 bg-surface-1 border-b border-surface-4 flex items-center justify-between px-6">
-      <h2 className="text-lg font-semibold text-[var(--color-text-primary)]">{title}</h2>
+    <header className="h-14 bg-surface-1 border-b border-surface-4 flex items-center justify-between px-4 md:px-6">
+      <div className="flex items-center gap-2 min-w-0">
+        {/* Mobile-only hamburger → opens the nav drawer */}
+        <button
+          onClick={() => setMobileOpen(true)}
+          aria-label="Open navigation menu"
+          className="md:hidden p-2 -ml-2 rounded-lg text-[var(--color-text-secondary)] hover:bg-surface-3"
+        >
+          <Menu className="w-5 h-5" />
+        </button>
+        <h2 className="text-base md:text-lg font-semibold text-[var(--color-text-primary)] truncate">{title}</h2>
+      </div>
 
       <div className="flex items-center gap-4">
         {/* Theme Toggle */}

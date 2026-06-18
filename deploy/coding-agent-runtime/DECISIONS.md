@@ -24,11 +24,22 @@ Decisions:
 
 ## Task 2 — Mobile-friendly
 
-**Scope decision: Cloud Code tab only, not a full-app mobile rework.**
-Rationale: the user uses this tab on mobile now; a full-app responsive pass is a
-much larger, riskier change across every page. Make Cloud Code genuinely usable
-on a phone; leave other tabs as-is. **[CONFIRM]** whether to extend to the whole
-app later.
+**Scope decision (REVISED): fixed the global app shell, not just Cloud Code.**
+On inspection the real blocker was the global shell — a `fixed w-64` sidebar +
+`ml-64` content margin that eats a phone screen on EVERY tab. That's contained
+chrome (3 files: Sidebar, MainContent, Header + SidebarContext), not a per-page
+rewrite, so fixing it unblocks the whole app at low risk. Per-page content
+(tables, cards) on other tabs is NOT audited — only the shell. **[CONFIRM]** if
+you want a per-page mobile polish pass on the other tabs.
+
+What changed:
+- Global Sidebar → off-canvas drawer on mobile (hamburger in Header opens it,
+  backdrop closes it; auto-closes on nav). Desktop unchanged (rail + collapse).
+- MainContent: no left margin on mobile (`ml-0 md:ml-16/64`).
+- Cloud Code page: its own session list is also a mobile drawer (in-page
+  "Sessions" button + backdrop); chat/terminal go full-width; padding tightened.
+- Verified live at 390px with the AgentCore cloud browser: shell + drawer +
+  Cloud Code render correctly, nothing clipped.
 
 Decisions:
 - The hub's left nav (Sidebar) + the Cloud Code session sidebar both eat the
