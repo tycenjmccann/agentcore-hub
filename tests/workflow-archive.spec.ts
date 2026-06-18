@@ -27,7 +27,17 @@ test.describe("Workflow Archive", () => {
     console.log(`Created throwaway workflow ${workflowId}`);
   });
 
-  test("PATCH /api/workflow/{id}/archive returns 200", async ({ request }) => {
+  test("PATCH archive on a RUNNING workflow returns 409", async ({ request }) => {
+    // Freshly started workflow (phase=requirements) is not terminal → refused.
+    const res = await request.patch(`/api/workflow/${workflowId}/archive`);
+    expect(res.status()).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("running");
+  });
+
+  test("PATCH archive after cancel returns 200", async ({ request }) => {
+    // Move to a terminal state first, then archiving is allowed.
+    await request.post(`/api/workflow/${workflowId}/cancel`);
     const res = await request.patch(`/api/workflow/${workflowId}/archive`);
     expect(res.ok()).toBeTruthy();
     const body = await res.json();
