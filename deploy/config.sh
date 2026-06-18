@@ -33,6 +33,9 @@ export CLOUD_CODE_TABLE="${CLOUD_CODE_TABLE:-agentcore-hub-cloud-code-sessions}"
 
 # Cloud Code — the standalone coding-agent runtime (set after deploy.py prints the ARN)
 export CODING_AGENT_RUNTIME_ARN="${CODING_AGENT_RUNTIME_ARN:-}"
+# Default MCP gateway wired into Cloud Code CLIs (shared Jira/S3/Skill tools).
+export MCP_GATEWAY_URL="${MCP_GATEWAY_URL:-}"
+export MCP_GATEWAY_NAME="${MCP_GATEWAY_NAME:-agentis_gateway}"
 
 # Validation
 if [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "None" ]; then

@@ -149,6 +149,10 @@ def main() -> None:
     # cloud-code/configs/{userId}/{version}.zip and materializes it on turn start.
     if bucket := os.environ.get("ARTIFACT_BUCKET"):
         env_vars["ARTIFACT_BUCKET"] = bucket
+    # Default MCP gateway — wired into both CLIs on session start.
+    if mcp_url := os.environ.get("MCP_GATEWAY_URL"):
+        env_vars["MCP_GATEWAY_URL"] = mcp_url
+        env_vars["MCP_GATEWAY_NAME"] = os.environ.get("MCP_GATEWAY_NAME", "agentis_gateway")
     # GitHub auth for private repo clone/push (launchers configure git from it).
     if gh_pat := os.environ.get("GITHUB_PAT"):
         env_vars["GITHUB_PAT"] = gh_pat

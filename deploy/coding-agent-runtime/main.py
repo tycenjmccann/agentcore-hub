@@ -96,6 +96,66 @@ def _remember_session(claude_session_id: str | None, repo: str | None) -> None:
         logger.warning("session_map_write_failed", extra={"error": str(exc)[:200]})
 
 
+# ─── Default MCP gateway ──────────────────────────────────────────────────────
+
+# AgentCore Gateway exposing shared MCP tools (Jira, S3, SkillLoader). Wired as
+# a default MCP server so every session gets these tools with zero config; a
+# user-uploaded config bundle merges its own servers on top. Set DISABLE_DEFAULT_MCP=1
+# to skip. Auth is currently NONE on the gateway (internal); revisit before
+# multi-user/public (would add an Authorization header here).
+MCP_GATEWAY_URL = os.environ.get("MCP_GATEWAY_URL", "")
+MCP_GATEWAY_NAME = os.environ.get("MCP_GATEWAY_NAME", "agentis_gateway")
+
+
+def _apply_default_mcp() -> None:
+    """Write the gateway as a default MCP server for both CLIs, without
+    clobbering a user's own MCP entries.
+
+    - Claude Code: a streamable-HTTP server in {CLAUDE_CONFIG_DIR}/.mcp.json
+      under key MCP_GATEWAY_NAME (we own that key; user keys are preserved).
+    - Codex: a [mcp_servers.<name>] table appended to config.toml only if absent
+      (merge-codex-config already guards our provider block)."""
+    if not MCP_GATEWAY_URL or os.environ.get("DISABLE_DEFAULT_MCP") == "1":
+        return
+
+    # Claude — .mcp.json (merge: keep user servers, set/overwrite only ours).
+    try:
+        os.makedirs(CLAUDE_CONFIG_DIR, exist_ok=True)
+        mcp_path = os.path.join(CLAUDE_CONFIG_DIR, ".mcp.json")
+        try:
+            with open(mcp_path) as f:
+                doc = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            doc = {}
+        servers = doc.get("mcpServers") or {}
+        servers[MCP_GATEWAY_NAME] = {"type": "http", "url": MCP_GATEWAY_URL}
+        doc["mcpServers"] = servers
+        with open(mcp_path, "w") as f:
+            json.dump(doc, f, indent=2)
+    except OSError as exc:
+        logger.warning("default_mcp_claude_failed", extra={"error": str(exc)[:200]})
+
+    # Codex — append [mcp_servers.<name>] if not already present.
+    try:
+        os.makedirs(CODEX_HOME, exist_ok=True)
+        toml_path = os.path.join(CODEX_HOME, "config.toml")
+        existing = ""
+        if os.path.exists(toml_path):
+            with open(toml_path) as f:
+                existing = f.read()
+        if f"[mcp_servers.{MCP_GATEWAY_NAME}]" not in existing:
+            block = (
+                f'\n[mcp_servers.{MCP_GATEWAY_NAME}]\n'
+                f'url = "{MCP_GATEWAY_URL}"\n'
+            )
+            with open(toml_path, "a") as f:
+                f.write(block)
+    except OSError as exc:
+        logger.warning("default_mcp_codex_failed", extra={"error": str(exc)[:200]})
+
+    logger.info("default_mcp_applied", extra={"gateway": MCP_GATEWAY_NAME})
+
+
 # ─── Per-user config bundle ───────────────────────────────────────────────────
 
 
@@ -303,8 +363,19 @@ def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
 def _run_claude(prompt: str, workdir: str, claude_session_id: str | None) -> dict:
     """Run one Claude Code turn. Resume the conversation when a prior
     claude_session_id is supplied (same microVM keeps its ~/.claude state)."""
-    args = [
-        "claude", "--print", "--dangerously-skip-permissions",
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
+    os.makedirs(config_dir, exist_ok=True)
+
+    args = ["claude", "--print"]
+    # `claude --print` does NOT auto-load a project .mcp.json (needs interactive
+    # approval). Pass it explicitly. --mcp-config takes a variadic <configs...>,
+    # so it must be followed by another flag — never placed right before the
+    # positional prompt, or the prompt gets parsed as a config path.
+    mcp_config = os.path.join(config_dir, ".mcp.json")
+    if os.path.isfile(mcp_config):
+        args += ["--mcp-config", mcp_config]
+    args += [
+        "--dangerously-skip-permissions",
         "--output-format", "json", "--model", CLAUDE_MODEL,
         "--max-turns", os.environ.get("MAX_TURNS", "100"),
     ]
@@ -312,9 +383,7 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None) -> dic
         args += ["--resume", claude_session_id]
     args.append(prompt)
 
-    env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1",
-           "CLAUDE_CONFIG_DIR": os.environ.get("CLAUDE_CONFIG_DIR", "/mnt/workspace/.claude-data")}
-    os.makedirs(env["CLAUDE_CONFIG_DIR"], exist_ok=True)
+    env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir}
 
     proc = subprocess.run(args, cwd=workdir, env=env, capture_output=True,
                           text=True, timeout=TURN_TIMEOUT_S, stdin=subprocess.DEVNULL)
@@ -434,7 +503,8 @@ async def invocations(request: Request):
         {"cli": cli, "repo": repo, "resume": bool(claude_session_id), "prompt_head": prompt[:120]}))
 
     try:
-        # Lay down the user's MCP/skills/agents config before launching a CLI.
+        # Default gateway MCP tools first, then the user's bundle on top.
+        _apply_default_mcp()
         _apply_config_bundle(user_id, config_version)
         _configure_git()
         try:
