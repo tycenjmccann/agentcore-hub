@@ -29,6 +29,10 @@ export ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}
 export EVENTS_TABLE="${EVENTS_TABLE:-agentcore-hub-events}"
 export TICKETS_TABLE="${TICKETS_TABLE:-agentcore-hub-tickets}"
 export WORKFLOWS_TABLE="${WORKFLOWS_TABLE:-agentcore-hub-workflows}"
+export CLOUD_CODE_TABLE="${CLOUD_CODE_TABLE:-agentcore-hub-cloud-code-sessions}"
+
+# Cloud Code — the standalone coding-agent runtime (set after deploy.py prints the ARN)
+export CODING_AGENT_RUNTIME_ARN="${CODING_AGENT_RUNTIME_ARN:-}"
 
 # Validation
 if [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "None" ]; then
