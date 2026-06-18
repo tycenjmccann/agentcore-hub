@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
-# shell-init.sh — sourced by every interactive Terminal-tab shell (via ~/.bashrc).
+# shell-init.sh — sourced by every interactive Terminal-tab shell.
 #
-# Makes bare `claude` / `codex` "just work" with no login screen: Claude uses
-# Bedrock (env var); Codex uses our Bedrock Mantle provider + a freshly minted
-# bearer token. Mirrors what run-claude/run-codex set up for headless turns, so
-# the interactive terminal matches the chat experience.
+# Makes bare `claude` / `codex` / `gh` "just work" with no login screen: Claude
+# uses Bedrock (env var); Codex uses our Bedrock Mantle provider + a freshly
+# minted bearer token; gh uses GITHUB_PAT. Mirrors what the headless launchers
+# set up, so the interactive terminal matches the chat experience.
+
+# Sourced from both /etc/bash.bashrc and ~/.bashrc — run once per shell.
+[ -n "$_CODING_SHELL_INIT_DONE" ] && return 0
+export _CODING_SHELL_INIT_DONE=1
+
+# The PTY shell does NOT inherit the server process's env (where AgentCore
+# injects GITHUB_PAT, model ids, ARTIFACT_BUCKET). The server writes them to the
+# writable workspace mount on startup so the interactive terminal sees them.
+[ -f /mnt/workspace/.runtime-env.sh ] && source /mnt/workspace/.runtime-env.sh
 
 export AWS_REGION="${AWS_REGION:-us-east-1}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-$AWS_REGION}"
@@ -50,7 +59,15 @@ PY
 }
 codextoken
 
+# ── GitHub CLI / git → authenticated via the PAT (no `gh auth login`) ──
+if [ -n "${GITHUB_PAT:-}" ]; then
+  export GH_TOKEN="$GITHUB_PAT"
+  export GITHUB_TOKEN="$GITHUB_PAT"
+  git config --global "url.https://x-access-token:${GITHUB_PAT}@github.com/.insteadOf" "https://github.com/" 2>/dev/null || true
+  git config --global --add safe.directory '*' 2>/dev/null || true
+fi
+
 if [ -t 1 ]; then
-  echo "Coding agents ready: 'claude' (Bedrock) · 'codex' (GPT-5.5 via Mantle). No login needed."
+  echo "Coding agents ready: 'claude' (Bedrock) · 'codex' (GPT-5.5 via Mantle) · 'gh' (authed). No login needed."
   echo "Workspace: $WORKSPACE_ROOT   (run 'codextoken' if codex auth expires)"
 fi

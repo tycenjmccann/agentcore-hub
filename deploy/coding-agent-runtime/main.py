@@ -28,6 +28,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -449,7 +450,31 @@ async def invocations(request: Request):
     return JSONResponse(result)
 
 
+def _export_runtime_env() -> None:
+    """Persist AgentCore-injected env vars to a file the interactive PTY shell
+    can source. The PTY spawns as a fresh process that does NOT inherit this
+    server process's environment, so GITHUB_PAT / model ids / bucket would be
+    empty in the Terminal tab. shell-init.sh sources this file."""
+    keys = [
+        "GITHUB_PAT", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_NAME",
+        "AWS_REGION", "BEDROCK_MANTLE_REGION", "ANTHROPIC_MODEL", "CLAUDE_MODEL",
+        "CODEX_MODEL", "ARTIFACT_BUCKET", "WORKSPACE_ROOT",
+    ]
+    # Write to a path the non-root runtime user can create AND that the PTY
+    # shell-init reads. /app is root-owned, so use the writable workspace mount.
+    os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+    try:
+        with open(os.path.join(WORKSPACE_ROOT, ".runtime-env.sh"), "w") as f:
+            for k in keys:
+                v = os.environ.get(k)
+                if v:
+                    f.write(f"export {k}={shlex.quote(v)}\n")
+    except OSError as exc:
+        logger.warning("runtime_env_export_failed", extra={"error": str(exc)[:200]})
+
+
 if __name__ == "__main__":
+    _export_runtime_env()
     _bootstrap_collector()
     logger.info("server_starting", extra={"port": 8080, "workspace_root": WORKSPACE_ROOT})
     uvicorn.run(app, host="0.0.0.0", port=8080)
