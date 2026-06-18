@@ -61,6 +61,9 @@ export async function invokeCodingTurn(params: {
   const payload: Record<string, unknown> = {
     prompt: params.prompt,
     cli: params.cli,
+    // Scope the workspace per session so concurrent sessions on the same repo
+    // get isolated checkouts (no clobbering each other's branch/edits).
+    session_id: params.sessionId,
   };
   if (params.repo) payload.repo = params.repo;
   if (params.claudeSessionId) payload.claude_session_id = params.claudeSessionId;

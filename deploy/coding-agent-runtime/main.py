@@ -261,14 +261,22 @@ def _valid_repo(repo: str) -> bool:
     return len([p for p in r.split("/") if p]) >= 2
 
 
-def _ensure_workspace(repo: str | None) -> str:
-    """Return the working dir. If repo given and not yet cloned, clone it.
-    The dir lives on persistent session storage, so a re-invoke with the same
-    runtimeSessionId finds it warm (no re-clone)."""
+def _session_dir(session_id: str | None) -> str:
+    """Per-session root under the workspace. Each session gets an isolated
+    checkout so two sessions on the same repo can't clobber each other's branch
+    or edits. Falls back to a shared 'default' dir when no session id is given."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", (session_id or "default"))[:80]
+    return os.path.join(WORKSPACE_ROOT, "sessions", safe)
+
+
+def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
+    """Return the working dir for this session. If repo given and not yet cloned,
+    clone it under the session's own dir (on EFS, so a re-invoke with the same
+    runtimeSessionId finds it warm — no re-clone)."""
+    base = _session_dir(session_id)
     if not repo:
-        wd = WORKSPACE_ROOT
-        os.makedirs(wd, exist_ok=True)
-        return wd
+        os.makedirs(base, exist_ok=True)
+        return base
     if not _valid_repo(repo):
         raise ValueError(
             f"'{repo}' is not a valid repository. Use 'owner/name' or a full "
@@ -276,11 +284,11 @@ def _ensure_workspace(repo: str | None) -> str:
             f"ask the agent to 'gh repo list {repo}' instead.)"
         )
     slug = _slugify_repo(repo)
-    wd = os.path.join(WORKSPACE_ROOT, slug)
+    wd = os.path.join(base, slug)
     if os.path.isdir(os.path.join(wd, ".git")):
         logger.info("workspace_warm", extra={"slug": slug})
         return wd
-    os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+    os.makedirs(base, exist_ok=True)
     clone_url = repo if repo.startswith(("http://", "https://", "git@")) else f"https://github.com/{repo}.git"
     logger.info("workspace_cloning", extra={"slug": slug, "url": clone_url.split("@")[-1]})
     res = subprocess.run(["git", "clone", clone_url, wd], capture_output=True, text=True, timeout=300)
@@ -415,6 +423,7 @@ async def invocations(request: Request):
     claude_session_id = payload.get("claude_session_id")
     user_id = payload.get("user_id")
     config_version = payload.get("config_version")
+    session_id = payload.get("session_id")  # isolates this session's checkout
 
     # On resume, recover the repo the conversation was started in (so we land in
     # the same cwd Claude Code scoped the session to) when the caller omits it.
@@ -429,7 +438,7 @@ async def invocations(request: Request):
         _apply_config_bundle(user_id, config_version)
         _configure_git()
         try:
-            workdir = _ensure_workspace(repo)
+            workdir = _ensure_workspace(repo, session_id)
         except ValueError as ve:  # bad repo field — caller error, not a 500
             return JSONResponse({"error": str(ve)}, status_code=400)
         if cli == "codex":
