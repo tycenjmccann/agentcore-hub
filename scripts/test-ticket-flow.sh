@@ -22,7 +22,7 @@
 # Expected duration: 8-12 minutes (30s per agent + orchestrator overhead)
 #
 # Usage:
-#   ./scripts/test-ticket-flow.sh                              # App Runner (tycenj-prod)
+#   ./scripts/test-ticket-flow.sh                              # App Runner (default profile)
 #   ./scripts/test-ticket-flow.sh --url http://localhost:3000  # Local dev
 #
 # ─────────────────────────────────────────────────────────────────────────────

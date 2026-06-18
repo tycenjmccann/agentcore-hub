@@ -12,7 +12,7 @@ a pre-built ECR image — it always wants to rebuild from source. We bypass it
 and call CreateAgentRuntime / UpdateAgentRuntime directly.
 
 Usage:
-  IMAGE_URI=838829463875.dkr.ecr.us-east-1.amazonaws.com/runtime-agent:v15 \
+  IMAGE_URI=<account-id>.dkr.ecr.us-east-1.amazonaws.com/runtime-agent:v15 \
   AGENTCORE_ROLE_ARN=arn:aws:iam::...:role/agentcore-hub-agentcore-role \
   ARTIFACT_BUCKET=agentcore-hub-artifacts-... \
   ./deploy-one-robust.py <agent_name>

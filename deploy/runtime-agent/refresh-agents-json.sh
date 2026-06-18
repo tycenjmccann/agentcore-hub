@@ -27,7 +27,7 @@
 #   - You need fleet-runtime-ids.json for verify-fleet-invoke.py.
 #
 # Usage:
-#   AWS_PROFILE=tycenj-prod ./refresh-agents-json.sh [--region us-east-1]
+#   AWS_PROFILE=<your-profile> ./refresh-agents-json.sh [--region us-east-1]
 #
 
 set -e
