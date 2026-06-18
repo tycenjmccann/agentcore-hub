@@ -65,9 +65,13 @@ RUN chmod +x /app/run-codex.sh /app/merge-codex-config.py /app/shell-init.sh
 
 # Make the interactive Terminal-tab shell pre-load Bedrock auth for both CLIs so
 # bare `claude`/`codex` skip their login screens (matches the chat experience).
-RUN echo '[ -f /app/shell-init.sh ] && source /app/shell-init.sh' \
-      >> /home/bedrock_agentcore/.bashrc \
-    && chown bedrock_agentcore:bedrock_agentcore /home/bedrock_agentcore/.bashrc
+# Write to BOTH the system-wide rc (read by every interactive bash, which the
+# PTY's non-login shell honors) and the user rc (login shells / belt-and-braces).
+RUN SRC='[ -f /app/shell-init.sh ] && source /app/shell-init.sh' \
+    && echo "$SRC" >> /etc/bash.bashrc \
+    && echo "$SRC" >> /home/bedrock_agentcore/.bashrc \
+    && echo "$SRC" >> /home/bedrock_agentcore/.profile \
+    && chown bedrock_agentcore:bedrock_agentcore /home/bedrock_agentcore/.bashrc /home/bedrock_agentcore/.profile
 
 USER bedrock_agentcore
 
