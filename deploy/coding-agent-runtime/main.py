@@ -43,7 +43,10 @@ from log import get_logger, redact
 
 logger = get_logger("coding-agent-runtime")
 
-WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/mnt/workspace")
+# Workspace lives on the EFS mount (/mnt/efs) — elastic + POSIX + persists across
+# cold microVMs, so repo clones + node_modules don't hit the ~1 GB sessionStorage
+# cap (ENOSPC) and survive for true warm resume. deploy.py sets WORKSPACE_ROOT.
+WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/mnt/efs")
 DEFAULT_CLI = "claude"
 CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
     "CLAUDE_MODEL", "us.anthropic.claude-opus-4-6-v1"
@@ -454,23 +457,36 @@ def _export_runtime_env() -> None:
     """Persist AgentCore-injected env vars to a file the interactive PTY shell
     can source. The PTY spawns as a fresh process that does NOT inherit this
     server process's environment, so GITHUB_PAT / model ids / bucket would be
-    empty in the Terminal tab. shell-init.sh sources this file."""
+    empty in the Terminal tab. shell-init.sh sources this file.
+
+    The EFS mount can lag the server's startup by a few seconds (writes fail
+    with EACCES until it's ready), so retry in a background thread rather than
+    block boot or give up on the first failure."""
+    import threading
+
     keys = [
         "GITHUB_PAT", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_NAME",
         "AWS_REGION", "BEDROCK_MANTLE_REGION", "ANTHROPIC_MODEL", "CLAUDE_MODEL",
         "CODEX_MODEL", "ARTIFACT_BUCKET", "WORKSPACE_ROOT",
     ]
-    # Write to a path the non-root runtime user can create AND that the PTY
-    # shell-init reads. /app is root-owned, so use the writable workspace mount.
-    os.makedirs(WORKSPACE_ROOT, exist_ok=True)
-    try:
-        with open(os.path.join(WORKSPACE_ROOT, ".runtime-env.sh"), "w") as f:
-            for k in keys:
-                v = os.environ.get(k)
-                if v:
-                    f.write(f"export {k}={shlex.quote(v)}\n")
-    except OSError as exc:
-        logger.warning("runtime_env_export_failed", extra={"error": str(exc)[:200]})
+    body = "".join(
+        f"export {k}={shlex.quote(os.environ[k])}\n" for k in keys if os.environ.get(k)
+    )
+    path = os.path.join(WORKSPACE_ROOT, ".runtime-env.sh")
+
+    def _writer() -> None:
+        for attempt in range(30):  # ~60s of retries for the EFS mount to appear
+            try:
+                os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+                with open(path, "w") as f:
+                    f.write(body)
+                logger.info("runtime_env_exported", extra={"path": path, "attempt": attempt})
+                return
+            except OSError:
+                time.sleep(2)
+        logger.warning("runtime_env_export_failed", extra={"path": path})
+
+    threading.Thread(target=_writer, daemon=True).start()
 
 
 if __name__ == "__main__":

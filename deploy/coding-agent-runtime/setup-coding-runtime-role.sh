@@ -161,6 +161,30 @@ aws iam put-role-policy \
   }"
 echo "   ✓ Config bundle read (s3://${ARTIFACT_BUCKET}/cloud-code/configs/*)"
 
+# ─── EFS mount (persistent code workspace at /mnt/efs) ───────────────────────
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name "EFSMount" \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [
+      {
+        \"Sid\": \"EFSClientAccess\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"elasticfilesystem:ClientMount\", \"elasticfilesystem:ClientWrite\", \"elasticfilesystem:ClientRootAccess\"],
+        \"Resource\": \"arn:aws:elasticfilesystem:${REGION}:${ACCOUNT_ID}:file-system/*\",
+        \"Condition\": { \"ArnLike\": { \"elasticfilesystem:AccessPointArn\": \"arn:aws:elasticfilesystem:${REGION}:${ACCOUNT_ID}:access-point/*\" } }
+      },
+      {
+        \"Sid\": \"EFSDescribe\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"elasticfilesystem:DescribeAccessPoints\", \"elasticfilesystem:DescribeMountTargets\", \"elasticfilesystem:DescribeFileSystems\"],
+        \"Resource\": [\"arn:aws:elasticfilesystem:${REGION}:${ACCOUNT_ID}:file-system/*\", \"arn:aws:elasticfilesystem:${REGION}:${ACCOUNT_ID}:access-point/*\"]
+      }
+    ]
+  }"
+echo "   ✓ EFS mount access"
+
 echo ""
 echo "   ⏳ Waiting 10s for IAM propagation..."
 sleep 10

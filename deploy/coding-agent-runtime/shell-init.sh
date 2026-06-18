@@ -13,11 +13,14 @@ export _CODING_SHELL_INIT_DONE=1
 # The PTY shell does NOT inherit the server process's env (where AgentCore
 # injects GITHUB_PAT, model ids, ARTIFACT_BUCKET). The server writes them to the
 # writable workspace mount on startup so the interactive terminal sees them.
-[ -f /mnt/workspace/.runtime-env.sh ] && source /mnt/workspace/.runtime-env.sh
+for _envf in /mnt/efs/.runtime-env.sh /mnt/workspace/.runtime-env.sh; do
+  [ -f "$_envf" ] && source "$_envf" && break
+done
 
 export AWS_REGION="${AWS_REGION:-us-east-1}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-$AWS_REGION}"
-export WORKSPACE_ROOT="${WORKSPACE_ROOT:-/mnt/workspace}"
+# EFS-backed workspace (set by deploy.py via WORKSPACE_ROOT); /mnt/efs default.
+export WORKSPACE_ROOT="${WORKSPACE_ROOT:-/mnt/efs}"
 
 # Claude Code installs to ~/.local/bin; a non-login Terminal shell doesn't have
 # it on PATH, so `claude` reads as "command not found". Add it (and npm globals).
