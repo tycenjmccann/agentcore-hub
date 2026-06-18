@@ -7,9 +7,29 @@ source "${REPO_ROOT}/deploy/config.sh"
 
 BUCKET="$ARTIFACT_BUCKET"
 ROLE_ARN="$LAMBDA_ROLE_ARN"
-AGENT_ID="${IMPROVEMENT_AGENT_ID:-agentcore_hub_fleet_improver-k5W5Vb9GhE}"
 WORKFLOW_API="${DEPLOYMENT_URL:-}"
 FLEET_REPO="$FLEET_REPO_URL"
+
+# Resolve the Fleet Improver runtime ARN dynamically (no hardcoded suffix —
+# the runtime id is account-specific). eval-packager invokes this on flush to
+# synthesize the improvement PRD. Prefer an explicit override, else discover by
+# name prefix. If none is found, the packager archives batches but skips
+# synthesis (and logs a warning) rather than failing the flush.
+IMPROVER_ARN="${IMPROVEMENT_AGENT_ARN:-}"
+if [ -z "$IMPROVER_ARN" ]; then
+  # Discovery is best-effort: an old AWS CLI without this AgentCore command, or
+  # credentials that can't list runtimes, must NOT abort the deploy under `set -e`.
+  # `|| true` swallows the nonzero exit so the empty-ARN fallback below runs.
+  IMPROVER_ARN=$(aws bedrock-agentcore-control list-agent-runtimes --region "$AWS_REGION" \
+    --query "agentRuntimes[?contains(agentRuntimeName,'fleet_improver')].agentRuntimeArn | [0]" \
+    --output text 2>/dev/null || true)
+  [ "$IMPROVER_ARN" = "None" ] && IMPROVER_ARN=""
+fi
+if [ -z "$IMPROVER_ARN" ]; then
+  echo "⚠ Fleet Improver runtime not found. Deploy it first:"
+  echo "    cd deploy/runtime-agent && ./deploy-one.sh agentcore_hub_fleet_improver"
+  echo "  eval-packager will archive batches but skip PRD synthesis until IMPROVEMENT_AGENT_ARN is set."
+fi
 
 # DEPLOYMENT_URL is consumed only by prd-submitter. If it isn't set yet (e.g.
 # when /setup runs evaluations before App Runner), deploy with a placeholder
@@ -35,10 +55,24 @@ echo "✓ S3: ${BUCKET}"
 # ─── Lambdas ─────────────────────────────────────────────────────────────────
 deploy_lambda() {
   local NAME=$1 DIR=$2 TIMEOUT=$3 MEM=$4 ENV_VARS=$5
-  cd "${REPO_ROOT}/lambda/${DIR}" && rm -f function.zip && zip -q function.zip index.mjs
+  cd "${REPO_ROOT}/lambda/${DIR}" && rm -f function.zip
+  # Bundle node_modules when the function declares runtime deps (e.g. the
+  # eval-packager's SigV4 stack used to invoke the improver runtime). The
+  # nodejs20.x runtime only ships the v3 SDK clients, not @smithy/* signing.
+  if [ -f package.json ] && grep -q '"dependencies"' package.json; then
+    npm install --omit=dev --no-audit --no-fund --silent
+    zip -rq function.zip index.mjs package.json node_modules/
+  else
+    zip -q function.zip index.mjs
+  fi
   if aws lambda get-function --function-name "agentcore-hub-${NAME}" 2>/dev/null >/dev/null; then
     aws lambda update-function-code --function-name "agentcore-hub-${NAME}" \
       --zip-file fileb://function.zip --output text 2>/dev/null >/dev/null
+    # update-function-code does NOT touch env vars — push them too so config
+    # changes (e.g. a re-resolved IMPROVEMENT_AGENT_ARN) actually take effect.
+    aws lambda wait function-updated --function-name "agentcore-hub-${NAME}" 2>/dev/null || true
+    aws lambda update-function-configuration --function-name "agentcore-hub-${NAME}" \
+      --environment "Variables=${ENV_VARS}" --output text 2>/dev/null >/dev/null
     echo "✓ Lambda: agentcore-hub-${NAME} (updated)"
   else
     aws lambda create-function \
@@ -48,11 +82,14 @@ deploy_lambda() {
       --environment "Variables=${ENV_VARS}" --output text 2>/dev/null >/dev/null
     echo "✓ Lambda: agentcore-hub-${NAME} (created)"
   fi
-  rm -f function.zip
+  rm -rf function.zip node_modules
 }
 
-deploy_lambda "eval-packager" "eval-packager" 300 512 \
-  "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ID=${AGENT_ID},AWS_ACCOUNT_ID=${ACCOUNT_ID}}"
+# 600s timeout: invokeImprover allows up to 240s, and the handleOverflow path can
+# chain a second flush (its own synthesis) before retrying the append. 300s left
+# no margin for that worst case; 600s clears it plus DDB/S3/CW Logs overhead.
+deploy_lambda "eval-packager" "eval-packager" 600 512 \
+  "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ARN=${IMPROVER_ARN},AWS_ACCOUNT_ID=${ACCOUNT_ID}}"
 
 deploy_lambda "prd-submitter" "prd-submitter" 30 256 \
   "{ARTIFACT_BUCKET=${BUCKET},WORKFLOW_API_URL=${WORKFLOW_API},FLEET_REPO_URL=${FLEET_REPO}}"

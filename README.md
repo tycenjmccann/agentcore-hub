@@ -530,10 +530,14 @@ The platform includes an optional **self-improvement loop** that automatically e
 
 ```
 Agent runs → OTEL traces → XRay → Online Evaluation (10 evaluators)
-    → Low scores trigger eval-packager Lambda
-    → Fleet Improver agent performs root-cause analysis
-    → Writes PRD → prd-submitter → [SI] Workflow Run → PR
+    → eval-packager Lambda buffers sessions; on flush it
+    → invokes the Fleet Improver runtime → root-cause analysis → JSON PRD {title, description}
+    → writes PRD to s3 prd/ → prd-submitter → [SI] Workflow Run → PR
 ```
+
+The Fleet Improver runtime must be deployed for synthesis to run
+(`cd deploy/runtime-agent && ./deploy-one.sh agentcore_hub_fleet_improver`).
+Without it, eval-packager archives batches but skips the workflow trigger.
 
 Every agent invocation is evaluated by 10 criteria (tool selection, instruction following, correctness, etc.) using a judge model. When scores drop, the fleet improver agent determines whether the fix is a prompt change, a missing tool, a permissions issue, or an infrastructure problem — then creates a PRD that triggers the same 14-agent pipeline to produce a fix PR.
 

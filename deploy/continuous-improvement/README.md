@@ -5,7 +5,10 @@ This directory contains deployment scripts for the **eval-packager** continuous 
 ## Architecture Overview
 
 ```
-CloudWatch Logs → eval-packager Lambda → DynamoDB buffer → S3 batch → improver agent
+CloudWatch Logs → eval-packager Lambda → DynamoDB buffer
+   → (on flush) archive raw batch to batches/
+   → invoke Fleet Improver runtime → synthesized PRD to prd/
+   → prd-submitter (S3→EventBridge) → workflow API → fix PR
 ```
 
 ### Pipeline Stages
@@ -22,20 +25,27 @@ CloudWatch Logs → eval-packager Lambda → DynamoDB buffer → S3 batch → im
    - Parses evaluator results (scores, evidence, evaluator name) from log event messages
    - Applies per-agent controls (enabled flag, sample rate)
    - Atomically appends enriched session data to a DynamoDB buffer
+   - **On flush, invokes the Fleet Improver runtime to synthesize a PRD** (see stage 5)
 
 3. **DynamoDB Buffer** (`agentcore-hub-eval-config` table):
    - Keyed by canonical `agentId` (e.g., `agentcore_hub_frontend_dev`)
    - Accumulates sessions in `sessionBuffer` list attribute
    - Flushes when buffer reaches configured `batchSize`
 
-4. **S3 Batch Output** (`fleet-imp-agent/prd/`):
-   - JSON files containing enriched evaluator results
-   - Each batch includes `sessions[]` with parsed evaluator scores, evidence, and metadata
+4. **S3 Batch Archive** (`fleet-imp-agent/batches/`):
+   - The raw flushed batch (`{agentId, batchSize, flushedAt, sessions[]}`)
    - Named: `batch-<agentId>-<timestamp>.json`
+   - **Distinct from the `prd/` prefix** — raw batches must NOT trigger prd-submitter
 
-5. **Improver Agent**:
-   - Consumes S3 batch files
-   - Synthesizes actionable improvement recommendations from evaluator scores and evidence
+5. **Fleet Improver synthesis** (in `flushBuffer`, env `IMPROVEMENT_AGENT_ARN`):
+   - eval-packager SigV4-invokes the Fleet Improver runtime with the batch
+   - The runtime returns a JSON object `{ title, description }` (description is the markdown PRD)
+   - `extractPrd` JSON-parses it (tolerates a stray code fence / prose; falls back to a generic title + raw body)
+   - The PRD is written to `fleet-imp-agent/prd/prd-<agentId>-<timestamp>.json`
+   - That `prd/` write is what triggers prd-submitter → workflow → PR
+   - If the improver ARN is unset or the call fails, the batch is still archived
+     (stage 4) and the buffer resets — the flush never wedges, it just skips the
+     workflow trigger and logs a warning
 
 ## Agent ID Resolution
 
@@ -82,7 +92,23 @@ Each session in the S3 batch `sessions[]` array contains **parsed evaluator resu
 }
 ```
 
-This structure enables the improver agent to directly synthesize insights without re-parsing raw log data.
+This structure (archived under `batches/`) is what eval-packager sends to the
+Fleet Improver runtime. The improver returns a JSON `{ title, description }`,
+which `extractPrd` reads into the object written to `prd/`:
+
+```json
+{
+  "title": "fix(agentcore_hub_frontend_dev): <top fix summary>",
+  "description": "<full markdown PRD>",
+  "agentId": "agentcore_hub_frontend_dev",
+  "generatedAt": "2026-06-14T20:41:16.474Z",
+  "sources": ["s3://<bucket>/fleet-imp-agent/batches/batch-...json"]
+}
+```
+
+prd-submitter reads `title` + `description` from this object — which is why a
+raw batch (no `title`/`description`) reaching `prd/` produced `[SI] undefined`
+before this synthesis step existed.
 
 ## Deployment
 
