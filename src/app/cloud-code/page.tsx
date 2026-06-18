@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare } from "lucide-react";
+import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check } from "lucide-react";
 import dynamic from "next/dynamic";
 
 // xterm touches the DOM/window — load only in the browser.
@@ -31,6 +31,7 @@ export default function CloudCodePage() {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [showNew, setShowNew] = useState(false);
+  const [showConfig, setShowConfig] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [view, setView] = useState<"chat" | "terminal">("chat");
   const streamEnd = useRef<HTMLDivElement>(null);
@@ -184,6 +185,12 @@ export default function CloudCodePage() {
           ))}
         </div>
 
+        <button
+          onClick={() => setShowConfig(true)}
+          className="flex items-center gap-2 px-4 py-2 border-t border-[var(--color-border)] text-[12px] text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+        >
+          <Settings className="w-3.5 h-3.5" /> My CLI config (MCP, skills, agents)
+        </button>
         <div className="px-4 py-2.5 border-t border-[var(--color-border)] text-[11px] text-[var(--color-text-muted)] flex items-center gap-2">
           <Cloud className="w-3 h-3" /> Sessions run on AgentCore — close the lid, resume anywhere
         </div>
@@ -317,6 +324,7 @@ export default function CloudCodePage() {
       </main>
 
       {showNew && <NewSessionModal onClose={() => setShowNew(false)} onCreate={createSession} />}
+      {showConfig && <ConfigModal onClose={() => setShowConfig(false)} onToast={flash} />}
 
       {toast && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg bg-red-600 text-white text-xs font-medium shadow-lg z-50">
@@ -396,6 +404,162 @@ function NewSessionModal({
             className="px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 text-white hover:bg-brand-500 transition-colors flex items-center gap-1.5"
           >
             <Radio className="w-3.5 h-3.5" /> Start
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface ConfigVersion {
+  version: string;
+  label?: string;
+  sizeBytes: number;
+  fileCount: number;
+  createdAt: string;
+}
+
+function ConfigModal({ onClose, onToast }: { onClose: () => void; onToast: (m: string) => void }) {
+  const [versions, setVersions] = useState<ConfigVersion[]>([]);
+  const [current, setCurrent] = useState<string | undefined>();
+  const [busy, setBusy] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const load = useCallback(async () => {
+    const res = await fetch("/api/cloud-code/config");
+    if (res.ok) {
+      const d = await res.json();
+      setVersions(d.versions || []);
+      setCurrent(d.currentVersion);
+    }
+  }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const upload = async (file: File) => {
+    setBusy(true);
+    try {
+      const fd = new FormData();
+      fd.append("bundle", file);
+      const res = await fetch("/api/cloud-code/config", { method: "POST", body: fd });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || "upload failed");
+      onToast("Config uploaded — now active");
+      await load();
+    } catch (e) {
+      onToast((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const setActive = async (version?: string) => {
+    setBusy(true);
+    try {
+      const res = await fetch("/api/cloud-code/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version }),
+      });
+      if (!res.ok) throw new Error("failed");
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[200] grid place-items-center p-4 bg-black/60" onClick={onClose} role="presentation">
+      <div
+        className="w-full max-w-lg bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl p-6"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-labelledby="cc-config-title"
+      >
+        <h2 id="cc-config-title" className="text-base font-semibold mb-1 flex items-center gap-2">
+          <Settings className="w-4 h-4 text-brand-400" /> My CLI config
+        </h2>
+        <p className="text-[12px] text-[var(--color-text-muted)] mb-4 leading-relaxed">
+          Upload a zip of your Claude Code / Codex setup so every session launches with it.
+          Layout: <span className="font-mono">claude/</span> (settings, .mcp.json, skills/, agents/) and{" "}
+          <span className="font-mono">codex/</span> (config.toml, AGENTS.md). Your Bedrock model
+          access is always preserved.
+        </p>
+
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".zip"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) upload(f);
+            e.target.value = "";
+          }}
+        />
+        <button
+          onClick={() => fileRef.current?.click()}
+          disabled={busy}
+          className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg border border-dashed border-[var(--color-border)] hover:border-brand-500/50 hover:bg-[var(--color-bg-tertiary)] text-sm transition-colors disabled:opacity-50 mb-4"
+        >
+          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+          Upload config bundle (.zip)
+        </button>
+
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)] mb-2">
+          Versions
+        </div>
+        <div className="max-h-56 overflow-y-auto flex flex-col gap-1.5">
+          {versions.length === 0 && (
+            <p className="text-xs text-[var(--color-text-muted)] py-2">No config uploaded — sessions use defaults.</p>
+          )}
+          {versions.map((v) => (
+            <div
+              key={v.version}
+              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-[var(--color-border)]"
+            >
+              <div className="flex-1 min-w-0">
+                <div className="text-[13px] font-mono truncate">{v.version}</div>
+                <div className="text-[10.5px] text-[var(--color-text-muted)]">
+                  {v.fileCount} files · {(v.sizeBytes / 1024).toFixed(0)} KB ·{" "}
+                  {new Date(v.createdAt).toLocaleString()}
+                </div>
+              </div>
+              {current === v.version ? (
+                <span className="flex items-center gap-1 text-[11px] text-green-400 font-medium">
+                  <Check className="w-3.5 h-3.5" /> Active
+                </span>
+              ) : (
+                <button
+                  onClick={() => setActive(v.version)}
+                  disabled={busy}
+                  className="text-[11px] px-2.5 py-1 rounded border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-50"
+                >
+                  Use
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div className="flex justify-between items-center mt-5">
+          {current ? (
+            <button
+              onClick={() => setActive(undefined)}
+              disabled={busy}
+              className="text-[12px] text-[var(--color-text-muted)] hover:text-red-400 transition-colors disabled:opacity-50"
+            >
+              Disable (use defaults)
+            </button>
+          ) : (
+            <span />
+          )}
+          <button
+            onClick={onClose}
+            className="px-4 py-2 rounded-lg text-sm border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+          >
+            Done
           </button>
         </div>
       </div>

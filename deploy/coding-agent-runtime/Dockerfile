@@ -60,8 +60,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Resumable /invocations server, OTel config, structured logging. The server
 # runs `claude` directly; Codex still goes through its Mantle launcher script.
 COPY otel-collector-config.yaml log.py main.py ./
-COPY run-codex.sh /app/
-RUN chmod +x /app/run-codex.sh
+COPY run-codex.sh merge-codex-config.py shell-init.sh /app/
+RUN chmod +x /app/run-codex.sh /app/merge-codex-config.py /app/shell-init.sh
+
+# Make the interactive Terminal-tab shell pre-load Bedrock auth for both CLIs so
+# bare `claude`/`codex` skip their login screens (matches the chat experience).
+RUN echo '[ -f /app/shell-init.sh ] && source /app/shell-init.sh' \
+      >> /home/bedrock_agentcore/.bashrc \
+    && chown bedrock_agentcore:bedrock_agentcore /home/bedrock_agentcore/.bashrc
 
 USER bedrock_agentcore
 

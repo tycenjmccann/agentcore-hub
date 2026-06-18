@@ -62,24 +62,15 @@ PYEOF
   export OPENAI_API_KEY="$TOKEN"
 fi
 
-# ── Codex config: explicit OpenAI-compatible provider → Bedrock Mantle ───────
+# ── Codex config: ensure our Bedrock Mantle provider, keep the user's rest ───
 # Persist CODEX_HOME on session storage so recorded sessions (under
-# $CODEX_HOME/sessions) survive microVM stop/restart and can be resumed.
+# $CODEX_HOME/sessions) survive microVM stop/restart and can be resumed, and so
+# a user-uploaded config.toml (MCP servers, profiles) persists here too.
+# merge-codex-config.py guarantees our provider/model wins without clobbering
+# the user's mcp_servers / profiles / prefs.
 export CODEX_HOME="${CODEX_HOME:-$WORKSPACE_DIR/.codex}"
 mkdir -p "$CODEX_HOME"
-cat > "$CODEX_HOME/config.toml" <<EOF
-model = "${MODEL}"
-model_provider = "bedrock-mantle"
-
-[model_providers.bedrock-mantle]
-name = "Amazon Bedrock Mantle (OpenAI-compatible)"
-base_url = "${BASE_URL}"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"
-
-[model_providers.bedrock-mantle.http_headers]
-OpenAI-Project = "${PROJECT}"
-EOF
+python3 /app/merge-codex-config.py "$CODEX_HOME/config.toml" "$MODEL" "$BASE_URL" "$PROJECT"
 
 echo "[codex] base_url=${BASE_URL} model=${MODEL} project=${PROJECT} resume=${RESUME_ID:-no}" >&2
 

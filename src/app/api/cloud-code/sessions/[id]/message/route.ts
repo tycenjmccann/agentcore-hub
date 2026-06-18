@@ -9,8 +9,9 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getSession, putSession } from "@/lib/cloud-code/sessions";
+import { getSession, putSession, DEFAULT_USER_ID } from "@/lib/cloud-code/sessions";
 import { invokeCodingTurn, codingRuntimeConfigured } from "@/lib/cloud-code/runtime";
+import { currentConfigVersion } from "@/lib/cloud-code/config-store";
 import type { CloudCodeTurn } from "@/lib/cloud-code/types";
 
 export const dynamic = "force-dynamic";
@@ -48,6 +49,8 @@ export async function POST(
       cli: session.cli,
       repo: session.repo,
       claudeSessionId: session.claudeSessionId,
+      userId: session.userId || DEFAULT_USER_ID,
+      configVersion: await currentConfigVersion(session.userId || DEFAULT_USER_ID),
       region: request.nextUrl.searchParams.get("region") || undefined,
     });
 

@@ -24,14 +24,17 @@ The OTel collector sidecar (otel-collector-config.yaml) forwards each CLI's
 telemetry to CloudWatch (aws/spans) so every tool call is a trace.
 """
 
+import io
 import json
 import os
 import re
-import shlex
+import shutil
 import socket
 import subprocess
 import time
+import zipfile
 
+import boto3
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -46,6 +49,17 @@ CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
 )
 # A single coding turn can be long; cap so a wedged CLI can't pin the microVM.
 TURN_TIMEOUT_S = int(os.environ.get("TURN_TIMEOUT_S", "1500"))
+
+# Per-user coding-CLI config bundle (MCP servers, skills, custom agents, prefs).
+# The app uploads a zip to s3://{ARTIFACT_BUCKET}/cloud-code/configs/{userId}/
+# {version}.zip; we materialize it into the CLI config dirs on session start.
+ARTIFACT_BUCKET = os.environ.get("ARTIFACT_BUCKET", "")
+CLAUDE_CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
+CODEX_HOME = os.environ.get("CODEX_HOME", os.path.join(WORKSPACE_ROOT, ".codex"))
+# Marker so we only materialize a given (user, version) once per warm microVM.
+_CONFIG_MARKER = os.path.join(WORKSPACE_ROOT, ".config-applied")
+BEDROCK_MANTLE_REGION = os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "openai.gpt-5.5")
 
 _CODING_PROC_NAMES = ("claude", "codex", "node")
 COLLECTOR_BIN = "/usr/bin/otelcol-contrib"
@@ -76,6 +90,70 @@ def _remember_session(claude_session_id: str | None, repo: str | None) -> None:
             json.dump(m, f)
     except OSError as exc:
         logger.warning("session_map_write_failed", extra={"error": str(exc)[:200]})
+
+
+# ─── Per-user config bundle ───────────────────────────────────────────────────
+
+
+def _apply_config_bundle(user_id: str | None, version: str | None) -> None:
+    """Materialize a user's coding-CLI config bundle into the CLI config dirs.
+
+    The bundle is a zip at s3://{ARTIFACT_BUCKET}/cloud-code/configs/{userId}/{version}.zip
+    laid out as `claude/...` (→ CLAUDE_CONFIG_DIR) and `codex/...` (→ CODEX_HOME).
+    Idempotent per warm microVM via a marker file. The user's files land first;
+    run-codex.sh / the launchers then re-assert our Bedrock provider on top, so a
+    user config can add MCP/skills/agents but never break model access.
+    """
+    if not (user_id and version and ARTIFACT_BUCKET):
+        return
+    token = f"{user_id}:{version}"
+    try:
+        with open(_CONFIG_MARKER) as f:
+            if f.read().strip() == token:
+                return  # already applied to this warm VM
+    except OSError:
+        pass
+
+    key = f"cloud-code/configs/{user_id}/{version}.zip"
+    try:
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        obj = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=key)
+        raw = obj["Body"].read()
+    except Exception as exc:  # noqa: BLE001 — missing/forbidden bundle is non-fatal
+        logger.warning("config_bundle_fetch_failed", extra={"key": key, "error": str(exc)[:200]})
+        return
+
+    dests = {"claude": CLAUDE_CONFIG_DIR, "codex": CODEX_HOME}
+    for d in dests.values():
+        os.makedirs(d, exist_ok=True)
+    applied = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            for member in zf.namelist():
+                if member.endswith("/"):
+                    continue
+                top, _, rel = member.partition("/")
+                dest_root = dests.get(top)
+                if not dest_root or not rel:
+                    continue  # ignore anything outside claude/ or codex/
+                # Path-traversal guard.
+                target = os.path.normpath(os.path.join(dest_root, rel))
+                if not target.startswith(os.path.normpath(dest_root) + os.sep):
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(member) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                applied += 1
+    except zipfile.BadZipFile:
+        logger.warning("config_bundle_bad_zip", extra={"key": key})
+        return
+
+    try:
+        with open(_CONFIG_MARKER, "w") as f:
+            f.write(token)
+    except OSError:
+        pass
+    logger.info("config_bundle_applied", extra={"user": user_id, "version": version, "files": applied})
 
 
 # ─── OTel collector sidecar ───────────────────────────────────────────────────
@@ -315,7 +393,8 @@ async def health():
 async def invocations(request: Request):
     """Run one coding turn.
 
-    Payload: { prompt (required), repo?, cli? (claude|codex), claude_session_id? }
+    Payload: { prompt (required), repo?, cli? (claude|codex), claude_session_id?,
+               user_id?, config_version? }
     Returns: { response, claude_session_id, cli, workspace }  (or { error })
     """
     try:
@@ -330,6 +409,8 @@ async def invocations(request: Request):
     cli = (payload.get("cli") or DEFAULT_CLI).lower()
     repo = payload.get("repo")
     claude_session_id = payload.get("claude_session_id")
+    user_id = payload.get("user_id")
+    config_version = payload.get("config_version")
 
     # On resume, recover the repo the conversation was started in (so we land in
     # the same cwd Claude Code scoped the session to) when the caller omits it.
@@ -340,6 +421,8 @@ async def invocations(request: Request):
         {"cli": cli, "repo": repo, "resume": bool(claude_session_id), "prompt_head": prompt[:120]}))
 
     try:
+        # Lay down the user's MCP/skills/agents config before launching a CLI.
+        _apply_config_bundle(user_id, config_version)
         _configure_git()
         try:
             workdir = _ensure_workspace(repo)

@@ -49,6 +49,8 @@ export async function invokeCodingTurn(params: {
   cli: CloudCodeCli;
   repo?: string;
   claudeSessionId?: string;
+  userId?: string;
+  configVersion?: string;
   region?: string;
 }): Promise<CodingTurnResult> {
   if (!CODING_RUNTIME_ARN) {
@@ -62,6 +64,9 @@ export async function invokeCodingTurn(params: {
   };
   if (params.repo) payload.repo = params.repo;
   if (params.claudeSessionId) payload.claude_session_id = params.claudeSessionId;
+  // Per-user config bundle (MCP/skills/agents) the runtime materializes first.
+  if (params.userId) payload.user_id = params.userId;
+  if (params.configVersion) payload.config_version = params.configVersion;
 
   const command = new InvokeAgentRuntimeCommand({
     agentRuntimeArn: CODING_RUNTIME_ARN,

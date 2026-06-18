@@ -133,6 +133,34 @@ aws iam put-role-policy \
   }'
 echo "   ✓ ECR pull access"
 
+# ─── S3 read: per-user coding-CLI config bundles ─────────────────────────────
+# The app uploads a user's .claude/.codex config bundle to
+# s3://<artifact-bucket>/cloud-code/configs/<userId>/...; the runtime fetches it
+# on session start and materializes it into the CLI config dirs.
+ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}}"
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name "ConfigBundleRead" \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [
+      {
+        \"Sid\": \"ConfigBundleObjects\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"s3:GetObject\"],
+        \"Resource\": [\"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/configs/*\"]
+      },
+      {
+        \"Sid\": \"ConfigBundleList\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"s3:ListBucket\"],
+        \"Resource\": [\"arn:aws:s3:::${ARTIFACT_BUCKET}\"],
+        \"Condition\": { \"StringLike\": { \"s3:prefix\": [\"cloud-code/configs/*\"] } }
+      }
+    ]
+  }"
+echo "   ✓ Config bundle read (s3://${ARTIFACT_BUCKET}/cloud-code/configs/*)"
+
 echo ""
 echo "   ⏳ Waiting 10s for IAM propagation..."
 sleep 10

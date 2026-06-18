@@ -106,6 +106,10 @@ def main() -> None:
         "BEDROCK_MANTLE_REGION": os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2"),
         "CODEX_MODEL": os.environ.get("CODEX_MODEL", "openai.gpt-5.5"),
     }
+    # Artifact bucket — where per-user config bundles live; the server fetches
+    # cloud-code/configs/{userId}/{version}.zip and materializes it on turn start.
+    if bucket := os.environ.get("ARTIFACT_BUCKET"):
+        env_vars["ARTIFACT_BUCKET"] = bucket
     # GitHub auth for private repo clone/push (launchers configure git from it).
     if gh_pat := os.environ.get("GITHUB_PAT"):
         env_vars["GITHUB_PAT"] = gh_pat
