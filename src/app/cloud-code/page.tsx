@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check } from "lucide-react";
 import dynamic from "next/dynamic";
 import { sseData } from "@/lib/sse";
+import { MarkdownRenderer } from "@/components/workflow/MarkdownRenderer";
 
 // xterm touches the DOM/window — load only in the browser.
 const ShellTerminal = dynamic(() => import("@/components/cloud-code/ShellTerminal"), { ssr: false });
@@ -328,8 +329,8 @@ export default function CloudCodePage() {
                     <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)] mb-1">
                       {active.cli}
                     </div>
-                    <div className="bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl rounded-tl-sm px-3.5 py-2.5 text-sm whitespace-pre-wrap">
-                      {t.text}
+                    <div className="bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl rounded-tl-sm px-3.5 py-2.5 text-sm">
+                      <MarkdownRenderer content={t.text} />
                     </div>
                   </div>
                 )

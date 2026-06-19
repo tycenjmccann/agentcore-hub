@@ -454,6 +454,7 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
                             stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
     new_session_id: str | None = claude_session_id
     full_text: list[str] = []
+    block_has_text = False  # did the current text block emit anything?
     try:
         for line in proc.stdout:  # line-buffered: yields as claude emits
             line = line.strip()
@@ -468,12 +469,21 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
                 new_session_id = obj["session_id"]
             elif t == "stream_event":
                 ev = obj.get("event", {})
-                if ev.get("type") == "content_block_delta":
+                et = ev.get("type")
+                if et == "content_block_delta":
                     delta = ev.get("delta", {})
                     txt = delta.get("text")  # ignore thinking deltas
                     if txt:
                         full_text.append(txt)
+                        block_has_text = True
                         yield sse({"type": "text", "text": txt})
+                elif et == "content_block_stop" and block_has_text:
+                    # Each text block is a distinct assistant message (often with
+                    # a tool call between them). Separate with a blank line so the
+                    # UI renders paragraphs, not run-on sentences.
+                    block_has_text = False
+                    full_text.append("\n\n")
+                    yield sse({"type": "text", "text": "\n\n"})
             elif t == "result":
                 if not full_text and isinstance(obj.get("result"), str):
                     full_text.append(obj["result"])
