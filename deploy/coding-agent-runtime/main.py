@@ -38,7 +38,7 @@ import zipfile
 import boto3
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from log import get_logger, redact
 
 logger = get_logger("coding-agent-runtime")
@@ -366,23 +366,10 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None) -> dic
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
     os.makedirs(config_dir, exist_ok=True)
 
-    args = ["claude", "--print"]
     # `claude --print` does NOT auto-load a project .mcp.json (needs interactive
-    # approval). Pass it explicitly. --mcp-config takes a variadic <configs...>,
-    # so it must be followed by another flag — never placed right before the
-    # positional prompt, or the prompt gets parsed as a config path.
-    mcp_config = os.path.join(config_dir, ".mcp.json")
-    if os.path.isfile(mcp_config):
-        args += ["--mcp-config", mcp_config]
-    args += [
-        "--dangerously-skip-permissions",
-        "--output-format", "json", "--model", CLAUDE_MODEL,
-        "--max-turns", os.environ.get("MAX_TURNS", "100"),
-    ]
-    if claude_session_id:
-        args += ["--resume", claude_session_id]
-    args.append(prompt)
-
+    # approval). _build_claude_args passes --mcp-config explicitly; it's variadic,
+    # so the positional prompt must come last (appended here).
+    args = _build_claude_args(config_dir, claude_session_id, stream=False) + [prompt]
     env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir}
 
     proc = subprocess.run(args, cwd=workdir, env=env, capture_output=True,
@@ -395,6 +382,83 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None) -> dic
                 "claude_session_id": parsed.get("session_id")}
     except json.JSONDecodeError:
         return {"response": proc.stdout.strip(), "claude_session_id": None}
+
+
+def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: bool) -> list:
+    """Shared argv for a Claude turn. stream=True emits realtime stream-json."""
+    args = ["claude", "--print"]
+    mcp_config = os.path.join(config_dir, ".mcp.json")
+    if os.path.isfile(mcp_config):
+        args += ["--mcp-config", mcp_config]
+    args += ["--dangerously-skip-permissions",
+             "--model", CLAUDE_MODEL, "--max-turns", os.environ.get("MAX_TURNS", "100")]
+    if stream:
+        # --include-partial-messages emits token-level content_block_delta frames
+        # (without it, claude sends whole message blocks → one chunk at the end).
+        args += ["--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+    else:
+        args += ["--output-format", "json"]
+    if claude_session_id:
+        args += ["--resume", claude_session_id]
+    return args
+
+
+def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None):
+    """Generator yielding SSE lines for a Claude turn as it runs.
+
+    Parses claude stream-json line-by-line: assistant text deltas → 'text'
+    events, the final 'result' → a terminal 'done' event carrying the full text
+    and the claude session id (for resume). The UI renders text incrementally.
+    """
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
+    os.makedirs(config_dir, exist_ok=True)
+    args = _build_claude_args(config_dir, claude_session_id, stream=True) + [prompt]
+    env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir}
+
+    def sse(obj: dict) -> str:
+        return f"data: {json.dumps(obj)}\n\n"
+
+    proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+    new_session_id: str | None = claude_session_id
+    full_text: list[str] = []
+    try:
+        for line in proc.stdout:  # line-buffered: yields as claude emits
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = obj.get("type")
+            if t == "system" and obj.get("subtype") == "init" and obj.get("session_id"):
+                new_session_id = obj["session_id"]
+            elif t == "stream_event":
+                ev = obj.get("event", {})
+                if ev.get("type") == "content_block_delta":
+                    delta = ev.get("delta", {})
+                    txt = delta.get("text")  # ignore thinking deltas
+                    if txt:
+                        full_text.append(txt)
+                        yield sse({"type": "text", "text": txt})
+            elif t == "result":
+                if not full_text and isinstance(obj.get("result"), str):
+                    full_text.append(obj["result"])
+                    yield sse({"type": "text", "text": obj["result"]})
+                if obj.get("session_id"):
+                    new_session_id = obj["session_id"]
+        proc.wait(timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        yield sse({"type": "error", "error": str(exc)[:600]})
+        return
+    if proc.returncode not in (0, None):
+        err = (proc.stderr.read() or "")[:600] if proc.stderr else ""
+        yield sse({"type": "error", "error": f"claude exited {proc.returncode}: {err}"})
+        return
+    # Persist {claude_session_id → repo} so a later resume recovers the cwd.
+    _remember_session(new_session_id, repo)
+    yield sse({"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id})
 
 
 def _run_codex(prompt: str, workdir: str, codex_session_id: str | None) -> dict:
@@ -493,6 +557,7 @@ async def invocations(request: Request):
     user_id = payload.get("user_id")
     config_version = payload.get("config_version")
     session_id = payload.get("session_id")  # isolates this session's checkout
+    stream = bool(payload.get("stream"))  # SSE incremental output (claude only)
 
     # On resume, recover the repo the conversation was started in (so we land in
     # the same cwd Claude Code scoped the session to) when the caller omits it.
@@ -500,17 +565,30 @@ async def invocations(request: Request):
         repo = _load_session_map().get(claude_session_id, {}).get("repo")
 
     logger.info("turn_start", extra=redact(
-        {"cli": cli, "repo": repo, "resume": bool(claude_session_id), "prompt_head": prompt[:120]}))
+        {"cli": cli, "repo": repo, "resume": bool(claude_session_id),
+         "stream": stream, "prompt_head": prompt[:120]}))
 
+    # Shared setup for both streaming and buffered paths.
     try:
-        # Default gateway MCP tools first, then the user's bundle on top.
         _apply_default_mcp()
         _apply_config_bundle(user_id, config_version)
         _configure_git()
-        try:
-            workdir = _ensure_workspace(repo, session_id)
-        except ValueError as ve:  # bad repo field — caller error, not a 500
-            return JSONResponse({"error": str(ve)}, status_code=400)
+        workdir = _ensure_workspace(repo, session_id)
+    except ValueError as ve:  # bad repo field — caller error, not a 500
+        return JSONResponse({"error": str(ve)}, status_code=400)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("turn_setup_failed", extra={"cli": cli, "error": str(exc)[:600]})
+        return JSONResponse({"error": str(exc)[:600]}, status_code=500)
+
+    # Streaming path (claude): yield SSE as the turn runs. The runtime forwards
+    # an async/sync generator response as text/event-stream through InvokeAgentRuntime.
+    if stream and cli == "claude":
+        return StreamingResponse(
+            _stream_claude(prompt, workdir, claude_session_id, repo),
+            media_type="text/event-stream",
+        )
+
+    try:
         if cli == "codex":
             result = _run_codex(prompt, workdir, claude_session_id)
         elif cli == "claude":

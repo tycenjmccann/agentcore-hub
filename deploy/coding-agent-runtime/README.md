@@ -100,10 +100,16 @@ Response: `{ response, claude_session_id, cli, workspace }` or `{ error }`.
 - Invoke loop, conversation resume (remembers prior turns), clone→edit→commit→push→**real PR**,
   warm `/mnt/workspace` across invokes with auto-recovered cwd, and Codex (GPT-5.5/Mantle) — all green.
 
-## Known gaps / next
+## Streaming
 
-- **Streaming:** turns are request/response today (the response returns when the CLI finishes).
-  Per-tool live streaming → switch the server to a streaming protocol / SSE.
+Claude turns stream token-by-token over SSE. `/invocations` with `stream:true`
+runs `claude --output-format stream-json --include-partial-messages` and the
+server returns a `StreamingResponse` of `data:` frames (`{type:text|done|error}`)
+that AgentCore forwards through `InvokeAgentRuntime` (accept `text/event-stream`).
+The Next.js chat consumes it via the shared SSE reader. See
+[docs/streaming-sse.md](../../docs/streaming-sse.md). Codex stays buffered.
+
+## Known gaps / next
 - **Codex resume:** each Codex turn is independent (no `--resume` wired) — Claude has full resume.
 - **Single-user:** no auth yet. Session records should carry `userId` (hardcode `"default"` now,
   swap for the Cognito `sub` when app-wide SSO lands).

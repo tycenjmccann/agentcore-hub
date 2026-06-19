@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check } from "lucide-react";
 import dynamic from "next/dynamic";
+import { sseData } from "@/lib/sse";
 
 // xterm touches the DOM/window — load only in the browser.
 const ShellTerminal = dynamic(() => import("@/components/cloud-code/ShellTerminal"), { ssr: false });
@@ -97,15 +98,41 @@ export default function CloudCodePage() {
       s ? { ...s, turns: [...s.turns, { role: "user", text: prompt, at: new Date().toISOString() }] } : s
     );
     try {
-      const res = await fetch(`/api/cloud-code/sessions/${active.sessionId}/message`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Turn failed");
-      setActive(data.session);
-      fetchSessions();
+      // Claude streams (SSE); codex is buffered (plain JSON).
+      const canStream = active.cli === "claude";
+      const res = await fetch(
+        `/api/cloud-code/sessions/${active.sessionId}/message${canStream ? "?stream=1" : ""}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }) }
+      );
+
+      if (canStream && res.body && res.headers.get("content-type")?.includes("event-stream")) {
+        // Append a live agent turn and grow it as text frames arrive.
+        setActive((s) =>
+          s ? { ...s, turns: [...s.turns, { role: "agent", text: "", at: new Date().toISOString() }] } : s
+        );
+        let acc = "";
+        // sseData handles the byte/frame plumbing; we own the {type:text|done|error} schema.
+        for await (const data of sseData(res.body)) {
+          let obj: { type?: string; text?: string; response?: string; error?: string };
+          try { obj = JSON.parse(data); } catch { continue; }
+          if (obj.type === "text") acc += obj.text || "";
+          else if (obj.type === "done") acc = obj.response || acc;
+          else if (obj.type === "error") acc += `\n⚠ ${obj.error}`;
+          // Update the last (agent) turn's text in place.
+          setActive((s) => {
+            if (!s) return s;
+            const turns = s.turns.slice();
+            turns[turns.length - 1] = { role: "agent", text: acc, at: turns[turns.length - 1].at };
+            return { ...s, turns };
+          });
+        }
+        fetchSessions();
+      } else {
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Turn failed");
+        setActive(data.session);
+        fetchSessions();
+      }
     } catch (err) {
       flash((err as Error).message);
       setActive((s) =>

@@ -51,3 +51,14 @@ Decisions:
 - Use Tailwind responsive prefixes (`md:`) so desktop layout is unchanged.
 - **[CONFIRM]** the global app shell/Sidebar on mobile is out of scope here; if
   the hub nav itself blocks the view, that's the full-app pass.
+
+## Streaming chat (SSE) + shared reader
+
+- Claude chat now streams token-by-token; Codex stays buffered (no stream-json
+  resume story yet). `--include-partial-messages` is required for token deltas.
+- Best-practice call: extracted the SSE byte/frame plumbing into ONE tested
+  helper `src/lib/sse.ts` (`sseData`), and routed ALL consumers through it —
+  Cloud Code chat, the message-route relay, and the existing agent-detail/builder
+  streamers (`agentcore-stream.ts`). Event *schemas* stay per-feature (different
+  upstreams); only the fragile transport is shared. 7 edge-case unit tests pass.
+- Docs: docs/streaming-sse.md (new), coding-runtime README updated.

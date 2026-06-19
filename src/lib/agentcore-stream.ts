@@ -1,7 +1,10 @@
 // AgentCore streaming client - ported from sample-amazon-bedrock-agentcore-fullstack-webapp
-// Handles SSE streaming for agent invocations
+// Handles SSE streaming for agent invocations.
+// SSE byte/frame plumbing is shared via sseData (src/lib/sse.ts); this file owns
+// only the agent event-schema handling.
 
 import { getClientRegion } from "@/lib/client-cache";
+import { sseData } from "@/lib/sse";
 
 export interface TraceEvent {
   type: "trace";
@@ -86,86 +89,50 @@ export async function streamAgentInvocation(request: StreamRequest): Promise<str
     throw new Error("No response body received");
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
   let fullResponse = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      if (line.startsWith("data: ")) {
-        const data = line.slice(6);
-        if (data === "[DONE]") {
-          request.onDone?.(fullResponse);
-          return fullResponse;
-        }
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.type === "text" && parsed.content) {
-            fullResponse += parsed.content;
-            request.onChunk(parsed.content);
-          } else if (parsed.type === "trace") {
-            request.onTrace?.(parsed as TraceEvent);
-          } else if (parsed.type === "done") {
-            request.onDone?.(fullResponse);
-            return fullResponse;
-          } else if (parsed.event?.contentBlockDelta?.delta?.text) {
-            // AgentCore Runtime async generator yield format
-            const text = parsed.event.contentBlockDelta.delta.text;
-            fullResponse += text;
-            request.onChunk(text);
-          } else if (parsed.event?.contentBlockStart?.start?.toolUse) {
-            // Tool use event from async generator yield
-            const toolName = parsed.event.contentBlockStart.start.toolUse.name;
-            request.onTrace?.({
-              type: "trace",
-              event: "tool_start",
-              name: toolName,
-              timestamp: new Date().toISOString(),
-            });
-          } else if (typeof parsed === "string") {
-            fullResponse += parsed;
-            request.onChunk(parsed);
-          } else {
-            // Unknown JSON structure — show raw so it's never silently lost
-            const raw = typeof parsed === "object" ? JSON.stringify(parsed, null, 2) : String(parsed);
-            fullResponse += raw;
-            request.onChunk(raw);
-          }
-        } catch {
-          // Not JSON - treat as plain text chunk
-          fullResponse += data;
-          request.onChunk(data);
-        }
-      }
+  // sseData owns the byte→frame plumbing; this loop owns the agent event schema.
+  for await (const data of sseData(response.body)) {
+    if (data === "[DONE]") {
+      request.onDone?.(fullResponse);
+      return fullResponse;
     }
-  }
-
-  // Handle remaining buffer
-  if (buffer.startsWith("data: ")) {
-    const data = buffer.slice(6);
-    if (data && data !== "[DONE]") {
-      try {
-        const parsed = JSON.parse(data);
-        if (parsed.type === "text" && parsed.content) {
-          fullResponse += parsed.content;
-          request.onChunk(parsed.content);
-        } else if (parsed.event?.contentBlockDelta?.delta?.text) {
-          const text = parsed.event.contentBlockDelta.delta.text;
-          fullResponse += text;
-          request.onChunk(text);
-        }
-      } catch {
-        fullResponse += data;
-        request.onChunk(data);
-      }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      fullResponse += data; // not JSON — plain text chunk
+      request.onChunk(data);
+      continue;
+    }
+    const p = parsed as Record<string, unknown> & { event?: Record<string, unknown> };
+    const ev = p.event as { contentBlockDelta?: { delta?: { text?: string } }; contentBlockStart?: { start?: { toolUse?: { name?: string } } } } | undefined;
+    if (p.type === "text" && p.content) {
+      fullResponse += p.content as string;
+      request.onChunk(p.content as string);
+    } else if (p.type === "trace") {
+      request.onTrace?.(p as unknown as TraceEvent);
+    } else if (p.type === "done") {
+      request.onDone?.(fullResponse);
+      return fullResponse;
+    } else if (ev?.contentBlockDelta?.delta?.text) {
+      const text = ev.contentBlockDelta.delta.text;
+      fullResponse += text;
+      request.onChunk(text);
+    } else if (ev?.contentBlockStart?.start?.toolUse) {
+      request.onTrace?.({
+        type: "trace",
+        event: "tool_start",
+        name: ev.contentBlockStart.start.toolUse.name,
+        timestamp: new Date().toISOString(),
+      });
+    } else if (typeof parsed === "string") {
+      fullResponse += parsed;
+      request.onChunk(parsed);
+    } else {
+      const raw = JSON.stringify(parsed, null, 2);
+      fullResponse += raw;
+      request.onChunk(raw);
     }
   }
 
@@ -198,42 +165,27 @@ export async function streamBuilderChat(request: BuilderStreamRequest): Promise<
     throw new Error("No response body received");
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
   let fullResponse = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      if (line.startsWith("data: ")) {
-        const data = line.slice(6);
-        if (data === "[DONE]") {
-          request.onDone?.(fullResponse);
-          return fullResponse;
-        }
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.type === "text" && parsed.content) {
-            fullResponse += parsed.content;
-            request.onChunk(parsed.content);
-          } else if (parsed.type === "config" && parsed.content) {
-            request.onConfig?.(parsed.content as HarnessConfig);
-          } else if (parsed.type === "done") {
-            request.onDone?.(fullResponse);
-            return fullResponse;
-          }
-        } catch {
-          fullResponse += data;
-          request.onChunk(data);
-        }
+  for await (const data of sseData(response.body)) {
+    if (data === "[DONE]") {
+      request.onDone?.(fullResponse);
+      return fullResponse;
+    }
+    try {
+      const parsed = JSON.parse(data) as { type?: string; content?: unknown };
+      if (parsed.type === "text" && parsed.content) {
+        fullResponse += parsed.content as string;
+        request.onChunk(parsed.content as string);
+      } else if (parsed.type === "config" && parsed.content) {
+        request.onConfig?.(parsed.content as HarnessConfig);
+      } else if (parsed.type === "done") {
+        request.onDone?.(fullResponse);
+        return fullResponse;
       }
+    } catch {
+      fullResponse += data;
+      request.onChunk(data);
     }
   }
 

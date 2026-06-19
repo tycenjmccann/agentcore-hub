@@ -10,8 +10,9 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { getSession, putSession, DEFAULT_USER_ID } from "@/lib/cloud-code/sessions";
-import { invokeCodingTurn, codingRuntimeConfigured } from "@/lib/cloud-code/runtime";
+import { invokeCodingTurn, invokeCodingTurnStream, codingRuntimeConfigured } from "@/lib/cloud-code/runtime";
 import { currentConfigVersion } from "@/lib/cloud-code/config-store";
+import { sseData } from "@/lib/sse";
 import type { CloudCodeTurn } from "@/lib/cloud-code/types";
 
 export const dynamic = "force-dynamic";
@@ -41,35 +42,84 @@ export async function POST(
   }
 
   const userTurn: CloudCodeTurn = { role: "user", text: prompt, at: new Date().toISOString() };
+  const wantStream =
+    request.nextUrl.searchParams.get("stream") === "1" && session.cli === "claude";
+  const userId = session.userId || DEFAULT_USER_ID;
+  const configVersion = await currentConfigVersion(userId);
+  const region = request.nextUrl.searchParams.get("region") || undefined;
 
-  try {
-    const result = await invokeCodingTurn({
-      sessionId: session.sessionId,
-      prompt,
-      cli: session.cli,
-      repo: session.repo,
-      claudeSessionId: session.claudeSessionId,
-      userId: session.userId || DEFAULT_USER_ID,
-      configVersion: await currentConfigVersion(session.userId || DEFAULT_USER_ID),
-      region: request.nextUrl.searchParams.get("region") || undefined,
+  // ── Streaming path (claude): relay SSE, persist on the terminal 'done' frame.
+  if (wantStream) {
+    let upstream: ReadableStream<Uint8Array>;
+    try {
+      upstream = await invokeCodingTurnStream({
+        sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
+        claudeSessionId: session.claudeSessionId, userId, configVersion, region,
+      });
+    } catch (err) {
+      return NextResponse.json({ error: (err as Error).message }, { status: 502 });
+    }
+
+    const enc = new TextEncoder();
+    let fullText = "";
+
+    const out = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        try {
+          // sseData parses the upstream frames; we tee text/done to persist and
+          // relay each frame to the browser verbatim.
+          for await (const json of sseData(upstream)) {
+            let obj: Record<string, unknown>;
+            try { obj = JSON.parse(json); } catch { continue; }
+            if (obj.type === "text") {
+              fullText += String(obj.text || "");
+            } else if (obj.type === "done") {
+              if (obj.claude_session_id) session.claudeSessionId = String(obj.claude_session_id);
+              fullText = String(obj.response || fullText);
+            }
+            controller.enqueue(enc.encode(`data: ${json}\n\n`));
+          }
+          // Persist the completed turn.
+          session.turns.push(userTurn, { role: "agent", text: fullText, at: new Date().toISOString() });
+          if (session.title === "New session") session.title = prompt.slice(0, 80);
+          session.updatedAt = new Date().toISOString();
+          await putSession(session).catch(() => {});
+        } catch (err) {
+          controller.enqueue(enc.encode(`data: ${JSON.stringify({ type: "error", error: (err as Error).message })}\n\n`));
+          session.turns.push(userTurn);
+          session.updatedAt = new Date().toISOString();
+          await putSession(session).catch(() => {});
+        } finally {
+          controller.close();
+        }
+      },
     });
 
-    const agentTurn: CloudCodeTurn = {
-      role: "agent",
-      text: result.response,
-      at: new Date().toISOString(),
-    };
+    return new Response(out, {
+      headers: {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+      },
+    });
+  }
 
+  // ── Buffered path (codex, or stream not requested).
+  try {
+    const result = await invokeCodingTurn({
+      sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
+      claudeSessionId: session.claudeSessionId, userId, configVersion, region,
+    });
+
+    const agentTurn: CloudCodeTurn = { role: "agent", text: result.response, at: new Date().toISOString() };
     session.turns.push(userTurn, agentTurn);
     if (result.claudeSessionId) session.claudeSessionId = result.claudeSessionId;
-    // First user message becomes the title if it's still the default.
     if (session.title === "New session") session.title = prompt.slice(0, 80);
     session.updatedAt = new Date().toISOString();
     await putSession(session);
 
     return NextResponse.json({ reply: agentTurn, session });
   } catch (err) {
-    // Persist the user turn even on failure so the conversation isn't lost.
     session.turns.push(userTurn);
     session.updatedAt = new Date().toISOString();
     await putSession(session).catch(() => {});

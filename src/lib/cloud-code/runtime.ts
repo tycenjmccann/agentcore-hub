@@ -100,3 +100,49 @@ export async function invokeCodingTurn(params: {
     workspace: (parsed.workspace as string) || undefined,
   };
 }
+
+/**
+ * Streaming variant: returns the runtime's raw text/event-stream body so the
+ * caller can relay SSE to the browser. The runtime emits `data: {type:text|done|error}`
+ * frames as the Claude turn runs. Claude only — codex stays buffered.
+ */
+export async function invokeCodingTurnStream(params: {
+  sessionId: string;
+  prompt: string;
+  cli: CloudCodeCli;
+  repo?: string;
+  claudeSessionId?: string;
+  userId?: string;
+  configVersion?: string;
+  region?: string;
+}): Promise<ReadableStream<Uint8Array>> {
+  if (!CODING_RUNTIME_ARN) {
+    throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
+  }
+  const region = params.region || REGION;
+
+  const payload: Record<string, unknown> = {
+    prompt: params.prompt,
+    cli: params.cli,
+    session_id: params.sessionId,
+    stream: true,
+  };
+  if (params.repo) payload.repo = params.repo;
+  if (params.claudeSessionId) payload.claude_session_id = params.claudeSessionId;
+  if (params.userId) payload.user_id = params.userId;
+  if (params.configVersion) payload.config_version = params.configVersion;
+
+  const command = new InvokeAgentRuntimeCommand({
+    agentRuntimeArn: CODING_RUNTIME_ARN,
+    runtimeSessionId: params.sessionId,
+    payload: new TextEncoder().encode(JSON.stringify(payload)),
+    contentType: "application/json",
+    accept: "text/event-stream",
+  });
+
+  const res = await client(region).send(command);
+  // res.response is a stream (SdkStream). Expose it as a web ReadableStream.
+  const r = res.response as unknown as { transformToWebStream?: () => ReadableStream<Uint8Array> };
+  if (r?.transformToWebStream) return r.transformToWebStream();
+  throw new Error("runtime did not return a stream");
+}
