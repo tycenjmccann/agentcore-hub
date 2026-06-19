@@ -55,43 +55,37 @@ export async function localTranscriptPath(cwd: string, sessionId: string): Promi
 
 /**
  * Write a pulled cloud transcript to the local project slug so `claude --resume`
- * picks it up. Guards against blind data loss (your round-trip concern): if a
- * local copy is NEWER than the cloud's was when ported, the user kept working
- * locally too — refuse unless force. Returns the written path.
+ * picks it up. The cloud copy IS the canonical latest after a round trip (it's
+ * this same session, grown), so we always overwrite the stale local file — that's
+ * the whole point. We back the old one up to `<id>.jsonl.bak-<stamp>` first so a
+ * divergent local branch (rare: you also kept working locally) is recoverable.
+ * Returns the written path + any backup made.
  */
 export async function installLocalTranscript(
   cwd: string,
   sessionId: string,
   data: Buffer | Uint8Array,
-  opts: { force?: boolean } = {}
-): Promise<{ path: string; overwrote: boolean }> {
+  opts: { force?: boolean; stamp?: string } = {}
+): Promise<{ path: string; overwrote: boolean; backup?: string }> {
   const dest = await localTranscriptPath(cwd, sessionId);
+  await mkdir(path.dirname(dest), { recursive: true });
+
   let overwrote = false;
+  let backup: string | undefined;
   try {
-    const cur = await stat(dest);
+    const existing = await readFile(dest);
     overwrote = true;
-    if (!opts.force) {
-      // Cloud transcript is the canonical latest after a round trip. We only
-      // block if the local file looks independently grown (mtime within the
-      // last 2 min suggests active local use, not a stale port copy).
-      const ageMs = Date.now() - cur.mtimeMs;
-      if (ageMs < 120_000) {
-        throw new Error(
-          `local transcript was modified ${Math.round(ageMs / 1000)}s ago — you may have ` +
-            `worked locally too. Re-run with force to overwrite, or back it up first: ${dest}`
-        );
-      }
+    // Only bother backing up if the local copy differs from what we're writing.
+    if (!Buffer.from(existing).equals(Buffer.from(data))) {
+      backup = `${dest}.bak-${opts.stamp || "prev"}`;
+      await writeFile(backup, existing);
     }
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT" && !(e as Error).message.includes("modified")) {
-      // stat failed for a non-missing reason — fall through and try to write.
-    } else if ((e as Error).message?.includes("modified")) {
-      throw e;
-    }
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
-  await mkdir(path.dirname(dest), { recursive: true });
+
   await writeFile(dest, data);
-  return { path: dest, overwrote };
+  return { path: dest, overwrote, backup };
 }
 
 function textFromContent(content: unknown): string {

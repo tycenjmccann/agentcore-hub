@@ -95,7 +95,6 @@ const PULL_TOOL = {
     properties: {
       session: { type: "string", description: "Cloud Code session id (cc-...) or the full session URL." },
       cwd: { type: "string", description: "Project directory to resume into. Defaults to the server cwd." },
-      force: { type: "boolean", description: "Overwrite the local transcript even if it was recently modified." },
     },
     required: ["session"],
   },
@@ -169,7 +168,6 @@ server.setRequestHandler(GetPromptRequestSchema, async (req) => {
 const PullSchema = z.object({
   session: z.string(),
   cwd: z.string().optional(),
-  force: z.boolean().optional(),
 });
 
 async function runPull(rawArgs: unknown) {
@@ -203,8 +201,11 @@ async function runPull(rawArgs: unknown) {
   if (!dl.ok) throw new Error(`transcript download failed: ${dl.status}`);
   const bytes = Buffer.from(await dl.arrayBuffer());
 
-  // 3. write it where `claude --resume` will find it (guarded against clobber).
-  const placed = await installLocalTranscript(cwd, data.claudeSessionId, bytes, { force: args.force });
+  // 3. write it where `claude --resume` will find it. The cloud copy is the
+  //    canonical latest (same session, grown) so we overwrite; a differing local
+  //    copy is backed up to .bak-<stamp> first.
+  const stamp = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
+  const placed = await installLocalTranscript(cwd, data.claudeSessionId, bytes, { stamp });
 
   // 4. pull the cloud's branch home so local code matches the transcript.
   let gitNote = "no branch reported";
@@ -223,8 +224,10 @@ async function runPull(rawArgs: unknown) {
     data.repo ? `Repo: ${data.repo}` : "",
     data.branch ? `Branch: ${gitNote}` : "",
     `Transcript: ${sizeMb} MB → ${placed.path}${placed.overwrote ? " (overwrote local)" : ""}`,
+    placed.backup ? `Prior local copy backed up → ${placed.backup}` : "",
     ``,
-    `Resume locally:`,
+    `Now exit this session and resume the pulled one:`,
+    `  /exit`,
     `  claude --resume ${data.claudeSessionId}`,
   ]
     .filter(Boolean)
@@ -342,7 +345,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       `Open on any device:`,
       link,
       ``,
-      `It will continue from where you left off — no context lost.`,
+      `When you're back at this machine, pull the cloud's work home:`,
+      `  /mcp__port-session__pull ${sid}`,
     ].join("\n");
 
     return { content: [{ type: "text", text: summary }] };
