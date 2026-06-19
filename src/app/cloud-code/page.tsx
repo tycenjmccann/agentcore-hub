@@ -167,7 +167,7 @@ export default function CloudCodePage() {
         <div className="fixed inset-0 z-30 bg-black/50 md:hidden" onClick={() => setSessionsOpen(false)} aria-hidden="true" />
       )}
       {/* Sidebar — session history. Off-canvas drawer on mobile, in-flow on desktop. */}
-      <aside className={`fixed md:static z-40 top-0 left-0 h-full w-72 bg-[var(--color-bg-secondary)] border-r border-[var(--color-border)] flex flex-col flex-shrink-0 transition-transform duration-300 ${sessionsOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"}`}>
+      <aside className={`fixed md:static z-40 top-0 left-0 h-full w-72 bg-surface-1 md:bg-[var(--color-bg-secondary)] border-r border-[var(--color-border)] flex flex-col flex-shrink-0 transition-transform duration-300 ${sessionsOpen ? "translate-x-0 shadow-2xl" : "-translate-x-full md:translate-x-0"}`}>
         <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--color-border)]">
           <span className="text-sm font-semibold flex items-center gap-2">
             <Cloud className="w-4 h-4 text-brand-400" /> Cloud Code
