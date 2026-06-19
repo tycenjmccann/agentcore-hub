@@ -155,6 +155,12 @@ aws iam put-role-policy \
         ]
       },
       {
+        \"Sid\": \"CloudCodeCheckpointWrite\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"s3:PutObject\"],
+        \"Resource\": [\"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/checkpoint/*\"]
+      },
+      {
         \"Sid\": \"CloudCodeList\",
         \"Effect\": \"Allow\",
         \"Action\": [\"s3:ListBucket\"],

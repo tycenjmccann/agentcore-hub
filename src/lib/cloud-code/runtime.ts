@@ -180,3 +180,48 @@ export async function warmCodingSession(params: {
   });
   await client(region).send(command);
 }
+
+/**
+ * Checkpoint: ask the runtime to upload the session's (now-grown) transcript
+ * back to S3 so the laptop can pull it home and `claude --resume` locally — the
+ * round trip. Returns the S3 key of the uploaded transcript + the cloud branch.
+ */
+export async function checkpointCodingSession(params: {
+  sessionId: string;
+  cli: CloudCodeCli;
+  repo?: string;
+  resumeSessionId?: string; // the conversation's real id (the transcript filename)
+  region?: string;
+}): Promise<{ key?: string; bytes?: number; branch?: string }> {
+  if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
+  const region = params.region || REGION;
+  const payload: Record<string, unknown> = {
+    checkpoint: true,
+    cli: params.cli,
+    session_id: params.sessionId,
+  };
+  if (params.repo) payload.repo = params.repo;
+  if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
+
+  const command = new InvokeAgentRuntimeCommand({
+    agentRuntimeArn: CODING_RUNTIME_ARN,
+    runtimeSessionId: params.sessionId,
+    payload: new TextEncoder().encode(JSON.stringify(payload)),
+    contentType: "application/json",
+    accept: "application/json",
+  });
+  const res = await client(region).send(command);
+  const body = res.response ? await res.response.transformToString() : "";
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    throw new Error(`checkpoint: bad runtime response: ${body.slice(0, 200)}`);
+  }
+  if (parsed.error) throw new Error(String(parsed.error));
+  return {
+    key: parsed.key as string | undefined,
+    bytes: parsed.bytes as number | undefined,
+    branch: parsed.branch as string | undefined,
+  };
+}

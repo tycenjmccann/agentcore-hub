@@ -71,3 +71,24 @@ export async function commitAndPush(
   await git(cwd, ["push", "--no-verify", "-u", "origin", target]);
   return { branch: target, pushed: true, committed };
 }
+
+/**
+ * Pull the cloud's work home: fetch + check out the branch, fast-forward to the
+ * cloud's commits. Best-effort and non-destructive — if the local tree is dirty
+ * or diverged we report it rather than clobber. Returns a status note.
+ */
+export async function pullBranch(cwd: string, branch: string): Promise<string> {
+  const status = await git(cwd, ["status", "--porcelain"]);
+  await git(cwd, ["fetch", "origin", branch]);
+  if (status.length > 0) {
+    // Don't risk local uncommitted work — just fetch and tell the user.
+    return `local tree is dirty; fetched origin/${branch} but did NOT check out. Stash/commit, then \`git checkout ${branch} && git pull\`.`;
+  }
+  await git(cwd, ["checkout", branch]);
+  try {
+    await git(cwd, ["merge", "--ff-only", `origin/${branch}`]);
+    return `pulled origin/${branch} (fast-forward).`;
+  } catch {
+    return `on ${branch}, but it diverged from origin/${branch}; resolve manually (\`git pull\`).`;
+  }
+}

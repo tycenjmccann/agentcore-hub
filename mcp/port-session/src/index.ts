@@ -27,8 +27,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
-import { readState, commitAndPush } from "./git.js";
-import { newestTranscript, sessionIdForTranscript } from "./transcript.js";
+import { readState, commitAndPush, pullBranch } from "./git.js";
+import { newestTranscript, sessionIdForTranscript, installLocalTranscript } from "./transcript.js";
 
 const CLOUD_CODE_URL = (process.env.CLOUD_CODE_URL || "").replace(/\/$/, "");
 
@@ -81,7 +81,27 @@ const TOOL = {
   },
 };
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [TOOL] }));
+const PULL_TOOL = {
+  name: "pull_session_from_cloud",
+  description:
+    "Bring a Cloud Code session back to this laptop (the round trip). Asks the " +
+    "cloud to checkpoint the session's transcript, pulls the cloud's branch + " +
+    "the grown transcript down, and places it so `claude --resume <id>` continues " +
+    "locally right where the cloud left off. Use when you're back at your desk " +
+    "after working from your phone. Provide the session id (from the deep link) " +
+    "or the Cloud Code session URL.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      session: { type: "string", description: "Cloud Code session id (cc-...) or the full session URL." },
+      cwd: { type: "string", description: "Project directory to resume into. Defaults to the server cwd." },
+      force: { type: "boolean", description: "Overwrite the local transcript even if it was recently modified." },
+    },
+    required: ["session"],
+  },
+};
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [TOOL, PULL_TOOL] }));
 
 // Slash-command surface: a `port` prompt shows up as
 // /mcp__port-session__port. Selecting it tells Claude to call the tool now.
@@ -99,9 +119,34 @@ const PORT_PROMPT = {
   ],
 };
 
-server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [PORT_PROMPT] }));
+const PULL_PROMPT = {
+  name: "pull",
+  description: "Pull a Cloud Code session back to this laptop (round trip) and resume locally.",
+  arguments: [
+    { name: "session id or URL", description: "The cc-... id or the Cloud Code session link.", required: true },
+  ],
+};
+
+server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [PORT_PROMPT, PULL_PROMPT] }));
 
 server.setRequestHandler(GetPromptRequestSchema, async (req) => {
+  if (req.params.name === "pull") {
+    const v = Object.values((req.params.arguments ?? {}) as Record<string, string>)[0] || "";
+    return {
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text:
+              `Pull my Cloud Code session "${v}" back to this laptop by calling the ` +
+              `pull_session_from_cloud tool now. After it returns, show me the ` +
+              `\`claude --resume\` command to continue locally.`,
+          },
+        },
+      ],
+    };
+  }
   const a = (req.params.arguments ?? {}) as Record<string, string>;
   // The single arg's name is a human label; read it positionally regardless.
   const raw = Object.values(a)[0] || "";
@@ -121,7 +166,80 @@ server.setRequestHandler(GetPromptRequestSchema, async (req) => {
   };
 });
 
+const PullSchema = z.object({
+  session: z.string(),
+  cwd: z.string().optional(),
+  force: z.boolean().optional(),
+});
+
+async function runPull(rawArgs: unknown) {
+  if (!CLOUD_CODE_URL) throw new Error("CLOUD_CODE_URL is not set in the MCP server environment.");
+  const args = PullSchema.parse(rawArgs ?? {});
+  const cwd = args.cwd || process.env.PROJECT_CWD || process.cwd();
+  // Accept a raw id or a full deep link.
+  const m = args.session.match(/cc-[a-f0-9]+/i);
+  const sid = m ? m[0] : args.session.trim();
+
+  // 1. checkpoint: cloud uploads the grown transcript + returns a presigned GET.
+  const res = await fetch(`${CLOUD_CODE_URL}/api/cloud-code/sessions/${sid}/checkpoint`, {
+    method: "POST",
+    signal: AbortSignal.timeout(110_000),
+  });
+  const data = (await res.json().catch(() => ({}))) as {
+    transcriptUrl?: string;
+    claudeSessionId?: string;
+    branch?: string;
+    repo?: string;
+    bytes?: number;
+    error?: string;
+  };
+  if (!res.ok) throw new Error(data.error || `checkpoint returned ${res.status}`);
+  if (!data.transcriptUrl || !data.claudeSessionId) {
+    throw new Error("checkpoint did not return a transcript URL / session id");
+  }
+
+  // 2. download the transcript bytes.
+  const dl = await fetch(data.transcriptUrl, { signal: AbortSignal.timeout(60_000) });
+  if (!dl.ok) throw new Error(`transcript download failed: ${dl.status}`);
+  const bytes = Buffer.from(await dl.arrayBuffer());
+
+  // 3. write it where `claude --resume` will find it (guarded against clobber).
+  const placed = await installLocalTranscript(cwd, data.claudeSessionId, bytes, { force: args.force });
+
+  // 4. pull the cloud's branch home so local code matches the transcript.
+  let gitNote = "no branch reported";
+  if (data.branch) {
+    try {
+      gitNote = await pullBranch(cwd, data.branch);
+    } catch (e) {
+      gitNote = `branch pull failed: ${(e as Error).message}`;
+    }
+  }
+
+  const sizeMb = (bytes.length / 1_048_576).toFixed(1);
+  const summary = [
+    `✅ Pulled session home.`,
+    ``,
+    data.repo ? `Repo: ${data.repo}` : "",
+    data.branch ? `Branch: ${gitNote}` : "",
+    `Transcript: ${sizeMb} MB → ${placed.path}${placed.overwrote ? " (overwrote local)" : ""}`,
+    ``,
+    `Resume locally:`,
+    `  claude --resume ${data.claudeSessionId}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return { content: [{ type: "text", text: summary }] };
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (req.params.name === PULL_TOOL.name) {
+    try {
+      return await runPull(req.params.arguments);
+    } catch (err) {
+      return { isError: true, content: [{ type: "text", text: `Pull failed: ${(err as Error).message}` }] };
+    }
+  }
   if (req.params.name !== TOOL.name) {
     return { isError: true, content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }] };
   }

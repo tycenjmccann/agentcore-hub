@@ -7,7 +7,7 @@
  * For the cloud handoff we only need the human↔assistant thread, so we keep
  * `user` and `assistant` text and drop everything else, then tail it to a budget.
  */
-import { readdir, readFile, stat, realpath } from "node:fs/promises";
+import { readdir, readFile, stat, realpath, mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -46,6 +46,52 @@ export async function newestTranscript(cwd: string): Promise<string | null> {
   );
   withMtime.sort((a, b) => b.m - a.m);
   return path.join(dir, withMtime[0].f);
+}
+
+/** Local path where `claude --resume <sessionId>` expects this session's file. */
+export async function localTranscriptPath(cwd: string, sessionId: string): Promise<string> {
+  return path.join(await projectDirFor(cwd), `${sessionId}.jsonl`);
+}
+
+/**
+ * Write a pulled cloud transcript to the local project slug so `claude --resume`
+ * picks it up. Guards against blind data loss (your round-trip concern): if a
+ * local copy is NEWER than the cloud's was when ported, the user kept working
+ * locally too — refuse unless force. Returns the written path.
+ */
+export async function installLocalTranscript(
+  cwd: string,
+  sessionId: string,
+  data: Buffer | Uint8Array,
+  opts: { force?: boolean } = {}
+): Promise<{ path: string; overwrote: boolean }> {
+  const dest = await localTranscriptPath(cwd, sessionId);
+  let overwrote = false;
+  try {
+    const cur = await stat(dest);
+    overwrote = true;
+    if (!opts.force) {
+      // Cloud transcript is the canonical latest after a round trip. We only
+      // block if the local file looks independently grown (mtime within the
+      // last 2 min suggests active local use, not a stale port copy).
+      const ageMs = Date.now() - cur.mtimeMs;
+      if (ageMs < 120_000) {
+        throw new Error(
+          `local transcript was modified ${Math.round(ageMs / 1000)}s ago — you may have ` +
+            `worked locally too. Re-run with force to overwrite, or back it up first: ${dest}`
+        );
+      }
+    }
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT" && !(e as Error).message.includes("modified")) {
+      // stat failed for a non-missing reason — fall through and try to write.
+    } else if ((e as Error).message?.includes("modified")) {
+      throw e;
+    }
+  }
+  await mkdir(path.dirname(dest), { recursive: true });
+  await writeFile(dest, data);
+  return { path: dest, overwrote };
 }
 
 function textFromContent(content: unknown): string {

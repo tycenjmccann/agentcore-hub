@@ -408,6 +408,37 @@ def _install_resume_transcript(s3_key: str, session_id: str, workdir: str) -> bo
         return False
 
 
+def _checkpoint_transcript(session_id: str, workdir: str) -> dict:
+    """Reverse of install: read the (now-grown) Claude transcript off EFS and
+    upload it to S3 so the laptop can pull it back and `claude --resume` locally.
+
+    The transcript lives at {CLAUDE_CONFIG_DIR}/projects/<slug>/<session_id>.jsonl
+    — the same file the cloud appended to during the session. Returns
+    {key, bytes, branch?} for the caller to presign a GET. The branch (current
+    checkout) lets the laptop pull the cloud's commits before resuming."""
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
+    src = os.path.join(config_dir, "projects", _claude_project_slug(workdir), f"{session_id}.jsonl")
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f"no transcript at {src} (session never resumed on this VM?)")
+    if not ARTIFACT_BUCKET:
+        raise RuntimeError("ARTIFACT_BUCKET not set")
+    key = f"cloud-code/checkpoint/{session_id}/{session_id}.jsonl"
+    with open(src, "rb") as f:
+        data = f.read()
+    s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    s3.put_object(Bucket=ARTIFACT_BUCKET, Key=key, Body=data, ContentType="application/x-ndjson")
+    branch = None
+    try:
+        res = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=workdir,
+                             capture_output=True, text=True, timeout=15)
+        if res.returncode == 0:
+            branch = res.stdout.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    logger.info("checkpoint_uploaded", extra={"session": session_id, "bytes": len(data), "branch": branch})
+    return {"key": key, "bytes": len(data), "branch": branch}
+
+
 def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
     """Return the working dir for this session. If repo given and not yet cloned,
     clone it under the session's own dir (on EFS, so a re-invoke with the same
@@ -661,9 +692,13 @@ async def invocations(request: Request):
     # opening the session later is instant (no prompt runs). Fired by the port
     # route right after the transcript is uploaded.
     warm = bool(payload.get("warm"))
+    # Checkpoint: upload the grown transcript back to S3 so the laptop can pull
+    # the session home (the round-trip / "unpark"). No prompt, no clone needed
+    # beyond locating the existing workspace.
+    checkpoint = bool(payload.get("checkpoint"))
 
     prompt = (payload.get("prompt") or "").strip()
-    if not prompt and not warm:
+    if not prompt and not warm and not checkpoint:
         return JSONResponse({"error": "prompt is required"}, status_code=400)
 
     cli = (payload.get("cli") or DEFAULT_CLI).lower()
@@ -710,6 +745,21 @@ async def invocations(request: Request):
     except Exception as exc:  # noqa: BLE001
         logger.error("turn_setup_failed", extra={"cli": cli, "error": str(exc)[:600]})
         return JSONResponse({"error": str(exc)[:600]}, status_code=500)
+
+    # Checkpoint: upload the grown transcript back to S3 for the laptop to pull.
+    # The session id to checkpoint is the resume id (the conversation's real id).
+    if checkpoint:
+        cp_id = resume_session_id or claude_session_id
+        if not cp_id:
+            return JSONResponse({"error": "checkpoint needs a session id"}, status_code=400)
+        try:
+            info = _checkpoint_transcript(cp_id, workdir)
+        except FileNotFoundError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("checkpoint_failed", extra={"error": str(exc)[:600]})
+            return JSONResponse({"error": str(exc)[:600]}, status_code=500)
+        return JSONResponse({"checkpointed": True, **info})
 
     # Pre-warm done: workspace cloned, branch checked out, transcript installed.
     # No CLI runs — the first real turn (on open) will be instant + warm.
