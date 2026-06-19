@@ -4,6 +4,46 @@ Architectural decisions and their rationale. Newest first.
 
 ---
 
+## DL-011: Port / pull — move a live coding session laptop↔cloud
+
+**Date:** 2026-06-19
+**Status:** IMPLEMENTED
+**Context:** Cloud Code (DL-010) lets a session run server-side, but starting one
+meant a cold cloud session. Wanted to hand off an *in-flight local* Claude Code
+session to the cloud (close the laptop mid-task, resume on the train) and bring
+it back later — losslessly.
+
+**Decisions:**
+- **Native `claude --resume`, not a text summary.** Ship the *raw* transcript
+  (`~/.claude/projects/<slug>/<id>.jsonl`) to S3; the runtime drops it at the
+  workspace's project slug and runs `claude --resume <id>`. Same session id, full
+  history, no size cap. (A first cut shipped an extracted text seed — replaced;
+  the user correctly pushed for native resume.)
+- **Slug rule, verified empirically:** `re.sub(r'[^a-zA-Z0-9]','-', realpath(cwd))`
+  — Claude slugifies the *real* path, every non-alphanumeric → `-`. `--resume`
+  404s if it doesn't match exactly (early bug: only `/`→`-`, broke on spaces/dots).
+- **Local stdio MCP** (`mcp/port-session/`), not a remote one — it needs laptop
+  git + filesystem access. Separate package, excluded from the app tsconfig.
+- **Transport:** presigned S3 PUT (port) / GET (pull) so the 16–20 MB transcript
+  never goes through the app or hits the DynamoDB item-size cap.
+- **Pre-warm at port:** a `warm` invoke (clone + checkout + install, no CLI run)
+  fires right after upload, so opening the link is instant.
+- **Round trip (pull):** a `checkpoint` invoke uploads the *grown* transcript
+  back; the laptop overwrites its stale copy (cloud is canonical) — backing up a
+  differing prior copy to `.bak-<stamp>`. Skips a dirty local tree.
+- **View persists:** `defaultView` (chat|terminal) on the session row so a sidebar
+  tap reopens the right surface; terminal auto-runs `claude --resume` in the PTY.
+- **Account guard:** `EXPECTED_ACCOUNT_ID` (in gitignored `.env.local`, sourced by
+  config.sh + deploy.py) refuses wrong-account deploys, after a duplicate stack
+  got created in the wrong AWS account.
+
+**Open follow-ups:** Claude-only (Codex `thread_id` resume not wired); no auth on
+port/checkpoint endpoints + presigned URLs yet (tighten before public/multi-user).
+
+See `mcp/port-session/README.md`, `deploy/coding-agent-runtime/{README,DECISIONS}.md`.
+
+---
+
 ## DL-010: Cloud Code — cloud-hosted coding agent (separate from the fleet)
 
 **Date:** 2026-06-18

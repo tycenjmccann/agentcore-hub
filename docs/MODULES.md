@@ -182,7 +182,20 @@ conversational.
   Codex buffered). See [streaming-sse.md](./streaming-sse.md).
 - `/sessions/[id]/shell` — mint a SigV4-presigned `wss://` URL; the browser
   connects directly to the runtime PTY (App Runner does not proxy it).
+- `/sessions/port` — "port to cloud" handoff: create a session + presigned S3 PUT
+  for the laptop transcript (see port-session MCP below).
+- `/sessions/[id]/warm` — pre-warm the microVM (clone + checkout + install
+  transcript) so a ported session opens instantly.
+- `/sessions/[id]/checkpoint` — round-trip return leg: ask the runtime to upload
+  the grown transcript back to S3, return a presigned GET for the laptop to pull.
 - `/config` — per-user CLI config bundle: GET list / POST upload→S3 / PUT set-current.
+
+**Port / pull MCP** — `mcp/port-session/` (standalone local stdio MCP, its own
+package; excluded from the app tsconfig). Moves a live session laptop↔cloud:
+`port_session_to_cloud` (commit+push, ship the raw `.jsonl` to S3, native
+`claude --resume` in the cloud) and `pull_session_from_cloud` (checkpoint the
+grown transcript home, `claude --resume` locally). Same session id both ways.
+See [mcp/port-session/README.md](../mcp/port-session/README.md).
 
 **Lib**
 - `src/lib/cloud-code/{types,sessions,runtime,config-store,shell-protocol}.ts`
@@ -205,8 +218,10 @@ conversational.
 
 **DynamoDB tables**
 - `agentcore-hub-cloud-code-sessions` — one row per session (turns, cli, repo,
-  claudeSessionId, userId); also holds `config:{userId}` rows for config-bundle
-  metadata. Single-user today (`userId:"default"`; swap for the Cognito sub).
+  claudeSessionId, userId, `defaultView` chat|terminal, and for ported sessions
+  `branch` + `resumeTranscriptKey` + `pendingSeed`); also holds `config:{userId}`
+  rows for config-bundle metadata. Single-user today (`userId:"default"`; swap
+  for the Cognito sub).
 
 **App env** (App Runner) — `CODING_AGENT_RUNTIME_ARN`, `CLOUD_CODE_TABLE`,
 `MCP_GATEWAY_URL`; instance role needs `bedrock-agentcore:InvokeAgentRuntime` +
@@ -214,7 +229,7 @@ conversational.
 
 **Removing the module**
 - Delete the `/cloud-code` nav entry tagged `module: "cloud-code"` in `src/config/modules.ts`
-- `rm -rf src/app/cloud-code src/app/api/cloud-code src/lib/cloud-code src/components/cloud-code`
+- `rm -rf src/app/cloud-code src/app/api/cloud-code src/lib/cloud-code src/components/cloud-code mcp/port-session`
 - Optionally tear down the runtime (`deploy/coding-agent-runtime/`), the
   `agentcore-hub-cloud-code-sessions` table, and the VPC/EFS stack
   (`agentcore-hub-coding-vpc-efs`). `src/lib/sse.ts` is shared — keep it.

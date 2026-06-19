@@ -88,12 +88,32 @@ python3 deploy/coding-agent-runtime/invoke.py --cli codex --repo owner/name "...
 
 | Field | Required | Notes |
 |---|---|---|
-| `prompt` | yes | The task / message for this turn |
+| `prompt` | yes* | The task / message for this turn (*not required when `warm` or `checkpoint`) |
 | `repo` | no | `owner/name` or clone URL. Cloned on first turn; recovered from the session map on resume |
 | `cli` | no | `claude` (default) or `codex` |
 | `claude_session_id` | no | From a prior turn's response → resumes that Claude Code conversation |
+| `session_id` | no | runtimeSessionId — isolates this session's checkout under `/mnt/efs/sessions/<id>` |
+| `stream` | no | `true` → SSE token stream (claude only) |
+| `branch` | no | `git fetch + checkout` this branch before the turn (the ported in-flight branch) |
+| `resume_transcript` | no | S3 key of a ported `.jsonl`. Installed at the cwd slug → native `claude --resume` |
+| `resume_session_id` | no | The conversation id inside that transcript (its filename) |
+| `warm` | no | Setup-only: clone + checkout + install transcript, **no CLI run**. Pre-warms the microVM at port time |
+| `checkpoint` | no | Upload the grown transcript back to S3 (the return leg). Returns `{key, bytes, branch}` |
 
-Response: `{ response, claude_session_id, cli, workspace }` or `{ error }`.
+Response: `{ response, claude_session_id, cli, workspace }`, or for the
+setup-only modes `{ warmed, workspace }` / `{ checkpointed, key, bytes, branch }`,
+or `{ error }`.
+
+### Port / pull round trip
+
+The `port-session` MCP (see [mcp/port-session](../../mcp/port-session/README.md))
+drives this for a laptop↔cloud handoff:
+- **port** ships the raw transcript to `s3://<bucket>/cloud-code/resume/<sid>/…`,
+  then `warm` pre-clones; the first turn passes `resume_transcript` + `branch` for
+  a lossless `claude --resume`.
+- **pull** calls `checkpoint` → the runtime uploads the now-grown transcript to
+  `…/cloud-code/checkpoint/<sid>/…`; the laptop downloads it and resumes locally.
+- Slug rule (must match Claude's): `re.sub(r'[^a-zA-Z0-9]','-', realpath(cwd))`.
 
 ## Verified
 
