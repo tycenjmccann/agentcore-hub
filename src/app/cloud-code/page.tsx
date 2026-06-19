@@ -408,7 +408,7 @@ function NewSessionModal({
       role="presentation"
     >
       <div
-        className="w-full max-w-md bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl p-6"
+        className="w-full max-w-md bg-surface-1 border border-[var(--color-border)] rounded-xl p-6 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-labelledby="cc-new-title"
@@ -531,7 +531,7 @@ function ConfigModal({ onClose, onToast }: { onClose: () => void; onToast: (m: s
   return (
     <div className="fixed inset-0 z-[200] grid place-items-center p-4 bg-black/60" onClick={onClose} role="presentation">
       <div
-        className="w-full max-w-lg bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl p-6"
+        className="w-full max-w-lg bg-surface-1 border border-[var(--color-border)] rounded-xl p-6 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-labelledby="cc-config-title"
