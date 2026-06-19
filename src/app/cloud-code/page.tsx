@@ -36,6 +36,7 @@ export default function CloudCodePage() {
   const [view, setView] = useState<"chat" | "terminal">("chat");
   const [sessionsOpen, setSessionsOpen] = useState(false); // mobile session drawer
   const streamEnd = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const fetchSessions = useCallback(async () => {
     const res = await fetch("/api/cloud-code/sessions");
@@ -120,6 +121,8 @@ export default function CloudCodePage() {
       );
     } finally {
       setSending(false);
+      // Re-focus the box so you can keep typing without clicking back in.
+      requestAnimationFrame(() => inputRef.current?.focus());
     }
   };
 
@@ -315,6 +318,7 @@ export default function CloudCodePage() {
             <div className="px-5 py-3.5 border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
               <div className="flex items-end gap-2 bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] rounded-xl px-3.5 py-2">
                 <textarea
+                  ref={inputRef}
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
                   onKeyDown={(e) => {
@@ -324,9 +328,9 @@ export default function CloudCodePage() {
                     }
                   }}
                   rows={1}
-                  placeholder="Give the next task…"
-                  disabled={sending}
-                  className="flex-1 bg-transparent resize-none outline-none text-sm max-h-32 disabled:opacity-50"
+                  placeholder={sending ? "Working… (you can queue your next message)" : "Give the next task…"}
+                  autoFocus
+                  className="flex-1 bg-transparent resize-none outline-none text-sm max-h-32"
                 />
                 <button
                   onClick={send}
