@@ -77,18 +77,34 @@ def wait_until_ready(control, runtime_id: str, timeout_s: int = 600) -> None:
     fail(f"timed out waiting for READY (last status={status})")
 
 
-def _load_efs_config() -> None:
-    """Source efs.config (written by setup-coding-efs.sh) into the environment
-    so the caller doesn't have to `source` it manually."""
-    cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "efs.config")
-    if not os.path.exists(cfg):
+def _load_env_file(path: str, prefix: str = "") -> None:
+    """Load KEY=VALUE / `export KEY=VALUE` lines from a dotenv-style file into the
+    environment (without overwriting anything already set). Used for efs.config and
+    .env.local so a deploy never silently drops GITHUB_PAT / ARTIFACT_BUCKET / role
+    just because the caller forgot to `source` first."""
+    if not os.path.exists(path):
         return
-    with open(cfg) as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("export "):
-                k, _, v = line[len("export "):].partition("=")
-                os.environ.setdefault(k.strip(), v.strip().strip('"'))
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith(prefix):
+                line = line[len(prefix):]
+            k, sep, v = line.partition("=")
+            if not sep:
+                continue
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def _load_efs_config() -> None:
+    """Source efs.config (VPC/EFS ids) AND repo .env.local (PAT, bucket, role,
+    gateway) so a bare `python deploy.py` has the full env, same as the shell
+    scripts that `source config.sh`."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    _load_env_file(os.path.join(here, "efs.config"), prefix="export ")
+    # .env.local lives at the repo root (deploy/coding-agent-runtime/ → ../../).
+    _load_env_file(os.path.abspath(os.path.join(here, "..", "..", ".env.local")))
 
 
 def main() -> None:
