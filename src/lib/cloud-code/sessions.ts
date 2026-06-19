@@ -71,6 +71,9 @@ export async function listSessions(
   } while (lastKey);
 
   return items
+    // Exclude non-session rows that share this table (e.g. config:{userId}
+    // metadata written by the config-bundle store) — they have no turns/cli.
+    .filter((s) => !String(s.sessionId).startsWith("config:") && s.cli)
     .filter((s) => (s.userId || DEFAULT_USER_ID) === userId)
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
     .map((s) => ({

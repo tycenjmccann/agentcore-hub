@@ -168,15 +168,45 @@ def _apply_config_bundle(user_id: str | None, version: str | None) -> None:
     run-codex.sh / the launchers then re-assert our Bedrock provider on top, so a
     user config can add MCP/skills/agents but never break model access.
     """
-    if not (user_id and version and ARTIFACT_BUCKET):
+    # The marker records {token, files[]} of the last applied bundle so we can
+    # (a) skip re-applying the same one and (b) cleanly remove exactly those
+    # files when the user disables their bundle (version unset).
+    def _read_marker() -> dict:
+        try:
+            with open(_CONFIG_MARKER) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _remove_applied(files: list) -> None:
+        for rel in files:
+            try:
+                os.remove(rel)
+            except OSError:
+                pass
+
+    # Disable path: no version selected → strip any previously-applied bundle
+    # files from the persistent EFS config dirs so defaults truly return.
+    if not version:
+        prev = _read_marker()
+        if prev.get("files"):
+            _remove_applied(prev["files"])
+            try:
+                os.remove(_CONFIG_MARKER)
+            except OSError:
+                pass
+            logger.info("config_bundle_cleared", extra={"removed": len(prev["files"])})
         return
+    if not (user_id and ARTIFACT_BUCKET):
+        return
+
     token = f"{user_id}:{version}"
-    try:
-        with open(_CONFIG_MARKER) as f:
-            if f.read().strip() == token:
-                return  # already applied to this warm VM
-    except OSError:
-        pass
+    prev = _read_marker()
+    if prev.get("token") == token:
+        return  # already applied to this warm VM
+    # Switching versions/disabling → clear the previous bundle's files first.
+    if prev.get("files"):
+        _remove_applied(prev["files"])
 
     key = f"cloud-code/configs/{user_id}/{version}.zip"
     try:
@@ -190,7 +220,7 @@ def _apply_config_bundle(user_id: str | None, version: str | None) -> None:
     dests = {"claude": CLAUDE_CONFIG_DIR, "codex": CODEX_HOME}
     for d in dests.values():
         os.makedirs(d, exist_ok=True)
-    applied = 0
+    applied_paths: list = []
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
             for member in zf.namelist():
@@ -207,17 +237,19 @@ def _apply_config_bundle(user_id: str | None, version: str | None) -> None:
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 with zf.open(member) as src, open(target, "wb") as out:
                     shutil.copyfileobj(src, out)
-                applied += 1
+                applied_paths.append(target)
     except zipfile.BadZipFile:
         logger.warning("config_bundle_bad_zip", extra={"key": key})
         return
 
+    # Record token + the exact files written, so a later disable/switch removes
+    # precisely this bundle (and nothing else in the shared config dirs).
     try:
         with open(_CONFIG_MARKER, "w") as f:
-            f.write(token)
+            json.dump({"token": token, "files": applied_paths}, f)
     except OSError:
         pass
-    logger.info("config_bundle_applied", extra={"user": user_id, "version": version, "files": applied})
+    logger.info("config_bundle_applied", extra={"user": user_id, "version": version, "files": len(applied_paths)})
 
 
 # ─── OTel collector sidecar ───────────────────────────────────────────────────
@@ -569,9 +601,12 @@ async def invocations(request: Request):
          "stream": stream, "prompt_head": prompt[:120]}))
 
     # Shared setup for both streaming and buffered paths.
+    # Order matters: lay down the user's bundle FIRST (it may include its own
+    # .mcp.json / config.toml), THEN merge our default gateway on top so the
+    # always-advertised gateway tools survive a bundle that ships MCP config.
     try:
-        _apply_default_mcp()
         _apply_config_bundle(user_id, config_version)
+        _apply_default_mcp()
         _configure_git()
         workdir = _ensure_workspace(repo, session_id)
     except ValueError as ve:  # bad repo field — caller error, not a 500
