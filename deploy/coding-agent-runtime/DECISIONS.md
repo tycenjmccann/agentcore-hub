@@ -62,3 +62,28 @@ Decisions:
   streamers (`agentcore-stream.ts`). Event *schemas* stay per-feature (different
   upstreams); only the fragile transport is shared. 7 edge-case unit tests pass.
 - Docs: docs/streaming-sse.md (new), coding-runtime README updated.
+
+## Port-to-cloud: native `claude --resume` (not a text seed)
+
+**Goal:** "I'm catching the train" — hand a live laptop coding session to Cloud
+Code and pick it up on the phone with zero context lost.
+
+Decision (after a wrong first cut): ship the **raw transcript** and use Claude
+Code's own resume, not an extracted text summary.
+
+- The local `port-session` MCP commits + pushes the in-flight work to a branch,
+  then uploads the real `~/.claude/projects/<slug>/<sessionId>.jsonl` to
+  `s3://<artifact-bucket>/cloud-code/resume/<sessionId>/<claudeSessionId>.jsonl`
+  via a presigned PUT (no big body through the app; no DynamoDB size cap).
+- On the first turn the runtime: checks out `branch`, downloads the transcript,
+  drops it at `{CLAUDE_CONFIG_DIR}/projects/<workdir-slug>/<sessionId>.jsonl`,
+  and runs `claude --resume <sessionId>`. Lossless continuation.
+- **Verified empirically** (claude 2.1.170): a verbatim transcript renamed to a
+  new id and placed under the matching cwd-slug resumes and recalls prior work.
+  The slug = `re.sub(r'[^a-zA-Z0-9]','-', realpath(cwd))` — `--resume` 404s if it
+  doesn't match exactly. (First attempt failed purely on slug mis-encoding.)
+- The first auto-fired turn is just a short nudge (`firstPrompt` or a default);
+  the context lives in the resumed transcript.
+- **Claude only** — Codex resume is a different `thread_id` mechanism, deferred.
+- **[CONFIRM]** terminal-tab auto-resume (`claude --resume` in the PTY) rides the
+  same installed transcript; wired next.

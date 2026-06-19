@@ -43,7 +43,7 @@ export function codingRuntimeConfigured(): boolean {
   return Boolean(CODING_RUNTIME_ARN);
 }
 
-export async function invokeCodingTurn(params: {
+export interface CodingTurnParams {
   sessionId: string; // runtimeSessionId — selects the warm microVM
   prompt: string;
   cli: CloudCodeCli;
@@ -52,12 +52,14 @@ export async function invokeCodingTurn(params: {
   userId?: string;
   configVersion?: string;
   region?: string;
-}): Promise<CodingTurnResult> {
-  if (!CODING_RUNTIME_ARN) {
-    throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
-  }
-  const region = params.region || REGION;
+  // "Port to cloud" handoff (first turn only): check out the pushed branch and
+  // natively resume the laptop transcript shipped to this S3 key.
+  branch?: string;
+  resumeTranscriptKey?: string;
+  resumeSessionId?: string;
+}
 
+function buildTurnPayload(params: CodingTurnParams): Record<string, unknown> {
   const payload: Record<string, unknown> = {
     prompt: params.prompt,
     cli: params.cli,
@@ -70,6 +72,19 @@ export async function invokeCodingTurn(params: {
   // Per-user config bundle (MCP/skills/agents) the runtime materializes first.
   if (params.userId) payload.user_id = params.userId;
   if (params.configVersion) payload.config_version = params.configVersion;
+  if (params.branch) payload.branch = params.branch;
+  if (params.resumeTranscriptKey) payload.resume_transcript = params.resumeTranscriptKey;
+  if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
+  return payload;
+}
+
+export async function invokeCodingTurn(params: CodingTurnParams): Promise<CodingTurnResult> {
+  if (!CODING_RUNTIME_ARN) {
+    throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
+  }
+  const region = params.region || REGION;
+
+  const payload = buildTurnPayload(params);
 
   const command = new InvokeAgentRuntimeCommand({
     agentRuntimeArn: CODING_RUNTIME_ARN,
@@ -106,31 +121,13 @@ export async function invokeCodingTurn(params: {
  * caller can relay SSE to the browser. The runtime emits `data: {type:text|done|error}`
  * frames as the Claude turn runs. Claude only — codex stays buffered.
  */
-export async function invokeCodingTurnStream(params: {
-  sessionId: string;
-  prompt: string;
-  cli: CloudCodeCli;
-  repo?: string;
-  claudeSessionId?: string;
-  userId?: string;
-  configVersion?: string;
-  region?: string;
-}): Promise<ReadableStream<Uint8Array>> {
+export async function invokeCodingTurnStream(params: CodingTurnParams): Promise<ReadableStream<Uint8Array>> {
   if (!CODING_RUNTIME_ARN) {
     throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
   }
   const region = params.region || REGION;
 
-  const payload: Record<string, unknown> = {
-    prompt: params.prompt,
-    cli: params.cli,
-    session_id: params.sessionId,
-    stream: true,
-  };
-  if (params.repo) payload.repo = params.repo;
-  if (params.claudeSessionId) payload.claude_session_id = params.claudeSessionId;
-  if (params.userId) payload.user_id = params.userId;
-  if (params.configVersion) payload.config_version = params.configVersion;
+  const payload = { ...buildTurnPayload(params), stream: true };
 
   const command = new InvokeAgentRuntimeCommand({
     agentRuntimeArn: CODING_RUNTIME_ARN,
@@ -145,4 +142,41 @@ export async function invokeCodingTurnStream(params: {
   const r = res.response as unknown as { transformToWebStream?: () => ReadableStream<Uint8Array> };
   if (r?.transformToWebStream) return r.transformToWebStream();
   throw new Error("runtime did not return a stream");
+}
+
+/**
+ * Pre-warm a session's microVM: clone the repo, check out the branch, and
+ * install the ported transcript NOW — no CLI runs. Called right after a port so
+ * the workspace is hot by the time the user opens the link (cloning a big repo
+ * can take 10-30s). Best-effort; resolves on the runtime's {warmed:true} reply.
+ */
+export async function warmCodingSession(params: {
+  sessionId: string;
+  cli: CloudCodeCli;
+  repo?: string;
+  branch?: string;
+  resumeTranscriptKey?: string;
+  resumeSessionId?: string;
+  region?: string;
+}): Promise<void> {
+  if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
+  const region = params.region || REGION;
+  const payload: Record<string, unknown> = {
+    warm: true,
+    cli: params.cli,
+    session_id: params.sessionId,
+  };
+  if (params.repo) payload.repo = params.repo;
+  if (params.branch) payload.branch = params.branch;
+  if (params.resumeTranscriptKey) payload.resume_transcript = params.resumeTranscriptKey;
+  if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
+
+  const command = new InvokeAgentRuntimeCommand({
+    agentRuntimeArn: CODING_RUNTIME_ARN,
+    runtimeSessionId: params.sessionId,
+    payload: new TextEncoder().encode(JSON.stringify(payload)),
+    contentType: "application/json",
+    accept: "application/json",
+  });
+  await client(region).send(command);
 }

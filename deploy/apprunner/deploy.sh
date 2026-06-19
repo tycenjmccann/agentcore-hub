@@ -40,6 +40,16 @@ fi
 
 : "${AWS_REGION:?AWS_REGION must be set}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# Account guard: if EXPECTED_ACCOUNT_ID is set (sourced from .env.local above),
+# refuse to deploy to any other account — prevents shipping to the wrong profile.
+# Opt-in and env-driven; no account ID is hardcoded in this open-source repo.
+if [[ -n "${EXPECTED_ACCOUNT_ID:-}" && "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT_ID" ]]; then
+  echo "ERROR: refusing to deploy — credentials resolve to account $ACCOUNT_ID," >&2
+  echo "       but EXPECTED_ACCOUNT_ID=$EXPECTED_ACCOUNT_ID. Wrong AWS_PROFILE?" >&2
+  exit 1
+fi
+
 ECR_REPO="agentcore-hub-frontend"
 ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
 SERVICE_NAME="agentcore-hub"

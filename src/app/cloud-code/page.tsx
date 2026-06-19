@@ -51,6 +51,17 @@ export default function CloudCodePage() {
     fetchSessions();
   }, [fetchSessions]);
 
+  // Deep link: /cloud-code?session=<id> selects it (the "port to cloud" handoff
+  // link opens straight into the ported session, on any device).
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get("session");
+    if (id) setSelectedId(id);
+  }, []);
+
+  // Tracks which session's pending seed we've already auto-fired, so opening a
+  // ported session runs its first turn exactly once.
+  const seededRef = useRef<string | null>(null);
+
   // Load full session when selected
   useEffect(() => {
     setView("chat");
@@ -93,17 +104,29 @@ export default function CloudCodePage() {
     if (!active || !draft.trim() || sending) return;
     const prompt = draft.trim();
     setDraft("");
+    await runTurn(prompt);
+  };
+
+  // The actual turn (shared by manual send + the auto-fired port seed).
+  // `displayAs` overrides the user-bubble text — used for the ported seed, whose
+  // real prompt is a huge transcript we don't want to render in the chat.
+  const runTurn = async (prompt: string, displayAs?: string) => {
+    if (!active || !prompt || sending) return;
     setSending(true);
     // Optimistic user turn
     setActive((s) =>
-      s ? { ...s, turns: [...s.turns, { role: "user", text: prompt, at: new Date().toISOString() }] } : s
+      s ? { ...s, turns: [...s.turns, { role: "user", text: displayAs ?? prompt, at: new Date().toISOString() }] } : s
     );
     try {
       // Claude streams (SSE); codex is buffered (plain JSON).
       const canStream = active.cli === "claude";
       const res = await fetch(
         `/api/cloud-code/sessions/${active.sessionId}/message${canStream ? "?stream=1" : ""}`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }) }
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(displayAs ? { prompt, displayPrompt: displayAs } : { prompt }),
+        }
       );
 
       if (canStream && res.body && res.headers.get("content-type")?.includes("event-stream")) {
@@ -159,6 +182,24 @@ export default function CloudCodePage() {
     if (selectedId === id) setSelectedId(null);
     fetchSessions();
   };
+
+  // Ported session: when one with a pendingSeed loads, fire it once as the
+  // first turn (clone → checkout branch → resume from the laptop context). The
+  // server clears pendingSeed when the turn persists, so a refresh won't re-run.
+  useEffect(() => {
+    if (!active?.pendingSeed) return;
+    if (active.turns.length > 0) return; // already started
+    if (seededRef.current === active.sessionId) return;
+    seededRef.current = active.sessionId;
+    const seed = active.pendingSeed;
+    // Clear locally so the input/UI doesn't treat it as still-pending.
+    setActive((s) => (s ? { ...s, pendingSeed: undefined } : s));
+    const label = active.branch
+      ? `↪ Resuming laptop session on \`${active.branch}\` — continue from here.`
+      : "↪ Resuming laptop session — continue from here.";
+    runTurn(seed, label);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active?.sessionId, active?.pendingSeed]);
 
   return (
     <div className="flex h-[calc(100vh-56px)] -m-4 md:-m-6 relative">
@@ -360,6 +401,12 @@ export default function CloudCodePage() {
                   rows={1}
                   placeholder={sending ? "Working… (you can queue your next message)" : "Give the next task…"}
                   autoFocus
+                  // Stop iOS/Safari from offering password/card/contact AutoFill on a
+                  // plain prompt box (the key/card/pin chips above the keyboard).
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                   data-testid="cc-message-input"
                   className="flex-1 bg-transparent resize-none outline-none text-sm max-h-32"
                 />
@@ -442,6 +489,10 @@ function NewSessionModal({
           value={repo}
           onChange={(e) => setRepo(e.target.value)}
           placeholder="owner/name"
+          autoComplete="off"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
           data-testid="cc-repo-input"
           className="w-full px-3 py-2 rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] text-sm outline-none focus:border-brand-500/50 mb-1.5 font-mono"
         />

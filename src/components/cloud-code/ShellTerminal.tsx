@@ -46,6 +46,14 @@ export default function ShellTerminal({ sessionId }: { sessionId: string }) {
     if (hostRef.current) {
       term0.open(hostRef.current);
       fit.fit();
+      // xterm's scrollable element is .xterm-viewport, NOT our host div. Let it
+      // pan vertically on touch (finger-scroll the terminal) and contain the
+      // overscroll so the gesture never chains up to scroll the page behind it.
+      const vp = hostRef.current.querySelector(".xterm-viewport") as HTMLElement | null;
+      if (vp) {
+        vp.style.touchAction = "pan-y";
+        vp.style.overscrollBehavior = "contain";
+      }
     }
     term0.writeln("\x1b[90mConnecting to your session…\x1b[0m");
 
@@ -141,12 +149,11 @@ export default function ShellTerminal({ sessionId }: { sessionId: string }) {
             : err || "disconnected"}
         </span>
       </div>
-      {/* touch-action:none + overscroll-contain keep finger-scroll inside the
-          xterm viewport on mobile instead of scrolling the page behind it. */}
+      {/* Touch scrolling is wired on the inner .xterm-viewport (see effect)
+          so finger-scroll pans the terminal, not the page. */}
       <div
         ref={hostRef}
         className="flex-1 min-h-0 p-2 bg-[#0b0f17] overscroll-contain"
-        style={{ touchAction: "none" }}
       />
     </div>
   );

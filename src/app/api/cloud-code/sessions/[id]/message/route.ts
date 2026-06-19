@@ -40,13 +40,32 @@ export async function POST(
   if (!prompt) {
     return NextResponse.json({ error: "prompt is required" }, { status: 400 });
   }
+  // For the ported seed, the prompt is a huge transcript; displayPrompt is the
+  // short label we persist/render in the chat instead of the raw seed.
+  const displayPrompt: string = (body.displayPrompt || "").trim();
 
-  const userTurn: CloudCodeTurn = { role: "user", text: prompt, at: new Date().toISOString() };
+  const userTurn: CloudCodeTurn = {
+    role: "user",
+    text: displayPrompt || prompt,
+    at: new Date().toISOString(),
+  };
   const wantStream =
     request.nextUrl.searchParams.get("stream") === "1" && session.cli === "claude";
   const userId = session.userId || DEFAULT_USER_ID;
   const configVersion = await currentConfigVersion(userId);
   const region = request.nextUrl.searchParams.get("region") || undefined;
+
+  // Ported-session first turn: tell the runtime to check out the pushed branch
+  // and natively resume the laptop transcript. Only on the seeding turn (while
+  // pendingSeed is set + no turns yet) — afterwards it resumes by session id.
+  const isPortSeed = Boolean(session.pendingSeed) && session.turns.length === 0;
+  const resumeFields = isPortSeed
+    ? {
+        branch: session.branch,
+        resumeTranscriptKey: session.resumeTranscriptKey,
+        resumeSessionId: session.claudeSessionId,
+      }
+    : {};
 
   // ── Streaming path (claude): relay SSE, persist on the terminal 'done' frame.
   if (wantStream) {
@@ -55,6 +74,7 @@ export async function POST(
       upstream = await invokeCodingTurnStream({
         sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
         claudeSessionId: session.claudeSessionId, userId, configVersion, region,
+        ...resumeFields,
       });
     } catch (err) {
       return NextResponse.json({ error: (err as Error).message }, { status: 502 });
@@ -82,6 +102,7 @@ export async function POST(
           // Persist the completed turn.
           session.turns.push(userTurn, { role: "agent", text: fullText, at: new Date().toISOString() });
           if (session.title === "New session") session.title = prompt.slice(0, 80);
+          session.pendingSeed = undefined; // ported seed has now run
           session.updatedAt = new Date().toISOString();
           await putSession(session).catch(() => {});
         } catch (err) {
@@ -109,12 +130,14 @@ export async function POST(
     const result = await invokeCodingTurn({
       sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
       claudeSessionId: session.claudeSessionId, userId, configVersion, region,
+      ...resumeFields,
     });
 
     const agentTurn: CloudCodeTurn = { role: "agent", text: result.response, at: new Date().toISOString() };
     session.turns.push(userTurn, agentTurn);
     if (result.claudeSessionId) session.claudeSessionId = result.claudeSessionId;
     if (session.title === "New session") session.title = prompt.slice(0, 80);
+    session.pendingSeed = undefined; // ported seed has now run
     session.updatedAt = new Date().toISOString();
     await putSession(session);
 

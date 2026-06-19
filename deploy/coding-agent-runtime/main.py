@@ -361,6 +361,53 @@ def _session_dir(session_id: str | None) -> str:
     return os.path.join(WORKSPACE_ROOT, "sessions", safe)
 
 
+def _claude_project_slug(workdir: str) -> str:
+    """Claude Code stores a conversation under
+    {CLAUDE_CONFIG_DIR}/projects/<slug>/<sessionId>.jsonl where <slug> is the
+    real (symlink-resolved) cwd with every non-alphanumeric char replaced by '-'.
+    `claude --resume` looks up the transcript by that exact slug, so a ported
+    session resumes ONLY if we place its .jsonl under the matching folder."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", os.path.realpath(workdir))
+
+
+def _install_resume_transcript(s3_key: str, session_id: str, workdir: str) -> bool:
+    """Download a ported Claude transcript from S3 and place it where
+    `claude --resume <session_id>` will find it (the workdir's project slug).
+
+    This is how "port my laptop session to the cloud" achieves a LOSSLESS,
+    native resume: we ship the real .jsonl, not a text summary. Idempotent — a
+    marker per (session, key) means we download once per warm microVM.
+    Returns True if the transcript is in place (freshly or already)."""
+    if not (s3_key and session_id and ARTIFACT_BUCKET):
+        return False
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
+    proj = os.path.join(config_dir, "projects", _claude_project_slug(workdir))
+    dest = os.path.join(proj, f"{session_id}.jsonl")
+    marker = os.path.join(_session_dir(session_id), ".resume-installed")
+    try:
+        if os.path.exists(dest) and os.path.exists(marker):
+            with open(marker) as f:
+                if f.read().strip() == s3_key:
+                    return True  # this exact transcript already installed
+    except OSError:
+        pass
+    try:
+        os.makedirs(proj, exist_ok=True)
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        obj = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=s3_key)
+        with open(dest, "wb") as f:
+            f.write(obj["Body"].read())
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w") as f:
+            f.write(s3_key)
+        logger.info("resume_transcript_installed",
+                    extra={"session": session_id, "slug": _claude_project_slug(workdir)})
+        return True
+    except Exception as exc:  # noqa: BLE001 — a missing transcript is non-fatal; fall back to a cold turn
+        logger.warning("resume_transcript_install_failed", extra={"key": s3_key, "error": str(exc)[:200]})
+        return False
+
+
 def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
     """Return the working dir for this session. If repo given and not yet cloned,
     clone it under the session's own dir (on EFS, so a re-invoke with the same
@@ -387,6 +434,27 @@ def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
     if res.returncode != 0:
         raise RuntimeError(f"git clone failed: {res.stderr.strip()[:400]}")
     return wd
+
+
+def _checkout_branch(workdir: str, branch: str) -> None:
+    """Fetch + check out the branch the laptop pushed its in-flight work to.
+    Best-effort: a fresh clone lands on the default branch, so we move to the
+    ported branch before the agent resumes. Non-fatal if it fails (agent can
+    recover via its own git tools)."""
+    if not os.path.isdir(os.path.join(workdir, ".git")):
+        return
+    safe = branch.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", safe or ""):
+        logger.warning("checkout_branch_rejected", extra={"branch": branch[:60]})
+        return
+    subprocess.run(["git", "fetch", "origin", safe], cwd=workdir,
+                   capture_output=True, text=True, timeout=120)
+    res = subprocess.run(["git", "checkout", safe], cwd=workdir,
+                         capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        logger.warning("checkout_branch_failed", extra={"branch": safe, "err": res.stderr.strip()[:200]})
+    else:
+        logger.info("checkout_branch_ok", extra={"branch": safe})
 
 
 # ─── CLI runners ──────────────────────────────────────────────────────────────
@@ -589,8 +657,13 @@ async def invocations(request: Request):
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
+    # Pre-warm: clone + checkout + install the transcript on the microVM NOW, so
+    # opening the session later is instant (no prompt runs). Fired by the port
+    # route right after the transcript is uploaded.
+    warm = bool(payload.get("warm"))
+
     prompt = (payload.get("prompt") or "").strip()
-    if not prompt:
+    if not prompt and not warm:
         return JSONResponse({"error": "prompt is required"}, status_code=400)
 
     cli = (payload.get("cli") or DEFAULT_CLI).lower()
@@ -600,6 +673,11 @@ async def invocations(request: Request):
     config_version = payload.get("config_version")
     session_id = payload.get("session_id")  # isolates this session's checkout
     stream = bool(payload.get("stream"))  # SSE incremental output (claude only)
+    # "Port to cloud": a real laptop transcript shipped via S3 for a native,
+    # lossless `claude --resume`. resume_session_id is the id INSIDE that file.
+    resume_transcript = payload.get("resume_transcript")  # s3 key
+    resume_session_id = payload.get("resume_session_id")
+    branch = payload.get("branch")  # checkout this branch before the turn
 
     # On resume, recover the repo the conversation was started in (so we land in
     # the same cwd Claude Code scoped the session to) when the caller omits it.
@@ -619,11 +697,25 @@ async def invocations(request: Request):
         _apply_default_mcp()
         _configure_git()
         workdir = _ensure_workspace(repo, session_id)
+        # Land on the ported branch (the laptop pushed its in-flight work there).
+        if branch:
+            _checkout_branch(workdir, branch)
+        # Install a ported transcript and resume it natively. On success the turn
+        # runs as `claude --resume <resume_session_id>` — true continuation.
+        if cli == "claude" and resume_transcript and resume_session_id:
+            if _install_resume_transcript(resume_transcript, resume_session_id, workdir):
+                claude_session_id = claude_session_id or resume_session_id
     except ValueError as ve:  # bad repo field — caller error, not a 500
         return JSONResponse({"error": str(ve)}, status_code=400)
     except Exception as exc:  # noqa: BLE001
         logger.error("turn_setup_failed", extra={"cli": cli, "error": str(exc)[:600]})
         return JSONResponse({"error": str(exc)[:600]}, status_code=500)
+
+    # Pre-warm done: workspace cloned, branch checked out, transcript installed.
+    # No CLI runs — the first real turn (on open) will be instant + warm.
+    if warm:
+        logger.info("warm_done", extra={"repo": repo, "workspace": workdir})
+        return JSONResponse({"warmed": True, "workspace": workdir, "cli": cli})
 
     # Streaming path (claude): yield SSE as the turn runs. The runtime forwards
     # an async/sync generator response as text/event-stream through InvokeAgentRuntime.

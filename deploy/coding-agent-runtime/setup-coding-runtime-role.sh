@@ -133,10 +133,11 @@ aws iam put-role-policy \
   }'
 echo "   ✓ ECR pull access"
 
-# ─── S3 read: per-user coding-CLI config bundles ─────────────────────────────
-# The app uploads a user's .claude/.codex config bundle to
-# s3://<artifact-bucket>/cloud-code/configs/<userId>/...; the runtime fetches it
-# on session start and materializes it into the CLI config dirs.
+# ─── S3 read: config bundles + ported resume transcripts ────────────────────
+# The app uploads two things under s3://<artifact-bucket>/cloud-code/:
+#   configs/<userId>/...  — a user's .claude/.codex config bundle
+#   resume/<sessionId>/... — a ported laptop transcript for `claude --resume`
+# The runtime fetches both on session start.
 ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}}"
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
@@ -145,21 +146,24 @@ aws iam put-role-policy \
     \"Version\": \"2012-10-17\",
     \"Statement\": [
       {
-        \"Sid\": \"ConfigBundleObjects\",
+        \"Sid\": \"CloudCodeObjects\",
         \"Effect\": \"Allow\",
         \"Action\": [\"s3:GetObject\"],
-        \"Resource\": [\"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/configs/*\"]
+        \"Resource\": [
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/configs/*\",
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/resume/*\"
+        ]
       },
       {
-        \"Sid\": \"ConfigBundleList\",
+        \"Sid\": \"CloudCodeList\",
         \"Effect\": \"Allow\",
         \"Action\": [\"s3:ListBucket\"],
         \"Resource\": [\"arn:aws:s3:::${ARTIFACT_BUCKET}\"],
-        \"Condition\": { \"StringLike\": { \"s3:prefix\": [\"cloud-code/configs/*\"] } }
+        \"Condition\": { \"StringLike\": { \"s3:prefix\": [\"cloud-code/configs/*\", \"cloud-code/resume/*\"] } }
       }
     ]
   }"
-echo "   ✓ Config bundle read (s3://${ARTIFACT_BUCKET}/cloud-code/configs/*)"
+echo "   ✓ Config bundle + resume transcript read (s3://${ARTIFACT_BUCKET}/cloud-code/{configs,resume}/*)"
 
 # ─── EFS mount (persistent code workspace at /mnt/efs) ───────────────────────
 aws iam put-role-policy \

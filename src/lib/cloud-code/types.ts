@@ -28,6 +28,15 @@ export interface CloudCodeSession {
   createdAt: string;
   updatedAt: string;
   turns: CloudCodeTurn[];
+  // Set when a session is created by "port to cloud" (the MCP handoff): the
+  // first prompt to auto-run on open. The real context comes from natively
+  // resuming the ported transcript (resumeTranscriptKey + claudeSessionId), not
+  // from this prompt. Cleared once it has been fired.
+  pendingSeed?: string;
+  branch?: string; // branch the local session pushed, for display + checkout
+  // S3 key of the raw laptop transcript (.jsonl). The runtime downloads it and
+  // runs `claude --resume claudeSessionId` for a lossless continuation.
+  resumeTranscriptKey?: string;
 }
 
 /** Trimmed shape for the sidebar list (no full turn history). */
