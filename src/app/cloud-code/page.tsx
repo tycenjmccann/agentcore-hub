@@ -260,6 +260,7 @@ export default function CloudCodePage() {
             </p>
             <button
               onClick={() => setShowNew(true)}
+              data-testid="cc-new-session"
               className="px-4 py-2 bg-brand-600 text-white text-sm font-medium rounded-lg hover:bg-brand-500 transition-colors"
             >
               New session
@@ -310,7 +311,7 @@ export default function CloudCodePage() {
                 <ShellTerminal sessionId={active.sessionId} />
               </div>
             ) : (
-            <div className="flex-1 overflow-y-auto px-5 py-5 flex flex-col gap-3.5">
+            <div data-testid="cc-stream" className="flex-1 overflow-y-auto px-5 py-5 flex flex-col gap-3.5">
               {active.turns.length === 0 && (
                 <p className="text-xs text-[var(--color-text-muted)] text-center mt-4">
                   First task clones the repo (warm after). Try: “add a CONTRIBUTING.md, commit on a branch, open a PR.”
@@ -322,7 +323,7 @@ export default function CloudCodePage() {
                     {t.text}
                   </div>
                 ) : (
-                  <div key={i} className="self-start max-w-[80%]">
+                  <div key={i} data-testid="cc-agent-turn" className="self-start max-w-[80%]">
                     <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)] mb-1">
                       {active.cli}
                     </div>
@@ -357,11 +358,13 @@ export default function CloudCodePage() {
                   rows={1}
                   placeholder={sending ? "Working… (you can queue your next message)" : "Give the next task…"}
                   autoFocus
+                  data-testid="cc-message-input"
                   className="flex-1 bg-transparent resize-none outline-none text-sm max-h-32"
                 />
                 <button
                   onClick={send}
                   disabled={sending || !draft.trim()}
+                  data-testid="cc-send"
                   className="w-8 h-8 rounded-lg bg-brand-600 text-white flex items-center justify-center hover:bg-brand-500 transition-colors disabled:opacity-40 flex-shrink-0"
                   aria-label="Send"
                 >
@@ -418,6 +421,7 @@ function NewSessionModal({
             <button
               key={c}
               onClick={() => setCli(c)}
+              data-testid={`cc-cli-${c}`}
               className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-colors ${
                 cli === c
                   ? "bg-brand-600/15 border-brand-500/40 text-brand-300"
@@ -436,6 +440,7 @@ function NewSessionModal({
           value={repo}
           onChange={(e) => setRepo(e.target.value)}
           placeholder="owner/name"
+          data-testid="cc-repo-input"
           className="w-full px-3 py-2 rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] text-sm outline-none focus:border-brand-500/50 mb-1.5 font-mono"
         />
         <p className="text-[11px] text-[var(--color-text-muted)] mb-5 leading-relaxed">
@@ -452,6 +457,7 @@ function NewSessionModal({
           </button>
           <button
             onClick={() => onCreate(cli, repo.trim())}
+            data-testid="cc-start"
             className="px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 text-white hover:bg-brand-500 transition-colors flex items-center gap-1.5"
           >
             <Radio className="w-3.5 h-3.5" /> Start
