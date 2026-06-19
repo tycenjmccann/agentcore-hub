@@ -107,26 +107,8 @@ def _load_efs_config() -> None:
     _load_env_file(os.path.abspath(os.path.join(here, "..", "..", ".env.local")))
 
 
-def _load_env_local() -> None:
-    """Source the repo's gitignored .env.local so runtime env (GITHUB_PAT,
-    ARTIFACT_BUCKET, model ids, etc.) is always forwarded — without it, clones
-    of private repos 401 and the resume-transcript install silently skips."""
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    envf = os.path.join(repo_root, ".env.local")
-    if not os.path.exists(envf):
-        return
-    with open(envf) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-
-
 def main() -> None:
-    _load_env_local()
-    _load_efs_config()
+    _load_efs_config()  # also loads .env.local (PAT, bucket, role, gateway)
     region = os.environ.get("AWS_REGION", "us-east-1")
     image_uri = os.environ.get("IMAGE_URI")
     role_arn = os.environ.get("CODING_RUNTIME_ROLE_ARN")
