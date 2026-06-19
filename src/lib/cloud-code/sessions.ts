@@ -81,6 +81,7 @@ export async function listSessions(
       title: s.title,
       cli: s.cli,
       repo: s.repo,
+      defaultView: s.defaultView,
       createdAt: s.createdAt,
       updatedAt: s.updatedAt,
       warmth: warmthOf(s.updatedAt),

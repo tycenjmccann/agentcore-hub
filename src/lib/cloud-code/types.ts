@@ -37,6 +37,10 @@ export interface CloudCodeSession {
   // S3 key of the raw laptop transcript (.jsonl). The runtime downloads it and
   // runs `claude --resume claudeSessionId` for a lossless continuation.
   resumeTranscriptKey?: string;
+  // Which surface this session opens in (sidebar tap restores it). Set at port
+  // time; defaults to chat. A ported terminal session auto-runs `claude --resume`
+  // in the PTY instead of firing the chat seed.
+  defaultView?: "chat" | "terminal";
 }
 
 /** Trimmed shape for the sidebar list (no full turn history). */
@@ -45,6 +49,7 @@ export interface CloudCodeSessionSummary {
   title: string;
   cli: CloudCodeCli;
   repo?: string;
+  defaultView?: "chat" | "terminal";
   createdAt: string;
   updatedAt: string;
   warmth: SessionWarmth;

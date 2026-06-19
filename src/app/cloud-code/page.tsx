@@ -69,18 +69,23 @@ export default function CloudCodePage() {
   // ported session runs its first turn exactly once.
   const seededRef = useRef<string | null>(null);
 
-  // Load full session when selected
+  // Load full session when selected. The view is restored from the session's
+  // own defaultView (set at port time) so a sidebar tap reopens it the right
+  // way; a deep-link &view= is a one-time override that wins if present.
   useEffect(() => {
-    // Honor a deep-link view override once, then default to chat.
-    setView(deepViewRef.current ?? "chat");
-    deepViewRef.current = null;
     if (!selectedId) {
       setActive(null);
       return;
     }
+    const override = deepViewRef.current;
+    deepViewRef.current = null;
     fetch(`/api/cloud-code/sessions/${selectedId}`)
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => d && setActive(d.session))
+      .then((d) => {
+        if (!d) return;
+        setActive(d.session);
+        setView(override ?? d.session.defaultView ?? "chat");
+      })
       .catch(() => {});
   }, [selectedId]);
 
@@ -250,6 +255,12 @@ export default function CloudCodePage() {
             >
               <div className="flex items-center gap-2">
                 <span className={`w-2 h-2 rounded-full flex-shrink-0 ${WARMTH_DOT[s.warmth]}`} />
+                {/* Surface this session opens in — terminal vs chat. */}
+                {s.defaultView === "terminal" ? (
+                  <TerminalSquare className="w-3.5 h-3.5 flex-shrink-0 text-brand-300" aria-label="Terminal session" />
+                ) : (
+                  <MessageSquare className="w-3.5 h-3.5 flex-shrink-0 text-[var(--color-text-muted)]" aria-label="Chat session" />
+                )}
                 <span className="text-[13px] font-medium truncate flex-1">{s.title}</span>
                 <button
                   onClick={(e) => {

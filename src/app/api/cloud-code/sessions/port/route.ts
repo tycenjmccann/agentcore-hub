@@ -64,6 +64,10 @@ export async function POST(request: NextRequest) {
     const branch: string | undefined = body.branch?.trim() || undefined;
     const firstPrompt: string | undefined = body.firstPrompt?.trim() || undefined;
     const title: string = (body.title?.trim() || `Ported: ${repo}`).slice(0, 120);
+    // Surface the session opens in (sidebar tap restores it). Terminal only
+    // makes sense for claude (--resume); codex always opens chat.
+    const defaultView: "chat" | "terminal" =
+      body.view === "terminal" && cli === "claude" ? "terminal" : "chat";
 
     const sessionId = `cc-${randomUUID().replace(/-/g, "")}`;
     const now = new Date().toISOString();
@@ -81,6 +85,7 @@ export async function POST(request: NextRequest) {
       // Resume the laptop conversation natively from the uploaded transcript.
       claudeSessionId,
       resumeTranscriptKey: transcriptKey,
+      defaultView,
       pendingSeed: buildResumePrompt({ branch, firstPrompt }),
       createdAt: now,
       updatedAt: now,
