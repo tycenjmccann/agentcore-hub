@@ -10,11 +10,12 @@ A web console for Amazon Bedrock AgentCore that dynamically discovers and intera
 - **Registry** — Browse, search, and manage records in the Amazon Bedrock AgentCore Registry (MCP servers, A2A agents, custom resources, agent skills): full CRUD, semantic search, and the approval lifecycle
 - **Builder** — Chat-based agent creation (harness with code_interpreter + MCP)
 - **Workflow** — Config-driven multi-agent pipelines: submit a request and a roster of agents produce the deliverable. Ships four workflows (Software Delivery → a PR; Marketing; Sales; Legal), each defined in `src/config/workflows.json`. Real-time pipeline visualization with animated phases, timeline replay/scrubber, S3 artifact browsing, optional **human review gates**, and dynamic header titles
+- **Cloud Code** — A coding agent that lives in the cloud ("safe to close your laptop"): Claude Code / Codex run server-side on a dedicated AgentCore Runtime with an EFS workspace. Streaming chat + a live terminal, per-session isolated checkouts, resumable from any device, MCP-gateway tools, and per-user CLI config bundles. Opens PRs from a clone — Git-native, separate from the workflow fleet
 
 ### Modular by design
 
 The console is a small always-on **core** (Dashboard, Agents, Invoke) plus
-optional **bolt-on modules** (Workflow, Registry, Evaluations, Builder). Each
+optional **bolt-on modules** (Workflow, Registry, Evaluations, Builder, Cloud Code). Each
 module's UI, API routes, Lambdas, and DynamoDB tables are namespaced, so you can
 deploy only what you need and cherry-pick the rest out. See
 [`docs/MODULES.md`](docs/MODULES.md) for the core-vs-optional breakdown, per-module
