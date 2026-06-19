@@ -44,9 +44,12 @@ def main() -> None:
                 continue
         if skip_section:
             continue
-        # Only TOP-LEVEL model/model_provider are ours; a `model=` inside a
-        # [profiles.*] table is the user's and must survive.
-        if in_top_level and re.match(r"^\s*(model|model_provider)\s*=", line):
+        # Only TOP-LEVEL model wiring is ours; a `model=` inside a [profiles.*]
+        # table is the user's and must survive. (Re-strip on every merge so we
+        # don't duplicate our own keys.)
+        if in_top_level and re.match(
+            r"^\s*(model|model_provider|model_context_window|model_max_output_tokens)\s*=", line
+        ):
             continue
         kept.append(line)
 
@@ -54,7 +57,12 @@ def main() -> None:
 
     ours = (
         f'model = "{model}"\n'
-        f'model_provider = "bedrock-mantle"\n\n'
+        f'model_provider = "bedrock-mantle"\n'
+        # Codex has no built-in metadata for openai.gpt-5.5 over Mantle, so it
+        # warns and falls back to conservative defaults. Declare the limits
+        # explicitly (GPT-5.5: 400k context, 128k max output).
+        f'model_context_window = 400000\n'
+        f'model_max_output_tokens = 128000\n\n'
         f'[model_providers.bedrock-mantle]\n'
         f'name = "Amazon Bedrock Mantle (OpenAI-compatible)"\n'
         f'base_url = "{base_url}"\n'

@@ -12,7 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 # System deps — git for repo ops, Node.js for the Node-based CLIs (Claude, Codex)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl ca-certificates bash nodejs npm openssh-client jq unzip \
+    git curl ca-certificates bash nodejs npm openssh-client jq unzip bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI — lets the agent enumerate/inspect repos it has access to

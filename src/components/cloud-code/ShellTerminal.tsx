@@ -36,6 +36,8 @@ export default function ShellTerminal({ sessionId }: { sessionId: string }) {
       cursorBlink: true,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
       fontSize: 13,
+      scrollback: 5000,        // keep history so there's something to scroll
+      scrollSensitivity: 3,    // smoother wheel/touch scroll
       theme: { background: "#0b0f17", foreground: "#e2e8f0" },
     });
     term = term0;
@@ -139,7 +141,13 @@ export default function ShellTerminal({ sessionId }: { sessionId: string }) {
             : err || "disconnected"}
         </span>
       </div>
-      <div ref={hostRef} className="flex-1 min-h-0 p-2 bg-[#0b0f17]" />
+      {/* touch-action:none + overscroll-contain keep finger-scroll inside the
+          xterm viewport on mobile instead of scrolling the page behind it. */}
+      <div
+        ref={hostRef}
+        className="flex-1 min-h-0 p-2 bg-[#0b0f17] overscroll-contain"
+        style={{ touchAction: "none" }}
+      />
     </div>
   );
 }
