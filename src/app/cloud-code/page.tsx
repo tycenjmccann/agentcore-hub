@@ -188,6 +188,7 @@ export default function CloudCodePage() {
           {sessions.map((s) => (
             <div
               key={s.sessionId}
+              data-testid="cc-session-row"
               onClick={() => { setSelectedId(s.sessionId); setSessionsOpen(false); }}
               className={`group px-2.5 py-2 rounded-lg mb-1 cursor-pointer border ${
                 selectedId === s.sessionId

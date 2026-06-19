@@ -18,53 +18,59 @@ import { test, expect } from "@playwright/test";
  * timeouts. The DEMO_REPO defaults to a small public repo; override with env.
  */
 
-const DEMO_REPO = process.env.DEMO_REPO || "tycenjmccann/hello-world";
-const TURN_TIMEOUT = 240_000; // a live coding turn can take minutes
+// A real codebase (HTML/CSS/JS + tests) so the refactor analysis has substance.
+const DEMO_REPO = process.env.DEMO_REPO || "tycenjmccann/tic-tac-toe-ai";
+const DEMO_REPO_NAME = DEMO_REPO.split("/").pop()!;
+const TURN_TIMEOUT = 300_000; // a live coding turn can take minutes
+
+// Each turn appends an agent bubble; wait for the Nth agent turn to fill in.
+async function waitForAgentTurn(page: import("@playwright/test").Page, n: number, minLen = 1) {
+  await expect
+    .poll(
+      async () => {
+        const turns = page.getByTestId("cc-agent-turn");
+        if ((await turns.count()) < n) return 0;
+        return (await turns.nth(n - 1).innerText().catch(() => "")).length;
+      },
+      { timeout: TURN_TIMEOUT, intervals: [2000] }
+    )
+    .toBeGreaterThan(minLen);
+}
 
 test.describe("Cloud Code demo", () => {
-  test.describe.configure({ mode: "serial", timeout: 900_000 });
+  test.describe.configure({ mode: "serial", timeout: 1_200_000 });
 
-  test("Claude chat: clone a repo, analyze a feature, request a report", async ({ page }) => {
+  test("Claude chat: find the repo via gh, then scope a hardening refactor", async ({ page }) => {
     await page.goto("/cloud-code");
 
-    // Start a new Claude session on the demo repo.
+    // Start a new Claude session — no repo set, so it must use gh to find it.
     await page.getByTestId("cc-new-session").click();
     await page.getByTestId("cc-cli-claude").click();
-    await page.getByTestId("cc-repo-input").fill(DEMO_REPO);
     await page.getByTestId("cc-start").click();
 
     const input = page.getByTestId("cc-message-input");
     await expect(input).toBeVisible({ timeout: 15_000 });
 
-    // Turn 1 — analyze for refactor. Stream renders into the chat.
+    // Turn 1 — show it has gh: ask it to find the repo.
     await input.fill(
-      "Clone and look around this repo. Pick one feature or file and analyze it " +
-        "for refactor opportunities — call out what you'd change and why. Keep it concise."
+      `Do you have access to a repo called "${DEMO_REPO_NAME}"? Use gh to check, ` +
+        `and if so tell me its full owner/name and what's in it.`
     );
     await page.getByTestId("cc-send").click();
+    await waitForAgentTurn(page, 1, 80);
+    await page.screenshot({ path: "test-results/cc-1-gh-find-repo.png", fullPage: true });
 
-    // The agent reply grows in place; wait until the agent turn has real text.
-    await expect
-      .poll(
-        async () => (await page.getByTestId("cc-agent-turn").last().innerText().catch(() => "")).length,
-        { timeout: TURN_TIMEOUT, intervals: [2000] }
-      )
-      .toBeGreaterThan(400);
-    await page.screenshot({ path: "test-results/cc-claude-analysis.png", fullPage: true });
-
-    // Turn 2 — ask for a written report (the "download the report" beat).
+    // Turn 2 — clone it and scope ONE hardening/cleanup refactor (find, don't fix).
     await input.fill(
-      "Write that up as a short REFACTOR_REPORT.md in the repo, commit it on a " +
-        "new branch, and tell me the branch name."
+      `Great — clone ${DEMO_REPO} and review the code. Find the single best ` +
+        `refactor opportunity to harden and clean up the codebase (correctness, ` +
+        `input validation, dead code, or structure). Describe exactly what you'd ` +
+        `change and why — but DON'T make any changes yet. I'll have you fix it next.`
     );
     await page.getByTestId("cc-send").click();
-    await expect
-      .poll(
-        async () => (await page.getByTestId("cc-agent-turn").last().innerText().catch(() => "")).toLowerCase().includes("branch"),
-        { timeout: TURN_TIMEOUT, intervals: [2000] }
-      )
-      .toBeTruthy();
-    await page.screenshot({ path: "test-results/cc-claude-report.png", fullPage: true });
+    await waitForAgentTurn(page, 2, 400);
+    await page.screenshot({ path: "test-results/cc-2-refactor-scoped.png", fullPage: true });
+    // Leaves this session warm + scoped — resume from mobile and tell it "do it".
   });
 
   test("Codex via the live terminal", async ({ page }) => {
@@ -91,7 +97,8 @@ test.describe("Cloud Code demo", () => {
     await page.locator(".xterm").click();
     await page.waitForTimeout(1500);
     await page.keyboard.type(
-      "codex exec --skip-git-repo-check 'List the files here and suggest one refactor.'",
+      "codex exec --skip-git-repo-check 'Review this tic-tac-toe codebase and " +
+        "name the single best hardening/cleanup refactor — what and why, do not change anything.'",
       { delay: 25 }
     );
     await page.waitForTimeout(500);
@@ -113,26 +120,22 @@ test.describe("Cloud Code demo", () => {
     await page.screenshot({ path: "test-results/cc-codex-terminal-output.png", fullPage: true });
   });
 
-  test("leaves a warm Claude session for mobile resume", async ({ page }) => {
+  // The Claude session from test 1 is the warm, scoped session left for mobile
+  // pickup ("do it" finishes the refactor). This test just confirms it's listed
+  // and resumable from a fresh page load (i.e. from any device).
+  test("scoped session is listed + resumable (mobile pickup)", async ({ page }) => {
     await page.goto("/cloud-code");
-    await page.getByTestId("cc-new-session").click();
-    await page.getByTestId("cc-cli-claude").click();
-    await page.getByTestId("cc-repo-input").fill(DEMO_REPO);
-    await page.getByTestId("cc-start").click();
-
-    const input = page.getByTestId("cc-message-input");
-    await input.fill("Remember this: my demo codeword is ORCHID. Reply with just: OK");
-    await page.getByTestId("cc-send").click();
-    // Wait for a real agent turn (not the prompt echo) to contain OK.
-    await expect
-      .poll(
-        async () => (await page.getByTestId("cc-agent-turn").last().innerText().catch(() => "")).includes("OK"),
-        { timeout: TURN_TIMEOUT, intervals: [2000] }
-      )
-      .toBeTruthy();
-
-    // The session now shows in the sidebar — resume it from any device by
-    // opening /cloud-code and clicking it. Capture its title for the demo.
-    await page.screenshot({ path: "test-results/cc-warm-session.png", fullPage: true });
+    // Fresh page load (simulates opening on another device). Reopen the Claude
+    // session — the one carrying the scoped refactor analysis (title is the
+    // gh-find prompt; the codex row is terminal-only with no chat turns).
+    const claudeRow = page
+      .getByTestId("cc-session-row")
+      .filter({ hasText: /Do you have access/i })
+      .first();
+    await expect(claudeRow).toBeVisible({ timeout: 15_000 });
+    await claudeRow.click();
+    // It reopens with its prior turns intact (the scoped refactor analysis).
+    await expect(page.getByTestId("cc-agent-turn").first()).toBeVisible({ timeout: 20_000 });
+    await page.screenshot({ path: "test-results/cc-3-resume-ready.png", fullPage: true });
   });
 });
