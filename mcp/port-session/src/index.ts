@@ -166,6 +166,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         claudeSessionId,
         firstPrompt: args.firstPrompt,
         cli: args.cli || "claude",
+        view: args.view || "chat",
         title: args.title,
       }),
     });
