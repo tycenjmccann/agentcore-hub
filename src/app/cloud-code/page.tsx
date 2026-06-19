@@ -51,11 +51,18 @@ export default function CloudCodePage() {
     fetchSessions();
   }, [fetchSessions]);
 
-  // Deep link: /cloud-code?session=<id> selects it (the "port to cloud" handoff
-  // link opens straight into the ported session, on any device).
+  // Deep link: /cloud-code?session=<id>[&view=terminal] selects it (the "port to
+  // cloud" handoff link opens straight into the ported session, on any device).
+  // deepViewRef records a one-time view override so the select effect below
+  // doesn't snap it back to chat.
+  const deepViewRef = useRef<"chat" | "terminal" | null>(null);
   useEffect(() => {
-    const id = new URLSearchParams(window.location.search).get("session");
-    if (id) setSelectedId(id);
+    const q = new URLSearchParams(window.location.search);
+    const id = q.get("session");
+    if (id) {
+      if (q.get("view") === "terminal") deepViewRef.current = "terminal";
+      setSelectedId(id);
+    }
   }, []);
 
   // Tracks which session's pending seed we've already auto-fired, so opening a
@@ -64,7 +71,9 @@ export default function CloudCodePage() {
 
   // Load full session when selected
   useEffect(() => {
-    setView("chat");
+    // Honor a deep-link view override once, then default to chat.
+    setView(deepViewRef.current ?? "chat");
+    deepViewRef.current = null;
     if (!selectedId) {
       setActive(null);
       return;
@@ -189,6 +198,7 @@ export default function CloudCodePage() {
   useEffect(() => {
     if (!active?.pendingSeed) return;
     if (active.turns.length > 0) return; // already started
+    if (view === "terminal") return; // terminal does its own `claude --resume`
     if (seededRef.current === active.sessionId) return;
     seededRef.current = active.sessionId;
     const seed = active.pendingSeed;
@@ -199,7 +209,7 @@ export default function CloudCodePage() {
       : "↪ Resuming laptop session — continue from here.";
     runTurn(seed, label);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active?.sessionId, active?.pendingSeed]);
+  }, [active?.sessionId, active?.pendingSeed, view]);
 
   return (
     <div className="flex h-[calc(100vh-56px)] -m-4 md:-m-6 relative">
@@ -351,7 +361,21 @@ export default function CloudCodePage() {
 
             {view === "terminal" ? (
               <div className="flex-1 min-h-0">
-                <ShellTerminal sessionId={active.sessionId} />
+                <ShellTerminal
+                  sessionId={active.sessionId}
+                  // Ported session opened in terminal: auto-run `claude --resume`
+                  // and type the first prompt. Only on the un-started seed.
+                  resumeSessionId={
+                    active.pendingSeed && active.turns.length === 0
+                      ? active.claudeSessionId
+                      : undefined
+                  }
+                  resumeFirstPrompt={
+                    active.pendingSeed && active.turns.length === 0
+                      ? active.pendingSeed
+                      : undefined
+                  }
+                />
               </div>
             ) : (
             <div data-testid="cc-stream" className="flex-1 overflow-y-auto px-5 py-5 flex flex-col gap-3.5">

@@ -20,10 +20,23 @@ type Status = "connecting" | "connected" | "closed" | "error";
  * the AgentCore runtime over a presigned wss:// URL (minted by our API); our
  * server never proxies the socket. Speaks the K8s channel-prefix protocol.
  */
-export default function ShellTerminal({ sessionId }: { sessionId: string }) {
+export default function ShellTerminal({
+  sessionId,
+  resumeSessionId,
+  resumeFirstPrompt,
+}: {
+  sessionId: string;
+  // When set, the shell auto-runs `claude --resume <resumeSessionId>` on connect
+  // (ported session opened in the Terminal tab). resumeFirstPrompt, if given, is
+  // typed as the first message to the resumed agent.
+  resumeSessionId?: string;
+  resumeFirstPrompt?: string;
+}) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<Status>("connecting");
   const [err, setErr] = useState<string | null>(null);
+  // Resume should fire exactly once per attach, even if onopen re-runs.
+  const resumedRef = useRef(false);
 
   useEffect(() => {
     let ws: WebSocket | null = null;
@@ -75,6 +88,30 @@ export default function ShellTerminal({ sessionId }: { sessionId: string }) {
           heartbeat = setInterval(() => {
             if (ws?.readyState === WebSocket.OPEN) ws.send(encodeHeartbeat());
           }, 30_000);
+
+          // Ported session opened in Terminal: cd into the cloned workspace and
+          // natively resume the laptop conversation, then type the first prompt.
+          // WORKSPACE_DIR is exported per-session by shell-init; fall back to the
+          // session's workspace path. The agent picks up with full history.
+          if (resumeSessionId && !resumedRef.current) {
+            resumedRef.current = true;
+            const safeSid = sessionId.replace(/[^A-Za-z0-9._-]/g, "-");
+            const cd = `cd "$WORKSPACE_ROOT/sessions/${safeSid}"/* 2>/dev/null || cd "$WORKSPACE_ROOT"`;
+            const resume = `claude --resume ${resumeSessionId}`;
+            // Send cd + resume as one line; the agent opens in the TUI.
+            setTimeout(() => {
+              if (ws?.readyState !== WebSocket.OPEN) return;
+              ws.send(encodeStdin(`${cd} && ${resume}\n`));
+              if (resumeFirstPrompt) {
+                // Give claude a moment to load the session before typing.
+                setTimeout(() => {
+                  if (ws?.readyState === WebSocket.OPEN) {
+                    ws.send(encodeStdin(`${resumeFirstPrompt}\n`));
+                  }
+                }, 4000);
+              }
+            }, 600);
+          }
         };
 
         ws.onmessage = (ev) => {

@@ -46,6 +46,10 @@ const InputSchema = z.object({
     .optional()
     .describe("Optional first instruction for the cloud agent on resume, e.g. 'focus on the scroll bug first'."),
   cli: z.enum(["claude", "codex"]).optional().describe("Which cloud CLI to resume with. Default: claude."),
+  view: z
+    .enum(["chat", "terminal"])
+    .optional()
+    .describe("Which surface the deep link opens. Default chat (mobile-friendly). 'terminal' auto-runs `claude --resume` in a live shell."),
   commitMessage: z.string().optional().describe("Commit message for the in-flight snapshot."),
   cwd: z.string().optional().describe("Project directory. Defaults to the server's cwd."),
 });
@@ -69,6 +73,7 @@ const TOOL = {
       title: { type: "string", description: "Short session name — sidebar title + one-line hint to the agent." },
       branch: { type: "string", description: "Branch to push to. Defaults to the current branch." },
       firstPrompt: { type: "string", description: "First instruction for the resumed cloud agent (optional)." },
+      view: { type: "string", enum: ["chat", "terminal"], description: "Deep-link surface. Default chat; 'terminal' auto-runs claude --resume in a shell." },
       cli: { type: "string", enum: ["claude", "codex"], description: "Cloud CLI to resume with. Default claude." },
       commitMessage: { type: "string", description: "Commit message for the in-flight snapshot." },
       cwd: { type: "string", description: "Project directory. Defaults to the server cwd." },
@@ -84,11 +89,11 @@ const PORT_PROMPT = {
   name: "port",
   description: "Port this coding session to Cloud Code (commit + push, then resume in the cloud).",
   // One free-text arg so spaces don't split across placeholders. Comma-separated:
-  //   title, first prompt (optional), new branch (optional)
+  //   view (chat|terminal), title, first prompt, new branch — all optional.
   arguments: [
     {
-      name: "title, first prompt, new branch",
-      description: "Comma-separated, all optional — e.g. \"fix scroll, start on the terminal bug, wip/train\"",
+      name: "view, title, first prompt, new branch",
+      description: "Comma-separated, all optional. view=chat|terminal (default chat). e.g. \"terminal, fix scroll, start on the terminal bug, wip/train\"",
       required: false,
     },
   ],
@@ -100,8 +105,9 @@ server.setRequestHandler(GetPromptRequestSchema, async (req) => {
   const a = (req.params.arguments ?? {}) as Record<string, string>;
   // The single arg's name is a human label; read it positionally regardless.
   const raw = Object.values(a)[0] || "";
-  const [title, firstPrompt, branch] = raw.split(",").map((s) => s.trim());
+  const [view, title, firstPrompt, branch] = raw.split(",").map((s) => s.trim());
   const extras: string[] = [];
+  if (view === "terminal" || view === "chat") extras.push(`Open in the ${view} view.`);
   if (title) extras.push(`Use session title: "${title}".`);
   if (firstPrompt) extras.push(`First instruction for the cloud agent on resume: "${firstPrompt}".`);
   if (branch) extras.push(`Push to branch: "${branch}".`);
@@ -199,8 +205,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     // Deep link — built from CLOUD_CODE_URL (the server's DEPLOYMENT_URL may be unset).
+    const viewQ = args.view === "terminal" ? "&view=terminal" : "";
     const link =
-      sid ? `${CLOUD_CODE_URL}/cloud-code?session=${sid}` : data.url || "(no url returned)";
+      sid ? `${CLOUD_CODE_URL}/cloud-code?session=${sid}${viewQ}` : data.url || "(no url returned)";
 
     const sizeMb = (transcript.length / 1_048_576).toFixed(1);
     const summary = [

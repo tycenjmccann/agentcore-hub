@@ -7,19 +7,32 @@
  * For the cloud handoff we only need the human↔assistant thread, so we keep
  * `user` and `assistant` text and drop everything else, then tail it to a budget.
  */
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
-/** cwd → the on-disk project dir name Claude Code uses (slashes → dashes). */
-export function projectDirFor(cwd: string): string {
-  const slug = cwd.replace(/\//g, "-");
-  return path.join(homedir(), ".claude", "projects", slug);
+/** cwd → the on-disk project dir name Claude Code uses.
+ *  Claude slugifies the REAL (symlink-resolved) path with EVERY non-alphanumeric
+ *  char → '-' (not just slashes). So a path with spaces/dots ("Q Projects",
+ *  "my.app") must be encoded the same way or the lookup misses. */
+export function slugForPath(realCwd: string): string {
+  return realCwd.replace(/[^a-zA-Z0-9]/g, "-");
+}
+
+export async function projectDirFor(cwd: string): Promise<string> {
+  // Resolve symlinks (e.g. macOS /var → /private/var) before slugifying.
+  let real = cwd;
+  try {
+    real = await realpath(cwd);
+  } catch {
+    /* path may not exist yet; fall back to the given cwd */
+  }
+  return path.join(homedir(), ".claude", "projects", slugForPath(real));
 }
 
 /** Newest transcript .jsonl in a project dir (= the current/most recent session). */
 export async function newestTranscript(cwd: string): Promise<string | null> {
-  const dir = projectDirFor(cwd);
+  const dir = await projectDirFor(cwd);
   let entries: string[];
   try {
     entries = await readdir(dir);
