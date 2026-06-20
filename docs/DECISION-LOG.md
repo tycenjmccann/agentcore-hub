@@ -4,6 +4,46 @@ Architectural decisions and their rationale. Newest first.
 
 ---
 
+## DL-012: Cloud CLI config that works in chat AND terminal, portable across engineers
+
+**Date:** 2026-06-20
+**Status:** IMPLEMENTED
+**Context:** `sync_cli_config` (DL-011's MCP) uploads a per-user bundle (skills,
+agents, `.mcp.json`) that the runtime materializes into the shared EFS config dir.
+It worked in **chat** but a terminal-opened session showed empty `/skills` + `/mcp`.
+And it must scale to ~hundreds of engineers, each with a different local setup, as a
+one-time setup — without per-user images.
+
+**Decisions:**
+- **Root cause was the trigger, not config loading.** Interactive cloud `claude`
+  *does* read `$CLAUDE_CONFIG_DIR/.mcp.json`. But materialization only ran inside
+  `/invocations` (chat turns + `warm`); a terminal opens via `/shell` (presign-only)
+  and `warm` didn't even pass `user_id`/`config_version`. Fix: a config-only
+  **`prepare`** invoke (apply bundle + default MCP, no clone, no CLI) that `/shell`
+  fires (bounded-await, marker-idempotent) before handing over the PTY URL; plus
+  pass the config ids through `warm`.
+- **One shared image carries launchers, not servers.** Added `uv`/`uvx` + headless
+  `chromium` to the ARM64 image (pip already had Node/npx). Each engineer's declared
+  servers self-install on first launch (`npx -y`, `uvx`). No per-user builds ever.
+- **Portability contract — classify + report, ship only the runnable.** Sync sorts
+  each MCP server into **works** (remote / npx / uvx / pipx), **needs-secret**
+  (runnable but a secret env value — shipped blanked), or **unsupported** (local
+  path, interpreter+local-script, bare binary not in the image, or platform-locked
+  like `xcodebuild`→macOS). Unsupported servers are dropped (cloud never advertises a
+  dead server) and the sync output tells the engineer to reconfigure as `uvx/npx`.
+- **Secrets vault deferred.** Secret env is redacted at sync (never in S3); the
+  servers that need a token stay inactive until a KMS-backed per-user vault lands.
+- **Per-user config dirs deferred.** Safe today because `userId` is hardcoded
+  `"default"` (one user). When SSO lands, config must move to per-user EFS subtrees
+  (shared `.mcp.json` would otherwise collide / leak secrets across users).
+
+**Open follow-ups:** per-user secrets vault; per-user config dirs at SSO; puppeteer
+needs `--no-sandbox` in its server config to launch chromium in the microVM.
+
+See `mcp/port-session/README.md`, `deploy/coding-agent-runtime/README.md`.
+
+---
+
 ## DL-011: Port / pull — move a live coding session laptop↔cloud
 
 **Date:** 2026-06-19

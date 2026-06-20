@@ -157,6 +157,10 @@ export async function warmCodingSession(params: {
   branch?: string;
   resumeTranscriptKey?: string;
   resumeSessionId?: string;
+  // Materialize the user's config bundle (skills/agents/MCP) as part of warming,
+  // so an opened session is hot AND has the user's tools without a chat turn.
+  userId?: string;
+  configVersion?: string;
   region?: string;
 }): Promise<void> {
   if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
@@ -170,6 +174,43 @@ export async function warmCodingSession(params: {
   if (params.branch) payload.branch = params.branch;
   if (params.resumeTranscriptKey) payload.resume_transcript = params.resumeTranscriptKey;
   if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
+  if (params.userId) payload.user_id = params.userId;
+  if (params.configVersion) payload.config_version = params.configVersion;
+
+  const command = new InvokeAgentRuntimeCommand({
+    agentRuntimeArn: CODING_RUNTIME_ARN,
+    runtimeSessionId: params.sessionId,
+    payload: new TextEncoder().encode(JSON.stringify(payload)),
+    contentType: "application/json",
+    accept: "application/json",
+  });
+  await client(region).send(command);
+}
+
+/**
+ * Config-only prepare: tell the session's microVM to materialize the user's
+ * config bundle (skills/agents/.mcp.json) + default MCP gateway, then return —
+ * no repo clone, no CLI. Fired by the /shell route before it hands the browser a
+ * presigned PTY URL, so a TERMINAL-only session (which never runs a chat turn)
+ * still gets the user's skills + MCP servers on disk. Idempotent + sub-second on
+ * a warm VM (the runtime's apply marker no-ops a repeat).
+ */
+export async function prepareCodingSession(params: {
+  sessionId: string;
+  cli: CloudCodeCli;
+  userId?: string;
+  configVersion?: string;
+  region?: string;
+}): Promise<void> {
+  if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
+  const region = params.region || REGION;
+  const payload: Record<string, unknown> = {
+    prepare: true,
+    cli: params.cli,
+    session_id: params.sessionId,
+  };
+  if (params.userId) payload.user_id = params.userId;
+  if (params.configVersion) payload.config_version = params.configVersion;
 
   const command = new InvokeAgentRuntimeCommand({
     agentRuntimeArn: CODING_RUNTIME_ARN,

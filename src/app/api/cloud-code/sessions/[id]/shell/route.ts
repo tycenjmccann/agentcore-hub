@@ -13,9 +13,13 @@ import { NextRequest, NextResponse } from "next/server";
 import { SignatureV4 } from "@smithy/signature-v4";
 import { Sha256 } from "@aws-crypto/sha256-js";
 import { defaultProvider } from "@aws-sdk/credential-provider-node";
-import { getSession } from "@/lib/cloud-code/sessions";
+import { getSession, DEFAULT_USER_ID } from "@/lib/cloud-code/sessions";
+import { currentConfigVersion } from "@/lib/cloud-code/config-store";
+import { prepareCodingSession } from "@/lib/cloud-code/runtime";
 
 export const dynamic = "force-dynamic";
+// Bounded by the prepare race below; the presign itself is instant.
+export const maxDuration = 30;
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const RUNTIME_ARN = process.env.CODING_AGENT_RUNTIME_ARN || "";
@@ -35,6 +39,30 @@ export async function POST(
   const session = await getSession(params.id);
   if (!session) {
     return NextResponse.json({ error: "Session not found" }, { status: 404 });
+  }
+
+  // Materialize the user's config bundle (skills/agents/MCP) onto the session's
+  // microVM BEFORE the browser opens the PTY — a terminal-only session never runs
+  // a chat turn, which is the only other thing that materializes config. Bounded:
+  // wait briefly so `claude` reads .mcp.json on first launch, but never block the
+  // URL on a cold path (materialization continues server-side; marker dedupes).
+  try {
+    const userId = session.userId || DEFAULT_USER_ID;
+    const configVersion = await currentConfigVersion(userId);
+    if (configVersion) {
+      await Promise.race([
+        prepareCodingSession({
+          sessionId: session.sessionId,
+          cli: session.cli,
+          userId,
+          configVersion,
+          region: REGION,
+        }).catch(() => {}),
+        new Promise((r) => setTimeout(r, 4000)),
+      ]);
+    }
+  } catch {
+    /* best-effort; the first chat turn (if any) still materializes */
   }
 
   // A shell id is the reconnect handle for this PTY; one per attach is fine.

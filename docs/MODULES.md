@@ -185,7 +185,10 @@ conversational.
 - `/sessions/port` — "port to cloud" handoff: create a session + presigned S3 PUT
   for the laptop transcript (see port-session MCP below).
 - `/sessions/[id]/warm` — pre-warm the microVM (clone + checkout + install
-  transcript) so a ported session opens instantly.
+  transcript + materialize the config bundle) so a ported session opens instantly.
+- `/sessions/[id]/shell` — also fires a config-only `prepare` invoke before
+  presigning the PTY URL, so a terminal-only session gets the user's skills + MCP
+  servers materialized (a terminal never runs a chat turn, the other trigger).
 - `/sessions/[id]/checkpoint` — round-trip return leg: ask the runtime to upload
   the grown transcript back to S3, return a presigned GET for the laptop to pull.
 - `/config` — per-user CLI config bundle: GET list / POST upload→S3 / PUT set-current.
@@ -196,8 +199,9 @@ own package; excluded from the app tsconfig). Three tools: `port_session_to_clou
 `pull_session_from_cloud` (checkpoint the grown transcript home, `claude --resume`
 locally — same session id both ways), and `sync_cli_config` (one-time: mirror the
 laptop's CLI config — CLAUDE.md/AGENTS.md, skills, agents, MCP servers — into the
-per-user `/config` bundle; scoped per CLI, drops local-path MCP servers, redacts
-secret env). See [mcp/port-session/README.md](../mcp/port-session/README.md).
+per-user `/config` bundle; scoped per CLI, classifies each MCP server works /
+needs-secret / unsupported and ships only the runnable ones, redacts secret env).
+See [mcp/port-session/README.md](../mcp/port-session/README.md).
 
 **Lib**
 - `src/lib/cloud-code/{types,sessions,runtime,config-store,shell-protocol}.ts`

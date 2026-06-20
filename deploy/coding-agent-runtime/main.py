@@ -696,9 +696,14 @@ async def invocations(request: Request):
     # the session home (the round-trip / "unpark"). No prompt, no clone needed
     # beyond locating the existing workspace.
     checkpoint = bool(payload.get("checkpoint"))
+    # Prepare: config-only. Materialize the user's bundle (skills/agents/.mcp.json)
+    # + default MCP into the shared config dir, then return. No clone, no CLI. The
+    # /shell route fires this before handing the browser a presigned PTY URL, so a
+    # terminal-only session (which never hits a chat turn) still gets skills + MCP.
+    prepare = bool(payload.get("prepare"))
 
     prompt = (payload.get("prompt") or "").strip()
-    if not prompt and not warm and not checkpoint:
+    if not prompt and not warm and not checkpoint and not prepare:
         return JSONResponse({"error": "prompt is required"}, status_code=400)
 
     cli = (payload.get("cli") or DEFAULT_CLI).lower()
@@ -730,6 +735,12 @@ async def invocations(request: Request):
     try:
         _apply_config_bundle(user_id, config_version)
         _apply_default_mcp()
+        # Config-only prepare: bundle + default MCP are now on the shared config
+        # dir; the interactive PTY (and any chat turn) will read them. Done — no
+        # clone, no CLI. Idempotent + cheap on a warm VM (marker no-ops re-apply).
+        if prepare:
+            logger.info("prepare_done", extra={"user": user_id, "version": config_version})
+            return JSONResponse({"prepared": True})
         _configure_git()
         workdir = _ensure_workspace(repo, session_id)
         # Land on the ported branch (the laptop pushed its in-flight work there).

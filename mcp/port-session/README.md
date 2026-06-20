@@ -121,15 +121,21 @@ What it ships per CLI:
 **Scoped merge** — syncing one CLI folds its subtree into the current bundle and
 leaves the other CLI's files intact (the `/config` route merges by top-level dir).
 
-**Two safety filters on MCP servers:**
-- **Local-path stdio servers are dropped** — a `command` that's an absolute/`~`/`.`
-  path (a binary not present in the cloud microVM) can't run there. Only remote
-  (`http`/`sse`) and registry-launched (`npx`/`uvx`/PATH) servers ride along and
-  self-install. `port-session` itself is always excluded.
-- **Secret env is redacted** — any `env` key matching token/secret/key/pat/password
-  is blanked before upload (reported back), so credentials aren't dumped to S3. Set
-  those in the cloud separately. (Codex `config.toml` ships verbatim — check it for
-  inline secrets.)
+**Portability contract (what runs in the cloud).** The cloud microVM is Linux
+ARM64 with `node`/`npx`, `uv`/`uvx`, `pip`, and headless `chromium` baked in — it
+carries the *launchers*, not anyone's specific servers, so each server self-installs
+on first launch. Sync classifies every MCP server into three buckets and **only
+ships the runnable ones**:
+
+| Verdict | What it is | Shipped? |
+|---|---|---|
+| ✅ **works** | remote (`http`/`sse`) or registry-launched (`npx`/`uvx`/`pipx`) | yes — self-installs |
+| 🔑 **needs-secret** | runnable, but an `env` value looks secret (token/key/…) | yes, value blanked — set the token in the cloud later (vault TBD) |
+| 🚫 **unsupported** | local-path command, interpreter+local-script, bare binary not in the image, or platform-locked (e.g. `xcodebuild` → needs macOS) | **dropped** — the report tells you to reconfigure as `uvx <pkg>` / `npx <pkg>` |
+
+The sync output prints all three buckets so you know exactly what will and won't
+work, and how to fix the rest. `port-session` itself is always excluded. Secret env
+is never uploaded (Codex `config.toml` ships verbatim — check it for inline secrets).
 
 ## Limits / future
 

@@ -160,6 +160,11 @@ def main() -> None:
         "WORKSPACE_ROOT": EFS_MOUNT,
         "CLAUDE_CONFIG_DIR": f"{EFS_MOUNT}/.claude-data",
         "CODEX_HOME": f"{EFS_MOUNT}/.codex",
+        # Browser-automation MCP servers use the image's system chromium (no
+        # per-session download). Mirrored in shell-init.sh for the PTY surface.
+        "PUPPETEER_EXECUTABLE_PATH": "/usr/bin/chromium",
+        "PUPPETEER_SKIP_DOWNLOAD": "1",
+        "PLAYWRIGHT_BROWSERS_PATH": "0",
     }
     # Artifact bucket — where per-user config bundles live; the server fetches
     # cloud-code/configs/{userId}/{version}.zip and materializes it on turn start.

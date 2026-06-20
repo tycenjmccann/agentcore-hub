@@ -309,26 +309,42 @@ async function runSync(rawArgs: unknown) {
   if (!res.ok) throw new Error(data.error || `config upload returned ${res.status}`);
 
   const sizeKb = (g.zip.length / 1024).toFixed(0);
-  const summary = [
+
+  // MCP servers split into three buckets so the engineer knows exactly what will
+  // and won't run in the cloud, and how to fix the ones that won't.
+  const works = g.classified.filter((c) => c.category === "works");
+  const needsSecret = g.classified.filter((c) => c.category === "needs-secret");
+  const unsupported = g.classified.filter((c) => c.category === "unsupported");
+
+  const lines: string[] = [
     `✅ Synced ${cli} config to Cloud Code.`,
     ``,
     `Uploaded ${g.files.length} files (${sizeKb} KB) — now the active config bundle.`,
     `Included: ${g.files.map((f) => f.replace(`${cli}/`, "")).join(", ")}`,
-    g.droppedServers.length
-      ? `Dropped local-only MCP servers (can't run in the cloud): ${g.droppedServers.join(", ")}`
-      : "",
-    g.redactedEnv.length
-      ? `Redacted secret env (set these in the cloud separately): ${g.redactedEnv.join(", ")}`
-      : "",
-    g.skipped.length ? `Not present locally (skipped): ${g.skipped.join(", ")}` : "",
+  ];
+
+  if (g.classified.length) {
+    lines.push(``, `MCP servers:`);
+    if (works.length)
+      lines.push(`  ✅ Works (${works.length}): ${works.map((c) => `${c.name} [${c.transport}]`).join(", ")}`);
+    if (needsSecret.length) {
+      lines.push(`  🔑 Needs a secret (${needsSecret.length}) — ships but inactive until you set the token in Cloud Code:`);
+      for (const c of needsSecret) lines.push(`     • ${c.name}: ${(c.redactedEnv || []).join(", ")}`);
+    }
+    if (unsupported.length) {
+      lines.push(`  🚫 Won't run in the cloud (${unsupported.length}) — dropped:`);
+      for (const c of unsupported) lines.push(`     • ${c.name}: ${c.reason || c.transport}`);
+    }
+  }
+
+  if (g.skipped.length) lines.push(``, `Not present locally (skipped): ${g.skipped.join(", ")}`);
+  lines.push(
     ``,
     cli === "codex"
       ? `Note: codex/config.toml shipped verbatim — check it for any inline secrets.`
-      : `Run \`/mcp__port-session__sync-config codex\` too if you use Codex in the cloud.`,
-  ]
-    .filter(Boolean)
-    .join("\n");
-  return { content: [{ type: "text", text: summary }] };
+      : `Run \`/mcp__port-session__sync-config codex\` too if you use Codex in the cloud.`
+  );
+  return { content: [{ type: "text", text: lines.join("\n") }] };
 }
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {

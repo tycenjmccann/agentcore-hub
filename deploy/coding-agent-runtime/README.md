@@ -44,7 +44,7 @@ resume = same runtimeSessionId  → same warm microVM + /mnt/workspace
 |---|---|
 | `main.py` | Resumable `/invocations` FastAPI server + `/ping` health (HealthyBusy while a CLI runs) |
 | `run-codex.sh` | Codex launcher — routes GPT-5.5 through Bedrock Mantle (no OpenAI key) |
-| `Dockerfile` | ARM64 image: git, Node, Claude Code, Codex, otelcol-contrib |
+| `Dockerfile` | ARM64 image: git, Node/npx, **uv/uvx**, pip, **headless chromium**, Claude Code, Codex, otelcol-contrib. Carries the MCP launchers (not specific servers) so a user's synced servers self-install |
 | `otel-collector-config.yaml` | SigV4 OTLP → CloudWatch `aws/spans` |
 | `setup-coding-runtime-role.sh` | IAM execution role (Bedrock + Mantle + ECR + observability) |
 | `build-and-push.sh` | Build/push ARM64 image to ECR (account/region from `config.sh`) |
@@ -97,7 +97,8 @@ python3 deploy/coding-agent-runtime/invoke.py --cli codex --repo owner/name "...
 | `branch` | no | `git fetch + checkout` this branch before the turn (the ported in-flight branch) |
 | `resume_transcript` | no | S3 key of a ported `.jsonl`. Installed at the cwd slug → native `claude --resume` |
 | `resume_session_id` | no | The conversation id inside that transcript (its filename) |
-| `warm` | no | Setup-only: clone + checkout + install transcript, **no CLI run**. Pre-warms the microVM at port time |
+| `warm` | no | Setup-only: clone + checkout + install transcript, **no CLI run**. Pre-warms the microVM at port time. Pass `user_id`+`config_version` so it also materializes the config bundle |
+| `prepare` | no | Config-only: materialize the user's bundle (skills/agents/`.mcp.json`) + default MCP, then return. No clone, no CLI. Fired by `/shell` so a terminal-only session gets the user's tools without a chat turn. Needs `user_id`+`config_version` |
 | `checkpoint` | no | Upload the grown transcript back to S3 (the return leg). Returns `{key, bytes, branch}` |
 
 Response: `{ response, claude_session_id, cli, workspace }`, or for the

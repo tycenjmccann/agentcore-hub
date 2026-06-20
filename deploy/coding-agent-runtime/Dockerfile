@@ -10,10 +10,20 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/home/bedrock_agentcore \
     PATH=/home/bedrock_agentcore/.local/bin:$PATH
 
-# System deps — git for repo ops, Node.js for the Node-based CLIs (Claude, Codex)
+# System deps — git for repo ops, Node.js for the Node-based CLIs (Claude, Codex).
+# chromium: so npx/uvx-launched puppeteer/playwright MCP servers use a system
+# browser instead of downloading one per session (PUPPETEER_EXECUTABLE_PATH below).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl ca-certificates bash nodejs npm openssh-client jq unzip bubblewrap \
+    chromium \
     && rm -rf /var/lib/apt/lists/*
+
+# uv / uvx — the universal Python launcher most MCP servers ship as
+# (`uvx <pkg>`). Installed to /usr/local/bin so BOTH the /invocations subprocess
+# and the interactive PTY shell (PATH includes /usr/local/bin) can launch them;
+# servers self-install on first run, so the image carries the launcher, not any
+# specific server. One shared image serves every engineer's synced config.
+RUN pip install --no-cache-dir uv
 
 # GitHub CLI — lets the agent enumerate/inspect repos it has access to
 # (authenticated via GH_TOKEN, which the server exports from GITHUB_PAT).
@@ -28,9 +38,14 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # telemetry and forwards it to CloudWatch. Includes sigv4auth + transform (OTTL)
 # processors that ADOT lacks.
 ARG OTELCOL_VERSION=0.104.0
+# The .deb postinst registers a systemd service, which fails under buildkit
+# ("System has not been booted with systemd"). We only need the unpacked binary
+# (main.py runs /usr/bin/otelcol-contrib directly), so tolerate the postinst
+# failure and assert the binary landed.
 RUN curl -fsSL -o /tmp/otelcol-contrib.deb \
       "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/otelcol-contrib_${OTELCOL_VERSION}_linux_$(dpkg --print-architecture).deb" \
-    && dpkg -i /tmp/otelcol-contrib.deb \
+    && (dpkg -i /tmp/otelcol-contrib.deb || true) \
+    && test -x /usr/bin/otelcol-contrib \
     && rm /tmp/otelcol-contrib.deb
 
 # Codex CLI (Node-based). Pinned for reproducibility.

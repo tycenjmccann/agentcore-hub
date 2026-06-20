@@ -23,8 +23,15 @@ export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-$AWS_REGION}"
 export WORKSPACE_ROOT="${WORKSPACE_ROOT:-/mnt/efs}"
 
 # Claude Code installs to ~/.local/bin; a non-login Terminal shell doesn't have
-# it on PATH, so `claude` reads as "command not found". Add it (and npm globals).
+# it on PATH, so `claude` reads as "command not found". Add it (and npm globals
+# + /usr/local/bin where uv/uvx live).
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+
+# Browser-automation MCP servers (puppeteer/playwright) use the system chromium
+# baked into the image instead of downloading one per session.
+export PUPPETEER_EXECUTABLE_PATH="${PUPPETEER_EXECUTABLE_PATH:-/usr/bin/chromium}"
+export PUPPETEER_SKIP_DOWNLOAD="${PUPPETEER_SKIP_DOWNLOAD:-1}"
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-0}"
 
 # ── Claude Code → Bedrock (no key) ──
 export CLAUDE_CODE_USE_BEDROCK=1

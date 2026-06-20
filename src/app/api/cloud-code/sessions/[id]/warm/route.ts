@@ -9,8 +9,9 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getSession } from "@/lib/cloud-code/sessions";
+import { getSession, DEFAULT_USER_ID } from "@/lib/cloud-code/sessions";
 import { warmCodingSession, codingRuntimeConfigured } from "@/lib/cloud-code/runtime";
+import { currentConfigVersion } from "@/lib/cloud-code/config-store";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -32,6 +33,8 @@ export async function POST(
   }
 
   const region = request.nextUrl.searchParams.get("region") || undefined;
+  const userId = session.userId || DEFAULT_USER_ID;
+  const configVersion = await currentConfigVersion(userId);
   try {
     await warmCodingSession({
       sessionId: session.sessionId,
@@ -40,6 +43,8 @@ export async function POST(
       branch: session.branch,
       resumeTranscriptKey: session.resumeTranscriptKey,
       resumeSessionId: session.claudeSessionId,
+      userId,
+      configVersion,
       region,
     });
     return NextResponse.json({ warmed: true });
