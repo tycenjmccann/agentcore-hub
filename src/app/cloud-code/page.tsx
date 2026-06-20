@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check } from "lucide-react";
+import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown } from "lucide-react";
 import dynamic from "next/dynamic";
 import { sseData } from "@/lib/sse";
 import { MarkdownRenderer } from "@/components/workflow/MarkdownRenderer";
@@ -34,7 +34,11 @@ export default function CloudCodePage() {
   const [view, setView] = useState<"chat" | "terminal">("chat");
   const [sessionsOpen, setSessionsOpen] = useState(false); // mobile session drawer
   const streamEnd = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Auto-scroll follows the bottom WHILE you're already there; if you scroll up
+  // to read, it stops yanking you down and shows a "jump to latest" pill instead.
+  const [stuck, setStuck] = useState(true);
 
   const fetchSessions = useCallback(async () => {
     const res = await fetch("/api/cloud-code/sessions");
@@ -85,9 +89,39 @@ export default function CloudCodePage() {
       .catch(() => {});
   }, [selectedId]);
 
+  // Stick-to-bottom: only follow new content if the user is already near the
+  // bottom. Track that on scroll (threshold absorbs sub-pixel rounding).
+  const onStreamScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    setStuck(nearBottom);
+  }, []);
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = "smooth") => {
+    streamEnd.current?.scrollIntoView({ behavior });
+    setStuck(true);
+  }, []);
+
+  // New turn / streamed text / spinner → follow only while stuck. Switching
+  // sessions snaps to the bottom instantly (you want the latest, no animation).
+  const lastText = active?.turns[active.turns.length - 1]?.text;
   useEffect(() => {
-    streamEnd.current?.scrollIntoView({ behavior: "smooth" });
-  }, [active?.turns.length, sending]);
+    if (stuck) streamEnd.current?.scrollIntoView({ behavior: "smooth" });
+  }, [active?.turns.length, lastText, sending, stuck]);
+
+  useEffect(() => {
+    scrollToLatest("auto");
+  }, [active?.sessionId, scrollToLatest]);
+
+  // Auto-grow the input from 1 line up to ~6, then it scrolls internally. Reset
+  // to scrollHeight on every change (incl. after send clears the draft).
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 152)}px`; // ~6 lines
+  }, [draft]);
 
   const flash = (msg: string) => {
     setToast(msg);
@@ -213,7 +247,7 @@ export default function CloudCodePage() {
   }, [active?.sessionId, active?.pendingSeed, view]);
 
   return (
-    <div className="flex h-[calc(100vh-56px)] -m-4 md:-m-6 relative">
+    <div className="flex h-[calc(100vh-56px)] h-[calc(100dvh-56px)] -m-4 md:-m-6 relative overflow-hidden">
       {/* Mobile backdrop for the session drawer */}
       {sessionsOpen && (
         <div className="fixed inset-0 z-30 bg-black/50 md:hidden" onClick={() => setSessionsOpen(false)} aria-hidden="true" />
@@ -289,10 +323,11 @@ export default function CloudCodePage() {
         </div>
       </aside>
 
-      {/* Main — chat */}
-      <main className="flex-1 flex flex-col min-w-0">
-        {/* Mobile-only bar: open the session drawer + quick New */}
-        <div className="md:hidden flex items-center justify-between px-3 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
+      {/* Main — chat. min-h-0 so the inner stream (not the panel) is what scrolls. */}
+      <main className="flex-1 flex flex-col min-w-0 min-h-0">
+        {/* Mobile-only bar: open the session drawer + quick New. Pinned (shrink-0)
+            so it stays reachable — never scrolls away with the chat. */}
+        <div className="md:hidden flex-shrink-0 flex items-center justify-between px-3 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
           <button
             onClick={() => setSessionsOpen(true)}
             className="flex items-center gap-1.5 text-xs font-medium text-[var(--color-text-secondary)]"
@@ -326,7 +361,7 @@ export default function CloudCodePage() {
           </div>
         ) : (
           <>
-            <div className="px-3 md:px-5 py-3 border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)] flex items-center justify-between gap-2">
+            <div className="flex-shrink-0 px-3 md:px-5 py-3 border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)] flex items-center justify-between gap-2">
               <div className="min-w-0">
                 <div className="font-semibold text-[13.5px] truncate">{active.title}</div>
                 <div className="text-[11px] text-[var(--color-text-muted)] font-mono flex items-center gap-2">
@@ -385,7 +420,13 @@ export default function CloudCodePage() {
                 />
               </div>
             ) : (
-            <div data-testid="cc-stream" className="flex-1 overflow-y-auto px-5 py-5 flex flex-col gap-3.5">
+            <div className="relative flex-1 min-h-0">
+            <div
+              ref={scrollRef}
+              onScroll={onStreamScroll}
+              data-testid="cc-stream"
+              className="h-full overflow-y-auto overscroll-contain px-3 md:px-5 py-5 flex flex-col gap-4"
+            >
               {active.turns.length === 0 && (
                 <p className="text-xs text-[var(--color-text-muted)] text-center mt-4">
                   First task clones the repo (warm after). Try: “add a CONTRIBUTING.md, commit on a branch, open a PR.”
@@ -393,16 +434,20 @@ export default function CloudCodePage() {
               )}
               {active.turns.map((t, i) =>
                 t.role === "user" ? (
-                  <div key={i} className="self-end max-w-[75%] bg-brand-600 text-white px-3.5 py-2 rounded-xl rounded-br-sm text-sm whitespace-pre-wrap">
+                  // User turns keep a bubble (right-aligned) — the visual anchor
+                  // for "what I asked". Capped width so long prompts wrap nicely.
+                  <div key={i} className="self-end max-w-[85%] md:max-w-[75%] bg-brand-600 text-white px-3.5 py-2 rounded-2xl rounded-br-sm text-sm whitespace-pre-wrap break-words">
                     {t.text}
                   </div>
                 ) : (
-                  <div key={i} data-testid="cc-agent-turn" className="self-start max-w-[80%]">
-                    <div className={`flex items-center gap-1 text-[10.5px] font-semibold mb-1 ${CLI_BRAND[active.cli].dot}`}>
+                  // Agent turns: no bubble — full content width (esp. on mobile),
+                  // just a brand label above. Matches ChatGPT/Claude's UI.
+                  <div key={i} data-testid="cc-agent-turn" className="self-stretch w-full">
+                    <div className={`flex items-center gap-1 text-[10.5px] font-semibold mb-1.5 ${CLI_BRAND[active.cli].dot}`}>
                       <CliMark cli={active.cli} className="w-3 h-3" />
                       <span className="tracking-wide">{CLI_BRAND[active.cli].label}</span>
                     </div>
-                    <div className="bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl rounded-tl-sm px-3.5 py-2.5 text-sm">
+                    <div className="text-sm leading-relaxed">
                       <MarkdownRenderer content={t.text} />
                     </div>
                   </div>
@@ -415,11 +460,24 @@ export default function CloudCodePage() {
               )}
               <div ref={streamEnd} />
             </div>
+            {/* Jump-to-latest — shows only when you've scrolled up off the bottom. */}
+            {!stuck && (
+              <button
+                onClick={() => scrollToLatest("smooth")}
+                className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 px-3 py-1.5 rounded-full bg-brand-600 text-white text-xs font-medium shadow-lg hover:bg-brand-500 transition-colors"
+                aria-label="Jump to latest"
+              >
+                <ArrowDown className="w-3.5 h-3.5" /> Latest
+              </button>
+            )}
+            </div>
             )}
 
             {view === "chat" && (
-            <div className="px-5 py-3.5 border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
-              <div className="flex items-end gap-2 bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] rounded-xl px-3.5 py-2">
+            <div className="flex-shrink-0 px-3 md:px-5 py-3 md:py-3.5 border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
+              {/* items-end keeps the send button pinned to the last line as the
+                  box grows; the textarea's own padding centers a single line. */}
+              <div className="flex items-end gap-2 bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] rounded-2xl pl-3.5 pr-2 py-1.5 focus-within:border-brand-500/50 transition-colors">
                 <textarea
                   ref={inputRef}
                   value={draft}
@@ -431,7 +489,7 @@ export default function CloudCodePage() {
                     }
                   }}
                   rows={1}
-                  placeholder={sending ? "Working… (you can queue your next message)" : "Give the next task…"}
+                  placeholder={sending ? "Working… (you can queue your next message)" : "Give the next task…   (Enter to send, Shift+Enter for a new line)"}
                   autoFocus
                   // Stop iOS/Safari from offering password/card/contact AutoFill on a
                   // plain prompt box (the key/card/pin chips above the keyboard).
@@ -440,13 +498,13 @@ export default function CloudCodePage() {
                   autoCapitalize="off"
                   spellCheck={false}
                   data-testid="cc-message-input"
-                  className="flex-1 bg-transparent resize-none outline-none text-sm max-h-32"
+                  className="flex-1 bg-transparent resize-none outline-none text-sm leading-6 py-1.5 max-h-[152px] placeholder:text-[var(--color-text-muted)]"
                 />
                 <button
                   onClick={send}
                   disabled={sending || !draft.trim()}
                   data-testid="cc-send"
-                  className="w-8 h-8 rounded-lg bg-brand-600 text-white flex items-center justify-center hover:bg-brand-500 transition-colors disabled:opacity-40 flex-shrink-0"
+                  className="w-8 h-8 mb-0.5 rounded-lg bg-brand-600 text-white flex items-center justify-center hover:bg-brand-500 transition-colors disabled:opacity-40 flex-shrink-0"
                   aria-label="Send"
                 >
                   <Send className="w-4 h-4" />
