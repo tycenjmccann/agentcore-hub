@@ -1,6 +1,11 @@
 /**
  * GET  /api/cloud-code/config   → list config-bundle versions + which is current
- * POST /api/cloud-code/config   → upload a new bundle (zip) → S3, register version
+ * POST /api/cloud-code/config   → upload a bundle (zip) → S3, register version.
+ *                                 multipart: bundle (zip), label?, scope?
+ *                                 scope=claude|codex → MERGE that CLI's subtree
+ *                                 into the current bundle (keeps the other CLI's
+ *                                 files); absent → full-replace. The port-session
+ *                                 MCP's sync_cli_config uses scope.
  * PUT  /api/cloud-code/config   → set the current version  { version }
  *
  * A bundle is the user's Claude Code / Codex setup (MCP servers, skills, custom
@@ -15,6 +20,8 @@ import {
   getUserConfig,
   saveUserConfig,
   s3KeyFor,
+  mergeScopedBundle,
+  getCurrentBundleZip,
   ARTIFACT_BUCKET,
   type ConfigVersion,
 } from "@/lib/cloud-code/config-store";
@@ -44,11 +51,23 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "bundle exceeds 25 MB" }, { status: 413 });
   }
   const label = (form?.get("label") as string) || undefined;
-  const bytes = Buffer.from(await file.arrayBuffer());
+  // scope=claude|codex → merge only that CLI's subtree into the current bundle
+  // (syncing one CLI keeps the other's files). Absent → full-replace (legacy).
+  const scopeRaw = (form?.get("scope") as string) || "";
+  const scope = scopeRaw === "claude" || scopeRaw === "codex" ? scopeRaw : undefined;
+  let bytes = Buffer.from(await file.arrayBuffer());
 
-  // Cheap zip sanity + file count (PK\x03\x04 magic).
+  // Cheap zip sanity (PK\x03\x04 magic).
   if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) {
     return NextResponse.json({ error: "bundle must be a .zip" }, { status: 400 });
+  }
+
+  // Scoped sync: fold the incoming CLI subtree into the current bundle so the
+  // other CLI's config survives. The merged zip becomes the new version.
+  if (scope) {
+    const current = await getCurrentBundleZip(DEFAULT_USER_ID);
+    const merged = await mergeScopedBundle(current, bytes, scope);
+    bytes = Buffer.from(merged.zip);
   }
   const fileCount = countZipEntries(bytes);
 

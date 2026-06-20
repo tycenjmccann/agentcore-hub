@@ -190,12 +190,14 @@ conversational.
   the grown transcript back to S3, return a presigned GET for the laptop to pull.
 - `/config` — per-user CLI config bundle: GET list / POST upload→S3 / PUT set-current.
 
-**Port / pull MCP** — `mcp/port-session/` (standalone local stdio MCP, its own
-package; excluded from the app tsconfig). Moves a live session laptop↔cloud:
-`port_session_to_cloud` (commit+push, ship the raw `.jsonl` to S3, native
-`claude --resume` in the cloud) and `pull_session_from_cloud` (checkpoint the
-grown transcript home, `claude --resume` locally). Same session id both ways.
-See [mcp/port-session/README.md](../mcp/port-session/README.md).
+**Port / pull / sync MCP** — `mcp/port-session/` (standalone local stdio MCP, its
+own package; excluded from the app tsconfig). Three tools: `port_session_to_cloud`
+(commit+push, ship the raw `.jsonl` to S3, native `claude --resume` in the cloud),
+`pull_session_from_cloud` (checkpoint the grown transcript home, `claude --resume`
+locally — same session id both ways), and `sync_cli_config` (one-time: mirror the
+laptop's CLI config — CLAUDE.md/AGENTS.md, skills, agents, MCP servers — into the
+per-user `/config` bundle; scoped per CLI, drops local-path MCP servers, redacts
+secret env). See [mcp/port-session/README.md](../mcp/port-session/README.md).
 
 **Lib**
 - `src/lib/cloud-code/{types,sessions,runtime,config-store,shell-protocol}.ts`

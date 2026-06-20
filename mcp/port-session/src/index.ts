@@ -29,6 +29,7 @@ import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import { readState, commitAndPush, pullBranch } from "./git.js";
 import { newestTranscript, sessionIdForTranscript, installLocalTranscript } from "./transcript.js";
+import { gatherBundle, type Cli } from "./config.js";
 
 const CLOUD_CODE_URL = (process.env.CLOUD_CODE_URL || "").replace(/\/$/, "");
 
@@ -100,7 +101,26 @@ const PULL_TOOL = {
   },
 };
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [TOOL, PULL_TOOL] }));
+const SYNC_TOOL = {
+  name: "sync_cli_config",
+  description:
+    "One-time setup: mirror this laptop's coding-CLI configuration to Cloud Code " +
+    "so cloud sessions are a clone of your local setup (CLAUDE.md / AGENTS.md, " +
+    "skills, custom agents, MCP servers). Run once per CLI — `cli:\"claude\"` " +
+    "uploads your Claude Code config, `cli:\"codex\"` your Codex config; run twice " +
+    "for both. Not part of porting — config is reused by every future session. " +
+    "Local-only MCP servers (absolute-path commands) are dropped (they can't run " +
+    "in the cloud) and secret env values are redacted before upload.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      cli: { type: "string", enum: ["claude", "codex"], description: "Which CLI's config to sync. Required — one at a time." },
+    },
+    required: ["cli"],
+  },
+};
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [TOOL, PULL_TOOL, SYNC_TOOL] }));
 
 // Slash-command surface: a `port` prompt shows up as
 // /mcp__port-session__port. Selecting it tells Claude to call the tool now.
@@ -126,9 +146,32 @@ const PULL_PROMPT = {
   ],
 };
 
-server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [PORT_PROMPT, PULL_PROMPT] }));
+const SYNC_PROMPT = {
+  name: "sync-config",
+  description: "Mirror this laptop's CLI config (skills, agents, MCP) to Cloud Code. One CLI at a time.",
+  arguments: [{ name: "cli", description: "claude or codex (required).", required: true }],
+};
+
+server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [PORT_PROMPT, PULL_PROMPT, SYNC_PROMPT] }));
 
 server.setRequestHandler(GetPromptRequestSchema, async (req) => {
+  if (req.params.name === "sync-config") {
+    const cli = (Object.values((req.params.arguments ?? {}) as Record<string, string>)[0] || "claude").trim();
+    return {
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text:
+              `Sync my local ${cli} CLI configuration to Cloud Code by calling the ` +
+              `sync_cli_config tool now with cli="${cli}". After it returns, show me ` +
+              `what was uploaded and anything that was dropped or redacted.`,
+          },
+        },
+      ],
+    };
+  }
   if (req.params.name === "pull") {
     const v = Object.values((req.params.arguments ?? {}) as Record<string, string>)[0] || "";
     return {
@@ -235,7 +278,67 @@ async function runPull(rawArgs: unknown) {
   return { content: [{ type: "text", text: summary }] };
 }
 
+const SyncSchema = z.object({ cli: z.enum(["claude", "codex"]) });
+
+async function runSync(rawArgs: unknown) {
+  if (!CLOUD_CODE_URL) throw new Error("CLOUD_CODE_URL is not set in the MCP server environment.");
+  const { cli } = SyncSchema.parse(rawArgs ?? {});
+
+  // 1. gather this CLI's local config into a bundle zip (claude/... or codex/...).
+  const g = await gatherBundle(cli as Cli);
+  if (g.files.length === 0) {
+    throw new Error(`No local ${cli} config found to sync (looked under ~/.${cli}).`);
+  }
+
+  // 2. upload to /config with scope=<cli> so the server MERGES this CLI's subtree
+  //    into the current bundle — syncing one CLI never wipes the other.
+  const form = new FormData();
+  form.set("bundle", new Blob([new Uint8Array(g.zip)], { type: "application/zip" }), `${cli}-config.zip`);
+  form.set("label", `${cli} config sync`);
+  form.set("scope", cli);
+  const res = await fetch(`${CLOUD_CODE_URL}/api/cloud-code/config`, {
+    method: "POST",
+    body: form,
+    signal: AbortSignal.timeout(60_000),
+  });
+  const data = (await res.json().catch(() => ({}))) as {
+    version?: { version?: string; fileCount?: number };
+    currentVersion?: string;
+    error?: string;
+  };
+  if (!res.ok) throw new Error(data.error || `config upload returned ${res.status}`);
+
+  const sizeKb = (g.zip.length / 1024).toFixed(0);
+  const summary = [
+    `✅ Synced ${cli} config to Cloud Code.`,
+    ``,
+    `Uploaded ${g.files.length} files (${sizeKb} KB) — now the active config bundle.`,
+    `Included: ${g.files.map((f) => f.replace(`${cli}/`, "")).join(", ")}`,
+    g.droppedServers.length
+      ? `Dropped local-only MCP servers (can't run in the cloud): ${g.droppedServers.join(", ")}`
+      : "",
+    g.redactedEnv.length
+      ? `Redacted secret env (set these in the cloud separately): ${g.redactedEnv.join(", ")}`
+      : "",
+    g.skipped.length ? `Not present locally (skipped): ${g.skipped.join(", ")}` : "",
+    ``,
+    cli === "codex"
+      ? `Note: codex/config.toml shipped verbatim — check it for any inline secrets.`
+      : `Run \`/mcp__port-session__sync-config codex\` too if you use Codex in the cloud.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return { content: [{ type: "text", text: summary }] };
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (req.params.name === SYNC_TOOL.name) {
+    try {
+      return await runSync(req.params.arguments);
+    } catch (err) {
+      return { isError: true, content: [{ type: "text", text: `Sync failed: ${(err as Error).message}` }] };
+    }
+  }
   if (req.params.name === PULL_TOOL.name) {
     try {
       return await runPull(req.params.arguments);

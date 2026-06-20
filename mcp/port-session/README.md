@@ -99,6 +99,38 @@ Returns a deep link `<CLOUD_CODE_URL>/cloud-code?session=<id>` + the `/pull` com
 
 Brings the cloud's work home and prints `/exit` + `claude --resume <id>`.
 
+### `sync_cli_config`  (slash: `/mcp__port-session__sync-config`)
+
+**One-time setup** (re-run when your local config changes) — mirror this laptop's
+coding-CLI configuration to Cloud Code so every future cloud session is a clone of
+your local setup. **Not** part of porting; it writes the per-user config bundle the
+runtime materializes on each turn (the same `/config` bundle you'd otherwise upload
+by hand).
+
+| Arg | Default | Notes |
+|---|---|---|
+| `cli` | — (required) | `claude` or `codex`. One at a time — run twice for both. |
+
+What it ships per CLI:
+
+| `cli` | Source → bundle | |
+|---|---|---|
+| `claude` | `~/.claude/CLAUDE.md`, `agents/`, `skills/`, `commands/`, `output-styles/` → `claude/…`; `~/.claude.json` `mcpServers` → `claude/.mcp.json` | |
+| `codex` | `~/.codex/config.toml`, `AGENTS.md`, `prompts/` → `codex/…` | |
+
+**Scoped merge** — syncing one CLI folds its subtree into the current bundle and
+leaves the other CLI's files intact (the `/config` route merges by top-level dir).
+
+**Two safety filters on MCP servers:**
+- **Local-path stdio servers are dropped** — a `command` that's an absolute/`~`/`.`
+  path (a binary not present in the cloud microVM) can't run there. Only remote
+  (`http`/`sse`) and registry-launched (`npx`/`uvx`/PATH) servers ride along and
+  self-install. `port-session` itself is always excluded.
+- **Secret env is redacted** — any `env` key matching token/secret/key/pat/password
+  is blanked before upload (reported back), so credentials aren't dumped to S3. Set
+  those in the cloud separately. (Codex `config.toml` ships verbatim — check it for
+  inline secrets.)
+
 ## Limits / future
 
 - **Claude only.** `--resume` is a Claude Code mechanism. Codex resume uses a
