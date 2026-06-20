@@ -86,10 +86,14 @@ def _load_session_map() -> dict:
 def _remember_session(claude_session_id: str | None, repo: str | None) -> None:
     if not claude_session_id:
         return
-    os.makedirs(WORKSPACE_ROOT, exist_ok=True)
-    m = _load_session_map()
-    m[claude_session_id] = {"repo": repo}
+    # Best-effort: a degraded/stale EFS mount can make makedirs raise
+    # FileExistsError even with exist_ok=True (path exists but isn't a dir). This
+    # is bookkeeping for cwd recovery on resume — never worth failing a finished
+    # turn over (the turn's output is already streamed by the time we get here).
     try:
+        os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+        m = _load_session_map()
+        m[claude_session_id] = {"repo": repo}
         with open(SESSION_MAP, "w") as f:
             json.dump(m, f)
     except OSError as exc:
@@ -445,8 +449,17 @@ def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
     runtimeSessionId finds it warm — no re-clone)."""
     base = _session_dir(session_id)
     if not repo:
-        os.makedirs(base, exist_ok=True)
-        return base
+        # A chat resume with no repo just needs a cwd. Tolerate a degraded EFS
+        # mount (makedirs can raise FileExistsError when the path exists but isn't
+        # a dir) — fall back to any usable existing dir rather than 500 the turn.
+        try:
+            os.makedirs(base, exist_ok=True)
+            return base
+        except OSError as exc:
+            logger.warning("workspace_mkdir_failed", extra={"base": base, "error": str(exc)[:200]})
+            if os.path.isdir(base):
+                return base
+            return WORKSPACE_ROOT if os.path.isdir(WORKSPACE_ROOT) else "/tmp"
     if not _valid_repo(repo):
         raise ValueError(
             f"'{repo}' is not a valid repository. Use 'owner/name' or a full "
@@ -728,19 +741,30 @@ async def invocations(request: Request):
         {"cli": cli, "repo": repo, "resume": bool(claude_session_id),
          "stream": stream, "prompt_head": prompt[:120]}))
 
-    # Shared setup for both streaming and buffered paths.
-    # Order matters: lay down the user's bundle FIRST (it may include its own
-    # .mcp.json / config.toml), THEN merge our default gateway on top so the
-    # always-advertised gateway tools survive a bundle that ships MCP config.
+    # Config materialization is BEST-EFFORT — never turn-fatal. A degraded EFS
+    # mount or unwritable config dir would otherwise 500 an otherwise-runnable
+    # turn (the CLI can still run against whatever's already on disk). Order:
+    # user bundle FIRST (may ship its own .mcp.json / config.toml), THEN our
+    # default gateway on top so the always-advertised gateway tools survive.
+    config_ok = True
+    config_err = ""
     try:
         _apply_config_bundle(user_id, config_version)
         _apply_default_mcp()
-        # Config-only prepare: bundle + default MCP are now on the shared config
-        # dir; the interactive PTY (and any chat turn) will read them. Done — no
-        # clone, no CLI. Idempotent + cheap on a warm VM (marker no-ops re-apply).
-        if prepare:
-            logger.info("prepare_done", extra={"user": user_id, "version": config_version})
-            return JSONResponse({"prepared": True})
+    except Exception as exc:  # noqa: BLE001 — config is non-fatal
+        config_ok = False
+        config_err = str(exc)[:300]
+        logger.warning("config_apply_failed", extra={"error": config_err})
+
+    # Config-only prepare: the bundle + default MCP are the whole job. Report
+    # success/failure but always 200 so the /shell best-effort caller never errors
+    # (a stale-mount VM will be replaced; the next turn retries).
+    if prepare:
+        logger.info("prepare_done", extra={"user": user_id, "version": config_version, "ok": config_ok})
+        return JSONResponse({"prepared": config_ok, "config_error": config_err or None})
+
+    # Workspace setup IS fatal — no workdir, no turn.
+    try:
         _configure_git()
         workdir = _ensure_workspace(repo, session_id)
         # Land on the ported branch (the laptop pushed its in-flight work there).

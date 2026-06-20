@@ -5,6 +5,7 @@ import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, Te
 import dynamic from "next/dynamic";
 import { sseData } from "@/lib/sse";
 import { MarkdownRenderer } from "@/components/workflow/MarkdownRenderer";
+import { CliBadge, CliMark, CLI_BRAND } from "@/components/cloud-code/CliBrand";
 
 // xterm touches the DOM/window — load only in the browser.
 const ShellTerminal = dynamic(() => import("@/components/cloud-code/ShellTerminal"), { ssr: false });
@@ -19,11 +20,6 @@ const WARMTH_DOT: Record<SessionWarmth, string> = {
   warm: "bg-green-400 shadow-[0_0_0_3px_rgba(34,197,94,0.15)]",
   idle: "bg-amber-400/70",
   cold: "bg-[var(--color-text-muted)]",
-};
-
-const CLI_BADGE: Record<CloudCodeCli, string> = {
-  claude: "bg-purple-500/15 text-purple-300",
-  codex: "bg-green-500/15 text-green-300",
 };
 
 export default function CloudCodePage() {
@@ -275,9 +271,7 @@ export default function CloudCodePage() {
                 </button>
               </div>
               <div className="flex items-center gap-2 mt-1 pl-4 text-[10.5px] text-[var(--color-text-muted)]">
-                <span className={`px-1.5 rounded font-semibold uppercase tracking-wide ${CLI_BADGE[s.cli]}`}>
-                  {s.cli}
-                </span>
+                <CliBadge cli={s.cli} className="text-[10px]" />
                 {s.repo && <span className="truncate">{s.repo.split("/").slice(-2).join("/")}</span>}
               </div>
             </div>
@@ -336,7 +330,7 @@ export default function CloudCodePage() {
               <div className="min-w-0">
                 <div className="font-semibold text-[13.5px] truncate">{active.title}</div>
                 <div className="text-[11px] text-[var(--color-text-muted)] font-mono flex items-center gap-2">
-                  <span className={`px-1.5 rounded font-semibold uppercase ${CLI_BADGE[active.cli]}`}>{active.cli}</span>
+                  <CliBadge cli={active.cli} />
                   {active.repo && (
                     <span className="flex items-center gap-1">
                       <GitBranch className="w-3 h-3" /> {active.repo}
@@ -404,8 +398,9 @@ export default function CloudCodePage() {
                   </div>
                 ) : (
                   <div key={i} data-testid="cc-agent-turn" className="self-start max-w-[80%]">
-                    <div className="text-[10.5px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)] mb-1">
-                      {active.cli}
+                    <div className={`flex items-center gap-1 text-[10.5px] font-semibold mb-1 ${CLI_BRAND[active.cli].dot}`}>
+                      <CliMark cli={active.cli} className="w-3 h-3" />
+                      <span className="tracking-wide">{CLI_BRAND[active.cli].label}</span>
                     </div>
                     <div className="bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl rounded-tl-sm px-3.5 py-2.5 text-sm">
                       <MarkdownRenderer content={t.text} />
