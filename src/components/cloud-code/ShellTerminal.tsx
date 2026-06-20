@@ -24,6 +24,7 @@ export default function ShellTerminal({
   sessionId,
   resumeSessionId,
   resumeFirstPrompt,
+  onSeedConsumed,
 }: {
   sessionId: string;
   // When set, the shell auto-runs `claude --resume <resumeSessionId>` on connect
@@ -31,6 +32,10 @@ export default function ShellTerminal({
   // typed as the first message to the resumed agent.
   resumeSessionId?: string;
   resumeFirstPrompt?: string;
+  // Called once after the first-prompt seed has been typed, so the parent can
+  // persist a clear (clearPendingSeed). Reopening then re-attaches via
+  // `claude --resume` WITHOUT re-typing the seed.
+  onSeedConsumed?: () => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<Status>("connecting");
@@ -102,11 +107,15 @@ export default function ShellTerminal({
             setTimeout(() => {
               if (ws?.readyState !== WebSocket.OPEN) return;
               ws.send(encodeStdin(`${cd} && ${resume}\n`));
+              // The first-prompt seed is typed ONCE (it's a long nudge). Tell the
+              // parent so it persists a clear — reopening re-runs `claude --resume`
+              // above (idempotent) but never re-types this seed (which would stack
+              // in the transcript). Re-attach without a seed skips this block.
               if (resumeFirstPrompt) {
-                // Give claude a moment to load the session before typing.
                 setTimeout(() => {
                   if (ws?.readyState === WebSocket.OPEN) {
                     ws.send(encodeStdin(`${resumeFirstPrompt}\n`));
+                    onSeedConsumed?.();
                   }
                 }, 4000);
               }

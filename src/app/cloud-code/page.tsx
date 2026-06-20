@@ -374,18 +374,20 @@ export default function CloudCodePage() {
               <div className="flex-1 min-h-0">
                 <ShellTerminal
                   sessionId={active.sessionId}
-                  // Ported session opened in terminal: auto-run `claude --resume`
-                  // and type the first prompt. Only on the un-started seed.
-                  resumeSessionId={
-                    active.pendingSeed && active.turns.length === 0
-                      ? active.claudeSessionId
-                      : undefined
-                  }
-                  resumeFirstPrompt={
-                    active.pendingSeed && active.turns.length === 0
-                      ? active.pendingSeed
-                      : undefined
-                  }
+                  // Re-attach with `claude --resume` on EVERY terminal open (the
+                  // session is resumable by id). Type the first-prompt seed only
+                  // while pendingSeed is set — once typed we clear it so reopening
+                  // re-attaches without re-typing (which would stack the seed).
+                  resumeSessionId={active.cli === "claude" ? active.claudeSessionId : undefined}
+                  resumeFirstPrompt={active.pendingSeed || undefined}
+                  onSeedConsumed={() => {
+                    setActive((s) => (s ? { ...s, pendingSeed: undefined } : s));
+                    fetch(`/api/cloud-code/sessions/${active.sessionId}`, {
+                      method: "PATCH",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ clearPendingSeed: true }),
+                    }).catch(() => {});
+                  }}
                 />
               </div>
             ) : (
