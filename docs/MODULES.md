@@ -21,6 +21,7 @@ with the Evaluations surface removed), the remaining app still passes
 | **Workflow** | Optional | Multi-agent orchestration pipeline: intake → requirements → design → development → verification → review, with Jira + ticket tracking. |
 | **Evaluations** | Optional | Self-improvement loop: ingests AgentCore evaluation results from CloudWatch Logs, buffers them, and feeds an improver agent. |
 | **Registry** | Optional | Browse/manage the Amazon Bedrock AgentCore Registry — catalogs of registries and their records (MCP servers, A2A agents, custom resources, agent skills) with an approval lifecycle. |
+| **Cloud Code** | Optional | "Safe to close your laptop" coding agent — Claude Code / Codex run server-side on a dedicated AgentCore Runtime with an EFS workspace; chat (streaming) + a live terminal, resumable from any device. |
 
 The core never imports from an optional module. Optional modules may share core
 libraries (`src/lib/agentcore-sdk.ts`, `src/lib/client-cache.ts`, etc.) and the
@@ -157,6 +158,88 @@ credentials) — no module-specific credentials config.
 - Delete the `/registry` nav entry tagged `module: "registry"` in `src/config/modules.ts`
 - `rm -rf src/app/registry src/app/api/agentcore/registry`
 - Nothing else to tear down (no Lambdas/tables); then `npx tsc --noEmit && npm run build`
+
+---
+
+## Module: Cloud Code (optional)
+
+A standalone, user-facing coding agent — the AWS "safe to close your laptop"
+pattern (`awslabs/agentcore-samples` 04-coding-agents). Claude Code and Codex
+(GPT-5.5 via Bedrock Mantle) run **server-side** in a dedicated AgentCore
+Runtime; the browser is a thin client. Sessions are resumable from any device.
+This module is **not** part of the 14-agent workflow fleet — it's Git-native and
+conversational.
+
+**UI routes**
+- `src/app/cloud-code/` — session sidebar (warm/idle/cold, resume) + chat
+  (streaming) + a live terminal (xterm over a presigned WebSocket PTY).
+- `src/components/cloud-code/ShellTerminal.tsx` — the terminal.
+
+**API routes** (under `src/app/api/cloud-code/`)
+- `/sessions` — list / create sessions
+- `/sessions/[id]` — get / delete
+- `/sessions/[id]/message` — run a turn; `?stream=1` relays SSE (Claude streams,
+  Codex buffered). See [streaming-sse.md](./streaming-sse.md).
+- `/sessions/[id]/shell` — mint a SigV4-presigned `wss://` URL; the browser
+  connects directly to the runtime PTY (App Runner does not proxy it).
+- `/sessions/port` — "port to cloud" handoff: create a session + presigned S3 PUT
+  for the laptop transcript (see port-session MCP below).
+- `/sessions/[id]/warm` — pre-warm the microVM (clone + checkout + install
+  transcript + materialize the config bundle) so a ported session opens instantly.
+- `/sessions/[id]/shell` — also fires a config-only `prepare` invoke before
+  presigning the PTY URL, so a terminal-only session gets the user's skills + MCP
+  servers materialized (a terminal never runs a chat turn, the other trigger).
+- `/sessions/[id]/checkpoint` — round-trip return leg: ask the runtime to upload
+  the grown transcript back to S3, return a presigned GET for the laptop to pull.
+- `/config` — per-user CLI config bundle: GET list / POST upload→S3 / PUT set-current.
+
+**Port / pull / sync MCP** — `mcp/port-session/` (standalone local stdio MCP, its
+own package; excluded from the app tsconfig). Three tools: `port_session_to_cloud`
+(commit+push, ship the raw `.jsonl` to S3, native `claude --resume` in the cloud),
+`pull_session_from_cloud` (checkpoint the grown transcript home, `claude --resume`
+locally — same session id both ways), and `sync_cli_config` (one-time: mirror the
+laptop's CLI config — CLAUDE.md/AGENTS.md, skills, agents, MCP servers — into the
+per-user `/config` bundle; scoped per CLI, classifies each MCP server works /
+needs-secret / unsupported and ships only the runnable ones, redacts secret env).
+See [mcp/port-session/README.md](../mcp/port-session/README.md).
+
+**Lib**
+- `src/lib/cloud-code/{types,sessions,runtime,config-store,shell-protocol}.ts`
+- `src/lib/sse.ts` — shared SSE reader (also used by agent-detail/builder streams).
+
+**The runtime** (separate from the fleet) — `deploy/coding-agent-runtime/`:
+- EFS-backed `/mnt/efs` workspace (elastic, survives cold microVMs; the default
+  ~1 GB sessionStorage overflowed). VPC + EFS provisioned by `cfn-vpc-efs.yaml` /
+  `setup-coding-efs.sh`.
+- `main.py` resumable `/invocations` server; per-session isolated checkouts;
+  no-login terminal (Bedrock env + token); default MCP gateway + user config
+  bundle materialized on turn start. See `deploy/coding-agent-runtime/README.md`.
+
+**AWS services**
+- `bedrock-agentcore` (data plane) — `InvokeAgentRuntime` (chat) + the WebSocket
+  shell (`InvokeAgentRuntimeCommandShell`).
+- `bedrock-agentcore-control` — create/update the runtime (VPC + EFS).
+- Bedrock (Claude) + Bedrock Mantle (Codex GPT-5.5), EFS, S3 (config bundles),
+  optional AgentCore Gateway (MCP tools).
+
+**DynamoDB tables**
+- `agentcore-hub-cloud-code-sessions` — one row per session (turns, cli, repo,
+  claudeSessionId, userId, `defaultView` chat|terminal, and for ported sessions
+  `branch` + `resumeTranscriptKey` + `pendingSeed`); also holds `config:{userId}`
+  rows for config-bundle metadata. Single-user today (`userId:"default"`; swap
+  for the Cognito sub).
+
+**App env** (App Runner) — `CODING_AGENT_RUNTIME_ARN`, `CLOUD_CODE_TABLE`,
+`MCP_GATEWAY_URL`; instance role needs `bedrock-agentcore:InvokeAgentRuntime` +
+`InvokeAgentRuntimeCommandShell`.
+
+**Removing the module**
+- Delete the `/cloud-code` nav entry tagged `module: "cloud-code"` in `src/config/modules.ts`
+- `rm -rf src/app/cloud-code src/app/api/cloud-code src/lib/cloud-code src/components/cloud-code mcp/port-session`
+- Optionally tear down the runtime (`deploy/coding-agent-runtime/`), the
+  `agentcore-hub-cloud-code-sessions` table, and the VPC/EFS stack
+  (`agentcore-hub-coding-vpc-efs`). `src/lib/sse.ts` is shared — keep it.
+- `npx tsc --noEmit && npm run build`
 
 ---
 

@@ -18,6 +18,7 @@ next-env.d.ts
 .aws-sam/
 lambda/orchestrator/.aws-sam/
 lambda/orchestrator/function.zip
+mcp/*/dist/
 lambda/skill-loader/function.zip
 lambda/eval-packager/function.zip
 
@@ -65,3 +66,4 @@ __pycache__/
 
 # Claude Code
 .claude/
+.recovered/

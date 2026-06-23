@@ -40,6 +40,16 @@ fi
 
 : "${AWS_REGION:?AWS_REGION must be set}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# Account guard: if EXPECTED_ACCOUNT_ID is set (sourced from .env.local above),
+# refuse to deploy to any other account — prevents shipping to the wrong profile.
+# Opt-in and env-driven; no account ID is hardcoded in this open-source repo.
+if [[ -n "${EXPECTED_ACCOUNT_ID:-}" && "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT_ID" ]]; then
+  echo "ERROR: refusing to deploy — credentials resolve to account $ACCOUNT_ID," >&2
+  echo "       but EXPECTED_ACCOUNT_ID=$EXPECTED_ACCOUNT_ID. Wrong AWS_PROFILE?" >&2
+  exit 1
+fi
+
 ECR_REPO="agentcore-hub-frontend"
 ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
 SERVICE_NAME="agentcore-hub"
@@ -170,6 +180,7 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": [
           \"bedrock-agentcore:InvokeAgentRuntime\",
+          \"bedrock-agentcore:InvokeAgentRuntimeCommandShell\",
           \"bedrock-agentcore:InvokeHarness\",
           \"bedrock-agentcore:GetAgentRuntime\",
           \"bedrock-agentcore:GetHarness\",
@@ -288,7 +299,7 @@ for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE
            JIRA_API_TOKEN JIRA_PROJECT_KEY GITHUB_PAT GITHUB_OWNER GITHUB_REPO \
            MCP_SERVERS BUILDER_AGENT_ID AGENTCORE_ROLE_ARN LAMBDA_ROLE_ARN \
            NEXT_PUBLIC_BRAND_NAME EVAL_CONFIG_TABLE DEPLOY_MODE \
-           WORKFLOW_RUNTIME_COUNT; do
+           WORKFLOW_RUNTIME_COUNT CODING_AGENT_RUNTIME_ARN CLOUD_CODE_TABLE; do
   val="${!var:-}"
   if [[ -n "$val" ]]; then
     # Escape quotes in the value for JSON safety

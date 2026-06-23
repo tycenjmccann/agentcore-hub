@@ -5,12 +5,21 @@ import { createContext, useContext, useState, useEffect, type ReactNode } from "
 interface SidebarContextType {
   isCollapsed: boolean;
   toggle: () => void;
+  /** Mobile off-canvas drawer open state (ignored on desktop). */
+  mobileOpen: boolean;
+  setMobileOpen: (open: boolean) => void;
 }
 
-const SidebarContext = createContext<SidebarContextType>({ isCollapsed: false, toggle: () => {} });
+const SidebarContext = createContext<SidebarContextType>({
+  isCollapsed: false,
+  toggle: () => {},
+  mobileOpen: false,
+  setMobileOpen: () => {},
+});
 
 export function SidebarProvider({ children }: { children: ReactNode }) {
   const [isCollapsed, setIsCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
 
   // Sync from localStorage after hydration to avoid SSR mismatch
   useEffect(() => {
@@ -29,7 +38,11 @@ export function SidebarProvider({ children }: { children: ReactNode }) {
     });
   };
 
-  return <SidebarContext.Provider value={{ isCollapsed, toggle }}>{children}</SidebarContext.Provider>;
+  return (
+    <SidebarContext.Provider value={{ isCollapsed, toggle, mobileOpen, setMobileOpen }}>
+      {children}
+    </SidebarContext.Provider>
+  );
 }
 
 export function useSidebar() {

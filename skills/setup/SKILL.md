@@ -75,21 +75,27 @@ This install can deploy four modules. You'll always get Core; the rest are optio
                    table (agentcore-hub-eval-config), and CloudWatch
                    subscription filters. ~5 min.
                    Depends on: Workflow (it watches Workflow agents' eval logs).
+  Cloud Code     — adds /cloud-code: Claude Code + Codex running server-side on a
+                   dedicated AgentCore Runtime ("safe to close your laptop").
+                   Deploys 1 runtime (image), a VPC + EFS workspace, 1 DynamoDB
+                   table (agentcore-hub-cloud-code-sessions). ~10-15 min
+                   (NAT gateway + EFS). Depends on: Core only — independent of
+                   Workflow/Evaluations. Needs Docker (Colima) for the image build.
 ```
 
 Then ask via `AskUserQuestion`:
 
 - **question:** "This application is modular — you can deploy as many or as few modules as you'd like depending on your use case and the time you have for install. You can deploy additional modules later by re-running /agentcore-hub:setup. Which modules would you like to install?"
 - **header:** "Modules"
-- **options** (single-select):
+- **options** (single-select; offer "Other" for a custom combination):
   1. *Core only* — Explore agents already deployed in your account. No new AWS resources are created. Fastest path to a working UI.
   2. *Core + Builder* — Adds chat-driven agent creation (`/build`). Deploys 1 AgentCore harness runtime + 1 Lambda. ~3–5 min.
   3. *Core + Builder + Workflow (Recommended)* — Adds the full multi-agent pipeline. Deploys ~15 AgentCore runtimes, 5 Lambdas, 3 DynamoDB tables, and an S3 bucket. ~15–20 min.
-  4. *Everything* — Adds the self-improvement evaluation loop on top of #3 (3 more Lambdas, 1 DynamoDB table, CloudWatch subscription filters). ~20–25 min total.
+  4. *Everything* — #3 + the self-improvement evaluation loop + Cloud Code (the cloud coding agent). ~30–40 min total.
 
-Map the answer to a `MODULES` set in the canonical order `core → builder → workflow → evaluations`. Enforce dependency order: if the user picks Evaluations they must also have Workflow; if they pick Workflow they must also have Core. The four presets above already encode this — if you ever offer a custom selection, validate before continuing.
+Map the answer to a `MODULES` set in the canonical order `core → builder → workflow → evaluations → cloud-code`. Enforce dependency order: if the user picks Evaluations they must also have Workflow; if they pick Workflow they must also have Core. **Cloud Code depends only on Core** — it can be added to any selection (or installed alone: `core + cloud-code`), since it's independent of the Workflow/Evaluations chain. If the user wants Cloud Code without the full pipeline, accept that via "Other".
 
-> **Hard rule:** never reorder the modules. `run-module.sh` runs them in the order you give it, and downstream modules read state written by earlier ones (e.g., Evaluations subscribes to log groups created by Workflow's runtime fleet).
+> **Hard rule:** never reorder the modules within the dependency chain. `run-module.sh` runs them in the order you give it, and downstream modules read state written by earlier ones (e.g., Evaluations subscribes to log groups created by Workflow's runtime fleet). Cloud Code has no such ordering dependency — run it any time after Core.
 
 ## Q3 — Ticket store *(skip if Workflow not in MODULES)*
 

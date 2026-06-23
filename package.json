@@ -13,6 +13,7 @@
     "test:full": "./tests/run-all.sh --full"
   },
   "dependencies": {
+    "@aws-crypto/sha256-js": "^5.2.0",
     "@aws-sdk/client-bedrock-agent": "^3.1048.0",
     "@aws-sdk/client-bedrock-agent-runtime": "^3.1048.0",
     "@aws-sdk/client-bedrock-agentcore": "^3.1045.0",
@@ -24,8 +25,12 @@
     "@aws-sdk/client-lambda": "^3.1051.0",
     "@aws-sdk/client-s3": "^3.1048.0",
     "@aws-sdk/client-sts": "^3.1046.0",
+    "@aws-sdk/credential-provider-node": "^3.972.57",
     "@aws-sdk/lib-dynamodb": "^3.1049.0",
     "@aws-sdk/s3-request-presigner": "^3.1048.0",
+    "@smithy/signature-v4": "^5.5.1",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "clsx": "^2.1.0",
     "jszip": "^3.10.1",
     "lucide-react": "^0.400.0",

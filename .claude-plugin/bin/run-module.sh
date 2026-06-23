@@ -3,7 +3,7 @@
 # Knows the script order and required env vars per module.
 # Underlying scripts already exist in deploy/ and scripts/ — this only sequences them.
 #
-# Usage: run-module.sh <core|builder|workflow|evaluations>
+# Usage: run-module.sh <core|builder|workflow|evaluations|cloud-code>
 #
 # Reads from environment:
 #   AWS_PROFILE, AWS_REGION (required)
@@ -13,7 +13,7 @@ set -euo pipefail
 
 MODULE="${1:-}"
 if [[ -z "$MODULE" ]]; then
-  echo "Usage: $0 <core|builder|workflow|evaluations>" >&2
+  echo "Usage: $0 <core|builder|workflow|evaluations|cloud-code>" >&2
   exit 2
 fi
 
@@ -192,9 +192,64 @@ case "$MODULE" in
     bash deploy/continuous-improvement/deploy-token-aggregator.sh
     ;;
 
+  cloud-code)
+    # Standalone coding-agent runtime (Claude Code + Codex) with an EFS
+    # workspace. Sequences the scripts under deploy/coding-agent-runtime/.
+    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    : "${AWS_REGION:?AWS_REGION required}"
+    BUCKET="agentcore-hub-artifacts-${ACCOUNT_ID}-${AWS_REGION}"
+    CC_TABLE="agentcore-hub-cloud-code-sessions"
+
+    # 1. Session store (one row per chat session; also config:{userId} rows).
+    if aws dynamodb describe-table --table-name "$CC_TABLE" --region "$AWS_REGION" >/dev/null 2>&1; then
+      echo "✓ DynamoDB table $CC_TABLE exists"
+    else
+      echo "→ create DynamoDB table $CC_TABLE"
+      aws dynamodb create-table --table-name "$CC_TABLE" --region "$AWS_REGION" \
+        --attribute-definitions AttributeName=sessionId,AttributeType=S \
+        --key-schema AttributeName=sessionId,KeyType=HASH \
+        --billing-mode PAY_PER_REQUEST --output text >/dev/null
+    fi
+
+    # 2. Execution role (Bedrock + Mantle + EFS + S3 config bundles + ECR + obs).
+    echo "→ source deploy/coding-agent-runtime/setup-coding-runtime-role.sh"
+    # shellcheck disable=SC1091
+    source deploy/coding-agent-runtime/setup-coding-runtime-role.sh
+    : "${CODING_RUNTIME_ROLE_ARN:?role script did not export CODING_RUNTIME_ROLE_ARN}"
+
+    # 3. VPC + EFS (elastic code workspace). Writes efs.config (sourced by deploy.py).
+    echo "→ deploy/coding-agent-runtime/setup-coding-efs.sh"
+    bash deploy/coding-agent-runtime/setup-coding-efs.sh
+
+    # 4. Build + push the ARM64 image.
+    echo "→ deploy/coding-agent-runtime/build-and-push.sh"
+    (cd deploy/coding-agent-runtime && ./build-and-push.sh)
+    export IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/coding-agent-runtime:latest"
+
+    # 5. Create/update the runtime (VPC + EFS), capture the ARN.
+    echo "→ python3 deploy/coding-agent-runtime/deploy.py"
+    export ARTIFACT_BUCKET="$BUCKET"
+    python3 deploy/coding-agent-runtime/deploy.py
+    CC_ARN=$(tr -d '\n' < deploy/coding-agent-runtime/coding-runtime-arn.txt 2>/dev/null)
+    : "${CC_ARN:?deploy.py did not write coding-runtime-arn.txt}"
+
+    # 6. Persist the env the App Runner app reads.
+    for kv in "CODING_AGENT_RUNTIME_ARN=$CC_ARN" "CLOUD_CODE_TABLE=$CC_TABLE"; do
+      key="${kv%%=*}"
+      if grep -q "^${key}=" .env.local 2>/dev/null; then
+        sed "s|^${key}=.*|${key}=\"${kv#*=}\"|" .env.local > .env.local.tmp && mv .env.local.tmp .env.local
+      else
+        echo "${key}=\"${kv#*=}\"" >> .env.local
+      fi
+    done
+    chmod 600 .env.local
+    echo "→ Persisted CODING_AGENT_RUNTIME_ARN + CLOUD_CODE_TABLE to .env.local"
+    echo "  (set MCP_GATEWAY_URL in .env.local to wire shared MCP tools — optional)"
+    ;;
+
   *)
     echo "Unknown module: $MODULE" >&2
-    echo "Valid: core, builder, workflow, evaluations" >&2
+    echo "Valid: core, builder, workflow, evaluations, cloud-code" >&2
     exit 2
     ;;
 esac

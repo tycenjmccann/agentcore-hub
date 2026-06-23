@@ -45,6 +45,8 @@ export default defineConfig({
     baseURL,
     screenshot: "on",
     trace: "on-first-retry",
+    // Set PWVIDEO=1 to record + keep video for every test (Cloud Code demo capture).
+    video: process.env.PWVIDEO === "1" ? "on" : "off",
   },
   projects: [
     {
