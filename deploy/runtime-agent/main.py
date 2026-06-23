@@ -558,6 +558,42 @@ def load_blueprint(blueprint_name: str) -> str:
 
 # ─── External Tool Integration (via MCP — GitHub, GitLab, Jira, etc.) ────────
 
+# AgentCore Gateways authorize with AWS_IAM, so requests must be SigV4-signed —
+# bearer headers won't work. The QA persona reaches the codebuild-ios-mcp gateway
+# (ios_test / ios_build_status / list_schemes / get_test_logs) this way. The
+# runtime signs with its own execution-role creds, which need
+# bedrock-agentcore:InvokeGateway on the gateway ARN.
+IOS_TEST_GATEWAY_URL = os.getenv("IOS_TEST_GATEWAY_URL", "")
+
+
+import httpx as _httpx  # SigV4 MCP-gateway auth subclasses httpx.Auth (also a mcp dep)
+
+
+class _SigV4HttpxAuth(_httpx.Auth):
+    """httpx.Auth that SigV4-signs each request against bedrock-agentcore."""
+
+    requires_request_body = True
+
+    def __init__(self, region):
+        from botocore.session import Session
+        self._session = Session()
+        self._creds = self._session.get_credentials()
+        self._region = region or self._session.get_config_variable("region") or REGION
+
+    def auth_flow(self, request):
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        aws_req = AWSRequest(
+            method=request.method, url=str(request.url),
+            data=request.content, headers=dict(request.headers),
+        )
+        SigV4Auth(
+            self._creds.get_frozen_credentials(), "bedrock-agentcore", self._region
+        ).add_auth(aws_req)
+        request.headers.update(dict(aws_req.headers))
+        yield request
+
+
 def _create_mcp_clients():
     """Create MCPClient instances for each configured MCP server."""
     from strands.tools.mcp import MCPClient
@@ -576,6 +612,20 @@ def _create_mcp_clients():
             (lambda u, h: lambda: streamablehttp_client(url=u, headers=h, timeout=60))(url, headers)
         ))
         logger.info(f"MCP server configured: {url}")
+
+    # AWS_IAM gateways (SigV4-signed). Region parsed from the gateway hostname.
+    if IOS_TEST_GATEWAY_URL:
+        gw_url = IOS_TEST_GATEWAY_URL
+        try:
+            gw_region = gw_url.split(".bedrock-agentcore.")[1].split(".amazonaws.com")[0]
+        except IndexError:
+            gw_region = REGION
+        clients.append(MCPClient(
+            (lambda u, r: lambda: streamablehttp_client(
+                url=u, auth=_SigV4HttpxAuth(r), timeout=120
+            ))(gw_url, gw_region)
+        ))
+        logger.info(f"MCP gateway (SigV4) configured: {gw_url}")
 
     return clients
 

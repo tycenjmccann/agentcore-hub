@@ -73,6 +73,9 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         env["MCP_SERVERS"] = mcp
     elif pat := os.environ.get("GITHUB_PAT"):
         env["GITHUB_PAT"] = pat
+    # AWS_IAM MCP gateway (SigV4) — e.g. codebuild-ios-mcp for the QA persona.
+    if ios_gw := os.environ.get("IOS_TEST_GATEWAY_URL"):
+        env["IOS_TEST_GATEWAY_URL"] = ios_gw
     return env
 
 
