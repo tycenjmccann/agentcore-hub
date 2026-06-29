@@ -1,6 +1,6 @@
 # AgentCore Hub
 
-A web console for Amazon Bedrock AgentCore that dynamically discovers and interacts with your deployed agents. Clone, configure your AWS credentials, and it works — no hardcoded ARNs, memory IDs, or account numbers.
+A platform for getting the most out of Amazon Bedrock AgentCore — run all your agents and workflows from one place. It dynamically discovers your deployed agents (no hardcoded ARNs, memory IDs, or account numbers), then layers on a metrics dashboard, a chat playground with full OTEL execution traces and session history, a Registry, a chat-based agent builder, config-driven multi-agent workflows, and a cloud coding agent (Claude Code / Codex). Clone, configure your AWS credentials, and it works.
 
 ## Features
 
