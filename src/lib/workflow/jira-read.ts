@@ -4,6 +4,8 @@
  * instead of DynamoDB. Uses plain fetch() — no AWS SDK needed.
  */
 
+import { blockersFromLinks, type JiraIssueLink } from "./jira-client";
+
 const JIRA_SITE_URL = process.env.JIRA_SITE_URL || "";
 const JIRA_EMAIL = process.env.JIRA_EMAIL || "";
 const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN || "";
@@ -111,18 +113,10 @@ function mapIssueToTicket(issue: Record<string, unknown>) {
   const statusName = (status?.name as string) || "To Do";
   const issuetype = fields?.issuetype as Record<string, unknown> | undefined;
   const parent = fields?.parent as Record<string, unknown> | undefined;
-  const issueLinks = (fields?.issuelinks as Array<Record<string, unknown>>) || [];
   const labels = (fields?.labels as string[]) || [];
 
-  // Extract blockedBy from issue links
-  const blockedBy: string[] = [];
-  for (const link of issueLinks) {
-    const linkType = link.type as Record<string, unknown> | undefined;
-    if (linkType?.name === "Blocks" && link.inwardIssue) {
-      const inward = link.inwardIssue as Record<string, unknown>;
-      blockedBy.push(inward.key as string);
-    }
-  }
+  // Extract blockedBy from issue links (shared with the nudge route)
+  const blockedBy = blockersFromLinks(fields?.issuelinks as JiraIssueLink[] | undefined);
 
   // Extract assignee from labels. Agent tickets use "agent:<id>"; human-review
   // gates use "reviewer:<who>" → surface as "human:<who>" so the UI shows the

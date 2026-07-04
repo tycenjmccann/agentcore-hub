@@ -233,4 +233,6 @@ export type WorkflowEvent = (
   | { type: "workflow_complete"; summary: string }
   | { type: "error"; agentId?: string; error: string }
   | { type: "nudge"; nudged: string[]; ticketsScanned?: number }
+  | { type: "manager_intervention"; action?: string; ticketId?: string; note?: string }
+  | { type: "manager_escalation"; message?: string }
 ) & { timestamp?: string; eventId?: string };

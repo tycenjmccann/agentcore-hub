@@ -17,6 +17,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, UpdateCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { JiraClient, mapJiraStatusToInternal, blockersFromLinks } from "@/lib/workflow/jira-client";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -29,125 +30,40 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 
 export const dynamic = "force-dynamic";
 
-// ─── Jira helpers ───────────────────────────────────────────────────────────
-
-function getJiraAuth() {
-  const siteUrl = process.env.JIRA_SITE_URL;
-  const email = process.env.JIRA_EMAIL;
-  const apiToken = process.env.JIRA_API_TOKEN;
-  const projectKey = process.env.JIRA_PROJECT_KEY;
-  if (!siteUrl || !email || !apiToken || !projectKey) return null;
-  return {
-    baseUrl: `https://${siteUrl}`,
-    authHeader: `Basic ${Buffer.from(`${email}:${apiToken}`).toString("base64")}`,
-    projectKey,
-  };
-}
-
-async function jiraRequest(method: string, path: string, body?: unknown) {
-  const auth = getJiraAuth();
-  if (!auth) throw new Error("Jira not configured");
-  const url = `${auth.baseUrl}${path}`;
-  const res = await fetch(url, {
-    method,
-    headers: {
-      Authorization: auth.authHeader,
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Jira ${res.status}: ${text.slice(0, 200)}`);
-  }
-  if (res.status === 204) return {};
-  return res.json();
-}
-
-const JIRA_STATUS_MAP: Record<string, string> = {
-  "To Do": "todo",
-  "Ready": "ready",
-  "In Progress": "in_progress",
-  "In Review": "in_review",
-  "Blocked": "blocked",
-  "Done": "done",
-  "Backlog": "backlog",
-};
-
-async function jiraTransitionTo(issueKey: string, targetStatus: string) {
-  const data = await jiraRequest("GET", `/rest/api/3/issue/${issueKey}/transitions`);
-  const transitions = (data.transitions || []) as Array<{ id: string; name: string; to?: { name?: string } }>;
-  const transition = transitions.find(
-    (t) => t.name === targetStatus || t.to?.name === targetStatus
-  );
-  if (!transition) {
-    console.warn(`[nudge] No transition to "${targetStatus}" for ${issueKey}`);
-    return false;
-  }
-  await jiraRequest("POST", `/rest/api/3/issue/${issueKey}/transitions`, {
-    transition: { id: transition.id },
-  });
-  return true;
-}
-
 // ─── Nudge via Jira ─────────────────────────────────────────────────────────
 
-async function nudgeJira(epicId: string, workflowId: string) {
-  const auth = getJiraAuth();
-  if (!auth) throw new Error("Jira not configured");
-
-  // Get all child issues of the epic
-  const jql = encodeURIComponent(`parent = ${epicId} AND project = ${auth.projectKey}`);
-  const data = await jiraRequest(
-    "GET",
-    `/rest/api/3/search/jql?jql=${jql}&fields=status,issuelinks,labels&maxResults=100`
-  );
-  const issues = (data.issues || []) as Array<Record<string, unknown>>;
+async function nudgeJira(epicId: string) {
+  const jira = JiraClient.fromEnv();
+  const issues = await jira.getChildIssues(epicId);
   const nudged: string[] = [];
 
-  // Build status map
-  const statusMap = new Map<string, string>();
-  for (const issue of issues) {
-    const key = issue.key as string;
-    const fields = issue.fields as Record<string, unknown>;
-    const status = fields?.status as Record<string, unknown>;
-    const statusName = (status?.name as string) || "To Do";
-    statusMap.set(key, JIRA_STATUS_MAP[statusName] || "todo");
-  }
+  const statusMap = new Map<string, string>(
+    issues.map((i) => [i.key, mapJiraStatusToInternal(i.fields.status?.name || "To Do")])
+  );
 
-  for (const issue of issues) {
-    const key = issue.key as string;
-    const fields = issue.fields as Record<string, unknown>;
-    const status = fields?.status as Record<string, unknown>;
-    const statusName = (status?.name as string) || "To Do";
-    const internalStatus = JIRA_STATUS_MAP[statusName] || "todo";
-
-    // Get blockers from issue links
-    const issueLinks = (fields?.issuelinks as Array<Record<string, unknown>>) || [];
-    const blockedBy: string[] = [];
-    for (const link of issueLinks) {
-      const linkType = link.type as Record<string, unknown>;
-      if (linkType?.name === "Blocks" && link.inwardIssue) {
-        blockedBy.push((link.inwardIssue as Record<string, unknown>).key as string);
-      }
+  // Best-effort transition to Ready; a board without a "Ready" transition just
+  // logs and moves on (mirrors the DynamoDB path's idempotent nudge).
+  const toReady = async (key: string, label: string) => {
+    try {
+      await jira.transitionIssue(key, "Ready");
+      nudged.push(`${key} (${label})`);
+    } catch (err) {
+      console.warn(`[nudge] ${key}: ${(err as Error).message}`);
     }
+  };
 
-    // Case 1: "todo" or "To Do" with no blockers — should be running
+  for (const issue of issues) {
+    const internalStatus = statusMap.get(issue.key) || "todo";
+    const blockedBy = blockersFromLinks(issue.fields.issuelinks);
+
+    // Case 1: "todo" with no blockers — should be running
     if (internalStatus === "todo" && blockedBy.length === 0) {
-      const ok = await jiraTransitionTo(key, "Ready");
-      if (ok) nudged.push(`${key} (todo→ready)`);
+      await toReady(issue.key, "todo→ready");
     }
-
     // Case 2: "blocked" but all blockers are done
     if (internalStatus === "blocked") {
-      const allDone = blockedBy.length === 0 || blockedBy.every(
-        (b) => statusMap.get(b) === "done"
-      );
-      if (allDone) {
-        const ok = await jiraTransitionTo(key, "Ready");
-        if (ok) nudged.push(`${key} (unblocked→ready)`);
-      }
+      const allDone = blockedBy.length === 0 || blockedBy.every((b) => statusMap.get(b) === "done");
+      if (allDone) await toReady(issue.key, "unblocked→ready");
     }
   }
 
@@ -231,7 +147,7 @@ export async function POST(
       if (!epicId) {
         return NextResponse.json({ error: "Workflow has no epicId — cannot query Jira" }, { status: 400 });
       }
-      result = await nudgeJira(epicId, workflowId);
+      result = await nudgeJira(epicId);
     } else {
       result = await nudgeDynamoDB(workflowId);
     }

@@ -40,6 +40,21 @@ export function mapJiraStatusToInternal(jiraStatus: string): string {
   return JIRA_STATUS_TO_INTERNAL[normalized] || normalized;
 }
 
+/**
+ * Extract the "blocked by" issue keys from an issue's links. A "Blocks" link's
+ * inwardIssue is the blocker. Shared by the ticket reader and the nudge route so
+ * both compute blockers identically.
+ */
+export function blockersFromLinks(links: JiraIssueLink[] | undefined): string[] {
+  const out: string[] = [];
+  for (const link of links || []) {
+    if (link.type?.name === "Blocks" && link.inwardIssue) {
+      out.push(link.inwardIssue.key);
+    }
+  }
+  return out;
+}
+
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
 export interface JiraClientConfig {

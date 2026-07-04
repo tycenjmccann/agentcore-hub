@@ -99,12 +99,14 @@ aws iam put-role-policy \
           \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-events\",
           \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-events/index/*\",
           \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-config\",
-          \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-config/index/*\"
+          \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-config/index/*\",
+          \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-workflow-analyses\",
+          \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-workflow-analyses/index/*\"
         ]
       }
     ]
   }"
-echo "   ✓ Attached DynamoDB CRUD (tickets, workflows, events, eval-config)"
+echo "   ✓ Attached DynamoDB CRUD (tickets, workflows, events, eval-config, workflow-analyses)"
 
 # ─── DynamoDB Streams read (orchestrator trigger on tickets) ─────────────────
 aws iam put-role-policy \

@@ -13,6 +13,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { JiraClient } from "@/lib/workflow/jira-client";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -25,60 +26,10 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 
 export const dynamic = "force-dynamic";
 
-// ─── Jira helpers ───────────────────────────────────────────────────────────
-
-function getJiraAuth() {
-  const siteUrl = process.env.JIRA_SITE_URL;
-  const email = process.env.JIRA_EMAIL;
-  const apiToken = process.env.JIRA_API_TOKEN;
-  const projectKey = process.env.JIRA_PROJECT_KEY;
-  if (!siteUrl || !email || !apiToken || !projectKey) return null;
-  return {
-    baseUrl: `https://${siteUrl}`,
-    authHeader: `Basic ${Buffer.from(`${email}:${apiToken}`).toString("base64")}`,
-    projectKey,
-  };
-}
-
-async function jiraRequest(method: string, path: string, body?: unknown) {
-  const auth = getJiraAuth();
-  if (!auth) throw new Error("Jira not configured");
-  const url = `${auth.baseUrl}${path}`;
-  const res = await fetch(url, {
-    method,
-    headers: {
-      Authorization: auth.authHeader,
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Jira ${res.status}: ${text.slice(0, 200)}`);
-  }
-  if (res.status === 204) return {};
-  return res.json();
-}
-
-async function jiraTransitionTo(issueKey: string, targetStatus: string) {
-  const data = await jiraRequest("GET", `/rest/api/3/issue/${issueKey}/transitions`);
-  const transitions = (data.transitions || []) as Array<{ id: string; name: string; to?: { name?: string } }>;
-  const transition = transitions.find(
-    (t) => t.name === targetStatus || t.to?.name === targetStatus
-  );
-  if (!transition) {
-    throw new Error(`No transition to "${targetStatus}" available for ${issueKey}`);
-  }
-  await jiraRequest("POST", `/rest/api/3/issue/${issueKey}/transitions`, {
-    transition: { id: transition.id },
-  });
-}
-
 // ─── Retry via Jira ─────────────────────────────────────────────────────────
 
 async function retryJira(workflowId: string, agentId: string, agentTasks: Record<string, Record<string, unknown>>) {
-  // Find the ticket for this agent
+  // Only an actively-running task is retryable (never reset done/in_review work).
   const ticketId = Object.keys(agentTasks).find((key) => {
     const t = agentTasks[key];
     return (t.agentId === agentId || t.assignee === agentId) &&
@@ -89,12 +40,13 @@ async function retryJira(workflowId: string, agentId: string, agentTasks: Record
     throw new Error(`No active ticket found for agent ${agentId}`);
   }
 
-  // Transition Jira ticket back to Ready
+  // Transition Jira ticket back to Ready, falling back to To Do (some boards
+  // don't have a "Ready" state).
+  const jira = JiraClient.fromEnv();
   try {
-    await jiraTransitionTo(ticketId, "Ready");
+    await jira.transitionIssue(ticketId, "Ready");
   } catch {
-    // Fallback: try "To Do" — some boards don't have "Ready"
-    await jiraTransitionTo(ticketId, "To Do");
+    await jira.transitionIssue(ticketId, "To Do");
   }
 
   // Update workflow agentTasks status
@@ -112,14 +64,17 @@ async function retryJira(workflowId: string, agentId: string, agentTasks: Record
 // ─── Retry via DynamoDB ─────────────────────────────────────────────────────
 
 async function retryDynamoDB(workflowId: string, agentId: string, agentTasks: Record<string, Record<string, unknown>>) {
-  // Find the ticket ID from the workflow record (already in memory — no scan needed)
+  // Only an actively-running task is retryable. Never reset a done/in_review/
+  // cancelled ticket — that would clobber completed work or a human review gate.
+  // (Same guard as retryJira; relied on by the Workflow Manager's watch mode.)
   const ticketId = Object.keys(agentTasks).find((key) => {
     const t = agentTasks[key];
-    return (t.agentId === agentId || t.assignee === agentId);
+    return (t.agentId === agentId || t.assignee === agentId) &&
+      (t.status === "running" || t.status === "in_progress");
   });
 
   if (!ticketId) {
-    throw new Error(`No ticket found for agent ${agentId}`);
+    throw new Error(`No active (running) ticket found for agent ${agentId}`);
   }
 
   // Reset ticket to "ready" in the tickets table
