@@ -40,8 +40,8 @@ the task role is what the running app assumes to call AWS. Do not merge them.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `EXPRESS_CPU` | `1` | vCPU (whole units) |
-| `EXPRESS_MEMORY` | `2` | GB |
+| `EXPRESS_CPU` | `1024` | CPU units, as the ECS API takes them (1024 = 1 vCPU) |
+| `EXPRESS_MEMORY` | `2048` | MiB (2048 = 2 GB); must form a valid Fargate combo with the CPU |
 | `EXPRESS_CLUSTER` | `default` | Cluster the service lives in |
 | `EXPRESS_SUBNETS` | — | Comma-separated subnet IDs (only if no usable default VPC) |
 | `EXPRESS_SECURITY_GROUPS` | — | Comma-separated SG IDs (pairs with the above) |

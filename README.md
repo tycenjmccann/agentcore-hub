@@ -621,8 +621,9 @@ conflate them):
 - `ecsInfrastructureRoleForExpressServices` — ECS provisions the ALB/scaling (managed policy `AmazonECSInfrastructureRoleforExpressGatewayServices`)
 - `agentcore-hub-ecs-task` — **the app's own** runtime permissions (DynamoDB, S3, Bedrock, AgentCore, Secrets Manager, CloudWatch); this is the direct successor to the App Runner instance role
 
-**Tuning knobs** (env vars, all optional): `EXPRESS_CPU` (vCPU, default 1),
-`EXPRESS_MEMORY` (GB, default 2), `EXPRESS_SUBNETS` + `EXPRESS_SECURITY_GROUPS`
+**Tuning knobs** (env vars, all optional): `EXPRESS_CPU` (CPU units, default
+`1024` = 1 vCPU), `EXPRESS_MEMORY` (MiB, default `2048` = 2 GB — must be a valid
+Fargate combo with the CPU), `EXPRESS_SUBNETS` + `EXPRESS_SECURITY_GROUPS`
 (comma-separated — only needed if you have no usable default VPC),
 `EXPRESS_CLUSTER` (default `default`).
 

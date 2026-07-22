@@ -63,8 +63,11 @@ CLUSTER="${EXPRESS_CLUSTER:-default}" # Express Mode services land in the defaul
 EXEC_ROLE="ecsTaskExecutionRole"
 INFRA_ROLE="ecsInfrastructureRoleForExpressServices"
 TASK_ROLE="agentcore-hub-ecs-task"     # the app's runtime permissions
-CPU="${EXPRESS_CPU:-1}"                # vCPU (Express Mode takes whole vCPUs)
-MEMORY="${EXPRESS_MEMORY:-2}"          # GB
+# CPU units + MiB, exactly as the ECS API takes them (NOT vCPU/GB): 1024 = 1 vCPU,
+# 2048 = 2 GB. Must be a valid Fargate combo (see the CPU/memory matrix) or the
+# create/update call is rejected. Defaults: 1 vCPU / 2 GB.
+CPU="${EXPRESS_CPU:-1024}"
+MEMORY="${EXPRESS_MEMORY:-2048}"
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  ECS Express Mode Deploy — AgentCore Hub"
@@ -356,19 +359,24 @@ if [[ -n "${EXPRESS_SUBNETS:-}" ]]; then
   NET_ARG=(--network-configuration "{\"subnets\":${SUBNETS_JSON},\"securityGroups\":${SG_JSON}}")
 fi
 
-# Idempotency: Express Mode services live in the default cluster; find ours by
-# name so a re-run updates in place instead of creating a duplicate.
-EXISTING_ARN=$(aws ecs list-services --cluster "$CLUSTER" --region "$AWS_REGION" --output json 2>/dev/null \
+# Idempotency: find OUR service in the target cluster so a re-run updates in
+# place instead of creating a duplicate. Match the service-name segment EXACTLY
+# — a prefix match would also hit e.g. agentcore-hub-frontend/-worker and, since
+# serviceArns ordering isn't guaranteed, could update the wrong service.
+EXISTING_ARN=$(SERVICE_NAME="$SERVICE_NAME" aws ecs list-services --cluster "$CLUSTER" --region "$AWS_REGION" --output json 2>/dev/null \
   | python3 -c "
-import json, sys
+import json, os, sys
+want = os.environ['SERVICE_NAME']
 data = json.load(sys.stdin)
 for arn in data.get('serviceArns', []):
-    if arn.rsplit('/', 1)[-1].startswith('${SERVICE_NAME}'):
+    if arn.rsplit('/', 1)[-1] == want:
         print(arn); break
 " 2>/dev/null || true)
 
 if [[ -n "$EXISTING_ARN" ]]; then
   echo "        Service exists ($EXISTING_ARN) — updating in place..."
+  # Re-apply networking on update too, so rotating EXPRESS_SUBNETS/SECURITY_GROUPS
+  # and rerunning actually takes effect (not just on first create).
   aws ecs update-express-gateway-service \
     --service-arn "$EXISTING_ARN" \
     --region "$AWS_REGION" \
@@ -379,6 +387,7 @@ if [[ -n "$EXISTING_ARN" ]]; then
     --memory "$MEMORY" \
     --health-check-path "/" \
     --monitor-resources \
+    ${NET_ARG[@]+"${NET_ARG[@]}"} \
     --output text >/dev/null
   SERVICE_ARN="$EXISTING_ARN"
   echo "        Update started"
@@ -386,6 +395,7 @@ else
   echo "        Creating new service..."
   SERVICE_ARN=$(aws ecs create-express-gateway-service \
     --service-name "$SERVICE_NAME" \
+    --cluster "$CLUSTER" \
     --region "$AWS_REGION" \
     --primary-container "$PRIMARY_CONTAINER" \
     --execution-role-arn "$EXEC_ROLE_ARN" \
@@ -403,48 +413,69 @@ fi
 echo ""
 
 # ─── Wait for ACTIVE + resolve the URL ────────────────────────────────────────
-
+# statusCode is only ACTIVE|DRAINING|INACTIVE — a fresh service starts INACTIVE
+# and flips to ACTIVE once the ALB targets pass health checks. The public
+# endpoint lives at activeConfigurations[].ingressPaths[].endpoint (there is no
+# service.url field). Poll for ACTIVE; require it after the loop.
 echo "        Waiting for service to become ACTIVE (5–10 min)..."
-SERVICE_URL=""
+STATUS="UNKNOWN"; STATUS_REASON=""; SERVICE_URL=""
 for i in $(seq 1 90); do
   DESC=$(aws ecs describe-express-gateway-service \
     --service-arn "$SERVICE_ARN" --region "$AWS_REGION" --output json 2>/dev/null || echo '{}')
-  read -r STATUS SERVICE_URL <<<"$(echo "$DESC" | python3 -c "
+  # Field-separate with \x1f (unit separator): a non-whitespace delimiter, so
+  # `read` won't collapse an empty middle field (an empty URL while INACTIVE)
+  # the way a tab/space would and shift the columns.
+  IFS=$'\x1f' read -r STATUS SERVICE_URL STATUS_REASON <<<"$(echo "$DESC" | python3 -c "
 import json, sys
 try: d = json.load(sys.stdin)
 except Exception: d = {}
 s = d.get('service', {})
-status = (s.get('status') or {}).get('statusCode', 'UNKNOWN')
-url = s.get('url') or s.get('serviceUrl') or ''
-print(status, url)
-" 2>/dev/null || echo 'UNKNOWN ')"
-  if [[ "$STATUS" == "ACTIVE" ]]; then break; fi
-  if [[ "$STATUS" == "FAILED" || "$STATUS" == "CREATE_FAILED" ]]; then
-    echo "        ERROR: Service status is $STATUS" >&2
-    exit 1
-  fi
+st = s.get('status') or {}
+status = st.get('statusCode', 'UNKNOWN')
+reason = st.get('statusReason', '')
+url = ''
+for cfg in s.get('activeConfigurations', []) or []:
+    for ing in cfg.get('ingressPaths', []) or []:
+        ep = ing.get('endpoint')
+        if ep:
+            url = ep; break
+    if url: break
+sys.stdout.write('\x1f'.join([status, url, reason]))
+" 2>/dev/null || printf 'UNKNOWN\x1f\x1f')"
+  # ACTIVE with a resolved endpoint = ready. (ACTIVE can briefly precede the
+  # ingress endpoint being published, so keep polling until we have both.)
+  if [[ "$STATUS" == "ACTIVE" && -n "$SERVICE_URL" ]]; then break; fi
   printf "        [%02d] Status: %s ...\r" "$i" "$STATUS"
   sleep 10
 done
 echo ""
 
-# Fall back to the documented URL shape if the API didn't echo one.
+if [[ "$STATUS" != "ACTIVE" ]]; then
+  echo "        ERROR: service did not reach ACTIVE (last status: ${STATUS})." >&2
+  [[ -n "$STATUS_REASON" ]] && echo "        Reason: ${STATUS_REASON}" >&2
+  echo "        Inspect: aws ecs describe-express-gateway-service --service-arn ${SERVICE_ARN} --region ${AWS_REGION}" >&2
+  exit 1
+fi
+
 if [[ -z "$SERVICE_URL" ]]; then
-  SVC_SHORT="${SERVICE_ARN##*/}"
-  SERVICE_URL="https://${SVC_SHORT}.ecs.${AWS_REGION}.on.aws"
+  echo "        WARNING: service is ACTIVE but no ingress endpoint was returned yet." >&2
+  echo "        Re-run describe-express-gateway-service shortly to get the URL." >&2
 elif [[ "$SERVICE_URL" != http* ]]; then
   SERVICE_URL="https://${SERVICE_URL}"
 fi
-echo "        Service URL: $SERVICE_URL"
+echo "        Service URL: ${SERVICE_URL:-<pending>}"
 
-# Persist DEPLOYMENT_URL to .env.local
-if grep -q '^DEPLOYMENT_URL=' .env.local 2>/dev/null; then
-  sed "s|^DEPLOYMENT_URL=.*|DEPLOYMENT_URL=\"${SERVICE_URL}\"|" .env.local > .env.local.tmp && mv .env.local.tmp .env.local
-else
-  echo "DEPLOYMENT_URL=\"${SERVICE_URL}\"" >> .env.local
+# Persist DEPLOYMENT_URL to .env.local (only if we actually resolved one, so a
+# transient empty endpoint can't blank a previously-good value).
+if [[ -n "$SERVICE_URL" ]]; then
+  if grep -q '^DEPLOYMENT_URL=' .env.local 2>/dev/null; then
+    sed "s|^DEPLOYMENT_URL=.*|DEPLOYMENT_URL=\"${SERVICE_URL}\"|" .env.local > .env.local.tmp && mv .env.local.tmp .env.local
+  else
+    echo "DEPLOYMENT_URL=\"${SERVICE_URL}\"" >> .env.local
+  fi
+  chmod 600 .env.local
+  echo "        Persisted DEPLOYMENT_URL to .env.local"
 fi
-chmod 600 .env.local
-echo "        Persisted DEPLOYMENT_URL to .env.local"
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
