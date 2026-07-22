@@ -146,8 +146,13 @@ export function useVoiceInput(onText?: (text: string) => void): VoiceInput {
 
   const stop = useCallback(() => {
     const rec = recRef.current;
+    // Don't flip `listening` here: SpeechRecognition.stop() can still deliver a
+    // final `result` asynchronously. If we cleared listening now, the parent
+    // would mark voice inactive and unmount us, and teardown would abort before
+    // the last correction (or a whole short utterance) arrived. Let `onend`
+    // (fired after pending results) clear listening instead.
     if (rec) { try { rec.stop(); } catch { /* noop */ } }
-    setListening(false);
+    else setListening(false); // nothing running → clear immediately
   }, []);
 
   const cancel = useCallback(() => {
@@ -157,6 +162,10 @@ export function useVoiceInput(onText?: (text: string) => void): VoiceInput {
     setListening(false);
     setFinalText("");
     setInterimText("");
+    // Every interim result was already pushed into the parent's draft via onText,
+    // so a slide-to-cancel must also blank the composer — otherwise the discarded
+    // dictation lingers and can still be sent.
+    onTextRef.current?.("");
   }, [teardown]);
 
   useEffect(() => teardown, [teardown]);
