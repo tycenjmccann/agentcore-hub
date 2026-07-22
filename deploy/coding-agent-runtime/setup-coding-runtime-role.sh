@@ -195,6 +195,15 @@ aws iam put-role-policy \
   }"
 echo "   ✓ EFS mount access"
 
+# ─── GitHub App key: DELIBERATELY NOT GRANTED ────────────────────────────────
+# The GitHub App private key (Secrets Manager: cloud-code/github-app) is the
+# master credential the GitHub App design keeps AWAY from the microVM. This role
+# is assumed by the untrusted coding runtime, so it is intentionally given NO
+# secretsmanager:GetSecretValue on that secret. The hub (App Runner / hosting
+# role) mints a short-lived, repo-scoped installation token per turn and passes
+# THAT in the invoke payload; the agent never sees the key. Do not add a
+# Secrets Manager grant here. See docs/github-app-auth.md.
+
 echo ""
 echo "   ⏳ Waiting 10s for IAM propagation..."
 sleep 10

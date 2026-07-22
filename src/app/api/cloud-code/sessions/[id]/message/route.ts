@@ -12,6 +12,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getOwnedSession, putSession, DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/cloud-code/sessions";
 import { invokeCodingTurn, invokeCodingTurnStream, codingRuntimeConfigured } from "@/lib/cloud-code/runtime";
 import { currentConfigVersion } from "@/lib/cloud-code/config-store";
+import { cloneTokenForUser } from "@/lib/cloud-code/github-app";
 import { getIdentity } from "@/lib/auth/identity";
 import { sseData } from "@/lib/sse";
 import type { CloudCodeTurn } from "@/lib/cloud-code/types";
@@ -58,6 +59,16 @@ export async function POST(
   const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
   const region = request.nextUrl.searchParams.get("region") || undefined;
 
+  // Mint a short-lived GitHub App clone token for the session owner, scoped to
+  // this repo. Absent when the App isn't set up or the owner hasn't connected —
+  // the runtime then falls back to GITHUB_PAT. `connected` tells the runtime NOT
+  // to fall back when a connected owner's scoped mint was denied.
+  const { token: githubToken, connected: githubAppConnected } = await cloneTokenForUser(
+    sessionTenant,
+    userId,
+    session.repo
+  );
+
   // Ported-session first turn: tell the runtime to check out the pushed branch
   // and natively resume the laptop transcript. Only on the seeding turn (while
   // pendingSeed is set + no turns yet) — afterwards it resumes by session id.
@@ -77,7 +88,7 @@ export async function POST(
       upstream = await invokeCodingTurnStream({
         sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
         claudeSessionId: session.claudeSessionId, userId, tenantId: sessionTenant, configVersion, region,
-        ...resumeFields,
+        githubToken, githubAppConnected, ...resumeFields,
       });
     } catch (err) {
       return NextResponse.json({ error: (err as Error).message }, { status: 502 });
@@ -133,7 +144,7 @@ export async function POST(
     const result = await invokeCodingTurn({
       sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
       claudeSessionId: session.claudeSessionId, userId, tenantId: sessionTenant, configVersion, region,
-      ...resumeFields,
+      githubToken, githubAppConnected, ...resumeFields,
     });
 
     const agentTurn: CloudCodeTurn = { role: "agent", text: result.response, at: new Date().toISOString() };

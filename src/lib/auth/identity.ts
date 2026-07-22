@@ -78,3 +78,15 @@ export function getIdentity(req: NextRequest): Identity {
     "Missing verified identity headers. A route was reached without auth middleware."
   );
 }
+
+/**
+ * True when the caller may perform operator-level actions (creating the shared
+ * GitHub App, which writes the deploy-level master credential). With AUTH_MODE=none
+ * there is one operator running the whole deploy, so they ARE the admin. Under a
+ * real SSO, membership in the `admin` group (stamped by the adapter) grants it.
+ */
+export function isAdmin(req: NextRequest): boolean {
+  if (authDisabled()) return true;
+  const groups = req.headers.get(GROUPS_HEADER) || "";
+  return groups.split(",").map((g) => g.trim()).includes("admin");
+}
