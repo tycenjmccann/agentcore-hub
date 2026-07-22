@@ -461,6 +461,62 @@ def _install_resume_transcript(s3_key: str, session_id: str, workdir: str) -> bo
         return False
 
 
+def _install_artifacts(artifact_prefix: str, workdir: str, session_id: str | None) -> int:
+    """Restore a session's artifacts (uploaded via the web, or ported) into the
+    workspace's .cloud-code/artifacts/ so the agent can open them on a turn.
+
+    Lists s3://{ARTIFACT_BUCKET}/{artifact_prefix} and downloads each object back
+    to .cloud-code/artifacts/<rel>. Idempotent per warm microVM via a marker.
+    Path-traversal guarded: a key whose rel escapes the artifacts dir is skipped.
+    Best-effort — a missing object or single failed download never fails the turn.
+    Returns the count restored."""
+    if not (artifact_prefix and workdir and ARTIFACT_BUCKET):
+        return 0
+    dest_root = os.path.join(workdir, ".cloud-code", "artifacts")
+    marker = os.path.join(_session_dir(session_id), ".artifacts-applied")
+    try:
+        if os.path.exists(marker):
+            with open(marker) as f:
+                if f.read().strip() == artifact_prefix:
+                    return 0  # already restored on this warm VM
+    except OSError:
+        pass
+
+    real_root = os.path.realpath(dest_root)
+    restored = 0
+    try:
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=ARTIFACT_BUCKET, Prefix=artifact_prefix):
+            for obj in page.get("Contents", []) or []:
+                key = obj["Key"]
+                rel = key[len(artifact_prefix):]
+                if not rel or rel.endswith("/"):
+                    continue  # the prefix placeholder / a dir marker
+                dest = os.path.join(dest_root, rel)
+                # Traversal guard: the resolved dest MUST stay under the artifacts root.
+                real_dest = os.path.realpath(dest)
+                if real_dest != real_root and not real_dest.startswith(real_root + os.sep):
+                    logger.warning("artifact_path_escape_skipped", extra={"rel": rel})
+                    continue
+                try:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    with open(dest, "wb") as fh:
+                        s3.download_fileobj(ARTIFACT_BUCKET, key, fh)
+                    restored += 1
+                except Exception as exc:  # noqa: BLE001 — one bad file is non-fatal
+                    logger.warning("artifact_download_failed",
+                                   extra={"key": key, "error": str(exc)[:200]})
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w") as f:
+            f.write(artifact_prefix)
+        logger.info("artifacts_installed", extra={"prefix": artifact_prefix, "count": restored})
+    except Exception as exc:  # noqa: BLE001 — listing/setup failure is non-fatal
+        logger.warning("artifacts_install_failed",
+                       extra={"prefix": artifact_prefix, "error": str(exc)[:200]})
+    return restored
+
+
 def _checkpoint_transcript(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
     """Reverse of install: read the (now-grown) Claude transcript off EFS and
     upload it to S3 so the laptop can pull it back and `claude --resume` locally.
@@ -490,6 +546,141 @@ def _checkpoint_transcript(session_id: str, workdir: str, tenant_id: str | None 
         pass
     logger.info("checkpoint_uploaded", extra={"session": session_id, "bytes": len(data), "branch": branch})
     return {"key": key, "bytes": len(data), "branch": branch}
+
+
+# ─── Artifacts: touched-but-untracked deliverables the cloud session produced ─
+# (generated media, exports, datasets). They don't travel home via the git branch
+# (untracked) or the transcript (binary), so we harvest them to S3 on checkpoint
+# and the web Artifacts tab lists them. Anything pre-staged under
+# .cloud-code/artifacts/ is always included.
+_ARTIFACT_FILE_CAP = int(os.environ.get("CC_ARTIFACT_FILE_CAP_MB", "500")) * 1024 * 1024
+_ARTIFACT_TOTAL_CAP = int(os.environ.get("CC_ARTIFACT_TOTAL_CAP_MB", "2048")) * 1024 * 1024
+_ARTIFACT_COUNT_CAP = int(os.environ.get("CC_ARTIFACT_COUNT_CAP", "200"))
+_MEDIA_TOKEN_RE = re.compile(
+    r"(?:[A-Za-z0-9_~][A-Za-z0-9_.~/-]*)?\.(?:png|jpe?g|gif|webp|svg|bmp|tiff|heic"
+    r"|mp4|mov|webm|avi|mkv|mp3|wav|aac|flac|m4a|pdf|docx|pptx|xlsx"
+    r"|csv|parquet|arrow|feather|npy|npz|pkl|h5|sqlite|db)\b",
+    re.IGNORECASE,
+)
+# Credential files a turn may have written — never ship them out.
+_SECRET_EXTS = {".pem", ".p12", ".pfx", ".keystore", ".jks", ".asc", ".gpg"}
+_SECRET_NAME_RE = re.compile(
+    r"(^\.env($|\.)|(^|\.)npmrc$|(^|\.)netrc$|(^|/)id_(rsa|ed25519|ecdsa|dsa)$"
+    r"|(^|\.)pgpass$|(^|/)credentials$|secrets?(\.|$)|\.secret$)",
+    re.IGNORECASE,
+)
+
+
+def _is_secret_path(rel: str) -> bool:
+    base = os.path.basename(rel).lower()
+    if os.path.splitext(base)[1] in _SECRET_EXTS:
+        return True
+    return bool(_SECRET_NAME_RE.search(base) or _SECRET_NAME_RE.search(rel))
+
+
+def _git_tracked(repo_dir: str, abs_path: str) -> bool:
+    try:
+        r = subprocess.run(["git", "ls-files", "--error-unmatch", abs_path],
+                           cwd=repo_dir, capture_output=True, timeout=15)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _detect_cloud_artifacts(workdir: str) -> list[dict]:
+    """Deliverables that exist in the workspace, aren't git-tracked (so they don't
+    already travel home via the branch), and aren't credential files — plus
+    anything pre-staged under .cloud-code/artifacts/. A media sweep of any git
+    'other' (untracked) files catches shell-produced outputs (a PNG a script
+    rendered, an MP4 ffmpeg wrote). Deduped, capped smallest-first so the caps
+    keep the most files. Returns [{rel, abs, bytes}]."""
+    if not workdir or not os.path.isdir(workdir):
+        return []
+    cands: set[str] = set()
+    artifacts_root = os.path.join(workdir, ".cloud-code", "artifacts")
+    if os.path.isdir(artifacts_root):
+        for root, _dirs, files in os.walk(artifacts_root):
+            for fn in files:
+                cands.add(os.path.join(root, fn))
+    # Untracked + ignored files in the repo, filtered to media/deliverable exts.
+    try:
+        r = subprocess.run(
+            ["git", "ls-files", "--others", "-z"],
+            cwd=workdir, capture_output=True, text=True, timeout=30,
+        )
+        for rel in r.stdout.split("\0"):
+            if rel and _MEDIA_TOKEN_RE.search(rel):
+                cands.add(os.path.join(workdir, rel))
+    except Exception:  # noqa: BLE001
+        pass
+
+    seen: set[str] = set()
+    out: list[dict] = []
+    real_wd = os.path.realpath(workdir)
+    real_artifacts = os.path.realpath(artifacts_root)
+    for raw in cands:
+        abs_path = os.path.realpath(raw)
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        if abs_path != real_wd and not abs_path.startswith(real_wd + os.sep):
+            continue  # must live inside the workspace
+        if not os.path.isfile(abs_path):
+            continue
+        if _git_tracked(workdir, abs_path):
+            continue  # already travels home via the branch
+        try:
+            size = os.path.getsize(abs_path)
+        except OSError:
+            continue
+        if size > _ARTIFACT_FILE_CAP:
+            continue
+        # rel is relative to .cloud-code/artifacts/ for staged files (no double
+        # nesting on restore), else relative to the workdir.
+        if abs_path == real_artifacts or abs_path.startswith(real_artifacts + os.sep):
+            rel = os.path.relpath(abs_path, real_artifacts)
+        else:
+            rel = os.path.relpath(abs_path, real_wd)
+        if _is_secret_path(rel):
+            continue
+        out.append({"rel": rel, "abs": abs_path, "bytes": size})
+
+    out.sort(key=lambda c: c["bytes"])
+    kept: list[dict] = []
+    running = 0
+    for c in out:
+        if len(kept) >= _ARTIFACT_COUNT_CAP or running + c["bytes"] > _ARTIFACT_TOTAL_CAP:
+            continue
+        kept.append(c)
+        running += c["bytes"]
+    return kept
+
+
+def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
+    """Upload the cloud session's touched-untracked deliverables to S3 under the
+    checkpoint artifacts prefix so the web Artifacts tab can list them (and a pull
+    can bring them home). Best-effort: a failed file is skipped, never fatal."""
+    if not (workdir and ARTIFACT_BUCKET):
+        return {"count": 0, "bytes": 0, "prefix": None}
+    cands = _detect_cloud_artifacts(workdir)
+    if not cands:
+        return {"count": 0, "bytes": 0, "prefix": None}
+    prefix = f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/artifacts/"
+    s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    count = 0
+    total = 0
+    for c in cands:
+        try:
+            with open(c["abs"], "rb") as fh:
+                s3.upload_fileobj(fh, ARTIFACT_BUCKET, prefix + c["rel"].replace(os.sep, "/"))
+            count += 1
+            total += c["bytes"]
+        except Exception as exc:  # noqa: BLE001 — one bad file is non-fatal
+            logger.warning("checkpoint_artifact_failed",
+                           extra={"rel": c["rel"], "error": str(exc)[:200]})
+    logger.info("checkpoint_artifacts_uploaded",
+                extra={"session": session_id, "count": count, "bytes": total})
+    return {"count": count, "bytes": total, "prefix": prefix if count else None}
 
 
 def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
@@ -831,6 +1022,12 @@ async def invocations(request: Request):
         if cli == "claude" and resume_transcript and resume_session_id:
             if _install_resume_transcript(resume_transcript, resume_session_id, workdir):
                 claude_session_id = claude_session_id or resume_session_id
+        # Restore uploaded/ported artifacts into .cloud-code/artifacts/ so the agent
+        # can open them (keyed by the cloud session id under the resume prefix).
+        if session_id:
+            _install_artifacts(
+                f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", workdir, session_id
+            )
     except ValueError as ve:  # bad repo field — caller error, not a 500
         return JSONResponse({"error": str(ve)}, status_code=400)
     except Exception as exc:  # noqa: BLE001
@@ -850,7 +1047,10 @@ async def invocations(request: Request):
         except Exception as exc:  # noqa: BLE001
             logger.error("checkpoint_failed", extra={"error": str(exc)[:600]})
             return JSONResponse({"error": str(exc)[:600]}, status_code=500)
-        return JSONResponse({"checkpointed": True, **info})
+        # Harvest touched-untracked deliverables too (best-effort — never fails the
+        # checkpoint). They surface in the web Artifacts tab under the same cp_id.
+        artifacts = _checkpoint_artifacts(cp_id, workdir, tenant_id)
+        return JSONResponse({"checkpointed": True, **info, "artifacts": artifacts})
 
     # Pre-warm done: workspace cloned, branch checked out, transcript installed.
     # No CLI runs — the first real turn (on open) will be instant + warm.

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown, Github, Square } from "lucide-react";
+import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown, Github, Square, FileBox } from "lucide-react";
 import dynamic from "next/dynamic";
 import { sseData } from "@/lib/sse";
 import { MarkdownRenderer } from "@/components/workflow/MarkdownRenderer";
@@ -9,6 +9,7 @@ import { CliBadge, CliMark, CLI_BRAND } from "@/components/cloud-code/CliBrand";
 
 // xterm touches the DOM/window — load only in the browser.
 const ShellTerminal = dynamic(() => import("@/components/cloud-code/ShellTerminal"), { ssr: false });
+const ArtifactsPanel = dynamic(() => import("@/components/cloud-code/ArtifactsPanel"), { ssr: false });
 import type {
   CloudCodeSession,
   CloudCodeSessionSummary,
@@ -31,7 +32,7 @@ export default function CloudCodePage() {
   const [showNew, setShowNew] = useState(false);
   const [showConfig, setShowConfig] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
-  const [view, setView] = useState<"chat" | "terminal">("chat");
+  const [view, setView] = useState<"chat" | "terminal" | "artifacts">("chat");
   const [sessionsOpen, setSessionsOpen] = useState(false); // mobile session drawer
   const streamEnd = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -69,7 +70,7 @@ export default function CloudCodePage() {
   // cloud" handoff link opens straight into the ported session, on any device).
   // deepViewRef records a one-time view override so the select effect below
   // doesn't snap it back to chat.
-  const deepViewRef = useRef<"chat" | "terminal" | null>(null);
+  const deepViewRef = useRef<"chat" | "terminal" | "artifacts" | null>(null);
   useEffect(() => {
     const q = new URLSearchParams(window.location.search);
     const id = q.get("session");
@@ -322,7 +323,7 @@ export default function CloudCodePage() {
   useEffect(() => {
     if (!active?.pendingSeed) return;
     if (active.turns.length > 0) return; // already started
-    if (view === "terminal") return; // terminal does its own `claude --resume`
+    if (view !== "chat") return; // terminal does its own resume; artifacts isn't a turn surface
     if (seededRef.current === active.sessionId) return;
     seededRef.current = active.sessionId;
     const seed = active.pendingSeed;
@@ -485,6 +486,17 @@ export default function CloudCodePage() {
                 >
                   <TerminalSquare className="w-3.5 h-3.5" /> Terminal
                 </button>
+                <button
+                  onClick={() => setView("artifacts")}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
+                    view === "artifacts"
+                      ? "bg-brand-600/15 text-brand-300"
+                      : "text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)]"
+                  }`}
+                  title="Files this session generated or you uploaded"
+                >
+                  <FileBox className="w-3.5 h-3.5" /> Artifacts
+                </button>
               </div>
             </div>
 
@@ -507,6 +519,10 @@ export default function CloudCodePage() {
                     }).catch(() => {});
                   }}
                 />
+              </div>
+            ) : view === "artifacts" ? (
+              <div className="flex-1 min-h-0">
+                <ArtifactsPanel sessionId={active.sessionId} />
               </div>
             ) : (
             <div className="relative flex-1 min-h-0">
