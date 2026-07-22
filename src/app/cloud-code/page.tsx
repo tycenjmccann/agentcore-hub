@@ -627,7 +627,7 @@ export default function CloudCodePage() {
                   >
                     {stopping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-3.5 h-3.5" fill="currentColor" />}
                   </button>
-                ) : draft.trim() || voiceActive ? (
+                ) : draft.trim() && !voiceActive ? (
                   <button
                     onClick={send}
                     disabled={!draft.trim()}
