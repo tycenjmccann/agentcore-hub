@@ -37,3 +37,36 @@ export function resumeTranscriptKey(
 ): string {
   return `${tenantRoot(tenantId)}/resume/${sessionId}/${claudeSessionId}.jsonl`;
 }
+
+/** Prefix a session's artifacts (touched-but-untracked deliverables — generated
+ *  media, exports, datasets — plus files the user uploads) live under. Keyed by
+ *  the cloud sessionId; the port/upload leg writes here and the runtime restores
+ *  it into the workspace's .cloud-code/artifacts/ on warm. */
+export function artifactPrefix(tenantId: string, sessionId: string): string {
+  return `${tenantRoot(tenantId)}/resume/${sessionId}/artifacts/`;
+}
+
+/** S3 key for one artifact by its workspace-relative path. `rel` MUST be
+ *  validated with safeRelPath (no leading slash, no `..`) before this is called. */
+export function artifactKey(tenantId: string, sessionId: string, rel: string): string {
+  return `${artifactPrefix(tenantId, sessionId)}${rel}`;
+}
+
+/** Prefix cloud-generated artifacts land under at checkpoint time (the runtime's
+ *  _checkpoint_artifacts uploads here). Keyed by the conversation's RESUME id (the
+ *  transcript filename id) — what the runtime checkpoints under, not the sessionId.
+ *  Distinct from the resume/upload prefix, so the web listing reads both. */
+export function checkpointArtifactPrefix(tenantId: string, resumeId: string): string {
+  return `${tenantRoot(tenantId)}/checkpoint/${resumeId}/artifacts/`;
+}
+
+/** Validate an artifact's workspace-relative path: reject absolute paths and any
+ *  `..` traversal so a malicious/buggy path can't write outside the session's
+ *  artifact prefix. Returns a POSIX rel path, or null if unsafe. */
+export function safeRelPath(rel: string): string | null {
+  if (typeof rel !== "string" || !rel) return null;
+  const norm = rel.replace(/\\/g, "/");
+  if (norm.startsWith("/")) return null;
+  if (norm.split("/").some((seg) => seg === ".." || seg === "")) return null;
+  return norm;
+}
