@@ -36,12 +36,19 @@ export default function CloudCodePage() {
   const streamEnd = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  // In-flight turn state, so Stop can abort the stream and hand the server the
-  // partial reply + prompt to persist. accRef mirrors the streamed text; abortRef
-  // holds the fetch's AbortController; turnMetaRef holds the current turn's labels.
-  const abortRef = useRef<AbortController | null>(null);
+  // The in-flight turn, bound to the session it belongs to. Stop must target THIS
+  // session (not whatever's selected now — the user may have switched sidebars),
+  // and a monotonic `gen` lets a superseded turn's cleanup skip clearing a newer
+  // turn's state. accRef mirrors the streamed text so Stop can persist the partial.
+  const turnRef = useRef<{
+    gen: number;
+    sessionId: string;
+    prompt: string;
+    displayAs?: string;
+    controller: AbortController;
+  } | null>(null);
+  const genRef = useRef(0);
   const accRef = useRef("");
-  const turnMetaRef = useRef<{ prompt: string; displayAs?: string }>({ prompt: "" });
   const [stopping, setStopping] = useState(false);
   // Auto-scroll follows the bottom WHILE you're already there; if you scroll up
   // to read, it stops yanking you down and shows a "jump to latest" pill instead.
@@ -173,7 +180,7 @@ export default function CloudCodePage() {
   };
 
   const send = async () => {
-    if (!active || !draft.trim() || sending) return;
+    if (!active || !draft.trim() || sending || stopping) return;
     const prompt = draft.trim();
     setDraft("");
     await runTurn(prompt);
@@ -183,12 +190,13 @@ export default function CloudCodePage() {
   // `displayAs` overrides the user-bubble text — used for the ported seed, whose
   // real prompt is a huge transcript we don't want to render in the chat.
   const runTurn = async (prompt: string, displayAs?: string) => {
-    if (!active || !prompt || sending) return;
+    if (!active || !prompt || sending || stopping) return;
     setSending(true);
     accRef.current = "";
-    turnMetaRef.current = { prompt, displayAs };
+    const gen = ++genRef.current;
+    const sessionId = active.sessionId; // bind the turn to THIS session
     const controller = new AbortController();
-    abortRef.current = controller;
+    turnRef.current = { gen, sessionId, prompt, displayAs, controller };
     // Optimistic user turn
     setActive((s) =>
       s ? { ...s, turns: [...s.turns, { role: "user", text: displayAs ?? prompt, at: new Date().toISOString() }] } : s
@@ -197,7 +205,7 @@ export default function CloudCodePage() {
       // Claude streams (SSE); codex is buffered (plain JSON).
       const canStream = active.cli === "claude";
       const res = await fetch(
-        `/api/cloud-code/sessions/${active.sessionId}/message${canStream ? "?stream=1" : ""}`,
+        `/api/cloud-code/sessions/${sessionId}/message${canStream ? "?stream=1" : ""}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -253,10 +261,15 @@ export default function CloudCodePage() {
         );
       }
     } finally {
-      abortRef.current = null;
-      setSending(false);
-      // Re-focus the box so you can keep typing without clicking back in.
-      requestAnimationFrame(() => inputRef.current?.focus());
+      // Only THIS turn's own generation may clear the shared state. A turn that
+      // was Stopped (stop() owns the teardown + persist) or superseded by a newer
+      // turn must not reset `sending`/turnRef out from under the live one.
+      if (genRef.current === gen) {
+        turnRef.current = null;
+        setSending(false);
+        // Re-focus the box so you can keep typing without clicking back in.
+        requestAnimationFrame(() => inputRef.current?.focus());
+      }
     }
   };
 
@@ -264,23 +277,34 @@ export default function CloudCodePage() {
   // down the microVM (kills the in-flight CLI) and persist the interrupted turn so
   // it survives reload. The server re-warms a fresh VM in the background.
   const stop = async () => {
-    if (!active || !sending || stopping) return;
+    const turn = turnRef.current;
+    if (!turn || !sending || stopping) return;
     setStopping(true);
-    const { prompt, displayAs } = turnMetaRef.current;
+    // Bump the generation so the aborted runTurn's finally can't clear state, and
+    // no new turn can start with the old turn's identity.
+    genRef.current++;
+    const { sessionId, prompt, displayAs } = turn; // stop the turn's OWN session
     const partial = accRef.current;
-    abortRef.current?.abort();
+    turn.controller.abort();
     try {
-      const res = await fetch(`/api/cloud-code/sessions/${active.sessionId}/stop`, {
+      const res = await fetch(`/api/cloud-code/sessions/${sessionId}/stop`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt, displayPrompt: displayAs, partial }),
       });
       const data = await res.json().catch(() => ({}));
-      if (data.session) setActive(data.session);
+      // The route returns HTTP 200 even when StopRuntimeSession failed
+      // ({stopped:false, error}); surface that instead of silently going idle.
+      if (!res.ok || data.stopped === false) {
+        flash(data.error || "Couldn't stop the run — it may still be running.");
+      }
+      // Only repaint if the user is still viewing the session we stopped.
+      if (data.session && active?.sessionId === sessionId) setActive(data.session);
       fetchSessions();
     } catch (err) {
       flash((err as Error).message);
     } finally {
+      turnRef.current = null;
       setStopping(false);
       setSending(false);
     }

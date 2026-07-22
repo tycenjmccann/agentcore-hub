@@ -9,17 +9,48 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getOwnedSession, putSession, DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/cloud-code/sessions";
+import { getOwnedSession, getSession, putSession, STOP_MARKER, DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/cloud-code/sessions";
 import { invokeCodingTurn, invokeCodingTurnStream, codingRuntimeConfigured } from "@/lib/cloud-code/runtime";
 import { currentConfigVersion } from "@/lib/cloud-code/config-store";
 import { cloneTokenForUser } from "@/lib/cloud-code/github-app";
 import { getIdentity } from "@/lib/auth/identity";
 import { sseData } from "@/lib/sse";
-import type { CloudCodeTurn } from "@/lib/cloud-code/types";
+import type { CloudCodeTurn, CloudCodeSession } from "@/lib/cloud-code/types";
 
 export const dynamic = "force-dynamic";
 // A coding turn can be long; allow the route plenty of headroom.
 export const maxDuration = 800;
+
+/**
+ * Persist a completed/errored turn without clobbering a concurrent /stop write.
+ * The stream handler holds a stale row snapshot; a blind full Put of it would
+ * overwrite the merged row /stop persisted after interrupting this same turn
+ * (the two writers race). So we RE-READ the latest row and, if /stop already
+ * recorded this turn (its agent turn starts with STOP_MARKER), leave it alone.
+ * Otherwise we append userTurn + the agent reply onto the fresh row.
+ */
+async function persistTurn(
+  sessionId: string,
+  snapshot: CloudCodeSession,
+  userTurn: CloudCodeTurn,
+  agentText: string | null,
+  prompt: string
+): Promise<void> {
+  const fresh = (await getSession(sessionId).catch(() => null)) || snapshot;
+  const last = fresh.turns[fresh.turns.length - 1];
+  // /stop landed first for this turn — don't overwrite its record.
+  if (last?.role === "agent" && last.text.startsWith(STOP_MARKER)) return;
+  const now = new Date().toISOString();
+  if (!(last?.role === "user" && last.text === userTurn.text)) {
+    fresh.turns.push(userTurn);
+  }
+  if (agentText !== null) fresh.turns.push({ role: "agent", text: agentText, at: now });
+  if (fresh.title === "New session") fresh.title = prompt.slice(0, 80);
+  if (snapshot.claudeSessionId) fresh.claudeSessionId = snapshot.claudeSessionId;
+  fresh.pendingSeed = undefined;
+  fresh.updatedAt = now;
+  await putSession(fresh);
+}
 
 export async function POST(
   request: NextRequest,
@@ -113,17 +144,12 @@ export async function POST(
             }
             controller.enqueue(enc.encode(`data: ${json}\n\n`));
           }
-          // Persist the completed turn.
-          session.turns.push(userTurn, { role: "agent", text: fullText, at: new Date().toISOString() });
-          if (session.title === "New session") session.title = prompt.slice(0, 80);
-          session.pendingSeed = undefined; // ported seed has now run
-          session.updatedAt = new Date().toISOString();
-          await putSession(session).catch(() => {});
+          // Persist the completed turn (re-read + merge so a /stop write for this
+          // same interrupted turn isn't clobbered).
+          await persistTurn(session.sessionId, session, userTurn, fullText, prompt).catch(() => {});
         } catch (err) {
           controller.enqueue(enc.encode(`data: ${JSON.stringify({ type: "error", error: (err as Error).message })}\n\n`));
-          session.turns.push(userTurn);
-          session.updatedAt = new Date().toISOString();
-          await putSession(session).catch(() => {});
+          await persistTurn(session.sessionId, session, userTurn, null, prompt).catch(() => {});
         } finally {
           controller.close();
         }

@@ -24,6 +24,7 @@ import {
   getSession,
   getOwnedSession,
   putSession,
+  STOP_MARKER,
   DEFAULT_USER_ID,
   DEFAULT_TENANT_ID,
 } from "@/lib/cloud-code/sessions";
@@ -35,7 +36,9 @@ import type { CloudCodeTurn } from "@/lib/cloud-code/types";
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
 
-const STOP_NOTE = "⏹ Stopped. What should the agent do instead?";
+// Must start with STOP_MARKER so the /message writer can detect a stop-recorded
+// turn on re-read and avoid clobbering it.
+const STOP_NOTE = `${STOP_MARKER} What should the agent do instead?`;
 
 export async function POST(
   request: NextRequest,

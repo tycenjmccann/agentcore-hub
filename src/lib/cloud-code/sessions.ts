@@ -33,6 +33,12 @@ export { DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/auth/identity";
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
 
+// Sentinel embedded in the agent turn the /stop route persists. The streaming
+// /message writer checks for it on a re-read so a late stream-completion Put
+// can't clobber a turn that /stop already recorded (the two writers race when a
+// turn is interrupted). Keep in sync with STOP_NOTE in the stop route.
+export const STOP_MARKER = "⏹ Stopped.";
+
 /** Tenant a row belongs to, tolerating legacy rows written before tenantId. */
 function tenantOf(s: CloudCodeSession): string {
   return s.tenantId || DEFAULT_TENANT_ID;
