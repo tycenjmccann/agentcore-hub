@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown, Github } from "lucide-react";
+import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown, Github, Square } from "lucide-react";
 import dynamic from "next/dynamic";
 import { sseData } from "@/lib/sse";
 import { MarkdownRenderer } from "@/components/workflow/MarkdownRenderer";
@@ -36,6 +36,20 @@ export default function CloudCodePage() {
   const streamEnd = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // The in-flight turn, bound to the session it belongs to. Stop must target THIS
+  // session (not whatever's selected now — the user may have switched sidebars),
+  // and a monotonic `gen` lets a superseded turn's cleanup skip clearing a newer
+  // turn's state. accRef mirrors the streamed text so Stop can persist the partial.
+  const turnRef = useRef<{
+    gen: number;
+    sessionId: string;
+    prompt: string;
+    displayAs?: string;
+    controller: AbortController;
+  } | null>(null);
+  const genRef = useRef(0);
+  const accRef = useRef("");
+  const [stopping, setStopping] = useState(false);
   // Auto-scroll follows the bottom WHILE you're already there; if you scroll up
   // to read, it stops yanking you down and shows a "jump to latest" pill instead.
   const [stuck, setStuck] = useState(true);
@@ -166,7 +180,7 @@ export default function CloudCodePage() {
   };
 
   const send = async () => {
-    if (!active || !draft.trim() || sending) return;
+    if (!active || !draft.trim() || sending || stopping) return;
     const prompt = draft.trim();
     setDraft("");
     await runTurn(prompt);
@@ -176,8 +190,13 @@ export default function CloudCodePage() {
   // `displayAs` overrides the user-bubble text — used for the ported seed, whose
   // real prompt is a huge transcript we don't want to render in the chat.
   const runTurn = async (prompt: string, displayAs?: string) => {
-    if (!active || !prompt || sending) return;
+    if (!active || !prompt || sending || stopping) return;
     setSending(true);
+    accRef.current = "";
+    const gen = ++genRef.current;
+    const sessionId = active.sessionId; // bind the turn to THIS session
+    const controller = new AbortController();
+    turnRef.current = { gen, sessionId, prompt, displayAs, controller };
     // Optimistic user turn
     setActive((s) =>
       s ? { ...s, turns: [...s.turns, { role: "user", text: displayAs ?? prompt, at: new Date().toISOString() }] } : s
@@ -186,11 +205,12 @@ export default function CloudCodePage() {
       // Claude streams (SSE); codex is buffered (plain JSON).
       const canStream = active.cli === "claude";
       const res = await fetch(
-        `/api/cloud-code/sessions/${active.sessionId}/message${canStream ? "?stream=1" : ""}`,
+        `/api/cloud-code/sessions/${sessionId}/message${canStream ? "?stream=1" : ""}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(displayAs ? { prompt, displayPrompt: displayAs } : { prompt }),
+          signal: controller.signal,
         }
       );
 
@@ -207,6 +227,7 @@ export default function CloudCodePage() {
           if (obj.type === "text") acc += obj.text || "";
           else if (obj.type === "done") acc = obj.response || acc;
           else if (obj.type === "error") acc += `\n⚠ ${obj.error}`;
+          accRef.current = acc; // mirror for Stop → persist partial
           // Update the last (agent) turn's text in place.
           setActive((s) => {
             if (!s) return s;
@@ -223,22 +244,69 @@ export default function CloudCodePage() {
         fetchSessions();
       }
     } catch (err) {
-      flash((err as Error).message);
-      setActive((s) =>
-        s
-          ? {
-              ...s,
-              turns: [
-                ...s.turns,
-                { role: "agent", text: `⚠ ${(err as Error).message}`, at: new Date().toISOString() },
-              ],
-            }
-          : s
-      );
+      // A user-initiated Stop aborts the fetch; stop() owns the UI update, so
+      // don't render an error bubble for it.
+      if ((err as Error).name !== "AbortError") {
+        flash((err as Error).message);
+        setActive((s) =>
+          s
+            ? {
+                ...s,
+                turns: [
+                  ...s.turns,
+                  { role: "agent", text: `⚠ ${(err as Error).message}`, at: new Date().toISOString() },
+                ],
+              }
+            : s
+        );
+      }
     } finally {
+      // Only THIS turn's own generation may clear the shared state. A turn that
+      // was Stopped (stop() owns the teardown + persist) or superseded by a newer
+      // turn must not reset `sending`/turnRef out from under the live one.
+      if (genRef.current === gen) {
+        turnRef.current = null;
+        setSending(false);
+        // Re-focus the box so you can keep typing without clicking back in.
+        requestAnimationFrame(() => inputRef.current?.focus());
+      }
+    }
+  };
+
+  // Stop the running turn: abort the client stream, then tell the runtime to tear
+  // down the microVM (kills the in-flight CLI) and persist the interrupted turn so
+  // it survives reload. The server re-warms a fresh VM in the background.
+  const stop = async () => {
+    const turn = turnRef.current;
+    if (!turn || !sending || stopping) return;
+    setStopping(true);
+    // Bump the generation so the aborted runTurn's finally can't clear state, and
+    // no new turn can start with the old turn's identity.
+    genRef.current++;
+    const { sessionId, prompt, displayAs } = turn; // stop the turn's OWN session
+    const partial = accRef.current;
+    turn.controller.abort();
+    try {
+      const res = await fetch(`/api/cloud-code/sessions/${sessionId}/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, displayPrompt: displayAs, partial }),
+      });
+      const data = await res.json().catch(() => ({}));
+      // The route returns HTTP 200 even when StopRuntimeSession failed
+      // ({stopped:false, error}); surface that instead of silently going idle.
+      if (!res.ok || data.stopped === false) {
+        flash(data.error || "Couldn't stop the run — it may still be running.");
+      }
+      // Only repaint if the user is still viewing the session we stopped.
+      if (data.session && active?.sessionId === sessionId) setActive(data.session);
+      fetchSessions();
+    } catch (err) {
+      flash((err as Error).message);
+    } finally {
+      turnRef.current = null;
+      setStopping(false);
       setSending(false);
-      // Re-focus the box so you can keep typing without clicking back in.
-      requestAnimationFrame(() => inputRef.current?.focus());
     }
   };
 
@@ -521,15 +589,28 @@ export default function CloudCodePage() {
                   data-testid="cc-message-input"
                   className="flex-1 bg-transparent resize-none outline-none text-sm leading-6 py-1.5 max-h-[152px] placeholder:text-[var(--color-text-muted)]"
                 />
-                <button
-                  onClick={send}
-                  disabled={sending || !draft.trim()}
-                  data-testid="cc-send"
-                  className="w-8 h-8 mb-0.5 rounded-lg bg-brand-600 text-white flex items-center justify-center hover:bg-brand-500 transition-colors disabled:opacity-40 flex-shrink-0"
-                  aria-label="Send"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
+                {sending ? (
+                  <button
+                    onClick={stop}
+                    disabled={stopping}
+                    data-testid="cc-stop"
+                    className="w-8 h-8 mb-0.5 rounded-lg bg-red-600 text-white flex items-center justify-center hover:bg-red-500 transition-colors disabled:opacity-40 flex-shrink-0"
+                    aria-label="Stop"
+                    title="Stop the running turn"
+                  >
+                    {stopping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-3.5 h-3.5" fill="currentColor" />}
+                  </button>
+                ) : (
+                  <button
+                    onClick={send}
+                    disabled={!draft.trim()}
+                    data-testid="cc-send"
+                    className="w-8 h-8 mb-0.5 rounded-lg bg-brand-600 text-white flex items-center justify-center hover:bg-brand-500 transition-colors disabled:opacity-40 flex-shrink-0"
+                    aria-label="Send"
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                )}
               </div>
             </div>
             )}
