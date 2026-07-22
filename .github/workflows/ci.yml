@@ -74,8 +74,11 @@ jobs:
           done
           echo "server did not come up"; exit 1
 
+      # --trace retain-on-failure overrides the config's on-first-retry: this job
+      # runs no retries, so on-first-retry would never capture a trace on a
+      # first-attempt failure — the artifact upload below would have nothing.
       - name: Cloud Code UI regression suite
-        run: npm run test:cloud-code
+        run: npm run test:cloud-code -- --trace retain-on-failure
         env:
           PLAYWRIGHT_BASE_URL: http://localhost:3737
 
