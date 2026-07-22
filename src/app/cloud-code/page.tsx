@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown } from "lucide-react";
+import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown, Github, Square, FileBox } from "lucide-react";
 import dynamic from "next/dynamic";
 import { sseData } from "@/lib/sse";
 import { MarkdownRenderer } from "@/components/workflow/MarkdownRenderer";
@@ -9,6 +9,9 @@ import { CliBadge, CliMark, CLI_BRAND } from "@/components/cloud-code/CliBrand";
 
 // xterm touches the DOM/window — load only in the browser.
 const ShellTerminal = dynamic(() => import("@/components/cloud-code/ShellTerminal"), { ssr: false });
+const ArtifactsPanel = dynamic(() => import("@/components/cloud-code/ArtifactsPanel"), { ssr: false });
+const VoiceButton = dynamic(() => import("@/components/cloud-code/VoiceButton"), { ssr: false });
+import { PullCommandButton } from "@/components/cloud-code/PullCommandButton";
 import type {
   CloudCodeSession,
   CloudCodeSessionSummary,
@@ -31,11 +34,28 @@ export default function CloudCodePage() {
   const [showNew, setShowNew] = useState(false);
   const [showConfig, setShowConfig] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
-  const [view, setView] = useState<"chat" | "terminal">("chat");
+  const [view, setView] = useState<"chat" | "terminal" | "artifacts">("chat");
   const [sessionsOpen, setSessionsOpen] = useState(false); // mobile session drawer
   const streamEnd = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // The in-flight turn, bound to the session it belongs to. Stop must target THIS
+  // session (not whatever's selected now — the user may have switched sidebars),
+  // and a monotonic `gen` lets a superseded turn's cleanup skip clearing a newer
+  // turn's state. accRef mirrors the streamed text so Stop can persist the partial.
+  const turnRef = useRef<{
+    gen: number;
+    sessionId: string;
+    prompt: string;
+    displayAs?: string;
+    controller: AbortController;
+  } | null>(null);
+  const genRef = useRef(0);
+  const accRef = useRef("");
+  const [stopping, setStopping] = useState(false);
+  // True while the mic is recording/locked, so the composer keeps the mic mounted
+  // even once dictated text fills the draft (otherwise send would swap in).
+  const [voiceActive, setVoiceActive] = useState(false);
   // Auto-scroll follows the bottom WHILE you're already there; if you scroll up
   // to read, it stops yanking you down and shows a "jump to latest" pill instead.
   const [stuck, setStuck] = useState(true);
@@ -55,7 +75,7 @@ export default function CloudCodePage() {
   // cloud" handoff link opens straight into the ported session, on any device).
   // deepViewRef records a one-time view override so the select effect below
   // doesn't snap it back to chat.
-  const deepViewRef = useRef<"chat" | "terminal" | null>(null);
+  const deepViewRef = useRef<"chat" | "terminal" | "artifacts" | null>(null);
   useEffect(() => {
     const q = new URLSearchParams(window.location.search);
     const id = q.get("session");
@@ -63,6 +83,27 @@ export default function CloudCodePage() {
       if (q.get("view") === "terminal") deepViewRef.current = "terminal";
       setSelectedId(id);
     }
+    // GitHub App connect/disconnect bounces back here with ?github=<status>.
+    const gh = q.get("github");
+    if (gh) {
+      const msgs: Record<string, string> = {
+        connected: "GitHub connected — private repos clone with short-lived tokens",
+        disconnected: "GitHub disconnected",
+        cancelled: "GitHub connection cancelled",
+        not_configured: "GitHub App isn't set up yet — ask your operator",
+        forbidden: "Only an admin can create the GitHub App",
+        state_mismatch: "GitHub connection couldn't be verified — start from Connect and try again",
+        ownership_unverified: "Couldn't confirm you own that GitHub installation — start from Connect and try again",
+        oauth_required: "GitHub App is missing OAuth credentials — your operator must add them first",
+        error: "GitHub connection failed — try again",
+        app_error: "Couldn't create the GitHub App — try again",
+      };
+      flash(msgs[gh] || "GitHub");
+      q.delete("github");
+      const qs = q.toString();
+      window.history.replaceState(null, "", window.location.pathname + (qs ? `?${qs}` : ""));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Tracks which session's pending seed we've already auto-fired, so opening a
@@ -145,7 +186,7 @@ export default function CloudCodePage() {
   };
 
   const send = async () => {
-    if (!active || !draft.trim() || sending) return;
+    if (!active || !draft.trim() || sending || stopping) return;
     const prompt = draft.trim();
     setDraft("");
     await runTurn(prompt);
@@ -155,8 +196,13 @@ export default function CloudCodePage() {
   // `displayAs` overrides the user-bubble text — used for the ported seed, whose
   // real prompt is a huge transcript we don't want to render in the chat.
   const runTurn = async (prompt: string, displayAs?: string) => {
-    if (!active || !prompt || sending) return;
+    if (!active || !prompt || sending || stopping) return;
     setSending(true);
+    accRef.current = "";
+    const gen = ++genRef.current;
+    const sessionId = active.sessionId; // bind the turn to THIS session
+    const controller = new AbortController();
+    turnRef.current = { gen, sessionId, prompt, displayAs, controller };
     // Optimistic user turn
     setActive((s) =>
       s ? { ...s, turns: [...s.turns, { role: "user", text: displayAs ?? prompt, at: new Date().toISOString() }] } : s
@@ -165,11 +211,12 @@ export default function CloudCodePage() {
       // Claude streams (SSE); codex is buffered (plain JSON).
       const canStream = active.cli === "claude";
       const res = await fetch(
-        `/api/cloud-code/sessions/${active.sessionId}/message${canStream ? "?stream=1" : ""}`,
+        `/api/cloud-code/sessions/${sessionId}/message${canStream ? "?stream=1" : ""}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(displayAs ? { prompt, displayPrompt: displayAs } : { prompt }),
+          signal: controller.signal,
         }
       );
 
@@ -186,6 +233,7 @@ export default function CloudCodePage() {
           if (obj.type === "text") acc += obj.text || "";
           else if (obj.type === "done") acc = obj.response || acc;
           else if (obj.type === "error") acc += `\n⚠ ${obj.error}`;
+          accRef.current = acc; // mirror for Stop → persist partial
           // Update the last (agent) turn's text in place.
           setActive((s) => {
             if (!s) return s;
@@ -202,22 +250,69 @@ export default function CloudCodePage() {
         fetchSessions();
       }
     } catch (err) {
-      flash((err as Error).message);
-      setActive((s) =>
-        s
-          ? {
-              ...s,
-              turns: [
-                ...s.turns,
-                { role: "agent", text: `⚠ ${(err as Error).message}`, at: new Date().toISOString() },
-              ],
-            }
-          : s
-      );
+      // A user-initiated Stop aborts the fetch; stop() owns the UI update, so
+      // don't render an error bubble for it.
+      if ((err as Error).name !== "AbortError") {
+        flash((err as Error).message);
+        setActive((s) =>
+          s
+            ? {
+                ...s,
+                turns: [
+                  ...s.turns,
+                  { role: "agent", text: `⚠ ${(err as Error).message}`, at: new Date().toISOString() },
+                ],
+              }
+            : s
+        );
+      }
     } finally {
+      // Only THIS turn's own generation may clear the shared state. A turn that
+      // was Stopped (stop() owns the teardown + persist) or superseded by a newer
+      // turn must not reset `sending`/turnRef out from under the live one.
+      if (genRef.current === gen) {
+        turnRef.current = null;
+        setSending(false);
+        // Re-focus the box so you can keep typing without clicking back in.
+        requestAnimationFrame(() => inputRef.current?.focus());
+      }
+    }
+  };
+
+  // Stop the running turn: abort the client stream, then tell the runtime to tear
+  // down the microVM (kills the in-flight CLI) and persist the interrupted turn so
+  // it survives reload. The server re-warms a fresh VM in the background.
+  const stop = async () => {
+    const turn = turnRef.current;
+    if (!turn || !sending || stopping) return;
+    setStopping(true);
+    // Bump the generation so the aborted runTurn's finally can't clear state, and
+    // no new turn can start with the old turn's identity.
+    genRef.current++;
+    const { sessionId, prompt, displayAs } = turn; // stop the turn's OWN session
+    const partial = accRef.current;
+    turn.controller.abort();
+    try {
+      const res = await fetch(`/api/cloud-code/sessions/${sessionId}/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, displayPrompt: displayAs, partial }),
+      });
+      const data = await res.json().catch(() => ({}));
+      // The route returns HTTP 200 even when StopRuntimeSession failed
+      // ({stopped:false, error}); surface that instead of silently going idle.
+      if (!res.ok || data.stopped === false) {
+        flash(data.error || "Couldn't stop the run — it may still be running.");
+      }
+      // Only repaint if the user is still viewing the session we stopped.
+      if (data.session && active?.sessionId === sessionId) setActive(data.session);
+      fetchSessions();
+    } catch (err) {
+      flash((err as Error).message);
+    } finally {
+      turnRef.current = null;
+      setStopping(false);
       setSending(false);
-      // Re-focus the box so you can keep typing without clicking back in.
-      requestAnimationFrame(() => inputRef.current?.focus());
     }
   };
 
@@ -233,7 +328,7 @@ export default function CloudCodePage() {
   useEffect(() => {
     if (!active?.pendingSeed) return;
     if (active.turns.length > 0) return; // already started
-    if (view === "terminal") return; // terminal does its own `claude --resume`
+    if (view !== "chat") return; // terminal does its own resume; artifacts isn't a turn surface
     if (seededRef.current === active.sessionId) return;
     seededRef.current = active.sessionId;
     const seed = active.pendingSeed;
@@ -373,8 +468,13 @@ export default function CloudCodePage() {
                   )}
                 </div>
               </div>
-              {/* Chat ⇄ Terminal toggle */}
-              <div className="flex items-center rounded-lg border border-[var(--color-border)] overflow-hidden flex-shrink-0">
+              <div className="flex items-center gap-2 flex-shrink-0">
+              {/* Pull-to-laptop command (claude only — pull resumes via --resume). */}
+              {active.cli === "claude" && (
+                <PullCommandButton sessionId={active.sessionId} className="hidden sm:flex" />
+              )}
+              {/* Chat ⇄ Terminal ⇄ Artifacts toggle */}
+              <div className="flex items-center rounded-lg border border-[var(--color-border)] overflow-hidden">
                 <button
                   onClick={() => setView("chat")}
                   className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
@@ -396,6 +496,18 @@ export default function CloudCodePage() {
                 >
                   <TerminalSquare className="w-3.5 h-3.5" /> Terminal
                 </button>
+                <button
+                  onClick={() => setView("artifacts")}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
+                    view === "artifacts"
+                      ? "bg-brand-600/15 text-brand-300"
+                      : "text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)]"
+                  }`}
+                  title="Files this session generated or you uploaded"
+                >
+                  <FileBox className="w-3.5 h-3.5" /> Artifacts
+                </button>
+              </div>
               </div>
             </div>
 
@@ -418,6 +530,10 @@ export default function CloudCodePage() {
                     }).catch(() => {});
                   }}
                 />
+              </div>
+            ) : view === "artifacts" ? (
+              <div className="flex-1 min-h-0">
+                <ArtifactsPanel sessionId={active.sessionId} />
               </div>
             ) : (
             <div className="relative flex-1 min-h-0">
@@ -500,15 +616,36 @@ export default function CloudCodePage() {
                   data-testid="cc-message-input"
                   className="flex-1 bg-transparent resize-none outline-none text-sm leading-6 py-1.5 max-h-[152px] placeholder:text-[var(--color-text-muted)]"
                 />
-                <button
-                  onClick={send}
-                  disabled={sending || !draft.trim()}
-                  data-testid="cc-send"
-                  className="w-8 h-8 mb-0.5 rounded-lg bg-brand-600 text-white flex items-center justify-center hover:bg-brand-500 transition-colors disabled:opacity-40 flex-shrink-0"
-                  aria-label="Send"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
+                {sending ? (
+                  <button
+                    onClick={stop}
+                    disabled={stopping}
+                    data-testid="cc-stop"
+                    className="w-8 h-8 mb-0.5 rounded-lg bg-red-600 text-white flex items-center justify-center hover:bg-red-500 transition-colors disabled:opacity-40 flex-shrink-0"
+                    aria-label="Stop"
+                    title="Stop the running turn"
+                  >
+                    {stopping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-3.5 h-3.5" fill="currentColor" />}
+                  </button>
+                ) : draft.trim() && !voiceActive ? (
+                  <button
+                    onClick={send}
+                    disabled={!draft.trim()}
+                    data-testid="cc-send"
+                    className="w-8 h-8 mb-0.5 rounded-lg bg-brand-600 text-white flex items-center justify-center hover:bg-brand-500 transition-colors disabled:opacity-40 flex-shrink-0"
+                    aria-label="Send"
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                ) : (
+                  // Empty composer → push-to-talk mic (hidden where unsupported,
+                  // which falls back to showing the disabled send button).
+                  <VoiceButton
+                    onText={(t) => setDraft(t)}
+                    onError={(m) => flash(m)}
+                    onActiveChange={setVoiceActive}
+                  />
+                )}
               </div>
             </div>
             )}
@@ -619,10 +756,17 @@ interface ConfigVersion {
   createdAt: string;
 }
 
+interface GithubState {
+  appConfigured: boolean;
+  isAdmin: boolean;
+  connection: { account?: string; repoSelection?: string; repoCount?: number } | null;
+}
+
 function ConfigModal({ onClose, onToast }: { onClose: () => void; onToast: (m: string) => void }) {
   const [versions, setVersions] = useState<ConfigVersion[]>([]);
   const [current, setCurrent] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
+  const [github, setGithub] = useState<GithubState>({ appConfigured: false, isAdmin: false, connection: null });
   const fileRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async () => {
@@ -633,9 +777,25 @@ function ConfigModal({ onClose, onToast }: { onClose: () => void; onToast: (m: s
       setCurrent(d.currentVersion);
     }
   }, []);
+  const loadGithub = useCallback(async () => {
+    const res = await fetch("/api/cloud-code/github");
+    if (res.ok) setGithub(await res.json());
+  }, []);
   useEffect(() => {
     load();
-  }, [load]);
+    loadGithub();
+  }, [load, loadGithub]);
+
+  const disconnectGithub = async () => {
+    setBusy(true);
+    try {
+      await fetch("/api/cloud-code/github", { method: "DELETE" });
+      await loadGithub();
+      onToast("GitHub disconnected");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const upload = async (file: File) => {
     setBusy(true);
@@ -706,6 +866,59 @@ function ConfigModal({ onClose, onToast }: { onClose: () => void; onToast: (m: s
           {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
           Upload config bundle (.zip)
         </button>
+
+        {/* GitHub: connect an App installation so private repos clone with
+            short-lived, per-repo tokens instead of a shared PAT. */}
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)] mb-2">
+          GitHub
+        </div>
+        <div className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-[var(--color-border)] mb-5">
+          <Github className="w-4 h-4 shrink-0 text-[var(--color-text-muted)]" />
+          <div className="flex-1 min-w-0">
+            {github.connection ? (
+              <>
+                <div className="text-[13px] font-medium truncate">
+                  {github.connection.account || "Connected"}
+                </div>
+                <div className="text-[10.5px] text-[var(--color-text-muted)]">
+                  {github.connection.repoSelection === "selected"
+                    ? `${github.connection.repoCount ?? "selected"} repo${github.connection.repoCount === 1 ? "" : "s"}`
+                    : "all repositories"}{" "}
+                  · short-lived tokens
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="text-[13px] font-medium">Not connected</div>
+                <div className="text-[10.5px] text-[var(--color-text-muted)]">
+                  {github.appConfigured
+                    ? "Connect to clone private repos with scoped, expiring tokens"
+                    : github.isAdmin
+                      ? "Set up the GitHub App to enable private-repo cloning"
+                      : "GitHub App isn't set up — ask your operator"}
+                </div>
+              </>
+            )}
+          </div>
+          {github.connection ? (
+            <button
+              onClick={disconnectGithub}
+              disabled={busy}
+              className="text-[11px] px-2.5 py-1 rounded border border-[var(--color-border)] hover:text-red-400 hover:border-red-500/40 transition-colors disabled:opacity-50"
+            >
+              Disconnect
+            </button>
+          ) : (
+            (github.appConfigured || github.isAdmin) && (
+              <a
+                href="/api/cloud-code/github/install"
+                className="text-[11px] px-2.5 py-1 rounded border border-brand-500/50 text-brand-300 hover:bg-brand-500/10 transition-colors"
+              >
+                {github.appConfigured ? "Connect" : "Set up"}
+              </a>
+            )
+          )}
+        </div>
 
         <div className="text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)] mb-2">
           Versions

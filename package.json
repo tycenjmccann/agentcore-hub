@@ -9,6 +9,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "test:unit": "vitest run",
+    "test:cloud-code": "playwright test tests/cloud-code-ui.spec.ts",
     "test": "npx playwright test tests/tab-*.spec.ts tests/e2e-api-routes.spec.ts",
     "test:full": "./tests/run-all.sh --full"
   },
@@ -24,6 +26,7 @@
     "@aws-sdk/client-dynamodb": "^3.1049.0",
     "@aws-sdk/client-lambda": "^3.1051.0",
     "@aws-sdk/client-s3": "^3.1048.0",
+    "@aws-sdk/client-secrets-manager": "^3.1092.0",
     "@aws-sdk/client-sts": "^3.1046.0",
     "@aws-sdk/credential-provider-node": "^3.972.57",
     "@aws-sdk/lib-dynamodb": "^3.1049.0",
@@ -32,6 +35,7 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "clsx": "^2.1.0",
+    "jose": "^5.10.0",
     "jszip": "^3.10.1",
     "lucide-react": "^0.400.0",
     "next": "^14.2.0",
@@ -56,6 +60,7 @@
     "eslint-config-next": "^14.2.35",
     "postcss": "^8.4.0",
     "tailwindcss": "^3.4.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^2.1.9"
   }
 }

@@ -13,9 +13,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { SignatureV4 } from "@smithy/signature-v4";
 import { Sha256 } from "@aws-crypto/sha256-js";
 import { defaultProvider } from "@aws-sdk/credential-provider-node";
-import { getSession, DEFAULT_USER_ID } from "@/lib/cloud-code/sessions";
+import { getOwnedSession, DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/cloud-code/sessions";
 import { currentConfigVersion } from "@/lib/cloud-code/config-store";
 import { prepareCodingSession } from "@/lib/cloud-code/runtime";
+import { getIdentity } from "@/lib/auth/identity";
 
 export const dynamic = "force-dynamic";
 // Bounded by the prepare race below; the presign itself is instant.
@@ -26,7 +27,7 @@ const RUNTIME_ARN = process.env.CODING_AGENT_RUNTIME_ARN || "";
 const EXPIRES = 300; // AgentCore presigned-URL max
 
 export async function POST(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: { id: string } }
 ) {
   if (!RUNTIME_ARN) {
@@ -36,7 +37,8 @@ export async function POST(
     );
   }
 
-  const session = await getSession(params.id);
+  const { tenantId } = getIdentity(request);
+  const session = await getOwnedSession(params.id, tenantId);
   if (!session) {
     return NextResponse.json({ error: "Session not found" }, { status: 404 });
   }
@@ -48,13 +50,15 @@ export async function POST(
   // URL on a cold path (materialization continues server-side; marker dedupes).
   try {
     const userId = session.userId || DEFAULT_USER_ID;
-    const configVersion = await currentConfigVersion(userId);
+    const sessionTenant = session.tenantId || DEFAULT_TENANT_ID;
+    const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
     if (configVersion) {
       await Promise.race([
         prepareCodingSession({
           sessionId: session.sessionId,
           cli: session.cli,
           userId,
+          tenantId: sessionTenant,
           configVersion,
           region: REGION,
         }).catch(() => {}),

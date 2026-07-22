@@ -55,9 +55,19 @@ CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
 TURN_TIMEOUT_S = int(os.environ.get("TURN_TIMEOUT_S", "1500"))
 
 # Per-user coding-CLI config bundle (MCP servers, skills, custom agents, prefs).
-# The app uploads a zip to s3://{ARTIFACT_BUCKET}/cloud-code/configs/{userId}/
-# {version}.zip; we materialize it into the CLI config dirs on session start.
+# The app uploads a zip under the tenant prefix (see _tenant_root); we materialize
+# it into the CLI config dirs on session start.
 ARTIFACT_BUCKET = os.environ.get("ARTIFACT_BUCKET", "")
+
+# Tenant boundary for S3 keys — MUST match src/lib/cloud-code/s3keys.ts. The
+# "default" tenant (no-auth deploys) keeps the legacy unprefixed layout so
+# pre-tenancy objects still resolve; real tenants get a `t/<tenantId>/` prefix.
+DEFAULT_TENANT_ID = "default"
+
+
+def _tenant_root(tenant_id: str | None) -> str:
+    tid = tenant_id or DEFAULT_TENANT_ID
+    return "cloud-code" if tid == DEFAULT_TENANT_ID else f"cloud-code/t/{tid}"
 CLAUDE_CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
 CODEX_HOME = os.environ.get("CODEX_HOME", os.path.join(WORKSPACE_ROOT, ".codex"))
 # Marker so we only materialize a given (user, version) once per warm microVM.
@@ -163,10 +173,10 @@ def _apply_default_mcp() -> None:
 # ─── Per-user config bundle ───────────────────────────────────────────────────
 
 
-def _apply_config_bundle(user_id: str | None, version: str | None) -> None:
+def _apply_config_bundle(user_id: str | None, version: str | None, tenant_id: str | None = None) -> None:
     """Materialize a user's coding-CLI config bundle into the CLI config dirs.
 
-    The bundle is a zip at s3://{ARTIFACT_BUCKET}/cloud-code/configs/{userId}/{version}.zip
+    The bundle is a zip at s3://{ARTIFACT_BUCKET}/{tenant_root}/configs/{userId}/{version}.zip
     laid out as `claude/...` (→ CLAUDE_CONFIG_DIR) and `codex/...` (→ CODEX_HOME).
     Idempotent per warm microVM via a marker file. The user's files land first;
     run-codex.sh / the launchers then re-assert our Bedrock provider on top, so a
@@ -204,7 +214,7 @@ def _apply_config_bundle(user_id: str | None, version: str | None) -> None:
     if not (user_id and ARTIFACT_BUCKET):
         return
 
-    token = f"{user_id}:{version}"
+    token = f"{tenant_id or DEFAULT_TENANT_ID}:{user_id}:{version}"
     prev = _read_marker()
     if prev.get("token") == token:
         return  # already applied to this warm VM
@@ -212,7 +222,7 @@ def _apply_config_bundle(user_id: str | None, version: str | None) -> None:
     if prev.get("files"):
         _remove_applied(prev["files"])
 
-    key = f"cloud-code/configs/{user_id}/{version}.zip"
+    key = f"{_tenant_root(tenant_id)}/configs/{user_id}/{version}.zip"
     try:
         s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
         obj = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=key)
@@ -316,7 +326,30 @@ def _slugify_repo(repo: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "-", slug) or "default"
 
 
-def _configure_git() -> None:
+def _clear_github_insteadof() -> None:
+    """Remove every `url.https://x-access-token:<token>@github.com/.insteadOf`
+    section from ~/.gitconfig. Each minted token produced a distinct section key,
+    so on a warm VM they accumulate and Git rewrites through the first (stale) one.
+    We enumerate the section names via --get-regexp and --remove-section each."""
+    res = subprocess.run(
+        ["git", "config", "--global", "--get-regexp",
+         r"^url\.https://x-access-token:.*@github\.com/\.insteadof"],
+        capture_output=True, text=True, check=False,
+    )
+    sections = set()
+    for line in res.stdout.splitlines():
+        # Each line is "<section>.insteadof <value>"; strip the ".insteadof …" tail.
+        name = line.split(" ", 1)[0]
+        if name.lower().endswith(".insteadof"):
+            sections.add(name[: -len(".insteadof")])
+    for section in sections:
+        subprocess.run(
+            ["git", "config", "--global", "--remove-section", section],
+            check=False, stderr=subprocess.DEVNULL,
+        )
+
+
+def _configure_git(github_token: str | None = None, app_connected: bool = False) -> None:
     # Session storage mounts under a uid that may differ from the runtime user,
     # so Git refuses to operate ("dubious ownership"). Trust the workspace tree.
     subprocess.run(
@@ -328,12 +361,28 @@ def _configure_git() -> None:
         ["git", "config", "--global", "--add", "safe.directory", "*"],
         check=False,
     )
-    pat = os.environ.get("GITHUB_PAT")
-    if not pat:
+    # Prefer the per-session GitHub App installation token minted by the hub for
+    # this session's owner: short-lived (~1h) and scoped to just this repo. Only
+    # fall back to the shared GITHUB_PAT when the owner is NOT App-connected — a
+    # connected owner whose scoped mint was denied must clone within their App
+    # scope, never escalate to the operator's broad PAT.
+    token = github_token
+    if not token and not app_connected:
+        token = os.environ.get("GITHUB_PAT")
+    # A warm microVM outlives a ~1h installation token, so a turn re-runs this with
+    # a DIFFERENT token. Each token makes a distinct `url.https://x-access-token:<t>@
+    # github.com/.insteadOf` KEY, so a plain re-add leaves the OLD (expired) rule in
+    # ~/.gitconfig. Git rewrites through the FIRST matching rule → clones/pushes use
+    # the stale token and fail. Drop every prior github.com insteadOf rule first, so
+    # only the current token's rule remains (also scrubs it on a token-less turn).
+    _clear_github_insteadof()
+    if not token:
+        os.environ.pop("GH_TOKEN", None)
+        os.environ.pop("GITHUB_TOKEN", None)
         return
     subprocess.run(
         ["git", "config", "--global",
-         f"url.https://x-access-token:{pat}@github.com/.insteadOf",
+         f"url.https://x-access-token:{token}@github.com/.insteadOf",
          "https://github.com/"],
         check=False,
     )
@@ -341,10 +390,10 @@ def _configure_git() -> None:
                     os.environ.get("GIT_AUTHOR_EMAIL", "agent@agentcore-hub.example.com")], check=False)
     subprocess.run(["git", "config", "--global", "user.name",
                     os.environ.get("GIT_AUTHOR_NAME", "AgentCore Hub Agent")], check=False)
-    # Expose the PAT to the GitHub CLI so the agent can enumerate/inspect repos
+    # Expose the token to the GitHub CLI so the agent can enumerate/inspect repos
     # (e.g. `gh repo list`, `gh api`) — not just clone a known URL.
-    os.environ.setdefault("GH_TOKEN", pat)
-    os.environ.setdefault("GITHUB_TOKEN", pat)
+    os.environ["GH_TOKEN"] = token
+    os.environ["GITHUB_TOKEN"] = token
 
 
 def _valid_repo(repo: str) -> bool:
@@ -412,7 +461,61 @@ def _install_resume_transcript(s3_key: str, session_id: str, workdir: str) -> bo
         return False
 
 
-def _checkpoint_transcript(session_id: str, workdir: str) -> dict:
+def _install_artifacts(artifact_prefix: str, workdir: str, session_id: str | None) -> int:
+    """Restore a session's artifacts (uploaded via the web, or ported) into the
+    workspace's .cloud-code/artifacts/ so the agent can open them on a turn.
+
+    RE-LISTS s3://{ARTIFACT_BUCKET}/{artifact_prefix} every call (a cheap
+    ListObjectsV2) rather than trusting a one-shot prefix marker: a file uploaded
+    AFTER the first restore must still land. Only objects that are missing locally
+    or whose size differs from the local copy are downloaded, so an unchanged
+    prefix costs one list and no downloads. Path-traversal guarded. Best-effort —
+    a single failed download never fails the turn. Returns the count downloaded."""
+    if not (artifact_prefix and workdir and ARTIFACT_BUCKET):
+        return 0
+    dest_root = os.path.join(workdir, ".cloud-code", "artifacts")
+    real_root = os.path.realpath(dest_root)
+    restored = 0
+    try:
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=ARTIFACT_BUCKET, Prefix=artifact_prefix):
+            for obj in page.get("Contents", []) or []:
+                key = obj["Key"]
+                rel = key[len(artifact_prefix):]
+                if not rel or rel.endswith("/"):
+                    continue  # the prefix placeholder / a dir marker
+                dest = os.path.join(dest_root, rel)
+                # Traversal guard: the resolved dest MUST stay under the artifacts root.
+                real_dest = os.path.realpath(dest)
+                if real_dest != real_root and not real_dest.startswith(real_root + os.sep):
+                    logger.warning("artifact_path_escape_skipped", extra={"rel": rel})
+                    continue
+                # Skip a byte-identical local copy (same size) — cheap change check
+                # without a per-object HEAD. A new or resized object re-downloads.
+                remote_size = int(obj.get("Size", 0) or 0)
+                try:
+                    if os.path.isfile(dest) and os.path.getsize(dest) == remote_size:
+                        continue
+                except OSError:
+                    pass
+                try:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    with open(dest, "wb") as fh:
+                        s3.download_fileobj(ARTIFACT_BUCKET, key, fh)
+                    restored += 1
+                except Exception as exc:  # noqa: BLE001 — one bad file is non-fatal
+                    logger.warning("artifact_download_failed",
+                                   extra={"key": key, "error": str(exc)[:200]})
+        if restored:
+            logger.info("artifacts_installed", extra={"prefix": artifact_prefix, "count": restored})
+    except Exception as exc:  # noqa: BLE001 — listing/setup failure is non-fatal
+        logger.warning("artifacts_install_failed",
+                       extra={"prefix": artifact_prefix, "error": str(exc)[:200]})
+    return restored
+
+
+def _checkpoint_transcript(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
     """Reverse of install: read the (now-grown) Claude transcript off EFS and
     upload it to S3 so the laptop can pull it back and `claude --resume` locally.
 
@@ -426,7 +529,7 @@ def _checkpoint_transcript(session_id: str, workdir: str) -> dict:
         raise FileNotFoundError(f"no transcript at {src} (session never resumed on this VM?)")
     if not ARTIFACT_BUCKET:
         raise RuntimeError("ARTIFACT_BUCKET not set")
-    key = f"cloud-code/checkpoint/{session_id}/{session_id}.jsonl"
+    key = f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/{session_id}.jsonl"
     with open(src, "rb") as f:
         data = f.read()
     s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
@@ -441,6 +544,156 @@ def _checkpoint_transcript(session_id: str, workdir: str) -> dict:
         pass
     logger.info("checkpoint_uploaded", extra={"session": session_id, "bytes": len(data), "branch": branch})
     return {"key": key, "bytes": len(data), "branch": branch}
+
+
+# ─── Artifacts: touched-but-untracked deliverables the cloud session produced ─
+# (generated media, exports, datasets). They don't travel home via the git branch
+# (untracked) or the transcript (binary), so we harvest them to S3 on checkpoint
+# and the web Artifacts tab lists them. Anything pre-staged under
+# .cloud-code/artifacts/ is always included.
+_ARTIFACT_FILE_CAP = int(os.environ.get("CC_ARTIFACT_FILE_CAP_MB", "500")) * 1024 * 1024
+_ARTIFACT_TOTAL_CAP = int(os.environ.get("CC_ARTIFACT_TOTAL_CAP_MB", "2048")) * 1024 * 1024
+_ARTIFACT_COUNT_CAP = int(os.environ.get("CC_ARTIFACT_COUNT_CAP", "200"))
+_MEDIA_TOKEN_RE = re.compile(
+    r"(?:[A-Za-z0-9_~][A-Za-z0-9_.~/-]*)?\.(?:png|jpe?g|gif|webp|svg|bmp|tiff|heic"
+    r"|mp4|mov|webm|avi|mkv|mp3|wav|aac|flac|m4a|pdf|docx|pptx|xlsx"
+    r"|csv|parquet|arrow|feather|npy|npz|pkl|h5|sqlite|db)\b",
+    re.IGNORECASE,
+)
+# Credential files a turn may have written — never ship them out.
+_SECRET_EXTS = {".pem", ".p12", ".pfx", ".keystore", ".jks", ".asc", ".gpg"}
+_SECRET_NAME_RE = re.compile(
+    r"(^\.env($|\.)|(^|\.)npmrc$|(^|\.)netrc$|(^|/)id_(rsa|ed25519|ecdsa|dsa)$"
+    # `credentials` at end-of-path OR before an extension (credentials.csv is a
+    # common AWS access-key export) — never ship either.
+    r"|(^|\.)pgpass$|(^|/)credentials(\.|$)|secrets?(\.|$)|\.secret$)",
+    re.IGNORECASE,
+)
+
+
+def _is_secret_path(rel: str) -> bool:
+    base = os.path.basename(rel).lower()
+    if os.path.splitext(base)[1] in _SECRET_EXTS:
+        return True
+    return bool(_SECRET_NAME_RE.search(base) or _SECRET_NAME_RE.search(rel))
+
+
+def _git_tracked(repo_dir: str, abs_path: str) -> bool:
+    try:
+        r = subprocess.run(["git", "ls-files", "--error-unmatch", abs_path],
+                           cwd=repo_dir, capture_output=True, timeout=15)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _detect_cloud_artifacts(workdir: str) -> list[dict]:
+    """Deliverables that exist in the workspace, aren't git-tracked (so they don't
+    already travel home via the branch), and aren't credential files — plus
+    anything pre-staged under .cloud-code/artifacts/. A media sweep of any git
+    'other' (untracked) files catches shell-produced outputs (a PNG a script
+    rendered, an MP4 ffmpeg wrote). Deduped, capped smallest-first so the caps
+    keep the most files. Returns [{rel, abs, bytes}]."""
+    if not workdir or not os.path.isdir(workdir):
+        return []
+    cands: set[str] = set()
+    artifacts_root = os.path.join(workdir, ".cloud-code", "artifacts")
+    if os.path.isdir(artifacts_root):
+        for root, _dirs, files in os.walk(artifacts_root):
+            for fn in files:
+                cands.add(os.path.join(root, fn))
+    # Untracked + ignored files in the repo, filtered to media/deliverable exts.
+    try:
+        r = subprocess.run(
+            ["git", "ls-files", "--others", "-z"],
+            cwd=workdir, capture_output=True, text=True, timeout=30,
+        )
+        for rel in r.stdout.split("\0"):
+            if rel and _MEDIA_TOKEN_RE.search(rel):
+                cands.add(os.path.join(workdir, rel))
+    except Exception:  # noqa: BLE001
+        pass
+
+    seen: set[str] = set()
+    out: list[dict] = []
+    real_wd = os.path.realpath(workdir)
+    real_artifacts = os.path.realpath(artifacts_root)
+    for raw in cands:
+        abs_path = os.path.realpath(raw)
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        if abs_path != real_wd and not abs_path.startswith(real_wd + os.sep):
+            continue  # must live inside the workspace
+        if not os.path.isfile(abs_path):
+            continue
+        if _git_tracked(workdir, abs_path):
+            continue  # already travels home via the branch
+        try:
+            size = os.path.getsize(abs_path)
+        except OSError:
+            continue
+        if size > _ARTIFACT_FILE_CAP:
+            continue
+        # rel is relative to .cloud-code/artifacts/ for staged files (no double
+        # nesting on restore), else relative to the workdir.
+        if abs_path == real_artifacts or abs_path.startswith(real_artifacts + os.sep):
+            rel = os.path.relpath(abs_path, real_artifacts)
+        else:
+            rel = os.path.relpath(abs_path, real_wd)
+        if _is_secret_path(rel):
+            continue
+        out.append({"rel": rel, "abs": abs_path, "bytes": size})
+
+    out.sort(key=lambda c: c["bytes"])
+    kept: list[dict] = []
+    running = 0
+    for c in out:
+        if len(kept) >= _ARTIFACT_COUNT_CAP or running + c["bytes"] > _ARTIFACT_TOTAL_CAP:
+            continue
+        kept.append(c)
+        running += c["bytes"]
+    return kept
+
+
+def _sync_artifacts(prefix: str, workdir: str) -> dict:
+    """Upload the session's touched-untracked deliverables to S3 under `prefix`.
+    Best-effort: a failed file is skipped, never fatal. Returns {count, bytes}."""
+    if not (workdir and ARTIFACT_BUCKET and prefix):
+        return {"count": 0, "bytes": 0, "prefix": None}
+    cands = _detect_cloud_artifacts(workdir)
+    if not cands:
+        return {"count": 0, "bytes": 0, "prefix": None}
+    s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    count = 0
+    total = 0
+    for c in cands:
+        try:
+            with open(c["abs"], "rb") as fh:
+                s3.upload_fileobj(fh, ARTIFACT_BUCKET, prefix + c["rel"].replace(os.sep, "/"))
+            count += 1
+            total += c["bytes"]
+        except Exception as exc:  # noqa: BLE001 — one bad file is non-fatal
+            logger.warning("artifact_sync_failed",
+                           extra={"rel": c["rel"], "error": str(exc)[:200]})
+    logger.info("artifacts_synced", extra={"prefix": prefix, "count": count, "bytes": total})
+    return {"count": count, "bytes": total, "prefix": prefix if count else None}
+
+
+def _sync_turn_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
+    """After every turn: harvest generated deliverables to the RESUME artifacts
+    prefix (keyed by the cloud session id — exactly what the web Artifacts tab
+    lists). This is what makes generated artifacts appear without a Claude-only
+    pull-home checkpoint, so codex + non-checkpointed sessions populate too."""
+    if not session_id:
+        return {"count": 0, "bytes": 0, "prefix": None}
+    return _sync_artifacts(f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", workdir)
+
+
+def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
+    """Pull-home leg: upload deliverables under the CHECKPOINT prefix (keyed by the
+    resume/claude session id) so the laptop pull brings them home too."""
+    return _sync_artifacts(f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/artifacts/", workdir)
 
 
 def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
@@ -547,7 +800,8 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
     return args
 
 
-def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None):
+def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None,
+                   session_id: str | None = None, tenant_id: str | None = None):
     """Generator yielding SSE lines for a Claude turn as it runs.
 
     Parses claude stream-json line-by-line: assistant text deltas → 'text'
@@ -612,6 +866,12 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         return
     # Persist {claude_session_id → repo} so a later resume recovers the cwd.
     _remember_session(new_session_id, repo)
+    # Harvest deliverables to the resume prefix so the Artifacts tab populates
+    # without a pull-home. Best-effort — never breaks the stream's done frame.
+    try:
+        _sync_turn_artifacts(session_id, workdir, tenant_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
     yield sse({"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id})
 
 
@@ -723,6 +983,7 @@ async def invocations(request: Request):
     repo = payload.get("repo")
     claude_session_id = payload.get("claude_session_id")
     user_id = payload.get("user_id")
+    tenant_id = payload.get("tenant_id")  # S3 isolation boundary (see _tenant_root)
     config_version = payload.get("config_version")
     session_id = payload.get("session_id")  # isolates this session's checkout
     stream = bool(payload.get("stream"))  # SSE incremental output (claude only)
@@ -731,6 +992,12 @@ async def invocations(request: Request):
     resume_transcript = payload.get("resume_transcript")  # s3 key
     resume_session_id = payload.get("resume_session_id")
     branch = payload.get("branch")  # checkout this branch before the turn
+    # Short-lived GitHub App installation token minted by the hub for this
+    # session's owner (scoped to the repo). Never logged. When app_connected is
+    # true, a MISSING token means the scoped mint was denied — do NOT fall back to
+    # GITHUB_PAT (that would clone beyond the owner's App scope).
+    github_token = payload.get("github_token")
+    github_app_connected = bool(payload.get("github_app_connected"))
 
     # On resume, recover the repo the conversation was started in (so we land in
     # the same cwd Claude Code scoped the session to) when the caller omits it.
@@ -749,7 +1016,7 @@ async def invocations(request: Request):
     config_ok = True
     config_err = ""
     try:
-        _apply_config_bundle(user_id, config_version)
+        _apply_config_bundle(user_id, config_version, tenant_id)
         _apply_default_mcp()
     except Exception as exc:  # noqa: BLE001 — config is non-fatal
         config_ok = False
@@ -765,7 +1032,7 @@ async def invocations(request: Request):
 
     # Workspace setup IS fatal — no workdir, no turn.
     try:
-        _configure_git()
+        _configure_git(github_token, app_connected=github_app_connected)
         workdir = _ensure_workspace(repo, session_id)
         # Land on the ported branch (the laptop pushed its in-flight work there).
         if branch:
@@ -775,6 +1042,12 @@ async def invocations(request: Request):
         if cli == "claude" and resume_transcript and resume_session_id:
             if _install_resume_transcript(resume_transcript, resume_session_id, workdir):
                 claude_session_id = claude_session_id or resume_session_id
+        # Restore uploaded/ported artifacts into .cloud-code/artifacts/ so the agent
+        # can open them (keyed by the cloud session id under the resume prefix).
+        if session_id:
+            _install_artifacts(
+                f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", workdir, session_id
+            )
     except ValueError as ve:  # bad repo field — caller error, not a 500
         return JSONResponse({"error": str(ve)}, status_code=400)
     except Exception as exc:  # noqa: BLE001
@@ -788,13 +1061,16 @@ async def invocations(request: Request):
         if not cp_id:
             return JSONResponse({"error": "checkpoint needs a session id"}, status_code=400)
         try:
-            info = _checkpoint_transcript(cp_id, workdir)
+            info = _checkpoint_transcript(cp_id, workdir, tenant_id)
         except FileNotFoundError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         except Exception as exc:  # noqa: BLE001
             logger.error("checkpoint_failed", extra={"error": str(exc)[:600]})
             return JSONResponse({"error": str(exc)[:600]}, status_code=500)
-        return JSONResponse({"checkpointed": True, **info})
+        # Harvest touched-untracked deliverables too (best-effort — never fails the
+        # checkpoint). They surface in the web Artifacts tab under the same cp_id.
+        artifacts = _checkpoint_artifacts(cp_id, workdir, tenant_id)
+        return JSONResponse({"checkpointed": True, **info, "artifacts": artifacts})
 
     # Pre-warm done: workspace cloned, branch checked out, transcript installed.
     # No CLI runs — the first real turn (on open) will be instant + warm.
@@ -806,7 +1082,7 @@ async def invocations(request: Request):
     # an async/sync generator response as text/event-stream through InvokeAgentRuntime.
     if stream and cli == "claude":
         return StreamingResponse(
-            _stream_claude(prompt, workdir, claude_session_id, repo),
+            _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id),
             media_type="text/event-stream",
         )
 
@@ -826,6 +1102,13 @@ async def invocations(request: Request):
 
     # Persist {claude_session_id → repo} so a later resume recovers the cwd.
     _remember_session(result.get("claude_session_id"), repo)
+
+    # Harvest any deliverables this turn produced to the resume prefix so they show
+    # in the web Artifacts tab immediately — no pull-home required. Best-effort.
+    try:
+        _sync_turn_artifacts(session_id, workdir, tenant_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
 
     result.update({"cli": cli, "workspace": workdir})
     logger.info("turn_done", extra={"cli": cli, "chars": len(result.get("response") or "")})

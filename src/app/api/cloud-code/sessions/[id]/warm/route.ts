@@ -9,9 +9,11 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getSession, DEFAULT_USER_ID } from "@/lib/cloud-code/sessions";
+import { getOwnedSession, DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/cloud-code/sessions";
 import { warmCodingSession, codingRuntimeConfigured } from "@/lib/cloud-code/runtime";
 import { currentConfigVersion } from "@/lib/cloud-code/config-store";
+import { cloneTokenForUser } from "@/lib/cloud-code/github-app";
+import { getIdentity } from "@/lib/auth/identity";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -23,7 +25,8 @@ export async function POST(
   if (!codingRuntimeConfigured()) {
     return NextResponse.json({ error: "Coding runtime not configured" }, { status: 503 });
   }
-  const session = await getSession(params.id);
+  const { tenantId } = getIdentity(request);
+  const session = await getOwnedSession(params.id, tenantId);
   if (!session) {
     return NextResponse.json({ error: "Session not found" }, { status: 404 });
   }
@@ -34,7 +37,14 @@ export async function POST(
 
   const region = request.nextUrl.searchParams.get("region") || undefined;
   const userId = session.userId || DEFAULT_USER_ID;
-  const configVersion = await currentConfigVersion(userId);
+  const sessionTenant = session.tenantId || DEFAULT_TENANT_ID;
+  const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
+  // Warming clones the repo, so it needs the same scoped clone token a turn gets.
+  const { token: githubToken, connected: githubAppConnected } = await cloneTokenForUser(
+    sessionTenant,
+    userId,
+    session.repo
+  );
   try {
     await warmCodingSession({
       sessionId: session.sessionId,
@@ -44,8 +54,11 @@ export async function POST(
       resumeTranscriptKey: session.resumeTranscriptKey,
       resumeSessionId: session.claudeSessionId,
       userId,
+      tenantId: sessionTenant,
       configVersion,
       region,
+      githubToken,
+      githubAppConnected,
     });
     return NextResponse.json({ warmed: true });
   } catch (err) {

@@ -6,17 +6,20 @@
  * Uploaded once, reused on every session: the runtime fetches the *current*
  * version from S3 and materializes it into the CLI config dirs at turn start.
  *
- * Storage:
- *   - Bundle bytes → S3 at cloud-code/configs/{userId}/{version}.zip
- *   - Metadata     → DynamoDB row in the sessions table, key "config:{userId}"
+ * Storage (per-tenant, per-user):
+ *   - Bundle bytes → S3 via configKey(tenantId, userId, version)
+ *   - Metadata     → DynamoDB row in the sessions table, key "config:{tenantId}:{userId}"
  *     ({ versions[], currentVersion }). Single-table to avoid new infra.
  *
- * Single-user today (userId "default"); swap for the Cognito sub later.
+ * Backward-compat: the "default" tenant+user keeps the legacy row key
+ * "config:default" and the legacy unprefixed S3 path, so pre-tenancy bundles
+ * still resolve with zero migration.
  */
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { DEFAULT_USER_ID } from "./sessions";
+import { DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/auth/identity";
+import { configKey } from "./s3keys";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
@@ -34,17 +37,35 @@ export interface ConfigVersion {
   createdAt: string;
 }
 
+/** Who a config bundle belongs to. tenantId is the isolation boundary; userId
+ *  is the individual within it. Both "default" in no-auth deploys. */
+export interface ConfigScope {
+  tenantId: string;
+  userId: string;
+}
+
+export const DEFAULT_SCOPE: ConfigScope = {
+  tenantId: DEFAULT_TENANT_ID,
+  userId: DEFAULT_USER_ID,
+};
+
 export interface UserConfig {
+  tenantId: string;
   userId: string;
   versions: ConfigVersion[];
   currentVersion?: string;
   updatedAt: string;
 }
 
-const keyFor = (userId: string) => `config:${userId}`;
+// Legacy single-user row key was "config:default"; keep it for the default scope
+// so pre-tenancy metadata still resolves. Real tenants key "config:{tenant}:{user}".
+const keyFor = ({ tenantId, userId }: ConfigScope): string =>
+  tenantId === DEFAULT_TENANT_ID && userId === DEFAULT_USER_ID
+    ? `config:${DEFAULT_USER_ID}`
+    : `config:${tenantId}:${userId}`;
 
-export function s3KeyFor(userId: string, version: string): string {
-  return `cloud-code/configs/${userId}/${version}.zip`;
+export function s3KeyFor(scope: ConfigScope, version: string): string {
+  return configKey(scope.tenantId, scope.userId, version);
 }
 
 /**
@@ -90,14 +111,14 @@ export async function mergeScopedBundle(
 }
 
 /** Fetch the current version's zip bytes from S3 (null if none / not found). */
-export async function getCurrentBundleZip(userId: string = DEFAULT_USER_ID): Promise<Buffer | null> {
-  const cfg = await getUserConfig(userId);
+export async function getCurrentBundleZip(scope: ConfigScope = DEFAULT_SCOPE): Promise<Buffer | null> {
+  const cfg = await getUserConfig(scope);
   if (!cfg.currentVersion || !ARTIFACT_BUCKET) return null;
   const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
   const s3 = new S3Client({ region: REGION });
   try {
     const obj = await s3.send(
-      new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: s3KeyFor(userId, cfg.currentVersion) })
+      new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: s3KeyFor(scope, cfg.currentVersion) })
     );
     const bytes = await obj.Body!.transformToByteArray();
     return Buffer.from(bytes);
@@ -106,14 +127,17 @@ export async function getCurrentBundleZip(userId: string = DEFAULT_USER_ID): Pro
   }
 }
 
-export async function getUserConfig(userId: string = DEFAULT_USER_ID): Promise<UserConfig> {
+export async function getUserConfig(scope: ConfigScope = DEFAULT_SCOPE): Promise<UserConfig> {
   const res = await ddb.send(
-    new GetCommand({ TableName: TABLE, Key: { sessionId: keyFor(userId) }, ConsistentRead: true })
+    new GetCommand({ TableName: TABLE, Key: { sessionId: keyFor(scope) }, ConsistentRead: true })
   );
   const item = res.Item as (UserConfig & { sessionId: string }) | undefined;
-  if (!item) return { userId, versions: [], updatedAt: new Date().toISOString() };
+  if (!item) {
+    return { tenantId: scope.tenantId, userId: scope.userId, versions: [], updatedAt: new Date().toISOString() };
+  }
   return {
-    userId,
+    tenantId: scope.tenantId,
+    userId: scope.userId,
     versions: item.versions || [],
     currentVersion: item.currentVersion,
     updatedAt: item.updatedAt,
@@ -124,14 +148,14 @@ export async function saveUserConfig(cfg: UserConfig): Promise<void> {
   await ddb.send(
     new PutCommand({
       TableName: TABLE,
-      Item: { sessionId: keyFor(cfg.userId), ...cfg },
+      Item: { sessionId: keyFor({ tenantId: cfg.tenantId, userId: cfg.userId }), ...cfg },
     })
   );
 }
 
 /** The version a new session should launch with (caller passes it to the runtime). */
 export async function currentConfigVersion(
-  userId: string = DEFAULT_USER_ID
+  scope: ConfigScope = DEFAULT_SCOPE
 ): Promise<string | undefined> {
-  return (await getUserConfig(userId)).currentVersion;
+  return (await getUserConfig(scope)).currentVersion;
 }

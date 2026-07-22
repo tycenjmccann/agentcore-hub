@@ -24,7 +24,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "crypto";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { putSession, DEFAULT_USER_ID } from "@/lib/cloud-code/sessions";
+import { putSession } from "@/lib/cloud-code/sessions";
+import { getIdentity } from "@/lib/auth/identity";
+import { resumeTranscriptKey } from "@/lib/cloud-code/s3keys";
 import type { CloudCodeSession, CloudCodeCli } from "@/lib/cloud-code/types";
 
 export const dynamic = "force-dynamic";
@@ -69,15 +71,21 @@ export async function POST(request: NextRequest) {
     const defaultView: "chat" | "terminal" =
       body.view === "terminal" && cli === "claude" ? "terminal" : "chat";
 
+    // The port-session MCP authenticates as the porting user; middleware stamps
+    // their identity (default in no-auth deploys). The cloud session is owned by
+    // that tenant so it shows in the right sidebar and is IAM-scoped correctly.
+    const { userId, tenantId } = getIdentity(request);
+
     const sessionId = `cc-${randomUUID().replace(/-/g, "")}`;
     const now = new Date().toISOString();
 
-    // Transcript lands in the shared artifact bucket, namespaced per session.
-    const transcriptKey = `cloud-code/resume/${sessionId}/${claudeSessionId}.jsonl`;
+    // Transcript lands in the shared artifact bucket under the tenant prefix.
+    const transcriptKey = resumeTranscriptKey(tenantId, sessionId, claudeSessionId);
 
     const session: CloudCodeSession = {
       sessionId,
-      userId: DEFAULT_USER_ID,
+      userId,
+      tenantId,
       title,
       cli,
       repo,

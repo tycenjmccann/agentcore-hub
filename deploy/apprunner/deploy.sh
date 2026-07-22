@@ -224,6 +224,12 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": \"sts:GetCallerIdentity\",
         \"Resource\": \"*\"
+      },
+      {
+        \"Sid\": \"GithubAppSecret\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"secretsmanager:GetSecretValue\", \"secretsmanager:CreateSecret\", \"secretsmanager:PutSecretValue\"],
+        \"Resource\": \"arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:cloud-code/github-app*\"
       }
     ]
   }"

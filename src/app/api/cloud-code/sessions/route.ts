@@ -5,14 +5,18 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "crypto";
-import { listSessions, putSession, DEFAULT_USER_ID } from "@/lib/cloud-code/sessions";
+import { listSessions, putSession } from "@/lib/cloud-code/sessions";
+import { getIdentity } from "@/lib/auth/identity";
 import type { CloudCodeSession, CloudCodeCli } from "@/lib/cloud-code/types";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
-    const sessions = await listSessions(DEFAULT_USER_ID);
+    // Identity is stamped by middleware; AUTH_MODE=none → "default" (legacy).
+    // Sidebar is tenant-scoped: colleagues in a tenant share the session list.
+    const { tenantId } = getIdentity(request);
+    const sessions = await listSessions(tenantId);
     return NextResponse.json({ sessions });
   } catch (err) {
     console.error("[cloud-code] list error:", err);
@@ -25,6 +29,7 @@ export async function GET() {
 
 export async function POST(request: NextRequest) {
   try {
+    const { userId, tenantId } = getIdentity(request);
     const body = await request.json().catch(() => ({}));
     const cli: CloudCodeCli = body.cli === "codex" ? "codex" : "claude";
     const repo: string | undefined = body.repo?.trim() || undefined;
@@ -36,7 +41,8 @@ export async function POST(request: NextRequest) {
 
     const session: CloudCodeSession = {
       sessionId,
-      userId: DEFAULT_USER_ID,
+      userId,
+      tenantId,
       title,
       cli,
       repo,

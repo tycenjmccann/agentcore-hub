@@ -15,7 +15,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { DEFAULT_USER_ID } from "@/lib/cloud-code/sessions";
+import { getIdentity } from "@/lib/auth/identity";
 import {
   getUserConfig,
   saveUserConfig,
@@ -24,6 +24,7 @@ import {
   getCurrentBundleZip,
   ARTIFACT_BUCKET,
   type ConfigVersion,
+  type ConfigScope,
 } from "@/lib/cloud-code/config-store";
 
 export const dynamic = "force-dynamic";
@@ -33,12 +34,15 @@ const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
 const MAX_BYTES = 25 * 1024 * 1024; // 25 MB — configs are small
 
-export async function GET() {
-  const cfg = await getUserConfig(DEFAULT_USER_ID);
+export async function GET(request: NextRequest) {
+  const { userId, tenantId } = getIdentity(request);
+  const cfg = await getUserConfig({ tenantId, userId });
   return NextResponse.json(cfg);
 }
 
 export async function POST(request: NextRequest) {
+  const { userId, tenantId } = getIdentity(request);
+  const scope: ConfigScope = { tenantId, userId };
   if (!ARTIFACT_BUCKET) {
     return NextResponse.json({ error: "ARTIFACT_BUCKET not configured" }, { status: 503 });
   }
@@ -54,7 +58,7 @@ export async function POST(request: NextRequest) {
   // scope=claude|codex → merge only that CLI's subtree into the current bundle
   // (syncing one CLI keeps the other's files). Absent → full-replace (legacy).
   const scopeRaw = (form?.get("scope") as string) || "";
-  const scope = scopeRaw === "claude" || scopeRaw === "codex" ? scopeRaw : undefined;
+  const scopeCli = scopeRaw === "claude" || scopeRaw === "codex" ? scopeRaw : undefined;
   let bytes = Buffer.from(await file.arrayBuffer());
 
   // Cheap zip sanity (PK\x03\x04 magic).
@@ -64,9 +68,9 @@ export async function POST(request: NextRequest) {
 
   // Scoped sync: fold the incoming CLI subtree into the current bundle so the
   // other CLI's config survives. The merged zip becomes the new version.
-  if (scope) {
-    const current = await getCurrentBundleZip(DEFAULT_USER_ID);
-    const merged = await mergeScopedBundle(current, bytes, scope);
+  if (scopeCli) {
+    const current = await getCurrentBundleZip(scope);
+    const merged = await mergeScopedBundle(current, bytes, scopeCli);
     bytes = Buffer.from(merged.zip);
   }
   const fileCount = countZipEntries(bytes);
@@ -77,13 +81,13 @@ export async function POST(request: NextRequest) {
   await s3.send(
     new PutObjectCommand({
       Bucket: ARTIFACT_BUCKET,
-      Key: s3KeyFor(DEFAULT_USER_ID, version),
+      Key: s3KeyFor(scope, version),
       Body: bytes,
       ContentType: "application/zip",
     })
   );
 
-  const cfg = await getUserConfig(DEFAULT_USER_ID);
+  const cfg = await getUserConfig(scope);
   const entry: ConfigVersion = {
     version,
     label,
@@ -100,9 +104,10 @@ export async function POST(request: NextRequest) {
 }
 
 export async function PUT(request: NextRequest) {
+  const { userId, tenantId } = getIdentity(request);
   const body = await request.json().catch(() => ({}));
   const version: string | undefined = body.version;
-  const cfg = await getUserConfig(DEFAULT_USER_ID);
+  const cfg = await getUserConfig({ tenantId, userId });
   // null/empty → disable the bundle (launch with no user config).
   if (version && !cfg.versions.some((v) => v.version === version)) {
     return NextResponse.json({ error: "unknown version" }, { status: 404 });
