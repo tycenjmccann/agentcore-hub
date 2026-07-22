@@ -16,8 +16,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { getSession } from "@/lib/cloud-code/sessions";
+import { getOwnedSession, DEFAULT_TENANT_ID } from "@/lib/cloud-code/sessions";
 import { checkpointCodingSession, codingRuntimeConfigured } from "@/lib/cloud-code/runtime";
+import { getIdentity } from "@/lib/auth/identity";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -36,7 +37,8 @@ export async function POST(
   if (!ARTIFACT_BUCKET) {
     return NextResponse.json({ error: "ARTIFACT_BUCKET not configured" }, { status: 503 });
   }
-  const session = await getSession(params.id);
+  const { tenantId } = getIdentity(request);
+  const session = await getOwnedSession(params.id, tenantId);
   if (!session) {
     return NextResponse.json({ error: "Session not found" }, { status: 404 });
   }
@@ -60,6 +62,7 @@ export async function POST(
       cli: session.cli,
       repo: session.repo,
       resumeSessionId,
+      tenantId: session.tenantId || DEFAULT_TENANT_ID,
       region,
     });
     if (!cp.key) {

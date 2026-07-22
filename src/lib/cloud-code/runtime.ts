@@ -50,6 +50,7 @@ export interface CodingTurnParams {
   repo?: string;
   claudeSessionId?: string;
   userId?: string;
+  tenantId?: string; // isolation boundary; scopes the runtime's config/checkpoint S3 keys
   configVersion?: string;
   region?: string;
   // "Port to cloud" handoff (first turn only): check out the pushed branch and
@@ -71,6 +72,8 @@ function buildTurnPayload(params: CodingTurnParams): Record<string, unknown> {
   if (params.claudeSessionId) payload.claude_session_id = params.claudeSessionId;
   // Per-user config bundle (MCP/skills/agents) the runtime materializes first.
   if (params.userId) payload.user_id = params.userId;
+  // Tenant scopes the runtime's config + checkpoint S3 keys (must match s3keys.ts).
+  if (params.tenantId) payload.tenant_id = params.tenantId;
   if (params.configVersion) payload.config_version = params.configVersion;
   if (params.branch) payload.branch = params.branch;
   if (params.resumeTranscriptKey) payload.resume_transcript = params.resumeTranscriptKey;
@@ -160,6 +163,7 @@ export async function warmCodingSession(params: {
   // Materialize the user's config bundle (skills/agents/MCP) as part of warming,
   // so an opened session is hot AND has the user's tools without a chat turn.
   userId?: string;
+  tenantId?: string;
   configVersion?: string;
   region?: string;
 }): Promise<void> {
@@ -175,6 +179,7 @@ export async function warmCodingSession(params: {
   if (params.resumeTranscriptKey) payload.resume_transcript = params.resumeTranscriptKey;
   if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
   if (params.userId) payload.user_id = params.userId;
+  if (params.tenantId) payload.tenant_id = params.tenantId;
   if (params.configVersion) payload.config_version = params.configVersion;
 
   const command = new InvokeAgentRuntimeCommand({
@@ -199,6 +204,7 @@ export async function prepareCodingSession(params: {
   sessionId: string;
   cli: CloudCodeCli;
   userId?: string;
+  tenantId?: string;
   configVersion?: string;
   region?: string;
 }): Promise<void> {
@@ -210,6 +216,7 @@ export async function prepareCodingSession(params: {
     session_id: params.sessionId,
   };
   if (params.userId) payload.user_id = params.userId;
+  if (params.tenantId) payload.tenant_id = params.tenantId;
   if (params.configVersion) payload.config_version = params.configVersion;
 
   const command = new InvokeAgentRuntimeCommand({
@@ -232,6 +239,7 @@ export async function checkpointCodingSession(params: {
   cli: CloudCodeCli;
   repo?: string;
   resumeSessionId?: string; // the conversation's real id (the transcript filename)
+  tenantId?: string;
   region?: string;
 }): Promise<{ key?: string; bytes?: number; branch?: string }> {
   if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
@@ -243,6 +251,7 @@ export async function checkpointCodingSession(params: {
   };
   if (params.repo) payload.repo = params.repo;
   if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
+  if (params.tenantId) payload.tenant_id = params.tenantId;
 
   const command = new InvokeAgentRuntimeCommand({
     agentRuntimeArn: CODING_RUNTIME_ARN,
