@@ -70,6 +70,11 @@ export async function POST(
   // either write. StopRuntimeSession has now torn the VM down, so /message's write
   // has almost certainly landed; RE-READ the latest row and append onto it (rather
   // than the snapshot above) so we merge with, not overwrite, whatever /message wrote.
+  // Merged row we return to the client. Defaults to the entry snapshot so a
+  // persist failure still returns *something*; on success it's the row with the
+  // interrupted turn appended — the client does setActive(data.session), so this
+  // MUST carry the stopped turn or the on-screen message + partial reply vanish.
+  let persisted = session;
   try {
     const now = new Date().toISOString();
     const fresh = (await getSession(params.id)) || session;
@@ -86,6 +91,7 @@ export async function POST(
     fresh.pendingSeed = undefined;
     fresh.updatedAt = now;
     await putSession(fresh);
+    persisted = fresh;
   } catch (err) {
     console.error("[cloud-code] stop persist error:", err);
     // Stop itself succeeded; a persist failure shouldn't 500 the action.
@@ -113,5 +119,5 @@ export async function POST(
     }
   })();
 
-  return NextResponse.json({ stopped: true, session });
+  return NextResponse.json({ stopped: true, session: persisted });
 }
