@@ -465,23 +465,15 @@ def _install_artifacts(artifact_prefix: str, workdir: str, session_id: str | Non
     """Restore a session's artifacts (uploaded via the web, or ported) into the
     workspace's .cloud-code/artifacts/ so the agent can open them on a turn.
 
-    Lists s3://{ARTIFACT_BUCKET}/{artifact_prefix} and downloads each object back
-    to .cloud-code/artifacts/<rel>. Idempotent per warm microVM via a marker.
-    Path-traversal guarded: a key whose rel escapes the artifacts dir is skipped.
-    Best-effort — a missing object or single failed download never fails the turn.
-    Returns the count restored."""
+    RE-LISTS s3://{ARTIFACT_BUCKET}/{artifact_prefix} every call (a cheap
+    ListObjectsV2) rather than trusting a one-shot prefix marker: a file uploaded
+    AFTER the first restore must still land. Only objects that are missing locally
+    or whose size differs from the local copy are downloaded, so an unchanged
+    prefix costs one list and no downloads. Path-traversal guarded. Best-effort —
+    a single failed download never fails the turn. Returns the count downloaded."""
     if not (artifact_prefix and workdir and ARTIFACT_BUCKET):
         return 0
     dest_root = os.path.join(workdir, ".cloud-code", "artifacts")
-    marker = os.path.join(_session_dir(session_id), ".artifacts-applied")
-    try:
-        if os.path.exists(marker):
-            with open(marker) as f:
-                if f.read().strip() == artifact_prefix:
-                    return 0  # already restored on this warm VM
-    except OSError:
-        pass
-
     real_root = os.path.realpath(dest_root)
     restored = 0
     try:
@@ -499,6 +491,14 @@ def _install_artifacts(artifact_prefix: str, workdir: str, session_id: str | Non
                 if real_dest != real_root and not real_dest.startswith(real_root + os.sep):
                     logger.warning("artifact_path_escape_skipped", extra={"rel": rel})
                     continue
+                # Skip a byte-identical local copy (same size) — cheap change check
+                # without a per-object HEAD. A new or resized object re-downloads.
+                remote_size = int(obj.get("Size", 0) or 0)
+                try:
+                    if os.path.isfile(dest) and os.path.getsize(dest) == remote_size:
+                        continue
+                except OSError:
+                    pass
                 try:
                     os.makedirs(os.path.dirname(dest), exist_ok=True)
                     with open(dest, "wb") as fh:
@@ -507,10 +507,8 @@ def _install_artifacts(artifact_prefix: str, workdir: str, session_id: str | Non
                 except Exception as exc:  # noqa: BLE001 — one bad file is non-fatal
                     logger.warning("artifact_download_failed",
                                    extra={"key": key, "error": str(exc)[:200]})
-        os.makedirs(os.path.dirname(marker), exist_ok=True)
-        with open(marker, "w") as f:
-            f.write(artifact_prefix)
-        logger.info("artifacts_installed", extra={"prefix": artifact_prefix, "count": restored})
+        if restored:
+            logger.info("artifacts_installed", extra={"prefix": artifact_prefix, "count": restored})
     except Exception as exc:  # noqa: BLE001 — listing/setup failure is non-fatal
         logger.warning("artifacts_install_failed",
                        extra={"prefix": artifact_prefix, "error": str(exc)[:200]})
@@ -566,7 +564,9 @@ _MEDIA_TOKEN_RE = re.compile(
 _SECRET_EXTS = {".pem", ".p12", ".pfx", ".keystore", ".jks", ".asc", ".gpg"}
 _SECRET_NAME_RE = re.compile(
     r"(^\.env($|\.)|(^|\.)npmrc$|(^|\.)netrc$|(^|/)id_(rsa|ed25519|ecdsa|dsa)$"
-    r"|(^|\.)pgpass$|(^|/)credentials$|secrets?(\.|$)|\.secret$)",
+    # `credentials` at end-of-path OR before an extension (credentials.csv is a
+    # common AWS access-key export) — never ship either.
+    r"|(^|\.)pgpass$|(^|/)credentials(\.|$)|secrets?(\.|$)|\.secret$)",
     re.IGNORECASE,
 )
 
@@ -656,16 +656,14 @@ def _detect_cloud_artifacts(workdir: str) -> list[dict]:
     return kept
 
 
-def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
-    """Upload the cloud session's touched-untracked deliverables to S3 under the
-    checkpoint artifacts prefix so the web Artifacts tab can list them (and a pull
-    can bring them home). Best-effort: a failed file is skipped, never fatal."""
-    if not (workdir and ARTIFACT_BUCKET):
+def _sync_artifacts(prefix: str, workdir: str) -> dict:
+    """Upload the session's touched-untracked deliverables to S3 under `prefix`.
+    Best-effort: a failed file is skipped, never fatal. Returns {count, bytes}."""
+    if not (workdir and ARTIFACT_BUCKET and prefix):
         return {"count": 0, "bytes": 0, "prefix": None}
     cands = _detect_cloud_artifacts(workdir)
     if not cands:
         return {"count": 0, "bytes": 0, "prefix": None}
-    prefix = f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/artifacts/"
     s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
     count = 0
     total = 0
@@ -676,11 +674,26 @@ def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None =
             count += 1
             total += c["bytes"]
         except Exception as exc:  # noqa: BLE001 — one bad file is non-fatal
-            logger.warning("checkpoint_artifact_failed",
+            logger.warning("artifact_sync_failed",
                            extra={"rel": c["rel"], "error": str(exc)[:200]})
-    logger.info("checkpoint_artifacts_uploaded",
-                extra={"session": session_id, "count": count, "bytes": total})
+    logger.info("artifacts_synced", extra={"prefix": prefix, "count": count, "bytes": total})
     return {"count": count, "bytes": total, "prefix": prefix if count else None}
+
+
+def _sync_turn_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
+    """After every turn: harvest generated deliverables to the RESUME artifacts
+    prefix (keyed by the cloud session id — exactly what the web Artifacts tab
+    lists). This is what makes generated artifacts appear without a Claude-only
+    pull-home checkpoint, so codex + non-checkpointed sessions populate too."""
+    if not session_id:
+        return {"count": 0, "bytes": 0, "prefix": None}
+    return _sync_artifacts(f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", workdir)
+
+
+def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
+    """Pull-home leg: upload deliverables under the CHECKPOINT prefix (keyed by the
+    resume/claude session id) so the laptop pull brings them home too."""
+    return _sync_artifacts(f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/artifacts/", workdir)
 
 
 def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
@@ -787,7 +800,8 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
     return args
 
 
-def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None):
+def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None,
+                   session_id: str | None = None, tenant_id: str | None = None):
     """Generator yielding SSE lines for a Claude turn as it runs.
 
     Parses claude stream-json line-by-line: assistant text deltas → 'text'
@@ -852,6 +866,12 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         return
     # Persist {claude_session_id → repo} so a later resume recovers the cwd.
     _remember_session(new_session_id, repo)
+    # Harvest deliverables to the resume prefix so the Artifacts tab populates
+    # without a pull-home. Best-effort — never breaks the stream's done frame.
+    try:
+        _sync_turn_artifacts(session_id, workdir, tenant_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
     yield sse({"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id})
 
 
@@ -1062,7 +1082,7 @@ async def invocations(request: Request):
     # an async/sync generator response as text/event-stream through InvokeAgentRuntime.
     if stream and cli == "claude":
         return StreamingResponse(
-            _stream_claude(prompt, workdir, claude_session_id, repo),
+            _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id),
             media_type="text/event-stream",
         )
 
@@ -1082,6 +1102,13 @@ async def invocations(request: Request):
 
     # Persist {claude_session_id → repo} so a later resume recovers the cwd.
     _remember_session(result.get("claude_session_id"), repo)
+
+    # Harvest any deliverables this turn produced to the resume prefix so they show
+    # in the web Artifacts tab immediately — no pull-home required. Best-effort.
+    try:
+        _sync_turn_artifacts(session_id, workdir, tenant_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
 
     result.update({"cli": cli, "workspace": workdir})
     logger.info("turn_done", extra={"cli": cli, "chars": len(result.get("response") or "")})
