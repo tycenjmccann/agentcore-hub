@@ -38,14 +38,19 @@ export interface InstallationToken {
   expiresAt: string; // ISO 8601
 }
 
-let _configChecked = false;
 let _config: GithubAppConfig | null = null;
-
+// Only a SUCCESSFUL load is cached (indefinitely — the App key is stable until an
+// operator rotates it, which calls resetGithubAppConfigCache). A missing/failed
+// load is NEVER cached: negative caching would make an instance that first ran
+// before the App existed — or hit a transient Secrets Manager error — return
+// "not configured" for its whole life, so cloneTokenForUser would fall back to
+// the broad shared PAT for a user who IS App-connected. Re-check every call when
+// unconfigured; success flips it to the cached path.
 async function loadConfig(): Promise<GithubAppConfig | null> {
-  if (_configChecked) return _config;
-  _config = await getGithubAppConfig();
-  _configChecked = true;
-  return _config;
+  if (_config) return _config;
+  const cfg = await getGithubAppConfig();
+  if (cfg) _config = cfg;
+  return cfg;
 }
 
 /** True when the App is configured (App ID + private key present). */
@@ -55,7 +60,6 @@ export async function githubAppConfigured(): Promise<boolean> {
 
 /** Invalidate the cached config (after an operator (re)creates the App). */
 export function resetGithubAppConfigCache(): void {
-  _configChecked = false;
   _config = null;
 }
 
@@ -237,10 +241,18 @@ function sign(payload: string, key: Buffer): string {
   return createHmac("sha256", key).update(payload).digest("base64url");
 }
 
+// `.` is the state-token field delimiter, but encodeURIComponent does NOT escape
+// it — and SSO userIds are email addresses (john.doe@acme.com), so a raw encode
+// leaves periods that shatter state.split(".") in verifyState. Escape `.` → %2E
+// (decodeURIComponent reverses it) so the userId can never contain the delimiter.
+function encodeUserId(userId: string): string {
+  return encodeURIComponent(userId).replace(/\./g, "%2E");
+}
+
 /** Mint a signed state token binding an install flow to `userId`. */
 export async function issueInstallState(userId: string): Promise<string> {
   const key = await stateKey();
-  const payload = `${encodeURIComponent(userId)}.${Date.now() + STATE_TTL_MS}`;
+  const payload = `${encodeUserId(userId)}.${Date.now() + STATE_TTL_MS}`;
   return `${payload}.${sign(payload, key)}`;
 }
 
@@ -252,7 +264,7 @@ export async function verifyInstallState(state: string, userId: string): Promise
 // the install flow), so a token minted for one can't be replayed for the other.
 export async function issueManifestState(userId: string): Promise<string> {
   const key = await stateKey();
-  const payload = `manifest.${encodeURIComponent(userId)}.${Date.now() + STATE_TTL_MS}`;
+  const payload = `manifest.${encodeUserId(userId)}.${Date.now() + STATE_TTL_MS}`;
   return `${payload}.${sign(payload, key)}`;
 }
 

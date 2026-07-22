@@ -102,12 +102,13 @@ The hub's hosting role needs `secretsmanager:GetSecretValue` +
 
 ## Follow-ups (not in this PR)
 
-- **tmpfs credential helper.** `_configure_git` still writes the token into
+- **tmpfs credential helper.** `_configure_git` writes the token into
   `~/.gitconfig` via `insteadOf` (matching the pre-existing PAT handling), so the
   agent can `cat ~/.gitconfig` and read it. The token is short-lived + repo-scoped
   (small blast radius), but a stricter version would write it to a `/dev/shm`
   file behind a `github.com`-scoped git credential helper and scrub it on a
-  token-less turn. Hardens both the App and PAT paths.
+  token-less turn. Hardens both the App and PAT paths. (Token *rotation* on a warm
+  VM is already handled — `_clear_github_insteadof` drops stale rules each turn.)
 - **Rollout:** additive + back-compat. The App path activates only when
   `cloud-code/github-app` is configured AND a user connects; otherwise the
   existing `GITHUB_PAT` path is untouched. No migration.

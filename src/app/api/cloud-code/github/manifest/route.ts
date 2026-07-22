@@ -101,10 +101,22 @@ export async function GET(request: NextRequest) {
   const manifestState = await issueManifestState(userId);
   const action = `https://github.com/settings/apps/new?state=${encodeURIComponent(manifestState)}`;
 
+  // The manifest embeds request-derived values (base URL from DEPLOYMENT_URL /
+  // request origin, GITHUB_APP_NAME). Fully HTML-escape every value interpolated
+  // into hand-built HTML rather than relying on single-quote-only escaping — no
+  // HTML-significant character can break out of its attribute or start a tag.
+  const escapeHtml = (s: string) =>
+    s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
   const html = `<!doctype html><html><head><meta charset="utf-8"><title>Creating GitHub App…</title></head>
 <body style="font-family:system-ui;background:#0b0b0d;color:#eee;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
-<form id="f" method="post" action="${action}">
-  <input type="hidden" name="manifest" value='${JSON.stringify(manifest).replace(/'/g, "&#39;")}'>
+<form id="f" method="post" action="${escapeHtml(action)}">
+  <input type="hidden" name="manifest" value="${escapeHtml(JSON.stringify(manifest))}">
   <noscript><button type="submit">Continue to GitHub</button></noscript>
 </form>
 <p>Redirecting to GitHub to create the app…</p>

@@ -326,6 +326,29 @@ def _slugify_repo(repo: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "-", slug) or "default"
 
 
+def _clear_github_insteadof() -> None:
+    """Remove every `url.https://x-access-token:<token>@github.com/.insteadOf`
+    section from ~/.gitconfig. Each minted token produced a distinct section key,
+    so on a warm VM they accumulate and Git rewrites through the first (stale) one.
+    We enumerate the section names via --get-regexp and --remove-section each."""
+    res = subprocess.run(
+        ["git", "config", "--global", "--get-regexp",
+         r"^url\.https://x-access-token:.*@github\.com/\.insteadof"],
+        capture_output=True, text=True, check=False,
+    )
+    sections = set()
+    for line in res.stdout.splitlines():
+        # Each line is "<section>.insteadof <value>"; strip the ".insteadof …" tail.
+        name = line.split(" ", 1)[0]
+        if name.lower().endswith(".insteadof"):
+            sections.add(name[: -len(".insteadof")])
+    for section in sections:
+        subprocess.run(
+            ["git", "config", "--global", "--remove-section", section],
+            check=False, stderr=subprocess.DEVNULL,
+        )
+
+
 def _configure_git(github_token: str | None = None, app_connected: bool = False) -> None:
     # Session storage mounts under a uid that may differ from the runtime user,
     # so Git refuses to operate ("dubious ownership"). Trust the workspace tree.
@@ -346,7 +369,16 @@ def _configure_git(github_token: str | None = None, app_connected: bool = False)
     token = github_token
     if not token and not app_connected:
         token = os.environ.get("GITHUB_PAT")
+    # A warm microVM outlives a ~1h installation token, so a turn re-runs this with
+    # a DIFFERENT token. Each token makes a distinct `url.https://x-access-token:<t>@
+    # github.com/.insteadOf` KEY, so a plain re-add leaves the OLD (expired) rule in
+    # ~/.gitconfig. Git rewrites through the FIRST matching rule → clones/pushes use
+    # the stale token and fail. Drop every prior github.com insteadOf rule first, so
+    # only the current token's rule remains (also scrubs it on a token-less turn).
+    _clear_github_insteadof()
     if not token:
+        os.environ.pop("GH_TOKEN", None)
+        os.environ.pop("GITHUB_TOKEN", None)
         return
     subprocess.run(
         ["git", "config", "--global",
