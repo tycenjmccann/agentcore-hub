@@ -12,6 +12,7 @@
 import {
   BedrockAgentCoreClient,
   InvokeAgentRuntimeCommand,
+  StopRuntimeSessionCommand,
 } from "@aws-sdk/client-bedrock-agentcore";
 import type { CloudCodeCli } from "./types";
 
@@ -154,6 +155,27 @@ export async function invokeCodingTurnStream(params: CodingTurnParams): Promise<
   const r = res.response as unknown as { transformToWebStream?: () => ReadableStream<Uint8Array> };
   if (r?.transformToWebStream) return r.transformToWebStream();
   throw new Error("runtime did not return a stream");
+}
+
+/**
+ * Interrupt a running turn ("Ctrl-C"). Chat turns run headless in the session
+ * microVM (claude --print), so there's no PTY signal to send — StopRuntimeSession
+ * tears the microVM down and kills the in-flight CLI. The workspace (EFS) +
+ * transcript persist, so the next turn resumes with any partial work intact.
+ */
+export async function stopCodingSession(params: {
+  sessionId: string; // runtimeSessionId — selects the microVM to tear down
+  region?: string;
+}): Promise<void> {
+  if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
+  const region = params.region || REGION;
+  await client(region).send(
+    new StopRuntimeSessionCommand({
+      runtimeSessionId: params.sessionId,
+      agentRuntimeArn: CODING_RUNTIME_ARN,
+      qualifier: "DEFAULT",
+    })
+  );
 }
 
 /**
