@@ -58,8 +58,11 @@ jobs:
 
       # Every backend call in this spec is intercepted with page.route, so a plain
       # `next start` with zero credentials serves it. Boot, wait for ready, test.
+      # Detach + redirect output: a bare `&` leaves next start holding the step's
+      # stdout/stderr pipe open, so the runner's output reader can block on EOF and
+      # hang the step until the job timeout. nohup + file redirect frees the pipe.
       - name: Start server
-        run: npm run start -- -p 3737 &
+        run: nohup npm run start -- -p 3737 > /tmp/next-server.log 2>&1 &
 
       - name: Wait for server
         run: |
