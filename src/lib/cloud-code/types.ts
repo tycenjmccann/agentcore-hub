@@ -29,6 +29,11 @@ export interface CloudCodeSession {
   claudeSessionId?: string; // CLI conversation id, for --resume
   createdAt: string;
   updatedAt: string;
+  // Optimistic-concurrency version. Incremented on every conditional write via
+  // mutateSession; a write only lands if the stored rev still matches the one it
+  // read, so two concurrent writers (e.g. the /message stream completing while
+  // /stop persists the same interrupted turn) can't silently clobber each other.
+  rev?: number;
   turns: CloudCodeTurn[];
   // Set when a session is created by "port to cloud" (the MCP handoff): the
   // first prompt to auto-run on open. The real context comes from natively

@@ -13,7 +13,7 @@
  * the tenant check is the actual boundary — not the id space.
  */
 
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBClient, ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
   GetCommand,
@@ -93,6 +93,52 @@ export async function putSession(session: CloudCodeSession): Promise<void> {
   // without one (and re-stamps legacy rows on rewrite).
   if (!session.tenantId) session.tenantId = DEFAULT_TENANT_ID;
   await ddb.send(new PutCommand({ TableName: TABLE, Item: session }));
+}
+
+/**
+ * Optimistic-concurrency read-modify-write. Reads the row, hands it to `mutate`
+ * (which edits in place and returns the row, or null to abort the write), then
+ * conditionally Puts it only if the stored `rev` still matches what we read —
+ * retrying the whole cycle on a version conflict. This SERIALIZES concurrent
+ * writers deterministically (unlike a plain re-read, which two callers can both
+ * pass before either writes). Used where the /message stream completing races
+ * the /stop persist for the same interrupted turn.
+ *
+ * `mutate` returning null (no change needed) skips the write and returns the row.
+ * Returns the row as persisted, or null if it no longer exists.
+ */
+export async function mutateSession(
+  sessionId: string,
+  mutate: (s: CloudCodeSession) => CloudCodeSession | null,
+  attempts = 5
+): Promise<CloudCodeSession | null> {
+  for (let i = 0; i < attempts; i++) {
+    const current = await getSession(sessionId);
+    if (!current) return null;
+    const prevRev = current.rev ?? 0;
+    const next = mutate(current);
+    if (!next) return current; // mutate opted out — nothing to write
+    if (!next.tenantId) next.tenantId = DEFAULT_TENANT_ID;
+    next.rev = prevRev + 1;
+    try {
+      await ddb.send(
+        new PutCommand({
+          TableName: TABLE,
+          Item: next,
+          // Land only if nobody else bumped rev since our read. attribute_not_exists
+          // covers legacy rows written before rev existed (treated as rev 0).
+          ConditionExpression: "attribute_not_exists(#rev) OR #rev = :prev",
+          ExpressionAttributeNames: { "#rev": "rev" },
+          ExpressionAttributeValues: { ":prev": prevRev },
+        })
+      );
+      return next;
+    } catch (err) {
+      if (err instanceof ConditionalCheckFailedException) continue; // lost the race — retry
+      throw err;
+    }
+  }
+  throw new Error(`mutateSession: exhausted ${attempts} attempts on ${sessionId} (write contention)`);
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {

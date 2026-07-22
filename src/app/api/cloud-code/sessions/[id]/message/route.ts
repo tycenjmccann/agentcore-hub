@@ -9,7 +9,7 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getOwnedSession, getSession, putSession, STOP_MARKER, DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/cloud-code/sessions";
+import { getOwnedSession, mutateSession, STOP_MARKER, DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/cloud-code/sessions";
 import { invokeCodingTurn, invokeCodingTurnStream, codingRuntimeConfigured } from "@/lib/cloud-code/runtime";
 import { currentConfigVersion } from "@/lib/cloud-code/config-store";
 import { cloneTokenForUser } from "@/lib/cloud-code/github-app";
@@ -23,11 +23,10 @@ export const maxDuration = 800;
 
 /**
  * Persist a completed/errored turn without clobbering a concurrent /stop write.
- * The stream handler holds a stale row snapshot; a blind full Put of it would
- * overwrite the merged row /stop persisted after interrupting this same turn
- * (the two writers race). So we RE-READ the latest row and, if /stop already
- * recorded this turn (its agent turn starts with STOP_MARKER), leave it alone.
- * Otherwise we append userTurn + the agent reply onto the fresh row.
+ * Goes through mutateSession (optimistic-concurrency read-modify-write) so a
+ * late stream completion and the /stop persist for the SAME interrupted turn
+ * serialize deterministically instead of last-writer-wins. If /stop already
+ * recorded this turn (its agent turn starts with STOP_MARKER), we opt out.
  */
 async function persistTurn(
   sessionId: string,
@@ -35,21 +34,22 @@ async function persistTurn(
   userTurn: CloudCodeTurn,
   agentText: string | null,
   prompt: string
-): Promise<void> {
-  const fresh = (await getSession(sessionId).catch(() => null)) || snapshot;
-  const last = fresh.turns[fresh.turns.length - 1];
-  // /stop landed first for this turn — don't overwrite its record.
-  if (last?.role === "agent" && last.text.startsWith(STOP_MARKER)) return;
-  const now = new Date().toISOString();
-  if (!(last?.role === "user" && last.text === userTurn.text)) {
-    fresh.turns.push(userTurn);
-  }
-  if (agentText !== null) fresh.turns.push({ role: "agent", text: agentText, at: now });
-  if (fresh.title === "New session") fresh.title = prompt.slice(0, 80);
-  if (snapshot.claudeSessionId) fresh.claudeSessionId = snapshot.claudeSessionId;
-  fresh.pendingSeed = undefined;
-  fresh.updatedAt = now;
-  await putSession(fresh);
+): Promise<CloudCodeSession | null> {
+  return mutateSession(sessionId, (fresh) => {
+    const last = fresh.turns[fresh.turns.length - 1];
+    // /stop landed first for this turn — don't overwrite its record.
+    if (last?.role === "agent" && last.text.startsWith(STOP_MARKER)) return null;
+    const now = new Date().toISOString();
+    if (!(last?.role === "user" && last.text === userTurn.text)) {
+      fresh.turns.push(userTurn);
+    }
+    if (agentText !== null) fresh.turns.push({ role: "agent", text: agentText, at: now });
+    if (fresh.title === "New session") fresh.title = prompt.slice(0, 80);
+    if (snapshot.claudeSessionId) fresh.claudeSessionId = snapshot.claudeSessionId;
+    fresh.pendingSeed = undefined;
+    fresh.updatedAt = now;
+    return fresh;
+  });
 }
 
 export async function POST(
@@ -174,18 +174,11 @@ export async function POST(
     });
 
     const agentTurn: CloudCodeTurn = { role: "agent", text: result.response, at: new Date().toISOString() };
-    session.turns.push(userTurn, agentTurn);
     if (result.claudeSessionId) session.claudeSessionId = result.claudeSessionId;
-    if (session.title === "New session") session.title = prompt.slice(0, 80);
-    session.pendingSeed = undefined; // ported seed has now run
-    session.updatedAt = new Date().toISOString();
-    await putSession(session);
-
-    return NextResponse.json({ reply: agentTurn, session });
+    const saved = await persistTurn(session.sessionId, session, userTurn, result.response, prompt);
+    return NextResponse.json({ reply: agentTurn, session: saved ?? session });
   } catch (err) {
-    session.turns.push(userTurn);
-    session.updatedAt = new Date().toISOString();
-    await putSession(session).catch(() => {});
+    await persistTurn(session.sessionId, session, userTurn, null, prompt).catch(() => {});
     console.error("[cloud-code] turn error:", err);
     return NextResponse.json({ error: (err as Error).message }, { status: 502 });
   }

@@ -21,9 +21,8 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import {
-  getSession,
   getOwnedSession,
-  putSession,
+  mutateSession,
   STOP_MARKER,
   DEFAULT_USER_ID,
   DEFAULT_TENANT_ID,
@@ -77,24 +76,28 @@ export async function POST(
   // persist failure still returns *something*; on success it's the row with the
   // interrupted turn appended — the client does setActive(data.session), so this
   // MUST carry the stopped turn or the on-screen message + partial reply vanish.
+  // mutateSession is an optimistic-concurrency read-modify-write, so this
+  // serializes with the /message stream's persist for the same turn (last-writer
+  // clobber avoided) rather than racing it on a plain re-read + Put.
   let persisted = session;
   try {
-    const now = new Date().toISOString();
-    const fresh = (await getSession(params.id)) || session;
-    // Only append the user message if it isn't already the last turn (the /message
-    // route may have written it in); always append the partial + marker.
-    const last = fresh.turns[fresh.turns.length - 1];
-    if (prompt && !(last?.role === "user" && last.text === prompt)) {
-      fresh.turns.push({ role: "user", text: prompt, at: now });
-    }
-    const agentText = partial ? `${partial}\n\n${STOP_NOTE}` : STOP_NOTE;
-    const agentTurn: CloudCodeTurn = { role: "agent", text: agentText, at: now };
-    fresh.turns.push(agentTurn);
-    if (fresh.title === "New session" && prompt) fresh.title = prompt.slice(0, 80);
-    fresh.pendingSeed = undefined;
-    fresh.updatedAt = now;
-    await putSession(fresh);
-    persisted = fresh;
+    const updated = await mutateSession(params.id, (fresh) => {
+      const now = new Date().toISOString();
+      // Only append the user message if it isn't already the last turn (the
+      // /message route may have written it in); always append the partial + marker.
+      const last = fresh.turns[fresh.turns.length - 1];
+      if (prompt && !(last?.role === "user" && last.text === prompt)) {
+        fresh.turns.push({ role: "user", text: prompt, at: now });
+      }
+      const agentText = partial ? `${partial}\n\n${STOP_NOTE}` : STOP_NOTE;
+      const agentTurn: CloudCodeTurn = { role: "agent", text: agentText, at: now };
+      fresh.turns.push(agentTurn);
+      if (fresh.title === "New session" && prompt) fresh.title = prompt.slice(0, 80);
+      fresh.pendingSeed = undefined;
+      fresh.updatedAt = now;
+      return fresh;
+    });
+    if (updated) persisted = updated;
   } catch (err) {
     console.error("[cloud-code] stop persist error:", err);
     // Stop itself succeeded; a persist failure shouldn't 500 the action.
