@@ -20,7 +20,9 @@ export interface CloudCodeTurn {
 
 export interface CloudCodeSession {
   sessionId: string; // runtimeSessionId — the resume handle
-  userId: string; // "default" until app-wide SSO lands
+  userId: string; // the individual (Cognito sub / SSO email); "default" in no-auth deploys
+  tenantId?: string; // company/isolation boundary; "default" in no-auth deploys. The
+  // security boundary is cross-tenant, not per-user — colleagues share a tenant.
   title: string;
   cli: CloudCodeCli;
   repo?: string; // owner/name or clone URL
@@ -46,6 +48,7 @@ export interface CloudCodeSession {
 /** Trimmed shape for the sidebar list (no full turn history). */
 export interface CloudCodeSessionSummary {
   sessionId: string;
+  tenantId?: string;
   title: string;
   cli: CloudCodeCli;
   repo?: string;

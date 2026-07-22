@@ -9,9 +9,10 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getSession, putSession, DEFAULT_USER_ID } from "@/lib/cloud-code/sessions";
+import { getOwnedSession, putSession, DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/cloud-code/sessions";
 import { invokeCodingTurn, invokeCodingTurnStream, codingRuntimeConfigured } from "@/lib/cloud-code/runtime";
 import { currentConfigVersion } from "@/lib/cloud-code/config-store";
+import { getIdentity } from "@/lib/auth/identity";
 import { sseData } from "@/lib/sse";
 import type { CloudCodeTurn } from "@/lib/cloud-code/types";
 
@@ -30,7 +31,8 @@ export async function POST(
     );
   }
 
-  const session = await getSession(params.id);
+  const { tenantId } = getIdentity(request);
+  const session = await getOwnedSession(params.id, tenantId);
   if (!session) {
     return NextResponse.json({ error: "Session not found" }, { status: 404 });
   }
@@ -52,7 +54,8 @@ export async function POST(
   const wantStream =
     request.nextUrl.searchParams.get("stream") === "1" && session.cli === "claude";
   const userId = session.userId || DEFAULT_USER_ID;
-  const configVersion = await currentConfigVersion(userId);
+  const sessionTenant = session.tenantId || DEFAULT_TENANT_ID;
+  const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
   const region = request.nextUrl.searchParams.get("region") || undefined;
 
   // Ported-session first turn: tell the runtime to check out the pushed branch
@@ -73,7 +76,7 @@ export async function POST(
     try {
       upstream = await invokeCodingTurnStream({
         sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
-        claudeSessionId: session.claudeSessionId, userId, configVersion, region,
+        claudeSessionId: session.claudeSessionId, userId, tenantId: sessionTenant, configVersion, region,
         ...resumeFields,
       });
     } catch (err) {
@@ -129,7 +132,7 @@ export async function POST(
   try {
     const result = await invokeCodingTurn({
       sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
-      claudeSessionId: session.claudeSessionId, userId, configVersion, region,
+      claudeSessionId: session.claudeSessionId, userId, tenantId: sessionTenant, configVersion, region,
       ...resumeFields,
     });
 

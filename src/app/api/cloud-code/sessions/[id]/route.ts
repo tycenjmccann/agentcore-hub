@@ -8,7 +8,8 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getSession, putSession, deleteSession } from "@/lib/cloud-code/sessions";
+import { getOwnedSession, putSession, deleteSession } from "@/lib/cloud-code/sessions";
+import { getIdentity } from "@/lib/auth/identity";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +24,8 @@ export async function PATCH(
   { params }: { params: { id: string } }
 ) {
   try {
-    const session = await getSession(params.id);
+    const { tenantId } = getIdentity(request);
+    const session = await getOwnedSession(params.id, tenantId);
     if (!session) return NextResponse.json({ error: "Session not found" }, { status: 404 });
     const body = await request.json().catch(() => ({}));
     if (body.clearPendingSeed) session.pendingSeed = undefined;
@@ -37,11 +39,12 @@ export async function PATCH(
 }
 
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: { id: string } }
 ) {
   try {
-    const session = await getSession(params.id);
+    const { tenantId } = getIdentity(request);
+    const session = await getOwnedSession(params.id, tenantId);
     if (!session) {
       return NextResponse.json({ error: "Session not found" }, { status: 404 });
     }
@@ -53,10 +56,17 @@ export async function GET(
 }
 
 export async function DELETE(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: { id: string } }
 ) {
   try {
+    // Only delete a row this tenant owns — a foreign/missing id is a no-op 404,
+    // so a probe can't delete (or confirm the existence of) another tenant's row.
+    const { tenantId } = getIdentity(request);
+    const session = await getOwnedSession(params.id, tenantId);
+    if (!session) {
+      return NextResponse.json({ error: "Session not found" }, { status: 404 });
+    }
     await deleteSession(params.id);
     return NextResponse.json({ deleted: true });
   } catch (err) {

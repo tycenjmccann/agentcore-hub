@@ -55,9 +55,19 @@ CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
 TURN_TIMEOUT_S = int(os.environ.get("TURN_TIMEOUT_S", "1500"))
 
 # Per-user coding-CLI config bundle (MCP servers, skills, custom agents, prefs).
-# The app uploads a zip to s3://{ARTIFACT_BUCKET}/cloud-code/configs/{userId}/
-# {version}.zip; we materialize it into the CLI config dirs on session start.
+# The app uploads a zip under the tenant prefix (see _tenant_root); we materialize
+# it into the CLI config dirs on session start.
 ARTIFACT_BUCKET = os.environ.get("ARTIFACT_BUCKET", "")
+
+# Tenant boundary for S3 keys — MUST match src/lib/cloud-code/s3keys.ts. The
+# "default" tenant (no-auth deploys) keeps the legacy unprefixed layout so
+# pre-tenancy objects still resolve; real tenants get a `t/<tenantId>/` prefix.
+DEFAULT_TENANT_ID = "default"
+
+
+def _tenant_root(tenant_id: str | None) -> str:
+    tid = tenant_id or DEFAULT_TENANT_ID
+    return "cloud-code" if tid == DEFAULT_TENANT_ID else f"cloud-code/t/{tid}"
 CLAUDE_CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
 CODEX_HOME = os.environ.get("CODEX_HOME", os.path.join(WORKSPACE_ROOT, ".codex"))
 # Marker so we only materialize a given (user, version) once per warm microVM.
@@ -163,10 +173,10 @@ def _apply_default_mcp() -> None:
 # ─── Per-user config bundle ───────────────────────────────────────────────────
 
 
-def _apply_config_bundle(user_id: str | None, version: str | None) -> None:
+def _apply_config_bundle(user_id: str | None, version: str | None, tenant_id: str | None = None) -> None:
     """Materialize a user's coding-CLI config bundle into the CLI config dirs.
 
-    The bundle is a zip at s3://{ARTIFACT_BUCKET}/cloud-code/configs/{userId}/{version}.zip
+    The bundle is a zip at s3://{ARTIFACT_BUCKET}/{tenant_root}/configs/{userId}/{version}.zip
     laid out as `claude/...` (→ CLAUDE_CONFIG_DIR) and `codex/...` (→ CODEX_HOME).
     Idempotent per warm microVM via a marker file. The user's files land first;
     run-codex.sh / the launchers then re-assert our Bedrock provider on top, so a
@@ -204,7 +214,7 @@ def _apply_config_bundle(user_id: str | None, version: str | None) -> None:
     if not (user_id and ARTIFACT_BUCKET):
         return
 
-    token = f"{user_id}:{version}"
+    token = f"{tenant_id or DEFAULT_TENANT_ID}:{user_id}:{version}"
     prev = _read_marker()
     if prev.get("token") == token:
         return  # already applied to this warm VM
@@ -212,7 +222,7 @@ def _apply_config_bundle(user_id: str | None, version: str | None) -> None:
     if prev.get("files"):
         _remove_applied(prev["files"])
 
-    key = f"cloud-code/configs/{user_id}/{version}.zip"
+    key = f"{_tenant_root(tenant_id)}/configs/{user_id}/{version}.zip"
     try:
         s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
         obj = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=key)
@@ -412,7 +422,7 @@ def _install_resume_transcript(s3_key: str, session_id: str, workdir: str) -> bo
         return False
 
 
-def _checkpoint_transcript(session_id: str, workdir: str) -> dict:
+def _checkpoint_transcript(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
     """Reverse of install: read the (now-grown) Claude transcript off EFS and
     upload it to S3 so the laptop can pull it back and `claude --resume` locally.
 
@@ -426,7 +436,7 @@ def _checkpoint_transcript(session_id: str, workdir: str) -> dict:
         raise FileNotFoundError(f"no transcript at {src} (session never resumed on this VM?)")
     if not ARTIFACT_BUCKET:
         raise RuntimeError("ARTIFACT_BUCKET not set")
-    key = f"cloud-code/checkpoint/{session_id}/{session_id}.jsonl"
+    key = f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/{session_id}.jsonl"
     with open(src, "rb") as f:
         data = f.read()
     s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
@@ -723,6 +733,7 @@ async def invocations(request: Request):
     repo = payload.get("repo")
     claude_session_id = payload.get("claude_session_id")
     user_id = payload.get("user_id")
+    tenant_id = payload.get("tenant_id")  # S3 isolation boundary (see _tenant_root)
     config_version = payload.get("config_version")
     session_id = payload.get("session_id")  # isolates this session's checkout
     stream = bool(payload.get("stream"))  # SSE incremental output (claude only)
@@ -749,7 +760,7 @@ async def invocations(request: Request):
     config_ok = True
     config_err = ""
     try:
-        _apply_config_bundle(user_id, config_version)
+        _apply_config_bundle(user_id, config_version, tenant_id)
         _apply_default_mcp()
     except Exception as exc:  # noqa: BLE001 — config is non-fatal
         config_ok = False
@@ -788,7 +799,7 @@ async def invocations(request: Request):
         if not cp_id:
             return JSONResponse({"error": "checkpoint needs a session id"}, status_code=400)
         try:
-            info = _checkpoint_transcript(cp_id, workdir)
+            info = _checkpoint_transcript(cp_id, workdir, tenant_id)
         except FileNotFoundError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         except Exception as exc:  # noqa: BLE001

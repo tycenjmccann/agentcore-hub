@@ -14,8 +14,9 @@ export const dynamic = "force-dynamic";
 export async function GET(request: NextRequest) {
   try {
     // Identity is stamped by middleware; AUTH_MODE=none → "default" (legacy).
-    const { userId } = getIdentity(request);
-    const sessions = await listSessions(userId);
+    // Sidebar is tenant-scoped: colleagues in a tenant share the session list.
+    const { tenantId } = getIdentity(request);
+    const sessions = await listSessions(tenantId);
     return NextResponse.json({ sessions });
   } catch (err) {
     console.error("[cloud-code] list error:", err);
@@ -28,7 +29,7 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const { userId } = getIdentity(request);
+    const { userId, tenantId } = getIdentity(request);
     const body = await request.json().catch(() => ({}));
     const cli: CloudCodeCli = body.cli === "codex" ? "codex" : "claude";
     const repo: string | undefined = body.repo?.trim() || undefined;
@@ -41,6 +42,7 @@ export async function POST(request: NextRequest) {
     const session: CloudCodeSession = {
       sessionId,
       userId,
+      tenantId,
       title,
       cli,
       repo,
