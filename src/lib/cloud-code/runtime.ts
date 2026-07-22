@@ -58,6 +58,13 @@ export interface CodingTurnParams {
   branch?: string;
   resumeTranscriptKey?: string;
   resumeSessionId?: string;
+  // Short-lived GitHub App installation token minted for the session owner (see
+  // github-app.ts). Handed to the runtime per turn; never persisted.
+  githubToken?: string;
+  // True when the owner has a GitHub App installation. When set, a missing token
+  // means the scoped mint was DENIED — the runtime must NOT fall back to
+  // GITHUB_PAT, or the clone would escalate beyond the user's App scope.
+  githubAppConnected?: boolean;
 }
 
 function buildTurnPayload(params: CodingTurnParams): Record<string, unknown> {
@@ -78,6 +85,8 @@ function buildTurnPayload(params: CodingTurnParams): Record<string, unknown> {
   if (params.branch) payload.branch = params.branch;
   if (params.resumeTranscriptKey) payload.resume_transcript = params.resumeTranscriptKey;
   if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
+  if (params.githubToken) payload.github_token = params.githubToken;
+  if (params.githubAppConnected) payload.github_app_connected = true;
   return payload;
 }
 
@@ -166,6 +175,8 @@ export async function warmCodingSession(params: {
   tenantId?: string;
   configVersion?: string;
   region?: string;
+  githubToken?: string;
+  githubAppConnected?: boolean;
 }): Promise<void> {
   if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
   const region = params.region || REGION;
@@ -181,6 +192,8 @@ export async function warmCodingSession(params: {
   if (params.userId) payload.user_id = params.userId;
   if (params.tenantId) payload.tenant_id = params.tenantId;
   if (params.configVersion) payload.config_version = params.configVersion;
+  if (params.githubToken) payload.github_token = params.githubToken;
+  if (params.githubAppConnected) payload.github_app_connected = true;
 
   const command = new InvokeAgentRuntimeCommand({
     agentRuntimeArn: CODING_RUNTIME_ARN,

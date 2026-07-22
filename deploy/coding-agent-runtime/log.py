@@ -18,7 +18,7 @@ import sys
 from typing import Any, Mapping
 
 SECRET_KEYS = frozenset(
-    {"token", "private_key", "secret", "password", "api_key", "authorization"}
+    {"token", "github_token", "private_key", "secret", "password", "api_key", "authorization"}
 )
 
 _RESERVED_RECORD_ATTRS = frozenset(

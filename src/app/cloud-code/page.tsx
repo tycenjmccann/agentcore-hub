@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown } from "lucide-react";
+import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown, Github } from "lucide-react";
 import dynamic from "next/dynamic";
 import { sseData } from "@/lib/sse";
 import { MarkdownRenderer } from "@/components/workflow/MarkdownRenderer";
@@ -63,6 +63,27 @@ export default function CloudCodePage() {
       if (q.get("view") === "terminal") deepViewRef.current = "terminal";
       setSelectedId(id);
     }
+    // GitHub App connect/disconnect bounces back here with ?github=<status>.
+    const gh = q.get("github");
+    if (gh) {
+      const msgs: Record<string, string> = {
+        connected: "GitHub connected — private repos clone with short-lived tokens",
+        disconnected: "GitHub disconnected",
+        cancelled: "GitHub connection cancelled",
+        not_configured: "GitHub App isn't set up yet — ask your operator",
+        forbidden: "Only an admin can create the GitHub App",
+        state_mismatch: "GitHub connection couldn't be verified — start from Connect and try again",
+        ownership_unverified: "Couldn't confirm you own that GitHub installation — start from Connect and try again",
+        oauth_required: "GitHub App is missing OAuth credentials — your operator must add them first",
+        error: "GitHub connection failed — try again",
+        app_error: "Couldn't create the GitHub App — try again",
+      };
+      flash(msgs[gh] || "GitHub");
+      q.delete("github");
+      const qs = q.toString();
+      window.history.replaceState(null, "", window.location.pathname + (qs ? `?${qs}` : ""));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Tracks which session's pending seed we've already auto-fired, so opening a
@@ -619,10 +640,17 @@ interface ConfigVersion {
   createdAt: string;
 }
 
+interface GithubState {
+  appConfigured: boolean;
+  isAdmin: boolean;
+  connection: { account?: string; repoSelection?: string; repoCount?: number } | null;
+}
+
 function ConfigModal({ onClose, onToast }: { onClose: () => void; onToast: (m: string) => void }) {
   const [versions, setVersions] = useState<ConfigVersion[]>([]);
   const [current, setCurrent] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
+  const [github, setGithub] = useState<GithubState>({ appConfigured: false, isAdmin: false, connection: null });
   const fileRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async () => {
@@ -633,9 +661,25 @@ function ConfigModal({ onClose, onToast }: { onClose: () => void; onToast: (m: s
       setCurrent(d.currentVersion);
     }
   }, []);
+  const loadGithub = useCallback(async () => {
+    const res = await fetch("/api/cloud-code/github");
+    if (res.ok) setGithub(await res.json());
+  }, []);
   useEffect(() => {
     load();
-  }, [load]);
+    loadGithub();
+  }, [load, loadGithub]);
+
+  const disconnectGithub = async () => {
+    setBusy(true);
+    try {
+      await fetch("/api/cloud-code/github", { method: "DELETE" });
+      await loadGithub();
+      onToast("GitHub disconnected");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const upload = async (file: File) => {
     setBusy(true);
@@ -706,6 +750,59 @@ function ConfigModal({ onClose, onToast }: { onClose: () => void; onToast: (m: s
           {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
           Upload config bundle (.zip)
         </button>
+
+        {/* GitHub: connect an App installation so private repos clone with
+            short-lived, per-repo tokens instead of a shared PAT. */}
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)] mb-2">
+          GitHub
+        </div>
+        <div className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-[var(--color-border)] mb-5">
+          <Github className="w-4 h-4 shrink-0 text-[var(--color-text-muted)]" />
+          <div className="flex-1 min-w-0">
+            {github.connection ? (
+              <>
+                <div className="text-[13px] font-medium truncate">
+                  {github.connection.account || "Connected"}
+                </div>
+                <div className="text-[10.5px] text-[var(--color-text-muted)]">
+                  {github.connection.repoSelection === "selected"
+                    ? `${github.connection.repoCount ?? "selected"} repo${github.connection.repoCount === 1 ? "" : "s"}`
+                    : "all repositories"}{" "}
+                  · short-lived tokens
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="text-[13px] font-medium">Not connected</div>
+                <div className="text-[10.5px] text-[var(--color-text-muted)]">
+                  {github.appConfigured
+                    ? "Connect to clone private repos with scoped, expiring tokens"
+                    : github.isAdmin
+                      ? "Set up the GitHub App to enable private-repo cloning"
+                      : "GitHub App isn't set up — ask your operator"}
+                </div>
+              </>
+            )}
+          </div>
+          {github.connection ? (
+            <button
+              onClick={disconnectGithub}
+              disabled={busy}
+              className="text-[11px] px-2.5 py-1 rounded border border-[var(--color-border)] hover:text-red-400 hover:border-red-500/40 transition-colors disabled:opacity-50"
+            >
+              Disconnect
+            </button>
+          ) : (
+            (github.appConfigured || github.isAdmin) && (
+              <a
+                href="/api/cloud-code/github/install"
+                className="text-[11px] px-2.5 py-1 rounded border border-brand-500/50 text-brand-300 hover:bg-brand-500/10 transition-colors"
+              >
+                {github.appConfigured ? "Connect" : "Set up"}
+              </a>
+            )
+          )}
+        </div>
 
         <div className="text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)] mb-2">
           Versions
