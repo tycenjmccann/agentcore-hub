@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: Lint, Typecheck, Build
+    name: Lint, Typecheck, Unit, Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -28,5 +28,58 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
+      - name: Unit tests (hermetic — no AWS)
+        run: npm run test:unit
+
       - name: Build
         run: npm run build
+
+  cloud-code-ui:
+    name: Cloud Code UI (mocked, no AWS)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Build
+        run: npm run build
+
+      # Every backend call in this spec is intercepted with page.route, so a plain
+      # `next start` with zero credentials serves it. Boot, wait for ready, test.
+      - name: Start server
+        run: npm run start -- -p 3737 &
+
+      - name: Wait for server
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null http://localhost:3737/cloud-code; then
+              echo "server up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "server did not come up"; exit 1
+
+      - name: Cloud Code UI regression suite
+        run: npm run test:cloud-code
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:3737
+
+      - name: Upload traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-code-ui-traces
+          path: test-results/
+          retention-days: 7
