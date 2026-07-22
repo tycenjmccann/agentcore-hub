@@ -10,6 +10,8 @@ import { CliBadge, CliMark, CLI_BRAND } from "@/components/cloud-code/CliBrand";
 // xterm touches the DOM/window — load only in the browser.
 const ShellTerminal = dynamic(() => import("@/components/cloud-code/ShellTerminal"), { ssr: false });
 const ArtifactsPanel = dynamic(() => import("@/components/cloud-code/ArtifactsPanel"), { ssr: false });
+const VoiceButton = dynamic(() => import("@/components/cloud-code/VoiceButton"), { ssr: false });
+import { PullCommandButton } from "@/components/cloud-code/PullCommandButton";
 import type {
   CloudCodeSession,
   CloudCodeSessionSummary,
@@ -51,6 +53,9 @@ export default function CloudCodePage() {
   const genRef = useRef(0);
   const accRef = useRef("");
   const [stopping, setStopping] = useState(false);
+  // True while the mic is recording/locked, so the composer keeps the mic mounted
+  // even once dictated text fills the draft (otherwise send would swap in).
+  const [voiceActive, setVoiceActive] = useState(false);
   // Auto-scroll follows the bottom WHILE you're already there; if you scroll up
   // to read, it stops yanking you down and shows a "jump to latest" pill instead.
   const [stuck, setStuck] = useState(true);
@@ -463,8 +468,13 @@ export default function CloudCodePage() {
                   )}
                 </div>
               </div>
-              {/* Chat ⇄ Terminal toggle */}
-              <div className="flex items-center rounded-lg border border-[var(--color-border)] overflow-hidden flex-shrink-0">
+              <div className="flex items-center gap-2 flex-shrink-0">
+              {/* Pull-to-laptop command (claude only — pull resumes via --resume). */}
+              {active.cli === "claude" && (
+                <PullCommandButton sessionId={active.sessionId} className="hidden sm:flex" />
+              )}
+              {/* Chat ⇄ Terminal ⇄ Artifacts toggle */}
+              <div className="flex items-center rounded-lg border border-[var(--color-border)] overflow-hidden">
                 <button
                   onClick={() => setView("chat")}
                   className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
@@ -497,6 +507,7 @@ export default function CloudCodePage() {
                 >
                   <FileBox className="w-3.5 h-3.5" /> Artifacts
                 </button>
+              </div>
               </div>
             </div>
 
@@ -616,7 +627,7 @@ export default function CloudCodePage() {
                   >
                     {stopping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-3.5 h-3.5" fill="currentColor" />}
                   </button>
-                ) : (
+                ) : draft.trim() || voiceActive ? (
                   <button
                     onClick={send}
                     disabled={!draft.trim()}
@@ -626,6 +637,14 @@ export default function CloudCodePage() {
                   >
                     <Send className="w-4 h-4" />
                   </button>
+                ) : (
+                  // Empty composer → push-to-talk mic (hidden where unsupported,
+                  // which falls back to showing the disabled send button).
+                  <VoiceButton
+                    onText={(t) => setDraft(t)}
+                    onError={(m) => flash(m)}
+                    onActiveChange={setVoiceActive}
+                  />
                 )}
               </div>
             </div>
