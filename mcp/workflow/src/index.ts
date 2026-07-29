@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { config } from "./config.js";
+import "./config.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -192,30 +192,27 @@ const TOOLS = [
 
 async function handleSubmitWorkflow(args: unknown) {
   const parsed = SubmitWorkflowInputSchema.safeParse(args);
-  if (!parsed.success) {
-    return zodError(parsed.error);
-  }
+  if (!parsed.success) return zodError(parsed.error);
 
-  const result = await request<{ id: string; status: string; workflowId: string; epicId: string }>(
+  const result = await request<{ id?: string; workflowId?: string; epicId?: string; status?: string }>(
     "POST",
     "/api/workflow/start",
     parsed.data
   );
 
-  if (!result.ok) {
-    return apiError(result);
-  }
+  if (!result.ok) return apiError(result);
 
-  return success(
-    `Workflow submitted successfully.\nWorkflow ID: ${result.data.workflowId ?? result.data.id}\nEpic ID: ${result.data.epicId ?? "N/A"}\nStatus: ${result.data.status ?? "started"}`
-  );
+  const d = result.data;
+  const id = d.workflowId || d.id || "unknown";
+  const lines = [`Workflow submitted successfully.`, `ID: ${id}`];
+  if (d.epicId) lines.push(`Epic: ${d.epicId}`);
+  if (d.status) lines.push(`Status: ${d.status}`);
+  return success(lines.join("\n"));
 }
 
 async function handleListWorkflows(args: unknown) {
-  const parsed = ListWorkflowsInputSchema.safeParse(args);
-  if (!parsed.success) {
-    return zodError(parsed.error);
-  }
+  const parsed = ListWorkflowsInputSchema.safeParse(args ?? {});
+  if (!parsed.success) return zodError(parsed.error);
 
   const params = new URLSearchParams();
   params.set("includeArchived", parsed.data.includeArchived ? "1" : "0");
@@ -227,6 +224,9 @@ async function handleListWorkflows(args: unknown) {
 }
 
 async function handleListWorkflowDefinitions(_args: unknown) {
+  const parsed = ListWorkflowDefinitionsInputSchema.safeParse(_args ?? {});
+  if (!parsed.success) return zodError(parsed.error);
+
   const result = await request("GET", "/api/workflow/definitions");
   if (!result.ok) return apiError(result);
 

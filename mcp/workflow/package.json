@@ -2,6 +2,7 @@
   "name": "@agentcore-hub/workflow-mcp",
   "version": "0.1.0",
   "private": true,
+  "description": "Local stdio MCP server: manage AgentCore Hub workflows via MCP tools.",
   "type": "module",
   "bin": {
     "workflow-mcp": "dist/index.js"
