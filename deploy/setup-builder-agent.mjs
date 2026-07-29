@@ -5,7 +5,8 @@
  * The builder uses:
  *   - code_interpreter: to call boto3 CreateHarness/CreateAgentRuntime APIs
  *   - remote_mcp (optional): connects to customer's MCP servers for tool discovery
- *   - memory (optional): remembers past agent builds
+ *   - memory (default-on): long-term memory so past builds inform future ones.
+ *     Auto-provisioned unless you pass --no-memory or --memory-id <existing>.
  *
  * The builder sees all tools available via MCP, then creates child agents wired
  * to the appropriate subset. Works with any infrastructure (AWS, GCP, on-prem)
@@ -24,10 +25,13 @@
  *     --mcp-url https://api.githubcopilot.com/mcp/ \
  *     --mcp-url https://my-tools.example.com/mcp
  *
- *   # With memory for persistent context
+ *   # Memory is created automatically by default. To reuse an existing store:
  *   node deploy/setup-builder-agent.mjs \
  *     --mcp-url https://my-tools.example.com/mcp \
  *     --memory-id my-builder-memory
+ *
+ *   # Opt out of memory entirely (stateless builder):
+ *   node deploy/setup-builder-agent.mjs --no-memory
  *
  * Prerequisites:
  *   - AWS credentials configured (with IAM permissions to create roles if not using --harness-role-arn)
@@ -61,7 +65,11 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
 let HARNESS_ROLE_ARN = getArg("harness-role-arn");
-const MEMORY_ID = getArg("memory-id");
+let MEMORY_ID = getArg("memory-id");
+// Memory is on by default; --no-memory opts out. An explicit --memory-id also
+// disables auto-creation (reuse the store the caller named).
+const NO_MEMORY = args.includes("--no-memory");
+const MEMORY_NAME = "agentcore_hub_builder_memory";
 const MCP_URLS = getAllArgs("mcp-url");
 const MODEL_ID = getArg("model-id") || "us.anthropic.claude-sonnet-4-6";
 const ROLE_NAME = "agentcore-hub-harness-role";
@@ -275,9 +283,53 @@ const {
   CreateHarnessCommand,
   GetHarnessCommand,
   ListHarnessesCommand,
+  CreateMemoryCommand,
+  GetMemoryCommand,
+  ListMemoriesCommand,
 } = await import("@aws-sdk/client-bedrock-agentcore-control");
 
 const agentcore = new BedrockAgentCoreControlClient({ region: REGION });
+
+// --- Provision memory (default-on) ---
+// Skipped by --no-memory, or when the caller passed an explicit --memory-id.
+if (!NO_MEMORY && !MEMORY_ID) {
+  console.log(`\n2/3 AgentCore Memory (auto-provisioned)`);
+  let memories = [];
+  let nextToken;
+  do {
+    const page = await agentcore.send(new ListMemoriesCommand({ nextToken }));
+    memories = memories.concat(page.memories || []);
+    nextToken = page.nextToken;
+  } while (nextToken);
+  const existing = memories.find(
+    (m) => (m.id || m.memoryId || "").startsWith(MEMORY_NAME) || m.name === MEMORY_NAME
+  );
+  if (existing) {
+    MEMORY_ID = existing.id || existing.memoryId;
+    console.log(`  ✓ Memory exists: ${MEMORY_ID}`);
+  } else {
+    const created = await agentcore.send(new CreateMemoryCommand({
+      name: MEMORY_NAME,
+      description: "Builder Agent long-term memory (past agent builds, tool discovery, roster)",
+      eventExpiryDuration: 90,
+      memoryStrategies: [
+        { semanticMemoryStrategy: { name: "builderSemantic", description: "Facts about agents built: names, models, tools, roles, gateways wired" } },
+        { summaryMemoryStrategy: { name: "builderSummary", description: "Session summaries of build conversations and decisions" } },
+      ],
+    }));
+    MEMORY_ID = created.memory?.id || created.memory?.memoryId;
+    console.log(`  Memory created: ${MEMORY_ID} — waiting for ACTIVE...`);
+    for (let i = 0; i < 60; i++) {
+      await sleep(5000);
+      const m = await agentcore.send(new GetMemoryCommand({ memoryId: MEMORY_ID }));
+      const status = m.memory?.status;
+      if (status === "ACTIVE") break;
+      if (status === "FAILED") throw new Error(`Memory creation failed: ${m.memory?.failureReason || "unknown"}`);
+      if (i === 59) throw new Error("Timed out waiting for memory ACTIVE");
+    }
+    console.log(`  ✓ Memory ACTIVE`);
+  }
+}
 
 console.log(`\n2/3 Deploying Builder Agent Harness`);
 console.log("  " + "=".repeat(50));
