@@ -41,10 +41,11 @@ export async function GET(_req: NextRequest, { params }: { params: { id: string 
     const analyses = (analysesPage.Items || []) as WorkflowAnalysis[];
     const latest = analyses[0] || null;
 
-    const history = analyses.map((a) => {
-      const { summaryMarkdown: _s, metrics: _m, ...rest } = a;
-      return rest;
-    });
+    // Full records: the panel lets a user select any history entry and renders
+    // its metric cards + full report, so history must carry metrics and
+    // summaryMarkdown. This is per-run (a handful of re-analyses), not the
+    // cross-run set — the compact projection belongs to `trend` below.
+    const history = analyses;
 
     // Def-level trend: resolve workflowDefId (from latest analysis or the run row).
     let workflowDefId: string | undefined = latest?.workflowDefId;

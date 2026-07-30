@@ -5,8 +5,9 @@ Every action is validated in code before executing — the model cannot bypass
 these rules by prompting differently:
   - human review gates (`human:*` assignees, `in_review` status) are untouchable
   - nothing is ever transitioned to done/cancelled
-  - unstick/retry delegate to the app's provider-aware endpoints (nudge/retry),
-    so DynamoDB and Jira modes behave identically to a human clicking the UI
+  - unstick/retry/comment delegate to the app's provider-aware endpoints
+    (nudge/retry/tickets/comment), so DynamoDB and Jira modes behave identically
+    to a human clicking the UI
 
 Every executed action publishes a `manager.intervention` event to the events
 table, so it shows on the board timeline and in the next run analysis.
@@ -17,8 +18,8 @@ Usage:
   python3 intervene.py comment  <workflowId> <ticketId> <text>
   python3 intervene.py escalate <workflowId> <message>
 
-Env: WORKFLOW_API_URL (App Runner base URL), EVENTS_TABLE, TICKETS_TABLE,
-     WORKFLOWS_TABLE, AWS_REGION.
+Env: WORKFLOW_API_URL (app base URL), EVENTS_TABLE, TICKETS_TABLE,
+     WORKFLOWS_TABLE, TICKET_PROVIDER (dynamodb|jira), AWS_REGION.
 """
 
 import argparse
@@ -38,6 +39,7 @@ API_URL = (os.environ.get("WORKFLOW_API_URL") or "").rstrip("/")
 EVENTS_TABLE = os.environ.get("EVENTS_TABLE", "agentcore-hub-events")
 TICKETS_TABLE = os.environ.get("TICKETS_TABLE", "agentcore-hub-tickets")
 WORKFLOWS_TABLE = os.environ.get("WORKFLOWS_TABLE", "agentcore-hub-workflows")
+TICKET_PROVIDER = os.environ.get("TICKET_PROVIDER", "dynamodb")
 
 dynamodb = boto3.resource("dynamodb", region_name=REGION)
 
@@ -118,25 +120,26 @@ def cmd_retry(args):
 
 
 def cmd_comment(args):
-    ticket = get_ticket(args.ticket_id)
-    refuse_if_protected(ticket)
-    comment = {
-        "id": event_id("cmt"),
+    # Route through the app's provider-aware endpoint (same as unstick/retry) so
+    # the comment lands in the canonical store: Jira when TICKET_PROVIDER=jira,
+    # DynamoDB otherwise. Writing straight to TICKETS_TABLE here would miss Jira
+    # entirely and, in Jira mode, touch an unused shadow row.
+    #
+    # In DynamoDB mode we can still enforce the human-gate guard locally from the
+    # ticket row. In Jira mode the DDB tickets table is optional/absent, so the
+    # guard is best-effort — the endpoint itself refuses to create shadow rows.
+    if TICKET_PROVIDER != "jira":
+        refuse_if_protected(get_ticket(args.ticket_id))
+
+    result = api_post(f"/api/workflow/{args.workflow_id}/tickets/comment", {
+        "ticketId": args.ticket_id,
         "author": "workflow-manager",
         "content": args.text,
-        "timestamp": now_iso(),
-    }
-    dynamodb.Table(TICKETS_TABLE).update_item(
-        Key={"ticketId": args.ticket_id},
-        UpdateExpression=(
-            "SET comments = list_append(if_not_exists(comments, :empty), :c), updatedAt = :u"
-        ),
-        ExpressionAttributeValues={":c": [comment], ":empty": [], ":u": now_iso()},
-    )
+    })
     publish_intervention(args.workflow_id, "comment", {
         "ticketId": args.ticket_id, "note": args.text[:500],
     })
-    print(json.dumps({"action": "comment", "ticketId": args.ticket_id}, indent=2))
+    print(json.dumps({"action": "comment", "ticketId": args.ticket_id, **result}, indent=2))
 
 
 def cmd_escalate(args):

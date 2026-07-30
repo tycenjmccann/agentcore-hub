@@ -750,6 +750,19 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           });
         }
         break;
+      case "nudge":
+        // Live nudge pulse — matches fireReplayVisuals so a nudge surfaces as it
+        // happens, not only on replay scrub.
+        setNudgePulse(true);
+        setTimeout(() => setNudgePulse(false), 1500);
+        break;
+      case "manager_intervention":
+      case "manager_escalation":
+        // Sky pulse + toast the moment the Workflow Manager unsticks/retries/
+        // comments/escalates a live run (previously only fired in replay).
+        setManagerPulse(managerPulseText(event));
+        setTimeout(() => setManagerPulse(null), 4000);
+        break;
       default:
         break;
     }

@@ -151,7 +151,7 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
   }, [workflowId, data]);
 
   const selected: WorkflowAnalysis | null =
-    (selectedId && data?.history.find((h) => h.analysisId === selectedId) as WorkflowAnalysis | undefined) ||
+    (selectedId && data?.history.find((h) => h.analysisId === selectedId)) ||
     data?.latest ||
     null;
 

@@ -82,6 +82,12 @@ async function analyze(workflowId, trigger) {
   // both read "none" before either writes). Claim the run atomically instead: a
   // conditional UpdateItem that only the first delivery can win. The loser skips
   // before spending the analyze delay or a harness invocation.
+  //
+  // The claim is an IN-PROGRESS marker, not a success marker: if the invocation
+  // (or the delay) throws, we RELEASE it so a retry can re-run. Otherwise a
+  // transient failure would leave wmAutoAnalyzedAt set forever and every retry
+  // would take the "already analyzed" branch — silently disabling auto-analysis
+  // for that run even though nothing was ever persisted.
   if (trigger === "auto") {
     try {
       await ddb.send(new UpdateCommand({
@@ -98,8 +104,6 @@ async function analyze(workflowId, trigger) {
       }
       throw err;
     }
-    // Let the final completions/*.json S3 writes land before the dossier pull.
-    await sleep(ANALYZE_DELAY_MS);
   }
 
   const defId = workflow.workflowDefId || "software-delivery";
@@ -108,9 +112,30 @@ async function analyze(workflowId, trigger) {
     `ANALYZE ${workflowId} (defId=${defId}, outcome=${phase}, trigger=${trigger})\n` +
     `Title: ${workflow.input?.title || "(untitled)"}`;
 
-  const result = await invokeHarness(prompt, sessionId("wm", workflowId));
-  console.log(`[analyzer] ANALYZE ${workflowId} stopReason=${result.stopReason} chars=${result.text.length}`);
-  return { workflowId, trigger, stopReason: result.stopReason, summary: result.text.slice(0, 500) };
+  try {
+    // Let the final completions/*.json S3 writes land before the dossier pull.
+    if (trigger === "auto") await sleep(ANALYZE_DELAY_MS);
+    const result = await invokeHarness(prompt, sessionId("wm", workflowId));
+    console.log(`[analyzer] ANALYZE ${workflowId} stopReason=${result.stopReason} chars=${result.text.length}`);
+    return { workflowId, trigger, stopReason: result.stopReason, summary: result.text.slice(0, 500) };
+  } catch (err) {
+    if (trigger === "auto") await releaseAutoClaim(workflowId);
+    throw err; // let EventBridge retry a released run
+  }
+}
+
+/** Release the in-progress auto-analysis claim so a retry can re-run. */
+async function releaseAutoClaim(workflowId) {
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE wmAutoAnalyzedAt",
+    }));
+    console.log(`[analyzer] released auto-analysis claim for ${workflowId} after failure`);
+  } catch (err) {
+    console.error(`[analyzer] failed to release claim for ${workflowId}:`, err.message);
+  }
 }
 
 // ─── WATCH ─────────────────────────────────────────────────────────────────────

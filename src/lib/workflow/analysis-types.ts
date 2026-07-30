@@ -166,8 +166,9 @@ export interface AnalysisTrendPoint {
 
 export interface AnalysisResponse {
   latest: WorkflowAnalysis | null;
-  /** All analyses for this run (newest first, compact — no summaryMarkdown). */
-  history: Array<Omit<WorkflowAnalysis, "summaryMarkdown" | "metrics">>;
+  /** All analyses for this run (newest first, full records — the panel renders
+   * metrics + full report for whichever entry the user selects). */
+  history: WorkflowAnalysis[];
   /** Def-level trend across runs (newest first). */
   trend: AnalysisTrendPoint[];
 }

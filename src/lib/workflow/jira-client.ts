@@ -277,6 +277,25 @@ export class JiraClient {
     await this.transitionIssue(issueKey, jiraStatus);
   }
 
+  /**
+   * Add a comment to an issue. Wraps the text in ADF (Atlassian Document
+   * Format) and prefixes the author, matching JiraCloudProvider.addComment.
+   */
+  async addComment(issueKey: string, author: string, content: string): Promise<void> {
+    await this.request("POST", `/issue/${issueKey}/comment`, {
+      body: {
+        type: "doc",
+        version: 1,
+        content: [
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: `[${author}]: ${content}` }],
+          },
+        ],
+      },
+    });
+  }
+
   // ─── Label Helpers ─────────────────────────────────────────────────────────
 
   /**
