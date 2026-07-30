@@ -35,6 +35,14 @@ export async function request<T = unknown>(
     headers["Authorization"] = `Bearer ${config.authToken}`;
   }
 
+  // Cloudflare Access service token: the mode the Hub's middleware actually
+  // accepts (AUTH_MODE=cloudflare-access). Access validates these at the edge
+  // and injects the Cf-Access-Jwt-Assertion the middleware verifies.
+  if (config.cfAccessClientId && config.cfAccessClientSecret) {
+    headers["CF-Access-Client-Id"] = config.cfAccessClientId;
+    headers["CF-Access-Client-Secret"] = config.cfAccessClientSecret;
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 

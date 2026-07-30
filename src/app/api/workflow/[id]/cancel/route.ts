@@ -235,6 +235,17 @@ export async function POST(
     );
   }
 
+  // Optional audit reason. Body is optional, so tolerate an empty/absent one.
+  let reason: string | undefined;
+  try {
+    const body = await request.json();
+    if (body && typeof body.reason === "string" && body.reason.trim()) {
+      reason = body.reason.trim().slice(0, 500);
+    }
+  } catch {
+    /* no body — reason stays undefined */
+  }
+
   try {
     // 1. Read current workflow with ConsistentRead
     const wfResult = await ddb.send(
@@ -273,7 +284,8 @@ export async function POST(
           TableName: WORKFLOWS_TABLE,
           Key: { workflowId },
           UpdateExpression:
-            "SET #phase = :cancelled, cancelledAt = :ts, previousPhase = :prev",
+            "SET #phase = :cancelled, cancelledAt = :ts, previousPhase = :prev" +
+            (reason ? ", cancelReason = :reason" : ""),
           ConditionExpression:
             "#phase <> :complete AND #phase <> :error AND #phase <> :alreadyCancelled",
           ExpressionAttributeNames: { "#phase": "phase" },
@@ -284,6 +296,7 @@ export async function POST(
             ":complete": "complete",
             ":error": "error",
             ":alreadyCancelled": "cancelled",
+            ...(reason ? { ":reason": reason } : {}),
           },
         })
       );
@@ -326,6 +339,7 @@ export async function POST(
               workflowId,
               cancelledAt,
               previousPhase: workflow.phase,
+              ...(reason ? { reason } : {}),
               ticketsCancelled: ticketResults.cancelled,
               ticketsSkipped: ticketResults.skipped,
               ticketsFailed: ticketResults.failed,
@@ -338,7 +352,7 @@ export async function POST(
     }
 
     return NextResponse.json(
-      { status: "cancelled", cancelledAt },
+      { status: "cancelled", cancelledAt, ...(reason ? { reason } : {}) },
       { status: 200 }
     );
   } catch (err) {

@@ -9,7 +9,10 @@ export const RepoTargetSchema = z.object({
 
 export const RepoConfigSchema = z.object({
   layout: z.enum(["monorepo", "multi-repo"]),
-  repos: z.array(RepoTargetSchema).min(1),
+  // No .min(1): workflow definitions with requiresRepo=false (marketing, sales,
+  // legal) are submitted with repos:[], matching the intake form and
+  // /api/workflow/start. Requiring a repo would make 3 of 4 defs unsubmittable.
+  repos: z.array(RepoTargetSchema),
 });
 
 export const IntakeSourceSchema = z.object({
@@ -64,5 +67,4 @@ export const CancelWorkflowInputSchema = z.object({
 
 export const NudgeWorkflowInputSchema = z.object({
   workflowId: z.string().min(1),
-  message: z.string().optional(),
 });

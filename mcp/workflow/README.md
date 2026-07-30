@@ -15,7 +15,9 @@ npm run build
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DEPLOYMENT_URL` | **Yes** | Base URL of the AgentCore Hub API (e.g., `https://hub.example.com`). Trailing slash is stripped. |
-| `AUTH_TOKEN` | No | Bearer token for API authentication. When present, sent as `Authorization: Bearer <token>` on all requests. |
+| `AUTH_TOKEN` | No | Bearer token, sent as `Authorization: Bearer <token>`. Use when the Hub reads a bearer token directly. |
+| `CF_ACCESS_CLIENT_ID` | No | Cloudflare Access service-token client ID. **Required when the Hub runs with `AUTH_MODE=cloudflare-access`** — the middleware only accepts a verified `Cf-Access-Jwt-Assertion`, not `Authorization`. Sent as the `CF-Access-Client-Id` header. |
+| `CF_ACCESS_CLIENT_SECRET` | No | Cloudflare Access service-token client secret. Pairs with `CF_ACCESS_CLIENT_ID`; sent as the `CF-Access-Client-Secret` header. |
 
 ## MCP Client Configuration
 

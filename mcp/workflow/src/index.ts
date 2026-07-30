@@ -63,7 +63,6 @@ const TOOLS = [
             layout: { type: "string", enum: ["monorepo", "multi-repo"] },
             repos: {
               type: "array",
-              minItems: 1,
               items: {
                 type: "object",
                 required: ["url", "defaultBranch", "platform"],
@@ -176,13 +175,12 @@ const TOOLS = [
   {
     name: "nudge_workflow",
     description:
-      "Send a nudge to a running workflow. Optionally provide a message with additional context or instructions to guide its execution.",
+      "Nudge a workflow: scan its tickets and auto-fix any that are stuck (e.g. re-transition blocked tickets). Note: this does not deliver instructions to a running agent — it only unblocks stalled tickets.",
     inputSchema: {
       type: "object",
       required: ["workflowId"],
       properties: {
         workflowId: { type: "string", minLength: 1 },
-        message: { type: "string" },
       },
     },
   },
@@ -279,15 +277,13 @@ async function handleNudgeWorkflow(args: unknown) {
   const parsed = NudgeWorkflowInputSchema.safeParse(args);
   if (!parsed.success) return zodError(parsed.error);
 
-  const body = parsed.data.message ? { message: parsed.data.message } : undefined;
   const result = await request(
     "POST",
-    `/api/workflow/${encodeURIComponent(parsed.data.workflowId)}/nudge`,
-    body
+    `/api/workflow/${encodeURIComponent(parsed.data.workflowId)}/nudge`
   );
   if (!result.ok) return apiError(result);
 
-  return success(`Nudge sent to workflow ${parsed.data.workflowId}.`);
+  return success(JSON.stringify(result.data, null, 2));
 }
 
 // --- MCP Server setup ---
@@ -302,7 +298,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  // MCP makes `arguments` optional; a tool whose fields are all optional
+  // (list_workflows, list_workflow_definitions) is legitimately called with
+  // none. Default to {} so Zod applies defaults instead of rejecting undefined.
+  const { name, arguments: args = {} } = request.params;
 
   switch (name) {
     case "submit_workflow":
