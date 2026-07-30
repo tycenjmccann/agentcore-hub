@@ -54,6 +54,12 @@ describe("sseData", () => {
     expect(await collect([": ping\nevent: msg\ndata: real\n\n"])).toEqual(["real"]);
   });
 
+  it("skips heartbeat comment frames interleaved between real data", async () => {
+    // The harness invoker emits ": ping\n\n" during long silent tool loops so
+    // App Runner doesn't drop the idle connection. They must be invisible here.
+    expect(await collect(["data: a\n\n", ": ping\n\n", ": ping\n\n", "data: b\n\n"])).toEqual(["a", "b"]);
+  });
+
   it("carries the Cloud Code JSON schema through intact", async () => {
     const frames = await collect([
       `data: ${JSON.stringify({ type: "text", text: "hi" })}\n\n`,

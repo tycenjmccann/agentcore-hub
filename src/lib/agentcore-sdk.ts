@@ -38,6 +38,11 @@ import {
 
 export const DEFAULT_REGION = process.env.AWS_REGION || "us-east-1";
 
+// SSE keep-alive cadence for long harness tool loops. Well under the ~120s
+// idle window App Runner and typical proxies enforce, so a silent "researching"
+// turn never trips the connection.
+const HARNESS_HEARTBEAT_MS = 15_000;
+
 // Per-region client cache (avoids recreating clients on every call)
 const bedrockClients = new Map<string, BedrockRuntimeClient>();
 const agentCoreClients = new Map<string, BedrockAgentCoreClient>();
@@ -638,6 +643,20 @@ export async function invokeAgentRuntime(params: {
       // Emit start trace
       controller.enqueue(encoder.encode(`data: ${traceStart}\n\n`));
 
+      // This path buffers the whole runtime response (transformToString) before
+      // emitting anything, so a long agent turn sends zero bytes for minutes.
+      // Keep the connection alive with SSE comment heartbeats so App Runner /
+      // proxies don't drop it. sseData ignores non-`data:` lines.
+      let closed = false;
+      const heartbeat = setInterval(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(`: ping\n\n`));
+        } catch {
+          clearInterval(heartbeat);
+        }
+      }, HARNESS_HEARTBEAT_MS);
+
       try {
         if (response.response) {
           const body = await response.response.transformToString();
@@ -739,9 +758,13 @@ export async function invokeAgentRuntime(params: {
           timestamp: new Date().toISOString(),
         })}\n\n`));
 
+        clearInterval(heartbeat);
+        closed = true;
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "done" })}\n\n`));
         controller.close();
       } catch (err) {
+        clearInterval(heartbeat);
+        closed = true;
         const errMsg = err instanceof Error ? err.message : "Unknown error";
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({
           type: "trace",
@@ -752,6 +775,9 @@ export async function invokeAgentRuntime(params: {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "error", content: errMsg })}\n\n`));
         controller.close();
       }
+    },
+    cancel() {
+      closed = true;
     },
   });
 }
@@ -809,6 +835,22 @@ export async function invokeHarnessAgent(params: {
 
   return new ReadableStream({
     async start(controller) {
+      let closed = false;
+      // A single harness tool call (the agent "researching") can run for minutes
+      // with zero bytes on the wire. App Runner — and most proxies/load balancers —
+      // drop a connection that goes idle, which the browser surfaces as a network
+      // error mid-chat. Emit an SSE comment heartbeat so bytes always flow. The
+      // shared sseData reader only yields `data:` lines, so ": ping" frames are
+      // invisible to every client.
+      const heartbeat = setInterval(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(`: ping\n\n`));
+        } catch {
+          clearInterval(heartbeat);
+        }
+      }, HARNESS_HEARTBEAT_MS);
+
       try {
         let hasEmittedText = false; // Track if we've sent any text content
 
@@ -867,13 +909,22 @@ export async function invokeHarnessAgent(params: {
           }
         }
         // Stream fully exhausted — NOW signal done
+        clearInterval(heartbeat);
+        closed = true;
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "done" })}\n\n`));
         controller.close();
       } catch (err) {
+        clearInterval(heartbeat);
+        closed = true;
         const errMsg = err instanceof Error ? err.message : "Unknown error";
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "error", content: errMsg })}\n\n`));
         controller.close();
       }
+    },
+    cancel() {
+      // Client disconnected (navigated away, closed drawer) — stop the heartbeat
+      // so we don't leak the interval or write to a dead controller.
+      closed = true;
     },
   });
 }
