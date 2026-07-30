@@ -41,6 +41,7 @@ import {
   AttachRolePolicyCommand,
   PutRolePolicyCommand,
 } from "@aws-sdk/client-iam";
+import { buildHarnessModelConfig } from "../src/lib/models/harness-models.mjs";
 
 const args = process.argv.slice(2);
 function getArg(name) {
@@ -429,7 +430,7 @@ console.log("  Creating builder agent harness...");
 const harnessConfig = {
   harnessName: "agentcore_hub_builder",
   executionRoleArn: HARNESS_ROLE_ARN,
-  model: { bedrockModelConfig: { modelId: MODEL_ID } },
+  model: buildHarnessModelConfig(MODEL_ID),
   systemPrompt: [{ text: SYSTEM_PROMPT }],
   tools,
   allowedTools: ["*"],
