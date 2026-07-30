@@ -362,10 +362,22 @@ def upload_file_to_s3(local_path: str, key: str, bucket: str = "", content_type:
         url = resp if isinstance(resp, str) and resp.startswith("http") else None
     if not url:
         return f"ERROR: could not obtain presigned URL: {resp}"
+    # PUT the bytes to the presigned URL. boto3 is the only guaranteed dependency
+    # (requirements.txt), so use urllib from the stdlib rather than httpx/requests
+    # — no NameError if the optional client isn't installed in the image.
+    import urllib.request
     with open(local_path, "rb") as f:
-        r = _httpx.put(url, content=f.read(), headers={"Content-Type": ct}, timeout=300)
-    if r.status_code not in (200, 201):
-        return f"ERROR: presigned PUT failed ({r.status_code}): {r.text[:300]}"
+        req = urllib.request.Request(url, data=f.read(), method="PUT",
+                                     headers={"Content-Type": ct})
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            return f"ERROR: presigned PUT failed ({e.code}): {e.read().decode('utf-8', 'replace')[:300]}"
+        except Exception as e:
+            return f"ERROR: presigned PUT failed: {e}"
+    if code not in (200, 201):
+        return f"ERROR: presigned PUT failed ({code})"
     return f"Uploaded s3://{tgt}/{key} ({size} bytes, {ct}) via presigned URL."
 
 

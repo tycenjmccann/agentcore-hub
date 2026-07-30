@@ -239,7 +239,14 @@ async function createTicket(params) {
         return true; // no assignee to disambiguate — same summary in same run is a dup
       });
       if (dup) {
-        console.log(`[jira-tools] IDEMPOTENT: "${summary}" (${assignee || "unassigned"}) already exists as ${dup.key} in ${workflow_id} — returning existing, not creating a duplicate.`);
+        // The original invocation may have been interrupted after the issue was
+        // created but before its blocker links + initial status were set. If we
+        // returned the bare dup now, the orchestrator would see a ticket missing
+        // the dependencies/state it relies on and could run or wedge it early.
+        // Reconcile (idempotently) before returning.
+        const dupBlockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
+        await reconcileBlockersAndStatus(dup.key, dupBlockers, assignee);
+        console.log(`[jira-tools] IDEMPOTENT: "${summary}" (${assignee || "unassigned"}) already exists as ${dup.key} in ${workflow_id} — reconciled blockers/status, returning existing instead of duplicating.`);
         return { ...mapIssue(dup), deduplicated: true };
       }
     } catch (err) {
@@ -362,8 +369,25 @@ async function createTicket(params) {
 
   const ticketId = created.key;
 
-  // 2. Create blocking links in Jira
+  // 2 + 3. Link blockers and set the initial status. Shared with the dedup path
+  // so an interrupted-then-retried create still ends up fully wired.
   const blockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
+  const status = await reconcileBlockersAndStatus(ticketId, blockers, assignee);
+
+  console.log(`[jira-tools] Created ${ticketId} in Jira. Status: ${status}`);
+  return { ticketId, status, message: `Created ${ticketId}: ${summary}` };
+}
+
+// Bring a ticket to its intended blocker-links + initial status. Idempotent:
+// safe to call on a freshly created ticket OR on one found via the dedup path
+// whose original setup may have been interrupted. Jira issue links dedupe by
+// (type, pair), and re-issuing a transition to the current status is a no-op,
+// so repeated calls converge without side effects.
+//   - blockers present → link each + transition to "Blocked" (prevents a
+//     premature "Ready" webhook before dependencies are done)
+//   - no blockers + has assignee → transition to "Ready" (tells orchestrator to
+//     invoke)
+async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
   for (const blockerKey of blockers) {
     try {
       await jiraFetch("/rest/api/3/issueLink", {
@@ -379,9 +403,6 @@ async function createTicket(params) {
     }
   }
 
-  // 3. Transition in Jira to the correct initial status.
-  //    - If blockers exist: transition to "Blocked" (prevents premature "Ready" webhooks)
-  //    - If no blockers + has assignee: transition to "Ready" (tells orchestrator to invoke)
   const status = blockers.length > 0 ? "blocked" : "todo";
   if (blockers.length > 0) {
     try {
@@ -416,9 +437,7 @@ async function createTicket(params) {
       console.log(`[jira-tools] Could not transition ${ticketId} to Ready: ${err.message}`);
     }
   }
-
-  console.log(`[jira-tools] Created ${ticketId} in Jira. Status: ${status}`);
-  return { ticketId, status, message: `Created ${ticketId}: ${summary}` };
+  return status;
 }
 
 async function transitionTicket(params) {
