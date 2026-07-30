@@ -140,11 +140,13 @@ All tabs should load, all API routes should respond. The dashboard will show 0 a
 
 ### Stage 5: Builder Agent
 
-Deploys the Builder Agent harness — enables the Build page for chat-based agent creation. The script creates the IAM role, deploys the harness, and verifies with a test invocation.
+Deploys the Builder Agent harness — enables the Build page for chat-based agent creation. The script creates the IAM role, auto-provisions an AgentCore Memory store (so past builds inform future ones), deploys the harness, and verifies with a test invocation.
 
 ```bash
 node deploy/setup-builder-agent.mjs
 ```
+
+> Memory is on by default. Pass `--no-memory` for a stateless builder, or `--memory-id <existing>` to reuse a store you already have.
 
 Expected output: `✓ Builder agent responded (XXX chars)`
 
@@ -294,15 +296,21 @@ node deploy/setup-builder-agent.mjs \
   --mcp-url https://api.githubcopilot.com/mcp/ \
   --mcp-url https://my-tools.example.com/mcp
 
-# With memory for persistent context
+# Memory is auto-provisioned by default. To reuse an existing store instead:
 node deploy/setup-builder-agent.mjs \
   --harness-role-arn arn:aws:iam::ACCOUNT:role/YourHarnessRole \
   --mcp-url https://my-tools.example.com/mcp \
   --memory-id my-builder-memory
+
+# Opt out of memory entirely (stateless builder):
+node deploy/setup-builder-agent.mjs \
+  --harness-role-arn arn:aws:iam::ACCOUNT:role/YourHarnessRole \
+  --no-memory
 ```
 
 **What this creates:**
 1. **Builder Agent harness** (`agentcore_hub_builder`) with code_interpreter + any MCP servers you specify
+2. **AgentCore Memory store** (`agentcore_hub_builder_memory`, semantic + summary strategies) wired to the harness — unless `--no-memory`
 
 **Output:**
 ```bash
