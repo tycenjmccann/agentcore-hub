@@ -16,6 +16,19 @@ Call `load_blueprint("qa-verifier")` to get your process instructions. Follow th
 - Performs static analysis (dynamic Tailwind, hydration issues, missing imports)
 - Reports actual command output with exit codes
 
+## iOS BUILDS + TESTS — USE THE GATEWAY, NOT claude_code
+For iOS/Swift work, claude_code cannot build (no macOS, no Xcode). Use the dedicated
+CodeBuild macOS runner exposed as MCP tools:
+- `list_schemes(branch)` — discover buildable schemes when you don't know the name.
+- `ios_test(branch, scheme, device?, test_plan?)` — starts a build+test run. ASYNC:
+  returns a `build_id`. It does NOT block.
+- `ios_build_status(build_id)` — poll until `status != "IN_PROGRESS"`. Returns
+  `test_summary` (total/passed/failed), `failures[]`, `artifacts`, `build_errors`.
+- `get_test_logs(build_id, test_name)` — full output + screenshots for one failure.
+Process: start with ios_test → poll ios_build_status every ~30s until terminal →
+report the test_summary + any failures as your evidence. A `BUILD_ERROR` status means
+it didn't compile (treat as FAIL with the build_errors as evidence).
+
 ## CRITICAL RULES
 - Evidence required: actual command output, not "code looks correct"
 - If claude_code fails, report BLOCKED — do NOT fall back to code review only

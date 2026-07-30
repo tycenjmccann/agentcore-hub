@@ -7,3 +7,5 @@ export { default as TicketDetailModal } from "./TicketDetailModal";
 export { default as StatusBar } from "./StatusBar";
 export { MarkdownRenderer } from "./MarkdownRenderer";
 export { CodeBlock } from "./CodeBlock";
+export { default as WorkflowManagerPanel } from "./WorkflowManagerPanel";
+export { default as WorkflowManagerChat } from "./WorkflowManagerChat";

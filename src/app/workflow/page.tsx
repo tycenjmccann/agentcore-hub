@@ -1,8 +1,9 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical, Archive, Trash2 } from "lucide-react";
+import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical, Archive, Trash2, ClipboardCheck } from "lucide-react";
 import WorkflowBoard from "@/components/workflow/WorkflowBoard";
+import WorkflowManagerChat from "@/components/workflow/WorkflowManagerChat";
 import IntakeForm from "@/components/workflow/IntakeForm";
 import type { WorkflowState, WorkflowInput } from "@/lib/workflow/types";
 import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID } from "@/lib/workflow/workflow-defs";
@@ -40,6 +41,9 @@ export default function WorkflowPage() {
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  // Set when the user clicks "Ask about this run" in the analysis panel.
+  const [chatSeedWorkflowId, setChatSeedWorkflowId] = useState<string | null>(null);
 
   useEffect(() => {
     const stored = localStorage.getItem('workflow-history-collapsed');
@@ -372,7 +376,11 @@ export default function WorkflowPage() {
             <IntakeForm onSubmit={handleSubmit} isLoading={isSubmitting} />
           </div>
         ) : selectedId ? (
-          <WorkflowBoard key={selectedId} workflowId={selectedId} />
+          <WorkflowBoard
+            key={selectedId}
+            workflowId={selectedId}
+            onAskManager={(wfId) => { setChatSeedWorkflowId(wfId); setChatOpen(true); }}
+          />
         ) : (
           <div className="flex flex-col items-center justify-center h-full text-center p-8">
             <div className="w-16 h-16 rounded-full bg-blue-600/10 flex items-center justify-center mb-4">
@@ -416,6 +424,22 @@ export default function WorkflowPage() {
           </div>
         )}
       </div>
+
+      {/* Workflow Manager chat — always-available PM assistant */}
+      <button
+        onClick={() => { setChatSeedWorkflowId(null); setChatOpen(true); }}
+        className="absolute right-5 bottom-5 z-40 flex items-center gap-2 px-4 py-2.5 rounded-full bg-sky-600 text-white text-sm font-medium shadow-lg hover:bg-sky-500 transition-colors"
+        title="Ask the Workflow Manager"
+      >
+        <ClipboardCheck className="w-4 h-4" />
+        <span className="hidden md:inline">Workflow Manager</span>
+      </button>
+      <WorkflowManagerChat
+        open={chatOpen}
+        onClose={() => { setChatOpen(false); setChatSeedWorkflowId(null); }}
+        selectedWorkflowId={selectedId}
+        seedWorkflowId={chatSeedWorkflowId}
+      />
 
       {/* Delete Confirmation Modal */}
       <DeleteConfirmationModal

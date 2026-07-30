@@ -195,7 +195,12 @@ aws iam put-role-policy \
       {
         \"Sid\": \"LambdaInvoke\",
         \"Effect\": \"Allow\",
-        \"Action\": \"lambda:InvokeFunction\",
+        \"Action\": [
+          \"lambda:InvokeFunction\",
+          \"lambda:GetFunctionConcurrency\",
+          \"lambda:PutFunctionConcurrency\",
+          \"lambda:DeleteFunctionConcurrency\"
+        ],
         \"Resource\": \"arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-*\"
       },
       {
@@ -337,7 +342,8 @@ for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE
            JIRA_API_TOKEN JIRA_PROJECT_KEY GITHUB_PAT GITHUB_OWNER GITHUB_REPO \
            MCP_SERVERS BUILDER_AGENT_ID AGENTCORE_ROLE_ARN LAMBDA_ROLE_ARN \
            NEXT_PUBLIC_BRAND_NAME EVAL_CONFIG_TABLE DEPLOY_MODE \
-           WORKFLOW_RUNTIME_COUNT CODING_AGENT_RUNTIME_ARN CLOUD_CODE_TABLE; do
+           WORKFLOW_RUNTIME_COUNT CODING_AGENT_RUNTIME_ARN CLOUD_CODE_TABLE \
+           WORKFLOW_MANAGER_ARN; do
   val="${!var:-}"
   if [[ -n "$val" ]]; then
     escaped="${val//\\/\\\\}"; escaped="${escaped//\"/\\\"}"
@@ -363,7 +369,12 @@ fi
 # place instead of creating a duplicate. Match the service-name segment EXACTLY
 # — a prefix match would also hit e.g. agentcore-hub-frontend/-worker and, since
 # serviceArns ordering isn't guaranteed, could update the wrong service.
-EXISTING_ARN=$(SERVICE_NAME="$SERVICE_NAME" aws ecs list-services --cluster "$CLUSTER" --region "$AWS_REGION" --output json 2>/dev/null \
+# NOTE: a `VAR=val cmd | python3` prefix only exports VAR to `cmd`, NOT to the
+# `python3` on the far side of the pipe — so export it for the whole subshell,
+# else the lookup KeyErrors (swallowed by 2>/dev/null), returns empty, and a
+# re-run wrongly takes the CREATE path and collides with the live service.
+export SERVICE_NAME
+EXISTING_ARN=$(aws ecs list-services --cluster "$CLUSTER" --region "$AWS_REGION" --output json 2>/dev/null \
   | python3 -c "
 import json, os, sys
 want = os.environ['SERVICE_NAME']

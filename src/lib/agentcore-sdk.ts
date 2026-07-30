@@ -800,6 +800,10 @@ export async function invokeHarnessAgent(params: {
   history?: Array<{ role: string; content: string }>;
   region?: string;
   model?: { bedrockModelConfig?: { modelId: string }; openAiModelConfig?: { modelId: string; apiKeyArn: string } };
+  /** Scopes the harness's attached Memory (e.g. a persistent PM agent). */
+  actorId?: string;
+  timeoutSeconds?: number;
+  maxIterations?: number;
 }): Promise<ReadableStream> {
   const region = params.region || DEFAULT_REGION;
   const client = getAgentCoreClient(region);
@@ -827,6 +831,10 @@ export async function invokeHarnessAgent(params: {
     runtimeSessionId: params.sessionId,
     messages,
   };
+
+  if (params.actorId) commandInput.actorId = params.actorId;
+  if (params.timeoutSeconds) commandInput.timeoutSeconds = params.timeoutSeconds;
+  if (params.maxIterations) commandInput.maxIterations = params.maxIterations;
 
   if (params.systemPrompt) {
     commandInput.system = [{ text: params.systemPrompt }];

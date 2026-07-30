@@ -9,16 +9,19 @@ import type {
 import awsIcons from "@/lib/aws-icons.json";
 import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePhaseConfig } from "@/lib/pipeline-config";
 import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
-import { Square } from "lucide-react";
+import { Square, ClipboardCheck } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
 import CancelConfirmationModal from "./CancelConfirmationModal";
 import TicketStatusBadge from "./TicketStatusBadge";
 import TicketDetailModal from "./TicketDetailModal";
+import WorkflowManagerPanel from "./WorkflowManagerPanel";
 import { useWorkflowStream } from "./useWorkflowStream";
 
 interface WorkflowBoardProps {
   workflowId: string;
+  /** Opens the Workflow Manager chat drawer scoped to this run. */
+  onAskManager?: (workflowId: string) => void;
 }
 
 // ─── Phase Order (derived from the running workflow's def) ───────────────────
@@ -82,9 +85,27 @@ function applyEventToState(s: WorkflowState, event: WorkflowEvent): WorkflowStat
   }
 }
 
+// A one-line, human-readable label for a Workflow Manager board toast.
+function managerPulseText(
+  event: Extract<WorkflowEvent, { type: "manager_intervention" | "manager_escalation" }>
+): string {
+  if (event.type === "manager_escalation") {
+    return `Workflow Manager escalated: ${event.message || "needs a human decision"}`;
+  }
+  const action = event.action || "acted";
+  const label: Record<string, string> = {
+    unstick: "unstuck a stalled ticket",
+    retry: "retried a failed agent",
+    comment: "commented on a ticket",
+    escalate: "escalated an issue",
+  };
+  const what = label[action] || `ran "${action}"`;
+  return `Workflow Manager ${what}${event.ticketId ? ` (${event.ticketId})` : ""}`;
+}
+
 // ─── Component ───────────────────────────────────────────────────────────────
 
-export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
+export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoardProps) {
   const [state, setState] = useState<WorkflowState | null>(null);
 
   // Phases + ordering are derived from the running workflow's definition so the
@@ -99,6 +120,8 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
   const phaseOrderRef = useRef(phaseOrder);
   phaseOrderRef.current = phaseOrder;
   const [celebrating, setCelebrating] = useState(false);
+  // Workflow Manager watchdog toggle for this run (default on).
+  const [managerWatch, setManagerWatch] = useState(true);
   const [expandedAgent, setExpandedAgent] = useState<string | null>(null);
   // Full agent output fetched directly from DDB (independent of replay scrubber)
   const [agentFullOutput, setAgentFullOutput] = useState<Record<string, string>>({});
@@ -123,6 +146,8 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
 
   // Nudge pulse effect — hot pink full-screen flash during replay
   const [nudgePulse, setNudgePulse] = useState(false);
+  // Workflow Manager intervention/escalation — sky toast on the board.
+  const [managerPulse, setManagerPulse] = useState<string | null>(null);
 
   // Catch-up replay state for live/in-progress workflows
   const [catchingUp, setCatchingUp] = useState(false);
@@ -466,6 +491,10 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
       // Hot pink full-screen pulse for nudge events
       setNudgePulse(true);
       setTimeout(() => setNudgePulse(false), 1500);
+    } else if (event.type === "manager_intervention" || event.type === "manager_escalation") {
+      // Sky pulse + toast when the Workflow Manager acts on this run.
+      setManagerPulse(managerPulseText(event));
+      setTimeout(() => setManagerPulse(null), 4000);
     }
   }, []);
 
@@ -721,6 +750,19 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
           });
         }
         break;
+      case "nudge":
+        // Live nudge pulse — matches fireReplayVisuals so a nudge surfaces as it
+        // happens, not only on replay scrub.
+        setNudgePulse(true);
+        setTimeout(() => setNudgePulse(false), 1500);
+        break;
+      case "manager_intervention":
+      case "manager_escalation":
+        // Sky pulse + toast the moment the Workflow Manager unsticks/retries/
+        // comments/escalates a live run (previously only fired in replay).
+        setManagerPulse(managerPulseText(event));
+        setTimeout(() => setManagerPulse(null), 4000);
+        break;
       default:
         break;
     }
@@ -830,6 +872,31 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
       if (manualStaleAgents.size > 0) setManualStaleAgents(new Set());
     }
   }, [state, streamingText, isStale, manualStaleAgents]);
+
+  // Load the Workflow Manager watch flag for this run.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/workflow/${workflowId}/watch`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (!cancelled && d && typeof d.watch === "boolean") setManagerWatch(d.watch); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [workflowId]);
+
+  const toggleManagerWatch = useCallback(async () => {
+    const next = !managerWatch;
+    setManagerWatch(next); // optimistic
+    try {
+      const res = await fetch(`/api/workflow/${workflowId}/watch`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ watch: next }),
+      });
+      if (!res.ok) setManagerWatch(!next); // revert on failure
+    } catch {
+      setManagerWatch(!next);
+    }
+  }, [managerWatch, workflowId]);
 
   useEffect(() => {
     if (!state || state.phase === "complete" || state.phase === "error" || replayMode) return;
@@ -1065,6 +1132,14 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
         <div className="nudge-pulse-overlay" />
       )}
 
+      {/* Workflow Manager toast — surfaces watch-mode interventions/escalations */}
+      {managerPulse && (
+        <div className="wm-pulse-toast" role="status">
+          <ClipboardCheck className="w-4 h-4" />
+          <span>{managerPulse}</span>
+        </div>
+      )}
+
       {/* Fallback top banner — only for gates we couldn't place on a phase card. */}
       {unplacedReviews.length > 0 && (
         <div className="review-banner" role="status">
@@ -1160,12 +1235,27 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
           </div>
 
 
-          {/* Cancel button — only show for active (non-terminal) workflows */}
+          {/* Manager watch toggle + Cancel — only for active (non-terminal) workflows */}
+          {state && state.phase !== "complete" && state.phase !== "error" && state.phase !== "cancelled" && (
+            <button
+              onClick={toggleManagerWatch}
+              className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium border transition-all duration-150 ${
+                managerWatch
+                  ? "border-sky-500/50 text-sky-400 bg-sky-500/10 hover:bg-sky-500/20"
+                  : "border-zinc-600/50 text-zinc-500 hover:text-zinc-400 hover:border-zinc-500/60"
+              }`}
+              title={managerWatch ? "Workflow Manager is watching this run — click to disable" : "Workflow Manager watch is off — click to enable"}
+              aria-pressed={managerWatch}
+            >
+              <ClipboardCheck className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">{managerWatch ? "Manager watching" : "Manager off"}</span>
+            </button>
+          )}
           {state && state.phase !== "complete" && state.phase !== "error" && state.phase !== "cancelled" && (
             <button
               onClick={() => { setCancelError(null); setShowCancelModal(true); }}
               disabled={cancelLoading}
-              className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium border border-red-500/40 text-red-400 hover:border-red-500/60 hover:bg-red-500/10 hover:text-red-300 active:border-red-500/80 active:bg-red-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-150"
+              className="shrink-0 ml-2 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium border border-red-500/40 text-red-400 hover:border-red-500/60 hover:bg-red-500/10 hover:text-red-300 active:border-red-500/80 active:bg-red-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-150"
               aria-label="Cancel workflow"
               title="Cancel workflow"
             >
@@ -1466,6 +1556,10 @@ export default function WorkflowBoard({ workflowId }: WorkflowBoardProps) {
           </div>
         </div>
 
+        {/* Workflow Manager — per-run analysis (terminal runs only) */}
+        {(state.phase === "complete" || state.phase === "cancelled" || state.phase === "error") && (
+          <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} />
+        )}
 
         {/* Agent Output Pop-Out Card */}
         <AgentOutputPanel
@@ -1717,4 +1811,6 @@ export const PIPELINE_STYLES = `
 
 .nudge-pulse-overlay{position:fixed;inset:0;z-index:9999;pointer-events:none;animation:nudgePulse 1.5s ease-out forwards}
 @keyframes nudgePulse{0%{background:rgba(236,72,153,0.35);box-shadow:inset 0 0 120px rgba(236,72,153,0.6)}30%{background:rgba(236,72,153,0.15);box-shadow:inset 0 0 60px rgba(236,72,153,0.3)}100%{background:transparent;box-shadow:none}}
+.wm-pulse-toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:9999;display:flex;align-items:center;gap:8px;max-width:min(560px,90vw);padding:10px 16px;border-radius:10px;background:rgba(14,165,233,0.14);border:1px solid rgba(14,165,233,0.5);color:#7dd3fc;font-size:13px;font-weight:500;box-shadow:0 8px 24px rgba(0,0,0,0.4);animation:wmToast 4s ease-out forwards}
+@keyframes wmToast{0%{opacity:0;transform:translate(-50%,-12px)}8%{opacity:1;transform:translate(-50%,0)}90%{opacity:1}100%{opacity:0}}
 `;

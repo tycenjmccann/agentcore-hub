@@ -95,6 +95,22 @@ export function transformEvent(
         timestamp,
       });
 
+    case "manager.intervention":
+      return base({
+        type: "manager_intervention",
+        action: detail.action,
+        ticketId: detail.ticketId,
+        note: detail.note,
+        timestamp,
+      });
+
+    case "manager.escalation":
+      return base({
+        type: "manager_escalation",
+        message: detail.message,
+        timestamp,
+      });
+
     default:
       return base({ type: eventType, ...detail, timestamp });
   }
