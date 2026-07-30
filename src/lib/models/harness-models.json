@@ -6,7 +6,7 @@
       "id": "claude-fable-5",
       "label": "Claude Fable 5 (Recommended)",
       "provider": "bedrock",
-      "modelId": "claude-fable-5",
+      "modelId": "us.anthropic.claude-fable-5",
       "apiFormat": "converse_stream",
       "description": "Most capable general model. Native Converse; handles tool loops + prefill.",
       "isDefault": true
