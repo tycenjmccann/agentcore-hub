@@ -545,7 +545,7 @@ Every agent invocation is evaluated by 10 criteria (tool selection, instruction 
 ### One-Command Setup
 
 ```bash
-export DEPLOYMENT_URL=https://your-app.us-east-1.awsapprunner.com
+export DEPLOYMENT_URL=https://your-service.ecs.us-east-1.on.aws
 cd deploy/continuous-improvement
 ./deploy-all.sh
 ```
@@ -595,45 +595,41 @@ This creates:
 
 ### Deployment Options
 
-#### Option A: AWS App Runner + ECR (Recommended)
+#### Option A: Amazon ECS Express Mode + ECR (Recommended)
 
-This is the default deployment method — no load balancer config, auto-scaling built-in.
+One script provisions everything — ECR repo, the three IAM roles, a Docker
+build+push, and an ECS Express Mode service (Fargate + Application Load Balancer
++ auto scaling + a public `https://<service>.ecs.<region>.on.aws` URL). This is
+AWS's recommended path now that **App Runner is closed to new customers and is
+being sunset (April 30, 2026)** — see the [App Runner availability change](https://docs.aws.amazon.com/apprunner/latest/dg/apprunner-availability-change.html).
+Express Mode is the named successor and preserves App Runner's operational
+simplicity.
 
 ```bash
-# 1. Create ECR repository (once)
-aws ecr create-repository --repository-name agentcore-hub-hub --region us-east-1
-
-# 2. Authenticate Docker to ECR
-aws ecr get-login-password --region us-east-1 | \
-  docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
-
-# 3. Build and push
-docker build --platform linux/amd64 -t agentcore-hub-hub:latest .
-docker tag agentcore-hub-hub:latest <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/agentcore-hub-hub:latest
-docker push <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/agentcore-hub-hub:latest
-
-# 4. Create App Runner service (first time — or use AWS Console)
-aws apprunner create-service \
-  --service-name agentcore-hub-hub \
-  --source-configuration '{
-    "ImageRepository": {
-      "ImageIdentifier": "<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/agentcore-hub-hub:latest",
-      "ImageConfiguration": {"Port": "8080"},
-      "ImageRepositoryType": "ECR"
-    },
-    "AutoDeploymentsEnabled": false,
-    "AuthenticationConfiguration": {
-      "AccessRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/AgentCoreHubAppRunnerECRAccess"
-    }
-  }' \
-  --instance-configuration '{"InstanceRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/AgentCoreHubAppRunnerInstanceRole"}' \
-  --region us-east-1
-
-# 5. Subsequent deploys — build, push, then:
-aws apprunner start-deployment \
-  --service-arn <SERVICE_ARN> \
-  --region us-east-1
+# Prereqs: AWS CLI v2 >= 2.34, Docker running, a default VPC with public subnets
+# in AWS_REGION, and .env.local populated (runtime env vars are forwarded in).
+./deploy/ecs-express/deploy.sh
 ```
+
+The script is idempotent: re-running it rebuilds the image and updates the
+existing service in place (found by name in the `default` cluster). It writes the
+resulting public URL back to `.env.local` as `DEPLOYMENT_URL`.
+
+**Roles it creates** (execution vs task vs infrastructure are distinct — do not
+conflate them):
+- `ecsTaskExecutionRole` — ECS pulls the image + writes logs (managed policy `AmazonECSTaskExecutionRolePolicy`)
+- `ecsInfrastructureRoleForExpressServices` — ECS provisions the ALB/scaling (managed policy `AmazonECSInfrastructureRoleforExpressGatewayServices`)
+- `agentcore-hub-ecs-task` — **the app's own** runtime permissions (DynamoDB, S3, Bedrock, AgentCore, Secrets Manager, CloudWatch); this is the direct successor to the App Runner instance role
+
+**Tuning knobs** (env vars, all optional): `EXPRESS_CPU` (CPU units, default
+`1024` = 1 vCPU), `EXPRESS_MEMORY` (MiB, default `2048` = 2 GB — must be a valid
+Fargate combo with the CPU), `EXPRESS_SUBNETS` + `EXPRESS_SECURITY_GROUPS`
+(comma-separated — only needed if you have no usable default VPC),
+`EXPRESS_CLUSTER` (default `default`).
+
+> **Redeploys replace running tasks.** `update-express-gateway-service` rolls out
+> a new task set; env var / secret changes take effect only on that new
+> deployment (no hot-reload). The script does this automatically on every run.
 
 **Build-time configuration:**
 
@@ -651,7 +647,12 @@ The `Dockerfile` uses a multi-stage build with a non-root `nextjs` user. The fol
 RUN mkdir -p /app/.next/cache && chown -R nextjs:nodejs /app/.next/cache
 ```
 
-Without this, Next.js cannot write its ISR/fetch cache at runtime, which causes EACCES errors that destabilize the process and make App Runner health checks fail (resulting in rollback after ~19 minutes).
+Without this, Next.js cannot write its ISR/fetch cache at runtime, which causes EACCES errors that destabilize the process and make the ALB health check fail (the deployment circuit breaker then rolls the service back).
+
+Also critical for any container host (baked into the Dockerfile + set by the
+deploy script): `HOSTNAME=0.0.0.0` and `PORT=8080`. Next.js standalone binds to
+whatever `HOSTNAME` resolves to, and some hosts inject their own at launch — pin
+it to all-interfaces or the health check on `:8080` never passes.
 
 **Deployment troubleshooting:**
 
@@ -659,14 +660,16 @@ Without this, Next.js cannot write its ISR/fetch cache at runtime, which causes 
 |---------|-------|-----|
 | Health check fails, app logs show `EACCES: permission denied, mkdir '/app/.next/cache'` | Cache dir not writable by nextjs user | Add the `mkdir`/`chown` line above |
 | Health check fails, app logs show repeating error loops (e.g. DDB query errors) | A background process (SSE stream, polling) crashes the Node.js process | Fix the error in the offending route — error loops destabilize the container |
-| Deployment takes >10 min then rolls back | Health check is failing repeatedly (5 consecutive failures × 10s interval, retried across instances) | Check `/aws/apprunner/.../application` logs — look for repeating errors, not just the service-level "Health check failed" message |
-| Deployment succeeds in ~4 min | Normal | — |
+| ALB returns 502 Bad Gateway | Container not listening on `:8080`, or `HOSTNAME` not `0.0.0.0` | Verify the two env vars above; check the task's CloudWatch logs |
+| Service stuck deploying then rolls back | Health check failing on the new task set | `aws ecs describe-express-gateway-service --service-arn <arn>`; check stopped-task reasons in the ECS console |
+| `AccessDeniedException` on AWS calls from the app | Perms on the execution role instead of the **task** role | Ensure `agentcore-hub-ecs-task` carries the runtime policy (the deploy script does this) |
 
-**Required IAM roles:**
-- `AgentCoreHubAppRunnerECRAccess` — allows App Runner to pull from ECR (trust: `build.apprunner.amazonaws.com`)
-- `AgentCoreHubAppRunnerInstanceRole` — runtime permissions (DynamoDB, Bedrock, Lambda invoke, S3, CloudWatch Logs, BedrockAgentCore)
+**Required IAM roles** (all created by `deploy/ecs-express/deploy.sh`):
+- `ecsTaskExecutionRole` — ECS pulls the image + writes logs
+- `ecsInfrastructureRoleForExpressServices` — ECS provisions the ALB + auto scaling
+- `agentcore-hub-ecs-task` — the app's runtime permissions (DynamoDB, Bedrock, Lambda invoke, S3, CloudWatch Logs, BedrockAgentCore, Secrets Manager)
 
-Set environment variables on the App Runner service (via Console or `update-service`):
+The deploy script forwards runtime env vars from `.env.local` into the container automatically. If setting them by hand elsewhere:
 - `TICKET_PROVIDER=jira` (or `dynamodb`)
 - `WORKFLOWS_TABLE=agentcore-hub-workflows`
 - `EVENTS_TABLE=agentcore-hub-events`
@@ -707,16 +710,30 @@ If you already have a hosted Next.js or React app:
 4. Add the IAM permissions below to your existing compute role
 5. No additional credential configuration needed — uses whatever role your app already runs as
 
+#### Option E: AWS App Runner (legacy — existing customers only)
+
+> App Runner is **closed to new customers** and being sunset (April 30, 2026).
+> Only use this if your account already runs an App Runner service; new deploys
+> should use Option A (ECS Express Mode). See the [availability change notice](https://docs.aws.amazon.com/apprunner/latest/dg/apprunner-availability-change.html).
+
+The original App Runner script is preserved at `deploy/apprunner/deploy.sh` for
+existing users. It creates the ECR repo, the `AppRunnerECRAccessRole` +
+`agentcore-hub-apprunner-instance` roles, builds + pushes, and creates/updates
+the service. To migrate to Express Mode, AWS recommends a blue/green DNS cutover
+(run both, shift traffic via Route 53 weighted records); the [migration guide](https://docs.aws.amazon.com/apprunner/latest/dg/apprunner-availability-change.html)
+has the steps.
+
 ### SSE Proxy Considerations
 
 The workflow UI relies on Server-Sent Events (`/api/workflow/[id]/stream`) for real-time event streaming. SSE requires an unbuffered, long-lived HTTP connection — most reverse proxies break this by default. The response sets `X-Accel-Buffering: no` and `Content-Encoding: identity` to handle nginx-style proxies, but some platforms need additional config:
 
 | Platform | SSE works out of the box? | Required config |
 |----------|---------------------------|-----------------|
-| **App Runner** (Option A) | Yes | None — Envoy honors response headers |
+| **ECS Express Mode** (Option A) | Yes, with config | Runs behind a managed ALB — raise the ALB `idle_timeout` to `>= 3600` (default 60s kills long SSE connections). Set it on the Express service's load balancer in the EC2 console. |
 | **Amplify Hosting** (Option B) | Yes | None — runs behind CloudFront with origin-shield bypass |
 | **ECS/Fargate behind ALB** (Option C) | Yes, with config | Set ALB `IdleTimeout >= 3600` (default 60s kills SSE) |
 | **Lambda Web Adapter** (Option C) | Limited | Use Lambda function URL with `RESPONSE_STREAM` invocation. API Gateway buffers and has 30s timeout — **don't put SSE behind API Gateway** |
+| **App Runner** (Option E, legacy) | Yes | None — Envoy honors response headers |
 | **EKS with ingress-nginx** | Yes, with annotation | Add `nginx.ingress.kubernetes.io/proxy-buffering: "off"` to the ingress |
 | **CloudFront** in front of any origin | No | CloudFront buffers + has 30s idle timeout. Route SSE endpoints around CloudFront (separate path → ALB direct) |
 | **Cloudflare** in front | Yes, with rule | Add a Cache Rule that bypasses cache for `/api/workflow/*/stream` |
