@@ -44,9 +44,23 @@ NAME="agentcore-hub-workflow-output"
 
 echo "=== Creating deployment zip ==="
 rm -f function.zip
-# index.mjs only imports AWS SDK modules, which are available in the
-# nodejs20.x runtime — no node_modules needed.
-zip -q function.zip index.mjs
+# @aws-sdk/s3-request-presigner is NOT guaranteed in the nodejs20.x runtime
+# bundle, and a missing ESM import crashes the whole function — so vendor it
+# (npm install writes node_modules here) and ship it in the zip. The other
+# @aws-sdk/client-* imports are runtime-provided.
+#
+# If install fails (e.g. registry outage) we must ABORT, not ship a bundle
+# without node_modules — that would replace the live Lambda with one whose
+# top-level presigner import cannot resolve, breaking every operation at init.
+if [ -f package.json ]; then
+  npm install --omit=dev --silent >/dev/null 2>&1 || npm install --production --silent >/dev/null 2>&1
+  if [ ! -d node_modules/@aws-sdk/s3-request-presigner ]; then
+    echo "  ✗ npm install did not produce @aws-sdk/s3-request-presigner — aborting" >&2
+    echo "    (shipping index.mjs without it would crash the function at init)" >&2
+    exit 1
+  fi
+fi
+zip -qr function.zip index.mjs node_modules
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"

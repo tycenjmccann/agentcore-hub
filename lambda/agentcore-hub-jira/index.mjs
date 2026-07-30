@@ -218,6 +218,44 @@ async function createTicket(params) {
     );
   }
 
+  // ─── Idempotency guard ───────────────────────────────────────────────────
+  // create_ticket has no natural idempotency, so any repeat (a model retry, an
+  // agentic-loop replay, a redelivered invocation) silently creates a full
+  // duplicate ticket plan. Before creating, look for an existing ticket in the
+  // same workflow with the same summary + assignee; if found, return it instead
+  // of making a copy. Keyed on the wf:<id> label so it only dedupes within a run.
+  if (workflow_id && summary) {
+    try {
+      const jql = `project = ${PROJECT_KEY} AND labels = "wf:${workflow_id}" AND summary ~ "\\"${summary.replace(/"/g, '\\"')}\\"" ORDER BY created ASC`;
+      const existingSearch = await jiraSearch(jql, ["summary", "status", "labels", "assignee", "issuetype", "parent"], 5);
+      const wantAgentLabel = assignee && !isHumanReviewer ? `agent:${assignee}` : null;
+      const wantReviewerLabel = isHumanReviewer ? `reviewer:${assignee.slice("human:".length)}` : null;
+      const dup = (existingSearch.issues || []).find((iss) => {
+        const s = (iss.fields?.summary || "").trim();
+        if (s !== summary.trim()) return false; // summary ~ is fuzzy; require exact
+        const labs = iss.fields?.labels || [];
+        if (wantAgentLabel) return labs.includes(wantAgentLabel);
+        if (wantReviewerLabel) return labs.includes(wantReviewerLabel);
+        return true; // no assignee to disambiguate — same summary in same run is a dup
+      });
+      if (dup) {
+        // The original invocation may have been interrupted after the issue was
+        // created but before its blocker links + initial status were set. If we
+        // returned the bare dup now, the orchestrator would see a ticket missing
+        // the dependencies/state it relies on and could run or wedge it early.
+        // Reconcile (idempotently) before returning.
+        const dupBlockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
+        await reconcileBlockersAndStatus(dup.key, dupBlockers, assignee);
+        console.log(`[jira-tools] IDEMPOTENT: "${summary}" (${assignee || "unassigned"}) already exists as ${dup.key} in ${workflow_id} — reconciled blockers/status, returning existing instead of duplicating.`);
+        return { ...mapIssue(dup), deduplicated: true };
+      }
+    } catch (err) {
+      // Never let the dedupe check block creation — fail open.
+      console.warn(`[jira-tools] idempotency check failed (proceeding to create): ${err.message}`);
+    }
+  }
+  // ─── End idempotency guard ─────────────────────────────────────────────────
+
   // Assignee is carried as a label (Jira's assignee field needs an accountId).
   // Human-review gates use a "reviewer:<who>" label + a "human-review" marker so
   // the orchestrator recognizes them and parks instead of invoking an agent.
@@ -241,7 +279,29 @@ async function createTicket(params) {
     "bug": "Bug",
   };
   const requestedType = (issue_type || "Task").toString().trim();
-  const canonicalType = ISSUE_TYPE_ALIASES[requestedType.toLowerCase()] || requestedType;
+  let canonicalType = ISSUE_TYPE_ALIASES[requestedType.toLowerCase()] || requestedType;
+
+  // Jira forbids a Subtask whose parent is an Epic (subtasks may only live under
+  // standard issue types). Intake agents plan phase tickets as children of the
+  // run's Epic, so a Subtask request there is always invalid — Jira 400s it, the
+  // agent then retries WITHOUT a parent, and the resulting orphan is invisible to
+  // both the orchestrator's epic->children unblock cascade and the nudge/unstick
+  // tool, wedging the whole run. Coerce Subtask->Task when the parent is an Epic
+  // so the ticket is created correctly as an Epic child on the first try.
+  if (canonicalType === "Subtask" && parent_key) {
+    try {
+      const parent = await jiraFetch(`/rest/api/3/issue/${parent_key}?fields=issuetype`);
+      const parentType = (parent?.fields?.issuetype?.name || "").toLowerCase();
+      if (parentType === "epic") {
+        console.log(`[jira-tools] parent ${parent_key} is an Epic — coercing Subtask -> Task (Jira forbids subtask-of-Epic) so the child isn't orphaned.`);
+        canonicalType = "Task";
+      }
+    } catch (err) {
+      // Can't confirm parent type — coerce anyway; an orphan is worse than a Task.
+      console.warn(`[jira-tools] could not read parent ${parent_key} issuetype (${err.message}); coercing Subtask -> Task to avoid orphaning.`);
+      canonicalType = "Task";
+    }
+  }
 
   const fields = {
     project: { key: PROJECT_KEY },
@@ -277,16 +337,57 @@ async function createTicket(params) {
     fields.parent = { key: parent_key };
   }
 
-  // 1. Create in Jira
-  const created = await jiraFetch("/rest/api/3/issue", {
-    method: "POST",
-    body: JSON.stringify({ fields }),
-  });
+  // 1. Create in Jira. If the type/parent combo is still rejected, retry ONCE as
+  // a Task while KEEPING the parent — never drop the parent, since an orphaned
+  // ticket silently breaks the unblock cascade. Only drop the parent as a last
+  // resort if even the parented Task is refused.
+  let created;
+  try {
+    created = await jiraFetch("/rest/api/3/issue", {
+      method: "POST",
+      body: JSON.stringify({ fields }),
+    });
+  } catch (err) {
+    const isTypeParentErr = /issuetype|parent|subtask|hierarchy/i.test(err.message || "");
+    if (!isTypeParentErr || fields.issuetype.name === "Task") throw err;
+    console.warn(`[jira-tools] create failed (${err.message}); retrying as Task with parent ${parent_key} kept.`);
+    fields.issuetype = { name: "Task" };
+    try {
+      created = await jiraFetch("/rest/api/3/issue", {
+        method: "POST",
+        body: JSON.stringify({ fields }),
+      });
+    } catch (err2) {
+      console.error(`[jira-tools] parented Task retry also failed (${err2.message}); creating parentless as last resort — this ticket will need manual linking.`);
+      delete fields.parent;
+      created = await jiraFetch("/rest/api/3/issue", {
+        method: "POST",
+        body: JSON.stringify({ fields }),
+      });
+    }
+  }
 
   const ticketId = created.key;
 
-  // 2. Create blocking links in Jira
+  // 2 + 3. Link blockers and set the initial status. Shared with the dedup path
+  // so an interrupted-then-retried create still ends up fully wired.
   const blockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
+  const status = await reconcileBlockersAndStatus(ticketId, blockers, assignee);
+
+  console.log(`[jira-tools] Created ${ticketId} in Jira. Status: ${status}`);
+  return { ticketId, status, message: `Created ${ticketId}: ${summary}` };
+}
+
+// Bring a ticket to its intended blocker-links + initial status. Idempotent:
+// safe to call on a freshly created ticket OR on one found via the dedup path
+// whose original setup may have been interrupted. Jira issue links dedupe by
+// (type, pair), and re-issuing a transition to the current status is a no-op,
+// so repeated calls converge without side effects.
+//   - blockers present → link each + transition to "Blocked" (prevents a
+//     premature "Ready" webhook before dependencies are done)
+//   - no blockers + has assignee → transition to "Ready" (tells orchestrator to
+//     invoke)
+async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
   for (const blockerKey of blockers) {
     try {
       await jiraFetch("/rest/api/3/issueLink", {
@@ -302,9 +403,6 @@ async function createTicket(params) {
     }
   }
 
-  // 3. Transition in Jira to the correct initial status.
-  //    - If blockers exist: transition to "Blocked" (prevents premature "Ready" webhooks)
-  //    - If no blockers + has assignee: transition to "Ready" (tells orchestrator to invoke)
   const status = blockers.length > 0 ? "blocked" : "todo";
   if (blockers.length > 0) {
     try {
@@ -339,9 +437,7 @@ async function createTicket(params) {
       console.log(`[jira-tools] Could not transition ${ticketId} to Ready: ${err.message}`);
     }
   }
-
-  console.log(`[jira-tools] Created ${ticketId} in Jira. Status: ${status}`);
-  return { ticketId, status, message: `Created ${ticketId}: ${summary}` };
+  return status;
 }
 
 async function transitionTicket(params) {

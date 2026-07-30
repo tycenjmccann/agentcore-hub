@@ -322,28 +322,100 @@ def download_s3_file(key: str, bucket: str = "") -> str:
 # ─── S3 Storage Tools ─────────────────────────────────────────────────────────
 
 @tool
-def S3Storage___read_object(key: str, bucket: str = "") -> str:
-    """Read a TEXT object from S3. Returns the object content as text. For images/binary files, use download_s3_file instead.
+def upload_file_to_s3(local_path: str, key: str, bucket: str = "", content_type: str = "") -> str:
+    """Upload a LOCAL FILE of ANY media type (image, video, audio, PDF, zip, text)
+    to S3, directly usable — this is the ONE tool to deliver binary artifacts.
+
+    It handles everything for you: detects the MIME type from the extension,
+    and picks the right transport by size (small files go base64 inline; large
+    files stream over a presigned URL, bypassing the Lambda payload limit). Do
+    NOT hand-roll base64 or write ".b64" sidecar files — just give the local
+    path and the destination key.
 
     Args:
-        key: Object key/path in the bucket
-        bucket: S3 bucket name (defaults to the team artifact bucket)
+        local_path: Path to the file on the local filesystem (e.g. /tmp/thumb.png)
+        key: Destination S3 object key (e.g. workflows/<wf>/shared/thumb.png)
+        bucket: S3 bucket (defaults to the team artifact bucket)
+        content_type: Optional MIME override; inferred from extension if omitted
+
+    Returns:
+        A confirmation string with the s3:// location and byte count.
     """
-    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "S3Storage___read_object", {"bucket": bucket or ARTIFACT_BUCKET, "key": key})
+    import os, base64, mimetypes, json as _json
+    if not os.path.exists(local_path):
+        return f"ERROR: local file not found: {local_path}"
+    ct = content_type or mimetypes.guess_type(local_path)[0] or "application/octet-stream"
+    size = os.path.getsize(local_path)
+    tgt = bucket or ARTIFACT_BUCKET
+    # base64 inflates ~33%; keep inline writes well under the 6MB Lambda-invoke
+    # ceiling. Larger files go over a presigned PUT (no size limit).
+    if size <= 3_500_000:
+        with open(local_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "S3Storage___write_object", {
+            "bucket": tgt, "key": key, "content": b64, "content_type": ct, "encoding": "base64"})
+    resp = _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "S3Storage___presign_url", {
+        "bucket": tgt, "key": key, "operation": "put", "content_type": ct})
+    try:
+        url = _json.loads(resp)["url"] if isinstance(resp, str) else resp["url"]
+    except Exception:
+        url = resp if isinstance(resp, str) and resp.startswith("http") else None
+    if not url:
+        return f"ERROR: could not obtain presigned URL: {resp}"
+    # PUT the bytes to the presigned URL. boto3 is the only guaranteed dependency
+    # (requirements.txt), so use urllib from the stdlib rather than httpx/requests
+    # — no NameError if the optional client isn't installed in the image.
+    import urllib.request
+    with open(local_path, "rb") as f:
+        req = urllib.request.Request(url, data=f.read(), method="PUT",
+                                     headers={"Content-Type": ct})
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            return f"ERROR: presigned PUT failed ({e.code}): {e.read().decode('utf-8', 'replace')[:300]}"
+        except Exception as e:
+            return f"ERROR: presigned PUT failed: {e}"
+    if code not in (200, 201):
+        return f"ERROR: presigned PUT failed ({code})"
+    return f"Uploaded s3://{tgt}/{key} ({size} bytes, {ct}) via presigned URL."
 
 
 @tool
-def S3Storage___write_object(key: str, content: str, bucket: str = "", content_type: str = "text/plain") -> str:
-    """Write content to an S3 object.
+def S3Storage___read_object(key: str, bucket: str = "", encoding: str = "text") -> str:
+    """Read an object from S3. Text by default. For binary files (images, PDFs,
+    audio, video) either set encoding="base64" to get the raw bytes back
+    base64-encoded, or use download_s3_file to save it locally for image_reader.
 
     Args:
         key: Object key/path in the bucket
-        content: Content to write
         bucket: S3 bucket name (defaults to the team artifact bucket)
-        content_type: MIME type of the content
+        encoding: "text" (default) or "base64" for binary-safe reads
+    """
+    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "S3Storage___read_object",
+        {"bucket": bucket or ARTIFACT_BUCKET, "key": key, "encoding": encoding})
+
+
+@tool
+def S3Storage___write_object(key: str, content: str, bucket: str = "", content_type: str = "text/plain", encoding: str = "text") -> str:
+    """Write content to an S3 object. Handles both text and binary (images, PDFs, zips).
+
+    For BINARY files (PNG/JPG/PDF/etc.): base64-encode the raw bytes, pass that
+    string as `content`, set `encoding="base64"`, and set the real MIME type
+    (e.g. content_type="image/png"). The bytes are decoded back to binary before
+    storage, so the object is a real, directly-usable file — NOT a .b64 sidecar.
+    Do NOT write raw binary as text; the string transport corrupts any byte > 0x7F.
+
+    Args:
+        key: Object key/path in the bucket
+        content: Text content, OR base64 of the raw bytes when encoding="base64"
+        bucket: S3 bucket name (defaults to the team artifact bucket)
+        content_type: MIME type of the object (e.g. "image/png", "application/pdf")
+        encoding: "text" (default) or "base64" for binary files
     """
     return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "S3Storage___write_object", {
-        "bucket": bucket or ARTIFACT_BUCKET, "key": key, "content": content, "content_type": content_type
+        "bucket": bucket or ARTIFACT_BUCKET, "key": key, "content": content,
+        "content_type": content_type, "encoding": encoding,
     })
 
 
@@ -374,15 +446,23 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
       3. create_ticket(assignee="agentcore_hub_qa_verifier", blocked_by="TEAM-102")  ← ALWAYS
       4. create_ticket(assignee="agentcore_hub_ci_agent", blocked_by="TEAM-103")     ← ALWAYS
 
+    TICKET TYPE — pick by what the PARENT is (this is the #1 thing to get right):
+      - Parent is an EPIC  → ticket_type="task"     (the DEFAULT — almost every run)
+      - Parent is a BUG    → ticket_type="subtask"   (bug-fix runs ONLY)
+    Every feature/marketing/legal/sales workflow is rooted on an Epic, so its
+    phase tickets are ALWAYS "task". Only a bug-fix workflow is rooted on a Bug,
+    and only then are its children "subtask". Jira REJECTS the wrong pairing
+    (task→Bug and subtask→Epic both fail), which silently orphans the ticket and
+    wedges the whole run. When unsure, the parent is an Epic → use "task".
+
     Args:
         title: Ticket title/summary
         description: Detailed description with requirements and acceptance criteria
         parent_id: Parent ticket key (e.g., "TEAM-1492"). Required for child tickets.
-            For bug-fix flows this must be the parent Bug's key — Jira requires
-            sub-tasks of a Bug to use issue_type=subtask, not task.
         assignee: Agent ID to assign to (e.g., agentcore_hub_frontend_dev, agentcore_hub_backend_dev, agentcore_hub_qa_verifier, agentcore_hub_ci_agent)
-        ticket_type: One of "epic", "story", "task", or "subtask".
-            Use "subtask" + a parent_id when the parent is a Bug (Jira rejects task→bug).
+        ticket_type: "task" when the parent is an Epic (default, use this unless the
+            parent is a Bug). "subtask" ONLY when the parent is a Bug. Also valid:
+            "epic", "story". Do NOT use "subtask" under an Epic.
         blocked_by: Comma-separated list of ticket IDs this ticket is blocked by (e.g., "TEAM-401,TEAM-402")
         workflow_id: Workflow ID this ticket belongs to
     """
@@ -907,6 +987,8 @@ def codex(task: str, working_directory: str = "/tmp") -> str:
 LAMBDA_TOOLS = [
     # S3 file download (for images → image_reader)
     download_s3_file,
+    # Upload any-media-type local file to S3 (the one binary-delivery tool)
+    upload_file_to_s3,
     # S3 (Lambda-backed)
     S3Storage___read_object,
     S3Storage___write_object,
