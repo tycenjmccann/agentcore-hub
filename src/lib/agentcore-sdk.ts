@@ -638,6 +638,13 @@ export async function invokeAgentRuntime(params: {
 
   const latencyMs = Date.now() - invokeStart;
 
+  // Heartbeat state lives in the enclosing scope so both start() and cancel()
+  // can touch it. (If declared inside start(), a bare `closed` in cancel() would
+  // resolve to the DOM global `Window.closed` — tsc passes, but at runtime in
+  // Node ESM the assignment throws and the interval never clears.)
+  let closed = false;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+
   return new ReadableStream({
     async start(controller) {
       // Emit start trace
@@ -647,8 +654,7 @@ export async function invokeAgentRuntime(params: {
       // emitting anything, so a long agent turn sends zero bytes for minutes.
       // Keep the connection alive with SSE comment heartbeats so App Runner /
       // proxies don't drop it. sseData ignores non-`data:` lines.
-      let closed = false;
-      const heartbeat = setInterval(() => {
+      heartbeat = setInterval(() => {
         if (closed) return;
         try {
           controller.enqueue(encoder.encode(`: ping\n\n`));
@@ -778,6 +784,7 @@ export async function invokeAgentRuntime(params: {
     },
     cancel() {
       closed = true;
+      clearInterval(heartbeat);
     },
   });
 }
@@ -833,16 +840,22 @@ export async function invokeHarnessAgent(params: {
   const command = new InvokeHarnessCommand(commandInput);
   const response = await client.send(command);
 
+  // Heartbeat state lives in the enclosing scope so both start() and cancel()
+  // can touch it. (If declared inside start(), a bare `closed` in cancel() would
+  // resolve to the DOM global `Window.closed` — tsc passes, but at runtime in
+  // Node ESM the assignment throws and the interval never clears.)
+  let closed = false;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+
   return new ReadableStream({
     async start(controller) {
-      let closed = false;
       // A single harness tool call (the agent "researching") can run for minutes
       // with zero bytes on the wire. App Runner — and most proxies/load balancers —
       // drop a connection that goes idle, which the browser surfaces as a network
       // error mid-chat. Emit an SSE comment heartbeat so bytes always flow. The
       // shared sseData reader only yields `data:` lines, so ": ping" frames are
       // invisible to every client.
-      const heartbeat = setInterval(() => {
+      heartbeat = setInterval(() => {
         if (closed) return;
         try {
           controller.enqueue(encoder.encode(`: ping\n\n`));
@@ -925,6 +938,7 @@ export async function invokeHarnessAgent(params: {
       // Client disconnected (navigated away, closed drawer) — stop the heartbeat
       // so we don't leak the interval or write to a dead controller.
       closed = true;
+      clearInterval(heartbeat);
     },
   });
 }
