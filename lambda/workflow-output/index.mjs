@@ -6,6 +6,7 @@
  */
 
 import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
@@ -192,26 +193,58 @@ async function updateManifest(workflowId, agentId, entries) {
 // Folded in from the (no-longer-shipped) agentcore-hub-s3-tools Lambda. Runtime
 // agents call these via S3Storage___read_object / write_object / list_objects.
 
-async function s3ReadObject({ bucket, key }) {
+async function s3ReadObject({ bucket, key, encoding }) {
   const targetBucket = bucket || BUCKET;
   if (!targetBucket) throw new Error("bucket is required (no ARTIFACT_BUCKET configured)");
   if (!key) throw new Error("key is required");
   const r = await s3.send(new GetObjectCommand({ Bucket: targetBucket, Key: key }));
+  // Binary objects can't survive transformToString (mangles bytes > 0x7F) —
+  // callers requesting base64 get the raw bytes back intact.
+  if (encoding === "base64") {
+    const bytes = await r.Body.transformToByteArray();
+    return { status: "ok", bucket: targetBucket, key, encoding: "base64",
+      content: Buffer.from(bytes).toString("base64"), content_type: r.ContentType };
+  }
   const body = await r.Body.transformToString();
   return { status: "ok", bucket: targetBucket, key, content: body };
 }
 
-async function s3WriteObject({ bucket, key, content, content_type }) {
+// Presigned URLs let agents stream files of ANY size and media type straight to
+// or from S3 with a plain HTTP PUT/GET — bypassing the ~6MB Lambda-invoke
+// payload ceiling that caps the inline base64 write path. Use for large
+// video/audio/image assets.
+async function s3PresignUrl({ bucket, key, operation, content_type, expires_in }) {
   const targetBucket = bucket || BUCKET;
   if (!targetBucket) throw new Error("bucket is required (no ARTIFACT_BUCKET configured)");
   if (!key) throw new Error("key is required");
+  const op = (operation || "put").toLowerCase();
+  const cmd = op === "get"
+    ? new GetObjectCommand({ Bucket: targetBucket, Key: key })
+    : new PutObjectCommand({ Bucket: targetBucket, Key: key, ContentType: content_type || "application/octet-stream" });
+  const url = await getSignedUrl(s3, cmd, { expiresIn: Math.min(expires_in || 3600, 86400) });
+  return { status: "ok", operation: op, bucket: targetBucket, key, url,
+    content_type: content_type || "application/octet-stream",
+    hint: op === "put"
+      ? "HTTP PUT the raw file bytes to this url; set header Content-Type to match content_type."
+      : "HTTP GET this url to download the raw file bytes." };
+}
+
+async function s3WriteObject({ bucket, key, content, content_type, encoding }) {
+  const targetBucket = bucket || BUCKET;
+  if (!targetBucket) throw new Error("bucket is required (no ARTIFACT_BUCKET configured)");
+  if (!key) throw new Error("key is required");
+  // Binary artifacts (images, PDFs, zips) can't survive as a UTF-8 string — the
+  // S3 SDK re-encodes any byte > 0x7F. Agents deliver them base64-encoded with
+  // encoding:"base64"; decode back to raw bytes here so the stored object is a
+  // real PNG/PDF, not corrupted text.
+  const body = encoding === "base64" ? Buffer.from(content || "", "base64") : (content || "");
   await s3.send(new PutObjectCommand({
     Bucket: targetBucket,
     Key: key,
-    Body: content || "",
+    Body: body,
     ContentType: content_type || "text/plain",
   }));
-  return { status: "saved", location: `s3://${targetBucket}/${key}` };
+  return { status: "saved", location: `s3://${targetBucket}/${key}`, bytes: body.length };
 }
 
 async function s3ListObjects({ bucket, prefix }) {
@@ -237,6 +270,7 @@ const TOOLS = {
   "S3Storage___read_object": s3ReadObject,
   "S3Storage___write_object": s3WriteObject,
   "S3Storage___list_objects": s3ListObjects,
+  "S3Storage___presign_url": s3PresignUrl,
 };
 
 /**

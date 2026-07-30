@@ -40,11 +40,20 @@ clone_skill() {
 
   echo "  [$persona] $name <- $repo${subdir:+ ($subdir)}"
   rm -rf "$clone_dir"
-  git clone --depth 1 --quiet "$repo" "$clone_dir"
+  # A single upstream skill repo moving/renaming a path must NOT kill the whole
+  # fleet build — warn and skip that one skill instead of aborting under set -e.
+  if ! git clone --depth 1 --quiet "$repo" "$clone_dir"; then
+    echo "  WARN: clone failed for $persona/$name ($repo) — skipping" >&2
+    return 0
+  fi
 
   mkdir -p "$(dirname "$dest")"
   rm -rf "$dest"
   if [ -n "$subdir" ]; then
+    if [ ! -e "$clone_dir/$subdir" ]; then
+      echo "  WARN: subdir '$subdir' not found in $repo — skipping $persona/$name" >&2
+      return 0
+    fi
     cp -r "$clone_dir/$subdir" "$dest"
   else
     cp -r "$clone_dir" "$dest"
