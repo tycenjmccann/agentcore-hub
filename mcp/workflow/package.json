@@ -1,0 +1,23 @@
+{
+  "name": "@agentcore-hub/workflow-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local stdio MCP server: manage AgentCore Hub workflows via MCP tools.",
+  "type": "module",
+  "bin": {
+    "workflow-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}
