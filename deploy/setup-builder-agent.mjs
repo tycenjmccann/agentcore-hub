@@ -81,7 +81,7 @@ const accountId = identity.Account;
 
 // --- Create or verify IAM role ---
 if (!HARNESS_ROLE_ARN) {
-  console.log("\n1/3 Setting up IAM harness execution role...\n");
+  console.log("\n1/4 Setting up IAM harness execution role...\n");
 
   const iam = new IAMClient({ region: REGION });
 
@@ -290,54 +290,17 @@ const {
 
 const agentcore = new BedrockAgentCoreControlClient({ region: REGION });
 
-// --- Provision memory (default-on) ---
-// Skipped by --no-memory, or when the caller passed an explicit --memory-id.
-if (!NO_MEMORY && !MEMORY_ID) {
-  console.log(`\n2/3 AgentCore Memory (auto-provisioned)`);
-  let memories = [];
-  let nextToken;
-  do {
-    const page = await agentcore.send(new ListMemoriesCommand({ nextToken }));
-    memories = memories.concat(page.memories || []);
-    nextToken = page.nextToken;
-  } while (nextToken);
-  const existing = memories.find(
-    (m) => (m.id || m.memoryId || "").startsWith(MEMORY_NAME) || m.name === MEMORY_NAME
-  );
-  if (existing) {
-    MEMORY_ID = existing.id || existing.memoryId;
-    console.log(`  ✓ Memory exists: ${MEMORY_ID}`);
-  } else {
-    const created = await agentcore.send(new CreateMemoryCommand({
-      name: MEMORY_NAME,
-      description: "Builder Agent long-term memory (past agent builds, tool discovery, roster)",
-      eventExpiryDuration: 90,
-      memoryStrategies: [
-        { semanticMemoryStrategy: { name: "builderSemantic", description: "Facts about agents built: names, models, tools, roles, gateways wired" } },
-        { summaryMemoryStrategy: { name: "builderSummary", description: "Session summaries of build conversations and decisions" } },
-      ],
-    }));
-    MEMORY_ID = created.memory?.id || created.memory?.memoryId;
-    console.log(`  Memory created: ${MEMORY_ID} — waiting for ACTIVE...`);
-    for (let i = 0; i < 60; i++) {
-      await sleep(5000);
-      const m = await agentcore.send(new GetMemoryCommand({ memoryId: MEMORY_ID }));
-      const status = m.memory?.status;
-      if (status === "ACTIVE") break;
-      if (status === "FAILED") throw new Error(`Memory creation failed: ${m.memory?.failureReason || "unknown"}`);
-      if (i === 59) throw new Error("Timed out waiting for memory ACTIVE");
-    }
-    console.log(`  ✓ Memory ACTIVE`);
-  }
-}
+// Memory (default-on) is provisioned lazily, AFTER the existence checks below —
+// creating it here would orphan a billable store whenever the builder already
+// exists and we early-exit. See provisionMemory().
 
-console.log(`\n2/3 Deploying Builder Agent Harness`);
+console.log(`\n2/4 Resolving Builder Agent Harness (checking for an existing one)`);
 console.log("  " + "=".repeat(50));
 console.log(`  Region:       ${REGION}`);
 console.log(`  Model:        ${MODEL_ID}`);
 console.log(`  Role:         ${HARNESS_ROLE_ARN}`);
 console.log(`  MCP Servers:  ${MCP_URLS.length > 0 ? MCP_URLS.join("\n                ") : "(none — builder can still create agents via code_interpreter)"}`);
-console.log(`  Memory:       ${MEMORY_ID || "(none)"}`);
+console.log(`  Memory:       ${MEMORY_ID || (NO_MEMORY ? "(none)" : "(auto-provision on create)")}`);
 console.log("  " + "=".repeat(50) + "\n");
 
 // --- Check if already exists ---
@@ -391,6 +354,68 @@ if (existingOther) {
         process.exit(1);
       }
     }
+  }
+}
+
+// --- Provision memory (default-on), lazily, only now that we KNOW we're
+// creating a fresh harness. Skipped by --no-memory or an explicit --memory-id.
+// Doing this here (not before the existence checks) avoids orphaning a billable
+// store when the builder already exists and the script early-exits above.
+if (!NO_MEMORY && !MEMORY_ID) {
+  console.log(`\n3/4 AgentCore Memory (auto-provisioned)`);
+  let memories = [];
+  let nextToken;
+  do {
+    const page = await agentcore.send(new ListMemoriesCommand({ nextToken }));
+    memories = memories.concat(page.memories || []);
+    nextToken = page.nextToken;
+  } while (nextToken);
+  // Only reuse a store that's actually usable. A prior run interrupted mid-create
+  // (CREATING) or a leftover FAILED/DELETING store must NOT be wired into the
+  // harness — poll a CREATING one to ACTIVE, otherwise fall through and create fresh.
+  const reusable = memories.find(
+    (m) => ((m.id || m.memoryId || "").startsWith(MEMORY_NAME) || m.name === MEMORY_NAME)
+  );
+  const waitActive = async (id) => {
+    for (let i = 0; i < 60; i++) {
+      const m = await agentcore.send(new GetMemoryCommand({ memoryId: id }));
+      const status = m.memory?.status;
+      if (status === "ACTIVE") return true;
+      if (status === "FAILED" || status === "CREATE_FAILED")
+        throw new Error(`Memory ${id} is ${status}: ${m.memory?.failureReason || "unknown"}`);
+      if (status === "DELETING") return false; // being torn down — create a fresh one
+      await sleep(5000);
+    }
+    throw new Error(`Timed out waiting for memory ${id} to become ACTIVE`);
+  };
+  let reused = false;
+  if (reusable) {
+    const id = reusable.id || reusable.memoryId;
+    if (reusable.status === "ACTIVE") {
+      MEMORY_ID = id;
+      reused = true;
+      console.log(`  ✓ Memory exists: ${MEMORY_ID}`);
+    } else if (reusable.status === "CREATING") {
+      console.log(`  Memory ${id} is CREATING — waiting for ACTIVE...`);
+      if (await waitActive(id)) { MEMORY_ID = id; reused = true; console.log(`  ✓ Memory ACTIVE: ${MEMORY_ID}`); }
+    } else {
+      console.log(`  Found memory ${id} in ${reusable.status} — creating a fresh store instead`);
+    }
+  }
+  if (!reused) {
+    const created = await agentcore.send(new CreateMemoryCommand({
+      name: MEMORY_NAME,
+      description: "Builder Agent long-term memory (past agent builds, tool discovery, roster)",
+      eventExpiryDuration: 90,
+      memoryStrategies: [
+        { semanticMemoryStrategy: { name: "builderSemantic", description: "Facts about agents built: names, models, tools, roles, gateways wired", namespaceTemplates: ["/builder/semantic/{actorId}"] } },
+        { summaryMemoryStrategy: { name: "builderSummary", description: "Session summaries of build conversations and decisions", namespaceTemplates: ["/builder/summary/{actorId}/{sessionId}"] } },
+      ],
+    }));
+    MEMORY_ID = created.memory?.id || created.memory?.memoryId;
+    console.log(`  Memory created: ${MEMORY_ID} — waiting for ACTIVE...`);
+    await waitActive(MEMORY_ID);
+    console.log(`  ✓ Memory ACTIVE`);
   }
 }
 
@@ -529,7 +554,7 @@ process.exit(1);
 
 // --- Verification: invoke the harness with a test prompt ---
 async function verifyHarness(harnessId) {
-  console.log(`\n3/3 Verifying builder agent (test invocation)...\n`);
+  console.log(`\n4/4 Verifying builder agent (test invocation)...\n`);
 
   const { BedrockAgentCoreClient, InvokeHarnessCommand } = await import(
     "@aws-sdk/client-bedrock-agentcore"
