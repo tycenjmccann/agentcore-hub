@@ -1,0 +1,49 @@
+{
+  "$comment": "Single source of truth for the harness model catalog. Consumed by both TS (harness-models.ts) and deploy scripts (harness-models.mjs). Each entry pins a model to a known-good (provider, apiFormat) pair so the AgentCore harness loop produces a request shape valid for THAT model's endpoint. See harness-models.ts for the full rationale.",
+  "defaultId": "claude-fable-5",
+  "models": [
+    {
+      "id": "claude-fable-5",
+      "label": "Claude Fable 5 (Recommended)",
+      "provider": "bedrock",
+      "modelId": "us.anthropic.claude-fable-5",
+      "apiFormat": "converse_stream",
+      "description": "Most capable general model. Native Converse; handles tool loops + prefill.",
+      "isDefault": true
+    },
+    {
+      "id": "claude-opus-4-6",
+      "label": "Claude Opus 4.6",
+      "provider": "bedrock",
+      "modelId": "us.anthropic.claude-opus-4-6",
+      "apiFormat": "converse_stream",
+      "description": "High-capability reasoning. Native Converse."
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "label": "Claude Sonnet 4.6",
+      "provider": "bedrock",
+      "modelId": "us.anthropic.claude-sonnet-4-6",
+      "apiFormat": "converse_stream",
+      "description": "Fast, strong default for most tasks. Native Converse."
+    },
+    {
+      "id": "claude-opus-4-8-mantle",
+      "label": "Claude Opus 4.8 (via Mantle)",
+      "provider": "bedrock",
+      "modelId": "us.anthropic.claude-opus-4-8",
+      "apiFormat": "responses",
+      "description": "Opus 4.8 through the Bedrock Mantle Responses endpoint. Required — this model rejects the harness loop's prefill turn on native Converse.",
+      "requiresMantle": true
+    },
+    {
+      "id": "claude-opus-4-8-mantle-chat",
+      "label": "Claude Opus 4.8 (via Mantle, Chat Completions)",
+      "provider": "bedrock",
+      "modelId": "us.anthropic.claude-opus-4-8",
+      "apiFormat": "chat_completions",
+      "description": "Opus 4.8 through the Bedrock Mantle Chat Completions endpoint. Alternative Mantle lane; also tolerates the harness prefill turn.",
+      "requiresMantle": true
+    }
+  ]
+}
