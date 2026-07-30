@@ -1607,7 +1607,7 @@ export const PIPELINE_STYLES = `
 .flow-path.animating{stroke:#0ea5e9;stroke-width:3;opacity:1;filter:url(#pathGlow)}
 .flow-dot{fill:#0ea5e9;filter:url(#dotGlow)}
 
-.pipeline-phases{display:flex;align-items:flex-start;gap:44px;position:relative;z-index:2}
+.pipeline-phases{display:flex;align-items:flex-start;gap:44px;position:relative;z-index:2;padding-left:16px}
 
 .phase{display:flex;flex-direction:column;align-items:center;width:290px;opacity:var(--pl-dim-inactive);transition:opacity .5s,transform .4s;transform:translateY(6px)}
 .phase.active{opacity:1;transform:translateY(0)}
