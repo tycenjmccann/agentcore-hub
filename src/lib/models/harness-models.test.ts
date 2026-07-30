@@ -41,14 +41,12 @@ describe("harness model catalog", () => {
     expect(cfg.bedrockModelConfig?.apiFormat).toBe("responses");
   });
 
-  it("builds an OpenAI-via-Mantle config with no api key", () => {
-    const cfg = buildHarnessModelConfig("gpt-5-4-mantle");
-    expect(cfg.openAiModelConfig).toEqual({
-      modelId: "gpt-5.4",
-      apiFormat: "responses",
-      endpoint: { bedrockMantle: {} },
+  it("pins opus-4-8 chat_completions to the Mantle Chat lane", () => {
+    const cfg = buildHarnessModelConfig("claude-opus-4-8-mantle-chat");
+    expect(cfg.bedrockModelConfig).toEqual({
+      modelId: "us.anthropic.claude-opus-4-8",
+      apiFormat: "chat_completions",
     });
-    expect(cfg.openAiModelConfig?.apiKeyArn).toBeUndefined();
   });
 
   it("falls back to native Converse for unknown ids", () => {
@@ -61,7 +59,8 @@ describe("harness model catalog", () => {
 
   it("findHarnessModel matches by id or modelId", () => {
     expect(findHarnessModel("claude-fable-5")?.id).toBe("claude-fable-5");
-    expect(findHarnessModel("gpt-5.4")?.id).toBe("gpt-5-4-mantle");
+    // Raw modelId shared by two entries resolves to the first (Responses lane).
+    expect(findHarnessModel("us.anthropic.claude-opus-4-8")?.id).toBe("claude-opus-4-8-mantle");
     expect(findHarnessModel("nope")).toBeUndefined();
   });
 });

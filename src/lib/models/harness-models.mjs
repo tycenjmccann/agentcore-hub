@@ -38,11 +38,17 @@ export function buildHarnessModelConfig(idOrModelId) {
   }
 
   if (opt.provider === "openai") {
+    if (!opt.apiKeyArn) {
+      throw new Error(
+        `Harness model "${opt.id}" is provider "openai" but has no apiKeyArn; ` +
+          `the control SDK requires one (there is no keyless Mantle route for OpenAI).`,
+      );
+    }
     return {
       openAiModelConfig: {
         modelId: opt.modelId,
         apiFormat: opt.apiFormat,
-        endpoint: { bedrockMantle: {} },
+        apiKeyArn: opt.apiKeyArn,
       },
     };
   }

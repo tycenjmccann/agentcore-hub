@@ -12,11 +12,16 @@
  * known-good (endpoint, apiFormat) pair makes the WM (and any harness agent)
  * work across models instead of only the ones whose defaults happen to match.
  *
- * The four lanes AgentCore supports (see AWS docs "Models and instructions"):
- *   1. bedrock  + converse_stream   → bedrock-runtime  (native Converse; default)
- *   2. bedrock  + responses         → bedrock-mantle   (OpenAI-compatible Responses)
- *   3. bedrock  + chat_completions  → bedrock-mantle   (OpenAI-compatible Chat)
- *   4. openai   + responses         → bedrock-mantle   (GPT via Mantle, no API key)
+ * The lanes AgentCore supports (see AWS docs "Models and instructions"):
+ *   1. bedrock + converse_stream   → bedrock-runtime  (native Converse; default)
+ *   2. bedrock + responses         → bedrock-mantle   (OpenAI-compatible Responses)
+ *   3. bedrock + chat_completions  → bedrock-mantle   (OpenAI-compatible Chat)
+ *   4. openai  + responses/chat    → a direct OpenAI endpoint; requires an API key
+ *      ARN in AgentCore Identity (apiKeyArn). NOTE: the JS control SDK models an
+ *      OpenAI config as { modelId, apiKeyArn, apiFormat } only — there is no
+ *      "route OpenAI through Mantle without a key" shape it can serialize, so the
+ *      catalog ships only the Bedrock lanes for Mantle. To add a direct-OpenAI
+ *      model, give its entry an apiKeyArn.
  *
  * The catalog DATA lives in `harness-models.json` so deploy scripts (.mjs) and
  * this module share exactly one list. This file adds the types + config builder.
@@ -38,10 +43,8 @@ export interface HarnessModelConfig {
   openAiModelConfig?: {
     modelId: string;
     apiFormat?: OpenAiApiFormat;
-    /** Route through Bedrock Mantle (execution-role creds, no API key). */
-    endpoint?: { bedrockMantle: Record<string, never> };
-    /** Direct OpenAI endpoint instead of Mantle. */
-    apiKeyArn?: string;
+    /** ARN of the OpenAI API key in AgentCore Identity. Required by the SDK. */
+    apiKeyArn: string;
   };
 }
 
@@ -56,6 +59,8 @@ export interface HarnessModelOption {
   modelId: string;
   /** Endpoint/protocol this model is pinned to. */
   apiFormat: BedrockApiFormat | OpenAiApiFormat;
+  /** For `openai` provider entries only: ARN of the API key in AgentCore Identity. */
+  apiKeyArn?: string;
   description?: string;
   isDefault?: boolean;
   /**
@@ -96,11 +101,17 @@ export function buildHarnessModelConfig(idOrModelId: string): HarnessModelConfig
   }
 
   if (opt.provider === "openai") {
+    if (!opt.apiKeyArn) {
+      throw new Error(
+        `Harness model "${opt.id}" is provider "openai" but has no apiKeyArn; ` +
+          `the control SDK requires one (there is no keyless Mantle route for OpenAI).`,
+      );
+    }
     return {
       openAiModelConfig: {
         modelId: opt.modelId,
         apiFormat: opt.apiFormat as OpenAiApiFormat,
-        endpoint: { bedrockMantle: {} },
+        apiKeyArn: opt.apiKeyArn,
       },
     };
   }

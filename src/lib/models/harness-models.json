@@ -37,12 +37,13 @@
       "requiresMantle": true
     },
     {
-      "id": "gpt-5-4-mantle",
-      "label": "OpenAI GPT-5.4 (via Mantle)",
-      "provider": "openai",
-      "modelId": "gpt-5.4",
-      "apiFormat": "responses",
-      "description": "GPT-5.4 via Bedrock Mantle — uses execution-role creds, no API key."
+      "id": "claude-opus-4-8-mantle-chat",
+      "label": "Claude Opus 4.8 (via Mantle, Chat Completions)",
+      "provider": "bedrock",
+      "modelId": "us.anthropic.claude-opus-4-8",
+      "apiFormat": "chat_completions",
+      "description": "Opus 4.8 through the Bedrock Mantle Chat Completions endpoint. Alternative Mantle lane; also tolerates the harness prefill turn.",
+      "requiresMantle": true
     }
   ]
 }
