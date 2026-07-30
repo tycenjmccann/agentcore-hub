@@ -369,7 +369,12 @@ fi
 # place instead of creating a duplicate. Match the service-name segment EXACTLY
 # — a prefix match would also hit e.g. agentcore-hub-frontend/-worker and, since
 # serviceArns ordering isn't guaranteed, could update the wrong service.
-EXISTING_ARN=$(SERVICE_NAME="$SERVICE_NAME" aws ecs list-services --cluster "$CLUSTER" --region "$AWS_REGION" --output json 2>/dev/null \
+# NOTE: a `VAR=val cmd | python3` prefix only exports VAR to `cmd`, NOT to the
+# `python3` on the far side of the pipe — so export it for the whole subshell,
+# else the lookup KeyErrors (swallowed by 2>/dev/null), returns empty, and a
+# re-run wrongly takes the CREATE path and collides with the live service.
+export SERVICE_NAME
+EXISTING_ARN=$(aws ecs list-services --cluster "$CLUSTER" --region "$AWS_REGION" --output json 2>/dev/null \
   | python3 -c "
 import json, os, sys
 want = os.environ['SERVICE_NAME']

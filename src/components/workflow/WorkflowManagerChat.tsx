@@ -49,8 +49,14 @@ export default function WorkflowManagerChat({ open, onClose, selectedWorkflowId,
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [activeTool, setActiveTool] = useState<string | null>(null);
+  // A CHAT turn can run a dozen silent tool calls (dossier pull, metrics) for a
+  // minute-plus before any prose streams. Track elapsed seconds + tool-step count
+  // so the indicator visibly advances instead of looking hung on "Using shell…".
+  const [elapsed, setElapsed] = useState(0);
+  const [step, setStep] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const conversationIdRef = useRef<string>("");
+  const startedAtRef = useRef(0);
 
   useEffect(() => {
     if (open && !conversationIdRef.current) conversationIdRef.current = getConversationId();
@@ -58,7 +64,15 @@ export default function WorkflowManagerChat({ open, onClose, selectedWorkflowId,
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, activeTool]);
+  }, [messages, activeTool, elapsed]);
+
+  // Tick a 1s elapsed clock while a turn is in flight, so the "working" indicator
+  // keeps moving even across long silent tool loops.
+  useEffect(() => {
+    if (!streaming) return;
+    const t = setInterval(() => setElapsed(Math.round((Date.now() - startedAtRef.current) / 1000)), 1000);
+    return () => clearInterval(t);
+  }, [streaming]);
 
   const send = useCallback(
     async (text: string, contextWorkflowId?: string | null) => {
@@ -68,6 +82,9 @@ export default function WorkflowManagerChat({ open, onClose, selectedWorkflowId,
       setMessages((m) => [...m, { role: "user", text: trimmed }, { role: "assistant", text: "" }]);
       setStreaming(true);
       setActiveTool(null);
+      setStep(0);
+      setElapsed(0);
+      startedAtRef.current = Date.now();
 
       try {
         const res = await fetch("/api/workflow-manager/chat", {
@@ -102,6 +119,7 @@ export default function WorkflowManagerChat({ open, onClose, selectedWorkflowId,
             });
           } else if (payload.type === "trace" && payload.name) {
             setActiveTool(payload.name);
+            setStep((s) => s + 1);
           } else if (payload.type === "error") {
             setMessages((m) => {
               const next = [...m];
@@ -163,7 +181,9 @@ export default function WorkflowManagerChat({ open, onClose, selectedWorkflowId,
                 m.text ? <MarkdownRenderer content={m.text} /> : (
                   <span className="wmc-thinking">
                     <Loader2 size={13} className="wmc-spin" />
-                    {activeTool ? `Using ${activeTool}…` : "Thinking…"}
+                    {activeTool ? `Using ${activeTool}` : "Thinking"}
+                    {step > 0 && <span className="wmc-thinking-meta">step {step}</span>}
+                    {elapsed > 0 && <span className="wmc-thinking-meta">{elapsed}s</span>}
                   </span>
                 )
               ) : (
@@ -218,6 +238,8 @@ const CHAT_STYLES = `
   color:var(--pipeline-text,#e4e4e7);padding:8px 12px;border-radius:12px 12px 2px 12px;max-width:85%}
 .wmc-assistant{align-self:flex-start;color:var(--pipeline-text,#e4e4e7);max-width:100%}
 .wmc-thinking{display:inline-flex;align-items:center;gap:7px;color:var(--pipeline-text-3,#a1a1aa);font-size:12px}
+.wmc-thinking-meta{font-variant-numeric:tabular-nums;font-size:11px;padding:1px 6px;border-radius:5px;
+  background:rgba(255,255,255,0.05);color:var(--pipeline-text-3,#a1a1aa)}
 .wmc-spin{animation:wmcspin 1s linear infinite}
 @keyframes wmcspin{to{transform:rotate(360deg)}}
 .wmc-input-row{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--pipeline-border,#27272a)}
