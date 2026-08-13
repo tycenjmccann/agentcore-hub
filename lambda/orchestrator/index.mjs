@@ -1260,6 +1260,17 @@ async function completeWorkflow(workflow) {
     }
   }
 
+  // Roll the epic ticket up so the board reflects the closure. Without this the
+  // run shows phase=complete while its epic sits in To Do/In Progress forever —
+  // the exact gap that leaves runs "open" and drives the watch loop. Best-effort:
+  // a board with no Done transition just logs and moves on.
+  if (TICKET_PROVIDER === "jira" && workflow.epicId) {
+    const rolled = await jiraTransition(workflow.epicId, "Done");
+    if (!rolled) {
+      console.warn(`[orchestrator] epic ${workflow.epicId} roll-up to Done skipped (no transition)`);
+    }
+  }
+
   await saveWorkflow(workflow);
   await publishEvent(workflow.epicId, "workflow.complete", {
     workflowId: workflow.id,

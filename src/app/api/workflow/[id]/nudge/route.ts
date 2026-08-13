@@ -70,6 +70,48 @@ async function nudgeJira(epicId: string) {
   return { ticketsScanned: issues.length, nudged };
 }
 
+// ─── Targeted dispatch (Jira) ───────────────────────────────────────────────
+
+/**
+ * Force a single ticket to Ready regardless of its current column, EXCEPT
+ * terminal/human-gate states. This is the `dispatch` path: an orphan that a
+ * missed stream/webhook left parked (e.g. "In Progress" with no agent ever
+ * assigned) matches none of the scan's stuck-patterns, so the scan can't move
+ * it. Never touches Done/In Review — those are finished or human-owned.
+ */
+async function dispatchJira(ticketKey: string) {
+  const jira = JiraClient.fromEnv();
+  const issue = await jira.getIssue(ticketKey, ["status"]);
+  const internal = mapJiraStatusToInternal(issue.fields.status?.name || "To Do");
+  if (internal === "done") {
+    return { ticketsScanned: 1, nudged: [], skipped: `${ticketKey} already done` };
+  }
+  if (internal === "in_review") {
+    return { ticketsScanned: 1, nudged: [], skipped: `${ticketKey} is in review — human-owned` };
+  }
+  await jira.transitionIssue(ticketKey, "Ready");
+  return { ticketsScanned: 1, nudged: [`${ticketKey} (dispatch→ready)`] };
+}
+
+async function dispatchDynamoDB(ticketId: string) {
+  const got = await ddb.send(new GetCommand({ TableName: TICKETS_TABLE, Key: { ticketId } }));
+  const ticket = got.Item;
+  if (!ticket) return { ticketsScanned: 0, nudged: [], skipped: `${ticketId} not found` };
+  const status = String(ticket.status || "");
+  if (status === "done") return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} already done` };
+  if (status === "in_review" || String(ticket.assignee || "").startsWith("human:")) {
+    return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} is human-owned` };
+  }
+  await ddb.send(new UpdateCommand({
+    TableName: TICKETS_TABLE,
+    Key: { ticketId },
+    UpdateExpression: "SET #s = :s, #u = :u",
+    ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+    ExpressionAttributeValues: { ":s": "ready", ":u": new Date().toISOString() },
+  }));
+  return { ticketsScanned: 1, nudged: [`${ticketId} (dispatch→ready)`] };
+}
+
 // ─── Nudge via DynamoDB ─────────────────────────────────────────────────────
 
 async function nudgeDynamoDB(workflowId: string) {
@@ -122,10 +164,22 @@ async function nudgeDynamoDB(workflowId: string) {
 // ─── Route Handler ──────────────────────────────────────────────────────────
 
 export async function POST(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: { id: string } }
 ) {
   const workflowId = params.id;
+
+  // Optional targeted dispatch: { ticketId, force } forces one specific orphan
+  // ticket to Ready. Bodyless POST keeps the original broad-scan behaviour.
+  let targetTicketId: string | undefined;
+  try {
+    const body = await req.json();
+    if (body && typeof body.ticketId === "string" && body.ticketId.trim()) {
+      targetTicketId = body.ticketId.trim();
+    }
+  } catch {
+    /* no body — broad scan */
+  }
 
   try {
     // Get workflow record to determine ticket provider and epicId
@@ -141,9 +195,13 @@ export async function POST(
     const ticketProvider = process.env.TICKET_PROVIDER || "dynamodb";
     const epicId = workflow.epicId;
 
-    let result: { ticketsScanned: number; nudged: string[] };
+    let result: { ticketsScanned: number; nudged: string[]; skipped?: string };
 
-    if (ticketProvider === "jira") {
+    if (targetTicketId) {
+      result = ticketProvider === "jira"
+        ? await dispatchJira(targetTicketId)
+        : await dispatchDynamoDB(targetTicketId);
+    } else if (ticketProvider === "jira") {
       if (!epicId) {
         return NextResponse.json({ error: "Workflow has no epicId — cannot query Jira" }, { status: 400 });
       }
