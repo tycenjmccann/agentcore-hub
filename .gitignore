@@ -22,6 +22,9 @@ mcp/*/dist/
 lambda/skill-loader/function.zip
 lambda/eval-packager/function.zip
 
+# Local / account-specific deployment glue (not for OSS)
+deploy/local/
+
 # Deploy artifacts (account-specific)
 deploy/runtime-agent/fleet-runtime-ids.json
 deploy/runtime-agent/fleet-health-results.json

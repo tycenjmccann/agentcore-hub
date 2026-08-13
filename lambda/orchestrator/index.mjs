@@ -1615,11 +1615,26 @@ async function bootstrapBugWorkflow(bugTicket) {
   const workflowId = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   console.log(`[orchestrator] Bootstrapping bug workflow ${workflowId} for ${bugKey}`);
 
-  // 1. Create workflow row
-  const repoUrl = process.env.DEFAULT_BUG_REPO_URL || "https://github.com/your-org/your-repo";
-  const repoConfig = {
-    repos: [{ platform: "github", url: repoUrl, defaultBranch: "main" }],
-  };
+  // 1. Create workflow row. The target repo travels ON the Bug ticket as a
+  //    `repo:owner/name` label (optional `branch:<name>`, defaults to "main").
+  //    This is what lets one hub serve bugs across many repos without any
+  //    per-repo config. DEFAULT_BUG_REPO_URL is an optional single-repo fallback
+  //    for simple setups. With neither, we fail loud rather than open a branch
+  //    on the wrong repo.
+  const repoConfig = repoConfigFromLabels(bugTicket.labels) || defaultBugRepoConfig();
+  if (!repoConfig) {
+    console.error(`[orchestrator] Bug ${bugKey} has no "repo:owner/name" label and no DEFAULT_BUG_REPO_URL — cannot bootstrap.`);
+    try {
+      await jiraFetch(`/rest/api/3/issue/${bugKey}/comment`, "POST", {
+        body: {
+          type: "doc",
+          version: 1,
+          content: [{ type: "paragraph", content: [{ type: "text", text: "AgentCore Hub: no target repo. Add a label `repo:<owner>/<name>` (e.g. repo:acme/checkout-api) so the fix can open a PR against the right repository." }] }],
+        },
+      });
+    } catch { /* comment is best-effort */ }
+    return;
+  }
   const workflow = {
     id: workflowId,
     workflowId,
@@ -1796,6 +1811,7 @@ function mapJiraIssueToTicket(issue) {
     workflowId: wfLabel ? wfLabel.replace("wf:", "") : null,
     type: rawIssueType.toLowerCase() === "epic" ? "epic" : "task",
     issueType: rawIssueType,
+    labels,
     blockedBy,
     comments: jiraComments,
     ...(reviewComment ? { reviewComment } : {}),
@@ -2047,6 +2063,35 @@ function parseRepoUrl(repoConfig) {
   const url = repoConfig?.repos?.[0]?.url || "";
   const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
   return match ? { owner: match[1], repo: match[2] } : { owner: "", repo: "" };
+}
+
+/**
+ * Build a repoConfig from a Jira ticket's labels. The target repo rides on the
+ * Bug as `repo:owner/name`; branch is optional via `branch:<name>` (default
+ * "main"). Returns null when no valid repo label is present so the caller can
+ * fall back or fail loud. This is what lets a single hub route bug fixes to
+ * many repositories with zero per-repo configuration.
+ */
+function repoConfigFromLabels(labels) {
+  const repoLabel = (labels || []).find((l) => l.startsWith("repo:"));
+  if (!repoLabel) return null;
+  const slug = repoLabel.slice("repo:".length).trim();
+  if (!/^[^/\s]+\/[^/\s]+$/.test(slug)) return null; // must be owner/name
+  const branchLabel = (labels || []).find((l) => l.startsWith("branch:"));
+  const defaultBranch = branchLabel ? branchLabel.slice("branch:".length).trim() : "main";
+  return {
+    repos: [{ platform: "github", url: `https://github.com/${slug}`, defaultBranch }],
+  };
+}
+
+/**
+ * Optional single-repo fallback for simple deployments that only ever fix bugs
+ * in one repo. Set DEFAULT_BUG_REPO_URL to enable; unset → null (label required).
+ */
+function defaultBugRepoConfig() {
+  const url = process.env.DEFAULT_BUG_REPO_URL;
+  if (!url) return null;
+  return { repos: [{ platform: "github", url, defaultBranch: process.env.DEFAULT_BUG_REPO_BRANCH || "main" }] };
 }
 
 /**
