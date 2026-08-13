@@ -4,19 +4,29 @@
 Every action is validated in code before executing — the model cannot bypass
 these rules by prompting differently:
   - human review gates (`human:*` assignees, `in_review` status) are untouchable
-  - nothing is ever transitioned to done/cancelled
-  - unstick/retry/comment delegate to the app's provider-aware endpoints
-    (nudge/retry/tickets/comment), so DynamoDB and Jira modes behave identically
-    to a human clicking the UI
+  - `complete` refuses unless EVERY non-epic child ticket is done/cancelled
+    (the API enforces this too) — the manager can close finished work, never
+    fake it
+  - unstick/retry/comment/dispatch/complete delegate to the app's
+    provider-aware endpoints, so DynamoDB and Jira modes behave identically to
+    a human clicking the UI
 
 Every executed action publishes a `manager.intervention` event to the events
 table, so it shows on the board timeline and in the next run analysis.
 
+`escalate` is idempotent: an identical open (unacknowledged) escalation is
+never appended twice, so the manager can't re-raise the same flag every pass.
+When a run is dead and shouldn't keep paging, the manager decides to `mute` it —
+that judgment is the agent's, not a coded cap.
+
 Usage:
   python3 intervene.py unstick  <workflowId> [--note "..."]
   python3 intervene.py retry    <workflowId> <agentId> [--note "..."]
+  python3 intervene.py dispatch <workflowId> <ticketId> [--note "..."]
   python3 intervene.py comment  <workflowId> <ticketId> <text>
   python3 intervene.py escalate <workflowId> <message>
+  python3 intervene.py complete <workflowId> [--reason "..."]
+  python3 intervene.py mute     <workflowId> [--note "..."]
 
 Env: WORKFLOW_API_URL (app base URL), EVENTS_TABLE, TICKETS_TABLE,
      WORKFLOWS_TABLE, TICKET_PROVIDER (dynamodb|jira), AWS_REGION.
@@ -142,7 +152,74 @@ def cmd_comment(args):
     print(json.dumps({"action": "comment", "ticketId": args.ticket_id, **result}, indent=2))
 
 
+def _set_manager_watch(workflow_id, on):
+    dynamodb.Table(WORKFLOWS_TABLE).update_item(
+        Key={"workflowId": workflow_id},
+        UpdateExpression="SET managerWatch = :w",
+        ExpressionAttributeValues={":w": on},
+    )
+
+
+def cmd_dispatch(args):
+    """Re-queue a ticket that was never picked up (in the roster but no agent
+    ever ran it — no agent.started, no error). Distinct from `retry`, which
+    only resets an actively-running task that appears dead. Routes through the
+    same provider-aware nudge endpoint the UI uses, so it works in Jira mode."""
+    if TICKET_PROVIDER != "jira":
+        refuse_if_protected(get_ticket(args.ticket_id))
+    result = api_post(f"/api/workflow/{args.workflow_id}/nudge",
+                      {"ticketId": args.ticket_id})
+    publish_intervention(args.workflow_id, "dispatch", {
+        "ticketId": args.ticket_id, "note": args.note,
+        "nudged": result.get("nudged"),
+    })
+    print(json.dumps({"action": "dispatch", "ticketId": args.ticket_id, **result}, indent=2))
+
+
+def cmd_complete(args):
+    """Close out a run whose work is actually finished but whose bookkeeping
+    never rolled up. The API refuses (409) unless every non-epic child is
+    done/cancelled — this is an honest close with no bypass. If it refuses,
+    the run genuinely has open work: `dispatch` it or `escalate`, don't force."""
+    body = {"reason": args.reason or "Closed by Workflow Manager: work finished, bookkeeping rolled up."}
+    result = api_post(f"/api/workflow/{args.workflow_id}/complete", body)
+    publish_intervention(args.workflow_id, "complete", {"note": args.reason})
+    print(json.dumps({"action": "complete", "workflowId": args.workflow_id, **result}, indent=2))
+
+
+def cmd_mute(args):
+    """Circuit breaker: stop watching a run that cannot be moved (no diagnosable
+    cause, work not verifiably done). Sets managerWatch=false so the watch
+    scheduler skips it and it stops paging — without touching any ticket or
+    faking completion. A human can re-enable by clearing the flag."""
+    _set_manager_watch(args.workflow_id, False)
+    publish_intervention(args.workflow_id, "mute", {"note": args.note})
+    print(json.dumps({"action": "mute", "workflowId": args.workflow_id, "managerWatch": False}, indent=2))
+
+
 def cmd_escalate(args):
+    # Idempotent: never append a second copy of an already-open (unacknowledged)
+    # escalation with the same message. This stops the manager re-raising the
+    # identical flag every pass — the source of the 400+ duplicate escalations
+    # that bloated stuck records. Judgment about WHEN to stop escalating and mute
+    # a dead run is the manager's (via the `mute` action), not a coded cap.
+    wf = dynamodb.Table(WORKFLOWS_TABLE).get_item(
+        Key={"workflowId": args.workflow_id}
+    ).get("Item") or {}
+    notifs = wf.get("humanNotifications") or []
+    open_dupe = any(
+        n.get("type") == "manager_escalation"
+        and n.get("details") == args.message
+        and not n.get("acknowledged")
+        for n in notifs
+    )
+    if open_dupe:
+        publish_intervention(args.workflow_id, "escalate_suppressed",
+                             {"reason": "duplicate-open", "note": args.message[:500]})
+        print(json.dumps({"action": "escalate", "suppressed": "duplicate open escalation already exists",
+                          "workflowId": args.workflow_id}, indent=2))
+        return
+
     notification = {
         "id": f"notif_wm_{now_iso()}",
         "type": "manager_escalation",
@@ -185,6 +262,12 @@ def main():
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_retry)
 
+    p = sub.add_parser("dispatch")
+    p.add_argument("workflow_id")
+    p.add_argument("ticket_id")
+    p.add_argument("--note", default="")
+    p.set_defaults(func=cmd_dispatch)
+
     p = sub.add_parser("comment")
     p.add_argument("workflow_id")
     p.add_argument("ticket_id")
@@ -195,6 +278,16 @@ def main():
     p.add_argument("workflow_id")
     p.add_argument("message")
     p.set_defaults(func=cmd_escalate)
+
+    p = sub.add_parser("complete")
+    p.add_argument("workflow_id")
+    p.add_argument("--reason", default="")
+    p.set_defaults(func=cmd_complete)
+
+    p = sub.add_parser("mute")
+    p.add_argument("workflow_id")
+    p.add_argument("--note", default="")
+    p.set_defaults(func=cmd_mute)
 
     args = parser.parse_args()
     args.func(args)
