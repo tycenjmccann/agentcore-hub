@@ -1621,19 +1621,25 @@ async function bootstrapBugWorkflow(bugTicket) {
   //    per-repo config. DEFAULT_BUG_REPO_URL is an optional single-repo fallback
   //    for simple setups. With neither, we fail loud rather than open a branch
   //    on the wrong repo.
-  const repoConfig = repoConfigFromLabels(bugTicket.labels) || defaultBugRepoConfig();
-  if (!repoConfig) {
-    console.error(`[orchestrator] Bug ${bugKey} has no "repo:owner/name" label and no DEFAULT_BUG_REPO_URL — cannot bootstrap.`);
-    try {
-      await jiraFetch(`/rest/api/3/issue/${bugKey}/comment`, "POST", {
-        body: {
-          type: "doc",
-          version: 1,
-          content: [{ type: "paragraph", content: [{ type: "text", text: "AgentCore Hub: no target repo. Add a label `repo:<owner>/<name>` (e.g. repo:acme/checkout-api) so the fix can open a PR against the right repository." }] }],
-        },
-      });
-    } catch { /* comment is best-effort */ }
+  const repoLabel = repoConfigFromLabels(bugTicket.labels);
+  let repoConfig;
+  if (repoLabel.status === "ok") {
+    repoConfig = repoLabel.repoConfig;
+  } else if (repoLabel.status === "invalid") {
+    // The ticket explicitly named a repo but it is malformed. Do NOT fall back to
+    // DEFAULT_BUG_REPO_URL — a typo like `repo:acme/service/api` must not silently
+    // open a PR on an unrelated repo. Fail loud and tell the reporter how to retry.
+    console.error(`[orchestrator] Bug ${bugKey} has a malformed repo label "repo:${repoLabel.slug}" — expected repo:<owner>/<name>. Not bootstrapping.`);
+    await commentOnBug(bugKey, `AgentCore Hub: the repo label \`repo:${repoLabel.slug}\` is not a valid \`owner/name\` (e.g. \`repo:acme/checkout-api\`). Fix the label, then move this ticket to any other status and back to "To Do" to retry.`);
     return;
+  } else {
+    // No repo label at all — the single-repo fallback (if configured) applies.
+    repoConfig = defaultBugRepoConfig();
+    if (!repoConfig) {
+      console.error(`[orchestrator] Bug ${bugKey} has no "repo:owner/name" label and no DEFAULT_BUG_REPO_URL — cannot bootstrap.`);
+      await commentOnBug(bugKey, `AgentCore Hub: no target repo. Add a label \`repo:<owner>/<name>\` (e.g. \`repo:acme/checkout-api\`), then move this ticket to any other status and back to "To Do" to retry.`);
+      return;
+    }
   }
   const workflow = {
     id: workflowId,
@@ -2066,21 +2072,30 @@ function parseRepoUrl(repoConfig) {
 }
 
 /**
- * Build a repoConfig from a Jira ticket's labels. The target repo rides on the
+ * Resolve the target repo from a Jira ticket's labels. The repo rides on the
  * Bug as `repo:owner/name`; branch is optional via `branch:<name>` (default
- * "main"). Returns null when no valid repo label is present so the caller can
- * fall back or fail loud. This is what lets a single hub route bug fixes to
- * many repositories with zero per-repo configuration.
+ * "main"). This is what lets a single hub route bug fixes to many repositories
+ * with zero per-repo configuration.
+ *
+ * Returns a tri-state so the caller can tell "no label" from "bad label":
+ *   { status: "none" }                    → no repo: label at all (fallback OK)
+ *   { status: "invalid", slug }           → repo: label present but malformed
+ *                                            (must NOT fall back — the ticket
+ *                                            explicitly named a repo; a typo
+ *                                            routing to DEFAULT_BUG_REPO_URL
+ *                                            would open a PR on the wrong repo)
+ *   { status: "ok", repoConfig }          → valid repo:owner/name
  */
 function repoConfigFromLabels(labels) {
   const repoLabel = (labels || []).find((l) => l.startsWith("repo:"));
-  if (!repoLabel) return null;
+  if (!repoLabel) return { status: "none" };
   const slug = repoLabel.slice("repo:".length).trim();
-  if (!/^[^/\s]+\/[^/\s]+$/.test(slug)) return null; // must be owner/name
+  if (!/^[^/\s]+\/[^/\s]+$/.test(slug)) return { status: "invalid", slug }; // must be exactly owner/name
   const branchLabel = (labels || []).find((l) => l.startsWith("branch:"));
   const defaultBranch = branchLabel ? branchLabel.slice("branch:".length).trim() : "main";
   return {
-    repos: [{ platform: "github", url: `https://github.com/${slug}`, defaultBranch }],
+    status: "ok",
+    repoConfig: { repos: [{ platform: "github", url: `https://github.com/${slug}`, defaultBranch }] },
   };
 }
 
@@ -2092,6 +2107,21 @@ function defaultBugRepoConfig() {
   const url = process.env.DEFAULT_BUG_REPO_URL;
   if (!url) return null;
   return { repos: [{ platform: "github", url, defaultBranch: process.env.DEFAULT_BUG_REPO_BRANCH || "main" }] };
+}
+
+/**
+ * Post a plain-text comment on a Bug (best-effort). Used to tell a reporter why
+ * bootstrap was skipped and how to retry: transitioning the Bug back to "To Do"
+ * re-fires the jira webhook → processStatusChange("todo") → bootstrap re-runs
+ * (idempotent), which is the supported retry path since issue_updated events
+ * without a status change are not acted on.
+ */
+async function commentOnBug(bugKey, text) {
+  try {
+    await jiraFetch(`/rest/api/3/issue/${bugKey}/comment`, "POST", {
+      body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] },
+    });
+  } catch { /* comment is best-effort */ }
 }
 
 /**

@@ -122,11 +122,20 @@ A reference AWS Lambda (DynamoDB Streams → create Jira Bug) is provided as a
 template — see the deployment guide for your environment; it is intentionally
 kept out of this OSS repo because it is account/table-specific.
 
+## Retrying a skipped bug
+
+If bootstrap was skipped (missing/invalid repo label), fix the label on the Bug,
+then **transition it to any other status and back to "To Do"**. That status
+change re-fires the webhook, which re-runs bootstrap (idempotent — it will not
+create a second workflow if one already exists). Simply editing the label does
+**not** retry: `issue_updated` events without a status change are ignored.
+
 ## Troubleshooting
 
 | Symptom | Cause |
 | --- | --- |
 | Nothing happens after creating the Bug | Webhook not registered, or issue created outside `JIRA_PROJECT_KEY`. |
-| Log: "no target repo" + Jira comment asking for `repo:` label | No `repo:owner/name` label and no `DEFAULT_BUG_REPO_URL`. |
+| Log: "no target repo" + Jira comment asking for `repo:` label | No `repo:owner/name` label and no `DEFAULT_BUG_REPO_URL`. Add the label and retry (see above). |
+| Log: "malformed repo label" + Jira comment | A `repo:` label is present but not exactly `owner/name` (e.g. an extra path segment). An invalid explicit label is **never** silently replaced by `DEFAULT_BUG_REPO_URL` — fix the label and retry. |
 | Bug created but no sub-task | Bug had a parent, or a `wf:` label already — bootstrap only fires for a bare top-level Bug. |
-| PR opened on the wrong repo | `repo:` label points at the wrong slug, or a `DEFAULT_BUG_REPO_URL` fallback masked a missing label. |
+| PR opened on the wrong repo | `repo:` label points at the wrong (but valid) slug. A malformed label fails loud rather than falling back. |
