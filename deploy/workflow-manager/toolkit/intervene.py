@@ -25,7 +25,7 @@ Usage:
   python3 intervene.py dispatch <workflowId> <ticketId> [--note "..."]
   python3 intervene.py comment  <workflowId> <ticketId> <text>
   python3 intervene.py escalate <workflowId> <message>
-  python3 intervene.py complete <workflowId> [--reason "..."] [--force]
+  python3 intervene.py complete <workflowId> [--reason "..."]
   python3 intervene.py mute     <workflowId> [--note "..."]
 
 Env: WORKFLOW_API_URL (app base URL), EVENTS_TABLE, TICKETS_TABLE,
@@ -168,7 +168,7 @@ def cmd_dispatch(args):
     if TICKET_PROVIDER != "jira":
         refuse_if_protected(get_ticket(args.ticket_id))
     result = api_post(f"/api/workflow/{args.workflow_id}/nudge",
-                      {"ticketId": args.ticket_id, "force": True})
+                      {"ticketId": args.ticket_id})
     publish_intervention(args.workflow_id, "dispatch", {
         "ticketId": args.ticket_id, "note": args.note,
         "nudged": result.get("nudged"),
@@ -179,15 +179,11 @@ def cmd_dispatch(args):
 def cmd_complete(args):
     """Close out a run whose work is actually finished but whose bookkeeping
     never rolled up. The API refuses (409) unless every non-epic child is
-    done/cancelled — this is an honest close, never a fake one. `--force` is
-    for operators who have independently confirmed completion."""
+    done/cancelled — this is an honest close with no bypass. If it refuses,
+    the run genuinely has open work: `dispatch` it or `escalate`, don't force."""
     body = {"reason": args.reason or "Closed by Workflow Manager: work finished, bookkeeping rolled up."}
-    if args.force:
-        body["force"] = True
     result = api_post(f"/api/workflow/{args.workflow_id}/complete", body)
-    publish_intervention(args.workflow_id, "complete", {
-        "note": args.reason, "forced": bool(args.force),
-    })
+    publish_intervention(args.workflow_id, "complete", {"note": args.reason})
     print(json.dumps({"action": "complete", "workflowId": args.workflow_id, **result}, indent=2))
 
 
@@ -286,7 +282,6 @@ def main():
     p = sub.add_parser("complete")
     p.add_argument("workflow_id")
     p.add_argument("--reason", default="")
-    p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_complete)
 
     p = sub.add_parser("mute")

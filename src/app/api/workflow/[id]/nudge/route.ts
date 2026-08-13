@@ -72,19 +72,32 @@ async function nudgeJira(epicId: string) {
 
 // ─── Targeted dispatch (Jira) ───────────────────────────────────────────────
 
+/** Statuses that must never be reopened by a targeted dispatch. `cancelled` is
+ *  terminal alongside `done` — reopening intentionally-cancelled work would run
+ *  it again. */
+const DISPATCH_TERMINAL = new Set(["done", "cancelled"]);
+
 /**
  * Force a single ticket to Ready regardless of its current column, EXCEPT
  * terminal/human-gate states. This is the `dispatch` path: an orphan that a
  * missed stream/webhook left parked (e.g. "In Progress" with no agent ever
  * assigned) matches none of the scan's stuck-patterns, so the scan can't move
- * it. Never touches Done/In Review — those are finished or human-owned.
+ * it. Never touches Done/Cancelled/In Review — those are terminal or human-owned.
+ *
+ * Ownership is verified against `epicId` (the ticket's parent must be this
+ * workflow's epic) so `/workflow/A/nudge` can't move a ticket that belongs to
+ * workflow B and mis-record the intervention against A.
  */
-async function dispatchJira(ticketKey: string) {
+async function dispatchJira(ticketKey: string, epicId: string | undefined) {
   const jira = JiraClient.fromEnv();
-  const issue = await jira.getIssue(ticketKey, ["status"]);
+  const issue = await jira.getIssue(ticketKey, ["status", "parent"]);
+  const parentKey = (issue.fields.parent as { key?: string } | undefined)?.key;
+  if (!epicId || parentKey !== epicId) {
+    return { ticketsScanned: 0, nudged: [], skipped: `${ticketKey} does not belong to this workflow (parent=${parentKey ?? "none"})` };
+  }
   const internal = mapJiraStatusToInternal(issue.fields.status?.name || "To Do");
-  if (internal === "done") {
-    return { ticketsScanned: 1, nudged: [], skipped: `${ticketKey} already done` };
+  if (DISPATCH_TERMINAL.has(internal)) {
+    return { ticketsScanned: 1, nudged: [], skipped: `${ticketKey} is ${internal} — terminal` };
   }
   if (internal === "in_review") {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketKey} is in review — human-owned` };
@@ -93,12 +106,20 @@ async function dispatchJira(ticketKey: string) {
   return { ticketsScanned: 1, nudged: [`${ticketKey} (dispatch→ready)`] };
 }
 
-async function dispatchDynamoDB(ticketId: string) {
+async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: string | undefined) {
   const got = await ddb.send(new GetCommand({ TableName: TICKETS_TABLE, Key: { ticketId } }));
   const ticket = got.Item;
   if (!ticket) return { ticketsScanned: 0, nudged: [], skipped: `${ticketId} not found` };
+  // Verify ownership: the ticket must be tagged with this workflow or parented
+  // to its epic. Prevents a stale/confused ID from moving another run's ticket.
+  const owns = ticket.workflowId === workflowId || (epicId && ticket.parentId === epicId);
+  if (!owns) {
+    return { ticketsScanned: 0, nudged: [], skipped: `${ticketId} does not belong to this workflow` };
+  }
   const status = String(ticket.status || "");
-  if (status === "done") return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} already done` };
+  if (DISPATCH_TERMINAL.has(status)) {
+    return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} is ${status} — terminal` };
+  }
   if (status === "in_review" || String(ticket.assignee || "").startsWith("human:")) {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} is human-owned` };
   }
@@ -199,8 +220,8 @@ export async function POST(
 
     if (targetTicketId) {
       result = ticketProvider === "jira"
-        ? await dispatchJira(targetTicketId)
-        : await dispatchDynamoDB(targetTicketId);
+        ? await dispatchJira(targetTicketId, epicId)
+        : await dispatchDynamoDB(targetTicketId, workflowId, epicId);
     } else if (ticketProvider === "jira") {
       if (!epicId) {
         return NextResponse.json({ error: "Workflow has no epicId — cannot query Jira" }, { status: 400 });

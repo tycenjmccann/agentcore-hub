@@ -6,17 +6,20 @@
  * or the last tickets were closed out-of-band). This is the write path the
  * Workflow Manager's watch-mode `complete` intervention calls.
  *
- * Guardrail — this NEVER fakes completion:
+ * Guardrail — this NEVER fakes completion, and there is NO bypass:
  *   1. Reads every child ticket via the configured provider (Jira or DynamoDB).
- *   2. Refuses (409) unless ALL non-epic children are done/cancelled.
+ *   2. Refuses (409) unless ALL non-epic children are done/cancelled. There is
+ *      deliberately no `force` flag — the manager toolkit is unauthenticated, so
+ *      an unconditional bypass would let a mistaken diagnosis (or prompt
+ *      injection) mark unfinished work complete. Genuinely-finished-but-
+ *      unrecorded work is resolved by closing the child ticket, not bypassing.
  *   3. Transitions the epic ticket to Done (Jira) so the board rolls up.
- *   4. Conditional write: phase → "complete", completedAt, managerWatch=false.
- *   5. Publishes workflow.complete (drives the ANALYZE trigger + clears the UI).
+ *   4. Conditional write: phase → "complete", completedAt, managerWatch=false,
+ *      and compacts runaway escalation noise in the same write.
+ *   5. Publishes workflow.complete on EventBridge (drives the ANALYZE trigger)
+ *      AND to the events table under workflowId (clears the live SSE board).
  *
- * Body: { reason?: string, force?: boolean }
- *   force=true skips the all-children-done gate — reserved for operators who
- *   have independently confirmed the run is finished. The response records
- *   which path was taken so it is auditable.
+ * Body: { reason?: string }
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -27,6 +30,7 @@ import {
   UpdateCommand,
   PutCommand,
 } from "@aws-sdk/lib-dynamodb";
+import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
@@ -34,6 +38,7 @@ import { JiraClient } from "@/lib/workflow/jira-client";
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
+const EVENT_BUS = process.env.EVENT_BUS || "default";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 
 const TERMINAL_PHASES = ["complete", "error", "cancelled"] as const;
@@ -42,6 +47,7 @@ const DONE_STATUSES = new Set(["done", "cancelled"]);
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
 });
+const eventBridge = new EventBridgeClient({ region: REGION });
 
 export const dynamic = "force-dynamic";
 
@@ -91,13 +97,11 @@ export async function POST(
   }
 
   let reason: string | undefined;
-  let force = false;
   try {
     const body = await request.json();
     if (body && typeof body.reason === "string" && body.reason.trim()) {
       reason = body.reason.trim().slice(0, 500);
     }
-    force = body?.force === true;
   } catch {
     /* no body */
   }
@@ -138,7 +142,7 @@ export async function POST(
     }
 
     const open = openChildren(tickets);
-    if (open.length > 0 && !force) {
+    if (open.length > 0) {
       return NextResponse.json(
         {
           error: "Work not finished — refusing to complete",
@@ -147,7 +151,7 @@ export async function POST(
             status: t.status,
             title: t.title,
           })),
-          hint: "Finish or cancel these tickets, or pass force=true if you have independently confirmed the run is done.",
+          hint: "Finish or cancel these tickets first — completion has no bypass.",
         },
         { status: 409 }
       );
@@ -182,8 +186,7 @@ export async function POST(
           Key: { workflowId },
           UpdateExpression:
             "SET #phase = :complete, completedAt = :ts, previousPhase = :prev, managerWatch = :false, humanNotifications = :notifs" +
-            (reason ? ", completeReason = :reason" : "") +
-            (force ? ", completedForce = :true" : ""),
+            (reason ? ", completeReason = :reason" : ""),
           ConditionExpression:
             "#phase <> :complete AND #phase <> :error AND #phase <> :alreadyCancelled",
           ExpressionAttributeNames: { "#phase": "phase" },
@@ -196,7 +199,6 @@ export async function POST(
             ":error": "error",
             ":alreadyCancelled": "cancelled",
             ...(reason ? { ":reason": reason } : {}),
-            ...(force ? { ":true": true } : {}),
           },
         })
       );
@@ -210,25 +212,45 @@ export async function POST(
       throw err;
     }
 
-    // 5. Publish workflow.complete (non-fatal) — drives ANALYZE + clears the board.
+    // 5. Publish workflow.complete. Two sinks, matching the orchestrator's
+    //    publishEvent: EventBridge (source agentcore-hub.orchestrator, detail
+    //    type workflow.complete) drives the ANALYZE trigger; the events-table
+    //    row is partitioned under workflowId so the live SSE board — which
+    //    queries by workflowId — clears immediately. Both are non-fatal.
+    const detail = {
+      workflowId,
+      completedAt,
+      previousPhase: workflow.phase,
+      closedBy: "workflow-manager",
+      epicRolledUp,
+      ...(reason ? { reason } : {}),
+    };
+    try {
+      await eventBridge.send(
+        new PutEventsCommand({
+          Entries: [
+            {
+              Source: "agentcore-hub.orchestrator",
+              DetailType: "workflow.complete",
+              Detail: JSON.stringify({ ...detail, timestamp: completedAt }),
+              EventBusName: EVENT_BUS,
+            },
+          ],
+        })
+      );
+    } catch (err) {
+      console.warn(`[complete] EventBridge publish failed: ${(err as Error).message}`);
+    }
     try {
       await ddb.send(
         new PutCommand({
           TableName: EVENTS_TABLE,
           Item: {
-            workflowId: workflow.epicId || workflowId,
+            workflowId,
             eventId: `${Date.now()}-complete-${Math.random().toString(36).slice(2, 6)}`,
             timestamp: completedAt,
             type: "workflow.complete",
-            detail: {
-              workflowId,
-              completedAt,
-              previousPhase: workflow.phase,
-              closedBy: "workflow-manager",
-              epicRolledUp,
-              forced: force,
-              ...(reason ? { reason } : {}),
-            },
+            detail,
           },
         })
       );
@@ -237,10 +259,10 @@ export async function POST(
     }
 
     console.log(
-      `[complete] Workflow ${workflowId} completed (was: ${workflow.phase}, force=${force}, epicRolledUp=${epicRolledUp})`
+      `[complete] Workflow ${workflowId} completed (was: ${workflow.phase}, epicRolledUp=${epicRolledUp})`
     );
     return NextResponse.json(
-      { status: "complete", completedAt, epicRolledUp, forced: force, ...(reason ? { reason } : {}) },
+      { status: "complete", completedAt, epicRolledUp, ...(reason ? { reason } : {}) },
       { status: 200 }
     );
   } catch (err) {
