@@ -54,9 +54,15 @@ function applyEventToState(s: WorkflowState, event: WorkflowEvent): WorkflowStat
     case "agent_status": {
       const tasks = { ...s.agentTasks };
       if (tasks[event.agentId]) {
-        // Never regress a completed agent back to running
-        if (tasks[event.agentId].status === "complete") return s;
-        tasks[event.agentId] = { ...tasks[event.agentId], status: event.status };
+        // Never regress a completed agent back to running — unless this is a
+        // NEW ticket (e.g. QA fix-it), which is a legitimate re-invocation.
+        const isNewTicket = !!event.ticketId && event.ticketId !== tasks[event.agentId].ticketId;
+        if (tasks[event.agentId].status === "complete" && !isNewTicket) return s;
+        tasks[event.agentId] = {
+          ...tasks[event.agentId],
+          status: event.status,
+          ...(isNewTicket ? { ticketId: event.ticketId } : {}),
+        };
       } else {
         tasks[event.agentId] = { id: `task_${Date.now()}`, agentId: event.agentId, ticketId: event.ticketId || "", status: event.status, input: "" };
       }
@@ -167,6 +173,26 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
 
   // Ticket status map — seeded from fetch, updated via SSE
   const [ticketStatusMap, setTicketStatusMap] = useState<Record<string, { status: TicketStatus; title: string; updatedAt: string; assignee?: string }>>({});
+
+  // Agents that still have an open ticket (todo/ready/in_progress) — e.g. QA
+  // fix-it tickets filed after the agent's first pass completed. These keep the
+  // section (and its agent row) visibly active until the ticket closes, even
+  // though the agentTask is already "complete".
+  const openTicketByAgent = useMemo(() => {
+    const map = new Map<string, { ticketId: string; status: TicketStatus }>();
+    for (const [ticketId, t] of Object.entries(ticketStatusMap)) {
+      const isOpen = t.status === "todo" || t.status === "ready" || t.status === "in_progress";
+      // human:* assignees are review gates, not agent work — handled separately
+      if (!t.assignee || t.assignee.startsWith("human:") || !isOpen) continue;
+      const existing = map.get(t.assignee);
+      // Prefer in_progress over todo/ready when an agent has several open tickets
+      if (!existing || (t.status === "in_progress" && existing.status !== "in_progress")) {
+        map.set(t.assignee, { ticketId, status: t.status });
+      }
+    }
+    return map;
+  }, [ticketStatusMap]);
+  const hasOpenTickets = openTicketByAgent.size > 0;
 
   // Modal open state for future TicketDetailModal
   const [openTicketModal, setOpenTicketModal] = useState<{ ticketId: string; workflowId: string } | null>(null);
@@ -361,12 +387,14 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         .catch(() => {});
     };
     fetchTickets();
-    // Poll every 15s while workflow is active (no SSE ticket_update events yet)
-    const isActive = state?.phase && state.phase !== "complete";
+    // Poll every 15s while workflow is active (no SSE ticket_update events yet).
+    // Keep polling a "complete" run while fix-it tickets remain open so the
+    // board un-freezes itself when QA follow-ups finally close.
+    const isActive = state?.phase && (state.phase !== "complete" || hasOpenTickets);
     if (!isActive) return;
     const interval = setInterval(fetchTickets, 15_000);
     return () => clearInterval(interval);
-  }, [workflowId, agentTaskKeys, state?.phase]);
+  }, [workflowId, agentTaskKeys, state?.phase, hasOpenTickets]);
 
 
   // Live-poll agent output while panel is open and agent is running
@@ -620,9 +648,15 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           if (!s) return s;
           const tasks = { ...s.agentTasks };
           if (tasks[event.agentId]) {
-            // Never regress a completed agent back to running (late/duplicate events)
-            if (tasks[event.agentId].status === "complete") return s;
-            tasks[event.agentId] = { ...tasks[event.agentId], status: event.status };
+            // Never regress a completed agent back to running (late/duplicate
+            // events) — unless a NEW ticketId means a real re-invocation (fix-it).
+            const isNewTicket = !!event.ticketId && event.ticketId !== tasks[event.agentId].ticketId;
+            if (tasks[event.agentId].status === "complete" && !isNewTicket) return s;
+            tasks[event.agentId] = {
+              ...tasks[event.agentId],
+              status: event.status,
+              ...(isNewTicket ? { ticketId: event.ticketId } : {}),
+            };
           } else {
             tasks[event.agentId] = {
               id: `task_${Date.now()}`,
@@ -810,7 +844,9 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
 
   // Derive visual states from workflow state
   const currentPhaseIndex = state ? (phaseOrder[state.phase] ?? -1) : -1;
-  const isComplete = state?.phase === "complete";
+  // A run isn't visually "complete" while fix-it tickets are still open —
+  // QA can file follow-ups after every phase has passed once.
+  const isComplete = state?.phase === "complete" && !hasOpenTickets;
   const isSettled = isComplete && !celebrating;
 
   // Trigger connector animation when activeConnector changes
@@ -1034,11 +1070,14 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     const tasks = phase.agents.map((a) => state.agentTasks[a.agentId]).filter(Boolean);
     if (tasks.length === 0) return "inactive";
 
-    // Active = at least one agent is running/waiting
+    // Active = at least one agent is running/waiting, OR still has an open
+    // ticket (todo/ready/in_progress) — e.g. a QA fix-it ticket filed after
+    // the agent's first pass completed.
     const hasRunning = tasks.some(
       (t) => t.status === "running" || t.status === "waiting_response"
     );
-    if (hasRunning) return "active";
+    const hasOpenTicket = phase.agents.some((a) => openTicketByAgent.has(a.agentId));
+    if (hasRunning || hasOpenTicket) return "active";
 
     // Done = all agents that have tasks are complete
     const allComplete = tasks.every((t) => t.status === "complete");
@@ -1231,7 +1270,12 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           )}
 
           <div className={`pipeline-status-header ${isComplete ? "settled" : ""} ${state.phase === "cancelled" ? "cancelled" : ""}`}>
-            {isComplete ? "Complete" : state.phase === "cancelled" ? "Cancelled" : state.phase === "error" ? "Error" : `In Progress: ${pipelinePhases[currentPhaseIndex]?.name || state.phase}`}
+            {isComplete ? "Complete" : state.phase === "cancelled" ? "Cancelled" : state.phase === "error" ? "Error" : `In Progress: ${
+              // Phase "complete" with open fix-it tickets → name the phase still working
+              (state.phase === "complete"
+                ? pipelinePhases.find((p) => p.agents.some((a) => openTicketByAgent.has(a.agentId)))?.name
+                : pipelinePhases[currentPhaseIndex]?.name) || state.phase
+            }`}
           </div>
 
 
@@ -1396,16 +1440,23 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                         {phase.agents.map((agent) => {
                           const agentTask = state?.agentTasks[agent.agentId];
                           const isAgentStale = (isStale || manualStaleAgents.has(agent.agentId)) && agentTask && (agentTask.status === "running" || agentTask.status === "waiting_response");
+                          // Open fix-it ticket overrides a "complete" agentTask —
+                          // the agent still has work queued/running for this run.
+                          const openTicket = openTicketByAgent.get(agent.agentId);
                           const agentItemClass = agentTask
                             ? isAgentStale
                               ? "error"
                               : agentTask.status === "running" || agentTask.status === "waiting_response"
                               ? "working"
+                              : openTicket
+                              ? (openTicket.status === "in_progress" ? "working" : "active-glow")
                               : agentTask.status === "complete"
                               ? "done"
                               : agentTask.status === "error"
                               ? "error"
                               : getItemClass(idx)
+                            : openTicket
+                            ? (openTicket.status === "in_progress" ? "working" : "active-glow")
                             : getItemClass(idx);
                           return (
                             <div
@@ -1430,7 +1481,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                               <span className="item-label">{agent.displayName}</span>
                               <span className="flex-shrink-0 flex items-center gap-2" style={{ marginLeft: 'auto' }}>
                                 {(() => {
-                                  const tid = agentTicketMapRef.current[agent.agentId] || agentTask?.ticketId;
+                                  // Prefer the open fix-it ticket over the original (closed) one
+                                  const tid = openTicket?.ticketId || agentTicketMapRef.current[agent.agentId] || agentTask?.ticketId;
                                   if (!tid) return null;
                                   const ticketInfo = ticketStatusMap[tid];
                                   // Derive status from agentTask when ticketStatusMap hasn't caught up
@@ -1556,8 +1608,9 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           </div>
         </div>
 
-        {/* Workflow Manager — per-run analysis (terminal runs only) */}
-        {(state.phase === "complete" || state.phase === "cancelled" || state.phase === "error") && (
+        {/* Workflow Manager — per-run analysis (terminal runs only; a run with
+            open fix-it tickets isn't terminal yet) */}
+        {(isComplete || state.phase === "cancelled" || state.phase === "error") && (
           <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} />
         )}
 
