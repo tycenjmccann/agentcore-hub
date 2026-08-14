@@ -119,9 +119,15 @@ def cmd_retry(args):
     ).get("Item")
     if not wf:
         raise SystemExit("REFUSED: workflow not found")
-    for tid, task in (wf.get("agentTasks") or {}).items():
-        if task.get("agentId") == args.agent_id or task.get("assignee") == args.agent_id:
-            refuse_if_protected(get_ticket(tid) or {"ticketId": tid})
+    # Local guard only in DynamoDB mode — in Jira mode the DDB tickets table is
+    # optional/absent and get_ticket() hard-fails (ResourceNotFoundException),
+    # blocking every retry. Same pattern as cmd_comment: the retry endpoint
+    # itself refuses done/in_review/cancelled work, so the guard is still
+    # enforced server-side.
+    if TICKET_PROVIDER != "jira":
+        for tid, task in (wf.get("agentTasks") or {}).items():
+            if task.get("agentId") == args.agent_id or task.get("assignee") == args.agent_id:
+                refuse_if_protected(get_ticket(tid) or {"ticketId": tid})
     result = api_post(f"/api/workflow/{args.workflow_id}/retry", {"agentId": args.agent_id})
     publish_intervention(args.workflow_id, "retry", {
         "agentId": args.agent_id, "ticketId": result.get("ticketId"), "note": args.note,
