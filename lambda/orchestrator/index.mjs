@@ -1293,22 +1293,17 @@ async function invokeAgent(agentDef, context, workflow) {
   const harnessArn = agentDef.runtimeArn || process.env[runtimeEnvKey] || process.env[harnessEnvKey];
   if (!harnessArn) {
     console.error(`[orchestrator] No ARN for agent: ${agentDef.agentId}. Tried ${runtimeEnvKey} and ${harnessEnvKey}. Marking ticket blocked.`);
-    // Mark ticket blocked instead of silently returning — prevents stuck workflows
     const task = Object.values(workflow.agentTasks || {}).find(t => t.agentId === agentDef.agentId && t.status === "running");
-    if (task?.ticketId) {
-      await ddb.send(new UpdateCommand({
-        TableName: TICKETS_TABLE,
-        Key: { ticketId: task.ticketId },
-        UpdateExpression: "SET #s = :s, #u = :u",
-        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-        ExpressionAttributeValues: { ":s": "blocked", ":u": new Date().toISOString() },
-      }));
-    }
+    // Publish the error FIRST — the ticket-blocking below can fail (e.g. the
+    // tickets table doesn't exist in Jira mode) and the Workflow Manager needs
+    // an agent.error event to distinguish "never started" from "hung".
     await publishEvent(workflow.epicId, "agent.error", {
       agentId: agentDef.agentId,
       workflowId: workflow.id,
+      ticketId: task?.ticketId || "",
       error: `No runtime ARN configured. Set ${runtimeEnvKey} env var on orchestrator Lambda.`,
     });
+    await blockTicketForFailedInvoke(task?.ticketId, "no runtime ARN configured");
     return;
   }
   console.log(`[orchestrator] Using ${harnessArn.includes("/runtime/") ? "Runtime" : "Harness"} for ${agentDef.agentId}`);
@@ -1385,17 +1380,46 @@ async function invokeAgent(agentDef, context, workflow) {
     }
   } catch (err) {
     console.error(`[orchestrator] Failed to invoke ${agentDef.agentId}:`, err);
-    // Mark ticket as blocked
-    const task = workflow.agentTasks?.[agentDef.agentId];
-    if (task) {
+    const task = Object.values(workflow.agentTasks || {}).find(t => t.agentId === agentDef.agentId && t.status === "running");
+    // Error event first — see the no-ARN path above for why.
+    await publishEvent(workflow.epicId, "agent.error", {
+      agentId: agentDef.agentId,
+      workflowId: workflow.id,
+      ticketId: task?.ticketId || "",
+      error: `Invoke failed: ${err.message}`,
+    });
+    await blockTicketForFailedInvoke(task?.ticketId, `invoke failed: ${err.message}`);
+  }
+}
+
+/**
+ * Park a ticket whose agent invoke failed, provider-aware. In Jira mode the
+ * DynamoDB tickets table is optional/absent — the old direct DDB write threw
+ * ResourceNotFoundException, which killed the handler and left the ticket
+ * showing In Progress forever with no error event (the TEAM-2229 stall). Jira
+ * mode transitions the issue to Blocked (fallback To Do) and leaves a comment
+ * so the failure is visible on the board. Best-effort: never throws.
+ */
+async function blockTicketForFailedInvoke(ticketId, reason) {
+  if (!ticketId) return;
+  try {
+    if (TICKET_PROVIDER === "jira") {
+      const moved = (await jiraTransition(ticketId, "Blocked")) || (await jiraTransition(ticketId, "To Do"));
+      if (!moved) console.warn(`[orchestrator] Could not park ${ticketId} after failed invoke`);
+      await jiraFetch(`/rest/api/3/issue/${ticketId}/comment`, "POST", {
+        body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: `AgentCore Hub: agent invoke failed (${reason}). Move this ticket back to Ready to retry once the cause is fixed.` }] }] },
+      });
+    } else {
       await ddb.send(new UpdateCommand({
         TableName: TICKETS_TABLE,
-        Key: { ticketId: task.ticketId },
+        Key: { ticketId },
         UpdateExpression: "SET #s = :s, #u = :u",
         ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
         ExpressionAttributeValues: { ":s": "blocked", ":u": new Date().toISOString() },
       }));
     }
+  } catch (err) {
+    console.warn(`[orchestrator] blockTicketForFailedInvoke(${ticketId}) failed: ${err.message}`);
   }
 }
 
