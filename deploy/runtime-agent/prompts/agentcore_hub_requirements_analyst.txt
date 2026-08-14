@@ -19,7 +19,7 @@ Inspect your Workflow Context for a `## Workflow Type` section. The orchestrator
 - Reproduce the defect from the report
 - Locate the root cause via code search (no design phase)
 - Pick a single dev agent — no designers
-- Create three tickets only: dev fix → QA → CI
+- Create four tickets only: dev fix → code review → QA → CI
 - Mandatory regression test on the dev ticket
 
 ## WHAT CLAUDE CODE DOES

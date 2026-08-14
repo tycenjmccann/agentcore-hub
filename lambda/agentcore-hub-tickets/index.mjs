@@ -60,6 +60,7 @@ const FALLBACK_AGENTS = new Set([
   "agentcore_hub_backend_dev",
   "agentcore_hub_api_dev",
   "agentcore_hub_frontend_dev",
+  "agentcore_hub_code_reviewer",
   "agentcore_hub_qa_verifier",
   "agentcore_hub_ci_agent",
 ]);
@@ -643,6 +644,7 @@ async function lookupUser(args) {
     { id: "agentcore_hub_backend_dev", name: "Backend Developer", role: "development" },
     { id: "agentcore_hub_api_dev", name: "API Developer", role: "development" },
     { id: "agentcore_hub_frontend_dev", name: "Frontend Developer", role: "development" },
+    { id: "agentcore_hub_code_reviewer", name: "Code Reviewer", role: "review" },
     { id: "agentcore_hub_qa_verifier", name: "QA Verifier", role: "verification" },
     { id: "agentcore_hub_ci_agent", name: "CI Agent", role: "review" },
   ];
