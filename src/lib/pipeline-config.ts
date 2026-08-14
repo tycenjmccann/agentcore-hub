@@ -265,6 +265,8 @@ export interface PipelinePhaseConfig {
   type: "app" | "agent";
   typeLabel: string;
   agentPhase: string;
+  /** Extra agents.json phase values rolled up into this phase (display only). */
+  extraAgentPhases?: string[];
   identity: PipelineIdentityItem[];
   config: PipelineConfigItem[];
   tools: PipelineDisplayItem[];
@@ -278,26 +280,19 @@ export interface PipelinePhaseConfig {
 }
 
 // ─── Phase-to-agentPhase mapping ────────────────────────────────────────────
-// Maps agents.json phase values to pipeline phase IDs.
-// agents.json uses "verification" and "review" for QA agents.
-
-const AGENT_PHASE_TO_PIPELINE_PHASE: Record<string, PipelinePhaseId> = {
-  requirements: "requirements",
-  design: "design",
-  development: "development",
-  verification: "qa",
-  review: "qa",
-};
 
 /**
  * Build the agentPhase → pipeline-phase-id map for a workflow definition.
- * For software-delivery this reproduces AGENT_PHASE_TO_PIPELINE_PHASE; for other
- * workflows each phase's agentPhase maps to its own phase id.
+ * Each phase's agentPhase (plus any extraAgentPhases, e.g. software-delivery's
+ * "review" agents rolling up into the QA card) maps to that phase's id.
  */
 function phaseMapForDef(def: WorkflowDef): Record<string, string> {
   const map: Record<string, string> = {};
   for (const phase of def.phases) {
     map[phase.agentPhase] = phase.id;
+    for (const extra of phase.extraAgentPhases || []) {
+      map[extra] = phase.id;
+    }
   }
   return map;
 }
@@ -436,6 +431,7 @@ function buildPipelinePhasesForDef(def: WorkflowDef): PipelinePhaseConfig[] {
       type: meta.type,
       typeLabel,
       agentPhase: meta.agentPhase,
+      extraAgentPhases: defPhase.extraAgentPhases,
       identity: meta.identity,
       config: meta.config,
       tools: phaseTools,

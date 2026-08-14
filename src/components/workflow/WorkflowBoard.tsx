@@ -35,6 +35,10 @@ function buildPhaseOrder(phases: PipelinePhaseConfig[]): Record<string, number> 
     if (phase.agentPhase !== phase.id) {
       order[phase.agentPhase] = idx;
     }
+    // extraAgentPhases roll up into this phase for display (e.g. "review" → qa)
+    for (const extra of phase.extraAgentPhases || []) {
+      order[extra] = idx;
+    }
   });
   // Special states. (No hardcoded "review" override — the loop above already
   // maps every phase id and agentPhase to its correct index per the running

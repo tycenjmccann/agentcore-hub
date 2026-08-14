@@ -19,7 +19,7 @@
         { "id": "requirements", "name": "Requirements", "type": "agent", "agentPhase": "requirements" },
         { "id": "design", "name": "Design", "type": "agent", "agentPhase": "design" },
         { "id": "development", "name": "Development", "type": "agent", "agentPhase": "development" },
-        { "id": "qa", "name": "QA & Ship", "type": "agent", "agentPhase": "verification" }
+        { "id": "qa", "name": "QA & Ship", "type": "agent", "agentPhase": "verification", "extraAgentPhases": ["review"] }
       ]
     },
     {

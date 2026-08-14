@@ -28,6 +28,13 @@ export interface WorkflowDefPhase {
   type: WorkflowPhaseType;
   /** The agents.json `phase` value mapped to this pipeline phase */
   agentPhase: string;
+  /**
+   * Additional agents.json `phase` values that roll up into this pipeline phase
+   * for DISPLAY purposes only (e.g. software-delivery's "review" agents — code
+   * reviewer + CI — live on the QA card). The orchestrator's phase-advancement
+   * order is derived solely from `agentPhase`, so these never affect it.
+   */
+  extraAgentPhases?: string[];
 }
 
 /**
