@@ -137,7 +137,7 @@ done
 
 # ── Remap agents.json so every persona points at the right anchor ───────────
 echo ""
-echo "→ Mapping ${#ANCHORS[@]} anchor ARN(s) onto 14 personas in agents.json"
+echo "→ Mapping ${#ANCHORS[@]} anchor ARN(s) onto all personas in agents.json"
 
 # In 1-mode only ANCHOR_REQ (agentcore_hub_agent) is populated and arn_for()
 # returns it for every persona. In 4-mode each phase anchor is populated.
@@ -221,7 +221,7 @@ except json.JSONDecodeError as e:
 with open(agents_path, "w") as f:
     f.write(text)
 
-print(f"  Updated runtimeArn on {updated}/14 personas")
+print(f"  Updated runtimeArn on {updated}/{len(config['agents'])} personas")
 PYEOF
 
 # ── Upload the rewritten agents.json so Lambdas pick it up at next cold start ─

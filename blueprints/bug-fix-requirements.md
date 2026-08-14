@@ -10,7 +10,7 @@ Load this blueprint when your Workflow Context contains a `## Workflow Type` sec
 The **Bug ticket itself is the workflow root.** There is no separate Epic wrapper.
 
 - The Bug's key is the workflow's `epic_id` (the orchestrator stores it that way regardless of issue type).
-- Your three new tickets must be created as **sub-tasks of the Bug** — Jira allows `Subtask → Bug` but does NOT allow `Task → Bug`.
+- Your four new tickets must be created as **sub-tasks of the Bug** — Jira allows `Subtask → Bug` but does NOT allow `Task → Bug`.
 - When calling `Tickets___create_ticket`, you MUST pass:
   - `ticket_type="subtask"` (the tool kwarg is **`ticket_type`**, not `issue_type`)
   - `parent_id="<the bug's key>"` (the tool kwarg is **`parent_id`**, not `parent_key`)
@@ -64,9 +64,10 @@ Match the suspected subsystem from Step 2 to a dev agent:
 
 If the symptom is in the UI but the report or stack trace points to a server response, pick `agentcore_hub_backend_dev` — fix the source, not the symptom.
 
-### Step 5: Create Three Sub-Tasks Under the Bug
+### Step 5: Create Four Sub-Tasks Under the Bug
 
-Create exactly three sub-tasks — no design phase, no top-level tickets:
+Create exactly four sub-tasks — no design phase, no top-level tickets. The chain
+is dev fix → code review → QA → CI:
 
 1. **Dev fix sub-task**
    - `assignee`: the single dev agent from Step 4
@@ -81,7 +82,20 @@ Create exactly three sub-tasks — no design phase, no top-level tickets:
    - `ticket_type`: `"subtask"`
    - `blocked_by`: `""` (runs immediately)
 
-2. **QA verification sub-task**
+2. **Code review sub-task**
+   - `assignee`: `agentcore_hub_code_reviewer`
+   - `title`: `Review fix: {one-line description}`
+   - `description`:
+     - Link to bug-analysis.md and the dev fix sub-task key + branch
+     - **Required:** review the fix branch diff adversarially — confirm the fix
+       addresses the ROOT CAUSE (not the symptom) and does not introduce races,
+       eventual-consistency reads, null/empty gaps, or regressions. Verify the
+       regression test actually exercises the failure path, not just the happy path.
+   - `parent_id`: the Bug's key
+   - `ticket_type`: `"subtask"`
+   - `blocked_by`: `{dev-fix-subtask-key}`
+
+3. **QA verification sub-task**
    - `assignee`: `agentcore_hub_qa_verifier`
    - `title`: `Verify fix: {one-line description}`
    - `description`:
@@ -91,9 +105,9 @@ Create exactly three sub-tasks — no design phase, no top-level tickets:
      - Standard build + visual checks
    - `parent_id`: the Bug's key
    - `ticket_type`: `"subtask"`
-   - `blocked_by`: `{dev-fix-subtask-key}`
+   - `blocked_by`: `{code-review-subtask-key}`
 
-3. **CI sub-task**
+4. **CI sub-task**
    - `assignee`: `agentcore_hub_ci_agent`
    - `title`: `CI: {one-line description}`
    - `parent_id`: the Bug's key
@@ -101,7 +115,7 @@ Create exactly three sub-tasks — no design phase, no top-level tickets:
    - `blocked_by`: `{qa-subtask-key}`
 
 ### Step 6: Wrap Up
-- Comment on the Bug ticket: "Bug-fix flow — assigned to {dev-agent}. Root cause hypothesis: {one-line}. Sub-task chain: {fix-key} (fix) → {qa-key} (QA) → {ci-key} (CI)."
+- Comment on the Bug ticket: "Bug-fix flow — assigned to {dev-agent}. Root cause hypothesis: {one-line}. Sub-task chain: {fix-key} (fix) → {review-key} (review) → {qa-key} (QA) → {ci-key} (CI)."
 - Transition your own sub-task to `done`
 - `WorkflowOutput___report_completion`
 
@@ -118,4 +132,4 @@ Create exactly three sub-tasks — no design phase, no top-level tickets:
 - DO NOT default to "rewrite the component" — surgical change first
 
 ## Output Format Recap
-Three sub-tasks created under the Bug (dev → QA → CI), one bug-analysis.md saved to S3, one comment on the Bug, your sub-task transitioned to done.
+Four sub-tasks created under the Bug (dev fix → code review → QA → CI), one bug-analysis.md saved to S3, one comment on the Bug, your sub-task transitioned to done.

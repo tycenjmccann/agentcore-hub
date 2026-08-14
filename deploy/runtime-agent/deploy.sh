@@ -22,7 +22,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Agent list — numbered 1-14
+# Agent list — numbered 1-15
 AGENTS=(
   "agentcore_hub_requirements_analyst"   # 1
   "agentcore_hub_frontend_designer"      # 2
@@ -36,8 +36,9 @@ AGENTS=(
   "agentcore_hub_backend_dev"            # 10
   "agentcore_hub_api_dev"                # 11
   "agentcore_hub_frontend_dev"           # 12
-  "agentcore_hub_qa_verifier"            # 13
-  "agentcore_hub_ci_agent"               # 14
+  "agentcore_hub_code_reviewer"          # 13
+  "agentcore_hub_qa_verifier"            # 14
+  "agentcore_hub_ci_agent"               # 15
 )
 
 # --- Handle --list and --help early (no AWS creds needed) ---

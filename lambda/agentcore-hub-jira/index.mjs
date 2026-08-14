@@ -41,6 +41,7 @@ const FALLBACK_ASSIGNEES = new Set([
   "agentcore_hub_backend_dev",
   "agentcore_hub_api_dev",
   "agentcore_hub_frontend_dev",
+  "agentcore_hub_code_reviewer",
   "agentcore_hub_qa_verifier",
   "agentcore_hub_ci_agent",
 ]);

@@ -93,7 +93,7 @@ fi
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 
-# All 14 agents — same code, different runtime name + system prompt
+# All 15 agents — same code, different runtime name + system prompt
 AGENTS=(
   "agentcore_hub_requirements_analyst"
   "agentcore_hub_frontend_designer"
@@ -107,6 +107,7 @@ AGENTS=(
   "agentcore_hub_backend_dev"
   "agentcore_hub_api_dev"
   "agentcore_hub_frontend_dev"
+  "agentcore_hub_code_reviewer"
   "agentcore_hub_qa_verifier"
   "agentcore_hub_ci_agent"
 )
