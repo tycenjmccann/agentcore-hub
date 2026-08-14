@@ -245,7 +245,16 @@ aws iam put-role-policy \
           \"bedrock-agentcore:DeleteRegistryRecord\",
           \"bedrock-agentcore:SubmitRegistryRecordForApproval\",
           \"bedrock-agentcore:UpdateRegistryRecordStatus\",
-          \"bedrock-agentcore:SearchRegistryRecords\"
+          \"bedrock-agentcore:SearchRegistryRecords\",
+          \"bedrock-agentcore:ListMemories\",
+          \"bedrock-agentcore:GetMemory\",
+          \"bedrock-agentcore:ListActors\",
+          \"bedrock-agentcore:ListSessions\",
+          \"bedrock-agentcore:ListEvents\",
+          \"bedrock-agentcore:GetEvent\",
+          \"bedrock-agentcore:CreateEvent\",
+          \"bedrock-agentcore:ListMemoryRecords\",
+          \"bedrock-agentcore:RetrieveMemoryRecords\"
         ],
         \"Resource\": \"*\"
       },

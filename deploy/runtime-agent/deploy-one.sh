@@ -132,6 +132,7 @@ run_deploy() {
     --env "PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers" \
     --env "HOME=/tmp" \
     --env "TMPDIR=/tmp" \
+    ${FLEET_MEMORY_ID:+--env "MEMORY_ID=${FLEET_MEMORY_ID}"} \
     ${PROMPT_ENV} \
     ${MCP_ENV} 2>&1
 }

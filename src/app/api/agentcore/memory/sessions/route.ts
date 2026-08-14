@@ -38,7 +38,14 @@ export async function GET(req: NextRequest) {
 
     // Get actors
     const actorsRes = await c.send(new ListActorsCommand({ memoryId }));
-    const actors = actorsRes.actorSummaries || [];
+    let actors = actorsRes.actorSummaries || [];
+
+    // Shared memories (e.g. the fleet runtime memory) hold many personas keyed
+    // by actorId = agent id. If an actor matches this agent, scope to it so the
+    // detail view doesn't show other agents' sessions.
+    const agentBase = agentId.replace(/-[^-]+$/, "");
+    const own = actors.filter((a) => a.actorId === agentId || a.actorId === agentBase);
+    if (own.length > 0) actors = own;
 
     // Collect sessions from all actors
     const allSessions: Array<{
