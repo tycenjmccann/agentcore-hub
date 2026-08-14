@@ -174,14 +174,15 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // Ticket status map — seeded from fetch, updated via SSE
   const [ticketStatusMap, setTicketStatusMap] = useState<Record<string, { status: TicketStatus; title: string; updatedAt: string; assignee?: string }>>({});
 
-  // Agents that still have an open ticket (todo/ready/in_progress) — e.g. QA
-  // fix-it tickets filed after the agent's first pass completed. These keep the
-  // section (and its agent row) visibly active until the ticket closes, even
-  // though the agentTask is already "complete".
+  // Agents that still have an open (nonterminal) ticket — e.g. QA fix-it
+  // tickets filed after the agent's first pass completed, including ones that
+  // failed and got parked "blocked". These keep the section (and its agent
+  // row) visibly active until the ticket actually closes, even though the
+  // agentTask is already "complete".
   const openTicketByAgent = useMemo(() => {
     const map = new Map<string, { ticketId: string; status: TicketStatus }>();
     for (const [ticketId, t] of Object.entries(ticketStatusMap)) {
-      const isOpen = t.status === "todo" || t.status === "ready" || t.status === "in_progress";
+      const isOpen = t.status !== "done" && t.status !== "cancelled";
       // human:* assignees are review gates, not agent work — handled separately
       if (!t.assignee || t.assignee.startsWith("human:") || !isOpen) continue;
       const existing = map.get(t.assignee);
@@ -1449,14 +1450,14 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                               : agentTask.status === "running" || agentTask.status === "waiting_response"
                               ? "working"
                               : openTicket
-                              ? (openTicket.status === "in_progress" ? "working" : "active-glow")
+                              ? (openTicket.status === "in_progress" ? "working" : openTicket.status === "blocked" ? "error" : "active-glow")
                               : agentTask.status === "complete"
                               ? "done"
                               : agentTask.status === "error"
                               ? "error"
                               : getItemClass(idx)
                             : openTicket
-                            ? (openTicket.status === "in_progress" ? "working" : "active-glow")
+                            ? (openTicket.status === "in_progress" ? "working" : openTicket.status === "blocked" ? "error" : "active-glow")
                             : getItemClass(idx);
                           return (
                             <div
