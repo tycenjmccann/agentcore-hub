@@ -13,7 +13,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { JiraClient } from "@/lib/workflow/jira-client";
+import { JiraClient, mapJiraStatusToInternal } from "@/lib/workflow/jira-client";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -40,9 +40,19 @@ async function retryJira(workflowId: string, agentId: string, agentTasks: Record
     throw new Error(`No active ticket found for agent ${agentId}`);
   }
 
+  // Check the LIVE Jira status, not just the cached agentTasks entry. The
+  // webhook has no in_review case, so a ticket a human moved to In Review can
+  // still show "running" in agentTasks — retrying it would yank a human-owned
+  // review back to Ready.
+  const jira = JiraClient.fromEnv();
+  const issue = await jira.getIssue(ticketId, ["status"]);
+  const live = mapJiraStatusToInternal(issue.fields.status?.name || "To Do");
+  if (live === "done" || live === "in_review" || live === "cancelled") {
+    throw new Error(`Ticket ${ticketId} is ${live} in Jira — not retryable`);
+  }
+
   // Transition Jira ticket back to Ready, falling back to To Do (some boards
   // don't have a "Ready" state).
-  const jira = JiraClient.fromEnv();
   try {
     await jira.transitionIssue(ticketId, "Ready");
   } catch {
