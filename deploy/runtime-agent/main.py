@@ -68,6 +68,8 @@ else:
 
 import json
 import logging
+from datetime import datetime, timezone
+
 import boto3
 
 from strands import Agent, tool
@@ -141,6 +143,11 @@ GATEWAY_ARN = os.getenv("GATEWAY_ARN", "")
 # NOTE: AgentCore reserves "ARTIFACT_BUCKET" as a system env var (points to CodeBuild source bucket).
 # We use AGENTCORE_HUB_ARTIFACT_BUCKET to avoid the collision.
 ARTIFACT_BUCKET = os.getenv("AGENTCORE_HUB_ARTIFACT_BUCKET", os.getenv("ARTIFACT_BUCKET", ""))
+# AgentCore Memory (optional). When set, each invocation's user prompt +
+# assistant response is saved as a conversational event, keyed by the runtime
+# session id and the persona's agent_id as actor. The hub dashboard resolves
+# this same MEMORY_ID env var to render session/chat history.
+MEMORY_ID = os.getenv("MEMORY_ID", "")
 
 # System prompt: prefer S3 (for large prompts), fall back to env var
 _prompt_s3_key = os.getenv("SYSTEM_PROMPT_S3_KEY", "")
@@ -1092,6 +1099,34 @@ def _publish_agent_started(workflow_id: str, agent_id: str):
         logger.warning(f"[{agent_id}] Failed to publish agent.started: {e}")
 
 
+def _save_memory_event(agent_id: str, session_id: str, user_text: str, assistant_text: str):
+    """Persist the invocation turn to AgentCore Memory (no-op if MEMORY_ID unset).
+
+    Actor = agent_id so the dashboard's memory browser groups history per persona
+    in shared-runtime topologies. Best-effort: memory must never fail a run.
+    """
+    if not MEMORY_ID or not session_id:
+        return
+    try:
+        payload = [
+            {"conversational": {"role": "USER", "content": {"text": user_text[:9000]}}},
+        ]
+        if assistant_text:
+            payload.append(
+                {"conversational": {"role": "ASSISTANT", "content": {"text": assistant_text[:9000]}}}
+            )
+        boto3.client("bedrock-agentcore", region_name=REGION).create_event(
+            memoryId=MEMORY_ID,
+            actorId=agent_id or "unknown",
+            sessionId=session_id,
+            eventTimestamp=datetime.now(timezone.utc),
+            payload=payload,
+        )
+        logger.info(f"[{agent_id}] Saved memory event to {MEMORY_ID} (session {session_id})")
+    except Exception as e:
+        logger.warning(f"[{agent_id}] Failed to save memory event: {e}")
+
+
 # --- App entrypoint (streaming enabled) ---
 app = BedrockAgentCoreApp()
 
@@ -1316,6 +1351,9 @@ async def agent_invocation(payload, context):
                     final_text += block["text"]
 
     logger.info(f"[{agent_id}] Invocation complete for workflow {workflow_id}, output: {len(final_text)} chars, tools used: {len(tool_events)}")
+
+    # Persist this turn to AgentCore Memory (no-op without MEMORY_ID env var)
+    _save_memory_event(agent_id, getattr(context, "session_id", None), prompt, final_text)
 
     # Emit tool_use events FIRST so the agent-invoker can publish them for real-time UI flashing.
     for tool_name in tool_events:

@@ -679,7 +679,7 @@
     {
       "agentId": "agentcore_hub_code_reviewer",
       "displayName": "Code Reviewer",
-      "description": "Adversarial diff review of a dev branch — reasons about failure modes the author's own tests never exercise (races, eventual consistency, null/empty reads, error paths, security). Files findings as fix tickets before QA runs.",
+      "description": "Adversarial diff review of a dev branch \u2014 reasons about failure modes the author's own tests never exercise (races, eventual consistency, null/empty reads, error paths, security). Files findings as fix tickets before QA runs.",
       "phase": "review",
       "type": "runtime",
       "model": "Claude Opus 4.6",
@@ -1507,6 +1507,22 @@
       "blueprints": [
         "legal-approver"
       ]
+    },
+    {
+      "agentId": "agentcore_hub_workflow_manager",
+      "displayName": "Workflow Manager",
+      "description": "Persistent meta-agent that analyzes workflow runs, unsticks live runs, and manages runs to completion (ANALYZE/WATCH/CHAT)",
+      "phase": "management",
+      "type": "harness",
+      "model": "Claude Opus 4.8",
+      "evaluationsEnabled": true,
+      "evalConfigName": "eval_agentcore_hub_workflow_manager",
+      "runtimeArn": null,
+      "tools": [
+        "code_interpreter"
+      ],
+      "skills": [],
+      "blueprints": []
     }
   ],
   "defaults": {

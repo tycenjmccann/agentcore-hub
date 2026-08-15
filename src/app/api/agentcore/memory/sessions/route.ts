@@ -38,7 +38,16 @@ export async function GET(req: NextRequest) {
 
     // Get actors
     const actorsRes = await c.send(new ListActorsCommand({ memoryId }));
-    const actors = actorsRes.actorSummaries || [];
+    let actors = actorsRes.actorSummaries || [];
+
+    // Shared memories (e.g. the fleet runtime memory) hold many personas keyed
+    // by actorId = agent id. If an actor matches this agent, scope to it so the
+    // detail view doesn't show other agents' sessions. Keep "agentcore_user" —
+    // the chat tab's POST /memory/events stores turns under that default actor.
+    const agentBase = agentId.replace(/-[^-]+$/, "");
+    const ownActorIds = new Set([agentId, agentBase, "agentcore_user"]);
+    const own = actors.filter((a) => a.actorId && ownActorIds.has(a.actorId));
+    if (own.some((a) => a.actorId === agentId || a.actorId === agentBase)) actors = own;
 
     // Collect sessions from all actors
     const allSessions: Array<{
