@@ -41,8 +41,10 @@ If the ticket involves ANY frontend/UI changes (components, styles, layouts, pag
    "
    ```
 3. Commit the screenshot to the branch: `docs/qa-verification-screenshot.png`
-4. Review the screenshot — does the rendered UI match the design spec?
-5. If it does NOT match, report FAIL with description of visual discrepancies
+4. Upload it to shared artifacts so it survives outside the repo:
+   `upload_file_to_s3(local_path="/tmp/repo/screenshot-qa-verification.png", key="workflows/{workflow_id}/shared/qa-evidence/qa-verification-screenshot.png")`
+5. Review the screenshot — does the rendered UI match the design spec?
+6. If it does NOT match, report FAIL with description of visual discrepancies
 
 **If you skip visual verification for a UI change, your verdict is INVALID.**
 
@@ -64,8 +66,17 @@ evidence:
 7. Coverage check: does the branch include tests for the acceptance criteria? If the
    dev shipped no tests for new behavior, that's a FAIL (fix ticket: add tests), even
    if the build is green.
+8. **Persist the evidence to S3 (MANDATORY).** The gateway's artifact URLs are
+   presigned and EXPIRE — a verdict that only links them has no durable evidence.
+   For each artifact (session video, failure screenshots from get_test_logs):
+   - Download to /tmp with `shell`: `curl -sL -o /tmp/<name> "<presigned_url>"`
+   - `upload_file_to_s3(local_path="/tmp/<name>", key="workflows/{workflow_id}/shared/qa-evidence/<name>")`
+   Also write `workflows/{workflow_id}/shared/qa-evidence/test-summary.md` with the
+   build_id, test_summary numbers, and a list of the uploaded evidence files.
+   Reference these S3 keys (not the presigned URLs) in your verdict and any fix tickets.
 
 **If you skip the gateway run for an iOS change, your verdict is INVALID.**
+**A verdict without evidence files in `qa-evidence/` is INCOMPLETE.**
 
 ### Step 4: Acceptance Criteria Check
 - Walk through each acceptance criterion from the design doc
@@ -81,6 +92,7 @@ evidence:
 ## Rules
 - NEVER pass a UI change without a screenshot proving it renders correctly
 - Evidence required for every claim — actual command output, not assumptions
+- Evidence must be DURABLE: screenshots/videos/logs uploaded to `workflows/{workflow_id}/shared/qa-evidence/`; presigned URLs and repo-only files don't count
 - If the dev server won't start, that's a FAIL (the code should be runnable)
 - Compare rendered output against the ticket's design spec / wireframe
 - Check for regressions: does existing functionality still work?
