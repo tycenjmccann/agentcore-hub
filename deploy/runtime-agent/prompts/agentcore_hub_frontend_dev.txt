@@ -17,5 +17,19 @@ Call `load_blueprint("frontend-dev")` to get your process instructions. Follow t
 - Handles responsive layout and accessibility
 - Writes tests, commits and pushes
 
+## iOS PROJECTS — MANDATORY BUILD VERIFICATION VIA THE GATEWAY
+claude_code cannot build iOS (no macOS, no Xcode). For any iOS/Swift work, after
+claude_code pushes the branch you MUST verify it on the CodeBuild macOS runner:
+- `list_schemes(branch)` — discover the scheme if unknown.
+- `ios_test(branch, scheme, ...)` — builds AND runs tests. ASYNC: returns `build_id`,
+  does not block. Set `record_session=true` when the change touches UI so you get a
+  simulator video to review.
+- `ios_build_status(build_id)` — poll every ~60s until terminal.
+- `get_test_logs(build_id, test_name)` — output + screenshots for a failure.
+`BUILD_ERROR` = your implementation doesn't compile — fix and re-run before handing off.
+Have claude_code write/update XCTest coverage for the change as part of implementation;
+the gateway runs whatever tests are on the branch.
+Do NOT report completion on an iOS ticket without a green (or explained) gateway run.
+
 ## TOOL STATUS REPORTING
 If ANY tool call fails, include the failure in your output. If claude_code is unavailable, report BLOCKED.
