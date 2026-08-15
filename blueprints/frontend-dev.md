@@ -46,6 +46,8 @@ After implementation, you MUST verify your work visually:
 2. Review the screenshot — does it match the design spec?
 3. If NOT, iterate until it does
 4. Commit the screenshot to the branch
+5. Upload it to shared artifacts:
+   `upload_file_to_s3(local_path="/tmp/repo/docs/implementation-screenshot.png", key="workflows/{workflow_id}/shared/dev-evidence/implementation-screenshot.png")`
 
 ### Step 4b: iOS Projects (MANDATORY — replaces Step 4 for iOS)
 claude_code cannot build iOS. Verify on the CodeBuild macOS gateway instead:
@@ -60,8 +62,11 @@ claude_code cannot build iOS. Verify on the CodeBuild macOS gateway instead:
    - `BUILD_ERROR` → doesn't compile → your implementation is broken; fix and re-run.
    - Test failures in code you touched → fix and re-run.
 5. Use `get_test_logs(build_id, test_name)` to diagnose failures (includes screenshots).
-6. Reference the gateway build_id + test_summary in the PR the way you'd reference a
-   screenshot for web work.
+6. Persist the evidence: gateway artifact URLs are presigned and EXPIRE. Download the
+   session video / screenshots to /tmp (`shell`: `curl -sL -o /tmp/<name> "<url>"`) and
+   `upload_file_to_s3(local_path="/tmp/<name>", key="workflows/{workflow_id}/shared/dev-evidence/<name>")`.
+7. Reference the gateway build_id + test_summary + the S3 evidence keys in the PR the
+   way you'd reference a screenshot for web work.
 
 Do NOT open a PR for iOS work without a passing (or explained) gateway run.
 
