@@ -13,12 +13,20 @@ REGION="${AWS_REGION:-us-east-1}"
 MEMORY_NAME="agentcore_hub_fleet_memory"
 
 EXISTING=$(aws bedrock-agentcore-control list-memories --region "$REGION" \
-  --query "memories[?starts_with(id, '${MEMORY_NAME}')].id | [0]" --output text)
+  --query "memories[?starts_with(id, '${MEMORY_NAME}') && status=='ACTIVE'].id | [0]" --output text)
 
 if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
   echo "Memory exists: $EXISTING" >&2
   echo "$EXISTING"
   exit 0
+fi
+
+# A non-ACTIVE leftover (FAILED/CREATING/DELETING) blocks name reuse — surface it.
+STALE=$(aws bedrock-agentcore-control list-memories --region "$REGION" \
+  --query "memories[?starts_with(id, '${MEMORY_NAME}')].{id:id,status:status} | [0]" --output text)
+if [ -n "$STALE" ] && [ "$STALE" != "None" ]; then
+  echo "Memory ${STALE} exists but is not ACTIVE — delete it or wait, then re-run." >&2
+  exit 1
 fi
 
 echo "Creating memory ${MEMORY_NAME}..." >&2
