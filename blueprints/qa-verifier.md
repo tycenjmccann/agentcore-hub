@@ -46,6 +46,27 @@ If the ticket involves ANY frontend/UI changes (components, styles, layouts, pag
 
 **If you skip visual verification for a UI change, your verdict is INVALID.**
 
+### Step 3b: iOS Projects (MANDATORY — replaces Steps 2-3 for iOS)
+claude_code cannot build iOS. Use the CodeBuild macOS gateway as your build + test
+evidence:
+
+1. `list_schemes(branch)` if the scheme is unknown.
+2. `ios_test(branch, scheme)` — async, returns `build_id`. Pass `record_session=true`
+   for UI-facing tickets so you get a simulator video as visual evidence.
+3. Poll `ios_build_status(build_id)` every ~60s until terminal. Returns
+   `test_summary` (total/passed/failed), `failures[]`, `artifacts`.
+4. `get_test_logs(build_id, test_name)` for each failure — includes screenshots.
+5. Verdict mapping:
+   - `BUILD_ERROR` → FAIL (doesn't compile; build_errors are the evidence)
+   - Test failures relevant to the ticket → FAIL with test names + logs
+   - Pre-existing failures unrelated to the ticket → note them, don't block on them
+6. If the dev's PR references a gateway build_id, still run your own — verify, don't trust.
+7. Coverage check: does the branch include tests for the acceptance criteria? If the
+   dev shipped no tests for new behavior, that's a FAIL (fix ticket: add tests), even
+   if the build is green.
+
+**If you skip the gateway run for an iOS change, your verdict is INVALID.**
+
 ### Step 4: Acceptance Criteria Check
 - Walk through each acceptance criterion from the design doc
 - For code-level criteria: grep/read the source

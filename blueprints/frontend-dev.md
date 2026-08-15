@@ -47,6 +47,24 @@ After implementation, you MUST verify your work visually:
 3. If NOT, iterate until it does
 4. Commit the screenshot to the branch
 
+### Step 4b: iOS Projects (MANDATORY — replaces Step 4 for iOS)
+claude_code cannot build iOS. Verify on the CodeBuild macOS gateway instead:
+
+1. Have claude_code implement the change AND write/update XCTest (unit + UI) coverage
+   for the acceptance criteria — tests are part of the implementation, not QA's job
+   to author. Push the branch.
+2. `list_schemes(branch)` if you don't know the scheme.
+3. `ios_test(branch, scheme)` — async, returns `build_id`. For UI changes pass
+   `record_session=true` and review the simulator video like you would a screenshot.
+4. Poll `ios_build_status(build_id)` every ~60s until terminal.
+   - `BUILD_ERROR` → doesn't compile → your implementation is broken; fix and re-run.
+   - Test failures in code you touched → fix and re-run.
+5. Use `get_test_logs(build_id, test_name)` to diagnose failures (includes screenshots).
+6. Reference the gateway build_id + test_summary in the PR the way you'd reference a
+   screenshot for web work.
+
+Do NOT open a PR for iOS work without a passing (or explained) gateway run.
+
 ### Step 5: Push & PR
 1. Commit all changes with a clear message referencing the ticket
 2. Push the branch
@@ -58,6 +76,7 @@ After implementation, you MUST verify your work visually:
 
 ## Rules
 - NEVER submit a UI change without first rendering it and verifying visually
+- iOS: the gateway run is the render — never open an iOS PR without one; write XCTests with the implementation
 - If the dev server won't start after your changes, your implementation is broken — fix it
 - Include a screenshot in every PR that has visual changes
 - Follow existing code patterns — don't introduce new paradigms
