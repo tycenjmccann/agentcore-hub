@@ -683,12 +683,124 @@ class _SigV4HttpxAuth(_httpx.Auth):
         yield request
 
 
-def _create_mcp_clients():
+# ─── Connectors ──────────────────────────────────────────────────────────────
+# A connector gives this agent external tools + credentials (Meta Ads, a private
+# MCP server, a SigV4 gateway) that are bound to the persona in config/agents.json
+# under `connectors: [ids]`. The registry (config/connectors.json in S3) holds only
+# metadata + secret-key NAMES; the values live in Secrets Manager under
+# connectors/<id> and are fetched HERE, with this runtime's own role — they never
+# ride in the invoke payload, the orchestrator, or a trace. Resolution is by
+# agent_id so it works identically for pipeline, chat, and direct invokes.
+#
+# Delivery by kind:
+#   env     → export secret keys as environment variables (http_request/shell/
+#             claude_code read them). The general REST-API path (Meta Graph, etc.).
+#   mcp     → attach a streamable-HTTP MCP server, filling {KEY} placeholders in
+#             the url/header templates from the secret.
+#   gateway → attach a SigV4-signed AgentCore gateway (no secret; IAM is the cred).
+
+def _load_connector_registry():
+    """Read config/connectors.json from S3 fresh per invocation.
+
+    Deliberately NOT cached across the microVM: a warm container is reused across
+    sessions, and a connector created (or credentialed) between two invokes must be
+    visible on the next one — same hot-reload contract as prompts/agents.json. It's
+    one small S3 GET per run that uses connectors.
+    """
+    registry = {}
+    if ARTIFACT_BUCKET:
+        try:
+            body = (
+                boto3.client("s3", region_name=REGION)
+                .get_object(Bucket=ARTIFACT_BUCKET, Key="config/connectors.json")["Body"]
+                .read()
+            )
+            for c in (json.loads(body).get("connectors") or []):
+                registry[c.get("id")] = c
+        except Exception as e:
+            logger.info(f"No connector registry loaded: {e}")
+    return registry
+
+
+def _connector_ids_for_agent(agent_id: str, payload_connectors) -> list:
+    """Connector ids bound to this agent: explicit payload override, else the
+    agents.json roster entry's `connectors` list."""
+    if payload_connectors:
+        return list(payload_connectors)
+    if not ARTIFACT_BUCKET or not agent_id or agent_id == "unknown":
+        return []
+    try:
+        body = (
+            boto3.client("s3", region_name=REGION)
+            .get_object(Bucket=ARTIFACT_BUCKET, Key="config/agents.json")["Body"]
+            .read()
+        )
+        doc = json.loads(body)
+        agents = doc if isinstance(doc, list) else doc.get("agents", [])
+        entry = next((a for a in agents if a.get("agentId") == agent_id), None)
+        return list(entry.get("connectors", [])) if entry else []
+    except Exception as e:
+        logger.info(f"[{agent_id}] connector lookup failed: {e}")
+        return []
+
+
+def _fetch_connector_secret(connector_id: str) -> dict:
+    """Read connectors/<id> from Secrets Manager with this runtime's role."""
+    try:
+        sm = boto3.client("secretsmanager", region_name=REGION)
+        resp = sm.get_secret_value(SecretId=f"connectors/{connector_id}")
+        return json.loads(resp.get("SecretString") or "{}")
+    except Exception as e:
+        logger.warning(f"connector secret connectors/{connector_id} unavailable: {e}")
+        return {}
+
+
+def _apply_connectors(agent_id: str, payload_connectors):
+    """Resolve this agent's connectors. Exports env for kind=env and returns a
+    list of extra MCP server dicts (kind=mcp) + gateway urls (kind=gateway) for
+    _create_mcp_clients to attach."""
+    ids = _connector_ids_for_agent(agent_id, payload_connectors)
+    if not ids:
+        return {"mcp_servers": [], "gateways": []}
+    registry = _load_connector_registry()
+    mcp_servers, gateways = [], []
+    for cid in ids:
+        conn = registry.get(cid)
+        if not conn:
+            logger.warning(f"[{agent_id}] connector '{cid}' not in registry — skipping")
+            continue
+        kind = conn.get("kind")
+        secret = _fetch_connector_secret(cid) if kind in ("env", "mcp") else {}
+
+        def _fill(s: str) -> str:
+            for k, v in secret.items():
+                s = s.replace("{" + k + "}", str(v))
+            return s
+
+        if kind == "env":
+            for k, v in secret.items():
+                os.environ[k] = str(v)
+            logger.info(f"[{agent_id}] connector '{cid}' (env): {len(secret)} var(s) exported")
+        elif kind == "mcp":
+            url = _fill(conn.get("urlTemplate", ""))
+            headers = {k: _fill(v) for k, v in (conn.get("headerTemplate") or {}).items()}
+            if url:
+                mcp_servers.append({"url": url, "headers": headers})
+                logger.info(f"[{agent_id}] connector '{cid}' (mcp): {url}")
+        elif kind == "gateway":
+            gw = conn.get("gatewayUrl", "")
+            if gw:
+                gateways.append(gw)
+                logger.info(f"[{agent_id}] connector '{cid}' (gateway): {gw}")
+    return {"mcp_servers": mcp_servers, "gateways": gateways}
+
+
+def _create_mcp_clients(extra_servers=None, extra_gateways=None):
     """Create MCPClient instances for each configured MCP server."""
     from strands.tools.mcp import MCPClient
     from mcp.client.streamable_http import streamablehttp_client
 
-    servers = _parse_mcp_servers()
+    servers = _parse_mcp_servers() + list(extra_servers or [])
     clients = []
 
     for server in servers:
@@ -703,8 +815,12 @@ def _create_mcp_clients():
         logger.info(f"MCP server configured: {url}")
 
     # AWS_IAM gateways (SigV4-signed). Region parsed from the gateway hostname.
-    if IOS_TEST_GATEWAY_URL:
-        gw_url = IOS_TEST_GATEWAY_URL
+    # The deploy-time iOS test gateway plus any connector gateways for this agent.
+    gateway_urls = [IOS_TEST_GATEWAY_URL] if IOS_TEST_GATEWAY_URL else []
+    gateway_urls += list(extra_gateways or [])
+    for gw_url in gateway_urls:
+        if not gw_url:
+            continue
         try:
             gw_region = gw_url.split(".bedrock-agentcore.")[1].split(".amazonaws.com")[0]
         except IndexError:
@@ -1152,6 +1268,8 @@ async def agent_invocation(payload, context):
     workflow_id = payload.get("workflow_id", "unknown")
     agent_id = payload.get("agent_id", "unknown")
     model_override = payload.get("model_override")
+    # Optional per-invoke connector override; otherwise resolved from agents.json.
+    payload_connectors = payload.get("connectors")
     _CURRENT_WORKFLOW_ID = workflow_id
     _CURRENT_AGENT_ID = agent_id
 
@@ -1189,9 +1307,14 @@ async def agent_invocation(payload, context):
     builtin_tools = _load_builtin_tools()
     all_tools = builtin_tools + LAMBDA_TOOLS + [claude_code, codex]
 
-    # External tools via MCP (GitHub, GitLab, Jira, Asana, etc.)
+    # Connectors bound to this agent: export env creds + collect MCP/gateway targets.
+    conn = _apply_connectors(agent_id, payload_connectors)
+
+    # External tools via MCP (GitHub, GitLab, Jira, Asana, etc.) + connectors.
     # Strands Agent manages MCPClient lifecycle internally (start/stop)
-    mcp_clients = _create_mcp_clients()
+    mcp_clients = _create_mcp_clients(
+        extra_servers=conn["mcp_servers"], extra_gateways=conn["gateways"]
+    )
     if mcp_clients:
         all_tools.extend(mcp_clients)
         logger.info(f"[{agent_id}] {len(mcp_clients)} MCP server(s) attached")

@@ -7,6 +7,8 @@ import {
   BarChart3,
   Boxes,
   Cloud,
+  CalendarClock,
+  Plug,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -26,6 +28,8 @@ export type ModuleId =
   | "core"
   | "builder"
   | "workflow"
+  | "routines"
+  | "connectors"
   | "evaluations"
   | "registry"
   | "cloud-code";
@@ -44,6 +48,8 @@ export const NAV_ITEMS: NavItem[] = [
   { href: "/registry", label: "Registry", icon: Boxes, module: "registry" },
   { href: "/build", label: "Build", icon: Hammer, module: "builder" },
   { href: "/workflow", label: "Workflow", icon: GitPullRequest, module: "workflow" },
+  { href: "/routines", label: "Routines", icon: CalendarClock, module: "routines" },
+  { href: "/connectors", label: "Connectors", icon: Plug, module: "connectors" },
   { href: "/cloud-code", label: "Cloud Code", icon: Cloud, module: "cloud-code" },
   { href: "/evaluations", label: "Evaluations", icon: BarChart3, module: "evaluations" },
   { href: "/tickets", label: "Ticket History", icon: History, module: "workflow" },

@@ -1,0 +1,15 @@
+{
+  "name": "routines-runner",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "ISC",
+  "description": "EventBridge Scheduler trigger that fires scheduled routines at the workflow API.",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.972.43",
+    "@aws-sdk/lib-dynamodb": "^3.972.43"
+  }
+}

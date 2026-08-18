@@ -41,6 +41,13 @@ export EVENTS_TABLE="${EVENTS_TABLE:-agentcore-hub-events}"
 export TICKETS_TABLE="${TICKETS_TABLE:-agentcore-hub-tickets}"
 export WORKFLOWS_TABLE="${WORKFLOWS_TABLE:-agentcore-hub-workflows}"
 export CLOUD_CODE_TABLE="${CLOUD_CODE_TABLE:-agentcore-hub-cloud-code-sessions}"
+export ROUTINES_TABLE="${ROUTINES_TABLE:-agentcore-hub-routines}"
+
+# Routines — scheduled workflows. Runner Lambda + scheduler role ARNs are set by
+# lambda/routines-runner/deploy.sh; the schedule group holds all routine schedules.
+export ROUTINES_SCHEDULE_GROUP="${ROUTINES_SCHEDULE_GROUP:-agentcore-hub-routines}"
+export ROUTINES_RUNNER_ARN="${ROUTINES_RUNNER_ARN:-arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-routines-runner}"
+export ROUTINES_SCHEDULER_ROLE_ARN="${ROUTINES_SCHEDULER_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-routines-scheduler-role}"
 
 # Cloud Code — the standalone coding-agent runtime (set after deploy.py prints the ARN)
 export CODING_AGENT_RUNTIME_ARN="${CODING_AGENT_RUNTIME_ARN:-}"

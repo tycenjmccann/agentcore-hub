@@ -15,7 +15,7 @@ import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { validateIntakeSources } from "@/lib/workflow/intake";
 import type { WorkflowInput } from "@/lib/workflow/types";
-import { getWorkflowDef } from "@/lib/workflow/workflow-defs";
+import { getWorkflowDef, WORKFLOW_DEFS } from "@/lib/workflow/workflow-defs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -33,8 +33,25 @@ export async function POST(req: NextRequest) {
   try {
     const body: WorkflowInput = await req.json();
 
-    if (!body.title || !body.repoConfig) {
-      return NextResponse.json({ error: "title and repoConfig are required" }, { status: 400 });
+    if (!body.title) {
+      return NextResponse.json({ error: "title is required" }, { status: 400 });
+    }
+    // repoConfig is only required for defs that actually check out a repo
+    // (requiresRepo). Marketing/legal/sales and most routines don't touch code.
+    // getWorkflowDef falls back to the default (repo-requiring) def for unknown
+    // ids, so only enforce the requirement when the id resolves to a KNOWN def —
+    // S3-only routine defs (not in the bundled config) never require a repo here.
+    const knownDef = body.workflowDefId
+      ? WORKFLOW_DEFS.find((w) => w.id === body.workflowDefId)
+      : undefined;
+    if (knownDef?.requiresRepo && !body.repoConfig) {
+      return NextResponse.json(
+        { error: `repoConfig is required for the "${knownDef.id}" workflow` },
+        { status: 400 }
+      );
+    }
+    if (!body.repoConfig) {
+      body.repoConfig = { layout: "multi-repo", repos: [] };
     }
 
     if (!body.sources) body.sources = [];
@@ -83,6 +100,9 @@ async function startWithJira(body: WorkflowInput) {
       phase: intakePhase,
       epicId,
       repoConfig: body.repoConfig,
+      // Routine-scoped connectors (if any) — forwarded to each agent invoke so
+      // the runtime loads their creds/tools for this workflow's run only.
+      connectors: body.connectors,
       input: body,
       agentTasks: {},
       messages: [],
@@ -148,6 +168,9 @@ async function startWithDynamoDB(body: WorkflowInput) {
       phase: intakePhase,
       epicId,
       repoConfig: body.repoConfig,
+      // Routine-scoped connectors (if any) — forwarded to each agent invoke so
+      // the runtime loads their creds/tools for this workflow's run only.
+      connectors: body.connectors,
       input: body,
       agentTasks: {},
       messages: [],
