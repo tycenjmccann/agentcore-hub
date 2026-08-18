@@ -15,7 +15,8 @@ import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { validateIntakeSources } from "@/lib/workflow/intake";
 import type { WorkflowInput } from "@/lib/workflow/types";
-import { getWorkflowDef, WORKFLOW_DEFS } from "@/lib/workflow/workflow-defs";
+import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
+import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -36,17 +37,33 @@ export async function POST(req: NextRequest) {
     if (!body.title) {
       return NextResponse.json({ error: "title is required" }, { status: 400 });
     }
+
+    // Resolve the def from the LIVE S3 config (same doc the orchestrator runs),
+    // so routine defs created by the Routine Builder resolve here. An unknown id
+    // is a HARD 400 — never silently fall back to software-delivery, which would
+    // run the full dev pipeline with the wrong intake agent on a schedule.
+    // An absent id means the caller wants the default (checked-in) pipeline.
+    let def: WorkflowDef | null;
+    if (body.workflowDefId) {
+      def = await resolveWorkflowDef(body.workflowDefId);
+      if (!def) {
+        return NextResponse.json(
+          { error: `Unknown workflowDefId "${body.workflowDefId}" — not found in config/workflows.json` },
+          { status: 400 }
+        );
+      }
+    } else {
+      def = await resolveWorkflowDef("software-delivery");
+      if (!def) {
+        return NextResponse.json({ error: "Default workflow def unavailable" }, { status: 500 });
+      }
+    }
+
     // repoConfig is only required for defs that actually check out a repo
     // (requiresRepo). Marketing/legal/sales and most routines don't touch code.
-    // getWorkflowDef falls back to the default (repo-requiring) def for unknown
-    // ids, so only enforce the requirement when the id resolves to a KNOWN def —
-    // S3-only routine defs (not in the bundled config) never require a repo here.
-    const knownDef = body.workflowDefId
-      ? WORKFLOW_DEFS.find((w) => w.id === body.workflowDefId)
-      : undefined;
-    if (knownDef?.requiresRepo && !body.repoConfig) {
+    if (def.requiresRepo && !body.repoConfig) {
       return NextResponse.json(
-        { error: `repoConfig is required for the "${knownDef.id}" workflow` },
+        { error: `repoConfig is required for the "${def.id}" workflow` },
         { status: 400 }
       );
     }
@@ -66,9 +83,9 @@ export async function POST(req: NextRequest) {
     }
 
     if (TICKET_PROVIDER === "jira") {
-      return await startWithJira(body);
+      return await startWithJira(body, def);
     } else {
-      return await startWithDynamoDB(body);
+      return await startWithDynamoDB(body, def);
     }
   } catch (err) {
     console.error("Workflow start error:", err);
@@ -78,11 +95,10 @@ export async function POST(req: NextRequest) {
 
 // ─── Jira Cloud Backend ────────────────────────────────────────────────────────
 
-async function startWithJira(body: WorkflowInput) {
+async function startWithJira(body: WorkflowInput, def: WorkflowDef) {
   const { JiraCloudProvider } = await import("@/lib/workflow/ticket-provider-jira");
   const jira = new JiraCloudProvider();
 
-  const def = getWorkflowDef(body.workflowDefId);
   const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
   const workflowId = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -133,8 +149,7 @@ async function startWithJira(body: WorkflowInput) {
 
 // ─── DynamoDB Backend (via ticket tools Lambda) ──────────────────────────────
 
-async function startWithDynamoDB(body: WorkflowInput) {
-  const def = getWorkflowDef(body.workflowDefId);
+async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef) {
   const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
   const intakePhaseName = def.phases.find((p) => p.type === "agent")?.name || "Intake";
   const workflowId = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;

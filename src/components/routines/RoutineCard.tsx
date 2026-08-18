@@ -87,12 +87,12 @@ const CARD_STYLES = `
   background:var(--color-bg-secondary);display:flex;flex-direction:column;gap:10px}
 .rc-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .rc-title-wrap{display:flex;align-items:center;gap:8px;min-width:0}
-.rc-icon{color:#8b5cf6;flex-shrink:0}
+.rc-icon{color:var(--color-brand-500);flex-shrink:0}
 .rc-name{font-weight:600;font-size:14px;color:var(--color-text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rc-desc{font-size:12px;color:var(--color-text-muted);margin:0;line-height:1.4}
 .rc-meta{display:flex;flex-wrap:wrap;gap:6px}
 .rc-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 8px;border-radius:6px;
-  background:rgba(139,92,246,0.1);color:#a78bfa;border:1px solid rgba(139,92,246,0.25)}
+  background:color-mix(in srgb,var(--color-brand-500) 10%,transparent);color:var(--color-brand-400);border:1px solid color-mix(in srgb,var(--color-brand-500) 25%,transparent)}
 .rc-badge.rc-muted{background:rgba(255,255,255,0.04);color:var(--color-text-muted);border-color:var(--color-border)}
 .rc-lastrun{font-size:11px}
 .rc-ok{color:#4ade80}
@@ -103,8 +103,8 @@ const CARD_STYLES = `
   border-radius:8px;border:1px solid var(--color-border);background:var(--color-bg-tertiary);
   color:var(--color-text-primary);cursor:pointer}
 .rc-btn:disabled{opacity:0.5;cursor:default}
-.rc-run{border-color:rgba(139,92,246,0.4);background:rgba(139,92,246,0.12);color:#a78bfa}
-.rc-run:hover:not(:disabled){background:rgba(139,92,246,0.2)}
+.rc-run{border-color:color-mix(in srgb,var(--color-brand-500) 40%,transparent);background:color-mix(in srgb,var(--color-brand-500) 12%,transparent);color:var(--color-brand-400)}
+.rc-run:hover:not(:disabled){background:color-mix(in srgb,var(--color-brand-500) 20%,transparent)}
 .rc-del{margin-left:auto;color:var(--color-text-muted)}
 .rc-del:hover:not(:disabled){color:#f87171;border-color:rgba(248,113,113,0.4)}
 .rc-spin{animation:rcspin 1s linear infinite}
@@ -116,7 +116,7 @@ const CARD_STYLES = `
   border:1px solid var(--color-border);border-radius:20px;transition:.2s}
 .rc-slider:before{content:"";position:absolute;height:14px;width:14px;left:2px;top:2px;
   background:var(--color-text-muted);border-radius:50%;transition:.2s}
-.rc-switch input:checked + .rc-slider{background:rgba(139,92,246,0.3);border-color:rgba(139,92,246,0.5)}
-.rc-switch input:checked + .rc-slider:before{transform:translateX(16px);background:#a78bfa}
+.rc-switch input:checked + .rc-slider{background:color-mix(in srgb,var(--color-brand-500) 30%,transparent);border-color:color-mix(in srgb,var(--color-brand-500) 50%,transparent)}
+.rc-switch input:checked + .rc-slider:before{transform:translateX(16px);background:var(--color-brand-400)}
 .rc-switch input:disabled + .rc-slider{opacity:0.5;cursor:default}
 `;

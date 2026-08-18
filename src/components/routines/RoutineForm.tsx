@@ -104,7 +104,7 @@ export default function RoutineForm({ onClose, onCreated }: { onClose: () => voi
   };
 
   const fieldCls =
-    "mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[#8b5cf6]";
+    "mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-500)]";
   const labelCls = "text-xs font-medium text-[var(--color-text-secondary)]";
 
   return (
@@ -115,7 +115,7 @@ export default function RoutineForm({ onClose, onCreated }: { onClose: () => voi
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-[var(--color-border)] sticky top-0 bg-[var(--color-bg-secondary)]">
           <div className="flex items-center gap-2">
-            <CalendarClock className="w-4 h-4 text-[#8b5cf6]" />
+            <CalendarClock className="w-4 h-4 text-[var(--color-brand-500)]" />
             <h2 className="text-sm font-semibold text-[var(--color-text-primary)]">New routine</h2>
           </div>
           <button onClick={onClose} className="text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)]">
@@ -206,7 +206,7 @@ export default function RoutineForm({ onClose, onCreated }: { onClose: () => voi
             </label>
           )}
 
-          <p className="text-[11px] text-[#8b5cf6]">{describeForm(form)}</p>
+          <p className="text-[11px] text-[var(--color-brand-500)]">{describeForm(form)}</p>
 
           {needsRepo && (
             <div className="grid grid-cols-3 gap-3">
@@ -241,7 +241,7 @@ export default function RoutineForm({ onClose, onCreated }: { onClose: () => voi
                       }
                       className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
                         on
-                          ? "bg-[#8b5cf6] text-white border-[#8b5cf6]"
+                          ? "bg-[var(--color-brand-500)] text-white border-[var(--color-brand-500)]"
                           : "bg-[var(--color-bg-tertiary)] text-[var(--color-text-secondary)] border-[var(--color-border)]"
                       }`}
                     >
@@ -264,7 +264,7 @@ export default function RoutineForm({ onClose, onCreated }: { onClose: () => voi
           <button
             onClick={create}
             disabled={!name.trim() || !workflowDefId || (needsRepo && !repoUrl.trim()) || saving}
-            className="px-4 py-2 rounded-lg bg-[#8b5cf6] hover:bg-[#7c3aed] disabled:opacity-50 text-white text-sm font-medium transition-colors"
+            className="px-4 py-2 rounded-lg bg-[var(--color-brand-500)] hover:bg-[var(--color-brand-600)] disabled:opacity-50 text-white text-sm font-medium transition-colors"
           >
             {saving ? "Creating…" : "Create routine"}
           </button>

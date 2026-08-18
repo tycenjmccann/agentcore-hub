@@ -12,6 +12,8 @@ import { randomUUID } from "crypto";
 import { getIdentity } from "@/lib/auth/identity";
 import { listRoutines, putRoutine } from "@/lib/routines/store";
 import { upsertSchedule } from "@/lib/routines/schedule";
+import { validateScheduleFloor } from "@/lib/routines/cron";
+import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 import type { Routine } from "@/lib/routines/types";
 
 export const dynamic = "force-dynamic";
@@ -46,6 +48,20 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       );
     }
+
+    // Reject a routine whose workflow def doesn't actually exist in the live config
+    // (S3) — otherwise it would fail on every fire, silently, forever.
+    const def = await resolveWorkflowDef(workflowDefId);
+    if (!def) {
+      return NextResponse.json(
+        { error: `Unknown workflowDefId "${workflowDefId}" — create the workflow def first` },
+        { status: 400 }
+      );
+    }
+
+    // Frequency floor — one fire per hour max (each fire = a full LLM pipeline).
+    const floorErr = validateScheduleFloor(schedule.expression);
+    if (floorErr) return NextResponse.json({ error: floorErr }, { status: 400 });
 
     const routineId = `rt-${randomUUID().replace(/-/g, "")}`;
     const now = new Date().toISOString();

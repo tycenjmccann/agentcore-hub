@@ -78,24 +78,46 @@ def main():
         ContentType="text/markdown",
     )
 
-    # 2) Roster entry → config/agents.json (replace if exists)
-    tools = [t.strip() for t in args.tools.split(",") if t.strip()] or DEFAULT_TOOLS
-    entry = {
-        "agentId": args.agent_id,
-        "displayName": args.display_name,
-        "description": args.description or f"{args.display_name} (routine persona)",
-        "phase": args.phase,
-        "workflowDefId": args.workflow_def_id,
-        "type": "runtime",
-        "model": DEFAULT_MODEL,
-        "evaluationsEnabled": False,
-        "runtimeArn": None,  # NEVER write a real ARN into the roster (repo is public)
-        "tools": tools,
-    }
-
+    # 2) Roster entry → config/agents.json.
+    #    MERGE into an existing entry rather than clobbering it: an already-deployed
+    #    agent carries tools, connectors, evaluationsEnabled, model, etc. that a
+    #    blueprint edit must NOT wipe. Only overwrite fields this tool actually owns
+    #    (blueprint prose is separate; here: displayName/description/phase/def, and
+    #    tools ONLY when --tools was passed). runtimeArn always stays null (public repo).
     cfg = read_agents()
+    prior = next((a for a in cfg.get("agents", []) if a.get("agentId") == args.agent_id), None)
+    existed = prior is not None
+
+    explicit_tools = [t.strip() for t in args.tools.split(",") if t.strip()]
+    if existed:
+        entry = dict(prior)
+        entry["displayName"] = args.display_name
+        entry["description"] = args.description or entry.get("description") or f"{args.display_name} (routine persona)"
+        entry["phase"] = args.phase
+        entry["workflowDefId"] = args.workflow_def_id
+        entry["runtimeArn"] = None  # never a real ARN in the public repo
+        # Preserve existing tools/connectors/evals unless the caller overrides tools.
+        if explicit_tools:
+            entry["tools"] = explicit_tools
+        entry.setdefault("tools", DEFAULT_TOOLS)
+        entry.setdefault("type", "runtime")
+        entry.setdefault("model", DEFAULT_MODEL)
+        entry.setdefault("evaluationsEnabled", False)
+    else:
+        entry = {
+            "agentId": args.agent_id,
+            "displayName": args.display_name,
+            "description": args.description or f"{args.display_name} (routine persona)",
+            "phase": args.phase,
+            "workflowDefId": args.workflow_def_id,
+            "type": "runtime",
+            "model": DEFAULT_MODEL,
+            "evaluationsEnabled": False,
+            "runtimeArn": None,  # NEVER write a real ARN into the roster (repo is public)
+            "tools": explicit_tools or DEFAULT_TOOLS,
+        }
+
     agents = [a for a in cfg.get("agents", []) if a.get("agentId") != args.agent_id]
-    existed = len(agents) != len(cfg.get("agents", []))
     agents.append(entry)
     cfg["agents"] = agents
     s3.put_object(

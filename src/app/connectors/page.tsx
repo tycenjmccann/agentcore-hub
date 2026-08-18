@@ -64,7 +64,7 @@ export default function ConnectorsPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-xl font-semibold text-[var(--color-text-primary)] flex items-center gap-2">
-            <Plug className="w-5 h-5 text-[#8b5cf6]" />
+            <Plug className="w-5 h-5 text-[var(--color-brand-500)]" />
             Connectors
           </h1>
           <p className="text-sm text-[var(--color-text-muted)] mt-1">
@@ -73,7 +73,7 @@ export default function ConnectorsPage() {
         </div>
         <button
           onClick={() => setShowNew(true)}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-[#8b5cf6] hover:bg-[#7c3aed] text-white text-sm font-medium transition-colors"
+          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-[var(--color-brand-500)] hover:bg-[var(--color-brand-600)] text-white text-sm font-medium transition-colors"
         >
           <Plus className="w-4 h-4" /> New connector
         </button>
@@ -83,8 +83,8 @@ export default function ConnectorsPage() {
         <div className="text-center text-sm text-[var(--color-text-muted)] py-16">Loading connectors…</div>
       ) : connectors.length === 0 ? (
         <div className="flex flex-col items-center justify-center text-center py-20 border border-dashed border-[var(--color-border)] rounded-xl">
-          <div className="w-14 h-14 rounded-full bg-[#8b5cf6]/10 flex items-center justify-center mb-4">
-            <Plug className="w-6 h-6 text-[#8b5cf6]" />
+          <div className="w-14 h-14 rounded-full bg-[color-mix(in_srgb,var(--color-brand-500)_10%,transparent)] flex items-center justify-center mb-4">
+            <Plug className="w-6 h-6 text-[var(--color-brand-500)]" />
           </div>
           <h3 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">No connectors yet</h3>
           <p className="text-sm text-[var(--color-text-muted)] max-w-md">
@@ -101,7 +101,7 @@ export default function ConnectorsPage() {
               <div key={c.id} className="rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] p-4">
                 <div className="flex items-start justify-between">
                   <div className="flex items-center gap-2">
-                    <KindIcon className="w-4 h-4 text-[#8b5cf6]" />
+                    <KindIcon className="w-4 h-4 text-[var(--color-brand-500)]" />
                     <div>
                       <div className="text-sm font-semibold text-[var(--color-text-primary)]">{c.name}</div>
                       <div className="text-[11px] text-[var(--color-text-muted)]">{km.label} · {c.id}</div>
@@ -127,7 +127,7 @@ export default function ConnectorsPage() {
                   {c.secretKeys.length > 0 && (
                     <button
                       onClick={() => setCredFor(c)}
-                      className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-md bg-[var(--color-bg-tertiary)] hover:bg-[#8b5cf6]/10 text-[var(--color-text-secondary)]"
+                      className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-md bg-[var(--color-bg-tertiary)] hover:bg-[color-mix(in_srgb,var(--color-brand-500)_10%,transparent)] text-[var(--color-text-secondary)]"
                     >
                       <KeyRound className="w-3 h-3" /> {needsCreds ? "Connect" : "Update"}
                     </button>
@@ -227,7 +227,7 @@ function NewConnectorModal({ onClose, onCreated }: { onClose: () => void; onCrea
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Meta Ads"
-              className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[#8b5cf6]"
+              className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-500)]"
             />
           </label>
           <label className="block">
@@ -236,7 +236,7 @@ function NewConnectorModal({ onClose, onCreated }: { onClose: () => void; onCrea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               placeholder="Facebook/Instagram ad performance via Graph API"
-              className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[#8b5cf6]"
+              className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-500)]"
             />
           </label>
           <label className="block">
@@ -244,7 +244,7 @@ function NewConnectorModal({ onClose, onCreated }: { onClose: () => void; onCrea
             <select
               value={kind}
               onChange={(e) => setKind(e.target.value as ConnectorKind)}
-              className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[#8b5cf6]"
+              className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-500)]"
             >
               <option value="env">REST / env — inject creds as env vars</option>
               <option value="mcp">MCP server — token in header</option>
@@ -258,7 +258,7 @@ function NewConnectorModal({ onClose, onCreated }: { onClose: () => void; onCrea
                 value={urlTemplate}
                 onChange={(e) => setUrlTemplate(e.target.value)}
                 placeholder="https://tools.example.com/mcp"
-                className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[#8b5cf6]"
+                className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-500)]"
               />
             </label>
           )}
@@ -269,7 +269,7 @@ function NewConnectorModal({ onClose, onCreated }: { onClose: () => void; onCrea
                 value={gatewayUrl}
                 onChange={(e) => setGatewayUrl(e.target.value)}
                 placeholder="https://abc.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
-                className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[#8b5cf6]"
+                className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-500)]"
               />
             </label>
           )}
@@ -282,7 +282,7 @@ function NewConnectorModal({ onClose, onCreated }: { onClose: () => void; onCrea
                 value={secretKeys}
                 onChange={(e) => setSecretKeys(e.target.value)}
                 placeholder="META_ACCESS_TOKEN, META_AD_ACCOUNT_ID"
-                className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[#8b5cf6]"
+                className="mt-1 w-full rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-500)]"
               />
             </label>
           )}
@@ -295,7 +295,7 @@ function NewConnectorModal({ onClose, onCreated }: { onClose: () => void; onCrea
           <button
             onClick={create}
             disabled={!name.trim() || saving}
-            className="px-4 py-2 rounded-lg bg-[#8b5cf6] hover:bg-[#7c3aed] disabled:opacity-50 text-white text-sm font-medium transition-colors"
+            className="px-4 py-2 rounded-lg bg-[var(--color-brand-500)] hover:bg-[var(--color-brand-600)] disabled:opacity-50 text-white text-sm font-medium transition-colors"
           >
             {saving ? "Creating…" : "Create"}
           </button>

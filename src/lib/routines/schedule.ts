@@ -30,6 +30,9 @@ const RUNNER_ARN = process.env.ROUTINES_RUNNER_ARN || "";
 const SCHEDULER_ROLE_ARN = process.env.ROUTINES_SCHEDULER_ROLE_ARN || "";
 /** All routine schedules live in one group for easy listing/teardown. */
 const GROUP = process.env.ROUTINES_SCHEDULE_GROUP || "agentcore-hub-routines";
+/** Failed invokes land here after the bounded retry policy is exhausted, instead
+ *  of silently disappearing. Set by lambda/routines-runner/deploy.sh. */
+const DLQ_ARN = process.env.ROUTINES_DLQ_ARN || "";
 
 const scheduler = new SchedulerClient({ region: REGION });
 
@@ -69,6 +72,11 @@ export async function upsertSchedule(
       Arn: RUNNER_ARN,
       RoleArn: SCHEDULER_ROLE_ARN,
       Input: JSON.stringify({ routineId }),
+      // Bound the retry storm: EventBridge Scheduler defaults to 185 retries over
+      // 24h. A slow/failed POST would otherwise start the same workflow many times.
+      // Cap retries; exhausted invokes go to the DLQ instead of vanishing.
+      RetryPolicy: { MaximumRetryAttempts: 2, MaximumEventAgeInSeconds: 300 },
+      ...(DLQ_ARN ? { DeadLetterConfig: { Arn: DLQ_ARN } } : {}),
     },
   };
 

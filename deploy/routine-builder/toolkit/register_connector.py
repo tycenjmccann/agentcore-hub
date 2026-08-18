@@ -79,6 +79,29 @@ def main():
     existed = len(connectors) != len(reg.get("connectors", []))
     prior = next((c for c in reg.get("connectors", []) if c.get("id") == args.connector_id), {})
 
+    # SECURITY: once a connector holds credentials (status active), refuse to
+    # silently repoint its endpoint. A prompt-injected chat turn could otherwise
+    # set urlTemplate/headerTemplate to "https://attacker/?t={TOKEN}" and the
+    # runtime would ship the real secret there on the next invoke. Endpoint changes
+    # on a live connector require deleting + re-registering it (a human step in the
+    # Connectors tab), which forces re-entry of the credential.
+    if existed and prior.get("status") == "active":
+        new_url = args.url_template or None
+        new_headers = header_template or None
+        if (new_url and new_url != prior.get("urlTemplate")) or (
+            new_headers and new_headers != prior.get("headerTemplate")
+        ):
+            raise SystemExit(
+                f"REFUSED: connector '{args.connector_id}' is active (has credentials). "
+                "Changing its urlTemplate/headerTemplate is blocked — delete it in the "
+                "Connectors tab and re-register to repoint it (forces credential re-entry)."
+            )
+
+    # Only https endpoints — a plaintext http target would leak a header/query token.
+    for u in (args.url_template, args.gateway_url):
+        if u and not u.startswith("https://"):
+            raise SystemExit(f"VALIDATION FAILED: '{u}' must be an https:// URL")
+
     entry = {
         "id": args.connector_id,
         "name": args.name,

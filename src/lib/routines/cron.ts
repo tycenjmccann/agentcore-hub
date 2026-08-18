@@ -51,6 +51,46 @@ export function toScheduleExpression(form: ScheduleForm): string {
   }
 }
 
+/**
+ * Reject schedules that fire too often. Each fire kicks off a full LLM pipeline,
+ * so a `rate(1 minute)` routine is a cost/abuse vector on the (auth-gated but
+ * still) reachable create API. Floor = one fire per hour. Returns an error string,
+ * or null if the expression is acceptable.
+ */
+const MIN_INTERVAL_MINUTES = 60;
+
+export function validateScheduleFloor(expression: string): string | null {
+  const expr = expression.trim();
+
+  const rate = expr.match(/^rate\(\s*(\d+)\s+(minute|minutes|hour|hours|day|days)\s*\)$/i);
+  if (rate) {
+    const n = parseInt(rate[1], 10);
+    const unit = rate[2].toLowerCase();
+    const minutes = unit.startsWith("minute") ? n : unit.startsWith("hour") ? n * 60 : n * 1440;
+    if (minutes < MIN_INTERVAL_MINUTES) {
+      return `Schedule fires every ${minutes} min; minimum is ${MIN_INTERVAL_MINUTES} min (one fire per hour).`;
+    }
+    return null;
+  }
+
+  const cron = expr.match(/^cron\((.+)\)$/i);
+  if (cron) {
+    const [minute, hour] = cron[1].trim().split(/\s+/);
+    // A wildcard/step in the minute or hour field means sub-hourly firing.
+    if (minute === "*" || minute?.includes("/") || minute?.includes(",") || minute?.includes("-")) {
+      return "Sub-hourly cron schedules are not allowed; use a fixed minute (one fire per hour max).";
+    }
+    if (hour === "*" || hour?.includes("/")) {
+      // Fixed minute + every hour = 24/day. Allowed (hourly), but a minute step was
+      // already rejected above, so this is at most hourly — permit it.
+      return null;
+    }
+    return null;
+  }
+
+  return `Unrecognized schedule expression: "${expression}"`;
+}
+
 /** Human summary of a form, for the form's live preview (mirrors format.ts output
  *  but works from the structured inputs before an expression exists). */
 export function describeForm(form: ScheduleForm): string {

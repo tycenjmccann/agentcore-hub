@@ -57,6 +57,29 @@ if [ -z "${GITHUB_PAT:-}" ]; then
   done
 fi
 
+# Same for FLEET_MEMORY_ID — without it the runtime ships with NO memory
+# (no long-term memory, no chat/trace history in the dashboard). It's a
+# conditional --env below, so a missing export silently strips memory. Auto-source
+# it from .env.local like GITHUB_PAT so single-agent deploys never drop it.
+if [ -z "${FLEET_MEMORY_ID:-}" ]; then
+  for candidate in \
+    "$SCRIPT_DIR/../../.env.local" \
+    "$SCRIPT_DIR/../.env.local" \
+    "$SCRIPT_DIR/.env.local" \
+    "$PWD/.env.local"; do
+    if [ -f "$candidate" ]; then
+      FLEET_MEMORY_ID=$(grep "^FLEET_MEMORY_ID=" "$candidate" | cut -d= -f2-)
+      FLEET_MEMORY_ID="${FLEET_MEMORY_ID%\"}"; FLEET_MEMORY_ID="${FLEET_MEMORY_ID#\"}"
+      FLEET_MEMORY_ID="${FLEET_MEMORY_ID%\'}"; FLEET_MEMORY_ID="${FLEET_MEMORY_ID#\'}"
+      if [ -n "$FLEET_MEMORY_ID" ]; then
+        export FLEET_MEMORY_ID
+        echo "Loaded FLEET_MEMORY_ID from $candidate" >&2
+        break
+      fi
+    fi
+  done
+fi
+
 # Hard-fail if neither GITHUB_PAT nor MCP_SERVERS is set — silent regression
 # here strips GitHub MCP auth from the runtime and every deploy reports OK.
 if [ -z "${GITHUB_PAT:-}" ] && [ -z "${MCP_SERVERS:-}" ]; then

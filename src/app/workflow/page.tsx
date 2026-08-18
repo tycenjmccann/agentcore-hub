@@ -69,15 +69,20 @@ export default function WorkflowPage() {
       const res = await fetch("/api/workflow/list");
       if (!res.ok) return;
       const data = await res.json();
-      const list: WorkflowSummary[] = (data.workflows || []).map((w: WorkflowState) => ({
-        id: w.id,
-        phase: w.phase,
-        epicId: w.epicId,
-        input: { title: w.input.title, description: w.input.description },
-        startedAt: w.startedAt,
-        completedAt: w.completedAt,
-        workflowType: w.workflowType,
-      }));
+      // Be defensive: a single malformed record (e.g. a cancelled stub with no
+      // `input`) must never throw and blank the entire list. Coerce missing
+      // fields and drop records with no usable id.
+      const list: WorkflowSummary[] = (data.workflows || [])
+        .map((w: Partial<WorkflowState> & { workflowId?: string }) => ({
+          id: w.id || w.workflowId || "",
+          phase: w.phase || "unknown",
+          epicId: w.epicId || "",
+          input: { title: w.input?.title || "(untitled)", description: w.input?.description || "" },
+          startedAt: w.startedAt || "",
+          completedAt: w.completedAt,
+          workflowType: w.workflowType,
+        }))
+        .filter((w: WorkflowSummary) => w.id);
       // Sort: active first, then by date descending
       list.sort((a, b) => {
         const aActive = a.phase !== "complete" && a.phase !== "error" && a.phase !== "cancelled";

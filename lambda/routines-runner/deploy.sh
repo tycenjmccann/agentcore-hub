@@ -27,6 +27,8 @@ fi
 
 RUNNER_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:${LAMBDA_NAME}"
 SCHEDULER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHEDULER_ROLE_NAME}"
+DLQ_NAME="${ROUTINES_DLQ_NAME:-agentcore-hub-routines-dlq}"
+DLQ_ARN="arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:${DLQ_NAME}"
 
 echo "═══════════════════════════════════════════════════════════"
 echo "  Routines"
@@ -87,6 +89,22 @@ aws iam put-role-policy --role-name "$(basename "$ROLE_ARN")" \
   }" >/dev/null
 echo "✓ IAM: RoutinesRunnerAccess on $(basename "$ROLE_ARN")"
 
+# ─── Dead-letter queue for failed schedule invokes ───────────────────────────
+# Scheduler drops an invoke here after its bounded RetryPolicy is exhausted, so a
+# persistently failing routine is visible (queue depth / alarm) instead of silent.
+if ! aws sqs get-queue-url --queue-name "$DLQ_NAME" >/dev/null 2>&1; then
+  aws sqs create-queue --queue-name "$DLQ_NAME" \
+    --attributes MessageRetentionPeriod=1209600 --output text >/dev/null
+  echo "✓ DLQ: ${DLQ_NAME} (created)"
+else
+  echo "✓ DLQ: ${DLQ_NAME} (exists)"
+fi
+# Allow EventBridge Scheduler to send failed invokes to the DLQ.
+aws sqs set-queue-attributes --queue-url "https://sqs.${AWS_REGION}.amazonaws.com/${ACCOUNT_ID}/${DLQ_NAME}" \
+  --attributes "{\"Policy\":\"{\\\"Version\\\":\\\"2012-10-17\\\",\\\"Statement\\\":[{\\\"Effect\\\":\\\"Allow\\\",\\\"Principal\\\":{\\\"Service\\\":\\\"scheduler.amazonaws.com\\\"},\\\"Action\\\":\\\"sqs:SendMessage\\\",\\\"Resource\\\":\\\"${DLQ_ARN}\\\",\\\"Condition\\\":{\\\"StringEquals\\\":{\\\"aws:SourceAccount\\\":\\\"${ACCOUNT_ID}\\\"}}}]}\"}" \
+  >/dev/null 2>&1 || echo "  (warn: could not set DLQ policy — set manually)"
+echo "✓ IAM: DLQ send policy for scheduler.amazonaws.com"
+
 # ─── EventBridge Schedule group ───────────────────────────────────────────────
 aws scheduler create-schedule-group --name "$SCHEDULE_GROUP" --output text >/dev/null 2>&1 \
   && echo "✓ Schedule group: ${SCHEDULE_GROUP} (created)" \
@@ -126,7 +144,7 @@ echo "✓ IAM: InvokeRoutinesRunner policy"
 # create/update/delete routine rows + their schedules. Grant both here. The
 # schedule Target uses the scheduler role above, so these principals also need
 # iam:PassRole on it.
-for PRINCIPAL_ROLE in "${ECS_TASK_ROLE_NAME:-agentcore-hub-ecs-task-role}" "agentcore-hub-harness-role"; do
+for PRINCIPAL_ROLE in "${ECS_TASK_ROLE_NAME:-agentcore-hub-ecs-task}" "agentcore-hub-harness-role"; do
   aws iam get-role --role-name "$PRINCIPAL_ROLE" >/dev/null 2>&1 || { echo "  (skip ${PRINCIPAL_ROLE} — not found)"; continue; }
   aws iam put-role-policy --role-name "$PRINCIPAL_ROLE" \
     --policy-name RoutinesManage \
@@ -169,6 +187,7 @@ echo "    ROUTINES_TABLE=${ROUTINES_TABLE}"
 echo "    ROUTINES_RUNNER_ARN=${RUNNER_ARN}"
 echo "    ROUTINES_SCHEDULER_ROLE_ARN=${SCHEDULER_ROLE_ARN}"
 echo "    ROUTINES_SCHEDULE_GROUP=${SCHEDULE_GROUP}"
+echo "    ROUTINES_DLQ_ARN=${DLQ_ARN}"
 echo ""
 echo "  Scheduler → routines-runner → POST ${WORKFLOW_API}/api/workflow/start"
 echo "═══════════════════════════════════════════════════════════"

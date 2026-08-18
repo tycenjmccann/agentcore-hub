@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { toScheduleExpression, describeForm, type ScheduleForm } from "./cron";
+import { toScheduleExpression, describeForm, validateScheduleFloor, type ScheduleForm } from "./cron";
 
 describe("toScheduleExpression", () => {
   it("daily → cron with time, wildcards", () => {
@@ -26,6 +26,37 @@ describe("toScheduleExpression", () => {
 
   it("biweekly → rate(14 days)", () => {
     expect(toScheduleExpression({ frequency: "biweekly", hour: 9, minute: 0, dayOfWeek: 1 })).toBe("rate(14 days)");
+  });
+});
+
+describe("validateScheduleFloor", () => {
+  it("rejects sub-hourly rate()", () => {
+    expect(validateScheduleFloor("rate(1 minute)")).toMatch(/minimum/);
+    expect(validateScheduleFloor("rate(30 minutes)")).toMatch(/minimum/);
+    expect(validateScheduleFloor("rate(59 minutes)")).toMatch(/minimum/);
+  });
+
+  it("allows hourly-or-slower rate()", () => {
+    expect(validateScheduleFloor("rate(1 hour)")).toBeNull();
+    expect(validateScheduleFloor("rate(60 minutes)")).toBeNull();
+    expect(validateScheduleFloor("rate(14 days)")).toBeNull();
+  });
+
+  it("rejects sub-hourly cron (wildcard/step/list/range minute)", () => {
+    expect(validateScheduleFloor("cron(* * * * ? *)")).toMatch(/Sub-hourly/);
+    expect(validateScheduleFloor("cron(0/5 * * * ? *)")).toMatch(/Sub-hourly/);
+    expect(validateScheduleFloor("cron(0,30 * * * ? *)")).toMatch(/Sub-hourly/);
+    expect(validateScheduleFloor("cron(0-15 * * * ? *)")).toMatch(/Sub-hourly/);
+  });
+
+  it("allows fixed-minute cron (daily/weekly/monthly and hourly)", () => {
+    expect(validateScheduleFloor("cron(30 6 * * ? *)")).toBeNull();
+    expect(validateScheduleFloor("cron(0 9 ? * MON *)")).toBeNull();
+    expect(validateScheduleFloor("cron(15 * * * ? *)")).toBeNull(); // once/hour at :15
+  });
+
+  it("rejects unrecognized expressions", () => {
+    expect(validateScheduleFloor("every minute")).toMatch(/Unrecognized/);
   });
 });
 

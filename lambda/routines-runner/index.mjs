@@ -79,18 +79,30 @@ export async function handler(event) {
   const payload = buildPayload(routine.input || {}, new Date());
   const firedAt = new Date().toISOString();
 
+  // Timeout the POST well under the Lambda's 30s so a hung workflow API surfaces as
+  // one clean failure — not a Lambda timeout that leaves Scheduler retrying blind.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 20_000);
+
   try {
     const resp = await fetch(`${WORKFLOW_API}/api/workflow/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: ctrl.signal,
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       const error = data.error || `HTTP ${resp.status}`;
       console.error(`[routines-runner] API ${resp.status}: ${JSON.stringify(data)}`);
       await recordLastRun(routineId, { at: firedAt, status: "failed", error });
-      return { statusCode: resp.status, body: error };
+      // 4xx = permanent client error (bad def, validation). Return 200 so Scheduler
+      // does NOT retry it 185× — a retry can't fix a malformed routine. 5xx is
+      // transient → throw so Scheduler retries (bounded) then DLQs.
+      if (resp.status >= 400 && resp.status < 500) {
+        return { statusCode: 200, body: `terminal client error (not retried): ${error}` };
+      }
+      throw new Error(`workflow API ${resp.status}: ${error}`);
     }
     const workflowId = data.workflowId || data.id;
     console.log(`[routines-runner] ${routineId} → workflow ${workflowId}`);
@@ -99,6 +111,9 @@ export async function handler(event) {
   } catch (err) {
     console.error(`[routines-runner] ${routineId} error:`, err);
     await recordLastRun(routineId, { at: firedAt, status: "failed", error: String(err?.message || err) });
-    return { statusCode: 500, body: String(err?.message || err) };
+    // Re-throw so Scheduler counts a failed invoke → bounded retry → DLQ.
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
 }

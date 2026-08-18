@@ -105,7 +105,7 @@ export default function RoutinesPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-xl font-semibold text-[var(--color-text-primary)] flex items-center gap-2">
-            <CalendarClock className="w-5 h-5 text-[#8b5cf6]" />
+            <CalendarClock className="w-5 h-5 text-[var(--color-brand-500)]" />
             Routines
           </h1>
           <p className="text-sm text-[var(--color-text-muted)] mt-1">
@@ -114,7 +114,7 @@ export default function RoutinesPage() {
         </div>
         <button
           onClick={() => setPickerOpen(true)}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-[#8b5cf6] hover:bg-[#7c3aed] text-white text-sm font-medium transition-colors"
+          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-[var(--color-brand-500)] hover:bg-[var(--color-brand-600)] text-white text-sm font-medium transition-colors"
         >
           <Plus className="w-4 h-4" /> New routine
         </button>
@@ -124,8 +124,8 @@ export default function RoutinesPage() {
         <div className="text-center text-sm text-[var(--color-text-muted)] py-16">Loading routines…</div>
       ) : routines.length === 0 ? (
         <div className="flex flex-col items-center justify-center text-center py-20 border border-dashed border-[var(--color-border)] rounded-xl">
-          <div className="w-14 h-14 rounded-full bg-[#8b5cf6]/10 flex items-center justify-center mb-4">
-            <Sparkles className="w-6 h-6 text-[#8b5cf6]" />
+          <div className="w-14 h-14 rounded-full bg-[color-mix(in_srgb,var(--color-brand-500)_10%,transparent)] flex items-center justify-center mb-4">
+            <Sparkles className="w-6 h-6 text-[var(--color-brand-500)]" />
           </div>
           <h3 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">No routines yet</h3>
           <p className="text-sm text-[var(--color-text-muted)] max-w-md mb-4">
@@ -133,7 +133,7 @@ export default function RoutinesPage() {
           </p>
           <button
             onClick={() => setPickerOpen(true)}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-[#8b5cf6] hover:bg-[#7c3aed] text-white text-sm font-medium transition-colors"
+            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-[var(--color-brand-500)] hover:bg-[var(--color-brand-600)] text-white text-sm font-medium transition-colors"
           >
             <Plus className="w-4 h-4" /> Create your first routine
           </button>
@@ -166,17 +166,17 @@ export default function RoutinesPage() {
             <div className="grid grid-cols-2 gap-3">
               <button
                 onClick={() => { setPickerOpen(false); setFormOpen(true); }}
-                className="flex flex-col items-center gap-2 rounded-lg border border-[var(--color-border)] hover:border-[#8b5cf6] p-4 text-center transition-colors"
+                className="flex flex-col items-center gap-2 rounded-lg border border-[var(--color-border)] hover:border-[var(--color-brand-500)] p-4 text-center transition-colors"
               >
-                <FormInput className="w-5 h-5 text-[#8b5cf6]" />
+                <FormInput className="w-5 h-5 text-[var(--color-brand-500)]" />
                 <span className="text-sm font-medium text-[var(--color-text-primary)]">Quick form</span>
                 <span className="text-[11px] text-[var(--color-text-muted)]">Existing workflow + schedule + repo</span>
               </button>
               <button
                 onClick={() => { setPickerOpen(false); setChatOpen(true); }}
-                className="flex flex-col items-center gap-2 rounded-lg border border-[var(--color-border)] hover:border-[#8b5cf6] p-4 text-center transition-colors"
+                className="flex flex-col items-center gap-2 rounded-lg border border-[var(--color-border)] hover:border-[var(--color-brand-500)] p-4 text-center transition-colors"
               >
-                <MessageSquare className="w-5 h-5 text-[#8b5cf6]" />
+                <MessageSquare className="w-5 h-5 text-[var(--color-brand-500)]" />
                 <span className="text-sm font-medium text-[var(--color-text-primary)]">Chat builder</span>
                 <span className="text-[11px] text-[var(--color-text-muted)]">Design a new pipeline conversationally</span>
               </button>

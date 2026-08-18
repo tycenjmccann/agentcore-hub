@@ -722,11 +722,8 @@ def _load_connector_registry():
     return registry
 
 
-def _connector_ids_for_agent(agent_id: str, payload_connectors) -> list:
-    """Connector ids bound to this agent: explicit payload override, else the
-    agents.json roster entry's `connectors` list."""
-    if payload_connectors:
-        return list(payload_connectors)
+def _roster_connector_ids(agent_id: str) -> list:
+    """Connector ids bound to this agent in the agents.json roster."""
     if not ARTIFACT_BUCKET or not agent_id or agent_id == "unknown":
         return []
     try:
@@ -744,6 +741,31 @@ def _connector_ids_for_agent(agent_id: str, payload_connectors) -> list:
         return []
 
 
+def _connector_ids_for_agent(agent_id: str, payload_connectors) -> list:
+    """Resolve the connector ids to activate for this invoke.
+
+    SECURITY: a per-invoke `payload_connectors` list may only NARROW the set of
+    connectors already bound to this agent in the roster (agents.json) — it can
+    never ADD one. This means an untrusted invoke payload (the workflow-start API
+    is reachable behind the app's auth gate, but we defend in depth) cannot load
+    an arbitrary connector's Secrets-Manager creds onto an agent that has shell/
+    claude_code. If the payload names a connector the agent isn't bound to, it's
+    dropped with a warning. No payload → use the full roster binding.
+    """
+    roster = _roster_connector_ids(agent_id)
+    if not payload_connectors:
+        return roster
+    roster_set = set(roster)
+    allowed, rejected = [], []
+    for cid in payload_connectors:
+        (allowed if cid in roster_set else rejected).append(cid)
+    if rejected:
+        logger.warning(
+            f"[{agent_id}] ignoring payload connector(s) not bound to this agent: {rejected}"
+        )
+    return allowed
+
+
 def _fetch_connector_secret(connector_id: str) -> dict:
     """Read connectors/<id> from Secrets Manager with this runtime's role."""
     try:
@@ -755,19 +777,49 @@ def _fetch_connector_secret(connector_id: str) -> dict:
         return {}
 
 
+# Env keys exported by the PREVIOUS invoke's connectors. A warm microVM is reused
+# across invokes (different workflows, possibly untrusted repo code), so we MUST
+# wipe a prior run's connector creds before the next agent runs — otherwise the
+# next agent (with shell/claude_code) could read secrets it was never bound to.
+_CONNECTOR_ENV_KEYS: set = set()
+
+
+def _clear_prior_connector_env():
+    """Remove env vars exported by the previous invoke's env-kind connectors."""
+    global _CONNECTOR_ENV_KEYS
+    for k in _CONNECTOR_ENV_KEYS:
+        os.environ.pop(k, None)
+    if _CONNECTOR_ENV_KEYS:
+        logger.info(f"cleared {len(_CONNECTOR_ENV_KEYS)} connector env var(s) from prior invoke")
+    _CONNECTOR_ENV_KEYS = set()
+
+
 def _apply_connectors(agent_id: str, payload_connectors):
     """Resolve this agent's connectors. Exports env for kind=env and returns a
     list of extra MCP server dicts (kind=mcp) + gateway urls (kind=gateway) for
-    _create_mcp_clients to attach."""
+    _create_mcp_clients to attach.
+
+    Always clears the prior invoke's connector env first (warm-microVM isolation).
+    """
+    global _CONNECTOR_ENV_KEYS
+    _clear_prior_connector_env()
+
     ids = _connector_ids_for_agent(agent_id, payload_connectors)
     if not ids:
         return {"mcp_servers": [], "gateways": []}
     registry = _load_connector_registry()
     mcp_servers, gateways = [], []
+    exported_keys = set()
     for cid in ids:
         conn = registry.get(cid)
         if not conn:
             logger.warning(f"[{agent_id}] connector '{cid}' not in registry — skipping")
+            continue
+        # Only load creds for a connector whose credential was actually entered.
+        # A "needs_credentials" connector must not connect (its urlTemplate could
+        # point anywhere and its secret is empty) — skip until a human activates it.
+        if conn.get("status") == "needs_credentials":
+            logger.warning(f"[{agent_id}] connector '{cid}' needs credentials — skipping")
             continue
         kind = conn.get("kind")
         secret = _fetch_connector_secret(cid) if kind in ("env", "mcp") else {}
@@ -780,18 +832,22 @@ def _apply_connectors(agent_id: str, payload_connectors):
         if kind == "env":
             for k, v in secret.items():
                 os.environ[k] = str(v)
+                exported_keys.add(k)
             logger.info(f"[{agent_id}] connector '{cid}' (env): {len(secret)} var(s) exported")
         elif kind == "mcp":
             url = _fill(conn.get("urlTemplate", ""))
             headers = {k: _fill(v) for k, v in (conn.get("headerTemplate") or {}).items()}
             if url:
                 mcp_servers.append({"url": url, "headers": headers})
-                logger.info(f"[{agent_id}] connector '{cid}' (mcp): {url}")
+                # Log the TEMPLATE, never the filled url — query-param tokens must
+                # not land in CloudWatch.
+                logger.info(f"[{agent_id}] connector '{cid}' (mcp): {conn.get('urlTemplate', '')}")
         elif kind == "gateway":
             gw = conn.get("gatewayUrl", "")
             if gw:
                 gateways.append(gw)
                 logger.info(f"[{agent_id}] connector '{cid}' (gateway): {gw}")
+    _CONNECTOR_ENV_KEYS = exported_keys
     return {"mcp_servers": mcp_servers, "gateways": gateways}
 
 
