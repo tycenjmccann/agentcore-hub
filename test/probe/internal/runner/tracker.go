@@ -28,13 +28,13 @@ func (ft *FailureTracker) Record(passed bool) {
 	ft.consecutiveFailures++
 
 	switch {
-	case ft.consecutiveFailures >= 3:
+	case ft.consecutiveFailures >= ft.threshold:
 		logging.Logger().Error("consecutive_failures",
 			"count", ft.consecutiveFailures,
 			"threshold", ft.threshold,
 			"alert", true,
 		)
-	case ft.consecutiveFailures == 2:
+	case ft.consecutiveFailures == ft.threshold-1:
 		logging.Logger().Error("consecutive_failures",
 			"count", ft.consecutiveFailures,
 			"threshold", ft.threshold,

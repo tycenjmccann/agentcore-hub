@@ -1,8 +1,13 @@
 package runner
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/tycenjmccann/agentcore-hub/test/probe/internal/logging"
 )
 
 func TestTracker_IncrementOnFailure(t *testing.T) {
@@ -115,5 +120,53 @@ func TestTracker_Concurrent(t *testing.T) {
 	ft.Record(true)
 	if got := ft.ConsecutiveFailures(); got != 0 {
 		t.Errorf("expected 0 after final reset, got %d", got)
+	}
+}
+
+func TestTracker_Threshold5_AlertAtExactly5(t *testing.T) {
+	var buf bytes.Buffer
+	logging.SetLogger(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer logging.Init("info")
+
+	ft := NewFailureTracker(5)
+
+	// Failures 1-4 should not produce an alert log
+	for i := 0; i < 4; i++ {
+		ft.Record(false)
+	}
+	if strings.Contains(buf.String(), `"alert"`) {
+		t.Error("alert should not fire before reaching threshold 5")
+	}
+
+	buf.Reset()
+	ft.Record(false) // failure 5 — should trigger alert
+	if !strings.Contains(buf.String(), `"alert"`) {
+		t.Error("alert should fire at exactly 5 consecutive failures with threshold 5")
+	}
+}
+
+func TestTracker_Threshold2_AlertAt2_ErrorAt1(t *testing.T) {
+	var buf bytes.Buffer
+	logging.SetLogger(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer logging.Init("info")
+
+	ft := NewFailureTracker(2)
+
+	// Failure 1: threshold-1 == 1, so this should be an ERROR without alert
+	ft.Record(false)
+	output := buf.String()
+	if !strings.Contains(output, `"level":"ERROR"`) {
+		t.Errorf("expected ERROR level at failure 1 with threshold 2, got: %s", output)
+	}
+	if strings.Contains(output, `"alert"`) {
+		t.Error("alert should not fire at failure 1 with threshold 2")
+	}
+
+	buf.Reset()
+	// Failure 2: meets threshold, should produce alert
+	ft.Record(false)
+	output = buf.String()
+	if !strings.Contains(output, `"alert"`) {
+		t.Error("alert should fire at exactly 2 consecutive failures with threshold 2")
 	}
 }
