@@ -3,7 +3,9 @@
 ## Process
 
 ### Step 1: Identify Branch
-1. Find the implementation branch from the ticket (search tickets for the parent work item)
+1. Use the run's SHARED integration branch (`feature/{EPIC}-...`) when one
+   exists — it contains all merged dev work. Only fall back to per-ticket
+   branches when there is no shared branch.
 2. Get the latest commit SHA
 
 ### Step 2: Run Full CI Pipeline
@@ -60,4 +62,6 @@ Report with a clear table:
 ## Rules
 - Always compare against base branch to confirm issues are pre-existing vs introduced
 - Include actual command output as evidence
-- If FAIL, create a fix ticket assigned back to the dev agent
+- If FAIL, create fix tickets grouped by file/component (one per component, not
+  per failure), assigned back to the owning dev agent; chain same-file tickets
+  with blocked_by so they run serially

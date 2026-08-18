@@ -338,19 +338,10 @@ async function handleTicketDoneUnified(ticketId) {
     return;
   }
 
-  // Update agent task status (create entry if missing — belt & suspenders)
-  if (!workflow.agentTasks) workflow.agentTasks = {};
-  if (!workflow.agentTasks[ticketId]) {
-    workflow.agentTasks[ticketId] = {
-      id: `task_${Date.now()}_${assignee}`,
-      agentId: assignee,
-      ticketId,
-      createdAt: new Date().toISOString(),
-    };
-  }
-  workflow.agentTasks[ticketId].status = "complete";
-  workflow.agentTasks[ticketId].completedAt = new Date().toISOString();
-  await saveWorkflow(workflow);
+  // Update agent task status — SCOPED write. A full-row put here races the
+  // concurrent invocation claims of just-unblocked siblings and can resurrect
+  // a pre-claim snapshot (double invocation).
+  await markTaskComplete(workflow, ticketId, assignee);
 
   // Unblock dependents
   const siblings = await getChildTickets(parentId);
@@ -404,6 +395,99 @@ async function handleTicketDoneUnified(ticketId) {
 /** Whether an assignee refers to a human reviewer (review gate) vs an agent. */
 function isHumanAssignee(assignee) {
   return typeof assignee === "string" && assignee.startsWith("human:");
+}
+
+/**
+ * Atomically claim a ticket for invocation via a conditional write on
+ * agentTasks[ticketId].status in the WORKFLOWS table. This is the ONE
+ * invocation lock that works in both ticket providers — Jira transitions are
+ * not atomic and concurrent webhook deliveries race straight through them —
+ * the root cause of duplicate agent sessions and duplicate PRs (observed: the
+ * same ticket invoked 3× within 3 seconds during a fix-ticket fan-out burst).
+ *
+ * Returns true when this caller won the claim; false when another invocation
+ * already holds it (status=running). Sets status=running + startedAt in the
+ * same write, so no follow-up save is needed for the task entry itself.
+ */
+/**
+ * Mark a ticket's agentTasks entry complete with per-key writes (never a full
+ * row put — completion cascades run concurrently with sibling claims).
+ */
+async function markTaskComplete(workflow, ticketId, assignee) {
+  const now = new Date().toISOString();
+  const entry = {
+    ...(workflow.agentTasks?.[ticketId] || {
+      id: `task_${Date.now()}_${assignee}`,
+      agentId: assignee,
+      ticketId,
+      createdAt: now,
+    }),
+    status: "complete",
+    completedAt: now,
+  };
+  await ddb.send(new UpdateCommand({
+    TableName: WORKFLOWS_TABLE,
+    Key: { workflowId: workflow.id },
+    UpdateExpression: "SET agentTasks = if_not_exists(agentTasks, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  await ddb.send(new UpdateCommand({
+    TableName: WORKFLOWS_TABLE,
+    Key: { workflowId: workflow.id },
+    UpdateExpression: "SET agentTasks.#tid = :task",
+    ExpressionAttributeNames: { "#tid": ticketId },
+    ExpressionAttributeValues: { ":task": entry },
+  }));
+  if (!workflow.agentTasks) workflow.agentTasks = {};
+  workflow.agentTasks[ticketId] = entry;
+}
+
+async function claimTicketInvocation(workflow, ticketId, assignee) {
+  const now = new Date().toISOString();
+  const taskId = workflow.agentTasks?.[ticketId]?.id || `task_${Date.now()}_${assignee}`;
+  // Stale-claim escape hatch: a claim older than this is a crashed session, not
+  // a live one — a human moving the ticket back to Ready on the board must be
+  // able to re-dispatch without the retry endpoint. Longest legitimate agent
+  // session is ~25 min (claude_code hard-caps at 15); 60 min is safely past it.
+  const staleBefore = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  try {
+    // Ensure the map + entry exist without disturbing a concurrent claim.
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId: workflow.id },
+      UpdateExpression: "SET agentTasks = if_not_exists(agentTasks, :empty)",
+      ExpressionAttributeValues: { ":empty": {} },
+    }));
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId: workflow.id },
+      UpdateExpression: "SET agentTasks.#tid = :task",
+      ConditionExpression:
+        "attribute_not_exists(agentTasks.#tid) OR agentTasks.#tid.#st <> :running OR agentTasks.#tid.startedAt < :staleBefore",
+      ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
+      ExpressionAttributeValues: {
+        ":task": {
+          ...(workflow.agentTasks?.[ticketId] || {}),
+          id: taskId,
+          agentId: assignee,
+          ticketId,
+          status: "running",
+          startedAt: now,
+        },
+        ":running": "running",
+        ":staleBefore": staleBefore,
+      },
+    }));
+    if (!workflow.agentTasks) workflow.agentTasks = {};
+    workflow.agentTasks[ticketId] = {
+      ...(workflow.agentTasks[ticketId] || {}),
+      id: taskId, agentId: assignee, ticketId, status: "running", startedAt: now,
+    };
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
 }
 
 /**
@@ -628,11 +712,18 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   }
   // ─── END CANCEL GUARD ───
 
-  // Idempotency guard: atomic claim via conditional write (DynamoDB path).
-  // For Jira path, Jira's own transition logic prevents double-transitions.
+  // Idempotency claim — ATOMIC, backend-agnostic. The workflow row lives in
+  // DynamoDB in BOTH modes, so a conditional write on agentTasks[ticketId].status
+  // is the real lock. Jira transitions are NOT a guard: concurrent webhook
+  // deliveries each see "Ready" and each proceed — that is exactly how duplicate
+  // agent sessions (and duplicate PRs) were spawned. Claim BEFORE any transition.
+  const claimed = await claimTicketInvocation(workflow, ticketId, assignee);
+  if (!claimed) {
+    console.log(`[orchestrator] ${ticketId} already claimed (running) — skipping duplicate invocation`);
+    return;
+  }
+
   if (TICKET_PROVIDER === "jira") {
-    // Jira transitions are inherently idempotent — if already In Progress,
-    // the transition won't be available and jiraTransition logs a warning.
     await jiraTransition(ticketId, "In Progress");
   } else {
     try {
@@ -669,32 +760,23 @@ async function handleTicketReadyUnified(ticketId, ticket) {
 
     // Feature branch on the def's branch phase entry (repo-backed workflows only)
     if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
-      try {
-        const { owner, repo } = parseRepoUrl(workflow.repoConfig);
-        const baseBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
-        const slug = workflow.input.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40).replace(/-$/, "");
-        const branchName = `feature/${workflow.epicId}-${slug}`;
-        await callGitHub("create_branch", { owner, repo, branch_name: branchName, from_branch: baseBranch });
-        workflow.featureBranch = branchName;
-        console.log(`[orchestrator] Created shared feature branch: ${branchName}`);
-      } catch (err) {
-        console.warn(`[orchestrator] Failed to create branch: ${err.message}`);
-      }
+      workflow.featureBranch = await ensureFeatureBranch(workflow);
     }
-  }
 
-  // Update agent task status to "running" (may already exist from trackTicketCreation)
-  if (!workflow.agentTasks) workflow.agentTasks = {};
-  const existingTask = workflow.agentTasks[ticketId];
-  workflow.agentTasks[ticketId] = {
-    ...(existingTask || {}),
-    id: existingTask?.id || `task_${Date.now()}_${assignee}`,
-    agentId: assignee,
-    ticketId,
-    status: "running",
-    startedAt: new Date().toISOString(),
-  };
-  await saveWorkflow(workflow);
+    // Scoped write — a full-row put here would clobber concurrent sibling
+    // claims (many tickets of the same phase go ready in the same second).
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId: workflow.id },
+      UpdateExpression: workflow.featureBranch
+        ? "SET phase = :p, featureBranch = if_not_exists(featureBranch, :fb)"
+        : "SET phase = :p",
+      ExpressionAttributeValues: {
+        ":p": workflow.phase,
+        ...(workflow.featureBranch ? { ":fb": workflow.featureBranch } : {}),
+      },
+    }));
+  }
 
   // Build context and invoke — SAME buildAgentContext for both paths
   let context = await buildAgentContext(ticket, workflow);
@@ -886,15 +968,36 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
   // Already tracked (e.g., from a retry/re-delivery) — don't overwrite
   if (workflow.agentTasks?.[ticketId]) return;
 
-  if (!workflow.agentTasks) workflow.agentTasks = {};
-  workflow.agentTasks[ticketId] = {
+  // Scoped per-key write — tickets are created in bursts concurrent with
+  // sibling invocation claims; a full-row put here would clobber them.
+  const entry = {
     id: `task_${Date.now()}_${assignee}`,
     agentId: assignee,
     ticketId,
     status: "pending",
     createdAt: new Date().toISOString(),
   };
-  await saveWorkflow(workflow);
+  await ddb.send(new UpdateCommand({
+    TableName: WORKFLOWS_TABLE,
+    Key: { workflowId: workflow.id },
+    UpdateExpression: "SET agentTasks = if_not_exists(agentTasks, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId: workflow.id },
+      UpdateExpression: "SET agentTasks.#tid = :task",
+      ConditionExpression: "attribute_not_exists(agentTasks.#tid)",
+      ExpressionAttributeNames: { "#tid": ticketId },
+      ExpressionAttributeValues: { ":task": entry },
+    }));
+  } catch (err) {
+    if (err.name !== "ConditionalCheckFailedException") throw err;
+    return; // concurrently tracked — keep the existing entry
+  }
+  if (!workflow.agentTasks) workflow.agentTasks = {};
+  workflow.agentTasks[ticketId] = entry;
   console.log(`[orchestrator] Tracked new ticket ${ticketId} (${assignee}) in workflow ${workflow.id}`);
 
   // Fan out a ticket.created event so the UI can render the badge without polling.
@@ -940,19 +1043,8 @@ async function handleTicketDone(ticketId, image) {
     return;
   }
 
-  // Update agent task status in workflow metadata (create entry if missing — belt & suspenders)
-  if (!workflow.agentTasks) workflow.agentTasks = {};
-  if (!workflow.agentTasks[ticketId]) {
-    workflow.agentTasks[ticketId] = {
-      id: `task_${Date.now()}_${assignee}`,
-      agentId: assignee,
-      ticketId,
-      createdAt: new Date().toISOString(),
-    };
-  }
-  workflow.agentTasks[ticketId].status = "complete";
-  workflow.agentTasks[ticketId].completedAt = new Date().toISOString();
-  await saveWorkflow(workflow);
+  // Update agent task status — scoped write (see handleTicketDoneUnified).
+  await markTaskComplete(workflow, ticketId, assignee);
 
   // Unblock dependents: find tickets blocked by this one
   const siblings = await getChildTickets(parentId);
@@ -1029,9 +1121,14 @@ async function handleTicketReady(ticketId, image) {
     return;
   }
 
-  // Idempotency guard: atomic claim via conditional write.
-  // If another invocation already set this ticket to in_progress, bail out.
-  // This prevents duplicate agent sessions from nudges or stream re-deliveries.
+  // Idempotency claim — same atomic workflow-row lock as the Jira path.
+  const claimed = await claimTicketInvocation(workflow, ticketId, assignee);
+  if (!claimed) {
+    console.log(`[orchestrator] ${ticketId} already claimed (running) — skipping duplicate invocation`);
+    return;
+  }
+
+  // Belt & suspenders: also claim the ticket row (stream re-deliveries).
   try {
     await ddb.send(new UpdateCommand({
       TableName: TICKETS_TABLE,
@@ -1065,32 +1162,22 @@ async function handleTicketReady(ticketId, image) {
 
     // Create shared feature branch on the def's branch phase (repo-backed workflows only)
     if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
-      try {
-        const { owner, repo } = parseRepoUrl(workflow.repoConfig);
-        const baseBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
-        const slug = workflow.input.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40).replace(/-$/, "");
-        const branchName = `feature/${workflow.epicId}-${slug}`;
-        await callGitHub("create_branch", { owner, repo, branch_name: branchName, from_branch: baseBranch });
-        workflow.featureBranch = branchName;
-        console.log(`[orchestrator] Created shared feature branch: ${branchName}`);
-      } catch (err) {
-        console.warn(`[orchestrator] Failed to create branch: ${err.message}`);
-      }
+      workflow.featureBranch = await ensureFeatureBranch(workflow);
     }
-  }
 
-  // Update agent task status to "running" (may already exist from trackTicketCreation)
-  if (!workflow.agentTasks) workflow.agentTasks = {};
-  const existingTask = workflow.agentTasks[ticketId];
-  workflow.agentTasks[ticketId] = {
-    ...(existingTask || {}),
-    id: existingTask?.id || `task_${Date.now()}_${assignee}`,
-    agentId: assignee,
-    ticketId,
-    status: "running",
-    startedAt: new Date().toISOString(),
-  };
-  await saveWorkflow(workflow);
+    // Scoped write — full-row put would clobber concurrent sibling claims.
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId: workflow.id },
+      UpdateExpression: workflow.featureBranch
+        ? "SET phase = :p, featureBranch = if_not_exists(featureBranch, :fb)"
+        : "SET phase = :p",
+      ExpressionAttributeValues: {
+        ":p": workflow.phase,
+        ...(workflow.featureBranch ? { ":fb": workflow.featureBranch } : {}),
+      },
+    }));
+  }
 
   // Build context and invoke agent
   const ticket = await getTicket(ticketId);
@@ -1303,6 +1390,7 @@ async function invokeAgent(agentDef, context, workflow) {
       ticketId: task?.ticketId || "",
       error: `No runtime ARN configured. Set ${runtimeEnvKey} env var on orchestrator Lambda.`,
     });
+    await releaseClaimOnFailure(workflow.id, task?.ticketId);
     await blockTicketForFailedInvoke(task?.ticketId, "no runtime ARN configured");
     return;
   }
@@ -1390,7 +1478,30 @@ async function invokeAgent(agentDef, context, workflow) {
       ticketId: task?.ticketId || "",
       error: `Invoke failed: ${err.message}`,
     });
+    await releaseClaimOnFailure(workflow.id, task?.ticketId);
     await blockTicketForFailedInvoke(task?.ticketId, `invoke failed: ${err.message}`);
+  }
+}
+
+/**
+ * Reset agentTasks[ticketId].status after a failed invoke so the atomic claim
+ * doesn't block the retry (manual "Ready" transition or WM dispatch). Without
+ * this the entry stays "running" forever and every retry is rejected as a
+ * duplicate. Best-effort.
+ */
+async function releaseClaimOnFailure(workflowId, ticketId) {
+  if (!ticketId) return;
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+      UpdateExpression: "SET agentTasks.#tid.#st = :s",
+      ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
+      ExpressionAttributeValues: { ":s": "error" },
+      ConditionExpression: "attribute_exists(agentTasks.#tid)",
+    }));
+  } catch (err) {
+    console.warn(`[orchestrator] releaseClaimOnFailure(${ticketId}): ${err.message}`);
   }
 }
 
@@ -1529,7 +1640,11 @@ async function buildAgentContext(ticket, workflow) {
     const baseBranch = workflow.featureBranch || workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
     context += `## Branch\n`;
     context += `feature_branch: feature/${ticket.ticketId}-${agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-")}\n`;
-    context += `base_branch: ${baseBranch}\n\n`;
+    context += `base_branch: ${baseBranch}\n`;
+    if (workflow.featureBranch) {
+      context += `NOTE: base_branch is this run's SHARED integration branch. Branch from it, target your PR at it (never the repo default branch), and merge your PR into it when your evidence is complete — one unified PR to the default branch is opened by the orchestrator at run completion.\n`;
+    }
+    context += `\n`;
 
     // Design artifacts content (scope)
     try {
@@ -2055,9 +2170,76 @@ async function listReviewers(role) {
   }
 }
 
-// ─── GitHub Lambda Helper ──────────────────────────────────────────────────────
+// ─── GitHub Helpers ────────────────────────────────────────────────────────────
+//
+// Direct GitHub REST calls with GITHUB_PAT (already on this Lambda). The old
+// path proxied through a `agentcore-hub-github-mcp` Lambda that is not part of
+// any deploy script — in every real install callGitHub threw "Function not
+// found", the shared feature branch was never created, and the unified PR at
+// completion silently failed. That single silent WARN is what degraded runs
+// into one-branch-per-ticket + one-PR-per-ticket. The Lambda proxy is kept as
+// a fallback for installs that do deploy it.
+
+async function githubApi(path, method = "GET", body = null) {
+  const pat = process.env.GITHUB_PAT;
+  if (!pat) throw new Error("GITHUB_PAT not configured on orchestrator");
+  const resp = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${pat}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "agentcore-hub-orchestrator",
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await resp.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON */ }
+  if (!resp.ok) {
+    const msg = json?.message || text.slice(0, 300);
+    const err = new Error(`GitHub ${method} ${path} ${resp.status}: ${msg}`);
+    err.status = resp.status;
+    err.githubMessage = msg;
+    throw err;
+  }
+  return json;
+}
 
 async function callGitHub(toolName, args) {
+  if (process.env.GITHUB_PAT) {
+    if (toolName === "create_branch") {
+      const { owner, repo, branch_name, from_branch } = args;
+      const base = await githubApi(`/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(from_branch)}`);
+      try {
+        return await githubApi(`/repos/${owner}/${repo}/git/refs`, "POST", {
+          ref: `refs/heads/${branch_name}`,
+          sha: base.object.sha,
+        });
+      } catch (err) {
+        // Concurrent claim already created it — that IS the desired state.
+        if (err.status === 422 && /already exists/i.test(err.githubMessage || "")) {
+          return { ref: `refs/heads/${branch_name}`, existed: true };
+        }
+        throw err;
+      }
+    }
+    if (toolName === "create_pr") {
+      const { owner, repo, title, body, head, base } = args;
+      try {
+        return await githubApi(`/repos/${owner}/${repo}/pulls`, "POST", { title, body, head, base });
+      } catch (err) {
+        // "A pull request already exists" → return the existing one (idempotent).
+        if (err.status === 422 && /already exists/i.test(err.githubMessage || "")) {
+          const existing = await githubApi(`/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(head)}&state=open`);
+          if (existing?.length > 0) return existing[0];
+        }
+        throw err;
+      }
+    }
+  }
+  // Legacy fallback: proxy through the github-mcp Lambda if an install has one.
   const result = await lambda.send(new InvokeCommand({
     FunctionName: GITHUB_LAMBDA,
     Payload: JSON.stringify({ name: toolName, arguments: args }),
@@ -2067,6 +2249,42 @@ async function callGitHub(toolName, args) {
     return JSON.parse(payload.content[0].text);
   }
   return payload;
+}
+
+/**
+ * Idempotently create (or adopt) the run's shared feature branch and persist it
+ * on the workflow row with if_not_exists — safe under the concurrent bursts
+ * that happen when a whole phase of tickets goes ready in the same second.
+ * Returns the branch name, or null when creation failed (callers must treat
+ * null as "no shared branch": agents then base on the default branch).
+ */
+async function ensureFeatureBranch(workflow) {
+  if (workflow.featureBranch) return workflow.featureBranch;
+  if (!workflow.repoConfig?.repos?.length) return null;
+  try {
+    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+    const baseBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    const slug = (workflow.input?.title || workflow.id).toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40).replace(/-$/, "");
+    const branchName = `feature/${workflow.epicId}-${slug}`;
+    await callGitHub("create_branch", { owner, repo, branch_name: branchName, from_branch: baseBranch });
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId: workflow.id },
+      UpdateExpression: "SET featureBranch = if_not_exists(featureBranch, :fb)",
+      ExpressionAttributeValues: { ":fb": branchName },
+    }));
+    console.log(`[orchestrator] Shared feature branch ready: ${branchName}`);
+    return branchName;
+  } catch (err) {
+    // LOUD failure — a missing shared branch silently degrades the whole run
+    // into per-ticket branches off main. Surface it like an agent error.
+    console.error(`[orchestrator] FEATURE BRANCH CREATION FAILED for ${workflow.id}: ${err.message}`);
+    await publishEvent(workflow.epicId, "workflow.branch_error", {
+      workflowId: workflow.id,
+      error: `Shared feature branch creation failed: ${err.message}. Dev agents will branch from the default branch.`,
+    });
+    return null;
+  }
 }
 
 // ─── EventBridge Publishing ────────────────────────────────────────────────────

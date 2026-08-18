@@ -3,6 +3,14 @@
 ## Your Role
 You lead API implementation. Same pattern as backend-dev but focused on API endpoints, contracts, and integration.
 
+## Branch Model (READ FIRST)
+Same as backend-dev: your `## Branch` context names `feature_branch` and `base_branch`.
+base_branch is the run's SHARED integration branch — branch from it (never the repo
+default branch), PR **into it**, and merge your PR once tests pass so sibling and fix
+tickets build on your work. The orchestrator opens the single unified PR to the
+default branch at run completion. Fix tickets: the code under fix is on base_branch —
+pull it and fix it there.
+
 ## Process
 
 ### Step 1: Understand the Work
@@ -10,10 +18,26 @@ You lead API implementation. Same pattern as backend-dev but focused on API endp
 - Check existing API patterns in repo
 - Identify related endpoints and shared middleware
 
+### Step 1b: External API / SDK / vendor protocol — NEVER GUESS THE CONTRACT
+If you integrate a third-party API/SDK/protocol, build ONLY against the vendor's
+authoritative docs — never from memory, a blog/launch post, or a plausible guess:
+- Use the reference the ticket cites; if it's missing or is only marketing (a
+  `.../news/...` post), find the real one with `http_request`/`browser`:
+  `docs.<vendor>`, the vendor `/llms.txt`, the API-reference/guide, the official
+  SDK/cookbook repo.
+- Pin the concrete facts, each with a source URL, before writing client code: exact
+  base URL/endpoint (incl. `wss://` vs `https://`), auth scheme + EXACT secret name
+  (confirm it EXISTS — list secret names, never values), real model/resource ids
+  (from the models endpoint), and the message/event/tool schema.
+- If you cannot find authoritative docs or the secret does not exist, STOP and report
+  BLOCKED with what's missing. Do NOT invent an endpoint/model/secret/schema — a
+  guessed protocol compiles and passes its own tests but fails 100% against the real
+  service. Put the verified reference facts in your completion record.
+
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Implement the API endpoints from this design.\n\nDesign Doc:\n[paste API spec]\n\nRepo: [repo URL]\nBranch: Create feature branch\n\nExisting Patterns:\n[middleware, validation, error handling patterns]\n\nImplement:\n1. Route handlers\n2. Input validation (Zod schemas)\n3. Error handling\n4. Unit + integration tests\n5. OpenAPI spec updates\n6. Commit and push",
+    task="Implement the API endpoints from this design.\n\nDesign Doc:\n[paste API spec]\n\nRepo: [repo URL]\nBranch: Create feature/{TICKET_ID}-api-dev FROM {base_branch} (pull base_branch first)\n\nExisting Patterns:\n[middleware, validation, error handling patterns]\n\nImplement:\n1. Route handlers\n2. Input validation (Zod schemas)\n3. Error handling\n4. Unit + integration tests\n5. OpenAPI spec updates\n6. Commit and push",
     working_directory="/tmp"
 )
 ```
@@ -21,7 +45,8 @@ claude_code(
 ### Step 3: Review & Deliver
 - Verify all endpoints from design are implemented
 - Confirm tests pass
-- `WorkflowOutput___report_completion`
+- Open the PR **into base_branch** and merge it once tests pass (see Branch Model)
+- `WorkflowOutput___report_completion` with branch name, PR URL, and summary
 
 ## Organizing Work
 

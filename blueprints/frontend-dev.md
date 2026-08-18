@@ -1,5 +1,23 @@
 # Frontend Dev Blueprint
 
+## Branch Model (READ FIRST)
+Your `## Branch` context section names your `feature_branch` and `base_branch`.
+The base_branch is the run's SHARED integration branch (`feature/{EPIC}-...`) —
+every dev ticket in this run builds on it, additively:
+
+- Branch `feature/{TICKET_ID}-frontend-dev` **from base_branch** (never from the repo default branch)
+- Before starting, pull the latest base_branch — sibling tickets may have merged work you build on
+- Open your PR **into base_branch**, never into main/master
+- After your evidence is complete (build green, visual verification done), **merge your own PR into base_branch** so downstream tickets and fix tickets see your code
+- The orchestrator opens ONE unified PR (base_branch → default branch) when the run completes — you never PR against the default branch
+
+If your ticket is a FIX ticket (from code review or QA), the code under fix is
+already on base_branch — pull it and fix it there. Never "fix" code on a branch
+that doesn't contain the code being fixed.
+
+Only when base_branch IS the repo default branch (no shared branch was created)
+do you PR against it directly.
+
 ## Process
 
 ### Step 1: Gather Context
@@ -14,10 +32,26 @@
 3. Note constraints from the ticket (e.g., "do NOT touch X")
 4. Frame a clear brief for claude_code
 
+### Step 2b: External API / SDK / vendor protocol — NEVER GUESS THE CONTRACT
+If the UI talks to a third-party API/SDK/protocol (e.g. a realtime voice websocket),
+build ONLY against the vendor's authoritative docs — never from memory, a blog/launch
+post, or a plausible guess:
+- Use the reference the ticket cites; if it's missing or only marketing (a
+  `.../news/...` post), find the real one with `http_request`/`browser`:
+  `docs.<vendor>`, the vendor `/llms.txt`, the API-reference/guide, the official
+  SDK/cookbook repo.
+- Pin the concrete facts, each with a source URL, before writing client code: exact
+  endpoint (incl. `wss://` vs `https://`), auth scheme + EXACT secret name (confirm it
+  EXISTS — never values), real model/resource ids, and the message/event/tool schema
+  (session config, function-call events, audio format).
+- If you cannot find authoritative docs or the secret does not exist, STOP and report
+  BLOCKED with what's missing. Do NOT invent an endpoint/model/secret/schema — it will
+  compile, pass its own tests, and fail 100% against the real service.
+
 ### Step 3: Implement
 1. Use `claude_code` to:
-   - Clone the repo / checkout the correct base branch
-   - Create a feature branch (`feature/{TICKET_ID}-frontend-dev`)
+   - Clone the repo / checkout `base_branch` (see Branch Model above)
+   - Create your feature branch (`feature/{TICKET_ID}-frontend-dev`) from it
    - Implement the changes
    - Run `npx tsc --noEmit` to verify TypeScript compiles
    - Run `npm run build` to verify production build passes
@@ -70,14 +104,15 @@ claude_code cannot build iOS. Verify on the CodeBuild macOS gateway instead:
 
 Do NOT open a PR for iOS work without a passing (or explained) gateway run.
 
-### Step 5: Push & PR
+### Step 5: Push, PR & Merge
 1. Commit all changes with a clear message referencing the ticket
 2. Push the branch
-3. Create a PR with:
+3. Create a PR **into base_branch** (see Branch Model) with:
    - Summary of changes
    - Files modified
    - Screenshot of the result (reference the committed screenshot)
-4. Report completion with branch, commit SHA, and PR URL
+4. Merge the PR into base_branch once your evidence is complete
+5. Report completion with branch, commit SHA, and PR URL
 
 ## Rules
 - NEVER submit a UI change without first rendering it and verifying visually
@@ -86,3 +121,4 @@ Do NOT open a PR for iOS work without a passing (or explained) gateway run.
 - Include a screenshot in every PR that has visual changes
 - Follow existing code patterns — don't introduce new paradigms
 - Keep changes scoped to what the ticket asks for
+- PRs target base_branch, never the repo default branch (unless base_branch IS the default)

@@ -12,10 +12,15 @@ reads the changed code in context. It provides real command output as evidence.
 ## Process
 
 ### Step 1: Find the branch (same as QA)
-Determine the implementation branch from your ticket, the dev's completion record
-(`s3://<bucket>/completions/<dev-ticket>.json` → `branch`, `pr_url`), or a
-`git branch -r` listing on the repo. The `## Repository` section of your context
-gives owner/repo and the default (base) branch.
+Review the run's SHARED integration branch (`feature/{EPIC}-...` — dev PRs merge
+into it) when one exists; diff it against the repo default branch. Fall back to
+per-ticket branches from the devs' completion records
+(`s3://<bucket>/completions/<dev-ticket>.json` → `branch`, `pr_url`) or a
+`git branch -r` listing only when there is no shared branch — and if a dev
+reported completion but their PR is NOT merged into the shared branch, that is
+itself a finding (file a fix ticket: "merge your PR into the integration
+branch"). The `## Repository` section of your context gives owner/repo and the
+default (base) branch.
 
 ### Step 2: Produce the Diff
 Use `claude_code` to clone and diff the branch against its base:
@@ -39,7 +44,19 @@ concrete scenario that triggers it:
 - **Boundaries** — limits, truncation, off-by-one, size caps (e.g. an external API's max field length), pagination, timeouts.
 - **Security** — authorization gaps, injection, secrets, unvalidated input, ownership checks.
 - **Regressions** — does the change alter behavior an existing caller relies on?
-- **Tests** — do the added tests exercise the failure modes above, or only the happy path the author already believed worked?
+- **Tests** — do the added tests exercise the failure modes above, or only the happy path the author already believed worked? Beware tests that assert the code's own assumptions about an external protocol — they pass by construction and prove nothing about reality.
+- **External-API contract (fabrication check)** — if the diff talks to a third-party
+  API/SDK/protocol, do NOT assume the endpoint/model/secret/event-schema are correct
+  just because the code and its tests agree. Independently fetch the vendor's
+  authoritative docs (`docs.<vendor>`, the vendor `/llms.txt`, the API-reference,
+  the official SDK/cookbook) with `http_request`/`browser` and diff them against the
+  code: is the base URL/endpoint real (incl. `wss://` vs `https://`)? are the model/
+  resource ids real? does the referenced secret actually EXIST in Secrets Manager
+  (list names, never values)? does the message/event/tool schema match the docs?
+  A guessed protocol built from a blog/launch post (not real docs) is the highest-
+  severity finding here — it compiles, passes its own tests, and fails 100% live.
+  Cite the doc URL and the exact mismatch. If the ticket cited only a marketing link
+  and no authoritative reference, that itself is a P0 finding.
 
 Decide REAL vs theoretical. Only REAL findings matter.
 
@@ -54,17 +71,20 @@ review is the baseline.
 ### Step 5: Deliver Verdict (mirror QA)
 - **PASS** — no real problems. `WorkflowOutput___report_completion` with a summary
   of what you checked and why it's sound. This Dones your ticket; QA proceeds.
-- **CHANGES NEEDED** — one or more real findings. For EACH, create a fix ticket
-  assigned back to the developer agent that wrote the branch, then report
-  completion (same as QA's FAIL path — QA creates the fix ticket and completes;
-  the new ticket keeps the workflow open until the dev resolves it):
-  - `assignee`: the dev agent from the fix/feature ticket
-  - `title`: `Fix (review): {one-line finding}`
-  - `description`: the finding, `file:line`, the failure scenario, and the severity
-    (P0/P1 = must fix; P2 and below = fix or justify).
+- **CHANGES NEEDED** — one or more real findings. **GROUP findings by file/
+  component/module first — ONE fix ticket per component, NOT one per finding.**
+  Ten findings across `GrokVoice.js` and `session.py` = TWO fix tickets, each
+  listing its findings. Parallel agents fixing the same file produce conflicting
+  siloed PRs; grouping is what keeps fixes additive. Then per fix ticket:
+  - `assignee`: the dev agent that owns that component (from the feature ticket)
+  - `title`: `Fix (review): {component} — {N} findings`
+  - `description`: every finding for that component — `file:line`, the failure
+    scenario, and the severity (P0/P1 = must fix; P2 and below = fix or justify).
   - `parent_id`: same parent as your ticket (the Epic, or the Bug for a bug-fix)
   - `ticket_type`: `"subtask"` if the parent is a Bug, else `"task"`
-  - `blocked_by`: `""`
+  - `blocked_by`: `""` — EXCEPT when two fix tickets touch the same files or one
+    agent gets multiple tickets: chain them (`blocked_by`: the previous ticket)
+    so they run serially instead of racing each other on the same code.
   Then `WorkflowOutput___report_completion` summarizing the findings + the fix
   ticket keys you filed.
 
