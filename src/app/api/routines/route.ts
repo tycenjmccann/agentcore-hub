@@ -14,6 +14,7 @@ import { listRoutines, putRoutine } from "@/lib/routines/store";
 import { upsertSchedule } from "@/lib/routines/schedule";
 import { validateScheduleFloor } from "@/lib/routines/cron";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
+import { boundConnectorIdsForDef } from "@/lib/workflow/roster-loader";
 import type { Routine } from "@/lib/routines/types";
 
 export const dynamic = "force-dynamic";
@@ -71,6 +72,25 @@ export async function POST(request: NextRequest) {
     // Normalize onto input.connectors — that's what flows to the workflow payload.
     const connectors: string[] | undefined =
       (Array.isArray(body.connectors) && body.connectors.length ? body.connectors : input.connectors) || undefined;
+
+    // The runtime only NARROWS per-invoke connectors against an agent's roster
+    // bindings — it never adds one. A connector picked here that isn't bound to any
+    // agent in this def would silently do nothing, so reject it up front with a
+    // clear message (bind it to the def's agent first, via the builder/agents.json).
+    if (connectors?.length) {
+      const bound = await boundConnectorIdsForDef(workflowDefId);
+      const orphans = connectors.filter((c) => !bound.has(c));
+      if (orphans.length) {
+        return NextResponse.json(
+          {
+            error:
+              `Connector(s) ${orphans.join(", ")} are not bound to any agent in "${workflowDefId}". ` +
+              `Bind them to the workflow's agent first (they would otherwise be ignored at run time).`,
+          },
+          { status: 400 }
+        );
+      }
+    }
 
     const routine: Routine = {
       routineId,

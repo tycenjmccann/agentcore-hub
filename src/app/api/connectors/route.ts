@@ -10,8 +10,17 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { getIdentity } from "@/lib/auth/identity";
-import { listConnectors, putConnector } from "@/lib/connectors/store";
+import { listConnectors, putConnector, getConnector } from "@/lib/connectors/store";
 import type { ConnectorKind } from "@/lib/connectors/types";
+
+/** A url/header target must be https — a plaintext endpoint would leak the
+ *  connector's token in the header/query on the wire. Mirrors register_connector.py. */
+function badScheme(...urls: (string | undefined)[]): string | null {
+  for (const u of urls) {
+    if (u && !u.startsWith("https://")) return `"${u}" must be an https:// URL`;
+  }
+  return null;
+}
 
 export const dynamic = "force-dynamic";
 
@@ -44,6 +53,31 @@ export async function POST(request: NextRequest) {
       : [];
     // A gateway connector authenticates via the runtime's IAM identity — no secret.
     const needsSecret = kind !== "gateway" && secretKeys.length > 0;
+
+    const schemeErr = badScheme(body.urlTemplate?.trim(), body.gatewayUrl?.trim());
+    if (schemeErr) return NextResponse.json({ error: schemeErr }, { status: 400 });
+
+    // SECURITY: refuse to repoint (or re-activate) an EXISTING credentialed connector
+    // via this create path. Otherwise a caller could set body.id to a live connector,
+    // swap urlTemplate/headerTemplate to an attacker host, and the runtime would ship
+    // its secret there on the next invoke. Endpoint changes on an active connector
+    // require delete + re-register (which forces credential re-entry). Mirrors the
+    // register_connector.py toolkit guard.
+    if (body.id) {
+      const prior = await getConnector(body.id);
+      if (prior) {
+        const urlChanged = body.urlTemplate !== undefined && body.urlTemplate?.trim() !== prior.urlTemplate;
+        const hdrChanged = body.headerTemplate !== undefined &&
+          JSON.stringify(body.headerTemplate) !== JSON.stringify(prior.headerTemplate);
+        const gwChanged = body.gatewayUrl !== undefined && body.gatewayUrl?.trim() !== prior.gatewayUrl;
+        if (prior.status === "active" && (urlChanged || hdrChanged || gwChanged)) {
+          return NextResponse.json(
+            { error: `Connector "${body.id}" is active; delete and re-register to change its endpoint (forces credential re-entry).` },
+            { status: 409 }
+          );
+        }
+      }
+    }
 
     const connector = await putConnector({
       id: body.id,

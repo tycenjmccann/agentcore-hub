@@ -12,6 +12,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { getIdentity } from "@/lib/auth/identity";
 import { getOwnedRoutine, mutateRoutine, deleteRoutine } from "@/lib/routines/store";
 import { upsertSchedule, deleteSchedule } from "@/lib/routines/schedule";
+import { validateScheduleFloor } from "@/lib/routines/cron";
+import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 
 export const dynamic = "force-dynamic";
 
@@ -38,6 +40,23 @@ export async function PATCH(
 
     const body = await request.json().catch(() => ({}));
     const now = new Date().toISOString();
+
+    // A new cadence must clear the same frequency floor the create path enforces —
+    // otherwise an edit could set rate(1 minute) and bypass it.
+    if (body.schedule?.expression) {
+      const floorErr = validateScheduleFloor(body.schedule.expression);
+      if (floorErr) return NextResponse.json({ error: floorErr }, { status: 400 });
+    }
+    // A changed def must exist in the live config, same as create.
+    if (typeof body.workflowDefId === "string" && body.workflowDefId !== existing.workflowDefId) {
+      const def = await resolveWorkflowDef(body.workflowDefId);
+      if (!def) {
+        return NextResponse.json(
+          { error: `Unknown workflowDefId "${body.workflowDefId}"` },
+          { status: 400 }
+        );
+      }
+    }
 
     // Apply the record change first, then reconcile the schedule to the new state.
     const updated = await mutateRoutine(id, (r) => {

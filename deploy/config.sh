@@ -48,6 +48,10 @@ export ROUTINES_TABLE="${ROUTINES_TABLE:-agentcore-hub-routines}"
 export ROUTINES_SCHEDULE_GROUP="${ROUTINES_SCHEDULE_GROUP:-agentcore-hub-routines}"
 export ROUTINES_RUNNER_ARN="${ROUTINES_RUNNER_ARN:-arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-routines-runner}"
 export ROUTINES_SCHEDULER_ROLE_ARN="${ROUTINES_SCHEDULER_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-routines-scheduler-role}"
+# DLQ for failed schedule invokes (created by lambda/routines-runner/deploy.sh).
+# Must reach the app + harness so schedule.ts / save_routine.py attach it as the
+# schedule's DeadLetterConfig — otherwise failed fires vanish.
+export ROUTINES_DLQ_ARN="${ROUTINES_DLQ_ARN:-arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:agentcore-hub-routines-dlq}"
 
 # Cloud Code — the standalone coding-agent runtime (set after deploy.py prints the ARN)
 export CODING_AGENT_RUNTIME_ARN="${CODING_AGENT_RUNTIME_ARN:-}"

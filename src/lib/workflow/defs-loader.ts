@@ -21,6 +21,16 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 const TTL_MS = 15_000;
 let _cache: { defs: WorkflowDef[]; at: number } | null = null;
 
+/** Merge bundled + S3 defs, S3 winning on id collision. This keeps newly-shipped
+ *  built-in defs (present in the app build but not yet re-synced to S3) resolvable,
+ *  while still surfacing S3-only routine defs. */
+function merge(s3Defs: WorkflowDef[]): WorkflowDef[] {
+  const byId = new Map<string, WorkflowDef>();
+  for (const d of WORKFLOW_DEFS) byId.set(d.id, d);
+  for (const d of s3Defs) if (d?.id) byId.set(d.id, d); // S3 overrides bundled
+  return [...byId.values()];
+}
+
 export async function loadWorkflowDefs(): Promise<WorkflowDef[]> {
   const now = Date.now();
   if (_cache && now - _cache.at < TTL_MS) return _cache.defs;
@@ -34,15 +44,13 @@ export async function loadWorkflowDefs(): Promise<WorkflowDef[]> {
       new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: "config/workflows.json" })
     );
     const doc = JSON.parse(await obj.Body!.transformToString());
-    const defs: WorkflowDef[] = Array.isArray(doc) ? doc : doc.workflows || [];
-    if (defs.length) {
-      _cache = { defs, at: now };
-      return defs;
-    }
-    return WORKFLOW_DEFS;
+    const s3Defs: WorkflowDef[] = Array.isArray(doc) ? doc : doc.workflows || [];
+    const defs = merge(s3Defs);
+    _cache = { defs, at: now };
+    return defs;
   } catch {
-    // S3 unavailable → fall back to the bundled defs so checked-in workflows still
-    // resolve. S3-only routine defs will be absent → the caller 400s (correct).
+    // S3 unavailable → bundled defs so checked-in workflows still resolve.
+    // S3-only routine defs will be absent → the caller 400s (correct).
     return WORKFLOW_DEFS;
   }
 }

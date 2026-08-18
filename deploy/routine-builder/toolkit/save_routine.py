@@ -32,6 +32,7 @@ Env (set on the harness by setup-routine-builder.mjs):
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -44,6 +45,11 @@ TABLE = os.environ.get("ROUTINES_TABLE", "agentcore-hub-routines")
 RUNNER_ARN = os.environ.get("ROUTINES_RUNNER_ARN", "")
 SCHEDULER_ROLE_ARN = os.environ.get("ROUTINES_SCHEDULER_ROLE_ARN", "")
 GROUP = os.environ.get("ROUTINES_SCHEDULE_GROUP", "agentcore-hub-routines")
+DLQ_ARN = os.environ.get("ROUTINES_DLQ_ARN", "")
+
+# One fire per hour max — each fire launches a full LLM pipeline. Mirrors
+# validateScheduleFloor in src/lib/routines/cron.ts.
+MIN_INTERVAL_MINUTES = 60
 
 ddb = boto3.resource("dynamodb", region_name=REGION)
 scheduler = boto3.client("scheduler", region_name=REGION)
@@ -66,13 +72,50 @@ def validate(r):
     expr = sch["expression"]
     if not (expr.startswith("rate(") or expr.startswith("cron(") or expr.startswith("at(")):
         fail("schedule.expression must be a rate(), cron(), or at() expression")
+    floor_err = schedule_floor_error(expr)
+    if floor_err:
+        fail(floor_err)
     inp = r["input"]
     if not inp.get("titleTemplate") or not inp.get("workflowDefId"):
         fail("input.titleTemplate and input.workflowDefId are required")
 
 
+def schedule_floor_error(expression):
+    """Reject sub-hourly schedules. Mirrors validateScheduleFloor in cron.ts.
+    Returns an error string, or None if acceptable."""
+    expr = expression.strip()
+    m = re.match(r"^rate\(\s*(\d+)\s+(minute|minutes|hour|hours|day|days)\s*\)$", expr, re.I)
+    if m:
+        n, unit = int(m.group(1)), m.group(2).lower()
+        minutes = n if unit.startswith("minute") else n * 60 if unit.startswith("hour") else n * 1440
+        if minutes < MIN_INTERVAL_MINUTES:
+            return f"schedule fires every {minutes} min; minimum is {MIN_INTERVAL_MINUTES} min (one fire per hour)"
+        return None
+    m = re.match(r"^cron\((.+)\)$", expr, re.I)
+    if m:
+        parts = m.group(1).strip().split()
+        minute = parts[0] if parts else ""
+        if minute == "*" or any(c in minute for c in "/,-"):
+            return "sub-hourly cron schedules are not allowed; use a fixed minute (one fire per hour max)"
+        return None
+    if expr.startswith("at("):
+        return None  # one-shot, no recurrence
+    return f"unrecognized schedule expression: {expression}"
+
+
 def upsert_schedule(routine_id, schedule, enabled):
     name = f"routine-{routine_id}"
+    # Bound the retry storm: EventBridge Scheduler defaults to 185 retries over 24h,
+    # which would relaunch the same full pipeline repeatedly on a slow/failed fire.
+    # Parity with src/lib/routines/schedule.ts.
+    target = {
+        "Arn": RUNNER_ARN,
+        "RoleArn": SCHEDULER_ROLE_ARN,
+        "Input": json.dumps({"routineId": routine_id}),
+        "RetryPolicy": {"MaximumRetryAttempts": 2, "MaximumEventAgeInSeconds": 300},
+    }
+    if DLQ_ARN:
+        target["DeadLetterConfig"] = {"Arn": DLQ_ARN}
     kwargs = dict(
         Name=name,
         GroupName=GROUP,
@@ -80,11 +123,7 @@ def upsert_schedule(routine_id, schedule, enabled):
         ScheduleExpressionTimezone=schedule.get("timezone", "UTC"),
         State="ENABLED" if enabled else "DISABLED",
         FlexibleTimeWindow={"Mode": "OFF"},
-        Target={
-            "Arn": RUNNER_ARN,
-            "RoleArn": SCHEDULER_ROLE_ARN,
-            "Input": json.dumps({"routineId": routine_id}),
-        },
+        Target=target,
     )
     try:
         scheduler.get_schedule(Name=name, GroupName=GROUP)

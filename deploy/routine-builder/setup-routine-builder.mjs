@@ -79,6 +79,9 @@ const RUNNER_ARN =
 const SCHEDULER_ROLE_ARN =
   process.env.ROUTINES_SCHEDULER_ROLE_ARN ||
   `arn:aws:iam::${accountId}:role/agentcore-hub-routines-scheduler-role`;
+const DLQ_ARN =
+  process.env.ROUTINES_DLQ_ARN ||
+  `arn:aws:sqs:${REGION}:${accountId}:agentcore-hub-routines-dlq`;
 
 // ─── 1/4 Execution role (shared harness role + routines data-plane policy) ─────
 console.log("\n1/4 Execution role");
@@ -233,6 +236,7 @@ const harnessConfig = {
     ROUTINES_RUNNER_ARN: RUNNER_ARN,
     ROUTINES_SCHEDULER_ROLE_ARN: SCHEDULER_ROLE_ARN,
     ROUTINES_SCHEDULE_GROUP: SCHEDULE_GROUP,
+    ROUTINES_DLQ_ARN: DLQ_ARN,
     MODEL_ID,
   },
 };

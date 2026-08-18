@@ -23,6 +23,31 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
 export async function PATCH(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const body = await request.json().catch(() => ({}));
+
+  const existing = await getConnector(id);
+  if (!existing) return NextResponse.json({ error: "Not found" }, { status: 404 });
+
+  // https-only endpoints (a plaintext target would leak the token on the wire).
+  for (const u of [body.urlTemplate?.trim(), body.gatewayUrl?.trim()]) {
+    if (u && !u.startsWith("https://")) {
+      return NextResponse.json({ error: `"${u}" must be an https:// URL` }, { status: 400 });
+    }
+  }
+  // SECURITY: an active (credentialed) connector's endpoint is immutable via PATCH —
+  // repointing it would ship the live secret to the new host on the next invoke.
+  if (existing.status === "active") {
+    const urlChanged = body.urlTemplate !== undefined && body.urlTemplate?.trim() !== existing.urlTemplate;
+    const hdrChanged = body.headerTemplate !== undefined &&
+      JSON.stringify(body.headerTemplate) !== JSON.stringify(existing.headerTemplate);
+    const gwChanged = body.gatewayUrl !== undefined && body.gatewayUrl?.trim() !== existing.gatewayUrl;
+    if (urlChanged || hdrChanged || gwChanged) {
+      return NextResponse.json(
+        { error: `Connector "${id}" is active; delete and re-register to change its endpoint (forces credential re-entry).` },
+        { status: 409 }
+      );
+    }
+  }
+
   const updated = await mutateConnector(id, (c) => ({
     ...c,
     name: body.name?.trim() || c.name,
