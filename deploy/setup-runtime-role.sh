@@ -317,8 +317,8 @@ aws iam put-role-policy \
       \"Effect\": \"Allow\",
       \"Action\": [\"s3:GetObject\", \"s3:PutObject\", \"s3:ListBucket\"],
       \"Resource\": [
-        \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}\",
-        \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}/*\"
+        \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}\",
+        \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/*\"
       ]
     }]
   }"

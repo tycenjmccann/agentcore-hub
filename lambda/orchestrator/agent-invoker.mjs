@@ -32,7 +32,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 const events = new EventBridgeClient({ region: REGION });
 
 export const handler = async (event) => {
-  const { harnessArn, sessionId, prompt, workflowId, agentId, ticketId, modelOverride } = event;
+  const { harnessArn, sessionId, prompt, workflowId, agentId, ticketId, modelOverride, connectors } = event;
   console.log(`[agent-invoker] Fire-and-forget: ${agentId} for workflow ${workflowId} (ticket: ${ticketId || "unknown"})`);
 
   try {
@@ -40,7 +40,7 @@ export const handler = async (event) => {
     const useRuntime = harnessArn.includes(":runtime/") || harnessArn.includes("/runtime/") || process.env.USE_RUNTIME === "true";
 
     if (useRuntime) {
-      await fireAndForgetRuntime(harnessArn, sessionId, prompt, workflowId, agentId, modelOverride, ticketId);
+      await fireAndForgetRuntime(harnessArn, sessionId, prompt, workflowId, agentId, modelOverride, ticketId, connectors);
     } else {
       // Legacy harness agents still use synchronous invocation (to be migrated)
       const output = await invokeHarnessAgent(harnessArn, sessionId, prompt, workflowId, agentId, modelOverride);
@@ -160,7 +160,7 @@ async function invokeHarnessAgent(harnessArn, sessionId, prompt, workflowId, age
  * - Calls report_completion when done (triggers orchestrator cascade)
  * - Nudge system handles crash/hang scenarios
  */
-async function fireAndForgetRuntime(runtimeArn, sessionId, prompt, workflowId, agentId, modelOverride, invokerTicketId) {
+async function fireAndForgetRuntime(runtimeArn, sessionId, prompt, workflowId, agentId, modelOverride, invokerTicketId, connectors) {
   const https = await import("https");
   const { SignatureV4 } = await import("@smithy/signature-v4");
   const { Sha256 } = await import("@aws-crypto/sha256-js");
@@ -172,6 +172,7 @@ async function fireAndForgetRuntime(runtimeArn, sessionId, prompt, workflowId, a
     agent_id: agentId,
     ticket_id: invokerTicketId || "",
     model_override: modelOverride?.bedrockModelConfig?.modelId || modelOverride || undefined,
+    ...(Array.isArray(connectors) && connectors.length ? { connectors } : {}),
   });
 
   const runtimeId = runtimeArn.split("/").pop();

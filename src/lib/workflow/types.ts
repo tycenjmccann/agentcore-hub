@@ -114,6 +114,8 @@ export interface WorkflowState {
   featureBranch?: string;
   /** QA verification retry counter (max 3 fix cycles before human escalation) */
   qaRetryCount?: number;
+  /** Routine-scoped connector ids forwarded to agent invocations for this run. */
+  connectors?: string[];
   /** Persisted event log for replay (populated during live runs) */
   eventLog?: StoredEvent[];
   /** Timestamp when workflow was cancelled */
@@ -184,6 +186,9 @@ export interface WorkflowInput {
   sources: IntakeSource[];
   /** Per-invocation model override for dev agents (e.g., Opus for complex tasks) */
   modelOverride?: ModelOverride;
+  /** Connector ids (routine-scoped) forwarded to each agent invoke so the runtime
+   *  loads their creds/tools for this run only. See src/lib/connectors. */
+  connectors?: string[];
   /** Workflow classification — "feature" (default) or "bug" */
   workflowType?: WorkflowType;
   /**

@@ -1356,6 +1356,8 @@ async function invokeAgent(agentDef, context, workflow) {
         agentId: agentDef.agentId,
         ticketId: task?.ticketId || "",
         modelOverride: modelConfig,
+        // Routine-scoped connectors travel with the workflow → each agent invoke.
+        connectors: workflow.connectors,
       }),
     }));
 
