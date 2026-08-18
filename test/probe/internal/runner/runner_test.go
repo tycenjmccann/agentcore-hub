@@ -253,6 +253,34 @@ func TestRunner_TriggerFails_SkipsToCleanup(t *testing.T) {
 	}
 }
 
+func TestRunner_TriggerFails_CleanupRunsExactlyOnce(t *testing.T) {
+	tracker := &endpointTracker{}
+	handlers := map[string]http.HandlerFunc{
+		"trigger": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+		},
+	}
+	srv := setupTestServer(t, tracker, handlers)
+	defer srv.Close()
+
+	cfg := newTestConfig(srv.URL)
+	c := client.NewRoutinesClient(srv.URL, "test-token", 5*time.Second)
+	ft := NewFailureTracker(3)
+	runner := NewSuiteRunner(cfg, c, ft)
+
+	result := runner.Run(context.Background())
+
+	if result.Passed {
+		t.Error("expected run to fail when trigger fails")
+	}
+	if tracker.deleteCalls.Load() != 1 {
+		t.Errorf("expected cleanup to run exactly once, got %d delete calls", tracker.deleteCalls.Load())
+	}
+	if result.StepResults["cleanup"] != "pass" {
+		t.Errorf("expected cleanup=pass, got %s", result.StepResults["cleanup"])
+	}
+}
+
 func TestRunner_VerifyFails_CleanupStillRuns(t *testing.T) {
 	tracker := &endpointTracker{}
 	handlers := map[string]http.HandlerFunc{

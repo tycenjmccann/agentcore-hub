@@ -59,6 +59,7 @@ func (r *SuiteRunner) Run(ctx context.Context) RunResult {
 
 	passed := true
 	cleanupNeeded := false
+	cleanupDone := false
 
 	for _, step := range allSteps {
 		if step.Name() == "cleanup" {
@@ -68,6 +69,7 @@ func (r *SuiteRunner) Run(ctx context.Context) RunResult {
 			}
 			result := r.executeStep(step, ctx, state)
 			state.StepResults[result.Name] = result.Result
+			cleanupDone = true
 			if result.Result == "fail" {
 				logging.Logger().Warn("cleanup_warning",
 					"run_id", runID,
@@ -97,7 +99,7 @@ func (r *SuiteRunner) Run(ctx context.Context) RunResult {
 		}
 	}
 
-	if cleanupNeeded && state.ResourceCreated {
+	if cleanupNeeded && state.ResourceCreated && !cleanupDone {
 		cleanup := steps.NewCleanupStep(r.client, r.config.CreateTimeout)
 		result := r.executeStep(cleanup, ctx, state)
 		state.StepResults[result.Name] = result.Result
