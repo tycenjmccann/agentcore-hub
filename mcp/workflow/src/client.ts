@@ -19,7 +19,7 @@ type ClientResult<T = unknown> = ClientResponse<T> | ClientError;
 export type { ClientError, ClientResult };
 
 export async function request<T = unknown>(
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
   body?: unknown,
   timeoutMs: number = DEFAULT_TIMEOUT_MS

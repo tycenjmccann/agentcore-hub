@@ -111,6 +111,64 @@ Send a nudge to a running workflow with optional guidance message.
 
 ---
 
+### `create_routine`
+Create a routine — a workflow that runs on a schedule (EventBridge Scheduler expression). The `workflowDefId` must already exist (see `list_workflow_definitions`). Minimum cadence is one fire per hour. `input.titleTemplate` may contain `{date}`, replaced with the fire date.
+
+**Required inputs:** `name` (string, ≤120 chars), `workflowDefId` (string), `schedule` (object with `expression`, optional `timezone`), `input` (object with `titleTemplate`, `description`, `workflowDefId`; optional `repoConfig`, `sources`, `connectors`)
+
+**Optional inputs:** `description` (string), `enabled` (boolean, default: true)
+
+**Endpoint:** `POST /api/routines`
+
+---
+
+### `list_routines`
+List all routines with schedule, enabled state, and last run.
+
+**No inputs required.**
+
+**Endpoint:** `GET /api/routines`
+
+---
+
+### `get_routine`
+Get one routine including its full input template and last run.
+
+**Required inputs:** `routineId` (string)
+
+**Endpoint:** `GET /api/routines/{routineId}`
+
+---
+
+### `update_routine`
+Enable/pause a routine, rename it, or change its schedule or input template. Only provided fields change.
+
+**Required inputs:** `routineId` (string)
+
+**Optional inputs:** `name`, `description`, `enabled`, `schedule`, `input` (partial, merged over existing)
+
+**Endpoint:** `PATCH /api/routines/{routineId}`
+
+---
+
+### `delete_routine`
+Delete a routine and its schedule. Stops firing immediately; cannot be undone.
+
+**Required inputs:** `routineId` (string)
+
+**Endpoint:** `DELETE /api/routines/{routineId}`
+
+---
+
+### `run_routine`
+Fire a routine immediately without waiting for its schedule.
+
+**Required inputs:** `routineId` (string)
+
+**Endpoint:** `POST /api/routines/{routineId}/run`
+
+---
+
 ## Error Handling
 
 - All tool inputs are validated with Zod before HTTP calls

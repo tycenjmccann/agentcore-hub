@@ -16,6 +16,12 @@ import {
   GetWorkflowArtifactsInputSchema,
   CancelWorkflowInputSchema,
   NudgeWorkflowInputSchema,
+  CreateRoutineInputSchema,
+  ListRoutinesInputSchema,
+  GetRoutineInputSchema,
+  UpdateRoutineInputSchema,
+  DeleteRoutineInputSchema,
+  RunRoutineInputSchema,
 } from "./schemas.js";
 
 // --- Response helpers ---
@@ -184,6 +190,136 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: "create_routine",
+    description:
+      "Create a routine: a workflow that runs on a schedule (EventBridge Scheduler expression, e.g. 'rate(7 days)' or 'cron(0 9 ? * MON *)'). The workflowDefId must already exist (see list_workflow_definitions). Minimum cadence is one fire per hour — each fire runs a full agent pipeline. input.titleTemplate may contain {date}, replaced with the fire date.",
+    inputSchema: {
+      type: "object",
+      required: ["name", "workflowDefId", "schedule", "input"],
+      properties: {
+        name: { type: "string", minLength: 1, maxLength: 120 },
+        description: { type: "string" },
+        workflowDefId: { type: "string", minLength: 1 },
+        schedule: {
+          type: "object",
+          required: ["expression"],
+          properties: {
+            expression: {
+              type: "string",
+              minLength: 1,
+              description: "EventBridge Scheduler expression: rate(...) or cron(...)",
+            },
+            timezone: { type: "string", description: "IANA timezone the cron is evaluated in (default UTC)" },
+          },
+        },
+        input: {
+          type: "object",
+          required: ["titleTemplate", "description", "workflowDefId"],
+          properties: {
+            titleTemplate: { type: "string", minLength: 1, description: "Workflow title; {date} is replaced with the fire date" },
+            description: { type: "string", minLength: 1 },
+            workflowDefId: { type: "string", minLength: 1 },
+            repoConfig: {
+              type: "object",
+              required: ["repos"],
+              properties: {
+                layout: { type: "string", enum: ["monorepo", "multi-repo"] },
+                repos: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    required: ["url"],
+                    properties: {
+                      url: { type: "string", format: "uri" },
+                      defaultBranch: { type: "string" },
+                      platform: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
+            sources: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["type", "value"],
+                properties: {
+                  type: { type: "string", enum: ["url", "upload", "s3"] },
+                  value: { type: "string", minLength: 1 },
+                  contentType: { type: "string" },
+                  label: { type: "string" },
+                },
+              },
+            },
+            connectors: {
+              type: "array",
+              items: { type: "string" },
+              description: "Connector ids applied to this routine's runs. Must already be bound to an agent in the workflow def.",
+            },
+          },
+        },
+        enabled: { type: "boolean", default: true },
+      },
+    },
+  },
+  {
+    name: "list_routines",
+    description: "List all routines (scheduled workflows) with their schedule, enabled state, and last run result.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "get_routine",
+    description: "Get a single routine by its ID, including its full input template and last run.",
+    inputSchema: {
+      type: "object",
+      required: ["routineId"],
+      properties: { routineId: { type: "string", minLength: 1 } },
+    },
+  },
+  {
+    name: "update_routine",
+    description:
+      "Update a routine: enable/pause it, rename it, or change its schedule or input template. Only the provided fields change.",
+    inputSchema: {
+      type: "object",
+      required: ["routineId"],
+      properties: {
+        routineId: { type: "string", minLength: 1 },
+        name: { type: "string", minLength: 1, maxLength: 120 },
+        description: { type: "string" },
+        enabled: { type: "boolean" },
+        schedule: {
+          type: "object",
+          required: ["expression"],
+          properties: {
+            expression: { type: "string", minLength: 1 },
+            timezone: { type: "string" },
+          },
+        },
+        input: { type: "object", description: "Partial input template; merged over the existing one" },
+      },
+    },
+  },
+  {
+    name: "delete_routine",
+    description: "Delete a routine and its schedule. The routine stops firing immediately. This cannot be undone.",
+    inputSchema: {
+      type: "object",
+      required: ["routineId"],
+      properties: { routineId: { type: "string", minLength: 1 } },
+    },
+  },
+  {
+    name: "run_routine",
+    description:
+      "Fire a routine immediately ('Run now') without waiting for its schedule. Starts a workflow from the routine's input template and records it as the routine's last run.",
+    inputSchema: {
+      type: "object",
+      required: ["routineId"],
+      properties: { routineId: { type: "string", minLength: 1 } },
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -286,6 +422,95 @@ async function handleNudgeWorkflow(args: unknown) {
   return success(JSON.stringify(result.data, null, 2));
 }
 
+async function handleCreateRoutine(args: unknown) {
+  const parsed = CreateRoutineInputSchema.safeParse(args);
+  if (!parsed.success) return zodError(parsed.error);
+
+  const result = await request<{ routine?: { routineId?: string; name?: string; enabled?: boolean } }>(
+    "POST",
+    "/api/routines",
+    parsed.data
+  );
+  if (!result.ok) return apiError(result);
+
+  const r = result.data.routine;
+  return success(
+    [
+      "Routine created.",
+      `ID: ${r?.routineId ?? "unknown"}`,
+      `Name: ${r?.name ?? parsed.data.name}`,
+      `Enabled: ${r?.enabled ?? true}`,
+      `Schedule: ${parsed.data.schedule.expression}${parsed.data.schedule.timezone ? ` (${parsed.data.schedule.timezone})` : ""}`,
+    ].join("\n")
+  );
+}
+
+async function handleListRoutines(args: unknown) {
+  const parsed = ListRoutinesInputSchema.safeParse(args ?? {});
+  if (!parsed.success) return zodError(parsed.error);
+
+  const result = await request("GET", "/api/routines");
+  if (!result.ok) return apiError(result);
+
+  return success(JSON.stringify(result.data, null, 2));
+}
+
+async function handleGetRoutine(args: unknown) {
+  const parsed = GetRoutineInputSchema.safeParse(args);
+  if (!parsed.success) return zodError(parsed.error);
+
+  const result = await request(
+    "GET",
+    `/api/routines/${encodeURIComponent(parsed.data.routineId)}`
+  );
+  if (!result.ok) return apiError(result);
+
+  return success(JSON.stringify(result.data, null, 2));
+}
+
+async function handleUpdateRoutine(args: unknown) {
+  const parsed = UpdateRoutineInputSchema.safeParse(args);
+  if (!parsed.success) return zodError(parsed.error);
+
+  const { routineId, ...body } = parsed.data;
+  const result = await request(
+    "PATCH",
+    `/api/routines/${encodeURIComponent(routineId)}`,
+    body
+  );
+  if (!result.ok) return apiError(result);
+
+  return success(JSON.stringify(result.data, null, 2));
+}
+
+async function handleDeleteRoutine(args: unknown) {
+  const parsed = DeleteRoutineInputSchema.safeParse(args);
+  if (!parsed.success) return zodError(parsed.error);
+
+  const result = await request(
+    "DELETE",
+    `/api/routines/${encodeURIComponent(parsed.data.routineId)}`
+  );
+  if (!result.ok) return apiError(result);
+
+  return success(`Routine ${parsed.data.routineId} deleted.`);
+}
+
+async function handleRunRoutine(args: unknown) {
+  const parsed = RunRoutineInputSchema.safeParse(args);
+  if (!parsed.success) return zodError(parsed.error);
+
+  const result = await request<{ workflowId?: string }>(
+    "POST",
+    `/api/routines/${encodeURIComponent(parsed.data.routineId)}/run`
+  );
+  if (!result.ok) return apiError(result);
+
+  const lines = [`Routine ${parsed.data.routineId} fired.`];
+  if (result.data.workflowId) lines.push(`Workflow: ${result.data.workflowId}`);
+  return success(lines.join("\n"));
+}
+
 // --- MCP Server setup ---
 
 const server = new Server(
@@ -318,6 +543,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return handleCancelWorkflow(args);
     case "nudge_workflow":
       return handleNudgeWorkflow(args);
+    case "create_routine":
+      return handleCreateRoutine(args);
+    case "list_routines":
+      return handleListRoutines(args);
+    case "get_routine":
+      return handleGetRoutine(args);
+    case "update_routine":
+      return handleUpdateRoutine(args);
+    case "delete_routine":
+      return handleDeleteRoutine(args);
+    case "run_routine":
+      return handleRunRoutine(args);
     default:
       return {
         isError: true,

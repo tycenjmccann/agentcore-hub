@@ -68,3 +68,65 @@ export const CancelWorkflowInputSchema = z.object({
 export const NudgeWorkflowInputSchema = z.object({
   workflowId: z.string().min(1),
 });
+
+// --- Routines ---
+
+export const RoutineScheduleSchema = z.object({
+  expression: z.string().min(1),
+  timezone: z.string().optional(),
+});
+
+// Mirrors RoutineInputTemplate (src/lib/routines/types.ts): the payload template
+// POSTed to /api/workflow/start on each fire. {date} in titleTemplate is
+// substituted with the fire date.
+export const RoutineInputTemplateSchema = z.object({
+  titleTemplate: z.string().min(1),
+  description: z.string().min(1),
+  workflowDefId: z.string().min(1),
+  repoConfig: z
+    .object({
+      layout: z.enum(["monorepo", "multi-repo"]).optional(),
+      repos: z.array(
+        z.object({
+          url: z.string().url(),
+          defaultBranch: z.string().optional(),
+          platform: z.string().optional(),
+        })
+      ),
+    })
+    .optional(),
+  sources: z.array(IntakeSourceSchema).optional(),
+  connectors: z.array(z.string()).optional(),
+});
+
+export const CreateRoutineInputSchema = z.object({
+  name: z.string().min(1).max(120),
+  description: z.string().optional(),
+  workflowDefId: z.string().min(1),
+  schedule: RoutineScheduleSchema,
+  input: RoutineInputTemplateSchema,
+  enabled: z.boolean().optional().default(true),
+});
+
+export const ListRoutinesInputSchema = z.object({});
+
+export const GetRoutineInputSchema = z.object({
+  routineId: z.string().min(1),
+});
+
+export const UpdateRoutineInputSchema = z.object({
+  routineId: z.string().min(1),
+  name: z.string().min(1).max(120).optional(),
+  description: z.string().optional(),
+  enabled: z.boolean().optional(),
+  schedule: RoutineScheduleSchema.optional(),
+  input: RoutineInputTemplateSchema.partial().optional(),
+});
+
+export const DeleteRoutineInputSchema = z.object({
+  routineId: z.string().min(1),
+});
+
+export const RunRoutineInputSchema = z.object({
+  routineId: z.string().min(1),
+});
