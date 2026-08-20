@@ -96,6 +96,10 @@ async function loadAgentRoster() {
       phase: a.phase,
       runtimeArn: a.runtimeArn || null,
       workflowDefId: a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID,
+      // An agent may serve multiple pipelines (e.g. reviewer/QA/CI run in both
+      // software-delivery and bug-fix). workflowDefIds is the multi-def list;
+      // fall back to the single workflowDefId shorthand.
+      workflowDefIds: a.workflowDefIds?.length ? a.workflowDefIds : [a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID],
     }));
     console.log(`[orchestrator] Loaded ${_agentRoster.length} agents from S3 config`);
   } catch (err) {
@@ -1554,7 +1558,7 @@ async function buildAgentContext(ticket, workflow) {
   if (ticket.assignee === wfDef.intakeAgentId) {
     const roster = (_agentRoster || FALLBACK_ROSTER)
       .filter(a => a.agentId !== wfDef.intakeAgentId)
-      .filter(a => (a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID) === wfDef.id)
+      .filter(a => (a.workflowDefIds || [a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID]).includes(wfDef.id))
       .map(a => `  - "${a.agentId}" (${a.phase})`)
       .join("\n");
     context += `## Available Agents\n${roster}\n\n`;
@@ -1799,11 +1803,16 @@ async function bootstrapBugWorkflow(bugTicket) {
     phase: "requirements",
     epicId: bugKey,
     repoConfig,
+    // Bugs run the dedicated 4-phase bug-fix pipeline (triage → fix → verify → CI),
+    // not the full 5-phase software-delivery flow. Top-level drives orchestrator
+    // phase advancement + roster scoping; input.workflowDefId drives the board.
+    workflowDefId: "bug-fix",
     input: {
       title: bugTicket.title || `Bug fix: ${bugKey}`,
       description: bugTicket.description || "",
       sources: [],
       repoConfig,
+      workflowDefId: "bug-fix",
     },
     agentTasks: {},
     messages: [],

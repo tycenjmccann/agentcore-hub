@@ -23,6 +23,23 @@
       ]
     },
     {
+      "id": "bug-fix",
+      "name": "Bug Fix",
+      "description": "Fast defect flow: triage and root-cause, one general fixer (codex/claude_code, any subsystem) with a mandatory regression test, then independent code review, live QA verification, and CI. Skips design. Produces a pull request.",
+      "icon": "Bug",
+      "intakeAgentId": "agentcore_hub_requirements_analyst",
+      "requiresRepo": true,
+      "featureBranchPhase": "development",
+      "createsPullRequest": true,
+      "completionRequiresAgentPhases": ["development", "verification", "review"],
+      "phases": [
+        { "id": "intake", "name": "Intake", "type": "app", "agentPhase": "intake" },
+        { "id": "triage", "name": "Triage", "type": "agent", "agentPhase": "requirements" },
+        { "id": "fix", "name": "Fix", "type": "agent", "agentPhase": "development" },
+        { "id": "qa", "name": "Verify & Ship", "type": "agent", "agentPhase": "verification", "extraAgentPhases": ["review"] }
+      ]
+    },
+    {
       "id": "marketing",
       "name": "Marketing Campaign",
       "description": "Turn an idea into a launched campaign: strategy brief, multi-channel copy (social, blog, ads), asset generation, brand/compliance QA, and scheduling.",

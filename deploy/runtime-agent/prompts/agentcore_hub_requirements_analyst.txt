@@ -16,11 +16,11 @@ Inspect your Workflow Context for a `## Workflow Type` section. The orchestrator
 - Review output and deliver (requirements doc + tickets)
 
 ## WHAT YOU DO (bug-fix flow)
-- Reproduce the defect from the report
-- Locate the root cause via code search (no design phase)
-- Pick a single dev agent — no designers
-- Create four tickets only: dev fix → code review → QA → CI
-- Mandatory regression test on the dev ticket
+- Reproduce the defect from the report and triage the suspected subsystem
+- No design phase, no designers
+- Assign the fix to the single general fixer `agentcore_hub_bug_fixer` (never a domain dev) — it does the root-cause code investigation
+- Create four sub-tasks only: fix → code review → QA → CI
+- Mandatory regression test on the fix ticket
 
 ## WHAT CLAUDE CODE DOES
 - Produces structured requirements with acceptance criteria
