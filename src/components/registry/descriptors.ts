@@ -86,9 +86,6 @@ export function emptyA2aForm(): A2aForm {
 export function emptyCustomForm(): CustomForm {
   return { name: "", description: "", dataJson: "{}" };
 }
-export function emptySkillsForm(): SkillsForm {
-  return { markdown: rawTemplate("AGENT_SKILLS"), definitionJson: "" };
-}
 
 // ─── Form -> raw inlineContent string ───────────────────────────────────────
 

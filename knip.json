@@ -1,0 +1,25 @@
+{
+  "entry": [
+    "src/app/**/page.tsx",
+    "src/app/**/route.ts",
+    "src/app/**/layout.tsx",
+    "src/middleware.ts",
+    "lambda/**/index.ts",
+    "lambda/**/handler.ts"
+  ],
+  "project": [
+    "src/**/*.{ts,tsx}",
+    "lambda/**/*.ts"
+  ],
+  "ignore": [
+    "mcp/**",
+    "tests/**",
+    "**/*.test.ts",
+    "**/*.spec.ts"
+  ],
+  "ignoreDependencies": [
+    "autoprefixer",
+    "postcss",
+    "@tailwindcss/typography"
+  ]
+}
