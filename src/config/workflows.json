@@ -4,6 +4,7 @@
     {
       "id": "software-delivery",
       "name": "Software Delivery",
+      "displayName": "SDLC",
       "description": "Autonomous feature/bug pipeline: requirements analysis, parallel design, development, QA verification, and CI — produces a pull request.",
       "icon": "GitPullRequest",
       "intakeAgentId": "agentcore_hub_requirements_analyst",
@@ -25,6 +26,7 @@
     {
       "id": "bug-fix",
       "name": "Bug Fix",
+      "displayName": "Bug-Fix",
       "description": "Fast defect flow: triage and root-cause, one general fixer (codex/claude_code, any subsystem) with a mandatory regression test, then independent code review, live QA verification, and CI. Skips design. Produces a pull request.",
       "icon": "Bug",
       "intakeAgentId": "agentcore_hub_requirements_analyst",
@@ -40,8 +42,26 @@
       ]
     },
     {
+      "id": "dead-code-sweep",
+      "name": "Dead Code Sweep",
+      "displayName": "Dead-Code",
+      "description": "Scheduled hygiene flow: statically detect unused code (language-aware — Periphery for Swift, knip/ts-prune for TS, vulture for Python), remove it surgically with evidence it is unreferenced, then independent code review, live QA that build + tests still pass, and CI. Produces a pull request for human review — never auto-merges.",
+      "icon": "Trash2",
+      "intakeAgentId": "agentcore_hub_requirements_analyst",
+      "requiresRepo": true,
+      "featureBranchPhase": "development",
+      "createsPullRequest": true,
+      "completionRequiresAgentPhases": ["development", "verification", "review"],
+      "phases": [
+        { "id": "intake", "name": "Intake", "type": "app", "agentPhase": "intake" },
+        { "id": "sweep", "name": "Sweep", "type": "agent", "agentPhase": "development" },
+        { "id": "qa", "name": "Verify & Ship", "type": "agent", "agentPhase": "verification", "extraAgentPhases": ["review"] }
+      ]
+    },
+    {
       "id": "marketing",
       "name": "Marketing Campaign",
+      "displayName": "Marketing",
       "description": "Turn an idea into a launched campaign: strategy brief, multi-channel copy (social, blog, ads), asset generation, brand/compliance QA, and scheduling.",
       "icon": "Megaphone",
       "intakeAgentId": "agentcore_hub_marketing_strategist",
@@ -61,6 +81,7 @@
     {
       "id": "sales",
       "name": "Sales Proposal",
+      "displayName": "Sales",
       "description": "Respond to an RFP or opportunity: qualify the deal, draft the proposal and solution, price it, run a deal-desk review, and route for approval.",
       "icon": "Handshake",
       "intakeAgentId": "agentcore_hub_deal_qualifier",
@@ -79,6 +100,7 @@
     {
       "id": "legal",
       "name": "Legal Contract Review",
+      "displayName": "Legal",
       "description": "Review an inbound contract: triage and classify, run parallel legal/risk/privacy review, draft redlines, and route for sign-off.",
       "icon": "Scale",
       "intakeAgentId": "agentcore_hub_legal_intake",
