@@ -49,8 +49,13 @@ post, or a plausible guess:
   compile, pass its own tests, and fail 100% against the real service.
 
 ### Step 3: Implement
+Pass `repo` on your FIRST `claude_code` call so the workspace is cloned. Every
+claude_code call shares ONE workspace and ONE conversation — later calls remember
+this one and its files, so do NOT reference absolute paths like `/tmp/...`; say
+"the same workspace as the previous call".
+
 1. Use `claude_code` to:
-   - Clone the repo / checkout `base_branch` (see Branch Model above)
+   - Clone the repo (pass `repo`) / checkout `base_branch` (see Branch Model above)
    - Create your feature branch (`feature/{TICKET_ID}-frontend-dev`) from it
    - Implement the changes
    - Run `npx tsc --noEmit` to verify TypeScript compiles
@@ -58,30 +63,19 @@ post, or a plausible guess:
 2. If compilation fails, fix the errors before proceeding
 
 ### Step 4: Visual Verification (MANDATORY for UI changes)
-After implementation, you MUST verify your work visually:
+After implementation, you MUST verify your work visually. claude_code has its
+own workspace, so the screenshot and its review both happen INSIDE claude_code —
+you don't read the file yourself.
 
-1. Use `claude_code` to start the dev server and take a screenshot:
-   ```
-   cd /tmp/repo && npm run dev &
-   sleep 10
-   npx playwright install chromium
-   node -e "
-   const { chromium } = require('playwright');
-   (async () => {
-     const browser = await chromium.launch();
-     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-     await page.goto('http://localhost:3000/workflow');
-     await page.waitForTimeout(3000);
-     await page.screenshot({ path: 'docs/implementation-screenshot.png', fullPage: false });
-     await browser.close();
-   })();
-   "
-   ```
-2. Review the screenshot — does it match the design spec?
-3. If NOT, iterate until it does
-4. Commit the screenshot to the branch
-5. Upload it to shared artifacts:
-   `upload_file_to_s3(local_path="/tmp/repo/docs/implementation-screenshot.png", key="workflows/{workflow_id}/shared/dev-evidence/implementation-screenshot.png")`
+Ask `claude_code` (same session) to:
+1. Start the dev server, install chromium, and screenshot the changed view with
+   Playwright, saving it INTO the repo (e.g. `docs/implementation-screenshot.png`).
+2. Review the screenshot against the design spec and describe what it shows in
+   its response — iterate until it matches.
+3. **Commit the screenshot to the branch** so the evidence travels via git (this
+   is how it reaches you, QA, and the PR — no local file handoff).
+The runtime also auto-harvests generated files to S3, but the committed-to-branch
+copy is the source of truth. Reference the committed path in your PR.
 
 ### Step 4b: iOS Projects (MANDATORY — replaces Step 4 for iOS)
 claude_code cannot build iOS. Verify on the CodeBuild macOS gateway instead:
@@ -96,9 +90,11 @@ claude_code cannot build iOS. Verify on the CodeBuild macOS gateway instead:
    - `BUILD_ERROR` → doesn't compile → your implementation is broken; fix and re-run.
    - Test failures in code you touched → fix and re-run.
 5. Use `get_test_logs(build_id, test_name)` to diagnose failures (includes screenshots).
-6. Persist the evidence: gateway artifact URLs are presigned and EXPIRE. Download the
-   session video / screenshots to /tmp (`shell`: `curl -sL -o /tmp/<name> "<url>"`) and
-   `upload_file_to_s3(local_path="/tmp/<name>", key="workflows/{workflow_id}/shared/dev-evidence/<name>")`.
+6. Persist the evidence: gateway artifact URLs are presigned and EXPIRE. Have
+   `claude_code` (same session) download the session video / screenshots and
+   commit them to the branch, OR write them into the repo so the runtime harvests
+   them to S3. Do NOT curl to `/tmp` and `upload_file_to_s3` yourself — with the
+   remote coding runtime that local path does not exist on your side.
 7. Reference the gateway build_id + test_summary + the S3 evidence keys in the PR the
    way you'd reference a screenshot for web work.
 

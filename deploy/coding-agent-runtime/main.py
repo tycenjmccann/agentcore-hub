@@ -696,6 +696,54 @@ def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None =
     return _sync_artifacts(f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/artifacts/", workdir)
 
 
+# Workflow-origin sessions mint one dir per agent-task, far faster than human
+# sessions — without GC the EFS volume grows unbounded. Opportunistic sweep at
+# turn start: remove session dirs whose tree is untouched for SESSION_TTL_DAYS.
+SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "14"))
+_GC_MARKER = os.path.join(WORKSPACE_ROOT, ".last-session-gc")
+_GC_INTERVAL_S = 6 * 3600  # at most one sweep per warm VM per 6h
+
+
+def _gc_stale_sessions() -> None:
+    """Best-effort TTL sweep of {WORKSPACE_ROOT}/sessions/*. Uses the session
+    dir's own mtime (updated on any direct child create/delete) plus its
+    top-level entries' mtimes as the activity signal — full-tree walks on EFS
+    are too slow for a turn path. Never raises."""
+    if SESSION_TTL_DAYS <= 0:
+        return
+    try:
+        now = time.time()
+        try:
+            if now - os.path.getmtime(_GC_MARKER) < _GC_INTERVAL_S:
+                return
+        except OSError:
+            pass
+        with open(_GC_MARKER, "w") as f:
+            f.write(str(int(now)))
+        sessions_root = os.path.join(WORKSPACE_ROOT, "sessions")
+        if not os.path.isdir(sessions_root):
+            return
+        cutoff = now - SESSION_TTL_DAYS * 86400
+        removed = 0
+        for name in os.listdir(sessions_root):
+            path = os.path.join(sessions_root, name)
+            if not os.path.isdir(path):
+                continue
+            try:
+                newest = os.path.getmtime(path)
+                for child in os.listdir(path)[:50]:
+                    newest = max(newest, os.path.getmtime(os.path.join(path, child)))
+            except OSError:
+                continue
+            if newest < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        if removed:
+            logger.info("session_gc", extra={"removed": removed, "ttl_days": SESSION_TTL_DAYS})
+    except Exception as exc:  # noqa: BLE001 — GC must never affect a turn
+        logger.warning("session_gc_failed", extra={"error": str(exc)[:200]})
+
+
 def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
     """Return the working dir for this session. If repo given and not yet cloned,
     clone it under the session's own dir (on EFS, so a re-invoke with the same
@@ -769,7 +817,7 @@ def _otel_turn_env(session_id: str | None) -> dict:
 
 
 def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
-                session_id: str | None = None) -> dict:
+                session_id: str | None = None, model: str | None = None) -> dict:
     """Run one Claude Code turn. Resume the conversation when a prior
     claude_session_id is supplied (same microVM keeps its ~/.claude state)."""
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
@@ -778,7 +826,7 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
     # `claude --print` does NOT auto-load a project .mcp.json (needs interactive
     # approval). _build_claude_args passes --mcp-config explicitly; it's variadic,
     # so the positional prompt must come last (appended here).
-    args = _build_claude_args(config_dir, claude_session_id, stream=False) + [prompt]
+    args = _build_claude_args(config_dir, claude_session_id, stream=False, model=model) + [prompt]
     env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
            **_otel_turn_env(session_id)}
 
@@ -794,14 +842,17 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
         return {"response": proc.stdout.strip(), "claude_session_id": None}
 
 
-def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: bool) -> list:
-    """Shared argv for a Claude turn. stream=True emits realtime stream-json."""
+def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: bool,
+                       model: str | None = None) -> list:
+    """Shared argv for a Claude turn. stream=True emits realtime stream-json.
+    model overrides CLAUDE_MODEL for this turn (pipeline personas carry their
+    own per-persona model)."""
     args = ["claude", "--print"]
     mcp_config = os.path.join(config_dir, ".mcp.json")
     if os.path.isfile(mcp_config):
         args += ["--mcp-config", mcp_config]
     args += ["--dangerously-skip-permissions",
-             "--model", CLAUDE_MODEL, "--max-turns", os.environ.get("MAX_TURNS", "100")]
+             "--model", model or CLAUDE_MODEL, "--max-turns", os.environ.get("MAX_TURNS", "100")]
     if stream:
         # --include-partial-messages emits token-level content_block_delta frames
         # (without it, claude sends whole message blocks → one chunk at the end).
@@ -814,7 +865,8 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
 
 
 def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None,
-                   session_id: str | None = None, tenant_id: str | None = None):
+                   session_id: str | None = None, tenant_id: str | None = None,
+                   model: str | None = None):
     """Generator yielding SSE lines for a Claude turn as it runs.
 
     Parses claude stream-json line-by-line: assistant text deltas → 'text'
@@ -823,7 +875,7 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     """
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
     os.makedirs(config_dir, exist_ok=True)
-    args = _build_claude_args(config_dir, claude_session_id, stream=True) + [prompt]
+    args = _build_claude_args(config_dir, claude_session_id, stream=True, model=model) + [prompt]
     env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
            **_otel_turn_env(session_id)}
 
@@ -890,13 +942,15 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
 
 
 def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
-               session_id: str | None = None) -> dict:
+               session_id: str | None = None, model: str | None = None) -> dict:
     """Run one Codex turn via the Mantle launcher (GPT-5.5). Resumes the prior
     conversation when codex_session_id (a codex thread_id) is supplied.
 
     We surface codex's thread_id through the same `claude_session_id` field the
     server returns, so the caller's resume handle is CLI-agnostic."""
     env = {**os.environ, "WORKSPACE_DIR": workdir, **_otel_turn_env(session_id)}
+    if model:
+        env["CODEX_MODEL"] = model  # run-codex.sh reads CODEX_MODEL
     args = ["/app/run-codex.sh", prompt]
     if codex_session_id:
         args.append(codex_session_id)
@@ -997,6 +1051,8 @@ async def invocations(request: Request):
     cli = (payload.get("cli") or DEFAULT_CLI).lower()
     repo = payload.get("repo")
     claude_session_id = payload.get("claude_session_id")
+    # Per-turn model override (pipeline personas run on their own model).
+    model = (payload.get("model") or "").strip() or None
     user_id = payload.get("user_id")
     tenant_id = payload.get("tenant_id")  # S3 isolation boundary (see _tenant_root)
     config_version = payload.get("config_version")
@@ -1022,6 +1078,10 @@ async def invocations(request: Request):
     logger.info("turn_start", extra=redact(
         {"cli": cli, "repo": repo, "resume": bool(claude_session_id),
          "stream": stream, "prompt_head": prompt[:120]}))
+
+    # Opportunistic stale-session GC off the turn path (EFS listdir can be slow).
+    import threading as _threading
+    _threading.Thread(target=_gc_stale_sessions, daemon=True).start()
 
     # Config materialization is BEST-EFFORT — never turn-fatal. A degraded EFS
     # mount or unwritable config dir would otherwise 500 an otherwise-runnable
@@ -1097,15 +1157,15 @@ async def invocations(request: Request):
     # an async/sync generator response as text/event-stream through InvokeAgentRuntime.
     if stream and cli == "claude":
         return StreamingResponse(
-            _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id),
+            _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id, model),
             media_type="text/event-stream",
         )
 
     try:
         if cli == "codex":
-            result = _run_codex(prompt, workdir, claude_session_id, session_id)
+            result = _run_codex(prompt, workdir, claude_session_id, session_id, model)
         elif cli == "claude":
-            result = _run_claude(prompt, workdir, claude_session_id, session_id)
+            result = _run_claude(prompt, workdir, claude_session_id, session_id, model)
         else:
             return JSONResponse({"error": f"unknown cli '{cli}'"}, status_code=400)
     except subprocess.TimeoutExpired:

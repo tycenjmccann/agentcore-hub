@@ -80,6 +80,29 @@ if [ -z "${FLEET_MEMORY_ID:-}" ]; then
   done
 fi
 
+# Same for IOS_TEST_GATEWAY_URL — without it the iOS CodeBuild gateway tools
+# (ios_test / ios_build_status / list_schemes / get_test_logs) never mount, so
+# iOS tickets ship with only static analysis and a false green. Auto-source it
+# from .env.local like GITHUB_PAT so single-agent deploys never drop it.
+if [ -z "${IOS_TEST_GATEWAY_URL:-}" ]; then
+  for candidate in \
+    "$SCRIPT_DIR/../../.env.local" \
+    "$SCRIPT_DIR/../.env.local" \
+    "$SCRIPT_DIR/.env.local" \
+    "$PWD/.env.local"; do
+    if [ -f "$candidate" ]; then
+      IOS_TEST_GATEWAY_URL=$(grep "^IOS_TEST_GATEWAY_URL=" "$candidate" | cut -d= -f2-)
+      IOS_TEST_GATEWAY_URL="${IOS_TEST_GATEWAY_URL%\"}"; IOS_TEST_GATEWAY_URL="${IOS_TEST_GATEWAY_URL#\"}"
+      IOS_TEST_GATEWAY_URL="${IOS_TEST_GATEWAY_URL%\'}"; IOS_TEST_GATEWAY_URL="${IOS_TEST_GATEWAY_URL#\'}"
+      if [ -n "$IOS_TEST_GATEWAY_URL" ]; then
+        export IOS_TEST_GATEWAY_URL
+        echo "Loaded IOS_TEST_GATEWAY_URL from $candidate" >&2
+        break
+      fi
+    fi
+  done
+fi
+
 # Hard-fail if neither GITHUB_PAT nor MCP_SERVERS is set — silent regression
 # here strips GitHub MCP auth from the runtime and every deploy reports OK.
 if [ -z "${GITHUB_PAT:-}" ] && [ -z "${MCP_SERVERS:-}" ]; then
@@ -156,6 +179,10 @@ run_deploy() {
     --env "HOME=/tmp" \
     --env "TMPDIR=/tmp" \
     ${FLEET_MEMORY_ID:+--env "MEMORY_ID=${FLEET_MEMORY_ID}"} \
+    ${IOS_TEST_GATEWAY_URL:+--env "IOS_TEST_GATEWAY_URL=${IOS_TEST_GATEWAY_URL}"} \
+    ${CODING_AGENT_RUNTIME_ARN:+--env "CODING_AGENT_RUNTIME_ARN=${CODING_AGENT_RUNTIME_ARN}"} \
+    ${CLOUD_CODE_TABLE:+--env "CLOUD_CODE_TABLE=${CLOUD_CODE_TABLE}"} \
+    ${REMOTE_CODING_PERSONAS:+--env "REMOTE_CODING_PERSONAS=${REMOTE_CODING_PERSONAS}"} \
     ${PROMPT_ENV} \
     ${MCP_ENV} 2>&1
 }

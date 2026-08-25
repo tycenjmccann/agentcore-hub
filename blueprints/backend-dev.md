@@ -52,10 +52,14 @@ a plausible-looking guess:
   real contract, not the code's own assumptions.
 
 ### Step 2: Delegate to Claude Code
+Pass `repo` on your FIRST call so the workspace is cloned. Every claude_code
+call you make shares ONE workspace and ONE conversation, so later calls remember
+this one and its files — do NOT pass absolute paths like `/tmp/...`; just refer
+to "the same workspace as the previous call".
 ```
 claude_code(
-    task="Implement [feature] based on this design.\n\nDesign Doc:\n[paste or reference]\n\nRepo: [repo URL]\nBranch: Create feature/{TICKET_ID}-backend-dev FROM {base_branch} (pull base_branch first — sibling work merges into it)\n\nExisting Patterns:\n[what you found — file structure, test approach, coding style]\n\nImplement:\n1. [specific files/endpoints to create]\n2. Write unit tests\n3. Update any integration tests\n4. Commit with descriptive message\n\nConstraints:\n[from design doc — tech stack, patterns to follow]",
-    working_directory="/tmp"
+    repo="[owner/name or clone URL]",
+    task="Implement [feature] based on this design.\n\nDesign Doc:\n[paste or reference]\n\nBranch: Create feature/{TICKET_ID}-backend-dev FROM {base_branch} (pull base_branch first — sibling work merges into it)\n\nExisting Patterns:\n[what you found — file structure, test approach, coding style]\n\nImplement:\n1. [specific files/endpoints to create]\n2. Write unit tests\n3. Update any integration tests\n4. Commit with descriptive message\n\nConstraints:\n[from design doc — tech stack, patterns to follow]"
 )
 ```
 
@@ -64,19 +68,22 @@ claude_code(
 - Are tests passing?
 - Any issues to flag?
 
-If incomplete, call `claude_code` again with specific corrections.
+If incomplete, call `claude_code` again with specific corrections (no `repo`
+needed — it continues in the same workspace and remembers what it already did).
 
 ### Step 4: Deliver
 - Confirm code is committed and pushed
 - Open the PR **into base_branch** and merge it once tests pass (see Branch Model)
-- `WorkflowOutput___report_completion` with branch name, PR URL, and summary
+- `WorkflowOutput___report_completion` with branch name, PR URL, and summary.
+  Include the `[coding-session: ...]` footer from claude_code's output in your
+  artifacts field — it lets the session be reopened + resumed later.
 
 ## Organizing Work
 
-Each claude_code session should be **one category of work**. Mixing unrelated concerns causes sessions to run long and timeout.
+Each claude_code call should be **one category of work**. Mixing unrelated concerns causes calls to run long and timeout. Splitting across calls is safe — they all share the same workspace and conversation, so a later call builds directly on the earlier ones.
 
-**Separate into different sessions:**
-- **Repo setup** — clone, branch, install dependencies
+**Separate into different calls:**
+- **Repo setup** — clone (pass `repo`), branch, install dependencies
 - **Implementation** — writing the actual feature code (group related files together)
 - **Content/data generation** — test fixtures, seed data, mock data, config files
 - **Tests** — writing and running tests

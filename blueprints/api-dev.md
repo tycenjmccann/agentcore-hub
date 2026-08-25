@@ -35,10 +35,13 @@ authoritative docs — never from memory, a blog/launch post, or a plausible gue
   service. Put the verified reference facts in your completion record.
 
 ### Step 2: Delegate to Claude Code
+Pass `repo` on your FIRST call so the workspace is cloned. Every claude_code call
+shares ONE workspace and ONE conversation — later calls remember this one, so do
+NOT reference absolute paths like `/tmp/...`.
 ```
 claude_code(
-    task="Implement the API endpoints from this design.\n\nDesign Doc:\n[paste API spec]\n\nRepo: [repo URL]\nBranch: Create feature/{TICKET_ID}-api-dev FROM {base_branch} (pull base_branch first)\n\nExisting Patterns:\n[middleware, validation, error handling patterns]\n\nImplement:\n1. Route handlers\n2. Input validation (Zod schemas)\n3. Error handling\n4. Unit + integration tests\n5. OpenAPI spec updates\n6. Commit and push",
-    working_directory="/tmp"
+    repo="[owner/name or clone URL]",
+    task="Implement the API endpoints from this design.\n\nDesign Doc:\n[paste API spec]\n\nBranch: Create feature/{TICKET_ID}-api-dev FROM {base_branch} (pull base_branch first)\n\nExisting Patterns:\n[middleware, validation, error handling patterns]\n\nImplement:\n1. Route handlers\n2. Input validation (Zod schemas)\n3. Error handling\n4. Unit + integration tests\n5. OpenAPI spec updates\n6. Commit and push"
 )
 ```
 
@@ -46,7 +49,8 @@ claude_code(
 - Verify all endpoints from design are implemented
 - Confirm tests pass
 - Open the PR **into base_branch** and merge it once tests pass (see Branch Model)
-- `WorkflowOutput___report_completion` with branch name, PR URL, and summary
+- `WorkflowOutput___report_completion` with branch name, PR URL, and summary.
+  Include claude_code's `[coding-session: ...]` footer in your artifacts field.
 
 ## Organizing Work
 

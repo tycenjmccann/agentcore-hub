@@ -50,11 +50,12 @@ already on base_branch — pull it and fix it there.
   messages, and any stack trace top frame (that names the file to start from).
 
 ### Step 2: Reproduce & Locate (codex → claude_code fallback)
-Use `codex` to clone `base_branch` and investigate:
-```
-git clone <repo> /tmp/repo && cd /tmp/repo
-git checkout <base_branch>   # pull latest — sibling/fix work may already be here
-```
+Pass `repo` on your FIRST `codex`/`claude_code` call so the workspace is cloned.
+Every call you make shares ONE workspace and ONE conversation — later calls
+remember this one and its files, so do NOT reference absolute paths like
+`/tmp/repo` across calls; say "the same workspace as the previous call". In that
+first call, check out `base_branch` and pull latest (sibling/fix work may already
+be there).
 - Search the code from the stack-trace frame / suspected subsystem outward.
 - Reproduce the failure with a test or a minimal script BEFORE fixing, so you can
   prove the fix later. Capture the failing output.
@@ -79,9 +80,22 @@ authoritative docs — never from memory, a blog/launch post, or a plausible gue
 - Add/extend the regression test. Run it: show it FAILS on base_branch (stash your
   fix or run on a clean checkout) and PASSES with your fix applied.
 - Run the project's existing test + build/lint commands and confirm they still pass.
-- iOS: `claude_code` cannot build iOS — verify on the CodeBuild macOS gateway
-  (`ios_test` → poll `ios_build_status`), and persist the evidence to
-  `workflows/{workflow_id}/shared/dev-evidence/` (gateway URLs expire).
+- iOS: neither `codex` nor `claude_code` can build iOS — a green edit is NOT a
+  verified fix. You MUST build + run the tests on the CodeBuild macOS gateway
+  before you merge: `list_schemes` if needed → `ios_test(branch, scheme)` → poll
+  `ios_build_status(build_id)` until terminal → confirm it compiles and the
+  regression test passes (fails on base_branch, passes on your fix). Persist the
+  evidence (build_id, test summary, any session video) to
+  `workflows/{workflow_id}/shared/dev-evidence/` — gateway URLs expire.
+  - If the `ios_test` / `ios_build_status` tools are NOT in your tool list, or a
+    gateway call errors, you cannot verify an iOS fix. **Report BLOCKED** with the
+    branch + your proposed fix and the missing tool — do NOT merge, do NOT mark
+    the ticket Done, and do NOT report completion as if it were tested. Shipping
+    an unbuilt iOS change is exactly the failure mode this rule prevents.
+  - Also confirm the reported symptom itself. This is a UI bug ("button does
+    nothing") — the diagnosis (e.g. a gesture conflict) is a hypothesis until a
+    real run shows the button now responds. Record repro-before / works-after in
+    your evidence, not just "compiles."
 
 ### Step 4: Push, PR & Merge
 1. Commit with a message referencing the Bug key and the root cause.
@@ -100,4 +114,6 @@ authoritative docs — never from memory, a blog/launch post, or a plausible gue
 - Surgical change only — no refactors, no unrelated cleanup; a needed refactor → BLOCKED, re-file as feature
 - A regression test that fails-on-old / passes-on-new is mandatory; no test = not done
 - Never guess an external protocol — real docs or BLOCKED (Step 2b)
+- iOS changes MUST be built + tested on the macOS gateway before merge; gateway tools missing/failing = BLOCKED, never a silent merge
 - Never mark done without working code + passing test on a branch, with real command output as evidence
+- In your completion record, be explicit about what you ACTUALLY ran vs did not (compiled? tests passed? symptom reproduced-then-fixed?) — never imply a build/test happened when it did not

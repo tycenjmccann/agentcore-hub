@@ -79,6 +79,15 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
     # Shared fleet AgentCore Memory (see setup-fleet-memory.sh) — opt-in.
     if mem := os.environ.get("FLEET_MEMORY_ID"):
         env["MEMORY_ID"] = mem
+    # Remote coding: delegate claude_code/codex to the Cloud Code runtime for the
+    # listed personas (resumable EFS sessions). Empty REMOTE_CODING_PERSONAS =
+    # every persona runs the CLI locally (legacy).
+    if coding_arn := os.environ.get("CODING_AGENT_RUNTIME_ARN"):
+        env["CODING_AGENT_RUNTIME_ARN"] = coding_arn
+    if cc_table := os.environ.get("CLOUD_CODE_TABLE"):
+        env["CLOUD_CODE_TABLE"] = cc_table
+    if personas := os.environ.get("REMOTE_CODING_PERSONAS"):
+        env["REMOTE_CODING_PERSONAS"] = personas
     return env
 
 

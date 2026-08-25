@@ -68,6 +68,7 @@ else:
 
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 
 import boto3
@@ -232,6 +233,144 @@ WORKFLOW_OUTPUT_LAMBDA = os.getenv("WORKFLOW_OUTPUT_LAMBDA", "agentcore-hub-work
 # Set per-invocation by agent_invocation() — used by tools to pass context to Lambdas
 _CURRENT_WORKFLOW_ID = "unknown"
 _CURRENT_AGENT_ID = "unknown"
+_CURRENT_TICKET_ID = ""
+
+# ─── Remote coding runtime (Cloud Code) ──────────────────────────────────────
+# When enabled, claude_code/codex delegate to the standalone coding-agent
+# runtime instead of spawning the CLI in this microVM. The coding runtime keeps
+# the workspace + transcript on EFS, so the session survives this container and
+# is resumable from the Cloud Code tab (chat resume / `claude --resume`).
+#
+# Gate: CODING_AGENT_RUNTIME_ARN set AND the current persona listed in
+# REMOTE_CODING_PERSONAS (comma-separated agent ids, or "all"). Off by default.
+CODING_AGENT_RUNTIME_ARN = os.getenv("CODING_AGENT_RUNTIME_ARN", "")
+REMOTE_CODING_PERSONAS = {
+    p.strip() for p in os.getenv("REMOTE_CODING_PERSONAS", "").split(",") if p.strip()
+}
+CLOUD_CODE_TABLE = os.getenv("CLOUD_CODE_TABLE", "agentcore-hub-cloud-code-sessions")
+# The coding runtime caps a turn at TURN_TIMEOUT_S (1500s); our client read
+# timeout must sit above that so the runtime's own timeout error reaches us.
+REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "1560"))
+
+# One coding session per agent-task: every claude_code/codex call in this
+# invocation lands on the same warm EFS workspace and resumes the same CLI
+# conversation. Reset by agent_invocation() alongside _CURRENT_*.
+_CODING_SESSION = {"session_id": None, "claude_session_id": None, "repo": None, "recorded": False}
+
+
+def _remote_coding_enabled() -> bool:
+    if not CODING_AGENT_RUNTIME_ARN:
+        return False
+    return "all" in REMOTE_CODING_PERSONAS or _CURRENT_AGENT_ID in REMOTE_CODING_PERSONAS
+
+
+def _record_coding_session(cli: str) -> None:
+    """Best-effort: upsert this agent-task's coding session into the Cloud Code
+    sessions table so the run is visible + resumable from the Cloud Code tab.
+    Row shape matches src/lib/cloud-code/types.ts (CloudCodeSession) plus
+    origin/workflowId/agentId so the UI can badge/filter workflow sessions."""
+    try:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        ticket = f" {_CURRENT_TICKET_ID}" if _CURRENT_TICKET_ID else ""
+        item = {
+            "sessionId": {"S": _CODING_SESSION["session_id"]},
+            "userId": {"S": "workflow"},
+            "tenantId": {"S": "default"},
+            "title": {"S": f"[wf]{ticket} {_CURRENT_AGENT_ID}"[:120]},
+            "cli": {"S": cli},
+            "createdAt": {"S": now},
+            "updatedAt": {"S": now},
+            "turns": {"L": []},
+            "origin": {"S": "workflow"},
+            "workflowId": {"S": _CURRENT_WORKFLOW_ID},
+            "agentId": {"S": _CURRENT_AGENT_ID},
+        }
+        if _CODING_SESSION.get("repo"):
+            item["repo"] = {"S": _CODING_SESSION["repo"]}
+        if _CODING_SESSION.get("claude_session_id"):
+            item["claudeSessionId"] = {"S": _CODING_SESSION["claude_session_id"]}
+        if _CODING_SESSION.get("recorded"):
+            # Row exists — only refresh the resume handle + timestamp, never
+            # clobber fields the UI may have touched (title edits, turns).
+            expr = "SET updatedAt = :u"
+            vals = {":u": {"S": now}}
+            if _CODING_SESSION.get("claude_session_id"):
+                expr += ", claudeSessionId = :c"
+                vals[":c"] = {"S": _CODING_SESSION["claude_session_id"]}
+            boto3.client("dynamodb", region_name=REGION).update_item(
+                TableName=CLOUD_CODE_TABLE,
+                Key={"sessionId": {"S": _CODING_SESSION["session_id"]}},
+                UpdateExpression=expr,
+                ExpressionAttributeValues=vals,
+            )
+        else:
+            boto3.client("dynamodb", region_name=REGION).put_item(
+                TableName=CLOUD_CODE_TABLE, Item=item
+            )
+            _CODING_SESSION["recorded"] = True
+    except Exception as e:  # noqa: BLE001 — session bookkeeping must never fail a turn
+        logger.warning(f"[remote-coding] session record failed (non-fatal): {e}")
+
+
+def _remote_coding_turn(task: str, cli: str, repo: str = "") -> str:
+    """Run one coding turn on the Cloud Code runtime. Returns the CLI's text
+    response with a session footer, or an ERROR string (never raises)."""
+    if not _CODING_SESSION["session_id"]:
+        _CODING_SESSION["session_id"] = f"cc-{uuid.uuid4().hex}"  # >=33 chars for AgentCore
+    if repo and not _CODING_SESSION.get("repo"):
+        _CODING_SESSION["repo"] = repo
+
+    payload = {
+        "prompt": task,
+        "cli": cli,
+        "session_id": _CODING_SESSION["session_id"],
+        "model": _CODING_MODEL_OVERRIDE.get(cli) or "",
+    }
+    if _CODING_SESSION.get("repo"):
+        payload["repo"] = _CODING_SESSION["repo"]
+    if _CODING_SESSION.get("claude_session_id"):
+        payload["claude_session_id"] = _CODING_SESSION["claude_session_id"]
+
+    logger.info(
+        f"[remote-coding] {cli} turn on {_CODING_SESSION['session_id']} "
+        f"(resume={bool(_CODING_SESSION.get('claude_session_id'))}, repo={_CODING_SESSION.get('repo')})"
+    )
+    try:
+        client = boto3.client(
+            "bedrock-agentcore", region_name=REGION,
+            config=BotocoreConfig(read_timeout=REMOTE_CODING_READ_TIMEOUT,
+                                  retries={"max_attempts": 0}),
+        )
+        resp = client.invoke_agent_runtime(
+            agentRuntimeArn=CODING_AGENT_RUNTIME_ARN,
+            runtimeSessionId=_CODING_SESSION["session_id"],
+            payload=json.dumps(payload).encode("utf-8"),
+        )
+        body = resp["response"].read().decode("utf-8")
+        result = json.loads(body)
+    except Exception as e:  # noqa: BLE001
+        # Do NOT fall back to a local CLI run: the session's workspace lives on
+        # the coding runtime, and a local run would fork it (split-brain).
+        logger.warning(f"[remote-coding] turn failed: {str(e)[:300]}")
+        return (f"ERROR: remote {cli} turn failed: {str(e)[:300]}. "
+                f"Retry this same {cli} call — the session workspace is preserved.")
+
+    if result.get("error"):
+        return (f"ERROR: remote {cli} turn failed: {result['error']}. "
+                f"Retry this same {cli} call — the session workspace is preserved.")
+
+    if result.get("claude_session_id"):
+        _CODING_SESSION["claude_session_id"] = result["claude_session_id"]
+    _record_coding_session(cli)
+
+    footer = (f"\n\n[coding-session: {_CODING_SESSION['session_id']} cli={cli}"
+              f" conversation={_CODING_SESSION.get('claude_session_id') or 'n/a'}]")
+    return (result.get("response") or "").strip() + footer
+
+
+# Per-cli model override for remote turns, set per-invocation from the fleet's
+# resolved model (claude only; codex model is pinned by the coding runtime).
+_CODING_MODEL_OVERRIDE: dict = {}
 
 # ARTIFACT_BUCKET is set near the top of this file (line ~135) via AGENTCORE_HUB_ARTIFACT_BUCKET env var.
 
@@ -900,7 +1039,7 @@ def _create_mcp_clients(extra_servers=None, extra_gateways=None):
 # reading repos, analyzing code structure, generating docs from source, etc.
 
 @tool
-def claude_code(task: str, working_directory: str = "/tmp") -> str:
+def claude_code(task: str, working_directory: str = "/tmp", repo: str = "") -> str:
     """Delegate a coding task to Claude Code — a specialized AI coding agent.
 
     Claude Code excels at:
@@ -913,16 +1052,27 @@ def claude_code(task: str, working_directory: str = "/tmp") -> str:
     WHEN TO USE: Any time you need to write/edit code, run tests, or interact with a git repo.
     Let Claude Code handle the HOW while you handle the WHAT and WHY.
 
+    All your claude_code calls in this task share ONE workspace and ONE
+    conversation — a later call remembers the earlier calls and their files.
+    Do NOT reference absolute paths like /tmp/... across calls; say "in the
+    same workspace as the previous call" instead.
+
     Args:
         task: Complete description of what to implement. Include:
               - Repo URL and branch name
               - What to build (specific files, endpoints, features)
               - Acceptance criteria (what success looks like)
               - Any constraints (don't modify X, use library Y)
-        working_directory: Directory to operate in (default: /tmp)
+        working_directory: Directory to operate in (default: /tmp; ignored when
+              the coding runtime hosts the session)
+        repo: Repository as owner/name or clone URL. Pass on your FIRST call so
+              the workspace is cloned; later calls reuse it automatically.
     """
     import subprocess
     import shutil
+
+    if _remote_coding_enabled():
+        return _remote_coding_turn(task, "claude", repo)
 
     logger.info(f"[claude_code] Delegating task: {task[:150]}...")
 
@@ -1081,20 +1231,30 @@ def _ensure_codex_config() -> str | None:
 
 
 @tool
-def codex(task: str, working_directory: str = "/tmp") -> str:
+def codex(task: str, working_directory: str = "/tmp", repo: str = "") -> str:
     """Delegate a coding task to OpenAI Codex (GPT-5.5 via Amazon Bedrock).
 
     A peer to claude_code — same contract, different engine. Useful for a second
     opinion, code review, or when you want GPT-5.5 to implement/verify. No OpenAI
     key required; inference routes through Amazon Bedrock using the runtime role.
 
+    All your codex calls in this task share ONE workspace and ONE conversation —
+    a later call remembers the earlier calls and their files. Do NOT reference
+    absolute paths like /tmp/... across calls.
+
     Args:
         task: Complete description of what to do (repo URL/branch, what to build
               or review, acceptance criteria, constraints).
-        working_directory: Directory to operate in (default: /tmp)
+        working_directory: Directory to operate in (default: /tmp; ignored when
+              the coding runtime hosts the session)
+        repo: Repository as owner/name or clone URL. Pass on your FIRST call so
+              the workspace is cloned; later calls reuse it automatically.
     """
     import subprocess
     import shutil
+
+    if _remote_coding_enabled():
+        return _remote_coding_turn(task, "codex", repo)
 
     logger.info(f"[codex] Delegating task: {task[:150]}...")
 
@@ -1319,7 +1479,7 @@ async def agent_invocation(payload, context):
     The system prompt is NOT in the payload — it's baked into the agent at deploy time
     via the SYSTEM_PROMPT env var. The orchestrator is dumb and only passes task context.
     """
-    global _CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID
+    global _CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID, _CURRENT_TICKET_ID
     prompt = payload.get("prompt", "")
     workflow_id = payload.get("workflow_id", "unknown")
     agent_id = payload.get("agent_id", "unknown")
@@ -1328,6 +1488,13 @@ async def agent_invocation(payload, context):
     payload_connectors = payload.get("connectors")
     _CURRENT_WORKFLOW_ID = workflow_id
     _CURRENT_AGENT_ID = agent_id
+    _CURRENT_TICKET_ID = payload.get("ticket_id", "")
+    # Fresh coding session per agent-task: a warm microVM reuses this module, so
+    # without a reset the next task would resume the PREVIOUS task's workspace.
+    _CODING_SESSION.update(
+        {"session_id": None, "claude_session_id": None, "repo": None, "recorded": False}
+    )
+    _CODING_MODEL_OVERRIDE.clear()
 
     logger.info(f"[{agent_id}] Starting invocation for workflow {workflow_id}")
     logger.info(f"[{agent_id}] Model: {model_override or MODEL_ID}, read_timeout: {READ_TIMEOUT}s")
@@ -1357,6 +1524,10 @@ async def agent_invocation(payload, context):
             boto_client_config=override_config,
             streaming=True,
         )
+        # Remote coding turns should run Claude Code on the persona's model too
+        # (only meaningful for anthropic ids; codex is pinned by the runtime).
+        if "anthropic" in resolved_model_id:
+            _CODING_MODEL_OVERRIDE["claude"] = resolved_model_id
         logger.info(f"[{agent_id}] Model override: {model_override} → {resolved_model_id}")
 
     # Load built-in tools (lazy — avoids 30s init timeout)

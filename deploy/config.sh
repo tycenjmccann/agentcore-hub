@@ -53,11 +53,24 @@ export ROUTINES_SCHEDULER_ROLE_ARN="${ROUTINES_SCHEDULER_ROLE_ARN:-arn:aws:iam::
 # schedule's DeadLetterConfig — otherwise failed fires vanish.
 export ROUTINES_DLQ_ARN="${ROUTINES_DLQ_ARN:-arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:agentcore-hub-routines-dlq}"
 
+# iOS CodeBuild macOS test gateway (SigV4). Injected into the shared runtime as
+# IOS_TEST_GATEWAY_URL so the QA / dev / bug-fixer personas can build+run iOS on a
+# real macOS runner (ios_test / ios_build_status / list_schemes / get_test_logs).
+# WITHOUT this the gateway MCP tools never mount and iOS tickets ship untested.
+export IOS_TEST_GATEWAY_URL="${IOS_TEST_GATEWAY_URL:-}"
+
 # Cloud Code — the standalone coding-agent runtime (set after deploy.py prints the ARN)
 export CODING_AGENT_RUNTIME_ARN="${CODING_AGENT_RUNTIME_ARN:-}"
 # Default MCP gateway wired into Cloud Code CLIs (shared Jira/S3/Skill tools).
 export MCP_GATEWAY_URL="${MCP_GATEWAY_URL:-}"
 export MCP_GATEWAY_NAME="${MCP_GATEWAY_NAME:-agentis_gateway}"
+
+# Remote coding: which fleet personas delegate claude_code/codex to the coding
+# runtime (comma-separated agent ids, or "all"). Empty = every persona runs the
+# CLI locally in its own microVM (legacy behavior). Roll out by wave.
+export REMOTE_CODING_PERSONAS="${REMOTE_CODING_PERSONAS:-}"
+# DynamoDB table the fleet records workflow coding sessions into (Cloud Code tab reads it).
+export CLOUD_CODE_TABLE="${CLOUD_CODE_TABLE:-agentcore-hub-cloud-code-sessions}"
 
 # Validation
 if [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "None" ]; then
