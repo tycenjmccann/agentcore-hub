@@ -757,7 +757,19 @@ def _checkout_branch(workdir: str, branch: str) -> None:
 # ─── CLI runners ──────────────────────────────────────────────────────────────
 
 
-def _run_claude(prompt: str, workdir: str, claude_session_id: str | None) -> dict:
+def _otel_turn_env(session_id: str | None) -> dict:
+    """Resource attributes for one turn's telemetry. session.id (the
+    runtimeSessionId) rides at resource level; the collector's
+    transform/normalize copies it down to every span/log attribute so the
+    dashboard groups CLI usage by runtime session — same convention as the
+    fleet agents' ADOT spans."""
+    if not session_id:
+        return {}
+    return {"OTEL_RESOURCE_ATTRIBUTES": f"session.id={session_id}"}
+
+
+def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
+                session_id: str | None = None) -> dict:
     """Run one Claude Code turn. Resume the conversation when a prior
     claude_session_id is supplied (same microVM keeps its ~/.claude state)."""
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
@@ -767,7 +779,8 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None) -> dic
     # approval). _build_claude_args passes --mcp-config explicitly; it's variadic,
     # so the positional prompt must come last (appended here).
     args = _build_claude_args(config_dir, claude_session_id, stream=False) + [prompt]
-    env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir}
+    env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
+           **_otel_turn_env(session_id)}
 
     proc = subprocess.run(args, cwd=workdir, env=env, capture_output=True,
                           text=True, timeout=TURN_TIMEOUT_S, stdin=subprocess.DEVNULL)
@@ -811,7 +824,8 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
     os.makedirs(config_dir, exist_ok=True)
     args = _build_claude_args(config_dir, claude_session_id, stream=True) + [prompt]
-    env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir}
+    env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
+           **_otel_turn_env(session_id)}
 
     def sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
@@ -875,13 +889,14 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     yield sse({"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id})
 
 
-def _run_codex(prompt: str, workdir: str, codex_session_id: str | None) -> dict:
+def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
+               session_id: str | None = None) -> dict:
     """Run one Codex turn via the Mantle launcher (GPT-5.5). Resumes the prior
     conversation when codex_session_id (a codex thread_id) is supplied.
 
     We surface codex's thread_id through the same `claude_session_id` field the
     server returns, so the caller's resume handle is CLI-agnostic."""
-    env = {**os.environ, "WORKSPACE_DIR": workdir}
+    env = {**os.environ, "WORKSPACE_DIR": workdir, **_otel_turn_env(session_id)}
     args = ["/app/run-codex.sh", prompt]
     if codex_session_id:
         args.append(codex_session_id)
@@ -1088,9 +1103,9 @@ async def invocations(request: Request):
 
     try:
         if cli == "codex":
-            result = _run_codex(prompt, workdir, claude_session_id)
+            result = _run_codex(prompt, workdir, claude_session_id, session_id)
         elif cli == "claude":
-            result = _run_claude(prompt, workdir, claude_session_id)
+            result = _run_claude(prompt, workdir, claude_session_id, session_id)
         else:
             return JSONResponse({"error": f"unknown cli '{cli}'"}, status_code=400)
     except subprocess.TimeoutExpired:

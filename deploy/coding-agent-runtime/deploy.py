@@ -165,6 +165,24 @@ def main() -> None:
         "PUPPETEER_EXECUTABLE_PATH": "/usr/bin/chromium",
         "PUPPETEER_SKIP_DOWNLOAD": "1",
         "PLAYWRIGHT_BROWSERS_PATH": "0",
+        # Point the CLIs' OTel SDK at the in-container collector sidecar, which
+        # SigV4-signs and forwards to AgentCore Observability. The image enables
+        # CLAUDE_CODE_ENABLE_TELEMETRY, but without exporters configured the CLI
+        # drops everything — this is why the dashboard showed 0 sessions/tokens.
+        # service.name follows the fleet convention (<runtimeName>.DEFAULT) so
+        # usage attributes to this agent's row.
+        "OTEL_SERVICE_NAME": f"{RUNTIME_NAME}.DEFAULT",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+        "OTEL_TRACES_EXPORTER": "otlp",
+        # Token usage rides on the api_request events (logs pipeline); the
+        # collector config has no metrics pipeline, so route metrics nowhere
+        # rather than at a signal the collector rejects.
+        "OTEL_LOGS_EXPORTER": "otlp",
+        "OTEL_METRICS_EXPORTER": "none",
+        # Turns are short-lived subprocesses — flush fast so telemetry lands
+        # before the CLI exits.
+        "OTEL_LOGS_EXPORT_INTERVAL": "5000",
     }
     # Artifact bucket — where per-user config bundles live; the server fetches
     # cloud-code/configs/{userId}/{version}.zip and materializes it on turn start.

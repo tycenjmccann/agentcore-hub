@@ -175,9 +175,13 @@ async function getTokenUsageFromSpans(region: string): Promise<Record<string, { 
     // Aggregate token usage server-side. Pulling raw @message blobs (limit
     // 10000) and JSON.parsing each one client-side took 80s+; a stats query
     // returns one small row per service in ~1s.
+    // Two shapes carry gen_ai.usage tokens: Strands/ADOT model spans (named
+    // "chat <model>") and Claude Code CLI api_request log events (coding
+    // runtime — its collector normalizes input_tokens -> gen_ai.usage.* and
+    // event.name arrives as "api_request", body carries the claude_code prefix).
     const query = `
       fields \`attributes.gen_ai.usage.input_tokens\` as inp, \`attributes.gen_ai.usage.output_tokens\` as outp, \`resource.attributes.service.name\` as svc
-      | filter name like /^chat /
+      | filter name like /^chat / or \`attributes.event.name\` = "api_request"
       | stats sum(inp) as inputTokens, sum(outp) as outputTokens, count(*) as calls by svc
     `;
 
