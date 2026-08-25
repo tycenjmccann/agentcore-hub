@@ -100,6 +100,7 @@ Target ~10 minutes of activity per session. Hard timeout is 15 minutes — sessi
 - **Sessions that try to do too much WILL timeout.** Splitting work is not optional.
 
 ## Rules
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - Always delegate implementation to `claude_code`
 - If `claude_code` fails or times out, break the task smaller and retry
 - If `claude_code` times out twice on the same subtask, report BLOCKED

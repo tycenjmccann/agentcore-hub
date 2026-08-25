@@ -138,7 +138,7 @@ def _load_builtin_tools():
 
 # --- Configuration ---
 REGION = os.getenv("AWS_REGION", "us-east-1")
-MODEL_ID = os.getenv("MODEL_ID", "us.anthropic.claude-opus-4-6-v1")
+MODEL_ID = os.getenv("MODEL_ID", "us.anthropic.claude-fable-5")
 READ_TIMEOUT = int(os.getenv("READ_TIMEOUT", "1200"))  # 20 minutes — agents need room for complex claude_code calls
 GATEWAY_ARN = os.getenv("GATEWAY_ARN", "")
 # NOTE: AgentCore reserves "ARTIFACT_BUCKET" as a system env var (points to CodeBuild source bucket).
@@ -257,6 +257,16 @@ REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "1560")
 # reads by the caller's tenant) won't show workflow sessions.
 CLOUD_CODE_TENANT_ID = os.getenv("CLOUD_CODE_TENANT_ID", "default")
 
+# Intelligence tiers the directing persona can pick per claude_code delegation
+# (`model` arg). Bedrock inference-profile ids — bare model names 500 on Bedrock.
+# Empty/unknown tier → the coding runtime's own CLAUDE_MODEL default (Fable 5).
+CODING_MODEL_TIERS = {
+    "fable": "us.anthropic.claude-fable-5",
+    "opus": "us.anthropic.claude-opus-5",
+    "sonnet": "us.anthropic.claude-sonnet-5",
+    "haiku": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+}
+
 # One coding session per agent-task: every claude_code/codex call in this
 # invocation lands on the same warm EFS workspace and resumes the same CLI
 # conversation. Conversation ids are per-CLI — claude and codex resume handles
@@ -339,9 +349,13 @@ def _localize_repo_task(task: str, repo: str, working_directory: str) -> str:
     )
 
 
-def _remote_coding_turn(task: str, cli: str, repo: str = "") -> str:
+def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") -> str:
     """Run one coding turn on the Cloud Code runtime. Returns the CLI's text
-    response with a session footer, or an ERROR string (never raises)."""
+    response with a session footer, or an ERROR string (never raises).
+
+    model: intelligence tier the persona chose ("fable"/"opus"/"sonnet"/"haiku"
+    or a full Bedrock inference-profile id). Claude only — codex is pinned by
+    the coding runtime. Empty = the runtime's default (Fable 5)."""
     if not _CODING_SESSION["session_id"]:
         _CODING_SESSION["session_id"] = f"cc-{uuid.uuid4().hex}"  # >=33 chars for AgentCore
     if repo and not _CODING_SESSION.get("repo"):
@@ -350,11 +364,14 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "") -> str:
     # --resume` and vice versa (an agent may use both engines in one task).
     conversation_id = _CODING_SESSION["conversation_ids"].get(cli)
 
+    tier = (model or "").strip().lower()
+    resolved_model = CODING_MODEL_TIERS.get(tier) or (model.strip() if "." in (model or "") else "")
+
     payload = {
         "prompt": task,
         "cli": cli,
         "session_id": _CODING_SESSION["session_id"],
-        "model": _CODING_MODEL_OVERRIDE.get(cli) or "",
+        "model": resolved_model if cli == "claude" else "",
         "origin": "workflow",  # coding runtime exempts human sessions from GC
     }
     if _CODING_SESSION.get("repo"):
@@ -404,10 +421,6 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "") -> str:
         footer += f"\n[coding-artifacts — S3 keys, fetch with download_s3_file:\n{keys}\n]"
     return (result.get("response") or "").strip() + footer
 
-
-# Per-cli model override for remote turns, set per-invocation from the fleet's
-# resolved model (claude only; codex model is pinned by the coding runtime).
-_CODING_MODEL_OVERRIDE: dict = {}
 
 # ARTIFACT_BUCKET is set near the top of this file (line ~135) via AGENTCORE_HUB_ARTIFACT_BUCKET env var.
 
@@ -1076,7 +1089,7 @@ def _create_mcp_clients(extra_servers=None, extra_gateways=None):
 # reading repos, analyzing code structure, generating docs from source, etc.
 
 @tool
-def claude_code(task: str, working_directory: str = "/tmp", repo: str = "") -> str:
+def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", model: str = "") -> str:
     """Delegate a coding task to Claude Code — a specialized AI coding agent.
 
     Claude Code excels at:
@@ -1109,12 +1122,17 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "") -> s
               the coding runtime hosts the session)
         repo: Repository as owner/name or clone URL. Pass on your FIRST call so
               the workspace is cloned; later calls reuse it automatically.
+        model: Intelligence tier for THIS delegation — "fable" (default; top
+              reasoning), "opus" (deep/complex implementation), "sonnet"
+              (routine coding, faster/cheaper), "haiku" (trivial mechanical
+              edits). YOU decide per call: match the tier to the difficulty of
+              the task. Leave empty for the default.
     """
     import subprocess
     import shutil
 
     if _remote_coding_enabled():
-        return _remote_coding_turn(task, "claude", repo)
+        return _remote_coding_turn(task, "claude", repo, model)
 
     task = _localize_repo_task(task, repo, working_directory)
     logger.info(f"[claude_code] Delegating task: {task[:150]}...")
@@ -1134,7 +1152,12 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "") -> s
             return f"ERROR: Failed to install Claude Code CLI: {e}. Use shell/editor tools directly instead."
 
     # Determine model for Claude Code (check both env vars Claude Code recognizes)
-    cc_model = os.environ.get("ANTHROPIC_MODEL") or os.environ.get("CLAUDE_MODEL") or "us.anthropic.claude-opus-4-6-v1"
+    cc_model = (
+        CODING_MODEL_TIERS.get((model or "").strip().lower())
+        or os.environ.get("ANTHROPIC_MODEL")
+        or os.environ.get("CLAUDE_MODEL")
+        or "us.anthropic.claude-fable-5"
+    )
 
     try:
         # Use Popen + start_new_session to create a new process group.
@@ -1542,7 +1565,6 @@ async def agent_invocation(payload, context):
     _CODING_SESSION.update(
         {"session_id": None, "conversation_ids": {}, "repo": None, "recorded": False}
     )
-    _CODING_MODEL_OVERRIDE.clear()
 
     logger.info(f"[{agent_id}] Starting invocation for workflow {workflow_id}")
     logger.info(f"[{agent_id}] Model: {model_override or MODEL_ID}, read_timeout: {READ_TIMEOUT}s")
@@ -1572,10 +1594,9 @@ async def agent_invocation(payload, context):
             boto_client_config=override_config,
             streaming=True,
         )
-        # Remote coding turns should run Claude Code on the persona's model too
-        # (only meaningful for anthropic ids; codex is pinned by the runtime).
-        if "anthropic" in resolved_model_id:
-            _CODING_MODEL_OVERRIDE["claude"] = resolved_model_id
+        # NOTE: the persona's board model governs its own reasoning only. The
+        # coding CLI's model is chosen per-delegation via claude_code(model=...)
+        # or falls back to the coding runtime's CLAUDE_MODEL default.
         logger.info(f"[{agent_id}] Model override: {model_override} → {resolved_model_id}")
 
     # Load built-in tools (lazy — avoids 30s init timeout)

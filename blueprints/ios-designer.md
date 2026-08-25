@@ -66,6 +66,7 @@ Do NOT create implementation, dev, QA, or CI tickets. The requirements analyst a
 - Sessions that try to do too much will timeout and work is lost.
 
 ## Rules
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - Always call `claude_code` for design work. It has iOS 26 skills you don't have access to.
 - **MANDATORY: Every iOS design MUST include a mockup screenshot.** Text-only designs are incomplete.
 - Review the screenshot YOURSELF via download_s3_file + image_reader before delivering.

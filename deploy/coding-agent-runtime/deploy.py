@@ -150,8 +150,8 @@ def main() -> None:
         "AWS_REGION": region,
         "EVENTS_TABLE": os.environ.get("EVENTS_TABLE", "agentcore-hub-events"),
         "CLAUDE_CODE_USE_BEDROCK": "1",
-        "ANTHROPIC_MODEL": os.environ.get("ANTHROPIC_MODEL", "us.anthropic.claude-opus-4-6-v1"),
-        "CLAUDE_MODEL": os.environ.get("CLAUDE_MODEL", "us.anthropic.claude-opus-4-6-v1"),
+        "ANTHROPIC_MODEL": os.environ.get("ANTHROPIC_MODEL", "us.anthropic.claude-fable-5"),
+        "CLAUDE_MODEL": os.environ.get("CLAUDE_MODEL", "us.anthropic.claude-fable-5"),
         # Codex routes through Bedrock Mantle (us-east-2 for GPT-5.5) via Codex's
         # built-in amazon-bedrock provider; CODEX_MODEL overrides the model.
         "BEDROCK_MANTLE_REGION": os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2"),

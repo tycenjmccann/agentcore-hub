@@ -60,6 +60,7 @@ Do NOT create implementation, dev, QA, or CI tickets. The requirements analyst a
 - Sessions that try to do too much will timeout and work is lost.
 
 ## Rules
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - Always delegate to `claude_code` for architecture documents
 - If `claude_code` fails, report BLOCKED
 - After `report_completion`, produce NO additional text — no summaries, no tables, no commentary

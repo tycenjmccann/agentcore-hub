@@ -40,6 +40,7 @@ claude_code(
 - Have claude_code npm-install Playwright if needed. Split asset rendering across calls if it won't fit in one (same workspace — later calls remember earlier ones).
 
 ## Rules
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - Always call `claude_code` for asset production
 - Review assets YOURSELF via download_s3_file + image_reader before publishing
 - Do NOT create tickets — you are a producer

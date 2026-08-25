@@ -164,15 +164,15 @@ run_deploy() {
     --auto-update-on-conflict \
     --env "BYPASS_TOOL_CONSENT=true" \
     ${GATEWAY_ARN:+--env "GATEWAY_ARN=${GATEWAY_ARN}"} \
-    --env "MODEL_ID=us.anthropic.claude-opus-4-6-v1" \
+    --env "MODEL_ID=us.anthropic.claude-fable-5" \
     --env "READ_TIMEOUT=1200" \
     --env "AWS_REGION=us-east-1" \
     --env "EVENTS_TABLE=agentcore-hub-events" \
     --env "TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA:-agentcore-hub-jira}" \
     --env "AGENTCORE_HUB_ARTIFACT_BUCKET=${ARTIFACT_BUCKET}" \
     --env "CLAUDE_CODE_USE_BEDROCK=1" \
-    --env "CLAUDE_MODEL=us.anthropic.claude-opus-4-6-v1" \
-    --env "ANTHROPIC_MODEL=us.anthropic.claude-opus-4-6-v1" \
+    --env "CLAUDE_MODEL=us.anthropic.claude-fable-5" \
+    --env "ANTHROPIC_MODEL=us.anthropic.claude-fable-5" \
     --env "BEDROCK_MANTLE_REGION=${BEDROCK_MANTLE_REGION:-us-east-2}" \
     --env "CODEX_MODEL=${CODEX_MODEL:-openai.gpt-5.5}" \
     --env "PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers" \

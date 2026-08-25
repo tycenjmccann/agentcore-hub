@@ -49,7 +49,7 @@ logger = get_logger("coding-agent-runtime")
 WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/mnt/efs")
 DEFAULT_CLI = "claude"
 CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
-    "CLAUDE_MODEL", "us.anthropic.claude-opus-4-6-v1"
+    "CLAUDE_MODEL", "us.anthropic.claude-fable-5"
 )
 # A single coding turn can be long; cap so a wedged CLI can't pin the microVM.
 TURN_TIMEOUT_S = int(os.environ.get("TURN_TIMEOUT_S", "1500"))

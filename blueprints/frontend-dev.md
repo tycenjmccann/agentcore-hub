@@ -111,6 +111,7 @@ Do NOT open a PR for iOS work without a passing (or explained) gateway run.
 5. Report completion with branch, commit SHA, and PR URL
 
 ## Rules
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - NEVER submit a UI change without first rendering it and verifying visually
 - iOS: the gateway run is the render — never open an iOS PR without one; write XCTests with the implementation
 - If the dev server won't start after your changes, your implementation is broken — fix it

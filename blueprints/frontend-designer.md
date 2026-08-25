@@ -56,6 +56,7 @@ UPDATED screenshot (same workspace; new keys appear in the new footer).
 - Sessions that try to do too much will timeout and work is lost.
 
 ## Rules
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - Always delegate design production to `claude_code`
 - **MANDATORY: Every frontend design MUST include a screenshot.** Text-only designs are incomplete.
 - Review the screenshot YOURSELF via download_s3_file + image_reader before delivering

@@ -49,15 +49,15 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
     """Mirror the env vars set by the lightweight CodeZip path in deploy-one.sh."""
     env = {
         "BYPASS_TOOL_CONSENT": "true",
-        "MODEL_ID": "us.anthropic.claude-opus-4-6-v1",
+        "MODEL_ID": "us.anthropic.claude-fable-5",
         "READ_TIMEOUT": "1200",
         "AWS_REGION": "us-east-1",
         "EVENTS_TABLE": "agentcore-hub-events",
         "TICKET_TOOLS_LAMBDA": os.environ.get("TICKET_TOOLS_LAMBDA", "agentcore-hub-jira"),
         "AGENTCORE_HUB_ARTIFACT_BUCKET": os.environ["ARTIFACT_BUCKET"],
         "CLAUDE_CODE_USE_BEDROCK": "1",
-        "CLAUDE_MODEL": "us.anthropic.claude-opus-4-6-v1",
-        "ANTHROPIC_MODEL": "us.anthropic.claude-opus-4-6-v1",
+        "CLAUDE_MODEL": "us.anthropic.claude-fable-5",
+        "ANTHROPIC_MODEL": "us.anthropic.claude-fable-5",
         # Codex via Bedrock Mantle (GPT-5.5, us-east-2) — no OpenAI key.
         "BEDROCK_MANTLE_REGION": os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2"),
         "CODEX_MODEL": os.environ.get("CODEX_MODEL", "openai.gpt-5.5"),

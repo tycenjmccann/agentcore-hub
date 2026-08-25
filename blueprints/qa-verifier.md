@@ -170,6 +170,7 @@ to merge" for an iOS change you could not build and run. That reads as an
 all-clear on something that was never tested. Use BLOCKED and say so plainly.**
 
 ## Rules
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - NEVER pass a UI change without a screenshot proving it renders correctly
 - NEVER pass an external-integration feature without a real round-trip against the
   real service + a docs cross-check (Step 3c). The dev's own unit tests are NOT
