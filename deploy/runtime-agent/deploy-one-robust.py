@@ -88,6 +88,8 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         env["CLOUD_CODE_TABLE"] = cc_table
     if personas := os.environ.get("REMOTE_CODING_PERSONAS"):
         env["REMOTE_CODING_PERSONAS"] = personas
+    if cc_tenant := os.environ.get("CLOUD_CODE_TENANT_ID"):
+        env["CLOUD_CODE_TENANT_ID"] = cc_tenant
     return env
 
 

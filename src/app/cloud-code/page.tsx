@@ -387,6 +387,14 @@ export default function CloudCodePage() {
                   <MessageSquare className="w-3.5 h-3.5 flex-shrink-0 text-[var(--color-text-muted)]" aria-label="Chat session" />
                 )}
                 <span className="text-[13px] font-medium truncate flex-1">{s.title}</span>
+                {s.origin === "workflow" && (
+                  <span
+                    className="flex-shrink-0 px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/25"
+                    title={`Started by workflow agent ${s.agentId || ""}`}
+                  >
+                    wf
+                  </span>
+                )}
                 <button
                   onClick={(e) => {
                     e.stopPropagation();

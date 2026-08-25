@@ -703,17 +703,35 @@ def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None =
 
 # Workflow-origin sessions mint one dir per agent-task, far faster than human
 # sessions — without GC the EFS volume grows unbounded. Opportunistic sweep at
-# turn start: remove session dirs whose tree is untouched for SESSION_TTL_DAYS.
+# turn start, WORKFLOW SESSIONS ONLY: a dir is eligible only if it carries the
+# origin marker below, and the marker's mtime (refreshed every workflow turn)
+# is the last-activity record. Human sessions are never touched.
 SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "14"))
 _GC_MARKER = os.path.join(WORKSPACE_ROOT, ".last-session-gc")
 _GC_INTERVAL_S = 6 * 3600  # at most one sweep per warm VM per 6h
+_WF_ORIGIN_MARKER = ".workflow-session"
+
+
+def _touch_workflow_marker(session_id: str | None) -> None:
+    """Stamp a session dir as workflow-origin and record activity. Called on
+    every workflow turn, so the marker's mtime is a reliable last-activity
+    signal without walking the tree (EFS walks are too slow for a turn path)."""
+    if not session_id:
+        return
+    try:
+        base = _session_dir(session_id)
+        os.makedirs(base, exist_ok=True)
+        with open(os.path.join(base, _WF_ORIGIN_MARKER), "w") as f:
+            f.write(str(int(time.time())))
+    except OSError as exc:
+        logger.warning("wf_marker_failed", extra={"error": str(exc)[:200]})
 
 
 def _gc_stale_sessions() -> None:
-    """Best-effort TTL sweep of {WORKSPACE_ROOT}/sessions/*. Uses the session
-    dir's own mtime (updated on any direct child create/delete) plus its
-    top-level entries' mtimes as the activity signal — full-tree walks on EFS
-    are too slow for a turn path. Never raises."""
+    """Best-effort TTL sweep of {WORKSPACE_ROOT}/sessions/*. Only dirs carrying
+    the workflow-origin marker are candidates — human Cloud Code sessions must
+    stay resumable indefinitely. Staleness = marker mtime older than the TTL.
+    Never raises."""
     if SESSION_TTL_DAYS <= 0:
         return
     try:
@@ -734,15 +752,15 @@ def _gc_stale_sessions() -> None:
             path = os.path.join(sessions_root, name)
             if not os.path.isdir(path):
                 continue
+            marker = os.path.join(path, _WF_ORIGIN_MARKER)
             try:
-                newest = os.path.getmtime(path)
-                for child in os.listdir(path)[:50]:
-                    newest = max(newest, os.path.getmtime(os.path.join(path, child)))
+                if not os.path.isfile(marker):
+                    continue  # human session — never GC
+                if os.path.getmtime(marker) < cutoff:
+                    shutil.rmtree(path, ignore_errors=True)
+                    removed += 1
             except OSError:
                 continue
-            if newest < cutoff:
-                shutil.rmtree(path, ignore_errors=True)
-                removed += 1
         if removed:
             logger.info("session_gc", extra={"removed": removed, "ttl_days": SESSION_TTL_DAYS})
     except Exception as exc:  # noqa: BLE001 — GC must never affect a turn
@@ -1066,6 +1084,7 @@ async def invocations(request: Request):
     tenant_id = payload.get("tenant_id")  # S3 isolation boundary (see _tenant_root)
     config_version = payload.get("config_version")
     session_id = payload.get("session_id")  # isolates this session's checkout
+    origin = payload.get("origin")  # "workflow" = fleet-driven session, GC-eligible
     stream = bool(payload.get("stream"))  # SSE incremental output (claude only)
     # "Port to cloud": a real laptop transcript shipped via S3 for a native,
     # lossless `claude --resume`. resume_session_id is the id INSIDE that file.
@@ -1087,6 +1106,11 @@ async def invocations(request: Request):
     logger.info("turn_start", extra=redact(
         {"cli": cli, "repo": repo, "resume": bool(claude_session_id),
          "stream": stream, "prompt_head": prompt[:120]}))
+
+    # Workflow turns stamp their session dir (origin marker + activity mtime) so
+    # the GC below can distinguish them from human sessions, which it never touches.
+    if origin == "workflow":
+        _touch_workflow_marker(session_id)
 
     # Opportunistic stale-session GC off the turn path (EFS listdir can be slow).
     import threading as _threading

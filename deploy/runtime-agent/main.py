@@ -252,10 +252,21 @@ CLOUD_CODE_TABLE = os.getenv("CLOUD_CODE_TABLE", "agentcore-hub-cloud-code-sessi
 # timeout must sit above that so the runtime's own timeout error reaches us.
 REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "1560"))
 
+# Tenant the workflow session rows belong to. Multi-tenant deployments must set
+# this to the tenant that owns the fleet, or the Cloud Code tab (which scopes
+# reads by the caller's tenant) won't show workflow sessions.
+CLOUD_CODE_TENANT_ID = os.getenv("CLOUD_CODE_TENANT_ID", "default")
+
 # One coding session per agent-task: every claude_code/codex call in this
 # invocation lands on the same warm EFS workspace and resumes the same CLI
-# conversation. Reset by agent_invocation() alongside _CURRENT_*.
-_CODING_SESSION = {"session_id": None, "claude_session_id": None, "repo": None, "recorded": False}
+# conversation. Conversation ids are per-CLI — claude and codex resume handles
+# are not interchangeable. Reset by agent_invocation() alongside _CURRENT_*.
+_CODING_SESSION = {
+    "session_id": None,
+    "conversation_ids": {},  # cli -> resume id
+    "repo": None,
+    "recorded": False,
+}
 
 
 def _remote_coding_enabled() -> bool:
@@ -272,10 +283,11 @@ def _record_coding_session(cli: str) -> None:
     try:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         ticket = f" {_CURRENT_TICKET_ID}" if _CURRENT_TICKET_ID else ""
+        conversation_id = _CODING_SESSION["conversation_ids"].get(cli)
         item = {
             "sessionId": {"S": _CODING_SESSION["session_id"]},
             "userId": {"S": "workflow"},
-            "tenantId": {"S": "default"},
+            "tenantId": {"S": CLOUD_CODE_TENANT_ID},
             "title": {"S": f"[wf]{ticket} {_CURRENT_AGENT_ID}"[:120]},
             "cli": {"S": cli},
             "createdAt": {"S": now},
@@ -287,16 +299,17 @@ def _record_coding_session(cli: str) -> None:
         }
         if _CODING_SESSION.get("repo"):
             item["repo"] = {"S": _CODING_SESSION["repo"]}
-        if _CODING_SESSION.get("claude_session_id"):
-            item["claudeSessionId"] = {"S": _CODING_SESSION["claude_session_id"]}
+        if conversation_id:
+            item["claudeSessionId"] = {"S": conversation_id}
         if _CODING_SESSION.get("recorded"):
             # Row exists — only refresh the resume handle + timestamp, never
             # clobber fields the UI may have touched (title edits, turns).
             expr = "SET updatedAt = :u"
             vals = {":u": {"S": now}}
-            if _CODING_SESSION.get("claude_session_id"):
-                expr += ", claudeSessionId = :c"
-                vals[":c"] = {"S": _CODING_SESSION["claude_session_id"]}
+            if conversation_id:
+                expr += ", claudeSessionId = :c, cli = :cli"
+                vals[":c"] = {"S": conversation_id}
+                vals[":cli"] = {"S": cli}
             boto3.client("dynamodb", region_name=REGION).update_item(
                 TableName=CLOUD_CODE_TABLE,
                 Key={"sessionId": {"S": _CODING_SESSION["session_id"]}},
@@ -312,6 +325,20 @@ def _record_coding_session(cli: str) -> None:
         logger.warning(f"[remote-coding] session record failed (non-fatal): {e}")
 
 
+def _localize_repo_task(task: str, repo: str, working_directory: str) -> str:
+    """Local-CLI fallback: blueprints pass repo= instead of putting clone
+    instructions in the task text, so when the remote gate is off we restore
+    that context here — otherwise the local CLI has no repository to work in."""
+    if not repo:
+        return task
+    clone_url = repo if repo.startswith(("http://", "https://", "git@")) else f"https://github.com/{repo}"
+    return (
+        f"First: if {working_directory}/repo is not already a git checkout of "
+        f"{clone_url}, clone it there (git clone {clone_url} {working_directory}/repo). "
+        f"Then cd into it and do the following task in that repository.\n\n{task}"
+    )
+
+
 def _remote_coding_turn(task: str, cli: str, repo: str = "") -> str:
     """Run one coding turn on the Cloud Code runtime. Returns the CLI's text
     response with a session footer, or an ERROR string (never raises)."""
@@ -319,21 +346,25 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "") -> str:
         _CODING_SESSION["session_id"] = f"cc-{uuid.uuid4().hex}"  # >=33 chars for AgentCore
     if repo and not _CODING_SESSION.get("repo"):
         _CODING_SESSION["repo"] = repo
+    # Resume handle is per-CLI: a codex thread id means nothing to `claude
+    # --resume` and vice versa (an agent may use both engines in one task).
+    conversation_id = _CODING_SESSION["conversation_ids"].get(cli)
 
     payload = {
         "prompt": task,
         "cli": cli,
         "session_id": _CODING_SESSION["session_id"],
         "model": _CODING_MODEL_OVERRIDE.get(cli) or "",
+        "origin": "workflow",  # coding runtime exempts human sessions from GC
     }
     if _CODING_SESSION.get("repo"):
         payload["repo"] = _CODING_SESSION["repo"]
-    if _CODING_SESSION.get("claude_session_id"):
-        payload["claude_session_id"] = _CODING_SESSION["claude_session_id"]
+    if conversation_id:
+        payload["claude_session_id"] = conversation_id
 
     logger.info(
         f"[remote-coding] {cli} turn on {_CODING_SESSION['session_id']} "
-        f"(resume={bool(_CODING_SESSION.get('claude_session_id'))}, repo={_CODING_SESSION.get('repo')})"
+        f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')})"
     )
     try:
         client = boto3.client(
@@ -360,11 +391,11 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "") -> str:
                 f"Retry this same {cli} call — the session workspace is preserved.")
 
     if result.get("claude_session_id"):
-        _CODING_SESSION["claude_session_id"] = result["claude_session_id"]
+        _CODING_SESSION["conversation_ids"][cli] = result["claude_session_id"]
     _record_coding_session(cli)
 
     footer = (f"\n\n[coding-session: {_CODING_SESSION['session_id']} cli={cli}"
-              f" conversation={_CODING_SESSION.get('claude_session_id') or 'n/a'}]")
+              f" conversation={_CODING_SESSION['conversation_ids'].get(cli) or 'n/a'}]")
     # Deliverables the turn produced (mockups, screenshots, diagrams) are
     # harvested to S3 by the coding runtime — these keys are how you reach files
     # in the remote workspace: download_s3_file(key) → image_reader / file ops.
@@ -1085,6 +1116,7 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "") -> s
     if _remote_coding_enabled():
         return _remote_coding_turn(task, "claude", repo)
 
+    task = _localize_repo_task(task, repo, working_directory)
     logger.info(f"[claude_code] Delegating task: {task[:150]}...")
 
     # Ensure claude CLI is available (install if needed — first invocation only)
@@ -1271,6 +1303,7 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "") -> str:
     if _remote_coding_enabled():
         return _remote_coding_turn(task, "codex", repo)
 
+    task = _localize_repo_task(task, repo, working_directory)
     logger.info(f"[codex] Delegating task: {task[:150]}...")
 
     codex_bin = shutil.which("codex")
@@ -1507,7 +1540,7 @@ async def agent_invocation(payload, context):
     # Fresh coding session per agent-task: a warm microVM reuses this module, so
     # without a reset the next task would resume the PREVIOUS task's workspace.
     _CODING_SESSION.update(
-        {"session_id": None, "claude_session_id": None, "repo": None, "recorded": False}
+        {"session_id": None, "conversation_ids": {}, "repo": None, "recorded": False}
     )
     _CODING_MODEL_OVERRIDE.clear()
 

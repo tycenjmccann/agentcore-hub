@@ -48,6 +48,11 @@ export interface CloudCodeSession {
   // time; defaults to chat. A ported terminal session auto-runs `claude --resume`
   // in the PTY instead of firing the chat seed.
   defaultView?: "chat" | "terminal";
+  // Workflow-origin sessions (fleet personas delegating to the coding runtime).
+  // The workflow board uses these to link an agent's task to its live session.
+  origin?: "workflow";
+  workflowId?: string;
+  agentId?: string;
 }
 
 /** Trimmed shape for the sidebar list (no full turn history). */
@@ -61,4 +66,7 @@ export interface CloudCodeSessionSummary {
   createdAt: string;
   updatedAt: string;
   warmth: SessionWarmth;
+  origin?: "workflow";
+  workflowId?: string;
+  agentId?: string;
 }

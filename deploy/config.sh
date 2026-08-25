@@ -71,6 +71,10 @@ export MCP_GATEWAY_NAME="${MCP_GATEWAY_NAME:-agentis_gateway}"
 export REMOTE_CODING_PERSONAS="${REMOTE_CODING_PERSONAS:-}"
 # DynamoDB table the fleet records workflow coding sessions into (Cloud Code tab reads it).
 export CLOUD_CODE_TABLE="${CLOUD_CODE_TABLE:-agentcore-hub-cloud-code-sessions}"
+# Tenant that owns workflow coding sessions. Multi-tenant deployments must set
+# this to their tenant id or the Cloud Code tab (tenant-scoped reads) won't
+# list workflow sessions.
+export CLOUD_CODE_TENANT_ID="${CLOUD_CODE_TENANT_ID:-default}"
 
 # Validation
 if [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "None" ]; then

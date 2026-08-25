@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { X, AlertCircle, FileText } from "lucide-react";
+import { X, AlertCircle, FileText, TerminalSquare } from "lucide-react";
 import type { AgentTask } from "@/lib/workflow/types";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import "./pipeline.css";
@@ -20,6 +20,21 @@ interface AgentOutputPanelProps {
   lastActivityTime?: number; // Date.now() timestamp of last streaming activity
   staleThreshold?: number; // ms — threshold for stale detection (720_000 or 180_000)
   onRestart?: () => void;
+}
+
+/** Remote coding sessions leave a footer in the agent's output:
+ *  [coding-session: cc-<hex> cli=claude conversation=<id>]
+ *  Each session id is a live, resumable Cloud Code session. */
+function extractCodingSessions(output: string): { sessionId: string; cli: string }[] {
+  const seen = new Set<string>();
+  const sessions: { sessionId: string; cli: string }[] = [];
+  for (const m of output.matchAll(/\[coding-session:\s*(cc-[a-f0-9]+)\s+cli=(\w+)/g)) {
+    if (!seen.has(m[1])) {
+      seen.add(m[1]);
+      sessions.push({ sessionId: m[1], cli: m[2] });
+    }
+  }
+  return sessions;
 }
 
 /** Format agent ID to display name */
@@ -90,6 +105,41 @@ export default function AgentOutputPanel({
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  // Remote coding sessions this agent-task ran (Cloud Code runtime). Primary
+  // source is the sessions table (footer text may not survive streaming);
+  // footers found in the output text are merged in as a fallback.
+  const [codingSessions, setCodingSessions] = useState<{ sessionId: string; cli: string }[]>([]);
+  useEffect(() => {
+    if (!isOpen || !workflowId || !task?.agentId) {
+      setCodingSessions([]);
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/cloud-code/sessions?workflowId=${encodeURIComponent(workflowId)}&agentId=${encodeURIComponent(task.agentId)}`)
+      .then((r) => (r.ok ? r.json() : { sessions: [] }))
+      .then((d) => {
+        if (cancelled) return;
+        const fromTable = (d.sessions || []).map(
+          (s: { sessionId: string; cli: string }) => ({ sessionId: s.sessionId, cli: s.cli })
+        );
+        const fromFooter = task?.output ? extractCodingSessions(task.output) : [];
+        const seen = new Set<string>();
+        setCodingSessions(
+          [...fromTable, ...fromFooter].filter((s) => {
+            if (seen.has(s.sessionId)) return false;
+            seen.add(s.sessionId);
+            return true;
+          })
+        );
+      })
+      .catch(() => {
+        if (!cancelled && task?.output) setCodingSessions(extractCodingSessions(task.output));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, workflowId, task?.agentId, task?.output]);
 
   // Auto-scroll to bottom when output changes (streaming)
   useEffect(() => {
@@ -437,6 +487,24 @@ export default function AgentOutputPanel({
                 )}
               </div>
               <div className="flex items-center gap-3">
+                {codingSessions.map(({ sessionId, cli }) => (
+                  <a
+                    key={sessionId}
+                    href={`/cloud-code?session=${sessionId}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded transition-colors"
+                    style={{
+                      background: "rgba(34, 197, 94, 0.12)",
+                      color: "#4ade80",
+                      border: "1px solid rgba(34, 197, 94, 0.3)",
+                    }}
+                    title={`Resume this agent's ${cli} session in Cloud Code`}
+                  >
+                    <TerminalSquare size={13} aria-hidden="true" />
+                    Open in Cloud Code{cli === "codex" ? " (codex)" : ""}
+                  </a>
+                ))}
                 {task.error && (
                   <div className="flex items-center gap-1.5">
                     <AlertCircle size={14} style={{ color: "var(--pipeline-error)" }} aria-hidden="true" />

@@ -179,5 +179,8 @@ export async function listSessions(
       createdAt: s.createdAt,
       updatedAt: s.updatedAt,
       warmth: warmthOf(s.updatedAt),
+      origin: s.origin,
+      workflowId: s.workflowId,
+      agentId: s.agentId,
     }));
 }
