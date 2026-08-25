@@ -658,26 +658,31 @@ def _detect_cloud_artifacts(workdir: str) -> list[dict]:
 
 def _sync_artifacts(prefix: str, workdir: str) -> dict:
     """Upload the session's touched-untracked deliverables to S3 under `prefix`.
-    Best-effort: a failed file is skipped, never fatal. Returns {count, bytes}."""
+    Best-effort: a failed file is skipped, never fatal. Returns {count, bytes,
+    prefix, keys} — keys lets callers (workflow personas) fetch the deliverables
+    without filesystem access to this microVM."""
     if not (workdir and ARTIFACT_BUCKET and prefix):
-        return {"count": 0, "bytes": 0, "prefix": None}
+        return {"count": 0, "bytes": 0, "prefix": None, "keys": []}
     cands = _detect_cloud_artifacts(workdir)
     if not cands:
-        return {"count": 0, "bytes": 0, "prefix": None}
+        return {"count": 0, "bytes": 0, "prefix": None, "keys": []}
     s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
     count = 0
     total = 0
+    keys: list[str] = []
     for c in cands:
         try:
+            key = prefix + c["rel"].replace(os.sep, "/")
             with open(c["abs"], "rb") as fh:
-                s3.upload_fileobj(fh, ARTIFACT_BUCKET, prefix + c["rel"].replace(os.sep, "/"))
+                s3.upload_fileobj(fh, ARTIFACT_BUCKET, key)
             count += 1
             total += c["bytes"]
+            keys.append(key)
         except Exception as exc:  # noqa: BLE001 — one bad file is non-fatal
             logger.warning("artifact_sync_failed",
                            extra={"rel": c["rel"], "error": str(exc)[:200]})
     logger.info("artifacts_synced", extra={"prefix": prefix, "count": count, "bytes": total})
-    return {"count": count, "bytes": total, "prefix": prefix if count else None}
+    return {"count": count, "bytes": total, "prefix": prefix if count else None, "keys": keys}
 
 
 def _sync_turn_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
@@ -934,11 +939,15 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     _remember_session(new_session_id, repo)
     # Harvest deliverables to the resume prefix so the Artifacts tab populates
     # without a pull-home. Best-effort — never breaks the stream's done frame.
+    artifact_keys: list = []
     try:
-        _sync_turn_artifacts(session_id, workdir, tenant_id)
+        artifact_keys = _sync_turn_artifacts(session_id, workdir, tenant_id).get("keys") or []
     except Exception as exc:  # noqa: BLE001
         logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
-    yield sse({"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id})
+    done = {"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id}
+    if artifact_keys:
+        done["artifacts"] = artifact_keys
+    yield sse(done)
 
 
 def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
@@ -1180,8 +1189,12 @@ async def invocations(request: Request):
 
     # Harvest any deliverables this turn produced to the resume prefix so they show
     # in the web Artifacts tab immediately — no pull-home required. Best-effort.
+    # The harvested keys ride the response so remote callers (workflow personas)
+    # can fetch deliverables they have no filesystem path to.
     try:
-        _sync_turn_artifacts(session_id, workdir, tenant_id)
+        synced = _sync_turn_artifacts(session_id, workdir, tenant_id)
+        if synced.get("keys"):
+            result["artifacts"] = synced["keys"]
     except Exception as exc:  # noqa: BLE001
         logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
 

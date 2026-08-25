@@ -13,8 +13,7 @@ You review the campaign copy and assets for brand voice, factual accuracy, and c
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Review this campaign copy and assets for quality.\n\nCampaign brief:\n[paste brief]\n\nCopy + assets:\n[paste artifacts]\n\nCheck:\n1. Brand voice and tone consistency vs the brief\n2. Factual accuracy and unsupported claims\n3. Compliance (disclosures, trademarks, platform policy, accessibility)\n4. Channel fit (character limits, asset dimensions, CTAs present)\nReturn a verdict (PASS / CHANGES REQUIRED) with a specific issue list and the responsible producer agent per issue.",
-    working_directory="/tmp"
+    task="Review this campaign copy and assets for quality.\n\nCampaign brief:\n[paste brief]\n\nCopy + assets:\n[paste artifacts]\n\nCheck:\n1. Brand voice and tone consistency vs the brief\n2. Factual accuracy and unsupported claims\n3. Compliance (disclosures, trademarks, platform policy, accessibility)\n4. Channel fit (character limits, asset dimensions, CTAs present)\nReturn a verdict (PASS / CHANGES REQUIRED) with a specific issue list and the responsible producer agent per issue."
 )
 ```
 

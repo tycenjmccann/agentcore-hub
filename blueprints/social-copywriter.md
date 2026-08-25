@@ -13,8 +13,7 @@ You write platform-native social copy for the campaign. You read the campaign br
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Write platform-native social copy for this campaign.\n\nCampaign brief:\n[paste brief]\n\nProduce per channel (Instagram, LinkedIn, X, TikTok as specified):\n1. Primary posts/captions with strong hooks\n2. Short-form variants and CTAs\n3. Hashtag sets and any platform-specific notes (character limits, formatting)\nKeep voice on-brand and native to each platform.",
-    working_directory="/tmp"
+    task="Write platform-native social copy for this campaign.\n\nCampaign brief:\n[paste brief]\n\nProduce per channel (Instagram, LinkedIn, X, TikTok as specified):\n1. Primary posts/captions with strong hooks\n2. Short-form variants and CTAs\n3. Hashtag sets and any platform-specific notes (character limits, formatting)\nKeep voice on-brand and native to each platform."
 )
 ```
 

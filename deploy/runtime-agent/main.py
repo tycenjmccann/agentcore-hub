@@ -365,6 +365,12 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "") -> str:
 
     footer = (f"\n\n[coding-session: {_CODING_SESSION['session_id']} cli={cli}"
               f" conversation={_CODING_SESSION.get('claude_session_id') or 'n/a'}]")
+    # Deliverables the turn produced (mockups, screenshots, diagrams) are
+    # harvested to S3 by the coding runtime — these keys are how you reach files
+    # in the remote workspace: download_s3_file(key) → image_reader / file ops.
+    if result.get("artifacts"):
+        keys = "\n".join(f"  - {k}" for k in result["artifacts"])
+        footer += f"\n[coding-artifacts — S3 keys, fetch with download_s3_file:\n{keys}\n]"
     return (result.get("response") or "").strip() + footer
 
 
@@ -1057,6 +1063,11 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "") -> s
     Do NOT reference absolute paths like /tmp/... across calls; say "in the
     same workspace as the previous call" instead.
 
+    The workspace is REMOTE — you cannot file_read/image_reader its files
+    directly. Files it produces (screenshots, mockups, diagrams) are harvested
+    to S3 and listed in a [coding-artifacts: ...] footer on the result; fetch
+    them with download_s3_file(key), then image_reader / upload_file_to_s3.
+
     Args:
         task: Complete description of what to implement. Include:
               - Repo URL and branch name
@@ -1241,6 +1252,10 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "") -> str:
     All your codex calls in this task share ONE workspace and ONE conversation —
     a later call remembers the earlier calls and their files. Do NOT reference
     absolute paths like /tmp/... across calls.
+
+    The workspace is REMOTE — you cannot file_read/image_reader its files
+    directly. Files it produces are harvested to S3 and listed in a
+    [coding-artifacts: ...] footer on the result; fetch with download_s3_file(key).
 
     Args:
         task: Complete description of what to do (repo URL/branch, what to build

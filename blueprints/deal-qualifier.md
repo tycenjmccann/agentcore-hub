@@ -14,8 +14,7 @@ You lead intake for the sales proposal workflow. You qualify an inbound RFP/oppo
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Produce a deal qualification brief and ticket plan for this opportunity.\n\nOpportunity / RFP:\n[paste ticket description]\n\nContext you found:\n[customer, use case, scope, requirements, budget, timeline, source notes]\n\nProduce:\n1. Deal brief: customer profile, qualified scope, requirements, win themes, risks, target terms, fit assessment\n2. Ticket plan with dependency chain and justification\n\nDependency chain (fan-out then linear gates):\n  TIER 1 — Drafting (blocked_by=none): agentcore_hub_proposal_writer, agentcore_hub_solution_engineer\n  TIER 2 — Review (blocked_by=ALL Tier 1 ticket ids): agentcore_hub_pricing_analyst, agentcore_hub_deal_desk_reviewer\n  TIER 3 — Approval (blocked_by=ALL Tier 2 ticket ids): agentcore_hub_sales_approver\n- Use the EXACT agent IDs above as the assignee — any other value is rejected.",
-    working_directory="/tmp"
+    task="Produce a deal qualification brief and ticket plan for this opportunity.\n\nOpportunity / RFP:\n[paste ticket description]\n\nContext you found:\n[customer, use case, scope, requirements, budget, timeline, source notes]\n\nProduce:\n1. Deal brief: customer profile, qualified scope, requirements, win themes, risks, target terms, fit assessment\n2. Ticket plan with dependency chain and justification\n\nDependency chain (fan-out then linear gates):\n  TIER 1 — Drafting (blocked_by=none): agentcore_hub_proposal_writer, agentcore_hub_solution_engineer\n  TIER 2 — Review (blocked_by=ALL Tier 1 ticket ids): agentcore_hub_pricing_analyst, agentcore_hub_deal_desk_reviewer\n  TIER 3 — Approval (blocked_by=ALL Tier 2 ticket ids): agentcore_hub_sales_approver\n- Use the EXACT agent IDs above as the assignee — any other value is rejected."
 )
 ```
 

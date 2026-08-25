@@ -13,8 +13,7 @@ You lead internationalization review. You assess string handling, locale support
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Review this feature design for localization readiness.\n\n[PASTE DESIGN]\n\nAnalyze:\n1. String catalog — all user-facing strings with key naming convention\n2. Pluralization needs\n3. Date/number/currency formatting requirements\n4. RTL layout considerations\n5. String length variation impact on layout\n6. Asset localization needs (images with text)\n7. Translation workflow integration\n\nProduce a localization spec with string keys and notes for translators.",
-    working_directory="/tmp"
+    task="Review this feature design for localization readiness.\n\n[PASTE DESIGN]\n\nAnalyze:\n1. String catalog — all user-facing strings with key naming convention\n2. Pluralization needs\n3. Date/number/currency formatting requirements\n4. RTL layout considerations\n5. String length variation impact on layout\n6. Asset localization needs (images with text)\n7. Translation workflow integration\n\nProduce a localization spec with string keys and notes for translators."
 )
 ```
 

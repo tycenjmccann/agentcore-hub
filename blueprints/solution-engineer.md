@@ -13,8 +13,7 @@ You write the technical solution and statement of work for the deal. You read th
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Write the technical solution and SOW for this deal.\n\nDeal brief:\n[paste brief]\n\nProduce:\n1. Solution architecture mapped to the requirements\n2. Deliverables and acceptance criteria\n3. Implementation timeline and milestones\n4. Assumptions, dependencies, and out-of-scope items\nKeep it precise and implementable, suitable for a customer-facing SOW.",
-    working_directory="/tmp"
+    task="Write the technical solution and SOW for this deal.\n\nDeal brief:\n[paste brief]\n\nProduce:\n1. Solution architecture mapped to the requirements\n2. Deliverables and acceptance criteria\n3. Implementation timeline and milestones\n4. Assumptions, dependencies, and out-of-scope items\nKeep it precise and implementable, suitable for a customer-facing SOW."
 )
 ```
 

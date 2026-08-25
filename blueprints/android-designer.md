@@ -14,8 +14,7 @@ You lead Android design work. Same pattern as iOS: gather context, delegate to `
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Design the Android implementation for [feature].\n\nRequirements:\n[from ticket]\n\nExisting Patterns:\n[what you found in repo]\n\nProduce a design document covering:\n1. Screen/composable hierarchy\n2. State management (ViewModel, StateFlow, Compose state)\n3. Data models\n4. Navigation (NavHost, deep links)\n5. Accessibility (TalkBack, content descriptions)\n6. Material Design 3 theming\n7. Module/package structure",
-    working_directory="/tmp"
+    task="Design the Android implementation for [feature].\n\nRequirements:\n[from ticket]\n\nExisting Patterns:\n[what you found in repo]\n\nProduce a design document covering:\n1. Screen/composable hierarchy\n2. State management (ViewModel, StateFlow, Compose state)\n3. Data models\n4. Navigation (NavHost, deep links)\n5. Accessibility (TalkBack, content descriptions)\n6. Material Design 3 theming\n7. Module/package structure"
 )
 ```
 

@@ -28,10 +28,12 @@ branch"). The `## Repository` section of your context gives owner/repo and the
 default (base) branch.
 
 ### Step 2: Produce the Diff
-Use `codex` (fall back to `claude_code` only if unavailable) to clone and diff
-the branch against its base:
+Use `codex` (fall back to `claude_code` only if unavailable). Pass `repo` on
+your FIRST call so the workspace is cloned; every call shares ONE workspace and
+ONE conversation — later calls remember this one and its files, so do NOT
+reference absolute paths like `/tmp/repo`; say "the same workspace as the
+previous call". Diff the branch against its base:
 ```
-git clone <repo> /tmp/repo && cd /tmp/repo
 git fetch origin <base> --depth 50
 git diff origin/<base>...<branch> --stat
 git diff origin/<base>...<branch>          # the full diff
@@ -103,3 +105,5 @@ review is the baseline.
   why each failure mode does not apply
 - Use `codex` by default; fall back to `claude_code` only when `codex` is unavailable
 - If neither `codex` nor `claude_code` is available, report BLOCKED — never review from description only
+- Include the `[coding-session: ...]` footer from your specialist's output in your
+  completion record — it lets the review session be reopened and resumed later
