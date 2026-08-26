@@ -1,16 +1,17 @@
 /**
  * GET    /api/cloud-code/sessions/[id]   → full session (turns)
- * DELETE /api/cloud-code/sessions/[id]   → forget the session row
+ * DELETE /api/cloud-code/sessions/[id]   → soft-delete (tombstone + TTL)
  *
- * Note: DELETE only removes the local session record. The runtime's
- * /mnt/workspace for that runtimeSessionId ages out on the runtime's own idle
- * lifecycle; we don't (yet) actively reap it.
+ * DELETE hides the row immediately and arms a short DynamoDB TTL; the table
+ * stream's REMOVE event fires the session-reaper Lambda, which stops the
+ * microVM and purges the session's EFS workspace, transcripts, and S3
+ * artifacts (deploy/session-reaper). An S3 lifecycle rule backstops any miss.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { getOwnedSession, putSession, deleteSession } from "@/lib/cloud-code/sessions";
+import { getOwnedSession, mutateSession, softDeleteSession } from "@/lib/cloud-code/sessions";
 import { getIdentity } from "@/lib/auth/identity";
 import { artifactKey } from "@/lib/cloud-code/s3keys";
 import type { CloudCodeSession } from "@/lib/cloud-code/types";
@@ -63,12 +64,19 @@ export async function PATCH(
 ) {
   try {
     const { tenantId } = getIdentity(request);
-    const session = await getOwnedSession(params.id, tenantId);
-    if (!session) return NextResponse.json({ error: "Session not found" }, { status: 404 });
+    const owned = await getOwnedSession(params.id, tenantId);
+    if (!owned) return NextResponse.json({ error: "Session not found" }, { status: 404 });
     const body = await request.json().catch(() => ({}));
-    if (body.clearPendingSeed) session.pendingSeed = undefined;
-    session.updatedAt = new Date().toISOString();
-    await putSession(session);
+    // mutateSession (conditional write), NOT a read+putSession: a full Put from
+    // a stale read here could land after a concurrent soft-delete and overwrite
+    // its deletedAt/ttl — resurrecting the session and disarming the reaper.
+    const session = await mutateSession(params.id, (fresh) => {
+      if (fresh.deletedAt) return null; // deleted since our ownership check — don't revive
+      if (body.clearPendingSeed) fresh.pendingSeed = undefined;
+      fresh.updatedAt = new Date().toISOString();
+      return fresh;
+    });
+    if (!session) return NextResponse.json({ error: "Session not found" }, { status: 404 });
     return NextResponse.json({ session });
   } catch (err) {
     console.error("[cloud-code] patch error:", err);
@@ -100,12 +108,14 @@ export async function DELETE(
   try {
     // Only delete a row this tenant owns — a foreign/missing id is a no-op 404,
     // so a probe can't delete (or confirm the existence of) another tenant's row.
+    // Soft-delete: the row is tombstoned (hidden immediately) with a short TTL;
+    // when DynamoDB expires it, the table stream fires the reaper Lambda which
+    // stops the microVM and purges the session's EFS workspace + S3 artifacts.
     const { tenantId } = getIdentity(request);
-    const session = await getOwnedSession(params.id, tenantId);
-    if (!session) {
+    const deleted = await softDeleteSession(params.id, tenantId);
+    if (!deleted) {
       return NextResponse.json({ error: "Session not found" }, { status: 404 });
     }
-    await deleteSession(params.id);
     return NextResponse.json({ deleted: true });
   } catch (err) {
     console.error("[cloud-code] delete error:", err);
