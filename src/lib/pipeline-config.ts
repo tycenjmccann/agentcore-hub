@@ -92,14 +92,6 @@ export const TOOL_ICON_MAP: Record<string, { icon: string; label: string }> = Ob
 
 export type PipelinePhaseId = "intake" | "requirements" | "design" | "development" | "qa";
 
-export const PHASE_DISPLAY_ORDER: PipelinePhaseId[] = [
-  "intake",
-  "requirements",
-  "design",
-  "development",
-  "qa",
-];
-
 // ─── Phase Display Metadata ─────────────────────────────────────────────────
 // Per-phase UI metadata: how to render each phase visually.
 // Agent lists are NOT here — they are derived from agents.json.
@@ -330,17 +322,7 @@ export function getPhaseToolCount(phaseId: string, defId: string = DEFAULT_WORKF
   return tools.size;
 }
 
-/** Count runtime agents (total agents in this phase) */
-export function getPhaseRuntimeAgentCount(phaseId: string, defId: string = DEFAULT_WORKFLOW_DEF_ID): number {
-  const map = phaseMapForDef(getWorkflowDef(defId));
-  return agentsForDef(defId).filter((a) => map[a.phase] === phaseId).length;
-}
 
-/** Count harness agents (agents with type === "harness") */
-export function getPhaseHarnessAgentCount(phaseId: string, defId: string = DEFAULT_WORKFLOW_DEF_ID): number {
-  const map = phaseMapForDef(getWorkflowDef(defId));
-  return agentsForDef(defId).filter((a) => map[a.phase] === phaseId && a.type === "harness").length;
-}
 
 // ─── Derive PIPELINE_PHASES from agents.json + display metadata ─────────────
 
@@ -486,14 +468,5 @@ export function resolveToolIcon(toolName: string): { icon: string; label: string
 
 // ─── Helper: Find which phase an agent belongs to ───────────────────────────
 
-export function findAgentPhase(agentId: string): PipelinePhaseConfig | undefined {
-  return PIPELINE_PHASES.find((phase) =>
-    phase.agents.some((a) => a.agentId === agentId)
-  );
-}
 
 // ─── Helper: Get all agent IDs from config ──────────────────────────────────
-
-export function getAllAgentIds(): string[] {
-  return PIPELINE_PHASES.flatMap((phase) => phase.agents.map((a) => a.agentId));
-}

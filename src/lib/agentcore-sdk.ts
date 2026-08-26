@@ -497,74 +497,6 @@ const SAVE_CONFIG_TOOL = {
   },
 };
 
-export async function streamBuilderConverse(
-  messages: Array<{ role: string; content: string }>,
-  systemPrompt: string,
-  region: string = DEFAULT_REGION
-): Promise<ReadableStream> {
-  const client = getBedrockClient(region);
-  const encoder = new TextEncoder();
-
-  const converseMessages = messages.map((m) => ({
-    role: m.role as "user" | "assistant",
-    content: [{ text: m.content }],
-  }));
-
-  const command = new ConverseStreamCommand({
-    modelId: process.env.BUILDER_MODEL_ID || "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    system: [{ text: systemPrompt }],
-    messages: converseMessages,
-    inferenceConfig: { maxTokens: 4096, temperature: 0.7 },
-    toolConfig: {
-      tools: [SAVE_CONFIG_TOOL],
-    },
-  });
-
-  const response = await client.send(command);
-
-  return new ReadableStream({
-    async start(controller) {
-      try {
-        // Track tool use blocks to detect save_agent_config calls
-        let currentToolName = "";
-        let currentToolInput = "";
-
-        if (response.stream) {
-          for await (const event of response.stream) {
-            if (event.contentBlockStart?.start?.toolUse) {
-              currentToolName = event.contentBlockStart.start.toolUse.name || "";
-              currentToolInput = "";
-            } else if (event.contentBlockDelta?.delta?.toolUse) {
-              // Accumulate tool input JSON
-              currentToolInput += event.contentBlockDelta.delta.toolUse.input || "";
-            } else if (event.contentBlockDelta?.delta?.text) {
-              const data = JSON.stringify({ type: "text", content: event.contentBlockDelta.delta.text });
-              controller.enqueue(encoder.encode(`data: ${data}\n\n`));
-            } else if (event.contentBlockStop) {
-              // If the completed block was our config tool, emit the config event
-              if (currentToolName === "save_agent_config" && currentToolInput) {
-                try {
-                  const config = JSON.parse(currentToolInput);
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "config", content: config })}\n\n`));
-                } catch { /* malformed tool input */ }
-              }
-              currentToolName = "";
-              currentToolInput = "";
-            } else if (event.messageStop) {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "done" })}\n\n`));
-            }
-          }
-        }
-        controller.close();
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : "Unknown error";
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "error", content: errMsg })}\n\n`));
-        controller.close();
-      }
-    },
-  });
-}
-
 /**
  * Invoke a deployed AgentCore Runtime agent (non-harness).
  */
@@ -960,14 +892,6 @@ export async function invokeHarnessAgent(params: {
 
 export type RegistryDescriptorType = "MCP" | "A2A" | "CUSTOM" | "AGENT_SKILLS";
 
-export type RegistryStatus =
-  | "CREATING"
-  | "READY"
-  | "UPDATING"
-  | "CREATE_FAILED"
-  | "UPDATE_FAILED"
-  | "DELETING"
-  | "DELETE_FAILED";
 
 export type RecordStatus =
   | "CREATING"

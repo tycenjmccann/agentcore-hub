@@ -44,20 +44,6 @@ export async function putConnectorSecret(
   }
 }
 
-/** True if a credential bundle exists for this connector (existence only — never
- *  returns the value). Used to reconcile status without exposing the secret. */
-export async function connectorSecretExists(connectorId: string): Promise<boolean> {
-  const { SecretsManagerClient, DescribeSecretCommand } = await import(
-    "@aws-sdk/client-secrets-manager"
-  );
-  const sm = new SecretsManagerClient({ region: REGION });
-  try {
-    await sm.send(new DescribeSecretCommand({ SecretId: secretIdFor(connectorId) }));
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /** Delete a connector's credential bundle (best-effort — called on connector delete). */
 export async function deleteConnectorSecret(connectorId: string): Promise<void> {

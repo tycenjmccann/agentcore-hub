@@ -230,14 +230,6 @@ export function parseHarnessConfig(text: string): HarnessConfig | null {
   return null;
 }
 
-/**
- * List available agents from AgentCore
- */
-export async function listAgentCoreAgents(): Promise<AgentInfo[]> {
-  const response = await fetch("/api/agentcore/agents", { headers: { "x-aws-region": getClientRegion() } });
-  if (!response.ok) return [];
-  return response.json();
-}
 
 /**
  * Deploy a harness config as a new agent
