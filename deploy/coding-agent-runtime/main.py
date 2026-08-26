@@ -1685,7 +1685,7 @@ async def invocations(request: Request):
     resume_transcript = payload.get("resume_transcript")  # s3 key
     resume_session_id = payload.get("resume_session_id")
     branch = payload.get("branch")  # checkout this branch before the turn
-    # Flexible git handoff (port-session MCP): git_mode is pushed|bundle|selfContained|none.
+    # Flexible git handoff (hub MCP): git_mode is pushed|bundle|selfContained|none.
     #   clone_url     — explicit origin to clone (may be an upstream we can't push to)
     #   resume_bundle — s3 key of a git bundle: commits-on-top (bundle mode) OR a
     #                   whole-repo `bundle --all` (selfContained mode)

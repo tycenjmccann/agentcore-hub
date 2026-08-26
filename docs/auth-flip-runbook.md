@@ -22,7 +22,7 @@ one** can create/manage the shared GitHub App after the flip.
   reachable by anyone who can reach the app at all. Flip sooner rather than
   later once the deploy is shared.
 
-## 3. Service token for the port-session MCP (headless caller)
+## 3. Service token for the hub MCP (headless caller)
 
 The MCP has no browser login. Without this it dies at the first call (401 on
 port/checkpoint/warm/config-sync).
@@ -60,7 +60,7 @@ once verified.
 - Smoke: browser session list loads (step 4 worked), a chat turn on a private
   repo clones (requester-bound App token), the Terminal opens with `gh auth
   status` showing the App token (prepare-path token passthrough), and
-  `/mcp__port-session__port` completes (service token works end to end).
+  `/mcp__agentcore-hub__port` completes (service token works end to end).
 
 ## Notes
 

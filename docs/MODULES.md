@@ -183,7 +183,7 @@ conversational.
 - `/sessions/[id]/shell` — mint a SigV4-presigned `wss://` URL; the browser
   connects directly to the runtime PTY (App Runner does not proxy it).
 - `/sessions/port` — "port to cloud" handoff: create a session + presigned S3 PUT
-  for the laptop transcript (see port-session MCP below).
+  for the laptop transcript (see the hub MCP below).
 - `/sessions/[id]/warm` — pre-warm the microVM (clone + checkout + install
   transcript + materialize the config bundle) so a ported session opens instantly.
 - `/sessions/[id]/shell` — also fires a config-only `prepare` invoke before
@@ -193,15 +193,16 @@ conversational.
   the grown transcript back to S3, return a presigned GET for the laptop to pull.
 - `/config` — per-user CLI config bundle: GET list / POST upload→S3 / PUT set-current.
 
-**Port / pull / sync MCP** — `mcp/port-session/` (standalone local stdio MCP, its
-own package; excluded from the app tsconfig). Three tools: `port_session_to_cloud`
+**Port / pull / sync MCP** — `mcp/hub/` cloud-code domain (part of the unified
+hub MCP — one local stdio server also carrying the workflow/routine tools; its
+own package, excluded from the app tsconfig). Three tools: `port_session_to_cloud`
 (commit+push, ship the raw `.jsonl` to S3, native `claude --resume` in the cloud),
 `pull_session_from_cloud` (checkpoint the grown transcript home, `claude --resume`
 locally — same session id both ways), and `sync_cli_config` (one-time: mirror the
 laptop's CLI config — CLAUDE.md/AGENTS.md, skills, agents, MCP servers — into the
 per-user `/config` bundle; scoped per CLI, classifies each MCP server works /
 needs-secret / unsupported and ships only the runnable ones, redacts secret env).
-See [mcp/port-session/README.md](../mcp/port-session/README.md).
+See [mcp/hub/README.md](../mcp/hub/README.md).
 
 **Lib**
 - `src/lib/cloud-code/{types,sessions,runtime,config-store,shell-protocol}.ts`
@@ -235,7 +236,7 @@ See [mcp/port-session/README.md](../mcp/port-session/README.md).
 
 **Removing the module**
 - Delete the `/cloud-code` nav entry tagged `module: "cloud-code"` in `src/config/modules.ts`
-- `rm -rf src/app/cloud-code src/app/api/cloud-code src/lib/cloud-code src/components/cloud-code mcp/port-session`
+- `rm -rf src/app/cloud-code src/app/api/cloud-code src/lib/cloud-code src/components/cloud-code` and the `cloud-code/` domain in `mcp/hub`
 - Optionally tear down the runtime (`deploy/coding-agent-runtime/`), the
   `agentcore-hub-cloud-code-sessions` table, and the VPC/EFS stack
   (`agentcore-hub-coding-vpc-efs`). `src/lib/sse.ts` is shared — keep it.
