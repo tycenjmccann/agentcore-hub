@@ -440,8 +440,7 @@ export default function CloudCodePage() {
     // bubble — never persisted server-side) are EXCLUDED, or recovery would wait
     // for a server count that can never exist and block the session for 10min.
     const baseTurns = liveTurns.current.get(sid) ?? active.turns;
-<<<<<<< HEAD
-    const baseCount = baseTurns.length;
+    const baseCount = baseTurns.filter((t) => !t.local).length;
     // Consumed by this turn. Blob preview URLs are NOT revoked here — they back
     // the optimistic turn's thumbnails until a reload swaps in presigned URLs;
     // a displayed blob isn't a leak. Removal/switch paths do revoke.
@@ -449,9 +448,6 @@ export default function CloudCodePage() {
     const optimisticAttach = turnAttachments.length
       ? turnAttachments.map((a) => ({ path: a.path, name: a.name, contentType: a.contentType, url: a.previewUrl }))
       : undefined;
-=======
-    const baseCount = baseTurns.filter((t) => !t.local).length;
->>>>>>> origin/feat/cloud-code-stream-isolation
     // Optimistic user message → into the overlay for THIS session only.
     const userTurn: CloudCodeTurn = {
       role: "user",
@@ -1079,9 +1075,6 @@ export default function CloudCodePage() {
                   >
                     {activeStopping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-3.5 h-3.5" fill="currentColor" />}
                   </button>
-<<<<<<< HEAD
-                ) : (draft.trim() || attachments.length > 0) && !voiceActive ? (
-=======
                 ) : activeSending ? (
                   // Recovering a dropped turn — nothing local to stop; show the
                   // reconnect state instead of an inert Stop button.
@@ -1092,8 +1085,7 @@ export default function CloudCodePage() {
                   >
                     <Loader2 className="w-4 h-4 animate-spin" />
                   </div>
-                ) : draft.trim() && !voiceActive ? (
->>>>>>> origin/feat/cloud-code-stream-isolation
+                ) : (draft.trim() || attachments.length > 0) && !voiceActive ? (
                   <button
                     onClick={send}
                     data-testid="cc-send"
