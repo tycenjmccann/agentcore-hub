@@ -43,7 +43,7 @@ export PROBE_INTERVAL=2m
 
 ## Health Endpoint
 
-The probe exposes a `/healthz` endpoint (default `:8080`) that returns 200 when the last probe run passed, or 503 when unhealthy.
+The probe exposes a `/health` endpoint (default `:8080`) that returns 200 when the last probe run passed, or 503 when unhealthy.
 
 ## Configuration
 
