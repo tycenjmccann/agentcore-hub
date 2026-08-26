@@ -73,7 +73,7 @@ export async function POST(
       const { token: githubToken, connected: githubAppConnected } = await cloneTokenForUser(
         sessionTenant,
         userId,
-        session.repo
+        session.repo ?? session.cloneUrl
       );
       const warmed = await Promise.race([
         warmCodingSession({
@@ -83,6 +83,9 @@ export async function POST(
           branch: session.branch,
           resumeTranscriptKey: session.resumeTranscriptKey,
           resumeSessionId: session.claudeSessionId,
+          gitMode: session.gitMode,
+          cloneUrl: session.cloneUrl,
+          resumeBundleKey: session.resumeBundleKey,
           userId,
           tenantId: sessionTenant,
           configVersion,

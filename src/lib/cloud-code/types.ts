@@ -52,6 +52,16 @@ export interface CloudCodeSession {
   // S3 key of the raw laptop transcript (.jsonl). The runtime downloads it and
   // runs `claude --resume claudeSessionId` for a lossless continuation.
   resumeTranscriptKey?: string;
+  // Flexible git handoff — how the laptop shipped its code:
+  //   pushed        — branch pushed to a writable origin; cloud clones + checks out
+  //   bundle        — origin read-only; cloud clones the upstream and layers the
+  //                   laptop's commits from a git bundle (resumeBundleKey)
+  //   selfContained — no usable remote; cloud rebuilds a standalone repo from a
+  //                   whole-repo `bundle --all` (resumeBundleKey)
+  //   none          — nothing to ship; transcript-only resume in a bare workspace
+  gitMode?: "pushed" | "bundle" | "selfContained" | "none";
+  cloneUrl?: string; // explicit origin URL the cloud clones (SSH→HTTPS-normalized)
+  resumeBundleKey?: string; // S3 key of the uploaded git bundle
   // Which surface this session opens in (sidebar tap restores it). Set at port
   // time; defaults to chat. A ported terminal session auto-runs `claude --resume`
   // in the PTY instead of firing the chat seed.

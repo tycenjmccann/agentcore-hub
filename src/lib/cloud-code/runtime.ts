@@ -54,11 +54,19 @@ export interface CodingTurnParams {
   tenantId?: string; // isolation boundary; scopes the runtime's config/checkpoint S3 keys
   configVersion?: string;
   region?: string;
-  // "Port to cloud" handoff (first turn only): check out the pushed branch and
-  // natively resume the laptop transcript shipped to this S3 key.
+  // "Port to cloud" handoff: check out the pushed branch and natively resume
+  // the laptop transcript shipped to this S3 key.
   branch?: string;
   resumeTranscriptKey?: string;
   resumeSessionId?: string;
+  // Flexible git handoff. gitMode: "pushed" (clone + checkout branch), "bundle"
+  // (clone cloneUrl, then git-fetch the uploaded bundle to layer the laptop's
+  // commits on top), "selfContained" (rebuild a standalone repo from a whole-repo
+  // bundle --all), or "none" (bare workspace). cloneUrl is the explicit origin;
+  // resumeBundleKey is the bundle's S3 key.
+  gitMode?: "pushed" | "bundle" | "selfContained" | "none";
+  cloneUrl?: string;
+  resumeBundleKey?: string;
   // Short-lived GitHub App installation token minted for the session owner (see
   // github-app.ts). Handed to the runtime per turn; never persisted.
   githubToken?: string;
@@ -90,6 +98,9 @@ function buildTurnPayload(params: CodingTurnParams): Record<string, unknown> {
   if (params.branch) payload.branch = params.branch;
   if (params.resumeTranscriptKey) payload.resume_transcript = params.resumeTranscriptKey;
   if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
+  if (params.gitMode) payload.git_mode = params.gitMode;
+  if (params.cloneUrl) payload.clone_url = params.cloneUrl;
+  if (params.resumeBundleKey) payload.resume_bundle = params.resumeBundleKey;
   if (params.githubToken) payload.github_token = params.githubToken;
   if (params.githubAppConnected) payload.github_app_connected = true;
   if (params.attachments?.length) payload.attachments = params.attachments;
@@ -204,6 +215,9 @@ export async function warmCodingSession(params: {
   region?: string;
   githubToken?: string;
   githubAppConnected?: boolean;
+  gitMode?: "pushed" | "bundle" | "selfContained" | "none";
+  cloneUrl?: string;
+  resumeBundleKey?: string;
 }): Promise<{ resumeReady: boolean }> {
   if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
   const region = params.region || REGION;
@@ -216,6 +230,9 @@ export async function warmCodingSession(params: {
   if (params.branch) payload.branch = params.branch;
   if (params.resumeTranscriptKey) payload.resume_transcript = params.resumeTranscriptKey;
   if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
+  if (params.gitMode) payload.git_mode = params.gitMode;
+  if (params.cloneUrl) payload.clone_url = params.cloneUrl;
+  if (params.resumeBundleKey) payload.resume_bundle = params.resumeBundleKey;
   if (params.userId) payload.user_id = params.userId;
   if (params.tenantId) payload.tenant_id = params.tenantId;
   if (params.configVersion) payload.config_version = params.configVersion;
@@ -297,10 +314,27 @@ export async function checkpointCodingSession(params: {
   sessionId: string;
   cli: CloudCodeCli;
   repo?: string;
+  // Workspace resolution on the runtime derives the slug from repo OR cloneUrl —
+  // a cloneUrl-only session (non-GitHub/SSH origin) MUST forward it or the
+  // checkpoint resolves to the bare session dir, misses the transcript's project
+  // slug, and 404s the pull-home.
+  cloneUrl?: string;
+  gitMode?: "pushed" | "bundle" | "selfContained" | "none";
   resumeSessionId?: string; // the conversation's real id (the transcript filename)
   tenantId?: string;
   region?: string;
-}): Promise<{ key?: string; bytes?: number; branch?: string }> {
+}): Promise<{
+  key?: string;
+  bytes?: number;
+  branch?: string;
+  artifactPrefix?: string;
+  artifactCount?: number;
+  // bundle/selfContained sessions: S3 key of a whole-history git bundle carrying
+  // the cloud's commits (no writable origin to fetch them from). The pull leg
+  // fetches from this bundle instead of origin.
+  returnBundleKey?: string;
+  returnBundleBranch?: string;
+}> {
   if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
   const region = params.region || REGION;
   const payload: Record<string, unknown> = {
@@ -309,6 +343,8 @@ export async function checkpointCodingSession(params: {
     session_id: params.sessionId,
   };
   if (params.repo) payload.repo = params.repo;
+  if (params.cloneUrl) payload.clone_url = params.cloneUrl;
+  if (params.gitMode) payload.git_mode = params.gitMode;
   if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
   if (params.tenantId) payload.tenant_id = params.tenantId;
 
@@ -328,9 +364,18 @@ export async function checkpointCodingSession(params: {
     throw new Error(`checkpoint: bad runtime response: ${body.slice(0, 200)}`);
   }
   if (parsed.error) throw new Error(String(parsed.error));
+  // The runtime also harvests touched-untracked deliverables to an S3 prefix
+  // ({count, bytes, prefix}) — surfaced so the checkpoint route can presign a
+  // GET per file for the pull-home leg.
+  const arts = (parsed.artifacts || {}) as { count?: number; prefix?: string };
+  const rb = (parsed.return_bundle || null) as { key?: string; branch?: string } | null;
   return {
     key: parsed.key as string | undefined,
     bytes: parsed.bytes as number | undefined,
     branch: parsed.branch as string | undefined,
+    artifactPrefix: arts.prefix || undefined,
+    artifactCount: arts.count ?? 0,
+    returnBundleKey: rb?.key || undefined,
+    returnBundleBranch: rb?.branch || undefined,
   };
 }

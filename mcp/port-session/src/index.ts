@@ -27,8 +27,9 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
-import { readState, commitAndPush, pullBranch } from "./git.js";
+import { readState, prepareGitHandoff, pullBranch, pullFromBundle } from "./git.js";
 import { newestTranscript, sessionIdForTranscript, installLocalTranscript } from "./transcript.js";
+import { detectArtifacts, uploadArtifact, stageArtifactLocally, downloadArtifact, ensureCloudCodeExcluded, fmtBytes } from "./artifacts.js";
 import { gatherBundle, type Cli } from "./config.js";
 
 const CLOUD_CODE_URL = (process.env.CLOUD_CODE_URL || "").replace(/\/$/, "");
@@ -53,6 +54,14 @@ const InputSchema = z.object({
     .describe("Which surface the deep link opens. Default chat (mobile-friendly). 'terminal' auto-runs `claude --resume` in a live shell."),
   commitMessage: z.string().optional().describe("Commit message for the in-flight snapshot."),
   cwd: z.string().optional().describe("Project directory. Defaults to the server's cwd."),
+  preferBundle: z
+    .boolean()
+    .optional()
+    .describe("Force bundle mode (ship a git bundle instead of pushing) even when origin is writable."),
+  artifacts: z
+    .enum(["y", "n", "auto"])
+    .optional()
+    .describe("Ship session-touched untracked files (images/exports/data/media) to the cloud. auto/y=detect+ship, n=skip. Default auto."),
 });
 
 const server = new Server(
@@ -78,6 +87,8 @@ const TOOL = {
       cli: { type: "string", enum: ["claude", "codex"], description: "Cloud CLI to resume with. Default claude." },
       commitMessage: { type: "string", description: "Commit message for the in-flight snapshot." },
       cwd: { type: "string", description: "Project directory. Defaults to the server cwd." },
+      preferBundle: { type: "boolean", description: "Force bundle mode even when origin is writable." },
+      artifacts: { type: "string", enum: ["y", "n", "auto"], description: "Ship session-touched untracked files to the cloud. Default auto." },
     },
   },
 };
@@ -232,6 +243,9 @@ async function runPull(rawArgs: unknown) {
     branch?: string;
     repo?: string;
     bytes?: number;
+    artifacts?: { rel: string; url: string; bytes: number }[];
+    returnBundleUrl?: string;
+    returnBundleBranch?: string;
     error?: string;
   };
   if (!res.ok) throw new Error(data.error || `checkpoint returned ${res.status}`);
@@ -250,9 +264,22 @@ async function runPull(rawArgs: unknown) {
   const stamp = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
   const placed = await installLocalTranscript(cwd, data.claudeSessionId, bytes, { stamp });
 
-  // 4. pull the cloud's branch home so local code matches the transcript.
+  // 4. pull the cloud's work home so local code matches the transcript.
+  //    Exclude .cloud-code/ first: a prior port staged artifacts there, and
+  //    the pull legs refuse a dirty tree. bundle/selfContained sessions have no
+  //    writable origin — their cloud commits arrive via the return bundle.
   let gitNote = "no branch reported";
-  if (data.branch) {
+  await ensureCloudCodeExcluded(cwd).catch(() => {});
+  if (data.returnBundleUrl) {
+    try {
+      const rb = await fetch(data.returnBundleUrl, { signal: AbortSignal.timeout(120_000) });
+      if (!rb.ok) throw new Error(`return bundle download failed: ${rb.status}`);
+      const rbBytes = Buffer.from(await rb.arrayBuffer());
+      gitNote = await pullFromBundle(cwd, rbBytes, data.returnBundleBranch || data.branch || "cloud-code/ported-work");
+    } catch (e) {
+      gitNote = `return-bundle pull failed: ${(e as Error).message}`;
+    }
+  } else if (data.branch) {
     try {
       gitNote = await pullBranch(cwd, data.branch);
     } catch (e) {
@@ -260,14 +287,41 @@ async function runPull(rawArgs: unknown) {
     }
   }
 
+  // 5. bring home the cloud session's artifacts (touched-untracked deliverables
+  //    it produced — media, exports, data). Streamed into local .cloud-code/artifacts/.
+  const pulledArtifacts: string[] = [];
+  const failedArtifacts: string[] = [];
+  let artifactBytes = 0;
+  if (data.artifacts?.length) {
+    await Promise.all(
+      data.artifacts.map(async (a) => {
+        try {
+          await downloadArtifact(cwd, a.rel, a.url);
+          pulledArtifacts.push(a.rel);
+          artifactBytes += a.bytes || 0;
+        } catch {
+          failedArtifacts.push(a.rel);
+        }
+      })
+    );
+  }
+  const artifactLine =
+    pulledArtifacts.length > 0
+      ? `Artifacts: ${pulledArtifacts.length} pulled (${fmtBytes(artifactBytes)}) → .cloud-code/artifacts/ — ${pulledArtifacts.slice(0, 8).join(", ")}`
+      : "";
+  const artifactFailLine =
+    failedArtifacts.length > 0 ? `⚠️ ${failedArtifacts.length} artifact(s) failed: ${failedArtifacts.join(", ")}` : "";
+
   const sizeMb = (bytes.length / 1_048_576).toFixed(1);
   const summary = [
     `✅ Pulled session home.`,
     ``,
     data.repo ? `Repo: ${data.repo}` : "",
-    data.branch ? `Branch: ${gitNote}` : "",
+    data.branch || data.returnBundleUrl ? `Code: ${gitNote}` : "",
     `Transcript: ${sizeMb} MB → ${placed.path}${placed.overwrote ? " (overwrote local)" : ""}`,
     placed.backup ? `Prior local copy backed up → ${placed.backup}` : "",
+    artifactLine,
+    artifactFailLine,
     ``,
     `Now exit this session and resume the pulled one:`,
     `  /exit`,
@@ -372,23 +426,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const args = InputSchema.parse(req.params.arguments ?? {});
     const cwd = args.cwd || process.env.PROJECT_CWD || process.cwd();
 
-    // 1. git state
-    const state = await readState(cwd);
-    if (!state.isRepo) throw new Error(`${cwd} is not a git repository.`);
-    if (!state.remoteRepo) {
-      throw new Error("No GitHub 'origin' remote — Cloud Code can only resume from a pushed repo.");
-    }
-
-    // 2. commit + push the in-flight work
-    const push = await commitAndPush(cwd, {
-      branch: args.branch,
-      message: args.commitMessage,
-      dirty: state.dirty,
-      currentBranch: state.branch,
-    });
-
-    // 3. locate the live transcript — its filename IS the Claude session id we'll
-    //    resume natively in the cloud.
+    // 1. locate the live transcript FIRST — it's the only hard requirement. Its
+    //    filename IS the Claude session id we'll resume natively in the cloud.
     const file = await newestTranscript(cwd);
     if (!file) {
       throw new Error(`No Claude Code transcript found for ${cwd}. Run this from inside a Claude Code session.`);
@@ -396,30 +435,66 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const claudeSessionId = sessionIdForTranscript(file);
     const transcript = await readFile(file); // raw .jsonl bytes (verbatim → native --resume)
 
-    // 4. create the cloud session + get a presigned URL to upload the transcript.
+    // 1b. artifact detection. The files this session touched that exist locally
+    //     and aren't git-tracked are exactly the deliverables the code bundle
+    //     misses. 'n' skips; 'auto'/'y' detect and (below) ship them.
+    const artifactMode = args.artifacts ?? "auto";
+    const detected =
+      artifactMode === "n"
+        ? null
+        : await detectArtifacts({ cwd, repoDir: cwd, transcript }).catch(() => null);
+
+    // 2. git handoff — best-effort, flexible. The transcript ships regardless;
+    //    git just determines whether (and how) the cloud also gets your code:
+    //    pushed (writable origin), bundle (read-only origin), selfContained
+    //    (no usable remote — bundle --all), or none (empty dir).
+    const state = await readState(cwd);
+    let bundleBytes: Buffer | null = null;
+    const handoff = await prepareGitHandoff(cwd, state, {
+      branch: args.branch,
+      message: args.commitMessage,
+      preferBundle: args.preferBundle,
+      writeArtifacts: async ({ bundle }) => { bundleBytes = bundle; },
+      writeSelfContained: async (bundle) => { bundleBytes = bundle; },
+    });
+
+    // 3. create the cloud session + presigned upload URLs (transcript always;
+    //    bundle only when we produced one).
     const res = await fetch(`${CLOUD_CODE_URL}/api/cloud-code/sessions/port`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        repo: state.remoteRepo,
-        branch: push.branch,
+        repo: handoff.mode === "none" ? undefined : state.remoteRepo,
+        cloneUrl: handoff.mode === "none" || handoff.mode === "selfContained"
+          ? undefined
+          : state.originUrl,
+        gitMode: handoff.mode, // pushed | bundle | selfContained | none
+        branch: handoff.mode === "none" ? undefined : handoff.branch,
+        wantBundleUpload: Boolean(bundleBytes),
         claudeSessionId,
         firstPrompt: args.firstPrompt,
         cli: args.cli || "claude",
         view: args.view || "chat",
         title: args.title,
+        // Artifact manifest → the route presigns a PUT per file. rel is the
+        // on-the-wire identity (validated server-side against path traversal).
+        artifacts: detected
+          ? detected.candidates.map((c) => ({ rel: c.rel, bytes: c.bytes }))
+          : undefined,
       }),
     });
     const data = (await res.json().catch(() => ({}))) as {
       url?: string;
       uploadUrl?: string;
+      bundleUploadUrl?: string;
+      artifactUploads?: { rel: string; url: string }[];
       error?: string;
       session?: { sessionId?: string };
     };
     if (!res.ok) throw new Error(data.error || `port endpoint returned ${res.status}`);
     if (!data.uploadUrl) throw new Error("port endpoint did not return an upload URL");
 
-    // 5. upload the raw transcript straight to S3 (presigned PUT — no big body
+    // 4. upload the raw transcript straight to S3 (presigned PUT — no big body
     //    through the app, no DynamoDB size cap).
     const up = await fetch(data.uploadUrl, {
       method: "PUT",
@@ -427,6 +502,42 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       body: transcript,
     });
     if (!up.ok) throw new Error(`transcript upload failed: ${up.status} ${up.statusText}`);
+
+    // 4b. upload the git bundle if we have one (bundle / selfContained modes).
+    if (bundleBytes && data.bundleUploadUrl) {
+      const ub = await fetch(data.bundleUploadUrl, {
+        method: "PUT",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: new Uint8Array(bundleBytes),
+      });
+      if (!ub.ok) throw new Error(`bundle upload failed: ${ub.status} ${ub.statusText}`);
+    }
+
+    // 4c. stream each detected artifact to its presigned PUT. Per-file failure is
+    //     NON-fatal — the port already succeeded (code + transcript shipped); we
+    //     count + NAME failures so the summary never reads a silent "0/N". Files
+    //     also copy into local .cloud-code/artifacts so pull is symmetric.
+    const uploadedArtifacts: string[] = [];
+    const failedArtifacts: { rel: string; error: string }[] = [];
+    if (detected && data.artifactUploads?.length) {
+      // Exclude .cloud-code/ locally BEFORE staging so the staged copies can't
+      // leave the tree dirty (which would block pull's checkout of cloud code).
+      await ensureCloudCodeExcluded(cwd);
+      const byRel = new Map(detected.candidates.map((c) => [c.rel, c]));
+      await Promise.all(
+        data.artifactUploads.map(async (u) => {
+          const cand = byRel.get(u.rel);
+          if (!cand) return;
+          try {
+            await uploadArtifact(u.url, cand.abs, cand.bytes);
+            uploadedArtifacts.push(u.rel);
+            await stageArtifactLocally(cwd, u.rel, cand.abs).catch(() => {});
+          } catch (e) {
+            failedArtifacts.push({ rel: u.rel, error: (e as Error).message });
+          }
+        })
+      );
+    }
 
     // 6. pre-warm the microVM now (clone + checkout + install transcript) so the
     //    session is hot the instant the user opens the link. Best-effort: we wait
@@ -451,14 +562,45 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       sid ? `${CLOUD_CODE_URL}/cloud-code?session=${sid}${viewQ}` : data.url || "(no url returned)";
 
     const sizeMb = (transcript.length / 1_048_576).toFixed(1);
+
+    // Mode-aware "what shipped / why / how" so a read-only or no-repo handoff is
+    // never silently degraded — the user knows exactly what the cloud has.
+    const codeLines: string[] = [];
+    if (handoff.mode === "pushed") {
+      codeLines.push(
+        `Repo: ${state.remoteRepo || state.originUrl}`,
+        `Branch: ${handoff.branch}${handoff.committed ? " (in-flight work committed + pushed)" : " (pushed)"}`
+      );
+    } else if (handoff.mode === "bundle") {
+      codeLines.push(
+        `Repo: ${state.remoteRepo || state.originUrl} (origin is read-only — no push needed)`,
+        `Code: shipped as a git bundle${bundleBytes ? ` (${fmtBytes((bundleBytes as Buffer).length)})` : " (nothing laptop-only — clean clone matches)"}; the cloud clones the upstream and layers your commits on branch \`${handoff.branch}\`.`
+      );
+    } else if (handoff.mode === "selfContained") {
+      codeLines.push(
+        `Code: no usable remote — shipped the WHOLE repo as a self-contained bundle${bundleBytes ? ` (${fmtBytes((bundleBytes as Buffer).length)})` : ""}${handoff.initialized ? " (git init'd it for you)" : ""}. The cloud rebuilt it standalone on branch \`${handoff.branch}\`; nothing left your AWS account.`
+      );
+    } else {
+      codeLines.push(`Code: none shipped (${handoff.reason}) — the conversation resumes in a bare workspace.`);
+    }
+    const artifactLine =
+      uploadedArtifacts.length > 0
+        ? `Artifacts: ${uploadedArtifacts.length} untracked deliverable(s) shipped → .cloud-code/artifacts/ — ${uploadedArtifacts.slice(0, 8).join(", ")}`
+        : "";
+    const artifactFailLine =
+      failedArtifacts.length > 0
+        ? `⚠️ ${failedArtifacts.length} artifact(s) failed to upload: ${failedArtifacts.map((f) => f.rel).join(", ")}`
+        : "";
+
     const summary = [
       `✅ Ported to Cloud Code (native resume).`,
       ``,
-      `Repo: ${state.remoteRepo}`,
-      `Branch: ${push.branch}${push.committed ? " (in-flight work committed + pushed)" : " (pushed)"}`,
+      ...codeLines,
       `Transcript: ${sizeMb} MB uploaded — the cloud agent resumes this exact session (claude --resume).`,
+      artifactLine,
+      artifactFailLine,
       warmed
-        ? `Workspace: pre-warmed (repo cloned + branch checked out) — open and it's instant.`
+        ? `Workspace: pre-warmed — open and it's instant.`
         : `Workspace: warms on first open (clone happens then).`,
       ``,
       `Open on any device:`,
@@ -466,7 +608,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       ``,
       `When you're back at this machine, pull the cloud's work home:`,
       `  /mcp__port-session__pull ${sid}`,
-    ].join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
 
     return { content: [{ type: "text", text: summary }] };
   } catch (err) {

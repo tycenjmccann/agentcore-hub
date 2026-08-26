@@ -122,18 +122,30 @@ export async function POST(
   const { token: githubToken, connected: githubAppConnected } = await cloneTokenForUser(
     sessionTenant,
     userId,
-    session.repo
+    session.repo ?? session.cloneUrl
   );
 
-  // Ported-session first turn: tell the runtime to check out the pushed branch
-  // and natively resume the laptop transcript. Only on the seeding turn (while
-  // pendingSeed is set + no turns yet) — afterwards it resumes by session id.
-  const isPortSeed = Boolean(session.pendingSeed) && session.turns.length === 0;
-  const resumeFields = isPortSeed
+  // Ported session: re-send the resume fields on EVERY turn, not just the seed.
+  // The runtime's transcript install is keyed to the cwd it lands in (Claude
+  // scopes a conversation by its project-slug = realpath(workdir)). That cwd can
+  // legitimately change between turns — e.g. the seed turn's clone failed and
+  // fell back to the bare session dir, but a later turn's clone succeeds and
+  // lands in the repo subdir. A different cwd → different slug → `claude
+  // --resume <id>` can't find the transcript ("No conversation found").
+  // Re-sending makes the runtime re-place the .jsonl at the current cwd before
+  // resuming. Idempotent: the install dedupes when the transcript is already
+  // there, and branch/clone/bundle each have their own on-disk markers.
+  const resumeFields = session.resumeTranscriptKey
     ? {
         branch: session.branch,
         resumeTranscriptKey: session.resumeTranscriptKey,
         resumeSessionId: session.claudeSessionId,
+        // Flexible git handoff: how the laptop shipped its code (pushed branch,
+        // git bundle on a read-only origin, whole-repo bundle, or none) + the
+        // explicit clone URL.
+        gitMode: session.gitMode,
+        cloneUrl: session.cloneUrl,
+        resumeBundleKey: session.resumeBundleKey,
       }
     : {};
 
