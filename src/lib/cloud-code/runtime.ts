@@ -280,6 +280,11 @@ export async function prepareCodingSession(params: {
   tenantId?: string;
   configVersion?: string;
   region?: string;
+  // Short-lived GitHub App clone token. A terminal-only session readies its VM
+  // only through prepare (no chat turn), so the runtime must configure the git
+  // credential helper here for private-repo git/gh in Terminal to work.
+  githubToken?: string;
+  githubAppConnected?: boolean;
 }): Promise<{ resumeReady: boolean }> {
   if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
   const region = params.region || REGION;
@@ -291,6 +296,8 @@ export async function prepareCodingSession(params: {
   if (params.userId) payload.user_id = params.userId;
   if (params.tenantId) payload.tenant_id = params.tenantId;
   if (params.configVersion) payload.config_version = params.configVersion;
+  if (params.githubToken) payload.github_token = params.githubToken;
+  if (params.githubAppConnected) payload.github_app_connected = true;
 
   const command = new InvokeAgentRuntimeCommand({
     agentRuntimeArn: CODING_RUNTIME_ARN,

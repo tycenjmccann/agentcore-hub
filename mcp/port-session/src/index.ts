@@ -31,6 +31,7 @@ import { readState, prepareGitHandoff, pullBranch } from "./git.js";
 import { newestTranscript, sessionIdForTranscript, installLocalTranscript } from "./transcript.js";
 import { detectArtifacts, uploadArtifact, stageArtifactLocally, downloadArtifact, ensureCloudCodeExcluded, fmtBytes } from "./artifacts.js";
 import { gatherBundle, type Cli } from "./config.js";
+import { ccFetch } from "./auth.js";
 
 const CLOUD_CODE_URL = (process.env.CLOUD_CODE_URL || "").replace(/\/$/, "");
 
@@ -233,10 +234,9 @@ async function runPull(rawArgs: unknown) {
   const sid = m ? m[0] : args.session.trim();
 
   // 1. checkpoint: cloud uploads the grown transcript + returns a presigned GET.
-  const res = await fetch(`${CLOUD_CODE_URL}/api/cloud-code/sessions/${sid}/checkpoint`, {
+  const res = await ccFetch(CLOUD_CODE_URL, `/api/cloud-code/sessions/${sid}/checkpoint`, {
     method: "POST",
-    signal: AbortSignal.timeout(110_000),
-  });
+  }, 110_000);
   const data = (await res.json().catch(() => ({}))) as {
     transcriptUrl?: string;
     claudeSessionId?: string;
@@ -338,11 +338,10 @@ async function runSync(rawArgs: unknown) {
   form.set("bundle", new Blob([new Uint8Array(g.zip)], { type: "application/zip" }), `${cli}-config.zip`);
   form.set("label", `${cli} config sync`);
   form.set("scope", cli);
-  const res = await fetch(`${CLOUD_CODE_URL}/api/cloud-code/config`, {
+  const res = await ccFetch(CLOUD_CODE_URL, `/api/cloud-code/config`, {
     method: "POST",
     body: form,
-    signal: AbortSignal.timeout(60_000),
-  });
+  }, 60_000);
   const data = (await res.json().catch(() => ({}))) as {
     version?: { version?: string; fileCount?: number };
     currentVersion?: string;
@@ -448,7 +447,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     // 3. create the cloud session + presigned upload URLs (transcript always;
     //    bundle only when we produced one).
-    const res = await fetch(`${CLOUD_CODE_URL}/api/cloud-code/sessions/port`, {
+    const res = await ccFetch(CLOUD_CODE_URL, `/api/cloud-code/sessions/port`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -534,10 +533,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     let warmed = false;
     if (sid) {
       try {
-        const w = await fetch(`${CLOUD_CODE_URL}/api/cloud-code/sessions/${sid}/warm`, {
+        const w = await ccFetch(CLOUD_CODE_URL, `/api/cloud-code/sessions/${sid}/warm`, {
           method: "POST",
-          signal: AbortSignal.timeout(60_000),
-        });
+        }, 60_000);
         warmed = w.ok && Boolean((await w.json().catch(() => ({}))).warmed);
       } catch {
         /* warming is an optimization; the first turn clones on demand */

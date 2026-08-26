@@ -1646,6 +1646,12 @@ async def invocations(request: Request):
     # success/failure but always 200 so the /shell best-effort caller never errors
     # (a stale-mount VM will be replaced; the next turn retries).
     if prepare:
+        # A terminal-only session reaches the VM ONLY through prepare (no chat turn
+        # runs _configure_git), so install/refresh/clear the GitHub credential
+        # helper here too — otherwise Terminal `git`/`gh` on a private repo has no
+        # App token, or keeps a prior turn's stale/expired one. Passing None (user
+        # disconnected / mint failed) scrubs it.
+        _configure_git(github_token, app_connected=github_app_connected)
         # resume_ready: a restored (or still-live) /tmp hint means shell-init will
         # auto-resume this conversation when the PTY opens — the /shell route
         # relays it so the browser knows whether to fire its first-prompt seed.

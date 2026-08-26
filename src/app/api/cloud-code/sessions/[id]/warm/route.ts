@@ -25,7 +25,7 @@ export async function POST(
   if (!codingRuntimeConfigured()) {
     return NextResponse.json({ error: "Coding runtime not configured" }, { status: 503 });
   }
-  const { tenantId } = getIdentity(request);
+  const { userId: requesterId, tenantId } = getIdentity(request);
   const session = await getOwnedSession(params.id, tenantId);
   if (!session) {
     return NextResponse.json({ error: "Session not found" }, { status: 404 });
@@ -39,10 +39,12 @@ export async function POST(
   const userId = session.userId || DEFAULT_USER_ID;
   const sessionTenant = session.tenantId || DEFAULT_TENANT_ID;
   const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
-  // Warming clones the repo, so it needs the same scoped clone token a turn gets.
+  // Warming clones the repo, so it needs the same scoped clone token a turn gets
+  // — bound to the verified requester (tenant sessions are shared; minting off
+  // the creator would hand a coworker the creator's repo access).
   const { token: githubToken, connected: githubAppConnected } = await cloneTokenForUser(
-    sessionTenant,
-    userId,
+    tenantId,
+    requesterId,
     session.repo ?? session.cloneUrl
   );
   try {

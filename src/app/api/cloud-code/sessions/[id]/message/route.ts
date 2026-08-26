@@ -63,7 +63,7 @@ export async function POST(
     );
   }
 
-  const { tenantId } = getIdentity(request);
+  const { userId: requesterId, tenantId } = getIdentity(request);
   const session = await getOwnedSession(params.id, tenantId);
   if (!session) {
     return NextResponse.json({ error: "Session not found" }, { status: 404 });
@@ -115,13 +115,17 @@ export async function POST(
   const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
   const region = request.nextUrl.searchParams.get("region") || undefined;
 
-  // Mint a short-lived GitHub App clone token for the session owner, scoped to
-  // this repo. Absent when the App isn't set up or the owner hasn't connected —
-  // the runtime then falls back to GITHUB_PAT. `connected` tells the runtime NOT
-  // to fall back when a connected owner's scoped mint was denied.
+  // Mint a short-lived GitHub App clone token, scoped to this repo. Bound to the
+  // VERIFIED REQUESTER, never session.userId: tenant sessions are shared
+  // (getOwnedSession only checks the tenant boundary), so minting off the
+  // creator's installation would hand a coworker the creator's repo access. Each
+  // turn clones with the token of whoever actually sent it. Absent when the App
+  // isn't set up or the requester hasn't connected — the runtime then falls back
+  // to GITHUB_PAT. `connected` tells the runtime NOT to fall back when a
+  // connected requester's scoped mint was denied.
   const { token: githubToken, connected: githubAppConnected } = await cloneTokenForUser(
-    sessionTenant,
-    userId,
+    tenantId,
+    requesterId,
     session.repo ?? session.cloneUrl
   );
 
