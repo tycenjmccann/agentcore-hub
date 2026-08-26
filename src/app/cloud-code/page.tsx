@@ -294,10 +294,14 @@ export default function CloudCodePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, liveNonce]);
   // "Busy" = actively streaming OR recovering a dropped turn. Both block a
-  // resend and keep the composer in its working state.
+  // resend and keep the composer in its working state. Stop is only offered
+  // while a LIVE controller exists — during recovery there's no local stream to
+  // abort (runTurn's finally already dropped the ctrl), so rendering Stop then
+  // would be a silent no-op; the composer shows the working state instead.
   const activeSending = active
     ? sendingIds.has(active.sessionId) || recoveringIds.has(active.sessionId)
     : false;
+  const activeStoppable = active ? sendingIds.has(active.sessionId) : false;
   const activeStopping = active ? stoppingIds.has(active.sessionId) : false;
 
   // New turn / streamed text / spinner → follow only while stuck. Switching
@@ -432,8 +436,11 @@ export default function CloudCodePage() {
     // agent) once it persists, which is how recovery knows the reply is ready.
     // Seed from the overlay when one exists (a just-completed reply the selection
     // effect hasn't reconciled yet), else the persisted turns — i.e. exactly what
-    // displayTurns renders.
+    // displayTurns renders. Client-only turns (a prior pre-run failure's ⚠
+    // bubble — never persisted server-side) are EXCLUDED, or recovery would wait
+    // for a server count that can never exist and block the session for 10min.
     const baseTurns = liveTurns.current.get(sid) ?? active.turns;
+<<<<<<< HEAD
     const baseCount = baseTurns.length;
     // Consumed by this turn. Blob preview URLs are NOT revoked here — they back
     // the optimistic turn's thumbnails until a reload swaps in presigned URLs;
@@ -442,6 +449,9 @@ export default function CloudCodePage() {
     const optimisticAttach = turnAttachments.length
       ? turnAttachments.map((a) => ({ path: a.path, name: a.name, contentType: a.contentType, url: a.previewUrl }))
       : undefined;
+=======
+    const baseCount = baseTurns.filter((t) => !t.local).length;
+>>>>>>> origin/feat/cloud-code-stream-isolation
     // Optimistic user message → into the overlay for THIS session only.
     const userTurn: CloudCodeTurn = {
       role: "user",
@@ -575,7 +585,16 @@ export default function CloudCodePage() {
           // session's overlay so it appears in the right chat — nothing is
           // persisted server-side, so this overlay is the only record of it.
           flash((err as Error).message);
-          patchLive(sid, (turns) => [...turns, { role: "agent", text: `⚠ ${(err as Error).message}`, at: new Date().toISOString() }]);
+          // `local: true` — these turns exist only client-side (the route
+          // failed before persisting anything), so a later turn's recovery
+          // threshold must not count them (see baseCount). The optimistic user
+          // turn from this failed attempt is retro-marked too.
+          patchLive(sid, (turns) => {
+            const next = turns.slice();
+            const last = next[next.length - 1];
+            if (last?.role === "user") next[next.length - 1] = { ...last, local: true };
+            return [...next, { role: "agent", text: `⚠ ${(err as Error).message}`, at: new Date().toISOString(), local: true }];
+          });
           liveError.current.add(sid);
           if (activeIdRef.current === sid) {
             // Still on this session — fold the overlay into `active` and clear it.
@@ -1049,7 +1068,7 @@ export default function CloudCodePage() {
                   data-testid="cc-message-input"
                   className="flex-1 bg-transparent resize-none outline-none text-sm leading-6 py-1.5 max-h-[152px] placeholder:text-[var(--color-text-muted)]"
                 />
-                {activeSending ? (
+                {activeStoppable ? (
                   <button
                     onClick={() => stopTurn()}
                     disabled={activeStopping}
@@ -1060,7 +1079,21 @@ export default function CloudCodePage() {
                   >
                     {activeStopping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-3.5 h-3.5" fill="currentColor" />}
                   </button>
+<<<<<<< HEAD
                 ) : (draft.trim() || attachments.length > 0) && !voiceActive ? (
+=======
+                ) : activeSending ? (
+                  // Recovering a dropped turn — nothing local to stop; show the
+                  // reconnect state instead of an inert Stop button.
+                  <div
+                    className="w-8 h-8 mb-0.5 rounded-lg flex items-center justify-center flex-shrink-0 text-[var(--color-text-muted)]"
+                    title="Reconnecting — waiting for the reply to land"
+                    aria-label="Reconnecting"
+                  >
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  </div>
+                ) : draft.trim() && !voiceActive ? (
+>>>>>>> origin/feat/cloud-code-stream-isolation
                   <button
                     onClick={send}
                     data-testid="cc-send"
