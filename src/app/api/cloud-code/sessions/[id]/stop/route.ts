@@ -58,6 +58,19 @@ export async function POST(
   // seed as the visible message.
   const prompt: string = (body.displayPrompt || body.prompt || "").trim();
   const partial: string = (body.partial || "").trim();
+  // The stopped turn's attachments — the killed /message request never persisted
+  // them, so without this a stopped attachment turn loses its files on reload.
+  // Same sanitation as the message route (untrusted paths → S3-key material).
+  const attachments: { path: string; name: string; contentType?: string }[] = Array.isArray(body.attachments)
+    ? body.attachments
+        .map((a: { path?: unknown; name?: unknown; contentType?: unknown }) => ({
+          path: String(a?.path || "").replace(/^\/+/, ""),
+          name: String(a?.name || "").slice(0, 256),
+          contentType: typeof a?.contentType === "string" ? a.contentType : undefined,
+        }))
+        .filter((a: { path: string }) => a.path && !a.path.includes("..") && a.path.length < 1024)
+        .slice(0, 20)
+    : [];
 
   try {
     await stopCodingSession({ sessionId: session.sessionId, region });
@@ -85,9 +98,16 @@ export async function POST(
       const now = new Date().toISOString();
       // Only append the user message if it isn't already the last turn (the
       // /message route may have written it in); always append the partial + marker.
+      // An attachment-only turn has an empty prompt but must still persist its
+      // user turn (the attachments ARE the message).
       const last = fresh.turns[fresh.turns.length - 1];
-      if (prompt && !(last?.role === "user" && last.text === prompt)) {
-        fresh.turns.push({ role: "user", text: prompt, at: now });
+      if ((prompt || attachments.length) && !(last?.role === "user" && last.text === prompt)) {
+        fresh.turns.push({
+          role: "user",
+          text: prompt,
+          at: now,
+          ...(attachments.length ? { attachments } : {}),
+        });
       }
       const agentText = partial ? `${partial}\n\n${STOP_NOTE}` : STOP_NOTE;
       const agentTurn: CloudCodeTurn = { role: "agent", text: agentText, at: now };

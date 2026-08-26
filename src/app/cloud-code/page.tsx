@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown, Github, Square, FileBox } from "lucide-react";
+import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown, Github, Square, FileBox, Paperclip, X } from "lucide-react";
 import dynamic from "next/dynamic";
 import { sseData } from "@/lib/sse";
 import { MarkdownRenderer } from "@/components/workflow/MarkdownRenderer";
@@ -11,6 +11,7 @@ import { CliBadge, CliMark, CLI_BRAND } from "@/components/cloud-code/CliBrand";
 const ShellTerminal = dynamic(() => import("@/components/cloud-code/ShellTerminal"), { ssr: false });
 const ArtifactsPanel = dynamic(() => import("@/components/cloud-code/ArtifactsPanel"), { ssr: false });
 const VoiceButton = dynamic(() => import("@/components/cloud-code/VoiceButton"), { ssr: false });
+const Lightbox = dynamic(() => import("@/components/cloud-code/Lightbox"), { ssr: false });
 import { PullCommandButton } from "@/components/cloud-code/PullCommandButton";
 import type {
   CloudCodeSession,
@@ -30,6 +31,10 @@ interface LiveTurnCtrl {
   prompt: string;        // handed to /stop so a killed turn still persists
   displayPrompt?: string;
   acc: string;           // accumulated agent text so far (for /stop)
+  // The turn's attachment metadata — /stop persists it with the interrupted
+  // user turn (the killed /message request never got to), so stopping a turn
+  // with attachments doesn't erase them from history on reload.
+  attachments?: { path: string; name: string; contentType?: string }[];
   abort: AbortController;
   stopped: boolean;      // Stop pressed → skip the drop-recovery path
   streamStarted: boolean; // SSE body began → a drop is recoverable, not a pre-run fail
@@ -103,6 +108,14 @@ export default function CloudCodePage() {
   const streamEnd = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Chat attachments: files uploaded in the composer, awaiting the next send.
+  // path = artifact-prefix path passed to the turn; previewUrl = local object URL
+  // for an instant thumbnail before the server presigns one.
+  const [attachments, setAttachments] = useState<{ path: string; name: string; contentType?: string; previewUrl?: string }[]>([]);
+  const [attaching, setAttaching] = useState(false);
+  const attachInput = useRef<HTMLInputElement>(null);
+  // Tapped chat image → full-screen lightbox (pinch-zoom).
+  const [lightbox, setLightbox] = useState<{ url: string; name: string } | null>(null);
   // True while the mic is recording/locked, so the composer keeps the mic mounted
   // even once dictated text fills the draft (otherwise send would swap in).
   const [voiceActive, setVoiceActive] = useState(false);
@@ -203,6 +216,13 @@ export default function CloudCodePage() {
   // own defaultView (set at port time) so a sidebar tap reopens it the right
   // way; a deep-link &view= is a one-time override that wins if present.
   useEffect(() => {
+    // Pending attachments were uploaded to the PREVIOUS session's artifact
+    // prefix — they can't ride a message in another session. Drop them (and
+    // free their blob preview URLs).
+    setAttachments((xs) => {
+      for (const a of xs) if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+      return [];
+    });
     if (!selectedId) {
       setActive(null);
       return;
@@ -325,8 +345,65 @@ export default function CloudCodePage() {
     setSelectedId(session.sessionId);
   };
 
+  // Upload picked files to the session's artifact prefix (presigned PUT), then
+  // stage them as pending attachments for the next send. Bound to the session
+  // that initiated the pick: if the user switches sessions while a PUT is in
+  // flight, the completion is DISCARDED (its S3 path lives under the old
+  // session's prefix — staging it into the new session's composer would send a
+  // path the runtime can't resolve).
+  const uploadAttachments = async (files: FileList | null) => {
+    if (!active || !files || files.length === 0) return;
+    const uploadSid = active.sessionId;
+    setAttaching(true);
+    try {
+      for (const file of Array.from(files)) {
+        const presign = await fetch(`/api/cloud-code/sessions/${uploadSid}/artifacts`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: file.name }),
+        });
+        const d = await presign.json();
+        if (!presign.ok) throw new Error(d.error || `presign failed (${presign.status})`);
+        const put = await fetch(d.uploadUrl, {
+          method: "PUT",
+          headers: { "Content-Type": d.contentType || file.type || "application/octet-stream" },
+          body: file,
+        });
+        if (!put.ok) throw new Error(`upload failed (${put.status})`);
+        if (activeIdRef.current !== uploadSid) continue; // switched away — drop it
+        const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
+        setAttachments((xs) => [...xs, { path: d.path, name: file.name, contentType: d.contentType || file.type, previewUrl }]);
+      }
+    } catch (e) {
+      flash((e as Error).message);
+    } finally {
+      setAttaching(false);
+      if (attachInput.current) attachInput.current.value = "";
+    }
+  };
+
+  // Revoke a pending attachment's blob preview URL when it leaves the composer
+  // (removed, consumed by a send, or dropped on session switch) — otherwise
+  // every uploaded image leaks its blob until a full page reload. Persisted
+  // chat turns use presigned S3 URLs, never these blob URLs.
+  const revokePreviews = useCallback(
+    (xs: { previewUrl?: string }[]) => {
+      for (const a of xs) if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+    },
+    []
+  );
+  const removeAttachment = (path: string) => {
+    setAttachments((xs) => {
+      revokePreviews(xs.filter((x) => x.path === path));
+      return xs.filter((x) => x.path !== path);
+    });
+  };
+
   const send = async () => {
-    if (!active || !draft.trim() || activeSending || activeStopping) return;
+    // `attaching` blocks the send: a mid-upload Enter would fire the message
+    // without the in-flight file, which would then ride the NEXT message.
+    if (!active || activeSending || activeStopping || attaching) return;
+    if (!draft.trim() && attachments.length === 0) return;
     const prompt = draft.trim();
     setDraft("");
     await runTurn(prompt);
@@ -345,13 +422,16 @@ export default function CloudCodePage() {
   // `displayAs` overrides the user-bubble text — used for the ported seed, whose
   // real prompt is a huge transcript we don't want to render in the chat.
   const runTurn = async (prompt: string, displayAs?: string) => {
-    if (!active || !prompt) return;
+    if (!active) return;
     const sid = active.sessionId; // bind the turn to THIS session
     // One turn per session (not one globally) — a turn already running in THIS
     // session blocks a resend, but other sessions are free to run concurrently.
     // A session still recovering a dropped turn also counts as busy: resending
     // now would clobber the pending overlay and confuse the armed recovery.
     if (sendingIds.has(sid) || recoveringIds.has(sid)) return;
+    // Snapshot + clear pending attachments for this turn.
+    const turnAttachments = attachments;
+    if (!prompt && turnAttachments.length === 0) return;
     // Turn count before this turn — the server will hold baseCount+2 (user +
     // agent) once it persists, which is how recovery knows the reply is ready.
     // Seed from the overlay when one exists (a just-completed reply the selection
@@ -361,8 +441,20 @@ export default function CloudCodePage() {
     // for a server count that can never exist and block the session for 10min.
     const baseTurns = liveTurns.current.get(sid) ?? active.turns;
     const baseCount = baseTurns.filter((t) => !t.local).length;
+    // Consumed by this turn. Blob preview URLs are NOT revoked here — they back
+    // the optimistic turn's thumbnails until a reload swaps in presigned URLs;
+    // a displayed blob isn't a leak. Removal/switch paths do revoke.
+    setAttachments([]);
+    const optimisticAttach = turnAttachments.length
+      ? turnAttachments.map((a) => ({ path: a.path, name: a.name, contentType: a.contentType, url: a.previewUrl }))
+      : undefined;
     // Optimistic user message → into the overlay for THIS session only.
-    const userTurn: CloudCodeTurn = { role: "user", text: displayAs ?? prompt, at: new Date().toISOString() };
+    const userTurn: CloudCodeTurn = {
+      role: "user",
+      text: displayAs ?? prompt,
+      at: new Date().toISOString(),
+      ...(optimisticAttach ? { attachments: optimisticAttach } : {}),
+    };
     liveTurns.current.set(sid, [...baseTurns, userTurn]);
     bumpLive();
     const abort = new AbortController();
@@ -371,6 +463,9 @@ export default function CloudCodePage() {
       prompt,
       displayPrompt: displayAs,
       acc: "",
+      attachments: turnAttachments.length
+        ? turnAttachments.map((a) => ({ path: a.path, name: a.name, contentType: a.contentType }))
+        : undefined,
       abort,
       stopped: false,
       streamStarted: false,
@@ -382,7 +477,11 @@ export default function CloudCodePage() {
       const res = await fetch(`/api/cloud-code/sessions/${sid}/message?stream=1`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(displayAs ? { prompt, displayPrompt: displayAs } : { prompt }),
+        body: JSON.stringify({
+          prompt,
+          ...(displayAs ? { displayPrompt: displayAs } : {}),
+          ...(turnAttachments.length ? { attachments: turnAttachments.map((a) => a.path) } : {}),
+        }),
         signal: abort.signal,
       });
 
@@ -522,12 +621,12 @@ export default function CloudCodePage() {
     const ctrl = liveCtrl.current.get(target);
     if (!ctrl || !sendingIds.has(target) || stoppingIds.has(target)) return;
     setStoppingFor(target, true);
-    const { prompt, displayPrompt, acc } = ctrl;
+    const { prompt, displayPrompt, acc, attachments: turnAttach } = ctrl;
     try {
       const res = await fetch(`/api/cloud-code/sessions/${target}/stop`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, displayPrompt, partial: acc }),
+        body: JSON.stringify({ prompt, displayPrompt, partial: acc, attachments: turnAttach }),
       }).catch(() => null);
       // The endpoint returns 200 even on { stopped: false, error }. ONLY abort
       // the local stream when the stop actually succeeded — otherwise the turn
@@ -840,8 +939,26 @@ export default function CloudCodePage() {
                 t.role === "user" ? (
                   // User turns keep a bubble (right-aligned) — the visual anchor
                   // for "what I asked". Capped width so long prompts wrap nicely.
-                  <div key={i} className="self-end max-w-[85%] md:max-w-[75%] bg-brand-600 text-white px-3.5 py-2 rounded-2xl rounded-br-sm text-sm whitespace-pre-wrap break-words">
-                    {t.text}
+                  <div key={i} className="self-end max-w-[85%] md:max-w-[75%] flex flex-col items-end gap-1.5">
+                    {t.attachments && t.attachments.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5 justify-end">
+                        {t.attachments.map((a, j) =>
+                          a.contentType?.startsWith("image/") && a.url ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img key={j} src={a.url} alt={a.name} onClick={() => setLightbox({ url: a.url!, name: a.name })} className="rounded-xl max-h-44 max-w-[200px] object-cover border border-[var(--color-border)] cursor-zoom-in" />
+                          ) : (
+                            <span key={j} className="flex items-center gap-1 text-[12px] px-2.5 py-1.5 rounded-xl bg-brand-600/20 text-brand-200">
+                              <Paperclip className="w-3 h-3" /> <span className="max-w-[160px] truncate">{a.name}</span>
+                            </span>
+                          )
+                        )}
+                      </div>
+                    )}
+                    {t.text && (
+                      <div className="bg-brand-600 text-white px-3.5 py-2 rounded-2xl rounded-br-sm text-sm whitespace-pre-wrap break-words">
+                        {t.text}
+                      </div>
+                    )}
                   </div>
                 ) : (
                   // Agent turns: no bubble — full content width (esp. on mobile),
@@ -879,9 +996,52 @@ export default function CloudCodePage() {
 
             {view === "chat" && (
             <div className="flex-shrink-0 px-3 md:px-5 py-3 md:py-3.5 border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
+              {/* Pending attachments (uploaded, awaiting send) */}
+              {attachments.length > 0 && (
+                <div className="flex flex-wrap gap-2 mb-2">
+                  {attachments.map((a) =>
+                    a.previewUrl ? (
+                      <div key={a.path} className="relative">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={a.previewUrl} alt={a.name} className="w-16 h-16 rounded-xl object-cover border border-[var(--color-border)]" />
+                        <button onClick={() => removeAttachment(a.path)} className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-surface-1 border border-[var(--color-border)] flex items-center justify-center" aria-label={`Remove ${a.name}`}>
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ) : (
+                      <span key={a.path} className="flex items-center gap-1 text-[12px] pl-2 pr-1 py-1 rounded-full bg-[var(--color-bg-tertiary)] border border-[var(--color-border)]">
+                        <Paperclip className="w-3 h-3" /> <span className="max-w-[140px] truncate">{a.name}</span>
+                        <button onClick={() => removeAttachment(a.path)} className="opacity-60 hover:opacity-100" aria-label={`Remove ${a.name}`}>
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </span>
+                    )
+                  )}
+                </div>
+              )}
               {/* items-end keeps the send button pinned to the last line as the
                   box grows; the textarea's own padding centers a single line. */}
-              <div className="flex items-end gap-2 bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] rounded-2xl pl-3.5 pr-2 py-1.5 focus-within:border-brand-500/50 transition-colors">
+              <div className="flex items-end gap-2">
+                <input
+                  ref={attachInput}
+                  type="file"
+                  multiple
+                  accept="image/*,.pdf,.txt,.md,.csv,.json"
+                  className="hidden"
+                  onChange={(e) => uploadAttachments(e.target.files)}
+                />
+                {/* Attach (+) — pick image/file; uploads to the session's artifact
+                    prefix then rides along with the next message. */}
+                <button
+                  onClick={() => attachInput.current?.click()}
+                  disabled={attaching || activeSending}
+                  data-testid="cc-attach"
+                  className="w-9 h-9 mb-0.5 rounded-full flex items-center justify-center flex-shrink-0 bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] hover:bg-[var(--color-bg-secondary)] transition-colors disabled:opacity-40"
+                  aria-label="Attach a file"
+                >
+                  <Plus className={`w-5 h-5 ${attaching ? "animate-pulse" : ""}`} strokeWidth={2.4} />
+                </button>
+              <div className="flex-1 flex items-end gap-2 bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] rounded-2xl pl-3.5 pr-2 py-1.5 focus-within:border-brand-500/50 transition-colors">
                 <textarea
                   ref={inputRef}
                   value={draft}
@@ -925,10 +1085,9 @@ export default function CloudCodePage() {
                   >
                     <Loader2 className="w-4 h-4 animate-spin" />
                   </div>
-                ) : draft.trim() && !voiceActive ? (
+                ) : (draft.trim() || attachments.length > 0) && !voiceActive ? (
                   <button
                     onClick={send}
-                    disabled={!draft.trim()}
                     data-testid="cc-send"
                     className="w-8 h-8 mb-0.5 rounded-lg bg-brand-600 text-white flex items-center justify-center hover:bg-brand-500 transition-colors disabled:opacity-40 flex-shrink-0"
                     aria-label="Send"
@@ -945,6 +1104,7 @@ export default function CloudCodePage() {
                   />
                 )}
               </div>
+              </div>
             </div>
             )}
           </>
@@ -953,6 +1113,9 @@ export default function CloudCodePage() {
 
       {showNew && <NewSessionModal onClose={() => setShowNew(false)} onCreate={createSession} />}
       {showConfig && <ConfigModal onClose={() => setShowConfig(false)} onToast={flash} />}
+      {lightbox && (
+        <Lightbox src={lightbox.url} alt={lightbox.name} downloadName={lightbox.name} onClose={() => setLightbox(null)} />
+      )}
 
       {toast && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg bg-red-600 text-white text-xs font-medium shadow-lg z-50">

@@ -16,6 +16,11 @@ export interface CloudCodeTurn {
   role: "user" | "agent";
   text: string;
   at: string; // ISO timestamp
+  // Files the user attached to this message (composer uploads). `path` is
+  // relative to the session's artifact prefix; `url` is a transient presigned
+  // GET added at read time (never persisted) so the chat renders image
+  // attachments as inline thumbnails, others as a chip.
+  attachments?: { path: string; name: string; contentType?: string; url?: string }[];
   // Client-only turn that was never persisted server-side (a pre-run failure's
   // ⚠ bubble + its user turn). Excluded from recovery's turn-count threshold.
   local?: boolean;
