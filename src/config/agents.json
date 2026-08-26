@@ -1672,6 +1672,36 @@
       "skills": [],
       "blueprints": [],
       "workflowDefIds": []
+    },
+    {
+      "agentId": "agentcore_hub_builder",
+      "displayName": "Builder",
+      "description": "Meta-agent harness that builds and modifies fleet agents (prompts, blueprints, deploys).",
+      "phase": "platform",
+      "type": "harness",
+      "model": "Claude Fable 5",
+      "evaluationsEnabled": true,
+      "evalConfigName": "eval_agentcore_hub_builder",
+      "runtimeArn": null,
+      "tools": [],
+      "skills": [],
+      "blueprints": [],
+      "workflowDefIds": []
+    },
+    {
+      "agentId": "agentcore_hub_routine_builder",
+      "displayName": "Routine Builder",
+      "description": "Harness that authors scheduled routines and connector-backed workflows.",
+      "phase": "platform",
+      "type": "harness",
+      "model": "Claude Fable 5",
+      "evaluationsEnabled": true,
+      "evalConfigName": "eval_agentcore_hub_routine_builder",
+      "runtimeArn": null,
+      "tools": [],
+      "skills": [],
+      "blueprints": [],
+      "workflowDefIds": []
     }
   ],
   "defaults": {
