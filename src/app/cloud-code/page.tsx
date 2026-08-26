@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, TerminalSquare, Settings, Upload, Check, ArrowDown, Github, Square, FileBox } from "lucide-react";
 import dynamic from "next/dynamic";
 import { sseData } from "@/lib/sse";
@@ -16,8 +16,24 @@ import type {
   CloudCodeSession,
   CloudCodeSessionSummary,
   CloudCodeCli,
+  CloudCodeTurn,
   SessionWarmth,
 } from "@/lib/cloud-code/types";
+
+// One in-flight turn per session. The chat used to hold a single `sending`/
+// abort/inflight set, so a turn's streamed deltas were written to whatever
+// session was on screen — switch chats mid-stream and the other reply bled into
+// the wrong window. Now every turn-scoped value is keyed by sessionId: sessions
+// stream independently and you can fire a new turn in one while another runs.
+interface LiveTurnCtrl {
+  base: number;          // turn count before this turn — recovery's ready threshold
+  prompt: string;        // handed to /stop so a killed turn still persists
+  displayPrompt?: string;
+  acc: string;           // accumulated agent text so far (for /stop)
+  abort: AbortController;
+  stopped: boolean;      // Stop pressed → skip the drop-recovery path
+  streamStarted: boolean; // SSE body began → a drop is recoverable, not a pre-run fail
+}
 
 const WARMTH_DOT: Record<SessionWarmth, string> = {
   warm: "bg-green-400 shadow-[0_0_0_3px_rgba(34,197,94,0.15)]",
@@ -30,7 +46,55 @@ export default function CloudCodePage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [active, setActive] = useState<CloudCodeSession | null>(null);
   const [draft, setDraft] = useState("");
-  const [sending, setSending] = useState(false);
+  // Sessions with a turn currently running (drives per-session composer/Stop/
+  // typing UI + the "don't double-fire" guard). A Set so many sessions can run
+  // at once; state (not a ref) so the UI re-renders as turns start/finish.
+  const [sendingIds, setSendingIds] = useState<Set<string>>(() => new Set());
+  const [stoppingIds, setStoppingIds] = useState<Set<string>>(() => new Set());
+  // Per-session in-flight turn control (abort handle, stop flag, partial text).
+  // Keyed by sessionId so a turn is never confused with another session's.
+  const liveCtrl = useRef<Map<string, LiveTurnCtrl>>(new Map());
+  // Per-session live/optimistic turns while a turn streams. The render overlays
+  // the SELECTED session's entry onto `active`; deltas only ever mutate their
+  // own session's array, so switching chats can't cross streams. Bumping
+  // liveNonce forces a re-render when a map entry mutates (refs don't trigger
+  // React on their own).
+  const liveTurns = useRef<Map<string, CloudCodeTurn[]>>(new Map());
+  const [liveNonce, setLiveNonce] = useState(0);
+  const bumpLive = useCallback(() => setLiveNonce((n) => n + 1), []);
+  // Sessions whose live overlay holds an error the server WON'T have: an
+  // in-stream `error` frame appends "⚠ …" to the partial agent text client-side,
+  // but the route persists only the partial (no marker), so overlay and server
+  // can end up the SAME length. Length-based reconciliation would then drop the
+  // ⚠ on switch-back; this set makes the selection effect prefer the overlay.
+  const liveError = useRef<Set<string>>(new Set());
+  // Sessions whose stream dropped and are polling for the persisted reply. Kept
+  // separate from sendingIds because the turn's `finally` clears sending, but the
+  // session must STAY busy (block a resend, hold its overlay) until recovery
+  // resolves — else a resend clobbers the pending overlay and the still-armed
+  // recovery later deletes the resend's overlay too.
+  const [recoveringIds, setRecoveringIds] = useState<Set<string>>(() => new Set());
+  const setSendingFor = useCallback((sid: string, on: boolean) => {
+    setSendingIds((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(sid); else next.delete(sid);
+      return next;
+    });
+  }, []);
+  const setStoppingFor = useCallback((sid: string, on: boolean) => {
+    setStoppingIds((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(sid); else next.delete(sid);
+      return next;
+    });
+  }, []);
+  const setRecoveringFor = useCallback((sid: string, on: boolean) => {
+    setRecoveringIds((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(sid); else next.delete(sid);
+      return next;
+    });
+  }, []);
   const [showNew, setShowNew] = useState(false);
   const [showConfig, setShowConfig] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -39,20 +103,6 @@ export default function CloudCodePage() {
   const streamEnd = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  // The in-flight turn, bound to the session it belongs to. Stop must target THIS
-  // session (not whatever's selected now — the user may have switched sidebars),
-  // and a monotonic `gen` lets a superseded turn's cleanup skip clearing a newer
-  // turn's state. accRef mirrors the streamed text so Stop can persist the partial.
-  const turnRef = useRef<{
-    gen: number;
-    sessionId: string;
-    prompt: string;
-    displayAs?: string;
-    controller: AbortController;
-  } | null>(null);
-  const genRef = useRef(0);
-  const accRef = useRef("");
-  const [stopping, setStopping] = useState(false);
   // True while the mic is recording/locked, so the composer keeps the mic mounted
   // even once dictated text fills the draft (otherwise send would swap in).
   const [voiceActive, setVoiceActive] = useState(false);
@@ -60,12 +110,51 @@ export default function CloudCodePage() {
   // to read, it stops yanking you down and shows a "jump to latest" pill instead.
   const [stuck, setStuck] = useState(true);
 
+  // Set while a turn's stream dropped before its reply was recovered (mobile
+  // background/lock, refresh). The server finishes + persists the turn
+  // regardless; we re-sync from it while the tab is visible until the reply
+  // lands. Bumping recoverNonce (re-)arms the polling effect even when the tab
+  // never lost focus.
+  const pendingRecover = useRef<Map<string, { baseCount: number }>>(new Map());
+  const [recoverNonce, setRecoverNonce] = useState(0);
+
   const fetchSessions = useCallback(async () => {
     const res = await fetch("/api/cloud-code/sessions");
     if (!res.ok) return;
     const data = await res.json();
     setSessions(data.sessions || []);
   }, []);
+
+  // Drop a session's overlay AND its error flag together — the flag must never
+  // outlive the overlay it describes, or it would force-adopt a later turn's.
+  const dropOverlay = useCallback((sid: string) => {
+    liveTurns.current.delete(sid);
+    liveError.current.delete(sid);
+  }, []);
+
+  // Pull the server's authoritative turns for a session and adopt them ONLY once
+  // the agent reply has actually been persisted (server has ≥ baseCount+2 turns,
+  // last is the agent's). Returns whether it adopted — so callers can keep
+  // optimistic turns (incl. the user's message) until the real reply is ready,
+  // instead of clobbering them with a not-yet-written server state.
+  const recoverActiveTurn = useCallback(async (sid: string, baseCount: number): Promise<boolean> => {
+    try {
+      const r = await fetch(`/api/cloud-code/sessions/${sid}`);
+      if (!r.ok) return false;
+      const d = await r.json();
+      const turns = d?.session?.turns;
+      if (!Array.isArray(turns) || turns.length < baseCount + 2) return false;
+      if (turns[turns.length - 1]?.role !== "agent") return false;
+      // Server is now authoritative for this session — drop the live overlay so
+      // the recovered turns (not the stale optimistic ones) render.
+      dropOverlay(sid);
+      bumpLive();
+      setActive((prev) => (prev && prev.sessionId === sid ? d.session : prev));
+      return true;
+    } catch {
+      return false;
+    }
+  }, [bumpLive, dropOverlay]);
 
   useEffect(() => {
     fetchSessions();
@@ -124,11 +213,41 @@ export default function CloudCodePage() {
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
         if (!d) return;
-        setActive(d.session);
-        setView(override ?? d.session.defaultView ?? "chat");
+        const server = d.session as CloudCodeSession;
+        // If a turn is still streaming OR recovering a dropped stream in this
+        // session, its live overlay is the source of truth — don't clobber it
+        // with the (staler) server turns; the stream loop / recovery poll owns
+        // clearing it. If a turn COMPLETED while we were away, its overlay was
+        // kept (persist may still be in flight): adopt whichever has more turns,
+        // then clear it.
+        const overlay = liveTurns.current.get(server.sessionId);
+        const busy = sendingIds.has(server.sessionId) || recoveringIds.has(server.sessionId);
+        if (overlay && !busy) {
+          // Adopt the overlay if it has more turns OR carries an in-stream error
+          // the server never persisted (same length, but the ⚠ marker only lives
+          // in the overlay). Otherwise the server is authoritative.
+          if (overlay.length > server.turns.length || liveError.current.has(server.sessionId)) {
+            server.turns = overlay;
+          }
+          dropOverlay(server.sessionId);
+          bumpLive();
+        }
+        setActive(server);
+        setView(override ?? server.defaultView ?? "chat");
       })
       .catch(() => {});
+    // sendingIds/recoveringIds/bumpLive intentionally omitted — this effect must
+    // run on selection change only, not when a background turn's flags flip.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
+
+  // Live mirror of the on-screen session id, readable inside async turn loops
+  // without the stale `active` closure (a turn started in A must know when the
+  // user has since switched to B — e.g. to not steal focus back to A's input).
+  const activeIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    activeIdRef.current = active?.sessionId ?? null;
+  }, [active?.sessionId]);
 
   // Stick-to-bottom: only follow new content if the user is already near the
   // bottom. Track that on scroll (threshold absorbs sub-pixel rounding).
@@ -144,12 +263,29 @@ export default function CloudCodePage() {
     setStuck(true);
   }, []);
 
+  // Turns to render for the on-screen session: its live overlay while a turn
+  // streams (optimistic user msg + growing agent reply), else the persisted
+  // turns. Keying the overlay by sessionId is what keeps a background session's
+  // stream out of this view. liveNonce forces recompute as the overlay mutates.
+  const displayTurns = useMemo(() => {
+    if (!active) return [];
+    const live = liveTurns.current.get(active.sessionId);
+    return live ?? active.turns;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, liveNonce]);
+  // "Busy" = actively streaming OR recovering a dropped turn. Both block a
+  // resend and keep the composer in its working state.
+  const activeSending = active
+    ? sendingIds.has(active.sessionId) || recoveringIds.has(active.sessionId)
+    : false;
+  const activeStopping = active ? stoppingIds.has(active.sessionId) : false;
+
   // New turn / streamed text / spinner → follow only while stuck. Switching
   // sessions snaps to the bottom instantly (you want the latest, no animation).
-  const lastText = active?.turns[active.turns.length - 1]?.text;
+  const lastText = displayTurns[displayTurns.length - 1]?.text;
   useEffect(() => {
     if (stuck) streamEnd.current?.scrollIntoView({ behavior: "smooth" });
-  }, [active?.turns.length, lastText, sending, stuck]);
+  }, [displayTurns.length, lastText, activeSending, stuck]);
 
   useEffect(() => {
     scrollToLatest("auto");
@@ -186,45 +322,68 @@ export default function CloudCodePage() {
   };
 
   const send = async () => {
-    if (!active || !draft.trim() || sending || stopping) return;
+    if (!active || !draft.trim() || activeSending || activeStopping) return;
     const prompt = draft.trim();
     setDraft("");
     await runTurn(prompt);
   };
 
+  // Mutate a session's live-turn overlay in place, then bump the render nonce.
+  // Only the turn that owns `sid` ever calls this for its own session, so two
+  // concurrent turns never touch each other's array.
+  const patchLive = useCallback((sid: string, fn: (turns: CloudCodeTurn[]) => CloudCodeTurn[]) => {
+    const cur = liveTurns.current.get(sid) ?? [];
+    liveTurns.current.set(sid, fn(cur));
+    bumpLive();
+  }, [bumpLive]);
+
   // The actual turn (shared by manual send + the auto-fired port seed).
   // `displayAs` overrides the user-bubble text — used for the ported seed, whose
   // real prompt is a huge transcript we don't want to render in the chat.
   const runTurn = async (prompt: string, displayAs?: string) => {
-    if (!active || !prompt || sending || stopping) return;
-    setSending(true);
-    accRef.current = "";
-    const gen = ++genRef.current;
-    const sessionId = active.sessionId; // bind the turn to THIS session
-    const controller = new AbortController();
-    turnRef.current = { gen, sessionId, prompt, displayAs, controller };
-    // Optimistic user turn
-    setActive((s) =>
-      s ? { ...s, turns: [...s.turns, { role: "user", text: displayAs ?? prompt, at: new Date().toISOString() }] } : s
-    );
+    if (!active || !prompt) return;
+    const sid = active.sessionId; // bind the turn to THIS session
+    // One turn per session (not one globally) — a turn already running in THIS
+    // session blocks a resend, but other sessions are free to run concurrently.
+    // A session still recovering a dropped turn also counts as busy: resending
+    // now would clobber the pending overlay and confuse the armed recovery.
+    if (sendingIds.has(sid) || recoveringIds.has(sid)) return;
+    // Turn count before this turn — the server will hold baseCount+2 (user +
+    // agent) once it persists, which is how recovery knows the reply is ready.
+    // Seed from the overlay when one exists (a just-completed reply the selection
+    // effect hasn't reconciled yet), else the persisted turns — i.e. exactly what
+    // displayTurns renders.
+    const baseTurns = liveTurns.current.get(sid) ?? active.turns;
+    const baseCount = baseTurns.length;
+    // Optimistic user message → into the overlay for THIS session only.
+    const userTurn: CloudCodeTurn = { role: "user", text: displayAs ?? prompt, at: new Date().toISOString() };
+    liveTurns.current.set(sid, [...baseTurns, userTurn]);
+    bumpLive();
+    const abort = new AbortController();
+    const ctrl: LiveTurnCtrl = {
+      base: baseCount,
+      prompt,
+      displayPrompt: displayAs,
+      acc: "",
+      abort,
+      stopped: false,
+      streamStarted: false,
+    };
+    liveCtrl.current.set(sid, ctrl);
+    setSendingFor(sid, true);
     try {
       // Both CLIs stream (SSE): claude token deltas, codex per-step frames.
-      const canStream = true;
-      const res = await fetch(
-        `/api/cloud-code/sessions/${sessionId}/message${canStream ? "?stream=1" : ""}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(displayAs ? { prompt, displayPrompt: displayAs } : { prompt }),
-          signal: controller.signal,
-        }
-      );
+      const res = await fetch(`/api/cloud-code/sessions/${sid}/message?stream=1`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(displayAs ? { prompt, displayPrompt: displayAs } : { prompt }),
+        signal: abort.signal,
+      });
 
-      if (canStream && res.body && res.headers.get("content-type")?.includes("event-stream")) {
-        // Append a live agent turn and grow it as text frames arrive.
-        setActive((s) =>
-          s ? { ...s, turns: [...s.turns, { role: "agent", text: "", at: new Date().toISOString() }] } : s
-        );
+      if (res.body && res.headers.get("content-type")?.includes("event-stream")) {
+        ctrl.streamStarted = true;
+        // Empty agent turn to grow — appended to THIS session's overlay.
+        patchLive(sid, (turns) => [...turns, { role: "agent", text: "", at: new Date().toISOString() }]);
         let acc = "";
         // sseData handles the byte/frame plumbing; we own the {type:text|done|error} schema.
         for await (const data of sseData(res.body)) {
@@ -232,89 +391,198 @@ export default function CloudCodePage() {
           try { obj = JSON.parse(data); } catch { continue; }
           if (obj.type === "text") acc += obj.text || "";
           else if (obj.type === "done") acc = obj.response || acc;
-          else if (obj.type === "error") acc += `\n⚠ ${obj.error}`;
-          accRef.current = acc; // mirror for Stop → persist partial
-          // Update the last (agent) turn's text in place.
-          setActive((s) => {
-            if (!s) return s;
-            const turns = s.turns.slice();
-            turns[turns.length - 1] = { role: "agent", text: acc, at: turns[turns.length - 1].at };
-            return { ...s, turns };
+          else if (obj.type === "error") { acc += `\n⚠ ${obj.error}`; liveError.current.add(sid); }
+          ctrl.acc = acc; // mirror for Stop → persist partial
+          patchLive(sid, (turns) => {
+            const next = turns.slice();
+            const last = next[next.length - 1];
+            next[next.length - 1] = { role: "agent", text: acc, at: last?.at ?? new Date().toISOString() };
+            return next;
           });
         }
+        // Turn complete. If the user is still on this session, adopt the finished
+        // overlay as its turns and drop the overlay (no flicker — displayTurns
+        // falls back to active.turns). If they've switched away, KEEP the
+        // completed overlay: the server persist runs concurrently with this
+        // completion, so a switch-back fetch could momentarily race ahead of the
+        // write and show the session without its reply. The selection effect
+        // reconciles the overlay against the server and clears it once caught up.
+        const finalTurns = liveTurns.current.get(sid) ?? baseTurns;
+        if (activeIdRef.current === sid) {
+          setActive((s) => (s && s.sessionId === sid ? { ...s, turns: finalTurns } : s));
+          dropOverlay(sid);
+        }
+        bumpLive();
         fetchSessions();
       } else {
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "Turn failed");
-        setActive(data.session);
+        // Buffered fallback. A proxy timeout answers with a PLAINTEXT body, not
+        // JSON — parse defensively so the user sees a readable timeout.
+        const raw = await res.text();
+        let data: { error?: string; session?: CloudCodeSession } = {};
+        try { data = JSON.parse(raw); } catch { /* non-JSON proxy/error body */ }
+        if (!res.ok) {
+          throw new Error(
+            data.error ||
+              (res.status === 502 || res.status === 504
+                ? "The turn ran longer than the gateway allows. It may still be running — reopen the session in a moment to see the reply."
+                : `Turn failed (${res.status})`)
+          );
+        }
+        if (data.session) {
+          const server = data.session;
+          setActive((s) => (s && s.sessionId === sid ? server : s));
+        }
+        dropOverlay(sid);
+        bumpLive();
         fetchSessions();
       }
     } catch (err) {
-      // A user-initiated Stop aborts the fetch; stop() owns the UI update, so
-      // don't render an error bubble for it.
-      if ((err as Error).name !== "AbortError") {
-        flash((err as Error).message);
-        setActive((s) =>
-          s
-            ? {
-                ...s,
-                turns: [
-                  ...s.turns,
-                  { role: "agent", text: `⚠ ${(err as Error).message}`, at: new Date().toISOString() },
-                ],
-              }
-            : s
-        );
+      if (ctrl.stopped) {
+        // Deliberate Stop — NOT a dropped stream. The /stop route killed the
+        // turn AND persisted the interrupted turn server-side; stopTurn() adopts
+        // that authoritative session. Don't run the drop-recovery path.
+      } else if (ctrl.streamStarted) {
+        // The stream dropped after starting — most often a phone backgrounding/
+        // locking mid-turn. The server keeps running the turn and persists the
+        // reply regardless, so don't strand a dead "Network Error" bubble: try to
+        // recover the finished reply now, and if it isn't written yet, arm a
+        // re-sync (recoverNonce) that polls while the tab is visible.
+        const recovered = await recoverActiveTurn(sid, baseCount);
+        if (!recovered) {
+          pendingRecover.current.set(sid, { baseCount });
+          setRecoveringFor(sid, true); // stay busy until the reply lands
+          setRecoverNonce((n) => n + 1);
+          flash("Reconnecting — your reply is still coming.");
+          fetchSessions();
+        }
+      } else {
+        // Turn failed at the transport (no stream to drop). A gateway timeout
+        // (502/504) doesn't stop the server — the turn keeps running and
+        // persists its reply — so try recovery first, exactly like the
+        // stream-drop path, before surfacing an error. A genuine pre-run failure
+        // (config/CLI exit) won't have the extra turns, so recovery no-ops and
+        // we fall through to the visible error.
+        const recovered = await recoverActiveTurn(sid, baseCount);
+        if (recovered) {
+          fetchSessions();
+        } else if (/gateway allows|502|504/.test((err as Error).message)) {
+          pendingRecover.current.set(sid, { baseCount });
+          setRecoveringFor(sid, true);
+          setRecoverNonce((n) => n + 1);
+          flash("Still working — your reply is on its way.");
+          fetchSessions();
+        } else {
+          // Genuine pre-run failure (config / CLI error). Surface it in the
+          // session's overlay so it appears in the right chat — nothing is
+          // persisted server-side, so this overlay is the only record of it.
+          flash((err as Error).message);
+          patchLive(sid, (turns) => [...turns, { role: "agent", text: `⚠ ${(err as Error).message}`, at: new Date().toISOString() }]);
+          liveError.current.add(sid);
+          if (activeIdRef.current === sid) {
+            // Still on this session — fold the overlay into `active` and clear it.
+            const errTurns = liveTurns.current.get(sid);
+            if (errTurns) setActive((s) => (s && s.sessionId === sid ? { ...s, turns: errTurns } : s));
+            dropOverlay(sid);
+            bumpLive();
+          }
+          // Switched away → KEEP the overlay (like the completion path); the
+          // selection effect adopts it on switch-back.
+        }
       }
     } finally {
-      // Only THIS turn's own generation may clear the shared state. A turn that
-      // was Stopped (stop() owns the teardown + persist) or superseded by a newer
-      // turn must not reset `sending`/turnRef out from under the live one.
-      if (genRef.current === gen) {
-        turnRef.current = null;
-        setSending(false);
-        // Re-focus the box so you can keep typing without clicking back in.
-        requestAnimationFrame(() => inputRef.current?.focus());
-      }
+      liveCtrl.current.delete(sid);
+      setSendingFor(sid, false);
+      // Only steal focus back if the user is still looking at this session.
+      if (activeIdRef.current === sid) requestAnimationFrame(() => inputRef.current?.focus());
     }
   };
 
-  // Stop the running turn: abort the client stream, then tell the runtime to tear
-  // down the microVM (kills the in-flight CLI) and persist the interrupted turn so
-  // it survives reload. The server re-warms a fresh VM in the background.
-  const stop = async () => {
-    const turn = turnRef.current;
-    if (!turn || !sending || stopping) return;
-    setStopping(true);
-    // Bump the generation so the aborted runTurn's finally can't clear state, and
-    // no new turn can start with the old turn's identity.
-    genRef.current++;
-    const { sessionId, prompt, displayAs } = turn; // stop the turn's OWN session
-    const partial = accRef.current;
-    turn.controller.abort();
+  // Stop the turn running in `sid` (defaults to the on-screen session): tell the
+  // runtime to tear down the microVM (kills the in-flight CLI) and persist the
+  // interrupted turn so it survives reload. Keyed by session so the Stop button
+  // only ever halts the chat you're looking at, never a background turn.
+  const stopTurn = async (sid?: string) => {
+    const target = sid ?? active?.sessionId;
+    if (!target) return;
+    const ctrl = liveCtrl.current.get(target);
+    if (!ctrl || !sendingIds.has(target) || stoppingIds.has(target)) return;
+    setStoppingFor(target, true);
+    const { prompt, displayPrompt, acc } = ctrl;
     try {
-      const res = await fetch(`/api/cloud-code/sessions/${sessionId}/stop`, {
+      const res = await fetch(`/api/cloud-code/sessions/${target}/stop`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, displayPrompt: displayAs, partial }),
-      });
-      const data = await res.json().catch(() => ({}));
-      // The route returns HTTP 200 even when StopRuntimeSession failed
-      // ({stopped:false, error}); surface that instead of silently going idle.
-      if (!res.ok || data.stopped === false) {
-        flash(data.error || "Couldn't stop the run — it may still be running.");
+        body: JSON.stringify({ prompt, displayPrompt, partial: acc }),
+      }).catch(() => null);
+      // The endpoint returns 200 even on { stopped: false, error }. ONLY abort
+      // the local stream when the stop actually succeeded — otherwise the turn
+      // is still running server-side, so leave it attached for the normal
+      // recovery/error path and surface the failure instead of hiding it.
+      const data = res && res.ok ? await res.json().catch(() => null) : null;
+      if (data?.stopped) {
+        ctrl.stopped = true;
+        if (data.session) {
+          const server = data.session as CloudCodeSession;
+          setActive((s) => (s && s.sessionId === target ? server : s));
+        }
+        // Server is authoritative now — drop the live overlay for this session.
+        dropOverlay(target);
+        bumpLive();
+        // Abort the local stream so runTurn's loop unwinds into the stopped branch.
+        ctrl.abort.abort();
+        fetchSessions();
+      } else {
+        flash(data?.error ? `Couldn't stop: ${data.error}` : "Couldn't stop the turn — still running.");
       }
-      // Only repaint if the user is still viewing the session we stopped.
-      if (data.session && active?.sessionId === sessionId) setActive(data.session);
-      fetchSessions();
-    } catch (err) {
-      flash((err as Error).message);
     } finally {
-      turnRef.current = null;
-      setStopping(false);
-      setSending(false);
+      setStoppingFor(target, false);
     }
   };
+
+  // Re-sync a dropped turn. Two triggers: tab refocus/visibility (mobile reopen)
+  // AND a poll while the tab is already visible — the drop can happen with the
+  // tab in the foreground, so we can't wait on a future focus event. Re-armed by
+  // recoverNonce; gives up after a bounded window so a turn that truly never
+  // persists doesn't poll forever.
+  useEffect(() => {
+    if (pendingRecover.current.size === 0) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = Date.now() + 10 * 60_000; // match the runtime's ~max turn
+
+    const finish = () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", attempt);
+      window.removeEventListener("focus", attempt);
+    };
+
+    async function attempt() {
+      if (stopped || pendingRecover.current.size === 0) return finish();
+      if (document.visibilityState !== "visible") return; // resume on next focus
+      // Poll every session with a dropped turn — each recovers independently.
+      for (const [sid, { baseCount }] of Array.from(pendingRecover.current.entries())) {
+        if (await recoverActiveTurn(sid, baseCount)) {
+          pendingRecover.current.delete(sid);
+          setRecoveringFor(sid, false); // reply landed → session free again
+          fetchSessions();
+        }
+      }
+      if (pendingRecover.current.size === 0) return finish();
+      if (Date.now() > deadline) {
+        for (const sid of Array.from(pendingRecover.current.keys())) setRecoveringFor(sid, false);
+        pendingRecover.current.clear();
+        flash("Couldn't reconnect — reopen the session to see the latest.");
+        return finish();
+      }
+      timer = setTimeout(attempt, 4000);
+    }
+
+    document.addEventListener("visibilitychange", attempt);
+    window.addEventListener("focus", attempt);
+    attempt();
+    return finish;
+  }, [recoverNonce, recoverActiveTurn, fetchSessions, setRecoveringFor]);
 
   const remove = async (id: string) => {
     await fetch(`/api/cloud-code/sessions/${id}`, { method: "DELETE" });
@@ -379,7 +647,13 @@ export default function CloudCodePage() {
               }`}
             >
               <div className="flex items-center gap-2">
-                <span className={`w-2 h-2 rounded-full flex-shrink-0 ${WARMTH_DOT[s.warmth]}`} />
+                {/* A turn running/recovering in this session shows a spinner in
+                    place of the warmth dot — visible even from another chat. */}
+                {sendingIds.has(s.sessionId) || recoveringIds.has(s.sessionId) ? (
+                  <Loader2 className="w-2.5 h-2.5 flex-shrink-0 animate-spin text-brand-400" aria-label="Turn running" />
+                ) : (
+                  <span className={`w-2 h-2 rounded-full flex-shrink-0 ${WARMTH_DOT[s.warmth]}`} />
+                )}
                 {/* Surface this session opens in — terminal vs chat. */}
                 {s.defaultView === "terminal" ? (
                   <TerminalSquare className="w-3.5 h-3.5 flex-shrink-0 text-brand-300" aria-label="Terminal session" />
@@ -542,12 +816,12 @@ export default function CloudCodePage() {
               data-testid="cc-stream"
               className="h-full overflow-y-auto overscroll-contain px-3 md:px-5 py-5 flex flex-col gap-4"
             >
-              {active.turns.length === 0 && (
+              {displayTurns.length === 0 && (
                 <p className="text-xs text-[var(--color-text-muted)] text-center mt-4">
                   First task clones the repo (warm after). Try: “add a CONTRIBUTING.md, commit on a branch, open a PR.”
                 </p>
               )}
-              {active.turns.map((t, i) =>
+              {displayTurns.map((t, i) =>
                 t.role === "user" ? (
                   // User turns keep a bubble (right-aligned) — the visual anchor
                   // for "what I asked". Capped width so long prompts wrap nicely.
@@ -568,7 +842,7 @@ export default function CloudCodePage() {
                   </div>
                 )
               )}
-              {sending && (
+              {activeSending && (
                 <div className="self-start flex items-center gap-2 text-[var(--color-text-muted)] text-sm">
                   <Loader2 className="w-3.5 h-3.5 animate-spin" /> working… (keeps running if you close this)
                 </div>
@@ -604,7 +878,7 @@ export default function CloudCodePage() {
                     }
                   }}
                   rows={1}
-                  placeholder={sending ? "Working… (you can queue your next message)" : "Give the next task…   (Enter to send, Shift+Enter for a new line)"}
+                  placeholder={activeSending ? "Working… (you can queue your next message)" : "Give the next task…   (Enter to send, Shift+Enter for a new line)"}
                   autoFocus
                   // Stop iOS/Safari from offering password/card/contact AutoFill on a
                   // plain prompt box (the key/card/pin chips above the keyboard).
@@ -615,16 +889,16 @@ export default function CloudCodePage() {
                   data-testid="cc-message-input"
                   className="flex-1 bg-transparent resize-none outline-none text-sm leading-6 py-1.5 max-h-[152px] placeholder:text-[var(--color-text-muted)]"
                 />
-                {sending ? (
+                {activeSending ? (
                   <button
-                    onClick={stop}
-                    disabled={stopping}
+                    onClick={() => stopTurn()}
+                    disabled={activeStopping}
                     data-testid="cc-stop"
                     className="w-8 h-8 mb-0.5 rounded-lg bg-red-600 text-white flex items-center justify-center hover:bg-red-500 transition-colors disabled:opacity-40 flex-shrink-0"
                     aria-label="Stop"
                     title="Stop the running turn"
                   >
-                    {stopping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-3.5 h-3.5" fill="currentColor" />}
+                    {activeStopping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-3.5 h-3.5" fill="currentColor" />}
                   </button>
                 ) : draft.trim() && !voiceActive ? (
                   <button
