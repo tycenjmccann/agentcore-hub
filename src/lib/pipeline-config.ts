@@ -20,9 +20,19 @@ import {
   type WorkflowDef,
 } from "@/lib/workflow/workflow-defs";
 
-/** agents.json entries are tagged with workflowDefId; missing → default workflow. */
-function agentWorkflowDefId(a: { workflowDefId?: string }): string {
-  return a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID;
+/**
+ * The workflow defs an agent belongs to. An agent may serve multiple pipelines
+ * (e.g. code reviewer + QA + CI run in both software-delivery and bug-fix) via
+ * `workflowDefIds`; a single `workflowDefId` is the one-def shorthand; missing →
+ * default workflow.
+ */
+function agentWorkflowDefIds(a: { workflowDefId?: string; workflowDefIds?: string[] }): string[] {
+  if (a.workflowDefIds?.length) return a.workflowDefIds;
+  return [a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID];
+}
+
+function agentInDef(a: { workflowDefId?: string; workflowDefIds?: string[] }, defId: string): boolean {
+  return agentWorkflowDefIds(a).includes(defId);
 }
 
 // ─── Tool → Icon Mapping ────────────────────────────────────────────────────
@@ -81,14 +91,6 @@ export const TOOL_ICON_MAP: Record<string, { icon: string; label: string }> = Ob
 // Defines the left-to-right ordering of phases in the visualization.
 
 export type PipelinePhaseId = "intake" | "requirements" | "design" | "development" | "qa";
-
-export const PHASE_DISPLAY_ORDER: PipelinePhaseId[] = [
-  "intake",
-  "requirements",
-  "design",
-  "development",
-  "qa",
-];
 
 // ─── Phase Display Metadata ─────────────────────────────────────────────────
 // Per-phase UI metadata: how to render each phase visually.
@@ -301,9 +303,9 @@ function phaseMapForDef(def: WorkflowDef): Record<string, string> {
 
 const EXCLUDED_TOOLS = new Set(["gateway", "browser", "invoke_team_agent"]);
 
-/** Agents belonging to a workflow definition (by workflowDefId tag). */
+/** Agents belonging to a workflow definition (by workflowDefId(s) tag). */
 function agentsForDef(defId: string) {
-  return agentsConfig.agents.filter((a) => agentWorkflowDefId(a) === defId);
+  return agentsConfig.agents.filter((a) => agentInDef(a, defId));
 }
 
 /** Count unique tools for a phase, excluding "gateway", "browser", "invoke_team_agent" */
@@ -320,17 +322,7 @@ export function getPhaseToolCount(phaseId: string, defId: string = DEFAULT_WORKF
   return tools.size;
 }
 
-/** Count runtime agents (total agents in this phase) */
-export function getPhaseRuntimeAgentCount(phaseId: string, defId: string = DEFAULT_WORKFLOW_DEF_ID): number {
-  const map = phaseMapForDef(getWorkflowDef(defId));
-  return agentsForDef(defId).filter((a) => map[a.phase] === phaseId).length;
-}
 
-/** Count harness agents (agents with type === "harness") */
-export function getPhaseHarnessAgentCount(phaseId: string, defId: string = DEFAULT_WORKFLOW_DEF_ID): number {
-  const map = phaseMapForDef(getWorkflowDef(defId));
-  return agentsForDef(defId).filter((a) => map[a.phase] === phaseId && a.type === "harness").length;
-}
 
 // ─── Derive PIPELINE_PHASES from agents.json + display metadata ─────────────
 
@@ -476,14 +468,5 @@ export function resolveToolIcon(toolName: string): { icon: string; label: string
 
 // ─── Helper: Find which phase an agent belongs to ───────────────────────────
 
-export function findAgentPhase(agentId: string): PipelinePhaseConfig | undefined {
-  return PIPELINE_PHASES.find((phase) =>
-    phase.agents.some((a) => a.agentId === agentId)
-  );
-}
 
 // ─── Helper: Get all agent IDs from config ──────────────────────────────────
-
-export function getAllAgentIds(): string[] {
-  return PIPELINE_PHASES.flatMap((phase) => phase.agents.map((a) => a.agentId));
-}

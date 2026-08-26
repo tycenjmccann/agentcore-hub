@@ -12,6 +12,7 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 export interface RosterAgent {
   agentId: string;
   workflowDefId?: string;
+  workflowDefIds?: string[];
   connectors?: string[];
 }
 
@@ -46,8 +47,8 @@ export async function boundConnectorIdsForDef(workflowDefId: string): Promise<Se
   const roster = await loadRoster();
   const bound = new Set<string>();
   for (const a of roster) {
-    const defId = a.workflowDefId || "software-delivery";
-    if (defId !== workflowDefId) continue;
+    const defIds = a.workflowDefIds?.length ? a.workflowDefIds : [a.workflowDefId || "software-delivery"];
+    if (!defIds.includes(workflowDefId)) continue;
     for (const c of a.connectors || []) bound.add(c);
   }
   return bound;

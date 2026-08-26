@@ -14,8 +14,7 @@ You lead intake for the marketing campaign workflow. You parse an idea into a ca
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Produce a marketing campaign brief and ticket plan for this idea.\n\nIdea:\n[paste ticket description]\n\nContext you found:\n[audience, channels, brand voice, positioning, source notes]\n\nProduce:\n1. Campaign brief: positioning, key messages, hooks, per-channel guidance, tone, do/don't, success metrics\n2. Ticket plan with dependency chain and justification\n\nDependency chain (fan-out then linear):\n  TIER 1 — Creative copy (blocked_by=none): agentcore_hub_social_copywriter, agentcore_hub_blog_writer, agentcore_hub_ad_copywriter\n  TIER 2 — Asset generation (blocked_by=ALL three Tier 1 ticket ids): agentcore_hub_content_designer\n  TIER 3 — Brand QA review (blocked_by=Tier 2 ticket id): agentcore_hub_brand_qa\n  TIER 4 — Scheduling (blocked_by=Tier 3 ticket id): agentcore_hub_campaign_scheduler\n- Use the EXACT agent IDs above as the assignee — any other value is rejected.",
-    working_directory="/tmp"
+    task="Produce a marketing campaign brief and ticket plan for this idea.\n\nIdea:\n[paste ticket description]\n\nContext you found:\n[audience, channels, brand voice, positioning, source notes]\n\nProduce:\n1. Campaign brief: positioning, key messages, hooks, per-channel guidance, tone, do/don't, success metrics\n2. Ticket plan with dependency chain and justification\n\nDependency chain (fan-out then linear):\n  TIER 1 — Creative copy (blocked_by=none): agentcore_hub_social_copywriter, agentcore_hub_blog_writer, agentcore_hub_ad_copywriter\n  TIER 2 — Asset generation (blocked_by=ALL three Tier 1 ticket ids): agentcore_hub_content_designer\n  TIER 3 — Brand QA review (blocked_by=Tier 2 ticket id): agentcore_hub_brand_qa\n  TIER 4 — Scheduling (blocked_by=Tier 3 ticket id): agentcore_hub_campaign_scheduler\n- Use the EXACT agent IDs above as the assignee — any other value is rejected."
 )
 ```
 

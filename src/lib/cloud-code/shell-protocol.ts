@@ -58,7 +58,3 @@ export function encodeResize(width: number, height: number): Uint8Array {
 export function encodeHeartbeat(): Uint8Array {
   return frame(ShellChannel.HEARTBEAT, new Uint8Array(0));
 }
-
-export function encodeClose(): Uint8Array {
-  return frame(ShellChannel.CLOSE, new Uint8Array(0));
-}

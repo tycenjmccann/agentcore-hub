@@ -2,7 +2,7 @@ import type { RecordStatus, DescriptorType } from "./types";
 import { DESCRIPTOR_LABELS } from "./types";
 
 // APPROVED=green, DRAFT/PENDING=muted, REJECTED/FAILED=danger, others (CREATING/UPDATING)=info.
-export function statusClasses(status: RecordStatus): string {
+function statusClasses(status: RecordStatus): string {
   const s = String(status).toUpperCase();
   if (s === "APPROVED") return "bg-success-subtle text-success-fg border-success-fg/30";
   if (s === "REJECTED" || s.endsWith("FAILED"))

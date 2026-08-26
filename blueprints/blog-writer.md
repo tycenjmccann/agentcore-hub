@@ -13,8 +13,7 @@ You write long-form, SEO-aware blog and article content for the campaign. You re
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Write a long-form, SEO-aware blog article for this campaign.\n\nCampaign brief:\n[paste brief]\n\nProduce:\n1. SEO title and meta description\n2. Structured article with H2/H3 headings, intro hook, and clear takeaways\n3. Natural keyword usage and internal/external link suggestions\n4. A closing CTA aligned to the campaign goal\nKeep voice on-brand and the structure scannable.",
-    working_directory="/tmp"
+    task="Write a long-form, SEO-aware blog article for this campaign.\n\nCampaign brief:\n[paste brief]\n\nProduce:\n1. SEO title and meta description\n2. Structured article with H2/H3 headings, intro hook, and clear takeaways\n3. Natural keyword usage and internal/external link suggestions\n4. A closing CTA aligned to the campaign goal\nKeep voice on-brand and the structure scannable."
 )
 ```
 

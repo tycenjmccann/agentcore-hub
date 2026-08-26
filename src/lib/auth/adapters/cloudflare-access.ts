@@ -45,12 +45,40 @@ function jwks(cfg: CfConfig) {
   return _jwks;
 }
 
+/**
+ * Tenant for a SERVICE TOKEN (headless MCP/CI caller). Service-token JWTs carry
+ * no email — only `common_name` (the token's name) and an empty/absent sub — so
+ * the email-domain tenant derivation can't work. The deployer maps each token
+ * name to its tenant via CF_ACCESS_SERVICE_TENANTS ("tokenName=tenantId,
+ * other=acme.com"). An unmapped service token is REJECTED (fail closed): letting
+ * it default would silently land a machine caller in the "default" tenant with
+ * access to the pre-auth legacy rows.
+ */
+function serviceTenantFor(commonName: string): string | null {
+  const raw = process.env.CF_ACCESS_SERVICE_TENANTS || "";
+  for (const pair of raw.split(",")) {
+    const [name, tenant] = pair.split("=").map((s) => s.trim());
+    if (name && tenant && name === commonName) return tenant;
+  }
+  return null;
+}
+
 /** Map verified Access claims → hub identity. */
 function identityFrom(p: JWTPayload): Identity | null {
   const email = typeof p.email === "string" ? p.email : undefined;
-  // Access always sets `sub`; prefer email as the human-facing userId, fall back
-  // to sub when a service token (no email) hits the app.
   const sub = typeof p.sub === "string" ? p.sub : undefined;
+
+  // Service token (MCP / headless CLI caller): Access authenticated the request
+  // with CF-Access-Client-Id/-Secret and issued an assertion carrying the token's
+  // `common_name` but NO email. Identity = the token name; tenant = the explicit
+  // mapping (required — see serviceTenantFor).
+  const commonName = typeof p.common_name === "string" ? (p.common_name as string) : undefined;
+  if (!email && commonName) {
+    const tenantId = serviceTenantFor(commonName);
+    if (!tenantId) return null; // unmapped machine caller → reject
+    return { userId: `svc:${commonName}`, tenantId, groups: [] };
+  }
+
   const userId = email || sub;
   if (!userId) return null;
 

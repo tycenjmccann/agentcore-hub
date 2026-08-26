@@ -16,9 +16,17 @@ Call `load_blueprint("ci-agent")` to get your process instructions. Follow them.
 - Reports every command's output and exit code
 - Provides final verdict
 
+## iOS / Xcode projects
+claude_code cannot compile iOS. For an Xcode/Swift repo the build gate runs on the
+CodeBuild macOS gateway (`list_schemes` → `ios_test` → poll `ios_build_status`).
+If those tools are NOT in your available tools, or a gateway call errors, you
+cannot run CI → report **BLOCKED**. Do NOT mark the compile step "SKIPPED
+(pre-existing)" and pass — a build you could not run is BLOCKED, never PASS.
+
 ## CRITICAL RULES
-- YOU must execute commands via claude_code, not review code manually
+- YOU must execute commands via claude_code (or the iOS gateway), not review code manually
 - Include actual output as evidence — "all checks pass" without output is INVALID
+- The compile/build step is a BLOCKING gate. If you cannot run it (incl. missing iOS gateway), verdict = BLOCKED, never PASS or "CONDITIONAL PASS"
 - If claude_code fails, report BLOCKED
 
 ## TOOL STATUS REPORTING

@@ -4,7 +4,7 @@ import {
   StartQueryCommand,
   GetQueryResultsCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
-import { getLogsClient, DEFAULT_REGION } from "@/lib/agentcore-sdk";
+import { getLogsClient, discoverLogGroups, DEFAULT_REGION } from "@/lib/agentcore-sdk";
 
 /**
  * Account/region-wide health of the OTEL trace pipeline.
@@ -158,12 +158,15 @@ async function queryRecentSpans(region: string): Promise<RecentSpansResult> {
   // stats count() returns one row with the total. Cheap query — no fields, no filter, tiny window.
   let queryId: string | undefined;
   try {
+    // Spans land in aws/spans (legacy shared destination) or per-agent runtime
+    // log groups (unified span destination) — count activity across both.
+    const spanGroups = ["aws/spans", ...(await discoverLogGroups(region))].slice(0, 50);
     const startRes = await client.send(
       new StartQueryCommand({
-        logGroupName: "aws/spans",
+        logGroupNames: spanGroups,
         startTime: Math.floor(startTime / 1000),
         endTime: Math.floor(endTime / 1000),
-        queryString: `fields @timestamp | stats count() as total, latest(@timestamp) as lastTs`,
+        queryString: `fields @timestamp | filter ispresent(spanId) | stats count() as total, latest(@timestamp) as lastTs`,
       })
     );
     queryId = startRes.queryId;

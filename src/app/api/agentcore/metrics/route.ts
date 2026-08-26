@@ -13,6 +13,7 @@ import {
 } from "@aws-sdk/client-cloudwatch";
 import {
   discoverAgents,
+  discoverLogGroups,
   DEFAULT_REGION,
 } from "@/lib/agentcore-sdk";
 
@@ -151,7 +152,17 @@ export async function GET(req: NextRequest) {
 }
 
 /**
- * Query aws/spans log group for per-agent token usage.
+ * OTEL span destinations. Newer runtimes deliver spans to their own log group's
+ * `spans` stream (unified span destination) instead of the shared aws/spans, so
+ * queries must cover both. Insights caps a query at 50 log groups.
+ */
+async function getSpanLogGroups(region: string): Promise<string[]> {
+  const runtimeGroups = await discoverLogGroups(region);
+  return ["aws/spans", ...runtimeGroups].slice(0, 50);
+}
+
+/**
+ * Query span log groups for per-agent token usage.
  */
 async function getTokenUsageFromSpans(region: string): Promise<Record<string, { input: number; output: number; calls: number }>> {
   const empty: Record<string, { input: number; output: number; calls: number }> = {};
@@ -164,15 +175,19 @@ async function getTokenUsageFromSpans(region: string): Promise<Record<string, { 
     // Aggregate token usage server-side. Pulling raw @message blobs (limit
     // 10000) and JSON.parsing each one client-side took 80s+; a stats query
     // returns one small row per service in ~1s.
+    // Two shapes carry gen_ai.usage tokens: Strands/ADOT model spans (named
+    // "chat <model>") and Claude Code CLI api_request log events (coding
+    // runtime — its collector normalizes input_tokens -> gen_ai.usage.* and
+    // event.name arrives as "api_request", body carries the claude_code prefix).
     const query = `
       fields \`attributes.gen_ai.usage.input_tokens\` as inp, \`attributes.gen_ai.usage.output_tokens\` as outp, \`resource.attributes.service.name\` as svc
-      | filter name like /^chat /
+      | filter name like /^chat / or \`attributes.event.name\` = "api_request"
       | stats sum(inp) as inputTokens, sum(outp) as outputTokens, count(*) as calls by svc
     `;
 
     const startRes = await client.send(
       new StartQueryCommand({
-        logGroupName: "aws/spans",
+        logGroupNames: await getSpanLogGroups(region),
         startTime,
         endTime,
         queryString: query,
@@ -291,8 +306,9 @@ async function getCWMetricsForAgents(
 }
 
 /**
- * Get session counts for all agents from OTEL spans (aws/spans log group).
- * Counts distinct session.id values per agent service name.
+ * Get session counts for all agents from OTEL spans (aws/spans + per-agent
+ * unified span destinations). Counts distinct session.id values per agent
+ * service name.
  */
 async function getSessionCounts(
   agents: Array<{ id: string; name: string; type: string }>,
@@ -315,7 +331,7 @@ async function getSessionCounts(
 
     const startRes = await client.send(
       new StartQueryCommand({
-        logGroupName: "aws/spans",
+        logGroupNames: await getSpanLogGroups(region),
         startTime,
         endTime,
         queryString: query,

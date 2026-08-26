@@ -51,15 +51,10 @@ async function retryJira(workflowId: string, agentId: string, agentTasks: Record
     throw new Error(`Ticket ${ticketId} is ${live} in Jira — not retryable`);
   }
 
-  // Transition Jira ticket back to Ready, falling back to To Do (some boards
-  // don't have a "Ready" state).
-  try {
-    await jira.transitionIssue(ticketId, "Ready");
-  } catch {
-    await jira.transitionIssue(ticketId, "To Do");
-  }
-
-  // Update workflow agentTasks status
+  // Release the invocation claim BEFORE the transition. The orchestrator's
+  // idempotency lock is agentTasks[ticketId].status — the "ready" webhook can
+  // arrive before a post-transition write lands, and a still-"running" status
+  // would make the orchestrator skip the retry as a duplicate.
   await ddb.send(new UpdateCommand({
     TableName: WORKFLOWS_TABLE,
     Key: { workflowId },
@@ -67,6 +62,14 @@ async function retryJira(workflowId: string, agentId: string, agentTasks: Record
     ExpressionAttributeNames: { "#at": "agentTasks", "#tid": ticketId, "#s": "status" },
     ExpressionAttributeValues: { ":s": "ready" },
   }));
+
+  // Transition Jira ticket back to Ready, falling back to To Do (some boards
+  // don't have a "Ready" state).
+  try {
+    await jira.transitionIssue(ticketId, "Ready");
+  } catch {
+    await jira.transitionIssue(ticketId, "To Do");
+  }
 
   return ticketId;
 }
@@ -87,6 +90,16 @@ async function retryDynamoDB(workflowId: string, agentId: string, agentTasks: Re
     throw new Error(`No active (running) ticket found for agent ${agentId}`);
   }
 
+  // Release the invocation claim FIRST (see retryJira) — the stream event from
+  // the ticket write below races the agentTasks update otherwise.
+  await ddb.send(new UpdateCommand({
+    TableName: WORKFLOWS_TABLE,
+    Key: { workflowId },
+    UpdateExpression: "SET #at.#tid.#s = :s",
+    ExpressionAttributeNames: { "#at": "agentTasks", "#tid": ticketId, "#s": "status" },
+    ExpressionAttributeValues: { ":s": "ready" },
+  }));
+
   // Reset ticket to "ready" in the tickets table
   await ddb.send(new UpdateCommand({
     TableName: TICKETS_TABLE,
@@ -94,15 +107,6 @@ async function retryDynamoDB(workflowId: string, agentId: string, agentTasks: Re
     UpdateExpression: "SET #s = :s, #u = :u",
     ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
     ExpressionAttributeValues: { ":s": "ready", ":u": new Date().toISOString() },
-  }));
-
-  // Also update workflow agentTasks
-  await ddb.send(new UpdateCommand({
-    TableName: WORKFLOWS_TABLE,
-    Key: { workflowId },
-    UpdateExpression: "SET #at.#tid.#s = :s",
-    ExpressionAttributeNames: { "#at": "agentTasks", "#tid": ticketId, "#s": "status" },
-    ExpressionAttributeValues: { ":s": "ready" },
   }));
 
   return ticketId;

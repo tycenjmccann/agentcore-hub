@@ -13,7 +13,7 @@ interface PullCommandButtonProps {
  * Copies the exact CLI command to pull this session down to a local terminal.
  * A web-started session has no easy way to surface its id to the terminal, so
  * we hand the user the whole command — tap to copy, paste into Claude Code. The
- * slash form matches the port-session MCP (`/mcp__port-session__pull`).
+ * slash form matches the hub MCP (`/mcp__agentcore-hub__pull`).
  */
 export function PullCommandButton({ sessionId, className }: PullCommandButtonProps) {
   const [copied, setCopied] = useState(false);
@@ -23,7 +23,7 @@ export function PullCommandButton({ sessionId, className }: PullCommandButtonPro
     if (timerRef.current) clearTimeout(timerRef.current);
   }, []);
 
-  const command = `/mcp__port-session__pull ${sessionId}`;
+  const command = `/mcp__agentcore-hub__pull ${sessionId}`;
 
   const handleCopy = useCallback(async () => {
     try {
@@ -69,4 +69,3 @@ export function PullCommandButton({ sessionId, className }: PullCommandButtonPro
   );
 }
 
-export default PullCommandButton;

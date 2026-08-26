@@ -1,0 +1,42 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "src/app/**/page.tsx",
+    "src/app/**/layout.tsx",
+    "src/app/**/route.ts",
+    "src/app/api/**/route.ts",
+    "src/middleware.ts",
+    "lambda/**/index.mjs",
+    "lambda/**/handler.mjs",
+    "lambda/**/*.test.mjs",
+    "scripts/**/*.{js,ts,mjs,cjs}",
+    "src/**/*.test.ts",
+    "tests/**/*.{js,ts,tsx}",
+    "next.config.mjs",
+    "vitest.config.ts",
+    "tailwind.config.js",
+    "postcss.config.js",
+    "playwright.config.ts"
+  ],
+  "project": [
+    "src/**/*.{ts,tsx}",
+    "lambda/**/*.mjs",
+    "scripts/**/*.{js,ts,mjs,cjs}",
+    "tests/**/*.{js,ts,tsx}",
+    "next.config.mjs",
+    "vitest.config.ts",
+    "tailwind.config.js",
+    "postcss.config.js",
+    "playwright.config.ts"
+  ],
+  "workspaces": {
+    "mcp/hub": {
+      "entry": [
+        "src/index.ts"
+      ],
+      "project": [
+        "src/**/*.ts"
+      ]
+    }
+  }
+}

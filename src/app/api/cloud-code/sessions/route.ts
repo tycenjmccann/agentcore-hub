@@ -16,7 +16,12 @@ export async function GET(request: NextRequest) {
     // Identity is stamped by middleware; AUTH_MODE=none → "default" (legacy).
     // Sidebar is tenant-scoped: colleagues in a tenant share the session list.
     const { tenantId } = getIdentity(request);
-    const sessions = await listSessions(tenantId);
+    let sessions = await listSessions(tenantId);
+    // Workflow board: link each agent task to the coding session(s) it ran.
+    const workflowId = request.nextUrl.searchParams.get("workflowId");
+    const agentId = request.nextUrl.searchParams.get("agentId");
+    if (workflowId) sessions = sessions.filter((s) => s.workflowId === workflowId);
+    if (agentId) sessions = sessions.filter((s) => s.agentId === agentId);
     return NextResponse.json({ sessions });
   } catch (err) {
     console.error("[cloud-code] list error:", err);

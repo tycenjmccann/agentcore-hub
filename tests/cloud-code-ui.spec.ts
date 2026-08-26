@@ -209,7 +209,7 @@ test.describe("Cloud Code UI (mocked)", () => {
     await page.getByRole("button", { name: /Copy the command to pull/i }).click();
     await expect(page.getByText("Copied")).toBeVisible();
     const clip = await page.evaluate(() => navigator.clipboard.readText());
-    expect(clip).toBe(`/mcp__port-session__pull ${SESSION_ID}`);
+    expect(clip).toBe(`/mcp__agentcore-hub__pull ${SESSION_ID}`);
   });
 
   test("GitHub section: Connect when app configured but not connected", async ({ page }) => {
