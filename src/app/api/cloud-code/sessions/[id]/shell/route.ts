@@ -16,6 +16,7 @@ import { defaultProvider } from "@aws-sdk/credential-provider-node";
 import { getOwnedSession, DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/cloud-code/sessions";
 import { currentConfigVersion } from "@/lib/cloud-code/config-store";
 import { prepareCodingSession, warmCodingSession } from "@/lib/cloud-code/runtime";
+import { cloneTokenForUser } from "@/lib/cloud-code/github-app";
 import { getIdentity } from "@/lib/auth/identity";
 
 export const dynamic = "force-dynamic";
@@ -67,6 +68,13 @@ export async function POST(
     const sessionTenant = session.tenantId || DEFAULT_TENANT_ID;
     const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
     if (session.resumeTranscriptKey) {
+      // The warm clones the repo — mint the same owner-scoped token a turn gets,
+      // so an App-connected user never rides the operator's broad PAT.
+      const { token: githubToken, connected: githubAppConnected } = await cloneTokenForUser(
+        sessionTenant,
+        userId,
+        session.repo
+      );
       const warmed = await Promise.race([
         warmCodingSession({
           sessionId: session.sessionId,
@@ -79,6 +87,8 @@ export async function POST(
           tenantId: sessionTenant,
           configVersion,
           region: REGION,
+          githubToken,
+          githubAppConnected,
         }).catch(() => null),
         new Promise<null>((r) => setTimeout(() => r(null), 50_000)),
       ]);
