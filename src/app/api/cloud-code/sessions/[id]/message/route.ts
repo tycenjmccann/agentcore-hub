@@ -83,8 +83,7 @@ export async function POST(
     text: displayPrompt || prompt,
     at: new Date().toISOString(),
   };
-  const wantStream =
-    request.nextUrl.searchParams.get("stream") === "1" && session.cli === "claude";
+  const wantStream = request.nextUrl.searchParams.get("stream") === "1";
   const userId = session.userId || DEFAULT_USER_ID;
   const sessionTenant = session.tenantId || DEFAULT_TENANT_ID;
   const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
@@ -130,6 +129,18 @@ export async function POST(
 
     const out = new ReadableStream<Uint8Array>({
       async start(controller) {
+        // Relaying to the browser is best-effort; draining `upstream` and
+        // persisting the turn is not. A client that backgrounds/locks/refreshes
+        // mid-turn kills its socket, but the runtime keeps working — so once the
+        // browser is gone we stop enqueuing yet keep reading upstream to the end
+        // and still persist the full reply (recovered on the next GET). Without
+        // this, enqueue throws, the catch's own enqueue rethrows, and BOTH
+        // persist paths are skipped — the whole turn is lost.
+        let clientGone = false;
+        const relay = (chunk: Uint8Array) => {
+          if (clientGone) return;
+          try { controller.enqueue(chunk); } catch { clientGone = true; }
+        };
         try {
           // sseData parses the upstream frames; we tee text/done to persist and
           // relay each frame to the browser verbatim.
@@ -142,16 +153,18 @@ export async function POST(
               if (obj.claude_session_id) session.claudeSessionId = String(obj.claude_session_id);
               fullText = String(obj.response || fullText);
             }
-            controller.enqueue(enc.encode(`data: ${json}\n\n`));
+            relay(enc.encode(`data: ${json}\n\n`));
           }
           // Persist the completed turn (re-read + merge so a /stop write for this
-          // same interrupted turn isn't clobbered).
+          // same interrupted turn isn't clobbered) — even if the browser
+          // disconnected mid-stream.
           await persistTurn(session.sessionId, session, userTurn, fullText, prompt).catch(() => {});
         } catch (err) {
-          controller.enqueue(enc.encode(`data: ${JSON.stringify({ type: "error", error: (err as Error).message })}\n\n`));
-          await persistTurn(session.sessionId, session, userTurn, null, prompt).catch(() => {});
+          // Upstream itself failed. Keep any partial reply so it isn't lost.
+          relay(enc.encode(`data: ${JSON.stringify({ type: "error", error: (err as Error).message })}\n\n`));
+          await persistTurn(session.sessionId, session, userTurn, fullText || null, prompt).catch(() => {});
         } finally {
-          controller.close();
+          if (!clientGone) { try { controller.close(); } catch { /* already closed */ } }
         }
       },
     });

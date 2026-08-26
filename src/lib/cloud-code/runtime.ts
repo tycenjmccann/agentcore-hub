@@ -132,7 +132,7 @@ export async function invokeCodingTurn(params: CodingTurnParams): Promise<Coding
 /**
  * Streaming variant: returns the runtime's raw text/event-stream body so the
  * caller can relay SSE to the browser. The runtime emits `data: {type:text|done|error}`
- * frames as the Claude turn runs. Claude only — codex stays buffered.
+ * frames as the turn runs — claude token deltas, codex per-step frames.
  */
 export async function invokeCodingTurnStream(params: CodingTurnParams): Promise<ReadableStream<Uint8Array>> {
   if (!CODING_RUNTIME_ARN) {
