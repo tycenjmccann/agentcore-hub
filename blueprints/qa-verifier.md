@@ -129,6 +129,26 @@ and still fail 100% against the real service. You MUST prove it works against re
 **A "PASS" on an external-integration feature that was verified only by the dev's own
 unit tests is INVALID. No real round-trip against the real contract = not a pass.**
 
+### Step 3d: Performance Verification (MANDATORY when the ticket claims a perf fix)
+A perf ticket's acceptance criterion IS the measured delta — not the test suite,
+not the build. "Compiles + tests green" verifies nothing about speed.
+1. The dev's evidence must contain measured before/after numbers (operation
+   counts, latency) — missing numbers = FAIL, fix ticket: "measure it".
+2. REPRODUCE the measurement yourself — you verify, you don't trust: run the
+   dev's counting test / measurement script on the base branch and on the fix
+   branch, same seeded scenario, and confirm the delta. On iOS route it through
+   the gateway like any test run.
+3. Check the SYMPTOM is gone, not just one contributor: count the total
+   operations the affected screen/endpoint issues end-to-end after the fix. If
+   the fix removed one N+1 and the same surface still issues N-scaling calls
+   elsewhere, that's a FAIL with the counts as evidence.
+4. Confirm the regression test asserts the invariant (an operation-count or
+   latency bound), not an implementation detail. A test asserting "filters on
+   field X" would pass while the perf bug returns — FAIL, fix ticket.
+5. Persist your own measured numbers to `qa-evidence/` and put the before/after
+   in the Verification Ledger.
+**A perf PASS with no independently reproduced numbers is INVALID.**
+
 ### Step 4: Acceptance Criteria Check
 - Walk through each acceptance criterion from the design doc
 - For code-level criteria: grep/read the source
@@ -147,6 +167,7 @@ tested build:
 | Test suite | yes/NO | X passed / Y failed | build_id / test-summary.md |
 | UI behavior (the actual bug) | yes/NO | reproduced-then-fixed? | session video S3 key |
 | Visual / acceptance criteria | yes/NO | … | screenshot S3 key |
+| Perf delta (perf tickets) | yes/NO | before → after numbers, independently reproduced | qa-evidence key |
 
 Any row marked "NO" means that dimension is UNVERIFIED and the verdict cannot be
 PASS on that dimension. Do not describe a code-read as if it were a test run.
@@ -172,6 +193,8 @@ all-clear on something that was never tested. Use BLOCKED and say so plainly.**
 ## Rules
 - Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - NEVER pass a UI change without a screenshot proving it renders correctly
+- NEVER pass a perf ticket without independently reproduced before/after numbers (Step 3d); the dev's claim is a hypothesis until you re-measure it
+- ZERO-ISSUE PASS: if ANY check, criterion, or suspicion surfaced during verification is unresolved — any severity — the verdict is FAIL with fix tickets, not "PASS with notes". Suspicions must be proven or filed, never waved through.
 - NEVER pass an external-integration feature without a real round-trip against the
   real service + a docs cross-check (Step 3c). The dev's own unit tests are NOT
   verification of a protocol they may have guessed.

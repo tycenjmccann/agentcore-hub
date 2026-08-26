@@ -81,6 +81,11 @@ is fix → code review → QA → CI:
      - Suspected subsystem and any stack trace top frame
      - Hypothesis from your analysis (clearly labelled as "hypothesis — confirm or refute")
      - **Mandatory:** "Locate the root cause via code search. Add or extend a regression test that fails on `{base-branch}` and passes on this fix."
+     - **Mandatory for performance bugs** (slow/N+1/excessive calls): name the
+       metric (query count, latency) and require measured before/after numbers
+       on the same scenario — "done_when: measured {metric} before vs after,
+       regression test asserts the operation-count/latency invariant (not the
+       implementation)". A perf fix without numbers is not done.
    - `parent_id`: the Bug's key (the workflow root)
    - `ticket_type`: `"subtask"`
    - `blocked_by`: `""` (runs immediately)
@@ -105,6 +110,9 @@ is fix → code review → QA → CI:
      - Link to bug-analysis.md
      - Repro steps from the original report
      - **Required check:** confirm the new regression test exists, fails on the base branch, and passes on the feature branch
+     - **Required for performance bugs:** independently reproduce the dev's
+       before/after measurement and count the whole symptom surface — the
+       measured delta is the acceptance criterion, not the test suite
      - Standard build + visual checks
    - `parent_id`: the Bug's key
    - `ticket_type`: `"subtask"`

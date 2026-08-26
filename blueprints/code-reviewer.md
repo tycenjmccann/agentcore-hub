@@ -66,7 +66,45 @@ concrete scenario that triggers it:
   Cite the doc URL and the exact mismatch. If the ticket cited only a marketing link
   and no authoritative reference, that itself is a P0 finding.
 
-Decide REAL vs theoretical. Only REAL findings matter.
+**PROVE-OR-FILE — you may not argue a finding away.** To dismiss a candidate
+finding as theoretical you must produce EVIDENCE: read the actual code path
+(including other tiers — Lambda handlers, resolvers, schema, every backend
+writer), run the scenario, or cite the authoritative doc, and put that evidence
+in the finding. "Acceptable trade-off", "unlikely in practice", "documented
+assumption", "not filing separately" — with no verification behind them — mean
+the finding is REAL: file it. If you lack the access to prove it either way,
+file it with that stated.
+
+**Removed/weakened-check rule (hard gate).** For ANY check that the diff
+deletes, weakens, or replaces with a proxy (a field filter, a flag, a cached
+value):
+1. State what the original check ENFORCED (not what it computed — what product
+   rule it protected).
+2. Find and read EVERY writer of the proxy field/value, across ALL tiers —
+   client, server, Lambda/transform handlers, resolvers, schema defaults,
+   migrations. `grep` for the field name repo-wide and in the backend repo(s).
+3. Confirm the proxy preserves the original semantics for every writer you
+   found, citing each `file:line`.
+You cannot complete all three → P0 finding, CHANGES NEEDED. This is the exact
+failure mode that shipped a privacy leak: a visibility check replaced by
+`lastMessageAt != nil` while a backend handler stamped that field on
+unapproved preview threads.
+
+**Severity floor + downgrade rule.** Any finding touching authorization,
+visibility, privacy, or data exposure is MINIMUM P1 — category floor, not your
+judgment. You may raise any severity freely; you may LOWER one only with
+verified evidence (code you actually read, a scenario you actually ran), cited
+in the finding. An initial severity that you talk down mid-review without new
+evidence stays at the initial severity.
+
+**Error-path rule.** `try` → `try?` (or any error-swallowing) in a path that
+writes state = automatic finding unless the diff itself proves the failure
+case cannot overwrite good state.
+
+**Unverified-perf rule.** If the ticket claims a performance fix and the dev's
+completion record has no measured before/after evidence (operation counts,
+latency, a profile — real numbers), that is an automatic finding: "unverified
+performance claim". A perf change nobody measured is unreviewed by definition.
 
 ### Step 4: (Optional) Harvest External PR Reviews
 Only if the repo has external review bots (Codex, Devin) configured. Your
@@ -78,7 +116,14 @@ their findings in with their severity. If none exist, skip silently — your own
 review is the baseline.
 
 ### Step 5: Deliver Verdict (mirror QA)
-- **PASS** — no real problems. `WorkflowOutput___report_completion` with a summary
+**ZERO-FINDINGS GATE: any finding of ANY severity = CHANGES NEEDED.** There is
+no "P2s are non-blocking" path and no "PASS with observations". If it was worth
+writing down, it is worth a fix ticket — the dev either fixes it or replies on
+the ticket with proof it is not real (which you verify on the re-review). A
+diff passes only when your findings list is EMPTY after the prove-or-file
+discipline above.
+
+- **PASS** — ZERO findings. `WorkflowOutput___report_completion` with a summary
   of what you checked and why it's sound. This Dones your ticket; QA proceeds.
 - **CHANGES NEEDED** — one or more real findings. **GROUP findings by file/
   component/module first — ONE fix ticket per component, NOT one per finding.**
@@ -88,7 +133,9 @@ review is the baseline.
   - `assignee`: the dev agent that owns that component (from the feature ticket)
   - `title`: `Fix (review): {component} — {N} findings`
   - `description`: every finding for that component — `file:line`, the failure
-    scenario, and the severity (P0/P1 = must fix; P2 and below = fix or justify).
+    scenario, and the severity. ALL severities must be resolved: fixed, or
+    refuted on the ticket with evidence you verify on re-review. There is no
+    "fix or justify later" tier.
   - `parent_id`: same parent as your ticket (the Epic, or the Bug for a bug-fix)
   - `ticket_type`: `"subtask"` if the parent is a Bug, else `"task"`
   - `blocked_by`: `""` — EXCEPT when two fix tickets touch the same files or one
@@ -98,6 +145,11 @@ review is the baseline.
   ticket keys you filed.
 
 ## Rules
+- ZERO findings = the only PASS. Any finding, any severity → CHANGES NEEDED + fix ticket
+- Dismissing a candidate finding requires verified evidence in writing; unverified "acceptable trade-off" = file it
+- Deleted/weakened check → state what it enforced + read every writer of the substitute, cross-tier, or P0
+- Auth/visibility/privacy/data-exposure findings: severity floor P1; downgrades only with verified evidence
+- Perf ticket with no measured before/after numbers from the dev = automatic finding
 - Review the DIFF plus surrounding code — never review from the ticket description alone
 - Every finding cites `file:line` and the exact code — no vague "looks risky"
 - Do NOT edit the code yourself — file fix tickets, the dev fixes

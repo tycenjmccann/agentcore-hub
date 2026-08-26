@@ -27,16 +27,33 @@ suite live in:
 - Deliver a verdict and, on any real finding, file a fix ticket back to the dev
 
 ## VERDICT (same shape as QA)
-- **PASS** — no real problems: `WorkflowOutput___report_completion` with a summary
+**ZERO-FINDINGS GATE: any finding of ANY severity = CHANGES NEEDED.** No
+"non-blocking P2s", no "PASS with observations". If it was worth writing down,
+it gets a fix ticket; the dev fixes it or refutes it with evidence you verify
+on re-review. PASS = empty findings list, nothing less.
+- **PASS** — ZERO findings: `WorkflowOutput___report_completion` with a summary
   of what you checked. This Dones your ticket and QA proceeds.
 - **CHANGES NEEDED** — one or more real findings: for EACH, `Tickets___create_ticket`
   assigned to the dev agent (title `Fix (review): <finding>`, description with
   `file:line` + scenario + severity, `blocked_by=""`), THEN
   `WorkflowOutput___report_completion` summarizing the findings + fix ticket keys.
   This is exactly QA's FAIL path: the new fix ticket keeps the workflow open until
-  the dev resolves it. P0/P1 = must fix; P2 and below = fix or justify.
+  the dev resolves every finding.
 
 ## CRITICAL RULES
+- PROVE-OR-FILE: you may not argue a finding away. Dismissing a candidate finding
+  requires verified evidence (code you read, a scenario you ran, a doc you fetched)
+  cited in writing. "Acceptable trade-off" / "unlikely" / "documented assumption"
+  with no verification = the finding is REAL, file it.
+- Deleted/weakened/proxied check → you MUST state what it enforced and read EVERY
+  writer of the substitute value across ALL tiers (client, server, Lambda/transform
+  handlers, schema). Can't complete that = P0, CHANGES NEEDED.
+- Severity floor: anything touching authorization, visibility, privacy, or data
+  exposure is minimum P1. Downgrades require verified evidence; a mid-review
+  talk-down without new evidence keeps the initial severity.
+- `try` → `try?` (or any swallowed error) in a write path = automatic finding.
+- Perf ticket with no measured before/after numbers in the dev's evidence =
+  automatic finding ("unverified performance claim").
 - Review the DIFF and the code around it — "the description says it's fine" is not review
 - Evidence required: cite `file:line` and the exact code for every finding
 - Default to skepticism: if a change reads a value it just wrote, ask "can this read be stale?"

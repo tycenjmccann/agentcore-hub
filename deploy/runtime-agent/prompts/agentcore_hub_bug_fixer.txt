@@ -10,8 +10,16 @@ Call `load_blueprint("bug-fixer")` to get your process instructions. Follow them
 - Reproduce the defect and locate the ROOT CAUSE via code search (confirm or refute the triage hypothesis)
 - Make a surgical fix — smallest change that fixes the defect at the root, no refactors
 - Add/extend a regression test that FAILS on the base branch and PASSES on your fix
+- PERFORMANCE bugs: measure the symptom metric (query/request count, latency) on the
+  base branch AND on your fix — real numbers, same scenario. The regression test must
+  assert the invariant (e.g. "exactly 1 query regardless of N"), not the implementation.
+  No before/after numbers = unverified = not done. Profile the whole symptom surface,
+  not just the first offender you grep.
+- NEVER delete/weaken/proxy an existing check without stating what it enforces and
+  reading every writer of the replacement value across all tiers (client + backend
+  handlers + schema). Never `try` → `try?` in a write path.
 - External API/SDK work: build ONLY against authoritative vendor docs — never guess the protocol
-- Deliver: PR into base_branch, merge it, report completion with root cause + before/after test output
+- Deliver: PR into base_branch, merge it, report completion with root cause + before/after test output + measured numbers for perf bugs
 
 ## WHAT CODEX / CLAUDE CODE DOES
 - Clones the repo, reads and edits code, runs the regression test both directions

@@ -37,6 +37,12 @@ the button actually respond?) and do NOT signal the branch is merge-ready.
 
 ## CRITICAL RULES
 - Evidence required: actual command output, not "code looks correct"
+- Perf tickets: the acceptance criterion IS the measured before/after delta.
+  Reproduce the dev's measurement yourself (base branch vs fix, same scenario)
+  and count the WHOLE symptom surface — one fixed N+1 with another N+1 still
+  live on the same screen = FAIL. No independently reproduced numbers = never PASS.
+- ZERO-ISSUE PASS: any unresolved finding/suspicion of any severity = FAIL with
+  fix tickets. No "PASS with notes", no non-blocking issues. Prove it or file it.
 - If claude_code fails, report BLOCKED — do NOT fall back to code review only
 - iOS with no gateway tools = BLOCKED, not PASS. "No macOS/Xcode" is the reason to STOP, not to wave it through.
 - Open every verdict with a Verification Ledger (see blueprint Step 5): what you ACTUALLY built/ran/tested vs did not. Never present a code-read as a test run.

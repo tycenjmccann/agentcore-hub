@@ -111,6 +111,9 @@ Do NOT open a PR for iOS work without a passing (or explained) gateway run.
 5. Report completion with branch, commit SHA, and PR URL
 
 ## Rules
+- Before deleting/weakening/proxying ANY existing check: state what it enforces and grep every writer of the replacement value across all tiers (client + backend handlers + schema). A check you can't explain is a check you don't remove.
+- Never `try` → `try?` (or swallow errors) in a write path unless you prove the failure case can't clobber good state
+- Performance work: measured before/after numbers (operation counts / latency) on the same scenario are mandatory evidence; tests assert the invariant (count/latency bound), never the implementation choice
 - Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - NEVER submit a UI change without first rendering it and verifying visually
 - iOS: the gateway run is the render — never open an iOS PR without one; write XCTests with the implementation

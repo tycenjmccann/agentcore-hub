@@ -80,6 +80,27 @@ authoritative docs — never from memory, a blog/launch post, or a plausible gue
 - Add/extend the regression test. Run it: show it FAILS on base_branch (stash your
   fix or run on a clean checkout) and PASSES with your fix applied.
 - Run the project's existing test + build/lint commands and confirm they still pass.
+
+### Step 3b: Performance bugs — MEASURE, don't assert
+If the defect is performance ("slow", "takes too long", "N+1", "excessive
+queries/renders/memory"), a compile + green tests prove NOTHING about the fix.
+You MUST produce a measured before/after:
+- Pick the metric the symptom names: request/query COUNT (log or intercept the
+  network/datastore layer and count calls), wall-clock latency, render count,
+  payload size.
+- Measure it on `base_branch` (the "before"), then on your fix (the "after"),
+  with the same seeded data / scenario. Real command output, real numbers —
+  e.g. "86 queries / 8.4s → 4 queries / 0.33s".
+- Your regression test must assert the INVARIANT, not the implementation: e.g.
+  "fetchThreads() issues exactly 1 list query regardless of thread count" (via
+  a counting mock/interceptor), NOT "the code filters on field X". A test that
+  asserts the implementation choice enshrines the next bug.
+- Also profile the WHOLE symptom surface: if the slow screen has three call
+  sites and you fixed one, count what remains. If the remaining sites still
+  dominate, the bug is NOT fixed — keep going or report the gap explicitly.
+- Persist the numbers to `workflows/{workflow_id}/shared/dev-evidence/` and put
+  them in your PR body + completion record. **No before/after numbers = the fix
+  is unverified = do not merge, do not report completion as done.**
 - iOS: neither `claude_code` nor `codex` can build iOS — a green edit is NOT a
   verified fix. You MUST build + run the tests on the CodeBuild macOS gateway
   before you merge: `list_schemes` if needed → `ios_test(branch, scheme)` → poll
@@ -114,6 +135,9 @@ authoritative docs — never from memory, a blog/launch post, or a plausible gue
 - Root cause, not symptom — a patch that hides the symptom is a fix ticket back to you
 - Surgical change only — no refactors, no unrelated cleanup; a needed refactor → BLOCKED, re-file as feature
 - A regression test that fails-on-old / passes-on-new is mandatory; no test = not done
+- Performance bug = measured before/after numbers (Step 3b) mandatory; tests assert the invariant (e.g. query count), never the implementation choice
+- Before deleting/weakening/proxying ANY existing check: state what it enforces and grep every writer of the replacement value across all tiers (client + backend handlers + schema). A check you can't explain is a check you don't remove.
+- Never `try` → `try?` in a write path unless you prove the failure case can't clobber good state
 - Never guess an external protocol — real docs or BLOCKED (Step 2b)
 - iOS changes MUST be built + tested on the macOS gateway before merge; gateway tools missing/failing = BLOCKED, never a silent merge
 - Never mark done without working code + passing test on a branch, with real command output as evidence
