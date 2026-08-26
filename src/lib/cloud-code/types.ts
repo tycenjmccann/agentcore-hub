@@ -16,6 +16,9 @@ export interface CloudCodeTurn {
   role: "user" | "agent";
   text: string;
   at: string; // ISO timestamp
+  // Client-only turn that was never persisted server-side (a pre-run failure's
+  // ⚠ bubble + its user turn). Excluded from recovery's turn-count threshold.
+  local?: boolean;
 }
 
 export interface CloudCodeSession {
