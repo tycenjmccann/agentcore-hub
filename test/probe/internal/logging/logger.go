@@ -33,6 +33,10 @@ func Logger() *slog.Logger {
 	return logger
 }
 
+func SetLogger(l *slog.Logger) {
+	logger = l
+}
+
 func LogRunStart(runID, mode, targetURL string) {
 	Logger().Info("run_start",
 		"run_id", runID,
