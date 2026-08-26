@@ -110,20 +110,6 @@ export function getWorkflowDef(id?: string | null): WorkflowDef {
   return found || WORKFLOW_DEFS.find((w) => w.id === DEFAULT_WORKFLOW_DEF_ID) || WORKFLOW_DEFS[0];
 }
 
-/**
- * Resolve which review gates are active for a run. "always" gates always apply;
- * "flagged" gates apply only when the run requested that phase (requestedPhases,
- * from the intake form). Returns gates keyed by the phase they guard.
- */
-export function resolveActiveGates(
-  def: WorkflowDef,
-  requestedPhases?: string[]
-): ReviewGate[] {
-  const requested = new Set(requestedPhases || []);
-  return (def.reviewGates || []).filter(
-    (g) => g.condition === "always" || requested.has(g.afterPhase)
-  );
-}
 
 /** Whether a ticket assignee refers to a human reviewer rather than an agent. */
 export function isHumanAssignee(assignee?: string | null): boolean {

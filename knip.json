@@ -30,13 +30,13 @@
     "playwright.config.ts"
   ],
   "workspaces": {
-    "mcp/port-session": {
-      "entry": ["src/index.ts"],
-      "project": ["src/**/*.ts"]
-    },
-    "mcp/workflow": {
-      "entry": ["src/index.ts"],
-      "project": ["src/**/*.ts"]
+    "mcp/hub": {
+      "entry": [
+        "src/index.ts"
+      ],
+      "project": [
+        "src/**/*.ts"
+      ]
     }
   }
 }

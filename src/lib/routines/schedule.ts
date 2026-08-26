@@ -95,14 +95,6 @@ export async function upsertSchedule(
   return `arn:aws:scheduler:${REGION}:${account}:schedule/${GROUP}/${Name}`;
 }
 
-/** Flip an existing schedule's enabled state without touching its definition. */
-export async function setScheduleEnabled(
-  routineId: string,
-  schedule: RoutineSchedule,
-  enabled: boolean
-): Promise<void> {
-  await upsertSchedule(routineId, schedule, enabled);
-}
 
 /** Delete a routine's schedule. Tolerates an already-absent schedule. */
 export async function deleteSchedule(routineId: string): Promise<void> {
