@@ -13,8 +13,7 @@ You write paid-ad copy variants for the campaign. You read the campaign brief, d
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Write paid-ad copy variants for this campaign.\n\nCampaign brief:\n[paste brief]\n\nProduce per platform (Meta, Google, LinkedIn as specified):\n1. Multiple headline variants (respect character limits)\n2. Primary text / description variants\n3. CTA button options\n4. Notes on the angle each variant tests\nKeep voice on-brand and conversion-focused.",
-    working_directory="/tmp"
+    task="Write paid-ad copy variants for this campaign.\n\nCampaign brief:\n[paste brief]\n\nProduce per platform (Meta, Google, LinkedIn as specified):\n1. Multiple headline variants (respect character limits)\n2. Primary text / description variants\n3. CTA button options\n4. Notes on the angle each variant tests\nKeep voice on-brand and conversion-focused."
 )
 ```
 

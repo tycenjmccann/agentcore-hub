@@ -52,7 +52,7 @@ logger = get_logger("coding-agent-runtime")
 WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/mnt/efs")
 DEFAULT_CLI = "claude"
 CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
-    "CLAUDE_MODEL", "us.anthropic.claude-opus-4-6-v1"
+    "CLAUDE_MODEL", "us.anthropic.claude-fable-5"
 )
 # A single coding turn can be long; cap so a wedged CLI can't pin the microVM.
 TURN_TIMEOUT_S = int(os.environ.get("TURN_TIMEOUT_S", "1500"))
@@ -893,26 +893,31 @@ def _detect_cloud_artifacts(workdir: str) -> list[dict]:
 
 def _sync_artifacts(prefix: str, workdir: str) -> dict:
     """Upload the session's touched-untracked deliverables to S3 under `prefix`.
-    Best-effort: a failed file is skipped, never fatal. Returns {count, bytes}."""
+    Best-effort: a failed file is skipped, never fatal. Returns {count, bytes,
+    prefix, keys} — keys lets callers (workflow personas) fetch the deliverables
+    without filesystem access to this microVM."""
     if not (workdir and ARTIFACT_BUCKET and prefix):
-        return {"count": 0, "bytes": 0, "prefix": None}
+        return {"count": 0, "bytes": 0, "prefix": None, "keys": []}
     cands = _detect_cloud_artifacts(workdir)
     if not cands:
-        return {"count": 0, "bytes": 0, "prefix": None}
+        return {"count": 0, "bytes": 0, "prefix": None, "keys": []}
     s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
     count = 0
     total = 0
+    keys: list[str] = []
     for c in cands:
         try:
+            key = prefix + c["rel"].replace(os.sep, "/")
             with open(c["abs"], "rb") as fh:
-                s3.upload_fileobj(fh, ARTIFACT_BUCKET, prefix + c["rel"].replace(os.sep, "/"))
+                s3.upload_fileobj(fh, ARTIFACT_BUCKET, key)
             count += 1
             total += c["bytes"]
+            keys.append(key)
         except Exception as exc:  # noqa: BLE001 — one bad file is non-fatal
             logger.warning("artifact_sync_failed",
                            extra={"rel": c["rel"], "error": str(exc)[:200]})
     logger.info("artifacts_synced", extra={"prefix": prefix, "count": count, "bytes": total})
-    return {"count": count, "bytes": total, "prefix": prefix if count else None}
+    return {"count": count, "bytes": total, "prefix": prefix if count else None, "keys": keys}
 
 
 def _sync_turn_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
@@ -967,6 +972,72 @@ def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None =
     """Pull-home leg: upload deliverables under the CHECKPOINT prefix (keyed by the
     resume/claude session id) so the laptop pull brings them home too."""
     return _sync_artifacts(f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/artifacts/", workdir)
+
+
+# Workflow-origin sessions mint one dir per agent-task, far faster than human
+# sessions — without GC the EFS volume grows unbounded. Opportunistic sweep at
+# turn start, WORKFLOW SESSIONS ONLY: a dir is eligible only if it carries the
+# origin marker below, and the marker's mtime (refreshed every workflow turn)
+# is the last-activity record. Human sessions are never touched.
+SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "14"))
+_GC_MARKER = os.path.join(WORKSPACE_ROOT, ".last-session-gc")
+_GC_INTERVAL_S = 6 * 3600  # at most one sweep per warm VM per 6h
+_WF_ORIGIN_MARKER = ".workflow-session"
+
+
+def _touch_workflow_marker(session_id: str | None) -> None:
+    """Stamp a session dir as workflow-origin and record activity. Called on
+    every workflow turn, so the marker's mtime is a reliable last-activity
+    signal without walking the tree (EFS walks are too slow for a turn path)."""
+    if not session_id:
+        return
+    try:
+        base = _session_dir(session_id)
+        os.makedirs(base, exist_ok=True)
+        with open(os.path.join(base, _WF_ORIGIN_MARKER), "w") as f:
+            f.write(str(int(time.time())))
+    except OSError as exc:
+        logger.warning("wf_marker_failed", extra={"error": str(exc)[:200]})
+
+
+def _gc_stale_sessions() -> None:
+    """Best-effort TTL sweep of {WORKSPACE_ROOT}/sessions/*. Only dirs carrying
+    the workflow-origin marker are candidates — human Cloud Code sessions must
+    stay resumable indefinitely. Staleness = marker mtime older than the TTL.
+    Never raises."""
+    if SESSION_TTL_DAYS <= 0:
+        return
+    try:
+        now = time.time()
+        try:
+            if now - os.path.getmtime(_GC_MARKER) < _GC_INTERVAL_S:
+                return
+        except OSError:
+            pass
+        with open(_GC_MARKER, "w") as f:
+            f.write(str(int(now)))
+        sessions_root = os.path.join(WORKSPACE_ROOT, "sessions")
+        if not os.path.isdir(sessions_root):
+            return
+        cutoff = now - SESSION_TTL_DAYS * 86400
+        removed = 0
+        for name in os.listdir(sessions_root):
+            path = os.path.join(sessions_root, name)
+            if not os.path.isdir(path):
+                continue
+            marker = os.path.join(path, _WF_ORIGIN_MARKER)
+            try:
+                if not os.path.isfile(marker):
+                    continue  # human session — never GC
+                if os.path.getmtime(marker) < cutoff:
+                    shutil.rmtree(path, ignore_errors=True)
+                    removed += 1
+            except OSError:
+                continue
+        if removed:
+            logger.info("session_gc", extra={"removed": removed, "ttl_days": SESSION_TTL_DAYS})
+    except Exception as exc:  # noqa: BLE001 — GC must never affect a turn
+        logger.warning("session_gc_failed", extra={"error": str(exc)[:200]})
 
 
 def _ensure_workspace(repo: str | None, session_id: str | None = None,
@@ -1295,7 +1366,19 @@ def _checkout_branch(workdir: str, branch: str) -> None:
 # ─── CLI runners ──────────────────────────────────────────────────────────────
 
 
-def _run_claude(prompt: str, workdir: str, claude_session_id: str | None) -> dict:
+def _otel_turn_env(session_id: str | None) -> dict:
+    """Resource attributes for one turn's telemetry. session.id (the
+    runtimeSessionId) rides at resource level; the collector's
+    transform/normalize copies it down to every span/log attribute so the
+    dashboard groups CLI usage by runtime session — same convention as the
+    fleet agents' ADOT spans."""
+    if not session_id:
+        return {}
+    return {"OTEL_RESOURCE_ATTRIBUTES": f"session.id={session_id}"}
+
+
+def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
+                session_id: str | None = None, model: str | None = None) -> dict:
     """Run one Claude Code turn. Resume the conversation when a prior
     claude_session_id is supplied (same microVM keeps its ~/.claude state)."""
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
@@ -1304,8 +1387,9 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None) -> dic
     # `claude --print` does NOT auto-load a project .mcp.json (needs interactive
     # approval). _build_claude_args passes --mcp-config explicitly; it's variadic,
     # so the positional prompt must come last (appended here).
-    args = _build_claude_args(config_dir, claude_session_id, stream=False) + [prompt]
-    env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir}
+    args = _build_claude_args(config_dir, claude_session_id, stream=False, model=model) + [prompt]
+    env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
+           **_otel_turn_env(session_id)}
 
     proc = subprocess.run(args, cwd=workdir, env=env, capture_output=True,
                           text=True, timeout=TURN_TIMEOUT_S, stdin=subprocess.DEVNULL)
@@ -1319,14 +1403,17 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None) -> dic
         return {"response": proc.stdout.strip(), "claude_session_id": None}
 
 
-def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: bool) -> list:
-    """Shared argv for a Claude turn. stream=True emits realtime stream-json."""
+def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: bool,
+                       model: str | None = None) -> list:
+    """Shared argv for a Claude turn. stream=True emits realtime stream-json.
+    model overrides CLAUDE_MODEL for this turn (pipeline personas carry their
+    own per-persona model)."""
     args = ["claude", "--print"]
     mcp_config = os.path.join(config_dir, ".mcp.json")
     if os.path.isfile(mcp_config):
         args += ["--mcp-config", mcp_config]
     args += ["--dangerously-skip-permissions",
-             "--model", CLAUDE_MODEL, "--max-turns", os.environ.get("MAX_TURNS", "100")]
+             "--model", model or CLAUDE_MODEL, "--max-turns", os.environ.get("MAX_TURNS", "100")]
     if stream:
         # --include-partial-messages emits token-level content_block_delta frames
         # (without it, claude sends whole message blocks → one chunk at the end).
@@ -1339,7 +1426,8 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
 
 
 def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None,
-                   session_id: str | None = None, tenant_id: str | None = None):
+                   session_id: str | None = None, tenant_id: str | None = None,
+                   model: str | None = None):
     """Generator yielding SSE lines for a Claude turn as it runs.
 
     Parses claude stream-json line-by-line: assistant text deltas → 'text'
@@ -1348,8 +1436,9 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     """
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
     os.makedirs(config_dir, exist_ok=True)
-    args = _build_claude_args(config_dir, claude_session_id, stream=True) + [prompt]
-    env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir}
+    args = _build_claude_args(config_dir, claude_session_id, stream=True, model=model) + [prompt]
+    env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
+           **_otel_turn_env(session_id)}
 
     def sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
@@ -1410,20 +1499,27 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         _write_resume_launch_hint(workdir, new_session_id, session_id)
     # Harvest deliverables to the resume prefix so the Artifacts tab populates
     # without a pull-home. Best-effort — never breaks the stream's done frame.
+    artifact_keys: list = []
     try:
-        _sync_turn_artifacts(session_id, workdir, tenant_id)
+        artifact_keys = _sync_turn_artifacts(session_id, workdir, tenant_id).get("keys") or []
     except Exception as exc:  # noqa: BLE001
         logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
-    yield sse({"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id})
+    done = {"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id}
+    if artifact_keys:
+        done["artifacts"] = artifact_keys
+    yield sse(done)
 
 
-def _run_codex(prompt: str, workdir: str, codex_session_id: str | None) -> dict:
+def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
+               session_id: str | None = None, model: str | None = None) -> dict:
     """Run one Codex turn via the Mantle launcher (GPT-5.5). Resumes the prior
     conversation when codex_session_id (a codex thread_id) is supplied.
 
     We surface codex's thread_id through the same `claude_session_id` field the
     server returns, so the caller's resume handle is CLI-agnostic."""
-    env = {**os.environ, "WORKSPACE_DIR": workdir}
+    env = {**os.environ, "WORKSPACE_DIR": workdir, **_otel_turn_env(session_id)}
+    if model:
+        env["CODEX_MODEL"] = model  # run-codex.sh reads CODEX_MODEL
     args = ["/app/run-codex.sh", prompt]
     if codex_session_id:
         args.append(codex_session_id)
@@ -1671,10 +1767,13 @@ async def invocations(request: Request):
     cli = (payload.get("cli") or DEFAULT_CLI).lower()
     repo = payload.get("repo")
     claude_session_id = payload.get("claude_session_id")
+    # Per-turn model override (pipeline personas run on their own model).
+    model = (payload.get("model") or "").strip() or None
     user_id = payload.get("user_id")
     tenant_id = payload.get("tenant_id")  # S3 isolation boundary (see _tenant_root)
     config_version = payload.get("config_version")
     session_id = payload.get("session_id")  # isolates this session's checkout
+    origin = payload.get("origin")  # "workflow" = fleet-driven session, GC-eligible
     # Repopulate the private /tmp resume hint from the durable per-session copy if
     # this microVM was recycled — so even a config-only prepare leaves the
     # Terminal able to auto-resume the conversation.
@@ -1711,6 +1810,15 @@ async def invocations(request: Request):
     logger.info("turn_start", extra=redact(
         {"cli": cli, "repo": repo, "resume": bool(claude_session_id),
          "stream": stream, "prompt_head": prompt[:120]}))
+
+    # Workflow turns stamp their session dir (origin marker + activity mtime) so
+    # the GC below can distinguish them from human sessions, which it never touches.
+    if origin == "workflow":
+        _touch_workflow_marker(session_id)
+
+    # Opportunistic stale-session GC off the turn path (EFS listdir can be slow).
+    import threading as _threading
+    _threading.Thread(target=_gc_stale_sessions, daemon=True).start()
 
     # Config materialization is BEST-EFFORT — never turn-fatal. A degraded EFS
     # mount or unwritable config dir would otherwise 500 an otherwise-runnable
@@ -1873,15 +1981,15 @@ async def invocations(request: Request):
         gen = (
             _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
             if cli == "codex"
-            else _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
+            else _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id, model)
         )
         return StreamingResponse(gen, media_type="text/event-stream")
 
     try:
         if cli == "codex":
-            result = _run_codex(prompt, workdir, claude_session_id)
+            result = _run_codex(prompt, workdir, claude_session_id, session_id, model)
         elif cli == "claude":
-            result = _run_claude(prompt, workdir, claude_session_id)
+            result = _run_claude(prompt, workdir, claude_session_id, session_id, model)
         else:
             return JSONResponse({"error": f"unknown cli '{cli}'"}, status_code=400)
     except subprocess.TimeoutExpired:
@@ -1902,8 +2010,12 @@ async def invocations(request: Request):
 
     # Harvest any deliverables this turn produced to the resume prefix so they show
     # in the web Artifacts tab immediately — no pull-home required. Best-effort.
+    # The harvested keys ride the response so remote callers (workflow personas)
+    # can fetch deliverables they have no filesystem path to.
     try:
-        _sync_turn_artifacts(session_id, workdir, tenant_id)
+        synced = _sync_turn_artifacts(session_id, workdir, tenant_id)
+        if synced.get("keys"):
+            result["artifacts"] = synced["keys"]
     except Exception as exc:  # noqa: BLE001
         logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
 

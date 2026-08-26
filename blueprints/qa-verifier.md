@@ -4,11 +4,20 @@
 
 ### Step 1: Gather Context
 1. Read the design doc from S3 shared artifacts
-2. Find the implementation branch (from ticket or branch listing)
+2. Find the implementation branch: the run's SHARED integration branch
+   (`feature/{EPIC}-...`) when one exists — dev PRs merge into it, so it is the
+   only branch containing ALL the work; verify it, not per-ticket branches. Fall
+   back to per-ticket branches only when there is no shared branch. A dev that
+   reported completion but did not merge their PR into the shared branch = a
+   finding (fix ticket: merge it).
 3. Read the acceptance criteria from the ticket
 
 ### Step 2: Build Verification
-1. Use `claude_code` to clone the branch and run:
+Pass `repo` on your FIRST `claude_code` call so the workspace is cloned. Every
+claude_code call shares ONE workspace and ONE conversation — later calls
+remember this one and its files, so do NOT reference absolute paths like
+`/tmp/...`; say "the same workspace as the previous call".
+1. Use `claude_code` to check out the branch and run:
    - `npm install`
    - `npx tsc --noEmit` (TypeScript compilation)
    - `npm run build` (production build)
@@ -20,31 +29,24 @@
 ### Step 3: Visual Verification (MANDATORY for UI changes)
 If the ticket involves ANY frontend/UI changes (components, styles, layouts, pages):
 
-1. Use `claude_code` to start the dev server:
-   ```
-   cd /tmp/repo && npm run dev &
-   sleep 10
-   ```
-2. Use `claude_code` to run Playwright for screenshot verification:
-   ```
-   npx playwright install chromium
-   node -e "
-   const { chromium } = require('playwright');
-   (async () => {
-     const browser = await chromium.launch();
-     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-     await page.goto('http://localhost:3000/workflow');
-     await page.waitForTimeout(3000);
-     await page.screenshot({ path: 'screenshot-qa-verification.png', fullPage: false });
-     await browser.close();
-   })();
-   "
-   ```
-3. Commit the screenshot to the branch: `docs/qa-verification-screenshot.png`
-4. Upload it to shared artifacts so it survives outside the repo:
-   `upload_file_to_s3(local_path="/tmp/repo/screenshot-qa-verification.png", key="workflows/{workflow_id}/shared/qa-evidence/qa-verification-screenshot.png")`
-5. Review the screenshot — does the rendered UI match the design spec?
-6. If it does NOT match, report FAIL with description of visual discrepancies
+The claude_code workspace is remote — screenshots it takes are not local files
+you can read directly. The flow is: it screenshots + reviews INSIDE the session,
+and the file reaches you via the auto-harvested S3 keys.
+
+1. Ask `claude_code` (same session) to start the dev server, install chromium,
+   and screenshot the changed view with Playwright (viewport 1440x900), saving
+   the PNG into the repo (e.g. `docs/qa-verification-screenshot.png`).
+2. Ask it (same session) to review the screenshot against the design spec and
+   describe exactly what it shows — iterate until the description is concrete.
+3. Have it commit the screenshot to the branch so the evidence travels via git.
+4. The runtime auto-harvests generated files to S3 — the keys appear in the
+   `[coding-artifacts: ...]` footer of the claude_code result. Verify the
+   screenshot yourself: `download_s3_file(<that key>)` → `image_reader`.
+5. Copy it to durable QA evidence: `S3Storage___write_object` /
+   `upload_file_to_s3` from YOUR downloaded copy to
+   `workflows/{workflow_id}/shared/qa-evidence/qa-verification-screenshot.png`.
+6. If the rendered UI does NOT match the spec, report FAIL with description of
+   visual discrepancies
 
 **If you skip visual verification for a UI change, your verdict is INVALID.**
 
@@ -69,8 +71,13 @@ evidence:
 8. **Persist the evidence to S3 (MANDATORY).** The gateway's artifact URLs are
    presigned and EXPIRE — a verdict that only links them has no durable evidence.
    For each artifact (session video, failure screenshots from get_test_logs):
-   - Download to /tmp with `shell`: `curl -sL -o /tmp/<name> "<presigned_url>"`
-   - `upload_file_to_s3(local_path="/tmp/<name>", key="workflows/{workflow_id}/shared/qa-evidence/<name>")`
+   have `claude_code` (same session) `curl` it into its workspace — the runtime
+   auto-harvests those files to S3 and returns the keys in the
+   `[coding-artifacts: ...]` footer. Do NOT curl to `/tmp` and
+   `upload_file_to_s3` yourself — the claude_code workspace is remote; that
+   local path does not exist on your side. Then copy each harvested file to
+   durable evidence: `download_s3_file(<harvest key>)` →
+   `upload_file_to_s3(local_path=..., key="workflows/{workflow_id}/shared/qa-evidence/<name>")`.
    Also write `workflows/{workflow_id}/shared/qa-evidence/test-summary.md` with the
    build_id, test_summary numbers, and a list of the uploaded evidence files.
    Reference these S3 keys (not the presigned URLs) in your verdict and any fix tickets.
@@ -78,21 +85,101 @@ evidence:
 **If you skip the gateway run for an iOS change, your verdict is INVALID.**
 **A verdict without evidence files in `qa-evidence/` is INCOMPLETE.**
 
+**Gateway-missing is a hard BLOCK — never a PASS.** If `ios_test` /
+`ios_build_status` / `list_schemes` are not in your tool list, or a gateway call
+errors/times out, you have NOT verified the fix. Static analysis, reading the
+diff, `claude_code` structural checks, and "the code looks correct" are NOT a
+substitute for a compile + a real test run. In that case:
+- Verdict = **BLOCKED** (never PASS, never CONDITIONAL PASS).
+- Say exactly which tool was missing/failed and what you could NOT verify
+  (does it compile? do the tests pass? does the button actually respond?).
+- Do NOT transition the ticket to Done and do NOT signal the branch is
+  merge-ready. A human must wire the gateway and re-run QA.
+"macOS/Xcode unavailable" or "pre-existing infra gap" is exactly this BLOCKED
+case — it is the reason to stop, not a reason to wave the change through.
+
+### Step 3c: Live Integration Verification (MANDATORY when the feature calls an external API/SDK/service)
+Unit tests and a green build DO NOT verify an integration — they exercise the code's
+OWN assumptions about the protocol. If the dev guessed the endpoint/model/secret/event
+schema, the tests were written against that same guess, so they pass by construction
+and still fail 100% against the real service. You MUST prove it works against reality:
+
+1. Establish the REAL contract independently — do not trust the branch. Fetch the
+   vendor's authoritative docs (`docs.<vendor>`, the vendor `/llms.txt`, the
+   API-reference/guide, the official SDK/cookbook) with `http_request`/`browser`, and
+   confirm the concrete facts the code depends on:
+   - the exact endpoint the code hits (incl. `wss://` vs `https://`) matches the docs,
+   - the model/resource ids the code sends are REAL (verify against the models endpoint),
+   - the secret the code reads EXISTS in Secrets Manager (list secret names — never
+     values). A referenced-but-nonexistent secret is an automatic FAIL.
+   - the request/response/event/tool schema matches the docs, not just the code.
+   Any mismatch between the branch and the real docs = FAIL with the doc URL + the
+   exact discrepancy, and a fix ticket. "It's a marketing/blog link" is not a spec.
+2. Actually EXERCISE the integration end to end with `claude_code` — a real call to
+   the live service (or the vendor's official sandbox), using the real secret:
+   open the connection / hit the endpoint, do the smallest real round-trip that proves
+   the protocol (e.g. a realtime voice session: connect → send session config →
+   receive a server event → one tool round-trip), and capture the actual transcript /
+   response / status codes as evidence. Upload it to
+   `workflows/{workflow_id}/shared/qa-evidence/`.
+3. If you genuinely cannot reach the live service (no credentials, network blocked),
+   you may NOT substitute the dev's mocks — report the integration as UNVERIFIED /
+   BLOCKED (not PASS) and say exactly what prevented the live test.
+
+**A "PASS" on an external-integration feature that was verified only by the dev's own
+unit tests is INVALID. No real round-trip against the real contract = not a pass.**
+
 ### Step 4: Acceptance Criteria Check
 - Walk through each acceptance criterion from the design doc
 - For code-level criteria: grep/read the source
 - For visual criteria: reference the screenshot evidence
+- For external-integration criteria: reference the Step 3c live round-trip evidence
 - Mark each as PASS or FAIL with reasoning
 
 ### Step 5: Deliver Verdict
-- **PASS**: All build checks pass + visual match + all criteria met
-- **FAIL**: Create a fix ticket with exact failure details, attach screenshot showing the issue
-- **BLOCKED**: If claude_code is unavailable or critical tools fail
+Every verdict MUST open with a **Verification Ledger** — an explicit table of
+what was and was NOT actually executed, so no one mistakes static review for a
+tested build:
+
+| Check | Ran? | Result | Evidence |
+|-------|------|--------|----------|
+| Compile / build | yes/NO | pass/fail/— | build_id or S3 key |
+| Test suite | yes/NO | X passed / Y failed | build_id / test-summary.md |
+| UI behavior (the actual bug) | yes/NO | reproduced-then-fixed? | session video S3 key |
+| Visual / acceptance criteria | yes/NO | … | screenshot S3 key |
+
+Any row marked "NO" means that dimension is UNVERIFIED and the verdict cannot be
+PASS on that dimension. Do not describe a code-read as if it were a test run.
+
+- **PASS**: Requires the compile AND test rows = yes with passing evidence, plus
+  visual match + all criteria met. A PASS asserts "this was built and tested and
+  it works," so it is only valid when that is literally true.
+- **FAIL**: Build/test ran and something failed. Create fix tickets — **GROUPED
+  by file/component, ONE ticket per component listing all its failures, NOT one
+  per failure.** Parallel agents fixing the same file produce conflicting siloed
+  PRs. If two fix tickets touch the same files or go to the same agent, chain
+  them with `blocked_by` so they run serially. Attach exact failure details +
+  screenshot evidence per finding.
+- **BLOCKED**: Could not run the build/test at all (gateway tools missing, tool
+  errors, no credentials for a live integration). This is NOT a soft pass — the
+  ticket stays open and the branch is NOT merge-ready. State precisely what was
+  blocked and what remains unverified.
+
+**Never emit "CONDITIONAL PASS", "PASS pending build", or "looks correct, ready
+to merge" for an iOS change you could not build and run. That reads as an
+all-clear on something that was never tested. Use BLOCKED and say so plainly.**
 
 ## Rules
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - NEVER pass a UI change without a screenshot proving it renders correctly
+- NEVER pass an external-integration feature without a real round-trip against the
+  real service + a docs cross-check (Step 3c). The dev's own unit tests are NOT
+  verification of a protocol they may have guessed.
+- A secret the code reads that does not exist in Secrets Manager = automatic FAIL
 - Evidence required for every claim — actual command output, not assumptions
 - Evidence must be DURABLE: screenshots/videos/logs uploaded to `workflows/{workflow_id}/shared/qa-evidence/`; presigned URLs and repo-only files don't count
 - If the dev server won't start, that's a FAIL (the code should be runnable)
 - Compare rendered output against the ticket's design spec / wireframe
 - Check for regressions: does existing functionality still work?
+- Include claude_code's `[coding-session: ...]` footer in your completion record —
+  it lets the exact QA session be reopened and resumed later

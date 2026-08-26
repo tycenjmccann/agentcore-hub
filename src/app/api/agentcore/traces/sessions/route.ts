@@ -3,7 +3,7 @@ import {
   StartQueryCommand,
   GetQueryResultsCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
-import { getLogsClient, discoverAgents, DEFAULT_REGION } from "@/lib/agentcore-sdk";
+import { getLogsClient, discoverAgents, discoverLogGroups, DEFAULT_REGION } from "@/lib/agentcore-sdk";
 
 interface SessionRecord {
   sessionId: string;
@@ -37,9 +37,12 @@ export async function GET(req: NextRequest) {
   const startTime = endTime - days * 24 * 60 * 60 * 1000;
 
   try {
-    // Always query aws/spans — that's where OTEL trace spans (with session.id) live.
-    // Agent-specific log groups only contain application logs, not spans.
-    const logGroupName = explicitLogGroup || "aws/spans";
+    // OTEL trace spans live in aws/spans (legacy shared destination) AND in
+    // per-agent runtime log groups' `spans` stream (unified span destination,
+    // default for newer runtimes) — query both.
+    const logGroupNames = explicitLogGroup
+      ? [explicitLogGroup]
+      : ["aws/spans", ...(await discoverLogGroups(region))].slice(0, 50);
 
     // Build filter using structured OTEL fields (not raw JSON parsing)
     let filterClause = `| filter ispresent(attributes.session.id)`;
@@ -73,7 +76,7 @@ export async function GET(req: NextRequest) {
     `;
 
     const startRes = await client.send(new StartQueryCommand({
-      logGroupName,
+      logGroupNames,
       startTime: Math.floor(startTime / 1000),
       endTime: Math.floor(endTime / 1000),
       queryString,

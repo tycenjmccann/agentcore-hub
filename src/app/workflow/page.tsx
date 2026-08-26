@@ -6,7 +6,7 @@ import WorkflowBoard from "@/components/workflow/WorkflowBoard";
 import WorkflowManagerChat from "@/components/workflow/WorkflowManagerChat";
 import IntakeForm from "@/components/workflow/IntakeForm";
 import type { WorkflowState, WorkflowInput } from "@/lib/workflow/types";
-import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID } from "@/lib/workflow/workflow-defs";
+import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import DeleteConfirmationModal from "@/components/workflow/DeleteConfirmationModal";
 
 interface WorkflowSummary {
@@ -17,6 +17,7 @@ interface WorkflowSummary {
   startedAt: string;
   completedAt?: string;
   workflowType?: "feature" | "bug";
+  workflowDefId?: string;
 }
 
 function BugIcon({ className }: { className?: string }) {
@@ -73,7 +74,7 @@ export default function WorkflowPage() {
       // `input`) must never throw and blank the entire list. Coerce missing
       // fields and drop records with no usable id.
       const list: WorkflowSummary[] = (data.workflows || [])
-        .map((w: Partial<WorkflowState> & { workflowId?: string }) => ({
+        .map((w: Partial<WorkflowState> & { workflowId?: string; workflowDefId?: string }) => ({
           id: w.id || w.workflowId || "",
           phase: w.phase || "unknown",
           epicId: w.epicId || "",
@@ -81,6 +82,7 @@ export default function WorkflowPage() {
           startedAt: w.startedAt || "",
           completedAt: w.completedAt,
           workflowType: w.workflowType,
+          workflowDefId: w.workflowDefId,
         }))
         .filter((w: WorkflowSummary) => w.id);
       // Sort: active first, then by date descending
@@ -492,6 +494,8 @@ function WorkflowListItem({
   const isBug = workflow.workflowType === "bug";
   const isRunning = workflow.phase !== "complete" && workflow.phase !== "error" && workflow.phase !== "cancelled";
   const timeStr = formatRelativeTime(workflow.startedAt);
+  const def = getWorkflowDef(workflow.workflowDefId);
+  const defLabel = def.displayName || def.name;
 
   return (
     <div
@@ -577,18 +581,24 @@ function WorkflowListItem({
               </button>
             </div>
           )}
-          {!isRunning && onDelete && (
-            <div className="flex justify-end mt-1">
+          <div className="flex items-center justify-between mt-1">
+            <span
+              className="text-[9px] px-1.5 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)] border border-[var(--color-border)] font-medium uppercase tracking-wider truncate"
+              title={def.name}
+            >
+              {defLabel}
+            </span>
+            {!isRunning && onDelete && (
               <button
                 onClick={(e) => { e.stopPropagation(); onDelete(workflow.id); }}
-                className="p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-red-500/20 text-[var(--color-text-muted)] hover:text-red-400 transition-all"
+                className="p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-red-500/20 text-[var(--color-text-muted)] hover:text-red-400 transition-all flex-shrink-0"
                 title="Delete workflow"
                 aria-label={`Delete workflow: ${workflow.input.title}`}
               >
                 <Trash2 className="w-3 h-3" />
               </button>
-            </div>
-          )}
+            )}
+          </div>
         </div>
       </div>
     </div>

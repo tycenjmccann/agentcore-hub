@@ -20,9 +20,19 @@ import {
   type WorkflowDef,
 } from "@/lib/workflow/workflow-defs";
 
-/** agents.json entries are tagged with workflowDefId; missing → default workflow. */
-function agentWorkflowDefId(a: { workflowDefId?: string }): string {
-  return a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID;
+/**
+ * The workflow defs an agent belongs to. An agent may serve multiple pipelines
+ * (e.g. code reviewer + QA + CI run in both software-delivery and bug-fix) via
+ * `workflowDefIds`; a single `workflowDefId` is the one-def shorthand; missing →
+ * default workflow.
+ */
+function agentWorkflowDefIds(a: { workflowDefId?: string; workflowDefIds?: string[] }): string[] {
+  if (a.workflowDefIds?.length) return a.workflowDefIds;
+  return [a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID];
+}
+
+function agentInDef(a: { workflowDefId?: string; workflowDefIds?: string[] }, defId: string): boolean {
+  return agentWorkflowDefIds(a).includes(defId);
 }
 
 // ─── Tool → Icon Mapping ────────────────────────────────────────────────────
@@ -301,9 +311,9 @@ function phaseMapForDef(def: WorkflowDef): Record<string, string> {
 
 const EXCLUDED_TOOLS = new Set(["gateway", "browser", "invoke_team_agent"]);
 
-/** Agents belonging to a workflow definition (by workflowDefId tag). */
+/** Agents belonging to a workflow definition (by workflowDefId(s) tag). */
 function agentsForDef(defId: string) {
-  return agentsConfig.agents.filter((a) => agentWorkflowDefId(a) === defId);
+  return agentsConfig.agents.filter((a) => agentInDef(a, defId));
 }
 
 /** Count unique tools for a phase, excluding "gateway", "browser", "invoke_team_agent" */

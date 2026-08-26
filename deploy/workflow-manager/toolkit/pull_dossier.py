@@ -18,7 +18,11 @@ Reads (table/bucket names from env, agentcore-hub defaults):
   - prior analyses     ANALYSES_TABLE workflowDefId-index (last 5, compact)
 
 Writes {workspace}/dossier.json. Streaming chunk events (agent.streaming) are
-not stored in the dossier — they are reduced to per-agent counters.
+reduced to per-agent counters, PLUS the tail of each agent's streamed text
+(`streamCounts[agent].lastText`) and the timestamp of its last stream event
+(`lastStreamAt`). That tail is the agent's own last words — its verdict/summary
+— which is often the only record of what it decided when it dies before calling
+report_completion. The manager judges done-ness from it.
 """
 
 import argparse
@@ -167,9 +171,22 @@ SIGNIFICANT_PREFIXES = (
 )
 
 
+# How much of each agent's streamed text to keep as its "verdict tail". An agent
+# writes its conclusion (e.g. "QA VERDICT: PASS, zero regressions") to the stream
+# right before it finishes; if it then dies without report_completion, that tail
+# is the ONLY record of what it decided. Keeping it lets the manager judge
+# done-ness from what the agent actually said, not from a bare event count.
+STREAM_TAIL_CHARS = 4000
+
+
 def get_events(workflow_id, epic_id, ticket_ids):
     table = dynamodb.Table(EVENTS_TABLE)
     events, stream_counts = [], {}
+    # Per-agent rolling buffer of streamed text + the timestamp of the last stream
+    # event (any subtype) — so the manager can see BOTH what the agent last said
+    # and how long it has been silent.
+    stream_text = {}
+    last_stream_ts = {}
     pks = [workflow_id] + ([epic_id] if epic_id else []) + list(ticket_ids)
     for pk in dict.fromkeys(pks):
         kwargs = {"KeyConditionExpression": Key("workflowId").eq(pk)}
@@ -183,6 +200,15 @@ def get_events(workflow_id, epic_id, ticket_ids):
                     sub = detail.get("type", "text")
                     counts = stream_counts.setdefault(agent, {"text": 0, "trace": 0, "reasoning": 0})
                     counts[sub] = counts.get(sub, 0) + 1
+                    ts = item.get("timestamp", "")
+                    if ts > last_stream_ts.get(agent, ""):
+                        last_stream_ts[agent] = ts
+                    # Accumulate visible text + reasoning; a trace event has no
+                    # content, so it only advances the silence clock above.
+                    if sub in ("text", "reasoning"):
+                        content = detail.get("content") or ""
+                        if content:
+                            stream_text[agent] = (stream_text.get(agent, "") + content)[-STREAM_TAIL_CHARS:]
                     continue
                 if etype == "agent.started" and not (item.get("detail") or {}).get("workflowId"):
                     item["_pkNote"] = "ticket-keyed"
@@ -193,6 +219,14 @@ def get_events(workflow_id, epic_id, ticket_ids):
             kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
     dedup = {(e.get("workflowId"), e.get("eventId")): e for e in events}
     events = sorted(dedup.values(), key=lambda e: (e.get("timestamp", ""), e.get("eventId", "")))
+    # Fold the tail + silence timestamp into the per-agent stream summary so the
+    # dossier carries "what the agent last said" next to "how much it streamed".
+    for agent, counts in stream_counts.items():
+        tail = stream_text.get(agent)
+        if tail:
+            counts["lastText"] = tail
+        if last_stream_ts.get(agent):
+            counts["lastStreamAt"] = last_stream_ts[agent]
     return events, stream_counts
 
 

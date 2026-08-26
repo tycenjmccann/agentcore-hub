@@ -29,9 +29,18 @@ Process: start with ios_test → poll ios_build_status every ~30s until terminal
 report the test_summary + any failures as your evidence. A `BUILD_ERROR` status means
 it didn't compile (treat as FAIL with the build_errors as evidence).
 
+If `ios_test` / `ios_build_status` are NOT in your available tools, or a gateway
+call errors, you CANNOT verify an iOS change. Report **BLOCKED** — never PASS,
+never "CONDITIONAL PASS", never "looks correct, ready to merge". Static analysis
+is not a build. Say exactly what you could not verify (compiles? tests pass? does
+the button actually respond?) and do NOT signal the branch is merge-ready.
+
 ## CRITICAL RULES
 - Evidence required: actual command output, not "code looks correct"
 - If claude_code fails, report BLOCKED — do NOT fall back to code review only
+- iOS with no gateway tools = BLOCKED, not PASS. "No macOS/Xcode" is the reason to STOP, not to wave it through.
+- Open every verdict with a Verification Ledger (see blueprint Step 5): what you ACTUALLY built/ran/tested vs did not. Never present a code-read as a test run.
+- A PASS asserts "built + tested + works." Only use it when that is literally true.
 - FAIL verdicts must include exact error output and create fix tickets
 
 ## TOOL STATUS REPORTING

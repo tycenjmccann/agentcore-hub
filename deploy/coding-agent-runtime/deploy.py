@@ -150,8 +150,8 @@ def main() -> None:
         "AWS_REGION": region,
         "EVENTS_TABLE": os.environ.get("EVENTS_TABLE", "agentcore-hub-events"),
         "CLAUDE_CODE_USE_BEDROCK": "1",
-        "ANTHROPIC_MODEL": os.environ.get("ANTHROPIC_MODEL", "us.anthropic.claude-opus-4-6-v1"),
-        "CLAUDE_MODEL": os.environ.get("CLAUDE_MODEL", "us.anthropic.claude-opus-4-6-v1"),
+        "ANTHROPIC_MODEL": os.environ.get("ANTHROPIC_MODEL", "us.anthropic.claude-fable-5"),
+        "CLAUDE_MODEL": os.environ.get("CLAUDE_MODEL", "us.anthropic.claude-fable-5"),
         # Codex routes through Bedrock Mantle (us-east-2 for GPT-5.5) via Codex's
         # built-in amazon-bedrock provider; CODEX_MODEL overrides the model.
         "BEDROCK_MANTLE_REGION": os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2"),
@@ -165,6 +165,24 @@ def main() -> None:
         "PUPPETEER_EXECUTABLE_PATH": "/usr/bin/chromium",
         "PUPPETEER_SKIP_DOWNLOAD": "1",
         "PLAYWRIGHT_BROWSERS_PATH": "0",
+        # Point the CLIs' OTel SDK at the in-container collector sidecar, which
+        # SigV4-signs and forwards to AgentCore Observability. The image enables
+        # CLAUDE_CODE_ENABLE_TELEMETRY, but without exporters configured the CLI
+        # drops everything — this is why the dashboard showed 0 sessions/tokens.
+        # service.name follows the fleet convention (<runtimeName>.DEFAULT) so
+        # usage attributes to this agent's row.
+        "OTEL_SERVICE_NAME": f"{RUNTIME_NAME}.DEFAULT",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+        "OTEL_TRACES_EXPORTER": "otlp",
+        # Token usage rides on the api_request events (logs pipeline); the
+        # collector config has no metrics pipeline, so route metrics nowhere
+        # rather than at a signal the collector rejects.
+        "OTEL_LOGS_EXPORTER": "otlp",
+        "OTEL_METRICS_EXPORTER": "none",
+        # Turns are short-lived subprocesses — flush fast so telemetry lands
+        # before the CLI exits.
+        "OTEL_LOGS_EXPORT_INTERVAL": "5000",
     }
     # Artifact bucket — where per-user config bundles live; the server fetches
     # cloud-code/configs/{userId}/{version}.zip and materializes it on turn start.

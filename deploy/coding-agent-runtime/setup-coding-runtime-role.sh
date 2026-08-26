@@ -161,6 +161,7 @@ aws iam put-role-policy \
         \"Action\": [\"s3:PutObject\"],
         \"Resource\": [
           \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/checkpoint/*\",
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/resume/*\",
           \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/t/*\"
         ]
       },

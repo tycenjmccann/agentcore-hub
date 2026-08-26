@@ -66,6 +66,11 @@ export interface CloudCodeSession {
   // time; defaults to chat. A ported terminal session auto-runs `claude --resume`
   // in the PTY instead of firing the chat seed.
   defaultView?: "chat" | "terminal";
+  // Workflow-origin sessions (fleet personas delegating to the coding runtime).
+  // The workflow board uses these to link an agent's task to its live session.
+  origin?: "workflow";
+  workflowId?: string;
+  agentId?: string;
   // Soft-delete tombstone. Set (with a short DynamoDB `ttl`) when the user
   // deletes the session: the row vanishes from lists immediately but survives
   // until the TTL lapses; the table stream's REMOVE event then fires the reaper
@@ -85,4 +90,7 @@ export interface CloudCodeSessionSummary {
   createdAt: string;
   updatedAt: string;
   warmth: SessionWarmth;
+  origin?: "workflow";
+  workflowId?: string;
+  agentId?: string;
 }

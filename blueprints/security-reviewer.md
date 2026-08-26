@@ -13,8 +13,7 @@ You lead security review. You identify what needs reviewing (code changes, archi
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Perform a security review of this [design/code].\n\n[PASTE DESIGN DOC OR CODE]\n\nCheck for:\n1. Authentication/authorization gaps\n2. Input validation issues (injection, XSS, SSRF)\n3. Data exposure (logs, error messages, API responses)\n4. Secrets management (hardcoded keys, env var handling)\n5. OWASP Top 10 applicability\n6. Data privacy concerns (PII handling, encryption at rest/transit)\n7. Rate limiting and abuse prevention\n\nFor each finding: severity (Critical/High/Medium/Low), description, specific location, remediation.",
-    working_directory="/tmp"
+    task="Perform a security review of this [design/code].\n\n[PASTE DESIGN DOC OR CODE]\n\nCheck for:\n1. Authentication/authorization gaps\n2. Input validation issues (injection, XSS, SSRF)\n3. Data exposure (logs, error messages, API responses)\n4. Secrets management (hardcoded keys, env var handling)\n5. OWASP Top 10 applicability\n6. Data privacy concerns (PII handling, encryption at rest/transit)\n7. Rate limiting and abuse prevention\n\nFor each finding: severity (Critical/High/Medium/Low), description, specific location, remediation."
 )
 ```
 

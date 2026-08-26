@@ -195,6 +195,23 @@ aws iam put-role-policy \
   }"
 echo "   ✓ Attached Code Interpreter + Browser"
 
+# ─── Remote coding runtime (Cloud Code) ──────────────────────────────────────
+# Lets fleet personas run claude_code/codex turns on the standalone coding
+# runtime (persistent EFS sessions, resumable from the Cloud Code tab).
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name "InvokeCodingRuntime" \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Sid\": \"InvokeCodingRuntime\",
+      \"Effect\": \"Allow\",
+      \"Action\": [\"bedrock-agentcore:InvokeAgentRuntime\"],
+      \"Resource\": \"arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:runtime/*\"
+    }]
+  }"
+echo "   ✓ Attached coding-runtime invoke access"
+
 # ─── Memory (built-in Strands tool) ──────────────────────────────────────────
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
