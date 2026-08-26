@@ -27,7 +27,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
-import { readState, prepareGitHandoff, pullBranch } from "./git.js";
+import { readState, prepareGitHandoff, pullBranch, pullFromBundle } from "./git.js";
 import { newestTranscript, sessionIdForTranscript, installLocalTranscript } from "./transcript.js";
 import { detectArtifacts, uploadArtifact, stageArtifactLocally, downloadArtifact, ensureCloudCodeExcluded, fmtBytes } from "./artifacts.js";
 import { gatherBundle, type Cli } from "./config.js";
@@ -244,6 +244,8 @@ async function runPull(rawArgs: unknown) {
     repo?: string;
     bytes?: number;
     artifacts?: { rel: string; url: string; bytes: number }[];
+    returnBundleUrl?: string;
+    returnBundleBranch?: string;
     error?: string;
   };
   if (!res.ok) throw new Error(data.error || `checkpoint returned ${res.status}`);
@@ -262,13 +264,23 @@ async function runPull(rawArgs: unknown) {
   const stamp = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
   const placed = await installLocalTranscript(cwd, data.claudeSessionId, bytes, { stamp });
 
-  // 4. pull the cloud's branch home so local code matches the transcript.
+  // 4. pull the cloud's work home so local code matches the transcript.
   //    Exclude .cloud-code/ first: a prior port staged artifacts there, and
-  //    pullBranch refuses a dirty tree.
+  //    the pull legs refuse a dirty tree. bundle/selfContained sessions have no
+  //    writable origin — their cloud commits arrive via the return bundle.
   let gitNote = "no branch reported";
-  if (data.branch) {
+  await ensureCloudCodeExcluded(cwd).catch(() => {});
+  if (data.returnBundleUrl) {
     try {
-      await ensureCloudCodeExcluded(cwd).catch(() => {});
+      const rb = await fetch(data.returnBundleUrl, { signal: AbortSignal.timeout(120_000) });
+      if (!rb.ok) throw new Error(`return bundle download failed: ${rb.status}`);
+      const rbBytes = Buffer.from(await rb.arrayBuffer());
+      gitNote = await pullFromBundle(cwd, rbBytes, data.returnBundleBranch || data.branch || "cloud-code/ported-work");
+    } catch (e) {
+      gitNote = `return-bundle pull failed: ${(e as Error).message}`;
+    }
+  } else if (data.branch) {
+    try {
       gitNote = await pullBranch(cwd, data.branch);
     } catch (e) {
       gitNote = `branch pull failed: ${(e as Error).message}`;
@@ -305,7 +317,7 @@ async function runPull(rawArgs: unknown) {
     `✅ Pulled session home.`,
     ``,
     data.repo ? `Repo: ${data.repo}` : "",
-    data.branch ? `Branch: ${gitNote}` : "",
+    data.branch || data.returnBundleUrl ? `Code: ${gitNote}` : "",
     `Transcript: ${sizeMb} MB → ${placed.path}${placed.overwrote ? " (overwrote local)" : ""}`,
     placed.backup ? `Prior local copy backed up → ${placed.backup}` : "",
     artifactLine,

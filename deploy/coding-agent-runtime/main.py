@@ -33,6 +33,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -924,6 +925,44 @@ def _sync_turn_artifacts(session_id: str, workdir: str, tenant_id: str | None = 
     return _sync_artifacts(f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", workdir)
 
 
+def _checkpoint_return_bundle(session_id: str, workdir: str,
+                              tenant_id: str | None = None) -> dict | None:
+    """Return leg for bundle/selfContained sessions: the cloud's commits can't
+    ride `git fetch origin` home (origin is read-only or absent), so bundle the
+    workspace's full history and upload it. The laptop's pull leg fetches this
+    bundle and fast-forwards its branch from it instead of origin. Best-effort:
+    returns {key, bytes, branch} or None (no repo / bundle failed)."""
+    if not (ARTIFACT_BUCKET and os.path.isdir(os.path.join(workdir, ".git"))):
+        return None
+    bundle_path = os.path.join(_session_dir(session_id), ".return.bundle")
+    try:
+        res = subprocess.run(["git", "bundle", "create", bundle_path, "--all", "HEAD"],
+                             cwd=workdir, capture_output=True, text=True, timeout=300)
+        if res.returncode != 0:
+            logger.warning("return_bundle_create_failed", extra={"err": res.stderr.strip()[:200]})
+            return None
+        branch = None
+        br = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=workdir,
+                            capture_output=True, text=True, timeout=30)
+        if br.returncode == 0 and br.stdout.strip() != "HEAD":
+            branch = br.stdout.strip()
+        key = f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/return.bundle"
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        with open(bundle_path, "rb") as f:
+            data = f.read()
+        s3.put_object(Bucket=ARTIFACT_BUCKET, Key=key, Body=data,
+                      ContentType="application/octet-stream")
+        return {"key": key, "bytes": len(data), "branch": branch}
+    except Exception as exc:  # noqa: BLE001 — best-effort return leg
+        logger.warning("return_bundle_failed", extra={"error": str(exc)[:200]})
+        return None
+    finally:
+        try:
+            os.remove(bundle_path)
+        except OSError:
+            pass
+
+
 def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
     """Pull-home leg: upload deliverables under the CHECKPOINT prefix (keyed by the
     resume/claude session id) so the laptop pull brings them home too."""
@@ -1457,6 +1496,17 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
 
     proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+    # Watchdog: the buffered runner enforced TURN_TIMEOUT_S via subprocess.run;
+    # this loop blocks on readline, so a codex (or an invoked command) that wedges
+    # without closing stdout would pin the microVM HealthyBusy forever. Kill the
+    # process at the cap so the loop unwinds and a terminal frame is emitted.
+    timed_out = threading.Event()
+
+    def _kill_on_timeout():
+        timed_out.set()
+        proc.kill()
+    watchdog = threading.Timer(TURN_TIMEOUT_S, _kill_on_timeout)
+    watchdog.start()
     thread_id: str | None = codex_session_id
     reply_parts: list[str] = []          # only agent_message text = the actual reply
     emitted_any_reply = False            # did we stream reply text (vs only status)?
@@ -1473,16 +1523,25 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
             t = obj.get("type")
             if t == "thread.started" and obj.get("thread_id"):
                 thread_id = obj["thread_id"]
+                # A fresh thread.started after an error frame is run-codex.sh
+                # RETRYING (cold-engine Mantle errors). The prior attempt's
+                # failure must not poison a successful retry's result.
+                fail_detail = None
                 continue
             if t in ("error", "turn.failed"):
                 fail_detail = str(obj.get("message") or (obj.get("error") or {}).get("message") or "")[:400]
                 continue
-            # item.started/completed carry the step payload (older builds: msg).
+            if t == "turn.completed":
+                fail_detail = None  # a completed turn supersedes any earlier attempt's error
+                continue
+            # item.started/completed carry the step payload. Older codex builds
+            # wrap it as {"msg":{...}} with NO top-level type — treat a msg-shaped
+            # agent_message as completed (there are no partial frames there).
             item = obj.get("item") or obj.get("msg") or {}
             itype = item.get("type")
             if itype == "agent_message":
                 # The reply. completed frame has the whole message; stream it once.
-                if t == "item.completed":
+                if t == "item.completed" or (t is None and "msg" in obj):
                     msg = item.get("text") or item.get("message") or ""
                     if msg:
                         reply_parts.append(msg)
@@ -1499,6 +1558,13 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
         proc.wait(timeout=30)
     except Exception as exc:  # noqa: BLE001
         yield sse({"type": "error", "error": str(exc)[:600]})
+        return
+    finally:
+        watchdog.cancel()
+    if timed_out.is_set():
+        err = f"codex timed out after {TURN_TIMEOUT_S}s"
+        yield sse({"type": "error", "error": err})
+        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": thread_id})
         return
     if proc.returncode not in (0, None) or fail_detail:
         banner = ((proc.stderr.read() or "")[:200] if proc.stderr else "")
@@ -1778,7 +1844,14 @@ async def invocations(request: Request):
         # Harvest touched-untracked deliverables too (best-effort — never fails the
         # checkpoint). They surface in the web Artifacts tab under the same cp_id.
         artifacts = _checkpoint_artifacts(cp_id, workdir, tenant_id)
-        return JSONResponse({"checkpointed": True, **info, "artifacts": artifacts})
+        # bundle/selfContained sessions have no writable origin — the laptop
+        # can't `git fetch origin` the cloud's commits home. Ship them as a
+        # return bundle instead (the pull leg fetches from it directly).
+        return_bundle = None
+        if git_mode in ("bundle", "selfContained") or _selfcontained_workspace(session_id):
+            return_bundle = _checkpoint_return_bundle(cp_id, workdir, tenant_id)
+        return JSONResponse({"checkpointed": True, **info, "artifacts": artifacts,
+                             "return_bundle": return_bundle})
 
     # Pre-warm done: workspace cloned, branch checked out, transcript installed.
     # No CLI runs — the first real turn (on open) will be instant + warm.
