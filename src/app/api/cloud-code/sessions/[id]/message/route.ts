@@ -63,52 +63,93 @@ export async function POST(
     );
   }
 
-  const { tenantId } = getIdentity(request);
+  const { userId: requesterId, tenantId } = getIdentity(request);
   const session = await getOwnedSession(params.id, tenantId);
   if (!session) {
     return NextResponse.json({ error: "Session not found" }, { status: 404 });
   }
 
   const body = await request.json().catch(() => ({}));
-  const prompt: string = (body.prompt || "").trim();
-  if (!prompt) {
-    return NextResponse.json({ error: "prompt is required" }, { status: 400 });
-  }
+  let prompt: string = (body.prompt || "").trim();
   // For the ported seed, the prompt is a huge transcript; displayPrompt is the
   // short label we persist/render in the chat instead of the raw seed.
   const displayPrompt: string = (body.displayPrompt || "").trim();
+  // Chat attachments: artifact-prefix paths the user uploaded in the composer
+  // (e.g. uploads/x/screenshot.png). Sanitized to safe relative paths; the
+  // runtime downloads them into the workspace and appends their on-disk paths
+  // to the prompt so the CLI reads them with its file tools.
+  const attachments: string[] = Array.isArray(body.attachments)
+    ? body.attachments
+        .map((p: unknown) => String(p || "").replace(/^\/+/, ""))
+        .filter((p: string) => p && !p.includes("..") && p.length < 1024)
+        .slice(0, 20)
+    : [];
+  // Need either text or at least one attachment. An attachment-only turn gets a
+  // default instruction so the CLI knows to look at the file(s).
+  if (!prompt && attachments.length === 0) {
+    return NextResponse.json({ error: "prompt or attachments required" }, { status: 400 });
+  }
+  if (!prompt) prompt = "Take a look at the attached file(s).";
 
+  // Persist attachments structurally on the turn so the chat can render image
+  // thumbnails (presigned at read time) instead of a plain text label.
+  const ctFor = (p: string): string | undefined => {
+    const ext = p.split(".").pop()?.toLowerCase() || "";
+    const map: Record<string, string> = {
+      png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+      webp: "image/webp", svg: "image/svg+xml", pdf: "application/pdf",
+    };
+    return map[ext];
+  };
   const userTurn: CloudCodeTurn = {
     role: "user",
-    text: displayPrompt || prompt,
+    text: displayPrompt || (attachments.length && !body.prompt?.trim() ? "" : prompt),
     at: new Date().toISOString(),
+    ...(attachments.length
+      ? { attachments: attachments.map((p) => ({ path: p, name: p.split("/").pop() || p, contentType: ctFor(p) })) }
+      : {}),
   };
-  const wantStream =
-    request.nextUrl.searchParams.get("stream") === "1" && session.cli === "claude";
+  const wantStream = request.nextUrl.searchParams.get("stream") === "1";
   const userId = session.userId || DEFAULT_USER_ID;
   const sessionTenant = session.tenantId || DEFAULT_TENANT_ID;
   const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
   const region = request.nextUrl.searchParams.get("region") || undefined;
 
-  // Mint a short-lived GitHub App clone token for the session owner, scoped to
-  // this repo. Absent when the App isn't set up or the owner hasn't connected —
-  // the runtime then falls back to GITHUB_PAT. `connected` tells the runtime NOT
-  // to fall back when a connected owner's scoped mint was denied.
+  // Mint a short-lived GitHub App clone token, scoped to this repo. Bound to the
+  // VERIFIED REQUESTER, never session.userId: tenant sessions are shared
+  // (getOwnedSession only checks the tenant boundary), so minting off the
+  // creator's installation would hand a coworker the creator's repo access. Each
+  // turn clones with the token of whoever actually sent it. Absent when the App
+  // isn't set up or the requester hasn't connected — the runtime then falls back
+  // to GITHUB_PAT. `connected` tells the runtime NOT to fall back when a
+  // connected requester's scoped mint was denied.
   const { token: githubToken, connected: githubAppConnected } = await cloneTokenForUser(
-    sessionTenant,
-    userId,
-    session.repo
+    tenantId,
+    requesterId,
+    session.repo ?? session.cloneUrl
   );
 
-  // Ported-session first turn: tell the runtime to check out the pushed branch
-  // and natively resume the laptop transcript. Only on the seeding turn (while
-  // pendingSeed is set + no turns yet) — afterwards it resumes by session id.
-  const isPortSeed = Boolean(session.pendingSeed) && session.turns.length === 0;
-  const resumeFields = isPortSeed
+  // Ported session: re-send the resume fields on EVERY turn, not just the seed.
+  // The runtime's transcript install is keyed to the cwd it lands in (Claude
+  // scopes a conversation by its project-slug = realpath(workdir)). That cwd can
+  // legitimately change between turns — e.g. the seed turn's clone failed and
+  // fell back to the bare session dir, but a later turn's clone succeeds and
+  // lands in the repo subdir. A different cwd → different slug → `claude
+  // --resume <id>` can't find the transcript ("No conversation found").
+  // Re-sending makes the runtime re-place the .jsonl at the current cwd before
+  // resuming. Idempotent: the install dedupes when the transcript is already
+  // there, and branch/clone/bundle each have their own on-disk markers.
+  const resumeFields = session.resumeTranscriptKey
     ? {
         branch: session.branch,
         resumeTranscriptKey: session.resumeTranscriptKey,
         resumeSessionId: session.claudeSessionId,
+        // Flexible git handoff: how the laptop shipped its code (pushed branch,
+        // git bundle on a read-only origin, whole-repo bundle, or none) + the
+        // explicit clone URL.
+        gitMode: session.gitMode,
+        cloneUrl: session.cloneUrl,
+        resumeBundleKey: session.resumeBundleKey,
       }
     : {};
 
@@ -119,7 +160,7 @@ export async function POST(
       upstream = await invokeCodingTurnStream({
         sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
         claudeSessionId: session.claudeSessionId, userId, tenantId: sessionTenant, configVersion, region,
-        githubToken, githubAppConnected, ...resumeFields,
+        githubToken, githubAppConnected, attachments, ...resumeFields,
       });
     } catch (err) {
       return NextResponse.json({ error: (err as Error).message }, { status: 502 });
@@ -130,6 +171,18 @@ export async function POST(
 
     const out = new ReadableStream<Uint8Array>({
       async start(controller) {
+        // Relaying to the browser is best-effort; draining `upstream` and
+        // persisting the turn is not. A client that backgrounds/locks/refreshes
+        // mid-turn kills its socket, but the runtime keeps working — so once the
+        // browser is gone we stop enqueuing yet keep reading upstream to the end
+        // and still persist the full reply (recovered on the next GET). Without
+        // this, enqueue throws, the catch's own enqueue rethrows, and BOTH
+        // persist paths are skipped — the whole turn is lost.
+        let clientGone = false;
+        const relay = (chunk: Uint8Array) => {
+          if (clientGone) return;
+          try { controller.enqueue(chunk); } catch { clientGone = true; }
+        };
         try {
           // sseData parses the upstream frames; we tee text/done to persist and
           // relay each frame to the browser verbatim.
@@ -142,16 +195,18 @@ export async function POST(
               if (obj.claude_session_id) session.claudeSessionId = String(obj.claude_session_id);
               fullText = String(obj.response || fullText);
             }
-            controller.enqueue(enc.encode(`data: ${json}\n\n`));
+            relay(enc.encode(`data: ${json}\n\n`));
           }
           // Persist the completed turn (re-read + merge so a /stop write for this
-          // same interrupted turn isn't clobbered).
+          // same interrupted turn isn't clobbered) — even if the browser
+          // disconnected mid-stream.
           await persistTurn(session.sessionId, session, userTurn, fullText, prompt).catch(() => {});
         } catch (err) {
-          controller.enqueue(enc.encode(`data: ${JSON.stringify({ type: "error", error: (err as Error).message })}\n\n`));
-          await persistTurn(session.sessionId, session, userTurn, null, prompt).catch(() => {});
+          // Upstream itself failed. Keep any partial reply so it isn't lost.
+          relay(enc.encode(`data: ${JSON.stringify({ type: "error", error: (err as Error).message })}\n\n`));
+          await persistTurn(session.sessionId, session, userTurn, fullText || null, prompt).catch(() => {});
         } finally {
-          controller.close();
+          if (!clientGone) { try { controller.close(); } catch { /* already closed */ } }
         }
       },
     });
@@ -170,7 +225,7 @@ export async function POST(
     const result = await invokeCodingTurn({
       sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
       claudeSessionId: session.claudeSessionId, userId, tenantId: sessionTenant, configVersion, region,
-      githubToken, githubAppConnected, ...resumeFields,
+      githubToken, githubAppConnected, attachments, ...resumeFields,
     });
 
     const agentTurn: CloudCodeTurn = { role: "agent", text: result.response, at: new Date().toISOString() };

@@ -151,7 +151,8 @@ aws iam put-role-policy \
         \"Action\": [\"s3:GetObject\"],
         \"Resource\": [
           \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/configs/*\",
-          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/resume/*\"
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/resume/*\",
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/t/*\"
         ]
       },
       {
@@ -160,7 +161,18 @@ aws iam put-role-policy \
         \"Action\": [\"s3:PutObject\"],
         \"Resource\": [
           \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/checkpoint/*\",
-          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/resume/*\"
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/resume/*\",
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/t/*\"
+        ]
+      },
+      {
+        \"Sid\": \"CloudCodePurgeDelete\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"s3:DeleteObject\"],
+        \"Resource\": [
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/resume/*\",
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/checkpoint/*\",
+          \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/t/*\"
         ]
       },
       {
@@ -168,7 +180,7 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": [\"s3:ListBucket\"],
         \"Resource\": [\"arn:aws:s3:::${ARTIFACT_BUCKET}\"],
-        \"Condition\": { \"StringLike\": { \"s3:prefix\": [\"cloud-code/configs/*\", \"cloud-code/resume/*\"] } }
+        \"Condition\": { \"StringLike\": { \"s3:prefix\": [\"cloud-code/configs/*\", \"cloud-code/resume/*\", \"cloud-code/checkpoint/*\", \"cloud-code/t/*\"] } }
       }
     ]
   }"

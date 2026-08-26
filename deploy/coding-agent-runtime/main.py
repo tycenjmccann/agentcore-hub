@@ -24,6 +24,7 @@ The OTel collector sidecar (otel-collector-config.yaml) forwards each CLI's
 telemetry to CloudWatch (aws/spans) so every tool call is a trace.
 """
 
+import glob
 import io
 import json
 import os
@@ -32,8 +33,10 @@ import shlex
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import zipfile
+from datetime import datetime, timezone
 
 import boto3
 import uvicorn
@@ -414,6 +417,78 @@ def _session_dir(session_id: str | None) -> str:
     return os.path.join(WORKSPACE_ROOT, "sessions", safe)
 
 
+# The resume hint shell-init reads is CONTAINER-LOCAL (/tmp) — never at
+# $WORKSPACE_ROOT. EFS is shared across every session's microVM, so a hint at the
+# shared root would leak: a different session's Terminal would source it and
+# `claude --resume` the wrong conversation. /tmp is private to this microVM (one
+# per runtimeSessionId).
+#
+# But /tmp dies when the microVM is recycled, and a cold VM may be reached only
+# by the config-only prepare path that doesn't recompute the hint. So we ALSO
+# persist a durable copy in the per-session EFS dir — session-scoped
+# (sessions/<id>/…), not the shared root, so it can't leak — and restore /tmp
+# from it at the start of every invocation. Durable source of truth, private
+# runtime copy.
+RESUME_HINT_PATH = "/tmp/.resume-launch.sh"  # noqa: S108 — container-local, see above
+RESUME_HINT_NAME = ".resume-launch.sh"
+
+
+def _write_resume_launch_hint(workdir: str, resume_sid: str,
+                              runtime_session_id: str | None,
+                              cli: str = "claude") -> bool:
+    """Write the hint the interactive shell reads on launch to
+    `cd <workdir> && <cli> --resume <resume_sid>` itself — so the browser never
+    types the resume command into an already-running TUI on reattach.
+
+    Two distinct ids: `resume_sid` is the conversation id (the resume arg);
+    `runtime_session_id` is the AgentCore runtimeSessionId that keys the
+    per-session EFS dir AND is what _restore_resume_launch_hint looks up later.
+    They differ, so the durable copy MUST be keyed by the runtime id or restore
+    would miss it on a recycled VM."""
+    body = (
+        f"CC_RESUME_DIR={shlex.quote(os.path.realpath(workdir))}\n"
+        f"CC_RESUME_SID={shlex.quote(resume_sid)}\n"
+        f"CC_RESUME_CLI={shlex.quote(cli)}\n"
+    )
+    ok = False
+    try:
+        with open(RESUME_HINT_PATH, "w") as f:
+            f.write(body)
+        ok = True
+    except OSError as exc:
+        logger.warning("resume_launch_hint_failed", extra={"error": str(exc)[:200]})
+    if runtime_session_id:
+        try:
+            sdir = _session_dir(runtime_session_id)
+            os.makedirs(sdir, exist_ok=True)
+            with open(os.path.join(sdir, RESUME_HINT_NAME), "w") as f:
+                f.write(body)
+        except OSError as exc:
+            logger.warning("resume_hint_persist_failed", extra={"error": str(exc)[:200]})
+    if ok:
+        logger.info("resume_launch_hint_written", extra={"workdir": workdir})
+    return ok
+
+
+def _restore_resume_launch_hint(session_id: str | None) -> None:
+    """Repopulate the private /tmp hint from the durable per-session EFS copy if
+    /tmp is missing (a recycled microVM). Lets a session resume in the Terminal
+    even when it's reached only by the config-only prepare path. No-op if /tmp
+    already has it or there's no durable copy."""
+    if not session_id or os.path.exists(RESUME_HINT_PATH):
+        return
+    src = os.path.join(_session_dir(session_id), RESUME_HINT_NAME)
+    try:
+        if os.path.isfile(src):
+            with open(src) as f:
+                body = f.read()
+            with open(RESUME_HINT_PATH, "w") as f:
+                f.write(body)
+            logger.info("resume_launch_hint_restored", extra={"session": session_id})
+    except OSError as exc:
+        logger.warning("resume_hint_restore_failed", extra={"error": str(exc)[:200]})
+
+
 def _claude_project_slug(workdir: str) -> str:
     """Claude Code stores a conversation under
     {CLAUDE_CONFIG_DIR}/projects/<slug>/<sessionId>.jsonl where <slug> is the
@@ -459,6 +534,166 @@ def _install_resume_transcript(s3_key: str, session_id: str, workdir: str) -> bo
     except Exception as exc:  # noqa: BLE001 — a missing transcript is non-fatal; fall back to a cold turn
         logger.warning("resume_transcript_install_failed", extra={"key": s3_key, "error": str(exc)[:200]})
         return False
+
+
+def _sanitize_codex_rollout(raw: bytes) -> bytes:
+    """Make a laptop-recorded codex rollout safe to resume against Bedrock Mantle.
+
+    Codex records reasoning items with provider-bound `encrypted_content`. A
+    rollout recorded on a laptop (model_provider "openai") carries OpenAI-encrypted
+    blobs; replaying them to Mantle's Responses API fails hard with
+    `validation_error: encrypted content missing recognized prefix (expected
+    rsn_/smry_)` — codex exits 1 and the whole resume dies. We drop reasoning items
+    whose encrypted blob doesn't carry a Mantle-recognized prefix (portable ones,
+    e.g. a prior cloud turn's rsn_/smry_ content, are kept).
+
+    We also drop a trailing unpaired `function_call` (no matching
+    function_call_output) — the port tool-call is often the last row the laptop
+    wrote before shipping, and the Responses API rejects a dangling call on replay.
+
+    Cross-provider only: the pristine S3 copy is untouched, so a pull-home resume
+    against the laptop's own OpenAI key still has its native encrypted reasoning."""
+    lines = raw.split(b"\n")
+    parsed: list[tuple[bytes, dict | None]] = []
+    output_ids: set[str] = set()
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            parsed.append((ln, None)); continue
+        try:
+            obj = json.loads(s)
+        except Exception:  # noqa: BLE001 — keep non-JSON lines verbatim
+            parsed.append((ln, None)); continue
+        parsed.append((ln, obj))
+        p = obj.get("payload") or {}
+        if obj.get("type") == "response_item" and p.get("type") == "function_call_output":
+            cid = p.get("call_id")
+            if cid:
+                output_ids.add(cid)
+
+    def _encrypted_portable(p: dict) -> bool:
+        blobs: list[str] = []
+        if p.get("encrypted_content"):
+            blobs.append(p["encrypted_content"])
+        for c in (p.get("content") or []):
+            if isinstance(c, dict) and c.get("encrypted_content"):
+                blobs.append(c["encrypted_content"])
+        if not blobs:
+            return True  # no encrypted payload → nothing provider-bound to reject
+        return all(str(b).startswith(("rsn_", "smry_")) for b in blobs)
+
+    kept: list[bytes] = []
+    dropped_reasoning = dropped_calls = 0
+    for ln, obj in parsed:
+        if obj and obj.get("type") == "response_item":
+            p = obj.get("payload") or {}
+            t = p.get("type")
+            if t == "reasoning" and not _encrypted_portable(p):
+                dropped_reasoning += 1; continue
+            if t == "function_call" and p.get("call_id") not in output_ids:
+                dropped_calls += 1; continue
+        kept.append(ln)
+
+    if not (dropped_reasoning or dropped_calls):
+        return raw
+    logger.info("codex_rollout_sanitized",
+                extra={"dropped_reasoning": dropped_reasoning, "dropped_calls": dropped_calls})
+    return b"\n".join(kept)
+
+
+def _find_codex_rollout(session_id: str) -> str | None:
+    """Locate a codex session's rollout .jsonl by its thread uuid. Codex stores
+    one file per session at {CODEX_HOME}/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl,
+    so we glob the tree for the uuid anywhere in the filename and take the newest
+    match (a resumed session keeps the same uuid)."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", session_id)
+    matches: list[str] = []
+    for cid in {session_id, safe}:
+        matches += glob.glob(
+            os.path.join(CODEX_HOME, "sessions", "**", f"*{glob.escape(cid)}*.jsonl"),
+            recursive=True,
+        )
+    return max(matches, key=os.path.getmtime) if matches else None
+
+
+def _install_codex_resume_transcript(s3_key: str, session_id: str) -> bool:
+    """Codex analog of _install_resume_transcript. Download a ported codex rollout
+    from S3 and place it under {CODEX_HOME}/sessions so `codex resume <uuid>`
+    finds it. Codex locates a session by parsing BOTH a timestamp and the uuid out
+    of the filename (rollout-<YYYY-MM-DDThh-mm-ss>-<uuid>.jsonl), so the name must
+    match that shape or the scan skips it. Idempotent: if a rollout for this uuid
+    is already on disk (e.g. a prior turn grew it), keep that grown copy.
+
+    The downloaded bytes are sanitized (_sanitize_codex_rollout) before landing on
+    disk: a laptop-recorded rollout's OpenAI-encrypted reasoning would otherwise
+    make the first Mantle resume fail with a validation_error."""
+    if not (s3_key and session_id and ARTIFACT_BUCKET):
+        return False
+    existing = _find_codex_rollout(session_id)
+    if existing:
+        # Already on disk (possibly grown by a prior cloud turn). Self-heal a
+        # rollout installed before the sanitizer existed: re-sanitize in place —
+        # no-op once clean, and portable rsn_/smry_ reasoning is preserved.
+        try:
+            with open(existing, "rb") as f:
+                cur = f.read()
+            fixed = _sanitize_codex_rollout(cur)
+            if fixed != cur:
+                with open(existing, "wb") as f:
+                    f.write(fixed)
+                logger.info("codex_rollout_resanitized", extra={"session": session_id})
+        except Exception as exc:  # noqa: BLE001 — non-fatal
+            logger.warning("codex_rollout_resanitize_failed", extra={"error": str(exc)[:200]})
+        return True
+    now = datetime.now(timezone.utc)
+    dest_dir = os.path.join(CODEX_HOME, "sessions",
+                            f"{now.year:04d}", f"{now.month:02d}", f"{now.day:02d}")
+    ts = now.strftime("%Y-%m-%dT%H-%M-%S")
+    dest = os.path.join(dest_dir, f"rollout-{ts}-{session_id}.jsonl")
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        obj = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=s3_key)
+        with open(dest, "wb") as f:
+            f.write(_sanitize_codex_rollout(obj["Body"].read()))
+        logger.info("codex_resume_transcript_installed", extra={"session": session_id})
+        return True
+    except Exception as exc:  # noqa: BLE001 — non-fatal; fall back to a cold turn
+        logger.warning("codex_resume_transcript_install_failed",
+                       extra={"key": s3_key, "error": str(exc)[:200]})
+        return False
+
+
+def _fetch_attachments(artifact_prefix: str, attachments: list, workdir: str) -> list[str]:
+    """Download chat attachments (paths relative to the session's artifact
+    prefix) into the workspace's .cloud-code/artifacts/ and return their absolute
+    on-disk paths. Traversal-guarded; best-effort per file — one bad attachment
+    never fails the turn."""
+    if not (artifact_prefix and attachments and workdir and ARTIFACT_BUCKET):
+        return []
+    dest_root = os.path.join(workdir, ".cloud-code", "artifacts")
+    real_root = os.path.realpath(dest_root)
+    paths: list[str] = []
+    try:
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        for rel in attachments[:20]:
+            rel = str(rel or "").lstrip("/")
+            if not rel or ".." in rel.split("/"):
+                continue
+            dest = os.path.join(dest_root, rel)
+            real_dest = os.path.realpath(dest)
+            if real_dest != real_root and not real_dest.startswith(real_root + os.sep):
+                continue
+            try:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as fh:
+                    s3.download_fileobj(ARTIFACT_BUCKET, artifact_prefix + rel, fh)
+                paths.append(dest)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("attachment_fetch_failed", extra={"rel": rel, "error": str(exc)[:200]})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("attachments_fetch_failed", extra={"error": str(exc)[:200]})
+    return paths
 
 
 def _install_artifacts(artifact_prefix: str, workdir: str, session_id: str | None) -> int:
@@ -695,6 +930,44 @@ def _sync_turn_artifacts(session_id: str, workdir: str, tenant_id: str | None = 
     return _sync_artifacts(f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", workdir)
 
 
+def _checkpoint_return_bundle(session_id: str, workdir: str,
+                              tenant_id: str | None = None) -> dict | None:
+    """Return leg for bundle/selfContained sessions: the cloud's commits can't
+    ride `git fetch origin` home (origin is read-only or absent), so bundle the
+    workspace's full history and upload it. The laptop's pull leg fetches this
+    bundle and fast-forwards its branch from it instead of origin. Best-effort:
+    returns {key, bytes, branch} or None (no repo / bundle failed)."""
+    if not (ARTIFACT_BUCKET and os.path.isdir(os.path.join(workdir, ".git"))):
+        return None
+    bundle_path = os.path.join(_session_dir(session_id), ".return.bundle")
+    try:
+        res = subprocess.run(["git", "bundle", "create", bundle_path, "--all", "HEAD"],
+                             cwd=workdir, capture_output=True, text=True, timeout=300)
+        if res.returncode != 0:
+            logger.warning("return_bundle_create_failed", extra={"err": res.stderr.strip()[:200]})
+            return None
+        branch = None
+        br = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=workdir,
+                            capture_output=True, text=True, timeout=30)
+        if br.returncode == 0 and br.stdout.strip() != "HEAD":
+            branch = br.stdout.strip()
+        key = f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/return.bundle"
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        with open(bundle_path, "rb") as f:
+            data = f.read()
+        s3.put_object(Bucket=ARTIFACT_BUCKET, Key=key, Body=data,
+                      ContentType="application/octet-stream")
+        return {"key": key, "bytes": len(data), "branch": branch}
+    except Exception as exc:  # noqa: BLE001 — best-effort return leg
+        logger.warning("return_bundle_failed", extra={"error": str(exc)[:200]})
+        return None
+    finally:
+        try:
+            os.remove(bundle_path)
+        except OSError:
+            pass
+
+
 def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
     """Pull-home leg: upload deliverables under the CHECKPOINT prefix (keyed by the
     resume/claude session id) so the laptop pull brings them home too."""
@@ -767,12 +1040,19 @@ def _gc_stale_sessions() -> None:
         logger.warning("session_gc_failed", extra={"error": str(exc)[:200]})
 
 
-def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
+def _ensure_workspace(repo: str | None, session_id: str | None = None,
+                      clone_url: str | None = None) -> str:
     """Return the working dir for this session. If repo given and not yet cloned,
     clone it under the session's own dir (on EFS, so a re-invoke with the same
-    runtimeSessionId finds it warm — no re-clone)."""
+    runtimeSessionId finds it warm — no re-clone).
+
+    clone_url overrides the URL derived from repo — used by the port handoff so
+    the cloud clones the laptop's exact origin (which may be a public upstream the
+    account has no push rights to; bundle mode then layers the laptop's commits)."""
     base = _session_dir(session_id)
-    if not repo:
+    # A non-github / self-hosted port can ship clone_url WITHOUT an owner/name
+    # repo. Treat clone_url as the clonable target then (slug derived from it).
+    if not repo and not clone_url:
         # A chat resume with no repo just needs a cwd. Tolerate a degraded EFS
         # mount (makedirs can raise FileExistsError when the path exists but isn't
         # a dir) — fall back to any usable existing dir rather than 500 the turn.
@@ -784,24 +1064,282 @@ def _ensure_workspace(repo: str | None, session_id: str | None = None) -> str:
             if os.path.isdir(base):
                 return base
             return WORKSPACE_ROOT if os.path.isdir(WORKSPACE_ROOT) else "/tmp"
-    if not _valid_repo(repo):
+    if repo and not _valid_repo(repo):
         raise ValueError(
             f"'{repo}' is not a valid repository. Use 'owner/name' or a full "
             f"clone URL. (A bare owner can't be cloned — leave repo empty and "
             f"ask the agent to 'gh repo list {repo}' instead.)"
         )
-    slug = _slugify_repo(repo)
+    slug = _slugify_repo(repo or clone_url or "default")
     wd = os.path.join(base, slug)
     if os.path.isdir(os.path.join(wd, ".git")):
         logger.info("workspace_warm", extra={"slug": slug})
         return wd
     os.makedirs(base, exist_ok=True)
-    clone_url = repo if repo.startswith(("http://", "https://", "git@")) else f"https://github.com/{repo}.git"
-    logger.info("workspace_cloning", extra={"slug": slug, "url": clone_url.split("@")[-1]})
-    res = subprocess.run(["git", "clone", clone_url, wd], capture_output=True, text=True, timeout=300)
+    url = clone_url or (repo if repo.startswith(("http://", "https://", "git@")) else f"https://github.com/{repo}.git")
+    logger.info("workspace_cloning", extra={"slug": slug, "url": url.split("@")[-1]})
+    res = subprocess.run(["git", "clone", url, wd], capture_output=True, text=True, timeout=300)
     if res.returncode != 0:
         raise RuntimeError(f"git clone failed: {res.stderr.strip()[:400]}")
     return wd
+
+
+def _safe_branch_name(name: str | None) -> str:
+    """A git-legal local branch name. Falls back to a stable default so bundle
+    mode always lands on a NAMED branch (never detached HEAD) — that's what lets
+    pull-home bring cloud commits back via a real branch."""
+    cand = (name or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", cand) and not cand.startswith("-"):
+        return cand
+    return "cloud-code/ported-work"
+
+
+def _apply_resume_bundle(s3_key: str, workdir: str, session_id: str | None,
+                         branch: str | None = None) -> bool:
+    """Bundle mode: download the laptop's git bundle from S3 and layer its commits
+    onto the freshly-cloned upstream. The bundle holds base..HEAD (the laptop's
+    in-flight commits); we fetch all its refs and check out its tip ON A NAMED
+    BRANCH so the workspace matches the laptop without push access to origin —
+    and so checkpoint/pull-home can return cloud commits on a real branch (a
+    detached HEAD would make pull try origin/HEAD and lose them).
+
+    Idempotent per warm microVM via a marker. Best-effort: a bad/missing bundle
+    leaves the clean clone in place (the agent can still work) rather than failing
+    the turn. Returns True if the bundle's work was checked out."""
+    if not (s3_key and ARTIFACT_BUCKET and os.path.isdir(os.path.join(workdir, ".git"))):
+        return False
+    marker = os.path.join(_session_dir(session_id), ".bundle-applied")
+    try:
+        if os.path.exists(marker):
+            with open(marker) as f:
+                if f.read().strip() == s3_key:
+                    return True  # already applied on this warm VM
+    except OSError:
+        pass
+    try:
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        obj = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=s3_key)
+        raw = obj["Body"].read()
+    except Exception as exc:  # noqa: BLE001 — missing bundle is non-fatal
+        logger.warning("bundle_fetch_failed", extra={"key": s3_key, "error": str(exc)[:200]})
+        return False
+
+    bundle_path = os.path.join(workdir, ".cloud-code-work.bundle")
+    try:
+        with open(bundle_path, "wb") as f:
+            f.write(raw)
+        # Verify it's a real bundle before fetching (clean error if not).
+        verify = subprocess.run(["git", "bundle", "verify", bundle_path], cwd=workdir,
+                                capture_output=True, text=True, timeout=60)
+        if verify.returncode != 0:
+            logger.warning("bundle_verify_failed", extra={"err": verify.stderr.strip()[:200]})
+            return False
+        # Fetch every ref the bundle carries into a namespace, then check out its tip.
+        fetch = subprocess.run(
+            ["git", "fetch", bundle_path, "+refs/heads/*:refs/remotes/cc-port/*", "HEAD"],
+            cwd=workdir, capture_output=True, text=True, timeout=120)
+        if fetch.returncode != 0:
+            logger.warning("bundle_fetch_refs_failed", extra={"err": fetch.stderr.strip()[:200]})
+            return False
+        # FETCH_HEAD is the bundle's HEAD (the laptop's tip). Land it on a NAMED
+        # branch (-B = create or reset) so the workspace isn't on a detached HEAD —
+        # checkpoint reads a real branch name and pull-home can fast-forward it.
+        local_branch = _safe_branch_name(branch)
+        co = subprocess.run(["git", "checkout", "-B", local_branch, "FETCH_HEAD"], cwd=workdir,
+                            capture_output=True, text=True, timeout=60)
+        if co.returncode != 0:
+            logger.warning("bundle_checkout_failed", extra={"err": co.stderr.strip()[:200]})
+            return False
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w") as f:
+            f.write(s3_key)
+        logger.info("bundle_applied", extra={"key": s3_key, "branch": local_branch})
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bundle_apply_failed", extra={"error": str(exc)[:200]})
+        return False
+    finally:
+        try:
+            os.remove(bundle_path)
+        except OSError:
+            pass
+
+
+def _purge_session(session_id: str, conversation_id: str | None = None,
+                   cli: str = "claude", tenant_id: str | None = None) -> dict:
+    """Reclaim everything a session left on disk, so deleting it in the UI also
+    frees the backend storage it was paying for. Three stores:
+
+      • EFS  — the session's isolated dir (clone, resume hint, markers) at
+               sessions/<id>/. The big one: a full clone can be 100s of MB.
+      • EFS  — the conversation transcript, which lives OUTSIDE that dir:
+                 claude → $CLAUDE_CONFIG_DIR/projects/<workdir-slug>/<id>.jsonl
+                 codex  → $CODEX_HOME/sessions/**/<...id...>  (rollout files)
+               We don't know the claude slug here, but the id is a unique filename,
+               so we glob for it; for codex we match files whose name carries the id.
+      • S3   — the ported transcript + git bundle (resume/<sessionId>/) and any
+               checkpoint uploads. Checkpoints are keyed by the CONVERSATION id
+               (checkpoint/<conversationId>/), not the runtime session id — purge
+               both forms so a checkpointed session doesn't leak its transcript.
+
+    Idempotent: a missing dir / already-deleted key is success, so a double-delete
+    or a purge of a session that never warmed a VM is harmless. But a FAILED
+    operation (EFS unavailable, S3 AccessDenied) is reported via ok=False so the
+    reaper raises and the stream redelivers — returning success on a swallowed
+    failure would permanently leak the storage (the lifecycle backstop doesn't
+    cover EFS or tenant-scoped keys). The live microVM is NOT torn down here —
+    the caller stops the runtime session separately."""
+    removed = {"efs": False, "s3_objects": 0, "transcripts": 0, "ok": True}
+    # EFS: rm -rf the per-session dir. _session_dir sanitizes the id, and we re-check
+    # the result stays under sessions/ so a crafted id can't escape the namespace.
+    sdir = _session_dir(session_id)
+    sessions_root = os.path.join(WORKSPACE_ROOT, "sessions")
+    if os.path.realpath(sdir).startswith(os.path.realpath(sessions_root) + os.sep):
+        try:
+            if os.path.isdir(sdir):
+                shutil.rmtree(sdir)
+                removed["efs"] = True
+        except OSError as exc:
+            removed["ok"] = False
+            logger.warning("purge_efs_failed", extra={"session": session_id, "error": str(exc)[:200]})
+    # EFS transcript: the conversation log lives OUTSIDE sessions/<id> (keyed by
+    # the cwd slug for claude, by the rollout path for codex), so rmtree above
+    # misses it. The conversation id is unique, so glob for files carrying it.
+    if conversation_id:
+        safe_cid = re.sub(r"[^A-Za-z0-9._-]", "-", conversation_id)
+        # Escape the id before embedding it in a glob: a raw id containing glob
+        # metacharacters (e.g. a ported session with claudeSessionId "*") would
+        # otherwise expand and delete EVERY session's transcript. The directory
+        # components stay literal; only the id substring is escaped.
+        glob_cid = glob.escape(conversation_id)
+        if cli == "codex":
+            # Codex rollout files persist under $CODEX_HOME/sessions/**; the id is
+            # embedded in the filename (rollout-...-<uuid>.jsonl). Match it
+            # anywhere in the tree, and also try the sanitized id form.
+            patterns = [
+                os.path.join(CODEX_HOME, "sessions", "**", f"*{glob_cid}*"),
+                os.path.join(CODEX_HOME, "sessions", "**", f"*{glob.escape(safe_cid)}*"),
+            ]
+        else:
+            # Claude: $CLAUDE_CONFIG_DIR/projects/<workdir-slug>/<id>.jsonl. The
+            # slug derives from the workdir's realpath — and the SAME conversation
+            # id can be ported into MULTIPLE cloud sessions, each with its own
+            # per-session workdir. Only delete transcripts whose slug belongs to
+            # THIS session's dir (sessions/<sid>/...), so purging one cloud
+            # session can't destroy a sibling's still-active transcript.
+            session_slug_prefix = _claude_project_slug(sdir)
+            patterns = [os.path.join(CLAUDE_CONFIG_DIR, "projects",
+                                     f"{session_slug_prefix}*",
+                                     f"{glob.escape(safe_cid)}.jsonl")]
+        try:
+            seen: set[str] = set()
+            for pat in patterns:
+                for path in glob.glob(pat, recursive=True):
+                    if path in seen or not os.path.isfile(path):
+                        continue
+                    seen.add(path)
+                    try:
+                        os.remove(path)
+                        removed["transcripts"] += 1
+                    except OSError:
+                        pass
+        except OSError as exc:
+            removed["ok"] = False
+            logger.warning("purge_transcript_failed",
+                           extra={"session": session_id, "cli": cli, "error": str(exc)[:200]})
+    # S3: delete every object under the session's resume + checkpoint prefixes.
+    # Keys are tenant-scoped; "default" resolves to the legacy unprefixed layout
+    # (see _tenant_root), so pre-tenancy sessions are reclaimed by the same pass.
+    if ARTIFACT_BUCKET:
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        tp = _tenant_root(tenant_id)
+        prefixes = [
+            f"{tp}/resume/{session_id}/",
+            f"{tp}/checkpoint/{session_id}/",
+        ]
+        if conversation_id:
+            prefixes.append(f"{tp}/checkpoint/{conversation_id}/")
+        for prefix in prefixes:
+            try:
+                paginator = s3.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=ARTIFACT_BUCKET, Prefix=prefix):
+                    keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+                    if keys:
+                        s3.delete_objects(Bucket=ARTIFACT_BUCKET, Delete={"Objects": keys, "Quiet": True})
+                        removed["s3_objects"] += len(keys)
+            except Exception as exc:  # noqa: BLE001 — recorded so the reaper retries
+                removed["ok"] = False
+                logger.warning("purge_s3_failed", extra={"prefix": prefix, "error": str(exc)[:200]})
+    logger.info("session_purged", extra={"session": session_id, **removed})
+    return removed
+
+
+def _selfcontained_workspace(session_id: str | None) -> str | None:
+    """Path of an already-rebuilt self-contained repo for this session, or None.
+
+    Self-contained ports live at `<session>/workspace` (a fixed name, NOT a
+    repo-slug), set by _rebuild_from_bundle. Later turns/checkpoint omit
+    git_mode + resume_bundle and carry no repo, so we detect the warm workspace
+    by its .git rather than relying on the caller re-sending the handoff fields."""
+    if not session_id:
+        return None
+    wd = os.path.join(_session_dir(session_id), "workspace")
+    return wd if os.path.isdir(os.path.join(wd, ".git")) else None
+
+
+def _rebuild_from_bundle(s3_key: str, session_id: str | None,
+                         branch: str | None = None) -> str:
+    """Self-contained mode: rebuild a STANDALONE repo from a `git bundle --all`
+    the laptop shipped (no origin, no clone). `git clone <bundle>` reconstructs
+    every branch + the full history into the session's EFS workspace; we then land
+    on a named branch so the agent works on a real branch (and pull-home works).
+
+    Idempotent + warm-safe: if the workspace already has a .git (a warm microVM, or
+    the pre-warm pass already rebuilt it), reuse it. Returns the workdir.
+
+    Raises on a missing/corrupt bundle — unlike bundle mode (which can fall back to
+    the clean clone), self-contained has NO other source for the code, so a failure
+    here is a real setup error the caller surfaces as 500."""
+    base = _session_dir(session_id)
+    wd = os.path.join(base, "workspace")
+    if os.path.isdir(os.path.join(wd, ".git")):
+        logger.info("selfcontained_warm")
+        return wd
+    if not (s3_key and ARTIFACT_BUCKET):
+        raise RuntimeError("self-contained port is missing its bundle (no resume_bundle/bucket)")
+    os.makedirs(base, exist_ok=True)
+
+    s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    obj = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=s3_key)
+    raw = obj["Body"].read()
+    bundle_path = os.path.join(base, ".cloud-code-all.bundle")
+    try:
+        with open(bundle_path, "wb") as f:
+            f.write(raw)
+        # Clone the bundle → a real repo with all refs; HEAD is the laptop's tip.
+        # (No separate `git bundle verify`: that needs to run inside a repo, which
+        # the runtime cwd isn't — and clone validates the bundle anyway, failing
+        # cleanly with the same diagnostic on a corrupt/truncated file.)
+        clone = subprocess.run(["git", "clone", bundle_path, wd],
+                               capture_output=True, text=True, timeout=300)
+        if clone.returncode != 0:
+            raise RuntimeError(f"bundle clone failed: {clone.stderr.strip()[:300]}")
+        # Drop the 'origin' the clone set to the local bundle file (it's gone after
+        # this function) so the workspace is truly standalone — `git remote add`
+        # later won't collide, and nothing points at a vanished path.
+        subprocess.run(["git", "remote", "remove", "origin"], cwd=wd,
+                       capture_output=True, text=True, timeout=30)
+        # Land on a NAMED branch (the bundle clone may be detached on HEAD).
+        local_branch = _safe_branch_name(branch)
+        subprocess.run(["git", "checkout", "-B", local_branch], cwd=wd,
+                       capture_output=True, text=True, timeout=60)
+        logger.info("selfcontained_rebuilt", extra={"branch": local_branch})
+        return wd
+    finally:
+        try:
+            os.remove(bundle_path)
+        except OSError:
+            pass
 
 
 def _checkout_branch(workdir: str, branch: str) -> None:
@@ -955,6 +1493,10 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         return
     # Persist {claude_session_id → repo} so a later resume recovers the cwd.
     _remember_session(new_session_id, repo)
+    # Update the Terminal resume hint now the id is known (new chats learn it
+    # here), so opening the Terminal auto-resumes this conversation server-side.
+    if new_session_id:
+        _write_resume_launch_hint(workdir, new_session_id, session_id)
     # Harvest deliverables to the resume prefix so the Artifacts tab populates
     # without a pull-home. Best-effort — never breaks the stream's done frame.
     artifact_keys: list = []
@@ -984,7 +1526,21 @@ def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
     proc = subprocess.run(args, cwd=workdir, env=env, capture_output=True,
                           text=True, timeout=TURN_TIMEOUT_S, stdin=subprocess.DEVNULL)
     if proc.returncode != 0:
-        raise RuntimeError(f"codex exited {proc.returncode}: {proc.stderr.strip()[:600]}")
+        # codex exec --json writes its real failure to STDOUT (a {"type":"error"}
+        # / {"type":"turn.failed"} JSONL frame), not stderr — stderr only carries
+        # run-codex.sh's banner. Surface the last error frame so the turn error is
+        # diagnosable instead of an opaque "codex exited 1: <banner>".
+        detail = ""
+        for line in reversed(proc.stdout.splitlines()):
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if o.get("type") in ("error", "turn.failed"):
+                detail = str(o.get("message") or (o.get("error") or {}).get("message") or "")[:400]
+                break
+        banner = proc.stderr.strip()[:200]
+        raise RuntimeError(f"codex exited {proc.returncode}: {detail or banner}")
     # codex exec --json emits JSONL. Pull the thread_id (resume handle) and the
     # final assistant text. New shape:
     #   {"type":"thread.started","thread_id":"..."}
@@ -1009,6 +1565,122 @@ def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
     if not found_text:
         text = proc.stdout.strip()
     return {"response": text, "claude_session_id": thread_id}
+
+
+def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
+                  repo: str | None = None, session_id: str | None = None,
+                  tenant_id: str | None = None):
+    """Generator yielding SSE lines for a Codex turn as it runs.
+
+    codex exec --json emits per-STEP JSONL (not token deltas): thread.started,
+    item.started/completed (command_execution, reasoning, agent_message), and a
+    final turn.completed/turn.failed. We map those to the same {type:text|done|
+    error} SSE frames _stream_claude uses:
+      • agent_message text            → 'text' (the reply itself)
+      • command_execution / reasoning → 'text' as a dim status line so the user
+                                        sees live progress instead of a spinner
+      • turn.completed                → 'done' carrying the full reply + thread_id
+    Streaming also keeps the connection alive, so a long codex turn no longer
+    trips the front-end proxy's idle timeout (the old buffered-path failure)."""
+    def sse(obj: dict) -> str:
+        return f"data: {json.dumps(obj)}\n\n"
+
+    env = {**os.environ, "WORKSPACE_DIR": workdir}
+    args = ["/app/run-codex.sh", prompt]
+    if codex_session_id:
+        args.append(codex_session_id)
+
+    proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+    # Watchdog: the buffered runner enforced TURN_TIMEOUT_S via subprocess.run;
+    # this loop blocks on readline, so a codex (or an invoked command) that wedges
+    # without closing stdout would pin the microVM HealthyBusy forever. Kill the
+    # process at the cap so the loop unwinds and a terminal frame is emitted.
+    timed_out = threading.Event()
+
+    def _kill_on_timeout():
+        timed_out.set()
+        proc.kill()
+    watchdog = threading.Timer(TURN_TIMEOUT_S, _kill_on_timeout)
+    watchdog.start()
+    thread_id: str | None = codex_session_id
+    reply_parts: list[str] = []          # only agent_message text = the actual reply
+    emitted_any_reply = False            # did we stream reply text (vs only status)?
+    fail_detail: str | None = None
+    try:
+        for line in proc.stdout:  # line-buffered: yields as codex emits each frame
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = obj.get("type")
+            if t == "thread.started" and obj.get("thread_id"):
+                thread_id = obj["thread_id"]
+                # A fresh thread.started after an error frame is run-codex.sh
+                # RETRYING (cold-engine Mantle errors). The prior attempt's
+                # failure must not poison a successful retry's result.
+                fail_detail = None
+                continue
+            if t in ("error", "turn.failed"):
+                fail_detail = str(obj.get("message") or (obj.get("error") or {}).get("message") or "")[:400]
+                continue
+            if t == "turn.completed":
+                fail_detail = None  # a completed turn supersedes any earlier attempt's error
+                continue
+            # item.started/completed carry the step payload. Older codex builds
+            # wrap it as {"msg":{...}} with NO top-level type — treat a msg-shaped
+            # agent_message as completed (there are no partial frames there).
+            item = obj.get("item") or obj.get("msg") or {}
+            itype = item.get("type")
+            if itype == "agent_message":
+                # The reply. completed frame has the whole message; stream it once.
+                if t == "item.completed" or (t is None and "msg" in obj):
+                    msg = item.get("text") or item.get("message") or ""
+                    if msg:
+                        reply_parts.append(msg)
+                        emitted_any_reply = True
+                        yield sse({"type": "text", "text": msg})
+            elif itype == "command_execution" and t == "item.started":
+                cmd = str(item.get("command") or "").strip()
+                if cmd:
+                    yield sse({"type": "text", "text": f"\n`$ {cmd[:200]}`\n"})
+            elif itype == "reasoning" and t == "item.completed":
+                note = str(item.get("text") or "").strip()
+                if note:
+                    yield sse({"type": "text", "text": f"\n_{note[:300]}_\n"})
+        proc.wait(timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        yield sse({"type": "error", "error": str(exc)[:600]})
+        return
+    finally:
+        watchdog.cancel()
+    if timed_out.is_set():
+        err = f"codex timed out after {TURN_TIMEOUT_S}s"
+        yield sse({"type": "error", "error": err})
+        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": thread_id})
+        return
+    if proc.returncode not in (0, None) or fail_detail:
+        banner = ((proc.stderr.read() or "")[:200] if proc.stderr else "")
+        err = fail_detail or banner or f"codex exited {proc.returncode}"
+        yield sse({"type": "error", "error": f"codex: {err}"})
+        yield sse({"type": "done", "response": f"⚠ codex: {err}",
+                   "claude_session_id": thread_id})
+        return
+    _remember_session(thread_id, repo)
+    # Update the Terminal resume hint now the thread id is known, so opening the
+    # Terminal auto-resumes this codex conversation server-side.
+    if thread_id:
+        _write_resume_launch_hint(workdir, thread_id, session_id, cli="codex")
+    try:
+        _sync_turn_artifacts(session_id, workdir, tenant_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
+    yield sse({"type": "done",
+               "response": "".join(reply_parts) if emitted_any_reply else "",
+               "claude_session_id": thread_id})
 
 
 # ─── Server ───────────────────────────────────────────────────────────────────
@@ -1070,6 +1742,23 @@ async def invocations(request: Request):
     # /shell route fires this before handing the browser a presigned PTY URL, so a
     # terminal-only session (which never hits a chat turn) still gets skills + MCP.
     prepare = bool(payload.get("prepare"))
+    # Purge: the session-reaper Lambda's cleanup action. Runs on a FRESH microVM
+    # that re-mounts the shared EFS (the original VM was stopped first), so the
+    # rmtree can't be torn down mid-flight. Reclaims the session's EFS dir,
+    # transcript files, and S3 resume/checkpoint objects.
+    purge = bool(payload.get("purge"))
+    if purge:
+        sid = payload.get("session_id")
+        if not sid:
+            return JSONResponse({"error": "purge needs a session id"}, status_code=400)
+        result = _purge_session(
+            sid, payload.get("claude_session_id"), (payload.get("cli") or "claude").lower(),
+            payload.get("tenant_id"))
+        if not result.get("ok"):
+            # Partial failure → non-2xx + purged:false so the reaper raises and
+            # the stream redelivers, instead of acknowledging a leak as success.
+            return JSONResponse({"purged": False, **result}, status_code=500)
+        return JSONResponse({"purged": True, **result})
 
     prompt = (payload.get("prompt") or "").strip()
     if not prompt and not warm and not checkpoint and not prepare:
@@ -1085,18 +1774,33 @@ async def invocations(request: Request):
     config_version = payload.get("config_version")
     session_id = payload.get("session_id")  # isolates this session's checkout
     origin = payload.get("origin")  # "workflow" = fleet-driven session, GC-eligible
+    # Repopulate the private /tmp resume hint from the durable per-session copy if
+    # this microVM was recycled — so even a config-only prepare leaves the
+    # Terminal able to auto-resume the conversation.
+    _restore_resume_launch_hint(session_id)
     stream = bool(payload.get("stream"))  # SSE incremental output (claude only)
     # "Port to cloud": a real laptop transcript shipped via S3 for a native,
     # lossless `claude --resume`. resume_session_id is the id INSIDE that file.
     resume_transcript = payload.get("resume_transcript")  # s3 key
     resume_session_id = payload.get("resume_session_id")
     branch = payload.get("branch")  # checkout this branch before the turn
+    # Flexible git handoff (hub MCP): git_mode is pushed|bundle|selfContained|none.
+    #   clone_url     — explicit origin to clone (may be an upstream we can't push to)
+    #   resume_bundle — s3 key of a git bundle: commits-on-top (bundle mode) OR a
+    #                   whole-repo `bundle --all` (selfContained mode)
+    git_mode = payload.get("git_mode")
+    clone_url = payload.get("clone_url")
+    resume_bundle = payload.get("resume_bundle")
     # Short-lived GitHub App installation token minted by the hub for this
     # session's owner (scoped to the repo). Never logged. When app_connected is
     # true, a MISSING token means the scoped mint was denied — do NOT fall back to
     # GITHUB_PAT (that would clone beyond the owner's App scope).
     github_token = payload.get("github_token")
     github_app_connected = bool(payload.get("github_app_connected"))
+    # Chat attachments: paths (relative to the session's artifact prefix, e.g.
+    # uploads/x/shot.png) the user uploaded in the composer. Downloaded into
+    # .cloud-code/artifacts/ and appended to the prompt so the CLI can open them.
+    attachments = payload.get("attachments") or []
 
     # On resume, recover the repo the conversation was started in (so we land in
     # the same cwd Claude Code scoped the session to) when the caller omits it.
@@ -1135,20 +1839,77 @@ async def invocations(request: Request):
     # success/failure but always 200 so the /shell best-effort caller never errors
     # (a stale-mount VM will be replaced; the next turn retries).
     if prepare:
-        logger.info("prepare_done", extra={"user": user_id, "version": config_version, "ok": config_ok})
-        return JSONResponse({"prepared": config_ok, "config_error": config_err or None})
+        # A terminal-only session reaches the VM ONLY through prepare (no chat turn
+        # runs _configure_git), so install/refresh/clear the GitHub credential
+        # helper here too — otherwise Terminal `git`/`gh` on a private repo has no
+        # App token, or keeps a prior turn's stale/expired one. Passing None (user
+        # disconnected / mint failed) scrubs it.
+        _configure_git(github_token, app_connected=github_app_connected)
+        # resume_ready: a restored (or still-live) /tmp hint means shell-init will
+        # auto-resume this conversation when the PTY opens — the /shell route
+        # relays it so the browser knows whether to fire its first-prompt seed.
+        resume_ready = os.path.exists(RESUME_HINT_PATH)
+        logger.info("prepare_done", extra={"user": user_id, "version": config_version,
+                                           "ok": config_ok, "resume_ready": resume_ready})
+        return JSONResponse({"prepared": config_ok, "config_error": config_err or None,
+                             "resume_ready": resume_ready})
 
     # Workspace setup IS fatal — no workdir, no turn.
     try:
         _configure_git(github_token, app_connected=github_app_connected)
-        workdir = _ensure_workspace(repo, session_id)
-        # Land on the ported branch (the laptop pushed its in-flight work there).
-        if branch:
-            _checkout_branch(workdir, branch)
+        # Self-contained: no origin — rebuild a standalone repo from the laptop's
+        # `bundle --all` (the no-remote / not-a-repo port). The bundle IS the only
+        # source of the code, so this replaces the clone entirely.
+        if git_mode == "selfContained" and resume_bundle:
+            workdir = _rebuild_from_bundle(resume_bundle, session_id, branch=branch)
+        elif _selfcontained_workspace(session_id) and not repo and not clone_url:
+            # Warm self-contained session on a LATER turn (or checkpoint): the
+            # caller only sends git_mode/resume_bundle on the seed turn, and there's
+            # no repo to re-derive a slug from. Reuse the standalone repo already on
+            # EFS — otherwise _ensure_workspace(None,…) returns the bare session root
+            # and the CLI runs OUTSIDE the shipped code (and checkpoint reads the
+            # wrong project slug).
+            workdir = _selfcontained_workspace(session_id)
+            logger.info("selfcontained_warm_reuse")
+        else:
+            # The repo clone / branch checkout is best-effort WHEN we have a
+            # conversation to resume: the resume only needs the transcript placed
+            # at the cwd's project slug, not a working clone. A clone can
+            # legitimately fail — an origin the cloud can't reach, a lost
+            # upstream, an auth failure. Letting that abort the whole setup means
+            # the resume hint is never written and the Terminal opens to a bare
+            # shell (the conversation is stranded). So on failure, fall back to a
+            # bare per-session workspace and still resume the chat. Later turns
+            # reuse the same per-session dir where the transcript was installed
+            # instead of re-attempting the doomed clone and 500ing the live chat.
+            can_fallback = cli == "claude" and bool(
+                (resume_transcript and resume_session_id) or claude_session_id
+            )
+            try:
+                workdir = _ensure_workspace(repo, session_id, clone_url=clone_url)
+                # Bundle mode: clone the upstream (above), then layer the laptop's
+                # commits from the uploaded git bundle. Do this BEFORE branch
+                # checkout — the bundle lands on the laptop's tip, which is the
+                # state we want to resume on.
+                if git_mode == "bundle" and resume_bundle:
+                    _apply_resume_bundle(resume_bundle, workdir, session_id, branch=branch)
+                # Land on the ported branch (pushed mode: the laptop's branch on origin).
+                elif branch:
+                    _checkout_branch(workdir, branch)
+            except Exception as exc:  # noqa: BLE001
+                if not can_fallback:
+                    raise
+                workdir = _ensure_workspace(None, session_id)
+                logger.warning("workspace_clone_failed_resume_fallback",
+                               extra={"clone_url": clone_url, "repo": repo,
+                                      "error": str(exc)[:300], "workdir": workdir})
         # Install a ported transcript and resume it natively. On success the turn
-        # runs as `claude --resume <resume_session_id>` — true continuation.
-        if cli == "claude" and resume_transcript and resume_session_id:
-            if _install_resume_transcript(resume_transcript, resume_session_id, workdir):
+        # runs as `claude --resume` / `codex resume` — true continuation.
+        if resume_transcript and resume_session_id:
+            if cli == "codex":
+                if _install_codex_resume_transcript(resume_transcript, resume_session_id):
+                    claude_session_id = claude_session_id or resume_session_id
+            elif _install_resume_transcript(resume_transcript, resume_session_id, workdir):
                 claude_session_id = claude_session_id or resume_session_id
         # Restore uploaded/ported artifacts into .cloud-code/artifacts/ so the agent
         # can open them (keyed by the cloud session id under the resume prefix).
@@ -1156,6 +1917,25 @@ async def invocations(request: Request):
             _install_artifacts(
                 f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", workdir, session_id
             )
+        # Chat attachments: fetch the user's uploads for THIS turn and point the
+        # CLI at them (appended paths — the CLI reads them with its file tools).
+        if attachments and session_id and not warm and not checkpoint:
+            fetched = _fetch_attachments(
+                f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", attachments, workdir
+            )
+            if fetched:
+                listing = "\n".join(f"- {p}" for p in fetched)
+                prompt = (prompt + "\n\nAttached file(s) for this message "
+                          "(already downloaded locally):\n" + listing)
+        # Hand the interactive Terminal a one-shot launch hint: which dir to cd
+        # into and which conversation to `claude --resume`. shell-init.sh reads it
+        # on a FRESH shell only (run-once guard — a PTY reattach to an
+        # already-running claude never re-fires), so the resume launches
+        # server-side instead of the browser typing it into a live TUI input box.
+        resume_ready = False
+        if claude_session_id and cli in ("claude", "codex"):
+            resume_ready = _write_resume_launch_hint(workdir, claude_session_id,
+                                                     session_id, cli=cli)
     except ValueError as ve:  # bad repo field — caller error, not a 500
         return JSONResponse({"error": str(ve)}, status_code=400)
     except Exception as exc:  # noqa: BLE001
@@ -1178,21 +1958,32 @@ async def invocations(request: Request):
         # Harvest touched-untracked deliverables too (best-effort — never fails the
         # checkpoint). They surface in the web Artifacts tab under the same cp_id.
         artifacts = _checkpoint_artifacts(cp_id, workdir, tenant_id)
-        return JSONResponse({"checkpointed": True, **info, "artifacts": artifacts})
+        # bundle/selfContained sessions have no writable origin — the laptop
+        # can't `git fetch origin` the cloud's commits home. Ship them as a
+        # return bundle instead (the pull leg fetches from it directly).
+        return_bundle = None
+        if git_mode in ("bundle", "selfContained") or _selfcontained_workspace(session_id):
+            return_bundle = _checkpoint_return_bundle(cp_id, workdir, tenant_id)
+        return JSONResponse({"checkpointed": True, **info, "artifacts": artifacts,
+                             "return_bundle": return_bundle})
 
     # Pre-warm done: workspace cloned, branch checked out, transcript installed.
     # No CLI runs — the first real turn (on open) will be instant + warm.
     if warm:
-        logger.info("warm_done", extra={"repo": repo, "workspace": workdir})
-        return JSONResponse({"warmed": True, "workspace": workdir, "cli": cli})
+        logger.info("warm_done", extra={"repo": repo, "workspace": workdir,
+                                        "resume_ready": resume_ready})
+        return JSONResponse({"warmed": True, "workspace": workdir, "cli": cli,
+                             "resume_ready": resume_ready})
 
-    # Streaming path (claude): yield SSE as the turn runs. The runtime forwards
-    # an async/sync generator response as text/event-stream through InvokeAgentRuntime.
-    if stream and cli == "claude":
-        return StreamingResponse(
-            _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id, model),
-            media_type="text/event-stream",
+    # Streaming path: yield SSE as the turn runs. The runtime forwards an
+    # async/sync generator response as text/event-stream through InvokeAgentRuntime.
+    if stream and cli in ("claude", "codex"):
+        gen = (
+            _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
+            if cli == "codex"
+            else _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id, model)
         )
+        return StreamingResponse(gen, media_type="text/event-stream")
 
     try:
         if cli == "codex":
@@ -1210,6 +2001,12 @@ async def invocations(request: Request):
 
     # Persist {claude_session_id → repo} so a later resume recovers the cwd.
     _remember_session(result.get("claude_session_id"), repo)
+
+    # A brand-new chat learns its claude_session_id only now (it was unset on
+    # entry, so the pre-run hint above was skipped). Write it here too, so opening
+    # the Terminal for this session also auto-resumes the conversation.
+    if result.get("claude_session_id") and cli in ("claude", "codex"):
+        _write_resume_launch_hint(workdir, result["claude_session_id"], session_id, cli=cli)
 
     # Harvest any deliverables this turn produced to the resume prefix so they show
     # in the web Artifacts tab immediately — no pull-home required. Best-effort.
