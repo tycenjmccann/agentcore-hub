@@ -1,7 +1,26 @@
 /**
- * Git helpers for the port handoff. Cloud Code can only see what's on the
- * remote, so before porting we must commit + push the in-flight work to a
- * branch. All commands run in the user's project cwd.
+ * Git helpers for the port handoff.
+ *
+ * The cloud needs the repo state, but it can reach it three different ways
+ * depending on what the laptop can do — so port is FLEXIBLE about git instead of
+ * demanding a writable origin:
+ *
+ *   pushed         — origin is writable: commit + push a branch, cloud clones it.
+ *   bundle         — repo exists but origin is read-only (e.g. an aws-samples
+ *                    clone you don't own): ship a `git bundle` of your in-flight
+ *                    commits; the cloud clones the PUBLIC origin and applies the
+ *                    bundle on top. No push rights needed.
+ *   selfContained  — NO usable remote (no origin, unreachable, or not even a git
+ *                    repo yet): we `git init` if needed, commit everything, and
+ *                    ship a `git bundle --all` (whole history + all branches). The
+ *                    cloud reconstructs a standalone repo from the bundle in its
+ *                    own EFS workspace — nothing leaves your AWS account, no
+ *                    GitHub, no push rights. This is the "I'm in a hurry and never
+ *                    set up a remote" path: it just works; wire a real remote later.
+ *   none           — nothing to ship as code (truly empty dir): transcript only.
+ *
+ * The transcript always ships regardless of git mode — it's just a file.
+ * All commands run in the user's project cwd.
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -9,14 +28,24 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 
 async function git(cwd: string, args: string[]): Promise<string> {
-  const { stdout } = await exec("git", args, { cwd, maxBuffer: 16 * 1024 * 1024 });
+  const { stdout } = await exec("git", args, { cwd, maxBuffer: 64 * 1024 * 1024 });
   return stdout.trim();
+}
+
+/** git that returns {ok, stdout} instead of throwing — for probes. */
+async function gitTry(cwd: string, args: string[]): Promise<{ ok: boolean; out: string }> {
+  try {
+    return { ok: true, out: await git(cwd, args) };
+  } catch (e) {
+    return { ok: false, out: (e as Error).message };
+  }
 }
 
 export interface GitState {
   isRepo: boolean;
   branch: string;
   remoteRepo?: string; // owner/name parsed from origin
+  originUrl?: string; // full origin URL (https/ssh) for the cloud to clone
   dirty: boolean;
 }
 
@@ -24,6 +53,31 @@ export interface GitState {
 export function parseRepo(remoteUrl: string): string | undefined {
   const m = remoteUrl.match(/github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?$/i);
   return m ? m[1] : undefined;
+}
+
+/**
+ * Produce a clone URL the CLOUD can use. The runtime only configures HTTPS PAT
+ * rewriting, so an `git@host:org/repo.git` SSH origin would fail there — convert
+ * it to `https://host/org/repo.git`. Also strip any embedded userinfo
+ * (`https://user:token@host/...`) so we never persist/return a credential.
+ * Returns undefined if there's nothing usable.
+ */
+export function normalizeCloneUrl(remoteUrl?: string): string | undefined {
+  if (!remoteUrl) return undefined;
+  const url = remoteUrl.trim();
+  // scp-like SSH: git@host:org/repo(.git)
+  const ssh = url.match(/^[\w.-]+@([\w.-]+):(.+?)(?:\.git)?\/?$/);
+  if (ssh) return `https://${ssh[1]}/${ssh[2]}.git`;
+  // ssh:// or https:// — drop userinfo (anything before @ in the authority).
+  const m = url.match(/^(https?|ssh):\/\/(?:[^@/]+@)?([^/]+)\/(.+?)(?:\.git)?\/?$/);
+  if (m) {
+    // An ssh:// URL's port (e.g. :22) is the SSH port — meaningless over HTTPS,
+    // so drop it. Keep an explicit port on an https:// origin.
+    const host = m[1] === "ssh" ? m[2].replace(/:\d+$/, "") : m[2];
+    return `https://${host}/${m[3]}.git`;
+  }
+  // Unknown shape (e.g. a local path) — return as-is, no credential to strip.
+  return url;
 }
 
 export async function readState(cwd: string): Promise<GitState> {
@@ -34,42 +88,243 @@ export async function readState(cwd: string): Promise<GitState> {
   }
   const branch = await git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
   let remoteRepo: string | undefined;
+  let originUrl: string | undefined;
   try {
-    remoteRepo = parseRepo(await git(cwd, ["remote", "get-url", "origin"]));
+    const raw = await git(cwd, ["remote", "get-url", "origin"]);
+    remoteRepo = parseRepo(raw);
+    // Normalize for the cloud: SSH→HTTPS, strip embedded credentials. Push still
+    // uses the local `origin` remote (this URL is only what the cloud clones).
+    originUrl = normalizeCloneUrl(raw);
   } catch {
     /* no origin */
   }
   const status = await git(cwd, ["status", "--porcelain"]);
-  return { isRepo: true, branch, remoteRepo, dirty: status.length > 0 };
+  return { isRepo: true, branch, remoteRepo, originUrl, dirty: status.length > 0 };
+}
+
+/** Can we push to origin? Probe with a dry-run push (no refs written). */
+export async function canPushToOrigin(cwd: string): Promise<boolean> {
+  // `--dry-run` performs auth + ref negotiation but writes nothing. A read-only
+  // remote (no write grant) fails here; a writable one succeeds.
+  const r = await gitTry(cwd, ["push", "--dry-run", "origin", "HEAD"]);
+  return r.ok;
+}
+
+export type GitHandoff =
+  | { mode: "pushed"; branch: string; committed: boolean; cloneUrl?: string }
+  | { mode: "bundle"; branch: string; committed: boolean; cloneUrl?: string; baseRef: string }
+  | { mode: "selfContained"; branch: string; committed: boolean; initialized: boolean }
+  | { mode: "none"; reason: string };
+
+/** Does the dir contain anything worth shipping (ignoring .git)? */
+async function dirHasFiles(cwd: string): Promise<boolean> {
+  const { readdir } = await import("node:fs/promises");
+  try {
+    const entries = await readdir(cwd);
+    return entries.some((e) => e !== ".git");
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Ensure the in-flight work is on a pushed branch.
- * - If clean and already on a non-default branch with an upstream, just push.
- * - If dirty, commit everything to `branch` (creating it if needed), then push.
- * Returns the branch name that now holds the work on the remote.
+ * Self-contained handoff: bundle the WHOLE repo (--all: every branch + tag + the
+ * current HEAD) into one file the cloud reconstructs standalone — no origin, no
+ * push. `git init`s + commits first if the dir isn't a repo yet. Returns the
+ * handoff descriptor, invoking writeAll with the bundle bytes for the caller to
+ * upload. Returns null only if there's genuinely nothing to ship (empty dir).
  */
-export async function commitAndPush(
-  cwd: string,
-  opts: { branch?: string; message?: string; dirty: boolean; currentBranch: string }
-): Promise<{ branch: string; pushed: boolean; committed: boolean }> {
-  let committed = false;
-  const target = opts.branch || opts.currentBranch;
+type SelfContained = Extract<GitHandoff, { mode: "selfContained" }>;
 
-  if (opts.branch && opts.branch !== opts.currentBranch) {
-    await git(cwd, ["checkout", "-B", opts.branch]);
+async function prepareSelfContained(
+  cwd: string,
+  state: GitState,
+  opts: {
+    branch?: string;
+    message?: string;
+    writeAll?: (bundle: Buffer) => Promise<void>;
+  }
+): Promise<SelfContained | null> {
+  let initialized = false;
+  let committed = false;
+
+  if (!state.isRepo) {
+    if (!(await dirHasFiles(cwd))) return null; // nothing to ship
+    await git(cwd, ["init"]);
+    // A repo with no commits can't be bundled; ensure an identity for the commit.
+    await ensureCommitIdentity(cwd);
+    initialized = true;
   }
 
-  if (opts.dirty) {
+  const startBranch = state.isRepo ? state.branch : await currentBranch(cwd);
+  const target = opts.branch || startBranch || "main";
+  if (target && target !== startBranch) {
+    await git(cwd, ["checkout", "-B", target]);
+  }
+
+  // Commit everything so the bundle is a complete snapshot. On a fresh init this
+  // is the first commit; on an existing repo it captures in-flight work.
+  const dirty = (await git(cwd, ["status", "--porcelain"])).length > 0;
+  const hasCommit = (await gitTry(cwd, ["rev-parse", "HEAD"])).ok;
+  if (dirty || !hasCommit) {
     await git(cwd, ["add", "-A"]);
     const msg = opts.message || `wip: port session to cloud (${new Date().toISOString()})`;
-    // --no-verify: skip local hooks; this is a snapshot for handoff, not a reviewed commit.
+    // --allow-empty so a repo with only ignored/empty content still gets a HEAD
+    // to bundle, rather than failing the whole port.
+    await git(cwd, ["commit", "--no-verify", "--allow-empty", "-m", msg]);
+    committed = true;
+  }
+
+  if (opts.writeAll) {
+    const { mkdtemp, readFile, rm } = await import("node:fs/promises");
+    const os = await import("node:os");
+    const pathMod = await import("node:path");
+    const tmp = await mkdtemp(pathMod.join(os.tmpdir(), "cc-bundle-"));
+    const bundlePath = pathMod.join(tmp, "all.bundle");
+    try {
+      // --all = every ref; add HEAD so a detached/odd state is still captured.
+      await git(cwd, ["bundle", "create", bundlePath, "--all", "HEAD"]);
+      await opts.writeAll(await readFile(bundlePath));
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  }
+
+  return { mode: "selfContained", branch: target, committed, initialized };
+}
+
+async function currentBranch(cwd: string): Promise<string> {
+  const r = await gitTry(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  return r.ok ? r.out : "main";
+}
+
+/** Ensure user.name/email exist for the commit (fresh `git init` may lack them). */
+async function ensureCommitIdentity(cwd: string): Promise<void> {
+  const name = await gitTry(cwd, ["config", "user.name"]);
+  if (!name.ok || !name.out) {
+    await git(cwd, ["config", "user.email", "cloud-code@localhost"]);
+    await git(cwd, ["config", "user.name", "Cloud Code Port"]);
+  }
+}
+
+/**
+ * Prepare the repo for handoff, choosing the best available mode.
+ *
+ * @param writeBundle  called with the bundle bytes when mode==="bundle" (the
+ *                     caller uploads them); receives {bundle, patch} buffers.
+ */
+export async function prepareGitHandoff(
+  cwd: string,
+  state: GitState,
+  opts: {
+    branch?: string;
+    message?: string;
+    preferBundle?: boolean; // force bundle even if origin is writable
+    writeArtifacts?: (a: { bundle: Buffer; patch: Buffer; baseRef: string }) => Promise<void>;
+    // Self-contained bundle (--all) bytes for the no-remote / not-a-repo path.
+    writeSelfContained?: (bundle: Buffer) => Promise<void>;
+  }
+): Promise<GitHandoff> {
+  // Not a git repo yet → self-contained: git init + commit + bundle --all (or
+  // 'none' if the dir is genuinely empty). Removes the "I never set up a repo"
+  // blocker — the cloud gets a real standalone repo from a bundle in your S3.
+  if (!state.isRepo) {
+    const sc = await prepareSelfContained(cwd, state, {
+      branch: opts.branch,
+      message: opts.message,
+      writeAll: opts.writeSelfContained,
+    });
+    return sc ?? { mode: "none", reason: "empty workspace (no files to ship)" };
+  }
+
+  const target = opts.branch || state.branch;
+  let committed = false;
+
+  // Snapshot in-flight work onto the target branch so HEAD captures everything.
+  if (opts.branch && opts.branch !== state.branch) {
+    await git(cwd, ["checkout", "-B", opts.branch]);
+  }
+  if (state.dirty) {
+    await git(cwd, ["add", "-A"]);
+    const msg = opts.message || `wip: port session to cloud (${new Date().toISOString()})`;
     await git(cwd, ["commit", "--no-verify", "-m", msg]);
     committed = true;
   }
 
-  await git(cwd, ["push", "--no-verify", "-u", "origin", target]);
-  return { branch: target, pushed: true, committed };
+  // Mode selection keys off originUrl (what the cloud actually clones), not the
+  // parsed github owner/name — a non-github or SSH origin is still clonable.
+  // pushed if we can push and aren't forced to bundle; else bundle if there's an
+  // origin to clone; else none.
+  const writable = !opts.preferBundle && state.originUrl
+    ? await canPushToOrigin(cwd)
+    : false;
+
+  if (writable) {
+    await git(cwd, ["push", "--no-verify", "-u", "origin", target]);
+    return { mode: "pushed", branch: target, committed, cloneUrl: state.originUrl };
+  }
+
+  // Bundle mode needs an origin the cloud can clone (the public upstream) AND a
+  // base commit present there, so the bundle only carries OUR commits on top.
+  if (state.originUrl) {
+    // base = the merge-base with the remote's default branch (or origin/HEAD).
+    // Falls back to the upstream of the current branch, then to the first commit.
+    let baseRef = "";
+    for (const cand of [
+      "origin/HEAD",
+      `origin/${target}`,
+      "@{upstream}",
+    ]) {
+      const r = await gitTry(cwd, ["merge-base", "HEAD", cand]);
+      if (r.ok && r.out) { baseRef = r.out; break; }
+    }
+    if (!baseRef) {
+      // No shared base with origin → bundle the whole branch history.
+      const root = await gitTry(cwd, ["rev-list", "--max-parents=0", "HEAD"]);
+      baseRef = root.ok ? root.out.split("\n")[0] : "";
+    }
+
+    if (opts.writeArtifacts) {
+      // git bundle of base..HEAD (our commits), plus a patch of anything still
+      // uncommitted (should be empty after the commit above, but cheap insurance).
+      const { mkdtemp, readFile, rm } = await import("node:fs/promises");
+      const os = await import("node:os");
+      const pathMod = await import("node:path");
+      const tmp = await mkdtemp(pathMod.join(os.tmpdir(), "cc-bundle-"));
+      const bundlePath = pathMod.join(tmp, "work.bundle");
+      try {
+        // Are there any commits in base..HEAD? An empty range means HEAD is
+        // already on origin (nothing laptop-only to ship) — `git bundle` refuses
+        // an empty bundle, so skip the artifact: the cloud's clean clone already
+        // has this state. We still report bundle mode (origin is read-only) but
+        // with no bundle to apply.
+        const ahead = baseRef
+          ? (await gitTry(cwd, ["rev-list", "--count", `${baseRef}..HEAD`])).out.trim()
+          : "1";
+        if (ahead && ahead !== "0") {
+          const range = baseRef ? `${baseRef}..HEAD` : "HEAD";
+          await git(cwd, ["bundle", "create", bundlePath, range, "HEAD"]);
+          const bundle = await readFile(bundlePath);
+          const patch = Buffer.from(await git(cwd, ["diff", "HEAD"]), "utf8"); // usually empty
+          await opts.writeArtifacts({ bundle, patch, baseRef });
+        }
+      } finally {
+        await rm(tmp, { recursive: true, force: true });
+      }
+    }
+    return { mode: "bundle", branch: target, committed, cloneUrl: state.originUrl, baseRef };
+  }
+
+  // Repo with NO usable origin (none configured, or unreachable) → self-contained:
+  // bundle --all to S3, cloud rebuilds standalone. The in-flight commit above
+  // already happened, so prepareSelfContained just bundles + reports.
+  const sc = await prepareSelfContained(cwd, state, {
+    branch: opts.branch,
+    message: opts.message,
+    writeAll: opts.writeSelfContained,
+  });
+  if (sc) return { ...sc, committed: committed || sc.committed };
+  return { mode: "none", reason: state.originUrl ? "origin not reachable" : "no origin remote" };
 }
 
 /**
@@ -81,7 +336,6 @@ export async function pullBranch(cwd: string, branch: string): Promise<string> {
   const status = await git(cwd, ["status", "--porcelain"]);
   await git(cwd, ["fetch", "origin", branch]);
   if (status.length > 0) {
-    // Don't risk local uncommitted work — just fetch and tell the user.
     return `local tree is dirty; fetched origin/${branch} but did NOT check out. Stash/commit, then \`git checkout ${branch} && git pull\`.`;
   }
   await git(cwd, ["checkout", branch]);

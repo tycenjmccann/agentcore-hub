@@ -14,7 +14,7 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { getOwnedSession, DEFAULT_TENANT_ID } from "@/lib/cloud-code/sessions";
 import { checkpointCodingSession, codingRuntimeConfigured } from "@/lib/cloud-code/runtime";
@@ -76,6 +76,40 @@ export async function POST(
       { expiresIn: DOWNLOAD_EXPIRES }
     );
 
+    // Return leg of artifact shipping: the runtime uploaded the cloud session's
+    // touched-untracked deliverables under cp.artifactPrefix. List them and hand
+    // back a presigned GET + workspace-relative path per file so the MCP can drop
+    // each into the laptop's .cloud-code/artifacts/.
+    let artifacts: { rel: string; url: string; bytes: number }[] | undefined;
+    if (cp.artifactPrefix && (cp.artifactCount ?? 0) > 0) {
+      const objects: { Key?: string; Size?: number }[] = [];
+      let token: string | undefined;
+      do {
+        const listed = await s3.send(
+          new ListObjectsV2Command({
+            Bucket: ARTIFACT_BUCKET,
+            Prefix: cp.artifactPrefix,
+            ContinuationToken: token,
+          })
+        );
+        for (const o of listed.Contents || []) objects.push(o);
+        token = listed.IsTruncated ? listed.NextContinuationToken : undefined;
+      } while (token);
+      artifacts = await Promise.all(
+        objects
+          .filter((o) => o.Key && !o.Key.endsWith("/"))
+          .map(async (o) => ({
+            rel: o.Key!.slice(cp.artifactPrefix!.length),
+            bytes: o.Size ?? 0,
+            url: await getSignedUrl(
+              s3,
+              new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: o.Key! }),
+              { expiresIn: DOWNLOAD_EXPIRES }
+            ),
+          }))
+      );
+    }
+
     return NextResponse.json({
       transcriptUrl,
       transcriptKey: cp.key,
@@ -83,6 +117,7 @@ export async function POST(
       branch: cp.branch || session.branch,
       repo: session.repo,
       bytes: cp.bytes,
+      artifacts,
     });
   } catch (err) {
     console.error("[cloud-code] checkpoint error:", err);
