@@ -19,6 +19,7 @@ import {
   PutCommand,
   UpdateCommand,
   QueryCommand,
+  ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
@@ -40,6 +41,7 @@ const EVENT_BUS = process.env.EVENT_BUS || "default";
 const MAX_QA_RETRIES = 3;
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
+const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
 
 // Jira config (only used when TICKET_PROVIDER=jira)
 const JIRA_SITE_URL = process.env.JIRA_SITE_URL || "";
@@ -599,12 +601,22 @@ async function handleReviewRejection(gateTicket) {
     gateTicket.reviewComment ||
     (gateTicket.comments || []).slice(-1)[0]?.content ||
     "Reviewer requested changes.";
-  const resumeNote = `## Review feedback (changes requested)\n${feedback}\n\nAddress this feedback and redo your work.`;
 
   // Persist each ticket's feedback atomically (per-key, no full-row put) BEFORE
   // reopening, so a fast re-invocation always finds its resume context.
   const reopened = [];
   for (const up of upstream) {
+    // Surface the agent's prior coding session so it can CHOOSE to continue
+    // that conversation (claude_code/codex resume_session=...) instead of
+    // rebuilding context. Scope, not a command — the resume decision is the
+    // agent's (fresh may be right if the feedback says start over).
+    const priorSession = await findCodingSession(workflow.id, up.assignee);
+    const sessionHint = priorSession
+      ? `\n\nYour previous coding session for this work: ${priorSession}. ` +
+        `You MAY pass it as resume_session on your first claude_code/codex call to continue that ` +
+        `conversation with its context intact — or omit it to start fresh. Resume is best-effort.`
+      : "";
+    const resumeNote = `## Review feedback (changes requested)\n${feedback}\n\nAddress this feedback and redo your work.${sessionHint}`;
     await setResumeContext(workflow.id, up.ticketId, resumeNote);
     reopened.push(up.ticketId);
   }
@@ -628,6 +640,30 @@ async function handleReviewRejection(gateTicket) {
   await publishEvent(gateTicket.ticketId, "review.rejected", {
     ticketId: gateTicket.ticketId, onReject, reopened, workflowId: workflow.id,
   });
+}
+
+/**
+ * Most recent Cloud Code session for (workflow, agent) — the runtime records
+ * one row per agent-task (origin "workflow"). Used only to HINT the reworking
+ * agent about its prior session; null on any failure (hint is optional).
+ */
+async function findCodingSession(workflowId, agentId) {
+  if (!workflowId || !agentId) return null;
+  try {
+    const res = await ddb.send(new ScanCommand({
+      TableName: CLOUD_CODE_TABLE,
+      FilterExpression: "workflowId = :w AND agentId = :a AND #or = :o",
+      ExpressionAttributeNames: { "#or": "origin" },
+      ExpressionAttributeValues: { ":w": workflowId, ":a": agentId, ":o": "workflow" },
+      ProjectionExpression: "sessionId, updatedAt",
+    }));
+    const rows = (res.Items || []).sort((x, y) =>
+      String(y.updatedAt || "").localeCompare(String(x.updatedAt || "")));
+    return rows[0]?.sessionId || null;
+  } catch (err) {
+    console.warn(`[orchestrator] findCodingSession failed (non-fatal): ${err.message}`);
+    return null;
+  }
 }
 
 /**

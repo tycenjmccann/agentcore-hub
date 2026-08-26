@@ -140,6 +140,7 @@ def _load_builtin_tools():
 REGION = os.getenv("AWS_REGION", "us-east-1")
 MODEL_ID = os.getenv("MODEL_ID", "us.anthropic.claude-fable-5")
 READ_TIMEOUT = int(os.getenv("READ_TIMEOUT", "1200"))  # 20 minutes — agents need room for complex claude_code calls
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "32000"))
 GATEWAY_ARN = os.getenv("GATEWAY_ARN", "")
 # NOTE: AgentCore reserves "ARTIFACT_BUCKET" as a system env var (points to CodeBuild source bucket).
 # We use AGENTCORE_HUB_ARTIFACT_BUCKET to avoid the collision.
@@ -220,6 +221,9 @@ model = BedrockModel(
     region_name=REGION,
     boto_client_config=boto_config,
     streaming=True,
+    # Without an explicit cap, Bedrock's default (~4k) truncates multi-ticket
+    # fan-out turns mid-JSON → MaxTokensReachedException kills the invocation.
+    max_tokens=MAX_OUTPUT_TOKENS,
 )
 
 # --- Lambda client for invoking tool backends ---
@@ -347,6 +351,41 @@ def _localize_repo_task(task: str, repo: str, working_directory: str) -> str:
         f"{clone_url}, clone it there (git clone {clone_url} {working_directory}/repo). "
         f"Then cd into it and do the following task in that repository.\n\n{task}"
     )
+
+
+def _maybe_resume_session(resume_session: str) -> None:
+    """Seed this task's coding session from a PRIOR agent-task's session (rework:
+    the reviewer rejected, the ticket came back, and the agent chose to continue
+    its earlier conversation instead of rebuilding context).
+
+    Only applies before the first coding call of this invocation — once a
+    session exists, later calls already share it. Conversation handles are
+    recovered from the Cloud Code sessions table; if the row is gone (reaped),
+    we still pin the runtimeSessionId — a warm workspace may survive — and the
+    CLI simply starts a new conversation there."""
+    if not resume_session or _CODING_SESSION["session_id"]:
+        return
+    _CODING_SESSION["session_id"] = resume_session
+    _CODING_SESSION["recorded"] = True  # row exists (or existed) — update, don't re-put
+    try:
+        row = boto3.client("dynamodb", region_name=REGION).get_item(
+            TableName=CLOUD_CODE_TABLE,
+            Key={"sessionId": {"S": resume_session}},
+        ).get("Item")
+        if row:
+            cli = row.get("cli", {}).get("S")
+            conv = row.get("claudeSessionId", {}).get("S")
+            if cli and conv:
+                _CODING_SESSION["conversation_ids"][cli] = conv
+            if row.get("repo", {}).get("S"):
+                _CODING_SESSION["repo"] = row["repo"]["S"]
+            logger.info(f"[remote-coding] resuming prior session {resume_session} "
+                        f"(cli={cli}, conversation={'yes' if conv else 'no'})")
+        else:
+            logger.info(f"[remote-coding] resume requested but no session row for "
+                        f"{resume_session} — pinning workspace only")
+    except Exception as e:  # noqa: BLE001 — resume is best-effort, never fail the turn
+        logger.warning(f"[remote-coding] session lookup failed (non-fatal): {e}")
 
 
 def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") -> str:
@@ -1089,7 +1128,7 @@ def _create_mcp_clients(extra_servers=None, extra_gateways=None):
 # reading repos, analyzing code structure, generating docs from source, etc.
 
 @tool
-def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", model: str = "") -> str:
+def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", model: str = "", resume_session: str = "") -> str:
     """Delegate a coding task to Claude Code — a specialized AI coding agent.
 
     Claude Code excels at:
@@ -1127,11 +1166,22 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
               (routine coding, faster/cheaper), "haiku" (trivial mechanical
               edits). YOU decide per call: match the tier to the difficulty of
               the task. Leave empty for the default.
+        resume_session: A PRIOR task's coding-session id (the "cc-..." value
+              from a [coding-session: ...] footer in your ticket history) to
+              continue that conversation instead of starting fresh. Use on
+              REWORK — when a reviewer rejected your recent work and you are
+              revising it: the session already holds the repo, your changes,
+              and your reasoning, so revision is faster and better informed.
+              Start fresh (leave empty) when the task differs from the prior
+              one, the feedback says start over, or a resumed session errors —
+              resume is best-effort and falls back to a fresh workspace.
+              Only honored on your FIRST coding call of this task.
     """
     import subprocess
     import shutil
 
     if _remote_coding_enabled():
+        _maybe_resume_session(resume_session)
         return _remote_coding_turn(task, "claude", repo, model)
 
     task = _localize_repo_task(task, repo, working_directory)
@@ -1297,7 +1347,7 @@ def _ensure_codex_config() -> str | None:
 
 
 @tool
-def codex(task: str, working_directory: str = "/tmp", repo: str = "") -> str:
+def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_session: str = "") -> str:
     """Delegate a coding task to OpenAI Codex (GPT-5.5 via Amazon Bedrock).
 
     A peer to claude_code — same contract, different engine. Useful for a second
@@ -1319,11 +1369,17 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "") -> str:
               the coding runtime hosts the session)
         repo: Repository as owner/name or clone URL. Pass on your FIRST call so
               the workspace is cloned; later calls reuse it automatically.
+        resume_session: A PRIOR task's coding-session id ("cc-..." from a
+              [coding-session: ...] footer in your ticket history) to continue
+              that conversation on rework instead of rebuilding context. Leave
+              empty for a fresh session; best-effort. Only honored on your
+              FIRST coding call of this task.
     """
     import subprocess
     import shutil
 
     if _remote_coding_enabled():
+        _maybe_resume_session(resume_session)
         return _remote_coding_turn(task, "codex", repo)
 
     task = _localize_repo_task(task, repo, working_directory)
@@ -1593,6 +1649,7 @@ async def agent_invocation(payload, context):
             region_name=REGION,
             boto_client_config=override_config,
             streaming=True,
+            max_tokens=MAX_OUTPUT_TOKENS,
         )
         # NOTE: the persona's board model governs its own reasoning only. The
         # coding CLI's model is chosen per-delegation via claude_code(model=...)

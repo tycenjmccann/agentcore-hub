@@ -208,6 +208,18 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
 
   // S3 Artifacts Modal state
   const [artifactsModal, setArtifactsModal] = useState<{ phaseId: string; phaseName: string } | null>(null);
+  const [deepLinkArtifact, setDeepLinkArtifact] = useState<string | null>(null);
+
+  // Deep link: /workflow?id=X&artifact=<s3-key> opens the viewer directly
+  // (e.g. a Telegram approval ping linking straight to the plan.md to review).
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const artifactKey = params.get("artifact");
+    if (artifactKey && artifactKey.startsWith(`workflows/${workflowId}/`)) {
+      setDeepLinkArtifact(artifactKey);
+      setArtifactsModal({ phaseId: "deep-link", phaseName: "Artifacts" });
+    }
+  }, [workflowId]);
 
   const handleCancelWorkflow = useCallback(async () => {
     setCancelLoading(true);
@@ -1675,10 +1687,20 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         {/* S3 Artifacts Modal — phase click shows all workflow artifacts */}
         <S3ArtifactsModal
           isOpen={!!artifactsModal}
-          onClose={() => setArtifactsModal(null)}
+          onClose={() => {
+            setArtifactsModal(null);
+            if (deepLinkArtifact) {
+              setDeepLinkArtifact(null);
+              // Drop the artifact param so refresh/back doesn't reopen the viewer
+              const url = new URL(window.location.href);
+              url.searchParams.delete("artifact");
+              window.history.replaceState({}, "", url.toString());
+            }
+          }}
           agentId=""
           agentName="Workflow"
           workflowId={workflowId}
+          initialArtifactKey={deepLinkArtifact}
         />
 
         {/* Cancel Confirmation Modal */}

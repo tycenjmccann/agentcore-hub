@@ -7,11 +7,14 @@ import {
   X,
   FileText,
   FileCode,
+  FileImage,
+  FileVideo,
   Download,
   Archive,
   AlertCircle,
   Loader2,
 } from "lucide-react";
+import ArtifactViewer, { artifactKind } from "./ArtifactViewer";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -28,6 +31,8 @@ interface S3ArtifactsModalProps {
   agentId: string;
   agentName: string;
   workflowId: string;
+  /** Deep link: open the viewer for this key as soon as the modal mounts. */
+  initialArtifactKey?: string | null;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -60,6 +65,9 @@ const CODE_EXTENSIONS = new Set([
 ]);
 
 function getFileIcon(filename: string) {
+  const kind = artifactKind(filename);
+  if (kind === "image") return FileImage;
+  if (kind === "video") return FileVideo;
   const ext = filename.split(".").pop()?.toLowerCase() || "";
   return CODE_EXTENSIONS.has(ext) ? FileCode : FileText;
 }
@@ -72,12 +80,14 @@ export default function S3ArtifactsModal({
   agentId,
   agentName,
   workflowId,
+  initialArtifactKey,
 }: S3ArtifactsModalProps) {
   const [artifacts, setArtifacts] = useState<S3Artifact[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
   const [downloadingAll, setDownloadingAll] = useState(false);
+  const [viewing, setViewing] = useState<S3Artifact | null>(null);
   const [isClosing, setIsClosing] = useState(false);
   const [mounted, setMounted] = useState(false);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
@@ -87,6 +97,18 @@ export default function S3ArtifactsModal({
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  // Deep link straight into the viewer without waiting for the list fetch
+  useEffect(() => {
+    if (isOpen && initialArtifactKey) {
+      setViewing({
+        key: initialArtifactKey,
+        filename: initialArtifactKey.split("/").pop() || initialArtifactKey,
+        size: 0,
+        lastModified: null,
+      });
+    }
+  }, [isOpen, initialArtifactKey]);
 
   // Fetch artifacts on open
   useEffect(() => {
@@ -118,16 +140,16 @@ export default function S3ArtifactsModal({
     }
   }, [isOpen, isClosing]);
 
-  // Escape key handler
+  // Escape key handler — when the viewer is open, Escape closes it, not the modal
   useEffect(() => {
     if (!isOpen) return;
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") handleClose();
+      if (e.key === "Escape" && !viewing) handleClose();
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen]);
+  }, [isOpen, viewing]);
 
   // Focus trap
   useEffect(() => {
@@ -362,8 +384,17 @@ export default function S3ArtifactsModal({
                         {groups[folder].map((artifact) => {
                           const IconComponent = getFileIcon(artifact.filename);
                           const isDownloading = downloadingFile === artifact.key;
+                          const previewable = artifactKind(artifact.filename) !== "binary";
                           return (
-                            <li key={artifact.key} className="s3-file-row group">
+                            <li
+                              key={artifact.key}
+                              className={`s3-file-row group${previewable ? " s3-file-row-viewable" : ""}`}
+                              onClick={previewable ? () => setViewing(artifact) : undefined}
+                              role={previewable ? "button" : undefined}
+                              tabIndex={previewable ? 0 : undefined}
+                              onKeyDown={previewable ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setViewing(artifact); } } : undefined}
+                              aria-label={previewable ? `View ${artifact.filename}` : undefined}
+                            >
                               <IconComponent size={16} className="text-[var(--pipeline-text-muted)] shrink-0" />
                               <div className="flex-1 min-w-0">
                                 <p
@@ -380,7 +411,7 @@ export default function S3ArtifactsModal({
                                 </p>
                               </div>
                               <button
-                                onClick={() => handleDownload(artifact)}
+                                onClick={(e) => { e.stopPropagation(); handleDownload(artifact); }}
                                 className="s3-download-btn"
                                 aria-label={`Download ${artifact.filename}`}
                                 type="button"
@@ -426,6 +457,15 @@ export default function S3ArtifactsModal({
           </div>
         )}
       </div>
+
+      {/* Single-artifact viewer (markdown/text/image/video/audio/pdf) */}
+      {viewing && (
+        <ArtifactViewer
+          s3Key={viewing.key}
+          filename={viewing.filename}
+          onClose={() => setViewing(null)}
+        />
+      )}
     </div>
   );
 
