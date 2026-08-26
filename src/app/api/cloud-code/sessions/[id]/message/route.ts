@@ -70,18 +70,44 @@ export async function POST(
   }
 
   const body = await request.json().catch(() => ({}));
-  const prompt: string = (body.prompt || "").trim();
-  if (!prompt) {
-    return NextResponse.json({ error: "prompt is required" }, { status: 400 });
-  }
+  let prompt: string = (body.prompt || "").trim();
   // For the ported seed, the prompt is a huge transcript; displayPrompt is the
   // short label we persist/render in the chat instead of the raw seed.
   const displayPrompt: string = (body.displayPrompt || "").trim();
+  // Chat attachments: artifact-prefix paths the user uploaded in the composer
+  // (e.g. uploads/x/screenshot.png). Sanitized to safe relative paths; the
+  // runtime downloads them into the workspace and appends their on-disk paths
+  // to the prompt so the CLI reads them with its file tools.
+  const attachments: string[] = Array.isArray(body.attachments)
+    ? body.attachments
+        .map((p: unknown) => String(p || "").replace(/^\/+/, ""))
+        .filter((p: string) => p && !p.includes("..") && p.length < 1024)
+        .slice(0, 20)
+    : [];
+  // Need either text or at least one attachment. An attachment-only turn gets a
+  // default instruction so the CLI knows to look at the file(s).
+  if (!prompt && attachments.length === 0) {
+    return NextResponse.json({ error: "prompt or attachments required" }, { status: 400 });
+  }
+  if (!prompt) prompt = "Take a look at the attached file(s).";
 
+  // Persist attachments structurally on the turn so the chat can render image
+  // thumbnails (presigned at read time) instead of a plain text label.
+  const ctFor = (p: string): string | undefined => {
+    const ext = p.split(".").pop()?.toLowerCase() || "";
+    const map: Record<string, string> = {
+      png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+      webp: "image/webp", svg: "image/svg+xml", pdf: "application/pdf",
+    };
+    return map[ext];
+  };
   const userTurn: CloudCodeTurn = {
     role: "user",
-    text: displayPrompt || prompt,
+    text: displayPrompt || (attachments.length && !body.prompt?.trim() ? "" : prompt),
     at: new Date().toISOString(),
+    ...(attachments.length
+      ? { attachments: attachments.map((p) => ({ path: p, name: p.split("/").pop() || p, contentType: ctFor(p) })) }
+      : {}),
   };
   const wantStream = request.nextUrl.searchParams.get("stream") === "1";
   const userId = session.userId || DEFAULT_USER_ID;
@@ -118,7 +144,7 @@ export async function POST(
       upstream = await invokeCodingTurnStream({
         sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
         claudeSessionId: session.claudeSessionId, userId, tenantId: sessionTenant, configVersion, region,
-        githubToken, githubAppConnected, ...resumeFields,
+        githubToken, githubAppConnected, attachments, ...resumeFields,
       });
     } catch (err) {
       return NextResponse.json({ error: (err as Error).message }, { status: 502 });
@@ -183,7 +209,7 @@ export async function POST(
     const result = await invokeCodingTurn({
       sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
       claudeSessionId: session.claudeSessionId, userId, tenantId: sessionTenant, configVersion, region,
-      githubToken, githubAppConnected, ...resumeFields,
+      githubToken, githubAppConnected, attachments, ...resumeFields,
     });
 
     const agentTurn: CloudCodeTurn = { role: "agent", text: result.response, at: new Date().toISOString() };

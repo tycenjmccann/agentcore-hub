@@ -663,6 +663,38 @@ def _install_codex_resume_transcript(s3_key: str, session_id: str) -> bool:
         return False
 
 
+def _fetch_attachments(artifact_prefix: str, attachments: list, workdir: str) -> list[str]:
+    """Download chat attachments (paths relative to the session's artifact
+    prefix) into the workspace's .cloud-code/artifacts/ and return their absolute
+    on-disk paths. Traversal-guarded; best-effort per file — one bad attachment
+    never fails the turn."""
+    if not (artifact_prefix and attachments and workdir and ARTIFACT_BUCKET):
+        return []
+    dest_root = os.path.join(workdir, ".cloud-code", "artifacts")
+    real_root = os.path.realpath(dest_root)
+    paths: list[str] = []
+    try:
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        for rel in attachments[:20]:
+            rel = str(rel or "").lstrip("/")
+            if not rel or ".." in rel.split("/"):
+                continue
+            dest = os.path.join(dest_root, rel)
+            real_dest = os.path.realpath(dest)
+            if real_dest != real_root and not real_dest.startswith(real_root + os.sep):
+                continue
+            try:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as fh:
+                    s3.download_fileobj(ARTIFACT_BUCKET, artifact_prefix + rel, fh)
+                paths.append(dest)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("attachment_fetch_failed", extra={"rel": rel, "error": str(exc)[:200]})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("attachments_fetch_failed", extra={"error": str(exc)[:200]})
+    return paths
+
+
 def _install_artifacts(artifact_prefix: str, workdir: str, session_id: str | None) -> int:
     """Restore a session's artifacts (uploaded via the web, or ported) into the
     workspace's .cloud-code/artifacts/ so the agent can open them on a turn.
@@ -1311,6 +1343,10 @@ async def invocations(request: Request):
     # GITHUB_PAT (that would clone beyond the owner's App scope).
     github_token = payload.get("github_token")
     github_app_connected = bool(payload.get("github_app_connected"))
+    # Chat attachments: paths (relative to the session's artifact prefix, e.g.
+    # uploads/x/shot.png) the user uploaded in the composer. Downloaded into
+    # .cloud-code/artifacts/ and appended to the prompt so the CLI can open them.
+    attachments = payload.get("attachments") or []
 
     # On resume, recover the repo the conversation was started in (so we land in
     # the same cwd Claude Code scoped the session to) when the caller omits it.
@@ -1370,6 +1406,16 @@ async def invocations(request: Request):
             _install_artifacts(
                 f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", workdir, session_id
             )
+        # Chat attachments: fetch the user's uploads for THIS turn and point the
+        # CLI at them (appended paths — the CLI reads them with its file tools).
+        if attachments and session_id and not warm and not checkpoint:
+            fetched = _fetch_attachments(
+                f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", attachments, workdir
+            )
+            if fetched:
+                listing = "\n".join(f"- {p}" for p in fetched)
+                prompt = (prompt + "\n\nAttached file(s) for this message "
+                          "(already downloaded locally):\n" + listing)
         # Hand the interactive Terminal a one-shot launch hint: which dir to cd
         # into and which conversation to `claude --resume`. shell-init.sh reads it
         # on a FRESH shell only (run-once guard — a PTY reattach to an

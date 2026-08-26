@@ -66,6 +66,10 @@ export interface CodingTurnParams {
   // means the scoped mint was DENIED — the runtime must NOT fall back to
   // GITHUB_PAT, or the clone would escalate beyond the user's App scope.
   githubAppConnected?: boolean;
+  // Chat attachments: paths relative to the session's artifact prefix (composer
+  // uploads). The runtime downloads them into the workspace and appends their
+  // on-disk paths to the prompt.
+  attachments?: string[];
 }
 
 function buildTurnPayload(params: CodingTurnParams): Record<string, unknown> {
@@ -88,6 +92,7 @@ function buildTurnPayload(params: CodingTurnParams): Record<string, unknown> {
   if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
   if (params.githubToken) payload.github_token = params.githubToken;
   if (params.githubAppConnected) payload.github_app_connected = true;
+  if (params.attachments?.length) payload.attachments = params.attachments;
   return payload;
 }
 
