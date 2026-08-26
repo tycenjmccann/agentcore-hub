@@ -33,6 +33,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -1160,6 +1161,17 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
 
     proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+    # Watchdog: the buffered runner enforced TURN_TIMEOUT_S via subprocess.run;
+    # this loop blocks on readline, so a codex (or an invoked command) that wedges
+    # without closing stdout would pin the microVM HealthyBusy forever. Kill the
+    # process at the cap so the loop unwinds and a terminal frame is emitted.
+    timed_out = threading.Event()
+
+    def _kill_on_timeout():
+        timed_out.set()
+        proc.kill()
+    watchdog = threading.Timer(TURN_TIMEOUT_S, _kill_on_timeout)
+    watchdog.start()
     thread_id: str | None = codex_session_id
     reply_parts: list[str] = []          # only agent_message text = the actual reply
     emitted_any_reply = False            # did we stream reply text (vs only status)?
@@ -1176,16 +1188,25 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
             t = obj.get("type")
             if t == "thread.started" and obj.get("thread_id"):
                 thread_id = obj["thread_id"]
+                # A fresh thread.started after an error frame is run-codex.sh
+                # RETRYING (cold-engine Mantle errors). The prior attempt's
+                # failure must not poison a successful retry's result.
+                fail_detail = None
                 continue
             if t in ("error", "turn.failed"):
                 fail_detail = str(obj.get("message") or (obj.get("error") or {}).get("message") or "")[:400]
                 continue
-            # item.started/completed carry the step payload (older builds: msg).
+            if t == "turn.completed":
+                fail_detail = None  # a completed turn supersedes any earlier attempt's error
+                continue
+            # item.started/completed carry the step payload. Older codex builds
+            # wrap it as {"msg":{...}} with NO top-level type — treat a msg-shaped
+            # agent_message as completed (there are no partial frames there).
             item = obj.get("item") or obj.get("msg") or {}
             itype = item.get("type")
             if itype == "agent_message":
                 # The reply. completed frame has the whole message; stream it once.
-                if t == "item.completed":
+                if t == "item.completed" or (t is None and "msg" in obj):
                     msg = item.get("text") or item.get("message") or ""
                     if msg:
                         reply_parts.append(msg)
@@ -1202,6 +1223,13 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
         proc.wait(timeout=30)
     except Exception as exc:  # noqa: BLE001
         yield sse({"type": "error", "error": str(exc)[:600]})
+        return
+    finally:
+        watchdog.cancel()
+    if timed_out.is_set():
+        err = f"codex timed out after {TURN_TIMEOUT_S}s"
+        yield sse({"type": "error", "error": err})
+        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": thread_id})
         return
     if proc.returncode not in (0, None) or fail_detail:
         banner = ((proc.stderr.read() or "")[:200] if proc.stderr else "")
