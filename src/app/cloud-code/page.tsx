@@ -208,8 +208,8 @@ export default function CloudCodePage() {
       s ? { ...s, turns: [...s.turns, { role: "user", text: displayAs ?? prompt, at: new Date().toISOString() }] } : s
     );
     try {
-      // Claude streams (SSE); codex is buffered (plain JSON).
-      const canStream = active.cli === "claude";
+      // Both CLIs stream (SSE): claude token deltas, codex per-step frames.
+      const canStream = true;
       const res = await fetch(
         `/api/cloud-code/sessions/${sessionId}/message${canStream ? "?stream=1" : ""}`,
         {
