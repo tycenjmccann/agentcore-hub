@@ -924,6 +924,44 @@ def _sync_turn_artifacts(session_id: str, workdir: str, tenant_id: str | None = 
     return _sync_artifacts(f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", workdir)
 
 
+def _checkpoint_return_bundle(session_id: str, workdir: str,
+                              tenant_id: str | None = None) -> dict | None:
+    """Return leg for bundle/selfContained sessions: the cloud's commits can't
+    ride `git fetch origin` home (origin is read-only or absent), so bundle the
+    workspace's full history and upload it. The laptop's pull leg fetches this
+    bundle and fast-forwards its branch from it instead of origin. Best-effort:
+    returns {key, bytes, branch} or None (no repo / bundle failed)."""
+    if not (ARTIFACT_BUCKET and os.path.isdir(os.path.join(workdir, ".git"))):
+        return None
+    bundle_path = os.path.join(_session_dir(session_id), ".return.bundle")
+    try:
+        res = subprocess.run(["git", "bundle", "create", bundle_path, "--all", "HEAD"],
+                             cwd=workdir, capture_output=True, text=True, timeout=300)
+        if res.returncode != 0:
+            logger.warning("return_bundle_create_failed", extra={"err": res.stderr.strip()[:200]})
+            return None
+        branch = None
+        br = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=workdir,
+                            capture_output=True, text=True, timeout=30)
+        if br.returncode == 0 and br.stdout.strip() != "HEAD":
+            branch = br.stdout.strip()
+        key = f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/return.bundle"
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        with open(bundle_path, "rb") as f:
+            data = f.read()
+        s3.put_object(Bucket=ARTIFACT_BUCKET, Key=key, Body=data,
+                      ContentType="application/octet-stream")
+        return {"key": key, "bytes": len(data), "branch": branch}
+    except Exception as exc:  # noqa: BLE001 — best-effort return leg
+        logger.warning("return_bundle_failed", extra={"error": str(exc)[:200]})
+        return None
+    finally:
+        try:
+            os.remove(bundle_path)
+        except OSError:
+            pass
+
+
 def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
     """Pull-home leg: upload deliverables under the CHECKPOINT prefix (keyed by the
     resume/claude session id) so the laptop pull brings them home too."""
@@ -1652,7 +1690,14 @@ async def invocations(request: Request):
         # Harvest touched-untracked deliverables too (best-effort — never fails the
         # checkpoint). They surface in the web Artifacts tab under the same cp_id.
         artifacts = _checkpoint_artifacts(cp_id, workdir, tenant_id)
-        return JSONResponse({"checkpointed": True, **info, "artifacts": artifacts})
+        # bundle/selfContained sessions have no writable origin — the laptop
+        # can't `git fetch origin` the cloud's commits home. Ship them as a
+        # return bundle instead (the pull leg fetches from it directly).
+        return_bundle = None
+        if git_mode in ("bundle", "selfContained") or _selfcontained_workspace(session_id):
+            return_bundle = _checkpoint_return_bundle(cp_id, workdir, tenant_id)
+        return JSONResponse({"checkpointed": True, **info, "artifacts": artifacts,
+                             "return_bundle": return_bundle})
 
     # Pre-warm done: workspace cloned, branch checked out, transcript installed.
     # No CLI runs — the first real turn (on open) will be instant + warm.

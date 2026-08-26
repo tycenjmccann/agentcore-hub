@@ -198,12 +198,18 @@ async function currentBranch(cwd: string): Promise<string> {
   return r.ok ? r.out : "main";
 }
 
-/** Ensure user.name/email exist for the commit (fresh `git init` may lack them). */
+/** Ensure user.name/email exist for the commit (fresh `git init` may lack them).
+ *  Probed independently: a machine with a global user.name but no user.email
+ *  would otherwise skip both and the snapshot commit dies with "Author identity
+ *  unknown". */
 async function ensureCommitIdentity(cwd: string): Promise<void> {
   const name = await gitTry(cwd, ["config", "user.name"]);
   if (!name.ok || !name.out) {
-    await git(cwd, ["config", "user.email", "cloud-code@localhost"]);
     await git(cwd, ["config", "user.name", "Cloud Code Port"]);
+  }
+  const email = await gitTry(cwd, ["config", "user.email"]);
+  if (!email.ok || !email.out) {
+    await git(cwd, ["config", "user.email", "cloud-code@localhost"]);
   }
 }
 
@@ -253,8 +259,9 @@ export async function prepareGitHandoff(
 
   // Mode selection keys off originUrl (what the cloud actually clones), not the
   // parsed github owner/name — a non-github or SSH origin is still clonable.
-  // pushed if we can push and aren't forced to bundle; else bundle if there's an
-  // origin to clone; else none.
+  // pushed if we can push and aren't forced to bundle; else bundle if the origin
+  // is READABLE (the cloud must clone it before layering the bundle); else
+  // self-contained (unreachable/laptop-local origins can't seed a cloud clone).
   const writable = !opts.preferBundle && state.originUrl
     ? await canPushToOrigin(cwd)
     : false;
@@ -264,12 +271,19 @@ export async function prepareGitHandoff(
     return { mode: "pushed", branch: target, committed, cloneUrl: state.originUrl };
   }
 
-  // Bundle mode needs an origin the cloud can clone (the public upstream) AND a
+  // Bundle mode needs an origin the cloud can CLONE (the public upstream) AND a
   // base commit present there, so the bundle only carries OUR commits on top.
-  if (state.originUrl) {
-    // base = the merge-base with the remote's default branch (or origin/HEAD).
-    // Falls back to the upstream of the current branch, then to the first commit.
-    let baseRef = "";
+  // A configured-but-unreachable origin (laptop-local path, dead host, revoked
+  // read access) fails the reachability probe → fall through to self-contained,
+  // otherwise the cloud's mandatory upstream clone fails and the user's code
+  // never arrives (runtime falls back to a bare workspace). Same for unrelated
+  // histories: a base..HEAD bundle without a shared root can't verify against
+  // the upstream clone, so ship the whole repo instead.
+  const originReadable = state.originUrl
+    ? (await gitTry(cwd, ["ls-remote", "--heads", "origin"])).ok
+    : false;
+  let baseRef = "";
+  if (state.originUrl && originReadable) {
     for (const cand of [
       "origin/HEAD",
       `origin/${target}`,
@@ -278,11 +292,8 @@ export async function prepareGitHandoff(
       const r = await gitTry(cwd, ["merge-base", "HEAD", cand]);
       if (r.ok && r.out) { baseRef = r.out; break; }
     }
-    if (!baseRef) {
-      // No shared base with origin → bundle the whole branch history.
-      const root = await gitTry(cwd, ["rev-list", "--max-parents=0", "HEAD"]);
-      baseRef = root.ok ? root.out.split("\n")[0] : "";
-    }
+  }
+  if (state.originUrl && originReadable && baseRef) {
 
     if (opts.writeArtifacts) {
       // git bundle of base..HEAD (our commits), plus a patch of anything still
@@ -325,6 +336,38 @@ export async function prepareGitHandoff(
   });
   if (sc) return { ...sc, committed: committed || sc.committed };
   return { mode: "none", reason: state.originUrl ? "origin not reachable" : "no origin remote" };
+}
+
+/**
+ * Pull the cloud's commits from a RETURN BUNDLE (bundle/selfContained sessions —
+ * no writable origin to fetch from). Fetches the bundle's refs and fast-forwards
+ * the named branch, with the same dirty/diverged safety as pullBranch.
+ */
+export async function pullFromBundle(cwd: string, bundleBytes: Buffer, branch: string): Promise<string> {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const tmp = await mkdtemp(pathMod.join(os.tmpdir(), "cc-return-"));
+  const bundlePath = pathMod.join(tmp, "return.bundle");
+  try {
+    await writeFile(bundlePath, bundleBytes);
+    const verify = await gitTry(cwd, ["bundle", "verify", bundlePath]);
+    if (!verify.ok) return `return bundle failed verification; cloud commits not applied.`;
+    const fetch_ = await gitTry(cwd, ["fetch", bundlePath, `+refs/heads/*:refs/remotes/cc-cloud/*`, "HEAD"]);
+    if (!fetch_.ok) return `return bundle fetch failed; cloud commits not applied.`;
+    const status = await git(cwd, ["status", "--porcelain"]);
+    if (status.length > 0) {
+      return `local tree is dirty; cloud commits fetched to cc-cloud/* but NOT checked out. Stash/commit, then \`git checkout -B ${branch} cc-cloud/${branch}\`.`;
+    }
+    const co = await gitTry(cwd, ["checkout", "-B", branch, `cc-cloud/${branch}`]);
+    if (!co.ok) {
+      const co2 = await gitTry(cwd, ["checkout", "-B", branch, "FETCH_HEAD"]);
+      if (!co2.ok) return `cloud commits fetched to cc-cloud/*, but checkout failed; run \`git checkout -B ${branch} FETCH_HEAD\`.`;
+    }
+    return `pulled the cloud's commits from its return bundle onto \`${branch}\`.`;
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
 }
 
 /**

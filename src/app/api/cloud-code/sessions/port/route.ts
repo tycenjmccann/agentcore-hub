@@ -55,6 +55,43 @@ const UPLOAD_EXPIRES = 900; // 15 min to push the transcript
 // untrusted-input backstop). Over-cap entries are dropped, not errored.
 const MAX_ARTIFACTS = 200;
 
+/**
+ * Validate an untrusted cloneUrl before it reaches `git clone` on the runtime.
+ * https-only (the runtime's PAT rewriting + App tokens are https; the MCP
+ * normalizes ssh→https before sending), no userinfo (nothing credential-shaped
+ * persists), and no private/link-local/loopback literals — an authenticated
+ * caller must not be able to point the runtime's git at VPC-internal targets
+ * (SSRF). Hostname-based private targets can't be fully resolved here, but the
+ * runtime egresses through its own network policy; this strips the cheap cases.
+ */
+function safeCloneUrl(raw?: string): string | undefined {
+  if (!raw) return undefined;
+  let u: URL;
+  try {
+    u = new URL(raw.trim());
+  } catch {
+    return undefined;
+  }
+  if (u.protocol !== "https:") return undefined;
+  if (u.username || u.password) return undefined;
+  const host = u.hostname.toLowerCase();
+  if (
+    host === "localhost" ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    /^127\./.test(host) ||
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+    /^169\.254\./.test(host) ||
+    host === "0.0.0.0" ||
+    host === "[::1]" || host === "::1"
+  ) {
+    return undefined;
+  }
+  return u.toString();
+}
+
 // Best-effort owner/name from any clone URL (for the default session title).
 function parseRepoFromUrl(url?: string): string | undefined {
   if (!url) return undefined;
@@ -109,7 +146,13 @@ export async function POST(request: NextRequest) {
       : body.gitMode === "none" ? "none"
       : "pushed";
     const repo: string = (body.repo || "").trim();
-    const cloneUrl: string | undefined = body.cloneUrl?.trim() || undefined;
+    const cloneUrl: string | undefined = safeCloneUrl(body.cloneUrl);
+    if (body.cloneUrl?.trim() && !cloneUrl) {
+      return NextResponse.json(
+        { error: "cloneUrl must be a public https URL (no credentials, no private hosts)" },
+        { status: 400 }
+      );
+    }
     // pushed/bundle need SOMETHING to clone — either owner/name (github) or an
     // explicit cloneUrl (non-github / self-hosted origins where remoteRepo is
     // undefined). selfContained ships a bundle --all instead (no origin); "none"
