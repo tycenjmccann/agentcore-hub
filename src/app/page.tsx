@@ -1,13 +1,10 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import {
-  Bot, Brain, Cpu, Activity, ArrowRight, MessageSquare,
-  Zap, Clock, Ticket, Layers, CheckCircle2,
-  TrendingUp, Timer,
-} from "lucide-react";
+import { Brain, Cpu, ArrowRight } from "lucide-react";
 import Link from "next/link";
 import { cachedFetch, getCached } from "@/lib/client-cache";
+import TicketsFlowPanel from "@/components/dashboard/TicketsFlowPanel";
 
 interface Agent {
   id: string;
@@ -41,62 +38,11 @@ interface MetricsData {
   }>;
 }
 
-type Timeframe = "day" | "week" | "month" | "year";
-
-interface EpicProgress {
-  epic: string;
-  key: string;
-  stories: number;
-  done: number;
-}
-
-interface JiraMetrics {
-  ticketsResolved: number;
-  ticketsInProgress: number;
-  epicsActive: number;
-  storiesCompleted: number;
-  storiesInProgress: number;
-  avgResolutionTime: number;
-  automationRate: number;
-  throughput: number;
-  timeframe: Timeframe;
-  epicProgress: EpicProgress[];
-}
-
-function useJiraMetrics() {
-  const [timeframe, setTimeframe] = useState<Timeframe>("week");
-  const [data, setData] = useState<JiraMetrics>({
-    ticketsResolved: 0,
-    ticketsInProgress: 0,
-    epicsActive: 0,
-    storiesCompleted: 0,
-    storiesInProgress: 0,
-    avgResolutionTime: 0,
-    automationRate: 0,
-    throughput: 0,
-    timeframe: "week",
-    epicProgress: [],
-  });
-  const [jiraLoading, setJiraLoading] = useState(true);
-
-  useEffect(() => {
-    setJiraLoading(true);
-    fetch(`/api/jira/metrics?timeframe=${timeframe}`)
-      .then((r) => r.json())
-      .then((d) => {
-        if (!d.error) setData(d);
-      })
-      .catch(() => {})
-      .finally(() => setJiraLoading(false));
-  }, [timeframe]);
-
-  return { ...data, loading: jiraLoading, timeframe, setTimeframe };
-}
-
 function formatNumber(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return n.toString();
+  const opts = { minimumFractionDigits: 1, maximumFractionDigits: 1 } as const;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toLocaleString("en-US", opts)}M`;
+  if (n >= 10_000) return `${(n / 1_000).toLocaleString("en-US", opts)}K`;
+  return n.toLocaleString("en-US");
 }
 
 function formatDuration(seconds: number): string {
@@ -115,7 +61,6 @@ export default function DashboardPage() {
   const [metrics, setMetrics] = useState<MetricsData | null>(() => getCached<MetricsData>("/api/agentcore/metrics"));
   const [loading, setLoading] = useState(!getCached("/api/agentcore/agents"));
   const [metricsLoading, setMetricsLoading] = useState(!getCached("/api/agentcore/metrics"));
-  const jira = useJiraMetrics();
 
   useEffect(() => {
     // Agent discovery is fast (~0.5s); metrics runs slow CloudWatch Logs
@@ -142,126 +87,34 @@ export default function DashboardPage() {
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
           <BigMetric
             label="Invocations"
-            value={metricsLoading ? "—" : (metrics?.usage.totalInvocations ?? 0).toString()}
-            sub={`${metrics?.usage.totalSessions ?? 0} sessions`}
-            icon={MessageSquare}
-            color="text-brand-400"
+            value={metricsLoading ? "—" : (metrics?.usage.totalInvocations ?? 0).toLocaleString("en-US")}
+            sub={`${(metrics?.usage.totalSessions ?? 0).toLocaleString("en-US")} sessions`}
           />
           <BigMetric
             label="Tokens"
             value={metricsLoading ? "—" : `${formatNumber(metrics?.usage.totalTokensIn ?? 0)} / ${formatNumber(metrics?.usage.totalTokensOut ?? 0)}`}
             sub="in / out"
-            icon={Zap}
-            color="text-info-fg"
           />
           <BigMetric
             label="Avg Duration"
             value={metricsLoading ? "—" : formatDuration(metrics?.usage.avgSessionDuration ?? 0)}
             sub="per session"
-            icon={Timer}
-            color="text-warning-fg"
           />
           <BigMetric
             label="Total Duration"
             value={metricsLoading ? "—" : formatDuration(metrics?.usage.totalDuration ?? 0)}
             sub="autonomous work time"
-            icon={Clock}
-            color="text-success-fg"
           />
           <BigMetric
             label="Active Agents"
             value={metricsLoading ? "—" : (metrics?.usage.activeAgents ?? agents.filter((a) => a.status === "ACTIVE" || a.status === "READY").length).toString()}
             sub={`of ${metrics?.usage.totalAgents ?? agents.length} total`}
-            icon={Bot}
-            color="text-brand-400"
           />
         </div>
       </div>
 
-      {/* Jira Section */}
-      <div className="card">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-xs font-semibold text-[var(--color-text-muted)] uppercase tracking-wide">Tickets · {process.env.NEXT_PUBLIC_TICKET_PROVIDER === "jira" ? "Jira" : "DynamoDB"}</h3>
-          <select
-            value={jira.timeframe}
-            onChange={(e) => jira.setTimeframe(e.target.value as Timeframe)}
-            className="text-xs bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] rounded-md px-2 py-1 text-[var(--color-text-secondary)] focus:outline-none focus:border-blue-500"
-          >
-            <option value="day">Today</option>
-            <option value="week">This Week</option>
-            <option value="month">This Month</option>
-            <option value="year">This Year</option>
-          </select>
-        </div>
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-          <BigMetric
-            label="Tickets Resolved"
-            value={jira.loading ? "—" : jira.ticketsResolved.toString()}
-            sub={`${jira.ticketsInProgress} in progress`}
-            icon={CheckCircle2}
-            color="text-success-fg"
-          />
-          <BigMetric
-            label="Active Epics"
-            value={jira.loading ? "—" : jira.epicsActive.toString()}
-            sub="in progress"
-            icon={Layers}
-            color="text-warning-fg"
-          />
-          <BigMetric
-            label="Stories Done"
-            value={jira.loading ? "—" : jira.storiesCompleted.toString()}
-            sub={`${jira.storiesInProgress} active`}
-            icon={Ticket}
-            color="text-info-fg"
-          />
-          <BigMetric
-            label="Avg Resolution"
-            value={jira.loading ? "—" : `${jira.avgResolutionTime}m`}
-            sub="per ticket"
-            icon={Timer}
-            color="text-success-fg"
-          />
-          <BigMetric
-            label="Throughput"
-            value={jira.loading ? "—" : `${jira.throughput}/day`}
-            sub={`avg this ${jira.timeframe}`}
-            icon={TrendingUp}
-            color="text-violet-fg"
-          />
-          <BigMetric
-            label="Automation Rate"
-            value={jira.loading ? "—" : `${jira.automationRate}%`}
-            sub="agent-handled"
-            icon={Activity}
-            color="text-brand-400"
-          />
-        </div>
-
-        {/* Epics breakdown */}
-        {jira.epicProgress.length > 0 && (
-          <div className="mt-5 pt-4 border-t border-surface-4">
-            <p className="text-xs text-[var(--color-text-muted)] mb-3">Epic Progress</p>
-            <div className="space-y-2.5">
-              {jira.epicProgress.map((e, i) => {
-                const colors = ["bg-orange-500", "bg-blue-500", "bg-purple-500", "bg-green-500", "bg-cyan-500", "bg-brand-500", "bg-yellow-500", "bg-red-500", "bg-emerald-500", "bg-pink-500"];
-                return (
-                  <div key={e.key} className="flex items-center gap-3">
-                    <span className="text-xs text-[var(--color-text-secondary)] w-56 truncate flex-shrink-0" title={e.epic}>{e.epic}</span>
-                    <div className="flex-1 h-2 bg-surface-3 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full ${colors[i % colors.length]} rounded-full transition-all duration-500`}
-                        style={{ width: `${(e.done / e.stories) * 100}%` }}
-                      />
-                    </div>
-                    <span className="text-[11px] text-[var(--color-text-muted)] w-16 text-right flex-shrink-0">{e.done}/{e.stories}</span>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-      </div>
+      {/* Ticket flow section */}
+      <TicketsFlowPanel />
 
       {/* Agent Performance Table */}
       <div className="card">
@@ -357,23 +210,12 @@ export default function DashboardPage() {
   );
 }
 
-function BigMetric({
-  label, value, icon: Icon, color, sub,
-}: {
-  label: string;
-  value: string;
-  icon: typeof Bot;
-  color: string;
-  sub?: string;
-}) {
+function BigMetric({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
-    <div className="flex items-start gap-3">
-      <Icon className={`w-5 h-5 ${color} opacity-60 mt-1 flex-shrink-0`} />
-      <div>
-        <p className="text-[10px] text-[var(--color-text-muted)] uppercase tracking-wide">{label}</p>
-        <p className="text-2xl font-bold text-[var(--color-text-primary)] mt-0.5">{value}</p>
-        {sub && <p className="text-[11px] text-[var(--color-text-secondary)] mt-0.5">{sub}</p>}
-      </div>
+    <div>
+      <p className="text-[10px] text-[var(--color-text-muted)] uppercase tracking-wide">{label}</p>
+      <p className="text-2xl font-bold text-[var(--color-text-primary)] mt-0.5">{value}</p>
+      {sub && <p className="text-[11px] text-[var(--color-text-secondary)] mt-0.5">{sub}</p>}
     </div>
   );
 }
