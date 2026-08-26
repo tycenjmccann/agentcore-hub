@@ -4,7 +4,7 @@
  *                                 multipart: bundle (zip), label?, scope?
  *                                 scope=claude|codex → MERGE that CLI's subtree
  *                                 into the current bundle (keeps the other CLI's
- *                                 files); absent → full-replace. The port-session
+ *                                 files); absent → full-replace. The hub
  *                                 MCP's sync_cli_config uses scope.
  * PUT  /api/cloud-code/config   → set the current version  { version }
  *

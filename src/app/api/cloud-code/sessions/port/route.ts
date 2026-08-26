@@ -1,7 +1,7 @@
 /**
  * POST /api/cloud-code/sessions/port  → "port my laptop session to the cloud"
  *
- * Called by the local `port-session` MCP server after it has prepared the git
+ * Called by the local hub MCP server after it has prepared the git
  * handoff. We create a Cloud Code session and hand back a presigned S3 PUT URL;
  * the MCP uploads the RAW Claude transcript (.jsonl) straight to S3. On open,
  * the runtime downloads that transcript, drops it into the workspace's project
@@ -13,7 +13,7 @@
  * so the runtime resumes. Instant + serverless-robust — the user can close the
  * laptop immediately.
  *
- * Git is FLEXIBLE (see the port-session MCP): gitMode is "pushed" (branch on
+ * Git is FLEXIBLE (see the hub MCP): gitMode is "pushed" (branch on
  * origin), "bundle" (origin read-only → a git bundle the runtime layers on top),
  * "selfContained" (NO usable remote → a `bundle --all` of the whole repo the
  * runtime rebuilds standalone, nothing leaves the account), or "none" (truly
@@ -180,7 +180,7 @@ export async function POST(request: NextRequest) {
     const defaultView: "chat" | "terminal" =
       body.view === "terminal" ? "terminal" : "chat";
 
-    // The port-session MCP authenticates as the porting user; middleware stamps
+    // The hub MCP authenticates as the porting user; middleware stamps
     // their identity (default in no-auth deploys). The cloud session is owned by
     // that tenant so it shows in the right sidebar and is IAM-scoped correctly.
     const { userId, tenantId } = getIdentity(request);

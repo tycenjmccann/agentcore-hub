@@ -254,7 +254,9 @@ async function sanitizeClaudeMcp(res: GatherResult): Promise<Record<string, unkn
   const servers = (doc.mcpServers || {}) as Record<string, ServerDesc>;
   const out: Record<string, unknown> = {};
   for (const [name, raw] of Object.entries(servers)) {
-    if (name === "port-session") continue; // the laptop-only handoff tool itself
+    // The laptop-only hub MCP itself (any registration alias) — porting it to
+    // the cloud would be circular, and its dist path doesn't exist there.
+    if (["port-session", "agentcore-hub", "workflow-hub", "cloud-code"].includes(name)) continue;
     const verdict = classifyServer(name, raw);
     res.classified.push(verdict);
     for (const k of verdict.redactedEnv || []) res.redactedEnv.push(`${name}.${k}`);

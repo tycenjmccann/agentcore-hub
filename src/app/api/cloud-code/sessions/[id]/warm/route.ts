@@ -1,7 +1,7 @@
 /**
  * POST /api/cloud-code/sessions/[id]/warm  → pre-warm a ported session's microVM
  *
- * Called by the port-session MCP right after it uploads the transcript to S3.
+ * Called by the hub MCP right after it uploads the transcript to S3.
  * Fires a setup-only invoke (clone + checkout branch + install transcript, no
  * CLI run) so the workspace is hot by the time the user opens the deep link.
  * Best-effort: returns 202 immediately and lets the warm run in the background;
@@ -42,7 +42,7 @@ export async function POST(
   // Warming clones the repo, so it needs the same scoped clone token a turn gets
   // — bound to the verified requester (tenant sessions are shared; minting off
   // the creator would hand a coworker the creator's repo access). EXCEPTION:
-  // a service principal (svc:<tokenName> — the port-session MCP calling warm
+  // a service principal (svc:<tokenName> — the hub MCP calling warm
   // right after a port) has no GitHub connection of its own; it acts on behalf
   // of the session owner, so mint with the OWNER's connection. Without this,
   // every post-flip MCP warm reported connected:false and the runtime fell back
