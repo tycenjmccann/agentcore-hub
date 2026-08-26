@@ -5,22 +5,71 @@
       "id": "software-delivery",
       "name": "Software Delivery",
       "displayName": "SDLC",
-      "description": "Autonomous feature/bug pipeline: requirements analysis, parallel design, development, QA verification, and CI — produces a pull request.",
+      "description": "Autonomous feature/bug pipeline: requirements analysis, parallel design, development, QA verification, and CI \u2014 produces a pull request.",
       "icon": "GitPullRequest",
       "intakeAgentId": "agentcore_hub_requirements_analyst",
       "requiresRepo": true,
       "featureBranchPhase": "development",
       "createsPullRequest": true,
-      "completionRequiresAgentPhases": ["development", "verification", "review"],
+      "completionRequiresAgentPhases": [
+        "development",
+        "verification",
+        "review"
+      ],
       "reviewGates": [
-        { "afterPhase": "design", "name": "Design Review", "blocking": true, "condition": "flagged", "onReject": "rework", "reviewerRole": "Designer" }
+        {
+          "afterPhase": "requirements",
+          "name": "Spec Approval",
+          "blocking": true,
+          "condition": "flagged",
+          "onReject": "rework",
+          "reviewerRole": "Product Owner",
+          "assignee": "human:product-owner"
+        },
+        {
+          "afterPhase": "design",
+          "name": "Plan Approval",
+          "blocking": true,
+          "condition": "flagged",
+          "onReject": "rework",
+          "reviewerRole": "Designer",
+          "assignee": "human:engineer"
+        }
       ],
       "phases": [
-        { "id": "intake", "name": "Intake", "type": "app", "agentPhase": "intake" },
-        { "id": "requirements", "name": "Requirements", "type": "agent", "agentPhase": "requirements" },
-        { "id": "design", "name": "Design", "type": "agent", "agentPhase": "design" },
-        { "id": "development", "name": "Development", "type": "agent", "agentPhase": "development" },
-        { "id": "qa", "name": "QA & Ship", "type": "agent", "agentPhase": "verification", "extraAgentPhases": ["review"] }
+        {
+          "id": "intake",
+          "name": "Intake",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "requirements",
+          "name": "Requirements",
+          "type": "agent",
+          "agentPhase": "requirements"
+        },
+        {
+          "id": "design",
+          "name": "Design",
+          "type": "agent",
+          "agentPhase": "design"
+        },
+        {
+          "id": "development",
+          "name": "Development",
+          "type": "agent",
+          "agentPhase": "development"
+        },
+        {
+          "id": "qa",
+          "name": "QA & Ship",
+          "type": "agent",
+          "agentPhase": "verification",
+          "extraAgentPhases": [
+            "review"
+          ]
+        }
       ]
     },
     {
@@ -33,29 +82,78 @@
       "requiresRepo": true,
       "featureBranchPhase": "development",
       "createsPullRequest": true,
-      "completionRequiresAgentPhases": ["development", "verification", "review"],
+      "completionRequiresAgentPhases": [
+        "development",
+        "verification",
+        "review"
+      ],
       "phases": [
-        { "id": "intake", "name": "Intake", "type": "app", "agentPhase": "intake" },
-        { "id": "triage", "name": "Triage", "type": "agent", "agentPhase": "requirements" },
-        { "id": "fix", "name": "Fix", "type": "agent", "agentPhase": "development" },
-        { "id": "qa", "name": "Verify & Ship", "type": "agent", "agentPhase": "verification", "extraAgentPhases": ["review"] }
+        {
+          "id": "intake",
+          "name": "Intake",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "triage",
+          "name": "Triage",
+          "type": "agent",
+          "agentPhase": "requirements"
+        },
+        {
+          "id": "fix",
+          "name": "Fix",
+          "type": "agent",
+          "agentPhase": "development"
+        },
+        {
+          "id": "qa",
+          "name": "Verify & Ship",
+          "type": "agent",
+          "agentPhase": "verification",
+          "extraAgentPhases": [
+            "review"
+          ]
+        }
       ]
     },
     {
       "id": "dead-code-sweep",
       "name": "Dead Code Sweep",
       "displayName": "Dead-Code",
-      "description": "Scheduled hygiene flow: statically detect unused code (language-aware — Periphery for Swift, knip/ts-prune for TS, vulture for Python), remove it surgically with evidence it is unreferenced, then independent code review, live QA that build + tests still pass, and CI. Produces a pull request for human review — never auto-merges.",
+      "description": "Scheduled hygiene flow: statically detect unused code (language-aware \u2014 Periphery for Swift, knip/ts-prune for TS, vulture for Python), remove it surgically with evidence it is unreferenced, then independent code review, live QA that build + tests still pass, and CI. Produces a pull request for human review \u2014 never auto-merges.",
       "icon": "Trash2",
       "intakeAgentId": "agentcore_hub_requirements_analyst",
       "requiresRepo": true,
       "featureBranchPhase": "development",
       "createsPullRequest": true,
-      "completionRequiresAgentPhases": ["development", "verification", "review"],
+      "completionRequiresAgentPhases": [
+        "development",
+        "verification",
+        "review"
+      ],
       "phases": [
-        { "id": "intake", "name": "Intake", "type": "app", "agentPhase": "intake" },
-        { "id": "sweep", "name": "Sweep", "type": "agent", "agentPhase": "development" },
-        { "id": "qa", "name": "Verify & Ship", "type": "agent", "agentPhase": "verification", "extraAgentPhases": ["review"] }
+        {
+          "id": "intake",
+          "name": "Intake",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "sweep",
+          "name": "Sweep",
+          "type": "agent",
+          "agentPhase": "development"
+        },
+        {
+          "id": "qa",
+          "name": "Verify & Ship",
+          "type": "agent",
+          "agentPhase": "verification",
+          "extraAgentPhases": [
+            "review"
+          ]
+        }
       ]
     },
     {
@@ -68,14 +166,47 @@
       "requiresRepo": false,
       "featureBranchPhase": null,
       "createsPullRequest": false,
-      "completionRequiresAgentPhases": ["generation", "scheduling"],
+      "completionRequiresAgentPhases": [
+        "generation",
+        "scheduling"
+      ],
       "phases": [
-        { "id": "intake", "name": "Idea", "type": "app", "agentPhase": "intake" },
-        { "id": "strategy", "name": "Strategy", "type": "agent", "agentPhase": "strategy" },
-        { "id": "creative", "name": "Creative", "type": "agent", "agentPhase": "creative" },
-        { "id": "generation", "name": "Assets", "type": "agent", "agentPhase": "generation" },
-        { "id": "qa", "name": "Brand QA", "type": "agent", "agentPhase": "verification" },
-        { "id": "scheduling", "name": "Scheduling", "type": "agent", "agentPhase": "scheduling" }
+        {
+          "id": "intake",
+          "name": "Idea",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "strategy",
+          "name": "Strategy",
+          "type": "agent",
+          "agentPhase": "strategy"
+        },
+        {
+          "id": "creative",
+          "name": "Creative",
+          "type": "agent",
+          "agentPhase": "creative"
+        },
+        {
+          "id": "generation",
+          "name": "Assets",
+          "type": "agent",
+          "agentPhase": "generation"
+        },
+        {
+          "id": "qa",
+          "name": "Brand QA",
+          "type": "agent",
+          "agentPhase": "verification"
+        },
+        {
+          "id": "scheduling",
+          "name": "Scheduling",
+          "type": "agent",
+          "agentPhase": "scheduling"
+        }
       ]
     },
     {
@@ -88,13 +219,42 @@
       "requiresRepo": false,
       "featureBranchPhase": null,
       "createsPullRequest": false,
-      "completionRequiresAgentPhases": ["drafting", "review", "approval"],
+      "completionRequiresAgentPhases": [
+        "drafting",
+        "review",
+        "approval"
+      ],
       "phases": [
-        { "id": "intake", "name": "Opportunity", "type": "app", "agentPhase": "intake" },
-        { "id": "qualification", "name": "Qualification", "type": "agent", "agentPhase": "qualification" },
-        { "id": "drafting", "name": "Drafting", "type": "agent", "agentPhase": "drafting" },
-        { "id": "review", "name": "Deal Review", "type": "agent", "agentPhase": "review" },
-        { "id": "approval", "name": "Approval", "type": "agent", "agentPhase": "approval" }
+        {
+          "id": "intake",
+          "name": "Opportunity",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "qualification",
+          "name": "Qualification",
+          "type": "agent",
+          "agentPhase": "qualification"
+        },
+        {
+          "id": "drafting",
+          "name": "Drafting",
+          "type": "agent",
+          "agentPhase": "drafting"
+        },
+        {
+          "id": "review",
+          "name": "Deal Review",
+          "type": "agent",
+          "agentPhase": "review"
+        },
+        {
+          "id": "approval",
+          "name": "Approval",
+          "type": "agent",
+          "agentPhase": "approval"
+        }
       ]
     },
     {
@@ -107,16 +267,53 @@
       "requiresRepo": false,
       "featureBranchPhase": null,
       "createsPullRequest": false,
-      "completionRequiresAgentPhases": ["review", "redline", "signoff"],
+      "completionRequiresAgentPhases": [
+        "review",
+        "redline",
+        "signoff"
+      ],
       "reviewGates": [
-        { "afterPhase": "redline", "name": "Counsel Sign-off", "blocking": true, "condition": "always", "onReject": "rework", "reviewerRole": "Legal", "assignee": "human:counsel" }
+        {
+          "afterPhase": "redline",
+          "name": "Counsel Sign-off",
+          "blocking": true,
+          "condition": "always",
+          "onReject": "rework",
+          "reviewerRole": "Legal",
+          "assignee": "human:counsel"
+        }
       ],
       "phases": [
-        { "id": "intake", "name": "Intake", "type": "app", "agentPhase": "intake" },
-        { "id": "triage", "name": "Triage", "type": "agent", "agentPhase": "triage" },
-        { "id": "review", "name": "Review", "type": "agent", "agentPhase": "review" },
-        { "id": "redline", "name": "Redline", "type": "agent", "agentPhase": "redline" },
-        { "id": "signoff", "name": "Sign-off", "type": "agent", "agentPhase": "signoff" }
+        {
+          "id": "intake",
+          "name": "Intake",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "triage",
+          "name": "Triage",
+          "type": "agent",
+          "agentPhase": "triage"
+        },
+        {
+          "id": "review",
+          "name": "Review",
+          "type": "agent",
+          "agentPhase": "review"
+        },
+        {
+          "id": "redline",
+          "name": "Redline",
+          "type": "agent",
+          "agentPhase": "redline"
+        },
+        {
+          "id": "signoff",
+          "name": "Sign-off",
+          "type": "agent",
+          "agentPhase": "signoff"
+        }
       ]
     }
   ]
