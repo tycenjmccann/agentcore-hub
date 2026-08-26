@@ -40,7 +40,7 @@ export async function POST(
     );
   }
 
-  const { tenantId } = getIdentity(request);
+  const { userId: requesterId, tenantId } = getIdentity(request);
   const session = await getOwnedSession(params.id, tenantId);
   if (!session) {
     return NextResponse.json({ error: "Session not found" }, { status: 404 });
@@ -67,14 +67,15 @@ export async function POST(
     const userId = session.userId || DEFAULT_USER_ID;
     const sessionTenant = session.tenantId || DEFAULT_TENANT_ID;
     const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
+    // Mint the clone token for the VERIFIED REQUESTER (whoever is opening this
+    // terminal), not the session creator — tenant sessions are shared, and the
+    // Terminal exposes git/gh directly, so it must carry the opener's scope.
+    const { token: githubToken, connected: githubAppConnected } = await cloneTokenForUser(
+      tenantId,
+      requesterId,
+      session.repo ?? session.cloneUrl
+    );
     if (session.resumeTranscriptKey) {
-      // The warm clones the repo — mint the same owner-scoped token a turn gets,
-      // so an App-connected user never rides the operator's broad PAT.
-      const { token: githubToken, connected: githubAppConnected } = await cloneTokenForUser(
-        sessionTenant,
-        userId,
-        session.repo ?? session.cloneUrl
-      );
       const warmed = await Promise.race([
         warmCodingSession({
           sessionId: session.sessionId,
@@ -105,6 +106,11 @@ export async function POST(
           tenantId: sessionTenant,
           configVersion,
           region: REGION,
+          // A terminal-only session readies its VM only through prepare (no chat
+          // turn runs _configure_git), so the scoped token must ride here too —
+          // otherwise Terminal git/gh uses the deploy-wide GITHUB_PAT.
+          githubToken,
+          githubAppConnected,
         }).catch(() => null),
         new Promise<null>((r) => setTimeout(() => r(null), 4000)),
       ]);
