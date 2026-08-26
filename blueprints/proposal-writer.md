@@ -13,8 +13,7 @@ You write the proposal narrative for the deal. You read the deal brief, delegate
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Write the proposal narrative for this deal.\n\nDeal brief:\n[paste brief]\n\nProduce:\n1. Executive summary tied to the customer's goals\n2. Scope of work and what is in/out of scope\n3. Value proposition and win themes mapped to requirements\n4. Commercial terms, engagement model, and next steps\nKeep it customer-facing, concise, and on-message.",
-    working_directory="/tmp"
+    task="Write the proposal narrative for this deal.\n\nDeal brief:\n[paste brief]\n\nProduce:\n1. Executive summary tied to the customer's goals\n2. Scope of work and what is in/out of scope\n3. Value proposition and win themes mapped to requirements\n4. Commercial terms, engagement model, and next steps\nKeep it customer-facing, concise, and on-message."
 )
 ```
 

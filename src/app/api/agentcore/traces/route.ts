@@ -4,7 +4,7 @@ import {
   GetQueryResultsCommand,
   DescribeLogGroupsCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
-import { getLogsClient, DEFAULT_REGION } from "@/lib/agentcore-sdk";
+import { getLogsClient, discoverLogGroups, DEFAULT_REGION } from "@/lib/agentcore-sdk";
 import agentsConfig from "@/config/agents.json";
 
 // In-memory cache for recently captured traces (immediate availability during streaming)
@@ -200,11 +200,15 @@ async function runSpansQuery(
       ? `| filter attributes.session.id = "${sessionId}"`
       : `| filter @message like "${sessionId}"`;
 
+  // Newer runtimes deliver spans to their own log group (unified span
+  // destination) instead of the shared aws/spans — query both.
+  const spanGroups = ["aws/spans", ...(await discoverLogGroups(region))].slice(0, 50);
+
   let startRes;
   try {
     startRes = await client.send(
       new StartQueryCommand({
-        logGroupName: "aws/spans",
+        logGroupNames: spanGroups,
         startTime: Math.floor(startTime / 1000),
         endTime: Math.floor(endTime / 1000),
         queryString: `fields @timestamp, name, kind, durationNano,

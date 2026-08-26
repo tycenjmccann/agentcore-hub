@@ -18,9 +18,9 @@ The **Bug ticket itself is the workflow root.** There is no separate Epic wrappe
 
 ## Core Principles
 - **No design phase.** Bugs do not need designers. The contract already exists — it's broken.
-- **One dev agent, not many.** Pick the single agent whose domain owns the broken code. Do not fan out.
+- **One fixer, not many.** All bug fixes go to the single general-purpose `agentcore_hub_bug_fixer`, regardless of which subsystem the defect lands in. Do not pick a domain dev; do not fan out.
 - **Root cause, not symptom.** A patch that hides the symptom is not a fix.
-- **Regression test is mandatory.** QA must add a test that fails on the old code and passes on the fix.
+- **Regression test is mandatory.** The fixer adds a test that fails on the old code and passes on the fix; QA independently confirms it.
 - **Coordinate via comments + sub-tasks, the way real Jira teams do.** Do not create top-level tickets.
 
 ## Process
@@ -55,22 +55,25 @@ Classify the fix scope:
 
 **Default to Surgical.** If you can't articulate why a refactor is required in one sentence, the fix is Surgical.
 
-### Step 4: Pick the Single Dev Agent
-Match the suspected subsystem from Step 2 to a dev agent:
+### Step 4: The Fixer Is Always `agentcore_hub_bug_fixer`
+There is exactly one fixer for every bug, regardless of subsystem — the general-
+purpose `agentcore_hub_bug_fixer`. It works UI, API, server libs, lambdas, infra,
+and iOS, and it runs the root-cause investigation itself (codex by default,
+claude_code fallback). Do NOT route to `agentcore_hub_frontend_dev` /
+`agentcore_hub_backend_dev` / `agentcore_hub_api_dev` for bugs — that is the
+feature flow.
 
-- UI / components / pages / styles (`src/components/`, `src/app/`, `*.tsx`, `*.css`) → `agentcore_hub_frontend_dev`
-- API routes / server libs / lambdas (`src/app/api/`, `src/lib/`, `lambda/`) → `agentcore_hub_backend_dev`
-- New API contract changes only → `agentcore_hub_api_dev` (rare for a bug)
-
-If the symptom is in the UI but the report or stack trace points to a server response, pick `agentcore_hub_backend_dev` — fix the source, not the symptom.
+Your Step 2 suspected-subsystem and stack-trace top frame still matter: put them
+in the fix ticket so the fixer starts in the right place. But the assignee is
+always `agentcore_hub_bug_fixer`.
 
 ### Step 5: Create Four Sub-Tasks Under the Bug
 
 Create exactly four sub-tasks — no design phase, no top-level tickets. The chain
-is dev fix → code review → QA → CI:
+is fix → code review → QA → CI:
 
-1. **Dev fix sub-task**
-   - `assignee`: the single dev agent from Step 4
+1. **Fix sub-task**
+   - `assignee`: `agentcore_hub_bug_fixer`
    - `title`: `Fix: {one-line symptom or hypothesis}` (e.g., `Fix: ticket badges fail to render on first load`)
    - `description`: includes
      - Link to the bug-analysis.md S3 path
@@ -125,11 +128,12 @@ is dev fix → code review → QA → CI:
 - DO NOT use `ticket_type="task"` for a bug's children — Jira will reject `Task → Bug` ("hierarchy" error). Always `ticket_type="subtask"`.
 - DO NOT confuse the kwarg names — the tool is `ticket_type` + `parent_id`, NOT `issue_type` + `parent_key`. Old docs may say otherwise; trust the tool signature.
 - DO NOT spin up `agentcore_hub_frontend_designer` or any design agent for a bug fix
-- DO NOT assign multiple dev agents — pick one
+- DO NOT route the fix to a domain dev (`frontend_dev`/`backend_dev`/`api_dev`) — the fixer is always `agentcore_hub_bug_fixer`
+- DO NOT assign multiple fixers — one `agentcore_hub_bug_fixer` ticket
 - DO NOT create a "design the fix" sub-task — the design is to remove the defect
 - DO NOT skip the regression test requirement
 - DO NOT propose architectural changes inside a bug ticket — re-file as a feature instead
 - DO NOT default to "rewrite the component" — surgical change first
 
 ## Output Format Recap
-Four sub-tasks created under the Bug (dev fix → code review → QA → CI), one bug-analysis.md saved to S3, one comment on the Bug, your sub-task transitioned to done.
+Four sub-tasks created under the Bug (fix → code review → QA → CI), all assigned as: fix → `agentcore_hub_bug_fixer`, review → `agentcore_hub_code_reviewer`, QA → `agentcore_hub_qa_verifier`, CI → `agentcore_hub_ci_agent`. One bug-analysis.md saved to S3, one comment on the Bug, your sub-task transitioned to done.

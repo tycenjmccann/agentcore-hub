@@ -1,13 +1,10 @@
-#!/usr/bin/env node
-import "./config.js";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+/**
+ * Workflow + routine tools — the hub's agent-pipeline surface.
+ * Ported verbatim from the standalone workflow-mcp; the only change is the
+ * shared authenticated client (auth.js) replacing the local one.
+ */
 import { z } from "zod";
-import { request, type ClientError } from "./client.js";
+import { request, type ClientError } from "../auth.js";
 import {
   SubmitWorkflowInputSchema,
   ListWorkflowsInputSchema,
@@ -51,7 +48,7 @@ function zodError(error: z.ZodError) {
 
 // --- Tool definitions ---
 
-const TOOLS = [
+export const WORKFLOW_TOOLS = [
   {
     name: "submit_workflow",
     description:
@@ -511,23 +508,8 @@ async function handleRunRoutine(args: unknown) {
   return success(lines.join("\n"));
 }
 
-// --- MCP Server setup ---
-
-const server = new Server(
-  { name: "workflow-mcp", version: "0.1.0" },
-  { capabilities: { tools: {} } }
-);
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS,
-}));
-
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  // MCP makes `arguments` optional; a tool whose fields are all optional
-  // (list_workflows, list_workflow_definitions) is legitimately called with
-  // none. Default to {} so Zod applies defaults instead of rejecting undefined.
-  const { name, arguments: args = {} } = request.params;
-
+/** Dispatch a workflow-domain tool call; null = not one of ours. */
+export async function callWorkflowTool(name: string, args: unknown) {
   switch (name) {
     case "submit_workflow":
       return handleSubmitWorkflow(args);
@@ -556,15 +538,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "run_routine":
       return handleRunRoutine(args);
     default:
-      return {
-        isError: true,
-        content: [{ type: "text" as const, text: `Unknown tool: ${name}` }],
-      };
+      return null;
   }
-});
-
-// --- Start ---
-
-const transport = new StdioServerTransport();
-await server.connect(transport);
-console.error("workflow-mcp ready (stdio)");
+}

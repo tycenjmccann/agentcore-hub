@@ -1,7 +1,7 @@
 /**
  * POST /api/cloud-code/sessions/[id]/warm  → pre-warm a ported session's microVM
  *
- * Called by the port-session MCP right after it uploads the transcript to S3.
+ * Called by the hub MCP right after it uploads the transcript to S3.
  * Fires a setup-only invoke (clone + checkout branch + install transcript, no
  * CLI run) so the workspace is hot by the time the user opens the deep link.
  * Best-effort: returns 202 immediately and lets the warm run in the background;
@@ -25,7 +25,7 @@ export async function POST(
   if (!codingRuntimeConfigured()) {
     return NextResponse.json({ error: "Coding runtime not configured" }, { status: 503 });
   }
-  const { tenantId } = getIdentity(request);
+  const { userId: requesterId, tenantId } = getIdentity(request);
   const session = await getOwnedSession(params.id, tenantId);
   if (!session) {
     return NextResponse.json({ error: "Session not found" }, { status: 404 });
@@ -39,11 +39,19 @@ export async function POST(
   const userId = session.userId || DEFAULT_USER_ID;
   const sessionTenant = session.tenantId || DEFAULT_TENANT_ID;
   const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
-  // Warming clones the repo, so it needs the same scoped clone token a turn gets.
+  // Warming clones the repo, so it needs the same scoped clone token a turn gets
+  // — bound to the verified requester (tenant sessions are shared; minting off
+  // the creator would hand a coworker the creator's repo access). EXCEPTION:
+  // a service principal (svc:<tokenName> — the hub MCP calling warm
+  // right after a port) has no GitHub connection of its own; it acts on behalf
+  // of the session owner, so mint with the OWNER's connection. Without this,
+  // every post-flip MCP warm reported connected:false and the runtime fell back
+  // to the deploy-wide PAT for what may be an App-connected owner.
+  const mintAs = requesterId.startsWith("svc:") ? userId : requesterId;
   const { token: githubToken, connected: githubAppConnected } = await cloneTokenForUser(
-    sessionTenant,
-    userId,
-    session.repo
+    tenantId,
+    mintAs,
+    session.repo ?? session.cloneUrl
   );
   try {
     await warmCodingSession({
@@ -53,6 +61,9 @@ export async function POST(
       branch: session.branch,
       resumeTranscriptKey: session.resumeTranscriptKey,
       resumeSessionId: session.claudeSessionId,
+      gitMode: session.gitMode,
+      cloneUrl: session.cloneUrl,
+      resumeBundleKey: session.resumeBundleKey,
       userId,
       tenantId: sessionTenant,
       configVersion,

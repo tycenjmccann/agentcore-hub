@@ -22,19 +22,18 @@ type Status = "connecting" | "connected" | "closed" | "error";
  */
 export default function ShellTerminal({
   sessionId,
-  resumeSessionId,
   resumeFirstPrompt,
   onSeedConsumed,
 }: {
   sessionId: string;
-  // When set, the shell auto-runs `claude --resume <resumeSessionId>` on connect
-  // (ported session opened in the Terminal tab). resumeFirstPrompt, if given, is
-  // typed as the first message to the resumed agent.
-  resumeSessionId?: string;
+  // The first message to type into a freshly-ported session's resumed agent.
+  // The server (shell-init.sh) launches `claude --resume` itself, so this is the
+  // only thing the browser types — once, into the already-live TUI, and only
+  // when the server confirms the resume is in place (resumeReady).
   resumeFirstPrompt?: string;
   // Called once after the first-prompt seed has been typed, so the parent can
-  // persist a clear (clearPendingSeed). Reopening then re-attaches via
-  // `claude --resume` WITHOUT re-typing the seed.
+  // persist a clear (clearPendingSeed). Reopening re-attaches to the server-
+  // resumed conversation WITHOUT re-typing the seed.
   onSeedConsumed?: () => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -81,6 +80,9 @@ export default function ShellTerminal({
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "failed to get shell URL");
         if (disposed) return;
+        // Server confirms the auto-resume hint is in place (shell-init will land
+        // the PTY in the live TUI) — gates typing the first-prompt seed below.
+        const resumeReady = Boolean(data.resumeReady);
 
         ws = new WebSocket(data.url);
         ws.binaryType = "arraybuffer";
@@ -94,32 +96,35 @@ export default function ShellTerminal({
             if (ws?.readyState === WebSocket.OPEN) ws.send(encodeHeartbeat());
           }, 30_000);
 
-          // Ported session opened in Terminal: cd into the cloned workspace and
-          // natively resume the laptop conversation, then type the first prompt.
-          // WORKSPACE_DIR is exported per-session by shell-init; fall back to the
-          // session's workspace path. The agent picks up with full history.
-          if (resumeSessionId && !resumedRef.current) {
+          // The SERVER launches `claude --resume` from shell-init (once per fresh
+          // shell), so the conversation is already live in the TUI when we attach
+          // — the browser no longer types the resume command (which used to land
+          // as leftover text in the running TUI on every refresh/reopen).
+          //
+          // We only type the first-prompt SEED, and only once: the initial nudge
+          // for a freshly ported session. Wait for the resumed TUI to open, fill
+          // the composer, then send Return as a separate keystroke (the TUI reads
+          // a trailing \n in the same write as a literal newline, not submit).
+          //
+          // GATE on resumeReady: the seed is meant for the resumed CLI's TUI. If
+          // the warm timed out/failed, no resume hint was written and the PTY is
+          // a bare shell — firing the seed there would run it as a shell command
+          // and consume it. An un-ready open leaves pendingSeed intact so a later
+          // reopen retries.
+          if (resumeFirstPrompt && resumeReady && !resumedRef.current) {
             resumedRef.current = true;
-            const safeSid = sessionId.replace(/[^A-Za-z0-9._-]/g, "-");
-            const cd = `cd "$WORKSPACE_ROOT/sessions/${safeSid}"/* 2>/dev/null || cd "$WORKSPACE_ROOT"`;
-            const resume = `claude --resume ${resumeSessionId}`;
-            // Send cd + resume as one line; the agent opens in the TUI.
             setTimeout(() => {
               if (ws?.readyState !== WebSocket.OPEN) return;
-              ws.send(encodeStdin(`${cd} && ${resume}\n`));
-              // The first-prompt seed is typed ONCE (it's a long nudge). Tell the
-              // parent so it persists a clear — reopening re-runs `claude --resume`
-              // above (idempotent) but never re-types this seed (which would stack
-              // in the transcript). Re-attach without a seed skips this block.
-              if (resumeFirstPrompt) {
-                setTimeout(() => {
-                  if (ws?.readyState === WebSocket.OPEN) {
-                    ws.send(encodeStdin(`${resumeFirstPrompt}\n`));
-                    onSeedConsumed?.();
-                  }
-                }, 4000);
-              }
-            }, 600);
+              ws.send(encodeStdin(resumeFirstPrompt));
+              setTimeout(() => {
+                // Only consume the seed once Return actually goes out. If the
+                // socket closed during the gap the prompt was merely pasted,
+                // never submitted — leave pendingSeed so reopening retries it.
+                if (ws?.readyState !== WebSocket.OPEN) return;
+                ws.send(encodeStdin("\r"));
+                onSeedConsumed?.();
+              }, 500);
+            }, 4000);
           }
         };
 

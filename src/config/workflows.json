@@ -4,80 +4,316 @@
     {
       "id": "software-delivery",
       "name": "Software Delivery",
-      "description": "Autonomous feature/bug pipeline: requirements analysis, parallel design, development, QA verification, and CI — produces a pull request.",
+      "displayName": "SDLC",
+      "description": "Autonomous feature/bug pipeline: requirements analysis, parallel design, development, QA verification, and CI \u2014 produces a pull request.",
       "icon": "GitPullRequest",
       "intakeAgentId": "agentcore_hub_requirements_analyst",
       "requiresRepo": true,
       "featureBranchPhase": "development",
       "createsPullRequest": true,
-      "completionRequiresAgentPhases": ["development", "verification", "review"],
+      "completionRequiresAgentPhases": [
+        "development",
+        "verification",
+        "review"
+      ],
       "reviewGates": [
-        { "afterPhase": "design", "name": "Design Review", "blocking": true, "condition": "flagged", "onReject": "rework", "reviewerRole": "Designer" }
+        {
+          "afterPhase": "requirements",
+          "name": "Spec Approval",
+          "blocking": true,
+          "condition": "flagged",
+          "onReject": "rework",
+          "reviewerRole": "Product Owner",
+          "assignee": "human:product-owner"
+        },
+        {
+          "afterPhase": "design",
+          "name": "Plan Approval",
+          "blocking": true,
+          "condition": "flagged",
+          "onReject": "rework",
+          "reviewerRole": "Designer",
+          "assignee": "human:engineer"
+        }
       ],
       "phases": [
-        { "id": "intake", "name": "Intake", "type": "app", "agentPhase": "intake" },
-        { "id": "requirements", "name": "Requirements", "type": "agent", "agentPhase": "requirements" },
-        { "id": "design", "name": "Design", "type": "agent", "agentPhase": "design" },
-        { "id": "development", "name": "Development", "type": "agent", "agentPhase": "development" },
-        { "id": "qa", "name": "QA & Ship", "type": "agent", "agentPhase": "verification", "extraAgentPhases": ["review"] }
+        {
+          "id": "intake",
+          "name": "Intake",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "requirements",
+          "name": "Requirements",
+          "type": "agent",
+          "agentPhase": "requirements"
+        },
+        {
+          "id": "design",
+          "name": "Design",
+          "type": "agent",
+          "agentPhase": "design"
+        },
+        {
+          "id": "development",
+          "name": "Development",
+          "type": "agent",
+          "agentPhase": "development"
+        },
+        {
+          "id": "qa",
+          "name": "QA & Ship",
+          "type": "agent",
+          "agentPhase": "verification",
+          "extraAgentPhases": [
+            "review"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bug-fix",
+      "name": "Bug Fix",
+      "displayName": "Bug-Fix",
+      "description": "Fast defect flow: triage and root-cause, one general fixer (codex/claude_code, any subsystem) with a mandatory regression test, then independent code review, live QA verification, and CI. Skips design. Produces a pull request.",
+      "icon": "Bug",
+      "intakeAgentId": "agentcore_hub_requirements_analyst",
+      "requiresRepo": true,
+      "featureBranchPhase": "development",
+      "createsPullRequest": true,
+      "completionRequiresAgentPhases": [
+        "development",
+        "verification",
+        "review"
+      ],
+      "phases": [
+        {
+          "id": "intake",
+          "name": "Intake",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "triage",
+          "name": "Triage",
+          "type": "agent",
+          "agentPhase": "requirements"
+        },
+        {
+          "id": "fix",
+          "name": "Fix",
+          "type": "agent",
+          "agentPhase": "development"
+        },
+        {
+          "id": "qa",
+          "name": "Verify & Ship",
+          "type": "agent",
+          "agentPhase": "verification",
+          "extraAgentPhases": [
+            "review"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dead-code-sweep",
+      "name": "Dead Code Sweep",
+      "displayName": "Dead-Code",
+      "description": "Scheduled hygiene flow: statically detect unused code (language-aware \u2014 Periphery for Swift, knip/ts-prune for TS, vulture for Python), remove it surgically with evidence it is unreferenced, then independent code review, live QA that build + tests still pass, and CI. Produces a pull request for human review \u2014 never auto-merges.",
+      "icon": "Trash2",
+      "intakeAgentId": "agentcore_hub_requirements_analyst",
+      "requiresRepo": true,
+      "featureBranchPhase": "development",
+      "createsPullRequest": true,
+      "completionRequiresAgentPhases": [
+        "development",
+        "verification",
+        "review"
+      ],
+      "phases": [
+        {
+          "id": "intake",
+          "name": "Intake",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "sweep",
+          "name": "Sweep",
+          "type": "agent",
+          "agentPhase": "development"
+        },
+        {
+          "id": "qa",
+          "name": "Verify & Ship",
+          "type": "agent",
+          "agentPhase": "verification",
+          "extraAgentPhases": [
+            "review"
+          ]
+        }
       ]
     },
     {
       "id": "marketing",
       "name": "Marketing Campaign",
+      "displayName": "Marketing",
       "description": "Turn an idea into a launched campaign: strategy brief, multi-channel copy (social, blog, ads), asset generation, brand/compliance QA, and scheduling.",
       "icon": "Megaphone",
       "intakeAgentId": "agentcore_hub_marketing_strategist",
       "requiresRepo": false,
       "featureBranchPhase": null,
       "createsPullRequest": false,
-      "completionRequiresAgentPhases": ["generation", "scheduling"],
+      "completionRequiresAgentPhases": [
+        "generation",
+        "scheduling"
+      ],
       "phases": [
-        { "id": "intake", "name": "Idea", "type": "app", "agentPhase": "intake" },
-        { "id": "strategy", "name": "Strategy", "type": "agent", "agentPhase": "strategy" },
-        { "id": "creative", "name": "Creative", "type": "agent", "agentPhase": "creative" },
-        { "id": "generation", "name": "Assets", "type": "agent", "agentPhase": "generation" },
-        { "id": "qa", "name": "Brand QA", "type": "agent", "agentPhase": "verification" },
-        { "id": "scheduling", "name": "Scheduling", "type": "agent", "agentPhase": "scheduling" }
+        {
+          "id": "intake",
+          "name": "Idea",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "strategy",
+          "name": "Strategy",
+          "type": "agent",
+          "agentPhase": "strategy"
+        },
+        {
+          "id": "creative",
+          "name": "Creative",
+          "type": "agent",
+          "agentPhase": "creative"
+        },
+        {
+          "id": "generation",
+          "name": "Assets",
+          "type": "agent",
+          "agentPhase": "generation"
+        },
+        {
+          "id": "qa",
+          "name": "Brand QA",
+          "type": "agent",
+          "agentPhase": "verification"
+        },
+        {
+          "id": "scheduling",
+          "name": "Scheduling",
+          "type": "agent",
+          "agentPhase": "scheduling"
+        }
       ]
     },
     {
       "id": "sales",
       "name": "Sales Proposal",
+      "displayName": "Sales",
       "description": "Respond to an RFP or opportunity: qualify the deal, draft the proposal and solution, price it, run a deal-desk review, and route for approval.",
       "icon": "Handshake",
       "intakeAgentId": "agentcore_hub_deal_qualifier",
       "requiresRepo": false,
       "featureBranchPhase": null,
       "createsPullRequest": false,
-      "completionRequiresAgentPhases": ["drafting", "review", "approval"],
+      "completionRequiresAgentPhases": [
+        "drafting",
+        "review",
+        "approval"
+      ],
       "phases": [
-        { "id": "intake", "name": "Opportunity", "type": "app", "agentPhase": "intake" },
-        { "id": "qualification", "name": "Qualification", "type": "agent", "agentPhase": "qualification" },
-        { "id": "drafting", "name": "Drafting", "type": "agent", "agentPhase": "drafting" },
-        { "id": "review", "name": "Deal Review", "type": "agent", "agentPhase": "review" },
-        { "id": "approval", "name": "Approval", "type": "agent", "agentPhase": "approval" }
+        {
+          "id": "intake",
+          "name": "Opportunity",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "qualification",
+          "name": "Qualification",
+          "type": "agent",
+          "agentPhase": "qualification"
+        },
+        {
+          "id": "drafting",
+          "name": "Drafting",
+          "type": "agent",
+          "agentPhase": "drafting"
+        },
+        {
+          "id": "review",
+          "name": "Deal Review",
+          "type": "agent",
+          "agentPhase": "review"
+        },
+        {
+          "id": "approval",
+          "name": "Approval",
+          "type": "agent",
+          "agentPhase": "approval"
+        }
       ]
     },
     {
       "id": "legal",
       "name": "Legal Contract Review",
+      "displayName": "Legal",
       "description": "Review an inbound contract: triage and classify, run parallel legal/risk/privacy review, draft redlines, and route for sign-off.",
       "icon": "Scale",
       "intakeAgentId": "agentcore_hub_legal_intake",
       "requiresRepo": false,
       "featureBranchPhase": null,
       "createsPullRequest": false,
-      "completionRequiresAgentPhases": ["review", "redline", "signoff"],
+      "completionRequiresAgentPhases": [
+        "review",
+        "redline",
+        "signoff"
+      ],
       "reviewGates": [
-        { "afterPhase": "redline", "name": "Counsel Sign-off", "blocking": true, "condition": "always", "onReject": "rework", "reviewerRole": "Legal", "assignee": "human:counsel" }
+        {
+          "afterPhase": "redline",
+          "name": "Counsel Sign-off",
+          "blocking": true,
+          "condition": "always",
+          "onReject": "rework",
+          "reviewerRole": "Legal",
+          "assignee": "human:counsel"
+        }
       ],
       "phases": [
-        { "id": "intake", "name": "Intake", "type": "app", "agentPhase": "intake" },
-        { "id": "triage", "name": "Triage", "type": "agent", "agentPhase": "triage" },
-        { "id": "review", "name": "Review", "type": "agent", "agentPhase": "review" },
-        { "id": "redline", "name": "Redline", "type": "agent", "agentPhase": "redline" },
-        { "id": "signoff", "name": "Sign-off", "type": "agent", "agentPhase": "signoff" }
+        {
+          "id": "intake",
+          "name": "Intake",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "triage",
+          "name": "Triage",
+          "type": "agent",
+          "agentPhase": "triage"
+        },
+        {
+          "id": "review",
+          "name": "Review",
+          "type": "agent",
+          "agentPhase": "review"
+        },
+        {
+          "id": "redline",
+          "name": "Redline",
+          "type": "agent",
+          "agentPhase": "redline"
+        },
+        {
+          "id": "signoff",
+          "name": "Sign-off",
+          "type": "agent",
+          "agentPhase": "signoff"
+        }
       ]
     }
   ]

@@ -40,7 +40,7 @@ one-time setup — without per-user images.
 **Open follow-ups:** per-user secrets vault; per-user config dirs at SSO; puppeteer
 needs `--no-sandbox` in its server config to launch chromium in the microVM.
 
-See `mcp/port-session/README.md`, `deploy/coding-agent-runtime/README.md`.
+See `mcp/hub/README.md`, `deploy/coding-agent-runtime/README.md`.
 
 ---
 
@@ -62,7 +62,7 @@ it back later — losslessly.
 - **Slug rule, verified empirically:** `re.sub(r'[^a-zA-Z0-9]','-', realpath(cwd))`
   — Claude slugifies the *real* path, every non-alphanumeric → `-`. `--resume`
   404s if it doesn't match exactly (early bug: only `/`→`-`, broke on spaces/dots).
-- **Local stdio MCP** (`mcp/port-session/`), not a remote one — it needs laptop
+- **Local stdio MCP** (`mcp/hub/` — the unified hub MCP), not a remote one — it needs laptop
   git + filesystem access. Separate package, excluded from the app tsconfig.
 - **Transport:** presigned S3 PUT (port) / GET (pull) so the 16–20 MB transcript
   never goes through the app or hits the DynamoDB item-size cap.
@@ -80,7 +80,7 @@ it back later — losslessly.
 **Open follow-ups:** Claude-only (Codex `thread_id` resume not wired); no auth on
 port/checkpoint endpoints + presigned URLs yet (tighten before public/multi-user).
 
-See `mcp/port-session/README.md`, `deploy/coding-agent-runtime/{README,DECISIONS}.md`.
+See `mcp/hub/README.md`, `deploy/coding-agent-runtime/{README,DECISIONS}.md`.
 
 ---
 

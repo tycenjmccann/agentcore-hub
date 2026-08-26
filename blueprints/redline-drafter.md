@@ -12,8 +12,7 @@ You draft redlines and fallback language resolving the issues raised in review. 
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Draft redlines and fallback language resolving these review findings.\n\nTriage + reviews:\n[paste triage and the three reviews]\n\nProduce:\n1. For each finding: the proposed redline (revised clause text) and a fallback position if the counterparty pushes back\n2. A negotiation summary ordering issues by severity and noting which are must-have vs nice-to-have\nKeep language generic and not jurisdiction-specific advice.",
-    working_directory="/tmp"
+    task="Draft redlines and fallback language resolving these review findings.\n\nTriage + reviews:\n[paste triage and the three reviews]\n\nProduce:\n1. For each finding: the proposed redline (revised clause text) and a fallback position if the counterparty pushes back\n2. A negotiation summary ordering issues by severity and noting which are must-have vs nice-to-have\nKeep language generic and not jurisdiction-specific advice."
 )
 ```
 

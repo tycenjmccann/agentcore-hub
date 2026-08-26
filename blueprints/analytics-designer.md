@@ -13,8 +13,7 @@ You lead analytics/tracking design. You identify what events need tracking, dele
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Design the analytics instrumentation for this feature.\n\n[PASTE DESIGN]\n\nProduce:\n1. Event catalog (event name, trigger, properties)\n2. User flow funnel definition\n3. Success metrics and KPIs\n4. Implementation approach (SDK, custom events)\n5. Privacy considerations (what NOT to track)\n6. Dashboard/alert recommendations",
-    working_directory="/tmp"
+    task="Design the analytics instrumentation for this feature.\n\n[PASTE DESIGN]\n\nProduce:\n1. Event catalog (event name, trigger, properties)\n2. User flow funnel definition\n3. Success metrics and KPIs\n4. Implementation approach (SDK, custom events)\n5. Privacy considerations (what NOT to track)\n6. Dashboard/alert recommendations"
 )
 ```
 

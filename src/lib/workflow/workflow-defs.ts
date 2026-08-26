@@ -70,6 +70,8 @@ export interface ReviewGate {
 export interface WorkflowDef {
   id: string;
   name: string;
+  /** Short label for the workflow-list badge, e.g. "Dead-Code", "Bug-Fix", "SDLC". Falls back to `name` when absent. */
+  displayName?: string;
   description: string;
   /** lucide-react icon name for the selector */
   icon: string;

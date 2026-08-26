@@ -49,15 +49,15 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
     """Mirror the env vars set by the lightweight CodeZip path in deploy-one.sh."""
     env = {
         "BYPASS_TOOL_CONSENT": "true",
-        "MODEL_ID": "us.anthropic.claude-opus-4-6-v1",
+        "MODEL_ID": "us.anthropic.claude-fable-5",
         "READ_TIMEOUT": "1200",
         "AWS_REGION": "us-east-1",
         "EVENTS_TABLE": "agentcore-hub-events",
         "TICKET_TOOLS_LAMBDA": os.environ.get("TICKET_TOOLS_LAMBDA", "agentcore-hub-jira"),
         "AGENTCORE_HUB_ARTIFACT_BUCKET": os.environ["ARTIFACT_BUCKET"],
         "CLAUDE_CODE_USE_BEDROCK": "1",
-        "CLAUDE_MODEL": "us.anthropic.claude-opus-4-6-v1",
-        "ANTHROPIC_MODEL": "us.anthropic.claude-opus-4-6-v1",
+        "CLAUDE_MODEL": "us.anthropic.claude-fable-5",
+        "ANTHROPIC_MODEL": "us.anthropic.claude-fable-5",
         # Codex via Bedrock Mantle (GPT-5.5, us-east-2) — no OpenAI key.
         "BEDROCK_MANTLE_REGION": os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2"),
         "CODEX_MODEL": os.environ.get("CODEX_MODEL", "openai.gpt-5.5"),
@@ -79,6 +79,17 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
     # Shared fleet AgentCore Memory (see setup-fleet-memory.sh) — opt-in.
     if mem := os.environ.get("FLEET_MEMORY_ID"):
         env["MEMORY_ID"] = mem
+    # Remote coding: delegate claude_code/codex to the Cloud Code runtime for the
+    # listed personas (resumable EFS sessions). Empty REMOTE_CODING_PERSONAS =
+    # every persona runs the CLI locally (legacy).
+    if coding_arn := os.environ.get("CODING_AGENT_RUNTIME_ARN"):
+        env["CODING_AGENT_RUNTIME_ARN"] = coding_arn
+    if cc_table := os.environ.get("CLOUD_CODE_TABLE"):
+        env["CLOUD_CODE_TABLE"] = cc_table
+    if personas := os.environ.get("REMOTE_CODING_PERSONAS"):
+        env["REMOTE_CODING_PERSONAS"] = personas
+    if cc_tenant := os.environ.get("CLOUD_CODE_TENANT_ID"):
+        env["CLOUD_CODE_TENANT_ID"] = cc_tenant
     return env
 
 

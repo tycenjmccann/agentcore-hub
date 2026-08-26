@@ -88,7 +88,7 @@ const DISPATCH_TERMINAL = new Set(["done", "cancelled"]);
  * workflow's epic) so `/workflow/A/nudge` can't move a ticket that belongs to
  * workflow B and mis-record the intervention against A.
  */
-async function dispatchJira(ticketKey: string, epicId: string | undefined) {
+async function dispatchJira(ticketKey: string, epicId: string | undefined, workflowId: string) {
   const jira = JiraClient.fromEnv();
   const issue = await jira.getIssue(ticketKey, ["status", "parent"]);
   const parentKey = (issue.fields.parent as { key?: string } | undefined)?.key;
@@ -102,8 +102,27 @@ async function dispatchJira(ticketKey: string, epicId: string | undefined) {
   if (internal === "in_review") {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketKey} is in review — human-owned` };
   }
+  await releaseInvocationClaim(workflowId, ticketKey);
   await jira.transitionIssue(ticketKey, "Ready");
   return { ticketsScanned: 1, nudged: [`${ticketKey} (dispatch→ready)`] };
+}
+
+/**
+ * Reset agentTasks[ticketId].status so the orchestrator's atomic invocation
+ * claim (status=running) doesn't reject the re-dispatch as a duplicate.
+ * Best-effort: a missing map/entry just means there is no claim to release.
+ */
+async function releaseInvocationClaim(workflowId: string, ticketId: string) {
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+      UpdateExpression: "SET #at.#tid.#s = :s",
+      ExpressionAttributeNames: { "#at": "agentTasks", "#tid": ticketId, "#s": "status" },
+      ExpressionAttributeValues: { ":s": "ready" },
+      ConditionExpression: "attribute_exists(#at.#tid)",
+    }));
+  } catch { /* no claim to release */ }
 }
 
 async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: string | undefined) {
@@ -123,6 +142,7 @@ async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: st
   if (status === "in_review" || String(ticket.assignee || "").startsWith("human:")) {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} is human-owned` };
   }
+  await releaseInvocationClaim(workflowId, ticketId);
   await ddb.send(new UpdateCommand({
     TableName: TICKETS_TABLE,
     Key: { ticketId },
@@ -220,7 +240,7 @@ export async function POST(
 
     if (targetTicketId) {
       result = ticketProvider === "jira"
-        ? await dispatchJira(targetTicketId, epicId)
+        ? await dispatchJira(targetTicketId, epicId, workflowId)
         : await dispatchDynamoDB(targetTicketId, workflowId, epicId);
     } else if (ticketProvider === "jira") {
       if (!epicId) {

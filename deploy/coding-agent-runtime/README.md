@@ -107,7 +107,7 @@ or `{ error }`.
 
 ### Port / pull round trip
 
-The `port-session` MCP (see [mcp/port-session](../../mcp/port-session/README.md))
+The hub MCP's cloud-code tools (see [mcp/hub](../../mcp/hub/README.md))
 drives this for a laptop↔cloud handoff:
 - **port** ships the raw transcript to `s3://<bucket>/cloud-code/resume/<sid>/…`,
   then `warm` pre-clones; the first turn passes `resume_transcript` + `branch` for

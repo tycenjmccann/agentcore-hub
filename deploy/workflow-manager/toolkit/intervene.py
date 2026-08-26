@@ -19,14 +19,20 @@ never appended twice, so the manager can't re-raise the same flag every pass.
 When a run is dead and shouldn't keep paging, the manager decides to `mute` it —
 that judgment is the agent's, not a coded cap.
 
+The two stuck-agent decisions (the common case) are `retry` and `mark-done`:
+  - work is NOT done (no deliverable) → `retry` the agent
+  - work IS done (deliverable shipped, agent died before report_completion) →
+    `mark-done` the ticket with evidence, so the next phase starts
+
 Usage:
-  python3 intervene.py unstick  <workflowId> [--note "..."]
-  python3 intervene.py retry    <workflowId> <agentId> [--note "..."]
-  python3 intervene.py dispatch <workflowId> <ticketId> [--note "..."]
-  python3 intervene.py comment  <workflowId> <ticketId> <text>
-  python3 intervene.py escalate <workflowId> <message>
-  python3 intervene.py complete <workflowId> [--reason "..."]
-  python3 intervene.py mute     <workflowId> [--note "..."]
+  python3 intervene.py unstick   <workflowId> [--note "..."]
+  python3 intervene.py retry     <workflowId> <agentId> [--note "..."]
+  python3 intervene.py mark-done <workflowId> <ticketId> --evidence "PR #87 / s3 key / streamed PASS"
+  python3 intervene.py dispatch  <workflowId> <ticketId> [--note "..."]
+  python3 intervene.py comment   <workflowId> <ticketId> <text>
+  python3 intervene.py escalate  <workflowId> <message>
+  python3 intervene.py complete  <workflowId> [--reason "..."]
+  python3 intervene.py mute      <workflowId> [--note "..."]
 
 Env: WORKFLOW_API_URL (app base URL), EVENTS_TABLE, TICKETS_TABLE,
      WORKFLOWS_TABLE, TICKET_PROVIDER (dynamodb|jira), AWS_REGION.
@@ -193,6 +199,54 @@ def cmd_complete(args):
     print(json.dumps({"action": "complete", "workflowId": args.workflow_id, **result}, indent=2))
 
 
+def cmd_mark_done(args):
+    """Close ONE stuck ticket whose agent finished the work but died before
+    calling report_completion — so the next phase can start.
+
+    This is the "work IS done" branch of a stuck-agent decision (the other is
+    `retry`, for "work is NOT done"). Use it ONLY with concrete evidence the
+    deliverable shipped: the expected artifact is in S3, a PR exists on GitHub,
+    or the agent's own streamed verdict (dossier streamCounts[agent].lastText)
+    states it passed (which may itself cite a PR/URL). That evidence is REQUIRED
+    and is recorded verbatim:
+
+      1. Posts `--evidence` as a ticket comment (the audit trail: WHY this was
+         safe to close), then
+      2. Transitions the ticket to done, which cascades the next phase.
+
+    The evidence is not optional — closing a ticket with no proof the work
+    shipped is exactly the false-green this guards against. If you cannot cite
+    the deliverable, the work is NOT done: `retry` instead."""
+    if not (args.evidence or "").strip():
+        raise SystemExit(
+            "REFUSED: mark-done requires --evidence citing the shipped deliverable "
+            "(S3 artifact key, PR URL, or the agent's streamed PASS verdict). "
+            "No proof = not done → use `retry`."
+        )
+    if TICKET_PROVIDER != "jira":
+        refuse_if_protected(get_ticket(args.ticket_id))
+    # 1. Record the evidence as a comment BEFORE closing, so the audit trail
+    #    survives even if the transition half-fails.
+    comment = api_post(f"/api/workflow/{args.workflow_id}/tickets/comment", {
+        "ticketId": args.ticket_id,
+        "author": "workflow-manager",
+        "content": f"[mark-done] Agent finished but never reported. Evidence work shipped: {args.evidence}",
+    })
+    # 2. Transition the single ticket to done → orchestrator cascades next phase.
+    result = api_post(f"/api/workflow/{args.workflow_id}/tickets/transition", {
+        "ticketId": args.ticket_id,
+        "targetStatus": "done",
+        "comment": f"Closed by Workflow Manager (agent finished, no report_completion). Evidence: {args.evidence}",
+    })
+    publish_intervention(args.workflow_id, "mark_done", {
+        "ticketId": args.ticket_id, "evidence": args.evidence[:500],
+    })
+    print(json.dumps({
+        "action": "mark_done", "ticketId": args.ticket_id,
+        "commented": comment.get("success", False), **result,
+    }, indent=2))
+
+
 def cmd_mute(args):
     """Circuit breaker: stop watching a run that cannot be moved (no diagnosable
     cause, work not verifiably done). Sets managerWatch=false so the watch
@@ -289,6 +343,13 @@ def main():
     p.add_argument("workflow_id")
     p.add_argument("--reason", default="")
     p.set_defaults(func=cmd_complete)
+
+    p = sub.add_parser("mark-done")
+    p.add_argument("workflow_id")
+    p.add_argument("ticket_id")
+    p.add_argument("--evidence", default="",
+                   help="REQUIRED: the shipped deliverable (S3 key, PR URL, or streamed PASS verdict)")
+    p.set_defaults(func=cmd_mark_done)
 
     p = sub.add_parser("mute")
     p.add_argument("workflow_id")

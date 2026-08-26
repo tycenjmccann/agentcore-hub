@@ -1,5 +1,23 @@
 # Frontend Dev Blueprint
 
+## Branch Model (READ FIRST)
+Your `## Branch` context section names your `feature_branch` and `base_branch`.
+The base_branch is the run's SHARED integration branch (`feature/{EPIC}-...`) —
+every dev ticket in this run builds on it, additively:
+
+- Branch `feature/{TICKET_ID}-frontend-dev` **from base_branch** (never from the repo default branch)
+- Before starting, pull the latest base_branch — sibling tickets may have merged work you build on
+- Open your PR **into base_branch**, never into main/master
+- After your evidence is complete (build green, visual verification done), **merge your own PR into base_branch** so downstream tickets and fix tickets see your code
+- The orchestrator opens ONE unified PR (base_branch → default branch) when the run completes — you never PR against the default branch
+
+If your ticket is a FIX ticket (from code review or QA), the code under fix is
+already on base_branch — pull it and fix it there. Never "fix" code on a branch
+that doesn't contain the code being fixed.
+
+Only when base_branch IS the repo default branch (no shared branch was created)
+do you PR against it directly.
+
 ## Process
 
 ### Step 1: Gather Context
@@ -14,40 +32,50 @@
 3. Note constraints from the ticket (e.g., "do NOT touch X")
 4. Frame a clear brief for claude_code
 
+### Step 2b: External API / SDK / vendor protocol — NEVER GUESS THE CONTRACT
+If the UI talks to a third-party API/SDK/protocol (e.g. a realtime voice websocket),
+build ONLY against the vendor's authoritative docs — never from memory, a blog/launch
+post, or a plausible guess:
+- Use the reference the ticket cites; if it's missing or only marketing (a
+  `.../news/...` post), find the real one with `http_request`/`browser`:
+  `docs.<vendor>`, the vendor `/llms.txt`, the API-reference/guide, the official
+  SDK/cookbook repo.
+- Pin the concrete facts, each with a source URL, before writing client code: exact
+  endpoint (incl. `wss://` vs `https://`), auth scheme + EXACT secret name (confirm it
+  EXISTS — never values), real model/resource ids, and the message/event/tool schema
+  (session config, function-call events, audio format).
+- If you cannot find authoritative docs or the secret does not exist, STOP and report
+  BLOCKED with what's missing. Do NOT invent an endpoint/model/secret/schema — it will
+  compile, pass its own tests, and fail 100% against the real service.
+
 ### Step 3: Implement
+Pass `repo` on your FIRST `claude_code` call so the workspace is cloned. Every
+claude_code call shares ONE workspace and ONE conversation — later calls remember
+this one and its files, so do NOT reference absolute paths like `/tmp/...`; say
+"the same workspace as the previous call".
+
 1. Use `claude_code` to:
-   - Clone the repo / checkout the correct base branch
-   - Create a feature branch (`feature/{TICKET_ID}-frontend-dev`)
+   - Clone the repo (pass `repo`) / checkout `base_branch` (see Branch Model above)
+   - Create your feature branch (`feature/{TICKET_ID}-frontend-dev`) from it
    - Implement the changes
    - Run `npx tsc --noEmit` to verify TypeScript compiles
    - Run `npm run build` to verify production build passes
 2. If compilation fails, fix the errors before proceeding
 
 ### Step 4: Visual Verification (MANDATORY for UI changes)
-After implementation, you MUST verify your work visually:
+After implementation, you MUST verify your work visually. claude_code has its
+own workspace, so the screenshot and its review both happen INSIDE claude_code —
+you don't read the file yourself.
 
-1. Use `claude_code` to start the dev server and take a screenshot:
-   ```
-   cd /tmp/repo && npm run dev &
-   sleep 10
-   npx playwright install chromium
-   node -e "
-   const { chromium } = require('playwright');
-   (async () => {
-     const browser = await chromium.launch();
-     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-     await page.goto('http://localhost:3000/workflow');
-     await page.waitForTimeout(3000);
-     await page.screenshot({ path: 'docs/implementation-screenshot.png', fullPage: false });
-     await browser.close();
-   })();
-   "
-   ```
-2. Review the screenshot — does it match the design spec?
-3. If NOT, iterate until it does
-4. Commit the screenshot to the branch
-5. Upload it to shared artifacts:
-   `upload_file_to_s3(local_path="/tmp/repo/docs/implementation-screenshot.png", key="workflows/{workflow_id}/shared/dev-evidence/implementation-screenshot.png")`
+Ask `claude_code` (same session) to:
+1. Start the dev server, install chromium, and screenshot the changed view with
+   Playwright, saving it INTO the repo (e.g. `docs/implementation-screenshot.png`).
+2. Review the screenshot against the design spec and describe what it shows in
+   its response — iterate until it matches.
+3. **Commit the screenshot to the branch** so the evidence travels via git (this
+   is how it reaches you, QA, and the PR — no local file handoff).
+The runtime also auto-harvests generated files to S3, but the committed-to-branch
+copy is the source of truth. Reference the committed path in your PR.
 
 ### Step 4b: iOS Projects (MANDATORY — replaces Step 4 for iOS)
 claude_code cannot build iOS. Verify on the CodeBuild macOS gateway instead:
@@ -62,27 +90,32 @@ claude_code cannot build iOS. Verify on the CodeBuild macOS gateway instead:
    - `BUILD_ERROR` → doesn't compile → your implementation is broken; fix and re-run.
    - Test failures in code you touched → fix and re-run.
 5. Use `get_test_logs(build_id, test_name)` to diagnose failures (includes screenshots).
-6. Persist the evidence: gateway artifact URLs are presigned and EXPIRE. Download the
-   session video / screenshots to /tmp (`shell`: `curl -sL -o /tmp/<name> "<url>"`) and
-   `upload_file_to_s3(local_path="/tmp/<name>", key="workflows/{workflow_id}/shared/dev-evidence/<name>")`.
+6. Persist the evidence: gateway artifact URLs are presigned and EXPIRE. Have
+   `claude_code` (same session) download the session video / screenshots and
+   commit them to the branch, OR write them into the repo so the runtime harvests
+   them to S3. Do NOT curl to `/tmp` and `upload_file_to_s3` yourself — with the
+   remote coding runtime that local path does not exist on your side.
 7. Reference the gateway build_id + test_summary + the S3 evidence keys in the PR the
    way you'd reference a screenshot for web work.
 
 Do NOT open a PR for iOS work without a passing (or explained) gateway run.
 
-### Step 5: Push & PR
+### Step 5: Push, PR & Merge
 1. Commit all changes with a clear message referencing the ticket
 2. Push the branch
-3. Create a PR with:
+3. Create a PR **into base_branch** (see Branch Model) with:
    - Summary of changes
    - Files modified
    - Screenshot of the result (reference the committed screenshot)
-4. Report completion with branch, commit SHA, and PR URL
+4. Merge the PR into base_branch once your evidence is complete
+5. Report completion with branch, commit SHA, and PR URL
 
 ## Rules
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - NEVER submit a UI change without first rendering it and verifying visually
 - iOS: the gateway run is the render — never open an iOS PR without one; write XCTests with the implementation
 - If the dev server won't start after your changes, your implementation is broken — fix it
 - Include a screenshot in every PR that has visual changes
 - Follow existing code patterns — don't introduce new paradigms
 - Keep changes scoped to what the ticket asks for
+- PRs target base_branch, never the repo default branch (unless base_branch IS the default)
