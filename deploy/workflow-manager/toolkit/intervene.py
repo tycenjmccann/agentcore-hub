@@ -33,6 +33,8 @@ Usage:
   python3 intervene.py escalate  <workflowId> <message>
   python3 intervene.py complete  <workflowId> [--reason "..."]
   python3 intervene.py mute      <workflowId> [--note "..."]
+  python3 intervene.py cancel    <workflowId> --reason "..."   (explicit user request ONLY)
+  python3 intervene.py start     --title "..." [--description "..."] [--repo owner/name] [--branch main]
 
 Env: WORKFLOW_API_URL (app base URL), EVENTS_TABLE, TICKETS_TABLE,
      WORKFLOWS_TABLE, TICKET_PROVIDER (dynamodb|jira), AWS_REGION.
@@ -257,6 +259,46 @@ def cmd_mute(args):
     print(json.dumps({"action": "mute", "workflowId": args.workflow_id, "managerWatch": False}, indent=2))
 
 
+def cmd_cancel(args):
+    """Cancel a live run. This is destructive-ish (non-done tickets get
+    cancelled; in-flight agents finish but their work is orphaned), so it is
+    reserved for an EXPLICIT user instruction — never use it on your own
+    judgment during WATCH. A mandatory --reason records who asked and why."""
+    if not (args.reason or "").strip():
+        raise SystemExit("REFUSED: cancel requires --reason quoting the user's explicit request")
+    result = api_post(f"/api/workflow/{args.workflow_id}/cancel",
+                      {"reason": args.reason})
+    publish_intervention(args.workflow_id, "cancel", {"note": args.reason})
+    print(json.dumps({"action": "cancel", "workflowId": args.workflow_id, **result}, indent=2))
+
+
+def cmd_start(args):
+    """Start a new workflow run — the same entry point the UI and Telegram
+    feature intake use. Only on explicit user request (e.g. 'restart that with
+    these instructions'). Returns workflowId + epicId."""
+    if not (args.title or "").strip():
+        raise SystemExit("REFUSED: start requires --title")
+    body = {
+        "title": args.title,
+        "description": args.description or "",
+        "workflowType": "feature",
+        "sources": [],
+    }
+    if args.repo:
+        body["repoConfig"] = {
+            "layout": "multi-repo",
+            "repos": [{"url": f"https://github.com/{args.repo}",
+                       "defaultBranch": args.branch or "main"}],
+        }
+    result = api_post("/api/workflow/start", body)
+    wf_id = result.get("workflowId")
+    if wf_id:
+        publish_intervention(wf_id, "start", {
+            "note": (args.description or args.title)[:500], "title": args.title,
+        })
+    print(json.dumps({"action": "start", **result}, indent=2))
+
+
 def cmd_escalate(args):
     # Idempotent: never append a second copy of an already-open (unacknowledged)
     # escalation with the same message. This stops the manager re-raising the
@@ -355,6 +397,18 @@ def main():
     p.add_argument("workflow_id")
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_mute)
+
+    p = sub.add_parser("cancel")
+    p.add_argument("workflow_id")
+    p.add_argument("--reason", default="")
+    p.set_defaults(func=cmd_cancel)
+
+    p = sub.add_parser("start")
+    p.add_argument("--title", default="")
+    p.add_argument("--description", default="")
+    p.add_argument("--repo", default="")
+    p.add_argument("--branch", default="")
+    p.set_defaults(func=cmd_start)
 
     args = parser.parse_args()
     args.func(args)
