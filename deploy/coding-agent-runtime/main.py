@@ -414,6 +414,76 @@ def _session_dir(session_id: str | None) -> str:
     return os.path.join(WORKSPACE_ROOT, "sessions", safe)
 
 
+# The resume hint shell-init reads is CONTAINER-LOCAL (/tmp) — never at
+# $WORKSPACE_ROOT. EFS is shared across every session's microVM, so a hint at the
+# shared root would leak: a different session's Terminal would source it and
+# `claude --resume` the wrong conversation. /tmp is private to this microVM (one
+# per runtimeSessionId).
+#
+# But /tmp dies when the microVM is recycled, and a cold VM may be reached only
+# by the config-only prepare path that doesn't recompute the hint. So we ALSO
+# persist a durable copy in the per-session EFS dir — session-scoped
+# (sessions/<id>/…), not the shared root, so it can't leak — and restore /tmp
+# from it at the start of every invocation. Durable source of truth, private
+# runtime copy.
+RESUME_HINT_PATH = "/tmp/.resume-launch.sh"  # noqa: S108 — container-local, see above
+RESUME_HINT_NAME = ".resume-launch.sh"
+
+
+def _write_resume_launch_hint(workdir: str, resume_sid: str,
+                              runtime_session_id: str | None) -> bool:
+    """Write the hint the interactive shell reads on launch to
+    `cd <workdir> && claude --resume <resume_sid>` itself — so the browser never
+    types the resume command into an already-running TUI on reattach.
+
+    Two distinct ids: `resume_sid` is the conversation id (the resume arg);
+    `runtime_session_id` is the AgentCore runtimeSessionId that keys the
+    per-session EFS dir AND is what _restore_resume_launch_hint looks up later.
+    They differ, so the durable copy MUST be keyed by the runtime id or restore
+    would miss it on a recycled VM."""
+    body = (
+        f"CC_RESUME_DIR={shlex.quote(os.path.realpath(workdir))}\n"
+        f"CC_RESUME_SID={shlex.quote(resume_sid)}\n"
+    )
+    ok = False
+    try:
+        with open(RESUME_HINT_PATH, "w") as f:
+            f.write(body)
+        ok = True
+    except OSError as exc:
+        logger.warning("resume_launch_hint_failed", extra={"error": str(exc)[:200]})
+    if runtime_session_id:
+        try:
+            sdir = _session_dir(runtime_session_id)
+            os.makedirs(sdir, exist_ok=True)
+            with open(os.path.join(sdir, RESUME_HINT_NAME), "w") as f:
+                f.write(body)
+        except OSError as exc:
+            logger.warning("resume_hint_persist_failed", extra={"error": str(exc)[:200]})
+    if ok:
+        logger.info("resume_launch_hint_written", extra={"workdir": workdir})
+    return ok
+
+
+def _restore_resume_launch_hint(session_id: str | None) -> None:
+    """Repopulate the private /tmp hint from the durable per-session EFS copy if
+    /tmp is missing (a recycled microVM). Lets a session resume in the Terminal
+    even when it's reached only by the config-only prepare path. No-op if /tmp
+    already has it or there's no durable copy."""
+    if not session_id or os.path.exists(RESUME_HINT_PATH):
+        return
+    src = os.path.join(_session_dir(session_id), RESUME_HINT_NAME)
+    try:
+        if os.path.isfile(src):
+            with open(src) as f:
+                body = f.read()
+            with open(RESUME_HINT_PATH, "w") as f:
+                f.write(body)
+            logger.info("resume_launch_hint_restored", extra={"session": session_id})
+    except OSError as exc:
+        logger.warning("resume_hint_restore_failed", extra={"error": str(exc)[:200]})
+
+
 def _claude_project_slug(workdir: str) -> str:
     """Claude Code stores a conversation under
     {CLAUDE_CONFIG_DIR}/projects/<slug>/<sessionId>.jsonl where <slug> is the
@@ -866,6 +936,10 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         return
     # Persist {claude_session_id → repo} so a later resume recovers the cwd.
     _remember_session(new_session_id, repo)
+    # Update the Terminal resume hint now the id is known (new chats learn it
+    # here), so opening the Terminal auto-resumes this conversation server-side.
+    if new_session_id:
+        _write_resume_launch_hint(workdir, new_session_id, session_id)
     # Harvest deliverables to the resume prefix so the Artifacts tab populates
     # without a pull-home. Best-effort — never breaks the stream's done frame.
     try:
@@ -986,6 +1060,10 @@ async def invocations(request: Request):
     tenant_id = payload.get("tenant_id")  # S3 isolation boundary (see _tenant_root)
     config_version = payload.get("config_version")
     session_id = payload.get("session_id")  # isolates this session's checkout
+    # Repopulate the private /tmp resume hint from the durable per-session copy if
+    # this microVM was recycled — so even a config-only prepare leaves the
+    # Terminal able to auto-resume the conversation.
+    _restore_resume_launch_hint(session_id)
     stream = bool(payload.get("stream"))  # SSE incremental output (claude only)
     # "Port to cloud": a real laptop transcript shipped via S3 for a native,
     # lossless `claude --resume`. resume_session_id is the id INSIDE that file.
@@ -1027,8 +1105,14 @@ async def invocations(request: Request):
     # success/failure but always 200 so the /shell best-effort caller never errors
     # (a stale-mount VM will be replaced; the next turn retries).
     if prepare:
-        logger.info("prepare_done", extra={"user": user_id, "version": config_version, "ok": config_ok})
-        return JSONResponse({"prepared": config_ok, "config_error": config_err or None})
+        # resume_ready: a restored (or still-live) /tmp hint means shell-init will
+        # auto-resume this conversation when the PTY opens — the /shell route
+        # relays it so the browser knows whether to fire its first-prompt seed.
+        resume_ready = os.path.exists(RESUME_HINT_PATH)
+        logger.info("prepare_done", extra={"user": user_id, "version": config_version,
+                                           "ok": config_ok, "resume_ready": resume_ready})
+        return JSONResponse({"prepared": config_ok, "config_error": config_err or None,
+                             "resume_ready": resume_ready})
 
     # Workspace setup IS fatal — no workdir, no turn.
     try:
@@ -1048,6 +1132,14 @@ async def invocations(request: Request):
             _install_artifacts(
                 f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", workdir, session_id
             )
+        # Hand the interactive Terminal a one-shot launch hint: which dir to cd
+        # into and which conversation to `claude --resume`. shell-init.sh reads it
+        # on a FRESH shell only (run-once guard — a PTY reattach to an
+        # already-running claude never re-fires), so the resume launches
+        # server-side instead of the browser typing it into a live TUI input box.
+        resume_ready = False
+        if cli == "claude" and claude_session_id:
+            resume_ready = _write_resume_launch_hint(workdir, claude_session_id, session_id)
     except ValueError as ve:  # bad repo field — caller error, not a 500
         return JSONResponse({"error": str(ve)}, status_code=400)
     except Exception as exc:  # noqa: BLE001
@@ -1075,8 +1167,10 @@ async def invocations(request: Request):
     # Pre-warm done: workspace cloned, branch checked out, transcript installed.
     # No CLI runs — the first real turn (on open) will be instant + warm.
     if warm:
-        logger.info("warm_done", extra={"repo": repo, "workspace": workdir})
-        return JSONResponse({"warmed": True, "workspace": workdir, "cli": cli})
+        logger.info("warm_done", extra={"repo": repo, "workspace": workdir,
+                                        "resume_ready": resume_ready})
+        return JSONResponse({"warmed": True, "workspace": workdir, "cli": cli,
+                             "resume_ready": resume_ready})
 
     # Streaming path (claude): yield SSE as the turn runs. The runtime forwards
     # an async/sync generator response as text/event-stream through InvokeAgentRuntime.
@@ -1102,6 +1196,12 @@ async def invocations(request: Request):
 
     # Persist {claude_session_id → repo} so a later resume recovers the cwd.
     _remember_session(result.get("claude_session_id"), repo)
+
+    # A brand-new chat learns its claude_session_id only now (it was unset on
+    # entry, so the pre-run hint above was skipped). Write it here too, so opening
+    # the Terminal for this session also auto-resumes the conversation.
+    if cli == "claude" and result.get("claude_session_id"):
+        _write_resume_launch_hint(workdir, result["claude_session_id"], session_id)
 
     # Harvest any deliverables this turn produced to the resume prefix so they show
     # in the web Artifacts tab immediately — no pull-home required. Best-effort.
