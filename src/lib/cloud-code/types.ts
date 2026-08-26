@@ -63,6 +63,12 @@ export interface CloudCodeSession {
   // time; defaults to chat. A ported terminal session auto-runs `claude --resume`
   // in the PTY instead of firing the chat seed.
   defaultView?: "chat" | "terminal";
+  // Soft-delete tombstone. Set (with a short DynamoDB `ttl`) when the user
+  // deletes the session: the row vanishes from lists immediately but survives
+  // until the TTL lapses; the table stream's REMOVE event then fires the reaper
+  // Lambda (stop microVM + purge EFS/S3). A failed reap re-arms the TTL.
+  deletedAt?: string;
+  ttl?: number; // epoch seconds — DynamoDB TTL attribute
 }
 
 /** Trimmed shape for the sidebar list (no full turn history). */

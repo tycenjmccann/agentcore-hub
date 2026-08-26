@@ -145,6 +145,36 @@ export async function deleteSession(sessionId: string): Promise<void> {
   await ddb.send(new DeleteCommand({ TableName: TABLE, Key: { sessionId } }));
 }
 
+// Grace before DynamoDB TTL expires a tombstoned row (and thereby triggers the
+// reaper via the table stream). The row is hidden from the user the instant
+// deletedAt is set; this only governs how soon the backend cleanup fires. Short
+// so reclamation is prompt, but non-zero to absorb clock skew. (Actual TTL delete
+// latency is best-effort — usually minutes — which is fine for storage cleanup.)
+const REAP_GRACE_S = 60;
+
+/**
+ * Soft-delete: stamp the row as deleted and give it a TTL, then return. The row
+ * vanishes from the user's list immediately (listSessions filters deletedAt), but
+ * survives as the retry handle for backend cleanup. When DynamoDB expires it, the
+ * table stream fires the reaper Lambda once — which stops the microVM + purges
+ * EFS/S3. No multi-step cleanup runs in the request path, so there's no race to
+ * lose: a failed cleanup just re-arms the TTL and fires again. Goes through
+ * mutateSession so a concurrent turn-persist can't resurrect the row.
+ */
+export async function softDeleteSession(
+  sessionId: string,
+  tenantId: string
+): Promise<boolean> {
+  const owned = await getOwnedSession(sessionId, tenantId);
+  if (!owned) return false; // missing or not this tenant's → no-op
+  const updated = await mutateSession(sessionId, (s) => {
+    s.deletedAt = new Date().toISOString();
+    s.ttl = Math.floor(Date.now() / 1000) + REAP_GRACE_S;
+    return s;
+  });
+  return Boolean(updated);
+}
+
 /**
  * List a tenant's sessions for the sidebar. Scoped by tenantId (the company),
  * NOT userId — colleagues in the same tenant share a workspace by design; the
@@ -167,6 +197,9 @@ export async function listSessions(
     // Exclude non-session rows that share this table (e.g. config:{userId}
     // metadata written by the config-bundle store) — they have no turns/cli.
     .filter((s) => !String(s.sessionId).startsWith("config:") && s.cli)
+    // Hide soft-deleted rows: the user's delete already happened; the tombstone
+    // lingers only until the reaper finishes backend cleanup.
+    .filter((s) => !s.deletedAt)
     .filter((s) => tenantOf(s) === tenantId)
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
     .map((s) => ({
