@@ -28,7 +28,7 @@
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
-  DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand, DeleteCommand,
+  DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand,
 } from "@aws-sdk/lib-dynamodb";
 import {
   S3Client, ListObjectsV2Command, CopyObjectCommand,
@@ -74,10 +74,25 @@ async function migrateSessions() {
       migrated++;
       log(`session ${id}: tenantId default → ${TENANT}, userId ${item.userId || "default"} → ${USER}`);
       if (APPLY) {
-        await ddb.send(new PutCommand({
-          TableName: TABLE,
-          Item: { ...item, tenantId: TENANT, userId: USER },
-        }));
+        // UpdateCommand touching ONLY the identity fields — a full-item Put from
+        // this scan's snapshot would clobber turns/rev/deletedAt written by a
+        // live session mid-migration. Conditional on the row still being
+        // default-tenant so a concurrent re-run/racer can't double-apply.
+        try {
+          await ddb.send(new UpdateCommand({
+            TableName: TABLE,
+            Key: { sessionId: id },
+            UpdateExpression: "SET tenantId = :t, userId = :u",
+            ConditionExpression: "attribute_not_exists(tenantId) OR tenantId = :def",
+            ExpressionAttributeValues: { ":t": TENANT, ":u": USER, ":def": "default" },
+          }));
+        } catch (e) {
+          if (e?.name === "ConditionalCheckFailedException") {
+            console.log(`session ${id}: already migrated by a concurrent writer — skip`);
+          } else {
+            throw e;
+          }
+        }
       }
     }
     lastKey = res.LastEvaluatedKey;
