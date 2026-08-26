@@ -199,7 +199,7 @@ export async function warmCodingSession(params: {
   region?: string;
   githubToken?: string;
   githubAppConnected?: boolean;
-}): Promise<void> {
+}): Promise<{ resumeReady: boolean }> {
   if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
   const region = params.region || REGION;
   const payload: Record<string, unknown> = {
@@ -224,7 +224,23 @@ export async function warmCodingSession(params: {
     contentType: "application/json",
     accept: "application/json",
   });
-  await client(region).send(command);
+  const res = await client(region).send(command);
+  // resume_ready: the runtime wrote the Terminal auto-resume hint, so opening the
+  // PTY will land in the live TUI. /shell relays this so the browser knows whether
+  // to fire its first-prompt seed (no resume → hold the seed, don't type it into a
+  // bare shell).
+  return { resumeReady: await parseResumeReady(res.response) };
+}
+
+// Both warm and prepare report whether the runtime's Terminal auto-resume hint is
+// in place. Non-JSON / missing body → not ready (the seed stays pending).
+async function parseResumeReady(body?: { transformToString(): Promise<string> }): Promise<boolean> {
+  try {
+    const text = body ? await body.transformToString() : "";
+    return Boolean(JSON.parse(text).resume_ready);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -242,7 +258,7 @@ export async function prepareCodingSession(params: {
   tenantId?: string;
   configVersion?: string;
   region?: string;
-}): Promise<void> {
+}): Promise<{ resumeReady: boolean }> {
   if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
   const region = params.region || REGION;
   const payload: Record<string, unknown> = {
@@ -261,7 +277,10 @@ export async function prepareCodingSession(params: {
     contentType: "application/json",
     accept: "application/json",
   });
-  await client(region).send(command);
+  const res = await client(region).send(command);
+  // resume_ready: a restored/prior /tmp hint means the Terminal will auto-resume
+  // this conversation (gates the client's first-prompt seed).
+  return { resumeReady: await parseResumeReady(res.response) };
 }
 
 /**
