@@ -84,6 +84,10 @@ export async function getOwnedSession(
   const s = await getSession(sessionId);
   if (!s) return null;
   if (tenantOf(s) !== tenantId) return null;
+  // A tombstoned row is deleted as far as every route is concerned — without
+  // this, a bookmarked/already-open client could keep messaging or opening a
+  // terminal on a session the user deleted, until the TTL actually expires.
+  if (s.deletedAt) return null;
   return s;
 }
 
