@@ -33,6 +33,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -924,6 +925,44 @@ def _sync_turn_artifacts(session_id: str, workdir: str, tenant_id: str | None = 
     return _sync_artifacts(f"{_tenant_root(tenant_id)}/resume/{session_id}/artifacts/", workdir)
 
 
+def _checkpoint_return_bundle(session_id: str, workdir: str,
+                              tenant_id: str | None = None) -> dict | None:
+    """Return leg for bundle/selfContained sessions: the cloud's commits can't
+    ride `git fetch origin` home (origin is read-only or absent), so bundle the
+    workspace's full history and upload it. The laptop's pull leg fetches this
+    bundle and fast-forwards its branch from it instead of origin. Best-effort:
+    returns {key, bytes, branch} or None (no repo / bundle failed)."""
+    if not (ARTIFACT_BUCKET and os.path.isdir(os.path.join(workdir, ".git"))):
+        return None
+    bundle_path = os.path.join(_session_dir(session_id), ".return.bundle")
+    try:
+        res = subprocess.run(["git", "bundle", "create", bundle_path, "--all", "HEAD"],
+                             cwd=workdir, capture_output=True, text=True, timeout=300)
+        if res.returncode != 0:
+            logger.warning("return_bundle_create_failed", extra={"err": res.stderr.strip()[:200]})
+            return None
+        branch = None
+        br = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=workdir,
+                            capture_output=True, text=True, timeout=30)
+        if br.returncode == 0 and br.stdout.strip() != "HEAD":
+            branch = br.stdout.strip()
+        key = f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/return.bundle"
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        with open(bundle_path, "rb") as f:
+            data = f.read()
+        s3.put_object(Bucket=ARTIFACT_BUCKET, Key=key, Body=data,
+                      ContentType="application/octet-stream")
+        return {"key": key, "bytes": len(data), "branch": branch}
+    except Exception as exc:  # noqa: BLE001 — best-effort return leg
+        logger.warning("return_bundle_failed", extra={"error": str(exc)[:200]})
+        return None
+    finally:
+        try:
+            os.remove(bundle_path)
+        except OSError:
+            pass
+
+
 def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
     """Pull-home leg: upload deliverables under the CHECKPOINT prefix (keyed by the
     resume/claude session id) so the laptop pull brings them home too."""
@@ -1072,11 +1111,14 @@ def _purge_session(session_id: str, conversation_id: str | None = None,
                (checkpoint/<conversationId>/), not the runtime session id — purge
                both forms so a checkpointed session doesn't leak its transcript.
 
-    Best-effort and idempotent: a missing dir / already-deleted key is success, so
-    a double-delete or a purge of a session that never warmed a VM is harmless. The
-    live microVM is NOT torn down here — the caller stops the runtime session
-    separately (it also ages out on its own idle lifecycle)."""
-    removed = {"efs": False, "s3_objects": 0, "transcripts": 0}
+    Idempotent: a missing dir / already-deleted key is success, so a double-delete
+    or a purge of a session that never warmed a VM is harmless. But a FAILED
+    operation (EFS unavailable, S3 AccessDenied) is reported via ok=False so the
+    reaper raises and the stream redelivers — returning success on a swallowed
+    failure would permanently leak the storage (the lifecycle backstop doesn't
+    cover EFS or tenant-scoped keys). The live microVM is NOT torn down here —
+    the caller stops the runtime session separately."""
+    removed = {"efs": False, "s3_objects": 0, "transcripts": 0, "ok": True}
     # EFS: rm -rf the per-session dir. _session_dir sanitizes the id, and we re-check
     # the result stays under sessions/ so a crafted id can't escape the namespace.
     sdir = _session_dir(session_id)
@@ -1084,9 +1126,10 @@ def _purge_session(session_id: str, conversation_id: str | None = None,
     if os.path.realpath(sdir).startswith(os.path.realpath(sessions_root) + os.sep):
         try:
             if os.path.isdir(sdir):
-                shutil.rmtree(sdir, ignore_errors=True)
+                shutil.rmtree(sdir)
                 removed["efs"] = True
         except OSError as exc:
+            removed["ok"] = False
             logger.warning("purge_efs_failed", extra={"session": session_id, "error": str(exc)[:200]})
     # EFS transcript: the conversation log lives OUTSIDE sessions/<id> (keyed by
     # the cwd slug for claude, by the rollout path for codex), so rmtree above
@@ -1107,8 +1150,16 @@ def _purge_session(session_id: str, conversation_id: str | None = None,
                 os.path.join(CODEX_HOME, "sessions", "**", f"*{glob.escape(safe_cid)}*"),
             ]
         else:
-            # Claude: $CLAUDE_CONFIG_DIR/projects/<workdir-slug>/<id>.jsonl.
-            patterns = [os.path.join(CLAUDE_CONFIG_DIR, "projects", "*", f"{glob.escape(safe_cid)}.jsonl")]
+            # Claude: $CLAUDE_CONFIG_DIR/projects/<workdir-slug>/<id>.jsonl. The
+            # slug derives from the workdir's realpath — and the SAME conversation
+            # id can be ported into MULTIPLE cloud sessions, each with its own
+            # per-session workdir. Only delete transcripts whose slug belongs to
+            # THIS session's dir (sessions/<sid>/...), so purging one cloud
+            # session can't destroy a sibling's still-active transcript.
+            session_slug_prefix = _claude_project_slug(sdir)
+            patterns = [os.path.join(CLAUDE_CONFIG_DIR, "projects",
+                                     f"{session_slug_prefix}*",
+                                     f"{glob.escape(safe_cid)}.jsonl")]
         try:
             seen: set[str] = set()
             for pat in patterns:
@@ -1122,6 +1173,7 @@ def _purge_session(session_id: str, conversation_id: str | None = None,
                     except OSError:
                         pass
         except OSError as exc:
+            removed["ok"] = False
             logger.warning("purge_transcript_failed",
                            extra={"session": session_id, "cli": cli, "error": str(exc)[:200]})
     # S3: delete every object under the session's resume + checkpoint prefixes.
@@ -1144,7 +1196,8 @@ def _purge_session(session_id: str, conversation_id: str | None = None,
                     if keys:
                         s3.delete_objects(Bucket=ARTIFACT_BUCKET, Delete={"Objects": keys, "Quiet": True})
                         removed["s3_objects"] += len(keys)
-            except Exception as exc:  # noqa: BLE001 — S3 cleanup is best-effort
+            except Exception as exc:  # noqa: BLE001 — recorded so the reaper retries
+                removed["ok"] = False
                 logger.warning("purge_s3_failed", extra={"prefix": prefix, "error": str(exc)[:200]})
     logger.info("session_purged", extra={"session": session_id, **removed})
     return removed
@@ -1443,6 +1496,17 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
 
     proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+    # Watchdog: the buffered runner enforced TURN_TIMEOUT_S via subprocess.run;
+    # this loop blocks on readline, so a codex (or an invoked command) that wedges
+    # without closing stdout would pin the microVM HealthyBusy forever. Kill the
+    # process at the cap so the loop unwinds and a terminal frame is emitted.
+    timed_out = threading.Event()
+
+    def _kill_on_timeout():
+        timed_out.set()
+        proc.kill()
+    watchdog = threading.Timer(TURN_TIMEOUT_S, _kill_on_timeout)
+    watchdog.start()
     thread_id: str | None = codex_session_id
     reply_parts: list[str] = []          # only agent_message text = the actual reply
     emitted_any_reply = False            # did we stream reply text (vs only status)?
@@ -1459,16 +1523,25 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
             t = obj.get("type")
             if t == "thread.started" and obj.get("thread_id"):
                 thread_id = obj["thread_id"]
+                # A fresh thread.started after an error frame is run-codex.sh
+                # RETRYING (cold-engine Mantle errors). The prior attempt's
+                # failure must not poison a successful retry's result.
+                fail_detail = None
                 continue
             if t in ("error", "turn.failed"):
                 fail_detail = str(obj.get("message") or (obj.get("error") or {}).get("message") or "")[:400]
                 continue
-            # item.started/completed carry the step payload (older builds: msg).
+            if t == "turn.completed":
+                fail_detail = None  # a completed turn supersedes any earlier attempt's error
+                continue
+            # item.started/completed carry the step payload. Older codex builds
+            # wrap it as {"msg":{...}} with NO top-level type — treat a msg-shaped
+            # agent_message as completed (there are no partial frames there).
             item = obj.get("item") or obj.get("msg") or {}
             itype = item.get("type")
             if itype == "agent_message":
                 # The reply. completed frame has the whole message; stream it once.
-                if t == "item.completed":
+                if t == "item.completed" or (t is None and "msg" in obj):
                     msg = item.get("text") or item.get("message") or ""
                     if msg:
                         reply_parts.append(msg)
@@ -1485,6 +1558,13 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
         proc.wait(timeout=30)
     except Exception as exc:  # noqa: BLE001
         yield sse({"type": "error", "error": str(exc)[:600]})
+        return
+    finally:
+        watchdog.cancel()
+    if timed_out.is_set():
+        err = f"codex timed out after {TURN_TIMEOUT_S}s"
+        yield sse({"type": "error", "error": err})
+        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": thread_id})
         return
     if proc.returncode not in (0, None) or fail_detail:
         banner = ((proc.stderr.read() or "")[:200] if proc.stderr else "")
@@ -1575,9 +1655,14 @@ async def invocations(request: Request):
         sid = payload.get("session_id")
         if not sid:
             return JSONResponse({"error": "purge needs a session id"}, status_code=400)
-        return JSONResponse({"purged": True, **_purge_session(
+        result = _purge_session(
             sid, payload.get("claude_session_id"), (payload.get("cli") or "claude").lower(),
-            payload.get("tenant_id"))})
+            payload.get("tenant_id"))
+        if not result.get("ok"):
+            # Partial failure → non-2xx + purged:false so the reaper raises and
+            # the stream redelivers, instead of acknowledging a leak as success.
+            return JSONResponse({"purged": False, **result}, status_code=500)
+        return JSONResponse({"purged": True, **result})
 
     prompt = (payload.get("prompt") or "").strip()
     if not prompt and not warm and not checkpoint and not prepare:
@@ -1765,7 +1850,14 @@ async def invocations(request: Request):
         # Harvest touched-untracked deliverables too (best-effort — never fails the
         # checkpoint). They surface in the web Artifacts tab under the same cp_id.
         artifacts = _checkpoint_artifacts(cp_id, workdir, tenant_id)
-        return JSONResponse({"checkpointed": True, **info, "artifacts": artifacts})
+        # bundle/selfContained sessions have no writable origin — the laptop
+        # can't `git fetch origin` the cloud's commits home. Ship them as a
+        # return bundle instead (the pull leg fetches from it directly).
+        return_bundle = None
+        if git_mode in ("bundle", "selfContained") or _selfcontained_workspace(session_id):
+            return_bundle = _checkpoint_return_bundle(cp_id, workdir, tenant_id)
+        return JSONResponse({"checkpointed": True, **info, "artifacts": artifacts,
+                             "return_bundle": return_bundle})
 
     # Pre-warm done: workspace cloned, branch checked out, transcript installed.
     # No CLI runs — the first real turn (on open) will be instant + warm.

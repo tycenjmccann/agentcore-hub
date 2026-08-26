@@ -108,6 +108,7 @@ function harvestPaths(transcript: Buffer): Map<string, string> {
 
   // Structured pass: claude .jsonl — one record per line, tool_use blocks live
   // in message.content[]. Gives us the real tool name → drop non-producers.
+  let structuredHit = false;
   for (const line of text.split("\n")) {
     if (!line.includes("tool_use")) continue;
     let rec: any;
@@ -120,6 +121,7 @@ function harvestPaths(transcript: Buffer): Map<string, string> {
     if (!Array.isArray(content)) continue;
     for (const b of content) {
       if (b?.type !== "tool_use" || !b.input) continue;
+      structuredHit = true; // transcript parses structurally — attribution works
       const name = String(b.name || "");
       if (!PRODUCER_TOOLS.has(name)) continue; // a Read/Glob/Grep is not a deliverable
       const p = b.input.file_path || b.input.notebook_path;
@@ -130,20 +132,26 @@ function harvestPaths(transcript: Buffer): Map<string, string> {
   }
 
   // Regex fallback: any `"file_path":"…"` / `"notebook_path":"…"` in the raw
-  // bytes (codex serializes tool args as a JSON string, kiro as one value blob —
-  // both still contain these keys). No tool attribution here, so the secret
-  // denylist (applied in detectArtifacts) is the guard for read-only secrets.
-  const re = /"(?:file_path|notebook_path)"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    let p: string;
-    try {
-      p = JSON.parse(`"${m[1]}"`); // unescape JSON string body
-    } catch {
-      continue;
+  // bytes (codex serializes tool args as a JSON string — the keys are still
+  // there but not structurally parseable). No tool attribution here, so the
+  // secret denylist (applied in detectArtifacts) is the guard. ONLY for
+  // transcripts the structured pass couldn't parse: on a structured (claude)
+  // transcript this would re-harvest every Read-only path the producer filter
+  // deliberately dropped — silently shipping files the session merely read.
+  if (!structuredHit) {
+    const re = /"(?:file_path|notebook_path)"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+    let m2: RegExpExecArray | null;
+    while ((m2 = re.exec(text)) !== null) {
+      let p: string;
+      try {
+        p = JSON.parse(`"${m2[1]}"`); // unescape JSON string body
+      } catch {
+        continue;
+      }
+      if (p && !byPath.has(p)) byPath.set(p, "unknown");
     }
-    if (p && !byPath.has(p)) byPath.set(p, "unknown");
   }
+  let m: RegExpExecArray | null;
 
   // Media sweep: deliverables are routinely produced by SHELL commands (a python
   // script rendering a PNG, ffmpeg writing an MP4) — no Write tool, no file_path
@@ -221,8 +229,22 @@ export async function detectArtifacts(opts: DetectOptions): Promise<DetectResult
     //    candidate. Those aren't deliverables; drop them so neither their bytes
     //    NOR their path/size ever leave the laptop (defense in depth — the server
     //    re-validates rels too, but detection shouldn't surface them at all).
+    //    Containment is checked on the REAL (symlink-resolved) path: stat and
+    //    the read stream follow links, so an in-workspace symlink pointing at a
+    //    credential file outside cwd would otherwise pass the lexical check and
+    //    upload its target.
     const rel = path.relative(cwd, abs);
     if (rel.startsWith("..") || path.isAbsolute(rel)) continue;
+    try {
+      const { realpath } = await import("node:fs/promises");
+      const realAbs = await realpath(abs);
+      const realCwd = await realpath(cwd);
+      const realRel = path.relative(realCwd, realAbs);
+      if (realRel.startsWith("..") || path.isAbsolute(realRel)) continue;
+      if (isSecretPath(realRel)) continue; // the target's real name, not the link's
+    } catch {
+      continue; // unresolvable → skip
+    }
 
     // 5. never ship a credential file. A producer-only harvest already drops
     //    Read-logged secrets for claude, but the codex/kiro regex pass can't

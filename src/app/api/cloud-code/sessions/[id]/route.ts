@@ -11,7 +11,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { getOwnedSession, putSession, softDeleteSession } from "@/lib/cloud-code/sessions";
+import { getOwnedSession, mutateSession, softDeleteSession } from "@/lib/cloud-code/sessions";
 import { getIdentity } from "@/lib/auth/identity";
 import { artifactKey } from "@/lib/cloud-code/s3keys";
 import type { CloudCodeSession } from "@/lib/cloud-code/types";
@@ -64,12 +64,19 @@ export async function PATCH(
 ) {
   try {
     const { tenantId } = getIdentity(request);
-    const session = await getOwnedSession(params.id, tenantId);
-    if (!session) return NextResponse.json({ error: "Session not found" }, { status: 404 });
+    const owned = await getOwnedSession(params.id, tenantId);
+    if (!owned) return NextResponse.json({ error: "Session not found" }, { status: 404 });
     const body = await request.json().catch(() => ({}));
-    if (body.clearPendingSeed) session.pendingSeed = undefined;
-    session.updatedAt = new Date().toISOString();
-    await putSession(session);
+    // mutateSession (conditional write), NOT a read+putSession: a full Put from
+    // a stale read here could land after a concurrent soft-delete and overwrite
+    // its deletedAt/ttl — resurrecting the session and disarming the reaper.
+    const session = await mutateSession(params.id, (fresh) => {
+      if (fresh.deletedAt) return null; // deleted since our ownership check — don't revive
+      if (body.clearPendingSeed) fresh.pendingSeed = undefined;
+      fresh.updatedAt = new Date().toISOString();
+      return fresh;
+    });
+    if (!session) return NextResponse.json({ error: "Session not found" }, { status: 404 });
     return NextResponse.json({ session });
   } catch (err) {
     console.error("[cloud-code] patch error:", err);

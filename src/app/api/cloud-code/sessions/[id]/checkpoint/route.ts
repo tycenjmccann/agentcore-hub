@@ -61,6 +61,8 @@ export async function POST(
       sessionId: session.sessionId,
       cli: session.cli,
       repo: session.repo,
+      cloneUrl: session.cloneUrl,
+      gitMode: session.gitMode,
       resumeSessionId,
       tenantId: session.tenantId || DEFAULT_TENANT_ID,
       region,
@@ -110,6 +112,16 @@ export async function POST(
       );
     }
 
+    // bundle/selfContained sessions: presign the return bundle so the laptop
+    // can fetch the cloud's commits without a writable origin.
+    const returnBundleUrl = cp.returnBundleKey
+      ? await getSignedUrl(
+          s3,
+          new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: cp.returnBundleKey }),
+          { expiresIn: DOWNLOAD_EXPIRES }
+        )
+      : undefined;
+
     return NextResponse.json({
       transcriptUrl,
       transcriptKey: cp.key,
@@ -118,6 +130,8 @@ export async function POST(
       repo: session.repo,
       bytes: cp.bytes,
       artifacts,
+      returnBundleUrl,
+      returnBundleBranch: cp.returnBundleBranch,
     });
   } catch (err) {
     console.error("[cloud-code] checkpoint error:", err);

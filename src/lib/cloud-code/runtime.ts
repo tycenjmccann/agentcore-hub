@@ -321,6 +321,12 @@ export async function checkpointCodingSession(params: {
   sessionId: string;
   cli: CloudCodeCli;
   repo?: string;
+  // Workspace resolution on the runtime derives the slug from repo OR cloneUrl —
+  // a cloneUrl-only session (non-GitHub/SSH origin) MUST forward it or the
+  // checkpoint resolves to the bare session dir, misses the transcript's project
+  // slug, and 404s the pull-home.
+  cloneUrl?: string;
+  gitMode?: "pushed" | "bundle" | "selfContained" | "none";
   resumeSessionId?: string; // the conversation's real id (the transcript filename)
   tenantId?: string;
   region?: string;
@@ -330,6 +336,11 @@ export async function checkpointCodingSession(params: {
   branch?: string;
   artifactPrefix?: string;
   artifactCount?: number;
+  // bundle/selfContained sessions: S3 key of a whole-history git bundle carrying
+  // the cloud's commits (no writable origin to fetch them from). The pull leg
+  // fetches from this bundle instead of origin.
+  returnBundleKey?: string;
+  returnBundleBranch?: string;
 }> {
   if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
   const region = params.region || REGION;
@@ -339,6 +350,8 @@ export async function checkpointCodingSession(params: {
     session_id: params.sessionId,
   };
   if (params.repo) payload.repo = params.repo;
+  if (params.cloneUrl) payload.clone_url = params.cloneUrl;
+  if (params.gitMode) payload.git_mode = params.gitMode;
   if (params.resumeSessionId) payload.resume_session_id = params.resumeSessionId;
   if (params.tenantId) payload.tenant_id = params.tenantId;
 
@@ -362,11 +375,14 @@ export async function checkpointCodingSession(params: {
   // ({count, bytes, prefix}) — surfaced so the checkpoint route can presign a
   // GET per file for the pull-home leg.
   const arts = (parsed.artifacts || {}) as { count?: number; prefix?: string };
+  const rb = (parsed.return_bundle || null) as { key?: string; branch?: string } | null;
   return {
     key: parsed.key as string | undefined,
     bytes: parsed.bytes as number | undefined,
     branch: parsed.branch as string | undefined,
     artifactPrefix: arts.prefix || undefined,
     artifactCount: arts.count ?? 0,
+    returnBundleKey: rb?.key || undefined,
+    returnBundleBranch: rb?.branch || undefined,
   };
 }
