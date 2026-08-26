@@ -77,4 +77,3 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
   );
 });
 
-export default MarkdownRenderer;

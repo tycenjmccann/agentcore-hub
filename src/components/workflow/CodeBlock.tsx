@@ -4,7 +4,7 @@ import React, { useState, useCallback, useRef, useEffect, memo } from "react";
 import { Copy, Check } from "lucide-react";
 
 interface CodeBlockProps {
-  /** Pre-highlighted HTML from rehype-highlight, rendered via dangerouslySetInnerHTML. */
+  /** Pre-highlighted HTML rendered via dangerouslySetInnerHTML. */
   highlightedHtml: string;
   language?: string;
   className?: string;
@@ -81,4 +81,3 @@ export const CodeBlock = memo(function CodeBlock({
   );
 });
 
-export default CodeBlock;
