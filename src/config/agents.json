@@ -1657,6 +1657,21 @@
       ],
       "skills": [],
       "blueprints": []
+    },
+    {
+      "agentId": "agentcore_hub_agent",
+      "displayName": "Hub Agent (Shared Runtime)",
+      "description": "The single shared AgentCore runtime that hosts all pipeline personas. Fleet-level ops metrics and evaluations aggregate here.",
+      "phase": "platform",
+      "type": "runtime",
+      "model": "Claude Fable 5",
+      "evaluationsEnabled": true,
+      "evalConfigName": "eval_agentcore_hub_agent",
+      "runtimeArn": null,
+      "tools": [],
+      "skills": [],
+      "blueprints": [],
+      "workflowDefIds": []
     }
   ],
   "defaults": {
