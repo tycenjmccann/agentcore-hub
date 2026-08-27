@@ -111,6 +111,8 @@ export interface WorkflowState {
   error?: string;
   /** Workflow classification — "feature" (default) or "bug" */
   workflowType?: WorkflowType;
+  /** SDLC framework the run follows — "playbook" (default) or "aidlc" */
+  sdlcFramework?: "playbook" | "aidlc";
   /** Shared feature branch — all dev agents commit to this single branch */
   featureBranch?: string;
   /** QA verification retry counter (max 3 fix cycles before human escalation) */
@@ -192,6 +194,8 @@ export interface WorkflowInput {
   connectors?: string[];
   /** Workflow classification — "feature" (default) or "bug" */
   workflowType?: WorkflowType;
+  /** SDLC framework the run follows — "playbook" (default) or "aidlc" */
+  sdlcFramework?: "playbook" | "aidlc";
   /**
    * Which workflow definition (shape) to run. Resolved against workflows.json.
    * Absent → default ("software-delivery"), preserving legacy behavior.
