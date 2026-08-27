@@ -8,6 +8,7 @@ import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { duplicateCaseIds } from "./lib/cases.mjs";
 
 const BATTERY_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(BATTERY_DIR, "..", "..");
@@ -96,10 +97,21 @@ for (const file of walk(CASES_DIR)) {
   cases.push({ file, case: parsed });
 }
 
-// ─── 3. Manifest cross-check ─────────────────────────────────────────────────
+// ─── 3. Duplicate case ids (B4) ──────────────────────────────────────────────
+
+// Same rule preflight applies: id-keyed rosters silently collapse duplicates,
+// so one of the two files would never run and never be missed.
+for (const [id, files] of duplicateCaseIds(cases.map(({ file, case: def }) => ({ file, def })))) {
+  fail(files[0], null, `duplicate case id '${id}' declared by ${files.length} case files: ${files.map((f) => relative(REPO_ROOT, f)).join(", ")}`);
+}
+
+// ─── 4. Manifest cross-check ─────────────────────────────────────────────────
 
 const manifest = JSON.parse(readFileSync(join(BATTERY_DIR, "manifest.json"), "utf8"));
 const manifestIds = new Set(manifest.activeCases);
+for (const id of new Set(manifest.activeCases.filter((id, i, arr) => arr.indexOf(id) !== i))) {
+  fail(join(BATTERY_DIR, "manifest.json"), null, `activeCases lists '${id}' more than once`);
+}
 const activeCases = cases.filter((c) => c.case.status === "active");
 const activeIds = new Set(activeCases.map((c) => c.case.id));
 
@@ -115,7 +127,7 @@ if (manifest.activeCases.length < manifest.minActiveCases)
   fail(join(BATTERY_DIR, "manifest.json"), null,
     `activeCases count ${manifest.activeCases.length} < minActiveCases ${manifest.minActiveCases}`);
 
-// ─── 4. Fixture references + reference-input evaluator dependency ───────────
+// ─── 5. Fixture references + reference-input evaluator dependency ───────────
 
 for (const { file, case: c } of cases) {
   const refs = [];

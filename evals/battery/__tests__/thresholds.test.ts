@@ -178,7 +178,7 @@ describe("new-case semantics", () => {
     expect(suite.failureReasons.join()).toContain("case fresh");
   });
 
-  it("treats ALL cases as informational under a bootstrap baseline", () => {
+  it("treats ALL cases as informational under a bootstrap baseline, but NEVER passes (B1/B3)", () => {
     const suite = run({
       baseline: { scoringBackend: "local-judge", bootstrap: true, cases: {} },
       caseResults: [
@@ -186,29 +186,33 @@ describe("new-case semantics", () => {
         { id: "b", status: "scored", scores: { "Builtin.Correctness": 20 } },
       ],
     });
-    expect(suite.verdict).toBe("PASS");
+    expect(suite.verdict).toBe("FAIL");
+    expect(suite.bootstrapBaseline).toBe(true);
+    expect(suite.failureReasons.join()).toContain("baseline is bootstrap");
+    expect(suite.failureReasons.join()).toContain("no baseline-compared gating cases");
+    // Scores are still reported informationally — the baseline workflow needs them.
     expect(suite.deltaRows.every((r: any) => r.verdict === "informational")).toBe(true);
     expect(suite.informationalCases.sort()).toEqual(["a", "b"]);
+    expect(suite.gatingCases).toEqual([]);
   });
 });
 
 describe("budget", () => {
+  // A gating case is required for any PASS (B3), so the budget cases carry a
+  // real baseline instead of the bootstrap placeholder.
+  const gated = {
+    baseline: baselineWith({ a: { "Builtin.Correctness": 90 } }),
+    caseResults: [{ id: "a", status: "scored", scores: { "Builtin.Correctness": 90 } }],
+  };
+
   it("FAILs with 'budget exceeded' when cost > maxRunUsd", () => {
-    const suite = run({
-      baseline: { scoringBackend: "local-judge", bootstrap: true, cases: {} },
-      caseResults: [{ id: "a", status: "scored", scores: {} }],
-      costEstimateUsd: 20.01,
-    });
+    const suite = run({ ...gated, costEstimateUsd: 20.01 });
     expect(suite.verdict).toBe("FAIL");
     expect(suite.failureReasons.join()).toContain("budget exceeded");
   });
 
   it("PASSes at exactly maxRunUsd", () => {
-    const suite = run({
-      baseline: { scoringBackend: "local-judge", bootstrap: true, cases: {} },
-      caseResults: [{ id: "a", status: "scored", scores: {} }],
-      costEstimateUsd: 20.0,
-    });
+    const suite = run({ ...gated, costEstimateUsd: 20.0 });
     expect(suite.verdict).toBe("PASS");
   });
 });

@@ -4,15 +4,22 @@
 //   --base-ref <ref> | --baseline-mode --repeat N --out <path>
 // Gate mode NEVER writes evals/battery/baseline.json — only the merge-to-main
 // baseline workflow regenerates it (via --baseline-mode with an explicit --out).
+//
+// Gate mode = --base-ref given. Then the rules the gate judges itself by
+// (baseline.json, thresholds.json, and manifest.json's gating knobs) are read
+// from the BASE REF, never from the PR checkout (B2), spend is capped live at
+// maxRunUsd (B5), and a bootstrap baseline (B1) or a suite with no
+// baseline-compared case (B3) can never produce a PASS.
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { preflight, SCORING_BACKEND as CASES_BACKEND } from "./lib/cases.mjs";
+import { preflight, resolveGateConfig, SCORING_BACKEND as CASES_BACKEND } from "./lib/cases.mjs";
 import { evaluateSuite } from "./lib/thresholds.mjs";
 import { createRegistry, FORBIDDEN_TOOLS } from "./lib/registry.mjs";
-import { runCase, MODEL_TIERS, usageCostUsd } from "./lib/agent-runner.mjs";
+import { runCase, MODEL_TIERS } from "./lib/agent-runner.mjs";
+import { createSpendLedger } from "./lib/spend.mjs";
 import { createConverseTransport, scoreCase, SCORING_BACKEND } from "./lib/scoring.mjs";
 import { buildResults, renderCheckSummary } from "./lib/report.mjs";
 import "./lib/otel.mjs"; // import-time contract check vs schema/otel-eval-attributes.json
@@ -114,6 +121,20 @@ function detectNewCaseIds({ baseline, baseRef, activeCases }) {
   }
 }
 
+// In gate mode the base ref tells us exactly which cases COULD be gated: a
+// case is informational only when it is neither active at the base ref nor
+// present in the (base-ref) baseline. That is stricter than the git-diff
+// heuristic — a pre-existing case the PR merely renamed/re-added stays gated.
+function gateNewCaseIds({ gate, baseline, selected }) {
+  // Bootstrap: nothing is comparable, so everything reports informational —
+  // and the suite verdict fails anyway (B1).
+  if (baseline?.bootstrap === true) return selected.map((c) => c.id);
+  const baseActive = new Set(gate.baseActiveIds || []);
+  return selected
+    .map((c) => c.id)
+    .filter((id) => !baseActive.has(id) && !baseline?.cases?.[id]);
+}
+
 // ─── Concurrency pool ────────────────────────────────────────────────────────
 
 async function runPool(items, size, worker) {
@@ -145,8 +166,25 @@ async function main() {
   } catch (err) {
     lintErrors.push(`fixture lint failed:\n${err.stdout || ""}${err.stderr || ""}`);
   }
+  // Gate mode (--base-ref): the rules the gate judges itself by come from the
+  // base ref, not from the PR checkout (B2).
+  const gateMode = !flags.baselineMode && Boolean(flags.baseRef);
+  const gate = gateMode
+    ? resolveGateConfig({
+        repoRoot: REPO_ROOT,
+        baseRef: flags.baseRef,
+        head: { manifest: pf.manifest, thresholds: pf.thresholds, baseline: pf.baseline, cases: pf.allCases },
+      })
+    : null;
+  if (gate) {
+    console.log(`Gate config resolution (--base-ref ${gate.baseRef}):`);
+    for (const [file, source] of Object.entries(gate.sources)) console.log(`  ${file}: ${source}`);
+    for (const w of gate.warnings) console.warn(`  warn: ${w}`);
+  }
+
   const allPreflightErrors = [
     ...pf.errors.map((e) => `[${e.check}] ${e.file ? `${e.file}: ` : ""}${e.message}`),
+    ...(gate?.errors || []).map((e) => `[${e.check}] ${e.file ? `${e.file}: ` : ""}${e.message}`),
     ...lintErrors,
   ];
   if (allPreflightErrors.length > 0) {
@@ -155,15 +193,26 @@ async function main() {
     process.exit(1);
   }
 
-  // Case selection.
-  let selected = pf.activeCases;
+  const thresholds = gate?.thresholds || pf.thresholds;
+  const baseline = gate?.baseline || pf.baseline;
+
+  // Case selection. Cases active at the base ref but retired by this PR still
+  // run and still gate — retirement only takes effect once it has landed. And
+  // for every base-active case the gating knobs inside the case file
+  // (evaluator_floors, evaluators, forbiddenTools) come from the base ref too.
+  const effectiveDef = (def) => gate?.effectiveCaseDefs?.get(def.id) || def;
+  const runnable = [...pf.activeCases, ...(gate?.resurrectedCases || []).map((c) => c.def)].map(effectiveDef);
+  const resurrectedIds = new Set((gate?.resurrectedCases || []).map((c) => c.def.id));
+  // A case the PR retires but that still gates is NOT reported as retired.
+  const retiredCases = pf.retiredCases.filter((r) => !resurrectedIds.has(r.id));
+  let selected = runnable;
   if (flags.cases.length > 0) {
-    const unknown = flags.cases.filter((id) => !pf.activeCases.some((c) => c.id === id));
+    const unknown = flags.cases.filter((id) => !runnable.some((c) => c.id === id));
     if (unknown.length > 0) {
       console.error(`Unknown/inactive case id(s): ${unknown.join(", ")}`);
       process.exit(2);
     }
-    selected = pf.activeCases.filter((c) => flags.cases.includes(c.id));
+    selected = runnable.filter((c) => flags.cases.includes(c.id));
   }
 
   const hermErrors = hermeticitySelfTest(runId, selected);
@@ -174,10 +223,13 @@ async function main() {
   }
 
   const configSha = git("rev-parse", "HEAD");
-  const newCaseIds = detectNewCaseIds({ baseline: pf.baseline, baseRef: flags.baseRef, activeCases: selected });
+  const newCaseIds =
+    gate && gate.baseActiveIds
+      ? gateNewCaseIds({ gate, baseline, selected })
+      : detectNewCaseIds({ baseline, baseRef: flags.baseRef, activeCases: selected });
 
   if (flags.dryRun) {
-    console.log(`Preflight OK — ${pf.activeCases.length} active case(s), ${pf.retiredCases.length} retired.`);
+    console.log(`Preflight OK — ${selected.length} runnable case(s), ${retiredCases.length} retired.`);
     console.log(`Hermeticity self-test OK. Fixture lint OK. Zero Bedrock calls made.\n`);
     console.log(`Plan (runId ${runId}, HEAD ${configSha.slice(0, 12)}):`);
     for (const def of selected) {
@@ -187,7 +239,7 @@ async function main() {
           `evaluators=${def.evaluators.length}  timeout=${def.timeoutSeconds}s${marker}`
       );
     }
-    for (const r of pf.retiredCases) console.log(`  - ${r.id}  RETIRED: ${r.retirement_reason}`);
+    for (const r of retiredCases) console.log(`  - ${r.id}  RETIRED: ${r.retirement_reason}`);
     process.exit(0);
   }
 
@@ -201,18 +253,53 @@ async function main() {
   }
 
   const transport = await createConverseTransport();
-  let costEstimateUsd = 0;
+  // B5: maxRunUsd is a live ceiling, not a post-hoc verdict check. The ledger
+  // meters every Converse response and refuses the next call once the ceiling
+  // is up, so spend is bounded by ~maxRunUsd + the turns already in flight.
+  // Baseline mode runs every case `--repeat` times, so its ceiling scales.
+  const spendCeilingUsd = flags.baselineMode ? thresholds.maxRunUsd * flags.repeat : thresholds.maxRunUsd;
+  const ledger = createSpendLedger({ maxUsd: spendCeilingUsd });
+  console.log(`Spend ceiling: $${spendCeilingUsd.toFixed(2)} (maxRunUsd from ${gate ? `${gate.baseRef} ` : "PR-head "}thresholds.json)`);
 
   async function executeAndScore(def) {
-    const run = await runCase({ caseDef: def, repoRoot: REPO_ROOT, runId, converse: transport });
-    costEstimateUsd += usageCostUsd(def.modelTier, run.usage);
+    // Never START new work past the ceiling — unstarted cases are skipped, and
+    // a skipped case fails the gate.
+    if (ledger.exceeded) {
+      ledger.noteAborted(def.id);
+      const error = ledger.message(`case '${def.id}' was not started`);
+      console.log(`  ${def.id}: skipped (${error})`);
+      return {
+        id: def.id,
+        status: "skipped",
+        attempt: 0,
+        sessionId: null,
+        forbiddenHits: [],
+        trajectory: [],
+        usage: { inputTokens: 0, outputTokens: 0 },
+        scores: {},
+        details: {},
+        error,
+        modelTier: def.modelTier,
+        evaluator_floors: def.evaluator_floors,
+      };
+    }
+    const run = await runCase({
+      caseDef: def,
+      repoRoot: REPO_ROOT,
+      runId,
+      converse: ledger.meter(transport, def.modelTier, def.id),
+    });
     let scores = {};
     let details = {};
     let status = run.status;
     let error = run.error;
     if (run.status === "completed") {
-      const scored = await scoreCase({ caseDef: def, runResult: run, transport, repoRoot: REPO_ROOT });
-      costEstimateUsd += usageCostUsd("judge", scored.usage);
+      const scored = await scoreCase({
+        caseDef: def,
+        runResult: run,
+        transport: ledger.meter(transport, "judge", def.id),
+        repoRoot: REPO_ROOT,
+      });
       status = scored.status; // 'scored' | 'unscored'
       scores = scored.scores;
       details = scored.details;
@@ -263,6 +350,12 @@ async function main() {
       }
       cases[def.id] = { evaluators };
     }
+    if (ledger.exceeded) {
+      console.error(
+        `Baseline generation FAILED — ${ledger.message("remaining runs were abandoned")}; not writing a partial baseline.`
+      );
+      process.exit(1);
+    }
     if (anyFailure) {
       console.error("Baseline generation FAILED — not writing an unsound baseline.");
       process.exit(1);
@@ -285,7 +378,7 @@ async function main() {
         2
       ) + "\n"
     );
-    console.log(`Candidate baseline written to ${outPath} (cost ~$${costEstimateUsd.toFixed(2)})`);
+    console.log(`Candidate baseline written to ${outPath} (cost ~$${ledger.spentUsd.toFixed(2)})`);
     process.exit(0);
   }
 
@@ -294,24 +387,27 @@ async function main() {
   const caseResults = await runPool(selected, POOL_SIZE, executeAndScore);
 
   const runtimeSeconds = (Date.now() - startedAt) / 1000;
+  const costEstimateUsd = ledger.spentUsd;
   const suite = evaluateSuite({
-    thresholds: pf.thresholds,
-    baseline: pf.baseline,
+    thresholds,
+    baseline,
     caseResults,
     newCaseIds,
     costEstimateUsd,
     scoringBackend: SCORING_BACKEND,
+    costCeilingReasons: ledger.failureReasons(),
   });
   const results = buildResults({
     runId,
     configSha,
-    baselineSha: pf.baseline.source_commit,
+    baselineSha: baseline.source_commit,
     scoringBackend: SCORING_BACKEND,
     suite,
     caseResults,
-    retiredCases: pf.retiredCases,
+    retiredCases,
     costEstimateUsd,
     runtimeSeconds,
+    configSources: gate ? { baseRef: gate.baseRef, ...gate.sources } : { baseRef: null, all: "pr-head (local/manual run)" },
   });
 
   const resultsPath = resolve(flags.results || join(BATTERY_DIR, "battery-results.json"));
