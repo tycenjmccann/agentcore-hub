@@ -33,6 +33,14 @@ export async function handler(event) {
   const result = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
   const prd = JSON.parse(await result.Body.transformToString());
 
+  // Only synthesized PRDs ({title, description}) may start a workflow. Raw eval
+  // batches (or anything else) landing on the prd/ prefix would interpolate as
+  // "[SI] undefined" and burn a full pipeline run on an empty request.
+  if (!prd.title || typeof prd.title !== "string" || !prd.description || typeof prd.description !== "string") {
+    console.error(`[prd-submitter] REJECTED ${key}: missing title/description — not a synthesized PRD (keys: ${Object.keys(prd).join(", ")})`);
+    return { statusCode: 200, body: "Rejected: not a synthesized PRD" };
+  }
+
   // Submit to workflow API
   const payload = {
     title: `[SI] ${prd.title}`,

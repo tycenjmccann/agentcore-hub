@@ -134,12 +134,12 @@ export const handler = async (event) => {
   // 5. Aggregate eval scores into DDB (for instant dashboard loads)
   await aggregateScoresToDdb(agentId, parsed);
 
-  // 6. Atomic append to sessionBuffer with size guard
+  // 6. Append to sessionBuffer, counting distinct runs toward batchSize
   const batchSize = config.batchSize || 10;
   const appended = await appendToBuffer(agentId, sessionData, batchSize);
 
   if (appended.shouldFlush) {
-    // 7. Buffer is full → flush to S3
+    // 7. Batch is full → flush to S3 + synthesize PRD
     await flushBuffer(agentId, appended.buffer, batchSize);
   }
 
@@ -170,12 +170,20 @@ async function getAgentConfig(agentId) {
 function extractSessionData(parsed) {
   const logEvents = parsed.logEvents || [];
   const sessionBuffer = [];
+  const sessionIds = new Set();
 
   for (const event of logEvents) {
     try {
       const parsedMessage = JSON.parse(event.message);
+      // session.id identifies the run (one workflow agent invocation). A single
+      // CW Logs delivery can carry several runs; we track distinct ids so the
+      // batch counts RUNS, not log deliveries.
+      const attrs = parsedMessage.attributes || {};
+      const sid = attrs['session.id'] || parsedMessage['session.id'] || null;
+      if (sid) sessionIds.add(sid);
       sessionBuffer.push({
         timestamp: event.timestamp,
+        sessionId: sid,
         evaluatorName: parsedMessage.evaluatorName || parsedMessage.name || null,
         score: parsedMessage.score ?? parsedMessage.evaluatorScore ?? null,
         evidence: parsedMessage.evidence || parsedMessage.reasoning || null,
@@ -196,92 +204,56 @@ function extractSessionData(parsed) {
     logGroup: parsed.logGroup,
     logStream: parsed.logStream,
     timestamp: new Date().toISOString(),
+    sessionIds: [...sessionIds],
     evaluatorResults: sessionBuffer,
   };
 }
 
 /**
- * Atomic append to the sessionBuffer in DDB.
- * Uses ConditionExpression to prevent exceeding batchSize.
+ * Append eval data to the buffer and track DISTINCT runs (session ids).
+ *
+ * batchSize is a count of RUNS, not log deliveries: one CloudWatch Logs delivery
+ * can carry several runs, and one run can span several deliveries. We accumulate
+ * the run's eval data in `sessionBuffer` and the distinct run ids in the
+ * `bufferSessions` string set, flushing only when batchSize distinct runs have
+ * been seen. (The old code flushed per `sessionBuffer.length`, i.e. per delivery,
+ * so it fired after ~1-2 runs instead of 10.)
+ *
  * Returns { shouldFlush: boolean, buffer: array | null }
  */
 async function appendToBuffer(agentId, sessionData, batchSize) {
-  try {
-    const result = await ddb.send(
-      new UpdateCommand({
-        TableName: TABLE,
-        Key: { agentId },
-        UpdateExpression:
-          'SET sessionBuffer = list_append(sessionBuffer, :new), lastUpdatedAt = :now',
-        ConditionExpression: 'size(sessionBuffer) < :max',
-        ExpressionAttributeValues: {
-          ':new': [sessionData],
-          ':max': batchSize,
-          ':now': new Date().toISOString(),
-        },
-        ReturnValues: 'ALL_NEW',
-      })
-    );
+  const sids = (sessionData.sessionIds || []).filter(Boolean);
 
-    const buffer = result.Attributes.sessionBuffer || [];
-    const shouldFlush = buffer.length >= batchSize;
-
-    console.log(
-      `[eval-packager] Agent ${agentId}: buffer size=${buffer.length}/${batchSize}` +
-        (shouldFlush ? ' → FLUSH' : '')
-    );
-
-    return { shouldFlush, buffer };
-  } catch (err) {
-    if (err.name === 'ConditionalCheckFailedException') {
-      // 7. Buffer was already full (race condition) — flush then retry
-      console.log(
-        `[eval-packager] Agent ${agentId}: ConditionalCheckFailedException — buffer full. Flushing and retrying.`
-      );
-      await handleOverflow(agentId, sessionData, batchSize);
-      return { shouldFlush: false, buffer: null };
-    }
-    throw err;
-  }
-}
-
-/**
- * Handle overflow: read current buffer, flush it, reset, then retry append.
- */
-async function handleOverflow(agentId, sessionData, batchSize) {
-  // Read current buffer
-  const config = await getAgentConfig(agentId);
-  const currentBuffer = config?.sessionBuffer || [];
-
-  // Flush the full buffer
-  if (currentBuffer.length > 0) {
-    await flushBuffer(agentId, currentBuffer, batchSize);
+  const expr = ['sessionBuffer = list_append(sessionBuffer, :new)', 'lastUpdatedAt = :now'];
+  const values = { ':new': [sessionData], ':now': new Date().toISOString() };
+  let updateExpression = 'SET ' + expr.join(', ');
+  if (sids.length > 0) {
+    // ADD into a string set → distinct run ids only.
+    updateExpression += ' ADD bufferSessions :sids';
+    values[':sids'] = new Set(sids);
   }
 
-  // Retry the append (buffer has been reset by flushBuffer)
-  try {
-    await ddb.send(
-      new UpdateCommand({
-        TableName: TABLE,
-        Key: { agentId },
-        UpdateExpression:
-          'SET sessionBuffer = list_append(sessionBuffer, :new), lastUpdatedAt = :now',
-        ConditionExpression: 'size(sessionBuffer) < :max',
-        ExpressionAttributeValues: {
-          ':new': [sessionData],
-          ':max': batchSize,
-          ':now': new Date().toISOString(),
-        },
-      })
-    );
-    console.log(`[eval-packager] Agent ${agentId}: retry append succeeded after overflow flush.`);
-  } catch (retryErr) {
-    console.error(
-      `[eval-packager] Agent ${agentId}: retry append failed after overflow flush:`,
-      retryErr.message
-    );
-    throw retryErr;
-  }
+  const result = await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { agentId },
+      UpdateExpression: updateExpression,
+      ExpressionAttributeValues: values,
+      ReturnValues: 'ALL_NEW',
+    })
+  );
+
+  const buffer = result.Attributes.sessionBuffer || [];
+  const runIds = result.Attributes.bufferSessions; // DynamoDBDocument unmarshals a Set
+  const runCount = runIds ? (runIds.size ?? (Array.isArray(runIds) ? runIds.length : 0)) : 0;
+  const shouldFlush = runCount >= batchSize;
+
+  console.log(
+    `[eval-packager] Agent ${agentId}: distinct runs=${runCount}/${batchSize} ` +
+      `(buffer entries=${buffer.length})` + (shouldFlush ? ' → FLUSH' : '')
+  );
+
+  return { shouldFlush, buffer };
 }
 
 /**
@@ -358,11 +330,11 @@ async function aggregateScoresToDdb(agentId, parsed) {
  *   3. Synthesize a PRD via the Fleet Improver and write it to prd/.
  *
  * The reset must happen before the (60–240s) synthesis call, not after. If it
- * came last, the buffer would stay full for the whole synthesis window — any
- * concurrent invocation for the same agent would hit the size-guard, fall into
- * handleOverflow, re-read the SAME batch, and flush it again → duplicate PRD +
- * duplicate workflow. Resetting first keeps the duplicate window at one DDB
- * write (~100ms), matching the pre-synthesis behavior.
+ * came last, the run set would stay at batchSize for the whole synthesis
+ * window — any concurrent invocation for the same agent would see
+ * shouldFlush=true, re-read the SAME batch, and flush it again → duplicate
+ * PRD + duplicate workflow. Resetting first keeps the duplicate window at one
+ * DDB write (~100ms).
  */
 async function flushBuffer(agentId, buffer, batchSize) {
   const timestamp = new Date().toISOString();
@@ -374,20 +346,22 @@ async function flushBuffer(agentId, buffer, batchSize) {
     sessions: buffer,
   };
 
-  // 1. Reset sessionBuffer in DDB FIRST — claim the batch so concurrent
-  //    invocations append into a fresh buffer instead of re-flushing this one.
+  // 1. Reset sessionBuffer AND the distinct-run set in DDB FIRST — claim the
+  //    batch so concurrent invocations append into a fresh buffer instead of
+  //    re-flushing this one.
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE,
       Key: { agentId },
-      UpdateExpression: 'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts',
+      UpdateExpression:
+        'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts REMOVE bufferSessions',
       ExpressionAttributeValues: {
         ':empty': [],
         ':ts': timestamp,
       },
     })
   );
-  console.log(`[eval-packager] Agent ${agentId}: buffer reset (batch claimed for flush).`);
+  console.log(`[eval-packager] Agent ${agentId}: buffer + run set reset (batch claimed for flush).`);
 
   // 2. Archive the raw batch (batches/ prefix — does NOT trigger prd-submitter)
   const batchKey = `${BATCH_PREFIX}/batch-${agentId}-${timestamp}.json`;
