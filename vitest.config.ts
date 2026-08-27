@@ -17,7 +17,13 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts", "evals/battery/**/*.test.ts"],
+    include: [
+      "src/**/*.test.ts",
+      "evals/battery/**/*.test.ts",
+      // Deploy-guard tests: bash subprocess + fixture repos + PATH-shimmed
+      // fake gh — still hermetic (no AWS, no network).
+      "deploy/lib/__tests__/**/*.test.ts",
+    ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
   },
