@@ -1,11 +1,22 @@
 #!/bin/bash
 # Set up AgentCore Online Evaluations for all fleet agents
-# Uses Opus 4.7 as judge model, 100% sampling, 10 evaluators per config
+# Uses Opus 4.7 as judge model, tiered sampling, 5 evaluators per config
 #
-# NOTE: API limit is 10 evaluators per config.
-#   - Ticket-creating agents (requirements_analyst, qa_verifier, ci_agent) get:
-#     9 built-in + 1 custom (dependency_chain_compliance_online) = 10
-#   - All other agents get 10 built-in evaluators
+# TEAM-3366 §2.4 load reduction: the previous 10-evaluator / 100%-sampling
+# setup drove ~10 Opus-judge calls per sampled session and throttled the
+# judge quota. Now:
+#   - 5 evaluators per config (down from 10; API limit is still 10):
+#     * All agents: Builtin.ToolSelectionAccuracy (TOOL_CALL),
+#       Builtin.InstructionFollowing, Builtin.Correctness (TRACE),
+#       Builtin.GoalSuccessRate (SESSION), plus a 5th slot —
+#     * Ticket-creating agents (requirements_analyst, qa_verifier, ci_agent):
+#       the custom dependency_chain_compliance_online evaluator (SESSION)
+#     * All other agents: Builtin.Helpfulness (TRACE)
+#     * Dropped everywhere: ToolParameterAccuracy, Coherence, Faithfulness,
+#       ResponseRelevance, Conciseness
+#   - Tiered sampling (down from a flat 100%):
+#     * Pipeline gate roles (requirements_analyst, qa_verifier, ci_agent): 100%
+#     * All other agents: 25%
 #
 # IMPORTANT: The custom evaluator must be the "_online" variant.
 #   The on-demand version (dependency_chain_compliance-VyBv7H2bCi) requires
@@ -90,8 +101,9 @@ echo "Reading agent IDs from: $FLEET_FILE"
 # The custom dependency-chain evaluator is created per-account and is NOT
 # provisioned by any deploy step in this repo (its ID is account-specific).
 # Probe for it once. If it's missing, ticket agents gracefully fall back to
-# 10 built-in evaluators (adding Conciseness) instead of emitting a config
-# that the API rejects with "Evaluators not found".
+# 5 built-in evaluators (adding Builtin.Helpfulness in the fifth slot, like
+# every other agent) instead of emitting a config that the API rejects with
+# "Evaluators not found".
 CUSTOM_EVALUATOR_AVAILABLE=false
 if AGENTCORE_SUPPRESS_RECOMMENDATION=1 agentcore eval evaluator list --max-results 100 2>/dev/null \
      | grep -q "$CUSTOM_EVALUATOR"; then
@@ -100,7 +112,7 @@ if AGENTCORE_SUPPRESS_RECOMMENDATION=1 agentcore eval evaluator list --max-resul
 else
   echo ""
   echo "⚠️  WARNING: custom evaluator '$CUSTOM_EVALUATOR' not found in this account."
-  echo "    Ticket agents will use 10 built-in evaluators (Conciseness substituted"
+  echo "    Ticket agents will use 5 built-in evaluators (Helpfulness substituted"
   echo "    for the dependency-chain check). To enable the custom evaluator, create"
   echo "    it with 'agentcore eval evaluator create' and re-run this script."
   echo ""
@@ -115,14 +127,18 @@ for name, arn in data.items():
     print(f'{name} {rid}')
 ")
 
+# TEAM-3366 §2.4: pipeline gate roles keep 100% sampling (their scores gate
+# ticket flow); everyone else drops to 25% to cut judge load.
+GATE_AGENTS="agentcore_hub_requirements_analyst agentcore_hub_qa_verifier agentcore_hub_ci_agent"
+
 AGENT_COUNT=$(echo "$AGENTS" | wc -l | tr -d ' ')
 echo "Creating online evaluation configs for ${AGENT_COUNT} agents..."
 if [ "$CUSTOM_EVALUATOR_AVAILABLE" = true ]; then
-  echo "Evaluators: 10 per agent (ticket agents get custom dependency_chain evaluator)"
+  echo "Evaluators: 5 per agent (ticket agents get custom dependency_chain evaluator)"
 else
-  echo "Evaluators: 10 built-in per agent (custom evaluator unavailable — see warning above)"
+  echo "Evaluators: 5 built-in per agent (custom evaluator unavailable — see warning above)"
 fi
-echo "Sampling: 100%"
+echo "Sampling: 100% for gate roles (requirements_analyst, qa_verifier, ci_agent), 25% otherwise"
 echo "Judge model: Opus 4.7"
 echo ""
 
@@ -134,24 +150,27 @@ while read name agent_id; do
 
   echo "→ Creating config for ${name} (${agent_id})..."
 
-  # Build the evaluator argument list. Ticket agents get the custom
-  # dependency-chain evaluator (9 built-in + 1 custom) when it's available;
-  # otherwise everyone gets the same 10 built-in evaluators.
+  # Build the evaluator argument list (TEAM-3366 §2.4: trimmed to 5). Ticket
+  # agents spend their fifth slot on the custom dependency-chain evaluator
+  # (4 built-in + 1 custom) when it's available; otherwise the fifth slot is
+  # Builtin.Helpfulness, same as every other agent.
   eval_args=(
     -e "Builtin.ToolSelectionAccuracy"
-    -e "Builtin.ToolParameterAccuracy"
     -e "Builtin.InstructionFollowing"
-    -e "Builtin.GoalSuccessRate"
     -e "Builtin.Correctness"
-    -e "Builtin.Coherence"
-    -e "Builtin.Faithfulness"
-    -e "Builtin.Helpfulness"
-    -e "Builtin.ResponseRelevance"
+    -e "Builtin.GoalSuccessRate"
   )
   if echo "$TICKET_AGENTS" | grep -qw "$name" && [ "$CUSTOM_EVALUATOR_AVAILABLE" = true ]; then
     eval_args+=(-e "${CUSTOM_EVALUATOR}")
   else
-    eval_args+=(-e "Builtin.Conciseness")
+    eval_args+=(-e "Builtin.Helpfulness")
+  fi
+
+  # Tiered sampling: gate roles at 100%, everyone else at 25%.
+  if echo "$GATE_AGENTS" | grep -qw "$name"; then
+    sampling_rate="100.0"
+  else
+    sampling_rate="25.0"
   fi
 
   # Capture output and exit status. Show the success/error lines, and on a
@@ -161,9 +180,9 @@ while read name agent_id; do
   create_out=$(agentcore eval online create \
     --agent-id "${agent_id}" \
     --name "${config_name}" \
-    --sampling-rate 100.0 \
+    --sampling-rate "${sampling_rate}" \
     "${eval_args[@]}" \
-    --description "Full evaluation suite for ${name} - 100% sampling with Opus 4.7 judge" \
+    --description "Core evaluation suite for ${name} - ${sampling_rate}% sampling with Opus 4.7 judge" \
     2>&1) && create_rc=0 || create_rc=$?
 
   echo "$create_out" | grep -E "(✓|Config ID|Status|Error)" || true

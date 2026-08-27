@@ -210,6 +210,55 @@
 
 ---
 
+## Eval judge throttling (quota)
+
+> **OPERATOR ACTION (TEAM-3366 §2.5)** — this is a one-time, account-level AWS
+> Service Quotas change run by a human operator with quota permissions. It is
+> NOT performed by CI, any deploy script, or agent code, and it is not
+> idempotent to re-request (each call opens a new support case).
+
+**Symptom**: eval results log groups fill with `ThrottlingException` from the
+Opus judge; sessions classify as `error` in eval batches; the
+`eval.batch.null_or_error_rate` metric climbs even though agent telemetry
+(`invoke_agent` spans) is healthy.
+
+**Step 1 — identify the exact quota (grep, don't guess).** Quota names vary by
+model/version, so list them and filter rather than assuming a code:
+
+```bash
+aws service-quotas list-service-quotas --service-code bedrock --output json \
+ | jq -r '.Quotas[] | select(.QuotaName|test("Opus";"i"))
+          | [.QuotaCode, .QuotaName, (.Value|tostring)] | @tsv'
+```
+
+The judge quota's expected name pattern is
+**"On-demand InvokeModel requests per minute for Anthropic Claude Opus 4.7"**.
+Record the `QuotaCode` and the current `Value` before requesting anything.
+
+**Step 2 — request an increase to 200 requests/minute.** Design derivation
+(TEAM-3366 §2.5): after the §2.4 load reduction (5 evaluators, tiered
+sampling) the judge runs at roughly ~16 RPM sustained, but two sessions
+completing simultaneously can burst to ~162 RPM — so 200 RPM gives headroom
+without over-asking:
+
+```bash
+aws service-quotas request-service-quota-increase \
+  --service-code bedrock --quota-code <QuotaCode from above> --desired-value 200
+```
+
+Track the resulting case with
+`aws service-quotas list-requested-service-quota-change-history --service-code bedrock`.
+
+**Note — shared on-demand pool.** Check whether online evaluations draw from
+the same on-demand InvokeModel pool as the fleet's own model calls: fleet
+model overrides include Opus 4.6/4.7, and if the judge and the fleet share one
+quota, the 200 RPM target must be re-derived with the fleet's RPM added on
+top. Compare the judge's throttling timestamps against fleet invocation spikes
+(or ask AWS support which quota the evaluations service consumes) before
+treating 200 as sufficient.
+
+---
+
 ## Tracing Script
 
 Use `scripts/trace-workflow.sh` to pull all logs for a workflow run in one shot.
