@@ -49,6 +49,31 @@ That span only exists if a real OTel `TracerProvider` is registered in the
 runtime — so after every deploy that touches telemetry, run both probes below.
 A green deploy with no spans still scores 0/10.
 
+### Verification gates (automated, blocking)
+
+The manual probes below are now enforced by two scripts — a deploy is not
+telemetry-verified until they pass:
+
+- **`verify-fleet.sh` span probe (blocking):** after each agent's health-check
+  invocation, the script polls that runtime's `spans` log stream (up to
+  3 × 60s) for a fresh `invoke_agent` span and **fails the deploy** if none
+  appears. Broken telemetry can no longer ship silently. Emergency bypass:
+  `SKIP_SPAN_PROBE=true` (prints a loud warning; the deploy is then NOT
+  telemetry-verified — re-verify as soon as possible).
+- **`../evaluations/canary-eval-spans.sh` (E2E canary):** one synthetic
+  invocation under a known `runtimeSessionId`, then a blocking check (≤5 min)
+  that an `invoke_agent` span carrying that `session.id` landed, plus an
+  advisory check (≤30 min, warn-only) that the online-eval results log group
+  scored the session (non-null `gen_ai.evaluation.score.value`). Run it
+  standalone (`./canary-eval-spans.sh [agent_id]`) or from `verify-fleet.sh`
+  with `RUN_EVAL_CANARY=true`.
+
+**AC2.3 (direct_code_deploy auto-instrumentation verification):** the RESULT
+for this acceptance criterion is produced by these gates at Stage-1 rollout —
+the span probe failing the deploy is the enforcement mechanism, and the
+observed outcome (which provider won, spans delivered or not) is to be
+recorded on the rollout PR when Stage-1 runs.
+
 ### 1. Startup probe — which TracerProvider won?
 
 `_init_telemetry()` in `main.py` logs exactly one `[telemetry]` line at module
