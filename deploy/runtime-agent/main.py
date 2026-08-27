@@ -254,8 +254,10 @@ REMOTE_CODING_PERSONAS = {
 }
 CLOUD_CODE_TABLE = os.getenv("CLOUD_CODE_TABLE", "agentcore-hub-cloud-code-sessions")
 # Submit and poll calls are all sub-second server-side; this only needs to cover
-# submit's workspace setup (git clone caps at 300s on a cold repo, plus config).
-REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "420"))
+# submit's worst-case workspace setup: clone (300s cap) + branch fetch (120s) +
+# checkout (60s) + config/artifact install. Submits are idempotent (turn_id is
+# client-generated), so even a timeout here can't double-run a turn.
+REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "600"))
 # Poll cadence + overall turn budget. The budget must exceed the coding
 # runtime's TURN_TIMEOUT_S (1500s) so its own timeout verdict reaches us via the
 # journal instead of us giving up first.
@@ -487,8 +489,24 @@ def _poll_once(client, turn_id: str) -> dict:
 
 
 def _submit_and_poll(client, payload: dict) -> dict:
-    """Submit one async coding turn and poll it to a terminal record."""
-    submitted = _coding_invoke(client, payload)
+    """Submit one async coding turn and poll it to a terminal record.
+
+    The turn_id is generated HERE and sent with the submit, making submission
+    idempotent: if the submit's response is lost client-side (read timeout on a
+    slow cold-clone setup) while the server accepted and started the turn, the
+    re-submit with the same id is acknowledged as a dedupe instead of running
+    the prompt a second time in the same workspace."""
+    payload = {**payload, "turn_id": f"turn-{uuid.uuid4().hex}"}
+    submitted = None
+    for attempt in (1, 2):
+        try:
+            submitted = _coding_invoke(client, payload)
+            break
+        except Exception as e:  # noqa: BLE001
+            if attempt == 2:
+                raise
+            logger.warning(f"[remote-coding] submit response lost, re-submitting "
+                           f"same turn_id (idempotent): {str(e)[:200]}")
     if submitted.get("error"):
         return submitted  # setup failure (bad repo, clone) — synchronous
     if not submitted.get("turn_id"):

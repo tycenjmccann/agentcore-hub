@@ -2199,8 +2199,22 @@ async def invocations(request: Request):
     # fail THIS call synchronously (bad repo, clone failure), which is what the
     # caller can act on.
     if payload.get("mode") == "async" and cli in ("claude", "codex"):
-        turn_id = f"turn-{uuid.uuid4().hex}"
+        # Idempotency: the caller supplies turn_id so a client-side timeout +
+        # resubmit of the same turn can't double-run it — if this id is already
+        # live (or already finished), acknowledge the existing turn instead of
+        # starting a second runner on the same workspace.
+        turn_id = payload.get("turn_id") or f"turn-{uuid.uuid4().hex}"
+        if turn_id in _ACTIVE_TURNS:
+            logger.info("turn_submit_dedupe", extra={"turn_id": turn_id})
+            return JSONResponse({"submitted": True, "turn_id": turn_id, "cli": cli,
+                                 "workspace": workdir, "deduped": True})
         journal = _turn_journal_path(session_id, turn_id)
+        # Same id journaled on EFS (this VM already ran it, possibly pre-recycle
+        # with a durable result): acknowledge, let the caller's poll collect it.
+        if os.path.exists(journal):
+            logger.info("turn_submit_dedupe_journal", extra={"turn_id": turn_id})
+            return JSONResponse({"submitted": True, "turn_id": turn_id, "cli": cli,
+                                 "workspace": workdir, "deduped": True})
         # Seed the journal BEFORE returning so an immediate poll can never see
         # "unknown" for a turn we accepted. If the seed can't be written the
         # turn must NOT start: an accepted-but-unjournaled turn polls as
