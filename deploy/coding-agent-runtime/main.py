@@ -25,6 +25,7 @@ telemetry to CloudWatch (aws/spans) so every tool call is a trace.
 """
 
 import glob
+import hashlib
 import io
 import json
 import os
@@ -47,6 +48,24 @@ from log import get_logger, redact
 
 logger = get_logger("coding-agent-runtime")
 
+
+def _safe_int_env(name: str, default: int) -> int:
+    """Parse an int env var, falling back to `default` on a malformed value.
+
+    These parses run at IMPORT time — an unguarded int('abc') would crash the
+    server before it starts, and no kill-switch can save a process that never
+    boots. A typo'd env var must degrade to the shipped default, not take the
+    runtime down."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        logger.warning("bad_int_env", extra={"var": name, "value": str(raw)[:40], "default": default})
+        return default
+
+
 # Workspace lives on the EFS mount (/mnt/efs) — elastic + POSIX + persists across
 # cold microVMs, so repo clones + node_modules don't hit the ~1 GB sessionStorage
 # cap (ENOSPC) and survive for true warm resume. deploy.py sets WORKSPACE_ROOT.
@@ -66,11 +85,11 @@ WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/mnt/efs")
 WORKSPACE_MIRROR_ENABLED = os.environ.get("WORKSPACE_MIRROR_ENABLED", "1").lower() not in ("0", "false", "no")
 MIRROR_ROOT = os.path.join(WORKSPACE_ROOT, ".mirrors")
 # Per-session checkout cap. Was 300s — too tight for a big repo on a busy mount.
-CLONE_TIMEOUT_S = int(os.environ.get("CLONE_TIMEOUT_S", "900"))
+CLONE_TIMEOUT_S = _safe_int_env("CLONE_TIMEOUT_S", 900)
 # Building a mirror is the one full download for that repo, ever — give it room.
-MIRROR_BUILD_TIMEOUT_S = int(os.environ.get("MIRROR_BUILD_TIMEOUT_S", "1200"))
+MIRROR_BUILD_TIMEOUT_S = _safe_int_env("MIRROR_BUILD_TIMEOUT_S", 1200)
 # How stale a mirror may be before a checkout refreshes it (`fetch --prune`).
-MIRROR_REFRESH_TTL_S = int(os.environ.get("MIRROR_REFRESH_TTL_S", "3600"))
+MIRROR_REFRESH_TTL_S = _safe_int_env("MIRROR_REFRESH_TTL_S", 3600)
 # Off by default: keeping the alternates link IS the win (borrowed objects are not
 # rewritten). Set 1 to copy objects into the checkout and cut the link instead.
 MIRROR_DISSOCIATE = os.environ.get("MIRROR_DISSOCIATE", "0").lower() not in ("0", "false", "no")
@@ -88,13 +107,13 @@ CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
     "CLAUDE_MODEL", "us.anthropic.claude-fable-5"
 )
 # A single coding turn can be long; cap so a wedged CLI can't pin the microVM.
-TURN_TIMEOUT_S = int(os.environ.get("TURN_TIMEOUT_S", "1500"))
+TURN_TIMEOUT_S = _safe_int_env("TURN_TIMEOUT_S", 1500)
 # Async (submit+poll) turns: journal heartbeat cadence and the staleness bar a
 # poll uses to declare a running turn dead (VM crashed mid-turn). The heartbeat
 # is written by the runner thread; 120s of silence >> one 15s beat, so a stale
 # read means the thread is gone, not slow.
-TURN_HEARTBEAT_S = int(os.environ.get("TURN_HEARTBEAT_S", "15"))
-TURN_STALE_S = int(os.environ.get("TURN_STALE_S", "120"))
+TURN_HEARTBEAT_S = _safe_int_env("TURN_HEARTBEAT_S", 15)
+TURN_STALE_S = _safe_int_env("TURN_STALE_S", 120)
 
 # Per-user coding-CLI config bundle (MCP servers, skills, custom agents, prefs).
 # The app uploads a zip under the tenant prefix (see _tenant_root); we materialize
@@ -825,9 +844,9 @@ def _checkpoint_transcript(session_id: str, workdir: str, tenant_id: str | None 
 # (untracked) or the transcript (binary), so we harvest them to S3 on checkpoint
 # and the web Artifacts tab lists them. Anything pre-staged under
 # .cloud-code/artifacts/ is always included.
-_ARTIFACT_FILE_CAP = int(os.environ.get("CC_ARTIFACT_FILE_CAP_MB", "500")) * 1024 * 1024
-_ARTIFACT_TOTAL_CAP = int(os.environ.get("CC_ARTIFACT_TOTAL_CAP_MB", "2048")) * 1024 * 1024
-_ARTIFACT_COUNT_CAP = int(os.environ.get("CC_ARTIFACT_COUNT_CAP", "200"))
+_ARTIFACT_FILE_CAP = _safe_int_env("CC_ARTIFACT_FILE_CAP_MB", 500) * 1024 * 1024
+_ARTIFACT_TOTAL_CAP = _safe_int_env("CC_ARTIFACT_TOTAL_CAP_MB", 2048) * 1024 * 1024
+_ARTIFACT_COUNT_CAP = _safe_int_env("CC_ARTIFACT_COUNT_CAP", 200)
 _MEDIA_TOKEN_RE = re.compile(
     r"(?:[A-Za-z0-9_~][A-Za-z0-9_.~/-]*)?\.(?:png|jpe?g|gif|webp|svg|bmp|tiff|heic"
     r"|mp4|mov|webm|avi|mkv|mp3|wav|aac|flac|m4a|pdf|docx|pptx|xlsx"
@@ -1018,7 +1037,7 @@ def _checkpoint_artifacts(session_id: str, workdir: str, tenant_id: str | None =
 # turn start, WORKFLOW SESSIONS ONLY: a dir is eligible only if it carries the
 # origin marker below, and the marker's mtime (refreshed every workflow turn)
 # is the last-activity record. Human sessions are never touched.
-SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "14"))
+SESSION_TTL_DAYS = _safe_int_env("SESSION_TTL_DAYS", 14)
 _GC_MARKER = os.path.join(WORKSPACE_ROOT, ".last-session-gc")
 _GC_INTERVAL_S = 6 * 3600  # at most one sweep per warm VM per 6h
 _WF_ORIGIN_MARKER = ".workflow-session"
@@ -1088,6 +1107,35 @@ def _scrub_git_url(text: str) -> str:
     before it reaches a log line or an exception. scp-style `git@host:path` has no
     `://` and is left alone (it carries no secret)."""
     return re.sub(r"(://)[^/@\s]*@", r"\1", text or "")
+
+
+def _normalize_git_url(url: str) -> str:
+    """Canonical form of a clone URL for mirror identity: credentials/userinfo
+    stripped, scheme dropped, scp-style colon folded to a path separator, host
+    lowercased, trailing slashes and .git removed. Credentialed and bare forms of
+    the SAME repo normalize identically (one shared mirror); the same owner/name
+    on DIFFERENT hosts do not."""
+    s = _scrub_git_url((url or "").strip())
+    s = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", s)
+    s = re.sub(r"^git@", "", s)          # scp form's userinfo (git@host:path)
+    s = s.replace(":", "/")
+    s = s.rstrip("/")
+    s = re.sub(r"\.git$", "", s)
+    parts = [p for p in s.split("/") if p]
+    if parts:
+        parts[0] = parts[0].lower()      # host is case-insensitive; the path isn't
+    return "/".join(parts)
+
+
+def _mirror_slug(url: str) -> str:
+    """Mirror-cache key: human-readable owner-name prefix plus a hash of the full
+    normalized URL. _slugify_repo alone keeps only the last two path components,
+    so acme/repo on github.com and on a self-hosted gitlab would collide onto ONE
+    mirror path (and its .fetched marker and .lock) — and a --reference checkout
+    would borrow the WRONG repo's object database. The hash pins the mirror to the
+    exact origin."""
+    norm = _normalize_git_url(url)
+    return f"{_slugify_repo(url)}-{hashlib.sha256(norm.encode()).hexdigest()[:12]}"
 
 
 def _is_mirror(path: str) -> bool:
@@ -1346,12 +1394,15 @@ def _ensure_workspace(repo: str | None, session_id: str | None = None,
         return wd
     os.makedirs(base, exist_ok=True)
     url = clone_url or (repo if repo.startswith(("http://", "https://", "git@")) else f"https://github.com/{repo}.git")
-    logger.info("workspace_cloning", extra={"slug": slug, "url": url.split("@")[-1]})
+    logger.info("workspace_cloning", extra={"slug": slug, "url": _scrub_git_url(url)})
     # Borrow objects from this repo's shared bare mirror when we have one. The
     # mirror is fed the credential-stripped URL so no token is ever persisted in
     # its remote config (the turn's global insteadOf rewrite supplies auth); the
-    # session clone keeps the caller's URL verbatim, exactly as before.
-    mirror = _ensure_mirror(_scrub_git_url(url), slug)
+    # session clone keeps the caller's URL verbatim, exactly as before. The mirror
+    # key is _mirror_slug (origin-hashed), NOT the workspace slug — the workspace
+    # dir name must stay stable for warm resume, while the mirror must distinguish
+    # same owner/name on different hosts.
+    mirror = _ensure_mirror(_scrub_git_url(url), _mirror_slug(url))
     if mirror:
         cmd = ["git", "clone", "--reference", mirror]
         if MIRROR_DISSOCIATE:
@@ -2307,7 +2358,7 @@ async def invocations(request: Request):
         repo = _load_session_map().get(claude_session_id, {}).get("repo")
 
     logger.info("turn_start", extra=redact(
-        {"cli": cli, "repo": repo, "resume": bool(claude_session_id),
+        {"cli": cli, "repo": _scrub_git_url(repo) if repo else repo, "resume": bool(claude_session_id),
          "stream": stream, "prompt_head": prompt[:120]}))
 
     # Workflow turns stamp their session dir (origin marker + activity mtime) so
@@ -2399,9 +2450,13 @@ async def invocations(request: Request):
                 if not can_fallback:
                     raise
                 workdir = _ensure_workspace(None, session_id)
+                # clone_url/repo can be full URLs carrying x-access-token creds,
+                # and str(exc) can echo one (git prints the remote in its errors).
                 logger.warning("workspace_clone_failed_resume_fallback",
-                               extra={"clone_url": clone_url, "repo": repo,
-                                      "error": str(exc)[:300], "workdir": workdir})
+                               extra={"clone_url": _scrub_git_url(clone_url) if clone_url else clone_url,
+                                      "repo": _scrub_git_url(repo) if repo else repo,
+                                      "error": _scrub_git_url(str(exc))[:300],
+                                      "workdir": workdir})
         # Install a ported transcript and resume it natively. On success the turn
         # runs as `claude --resume` / `codex resume` — true continuation.
         if resume_transcript and resume_session_id:
@@ -2469,7 +2524,7 @@ async def invocations(request: Request):
     # Pre-warm done: workspace cloned, branch checked out, transcript installed.
     # No CLI runs — the first real turn (on open) will be instant + warm.
     if warm:
-        logger.info("warm_done", extra={"repo": repo, "workspace": workdir,
+        logger.info("warm_done", extra={"repo": _scrub_git_url(repo) if repo else repo, "workspace": workdir,
                                         "resume_ready": resume_ready})
         return JSONResponse({"warmed": True, "workspace": workdir, "cli": cli,
                              "resume_ready": resume_ready})
