@@ -264,6 +264,19 @@ REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "600"))
 # verdict reaches us via the journal instead of us giving up first.
 REMOTE_CODING_POLL_S = int(os.getenv("REMOTE_CODING_POLL_S", "20"))
 REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "2700"))
+# Outer wall-clock deadline on ONE ENTIRE nested coding turn: submit (including
+# lost-submit recovery probes), every poll, and the single automatic vm-death
+# resubmit. The poll loop bounds each CYCLE (budget, 2x hard stop), but cycles
+# and recovery sleeps stack — worst case ran to hours of silent blocking with
+# no event emitted (TEAM-3119). The default sits above one full worst-case
+# cycle (submit read timeout + the poll loop's hard stop) so it never preempts
+# a provably-live runner; on expiry the turn fails loudly (agent.error event +
+# ERROR string to the persona) instead of pinning it. Follow-up (not here):
+# periodic agent.streaming heartbeats while a coding turn is being polled.
+REMOTE_CODING_TURN_DEADLINE_S = int(os.getenv(
+    "REMOTE_CODING_TURN_DEADLINE_S",
+    str(REMOTE_CODING_READ_TIMEOUT + 2 * REMOTE_CODING_TURN_BUDGET_S),
+))
 
 # Tenant the workflow session rows belong to. Multi-tenant deployments must set
 # this to the tenant that owns the fleet, or the Cloud Code tab (which scopes
@@ -429,7 +442,7 @@ def _coding_invoke(client, payload: dict) -> dict:
     return json.loads(resp["response"].read().decode("utf-8"))
 
 
-def _poll_coding_turn(client, turn_id: str) -> dict:
+def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None) -> dict:
     """Poll an async coding turn to its terminal state. Returns the done record
     ({response, claude_session_id, artifacts?} or {error}).
 
@@ -439,13 +452,19 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
     sub-second invocation, so wall-clock turn length no longer matters. A poll
     also confirms the microVM is alive: 'dead' (stale heartbeat) and 'unknown'
     (journal gone) both mean the turn will never finish — fail fast, don't wait
-    out the budget."""
+    out the budget.
+
+    outer_deadline is a time.monotonic() timestamp bounding the whole turn
+    (REMOTE_CODING_TURN_DEADLINE_S): unlike the budget, it is NEVER extended by
+    a live heartbeat, so a runner that reports "running" forever cannot pin the
+    persona past it (TEAM-3119)."""
     deadline = time.time() + REMOTE_CODING_TURN_BUDGET_S
     # Live heartbeats extend the deadline (terminal work is unbounded), but a
     # wedged-yet-heartbeating runner must not pin this persona forever.
     hard_stop = time.time() + 2 * REMOTE_CODING_TURN_BUDGET_S
     unknowns = 0
-    while time.time() < min(deadline, hard_stop):
+    while time.time() < min(deadline, hard_stop) and (
+            outer_deadline is None or time.monotonic() < outer_deadline):
         time.sleep(REMOTE_CODING_POLL_S)
         try:
             status = _poll_once(client, turn_id)
@@ -501,6 +520,16 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
             return final
     except Exception:  # noqa: BLE001
         pass
+    if outer_deadline is not None and time.monotonic() >= outer_deadline:
+        return {"error": f"coding turn exceeded the {REMOTE_CODING_TURN_DEADLINE_S}s "
+                         f"overall deadline with no verdict. Its work may already "
+                         f"exist and a runner may still be finishing. Do NOT re-run "
+                         f"the task and do NOT start another coding call yet: wait a "
+                         f"few minutes, then check the branch on GitHub "
+                         f"(get_file_contents / list commits) to see whether the "
+                         f"work landed before deciding anything",
+                "deadline_exceeded": True,
+                "no_retry_hint": True}
     return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget "
                      f"with no verdict. Its work may already exist and a runner "
                      f"may still be finishing. Do NOT re-run the task and do NOT "
@@ -585,7 +614,7 @@ def _recover_lost_submit(client, payload: dict):
     return None
 
 
-def _submit_and_poll(client, payload: dict) -> dict:
+def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None) -> dict:
     """Submit one async coding turn and poll it to a terminal record.
 
     The turn_id is generated HERE and sent with the submit, making submission
@@ -608,7 +637,7 @@ def _submit_and_poll(client, payload: dict) -> dict:
         # Runtime predates async mode (or ran a legacy path) and executed the
         # turn synchronously — its result is already complete.
         return submitted
-    return _poll_coding_turn(client, submitted["turn_id"])
+    return _poll_coding_turn(client, submitted["turn_id"], outer_deadline)
 
 
 def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") -> str:
@@ -667,29 +696,41 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         f"[remote-coding] {cli} turn on {_CODING_SESSION['session_id']} "
         f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')}, mode=async)"
     )
+    # One monotonic deadline for the WHOLE nested turn — submit, recovery,
+    # polls, and the automatic vm-death resubmit all check against it, so no
+    # combination of inner retries can silently block this persona past it.
+    turn_deadline = time.monotonic() + REMOTE_CODING_TURN_DEADLINE_S
     try:
         client = boto3.client(
             "bedrock-agentcore", region_name=REGION,
             config=BotocoreConfig(read_timeout=REMOTE_CODING_READ_TIMEOUT,
+                                  connect_timeout=30,
                                   retries={"max_attempts": 0}),
         )
-        result = _submit_and_poll(client, payload)
+        result = _submit_and_poll(client, payload, turn_deadline)
         # A dead/vanished verdict means the microVM recycled mid-turn — the
         # workspace and transcript are on EFS, so one automatic resubmit (same
         # conversation id) is cheap and usually completes. A second death is a
         # real failure the persona should see.
         if result.get("retryable_vm_death"):
-            logger.warning(f"[remote-coding] {result.get('error')} — resubmitting once")
-            result = _submit_and_poll(client, payload)
+            if time.monotonic() < turn_deadline:
+                logger.warning(f"[remote-coding] {result.get('error')} — resubmitting once")
+                result = _submit_and_poll(client, payload, turn_deadline)
             result.pop("retryable_vm_death", None)
     except Exception as e:  # noqa: BLE001
         # Do NOT fall back to a local CLI run: the session's workspace lives on
         # the coding runtime, and a local run would fork it (split-brain).
         logger.warning(f"[remote-coding] turn failed: {str(e)[:300]}")
+        _publish_agent_error(_CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID,
+                             f"remote {cli} turn failed: {str(e)[:300]}",
+                             ticket_id=_CURRENT_TICKET_ID)
         return (f"ERROR: remote {cli} turn failed: {str(e)[:300]}. "
                 f"Retry this same {cli} call — the session workspace is preserved.")
 
     if result.get("error"):
+        _publish_agent_error(_CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID,
+                             f"remote {cli} turn failed: {str(result['error'])[:600]}",
+                             ticket_id=_CURRENT_TICKET_ID)
         if result.get("no_retry_hint"):
             # The turn's work may already exist in the workspace — the error
             # text itself carries the verify-first instructions.
@@ -2008,26 +2049,42 @@ async def agent_invocation(payload, context):
         yield event
 
 
-def _publish_agent_error(workflow_id: str, agent_id: str, error: str) -> None:
-    """Surface a detached-run crash to the events table so the workflow board
-    and nudge system can see it (a detached task has no caller to error to)."""
+def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
+                         ticket_id: str = "") -> None:
+    """Surface a failure to the events table so the workflow board and nudge
+    system can see it — a detached-run crash (a detached task has no caller to
+    error to) or a failed nested coding-runtime handoff (TEAM-3119: those used
+    to fail silently and orphan their ticket).
+
+    Best-effort by contract: callers sit on failure paths (including inside
+    except blocks of code that must never raise), so this swallows its own
+    errors instead of letting error surfacing break the turn it reports."""
     import time as _t
-    # Random suffix on both keys: two personas failing in the same millisecond
-    # (shared-outage case) must not overwrite each other's error item. The
-    # timestamp's fractional part must stay NUMERIC — workflow-analyzer
-    # Date.parse()s it, so hex there would poison lastSignificantEventAge().
-    digits = f"{uuid.uuid4().int % 10**6:06d}"
-    _ddb_events_client.put_item(
-        TableName=_EVENTS_TABLE,
-        Item={
-            "workflowId": {"S": workflow_id},
-            "eventId": {"S": f"{int(_t.time() * 1000)}-err-{digits}"},
-            "type": {"S": "agent.error"},
-            "detail": {"M": {"agentId": {"S": agent_id}, "error": {"S": error}}},
-            "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
-                          + f".{digits}Z"},
-        },
-    )
+    try:
+        # Random suffix on both keys: two personas failing in the same millisecond
+        # (shared-outage case) must not overwrite each other's error item. The
+        # timestamp's fractional part must stay NUMERIC — workflow-analyzer
+        # Date.parse()s it, so hex there would poison lastSignificantEventAge().
+        digits = f"{uuid.uuid4().int % 10**6:06d}"
+        _ddb_events_client.put_item(
+            TableName=_EVENTS_TABLE,
+            Item={
+                "workflowId": {"S": workflow_id or "unknown"},
+                "eventId": {"S": f"{int(_t.time() * 1000)}-err-{digits}"},
+                "type": {"S": "agent.error"},
+                "detail": {"M": {
+                    "agentId": {"S": agent_id},
+                    "workflowId": {"S": workflow_id or "unknown"},
+                    "ticketId": {"S": ticket_id or ""},
+                    "error": {"S": (error or "")[:1000]},
+                }},
+                "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
+                              + f".{digits}Z"},
+            },
+        )
+        logger.info(f"[{agent_id}] Published agent.error event")
+    except Exception as e:  # noqa: BLE001 — error surfacing must never fail the turn
+        logger.warning(f"[{agent_id}] Failed to publish agent.error: {e}")
 
 
 async def _run_agent_invocation(payload, context):
