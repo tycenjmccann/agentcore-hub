@@ -39,6 +39,7 @@ import {
   openCountFrom,
   OPEN_WORKFLOW_CAP,
   RATELIMIT_PK,
+  readEnv,
   resolveScheduledTime,
   runCycle,
 } from "./index.mjs";
@@ -324,7 +325,7 @@ function makeHarness(opts = {}) {
     },
     cmd: CMD,
     async fetch(url, init) {
-      fetchCalls.push({ url, method: init?.method, body: JSON.parse(init.body) });
+      fetchCalls.push({ url, method: init?.method, headers: init?.headers || {}, body: JSON.parse(init.body) });
       return responses.length ? responses.shift() : okResponse();
     },
   };
@@ -338,7 +339,7 @@ const startPosts = (h) => h.fetchCalls.filter((c) => c.url.endsWith("/api/workfl
  * Run one cycle with the console captured — runCycle logs a summary line and a
  * warning per suppressed action, which would otherwise bury the test output.
  */
-async function runWatcher({ harness, bands, event = EVENT, nowMs = NOW_MS, requestId = "req-a" }) {
+async function runWatcher({ harness, bands, event = EVENT, nowMs = NOW_MS, requestId = "req-a", env = ENV }) {
   const logs = [];
   const original = { log: console.log, warn: console.warn, error: console.error };
   for (const level of ["log", "warn", "error"]) {
@@ -348,7 +349,7 @@ async function runWatcher({ harness, bands, event = EVENT, nowMs = NOW_MS, reque
     const summary = await runCycle({
       event,
       context: { awsRequestId: requestId },
-      env: ENV,
+      env,
       clients: harness.clients,
       nowMs,
       bands,
@@ -1380,4 +1381,28 @@ test("a filed id already visible in the GSI is not double-counted (F3)", async (
 
   assert.deepEqual(summary.rateLimit, { openCount: 2, cap: 3, allowed: 1 });
   assert.equal(startPosts(harness).length, 1, "2 open ⇒ still 1 filing allowed");
+});
+
+test("readEnv picks up ANOMALY_INTAKE_SECRET, empty when unset (TEAM-3335 F2)", () => {
+  assert.equal(readEnv({ ANOMALY_INTAKE_SECRET: "s3cret" }).intakeSecret, "s3cret");
+  assert.equal(readEnv({}).intakeSecret, "");
+});
+
+test("postStart sends x-intake-internal-secret when the secret is set (TEAM-3335 F2)", async () => {
+  const { harness, bands } = scenario({ responses: [okResponse()] });
+  await runWatcher({ harness, bands, env: { ...ENV, intakeSecret: "s3cret" } });
+
+  const posts = startPosts(harness);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].headers["x-intake-internal-secret"], "s3cret");
+});
+
+test("postStart OMITS the x-intake-internal-secret header entirely when the secret is empty (TEAM-3335 F2)", async () => {
+  const { harness, bands } = scenario({ responses: [okResponse()] });
+  // ENV carries no intakeSecret — an empty header would read as a (wrong) proof.
+  await runWatcher({ harness, bands });
+
+  const posts = startPosts(harness);
+  assert.equal(posts.length, 1);
+  assert.ok(!("x-intake-internal-secret" in posts[0].headers), "no empty header sent");
 });

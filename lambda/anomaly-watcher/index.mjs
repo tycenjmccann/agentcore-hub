@@ -559,6 +559,10 @@ export function readEnv(env = process.env) {
     analyzerFunction: env.WORKFLOW_ANALYZER_FUNCTION || "agentcore-hub-workflow-analyzer",
     eventBus: env.EVENT_BUS || "default",
     repoUrl: env.ANOMALY_REPO_URL || "",
+    // TEAM-3335 F1: proves internal origin to intake for the reserved
+    // intakeChannel "anomaly-detector". Empty ⇒ intake fails closed with a 403,
+    // which postStart treats as terminal (loud Tier-2 degrade, no retry loop).
+    intakeSecret: env.ANOMALY_INTAKE_SECRET || "",
   };
 }
 
@@ -1487,7 +1491,11 @@ async function postStart(ctx, payload) {
   try {
     const resp = await ctx.clients.fetch(`${ctx.env.workflowApiUrl}/api/workflow/start`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        // TEAM-3335 F1: omitted entirely when unset — an empty header is not a proof.
+        ...(ctx.env.intakeSecret ? { "x-intake-internal-secret": ctx.env.intakeSecret } : {}),
+      },
       body: JSON.stringify(payload),
       signal: ctrl.signal,
     });

@@ -54,6 +54,16 @@ if [ -z "$ANOMALY_REPO_URL" ] && [ -n "${GITHUB_OWNER:-}" ]; then
   ANOMALY_REPO_URL="https://github.com/${GITHUB_OWNER}/agentcore-hub.git"
 fi
 
+# TEAM-3335 F1: shared secret proving internal origin for the reserved
+# intakeChannel "anomaly-detector" on /api/workflow/start. Empty is valid but
+# degrades: intake fails closed with a 403, so Tier 3 pages "FILING FAILED"
+# instead of filing.
+ANOMALY_INTAKE_SECRET="${ANOMALY_INTAKE_SECRET:-}"
+if [ -z "$ANOMALY_INTAKE_SECRET" ]; then
+  echo "⚠ ANOMALY_INTAKE_SECRET not set — intake will reject the watcher's reserved"
+  echo "  intakeChannel with 403 and Tier 3 will page instead of filing."
+fi
+
 echo "═══════════════════════════════════════════════════════════"
 echo "  Anomaly watcher"
 echo "  Account: ${ACCOUNT_ID}"
@@ -239,7 +249,8 @@ ENVIRONMENT="{\"Variables\":{
   \"WORKFLOW_API_URL\":\"${WORKFLOW_API}\",
   \"WORKFLOW_ANALYZER_FUNCTION\":\"${ANALYZER_FUNCTION}\",
   \"EVENT_BUS\":\"${EVENT_BUS}\",
-  \"ANOMALY_REPO_URL\":\"${ANOMALY_REPO_URL}\"
+  \"ANOMALY_REPO_URL\":\"${ANOMALY_REPO_URL}\",
+  \"ANOMALY_INTAKE_SECRET\":\"${ANOMALY_INTAKE_SECRET}\"
 }}"
 
 cd "${REPO_ROOT}/lambda/anomaly-watcher" && rm -f function.zip

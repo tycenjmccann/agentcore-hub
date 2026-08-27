@@ -9,6 +9,7 @@
  * The Next.js app does NOT invoke any agents directly.
  */
 
+import { timingSafeEqual } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
@@ -25,10 +26,27 @@ const PROJECT_KEY = process.env.JIRA_PROJECT_KEY || process.env.PROJECT_KEY || "
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || "agentcore-hub-tickets";
 
+// TEAM-3335 F1: intakeChannel values reserved for internal callers. The
+// anomaly-watcher Lambda counts its fleet-wide open-filing cap via a GSI on
+// intakeChannel = "anomaly-detector", and FR-7 requires autonomous filings to be
+// audit-distinguishable from external ones — so this route (which has no auth in
+// the default AUTH_MODE=none) must not let an arbitrary caller spoof the value,
+// which would poison the cap (DoS on genuine autonomous filings) and forge
+// "autonomous" audit records. Reserved values require the shared-secret header.
+const RESERVED_INTAKE_CHANNELS = new Set(["anomaly-detector"]);
+const INTAKE_INTERNAL_SECRET_HEADER = "x-intake-internal-secret";
+
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
 });
 const lambda = new LambdaClient({ region: REGION });
+
+function secretMatches(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -40,6 +58,22 @@ export async function POST(req: NextRequest) {
 
     if (body.intakeChannel !== undefined && !/^[a-z][a-z0-9-]{1,31}$/.test(body.intakeChannel)) {
       return NextResponse.json({ error: "intakeChannel must match ^[a-z][a-z0-9-]{1,31}$" }, { status: 400 });
+    }
+
+    // TEAM-3335 F1: reserved values need proof of internal origin. FAIL CLOSED:
+    // with ANOMALY_INTAKE_SECRET unset on the server, every reserved-value request
+    // is rejected. 403 is a 4xx, which the watcher's postStart treats as terminal —
+    // a misconfiguration degrades loudly to a "FILING FAILED" page, never a silent
+    // retry loop. Requests without intakeChannel are untouched by this branch.
+    if (body.intakeChannel !== undefined && RESERVED_INTAKE_CHANNELS.has(body.intakeChannel)) {
+      const expected = process.env.ANOMALY_INTAKE_SECRET || "";
+      const provided = req.headers.get(INTAKE_INTERNAL_SECRET_HEADER) || "";
+      if (!expected || !secretMatches(provided, expected)) {
+        return NextResponse.json(
+          { error: `intakeChannel "${body.intakeChannel}" is reserved for internal callers` },
+          { status: 403 }
+        );
+      }
     }
 
     // Resolve the def from the LIVE S3 config (same doc the orchestrator runs),
