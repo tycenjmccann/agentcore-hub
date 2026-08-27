@@ -193,7 +193,7 @@ async function getAgentConfig(agentId) {
  * evaluator name, and evidence. Stores parsed results (not raw event metadata)
  * so the improver agent can synthesize actionable insights from batch payloads.
  */
-function extractSessionData(parsed) {
+export function extractSessionData(parsed) {
   const logEvents = parsed.logEvents || [];
   const sessionBuffer = [];
   const sessionIds = new Set();
@@ -211,11 +211,16 @@ function extractSessionData(parsed) {
       // gen_ai.* keys, NOT top-level fields. Reading parsedMessage.score/.evidence
       // produced all-null batches the improver couldn't synthesize from.
       const rawScore = attrs['gen_ai.evaluation.score.value'];
+      const numericScore = rawScore !== undefined && rawScore !== null ? Number(rawScore) : null;
       sessionBuffer.push({
         timestamp: event.timestamp,
         sessionId: sid,
         evaluatorName: attrs['gen_ai.evaluation.name'] || parsedMessage.evaluatorName || null,
-        score: rawScore !== undefined && rawScore !== null ? Number(rawScore) : null,
+        // Number(rawScore) coerces non-numeric garbage (e.g. "not-a-number") to
+        // NaN, and NaN !== null — that defeated classifySessions' allNull check
+        // and marked span_missing sessions as "scored". Store null instead so
+        // malformed scores participate in null/error/span_missing classification.
+        score: Number.isFinite(numericScore) ? numericScore : null,
         scoreLabel: attrs['gen_ai.evaluation.score.label'] || null,
         evidence: attrs['gen_ai.evaluation.explanation'] || parsedMessage.evidence || null,
         errorType: attrs['error.type'] || null,
@@ -355,9 +360,12 @@ async function aggregateScoresToDdb(agentId, parsed) {
       const hasError = attrs['error'] === 1 || attrs['error.type'];
 
       if (sessionId) sessions.add(sessionId);
-      if (evaluator && score !== undefined && score !== null && !hasError) {
+      const numericScore = score !== undefined && score !== null ? Number(score) : null;
+      // Number.isFinite gate: non-numeric garbage coerces to NaN, which would
+      // otherwise poison the rolling sum/count in the DDB scorecard.
+      if (evaluator && Number.isFinite(numericScore) && !hasError) {
         if (!scoreDeltas[evaluator]) scoreDeltas[evaluator] = { sum: 0, count: 0 };
-        scoreDeltas[evaluator].sum += Number(score);
+        scoreDeltas[evaluator].sum += numericScore;
         scoreDeltas[evaluator].count += 1;
       }
     } catch { /* skip */ }

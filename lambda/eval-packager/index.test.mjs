@@ -10,7 +10,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
-const { classifySessions, emitEvalMetrics } = await import('./index.mjs');
+const { classifySessions, emitEvalMetrics, extractSessionData } = await import('./index.mjs');
 
 // Minimal evaluatorResults row as extractSessionData produces it.
 const row = (sessionId, score, extra = {}) => ({
@@ -26,6 +26,26 @@ const row = (sessionId, score, extra = {}) => ({
 });
 
 const data = (evaluatorResults) => ({ evaluatorResults });
+
+// Minimal parsed CW Logs delivery, as extractSessionData consumes it: each
+// logEvent.message is a JSON OTEL log record with gen_ai.* attributes.
+const delivery = (logEvents) => ({
+  logGroup: '/aws/bedrock-agentcore/evaluations/results/eval_requirements_analyst-test',
+  logStream: 'test-stream',
+  logEvents,
+});
+
+const logEvent = (sessionId, scoreValue, extraAttrs = {}) => ({
+  timestamp: 1756250000000,
+  message: JSON.stringify({
+    attributes: {
+      'session.id': sessionId,
+      'gen_ai.evaluation.name': 'Builtin.Correctness',
+      'gen_ai.evaluation.score.value': scoreValue,
+      ...extraAttrs,
+    },
+  }),
+});
 
 test('all-null scores with no errorType → span_missing', () => {
   const { statuses, total, spanMissing } = classifySessions(
@@ -97,6 +117,16 @@ test('parseError rows and rows without sessionId are ignored', () => {
   );
   assert.equal(total, 0);
   assert.equal(spanMissing, 0);
+});
+
+test('non-numeric garbage score with no errorType → span_missing, not scored (TEAM-3315)', () => {
+  const sessionData = extractSessionData(
+    delivery([logEvent('s1', 'not-a-number'), logEvent('s1', 'NaN')])
+  );
+  const { statuses, total, spanMissing } = classifySessions(sessionData);
+  assert.equal(statuses.get('s1'), 'span_missing');
+  assert.equal(total, 1);
+  assert.equal(spanMissing, 1);
 });
 
 test('session with some null and some numeric scores → scored', () => {
