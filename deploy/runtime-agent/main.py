@@ -171,40 +171,61 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentcore-hub-pipeline-agent")
 
-# --- Telemetry (R1): make strands emit gen_ai.operation.name=invoke_agent spans ---
-# direct_code_deploy runs plain `python main.py` (no opentelemetry-instrument
-# wrapper — see DEPLOY.md Gotcha #3), so nothing else configures a TracerProvider.
-# Without this block, strands' tracer binds to the no-op ProxyTracerProvider and
-# AgentCore online evaluations see zero invoke_agent spans.
-# Module top-level runs once per process; warm-microVM invokes reuse the module
-# and never re-execute this. _TELEMETRY makes that once-only contract explicit.
-# (StrandsTelemetry.__init__ is NOT idempotent: a second call creates a new
-# provider that the OTel API refuses to install globally, leaving its exporter
-# attached to an orphan provider that receives no spans — silent span loss.)
-# Span DELIVERY half of the fix (force_flush before microVM freeze) lives in
+# Span EMISSION half of the telemetry fix (R1) is the init block below; the
+# span DELIVERY half (force_flush before microVM freeze) lives in
 # _run_agent_invocation's finally block — see the comment there (R5).
-_TELEMETRY = None
-try:
-    from opentelemetry import trace as _trace_api
-    from opentelemetry.sdk.trace import TracerProvider as _SDKTracerProvider
+# --- OTel telemetry init (TEAM-3102) ---------------------------------------
+# Under the Dockerfile's `opentelemetry-instrument` wrapper, ADOT's
+# aws_configurator has ALREADY installed the global TracerProvider + OTLP
+# pipeline before this module imports. Strands' Tracer binds the global
+# provider (strands/telemetry/tracer.py:119), so in that case we must attach
+# NOTHING — a no-arg StrandsTelemetry() would log "Overriding of current
+# TracerProvider is not allowed", orphan its own provider, and clobber the
+# baggage,xray,tracecontext propagators (drops session.id stamping).
+# The StrandsTelemetry fallback exists only for bare `python main.py`.
 
-    if isinstance(_trace_api.get_tracer_provider(), _SDKTracerProvider):
-        # A real provider already exists (e.g. ADOT auto-instrumentation in a
-        # container deploy). Strands uses the global provider automatically;
-        # adding our own OTLP exporter here would double-export every span.
-        _TELEMETRY = "external-provider"
-        logger.info("Telemetry: reusing existing global TracerProvider")
-    else:
-        from strands.telemetry import StrandsTelemetry
-        _TELEMETRY = StrandsTelemetry()          # creates + sets global provider
-        _TELEMETRY.setup_otlp_exporter()          # BatchSpanProcessor + OTLP/HTTP
-        logger.info(
-            "Telemetry: StrandsTelemetry initialized (OTLP endpoint env: %s)",
-            os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-            or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "<default localhost:4318>",
+_TELEMETRY_INITIALIZED = False
+
+
+def _init_telemetry() -> None:
+    global _TELEMETRY_INITIALIZED
+    if _TELEMETRY_INITIALIZED:
+        return
+    # TEAM-3313: this runs at module import — any exception here would abort
+    # the import before `app = BedrockAgentCoreApp()` and turn a telemetry
+    # failure into a total agent outage. Swallow and log instead.
+    try:
+        from opentelemetry import trace as _otel_trace_api
+
+        provider = _otel_trace_api.get_tracer_provider()
+        if hasattr(provider, "add_span_processor"):
+            # Real SDK provider → opentelemetry-instrument/ADOT own the pipeline.
+            logger.info(
+                "telemetry: ADOT-managed TracerProvider active (%s) — Strands "
+                "invoke_agent spans attach to it; no local exporter added",
+                type(provider).__name__,
+            )
+        else:
+            from strands.telemetry import StrandsTelemetry
+
+            StrandsTelemetry().setup_otlp_exporter()
+            logger.info(
+                "telemetry: no SDK TracerProvider found — StrandsTelemetry "
+                "fallback provider + OTLP exporter installed"
+            )
+    except Exception:
+        logger.warning(
+            "telemetry: init failed — continuing without telemetry",
+            exc_info=True,
         )
-except Exception as _tel_err:  # noqa: BLE001 — telemetry must never break startup (R1.4)
-    logger.warning(f"Telemetry init failed (non-fatal, continuing without tracing): {_tel_err}")
+    finally:
+        # Mark initialized even on failure: a retry would run against
+        # partially-mutated global OTel state, so one attempt only.
+        _TELEMETRY_INITIALIZED = True
+
+
+_init_telemetry()
+# ---------------------------------------------------------------------------
 
 # Per-invocation prompt cache for shared-runtime topologies (1 or 4 runtimes
 # hosting many personas). First call for an agent_id reads
@@ -2288,6 +2309,8 @@ async def _run_agent_invocation(payload, context):
             "session.id": _session_id,
             "workflow.id": workflow_id,
             "agent.id": agent_id,
+            "gen_ai.agent.id": agent_id,
+            "ticket.id": _CURRENT_TICKET_ID,
         }.items() if v}
         completion_gate = _CompletionGate()
         agent = Agent(

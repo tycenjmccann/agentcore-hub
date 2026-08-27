@@ -1,0 +1,28 @@
+{
+  "AlarmName": "agentcore-hub-eval-span-missing-ratio",
+  "AlarmDescription": "More than 50% of eval sessions have no invoke_agent span (all evaluator scores null with no error.type). Fires on 3 of 4 hourly datapoints. INSUFFICIENT_DATA when no eval sessions arrive.",
+  "ActionsEnabled": true,
+  "EvaluationPeriods": 4,
+  "DatapointsToAlarm": 3,
+  "Threshold": 0.5,
+  "ComparisonOperator": "GreaterThanThreshold",
+  "TreatMissingData": "missing",
+  "Metrics": [
+    {
+      "Id": "missing",
+      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsSpanMissing\"', 'Sum', 3600))",
+      "ReturnData": false
+    },
+    {
+      "Id": "total",
+      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 3600))",
+      "ReturnData": false
+    },
+    {
+      "Id": "ratio",
+      "Expression": "missing / total",
+      "Label": "span_missing ratio (fleet)",
+      "ReturnData": true
+    }
+  ]
+}
