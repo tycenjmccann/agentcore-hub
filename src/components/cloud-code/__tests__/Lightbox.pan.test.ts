@@ -243,6 +243,13 @@ function mouseDrag(
 const wheel = (deltaY: number) => fire("onWheel", { deltaY, preventDefault: () => {} });
 const doubleClick = () => fire("onDoubleClick", {});
 
+// Full one-finger touch pan as a browser would deliver it: start, move, end.
+function touchDrag(from: { x: number; y: number }, to: { x: number; y: number }) {
+  fire("onTouchStart", touchEv([{ x: from.x, y: from.y }]));
+  fire("onTouchMove", touchEv([{ x: to.x, y: to.y }]));
+  fire("onTouchEnd", touchEv([]));
+}
+
 // Genuine (drag-free) double-click: two clean clicks then the dblclick event.
 function genuineDoubleClick() {
   clickImage();
@@ -398,6 +405,64 @@ describe("Lightbox pan clamping (FR-2, two aspect ratios per AC-2.6)", () => {
     expect(transformState().tx).not.toBe(0);
     wheel(10_000); // → clamped to 1
     expect(transformState()).toEqual({ tx: 0, ty: 0, scale: 1 });
+  });
+});
+
+describe("Lightbox one-finger touch pan (FR-3)", () => {
+  it("AC-3.2: touch move at scale=1 does not move the image, and the swipe's lastTap clear stops a following quick tap from toggling zoom", () => {
+    mount(BASE);
+    fire("onTouchStart", touchEv([{ x: 100, y: 100 }]));
+    fire("onTouchMove", touchEv([{ x: 160, y: 100 }])); // 60px, well over the 5px threshold
+    expect(transformState()).toEqual({ tx: 0, ty: 0, scale: 1 });
+    fire("onTouchEnd", touchEv([]));
+
+    // A quick tap right after the swipe must not pair with the swipe's start
+    // to register as the second tap of a double-tap (Lightbox.tsx ~163-167
+    // clears lastTap.current on the swipe precisely to prevent this).
+    now += 100;
+    fire("onTouchStart", touchEv([{ x: 160, y: 100 }]));
+    fire("onTouchEnd", touchEv([]));
+    expect(transformState().scale).toBe(1);
+  });
+
+  it("AC-3.3: a second finger landing during an in-progress one-finger pan hands control to pinch", () => {
+    mount(BASE);
+    genuineDoubleClick(); // 2.5x
+
+    // One-finger pan in progress.
+    fire("onTouchStart", touchEv([{ x: 400, y: 300 }]));
+    fire("onTouchMove", touchEv([{ x: 430, y: 300 }])); // dx 30, well within clamp
+    expect(transformState()).toMatchObject({ tx: 30, ty: 0, scale: 2.5 });
+
+    // Second finger lands — re-entry into onTouchStart with 2 touches (Lightbox.tsx
+    // ~118-124) switches gesture mode from "pan" to "pinch".
+    fire("onTouchStart", touchEv([{ x: 100, y: 100 }, { x: 200, y: 100 }])); // dist 100
+    fire("onTouchMove", touchEv([{ x: 100, y: 100 }, { x: 250, y: 100 }])); // dist 150 → ×1.5
+    expect(transformState()).toMatchObject({ tx: 30, ty: 0, scale: 3.75 });
+
+    // Further two-finger movement that preserves the pinch distance (no zoom
+    // change) but shifts finger 1's absolute position a long way — if 1:1
+    // finger-1 pan tracking were still active this would move tx, but pan
+    // mode was replaced by pinch, so tx/ty stay governed by the pinch branch.
+    fire("onTouchMove", touchEv([{ x: 300, y: 100 }, { x: 450, y: 100 }])); // dist still 150
+    expect(transformState()).toMatchObject({ tx: 30, ty: 0, scale: 3.75 });
+
+    fire("onTouchEnd", touchEv([]));
+  });
+
+  it("AC-3.1: one-finger touch pan tracks the finger 1:1 while movement stays within the clamp bounds", () => {
+    mount(BASE);
+    genuineDoubleClick(); // 2.5x → maxX 500 / maxY 400; deltas below stay well inside
+    touchDrag({ x: 400, y: 300 }, { x: 460, y: 340 }); // diagonal
+    expect(transformState()).toMatchObject({ tx: 60, ty: 40 });
+    touchDrag({ x: 400, y: 300 }, { x: 300, y: 300 }); // left
+    expect(transformState()).toMatchObject({ tx: -40, ty: 40 });
+    touchDrag({ x: 400, y: 300 }, { x: 400, y: 200 }); // up
+    expect(transformState()).toMatchObject({ tx: -40, ty: -60 });
+    touchDrag({ x: 400, y: 300 }, { x: 400, y: 400 }); // down
+    expect(transformState()).toMatchObject({ tx: -40, ty: 40 });
+    touchDrag({ x: 400, y: 300 }, { x: 500, y: 300 }); // right
+    expect(transformState()).toMatchObject({ tx: 60, ty: 40 });
   });
 });
 
