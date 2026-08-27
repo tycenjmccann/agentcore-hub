@@ -2012,18 +2012,20 @@ def _publish_agent_error(workflow_id: str, agent_id: str, error: str) -> None:
     """Surface a detached-run crash to the events table so the workflow board
     and nudge system can see it (a detached task has no caller to error to)."""
     import time as _t
-    # uuid suffix on both keys: two personas failing in the same millisecond
-    # (shared-outage case) must not overwrite each other's error item.
-    suffix = uuid.uuid4().hex[:8]
+    # Random suffix on both keys: two personas failing in the same millisecond
+    # (shared-outage case) must not overwrite each other's error item. The
+    # timestamp's fractional part must stay NUMERIC — workflow-analyzer
+    # Date.parse()s it, so hex there would poison lastSignificantEventAge().
+    digits = f"{uuid.uuid4().int % 10**6:06d}"
     _ddb_events_client.put_item(
         TableName=_EVENTS_TABLE,
         Item={
             "workflowId": {"S": workflow_id},
-            "eventId": {"S": f"{int(_t.time() * 1000)}-err-{suffix}"},
+            "eventId": {"S": f"{int(_t.time() * 1000)}-err-{digits}"},
             "type": {"S": "agent.error"},
             "detail": {"M": {"agentId": {"S": agent_id}, "error": {"S": error}}},
             "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
-                          + f".{suffix}Z"},
+                          + f".{digits}Z"},
         },
     )
 
