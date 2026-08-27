@@ -1729,6 +1729,14 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
 # by the next poll off the shared EFS.
 
 
+# Authoritative liveness for turns on THIS microVM. Session affinity routes a
+# session's polls to the same VM as its submits, so membership here is ground
+# truth for "the runner thread is still executing" — independent of EFS, whose
+# write failures can make a journal look stale while the CLI is alive. A VM
+# recycle empties it, which is precisely the case where "dead" is true.
+_ACTIVE_TURNS: dict = {}
+
+
 def _turn_journal_path(session_id: str | None, turn_id: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]", "-", turn_id)[:80]
     return os.path.join(_session_dir(session_id), ".turns", f"{safe}.json")
@@ -1761,6 +1769,14 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
     bookkeeping), heartbeat the journal while it runs, then journal the terminal
     frame. The generator's SSE framing is an implementation detail here — we
     consume frames directly, no HTTP involved."""
+    # Prune finished entries older than an hour so a long-lived VM doesn't
+    # accumulate every done record it ever served.
+    cutoff = int(time.time()) - 3600
+    for tid in [t for t, r in _ACTIVE_TURNS.items()
+                if r.get("status") == "done" and int(r.get("finished_at") or 0) < cutoff]:
+        _ACTIVE_TURNS.pop(tid, None)
+    _ACTIVE_TURNS[turn_id] = {"status": "running", "turn_id": turn_id, "cli": cli,
+                              "started_at": int(time.time())}
     beat = {"status": "running", "turn_id": turn_id, "cli": cli,
             "started_at": int(time.time()), "heartbeat": int(time.time())}
     stop_beating = threading.Event()
@@ -1830,32 +1846,46 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
     else:
         logger.error("turn_done_write_failed", extra={"turn_id": turn_id})
     stop_beating.set()
+    # Keep the result reachable in memory even if EFS never accepted the done
+    # record — a poll on this VM serves it from here (see _poll_turn).
+    _ACTIVE_TURNS[turn_id] = done
     logger.info("turn_done", extra={"cli": cli, "chars": len(done["response"]),
                                     "async": True, "turn_id": turn_id})
 
 
 def _poll_turn(session_id: str | None, turn_id: str) -> dict:
-    """Read a turn's journal and classify it. Read-only — a poll can never touch
-    the CLI process or start work."""
+    """Classify a turn. Read-only — a poll can never touch the CLI process or
+    start work.
+
+    Order of authority: the in-process _ACTIVE_TURNS table first (session
+    affinity means a live runner is on THIS VM — its word beats any EFS state,
+    including a journal gone stale because EFS write attempts are failing while
+    the CLI is alive), then the EFS journal (which is what survives a VM
+    recycle — the case where 'dead'/'unknown' verdicts are actually true)."""
+    live = _ACTIVE_TURNS.get(turn_id)
+    if live is not None:
+        if live.get("status") == "done":
+            return live  # terminal result, even if EFS never accepted it
+        return {"status": "running", "turn_id": turn_id, "source": "memory"}
     journal = _turn_journal_path(session_id, turn_id)
     try:
         with open(journal) as f:
             record = json.load(f)
     except FileNotFoundError:
-        # Journal never appeared: the submit's runner thread died before its
-        # first write, or the VM recycled pre-write. Either way the turn is gone.
+        # Not in memory and no journal: the VM recycled before the seed was
+        # durable, or the runner died pre-write. Either way the turn is gone.
         return {"status": "unknown", "turn_id": turn_id}
     except (OSError, json.JSONDecodeError) as exc:
         # Degraded EFS read or a torn read racing the tmp+rename — the turn may
-        # well still be running. NOT death: callers must keep polling, never
-        # resubmit off this (a resubmit against a live runner would execute the
-        # same task twice in one workspace).
+        # well still be running on another incarnation's clock. NOT death:
+        # callers must keep polling, never resubmit off this.
         return {"status": "transient", "turn_id": turn_id, "detail": str(exc)[:200]}
     if record.get("status") == "running":
+        # Journal says running but the turn is NOT in this VM's memory: with
+        # session affinity that means the VM restarted mid-turn. The stale bar
+        # guards the brief window where a poll raced the submit on a healthy VM.
         age = int(time.time()) - int(record.get("heartbeat") or 0)
         if age > TURN_STALE_S:
-            # Beats stopped but no done record: the runner (or the whole VM)
-            # died mid-turn. Definitive — the thread can't resume.
             return {"status": "dead", "turn_id": turn_id, "stale_s": age}
         return {"status": "running", "turn_id": turn_id, "heartbeat_age_s": age}
     return record  # done record verbatim (response / error / artifacts)
