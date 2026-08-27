@@ -140,6 +140,19 @@ describe("judge prompt construction", () => {
     expect(req.system[0].text).toContain('"score"');
   });
 
+  it("tells the judge to treat harness stub results as the agent's ground-truth observations", () => {
+    const req = buildJudgeRequest({
+      evaluator: "Builtin.Correctness",
+      caseDef: CASE_DEF,
+      runResult: RUN_RESULT,
+      repoRoot: REPO_ROOT,
+    });
+    const text = req.messages[0].content[0].text;
+    expect(text).toContain("## Harness note (hermetic battery)");
+    expect(text).toContain("[battery-stub]");
+    expect(text).toContain("citing them as evidence is correct");
+  });
+
   it("renders the pinned persona contract as a reference section for every evaluator", () => {
     const caseDef = {
       ...CASE_DEF,

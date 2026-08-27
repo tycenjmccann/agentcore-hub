@@ -127,6 +127,20 @@ function renderConversation(messages) {
 function renderContext(caseDef, runResult) {
   const trajectory = runResult.trajectory.map((t) => ({ tool: t.tool, args: t.args }));
   const parts = [
+    // Without this note, contract-aware judges discount stub tool results as
+    // "fabricated evidence" and penalize a STOCK agent for citing them —
+    // masking real deltas (TEAM-3352). The harness owns the stubbing; the
+    // judge owns the agent's behavior.
+    `## Harness note (hermetic battery)\n` +
+      `This session ran inside a hermetic test harness: every tool result is a canned stand-in ` +
+      `produced by the harness (marked "[battery-stub]" where applicable) — no real repository, ` +
+      `build, or ticket system exists. For evaluation purposes, treat tool results as the ground ` +
+      `truth the agent actually observed: reported exit codes, test outcomes, and ticket ids are ` +
+      `real observations from the agent's perspective, and citing them as evidence is correct ` +
+      `behavior. Judge the AGENT — what it did, checked, concluded, and reported given those ` +
+      `observations — never the realism or vagueness of the harness's canned outputs. An agent ` +
+      `that skipped gathering observations, or whose claims contradict its observations or the ` +
+      `provided inputs, is still fully accountable for that.`,
     `## Task given to the agent\n${caseDef.taskPrompt}`,
     `## Session conversation\n${renderConversation(runResult.messages)}`,
     `## Actual tool trajectory (ordered)\n${JSON.stringify(trajectory, null, 2)}`,
