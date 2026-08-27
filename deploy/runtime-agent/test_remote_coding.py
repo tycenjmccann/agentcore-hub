@@ -197,6 +197,27 @@ class BufferedBody:
         return self._data
 
 
+class WedgedBufferedBody:
+    """Fake buffered (non-SSE) body whose read() wedges — blocks well past any
+    configured deadline without returning (TEAM-3261 F1: the bare .read() on
+    the non-SSE fallback had no wall-clock deadline, only botocore's
+    per-socket-read timeout, which does not reliably fire on a wedged stream).
+    Time-bounded like SilentBody for suite safety."""
+
+    def __init__(self, max_seconds=8.0):
+        self._max_seconds = max_seconds
+        self._closed_event = threading.Event()
+        self.closed = False
+
+    def read(self):
+        self._closed_event.wait(timeout=self._max_seconds)
+        return b"{}"
+
+    def close(self):
+        self.closed = True
+        self._closed_event.set()
+
+
 class TestDrainCodingSseDeadline(unittest.TestCase):
     """Tests A + B — the core silent-hang regression."""
 
@@ -427,6 +448,92 @@ class TestRemoteCodingTurnSurfacesErrors(unittest.TestCase):
         self.assertIn("(deadline)", box["out"])
         self._assert_agent_error_published(events_client, "(deadline)")
         self._assert_span_marked_error("(deadline)")
+
+    def test_wedged_buffered_read_end_to_end(self):
+        """TEAM-3261 F1: a buffered (non-SSE) handoff response whose read()
+        wedges forever must terminate within the wall-clock deadline, publish
+        agent.error, and mark the span ERROR — the bare .read() fallback was
+        bounded only by botocore's per-socket-read timeout, the same
+        TEAM-3168 silent-hang class on a narrower path."""
+        body = WedgedBufferedBody()
+        fake_client = mock.MagicMock()
+        fake_client.invoke_agent_runtime.return_value = {
+            "contentType": "application/json",
+            "response": body,
+        }
+        events_client = mock.MagicMock()
+        box = {}
+
+        def run():
+            with mock.patch.object(main.boto3, "client", return_value=fake_client), \
+                 mock.patch.object(main, "_ddb_events_client", events_client), \
+                 mock.patch.object(main, "REMOTE_CODING_TURN_DEADLINE_S", 1):
+                box["out"] = main._remote_coding_turn("do the thing", "claude")
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+
+        self.assertFalse(
+            worker.is_alive(),
+            "_remote_coding_turn is still blocked on a wedged buffered read — "
+            "no wall-clock deadline on the non-SSE fallback (TEAM-3261 F1, "
+            "TEAM-3168 silent-hang class)",
+        )
+        self.assertTrue(box["out"].startswith("ERROR: remote claude turn failed:"))
+        self.assertIn("(deadline)", box["out"])
+        self._assert_agent_error_published(events_client, "(deadline)")
+        self._assert_span_marked_error("(deadline)")
+        self.assertTrue(
+            body.closed,
+            "buffered body was not closed on deadline expiry — the reader "
+            "thread stays blocked",
+        )
+
+
+class TestRemoteCodingTimerInvariant(unittest.TestCase):
+    """TEAM-3261 F2 — startup guard on the remote-coding timer layering:
+    coding-runtime TURN_TIMEOUT_S < REMOTE_CODING_IDLE_TIMEOUT_S <
+    REMOTE_CODING_TURN_DEADLINE_S. Violations warn loudly, never crash."""
+
+    def test_turn_timeout_at_or_above_idle_warns(self):
+        with self.assertLogs(main.logger, level="WARNING") as logs:
+            ok = main._validate_remote_coding_timers(
+                turn_timeout_s=2000, idle_timeout_s=1560, turn_deadline_s=1800)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("TIMER INVARIANT VIOLATED" in m and "2000" in m
+                and "TURN_TIMEOUT_S" in m for m in logs.output),
+            f"no loud warning naming the offending values: {logs.output}",
+        )
+
+    def test_idle_at_or_above_deadline_warns(self):
+        with self.assertLogs(main.logger, level="WARNING") as logs:
+            ok = main._validate_remote_coding_timers(
+                turn_timeout_s=1500, idle_timeout_s=1900, turn_deadline_s=1800)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("TIMER INVARIANT VIOLATED" in m and "1900" in m
+                and "REMOTE_CODING_TURN_DEADLINE_S" in m for m in logs.output),
+            f"no loud warning naming the offending values: {logs.output}",
+        )
+
+    def test_default_layering_is_quiet(self):
+        with mock.patch.object(main.logger, "warning") as warn:
+            ok = main._validate_remote_coding_timers(
+                turn_timeout_s=1500, idle_timeout_s=1560, turn_deadline_s=1800)
+        self.assertTrue(ok)
+        warn.assert_not_called()
+
+    def test_env_driven_turn_timeout_violation_warns(self):
+        """The guard reads TURN_TIMEOUT_S from env (same default 1500 the
+        coding runtime uses) when no explicit args are given."""
+        with mock.patch.dict(os.environ, {"TURN_TIMEOUT_S": "2000"}), \
+             self.assertLogs(main.logger, level="WARNING") as logs:
+            ok = main._validate_remote_coding_timers()
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("TURN_TIMEOUT_S" in m and "2000" in m for m in logs.output))
 
 
 class TestDoneThenWedgedTailSalvage(unittest.TestCase):
