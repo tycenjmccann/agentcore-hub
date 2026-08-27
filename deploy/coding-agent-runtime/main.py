@@ -1445,6 +1445,18 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
 
     proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+    # Same watchdog as _stream_codex: the loop blocks on readline, so a wedged
+    # claude (or a command it spawned holding stdout) would pin the microVM
+    # HealthyBusy forever — and now that workflow personas ride this path, it
+    # would strand their agent-task claim too. Kill at the cap so the loop
+    # unwinds and a terminal frame reaches the caller.
+    timed_out = threading.Event()
+
+    def _kill_on_timeout():
+        timed_out.set()
+        proc.kill()
+    watchdog = threading.Timer(TURN_TIMEOUT_S, _kill_on_timeout)
+    watchdog.start()
     new_session_id: str | None = claude_session_id
     full_text: list[str] = []
     block_has_text = False  # did the current text block emit anything?
@@ -1487,6 +1499,13 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     except Exception as exc:  # noqa: BLE001
         yield sse({"type": "error", "error": str(exc)[:600]})
         return
+    finally:
+        watchdog.cancel()
+    if timed_out.is_set():
+        err = f"claude timed out after {TURN_TIMEOUT_S}s"
+        yield sse({"type": "error", "error": err})
+        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": new_session_id})
+        return
     if proc.returncode not in (0, None):
         err = (proc.stderr.read() or "")[:600] if proc.stderr else ""
         yield sse({"type": "error", "error": f"claude exited {proc.returncode}: {err}"})
@@ -1507,6 +1526,7 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     done = {"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id}
     if artifact_keys:
         done["artifacts"] = artifact_keys
+    logger.info("turn_done", extra={"cli": "claude", "chars": len(done["response"]), "stream": True})
     yield sse(done)
 
 
@@ -1674,13 +1694,18 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
     # Terminal auto-resumes this codex conversation server-side.
     if thread_id:
         _write_resume_launch_hint(workdir, thread_id, session_id, cli="codex")
+    artifact_keys: list = []
     try:
-        _sync_turn_artifacts(session_id, workdir, tenant_id)
+        artifact_keys = _sync_turn_artifacts(session_id, workdir, tenant_id).get("keys") or []
     except Exception as exc:  # noqa: BLE001
         logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
-    yield sse({"type": "done",
-               "response": "".join(reply_parts) if emitted_any_reply else "",
-               "claude_session_id": thread_id})
+    done = {"type": "done",
+            "response": "".join(reply_parts) if emitted_any_reply else "",
+            "claude_session_id": thread_id}
+    if artifact_keys:
+        done["artifacts"] = artifact_keys
+    logger.info("turn_done", extra={"cli": "codex", "chars": len(done["response"]), "stream": True})
+    yield sse(done)
 
 
 # ─── Server ───────────────────────────────────────────────────────────────────

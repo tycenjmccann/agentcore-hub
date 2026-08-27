@@ -407,6 +407,39 @@ def _maybe_resume_session(resume_session: str) -> None:
         logger.warning(f"[remote-coding] session lookup failed (non-fatal): {e}")
 
 
+def _drain_coding_sse(body) -> dict:
+    """Consume the coding runtime's SSE stream to completion and return the
+    terminal frame as a result dict (same shape as the buffered JSON path).
+
+    Frames: data: {"type": "text", ...} progress deltas (discarded — the full
+    text rides the done frame), data: {"type": "error", ...}, and a final
+    data: {"type": "done", "response": ..., "claude_session_id": ...,
+    "artifacts": [...]}. An error frame followed by no done frame is a failed
+    turn; text frames flowing keep both runtimes' invocations alive."""
+    result: dict = {}
+    last_error = ""
+    for raw in body.iter_lines():
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+        if not line.startswith("data:"):
+            continue
+        try:
+            frame = json.loads(line[5:].strip())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        ftype = frame.get("type")
+        if ftype == "error":
+            last_error = str(frame.get("error") or "")[:400]
+        elif ftype == "done":
+            result = frame
+    if not result:
+        return {"error": last_error or "stream ended without a done frame"}
+    if last_error and not (result.get("response") or "").strip():
+        result["error"] = last_error
+    return result
+
+
 def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") -> str:
     """Run one coding turn on the Cloud Code runtime. Returns the CLI's text
     response with a session footer, or an ERROR string (never raises).
@@ -449,9 +482,16 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         if _CODING_SESSION.get("clone_url"):
             payload["clone_url"] = _CODING_SESSION["clone_url"]
 
+    # Stream the turn (SSE) instead of one silent blocking read: a synchronous
+    # InvokeAgentRuntime is hard-capped at ~15 min and killed WITHOUT an error —
+    # every coding turn that crossed the cap died silently and stranded its
+    # persona mid-tool (stuck-fleet postmortem 2026-08-27). Streaming invocations
+    # get the platform's long budget, and the frames double as liveness.
+    payload["stream"] = True
+
     logger.info(
         f"[remote-coding] {cli} turn on {_CODING_SESSION['session_id']} "
-        f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')})"
+        f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')}, stream=True)"
     )
     try:
         client = boto3.client(
@@ -463,9 +503,14 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
             agentRuntimeArn=CODING_AGENT_RUNTIME_ARN,
             runtimeSessionId=_CODING_SESSION["session_id"],
             payload=json.dumps(payload).encode("utf-8"),
+            accept="text/event-stream",
         )
-        body = resp["response"].read().decode("utf-8")
-        result = json.loads(body)
+        if "text/event-stream" in (resp.get("contentType") or ""):
+            result = _drain_coding_sse(resp["response"])
+        else:
+            # Early failures (bad payload, workspace-fatal) come back as plain
+            # JSON even when streaming was requested.
+            result = json.loads(resp["response"].read().decode("utf-8"))
     except Exception as e:  # noqa: BLE001
         # Do NOT fall back to a local CLI run: the session's workspace lives on
         # the coding runtime, and a local run would fork it (split-brain).
