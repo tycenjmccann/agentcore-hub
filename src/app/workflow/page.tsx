@@ -445,6 +445,7 @@ export default function WorkflowPage() {
         open={chatOpen}
         onClose={() => { setChatOpen(false); setChatSeedWorkflowId(null); }}
         selectedWorkflowId={selectedId}
+        selectedWorkflowPhase={workflows.find((w) => w.id === selectedId)?.phase ?? null}
         seedWorkflowId={chatSeedWorkflowId}
       />
 

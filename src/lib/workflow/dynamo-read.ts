@@ -9,6 +9,7 @@ import { DynamoDBDocumentClient, GetCommand, QueryCommand, ScanCommand, BatchGet
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
+const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
@@ -54,6 +55,18 @@ export async function getTicketsForWorkflowFromDynamo(workflowId: string) {
     ExpressionAttributeValues: { ":wid": workflowId },
   }));
   return (result.Items || []).filter(t => t.ticketId !== "__COUNTER__");
+}
+
+/** Most recent event for a workflow — enough to tell how long a run has been silent. */
+export async function getLastEventForWorkflow(workflowId: string) {
+  const result = await ddb.send(new QueryCommand({
+    TableName: EVENTS_TABLE,
+    KeyConditionExpression: "workflowId = :wid",
+    ExpressionAttributeValues: { ":wid": workflowId },
+    ScanIndexForward: false,
+    Limit: 1,
+  }));
+  return result.Items?.[0] || null;
 }
 
 export async function getTicketsByIds(ticketIds: string[]) {
