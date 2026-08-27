@@ -1588,6 +1588,24 @@ async function buildAgentContext(ticket, workflow) {
   context += `epic_id: ${workflow.epicId}\n`;
   context += `ticket_id: ${ticket.ticketId}\n\n`;
 
+  // Shipped laptop session: the requester planned this work in a live coding
+  // session and shipped it here. Visible to EVERY agent — the transcript is the
+  // authoritative context, and the branch already carries in-flight work.
+  const ported = workflow.input?.portedSession;
+  if (ported?.sessionId) {
+    context += `## Ported Session\n`;
+    context += `The requester pre-planned this work in a live coding session and shipped it to this workflow. `;
+    context += `The session transcript contains the research, decisions, and constraints — it is the authoritative context for this run.\n`;
+    context += `coding_session_id: ${ported.sessionId}\n`;
+    context += `cli: ${ported.cli || "claude"}\n`;
+    if (ported.repo) context += `repo: ${ported.repo}\n`;
+    context += `ported_branch: ${ported.branch} (already contains the requester's in-flight work — build on it, never discard it)\n`;
+    context += `To resume the session, pass resume_session="${ported.sessionId}" on your FIRST ${ported.cli === "codex" ? "codex" : "claude_code"} call — it continues the requester's exact conversation and workspace.\n`;
+    context += `Intake/requirements: resume it to read the plan out of the conversation before writing tickets. `;
+    context += `Dev agents: resume it and continue the work in place. `;
+    context += `Review/QA: verify the branch independently — do NOT resume the dev conversation; inspect the code and run your own checks.\n\n`;
+  }
+
   // For the intake agent only: provide the valid agent roster (registry data),
   // scoped to agents belonging to this workflow definition.
   const wfDef = getWorkflowDef(workflow.workflowDefId);
@@ -2305,6 +2323,26 @@ async function callGitHub(toolName, args) {
  */
 async function ensureFeatureBranch(workflow) {
   if (workflow.featureBranch) return workflow.featureBranch;
+  // Shipped-session runs: the laptop already pushed its in-flight work to a
+  // branch — ADOPT it as the run's shared integration branch so the pipeline
+  // builds on the requester's work (and the final PR carries it) instead of
+  // starting a parallel branch off the default.
+  const ported = workflow.input?.portedSession;
+  if (ported?.branch) {
+    try {
+      await ddb.send(new UpdateCommand({
+        TableName: WORKFLOWS_TABLE,
+        Key: { workflowId: workflow.id },
+        UpdateExpression: "SET featureBranch = if_not_exists(featureBranch, :fb)",
+        ExpressionAttributeValues: { ":fb": ported.branch },
+      }));
+      console.log(`[orchestrator] Adopted ported-session branch as shared feature branch: ${ported.branch}`);
+      return ported.branch;
+    } catch (err) {
+      console.error(`[orchestrator] failed to adopt ported branch ${ported.branch}: ${err.message}`);
+      // fall through to normal creation
+    }
+  }
   if (!workflow.repoConfig?.repos?.length) return null;
   try {
     const { owner, repo } = parseRepoUrl(workflow.repoConfig);

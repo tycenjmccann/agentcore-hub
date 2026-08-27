@@ -20,6 +20,7 @@ import { readState, prepareGitHandoff, pullBranch, pullFromBundle } from "./git.
 import { newestTranscript, sessionIdForTranscript, installLocalTranscript } from "./transcript.js";
 import { detectArtifacts, uploadArtifact, stageArtifactLocally, downloadArtifact, ensureCloudCodeExcluded, fmtBytes } from "./artifacts.js";
 import { gatherBundle, type Cli } from "./cli-config.js";
+import { SHIP_TOOL, runShip } from "./ship.js";
 
 const InputSchema = z.object({
   title: z
@@ -113,7 +114,7 @@ const SYNC_TOOL = {
   },
 };
 
-export const CLOUD_CODE_TOOLS = [PORT_TOOL, PULL_TOOL, SYNC_TOOL];
+export const CLOUD_CODE_TOOLS = [PORT_TOOL, PULL_TOOL, SYNC_TOOL, SHIP_TOOL];
 
 // Slash-command surface: a `port` prompt shows up as
 // /mcp__<alias>__port (alias = the name this server is registered under).
@@ -128,6 +129,17 @@ export const CLOUD_CODE_PROMPTS = [
         name: "view, title, first prompt, new branch",
         description: "Comma-separated, all optional. view=chat|terminal (default chat). e.g. \"terminal, fix scroll, start on the terminal bug, wip/train\"",
         required: false,
+      },
+    ],
+  },
+  {
+    name: "ship",
+    description: "Ship this session to the agent workflow pipeline — agents resume it and build autonomously; you get a PR.",
+    arguments: [
+      {
+        name: "title, description",
+        description: "Comma-separated. title = one-line what to build (required); description = plan summary for the intake agent (optional).",
+        required: true,
       },
     ],
   },
@@ -160,6 +172,30 @@ export function getCloudCodePrompt(name: string, argsIn: Record<string, string> 
               `Sync my local ${cli} CLI configuration to Cloud Code by calling the ` +
               `sync_cli_config tool now with cli="${cli}". After it returns, show me ` +
               `what was uploaded and anything that was dropped or redacted.`,
+          },
+        },
+      ],
+    };
+  }
+  if (name === "ship") {
+    const raw = Object.values(a)[0] || "";
+    const comma = raw.indexOf(",");
+    const title = (comma === -1 ? raw : raw.slice(0, comma)).trim();
+    const description = comma === -1 ? "" : raw.slice(comma + 1).trim();
+    return {
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text:
+              `Ship my current coding session to the agent workflow pipeline by calling the ` +
+              `ship_session_to_workflow tool now with title="${title}"` +
+              (description ? ` and a description summarizing: ${description}. ` : `. `) +
+              `Before calling it, write the description yourself from OUR conversation: the goal, ` +
+              `the decisions we already made, constraints, and what "done" looks like — the intake ` +
+              `agent reads it before resuming the transcript. After it returns, show me the ` +
+              `workflow tracking link.`,
           },
         },
       ],
@@ -592,6 +628,13 @@ export async function callCloudCodeTool(name: string, args: unknown) {
       return await runPort(args);
     } catch (err) {
       return { isError: true, content: [{ type: "text" as const, text: `Port failed: ${(err as Error).message}` }] };
+    }
+  }
+  if (name === SHIP_TOOL.name) {
+    try {
+      return await runShip(args);
+    } catch (err) {
+      return { isError: true, content: [{ type: "text" as const, text: `Ship failed: ${(err as Error).message}` }] };
     }
   }
   return null;

@@ -8,6 +8,9 @@ Inspect your Workflow Context for a `## Workflow Type` section. The orchestrator
 - If the context contains `Workflow Type` followed by `bug-fix` → call `load_blueprint("bug-fix-requirements")` and follow that blueprint. STOP reading this prompt; the blueprint replaces the feature flow.
 - Otherwise → call `load_blueprint("requirements-analyst")` for the standard feature flow described below.
 
+## PORTED SESSION
+If the context contains a `## Ported Session` section, the requester pre-planned this work in a live coding session. Your first claude_code call MUST pass resume_session="<coding_session_id>" to resume that exact conversation — derive the plan FROM it (decisions there are final), put the ported-session block into every dev ticket, and never plan work that discards the ported branch. The blueprint has the full rules.
+
 ## WHAT YOU DO (feature flow)
 - Parse feature requests and identify scope
 - Gather context (existing code, related tickets, mockups)

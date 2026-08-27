@@ -201,6 +201,26 @@ export interface WorkflowInput {
    * def reviewGates whose condition is "flagged". "always" gates apply regardless.
    */
   reviewGates?: string[];
+  /**
+   * A laptop coding session shipped to this workflow (ship_session_to_workflow).
+   * The session's branch becomes the run's shared integration branch, and
+   * pipeline personas resume the session (claude_code resume_session) instead
+   * of starting cold — the requester's research/plan travels in the transcript.
+   */
+  portedSession?: PortedSession;
+}
+
+export interface PortedSession {
+  /** Cloud Code session id (cc-…) the personas resume via resume_session. */
+  sessionId: string;
+  /** The CLI conversation id inside the transcript (claude --resume <id>). */
+  claudeSessionId: string;
+  /** Which CLI recorded the transcript. */
+  cli: "claude" | "codex";
+  /** owner/name of the repo the session worked in. */
+  repo?: string;
+  /** Branch the in-flight work was pushed to — the run builds on it. */
+  branch: string;
 }
 
 // ─── Human Notifications ─────────────────────────────────────────────────────
