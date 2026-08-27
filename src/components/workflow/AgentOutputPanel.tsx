@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { X, AlertCircle, FileText, TerminalSquare } from "lucide-react";
+import { X, AlertCircle, FileText, TerminalSquare, Send } from "lucide-react";
 import type { AgentTask } from "@/lib/workflow/types";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import "./pipeline.css";
@@ -105,6 +105,29 @@ export default function AgentOutputPanel({
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  // Operator message composer — queue a mid-flow message for a running agent.
+  const [messageDraft, setMessageDraft] = useState("");
+  const [messageState, setMessageState] = useState<"idle" | "sending" | "queued" | "error">("idle");
+  const sendOperatorMessage = useCallback(async () => {
+    const message = messageDraft.trim();
+    if (!message || !workflowId || !task?.agentId || messageState === "sending") return;
+    setMessageState("sending");
+    try {
+      const resp = await fetch(`/api/workflow/${workflowId}/message`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentId: task.agentId, message }),
+      });
+      if (!resp.ok) throw new Error(`${resp.status}`);
+      setMessageDraft("");
+      setMessageState("queued");
+      setTimeout(() => setMessageState("idle"), 3000);
+    } catch {
+      setMessageState("error");
+      setTimeout(() => setMessageState("idle"), 4000);
+    }
+  }, [messageDraft, workflowId, task?.agentId, messageState]);
 
   // Remote coding sessions this agent-task ran (Cloud Code runtime). Primary
   // source is the sessions table (footer text may not survive streaming);
@@ -423,6 +446,48 @@ export default function AgentOutputPanel({
             </div>
           )}
         </div>
+
+        {/* Operator message composer — only for a live agent */}
+        {task && workflowId && (task.status === "running" || task.status === "waiting_response") && (
+          <div
+            className="flex items-center gap-2 px-4 py-2 border-t"
+            style={{ borderColor: "var(--pipeline-border)", background: "rgba(15, 15, 20, 0.6)" }}
+          >
+            <input
+              type="text"
+              value={messageDraft}
+              onChange={(e) => setMessageDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  sendOperatorMessage();
+                }
+              }}
+              placeholder="Message this agent — delivered at its next tool call…"
+              maxLength={4000}
+              className="flex-1 bg-transparent text-sm outline-none px-2 py-1.5 rounded border"
+              style={{
+                color: "var(--pipeline-text)",
+                borderColor: "rgba(99, 102, 241, 0.25)",
+              }}
+              aria-label="Send a message to this agent"
+            />
+            <button
+              onClick={sendOperatorMessage}
+              disabled={!messageDraft.trim() || messageState === "sending"}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded transition-colors disabled:opacity-40"
+              style={{
+                background: "rgba(99, 102, 241, 0.15)",
+                color: "#a5b4fc",
+                border: "1px solid rgba(99, 102, 241, 0.3)",
+              }}
+              type="button"
+            >
+              <Send size={13} aria-hidden="true" />
+              {messageState === "sending" ? "Queuing…" : messageState === "queued" ? "Queued ✓" : messageState === "error" ? "Failed — retry" : "Send"}
+            </button>
+          </div>
+        )}
 
         {/* Footer */}
         {task && (() => {

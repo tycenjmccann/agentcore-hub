@@ -350,7 +350,7 @@ aws iam put-role-policy \
     \"Statement\": [{
       \"Sid\": \"EventsTableWrite\",
       \"Effect\": \"Allow\",
-      \"Action\": [\"dynamodb:PutItem\", \"dynamodb:UpdateItem\", \"dynamodb:GetItem\", \"dynamodb:Query\"],
+      \"Action\": [\"dynamodb:PutItem\", \"dynamodb:UpdateItem\", \"dynamodb:GetItem\", \"dynamodb:Query\", \"dynamodb:DeleteItem\"],
       \"Resource\": \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-*\"
     }]
   }"
