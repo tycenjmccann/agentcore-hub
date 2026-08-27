@@ -33,6 +33,8 @@ DLQ_NAME="${ANOMALY_DLQ_NAME:-agentcore-hub-anomaly-watcher-dlq}"
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 WATCHER_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:${LAMBDA_NAME}"
 SCHEDULER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHEDULER_ROLE_NAME}"
+# TEAM-3334 F4a: the exact schedule allowed to assume the scheduler role.
+SCHEDULE_ARN="arn:aws:scheduler:${AWS_REGION}:${ACCOUNT_ID}:schedule/${SCHEDULE_GROUP}/${SCHEDULE_NAME}"
 DLQ_ARN="arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:${DLQ_NAME}"
 ANALYZER_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:${ANALYZER_FUNCTION}"
 BUS_ARN="arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:event-bus/${EVENT_BUS}"
@@ -142,6 +144,11 @@ aws iam attach-role-policy --role-name "$ROLE_NAME" \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole >/dev/null
 echo "✓ IAM: AWSLambdaBasicExecutionRole attached"
 
+# TEAM-3334 F4b: WorkflowsNotify is scoped to the single UpdateItem the watcher
+# makes (index.mjs tier2 notification): list_append on humanNotifications with an
+# attribute_exists(workflowId) condition and no ReturnValues. Key + condition
+# attributes count as accessed, hence workflowId in dynamodb:Attributes;
+# StringEqualsIfExists permits the default (unset) ReturnValues but nothing else.
 aws iam put-role-policy --role-name "$ROLE_NAME" \
   --policy-name AnomalyWatcherAccess \
   --policy-document "{
@@ -172,7 +179,13 @@ aws iam put-role-policy --role-name "$ROLE_NAME" \
         \"Sid\": \"WorkflowsNotify\",
         \"Effect\": \"Allow\",
         \"Action\": [\"dynamodb:UpdateItem\"],
-        \"Resource\": \"${DDB}/${WORKFLOWS_TABLE}\"
+        \"Resource\": \"${DDB}/${WORKFLOWS_TABLE}\",
+        \"Condition\": {
+          \"ForAllValues:StringEquals\": {
+            \"dynamodb:Attributes\": [\"workflowId\", \"humanNotifications\"]
+          },
+          \"StringEqualsIfExists\": {\"dynamodb:ReturnValues\": \"NONE\"}
+        }
       },
       {
         \"Sid\": \"EvalConfigRead\",
@@ -283,21 +296,31 @@ aws scheduler create-schedule-group --name "$SCHEDULE_GROUP" --output text >/dev
 # This role holds the ONLY lambda:InvokeFunction grant on the watcher. There is no
 # function URL, no API Gateway stage, and no resource policy — the function has no
 # ingress an outside caller could reach.
+# TEAM-3334 F4a: pin the trust to THIS schedule's ARN, not just the account —
+# without aws:SourceArn any schedule in the account could assume the invoke
+# role. Applied on the exists path too, so already-deployed roles get hardened.
+SCHEDULER_TRUST_POLICY="{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [{
+    \"Effect\": \"Allow\",
+    \"Principal\": {\"Service\": \"scheduler.amazonaws.com\"},
+    \"Action\": \"sts:AssumeRole\",
+    \"Condition\": {
+      \"StringEquals\": {\"aws:SourceAccount\": \"${ACCOUNT_ID}\"},
+      \"ArnLike\": {\"aws:SourceArn\": \"${SCHEDULE_ARN}\"}
+    }
+  }]
+}"
 if ! aws iam get-role --role-name "$SCHEDULER_ROLE_NAME" >/dev/null 2>&1; then
   aws iam create-role --role-name "$SCHEDULER_ROLE_NAME" \
-    --assume-role-policy-document "{
-      \"Version\": \"2012-10-17\",
-      \"Statement\": [{
-        \"Effect\": \"Allow\",
-        \"Principal\": {\"Service\": \"scheduler.amazonaws.com\"},
-        \"Action\": \"sts:AssumeRole\",
-        \"Condition\": {\"StringEquals\": {\"aws:SourceAccount\": \"${ACCOUNT_ID}\"}}
-      }]
-    }" --description "Lets EventBridge Scheduler invoke the anomaly-watcher Lambda" \
+    --assume-role-policy-document "$SCHEDULER_TRUST_POLICY" \
+    --description "Lets EventBridge Scheduler invoke the anomaly-watcher Lambda" \
     --output text >/dev/null
-  echo "✓ IAM: ${SCHEDULER_ROLE_NAME} (created)"
+  echo "✓ IAM: ${SCHEDULER_ROLE_NAME} (created — trust pinned to ${SCHEDULE_ARN})"
 else
-  echo "✓ IAM: ${SCHEDULER_ROLE_NAME} (exists)"
+  aws iam update-assume-role-policy --role-name "$SCHEDULER_ROLE_NAME" \
+    --policy-document "$SCHEDULER_TRUST_POLICY" >/dev/null
+  echo "✓ IAM: ${SCHEDULER_ROLE_NAME} (exists — trust pinned to ${SCHEDULE_ARN})"
 fi
 aws iam put-role-policy --role-name "$SCHEDULER_ROLE_NAME" \
   --policy-name InvokeAnomalyWatcher \

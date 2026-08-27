@@ -917,7 +917,10 @@ test("an unverifiable open count fails CLOSED", async () => {
 // 7. Fail-safe behaviour (§10.1)
 // ═════════════════════════════════════════════════════════════════════════════
 
-test("a 5xx from intake releases the claim and does not throw", async () => {
+// TEAM-3334 F1: intake is not idempotent, so a 5xx (which may have landed AFTER
+// the workflow was created) no longer releases the claim — it is kept, marked
+// unverified, for a later cycle to verify against the intake index.
+test("a 5xx from intake KEEPS the claim marked unverified and does not throw", async () => {
   const { harness, bands, metricId } = scenario({ responses: [errResponse(500, { error: "boom" })] });
   const { summary } = await runWatcher({ harness, bands });
 
@@ -925,17 +928,17 @@ test("a 5xx from intake releases the claim and does not throw", async () => {
   assert.deepEqual(summary.actions.tier3Filed, []);
   const failure = summary.actions.failures.find((f) => f.stage === "tier3Filing");
   assert.equal(failure.status, 500);
-  assert.equal(failure.claim, "released");
+  assert.equal(failure.claim, "unverified");
   assert.equal(failure.metricId, metricId);
 
-  // The release is ownership-conditioned, and the claim really is gone so a later
-  // cycle may retry.
-  const del = harness.calls.find((c) => c.__cmd === "Delete");
-  assert.ok(del, "the claim must be deleted");
-  assert.deepEqual(del.Key, { pk: `claim#${metricId}#fleet`, sk: "t3" });
-  assert.equal(del.ConditionExpression, "claimToken = :mine");
-  assert.equal(del.ExpressionAttributeValues[":mine"], "req-a");
-  assert.equal(harness.store.has(`claim#${metricId}#fleet\u0000t3`), false);
+  // The claim survives, ownership-annotated as unverified — the ambiguous POST
+  // may have filed, so releasing here could double-file next cycle.
+  assert.equal(harness.calls.filter((c) => c.__cmd === "Delete").length, 0, "the claim must NOT be deleted");
+  const claim = harness.store.get(`claim#${metricId}#fleet\u0000t3`);
+  assert.ok(claim, "the claim survives an ambiguous outcome");
+  assert.equal(claim.unverified, true);
+  assert.equal(claim.unverifiedCycle, CYCLE);
+  assert.equal(claim.unverifiedStatus, 500);
 
   // A transient failure is not an escalation — no duplicate operator page.
   assert.equal(summary.actions.tier2Escalations, 0);

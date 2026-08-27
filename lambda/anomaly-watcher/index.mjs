@@ -57,6 +57,8 @@ export const CYCLE_MS = 600_000;
 export const TERMINAL_PHASES = new Set(["complete", "cancelled", "error"]);
 /** §6 — max OPEN anomaly-filed workflows fleet-wide. */
 export const OPEN_WORKFLOW_CAP = 3;
+/** TEAM-3334 F3: how many recent ratelimit cycle items supplement the GSI count. */
+export const RECENT_FILED_CYCLES = 3;
 export const INTAKE_CHANNEL = "anomaly-detector";
 export const INTAKE_INDEX = "intakeChannel-index";
 export const ANOMALY_PARTITION = "anomaly-watcher";
@@ -525,6 +527,18 @@ export function isConditionalFailure(err) {
   return err?.name === "ConditionalCheckFailedException";
 }
 
+/**
+ * TEAM-3334 F1: a fetch error thrown before any connection existed (DNS miss,
+ * connection refused — Node's fetch wraps the socket error in `cause`) cannot
+ * have reached intake, so the request is safe to retry. EVERYTHING else — abort
+ * after send, reset mid-response, and any error we cannot place — is ambiguous:
+ * the filing may already exist. When in doubt, ambiguous.
+ */
+export function isPreConnectionError(err) {
+  const code = err?.cause?.code || err?.code;
+  return code === "ENOTFOUND" || code === "ECONNREFUSED";
+}
+
 /** A cancelled transaction whose ONLY condition is the cursor guard (§4). */
 export function isCursorConflict(err) {
   if (err?.name !== "TransactionCanceledException") return false;
@@ -613,7 +627,7 @@ export async function loadBands() {
 
 // ─── DynamoDB helpers ────────────────────────────────────────────────────────
 
-async function queryAll(ctx, params, { maxPages = 20 } = {}) {
+async function queryAll(ctx, params, { maxPages = 20, failOnTruncation = false } = {}) {
   const items = [];
   let ExclusiveStartKey;
   let pages = 0;
@@ -623,6 +637,14 @@ async function queryAll(ctx, params, { maxPages = 20 } = {}) {
     ExclusiveStartKey = page.LastEvaluatedKey;
     pages += 1;
   } while (ExclusiveStartKey && pages < maxPages);
+  // TEAM-3334 F2: a LastEvaluatedKey surviving the page cap means the result is
+  // PARTIAL. Callers whose correctness depends on completeness (the open-count
+  // cap, F1 claim verification) pass failOnTruncation to get the error path
+  // instead of a silent undercount; the aggregate/snapshot/contrib readers keep
+  // the old partial-is-acceptable semantics by not passing it.
+  if (ExclusiveStartKey && failOnTruncation) {
+    throw new Error(`query truncated after ${pages} pages (LastEvaluatedKey still set)`);
+  }
   return items;
 }
 
@@ -1401,13 +1423,35 @@ async function emitFleetRecords(ctx, metric, verdict, bundle, filedWorkflowId) {
 async function openState(ctx) {
   if (ctx.openStateCache) return ctx.openStateCache;
   try {
-    const items = await queryAll(ctx, {
-      TableName: ctx.env.workflowsTable,
-      IndexName: INTAKE_INDEX,
-      KeyConditionExpression: "intakeChannel = :c",
-      ExpressionAttributeValues: { ":c": INTAKE_CHANNEL },
-    });
-    const openCount = openCountFrom(items);
+    // TEAM-3334 F2: failOnTruncation — a partial index read must land in the
+    // fail-closed catch below, never a silent undercount that bypasses the cap.
+    const items = await queryAll(
+      ctx,
+      {
+        TableName: ctx.env.workflowsTable,
+        IndexName: INTAKE_INDEX,
+        KeyConditionExpression: "intakeChannel = :c",
+        ExpressionAttributeValues: { ":c": INTAKE_CHANNEL },
+      },
+      { failOnTruncation: true }
+    );
+    // TEAM-3334 F3: the GSI is eventually consistent, so a workflow filed in the
+    // last few cycles may not be indexed yet. Union the filed lists recorded on
+    // the recent ratelimit cycle items into the count. An id absent from the GSI
+    // cannot be proven closed, so it counts as OPEN (fail closed toward the
+    // cap); once the GSI catches up, the item's real phase takes over. A failed
+    // supplemental read throws into the catch below: fail closed, allowed 0.
+    const gsiIds = new Set(items.map((w) => w?.workflowId).filter(Boolean));
+    const recentFiled = new Set();
+    for (let k = 0; k < RECENT_FILED_CYCLES; k += 1) {
+      const sk = cycleLabel(isoOf(epochMsOf(ctx.canonicalCycle) - k * CYCLE_MS));
+      const row = await getState(ctx, RATELIMIT_PK, sk);
+      if (!row || !isLive(row, ctx.nowEpoch)) continue;
+      for (const id of Array.isArray(row.filed) ? row.filed : []) {
+        if (typeof id === "string" && id && !gsiIds.has(id)) recentFiled.add(id);
+      }
+    }
+    const openCount = openCountFrom(items) + recentFiled.size;
     ctx.openStateCache = { openCount, cap: OPEN_WORKFLOW_CAP, allowed: allowedFilings(openCount) };
   } catch (err) {
     // Fail CLOSED: an unverifiable cap must never authorise a filing.
@@ -1449,15 +1493,131 @@ async function postStart(ctx, payload) {
     if (!resp.ok) {
       const error = data.error || `HTTP ${resp.status}`;
       console.error(`${LOG_PREFIX} intake ${resp.status}: ${JSON.stringify(data).slice(0, 500)}`);
-      // Same split as routines-runner: 4xx is permanent (a retry cannot fix a
-      // rejected payload), 5xx/timeout is transient.
-      return { ok: false, status: resp.status, terminal: resp.status >= 400 && resp.status < 500, error };
+      // 4xx is permanent: a retry cannot fix a rejected payload. TEAM-3334 F1:
+      // a 5xx is AMBIGUOUS, not transient — intake mints a random workflowId per
+      // request and may have created the workflow before erroring, so the caller
+      // must not release its dedupe claim on this result.
+      return {
+        ok: false,
+        status: resp.status,
+        terminal: resp.status >= 400 && resp.status < 500,
+        ambiguous: resp.status >= 500,
+        error,
+      };
     }
     return { ok: true, workflowId: data.workflowId || data.id };
   } catch (err) {
-    return { ok: false, status: null, terminal: false, error: errMessage(err) };
+    // TEAM-3334 F1: only a provably pre-connection failure is retriable; an
+    // abort/timeout or anything mid-flight may have landed at intake.
+    return { ok: false, status: null, terminal: false, ambiguous: !isPreConnectionError(err), error: errMessage(err) };
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/**
+ * TEAM-3334 F1: resolve a t3 claim left `unverified` by an ambiguous POST
+ * outcome. The filed title embeds metric + groupKey + cycle (buildStartPayload),
+ * so the filing is verifiable: Query the intakeChannel-index for filings started
+ * since just before the claim was created, then read each candidate's stored
+ * intake payload title (`input.title` on the base table — the GSI projects no
+ * title) and match it. Returns:
+ *   { released: true }              — VERIFIABLY absent: the stale claim was
+ *                                     deleted and the caller may retry filing.
+ *   { released: false, filed }      — the filing exists (recorded on the claim,
+ *                                     claim kept) or verification itself failed
+ *                                     (claim kept untouched). Either way the
+ *                                     caller must NOT file: fail closed against
+ *                                     duplicating.
+ */
+async function resolveUnverifiedClaim(ctx, metric, verdict, claimItem) {
+  const claim = { pk: claimPk(metric.id, verdict.groupKey), sk: "t3" };
+  try {
+    const cycleTag = claimItem.unverifiedCycle;
+    if (typeof cycleTag !== "string" || !cycleTag) throw new Error("unverified claim has no unverifiedCycle");
+    // One cycle of slack below createdAt: intake stamps startedAt with ITS clock.
+    const since = isoOf(epochMsOf(claimItem.createdAt || ctx.nowIso) - CYCLE_MS);
+    const candidates = await queryAll(
+      ctx,
+      {
+        TableName: ctx.env.workflowsTable,
+        IndexName: INTAKE_INDEX,
+        KeyConditionExpression: "intakeChannel = :c AND startedAt >= :since",
+        ExpressionAttributeValues: { ":c": INTAKE_CHANNEL, ":since": since },
+      },
+      { failOnTruncation: true }
+    );
+    let found = null;
+    for (const cand of candidates) {
+      if (!cand?.workflowId) continue;
+      const rows = await queryAll(
+        ctx,
+        {
+          TableName: ctx.env.workflowsTable,
+          KeyConditionExpression: "workflowId = :id",
+          ProjectionExpression: "workflowId, #in.#title",
+          ExpressionAttributeNames: { "#in": "input", "#title": "title" },
+          ExpressionAttributeValues: { ":id": cand.workflowId },
+        },
+        { failOnTruncation: true }
+      );
+      const title = rows[0]?.input?.title;
+      if (
+        typeof title === "string" &&
+        title.startsWith(`[anomaly] ${metric.id} `) &&
+        title.includes(`(${verdict.groupKey})`) &&
+        title.includes(cycleTag)
+      ) {
+        found = cand.workflowId;
+        break;
+      }
+    }
+
+    if (found) {
+      // The ambiguous POST DID file. Record the workflowId on the claim and keep
+      // it — the suppression it provides is now backed by a real filing.
+      await ctx.clients.ddb.send(
+        new ctx.cmd.UpdateCommand({
+          TableName: ctx.env.stateTable,
+          Key: claim,
+          UpdateExpression: "SET workflowId = :w, verifiedAt = :now, unverified = :f",
+          ConditionExpression: "claimToken = :owner",
+          ExpressionAttributeValues: { ":w": found, ":now": ctx.nowIso, ":f": false, ":owner": claimItem.claimToken },
+        })
+      );
+      ctx.summary.actions.dedupeSuppressed.push({
+        metricId: metric.id,
+        groupKey: verdict.groupKey,
+        tier: 3,
+        reason: "unverified_claim_verified_filed",
+      });
+      console.log(`${LOG_PREFIX} unverified t3 claim for ${metric.id}/${verdict.groupKey} resolved: filed as ${found}`);
+      return { released: false, filed: found };
+    }
+
+    // Verifiably absent: delete the stale claim (guarded by ITS owner token, so a
+    // concurrent resolver cannot double-release) and let the caller retry.
+    await ctx.clients.ddb.send(
+      new ctx.cmd.DeleteCommand({
+        TableName: ctx.env.stateTable,
+        Key: claim,
+        ConditionExpression: "claimToken = :owner",
+        ExpressionAttributeValues: { ":owner": claimItem.claimToken },
+      })
+    );
+    console.log(`${LOG_PREFIX} unverified t3 claim for ${metric.id}/${verdict.groupKey} resolved: not filed — released`);
+    return { released: true };
+  } catch (err) {
+    // Verification failed (query error, truncation, lost the delete race): stay
+    // unverified. Filing anyway is the one outcome NFR-4 forbids.
+    ctx.summary.actions.failures.push({
+      metricId: metric.id,
+      groupKey: verdict.groupKey,
+      stage: "tier3VerifyUnverified",
+      error: errMessage(err),
+    });
+    console.error(`${LOG_PREFIX} unverified-claim verification failed for ${metric.id}/${verdict.groupKey}:`, errMessage(err));
+    return { released: false };
   }
 }
 
@@ -1477,6 +1637,27 @@ async function tier3(ctx, metric, verdict, extras) {
       tier: 3,
       reason,
     });
+
+  // TEAM-3334 F1: a claim left `unverified` by an earlier ambiguous POST must be
+  // resolved BEFORE any acquire below — both acquire sites overwrite an expired
+  // claim, which would erase the marker and re-open the double-filing window.
+  // Fail closed: if the claim cannot even be read, take no action this cycle.
+  let existingClaim;
+  try {
+    existingClaim = await getState(ctx, claim.pk, claim.sk);
+  } catch (err) {
+    ctx.summary.actions.failures.push({
+      metricId: metric.id,
+      groupKey: verdict.groupKey,
+      stage: "tier3ClaimRead",
+      error: errMessage(err),
+    });
+    return;
+  }
+  if (existingClaim?.unverified) {
+    const resolved = await resolveUnverifiedClaim(ctx, metric, verdict, existingClaim);
+    if (!resolved.released) return; // verified-filed or unresolved — never file past it
+  }
 
   const state = await openState(ctx);
   const allowed = allowedFilings(state.openCount ?? state.cap, ctx.filedThisCycle);
@@ -1596,8 +1777,38 @@ async function tier3(ctx, metric, verdict, extras) {
     return;
   }
 
-  // 5xx / timeout: release the claim so a later cycle may retry, and do NOT
-  // rethrow — the summary carries the failure.
+  if (result.ambiguous) {
+    // TEAM-3334 F1: the POST may have been processed (timeout after send, 5xx
+    // after intake wrote the workflow, connection lost mid-response) and intake
+    // is NOT idempotent — releasing the claim here is exactly how a duplicate
+    // gets filed. Keep the claim, mark it unverified, and extend it so the
+    // marker outlives the suppression TTL; a later cycle verifies against the
+    // intake index (resolveUnverifiedClaim) before releasing or retrying.
+    await annotateClaim(ctx, {
+      ...claim,
+      fields: {
+        unverified: true,
+        unverifiedAt: ctx.nowIso,
+        unverifiedCycle: ctx.cycle,
+        unverifiedStatus: result.status ?? null,
+        unverifiedError: result.error ?? null,
+        expiresAt: ttlEpoch(ctx.nowMs, Math.max(ttlMs, RATELIMIT_TTL_MS)),
+      },
+    });
+    ctx.summary.actions.failures.push({
+      metricId: metric.id,
+      groupKey: verdict.groupKey,
+      stage: "tier3Filing",
+      status: result.status,
+      error: result.error,
+      claim: "unverified",
+    });
+    return;
+  }
+
+  // Pre-connection failure: the request provably never reached intake, so the
+  // claim is safe to release for a later cycle to retry. Do NOT rethrow — the
+  // summary carries the failure.
   await releaseClaim(ctx, claim);
   ctx.summary.actions.failures.push({
     metricId: metric.id,
