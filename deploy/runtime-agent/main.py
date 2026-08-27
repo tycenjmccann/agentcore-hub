@@ -270,6 +270,18 @@ REMOTE_CODING_IDLE_TIMEOUT_S = int(
     os.getenv("REMOTE_CODING_IDLE_TIMEOUT_S", str(REMOTE_CODING_READ_TIMEOUT))
 )
 
+# Wall-clock guard on the persona's own model-chat stream (TEAM-3252). The
+# strands BedrockModel converse_stream read is the SECOND streamed handoff of
+# the TEAM-3168 defect class: the botocore per-read socket timeout does not
+# reliably fire on a wedged stream read, so a stream that stops yielding
+# blocks agent.stream_async forever — the `chat` span dangles status=UNSET
+# and no agent.error is ever emitted.
+MODEL_CHAT_TURN_DEADLINE_S = int(os.getenv("MODEL_CHAT_TURN_DEADLINE_S", "1800"))
+# Idle cap on any single stream event. Sits just above the botocore
+# read_timeout (READ_TIMEOUT=1200) so the socket timeout gets first chance,
+# and long model thinking pauses don't false-trip.
+MODEL_CHAT_IDLE_TIMEOUT_S = int(os.getenv("MODEL_CHAT_IDLE_TIMEOUT_S", "1260"))
+
 # Tenant the workflow session rows belong to. Multi-tenant deployments must set
 # this to the tenant that owns the fleet, or the Cloud Code tab (which scopes
 # reads by the caller's tenant) won't show workflow sessions.
@@ -1771,6 +1783,67 @@ def _publish_agent_error(error_text: str):
         logger.warning(f"[{_CURRENT_AGENT_ID}] Failed to publish agent.error: {e}")
 
 
+class _ModelChatStreamStall(RuntimeError):
+    """The model-chat stream tripped the wall-clock guard (TEAM-3252)."""
+
+
+async def _guarded_stream_events(agen, deadline_s: float | None = None,
+                                 idle_timeout_s: float | None = None):
+    """Yield events from agent.stream_async's generator under a wall clock.
+
+    deadline_s (default MODEL_CHAT_TURN_DEADLINE_S) caps the whole model turn;
+    idle_timeout_s (default MODEL_CHAT_IDLE_TIMEOUT_S) caps the wait for any
+    single stream event. Needed because the underlying converse_stream read is
+    only bounded by botocore's per-read socket timeout, which resets on every
+    frame and does not reliably fire on a wedged read (same postmortem fact as
+    the coding-runtime handoff, TEAM-3168/TEAM-3194) — either way the persona
+    blocked forever with the `chat` span left status=UNSET (TEAM-3252).
+
+    On expiry: closes the generator (GeneratorExit propagates into strands'
+    event loop, whose except path runs end_span_with_error — the `chat` span
+    closes with status=ERROR instead of dangling), publishes agent.error,
+    marks the active span ERROR, and raises _ModelChatStreamStall so the
+    invocation ends with an error instead of hanging."""
+    import asyncio, time
+    if deadline_s is None:
+        deadline_s = MODEL_CHAT_TURN_DEADLINE_S
+    if idle_timeout_s is None:
+        idle_timeout_s = MODEL_CHAT_IDLE_TIMEOUT_S
+    deadline = time.monotonic() + deadline_s
+    it = agen.__aiter__()
+
+    async def _stall(reason: str):
+        try:
+            await asyncio.wait_for(it.aclose(), timeout=5)
+        except Exception:  # noqa: BLE001 — already giving up, just surface the stall
+            pass
+        _publish_agent_error(reason)
+        _record_span_error(reason)
+        # The wedged converse_stream read sits on a worker thread
+        # (asyncio.to_thread inside strands BedrockModel.stream) that cannot
+        # be interrupted — it lingers until the microVM recycles. Accepted
+        # leak, same tradeoff as _drain_coding_sse's reader thread.
+        raise _ModelChatStreamStall(reason)
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            await _stall(
+                f"model chat turn exceeded {deadline_s}s without completion (deadline)")
+        try:
+            event = await asyncio.wait_for(
+                it.__anext__(), timeout=min(remaining, idle_timeout_s))
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            if deadline - time.monotonic() <= 0:
+                await _stall(
+                    f"model chat turn exceeded {deadline_s}s without completion (deadline)")
+            await _stall(
+                f"model chat stream sent no event for {idle_timeout_s}s (idle timeout)")
+        yield event
+
+
 def _save_memory_event(agent_id: str, session_id: str, user_text: str, assistant_text: str):
     """Persist the invocation turn to AgentCore Memory (no-op if MEMORY_ID unset).
 
@@ -1997,37 +2070,48 @@ async def agent_invocation(payload, context):
             })
             _text_buffer = ""
 
-    async for event in agent.stream_async(prompt):
-        if "data" in event and event["data"]:
-            final_text += event["data"]
-            _text_buffer += event["data"]
-            if len(_text_buffer) >= _FLUSH_THRESHOLD:
-                _flush_text_buffer()
-        elif "current_tool_use" in event:
-            _flush_text_buffer()  # flush pending text before tool event
-            current_tool_use = event["current_tool_use"]
-            if current_tool_use and current_tool_use.get("name"):
-                if tracker.previous_tool_use != current_tool_use:
-                    tracker.previous_tool_use = current_tool_use
-                    tool_name = current_tool_use["name"]
-                    tool_events.append(tool_name)
-                    logger.info(f"[{agent_id}] Tool call: {tool_name}")
-                    tracker._publish_event("agent.streaming", {
-                        "agentId": agent_id,
-                        "type": "trace",
-                        "toolName": tool_name,
-                        "workflowId": workflow_id,
-                    })
-        elif "reasoningText" in event and event["reasoningText"]:
-            _flush_text_buffer()  # flush pending text before reasoning event
-            tracker._publish_event("agent.streaming", {
-                "agentId": agent_id,
-                "type": "reasoning",
-                "content": event["reasoningText"],
-                "workflowId": workflow_id,
-            })
-        if "result" in event:
-            result = event["result"]
+    # The stream rides the wall-clock guard (TEAM-3252): a wedged
+    # converse_stream read otherwise blocks this loop forever with the `chat`
+    # span left status=UNSET and no agent.error — the model-chat twin of the
+    # TEAM-3168 coding-handoff hang.
+    try:
+        async for event in _guarded_stream_events(agent.stream_async(prompt)):
+            if "data" in event and event["data"]:
+                final_text += event["data"]
+                _text_buffer += event["data"]
+                if len(_text_buffer) >= _FLUSH_THRESHOLD:
+                    _flush_text_buffer()
+            elif "current_tool_use" in event:
+                _flush_text_buffer()  # flush pending text before tool event
+                current_tool_use = event["current_tool_use"]
+                if current_tool_use and current_tool_use.get("name"):
+                    if tracker.previous_tool_use != current_tool_use:
+                        tracker.previous_tool_use = current_tool_use
+                        tool_name = current_tool_use["name"]
+                        tool_events.append(tool_name)
+                        logger.info(f"[{agent_id}] Tool call: {tool_name}")
+                        tracker._publish_event("agent.streaming", {
+                            "agentId": agent_id,
+                            "type": "trace",
+                            "toolName": tool_name,
+                            "workflowId": workflow_id,
+                        })
+            elif "reasoningText" in event and event["reasoningText"]:
+                _flush_text_buffer()  # flush pending text before reasoning event
+                tracker._publish_event("agent.streaming", {
+                    "agentId": agent_id,
+                    "type": "reasoning",
+                    "content": event["reasoningText"],
+                    "workflowId": workflow_id,
+                })
+            if "result" in event:
+                result = event["result"]
+    except _ModelChatStreamStall as stall:
+        # The guard already published agent.error and marked the span ERROR —
+        # end the invocation with an ERROR text instead of hanging until the
+        # external watchdog kills the persona.
+        logger.warning(f"[{agent_id}] model chat stream stalled: {stall}")
+        final_text = (final_text + "\n\n" if final_text else "") + f"ERROR: {stall}"
 
     # Flush any remaining buffered text after stream ends
     _flush_text_buffer()
