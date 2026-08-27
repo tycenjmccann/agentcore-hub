@@ -1639,9 +1639,10 @@ async function evaluateMetric(ctx, metric) {
 
 /**
  * One watcher cycle. Injectable for tests: pass `clients` (see initClients for
- * the shape), `env`, and `nowMs` to run it without AWS or a clock.
+ * the shape), `env`, `nowMs` and `bands` (a loadBands() result) to run it without
+ * AWS, a clock, or the bundled bands.yaml.
  */
-export async function runCycle({ event, context, env, clients, nowMs } = {}) {
+export async function runCycle({ event, context, env, clients, nowMs, bands: injectedBands } = {}) {
   const startedAt = Date.now();
   const resolvedEnv = env || readEnv();
   const nowStamp = Number.isFinite(nowMs) ? nowMs : Date.now();
@@ -1649,7 +1650,7 @@ export async function runCycle({ event, context, env, clients, nowMs } = {}) {
   const canonicalCycle = canonicalWindowStart(isoOf(scheduledMs), CYCLE_MS);
   const cycle = cycleLabel(canonicalCycle);
 
-  const bands = await loadBands();
+  const bands = injectedBands || (await loadBands());
   let configError = null;
   if (!bands.ok) {
     configError = `bands.yaml invalid: ${bands.errors.length} error(s)`;
