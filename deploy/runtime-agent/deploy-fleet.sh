@@ -28,6 +28,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$SCRIPT_DIR"
 DEPLOY_MODE="${DEPLOY_MODE:-lightweight}"
 
+# Eval gate (FR-7): refuse to ship ungated prompt/agents.json changes.
+source "$SCRIPT_DIR/../lib/check-eval-gate.sh"
+require_eval_gate "deploy/runtime-agent/prompts/**" "src/config/agents.json"
+
 # Create runtime role if not already set
 if [ -z "${AGENTCORE_ROLE_ARN:-}" ]; then
   echo "AGENTCORE_ROLE_ARN not set — creating runtime role..."

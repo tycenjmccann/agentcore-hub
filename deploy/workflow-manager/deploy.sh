@@ -11,6 +11,10 @@ set -e
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "${REPO_ROOT}/deploy/config.sh"
 
+# Eval gate (FR-7): the workflow-manager system prompt is a gated artifact.
+source "${REPO_ROOT}/deploy/lib/check-eval-gate.sh"
+require_eval_gate "deploy/workflow-manager/system-prompt.md"
+
 BUCKET="$ARTIFACT_BUCKET"
 ROLE_ARN="$LAMBDA_ROLE_ARN"
 ANALYSES_TABLE="${ANALYSES_TABLE:-agentcore-hub-workflow-analyses}"

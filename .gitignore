@@ -70,3 +70,6 @@ __pycache__/
 # Claude Code
 .claude/
 .recovered/
+
+# Eval-gate break-glass audit log (local copy; canonical record is in S3)
+.eval-gate-overrides.log

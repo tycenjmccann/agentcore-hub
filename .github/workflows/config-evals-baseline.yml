@@ -1,0 +1,112 @@
+# Config Evals Baseline (FR-3) — regenerates evals/battery/baseline.json ONLY
+# on merge to main (plus manual dispatch). PR runs never write the baseline;
+# run-battery.mjs refuses --out outside --baseline-mode by construction.
+#
+# Security posture mirrors config-evals-gate.yml: OIDC only, no persisted git
+# credential, attributable role session name (CRED-3).
+name: Config Evals Baseline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/runtime-agent/prompts/**"
+      - "deploy/workflow-manager/system-prompt.md"
+      - "src/config/workflows.json"
+      - "src/config/agents.json"
+      - "blueprints/**"
+      - "evals/battery/**"
+  workflow_dispatch:
+
+# Serialize baseline runs; never cancel one mid-write — the supersession check
+# in the commit step handles a queued run landing after a newer one.
+concurrency:
+  group: config-evals-baseline
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    # ~3× the gate battery's budget: --repeat 3 runs every case three times to
+    # stabilize per-evaluator means.
+    timeout-minutes: 30
+    permissions:
+      contents: write # commit-back of baseline.json
+      id-token: write # OIDC role assumption
+    environment: config-evals
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # No on-disk credential; the push step below injects a token
+          # explicitly and only into its own environment.
+          persist-credentials: false
+          # Full history: the supersession check needs ancestry
+          # (merge-base --is-ancestor) and the rebase+push needs real parents.
+          fetch-depth: 0
+
+      - name: Assert no on-disk git credential
+        run: |
+          set -euo pipefail
+          extraheader="$(git config --get http.https://github.com/.extraheader || true)"
+          if [ -n "$extraheader" ]; then
+            echo "::error::git http extraheader credential persisted despite persist-credentials:false"
+            exit 1
+          fi
+          if grep -qi authorization .git/config; then
+            echo "::error::authorization header present in .git/config"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Assume eval-gate role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_EVAL_GATE_ROLE_ARN }}
+          aws-region: us-east-1
+          # CRED-3: attributable session name for CloudTrail.
+          role-session-name: gha-baseline-${{ github.run_id }}
+
+      - name: Regenerate baseline (repeat 3)
+        run: node evals/battery/run-battery.mjs --baseline-mode --repeat 3 --out evals/battery/baseline.json
+
+      # SECRET-4: the push uses the workflow-scoped ephemeral GITHUB_TOKEN,
+      # injected only into this step's env (persist-credentials is false, so
+      # nothing lives on disk). OPS PREREQUISITE: branch protection on main
+      # must allow pushes from the github-actions[bot] app (or swap this for a
+      # narrowly-scoped deploy key) — otherwise this step fails with a 403 and
+      # the baseline must be committed manually.
+      - name: Commit baseline back to main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- evals/battery/baseline.json; then
+            echo "baseline unchanged — nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add evals/battery/baseline.json
+          git commit -m "chore: regenerate evals baseline for ${GITHUB_SHA} [skip ci]"
+          if ! git pull --rebase origin main; then
+            # Conflict: someone else landed a baseline while we ran. If theirs
+            # was generated from a DESCENDANT of our commit, ours is stale —
+            # discard it and exit green (superseded, not an error).
+            incoming_source="$(git show origin/main:evals/battery/baseline.json | jq -r '.source_commit // empty' || true)"
+            if [ -n "$incoming_source" ] && git merge-base --is-ancestor "$GITHUB_SHA" "$incoming_source"; then
+              echo "::notice::superseded — origin/main already carries a baseline generated from $incoming_source, a descendant of $GITHUB_SHA. Discarding this run's baseline."
+              git rebase --abort || true
+              exit 0
+            fi
+            echo "::error::rebase conflict on baseline.json not explained by a newer (descendant) baseline — resolve manually"
+            exit 1
+          fi
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main

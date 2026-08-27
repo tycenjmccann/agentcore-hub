@@ -38,6 +38,11 @@ if [[ -f .env.local ]]; then
   set +a
 fi
 
+# Eval gate (FR-7): the container bakes in agents.json/workflows.json — refuse
+# to build/push ungated config. Runs before the docker build and S3 reads.
+source "$REPO_ROOT/deploy/lib/check-eval-gate.sh"
+require_eval_gate "src/config/agents.json" "src/config/workflows.json"
+
 : "${AWS_REGION:?AWS_REGION must be set}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
