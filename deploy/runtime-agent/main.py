@@ -259,10 +259,11 @@ CLOUD_CODE_TABLE = os.getenv("CLOUD_CODE_TABLE", "agentcore-hub-cloud-code-sessi
 # client-generated), so even a timeout here can't double-run a turn.
 REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "600"))
 # Poll cadence + overall turn budget. The budget must exceed the coding
-# runtime's TURN_TIMEOUT_S (1500s) so its own timeout verdict reaches us via the
-# journal instead of us giving up first.
+# runtime's TURN_TIMEOUT_S (1500s) PLUS its post-CLI terminal work — artifact
+# harvest (can be GBs) and the journal-write retry loop — so the runner's own
+# verdict reaches us via the journal instead of us giving up first.
 REMOTE_CODING_POLL_S = int(os.getenv("REMOTE_CODING_POLL_S", "20"))
-REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "1700"))
+REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "2700"))
 
 # Tenant the workflow session rows belong to. Multi-tenant deployments must set
 # this to the tenant that owns the fleet, or the Cloud Code tab (which scopes
@@ -477,7 +478,22 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
         unknowns = 0
         # "running" or "transient" (degraded EFS read / torn read racing the
         # journal's tmp+rename): the turn may still be live — keep polling.
-    return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget"}
+    # Budget spent with no terminal verdict. The turn may STILL complete (e.g.
+    # a huge artifact harvest after the CLI finished) — its edits/commits may
+    # already exist, so a blind re-run is not safe. Probe once more and tell
+    # the persona to VERIFY (git log / workspace state) before re-issuing.
+    try:
+        final = _poll_once(client, turn_id)
+        if final.get("status") == "done":
+            return final
+    except Exception:  # noqa: BLE001
+        pass
+    return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget "
+                     f"with no verdict — the turn may have completed its work. "
+                     f"Do NOT blindly re-run: first issue a short coding call asking "
+                     f"to summarize current workspace/branch state (git log, git "
+                     f"status) and continue from there",
+            "no_retry_hint": True}
 
 
 def _poll_once(client, turn_id: str) -> dict:
@@ -502,10 +518,16 @@ def _recover_lost_submit(client, payload: dict):
         resubmit; give up with an explicit error (the persona's retry guidance
         stands, and the workspace is preserved).
     Returns a submit-shaped dict, or None when recovery is unsafe."""
-    try:
-        probe = _poll_once(client, payload["turn_id"])
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"[remote-coding] recovery probe failed: {str(e)[:200]}")
+    probe = None
+    for attempt in range(5):  # a throttled probe is transient — keep asking
+        try:
+            probe = _poll_once(client, payload["turn_id"])
+            break
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[remote-coding] recovery probe failed "
+                           f"({attempt + 1}/5): {str(e)[:200]}")
+            time.sleep(REMOTE_CODING_POLL_S)
+    if probe is None:
         return None
     state = probe.get("status")
     if state in ("running", "done", "transient"):
@@ -627,6 +649,10 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
                 f"Retry this same {cli} call — the session workspace is preserved.")
 
     if result.get("error"):
+        if result.get("no_retry_hint"):
+            # The turn's work may already exist in the workspace — the error
+            # text itself carries the verify-first instructions.
+            return f"ERROR: remote {cli} turn: {result['error']}"
         return (f"ERROR: remote {cli} turn failed: {result['error']}. "
                 f"Retry this same {cli} call — the session workspace is preserved.")
 
