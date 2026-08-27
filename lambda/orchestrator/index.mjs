@@ -316,9 +316,10 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
 
 /**
  * Unified "ticket done" handler — works with both DynamoDB and Jira backends.
- * Called from processStatusChange (Jira webhook path).
+ * Called from processStatusChange (Jira webhook path). Exported for tests —
+ * the webhook route to it is gated on TICKET_PROVIDER=jira at module load.
  */
-async function handleTicketDoneUnified(ticketId) {
+export async function handleTicketDoneUnified(ticketId) {
   const ticket = await getTicket(ticketId);
   if (!ticket) return;
 
