@@ -159,6 +159,14 @@ PROMPT_ENV="--env SYSTEM_PROMPT_S3_KEY=${PROMPT_S3_KEY}"
 
 # Run `agentcore deploy`, retrying once if S3 races with another concurrent
 # fleet deploy (the toolkit creates a shared codebuild bucket internally).
+#
+# OTel note: AGENT_OBSERVABILITY_ENABLED is what makes the platform inject ADOT
+# and route spans to the unified telemetry destination; it also gates main.py's
+# StrandsTelemetry fallback. Without it the invoke_agent span is never exported
+# and eval batches score 0/10. These are Runtime-hosted agents, so the OTLP
+# endpoint, auth headers and resource attributes are platform-managed — we
+# deliberately do NOT set OTEL_EXPORTER_OTLP_{LOGS,TRACES}_HEADERS or
+# OTEL_RESOURCE_ATTRIBUTES, and NEVER set DISABLE_ADOT_OBSERVABILITY.
 run_deploy() {
   agentcore deploy \
     --auto-update-on-conflict \
@@ -178,6 +186,13 @@ run_deploy() {
     --env "PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers" \
     --env "HOME=/tmp" \
     --env "TMPDIR=/tmp" \
+    --env "AGENT_OBSERVABILITY_ENABLED=true" \
+    --env "OTEL_PYTHON_DISTRO=aws_distro" \
+    --env "OTEL_PYTHON_CONFIGURATOR=aws_configurator" \
+    --env "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" \
+    --env "OTEL_TRACES_EXPORTER=otlp" \
+    --env "UNIFIED_TRACES_DESTINATION_ENABLED=true" \
+    --env "OTEL_SERVICE_NAME=${AGENT_NAME}" \
     ${FLEET_MEMORY_ID:+--env "MEMORY_ID=${FLEET_MEMORY_ID}"} \
     ${IOS_TEST_GATEWAY_URL:+--env "IOS_TEST_GATEWAY_URL=${IOS_TEST_GATEWAY_URL}"} \
     ${CODING_AGENT_RUNTIME_ARN:+--env "CODING_AGENT_RUNTIME_ARN=${CODING_AGENT_RUNTIME_ARN}"} \

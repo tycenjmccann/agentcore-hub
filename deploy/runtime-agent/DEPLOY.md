@@ -41,6 +41,78 @@ Optional: test with a different model:
 python3 verify-fleet-invoke.py --fleet-file fleet-runtime-ids.json --timeout 600 --parallel 5 --model us.anthropic.claude-sonnet-4-6
 ```
 
+## Post-deploy telemetry verification
+
+The eval batch classifies a run by the `invoke_agent` span
+(`gen_ai.operation.name=invoke_agent`, `scope.name=strands.telemetry.tracer`).
+That span only exists if a real OTel `TracerProvider` is registered in the
+runtime — so after every deploy that touches telemetry, run both probes below.
+A green deploy with no spans still scores 0/10.
+
+### 1. Startup probe — which TracerProvider won?
+
+`_init_telemetry()` in `main.py` logs exactly one `[telemetry]` line at module
+import. Read it from the runtime's log group:
+
+```bash
+AGENT_ID=<agent_id>   # e.g. agentcore_hub_backend_dev-XXXXXXXXXX
+aws logs filter-log-events \
+  --log-group-name "/aws/bedrock-agentcore/runtimes/${AGENT_ID}-DEFAULT" \
+  --filter-pattern '"[telemetry]"' \
+  --max-items 20
+```
+
+Interpret:
+
+| Log line | Meaning | Action |
+|----------|---------|--------|
+| `existing global TracerProvider: opentelemetry.sdk.trace.TracerProvider` (or an ADOT provider class) | Auto-instrumentation applied — the platform/ADOT registered the SDK before `main.py` loaded. **This is the healthy path.** | Continue to probe 2 |
+| `auto-instrumentation absent — StrandsTelemetry OTLP fallback active (was ...ProxyTracerProvider, now TracerProvider)` | No auto-instrumentation; `main.py` registered its own OTLP exporter. Spans *may* still ship, but only if `OTEL_EXPORTER_OTLP_*` resolves. | Continue to probe 2; if it fails, escalate (§3) |
+| `no TracerProvider and AGENT_OBSERVABILITY_ENABLED != true — spans will NOT be exported` | The observability env vars were not applied to this runtime. | Re-deploy — `AGENT_OBSERVABILITY_ENABLED=true` is missing (check `deploy-one.sh` / `deploy-one-robust.py` ran the current version) |
+| *no `[telemetry]` line at all* | Runtime is serving stale code. | Re-deploy and confirm the runtime status went through UPDATE |
+
+### 2. Span probe — did an `invoke_agent` span land?
+
+Invoke one agent (any real task, or `verify-fleet-invoke.py` against a single
+ARN), wait ~1 min for export, then:
+
+```bash
+aws logs filter-log-events \
+  --log-group-name "/aws/bedrock-agentcore/runtimes/${AGENT_ID}-DEFAULT" \
+  --log-stream-name-prefix spans \
+  --filter-pattern '"invoke_agent"'
+```
+
+Confirm in the returned span JSON:
+
+- `gen_ai.operation.name` = `invoke_agent`
+- `gen_ai.agent.name` = the persona's `agent_id` (comes from `Agent(name=agent_id)`)
+- `session.id` present (the runtime session id)
+- `gen_ai.user.message` and `gen_ai.choice` events present on the span
+- `agent.id` / `workflow.id` attributes present (from `trace_attributes`)
+
+Repeat once for a **detached** invocation — a payload with `{"detach": true}`,
+which is how the orchestrator dispatches workflow persona runs. Detached runs
+return to the caller immediately and finish on a background asyncio task, so
+they're the case most likely to lose spans if the provider is never flushed.
+An `invoke_agent` span must appear for the detached run too.
+
+### 3. Escalation — fallback active and no spans delivered
+
+If probe 1 reports the StrandsTelemetry fallback **and** probe 2 finds no
+`invoke_agent` span, stop trying to fix the CodeZip path: `direct_code_deploy`
+runtimes have no `opentelemetry-instrument` wrapper, so span delivery depends
+entirely on platform ADOT injection. Move the eval fleet to the container path,
+which runs `opentelemetry-instrument` explicitly via the Dockerfile `CMD`:
+
+```bash
+export DEPLOY_MODE=robust      # build-and-push.sh + deploy-one-robust.py
+./deploy-fleet.sh              # or ./deploy-one.sh <agent_name> for a single agent
+```
+
+Then re-run probes 1 and 2 — probe 1 should now report an existing SDK/ADOT
+`TracerProvider` rather than the fallback.
+
 ## Environment Variables Reference
 
 ### Required Shell Env (set BEFORE running deploy-one.sh)
@@ -72,6 +144,18 @@ These are passed via `--env` in deploy-one.sh and available inside the runtime a
 | `CLAUDE_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Claude Code model |
 | `ANTHROPIC_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Claude Code model (alt) |
 | `GITHUB_PAT` | *(token)* | GitHub MCP access |
+| `AGENT_OBSERVABILITY_ENABLED` | `true` | Platform ADOT injection + gates main.py's StrandsTelemetry fallback |
+| `OTEL_PYTHON_DISTRO` | `aws_distro` | Use the AWS OTel distro |
+| `OTEL_PYTHON_CONFIGURATOR` | `aws_configurator` | AWS OTel configurator |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | OTLP wire protocol |
+| `OTEL_TRACES_EXPORTER` | `otlp` | Export traces over OTLP |
+| `UNIFIED_TRACES_DESTINATION_ENABLED` | `true` | Deliver spans to the unified telemetry destination (`spans` log streams) |
+| `OTEL_SERVICE_NAME` | *(agent name)* | Service name on every emitted span |
+
+> Runtime-hosted agents get their OTLP endpoint, auth headers and resource
+> attributes from the platform. Do **not** set
+> `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_HEADERS` or
+> `OTEL_RESOURCE_ATTRIBUTES`, and **never** set `DISABLE_ADOT_OBSERVABILITY`.
 
 ## Known Gotchas
 

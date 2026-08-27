@@ -169,6 +169,45 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentcore-hub-pipeline-agent")
 
+
+# --- OTel telemetry (THE FIX for 0/10 eval scores) ---
+# Without a real TracerProvider registered, Strands' Tracer no-ops and the
+# `invoke_agent` span (gen_ai.operation.name=invoke_agent, emitted internally by
+# Agent.stream_async) is never exported — so eval batches see zero spans.
+def _init_telemetry() -> None:
+    """Register a real TracerProvider exactly once, whoever gets there first wins.
+
+    Under opentelemetry-instrument (container path — Dockerfile CMD) or
+    platform-injected ADOT (direct_code_deploy), a real SDK provider is already
+    global before this module loads; Strands' Tracer picks it up via
+    trace_api.get_tracer_provider() and we must NOT register a second one.
+    """
+    from opentelemetry import trace as trace_api
+
+    provider = trace_api.get_tracer_provider()
+    provider_cls = f"{provider.__class__.__module__}.{provider.__class__.__name__}"
+    # ProxyTracerProvider == "nobody has configured the SDK yet".
+    if not isinstance(provider, trace_api.ProxyTracerProvider):
+        logger.info(
+            f"[telemetry] existing global TracerProvider: {provider_cls} — skipping StrandsTelemetry init"
+        )
+        return
+    if os.getenv("AGENT_OBSERVABILITY_ENABLED", "").lower() != "true":
+        logger.warning(
+            f"[telemetry] no TracerProvider and AGENT_OBSERVABILITY_ENABLED != true — spans will NOT be exported (provider={provider_cls})"
+        )
+        return
+    from strands.telemetry import StrandsTelemetry
+
+    StrandsTelemetry().setup_otlp_exporter()  # honors OTEL_EXPORTER_OTLP_* env vars
+    logger.warning(
+        "[telemetry] auto-instrumentation absent — StrandsTelemetry OTLP fallback active "
+        f"(was {provider_cls}, now {trace_api.get_tracer_provider().__class__.__name__})"
+    )
+
+
+_init_telemetry()
+
 # Per-invocation prompt cache for shared-runtime topologies (1 or 4 runtimes
 # hosting many personas). First call for an agent_id reads
 # s3://{ARTIFACT_BUCKET}/prompts/{agent_id}.txt; subsequent calls in the same
@@ -2197,12 +2236,17 @@ async def _run_agent_invocation(payload, context):
     # mode short-circuits to the deployed SYSTEM_PROMPT.
     tracker = ToolTrackingHandler()
     persona_prompt = _load_prompt_for_agent(agent_id)
+    # name + trace_attributes land on the invoke_agent span as gen_ai.agent.name
+    # and agent.id/workflow.id, which is how the eval batch attributes a span
+    # to a persona and a workflow run.
     agent = Agent(
         model=active_model,
+        name=agent_id,
         system_prompt=persona_prompt,
         tools=all_tools,
         callback_handler=None,
         hooks=[_OperatorMailbox(workflow_id, agent_id)],
+        trace_attributes={"agent.id": agent_id, "workflow.id": workflow_id},
     )
 
     # Iterate stream_async — write events to DDB in real-time as they arrive.

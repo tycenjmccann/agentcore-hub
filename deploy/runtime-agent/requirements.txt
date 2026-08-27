@@ -11,4 +11,4 @@ playwright>=1.40.0
 nest-asyncio>=1.5.0
 opentelemetry-distro>=0.50b0
 opentelemetry-exporter-otlp>=1.29.0
-aws-opentelemetry-distro>=0.10.0
+aws-opentelemetry-distro>=0.18.0
