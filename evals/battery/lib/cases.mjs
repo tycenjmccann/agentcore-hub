@@ -68,6 +68,7 @@ export function loadCaseValidator(repoRoot) {
 
 export function loadBattery(repoRoot) {
   const dir = batteryDir(repoRoot);
+  /** @type {{ manifest: any, thresholds: any, baseline: any, cases: any[], errors: Array<{check: string, file: string, message: string}> }} */
   const out = { manifest: null, thresholds: null, baseline: null, cases: [], errors: [] };
   for (const [key, file] of [
     ["manifest", "manifest.json"],

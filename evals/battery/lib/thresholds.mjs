@@ -14,6 +14,7 @@ export function normalizeScore(raw) {
 
 // floor = baseline mean − floorDelta, clamped up to minAbsoluteFloor;
 // a case file's evaluator_floors entry overrides the derivation entirely.
+/** @param {{ baselineMean: number, thresholds: any, override?: number|null }} args */
 export function deriveFloor({ baselineMean, thresholds, override }) {
   if (override !== undefined && override !== null) return override;
   return Math.max(baselineMean - thresholds.floorRule.floorDelta, thresholds.floorRule.minAbsoluteFloor);
@@ -28,6 +29,8 @@ const round2 = (x) => Math.round(x * 100) / 100;
  * newCaseIds: ids added in this PR (or ALL active ids when baseline.bootstrap)
  *   — these run informational: scores reported, no delta verdict; but a
  *   non-scored new case still fails the gate.
+ *
+ * @param {{ thresholds: any, baseline: any, caseResults: any[], newCaseIds?: string[], costEstimateUsd?: number, scoringBackend?: string }} args
  */
 export function evaluateSuite({ thresholds, baseline, caseResults, newCaseIds, costEstimateUsd, scoringBackend }) {
   const failureReasons = [];

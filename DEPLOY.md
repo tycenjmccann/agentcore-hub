@@ -26,6 +26,16 @@ NOT rewritten by the commands below. That is deliberate:
   set — it rewrites function env vars and would blank prod Jira credentials.**
   The staging deploy below is code-only for exactly this reason.
 
+## Config evals gate
+
+Prompt/config/blueprint changes are gated by the config-evals battery — see
+[`evals/battery/README.md`](evals/battery/README.md) for cases, thresholds,
+and the break-glass procedure. All deploy targets that ship gated artifacts
+(`deploy/runtime-agent/deploy{,-one,-fleet,-topology}.sh`,
+`deploy/workflow-manager/deploy.sh`, `deploy/apprunner/deploy.sh`,
+`deploy/ecs-express/deploy.sh`) source `deploy/lib/check-eval-gate.sh` and
+refuse to run unless HEAD carries a green `config-evals-gate` check run.
+
 ## Staging deploy
 
 The hub has no separate staging account; "staging" = deploying code-only
@@ -40,6 +50,11 @@ aws lambda update-function-code --function-name agentcore-hub-orchestrator \
 # 2. Blueprints + prompts + config → S3 artifact bucket
 #    (blueprints/prompts are safe to cp; agents.json must be MERGED onto the S3
 #    copy — the S3 version carries deploy-injected runtimeArns the repo nulls out)
+#    PRE-STEP: this target ships gated artifacts raw (no deploy script), so run
+#    the eval-gate check yourself before syncing:
+source deploy/lib/check-eval-gate.sh
+require_eval_gate "blueprints/**" "deploy/runtime-agent/prompts/**" \
+  "deploy/workflow-manager/system-prompt.md" "src/config/agents.json" "src/config/workflows.json"
 aws s3 sync blueprints/ "s3://$ARTIFACT_BUCKET/blueprints/"
 aws s3 sync deploy/runtime-agent/prompts/ "s3://$ARTIFACT_BUCKET/prompts/"
 aws s3 cp src/config/workflows.json "s3://$ARTIFACT_BUCKET/config/workflows.json"

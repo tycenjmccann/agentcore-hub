@@ -85,7 +85,7 @@ describe("malformed cases fail loudly (before any Bedrock spend)", () => {
     }));
     expect(pf.ok).toBe(false);
     const err = pf.errors.find((e: any) => e.check === "parse");
-    expect(err.file).toBe("evals/battery/cases/broken.json");
+    expect(err?.file).toBe("evals/battery/cases/broken.json");
   });
 
   it("names the file on a schema violation", () => {

@@ -163,8 +163,8 @@ describe("new-case semantics", () => {
     });
     expect(suite.verdict).toBe("PASS");
     const row = suite.deltaRows.find((r: any) => r.case === "fresh");
-    expect(row.verdict).toBe("informational");
-    expect(row.baseline).toBeNull();
+    expect(row?.verdict).toBe("informational");
+    expect(row?.baseline).toBeNull();
     expect(suite.informationalCases).toContain("fresh");
   });
 

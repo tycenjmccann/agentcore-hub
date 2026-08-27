@@ -164,7 +164,7 @@ export async function runCase({ caseDef, repoRoot, runId, converse, maxTurns = M
       clearTimeout(timer);
       if (watchdog.signal.aborted) {
         // The per-case watchdog fired — a real timeout, never retried.
-        return { id: caseDef.id, status: "timed_out", attempt, sessionId, error: `timed out after ${caseDef.timeoutSeconds}s`, trajectory: [], usage: { inputTokens: 0, outputTokens: 0 } };
+        return { id: caseDef.id, status: "timed_out", attempt, sessionId, error: `timed out after ${caseDef.timeoutSeconds}s`, forbiddenHits: [], trajectory: [], usage: { inputTokens: 0, outputTokens: 0 } };
       }
       lastError = err;
       const retryable = isRetryableTransportError(err) && (!producedOutput || /Throttling|5\d\d/.test(String(err?.$metadata?.httpStatusCode || err?.name)));
@@ -175,6 +175,7 @@ export async function runCase({ caseDef, repoRoot, runId, converse, maxTurns = M
         attempt,
         sessionId,
         error: `${err.name || "Error"}: ${err.message}`,
+        forbiddenHits: [],
         trajectory: [],
         usage: { inputTokens: 0, outputTokens: 0 },
       };
@@ -186,6 +187,7 @@ export async function runCase({ caseDef, repoRoot, runId, converse, maxTurns = M
     attempt,
     sessionId,
     error: `${lastError?.name || "Error"}: ${lastError?.message}`,
+    forbiddenHits: [],
     trajectory: [],
     usage: { inputTokens: 0, outputTokens: 0 },
   };

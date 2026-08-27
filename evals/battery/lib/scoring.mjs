@@ -181,7 +181,9 @@ export function parseJudgeResponse(response) {
  * `unscored` ⇒ gate FAIL (a partial score set is never a silent pass).
  */
 export async function scoreCase({ caseDef, runResult, transport, repoRoot }) {
+  /** @type {Record<string, number>} */
   const scores = {};
+  /** @type {Record<string, any>} */
   const details = {};
   const usage = { inputTokens: 0, outputTokens: 0 };
   for (const evaluator of caseDef.evaluators) {
