@@ -205,6 +205,16 @@ function makeHarness(opts = {}) {
     return Number.isFinite(existing.expiresAt) && Number.isFinite(nowEpoch) && existing.expiresAt < nowEpoch;
   }
 
+  // TEAM-3334: ownership guards come in two spellings now — ":mine" (this
+  // invocation's claims) and ":owner" (the unverified-claim resolver acting on
+  // an EARLIER invocation's claim). Enforce whichever the expression names.
+  function checkClaimToken(cmd, existing) {
+    const ref = cmd.ConditionExpression?.match(/claimToken = (:\w+)/);
+    if (!ref) return;
+    const want = cmd.ExpressionAttributeValues?.[ref[1]];
+    if (!existing || existing.claimToken !== want) throw conditionalFailure();
+  }
+
   const ddb = {
     async send(cmd) {
       // Yield BEFORE handling so two in-flight cycles interleave here; the
@@ -236,14 +246,20 @@ function makeHarness(opts = {}) {
           }
           const key = keyOf(cmd.Key.pk, cmd.Key.sk);
           const existing = store.get(key);
-          if (cmd.ConditionExpression?.includes("claimToken = :mine")) {
-            const mine = cmd.ExpressionAttributeValues?.[":mine"];
-            if (!existing || existing.claimToken !== mine) throw conditionalFailure();
-          }
+          checkClaimToken(cmd, existing);
           const merged = { ...(existing || { pk: cmd.Key.pk, sk: cmd.Key.sk }) };
-          for (const [name, value] of Object.entries(cmd.ExpressionAttributeValues || {})) {
-            if (name === ":mine" || name === ":empty") continue;
-            merged[name.slice(1)] = value;
+          if (cmd.UpdateExpression?.includes("list_append") && cmd.ExpressionAttributeValues?.[":w"]) {
+            // TEAM-3334: the only state-table list_append is the ratelimit filed
+            // list — apply real append semantics so tests can read it back.
+            merged.filed = [
+              ...(Array.isArray(existing?.filed) ? existing.filed : []),
+              ...cmd.ExpressionAttributeValues[":w"],
+            ];
+          } else {
+            for (const [name, value] of Object.entries(cmd.ExpressionAttributeValues || {})) {
+              if (name === ":mine" || name === ":empty" || name === ":owner") continue;
+              merged[name.slice(1)] = value;
+            }
           }
           store.set(key, merged);
           return {};
@@ -251,15 +267,21 @@ function makeHarness(opts = {}) {
         case "Delete": {
           const key = keyOf(cmd.Key.pk, cmd.Key.sk);
           const existing = store.get(key);
-          if (cmd.ConditionExpression?.includes("claimToken = :mine")) {
-            const mine = cmd.ExpressionAttributeValues?.[":mine"];
-            if (!existing || existing.claimToken !== mine) throw conditionalFailure();
-          }
+          checkClaimToken(cmd, existing);
           store.delete(key);
           return {};
         }
         case "Query": {
-          if (cmd.TableName === ENV.workflowsTable) return { Items: opts.openItems || [] };
+          if (cmd.TableName === ENV.workflowsTable) {
+            const items = opts.openItems || [];
+            // TEAM-3334 F1: the resolver bounds its index read by startedAt and
+            // reads a candidate's stored intake payload from the base table.
+            const since = cmd.ExpressionAttributeValues?.[":since"];
+            if (since !== undefined) return { Items: items.filter((w) => String(w?.startedAt ?? "") >= since) };
+            const id = cmd.ExpressionAttributeValues?.[":id"];
+            if (id !== undefined) return { Items: items.filter((w) => w?.workflowId === id) };
+            return { Items: items };
+          }
           if (cmd.TableName === ENV.eventsTable) return { Items: [] };
           const pk = cmd.ExpressionAttributeValues?.[":pk"];
           const lo = cmd.ExpressionAttributeValues?.[":a"];
@@ -1118,4 +1140,244 @@ test("two invocations of the same scheduled cycle agree on label and windows", a
   // The claim keys they compute are identical — which is what makes the
   // conditional write a mutual exclusion rather than a coincidence.
   assert.deepEqual([...a.store.keys()].sort(), [...b.store.keys()].sort());
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. TEAM-3334 — ambiguous filings (F1), truncated counts (F2), GSI lag (F3)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** 14:37:31 → the cycle AFTER `CYCLE` (14:30Z), same evaluation window. */
+const EVENT_NEXT = Object.freeze({ time: "2026-08-27T14:37:31Z" });
+const NOW_NEXT_MS = Date.parse("2026-08-27T14:37:35Z");
+const CYCLE_NEXT = "2026-08-27T14:30Z";
+
+/** A post-send network death: ambiguous — the request MAY have been processed. */
+function ambiguousNetworkError() {
+  return Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } });
+}
+
+/** Record the POST in fetchCalls, then throw `err` (opts.responses cannot throw). */
+function throwingFetch(harness, err, onBody) {
+  return async (url, init) => {
+    const body = JSON.parse(init.body);
+    harness.fetchCalls.push({ url, method: init?.method, body });
+    if (onBody) onBody(body);
+    throw err;
+  };
+}
+
+test("a lost response to a processed POST never double-files (F1)", async () => {
+  const store = new Map();
+  const metricId = "fleet_rate_a";
+  const bands = bandsFixture(metricId);
+  const rows = rowsFor(metricId, TIER3_EVAL);
+  const openItems = []; // what intake actually recorded, GSI + base table
+
+  // Cycle N: intake processes the filing, but the response never arrives.
+  const first = makeHarness({ rows, store, openItems });
+  first.clients.fetch = throwingFetch(first, ambiguousNetworkError(), (body) => {
+    openItems.push({
+      workflowId: "wf_ghost",
+      intakeChannel: body.intakeChannel,
+      phase: "development",
+      startedAt: "2026-08-27T14:27:36Z",
+      input: { title: body.title },
+    });
+  });
+  const a = await runWatcher({ harness: first, bands, requestId: "req-a" });
+
+  assert.equal(startPosts(first).length, 1, "the first cycle did POST");
+  assert.deepEqual(a.summary.actions.tier3Filed, []);
+  const claimKey = `claim#${metricId}#fleet\u0000t3`;
+  assert.equal(store.get(claimKey).unverified, true, "ambiguous outcome keeps the claim, unverified");
+  assert.equal(store.get(claimKey).unverifiedCycle, CYCLE);
+
+  // Cycle N+1: same anomaly, and verification finds the ghost on the channel.
+  const second = makeHarness({ rows, store, openItems });
+  const b = await runWatcher({ harness: second, bands, event: EVENT_NEXT, nowMs: NOW_NEXT_MS, requestId: "req-b" });
+
+  assert.equal(startPosts(second).length, 0, "NO second filing");
+  assert.deepEqual(b.summary.actions.tier3Filed, []);
+  assert.deepEqual(b.summary.actions.dedupeSuppressed, [
+    { metricId, groupKey: "fleet", tier: 3, reason: "unverified_claim_verified_filed" },
+  ]);
+  assert.deepEqual(b.summary.actions.failures, []);
+  // The GSI shows the ghost by now, so the cap counts it too (no F3 double count).
+  assert.deepEqual(b.summary.rateLimit, { openCount: 1, cap: 3, allowed: 2 });
+  // The claim now records the verified filing and stops being unverified.
+  const claim = store.get(claimKey);
+  assert.equal(claim.workflowId, "wf_ghost");
+  assert.equal(claim.unverified, false);
+  assert.equal(claim.claimToken, "req-a", "still the original owner's claim — never re-acquired");
+  assert.equal(startPosts(first).length + startPosts(second).length, 1, "exactly ONE filing ever");
+});
+
+test("an unverified claim whose filing is verifiably absent is released and retried (F1)", async () => {
+  const store = new Map();
+  const metricId = "fleet_rate_a";
+  const bands = bandsFixture(metricId);
+  const rows = rowsFor(metricId, TIER3_EVAL);
+
+  // Cycle N: the POST dies ambiguously and intake recorded NOTHING.
+  const first = makeHarness({ rows, store });
+  first.clients.fetch = throwingFetch(first, ambiguousNetworkError());
+  const a = await runWatcher({ harness: first, bands, requestId: "req-a" });
+
+  const claimKey = `claim#${metricId}#fleet\u0000t3`;
+  assert.equal(store.get(claimKey).unverified, true);
+  const failure = a.summary.actions.failures.find((f) => f.stage === "tier3Filing");
+  assert.equal(failure.claim, "unverified");
+  assert.equal(failure.status, null);
+  assert.equal(first.calls.filter((c) => c.__cmd === "Delete").length, 0, "an ambiguous outcome never releases");
+
+  // Cycle N+1: the intake channel provably has no matching filing → the stale
+  // claim is released (owner-conditioned) and the retry files this cycle.
+  const second = makeHarness({ rows, store, responses: [okResponse({ workflowId: "wf_retry_1" })] });
+  const b = await runWatcher({ harness: second, bands, event: EVENT_NEXT, nowMs: NOW_NEXT_MS, requestId: "req-b" });
+
+  assert.equal(startPosts(second).length, 1, "the retry files");
+  assert.deepEqual(b.summary.actions.tier3Filed, [
+    { metricId, groupKey: "fleet", sigma: 14, workflowId: "wf_retry_1" },
+  ]);
+  const del = second.calls.find((c) => c.__cmd === "Delete");
+  assert.ok(del, "the stale claim was deleted before retrying");
+  assert.deepEqual(del.Key, { pk: `claim#${metricId}#fleet`, sk: "t3" });
+  assert.equal(del.ConditionExpression, "claimToken = :owner");
+  assert.equal(del.ExpressionAttributeValues[":owner"], "req-a", "guarded by the ORIGINAL owner's token");
+  const claim = store.get(claimKey);
+  assert.equal(claim.claimToken, "req-b", "a fresh claim replaced the released one");
+  assert.equal(claim.workflowId, "wf_retry_1");
+  assert.ok(!claim.unverified, "no unverified marker on the fresh claim");
+  // The retry's filing is on the new cycle's ratelimit filed list (F3 feed).
+  assert.deepEqual(store.get(`${RATELIMIT_PK}\u0000${CYCLE_NEXT}`).filed, ["wf_retry_1"]);
+});
+
+test("an unverified claim stays put when verification itself fails (F1 fail-closed)", async () => {
+  const store = new Map();
+  const metricId = "fleet_rate_a";
+  const bands = bandsFixture(metricId);
+  const rows = rowsFor(metricId, TIER3_EVAL);
+
+  const first = makeHarness({ rows, store });
+  first.clients.fetch = throwingFetch(first, ambiguousNetworkError());
+  await runWatcher({ harness: first, bands, requestId: "req-a" });
+  const claimKey = `claim#${metricId}#fleet\u0000t3`;
+  assert.equal(store.get(claimKey).unverified, true);
+
+  // Cycle N+1: only the verification read (the :since-bounded index Query)
+  // fails; the open-count query still works, so the ONLY blocker is F1.
+  const second = makeHarness({ rows, store });
+  const original = second.clients.ddb.send.bind(second.clients.ddb);
+  second.clients.ddb.send = async (cmd) => {
+    if (cmd.__cmd === "Query" && cmd.IndexName === INTAKE_INDEX && cmd.ExpressionAttributeValues?.[":since"]) {
+      throw new Error("gsi unavailable");
+    }
+    return original(cmd);
+  };
+  const b = await runWatcher({ harness: second, bands, event: EVENT_NEXT, nowMs: NOW_NEXT_MS, requestId: "req-b" });
+
+  assert.equal(startPosts(second).length, 0, "fail closed: never file past an unresolved claim");
+  assert.deepEqual(b.summary.actions.tier3Filed, []);
+  assert.ok(
+    b.summary.actions.failures.some((f) => f.stage === "tier3VerifyUnverified" && /gsi unavailable/.test(f.error)),
+    JSON.stringify(b.summary.actions.failures)
+  );
+  const claim = store.get(claimKey);
+  assert.equal(claim.unverified, true, "the claim is untouched");
+  assert.equal(claim.claimToken, "req-a");
+  assert.equal(second.calls.filter((c) => c.__cmd === "Delete").length, 0, "nothing was released");
+});
+
+test("a pre-connection failure (ECONNREFUSED) still releases the claim for retry (F1)", async () => {
+  const { harness, bands, metricId } = scenario({});
+  harness.clients.fetch = throwingFetch(
+    harness,
+    Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } })
+  );
+  const { summary } = await runWatcher({ harness, bands });
+
+  assert.equal(startPosts(harness).length, 1, "it did try");
+  assert.deepEqual(summary.actions.tier3Filed, []);
+  const failure = summary.actions.failures.find((f) => f.stage === "tier3Filing");
+  assert.equal(failure.claim, "released", "nothing reached intake — provably safe to retry");
+  const del = harness.calls.find((c) => c.__cmd === "Delete");
+  assert.ok(del, "the claim is deleted");
+  assert.equal(del.ConditionExpression, "claimToken = :mine");
+  assert.equal(harness.store.has(`claim#${metricId}#fleet\u0000t3`), false);
+});
+
+test("a truncated open-count query fails CLOSED and blocks the filing (F2)", async () => {
+  const { harness, bands, metricId } = scenario({ openItems: [openWorkflow("wf_open_1")] });
+  const original = harness.clients.ddb.send.bind(harness.clients.ddb);
+  harness.clients.ddb.send = async (cmd) => {
+    const res = await original(cmd);
+    if (cmd.__cmd === "Query" && cmd.IndexName === INTAKE_INDEX) {
+      // Every page still points onward: the page cap leaves a PARTIAL list.
+      return { ...res, LastEvaluatedKey: { workflowId: "wf_more" } };
+    }
+    return res;
+  };
+  const { summary } = await runWatcher({ harness, bands });
+
+  assert.deepEqual(summary.rateLimit, { openCount: null, cap: 3, allowed: 0 });
+  assert.equal(harness.fetchCalls.length, 0, "a partial count must never authorise a filing");
+  assert.ok(
+    summary.actions.failures.some(
+      (f) => f.stage === "tier3Filing" && f.metricId === metricId && /truncated after 20 pages/.test(f.error)
+    ),
+    JSON.stringify(summary.actions.failures)
+  );
+  // Degradation is not silent: the operator is paged with the blocked reason.
+  assert.equal(harness.notifications.length, 1);
+  assert.ok(harness.notifications[0].notification.details.includes("NOT FILED"));
+});
+
+test("a workflow filed last cycle but missing from the GSI still counts toward the cap (F3)", async () => {
+  const store = new Map();
+  const metricId = "fleet_rate_a";
+  const bands = bandsFixture(metricId);
+  // Cycle N-1 (14:10Z) filed wf_ghost_1, but the eventually-consistent GSI still
+  // shows only the two older open filings.
+  store.set(`${RATELIMIT_PK}\u00002026-08-27T14:10Z`, {
+    pk: RATELIMIT_PK,
+    sk: "2026-08-27T14:10Z",
+    claimToken: "req-past",
+    filed: ["wf_ghost_1"],
+    expiresAt: Math.floor(NOW_MS / 1000) + 3600,
+  });
+  const harness = makeHarness({
+    rows: rowsFor(metricId, TIER3_EVAL),
+    store,
+    openItems: [openWorkflow("wf_o1"), openWorkflow("wf_o2")],
+  });
+  const { summary } = await runWatcher({ harness, bands });
+
+  assert.deepEqual(summary.rateLimit, { openCount: 3, cap: 3, allowed: 0 });
+  assert.equal(startPosts(harness).length, 0, "the not-yet-indexed filing closes the cap");
+  assert.deepEqual(summary.actions.tier3RateLimited, [
+    { metricId, groupKey: "fleet", sigma: 14, openCount: 3 },
+  ]);
+});
+
+test("a filed id already visible in the GSI is not double-counted (F3)", async () => {
+  const store = new Map();
+  const metricId = "fleet_rate_a";
+  const bands = bandsFixture(metricId);
+  store.set(`${RATELIMIT_PK}\u00002026-08-27T14:10Z`, {
+    pk: RATELIMIT_PK,
+    sk: "2026-08-27T14:10Z",
+    claimToken: "req-past",
+    filed: ["wf_ghost_1"],
+    expiresAt: Math.floor(NOW_MS / 1000) + 3600,
+  });
+  // The GSI has caught up: wf_ghost_1 is indexed (open) alongside one other.
+  const harness = makeHarness({
+    rows: rowsFor(metricId, TIER3_EVAL),
+    store,
+    openItems: [openWorkflow("wf_ghost_1"), openWorkflow("wf_o1")],
+  });
+  const { summary } = await runWatcher({ harness, bands });
+
+  assert.deepEqual(summary.rateLimit, { openCount: 2, cap: 3, allowed: 1 });
+  assert.equal(startPosts(harness).length, 1, "2 open ⇒ still 1 filing allowed");
 });

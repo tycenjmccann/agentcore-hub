@@ -718,9 +718,11 @@ async function releaseClaim(ctx, { pk, sk }) {
   }
 }
 
-async function annotateClaim(ctx, { pk, sk, fields }) {
+// TEAM-3334 F1: ownerToken lets the unverified-claim resolver annotate a claim
+// created by an EARLIER invocation; default remains this invocation's own claims.
+async function annotateClaim(ctx, { pk, sk, fields, ownerToken }) {
   const names = {};
-  const values = { ":mine": ctx.requestId };
+  const values = { ":mine": ownerToken ?? ctx.requestId };
   const sets = [];
   for (const [key, value] of Object.entries(fields)) {
     names[`#${key}`] = key;
@@ -1575,16 +1577,14 @@ async function resolveUnverifiedClaim(ctx, metric, verdict, claimItem) {
 
     if (found) {
       // The ambiguous POST DID file. Record the workflowId on the claim and keep
-      // it — the suppression it provides is now backed by a real filing.
-      await ctx.clients.ddb.send(
-        new ctx.cmd.UpdateCommand({
-          TableName: ctx.env.stateTable,
-          Key: claim,
-          UpdateExpression: "SET workflowId = :w, verifiedAt = :now, unverified = :f",
-          ConditionExpression: "claimToken = :owner",
-          ExpressionAttributeValues: { ":w": found, ":now": ctx.nowIso, ":f": false, ":owner": claimItem.claimToken },
-        })
-      );
+      // it — the suppression it provides is now backed by a real filing. The
+      // annotation is owner-conditioned; if it fails, the claim simply stays
+      // unverified and the next cycle re-verifies (still no filing either way).
+      await annotateClaim(ctx, {
+        ...claim,
+        fields: { workflowId: found, verifiedAt: ctx.nowIso, unverified: false },
+        ownerToken: claimItem.claimToken,
+      });
       ctx.summary.actions.dedupeSuppressed.push({
         metricId: metric.id,
         groupKey: verdict.groupKey,
