@@ -544,6 +544,71 @@ describe("Lightbox drag vs click threshold (FR-5)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Browser-faithful tap simulation (TEAM-3329). Real browsers synthesize
+// mouse events from taps: each un-prevented touchend yields a click, and two
+// such clicks in quick succession also yield a dblclick. jsdom/this harness
+// does none of that, so these helpers replay the full sequence, honoring
+// defaultPrevented on touchend exactly like a browser would.
+// ---------------------------------------------------------------------------
+
+// Single tap: touchstart/touchend, then the synthesized click unless the
+// touchend was default-prevented. Returns whether it was prevented.
+function tap(p: { x: number; y: number }): boolean {
+  fire("onTouchStart", touchEv([p]));
+  let prevented = false;
+  fire("onTouchEnd", {
+    touches: [],
+    preventDefault: () => (prevented = true),
+    stopPropagation: () => {},
+  });
+  if (!prevented) clickImage();
+  return prevented;
+}
+
+describe("Lightbox touch double-tap vs synthesized mouse events (TEAM-3329)", () => {
+  it("defect 1: double-tap toggle survives the browser's synthesized click/dblclick", () => {
+    mount(BASE);
+    const prevented1 = tap({ x: 100, y: 100 });
+    now += 100;
+    const prevented2 = tap({ x: 100, y: 100 }); // second tap toggles in touchstart
+    expect(transformState().scale).toBe(2.5);
+    // The browser only synthesizes the trailing dblclick when both taps'
+    // clicks went through; the fix must prevent the handled tap's touchend.
+    expect(prevented2).toBe(true);
+    if (!prevented1 && !prevented2) doubleClick();
+    expect(transformState().scale).toBe(2.5); // still zoomed — no re-toggle
+  });
+
+  it("defect 1 belt-and-braces: a dblclick delivered despite preventDefault right after a double-tap is ignored, but a later mouse double-click still works", () => {
+    mount(BASE);
+    tap({ x: 100, y: 100 });
+    now += 100;
+    tap({ x: 100, y: 100 }); // → 2.5x
+    expect(transformState().scale).toBe(2.5);
+    doubleClick(); // hostile: browser synthesized it anyway
+    expect(transformState().scale).toBe(2.5); // guard swallowed it
+    now += 1000; // well past the touch-proximity window
+    genuineDoubleClick();
+    expect(transformState()).toEqual({ tx: 0, ty: 0, scale: 1 });
+  });
+
+  it("defect 2: pinch disarms the double-tap detector — a quick tap after a pinch does not reset zoom", () => {
+    mount(BASE);
+    // First finger down (arms the tap detector), second lands → pinch to 1.5x.
+    fire("onTouchStart", touchEv([{ x: 100, y: 100 }]));
+    fire("onTouchStart", touchEv([{ x: 100, y: 100 }, { x: 200, y: 100 }])); // dist 100
+    fire("onTouchMove", touchEv([{ x: 100, y: 100 }, { x: 250, y: 100 }])); // dist 150 → ×1.5
+    fire("onTouchEnd", touchEv([]));
+    expect(transformState().scale).toBe(1.5);
+    // Tap within 300ms of the pinch's first finger-down: must NOT pair with
+    // it as a double-tap (which would reset the zoom to 1).
+    now += 150;
+    tap({ x: 150, y: 100 });
+    expect(transformState().scale).toBe(1.5);
+  });
+});
+
 describe("Lightbox zoom behaviors preserved (FR-6/8)", () => {
   it("AC-8.2: wheel sensitivity is deltaY×0.003, clamped 1–5", () => {
     mount(BASE);
