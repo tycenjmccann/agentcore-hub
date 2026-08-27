@@ -9,6 +9,7 @@ import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { duplicateCaseIds } from "./lib/cases.mjs";
+import { scanText } from "./lib/redact.mjs";
 
 const BATTERY_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(BATTERY_DIR, "..", "..");
@@ -19,21 +20,10 @@ const errors = [];
 const fail = (file, line, msg) =>
   errors.push(`${relative(REPO_ROOT, file)}${line ? `:${line}` : ""}  ${msg}`);
 
-// ─── 1. Forbidden-pattern scan over cases/ and fixtures/ ────────────────────
-
-const FORBIDDEN = [
-  [/TEAM-[0-9]+/, "real Jira project key (use BATT-*)"],
-  [/atlassian\.net/, "real Jira host"],
-  [/github\.com\/tycenjmccann/, "real GitHub owner (use example-org/sample-service)"],
-  [/agentcore-hub-artifacts/, "real artifact bucket name"],
-  [/arn:aws/, "AWS ARN"],
-  [/[0-9]{12}/, "AWS-account-shaped id (12 consecutive digits)"],
-  [/wf_[0-9]{13}/, "prod workflow-id shape (use wf_battery_*)"],
-  [/AKIA[A-Z0-9]{16}/, "AWS access key id"],
-  [/-----BEGIN/, "PEM material"],
-  [/x-api-key/i, "API key header"],
-  [/Bearer [A-Za-z0-9]/, "bearer token"],
-];
+// ─── 1. Forbidden-pattern scan over cases/, fixtures/, and baseline.json ────
+// Pattern table + scanner live in lib/redact.mjs (shared with the runner's
+// write-time artifact redaction, C2). The committed baseline.json is repo
+// content and must be clean too.
 
 function* walk(dir) {
   if (!existsSync(dir)) return;
@@ -44,13 +34,12 @@ function* walk(dir) {
   }
 }
 
-for (const file of [...walk(CASES_DIR), ...walk(FIXTURES_DIR)]) {
-  const lines = readFileSync(file, "utf8").split("\n");
-  lines.forEach((text, i) => {
-    for (const [pattern, why] of FORBIDDEN) {
-      if (pattern.test(text)) fail(file, i + 1, `forbidden pattern ${pattern} — ${why}`);
-    }
-  });
+const baselinePath = join(BATTERY_DIR, "baseline.json");
+const scanned = [...walk(CASES_DIR), ...walk(FIXTURES_DIR), ...(existsSync(baselinePath) ? [baselinePath] : [])];
+for (const file of scanned) {
+  for (const f of scanText(readFileSync(file, "utf8"), { file })) {
+    fail(file, f.line, `forbidden pattern ${f.pattern} — ${f.why}`);
+  }
 }
 
 // ─── 2. Case schema validation (ajv when available) ─────────────────────────

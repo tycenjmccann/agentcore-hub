@@ -18,7 +18,7 @@
 // BATTERY_RUN_DEADLINE_SECONDS, BATTERY_CASE_DEADLINE_SECONDS,
 // BATTERY_MAX_TRANSPORT_RETRIES.
 
-import { readFileSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
+import { readFileSync, appendFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
@@ -30,6 +30,7 @@ import { createSpendLedger } from "./lib/spend.mjs";
 import { createConverseTransport, scoreCase, SCORING_BACKEND } from "./lib/scoring.mjs";
 import { createSemaphore, linkAbort } from "./lib/retry.mjs";
 import { buildResults, renderCheckSummary } from "./lib/report.mjs";
+import { writeRedacted, redactText } from "./lib/redact.mjs";
 import "./lib/otel.mjs"; // import-time contract check vs schema/otel-eval-attributes.json
 
 const BATTERY_DIR = dirname(fileURLToPath(import.meta.url));
@@ -296,8 +297,10 @@ async function main() {
   const resultsPath = resolve(flags.results || join(BATTERY_DIR, "battery-results.json"));
   const resultsDir = flags.baselineMode ? dirname(resolve(flags.out)) : dirname(resultsPath);
   const progressPath = join(resultsDir, "battery-progress.jsonl");
-  writeFileSync(progressPath, "");
-  const progress = (record) => appendFileSync(progressPath, JSON.stringify(record) + "\n");
+  writeRedacted(progressPath, "");
+  // Appends go through the same C2 redaction as every other generated
+  // artifact — progress lines carry runner error strings.
+  const progress = (record) => appendFileSync(progressPath, redactText(JSON.stringify(record)).text + "\n");
 
   // Whole-run watchdog: when it fires, every case deadline linked to it aborts,
   // in-flight cases report timed_out/unscored, unstarted cases report timed_out
@@ -490,7 +493,9 @@ async function main() {
       console.error("Baseline generation FAILED — not writing an unsound baseline.");
       process.exit(1);
     }
-    writeFileSync(
+    // C2: redact at the write-time choke point — nothing forbidden may land
+    // in the committed baseline regardless of raw error strings.
+    writeRedacted(
       outPath,
       JSON.stringify(
         {
@@ -541,9 +546,14 @@ async function main() {
     configSources: gate ? { baseRef: gate.baseRef, ...gate.sources } : { baseRef: null, all: "pr-head (local/manual run)" },
   });
 
-  writeFileSync(resultsPath, JSON.stringify(results, null, 2) + "\n");
+  // C2: redact at the write-time choke point. check-summary.md is published
+  // verbatim into a public check run, and battery-results.json is uploaded as
+  // an artifact — raw agent/judge error strings must never leak through them.
+  // (resultsPath is computed before the pool runs — the incremental
+  // battery-progress.jsonl lives next to it; TEAM-3352.)
+  writeRedacted(resultsPath, JSON.stringify(results, null, 2) + "\n");
   const summaryPath = join(dirname(resultsPath), "check-summary.md");
-  writeFileSync(summaryPath, renderCheckSummary(results) + "\n");
+  writeRedacted(summaryPath, renderCheckSummary(results) + "\n");
 
   console.log(`\n${renderCheckSummary(results)}`);
   console.log(`Results: ${resultsPath}\nCheck summary: ${summaryPath}`);
@@ -551,8 +561,9 @@ async function main() {
 }
 
 // Sanity: this module must never import anything that writes the canonical
-// baseline in gate mode; the only writeFileSync targets above are --out
-// (baseline mode, explicit) and the results/summary files.
+// baseline in gate mode; the only file-write targets above are --out
+// (baseline mode, explicit) and the results/summary files — all via the
+// writeRedacted choke point (C2).
 if (CASES_BACKEND !== SCORING_BACKEND) {
   console.error("internal: scoring backend constants diverged between cases.mjs and scoring.mjs");
   process.exit(1);

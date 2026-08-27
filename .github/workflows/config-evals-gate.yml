@@ -1,5 +1,16 @@
 # Config Evals Gate (FR-4/FR-6) — PR gate for prompt/config/blueprint changes.
 #
+# Always-run design (C1 / FR-2.6): the workflow triggers on EVERY pull_request
+# (no `paths:` filter) and computes the gated-path filter INSIDE the workflow
+# (changed-paths job). A trigger-level `paths:` filter would mean PRs touching
+# no gated path get NO `config-evals-gate` check run at all — making the check
+# unusable as a required status check in branch protection (every unrelated PR
+# would hang on "Expected — waiting"). Instead, the skip-publish job publishes
+# an explicit SUCCESS check ("SKIPPED — no gated paths changed") for ungated
+# PRs, so the check is always present and can safely be marked required.
+# Path detection FAILS CLOSED: if changed-paths cannot list the PR's files,
+# the PR is treated as gated (publish/fork-guard use `gated != 'false'`).
+#
 # Hardened per the TEAM-3066 security review:
 #   HERM-1  The job that executes PR code (battery) has NO checks:write and no
 #           on-disk git credential (persist-credentials: false + preflight
@@ -8,6 +19,8 @@
 #   CRED-2  Fork PRs never receive credentials and never run; a dedicated
 #           fork-guard job publishes an explicit FAILING check so a gated-path
 #           fork PR can never slip through with an absent/neutral check.
+#           (Ungated fork PRs get the skip-publish SUCCESS check instead —
+#           the fork guard only applies to PRs that touch gated paths.)
 #   CRED-3  The OIDC role session is named gha-<run_id>-<actor> so every
 #           Bedrock/S3 call in CloudTrail attributes to a specific run + human.
 #
@@ -17,13 +30,6 @@ name: Config Evals Gate
 
 on:
   pull_request:
-    paths:
-      - "deploy/runtime-agent/prompts/**"
-      - "deploy/workflow-manager/system-prompt.md"
-      - "src/config/workflows.json"
-      - "src/config/agents.json"
-      - "blueprints/**"
-      - "evals/battery/**"
 
 concurrency:
   group: config-evals-gate-${{ github.event.pull_request.number }}
@@ -34,10 +40,71 @@ concurrency:
 permissions: {}
 
 jobs:
+  # Decides whether this PR touches any gated path. Runs for ALL PRs — same-repo
+  # AND forks — which is safe because it executes zero PR code (github-script
+  # against the API only, no checkout). The path list must stay EXACTLY in sync
+  # with config-evals-baseline.yml's push paths, plus the two workflow files
+  # themselves: a PR that edits the gate must run the gate (fail closed).
+  changed-paths:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      gated: ${{ steps.filter.outputs.gated }}
+    steps:
+      - name: Detect gated-path changes
+        id: filter
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Keep in sync with config-evals-baseline.yml `on.push.paths`.
+            const gatedPrefixes = [
+              "deploy/runtime-agent/prompts/", // deploy/runtime-agent/prompts/**
+              "blueprints/",                   // blueprints/**
+              "evals/battery/",                // evals/battery/**
+            ];
+            const gatedFiles = [
+              "deploy/workflow-manager/system-prompt.md",
+              "src/config/workflows.json",
+              "src/config/agents.json",
+              // The gate workflows themselves: changes to the gate run the gate.
+              ".github/workflows/config-evals-gate.yml",
+              ".github/workflows/config-evals-baseline.yml",
+            ];
+            const isGated = (name) =>
+              typeof name === "string" &&
+              (gatedFiles.includes(name) ||
+                gatedPrefixes.some((p) => name.startsWith(p)));
+
+            // FAIL CLOSED: no try/catch — if listing files throws, this job
+            // fails, the `gated` output stays empty, and publish/fork-guard
+            // (`gated != 'false'`) treat the PR as gated.
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            // A rename out of a gated path changes gated content too, so
+            // previous_filename counts as well (matches git-diff semantics).
+            const hits = files
+              .filter((f) => isGated(f.filename) || isGated(f.previous_filename))
+              .map((f) => f.filename);
+            const gated = hits.length > 0;
+            core.info(
+              gated
+                ? `Gated paths changed (${hits.length}):\n${hits.join("\n")}`
+                : `No gated paths among ${files.length} changed file(s).`
+            );
+            core.setOutput("gated", gated ? "true" : "false");
+
   # The ONLY job that executes PR code. It cannot publish checks (HERM-1) and
   # only runs for same-repo branches (CRED-2 — forks get fork-guard instead).
   battery:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    needs: changed-paths
+    if: needs.changed-paths.outputs.gated == 'true' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     # A hung battery hits this timeout ⇒ failed job ⇒ publish reports a FAILED
     # check. Never neutral, never absent.
@@ -108,9 +175,12 @@ jobs:
 
   # Publishes the `config-evals-gate` check run. Runs NO PR code — no checkout
   # at all (HERM-1 split): its only inputs are the artifact and job status.
+  # `gated != 'false'` (not `== 'true'`): if changed-paths itself failed, its
+  # output is empty and the PR must still get a check — a FAILING one (fail
+  # closed), since we could not prove the PR touches no gated path.
   publish:
-    needs: battery
-    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [changed-paths, battery]
+    if: always() && needs.changed-paths.outputs.gated != 'false' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -128,12 +198,14 @@ jobs:
         uses: actions/github-script@v7
         env:
           BATTERY_JOB_RESULT: ${{ needs.battery.result }}
+          CHANGED_PATHS_RESULT: ${{ needs.changed-paths.result }}
         with:
           script: |
             const fs = require("fs");
             const path = require("path");
             const dir = path.join(process.env.RUNNER_TEMP, "battery-results");
             const jobResult = process.env.BATTERY_JOB_RESULT;
+            const pathsResult = process.env.CHANGED_PATHS_RESULT;
 
             let results = null;
             try {
@@ -147,12 +219,24 @@ jobs:
             // Fail closed in EVERY branch: success requires the artifact to
             // exist, the verdict to be PASS, and the battery job to have
             // succeeded. Missing artifact, FAIL verdict, job failure,
-            // cancellation, and timeout all land on "failure".
+            // cancellation, timeout, and a failed path detection all land on
+            // "failure".
             let conclusion = "failure";
             let title;
             if (results && results.verdict === "PASS" && jobResult === "success") {
               conclusion = "success";
               title = "PASS — config evals battery held the baseline";
+            } else if (jobResult === "skipped" && pathsResult !== "success") {
+              // The battery only skips inside this job's `if` when
+              // changed-paths failed (gated output empty ⇒ battery's
+              // `gated == 'true'` condition was false). We could not
+              // determine whether the PR touches gated paths ⇒ fail closed.
+              title = `FAIL — gated-path detection failed (changed-paths: ${pathsResult}), battery skipped`;
+              summaryMd = summaryMd ||
+                "The changed-paths job could not list this PR's files, so the " +
+                "gate cannot prove the PR touches no gated path. The gate fails " +
+                "closed: re-run the workflow (transient API failure) or investigate " +
+                "the changed-paths job log.";
             } else if (!results) {
               title = `FAIL — no battery results (battery job: ${jobResult})`;
               summaryMd = summaryMd ||
@@ -179,8 +263,12 @@ jobs:
   # CRED-2: fork PRs cannot assume the OIDC role, so the battery cannot run.
   # An absent/neutral check would let a gated-path fork PR merge unexamined —
   # so publish an explicit FAILURE instead. No checkout: zero PR code executes.
+  # `gated != 'false'` for the same fail-closed reason as publish: a fork PR
+  # whose path detection failed must still get the failing check. Ungated fork
+  # PRs (`gated == 'false'`) get skip-publish's SUCCESS check instead.
   fork-guard:
-    if: github.event.pull_request.head.repo.full_name != github.repository
+    needs: changed-paths
+    if: always() && needs.changed-paths.outputs.gated != 'false' && github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -200,5 +288,41 @@ jobs:
               output: {
                 title: "Fork PRs cannot run the config evals gate",
                 summary: "Fork PRs cannot run the config evals gate (no credentials). A maintainer must push this branch to the base repository to gate it.",
+              },
+            });
+
+  # Neutral-publisher (C1 / FR-2.6): a PR that touches NO gated path still gets
+  # a completed `config-evals-gate` check — an explicit SUCCESS — so the check
+  # can be marked REQUIRED in branch protection without blocking unrelated PRs
+  # on "Expected — waiting". Runs for same-repo AND fork PRs (an ungated fork
+  # PR must not be blocked by fork-guard). No checkout: zero PR code executes.
+  skip-publish:
+    needs: changed-paths
+    if: needs.changed-paths.outputs.gated == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    steps:
+      - name: Publish skipped-success check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: "config-evals-gate",
+              head_sha: context.payload.pull_request.head.sha,
+              status: "completed",
+              conclusion: "success",
+              output: {
+                title: "SKIPPED — no gated paths changed",
+                summary: "This PR touches none of the gated paths (prompts, workflow/agent " +
+                  "config, blueprints, eval battery, or the gate workflows themselves), so " +
+                  "the config evals battery did not run. This success check exists so " +
+                  "`config-evals-gate` can be a required status check in branch protection " +
+                  "without blocking unrelated PRs: every PR gets exactly one completed " +
+                  "check — PASS/FAIL from the battery when gated paths change, this " +
+                  "SKIPPED success when they don't.",
               },
             });

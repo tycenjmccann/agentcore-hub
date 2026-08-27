@@ -211,6 +211,38 @@ is a gate failure** (fail closed; scores across backends are not comparable).
 - Concurrent baseline runs are serialized; a run whose commit is superseded by
   a baseline from a descendant commit discards itself (see the workflow).
 
+### Baseline freshness & the commit-back race
+
+`source_commit` is **the sha the baseline was generated from** — the runner
+records `git rev-parse HEAD` of its own checkout, and the workflow asserts it
+equals `$GITHUB_SHA` before committing. It may legitimately *trail* `main`'s
+tip: it says "these scores describe this tree", not "this is main's newest
+commit". Gate/deploy tooling that needs freshness compares `source_commit`
+against `main` (ancestry), never against wall-clock time.
+
+The race it guards against: baseline run **A** (from commit A) is in flight;
+gated commit **B** merges to `main`; A finishes and its
+`git pull --rebase origin main` succeeds *cleanly* because B didn't touch
+`baseline.json` — nothing conflicts, yet A's baseline describes a stale tree.
+The commit-back step therefore runs the same supersession + ancestry checks on
+**both** rebase outcomes:
+
+- **Superseded** — `origin/main` already carries a baseline whose
+  `source_commit` is a descendant of our commit ⇒ ours is stale; discard and
+  exit green (both the conflict path and the clean path).
+- **Ancestry** — if `$GITHUB_SHA` is no longer an ancestor of `origin/main`
+  (history rewrite, dispatch on a stale ref), abort with an error instead of
+  pushing.
+- **Main advanced, no newer baseline** — not fatal: our baseline is the best
+  available, so it pushes with a warning; the queued run for the newer commit
+  supersedes it when it lands.
+
+The bot commit message carries `[skip ci]`, so the push-back does not trigger
+another baseline run (no recursion). If the queued run for a newer commit is
+ever lost (manual cancellation, runner outage), recovery is a manual
+`workflow_dispatch` of **Config Evals Baseline** — it regenerates from `main`'s
+tip and supersedes whatever is committed.
+
 ### Where the gating rules come from (gate mode)
 
 A PR can edit the battery's own config, so in **gate mode** — whenever
