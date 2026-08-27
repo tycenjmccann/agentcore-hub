@@ -1,0 +1,28 @@
+{
+  "AlarmName": "agentcore-hub-eval-throttle-ratio",
+  "AlarmDescription": "More than 20% of evaluator results across the fleet are throttled (ThrottlingException from the Bedrock judge model). Remediation levers are the eval-config sampling rate and evaluator count in deploy/evaluations/setup-evaluations.sh. In-evaluator backoff/retry is impossible: the AWS Bedrock AgentCore Online Evaluations service executes the evaluators. If throttling persists at the reduced load profile, a Bedrock quota increase is a human/ops follow-up (AWS support ticket). Fires on 2 of 3 hourly datapoints. INSUFFICIENT_DATA when no evaluator results arrive.",
+  "ActionsEnabled": true,
+  "EvaluationPeriods": 3,
+  "DatapointsToAlarm": 2,
+  "Threshold": 0.2,
+  "ComparisonOperator": "GreaterThanThreshold",
+  "TreatMissingData": "missing",
+  "Metrics": [
+    {
+      "Id": "throttled",
+      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalResultsThrottled\"', 'Sum', 3600))",
+      "ReturnData": false
+    },
+    {
+      "Id": "total",
+      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalResultsTotal\"', 'Sum', 3600))",
+      "ReturnData": false
+    },
+    {
+      "Id": "ratio",
+      "Expression": "throttled / total",
+      "Label": "throttled results ratio (fleet)",
+      "ReturnData": true
+    }
+  ]
+}

@@ -1,11 +1,30 @@
 #!/bin/bash
 # Set up AgentCore Online Evaluations for all fleet agents
-# Uses Opus 4.7 as judge model, 100% sampling, 10 evaluators per config
+# Uses Opus 4.7 as judge model, 30% sampling, 5 evaluators per config
 #
-# NOTE: API limit is 10 evaluators per config.
-#   - Ticket-creating agents (requirements_analyst, qa_verifier, ci_agent) get:
-#     9 built-in + 1 custom (dependency_chain_compliance_online) = 10
-#   - All other agents get 10 built-in evaluators
+# LOAD PROFILE (TEAM-3359): the previous 100% sampling × 10 evaluators
+# saturated the Bedrock judge-model quota — ~78% of evaluator results in the
+# live results log groups were ThrottlingException, i.e. effective capacity
+# ≈ 0.22× that offered load. This profile offers 0.30 sampling × ~0.47 of the
+# per-session evaluator load (5 of the previous mix) ≈ 0.14× the old load
+# ≈ 64% of measured capacity — ~35% burst headroom, targeting a steady-state
+# throttle rate < 5% (alarmed at 20%, see throttle-rate-alarm.json).
+#
+# HARD CONSTRAINT: evaluator calls are executed by the AWS Bedrock AgentCore
+# Online Evaluations SERVICE — no backoff, retry, or staggering can be added
+# to evaluator execution from this repo. The only load levers we hold are the
+# sampling rate and evaluator count below. If throttling persists at this
+# reduced profile, a Bedrock quota increase is a HUMAN/ops follow-up (AWS
+# support ticket) — never something this script performs.
+#
+# Evaluator mix per config (API limit is 10; we deliberately run 5),
+# structured one-per-evaluation-level plus the highest-signal TRACE trio:
+#   - TOOL_CALL: Builtin.ToolSelectionAccuracy
+#   - TRACE:     Builtin.InstructionFollowing, Builtin.Correctness,
+#                Builtin.Helpfulness
+#   - SESSION:   dependency_chain_compliance_online (ticket-creating agents)
+#                or Builtin.GoalSuccessRate (all other agents, and the
+#                graceful fallback when the custom evaluator is absent)
 #
 # IMPORTANT: The custom evaluator must be the "_online" variant.
 #   The on-demand version (dependency_chain_compliance-VyBv7H2bCi) requires
@@ -26,22 +45,28 @@ source "${REPO_ROOT}/deploy/config.sh"
 # Custom evaluator (online-compatible, no reference inputs needed)
 CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 
-# --- Re-registering a corrected evaluator rubric (e.g. TEAM-3103) ----------
+# --- Re-registering a corrected evaluator rubric (TEAM-3103 / TEAM-3359) ---
 # This script only PROBES for CUSTOM_EVALUATOR above — it never creates or
 # updates the evaluator itself (it's account-provisioned, out of band). When
-# deploy/evaluations/dependency_chain_evaluator.json changes (rubric fix),
-# get it live with:
+# deploy/evaluations/dependency_chain_evaluator.json changes (rubric fix,
+# e.g. the TEAM-3359 NotApplicable 2.0 rating), get it live with:
+#
+#   0. Deploy lambda/eval-packager FIRST. The packager must already understand
+#      N/A verdicts (isNotApplicable / naCount, shipped with TEAM-3359) before
+#      the first NotApplicable (score 2.0) result arrives — otherwise 2.0 rows
+#      would be averaged into the DDB scorecard as if they were real scores.
 #
 #   Preferred — in-place update, ID stays the same, nothing below to edit:
 #     agentcore eval evaluator update --evaluator-id "$CUSTOM_EVALUATOR" \
 #       --config-file deploy/evaluations/dependency_chain_evaluator.json
-#     (Verify the exact update verb/flags against the installed `agentcore`
-#     CLI at deploy time — this repo's scripts only demonstrate list/create
-#     for eval evaluators; `update` may differ or not exist in your CLI
-#     version. Run `agentcore eval evaluator update --help` first.)
+#     (UpdateEvaluator is CONFIRMED to exist in the bedrock-agentcore-control
+#     API — evaluators pass through an UPDATING status and can land in
+#     UPDATE_FAILED — but verify the installed `agentcore` CLI exposes it
+#     before relying on it: run `agentcore eval evaluator update --help`
+#     first. This repo's scripts only demonstrate list/create.)
 #
-#   Fallback — if an in-place update isn't available, the fix needs a NEW
-#   evaluator (a fresh account-generated "-XXXX" id):
+#   Fallback — if the CLI has no update verb, the fix needs a NEW evaluator
+#   (a fresh account-generated "-XXXX" id):
 #     1. agentcore eval evaluator create \
 #          --config-file deploy/evaluations/dependency_chain_evaluator.json
 #        → capture the new evaluator ID from the output.
@@ -53,24 +78,48 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 #        deploy/evaluations/eval-config-ids.json to the new ID — that file is
 #        a non-load-bearing snapshot per its own "_configs_note", but keep it
 #        truthful for the next reader.
+#
+#   Rollback: re-register the PREVIOUS rubric JSON from git history (git show
+#   <old-sha>:deploy/evaluations/dependency_chain_evaluator.json > /tmp/rubric.json)
+#   via the same update/create procedure above. The packager tolerates a
+#   rubric without N/A indefinitely, so rolling the rubric back needs no
+#   packager rollback.
 # -----------------------------------------------------------------------------
 
-# --- Fleet span_missing health alarm (TEAM-3103) ---------------------------
-# deploy/evaluations/span-missing-alarm.json watches the EMF metrics that
-# lambda/eval-packager/index.mjs now emits (EvalSessionsTotal /
-# EvalSessionsSpanMissing in the AgentCoreHub/Evaluations namespace) and
-# fires when >50% of eval sessions across the fleet have no invoke_agent
-# span. Apply it with:
+# --- Fleet eval health alarms (TEAM-3103 / TEAM-3359) ----------------------
+# Three alarm definitions in this directory watch the EMF metrics that
+# lambda/eval-packager/index.mjs emits into the AgentCoreHub/Evaluations
+# namespace (EvalSessionsTotal / EvalSessionsSpanMissing / EvalResultsTotal /
+# EvalResultsThrottled):
 #
-#   aws cloudwatch put-metric-alarm --cli-input-json file://span-missing-alarm.json
+#   span-missing-alarm.json          — pager: >50% of eval sessions have no
+#                                      invoke_agent span (hourly, 3 of 4).
+#   span-missing-elevated-alarm.json — ticket severity: >5% span-missing over
+#                                      6-hour windows (3 of 4) — catches the
+#                                      slow telemetry regression the 50%
+#                                      pager would sleep through.
+#   throttle-rate-alarm.json         — >20% of evaluator RESULTS throttled
+#                                      (EvalResultsThrottled/EvalResultsTotal,
+#                                      hourly, 2 of 3). Remediation levers are
+#                                      the sampling rate and evaluator count
+#                                      in THIS script — in-evaluator backoff
+#                                      is impossible (the AWS Online
+#                                      Evaluations service executes the
+#                                      evaluators), and a Bedrock quota
+#                                      increase is a human/ops follow-up.
 #
-# Rollout constraint: create this alarm ONLY AFTER the runtime telemetry fix
+# Apply each with:
+#   aws cloudwatch put-metric-alarm \
+#     --cli-input-json file://deploy/evaluations/<alarm-file>.json
+#   e.g. file://deploy/evaluations/throttle-rate-alarm.json
+#
+# Rollout constraint: create these alarms ONLY AFTER the runtime telemetry fix
 # (R1/R2 — Strands/ADOT tracer wiring) is deployed AND at least one healthy
-# eval batch with non-zero EvalSessionsTotal has been observed in CloudWatch.
-# Creating it earlier means every session is span_missing by definition and
-# the alarm fires immediately on stale data. Add AlarmActions (the
-# environment's SNS topic ARN) to the JSON at apply time — it's intentionally
-# omitted here since it's environment-specific.
+# eval batch with non-zero EvalSessionsTotal AND EvalResultsTotal has been
+# observed in CloudWatch. Creating them earlier means every session is
+# span_missing by definition and the alarms fire immediately on stale data.
+# Add AlarmActions (the environment's SNS topic ARN) to each JSON at apply
+# time — it's intentionally omitted since it's environment-specific.
 # -----------------------------------------------------------------------------
 
 # Agents that create/reassign tickets (need the custom evaluator)
@@ -90,8 +139,9 @@ echo "Reading agent IDs from: $FLEET_FILE"
 # The custom dependency-chain evaluator is created per-account and is NOT
 # provisioned by any deploy step in this repo (its ID is account-specific).
 # Probe for it once. If it's missing, ticket agents gracefully fall back to
-# 10 built-in evaluators (adding Conciseness) instead of emitting a config
-# that the API rejects with "Evaluators not found".
+# 5 built-in evaluators (Builtin.GoalSuccessRate filling the SESSION-level
+# slot) instead of emitting a config the API rejects with "Evaluators not
+# found".
 CUSTOM_EVALUATOR_AVAILABLE=false
 if AGENTCORE_SUPPRESS_RECOMMENDATION=1 agentcore eval evaluator list --max-results 100 2>/dev/null \
      | grep -q "$CUSTOM_EVALUATOR"; then
@@ -100,9 +150,10 @@ if AGENTCORE_SUPPRESS_RECOMMENDATION=1 agentcore eval evaluator list --max-resul
 else
   echo ""
   echo "⚠️  WARNING: custom evaluator '$CUSTOM_EVALUATOR' not found in this account."
-  echo "    Ticket agents will use 10 built-in evaluators (Conciseness substituted"
-  echo "    for the dependency-chain check). To enable the custom evaluator, create"
-  echo "    it with 'agentcore eval evaluator create' and re-run this script."
+  echo "    Ticket agents will use 5 built-in evaluators (Builtin.GoalSuccessRate"
+  echo "    substituted for the dependency-chain check in the SESSION-level slot)."
+  echo "    To enable the custom evaluator, create it with 'agentcore eval"
+  echo "    evaluator create' and re-run this script."
   echo ""
 fi
 
@@ -118,11 +169,11 @@ for name, arn in data.items():
 AGENT_COUNT=$(echo "$AGENTS" | wc -l | tr -d ' ')
 echo "Creating online evaluation configs for ${AGENT_COUNT} agents..."
 if [ "$CUSTOM_EVALUATOR_AVAILABLE" = true ]; then
-  echo "Evaluators: 10 per agent (ticket agents get custom dependency_chain evaluator)"
+  echo "Evaluators: 5 per agent (ticket agents get custom dependency_chain evaluator)"
 else
-  echo "Evaluators: 10 built-in per agent (custom evaluator unavailable — see warning above)"
+  echo "Evaluators: 5 built-in per agent (custom evaluator unavailable — see warning above)"
 fi
-echo "Sampling: 100%"
+echo "Sampling: 30%"
 echo "Judge model: Opus 4.7"
 echo ""
 
@@ -134,24 +185,21 @@ while read name agent_id; do
 
   echo "→ Creating config for ${name} (${agent_id})..."
 
-  # Build the evaluator argument list. Ticket agents get the custom
-  # dependency-chain evaluator (9 built-in + 1 custom) when it's available;
-  # otherwise everyone gets the same 10 built-in evaluators.
+  # Build the evaluator argument list — the reduced TEAM-3359 load profile
+  # (see header): 1 TOOL_CALL + 3 TRACE, plus one SESSION-level slot below.
   eval_args=(
-    -e "Builtin.ToolSelectionAccuracy"
-    -e "Builtin.ToolParameterAccuracy"
-    -e "Builtin.InstructionFollowing"
-    -e "Builtin.GoalSuccessRate"
-    -e "Builtin.Correctness"
-    -e "Builtin.Coherence"
-    -e "Builtin.Faithfulness"
-    -e "Builtin.Helpfulness"
-    -e "Builtin.ResponseRelevance"
+    -e "Builtin.ToolSelectionAccuracy"   # TOOL_CALL level
+    -e "Builtin.InstructionFollowing"    # TRACE level
+    -e "Builtin.Correctness"             # TRACE level
+    -e "Builtin.Helpfulness"             # TRACE level
   )
+  # SESSION-level slot: the custom dependency-chain evaluator for ticket
+  # agents when it's available; Builtin.GoalSuccessRate for everyone else
+  # (and as the graceful fallback when the custom evaluator is absent).
   if echo "$TICKET_AGENTS" | grep -qw "$name" && [ "$CUSTOM_EVALUATOR_AVAILABLE" = true ]; then
     eval_args+=(-e "${CUSTOM_EVALUATOR}")
   else
-    eval_args+=(-e "Builtin.Conciseness")
+    eval_args+=(-e "Builtin.GoalSuccessRate")
   fi
 
   # Capture output and exit status. Show the success/error lines, and on a
@@ -161,9 +209,9 @@ while read name agent_id; do
   create_out=$(agentcore eval online create \
     --agent-id "${agent_id}" \
     --name "${config_name}" \
-    --sampling-rate 100.0 \
+    --sampling-rate 30.0 \
     "${eval_args[@]}" \
-    --description "Full evaluation suite for ${name} - 100% sampling with Opus 4.7 judge" \
+    --description "Reduced evaluation suite for ${name} - 30% sampling with Opus 4.7 judge (TEAM-3359 load profile)" \
     2>&1) && create_rc=0 || create_rc=$?
 
   echo "$create_out" | grep -E "(✓|Config ID|Status|Error)" || true
@@ -172,6 +220,12 @@ while read name agent_id; do
     echo "$create_out" | sed 's/^/      /'
     FAILED_CONFIGS="${FAILED_CONFIGS} ${name}"
   fi
+
+  # Stagger the CONTROL-PLANE CreateOnlineEvaluationConfig calls only. This
+  # cannot and does not stagger runtime evaluator execution — the AWS Online
+  # Evaluations service runs the evaluators on its own schedule; the only
+  # runtime-load levers are the sampling rate and evaluator count above.
+  sleep 5
 
   echo ""
 done < <(echo "$AGENTS")

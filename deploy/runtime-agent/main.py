@@ -243,6 +243,116 @@ def _init_telemetry() -> None:
 _init_telemetry()
 # ---------------------------------------------------------------------------
 
+# --- Tool-span telemetry bounding (TEAM-3359 F3.2) -------------------------
+# The eval service raised ToolSpanMappingException ("Failed to parse
+# tool_output from tool-span with spanId: ... and scope:
+# strands.telemetry.tracer") on 148 results. Root cause, reproduced locally
+# (tests/test_tool_span_bounding.py): strands' Tracer.end_tool_call_span
+# mirrors the ENTIRE tool result into the execute_tool span (the
+# gen_ai.choice event's `message` attribute = json-serialized content), and
+# claude_code/codex return full CLI transcripts of hundreds of KB. Under an
+# OTel attribute value length limit (OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT — set
+# by the platform's ADOT env, not by this repo) the SDK truncates that
+# serialized JSON mid-string, producing unparseable tool_output.
+#
+# Fix at the tool-telemetry boundary ONLY: end_tool_call_span is wrapped so
+# the copy mirrored into span attributes has its text blocks bounded (the
+# JSON is then valid at any plausible limit). The tool_result object itself is
+# NEVER mutated — the model still receives the full tool output; tool return
+# values are unchanged. Fail-open per R1.4 throughout.
+
+# Default per-text-block cap. Well under CloudWatch/X-Ray span budgets while
+# leaving the judge plenty of transcript to reason over.
+_TOOL_SPAN_TEXT_LIMIT_DEFAULT = 8192
+
+
+def _tool_span_text_limit() -> int:
+    """Per-text-block char cap for tool output mirrored into span attributes.
+
+    When the SDK-level attribute value length limit is configured (the
+    platform's ADOT env sets OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT /
+    OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT), stay at a quarter of the
+    smallest limit so the SERIALIZED JSON — quote/escape overhead plus the
+    surrounding [{"text": ...}] structure — can never be what gets truncated.
+    """
+    limits = []
+    for var in ("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT"):
+        raw = os.environ.get(var, "").strip()
+        if raw.isdigit():
+            limits.append(int(raw))
+    cap = _TOOL_SPAN_TEXT_LIMIT_DEFAULT
+    if limits:
+        cap = min(cap, max(min(limits) // 4, 256))
+    return cap
+
+
+def _bound_tool_result_for_telemetry(tool_result):
+    """Return a COPY of tool_result with oversized text blocks bounded, for
+    span mirroring only. Returns the original object untouched when nothing
+    needs bounding (or the shape is unexpected — never guess)."""
+    if not isinstance(tool_result, dict):
+        return tool_result
+    content = tool_result.get("content")
+    if not isinstance(content, list):
+        return tool_result
+    limit = _tool_span_text_limit()
+    changed = False
+    bounded = []
+    for block in content:
+        text = block.get("text") if isinstance(block, dict) else None
+        if isinstance(text, str) and len(text) > limit:
+            marker = (
+                f"\n...[tool output truncated for telemetry: {len(text) - limit} of "
+                f"{len(text)} chars omitted; the model received the full output]"
+            )
+            bounded.append({**block, "text": text[:limit] + marker})
+            changed = True
+        else:
+            bounded.append(block)
+    if not changed:
+        return tool_result
+    return {**tool_result, "content": bounded}
+
+
+def _install_tool_span_bounding() -> None:
+    global _TOOL_SPAN_BOUNDING_INSTALLED
+    # globals().get(): same bare-namespace exec pattern as _init_telemetry.
+    if globals().get("_TOOL_SPAN_BOUNDING_INSTALLED", False):
+        return
+    try:
+        from strands.telemetry.tracer import Tracer as _StrandsTracer
+
+        _orig_end_tool_call_span = _StrandsTracer.end_tool_call_span
+        # Cross-namespace idempotence: the global flag above is per-exec, so a
+        # re-exec of this module in one process (the exec-based test harnesses,
+        # a warm re-import) must ALSO detect an already-wrapped method and not
+        # stack a second wrapper.
+        if getattr(_orig_end_tool_call_span, "__wrapped__", None) is not None:
+            return
+
+        def _bounded_end_tool_call_span(self, span, tool_result, error=None):
+            try:
+                telemetry_result = _bound_tool_result_for_telemetry(tool_result)
+            except Exception:  # noqa: BLE001 — telemetry must never break the invocation (R1.4)
+                telemetry_result = tool_result
+            return _orig_end_tool_call_span(self, span, telemetry_result, error)
+
+        # functools.wraps convention: marks the method as wrapped (see the
+        # idempotence guard above) and keeps the original reachable for tests.
+        _bounded_end_tool_call_span.__wrapped__ = _orig_end_tool_call_span
+        _StrandsTracer.end_tool_call_span = _bounded_end_tool_call_span
+    except Exception:
+        logger.warning(
+            "telemetry: tool-span bounding install failed — continuing without it",
+            exc_info=True,
+        )
+    finally:
+        _TOOL_SPAN_BOUNDING_INSTALLED = True
+
+
+_install_tool_span_bounding()
+# ---------------------------------------------------------------------------
+
 # Per-invocation prompt cache for shared-runtime topologies (1 or 4 runtimes
 # hosting many personas). First call for an agent_id reads
 # s3://{ARTIFACT_BUCKET}/prompts/{agent_id}.txt; subsequent calls in the same
@@ -2280,6 +2390,26 @@ async def _run_agent_invocation(payload, context):
     except Exception:  # noqa: BLE001 — telemetry must never break the invocation (R1.4)
         pass
 
+    # F3.1 (TEAM-3359): `agent` stays None until the Strands Agent below is
+    # constructed. The except arm at the bottom emits a synthetic fallback
+    # invoke_agent span ONLY while it is still None — see the comment there.
+    agent = None
+    # Hoisted ABOVE the first fallible call (_publish_agent_started): pure dict
+    # construction from payload/context, needed by both the Agent(...) below
+    # and the synthetic fallback span. trace_attributes → session.id
+    # correlation so online evaluations find the span on the session's traces.
+    # session.id falls back to wf-<workflow_id> so the span stays keyed for the
+    # eval-packager even when ADOT header injection is absent
+    # (direct_code_deploy fallback path) — an unkeyed span is invisible to it.
+    _session_id = getattr(context, "session_id", None)
+    _trace_attrs = {k: v for k, v in {
+        "session.id": _session_id or f"wf-{workflow_id}",
+        "workflow.id": workflow_id,
+        "agent.id": agent_id,
+        "gen_ai.agent.id": agent_id,
+        "ticket.id": _CURRENT_TICKET_ID,
+    }.items() if v}
+
     try:
         # Fresh coding session per agent-task: a warm microVM reuses this module, so
         # without a reset the next task would resume the PREVIOUS task's workspace.
@@ -2424,19 +2554,9 @@ async def _run_agent_invocation(payload, context):
         tracker = ToolTrackingHandler()
         persona_prompt = _load_prompt_for_agent(agent_id)
         # name → gen_ai.agent.name on the SDK's auto-emitted invoke_agent span;
-        # trace_attributes → session.id correlation so online evaluations find the
-        # span on the session's traces. session.id falls back to wf-<workflow_id>
-        # so the span stays keyed for the eval-packager even when ADOT header
-        # injection is absent (direct_code_deploy fallback path) — an unkeyed
-        # span is invisible to it.
-        _session_id = getattr(context, "session_id", None)
-        _trace_attrs = {k: v for k, v in {
-            "session.id": _session_id or f"wf-{workflow_id}",
-            "workflow.id": workflow_id,
-            "agent.id": agent_id,
-            "gen_ai.agent.id": agent_id,
-            "ticket.id": _CURRENT_TICKET_ID,
-        }.items() if v}
+        # trace_attributes (_trace_attrs, hoisted above the try so the synthetic
+        # fallback span can reuse it) → session.id correlation so online
+        # evaluations find the span on the session's traces.
         completion_gate = _CompletionGate()
         agent = Agent(
             model=active_model,
@@ -2525,6 +2645,41 @@ async def _run_agent_invocation(payload, context):
 
         # Then emit the final text as a single contentBlockDelta event
         yield {"event": {"contentBlockDelta": {"delta": {"text": final_text}}}}
+    except Exception as exc:
+        # F3.1 (TEAM-3359): failures BEFORE Agent(...) is constructed — the
+        # started-event publish, model-override construction, builtin-tool
+        # loading, connectors, MCP clients — leave the session with ZERO
+        # invoke_agent spans, and the eval service then fails EVERY evaluator
+        # on the session with ValidationException ("none of the spans contain
+        # the required agent invocation (gen_ai.operation.name=invoke_agent)").
+        # Emit a minimal synthetic fallback span so the session stays
+        # evaluable and the failure is attributable. ONLY while agent is None:
+        # once the SDK Agent exists it owns the invoke_agent span (including
+        # on mid-stream failures), and a second span would corrupt eval traces
+        # (evaluator attribution selects by gen_ai.operation.name).
+        if agent is None:
+            try:
+                from opentelemetry import trace as _fallback_trace_api
+
+                _fallback_tracer = _fallback_trace_api.get_tracer(__name__)
+                with _fallback_tracer.start_as_current_span(
+                    f"invoke_agent {agent_id}"
+                ) as _fallback_span:
+                    _fallback_span.set_attribute("gen_ai.operation.name", "invoke_agent")
+                    _fallback_span.set_attribute("gen_ai.agent.name", agent_id)
+                    for _attr_key, _attr_value in _trace_attrs.items():
+                        _fallback_span.set_attribute(_attr_key, _attr_value)
+                    _fallback_span.set_attribute("error.type", type(exc).__name__)
+                    _fallback_span.set_status(
+                        _fallback_trace_api.Status(
+                            _fallback_trace_api.StatusCode.ERROR, str(exc)[:200]
+                        )
+                    )
+            except Exception:  # noqa: BLE001 — telemetry must never break the invocation (R1.4)
+                pass
+        # Re-raise unchanged; this arm belongs to the same try as the finally
+        # below, so the force_flush still runs (and delivers the span above).
+        raise
     finally:
         # Deliver queued spans before the microVM becomes freeze-eligible.
         # BatchSpanProcessor exports on a daemon thread on a 5s batch delay;

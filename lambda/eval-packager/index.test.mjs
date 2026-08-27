@@ -710,8 +710,13 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
     expect(spanMissing).toBe(0);
   });
 
-  it('emitEvalMetrics emits a single EMF record with both metrics', () => {
-    emitEvalMetrics('agentcore_hub_backend_dev', { total: 4, spanMissing: 0 });
+  it('emitEvalMetrics emits a single EMF record with all four metrics', () => {
+    emitEvalMetrics('agentcore_hub_backend_dev', {
+      total: 4,
+      spanMissing: 0,
+      resultsTotal: 12,
+      resultsThrottled: 0,
+    });
 
     const records = emfLines('EvalSessionsTotal');
     expect(records).toHaveLength(1);
@@ -721,20 +726,429 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
     expect(emf[0].Namespace).toBe('AgentCoreHub/Evaluations');
     expect(emf[0].Dimensions).toEqual([['AgentName']]);
     expect(emf[0].Metrics.map((m) => m.Name).sort()).toEqual([
+      'EvalResultsThrottled',
+      'EvalResultsTotal',
       'EvalSessionsSpanMissing',
       'EvalSessionsTotal',
     ]);
+    expect(emf[0].Metrics.every((m) => m.Unit === 'Count')).toBe(true);
     expect(typeof record._aws.Timestamp).toBe('number');
     expect(record.AgentName).toBe('agentcore_hub_backend_dev');
     expect(record.EvalSessionsTotal).toBe(4);
+    expect(record.EvalResultsTotal).toBe(12);
     // Explicit 0 must be emitted (healthy fleet still writes a datapoint).
     expect(record.EvalSessionsSpanMissing).toBe(0);
+    expect(record.EvalResultsThrottled).toBe(0);
   });
 
-  it('emitEvalMetrics carries non-zero spanMissing through', () => {
-    emitEvalMetrics('agentcore_hub_qa_verifier', { total: 7, spanMissing: 3 });
+  it('emitEvalMetrics carries non-zero spanMissing/throttled through', () => {
+    emitEvalMetrics('agentcore_hub_qa_verifier', {
+      total: 7,
+      spanMissing: 3,
+      resultsTotal: 20,
+      resultsThrottled: 5,
+    });
     const [record] = emfLines('EvalSessionsTotal');
     expect(record.EvalSessionsTotal).toBe(7);
     expect(record.EvalSessionsSpanMissing).toBe(3);
+    expect(record.EvalResultsTotal).toBe(20);
+    expect(record.EvalResultsThrottled).toBe(5);
+  });
+
+  it('emitEvalMetrics defaults the entry-level metrics to explicit zeros', () => {
+    // Old call shape (no entry counts) must still write all four datapoints.
+    emitEvalMetrics('agentcore_hub_backend_dev', { total: 2, spanMissing: 1 });
+    const [record] = emfLines('EvalSessionsTotal');
+    expect(record.EvalResultsTotal).toBe(0);
+    expect(record.EvalResultsThrottled).toBe(0);
+  });
+});
+
+// ─── Error classification, dedupe, N/A verdicts, throttle-aware matrix ───────
+// (TEAM-3359) Fixtures mirror the VERIFIED live shapes from the results log
+// group /aws/bedrock-agentcore/evaluations/results/eval_agentcore_hub_agent-*,
+// inspected 2026-08-27: exact error strings, the per-tool-call throttle
+// duplicate cluster, and legit distinct TOOL_CALL verdicts that share one
+// timeUnixNano and score/label but differ in explanation.
+
+describe('classifyError / isNotApplicable / dedupe / computeScoreDeltas (TEAM-3359)', () => {
+  let classifyError;
+  let isNotApplicable;
+  let dedupeEntries;
+  let computeScoreDeltas;
+  let classifySessions;
+  let extractSessionData;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({
+      classifyError,
+      isNotApplicable,
+      dedupeEntries,
+      computeScoreDeltas,
+      classifySessions,
+      extractSessionData,
+    } = await import('./index.mjs'));
+  });
+
+  const UUID_A = '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0';
+  const UUID_B = '11111111-2222-4333-8444-555555555555';
+
+  /** The evaluator's verified exact strings (facts B). */
+  const THROTTLE_MESSAGE = (uuid) => `Request ${uuid} is being throttled`;
+  const VALIDATION_MESSAGE =
+    'Evaluation failed because none of the spans contain the required agent invocation ' +
+    '(gen_ai.operation.name=invoke_agent). TraceIds: [abc123def456]';
+  const TOOL_SPAN_MESSAGE =
+    'Failed to parse tool_output from tool-span with spanId: 0a1b2c3d4e5f6789 ' +
+    'and scope: strands.telemetry.tracer';
+
+  const delivery = (logEvents) => ({
+    logGroup: '/aws/bedrock-agentcore/evaluations/results/eval_agentcore_hub_agent-wuNv8o5ZBa',
+    logStream: 'eval-results-stream',
+    logEvents,
+  });
+
+  /** One OTEL result logEvent as the online-evaluations service writes it. */
+  const resultEvent = ({
+    sessionId,
+    evaluator = 'Builtin.Correctness',
+    score,
+    scoreLabel,
+    explanation,
+    errorType,
+    errorMessage,
+    errorFlag,
+    throttleFlag,
+    responseId,
+    timeUnixNano = 1756250000000000000,
+    timestamp = 1756250000000,
+  }) => {
+    const attributes = { 'session.id': sessionId, 'gen_ai.evaluation.name': evaluator };
+    if (score !== undefined) attributes['gen_ai.evaluation.score.value'] = score;
+    if (scoreLabel !== undefined) attributes['gen_ai.evaluation.score.label'] = scoreLabel;
+    if (explanation !== undefined) attributes['gen_ai.evaluation.explanation'] = explanation;
+    if (errorType) attributes['error.type'] = errorType;
+    if (errorMessage) attributes['error.message'] = errorMessage;
+    if (errorFlag !== undefined) attributes['error'] = errorFlag;
+    if (throttleFlag !== undefined) attributes['throttle'] = throttleFlag;
+    if (responseId) attributes['gen_ai.response.id'] = responseId;
+    return {
+      timestamp,
+      message: JSON.stringify({
+        traceId: 'trace-0001',
+        name: 'gen_ai.evaluation.result',
+        timeUnixNano,
+        attributes,
+      }),
+    };
+  };
+
+  /** A throttled result entry, verified shape: throttle:1, error:0, no score. */
+  const throttledEvent = (sessionId, uuid, extra = {}) =>
+    resultEvent({
+      sessionId,
+      errorType: 'ThrottlingException',
+      errorMessage: THROTTLE_MESSAGE(uuid),
+      errorFlag: 0,
+      throttleFlag: 1,
+      ...extra,
+    });
+
+  describe('classifyError — one row per verified live error string', () => {
+    it('ThrottlingException + throttle message → throttled', () => {
+      expect(classifyError('ThrottlingException', THROTTLE_MESSAGE(UUID_A))).toBe('throttled');
+    });
+
+    it('ThrottlingException named only in the message → throttled', () => {
+      expect(classifyError(null, 'ThrottlingException: rate exceeded')).toBe('throttled');
+    });
+
+    it('ValidationException + invoke_agent message → span_missing_validation', () => {
+      expect(classifyError('ValidationException', VALIDATION_MESSAGE)).toBe(
+        'span_missing_validation'
+      );
+    });
+
+    it('ToolSpanMappingException → tool_span_mapping', () => {
+      expect(classifyError('ToolSpanMappingException', TOOL_SPAN_MESSAGE)).toBe(
+        'tool_span_mapping'
+      );
+    });
+
+    it('ValidationException WITHOUT invoke_agent → other, never span_missing', () => {
+      expect(classifyError('ValidationException', 'payload too large')).toBe('other');
+    });
+
+    it('any other non-null errorType → other', () => {
+      expect(classifyError('InternalServerException', 'judge crashed')).toBe('other');
+    });
+
+    it('no error attributes → null', () => {
+      expect(classifyError(null, null)).toBe(null);
+      expect(classifyError(undefined, undefined)).toBe(null);
+    });
+  });
+
+  describe('isNotApplicable', () => {
+    it('matches the NotApplicable label variants', () => {
+      expect(isNotApplicable({ scoreLabel: 'NotApplicable' })).toBe(true);
+      expect(isNotApplicable({ scoreLabel: 'not_applicable' })).toBe(true);
+      expect(isNotApplicable({ scoreLabel: 'Not Applicable' })).toBe(true);
+      expect(isNotApplicable({ scoreLabel: 'not-applicable' })).toBe(true);
+    });
+
+    it('matches the numerical rubric sentinel score 2.0', () => {
+      expect(isNotApplicable({ score: 2 })).toBe(true);
+    });
+
+    it('matches the NOT_APPLICABLE explanation sentinel', () => {
+      expect(isNotApplicable({ evidence: 'NOT_APPLICABLE: run has no dependencies' })).toBe(true);
+    });
+
+    it('does not match real verdicts', () => {
+      expect(isNotApplicable({ score: 1, scoreLabel: 'Yes', evidence: 'good' })).toBe(false);
+      expect(isNotApplicable({ score: 0 })).toBe(false);
+      expect(isNotApplicable({ scoreLabel: 'notably_applicable_rule' })).toBe(false);
+    });
+  });
+
+  describe('per-delivery dedupe (the F4 throttle-cluster defect)', () => {
+    it('collapses a 10-entry throttle cluster (one request uuid) to exactly one buffered entry', () => {
+      const cluster = Array.from({ length: 10 }, () => throttledEvent('sess-c', UUID_A));
+      const sessionData = extractSessionData(delivery(cluster));
+      expect(sessionData.evaluatorResults).toHaveLength(1);
+      // The key is stamped on the survivor for auditability.
+      expect(sessionData.evaluatorResults[0].dedupeKey).toBe(
+        `sess-c|Builtin.Correctness|req:${UUID_A}`
+      );
+
+      // Scorecard deltas identical to the 1-entry case (never double-counted).
+      const many = computeScoreDeltas(delivery(cluster).logEvents);
+      const one = computeScoreDeltas([throttledEvent('sess-c', UUID_A)]);
+      expect(many.scoreDeltas).toEqual(one.scoreDeltas);
+
+      // Entry counts see the cluster once, not ten times.
+      const c = classifySessions(sessionData);
+      expect(c.resultsTotal).toBe(1);
+      expect(c.resultsThrottled).toBe(1);
+    });
+
+    it('does NOT collapse throttled entries with distinct request uuids', () => {
+      const sessionData = extractSessionData(
+        delivery([throttledEvent('sess-d', UUID_A), throttledEvent('sess-d', UUID_B)])
+      );
+      expect(sessionData.evaluatorResults).toHaveLength(2);
+      expect(classifySessions(sessionData).resultsThrottled).toBe(2);
+    });
+
+    it('does NOT collapse legit distinct TOOL_CALL verdicts differing only in explanation', () => {
+      // Verified fact D: same (session, evaluator), ONE timeUnixNano, identical
+      // "Yes"/1.0 — only the explanation differs. Both must survive.
+      const events = [
+        resultEvent({
+          sessionId: 'sess-tc',
+          evaluator: 'Builtin.ToolSelectionAccuracy',
+          score: 1.0,
+          scoreLabel: 'Yes',
+          explanation: 'Tool call 1: file_list was the correct tool for enumerating the repo.',
+        }),
+        resultEvent({
+          sessionId: 'sess-tc',
+          evaluator: 'Builtin.ToolSelectionAccuracy',
+          score: 1.0,
+          scoreLabel: 'Yes',
+          explanation: 'Tool call 2: file_read was the correct tool for inspecting the diff.',
+        }),
+      ];
+      const sessionData = extractSessionData(delivery(events));
+      expect(sessionData.evaluatorResults).toHaveLength(2);
+
+      const { scoreDeltas } = computeScoreDeltas(events);
+      expect(scoreDeltas['Builtin.ToolSelectionAccuracy']).toMatchObject({ sum: 2, count: 2 });
+    });
+
+    it('collapses true content duplicates via the sha1 fallback (no request id)', () => {
+      const twin = () =>
+        resultEvent({
+          sessionId: 'sess-x',
+          score: 1.0,
+          scoreLabel: 'Yes',
+          explanation: 'Identical verdict text.',
+        });
+      const sessionData = extractSessionData(delivery([twin(), twin()]));
+      expect(sessionData.evaluatorResults).toHaveLength(1);
+      expect(sessionData.evaluatorResults[0].dedupeKey).toMatch(/^sha1:[0-9a-f]{40}$/);
+    });
+
+    it('never drops unparseable rows (no identity to hash)', () => {
+      const entries = [
+        { timestamp: 1, rawMessage: 'START RequestId: abc', parseError: true },
+        { timestamp: 1, rawMessage: 'START RequestId: abc', parseError: true },
+      ];
+      expect(dedupeEntries(entries)).toHaveLength(2);
+    });
+  });
+
+  describe('computeScoreDeltas (scorecard aggregation without DDB)', () => {
+    it('hasError regression: a throttled entry carrying a numeric-looking score never enters sum/count', () => {
+      const { scoreDeltas } = computeScoreDeltas([
+        throttledEvent('sess-h', UUID_A, { score: 0.9 }),
+      ]);
+      expect(scoreDeltas).toEqual({});
+    });
+
+    it('N/A rows increment naCount only; other evaluators in the same delivery aggregate normally', () => {
+      const events = [
+        resultEvent({
+          sessionId: 'sess-na',
+          evaluator: 'Custom.DependencyChain',
+          score: 2,
+          scoreLabel: 'NotApplicable',
+          explanation: 'NOT_APPLICABLE: run has no upstream dependencies.',
+        }),
+        resultEvent({
+          sessionId: 'sess-na',
+          evaluator: 'Custom.DependencyChain',
+          score: 2,
+          scoreLabel: 'NotApplicable',
+          explanation: 'NOT_APPLICABLE: nothing to verify for this tool call.',
+        }),
+        resultEvent({
+          sessionId: 'sess-scored',
+          evaluator: 'Builtin.Correctness',
+          score: 0.8,
+          scoreLabel: 'Yes',
+          explanation: 'The agent addressed the ticket.',
+        }),
+      ];
+      const { scoreDeltas } = computeScoreDeltas(events);
+      expect(scoreDeltas['Custom.DependencyChain']).toEqual({ sum: 0, count: 0, naCount: 2 });
+      expect(scoreDeltas['Builtin.Correctness']).toMatchObject({ sum: 0.8, count: 1 });
+    });
+
+    it('maps categorical Correct/Partial/Failed labels only when score.value is absent — never Yes/No', () => {
+      const { scoreDeltas } = computeScoreDeltas([
+        resultEvent({ sessionId: 's', evaluator: 'Custom.Rubric', scoreLabel: 'Correct', explanation: 'a' }),
+        resultEvent({ sessionId: 's', evaluator: 'Custom.Rubric', scoreLabel: 'Partial', explanation: 'b' }),
+        resultEvent({ sessionId: 's', evaluator: 'Custom.Rubric', scoreLabel: 'Failed', explanation: 'c' }),
+        resultEvent({ sessionId: 's', evaluator: 'Custom.YesNo', scoreLabel: 'Yes', explanation: 'd' }),
+      ]);
+      expect(scoreDeltas['Custom.Rubric']).toMatchObject({ sum: 1.5, count: 3 });
+      // A bare Yes label has no defined numeric meaning — it must not aggregate.
+      expect(scoreDeltas['Custom.YesNo']).toBeUndefined();
+    });
+
+    it('a delivered score.value wins over any categorical label', () => {
+      const { scoreDeltas } = computeScoreDeltas([
+        resultEvent({ sessionId: 's', evaluator: 'Custom.Rubric', score: 0.25, scoreLabel: 'Correct', explanation: 'e' }),
+      ]);
+      expect(scoreDeltas['Custom.Rubric']).toMatchObject({ sum: 0.25, count: 1 });
+    });
+  });
+
+  describe('classifySessions — six-row first-match-wins matrix', () => {
+    it('all-throttled session → throttled, not span_missing; resultsThrottled === resultsTotal', () => {
+      const sessionData = extractSessionData(
+        delivery([throttledEvent('sess-t', UUID_A), throttledEvent('sess-t', UUID_B)])
+      );
+      const c = classifySessions(sessionData);
+      expect(c.statuses.get('sess-t')).toBe('throttled');
+      expect(c.total).toBe(1);
+      expect(c.spanMissing).toBe(0);
+      expect(c.throttled).toBe(1);
+      expect(c.resultsTotal).toBe(2);
+      expect(c.resultsThrottled).toBe(c.resultsTotal);
+    });
+
+    it('mixed throttled + scored → scored; throttled entries still counted in resultsThrottled', () => {
+      const sessionData = extractSessionData(
+        delivery([
+          throttledEvent('sess-m', UUID_A),
+          resultEvent({
+            sessionId: 'sess-m',
+            evaluator: 'Builtin.Helpfulness',
+            score: 0.75,
+            scoreLabel: 'Yes',
+            explanation: 'Helped with the task.',
+          }),
+        ])
+      );
+      const c = classifySessions(sessionData);
+      expect(c.statuses.get('sess-m')).toBe('scored');
+      expect(c.throttled).toBe(0);
+      expect(c.resultsTotal).toBe(2);
+      expect(c.resultsThrottled).toBe(1);
+    });
+
+    it('all-N/A session with no errors → na (not span_missing, not error)', () => {
+      const sessionData = extractSessionData(
+        delivery([
+          resultEvent({
+            sessionId: 'sess-n',
+            evaluator: 'Custom.DependencyChain',
+            score: 2,
+            scoreLabel: 'NotApplicable',
+            explanation: 'NOT_APPLICABLE: no dependencies declared.',
+          }),
+        ])
+      );
+      const c = classifySessions(sessionData);
+      expect(c.statuses.get('sess-n')).toBe('na');
+      expect(c.na).toBe(1);
+      expect(c.spanMissing).toBe(0);
+    });
+
+    it('N/A + throttled mix → throttled (the throttle hid real work)', () => {
+      const sessionData = extractSessionData(
+        delivery([
+          resultEvent({
+            sessionId: 'sess-nt',
+            evaluator: 'Custom.DependencyChain',
+            score: 2,
+            scoreLabel: 'NotApplicable',
+            explanation: 'NOT_APPLICABLE: nothing to check.',
+          }),
+          throttledEvent('sess-nt', UUID_A),
+        ])
+      );
+      const c = classifySessions(sessionData);
+      expect(c.statuses.get('sess-nt')).toBe('throttled');
+      expect(c.na).toBe(0);
+    });
+
+    it('ValidationException + invoke_agent message → span_missing', () => {
+      const sessionData = extractSessionData(
+        delivery([
+          resultEvent({
+            sessionId: 'sess-v',
+            errorType: 'ValidationException',
+            errorMessage: VALIDATION_MESSAGE,
+            errorFlag: 1,
+          }),
+        ])
+      );
+      const c = classifySessions(sessionData);
+      expect(c.statuses.get('sess-v')).toBe('span_missing');
+      expect(c.spanMissing).toBe(1);
+    });
+
+    it('ToolSpanMappingException → error', () => {
+      const sessionData = extractSessionData(
+        delivery([
+          resultEvent({
+            sessionId: 'sess-ts',
+            errorType: 'ToolSpanMappingException',
+            errorMessage: TOOL_SPAN_MESSAGE,
+            errorFlag: 1,
+          }),
+        ])
+      );
+      const c = classifySessions(sessionData);
+      expect(c.statuses.get('sess-ts')).toBe('error');
+      expect(c.spanMissing).toBe(0);
+    });
   });
 });

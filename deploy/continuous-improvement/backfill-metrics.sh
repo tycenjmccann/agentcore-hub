@@ -8,6 +8,46 @@
 # historical data so the dashboard has immediate content.
 #
 # Usage: bash backfill-metrics.sh [--region us-east-1] [--days 7]
+#
+# ── Known limitations ────────────────────────────────────────────────────────
+# - The eval pass reads at most 500 events per results log group (single
+#   filter-log-events call, no pagination). On a busy group that is a SAMPLE
+#   of recent history, not a census.
+# - Eval writes use SET (overwrite) semantics: evalScores/evalSessionCount are
+#   REPLACED wholesale with whatever the capped window contained.
+#
+# ── Do NOT use this script for the TEAM-3359 dependency_chain pollution ─────
+# The dependency_chain_compliance_online scorecard was polluted by false 0.0
+# verdicts (sessions that created no tickets scored as "Failed"; verified on
+# agentcore_hub_requirements_analyst: sum 42.5 / count 240 as of 2026-08-27).
+# Re-running this script is the WRONG cleanup tool, twice over:
+#   1. SET-overwrite + the 500-event cap would destroy every HEALTHY
+#      evaluator's rolling history for the agent to fix one bad key.
+#   2. The pollution is not reconstructible from results logs anyway — a
+#      false-positive 0.0 ("no tickets created") is indistinguishable from a
+#      genuine 0.0 failure in the log records alone.
+#
+# Targeted reset runbook instead — run once, at CD time, AFTER the corrected
+# rubric (NotApplicable 2.0) and the TEAM-3359 packager are deployed:
+#
+#   for agent in agentcore_hub_requirements_analyst \
+#                agentcore_hub_qa_verifier \
+#                agentcore_hub_ci_agent; do
+#     aws dynamodb update-item \
+#       --table-name agentcore-hub-eval-config \
+#       --key "{\"agentId\":{\"S\":\"$agent\"}}" \
+#       --update-expression 'REMOVE evalScores.#e' \
+#       --expression-attribute-names '{"#e":"dependency_chain_compliance_online"}'
+#   done
+#
+# Notes (verified against the live table, 2026-08-27):
+# - The evalScores map key is the BARE evaluator name
+#   "dependency_chain_compliance_online" — no "-XXXX" ID suffix.
+# - Only requirements_analyst currently carries the pollution; qa_verifier and
+#   ci_agent have empty evalScores, so the REMOVE is a safe no-op there.
+# - lambda/eval-packager (aggregateScoresToDdb) re-initializes a missing
+#   evaluator key to {sum:0,count:0} on the next delivery; evalSessionCount is
+#   deliberately left untouched.
 
 set -euo pipefail
 
@@ -36,7 +76,7 @@ NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # Process each agent
 python3 -c "
-import json, subprocess, sys, time
+import json, re, subprocess, sys, time
 
 with open('${AGENTS_FILE}') as f:
     agents = json.load(f)['agents']
@@ -137,6 +177,8 @@ for agent in agents:
         eval_groups = json.loads(result.stdout) if result.returncode == 0 else []
 
         for eval_lg in eval_groups:
+            # KNOWN LIMITATION: single call, 500-event cap, no pagination —
+            # a sample of recent history on busy groups (see script header).
             result = subprocess.run([
                 'aws', 'logs', 'filter-log-events',
                 '--log-group-name', eval_lg,
@@ -155,14 +197,35 @@ for agent in agents:
                     attrs = record.get('attributes', {})
                     evaluator = attrs.get('gen_ai.evaluation.name', '')
                     score = attrs.get('gen_ai.evaluation.score.value')
+                    score_label = attrs.get('gen_ai.evaluation.score.label') or ''
+                    explanation = attrs.get('gen_ai.evaluation.explanation') or ''
                     session_id = attrs.get('session.id', '')
+                    # Mirrors the packager's error exclusion: every errorClass
+                    # (throttled / span_missing_validation / tool_span_mapping
+                    # / other) carries error.type, and throttled rows can carry
+                    # a numeric-looking score that must never aggregate.
                     has_error = attrs.get('error') == 1 or attrs.get('error.type')
 
+                    try:
+                        numeric = float(score) if score is not None else None
+                    except (TypeError, ValueError):
+                        numeric = None
+
+                    # Mirrors lambda/eval-packager isNotApplicable(): the
+                    # NotApplicable rubric verdict (score 2.0 / NotApplicable
+                    # label / NOT_APPLICABLE-prefixed explanation) means
+                    # \"nothing to judge\" — never averaged into sum/count.
+                    is_na = (
+                        re.match(r'not[\s_-]?applicable\$', score_label.strip(), re.I) is not None
+                        or numeric == 2.0
+                        or explanation.startswith('NOT_APPLICABLE')
+                    )
+
                     if session_id: sessions_seen.add(session_id)
-                    if evaluator and score is not None and not has_error:
+                    if evaluator and not is_na and numeric is not None and not has_error:
                         if evaluator not in eval_scores:
                             eval_scores[evaluator] = {'sum': 0, 'count': 0}
-                        eval_scores[evaluator]['sum'] += float(score)
+                        eval_scores[evaluator]['sum'] += numeric
                         eval_scores[evaluator]['count'] += 1
                 except:
                     pass
