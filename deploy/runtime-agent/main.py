@@ -2029,6 +2029,20 @@ async def agent_invocation(payload, context):
                 except Exception:  # noqa: BLE001
                     pass
             finally:
+                # Flush spans before completing the task: BatchSpanProcessor's
+                # ~5s export delay + microVM reap after complete_async_task can
+                # drop the final invoke_agent span. A flush failure must never
+                # prevent task completion.
+                try:
+                    import opentelemetry.trace as trace_api
+                    provider = trace_api.get_tracer_provider()
+                    if hasattr(provider, "force_flush"):
+                        provider.force_flush(timeout_millis=5000)
+                except Exception as flush_exc:  # noqa: BLE001
+                    logger.warning(
+                        f"[{agent_id}] span flush failed before task "
+                        f"completion: {str(flush_exc)[:200]}"
+                    )
                 app.complete_async_task(task_id)
                 _DETACHED_TASKS.discard(asyncio.current_task())
 
@@ -2246,7 +2260,13 @@ async def _run_agent_invocation(payload, context):
         tools=all_tools,
         callback_handler=None,
         hooks=[_OperatorMailbox(workflow_id, agent_id)],
-        trace_attributes={"agent.id": agent_id, "workflow.id": workflow_id},
+        trace_attributes={
+            # session.id keys spans for the eval-packager even when ADOT
+            # header injection is absent (direct_code_deploy fallback path).
+            "session.id": getattr(context, "session_id", None) or f"wf-{workflow_id}",
+            "agent.id": agent_id,
+            "workflow.id": workflow_id,
+        },
     )
 
     # Iterate stream_async — write events to DDB in real-time as they arrive.
