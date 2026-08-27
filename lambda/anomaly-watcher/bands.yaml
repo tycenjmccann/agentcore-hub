@@ -1,0 +1,104 @@
+# lambda/anomaly-watcher/bands.yaml
+# Source of truth: git. Bundled into the Lambda artifact by deploy.sh (D2).
+# Invalid file => watcher logs errors and takes NO tiered action that cycle.
+version: 1
+metrics:
+  # (a) Agent task duration, per agent. Pairs agent.invoked -> agent.complete /
+  # workflow.report_completion per ticketId — same pairing as compute_metrics.py.
+  - id: agent_task_duration_ms
+    enabled: true
+    direction: upper                 # slower than baseline is the anomaly
+    source:
+      kind: events
+      startTypes: [agent.invoked]
+      endTypes: [agent.complete, workflow.report_completion]
+      groupBy: detail.agentId        # one band per agent persona
+    aggregation: duration_ms
+    baselineWindow: 7d
+    evaluationWindow: 1h
+    sigmaThresholds: { tier1: 1, tier2: 2, tier3: 3 }
+    minSamples:
+      baselineBuckets: 24            # >=24 hourly buckets with >=1 completion
+      evalSamples: 3                 # >=3 completed tasks in the eval window
+    stddevFloor:
+      epsilon: 30000                 # 30s absolute floor (ms)
+      relFloor: 0.10                 # 10% of |mean|
+    westernElectric: { rules: [1, 2, 3] }
+    suppression: { tier3Ttl: 6h, tier2Ttl: 2h }
+    diagnosis: { maxTargets: 2 }
+
+  # (b) Agent error/retry rate, fleet-wide.
+  - id: agent_error_retry_rate
+    enabled: true
+    direction: upper
+    source:
+      kind: events
+      numeratorTypes: [agent.error, agent.retry]
+      denominatorTypes: [agent.invoked]
+      groupBy: fleet
+    aggregation: rate
+    baselineWindow: 7d
+    evaluationWindow: 1h
+    sigmaThresholds: { tier1: 1, tier2: 2, tier3: 3 }
+    minSamples:
+      baselineBuckets: 24
+      evalSamples: 5
+      bucketDenominator: 5
+    stddevFloor:
+      epsilon: 0.05
+      relFloor: 0.25
+    westernElectric: { rules: [1, 2, 3] }
+    suppression: { tier3Ttl: 6h, tier2Ttl: 2h }
+    diagnosis: { maxTargets: 2 }
+
+  # (c) CI/verification failure rate, fleet-wide.
+  - id: ci_failure_rate
+    enabled: true
+    direction: upper
+    source:
+      kind: events
+      numeratorTypes: [review.rejected, ticket.created]
+      denominatorTypes: [agent.invoked]
+      where:
+        numerator:
+          ticket.created: { detail.ticket.title: { startsWith: "Fix:" } }
+        denominator:
+          agent.invoked:
+            detail.agentId: { in: [agentcore_hub_ci_agent, agentcore_hub_qa_verifier] }
+      groupBy: fleet
+    aggregation: rate
+    baselineWindow: 7d
+    evaluationWindow: 6h             # CI attempts are sparse; wider window
+    sigmaThresholds: { tier1: 1, tier2: 2, tier3: 3 }
+    minSamples:
+      baselineBuckets: 14
+      evalSamples: 2
+      bucketDenominator: 2
+    stddevFloor:
+      epsilon: 0.10
+      relFloor: 0.25
+    westernElectric: { rules: [1, 2, 3] }
+    suppression: { tier3Ttl: 12h, tier2Ttl: 4h }
+    diagnosis: { maxTargets: 2 }
+
+  # (d) Evaluation-score rolling average, per agent. NOT an event query.
+  - id: eval_score_avg
+    enabled: true
+    direction: lower                 # score DROP is the anomaly
+    source:
+      kind: eval-config-snapshot
+      groupBy: agentId
+    aggregation: snapshot_delta_avg
+    baselineWindow: 7d
+    evaluationWindow: 6h
+    sigmaThresholds: { tier1: 1, tier2: 2, tier3: 3 }
+    minSamples:
+      baselineBuckets: 24
+      evalSamples: 3
+      bucketDenominator: 3
+    stddevFloor:
+      epsilon: 0.05
+      relFloor: 0.05
+    westernElectric: { rules: [1, 2, 3] }
+    suppression: { tier3Ttl: 12h, tier2Ttl: 4h }
+    diagnosis: { maxTargets: 1 }
