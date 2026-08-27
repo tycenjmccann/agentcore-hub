@@ -5,6 +5,11 @@ import { getEvalConfig, clearSessionBuffer } from "@/lib/eval-config";
 const REGION = process.env.AWS_REGION || "us-east-1";
 const S3_BUCKET = process.env.ARTIFACT_BUCKET || process.env.ARTIFACTS_BUCKET;
 
+// Raw batches are archived here. NEVER the prd/ prefix — prd-submitter treats
+// every prd/ object as a synthesized PRD and starts a workflow from it, so a
+// raw batch there becomes an "[SI] undefined" run.
+const BATCH_PREFIX = "fleet-imp-agent/batches";
+
 const s3 = new S3Client({ region: REGION });
 
 export const dynamic = "force-dynamic";
@@ -37,7 +42,7 @@ export async function POST(
 
   const now = new Date().toISOString();
   const safeTimestamp = now.replace(/:/g, "-");
-  const s3Key = `fleet-imp-agent/prd/batch-${agentId}-${safeTimestamp}.json`;
+  const s3Key = `${BATCH_PREFIX}/batch-${agentId}-${safeTimestamp}.json`;
 
   const batchBody = JSON.stringify({
     agentId,

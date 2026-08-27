@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getAllEvalConfigs } from "@/lib/eval-config";
+import { getAllEvalConfigs, bufferRunCount } from "@/lib/eval-config";
 
 export const dynamic = "force-dynamic";
 
@@ -12,7 +12,8 @@ export async function GET() {
       enabled: item.enabled,
       sampleRate: item.sampleRate,
       batchSize: item.batchSize,
-      currentBufferLen: Array.isArray(item.sessionBuffer) ? item.sessionBuffer.length : 0,
+      // Runs, not deliveries — this is what the packager compares to batchSize.
+      currentBufferLen: bufferRunCount(item),
       lastFlushedAt: item.lastFlushedAt,
       lastUpdatedAt: item.lastUpdatedAt,
       lastUpdatedBy: item.lastUpdatedBy,

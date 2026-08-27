@@ -61,10 +61,14 @@ export async function updateEvalConfig(agentId: string, updates: Record<string, 
 }
 
 export async function clearSessionBuffer(agentId: string, lastFlushedAt: string) {
+  // bufferSessions (the distinct-run set the packager flushes on) must reset
+  // with the buffer. Leaving it behind keeps the run count >= batchSize, so
+  // the very next log delivery re-triggers an auto-flush with a near-empty
+  // buffer — flushes every few minutes instead of every batchSize runs.
   await ddb.send(new UpdateCommand({
     TableName: TABLE,
     Key: { agentId },
-    UpdateExpression: "SET #buf = :empty, #lf = :lf",
+    UpdateExpression: "SET #buf = :empty, #lf = :lf REMOVE bufferSessions",
     ExpressionAttributeNames: {
       "#buf": "sessionBuffer",
       "#lf": "lastFlushedAt",
@@ -74,4 +78,16 @@ export async function clearSessionBuffer(agentId: string, lastFlushedAt: string)
       ":lf": lastFlushedAt,
     },
   }));
+}
+
+/**
+ * Distinct runs currently buffered — the count the packager compares to
+ * batchSize. sessionBuffer.length counts log DELIVERIES, not runs, and one
+ * delivery can carry many runs (or one run many deliveries).
+ */
+export function bufferRunCount(item: Record<string, unknown>): number {
+  const runs = item.bufferSessions;
+  if (runs instanceof Set) return runs.size;
+  if (Array.isArray(runs)) return runs.length;
+  return 0;
 }

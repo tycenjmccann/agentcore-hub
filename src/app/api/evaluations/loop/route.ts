@@ -1,11 +1,13 @@
 /**
  * GET/POST /api/evaluations/loop — Toggle the continuous improvement loop
  *
- * Mechanism: Lambda reserved concurrency on agentcore-hub-eval-packager
- *   - concurrency = 0 → loop OFF (Lambda can't be invoked)
- *   - concurrency removed → loop ON (Lambda uses unreserved pool)
- *
- * No new tables, no new lambdas. Pure AWS API.
+ * Two independent legs must flip together:
+ *   1. eval-packager Lambda reserved concurrency (buffering + PRD synthesis)
+ *        - concurrency = 0 → Lambda can't be invoked
+ *        - concurrency removed → Lambda uses unreserved pool
+ *   2. Online evaluation configs' executionStatus (the judge model itself).
+ *      This is where the cost is — with only the Lambda off, the judge keeps
+ *      evaluating every sampled session and the spend continues.
  */
 
 import { NextResponse } from "next/server";
@@ -14,6 +16,41 @@ export const dynamic = "force-dynamic";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const FUNCTION_NAME = "agentcore-hub-eval-packager";
+
+async function setAllOnlineEvalConfigs(enabled: boolean): Promise<{ updated: string[]; errors: string[] }> {
+  const {
+    BedrockAgentCoreControlClient,
+    ListOnlineEvaluationConfigsCommand,
+    UpdateOnlineEvaluationConfigCommand,
+  } = await import("@aws-sdk/client-bedrock-agentcore-control");
+
+  const client = new BedrockAgentCoreControlClient({ region: REGION });
+  const target = enabled ? "ENABLED" : "DISABLED";
+  const updated: string[] = [];
+  const errors: string[] = [];
+
+  let nextToken: string | undefined;
+  do {
+    const page = await client.send(new ListOnlineEvaluationConfigsCommand({ nextToken }));
+    for (const cfg of page.onlineEvaluationConfigs || []) {
+      const id = cfg.onlineEvaluationConfigId;
+      if (!id) continue;
+      if (cfg.executionStatus === target) continue;
+      try {
+        await client.send(new UpdateOnlineEvaluationConfigCommand({
+          onlineEvaluationConfigId: id,
+          executionStatus: target,
+        }));
+        updated.push(id);
+      } catch (err) {
+        errors.push(`${id}: ${(err as Error).message}`);
+      }
+    }
+    nextToken = page.nextToken;
+  } while (nextToken);
+
+  return { updated, errors };
+}
 
 export async function GET() {
   try {
@@ -60,7 +97,16 @@ export async function POST(request: Request) {
       }));
     }
 
-    return NextResponse.json({ enabled });
+    const judges = await setAllOnlineEvalConfigs(enabled);
+    if (judges.errors.length > 0) {
+      console.error("[eval-loop] online eval config updates failed:", judges.errors.join("; "));
+    }
+
+    return NextResponse.json({
+      enabled,
+      onlineEvalConfigsUpdated: judges.updated,
+      ...(judges.errors.length > 0 ? { onlineEvalWarnings: judges.errors } : {}),
+    });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });

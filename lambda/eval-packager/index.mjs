@@ -139,6 +139,22 @@ export const handler = async (event) => {
   const appended = await appendToBuffer(agentId, sessionData, batchSize);
 
   if (appended.shouldFlush) {
+    // Flush cooldown: batchSize alone doesn't bound PRD rate — every persona
+    // on the shared runtime counts toward the same agent's batch, and each
+    // synthesized PRD starts a 14-agent workflow whose runs feed the NEXT
+    // batch. During a busy stretch that produced a PRD (and a workflow) every
+    // ~10 minutes, self-sustaining. Hold the full buffer until the cooldown
+    // elapses; runs keep accumulating and flush in one bigger batch.
+    const cooldownMin = config.flushCooldownMinutes ?? 60;
+    const lastFlushed = config.lastFlushedAt ? Date.parse(config.lastFlushedAt) : 0;
+    const sinceMin = (Date.now() - lastFlushed) / 60000;
+    if (sinceMin < cooldownMin) {
+      console.log(
+        `[eval-packager] Agent ${agentId}: batch full but cooling down ` +
+          `(${sinceMin.toFixed(1)}/${cooldownMin} min since last flush) — holding.`
+      );
+      return { statusCode: 200, body: 'cooldown' };
+    }
     // 7. Batch is full → flush to S3 + synthesize PRD
     await flushBuffer(agentId, appended.buffer, batchSize);
   }
