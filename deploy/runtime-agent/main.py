@@ -270,6 +270,44 @@ REMOTE_CODING_IDLE_TIMEOUT_S = int(
     os.getenv("REMOTE_CODING_IDLE_TIMEOUT_S", str(REMOTE_CODING_READ_TIMEOUT))
 )
 
+
+def _validate_remote_coding_timers(turn_timeout_s: int | None = None,
+                                   idle_timeout_s: int | None = None,
+                                   turn_deadline_s: int | None = None) -> bool:
+    """Startup guard on the remote-coding timer layering (TEAM-3261): the
+    coding runtime's TURN_TIMEOUT_S must sit strictly below the client idle
+    timeout (else legitimate frame-silent turns are falsely killable
+    client-side before the runtime's own cap fires), which must sit strictly
+    below the whole-turn deadline. These are independent env vars with no
+    other cross-check. Warns loudly on violation — never crashes the runtime."""
+    if turn_timeout_s is None:
+        turn_timeout_s = int(os.getenv("TURN_TIMEOUT_S", "1500"))
+    if idle_timeout_s is None:
+        idle_timeout_s = REMOTE_CODING_IDLE_TIMEOUT_S
+    if turn_deadline_s is None:
+        turn_deadline_s = REMOTE_CODING_TURN_DEADLINE_S
+    ok = True
+    if not turn_timeout_s < idle_timeout_s:
+        logger.warning(
+            f"[remote-coding] TIMER INVARIANT VIOLATED: coding-runtime turn "
+            f"budget TURN_TIMEOUT_S ({turn_timeout_s}s) must be strictly less "
+            f"than REMOTE_CODING_IDLE_TIMEOUT_S ({idle_timeout_s}s) — "
+            f"legitimate frame-silent coding turns will be killed client-side "
+            f"before the runtime's own cap fires")
+        ok = False
+    if not idle_timeout_s < turn_deadline_s:
+        logger.warning(
+            f"[remote-coding] TIMER INVARIANT VIOLATED: "
+            f"REMOTE_CODING_IDLE_TIMEOUT_S ({idle_timeout_s}s) must be "
+            f"strictly less than REMOTE_CODING_TURN_DEADLINE_S "
+            f"({turn_deadline_s}s) — the idle watchdog could never fire "
+            f"before the whole-turn deadline")
+        ok = False
+    return ok
+
+
+_validate_remote_coding_timers()
+
 # Tenant the workflow session rows belong to. Multi-tenant deployments must set
 # this to the tenant that owns the fleet, or the Cloud Code tab (which scopes
 # reads by the caller's tenant) won't show workflow sessions.
@@ -542,6 +580,45 @@ def _drain_coding_sse(body, deadline_s: float | None = None,
     return _finalize(result)
 
 
+def _read_buffered_with_deadline(body, deadline_s: float | None = None) -> bytes:
+    """Read a buffered (non-SSE) coding-handoff body under the same wall-clock
+    deadline as the SSE drain (TEAM-3261, same TEAM-3168 hang class): a bare
+    .read() is bounded only by botocore's per-socket-read timeout, which does
+    not reliably fire on a wedged stream and is extended indefinitely by a
+    server dribbling bytes. The read runs on a daemon thread (mirroring
+    _drain_coding_sse) so the deadline fires even while the read is blocked;
+    expiry raises TimeoutError into _remote_coding_turn's existing error path."""
+    import queue
+    if deadline_s is None:
+        deadline_s = REMOTE_CODING_TURN_DEADLINE_S
+    out: queue.Queue = queue.Queue()
+
+    def _read():
+        try:
+            out.put(body.read())
+        except Exception as e:  # noqa: BLE001 — re-raised on the waiting thread
+            out.put(e)
+
+    reader = threading.Thread(target=_read, daemon=True,
+                              name="coding-buffered-reader")
+    reader.start()
+    try:
+        raw = out.get(timeout=deadline_s)
+    except queue.Empty:
+        # Closing the body aborts the blocked reader thread's read, same as
+        # _drain_coding_sse's abandon path.
+        try:
+            body.close()
+        except Exception:  # noqa: BLE001 — already giving up
+            pass
+        raise TimeoutError(
+            f"coding turn buffered read exceeded {deadline_s}s without "
+            f"completion (deadline)")
+    if isinstance(raw, Exception):
+        raise raw
+    return raw
+
+
 def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") -> str:
     """Run one coding turn on the Cloud Code runtime. Returns the CLI's text
     response with a session footer, or an ERROR string (never raises).
@@ -613,7 +690,8 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         else:
             # Early failures (bad payload, workspace-fatal) come back as plain
             # JSON even when streaming was requested.
-            result = json.loads(resp["response"].read().decode("utf-8"))
+            result = json.loads(
+                _read_buffered_with_deadline(resp["response"]).decode("utf-8"))
     except Exception as e:  # noqa: BLE001
         # Do NOT fall back to a local CLI run: the session's workspace lives on
         # the coding runtime, and a local run would fork it (split-brain).
