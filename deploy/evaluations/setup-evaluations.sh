@@ -50,6 +50,24 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 #        truthful for the next reader.
 # -----------------------------------------------------------------------------
 
+# --- Fleet span_missing health alarm (TEAM-3103) ---------------------------
+# deploy/evaluations/span-missing-alarm.json watches the EMF metrics that
+# lambda/eval-packager/index.mjs now emits (EvalSessionsTotal /
+# EvalSessionsSpanMissing in the AgentCoreHub/Evaluations namespace) and
+# fires when >50% of eval sessions across the fleet have no invoke_agent
+# span. Apply it with:
+#
+#   aws cloudwatch put-metric-alarm --cli-input-json file://span-missing-alarm.json
+#
+# Rollout constraint: create this alarm ONLY AFTER the runtime telemetry fix
+# (R1/R2 — Strands/ADOT tracer wiring) is deployed AND at least one healthy
+# eval batch with non-zero EvalSessionsTotal has been observed in CloudWatch.
+# Creating it earlier means every session is span_missing by definition and
+# the alarm fires immediately on stale data. Add AlarmActions (the
+# environment's SNS topic ARN) to the JSON at apply time — it's intentionally
+# omitted here since it's environment-specific.
+# -----------------------------------------------------------------------------
+
 # Agents that create/reassign tickets (need the custom evaluator)
 TICKET_AGENTS="agentcore_hub_requirements_analyst agentcore_hub_qa_verifier agentcore_hub_ci_agent"
 
