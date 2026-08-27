@@ -15,7 +15,7 @@ so nobody else will analyze them — you are the only component that does.
 ## Procedure
 
 **1. Unblock first, analyze second.** The run's owner is waiting. Apply the
-standard stuck-agent test (dossier `lastText` + artifacts). If work didn't
+stuck-agent test from the `watch-triage` skill (dossier `lastText` + artifacts). If work didn't
 ship: `python3 /mnt/workspace/toolkit/intervene.py retry <wfId> <agentId>`.
 Never hold the run hostage to the investigation.
 
