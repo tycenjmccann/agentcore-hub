@@ -280,6 +280,14 @@ _CODING_SESSION = {
     "conversation_ids": {},  # cli -> resume id
     "repo": None,
     "recorded": False,
+    # Ported-session resume fields (a laptop session shipped to this workflow).
+    # Forwarded to the coding runtime so it installs the S3 transcript + checks
+    # out the ported branch — idempotent there, so sending every turn is safe.
+    "resume_transcript": None,  # S3 key of the raw .jsonl
+    "resume_session_id": None,  # conversation id inside that transcript
+    "branch": None,
+    "git_mode": None,
+    "clone_url": None,
 }
 
 
@@ -379,8 +387,19 @@ def _maybe_resume_session(resume_session: str) -> None:
                 _CODING_SESSION["conversation_ids"][cli] = conv
             if row.get("repo", {}).get("S"):
                 _CODING_SESSION["repo"] = row["repo"]["S"]
+            # Ported laptop session (ship_session_to_workflow): the transcript
+            # lives in S3, not on the coding runtime's EFS yet. Forward the
+            # install fields so the first turn restores the exact conversation
+            # and checks out the ported branch (idempotent on the runtime).
+            if row.get("resumeTranscriptKey", {}).get("S"):
+                _CODING_SESSION["resume_transcript"] = row["resumeTranscriptKey"]["S"]
+                _CODING_SESSION["resume_session_id"] = conv
+                _CODING_SESSION["branch"] = row.get("branch", {}).get("S")
+                _CODING_SESSION["git_mode"] = row.get("gitMode", {}).get("S")
+                _CODING_SESSION["clone_url"] = row.get("cloneUrl", {}).get("S")
             logger.info(f"[remote-coding] resuming prior session {resume_session} "
-                        f"(cli={cli}, conversation={'yes' if conv else 'no'})")
+                        f"(cli={cli}, conversation={'yes' if conv else 'no'}, "
+                        f"ported={'yes' if _CODING_SESSION['resume_transcript'] else 'no'})")
         else:
             logger.info(f"[remote-coding] resume requested but no session row for "
                         f"{resume_session} — pinning workspace only")
@@ -417,6 +436,18 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         payload["repo"] = _CODING_SESSION["repo"]
     if conversation_id:
         payload["claude_session_id"] = conversation_id
+    # Ported laptop session: tell the coding runtime to install the S3
+    # transcript + check out the ported branch. Idempotent runtime-side
+    # (.resume-installed marker), so forwarding on every turn is safe.
+    if _CODING_SESSION.get("resume_transcript"):
+        payload["resume_transcript"] = _CODING_SESSION["resume_transcript"]
+        payload["resume_session_id"] = _CODING_SESSION.get("resume_session_id")
+        if _CODING_SESSION.get("branch"):
+            payload["branch"] = _CODING_SESSION["branch"]
+        if _CODING_SESSION.get("git_mode"):
+            payload["git_mode"] = _CODING_SESSION["git_mode"]
+        if _CODING_SESSION.get("clone_url"):
+            payload["clone_url"] = _CODING_SESSION["clone_url"]
 
     logger.info(
         f"[remote-coding] {cli} turn on {_CODING_SESSION['session_id']} "
@@ -1619,7 +1650,9 @@ async def agent_invocation(payload, context):
     # Fresh coding session per agent-task: a warm microVM reuses this module, so
     # without a reset the next task would resume the PREVIOUS task's workspace.
     _CODING_SESSION.update(
-        {"session_id": None, "conversation_ids": {}, "repo": None, "recorded": False}
+        {"session_id": None, "conversation_ids": {}, "repo": None, "recorded": False,
+         "resume_transcript": None, "resume_session_id": None, "branch": None,
+         "git_mode": None, "clone_url": None}
     )
 
     logger.info(f"[{agent_id}] Starting invocation for workflow {workflow_id}")

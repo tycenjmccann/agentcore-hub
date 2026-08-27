@@ -32,6 +32,17 @@ export const ModelOverrideSchema = z.object({
   }).optional(),
 }).optional();
 
+// A laptop coding session shipped into the workflow (ship_session_to_workflow):
+// its branch becomes the run's shared integration branch and pipeline personas
+// resume the session for context instead of starting cold.
+export const PortedSessionSchema = z.object({
+  sessionId: z.string().min(1),
+  claudeSessionId: z.string().min(1),
+  cli: z.enum(["claude", "codex"]),
+  repo: z.string().optional(),
+  branch: z.string().min(1),
+});
+
 export const WorkflowInputSchema = z.object({
   title: z.string().min(1),
   description: z.string().min(1),
@@ -41,6 +52,7 @@ export const WorkflowInputSchema = z.object({
   workflowType: z.enum(["feature", "bug"]).optional(),
   workflowDefId: z.string().optional(),
   reviewGates: z.array(z.string()).optional(),
+  portedSession: PortedSessionSchema.optional(),
 });
 
 export const SubmitWorkflowInputSchema = WorkflowInputSchema;
