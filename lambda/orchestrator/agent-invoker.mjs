@@ -171,6 +171,11 @@ async function fireAndForgetRuntime(runtimeArn, sessionId, prompt, workflowId, a
     workflow_id: workflowId,
     agent_id: agentId,
     ticket_id: invokerTicketId || "",
+    // Nobody reads this response (we destroy the connection below), so tell the
+    // runtime to detach: ack instantly, run the agent loop as a background task.
+    // Without this, the idle response stream gets platform-killed at ~15 min
+    // and takes the persona run with it.
+    detach: true,
     model_override: modelOverride?.bedrockModelConfig?.modelId || modelOverride || undefined,
     ...(Array.isArray(connectors) && connectors.length ? { connectors } : {}),
   });

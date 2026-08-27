@@ -1961,12 +1961,14 @@ async def agent_invocation(payload, context):
     DynamoDB events + report_completion exactly as before, and no connection
     exists for the idle kill to take.
 
-    Chat/ad-hoc invocations (workflow_id "unknown") DO have a live reader on
-    the response — they keep the synchronous streaming path."""
+    Detachment is OPT-IN via payload {"detach": true} — only the orchestrator's
+    agent-invoker sends it. Anything that reads the response synchronously
+    (chat, verify-fleet-invoke.py healthchecks, ad-hoc invokes) keeps the
+    streaming path by default."""
     workflow_id = payload.get("workflow_id", "unknown")
     agent_id = payload.get("agent_id", "unknown")
 
-    if workflow_id and workflow_id != "unknown":
+    if payload.get("detach") and workflow_id and workflow_id != "unknown":
         import asyncio
 
         task_id = app.add_async_task(
