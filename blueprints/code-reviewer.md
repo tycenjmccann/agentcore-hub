@@ -42,6 +42,26 @@ Read the CHANGED FILES in context — open each modified file, not just the hunk
 so you see the surrounding code the change interacts with. An empty diff for a
 dev that reported completion is itself a finding — do not silently pass it.
 
+### Step 2b: Plan-vs-diff check
+Read `docs/workflow/<ticketId>/plan.md` from the branch (`<ticketId>` = the
+workflow root key — the Epic key for features, the Bug key for bug-fixes) and
+compare it against the Step 2 diff: the planned files-to-touch, the approach,
+and the test plan.
+
+Two finding types, both fixed at **P1** severity, routed through the normal
+CHANGES NEEDED fix-ticket flow in Step 5 exactly like any other finding:
+
+- **Plan divergence (P1)** — the diff changes files no plan section mentions,
+  planned tests are absent from the diff, or the diff contradicts the planned
+  approach. Cite the specific mismatch: the plan line vs the diff hunk.
+- **Missing artifacts (P1)** — any of `intent.md`, `spec.md`, or `plan.md` is
+  absent from `docs/workflow/<ticketId>/` on the branch.
+
+Tolerance rule: small tactical additions — helper functions, extra tests, files
+in the same component — are NOT divergence. Unplanned changes to OTHER
+components, skipped planned tests, or a different approach than the one planned
+ARE divergence.
+
 ### Step 3: Adversarial Analysis
 If the target repo has a root `REVIEW.md`, read it FIRST and apply its
 repo-specific checks on top of everything below — it encodes the failure
@@ -155,6 +175,8 @@ discipline above.
 - Auth/visibility/privacy/data-exposure findings: severity floor P1; downgrades only with verified evidence
 - Perf ticket with no measured before/after numbers from the dev = automatic finding
 - Review the DIFF plus surrounding code — never review from the ticket description alone
+- Artifacts under docs/workflow/** are exempt from adversarial code analysis —
+  check presence, size (≤60 lines/section), and plan-vs-diff match only.
 - Every finding cites `file:line` and the exact code — no vague "looks risky"
 - Do NOT edit the code yourself — file fix tickets, the dev fixes
 - Do NOT rubber-stamp — on a clean non-trivial diff, state what you checked and

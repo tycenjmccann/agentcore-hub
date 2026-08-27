@@ -47,6 +47,67 @@ Write your triage to: `workflows/{workflow_id}/shared/bug-analysis.md` with sect
 - **Hypothesis** — your best one-paragraph guess at the root cause (the dev agent will confirm or refute)
 - **Blast Radius** — what else could be affected if the hypothesis is correct
 
+### Step 2b: Write the audit artifacts (intent.md + spec.md) to S3
+In addition to `bug-analysis.md` (unchanged, above), write the two workflow audit
+artifacts via `S3Storage___write_object` to
+`workflows/{workflow_id}/shared/artifacts/<ticketId>/`, where `<ticketId>` is the
+Bug's key (the workflow root — the orchestrator stores it as `epic_id`):
+
+1. `workflows/{workflow_id}/shared/artifacts/<ticketId>/intent.md` — this
+   template VERBATIM, filled in, ≤ 60 lines (`**Type:**` is `bug-fix`):
+
+   ```markdown
+   # Intent — <ticketId>: <title>
+   - **Requested by:** <reporter / source system>
+   - **Date:** <YYYY-MM-DD>
+   - **Workflow:** <workflow_id> | **Type:** feature | bug-fix
+
+   ## Problem statement (verbatim from the root ticket)
+   > <paste, verbatim — do not paraphrase>
+
+   ## Why now / impact
+   <1–3 sentences>
+
+   ## Success criteria
+   - <observable outcome 1>
+   - <observable outcome 2>
+
+   <!-- Hard cap: this file ≤ 60 lines of markdown. -->
+   ```
+
+2. `workflows/{workflow_id}/shared/artifacts/<ticketId>/spec.md` — this template
+   VERBATIM, filled in, ≤ 60 lines. For a bug, the Functional requirements
+   section IS the repro + regression-test contract: FR1 = the repro (verbatim
+   steps, fails today), FR2 = the regression-test contract (test fails on
+   `base_branch`, passes on the fix). The Ticket plan table lists the sub-task
+   chain from Step 5:
+
+   ```markdown
+   # Spec — <ticketId>: <title>
+   Source of record: this file. Transport copy: s3://…/workflows/<workflow_id>/shared/
+
+   ## Functional requirements
+   <!-- Bug-fix workflows: FR1 = the repro (fails today, verbatim steps), FR2 = the
+        regression-test contract (test fails on base_branch, passes on the fix). -->
+   - **FR1:** <requirement> — AC: <checkable criterion>
+   - **FR2:** <requirement> — AC: <checkable criterion>
+
+   ## Out of scope
+   - <explicit exclusion>
+
+   ## Ticket plan
+   | Ticket | Assignee (agent) | Blocked by |
+   |---|---|---|
+   | <key> — <title> | <agent id> | <key or none> |
+
+   <!-- Hard cap: this file ≤ 60 lines of markdown. -->
+   ```
+
+These artifacts are ADDITIVE-ONLY — the fixer commits them under
+`docs/workflow/<ticketId>/`, never touching app code paths (`src/`, `lambda/`,
+`mcp/`, `scripts/`, `tests/`). S3 remains the phase-to-phase transport; the repo
+copy is the audit record.
+
 ### Step 3: Scope the Fix
 Classify the fix scope:
 
@@ -77,6 +138,12 @@ is fix → code review → QA → CI:
    - `title`: `Fix: {one-line symptom or hypothesis}` (e.g., `Fix: ticket badges fail to render on first load`)
    - `description`: includes
      - Link to the bug-analysis.md S3 path
+     - The two S3 artifact paths from Step 2b
+       (`workflows/{workflow_id}/shared/artifacts/<ticketId>/intent.md` and
+       …/spec.md`) plus this exact instruction: "First commit (if not already
+       on base_branch): copy intent.md and spec.md from the S3 artifact path
+       into docs/workflow/<ticketId>/ and commit with message
+       docs(<ticketId>): add workflow audit artifacts."
      - Symptom + repro steps verbatim from the report
      - Suspected subsystem and any stack trace top frame
      - Hypothesis from your analysis (clearly labelled as "hypothesis — confirm or refute")
