@@ -55,6 +55,19 @@ OTEL spans, and last tool activity before death. What to read off it:
 
 **5. Decide: file or note.**
 
+**FIRST — check for a standing stop order.** Before any filing decision:
+
+- If the operator has EVER told you (in chat or memory) to stop filing bugs,
+  run `python3 /mnt/workspace/toolkit/intervene.py bugs-off --note "<why>"`
+  immediately if you haven't already — that flips a server-side kill switch
+  that outlives your session. A promise in chat that isn't backed by the
+  switch WILL be broken by your next WATCH invocation, which starts with no
+  chat context. Then comment the RCA on the stuck ticket instead of filing.
+- Check whether fix runs for this signature were CANCELLED (dossier / the
+  workflows table: `workflowType=bug`, phase `cancelled`, matching title).
+  A cancelled fix run is the operator saying "not this way" — do NOT refile
+  the same signature; comment the RCA on the original bug ticket.
+
 - **Systemic** (≥2 dead sessions with the same signature, or the same
   signature across different runs/agents) → file a bug. It auto-fires the
   bug-fix pipeline:
@@ -83,6 +96,13 @@ past crashes are retrievable.
 
 - Never file a bug without log evidence from step 3 — "it died" is not an RCA.
 - Never re-file what dedupe suppressed; add new occurrences to the open bug.
+- The API enforces a hard cap on OPEN auto-filed bugs per family (default 3)
+  and suppresses signatures recently closed Won't Do. A `suppressed: true` or
+  cap response is FINAL for this session — do not rephrase the title or tweak
+  labels to get a ticket through.
+- Same last-activity shape on different personas = ONE systemic bug (the
+  runtime/handoff layer), not one bug per persona. Check open crash-rca bugs
+  for the same signature under a different agent label before filing.
 - The bug's job is diagnosis, not blame: cite sessions, spans, and log lines,
   not agent quality.
 - If `pull_session_logs.py` returns nothing for any corpse (logs expired or

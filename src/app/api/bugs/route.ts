@@ -1,9 +1,86 @@
 import { NextRequest, NextResponse } from "next/server";
 import { JiraClient } from "@/lib/workflow/jira-client";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, GetCommand, PutCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 
 export const dynamic = "force-dynamic";
 
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
+const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
+// Ceiling on OPEN auto-filed bugs sharing a dedupe signature label family
+// (e.g. "crash-rca"). At the cap, new reports land as comments on the newest
+// open bug instead of new tickets — one systemic root cause (a crashed
+// runtime) must never fan out into a bug per persona per night.
+const MAX_OPEN_AUTO_BUGS = Number(process.env.WM_MAX_OPEN_AUTO_BUGS || 3);
+// A signature the user closed as Won't Do stays muted this long.
+const WONT_DO_MUTE_DAYS = Number(process.env.WM_BUG_MUTE_DAYS || 7);
+
+const ddb = DynamoDBDocumentClient.from(
+  new DynamoDBClient({ region: process.env.AWS_REGION || "us-east-1" })
+);
+
+/**
+ * Auto-bug-filing kill switch. Stored in the events table (no new IAM) as
+ * {workflowId: "wm-config", eventId: "auto-file-bugs", detail: {value}} —
+ * toggled by `intervene.py bugs-off|bugs-on`. Missing item = enabled.
+ *
+ * Returns "on" | "off" | "unknown". Callers on the automated path must FAIL
+ * CLOSED on "unknown": a DDB blip while the switch is set to off must not
+ * silently re-enable filing. Human-relayed bugs never consult this.
+ */
+async function autoFilingSwitch(): Promise<"on" | "off" | "unknown"> {
+  try {
+    const item = (await ddb.send(new GetCommand({
+      TableName: EVENTS_TABLE,
+      Key: { workflowId: "wm-config", eventId: "auto-file-bugs" },
+    }))).Item;
+    return item?.detail?.value === "off" ? "off" : "on";
+  } catch (err) {
+    console.error("[api/bugs] kill-switch read failed:", err instanceof Error ? err.message : err);
+    return "unknown";
+  }
+}
+
+/**
+ * Short-lived mutex serializing the family-cap check-then-create so concurrent
+ * automated filings can't all read count < cap and each open a ticket.
+ * Conditional put on the events table; a stale lock (holder crashed) expires
+ * after LOCK_TTL_MS. Returns true if acquired.
+ */
+const LOCK_TTL_MS = 30_000;
+async function acquireFilingLock(family: string): Promise<boolean> {
+  const now = Date.now();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await ddb.send(new PutCommand({
+        TableName: EVENTS_TABLE,
+        Item: {
+          workflowId: "wm-config",
+          eventId: `filing-lock-${family}`,
+          type: "wm.lock",
+          expiresAtMs: now + LOCK_TTL_MS,
+          timestamp: new Date(now).toISOString(),
+        },
+        ConditionExpression: "attribute_not_exists(eventId) OR expiresAtMs < :now",
+        ExpressionAttributeValues: { ":now": now },
+      }));
+      return true;
+    } catch (err) {
+      if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
+      await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+    }
+  }
+  return false;
+}
+
+async function releaseFilingLock(family: string): Promise<void> {
+  try {
+    await ddb.send(new DeleteCommand({
+      TableName: EVENTS_TABLE,
+      Key: { workflowId: "wm-config", eventId: `filing-lock-${family}` },
+    }));
+  } catch { /* lock expires on its own */ }
+}
 
 /**
  * POST /api/bugs — file a top-level Jira Bug programmatically.
@@ -67,23 +144,92 @@ export async function POST(req: NextRequest) {
   const labels = [`repo:${repo}`, ...extraLabels];
   const projectKey = process.env.JIRA_PROJECT_KEY || "TEAM";
 
+  let filingLockFamily: string | null = null;
   try {
     const jira = JiraClient.fromEnv();
 
-    // Dedupe: one open bug per signature. New occurrences accumulate on it as
-    // comments so the fix ticket sees the full history instead of the pipeline
-    // burning a run per crash.
+    // dedupeLabels present = automated filing path (WM crash-rca etc.). Everything
+    // below the kill switch applies ONLY to automated filings; human-relayed bugs
+    // (Telegram intake, UI) don't send dedupeLabels and are never suppressed.
     const dedupeLabels = (body.dedupeLabels || []).map((l) => String(l).trim()).filter(Boolean);
     if (dedupeLabels.length > 0) {
-      const jql =
+      // 0. Kill switch — the operator said stop; enforce it in code, not prompt.
+      //    Fail CLOSED on a read failure: a DDB blip while the switch is off
+      //    must not re-enable filing. Human bugs never reach this check.
+      const filingSwitch = await autoFilingSwitch();
+      if (filingSwitch !== "on") {
+        return NextResponse.json({
+          suppressed: true,
+          reason: filingSwitch === "off"
+            ? "Automated bug filing is disabled (wm-config/auto-file-bugs=off). Report the RCA as a ticket comment instead. Do NOT retry."
+            : "Kill-switch state could not be read — automated filing fails closed. Report the RCA as a ticket comment instead. Do NOT retry.",
+        });
+      }
+
+      // Serialize the whole automated check-then-create sequence per family so
+      // concurrent WATCH sessions can't race the dedupe or the cap and file
+      // duplicate tickets. Lock released in finally; stale locks self-expire.
+      filingLockFamily = dedupeLabels[0];
+      if (!(await acquireFilingLock(filingLockFamily))) {
+        filingLockFamily = null;
+        return NextResponse.json({
+          suppressed: true,
+          reason: "Another automated filing for this family is in flight — re-check for an existing bug and comment on it instead. Do NOT retry immediately.",
+        });
+      }
+
+      // 1. Exact-signature dedupe: one open bug per signature, occurrences
+      //    accumulate as comments.
+      const sigJql =
         `project = "${projectKey}" AND issuetype = Bug AND statusCategory != Done AND ` +
         dedupeLabels.map((l) => `labels = "${l}"`).join(" AND ") +
         " ORDER BY created DESC";
-      const existing = await jira.searchIssues(jql, ["summary", "status", "labels"], 1);
+      const existing = await jira.searchIssues(sigJql, ["summary", "status", "labels"], 1);
       if (existing.issues.length > 0) {
         const key = existing.issues[0].key;
         await jira.addComment(key, "workflow-manager", `[new occurrence] ${title}\n\n${description}`);
         return NextResponse.json({ ticketId: key, deduped: true });
+      }
+
+      // 2. Won't-Do mute: a signature the operator recently closed unresolved
+      //    (or whose fix run they cancelled) is a "stop reporting this" signal.
+      //    Refiling it within the mute window is suppressed outright.
+      const mutedJql =
+        `project = "${projectKey}" AND issuetype = Bug AND statusCategory = Done AND ` +
+        `resolution in ("Won't Do", "Won't Fix", "Duplicate") AND resolved >= -${WONT_DO_MUTE_DAYS}d AND ` +
+        dedupeLabels.map((l) => `labels = "${l}"`).join(" AND ") +
+        " ORDER BY resolved DESC";
+      try {
+        const muted = await jira.searchIssues(mutedJql, ["summary", "resolution"], 1);
+        if (muted.issues.length > 0) {
+          return NextResponse.json({
+            suppressed: true,
+            reason: `Signature muted: ${muted.issues[0].key} was closed Won't Do within the last ${WONT_DO_MUTE_DAYS} days. Do NOT retry.`,
+          });
+        }
+      } catch { /* mute check is best-effort — resolution field may vary per site */ }
+
+      // 3. Family cap: at MAX_OPEN_AUTO_BUGS open bugs sharing the family label
+      //    (dedupeLabels[0], e.g. "crash-rca"), one systemic root cause has
+      //    already fanned out enough — absorb this report as a comment on the
+      //    newest open bug instead of opening ticket N+1 and burning another
+      //    pipeline run.
+      const familyJql =
+        `project = "${projectKey}" AND issuetype = Bug AND statusCategory != Done AND ` +
+        `labels = "${dedupeLabels[0]}" ORDER BY created DESC`;
+      const openFamily = await jira.searchIssues(familyJql, ["summary"], MAX_OPEN_AUTO_BUGS);
+      if (openFamily.issues.length >= MAX_OPEN_AUTO_BUGS) {
+        const key = openFamily.issues[0].key;
+        await jira.addComment(
+          key,
+          "workflow-manager",
+          `[absorbed — open ${dedupeLabels[0]} bug cap (${MAX_OPEN_AUTO_BUGS}) reached] ${title}\n\n${description}`
+        );
+        return NextResponse.json({
+          ticketId: key,
+          deduped: true,
+          reason: `${openFamily.issues.length} open ${dedupeLabels[0]} bugs already — RCA added as comment on ${key}. Likely one systemic root cause; do NOT file more.`,
+        });
       }
     }
 
@@ -107,5 +253,7 @@ export async function POST(req: NextRequest) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[api/bugs] file failed:", message);
     return NextResponse.json({ error: message }, { status: 500 });
+  } finally {
+    if (filingLockFamily) await releaseFilingLock(filingLockFamily);
   }
 }
