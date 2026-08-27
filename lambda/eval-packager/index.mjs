@@ -181,14 +181,19 @@ function extractSessionData(parsed) {
       const attrs = parsedMessage.attributes || {};
       const sid = attrs['session.id'] || parsedMessage['session.id'] || null;
       if (sid) sessionIds.add(sid);
+      // Eval results are OTEL log records: everything lives in attributes under
+      // gen_ai.* keys, NOT top-level fields. Reading parsedMessage.score/.evidence
+      // produced all-null batches the improver couldn't synthesize from.
+      const rawScore = attrs['gen_ai.evaluation.score.value'];
       sessionBuffer.push({
         timestamp: event.timestamp,
         sessionId: sid,
-        evaluatorName: parsedMessage.evaluatorName || parsedMessage.name || null,
-        score: parsedMessage.score ?? parsedMessage.evaluatorScore ?? null,
-        evidence: parsedMessage.evidence || parsedMessage.reasoning || null,
-        metadata: parsedMessage.metadata || null,
-        result: parsedMessage.result || null,
+        evaluatorName: attrs['gen_ai.evaluation.name'] || parsedMessage.evaluatorName || null,
+        score: rawScore !== undefined && rawScore !== null ? Number(rawScore) : null,
+        scoreLabel: attrs['gen_ai.evaluation.score.label'] || null,
+        evidence: attrs['gen_ai.evaluation.explanation'] || parsedMessage.evidence || null,
+        errorType: attrs['error.type'] || null,
+        errorMessage: attrs['error.message'] || null,
       });
     } catch {
       // If message is not valid JSON, include it as raw text with a flag
