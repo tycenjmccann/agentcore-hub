@@ -478,6 +478,13 @@ def _drain_coding_sse(body, deadline_s: float | None = None,
                               name="coding-sse-reader")
     reader.start()
 
+    def _finalize(res: dict) -> dict:
+        # Tail validation shared by the normal exit and a salvaging abandon:
+        # an error frame with no usable response text fails the turn.
+        if last_error and not (res.get("response") or "").strip():
+            res["error"] = last_error
+        return res
+
     def _abandon(reason: str) -> dict:
         # Closing the body aborts the blocked reader thread's read and lets
         # the botocore/OTEL instrumentation finish the InvokeAgentRuntime span
@@ -486,6 +493,15 @@ def _drain_coding_sse(body, deadline_s: float | None = None,
             body.close()
         except Exception:  # noqa: BLE001 — already giving up, just surface the reason
             pass
+        # A done frame may already be sitting in `result` with the transport
+        # wedged without ever closing (TEAM-3204): the turn SUCCEEDED —
+        # returning an error would publish a false agent.error, mark the span
+        # ERROR, make the LLM retry completed work (duplicate commits/PRs),
+        # and drop the claude_session_id resume handle. Salvage it.
+        if result:
+            logger.warning(
+                f"[remote-coding] done frame salvaged after wedged stream tail: {reason}")
+            return _finalize(result)
         return {"error": reason}
 
     result: dict = {}
@@ -523,9 +539,7 @@ def _drain_coding_sse(body, deadline_s: float | None = None,
             result = frame
     if not result:
         return {"error": last_error or "stream ended without a done frame"}
-    if last_error and not (result.get("response") or "").strip():
-        result["error"] = last_error
-    return result
+    return _finalize(result)
 
 
 def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") -> str:

@@ -166,6 +166,27 @@ class SilentBody:
         self._closed_event.set()
 
 
+class DoneThenSilentBody:
+    """Fake response stream that delivers a valid terminal done frame and then
+    wedges — never closes, never raises (the done-then-wedged-transport
+    variant, TEAM-3204). The turn SUCCEEDED; only the tail of the stream is
+    stuck. Time-bounded for suite safety."""
+
+    def __init__(self, max_seconds=8.0):
+        self._max_seconds = max_seconds
+        self._closed_event = threading.Event()
+        self.closed = False
+
+    def iter_lines(self):
+        yield (b'data: {"type": "done", "response": "task complete", '
+               b'"claude_session_id": "sess-x"}')
+        self._closed_event.wait(timeout=self._max_seconds)
+
+    def close(self):
+        self.closed = True
+        self._closed_event.set()
+
+
 class BufferedBody:
     """Fake buffered (non-SSE) response body."""
 
@@ -250,6 +271,38 @@ class TestDrainCodingSseDeadline(unittest.TestCase):
         result = main._drain_coding_sse(DoneBody(), deadline_s=30)
         self.assertEqual(result.get("response"), "all done")
         self.assertNotIn("error", result)
+
+    def test_done_then_wedged_stream_salvages_done_on_idle_timeout(self):
+        """TEAM-3204: a done frame followed by a wedged (never-closing) tail
+        must return the successful done result on idle expiry, not an error —
+        an error here falsely retries a turn that already completed."""
+        body = DoneThenSilentBody()
+        worker, box = self._drain_in_thread(body, deadline_s=5, idle_timeout_s=0.2)
+
+        self.assertFalse(
+            worker.is_alive(),
+            "_drain_coding_sse is still blocked on a done-then-wedged stream",
+        )
+        self.assertEqual(box["result"].get("response"), "task complete")
+        self.assertEqual(box["result"].get("claude_session_id"), "sess-x")
+        self.assertNotIn(
+            "error", box["result"],
+            "received done frame was discarded on idle expiry (TEAM-3204)",
+        )
+        self.assertTrue(
+            body.closed,
+            "stream body was not closed on salvage — wedged reader stays blocked",
+        )
+
+    def test_done_then_wedged_stream_salvages_done_on_deadline(self):
+        """Same salvage on the wall-clock deadline path."""
+        body = DoneThenSilentBody()
+        worker, box = self._drain_in_thread(body, deadline_s=0.3, idle_timeout_s=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(box["result"].get("response"), "task complete")
+        self.assertNotIn("error", box["result"])
+        self.assertTrue(body.closed)
 
     def test_reader_exception_propagates(self):
         class BrokenBody:
@@ -374,6 +427,72 @@ class TestRemoteCodingTurnSurfacesErrors(unittest.TestCase):
         self.assertIn("(deadline)", box["out"])
         self._assert_agent_error_published(events_client, "(deadline)")
         self._assert_span_marked_error("(deadline)")
+
+
+class TestDoneThenWedgedTailSalvage(unittest.TestCase):
+    """TEAM-3204 end-to-end — a coding turn whose stream delivers a done frame
+    and then wedges without closing must surface as a SUCCESS: no agent.error,
+    no ERROR string handed to the LLM (which would retry completed work), and
+    the claude_session_id resume handle recorded."""
+
+    def setUp(self):
+        main._CODING_SESSION.update({
+            "session_id": None,
+            "conversation_ids": {},
+            "repo": None,
+            "recorded": False,
+            "resume_transcript": None,
+            "resume_session_id": None,
+            "branch": None,
+            "git_mode": None,
+            "clone_url": None,
+        })
+        main._CURRENT_WORKFLOW_ID = "wf-test"
+        main._CURRENT_AGENT_ID = "frontend_dev"
+        main._CURRENT_TICKET_ID = "TEAM-3204"
+        _OTEL_SPAN.reset_mock()
+
+    def test_done_then_wedged_stream_end_to_end_is_a_success(self):
+        body = DoneThenSilentBody()
+        fake_client = mock.MagicMock()
+        fake_client.invoke_agent_runtime.return_value = {
+            "contentType": "text/event-stream",
+            "response": body,
+        }
+        events_client = mock.MagicMock()
+        box = {}
+
+        def run():
+            with mock.patch.object(main.boto3, "client", return_value=fake_client), \
+                 mock.patch.object(main, "_ddb_events_client", events_client), \
+                 mock.patch.object(main, "REMOTE_CODING_TURN_DEADLINE_S", 5), \
+                 mock.patch.object(main, "REMOTE_CODING_IDLE_TIMEOUT_S", 0.2):
+                box["out"] = main._remote_coding_turn("do the thing", "claude")
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=10)
+
+        self.assertFalse(
+            worker.is_alive(),
+            "_remote_coding_turn is still blocked on a done-then-wedged stream",
+        )
+        self.assertFalse(
+            box["out"].startswith("ERROR:"),
+            f"successful turn was reported as an error: {box['out']!r}",
+        )
+        self.assertTrue(box["out"].startswith("task complete"))
+        self.assertIn("[coding-session:", box["out"])
+        self.assertFalse(
+            events_client.put_item.called,
+            "a false agent.error was published for a turn that succeeded",
+        )
+        self.assertEqual(
+            main._CODING_SESSION["conversation_ids"].get("claude"), "sess-x",
+            "claude_session_id from the salvaged done frame was not recorded — "
+            "conversation-resume handle lost",
+        )
+        self.assertTrue(body.closed, "stream body was not closed")
 
 
 if __name__ == "__main__":
