@@ -109,6 +109,12 @@ export default function AgentOutputPanel({
   // Operator message composer — queue a mid-flow message for a running agent.
   const [messageDraft, setMessageDraft] = useState("");
   const [messageState, setMessageState] = useState<"idle" | "sending" | "queued" | "error">("idle");
+  // The panel stays mounted across agent switches — drop any draft typed for
+  // the previous agent so it can't be sent to the wrong one.
+  useEffect(() => {
+    setMessageDraft("");
+    setMessageState("idle");
+  }, [workflowId, task?.agentId]);
   const sendOperatorMessage = useCallback(async () => {
     const message = messageDraft.trim();
     if (!message || !workflowId || !task?.agentId || messageState === "sending") return;

@@ -1672,26 +1672,23 @@ class _OperatorMailbox:
     Best-effort by design: mailbox failures must never break a run. Messages
     left unconsumed (agent finished first) are invisible to the UI and get
     picked up by a retry of the same agent, which is the desired behavior.
-    """
 
-    CHECK_INTERVAL_S = 5.0  # floor between DDB checks during rapid tool bursts
+    Every tool boundary checks the mailbox — deliberately unthrottled. Any
+    boundary can be the run's LAST one, and skipping it would strand a message
+    the UI already reported as delivered-on-next-tool-call. One Query per tool
+    call is noise next to the model call that follows it.
+    """
 
     def __init__(self, workflow_id: str, agent_id: str):
         self._wf = workflow_id
         self._agent = agent_id
         self._prefix = f"0#mailbox#{agent_id}#"
-        self._last_check = 0.0
 
     def register_hooks(self, registry, **kwargs):
         from strands.hooks import AfterToolCallEvent
         registry.add_callback(AfterToolCallEvent, self._on_tool_result)
 
     def _consume_pending(self) -> list:
-        import time
-        now = time.monotonic()
-        if now - self._last_check < self.CHECK_INTERVAL_S:
-            return []
-        self._last_check = now
         resp = _ddb_events_client.query(
             TableName=_EVENTS_TABLE,
             KeyConditionExpression="workflowId = :wid AND begins_with(eventId, :pfx)",
