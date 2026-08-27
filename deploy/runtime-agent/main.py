@@ -68,6 +68,7 @@ else:
 
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -252,9 +253,14 @@ REMOTE_CODING_PERSONAS = {
     p.strip() for p in os.getenv("REMOTE_CODING_PERSONAS", "").split(",") if p.strip()
 }
 CLOUD_CODE_TABLE = os.getenv("CLOUD_CODE_TABLE", "agentcore-hub-cloud-code-sessions")
-# The coding runtime caps a turn at TURN_TIMEOUT_S (1500s); our client read
-# timeout must sit above that so the runtime's own timeout error reaches us.
-REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "1560"))
+# Submit and poll calls are all sub-second server-side; this only needs to cover
+# submit's workspace setup (git clone caps at 300s on a cold repo, plus config).
+REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "420"))
+# Poll cadence + overall turn budget. The budget must exceed the coding
+# runtime's TURN_TIMEOUT_S (1500s) so its own timeout verdict reaches us via the
+# journal instead of us giving up first.
+REMOTE_CODING_POLL_S = int(os.getenv("REMOTE_CODING_POLL_S", "20"))
+REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "1700"))
 
 # Tenant the workflow session rows belong to. Multi-tenant deployments must set
 # this to the tenant that owns the fleet, or the Cloud Code tab (which scopes
@@ -407,37 +413,76 @@ def _maybe_resume_session(resume_session: str) -> None:
         logger.warning(f"[remote-coding] session lookup failed (non-fatal): {e}")
 
 
-def _drain_coding_sse(body) -> dict:
-    """Consume the coding runtime's SSE stream to completion and return the
-    terminal frame as a result dict (same shape as the buffered JSON path).
+def _coding_invoke(client, payload: dict) -> dict:
+    """One short InvokeAgentRuntime round-trip to the coding runtime (JSON in,
+    JSON out). Both submit and poll ride this — every call closes in seconds,
+    so nothing here can hit the platform's ~15-min idle-connection kill."""
+    resp = client.invoke_agent_runtime(
+        agentRuntimeArn=CODING_AGENT_RUNTIME_ARN,
+        runtimeSessionId=_CODING_SESSION["session_id"],
+        payload=json.dumps(payload).encode("utf-8"),
+        accept="application/json",
+    )
+    return json.loads(resp["response"].read().decode("utf-8"))
 
-    Frames: data: {"type": "text", ...} progress deltas (discarded — the full
-    text rides the done frame), data: {"type": "error", ...}, and a final
-    data: {"type": "done", "response": ..., "claude_session_id": ...,
-    "artifacts": [...]}. An error frame followed by no done frame is a failed
-    turn; text frames flowing keep both runtimes' invocations alive."""
-    result: dict = {}
-    last_error = ""
-    for raw in body.iter_lines():
-        if not raw:
-            continue
-        line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
-        if not line.startswith("data:"):
-            continue
+
+def _poll_coding_turn(client, turn_id: str) -> dict:
+    """Poll an async coding turn to its terminal state. Returns the done record
+    ({response, claude_session_id, artifacts?} or {error}).
+
+    Long silent stretches (builds, big writes) are NORMAL for coding turns — the
+    connection-per-turn transport died on exactly those (idle >15 min = silent
+    kill, stuck-fleet postmortems 2026-08-27 ×2). Each poll here is a fresh
+    sub-second invocation, so wall-clock turn length no longer matters. A poll
+    also confirms the microVM is alive: 'dead' (stale heartbeat) and 'unknown'
+    (journal gone) both mean the turn will never finish — fail fast, don't wait
+    out the budget."""
+    deadline = time.time() + REMOTE_CODING_TURN_BUDGET_S
+    misses = 0
+    while time.time() < deadline:
+        time.sleep(REMOTE_CODING_POLL_S)
         try:
-            frame = json.loads(line[5:].strip())
-        except (json.JSONDecodeError, ValueError):
+            status = _poll_once(client, turn_id)
+        except Exception as e:  # noqa: BLE001 — transient invoke hiccup
+            misses += 1
+            logger.warning(f"[remote-coding] poll error ({misses}/3): {str(e)[:200]}")
+            if misses >= 3:
+                return {"error": f"poll failed 3x: {str(e)[:200]}"}
             continue
-        ftype = frame.get("type")
-        if ftype == "error":
-            last_error = str(frame.get("error") or "")[:400]
-        elif ftype == "done":
-            result = frame
-    if not result:
-        return {"error": last_error or "stream ended without a done frame"}
-    if last_error and not (result.get("response") or "").strip():
-        result["error"] = last_error
-    return result
+        misses = 0
+        state = status.get("status")
+        if state == "done":
+            return status
+        if state == "dead":
+            return {"error": f"coding turn died mid-run (heartbeat stale "
+                             f"{status.get('stale_s')}s — microVM likely recycled)",
+                    "retryable_vm_death": True}
+        if state == "unknown":
+            return {"error": "coding turn vanished (no journal — runtime restarted "
+                             "before the turn started)",
+                    "retryable_vm_death": True}
+        # state == "running": keep polling
+    return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget"}
+
+
+def _poll_once(client, turn_id: str) -> dict:
+    return _coding_invoke(client, {
+        "action": "poll",
+        "turn_id": turn_id,
+        "session_id": _CODING_SESSION["session_id"],
+    })
+
+
+def _submit_and_poll(client, payload: dict) -> dict:
+    """Submit one async coding turn and poll it to a terminal record."""
+    submitted = _coding_invoke(client, payload)
+    if submitted.get("error"):
+        return submitted  # setup failure (bad repo, clone) — synchronous
+    if not submitted.get("turn_id"):
+        # Runtime predates async mode (or ran a legacy path) and executed the
+        # turn synchronously — its result is already complete.
+        return submitted
+    return _poll_coding_turn(client, submitted["turn_id"])
 
 
 def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") -> str:
@@ -482,16 +527,19 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         if _CODING_SESSION.get("clone_url"):
             payload["clone_url"] = _CODING_SESSION["clone_url"]
 
-    # Stream the turn (SSE) instead of one silent blocking read: a synchronous
-    # InvokeAgentRuntime is hard-capped at ~15 min and killed WITHOUT an error —
-    # every coding turn that crossed the cap died silently and stranded its
-    # persona mid-tool (stuck-fleet postmortem 2026-08-27). Streaming invocations
-    # get the platform's long budget, and the frames double as liveness.
-    payload["stream"] = True
+    # Submit + poll instead of one long-lived call: ANY invocation whose
+    # response goes quiet for ~15 min is killed silently by the platform, and
+    # coding turns are routinely silent that long (builds, big writes) — both
+    # the sync AND the SSE transport died this way (stuck-fleet postmortems
+    # 2026-08-27 ×2). Submit returns a turn_id in seconds; the turn journals to
+    # EFS; each poll is a fresh sub-second invocation. No connection lives long
+    # enough to idle out, and a result written right before a microVM recycle
+    # is still collected from the journal.
+    payload["mode"] = "async"
 
     logger.info(
         f"[remote-coding] {cli} turn on {_CODING_SESSION['session_id']} "
-        f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')}, stream=True)"
+        f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')}, mode=async)"
     )
     try:
         client = boto3.client(
@@ -499,18 +547,15 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
             config=BotocoreConfig(read_timeout=REMOTE_CODING_READ_TIMEOUT,
                                   retries={"max_attempts": 0}),
         )
-        resp = client.invoke_agent_runtime(
-            agentRuntimeArn=CODING_AGENT_RUNTIME_ARN,
-            runtimeSessionId=_CODING_SESSION["session_id"],
-            payload=json.dumps(payload).encode("utf-8"),
-            accept="text/event-stream",
-        )
-        if "text/event-stream" in (resp.get("contentType") or ""):
-            result = _drain_coding_sse(resp["response"])
-        else:
-            # Early failures (bad payload, workspace-fatal) come back as plain
-            # JSON even when streaming was requested.
-            result = json.loads(resp["response"].read().decode("utf-8"))
+        result = _submit_and_poll(client, payload)
+        # A dead/vanished verdict means the microVM recycled mid-turn — the
+        # workspace and transcript are on EFS, so one automatic resubmit (same
+        # conversation id) is cheap and usually completes. A second death is a
+        # real failure the persona should see.
+        if result.get("retryable_vm_death"):
+            logger.warning(f"[remote-coding] {result.get('error')} — resubmitting once")
+            result = _submit_and_poll(client, payload)
+            result.pop("retryable_vm_death", None)
     except Exception as e:  # noqa: BLE001
         # Do NOT fall back to a local CLI run: the session's workspace lives on
         # the coding runtime, and a local run would fork it (split-brain).
