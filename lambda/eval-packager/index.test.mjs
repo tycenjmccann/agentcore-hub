@@ -23,6 +23,7 @@
 
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import { gzipSync } from 'zlib';
+import { readFileSync } from 'fs';
 import { EventEmitter } from 'events';
 import { computeBatchSummary } from './lib/classify.mjs';
 
@@ -774,7 +775,7 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
     expect(spanMissing).toBe(0);
   });
 
-  it('emitEvalMetrics emits a single EMF record with both metrics', () => {
+  it('emitEvalMetrics emits a single EMF record carrying all health metrics', () => {
     emitEvalMetrics('agentcore_hub_backend_dev', { total: 4, spanMissing: 0 });
 
     const records = emfLines('EvalSessionsTotal');
@@ -785,8 +786,12 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
     expect(emf[0].Namespace).toBe('AgentCoreHub/Evaluations');
     expect(emf[0].Dimensions).toEqual([['AgentName']]);
     expect(emf[0].Metrics.map((m) => m.Name).sort()).toEqual([
+      'EvalDepChainExcludedCount',
+      'EvalDuplicateResultCount',
+      'EvalSessionsError',
       'EvalSessionsSpanMissing',
       'EvalSessionsTotal',
+      'EvalThrottleCount',
     ]);
     expect(typeof record._aws.Timestamp).toBe('number');
     expect(record.AgentName).toBe('agentcore_hub_backend_dev');
@@ -918,6 +923,303 @@ describe('extractSessionData dedup (TEAM-3367)', () => {
       { requestId: 'r1', evaluatorName: 'e', score: 2, timestamp: 2 },
     ];
     expect(dedupeResults(rows)).toEqual([rows[0]]);
+  });
+});
+
+// ─── dependency-chain role scoping (TEAM-3368) ───────────────────────────────
+// The custom dependency_chain_compliance evaluator is scoped to
+// requirements_analyst (setup-evaluations.sh); this guard drops rows the live
+// configs may still emit for other roles (config drift). FAIL-OPEN: an
+// unparseable session id or a non-dep-chain evaluator never costs a record.
+
+describe('dependency-chain role scoping (TEAM-3368)', () => {
+  let extractSessionData;
+  let classifySessions;
+  let roleFromSessionId;
+  let isOutOfScopeDepChain;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ extractSessionData, classifySessions, roleFromSessionId, isOutOfScopeDepChain } =
+      await import('./index.mjs'));
+  });
+
+  const delivery = (logEvents) => ({
+    logGroup: '/aws/bedrock-agentcore/evaluations/results/eval_backend_dev-test',
+    logStream: 'test-stream',
+    logEvents,
+  });
+
+  const otelEvent = ({ sessionId, evaluatorName, score, timestamp, attrs = {} }) => ({
+    timestamp,
+    message: JSON.stringify({
+      attributes: {
+        'session.id': sessionId,
+        'gen_ai.evaluation.name': evaluatorName,
+        ...(score !== undefined && score !== null ? { 'gen_ai.evaluation.score.value': score } : {}),
+        ...attrs,
+      },
+    }),
+  });
+
+  const DEP_CHAIN_EVALUATOR = 'dependency_chain_compliance_online-mbLh2kEFhw';
+  const BACKEND_SID = 'wf_1756240000000_ab12cd-agentcore_hub_backend_dev-1756240012345';
+  const ANALYST_SID = 'TEAM-3201_wf_1756240000000_ab12cd-agentcore_hub_requirements_analyst-1756240012345';
+
+  it('roleFromSessionId parses orchestrator session ids, with and without ticket prefix', () => {
+    expect(
+      roleFromSessionId('TEAM-3200_wf_1756240000000_ab12cd-agentcore_hub_frontend_dev-1756240012345')
+    ).toBe('agentcore_hub_frontend_dev');
+    expect(roleFromSessionId(BACKEND_SID)).toBe('agentcore_hub_backend_dev');
+  });
+
+  it('roleFromSessionId returns null on malformed/absent/non-workflow ids', () => {
+    expect(roleFromSessionId('si-agentcore_hub_backend_dev-123')).toBe(null); // short ms suffix
+    expect(roleFromSessionId('cc-b46ff2c0237e4516ab3eaefbd724f9d9')).toBe(null);
+    expect(roleFromSessionId(null)).toBe(null);
+    expect(roleFromSessionId('')).toBe(null);
+  });
+
+  it('isOutOfScopeDepChain fails open on a null role', () => {
+    expect(
+      isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: 'si-something-123' })
+    ).toBe(false);
+    expect(isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: null })).toBe(false);
+  });
+
+  it('isOutOfScopeDepChain never touches non-dep-chain evaluators, whatever the role', () => {
+    expect(isOutOfScopeDepChain({ evaluatorName: 'Builtin.Correctness', sessionId: BACKEND_SID })).toBe(false);
+    expect(isOutOfScopeDepChain({ evaluatorName: null, sessionId: BACKEND_SID })).toBe(false);
+    expect(isOutOfScopeDepChain({ sessionId: BACKEND_SID })).toBe(false);
+  });
+
+  it('flags a dep-chain row for an out-of-scope role, keeps one for requirements_analyst', () => {
+    expect(isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: BACKEND_SID })).toBe(true);
+    expect(isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: ANALYST_SID })).toBe(false);
+  });
+
+  it('extractSessionData excludes an out-of-scope dep-chain row and leaves the rest intact', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({
+          sessionId: BACKEND_SID,
+          evaluatorName: DEP_CHAIN_EVALUATOR,
+          score: 0,
+          timestamp: 1,
+          attrs: { 'aws.request_id': 'req-dep' },
+        }),
+        otelEvent({
+          sessionId: BACKEND_SID,
+          evaluatorName: 'Builtin.Correctness',
+          score: 8,
+          timestamp: 2,
+          attrs: { 'aws.request_id': 'req-corr' },
+        }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.evaluatorResults[0]).toMatchObject({
+      evaluatorName: 'Builtin.Correctness',
+      score: 8,
+    });
+    expect(sessionData.depChainExcluded).toBe(1);
+    expect(sessionData.duplicatesDropped).toBe(0); // scope removals don't count as dupes
+
+    // Classification sees only the retained row: one scored session, no noise.
+    const { statuses, total, spanMissing } = classifySessions(sessionData);
+    expect(total).toBe(1);
+    expect(spanMissing).toBe(0);
+    expect(statuses.get(BACKEND_SID)).toBe('scored');
+  });
+
+  it('extractSessionData retains a dep-chain row for requirements_analyst', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({
+          sessionId: ANALYST_SID,
+          evaluatorName: DEP_CHAIN_EVALUATOR,
+          score: 7,
+          timestamp: 1,
+          attrs: { 'aws.request_id': 'req-dep-ra' },
+        }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.evaluatorResults[0]).toMatchObject({
+      evaluatorName: DEP_CHAIN_EVALUATOR,
+      score: 7,
+    });
+    expect(sessionData.depChainExcluded).toBe(0);
+  });
+});
+
+// ─── eval health metrics (TEAM-3368 §4) ──────────────────────────────────────
+// emitEvalMetrics extended to Error/Throttle/Duplicate (+ DepChainExcluded) in
+// the SAME single EMF record; classifySessions grows an `errors` count; the
+// success-rate alarm's metric math is restated in pure JS against its JSON.
+
+describe('eval health metrics (TEAM-3368 §4)', () => {
+  let classifySessions;
+  let emitEvalMetrics;
+  let extractSessionData;
+  let countThrottles;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ classifySessions, emitEvalMetrics, extractSessionData, countThrottles } =
+      await import('./index.mjs'));
+  });
+
+  const delivery = (logEvents) => ({
+    logGroup: '/aws/bedrock-agentcore/evaluations/results/eval_backend_dev-test',
+    logStream: 'test-stream',
+    logEvents,
+  });
+
+  const otelEvent = ({ sessionId = 'sess-1', evaluatorName = 'Builtin.Correctness', score, timestamp, attrs = {} }) => ({
+    timestamp,
+    message: JSON.stringify({
+      attributes: {
+        'session.id': sessionId,
+        'gen_ai.evaluation.name': evaluatorName,
+        ...(score !== undefined && score !== null ? { 'gen_ai.evaluation.score.value': score } : {}),
+        ...attrs,
+      },
+    }),
+  });
+
+  it('one EMF record carries all metrics with Count units', () => {
+    emitEvalMetrics('agentcore_hub_backend_dev', {
+      total: 5, spanMissing: 1, errors: 2, throttles: 3, duplicates: 4, depChainExcluded: 1,
+    });
+    const records = emfLines('EvalSessionsTotal');
+    expect(records).toHaveLength(1);
+    const [record] = records;
+    const [directive] = record._aws.CloudWatchMetrics;
+    expect(directive.Namespace).toBe('AgentCoreHub/Evaluations');
+    expect(directive.Dimensions).toEqual([['AgentName']]);
+    expect(directive.Metrics.every((m) => m.Unit === 'Count')).toBe(true);
+    expect(record.EvalSessionsTotal).toBe(5);
+    expect(record.EvalSessionsSpanMissing).toBe(1);
+    expect(record.EvalSessionsError).toBe(2);
+    expect(record.EvalThrottleCount).toBe(3);
+    expect(record.EvalDuplicateResultCount).toBe(4);
+    expect(record.EvalDepChainExcludedCount).toBe(1);
+  });
+
+  it('throttled delivery: throttle records count AND their session classifies error', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ sessionId: 's-throttled', timestamp: 1, attrs: { 'error.type': 'ThrottlingException' } }),
+        otelEvent({ sessionId: 's-throttled', evaluatorName: 'Builtin.Helpfulness', timestamp: 2, attrs: { 'error.type': 'ThrottlingException' } }),
+        otelEvent({ sessionId: 's-ok', score: 0.9, timestamp: 3 }),
+      ])
+    );
+    const { total, spanMissing, errors } = classifySessions(sessionData);
+    const throttles = countThrottles(sessionData.evaluatorResults);
+    expect(throttles).toBe(2);
+    expect(errors).toBe(1);
+
+    emitEvalMetrics('agentcore_hub_backend_dev', {
+      total, spanMissing, errors, throttles, duplicates: sessionData.duplicatesDropped,
+    });
+    const [record] = emfLines('EvalSessionsTotal');
+    expect(record.EvalSessionsTotal).toBe(2);
+    expect(record.EvalSessionsError).toBe(1);
+    expect(record.EvalThrottleCount).toBe(2);
+    expect(record.EvalSessionsSpanMissing).toBe(0);
+  });
+
+  it('namespaced throttle form still counts; other error types do not', () => {
+    expect(
+      countThrottles([
+        { errorType: 'com.amazonaws#ThrottlingException' },
+        { errorType: 'ThrottlingException' },
+        { errorType: 'AccessDenied' },
+        { errorType: null },
+        {},
+      ])
+    ).toBe(2);
+  });
+
+  it('duplicated delivery: duplicatesDropped flows to EvalDuplicateResultCount', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ score: 8, timestamp: 1, attrs: { 'aws.request_id': 'req-dup' } }),
+        otelEvent({ score: 8, timestamp: 2, attrs: { 'aws.request_id': 'req-dup' } }),
+        otelEvent({ score: 8, timestamp: 3, attrs: { 'aws.request_id': 'req-dup' } }),
+      ])
+    );
+    expect(sessionData.duplicatesDropped).toBe(2);
+
+    const { total, spanMissing, errors } = classifySessions(sessionData);
+    emitEvalMetrics('agentcore_hub_backend_dev', {
+      total, spanMissing, errors, throttles: 0, duplicates: sessionData.duplicatesDropped,
+    });
+    const [record] = emfLines('EvalSessionsTotal');
+    expect(record.EvalDuplicateResultCount).toBe(2);
+  });
+
+  it('healthy delivery emits explicit zeros for SpanMissing/Error/Throttle/Duplicate', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ sessionId: 'h-1', score: 0.9, timestamp: 1, attrs: { 'aws.request_id': 'r1' } }),
+        otelEvent({ sessionId: 'h-2', score: 0.7, timestamp: 2, attrs: { 'aws.request_id': 'r2' } }),
+      ])
+    );
+    const { total, spanMissing, errors } = classifySessions(sessionData);
+    emitEvalMetrics('agentcore_hub_backend_dev', {
+      total, spanMissing, errors,
+      throttles: countThrottles(sessionData.evaluatorResults),
+      duplicates: sessionData.duplicatesDropped,
+    });
+    const [record] = emfLines('EvalSessionsTotal');
+    expect(record.EvalSessionsTotal).toBe(2);
+    expect(record.EvalSessionsSpanMissing).toBe(0);
+    expect(record.EvalSessionsError).toBe(0);
+    expect(record.EvalThrottleCount).toBe(0);
+    expect(record.EvalDuplicateResultCount).toBe(0);
+  });
+
+  it('classifySessions counts error sessions', () => {
+    const evRow = (sessionId, score, extra = {}) => ({
+      timestamp: 1, sessionId, evaluatorName: 'Builtin.Correctness', score,
+      errorType: null, ...extra,
+    });
+    const { total, spanMissing, errors } = classifySessions({
+      evaluatorResults: [
+        evRow('a', 0.9),
+        evRow('b', null, { errorType: 'ThrottlingException' }),
+        evRow('c', null, { errorType: 'JudgeTimeout' }),
+        evRow('d', null),
+      ],
+    });
+    expect(total).toBe(4);
+    expect(errors).toBe(2);
+    expect(spanMissing).toBe(1);
+  });
+
+  it('success-rate alarm math: healthy stays quiet, broken batch fires', () => {
+    // Pure-JS restatement of eval-success-rate-alarm.json's metric math,
+    // reading Threshold/operator from the JSON so drift breaks this test.
+    const alarm = JSON.parse(
+      readFileSync(new URL('../../deploy/evaluations/eval-success-rate-alarm.json', import.meta.url), 'utf8')
+    );
+    expect(alarm.AlarmName).toBe('agentcore-hub-eval-success-rate');
+    expect(alarm.ComparisonOperator).toBe('LessThanThreshold');
+    expect(alarm.Metrics.find((m) => m.ReturnData).Expression).toBe('(total - missing - errors) / total');
+
+    const rate = (total, missing, errors) => (total - missing - errors) / total;
+    const fires = (r) => r < alarm.Threshold;
+
+    expect(rate(10, 0, 0)).toBe(1.0);
+    expect(fires(rate(10, 0, 0))).toBe(false); // healthy batch: no fire
+    expect(rate(10, 3, 4)).toBeCloseTo(0.3);
+    expect(fires(rate(10, 3, 4))).toBe(true); // broken batch: 0.3 < 0.8 fires
   });
 });
 

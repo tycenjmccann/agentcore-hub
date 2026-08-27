@@ -132,9 +132,16 @@ export const handler = async (event) => {
   // be measured on ALL deliveries, not just the sampled subset that gets buffered.
   const sessionData = extractSessionData(parsed);
 
-  const { statuses, total, spanMissing } = classifySessions(sessionData);
+  const { statuses, total, spanMissing, errors } = classifySessions(sessionData);
   if (total > 0) {
-    emitEvalMetrics(agentId, { total, spanMissing });
+    emitEvalMetrics(agentId, {
+      total,
+      spanMissing,
+      errors,
+      throttles: countThrottles(sessionData.evaluatorResults),
+      duplicates: sessionData.duplicatesDropped,
+      depChainExcluded: sessionData.depChainExcluded,
+    });
     sessionData.sessionStatus = Object.fromEntries(statuses);
     if (spanMissing > 0) sessionData.status = 'span_missing';
     console.log(`[eval-packager] ${agentId}: sessions=${total} span_missing=${spanMissing}`);
@@ -254,15 +261,48 @@ export function dedupeResults(records) {
 }
 
 /**
+ * TEAM-3368 §3.2: role scoping for the custom dependency-chain evaluator.
+ * The eval configs (setup-evaluations.sh) attach it to requirements_analyst
+ * only, but live configs drift — an account may still carry the old
+ * qa_verifier/ci_agent configs until the next setup run. Those rows are
+ * rubric-mismatch zeros, not quality signal, so drop them here too (defense
+ * in depth). The role comes from the session id the orchestrator constructs
+ * (lambda/orchestrator/index.mjs): `${ticketPrefix}${workflow.id}-<agentId>-<ms>`
+ * — agent ids contain '_' never '-', and the trailing timestamp is a 13-digit
+ * millisecond value, so `-(agentcore_hub_...)-<13 digits>$` is unambiguous.
+ *
+ * FAIL-OPEN by design: a session id we can't parse (absent, malformed, or a
+ * non-workflow id like si-…/cc-…) must never cost us a record, and rows for
+ * any evaluator other than the dependency-chain family are never touched.
+ */
+export const ROLE_RE = /-(agentcore_hub_[a-z0-9_]+)-\d{13}$/;
+export const DEP_CHAIN_ROLES = new Set(['agentcore_hub_requirements_analyst']);
+export const DEP_CHAIN_RE = /^dependency_chain_compliance/;
+
+export function roleFromSessionId(sid) {
+  if (typeof sid !== 'string') return null;
+  const match = ROLE_RE.exec(sid);
+  return match ? match[1] : null;
+}
+
+export function isOutOfScopeDepChain(row) {
+  if (!DEP_CHAIN_RE.test(row?.evaluatorName ?? '')) return false;
+  const role = roleFromSessionId(row.sessionId);
+  if (role === null) return false; // fail-open: unattributable → keep
+  return !DEP_CHAIN_ROLES.has(role);
+}
+
+/**
  * Extract session data from parsed CW Logs event.
  * Parses each logEvent.message as JSON to extract evaluator scores,
  * evaluator name, and evidence. Stores parsed results (not raw event metadata)
  * so the improver agent can synthesize actionable insights from batch payloads.
  *
- * evaluatorResults comes back DEDUPED (TEAM-3367) so classifySessions, the
- * score aggregation, and the buffered batch all see one row per evaluation
- * attempt; `duplicatesDropped` counts what was removed (exposed for a
- * follow-up monitoring ticket — no metric emitted here).
+ * evaluatorResults comes back DEDUPED (TEAM-3367) and role-scoped (TEAM-3368,
+ * see isOutOfScopeDepChain above) so classifySessions, the score aggregation,
+ * and the buffered batch all see one row per in-scope evaluation attempt;
+ * `duplicatesDropped` counts dedup removals and `depChainExcluded` counts
+ * scope removals (both feed the handler's emitEvalMetrics EMF record).
  */
 export function extractSessionData(parsed) {
   const logEvents = parsed.logEvents || [];
@@ -316,7 +356,17 @@ export function extractSessionData(parsed) {
     }
   }
 
-  const evaluatorResults = dedupeResults(sessionBuffer);
+  const deduped = dedupeResults(sessionBuffer);
+  const evaluatorResults = deduped.filter((r) => !isOutOfScopeDepChain(r));
+  const depChainExcluded = deduped.length - evaluatorResults.length;
+  if (depChainExcluded > 0) {
+    console.log(JSON.stringify({
+      level: 'warn',
+      event: 'eval.depchain.out_of_scope_excluded',
+      logGroup: parsed.logGroup,
+      excluded: depChainExcluded,
+    }));
+  }
 
   return {
     logGroup: parsed.logGroup,
@@ -324,7 +374,8 @@ export function extractSessionData(parsed) {
     timestamp: new Date().toISOString(),
     sessionIds: [...sessionIds],
     evaluatorResults,
-    duplicatesDropped: sessionBuffer.length - evaluatorResults.length,
+    duplicatesDropped: sessionBuffer.length - deduped.length,
+    depChainExcluded,
   };
 }
 
@@ -393,15 +444,40 @@ export function classifySessions(sessionData) {
     statuses,
     total: bySession.size,
     spanMissing: [...statuses.values()].filter((s) => s === 'span_missing').length,
+    errors: [...statuses.values()].filter((s) => s === 'error').length,
   };
 }
 
 /**
- * Emit fleet span_missing health metrics as a single EMF log record.
+ * TEAM-3368 §4.1: judge-quota throttling signature. OTel semconv error.type
+ * carries the exception class name, so the exact form is 'ThrottlingException'
+ * — but live verification of what the evaluations service writes was
+ * IAM-blocked, so match on the suffix to also tolerate a namespaced form
+ * (e.g. 'com.amazonaws#ThrottlingException') rather than miss throttles on a
+ * prefix we guessed wrong.
+ */
+export const THROTTLE_RE = /ThrottlingException$/;
+
+export function countThrottles(entries) {
+  return (entries || []).filter((r) => THROTTLE_RE.test(r?.errorType ?? '')).length;
+}
+
+/**
+ * Emit fleet eval health metrics as a single EMF log record.
  * CloudWatch Logs auto-extracts these into the AgentCoreHub/Evaluations
  * namespace — no CloudWatch SDK call, no new dependency.
+ *
+ * TEAM-3368 §4.1 extends the TEAM-3103 record (Total/SpanMissing) with
+ * EvalSessionsError, EvalThrottleCount, EvalDuplicateResultCount, plus
+ * EvalDepChainExcludedCount (the Part A scope filter's removals). Still ONE
+ * record: the eval-health dashboard and the success-rate alarm SEARCH this
+ * namespace, and healthy batches must write explicit 0 datapoints (a metric
+ * that goes silent is indistinguishable from a broken emitter).
  */
-export function emitEvalMetrics(agentName, { total, spanMissing }) {
+export function emitEvalMetrics(
+  agentName,
+  { total, spanMissing, errors = 0, throttles = 0, duplicates = 0, depChainExcluded = 0 }
+) {
   console.log(JSON.stringify({
     _aws: {
       Timestamp: Date.now(),
@@ -411,12 +487,20 @@ export function emitEvalMetrics(agentName, { total, spanMissing }) {
         Metrics: [
           { Name: 'EvalSessionsTotal', Unit: 'Count' },
           { Name: 'EvalSessionsSpanMissing', Unit: 'Count' },
+          { Name: 'EvalSessionsError', Unit: 'Count' },
+          { Name: 'EvalThrottleCount', Unit: 'Count' },
+          { Name: 'EvalDuplicateResultCount', Unit: 'Count' },
+          { Name: 'EvalDepChainExcludedCount', Unit: 'Count' },
         ],
       }],
     },
     AgentName: agentName,
     EvalSessionsTotal: total,
     EvalSessionsSpanMissing: spanMissing,
+    EvalSessionsError: errors,
+    EvalThrottleCount: throttles,
+    EvalDuplicateResultCount: duplicates,
+    EvalDepChainExcludedCount: depChainExcluded,
   }));
 }
 

@@ -1,18 +1,14 @@
 {
   "created": "2026-05-22",
-  "sampling_rate": "100%",
+  "updated": "2026-08-27",
+  "sampling_rate": "tiered (TEAM-3366 §2.4): 100% for gate roles (requirements_analyst, qa_verifier, ci_agent), 25% for all other agents",
   "judge_model": "us.anthropic.claude-opus-4-7",
   "evaluators": [
     "Builtin.ToolSelectionAccuracy (TOOL_CALL)",
-    "Builtin.ToolParameterAccuracy (TOOL_CALL)",
     "Builtin.InstructionFollowing (TRACE)",
-    "Builtin.GoalSuccessRate (SESSION)",
     "Builtin.Correctness (TRACE)",
-    "Builtin.Coherence (TRACE)",
-    "Builtin.Faithfulness (TRACE)",
-    "Builtin.Helpfulness (TRACE)",
-    "Builtin.Conciseness (TRACE)",
-    "dependency_chain_compliance_online-mbLh2kEFhw (SESSION, custom)"
+    "Builtin.GoalSuccessRate (SESSION)",
+    "5th slot: dependency_chain_compliance_online-mbLh2kEFhw (SESSION, custom) for requirements_analyst; Builtin.Helpfulness (TRACE) for all other agents"
   ],
   "custom_evaluators": {
     "dependency_chain_compliance_online": "dependency_chain_compliance_online-mbLh2kEFhw",
@@ -39,7 +35,7 @@
   "notes": {
     "trajectory_evaluators": "TrajectoryInOrderMatch/ExactOrderMatch/AnyOrderMatch require reference inputs — only usable in on-demand evaluations, not online",
     "custom_evaluator_note": "dependency_chain_compliance (on-demand version) uses {actual_tool_trajectory} placeholder — use for scheduled batch evaluations",
-    "dependency_chain_agents": "Only requirements_analyst, qa_verifier, and ci_agent have the custom evaluator (they create/reassign tickets). Other agents have 10 built-in evaluators instead.",
-    "max_evaluators": "API limit is 10 evaluators per config. Agents with custom evaluator drop Conciseness to stay at 10."
+    "dependency_chain_agents": "TEAM-3368: only requirements_analyst has the custom evaluator — it is the only role that CREATES the ticket dependency graph; qa_verifier/ci_agent reassign rather than construct chains and scored rubric-mismatch zeros. Other agents get Builtin.Helpfulness in the fifth slot.",
+    "max_evaluators": "API limit is 10 evaluators per config; TEAM-3366 §2.4 trimmed every config to 5 to cut Opus-judge load."
   }
 }
