@@ -125,8 +125,33 @@ is fix → code review → QA → CI:
    - `ticket_type`: `"subtask"`
    - `blocked_by`: `{qa-subtask-key}`
 
+5. **Ship sub-task** (final PR review)
+   - `assignee`: `agentcore_hub_release_manager`
+   - `title`: `Ship: {one-line description}`
+   - `description`: open the unified PR (shared branch → default) and review
+     the final assembled diff per the release-manager blueprint
+   - `parent_id`: the Bug's key
+   - `ticket_type`: `"subtask"`
+   - `blocked_by`: `{ci-subtask-key}`
+
+6. **Merge Approval gate sub-task** (from ## Human Review Gates in your context)
+   - `assignee`: the exact `human:<…>` string given for the "Merge Approval" gate
+   - `title`: `Merge Approval: {one-line description}`
+   - `parent_id`: the Bug's key
+   - `ticket_type`: `"subtask"`
+   - `blocked_by`: `{ship-subtask-key}`
+
+7. **CD sub-task** (merge + deploy)
+   - `assignee`: `agentcore_hub_release_manager`
+   - `title`: `CD: {one-line description}`
+   - `description`: merge the approved PR and deploy per the target repo's
+     DEPLOY.md contract (staging + smoke; BLOCKED if DEPLOY.md is missing)
+   - `parent_id`: the Bug's key
+   - `ticket_type`: `"subtask"`
+   - `blocked_by`: `{merge-approval-subtask-key}`
+
 ### Step 6: Wrap Up
-- Comment on the Bug ticket: "Bug-fix flow — assigned to {dev-agent}. Root cause hypothesis: {one-line}. Sub-task chain: {fix-key} (fix) → {review-key} (review) → {qa-key} (QA) → {ci-key} (CI)."
+- Comment on the Bug ticket: "Bug-fix flow — assigned to {dev-agent}. Root cause hypothesis: {one-line}. Sub-task chain: {fix-key} (fix) → {review-key} (review) → {qa-key} (QA) → {ci-key} (CI) → {ship-key} (ship) → {gate-key} (merge approval) → {cd-key} (CD)."
 - Transition your own sub-task to `done`
 - `WorkflowOutput___report_completion`
 

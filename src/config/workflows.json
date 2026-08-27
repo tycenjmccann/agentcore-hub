@@ -5,7 +5,7 @@
       "id": "software-delivery",
       "name": "Software Delivery",
       "displayName": "SDLC",
-      "description": "Autonomous feature/bug pipeline: requirements analysis, parallel design, development, QA verification, and CI \u2014 produces a pull request.",
+      "description": "Autonomous feature/bug pipeline: requirements analysis, parallel design, development, QA verification, CI, and a release manager that reviews the final PR — a human approves the merge, then it merges and deploys per the repo's DEPLOY.md.",
       "icon": "GitPullRequest",
       "intakeAgentId": "agentcore_hub_requirements_analyst",
       "requiresRepo": true,
@@ -14,7 +14,8 @@
       "completionRequiresAgentPhases": [
         "development",
         "verification",
-        "review"
+        "review",
+        "ship"
       ],
       "reviewGates": [
         {
@@ -33,6 +34,15 @@
           "condition": "flagged",
           "onReject": "rework",
           "reviewerRole": "Designer",
+          "assignee": "human:engineer"
+        },
+        {
+          "afterPhase": "ship",
+          "name": "Merge Approval",
+          "blocking": true,
+          "condition": "always",
+          "onReject": "rework",
+          "reviewerRole": "Code Owner",
           "assignee": "human:engineer"
         }
       ],
@@ -67,7 +77,8 @@
           "type": "agent",
           "agentPhase": "verification",
           "extraAgentPhases": [
-            "review"
+            "review",
+            "ship"
           ]
         }
       ]
@@ -76,7 +87,7 @@
       "id": "bug-fix",
       "name": "Bug Fix",
       "displayName": "Bug-Fix",
-      "description": "Fast defect flow: triage and root-cause, one general fixer (codex/claude_code, any subsystem) with a mandatory regression test, then independent code review, live QA verification, and CI. Skips design. Produces a pull request.",
+      "description": "Fast defect flow: triage and root-cause, one general fixer (codex/claude_code, any subsystem) with a mandatory regression test, then independent code review, live QA verification, CI, and a release manager that reviews the final PR — a human approves the merge, then it merges and deploys per the repo's DEPLOY.md.",
       "icon": "Bug",
       "intakeAgentId": "agentcore_hub_requirements_analyst",
       "requiresRepo": true,
@@ -85,7 +96,19 @@
       "completionRequiresAgentPhases": [
         "development",
         "verification",
-        "review"
+        "review",
+        "ship"
+      ],
+      "reviewGates": [
+        {
+          "afterPhase": "ship",
+          "name": "Merge Approval",
+          "blocking": true,
+          "condition": "always",
+          "onReject": "rework",
+          "reviewerRole": "Code Owner",
+          "assignee": "human:engineer"
+        }
       ],
       "phases": [
         {
@@ -112,7 +135,8 @@
           "type": "agent",
           "agentPhase": "verification",
           "extraAgentPhases": [
-            "review"
+            "review",
+            "ship"
           ]
         }
       ]
@@ -121,7 +145,7 @@
       "id": "dead-code-sweep",
       "name": "Dead Code Sweep",
       "displayName": "Dead-Code",
-      "description": "Scheduled hygiene flow: statically detect unused code (language-aware \u2014 Periphery for Swift, knip/ts-prune for TS, vulture for Python), remove it surgically with evidence it is unreferenced, then independent code review, live QA that build + tests still pass, and CI. Produces a pull request for human review \u2014 never auto-merges.",
+      "description": "Scheduled hygiene flow: statically detect unused code (language-aware — Periphery for Swift, knip/ts-prune for TS, vulture for Python), remove it surgically with evidence it is unreferenced, then independent code review, live QA that build + tests still pass, CI, and a release manager that reviews the final PR — a human approves the merge, then it merges and deploys per the repo's DEPLOY.md.",
       "icon": "Trash2",
       "intakeAgentId": "agentcore_hub_requirements_analyst",
       "requiresRepo": true,
@@ -130,7 +154,8 @@
       "completionRequiresAgentPhases": [
         "development",
         "verification",
-        "review"
+        "review",
+        "ship"
       ],
       "phases": [
         {
@@ -151,8 +176,20 @@
           "type": "agent",
           "agentPhase": "verification",
           "extraAgentPhases": [
-            "review"
+            "review",
+            "ship"
           ]
+        }
+      ],
+      "reviewGates": [
+        {
+          "afterPhase": "ship",
+          "name": "Merge Approval",
+          "blocking": true,
+          "condition": "always",
+          "onReject": "rework",
+          "reviewerRole": "Code Owner",
+          "assignee": "human:engineer"
         }
       ]
     },

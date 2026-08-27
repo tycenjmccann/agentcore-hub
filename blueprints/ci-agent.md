@@ -93,6 +93,9 @@ Report with a clear table:
   step is never a soft SKIP — if you can't run it, that's BLOCKED, not PASS.
 
 ## Rules
+- Your completion record MUST include the tested head SHA (`git rev-parse HEAD`
+  on the branch you verified) — the release manager cross-checks it against the
+  final PR head before merging; a PASS without the SHA is unusable downstream
 - Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - Always compare against base branch to confirm issues are pre-existing vs introduced
 - Include actual command output as evidence
