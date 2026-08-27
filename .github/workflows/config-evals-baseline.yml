@@ -18,8 +18,9 @@ on:
       - "evals/battery/**"
   workflow_dispatch:
 
-# Serialize baseline runs; never cancel one mid-write — the supersession check
-# in the commit step handles a queued run landing after a newer one.
+# Serialize baseline runs; never cancel one mid-write — the supersession +
+# ancestry checks in the commit step (run on BOTH the conflict and the
+# clean-rebase path, C3) handle a queued run landing after a newer one.
 concurrency:
   group: config-evals-baseline
   cancel-in-progress: false
@@ -77,6 +78,20 @@ jobs:
       - name: Regenerate baseline (repeat 3)
         run: node evals/battery/run-battery.mjs --baseline-mode --repeat 3 --out evals/battery/baseline.json
 
+      # C3 provenance: source_commit is the sha the baseline was GENERATED
+      # FROM (run-battery.mjs records `git rev-parse HEAD`). The supersession
+      # check below — and any gate/deploy-side drift detection — keys off it,
+      # so a mismatch with the checked-out sha means the file lies about its
+      # provenance and must never be committed.
+      - name: Assert baseline provenance (source_commit == GITHUB_SHA)
+        run: |
+          set -euo pipefail
+          source_commit="$(jq -r '.source_commit // empty' evals/battery/baseline.json)"
+          if [ "$source_commit" != "$GITHUB_SHA" ]; then
+            echo "::error::baseline.json source_commit '$source_commit' != checked-out sha '$GITHUB_SHA' — provenance mismatch, refusing to commit"
+            exit 1
+          fi
+
       # SECRET-4: the push uses the workflow-scoped ephemeral GITHUB_TOKEN,
       # injected only into this step's env (persist-credentials is false, so
       # nothing lives on disk). OPS PREREQUISITE: branch protection on main
@@ -88,6 +103,16 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
+          # C3: shared supersession test, used by BOTH the conflict path and
+          # the clean-rebase path. True when origin/main already carries a
+          # baseline generated from a descendant of our commit — ours is
+          # stale and must be discarded. Sets $incoming_source for messages.
+          superseded_by_origin() {
+            incoming_source="$(git show origin/main:evals/battery/baseline.json | jq -r '.source_commit // empty' || true)"
+            [ -n "$incoming_source" ] && git merge-base --is-ancestor "$GITHUB_SHA" "$incoming_source"
+          }
+
           if git diff --quiet -- evals/battery/baseline.json; then
             echo "baseline unchanged — nothing to commit"
             exit 0
@@ -100,13 +125,34 @@ jobs:
             # Conflict: someone else landed a baseline while we ran. If theirs
             # was generated from a DESCENDANT of our commit, ours is stale —
             # discard it and exit green (superseded, not an error).
-            incoming_source="$(git show origin/main:evals/battery/baseline.json | jq -r '.source_commit // empty' || true)"
-            if [ -n "$incoming_source" ] && git merge-base --is-ancestor "$GITHUB_SHA" "$incoming_source"; then
+            if superseded_by_origin; then
               echo "::notice::superseded — origin/main already carries a baseline generated from $incoming_source, a descendant of $GITHUB_SHA. Discarding this run's baseline."
               git rebase --abort || true
               exit 0
             fi
             echo "::error::rebase conflict on baseline.json not explained by a newer (descendant) baseline — resolve manually"
             exit 1
+          fi
+
+          # C3: a CLEAN rebase proves nothing about freshness — a newer gated
+          # commit that didn't touch baseline.json rebases cleanly, and its
+          # (queued) baseline run can be lost to cancellation or runner
+          # outage. Re-fetch the true tip and run the SAME supersession +
+          # ancestry validation before pushing.
+          git fetch origin main
+          if superseded_by_origin; then
+            echo "::notice::superseded — origin/main already carries a baseline generated from $incoming_source, a descendant of $GITHUB_SHA. Discarding this run's baseline."
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA is no longer an ancestor of origin/main (history rewrite, or dispatch on a stale ref) — refusing to push a baseline generated from it"
+            exit 1
+          fi
+          if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
+            # Not fatal by itself: no newer-descendant baseline exists (checked
+            # above), so ours is the best available. The queued baseline run
+            # for the newer commit — or a manual workflow_dispatch — will
+            # regenerate from the tip.
+            echo "::warning::main advanced past $GITHUB_SHA while this baseline was generated; pushing anyway since origin/main carries no baseline from a newer commit. The newer commit's baseline run (or a manual workflow_dispatch) will supersede this one."
           fi
           git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
