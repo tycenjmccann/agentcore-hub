@@ -1943,9 +1943,94 @@ def _save_memory_event(agent_id: str, session_id: str, user_text: str, assistant
 # --- App entrypoint (streaming enabled) ---
 app = BedrockAgentCoreApp()
 
+# Strong refs to detached persona runs — the asyncio event loop only weak-refs
+# its tasks, so without this a suspended run can be GC'd mid-await.
+_DETACHED_TASKS: set = set()
+
 
 @app.entrypoint
 async def agent_invocation(payload, context):
+    """Route an invocation: workflow runs detach to a background task, chat runs
+    stay synchronous.
+
+    WHY DETACH: the platform silently kills ANY invocation whose response stream
+    is idle ~15 min — and this entrypoint yields nothing until the agent loop
+    finishes. Workflow personas are invoked fire-and-forget (agent-invoker
+    destroys the connection without reading), so for them the open invocation
+    buys nothing and costs everything: every persona run longer than ~16 min
+    died mid-flight (2026-08-27 stuck fleet, all 19 re-kicked personas dead at
+    exactly 16.5 min). Workflow runs therefore ack immediately and do the real
+    work in an asyncio task registered via add_async_task — ping reports
+    HealthyBusy so the microVM isn't reaped, progress/results flow through
+    DynamoDB events + report_completion exactly as before, and no connection
+    exists for the idle kill to take.
+
+    Detachment is OPT-IN via payload {"detach": true} — only the orchestrator's
+    agent-invoker sends it. Anything that reads the response synchronously
+    (chat, verify-fleet-invoke.py healthchecks, ad-hoc invokes) keeps the
+    streaming path by default."""
+    workflow_id = payload.get("workflow_id", "unknown")
+    agent_id = payload.get("agent_id", "unknown")
+
+    if payload.get("detach") and workflow_id and workflow_id != "unknown":
+        import asyncio
+
+        task_id = app.add_async_task(
+            "persona_run", {"workflow_id": workflow_id, "agent_id": agent_id}
+        )
+
+        async def _run_detached():
+            try:
+                async for _ in _run_agent_invocation(payload, context):
+                    pass  # events already flow to DDB inside the loop
+            except Exception as exc:  # noqa: BLE001 — must never die silently
+                logger.error(f"[{agent_id}] detached run failed: {str(exc)[:500]}")
+                try:
+                    _publish_agent_error(workflow_id, agent_id, str(exc)[:500])
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                app.complete_async_task(task_id)
+                _DETACHED_TASKS.discard(asyncio.current_task())
+
+        # The event loop holds only weak refs to tasks; without a strong ref a
+        # suspended persona (awaiting a model/tool call) can be garbage
+        # collected mid-run. Pin it until its own finally removes it.
+        _DETACHED_TASKS.add(asyncio.get_event_loop().create_task(_run_detached()))
+        logger.info(f"[{agent_id}] accepted for workflow {workflow_id} — detached "
+                    f"as async task {task_id}")
+        yield {"event": {"contentBlockDelta": {"delta": {"text": (
+            f"[accepted: {agent_id} running detached for {workflow_id}]"
+        )}}}}
+        return
+
+    async for event in _run_agent_invocation(payload, context):
+        yield event
+
+
+def _publish_agent_error(workflow_id: str, agent_id: str, error: str) -> None:
+    """Surface a detached-run crash to the events table so the workflow board
+    and nudge system can see it (a detached task has no caller to error to)."""
+    import time as _t
+    # Random suffix on both keys: two personas failing in the same millisecond
+    # (shared-outage case) must not overwrite each other's error item. The
+    # timestamp's fractional part must stay NUMERIC — workflow-analyzer
+    # Date.parse()s it, so hex there would poison lastSignificantEventAge().
+    digits = f"{uuid.uuid4().int % 10**6:06d}"
+    _ddb_events_client.put_item(
+        TableName=_EVENTS_TABLE,
+        Item={
+            "workflowId": {"S": workflow_id},
+            "eventId": {"S": f"{int(_t.time() * 1000)}-err-{digits}"},
+            "type": {"S": "agent.error"},
+            "detail": {"M": {"agentId": {"S": agent_id}, "error": {"S": error}}},
+            "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
+                          + f".{digits}Z"},
+        },
+    )
+
+
+async def _run_agent_invocation(payload, context):
     """
     Handler for agent invocations — streaming responses.
 
