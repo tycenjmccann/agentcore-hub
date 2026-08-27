@@ -108,9 +108,15 @@ const SINKERS = [
   },
   {
     // Explicit acceptance criteria + a concrete file target in a short
-    // prompt = well-specified standard work, not deep reasoning.
+    // prompt = well-specified standard work, not deep reasoning. IMPLEMENTATION
+    // work only: a review-phase task normally carries the same filename +
+    // "Acceptance:" combination, and sinking it would undercut the router's
+    // own policy that correctness review is opus work (and suppress the L2
+    // classifier via `sank`).
     name: "well-specified-change",
-    test: (s) =>
+    test: (s, phase) =>
+      phase !== "review" &&
+      !/\b(review|audit)\b/i.test(s.slice(0, 200)) &&
       s.length < 1_500 &&
       /\bacceptance( criteria)?\s*:/i.test(s) &&
       /\S+\.(sh|ts|tsx|js|jsx|mjs|cjs|py|go|rb|rs|java|json|ya?ml|toml|css|html|md)\b/i.test(s),
@@ -229,7 +235,7 @@ export async function routeTask(task, opts = {}) {
   let sank = false;
   if (conservatism < 0.9) {
     for (const s of SINKERS) {
-      if (s.test(text)) {
+      if (s.test(text, task.phase)) {
         const target = TIERS[Math.max(TIER_RANK[floor], TIER_RANK[tier] - 1)];
         if (target !== tier) {
           trail.push(`L1 sinker:${s.name} ${tier}->${target}`);

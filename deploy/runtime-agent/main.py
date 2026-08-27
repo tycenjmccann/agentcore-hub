@@ -647,7 +647,7 @@ def _poll_once(client, turn_id: str) -> dict:
     })
 
 
-def _recover_lost_submit(client, payload: dict):
+def _recover_lost_submit(client, payload: dict, outer_deadline: float | None = None):
     """The submit's response was lost client-side. What the server did is
     unknown — AND the server itself may be a legacy build that ignores
     mode/turn_id and is still executing the turn synchronously (no dedupe, so a
@@ -660,9 +660,21 @@ def _recover_lost_submit(client, payload: dict):
       - legacy runtime → poll comes back an error/no-status → NOT safe to
         resubmit; give up with an explicit error (the persona's retry guidance
         stands, and the workspace is preserved).
-    Returns a submit-shaped dict, or None when recovery is unsafe."""
+    Returns a submit-shaped dict, or None when recovery is unsafe.
+
+    outer_deadline bounds recovery just like the poll loop (TEAM-3307): a
+    submit that times out AFTER the deadline lands here, and without the check
+    the probe loop (5 × ~40s) plus a recovery resubmit (up to ~630s) would blow
+    straight past the supposedly hard bound. On expiry, hand the turn_id back
+    as submitted — _poll_coding_turn re-checks the deadline immediately and
+    returns the deadline-expired error without another blocking call."""
+    def _expired() -> bool:
+        return outer_deadline is not None and time.monotonic() >= outer_deadline
+
     probe = None
     for attempt in range(5):  # a throttled probe is transient — keep asking
+        if _expired():
+            return {"submitted": True, "turn_id": payload["turn_id"]}
         try:
             probe = _poll_once(client, payload["turn_id"])
             break
@@ -680,6 +692,10 @@ def _recover_lost_submit(client, payload: dict):
     if state in ("running", "done", "transient"):
         return {"submitted": True, "turn_id": payload["turn_id"]}
     if state == "unknown":
+        if _expired():
+            # No evidence the turn started and no time left to start it — the
+            # poll loop's deadline check turns this into the expired error.
+            return {"submitted": True, "turn_id": payload["turn_id"]}
         try:
             return _coding_invoke(client, payload)  # deduped server-side
         except Exception as e:  # noqa: BLE001
@@ -718,7 +734,7 @@ def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None)
         submitted = _coding_invoke(client, payload)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[remote-coding] submit response lost: {str(e)[:200]}")
-        submitted = _recover_lost_submit(client, payload)
+        submitted = _recover_lost_submit(client, payload, outer_deadline)
         if submitted is None:
             return {"error": "submit response lost and could not be safely "
                              "recovered (see logs)"}
