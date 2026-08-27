@@ -16,7 +16,8 @@
   ],
   "custom_evaluators": {
     "dependency_chain_compliance_online": "dependency_chain_compliance_online-mbLh2kEFhw",
-    "dependency_chain_compliance_ondemand": "dependency_chain_compliance-VyBv7H2bCi"
+    "dependency_chain_compliance_ondemand": "dependency_chain_compliance-VyBv7H2bCi",
+    "_note": "TEAM-3103: dependency_chain_evaluator.json rubric corrected to route QA through code_reviewer (design -> dev -> code_reviewer -> qa_verifier -> ci/security), matching the actual pipeline. Applied via in-place 'agentcore eval evaluator update' where the IDs above are unchanged. If the evaluator was instead recreated (new account-generated ID), refresh the IDs above and CUSTOM_EVALUATOR in setup-evaluations.sh — see that script's re-registration comment block."
   },
   "_configs_note": "Snapshot only — not load-bearing. The '-XXXX' suffixes are account-specific and regenerated on each setup-evaluations.sh run; consumers read evalConfigName from agents.json, which refresh-agents-json.sh repopulates by querying live CW log groups. Keys use the canonical long form 'eval_<agentId>' (e.g. eval_agentcore_hub_requirements_analyst), matching what setup-evaluations.sh creates.",
   "configs": {

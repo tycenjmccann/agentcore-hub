@@ -568,3 +568,173 @@ describe('handler (IMPROVEMENT_AGENT_ARN unset)', () => {
     expect(putsUnder('fleet-imp-agent/prd/')).toEqual([]);
   });
 });
+
+// ─── Session classification + fleet EMF metrics (TEAM-3103 AC4.1–4.4) ────────
+// Ported from the node:test suite that shipped with TEAM-3096 (d2f3c06) —
+// same assertions, run under vitest like the rest of this file.
+
+describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', () => {
+  let classifySessions;
+  let emitEvalMetrics;
+  let extractSessionData;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ classifySessions, emitEvalMetrics, extractSessionData } = await import('./index.mjs'));
+  });
+
+  // Minimal evaluatorResults row as extractSessionData produces it.
+  const row = (sessionId, score, extra = {}) => ({
+    timestamp: 1756250000000,
+    sessionId,
+    evaluatorName: 'Builtin.Correctness',
+    score,
+    scoreLabel: null,
+    evidence: null,
+    errorType: null,
+    errorMessage: null,
+    ...extra,
+  });
+
+  const data = (evaluatorResults) => ({ evaluatorResults });
+
+  // Minimal parsed CW Logs delivery, as extractSessionData consumes it: each
+  // logEvent.message is a JSON OTEL log record with gen_ai.* attributes.
+  const delivery = (logEvents) => ({
+    logGroup: '/aws/bedrock-agentcore/evaluations/results/eval_requirements_analyst-test',
+    logStream: 'test-stream',
+    logEvents,
+  });
+
+  const logEvent = (sessionId, scoreValue, extraAttrs = {}) => ({
+    timestamp: 1756250000000,
+    message: JSON.stringify({
+      attributes: {
+        'session.id': sessionId,
+        'gen_ai.evaluation.name': 'Builtin.Correctness',
+        'gen_ai.evaluation.score.value': scoreValue,
+        ...extraAttrs,
+      },
+    }),
+  });
+
+  it('all-null scores with no errorType → span_missing', () => {
+    const { statuses, total, spanMissing } = classifySessions(
+      data([row('s1', null), row('s1', null), row('s1', null)])
+    );
+    expect(statuses.get('s1')).toBe('span_missing');
+    expect(total).toBe(1);
+    expect(spanMissing).toBe(1);
+  });
+
+  it('numeric scores → scored, spanMissing=0', () => {
+    const { statuses, total, spanMissing } = classifySessions(
+      data([row('s1', 1.0), row('s1', 0.5), row('s2', 0.75)])
+    );
+    expect(statuses.get('s1')).toBe('scored');
+    expect(statuses.get('s2')).toBe('scored');
+    expect(total).toBe(2);
+    expect(spanMissing).toBe(0);
+  });
+
+  it('score of 0 is a real score, not missing', () => {
+    const { statuses, spanMissing } = classifySessions(data([row('s1', 0)]));
+    expect(statuses.get('s1')).toBe('scored');
+    expect(spanMissing).toBe(0);
+  });
+
+  it('mixed batch: scored / span_missing / error classified per session', () => {
+    const { statuses, total, spanMissing } = classifySessions(
+      data([
+        row('a', 0.9),
+        row('a', null),
+        row('b', null),
+        row('b', null),
+        row('c', null, { errorType: 'JudgeTimeout' }),
+        row('c', null),
+      ])
+    );
+    expect(statuses.get('a')).toBe('scored');
+    expect(statuses.get('b')).toBe('span_missing');
+    expect(statuses.get('c')).toBe('error');
+    // The error session counts toward total but NOT toward spanMissing.
+    expect(total).toBe(3);
+    expect(spanMissing).toBe(1);
+  });
+
+  it('all-null WITH errorType → error, excluded from spanMissing', () => {
+    const { statuses, total, spanMissing } = classifySessions(
+      data([row('s1', null, { errorType: 'AccessDenied' })])
+    );
+    expect(statuses.get('s1')).toBe('error');
+    expect(total).toBe(1);
+    expect(spanMissing).toBe(0);
+  });
+
+  it('empty evaluatorResults → total=0, spanMissing=0, no throw', () => {
+    const { statuses, total, spanMissing } = classifySessions(data([]));
+    expect(total).toBe(0);
+    expect(spanMissing).toBe(0);
+    expect(statuses.size).toBe(0);
+  });
+
+  it('parseError rows and rows without sessionId are ignored', () => {
+    const { total, spanMissing } = classifySessions(
+      data([
+        { timestamp: 1, rawMessage: 'not json', parseError: true },
+        row(null, null),
+        row('', 0.9),
+      ])
+    );
+    expect(total).toBe(0);
+    expect(spanMissing).toBe(0);
+  });
+
+  it('non-numeric garbage score with no errorType → span_missing, not scored (TEAM-3315)', () => {
+    const sessionData = extractSessionData(
+      delivery([logEvent('s1', 'not-a-number'), logEvent('s1', 'NaN')])
+    );
+    const { statuses, total, spanMissing } = classifySessions(sessionData);
+    expect(statuses.get('s1')).toBe('span_missing');
+    expect(total).toBe(1);
+    expect(spanMissing).toBe(1);
+  });
+
+  it('session with some null and some numeric scores → scored', () => {
+    const { statuses, spanMissing } = classifySessions(
+      data([row('s1', null), row('s1', 0.8), row('s1', null)])
+    );
+    expect(statuses.get('s1')).toBe('scored');
+    expect(spanMissing).toBe(0);
+  });
+
+  it('emitEvalMetrics emits a single EMF record with both metrics', () => {
+    emitEvalMetrics('agentcore_hub_backend_dev', { total: 4, spanMissing: 0 });
+
+    const records = emfLines('EvalSessionsTotal');
+    expect(records).toHaveLength(1);
+    const record = records[0];
+    const emf = record._aws.CloudWatchMetrics;
+    expect(emf).toHaveLength(1);
+    expect(emf[0].Namespace).toBe('AgentCoreHub/Evaluations');
+    expect(emf[0].Dimensions).toEqual([['AgentName']]);
+    expect(emf[0].Metrics.map((m) => m.Name).sort()).toEqual([
+      'EvalSessionsSpanMissing',
+      'EvalSessionsTotal',
+    ]);
+    expect(typeof record._aws.Timestamp).toBe('number');
+    expect(record.AgentName).toBe('agentcore_hub_backend_dev');
+    expect(record.EvalSessionsTotal).toBe(4);
+    // Explicit 0 must be emitted (healthy fleet still writes a datapoint).
+    expect(record.EvalSessionsSpanMissing).toBe(0);
+  });
+
+  it('emitEvalMetrics carries non-zero spanMissing through', () => {
+    emitEvalMetrics('agentcore_hub_qa_verifier', { total: 7, spanMissing: 3 });
+    const [record] = emfLines('EvalSessionsTotal');
+    expect(record.EvalSessionsTotal).toBe(7);
+    expect(record.EvalSessionsSpanMissing).toBe(3);
+  });
+});

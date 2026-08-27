@@ -58,8 +58,15 @@ jobs:
       - name: Install test dependencies
         run: pip install -r deploy/runtime-agent/tests/requirements-test.txt
 
+      # tests/ plus the TEAM-3096 unittest suites that live next to the code
+      # they extract from (test_telemetry_init.py execs main.py's init block,
+      # test_build_env_vars.py imports deploy-one-robust.py).
       - name: Telemetry span tests
-        run: pytest deploy/runtime-agent/tests -q
+        run: >
+          pytest -q
+          deploy/runtime-agent/tests
+          deploy/runtime-agent/test_telemetry_init.py
+          deploy/runtime-agent/test_build_env_vars.py
 
   cloud-code-ui:
     name: Cloud Code UI (mocked, no AWS)
