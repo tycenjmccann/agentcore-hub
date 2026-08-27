@@ -21,6 +21,53 @@ source "${REPO_ROOT}/deploy/config.sh"
 # Custom evaluator (online-compatible, no reference inputs needed)
 CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 
+# --- Re-registering a corrected evaluator rubric (e.g. TEAM-3103) ----------
+# This script only PROBES for CUSTOM_EVALUATOR above — it never creates or
+# updates the evaluator itself (it's account-provisioned, out of band). When
+# deploy/evaluations/dependency_chain_evaluator.json changes (rubric fix),
+# get it live with:
+#
+#   Preferred — in-place update, ID stays the same, nothing below to edit:
+#     agentcore eval evaluator update --evaluator-id "$CUSTOM_EVALUATOR" \
+#       --config-file deploy/evaluations/dependency_chain_evaluator.json
+#     (Verify the exact update verb/flags against the installed `agentcore`
+#     CLI at deploy time — this repo's scripts only demonstrate list/create
+#     for eval evaluators; `update` may differ or not exist in your CLI
+#     version. Run `agentcore eval evaluator update --help` first.)
+#
+#   Fallback — if an in-place update isn't available, the fix needs a NEW
+#   evaluator (a fresh account-generated "-XXXX" id):
+#     1. agentcore eval evaluator create \
+#          --config-file deploy/evaluations/dependency_chain_evaluator.json
+#        → capture the new evaluator ID from the output.
+#     2. Update CUSTOM_EVALUATOR above to that new ID.
+#     3. Re-run this script (setup-evaluations.sh), then
+#        deploy/runtime-agent/refresh-agents-json.sh so agents.json picks up
+#        the new evalConfigName.
+#     4. Update the "custom_evaluators" map in
+#        deploy/evaluations/eval-config-ids.json to the new ID — that file is
+#        a non-load-bearing snapshot per its own "_configs_note", but keep it
+#        truthful for the next reader.
+# -----------------------------------------------------------------------------
+
+# --- Fleet span_missing health alarm (TEAM-3103) ---------------------------
+# deploy/evaluations/span-missing-alarm.json watches the EMF metrics that
+# lambda/eval-packager/index.mjs now emits (EvalSessionsTotal /
+# EvalSessionsSpanMissing in the AgentCoreHub/Evaluations namespace) and
+# fires when >50% of eval sessions across the fleet have no invoke_agent
+# span. Apply it with:
+#
+#   aws cloudwatch put-metric-alarm --cli-input-json file://span-missing-alarm.json
+#
+# Rollout constraint: create this alarm ONLY AFTER the runtime telemetry fix
+# (R1/R2 — Strands/ADOT tracer wiring) is deployed AND at least one healthy
+# eval batch with non-zero EvalSessionsTotal has been observed in CloudWatch.
+# Creating it earlier means every session is span_missing by definition and
+# the alarm fires immediately on stale data. Add AlarmActions (the
+# environment's SNS topic ARN) to the JSON at apply time — it's intentionally
+# omitted here since it's environment-specific.
+# -----------------------------------------------------------------------------
+
 # Agents that create/reassign tickets (need the custom evaluator)
 TICKET_AGENTS="agentcore_hub_requirements_analyst agentcore_hub_qa_verifier agentcore_hub_ci_agent"
 

@@ -169,6 +169,46 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentcore-hub-pipeline-agent")
 
+# --- OTel telemetry init (TEAM-3102) ---------------------------------------
+# Under the Dockerfile's `opentelemetry-instrument` wrapper, ADOT's
+# aws_configurator has ALREADY installed the global TracerProvider + OTLP
+# pipeline before this module imports. Strands' Tracer binds the global
+# provider (strands/telemetry/tracer.py:119), so in that case we must attach
+# NOTHING — a no-arg StrandsTelemetry() would log "Overriding of current
+# TracerProvider is not allowed", orphan its own provider, and clobber the
+# baggage,xray,tracecontext propagators (drops session.id stamping).
+# The StrandsTelemetry fallback exists only for bare `python main.py`.
+from opentelemetry import trace as _otel_trace_api
+
+_TELEMETRY_INITIALIZED = False
+
+
+def _init_telemetry() -> None:
+    global _TELEMETRY_INITIALIZED
+    if _TELEMETRY_INITIALIZED:
+        return
+    provider = _otel_trace_api.get_tracer_provider()
+    if hasattr(provider, "add_span_processor"):
+        # Real SDK provider → opentelemetry-instrument/ADOT own the pipeline.
+        logger.info(
+            "telemetry: ADOT-managed TracerProvider active (%s) — Strands "
+            "invoke_agent spans attach to it; no local exporter added",
+            type(provider).__name__,
+        )
+    else:
+        from strands.telemetry import StrandsTelemetry
+
+        StrandsTelemetry().setup_otlp_exporter()
+        logger.info(
+            "telemetry: no SDK TracerProvider found — StrandsTelemetry "
+            "fallback provider + OTLP exporter installed"
+        )
+    _TELEMETRY_INITIALIZED = True
+
+
+_init_telemetry()
+# ---------------------------------------------------------------------------
+
 # Per-invocation prompt cache for shared-runtime topologies (1 or 4 runtimes
 # hosting many personas). First call for an agent_id reads
 # s3://{ARTIFACT_BUCKET}/prompts/{agent_id}.txt; subsequent calls in the same
@@ -2197,12 +2237,26 @@ async def _run_agent_invocation(payload, context):
     # mode short-circuits to the deployed SYSTEM_PROMPT.
     tracker = ToolTrackingHandler()
     persona_prompt = _load_prompt_for_agent(agent_id)
+
+    _session_id = getattr(context, "session_id", None)
+    _trace_attributes = {
+        "agent.id": agent_id,
+        "gen_ai.agent.id": agent_id,
+        "workflow.id": workflow_id,
+    }
+    if _session_id:
+        _trace_attributes["session.id"] = _session_id
+    if _CURRENT_TICKET_ID:
+        _trace_attributes["ticket.id"] = _CURRENT_TICKET_ID
+
     agent = Agent(
         model=active_model,
         system_prompt=persona_prompt,
         tools=all_tools,
         callback_handler=None,
         hooks=[_OperatorMailbox(workflow_id, agent_id)],
+        name=agent_id,
+        trace_attributes=_trace_attributes,
     )
 
     # Iterate stream_async — write events to DDB in real-time as they arrive.

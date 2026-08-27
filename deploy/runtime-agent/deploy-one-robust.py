@@ -66,6 +66,10 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         "HOME": "/root",
         "TMPDIR": "/tmp",
         "SYSTEM_PROMPT_S3_KEY": prompt_key,
+        # TEAM-3102: per-persona OTel identity + eval message capture.
+        "OTEL_SERVICE_NAME": agent_name,
+        "OTEL_RESOURCE_ATTRIBUTES": f"service.name={agent_name},deployment.environment=production",
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true",
     }
     if gw := os.environ.get("GATEWAY_ARN"):
         env["GATEWAY_ARN"] = gw

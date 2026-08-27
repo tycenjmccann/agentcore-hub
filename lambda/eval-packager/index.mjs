@@ -121,15 +121,25 @@ export const handler = async (event) => {
     return { statusCode: 200, body: 'disabled' };
   }
 
+  // Extract session data from log events (enriched with parsed evaluator results).
+  // Done BEFORE the sample-rate gate below: telemetry health (span_missing) must
+  // be measured on ALL deliveries, not just the sampled subset that gets buffered.
+  const sessionData = extractSessionData(parsed);
+
+  const { statuses, total, spanMissing } = classifySessions(sessionData);
+  if (total > 0) {
+    emitEvalMetrics(agentId, { total, spanMissing });
+    sessionData.sessionStatus = Object.fromEntries(statuses);
+    if (spanMissing > 0) sessionData.status = 'span_missing';
+    console.log(`[eval-packager] ${agentId}: sessions=${total} span_missing=${spanMissing}`);
+  }
+
   // 4. Sample rate check
   const sampleRate = config.sampleRate ?? 100;
   if (Math.random() * 100 >= sampleRate) {
     console.log(`[eval-packager] Agent ${agentId} sample-rate miss (rate=${sampleRate}%). Skipping.`);
     return { statusCode: 200, body: 'sampled-out' };
   }
-
-  // Extract session data from log events (enriched with parsed evaluator results)
-  const sessionData = extractSessionData(parsed);
 
   // 5. Aggregate eval scores into DDB (for instant dashboard loads)
   await aggregateScoresToDdb(agentId, parsed);
@@ -228,6 +238,54 @@ function extractSessionData(parsed) {
     sessionIds: [...sessionIds],
     evaluatorResults: sessionBuffer,
   };
+}
+
+/**
+ * Classify each distinct session in this delivery.
+ * Returns { statuses: Map<sessionId, 'scored'|'span_missing'|'error'>, total, spanMissing }
+ */
+export function classifySessions(sessionData) {
+  const bySession = new Map();
+  for (const r of sessionData.evaluatorResults) {
+    if (r.parseError || !r.sessionId) continue;      // unattributable rows
+    if (!bySession.has(r.sessionId)) bySession.set(r.sessionId, []);
+    bySession.get(r.sessionId).push(r);
+  }
+  const statuses = new Map();
+  for (const [sid, rows] of bySession) {
+    const allNull = rows.every((r) => r.score === null);
+    const hasError = rows.some((r) => r.errorType);
+    statuses.set(sid, !allNull ? 'scored' : hasError ? 'error' : 'span_missing');
+  }
+  return {
+    statuses,
+    total: bySession.size,
+    spanMissing: [...statuses.values()].filter((s) => s === 'span_missing').length,
+  };
+}
+
+/**
+ * Emit fleet span_missing health metrics as a single EMF log record.
+ * CloudWatch Logs auto-extracts these into the AgentCoreHub/Evaluations
+ * namespace — no CloudWatch SDK call, no new dependency.
+ */
+export function emitEvalMetrics(agentName, { total, spanMissing }) {
+  console.log(JSON.stringify({
+    _aws: {
+      Timestamp: Date.now(),
+      CloudWatchMetrics: [{
+        Namespace: 'AgentCoreHub/Evaluations',
+        Dimensions: [['AgentName']],
+        Metrics: [
+          { Name: 'EvalSessionsTotal', Unit: 'Count' },
+          { Name: 'EvalSessionsSpanMissing', Unit: 'Count' },
+        ],
+      }],
+    },
+    AgentName: agentName,
+    EvalSessionsTotal: total,
+    EvalSessionsSpanMissing: spanMissing,
+  }));
 }
 
 /**
