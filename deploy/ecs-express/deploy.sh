@@ -254,7 +254,10 @@ aws iam put-role-policy \
           \"bedrock-agentcore:GetEvent\",
           \"bedrock-agentcore:CreateEvent\",
           \"bedrock-agentcore:ListMemoryRecords\",
-          \"bedrock-agentcore:RetrieveMemoryRecords\"
+          \"bedrock-agentcore:RetrieveMemoryRecords\",
+          \"bedrock-agentcore:ListOnlineEvaluationConfigs\",
+          \"bedrock-agentcore:GetOnlineEvaluationConfig\",
+          \"bedrock-agentcore:UpdateOnlineEvaluationConfig\"
         ],
         \"Resource\": \"*\"
       },

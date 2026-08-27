@@ -91,10 +91,10 @@ export async function GET(req: NextRequest) {
     const agents = await discoverAgents(region);
 
     // Fetch token usage from aws/spans and CW metrics in parallel
-    const [tokensByAgent, cwMetricsByAgent, sessionCounts] = await Promise.all([
+    const [tokensByAgent, cwMetricsByAgent, sessionStats] = await Promise.all([
       getTokenUsageFromSpans(region),
       getCWMetricsForAgents(agents, region),
-      getSessionCounts(agents, region),
+      getSessionStats(agents, region),
     ]);
 
     // Build per-agent metrics
@@ -105,17 +105,17 @@ export async function GET(req: NextRequest) {
         : `${agent.name}.DEFAULT`;
 
       const tokens = tokensByAgent[serviceName] || { input: 0, output: 0, calls: 0 };
-      const cw = cwMetricsByAgent[agent.id] || { invocations: 0, avgLatency: 0, totalDuration: 0 };
-      const sessions = sessionCounts[agent.id] || 0;
+      const cw = cwMetricsByAgent[agent.id] || { invocations: 0 };
+      const stats = sessionStats[agent.id] || { sessions: 0, totalDurationSec: 0 };
 
       return {
         id: agent.id,
         name: agent.name,
-        sessions,
+        sessions: stats.sessions,
         tokensIn: tokens.input,
         tokensOut: tokens.output,
-        avgDuration: cw.avgLatency > 0 ? Math.round(cw.avgLatency / 1000) : 0, // ms -> seconds
-        totalDuration: cw.totalDuration > 0 ? Math.round(cw.totalDuration / 1000) : 0,
+        avgDuration: stats.sessions > 0 ? Math.round(stats.totalDurationSec / stats.sessions) : 0,
+        totalDuration: Math.round(stats.totalDurationSec),
         invocations: cw.invocations,
       };
     });
@@ -126,7 +126,7 @@ export async function GET(req: NextRequest) {
     const totalTokensOut = agentMetrics.reduce((sum, a) => sum + a.tokensOut, 0);
     const totalDuration = agentMetrics.reduce((sum, a) => sum + a.totalDuration, 0);
     const totalInvocations = agentMetrics.reduce((sum, a) => sum + a.invocations, 0);
-    const avgSessionDuration = totalInvocations > 0 ? Math.round(totalDuration / totalInvocations) : 0;
+    const avgSessionDuration = totalSessions > 0 ? Math.round(totalDuration / totalSessions) : 0;
     const activeAgents = agents.filter((a) => a.status === "ACTIVE" || a.status === "READY").length;
 
     const result = {
@@ -218,13 +218,17 @@ async function getTokenUsageFromSpans(region: string): Promise<Record<string, { 
 }
 
 /**
- * Get CloudWatch metrics (Invocations, Latency) from AWS/Bedrock-AgentCore namespace.
+ * Get invocation counts from the AWS/Bedrock-AgentCore namespace.
+ *
+ * ListMetrics returns each series once per dimension SET — the same
+ * Resource/Name pair appears both with and without ComputeType — so entries
+ * must be deduped on (resource, name) or every agent is summed twice.
  */
 async function getCWMetricsForAgents(
   agents: Array<{ id: string; name: string; type: string; arn: string }>,
   region: string
-): Promise<Record<string, { invocations: number; avgLatency: number; totalDuration: number }>> {
-  const result: Record<string, { invocations: number; avgLatency: number; totalDuration: number }> = {};
+): Promise<Record<string, { invocations: number }>> {
+  const result: Record<string, { invocations: number }> = {};
   const cw = getCWClient(region);
   const endTime = new Date();
   const startTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // 30 days
@@ -236,9 +240,14 @@ async function getCWMetricsForAgents(
   }));
 
   const cwDimMap: Record<string, { resource: string; name: string }[]> = {};
+  const seen = new Set<string>();
   for (const metric of listRes.Metrics || []) {
     const dims = Object.fromEntries((metric.Dimensions || []).map((d) => [d.Name!, d.Value!]));
     if (!dims.Resource || !dims.Name) continue;
+
+    const dedupeKey = `${dims.Resource}|${dims.Name}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
 
     const baseName = dims.Name.replace(/::DEFAULT$/, "");
     if (!cwDimMap[baseName]) cwDimMap[baseName] = [];
@@ -250,54 +259,33 @@ async function getCWMetricsForAgents(
     const entries = cwDimMap[lookupName] || [];
 
     if (entries.length === 0) {
-      result[agent.id] = { invocations: 0, avgLatency: 0, totalDuration: 0 };
+      result[agent.id] = { invocations: 0 };
       return;
     }
 
     try {
       let totalInvocations = 0;
-      let weightedLatency = 0;
-      let totalDuration = 0;
 
       for (const entry of entries) {
-        const dimensions = [
-          { Name: "Resource", Value: entry.resource },
-          { Name: "Operation", Value: "InvokeAgentRuntime" },
-          { Name: "Name", Value: entry.name },
-        ];
+        const invRes = await cw.send(new GetMetricStatisticsCommand({
+          Namespace: "AWS/Bedrock-AgentCore",
+          MetricName: "Invocations",
+          Dimensions: [
+            { Name: "Resource", Value: entry.resource },
+            { Name: "Operation", Value: "InvokeAgentRuntime" },
+            { Name: "Name", Value: entry.name },
+          ],
+          StartTime: startTime, EndTime: endTime,
+          Period: 30 * 24 * 60 * 60,
+          Statistics: ["Sum"],
+        }));
 
-        const [invRes, latRes] = await Promise.all([
-          cw.send(new GetMetricStatisticsCommand({
-            Namespace: "AWS/Bedrock-AgentCore",
-            MetricName: "Invocations",
-            Dimensions: dimensions,
-            StartTime: startTime, EndTime: endTime,
-            Period: 30 * 24 * 60 * 60,
-            Statistics: ["Sum"],
-          })),
-          cw.send(new GetMetricStatisticsCommand({
-            Namespace: "AWS/Bedrock-AgentCore",
-            MetricName: "Latency",
-            Dimensions: dimensions,
-            StartTime: startTime, EndTime: endTime,
-            Period: 30 * 24 * 60 * 60,
-            Statistics: ["Average", "Sum"],
-          })),
-        ]);
-
-        const inv = invRes.Datapoints?.reduce((s, dp) => s + (dp.Sum || 0), 0) || 0;
-        const avgLat = latRes.Datapoints?.[0]?.Average || 0;
-        const durSum = latRes.Datapoints?.reduce((s, dp) => s + (dp.Sum || 0), 0) || 0;
-
-        totalInvocations += inv;
-        weightedLatency += avgLat * inv;
-        totalDuration += durSum;
+        totalInvocations += invRes.Datapoints?.reduce((s, dp) => s + (dp.Sum || 0), 0) || 0;
       }
 
-      const avgLatency = totalInvocations > 0 ? weightedLatency / totalInvocations : 0;
-      result[agent.id] = { invocations: totalInvocations, avgLatency, totalDuration };
+      result[agent.id] = { invocations: totalInvocations };
     } catch {
-      result[agent.id] = { invocations: 0, avgLatency: 0, totalDuration: 0 };
+      result[agent.id] = { invocations: 0 };
     }
   });
 
@@ -306,17 +294,20 @@ async function getCWMetricsForAgents(
 }
 
 /**
- * Get session counts for all agents from OTEL spans (aws/spans + per-agent
- * unified span destinations). Counts distinct session.id values per agent
- * service name.
+ * Get session counts and durations from OTEL spans (aws/spans + per-agent
+ * unified span destinations). A session's duration is its wall-clock span:
+ * max(endTime) - min(startTime) across all its spans. This is the only
+ * duration source that survives submit+poll — the CloudWatch Latency metric
+ * measures sync InvokeAgentRuntime response time, so an async coding turn's
+ * work never appears in it.
  */
-async function getSessionCounts(
+async function getSessionStats(
   agents: Array<{ id: string; name: string; type: string }>,
   region: string
-): Promise<Record<string, number>> {
-  const result: Record<string, number> = {};
+): Promise<Record<string, { sessions: number; totalDurationSec: number }>> {
+  const result: Record<string, { sessions: number; totalDurationSec: number }> = {};
   // Initialize all to 0
-  for (const agent of agents) result[agent.id] = 0;
+  for (const agent of agents) result[agent.id] = { sessions: 0, totalDurationSec: 0 };
 
   try {
     const client = getLogsClient(region);
@@ -324,9 +315,10 @@ async function getSessionCounts(
     const startTime = endTime - 30 * 24 * 60 * 60; // Last 30 days
 
     const query = `
-      fields resource.attributes.service.name as svc, attributes.session.id as sessionId
-      | filter ispresent(attributes.session.id)
-      | stats count_distinct(sessionId) as sessionCount by svc
+      fields \`resource.attributes.service.name\` as svc, \`attributes.session.id\` as sessionId, startTimeUnixNano/1000000 as st, endTimeUnixNano/1000000 as et
+      | filter ispresent(\`attributes.session.id\`) and ispresent(startTimeUnixNano)
+      | stats min(st) as sessionStart, max(et) as sessionEnd by svc, sessionId
+      | stats count(*) as sessionCount, sum((sessionEnd - sessionStart) / 1000) as totalSec by svc
     `;
 
     const startRes = await client.send(
@@ -352,14 +344,17 @@ async function getSessionCounts(
 
     for (const row of rows) {
       const svc = row.svc || "";
-      const count = parseInt(row.sessionCount || "0", 10);
       const agentId = svcToAgent.get(svc);
-      if (agentId) result[agentId] = count;
+      if (!agentId) continue;
+      result[agentId] = {
+        sessions: parseInt(row.sessionCount || "0", 10),
+        totalDurationSec: Number(row.totalSec || 0),
+      };
     }
 
     return result;
   } catch (err) {
-    console.error("Session count from spans error:", err);
+    console.error("Session stats from spans error:", err);
     return result;
   }
 }
