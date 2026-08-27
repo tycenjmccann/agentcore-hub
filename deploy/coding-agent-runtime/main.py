@@ -1734,17 +1734,22 @@ def _turn_journal_path(session_id: str | None, turn_id: str) -> str:
     return os.path.join(_session_dir(session_id), ".turns", f"{safe}.json")
 
 
-def _journal_write(path: str, record: dict) -> None:
+def _journal_write(path: str, record: dict) -> bool:
     """Atomic-enough journal write (tmp + rename; EFS rename is atomic within a
-    directory). Never raises — a failed beat must not kill the runner thread."""
+    directory). Never raises — a failed beat must not kill the runner thread —
+    but reports success so the submit path can refuse to start a turn whose
+    journal can't be seeded (an accepted turn with no journal reads as 'unknown'
+    and would get resubmitted while still running)."""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.tmp"
         with open(tmp, "w") as f:
             json.dump(record, f)
         os.replace(tmp, path)
+        return True
     except OSError as exc:
         logger.warning("turn_journal_write_failed", extra={"error": str(exc)[:200]})
+        return False
 
 
 def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: str,
@@ -1758,13 +1763,22 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
     consume frames directly, no HTTP involved."""
     beat = {"status": "running", "turn_id": turn_id, "cli": cli,
             "started_at": int(time.time()), "heartbeat": int(time.time())}
-    _journal_write(journal, beat)
     stop_beating = threading.Event()
+    # Serializes heartbeat vs terminal writes: once `finished` flips under the
+    # lock, a delayed beat can never overwrite the done record with "running"
+    # (which a poll would later read as a stale heartbeat → dead → duplicate
+    # resubmit of a completed turn). A bounded join can't guarantee that
+    # ordering — an EFS write can outlast any timeout we'd pick.
+    journal_lock = threading.Lock()
+    finished = threading.Event()
 
     def _heartbeat():
         while not stop_beating.wait(TURN_HEARTBEAT_S):
-            beat["heartbeat"] = int(time.time())
-            _journal_write(journal, beat)
+            with journal_lock:
+                if finished.is_set():
+                    return
+                beat["heartbeat"] = int(time.time())
+                _journal_write(journal, beat)
 
     beater = threading.Thread(target=_heartbeat, daemon=True)
     beater.start()
@@ -1792,11 +1806,6 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
         last_error = str(exc)[:600]
     finally:
         stop_beating.set()
-        # Join before writing the terminal record: a beat mid-write when the CLI
-        # finishes would otherwise land AFTER "done" and revert the journal to
-        # "running" — which a later poll reads as a stale heartbeat (dead) and
-        # the caller resubmits a completed turn.
-        beater.join(timeout=TURN_HEARTBEAT_S + 5)
 
     done = {"status": "done", "turn_id": turn_id, "cli": cli,
             "finished_at": int(time.time()),
@@ -1808,7 +1817,9 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
         done["error"] = last_error or "turn produced no done frame"
     elif last_error and not (done["response"] or "").strip():
         done["error"] = last_error
-    _journal_write(journal, done)
+    with journal_lock:
+        finished.set()
+        _journal_write(journal, done)
     logger.info("turn_done", extra={"cli": cli, "chars": len(done["response"]),
                                     "async": True, "turn_id": turn_id})
 
@@ -2151,10 +2162,17 @@ async def invocations(request: Request):
         turn_id = f"turn-{uuid.uuid4().hex}"
         journal = _turn_journal_path(session_id, turn_id)
         # Seed the journal BEFORE returning so an immediate poll can never see
-        # "unknown" for a turn we accepted.
-        _journal_write(journal, {"status": "running", "turn_id": turn_id, "cli": cli,
-                                 "started_at": int(time.time()),
-                                 "heartbeat": int(time.time())})
+        # "unknown" for a turn we accepted. If the seed can't be written the
+        # turn must NOT start: an accepted-but-unjournaled turn polls as
+        # "unknown" and gets resubmitted while the original still runs.
+        seeded = _journal_write(journal, {"status": "running", "turn_id": turn_id,
+                                          "cli": cli, "started_at": int(time.time()),
+                                          "heartbeat": int(time.time())})
+        if not seeded:
+            logger.error("turn_submit_seed_failed", extra={"turn_id": turn_id})
+            return JSONResponse(
+                {"error": "turn journal unwritable (EFS degraded) — turn not started"},
+                status_code=503)
         threading.Thread(
             target=_run_turn_async,
             args=(turn_id, journal, cli, prompt, workdir, claude_session_id,
