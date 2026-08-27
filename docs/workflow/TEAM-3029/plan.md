@@ -21,7 +21,7 @@
 - `deploy/runtime-agent/prompts/agentcore_hub_bug_fixer.txt` — same section (Bug-key variant)
 - `deploy/runtime-agent/prompts/agentcore_hub_development.txt` — audit-artifacts paragraph (prose style)
 - `deploy/runtime-agent/prompts/agentcore_hub_code_reviewer.txt` — two failure-mode bullets + "## COMMITTED AUDIT ARTIFACTS" section
-- `.github/pull_request_template.md` — NET NEW (Summary / Testing / Audit Trail, 14 lines)
+- `.github/pull_request_template.md` — NET NEW (Summary / Testing / Audit Trail, 13 lines)
 
 ### Approach
 Apply the per-file insertion specs from the approved design (TEAM-3060) verbatim at the quoted anchors — no rewording, no renumbering (suffix steps 1c/2b/2c only). Rejected alternative: centralizing the artifact instructions in one shared doc — each prompt/blueprint is that agent's entire context, so the obligation must live inline in all 17 files.
