@@ -1792,6 +1792,11 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
         last_error = str(exc)[:600]
     finally:
         stop_beating.set()
+        # Join before writing the terminal record: a beat mid-write when the CLI
+        # finishes would otherwise land AFTER "done" and revert the journal to
+        # "running" — which a later poll reads as a stale heartbeat (dead) and
+        # the caller resubmits a completed turn.
+        beater.join(timeout=TURN_HEARTBEAT_S + 5)
 
     done = {"status": "done", "turn_id": turn_id, "cli": cli,
             "finished_at": int(time.time()),
@@ -1820,7 +1825,11 @@ def _poll_turn(session_id: str | None, turn_id: str) -> dict:
         # first write, or the VM recycled pre-write. Either way the turn is gone.
         return {"status": "unknown", "turn_id": turn_id}
     except (OSError, json.JSONDecodeError) as exc:
-        return {"status": "unknown", "turn_id": turn_id, "detail": str(exc)[:200]}
+        # Degraded EFS read or a torn read racing the tmp+rename — the turn may
+        # well still be running. NOT death: callers must keep polling, never
+        # resubmit off this (a resubmit against a live runner would execute the
+        # same task twice in one workspace).
+        return {"status": "transient", "turn_id": turn_id, "detail": str(exc)[:200]}
     if record.get("status") == "running":
         age = int(time.time()) - int(record.get("heartbeat") or 0)
         if age > TURN_STALE_S:

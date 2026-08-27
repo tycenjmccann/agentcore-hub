@@ -439,6 +439,7 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
     out the budget."""
     deadline = time.time() + REMOTE_CODING_TURN_BUDGET_S
     misses = 0
+    unknowns = 0
     while time.time() < deadline:
         time.sleep(REMOTE_CODING_POLL_S)
         try:
@@ -454,14 +455,26 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
         if state == "done":
             return status
         if state == "dead":
+            # Heartbeat provably stale — the runner is gone. Only this and a
+            # repeatedly-absent journal may trigger a resubmit: anything softer
+            # risks racing a still-live runner and executing the task twice.
             return {"error": f"coding turn died mid-run (heartbeat stale "
                              f"{status.get('stale_s')}s — microVM likely recycled)",
                     "retryable_vm_death": True}
         if state == "unknown":
-            return {"error": "coding turn vanished (no journal — runtime restarted "
-                             "before the turn started)",
-                    "retryable_vm_death": True}
-        # state == "running": keep polling
+            # Journal missing. It's seeded before submit returns and lives on
+            # shared EFS, so this should be definitive — but demand consecutive
+            # confirmations before declaring death, in case the read raced a
+            # slow first write or a flaky mount.
+            unknowns += 1
+            if unknowns >= 3:
+                return {"error": "coding turn vanished (no journal across 3 "
+                                 "consecutive polls)",
+                        "retryable_vm_death": True}
+            continue
+        unknowns = 0
+        # "running" or "transient" (degraded EFS read / torn read racing the
+        # journal's tmp+rename): the turn may still be live — keep polling.
     return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget"}
 
 
