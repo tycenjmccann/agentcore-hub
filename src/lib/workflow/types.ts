@@ -209,6 +209,13 @@ export interface WorkflowInput {
    * of starting cold — the requester's research/plan travels in the transcript.
    */
   portedSession?: PortedSession;
+  /**
+   * Who opened this run, for fleet accounting — e.g. "anomaly-detector" for
+   * anomaly-watcher filings. Persisted on the workflow row and indexed
+   * (intakeChannel-index) so an automated filer can cap its own open runs.
+   * Absent → attribute omitted entirely; human/API callers are unaffected.
+   */
+  intakeChannel?: string;
 }
 
 export interface PortedSession {

@@ -38,6 +38,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "title is required" }, { status: 400 });
     }
 
+    if (body.intakeChannel !== undefined && !/^[a-z][a-z0-9-]{1,31}$/.test(body.intakeChannel)) {
+      return NextResponse.json({ error: "intakeChannel must match ^[a-z][a-z0-9-]{1,31}$" }, { status: 400 });
+    }
+
     // Resolve the def from the LIVE S3 config (same doc the orchestrator runs),
     // so routine defs created by the Routine Builder resolve here. An unknown id
     // is a HARD 400 — never silently fall back to software-delivery, which would
@@ -127,6 +131,7 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef) {
       ticketProvider: "jira",
       workflowType: body.workflowType || "feature",
       workflowDefId: def.id,
+      ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
     },
   }));
 
@@ -193,6 +198,7 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef) {
       startedAt: new Date().toISOString(),
       workflowType: body.workflowType || "feature",
       workflowDefId: def.id,
+      ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
     },
   }));
 
