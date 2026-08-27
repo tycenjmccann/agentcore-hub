@@ -110,9 +110,13 @@ async function jiraFetch(path, options = {}) {
   try { body = JSON.parse(text); } catch { body = text; }
 
   if (!resp.ok) {
-    const msg = body?.errorMessages?.join("; ") || body?.errors
-      ? JSON.stringify(body.errors)
-      : typeof body === "string" ? body : JSON.stringify(body);
+    // Surface EVERYTHING Jira says — errorMessages, field errors, or the raw
+    // body. (A precedence bug here (`a || b ? x : y`) used to reduce real JQL
+    // errors to "400: {}", leaving agents unable to self-correct queries.)
+    const parts = [];
+    if (Array.isArray(body?.errorMessages) && body.errorMessages.length) parts.push(body.errorMessages.join("; "));
+    if (body?.errors && Object.keys(body.errors).length) parts.push(JSON.stringify(body.errors));
+    const msg = parts.join(" | ") || (typeof body === "string" ? body : JSON.stringify(body));
     throw new Error(`Jira API ${resp.status}: ${msg}`);
   }
   return body;
@@ -538,8 +542,12 @@ async function addComment(params) {
 }
 
 async function searchIssues(params) {
-  const { query, max_results } = params;
-  const data = await jiraSearch(query, ["summary", "status", "labels", "assignee", "issuetype", "parent"], max_results || 50);
+  // Accept `jql` as an alias — agents regularly pass it and used to get an
+  // opaque 400 (empty jql param) back.
+  const { query, jql, max_results } = params;
+  const q = query || jql;
+  if (!q) throw new Error("search_issues requires a `query` (JQL string)");
+  const data = await jiraSearch(q, ["summary", "status", "labels", "assignee", "issuetype", "parent"], max_results || 50);
   const tickets = (data.issues || []).map(mapIssue);
   return { tickets };
 }

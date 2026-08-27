@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, GetCommand, PutCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 
 export const dynamic = "force-dynamic";
 
@@ -23,17 +23,63 @@ const ddb = DynamoDBDocumentClient.from(
  * Auto-bug-filing kill switch. Stored in the events table (no new IAM) as
  * {workflowId: "wm-config", eventId: "auto-file-bugs", detail: {value}} —
  * toggled by `intervene.py bugs-off|bugs-on`. Missing item = enabled.
+ *
+ * Returns "on" | "off" | "unknown". Callers on the automated path must FAIL
+ * CLOSED on "unknown": a DDB blip while the switch is set to off must not
+ * silently re-enable filing. Human-relayed bugs never consult this.
  */
-async function autoFilingDisabled(): Promise<boolean> {
+async function autoFilingSwitch(): Promise<"on" | "off" | "unknown"> {
   try {
     const item = (await ddb.send(new GetCommand({
       TableName: EVENTS_TABLE,
       Key: { workflowId: "wm-config", eventId: "auto-file-bugs" },
     }))).Item;
-    return item?.detail?.value === "off";
-  } catch {
-    return false; // config read failure must not block human-relayed bugs
+    return item?.detail?.value === "off" ? "off" : "on";
+  } catch (err) {
+    console.error("[api/bugs] kill-switch read failed:", err instanceof Error ? err.message : err);
+    return "unknown";
   }
+}
+
+/**
+ * Short-lived mutex serializing the family-cap check-then-create so concurrent
+ * automated filings can't all read count < cap and each open a ticket.
+ * Conditional put on the events table; a stale lock (holder crashed) expires
+ * after LOCK_TTL_MS. Returns true if acquired.
+ */
+const LOCK_TTL_MS = 30_000;
+async function acquireFilingLock(family: string): Promise<boolean> {
+  const now = Date.now();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await ddb.send(new PutCommand({
+        TableName: EVENTS_TABLE,
+        Item: {
+          workflowId: "wm-config",
+          eventId: `filing-lock-${family}`,
+          type: "wm.lock",
+          expiresAtMs: now + LOCK_TTL_MS,
+          timestamp: new Date(now).toISOString(),
+        },
+        ConditionExpression: "attribute_not_exists(eventId) OR expiresAtMs < :now",
+        ExpressionAttributeValues: { ":now": now },
+      }));
+      return true;
+    } catch (err) {
+      if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
+      await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+    }
+  }
+  return false;
+}
+
+async function releaseFilingLock(family: string): Promise<void> {
+  try {
+    await ddb.send(new DeleteCommand({
+      TableName: EVENTS_TABLE,
+      Key: { workflowId: "wm-config", eventId: `filing-lock-${family}` },
+    }));
+  } catch { /* lock expires on its own */ }
 }
 
 /**
@@ -98,6 +144,7 @@ export async function POST(req: NextRequest) {
   const labels = [`repo:${repo}`, ...extraLabels];
   const projectKey = process.env.JIRA_PROJECT_KEY || "TEAM";
 
+  let filingLockFamily: string | null = null;
   try {
     const jira = JiraClient.fromEnv();
 
@@ -107,10 +154,27 @@ export async function POST(req: NextRequest) {
     const dedupeLabels = (body.dedupeLabels || []).map((l) => String(l).trim()).filter(Boolean);
     if (dedupeLabels.length > 0) {
       // 0. Kill switch — the operator said stop; enforce it in code, not prompt.
-      if (await autoFilingDisabled()) {
+      //    Fail CLOSED on a read failure: a DDB blip while the switch is off
+      //    must not re-enable filing. Human bugs never reach this check.
+      const filingSwitch = await autoFilingSwitch();
+      if (filingSwitch !== "on") {
         return NextResponse.json({
           suppressed: true,
-          reason: "Automated bug filing is disabled (wm-config/auto-file-bugs=off). Report the RCA as a ticket comment instead. Do NOT retry.",
+          reason: filingSwitch === "off"
+            ? "Automated bug filing is disabled (wm-config/auto-file-bugs=off). Report the RCA as a ticket comment instead. Do NOT retry."
+            : "Kill-switch state could not be read — automated filing fails closed. Report the RCA as a ticket comment instead. Do NOT retry.",
+        });
+      }
+
+      // Serialize the whole automated check-then-create sequence per family so
+      // concurrent WATCH sessions can't race the dedupe or the cap and file
+      // duplicate tickets. Lock released in finally; stale locks self-expire.
+      filingLockFamily = dedupeLabels[0];
+      if (!(await acquireFilingLock(filingLockFamily))) {
+        filingLockFamily = null;
+        return NextResponse.json({
+          suppressed: true,
+          reason: "Another automated filing for this family is in flight — re-check for an existing bug and comment on it instead. Do NOT retry immediately.",
         });
       }
 
@@ -189,5 +253,7 @@ export async function POST(req: NextRequest) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[api/bugs] file failed:", message);
     return NextResponse.json({ error: message }, { status: 500 });
+  } finally {
+    if (filingLockFamily) await releaseFilingLock(filingLockFamily);
   }
 }
