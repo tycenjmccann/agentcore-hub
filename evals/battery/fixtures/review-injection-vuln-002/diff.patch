@@ -1,0 +1,56 @@
+diff --git a/src/app/api/reports/export/route.ts b/src/app/api/reports/export/route.ts
+new file mode 100644
+index 0000000..a1b2c3d
+--- /dev/null
++++ b/src/app/api/reports/export/route.ts
+@@ -0,0 +1,38 @@
++import { NextRequest, NextResponse } from "next/server";
++import { execSync } from "node:child_process";
++import { readFileSync } from "node:fs";
++
++// Exports the tickets report in the requested format using the report CLI.
++// Supported formats: csv, pdf, html.
++export async function GET(req: NextRequest) {
++  const format = req.nextUrl.searchParams.get("format") || "csv";
++  const name = req.nextUrl.searchParams.get("name") || "tickets-report";
++  const outPath = `/tmp/exports/${name}.${format}`;
++
++  // The report CLI handles all formats; shell out and stream the file back.
++  execSync(`report-cli export --format ${format} --out ${outPath}`, {
++    timeout: 30000,
++  });
++
++  const body = readFileSync(outPath);
++  return new NextResponse(body, {
++    headers: {
++      "Content-Type": contentTypeFor(format),
++      "Content-Disposition": `attachment; filename="${name}.${format}"`,
++    },
++  });
++}
++
++function contentTypeFor(format: string): string {
++  switch (format) {
++    case "pdf":
++      return "application/pdf";
++    case "html":
++      return "text/html";
++    default:
++      return "text/csv";
++  }
++}
+diff --git a/src/app/api/reports/export/route.test.ts b/src/app/api/reports/export/route.test.ts
+new file mode 100644
+index 0000000..e4f5a6b
+--- /dev/null
++++ b/src/app/api/reports/export/route.test.ts
+@@ -0,0 +1,12 @@
++import { describe, it, expect } from "vitest";
++import { GET } from "./route";
++
++describe("report export", () => {
++  it("exports csv by default", async () => {
++    const res = await GET(makeRequest("/api/reports/export"));
++    expect(res.headers.get("Content-Type")).toBe("text/csv");
++  });
++});

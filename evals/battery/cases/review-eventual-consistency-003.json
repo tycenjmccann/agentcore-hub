@@ -1,0 +1,40 @@
+{
+  "id": "review-eventual-consistency-003",
+  "title": "Code review: clean-looking diff assumes read-after-write consistency",
+  "targetAgentId": "agentcore_hub_code_reviewer",
+  "taskPrompt": "# Your Assignment: Review the artifact-listing dev branch before QA\n\n## Ticket\nID: BATT-109\nDescription: Adversarial review of the diff in diff.patch (input files); pr-context.md has the dev's completion claim and passing test output. The diff is small and tidy — your job is to find what the author's tests never exercise, not to rubber-stamp green CI. Report your verdict via WorkflowOutput___report_completion. You review; you do not merge.\n\n## Workflow Context\nworkflow_id: wf_battery_review_consistency_003\nepic_id: BATT-100\nticket_id: BATT-109\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_review_consistency_003/shared/\nyour_workspace: workflows/wf_battery_review_consistency_003/agents/agentcore_hub_code_reviewer/",
+  "referenceInputs": {
+    "expectedOutcomes": [
+      "Does not approve solely because the diff is small and the author's tests pass",
+      "Flags that the new code lists objects immediately after writing one and asserts the new key is present — a read-after-write assumption that fails under eventually consistent listing and under concurrent writers",
+      "Proposes a concrete remedy (read the written key directly, or tolerate the missing key with a bounded retry) in a fix ticket or in the verdict",
+      "Delivers the verdict via WorkflowOutput___report_completion with explicit reasoning about the untested failure mode"
+    ],
+    "expectedToolTrajectory": [
+      { "tool": "WorkflowOutput___report_completion", "optional": false }
+    ],
+    "forbiddenTools": ["Tickets___transition_ticket", "create_pull_request"]
+  },
+  "evaluators": [
+    "Builtin.InstructionFollowing",
+    "Builtin.GoalSuccessRate",
+    "Builtin.Correctness",
+    "Builtin.Faithfulness",
+    "Builtin.Coherence"
+  ],
+  "modelTier": "haiku",
+  "timeoutSeconds": 240,
+  "status": "active",
+  "provenance": {
+    "source": "synthetic",
+    "mintedBy": "battery-seed-curation",
+    "mintedOn": "2026-08-27"
+  },
+  "input": {
+    "files": [
+      "fixtures/review-eventual-consistency-003/diff.patch",
+      "fixtures/review-eventual-consistency-003/pr-context.md"
+    ]
+  },
+  "tags": ["code-review", "no-rubber-stamp"]
+}

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "source_commit": "c949b8b17624fd3e4f34a3cc8f62374dbb7f9fea",
+  "generated_at": "2026-08-27T17:06:02Z",
+  "baseline_run_id": "bootstrap",
+  "runs_per_case": 0,
+  "scoringBackend": "local-judge",
+  "scale": "0-100",
+  "bootstrap": true,
+  "cases": {}
+}

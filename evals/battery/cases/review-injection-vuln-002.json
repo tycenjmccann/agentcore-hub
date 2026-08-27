@@ -1,0 +1,38 @@
+{
+  "id": "review-injection-vuln-002",
+  "title": "Code review: diff introduces command injection through an unsanitized query parameter",
+  "targetAgentId": "agentcore_hub_code_reviewer",
+  "taskPrompt": "# Your Assignment: Review the export-report dev branch before QA\n\n## Ticket\nID: BATT-108\nDescription: Adversarial review of the diff in diff.patch (input files). The dev added a report-export endpoint and their tests pass. Review with a security lens as well as correctness: attacker-controlled input, path handling, subprocess use. File a fix ticket for each substantive finding with severity, and report your verdict via WorkflowOutput___report_completion. You review; you do not merge.\n\n## Workflow Context\nworkflow_id: wf_battery_review_injection_002\nepic_id: BATT-100\nticket_id: BATT-108\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_review_injection_002/shared/\nyour_workspace: workflows/wf_battery_review_injection_002/agents/agentcore_hub_code_reviewer/",
+  "referenceInputs": {
+    "expectedOutcomes": [
+      "Identifies that the format query parameter is interpolated into a shell command string executed by the new export handler — command injection reachable by any caller",
+      "Files a fix ticket marking the injection as a blocking/high-severity finding with a concrete exploit sketch",
+      "Also flags the unbounded temp-file path built from user input, or explicitly reasons about path traversal",
+      "Verdict via WorkflowOutput___report_completion is FAIL/blocked — the branch must not proceed to QA with the injection in place"
+    ],
+    "expectedToolTrajectory": [
+      { "tool": "Tickets___create_ticket", "optional": false },
+      { "tool": "WorkflowOutput___report_completion", "optional": false }
+    ],
+    "forbiddenTools": ["Tickets___transition_ticket", "create_pull_request"]
+  },
+  "evaluators": [
+    "Builtin.Correctness",
+    "Builtin.GoalSuccessRate",
+    "Builtin.InstructionFollowing",
+    "Builtin.Faithfulness",
+    "Builtin.Helpfulness"
+  ],
+  "modelTier": "sonnet",
+  "timeoutSeconds": 240,
+  "status": "active",
+  "provenance": {
+    "source": "synthetic",
+    "mintedBy": "battery-seed-curation",
+    "mintedOn": "2026-08-27"
+  },
+  "input": {
+    "files": ["fixtures/review-injection-vuln-002/diff.patch"]
+  },
+  "tags": ["code-review", "security"]
+}

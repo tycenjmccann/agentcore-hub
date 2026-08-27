@@ -1,0 +1,42 @@
+{
+  "id": "fix-race-condition-cas-003",
+  "title": "Fix with regression test: lost update between concurrent stop and message writes",
+  "targetAgentId": "agentcore_hub_bug_fixer",
+  "taskPrompt": "# Your Assignment: Fix: a stop request is silently lost when it races a message write\n\n## Ticket\nID: BATT-106\nDescription: When a user hits stop while a message write is in flight, the stop flag sometimes vanishes and the run keeps going. bug-report.md describes two captured occurrences; store.ts is the state store module. Find the root cause — this is a concurrency defect, not an input-validation one — make the smallest correct fix, and add a regression test that simulates the interleaving. Delegate the code work to claude_code.\n\n## Workflow Context\nworkflow_id: wf_battery_fix_race_cas_003\nepic_id: BATT-100\nticket_id: BATT-106\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_fix_race_cas_003/shared/\nyour_workspace: workflows/wf_battery_fix_race_cas_003/agents/agentcore_hub_bug_fixer/\n\n## Branch\nfeature_branch: feature/BATT-106-bug-fixer\nbase_branch: main",
+  "referenceInputs": {
+    "expectedOutcomes": [
+      "Identifies the root cause as an unconditional read-modify-write in store.ts that lets the message write overwrite the concurrent stop write (lost update), not a missing null check",
+      "The fix serializes the write race with a compare-and-set / conditional write (or equivalent), rather than adding a sleep or retry that only narrows the window",
+      "Adds a regression test that interleaves the two writes deterministically and fails on the old code",
+      "Delegates the work to claude_code and reports completion via WorkflowOutput___report_completion with the feature branch name"
+    ],
+    "expectedToolTrajectory": [
+      { "tool": "claude_code", "optional": false },
+      { "tool": "WorkflowOutput___report_completion", "optional": false }
+    ],
+    "forbiddenTools": ["bash", "run_command", "Tickets___transition_ticket"]
+  },
+  "evaluators": [
+    "Builtin.ToolSelectionAccuracy",
+    "Builtin.InstructionFollowing",
+    "Builtin.GoalSuccessRate",
+    "Builtin.Correctness",
+    "Builtin.Coherence"
+  ],
+  "modelTier": "sonnet",
+  "timeoutSeconds": 300,
+  "status": "active",
+  "provenance": {
+    "source": "workflow-run",
+    "workflowRunId": "wf_battery_seed_4 (distilled+sanitized from completed hub workflow patterns)",
+    "mintedBy": "battery-seed-curation",
+    "mintedOn": "2026-08-27"
+  },
+  "input": {
+    "files": [
+      "fixtures/fix-race-condition-cas-003/bug-report.md",
+      "fixtures/fix-race-condition-cas-003/store.ts"
+    ]
+  },
+  "tags": ["fix-regression-test", "concurrency"]
+}

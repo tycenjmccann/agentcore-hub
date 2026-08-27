@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "minActiveCases": 10,
+  "activeCases": [
+    "triage-crash-chain-001",
+    "triage-flaky-upload-002",
+    "triage-rootcause-comment-003",
+    "fix-null-session-crash-001",
+    "fix-pagination-offbyone-002",
+    "fix-race-condition-cas-003",
+    "review-error-handling-001",
+    "review-injection-vuln-002",
+    "review-eventual-consistency-003",
+    "qa-verifier-regression-001",
+    "qa-build-verification-002",
+    "qa-design-mismatch-003"
+  ],
+  "notes": "activeCases must list every cases/*.json with status=active; runner preflight cross-checks and fails on drift"
+}

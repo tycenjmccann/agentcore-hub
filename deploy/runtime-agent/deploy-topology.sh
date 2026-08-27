@@ -31,6 +31,11 @@ AGENTS_JSON="$REPO_ROOT/src/config/agents.json"
 WORKFLOWS_JSON="$REPO_ROOT/src/config/workflows.json"
 PROMPTS_DIR="$SCRIPT_DIR/prompts"
 
+# Eval gate (FR-7): runs before the prompt/config S3 syncs below. Read-only —
+# does not touch the agents.json runtimeArn merge this script performs later.
+source "$SCRIPT_DIR/../lib/check-eval-gate.sh"
+require_eval_gate "deploy/runtime-agent/prompts/**" "src/config/agents.json" "src/config/workflows.json"
+
 : "${AWS_REGION:?AWS_REGION must be set}"
 : "${ARTIFACT_BUCKET:?ARTIFACT_BUCKET must be set}"
 

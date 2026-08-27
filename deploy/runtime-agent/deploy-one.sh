@@ -7,6 +7,11 @@ ROLE_ARN="${AGENTCORE_ROLE_ARN:?Set AGENTCORE_ROLE_ARN to your AgentCore executi
 REGION="${AWS_REGION:-us-east-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Eval gate (FR-7): refuse to ship ungated prompt changes. No-ops when
+# deploy-fleet.sh already latched EVAL_GATE_CHECKED for this process tree.
+source "$SCRIPT_DIR/../lib/check-eval-gate.sh"
+require_eval_gate "deploy/runtime-agent/prompts/**"
+
 # DEPLOY_MODE selects between two deploy paths:
 #   lightweight (default) — CodeZip via the bedrock-agentcore-starter-toolkit.
 #                           Stock python:3.10 container; main.py downloads Node

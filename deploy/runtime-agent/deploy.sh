@@ -69,6 +69,10 @@ done
 # --- Source config (derives ACCOUNT_ID, ROLE_ARN, BUCKET from credentials) ---
 source "$REPO_ROOT/deploy/config.sh"
 
+# Eval gate (FR-7): this script ships per-agent prompts via deploy-one.sh.
+source "$REPO_ROOT/deploy/lib/check-eval-gate.sh"
+require_eval_gate "deploy/runtime-agent/prompts/**"
+
 # --- Auto-detect gateway if not set ---
 if [ -z "${GATEWAY_ARN:-}" ]; then
   set +e

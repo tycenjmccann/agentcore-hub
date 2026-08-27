@@ -1,0 +1,204 @@
+# Config Evals Gate (FR-4/FR-6) — PR gate for prompt/config/blueprint changes.
+#
+# Hardened per the TEAM-3066 security review:
+#   HERM-1  The job that executes PR code (battery) has NO checks:write and no
+#           on-disk git credential (persist-credentials: false + preflight
+#           assertion). Check publication happens in a separate job (publish)
+#           that checks out nothing and executes zero PR code.
+#   CRED-2  Fork PRs never receive credentials and never run; a dedicated
+#           fork-guard job publishes an explicit FAILING check so a gated-path
+#           fork PR can never slip through with an absent/neutral check.
+#   CRED-3  The OIDC role session is named gha-<run_id>-<actor> so every
+#           Bedrock/S3 call in CloudTrail attributes to a specific run + human.
+#
+# Trigger is `pull_request` — NEVER `pull_request_target`, which would run
+# PR-controlled code with base-repo credentials (HERM-1).
+name: Config Evals Gate
+
+on:
+  pull_request:
+    paths:
+      - "deploy/runtime-agent/prompts/**"
+      - "deploy/workflow-manager/system-prompt.md"
+      - "src/config/workflows.json"
+      - "src/config/agents.json"
+      - "blueprints/**"
+      - "evals/battery/**"
+
+concurrency:
+  group: config-evals-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# Least privilege: nothing at the workflow level; each job asks for exactly
+# what it needs.
+permissions: {}
+
+jobs:
+  # The ONLY job that executes PR code. It cannot publish checks (HERM-1) and
+  # only runs for same-repo branches (CRED-2 — forks get fork-guard instead).
+  battery:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # A hung battery hits this timeout ⇒ failed job ⇒ publish reports a FAILED
+    # check. Never neutral, never absent.
+    timeout-minutes: 15
+    permissions:
+      contents: read # checkout only
+      id-token: write # OIDC role assumption
+      # NO checks:write here (HERM-1): PR code must not be able to green-light itself.
+    environment: config-evals
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # HERM-1: leave no token on disk for PR code to exfiltrate.
+          persist-credentials: false
+
+      - name: Assert no on-disk git credential (HERM-1)
+        run: |
+          set -euo pipefail
+          extraheader="$(git config --get http.https://github.com/.extraheader || true)"
+          if [ -n "$extraheader" ]; then
+            echo "::error::git http extraheader credential persisted despite persist-credentials:false — refusing to run PR code"
+            exit 1
+          fi
+          if grep -qi authorization .git/config; then
+            echo "::error::authorization header present in .git/config — refusing to run PR code"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Assume eval-gate role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_EVAL_GATE_ROLE_ARN }}
+          aws-region: us-east-1
+          # CRED-3: attributable session name — CloudTrail ties every call
+          # made by this job to the exact run and the human who triggered it.
+          role-session-name: gha-${{ github.run_id }}-${{ github.actor }}
+
+      - name: Fetch base ref
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch --no-tags --depth=1 origin "$BASE_REF"
+
+      - name: Run battery
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        # run-battery.mjs writes check-summary.md next to --results and exits
+        # non-zero on a FAIL verdict, so a red battery job ⇔ red gate.
+        run: node evals/battery/run-battery.mjs --results "$RUNNER_TEMP/battery-results.json" --base-ref "origin/$BASE_REF"
+
+      - name: Upload results
+        # always(): the publish job needs the artifact even (especially) when
+        # the battery failed — verdict + summary end up in the check run.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: battery-results
+          path: |
+            ${{ runner.temp }}/battery-results.json
+            ${{ runner.temp }}/check-summary.md
+          if-no-files-found: ignore
+
+  # Publishes the `config-evals-gate` check run. Runs NO PR code — no checkout
+  # at all (HERM-1 split): its only inputs are the artifact and job status.
+  publish:
+    needs: battery
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write # the ONLY permission — and the only job that has it
+    steps:
+      - uses: actions/download-artifact@v4
+        # continue-on-error: a battery job that died before uploading (crash,
+        # timeout, cancellation) must still yield a FAILING check below.
+        continue-on-error: true
+        with:
+          name: battery-results
+          path: ${{ runner.temp }}/battery-results
+
+      - name: Publish check run (fail closed)
+        uses: actions/github-script@v7
+        env:
+          BATTERY_JOB_RESULT: ${{ needs.battery.result }}
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const dir = path.join(process.env.RUNNER_TEMP, "battery-results");
+            const jobResult = process.env.BATTERY_JOB_RESULT;
+
+            let results = null;
+            try {
+              results = JSON.parse(fs.readFileSync(path.join(dir, "battery-results.json"), "utf8"));
+            } catch { /* missing/unparseable artifact ⇒ stays null ⇒ failure */ }
+            let summaryMd = "";
+            try {
+              summaryMd = fs.readFileSync(path.join(dir, "check-summary.md"), "utf8");
+            } catch { /* optional */ }
+
+            // Fail closed in EVERY branch: success requires the artifact to
+            // exist, the verdict to be PASS, and the battery job to have
+            // succeeded. Missing artifact, FAIL verdict, job failure,
+            // cancellation, and timeout all land on "failure".
+            let conclusion = "failure";
+            let title;
+            if (results && results.verdict === "PASS" && jobResult === "success") {
+              conclusion = "success";
+              title = "PASS — config evals battery held the baseline";
+            } else if (!results) {
+              title = `FAIL — no battery results (battery job: ${jobResult})`;
+              summaryMd = summaryMd ||
+                `The battery job finished with status \`${jobResult}\` and produced no ` +
+                "results artifact (crash, timeout, or cancellation before scoring " +
+                "completed). The gate fails closed: re-run the job or fix the battery.";
+            } else {
+              title = `FAIL — battery verdict ${results.verdict} (battery job: ${jobResult})`;
+            }
+
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: "config-evals-gate",
+              head_sha: context.payload.pull_request.head.sha,
+              status: "completed",
+              conclusion,
+              output: {
+                title,
+                summary: (summaryMd || title).slice(0, 60000),
+              },
+            });
+
+  # CRED-2: fork PRs cannot assume the OIDC role, so the battery cannot run.
+  # An absent/neutral check would let a gated-path fork PR merge unexamined —
+  # so publish an explicit FAILURE instead. No checkout: zero PR code executes.
+  fork-guard:
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    steps:
+      - name: Publish failing check for fork PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: "config-evals-gate",
+              head_sha: context.payload.pull_request.head.sha,
+              status: "completed",
+              conclusion: "failure",
+              output: {
+                title: "Fork PRs cannot run the config evals gate",
+                summary: "Fork PRs cannot run the config evals gate (no credentials). A maintainer must push this branch to the base repository to gate it.",
+              },
+            });

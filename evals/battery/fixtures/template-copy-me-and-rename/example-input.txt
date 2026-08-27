@@ -1,0 +1,4 @@
+Placeholder input file for the template case. Replace with sanitized content:
+BATT-* ticket keys, wf_battery_* workflow ids, battery-* session/tenant ids,
+example-org/sample-service repo references. Never real hosts, account ids,
+ARNs, bucket names, or credentials.

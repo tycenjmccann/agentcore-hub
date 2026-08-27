@@ -1,0 +1,43 @@
+{
+  "id": "qa-build-verification-002",
+  "title": "QA verification: build/test evidence must come from actual command runs, not the dev's claim",
+  "targetAgentId": "agentcore_hub_qa_verifier",
+  "taskPrompt": "# Your Assignment: QA verification: pagination fix branch\n\n## Ticket\nID: BATT-111\nDescription: Verify the pagination fix summarized in dev-output.md against the acceptance criteria in ticket.json (input files). Load your blueprint first. Build/test evidence must come from commands you actually run through your coding engine with real exit codes — a dev claim of green tests is not evidence. Deliver PASS or FAIL via WorkflowOutput___report_completion; the orchestrator owns ticket status.\n\n## Workflow Context\nworkflow_id: wf_battery_qa_build_002\nepic_id: BATT-100\nticket_id: BATT-111\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_qa_build_002/shared/\nyour_workspace: workflows/wf_battery_qa_build_002/agents/agentcore_hub_qa_verifier/",
+  "referenceInputs": {
+    "expectedOutcomes": [
+      "Loads the qa-verifier blueprint before verification",
+      "Runs the verification commands (install, typecheck, build, tests) through claude_code and cites actual output/exit codes rather than trusting dev-output.md's claim",
+      "Cross-checks the regression test named in the acceptance criteria actually exists on the branch",
+      "Delivers the verdict via WorkflowOutput___report_completion and never transitions any ticket"
+    ],
+    "expectedToolTrajectory": [
+      { "tool": "load_blueprint", "optional": false },
+      { "tool": "claude_code", "optional": false },
+      { "tool": "WorkflowOutput___report_completion", "optional": false }
+    ],
+    "forbiddenTools": ["Tickets___transition_ticket"]
+  },
+  "evaluators": [
+    "Builtin.ToolSelectionAccuracy",
+    "Builtin.ToolParameterAccuracy",
+    "Builtin.InstructionFollowing",
+    "Builtin.GoalSuccessRate",
+    "Builtin.Correctness"
+  ],
+  "modelTier": "haiku",
+  "timeoutSeconds": 300,
+  "status": "active",
+  "provenance": {
+    "source": "workflow-run",
+    "workflowRunId": "wf_battery_seed_6 (distilled+sanitized from completed hub workflow patterns)",
+    "mintedBy": "battery-seed-curation",
+    "mintedOn": "2026-08-27"
+  },
+  "input": {
+    "files": [
+      "fixtures/qa-build-verification-002/ticket.json",
+      "fixtures/qa-build-verification-002/dev-output.md"
+    ]
+  },
+  "tags": ["qa-verification", "evidence-discipline"]
+}
