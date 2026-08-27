@@ -1,0 +1,15 @@
+# Offline unit-test deps for the runtime agent's telemetry instrumentation.
+#
+# Deliberately NOT deploy/runtime-agent/requirements.txt: these tests must run in
+# CI with no AWS credentials, no network at test time, and no Playwright/Node
+# install. Only what's needed to build a real Strands Agent against a mocked
+# model and read the spans back out of an in-memory exporter.
+strands-agents>=0.3.0
+opentelemetry-sdk>=1.29.0
+# StrandsTelemetry.setup_otlp_exporter() imports the OTLP/HTTP span exporter at
+# call time, so the fallback branch of main.py's _init_telemetry() can't be
+# exercised without it. Constructing the exporter opens no connection — nothing
+# is ever flushed, since that test emits no spans.
+opentelemetry-exporter-otlp-proto-http>=1.29.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

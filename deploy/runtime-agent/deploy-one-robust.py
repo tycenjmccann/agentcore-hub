@@ -66,6 +66,22 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         "HOME": "/root",
         "TMPDIR": "/tmp",
         "SYSTEM_PROMPT_S3_KEY": prompt_key,
+        # ─── OTel / AgentCore observability ───────────────────────────────────
+        # AGENT_OBSERVABILITY_ENABLED is what makes the platform inject ADOT and
+        # route spans to the unified telemetry destination; it also gates main.py's
+        # StrandsTelemetry fallback. Without it the invoke_agent span is never
+        # exported and eval batches score 0/10.
+        # This is a Runtime-hosted agent: endpoint + auth headers + resource
+        # attributes are platform-managed, so we deliberately do NOT set
+        # OTEL_EXPORTER_OTLP_{LOGS,TRACES}_HEADERS or OTEL_RESOURCE_ATTRIBUTES,
+        # and NEVER DISABLE_ADOT_OBSERVABILITY.
+        "AGENT_OBSERVABILITY_ENABLED": "true",
+        "OTEL_PYTHON_DISTRO": "aws_distro",
+        "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+        "OTEL_TRACES_EXPORTER": "otlp",
+        "UNIFIED_TRACES_DESTINATION_ENABLED": "true",
+        "OTEL_SERVICE_NAME": agent_name,
     }
     if gw := os.environ.get("GATEWAY_ARN"):
         env["GATEWAY_ARN"] = gw

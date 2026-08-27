@@ -63,6 +63,10 @@ echo "   ✓ Attached BedrockAgentCoreFullAccess"
 
 # ─── Observability (CloudWatch Logs + X-Ray + Metrics) ────────────────────────
 # Required per: https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-permissions.html
+# logs:PutResourcePolicy on the runtime log groups is the prerequisite for the
+# unified telemetry destination (UNIFIED_TRACES_DESTINATION_ENABLED=true) — it's
+# what lets the platform grant itself delivery into /aws/bedrock-agentcore/runtimes/*,
+# where the `invoke_agent` spans land in the `spans` log streams.
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "Observability" \
@@ -86,6 +90,12 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": [\"logs:CreateLogStream\", \"logs:PutLogEvents\"],
         \"Resource\": [\"arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*\"]
+      },
+      {
+        \"Sid\": \"LogsResourcePolicyForUnifiedTelemetry\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"logs:PutResourcePolicy\"],
+        \"Resource\": [\"arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/runtimes/*\"]
       },
       {
         \"Sid\": \"XRay\",

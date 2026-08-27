@@ -56,14 +56,19 @@ echo "✓ S3: ${BUCKET}"
 deploy_lambda() {
   local NAME=$1 DIR=$2 TIMEOUT=$3 MEM=$4 ENV_VARS=$5
   cd "${REPO_ROOT}/lambda/${DIR}" && rm -f function.zip
+  # Include lib/ when the function has one — eval-packager's classifiers live in
+  # lib/classify.mjs, and index.mjs imports it at module load. Omitting it makes
+  # every invocation fail with ERR_MODULE_NOT_FOUND at init.
+  local EXTRA_PATHS=()
+  [ -d lib ] && EXTRA_PATHS+=(lib/)
   # Bundle node_modules when the function declares runtime deps (e.g. the
   # eval-packager's SigV4 stack used to invoke the improver runtime). The
   # nodejs20.x runtime only ships the v3 SDK clients, not @smithy/* signing.
   if [ -f package.json ] && grep -q '"dependencies"' package.json; then
     npm install --omit=dev --no-audit --no-fund --silent
-    zip -rq function.zip index.mjs package.json node_modules/
+    zip -rq function.zip index.mjs package.json node_modules/ "${EXTRA_PATHS[@]}"
   else
-    zip -q function.zip index.mjs
+    zip -rq function.zip index.mjs "${EXTRA_PATHS[@]}"
   fi
   if aws lambda get-function --function-name "agentcore-hub-${NAME}" 2>/dev/null >/dev/null; then
     aws lambda update-function-code --function-name "agentcore-hub-${NAME}" \
@@ -113,6 +118,56 @@ for lg in json.load(sys.stdin):
         capture_output=True, env={**os.environ})
 "
 echo "✓ Subscriptions: 14 eval log groups → packager"
+
+# ─── Alerting (SNS + CloudWatch alarms on eval health) ──────────────────────
+# The packager publishes two EMF metrics from plain console.log lines (see
+# lambda/eval-packager/lib/classify.mjs → emfRecord), so there's no
+# PutMetricData permission to grant:
+#   eval.preflight.missing_span   — a session whose invoke_agent span never
+#                                   arrived, i.e. a RUNTIME TELEMETRY failure.
+#                                   This is the signal that used to show up as
+#                                   a silent 0/10 batch.
+#   eval.batch.null_or_error_rate — % of a flushed batch that never scored.
+# Both are emitted with Dimensions [["agentId"], []]; the alarms below watch the
+# dimensionless fleet aggregate so one broken agent still pages.
+# create-topic and put-metric-alarm are both idempotent by name.
+ALERT_TOPIC_ARN=$(aws sns create-topic --name agentcore-hub-alerts \
+  --region "$AWS_REGION" --query 'TopicArn' --output text)
+echo "✓ SNS topic: ${ALERT_TOPIC_ARN}"
+
+aws cloudwatch put-metric-alarm \
+  --region "$AWS_REGION" \
+  --alarm-name "agentcore-hub-eval-null-or-error-rate-high" \
+  --alarm-description "More than 50% of a flushed eval batch never scored (errors or missing scores) — suspect runtime telemetry, not agent quality." \
+  --namespace "AgentCoreHub/Evaluations" \
+  --metric-name "eval.batch.null_or_error_rate" \
+  --statistic Average \
+  --period 3600 \
+  --threshold 50 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 1 \
+  --datapoints-to-alarm 1 \
+  --treat-missing-data notBreaching \
+  --alarm-actions "$ALERT_TOPIC_ARN" \
+  --output text >/dev/null
+echo "✓ Alarm: agentcore-hub-eval-null-or-error-rate-high (>50% over 1h)"
+
+aws cloudwatch put-metric-alarm \
+  --region "$AWS_REGION" \
+  --alarm-name "agentcore-hub-eval-missing-span" \
+  --alarm-description "An eval session was rejected because the invoke_agent span was missing — the runtime is not exporting Strands telemetry." \
+  --namespace "AgentCoreHub/Evaluations" \
+  --metric-name "eval.preflight.missing_span" \
+  --statistic Sum \
+  --period 900 \
+  --threshold 0 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 1 \
+  --treat-missing-data notBreaching \
+  --alarm-actions "$ALERT_TOPIC_ARN" \
+  --output text >/dev/null
+echo "✓ Alarm: agentcore-hub-eval-missing-span (any occurrence in 15m)"
+echo "  Subscribe to alerts: aws sns subscribe --topic-arn ${ALERT_TOPIC_ARN} --protocol email --notification-endpoint you@example.com"
 
 # ─── S3 → PRD Submitter (EventBridge) ───────────────────────────────────────
 SUBMITTER_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-prd-submitter"
