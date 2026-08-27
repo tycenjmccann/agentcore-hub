@@ -77,9 +77,11 @@ MIRROR_DISSOCIATE = os.environ.get("MIRROR_DISSOCIATE", "0").lower() not in ("0"
 # Mirror create/refresh is serialized by a lock file; readers never lock.
 _MIRROR_LOCK_WAIT_S = 60      # give up waiting → caller falls back to a plain clone
 _MIRROR_LOCK_POLL_S = 1.0
-# A lock older than this was orphaned by a microVM that died mid-build. It MUST
-# stay above MIRROR_BUILD_TIMEOUT_S so a live build is never stolen.
-_MIRROR_LOCK_STALE_S = 1800
+# A lock older than this was orphaned by a microVM that died mid-build. Derived
+# from MIRROR_BUILD_TIMEOUT_S (+ margin) so it stays above the longest legal
+# build BY CONSTRUCTION — an operator raising the build timeout can't reopen the
+# window where a live build's lock looks stale and gets stolen.
+_MIRROR_LOCK_STALE_S = max(1800, MIRROR_BUILD_TIMEOUT_S + 300)
 
 DEFAULT_CLI = "claude"
 CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
@@ -1095,30 +1097,36 @@ def _is_mirror(path: str) -> bool:
     return os.path.isfile(os.path.join(path, "HEAD")) and os.path.isdir(os.path.join(path, "objects"))
 
 
-def _acquire_mirror_lock(lock_path: str) -> bool:
-    """Take this repo's mirror lock, or return False.
+def _acquire_mirror_lock(lock_path: str) -> str | None:
+    """Take this repo's mirror lock; return an ownership token, or None.
 
     O_CREAT|O_EXCL, deliberately NOT fcntl.flock: the lock is shared across
     microVMs through EFS and flock semantics over NFS are unreliable. Waits up to
     _MIRROR_LOCK_WAIT_S for the holder, then gives up so a turn is never stalled
     behind someone else's build (the caller falls back to a plain clone). A lock
-    whose mtime exceeds _MIRROR_LOCK_STALE_S (> MIRROR_BUILD_TIMEOUT_S, so a live
-    build is never stolen) was orphaned by a dead VM and is reclaimed — by atomic
-    rename, so two racing waiters can't both believe they stole it."""
+    whose mtime exceeds _MIRROR_LOCK_STALE_S (derived above MIRROR_BUILD_TIMEOUT_S,
+    so a live build is never stolen) was orphaned by a dead VM and is reclaimed —
+    by atomic rename, so two racing waiters can't both believe they stole it.
+
+    The token written into the lock file is what makes release ownership-checked:
+    if this holder's lock was nonetheless stolen (clock skew, an operator's manual
+    unlink+relock), its release must not unlink the NEW holder's lock — that would
+    admit a third builder onto the same mirror."""
+    token = f"{os.getpid()}-{uuid.uuid4().hex}"
     deadline = time.time() + _MIRROR_LOCK_WAIT_S
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             try:
-                os.write(fd, str(int(time.time())).encode())
+                os.write(fd, token.encode())
             finally:
                 os.close(fd)
-            return True
+            return token
         except FileExistsError:
             pass
         except OSError as exc:
             logger.warning("mirror_lock_failed", extra={"error": str(exc)[:200]})
-            return False
+            return None
         try:
             if time.time() - os.path.getmtime(lock_path) > _MIRROR_LOCK_STALE_S:
                 victim = f"{lock_path}.stale.{uuid.uuid4().hex[:8]}"
@@ -1129,15 +1137,44 @@ def _acquire_mirror_lock(lock_path: str) -> bool:
         except OSError:
             pass  # released or stolen between checks — just retry the create
         if time.time() >= deadline:
-            return False
+            return None
         time.sleep(_MIRROR_LOCK_POLL_S)
 
 
-def _release_mirror_lock(lock_path: str) -> None:
+def _release_mirror_lock(lock_path: str, token: str) -> None:
+    """Unlink the lock only if we still own it (file content == our token). A
+    mismatch means it was stolen and now belongs to someone else — leave it."""
+    try:
+        with open(lock_path) as f:
+            holder = f.read().strip()
+    except OSError:
+        return  # already released/stolen-and-released — nothing to do
+    if holder != token:
+        logger.warning("mirror_lock_stolen", extra={"lock": os.path.basename(lock_path)})
+        return
     try:
         os.unlink(lock_path)
     except OSError:
         pass
+
+
+def _disable_mirror_gc(mirror: str) -> None:
+    """Persist gc-off config INSIDE the mirror. This is what enforces the 'mirror
+    is never gc'd' invariant: `git fetch` runs `maintenance run --auto` by default,
+    and once packs pile past gc.autoPackLimit an auto-gc would `repack -d` — deleting
+    packfiles that lock-free `--reference` readers may be streaming from, and pruning
+    objects that live checkouts' alternates still point at. Config (not just a fetch
+    flag) so any FUTURE fetch — including a manual one — is also safe. Best-effort:
+    a failure here must not fail the turn, but is worth a warning."""
+    for key, val in (("gc.auto", "0"), ("gc.autoPackLimit", "0"), ("maintenance.auto", "false")):
+        try:
+            res = subprocess.run(["git", "-C", mirror, "config", key, val],
+                                 capture_output=True, text=True, timeout=30)
+            if res.returncode != 0:
+                logger.warning("mirror_gc_config_failed",
+                               extra={"key": key, "error": res.stderr.strip()[:120]})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mirror_gc_config_failed", extra={"key": key, "error": str(exc)[:120]})
 
 
 def _ensure_mirror(url: str, slug: str) -> str | None:
@@ -1149,9 +1186,12 @@ def _ensure_mirror(url: str, slug: str) -> str | None:
     checkouts borrow its objects via `git clone --reference`, so the only bytes on
     the wire are whatever origin has beyond the mirror.
 
-    Never raises. Never `git gc`s the mirror: live checkouts reach its objects
-    through .git/objects/info/alternates, so pruning objects would break them
-    (`fetch --prune` prunes remote-tracking REFS only, which is safe)."""
+    Never raises. The mirror must never be gc'd — live checkouts reach its objects
+    through .git/objects/info/alternates — and that is ENFORCED by _disable_mirror_gc
+    (gc.auto=0 / gc.autoPackLimit=0 / maintenance.auto=false persisted in the mirror
+    at build time and re-applied on every refresh) plus --no-auto-maintenance on the
+    refresh fetch. (`fetch --prune` itself only prunes remote-tracking REFS, which
+    is safe.)"""
     if not WORKSPACE_MIRROR_ENABLED:
         return None
     mirror = os.path.join(MIRROR_ROOT, f"{slug}.git")
@@ -1181,7 +1221,8 @@ def _ensure_mirror(url: str, slug: str) -> str | None:
     if _is_mirror(mirror) and _fresh():
         return mirror
 
-    if not _acquire_mirror_lock(lock):
+    lock_token = _acquire_mirror_lock(lock)
+    if not lock_token:
         logger.info("mirror_fallback", extra={"slug": slug, "reason": "lock_timeout"})
         return None
     try:
@@ -1190,8 +1231,12 @@ def _ensure_mirror(url: str, slug: str) -> str | None:
         if _is_mirror(mirror):
             if _fresh():
                 return mirror
-            res = subprocess.run(["git", "-C", mirror, "fetch", "--prune"],
-                                 capture_output=True, text=True, timeout=MIRROR_BUILD_TIMEOUT_S)
+            # Re-apply gc-off config before fetching: heals mirrors built before
+            # _disable_mirror_gc existed (or whose config was hand-edited).
+            _disable_mirror_gc(mirror)
+            res = subprocess.run(
+                ["git", "-C", mirror, "fetch", "--prune", "--no-auto-maintenance"],
+                capture_output=True, text=True, timeout=MIRROR_BUILD_TIMEOUT_S)
             if res.returncode != 0:
                 logger.info("mirror_fallback", extra={
                     "slug": slug, "reason": f"fetch: {_scrub_git_url(res.stderr.strip())[:160]}"})
@@ -1210,6 +1255,7 @@ def _ensure_mirror(url: str, slug: str) -> str | None:
                     "slug": slug, "reason": f"build: {_scrub_git_url(res.stderr.strip())[:160]}"})
                 return None
             os.rename(tmp, mirror)
+            _disable_mirror_gc(mirror)
             _stamp()
             logger.info("mirror_build", extra={"slug": slug})
             return mirror
@@ -1221,7 +1267,7 @@ def _ensure_mirror(url: str, slug: str) -> str | None:
             "slug": slug, "reason": f"{type(exc).__name__}: {_scrub_git_url(str(exc))[:160]}"})
         return None
     finally:
-        _release_mirror_lock(lock)
+        _release_mirror_lock(lock, lock_token)
 
 
 def _reset_workdir(wd: str) -> None:
