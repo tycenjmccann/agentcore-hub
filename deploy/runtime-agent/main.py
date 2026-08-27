@@ -259,10 +259,11 @@ CLOUD_CODE_TABLE = os.getenv("CLOUD_CODE_TABLE", "agentcore-hub-cloud-code-sessi
 # client-generated), so even a timeout here can't double-run a turn.
 REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "600"))
 # Poll cadence + overall turn budget. The budget must exceed the coding
-# runtime's TURN_TIMEOUT_S (1500s) so its own timeout verdict reaches us via the
-# journal instead of us giving up first.
+# runtime's TURN_TIMEOUT_S (1500s) PLUS its post-CLI terminal work — artifact
+# harvest (can be GBs) and the journal-write retry loop — so the runner's own
+# verdict reaches us via the journal instead of us giving up first.
 REMOTE_CODING_POLL_S = int(os.getenv("REMOTE_CODING_POLL_S", "20"))
-REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "1700"))
+REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "2700"))
 
 # Tenant the workflow session rows belong to. Multi-tenant deployments must set
 # this to the tenant that owns the fleet, or the Cloud Code tab (which scopes
@@ -440,8 +441,11 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
     (journal gone) both mean the turn will never finish — fail fast, don't wait
     out the budget."""
     deadline = time.time() + REMOTE_CODING_TURN_BUDGET_S
+    # Live heartbeats extend the deadline (terminal work is unbounded), but a
+    # wedged-yet-heartbeating runner must not pin this persona forever.
+    hard_stop = time.time() + 2 * REMOTE_CODING_TURN_BUDGET_S
     unknowns = 0
-    while time.time() < deadline:
+    while time.time() < min(deadline, hard_stop):
         time.sleep(REMOTE_CODING_POLL_S)
         try:
             status = _poll_once(client, turn_id)
@@ -477,11 +481,52 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
         unknowns = 0
         # "running" or "transient" (degraded EFS read / torn read racing the
         # journal's tmp+rename): the turn may still be live — keep polling.
-    return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget"}
+        # A provably-live runner (fresh heartbeat / in-memory answer) extends
+        # the deadline: terminal work after the CLI (artifact harvest can be
+        # GBs) has no fixed bound, and expiring against a live runner would
+        # push the persona toward re-running work that already happened. The
+        # runner's own watchdog (TURN_TIMEOUT_S) bounds the CLI; a runner that
+        # dies mid-harvest stops heartbeating and the dead verdict fires.
+        if state == "running":
+            deadline = max(deadline,
+                           time.time() + max(3 * REMOTE_CODING_POLL_S, 120))
+    # Budget spent with no live heartbeat seen recently and no verdict. The
+    # turn may STILL have completed its work — a blind re-run is not safe.
+    # Probe once more, then tell the persona to VERIFY STATE WITHOUT running a
+    # coding turn (a fresh CLI call would race a still-live runner in the same
+    # workspace).
+    try:
+        final = _poll_once(client, turn_id)
+        if final.get("status") == "done":
+            return final
+    except Exception:  # noqa: BLE001
+        pass
+    return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget "
+                     f"with no verdict. Its work may already exist and a runner "
+                     f"may still be finishing. Do NOT re-run the task and do NOT "
+                     f"start another coding call yet: wait a few minutes, then "
+                     f"check the branch on GitHub (get_file_contents / list "
+                     f"commits) to see whether the work landed before deciding "
+                     f"anything",
+            "no_retry_hint": True}
+
+
+_POLL_CLIENT = None
 
 
 def _poll_once(client, turn_id: str) -> dict:
-    return _coding_invoke(client, {
+    """client is the submit client (600s read timeout, sized for cold-clone
+    setup). Polls answer in under a second server-side, so they get their own
+    short-timeout client — otherwise one accepted-but-silent poll connection
+    blocks 600s and blows straight past the loop's hard stop."""
+    global _POLL_CLIENT
+    if _POLL_CLIENT is None:
+        _POLL_CLIENT = boto3.client(
+            "bedrock-agentcore", region_name=REGION,
+            config=BotocoreConfig(read_timeout=30, connect_timeout=10,
+                                  retries={"max_attempts": 0}),
+        )
+    return _coding_invoke(_POLL_CLIENT, {
         "action": "poll",
         "turn_id": turn_id,
         "session_id": _CODING_SESSION["session_id"],
@@ -502,11 +547,21 @@ def _recover_lost_submit(client, payload: dict):
         resubmit; give up with an explicit error (the persona's retry guidance
         stands, and the workspace is preserved).
     Returns a submit-shaped dict, or None when recovery is unsafe."""
-    try:
-        probe = _poll_once(client, payload["turn_id"])
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"[remote-coding] recovery probe failed: {str(e)[:200]}")
-        return None
+    probe = None
+    for attempt in range(5):  # a throttled probe is transient — keep asking
+        try:
+            probe = _poll_once(client, payload["turn_id"])
+            break
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[remote-coding] recovery probe failed "
+                           f"({attempt + 1}/5): {str(e)[:200]}")
+            time.sleep(REMOTE_CODING_POLL_S)
+    if probe is None:
+        # Every probe hit a transient failure — still zero evidence about the
+        # runner. The poll loop tolerates transient errors until its budget, so
+        # hand it the turn_id rather than abandoning (abandoning advises a
+        # fresh-id retry that could race an accepted runner).
+        return {"submitted": True, "turn_id": payload["turn_id"]}
     state = probe.get("status")
     if state in ("running", "done", "transient"):
         return {"submitted": True, "turn_id": payload["turn_id"]}
@@ -514,8 +569,16 @@ def _recover_lost_submit(client, payload: dict):
         try:
             return _coding_invoke(client, payload)  # deduped server-side
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[remote-coding] recovery resubmit failed: {str(e)[:200]}")
-            return None
+            # The resubmit may have been ACCEPTED with only its response lost —
+            # the same ambiguity we're recovering from. Accepted turns journal
+            # before the response is sent, so hand the turn_id to the poll loop
+            # to resolve: running/done if it started, three consecutive
+            # 'unknown's → the retryable death verdict if it never did. Never
+            # abandon here — that advises a fresh-id retry that could race an
+            # accepted runner.
+            logger.warning(f"[remote-coding] recovery resubmit response lost — "
+                           f"polling turn_id anyway: {str(e)[:200]}")
+            return {"submitted": True, "turn_id": payload["turn_id"]}
     # No parseable status → legacy runtime mid-synchronous-turn. Resubmitting
     # would run the task twice; surface the loss instead.
     logger.warning(f"[remote-coding] recovery probe unrecognized: {str(probe)[:200]}")
@@ -627,6 +690,10 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
                 f"Retry this same {cli} call — the session workspace is preserved.")
 
     if result.get("error"):
+        if result.get("no_retry_hint"):
+            # The turn's work may already exist in the workspace — the error
+            # text itself carries the verify-first instructions.
+            return f"ERROR: remote {cli} turn: {result['error']}"
         return (f"ERROR: remote {cli} turn failed: {result['error']}. "
                 f"Retry this same {cli} call — the session workspace is preserved.")
 
@@ -1742,6 +1809,109 @@ def _publish_agent_started(workflow_id: str, agent_id: str):
         logger.warning(f"[{agent_id}] Failed to publish agent.started: {e}")
 
 
+def _publish_operator_delivery(workflow_id: str, agent_id: str, message: str):
+    """Surface a consumed operator message in the agent's output stream so the
+    UI shows the hand-off (rides the same agent.streaming path as model text)."""
+    import time, random, string
+    try:
+        event_id = f"{int(time.time() * 1000)}-opmsg-{''.join(random.choices(string.ascii_lowercase, k=4))}"
+        _ddb_events_client.put_item(
+            TableName=_EVENTS_TABLE,
+            Item={
+                "workflowId": {"S": workflow_id},
+                "eventId": {"S": event_id},
+                "type": {"S": "agent.streaming"},
+                "detail": {"M": {
+                    "agentId": {"S": agent_id},
+                    "type": {"S": "text"},
+                    "content": {"S": f"\n\n> 📨 **Operator:** {message}\n\n"},
+                    "workflowId": {"S": workflow_id},
+                }},
+                "timestamp": {"S": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+            },
+        )
+    except Exception as e:
+        logger.warning(f"[{agent_id}] Failed to publish operator delivery: {e}")
+
+
+class _OperatorMailbox:
+    """Mid-flow operator messaging (Claude Code-style queued messages).
+
+    The UI queues a message via POST /api/workflow/{id}/message, which writes a
+    mailbox item to the events table under eventId "0#mailbox#<agentId>#<id>".
+    This hook checks the mailbox after each tool call and appends any pending
+    messages to that tool's result, so the model reads them on its very next
+    reasoning step — no interruption, no restart. Consumption is an atomic
+    DeleteItem, so a zombie duplicate of a retried agent can't double-deliver.
+
+    Best-effort by design: mailbox failures must never break a run. Messages
+    left unconsumed (agent finished first) are invisible to the UI and get
+    picked up by a retry of the same agent, which is the desired behavior.
+
+    Every tool boundary checks the mailbox — deliberately unthrottled. Any
+    boundary can be the run's LAST one, and skipping it would strand a message
+    the UI already reported as delivered-on-next-tool-call. One Query per tool
+    call is noise next to the model call that follows it.
+    """
+
+    def __init__(self, workflow_id: str, agent_id: str):
+        self._wf = workflow_id
+        self._agent = agent_id
+        self._prefix = f"0#mailbox#{agent_id}#"
+
+    def register_hooks(self, registry, **kwargs):
+        from strands.hooks import AfterToolCallEvent
+        registry.add_callback(AfterToolCallEvent, self._on_tool_result)
+
+    def _consume_pending(self) -> list:
+        resp = _ddb_events_client.query(
+            TableName=_EVENTS_TABLE,
+            KeyConditionExpression="workflowId = :wid AND begins_with(eventId, :pfx)",
+            ExpressionAttributeValues={
+                ":wid": {"S": self._wf},
+                ":pfx": {"S": self._prefix},
+            },
+            Limit=10,
+        )
+        messages = []
+        for item in resp.get("Items", []):
+            deleted = _ddb_events_client.delete_item(
+                TableName=_EVENTS_TABLE,
+                Key={"workflowId": item["workflowId"], "eventId": item["eventId"]},
+                ReturnValues="ALL_OLD",
+            )
+            attrs = deleted.get("Attributes") or {}
+            text = attrs.get("detail", {}).get("M", {}).get("message", {}).get("S", "")
+            if text:
+                messages.append(text)
+        return messages
+
+    def _on_tool_result(self, event):
+        if not self._wf or self._wf == "unknown":
+            return
+        # Only inject into a well-formed ToolResult — if the tool raised, skip
+        # (nothing consumed; the message waits for the next tool boundary).
+        result = getattr(event, "result", None)
+        if not isinstance(result, dict) or not isinstance(result.get("content"), list):
+            return
+        try:
+            messages = self._consume_pending()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{self._agent}] mailbox check failed (non-fatal): {e}")
+            return
+        if not messages:
+            return
+        joined = "\n".join(f"- {m}" for m in messages)
+        result["content"].append({"text": (
+            "\n\n[OPERATOR MESSAGE — the human operator watching this run just "
+            "sent you the following. Read it now, acknowledge it in your next "
+            f"output, and adjust your work accordingly before continuing:\n{joined}\n]"
+        )})
+        logger.info(f"[{self._agent}] delivered {len(messages)} operator message(s) mid-flow")
+        for m in messages:
+            _publish_operator_delivery(self._wf, self._agent, m)
+
+
 def _save_memory_event(agent_id: str, session_id: str, user_text: str, assistant_text: str):
     """Persist the invocation turn to AgentCore Memory (no-op if MEMORY_ID unset).
 
@@ -1947,6 +2117,7 @@ async def agent_invocation(payload, context):
         system_prompt=persona_prompt,
         tools=all_tools,
         callback_handler=None,
+        hooks=[_OperatorMailbox(workflow_id, agent_id)],
     )
 
     # Iterate stream_async — write events to DDB in real-time as they arrive.

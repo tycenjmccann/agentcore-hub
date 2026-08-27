@@ -36,6 +36,8 @@ Usage:
   python3 intervene.py cancel    <workflowId> --reason "..."   (explicit user request ONLY)
   python3 intervene.py start     --title "..." [--description "..."] [--repo owner/name] [--branch main]
   python3 intervene.py file-bug  <workflowId> --title "..." --description "<RCA>" --agent <agentId> [--repo owner/name]
+  python3 intervene.py bugs-off  [--note "..."]   (operator said stop → suppress ALL automated bug filing)
+  python3 intervene.py bugs-on   [--note "..."]
 
 Env: WORKFLOW_API_URL (app base URL), EVENTS_TABLE, TICKETS_TABLE,
      WORKFLOWS_TABLE, TICKET_PROVIDER (dynamodb|jira), AWS_REGION.
@@ -300,6 +302,22 @@ def cmd_start(args):
     print(json.dumps({"action": "start", **result}, indent=2))
 
 
+def cmd_bugs_toggle(args):
+    """Flip the auto-bug-filing kill switch (enforced server-side in /api/bugs).
+    `bugs-off` = automated filings (any request with dedupeLabels) are suppressed;
+    human-relayed bugs are unaffected. Config lives in the events table so no new
+    IAM is needed. Use when the operator says "stop filing bugs"."""
+    value = "off" if args.action == "bugs-off" else "on"
+    dynamodb.Table(EVENTS_TABLE).put_item(Item={
+        "workflowId": "wm-config",
+        "eventId": "auto-file-bugs",
+        "type": "wm.config",
+        "timestamp": now_iso(),
+        "detail": {"value": value, "by": "workflow-manager", "note": args.note or ""},
+    })
+    print(json.dumps({"action": args.action, "auto_file_bugs": value}, indent=2))
+
+
 def cmd_file_bug(args):
     """File a top-level Bug that auto-fires the bug-fix pipeline (Jira webhook →
     bootstrapBugWorkflow). This is the crash-rca skill's output path: the RCA
@@ -444,6 +462,11 @@ def main():
     p.add_argument("--repo", default="")
     p.add_argument("--branch", default="")
     p.set_defaults(func=cmd_start)
+
+    for name in ("bugs-off", "bugs-on"):
+        p = sub.add_parser(name)
+        p.add_argument("--note", default="")
+        p.set_defaults(func=cmd_bugs_toggle, action=name)
 
     p = sub.add_parser("file-bug")
     p.add_argument("workflow_id")

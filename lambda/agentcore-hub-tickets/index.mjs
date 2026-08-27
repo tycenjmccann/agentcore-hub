@@ -349,7 +349,9 @@ async function editIssue(args) {
 }
 
 async function searchIssues(args) {
-  const { jql, max_results } = args;
+  // The runtime tool sends `query`; accept `jql` too so both providers match.
+  const { query, jql: jqlArg, max_results } = args;
+  const jql = query || jqlArg;
   const limit = max_results || 50;
 
   // Simple JQL parsing — supports common patterns:
