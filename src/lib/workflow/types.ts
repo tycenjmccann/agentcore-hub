@@ -53,7 +53,7 @@ export interface Artifact {
 
 // ─── Agent Definitions ───────────────────────────────────────────────────────
 
-export type AgentPhase = "requirements" | "design" | "development" | "verification" | "review";
+export type AgentPhase = "requirements" | "design" | "development" | "verification" | "review" | "ship";
 
 // ─── Workflow State ──────────────────────────────────────────────────────────
 
@@ -64,6 +64,7 @@ export type WorkflowPhase =
   | "development"
   | "verification"
   | "review"
+  | "ship"
   | "complete"
   | "error"
   | "cancelled";

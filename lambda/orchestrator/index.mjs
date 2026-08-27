@@ -76,6 +76,7 @@ const FALLBACK_ROSTER = [
   { agentId: "agentcore_hub_frontend_dev", phase: "development" },
   { agentId: "agentcore_hub_qa_verifier", phase: "verification" },
   { agentId: "agentcore_hub_ci_agent", phase: "review" },
+  { agentId: "agentcore_hub_release_manager", phase: "ship" },
 ];
 
 let _agentRoster = null;
@@ -1366,9 +1367,12 @@ async function completeWorkflow(workflow) {
   workflow.phase = "complete";
   workflow.completedAt = new Date().toISOString();
 
-  // Create unified PR if feature branch exists
+  // Create unified PR if feature branch exists — unless the def has a "ship"
+  // phase: there the release manager owns the PR, and by completion time the
+  // branch is already merged (create_pr here would 422 "no commits between").
+  const defHasShip = (getWorkflowDef(workflow?.workflowDefId).completionRequiresAgentPhases || []).includes("ship");
   let prUrl = "";
-  if (workflow.featureBranch && workflow.repoConfig) {
+  if (!defHasShip && workflow.featureBranch && workflow.repoConfig) {
     try {
       const { owner, repo } = parseRepoUrl(workflow.repoConfig);
       const baseBranch = workflow.repoConfig.repos?.[0]?.defaultBranch || "main";
@@ -2108,7 +2112,7 @@ async function initManifestIfNeeded(workflow) {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     repoConfig: workflow.repoConfig,
-    phases: { intake: [], requirements: [], design: [], development: [], verification: [] },
+    phases: { intake: [], requirements: [], design: [], development: [], verification: [], ship: [] },
   };
 
   // Seed intake entries from workflow input sources (if any)
@@ -2162,7 +2166,7 @@ async function updateManifestSession(workflowId, agentId, sessionInfo) {
 function buildManifestContext(manifest, agentPhase, workflow, ticket) {
   if (!manifest) return "";
 
-  const phaseOrder = ["intake", "requirements", "design", "development", "verification"];
+  const phaseOrder = ["intake", "requirements", "design", "development", "verification", "ship"];
   const currentIdx = phaseOrder.indexOf(agentPhase);
   if (currentIdx < 0) return "";
 

@@ -43,6 +43,10 @@ so you see the surrounding code the change interacts with. An empty diff for a
 dev that reported completion is itself a finding — do not silently pass it.
 
 ### Step 3: Adversarial Analysis
+If the target repo has a root `REVIEW.md`, read it FIRST and apply its
+repo-specific checks on top of everything below — it encodes the failure
+modes that previously escaped review in this repo.
+
 For every changed hunk, actively try to break it. Per finding, write down the
 concrete scenario that triggers it:
 - **Races / ordering** — reads a value right after writing it? two callers on the same row? check-then-act gaps?

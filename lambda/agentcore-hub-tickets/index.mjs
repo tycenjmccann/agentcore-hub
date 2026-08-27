@@ -63,6 +63,7 @@ const FALLBACK_AGENTS = new Set([
   "agentcore_hub_code_reviewer",
   "agentcore_hub_qa_verifier",
   "agentcore_hub_ci_agent",
+  "agentcore_hub_release_manager",
 ]);
 
 let VALID_AGENTS = null;
@@ -647,6 +648,7 @@ async function lookupUser(args) {
     { id: "agentcore_hub_code_reviewer", name: "Code Reviewer", role: "review" },
     { id: "agentcore_hub_qa_verifier", name: "QA Verifier", role: "verification" },
     { id: "agentcore_hub_ci_agent", name: "CI Agent", role: "review" },
+    { id: "agentcore_hub_release_manager", name: "Release Manager", role: "ship" },
   ];
 
   const matches = agents.filter(

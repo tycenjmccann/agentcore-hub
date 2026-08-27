@@ -156,6 +156,7 @@ const PHASE_MAP = {
   "agentcore_hub_frontend_dev": "development", "agentcore_hub_backend_dev": "development",
   "agentcore_hub_api_dev": "development",
   "agentcore_hub_qa_verifier": "verification", "agentcore_hub_ci_agent": "verification",
+  "agentcore_hub_release_manager": "ship",
 };
 
 async function updateManifest(workflowId, agentId, entries) {
@@ -170,7 +171,7 @@ async function updateManifest(workflowId, agentId, entries) {
       workflowId,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      phases: { intake: [], requirements: [], design: [], development: [], verification: [] },
+      phases: { intake: [], requirements: [], design: [], development: [], verification: [], ship: [] },
     };
   }
 
