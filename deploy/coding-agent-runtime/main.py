@@ -164,7 +164,19 @@ def _remember_session(claude_session_id: str | None, repo: str | None) -> None:
     try:
         os.makedirs(WORKSPACE_ROOT, exist_ok=True)
         m = _load_session_map()
-        m[claude_session_id] = {"repo": repo}
+        # Persist the repo credential-free. Accepted trade-off: a non-GitHub
+        # origin whose ONLY credential lived in this URL re-clones
+        # unauthenticated on resume; GitHub origins are unaffected because the
+        # global insteadOf rewrite from GITHUB_PAT re-supplies auth — same
+        # precedent as the mirror cache, which is fed the scrubbed URL. The cwd
+        # slug is unaffected (_slugify_repo ignores userinfo).
+        m[claude_session_id] = {"repo": _scrub_git_url(repo) if repo else repo}
+        # Lazy heal: maps written before this scrub existed can still carry
+        # credentialed URLs on EFS — scrub every entry on the way back out.
+        # Malformed entries (wrong shape/type) are left untouched.
+        for entry in m.values():
+            if isinstance(entry, dict) and isinstance(entry.get("repo"), str):
+                entry["repo"] = _scrub_git_url(entry["repo"])
         with open(SESSION_MAP, "w") as f:
             json.dump(m, f)
     except OSError as exc:
@@ -2356,6 +2368,11 @@ async def invocations(request: Request):
     # the same cwd Claude Code scoped the session to) when the caller omits it.
     if claude_session_id and not repo:
         repo = _load_session_map().get(claude_session_id, {}).get("repo")
+        # Defense-in-depth: a map entry written before persist-time scrubbing
+        # (and not yet lazily healed) may still carry a credentialed URL — never
+        # let one flow into turn_start logging or _ensure_workspace.
+        if isinstance(repo, str):
+            repo = _scrub_git_url(repo)
 
     logger.info("turn_start", extra=redact(
         {"cli": cli, "repo": _scrub_git_url(repo) if repo else repo, "resume": bool(claude_session_id),
