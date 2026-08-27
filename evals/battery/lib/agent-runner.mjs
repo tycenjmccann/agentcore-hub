@@ -7,6 +7,7 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createRegistry } from "./registry.mjs";
+import { backoffDelayMs, createRetryBudget, linkAbort, sleep } from "./retry.mjs";
 
 // Mirrors CODING_MODEL_TIERS in deploy/runtime-agent/main.py (keep in sync;
 // the battery deliberately exposes only haiku/sonnet/opus — no fable tier).
@@ -25,6 +26,10 @@ export const PRICING_PER_MTOK = Object.freeze({
 });
 
 export const MAX_TURNS = 24;
+// FR-10: a single transport retry per case by default (never per score), with
+// jittered backoff. Bounded in attempts AND in elapsed time via the per-case
+// retry budget below; the runner can widen it with BATTERY_MAX_TRANSPORT_RETRIES.
+export const MAX_TRANSPORT_RETRIES = 1;
 
 export function usageCostUsd(tier, usage) {
   const price = PRICING_PER_MTOK[tier];
@@ -33,13 +38,24 @@ export function usageCostUsd(tier, usage) {
 
 // FR-10 retry classifier: typed transport errors only — throttling, 5xx,
 // connection reset/timeout. Score variance is NEVER a retry reason.
+// Name and HTTP status are tested INDEPENDENTLY: throttling errors carry
+// httpStatusCode 400, so a combined `status || name` string would hide the
+// name and misclassify throttling as non-retryable (TEAM-3352 finding 1D).
+export function isThrottlingOrServerError(err) {
+  const name = String(err?.name || "");
+  const status = err?.$metadata?.httpStatusCode;
+  return (
+    /Throttling|TooManyRequests|ServiceUnavailable/i.test(name) ||
+    (typeof status === "number" && status >= 500)
+  );
+}
+
 export function isRetryableTransportError(err) {
   const name = err?.name || "";
   const code = err?.code || err?.cause?.code || "";
-  const status = err?.$metadata?.httpStatusCode;
   return (
-    /Throttling|TooManyRequests|ServiceUnavailable|InternalServer|ModelError/i.test(name) ||
-    (typeof status === "number" && status >= 500) ||
+    isThrottlingOrServerError(err) ||
+    /InternalServer|ModelError/i.test(name) ||
     /ECONNRESET|ETIMEDOUT|EPIPE|ECONNREFUSED|TimeoutError/i.test(`${code} ${name}`)
   );
 }
@@ -67,7 +83,24 @@ export function buildMessages(transcript, taskPrompt) {
   return messages;
 }
 
-async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxTurns }) {
+// One Converse turn with the per-case retry budget: a retryable transport
+// failure retries THIS turn (the failed call produced nothing, so the
+// conversation state is untouched) after a jittered backoff — never a restart
+// of the whole case from turn 0, which under throttling only re-adds the load
+// that caused the failure.
+async function converseTurn({ converse, params, signal, retryBudget }) {
+  for (let retry = 1; ; retry++) {
+    try {
+      return await converse(params, { signal });
+    } catch (err) {
+      if (signal?.aborted || !isRetryableTransportError(err) || !retryBudget.tryConsume()) throw err;
+      await sleep(backoffDelayMs(retry), signal);
+      if (signal?.aborted) throw err;
+    }
+  }
+}
+
+async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxTurns, retryBudget }) {
   const workspaceDir = mkdtempSync(join(tmpdir(), `battery-${caseDef.id}-`));
   try {
     const registry = createRegistry({ caseDef, repoRoot, workspaceDir });
@@ -81,16 +114,18 @@ async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxT
     let finalText = "";
 
     for (let turn = 0; turn < maxTurns; turn++) {
-      const response = await converse(
-        {
+      const response = await converseTurn({
+        converse,
+        params: {
           modelId,
           system,
           messages,
           toolConfig: { tools: registry.toolSpecs },
           inferenceConfig: { maxTokens: 4096 },
         },
-        { signal }
-      );
+        signal,
+        retryBudget,
+      });
       usage.inputTokens += response.usage?.inputTokens || 0;
       usage.outputTokens += response.usage?.outputTokens || 0;
       const message = response.output?.message || { role: "assistant", content: [] };
@@ -130,65 +165,73 @@ async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxT
  * Run one case end to end. Returns:
  * { id, status: completed|errored|timed_out|failed_forbidden_tool, attempt,
  *   trajectory, messages, usage, finalText, forbiddenHits, error?, sessionId }
+ *
+ * `attempt` = transport attempts consumed (1 + retries used).
+ * `signal` (optional) is the runner's end-to-end case deadline / whole-run
+ * watchdog — an abort from it cuts through in-flight turns and backoff sleeps
+ * and reports as timed_out with the deadline's own reason.
  */
-export async function runCase({ caseDef, repoRoot, runId, converse, maxTurns = MAX_TURNS }) {
+export async function runCase({
+  caseDef,
+  repoRoot,
+  runId,
+  converse,
+  maxTurns = MAX_TURNS,
+  signal,
+  maxTransportRetries = MAX_TRANSPORT_RETRIES,
+}) {
   const sessionId = `battery-${runId}-${caseDef.id}`;
   const modelId = MODEL_TIERS[caseDef.modelTier];
-  let attempt = 0;
-  let lastError = null;
-
-  while (attempt < 2) {
-    attempt += 1;
-    const watchdog = new AbortController();
-    const timer = setTimeout(() => watchdog.abort(new Error("case timeout")), caseDef.timeoutSeconds * 1000);
-    let producedOutput = false;
-    try {
-      const loop = await converseLoop({
-        caseDef,
-        repoRoot,
-        converse: async (params, opts) => {
-          const r = await converse(params, opts);
-          producedOutput = true;
-          return r;
-        },
-        modelId,
-        signal: watchdog.signal,
-        maxTurns,
-      });
-      clearTimeout(timer);
-      const forbidden = new Set(caseDef.referenceInputs?.forbiddenTools || []);
-      const forbiddenHits = loop.trajectory.filter((t) => forbidden.has(t.tool)).map((t) => t.tool);
-      const status = forbiddenHits.length > 0 ? "failed_forbidden_tool" : "completed";
-      return { id: caseDef.id, status, attempt, sessionId, forbiddenHits, ...loop };
-    } catch (err) {
-      clearTimeout(timer);
-      if (watchdog.signal.aborted) {
-        // The per-case watchdog fired — a real timeout, never retried.
-        return { id: caseDef.id, status: "timed_out", attempt, sessionId, error: `timed out after ${caseDef.timeoutSeconds}s`, forbiddenHits: [], trajectory: [], usage: { inputTokens: 0, outputTokens: 0 } };
-      }
-      lastError = err;
-      const retryable = isRetryableTransportError(err) && (!producedOutput || /Throttling|5\d\d/.test(String(err?.$metadata?.httpStatusCode || err?.name)));
-      if (attempt < 2 && retryable) continue;
+  const watchdog = new AbortController();
+  const unlink = linkAbort(signal, watchdog);
+  const timer = setTimeout(
+    () => watchdog.abort(new Error(`timed out after ${caseDef.timeoutSeconds}s`)),
+    caseDef.timeoutSeconds * 1000
+  );
+  // Retries are bounded in attempts AND in elapsed time: the budget's clock is
+  // the same window the agent-loop watchdog enforces.
+  const retryBudget = createRetryBudget({
+    maxRetries: maxTransportRetries,
+    maxElapsedMs: caseDef.timeoutSeconds * 1000,
+  });
+  const empty = { forbiddenHits: [], trajectory: [], usage: { inputTokens: 0, outputTokens: 0 } };
+  try {
+    const loop = await converseLoop({
+      caseDef,
+      repoRoot,
+      converse,
+      modelId,
+      signal: watchdog.signal,
+      maxTurns,
+      retryBudget,
+    });
+    const forbidden = new Set(caseDef.referenceInputs?.forbiddenTools || []);
+    const forbiddenHits = loop.trajectory.filter((t) => forbidden.has(t.tool)).map((t) => t.tool);
+    const status = forbiddenHits.length > 0 ? "failed_forbidden_tool" : "completed";
+    return { id: caseDef.id, status, attempt: retryBudget.used + 1, sessionId, forbiddenHits, ...loop };
+  } catch (err) {
+    if (watchdog.signal.aborted) {
+      // Watchdog or external deadline fired — a real timeout, never retried.
+      const reason = watchdog.signal.reason;
       return {
         id: caseDef.id,
-        status: "errored",
-        attempt,
+        status: "timed_out",
+        attempt: retryBudget.used + 1,
         sessionId,
-        error: `${err.name || "Error"}: ${err.message}`,
-        forbiddenHits: [],
-        trajectory: [],
-        usage: { inputTokens: 0, outputTokens: 0 },
+        error: reason?.message || `timed out after ${caseDef.timeoutSeconds}s`,
+        ...empty,
       };
     }
+    return {
+      id: caseDef.id,
+      status: "errored",
+      attempt: retryBudget.used + 1,
+      sessionId,
+      error: `${err.name || "Error"}: ${err.message}`,
+      ...empty,
+    };
+  } finally {
+    clearTimeout(timer);
+    unlink();
   }
-  return {
-    id: caseDef.id,
-    status: "errored",
-    attempt,
-    sessionId,
-    error: `${lastError?.name || "Error"}: ${lastError?.message}`,
-    forbiddenHits: [],
-    trajectory: [],
-    usage: { inputTokens: 0, outputTokens: 0 },
-  };
 }

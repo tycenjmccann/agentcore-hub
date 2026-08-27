@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { normalizeScore } from "./thresholds.mjs";
 import { isRetryableTransportError } from "./agent-runner.mjs";
+import { backoffDelayMs, sleep } from "./retry.mjs";
 
 export const SCORING_BACKEND = "local-judge";
 // Same judge the online eval configs use (deploy/evaluations/
@@ -78,11 +79,24 @@ export function builtinInstruction(name) {
 
 // ─── Transport ───────────────────────────────────────────────────────────────
 
+// HTTP backstop (TEAM-3352): with the SDK defaults (requestTimeout 0 = never)
+// a single stalled connection parks a pool slot forever, invisibly. These caps
+// guarantee every Converse call settles even if an abort signal is lost.
+export const HTTP_CONNECTION_TIMEOUT_MS = 5_000;
+export const HTTP_REQUEST_TIMEOUT_MS = 120_000;
+export const SDK_MAX_ATTEMPTS = 3; // explicit, so quota changes can't widen it silently
+
 // Real Bedrock transport, created lazily so --dry-run never constructs a
 // client. Shared by agent-runner (case model) and the judge.
 export async function createConverseTransport() {
   const { BedrockRuntimeClient, ConverseCommand } = await import("@aws-sdk/client-bedrock-runtime");
-  const client = new BedrockRuntimeClient({});
+  const client = new BedrockRuntimeClient({
+    maxAttempts: SDK_MAX_ATTEMPTS,
+    requestHandler: {
+      connectionTimeout: HTTP_CONNECTION_TIMEOUT_MS,
+      requestTimeout: HTTP_REQUEST_TIMEOUT_MS,
+    },
+  });
   return async (params, { signal } = {}) => client.send(new ConverseCommand(params), { abortSignal: signal });
 }
 
@@ -179,28 +193,39 @@ export function parseJudgeResponse(response) {
  * Score a completed case run with every evaluator it declares.
  * Any evaluator failing after its single transport retry ⇒ the whole case is
  * `unscored` ⇒ gate FAIL (a partial score set is never a silent pass).
+ *
+ * `signal` (optional) is the case's end-to-end deadline: it aborts in-flight
+ * judge calls and backoff sleeps, and once fired the remaining evaluators are
+ * never attempted — the case reports `unscored` with the deadline as reason.
  */
-export async function scoreCase({ caseDef, runResult, transport, repoRoot }) {
+export async function scoreCase({ caseDef, runResult, transport, repoRoot, signal }) {
   /** @type {Record<string, number>} */
   const scores = {};
   /** @type {Record<string, any>} */
   const details = {};
   const usage = { inputTokens: 0, outputTokens: 0 };
+  const deadlineError = () =>
+    new Error(signal?.reason?.message || "case deadline exceeded during judge scoring");
   for (const evaluator of caseDef.evaluators) {
     const request = buildJudgeRequest({ evaluator, caseDef, runResult, repoRoot });
     let lastError = null;
     let verdict = null;
     let attemptUsed = 0;
     for (let attempt = 1; attempt <= 2 && !verdict; attempt++) {
+      if (signal?.aborted) {
+        lastError = deadlineError();
+        break;
+      }
       attemptUsed = attempt;
       try {
-        const response = await transport(request, {});
+        const response = await transport(request, { signal });
         usage.inputTokens += response.usage?.inputTokens || 0;
         usage.outputTokens += response.usage?.outputTokens || 0;
         verdict = parseJudgeResponse(response);
       } catch (err) {
-        lastError = err;
-        if (!(attempt < 2 && isRetryableTransportError(err))) break;
+        lastError = signal?.aborted ? deadlineError() : err;
+        if (signal?.aborted || !(attempt < 2 && isRetryableTransportError(err))) break;
+        await sleep(backoffDelayMs(attempt), signal);
       }
     }
     if (!verdict) {

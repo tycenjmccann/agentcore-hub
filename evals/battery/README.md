@@ -103,6 +103,21 @@ node evals/battery/run-battery.mjs --baseline-mode --repeat 3 --out /tmp/baselin
 `check-summary.md` (the text posted to the PR check) is written next to
 whatever `--results` path you give.
 
+### Runtime limits & progress output (TEAM-3352)
+
+The runner prints a start line (`▶ case-id`), an agent-loop→scoring transition
+line (`⚖`), and a completion line (with elapsed seconds) per case, and appends
+each finished case to `battery-progress.jsonl` next to the results file — a
+killed run still leaves per-case evidence. Every Bedrock path is bounded; env
+knobs (all optional):
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `BATTERY_BEDROCK_CONCURRENCY` | `3` | Global cap on in-flight Converse calls (agent turns + judge calls combined) across all case workers. |
+| `BATTERY_CASE_DEADLINE_SECONDS` | `timeoutSeconds + 60 × evaluators` | End-to-end per-case deadline covering the agent loop AND judge scoring; firing during scoring ⇒ `unscored` (gate FAIL), suite continues. |
+| `BATTERY_RUN_DEADLINE_SECONDS` | `780` (13 min) | Whole-run watchdog: aborts outstanding work, marks unfinished cases `timed_out`, and still writes results + check summary (FAIL). |
+| `BATTERY_MAX_TRANSPORT_RETRIES` | `1` | Per-case transport retry budget (jittered backoff, elapsed-capped); retries re-run the failed turn, never the whole case. |
+
 ## Scoring backend
 
 `scoringBackend: "local-judge"` — each evaluator is scored by **Claude Opus 4.7

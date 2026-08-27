@@ -40,6 +40,7 @@ export function buildResults({
       deltas: suite.deltaRows.filter((r) => r.case === c.id),
       forbiddenHits: c.forbiddenHits || [],
       error: c.error ?? null,
+      runtimeSeconds: round2(c.runtimeSeconds ?? null),
       informational: suite.informationalCases.includes(c.id),
     })),
     summary: suite.summary,

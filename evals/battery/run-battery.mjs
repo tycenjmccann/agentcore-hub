@@ -10,17 +10,25 @@
 // from the BASE REF, never from the PR checkout (B2), spend is capped live at
 // maxRunUsd (B5), and a bootstrap baseline (B1) or a suite with no
 // baseline-compared case (B3) can never produce a PASS.
+//
+// Runtime reliability (TEAM-3352): per-case progress lines + an incremental
+// battery-progress.jsonl, an end-to-end per-case deadline, a whole-run
+// watchdog that still writes results on abort, and a global Bedrock
+// concurrency gate. Env knobs: BATTERY_BEDROCK_CONCURRENCY,
+// BATTERY_RUN_DEADLINE_SECONDS, BATTERY_CASE_DEADLINE_SECONDS,
+// BATTERY_MAX_TRANSPORT_RETRIES.
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { preflight, resolveGateConfig, SCORING_BACKEND as CASES_BACKEND } from "./lib/cases.mjs";
 import { evaluateSuite } from "./lib/thresholds.mjs";
 import { createRegistry, FORBIDDEN_TOOLS } from "./lib/registry.mjs";
-import { runCase, MODEL_TIERS } from "./lib/agent-runner.mjs";
+import { runCase, MODEL_TIERS, MAX_TRANSPORT_RETRIES } from "./lib/agent-runner.mjs";
 import { createSpendLedger } from "./lib/spend.mjs";
 import { createConverseTransport, scoreCase, SCORING_BACKEND } from "./lib/scoring.mjs";
+import { createSemaphore, linkAbort } from "./lib/retry.mjs";
 import { buildResults, renderCheckSummary } from "./lib/report.mjs";
 import "./lib/otel.mjs"; // import-time contract check vs schema/otel-eval-attributes.json
 
@@ -28,6 +36,28 @@ const BATTERY_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(BATTERY_DIR, "..", "..");
 const CANONICAL_BASELINE = resolve(BATTERY_DIR, "baseline.json");
 const POOL_SIZE = 4;
+
+// Runtime-reliability knobs (TEAM-3352). Env overrides exist so CI can tune
+// them without a code change; every default keeps the run bounded.
+const envInt = (name, fallback) => {
+  const v = parseInt(process.env[name] ?? "", 10);
+  return Number.isInteger(v) && v > 0 ? v : fallback;
+};
+// Global cap on in-flight Bedrock calls (agent turns + judge calls combined),
+// so POOL_SIZE case workers cannot stampede the model quotas.
+const BEDROCK_CONCURRENCY = envInt("BATTERY_BEDROCK_CONCURRENCY", 3);
+// Whole-run watchdog: past this, outstanding work is aborted, unfinished cases
+// report timed_out, and the results/summary files are STILL written (FAIL).
+const RUN_DEADLINE_SECONDS = envInt("BATTERY_RUN_DEADLINE_SECONDS", 13 * 60);
+// End-to-end per-case deadline (agent loop + judge scoring). Default derives
+// from the case's own agent timeout plus a judge budget per evaluator.
+const CASE_DEADLINE_SECONDS = envInt("BATTERY_CASE_DEADLINE_SECONDS", 0) || null;
+const JUDGE_BUDGET_SECONDS_PER_EVALUATOR = 60;
+const MAX_CASE_TRANSPORT_RETRIES = envInt("BATTERY_MAX_TRANSPORT_RETRIES", MAX_TRANSPORT_RETRIES);
+
+const caseDeadlineSeconds = (def) =>
+  CASE_DEADLINE_SECONDS ?? def.timeoutSeconds + JUDGE_BUDGET_SECONDS_PER_EVALUATOR * def.evaluators.length;
+const clock = () => new Date().toISOString().slice(11, 19);
 
 // ─── Flags ───────────────────────────────────────────────────────────────────
 
@@ -137,14 +167,22 @@ function gateNewCaseIds({ gate, baseline, selected }) {
 
 // ─── Concurrency pool ────────────────────────────────────────────────────────
 
-async function runPool(items, size, worker) {
+// An unexpected worker exception must cost only that item (mapped through
+// `onWorkerError`), never reject the whole Promise.all and abandon the run
+// with no results file.
+async function runPool(items, size, worker, onWorkerError) {
   const results = new Array(items.length);
   let next = 0;
   await Promise.all(
     Array.from({ length: Math.min(size, items.length) }, async () => {
       while (next < items.length) {
         const i = next++;
-        results[i] = await worker(items[i], i);
+        try {
+          results[i] = await worker(items[i], i);
+        } catch (err) {
+          if (!onWorkerError) throw err;
+          results[i] = onWorkerError(items[i], err);
+        }
       }
     })
   );
@@ -252,7 +290,35 @@ async function main() {
     process.exit(2);
   }
 
-  const transport = await createConverseTransport();
+  // Results/progress paths are fixed BEFORE any case runs: completed cases are
+  // appended to battery-progress.jsonl one flushed line at a time, so a killed
+  // or deadline-aborted run still leaves per-case evidence on disk.
+  const resultsPath = resolve(flags.results || join(BATTERY_DIR, "battery-results.json"));
+  const resultsDir = flags.baselineMode ? dirname(resolve(flags.out)) : dirname(resultsPath);
+  const progressPath = join(resultsDir, "battery-progress.jsonl");
+  writeFileSync(progressPath, "");
+  const progress = (record) => appendFileSync(progressPath, JSON.stringify(record) + "\n");
+
+  // Whole-run watchdog: when it fires, every case deadline linked to it aborts,
+  // in-flight cases report timed_out/unscored, unstarted cases report timed_out
+  // immediately — and the suite still completes and writes its results (FAIL).
+  const runWatchdog = new AbortController();
+  const runTimer = setTimeout(
+    () => runWatchdog.abort(new Error(`run deadline of ${RUN_DEADLINE_SECONDS}s exceeded`)),
+    RUN_DEADLINE_SECONDS * 1000
+  );
+  runWatchdog.signal.addEventListener(
+    "abort",
+    () => console.error(`[${clock()}] RUN DEADLINE — aborting outstanding cases (${RUN_DEADLINE_SECONDS}s)`),
+    { once: true }
+  );
+
+  // Global Bedrock gate: at most BEDROCK_CONCURRENCY Converse calls in flight
+  // across ALL case workers (agent turns + judge calls), so the pool of
+  // POOL_SIZE cannot stampede the model quotas into throttling.
+  const bedrockGate = createSemaphore(BEDROCK_CONCURRENCY);
+  const rawTransport = await createConverseTransport();
+  const transport = (params, opts) => bedrockGate.run(() => rawTransport(params, opts));
   // B5: maxRunUsd is a live ceiling, not a post-hoc verdict check. The ledger
   // meters every Converse response and refuses the next call once the ceiling
   // is up, so spend is bounded by ~maxRunUsd + the turns already in flight.
@@ -260,64 +326,121 @@ async function main() {
   const spendCeilingUsd = flags.baselineMode ? thresholds.maxRunUsd * flags.repeat : thresholds.maxRunUsd;
   const ledger = createSpendLedger({ maxUsd: spendCeilingUsd });
   console.log(`Spend ceiling: $${spendCeilingUsd.toFixed(2)} (maxRunUsd from ${gate ? `${gate.baseRef} ` : "PR-head "}thresholds.json)`);
+  console.log(
+    `Limits: bedrock concurrency ${BEDROCK_CONCURRENCY}, run deadline ${RUN_DEADLINE_SECONDS}s, ` +
+      `case deadline ${CASE_DEADLINE_SECONDS ? `${CASE_DEADLINE_SECONDS}s` : `timeoutSeconds + ${JUDGE_BUDGET_SECONDS_PER_EVALUATOR}s/evaluator`}, ` +
+      `transport retries/case ${MAX_CASE_TRANSPORT_RETRIES}. Progress: ${progressPath}`
+  );
+
+  const emptyResult = (def, status, error, attempt = 0) => ({
+    id: def.id,
+    status,
+    attempt,
+    sessionId: null,
+    forbiddenHits: [],
+    trajectory: [],
+    usage: { inputTokens: 0, outputTokens: 0 },
+    scores: {},
+    details: {},
+    error,
+    modelTier: def.modelTier,
+    evaluator_floors: def.evaluator_floors,
+  });
+
+  function finishCase(def, result, startedAtMs) {
+    const runtimeSeconds = Math.round((Date.now() - startedAtMs) / 10) / 100;
+    const final = { ...result, runtimeSeconds };
+    console.log(
+      `[${clock()}]   ${def.id}: ${final.status}${final.error ? ` (${final.error})` : ""} ` +
+        `[attempt ${final.attempt}] (${runtimeSeconds}s)`
+    );
+    progress({
+      ts: new Date().toISOString(),
+      runId,
+      id: def.id,
+      status: final.status,
+      attempt: final.attempt,
+      modelTier: def.modelTier,
+      runtimeSeconds,
+      scores: final.scores,
+      error: final.error ?? null,
+    });
+    return final;
+  }
 
   async function executeAndScore(def) {
-    // Never START new work past the ceiling — unstarted cases are skipped, and
-    // a skipped case fails the gate.
+    const startedAtMs = Date.now();
+    // Never START new work past the run deadline or the spend ceiling —
+    // unstarted cases fail the gate either way.
+    if (runWatchdog.signal.aborted) {
+      const error = `${runWatchdog.signal.reason?.message || "run deadline exceeded"} — case '${def.id}' was not started`;
+      return finishCase(def, emptyResult(def, "timed_out", error), startedAtMs);
+    }
     if (ledger.exceeded) {
       ledger.noteAborted(def.id);
       const error = ledger.message(`case '${def.id}' was not started`);
-      console.log(`  ${def.id}: skipped (${error})`);
-      return {
-        id: def.id,
-        status: "skipped",
-        attempt: 0,
-        sessionId: null,
-        forbiddenHits: [],
-        trajectory: [],
-        usage: { inputTokens: 0, outputTokens: 0 },
-        scores: {},
-        details: {},
-        error,
-        modelTier: def.modelTier,
-        evaluator_floors: def.evaluator_floors,
-      };
+      return finishCase(def, emptyResult(def, "skipped", error), startedAtMs);
     }
-    const run = await runCase({
-      caseDef: def,
-      repoRoot: REPO_ROOT,
-      runId,
-      converse: ledger.meter(transport, def.modelTier, def.id),
-    });
-    let scores = {};
-    let details = {};
-    let status = run.status;
-    let error = run.error;
-    if (run.status === "completed") {
-      const scored = await scoreCase({
+
+    // One deadline per case, covering the agent loop AND all judge scoring;
+    // the whole-run watchdog aborts through it.
+    const deadlineSeconds = caseDeadlineSeconds(def);
+    const caseWatchdog = new AbortController();
+    const caseTimer = setTimeout(
+      () => caseWatchdog.abort(new Error(`case deadline of ${deadlineSeconds}s exceeded`)),
+      deadlineSeconds * 1000
+    );
+    const unlink = linkAbort(runWatchdog.signal, caseWatchdog);
+    try {
+      console.log(`[${clock()}] ▶ ${def.id} (${def.modelTier}, attempt 1)`);
+      const run = await runCase({
         caseDef: def,
-        runResult: run,
-        transport: ledger.meter(transport, "judge", def.id),
         repoRoot: REPO_ROOT,
+        runId,
+        converse: ledger.meter(transport, def.modelTier, def.id),
+        signal: caseWatchdog.signal,
+        maxTransportRetries: MAX_CASE_TRANSPORT_RETRIES,
       });
-      status = scored.status; // 'scored' | 'unscored'
-      scores = scored.scores;
-      details = scored.details;
-      error = scored.error || error;
-    } else if (run.status === "failed_forbidden_tool") {
-      error = `forbidden tool(s) called: ${run.forbiddenHits.join(", ")}`;
+      let scores = {};
+      let details = {};
+      let status = run.status;
+      let error = run.error;
+      if (run.status === "completed") {
+        const agentSeconds = Math.round((Date.now() - startedAtMs) / 10) / 100;
+        console.log(
+          `[${clock()}] ⚖ ${def.id}: agent loop done in ${agentSeconds}s (${run.turns} turn(s)) — ` +
+            `scoring ${def.evaluators.length} evaluator(s)`
+        );
+        const scored = await scoreCase({
+          caseDef: def,
+          runResult: run,
+          transport: ledger.meter(transport, "judge", def.id),
+          repoRoot: REPO_ROOT,
+          signal: caseWatchdog.signal,
+        });
+        status = scored.status; // 'scored' | 'unscored'
+        scores = scored.scores;
+        details = scored.details;
+        error = scored.error || error;
+      } else if (run.status === "failed_forbidden_tool") {
+        error = `forbidden tool(s) called: ${run.forbiddenHits.join(", ")}`;
+      }
+      return finishCase(
+        def,
+        { ...run, status, scores, details, error, modelTier: def.modelTier, evaluator_floors: def.evaluator_floors },
+        startedAtMs
+      );
+    } catch (err) {
+      // A worker bug must cost exactly one case, never the suite.
+      return finishCase(def, emptyResult(def, "errored", `unexpected runner error: ${err.message}`), startedAtMs);
+    } finally {
+      clearTimeout(caseTimer);
+      unlink();
     }
-    console.log(`  ${def.id}: ${status}${error ? ` (${error})` : ""} [attempt ${run.attempt}]`);
-    return {
-      ...run,
-      status,
-      scores,
-      details,
-      error,
-      modelTier: def.modelTier,
-      evaluator_floors: def.evaluator_floors,
-    };
   }
+
+  const onWorkerError = (def, err) =>
+    finishCase(def, emptyResult(def, "errored", `runner worker crashed: ${err.message}`), Date.now());
 
   if (flags.baselineMode) {
     const outPath = resolve(flags.out);
@@ -328,7 +451,12 @@ async function main() {
     }
     console.log(`Baseline mode: ${selected.length} case(s) × ${flags.repeat} run(s) → ${outPath}`);
     const runs = selected.flatMap((def) => Array.from({ length: flags.repeat }, () => def));
-    const results = await runPool(runs, POOL_SIZE, executeAndScore);
+    const results = await runPool(runs, POOL_SIZE, executeAndScore, onWorkerError);
+    clearTimeout(runTimer);
+    if (runWatchdog.signal.aborted) {
+      console.error(`Baseline generation FAILED — ${runWatchdog.signal.reason?.message}; not writing a partial baseline.`);
+      process.exit(1);
+    }
     const cases = {};
     let anyFailure = false;
     for (const def of selected) {
@@ -384,7 +512,8 @@ async function main() {
 
   // ── Gate mode ──────────────────────────────────────────────────────────────
   console.log(`Running ${selected.length} case(s) (pool of ${POOL_SIZE}), runId ${runId}…`);
-  const caseResults = await runPool(selected, POOL_SIZE, executeAndScore);
+  const caseResults = await runPool(selected, POOL_SIZE, executeAndScore, onWorkerError);
+  clearTimeout(runTimer);
 
   const runtimeSeconds = (Date.now() - startedAt) / 1000;
   const costEstimateUsd = ledger.spentUsd;
@@ -410,7 +539,6 @@ async function main() {
     configSources: gate ? { baseRef: gate.baseRef, ...gate.sources } : { baseRef: null, all: "pr-head (local/manual run)" },
   });
 
-  const resultsPath = resolve(flags.results || join(BATTERY_DIR, "battery-results.json"));
   writeFileSync(resultsPath, JSON.stringify(results, null, 2) + "\n");
   const summaryPath = join(dirname(resultsPath), "check-summary.md");
   writeFileSync(summaryPath, renderCheckSummary(results) + "\n");
