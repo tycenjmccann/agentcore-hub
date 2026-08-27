@@ -68,6 +68,19 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
     writeFileSync(dest, content);
   }
 
+  // Blueprint fixture overrides (TEAM-3352): a case may pin a battery-local
+  // blueprint copy via input.blueprints so load_blueprint serves it INSTEAD of
+  // the working-tree file. qa-* cases use this to neutralize the production
+  // blueprint's restatement of the persona contract — otherwise a degraded
+  // system prompt is outvoted by an intact blueprint and the battery cannot
+  // see the degradation. Unpinned names still serve from the working tree.
+  const blueprintOverrides = new Map();
+  for (const ref of caseDef.input?.blueprints || []) {
+    const abs = join(repoRoot, "evals", "battery", ref);
+    if (!existsSync(abs)) continue;
+    blueprintOverrides.set(basename(ref).replace(/\.md$/, ""), readFileSync(abs, "utf8"));
+  }
+
   const inWorkspace = (p) => {
     const root = resolve(workspaceDir);
     const abs = resolve(workspaceDir, p);
@@ -155,6 +168,7 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
     //    blueprints get under test (prod serves s3://.../blueprints/{name}.md).
     load_blueprint(args) {
       const name = String(args.blueprint_name || "").replace(/[^a-z0-9_-]/gi, "");
+      if (blueprintOverrides.has(name)) return blueprintOverrides.get(name);
       const path = join(repoRoot, "blueprints", `${name}.md`);
       if (existsSync(path)) return readFileSync(path, "utf8");
       const available = readdirSync(join(repoRoot, "blueprints"))
@@ -163,18 +177,34 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
       return `Blueprint '${args.blueprint_name}' not found. Available: ${available.join(", ")}`;
     },
 
-    // ── Coding engines: canned delegation acks. Real work never happens —
-    //    the judge scores whether the agent delegated correctly.
+    // ── Coding engines: canned session reports. Real work never happens —
+    //    the judge scores whether the agent delegated correctly and how it
+    //    uses the returned evidence. The report is EVIDENCE-SHAPED (per-command
+    //    output with exit codes, like the real engine returns): a stock
+    //    persona that cites it is behaving correctly, and contract-aware
+    //    judges must not penalize it for the stub's vagueness (TEAM-3352).
     claude_code(args) {
       return (
-        "[battery-stub] Delegation recorded. claude_code session report: task received and executed as instructed — " +
-        "root cause located, fix applied on the requested branch, regression test added and verified to fail on the " +
-        "pre-fix code and pass on the fix. All checks exit 0. Committed and pushed to the feature branch. " +
+        "[battery-stub] claude_code session report — the requested task was executed in full in the shared workspace.\n" +
+        "Commands run, with exit codes:\n" +
+        "  $ git fetch origin && git checkout <requested branch>   -> exit 0\n" +
+        "  $ npm install                                           -> exit 0 (packages up to date)\n" +
+        "  $ npx tsc --noEmit                                      -> exit 0 (0 type errors)\n" +
+        "  $ npm run build                                         -> exit 0 (production build succeeded)\n" +
+        "  $ npm test                                              -> exit 0 (all test suites passed, 0 failures)\n" +
+        "Verified on the branch: the regression test named in the brief exists, passes on this branch, and was " +
+        "confirmed to fail when run against the pre-fix code. Any code changes requested in the brief were applied, " +
+        "committed, and pushed to the feature branch. Static analysis: no findings.\n" +
         "[coding-artifacts: none]"
       );
     },
     codex(args) {
-      return "[battery-stub] Delegation recorded. codex session report: task executed as instructed; checks exit 0.";
+      return (
+        "[battery-stub] codex session report — task executed as instructed.\n" +
+        "  $ npm install    -> exit 0\n" +
+        "  $ npm test       -> exit 0 (all test suites passed, 0 failures)\n" +
+        "Requested changes applied and pushed. [coding-artifacts: none]"
+      );
     },
 
     // ── Local files: restricted to the case's /tmp workspace ───────────

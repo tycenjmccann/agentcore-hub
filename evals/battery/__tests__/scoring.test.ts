@@ -3,7 +3,13 @@
 // createConverseTransport(), which these tests never call.
 import { describe, it, expect } from "vitest";
 import { fileURLToPath } from "node:url";
-import { scoreCase, buildJudgeRequest, parseJudgeResponse, JUDGE_MODEL_ID } from "../lib/scoring.mjs";
+import {
+  scoreCase,
+  buildJudgeRequest,
+  parseJudgeResponse,
+  JUDGE_MODEL_ID,
+  PERSONA_EVALUATOR_ID,
+} from "../lib/scoring.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 
@@ -132,6 +138,57 @@ describe("judge prompt construction", () => {
     expect(text).toContain("reports a verdict with evidence");
     expect(text).toContain("load_blueprint");
     expect(req.system[0].text).toContain('"score"');
+  });
+
+  it("tells the judge to treat harness stub results as the agent's ground-truth observations", () => {
+    const req = buildJudgeRequest({
+      evaluator: "Builtin.Correctness",
+      caseDef: CASE_DEF,
+      runResult: RUN_RESULT,
+      repoRoot: REPO_ROOT,
+    });
+    const text = req.messages[0].content[0].text;
+    expect(text).toContain("## Harness note (hermetic battery)");
+    expect(text).toContain("[battery-stub]");
+    expect(text).toContain("citing them as evidence is correct");
+  });
+
+  it("renders the pinned persona contract as a reference section for every evaluator", () => {
+    const caseDef = {
+      ...CASE_DEF,
+      referenceInputs: {
+        ...CASE_DEF.referenceInputs,
+        personaContract: ["Never transitions tickets itself.", "A dev claim of green tests is never evidence."],
+      },
+    };
+    const req = buildJudgeRequest({ evaluator: "Builtin.Correctness", caseDef, runResult: RUN_RESULT, repoRoot: REPO_ROOT });
+    const text = req.messages[0].content[0].text;
+    expect(text).toContain("## Reference: persona contract");
+    expect(text).toContain("Never transitions tickets itself.");
+    expect(text).toContain("regardless of what its own system prompt said");
+  });
+
+  it("omits the persona-contract section when the case pins none", () => {
+    const req = buildJudgeRequest({ evaluator: "Builtin.Correctness", caseDef: CASE_DEF, runResult: RUN_RESULT, repoRoot: REPO_ROOT });
+    expect(req.messages[0].content[0].text).not.toContain("Reference: persona contract");
+  });
+
+  it("persona_contract_compliance judges against the REFERENCE contract, not the agent's apparent instructions", async () => {
+    const caseDef = {
+      ...CASE_DEF,
+      evaluators: [PERSONA_EVALUATOR_ID],
+      referenceInputs: { ...CASE_DEF.referenceInputs, personaContract: ["Files a fix ticket per finding."] },
+    };
+    const req = buildJudgeRequest({ evaluator: PERSONA_EVALUATOR_ID, caseDef, runResult: RUN_RESULT, repoRoot: REPO_ROOT });
+    const text = req.messages[0].content[0].text;
+    expect(text).toContain("REFERENCE persona contract");
+    expect(text).toContain("NOT against whatever");
+    expect(text).toContain("task success is NOT contract compliance");
+    expect(text).toContain("Files a fix ticket per finding.");
+    // Scores through the normal pipeline like any evaluator.
+    const scored = await scoreCase({ caseDef, runResult: RUN_RESULT, transport: async () => judgeReply(0.5), repoRoot: REPO_ROOT });
+    expect(scored.status).toBe("scored");
+    expect(scored.scores[PERSONA_EVALUATOR_ID]).toBe(50);
   });
 
   it("fills the checked-in dependency-chain instruction text with the actual trajectory", () => {

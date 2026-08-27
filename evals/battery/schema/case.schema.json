@@ -65,6 +65,12 @@
         "forbiddenTools": {
           "type": "array",
           "items": { "type": "string" }
+        },
+        "personaContract": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Curated, case-pinned list of the STOCK persona's non-negotiable rules. Judge reference for persona_contract_compliance — never sourced from the working-tree prompt file (that file is the artifact under test). A gating knob: read from the base ref in gate mode."
         }
       }
     },
@@ -73,7 +79,7 @@
       "minItems": 1,
       "maxItems": 10,
       "uniqueItems": true,
-      "description": "Max 10 is the hard API limit per deploy/evaluations/setup-evaluations.sh. Builtin.* names exactly as in setup-evaluations.sh, or the on-demand custom evaluator id.",
+      "description": "Max 10 is the hard API limit per deploy/evaluations/setup-evaluations.sh. Builtin.* names exactly as in setup-evaluations.sh, the on-demand custom evaluator id, or the battery-local persona_contract_compliance (requires referenceInputs.personaContract).",
       "items": {
         "enum": [
           "Builtin.ToolSelectionAccuracy",
@@ -86,7 +92,8 @@
           "Builtin.Helpfulness",
           "Builtin.ResponseRelevance",
           "Builtin.Conciseness",
-          "dependency_chain_compliance-VyBv7H2bCi"
+          "dependency_chain_compliance-VyBv7H2bCi",
+          "persona_contract_compliance"
         ]
       }
     },

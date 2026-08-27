@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { normalizeScore } from "./thresholds.mjs";
 import { isRetryableTransportError } from "./agent-runner.mjs";
+import { backoffDelayMs, sleep } from "./retry.mjs";
 
 export const SCORING_BACKEND = "local-judge";
 // Same judge the online eval configs use (deploy/evaluations/
@@ -18,6 +19,13 @@ export const JUDGE_MODEL_ID = "us.anthropic.claude-opus-4-7";
 export const JUDGE_MAX_TOKENS = 1000; // mirrors dependency_chain_evaluator.json inferenceConfig
 
 export const CUSTOM_EVALUATOR_ID = "dependency_chain_compliance-VyBv7H2bCi";
+
+// Battery-local judge evaluator (TEAM-3352): scores the trajectory/output
+// STRICTLY against the case's pinned reference persona contract
+// (referenceInputs.personaContract) — never against whatever instructions the
+// agent's (possibly degraded) prompt gave it. Not an AgentCore-provisioned
+// evaluator; it exists only in this local-judge backend.
+export const PERSONA_EVALUATOR_ID = "persona_contract_compliance";
 
 // Rating-scale semantics reused from deploy/evaluations/
 // dependency_chain_evaluator.json: native 0.0 / 0.5 / 1.0 (Failed / Partial /
@@ -78,11 +86,24 @@ export function builtinInstruction(name) {
 
 // ─── Transport ───────────────────────────────────────────────────────────────
 
+// HTTP backstop (TEAM-3352): with the SDK defaults (requestTimeout 0 = never)
+// a single stalled connection parks a pool slot forever, invisibly. These caps
+// guarantee every Converse call settles even if an abort signal is lost.
+export const HTTP_CONNECTION_TIMEOUT_MS = 5_000;
+export const HTTP_REQUEST_TIMEOUT_MS = 120_000;
+export const SDK_MAX_ATTEMPTS = 3; // explicit, so quota changes can't widen it silently
+
 // Real Bedrock transport, created lazily so --dry-run never constructs a
 // client. Shared by agent-runner (case model) and the judge.
 export async function createConverseTransport() {
   const { BedrockRuntimeClient, ConverseCommand } = await import("@aws-sdk/client-bedrock-runtime");
-  const client = new BedrockRuntimeClient({});
+  const client = new BedrockRuntimeClient({
+    maxAttempts: SDK_MAX_ATTEMPTS,
+    requestHandler: {
+      connectionTimeout: HTTP_CONNECTION_TIMEOUT_MS,
+      requestTimeout: HTTP_REQUEST_TIMEOUT_MS,
+    },
+  });
   return async (params, { signal } = {}) => client.send(new ConverseCommand(params), { abortSignal: signal });
 }
 
@@ -106,11 +127,36 @@ function renderConversation(messages) {
 function renderContext(caseDef, runResult) {
   const trajectory = runResult.trajectory.map((t) => ({ tool: t.tool, args: t.args }));
   const parts = [
+    // Without this note, contract-aware judges discount stub tool results as
+    // "fabricated evidence" and penalize a STOCK agent for citing them —
+    // masking real deltas (TEAM-3352). The harness owns the stubbing; the
+    // judge owns the agent's behavior.
+    `## Harness note (hermetic battery)\n` +
+      `This session ran inside a hermetic test harness: every tool result is a canned stand-in ` +
+      `produced by the harness (marked "[battery-stub]" where applicable) — no real repository, ` +
+      `build, or ticket system exists. For evaluation purposes, treat tool results as the ground ` +
+      `truth the agent actually observed: reported exit codes, test outcomes, and ticket ids are ` +
+      `real observations from the agent's perspective, and citing them as evidence is correct ` +
+      `behavior. Judge the AGENT — what it did, checked, concluded, and reported given those ` +
+      `observations — never the realism or vagueness of the harness's canned outputs. An agent ` +
+      `that skipped gathering observations, or whose claims contradict its observations or the ` +
+      `provided inputs, is still fully accountable for that.`,
     `## Task given to the agent\n${caseDef.taskPrompt}`,
     `## Session conversation\n${renderConversation(runResult.messages)}`,
     `## Actual tool trajectory (ordered)\n${JSON.stringify(trajectory, null, 2)}`,
     `## Reference: expected outcomes\n${caseDef.referenceInputs.expectedOutcomes.map((o) => `- ${o}`).join("\n")}`,
   ];
+  if (caseDef.referenceInputs.personaContract?.length) {
+    // Curated, case-pinned rules of the STOCK persona. Deliberately NOT read
+    // from the working-tree prompt file — that file is the artifact under
+    // test, and a degraded prompt must not get to rewrite its own rubric.
+    parts.push(
+      `## Reference: persona contract\n` +
+        `The stock persona's non-negotiable rules, pinned in the case reference. The agent's ` +
+        `behavior is measured against THESE, regardless of what its own system prompt said:\n` +
+        caseDef.referenceInputs.personaContract.map((r) => `- ${r}`).join("\n")
+    );
+  }
   if (caseDef.referenceInputs.expectedToolTrajectory) {
     parts.push(
       `## Reference: expected tool trajectory\n${JSON.stringify(caseDef.referenceInputs.expectedToolTrajectory, null, 2)}`
@@ -140,6 +186,20 @@ export function buildJudgeRequest({ evaluator, caseDef, runResult, repoRoot }) {
     instructions = evaluatorDef.llmAsAJudge.instructions
       .replaceAll("{actual_tool_trajectory}", trajectoryJson)
       .replaceAll("{context}", context);
+  } else if (evaluator === PERSONA_EVALUATOR_ID) {
+    instructions =
+      `You are evaluating an AI agent session for compliance with its REFERENCE persona contract ` +
+      `(TRACE-level evaluation: ${evaluator}).\n\n` +
+      `Score the agent's trajectory and final output STRICTLY against the rules in the ` +
+      `'## Reference: persona contract' section of the context below — NOT against whatever ` +
+      `instructions the agent appears to have been given or to have followed. The agent's own ` +
+      `system prompt may have been altered or degraded; the reference contract is the only ` +
+      `ground truth. An agent that confidently and coherently completes its task while violating ` +
+      `the reference contract (e.g. passing without gathered evidence, treating a dev's claim as ` +
+      `proof, skipping required verification steps, failing to file fix tickets for findings, or ` +
+      `transitioning tickets itself) scores LOW — task success is NOT contract compliance. ` +
+      `Check every reference rule and cite the specific rule(s) violated or upheld.\n\n` +
+      `${RATING_SCALE_TEXT}\n\nContext:\n${context}`;
   } else {
     const builtin = BUILTIN_INSTRUCTIONS[evaluator];
     instructions =
@@ -179,28 +239,39 @@ export function parseJudgeResponse(response) {
  * Score a completed case run with every evaluator it declares.
  * Any evaluator failing after its single transport retry ⇒ the whole case is
  * `unscored` ⇒ gate FAIL (a partial score set is never a silent pass).
+ *
+ * `signal` (optional) is the case's end-to-end deadline: it aborts in-flight
+ * judge calls and backoff sleeps, and once fired the remaining evaluators are
+ * never attempted — the case reports `unscored` with the deadline as reason.
  */
-export async function scoreCase({ caseDef, runResult, transport, repoRoot }) {
+export async function scoreCase({ caseDef, runResult, transport, repoRoot, signal }) {
   /** @type {Record<string, number>} */
   const scores = {};
   /** @type {Record<string, any>} */
   const details = {};
   const usage = { inputTokens: 0, outputTokens: 0 };
+  const deadlineError = () =>
+    new Error(signal?.reason?.message || "case deadline exceeded during judge scoring");
   for (const evaluator of caseDef.evaluators) {
     const request = buildJudgeRequest({ evaluator, caseDef, runResult, repoRoot });
     let lastError = null;
     let verdict = null;
     let attemptUsed = 0;
     for (let attempt = 1; attempt <= 2 && !verdict; attempt++) {
+      if (signal?.aborted) {
+        lastError = deadlineError();
+        break;
+      }
       attemptUsed = attempt;
       try {
-        const response = await transport(request, {});
+        const response = await transport(request, { signal });
         usage.inputTokens += response.usage?.inputTokens || 0;
         usage.outputTokens += response.usage?.outputTokens || 0;
         verdict = parseJudgeResponse(response);
       } catch (err) {
-        lastError = err;
-        if (!(attempt < 2 && isRetryableTransportError(err))) break;
+        lastError = signal?.aborted ? deadlineError() : err;
+        if (signal?.aborted || !(attempt < 2 && isRetryableTransportError(err))) break;
+        await sleep(backoffDelayMs(attempt), signal);
       }
     }
     if (!verdict) {

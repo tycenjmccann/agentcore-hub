@@ -111,6 +111,21 @@ describe("working-tree blueprints", () => {
     expect(registry.execute("load_blueprint", { blueprint_name: "qa-verifier" })).toBe(real);
     expect(registry.execute("load_blueprint", { blueprint_name: "no-such-blueprint" })).toContain("Available:");
   });
+
+  it("serves a case-pinned fixture blueprint INSTEAD of the working-tree copy (persona-contract isolation)", () => {
+    const { registry } = makeRegistry({
+      id: "reg-test-bp",
+      input: { blueprints: ["fixtures/blueprints/qa-verifier.md"] },
+    });
+    const fixture = readFileSync(join(REPO_ROOT, "evals/battery/fixtures/blueprints/qa-verifier.md"), "utf8");
+    const real = readFileSync(join(REPO_ROOT, "blueprints/qa-verifier.md"), "utf8");
+    const served = registry.execute("load_blueprint", { blueprint_name: "qa-verifier" });
+    expect(served).toBe(fixture);
+    expect(served).not.toBe(real);
+    // Names the case does not pin still come from the working tree.
+    const codeReviewer = readFileSync(join(REPO_ROOT, "blueprints/code-reviewer.md"), "utf8");
+    expect(registry.execute("load_blueprint", { blueprint_name: "code-reviewer" })).toBe(codeReviewer);
+  });
 });
 
 describe("workspace jail", () => {

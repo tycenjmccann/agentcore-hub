@@ -1,0 +1,13 @@
+{
+  "ticket_id": "BATT-113",
+  "title": "Refund processing for digital orders",
+  "type": "task",
+  "branch": "feature/batt-113-refund-processing",
+  "acceptance_criteria": [
+    "1. POST /refunds creates a refund record and returns 201 with the refund id",
+    "2. Refunds exceeding the order total are rejected with 422 and a validation message",
+    "3. Every refund over $100 writes an audit log entry (actor, amount, order id) BEFORE the payment-provider call is made",
+    "4. A regression test covers the over-total rejection path (criterion 2)"
+  ],
+  "notes": "Audit logging (criterion 3) is a compliance requirement — the ticket is not done without it."
+}

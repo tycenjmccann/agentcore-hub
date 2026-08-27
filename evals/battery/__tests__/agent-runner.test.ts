@@ -4,12 +4,25 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runCase, buildMessages, isRetryableTransportError, MODEL_TIERS, usageCostUsd } from "../lib/agent-runner.mjs";
+import {
+  runCase,
+  buildMessages,
+  isRetryableTransportError,
+  isThrottlingOrServerError,
+  MODEL_TIERS,
+  usageCostUsd,
+} from "../lib/agent-runner.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const QA_CASE = JSON.parse(
   readFileSync(join(REPO_ROOT, "evals/battery/cases/qa-verifier-regression-001.json"), "utf8")
 );
+// Retry-policy tests end the conversation without tool calls, so they use a
+// variant with no required trajectory (which would otherwise fail mechanically).
+const NO_TRAJECTORY_CASE = {
+  ...QA_CASE,
+  referenceInputs: { ...QA_CASE.referenceInputs, expectedToolTrajectory: [] },
+};
 
 const endTurn = (text = "Done.") => ({
   stopReason: "end_turn",
@@ -80,7 +93,7 @@ describe("transport retry policy (FR-10: single retry, typed errors only)", () =
       if (calls === 1) throw Object.assign(new Error("slow down"), { name: "ThrottlingException" });
       return endTurn();
     };
-    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t4", converse });
+    const run = await runCase({ caseDef: NO_TRAJECTORY_CASE, repoRoot: REPO_ROOT, runId: "t4", converse });
     expect(run.status).toBe("completed");
     expect(run.attempt).toBe(2);
     expect(calls).toBe(2);
@@ -116,6 +129,55 @@ describe("transport retry policy (FR-10: single retry, typed errors only)", () =
     expect(isRetryableTransportError({ code: "ECONNRESET" })).toBe(true);
     expect(isRetryableTransportError({ name: "ValidationException", $metadata: { httpStatusCode: 400 } })).toBe(false);
     expect(isRetryableTransportError({ name: "AccessDeniedException" })).toBe(false);
+  });
+
+  it("tests name and HTTP status independently — a ThrottlingException's 400 status must not hide its name", () => {
+    // Regression (TEAM-3352 finding 1D): the old classifier tested
+    // String(status || name), so throttling's httpStatusCode 400 shadowed the
+    // name and mid-case throttling was misclassified as non-retryable.
+    expect(isThrottlingOrServerError({ name: "ThrottlingException", $metadata: { httpStatusCode: 400 } })).toBe(true);
+    expect(isRetryableTransportError({ name: "ThrottlingException", $metadata: { httpStatusCode: 400 } })).toBe(true);
+    expect(isThrottlingOrServerError({ name: "TooManyRequestsException" })).toBe(true);
+    expect(isThrottlingOrServerError({ name: "SomethingElse", $metadata: { httpStatusCode: 502 } })).toBe(true);
+    expect(isThrottlingOrServerError({ name: "ValidationException", $metadata: { httpStatusCode: 400 } })).toBe(false);
+  });
+});
+
+describe("required-tool enforcement (mechanical, no judge)", () => {
+  it("fails a run that never calls a non-optional expectedToolTrajectory tool", async () => {
+    // QA_CASE requires load_blueprint and WorkflowOutput___report_completion;
+    // this agent answers in prose without touching either.
+    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t7", converse: async () => endTurn() });
+    expect(run.status).toBe("failed_required_tool");
+    expect(run.missingRequiredTools).toEqual(["load_blueprint", "WorkflowOutput___report_completion"]);
+  });
+
+  it("does not enforce optional trajectory entries", async () => {
+    const caseDef = {
+      ...QA_CASE,
+      referenceInputs: {
+        ...QA_CASE.referenceInputs,
+        expectedToolTrajectory: [
+          { tool: "load_blueprint", optional: false },
+          { tool: "Tickets___add_comment", optional: true },
+        ],
+      },
+    };
+    const script = [toolUse("load_blueprint", { blueprint_name: "qa-verifier" }), endTurn()];
+    let i = 0;
+    const run = await runCase({ caseDef, repoRoot: REPO_ROOT, runId: "t8", converse: async () => script[i++] });
+    expect(run.status).toBe("completed");
+    expect(run.missingRequiredTools).toEqual([]);
+  });
+
+  it("forbidden-tool failure takes precedence over a missing required tool", async () => {
+    const script = [
+      toolUse("Tickets___transition_ticket", { ticket_id: "BATT-110", transition_id: "done" }),
+      endTurn(),
+    ];
+    let i = 0;
+    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t9", converse: async () => script[i++] });
+    expect(run.status).toBe("failed_forbidden_tool");
   });
 });
 

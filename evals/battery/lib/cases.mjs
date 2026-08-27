@@ -9,6 +9,7 @@ import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
 
 export const CUSTOM_EVALUATOR_ID = "dependency_chain_compliance-VyBv7H2bCi";
+export const PERSONA_EVALUATOR_ID = "persona_contract_compliance";
 export const SCORING_BACKEND = "local-judge";
 
 export const batteryDir = (repoRoot) => join(repoRoot, "evals", "battery");
@@ -171,6 +172,8 @@ export function preflight(repoRoot) {
       !def.referenceInputs?.expectedToolTrajectory?.length
     )
       fail("reference-inputs", file, `${CUSTOM_EVALUATOR_ID} requires referenceInputs.expectedToolTrajectory`);
+    if ((def.evaluators || []).includes(PERSONA_EVALUATOR_ID) && !def.referenceInputs?.personaContract?.length)
+      fail("reference-inputs", file, `${PERSONA_EVALUATOR_ID} requires referenceInputs.personaContract`);
   }
 
   // Manifest drift (exact set equality with status:active case files).
@@ -284,6 +287,17 @@ function applyBaseCaseKnobs(headDef, baseDef) {
   if (union.length !== headForbidden.length) {
     changed.push("referenceInputs.forbiddenTools");
     def.referenceInputs = { ...headDef.referenceInputs, forbiddenTools: union };
+  }
+
+  // Persona contract: replaced wholesale from base, like floors. It is the
+  // rubric persona_contract_compliance judges against, so the PR that degrades
+  // a prompt must not also be able to water the contract down (or delete it).
+  if (!same(baseDef.referenceInputs?.personaContract, headDef.referenceInputs?.personaContract)) {
+    changed.push("referenceInputs.personaContract");
+    const refs = { ...(def.referenceInputs || headDef.referenceInputs) };
+    if (baseDef.referenceInputs?.personaContract === undefined) delete refs.personaContract;
+    else refs.personaContract = baseDef.referenceInputs.personaContract;
+    def.referenceInputs = refs;
   }
   return { def, changed };
 }
@@ -434,9 +448,15 @@ export function resolveGateConfig({ repoRoot, baseRef, head, gitShow }) {
         file: relPath,
         message: `${CUSTOM_EVALUATOR_ID} is gating at ${baseRef} but HEAD has no referenceInputs.expectedToolTrajectory for case '${id}'`,
       });
+    if ((def.evaluators || []).includes(PERSONA_EVALUATOR_ID) && !def.referenceInputs?.personaContract?.length)
+      errors.push({
+        check: "gate-config",
+        file: relPath,
+        message: `${PERSONA_EVALUATOR_ID} is gating at ${baseRef} but the effective case def has no referenceInputs.personaContract for case '${id}'`,
+      });
   }
   sources["cases/*.json"] = baseActiveIds
-    ? `gating knobs (evaluator_floors, evaluators, forbiddenTools) from base-ref ${baseRef} for ` +
+    ? `gating knobs (evaluator_floors, evaluators, forbiddenTools, personaContract) from base-ref ${baseRef} for ` +
       `${effectiveCaseDefs.size}/${baseActiveIds.length} base-active case(s); pr-head for new cases`
     : "pr-head (no base-ref manifest)";
 

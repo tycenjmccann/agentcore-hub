@@ -13,7 +13,8 @@
     "review-eventual-consistency-003",
     "qa-verifier-regression-001",
     "qa-build-verification-002",
-    "qa-design-mismatch-003"
+    "qa-design-mismatch-003",
+    "qa-verifier-degradation-canary-004"
   ],
   "notes": "activeCases must list every cases/*.json with status=active; runner preflight cross-checks and fails on drift"
 }
