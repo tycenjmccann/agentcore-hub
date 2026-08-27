@@ -23,7 +23,11 @@ spec.loader.exec_module(deploy_one_robust)
 AGENT = "agentcore_hub_backend_dev"
 
 # Platform/ADOT-managed vars the deploy path must never clobber (TEAM-3103
-# design: only the three per-persona identity/capture vars are ours to set).
+# design: only the two per-persona vars — OTEL_SERVICE_NAME and
+# OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT — are ours to set).
+# OTEL_RESOURCE_ATTRIBUTES is platform-injected with aws.log.group.names;
+# setting it at deploy time replaces that value and breaks CloudWatch
+# log-group correlation (TEAM-3313).
 PLATFORM_MANAGED = [
     "AGENT_OBSERVABILITY_ENABLED",
     "OTEL_PYTHON_DISTRO",
@@ -32,6 +36,7 @@ PLATFORM_MANAGED = [
     "OTEL_TRACES_EXPORTER",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_PROPAGATORS",
+    "OTEL_RESOURCE_ATTRIBUTES",
     "DISABLE_ADOT_OBSERVABILITY",
 ]
 
@@ -48,10 +53,10 @@ class TestBuildEnvVars(unittest.TestCase):
     def test_otel_service_name(self):
         self.assertEqual(self.build()["OTEL_SERVICE_NAME"], AGENT)
 
-    def test_otel_resource_attributes(self):
-        env = self.build()
-        self.assertIn(f"service.name={AGENT}", env["OTEL_RESOURCE_ATTRIBUTES"])
-        self.assertIn("deployment.environment=production", env["OTEL_RESOURCE_ATTRIBUTES"])
+    def test_otel_resource_attributes_not_set(self):
+        # TEAM-3313: covered by the PLATFORM_MANAGED guard too, but assert
+        # explicitly — this var regressing silently breaks log correlation.
+        self.assertNotIn("OTEL_RESOURCE_ATTRIBUTES", self.build())
 
     def test_genai_message_capture(self):
         self.assertEqual(

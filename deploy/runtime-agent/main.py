@@ -178,7 +178,6 @@ logger = logging.getLogger("agentcore-hub-pipeline-agent")
 # TracerProvider is not allowed", orphan its own provider, and clobber the
 # baggage,xray,tracecontext propagators (drops session.id stamping).
 # The StrandsTelemetry fallback exists only for bare `python main.py`.
-from opentelemetry import trace as _otel_trace_api
 
 _TELEMETRY_INITIALIZED = False
 
@@ -187,23 +186,37 @@ def _init_telemetry() -> None:
     global _TELEMETRY_INITIALIZED
     if _TELEMETRY_INITIALIZED:
         return
-    provider = _otel_trace_api.get_tracer_provider()
-    if hasattr(provider, "add_span_processor"):
-        # Real SDK provider → opentelemetry-instrument/ADOT own the pipeline.
-        logger.info(
-            "telemetry: ADOT-managed TracerProvider active (%s) — Strands "
-            "invoke_agent spans attach to it; no local exporter added",
-            type(provider).__name__,
-        )
-    else:
-        from strands.telemetry import StrandsTelemetry
+    # TEAM-3313: this runs at module import — any exception here would abort
+    # the import before `app = BedrockAgentCoreApp()` and turn a telemetry
+    # failure into a total agent outage. Swallow and log instead.
+    try:
+        from opentelemetry import trace as _otel_trace_api
 
-        StrandsTelemetry().setup_otlp_exporter()
-        logger.info(
-            "telemetry: no SDK TracerProvider found — StrandsTelemetry "
-            "fallback provider + OTLP exporter installed"
+        provider = _otel_trace_api.get_tracer_provider()
+        if hasattr(provider, "add_span_processor"):
+            # Real SDK provider → opentelemetry-instrument/ADOT own the pipeline.
+            logger.info(
+                "telemetry: ADOT-managed TracerProvider active (%s) — Strands "
+                "invoke_agent spans attach to it; no local exporter added",
+                type(provider).__name__,
+            )
+        else:
+            from strands.telemetry import StrandsTelemetry
+
+            StrandsTelemetry().setup_otlp_exporter()
+            logger.info(
+                "telemetry: no SDK TracerProvider found — StrandsTelemetry "
+                "fallback provider + OTLP exporter installed"
+            )
+    except Exception:
+        logger.warning(
+            "telemetry: init failed — continuing without telemetry",
+            exc_info=True,
         )
-    _TELEMETRY_INITIALIZED = True
+    finally:
+        # Mark initialized even on failure: a retry would run against
+        # partially-mutated global OTel state, so one attempt only.
+        _TELEMETRY_INITIALIZED = True
 
 
 _init_telemetry()
