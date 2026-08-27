@@ -128,8 +128,16 @@ echo "✓ Subscriptions: 14 eval log groups → packager"
 #                                   This is the signal that used to show up as
 #                                   a silent 0/10 batch.
 #   eval.batch.null_or_error_rate — % of a flushed batch that never scored.
-# Both are emitted with Dimensions [["agentId"], []]; the alarms below watch the
-# dimensionless fleet aggregate so one broken agent still pages.
+# Both are emitted with Dimensions [["agentId"], []], i.e. a per-agent series AND
+# a dimensionless fleet rollup.
+#
+# The rate is alarmed PER AGENT, because the rollup alone cannot see a single
+# broken agent: one agent at 100% among three healthy ones averages to 25, which
+# is under the 50 threshold, and the page never fires. Statistic Maximum (not
+# Average) on every alarm for the same reason — a single flushed batch at 100 is
+# the signal, and averaging it against that hour's healthy batches erases it.
+# The dimensionless alarm stays as a fleet backstop for agents that aren't in
+# fleet-runtime-ids.json yet.
 # create-topic and put-metric-alarm are both idempotent by name.
 ALERT_TOPIC_ARN=$(aws sns create-topic --name agentcore-hub-alerts \
   --region "$AWS_REGION" --query 'TopicArn' --output text)
@@ -138,10 +146,10 @@ echo "✓ SNS topic: ${ALERT_TOPIC_ARN}"
 aws cloudwatch put-metric-alarm \
   --region "$AWS_REGION" \
   --alarm-name "agentcore-hub-eval-null-or-error-rate-high" \
-  --alarm-description "More than 50% of a flushed eval batch never scored (errors or missing scores) — suspect runtime telemetry, not agent quality." \
+  --alarm-description "FLEET BACKSTOP: some agent flushed an eval batch where more than 50% never scored (errors or missing scores) — suspect runtime telemetry, not agent quality. Per-agent alarms name the agent." \
   --namespace "AgentCoreHub/Evaluations" \
   --metric-name "eval.batch.null_or_error_rate" \
-  --statistic Average \
+  --statistic Maximum \
   --period 3600 \
   --threshold 50 \
   --comparison-operator GreaterThanThreshold \
@@ -150,7 +158,47 @@ aws cloudwatch put-metric-alarm \
   --treat-missing-data notBreaching \
   --alarm-actions "$ALERT_TOPIC_ARN" \
   --output text >/dev/null
-echo "✓ Alarm: agentcore-hub-eval-null-or-error-rate-high (>50% over 1h)"
+echo "✓ Alarm: agentcore-hub-eval-null-or-error-rate-high (fleet backstop, max >50% over 1h)"
+
+# ─── Per-agent rate alarms ──────────────────────────────────────────────────
+# Agent ids come from fleet-runtime-ids.json (the same source setup-evaluations.sh
+# reads) and equal the agentId dimension the packager publishes. If the file is
+# absent the deploy must still succeed — the fleet backstop above still covers
+# the whole fleet, just without naming the agent.
+FLEET_FILE="${REPO_ROOT}/deploy/runtime-agent/fleet-runtime-ids.json"
+if [ -f "$FLEET_FILE" ]; then
+  AGENT_IDS=$(python3 -c "
+import json
+with open('$FLEET_FILE') as f:
+    for name in json.load(f):
+        print(name)
+")
+  PER_AGENT_ALARMS=0
+  while read -r AGENT_ID; do
+    [ -z "$AGENT_ID" ] && continue
+    aws cloudwatch put-metric-alarm \
+      --region "$AWS_REGION" \
+      --alarm-name "agentcore-hub-eval-null-or-error-rate-${AGENT_ID}" \
+      --alarm-description "More than 50% of a flushed eval batch for ${AGENT_ID} never scored (errors or missing scores) — suspect runtime telemetry for this agent, not its output quality." \
+      --namespace "AgentCoreHub/Evaluations" \
+      --metric-name "eval.batch.null_or_error_rate" \
+      --dimensions "Name=agentId,Value=${AGENT_ID}" \
+      --statistic Maximum \
+      --period 3600 \
+      --threshold 50 \
+      --comparison-operator GreaterThanThreshold \
+      --evaluation-periods 1 \
+      --datapoints-to-alarm 1 \
+      --treat-missing-data notBreaching \
+      --alarm-actions "$ALERT_TOPIC_ARN" \
+      --output text >/dev/null
+    PER_AGENT_ALARMS=$((PER_AGENT_ALARMS + 1))
+  done <<< "$AGENT_IDS"
+  echo "✓ Alarms: ${PER_AGENT_ALARMS} per-agent eval-null-or-error-rate (max >50% over 1h)"
+else
+  echo "⚠ No ${FLEET_FILE} — skipping per-agent rate alarms (fleet backstop alarm still active)."
+  echo "  Run deploy/runtime-agent/refresh-agents-json.sh, then re-run this script."
+fi
 
 aws cloudwatch put-metric-alarm \
   --region "$AWS_REGION" \

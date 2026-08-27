@@ -450,7 +450,9 @@ async function aggregateScoresToDdb(agentId, parsed, entries = []) {
  * Flush the session buffer. ORDER MATTERS:
  *   1. Reset the DDB buffer FIRST (the batch is already captured in memory).
  *   2. Archive the raw batch to batches/.
- *   3. Synthesize a PRD via the Fleet Improver and write it to prd/.
+ *   3. Synthesize a PRD via the Fleet Improver and write it to prd/ — UNLESS the
+ *      batch carries no evidence (see the evidence guard below), in which case
+ *      the batch is archived and the loop stops here.
  *
  * The reset must happen before the (60–240s) synthesis call, not after. If it
  * came last, the run set would stay at batchSize for the whole synthesis
@@ -487,6 +489,7 @@ async function flushBuffer(agentId, buffer, batchSize) {
           errorCount: summary.errorCount,
           nullCount: summary.nullCount,
           skippedCount: summary.skippedCount,
+          scoredTotal: summary.scoredTotal,
           totalCount: summary.totalCount,
         })
       )
@@ -526,7 +529,45 @@ async function flushBuffer(agentId, buffer, batchSize) {
     `[eval-packager] FLUSHED | agent=${agentId} | batchSize=${buffer.length} | archived=${batchKey}`
   );
 
-  // 3. Synthesize a PRD from the batch and write it to prd/ (triggers the loop).
+  // 3. Evidence guard — do NOT synthesize a PRD from a batch that contains no
+  //    evidence. Two shapes qualify: nothing was ever scored (scoredTotal === 0)
+  //    or everything the evaluator attempted failed (rate at the 100 maximum).
+  //    Both mean the runtime/telemetry pipeline is broken, and a PRD built from
+  //    them is the improver hallucinating quality findings out of zero data —
+  //    which then starts a 14-agent workflow and opens a PR against a phantom.
+  //    The archive above is deliberately untouched: the batch stays on S3 for
+  //    debugging, we just don't act on it. Checked here rather than inside
+  //    synthesizeAndWritePrd so the suppression is logged whether or not
+  //    IMPROVER_ARN is configured.
+  if (summary.scoredTotal === 0 || summary.nullOrErrorRate >= 100) {
+    console.log(
+      JSON.stringify({
+        level: 'warn',
+        event: 'eval.prd.synthesis_suppressed',
+        agentId,
+        reason:
+          summary.scoredTotal === 0
+            ? 'no evaluator-attempted entries in batch (scoredTotal=0)'
+            : 'every evaluator-attempted entry failed (nullOrErrorRate at maximum)',
+        scoredTotal: summary.scoredTotal,
+        nullOrErrorRate: summary.nullOrErrorRate,
+        successCount: summary.successCount,
+        errorCount: summary.errorCount,
+        nullCount: summary.nullCount,
+        skippedCount: summary.skippedCount,
+        totalCount: summary.totalCount,
+        archivedKey: batchKey,
+      })
+    );
+    console.warn(
+      `[eval-packager] ${agentId}: PRD synthesis SUPPRESSED — scoredTotal=${summary.scoredTotal}, ` +
+        `nullOrErrorRate=${summary.nullOrErrorRate}%. Batch archived at ${batchKey}; no workflow triggered. ` +
+        'Fix the eval/telemetry pipeline, not the agent.'
+    );
+    return;
+  }
+
+  // 4. Synthesize a PRD from the batch and write it to prd/ (triggers the loop).
   //    Best-effort: a transient improver failure leaves the batch archived and
   //    the buffer already reset, so the flush never wedges.
   try {
