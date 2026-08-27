@@ -9,8 +9,9 @@
 #     * All agents: Builtin.ToolSelectionAccuracy (TOOL_CALL),
 #       Builtin.InstructionFollowing, Builtin.Correctness (TRACE),
 #       Builtin.GoalSuccessRate (SESSION), plus a 5th slot —
-#     * Ticket-creating agents (requirements_analyst, qa_verifier, ci_agent):
-#       the custom dependency_chain_compliance_online evaluator (SESSION)
+#     * requirements_analyst (TEAM-3368: the only role in scope for the
+#       dependency-chain rubric): the custom
+#       dependency_chain_compliance_online evaluator (SESSION)
 #     * All other agents: Builtin.Helpfulness (TRACE)
 #     * Dropped everywhere: ToolParameterAccuracy, Coherence, Faithfulness,
 #       ResponseRelevance, Conciseness
@@ -84,8 +85,16 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 # omitted here since it's environment-specific.
 # -----------------------------------------------------------------------------
 
-# Agents that create/reassign tickets (need the custom evaluator)
-TICKET_AGENTS="agentcore_hub_requirements_analyst agentcore_hub_qa_verifier agentcore_hub_ci_agent"
+# Agents scoped to the custom dependency-chain evaluator (TEAM-3368,
+# TEAM-3366 design §3.1): requirements_analyst only. It is the only role whose
+# core deliverable is CREATING the ticket dependency graph; qa_verifier and
+# ci_agent merely reassign tickets rather than construct chains, and scoring
+# them against the chain-construction rubric produced rubric-mismatch zeros.
+# The orchestrator (the other chain-toucher) is a Lambda with no online eval
+# config, so there is nothing to scope there. Out-of-scope roles fall into the
+# Builtin.Helpfulness fifth-slot fallback below. Sampling tiers (GATE_AGENTS)
+# are unchanged — this only narrows who gets the custom evaluator.
+TICKET_AGENTS="agentcore_hub_requirements_analyst"
 
 # Read agent IDs dynamically from fleet-runtime-ids.json
 FLEET_FILE="${REPO_ROOT}/deploy/runtime-agent/fleet-runtime-ids.json"
@@ -100,10 +109,10 @@ echo "Reading agent IDs from: $FLEET_FILE"
 
 # The custom dependency-chain evaluator is created per-account and is NOT
 # provisioned by any deploy step in this repo (its ID is account-specific).
-# Probe for it once. If it's missing, ticket agents gracefully fall back to
-# 5 built-in evaluators (adding Builtin.Helpfulness in the fifth slot, like
-# every other agent) instead of emitting a config that the API rejects with
-# "Evaluators not found".
+# Probe for it once. If it's missing, requirements_analyst gracefully falls
+# back to 5 built-in evaluators (adding Builtin.Helpfulness in the fifth slot,
+# like every other agent) instead of emitting a config that the API rejects
+# with "Evaluators not found".
 CUSTOM_EVALUATOR_AVAILABLE=false
 if AGENTCORE_SUPPRESS_RECOMMENDATION=1 agentcore eval evaluator list --max-results 100 2>/dev/null \
      | grep -q "$CUSTOM_EVALUATOR"; then
@@ -112,7 +121,7 @@ if AGENTCORE_SUPPRESS_RECOMMENDATION=1 agentcore eval evaluator list --max-resul
 else
   echo ""
   echo "⚠️  WARNING: custom evaluator '$CUSTOM_EVALUATOR' not found in this account."
-  echo "    Ticket agents will use 5 built-in evaluators (Helpfulness substituted"
+  echo "    requirements_analyst will use 5 built-in evaluators (Helpfulness substituted"
   echo "    for the dependency-chain check). To enable the custom evaluator, create"
   echo "    it with 'agentcore eval evaluator create' and re-run this script."
   echo ""
@@ -134,7 +143,7 @@ GATE_AGENTS="agentcore_hub_requirements_analyst agentcore_hub_qa_verifier agentc
 AGENT_COUNT=$(echo "$AGENTS" | wc -l | tr -d ' ')
 echo "Creating online evaluation configs for ${AGENT_COUNT} agents..."
 if [ "$CUSTOM_EVALUATOR_AVAILABLE" = true ]; then
-  echo "Evaluators: 5 per agent (ticket agents get custom dependency_chain evaluator)"
+  echo "Evaluators: 5 per agent (requirements_analyst gets custom dependency_chain evaluator)"
 else
   echo "Evaluators: 5 built-in per agent (custom evaluator unavailable — see warning above)"
 fi
@@ -150,10 +159,10 @@ while read name agent_id; do
 
   echo "→ Creating config for ${name} (${agent_id})..."
 
-  # Build the evaluator argument list (TEAM-3366 §2.4: trimmed to 5). Ticket
-  # agents spend their fifth slot on the custom dependency-chain evaluator
-  # (4 built-in + 1 custom) when it's available; otherwise the fifth slot is
-  # Builtin.Helpfulness, same as every other agent.
+  # Build the evaluator argument list (TEAM-3366 §2.4: trimmed to 5).
+  # requirements_analyst spends its fifth slot on the custom dependency-chain
+  # evaluator (4 built-in + 1 custom) when it's available; otherwise the fifth
+  # slot is Builtin.Helpfulness, same as every other agent.
   eval_args=(
     -e "Builtin.ToolSelectionAccuracy"
     -e "Builtin.InstructionFollowing"

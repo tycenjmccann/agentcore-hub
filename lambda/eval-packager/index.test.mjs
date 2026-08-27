@@ -921,6 +921,135 @@ describe('extractSessionData dedup (TEAM-3367)', () => {
   });
 });
 
+// ─── dependency-chain role scoping (TEAM-3368) ───────────────────────────────
+// The custom dependency_chain_compliance evaluator is scoped to
+// requirements_analyst (setup-evaluations.sh); this guard drops rows the live
+// configs may still emit for other roles (config drift). FAIL-OPEN: an
+// unparseable session id or a non-dep-chain evaluator never costs a record.
+
+describe('dependency-chain role scoping (TEAM-3368)', () => {
+  let extractSessionData;
+  let classifySessions;
+  let roleFromSessionId;
+  let isOutOfScopeDepChain;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ extractSessionData, classifySessions, roleFromSessionId, isOutOfScopeDepChain } =
+      await import('./index.mjs'));
+  });
+
+  const delivery = (logEvents) => ({
+    logGroup: '/aws/bedrock-agentcore/evaluations/results/eval_backend_dev-test',
+    logStream: 'test-stream',
+    logEvents,
+  });
+
+  const otelEvent = ({ sessionId, evaluatorName, score, timestamp, attrs = {} }) => ({
+    timestamp,
+    message: JSON.stringify({
+      attributes: {
+        'session.id': sessionId,
+        'gen_ai.evaluation.name': evaluatorName,
+        ...(score !== undefined && score !== null ? { 'gen_ai.evaluation.score.value': score } : {}),
+        ...attrs,
+      },
+    }),
+  });
+
+  const DEP_CHAIN_EVALUATOR = 'dependency_chain_compliance_online-mbLh2kEFhw';
+  const BACKEND_SID = 'wf_1756240000000_ab12cd-agentcore_hub_backend_dev-1756240012345';
+  const ANALYST_SID = 'TEAM-3201_wf_1756240000000_ab12cd-agentcore_hub_requirements_analyst-1756240012345';
+
+  it('roleFromSessionId parses orchestrator session ids, with and without ticket prefix', () => {
+    expect(
+      roleFromSessionId('TEAM-3200_wf_1756240000000_ab12cd-agentcore_hub_frontend_dev-1756240012345')
+    ).toBe('agentcore_hub_frontend_dev');
+    expect(roleFromSessionId(BACKEND_SID)).toBe('agentcore_hub_backend_dev');
+  });
+
+  it('roleFromSessionId returns null on malformed/absent/non-workflow ids', () => {
+    expect(roleFromSessionId('si-agentcore_hub_backend_dev-123')).toBe(null); // short ms suffix
+    expect(roleFromSessionId('cc-b46ff2c0237e4516ab3eaefbd724f9d9')).toBe(null);
+    expect(roleFromSessionId(null)).toBe(null);
+    expect(roleFromSessionId('')).toBe(null);
+  });
+
+  it('isOutOfScopeDepChain fails open on a null role', () => {
+    expect(
+      isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: 'si-something-123' })
+    ).toBe(false);
+    expect(isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: null })).toBe(false);
+  });
+
+  it('isOutOfScopeDepChain never touches non-dep-chain evaluators, whatever the role', () => {
+    expect(isOutOfScopeDepChain({ evaluatorName: 'Builtin.Correctness', sessionId: BACKEND_SID })).toBe(false);
+    expect(isOutOfScopeDepChain({ evaluatorName: null, sessionId: BACKEND_SID })).toBe(false);
+    expect(isOutOfScopeDepChain({ sessionId: BACKEND_SID })).toBe(false);
+  });
+
+  it('flags a dep-chain row for an out-of-scope role, keeps one for requirements_analyst', () => {
+    expect(isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: BACKEND_SID })).toBe(true);
+    expect(isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: ANALYST_SID })).toBe(false);
+  });
+
+  it('extractSessionData excludes an out-of-scope dep-chain row and leaves the rest intact', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({
+          sessionId: BACKEND_SID,
+          evaluatorName: DEP_CHAIN_EVALUATOR,
+          score: 0,
+          timestamp: 1,
+          attrs: { 'aws.request_id': 'req-dep' },
+        }),
+        otelEvent({
+          sessionId: BACKEND_SID,
+          evaluatorName: 'Builtin.Correctness',
+          score: 8,
+          timestamp: 2,
+          attrs: { 'aws.request_id': 'req-corr' },
+        }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.evaluatorResults[0]).toMatchObject({
+      evaluatorName: 'Builtin.Correctness',
+      score: 8,
+    });
+    expect(sessionData.depChainExcluded).toBe(1);
+    expect(sessionData.duplicatesDropped).toBe(0); // scope removals don't count as dupes
+
+    // Classification sees only the retained row: one scored session, no noise.
+    const { statuses, total, spanMissing } = classifySessions(sessionData);
+    expect(total).toBe(1);
+    expect(spanMissing).toBe(0);
+    expect(statuses.get(BACKEND_SID)).toBe('scored');
+  });
+
+  it('extractSessionData retains a dep-chain row for requirements_analyst', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({
+          sessionId: ANALYST_SID,
+          evaluatorName: DEP_CHAIN_EVALUATOR,
+          score: 7,
+          timestamp: 1,
+          attrs: { 'aws.request_id': 'req-dep-ra' },
+        }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.evaluatorResults[0]).toMatchObject({
+      evaluatorName: DEP_CHAIN_EVALUATOR,
+      score: 7,
+    });
+    expect(sessionData.depChainExcluded).toBe(0);
+  });
+});
+
 // ─── invokeImprover retry (TEAM-3367) ────────────────────────────────────────
 // Exponential backoff with FULL jitter (base 2s, cap 60s, 3 attempts), retrying
 // only transient failures, deadline-aware under the Lambda's 600s timeout.

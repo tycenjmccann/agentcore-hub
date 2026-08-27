@@ -254,15 +254,49 @@ export function dedupeResults(records) {
 }
 
 /**
+ * TEAM-3368 §3.2: role scoping for the custom dependency-chain evaluator.
+ * The eval configs (setup-evaluations.sh) attach it to requirements_analyst
+ * only, but live configs drift — an account may still carry the old
+ * qa_verifier/ci_agent configs until the next setup run. Those rows are
+ * rubric-mismatch zeros, not quality signal, so drop them here too (defense
+ * in depth). The role comes from the session id the orchestrator constructs
+ * (lambda/orchestrator/index.mjs): `${ticketPrefix}${workflow.id}-<agentId>-<ms>`
+ * — agent ids contain '_' never '-', and the trailing timestamp is a 13-digit
+ * millisecond value, so `-(agentcore_hub_...)-<13 digits>$` is unambiguous.
+ *
+ * FAIL-OPEN by design: a session id we can't parse (absent, malformed, or a
+ * non-workflow id like si-…/cc-…) must never cost us a record, and rows for
+ * any evaluator other than the dependency-chain family are never touched.
+ */
+export const ROLE_RE = /-(agentcore_hub_[a-z0-9_]+)-\d{13}$/;
+export const DEP_CHAIN_ROLES = new Set(['agentcore_hub_requirements_analyst']);
+export const DEP_CHAIN_RE = /^dependency_chain_compliance/;
+
+export function roleFromSessionId(sid) {
+  if (typeof sid !== 'string') return null;
+  const match = ROLE_RE.exec(sid);
+  return match ? match[1] : null;
+}
+
+export function isOutOfScopeDepChain(row) {
+  if (!DEP_CHAIN_RE.test(row?.evaluatorName ?? '')) return false;
+  const role = roleFromSessionId(row.sessionId);
+  if (role === null) return false; // fail-open: unattributable → keep
+  return !DEP_CHAIN_ROLES.has(role);
+}
+
+/**
  * Extract session data from parsed CW Logs event.
  * Parses each logEvent.message as JSON to extract evaluator scores,
  * evaluator name, and evidence. Stores parsed results (not raw event metadata)
  * so the improver agent can synthesize actionable insights from batch payloads.
  *
- * evaluatorResults comes back DEDUPED (TEAM-3367) so classifySessions, the
- * score aggregation, and the buffered batch all see one row per evaluation
- * attempt; `duplicatesDropped` counts what was removed (exposed for a
- * follow-up monitoring ticket — no metric emitted here).
+ * evaluatorResults comes back DEDUPED (TEAM-3367) and role-scoped (TEAM-3368,
+ * see isOutOfScopeDepChain above) so classifySessions, the score aggregation,
+ * and the buffered batch all see one row per in-scope evaluation attempt;
+ * `duplicatesDropped` counts dedup removals and `depChainExcluded` counts
+ * scope removals (both exposed for a follow-up monitoring ticket — no metric
+ * emitted here).
  */
 export function extractSessionData(parsed) {
   const logEvents = parsed.logEvents || [];
@@ -316,7 +350,17 @@ export function extractSessionData(parsed) {
     }
   }
 
-  const evaluatorResults = dedupeResults(sessionBuffer);
+  const deduped = dedupeResults(sessionBuffer);
+  const evaluatorResults = deduped.filter((r) => !isOutOfScopeDepChain(r));
+  const depChainExcluded = deduped.length - evaluatorResults.length;
+  if (depChainExcluded > 0) {
+    console.log(JSON.stringify({
+      level: 'warn',
+      event: 'eval.depchain.out_of_scope_excluded',
+      logGroup: parsed.logGroup,
+      excluded: depChainExcluded,
+    }));
+  }
 
   return {
     logGroup: parsed.logGroup,
@@ -324,7 +368,8 @@ export function extractSessionData(parsed) {
     timestamp: new Date().toISOString(),
     sessionIds: [...sessionIds],
     evaluatorResults,
-    duplicatesDropped: sessionBuffer.length - evaluatorResults.length,
+    duplicatesDropped: sessionBuffer.length - deduped.length,
+    depChainExcluded,
   };
 }
 
