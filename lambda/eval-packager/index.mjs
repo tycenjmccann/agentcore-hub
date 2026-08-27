@@ -121,15 +121,25 @@ export const handler = async (event) => {
     return { statusCode: 200, body: 'disabled' };
   }
 
+  // Extract session data from log events (enriched with parsed evaluator results).
+  // Done BEFORE the sample-rate gate below: telemetry health (span_missing) must
+  // be measured on ALL deliveries, not just the sampled subset that gets buffered.
+  const sessionData = extractSessionData(parsed);
+
+  const { statuses, total, spanMissing } = classifySessions(sessionData);
+  if (total > 0) {
+    emitEvalMetrics(agentId, { total, spanMissing });
+    sessionData.sessionStatus = Object.fromEntries(statuses);
+    if (spanMissing > 0) sessionData.status = 'span_missing';
+    console.log(`[eval-packager] ${agentId}: sessions=${total} span_missing=${spanMissing}`);
+  }
+
   // 4. Sample rate check
   const sampleRate = config.sampleRate ?? 100;
   if (Math.random() * 100 >= sampleRate) {
     console.log(`[eval-packager] Agent ${agentId} sample-rate miss (rate=${sampleRate}%). Skipping.`);
     return { statusCode: 200, body: 'sampled-out' };
   }
-
-  // Extract session data from log events (enriched with parsed evaluator results)
-  const sessionData = extractSessionData(parsed);
 
   // 5. Aggregate eval scores into DDB (for instant dashboard loads)
   await aggregateScoresToDdb(agentId, parsed);
@@ -183,7 +193,7 @@ async function getAgentConfig(agentId) {
  * evaluator name, and evidence. Stores parsed results (not raw event metadata)
  * so the improver agent can synthesize actionable insights from batch payloads.
  */
-function extractSessionData(parsed) {
+export function extractSessionData(parsed) {
   const logEvents = parsed.logEvents || [];
   const sessionBuffer = [];
   const sessionIds = new Set();
@@ -201,11 +211,16 @@ function extractSessionData(parsed) {
       // gen_ai.* keys, NOT top-level fields. Reading parsedMessage.score/.evidence
       // produced all-null batches the improver couldn't synthesize from.
       const rawScore = attrs['gen_ai.evaluation.score.value'];
+      const numericScore = rawScore !== undefined && rawScore !== null ? Number(rawScore) : null;
       sessionBuffer.push({
         timestamp: event.timestamp,
         sessionId: sid,
         evaluatorName: attrs['gen_ai.evaluation.name'] || parsedMessage.evaluatorName || null,
-        score: rawScore !== undefined && rawScore !== null ? Number(rawScore) : null,
+        // Number(rawScore) coerces non-numeric garbage (e.g. "not-a-number") to
+        // NaN, and NaN !== null — that defeated classifySessions' allNull check
+        // and marked span_missing sessions as "scored". Store null instead so
+        // malformed scores participate in null/error/span_missing classification.
+        score: Number.isFinite(numericScore) ? numericScore : null,
         scoreLabel: attrs['gen_ai.evaluation.score.label'] || null,
         evidence: attrs['gen_ai.evaluation.explanation'] || parsedMessage.evidence || null,
         errorType: attrs['error.type'] || null,
@@ -228,6 +243,54 @@ function extractSessionData(parsed) {
     sessionIds: [...sessionIds],
     evaluatorResults: sessionBuffer,
   };
+}
+
+/**
+ * Classify each distinct session in this delivery.
+ * Returns { statuses: Map<sessionId, 'scored'|'span_missing'|'error'>, total, spanMissing }
+ */
+export function classifySessions(sessionData) {
+  const bySession = new Map();
+  for (const r of sessionData.evaluatorResults) {
+    if (r.parseError || !r.sessionId) continue;      // unattributable rows
+    if (!bySession.has(r.sessionId)) bySession.set(r.sessionId, []);
+    bySession.get(r.sessionId).push(r);
+  }
+  const statuses = new Map();
+  for (const [sid, rows] of bySession) {
+    const allNull = rows.every((r) => r.score === null);
+    const hasError = rows.some((r) => r.errorType);
+    statuses.set(sid, !allNull ? 'scored' : hasError ? 'error' : 'span_missing');
+  }
+  return {
+    statuses,
+    total: bySession.size,
+    spanMissing: [...statuses.values()].filter((s) => s === 'span_missing').length,
+  };
+}
+
+/**
+ * Emit fleet span_missing health metrics as a single EMF log record.
+ * CloudWatch Logs auto-extracts these into the AgentCoreHub/Evaluations
+ * namespace — no CloudWatch SDK call, no new dependency.
+ */
+export function emitEvalMetrics(agentName, { total, spanMissing }) {
+  console.log(JSON.stringify({
+    _aws: {
+      Timestamp: Date.now(),
+      CloudWatchMetrics: [{
+        Namespace: 'AgentCoreHub/Evaluations',
+        Dimensions: [['AgentName']],
+        Metrics: [
+          { Name: 'EvalSessionsTotal', Unit: 'Count' },
+          { Name: 'EvalSessionsSpanMissing', Unit: 'Count' },
+        ],
+      }],
+    },
+    AgentName: agentName,
+    EvalSessionsTotal: total,
+    EvalSessionsSpanMissing: spanMissing,
+  }));
 }
 
 /**
@@ -297,9 +360,12 @@ async function aggregateScoresToDdb(agentId, parsed) {
       const hasError = attrs['error'] === 1 || attrs['error.type'];
 
       if (sessionId) sessions.add(sessionId);
-      if (evaluator && score !== undefined && score !== null && !hasError) {
+      const numericScore = score !== undefined && score !== null ? Number(score) : null;
+      // Number.isFinite gate: non-numeric garbage coerces to NaN, which would
+      // otherwise poison the rolling sum/count in the DDB scorecard.
+      if (evaluator && Number.isFinite(numericScore) && !hasError) {
         if (!scoreDeltas[evaluator]) scoreDeltas[evaluator] = { sum: 0, count: 0 };
-        scoreDeltas[evaluator].sum += Number(score);
+        scoreDeltas[evaluator].sum += numericScore;
         scoreDeltas[evaluator].count += 1;
       }
     } catch { /* skip */ }

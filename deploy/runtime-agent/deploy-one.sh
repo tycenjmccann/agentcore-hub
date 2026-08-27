@@ -159,6 +159,12 @@ PROMPT_ENV="--env SYSTEM_PROMPT_S3_KEY=${PROMPT_S3_KEY}"
 
 # Run `agentcore deploy`, retrying once if S3 races with another concurrent
 # fleet deploy (the toolkit creates a shared codebuild bucket internally).
+# TEAM-3313: do NOT set OTEL_RESOURCE_ATTRIBUTES — AgentCore Runtime injects
+# it as a platform ADOT default carrying aws.log.group.names, and a
+# deploy-time value REPLACES (never merges with) the platform one, breaking
+# CloudWatch log-group correlation. OTEL_SERVICE_NAME takes precedence over
+# service.name in resource attributes per the OTel spec, so per-persona
+# identity is preserved without it.
 run_deploy() {
   agentcore deploy \
     --auto-update-on-conflict \
@@ -178,6 +184,8 @@ run_deploy() {
     --env "PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers" \
     --env "HOME=/tmp" \
     --env "TMPDIR=/tmp" \
+    --env "OTEL_SERVICE_NAME=${AGENT_NAME}" \
+    --env "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true" \
     ${FLEET_MEMORY_ID:+--env "MEMORY_ID=${FLEET_MEMORY_ID}"} \
     ${IOS_TEST_GATEWAY_URL:+--env "IOS_TEST_GATEWAY_URL=${IOS_TEST_GATEWAY_URL}"} \
     ${CODING_AGENT_RUNTIME_ARN:+--env "CODING_AGENT_RUNTIME_ARN=${CODING_AGENT_RUNTIME_ARN}"} \
