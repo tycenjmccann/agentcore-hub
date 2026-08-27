@@ -488,6 +488,40 @@ def _poll_once(client, turn_id: str) -> dict:
     })
 
 
+def _recover_lost_submit(client, payload: dict):
+    """The submit's response was lost client-side. What the server did is
+    unknown — AND the server itself may be a legacy build that ignores
+    mode/turn_id and is still executing the turn synchronously (no dedupe, so a
+    blind resubmit would double-run it). Probe with a poll on the turn_id we
+    sent:
+      - async runtime that accepted the submit → running/done → treat as
+        submitted and let the normal poll loop take over;
+      - async runtime that never started it → unknown (journal seeded pre-return
+        means accepted turns always journal) → resubmit same id (deduped);
+      - legacy runtime → poll comes back an error/no-status → NOT safe to
+        resubmit; give up with an explicit error (the persona's retry guidance
+        stands, and the workspace is preserved).
+    Returns a submit-shaped dict, or None when recovery is unsafe."""
+    try:
+        probe = _poll_once(client, payload["turn_id"])
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[remote-coding] recovery probe failed: {str(e)[:200]}")
+        return None
+    state = probe.get("status")
+    if state in ("running", "done", "transient"):
+        return {"submitted": True, "turn_id": payload["turn_id"]}
+    if state == "unknown":
+        try:
+            return _coding_invoke(client, payload)  # deduped server-side
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[remote-coding] recovery resubmit failed: {str(e)[:200]}")
+            return None
+    # No parseable status → legacy runtime mid-synchronous-turn. Resubmitting
+    # would run the task twice; surface the loss instead.
+    logger.warning(f"[remote-coding] recovery probe unrecognized: {str(probe)[:200]}")
+    return None
+
+
 def _submit_and_poll(client, payload: dict) -> dict:
     """Submit one async coding turn and poll it to a terminal record.
 
@@ -497,16 +531,14 @@ def _submit_and_poll(client, payload: dict) -> dict:
     re-submit with the same id is acknowledged as a dedupe instead of running
     the prompt a second time in the same workspace."""
     payload = {**payload, "turn_id": f"turn-{uuid.uuid4().hex}"}
-    submitted = None
-    for attempt in (1, 2):
-        try:
-            submitted = _coding_invoke(client, payload)
-            break
-        except Exception as e:  # noqa: BLE001
-            if attempt == 2:
-                raise
-            logger.warning(f"[remote-coding] submit response lost, re-submitting "
-                           f"same turn_id (idempotent): {str(e)[:200]}")
+    try:
+        submitted = _coding_invoke(client, payload)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[remote-coding] submit response lost: {str(e)[:200]}")
+        submitted = _recover_lost_submit(client, payload)
+        if submitted is None:
+            return {"error": "submit response lost and could not be safely "
+                             "recovered (see logs)"}
     if submitted.get("error"):
         return submitted  # setup failure (bad repo, clone) — synchronous
     if not submitted.get("turn_id"):
