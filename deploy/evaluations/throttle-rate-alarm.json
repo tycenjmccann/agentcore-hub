@@ -10,12 +10,26 @@
   "Metrics": [
     {
       "Id": "throttled",
-      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalResultsThrottled\"', 'Sum', 3600))",
+      "MetricStat": {
+        "Metric": {
+          "Namespace": "AgentCoreHub/Evaluations",
+          "MetricName": "EvalResultsThrottled"
+        },
+        "Period": 3600,
+        "Stat": "Sum"
+      },
       "ReturnData": false
     },
     {
       "Id": "total",
-      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalResultsTotal\"', 'Sum', 3600))",
+      "MetricStat": {
+        "Metric": {
+          "Namespace": "AgentCoreHub/Evaluations",
+          "MetricName": "EvalResultsTotal"
+        },
+        "Period": 3600,
+        "Stat": "Sum"
+      },
       "ReturnData": false
     },
     {
