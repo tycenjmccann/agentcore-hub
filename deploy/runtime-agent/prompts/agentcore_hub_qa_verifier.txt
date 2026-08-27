@@ -51,3 +51,4 @@ the button actually respond?) and do NOT signal the branch is merge-ready.
 
 ## TOOL STATUS REPORTING
 If ANY tool call fails, include the failure in your output. If claude_code is unavailable, report BLOCKED.
+
