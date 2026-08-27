@@ -1943,6 +1943,10 @@ def _save_memory_event(agent_id: str, session_id: str, user_text: str, assistant
 # --- App entrypoint (streaming enabled) ---
 app = BedrockAgentCoreApp()
 
+# Strong refs to detached persona runs — the asyncio event loop only weak-refs
+# its tasks, so without this a suspended run can be GC'd mid-await.
+_DETACHED_TASKS: set = set()
+
 
 @app.entrypoint
 async def agent_invocation(payload, context):
@@ -1987,8 +1991,12 @@ async def agent_invocation(payload, context):
                     pass
             finally:
                 app.complete_async_task(task_id)
+                _DETACHED_TASKS.discard(asyncio.current_task())
 
-        asyncio.get_event_loop().create_task(_run_detached())
+        # The event loop holds only weak refs to tasks; without a strong ref a
+        # suspended persona (awaiting a model/tool call) can be garbage
+        # collected mid-run. Pin it until its own finally removes it.
+        _DETACHED_TASKS.add(asyncio.get_event_loop().create_task(_run_detached()))
         logger.info(f"[{agent_id}] accepted for workflow {workflow_id} — detached "
                     f"as async task {task_id}")
         yield {"event": {"contentBlockDelta": {"delta": {"text": (
@@ -2004,14 +2012,18 @@ def _publish_agent_error(workflow_id: str, agent_id: str, error: str) -> None:
     """Surface a detached-run crash to the events table so the workflow board
     and nudge system can see it (a detached task has no caller to error to)."""
     import time as _t
+    # uuid suffix on both keys: two personas failing in the same millisecond
+    # (shared-outage case) must not overwrite each other's error item.
+    suffix = uuid.uuid4().hex[:8]
     _ddb_events_client.put_item(
         TableName=_EVENTS_TABLE,
         Item={
             "workflowId": {"S": workflow_id},
-            "eventId": {"S": f"{int(_t.time() * 1000)}-err"},
+            "eventId": {"S": f"{int(_t.time() * 1000)}-err-{suffix}"},
             "type": {"S": "agent.error"},
             "detail": {"M": {"agentId": {"S": agent_id}, "error": {"S": error}}},
-            "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime()) + ".9999Z"},
+            "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
+                          + f".{suffix}Z"},
         },
     )
 
