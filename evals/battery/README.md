@@ -24,12 +24,32 @@ workflow). It is `success` only when every active case ran, scored, and held
 the thresholds; every other state — battery crash, timeout, missing results,
 fork PR — is an explicit **failure**, never neutral or absent.
 
+There is no neutral verdict anywhere in this pipeline: the publish job maps
+everything that is not `verdict: "PASS"` + a successful battery job onto
+`conclusion: failure`, and the deploy guard treats anything but a green check
+as "refuse to ship". So every "the gate proved nothing" condition below is a
+**FAIL with an explicit `failureReason`**, not a neutral conclusion.
+
+### What can never produce a PASS
+
+| Condition | Why |
+| --- | --- |
+| `baseline.json` is still `bootstrap: true` | Nothing to compare against — the run still executes and reports scores (the baseline workflow consumes them), but the gate stays red until a real baseline is published. |
+| Zero baseline-compared gating cases | Informational cases (new-in-PR, or every case under a bootstrap baseline) prove nothing; PASS requires ≥1 scored case that was actually compared to a baseline entry. |
+| Any case not `scored` | errored / timed_out / skipped / unscored / forbidden-tool — a partial run is never a pass. |
+| Duplicate case ids across `cases/*.json` | Preflight failure, before any spend. |
+| Accumulated spend above `maxRunUsd` | The runner aborts remaining work and fails the suite. |
+| A case active at the base ref that the PR deletes | Preflight failure — a PR cannot remove a gating case. |
+
 ## Case format
 
 Cases live in `cases/*.json`, one file per case, validated against
 `schema/case.schema.json` by preflight (which runs before any model call —
-malformed cases fail loudly at zero cost). Copy `cases/_template.json` to
-start a new one. Fields:
+malformed cases fail loudly at zero cost). **Ids must be unique across
+`cases/`**: two files claiming the same id would collapse in every id-keyed
+roster (manifest cross-check, baseline lookup, selection), so preflight and
+`npm run battery:lint` both fail and name the offending files. Copy
+`cases/_template.json` to start a new one. Fields:
 
 | Field | Meaning |
 | --- | --- |
@@ -112,6 +132,12 @@ is a gate failure** (fail closed; scores across backends are not comparable).
 - **Bootstrap state.** `bootstrap: true` with `runs_per_case: 0` and empty
   `cases` means no real baseline has been recorded yet; every case runs
   informational until the first baseline workflow run populates the file.
+  **A bootstrap baseline can never produce a green gate**: the suite verdict is
+  `FAIL` with `baseline is bootstrap — gate cannot pass until a real baseline is
+  published…`, and the runner exits non-zero. Scores are still executed and
+  reported so the baseline workflow (and reviewers) can see them; only the
+  verdict is withheld. Bootstrap is a "gate not yet armed" state, and an unarmed
+  gate must not look identical to a passing one.
 - **Regenerated ONLY by `.github/workflows/config-evals-baseline.yml`** on
   merge to `main` (or manual dispatch). PR runs never write it — the runner
   has no baseline-writing code path outside `--baseline-mode --out`.
@@ -119,9 +145,45 @@ is a gate failure** (fail closed; scores across backends are not comparable).
   case absent from the baseline (drift or hand-editing).
 - **New-in-PR cases run informational**: scores are reported in the check
   summary but produce no delta verdict in the PR that introduces them; the
-  post-merge baseline run absorbs them.
+  post-merge baseline run absorbs them. A suite in which *every* case is
+  informational is a `FAIL` ("no baseline-compared gating cases") — otherwise a
+  PR that made every case look new would pass by proving nothing.
 - Concurrent baseline runs are serialized; a run whose commit is superseded by
   a baseline from a descendant commit discards itself (see the workflow).
+
+### Where the gating rules come from (gate mode)
+
+A PR can edit the battery's own config, so in **gate mode** — whenever
+`--base-ref <ref>` is passed, as CI does — the runner refuses to referee itself
+with PR-controlled rules. It reads these from `git show <base-ref>:<path>`
+instead of the PR checkout:
+
+| File | What comes from the base ref |
+| --- | --- |
+| `baseline.json` | the whole baseline (means, `source_commit`, `scoringBackend`) |
+| `thresholds.json` | every knob: `overallDropMaxPoints`, `floorRule`, `maxRunUsd` |
+| `manifest.json` | the gating knobs only — `minActiveCases`, and which case ids count as active |
+
+Consequences for a PR that touches the battery:
+
+- **Weakening thresholds or hand-editing the baseline has no effect on its own
+  gate run.** The change applies from the merge onward.
+- **Retiring a case takes effect only once it has landed on the base branch.** A
+  case that is active at the base ref but `retired` at HEAD still runs and still
+  gates (the runner logs a warning and does not list it as retired).
+- **Deleting a base-active case file is a preflight failure**, never a silent
+  drop from the run set.
+- **New cases use PR-head definitions** — they cannot exist at the base ref, so
+  there is nothing else to read. They run informational (see above).
+- **If a file is absent at the base ref** (the battery didn't exist there yet),
+  the runner falls back to the PR-head copy and says so loudly. That fallback is
+  only safe because of the bootstrap and zero-gating-case rules above — a
+  fabricated baseline still cannot manufacture a PASS.
+- Every run prints a `Gate config resolution` block naming the source of each
+  file, and `battery-results.json` records it under `configSources`.
+
+Without `--base-ref` (local/manual runs) everything comes from the working tree,
+which is what you want when iterating on a case.
 
 ### Gate thresholds (`thresholds.json`)
 
@@ -132,6 +194,9 @@ is a gate failure** (fail closed; scores across backends are not comparable).
   One floor breach fails the gate regardless of every other cell.
 - **Partial runs never pass:** an errored, timed-out, skipped, or unscored
   case is a failure — there is no code path from a partial run to `PASS`.
+- **At least one gating case:** `PASS` requires ≥1 scored case compared against
+  a baseline entry (`gatingCases` in the results file).
+- In gate mode all of these numbers are read from the **base ref** — see above.
 
 ## Incident-to-eval-case process (FR-8)
 
@@ -173,9 +238,14 @@ regression.**
   `activeCases`.
 - Retired cases are excluded from gating but **listed in every check summary
   with their reason** — retirement is visible, never silent.
-- The battery never drops below `minActiveCases: 10`. A retirement PR that
-  would go under fails its own gate (preflight) until a replacement case lands
-  in the same PR.
+- **Retirement takes effect only after merge.** The retirement PR's own gate run
+  still executes and still gates the case it retires (the base ref says it is
+  active), so a flaky case cannot be silenced in the same PR that degrades a
+  prompt. The check summary logs the case as "still gating this run".
+- The battery never drops below `minActiveCases: 10` — read from the base ref in
+  gate mode, so lowering the floor and retiring cases in one PR does not work. A
+  retirement PR that would go under fails its own gate (preflight) until a
+  replacement case lands in the same PR.
 
 ## Hermeticity
 
@@ -234,8 +304,23 @@ Design cost model ($/MTok, `lib/agent-runner.mjs` `PRICING_PER_MTOK`):
 | opus (needs justification) | $5 | $25 |
 | judge (Opus 4.7 scoring) | $5 | $25 |
 
-Every run tracks cumulative usage; a run whose cost exceeds
-**`maxRunUsd: 20`** fails the gate with "budget exceeded" (exactly $20
-passes). The CI job is additionally capped at **`timeout-minutes: 15`** — a
-hung battery becomes a failed job, which the publish job turns into a failed
-check.
+**`maxRunUsd: 20` is a live ceiling, not a post-hoc report** (`lib/spend.mjs`).
+Every Converse response — case turns *and* judge calls — is metered into a
+ledger, and the ledger is consulted *before* each call and before each unstarted
+case:
+
+- Crossing the ceiling mid-case aborts that case (it lands `errored`).
+- Cases not yet started are marked `skipped` and cost nothing.
+- The suite verdict is `FAIL` with a `run spend ceiling exceeded` reason naming
+  the abandoned cases; the final total is still checked against `maxRunUsd` as a
+  backstop (exactly $20 passes).
+- Worst-case spend is therefore ~`maxRunUsd` plus the turns already in flight
+  across the pool of 4 — not "however much the whole suite happened to cost".
+
+In gate mode `maxRunUsd` comes from the base ref's `thresholds.json`, so a PR
+cannot raise its own ceiling. `--baseline-mode` runs each case `--repeat` times,
+so its ceiling is `maxRunUsd × repeat`; hitting it fails baseline generation
+rather than writing a partial baseline.
+
+The CI job is additionally capped at **`timeout-minutes: 15`** — a hung battery
+becomes a failed job, which the publish job turns into a failed check.

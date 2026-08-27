@@ -29,13 +29,37 @@ const round2 = (x) => Math.round(x * 100) / 100;
  * newCaseIds: ids added in this PR (or ALL active ids when baseline.bootstrap)
  *   — these run informational: scores reported, no delta verdict; but a
  *   non-scored new case still fails the gate.
+ * costCeilingReasons: pre-computed failure reasons from the runner's live spend
+ *   ceiling (B5) — the run was aborted mid-suite, so the verdict must fail even
+ *   if every case that did run held its floors.
  *
- * @param {{ thresholds: any, baseline: any, caseResults: any[], newCaseIds?: string[], costEstimateUsd?: number, scoringBackend?: string }} args
+ * @param {{ thresholds: any, baseline: any, caseResults: any[], newCaseIds?: string[], costEstimateUsd?: number, scoringBackend?: string, costCeilingReasons?: string[] }} args
  */
-export function evaluateSuite({ thresholds, baseline, caseResults, newCaseIds, costEstimateUsd, scoringBackend }) {
+export function evaluateSuite({
+  thresholds,
+  baseline,
+  caseResults,
+  newCaseIds,
+  costEstimateUsd,
+  scoringBackend,
+  costCeilingReasons,
+}) {
   const failureReasons = [];
   const deltaRows = [];
-  const newIds = new Set(baseline?.bootstrap === true ? caseResults.map((c) => c.id) : newCaseIds || []);
+  const bootstrapBaseline = baseline?.bootstrap === true;
+  const newIds = new Set(bootstrapBaseline ? caseResults.map((c) => c.id) : newCaseIds || []);
+  /** Cases that were scored AND compared against a baseline entry (B3). */
+  const gatingCaseIds = new Set();
+
+  // (f) A bootstrap baseline compares against nothing, so every case runs
+  // informational — which would otherwise make an all-zero suite "PASS". The
+  // run still executes and reports scores (the baseline workflow consumes
+  // them), but the gate itself can never be green off a bootstrap baseline.
+  if (bootstrapBaseline) {
+    failureReasons.push(
+      "baseline is bootstrap — gate cannot pass until a real baseline is published by .github/workflows/config-evals-baseline.yml"
+    );
+  }
 
   if (scoringBackend && baseline?.scoringBackend && baseline.scoringBackend !== scoringBackend) {
     failureReasons.push(
@@ -100,6 +124,7 @@ export function evaluateSuite({ thresholds, baseline, caseResults, newCaseIds, c
       }
       baselinePairs.push(stats.mean);
       currentPairs.push(current);
+      gatingCaseIds.add(result.id);
     }
   }
 
@@ -119,10 +144,23 @@ export function evaluateSuite({ thresholds, baseline, caseResults, newCaseIds, c
     }
   }
 
-  // (d) budget.
+  // (d) budget. The runner also enforces this live, between cases and between
+  // turns (see lib/spend.mjs) — this is the backstop for the final total.
   if (typeof costEstimateUsd === "number" && costEstimateUsd > thresholds.maxRunUsd) {
     failureReasons.push(
       `FAIL: budget exceeded — estimated $${costEstimateUsd.toFixed(2)} > maxRunUsd $${thresholds.maxRunUsd.toFixed(2)}`
+    );
+  }
+  for (const reason of costCeilingReasons || []) failureReasons.push(reason);
+
+  // (g) A suite in which NOTHING was compared against the baseline proves
+  // nothing: bootstrap baselines, all-cases-new-in-PR, and an empty selection
+  // all land here. PASS requires at least one scored, baseline-compared,
+  // non-informational case.
+  if (gatingCaseIds.size === 0) {
+    failureReasons.push(
+      `no baseline-compared gating cases — refusing to PASS ` +
+        `(${caseResults.length} case result(s), ${newIds.size} informational, 0 compared against the baseline)`
     );
   }
 
@@ -131,6 +169,8 @@ export function evaluateSuite({ thresholds, baseline, caseResults, newCaseIds, c
     failureReasons,
     deltaRows,
     informationalCases: [...newIds].filter((id) => caseResults.some((c) => c.id === id)),
+    gatingCases: [...gatingCaseIds],
+    bootstrapBaseline,
     summary: { overallBaseline, overallCurrent, overallDelta, scale: SCALE },
   };
 }

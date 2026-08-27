@@ -14,6 +14,7 @@ export function buildResults({
   retiredCases,
   costEstimateUsd,
   runtimeSeconds,
+  configSources,
 }) {
   return {
     runId,
@@ -22,6 +23,11 @@ export function buildResults({
     scoringBackend,
     verdict: suite.verdict,
     failureReasons: suite.failureReasons,
+    // Where the gating rules came from (base ref vs PR head) and whether the
+    // baseline was still a bootstrap placeholder — both decide the verdict.
+    configSources: configSources ?? null,
+    bootstrapBaseline: suite.bootstrapBaseline ?? false,
+    gatingCases: suite.gatingCases ?? [],
     cases: caseResults.map((c) => ({
       id: c.id,
       status: c.status,
@@ -52,6 +58,19 @@ export function renderCheckSummary(results) {
   lines.push(`- **Run:** \`${results.runId}\` @ \`${results.configSha}\``);
   lines.push(`- **Baseline:** \`${results.baselineSha}\` (backend: ${results.scoringBackend})`);
   lines.push(`- **Cost:** $${results.costEstimateUsd} — **Runtime:** ${results.runtimeSeconds}s`);
+  if (results.configSources?.baseRef) {
+    const sources = Object.entries(results.configSources)
+      .filter(([key]) => key !== "baseRef")
+      .map(([file, source]) => `${file} ← ${source}`)
+      .join("; ");
+    lines.push(`- **Gating rules:** ${sources}`);
+  }
+  lines.push(`- **Gating cases:** ${(results.gatingCases || []).length} compared against the baseline`);
+  if (results.bootstrapBaseline) {
+    lines.push(
+      "- ⚠️ **Bootstrap baseline** — scores below are informational only and the gate cannot pass until the baseline workflow publishes a real baseline."
+    );
+  }
   const s = results.summary;
   if (s.overallBaseline !== null && s.overallBaseline !== undefined) {
     lines.push(`- **Overall:** baseline ${s.overallBaseline} → current ${s.overallCurrent} (Δ ${s.overallDelta}, scale ${s.scale})`);
