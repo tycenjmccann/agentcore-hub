@@ -10,6 +10,7 @@ its heavyweight neighbors.
 Run: python3 -m unittest deploy/runtime-agent/test_telemetry_init.py
 """
 
+import os
 import sys
 import types
 import unittest
@@ -63,9 +64,12 @@ class TestTelemetryInit(unittest.TestCase):
     def test_no_sdk_provider_installs_strands_fallback(self):
         # Bare object() (API-default ProxyTracerProvider stand-in, no
         # add_span_processor) → StrandsTelemetry().setup_otlp_exporter() once.
+        # The fallback is gated on AGENT_OBSERVABILITY_ENABLED=true (the
+        # gate-off cases live in tests/test_telemetry_spans.py).
         strands_cls = mock.Mock()
         ns = {"logger": mock.Mock()}
-        with mock.patch.dict(sys.modules, _fake_modules(object(), strands_cls)):
+        with mock.patch.dict(sys.modules, _fake_modules(object(), strands_cls)), \
+                mock.patch.dict(os.environ, {"AGENT_OBSERVABILITY_ENABLED": "true"}):
             exec(compile(_extract_block(), str(_MAIN), "exec"), ns)
         strands_cls.assert_called_once_with()
         strands_cls.return_value.setup_otlp_exporter.assert_called_once_with()
@@ -76,7 +80,8 @@ class TestTelemetryInit(unittest.TestCase):
         # StrandsTelemetry constructed at most once.
         strands_cls = mock.Mock()
         ns = {"logger": mock.Mock()}
-        with mock.patch.dict(sys.modules, _fake_modules(object(), strands_cls)):
+        with mock.patch.dict(sys.modules, _fake_modules(object(), strands_cls)), \
+                mock.patch.dict(os.environ, {"AGENT_OBSERVABILITY_ENABLED": "true"}):
             exec(compile(_extract_block(), str(_MAIN), "exec"), ns)
             ns["_init_telemetry"]()
             ns["_init_telemetry"]()
@@ -109,7 +114,8 @@ class TestTelemetryInit(unittest.TestCase):
         )
         logger = mock.Mock()
         ns = {"logger": logger}
-        with mock.patch.dict(sys.modules, _fake_modules(object(), strands_cls)):
+        with mock.patch.dict(sys.modules, _fake_modules(object(), strands_cls)), \
+                mock.patch.dict(os.environ, {"AGENT_OBSERVABILITY_ENABLED": "true"}):
             exec(compile(_extract_block(), str(_MAIN), "exec"), ns)
             ns["_init_telemetry"]()
         strands_cls.assert_called_once()

@@ -41,6 +41,103 @@ Optional: test with a different model:
 python3 verify-fleet-invoke.py --fleet-file fleet-runtime-ids.json --timeout 600 --parallel 5 --model us.anthropic.claude-sonnet-4-6
 ```
 
+## Post-deploy telemetry verification
+
+The eval batch classifies a run by the `invoke_agent` span
+(`gen_ai.operation.name=invoke_agent`, `scope.name=strands.telemetry.tracer`).
+That span only exists if a real OTel `TracerProvider` is registered in the
+runtime — so after every deploy that touches telemetry, run both probes below.
+A green deploy with no spans still scores 0/10.
+
+### Verification gates (automated, blocking)
+
+The manual probes below are now enforced by two scripts — a deploy is not
+telemetry-verified until they pass:
+
+- **`verify-fleet.sh` span probe (blocking):** after each agent's health-check
+  invocation, the script polls that runtime's `spans` log stream (up to
+  3 × 60s) for a fresh `invoke_agent` span and **fails the deploy** if none
+  appears. Broken telemetry can no longer ship silently. Emergency bypass:
+  `SKIP_SPAN_PROBE=true` (prints a loud warning; the deploy is then NOT
+  telemetry-verified — re-verify as soon as possible).
+- **`../evaluations/canary-eval-spans.sh` (E2E canary):** one synthetic
+  invocation under a known `runtimeSessionId`, then a blocking check (≤5 min)
+  that an `invoke_agent` span carrying that `session.id` landed, plus an
+  advisory check (≤30 min, warn-only) that the online-eval results log group
+  scored the session (non-null `gen_ai.evaluation.score.value`). Run it
+  standalone (`./canary-eval-spans.sh [agent_id]`) or from `verify-fleet.sh`
+  with `RUN_EVAL_CANARY=true`.
+
+**AC2.3 (direct_code_deploy auto-instrumentation verification):** the RESULT
+for this acceptance criterion is produced by these gates at Stage-1 rollout —
+the span probe failing the deploy is the enforcement mechanism, and the
+observed outcome (which provider won, spans delivered or not) is to be
+recorded on the rollout PR when Stage-1 runs.
+
+### 1. Startup probe — which TracerProvider won?
+
+`_init_telemetry()` in `main.py` logs exactly one `[telemetry]` line at module
+import. Read it from the runtime's log group:
+
+```bash
+AGENT_ID=<agent_id>   # e.g. agentcore_hub_backend_dev-XXXXXXXXXX
+aws logs filter-log-events \
+  --log-group-name "/aws/bedrock-agentcore/runtimes/${AGENT_ID}-DEFAULT" \
+  --filter-pattern '"[telemetry]"' \
+  --max-items 20
+```
+
+Interpret:
+
+| Log line | Meaning | Action |
+|----------|---------|--------|
+| `existing global TracerProvider: opentelemetry.sdk.trace.TracerProvider` (or an ADOT provider class) | Auto-instrumentation applied — the platform/ADOT registered the SDK before `main.py` loaded. **This is the healthy path.** | Continue to probe 2 |
+| `auto-instrumentation absent — StrandsTelemetry OTLP fallback active (was ...ProxyTracerProvider, now TracerProvider)` | No auto-instrumentation; `main.py` registered its own OTLP exporter. Spans *may* still ship, but only if `OTEL_EXPORTER_OTLP_*` resolves. | Continue to probe 2; if it fails, escalate (§3) |
+| `no TracerProvider and AGENT_OBSERVABILITY_ENABLED != true — spans will NOT be exported` | Platform observability was not applied to this runtime (no ADOT injection, no `AGENT_OBSERVABILITY_ENABLED`). | Re-deploy and confirm the runtime has observability enabled — the platform injects `AGENT_OBSERVABILITY_ENABLED=true`; deploy scripts deliberately do not set it (TEAM-3103) |
+| *no `[telemetry]` line at all* | Runtime is serving stale code. | Re-deploy and confirm the runtime status went through UPDATE |
+
+### 2. Span probe — did an `invoke_agent` span land?
+
+Invoke one agent (any real task, or `verify-fleet-invoke.py` against a single
+ARN), wait ~1 min for export, then:
+
+```bash
+aws logs filter-log-events \
+  --log-group-name "/aws/bedrock-agentcore/runtimes/${AGENT_ID}-DEFAULT" \
+  --log-stream-name-prefix spans \
+  --filter-pattern '"invoke_agent"'
+```
+
+Confirm in the returned span JSON:
+
+- `gen_ai.operation.name` = `invoke_agent`
+- `gen_ai.agent.name` = the persona's `agent_id` (comes from `Agent(name=agent_id)`)
+- `session.id` present (the runtime session id)
+- `gen_ai.user.message` and `gen_ai.choice` events present on the span
+- `agent.id` / `workflow.id` attributes present (from `trace_attributes`)
+
+Repeat once for a **detached** invocation — a payload with `{"detach": true}`,
+which is how the orchestrator dispatches workflow persona runs. Detached runs
+return to the caller immediately and finish on a background asyncio task, so
+they're the case most likely to lose spans if the provider is never flushed.
+An `invoke_agent` span must appear for the detached run too.
+
+### 3. Escalation — fallback active and no spans delivered
+
+If probe 1 reports the StrandsTelemetry fallback **and** probe 2 finds no
+`invoke_agent` span, stop trying to fix the CodeZip path: `direct_code_deploy`
+runtimes have no `opentelemetry-instrument` wrapper, so span delivery depends
+entirely on platform ADOT injection. Move the eval fleet to the container path,
+which runs `opentelemetry-instrument` explicitly via the Dockerfile `CMD`:
+
+```bash
+export DEPLOY_MODE=robust      # build-and-push.sh + deploy-one-robust.py
+./deploy-fleet.sh              # or ./deploy-one.sh <agent_name> for a single agent
+```
+
+Then re-run probes 1 and 2 — probe 1 should now report an existing SDK/ADOT
+`TracerProvider` rather than the fallback.
+
 ## Environment Variables Reference
 
 ### Required Shell Env (set BEFORE running deploy-one.sh)
@@ -72,6 +169,20 @@ These are passed via `--env` in deploy-one.sh and available inside the runtime a
 | `CLAUDE_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Claude Code model |
 | `ANTHROPIC_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Claude Code model (alt) |
 | `GITHUB_PAT` | *(token)* | GitHub MCP access |
+| `UNIFIED_TRACES_DESTINATION_ENABLED` | `true` | Deliver spans to the unified telemetry destination (`spans` log streams) |
+| `OTEL_SERVICE_NAME` | *(agent name)* | Service name on every emitted span |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | `true` | Capture prompt/response content on GenAI span events (eval input) |
+
+> Runtime-hosted agents get ADOT injected by the platform, and with it
+> `AGENT_OBSERVABILITY_ENABLED`, `OTEL_PYTHON_DISTRO`,
+> `OTEL_PYTHON_CONFIGURATOR`, `OTEL_EXPORTER_OTLP_PROTOCOL`,
+> `OTEL_TRACES_EXPORTER`, the OTLP endpoint, auth headers and resource
+> attributes (TEAM-3103: `test_build_env_vars.py` pins the platform-managed
+> list). Do **not** set those at deploy time — in particular
+> `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_HEADERS` or
+> `OTEL_RESOURCE_ATTRIBUTES` (TEAM-3313: a deploy-time value replaces the
+> platform one carrying `aws.log.group.names` and breaks log-group
+> correlation) — and **never** set `DISABLE_ADOT_OBSERVABILITY`.
 
 ## Known Gotchas
 

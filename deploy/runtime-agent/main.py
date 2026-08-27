@@ -171,6 +171,7 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentcore-hub-pipeline-agent")
 
+
 # Span EMISSION half of the telemetry fix (R1) is the init block below; the
 # span DELIVERY half (force_flush before microVM freeze) lives in
 # _run_agent_invocation's finally block — see the comment there (R5).
@@ -182,36 +183,51 @@ logger = logging.getLogger("agentcore-hub-pipeline-agent")
 # NOTHING — a no-arg StrandsTelemetry() would log "Overriding of current
 # TracerProvider is not allowed", orphan its own provider, and clobber the
 # baggage,xray,tracecontext propagators (drops session.id stamping).
-# The StrandsTelemetry fallback exists only for bare `python main.py`.
+# The StrandsTelemetry fallback exists only for runs without
+# auto-instrumentation (bare `python main.py`, direct_code_deploy without
+# ADOT), and it is gated on AGENT_OBSERVABILITY_ENABLED=true: without a real
+# TracerProvider the `invoke_agent` span is never exported and eval batches
+# score 0/10, so when the gate blocks we log the exact warning string the
+# DEPLOY.md startup probe and verify-fleet.sh grep for.
 
 _TELEMETRY_INITIALIZED = False
 
 
 def _init_telemetry() -> None:
     global _TELEMETRY_INITIALIZED
-    if _TELEMETRY_INITIALIZED:
+    # globals().get(): tests exec this function in a bare namespace where the
+    # module-level `_TELEMETRY_INITIALIZED = False` assignment is absent, and
+    # the guard runs before the try block below.
+    if globals().get("_TELEMETRY_INITIALIZED", False):
         return
     # TEAM-3313: this runs at module import — any exception here would abort
     # the import before `app = BedrockAgentCoreApp()` and turn a telemetry
     # failure into a total agent outage. Swallow and log instead.
     try:
+        import os as _os
+
         from opentelemetry import trace as _otel_trace_api
 
         provider = _otel_trace_api.get_tracer_provider()
+        provider_cls = f"{provider.__class__.__module__}.{provider.__class__.__name__}"
         if hasattr(provider, "add_span_processor"):
             # Real SDK provider → opentelemetry-instrument/ADOT own the pipeline.
             logger.info(
-                "telemetry: ADOT-managed TracerProvider active (%s) — Strands "
-                "invoke_agent spans attach to it; no local exporter added",
-                type(provider).__name__,
+                f"[telemetry] existing global TracerProvider: {provider_cls} — "
+                "ADOT/auto-instrumentation owns the pipeline; skipping StrandsTelemetry init"
+            )
+        elif _os.getenv("AGENT_OBSERVABILITY_ENABLED", "").lower() != "true":
+            logger.warning(
+                f"[telemetry] no TracerProvider and AGENT_OBSERVABILITY_ENABLED != true — "
+                f"spans will NOT be exported (provider={provider_cls})"
             )
         else:
             from strands.telemetry import StrandsTelemetry
 
-            StrandsTelemetry().setup_otlp_exporter()
-            logger.info(
-                "telemetry: no SDK TracerProvider found — StrandsTelemetry "
-                "fallback provider + OTLP exporter installed"
+            StrandsTelemetry().setup_otlp_exporter()  # honors OTEL_EXPORTER_OTLP_* env vars
+            logger.warning(
+                "[telemetry] auto-instrumentation absent — StrandsTelemetry OTLP fallback active "
+                f"(was {provider_cls}, now {_otel_trace_api.get_tracer_provider().__class__.__name__})"
             )
     except Exception:
         logger.warning(
@@ -2083,6 +2099,10 @@ async def agent_invocation(payload, context):
                 except Exception:  # noqa: BLE001
                     pass
             finally:
+                # Span flush before complete_async_task happens inside
+                # _run_agent_invocation's own finally (which unwinds before we
+                # get here), so the microVM can't be reaped with the final
+                # invoke_agent span still queued — no second flush needed.
                 app.complete_async_task(task_id)
                 _DETACHED_TASKS.discard(asyncio.current_task())
 
@@ -2303,10 +2323,13 @@ async def _run_agent_invocation(payload, context):
         persona_prompt = _load_prompt_for_agent(agent_id)
         # name → gen_ai.agent.name on the SDK's auto-emitted invoke_agent span;
         # trace_attributes → session.id correlation so online evaluations find the
-        # span on the session's traces.
+        # span on the session's traces. session.id falls back to wf-<workflow_id>
+        # so the span stays keyed for the eval-packager even when ADOT header
+        # injection is absent (direct_code_deploy fallback path) — an unkeyed
+        # span is invisible to it.
         _session_id = getattr(context, "session_id", None)
         _trace_attrs = {k: v for k, v in {
-            "session.id": _session_id,
+            "session.id": _session_id or f"wf-{workflow_id}",
             "workflow.id": workflow_id,
             "agent.id": agent_id,
             "gen_ai.agent.id": agent_id,
