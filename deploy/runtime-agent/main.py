@@ -1634,6 +1634,109 @@ def _publish_agent_started(workflow_id: str, agent_id: str):
         logger.warning(f"[{agent_id}] Failed to publish agent.started: {e}")
 
 
+def _publish_operator_delivery(workflow_id: str, agent_id: str, message: str):
+    """Surface a consumed operator message in the agent's output stream so the
+    UI shows the hand-off (rides the same agent.streaming path as model text)."""
+    import time, random, string
+    try:
+        event_id = f"{int(time.time() * 1000)}-opmsg-{''.join(random.choices(string.ascii_lowercase, k=4))}"
+        _ddb_events_client.put_item(
+            TableName=_EVENTS_TABLE,
+            Item={
+                "workflowId": {"S": workflow_id},
+                "eventId": {"S": event_id},
+                "type": {"S": "agent.streaming"},
+                "detail": {"M": {
+                    "agentId": {"S": agent_id},
+                    "type": {"S": "text"},
+                    "content": {"S": f"\n\n> 📨 **Operator:** {message}\n\n"},
+                    "workflowId": {"S": workflow_id},
+                }},
+                "timestamp": {"S": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+            },
+        )
+    except Exception as e:
+        logger.warning(f"[{agent_id}] Failed to publish operator delivery: {e}")
+
+
+class _OperatorMailbox:
+    """Mid-flow operator messaging (Claude Code-style queued messages).
+
+    The UI queues a message via POST /api/workflow/{id}/message, which writes a
+    mailbox item to the events table under eventId "0#mailbox#<agentId>#<id>".
+    This hook checks the mailbox after each tool call and appends any pending
+    messages to that tool's result, so the model reads them on its very next
+    reasoning step — no interruption, no restart. Consumption is an atomic
+    DeleteItem, so a zombie duplicate of a retried agent can't double-deliver.
+
+    Best-effort by design: mailbox failures must never break a run. Messages
+    left unconsumed (agent finished first) are invisible to the UI and get
+    picked up by a retry of the same agent, which is the desired behavior.
+
+    Every tool boundary checks the mailbox — deliberately unthrottled. Any
+    boundary can be the run's LAST one, and skipping it would strand a message
+    the UI already reported as delivered-on-next-tool-call. One Query per tool
+    call is noise next to the model call that follows it.
+    """
+
+    def __init__(self, workflow_id: str, agent_id: str):
+        self._wf = workflow_id
+        self._agent = agent_id
+        self._prefix = f"0#mailbox#{agent_id}#"
+
+    def register_hooks(self, registry, **kwargs):
+        from strands.hooks import AfterToolCallEvent
+        registry.add_callback(AfterToolCallEvent, self._on_tool_result)
+
+    def _consume_pending(self) -> list:
+        resp = _ddb_events_client.query(
+            TableName=_EVENTS_TABLE,
+            KeyConditionExpression="workflowId = :wid AND begins_with(eventId, :pfx)",
+            ExpressionAttributeValues={
+                ":wid": {"S": self._wf},
+                ":pfx": {"S": self._prefix},
+            },
+            Limit=10,
+        )
+        messages = []
+        for item in resp.get("Items", []):
+            deleted = _ddb_events_client.delete_item(
+                TableName=_EVENTS_TABLE,
+                Key={"workflowId": item["workflowId"], "eventId": item["eventId"]},
+                ReturnValues="ALL_OLD",
+            )
+            attrs = deleted.get("Attributes") or {}
+            text = attrs.get("detail", {}).get("M", {}).get("message", {}).get("S", "")
+            if text:
+                messages.append(text)
+        return messages
+
+    def _on_tool_result(self, event):
+        if not self._wf or self._wf == "unknown":
+            return
+        # Only inject into a well-formed ToolResult — if the tool raised, skip
+        # (nothing consumed; the message waits for the next tool boundary).
+        result = getattr(event, "result", None)
+        if not isinstance(result, dict) or not isinstance(result.get("content"), list):
+            return
+        try:
+            messages = self._consume_pending()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{self._agent}] mailbox check failed (non-fatal): {e}")
+            return
+        if not messages:
+            return
+        joined = "\n".join(f"- {m}" for m in messages)
+        result["content"].append({"text": (
+            "\n\n[OPERATOR MESSAGE — the human operator watching this run just "
+            "sent you the following. Read it now, acknowledge it in your next "
+            f"output, and adjust your work accordingly before continuing:\n{joined}\n]"
+        )})
+        logger.info(f"[{self._agent}] delivered {len(messages)} operator message(s) mid-flow")
+        for m in messages:
+            _publish_operator_delivery(self._wf, self._agent, m)
+
+
 def _save_memory_event(agent_id: str, session_id: str, user_text: str, assistant_text: str):
     """Persist the invocation turn to AgentCore Memory (no-op if MEMORY_ID unset).
 
@@ -1839,6 +1942,7 @@ async def agent_invocation(payload, context):
         system_prompt=persona_prompt,
         tools=all_tools,
         callback_handler=None,
+        hooks=[_OperatorMailbox(workflow_id, agent_id)],
     )
 
     # Iterate stream_async — write events to DDB in real-time as they arrive.

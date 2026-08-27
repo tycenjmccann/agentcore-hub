@@ -111,6 +111,11 @@ export function transformEvent(
         timestamp,
       });
 
+    case "operator.message":
+      // Mailbox item for mid-flow agent messaging — consumed by the persona
+      // runtime, not a UI event. (Delivery is surfaced as agent.streaming.)
+      return null;
+
     default:
       return base({ type: eventType, ...detail, timestamp });
   }
