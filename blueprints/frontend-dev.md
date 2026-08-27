@@ -57,6 +57,44 @@ post, or a plausible guess:
   BLOCKED with what's missing. Do NOT invent an endpoint/model/secret/schema — it will
   compile, pass its own tests, and fail 100% against the real service.
 
+### Step 2c: Commit the plan first
+The workflow audit artifacts land on your feature branch BEFORE any code —
+`<ticketId>` is the workflow root key (the Epic key for features, the Bug key
+for bug-fixes; your ticket's artifact S3 paths name it):
+
+1. **Intent + spec (idempotence guard, first commit):** if
+   `docs/workflow/<ticketId>/intent.md` already exists on `base_branch`, skip
+   this item. Otherwise copy `intent.md` and `spec.md` from the S3 artifact path
+   embedded in your ticket (`workflows/{workflow_id}/shared/artifacts/<ticketId>/`)
+   into `docs/workflow/<ticketId>/` and commit with message
+   `docs(<ticketId>): add workflow audit artifacts`.
+2. **Plan (committed before any implementation commit):** APPEND your section to
+   `docs/workflow/<ticketId>/plan.md` — create the file with the
+   `# Plan — <ticketId>` header if it does not exist. Append-only: NEVER
+   overwrite or edit another agent's section. Your section follows this template
+   VERBATIM and is ≤ 60 lines:
+
+   ```markdown
+   ## Plan — <agent id> (<devTicketKey>)
+   ### Files to touch
+   - `<path>` — <what changes>
+
+   ### Approach
+   <2–5 sentences: how, and any alternative rejected>
+
+   ### Test plan
+   - <test to add/extend, and what failure it proves>
+
+   ### Risks / rollback
+   <1–2 sentences>
+   ```
+
+Artifact commits are ADDITIVE-ONLY: they may only create/append files under
+`docs/workflow/<ticketId>/` and never touch app code paths (`src/`, `lambda/`,
+`mcp/`, `scripts/`, `tests/`). S3 remains the phase-to-phase transport; the repo
+copy is the audit record. Both commits go through your first `claude_code` call
+(Step 3) — the implementation list below carries the instruction.
+
 ### Step 3: Implement
 Pass `repo` on your FIRST `claude_code` call so the workspace is cloned. Every
 claude_code call shares ONE workspace and ONE conversation — later calls remember
@@ -66,6 +104,13 @@ this one and its files, so do NOT reference absolute paths like `/tmp/...`; say
 1. Use `claude_code` to:
    - Clone the repo (pass `repo`) / checkout `base_branch` (see Branch Model above)
    - Create your feature branch (`feature/{TICKET_ID}-frontend-dev`) from it
+   - FIRST commit (idempotence guard — Step 2c): if `docs/workflow/<ticketId>/intent.md`
+     is not already on `base_branch`, copy intent.md and spec.md from the ticket's S3
+     artifact path into `docs/workflow/<ticketId>/` and commit with message
+     `docs(<ticketId>): add workflow audit artifacts`
+   - Append your plan section (Step 2c template, ≤ 60 lines) to
+     `docs/workflow/<ticketId>/plan.md` — append-only, never overwrite — and commit it
+     BEFORE any code
    - Implement the changes
    - Run `npx tsc --noEmit` to verify TypeScript compiles
    - Run `npm run build` to verify production build passes

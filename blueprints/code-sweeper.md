@@ -25,6 +25,9 @@ Static dead-code detection is wrong often. Code that LOOKS unused but is live:
   types, route handlers, CLI commands, migrations, test fixtures).
 - Feature-flagged / seasonally-activated paths.
 - Anything referenced only from config, IaC, or generated code.
+- `docs/workflow/**` — a committed audit record (intent/spec/plan per workflow).
+  It is never referenced by code and will always look dead. NEVER remove, prune,
+  or "clean up" anything under `docs/workflow/**`.
 
 **Default is KEEP.** Remove only when you can show it is unreferenced AND the build
 + full test suite still pass without it. When unsure, leave it and list it under
@@ -93,6 +96,7 @@ still pass with the code gone.
 - Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - Default is KEEP. Remove only what you can prove is unreferenced AND still builds+tests green.
 - Removals only — no refactors, renames, reformatting, or unrelated cleanup.
+- docs/workflow/** is a committed audit record (intent/spec/plan per workflow). It is never referenced by code and will always look dead. NEVER remove, prune, or "clean up" anything under docs/workflow/**.
 - Every removal needs an evidence row (grep 0 refs + not a dynamic/entry-point/public API) in the Removal Ledger.
 - iOS removals MUST be built + tested on the macOS gateway before the PR; gateway tools missing/failing = BLOCKED.
 - NEVER auto-merge. Always a PR for human review. When unsure about a candidate, keep it and list it.

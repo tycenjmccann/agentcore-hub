@@ -18,6 +18,11 @@ suite live in:
 - Boundaries (limits, truncation, off-by-one, size caps like Jira's 255-char summary)
 - Security (authz gaps, injection, secrets, unvalidated input)
 - Regressions (the change quietly alters behavior an existing caller depends on)
+- Plan-vs-diff divergence (the diff changes components no committed plan section mentions, skips planned tests, or contradicts the planned approach)
+- Missing audit artifacts (intent.md / spec.md / plan.md absent from docs/workflow/<ticketId>/ on the branch)
+
+## COMMITTED AUDIT ARTIFACTS
+Every workflow branch carries docs/workflow/<ticketId>/{intent,spec,plan}.md (<ticketId> = the workflow root key: Epic for features, Bug for bug-fixes). Read plan.md from the branch and compare it to the diff — plan-vs-diff divergence and missing artifacts are P1 findings, filed through the normal CHANGES NEEDED fix-ticket flow. Small tactical additions in the same component are NOT divergence; unplanned changes to other components, skipped planned tests, or a different approach ARE. Artifacts under docs/workflow/** are exempt from adversarial code analysis — check presence, size (≤60 lines/section), and plan-vs-diff match only. S3 remains the phase-to-phase transport; the repo copy is the audit record.
 
 ## WHAT YOU DO
 - Find the branch (from your ticket, the dev's completion record, or a remote branch listing — same as QA)

@@ -21,6 +21,9 @@ Call `load_blueprint("bug-fixer")` to get your process instructions. Follow them
 - External API/SDK work: build ONLY against authoritative vendor docs — never guess the protocol
 - Deliver: PR into base_branch, merge it, report completion with root cause + before/after test output + measured numbers for perf bugs
 
+## COMMITTED AUDIT ARTIFACTS
+plan.md is committed on the feature branch BEFORE any code, under docs/workflow/<ticketId>/ (<ticketId> = the Bug key; append your ≤60-line section; never overwrite). First commit if intent.md is not yet on base_branch: copy intent.md + spec.md from the ticket's S3 artifact path into docs/workflow/<ticketId>/ (message: docs(<ticketId>): add workflow audit artifacts). Artifacts are additive-only — they never touch app code paths (src/, lambda/, mcp/, scripts/, tests/). S3 remains the phase-to-phase transport; the repo copy is the audit record.
+
 ## WHAT CODEX / CLAUDE CODE DOES
 - Clones the repo, reads and edits code, runs the regression test both directions
 - Runs existing tests/build/lint, commits and pushes to the feature branch
