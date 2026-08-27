@@ -210,6 +210,62 @@
 
 ---
 
+## Eval judge throttling (quota)
+
+**Symptom**: eval results log groups (`/aws/bedrock-agentcore/evaluations/results/eval_*`) fill with
+`error.type=ThrottlingException` / "Rate exceeded" records; `EvalThrottleRate` climbs on the
+`agentcore-hub-eval-health` dashboard; the `agentcore-hub-eval-success-rate` alarm fires with
+error-heavy (not span_missing-heavy) sessions.
+
+**Root cause**: every sampled session costs one Opus judge call *per evaluator* in its eval config.
+The judge model's requests-per-minute Service Quota is shared with everything else in the account
+using that model, and a busy fleet burst exceeds it. The evaluator retries each throttled call 8-10
+times, so throttling also multiplies log volume (the eval-packager dedups those retries, but the
+underlying judge calls are still lost).
+
+**First response (no quota change needed)**: verify the TEAM-3376 mitigations are actually applied —
+the trimmed 5-evaluator matrix and tiered sampling (100% gate roles / 25% others) in
+`deploy/evaluations/setup-evaluations.sh`, reconciled against the live configs per that script's
+reconciliation section. That alone cuts judge calls ~4-8×.
+
+**Quota increase — OPERATOR action, never CI.** A quota request needs a human to pick the value and
+own the AWS support conversation; do not script it into any pipeline.
+
+1. Find the quota for the judge model (Opus). Record the `QuotaCode` and current `Value`:
+
+   ```bash
+   aws service-quotas list-service-quotas \
+     --service-code bedrock \
+     --query "Quotas[?contains(QuotaName, 'Opus')].{Name:QuotaName,Code:QuotaCode,Value:Value}" \
+     --output table
+   ```
+
+   Look for the on-demand **requests per minute** quota matching the judge model id in
+   `deploy/evaluations/eval-config-ids.json` (`us.anthropic.claude-opus-4-7`). If the list is empty
+   in your region, drop the `--query` filter and grep the full output for "Opus".
+
+2. Request the increase to **200 requests/minute**:
+
+   ```bash
+   aws service-quotas request-service-quota-increase \
+     --service-code bedrock \
+     --quota-code <QuotaCode-from-step-1> \
+     --desired-value 200
+   ```
+
+3. Track the request until it's granted (large increases route to AWS Support for human review):
+
+   ```bash
+   aws service-quotas list-requested-service-quota-change-history \
+     --service-code bedrock \
+     --query "RequestedQuotas[?QuotaCode=='<QuotaCode>'].{Status:Status,Requested:DesiredValue}"
+   ```
+
+4. After the grant, watch `EvalThrottleRate` on the eval-health dashboard for a full batch window
+   before considering raising sampling rates back up.
+
+---
+
 ## Tracing Script
 
 Use `scripts/trace-workflow.sh` to pull all logs for a workflow run in one shot.

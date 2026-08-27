@@ -1,0 +1,135 @@
+{
+  "widgets": [
+    {
+      "type": "text",
+      "x": 0,
+      "y": 0,
+      "width": 24,
+      "height": 2,
+      "properties": {
+        "markdown": "## AgentCore Hub — Eval Pipeline Health (TEAM-3376)\nSource: EMF metrics from `lambda/eval-packager/index.mjs` (namespace `AgentCoreHub/Evaluations`, dimension `AgentName`). Region is hard-coded `us-east-1` — substitute at apply time (see `deploy/evaluations/setup-evaluations.sh`). Safe to apply before the fleet emits the new metrics; widgets stay empty until data flows."
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 2,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Fleet eval success rate (hourly)",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 3600,
+        "metrics": [
+          [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 3600))", "id": "total", "visible": false } ],
+          [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsSpanMissing\"', 'Sum', 3600))", "id": "missing", "visible": false } ],
+          [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsError\"', 'Sum', 3600))", "id": "errors", "visible": false } ],
+          [ { "expression": "(total - missing - errors) / total", "label": "success rate (fleet)", "id": "success_rate" } ]
+        ],
+        "yAxis": { "left": { "min": 0, "max": 1 } },
+        "annotations": {
+          "horizontal": [ { "label": "alarm threshold (0.8)", "value": 0.8 } ]
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 8,
+      "y": 2,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Judge throttle rate (EvalThrottleRate, fleet avg)",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 3600,
+        "metrics": [
+          [ { "expression": "AVG(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalThrottleRate\"', 'Average', 3600))", "label": "throttle rate (fleet avg)", "id": "throttle" } ]
+        ],
+        "yAxis": { "left": { "min": 0, "max": 1 } }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 16,
+      "y": 2,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "span_missing ratio (fleet)",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 3600,
+        "metrics": [
+          [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsSpanMissing\"', 'Sum', 3600))", "id": "sm_missing", "visible": false } ],
+          [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 3600))", "id": "sm_total", "visible": false } ],
+          [ { "expression": "sm_missing / sm_total", "label": "span_missing ratio", "id": "sm_ratio" } ]
+        ],
+        "yAxis": { "left": { "min": 0, "max": 1 } },
+        "annotations": {
+          "horizontal": [ { "label": "span-missing alarm threshold (0.5)", "value": 0.5 } ]
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 8,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Duplicate eval records dropped (EvalDuplicateResultCount)",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 3600,
+        "metrics": [
+          [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalDuplicateResultCount\"', 'Sum', 3600))", "label": "duplicates dropped (fleet)", "id": "dups" } ]
+        ],
+        "yAxis": { "left": { "min": 0 } }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 8,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Validation-exception rate (EvalValidationExceptionRate, fleet avg)",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 3600,
+        "metrics": [
+          [ { "expression": "AVG(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalValidationExceptionRate\"', 'Average', 3600))", "label": "validation rate (fleet avg)", "id": "validation" } ]
+        ],
+        "yAxis": { "left": { "min": 0, "max": 1 } }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 14,
+      "width": 24,
+      "height": 6,
+      "properties": {
+        "title": "Per-agent eval sessions: total / span_missing / error",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 3600,
+        "metrics": [
+          [ { "expression": "SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 3600)", "id": "pa_total" } ],
+          [ { "expression": "SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsSpanMissing\"', 'Sum', 3600)", "id": "pa_missing" } ],
+          [ { "expression": "SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsError\"', 'Sum', 3600)", "id": "pa_errors" } ]
+        ],
+        "yAxis": { "left": { "min": 0 } }
+      }
+    }
+  ]
+}

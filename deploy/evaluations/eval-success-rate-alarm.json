@@ -1,0 +1,33 @@
+{
+  "AlarmName": "agentcore-hub-eval-success-rate",
+  "AlarmDescription": "Fleet eval success rate (EvalSessionsTotal - EvalSessionsSpanMissing - EvalSessionsError, over EvalSessionsTotal) below 0.8 on 3 of 4 hourly datapoints. Covers BOTH failure modes: span_missing (runtime telemetry broken — no invoke_agent span) AND error sessions, including judge throttling (ThrottlingException) and validation failures. DEPLOYMENT ORDER (TEAM-3376): apply only AFTER (a) the runtime anchor-span fix is deployed to the fleet and (b) at least one healthy batch with non-zero EvalSessionsTotal and the new EvalSessionsError metric has been observed in CloudWatch — earlier, the rate computes over pre-fix data and fires immediately. INSUFFICIENT_DATA when no eval sessions arrive. Add AlarmActions (environment SNS topic) at apply time.",
+  "ActionsEnabled": true,
+  "EvaluationPeriods": 4,
+  "DatapointsToAlarm": 3,
+  "Threshold": 0.8,
+  "ComparisonOperator": "LessThanThreshold",
+  "TreatMissingData": "missing",
+  "Metrics": [
+    {
+      "Id": "total",
+      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 3600))",
+      "ReturnData": false
+    },
+    {
+      "Id": "missing",
+      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsSpanMissing\"', 'Sum', 3600))",
+      "ReturnData": false
+    },
+    {
+      "Id": "errors",
+      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsError\"', 'Sum', 3600))",
+      "ReturnData": false
+    },
+    {
+      "Id": "success_rate",
+      "Expression": "(total - missing - errors) / total",
+      "Label": "eval success rate (fleet)",
+      "ReturnData": true
+    }
+  ]
+}
