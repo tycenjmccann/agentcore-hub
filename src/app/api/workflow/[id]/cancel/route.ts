@@ -50,6 +50,26 @@ function getJiraAuth() {
 
 // ─── DynamoDB Ticket Cancellation ───────────────────────────────────────────
 
+// Cancel one DDB ticket unless it's already done. Shared by the child sweep
+// and the epic close so the parent record doesn't outlive its children.
+async function cancelOneTicketDynamoDB(ticketId: string) {
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId },
+      UpdateExpression: "SET #s = :cancelled, cancelledAt = :ts, #u = :u",
+      ConditionExpression: "#s <> :done",
+      ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+      ExpressionAttributeValues: {
+        ":cancelled": "cancelled",
+        ":done": "done",
+        ":ts": new Date().toISOString(),
+        ":u": new Date().toISOString(),
+      },
+    })
+  );
+}
+
 async function cancelTicketsDynamoDB(epicId: string) {
   // 1. Query all tickets for this epic
   const result = await ddb.send(
@@ -74,24 +94,7 @@ async function cancelTicketsDynamoDB(epicId: string) {
   for (let i = 0; i < toCancel.length; i += batchSize) {
     const batch = toCancel.slice(i, i + batchSize);
     const results = await Promise.allSettled(
-      batch.map((ticket) =>
-        ddb.send(
-          new UpdateCommand({
-            TableName: TICKETS_TABLE,
-            Key: { ticketId: ticket.ticketId },
-            UpdateExpression:
-              "SET #s = :cancelled, cancelledAt = :ts, #u = :u",
-            ConditionExpression: "#s <> :done",
-            ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-            ExpressionAttributeValues: {
-              ":cancelled": "cancelled",
-              ":done": "done",
-              ":ts": new Date().toISOString(),
-              ":u": new Date().toISOString(),
-            },
-          })
-        )
-      )
+      batch.map((ticket) => cancelOneTicketDynamoDB(ticket.ticketId))
     );
 
     for (const r of results) {
@@ -110,10 +113,68 @@ async function cancelTicketsDynamoDB(epicId: string) {
     }
   }
 
+  // 3. Close the epic itself — the child query above excludes it (an epic has no
+  //    parentId), so without this it lingers OPEN forever after every cancel.
+  try {
+    await cancelOneTicketDynamoDB(epicId);
+    cancelled++;
+  } catch (err) {
+    if ((err as { name?: string }).name === "ConditionalCheckFailedException") {
+      skipped++;
+    } else {
+      failed++;
+      console.warn(`[cancel] Failed to cancel epic ${epicId}: ${(err as Error).message}`);
+    }
+  }
+
   return { cancelled, skipped, failed };
 }
 
 // ─── Jira Ticket Cancellation ───────────────────────────────────────────────
+
+// Transition one Jira issue to Won't Do / Cancelled (falls back to any Done
+// category). Throws if no terminal transition exists. Shared by the child
+// sweep and the epic close.
+async function cancelOneIssueJira(
+  jiraAuth: NonNullable<ReturnType<typeof getJiraAuth>>,
+  issueKey: string
+) {
+  const transUrl = `${jiraAuth.baseUrl}/rest/api/3/issue/${issueKey}/transitions`;
+  const transResp = await fetch(transUrl, {
+    headers: { Authorization: jiraAuth.authHeader, Accept: "application/json" },
+  });
+  const transData = await transResp.json();
+
+  const cancelTrans = (transData.transitions || []).find(
+    (t: { name: string; to?: { name?: string; statusCategory?: { key?: string } } }) =>
+      t.name === "Won't Do" ||
+      t.name === "Cancelled" ||
+      t.name === "Cancel" ||
+      t.to?.name === "Won't Do" ||
+      t.to?.name === "Cancelled"
+  );
+
+  const trans =
+    cancelTrans ||
+    (transData.transitions || []).find(
+      (t: { to?: { statusCategory?: { key?: string } } }) =>
+        t.to?.statusCategory?.key === "done"
+    );
+
+  if (!trans) throw new Error(`No cancel transition for ${issueKey}`);
+
+  await fetch(transUrl, {
+    method: "POST",
+    headers: {
+      Authorization: jiraAuth.authHeader,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      transition: { id: trans.id },
+      fields: { resolution: { name: "Won't Do" } },
+    }),
+  });
+}
 
 async function cancelTicketsJira(epicId: string) {
   const jiraAuth = getJiraAuth();
@@ -140,6 +201,7 @@ async function cancelTicketsJira(epicId: string) {
 
   const issues = data.issues || [];
   let cancelled = 0,
+    skipped = 0,
     failed = 0;
 
   // 2. Transition each to "Won't Do" / "Cancelled" (concurrency: 5 for Jira rate limits)
@@ -147,61 +209,7 @@ async function cancelTicketsJira(epicId: string) {
   for (let i = 0; i < issues.length; i += batchSize) {
     const batch = issues.slice(i, i + batchSize);
     const results = await Promise.allSettled(
-      batch.map(async (issue) => {
-        const transUrl = `${jiraAuth.baseUrl}/rest/api/3/issue/${issue.key}/transitions`;
-        const transResp = await fetch(transUrl, {
-          headers: {
-            Authorization: jiraAuth.authHeader,
-            Accept: "application/json",
-          },
-        });
-        const transData = await transResp.json();
-
-        // Look for cancel/won't do transition
-        const cancelTrans = (transData.transitions || []).find(
-          (t: { name: string; to?: { name?: string; statusCategory?: { key?: string } } }) =>
-            t.name === "Won't Do" ||
-            t.name === "Cancelled" ||
-            t.name === "Cancel" ||
-            t.to?.name === "Won't Do" ||
-            t.to?.name === "Cancelled"
-        );
-
-        if (!cancelTrans) {
-          // Fallback: look for any "Done" category transition
-          const doneTrans = (transData.transitions || []).find(
-            (t: { to?: { statusCategory?: { key?: string } } }) =>
-              t.to?.statusCategory?.key === "done"
-          );
-          if (!doneTrans) {
-            throw new Error(`No cancel transition for ${issue.key}`);
-          }
-          await fetch(transUrl, {
-            method: "POST",
-            headers: {
-              Authorization: jiraAuth.authHeader,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              transition: { id: doneTrans.id },
-              fields: { resolution: { name: "Won't Do" } },
-            }),
-          });
-          return;
-        }
-
-        await fetch(transUrl, {
-          method: "POST",
-          headers: {
-            Authorization: jiraAuth.authHeader,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            transition: { id: cancelTrans.id },
-            fields: { resolution: { name: "Won't Do" } },
-          }),
-        });
-      })
+      batch.map((issue) => cancelOneIssueJira(jiraAuth, issue.key))
     );
 
     for (const r of results) {
@@ -216,7 +224,23 @@ async function cancelTicketsJira(epicId: string) {
     }
   }
 
-  return { cancelled, skipped: 0, failed };
+  // 3. Close the epic itself. The child JQL (`parent = epic`) never matches the
+  //    epic, so without this the epic stays OPEN after every cancel — the source
+  //    of the rising unresolved-epic count. Already-terminal → transition list
+  //    has no cancel target → counted as skipped, not failed.
+  try {
+    await cancelOneIssueJira(jiraAuth, epicId);
+    cancelled++;
+  } catch (err) {
+    if ((err as Error).message?.startsWith("No cancel transition")) {
+      skipped++;
+    } else {
+      failed++;
+      console.warn(`[cancel] Jira epic ${epicId} close failed: ${(err as Error).message}`);
+    }
+  }
+
+  return { cancelled, skipped, failed };
 }
 
 // ─── Route Handler ──────────────────────────────────────────────────────────
