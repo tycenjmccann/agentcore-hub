@@ -18,6 +18,13 @@ submit+poll transport:
      returning the ERROR string to the LLM.
   C. A healthy turn finishing under the deadline is untouched — no agent.error,
      response text + session footer intact.
+  D. (TEAM-3307 F1) The deadline is a HARD bound: no blocking
+     InvokeAgentRuntime call (final poll probe, vm-death resubmit) may be
+     STARTED once it has expired — worst-case overshoot is the one call
+     already in flight, never deadline + another connect/read window.
+  E. (TEAM-3307 F2) agent.error publishing retries transient put_item
+     failures (bounded, short backoff) and, when exhausted, logs
+     workflow_id + ticket_id without raising.
 
 main.py needs strands / bedrock_agentcore / httpx at import time; those are
 stubbed below so this suite runs hermetically (boto3 is real but never called
@@ -264,6 +271,145 @@ class TestHealthyTurnUnaffected(RemoteCodingTestCase):
         self.assertEqual(agent_error_calls, [],
                          "healthy turn must not publish agent.error")
         self.assertEqual(main._CODING_SESSION["conversation_ids"].get("claude"), "s-1")
+
+
+class TestDeadlineIsHardBound(RemoteCodingTestCase):
+    """Test D (TEAM-3307 F1) — the overall deadline must bound EVERY blocking
+    call, not just the poll-loop condition. Pre-fix, a blocking call could be
+    STARTED after (or across) the deadline and pin the persona for a full
+    connect+read window (~630s in prod) past REMOTE_CODING_TURN_DEADLINE_S."""
+
+    def test_blocking_polls_do_not_overshoot_deadline_by_more_than_one_call(self):
+        # Every poll BLOCKS for 2s before answering "running" (a slow/hung
+        # poll transport). Deadline is 0.5s. A poll already in flight when the
+        # deadline expires cannot be interrupted — that one call is the
+        # permissible overshoot. Pre-fix, the loop exit was followed by one
+        # MORE unconditional blocking probe, doubling the overshoot.
+        # Invariant: wall time <= deadline + ~one blocking call, and the
+        # failure is still loud (ERROR string + agent.error event).
+        poll_block_s = 2.0
+        submit_client = mock.MagicMock()
+        submit_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
+            {"submitted": True, "turn_id": json.loads(kw["payload"])["turn_id"]}
+        )
+
+        def blocking_running_poll(**kw):
+            time.sleep(poll_block_s)
+            return _invoke_response({"status": "running"})
+
+        poll_client = mock.MagicMock()
+        poll_client.invoke_agent_runtime.side_effect = blocking_running_poll
+        events_client = mock.MagicMock()
+
+        with mock.patch.object(main.boto3, "client", return_value=submit_client), \
+             mock.patch.object(main, "_POLL_CLIENT", poll_client, create=True), \
+             mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01), \
+             mock.patch.object(main, "REMOTE_CODING_TURN_BUDGET_S", 5), \
+             mock.patch.object(main, "REMOTE_CODING_TURN_DEADLINE_S", 0.5, create=True):
+            t0 = time.monotonic()
+            result = main._remote_coding_turn("implement the widget", "claude")
+            elapsed = time.monotonic() - t0
+
+        self.assertLess(
+            elapsed, 0.5 + poll_block_s + 0.5,
+            f"turn took {elapsed:.2f}s — a blocking call was started after the "
+            f"0.5s deadline expired (TEAM-3307 F1 overshoot)",
+        )
+        self.assertTrue(result.startswith("ERROR: remote claude turn"),
+                        f"expected a loud ERROR return, got: {result[:120]!r}")
+        self.assertIn("deadline", result)
+        self._assert_agent_error_published(events_client, "deadline")
+
+    def test_submit_is_not_started_once_deadline_expired(self):
+        # The vm-death resubmit race: by the time _submit_and_poll runs again,
+        # the deadline has expired. The submit invoke here would block for the
+        # full read timeout (mocked as 5s; ~630s in prod) — it must not be
+        # STARTED at all, and the caller must get the deadline-expired error.
+        def blocking_submit(**kw):
+            time.sleep(5.0)
+            return _invoke_response(
+                {"submitted": True, "turn_id": json.loads(kw["payload"])["turn_id"]}
+            )
+
+        submit_client = mock.MagicMock()
+        submit_client.invoke_agent_runtime.side_effect = blocking_submit
+        poll_client = mock.MagicMock()
+        poll_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
+            {"status": "running"}
+        )
+        main._CODING_SESSION["session_id"] = "cc-test-deadline-expired-session"
+
+        expired_deadline = time.monotonic() - 0.001
+        with mock.patch.object(main, "_POLL_CLIENT", poll_client, create=True), \
+             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01):
+            t0 = time.monotonic()
+            result = main._submit_and_poll(
+                submit_client, {"prompt": "x", "cli": "claude"}, expired_deadline)
+            elapsed = time.monotonic() - t0
+
+        self.assertLess(
+            elapsed, 2.0,
+            f"_submit_and_poll took {elapsed:.2f}s with an already-expired "
+            f"deadline — the blocking submit was started past it (TEAM-3307 F1)",
+        )
+        self.assertIn("deadline", result.get("error", ""))
+        self.assertTrue(result.get("deadline_exceeded"))
+        self.assertEqual(
+            submit_client.invoke_agent_runtime.call_count, 0,
+            "a blocking InvokeAgentRuntime call was started after the overall "
+            "deadline had already expired",
+        )
+
+
+class TestAgentErrorPublishRetry(RemoteCodingTestCase):
+    """Test E (TEAM-3307 F2) — agent.error publishing retries transient
+    put_item failures, and an exhausted retry logs enough (workflow + ticket)
+    to find the lost event — without ever raising."""
+
+    def test_transient_put_item_failures_are_retried_until_published(self):
+        events_client = mock.MagicMock()
+        events_client.put_item.side_effect = [
+            RuntimeError("ThrottlingException"),
+            RuntimeError("ThrottlingException"),
+            {},  # third attempt succeeds
+        ]
+        with mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main, "_AGENT_ERROR_PUBLISH_BACKOFF_S", (0, 0),
+                               create=True):
+            main._publish_agent_error("wf-test", "frontend_dev", "boom",
+                                      ticket_id="TEAM-3119")
+
+        self.assertEqual(
+            events_client.put_item.call_count, 3,
+            "transient put_item failures must be retried — a single-shot "
+            "publish silently loses the only record of the failure",
+        )
+        item = events_client.put_item.call_args_list[-1].kwargs["Item"]
+        self.assertEqual(item["type"]["S"], "agent.error")
+        self.assertEqual(item["detail"]["M"]["ticketId"]["S"], "TEAM-3119")
+
+    def test_exhausted_retries_never_raise_and_log_workflow_and_ticket(self):
+        events_client = mock.MagicMock()
+        events_client.put_item.side_effect = RuntimeError("table unavailable")
+        with mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main, "_AGENT_ERROR_PUBLISH_BACKOFF_S", (0, 0),
+                               create=True), \
+             self.assertLogs(main.logger, level="WARNING") as logs:
+            # Must never raise, even with every attempt failing.
+            main._publish_agent_error("wf-test", "frontend_dev", "boom",
+                                      ticket_id="TEAM-3119")
+
+        failure_lines = [line for line in logs.output
+                         if "Failed to publish agent.error" in line]
+        self.assertTrue(failure_lines,
+                        "exhausted publish retries must log a failure line")
+        self.assertTrue(
+            any("wf-test" in line and "TEAM-3119" in line
+                for line in failure_lines),
+            f"the give-up log line must carry workflow_id and ticket_id so the "
+            f"lost event is discoverable; got: {failure_lines}",
+        )
 
 
 if __name__ == "__main__":

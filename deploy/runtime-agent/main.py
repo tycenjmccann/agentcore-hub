@@ -442,6 +442,21 @@ def _coding_invoke(client, payload: dict) -> dict:
     return json.loads(resp["response"].read().decode("utf-8"))
 
 
+def _deadline_expired_error() -> dict:
+    """The terminal record for a turn cut off by REMOTE_CODING_TURN_DEADLINE_S —
+    shared by the poll loop and the pre-submit guard so both exits carry the
+    same verify-first instructions (TEAM-3307)."""
+    return {"error": f"coding turn exceeded the {REMOTE_CODING_TURN_DEADLINE_S}s "
+                     f"overall deadline with no verdict. Its work may already "
+                     f"exist and a runner may still be finishing. Do NOT re-run "
+                     f"the task and do NOT start another coding call yet: wait a "
+                     f"few minutes, then check the branch on GitHub "
+                     f"(get_file_contents / list commits) to see whether the "
+                     f"work landed before deciding anything",
+            "deadline_exceeded": True,
+            "no_retry_hint": True}
+
+
 def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None) -> dict:
     """Poll an async coding turn to its terminal state. Returns the done record
     ({response, claude_session_id, artifacts?} or {error}).
@@ -513,7 +528,11 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None)
     # turn may STILL have completed its work — a blind re-run is not safe.
     # Probe once more, then tell the persona to VERIFY STATE WITHOUT running a
     # coding turn (a fresh CLI call would race a still-live runner in the same
-    # workspace).
+    # workspace). Skip the probe once the outer deadline has expired: the
+    # deadline is a HARD bound, and one more blocking call (up to the poll
+    # client's ~40s connect+read window) would overshoot it (TEAM-3307).
+    if outer_deadline is not None and time.monotonic() >= outer_deadline:
+        return _deadline_expired_error()
     try:
         final = _poll_once(client, turn_id)
         if final.get("status") == "done":
@@ -521,15 +540,7 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None)
     except Exception:  # noqa: BLE001
         pass
     if outer_deadline is not None and time.monotonic() >= outer_deadline:
-        return {"error": f"coding turn exceeded the {REMOTE_CODING_TURN_DEADLINE_S}s "
-                         f"overall deadline with no verdict. Its work may already "
-                         f"exist and a runner may still be finishing. Do NOT re-run "
-                         f"the task and do NOT start another coding call yet: wait a "
-                         f"few minutes, then check the branch on GitHub "
-                         f"(get_file_contents / list commits) to see whether the "
-                         f"work landed before deciding anything",
-                "deadline_exceeded": True,
-                "no_retry_hint": True}
+        return _deadline_expired_error()
     return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget "
                      f"with no verdict. Its work may already exist and a runner "
                      f"may still be finishing. Do NOT re-run the task and do NOT "
@@ -623,6 +634,12 @@ def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None)
     re-submit with the same id is acknowledged as a dedupe instead of running
     the prompt a second time in the same workspace."""
     payload = {**payload, "turn_id": f"turn-{uuid.uuid4().hex}"}
+    # HARD deadline check before the blocking submit: this client's
+    # connect+read window is ~630s, all of which would land PAST an
+    # already-expired deadline (worst case: a vm-death resubmit racing the
+    # deadline). Expired means don't start the call at all (TEAM-3307).
+    if outer_deadline is not None and time.monotonic() >= outer_deadline:
+        return _deadline_expired_error()
     try:
         submitted = _coding_invoke(client, payload)
     except Exception as e:  # noqa: BLE001
@@ -2049,6 +2066,12 @@ async def agent_invocation(payload, context):
         yield event
 
 
+# A lost agent.error is an invisible failure — retry the publish a few times.
+# Backoff lives in a module constant so tests can zero it out (TEAM-3307).
+_AGENT_ERROR_PUBLISH_ATTEMPTS = 3
+_AGENT_ERROR_PUBLISH_BACKOFF_S = (0.5, 1.0)
+
+
 def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
                          ticket_id: str = "") -> None:
     """Surface a failure to the events table so the workflow board and nudge
@@ -2058,33 +2081,55 @@ def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
 
     Best-effort by contract: callers sit on failure paths (including inside
     except blocks of code that must never raise), so this swallows its own
-    errors instead of letting error surfacing break the turn it reports."""
+    errors instead of letting error surfacing break the turn it reports.
+    Best-effort is not single-shot, though: a throttle or network blip here
+    loses the only record of the failure, so the put is retried a couple of
+    times with short backoff before giving up (TEAM-3307)."""
     import time as _t
     try:
-        # Random suffix on both keys: two personas failing in the same millisecond
-        # (shared-outage case) must not overwrite each other's error item. The
-        # timestamp's fractional part must stay NUMERIC — workflow-analyzer
-        # Date.parse()s it, so hex there would poison lastSignificantEventAge().
-        digits = f"{uuid.uuid4().int % 10**6:06d}"
-        _ddb_events_client.put_item(
-            TableName=_EVENTS_TABLE,
-            Item={
-                "workflowId": {"S": workflow_id or "unknown"},
-                "eventId": {"S": f"{int(_t.time() * 1000)}-err-{digits}"},
-                "type": {"S": "agent.error"},
-                "detail": {"M": {
-                    "agentId": {"S": agent_id},
-                    "workflowId": {"S": workflow_id or "unknown"},
-                    "ticketId": {"S": ticket_id or ""},
-                    "error": {"S": (error or "")[:1000]},
-                }},
-                "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
-                              + f".{digits}Z"},
-            },
-        )
-        logger.info(f"[{agent_id}] Published agent.error event")
+        for attempt in range(1, _AGENT_ERROR_PUBLISH_ATTEMPTS + 1):
+            try:
+                # Random suffix on both keys: two personas failing in the same millisecond
+                # (shared-outage case) must not overwrite each other's error item. The
+                # timestamp's fractional part must stay NUMERIC — workflow-analyzer
+                # Date.parse()s it, so hex there would poison lastSignificantEventAge().
+                digits = f"{uuid.uuid4().int % 10**6:06d}"
+                _ddb_events_client.put_item(
+                    TableName=_EVENTS_TABLE,
+                    Item={
+                        "workflowId": {"S": workflow_id or "unknown"},
+                        "eventId": {"S": f"{int(_t.time() * 1000)}-err-{digits}"},
+                        "type": {"S": "agent.error"},
+                        "detail": {"M": {
+                            "agentId": {"S": agent_id},
+                            "workflowId": {"S": workflow_id or "unknown"},
+                            "ticketId": {"S": ticket_id or ""},
+                            "error": {"S": (error or "")[:1000]},
+                        }},
+                        "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
+                                      + f".{digits}Z"},
+                    },
+                )
+                logger.info(f"[{agent_id}] Published agent.error event")
+                return
+            except Exception as e:  # noqa: BLE001
+                if attempt == _AGENT_ERROR_PUBLISH_ATTEMPTS:
+                    logger.warning(
+                        f"[{agent_id}] Failed to publish agent.error after "
+                        f"{attempt} attempts (workflow_id={workflow_id or 'unknown'}, "
+                        f"ticket_id={ticket_id or 'n/a'}): {e}")
+                    return
+                logger.warning(
+                    f"[{agent_id}] agent.error publish attempt {attempt}/"
+                    f"{_AGENT_ERROR_PUBLISH_ATTEMPTS} failed "
+                    f"(workflow_id={workflow_id or 'unknown'}, "
+                    f"ticket_id={ticket_id or 'n/a'}) — retrying: {e}")
+                _t.sleep(_AGENT_ERROR_PUBLISH_BACKOFF_S[
+                    min(attempt - 1, len(_AGENT_ERROR_PUBLISH_BACKOFF_S) - 1)])
     except Exception as e:  # noqa: BLE001 — error surfacing must never fail the turn
-        logger.warning(f"[{agent_id}] Failed to publish agent.error: {e}")
+        logger.warning(f"[{agent_id}] Failed to publish agent.error "
+                       f"(workflow_id={workflow_id or 'unknown'}, "
+                       f"ticket_id={ticket_id or 'n/a'}): {e}")
 
 
 async def _run_agent_invocation(payload, context):
