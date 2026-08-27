@@ -35,6 +35,7 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 import zipfile
 from datetime import datetime, timezone
 
@@ -56,6 +57,12 @@ CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
 )
 # A single coding turn can be long; cap so a wedged CLI can't pin the microVM.
 TURN_TIMEOUT_S = int(os.environ.get("TURN_TIMEOUT_S", "1500"))
+# Async (submit+poll) turns: journal heartbeat cadence and the staleness bar a
+# poll uses to declare a running turn dead (VM crashed mid-turn). The heartbeat
+# is written by the runner thread; 120s of silence >> one 15s beat, so a stale
+# read means the thread is gone, not slow.
+TURN_HEARTBEAT_S = int(os.environ.get("TURN_HEARTBEAT_S", "15"))
+TURN_STALE_S = int(os.environ.get("TURN_STALE_S", "120"))
 
 # Per-user coding-CLI config bundle (MCP servers, skills, custom agents, prefs).
 # The app uploads a zip under the tenant prefix (see _tenant_root); we materialize
@@ -1708,6 +1715,182 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
     yield sse(done)
 
 
+# ─── Async turns (submit + poll) ──────────────────────────────────────────────
+#
+# Workflow personas used to hold ONE InvokeAgentRuntime open for the whole coding
+# turn. That connection dies silently when no bytes flow for ~15 min (proved
+# 2026-08-27: a 17-min turn emitting text every 60s survives; the same turn
+# silent through two `sleep 500`s finishes server-side but the caller never gets
+# a frame). Long quiet stretches — builds, big writes — are normal for coding
+# turns, so the connection itself is the wrong transport. Submit+poll replaces
+# it: submit returns a turn_id immediately, a runner thread journals the result
+# to EFS, and each sub-second poll reads the journal. No long-lived connection
+# exists, and a result written just before a microVM recycle is still collected
+# by the next poll off the shared EFS.
+
+
+# Authoritative liveness for turns on THIS microVM. Session affinity routes a
+# session's polls to the same VM as its submits, so membership here is ground
+# truth for "the runner thread is still executing" — independent of EFS, whose
+# write failures can make a journal look stale while the CLI is alive. A VM
+# recycle empties it, which is precisely the case where "dead" is true.
+_ACTIVE_TURNS: dict = {}
+
+
+def _turn_journal_path(session_id: str | None, turn_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", turn_id)[:80]
+    return os.path.join(_session_dir(session_id), ".turns", f"{safe}.json")
+
+
+def _journal_write(path: str, record: dict) -> bool:
+    """Atomic-enough journal write (tmp + rename; EFS rename is atomic within a
+    directory). Never raises — a failed beat must not kill the runner thread —
+    but reports success so the submit path can refuse to start a turn whose
+    journal can't be seeded (an accepted turn with no journal reads as 'unknown'
+    and would get resubmitted while still running)."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(record, f)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        logger.warning("turn_journal_write_failed", extra={"error": str(exc)[:200]})
+        return False
+
+
+def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: str,
+                    claude_session_id: str | None, repo: str | None,
+                    session_id: str | None, tenant_id: str | None,
+                    model: str | None) -> None:
+    """Runner thread body: drive one CLI turn via the existing streaming
+    generators (they carry the watchdog, artifact harvest, and session-id
+    bookkeeping), heartbeat the journal while it runs, then journal the terminal
+    frame. The generator's SSE framing is an implementation detail here — we
+    consume frames directly, no HTTP involved."""
+    # Prune finished entries older than an hour so a long-lived VM doesn't
+    # accumulate every done record it ever served.
+    cutoff = int(time.time()) - 3600
+    for tid in [t for t, r in _ACTIVE_TURNS.items()
+                if r.get("status") == "done" and int(r.get("finished_at") or 0) < cutoff]:
+        _ACTIVE_TURNS.pop(tid, None)
+    _ACTIVE_TURNS[turn_id] = {"status": "running", "turn_id": turn_id, "cli": cli,
+                              "started_at": int(time.time())}
+    beat = {"status": "running", "turn_id": turn_id, "cli": cli,
+            "started_at": int(time.time()), "heartbeat": int(time.time())}
+    stop_beating = threading.Event()
+    # Serializes heartbeat vs terminal writes: once `finished` flips under the
+    # lock, a delayed beat can never overwrite the done record with "running"
+    # (which a poll would later read as a stale heartbeat → dead → duplicate
+    # resubmit of a completed turn). A bounded join can't guarantee that
+    # ordering — an EFS write can outlast any timeout we'd pick.
+    journal_lock = threading.Lock()
+    finished = threading.Event()
+
+    def _heartbeat():
+        while not stop_beating.wait(TURN_HEARTBEAT_S):
+            with journal_lock:
+                if finished.is_set():
+                    return
+                beat["heartbeat"] = int(time.time())
+                _journal_write(journal, beat)
+
+    beater = threading.Thread(target=_heartbeat, daemon=True)
+    beater.start()
+
+    result: dict = {}
+    last_error = ""
+    try:
+        gen = (_stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
+               if cli == "codex"
+               else _stream_claude(prompt, workdir, claude_session_id, repo,
+                                   session_id, tenant_id, model))
+        for line in gen:
+            if not line.startswith("data:"):
+                continue
+            try:
+                frame = json.loads(line[5:].strip())
+            except (json.JSONDecodeError, ValueError):
+                continue
+            ftype = frame.get("type")
+            if ftype == "error":
+                last_error = str(frame.get("error") or "")[:600]
+            elif ftype == "done":
+                result = frame
+    except Exception as exc:  # noqa: BLE001 — journal the failure, never raise
+        last_error = str(exc)[:600]
+
+    done = {"status": "done", "turn_id": turn_id, "cli": cli,
+            "finished_at": int(time.time()),
+            "response": result.get("response") or "",
+            "claude_session_id": result.get("claude_session_id")}
+    if result.get("artifacts"):
+        done["artifacts"] = result["artifacts"]
+    if not result:
+        done["error"] = last_error or "turn produced no done frame"
+    elif last_error and not (done["response"] or "").strip():
+        done["error"] = last_error
+    # Heartbeats stay alive UNTIL the terminal record is durably written: if
+    # this write fails transiently (degraded EFS) and beats had already
+    # stopped, the last durable record would go stale → dead → the caller
+    # resubmits a turn that actually completed. Retry under liveness; only a
+    # persistent failure (result truly undeliverable) lets the journal go
+    # stale, and then a resubmit IS the right outcome.
+    for _ in range(15):
+        with journal_lock:
+            if _journal_write(journal, done):
+                finished.set()
+                break
+        time.sleep(4)
+    else:
+        logger.error("turn_done_write_failed", extra={"turn_id": turn_id})
+    stop_beating.set()
+    # Keep the result reachable in memory even if EFS never accepted the done
+    # record — a poll on this VM serves it from here (see _poll_turn).
+    _ACTIVE_TURNS[turn_id] = done
+    logger.info("turn_done", extra={"cli": cli, "chars": len(done["response"]),
+                                    "async": True, "turn_id": turn_id})
+
+
+def _poll_turn(session_id: str | None, turn_id: str) -> dict:
+    """Classify a turn. Read-only — a poll can never touch the CLI process or
+    start work.
+
+    Order of authority: the in-process _ACTIVE_TURNS table first (session
+    affinity means a live runner is on THIS VM — its word beats any EFS state,
+    including a journal gone stale because EFS write attempts are failing while
+    the CLI is alive), then the EFS journal (which is what survives a VM
+    recycle — the case where 'dead'/'unknown' verdicts are actually true)."""
+    live = _ACTIVE_TURNS.get(turn_id)
+    if live is not None:
+        if live.get("status") == "done":
+            return live  # terminal result, even if EFS never accepted it
+        return {"status": "running", "turn_id": turn_id, "source": "memory"}
+    journal = _turn_journal_path(session_id, turn_id)
+    try:
+        with open(journal) as f:
+            record = json.load(f)
+    except FileNotFoundError:
+        # Not in memory and no journal: the VM recycled before the seed was
+        # durable, or the runner died pre-write. Either way the turn is gone.
+        return {"status": "unknown", "turn_id": turn_id}
+    except (OSError, json.JSONDecodeError) as exc:
+        # Degraded EFS read or a torn read racing the tmp+rename — the turn may
+        # well still be running on another incarnation's clock. NOT death:
+        # callers must keep polling, never resubmit off this.
+        return {"status": "transient", "turn_id": turn_id, "detail": str(exc)[:200]}
+    if record.get("status") == "running":
+        # Journal says running but the turn is NOT in this VM's memory: with
+        # session affinity that means the VM restarted mid-turn. The stale bar
+        # guards the brief window where a poll raced the submit on a healthy VM.
+        age = int(time.time()) - int(record.get("heartbeat") or 0)
+        if age > TURN_STALE_S:
+            return {"status": "dead", "turn_id": turn_id, "stale_s": age}
+        return {"status": "running", "turn_id": turn_id, "heartbeat_age_s": age}
+    return record  # done record verbatim (response / error / artifacts)
+
+
 # ─── Server ───────────────────────────────────────────────────────────────────
 
 app = FastAPI()
@@ -1784,6 +1967,15 @@ async def invocations(request: Request):
             # the stream redelivers, instead of acknowledging a leak as success.
             return JSONResponse({"purged": False, **result}, status_code=500)
         return JSONResponse({"purged": True, **result})
+
+    # Poll: read-only status check on an async turn. Handled before prompt
+    # validation (polls carry no prompt) and before any workspace/config work —
+    # it must stay sub-second and side-effect-free.
+    if payload.get("action") == "poll":
+        turn_id = payload.get("turn_id") or ""
+        if not turn_id:
+            return JSONResponse({"error": "poll needs a turn_id"}, status_code=400)
+        return JSONResponse(_poll_turn(payload.get("session_id"), turn_id))
 
     prompt = (payload.get("prompt") or "").strip()
     if not prompt and not warm and not checkpoint and not prepare:
@@ -1999,6 +2191,51 @@ async def invocations(request: Request):
                                         "resume_ready": resume_ready})
         return JSONResponse({"warmed": True, "workspace": workdir, "cli": cli,
                              "resume_ready": resume_ready})
+
+    # Async path (workflow personas): kick the CLI off on a runner thread and
+    # return a turn_id immediately. The caller polls with {action:"poll",
+    # turn_id, session_id} — no connection stays open during the turn, so the
+    # ~15-min idle-stream kill can't strand anyone. Setup errors above still
+    # fail THIS call synchronously (bad repo, clone failure), which is what the
+    # caller can act on.
+    if payload.get("mode") == "async" and cli in ("claude", "codex"):
+        # Idempotency: the caller supplies turn_id so a client-side timeout +
+        # resubmit of the same turn can't double-run it — if this id is already
+        # live (or already finished), acknowledge the existing turn instead of
+        # starting a second runner on the same workspace.
+        turn_id = payload.get("turn_id") or f"turn-{uuid.uuid4().hex}"
+        if turn_id in _ACTIVE_TURNS:
+            logger.info("turn_submit_dedupe", extra={"turn_id": turn_id})
+            return JSONResponse({"submitted": True, "turn_id": turn_id, "cli": cli,
+                                 "workspace": workdir, "deduped": True})
+        journal = _turn_journal_path(session_id, turn_id)
+        # Same id journaled on EFS (this VM already ran it, possibly pre-recycle
+        # with a durable result): acknowledge, let the caller's poll collect it.
+        if os.path.exists(journal):
+            logger.info("turn_submit_dedupe_journal", extra={"turn_id": turn_id})
+            return JSONResponse({"submitted": True, "turn_id": turn_id, "cli": cli,
+                                 "workspace": workdir, "deduped": True})
+        # Seed the journal BEFORE returning so an immediate poll can never see
+        # "unknown" for a turn we accepted. If the seed can't be written the
+        # turn must NOT start: an accepted-but-unjournaled turn polls as
+        # "unknown" and gets resubmitted while the original still runs.
+        seeded = _journal_write(journal, {"status": "running", "turn_id": turn_id,
+                                          "cli": cli, "started_at": int(time.time()),
+                                          "heartbeat": int(time.time())})
+        if not seeded:
+            logger.error("turn_submit_seed_failed", extra={"turn_id": turn_id})
+            return JSONResponse(
+                {"error": "turn journal unwritable (EFS degraded) — turn not started"},
+                status_code=503)
+        threading.Thread(
+            target=_run_turn_async,
+            args=(turn_id, journal, cli, prompt, workdir, claude_session_id,
+                  repo, session_id, tenant_id, model),
+            daemon=True,
+        ).start()
+        logger.info("turn_submitted", extra={"cli": cli, "turn_id": turn_id})
+        return JSONResponse({"submitted": True, "turn_id": turn_id, "cli": cli,
+                             "workspace": workdir})
 
     # Streaming path: yield SSE as the turn runs. The runtime forwards an
     # async/sync generator response as text/event-stream through InvokeAgentRuntime.
