@@ -16,6 +16,7 @@ RUN bash install-skills.sh && rm install-skills.sh
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
+COPY liveness.py .
 EXPOSE 8080
 # Wrap with opentelemetry-instrument so the runtime emits GenAI-semantic OTel
 # spans to CloudWatch. Without this, AgentCore online evaluations have no

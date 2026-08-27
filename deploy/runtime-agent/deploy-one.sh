@@ -116,6 +116,7 @@ fi
 
 DEPLOY_DIR=$(mktemp -d)
 cp "$SCRIPT_DIR/main.py" "$DEPLOY_DIR/"
+cp "$SCRIPT_DIR/liveness.py" "$DEPLOY_DIR/"
 cp "$SCRIPT_DIR/requirements.txt" "$DEPLOY_DIR/"
 cd "$DEPLOY_DIR"
 

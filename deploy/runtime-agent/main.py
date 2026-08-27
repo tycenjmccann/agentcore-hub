@@ -66,12 +66,21 @@ if not os.path.exists(_node_marker):
 else:
     os.environ["PATH"] = f"/tmp/node-v20.18.0-linux-arm64/bin:/tmp/.npm-global/bin:{os.environ.get('PATH', '')}"
 
+import asyncio
 import json
 import logging
 import uuid
 from datetime import datetime, timezone
 
 import boto3
+
+from liveness import (
+    DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    DEFAULT_SILENCE_TIMEOUT_SECONDS,
+    LivenessMonitor,
+    heartbeat_loop,
+    read_positive_float_env,
+)
 
 from strands import Agent, tool
 from strands.models import BedrockModel
@@ -1761,6 +1770,9 @@ async def agent_invocation(payload, context):
         def __init__(self):
             self.previous_tool_use = None
             self._seq = 0
+            # The liveness watchdog thread emits through this same path, so the
+            # sequence counter (part of the unique sort key) must be race-safe.
+            self._seq_lock = threading.Lock()
 
         def _publish_event(self, event_type: str, detail: dict):
             """Publish an event to the DynamoDB events table (fire-and-forget).
@@ -1770,10 +1782,12 @@ async def agent_invocation(payload, context):
                 return
             try:
                 import time
-                self._seq += 1
-                event_id = f"{int(time.time() * 1000)}-{self._seq:06d}"
+                with self._seq_lock:
+                    self._seq += 1
+                    seq = self._seq
+                event_id = f"{int(time.time() * 1000)}-{seq:06d}"
                 # Unique timestamp with sequence suffix (sort key must never collide)
-                unique_ts = f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())}.{self._seq:04d}Z"
+                unique_ts = f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())}.{seq:04d}Z"
                 detail_map = {}
                 for k, v in detail.items():
                     if v is not None:
@@ -1860,37 +1874,113 @@ async def agent_invocation(payload, context):
             })
             _text_buffer = ""
 
-    async for event in agent.stream_async(prompt):
-        if "data" in event and event["data"]:
-            final_text += event["data"]
-            _text_buffer += event["data"]
-            if len(_text_buffer) >= _FLUSH_THRESHOLD:
-                _flush_text_buffer()
-        elif "current_tool_use" in event:
-            _flush_text_buffer()  # flush pending text before tool event
-            current_tool_use = event["current_tool_use"]
-            if current_tool_use and current_tool_use.get("name"):
-                if tracker.previous_tool_use != current_tool_use:
-                    tracker.previous_tool_use = current_tool_use
-                    tool_name = current_tool_use["name"]
-                    tool_events.append(tool_name)
-                    logger.info(f"[{agent_id}] Tool call: {tool_name}")
-                    tracker._publish_event("agent.streaming", {
-                        "agentId": agent_id,
-                        "type": "trace",
-                        "toolName": tool_name,
-                        "workflowId": workflow_id,
-                    })
-        elif "reasoningText" in event and event["reasoningText"]:
-            _flush_text_buffer()  # flush pending text before reasoning event
-            tracker._publish_event("agent.streaming", {
-                "agentId": agent_id,
-                "type": "reasoning",
-                "content": event["reasoningText"],
-                "workflowId": workflow_id,
+    # ── Liveness: heartbeat + silence watchdog (TEAM-3202/TEAM-3211) ────────
+    # Before this, a mid-loop death emitted no terminal event and left the
+    # ticket in_progress forever. The heartbeat is an asyncio task (ticks even
+    # during a long tool call — tools run in worker threads); the watchdog is a
+    # plain OS thread so it survives the exact failure it detects (event loop
+    # wedged/abandoned while the process lingers). Residual gap: a hard SIGKILL
+    # of the whole microVM kills the watchdog too — see liveness.py docstring.
+    heartbeat_interval = read_positive_float_env(
+        "AGENT_HEARTBEAT_INTERVAL_SECONDS", DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
+    silence_timeout = read_positive_float_env(
+        "AGENT_SILENCE_TIMEOUT_SECONDS", DEFAULT_SILENCE_TIMEOUT_SECONDS)
+    if silence_timeout <= heartbeat_interval:
+        logger.warning(
+            f"[{agent_id}] AGENT_SILENCE_TIMEOUT_SECONDS ({silence_timeout}s) must exceed "
+            f"the heartbeat interval ({heartbeat_interval}s) — raising to {heartbeat_interval * 4}s")
+        silence_timeout = heartbeat_interval * 4
+
+    # Capture the ticket id locally: the _CURRENT_* globals are reset by the
+    # next invocation on a warm microVM, but the watchdog may fire after that.
+    liveness_ticket_id = _CURRENT_TICKET_ID
+
+    def _emit_lifecycle_event(event_type: str, detail: dict):
+        tracker._publish_event(event_type, {
+            "agentId": agent_id,
+            "workflowId": workflow_id,
+            **({"ticketId": liveness_ticket_id} if liveness_ticket_id else {}),
+            **detail,
+        })
+
+    def _release_stuck_ticket(reason: str):
+        """Fail the stuck ticket so downstream unblocks — same convention as the
+        orchestrator's failed-invoke path (ticket → blocked, human moves it back
+        to retry), via the same tickets Lambda the runtime's tools use."""
+        if not liveness_ticket_id:
+            logger.warning(f"[{agent_id}] liveness: no ticket_id on this invocation — nothing to release")
+            return
+        out = _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___transition_ticket", {
+            "ticket_id": liveness_ticket_id, "transition_id": "blocked", "reason": reason,
+        })
+        logger.info(f"[{agent_id}] liveness: released ticket {liveness_ticket_id} → blocked: {str(out)[:200]}")
+
+    monitor = LivenessMonitor(
+        silence_timeout=silence_timeout,
+        emit_event=_emit_lifecycle_event,
+        release_ticket=_release_stuck_ticket,
+    )
+    monitor.start()
+    heartbeat_task = asyncio.create_task(heartbeat_loop(
+        monitor, heartbeat_interval,
+        lambda: _emit_lifecycle_event("agent.heartbeat", {
+            "intervalSeconds": int(heartbeat_interval),
+        }),
+    ))
+
+    try:
+        async for event in agent.stream_async(prompt):
+            monitor.beat()
+            if "data" in event and event["data"]:
+                final_text += event["data"]
+                _text_buffer += event["data"]
+                if len(_text_buffer) >= _FLUSH_THRESHOLD:
+                    _flush_text_buffer()
+            elif "current_tool_use" in event:
+                _flush_text_buffer()  # flush pending text before tool event
+                current_tool_use = event["current_tool_use"]
+                if current_tool_use and current_tool_use.get("name"):
+                    if tracker.previous_tool_use != current_tool_use:
+                        tracker.previous_tool_use = current_tool_use
+                        tool_name = current_tool_use["name"]
+                        tool_events.append(tool_name)
+                        logger.info(f"[{agent_id}] Tool call: {tool_name}")
+                        tracker._publish_event("agent.streaming", {
+                            "agentId": agent_id,
+                            "type": "trace",
+                            "toolName": tool_name,
+                            "workflowId": workflow_id,
+                        })
+            elif "reasoningText" in event and event["reasoningText"]:
+                _flush_text_buffer()  # flush pending text before reasoning event
+                tracker._publish_event("agent.streaming", {
+                    "agentId": agent_id,
+                    "type": "reasoning",
+                    "content": event["reasoningText"],
+                    "workflowId": workflow_id,
+                })
+            if "result" in event:
+                result = event["result"]
+    except Exception as e:
+        # The loop died in-process. claim_terminal() is the shared atomic guard:
+        # if the watchdog already tripped, do not emit a second terminal event.
+        if monitor.claim_terminal():
+            _emit_lifecycle_event("agent.error", {
+                "error": f"agent event loop failed: {str(e)[:500]}",
+                "reason": "loop_exception",
             })
-        if "result" in event:
-            result = event["result"]
+            try:
+                _release_stuck_ticket(f"agent event loop failed: {str(e)[:200]}")
+            except Exception as release_err:  # noqa: BLE001
+                logger.error(f"[{agent_id}] liveness: ticket release on loop failure failed: {release_err}")
+        raise
+    finally:
+        # Normal exit (or cancellation): claim the terminal slot so the watchdog
+        # can never trip afterwards, stop heartbeats, and join the watchdog
+        # thread — no leaked threads keeping the process alive.
+        monitor.claim_terminal()
+        heartbeat_task.cancel()
+        monitor.stop()
 
     # Flush any remaining buffered text after stream ends
     _flush_text_buffer()
