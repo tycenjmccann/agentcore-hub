@@ -163,17 +163,28 @@ async function cancelOneIssueJira(
 
   if (!trans) throw new Error(`No cancel transition for ${issueKey}`);
 
-  await fetch(transUrl, {
-    method: "POST",
-    headers: {
-      Authorization: jiraAuth.authHeader,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      transition: { id: trans.id },
-      fields: { resolution: { name: "Won't Do" } },
-    }),
-  });
+  const doTransition = (withResolution: boolean) =>
+    fetch(transUrl, {
+      method: "POST",
+      headers: {
+        Authorization: jiraAuth.authHeader,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        transition: { id: trans.id },
+        ...(withResolution ? { fields: { resolution: { name: "Won't Do" } } } : {}),
+      }),
+    });
+
+  let resp = await doTransition(true);
+  if (!resp.ok) {
+    // Resolution may not be on the transition screen — retry the bare transition.
+    resp = await doTransition(false);
+  }
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Transition failed for ${issueKey}: HTTP ${resp.status} ${body.slice(0, 200)}`);
+  }
 }
 
 async function cancelTicketsJira(epicId: string) {
