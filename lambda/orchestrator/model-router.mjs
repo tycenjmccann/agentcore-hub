@@ -91,13 +91,29 @@ const ESCALATORS = [
   },
 ];
 
+// Share of duplicate lines: 400 identical import lines -> ~0.995.
+function lineRepetition(s) {
+  const lines = s.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (lines.length < 20) return 0;
+  return 1 - new Set(lines).size / lines.length;
+}
+
 // Signals that a task is mechanical enough to sink toward the floor.
 const SINKERS = [
   {
     name: "formatting-ops",
     test: (s) =>
-      s.length < 2_000 &&
-      /\b(reformat|rename|lint|bump version|update (the )?(label|status|date)|move file|sort|dedupe|convert .{0,20}to (json|yaml|csv))\b/i.test(s),
+      /\b(reformat|rename|lint|bump version|update (the )?(label|status|date)|move file|sort|dedupe|convert .{0,20}to (json|yaml|csv))\b/i.test(s) &&
+      (s.length < 2_000 || lineRepetition(s) >= 0.8),
+  },
+  {
+    // Explicit acceptance criteria + a concrete file target in a short
+    // prompt = well-specified standard work, not deep reasoning.
+    name: "well-specified-change",
+    test: (s) =>
+      s.length < 1_500 &&
+      /\bacceptance( criteria)?\s*:/i.test(s) &&
+      /\S+\.(sh|ts|tsx|js|jsx|mjs|cjs|py|go|rb|rs|java|json|ya?ml|toml|css|html|md)\b/i.test(s),
   },
   {
     name: "status-report",
