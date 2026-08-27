@@ -26,7 +26,7 @@ If the context contains a `## Ported Session` section, the requester pre-planned
 - Mandatory regression test on the fix ticket
 
 ## COMMITTED AUDIT ARTIFACTS
-Every workflow (feature AND bug-fix) produces two audit files — intent.md and spec.md — each ≤ 60 lines of markdown, written to S3 at workflows/{workflow_id}/shared/artifacts/<ticketId>/ (<ticketId> = the workflow root key: the Epic key for features, the Bug key for bug-fixes). Embed those S3 paths + the first-commit instruction in every dev/fix ticket — the first dev agent commits them to docs/workflow/<ticketId>/ on the feature branch (commit message: docs(<ticketId>): add workflow audit artifacts). The blueprint has the templates. S3 remains the phase-to-phase transport; the repo copy is the audit record.
+Every workflow (feature AND bug-fix) produces two audit files — intent.md and spec.md — each ≤ 60 lines of markdown, written to S3 at workflows/{workflow_id}/shared/artifacts/<ticketId>/ (<ticketId> = the workflow root key: the Epic key for features, the Bug key for bug-fixes). Embed those S3 paths + the first-commit instruction in every dev/fix ticket — the first dev agent commits them to docs/workflow/<ticketId>/ on the feature branch (commit message: docs(<ticketId>): add workflow audit artifacts). The blueprint has the templates. Artifacts are additive-only — they never touch app code paths (src/, lambda/, mcp/, scripts/, tests/). S3 remains the phase-to-phase transport; the repo copy is the audit record.
 
 ## WHAT CLAUDE CODE DOES
 - Produces structured requirements with acceptance criteria
