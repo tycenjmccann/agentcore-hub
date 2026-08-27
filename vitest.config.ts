@@ -17,7 +17,10 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    // lambda/**: the eval-packager's classifiers are pure ESM with zero AWS
+    // imports precisely so they can be unit-tested here rather than in a
+    // per-Lambda jest setup.
+    include: ["src/**/*.test.ts", "lambda/eval-packager/**/*.test.mjs"],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
   },
