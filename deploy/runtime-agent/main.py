@@ -511,8 +511,22 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
             "no_retry_hint": True}
 
 
+_POLL_CLIENT = None
+
+
 def _poll_once(client, turn_id: str) -> dict:
-    return _coding_invoke(client, {
+    """client is the submit client (600s read timeout, sized for cold-clone
+    setup). Polls answer in under a second server-side, so they get their own
+    short-timeout client — otherwise one accepted-but-silent poll connection
+    blocks 600s and blows straight past the loop's hard stop."""
+    global _POLL_CLIENT
+    if _POLL_CLIENT is None:
+        _POLL_CLIENT = boto3.client(
+            "bedrock-agentcore", region_name=REGION,
+            config=BotocoreConfig(read_timeout=30, connect_timeout=10,
+                                  retries={"max_attempts": 0}),
+        )
+    return _coding_invoke(_POLL_CLIENT, {
         "action": "poll",
         "turn_id": turn_id,
         "session_id": _CODING_SESSION["session_id"],
