@@ -3,7 +3,7 @@
 // up the one file they add. No AWS, no network.
 import { describe, it, expect, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, readdirSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,6 +11,7 @@ const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const LINTER = join(REPO_ROOT, "evals/battery/lint-fixtures.mjs");
 const CASES_DIR = join(REPO_ROOT, "evals/battery/cases");
 const PROBE = join(CASES_DIR, "zz-duplicate-id-probe.json");
+const BASELINE = join(REPO_ROOT, "evals/battery/baseline.json");
 
 /** Run the linter; returns { code, output } instead of throwing. */
 function lint(): { code: number; output: string } {
@@ -47,5 +48,20 @@ describe("battery:lint", () => {
     expect(output).toMatch(/duplicate case id '[a-z0-9-]+' declared by 2 case files/);
     expect(output).toContain(`evals/battery/cases/${source}`);
     expect(output).toContain("evals/battery/cases/zz-duplicate-id-probe.json");
+  });
+
+  it("scans the committed baseline.json for forbidden patterns (C2)", () => {
+    const original = readFileSync(BASELINE, "utf8");
+    try {
+      const poisoned = JSON.parse(original);
+      poisoned.note = "regenerated for TEAM-3067";
+      writeFileSync(BASELINE, JSON.stringify(poisoned, null, 2) + "\n");
+      const { code, output } = lint();
+      expect(code).toBe(1);
+      expect(output).toContain("evals/battery/baseline.json");
+      expect(output).toContain("real Jira project key (use BATT-*)");
+    } finally {
+      writeFileSync(BASELINE, original);
+    }
   });
 });

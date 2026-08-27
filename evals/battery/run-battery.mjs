@@ -11,7 +11,7 @@
 // maxRunUsd (B5), and a bootstrap baseline (B1) or a suite with no
 // baseline-compared case (B3) can never produce a PASS.
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
@@ -22,6 +22,7 @@ import { runCase, MODEL_TIERS } from "./lib/agent-runner.mjs";
 import { createSpendLedger } from "./lib/spend.mjs";
 import { createConverseTransport, scoreCase, SCORING_BACKEND } from "./lib/scoring.mjs";
 import { buildResults, renderCheckSummary } from "./lib/report.mjs";
+import { writeRedacted } from "./lib/redact.mjs";
 import "./lib/otel.mjs"; // import-time contract check vs schema/otel-eval-attributes.json
 
 const BATTERY_DIR = dirname(fileURLToPath(import.meta.url));
@@ -360,7 +361,9 @@ async function main() {
       console.error("Baseline generation FAILED — not writing an unsound baseline.");
       process.exit(1);
     }
-    writeFileSync(
+    // C2: redact at the write-time choke point — nothing forbidden may land
+    // in the committed baseline regardless of raw error strings.
+    writeRedacted(
       outPath,
       JSON.stringify(
         {
@@ -410,10 +413,13 @@ async function main() {
     configSources: gate ? { baseRef: gate.baseRef, ...gate.sources } : { baseRef: null, all: "pr-head (local/manual run)" },
   });
 
+  // C2: redact at the write-time choke point. check-summary.md is published
+  // verbatim into a public check run, and battery-results.json is uploaded as
+  // an artifact — raw agent/judge error strings must never leak through them.
   const resultsPath = resolve(flags.results || join(BATTERY_DIR, "battery-results.json"));
-  writeFileSync(resultsPath, JSON.stringify(results, null, 2) + "\n");
+  writeRedacted(resultsPath, JSON.stringify(results, null, 2) + "\n");
   const summaryPath = join(dirname(resultsPath), "check-summary.md");
-  writeFileSync(summaryPath, renderCheckSummary(results) + "\n");
+  writeRedacted(summaryPath, renderCheckSummary(results) + "\n");
 
   console.log(`\n${renderCheckSummary(results)}`);
   console.log(`Results: ${resultsPath}\nCheck summary: ${summaryPath}`);
@@ -421,8 +427,9 @@ async function main() {
 }
 
 // Sanity: this module must never import anything that writes the canonical
-// baseline in gate mode; the only writeFileSync targets above are --out
-// (baseline mode, explicit) and the results/summary files.
+// baseline in gate mode; the only file-write targets above are --out
+// (baseline mode, explicit) and the results/summary files — all via the
+// writeRedacted choke point (C2).
 if (CASES_BACKEND !== SCORING_BACKEND) {
   console.error("internal: scoring backend constants diverged between cases.mjs and scoring.mjs");
   process.exit(1);
