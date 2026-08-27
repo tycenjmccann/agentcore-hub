@@ -51,6 +51,36 @@ logger = get_logger("coding-agent-runtime")
 # cold microVMs, so repo clones + node_modules don't hit the ~1 GB sessionStorage
 # cap (ENOSPC) and survive for true warm resume. deploy.py sets WORKSPACE_ROOT.
 WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/mnt/efs")
+
+# ── Shared git object cache (bare mirrors) ──────────────────────────────────
+# Every workflow task lands on a NEW runtimeSessionId, so a cold workspace meant a
+# FULL `git clone` onto the shared EFS mount. Under burst load (many workflows,
+# the same handful of repos) those concurrent clones blew the old 300s cap and
+# faulted the mount mid-pack-index ("Bad file descriptor" / "invalid index-pack"),
+# which surfaced to the agent as a tool timeout. Fix: keep ONE bare mirror per repo
+# on EFS and have each session `clone --reference` it — a cold setup becomes a refs
+# negotiation plus a small delta instead of a full object transfer, with near-zero
+# object writes (the part that was faulting).
+# Kill-switch: WORKSPACE_MIRROR_ENABLED=0 restores the plain-clone path and never
+# touches .mirrors at all — an env flip, no code rollback.
+WORKSPACE_MIRROR_ENABLED = os.environ.get("WORKSPACE_MIRROR_ENABLED", "1").lower() not in ("0", "false", "no")
+MIRROR_ROOT = os.path.join(WORKSPACE_ROOT, ".mirrors")
+# Per-session checkout cap. Was 300s — too tight for a big repo on a busy mount.
+CLONE_TIMEOUT_S = int(os.environ.get("CLONE_TIMEOUT_S", "900"))
+# Building a mirror is the one full download for that repo, ever — give it room.
+MIRROR_BUILD_TIMEOUT_S = int(os.environ.get("MIRROR_BUILD_TIMEOUT_S", "1200"))
+# How stale a mirror may be before a checkout refreshes it (`fetch --prune`).
+MIRROR_REFRESH_TTL_S = int(os.environ.get("MIRROR_REFRESH_TTL_S", "3600"))
+# Off by default: keeping the alternates link IS the win (borrowed objects are not
+# rewritten). Set 1 to copy objects into the checkout and cut the link instead.
+MIRROR_DISSOCIATE = os.environ.get("MIRROR_DISSOCIATE", "0").lower() not in ("0", "false", "no")
+# Mirror create/refresh is serialized by a lock file; readers never lock.
+_MIRROR_LOCK_WAIT_S = 60      # give up waiting → caller falls back to a plain clone
+_MIRROR_LOCK_POLL_S = 1.0
+# A lock older than this was orphaned by a microVM that died mid-build. It MUST
+# stay above MIRROR_BUILD_TIMEOUT_S so a live build is never stolen.
+_MIRROR_LOCK_STALE_S = 1800
+
 DEFAULT_CLI = "claude"
 CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
     "CLAUDE_MODEL", "us.anthropic.claude-fable-5"
@@ -1047,6 +1077,192 @@ def _gc_stale_sessions() -> None:
         logger.warning("session_gc_failed", extra={"error": str(exc)[:200]})
 
 
+def _scrub_git_url(text: str) -> str:
+    """Strip `user:token@` userinfo out of any URL inside `text`.
+
+    Git echoes the remote URL in its own error output, and a turn's global
+    gitconfig rewrites github.com to an `x-access-token:<pat>@` form — so raw
+    stderr can carry a credential. Every mirror/clone message goes through this
+    before it reaches a log line or an exception. scp-style `git@host:path` has no
+    `://` and is left alone (it carries no secret)."""
+    return re.sub(r"(://)[^/@\s]*@", r"\1", text or "")
+
+
+def _is_mirror(path: str) -> bool:
+    """True if `path` looks like a usable bare repo (built, not half-built). A
+    mirror is published by atomic rename, so this is belt-and-braces against a
+    directory left behind by an older/killed build."""
+    return os.path.isfile(os.path.join(path, "HEAD")) and os.path.isdir(os.path.join(path, "objects"))
+
+
+def _acquire_mirror_lock(lock_path: str) -> bool:
+    """Take this repo's mirror lock, or return False.
+
+    O_CREAT|O_EXCL, deliberately NOT fcntl.flock: the lock is shared across
+    microVMs through EFS and flock semantics over NFS are unreliable. Waits up to
+    _MIRROR_LOCK_WAIT_S for the holder, then gives up so a turn is never stalled
+    behind someone else's build (the caller falls back to a plain clone). A lock
+    whose mtime exceeds _MIRROR_LOCK_STALE_S (> MIRROR_BUILD_TIMEOUT_S, so a live
+    build is never stolen) was orphaned by a dead VM and is reclaimed — by atomic
+    rename, so two racing waiters can't both believe they stole it."""
+    deadline = time.time() + _MIRROR_LOCK_WAIT_S
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            try:
+                os.write(fd, str(int(time.time())).encode())
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            logger.warning("mirror_lock_failed", extra={"error": str(exc)[:200]})
+            return False
+        try:
+            if time.time() - os.path.getmtime(lock_path) > _MIRROR_LOCK_STALE_S:
+                victim = f"{lock_path}.stale.{uuid.uuid4().hex[:8]}"
+                os.rename(lock_path, victim)  # atomic — only one racer wins
+                os.unlink(victim)
+                logger.info("mirror_lock_stale_steal", extra={"lock": os.path.basename(lock_path)})
+                continue
+        except OSError:
+            pass  # released or stolen between checks — just retry the create
+        if time.time() >= deadline:
+            return False
+        time.sleep(_MIRROR_LOCK_POLL_S)
+
+
+def _release_mirror_lock(lock_path: str) -> None:
+    try:
+        os.unlink(lock_path)
+    except OSError:
+        pass
+
+
+def _ensure_mirror(url: str, slug: str) -> str | None:
+    """Return this repo's shared bare mirror (building/refreshing it first), or
+    None if the cache can't be used — the caller then does a plain clone.
+
+    The mirror is an OBJECT CACHE, not a workspace: one per repo under
+    {WORKSPACE_ROOT}/.mirrors, shared by every session on this EFS mount. Session
+    checkouts borrow its objects via `git clone --reference`, so the only bytes on
+    the wire are whatever origin has beyond the mirror.
+
+    Never raises. Never `git gc`s the mirror: live checkouts reach its objects
+    through .git/objects/info/alternates, so pruning objects would break them
+    (`fetch --prune` prunes remote-tracking REFS only, which is safe)."""
+    if not WORKSPACE_MIRROR_ENABLED:
+        return None
+    mirror = os.path.join(MIRROR_ROOT, f"{slug}.git")
+    stamp = os.path.join(MIRROR_ROOT, f"{slug}.fetched")
+    lock = os.path.join(MIRROR_ROOT, f"{slug}.lock")
+
+    def _fresh() -> bool:
+        try:
+            return time.time() - os.path.getmtime(stamp) < MIRROR_REFRESH_TTL_S
+        except OSError:
+            return False
+
+    def _stamp() -> None:
+        try:
+            with open(stamp, "w") as f:
+                f.write(str(int(time.time())))
+        except OSError:
+            pass  # a missing stamp only costs an extra refresh next time
+
+    try:
+        os.makedirs(MIRROR_ROOT, exist_ok=True)
+    except OSError as exc:
+        logger.info("mirror_fallback", extra={"slug": slug, "reason": f"mkdir: {str(exc)[:120]}"})
+        return None
+
+    # Fast path: a built mirror refreshed within the TTL needs no lock at all.
+    if _is_mirror(mirror) and _fresh():
+        return mirror
+
+    if not _acquire_mirror_lock(lock):
+        logger.info("mirror_fallback", extra={"slug": slug, "reason": "lock_timeout"})
+        return None
+    try:
+        # Double-check under the lock: the holder we waited on may have just done
+        # the exact work we were about to redo.
+        if _is_mirror(mirror):
+            if _fresh():
+                return mirror
+            res = subprocess.run(["git", "-C", mirror, "fetch", "--prune"],
+                                 capture_output=True, text=True, timeout=MIRROR_BUILD_TIMEOUT_S)
+            if res.returncode != 0:
+                logger.info("mirror_fallback", extra={
+                    "slug": slug, "reason": f"fetch: {_scrub_git_url(res.stderr.strip())[:160]}"})
+                return None
+            _stamp()
+            logger.info("mirror_refresh", extra={"slug": slug})
+            return mirror
+        # Build it. Clone to a temp path and publish by atomic rename so a killed
+        # build can never leave a half-written mirror that looks valid.
+        tmp = f"{mirror}.tmp.{uuid.uuid4().hex[:8]}"
+        try:
+            res = subprocess.run(["git", "clone", "--mirror", url, tmp],
+                                 capture_output=True, text=True, timeout=MIRROR_BUILD_TIMEOUT_S)
+            if res.returncode != 0:
+                logger.info("mirror_fallback", extra={
+                    "slug": slug, "reason": f"build: {_scrub_git_url(res.stderr.strip())[:160]}"})
+                return None
+            os.rename(tmp, mirror)
+            _stamp()
+            logger.info("mirror_build", extra={"slug": slug})
+            return mirror
+        finally:
+            if os.path.exists(tmp):
+                shutil.rmtree(tmp, ignore_errors=True)
+    except Exception as exc:  # noqa: BLE001 — the cache is an optimization, never a failure mode
+        logger.info("mirror_fallback", extra={
+            "slug": slug, "reason": f"{type(exc).__name__}: {_scrub_git_url(str(exc))[:160]}"})
+        return None
+    finally:
+        _release_mirror_lock(lock)
+
+
+def _reset_workdir(wd: str) -> None:
+    """Clear a partial checkout. `git clone` refuses a non-empty target, so any
+    failed attempt must be swept before the next one."""
+    if os.path.exists(wd):
+        shutil.rmtree(wd, ignore_errors=True)
+
+
+# Faults seen when many sessions cloned the same repo onto one EFS mount at once.
+# They are transient by nature (the mount, not the repo), so one retry is worth it.
+_TRANSIENT_CLONE_ERRS = (
+    "bad file descriptor", "invalid index-pack", "index-pack failed",
+    "input/output error", "early eof", "unable to read", "remote end hung up",
+    "connection reset", "timed out",
+)
+
+
+def _plain_clone(url: str, wd: str, slug: str) -> str:
+    """The pre-mirror clone path, kept as the always-available fallback so a mirror
+    problem can never be worse than today. One retry on the transient mount-fault
+    class above; anything else fails fast."""
+    last = ""
+    for attempt in (1, 2):
+        try:
+            res = subprocess.run(["git", "clone", url, wd], capture_output=True, text=True,
+                                 timeout=CLONE_TIMEOUT_S)
+            if res.returncode == 0:
+                return wd
+            last = res.stderr.strip()
+        except subprocess.TimeoutExpired:
+            last = f"timed out after {CLONE_TIMEOUT_S}s"
+        low = last.lower()
+        if attempt == 2 or not any(e in low for e in _TRANSIENT_CLONE_ERRS):
+            break
+        logger.warning("workspace_clone_retry",
+                       extra={"slug": slug, "error": _scrub_git_url(last)[:200]})
+        _reset_workdir(wd)
+    raise RuntimeError(f"git clone failed: {_scrub_git_url(last)[:400]}")
+
+
 def _ensure_workspace(repo: str | None, session_id: str | None = None,
                       clone_url: str | None = None) -> str:
     """Return the working dir for this session. If repo given and not yet cloned,
@@ -1085,10 +1301,30 @@ def _ensure_workspace(repo: str | None, session_id: str | None = None,
     os.makedirs(base, exist_ok=True)
     url = clone_url or (repo if repo.startswith(("http://", "https://", "git@")) else f"https://github.com/{repo}.git")
     logger.info("workspace_cloning", extra={"slug": slug, "url": url.split("@")[-1]})
-    res = subprocess.run(["git", "clone", url, wd], capture_output=True, text=True, timeout=300)
-    if res.returncode != 0:
-        raise RuntimeError(f"git clone failed: {res.stderr.strip()[:400]}")
-    return wd
+    # Borrow objects from this repo's shared bare mirror when we have one. The
+    # mirror is fed the credential-stripped URL so no token is ever persisted in
+    # its remote config (the turn's global insteadOf rewrite supplies auth); the
+    # session clone keeps the caller's URL verbatim, exactly as before.
+    mirror = _ensure_mirror(_scrub_git_url(url), slug)
+    if mirror:
+        cmd = ["git", "clone", "--reference", mirror]
+        if MIRROR_DISSOCIATE:
+            cmd.append("--dissociate")
+        cmd += [url, wd]
+        reason = ""
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=CLONE_TIMEOUT_S)
+            if res.returncode == 0:
+                logger.info("mirror_hit", extra={"slug": slug, "dissociate": MIRROR_DISSOCIATE})
+                return wd
+            reason = f"reference_clone: {_scrub_git_url(res.stderr.strip())[:160]}"
+        except subprocess.TimeoutExpired:
+            reason = f"reference_clone timed out after {CLONE_TIMEOUT_S}s"
+        except OSError as exc:
+            reason = f"reference_clone: {type(exc).__name__}: {str(exc)[:120]}"
+        logger.info("mirror_fallback", extra={"slug": slug, "reason": reason})
+        _reset_workdir(wd)  # a failed attempt can leave a partial dir; clone needs it clean
+    return _plain_clone(url, wd, slug)
 
 
 def _safe_branch_name(name: str | None) -> str:
