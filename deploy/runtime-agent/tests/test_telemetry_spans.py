@@ -449,6 +449,19 @@ def _load_production_entrypoints() -> dict[str, Any]:
     missing = wanted - {func.name for func in funcs}
     assert not missing, f"{sorted(missing)} not defined at module scope in {MAIN_PY}"
 
+    # _run_agent_invocation instantiates the STOP-after-completion gate
+    # (TEAM-3132); extract the real shipped class rather than stubbing it —
+    # it is a plain class whose only module-scope dependency is `logger`.
+    gate_cls = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "_CompletionGate"
+        ),
+        None,
+    )
+    assert gate_cls is not None, f"_CompletionGate is not defined at module scope in {MAIN_PY}"
+
     # The mock model never emits toolUse, so these delegation-tool stubs exist
     # only to satisfy the `all_tools` assembly in the shipped source.
     @tool
@@ -495,7 +508,7 @@ def _load_production_entrypoints() -> dict[str, Any]:
         "_DETACHED_TASKS": set(),
         "app": _RecordingApp(),
     }
-    module = ast.Module(body=funcs, type_ignores=[])
+    module = ast.Module(body=[gate_cls, *funcs], type_ignores=[])
     exec(compile(module, str(MAIN_PY), "exec"), namespace)  # noqa: S102
     return namespace
 

@@ -93,7 +93,7 @@ Interpret:
 |----------|---------|--------|
 | `existing global TracerProvider: opentelemetry.sdk.trace.TracerProvider` (or an ADOT provider class) | Auto-instrumentation applied — the platform/ADOT registered the SDK before `main.py` loaded. **This is the healthy path.** | Continue to probe 2 |
 | `auto-instrumentation absent — StrandsTelemetry OTLP fallback active (was ...ProxyTracerProvider, now TracerProvider)` | No auto-instrumentation; `main.py` registered its own OTLP exporter. Spans *may* still ship, but only if `OTEL_EXPORTER_OTLP_*` resolves. | Continue to probe 2; if it fails, escalate (§3) |
-| `no TracerProvider and AGENT_OBSERVABILITY_ENABLED != true — spans will NOT be exported` | The observability env vars were not applied to this runtime. | Re-deploy — `AGENT_OBSERVABILITY_ENABLED=true` is missing (check `deploy-one.sh` / `deploy-one-robust.py` ran the current version) |
+| `no TracerProvider and AGENT_OBSERVABILITY_ENABLED != true — spans will NOT be exported` | Platform observability was not applied to this runtime (no ADOT injection, no `AGENT_OBSERVABILITY_ENABLED`). | Re-deploy and confirm the runtime has observability enabled — the platform injects `AGENT_OBSERVABILITY_ENABLED=true`; deploy scripts deliberately do not set it (TEAM-3103) |
 | *no `[telemetry]` line at all* | Runtime is serving stale code. | Re-deploy and confirm the runtime status went through UPDATE |
 
 ### 2. Span probe — did an `invoke_agent` span land?
@@ -169,18 +169,20 @@ These are passed via `--env` in deploy-one.sh and available inside the runtime a
 | `CLAUDE_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Claude Code model |
 | `ANTHROPIC_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Claude Code model (alt) |
 | `GITHUB_PAT` | *(token)* | GitHub MCP access |
-| `AGENT_OBSERVABILITY_ENABLED` | `true` | Platform ADOT injection + gates main.py's StrandsTelemetry fallback |
-| `OTEL_PYTHON_DISTRO` | `aws_distro` | Use the AWS OTel distro |
-| `OTEL_PYTHON_CONFIGURATOR` | `aws_configurator` | AWS OTel configurator |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | OTLP wire protocol |
-| `OTEL_TRACES_EXPORTER` | `otlp` | Export traces over OTLP |
 | `UNIFIED_TRACES_DESTINATION_ENABLED` | `true` | Deliver spans to the unified telemetry destination (`spans` log streams) |
 | `OTEL_SERVICE_NAME` | *(agent name)* | Service name on every emitted span |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | `true` | Capture prompt/response content on GenAI span events (eval input) |
 
-> Runtime-hosted agents get their OTLP endpoint, auth headers and resource
-> attributes from the platform. Do **not** set
+> Runtime-hosted agents get ADOT injected by the platform, and with it
+> `AGENT_OBSERVABILITY_ENABLED`, `OTEL_PYTHON_DISTRO`,
+> `OTEL_PYTHON_CONFIGURATOR`, `OTEL_EXPORTER_OTLP_PROTOCOL`,
+> `OTEL_TRACES_EXPORTER`, the OTLP endpoint, auth headers and resource
+> attributes (TEAM-3103: `test_build_env_vars.py` pins the platform-managed
+> list). Do **not** set those at deploy time — in particular
 > `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_HEADERS` or
-> `OTEL_RESOURCE_ATTRIBUTES`, and **never** set `DISABLE_ADOT_OBSERVABILITY`.
+> `OTEL_RESOURCE_ATTRIBUTES` (TEAM-3313: a deploy-time value replaces the
+> platform one carrying `aws.log.group.names` and breaks log-group
+> correlation) — and **never** set `DISABLE_ADOT_OBSERVABILITY`.
 
 ## Known Gotchas
 
