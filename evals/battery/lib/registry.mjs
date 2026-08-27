@@ -7,7 +7,7 @@
 // run-battery.mjs before any case runs).
 
 import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, resolve, basename, dirname } from "node:path";
+import { join, resolve, basename, dirname, sep } from "node:path";
 import { createHash } from "node:crypto";
 
 export const FORBIDDEN_TOOLS = Object.freeze([
@@ -69,8 +69,11 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
   }
 
   const inWorkspace = (p) => {
+    const root = resolve(workspaceDir);
     const abs = resolve(workspaceDir, p);
-    if (!abs.startsWith(resolve(workspaceDir))) {
+    // Exact-or-child check (a bare startsWith would also match a sibling dir
+    // like `${root}-evil`).
+    if (abs !== root && !abs.startsWith(root + sep)) {
       throw new Error(`path '${p}' escapes the case workspace — denied`);
     }
     return abs;

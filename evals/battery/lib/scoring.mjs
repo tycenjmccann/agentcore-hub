@@ -188,7 +188,9 @@ export async function scoreCase({ caseDef, runResult, transport, repoRoot }) {
     const request = buildJudgeRequest({ evaluator, caseDef, runResult, repoRoot });
     let lastError = null;
     let verdict = null;
+    let attemptUsed = 0;
     for (let attempt = 1; attempt <= 2 && !verdict; attempt++) {
+      attemptUsed = attempt;
       try {
         const response = await transport(request, {});
         usage.inputTokens += response.usage?.inputTokens || 0;
@@ -209,7 +211,7 @@ export async function scoreCase({ caseDef, runResult, transport, repoRoot }) {
       };
     }
     scores[evaluator] = verdict.score;
-    details[evaluator] = verdict;
+    details[evaluator] = { ...verdict, attempt: attemptUsed };
   }
   return { status: "scored", scores, details, usage };
 }
