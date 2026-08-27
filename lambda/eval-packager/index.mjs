@@ -154,7 +154,7 @@ export const handler = async (event) => {
   }
 
   // 5. Aggregate eval scores into DDB (for instant dashboard loads)
-  await aggregateScoresToDdb(agentId, parsed, sessionData.evaluatorResults);
+  await aggregateScoresToDdb(agentId, sessionData.evaluatorResults);
 
   // 6. Append to sessionBuffer, counting distinct runs toward batchSize
   const batchSize = config.batchSize || 10;
@@ -200,10 +200,69 @@ async function getAgentConfig(agentId) {
 }
 
 /**
+ * TEAM-3367: per-record request identity, for dedup. CloudWatch Logs
+ * subscription delivery is at-least-once, and the evaluator itself retries —
+ * either way the SAME evaluation attempt can land in a delivery several times
+ * and double-count scores/sessions downstream. Ranked candidates (live
+ * verification of which one production carries was IAM-blocked, so all three
+ * are wired as a fallback chain):
+ *   (a) the OTEL log-record envelope traceId+spanId — duplicates of one
+ *       evaluation attempt share the evaluated span's ids;
+ *   (b) attributes['aws.request_id'];
+ *   (c) attributes['gen_ai.response.id'].
+ * Returns null when none is present (dedupeResults then falls back to a
+ * content key).
+ */
+function extractRequestId(parsedMessage, attrs) {
+  const traceId = parsedMessage.traceId || parsedMessage.trace_id;
+  const spanId = parsedMessage.spanId || parsedMessage.span_id;
+  if (traceId && spanId) return `${traceId}:${spanId}`;
+  if (attrs['aws.request_id']) return String(attrs['aws.request_id']);
+  if (attrs['gen_ai.response.id']) return String(attrs['gen_ai.response.id']);
+  return null;
+}
+
+/**
+ * TEAM-3367: drop duplicate evaluator-result rows within one delivery (first
+ * occurrence wins). Keyed by requestId when the record carried one; otherwise
+ * by a content key — timestamp inclusion keeps genuinely distinct same-score
+ * evaluations apart, while identical retry writes share all five fields.
+ * Unparseable rows key on their raw text so two different platform lines that
+ * happen to share a timestamp never collapse into one.
+ *
+ * In-memory (per delivery) only by design decision: cross-delivery dedup via a
+ * DynamoDB seen-set is a follow-up, not this ticket.
+ */
+export function dedupeResults(records) {
+  const seen = new Set();
+  const out = [];
+  for (const r of records || []) {
+    const key = r.requestId
+      // evaluatorName rides along with the request id: every metric record an
+      // eval run emits about ONE evaluated span (correctness, helpfulness, …)
+      // can share that span's trace/span ids, and those are distinct results,
+      // not duplicates. Retries of the same record share both fields.
+      ? `req|${r.requestId}|${r.evaluatorName ?? ''}`
+      : r.parseError
+        ? `raw|${r.timestamp}|${r.rawMessage}`
+        : `content|${r.sessionId}|${r.evaluatorName}|${r.evaluationName ?? ''}|${r.score}|${r.timestamp}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+
+/**
  * Extract session data from parsed CW Logs event.
  * Parses each logEvent.message as JSON to extract evaluator scores,
  * evaluator name, and evidence. Stores parsed results (not raw event metadata)
  * so the improver agent can synthesize actionable insights from batch payloads.
+ *
+ * evaluatorResults comes back DEDUPED (TEAM-3367) so classifySessions, the
+ * score aggregation, and the buffered batch all see one row per evaluation
+ * attempt; `duplicatesDropped` counts what was removed (exposed for a
+ * follow-up monitoring ticket — no metric emitted here).
  */
 export function extractSessionData(parsed) {
   const logEvents = parsed.logEvents || [];
@@ -226,6 +285,7 @@ export function extractSessionData(parsed) {
       const numericScore = rawScore !== undefined && rawScore !== null ? Number(rawScore) : null;
       const entry = {
         timestamp: event.timestamp,
+        requestId: extractRequestId(parsedMessage, attrs),
         sessionId: sid,
         evaluatorName: attrs['gen_ai.evaluation.name'] || parsedMessage.evaluatorName || null,
         // Number(rawScore) coerces non-numeric garbage (e.g. "not-a-number") to
@@ -237,6 +297,10 @@ export function extractSessionData(parsed) {
         evidence: attrs['gen_ai.evaluation.explanation'] || parsedMessage.evidence || null,
         errorType: attrs['error.type'] || null,
         errorMessage: attrs['error.message'] || null,
+        // Raw OTEL error flag (attributes.error === 1) — some records carry it
+        // with no error.type; the score aggregation excludes those from the
+        // rolling average. undefined (not null) so it vanishes from JSON/DDB.
+        errorFlag: attrs['error'] === 1 ? 1 : undefined,
       };
       // status/statusReason let the improver (and the dashboard) tell an un-scored
       // run apart from a badly-scored one instead of averaging nulls into zeros.
@@ -252,12 +316,15 @@ export function extractSessionData(parsed) {
     }
   }
 
+  const evaluatorResults = dedupeResults(sessionBuffer);
+
   return {
     logGroup: parsed.logGroup,
     logStream: parsed.logStream,
     timestamp: new Date().toISOString(),
     sessionIds: [...sessionIds],
-    evaluatorResults: sessionBuffer,
+    evaluatorResults,
+    duplicatesDropped: sessionBuffer.length - evaluatorResults.length,
   };
 }
 
@@ -411,34 +478,31 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
  * data points. The score aggregation above is deliberately untouched: a run that
  * errored still must not contribute to evalScores.
  *
+ * TEAM-3367: consumes the already-DEDUPED evaluator-result entries from
+ * extractSessionData instead of independently re-parsing the raw logEvents —
+ * the second raw parse was where duplicate records re-entered and
+ * double-counted the rolling sum/count and the session tally.
+ *
  * @param {Array<object>} [entries] classified evaluator-result entries for this
- *   delivery (from extractSessionData). Optional — omitted or empty leaves the
- *   status tally alone.
+ *   delivery (from extractSessionData, deduped). Optional — omitted or empty
+ *   leaves the status tally alone.
  */
-async function aggregateScoresToDdb(agentId, parsed, entries = []) {
-  const logEvents = parsed.logEvents || [];
+async function aggregateScoresToDdb(agentId, entries = []) {
   const sessions = new Set();
   const scoreDeltas = {}; // { evaluatorName: { sum, count } }
 
-  for (const event of logEvents) {
-    try {
-      const record = JSON.parse(event.message);
-      const attrs = record.attributes || {};
-      const evaluator = attrs['gen_ai.evaluation.name'];
-      const score = attrs['gen_ai.evaluation.score.value'];
-      const sessionId = attrs['session.id'] || '';
-      const hasError = attrs['error'] === 1 || attrs['error.type'];
-
-      if (sessionId) sessions.add(sessionId);
-      const numericScore = score !== undefined && score !== null ? Number(score) : null;
-      // Number.isFinite gate: non-numeric garbage coerces to NaN, which would
-      // otherwise poison the rolling sum/count in the DDB scorecard.
-      if (evaluator && Number.isFinite(numericScore) && !hasError) {
-        if (!scoreDeltas[evaluator]) scoreDeltas[evaluator] = { sum: 0, count: 0 };
-        scoreDeltas[evaluator].sum += numericScore;
-        scoreDeltas[evaluator].count += 1;
-      }
-    } catch { /* skip */ }
+  for (const r of entries) {
+    if (r.parseError) continue;
+    if (r.sessionId) sessions.add(r.sessionId);
+    // Same eligibility as the old raw parse: an evaluator name, a finite score
+    // (extractSessionData already nulls NaN garbage that would poison the
+    // rolling sum), and no error signal (error.type or the raw error===1 flag).
+    const hasError = r.errorFlag === 1 || r.errorType;
+    if (r.evaluatorName && Number.isFinite(r.score) && !hasError) {
+      if (!scoreDeltas[r.evaluatorName]) scoreDeltas[r.evaluatorName] = { sum: 0, count: 0 };
+      scoreDeltas[r.evaluatorName].sum += r.score;
+      scoreDeltas[r.evaluatorName].count += 1;
+    }
   }
 
   if (Object.keys(scoreDeltas).length === 0 && sessions.size === 0) return;
@@ -747,12 +811,90 @@ function extractPrd(raw, agentId) {
   return { title, description };
 }
 
+// ─── Improver invoke retry policy (TEAM-3367) ───────────────────────────────
+// One transient throttle/5xx/socket-reset used to lose the whole synthesis (the
+// batch stayed archived but no PRD, no workflow). Bounded retry with full
+// jitter, deadline-aware under the Lambda's 600s timeout: each attempt can run
+// up to ATTEMPT_TIMEOUT, so a retry is only started while it can still finish
+// inside RETRY_DEADLINE.
+const IMPROVER_RETRY = {
+  maxAttempts: 3,
+  baseDelayMs: 2_000,
+  maxDelayMs: 60_000,
+  attemptTimeoutMs: 240_000,
+  deadlineMs: 520_000,
+};
+
+/**
+ * FULL-jitter backoff: random(0, min(cap, base * 2**attempt)), attempt 0-based
+ * per failed attempt (first retry ≤2s, second ≤4s, capped at 60s). `random`
+ * injectable so tests are deterministic.
+ */
+export function improverBackoffDelayMs(attempt, random = Math.random) {
+  return random() * Math.min(IMPROVER_RETRY.maxDelayMs, IMPROVER_RETRY.baseDelayMs * 2 ** attempt);
+}
+
+/**
+ * Retry ONLY transient failures: throttling (429/ThrottlingException), server
+ * errors (5xx) and connection-level socket failures. A 4xx validation error is
+ * deterministic — retrying it just burns the deadline.
+ */
+export function isRetryableImproverError(err) {
+  if (typeof err?.statusCode === 'number') {
+    return err.statusCode === 429 || err.statusCode >= 500;
+  }
+  if (['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN'].includes(err?.code)) {
+    return true;
+  }
+  return /ThrottlingException/i.test(String(err?.message || ''));
+}
+
+/**
+ * Invoke the improver with bounded, deadline-aware retries (TEAM-3367).
+ * `deps` exists for tests: { sleep, random, now } all default to the real thing.
+ */
+export async function invokeImprover(runtimeArn, prompt, agentId, deps = {}) {
+  const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const random = deps.random || Math.random;
+  const now = deps.now || Date.now;
+
+  const start = now();
+  let lastErr = null;
+  for (let attempt = 0; attempt < IMPROVER_RETRY.maxAttempts; attempt += 1) {
+    if (attempt > 0) {
+      const elapsed = now() - start;
+      if (elapsed + IMPROVER_RETRY.attemptTimeoutMs > IMPROVER_RETRY.deadlineMs) {
+        throw new Error(
+          `improver retry abandoned after ${attempt} attempt(s): ${Math.round(elapsed / 1000)}s elapsed, ` +
+            `another ${IMPROVER_RETRY.attemptTimeoutMs / 1000}s attempt would exceed the ` +
+            `${IMPROVER_RETRY.deadlineMs / 1000}s deadline. Last error: ${lastErr?.message}`
+        );
+      }
+      const delayMs = improverBackoffDelayMs(attempt - 1, random);
+      console.warn(
+        `[eval-packager] ${agentId}: improver attempt ${attempt}/${IMPROVER_RETRY.maxAttempts} failed ` +
+          `(${lastErr?.message}) — retrying in ${Math.round(delayMs)}ms`
+      );
+      await sleep(delayMs);
+    }
+    try {
+      return await invokeImproverOnce(runtimeArn, prompt, agentId);
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryableImproverError(err)) throw err;
+    }
+  }
+  throw lastErr;
+}
+
 /**
  * Invoke an AgentCore Runtime via SigV4-signed HTTPS and return the assembled
  * text. The runtime streams SSE "data: {event:{contentBlockDelta:{delta:{text}}}}"
  * frames; we concatenate every delta.text. Mirrors the orchestrator's invoker.
+ * Signed per attempt (see invokeImprover): a SigV4 signature is only valid for
+ * ~5 minutes, which a backed-off retry can outlive.
  */
-async function invokeImprover(runtimeArn, prompt, agentId) {
+async function invokeImproverOnce(runtimeArn, prompt, agentId) {
   const https = await import('https');
   const { SignatureV4 } = await import('@smithy/signature-v4');
   const { Sha256 } = await import('@aws-crypto/sha256-js');
@@ -793,8 +935,12 @@ async function invokeImprover(runtimeArn, prompt, agentId) {
   });
 
   return new Promise((resolve, reject) => {
-    // Improver runs ~60-90s; allow 240s (under the Lambda's 300s ceiling).
-    const timer = setTimeout(() => reject(new Error('improver invoke timed out after 240s')), 240_000);
+    // Improver runs ~60-90s; allow attemptTimeoutMs (240s) per attempt — the
+    // retry loop's deadline math assumes this bound.
+    const timer = setTimeout(
+      () => reject(new Error(`improver invoke timed out after ${IMPROVER_RETRY.attemptTimeoutMs / 1000}s`)),
+      IMPROVER_RETRY.attemptTimeoutMs
+    );
 
     const req = https.default.request(
       {
@@ -802,7 +948,7 @@ async function invokeImprover(runtimeArn, prompt, agentId) {
         path: `${urlPath}?accountId=${accountId}`,
         method: 'POST',
         headers: { ...signed.headers },
-        timeout: 240_000,
+        timeout: IMPROVER_RETRY.attemptTimeoutMs,
       },
       (res) => {
         let buffer = '';
@@ -833,7 +979,9 @@ async function invokeImprover(runtimeArn, prompt, agentId) {
           clearTimeout(timer);
           if (buffer) consume(buffer);
           if (res.statusCode >= 400) {
-            reject(new Error(`improver returned ${res.statusCode}: ${text.slice(0, 300)}`));
+            const err = new Error(`improver returned ${res.statusCode}: ${text.slice(0, 300)}`);
+            err.statusCode = res.statusCode; // lets isRetryableImproverError tell 429/5xx from 4xx
+            reject(err);
           } else {
             resolve(text);
           }

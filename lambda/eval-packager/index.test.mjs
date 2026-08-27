@@ -99,8 +99,9 @@ const MISSING_SPAN_MESSAGE =
  * payload lives entirely in `attributes` under gen_ai.* keys. Reading
  * top-level .score/.evidence instead is what produced all-null batches.
  */
-function evalRecord({ sessionId, evaluatorName = 'builtin.correctness', score, scoreLabel, errorType, errorMessage }) {
+function evalRecord({ sessionId, evaluatorName = 'builtin.correctness', score, scoreLabel, errorType, errorMessage, requestId }) {
   const attributes = { 'session.id': sessionId, 'gen_ai.evaluation.name': evaluatorName };
+  if (requestId) attributes['aws.request_id'] = requestId;
   if (score !== undefined && score !== null) attributes['gen_ai.evaluation.score.value'] = score;
   if (scoreLabel) attributes['gen_ai.evaluation.score.label'] = scoreLabel;
   if (score !== undefined && score !== null) {
@@ -535,6 +536,69 @@ describe('handler (IMPROVEMENT_AGENT_ARN configured)', () => {
       expect(s3Send.mock.calls.every((c) => c[0].constructor.name === 'GetObjectCommand')).toBe(true);
     });
   });
+
+  // ─── Delivery dedup through the shipped pipeline (TEAM-3367) ──────────────
+  // CW Logs subscription delivery is at-least-once and the evaluator retries,
+  // so one evaluation attempt can appear in a delivery N times. Pre-fix, the
+  // aggregation re-parsed the raw logEvents and double-counted every dup into
+  // the rolling scorecard; classification and the buffered batch saw them too.
+  describe('duplicate records: aggregation + classification (TEAM-3367)', () => {
+    const scoresUpdate = () =>
+      sentCommands(ddbSend, 'UpdateCommand').find((c) => c.input.UpdateExpression.includes('evalScores'));
+
+    it('aggregation totals are unchanged when every record arrives duplicated 8×', async () => {
+      // batchSize 10 → no flush; this test is about the aggregation write only.
+      ddbState.config = { ...ddbState.config, batchSize: 10 };
+      const records = () => [
+        evalRecord({ sessionId: 'sess-1', score: 8, scoreLabel: 'pass', requestId: 'req-corr-1' }),
+        evalRecord({ sessionId: 'sess-2', evaluatorName: 'builtin.helpfulness', score: 6, scoreLabel: 'pass', requestId: 'req-help-1' }),
+      ];
+
+      await handler(awslogsEvent(records()));
+      const clean = scoresUpdate();
+      const cleanScores = clean.input.ExpressionAttributeValues[':scores'];
+      const cleanSessions = clean.input.ExpressionAttributeValues[':sc'];
+      expect(cleanScores).toEqual({
+        'builtin.correctness': { sum: 8, count: 1 },
+        'builtin.helpfulness': { sum: 6, count: 1 },
+      });
+      expect(cleanSessions).toBe(2);
+
+      // Same delivery, but each record repeated 9× (8 injected duplicates).
+      // awslogsEvent gives every copy a distinct timestamp, so only the shared
+      // request id can collapse them.
+      ddbSend.mockClear();
+      await handler(awslogsEvent(records().flatMap((r) => Array(9).fill(r))));
+      const dup = scoresUpdate();
+      expect(dup.input.ExpressionAttributeValues[':scores']).toEqual(cleanScores);
+      expect(dup.input.ExpressionAttributeValues[':sc']).toBe(cleanSessions);
+    });
+
+    it('classifySessions sees deduped input: a throttled session with 8 duplicates is ONE error session', async () => {
+      ddbState.config = { ...ddbState.config, batchSize: 10 };
+      const throttled = evalRecord({
+        sessionId: 'sess-throttled',
+        score: null,
+        errorType: 'ThrottlingException',
+        errorMessage: 'Rate exceeded',
+        requestId: 'req-throttle-1',
+      });
+
+      await handler(awslogsEvent(Array(9).fill(throttled)));
+
+      // The buffered batch carries ONE row, not nine.
+      const append = sentCommands(ddbSend, 'UpdateCommand').find((c) => c.input.ReturnValues === 'ALL_NEW');
+      const sessionData = append.input.ExpressionAttributeValues[':new'][0];
+      expect(sessionData.evaluatorResults).toHaveLength(1);
+      expect(sessionData.duplicatesDropped).toBe(8);
+      expect(sessionData.sessionStatus).toEqual({ 'sess-throttled': 'error' });
+
+      // And the fleet tally counts one session — an error one, not span_missing.
+      const [metrics] = emfLines('EvalSessionsTotal');
+      expect(metrics.EvalSessionsTotal).toBe(1);
+      expect(metrics.EvalSessionsSpanMissing).toBe(0);
+    });
+  });
 });
 
 // ─── Without the improver configured ────────────────────────────────────────
@@ -736,5 +800,250 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
     const [record] = emfLines('EvalSessionsTotal');
     expect(record.EvalSessionsTotal).toBe(7);
     expect(record.EvalSessionsSpanMissing).toBe(3);
+  });
+});
+
+// ─── extractSessionData dedup (TEAM-3367) ────────────────────────────────────
+// Request-id extraction chain, ranked: (a) OTEL envelope traceId+spanId,
+// (b) attributes['aws.request_id'], (c) attributes['gen_ai.response.id'];
+// content-key fallback when a record carries none of them.
+
+describe('extractSessionData dedup (TEAM-3367)', () => {
+  let extractSessionData;
+  let dedupeResults;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ extractSessionData, dedupeResults } = await import('./index.mjs'));
+  });
+
+  const delivery = (logEvents) => ({
+    logGroup: '/aws/bedrock-agentcore/evaluations/results/eval_backend_dev-test',
+    logStream: 'test-stream',
+    logEvents,
+  });
+
+  /** OTEL eval log record with full control over envelope ids and timestamps. */
+  const otelEvent = ({
+    sessionId = 'sess-1',
+    evaluatorName = 'Builtin.Correctness',
+    score,
+    timestamp = 1_756_250_000_000,
+    envelope = {},
+    attrs = {},
+  }) => ({
+    timestamp,
+    message: JSON.stringify({
+      ...envelope,
+      attributes: {
+        'session.id': sessionId,
+        'gen_ai.evaluation.name': evaluatorName,
+        ...(score !== undefined && score !== null ? { 'gen_ai.evaluation.score.value': score } : {}),
+        ...attrs,
+      },
+    }),
+  });
+
+  it('collapses 9 records sharing a request id (aws.request_id) to one', () => {
+    // Distinct timestamps on every copy: only the shared id can collapse them.
+    const events = Array.from({ length: 9 }, (_, i) =>
+      otelEvent({ score: 8, timestamp: 1_756_250_000_000 + i, attrs: { 'aws.request_id': 'req-abc' } })
+    );
+    const sessionData = extractSessionData(delivery(events));
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.duplicatesDropped).toBe(8);
+    expect(sessionData.evaluatorResults[0]).toMatchObject({ requestId: 'req-abc', score: 8 });
+  });
+
+  it('envelope traceId+spanId identify duplicates and outrank aws.request_id', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        // Same evaluated span, two delivery copies — the differing aws.request_id
+        // must not keep them apart, because the envelope ids rank first.
+        otelEvent({ score: 7, timestamp: 1, envelope: { traceId: 'trace-1', spanId: 'span-1' }, attrs: { 'aws.request_id': 'req-1' } }),
+        otelEvent({ score: 7, timestamp: 2, envelope: { traceId: 'trace-1', spanId: 'span-1' }, attrs: { 'aws.request_id': 'req-2' } }),
+        // Same span ids but a DIFFERENT evaluator: a distinct result, kept.
+        otelEvent({ evaluatorName: 'Builtin.Helpfulness', score: 5, timestamp: 3, envelope: { traceId: 'trace-1', spanId: 'span-1' } }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(2);
+    expect(sessionData.duplicatesDropped).toBe(1);
+    expect(sessionData.evaluatorResults[0].requestId).toBe('trace-1:span-1');
+  });
+
+  it('falls back to gen_ai.response.id when the envelope carries no ids', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ score: 9, timestamp: 1, attrs: { 'gen_ai.response.id': 'resp-1' } }),
+        otelEvent({ score: 9, timestamp: 2, attrs: { 'gen_ai.response.id': 'resp-1' } }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.duplicatesDropped).toBe(1);
+  });
+
+  it('preserves distinct records: same session, different evaluators/scores/request ids', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ score: 8, timestamp: 1, attrs: { 'aws.request_id': 'req-1' } }),
+        otelEvent({ evaluatorName: 'Builtin.Helpfulness', score: 6, timestamp: 2, attrs: { 'aws.request_id': 'req-2' } }),
+        otelEvent({ evaluatorName: 'Builtin.Faithfulness', score: 4, timestamp: 3, attrs: { 'aws.request_id': 'req-3' } }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(3);
+    expect(sessionData.duplicatesDropped).toBe(0);
+  });
+
+  it('content-key fallback: identical no-id rows collapse; rows differing only in timestamp do not', () => {
+    // Two byte-identical retry writes (no request id anywhere) → one row.
+    const identical = extractSessionData(
+      delivery([otelEvent({ score: 8, timestamp: 42 }), otelEvent({ score: 8, timestamp: 42 })])
+    );
+    expect(identical.evaluatorResults).toHaveLength(1);
+    expect(identical.duplicatesDropped).toBe(1);
+
+    // Same score, DIFFERENT timestamps → genuinely distinct evaluations, kept.
+    const distinct = extractSessionData(
+      delivery([otelEvent({ score: 8, timestamp: 42 }), otelEvent({ score: 8, timestamp: 43 })])
+    );
+    expect(distinct.evaluatorResults).toHaveLength(2);
+    expect(distinct.duplicatesDropped).toBe(0);
+  });
+
+  it('dedupeResults is exported and keeps first occurrence', () => {
+    const rows = [
+      { requestId: 'r1', evaluatorName: 'e', score: 1, timestamp: 1 },
+      { requestId: 'r1', evaluatorName: 'e', score: 2, timestamp: 2 },
+    ];
+    expect(dedupeResults(rows)).toEqual([rows[0]]);
+  });
+});
+
+// ─── invokeImprover retry (TEAM-3367) ────────────────────────────────────────
+// Exponential backoff with FULL jitter (base 2s, cap 60s, 3 attempts), retrying
+// only transient failures, deadline-aware under the Lambda's 600s timeout.
+
+describe('invokeImprover retry (TEAM-3367)', () => {
+  let invokeImprover;
+  let improverBackoffDelayMs;
+  let isRetryableImproverError;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ invokeImprover, improverBackoffDelayMs, isRetryableImproverError } = await import('./index.mjs'));
+  });
+
+  const ARN = 'arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/improver-Test01';
+
+  /** An attempt answered with `statusCode` and an optional SSE body. */
+  const respondWith = (statusCode, body = '') => (options, callback) => {
+    const res = new EventEmitter();
+    res.statusCode = statusCode;
+    const req = {
+      on() { return req; },
+      write() {},
+      end() {
+        process.nextTick(() => {
+          if (body) res.emit('data', Buffer.from(body));
+          res.emit('end');
+        });
+      },
+    };
+    callback(res);
+    return req;
+  };
+
+  /** An attempt that dies at the socket with `code` before any response. */
+  const failSocket = (code) => (options) => {
+    const handlers = {};
+    const req = {
+      on(evt, fn) { handlers[evt] = fn; return req; },
+      write() {},
+      end() {
+        process.nextTick(() => {
+          const err = new Error(`socket hang up`);
+          err.code = code;
+          handlers.error?.(err);
+        });
+      },
+    };
+    return req;
+  };
+
+  const sseBody = `data: ${JSON.stringify({ event: { contentBlockDelta: { delta: { text: 'hello' } } } })}\n\n`;
+
+  it('retries a 5xx with full-jitter backoff, then gives up after 3 attempts', async () => {
+    httpsRequest.mockImplementation(respondWith(500));
+    const sleeps = [];
+    const deps = { sleep: async (ms) => sleeps.push(ms), random: () => 0.5 };
+
+    await expect(invokeImprover(ARN, 'p', 'agent-x', deps)).rejects.toThrow(/improver returned 500/);
+
+    expect(httpsRequest).toHaveBeenCalledTimes(3);
+    // random()=0.5 → half of min(60s, 2s·2^attempt): 1s before retry 1, 2s before retry 2.
+    expect(sleeps).toEqual([1000, 2000]);
+  });
+
+  it('retries a 429 throttle', async () => {
+    httpsRequest.mockImplementation(respondWith(429));
+    await expect(invokeImprover(ARN, 'p', 'agent-x', { sleep: async () => {}, random: () => 0 }))
+      .rejects.toThrow(/improver returned 429/);
+    expect(httpsRequest).toHaveBeenCalledTimes(3);
+  });
+
+  it('retries a connection reset and succeeds on the second attempt', async () => {
+    httpsRequest
+      .mockImplementationOnce(failSocket('ECONNRESET'))
+      .mockImplementationOnce(respondWith(200, sseBody));
+    const sleeps = [];
+
+    const text = await invokeImprover(ARN, 'p', 'agent-x', { sleep: async (ms) => sleeps.push(ms), random: () => 0.5 });
+
+    expect(text).toBe('hello');
+    expect(httpsRequest).toHaveBeenCalledTimes(2);
+    expect(sleeps).toEqual([1000]);
+  });
+
+  it('does NOT retry a 4xx validation error', async () => {
+    httpsRequest.mockImplementation(respondWith(400));
+    const sleep = vi.fn();
+
+    await expect(invokeImprover(ARN, 'p', 'agent-x', { sleep })).rejects.toThrow(/improver returned 400/);
+
+    expect(httpsRequest).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('abandons a retry that could not finish inside the 520s deadline', async () => {
+    httpsRequest.mockImplementation(respondWith(500));
+    // start=0; by the first retry check 300s have elapsed → 300+240 > 520.
+    const now = vi.fn().mockReturnValueOnce(0).mockReturnValue(300_000);
+    const sleep = vi.fn();
+
+    await expect(invokeImprover(ARN, 'p', 'agent-x', { now, sleep })).rejects.toThrow(/deadline/);
+
+    expect(httpsRequest).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('backoff calculator: full jitter over min(cap, base·2^attempt)', () => {
+    expect(improverBackoffDelayMs(0, () => 1)).toBe(2000);
+    expect(improverBackoffDelayMs(1, () => 1)).toBe(4000);
+    expect(improverBackoffDelayMs(10, () => 1)).toBe(60_000); // capped
+    expect(improverBackoffDelayMs(0, () => 0)).toBe(0); // jitter floor is zero
+  });
+
+  it('classifies retryability: throttle/5xx/socket-reset yes, 4xx no', () => {
+    expect(isRetryableImproverError(Object.assign(new Error('x'), { statusCode: 429 }))).toBe(true);
+    expect(isRetryableImproverError(Object.assign(new Error('x'), { statusCode: 503 }))).toBe(true);
+    expect(isRetryableImproverError(Object.assign(new Error('x'), { code: 'ECONNRESET' }))).toBe(true);
+    expect(isRetryableImproverError(new Error('ThrottlingException: rate exceeded'))).toBe(true);
+    expect(isRetryableImproverError(Object.assign(new Error('x'), { statusCode: 400 }))).toBe(false);
+    expect(isRetryableImproverError(Object.assign(new Error('x'), { statusCode: 403 }))).toBe(false);
+    expect(isRetryableImproverError(new Error('improver returned empty output'))).toBe(false);
   });
 });
