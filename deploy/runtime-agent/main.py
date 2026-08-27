@@ -681,7 +681,15 @@ def _recover_lost_submit(client, payload: dict, outer_deadline: float | None = N
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[remote-coding] recovery probe failed "
                            f"({attempt + 1}/5): {str(e)[:200]}")
-            time.sleep(REMOTE_CODING_POLL_S)
+            # Backoff capped to the time left: a probe that failed just past
+            # the deadline must not tack a full poll interval onto the
+            # overshoot before the loop's own expiry check runs.
+            if _expired():
+                return {"submitted": True, "turn_id": payload["turn_id"]}
+            sleep_s = REMOTE_CODING_POLL_S
+            if outer_deadline is not None:
+                sleep_s = min(sleep_s, max(0.0, outer_deadline - time.monotonic()))
+            time.sleep(sleep_s)
     if probe is None:
         # Every probe hit a transient failure — still zero evidence about the
         # runner. The poll loop tolerates transient errors until its budget, so

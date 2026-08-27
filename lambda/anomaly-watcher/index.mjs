@@ -959,7 +959,13 @@ async function ingestWorkflow(ctx, wf, { drain }) {
     const cursorAt = wholeBatch
       ? { lastEventId: lastRaw.eventId, lastTimestamp: lastRaw.timestamp ?? last.timestamp ?? ctx.nowIso }
       : { lastEventId: last.eventId, lastTimestamp: last.timestamp ?? ctx.nowIso };
-    txnItems = buildIngestTxnItems(ctx, { workflowId, phase: wf.phase, cursor, folded, cursorAt });
+    // A partial read (page cap, txn-limit slice) must NOT persist the terminal
+    // phase: the drain gate skips terminal-phased cursors, so stamping it on a
+    // prefix would strand the remainder forever. A non-terminal phase keeps the
+    // workflow drain-eligible; the phase is stamped once a whole read lands.
+    const partial = truncated || !wholeBatch;
+    const cursorPhase = partial && TERMINAL_PHASES.has(wf.phase) ? cursor?.phase ?? null : wf.phase;
+    txnItems = buildIngestTxnItems(ctx, { workflowId, phase: cursorPhase, cursor, folded, cursorAt });
     if (txnItems.length <= TXN_ITEM_LIMIT || slice.length <= 1) break;
     slice = slice.slice(0, Math.floor(slice.length / 2));
   }
