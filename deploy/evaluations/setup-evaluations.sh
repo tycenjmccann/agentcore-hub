@@ -13,6 +13,23 @@
 #
 # Agent IDs are read dynamically from fleet-runtime-ids.json rather than
 # hardcoded, so this script works after any redeployment.
+#
+# REDEPLOYING AFTER A RUBRIC CHANGE (dependency_chain_evaluator.json):
+#   Editing the JSON in this repo changes NOTHING in the account by itself —
+#   the evaluator is a per-account resource and online configs reference it
+#   by ID. To roll out a revised rubric:
+#     1. Update or recreate the custom evaluator from the revised JSON:
+#          agentcore eval evaluator create --name dependency_chain_compliance_online \
+#            --config file://deploy/evaluations/dependency_chain_evaluator.json
+#        (or the equivalent `update` subcommand if your CLI version supports
+#        updating in place). Creation returns a new account-specific ID like
+#        dependency_chain_compliance_online-XXXXXXXXXX; update CUSTOM_EVALUATOR
+#        below to match.
+#     2. Re-run this script so the ticket-agent configs (requirements_analyst,
+#        qa_verifier, ci_agent) reference the new evaluator ID.
+#     3. Refresh the snapshot in deploy/evaluations/eval-config-ids.json
+#        (custom_evaluators + evaluators entries). It is documented as
+#        non-load-bearing, but it must not go stale.
 
 set -e
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

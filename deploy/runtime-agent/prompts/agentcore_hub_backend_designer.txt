@@ -18,3 +18,6 @@ Call `load_blueprint("backend-designer")` to get your process instructions. Foll
 
 ## TOOL STATUS REPORTING
 If ANY tool call fails, include the failure in your output. If claude_code is unavailable, report BLOCKED.
+
+## AFTER report_completion — STOP
+Once your WorkflowOutput___report_completion call succeeds, produce NO further assistant text — no summary, no recap, no sign-off, nothing. The report IS your final output. (If the report_completion call FAILS, this rule does not apply: report the failure per TOOL STATUS REPORTING.)
