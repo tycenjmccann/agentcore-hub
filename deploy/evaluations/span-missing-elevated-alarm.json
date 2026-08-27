@@ -10,12 +10,26 @@
   "Metrics": [
     {
       "Id": "missing",
-      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsSpanMissing\"', 'Sum', 21600))",
+      "MetricStat": {
+        "Metric": {
+          "Namespace": "AgentCoreHub/Evaluations",
+          "MetricName": "EvalSessionsSpanMissing"
+        },
+        "Period": 21600,
+        "Stat": "Sum"
+      },
       "ReturnData": false
     },
     {
       "Id": "total",
-      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 21600))",
+      "MetricStat": {
+        "Metric": {
+          "Namespace": "AgentCoreHub/Evaluations",
+          "MetricName": "EvalSessionsTotal"
+        },
+        "Period": 21600,
+        "Stat": "Sum"
+      },
       "ReturnData": false
     },
     {

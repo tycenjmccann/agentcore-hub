@@ -528,24 +528,38 @@ export function classifySessions(sessionData) {
  * while the telemetry alarm needs session counts. Zeros are emitted
  * explicitly — a healthy delivery still writes a datapoint, keeping the
  * alarms' missing-data handling out of the picture.
+ *
+ * Two CloudWatchMetrics directives extract each value twice: once per-agent
+ * (AgentName dimension — dashboards) and once with an EMPTY dimension set, a
+ * dimensionless fleet-level rollup. The rollup exists because CloudWatch
+ * alarms reject SEARCH expressions, so the fleet alarms in deploy/evaluations
+ * can't aggregate the per-agent series — they alarm on the dimensionless one.
  */
 export function emitEvalMetrics(
   agentName,
   { total, spanMissing, resultsTotal = 0, resultsThrottled = 0 }
 ) {
+  const metrics = [
+    { Name: 'EvalSessionsTotal', Unit: 'Count' },
+    { Name: 'EvalSessionsSpanMissing', Unit: 'Count' },
+    { Name: 'EvalResultsTotal', Unit: 'Count' },
+    { Name: 'EvalResultsThrottled', Unit: 'Count' },
+  ];
   console.log(JSON.stringify({
     _aws: {
       Timestamp: Date.now(),
-      CloudWatchMetrics: [{
-        Namespace: 'AgentCoreHub/Evaluations',
-        Dimensions: [['AgentName']],
-        Metrics: [
-          { Name: 'EvalSessionsTotal', Unit: 'Count' },
-          { Name: 'EvalSessionsSpanMissing', Unit: 'Count' },
-          { Name: 'EvalResultsTotal', Unit: 'Count' },
-          { Name: 'EvalResultsThrottled', Unit: 'Count' },
-        ],
-      }],
+      CloudWatchMetrics: [
+        {
+          Namespace: 'AgentCoreHub/Evaluations',
+          Dimensions: [['AgentName']],
+          Metrics: metrics,
+        },
+        {
+          Namespace: 'AgentCoreHub/Evaluations',
+          Dimensions: [[]],
+          Metrics: metrics,
+        },
+      ],
     },
     AgentName: agentName,
     EvalSessionsTotal: total,

@@ -86,11 +86,15 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 #   packager rollback.
 # -----------------------------------------------------------------------------
 
-# --- Fleet eval health alarms (TEAM-3103 / TEAM-3359) ----------------------
-# Three alarm definitions in this directory watch the EMF metrics that
-# lambda/eval-packager/index.mjs emits into the AgentCoreHub/Evaluations
-# namespace (EvalSessionsTotal / EvalSessionsSpanMissing / EvalResultsTotal /
-# EvalResultsThrottled):
+# --- Fleet eval health alarms (TEAM-3103 / TEAM-3359 / TEAM-3382) ----------
+# Three alarm definitions in this directory watch the DIMENSIONLESS fleet-level
+# EMF metrics that lambda/eval-packager/index.mjs emits into the
+# AgentCoreHub/Evaluations namespace (EvalSessionsTotal /
+# EvalSessionsSpanMissing / EvalResultsTotal / EvalResultsThrottled). The
+# packager's EMF record carries a second CloudWatchMetrics directive with an
+# empty dimension set: CloudWatch alarms reject SEARCH expressions, so the
+# alarms can't aggregate the per-agent (AgentName) series — they alarm on the
+# dimensionless rollup instead, while dashboards keep the per-agent series.
 #
 #   span-missing-alarm.json          — pager: >50% of eval sessions have no
 #                                      invoke_agent span (hourly, 3 of 4).
@@ -113,11 +117,15 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 #     --cli-input-json file://deploy/evaluations/<alarm-file>.json
 #   e.g. file://deploy/evaluations/throttle-rate-alarm.json
 #
-# Rollout constraint: create these alarms ONLY AFTER the runtime telemetry fix
-# (R1/R2 — Strands/ADOT tracer wiring) is deployed AND at least one healthy
-# eval batch with non-zero EvalSessionsTotal AND EvalResultsTotal has been
-# observed in CloudWatch. Creating them earlier means every session is
-# span_missing by definition and the alarms fire immediately on stale data.
+# Rollout constraint: create these alarms ONLY AFTER (a) the runtime telemetry
+# fix (R1/R2 — Strands/ADOT tracer wiring) is deployed, (b) the updated
+# eval-packager Lambda (TEAM-3382, dimensionless fleet-level EMF directive) is
+# deployed — the fleet-level series the alarms watch only exists once the new
+# EMF record ships, so alarms created earlier sit in INSUFFICIENT_DATA — and
+# (c) at least one healthy eval batch with non-zero EvalSessionsTotal AND
+# EvalResultsTotal has been observed in CloudWatch. Creating them before the
+# telemetry fix means every session is span_missing by definition and the
+# alarms fire immediately on stale data.
 # Add AlarmActions (the environment's SNS topic ARN) to each JSON at apply
 # time — it's intentionally omitted since it's environment-specific.
 # -----------------------------------------------------------------------------

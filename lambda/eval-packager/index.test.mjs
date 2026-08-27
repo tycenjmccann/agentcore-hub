@@ -722,18 +722,24 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
     expect(records).toHaveLength(1);
     const record = records[0];
     const emf = record._aws.CloudWatchMetrics;
-    expect(emf).toHaveLength(1);
-    expect(emf[0].Namespace).toBe('AgentCoreHub/Evaluations');
-    expect(emf[0].Dimensions).toEqual([['AgentName']]);
-    expect(emf[0].Metrics.map((m) => m.Name).sort()).toEqual([
+    // Two directives on the same record: per-agent (dashboards) plus a
+    // dimensionless fleet-level rollup (alarms — SEARCH is rejected there).
+    expect(emf).toHaveLength(2);
+    const allMetricNames = [
       'EvalResultsThrottled',
       'EvalResultsTotal',
       'EvalSessionsSpanMissing',
       'EvalSessionsTotal',
-    ]);
-    expect(emf[0].Metrics.every((m) => m.Unit === 'Count')).toBe(true);
+    ];
+    for (const directive of emf) {
+      expect(directive.Namespace).toBe('AgentCoreHub/Evaluations');
+      expect(directive.Metrics.map((m) => m.Name).sort()).toEqual(allMetricNames);
+      expect(directive.Metrics.every((m) => m.Unit === 'Count')).toBe(true);
+    }
+    expect(emf.map((d) => d.Dimensions)).toEqual([[['AgentName']], [[]]]);
     expect(typeof record._aws.Timestamp).toBe('number');
     expect(record.AgentName).toBe('agentcore_hub_backend_dev');
+    // Metric values live as top-level keys, shared by both directives.
     expect(record.EvalSessionsTotal).toBe(4);
     expect(record.EvalResultsTotal).toBe(12);
     // Explicit 0 must be emitted (healthy fleet still writes a datapoint).
