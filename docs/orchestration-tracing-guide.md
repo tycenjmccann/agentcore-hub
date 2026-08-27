@@ -259,6 +259,55 @@ treating 200 as sufficient.
 
 ---
 
+## Eval health monitoring (dashboard + success-rate alarm)
+
+TEAM-3368 §4: `lambda/eval-packager/index.mjs` emits one EMF record per log
+delivery into the `AgentCoreHub/Evaluations` namespace (dimension
+`AgentName`), with five health metrics:
+
+| Metric | Meaning |
+|---|---|
+| `EvalSessionsTotal` | Distinct eval sessions seen in the delivery |
+| `EvalSessionsSpanMissing` | Sessions with all-null scores and no `error.type` — the `invoke_agent` span never reached the evaluator (telemetry failure, not agent quality) |
+| `EvalSessionsError` | Sessions whose results carry an `error.type` (judge/eval failure) |
+| `EvalThrottleCount` | Result records whose `error.type` ends in `ThrottlingException` — judge quota pressure (see the quota section above) |
+| `EvalDuplicateResultCount` | Duplicate result rows dropped by the TEAM-3367 dedup (at-least-once delivery / evaluator retries) |
+
+(A sixth, `EvalDepChainExcludedCount`, counts dependency-chain evaluator rows
+dropped for out-of-scope roles — TEAM-3368 §3.2 config-drift guard.)
+
+Healthy batches emit explicit `0` datapoints for all of them; nothing is
+emitted when a delivery contains no sessions.
+
+Apply the dashboard (safe any time — widgets stay empty until metrics flow;
+the JSON hardcodes `us-east-1`, substitute the target region at apply time):
+
+```bash
+aws cloudwatch put-dashboard --dashboard-name agentcore-hub-eval-health \
+  --dashboard-body file://deploy/evaluations/eval-health-dashboard.json
+```
+
+Apply the success-rate alarm — fires when fleet
+`(total - span_missing - errors) / total` < 0.8 on 3 of 4 hourly datapoints:
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --cli-input-json file://deploy/evaluations/eval-success-rate-alarm.json
+```
+
+**Rollout order:** apply the alarm ONLY AFTER the P0-A runtime telemetry fix
+and the P0-B eval-packager fix are deployed AND at least one healthy batch
+with non-zero `EvalSessionsTotal` carrying the three new metrics has been
+observed — earlier, the rate evaluates on stale/partial data and fires
+immediately. Add `AlarmActions` (the environment's SNS topic ARN) to the JSON
+at apply time; it is intentionally omitted from the repo copy.
+
+**INSUFFICIENT_DATA during quiet hours is expected** — both eval alarms use
+`TreatMissingData: missing`, and no eval sessions means no datapoints. Do not
+page on INSUFFICIENT_DATA.
+
+---
+
 ## Tracing Script
 
 Use `scripts/trace-workflow.sh` to pull all logs for a workflow run in one shot.

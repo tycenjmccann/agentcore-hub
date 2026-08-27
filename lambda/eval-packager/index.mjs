@@ -132,9 +132,16 @@ export const handler = async (event) => {
   // be measured on ALL deliveries, not just the sampled subset that gets buffered.
   const sessionData = extractSessionData(parsed);
 
-  const { statuses, total, spanMissing } = classifySessions(sessionData);
+  const { statuses, total, spanMissing, errors } = classifySessions(sessionData);
   if (total > 0) {
-    emitEvalMetrics(agentId, { total, spanMissing });
+    emitEvalMetrics(agentId, {
+      total,
+      spanMissing,
+      errors,
+      throttles: countThrottles(sessionData.evaluatorResults),
+      duplicates: sessionData.duplicatesDropped,
+      depChainExcluded: sessionData.depChainExcluded,
+    });
     sessionData.sessionStatus = Object.fromEntries(statuses);
     if (spanMissing > 0) sessionData.status = 'span_missing';
     console.log(`[eval-packager] ${agentId}: sessions=${total} span_missing=${spanMissing}`);
@@ -295,8 +302,7 @@ export function isOutOfScopeDepChain(row) {
  * see isOutOfScopeDepChain above) so classifySessions, the score aggregation,
  * and the buffered batch all see one row per in-scope evaluation attempt;
  * `duplicatesDropped` counts dedup removals and `depChainExcluded` counts
- * scope removals (both exposed for a follow-up monitoring ticket — no metric
- * emitted here).
+ * scope removals (both feed the handler's emitEvalMetrics EMF record).
  */
 export function extractSessionData(parsed) {
   const logEvents = parsed.logEvents || [];
@@ -438,15 +444,40 @@ export function classifySessions(sessionData) {
     statuses,
     total: bySession.size,
     spanMissing: [...statuses.values()].filter((s) => s === 'span_missing').length,
+    errors: [...statuses.values()].filter((s) => s === 'error').length,
   };
 }
 
 /**
- * Emit fleet span_missing health metrics as a single EMF log record.
+ * TEAM-3368 §4.1: judge-quota throttling signature. OTel semconv error.type
+ * carries the exception class name, so the exact form is 'ThrottlingException'
+ * — but live verification of what the evaluations service writes was
+ * IAM-blocked, so match on the suffix to also tolerate a namespaced form
+ * (e.g. 'com.amazonaws#ThrottlingException') rather than miss throttles on a
+ * prefix we guessed wrong.
+ */
+export const THROTTLE_RE = /ThrottlingException$/;
+
+export function countThrottles(entries) {
+  return (entries || []).filter((r) => THROTTLE_RE.test(r?.errorType ?? '')).length;
+}
+
+/**
+ * Emit fleet eval health metrics as a single EMF log record.
  * CloudWatch Logs auto-extracts these into the AgentCoreHub/Evaluations
  * namespace — no CloudWatch SDK call, no new dependency.
+ *
+ * TEAM-3368 §4.1 extends the TEAM-3103 record (Total/SpanMissing) with
+ * EvalSessionsError, EvalThrottleCount, EvalDuplicateResultCount, plus
+ * EvalDepChainExcludedCount (the Part A scope filter's removals). Still ONE
+ * record: the eval-health dashboard and the success-rate alarm SEARCH this
+ * namespace, and healthy batches must write explicit 0 datapoints (a metric
+ * that goes silent is indistinguishable from a broken emitter).
  */
-export function emitEvalMetrics(agentName, { total, spanMissing }) {
+export function emitEvalMetrics(
+  agentName,
+  { total, spanMissing, errors = 0, throttles = 0, duplicates = 0, depChainExcluded = 0 }
+) {
   console.log(JSON.stringify({
     _aws: {
       Timestamp: Date.now(),
@@ -456,12 +487,20 @@ export function emitEvalMetrics(agentName, { total, spanMissing }) {
         Metrics: [
           { Name: 'EvalSessionsTotal', Unit: 'Count' },
           { Name: 'EvalSessionsSpanMissing', Unit: 'Count' },
+          { Name: 'EvalSessionsError', Unit: 'Count' },
+          { Name: 'EvalThrottleCount', Unit: 'Count' },
+          { Name: 'EvalDuplicateResultCount', Unit: 'Count' },
+          { Name: 'EvalDepChainExcludedCount', Unit: 'Count' },
         ],
       }],
     },
     AgentName: agentName,
     EvalSessionsTotal: total,
     EvalSessionsSpanMissing: spanMissing,
+    EvalSessionsError: errors,
+    EvalThrottleCount: throttles,
+    EvalDuplicateResultCount: duplicates,
+    EvalDepChainExcludedCount: depChainExcluded,
   }));
 }
 

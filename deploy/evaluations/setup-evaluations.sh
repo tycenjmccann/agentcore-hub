@@ -85,6 +85,33 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 # omitted here since it's environment-specific.
 # -----------------------------------------------------------------------------
 
+# --- Eval health dashboard + success-rate alarm (TEAM-3368 §4.2/§4.3) -------
+# deploy/evaluations/eval-health-dashboard.json visualizes the extended EMF
+# record emitted by lambda/eval-packager (EvalSessionsTotal / SpanMissing /
+# Error, EvalThrottleCount, EvalDuplicateResultCount) and
+# deploy/evaluations/eval-success-rate-alarm.json fires when the fleet's
+# (total - span_missing - errors) / total success rate drops below 0.8.
+#
+# Dashboard — safe to apply ANY time (widgets simply stay empty until the new
+# metrics flow; region is hardcoded us-east-1 in the JSON — substitute the
+# target region at apply time):
+#
+#   aws cloudwatch put-dashboard --dashboard-name agentcore-hub-eval-health \
+#     --dashboard-body file://deploy/evaluations/eval-health-dashboard.json
+#
+# Success-rate alarm — same rollout constraint as the span_missing alarm
+# above, plus the packager side: apply ONLY AFTER the P0-A runtime telemetry
+# fix AND the P0-B eval-packager fix are deployed, AND at least one healthy
+# batch with non-zero EvalSessionsTotal carrying the three new metrics
+# (EvalSessionsError, EvalThrottleCount, EvalDuplicateResultCount) has been
+# observed in CloudWatch. Applying earlier evaluates the rate on stale/partial
+# data and fires immediately. Add AlarmActions (the environment's SNS topic
+# ARN) to the JSON at apply time — intentionally omitted, environment-specific:
+#
+#   aws cloudwatch put-metric-alarm \
+#     --cli-input-json file://deploy/evaluations/eval-success-rate-alarm.json
+# -----------------------------------------------------------------------------
+
 # Agents scoped to the custom dependency-chain evaluator (TEAM-3368,
 # TEAM-3366 design §3.1): requirements_analyst only. It is the only role whose
 # core deliverable is CREATING the ticket dependency graph; qa_verifier and
