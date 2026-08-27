@@ -151,6 +151,19 @@ await iam.send(new PutRolePolicyCommand({
           `arn:aws:s3:::${ARTIFACT_BUCKET}/*`,
         ],
       },
+      {
+        // crash-rca skill: pull_session_logs.py reads runtime log groups +
+        // span destinations to diagnose dead agent sessions. Read-only.
+        Sid: "SessionLogsRead",
+        Effect: "Allow",
+        Action: [
+          "logs:DescribeLogGroups",
+          "logs:StartQuery",
+          "logs:GetQueryResults",
+          "logs:StopQuery",
+        ],
+        Resource: "*",
+      },
     ],
   }),
 }));
@@ -163,6 +176,7 @@ const {
   CreateHarnessCommand,
   GetHarnessCommand,
   ListHarnessesCommand,
+  UpdateHarnessCommand,
   CreateMemoryCommand,
   GetMemoryCommand,
   ListMemoriesCommand,
@@ -210,12 +224,20 @@ const memoryArn = `arn:aws:bedrock-agentcore:${REGION}:${accountId}:memory/${mem
 console.log("\n3/4 Harness");
 const SYSTEM_PROMPT = readFileSync(join(__dirname, "system-prompt.md"), "utf8");
 
+// Skills: on-demand playbooks (SKILL.md bundles) the WM pulls into context
+// when a situation matches — behavior lives in skill files, not prompt bloat.
+// Synced to S3 by deploy.sh; the harness resolves them from there.
+const SKILLS = [
+  { s3: { uri: `s3://${ARTIFACT_BUCKET}/workflow-manager/skills/crash-rca/` } },
+];
+
 const harnessConfig = {
   harnessName: HARNESS_NAME,
   executionRoleArn: ROLE_ARN,
   model: { bedrockModelConfig: { modelId: MODEL_ID } },
   systemPrompt: [{ text: SYSTEM_PROMPT }],
   tools: [{ type: "agentcore_code_interpreter", name: "code_interpreter" }],
+  skills: SKILLS,
   allowedTools: ["*"],
   truncation: { strategy: "sliding_window", config: { slidingWindow: { messagesCount: 150 } } },
   maxIterations: 75,
@@ -242,8 +264,27 @@ let harnessArn;
 if (existing && existing.status === "READY") {
   harnessId = existing.harnessId;
   harnessArn = existing.arn;
-  console.log(`   ✓ Harness exists: ${harnessId} (READY)`);
-  console.log("   ℹ To pick up a changed system prompt/env, delete and re-run, or use UpdateHarness.");
+  console.log(`   ✓ Harness exists: ${harnessId} (READY) — updating in place`);
+  // Update prompt + skills in place. env/memory/tools are left as-is (env is a
+  // replace-all on Update and the live harness may carry values this script
+  // doesn't know; memory needs the optionalValue wrapper — neither is worth
+  // touching for a prompt/skills rollout).
+  await agentcore.send(new UpdateHarnessCommand({
+    harnessId,
+    systemPrompt: [{ text: SYSTEM_PROMPT }],
+    skills: SKILLS,
+  }));
+  for (let i = 0; i < 24; i++) {
+    await sleep(5000);
+    const status = await agentcore.send(new GetHarnessCommand({ harnessId }));
+    const s = status.harness?.status;
+    if (s === "READY") break;
+    if (s === "UPDATE_FAILED") {
+      throw new Error(`Update failed: ${status.harness?.failureReason || "unknown"}`);
+    }
+    if (i === 23) throw new Error("Timed out waiting for harness READY after update");
+  }
+  console.log("   ✓ Harness updated (system prompt + skills) — READY");
 } else if (existing) {
   throw new Error(`Harness ${HARNESS_NAME} exists in status ${existing.status} — resolve manually (delete or wait), then re-run.`);
 } else {
