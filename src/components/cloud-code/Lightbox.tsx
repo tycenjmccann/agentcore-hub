@@ -118,6 +118,24 @@ export default function Lightbox({
     };
   }, [onClose]);
 
+  // Re-clamp when the viewport changes (resize, orientation rotate): the
+  // permitted offsets shrink with the viewport, and an image panned to the old
+  // limit would otherwise show blank space past its edge until the next
+  // pan/zoom runs clampOffset.
+  useEffect(() => {
+    const reclamp = () => {
+      const c = clampOffset(tx, ty, scale);
+      if (c.x !== tx) setTx(c.x);
+      if (c.y !== ty) setTy(c.y);
+    };
+    window.addEventListener("resize", reclamp);
+    window.addEventListener("orientationchange", reclamp);
+    return () => {
+      window.removeEventListener("resize", reclamp);
+      window.removeEventListener("orientationchange", reclamp);
+    };
+  }, [tx, ty, scale, clampOffset]);
+
   const dist = (t: React.TouchList) =>
     Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
 

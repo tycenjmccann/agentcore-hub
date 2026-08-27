@@ -48,7 +48,11 @@ export const handler = async (event) => {
       type: event["detail-type"] || "unknown",
       source: event.source,
       detail,
-      timestamp: event.time || new Date().toISOString(),
+      // Prefer the publisher's own timestamp (publishEvent stamps it into
+      // detail and uses the SAME value on its direct DDB write): the
+      // anomaly-watcher dedupes the two copies by timestamp, and EventBridge's
+      // event.time is a different, second-granularity value.
+      timestamp: detail.timestamp || event.time || new Date().toISOString(),
     },
   }));
 };

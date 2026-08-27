@@ -718,13 +718,15 @@ test("a second sequential cycle for the same window files nothing", async () => 
   assert.equal(startPosts(first).length, 1);
   assert.equal(a.summary.actions.tier3Filed.length, 1);
 
-  // Same scheduled time ⇒ same cycle key: the ratelimit#t3 cycle claim is strict.
+  // Same scheduled time ⇒ same cycle key. The metric claim is checked BEFORE
+  // the cycle claim (a suppressed group must not consume the fleet-wide cycle
+  // claim), so the duplicate is attributed to the metric claim.
   const second = makeHarness({ rows, store });
   const b = await runWatcher({ harness: second, bands, requestId: "req-b" });
   assert.equal(startPosts(second).length, 0, "no second filing");
   assert.deepEqual(b.summary.actions.tier3Filed, []);
   assert.deepEqual(b.summary.actions.dedupeSuppressed, [
-    { metricId, groupKey: "fleet", tier: 3, reason: "ratelimit_cycle_claim_held" },
+    { metricId, groupKey: "fleet", tier: 3, reason: "claim_held" },
   ]);
   assert.deepEqual(b.summary.actions.failures, []);
 

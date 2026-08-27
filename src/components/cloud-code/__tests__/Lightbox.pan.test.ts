@@ -114,7 +114,19 @@ import Lightbox from "../Lightbox";
 
 const keydownHandlers: Array<(e: { key: string }) => void> = [];
 const bodyStyle: Record<string, string> = {};
-(globalThis as any).window = { innerWidth: 1000, innerHeight: 700 };
+const windowHandlers: Record<string, Array<() => void>> = {};
+(globalThis as any).window = {
+  innerWidth: 1000,
+  innerHeight: 700,
+  addEventListener: (type: string, fn: () => void) => {
+    (windowHandlers[type] ||= []).push(fn);
+  },
+  removeEventListener: (type: string, fn: () => void) => {
+    const arr = windowHandlers[type] || [];
+    const i = arr.indexOf(fn);
+    if (i !== -1) arr.splice(i, 1);
+  },
+};
 (globalThis as any).document = {
   addEventListener: (type: string, fn: (e: { key: string }) => void) => {
     if (type === "keydown") keydownHandlers.push(fn);

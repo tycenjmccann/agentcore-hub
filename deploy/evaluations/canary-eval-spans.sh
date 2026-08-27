@@ -157,10 +157,11 @@ fi
 echo "  ✓ invoke_agent span found for session.id=$SESSION_ID"
 
 # ── 2. ADVISORY: online-eval score for the session ────────────────────────────
-# Eval configs are named eval_<agent-short>-<suffix>; results are OTEL log
-# records whose score lives at attributes["gen_ai.evaluation.score.value"].
-AGENT_SHORT="${AGENT_ID#agentcore_hub_}"
-EVAL_PREFIX="/aws/bedrock-agentcore/evaluations/results/eval_${AGENT_SHORT}"
+# Eval configs are named eval_<FULL agent id>-<suffix> (setup-evaluations.sh
+# does config_name="eval_${name}" with the canonical id, prefix included);
+# results are OTEL log records whose score lives at
+# attributes["gen_ai.evaluation.score.value"].
+EVAL_PREFIX="/aws/bedrock-agentcore/evaluations/results/eval_${AGENT_ID}"
 echo ""
 echo "  [2/2] ADVISORY: eval score for the session under ${EVAL_PREFIX}*"
 

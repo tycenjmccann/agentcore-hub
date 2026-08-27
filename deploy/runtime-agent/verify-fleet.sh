@@ -48,10 +48,14 @@ fi
 # Blocking telemetry gate: after the health-check invocation, a fresh
 # invoke_agent span must appear in the runtime's `spans` log stream. Export via
 # the platform pipeline takes ~1 min, so poll 3 times, 60s apart.
+# The filter requires THIS health check's session id, not just any
+# invoke_agent since start_ms — concurrent production traffic on the runtime
+# would otherwise satisfy the probe and let a span-less deploy pass the gate.
 probe_invoke_agent_span() {
   local agent_name="$1"
   local runtime_id="$2"
   local start_ms="$3"
+  local session_id="$4"
   local log_group="/aws/bedrock-agentcore/runtimes/${runtime_id}-DEFAULT"
   local attempt found
 
@@ -60,7 +64,7 @@ probe_invoke_agent_span() {
     found=$(aws logs filter-log-events \
       --log-group-name "$log_group" \
       --log-stream-name-prefix "spans" \
-      --filter-pattern '"invoke_agent"' \
+      --filter-pattern "\"invoke_agent\" \"${session_id}\"" \
       --start-time "$start_ms" \
       --max-items 1 \
       --query 'events[0].eventId' \
@@ -72,7 +76,7 @@ probe_invoke_agent_span() {
   done
 
   echo "  ✗ $agent_name — TELEMETRY GATE FAILED"
-  echo "    No invoke_agent span since epoch-ms $start_ms in log group:"
+  echo "    No invoke_agent span for session $session_id since epoch-ms $start_ms in log group:"
   echo "      $log_group (stream prefix 'spans')"
   echo "    The agent answered the health check but exported no span, so eval"
   echo "    batches would score this persona 0/10. Broken telemetry can no longer"
@@ -103,6 +107,10 @@ while IFS= read -r agent_name; do
   # Captured BEFORE the invocation so the span probe only matches spans this
   # health check produced, never leftovers from an earlier deploy.
   DEPLOY_EPOCH_MS=$(python3 -c "import time; print(int(time.time() * 1000))")
+  # Session id generated OUT here (not inside the Node snippet) so the span
+  # probe can require it in the log filter — timestamp alone can't correlate
+  # the span to this health check when production traffic is concurrent.
+  HC_SESSION_ID="health-check-${DEPLOY_EPOCH_MS}-$(python3 -c "import uuid; print(uuid.uuid4().hex[:8])")"
 
   # Use the SDK to invoke with a simple prompt (runtime agents use payload, not messages)
   RESULT=$(node -e "
@@ -112,7 +120,7 @@ while IFS= read -r agent_name; do
       const payload = JSON.stringify({ prompt: 'Respond with OK if you can hear me.' });
       const res = await client.send(new InvokeAgentRuntimeCommand({
         agentRuntimeArn: '$ARN',
-        runtimeSessionId: 'health-check-' + Date.now() + '-' + Math.random().toString(36).slice(2,10),
+        runtimeSessionId: '$HC_SESSION_ID',
         payload: new TextEncoder().encode(payload),
         contentType: 'application/json',
         accept: 'application/json',
@@ -129,7 +137,7 @@ while IFS= read -r agent_name; do
     if [ "${SKIP_SPAN_PROBE:-}" = "true" ]; then
       echo "  ✓ $agent_name (⚠️ span probe SKIPPED — not telemetry-verified)"
       PASS=$((PASS + 1))
-    elif probe_invoke_agent_span "$agent_name" "${ARN##*/}" "$DEPLOY_EPOCH_MS"; then
+    elif probe_invoke_agent_span "$agent_name" "${ARN##*/}" "$DEPLOY_EPOCH_MS" "$HC_SESSION_ID"; then
       echo "  ✓ $agent_name — invoke_agent span verified"
       PASS=$((PASS + 1))
     else

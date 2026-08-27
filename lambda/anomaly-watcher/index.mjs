@@ -913,12 +913,19 @@ async function ingestWorkflow(ctx, wf, { drain }) {
   const cursor = await getState(ctx, cursorPk(workflowId), "cursor");
   // A workflow that went terminal gets exactly one final drain: after this write
   // the cursor records the terminal phase, and it is skipped until it TTLs out.
-  if (drain && (!cursor || TERMINAL_PHASES.has(cursor.phase))) return;
+  // A MISSING cursor must NOT skip: a workflow that started and went terminal
+  // between two watcher runs arrives here drain-first, and returning early
+  // would orphan all of its events until it ages out of DRAIN_LOOKBACK_MS —
+  // its first drain is also its final one.
+  if (drain && cursor && TERMINAL_PHASES.has(cursor.phase)) return;
 
   const { items: raw, truncated } = await readEvents(ctx, workflowId, cursor);
   const usable = dropStaleItems(raw, cursor);
   if (!usable.length) {
-    if (drain && cursor) {
+    // Stamp the terminal phase even when no cursor row exists yet (UpdateCommand
+    // creates it): a cursor-less terminal workflow with nothing to read would
+    // otherwise re-enter this drain every cycle until DRAIN_LOOKBACK_MS.
+    if (drain) {
       await ctx.clients.ddb.send(
         new ctx.cmd.UpdateCommand({
           TableName: ctx.env.stateTable,
@@ -952,7 +959,13 @@ async function ingestWorkflow(ctx, wf, { drain }) {
     const cursorAt = wholeBatch
       ? { lastEventId: lastRaw.eventId, lastTimestamp: lastRaw.timestamp ?? last.timestamp ?? ctx.nowIso }
       : { lastEventId: last.eventId, lastTimestamp: last.timestamp ?? ctx.nowIso };
-    txnItems = buildIngestTxnItems(ctx, { workflowId, phase: wf.phase, cursor, folded, cursorAt });
+    // A partial read (page cap, txn-limit slice) must NOT persist the terminal
+    // phase: the drain gate skips terminal-phased cursors, so stamping it on a
+    // prefix would strand the remainder forever. A non-terminal phase keeps the
+    // workflow drain-eligible; the phase is stamped once a whole read lands.
+    const partial = truncated || !wholeBatch;
+    const cursorPhase = partial && TERMINAL_PHASES.has(wf.phase) ? cursor?.phase ?? null : wf.phase;
+    txnItems = buildIngestTxnItems(ctx, { workflowId, phase: cursorPhase, cursor, folded, cursorAt });
     if (txnItems.length <= TXN_ITEM_LIMIT || slice.length <= 1) break;
     slice = slice.slice(0, Math.floor(slice.length / 2));
   }
@@ -961,6 +974,11 @@ async function ingestWorkflow(ctx, wf, { drain }) {
       `${LOG_PREFIX} ${workflowId}: batch split to ${slice.length}/${usable.length} events to fit one transaction`
     );
     ctx.summary.ingest.truncated.push({ workflowId, reason: "transaction_item_limit", events: slice.length });
+    // Partial ingest = incomplete eval window. Same fail-closed rule as an
+    // ingest error: evaluating a prefix of a workflow's events can fabricate a
+    // rate/duration anomaly. The cursor still advances for what WAS folded, so
+    // the remainder rides to the next cycle and evaluation resumes then.
+    ctx.ingestErrors.events = true;
   }
 
   try {
@@ -981,6 +999,8 @@ async function ingestWorkflow(ctx, wf, { drain }) {
   ctx.summary.ingest.eventsDeduped += folded.stats.eventsDeduped;
   if (truncated) {
     ctx.summary.ingest.truncated.push({ workflowId, reason: "page_cap", events: folded.stats.eventsRead });
+    // Same fail-closed rule: a capped read means this cycle saw only a prefix.
+    ctx.ingestErrors.events = true;
   }
   for (const evicted of folded.evictedOpenPairs || []) {
     console.warn(
@@ -1711,19 +1731,10 @@ async function tier3(ctx, metric, verdict, extras) {
     return;
   }
 
-  const cycleClaim = await cycleFilingClaim(ctx);
-  if (!cycleClaim.ok) {
-    if (cycleClaim.duplicate) suppressed("ratelimit_cycle_claim_held");
-    else
-      ctx.summary.actions.failures.push({
-        metricId: metric.id,
-        groupKey: verdict.groupKey,
-        stage: "ratelimitClaim",
-        error: cycleClaim.error,
-      });
-    return;
-  }
-
+  // Metric claim FIRST: a group still under its suppression claim must bail
+  // here, BEFORE the fleet-wide cycle claim is consumed — otherwise one
+  // persistent suppressed group that sorts first burns the cycle claim every
+  // cycle and no other anomaly can ever file.
   const got = await acquireClaim(ctx, { ...claim, ttlMs, attrs: claimAttrs });
   if (!got.ok) {
     if (got.duplicate) suppressed("claim_held");
@@ -1733,6 +1744,23 @@ async function tier3(ctx, metric, verdict, extras) {
         groupKey: verdict.groupKey,
         stage: "tier3Claim",
         error: got.error,
+      });
+    return;
+  }
+
+  const cycleClaim = await cycleFilingClaim(ctx);
+  if (!cycleClaim.ok) {
+    // Nothing has left the account — release the metric claim so this group's
+    // suppression TTL isn't burned on a filing that never happened; it can
+    // retry on a later cycle.
+    await releaseClaim(ctx, claim);
+    if (cycleClaim.duplicate) suppressed("ratelimit_cycle_claim_held");
+    else
+      ctx.summary.actions.failures.push({
+        metricId: metric.id,
+        groupKey: verdict.groupKey,
+        stage: "ratelimitClaim",
+        error: cycleClaim.error,
       });
     return;
   }
