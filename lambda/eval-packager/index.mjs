@@ -45,6 +45,10 @@ const s3 = new S3Client({});
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 const TABLE = process.env.EVAL_CONFIG_TABLE || 'agentcore-hub-eval-config';
+// Cross-delivery dedup seen-set (TEAM-3376). Set EVAL_SEEN_TABLE='' to disable
+// the persistent check entirely (in-memory per-delivery dedup still applies).
+const SEEN_TABLE = process.env.EVAL_SEEN_TABLE ?? 'agentcore-hub-eval-seen';
+const SEEN_TTL_SECONDS = 24 * 60 * 60;
 const BUCKET = process.env.ARTIFACTS_BUCKET || process.env.ARTIFACT_BUCKET;
 if (!BUCKET) {
   throw new Error(
@@ -131,13 +135,40 @@ export const handler = async (event) => {
   // Done BEFORE the sample-rate gate below: telemetry health (span_missing) must
   // be measured on ALL deliveries, not just the sampled subset that gets buffered.
   const sessionData = extractSessionData(parsed);
+  if (sessionData.duplicatesDropped > 0) {
+    console.log(
+      `[eval-packager] ${agentId}: dropped ${sessionData.duplicatesDropped} duplicate record(s) in-delivery`
+    );
+  }
 
-  const { statuses, total, spanMissing } = classifySessions(sessionData);
-  if (total > 0) {
-    emitEvalMetrics(agentId, { total, spanMissing });
+  // Cross-delivery/concurrent dedup + role guard run BEFORE classification,
+  // aggregation and buffering — everything downstream sees the filtered view.
+  await dedupeAgainstSeenSet(sessionData, agentId);
+  const guarded = applyRoleGuard(sessionData.evaluatorResults);
+  sessionData.evaluatorResults = guarded.records;
+  if (guarded.excluded > 0) {
+    console.log(
+      `[eval-packager] ${agentId}: excluded ${guarded.excluded} out-of-scope dependency-chain record(s)`
+    );
+  }
+
+  const { statuses, total, spanMissing, throttled, validationErrors, genericErrors } =
+    classifySessions(sessionData);
+  if (total > 0 || (sessionData.duplicatesDropped || 0) > 0) {
+    emitEvalMetrics(agentId, {
+      total,
+      spanMissing,
+      throttled,
+      validationErrors,
+      genericErrors,
+      duplicatesDropped: sessionData.duplicatesDropped || 0,
+    });
     sessionData.sessionStatus = Object.fromEntries(statuses);
     if (spanMissing > 0) sessionData.status = 'span_missing';
-    console.log(`[eval-packager] ${agentId}: sessions=${total} span_missing=${spanMissing}`);
+    console.log(
+      `[eval-packager] ${agentId}: sessions=${total} span_missing=${spanMissing} ` +
+        `throttled=${throttled} validation=${validationErrors} duplicates=${sessionData.duplicatesDropped || 0}`
+    );
   }
 
   // Preflight alert: any session whose invoke_agent span never arrived is a
@@ -154,7 +185,7 @@ export const handler = async (event) => {
   }
 
   // 5. Aggregate eval scores into DDB (for instant dashboard loads)
-  await aggregateScoresToDdb(agentId, parsed, sessionData.evaluatorResults);
+  await aggregateScoresToDdb(agentId, sessionData.evaluatorResults);
 
   // 6. Append to sessionBuffer, counting distinct runs toward batchSize
   const batchSize = config.batchSize || 10;
@@ -200,6 +231,62 @@ async function getAgentConfig(agentId) {
 }
 
 /**
+ * Compute the per-record dedup key (TEAM-3376). The Bedrock evaluator retries a
+ * throttled judge call 8-10 times and each retry lands as its own log record —
+ * without a stable identity every retry becomes a separate row, inflating error
+ * counts and DDB aggregates. The live attribute carrying the request identity
+ * was unverifiable, so this is a ranked chain of candidates:
+ *   1. OTEL envelope traceId+spanId (both required — one alone is ambiguous)
+ *   2. attributes['aws.request_id']
+ *   3. attributes['gen_ai.response.id']
+ *   4. content key sessionId|evaluatorName|evaluationName|score|timestamp —
+ *      collapses byte-identical re-deliveries only (timestamp keeps genuine
+ *      retries, which arrive at distinct timestamps, apart)
+ * All missing → null → the record FAILS OPEN through dedup (retained).
+ */
+export function dedupKeyFor(parsedMessage, attrs, entry) {
+  if (parsedMessage.traceId && parsedMessage.spanId) {
+    return `${parsedMessage.traceId}:${parsedMessage.spanId}`;
+  }
+  if (attrs['aws.request_id']) return String(attrs['aws.request_id']);
+  if (attrs['gen_ai.response.id']) return String(attrs['gen_ai.response.id']);
+  if (entry.sessionId && entry.evaluatorName && entry.timestamp != null) {
+    return (
+      `${entry.sessionId}|${entry.evaluatorName}|${entry.evaluationName ?? ''}|` +
+      `${entry.score}|${entry.timestamp}`
+    );
+  }
+  return null;
+}
+
+/**
+ * In-memory dedup: first occurrence per dedupKey wins; rows with a null key
+ * fail OPEN (retained and counted) — losing real data is worse than
+ * double-counting. Runs inside extractSessionData, so classifySessions,
+ * aggregateScoresToDdb and appendToBuffer all see the deduped view.
+ */
+export function dedupeResults(records) {
+  const seen = new Set();
+  const kept = [];
+  let duplicatesDropped = 0;
+  let missingKeyCount = 0;
+  for (const record of records || []) {
+    if (!record.dedupKey) {
+      missingKeyCount += 1;
+      kept.push(record);
+      continue;
+    }
+    if (seen.has(record.dedupKey)) {
+      duplicatesDropped += 1;
+      continue;
+    }
+    seen.add(record.dedupKey);
+    kept.push(record);
+  }
+  return { records: kept, duplicatesDropped, missingKeyCount };
+}
+
+/**
  * Extract session data from parsed CW Logs event.
  * Parses each logEvent.message as JSON to extract evaluator scores,
  * evaluator name, and evidence. Stores parsed results (not raw event metadata)
@@ -237,7 +324,12 @@ export function extractSessionData(parsed) {
         evidence: attrs['gen_ai.evaluation.explanation'] || parsedMessage.evidence || null,
         errorType: attrs['error.type'] || null,
         errorMessage: attrs['error.message'] || null,
+        // attrs['error'] === 1 marks an errored record even without error.type;
+        // aggregateScoresToDdb honors it when excluding scores from the rolling
+        // average (parity with the raw-logEvents parse it used to do itself).
+        errorFlag: attrs['error'] === 1 ? true : null,
       };
+      entry.dedupKey = dedupKeyFor(parsedMessage, attrs, entry);
       // status/statusReason let the improver (and the dashboard) tell an un-scored
       // run apart from a badly-scored one instead of averaging nulls into zeros.
       sessionBuffer.push({ ...entry, ...classifyEntry(entry) });
@@ -247,18 +339,140 @@ export function extractSessionData(parsed) {
         timestamp: event.timestamp,
         rawMessage: event.message,
         parseError: true,
+        dedupKey: null, // unreadable → no identity → fails open through dedup
       };
       sessionBuffer.push({ ...entry, ...classifyEntry(entry) });
     }
   }
+
+  const deduped = dedupeResults(sessionBuffer);
 
   return {
     logGroup: parsed.logGroup,
     logStream: parsed.logStream,
     timestamp: new Date().toISOString(),
     sessionIds: [...sessionIds],
-    evaluatorResults: sessionBuffer,
+    evaluatorResults: deduped.records,
+    duplicatesDropped: deduped.duplicatesDropped,
+    dedupMissingKeyCount: deduped.missingKeyCount,
   };
+}
+
+// Injectable DynamoDB client for the seen-set (tests swap in a fake without
+// touching the buffer/config client above). Defaults to the module's doc client.
+let seenSetClient = null;
+export function setSeenSetClient(client) {
+  seenSetClient = client;
+}
+
+/**
+ * Cross-delivery + concurrent-invocation dedup (TEAM-3376). CW Logs can
+ * re-deliver the same log events in a second subscription batch, and two
+ * concurrent Lambda invocations can each see a copy — the in-memory pass in
+ * extractSessionData can't catch either. Persistent seen-set: one conditional
+ * PutItem per keyed record; ConditionalCheckFailedException means another
+ * delivery already claimed this dedupKey → drop the row before classification,
+ * aggregation and buffering. TTL'd at 24h so the table self-cleans.
+ *
+ * FAIL-OPEN throughout, matching aggregateScoresToDdb's non-fatal posture:
+ * table unset/missing, SDK unavailable, or any non-conditional DDB error →
+ * the record is treated as fresh (double-count beats data loss).
+ *
+ * Mutates sessionData in place: filters evaluatorResults and adds the drops to
+ * duplicatesDropped so the EMF duplicate count covers both dedup layers.
+ */
+export async function dedupeAgainstSeenSet(sessionData, agentId = '') {
+  const records = sessionData?.evaluatorResults || [];
+  const keyed = records.filter((r) => r.dedupKey);
+  if (!SEEN_TABLE || keyed.length === 0) return sessionData;
+
+  let PutCommand;
+  try {
+    ({ PutCommand } = await import('@aws-sdk/lib-dynamodb'));
+  } catch {
+    PutCommand = undefined;
+  }
+  if (!PutCommand) return sessionData; // SDK unavailable → skip gracefully
+
+  const client = seenSetClient || ddb;
+  const expiresAt = Math.floor(Date.now() / 1000) + SEEN_TTL_SECONDS;
+  const duplicateKeys = new Set();
+  let failedOpen = 0;
+
+  for (const record of keyed) {
+    try {
+      await client.send(
+        new PutCommand({
+          TableName: SEEN_TABLE,
+          Item: { dedupKey: record.dedupKey, expiresAt },
+          ConditionExpression: 'attribute_not_exists(dedupKey)',
+        })
+      );
+    } catch (err) {
+      if (err?.name === 'ConditionalCheckFailedException') {
+        duplicateKeys.add(record.dedupKey);
+      } else {
+        failedOpen += 1; // any other error → fresh
+      }
+    }
+  }
+
+  if (failedOpen > 0) {
+    console.warn(
+      `[eval-packager] ${agentId}: seen-set check failed open for ${failedOpen} record(s) ` +
+        `(table=${SEEN_TABLE}) — retained; duplicates may double-count.`
+    );
+  }
+  if (duplicateKeys.size > 0) {
+    const before = records.length;
+    sessionData.evaluatorResults = records.filter((r) => !duplicateKeys.has(r.dedupKey));
+    sessionData.duplicatesDropped =
+      (sessionData.duplicatesDropped || 0) + (before - sessionData.evaluatorResults.length);
+    console.log(
+      `[eval-packager] ${agentId}: dropped ${before - sessionData.evaluatorResults.length} ` +
+        'cross-delivery duplicate record(s) via seen-set.'
+    );
+  }
+  return sessionData;
+}
+
+// ─── Role guard (TEAM-3376, design §3.2) ────────────────────────────────────
+// dependency_chain_compliance_online* is scoped to the requirements analyst;
+// eval-config drift has pointed it at other roles before, flooding their
+// scorecards with irrelevant failures. Belt-and-suspenders: drop those rows
+// here regardless of what the eval config says. Fail-open on session ids the
+// role regex can't parse (si-…, cc-…) — never discard data on a guess.
+
+export const ROLE_RE = /-(agentcore_hub_[a-z0-9_]+)-\d{13}$/;
+export const DEP_CHAIN_ROLES = new Set(['agentcore_hub_requirements_analyst']);
+export const DEP_CHAIN_RE = /^dependency_chain_compliance/;
+
+/** Extract the persona role from a runtime session id; null when unparseable. */
+export function roleFromSessionId(sid) {
+  const m = typeof sid === 'string' ? sid.match(ROLE_RE) : null;
+  return m ? m[1] : null;
+}
+
+/** True only for a dep-chain row whose session id parses to an out-of-scope role. */
+export function isOutOfScopeDepChain(row) {
+  if (!DEP_CHAIN_RE.test(row.evaluatorName || '')) return false;
+  const role = roleFromSessionId(row.sessionId);
+  if (role === null) return false; // FAIL-OPEN: unparseable (si-…, cc-…) → keep
+  return !DEP_CHAIN_ROLES.has(role);
+}
+
+/**
+ * Drop out-of-scope dep-chain rows. Other evaluators' records are never
+ * affected, whatever the role parse says. Returns { records, excluded }.
+ */
+export function applyRoleGuard(records) {
+  const kept = [];
+  let excluded = 0;
+  for (const row of records || []) {
+    if (isOutOfScopeDepChain(row)) excluded += 1;
+    else kept.push(row);
+  }
+  return { records: kept, excluded };
 }
 
 /**
@@ -305,9 +519,21 @@ function emitMissingSpanAlerts(agentId, entries) {
   }
 }
 
+// error.type may arrive bare ("ThrottlingException") or namespaced
+// ("com.amazonaws...#ThrottlingException") — match on the suffix.
+const THROTTLE_ERROR_RE = /ThrottlingException$/;
+const VALIDATION_ERROR_RE = /ValidationException$/;
+
 /**
  * Classify each distinct session in this delivery.
- * Returns { statuses: Map<sessionId, 'scored'|'span_missing'|'error'>, total, spanMissing }
+ * Returns { statuses: Map<sessionId, 'scored'|'span_missing'|'error'>, total,
+ * spanMissing, throttled, validationErrors, genericErrors }.
+ *
+ * The three error counts partition the 'error' sessions by error.type —
+ * throttle first (a throttled judge often also reports a validation-shaped
+ * message downstream), then validation, then everything else. The statuses map
+ * itself keeps the coarse 'error' value: nothing downstream (buffer,
+ * dashboard) may flip based on the subtype, only the EMF rates read it.
  */
 export function classifySessions(sessionData) {
   const bySession = new Map();
@@ -317,24 +543,44 @@ export function classifySessions(sessionData) {
     bySession.get(r.sessionId).push(r);
   }
   const statuses = new Map();
+  let throttled = 0;
+  let validationErrors = 0;
+  let genericErrors = 0;
   for (const [sid, rows] of bySession) {
     const allNull = rows.every((r) => r.score === null);
     const hasError = rows.some((r) => r.errorType);
     statuses.set(sid, !allNull ? 'scored' : hasError ? 'error' : 'span_missing');
+    if (statuses.get(sid) === 'error') {
+      if (rows.some((r) => THROTTLE_ERROR_RE.test(r.errorType || ''))) throttled += 1;
+      else if (rows.some((r) => VALIDATION_ERROR_RE.test(r.errorType || ''))) validationErrors += 1;
+      else genericErrors += 1;
+    }
   }
   return {
     statuses,
     total: bySession.size,
     spanMissing: [...statuses.values()].filter((s) => s === 'span_missing').length,
+    throttled,
+    validationErrors,
+    genericErrors,
   };
 }
 
 /**
- * Emit fleet span_missing health metrics as a single EMF log record.
+ * Emit fleet eval health metrics as a single EMF log record.
  * CloudWatch Logs auto-extracts these into the AgentCoreHub/Evaluations
  * namespace — no CloudWatch SDK call, no new dependency.
+ *
+ * TEAM-3376 adds throttle/validation session rates (0–1 for the batch window,
+ * 0 when the delivery carried no sessions) and the duplicate-records-dropped
+ * count, alongside the raw error-session count, so the eval-health dashboard
+ * can tell "the judge is throttled" apart from "the runtime broke telemetry".
  */
-export function emitEvalMetrics(agentName, { total, spanMissing }) {
+export function emitEvalMetrics(
+  agentName,
+  { total, spanMissing, throttled = 0, validationErrors = 0, genericErrors = 0, duplicatesDropped = 0 }
+) {
+  const errorSessions = throttled + validationErrors + genericErrors;
   console.log(JSON.stringify({
     _aws: {
       Timestamp: Date.now(),
@@ -344,12 +590,20 @@ export function emitEvalMetrics(agentName, { total, spanMissing }) {
         Metrics: [
           { Name: 'EvalSessionsTotal', Unit: 'Count' },
           { Name: 'EvalSessionsSpanMissing', Unit: 'Count' },
+          { Name: 'EvalSessionsError', Unit: 'Count' },
+          { Name: 'EvalThrottleRate', Unit: 'None' },
+          { Name: 'EvalValidationExceptionRate', Unit: 'None' },
+          { Name: 'EvalDuplicateResultCount', Unit: 'Count' },
         ],
       }],
     },
     AgentName: agentName,
     EvalSessionsTotal: total,
     EvalSessionsSpanMissing: spanMissing,
+    EvalSessionsError: errorSessions,
+    EvalThrottleRate: total > 0 ? throttled / total : 0,
+    EvalValidationExceptionRate: total > 0 ? validationErrors / total : 0,
+    EvalDuplicateResultCount: duplicatesDropped,
   }));
 }
 
@@ -411,34 +665,31 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
  * data points. The score aggregation above is deliberately untouched: a run that
  * errored still must not contribute to evalScores.
  *
+ * TEAM-3376: consumes the extracted (deduped, role-guarded) evaluatorResults
+ * instead of independently re-parsing the raw logEvents — that second parse
+ * bypassed dedup, so every throttle-retry duplicate re-entered the rolling
+ * scorecard here even after extractSessionData had dropped it.
+ *
  * @param {Array<object>} [entries] classified evaluator-result entries for this
  *   delivery (from extractSessionData). Optional — omitted or empty leaves the
  *   status tally alone.
  */
-async function aggregateScoresToDdb(agentId, parsed, entries = []) {
-  const logEvents = parsed.logEvents || [];
+async function aggregateScoresToDdb(agentId, entries = []) {
   const sessions = new Set();
   const scoreDeltas = {}; // { evaluatorName: { sum, count } }
 
-  for (const event of logEvents) {
-    try {
-      const record = JSON.parse(event.message);
-      const attrs = record.attributes || {};
-      const evaluator = attrs['gen_ai.evaluation.name'];
-      const score = attrs['gen_ai.evaluation.score.value'];
-      const sessionId = attrs['session.id'] || '';
-      const hasError = attrs['error'] === 1 || attrs['error.type'];
+  for (const entry of entries || []) {
+    if (entry.parseError) continue;
+    const hasError = entry.errorFlag === true || Boolean(entry.errorType);
 
-      if (sessionId) sessions.add(sessionId);
-      const numericScore = score !== undefined && score !== null ? Number(score) : null;
-      // Number.isFinite gate: non-numeric garbage coerces to NaN, which would
-      // otherwise poison the rolling sum/count in the DDB scorecard.
-      if (evaluator && Number.isFinite(numericScore) && !hasError) {
-        if (!scoreDeltas[evaluator]) scoreDeltas[evaluator] = { sum: 0, count: 0 };
-        scoreDeltas[evaluator].sum += numericScore;
-        scoreDeltas[evaluator].count += 1;
-      }
-    } catch { /* skip */ }
+    if (entry.sessionId) sessions.add(entry.sessionId);
+    // entry.score is already Number.isFinite-gated (or null) by
+    // extractSessionData, so garbage can't poison the rolling sum/count.
+    if (entry.evaluatorName && Number.isFinite(entry.score) && !hasError) {
+      if (!scoreDeltas[entry.evaluatorName]) scoreDeltas[entry.evaluatorName] = { sum: 0, count: 0 };
+      scoreDeltas[entry.evaluatorName].sum += entry.score;
+      scoreDeltas[entry.evaluatorName].count += 1;
+    }
   }
 
   if (Object.keys(scoreDeltas).length === 0 && sessions.size === 0) return;
@@ -747,12 +998,78 @@ function extractPrd(raw, agentId) {
   return { title, description };
 }
 
+// ─── Improver retry (TEAM-3376, design §2.3) ────────────────────────────────
+// Injectable timing hooks so tests can drive the backoff deterministically.
+let _sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let _random = Math.random;
+let _now = Date.now;
+export function setRetryHooks({ sleep, random, now } = {}) {
+  if (sleep) _sleep = sleep;
+  if (random) _random = random;
+  if (now) _now = now;
+}
+
+const RETRYABLE_SOCKET_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT']);
+const IMPROVER_ATTEMPT_MS = 240_000; // per-attempt HTTP timeout below
+const IMPROVER_DEADLINE_MS = 520_000; // total budget from the first attempt
+const IMPROVER_MAX_ATTEMPTS = 3;
+
+/**
+ * Retry ONLY transient failures: judge throttling (ThrottlingException / HTTP
+ * 429), 5xx, and connection resets. Never other 4xx — a ValidationException
+ * will fail identically on every attempt and each retry burns 240s of the
+ * Lambda's budget.
+ */
+function isRetryableImproverError(err) {
+  const status = err?.statusCode;
+  if (status === 429 || (status >= 500 && status < 600)) return true;
+  if (status >= 400 && status < 500) return false;
+  if (/ThrottlingException/.test(err?.name || '') || /ThrottlingException/.test(err?.message || '')) {
+    return true;
+  }
+  if (RETRYABLE_SOCKET_CODES.has(err?.code)) return true;
+  if (/ECONNRESET|socket hang up|connection reset/i.test(err?.message || '')) return true;
+  return false;
+}
+
+/**
+ * Deadline-aware retry around the single-attempt invoker: at most 3 attempts,
+ * exponential backoff with FULL jitter (sleep = random(0, min(60s, 2s·2^n))),
+ * and a hard 520s budget — if a retry could not finish inside it
+ * (elapsed + 240s > 520s), stop and rethrow instead of starting an attempt
+ * the Lambda timeout would kill anyway.
+ */
+export async function invokeImprover(runtimeArn, prompt, agentId) {
+  const startedAt = _now();
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await invokeImproverOnce(runtimeArn, prompt, agentId);
+    } catch (err) {
+      if (attempt >= IMPROVER_MAX_ATTEMPTS || !isRetryableImproverError(err)) throw err;
+      const elapsed = _now() - startedAt;
+      if (elapsed + IMPROVER_ATTEMPT_MS > IMPROVER_DEADLINE_MS) {
+        console.warn(
+          `[eval-packager] ${agentId}: improver retry abandoned — ` +
+            `${Math.round(elapsed / 1000)}s elapsed leaves no room for a 240s attempt in the 520s budget`
+        );
+        throw err;
+      }
+      const backoffMs = Math.floor(_random() * Math.min(60_000, 2_000 * 2 ** attempt));
+      console.warn(
+        `[eval-packager] ${agentId}: improver attempt ${attempt} failed (${err.message}) — ` +
+          `retrying in ${backoffMs}ms`
+      );
+      await _sleep(backoffMs);
+    }
+  }
+}
+
 /**
  * Invoke an AgentCore Runtime via SigV4-signed HTTPS and return the assembled
  * text. The runtime streams SSE "data: {event:{contentBlockDelta:{delta:{text}}}}"
  * frames; we concatenate every delta.text. Mirrors the orchestrator's invoker.
  */
-async function invokeImprover(runtimeArn, prompt, agentId) {
+async function invokeImproverOnce(runtimeArn, prompt, agentId) {
   const https = await import('https');
   const { SignatureV4 } = await import('@smithy/signature-v4');
   const { Sha256 } = await import('@aws-crypto/sha256-js');
@@ -833,7 +1150,9 @@ async function invokeImprover(runtimeArn, prompt, agentId) {
           clearTimeout(timer);
           if (buffer) consume(buffer);
           if (res.statusCode >= 400) {
-            reject(new Error(`improver returned ${res.statusCode}: ${text.slice(0, 300)}`));
+            const err = new Error(`improver returned ${res.statusCode}: ${text.slice(0, 300)}`);
+            err.statusCode = res.statusCode; // retry wrapper keys off this
+            reject(err);
           } else {
             resolve(text);
           }

@@ -721,8 +721,12 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
     expect(emf[0].Namespace).toBe('AgentCoreHub/Evaluations');
     expect(emf[0].Dimensions).toEqual([['AgentName']]);
     expect(emf[0].Metrics.map((m) => m.Name).sort()).toEqual([
+      'EvalDuplicateResultCount',
+      'EvalSessionsError',
       'EvalSessionsSpanMissing',
       'EvalSessionsTotal',
+      'EvalThrottleRate',
+      'EvalValidationExceptionRate',
     ]);
     expect(typeof record._aws.Timestamp).toBe('number');
     expect(record.AgentName).toBe('agentcore_hub_backend_dev');
