@@ -441,8 +441,11 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
     (journal gone) both mean the turn will never finish — fail fast, don't wait
     out the budget."""
     deadline = time.time() + REMOTE_CODING_TURN_BUDGET_S
+    # Live heartbeats extend the deadline (terminal work is unbounded), but a
+    # wedged-yet-heartbeating runner must not pin this persona forever.
+    hard_stop = time.time() + 2 * REMOTE_CODING_TURN_BUDGET_S
     unknowns = 0
-    while time.time() < deadline:
+    while time.time() < min(deadline, hard_stop):
         time.sleep(REMOTE_CODING_POLL_S)
         try:
             status = _poll_once(client, turn_id)
@@ -478,10 +481,20 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
         unknowns = 0
         # "running" or "transient" (degraded EFS read / torn read racing the
         # journal's tmp+rename): the turn may still be live — keep polling.
-    # Budget spent with no terminal verdict. The turn may STILL complete (e.g.
-    # a huge artifact harvest after the CLI finished) — its edits/commits may
-    # already exist, so a blind re-run is not safe. Probe once more and tell
-    # the persona to VERIFY (git log / workspace state) before re-issuing.
+        # A provably-live runner (fresh heartbeat / in-memory answer) extends
+        # the deadline: terminal work after the CLI (artifact harvest can be
+        # GBs) has no fixed bound, and expiring against a live runner would
+        # push the persona toward re-running work that already happened. The
+        # runner's own watchdog (TURN_TIMEOUT_S) bounds the CLI; a runner that
+        # dies mid-harvest stops heartbeating and the dead verdict fires.
+        if state == "running":
+            deadline = max(deadline,
+                           time.time() + max(3 * REMOTE_CODING_POLL_S, 120))
+    # Budget spent with no live heartbeat seen recently and no verdict. The
+    # turn may STILL have completed its work — a blind re-run is not safe.
+    # Probe once more, then tell the persona to VERIFY STATE WITHOUT running a
+    # coding turn (a fresh CLI call would race a still-live runner in the same
+    # workspace).
     try:
         final = _poll_once(client, turn_id)
         if final.get("status") == "done":
@@ -489,10 +502,12 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
     except Exception:  # noqa: BLE001
         pass
     return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget "
-                     f"with no verdict — the turn may have completed its work. "
-                     f"Do NOT blindly re-run: first issue a short coding call asking "
-                     f"to summarize current workspace/branch state (git log, git "
-                     f"status) and continue from there",
+                     f"with no verdict. Its work may already exist and a runner "
+                     f"may still be finishing. Do NOT re-run the task and do NOT "
+                     f"start another coding call yet: wait a few minutes, then "
+                     f"check the branch on GitHub (get_file_contents / list "
+                     f"commits) to see whether the work landed before deciding "
+                     f"anything",
             "no_retry_hint": True}
 
 
@@ -528,7 +543,11 @@ def _recover_lost_submit(client, payload: dict):
                            f"({attempt + 1}/5): {str(e)[:200]}")
             time.sleep(REMOTE_CODING_POLL_S)
     if probe is None:
-        return None
+        # Every probe hit a transient failure — still zero evidence about the
+        # runner. The poll loop tolerates transient errors until its budget, so
+        # hand it the turn_id rather than abandoning (abandoning advises a
+        # fresh-id retry that could race an accepted runner).
+        return {"submitted": True, "turn_id": payload["turn_id"]}
     state = probe.get("status")
     if state in ("running", "done", "transient"):
         return {"submitted": True, "turn_id": payload["turn_id"]}
