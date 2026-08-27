@@ -316,9 +316,10 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
 
 /**
  * Unified "ticket done" handler — works with both DynamoDB and Jira backends.
- * Called from processStatusChange (Jira webhook path).
+ * Called from processStatusChange (Jira webhook path). Exported for tests —
+ * the webhook route to it is gated on TICKET_PROVIDER=jira at module load.
  */
-async function handleTicketDoneUnified(ticketId) {
+export async function handleTicketDoneUnified(ticketId) {
   const ticket = await getTicket(ticketId);
   if (!ticket) return;
 
@@ -348,6 +349,11 @@ async function handleTicketDoneUnified(ticketId) {
   // concurrent invocation claims of just-unblocked siblings and can resurrect
   // a pre-claim snapshot (double invocation).
   await markTaskComplete(workflow, ticketId, assignee);
+
+  // ── gate approved → close its open review notification ──
+  if (isHumanAssignee(assignee)) {
+    await ackReviewNotifications(workflow, ticketId); // never throws
+  }
 
   // Unblock dependents
   const siblings = await getChildTickets(parentId);
@@ -401,6 +407,51 @@ async function handleTicketDoneUnified(ticketId) {
 /** Whether an assignee refers to a human reviewer (review gate) vs an agent. */
 function isHumanAssignee(assignee) {
   return typeof assignee === "string" && assignee.startsWith("human:");
+}
+
+/**
+ * Indices of open review_needed notifications for a ticket.
+ * Exported for tests. Pure — no I/O.
+ */
+export function reviewAckIndices(workflow, ticketId) {
+  const list = workflow?.humanNotifications;
+  if (!Array.isArray(list)) return [];
+  const idx = [];
+  list.forEach((n, i) => {
+    if (n?.ticketId === ticketId && n?.type === "review_needed" && n?.acknowledged !== true) {
+      idx.push(i);
+    }
+  });
+  return idx;
+}
+
+/**
+ * Acknowledge all open review_needed notifications for a resolved gate ticket.
+ * SCOPED per-index write on workflow.humanNotifications — never a full-row put
+ * (see the race warning at markTaskComplete / handleTicketDoneUnified).
+ * Mutates the in-memory snapshot too, so a later full save in the same cascade
+ * (e.g. completeWorkflow's saveWorkflow) can't resurrect acknowledged:false.
+ * Never throws — ack failure must not break the done/reject cascade.
+ */
+export async function ackReviewNotifications(workflow, ticketId) {
+  try {
+    const indices = reviewAckIndices(workflow, ticketId);
+    if (indices.length === 0) return; // silent no-op — NO DynamoDB call
+    const setClauses = indices.map((i) => `humanNotifications[${i}].acknowledged = :true`);
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId: workflow.id },
+      UpdateExpression: `SET ${setClauses.join(", ")}`,
+      ExpressionAttributeValues: { ":true": true },
+    }));
+    // Keep the snapshot consistent — completeWorkflow() does a full
+    // saveWorkflow(workflow) later in the same cascade and must not
+    // write acknowledged:false back.
+    for (const i of indices) workflow.humanNotifications[i].acknowledged = true;
+    console.log(`[orchestrator] Acknowledged ${indices.length} review notification(s) for ${ticketId}`);
+  } catch (err) {
+    console.error(`[orchestrator] ackReviewNotifications failed for ${ticketId} (non-fatal):`, err.message);
+  }
 }
 
 /**
@@ -563,11 +614,7 @@ async function handleReviewRejection(gateTicket) {
 
   // Acknowledge this gate's open review notification — the review concluded, and
   // clearing it lets a later cycle (after rework) create a fresh notification.
-  if (Array.isArray(workflow.humanNotifications)) {
-    for (const n of workflow.humanNotifications) {
-      if (n.ticketId === gateTicket.ticketId && n.type === "review_needed") n.acknowledged = true;
-    }
-  }
+  await ackReviewNotifications(workflow, gateTicket.ticketId);
 
   // The gate's blockedBy lists the agent tickets it reviewed. Their shared agent
   // phase is the gate's `afterPhase` — match the SPECIFIC gate by phase (a
@@ -1085,6 +1132,11 @@ async function handleTicketDone(ticketId, image) {
 
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);
+
+  // ── gate approved → close its open review notification ──
+  if (isHumanAssignee(assignee)) {
+    await ackReviewNotifications(workflow, ticketId); // never throws
+  }
 
   // Unblock dependents: find tickets blocked by this one
   const siblings = await getChildTickets(parentId);
