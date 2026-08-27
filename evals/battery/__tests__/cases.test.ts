@@ -131,6 +131,32 @@ describe("manifest drift", () => {
   });
 });
 
+describe("duplicate case ids (B4)", () => {
+  it("fails preflight naming the id and every file that claims it", () => {
+    const pf = preflight(makeRepo((root) => {
+      // Same id, different file — every downstream roster is id-keyed, so one of
+      // the two would silently never run.
+      writeFileSync(join(root, "evals/battery/cases/copy-of-valid.json"), JSON.stringify(VALID_CASE, null, 2));
+    }));
+    expect(pf.ok).toBe(false);
+    const err = pf.errors.find((e: any) => e.check === "duplicate-id");
+    expect(err?.message).toContain("duplicate case id 'valid-case-001'");
+    expect(err?.message).toContain("evals/battery/cases/copy-of-valid.json");
+    expect(err?.message).toContain("evals/battery/cases/valid-case-001.json");
+  });
+
+  it("fails preflight when manifest.json lists the same id twice", () => {
+    const pf = preflight(makeRepo((root) => {
+      writeFileSync(
+        join(root, "evals/battery/manifest.json"),
+        JSON.stringify({ schemaVersion: 1, minActiveCases: 1, activeCases: ["valid-case-001", "valid-case-001"] })
+      );
+    }));
+    expect(pf.ok).toBe(false);
+    expect(errorText(pf)).toContain("activeCases lists 'valid-case-001' more than once");
+  });
+});
+
 describe("cross-file integrity", () => {
   it("fails on a targetAgentId not present in src/config/agents.json", () => {
     const pf = preflight(makeRepo((root) => {

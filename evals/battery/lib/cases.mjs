@@ -246,12 +246,56 @@ const REQUIRED_THRESHOLD_KEYS = ["overallDropMaxPoints", "floorRule", "maxRunUsd
 const GATE_CONFIG_FILES = ["baseline.json", "thresholds.json", "manifest.json"];
 
 /**
+ * Gating knobs that live INSIDE a case file. These decide how strictly the case
+ * is judged rather than what it exercises, so for a case that already exists at
+ * the base ref they must come from the base ref too — otherwise the same PR
+ * that degrades a prompt could lower the case's floors, drop the evaluator that
+ * would have caught it, or delete a forbidden-tool entry.
+ *
+ * Everything else in a case def (taskPrompt, input fixtures, targetAgentId,
+ * modelTier, expectedOutcomes/Trajectory) stays PR-head: it is the case's
+ * content, it must be editable in the PR that edits the config it exercises,
+ * and deferring e.g. targetAgentId would deadlock an agent-id rename.
+ *
+ * @param {any} headDef @param {any} baseDef
+ * @returns {{ def: any, changed: string[] }}
+ */
+function applyBaseCaseKnobs(headDef, baseDef) {
+  const def = { ...headDef };
+  const changed = [];
+  const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+  // Floors: replaced wholesale, including "base had none, HEAD adds some".
+  if (!same(baseDef.evaluator_floors, headDef.evaluator_floors)) changed.push("evaluator_floors");
+  if (baseDef.evaluator_floors === undefined) delete def.evaluator_floors;
+  else def.evaluator_floors = baseDef.evaluator_floors;
+
+  // Evaluator list: each entry is a baseline-compared cell, so dropping one at
+  // HEAD would silently retire that comparison.
+  if (Array.isArray(baseDef.evaluators) && !same(baseDef.evaluators, headDef.evaluators)) {
+    changed.push("evaluators");
+    def.evaluators = [...baseDef.evaluators];
+  }
+
+  // Forbidden tools fail the case mechanically. Union, not replacement: a PR may
+  // add a new prohibition immediately, it just cannot drop one.
+  const headForbidden = headDef.referenceInputs?.forbiddenTools || [];
+  const union = [...new Set([...(baseDef.referenceInputs?.forbiddenTools || []), ...headForbidden])];
+  if (union.length !== headForbidden.length) {
+    changed.push("referenceInputs.forbiddenTools");
+    def.referenceInputs = { ...headDef.referenceInputs, forbiddenTools: union };
+  }
+  return { def, changed };
+}
+
+/**
  * The gate must not referee itself with rules the PR controls (B2). In gate
- * mode the baseline, the thresholds, and the GATING knobs of the manifest
- * (minActiveCases + which cases count as active) are read from the base ref;
- * PR-head copies only ever apply to cases the PR adds (those cannot exist at
- * base) or when the file is absent at base — and that fallback is only safe in
- * combination with the bootstrap (B1) and zero-gating-case (B3) guards.
+ * mode the baseline, the thresholds, the GATING knobs of the manifest
+ * (minActiveCases + which cases count as active) and the gating knobs inside
+ * each base-active case file (see applyBaseCaseKnobs) are read from the base
+ * ref; PR-head copies only ever apply to cases the PR adds (those cannot exist
+ * at base) or when the file is absent at base — and that fallback is only safe
+ * in combination with the bootstrap (B1) and zero-gating-case (B3) guards.
  *
  * @param {{ repoRoot: string, baseRef: string,
  *           head: { manifest: any, thresholds: any, baseline: any, cases: Array<{file: string, def: any}> },
@@ -328,6 +372,10 @@ export function resolveGateConfig({ repoRoot, baseRef, head, gitShow }) {
   const headById = new Map(head.cases.filter((c) => typeof c.def?.id === "string").map((c) => [c.def.id, c]));
   /** Cases active at base that the PR retired — they keep gating. */
   const resurrectedCases = [];
+  /** id → case def with the base-ref gating knobs applied. */
+  const effectiveCaseDefs = new Map();
+  /** id → where this case's gating knobs came from. */
+  const caseSources = {};
   for (const id of baseActiveIds || []) {
     const headCase = headById.get(id);
     if (!headCase) {
@@ -346,7 +394,51 @@ export function resolveGateConfig({ repoRoot, baseRef, head, gitShow }) {
           `(retirement takes effect only once it has landed on the base branch)`
       );
     }
+
+    // Gating knobs inside the case file come from the base ref as well.
+    const relPath = `evals/battery/cases/${id}.json`;
+    let text;
+    try {
+      text = show(baseRef, relPath);
+    } catch (err) {
+      // Same convention as the config files: fall back to PR head, loudly. The
+      // id is active in the base manifest, so this is base-side drift (or a
+      // renamed file) — worth saying out loud either way.
+      caseSources[id] = "pr-head (absent at base ref)";
+      warnings.push(
+        `${relPath} is not readable at ${baseRef} (${firstLine(err)}) — falling back to the PR-head gating knobs for case '${id}'`
+      );
+      continue;
+    }
+    let baseDef;
+    try {
+      baseDef = JSON.parse(text);
+    } catch (err) {
+      caseSources[id] = "unreadable at base ref";
+      errors.push({ check: "gate-config", file: `${baseRef}:${relPath}`, message: `JSON parse error: ${err.message}` });
+      continue;
+    }
+    const { def, changed } = applyBaseCaseKnobs(headCase.def, baseDef);
+    effectiveCaseDefs.set(id, def);
+    caseSources[id] = changed.length > 0 ? `base-ref ${baseRef} (overrides HEAD ${changed.join(", ")})` : `base-ref ${baseRef}`;
+    if (changed.length > 0)
+      warnings.push(
+        `case '${id}': ${changed.join(", ")} differ at HEAD — gating this run with the ${baseRef} value(s) ` +
+          `(gating-knob edits take effect only once they have landed on the base branch)`
+      );
+    // The base-ref evaluator list can reintroduce the reference-input evaluator
+    // that HEAD dropped the trajectory for; preflight only saw the HEAD def.
+    if ((def.evaluators || []).includes(CUSTOM_EVALUATOR_ID) && !def.referenceInputs?.expectedToolTrajectory?.length)
+      errors.push({
+        check: "gate-config",
+        file: relPath,
+        message: `${CUSTOM_EVALUATOR_ID} is gating at ${baseRef} but HEAD has no referenceInputs.expectedToolTrajectory for case '${id}'`,
+      });
   }
+  sources["cases/*.json"] = baseActiveIds
+    ? `gating knobs (evaluator_floors, evaluators, forbiddenTools) from base-ref ${baseRef} for ` +
+      `${effectiveCaseDefs.size}/${baseActiveIds.length} base-active case(s); pr-head for new cases`
+    : "pr-head (no base-ref manifest)";
 
   const effectiveActiveIds = new Set([
     ...head.cases.filter((c) => c.def?.status === "active").map((c) => c.def.id),
@@ -359,5 +451,17 @@ export function resolveGateConfig({ repoRoot, baseRef, head, gitShow }) {
       message: `effective active case count ${effectiveActiveIds.size} < minActiveCases ${minActiveCases} (base-ref value)`,
     });
 
-  return { baseRef, sources, baseline, thresholds, minActiveCases, baseActiveIds, resurrectedCases, errors, warnings };
+  return {
+    baseRef,
+    sources,
+    baseline,
+    thresholds,
+    minActiveCases,
+    baseActiveIds,
+    resurrectedCases,
+    effectiveCaseDefs,
+    caseSources,
+    errors,
+    warnings,
+  };
 }

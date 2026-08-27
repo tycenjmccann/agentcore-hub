@@ -197,8 +197,11 @@ async function main() {
   const baseline = gate?.baseline || pf.baseline;
 
   // Case selection. Cases active at the base ref but retired by this PR still
-  // run and still gate — retirement only takes effect once it has landed.
-  const runnable = [...pf.activeCases, ...(gate?.resurrectedCases || []).map((c) => c.def)];
+  // run and still gate — retirement only takes effect once it has landed. And
+  // for every base-active case the gating knobs inside the case file
+  // (evaluator_floors, evaluators, forbiddenTools) come from the base ref too.
+  const effectiveDef = (def) => gate?.effectiveCaseDefs?.get(def.id) || def;
+  const runnable = [...pf.activeCases, ...(gate?.resurrectedCases || []).map((c) => c.def)].map(effectiveDef);
   const resurrectedIds = new Set((gate?.resurrectedCases || []).map((c) => c.def.id));
   // A case the PR retires but that still gates is NOT reported as retired.
   const retiredCases = pf.retiredCases.filter((r) => !resurrectedIds.has(r.id));

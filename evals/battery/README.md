@@ -66,7 +66,7 @@ roster (manifest cross-check, baseline lookup, selection), so preflight and
 | `status` | `active` or `retired` (+ `retirement_reason`). |
 | `provenance` | `source` (`incident` \| `synthetic` \| `workflow`), `mintedBy`, `mintedOn`, optional `reference` (ticket/incident id), `tierJustification`. |
 | `input` | Fixture pointers: `transcript` (replayed as prior messages), `files` (seeded into the in-memory S3 under `shared/inputs/`), `repoFixture`, `blueprints`. |
-| `evaluator_floors` | Optional per-evaluator absolute floors overriding the derived ones. |
+| `evaluator_floors` | Optional per-evaluator absolute floors overriding the derived ones. A gating knob: in gate mode it is read from the base ref for cases that already exist there. |
 
 Evaluator names are the ones provisioned by
 `deploy/evaluations/setup-evaluations.sh`:
@@ -163,11 +163,21 @@ instead of the PR checkout:
 | `baseline.json` | the whole baseline (means, `source_commit`, `scoringBackend`) |
 | `thresholds.json` | every knob: `overallDropMaxPoints`, `floorRule`, `maxRunUsd` |
 | `manifest.json` | the gating knobs only — `minActiveCases`, and which case ids count as active |
+| `cases/<id>.json` (base-active cases only) | the gating knobs only — `evaluator_floors`, the `evaluators` list, and `referenceInputs.forbiddenTools` (union with HEAD: a PR may add a prohibition, never drop one) |
+
+Everything else in a case file stays PR-head — `taskPrompt`, `input` fixtures,
+`targetAgentId`, `modelTier`, `expectedOutcomes`/`expectedToolTrajectory`. That
+is the case's *content*: it has to be editable in the same PR that edits the
+config it exercises (an agent-id rename would otherwise deadlock). Only the
+knobs that decide *how strictly* the case is judged are deferred.
 
 Consequences for a PR that touches the battery:
 
 - **Weakening thresholds or hand-editing the baseline has no effect on its own
-  gate run.** The change applies from the merge onward.
+  gate run.** The change applies from the merge onward. Same for lowering a
+  case's `evaluator_floors`, dropping an evaluator from a pre-existing case, or
+  removing one of its `forbiddenTools` — the runner logs which knobs it
+  overrode and gates on the base-ref values.
 - **Retiring a case takes effect only once it has landed on the base branch.** A
   case that is active at the base ref but `retired` at HEAD still runs and still
   gates (the runner logs a warning and does not list it as retired).
@@ -190,8 +200,9 @@ which is what you want when iterating on a case.
 - **Overall drop rule:** fail when baseline overall mean − current overall
   mean is **strictly greater than 5.00** (a drop of exactly 5.00 passes).
 - **Floor rule:** per-case per-evaluator floor = baseline mean − 10, clamped
-  up to an absolute minimum of 40; `evaluator_floors` in a case file override.
-  One floor breach fails the gate regardless of every other cell.
+  up to an absolute minimum of 40; `evaluator_floors` in a case file override
+  (base-ref copy in gate mode). One floor breach fails the gate regardless of
+  every other cell.
 - **Partial runs never pass:** an errored, timed-out, skipped, or unscored
   case is a failure — there is no code path from a partial run to `PASS`.
 - **At least one gating case:** `PASS` requires ≥1 scored case compared against
