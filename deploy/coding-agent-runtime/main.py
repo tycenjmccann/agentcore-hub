@@ -1804,8 +1804,6 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
                 result = frame
     except Exception as exc:  # noqa: BLE001 — journal the failure, never raise
         last_error = str(exc)[:600]
-    finally:
-        stop_beating.set()
 
     done = {"status": "done", "turn_id": turn_id, "cli": cli,
             "finished_at": int(time.time()),
@@ -1817,9 +1815,21 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
         done["error"] = last_error or "turn produced no done frame"
     elif last_error and not (done["response"] or "").strip():
         done["error"] = last_error
-    with journal_lock:
-        finished.set()
-        _journal_write(journal, done)
+    # Heartbeats stay alive UNTIL the terminal record is durably written: if
+    # this write fails transiently (degraded EFS) and beats had already
+    # stopped, the last durable record would go stale → dead → the caller
+    # resubmits a turn that actually completed. Retry under liveness; only a
+    # persistent failure (result truly undeliverable) lets the journal go
+    # stale, and then a resubmit IS the right outcome.
+    for _ in range(15):
+        with journal_lock:
+            if _journal_write(journal, done):
+                finished.set()
+                break
+        time.sleep(4)
+    else:
+        logger.error("turn_done_write_failed", extra={"turn_id": turn_id})
+    stop_beating.set()
     logger.info("turn_done", extra={"cli": cli, "chars": len(done["response"]),
                                     "async": True, "turn_id": turn_id})
 

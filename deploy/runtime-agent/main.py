@@ -438,19 +438,19 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
     (journal gone) both mean the turn will never finish — fail fast, don't wait
     out the budget."""
     deadline = time.time() + REMOTE_CODING_TURN_BUDGET_S
-    misses = 0
     unknowns = 0
     while time.time() < deadline:
         time.sleep(REMOTE_CODING_POLL_S)
         try:
             status = _poll_once(client, turn_id)
-        except Exception as e:  # noqa: BLE001 — transient invoke hiccup
-            misses += 1
-            logger.warning(f"[remote-coding] poll error ({misses}/3): {str(e)[:200]}")
-            if misses >= 3:
-                return {"error": f"poll failed 3x: {str(e)[:200]}"}
+        except Exception as e:  # noqa: BLE001
+            # Throttle / network / AgentCore blip — says nothing about the
+            # runner, which may be mid-turn writing heartbeats. Never terminal:
+            # bailing here would make the persona resubmit into a workspace
+            # where the original turn is still executing. Keep polling until
+            # the budget expires or the journal renders a verdict.
+            logger.warning(f"[remote-coding] poll error (non-terminal): {str(e)[:200]}")
             continue
-        misses = 0
         state = status.get("status")
         if state == "done":
             return status
