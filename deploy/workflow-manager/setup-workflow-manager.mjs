@@ -226,10 +226,15 @@ const SYSTEM_PROMPT = readFileSync(join(__dirname, "system-prompt.md"), "utf8");
 
 // Skills: on-demand playbooks (SKILL.md bundles) the WM pulls into context
 // when a situation matches — behavior lives in skill files, not prompt bloat.
-// Synced to S3 by deploy.sh; the harness resolves them from there.
-const SKILLS = [
-  { s3: { uri: `s3://${ARTIFACT_BUCKET}/workflow-manager/skills/crash-rca/` } },
-];
+// Auto-discovered from skills/ (any dir containing SKILL.md); synced to S3 by
+// deploy.sh, so adding a skill = new folder + deploy.sh + re-run this script.
+const { readdirSync } = await import("node:fs");
+const SKILLS_DIR = join(__dirname, "skills");
+const SKILLS = readdirSync(SKILLS_DIR, { withFileTypes: true })
+  .filter((d) => d.isDirectory() && existsSync(join(SKILLS_DIR, d.name, "SKILL.md")))
+  .map((d) => ({ s3: { uri: `s3://${ARTIFACT_BUCKET}/workflow-manager/skills/${d.name}/` } }));
+if (SKILLS.length === 0) throw new Error(`No skills found in ${SKILLS_DIR}`);
+console.log(`   Skills: ${SKILLS.map((s) => s.s3.uri.split("/").at(-2)).join(", ")}`);
 
 const harnessConfig = {
   harnessName: HARNESS_NAME,
