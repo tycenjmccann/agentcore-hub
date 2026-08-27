@@ -86,6 +86,15 @@ aws s3 sync "${REPO_ROOT}/deploy/workflow-manager/toolkit/" \
   --exclude "test_*.py" --delete --quiet
 echo "✓ Toolkit: s3://${BUCKET}/workflow-manager/toolkit/"
 
+# ─── Skills sync (harness skills[] resolves these S3 URIs on demand) ─────────
+# Adding a NEW skill also requires registering its URI in the harness skills[]
+# array: re-run setup-workflow-manager.mjs. Editing an existing skill = this
+# sync alone.
+aws s3 sync "${REPO_ROOT}/deploy/workflow-manager/skills/" \
+  "s3://${BUCKET}/workflow-manager/skills/" \
+  --delete --quiet
+echo "✓ Skills: s3://${BUCKET}/workflow-manager/skills/"
+
 # ─── Trigger Lambda ───────────────────────────────────────────────────────────
 LAMBDA_NAME="agentcore-hub-workflow-analyzer"
 ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},WM_STALE_MINUTES=${WM_STALE_MINUTES:-10},WM_WATCH_COOLDOWN_MINUTES=${WM_WATCH_COOLDOWN_MINUTES:-15}}"

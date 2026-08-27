@@ -278,6 +278,15 @@ export class JiraClient {
   }
 
   /**
+   * Create an issue from raw Jira fields (project, issuetype, summary, labels,
+   * ADF description, ...). Returns { key }. Used for top-level issues that the
+   * typed provider methods don't cover (e.g. programmatic Bug filing).
+   */
+  async createIssue(fields: Record<string, unknown>): Promise<{ key: string }> {
+    return this.request<{ key: string }>("POST", "/issue", { fields });
+  }
+
+  /**
    * Add a comment to an issue. Wraps the text in ADF (Atlassian Document
    * Format) and prefixes the author, matching JiraCloudProvider.addComment.
    */

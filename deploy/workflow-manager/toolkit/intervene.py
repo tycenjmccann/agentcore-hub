@@ -35,6 +35,7 @@ Usage:
   python3 intervene.py mute      <workflowId> [--note "..."]
   python3 intervene.py cancel    <workflowId> --reason "..."   (explicit user request ONLY)
   python3 intervene.py start     --title "..." [--description "..."] [--repo owner/name] [--branch main]
+  python3 intervene.py file-bug  <workflowId> --title "..." --description "<RCA>" --agent <agentId> [--repo owner/name]
 
 Env: WORKFLOW_API_URL (app base URL), EVENTS_TABLE, TICKETS_TABLE,
      WORKFLOWS_TABLE, TICKET_PROVIDER (dynamodb|jira), AWS_REGION.
@@ -299,6 +300,40 @@ def cmd_start(args):
     print(json.dumps({"action": "start", **result}, indent=2))
 
 
+def cmd_file_bug(args):
+    """File a top-level Bug that auto-fires the bug-fix pipeline (Jira webhook →
+    bootstrapBugWorkflow). This is the crash-rca skill's output path: the RCA
+    becomes the bug description, and the fix ships without a human relay.
+
+    Guardrails enforced here and server-side:
+      - --title, --description (the RCA), and --agent are all REQUIRED. An RCA
+        must cite evidence; a bare "agent X died" is refused by the skill, and
+        an empty description is refused here.
+      - Dedupe is signature-based: one OPEN bug per (crash-rca, agent:<id>)
+        label pair. A second filing for the same agent lands as a comment on
+        the existing bug — the pipeline never burns a run per crash.
+      - --repo defaults server-side to the hub repo (GITHUB_OWNER/GITHUB_REPO):
+        agent crashes are hub infrastructure, not the workload's repo."""
+    for field, val in (("--title", args.title), ("--description", args.description),
+                       ("--agent", args.agent)):
+        if not (val or "").strip():
+            raise SystemExit(f"REFUSED: file-bug requires {field}")
+    body = {
+        "title": args.title,
+        "description": args.description,
+        "labels": ["crash-rca", f"agent:{args.agent}", f"crashed-in:{args.workflow_id}"],
+        "dedupeLabels": ["crash-rca", f"agent:{args.agent}"],
+    }
+    if args.repo:
+        body["repo"] = args.repo
+    result = api_post("/api/bugs", body)
+    publish_intervention(args.workflow_id, "file_bug", {
+        "ticketId": result.get("ticketId"), "deduped": result.get("deduped"),
+        "agentId": args.agent, "note": args.title[:500],
+    })
+    print(json.dumps({"action": "file_bug", **result}, indent=2))
+
+
 def cmd_escalate(args):
     # Idempotent: never append a second copy of an already-open (unacknowledged)
     # escalation with the same message. This stops the manager re-raising the
@@ -409,6 +444,16 @@ def main():
     p.add_argument("--repo", default="")
     p.add_argument("--branch", default="")
     p.set_defaults(func=cmd_start)
+
+    p = sub.add_parser("file-bug")
+    p.add_argument("workflow_id")
+    p.add_argument("--title", default="")
+    p.add_argument("--description", default="",
+                   help="REQUIRED: the full crash RCA (symptom, occurrences, last activity, suspected cause)")
+    p.add_argument("--agent", default="",
+                   help="REQUIRED: the persona that crashed (dedupe key)")
+    p.add_argument("--repo", default="")
+    p.set_defaults(func=cmd_file_bug)
 
     args = parser.parse_args()
     args.func(args)

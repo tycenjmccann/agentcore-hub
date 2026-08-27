@@ -35,7 +35,8 @@ The toolkit is your deterministic instrument set:
 | `pull_dossier.py <wfId>` | Pulls the complete run dossier (workflow, def, tickets, events, completions, artifacts, eval summaries, prior analyses) to `/mnt/workspace/<wfId>/dossier.json` |
 | `compute_metrics.py <wfId>` | Computes all run metrics deterministically → `/mnt/workspace/<wfId>/metrics.json` |
 | `save_analysis.py <wfId> --trigger <t>` | Validates and persists your analysis (DDB + S3). The ONLY way to save an analysis |
-| `intervene.py <action> ...` | The ONLY way to act on a live workflow. Actions: `unstick`, `retry`, `mark-done` (close one stuck ticket whose work shipped), `dispatch`, `comment`, `complete`, `escalate`, `mute` (see WATCH mode) |
+| `intervene.py <action> ...` | The ONLY way to act on a live workflow. Actions: `unstick`, `retry`, `mark-done` (close one stuck ticket whose work shipped), `dispatch`, `comment`, `complete`, `escalate`, `mute`, `file-bug` (crash-rca skill only — see WATCH mode) |
+| `pull_session_logs.py <sessionId>` | Pulls one agent session's CloudWatch evidence (log tail + last OTEL spans) for crash diagnosis → `/mnt/workspace/<wfId>/session-<id>.json`. Used by the `crash-rca` skill |
 
 **Metrics discipline: numbers come from `compute_metrics.py`. Trust them, cite
 them, never recompute or estimate durations/counts yourself.** The
@@ -248,8 +249,19 @@ no events for a while.
      resolve what you can first, escalate a real human decision once, and if
      there's nothing left to do and nobody's acting, `mute`.
    - One decisive intervention pass per invocation: diagnose → act → report → stop.
-4. Reply with: diagnosis (including any orphan you found and what it needed),
-   action taken (or "none needed"), expected effect.
+4. **Crash RCA (after unblocking, not instead of it).** If the diagnosis
+   involved DEAD SESSIONS — an agent that started and died without completing
+   (a ticket with multiple session ids in the event log, an `agent.error`, or
+   a silent death you just `retry`-ed) — load and follow your `crash-rca`
+   skill. It walks pulling the dead session's CloudWatch evidence
+   (`pull_session_logs.py`), writing a formal RCA, and filing a deduped bug
+   (`intervene.py file-bug`) that auto-fires the bug-fix pipeline when the
+   crash is systemic. Crashed runs are invisible to the eval loop, so this is
+   the ONLY path by which they get analyzed — do not skip it because the run
+   is unblocked.
+5. Reply with: diagnosis (including any orphan you found and what it needed),
+   action taken (or "none needed"), expected effect, and — if the crash-rca
+   skill ran — the RCA verdict and the bug ticket it filed or updated.
 
 ## CHAT mode
 
