@@ -255,6 +255,20 @@ CLOUD_CODE_TABLE = os.getenv("CLOUD_CODE_TABLE", "agentcore-hub-cloud-code-sessi
 # The coding runtime caps a turn at TURN_TIMEOUT_S (1500s); our client read
 # timeout must sit above that so the runtime's own timeout error reaches us.
 REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "1560"))
+# Wall-clock cap on draining one coding turn's SSE stream. The read timeout
+# above is per-socket-read and resets on every frame, so a runtime that keeps
+# streaming without ever sending a done frame would block this persona forever
+# (TEAM-3168/TEAM-3194). Sits above TURN_TIMEOUT_S so the runtime's own cap
+# fires first.
+REMOTE_CODING_TURN_DEADLINE_S = int(os.getenv("REMOTE_CODING_TURN_DEADLINE_S", "1800"))
+# Client-side idle watchdog on the SSE drain: max seconds to wait for any
+# single frame. Mirrors REMOTE_CODING_READ_TIMEOUT but is enforced by
+# _drain_coding_sse itself on a wall clock — the botocore read timeout does
+# not reliably fire on a wedged stream read, which is how TEAM-3168 hung
+# personas forever with the InvokeAgentRuntime span left status=UNSET.
+REMOTE_CODING_IDLE_TIMEOUT_S = int(
+    os.getenv("REMOTE_CODING_IDLE_TIMEOUT_S", str(REMOTE_CODING_READ_TIMEOUT))
+)
 
 # Tenant the workflow session rows belong to. Multi-tenant deployments must set
 # this to the tenant that owns the fleet, or the Cloud Code tab (which scopes
@@ -407,7 +421,24 @@ def _maybe_resume_session(resume_session: str) -> None:
         logger.warning(f"[remote-coding] session lookup failed (non-fatal): {e}")
 
 
-def _drain_coding_sse(body) -> dict:
+def _record_span_error(error_text: str, exc: Exception | None = None) -> None:
+    """Mark the active OTEL span failed (status=ERROR + exception event) so a
+    failed coding handoff never leaves a dangling status=UNSET span in the
+    trace (TEAM-3168/TEAM-3194). Best-effort: tracing must never fail the
+    turn it is reporting on (and is a no-op when not instrumented)."""
+    try:
+        from opentelemetry import trace as _otel_trace
+        from opentelemetry.trace import Status, StatusCode
+        span = _otel_trace.get_current_span()
+        if exc is not None:
+            span.record_exception(exc)
+        span.set_status(Status(StatusCode.ERROR, (error_text or "")[:500]))
+    except Exception:  # noqa: BLE001 — tracing must never fail the turn
+        pass
+
+
+def _drain_coding_sse(body, deadline_s: float | None = None,
+                      idle_timeout_s: float | None = None) -> dict:
     """Consume the coding runtime's SSE stream to completion and return the
     terminal frame as a result dict (same shape as the buffered JSON path).
 
@@ -415,10 +446,67 @@ def _drain_coding_sse(body) -> dict:
     text rides the done frame), data: {"type": "error", ...}, and a final
     data: {"type": "done", "response": ..., "claude_session_id": ...,
     "artifacts": [...]}. An error frame followed by no done frame is a failed
-    turn; text frames flowing keep both runtimes' invocations alive."""
+    turn; text frames flowing keep both runtimes' invocations alive.
+
+    deadline_s (default REMOTE_CODING_TURN_DEADLINE_S) is a wall-clock cap on
+    the whole drain; idle_timeout_s (default REMOTE_CODING_IDLE_TIMEOUT_S)
+    caps the wait for any single frame. The client's per-read socket timeout
+    is not enough: it resets on every frame (endless progress frames extend
+    it forever) and does not reliably bound a read that never returns —
+    either way the persona blocked forever with the nested InvokeAgentRuntime
+    span left dangling (TEAM-3168/TEAM-3194). Reads happen on a helper thread
+    so both caps fire on a wall clock even while the read itself is blocked."""
+    import queue, time
+    if deadline_s is None:
+        deadline_s = REMOTE_CODING_TURN_DEADLINE_S
+    if idle_timeout_s is None:
+        idle_timeout_s = REMOTE_CODING_IDLE_TIMEOUT_S
+    deadline = time.monotonic() + deadline_s
+    frames: queue.Queue = queue.Queue()
+    _EOS = object()  # end-of-stream marker from the reader thread
+
+    def _read_frames():
+        try:
+            for raw in body.iter_lines():
+                frames.put(raw)
+        except Exception as e:  # noqa: BLE001 — re-raised on the draining thread
+            frames.put(e)
+        finally:
+            frames.put(_EOS)
+
+    reader = threading.Thread(target=_read_frames, daemon=True,
+                              name="coding-sse-reader")
+    reader.start()
+
+    def _abandon(reason: str) -> dict:
+        # Closing the body aborts the blocked reader thread's read and lets
+        # the botocore/OTEL instrumentation finish the InvokeAgentRuntime span
+        # instead of leaving it open forever.
+        try:
+            body.close()
+        except Exception:  # noqa: BLE001 — already giving up, just surface the reason
+            pass
+        return {"error": reason}
+
     result: dict = {}
     last_error = ""
-    for raw in body.iter_lines():
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _abandon(
+                f"coding turn exceeded {deadline_s}s without completion (deadline)")
+        try:
+            raw = frames.get(timeout=min(remaining, idle_timeout_s))
+        except queue.Empty:
+            if deadline - time.monotonic() <= 0:
+                return _abandon(
+                    f"coding turn exceeded {deadline_s}s without completion (deadline)")
+            return _abandon(
+                f"coding stream sent no frame for {idle_timeout_s}s (idle timeout)")
+        if raw is _EOS:
+            break
+        if isinstance(raw, Exception):
+            raise raw  # stream read failed — surfaced by _remote_coding_turn's error path
         if not raw:
             continue
         line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
@@ -497,6 +585,7 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         client = boto3.client(
             "bedrock-agentcore", region_name=REGION,
             config=BotocoreConfig(read_timeout=REMOTE_CODING_READ_TIMEOUT,
+                                  connect_timeout=30,
                                   retries={"max_attempts": 0}),
         )
         resp = client.invoke_agent_runtime(
@@ -515,10 +604,14 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         # Do NOT fall back to a local CLI run: the session's workspace lives on
         # the coding runtime, and a local run would fork it (split-brain).
         logger.warning(f"[remote-coding] turn failed: {str(e)[:300]}")
+        _publish_agent_error(f"remote {cli} turn failed: {str(e)[:300]}")
+        _record_span_error(f"remote {cli} turn failed: {str(e)[:300]}", exc=e)
         return (f"ERROR: remote {cli} turn failed: {str(e)[:300]}. "
                 f"Retry this same {cli} call — the session workspace is preserved.")
 
     if result.get("error"):
+        _publish_agent_error(f"remote {cli} turn failed: {result['error']}")
+        _record_span_error(f"remote {cli} turn failed: {result['error']}")
         return (f"ERROR: remote {cli} turn failed: {result['error']}. "
                 f"Retry this same {cli} call — the session workspace is preserved.")
 
@@ -1632,6 +1725,36 @@ def _publish_agent_started(workflow_id: str, agent_id: str):
         logger.info(f"[{agent_id}] Published agent.started event")
     except Exception as e:
         logger.warning(f"[{agent_id}] Failed to publish agent.started: {e}")
+
+
+def _publish_agent_error(error_text: str):
+    """Publish agent.error so the dashboard and Workflow Manager see the failure
+    instead of a silent hang (TEAM-3168/TEAM-3194). Same row shape as the
+    EventBridge events-writer rows. Best-effort: error surfacing must never
+    itself fail the turn it is reporting on."""
+    import time, random, string
+    try:
+        event_id = f"{int(time.time() * 1000)}-{''.join(random.choices(string.ascii_lowercase, k=4))}"
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _ddb_events_client.put_item(
+            TableName=_EVENTS_TABLE,
+            Item={
+                "workflowId": {"S": _CURRENT_WORKFLOW_ID or "unknown"},
+                "eventId": {"S": event_id},
+                "type": {"S": "agent.error"},
+                "detail": {"M": {
+                    "agentId": {"S": _CURRENT_AGENT_ID},
+                    "workflowId": {"S": _CURRENT_WORKFLOW_ID},
+                    "ticketId": {"S": _CURRENT_TICKET_ID},
+                    "error": {"S": (error_text or "")[:1000]},
+                    "timestamp": {"S": now},
+                }},
+                "timestamp": {"S": now},
+            },
+        )
+        logger.info(f"[{_CURRENT_AGENT_ID}] Published agent.error event")
+    except Exception as e:  # noqa: BLE001 — error surfacing must never fail the turn
+        logger.warning(f"[{_CURRENT_AGENT_ID}] Failed to publish agent.error: {e}")
 
 
 def _save_memory_event(agent_id: str, session_id: str, user_text: str, assistant_text: str):
