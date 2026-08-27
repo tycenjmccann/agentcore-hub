@@ -13,6 +13,11 @@
 #
 # Agent IDs are read dynamically from fleet-runtime-ids.json rather than
 # hardcoded, so this script works after any redeployment.
+#
+# REDEPLOYING AFTER A RUBRIC CHANGE (dependency_chain_evaluator.json):
+#   Editing the JSON in this repo changes NOTHING in the account by itself —
+#   see the "Re-registering a corrected evaluator rubric" section below
+#   CUSTOM_EVALUATOR for the rollout procedure.
 
 set -e
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

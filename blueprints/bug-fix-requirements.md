@@ -30,6 +30,8 @@ The **Bug ticket itself is the workflow root.** There is no separate Epic wrappe
 - Extract: expected behavior, actual behavior, repro steps, environment, error messages, stack traces.
 - If the report is missing repro steps, comment on the Bug requesting them and STOP. Do not guess.
 
+**Exception — synthetic pipeline-test tickets:** If the Bug ticket explicitly requests creation of the sub-task chain, or carries a synthetic/pipeline-test label, there is no defect to reproduce: proceed to create the standard fix → review → QA → CI sub-task chain and note in bug-analysis.md that repro steps are N/A for a synthetic ticket. This exception applies ONLY when one of those objective triggers is present — a genuine bug report that merely lacks repro steps still gets the comment-and-STOP treatment above.
+
 ### Step 2: Triage and Hypothesize
 You do NOT have code-reading tools — your job is triage and dispatch, not root-cause-in-code. The dev agent will do the deep code investigation.
 
