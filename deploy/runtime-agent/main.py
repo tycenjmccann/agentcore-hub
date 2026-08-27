@@ -536,8 +536,16 @@ def _recover_lost_submit(client, payload: dict):
         try:
             return _coding_invoke(client, payload)  # deduped server-side
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[remote-coding] recovery resubmit failed: {str(e)[:200]}")
-            return None
+            # The resubmit may have been ACCEPTED with only its response lost —
+            # the same ambiguity we're recovering from. Accepted turns journal
+            # before the response is sent, so hand the turn_id to the poll loop
+            # to resolve: running/done if it started, three consecutive
+            # 'unknown's → the retryable death verdict if it never did. Never
+            # abandon here — that advises a fresh-id retry that could race an
+            # accepted runner.
+            logger.warning(f"[remote-coding] recovery resubmit response lost — "
+                           f"polling turn_id anyway: {str(e)[:200]}")
+            return {"submitted": True, "turn_id": payload["turn_id"]}
     # No parseable status → legacy runtime mid-synchronous-turn. Resubmitting
     # would run the task twice; surface the loss instead.
     logger.warning(f"[remote-coding] recovery probe unrecognized: {str(probe)[:200]}")
