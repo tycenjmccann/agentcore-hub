@@ -15,8 +15,28 @@ runs (StrandsTelemetry + setup_otlp_exporter, try/except-wrapped) is exercised
 directly in test_broken_otlp_endpoint_does_not_raise below.
 """
 
+import logging
+from pathlib import Path
+
 from strands import Agent
 from strands.models import Model
+
+_MAIN = Path(__file__).parent.parent / "main.py"
+
+
+def _load_anchor_helper():
+    """Extract _emit_session_anchor_span from main.py (TEAM-3366 P0-A) and exec
+    it standalone — same reason as above: main.py itself can't be imported. The
+    helper binds the process-global TracerProvider set up in conftest.py."""
+    src = _MAIN.read_text()
+    start = src.index("# --- Session anchor span (TEAM-3366")
+    end = src.index(
+        "\n# ---------------------------------------------------------------------------",
+        start,
+    )
+    ns = {"logger": logging.getLogger("test-anchor")}
+    exec(compile(src[start:end], str(_MAIN), "exec"), ns)
+    return ns["_emit_session_anchor_span"]
 
 
 class FakeModel(Model):
@@ -111,3 +131,36 @@ def test_broken_otlp_endpoint_does_not_raise(span_exporter, monkeypatch):
     result = _invoke_agent(name="test_agent")
     assert "canned response" in str(result)
     _find_invoke_agent_span(span_exporter)
+
+
+def test_anchor_span_exported_without_agent_loop(span_exporter):
+    """TEAM-3366 P0-A: the session-anchor helper alone — no Agent loop at all —
+    yields one exported, ended, spec-compliant invoke_agent span. This is the
+    microVM-interrupted-mid-loop scenario where the SDK's own loop-spanning
+    invoke_agent span is lost."""
+    _load_anchor_helper()("test_agent", "sess-123", "wf-1", "TEAM-1")
+
+    span = _find_invoke_agent_span(span_exporter)
+    assert span.name == "invoke_agent test_agent"
+    assert span.end_time is not None
+    assert span.attributes.get("gen_ai.agent.name") == "test_agent"
+    assert span.attributes.get("session.id") == "sess-123"
+    assert span.attributes.get("agentcore.hub.anchor") is True
+
+
+def test_anchor_plus_completed_run_yields_two_distinguishable_spans(span_exporter):
+    """TEAM-3366 P0-A: a run that DOES complete produces the anchor span plus
+    the SDK's loop span — two invoke_agent spans, distinguishable by the
+    agentcore.hub.anchor attribute so evals/dashboards can tell them apart."""
+    _load_anchor_helper()("test_agent", "sess-123", "wf-1", "TEAM-1")
+    _invoke_agent(name="test_agent")
+
+    spans = [
+        s
+        for s in span_exporter.get_finished_spans()
+        if s.attributes.get("gen_ai.operation.name") == "invoke_agent"
+    ]
+    assert len(spans) == 2, f"expected anchor + SDK loop span, got {len(spans)}"
+    anchors = [s for s in spans if s.attributes.get("agentcore.hub.anchor") is True]
+    assert len(anchors) == 1
+    assert all(s.name == "invoke_agent test_agent" for s in spans)

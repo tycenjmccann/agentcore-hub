@@ -489,6 +489,13 @@ def _load_production_entrypoints() -> dict[str, Any]:
         "BedrockModel": None,
         "_CODING_SESSION": {},
         # Network-touching collaborators, stubbed.
+        # TEAM-3366 P0-A session-anchor span: stubbed so these tests keep
+        # pinning the SDK's own loop span in isolation (exactly one
+        # invoke_agent span per run); the anchor helper itself is exercised
+        # in test_telemetry_init.py and tests/test_telemetry.py.
+        "_emit_session_anchor_span": (
+            lambda agent_id, session_id, workflow_id, ticket_id: None
+        ),
         "_publish_agent_started": lambda workflow_id, agent_id: None,
         "_publish_agent_error": lambda workflow_id, agent_id, error: None,
         "_load_builtin_tools": lambda: [],

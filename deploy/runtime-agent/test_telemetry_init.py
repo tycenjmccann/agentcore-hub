@@ -19,12 +19,13 @@ from unittest import mock
 
 _MAIN = Path(__file__).parent / "main.py"
 _START = "# --- OTel telemetry init (TEAM-3102)"
+_ANCHOR_START = "# --- Session anchor span (TEAM-3366"
 _END = "\n# ---------------------------------------------------------------------------"
 
 
-def _extract_block():
+def _extract_block(start_marker=_START):
     src = _MAIN.read_text()
-    start = src.index(_START)
+    start = src.index(start_marker)
     end = src.index(_END, start)
     return src[start:end]
 
@@ -133,6 +134,92 @@ class TestTelemetryInit(unittest.TestCase):
             ns["_init_telemetry"]()
         strands_cls.assert_not_called()
         self.assertEqual(logger.info.call_count, first_info_calls)
+
+
+class TestSessionAnchorSpan(unittest.TestCase):
+    """TEAM-3366 P0-A: _emit_session_anchor_span from main.py, extracted and
+    exec'd the same way as the init block. The real opentelemetry SDK is
+    installed for these tests (tests/requirements-test.txt), but the helper is
+    pointed at a LOCAL in-memory SDK provider via a fake `opentelemetry`
+    module, so no test ever mutates the process-global TracerProvider."""
+
+    def _load_helper(self, fake_trace, logger=None):
+        # The helper imports opentelemetry at CALL time, so the fake module
+        # must be in sys.modules during each call — not just during exec.
+        fake_otel = types.ModuleType("opentelemetry")
+        fake_otel.trace = fake_trace
+        ns = {"logger": logger or mock.Mock()}
+        exec(compile(_extract_block(_ANCHOR_START), str(_MAIN), "exec"), ns)
+
+        def call(*args):
+            with mock.patch.dict(sys.modules, {"opentelemetry": fake_otel}):
+                return ns["_emit_session_anchor_span"](*args)
+
+        return call
+
+    @staticmethod
+    def _sdk_provider_and_exporter():
+        from opentelemetry import trace as real_trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        fake_trace = types.SimpleNamespace(
+            get_tracer=provider.get_tracer,
+            get_tracer_provider=lambda: provider,
+            set_tracer_provider=mock.Mock(),
+            SpanKind=real_trace.SpanKind,
+        )
+        return provider, exporter, fake_trace
+
+    def test_anchor_span_exported_without_agent_loop(self):
+        # The whole point of the anchor: one ENDED, spec-compliant invoke_agent
+        # span exists in the exporter with NO Agent loop having run at all.
+        _provider, exporter, fake_trace = self._sdk_provider_and_exporter()
+        helper = self._load_helper(fake_trace)
+
+        helper("test_agent", "sess-123", "wf-1", "TEAM-1")
+
+        spans = exporter.get_finished_spans()
+        self.assertEqual(len(spans), 1)
+        span = spans[0]
+        self.assertEqual(span.name, "invoke_agent test_agent")
+        self.assertIsNotNone(span.end_time)
+        self.assertEqual(span.attributes.get("gen_ai.operation.name"), "invoke_agent")
+        self.assertEqual(span.attributes.get("session.id"), "sess-123")
+        self.assertIs(span.attributes.get("agentcore.hub.anchor"), True)
+
+    def test_anchor_fail_open_on_tracer_error(self):
+        # get_tracer exploding must neither raise out of the helper (it runs
+        # in the invocation hot path) nor stay silent — one warning logged.
+        def _raise(*args, **kwargs):
+            raise RuntimeError("otel exploded")
+
+        logger = mock.Mock()
+        helper = self._load_helper(
+            types.SimpleNamespace(get_tracer=_raise), logger=logger
+        )
+
+        helper("test_agent", "sess-123", "wf-1", "TEAM-1")  # must not raise
+
+        logger.warning.assert_called_once()
+
+    def test_anchor_never_replaces_tracer_provider(self):
+        # _init_telemetry invariant (TEAM-3102/TEAM-3313): under an existing
+        # (ADOT-owned) provider the helper may only read it — the global
+        # provider identity is unchanged and set_tracer_provider never called.
+        provider, _exporter, fake_trace = self._sdk_provider_and_exporter()
+        helper = self._load_helper(fake_trace)
+
+        helper("test_agent", "sess-123", "wf-1", "TEAM-1")
+
+        self.assertIs(fake_trace.get_tracer_provider(), provider)
+        fake_trace.set_tracer_provider.assert_not_called()
 
 
 if __name__ == "__main__":
