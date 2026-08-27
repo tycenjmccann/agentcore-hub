@@ -1,0 +1,42 @@
+{
+  "id": "fix-pagination-offbyone-002",
+  "title": "Fix with regression test: off-by-one drops the last item on every page boundary",
+  "targetAgentId": "agentcore_hub_backend_dev",
+  "taskPrompt": "# Your Assignment: Fix: list endpoint drops one item at every page boundary\n\n## Ticket\nID: BATT-105\nDescription: The tickets list endpoint silently drops the last item of each page. bug-report.md has the observed behavior, pagination.ts is the module under suspicion, and design-excerpt.md is the pagination contract from the design doc. Fix the defect and add a regression test that pins the page-boundary behavior. Delegate the code work to claude_code.\n\n## Workflow Context\nworkflow_id: wf_battery_fix_pagination_002\nepic_id: BATT-100\nticket_id: BATT-105\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_fix_pagination_002/shared/\nyour_workspace: workflows/wf_battery_fix_pagination_002/agents/agentcore_hub_backend_dev/\n\n## Branch\nfeature_branch: feature/BATT-105-backend-dev\nbase_branch: feature/BATT-100-epic\nNOTE: base_branch is this run's SHARED integration branch. Branch from it, target your PR at it (never the repo default branch), and merge your PR into it when your evidence is complete — one unified PR to the default branch is opened by the orchestrator at run completion.",
+  "referenceInputs": {
+    "expectedOutcomes": [
+      "Identifies the off-by-one in the slice upper bound in pagination.ts as the root cause, matching the contract in design-excerpt.md",
+      "Adds a regression test covering an exact page-boundary item count that fails on the old code",
+      "Delegates the edit to claude_code, branches from the shared integration branch feature/BATT-100-epic, and targets the PR at it — not at main",
+      "Reports completion via WorkflowOutput___report_completion with the feature branch name"
+    ],
+    "expectedToolTrajectory": [
+      { "tool": "claude_code", "optional": false },
+      { "tool": "WorkflowOutput___report_completion", "optional": false }
+    ],
+    "forbiddenTools": ["bash", "terminal", "Tickets___transition_ticket"]
+  },
+  "evaluators": [
+    "Builtin.ToolSelectionAccuracy",
+    "Builtin.InstructionFollowing",
+    "Builtin.GoalSuccessRate",
+    "Builtin.Correctness",
+    "Builtin.Coherence"
+  ],
+  "modelTier": "haiku",
+  "timeoutSeconds": 300,
+  "status": "active",
+  "provenance": {
+    "source": "synthetic",
+    "mintedBy": "battery-seed-curation",
+    "mintedOn": "2026-08-27"
+  },
+  "input": {
+    "files": [
+      "fixtures/fix-pagination-offbyone-002/bug-report.md",
+      "fixtures/fix-pagination-offbyone-002/pagination.ts",
+      "fixtures/fix-pagination-offbyone-002/design-excerpt.md"
+    ]
+  },
+  "tags": ["fix-regression-test", "branch-discipline"]
+}

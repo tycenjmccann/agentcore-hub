@@ -1,0 +1,13 @@
+{
+  "ticketId": "BATT-110",
+  "title": "QA verification: archive-workflow feature branch",
+  "issueType": "Task",
+  "assignee": "agentcore_hub_qa_verifier",
+  "blockedBy": ["BATT-104"],
+  "acceptanceCriteria": [
+    "Archiving a workflow with zero completed tickets succeeds without a crash",
+    "Archiving a workflow whose artifact move fails surfaces the failure to the user instead of reporting success",
+    "A regression test covers the zero-completed-tickets path and fails on the pre-fix code",
+    "TypeScript compilation and the unit suite pass on the feature branch"
+  ]
+}

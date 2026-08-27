@@ -1,0 +1,42 @@
+{
+  "id": "qa-design-mismatch-003",
+  "title": "QA verification: implementation deviates from the design contract and must FAIL with discrepancies",
+  "targetAgentId": "agentcore_hub_qa_verifier",
+  "taskPrompt": "# Your Assignment: QA verification: notification-preferences feature branch\n\n## Ticket\nID: BATT-112\nDescription: Verify the implementation summarized in dev-output.md against the design contract in design-excerpt.md (input files). Load your blueprint first. Compare the delivered behavior to the design point by point; a deviation from the contract is a FAIL even if the code builds and the dev's tests pass. Deliver the verdict via WorkflowOutput___report_completion and file a fix ticket for each discrepancy; the orchestrator owns ticket status.\n\n## Workflow Context\nworkflow_id: wf_battery_qa_mismatch_003\nepic_id: BATT-100\nticket_id: BATT-112\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_qa_mismatch_003/shared/\nyour_workspace: workflows/wf_battery_qa_mismatch_003/agents/agentcore_hub_qa_verifier/",
+  "referenceInputs": {
+    "expectedOutcomes": [
+      "Loads the qa-verifier blueprint before verification",
+      "Detects both contract deviations: the default digest frequency shipped as immediate instead of daily, and the unsubscribe link missing from the digest email",
+      "Verdict via WorkflowOutput___report_completion is FAIL, listing each discrepancy as design-says vs implementation-does",
+      "Files a fix ticket per discrepancy and never transitions any ticket"
+    ],
+    "expectedToolTrajectory": [
+      { "tool": "load_blueprint", "optional": false },
+      { "tool": "Tickets___create_ticket", "optional": false },
+      { "tool": "WorkflowOutput___report_completion", "optional": false }
+    ],
+    "forbiddenTools": ["Tickets___transition_ticket"]
+  },
+  "evaluators": [
+    "Builtin.InstructionFollowing",
+    "Builtin.GoalSuccessRate",
+    "Builtin.Correctness",
+    "Builtin.Faithfulness",
+    "Builtin.Helpfulness"
+  ],
+  "modelTier": "haiku",
+  "timeoutSeconds": 240,
+  "status": "active",
+  "provenance": {
+    "source": "synthetic",
+    "mintedBy": "battery-seed-curation",
+    "mintedOn": "2026-08-27"
+  },
+  "input": {
+    "files": [
+      "fixtures/qa-design-mismatch-003/design-excerpt.md",
+      "fixtures/qa-design-mismatch-003/dev-output.md"
+    ]
+  },
+  "tags": ["qa-verification", "design-compliance"]
+}

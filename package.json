@@ -10,6 +10,7 @@
     "start": "next start",
     "lint": "next lint",
     "test:unit": "vitest run",
+    "battery:lint": "node evals/battery/lint-fixtures.mjs",
     "test:cloud-code": "playwright test tests/cloud-code-ui.spec.ts",
     "test": "npx playwright test tests/tab-*.spec.ts tests/e2e-api-routes.spec.ts",
     "test:full": "./tests/run-all.sh --full"

@@ -1,0 +1,34 @@
+{
+  "id": "triage-flaky-upload-002",
+  "title": "Bug triage: intermittent upload failure distilled into structured requirements and acceptance criteria",
+  "targetAgentId": "agentcore_hub_requirements_analyst",
+  "taskPrompt": "# Your Assignment: Triage: file uploads intermittently fail with an empty error toast\n\n## Ticket\nID: BATT-102\nDescription: Bug intake for the intermittent upload failure in the attached bug report. Extract structured requirements and acceptance criteria, then plan the bug-fix tickets.\n\n## Workflow Context\nworkflow_id: wf_battery_triage_flaky_upload_002\nepic_id: BATT-100\nticket_id: BATT-102\n\n## Available Agents\n  - \"agentcore_hub_bug_fixer\" (development)\n  - \"agentcore_hub_code_reviewer\" (review)\n  - \"agentcore_hub_qa_verifier\" (verification)\n  - \"agentcore_hub_ci_agent\" (review)\n\n## Workflow Type\nbug-fix (workflow root BATT-100 is a Jira Bug)\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_triage_flaky_upload_002/shared/\nyour_workspace: workflows/wf_battery_triage_flaky_upload_002/agents/agentcore_hub_requirements_analyst/\n\n## Request\nTitle: File uploads intermittently fail with an empty error toast\nDescription: See bug-report.md in your input files. The report is vague about frequency and environment — extract every concrete fact into requirements, define acceptance criteria that pin down the reproduction, and plan the fix pipeline.",
+  "referenceInputs": {
+    "expectedOutcomes": [
+      "Extracts the concrete facts from the report (payload size boundary, retry behavior, empty toast) into structured requirements rather than restating the prose",
+      "Acceptance criteria include a deterministic reproduction (upload just above the size boundary) and a user-visible error message requirement",
+      "Fix ticket is assigned to agentcore_hub_bug_fixer and downstream review/QA/CI tickets are chained with blocked_by",
+      "Does not transition its own ticket BATT-102 and does not invent facts that are not in the report"
+    ],
+    "forbiddenTools": ["Tickets___transition_ticket"]
+  },
+  "evaluators": [
+    "Builtin.InstructionFollowing",
+    "Builtin.GoalSuccessRate",
+    "Builtin.Correctness",
+    "Builtin.Faithfulness",
+    "Builtin.Coherence"
+  ],
+  "modelTier": "haiku",
+  "timeoutSeconds": 180,
+  "status": "active",
+  "provenance": {
+    "source": "synthetic",
+    "mintedBy": "battery-seed-curation",
+    "mintedOn": "2026-08-27"
+  },
+  "input": {
+    "files": ["fixtures/triage-flaky-upload-002/bug-report.md"]
+  },
+  "tags": ["bug-triage", "requirements-extraction"]
+}
