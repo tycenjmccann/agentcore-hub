@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentcore-hub/evals/battery/schema/case.schema.json",
+  "title": "Config-evals battery case",
+  "description": "One battery case: a task prompt run against a target agent from src/config/agents.json, scored by AgentCore evaluators. targetAgentId existence in src/config/agents.json is a cross-file check done by the runner preflight, not by this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "title",
+    "targetAgentId",
+    "taskPrompt",
+    "referenceInputs",
+    "evaluators",
+    "modelTier",
+    "timeoutSeconds",
+    "status",
+    "provenance"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{2,63}$",
+      "description": "Stable case id; also the fixtures/<id>/ directory name."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "targetAgentId": {
+      "type": "string",
+      "pattern": "^agentcore_hub_[a-z0-9_]+$",
+      "description": "Must be an agentId present in src/config/agents.json (runner preflight cross-checks)."
+    },
+    "taskPrompt": {
+      "type": "string",
+      "minLength": 20
+    },
+    "referenceInputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedOutcomes"],
+      "properties": {
+        "expectedOutcomes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "expectedToolTrajectory": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["tool"],
+            "properties": {
+              "tool": { "type": "string" },
+              "argsSubset": {
+                "type": "object",
+                "description": "Subset of the tool call's arguments that must match."
+              },
+              "optional": { "type": "boolean" }
+            }
+          }
+        },
+        "forbiddenTools": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "evaluators": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "uniqueItems": true,
+      "description": "Max 10 is the hard API limit per deploy/evaluations/setup-evaluations.sh. Builtin.* names exactly as in setup-evaluations.sh, or the on-demand custom evaluator id.",
+      "items": {
+        "enum": [
+          "Builtin.ToolSelectionAccuracy",
+          "Builtin.ToolParameterAccuracy",
+          "Builtin.InstructionFollowing",
+          "Builtin.GoalSuccessRate",
+          "Builtin.Correctness",
+          "Builtin.Coherence",
+          "Builtin.Faithfulness",
+          "Builtin.Helpfulness",
+          "Builtin.ResponseRelevance",
+          "Builtin.Conciseness",
+          "dependency_chain_compliance-VyBv7H2bCi"
+        ]
+      }
+    },
+    "modelTier": {
+      "enum": ["haiku", "sonnet", "opus"],
+      "default": "haiku",
+      "description": "Tier resolved via CODING_MODEL_TIERS in deploy/runtime-agent/main.py. opus requires provenance.tierJustification."
+    },
+    "timeoutSeconds": {
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 300,
+      "default": 180
+    },
+    "status": {
+      "enum": ["active", "retired"]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source"],
+      "properties": {
+        "source": { "enum": ["incident", "workflow-run", "synthetic"] },
+        "incident": { "type": "string" },
+        "workflowRunId": { "type": "string" },
+        "mintedBy": { "type": "string" },
+        "mintedOn": { "type": "string" },
+        "tierJustification": { "type": "string" }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional canned inputs; all paths live under fixtures/<id>/.",
+      "properties": {
+        "transcript": { "type": "string" },
+        "files": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "repoFixture": { "type": "string" },
+        "blueprints": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "evaluator_floors": {
+      "type": "object",
+      "description": "Per-evaluator absolute floor overrides on the 0-100 scale; override the derived floors in thresholds.json.",
+      "additionalProperties": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 100
+      }
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "retirement_reason": {
+      "type": "string",
+      "minLength": 20
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "retired" } },
+        "required": ["status"]
+      },
+      "then": {
+        "required": ["retirement_reason"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "modelTier": { "const": "opus" } },
+        "required": ["modelTier"]
+      },
+      "then": {
+        "properties": {
+          "provenance": { "type": "object", "required": ["tierJustification"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "provenance": {
+            "type": "object",
+            "properties": { "source": { "const": "incident" } },
+            "required": ["source"]
+          }
+        },
+        "required": ["provenance"]
+      },
+      "then": {
+        "properties": {
+          "provenance": { "type": "object", "required": ["incident"] }
+        }
+      }
+    }
+  ]
+}

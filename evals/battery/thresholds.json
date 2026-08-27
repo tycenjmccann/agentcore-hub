@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "scale": "0-100",
+  "scoreNormalization": "evaluator native 0.0–1.0 scores ×100 at ingestion (see deploy/evaluations/dependency_chain_evaluator.json ratingScale)",
+  "overallDropMaxPoints": 5,
+  "overallDropComparison": "fail when (baseline overall mean − current overall mean) > 5.0 strictly — exactly 5.00 passes",
+  "floorRule": {
+    "derivation": "per-case per-evaluator floor = baseline mean − floorDelta, clamped to minAbsoluteFloor; case-file evaluator_floors override",
+    "floorDelta": 10,
+    "minAbsoluteFloor": 40
+  },
+  "erroredCaseIsFailure": true,
+  "timedOutCaseIsFailure": true,
+  "skippedCaseIsFailure": true,
+  "maxRunUsd": 20.0,
+  "maxActiveEvaluatorsPerCase": 10
+}

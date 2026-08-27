@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "minActiveCases": 10,
+  "activeCases": [],
+  "notes": "activeCases must list every cases/*.json with status=active; runner preflight cross-checks and fails on drift"
+}
