@@ -369,3 +369,97 @@ describe("belt loop (A3)", () => {
     expect(r.latch).toBe("unset");
   });
 });
+
+describe("credentialed origin URLs (TEAM-3351)", () => {
+  const FAKE_TOKEN = "FAKETOKEN123";
+
+  /** Invoke a pure helper from the sourced script directly. */
+  function callFn(fn: string, arg: string) {
+    const res = spawnSync(
+      "bash",
+      ["-c", `source '${SCRIPT}'; ${fn} '${arg}'`],
+      { encoding: "utf8", env: { ...process.env, ...gitEnv } },
+    );
+    return { status: res.status, out: (res.stdout ?? "").trim() };
+  }
+
+  describe("eval_gate_owner_repo", () => {
+    it.each([
+      [`https://x-access-token:${FAKE_TOKEN}@github.com/acme/widgets.git`],
+      ["git@github.com:acme/widgets.git"],
+      ["ssh://git@github.com/acme/widgets"],
+      ["https://github.com/acme/widgets.git"],
+      ["https://github.com/acme/widgets"],
+      ["https://user@github.com/acme/widgets"],
+    ])("parses %s → acme/widgets", (url) => {
+      const r = callFn("eval_gate_owner_repo", url);
+      expect(r.status).toBe(0);
+      expect(r.out).toBe("acme/widgets");
+    });
+
+    it.each([
+      [`https://user:${FAKE_TOKEN}@example.com/foo`],
+      ["https://gitlab.com/acme/widgets.git"],
+      ["not a url"],
+    ])("still fails closed on unrecognizable URL %s", (url) => {
+      const r = callFn("eval_gate_owner_repo", url);
+      expect(r.status).toBe(1);
+      expect(r.out).toBe("");
+    });
+  });
+
+  describe("eval_gate_redact_url", () => {
+    it("redacts user:password userinfo", () => {
+      const r = callFn(
+        "eval_gate_redact_url",
+        `https://x-access-token:${FAKE_TOKEN}@github.com/o/r.git`,
+      );
+      expect(r.out).toBe("https://***@github.com/o/r.git");
+    });
+
+    it("redacts a password-less user@ userinfo", () => {
+      const r = callFn("eval_gate_redact_url", "https://user@github.com/o/r");
+      expect(r.out).toBe("https://***@github.com/o/r");
+    });
+
+    it("redacts scp-like user:pass@host:path forms", () => {
+      const r = callFn(
+        "eval_gate_redact_url",
+        `user:${FAKE_TOKEN}@github.com:o/r`,
+      );
+      expect(r.out).toContain("***@github.com");
+      expect(r.out).not.toContain(FAKE_TOKEN);
+    });
+
+    it("passes a URL without userinfo through unchanged", () => {
+      const r = callFn("eval_gate_redact_url", "https://github.com/o/r.git");
+      expect(r.out).toBe("https://github.com/o/r.git");
+    });
+  });
+
+  it("proceeds on a credentialed github.com origin with a green HEAD check — and never prints the token", () => {
+    const repo = makeRepo(
+      "cred-origin",
+      `git remote set-url origin 'https://x-access-token:${FAKE_TOKEN}@github.com/acme/widgets.git'
+       echo b > ungated.txt && git add . && git commit -qm c1`,
+    );
+    const head = sha(repo);
+    const r = runGate(repo, { [`CHECK_${head.slice(0, 7)}`]: "green" });
+    expect(r.status).toBe(0);
+    expect(r.out).toContain("is green on HEAD");
+    expect(r.out).not.toContain(FAKE_TOKEN);
+  });
+
+  it("refuses a credentialed but unparseable origin with a REDACTED url in the diagnostic", () => {
+    const repo = makeRepo(
+      "cred-unparseable",
+      `git remote set-url origin 'https://user:${FAKE_TOKEN}@example.com/foo'
+       echo b > ungated.txt && git add . && git commit -qm c1`,
+    );
+    const r = runGate(repo);
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("cannot derive owner/repo");
+    expect(r.out).not.toContain(FAKE_TOKEN);
+    expect(r.out).toContain("***@");
+  });
+});

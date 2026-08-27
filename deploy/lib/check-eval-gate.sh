@@ -80,20 +80,70 @@ eval_gate_path_matches() {
 }
 
 # Pure helper: derive "owner/repo" from an origin remote URL (https / ssh /
-# scp-like). Prints it on stdout; returns 1 if the URL is not recognizable.
+# scp-like), including credentialed forms carrying a user[:password]@ userinfo
+# component (common in CI via insteadOf rewrites). Prints it on stdout;
+# returns 1 if the URL is not recognizable.
 eval_gate_owner_repo() {
-  local _egor="$1"
+  local _egor="$1" _egor_auth
   _egor="${_egor%.git}"
   _egor="${_egor%/}"
-  _egor="${_egor#git@github.com:}"
-  _egor="${_egor#ssh://git@github.com/}"
-  _egor="${_egor#https://github.com/}"
-  _egor="${_egor#http://github.com/}"
+  case "$_egor" in
+    git@github.com:*)
+      # scp-like — handled FIRST so the generic userinfo strip below can't
+      # mangle the "git@github.com:" prefix.
+      _egor="${_egor#git@github.com:}"
+      ;;
+    ssh://* | https://* | http://*)
+      _egor="${_egor#*://}"
+      # Drop a user[:password]@ userinfo component ahead of the host, if any
+      # (split the authority on its LAST '@' so a literal '@' in the password
+      # can't leave credentials behind).
+      case "$_egor" in
+        */*)
+          _egor_auth="${_egor%%/*}"
+          case "$_egor_auth" in
+            *@*) _egor="${_egor_auth##*@}/${_egor#*/}" ;;
+          esac
+          ;;
+      esac
+      case "$_egor" in
+        github.com/*) _egor="${_egor#github.com/}" ;;
+        *) return 1 ;;
+      esac
+      ;;
+  esac
   case "$_egor" in
     */*/* | "" | */ | /*) return 1 ;;
     */*) printf '%s\n' "$_egor"; return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# Pure helper: redact any user[:password]@ userinfo in a remote URL so it can
+# be printed in diagnostics without leaking an embedded credential. The whole
+# userinfo — username AND password/token — becomes '***'; URLs without
+# userinfo pass through unchanged.
+eval_gate_redact_url() {
+  local _egru="$1" _egru_scheme="" _egru_head _egru_tail=""
+  case "$_egru" in
+    *://*)
+      _egru_scheme="${_egru%%://*}://"
+      _egru="${_egru#*://}"
+      ;;
+  esac
+  # Userinfo lives in the authority — everything before the first '/'. This
+  # also covers scp-like host:path forms, whose '@' precedes any slash.
+  case "$_egru" in
+    */*)
+      _egru_head="${_egru%%/*}"
+      _egru_tail="/${_egru#*/}"
+      ;;
+    *) _egru_head="$_egru" ;;
+  esac
+  case "$_egru_head" in
+    *@*) _egru_head="***@${_egru_head##*@}" ;;
+  esac
+  printf '%s\n' "${_egru_scheme}${_egru_head}${_egru_tail}"
 }
 
 # stdin: newline-separated repo-relative paths; args: gated globs.
@@ -354,7 +404,7 @@ require_eval_gate() {
   local origin_url owner_repo
   origin_url="$(git -C "$repo_root" remote get-url origin 2>/dev/null || true)"
   if [ -z "$origin_url" ] || ! owner_repo="$(eval_gate_owner_repo "$origin_url")"; then
-    _eval_gate_refuse "cannot derive owner/repo from the 'origin' remote (url: '${origin_url:-<none>}')" \
+    _eval_gate_refuse "cannot derive owner/repo from the 'origin' remote (url: '$(eval_gate_redact_url "${origin_url:-<none>}")')" \
       "  The guard needs a github.com origin remote to look up check runs."
     export EVAL_GATE_CHECKED="$head_sha"
     return 0
