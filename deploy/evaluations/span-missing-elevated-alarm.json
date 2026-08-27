@@ -1,0 +1,28 @@
+{
+  "AlarmName": "agentcore-hub-eval-span-missing-elevated",
+  "AlarmDescription": "Ticket severity (not a pager): more than 5% of eval sessions over 6-hour windows have no invoke_agent span — a slow telemetry regression well below the 50% agentcore-hub-eval-span-missing-ratio pager. File a ticket against runtime telemetry (Strands/ADOT tracer wiring), not agent quality. Fires on 3 of 4 six-hour datapoints. INSUFFICIENT_DATA when no eval sessions arrive.",
+  "ActionsEnabled": true,
+  "EvaluationPeriods": 4,
+  "DatapointsToAlarm": 3,
+  "Threshold": 0.05,
+  "ComparisonOperator": "GreaterThanThreshold",
+  "TreatMissingData": "missing",
+  "Metrics": [
+    {
+      "Id": "missing",
+      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsSpanMissing\"', 'Sum', 21600))",
+      "ReturnData": false
+    },
+    {
+      "Id": "total",
+      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 21600))",
+      "ReturnData": false
+    },
+    {
+      "Id": "ratio",
+      "Expression": "missing / total",
+      "Label": "span_missing ratio (fleet, 6h)",
+      "ReturnData": true
+    }
+  ]
+}
