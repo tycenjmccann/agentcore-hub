@@ -83,6 +83,39 @@ class TestTelemetryInit(unittest.TestCase):
         strands_cls.assert_called_once()
         strands_cls.return_value.setup_otlp_exporter.assert_called_once()
 
+    def test_init_failure_swallowed(self):
+        # TEAM-3313: telemetry init failure must never abort module import
+        # (which would kill the agent before app = BedrockAgentCoreApp()).
+        def _raise():
+            raise RuntimeError("otel exploded")
+
+        fake = _fake_modules(object(), mock.Mock())
+        fake["opentelemetry"].trace = types.SimpleNamespace(
+            get_tracer_provider=_raise
+        )
+        logger = mock.Mock()
+        ns = {"logger": logger}
+        with mock.patch.dict(sys.modules, fake):
+            exec(compile(_extract_block(), str(_MAIN), "exec"), ns)
+        logger.warning.assert_called_once()
+        self.assertTrue(ns["_TELEMETRY_INITIALIZED"])
+
+    def test_init_failure_not_retried(self):
+        # After a failed attempt, repeat calls stay no-ops — retrying against
+        # partially-mutated global OTel state is worse than no telemetry.
+        strands_cls = mock.Mock()
+        strands_cls.return_value.setup_otlp_exporter.side_effect = RuntimeError(
+            "otlp endpoint down"
+        )
+        logger = mock.Mock()
+        ns = {"logger": logger}
+        with mock.patch.dict(sys.modules, _fake_modules(object(), strands_cls)):
+            exec(compile(_extract_block(), str(_MAIN), "exec"), ns)
+            ns["_init_telemetry"]()
+        strands_cls.assert_called_once()
+        logger.warning.assert_called_once()
+        self.assertTrue(ns["_TELEMETRY_INITIALIZED"])
+
     def test_idempotent_on_adot_path(self):
         provider = types.SimpleNamespace(add_span_processor=lambda p: None)
         strands_cls = mock.Mock()
