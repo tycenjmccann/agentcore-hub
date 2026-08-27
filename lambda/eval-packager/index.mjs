@@ -165,8 +165,11 @@ export const handler = async (event) => {
       );
       return { statusCode: 200, body: 'cooldown' };
     }
-    // 7. Batch is full → flush to S3 + synthesize PRD
-    await flushBuffer(agentId, appended.buffer, batchSize);
+    // 7. Batch is full → flush to S3 + synthesize PRD. Pass the lastFlushedAt we
+    //    read at invocation start: flushBuffer claims the batch with a
+    //    conditional write on it, so of N concurrent invocations that all see
+    //    shouldFlush=true, exactly ONE synthesizes a PRD (one workflow, not N).
+    await flushBuffer(agentId, config.lastFlushedAt, batchSize);
   }
 
   return { statusCode: 200, body: 'ok' };
@@ -423,32 +426,55 @@ async function aggregateScoresToDdb(agentId, parsed) {
  * PRD + duplicate workflow. Resetting first keeps the duplicate window at one
  * DDB write (~100ms).
  */
-async function flushBuffer(agentId, buffer, batchSize) {
+async function flushBuffer(agentId, expectedLastFlushedAt, batchSize) {
   const timestamp = new Date().toISOString();
 
+  // 1. Claim the batch with a CONDITIONAL reset: only the invocation whose
+  //    lastFlushedAt still matches what it read wins. ReturnValues:ALL_OLD hands
+  //    the winner the exact buffer it's claiming, so we flush THAT (not the
+  //    caller's stale in-memory copy — which under concurrency is a partial or
+  //    duplicate view). Losers get ConditionalCheckFailed and bail: no second
+  //    PRD, no second workflow, and the whole backlog lands in ONE batch.
+  let claimed;
+  try {
+    claimed = await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { agentId },
+        UpdateExpression:
+          'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts REMOVE bufferSessions',
+        ConditionExpression: expectedLastFlushedAt
+          ? 'lastFlushedAt = :expected'
+          : 'attribute_not_exists(lastFlushedAt)',
+        ExpressionAttributeValues: {
+          ':empty': [],
+          ':ts': timestamp,
+          ...(expectedLastFlushedAt ? { ':expected': expectedLastFlushedAt } : {}),
+        },
+        ReturnValues: 'ALL_OLD',
+      })
+    );
+  } catch (err) {
+    if (err.name === 'ConditionalCheckFailedException') {
+      console.log(
+        `[eval-packager] Agent ${agentId}: flush already claimed by a concurrent ` +
+          `invocation — skipping (no duplicate PRD/workflow).`
+      );
+      return;
+    }
+    throw err;
+  }
+
+  const buffer = claimed.Attributes?.sessionBuffer || [];
   const batchPayload = {
     agentId,
     batchSize,
     flushedAt: timestamp,
     sessions: buffer,
   };
-
-  // 1. Reset sessionBuffer AND the distinct-run set in DDB FIRST — claim the
-  //    batch so concurrent invocations append into a fresh buffer instead of
-  //    re-flushing this one.
-  await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE,
-      Key: { agentId },
-      UpdateExpression:
-        'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts REMOVE bufferSessions',
-      ExpressionAttributeValues: {
-        ':empty': [],
-        ':ts': timestamp,
-      },
-    })
+  console.log(
+    `[eval-packager] Agent ${agentId}: batch claimed for flush (${buffer.length} buffer entries).`
   );
-  console.log(`[eval-packager] Agent ${agentId}: buffer + run set reset (batch claimed for flush).`);
 
   // 2. Archive the raw batch (batches/ prefix — does NOT trigger prd-submitter)
   const batchKey = `${BATCH_PREFIX}/batch-${agentId}-${timestamp}.json`;
@@ -536,24 +562,31 @@ async function synthesizeAndWritePrd(agentId, batchPayload, timestamp) {
 
 /**
  * Read the improver's JSON PRD into a PR-ready { title, description }.
- * The improver is instructed to return a single JSON object {title, description}.
- * We tolerate a leading/trailing code fence or stray prose by extracting the
- * outermost {...} before parsing. Title/description fall back to safe defaults
- * so a malformed response degrades gracefully instead of wedging the flush.
+ * The improver is instructed to return a single JSON object {title, description},
+ * but models often prepend a thinking preamble ("Now I have a clear picture. Let
+ * me produce the PRD:") and then emit the PRD as raw markdown instead of JSON.
+ * If we naively fell back to raw.trim(), that leaked preamble became the work
+ * order and the downstream agent had no clean directive. So: try JSON first,
+ * then treat the response as markdown — strip everything before the first real
+ * PRD heading and derive the title from it.
  */
-function extractPrd(raw, agentId) {
+export function extractPrd(raw, agentId) {
   let parsed = null;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    // Strip a ```json fence or surrounding prose, then take the outermost object.
+    // A valid {title, description} object must have BOTH keys — otherwise a `{`
+    // inside a markdown code block would hijack the parse. Require both.
     const start = raw.indexOf('{');
     const end = raw.lastIndexOf('}');
     if (start !== -1 && end > start) {
       try {
-        parsed = JSON.parse(raw.slice(start, end + 1));
+        const cand = JSON.parse(raw.slice(start, end + 1));
+        if (cand && typeof cand.title === 'string' && typeof cand.description === 'string') {
+          parsed = cand;
+        }
       } catch {
-        /* fall through to defaults */
+        /* fall through to markdown handling */
       }
     }
   }
@@ -561,14 +594,41 @@ function extractPrd(raw, agentId) {
   let title = (parsed?.title || '').toString().trim();
   let description = (parsed?.description || '').toString().trim();
 
-  // Graceful degradation: never drop the batch just because the model drifted
-  // from the JSON contract. Use the raw text as the body, derive a generic title.
-  if (!description) description = raw.trim();
+  // Markdown fallback: the model returned prose+markdown, not the JSON contract.
+  // Strip the leading preamble (any text before the first `#`/`##`/`**` heading)
+  // so the PRD starts at its real first section, and lift the title from the
+  // first heading rather than shipping a generic boilerplate one.
+  if (!description) {
+    description = stripPreamble(raw);
+    if (!title) title = titleFromMarkdown(description, agentId);
+  }
   if (!title) title = `Improve ${agentId} based on evaluation findings`;
 
-  title = title.replace(/`/g, '').replace(/\*\*/g, '').slice(0, 120).trim();
+  title = title.replace(/[`#*]/g, '').replace(/^\s*PRD[:\-\s]*/i, '').slice(0, 120).trim();
+  if (!title) title = `Improve ${agentId} based on evaluation findings`;
 
   return { title, description };
+}
+
+// Drop conversational lead-in before the first markdown heading. Preserves the
+// PRD body untouched once a real `# `/`## `/`### ` heading is found; if none
+// exists, returns the trimmed raw so we never lose the batch.
+function stripPreamble(raw) {
+  const text = raw.trim();
+  const m = text.match(/^[ \t]{0,3}#{1,6}[ \t]+\S/m);
+  if (m && m.index !== undefined) return text.slice(m.index).trim();
+  return text;
+}
+
+// Best-effort title from the first markdown heading, stripped of decoration and
+// generic "Improvement PRD" boilerplate so the workflow gets a real summary.
+function titleFromMarkdown(md, agentId) {
+  const line = (md.match(/^[ \t]{0,3}#{1,6}[ \t]+(.+)$/m)?.[1] || '').trim();
+  const cleaned = line
+    .replace(/[`*]/g, '')
+    .replace(/^(improvement\s+)?prd[:\-\s—]*/i, '')
+    .trim();
+  return cleaned || `Improve ${agentId} based on evaluation findings`;
 }
 
 /**
@@ -582,10 +642,22 @@ async function invokeImprover(runtimeArn, prompt, agentId) {
   const { Sha256 } = await import('@aws-crypto/sha256-js');
   const { defaultProvider } = await import('@aws-sdk/credential-provider-node');
 
+  // agent_id selects which prompt the shared runtime loads (prompts/<id>.txt).
+  // It MUST be the improver's own id, not the agent under analysis — passing the
+  // analyzed agent's id made the runtime load THAT persona's prompt (a generic
+  // dev persona with no JSON contract), so the improver dumped raw markdown +
+  // thinking preamble instead of {title, description}. The runtime ARN already
+  // pins the fleet_improver runtime; agent_id must match its baked prompt key.
+  // The analyzed agent travels in the prompt/batch payload, not as agent_id.
+  const IMPROVER_AGENT_ID = process.env.IMPROVER_AGENT_ID || 'agentcore_hub_fleet_improver';
+
   const payload = JSON.stringify({
     prompt,
     workflow_id: 'self-improvement',
-    agent_id: agentId,
+    agent_id: IMPROVER_AGENT_ID,
+    // Keep the analyzed agent visible to the runtime for logging/journey without
+    // hijacking prompt selection.
+    analyzed_agent_id: agentId,
   });
 
   const runtimeId = runtimeArn.split('/').pop();

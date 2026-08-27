@@ -47,7 +47,14 @@ Analyze ALL sessions in the batch holistically. Whether you receive 1 session or
 
 Your output is consumed by an automated pipeline that turns it into a pull
 request. **Output a single JSON object and nothing else** — no prose before or
-after, no markdown code fences. The object has exactly two fields:
+after, no markdown code fences.
+
+CRITICAL: The FIRST character you emit must be `{`. Do NOT narrate your
+reasoning first ("Now I have a clear picture...", "Let me produce the PRD:").
+Do all analysis silently, then emit only the JSON. Any text before the `{`
+leaks into the work order and corrupts the downstream agent's instructions.
+
+The object has exactly two fields:
 
 ```json
 {

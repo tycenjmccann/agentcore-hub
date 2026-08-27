@@ -10,7 +10,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
-const { classifySessions, emitEvalMetrics, extractSessionData } = await import('./index.mjs');
+const { classifySessions, emitEvalMetrics, extractSessionData, extractPrd } = await import('./index.mjs');
 
 // Minimal evaluatorResults row as extractSessionData produces it.
 const row = (sessionId, score, extra = {}) => ({
@@ -176,4 +176,43 @@ test('emitEvalMetrics carries non-zero spanMissing through', () => {
   const record = JSON.parse(logs[0]);
   assert.equal(record.EvalSessionsTotal, 7);
   assert.equal(record.EvalSessionsSpanMissing, 3);
+});
+
+// ─── extractPrd: JSON contract + markdown/preamble fallbacks ────────────────
+
+test('extractPrd parses the clean JSON contract', () => {
+  const raw = JSON.stringify({
+    title: 'fix(agentcore_hub_backend_dev): stop loading code-simplifier skill',
+    description: '## Summary\n\nThings happened.',
+  });
+  const { title, description } = extractPrd(raw, 'agentcore_hub_backend_dev');
+  assert.equal(title, 'fix(agentcore_hub_backend_dev): stop loading code-simplifier skill');
+  assert.equal(description, '## Summary\n\nThings happened.');
+});
+
+test('extractPrd strips a leaked thinking preamble before the first heading', () => {
+  const raw =
+    'Now I have a clear picture. Let me produce the improvement PRD:---\n\n' +
+    '## Improvement PRD: Agent Evaluation Reliability\n\n' +
+    'The evaluation pipeline is broken.';
+  const { title, description } = extractPrd(raw, 'agentcore_hub_agent');
+  // Preamble must be gone — description starts at the real heading.
+  assert.ok(description.startsWith('## Improvement PRD'), description.slice(0, 40));
+  assert.ok(!/Now I have a clear picture/.test(description));
+  // Title lifted from the heading, boilerplate "Improvement PRD:" stripped.
+  assert.equal(title, 'Agent Evaluation Reliability');
+});
+
+test('extractPrd ignores a bare {} inside markdown (needs both title+description)', () => {
+  const raw = '## Fix\n\nSet config `{ "retries": 3 }` on the client.';
+  const { title, description } = extractPrd(raw, 'agentcore_hub_ci_agent');
+  assert.equal(description, raw); // no heading-preamble to strip → whole body kept
+  assert.equal(title, 'Fix');
+});
+
+test('extractPrd falls back to a generic title when there is no heading', () => {
+  const raw = 'just some prose with no structure at all';
+  const { title, description } = extractPrd(raw, 'agentcore_hub_qa_verifier');
+  assert.equal(description, raw);
+  assert.equal(title, 'Improve agentcore_hub_qa_verifier based on evaluation findings');
 });
