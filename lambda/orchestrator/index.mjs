@@ -429,21 +429,48 @@ export function reviewAckIndices(workflow, ticketId) {
  * Acknowledge all open review_needed notifications for a resolved gate ticket.
  * SCOPED per-index write on workflow.humanNotifications — never a full-row put
  * (see the race warning at markTaskComplete / handleTicketDoneUnified).
+ *
+ * Indices are NOT stable: the complete route's compactNotifications
+ * (src/app/api/workflow/[id]/complete/route.ts) rewrites the whole list and can
+ * shift review_needed entries to smaller indices. Every targeted index is
+ * therefore identity-guarded with a ConditionExpression (ticketId + type) —
+ * a stale or out-of-range index fails the condition instead of acking the
+ * wrong entry (or silently APPENDING, which is what SET list[oob] does).
+ * On ConditionalCheckFailedException we re-read the row (consistent),
+ * recompute indices, and retry the guarded write once. Compaction only
+ * removes/reorders manager_escalation entries — review_needed entries are
+ * always kept — so the re-read always finds the target (or finds it already
+ * acknowledged, which is a no-op success).
+ *
  * Mutates the in-memory snapshot too, so a later full save in the same cascade
  * (e.g. completeWorkflow's saveWorkflow) can't resurrect acknowledged:false.
  * Never throws — ack failure must not break the done/reject cascade.
  */
 export async function ackReviewNotifications(workflow, ticketId) {
   try {
-    const indices = reviewAckIndices(workflow, ticketId);
+    let indices = reviewAckIndices(workflow, ticketId);
     if (indices.length === 0) return; // silent no-op — NO DynamoDB call
-    const setClauses = indices.map((i) => `humanNotifications[${i}].acknowledged = :true`);
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId: workflow.id },
-      UpdateExpression: `SET ${setClauses.join(", ")}`,
-      ExpressionAttributeValues: { ":true": true },
-    }));
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await ddb.send(new UpdateCommand({
+          TableName: WORKFLOWS_TABLE,
+          Key: { workflowId: workflow.id },
+          UpdateExpression: `SET ${indices.map((i) => `humanNotifications[${i}].acknowledged = :true`).join(", ")}`,
+          ConditionExpression: indices.map((i) => `humanNotifications[${i}].ticketId = :tid AND humanNotifications[${i}].#nt = :rn`).join(" AND "),
+          ExpressionAttributeNames: { "#nt": "type" },
+          ExpressionAttributeValues: { ":true": true, ":tid": ticketId, ":rn": "review_needed" },
+        }));
+        break;
+      } catch (err) {
+        if (err.name !== "ConditionalCheckFailedException" || attempt > 0) throw err;
+        // Stale indices — compactNotifications rewrote the list under us.
+        // Re-read fresh, recompute, retry the guarded write once.
+        const fresh = await getWorkflow(workflow.id);
+        workflow.humanNotifications = fresh?.humanNotifications ?? [];
+        indices = reviewAckIndices(workflow, ticketId);
+        if (indices.length === 0) return; // another writer already acked — no-op success
+      }
+    }
     // Keep the snapshot consistent — completeWorkflow() does a full
     // saveWorkflow(workflow) later in the same cascade and must not
     // write acknowledged:false back.

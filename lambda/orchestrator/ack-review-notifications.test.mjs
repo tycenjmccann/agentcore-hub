@@ -30,7 +30,7 @@ const state = {
   children: new Map(),     // parentId → items (QueryCommand on parentId-index)
   workflows: new Map(),    // workflowId → workflow row
   sent: [],                // every ddb command: { name, input }
-  failMatcher: null,       // (name, input) => true → reject that send
+  failMatcher: null,       // (name, input) => truthy → reject that send; return an Error to throw it verbatim
 };
 
 beforeEach(() => {
@@ -47,8 +47,9 @@ DynamoDBDocumentClient.prototype.send = async function (cmd) {
   const name = cmd.constructor.name;
   const input = cmd.input;
   state.sent.push({ name, input });
-  if (state.failMatcher && state.failMatcher(name, input)) {
-    throw new Error("simulated DynamoDB failure");
+  if (state.failMatcher) {
+    const fail = state.failMatcher(name, input);
+    if (fail) throw fail instanceof Error ? fail : new Error("simulated DynamoDB failure");
   }
   if (name === "GetCommand" && input.TableName === TICKETS_TABLE) {
     return { Item: state.tickets.get(input.Key.ticketId) || undefined };
@@ -188,7 +189,16 @@ test("multi-index ack: one UpdateCommand targeting exactly the matching indices"
     input.UpdateExpression,
     "SET humanNotifications[2].acknowledged = :true, humanNotifications[5].acknowledged = :true"
   );
-  assert.deepEqual(input.ExpressionAttributeValues, { ":true": true });
+  // Identity guard: every targeted index asserts ticketId + type, so a
+  // compaction-shifted (or out-of-range) index fails the condition instead
+  // of acking the wrong entry.
+  assert.equal(
+    input.ConditionExpression,
+    "humanNotifications[2].ticketId = :tid AND humanNotifications[2].#nt = :rn AND " +
+    "humanNotifications[5].ticketId = :tid AND humanNotifications[5].#nt = :rn"
+  );
+  assert.deepEqual(input.ExpressionAttributeNames, { "#nt": "type" });
+  assert.deepEqual(input.ExpressionAttributeValues, { ":true": true, ":tid": "T-1", ":rn": "review_needed" });
   assert.deepEqual(input.Key, { workflowId: "wf_multi" });
   assert.equal(input.TableName, WORKFLOWS_TABLE);
 
@@ -234,6 +244,11 @@ test("selectivity: other types and other tickets are never targeted", async () =
     updates[0].input.UpdateExpression,
     "SET humanNotifications[3].acknowledged = :true"
   );
+  assert.equal(
+    updates[0].input.ConditionExpression,
+    "humanNotifications[3].ticketId = :tid AND humanNotifications[3].#nt = :rn"
+  );
+  assert.deepEqual(updates[0].input.ExpressionAttributeNames, { "#nt": "type" });
   assert.equal(workflow.humanNotifications[0].acknowledged, false);
   assert.equal(workflow.humanNotifications[1].acknowledged, false);
   assert.equal(workflow.humanNotifications[2].acknowledged, false);
@@ -266,6 +281,10 @@ test("approve-ack, unified path: gate done → scoped ack issued, cascade still 
   const updates = ackUpdates();
   assert.equal(updates.length, 1);
   assert.equal(updates[0].input.UpdateExpression, "SET humanNotifications[0].acknowledged = :true");
+  assert.equal(
+    updates[0].input.ConditionExpression,
+    "humanNotifications[0].ticketId = :tid AND humanNotifications[0].#nt = :rn"
+  );
   assert.deepEqual(updates[0].input.Key, { workflowId: "wf_test7" });
   assert.ok(siblingQueries().length >= 1, "sibling query ran after the ack");
 });
@@ -346,4 +365,115 @@ test("ack failure doesn't kill the cascade: sibling query still runs", async () 
 
   assert.equal(ackUpdates().length, 1, "the failing ack attempt was made");
   assert.ok(siblingQueries().length >= 1, "cascade continued past the failed ack");
+});
+
+// ─── 3. Compaction race (complete route's compactNotifications rewrites the ────
+//        list under the done-cascade — indices computed from the in-memory
+//        snapshot go stale; the identity guard + re-read-retry must converge)
+
+function conditionalError() {
+  const err = new Error("The conditional request failed");
+  err.name = "ConditionalCheckFailedException";
+  return err;
+}
+
+/** failMatcher that conditional-fails the first `n` humanNotifications ack writes. */
+function failFirstAcks(n) {
+  let count = 0;
+  return (name, input) => {
+    if (name === "UpdateCommand" && (input.UpdateExpression || "").includes("humanNotifications[")) {
+      count++;
+      if (count <= n) return conditionalError();
+    }
+    return false;
+  };
+}
+
+function workflowReads() {
+  return state.sent.filter(
+    (c) => c.name === "GetCommand" && c.input.TableName === WORKFLOWS_TABLE
+  );
+}
+
+test("compaction race: stale index → conditional failure → re-read, retry converges at shifted index", async () => {
+  const esc = () => notif("T-ESC", { type: "manager_escalation" });
+  // Pre-compaction snapshot: review_needed for T-1 sits at index 4, behind escalations.
+  const workflow = {
+    id: "wf_race_a",
+    humanNotifications: [esc(), esc(), esc(), esc(), notif("T-1")],
+  };
+  // Post-compaction row: compactNotifications moved escalations to the tail
+  // (kept last 3) — the review_needed entry shifted down to index 0.
+  const freshList = [notif("T-1"), esc(), esc(), esc()];
+  state.workflows.set("wf_race_a", { workflowId: "wf_race_a", id: "wf_race_a", humanNotifications: freshList });
+  state.failMatcher = failFirstAcks(1);
+
+  await ackReviewNotifications(workflow, "T-1"); // must not throw
+
+  const updates = ackUpdates();
+  assert.equal(updates.length, 2, "exactly two UpdateCommands: stale attempt + guarded retry");
+  assert.equal(updates[0].input.UpdateExpression, "SET humanNotifications[4].acknowledged = :true");
+  assert.equal(updates[1].input.UpdateExpression, "SET humanNotifications[0].acknowledged = :true");
+  assert.equal(
+    updates[1].input.ConditionExpression,
+    "humanNotifications[0].ticketId = :tid AND humanNotifications[0].#nt = :rn"
+  );
+  assert.deepEqual(updates[1].input.ExpressionAttributeNames, { "#nt": "type" });
+  assert.equal(updates[1].input.ExpressionAttributeValues[":tid"], "T-1");
+  assert.equal(updates[1].input.ExpressionAttributeValues[":rn"], "review_needed");
+  const reads = workflowReads();
+  assert.equal(reads.length, 1, "one fresh re-read between the attempts");
+  assert.equal(reads[0].input.ConsistentRead, true);
+  // In-memory snapshot was swapped to the fresh list and the entry acked there.
+  assert.equal(workflow.humanNotifications, freshList);
+  assert.equal(workflow.humanNotifications[0].type, "review_needed");
+  assert.equal(workflow.humanNotifications[0].acknowledged, true);
+});
+
+test("compaction race: retry finds entry already acked → no second write, no error log", async (t) => {
+  const errSpy = t.mock.method(console, "error", () => {});
+  const workflow = { id: "wf_race_b", humanNotifications: [notif("T-ESC", { type: "manager_escalation" }), notif("T-1")] };
+  state.workflows.set("wf_race_b", {
+    workflowId: "wf_race_b", id: "wf_race_b",
+    humanNotifications: [notif("T-1", { acknowledged: true })],
+  });
+  state.failMatcher = failFirstAcks(1);
+
+  await ackReviewNotifications(workflow, "T-1"); // must not throw
+
+  assert.equal(ackUpdates().length, 1, "no second UpdateCommand — another writer already acked");
+  assert.equal(workflowReads().length, 1, "fresh re-read happened");
+  const failureLogs = errSpy.mock.calls.filter((c) =>
+    String(c.arguments[0]).includes("ackReviewNotifications failed")
+  );
+  assert.equal(failureLogs.length, 0, "no-op success is not logged as a failure");
+});
+
+test("compaction race: second conditional failure is non-fatal — logged, snapshot unmutated", async (t) => {
+  const errSpy = t.mock.method(console, "error", () => {});
+  const workflow = { id: "wf_race_c", humanNotifications: [notif("T-1")] };
+  const freshList = [notif("T-1")]; // still open — retry fails again anyway
+  state.workflows.set("wf_race_c", { workflowId: "wf_race_c", id: "wf_race_c", humanNotifications: freshList });
+  state.failMatcher = failFirstAcks(2);
+
+  await ackReviewNotifications(workflow, "T-1"); // must not throw
+
+  assert.equal(ackUpdates().length, 2, "exactly one retry — no infinite loop");
+  const failureLogs = errSpy.mock.calls.filter((c) =>
+    String(c.arguments[0]).includes("ackReviewNotifications failed for T-1")
+  );
+  assert.equal(failureLogs.length, 1, "failure logged via the non-fatal path");
+  assert.equal(workflow.humanNotifications[0].acknowledged, false, "in-memory entry not mutated on failure");
+});
+
+test("compaction race: non-conditional error → no re-read, no retry, still non-fatal", async () => {
+  const workflow = { id: "wf_race_d", humanNotifications: [notif("T-1")] };
+  state.failMatcher = (name, input) =>
+    name === "UpdateCommand" && (input.UpdateExpression || "").includes("humanNotifications[");
+
+  await ackReviewNotifications(workflow, "T-1"); // must not throw
+
+  assert.equal(ackUpdates().length, 1, "generic errors are not retried");
+  assert.equal(workflowReads().length, 0, "no fresh re-read for non-conditional errors");
+  assert.equal(workflow.humanNotifications[0].acknowledged, false);
 });
