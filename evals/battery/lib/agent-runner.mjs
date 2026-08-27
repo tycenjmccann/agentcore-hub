@@ -163,8 +163,14 @@ async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxT
 
 /**
  * Run one case end to end. Returns:
- * { id, status: completed|errored|timed_out|failed_forbidden_tool, attempt,
- *   trajectory, messages, usage, finalText, forbiddenHits, error?, sessionId }
+ * { id, status: completed|errored|timed_out|failed_forbidden_tool|failed_required_tool,
+ *   attempt, trajectory, messages, usage, finalText, forbiddenHits,
+ *   missingRequiredTools, error?, sessionId }
+ *
+ * Forbidden tools AND non-optional expectedToolTrajectory entries are enforced
+ * mechanically here, with zero judge spend: contract-critical binary behaviors
+ * (blueprint loaded, verdict via report_completion, fix ticket filed) must not
+ * depend on an LLM judge noticing their absence in prose (TEAM-3352).
  *
  * `attempt` = transport attempts consumed (1 + retries used).
  * `signal` (optional) is the runner's end-to-end case deadline / whole-run
@@ -194,7 +200,12 @@ export async function runCase({
     maxRetries: maxTransportRetries,
     maxElapsedMs: caseDef.timeoutSeconds * 1000,
   });
-  const empty = { forbiddenHits: [], trajectory: [], usage: { inputTokens: 0, outputTokens: 0 } };
+  const empty = {
+    forbiddenHits: [],
+    missingRequiredTools: [],
+    trajectory: [],
+    usage: { inputTokens: 0, outputTokens: 0 },
+  };
   try {
     const loop = await converseLoop({
       caseDef,
@@ -207,8 +218,30 @@ export async function runCase({
     });
     const forbidden = new Set(caseDef.referenceInputs?.forbiddenTools || []);
     const forbiddenHits = loop.trajectory.filter((t) => forbidden.has(t.tool)).map((t) => t.tool);
-    const status = forbiddenHits.length > 0 ? "failed_forbidden_tool" : "completed";
-    return { id: caseDef.id, status, attempt: retryBudget.used + 1, sessionId, forbiddenHits, ...loop };
+    const called = new Set(loop.trajectory.map((t) => t.tool));
+    const missingRequiredTools = [
+      ...new Set(
+        (caseDef.referenceInputs?.expectedToolTrajectory || [])
+          .filter((e) => e && e.optional !== true)
+          .map((e) => e.tool)
+          .filter((tool) => !called.has(tool))
+      ),
+    ];
+    const status =
+      forbiddenHits.length > 0
+        ? "failed_forbidden_tool"
+        : missingRequiredTools.length > 0
+          ? "failed_required_tool"
+          : "completed";
+    return {
+      id: caseDef.id,
+      status,
+      attempt: retryBudget.used + 1,
+      sessionId,
+      forbiddenHits,
+      missingRequiredTools,
+      ...loop,
+    };
   } catch (err) {
     if (watchdog.signal.aborted) {
       // Watchdog or external deadline fired — a real timeout, never retried.

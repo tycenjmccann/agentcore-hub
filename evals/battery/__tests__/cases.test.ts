@@ -202,6 +202,31 @@ describe("cross-file integrity", () => {
     expect(pf.ok).toBe(false);
     expect(pf.errors.some((e: any) => e.check === "reference-inputs")).toBe(true);
   });
+
+  it("requires referenceInputs.personaContract when persona_contract_compliance is listed", () => {
+    const pf = preflight(makeRepo((root) => {
+      const c = { ...VALID_CASE, evaluators: ["persona_contract_compliance"] };
+      writeFileSync(join(root, "evals/battery/cases/valid-case-001.json"), JSON.stringify(c));
+    }));
+    expect(pf.ok).toBe(false);
+    expect(pf.errors.some((e: any) => e.check === "reference-inputs" && /personaContract/.test(e.message))).toBe(true);
+  });
+
+  it("passes when persona_contract_compliance comes with a pinned contract", () => {
+    const pf = preflight(makeRepo((root) => {
+      const c = {
+        ...VALID_CASE,
+        evaluators: ["persona_contract_compliance"],
+        referenceInputs: {
+          ...VALID_CASE.referenceInputs,
+          personaContract: ["Never transitions tickets itself."],
+        },
+      };
+      writeFileSync(join(root, "evals/battery/cases/valid-case-001.json"), JSON.stringify(c));
+    }));
+    expect(pf.errors).toEqual([]);
+    expect(pf.ok).toBe(true);
+  });
 });
 
 describe("baseline fail-closed", () => {

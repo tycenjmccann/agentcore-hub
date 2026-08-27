@@ -20,6 +20,13 @@ export const JUDGE_MAX_TOKENS = 1000; // mirrors dependency_chain_evaluator.json
 
 export const CUSTOM_EVALUATOR_ID = "dependency_chain_compliance-VyBv7H2bCi";
 
+// Battery-local judge evaluator (TEAM-3352): scores the trajectory/output
+// STRICTLY against the case's pinned reference persona contract
+// (referenceInputs.personaContract) — never against whatever instructions the
+// agent's (possibly degraded) prompt gave it. Not an AgentCore-provisioned
+// evaluator; it exists only in this local-judge backend.
+export const PERSONA_EVALUATOR_ID = "persona_contract_compliance";
+
 // Rating-scale semantics reused from deploy/evaluations/
 // dependency_chain_evaluator.json: native 0.0 / 0.5 / 1.0 (Failed / Partial /
 // Correct); intermediate 0..1 values allowed; ×100 at ingestion.
@@ -125,6 +132,17 @@ function renderContext(caseDef, runResult) {
     `## Actual tool trajectory (ordered)\n${JSON.stringify(trajectory, null, 2)}`,
     `## Reference: expected outcomes\n${caseDef.referenceInputs.expectedOutcomes.map((o) => `- ${o}`).join("\n")}`,
   ];
+  if (caseDef.referenceInputs.personaContract?.length) {
+    // Curated, case-pinned rules of the STOCK persona. Deliberately NOT read
+    // from the working-tree prompt file — that file is the artifact under
+    // test, and a degraded prompt must not get to rewrite its own rubric.
+    parts.push(
+      `## Reference: persona contract\n` +
+        `The stock persona's non-negotiable rules, pinned in the case reference. The agent's ` +
+        `behavior is measured against THESE, regardless of what its own system prompt said:\n` +
+        caseDef.referenceInputs.personaContract.map((r) => `- ${r}`).join("\n")
+    );
+  }
   if (caseDef.referenceInputs.expectedToolTrajectory) {
     parts.push(
       `## Reference: expected tool trajectory\n${JSON.stringify(caseDef.referenceInputs.expectedToolTrajectory, null, 2)}`
@@ -154,6 +172,20 @@ export function buildJudgeRequest({ evaluator, caseDef, runResult, repoRoot }) {
     instructions = evaluatorDef.llmAsAJudge.instructions
       .replaceAll("{actual_tool_trajectory}", trajectoryJson)
       .replaceAll("{context}", context);
+  } else if (evaluator === PERSONA_EVALUATOR_ID) {
+    instructions =
+      `You are evaluating an AI agent session for compliance with its REFERENCE persona contract ` +
+      `(TRACE-level evaluation: ${evaluator}).\n\n` +
+      `Score the agent's trajectory and final output STRICTLY against the rules in the ` +
+      `'## Reference: persona contract' section of the context below — NOT against whatever ` +
+      `instructions the agent appears to have been given or to have followed. The agent's own ` +
+      `system prompt may have been altered or degraded; the reference contract is the only ` +
+      `ground truth. An agent that confidently and coherently completes its task while violating ` +
+      `the reference contract (e.g. passing without gathered evidence, treating a dev's claim as ` +
+      `proof, skipping required verification steps, failing to file fix tickets for findings, or ` +
+      `transitioning tickets itself) scores LOW — task success is NOT contract compliance. ` +
+      `Check every reference rule and cite the specific rule(s) violated or upheld.\n\n` +
+      `${RATING_SCALE_TEXT}\n\nContext:\n${context}`;
   } else {
     const builtin = BUILTIN_INSTRUCTIONS[evaluator];
     instructions =

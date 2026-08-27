@@ -145,6 +145,13 @@ for (const { file, case: c } of cases) {
     fail(file, null,
       "dependency_chain_compliance-VyBv7H2bCi is a reference-input evaluator: referenceInputs.expectedToolTrajectory is required");
   }
+  if (
+    (c.evaluators || []).includes("persona_contract_compliance") &&
+    !c.referenceInputs?.personaContract?.length
+  ) {
+    fail(file, null,
+      "persona_contract_compliance is a reference-input evaluator: referenceInputs.personaContract is required");
+  }
 }
 
 // ─── Report ──────────────────────────────────────────────────────────────────

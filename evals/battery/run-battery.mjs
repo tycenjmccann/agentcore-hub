@@ -424,6 +424,8 @@ async function main() {
         error = scored.error || error;
       } else if (run.status === "failed_forbidden_tool") {
         error = `forbidden tool(s) called: ${run.forbiddenHits.join(", ")}`;
+      } else if (run.status === "failed_required_tool") {
+        error = `required tool(s) never called: ${run.missingRequiredTools.join(", ")}`;
       }
       return finishCase(
         def,

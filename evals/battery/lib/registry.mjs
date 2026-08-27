@@ -68,6 +68,19 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
     writeFileSync(dest, content);
   }
 
+  // Blueprint fixture overrides (TEAM-3352): a case may pin a battery-local
+  // blueprint copy via input.blueprints so load_blueprint serves it INSTEAD of
+  // the working-tree file. qa-* cases use this to neutralize the production
+  // blueprint's restatement of the persona contract — otherwise a degraded
+  // system prompt is outvoted by an intact blueprint and the battery cannot
+  // see the degradation. Unpinned names still serve from the working tree.
+  const blueprintOverrides = new Map();
+  for (const ref of caseDef.input?.blueprints || []) {
+    const abs = join(repoRoot, "evals", "battery", ref);
+    if (!existsSync(abs)) continue;
+    blueprintOverrides.set(basename(ref).replace(/\.md$/, ""), readFileSync(abs, "utf8"));
+  }
+
   const inWorkspace = (p) => {
     const root = resolve(workspaceDir);
     const abs = resolve(workspaceDir, p);
@@ -155,6 +168,7 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
     //    blueprints get under test (prod serves s3://.../blueprints/{name}.md).
     load_blueprint(args) {
       const name = String(args.blueprint_name || "").replace(/[^a-z0-9_-]/gi, "");
+      if (blueprintOverrides.has(name)) return blueprintOverrides.get(name);
       const path = join(repoRoot, "blueprints", `${name}.md`);
       if (existsSync(path)) return readFileSync(path, "utf8");
       const available = readdirSync(join(repoRoot, "blueprints"))

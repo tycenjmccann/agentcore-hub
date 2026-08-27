@@ -25,7 +25,8 @@ const round2 = (x) => Math.round(x * 100) / 100;
 
 /**
  * caseResults: [{ id, status, scores: {evaluator: 0-100}, evaluator_floors?, error? }]
- *   status ∈ scored | errored | timed_out | skipped | unscored | failed_forbidden_tool
+ *   status ∈ scored | errored | timed_out | skipped | unscored |
+ *            failed_forbidden_tool | failed_required_tool
  * newCaseIds: ids added in this PR (or ALL active ids when baseline.bootstrap)
  *   — these run informational: scores reported, no delta verdict; but a
  *   non-scored new case still fails the gate.

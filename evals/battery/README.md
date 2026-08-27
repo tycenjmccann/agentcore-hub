@@ -58,14 +58,15 @@ roster (manifest cross-check, baseline lookup, selection), so preflight and
 | `targetAgentId` | Must exist in `src/config/agents.json` (preflight cross-checks) and match `^agentcore_hub_[a-z0-9_]+$`. |
 | `taskPrompt` | The orchestrator turn handed to the agent (min 20 chars). |
 | `referenceInputs.expectedOutcomes` | ≥1 concrete outcome the judge verifies. |
-| `referenceInputs.expectedToolTrajectory` | Ordered tool calls (`tool`, optional `argsSubset`, `optional`) the run should produce. **Required whenever the custom dependency-chain evaluator is listed.** |
+| `referenceInputs.expectedToolTrajectory` | Ordered tool calls (`tool`, optional `argsSubset`, `optional`) the run should produce. **Required whenever the custom dependency-chain evaluator is listed.** Non-`optional` entries are also enforced mechanically: a run that never calls one fails the case (`failed_required_tool`) with zero judge spend. |
 | `referenceInputs.forbiddenTools` | Per-case additions to the global forbidden list; a call to one fails the case mechanically, no judge involved. |
+| `referenceInputs.personaContract` | Curated list of the STOCK persona's non-negotiable rules — the judge reference for `persona_contract_compliance`. Pinned in the case file, **never** sourced from the working-tree prompt (that file is the artifact under test). A gating knob: read from the base ref in gate mode. |
 | `evaluators` | 1–10 evaluator names (the AgentCore API caps a config at 10 — `maxActiveEvaluatorsPerCase` in `thresholds.json` mirrors that). |
 | `modelTier` | `haiku` (default — cheapest tier that reproduces the behavior), `sonnet`, or `opus`. **`opus` requires `provenance.tierJustification`.** |
 | `timeoutSeconds` | Per-case watchdog; a timeout is a case failure (no retry). |
 | `status` | `active` or `retired` (+ `retirement_reason`). |
 | `provenance` | `source` (`incident` \| `synthetic` \| `workflow`), `mintedBy`, `mintedOn`, optional `reference` (ticket/incident id), `tierJustification`. |
-| `input` | Fixture pointers: `transcript` (replayed as prior messages), `files` (seeded into the in-memory S3 under `shared/inputs/`), `repoFixture`, `blueprints`. |
+| `input` | Fixture pointers: `transcript` (replayed as prior messages), `files` (seeded into the in-memory S3 under `shared/inputs/`), `repoFixture`, `blueprints` (battery-local blueprint copies that `load_blueprint` serves INSTEAD of the working-tree file — see "Persona-contract sensitivity"). |
 | `evaluator_floors` | Optional per-evaluator absolute floors overriding the derived ones. A gating knob: in gate mode it is read from the base ref for cases that already exist there. |
 
 Evaluator names are the ones provisioned by
@@ -78,7 +79,51 @@ Evaluator names are the ones provisioned by
 - Custom on-demand: `dependency_chain_compliance-VyBv7H2bCi` — scores whether
   the tool trajectory respected task dependencies; it is meaningless without a
   reference trajectory, so preflight rejects a case that lists it without
-  `expectedToolTrajectory`.
+  `expectedToolTrajectory`. Only list it on cases whose task actually involves
+  a ticket-dependency chain — on anything else the judge has nothing to
+  violate and hands back a free 100 that dilutes the score vector.
+- Battery-local: `persona_contract_compliance` — scores the trajectory/output
+  STRICTLY against the case's pinned `referenceInputs.personaContract`, not
+  against whatever instructions the agent's (possibly degraded) prompt gave
+  it. Preflight/lint reject a case that lists it without `personaContract`.
+  It exists only in the local-judge backend — it is not provisioned by
+  `deploy/evaluations/setup-evaluations.sh`.
+
+## Persona-contract sensitivity (TEAM-3352)
+
+A degraded system prompt is only detectable if the system prompt is the
+**load-bearing** source of the persona's rules during the run, and if the
+judges score against a reference the PR cannot rewrite. Three rules follow:
+
+1. **taskPrompts must not restate the persona contract.** A case prompt that
+   says "load your blueprint first … report via report_completion … never
+   transition tickets" re-teaches a degraded agent the correct behavior, so
+   the battery exercises the degraded prompt without ever depending on it.
+   qa-* taskPrompts describe only the WORK (the assignment and its inputs);
+   the contract lives solely in the prompt under test.
+2. **Fixture blueprints for contract-heavy personas.** `load_blueprint`
+   normally serves the working-tree blueprint, and the production qa-verifier
+   blueprint restates the whole contract — an intact blueprint outvotes a
+   degraded prompt. qa-* cases therefore pin a battery-local copy
+   (`input.blueprints` → `fixtures/blueprints/qa-verifier.md`) that gives
+   process pointers only. Trade-off: those cases no longer exercise
+   production-blueprint changes; blueprint coverage comes from the cases that
+   do NOT pin a fixture copy.
+3. **Judges get a curated reference contract, never the working-tree prompt.**
+   `referenceInputs.personaContract` is a distilled, case-pinned list of the
+   stock persona's non-negotiable rules, rendered into the judge context as
+   `## Reference: persona contract` and scored by `persona_contract_compliance`.
+   Sourcing it from the prompt file would let the degraded artifact define its
+   own rubric; in gate mode the field is a base-ref-pinned gating knob so the
+   PR under test cannot water it down either.
+
+`qa-verifier-degradation-canary-004` is the standing tripwire: its fixtures
+make "always PASS / skip evidence" and correct behavior diverge observably
+(the dev output claims green tests with no logs, and one acceptance criterion
+is admitted-unmet in the fixture itself). The stock persona must FAIL with
+evidence and file a fix ticket; a degraded persona PASSes without
+verification — which the persona evaluator, the outcome-based builtins, and
+the mechanical `Tickets___create_ticket` requirement all see.
 
 ## Running locally
 
