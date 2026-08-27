@@ -1917,6 +1917,44 @@ _ddb_events_client = boto3.client("dynamodb", region_name=REGION)
 _EVENTS_TABLE = os.getenv("EVENTS_TABLE", "agentcore-hub-events")
 
 
+def _emit_session_anchor_span(agent_id: str, session_id: str | None,
+                              workflow_id: str, ticket_id: str) -> None:
+    """TEAM-3366 P0-A: guarantee >=1 EXPORTED invoke_agent span per session.
+
+    The SDK's invoke_agent span only ends when the whole agent loop ends
+    (tests/test_telemetry.py contract); detached runs with remote-coding turns
+    keep that loop open for hours, and any microVM interruption loses the
+    un-ended span -> online evals fail with "none of the spans contain the
+    required agent invocation". This anchor span ends immediately and is
+    flushed synchronously, so the session is evaluable even if the run dies.
+    Fail-open — telemetry must never break the invocation.
+    """
+    try:
+        from opentelemetry import trace as _t
+
+        tracer = _t.get_tracer("agentcore-hub-pipeline-agent")
+        attrs = {k: v for k, v in {
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.agent.name": agent_id,
+            "gen_ai.agent.id": agent_id,
+            "session.id": session_id,
+            "workflow.id": workflow_id,
+            "ticket.id": ticket_id,
+            "agentcore.hub.anchor": True,
+        }.items() if v}
+        with tracer.start_as_current_span(f"invoke_agent {agent_id}",
+                                          kind=_t.SpanKind.INTERNAL,
+                                          attributes=attrs):
+            pass  # ends immediately — exportable from this moment on
+
+        provider = _t.get_tracer_provider()
+        if hasattr(provider, "force_flush"):
+            provider.force_flush(5000)  # deliver NOW, before the long loop
+    except Exception:  # noqa: BLE001 — fail-open, never break the run
+        logger.warning("telemetry: session anchor span failed (non-fatal)",
+                       exc_info=True)
+
+
 def _publish_agent_started(workflow_id: str, agent_id: str):
     """Publish agent.started event so UI immediately shows this agent as running."""
     import time, random, string
@@ -2279,6 +2317,11 @@ async def _run_agent_invocation(payload, context):
             _otel_context.attach(_otel_baggage.set_baggage("session.id", _bag_session_id))
     except Exception:  # noqa: BLE001 — telemetry must never break the invocation (R1.4)
         pass
+
+    # TEAM-3366 P0-A: anchor span — exported before the (possibly hours-long)
+    # agent loop starts, so the session stays evaluable even if the run dies.
+    _emit_session_anchor_span(agent_id, getattr(context, "session_id", None),
+                              workflow_id, _CURRENT_TICKET_ID)
 
     try:
         # Fresh coding session per agent-task: a warm microVM reuses this module, so

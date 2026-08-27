@@ -29,6 +29,15 @@ def _extract_block():
     return src[start:end]
 
 
+def _extract_anchor_helper():
+    """The shipped _emit_session_anchor_span (TEAM-3366 P0-A), from def to the
+    next module-level def — same extract-and-exec approach as the init block."""
+    src = _MAIN.read_text()
+    start = src.index("def _emit_session_anchor_span")
+    end = src.index("\ndef ", start)
+    return src[start:end]
+
+
 def _fake_modules(provider, strands_telemetry_cls):
     fake_otel = types.ModuleType("opentelemetry")
     fake_otel.trace = types.SimpleNamespace(get_tracer_provider=lambda: provider)
@@ -121,6 +130,24 @@ class TestTelemetryInit(unittest.TestCase):
         strands_cls.assert_called_once()
         logger.warning.assert_called_once()
         self.assertTrue(ns["_TELEMETRY_INITIALIZED"])
+
+    def test_anchor_span_fail_open(self):
+        # TEAM-3366 P0-A: the anchor span helper must never break an
+        # invocation — a tracer failure is swallowed and logged once.
+        def _raise(*args, **kwargs):
+            raise RuntimeError("otel exploded")
+
+        fake = _fake_modules(object(), mock.Mock())
+        fake["opentelemetry"].trace = types.SimpleNamespace(get_tracer=_raise)
+        logger = mock.Mock()
+        ns = {"logger": logger}
+        with mock.patch.dict(sys.modules, fake):
+            exec(compile(_extract_anchor_helper(), str(_MAIN), "exec"), ns)
+            result = ns["_emit_session_anchor_span"](
+                "test_agent", "sess-123", "wf-1", "T-1"
+            )
+        self.assertIsNone(result)
+        logger.warning.assert_called_once()
 
     def test_idempotent_on_adot_path(self):
         provider = types.SimpleNamespace(add_span_processor=lambda p: None)
