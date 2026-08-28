@@ -250,10 +250,13 @@ export const handler = async (event) => {
     //    OTHER append landed after the snapshot this flush archives (TEAM-3406
     //    F1 — the old lastFlushedAt CAS let a reset wipe rows appended between
     //    the snapshot and the reset). Of two concurrent invocations that both
-    //    decided to flush, still exactly one actually does (TEAM-3385 finding 6);
-    //    the cooldown decision above still reads config.lastFlushedAt from the
-    //    invocation-start GetCommand.
-    await flushBuffer(agentId, appended.buffer, batchSize, appended.bufferVersion);
+    //    decided to flush, still exactly one actually does (TEAM-3385 finding 6).
+    //    The cooldown gate above compared against config.lastFlushedAt from the
+    //    invocation-start GetCommand, which a concurrent flush can have made
+    //    stale — so cooldownMin rides along and the flush claim re-checks the
+    //    STORED lastFlushedAt atomically in its ConditionExpression (TEAM-3410,
+    //    PR #187 G1); the check above remains as a cheap early-out only.
+    await flushBuffer(agentId, appended.buffer, batchSize, appended.bufferVersion, cooldownMin);
   }
 
   return { statusCode: 200, body: 'ok' };
@@ -1449,17 +1452,41 @@ async function aggregateScoresToDdb(agentId, entries = []) {
  * CASes on lastFlushedAt, which this reset still SETs, so the old guard keeps
  * functioning (with its known weakness) until the deploy completes.
  *
+ * TEAM-3410 (PR #187 G1): the bufferVersion CAS alone cannot enforce the flush
+ * COOLDOWN, because the handler's cooldown gate reads config.lastFlushedAt from
+ * the invocation-start GetCommand — stale by everything that ran since.
+ * Interleaving: A and B both read the pre-flush lastFlushedAt; A appends,
+ * flushes and resets (writing a fresh lastFlushedAt); B appends AFTER the reset
+ * and so holds the LATEST bufferVersion — its CAS would win — yet its cooldown
+ * decision still used the stale pre-reset value, letting it flush a second
+ * batch (and start a second improver workflow) inside the window the cooldown
+ * exists to close (the P0-B invocation-storm mitigation). So the claim also
+ * conditions on the STORED lastFlushedAt being at least cooldownMinutes old at
+ * flush time: `attribute_not_exists(lastFlushedAt) OR lastFlushedAt <=
+ * :cooldownCutoff`. lastFlushedAt is only ever written via toISOString(), and
+ * fixed-length ISO-8601 UTC strings compare lexicographically in timestamp
+ * order, so the string comparison is a time comparison. The `<=` mirrors the
+ * handler gate (hold strictly inside the window); the attribute_not_exists arm
+ * covers an item that has never flushed. cooldownMinutes <= 0 means no cooldown
+ * is configured, so no cooldown arm is added — the version CAS still applies.
+ *
  * The loser produces NO side effects beyond its failed conditional write — no
- * archive, no batch metric, no synthesis — and its rows are NOT lost: they are
- * in the buffer snapshot of the concurrent appender that bumped the version
- * past ours. That appender saw the same full run set (shouldFlush) and flushes
- * them itself, or — if it crashed or hit the cooldown — the next delivery's
- * flush picks them up from the still-intact buffer.
+ * archive, no batch metric, no synthesis — and its rows are NOT lost. Losing on
+ * the version arm means a concurrent appender bumped the version past ours: our
+ * rows are in ITS snapshot, and it saw the same full run set (shouldFlush) and
+ * flushes them itself. Losing on the cooldown arm means a concurrent flush just
+ * happened: the buffer (our rows included) is left intact and keeps
+ * accumulating, exactly like the handler's own cooldown hold, until a delivery
+ * after the window flushes it in one bigger batch. Either way — or if the
+ * winner crashed — the next delivery's flush picks the rows up from the
+ * still-intact buffer.
  *
  * @param {number} expectedBufferVersion the `bufferVersion` of the ALL_NEW
  *   snapshot in `buffer` (from appendToBuffer) — the CAS token for the reset.
+ * @param {number} [cooldownMinutes] the agent's flushCooldownMinutes — the
+ *   claim loses if the stored lastFlushedAt is younger than this (TEAM-3410).
  */
-async function flushBuffer(agentId, buffer, batchSize, expectedBufferVersion) {
+async function flushBuffer(agentId, buffer, batchSize, expectedBufferVersion, cooldownMinutes = 0) {
   const timestamp = new Date().toISOString();
 
   // TEAM-3381 (FR-2.1 AC-1/AC-2): re-dedupe the MERGED buffer before anything
@@ -1502,7 +1529,22 @@ async function flushBuffer(agentId, buffer, batchSize, expectedBufferVersion) {
   //    removed or reset here — it must increase monotonically forever, or a
   //    recycled version could win a stale CAS (ABA; see doc comment).
   //    Concurrent invocations then append into a fresh buffer instead of
-  //    re-flushing this one, and only the winner proceeds past here.
+  //    re-flushing this one, and only the winner proceeds past here. The claim
+  //    ALSO loses if the STORED lastFlushedAt is inside the cooldown window
+  //    (TEAM-3410, PR #187 G1) — the handler's own cooldown gate ran on the
+  //    invocation-start config read, which a concurrent flush makes stale.
+  const claimConditions = ['bufferVersion = :expectedVersion'];
+  const claimValues = {
+    ':empty': [],
+    ':ts': timestamp,
+    ':expectedVersion': expectedBufferVersion,
+  };
+  if (cooldownMinutes > 0) {
+    claimConditions.push('(attribute_not_exists(lastFlushedAt) OR lastFlushedAt <= :cooldownCutoff)');
+    claimValues[':cooldownCutoff'] = new Date(
+      Date.parse(timestamp) - cooldownMinutes * 60_000
+    ).toISOString();
+  }
   try {
     await ddb.send(
       new UpdateCommand({
@@ -1510,33 +1552,36 @@ async function flushBuffer(agentId, buffer, batchSize, expectedBufferVersion) {
         Key: { agentId },
         UpdateExpression:
           'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts REMOVE bufferSessions',
-        ConditionExpression: 'bufferVersion = :expectedVersion',
-        ExpressionAttributeValues: {
-          ':empty': [],
-          ':ts': timestamp,
-          ':expectedVersion': expectedBufferVersion,
-        },
+        ConditionExpression: claimConditions.join(' AND '),
+        ExpressionAttributeValues: claimValues,
       })
     );
   } catch (err) {
     if (err?.name !== 'ConditionalCheckFailedException') throw err;
-    // Lost the race: the buffer version moved past our snapshot, so either a
-    // concurrent invocation appended after it (and, holding the later version,
-    // flushes a SUPERSET of our snapshot — our rows included) or it already won
-    // the reset. Nothing is lost: our rows are durably in the buffer or in the
-    // winner's batch. Emitting the batch metric or archiving here would
-    // double-count a single batch, so stop before ANY side effect.
+    // Lost the claim, one of two ways. (a) The buffer version moved past our
+    // snapshot: a concurrent invocation appended after it and, holding the
+    // later version, flushes a SUPERSET of our snapshot — our rows included.
+    // (b) The stored lastFlushedAt is inside the cooldown window (TEAM-3410):
+    // a concurrent flush just happened, and the buffer — our rows included —
+    // stays intact and flushes after the cooldown, exactly like the handler's
+    // own cooldown hold. Nothing is lost either way: our rows are durably in
+    // the buffer or in the winner's batch. Emitting the batch metric or
+    // archiving here would double-count a single batch, so stop before ANY
+    // side effect.
     console.log(
       JSON.stringify({
         level: 'warn',
         event: 'eval.flush.claim_lost',
         agentId,
         expectedBufferVersion: expectedBufferVersion ?? null,
+        cooldownCutoff: claimValues[':cooldownCutoff'] ?? null,
         bufferEntries: sessions.length,
         reason:
-          'another invocation appended past this snapshot (bufferVersion moved) — ' +
-          'it flushes a superset including these rows; no archive, no batch ' +
-          'metric, no PRD from this one',
+          'another invocation appended past this snapshot (bufferVersion moved — ' +
+          'it flushes a superset including these rows) or a concurrent flush set ' +
+          'lastFlushedAt inside the cooldown window (the buffer stays intact and ' +
+          'flushes after the cooldown); no archive, no batch metric, no PRD from ' +
+          'this one',
       })
     );
     return;
