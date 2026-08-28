@@ -51,7 +51,7 @@
         "metrics": [
           [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalThrottleCount\"', 'Sum', 3600))", "id": "throttles", "label": "EvalThrottleCount (fleet)" } ],
           [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 3600))", "id": "ttotal", "visible": false } ],
-          [ { "expression": "throttles / ttotal", "id": "trate", "label": "throttles per eval session", "yAxis": "right" } ]
+          [ { "expression": "IF(ttotal > 0, throttles / ttotal, 0)", "id": "trate", "label": "throttles per eval session", "yAxis": "right" } ]
         ],
         "yAxis": { "left": { "min": 0 }, "right": { "min": 0 } }
       }
