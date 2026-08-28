@@ -223,10 +223,18 @@ afterAll(() => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
-describe("latch (A2/A4)", () => {
-  it("short-circuits loudly with ZERO gh calls when EVAL_GATE_CHECKED == HEAD sha", () => {
+describe("latch (A2/A4, token-hardened by TEAM-3388)", () => {
+  it("short-circuits loudly with ZERO gh calls when the full latch token round-trips", () => {
+    // Simulate what _eval_gate_set_latch writes: "<head_sha> <nonce>" in a
+    // 600-mode file plus the three exports. (The end-to-end round-trip is
+    // covered in gate-hardening.test.ts.)
+    const nonce = "cafef00ddeadbeefcafef00ddeadbeef";
+    const latchFile = join(tmp, "latch-valid");
+    writeFileSync(latchFile, `${basicHead} ${nonce}\n`, { mode: 0o600 });
     const r = runGate(repoBasic, {
       EVAL_GATE_CHECKED: basicHead,
+      EVAL_GATE_LATCH_FILE: latchFile,
+      EVAL_GATE_LATCH_NONCE: nonce,
       [`CHECK_${basicHead.slice(0, 7)}`]: "red", // would refuse if it ran
     });
     expect(r.status).toBe(0);
@@ -235,13 +243,24 @@ describe("latch (A2/A4)", () => {
     expect(r.ghCalls).toHaveLength(0);
   });
 
+  it("treats a bare EVAL_GATE_CHECKED == HEAD with no latch token as forged and runs the full check", () => {
+    const r = runGate(repoBasic, {
+      EVAL_GATE_CHECKED: basicHead, // guessable: git rev-parse HEAD
+      [`CHECK_${basicHead.slice(0, 7)}`]: "red",
+    });
+    expect(r.status).toBe(1); // full check ran and refused on the red check
+    expect(r.out).toContain("no valid latch token");
+    expect(r.out).toContain("FORGED");
+    expect(r.ghCalls.length).toBeGreaterThan(0);
+  });
+
   it("loudly ignores the legacy latch value '1' and runs the full check", () => {
     const r = runGate(repoBasic, {
       EVAL_GATE_CHECKED: "1",
       [`CHECK_${basicHead.slice(0, 7)}`]: "green",
     });
     expect(r.status).toBe(0);
-    expect(r.out).toContain("IGNORING the stale/foreign latch");
+    expect(r.out).toContain("IGNORING it and running the full check");
     expect(r.out).toContain("is green on HEAD");
     expect(r.ghCalls.length).toBeGreaterThan(0);
   });
@@ -252,7 +271,7 @@ describe("latch (A2/A4)", () => {
       [`CHECK_${basicHead.slice(0, 7)}`]: "red",
     });
     expect(r.status).toBe(1);
-    expect(r.out).toContain("IGNORING the stale/foreign latch");
+    expect(r.out).toContain("IGNORING it and running the full check");
     expect(r.out).toContain("concluded 'failure'");
   });
 
@@ -361,12 +380,12 @@ describe("belt loop (A3)", () => {
     expect(r.ghCalls.join("\n")).not.toContain(anchorDeepGated);
   });
 
-  it("proceeds with an explicit residual warning when the 100-commit cap is hit on clean history", () => {
+  it("REFUSES when the 100-commit cap is hit with history extending beyond it (TEAM-3388: fail closed, was warn-and-proceed)", () => {
     const r = runGate(repoDeep);
-    expect(r.status).toBe(0);
-    expect(r.out).toContain("hard cap reached");
-    expect(r.out).toContain("Residual risk");
-    expect(r.latch).toBe("unset");
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("EVAL GATE REFUSED");
+    expect(r.out).toContain("hit the 100-commit cap without finding a green anchor or a gated-path touch");
+    expect(r.out).toContain("unexamined");
   });
 });
 
