@@ -191,6 +191,10 @@ beforeEach(() => {
     },
     bufferSessions: new Set(['sess-from-an-earlier-delivery']),
     priorBuffer: [],
+    // TEAM-3406 F1: the append-count CAS token. Every ALL_NEW append bumps it
+    // (mirroring `ADD bufferVersion :one`), and the flush reset is conditioned
+    // on it still holding the archived snapshot's value.
+    bufferVersion: 0,
     // TEAM-3376 seen-set table, TEAM-3385 two-phase (check-then-claim).
     // `seenItems` is the fake table: dedupKey → { dedupKey, outcome, expiresAt }.
     // Reads and conditional-write semantics are only HONOURED when
@@ -205,9 +209,13 @@ beforeEach(() => {
     // DDB throttle / 400KB-item rejection does, so a test can prove that a
     // failed invocation claimed nothing and its re-delivery is processed.
     appendFailures: 0,
-    // TEAM-3385 finding 6: every conditional buffer-reset ("flush claim") the
-    // handler attempts, won or lost. `stealFlushClaim` makes a rival invocation
-    // move lastFlushedAt between our config read and our claim (see GetCommand).
+    // TEAM-3385 finding 6 / TEAM-3406 F1: every conditional buffer-reset
+    // ("flush claim") the handler attempts, won or lost. `stealFlushClaim`
+    // makes a rival invocation's APPEND land between our ALL_NEW snapshot and
+    // our reset — bufferVersion moves, so our compare-and-swap must fail. Set
+    // it to a buffer entry (instead of `true`) to also persist the rival's
+    // rows, so a test can prove they survive the lost reset and reach the next
+    // flush's archive. One-shot: consumed by the first reset it defeats.
     flushResets: [],
     stealFlushClaim: false,
     // TEAM-3385 finding 7: the scorecard merge is optimistic-locked on
@@ -225,9 +233,15 @@ beforeEach(() => {
     aggPersist: false,
   };
 
-  // Evaluate the two conditional-write shapes index.mjs uses against the fake
-  // item. Anything else is unconditional.
+  // Evaluate the conditional-write shapes index.mjs uses against the fake
+  // item. The lastFlushedAt arms model the PRE-TEAM-3406 flush condition —
+  // shipped code never sends them, but keeping them honest lets a mutation
+  // check revert flushBuffer's ConditionExpression and watch the F1
+  // interleaving test catch the data loss. Anything else is unconditional.
   const conditionHolds = (cond, values) => {
+    if (cond.includes('bufferVersion = :expectedVersion')) {
+      return ddbState.bufferVersion === values[':expectedVersion'];
+    }
     if (cond.includes('attribute_not_exists(lastFlushedAt)')) return ddbState.config.lastFlushedAt === undefined;
     if (cond.includes('lastFlushedAt = :expected')) return ddbState.config.lastFlushedAt === values[':expected'];
     if (cond.includes('attribute_not_exists(evalAggVersion)')) return ddbState.config.evalAggVersion === undefined;
@@ -247,12 +261,6 @@ beforeEach(() => {
     const name = cmd.constructor.name;
     if (name === 'GetCommand') {
       const snapshot = ddbState.config;
-      // TEAM-3385 finding 6: model the race itself. A concurrent invocation wins
-      // the flush AFTER this read and BEFORE our claim, so the value we based the
-      // cooldown decision on is already stale by the time we compare-and-swap.
-      if (ddbState.stealFlushClaim) {
-        ddbState.config = { ...snapshot, lastFlushedAt: '2026-08-28T00:00:00.000Z' };
-      }
       // Cloned, because a real Get deserializes a fresh object every call: handing
       // out the stored reference would let a caller's in-place merge mutate the
       // "table" and make a retried read see its own half-applied write.
@@ -279,10 +287,12 @@ beforeEach(() => {
       ddbState.seenPuts.push(cmd.input);
       if (ddbState.seenSetPersistent) {
         const existing = ddbState.seenItems.get(key);
-        // The claim's condition is `attribute_not_exists(dedupKey)`, optionally
-        // `OR #outcome = :error` when the incoming row is scored.
-        const supersedesError = (cmd.input.ConditionExpression || '').includes('#outcome = :error');
-        if (existing && !(supersedesError && existing.outcome === 'error')) {
+        // The claim's condition is `attribute_not_exists(dedupKey)`, with the
+        // scored supersede arms `OR attribute_not_exists(#outcome) OR #outcome
+        // <> :scored` (TEAM-3406 F2): any stored NON-scored outcome — including
+        // a legacy item that has no outcome attribute at all — is overwritable.
+        const supersedesNonScored = (cmd.input.ConditionExpression || '').includes('#outcome <> :scored');
+        if (existing && !(supersedesNonScored && existing.outcome !== 'scored')) {
           const err = new Error('The conditional request failed');
           err.name = 'ConditionalCheckFailedException';
           throw err;
@@ -292,8 +302,11 @@ beforeEach(() => {
       return {};
     }
     if (name === 'UpdateCommand') {
-      // appendToBuffer asks for ALL_NEW; mirror DDB's list_append so the flush
-      // sees the delivery that was just appended.
+      // appendToBuffer asks for ALL_NEW; mirror DDB's list_append + `ADD
+      // bufferVersion :one` so the flush sees the delivery that was just
+      // appended AND holds that exact snapshot's version. The append PERSISTS
+      // (TEAM-3406 F1): a lost flush claim must leave the buffer intact for the
+      // next invocation's snapshot, which is the whole point of the version CAS.
       if (cmd.input.ReturnValues === 'ALL_NEW') {
         if (ddbState.appendFailures > 0) {
           ddbState.appendFailures -= 1;
@@ -302,10 +315,13 @@ beforeEach(() => {
           throw err;
         }
         const appended = cmd.input.ExpressionAttributeValues[':new'] || [];
+        ddbState.priorBuffer = [...ddbState.priorBuffer, ...appended];
+        ddbState.bufferVersion += 1;
         return {
           Attributes: {
-            sessionBuffer: [...ddbState.priorBuffer, ...appended],
+            sessionBuffer: [...ddbState.priorBuffer],
             bufferSessions: ddbState.bufferSessions,
+            bufferVersion: ddbState.bufferVersion,
           },
         };
       }
@@ -313,9 +329,20 @@ beforeEach(() => {
       const values = cmd.input.ExpressionAttributeValues || {};
       const cond = cmd.input.ConditionExpression || '';
 
-      // flushBuffer's flush claim: reset the buffer iff lastFlushedAt still holds
-      // the value the cooldown decision was made from (TEAM-3385 finding 6).
+      // flushBuffer's flush claim: reset the buffer iff bufferVersion still
+      // holds the archived snapshot's value, i.e. no append landed since
+      // (TEAM-3385 finding 6, re-guarded by TEAM-3406 F1). `stealFlushClaim`
+      // is the rival append landing JUST before this reset. The version is
+      // deliberately NOT reset on a won claim — it increases monotonically,
+      // exactly like the shipped `ADD`-only attribute (the ABA guard).
       if (values[':empty']) {
+        if (ddbState.stealFlushClaim) {
+          ddbState.bufferVersion += 1;
+          if (typeof ddbState.stealFlushClaim === 'object') {
+            ddbState.priorBuffer = [...ddbState.priorBuffer, ddbState.stealFlushClaim];
+          }
+          ddbState.stealFlushClaim = false;
+        }
         ddbState.flushResets.push(cmd.input);
         if (!conditionHolds(cond, values)) throw conditionalCheckFailed();
         ddbState.config = { ...ddbState.config, lastFlushedAt: values[':ts'] };
@@ -2204,7 +2231,7 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
     // Only delivery A claimed: B had no surviving keyed row left to claim.
     expect(ddbState.seenPuts).toHaveLength(1);
     expect(ddbState.seenPuts[0].ConditionExpression).toBe(
-      'attribute_not_exists(dedupKey) OR #outcome = :error'
+      'attribute_not_exists(dedupKey) OR attribute_not_exists(#outcome) OR #outcome <> :scored'
     );
     expect(ddbState.seenPuts[0].Item.outcome).toBe('scored');
     expect(typeof ddbState.seenPuts[0].Item.expiresAt).toBe('number');
@@ -2508,10 +2535,12 @@ describe('TEAM-3385: seen-set check-then-claim + keep-best dedup', () => {
 
     // The stored claim was upgraded in place, error → scored.
     expect([...ddbState.seenItems.values()].map((i) => i.outcome)).toEqual(['scored']);
-    // Only the scored claim asks to supersede; the error claim can't.
+    // Only the scored claim asks to supersede; the error claim can't. Since
+    // TEAM-3406 F2 the supersede arm covers EVERY non-scored stored outcome
+    // (error, other, legacy-no-attribute), of which error→scored is one case.
     expect(ddbState.seenPuts.map((p) => p.ConditionExpression)).toEqual([
       'attribute_not_exists(dedupKey)',
-      'attribute_not_exists(dedupKey) OR #outcome = :error',
+      'attribute_not_exists(dedupKey) OR attribute_not_exists(#outcome) OR #outcome <> :scored',
     ]);
   });
 
@@ -2798,19 +2827,20 @@ describe('TEAM-3385: span-missing classification + concurrency claims', () => {
     expect(emf.EvalThrottleRate).toBe(0);
   });
 
-  // ── finding 6: the flush claim ─────────────────────────────────────────────
+  // ── finding 6: the flush claim (re-guarded on bufferVersion by TEAM-3406) ──
   it('the losing invocation of a concurrent double-flush archives nothing and synthesizes nothing', async () => {
     ddbState.config = { ...ddbState.config, lastFlushedAt: '2026-08-27T00:00:00.000Z' };
-    ddbState.stealFlushClaim = true; // a rival flushes between our read and our claim
+    ddbState.stealFlushClaim = true; // a rival appends between our snapshot and our claim
 
     const result = await handler(
       awslogsEvent([evalRecord({ sessionId: 'sess-lost', score: 8, scoreLabel: 'pass', requestId: 'req-lost' })])
     );
 
-    // It tried to claim, on exactly the value its cooldown decision was made from.
+    // It tried to claim, on exactly the version of the snapshot it archives —
+    // and lost, because the rival's append moved the version past it.
     expect(flushClaims()).toHaveLength(1);
-    expect(flushClaims()[0].ConditionExpression).toBe('lastFlushedAt = :expected');
-    expect(flushClaims()[0].ExpressionAttributeValues[':expected']).toBe('2026-08-27T00:00:00.000Z');
+    expect(flushClaims()[0].ConditionExpression).toBe('bufferVersion = :expectedVersion');
+    expect(flushClaims()[0].ExpressionAttributeValues[':expectedVersion']).toBe(1);
 
     // ...and having lost it, produced no side effects at all beyond that write.
     expect(putsUnder('fleet-imp-agent/batches/')).toEqual([]);
@@ -2821,11 +2851,14 @@ describe('TEAM-3385: span-missing classification + concurrency claims', () => {
     expect(emfLines('eval.batch.null_or_error_rate')).toEqual([]);
     // The delivery itself succeeded — the rows are buffered for the winner.
     expect(result).toEqual({ statusCode: 200, body: 'ok' });
+    // And nothing was wiped: the buffer still holds this delivery's rows for
+    // the invocation that appended past us.
+    expect(ddbState.priorBuffer).toHaveLength(1);
 
     const claimLost = jsonLogs().filter((l) => l.event === 'eval.flush.claim_lost');
     expect(claimLost).toHaveLength(1);
     expect(claimLost[0].agentId).toBe(AGENT_ID);
-    expect(claimLost[0].expectedLastFlushedAt).toBe('2026-08-27T00:00:00.000Z');
+    expect(claimLost[0].expectedBufferVersion).toBe(1);
   });
 
   it('the winning invocation still archives, meters and synthesizes (claim path unchanged)', async () => {
@@ -2833,16 +2866,109 @@ describe('TEAM-3385: span-missing classification + concurrency claims', () => {
       awslogsEvent([evalRecord({ sessionId: 'sess-won', score: 8, scoreLabel: 'pass', requestId: 'req-won' })])
     );
 
-    // Never flushed before → the claim guards on absence rather than a value.
+    // The claim guards on the version of its own append — the first ever here.
     expect(flushClaims()).toHaveLength(1);
-    expect(flushClaims()[0].ConditionExpression).toBe('attribute_not_exists(lastFlushedAt)');
-    expect(flushClaims()[0].ExpressionAttributeValues[':expected']).toBeUndefined();
+    expect(flushClaims()[0].ConditionExpression).toBe('bufferVersion = :expectedVersion');
+    expect(flushClaims()[0].ExpressionAttributeValues[':expectedVersion']).toBe(1);
 
     expect(putsUnder('fleet-imp-agent/batches/')).toHaveLength(1);
     expect(putsUnder('fleet-imp-agent/prd/')).toHaveLength(1);
     expect(emfLines('eval.batch.null_or_error_rate')).toHaveLength(1);
     expect(result).toEqual({ statusCode: 200, body: 'ok' });
     expect(jsonLogs().filter((l) => l.event === 'eval.flush.claim_lost')).toEqual([]);
+  });
+
+  // ── TEAM-3406 F1: append-between-snapshot-and-reset interleaving ───────────
+  // The exact interleaving the pre-fix lastFlushedAt-only CAS could not see, so
+  // THIS TEST FAILS ON THE PRE-FIX CODE: invocation A appends delivery A and
+  // holds the ALL_NEW snapshot at version 1; invocation B appends delivery B
+  // (buffer [A, B], version 2) BEFORE A's reset executes. Appends never touched
+  // lastFlushedAt, so A's reset wrongly won its CAS, cleared the WHOLE buffer —
+  // erasing B's rows, absent from A's archived snapshot — and B's own flush
+  // then lost and archived nothing: permanent data loss. Under the bufferVersion
+  // CAS, A's reset loses (version moved past its snapshot), the buffer survives
+  // intact, and B — holding the latest version — flushes a superset with BOTH
+  // deliveries' rows. The two handler invocations run genuinely concurrently
+  // here; promise gates in a wrapped ddbSend pin the interleaving.
+  it('a reset cannot clear rows appended after its snapshot: the interleaved append wins the flush with a superset (F1)', async () => {
+    const deferred = () => {
+      let resolve;
+      const promise = new Promise((r) => (resolve = r));
+      return { promise, resolve };
+    };
+    const aAtReset = deferred(); // A has arrived at its flush reset
+    const bAppended = deferred(); // B's append has landed in the table
+    const aResetDone = deferred(); // A's reset attempt has completed
+    let bufferAfterAReset = null; // table state the instant A's reset settled
+
+    const baseImpl = ddbSend.getMockImplementation();
+    let resetsSeen = 0;
+    ddbSend.mockImplementation(async (cmd) => {
+      const input = cmd.input || {};
+      const isFlushReset =
+        cmd.constructor.name === 'UpdateCommand' && input.ExpressionAttributeValues?.[':empty'];
+      if (isFlushReset) {
+        resetsSeen += 1;
+        if (resetsSeen === 1) {
+          // Invocation A: hold the reset until B's append has landed.
+          aAtReset.resolve();
+          await bAppended.promise;
+          try {
+            return await baseImpl(cmd);
+          } finally {
+            bufferAfterAReset = [...ddbState.priorBuffer];
+            aResetDone.resolve();
+          }
+        }
+        // Invocation B: its reset executes strictly after A's attempt.
+        await aResetDone.promise;
+        return baseImpl(cmd);
+      }
+      const result = await baseImpl(cmd);
+      if (cmd.constructor.name === 'UpdateCommand' && input.ReturnValues === 'ALL_NEW' && ddbState.priorBuffer.length === 2) {
+        bAppended.resolve(); // the second append is B's
+      }
+      return result;
+    });
+
+    // Invocation A appends delivery A (snapshot version 1) and reaches its
+    // reset; invocation B's append (version 2) then lands before it executes.
+    const pA = handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-A', score: 8, scoreLabel: 'pass', requestId: 'req-A' })])
+    );
+    await aAtReset.promise;
+    const pB = handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-B', score: 5, scoreLabel: 'pass', requestId: 'req-B' })])
+    );
+    const [resA, resB] = await Promise.all([pA, pB]);
+    expect(resA).toEqual({ statusCode: 200, body: 'ok' });
+    expect(resB).toEqual({ statusCode: 200, body: 'ok' });
+
+    // The core of the fix: A's failed reset cleared NOTHING — both deliveries'
+    // rows were still in the table the instant it settled. (Pre-fix, A's reset
+    // succeeded here and this array came back empty: B's rows gone for good.)
+    expect(bufferAfterAReset).toHaveLength(2);
+    expect(bufferAfterAReset.flatMap((e) => e.evaluatorResults.map((r) => r.requestId)).sort())
+      .toEqual(['req-A', 'req-B']);
+
+    // Exactly ONE archive and ONE PRD — B's — and the batch is the superset.
+    const batches = putsUnder('fleet-imp-agent/batches/');
+    expect(batches).toHaveLength(1);
+    const flat = JSON.parse(batches[0].input.Body).sessions.flatMap((s) => s?.evaluatorResults || []);
+    expect(flat.map((r) => r.requestId).sort()).toEqual(['req-A', 'req-B']);
+    expect(putsUnder('fleet-imp-agent/prd/')).toHaveLength(1);
+    expect(httpsRequest).toHaveBeenCalledTimes(1);
+
+    // A CASed on its snapshot's version (1) and lost; B won at version 2 and
+    // its reset cleared the buffer it had just archived.
+    expect(flushClaims()).toHaveLength(2);
+    expect(flushClaims()[0].ExpressionAttributeValues[':expectedVersion']).toBe(1);
+    expect(flushClaims()[1].ExpressionAttributeValues[':expectedVersion']).toBe(2);
+    expect(ddbState.priorBuffer).toEqual([]);
+
+    const claimLost = jsonLogs().filter((l) => l.event === 'eval.flush.claim_lost');
+    expect(claimLost).toHaveLength(1);
+    expect(claimLost[0].expectedBufferVersion).toBe(1);
   });
 
   // ── finding 7: the optimistic-locked scorecard merge ───────────────────────
@@ -2921,5 +3047,134 @@ describe('TEAM-3385: span-missing classification + concurrency claims', () => {
     expect(appendWrites()).toHaveLength(1);
     expect(putsUnder('fleet-imp-agent/batches/')).toHaveLength(1);
     expect(result).toEqual({ statusCode: 200, body: 'ok' });
+  });
+});
+
+// ─── TEAM-3406 F2: scored supersedes EVERY non-scored seen-set claim ──────────
+// The TEAM-3385 supersede rule was error-only, but 'other' claims are a real
+// shape too: a pending row (no score, no error yet) or a sampled-out delivery
+// claims its keys with outcome 'other'. Pre-fix, the later SCORED row for the
+// same evaluation attempt was dropped by checkSeenSet as a duplicate AND could
+// not overwrite the claim — the score was permanently lost from the scorecard
+// and the flushed batch. The rule is now the mirror of OUTCOME_RANK
+// (scored > other > error): an incoming scored row passes the check and its
+// claim overwrites ANY stored non-scored outcome, legacy no-attribute items
+// included.
+
+describe('TEAM-3406 F2: scored supersedes non-scored seen-set claims', () => {
+  let handler;
+  let dedupeResults;
+  let checkSeenSet;
+  let claimSeenSet;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET = 'agentcore-hub-artifacts-123456789012-us-east-1';
+    process.env.EVAL_CONFIG_TABLE = 'agentcore-hub-eval-config';
+    process.env.AWS_REGION = 'us-east-1';
+    process.env.AWS_ACCOUNT_ID = '123456789012';
+    process.env.IMPROVEMENT_AGENT_ARN = IMPROVER_ARN;
+    process.env.EVAL_SEEN_TABLE = 'agentcore-hub-eval-seen-test';
+    vi.resetModules();
+    ({ handler, dedupeResults, checkSeenSet, claimSeenSet } = await import('./index.mjs'));
+  });
+
+  beforeEach(() => {
+    // No flush in these tests: they assert the seen-set semantics, not synthesis.
+    ddbState.config = { ...ddbState.config, batchSize: 10 };
+  });
+
+  const appendWrites = () =>
+    sentCommands(ddbSend, 'UpdateCommand').filter((c) => c.input.ReturnValues === 'ALL_NEW');
+  const rowsOf = (append) => append.input.ExpressionAttributeValues[':new'][0].evaluatorResults;
+
+  // ── F2a: within one delivery (pins the OUTCOME_RANK invariant) ─────────────
+  it('within a delivery, a scored row beats a PENDING row on the same key, whichever order (F2a)', () => {
+    const pending = { sessionId: 's', evaluatorName: 'e', score: null, errorType: null, dedupKey: 'req|po|e' };
+    const ok = { sessionId: 's', evaluatorName: 'e', score: 8, errorType: null, dedupKey: 'req|po|e' };
+
+    expect(dedupeResults([pending, ok])).toEqual([ok]); // later scored upgrades in place
+    expect(dedupeResults([ok, pending])).toEqual([ok]); // pending never downgrades a score
+  });
+
+  // ── F2b: across deliveries, the read-only check phase ──────────────────────
+  it("checkSeenSet: a scored row supersedes a stored 'other'/legacy/'error' claim; non-scored rows are still dropped (F2b)", async () => {
+    ddbState.seenSetPersistent = true;
+    ddbState.seenItems.set('req|o1|e', { dedupKey: 'req|o1|e', outcome: 'other', expiresAt: 1 });
+    ddbState.seenItems.set('req|leg|e', { dedupKey: 'req|leg|e', expiresAt: 1 }); // legacy: no outcome attribute
+    ddbState.seenItems.set('req|err|e', { dedupKey: 'req|err|e', outcome: 'error', expiresAt: 1 });
+    ddbState.seenItems.set('req|o2|e', { dedupKey: 'req|o2|e', outcome: 'other', expiresAt: 1 });
+    ddbState.seenItems.set('req|o3|e', { dedupKey: 'req|o3|e', outcome: 'other', expiresAt: 1 });
+
+    const row = (dedupKey, fields) =>
+      ({ sessionId: 's', evaluatorName: 'e', score: null, errorType: null, dedupKey, ...fields });
+    const sessionData = {
+      evaluatorResults: [
+        row('req|o1|e', { score: 8 }), // scored vs stored 'other'   → retained (pre-fix: dropped)
+        row('req|leg|e', { score: 7 }), // scored vs legacy no-outcome → retained (reads as 'other')
+        row('req|err|e', { score: 6 }), // scored vs stored 'error'  → retained (the TEAM-3385 case)
+        row('req|o2|e', {}), // pending vs stored 'other'  → duplicate, dropped
+        row('req|o3|e', { errorType: 'ThrottlingException' }), // error vs 'other' → dropped
+      ],
+      duplicatesDropped: 0,
+    };
+
+    await checkSeenSet(sessionData, AGENT_ID);
+
+    expect(sessionData.evaluatorResults.map((r) => r.dedupKey)).toEqual([
+      'req|o1|e',
+      'req|leg|e',
+      'req|err|e',
+    ]);
+    expect(sessionData.duplicatesDropped).toBe(2);
+  });
+
+  // ── F2c: the claim phase's conditional writes ──────────────────────────────
+  it('claimSeenSet: scored claims use the three-arm supersede condition, non-scored claims guard on absence only (F2c)', async () => {
+    await claimSeenSet({ evaluatorResults: [{ dedupKey: 'req|c1|e', score: 8, errorType: null }] }, AGENT_ID);
+    await claimSeenSet({ evaluatorResults: [{ dedupKey: 'req|c2|e', score: null, errorType: null }] }, AGENT_ID);
+
+    // The middle arm matters: `#outcome <> :scored` alone is FALSE in DynamoDB
+    // when the attribute is missing, so legacy claims would be un-supersedable.
+    expect(ddbState.seenPuts.map((p) => p.ConditionExpression)).toEqual([
+      'attribute_not_exists(dedupKey) OR attribute_not_exists(#outcome) OR #outcome <> :scored',
+      'attribute_not_exists(dedupKey)',
+    ]);
+    expect(ddbState.seenPuts[0].ExpressionAttributeValues).toEqual({ ':scored': 'scored' });
+    expect(ddbState.seenPuts[0].Item.outcome).toBe('scored');
+    expect(ddbState.seenPuts[1].ExpressionAttributeValues).toBeUndefined();
+    expect(ddbState.seenPuts[1].Item.outcome).toBe('other');
+  });
+
+  // ── F2d: the full lifecycle that used to lose the score for good ───────────
+  it("a sampled-out pending claim no longer blocks the eventual score: 'other' → 'scored' → duplicate (F2d)", async () => {
+    ddbState.seenSetPersistent = true;
+    ddbState.config = { ...ddbState.config, sampleRate: 0 };
+
+    // Delivery 1: a pending row (no score, no error yet) arrives while the agent
+    // is sampled out. Dropping is final for THESE rows, so the key is claimed —
+    // with outcome 'other', which a later score may supersede.
+    const res1 = await handler(awslogsEvent([evalRecord({ sessionId: 'sess-po', requestId: 'req-po' })]));
+    expect(res1.body).toBe('sampled-out');
+    expect(appendWrites()).toHaveLength(0);
+    expect([...ddbState.seenItems.values()].map((i) => i.outcome)).toEqual(['other']);
+
+    // Delivery 2: the SCORED row for the same evaluation attempt. Pre-fix it was
+    // dropped as a duplicate of the pending claim, unrecoverably.
+    ddbState.config = { ...ddbState.config, sampleRate: 100 };
+    await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-po', score: 8, scoreLabel: 'pass', requestId: 'req-po' })])
+    );
+    expect(appendWrites()).toHaveLength(1);
+    expect(rowsOf(appendWrites()[0])).toHaveLength(1);
+    expect(rowsOf(appendWrites()[0])[0].score).toBe(8);
+    // The stored claim was upgraded in place, other → scored.
+    expect([...ddbState.seenItems.values()].map((i) => i.outcome)).toEqual(['scored']);
+
+    // Delivery 3: a re-delivery of the scored row is now a genuine duplicate.
+    await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-po', score: 8, scoreLabel: 'pass', requestId: 'req-po' })])
+    );
+    expect(appendWrites()).toHaveLength(2);
+    expect(rowsOf(appendWrites()[1])).toHaveLength(0);
   });
 });

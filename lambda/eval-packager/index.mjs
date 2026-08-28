@@ -184,6 +184,10 @@ export const handler = async (event) => {
     // Dropping the delivery is a FINAL decision, so claim its keys: without this
     // a re-delivery of the same rows would roll the sample dice again and could
     // buffer rows this invocation already accounted for in the EMF metrics above.
+    // Final for THESE rows only, though: a non-scored claim made here (a pending
+    // row claims 'other') is supersedable by a later SCORED delivery of the same
+    // evaluation attempt (TEAM-3406 F2) — sampling out a pending row must not
+    // permanently block the eventual score from reaching the scorecard.
     await claimSeenSet(sessionData, agentId);
     return { statusCode: 200, body: 'sampled-out' };
   }
@@ -240,12 +244,16 @@ export const handler = async (event) => {
       return { statusCode: 200, body: 'cooldown' };
     }
     // 7. Batch is full → flush to S3 + synthesize PRD.
-    //    config.lastFlushedAt is the value the cooldown decision above was made
-    //    from, and it is already stale by the whole per-record loop. Passing it
-    //    through turns the flush's buffer reset into a compare-and-swap on
-    //    exactly that value, so of two concurrent invocations that both decided
-    //    to flush, only one actually does (TEAM-3385 finding 6).
-    await flushBuffer(agentId, appended.buffer, batchSize, config.lastFlushedAt);
+    //    appended.bufferVersion is the version of the exact ALL_NEW snapshot in
+    //    appended.buffer. Passing it through turns the flush's buffer reset into
+    //    a compare-and-swap on that version, so the reset only succeeds if no
+    //    OTHER append landed after the snapshot this flush archives (TEAM-3406
+    //    F1 — the old lastFlushedAt CAS let a reset wipe rows appended between
+    //    the snapshot and the reset). Of two concurrent invocations that both
+    //    decided to flush, still exactly one actually does (TEAM-3385 finding 6);
+    //    the cooldown decision above still reads config.lastFlushedAt from the
+    //    invocation-start GetCommand.
+    await flushBuffer(agentId, appended.buffer, batchSize, appended.bufferVersion);
   }
 
   return { statusCode: 200, body: 'ok' };
@@ -723,11 +731,17 @@ const SEEN_CLAIM_CONCURRENCY = 10;
  *
  * One BatchGetItem per 100 keys, not one round-trip per row.
  *
- * A hit is a duplicate UNLESS the stored claim is an 'error' and the incoming row
- * is 'scored': a success supersedes an error claim for the same evaluation
- * attempt (TEAM-3385 finding 3 — see OUTCOME_RANK). The claim phase then
- * overwrites the stored outcome, so the NEXT re-delivery of that success is
- * dropped normally.
+ * A hit is a duplicate UNLESS the incoming row is 'scored' and the stored claim
+ * is anything BUT 'scored': a success supersedes EVERY non-scored claim for the
+ * same evaluation attempt, mirroring OUTCOME_RANK (scored > other > error).
+ * TEAM-3406 (F2) widened this from error-only: a pending row (outcome 'other' —
+ * a real shape from lib/classify.mjs) or a sampled-out delivery claims its keys
+ * with 'other', and under the old rule the later SCORED row for the same
+ * request-id/trace-span was dropped here as a duplicate AND could not overwrite
+ * the claim — the score was permanently lost from the scorecard and the batch.
+ * Legacy items with no outcome attribute read as 'other' below, so they too are
+ * upgradeable. The claim phase then overwrites the stored outcome with 'scored',
+ * so the NEXT re-delivery of that success is dropped normally.
  *
  * FAIL-OPEN throughout, matching aggregateScoresToDdb's non-fatal posture:
  * table unset/missing, SDK unavailable, any DDB error, or keys left in
@@ -792,7 +806,9 @@ export async function checkSeenSet(sessionData, agentId = '') {
   for (const record of keyed) {
     const prior = storedOutcome.get(record.dedupKey);
     if (prior === undefined) continue; // fresh key
-    if (prior === 'error' && recordOutcome(record) === 'scored') continue; // success supersedes
+    // A scored row supersedes ANY non-scored claim ('error' OR 'other' — see
+    // OUTCOME_RANK and the doc comment above; TEAM-3406 F2).
+    if (recordOutcome(record) === 'scored' && prior !== 'scored') continue;
     duplicateKeys.add(record.dedupKey);
   }
 
@@ -865,11 +881,16 @@ export async function claimSeenSet(sessionData, agentId = '') {
     let failedOpen = 0;
 
     const putClaim = async ([dedupKey, outcome]) => {
-      // A fresh key always claims. A 'scored' claim may ALSO overwrite an
-      // existing 'error' claim — the mirror of checkSeenSet's supersede rule,
-      // and the reason the outcome is stored at all. Any other lost condition is
-      // a benign concurrent claim by another invocation: the key is spoken for,
-      // which is exactly the state we wanted.
+      // A fresh key always claims. A 'scored' claim may ALSO overwrite any
+      // existing NON-scored claim ('error' or 'other') — the mirror of
+      // checkSeenSet's supersede rule, and the reason the outcome is stored at
+      // all (TEAM-3406 F2 widened this from error-only; see OUTCOME_RANK).
+      // `#outcome <> :scored` alone would NOT cover a legacy item that has no
+      // outcome attribute — in DynamoDB a comparison against a missing attribute
+      // is FALSE — hence the explicit attribute_not_exists(#outcome) arm, so
+      // legacy no-outcome claims are supersedable too. Any other lost condition
+      // is a benign concurrent claim by another invocation: the key is spoken
+      // for, which is exactly the state we wanted.
       const supersedes = outcome === 'scored';
       try {
         await client.send(
@@ -877,12 +898,12 @@ export async function claimSeenSet(sessionData, agentId = '') {
             TableName: SEEN_TABLE,
             Item: { dedupKey, expiresAt, outcome },
             ConditionExpression: supersedes
-              ? 'attribute_not_exists(dedupKey) OR #outcome = :error'
+              ? 'attribute_not_exists(dedupKey) OR attribute_not_exists(#outcome) OR #outcome <> :scored'
               : 'attribute_not_exists(dedupKey)',
             ...(supersedes
               ? {
                   ExpressionAttributeNames: { '#outcome': 'outcome' },
-                  ExpressionAttributeValues: { ':error': 'error' },
+                  ExpressionAttributeValues: { ':scored': 'scored' },
                 }
               : {}),
           })
@@ -1132,19 +1153,31 @@ export function emitEvalMetrics(
  * been seen. (The old code flushed per `sessionBuffer.length`, i.e. per delivery,
  * so it fired after ~1-2 runs instead of 10.)
  *
- * Returns { shouldFlush: boolean, buffer: array | null }
+ * TEAM-3406 (F1): every append atomically increments `bufferVersion` in the SAME
+ * UpdateCommand, and the ALL_NEW value rides back to the caller. That version is
+ * what flushBuffer's reset compare-and-swaps on: a reset can only succeed if NO
+ * append happened after the snapshot it is archiving, so a concurrent append can
+ * never be wiped by a reset whose snapshot predates it (see flushBuffer).
+ * DynamoDB ADD on a missing attribute starts from 0, so a legacy item that
+ * predates bufferVersion gets the attribute on its first post-deploy append —
+ * meaning every ALL_NEW this function returns carries a numeric bufferVersion.
+ *
+ * Returns { shouldFlush: boolean, buffer: array | null, bufferVersion: number }
  */
 async function appendToBuffer(agentId, sessionData, batchSize) {
   const sids = (sessionData.sessionIds || []).filter(Boolean);
 
   const expr = ['sessionBuffer = list_append(sessionBuffer, :new)', 'lastUpdatedAt = :now'];
-  const values = { ':new': [sessionData], ':now': new Date().toISOString() };
-  let updateExpression = 'SET ' + expr.join(', ');
+  const values = { ':new': [sessionData], ':now': new Date().toISOString(), ':one': 1 };
+  // bufferVersion increments on EVERY append (TEAM-3406 F1) — it is the flush
+  // reset's CAS token, so it must move whenever the buffer contents move.
+  const addClauses = ['bufferVersion :one'];
   if (sids.length > 0) {
     // ADD into a string set → distinct run ids only.
-    updateExpression += ' ADD bufferSessions :sids';
+    addClauses.push('bufferSessions :sids');
     values[':sids'] = new Set(sids);
   }
+  const updateExpression = 'SET ' + expr.join(', ') + ' ADD ' + addClauses.join(', ');
 
   const result = await ddb.send(
     new UpdateCommand({
@@ -1157,16 +1190,17 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
   );
 
   const buffer = result.Attributes.sessionBuffer || [];
+  const bufferVersion = result.Attributes.bufferVersion;
   const runIds = result.Attributes.bufferSessions; // DynamoDBDocument unmarshals a Set
   const runCount = runIds ? (runIds.size ?? (Array.isArray(runIds) ? runIds.length : 0)) : 0;
   const shouldFlush = runCount >= batchSize;
 
   console.log(
     `[eval-packager] Agent ${agentId}: distinct runs=${runCount}/${batchSize} ` +
-      `(buffer entries=${buffer.length})` + (shouldFlush ? ' → FLUSH' : '')
+      `(buffer entries=${buffer.length}, version=${bufferVersion})` + (shouldFlush ? ' → FLUSH' : '')
   );
 
-  return { shouldFlush, buffer };
+  return { shouldFlush, buffer, bufferVersion };
 }
 
 /**
@@ -1381,17 +1415,51 @@ async function aggregateScoresToDdb(agentId, entries = []) {
  * duplicate PRD (so a duplicate 14-agent workflow), and worse — the second reset
  * wiped any delivery appended between the two resets.
  *
- * So the reset is now a compare-and-swap on the very value the cooldown decision
- * was made from: `lastFlushedAt = :expected`, or attribute_not_exists for an agent
- * that has never flushed. Exactly one concurrent invocation can win it. The loser
- * produces NO side effects beyond its failed conditional write — no archive, no
- * batch metric, no synthesis — and its rows are not lost: they stay in the
- * winner's snapshot or in the fresh buffer the winner just created.
+ * TEAM-3406 (F1): the CAS guard is `bufferVersion`, not `lastFlushedAt`. The
+ * lastFlushedAt CAS made the reset single-winner, but it guarded the WRONG
+ * value: appendToBuffer never touched lastFlushedAt, so invocation B could
+ * append a delivery AFTER invocation A's ALL_NEW snapshot and BEFORE A's reset
+ * — A's reset still won its CAS and cleared the WHOLE buffer, erasing B's rows,
+ * which were absent from A's archived batch. B then lost its own flush CAS and,
+ * because B had already claimed its seen-set keys, a CloudWatch redelivery of
+ * B's rows was dropped by checkSeenSet → permanent, unrecoverable data loss.
  *
- * @param {string|undefined} expectedLastFlushedAt the `lastFlushedAt` this
- *   invocation's flush decision was based on (undefined = never flushed).
+ * So the reset is now conditioned on `bufferVersion = :expectedVersion`, the
+ * version of the exact snapshot this flush archives. appendToBuffer increments
+ * bufferVersion atomically on EVERY append, which gives the invariant this
+ * function relies on: versions are unique per append, so of N concurrent
+ * invocations — each holding the version its OWN append returned — only the one
+ * holding the LATEST version can win the CAS, and its ALL_NEW snapshot is by
+ * construction a superset of every earlier snapshot. Exactly one flush happens
+ * (TEAM-3385 finding 6 semantics preserved), and the winning batch always
+ * contains the losers' rows. The reset still SETs lastFlushedAt (the handler's
+ * cooldown gate reads it) — it is just no longer the CAS token.
+ *
+ * The reset deliberately does NOT remove or zero bufferVersion: it must
+ * monotonically increase for the item's lifetime. If the reset REMOVEd it, the
+ * next append would ADD from 0 again, and a stale in-flight flush holding an
+ * old low version could collide with the recycled value and win a CAS it must
+ * lose (classic ABA). One number attribute is cheap; correctness isn't.
+ *
+ * Legacy/mid-deploy note: an item written before this change has no
+ * bufferVersion attribute, but the handler only reaches this function through
+ * appendToBuffer's ALL_NEW, which (post-fix) always contains a numeric
+ * bufferVersion — the first post-deploy append ADDs the attribute (DynamoDB ADD
+ * starts a missing number at 0). An OLD-code invocation racing mid-deploy still
+ * CASes on lastFlushedAt, which this reset still SETs, so the old guard keeps
+ * functioning (with its known weakness) until the deploy completes.
+ *
+ * The loser produces NO side effects beyond its failed conditional write — no
+ * archive, no batch metric, no synthesis — and its rows are NOT lost: they are
+ * in the buffer snapshot of the concurrent appender that bumped the version
+ * past ours. That appender saw the same full run set (shouldFlush) and flushes
+ * them itself, or — if it crashed or hit the cooldown — the next delivery's
+ * flush picks them up from the still-intact buffer.
+ *
+ * @param {number} expectedBufferVersion the `bufferVersion` of the ALL_NEW
+ *   snapshot in `buffer` (from appendToBuffer) — the CAS token for the reset.
  */
-async function flushBuffer(agentId, buffer, batchSize, expectedLastFlushedAt) {
+async function flushBuffer(agentId, buffer, batchSize, expectedBufferVersion) {
   const timestamp = new Date().toISOString();
 
   // TEAM-3381 (FR-2.1 AC-1/AC-2): re-dedupe the MERGED buffer before anything
@@ -1427,8 +1495,12 @@ async function flushBuffer(agentId, buffer, batchSize, expectedLastFlushedAt) {
     sessions,
   };
 
-  // 1. CLAIM the batch: reset sessionBuffer AND the distinct-run set, but only if
-  //    lastFlushedAt still holds the value this flush decision was made from.
+  // 1. CLAIM the batch: reset sessionBuffer AND the distinct-run set, but only
+  //    if bufferVersion still holds the version of the snapshot being archived —
+  //    i.e. only if NO append landed since that snapshot (TEAM-3406 F1; the
+  //    invariant is in the doc comment above). bufferVersion is deliberately NOT
+  //    removed or reset here — it must increase monotonically forever, or a
+  //    recycled version could win a stale CAS (ABA; see doc comment).
   //    Concurrent invocations then append into a fresh buffer instead of
   //    re-flushing this one, and only the winner proceeds past here.
   try {
@@ -1438,32 +1510,33 @@ async function flushBuffer(agentId, buffer, batchSize, expectedLastFlushedAt) {
         Key: { agentId },
         UpdateExpression:
           'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts REMOVE bufferSessions',
-        ConditionExpression: expectedLastFlushedAt
-          ? 'lastFlushedAt = :expected'
-          : 'attribute_not_exists(lastFlushedAt)',
+        ConditionExpression: 'bufferVersion = :expectedVersion',
         ExpressionAttributeValues: {
           ':empty': [],
           ':ts': timestamp,
-          ...(expectedLastFlushedAt ? { ':expected': expectedLastFlushedAt } : {}),
+          ':expectedVersion': expectedBufferVersion,
         },
       })
     );
   } catch (err) {
     if (err?.name !== 'ConditionalCheckFailedException') throw err;
-    // Lost the race. Another invocation owns this batch: it has the snapshot (or
-    // a superset of it) and will archive and synthesize from it. Emitting the
-    // batch metric or archiving here would double-count a single batch, so stop
-    // before ANY side effect.
+    // Lost the race: the buffer version moved past our snapshot, so either a
+    // concurrent invocation appended after it (and, holding the later version,
+    // flushes a SUPERSET of our snapshot — our rows included) or it already won
+    // the reset. Nothing is lost: our rows are durably in the buffer or in the
+    // winner's batch. Emitting the batch metric or archiving here would
+    // double-count a single batch, so stop before ANY side effect.
     console.log(
       JSON.stringify({
         level: 'warn',
         event: 'eval.flush.claim_lost',
         agentId,
-        expectedLastFlushedAt: expectedLastFlushedAt ?? null,
+        expectedBufferVersion: expectedBufferVersion ?? null,
         bufferEntries: sessions.length,
         reason:
-          'another invocation claimed this flush (lastFlushedAt moved since the ' +
-          'cooldown check) — no archive, no batch metric, no PRD from this one',
+          'another invocation appended past this snapshot (bufferVersion moved) — ' +
+          'it flushes a superset including these rows; no archive, no batch ' +
+          'metric, no PRD from this one',
       })
     );
     return;

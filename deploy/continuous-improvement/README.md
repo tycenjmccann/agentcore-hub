@@ -43,11 +43,15 @@ CloudWatch Logs → eval-packager Lambda → DynamoDB buffer
      then writes one conditional `PutItem` per surviving key **after** the buffer
      append succeeds.
    - **Items** are `{ dedupKey, expiresAt, outcome }`, where `outcome` is
-     `scored` / `error` / `other`. It exists so a *scored* row supersedes an
-     earlier *error* claim for the same evaluation attempt: an eval retry storm
-     emits a throttled ERROR record and then the real SCORED record with the same
-     trace/span/evaluator, and dropping the second one would misclassify the
-     session as an error and lose the score.
+     `scored` / `error` / `other`. It exists so a *scored* row supersedes **any
+     non-scored** claim for the same evaluation attempt (TEAM-3406 — mirroring
+     the `OUTCOME_RANK` preference `scored > other > error`): an eval retry
+     storm emits a throttled ERROR record and then the real SCORED record with
+     the same trace/span/evaluator, and a pending row (or a sampled-out
+     delivery) claims `other` before the score exists — in either case dropping
+     the later scored row as a duplicate would misclassify the session and lose
+     the score permanently. Legacy items with no `outcome` attribute count as
+     non-scored and are supersedable too.
    - **Check-then-claim, never claim-then-process**: the claim is deliberately
      ordered after `appendToBuffer`. Claiming first meant that an invocation which
      threw *after* claiming (a DDB throttle, or the 400KB item cap on a long
@@ -97,13 +101,22 @@ conditionally written instead of being globally serialized:
   the rolling aggregates; per the fail-open posture used throughout this
   pipeline, that is preferred over silently losing an evaluation.
 - **Flush claim**: `flushBuffer`'s buffer-reset `UpdateItem` is conditioned on
-  `lastFlushedAt` holding the exact value the caller's cooldown decision was
-  made from (`attribute_not_exists(lastFlushedAt)` on the very first flush).
-  Of two invocations that both decide to flush, only one wins that
-  compare-and-swap; the loser gets `ConditionalCheckFailedException`, logs
-  `eval.flush.claim_lost`, and returns immediately with **no** S3 archive, no
-  batch metric and no PRD synthesis — a losing invocation has zero side
-  effects beyond the failed conditional write.
+  `bufferVersion` holding the version of the exact `ALL_NEW` snapshot the flush
+  is archiving (TEAM-3406). `appendToBuffer` atomically increments
+  `bufferVersion` on every append, so the reset can only succeed if **no**
+  append landed after the snapshot — the old `lastFlushedAt` condition (which
+  appends never touched) let a reset wipe rows appended between the snapshot
+  and the reset, losing them permanently once their seen-set keys were claimed.
+  Versions are unique per append, so of N concurrent invocations only the one
+  holding the latest version wins, and its snapshot is a superset of every
+  earlier one — of two invocations that both decide to flush, still exactly one
+  does, and the flushed batch always contains the loser's rows. The loser gets
+  `ConditionalCheckFailedException`, logs `eval.flush.claim_lost`, and returns
+  immediately with **no** S3 archive, no batch metric and no PRD synthesis — a
+  losing invocation has zero side effects beyond the failed conditional write.
+  The reset still writes `lastFlushedAt` (the flush-cooldown gate reads it) and
+  deliberately leaves `bufferVersion` in place, monotonically increasing forever
+  — removing it would let a recycled version win a stale compare-and-swap (ABA).
 - **Scorecard aggregation**: `aggregateScoresToDdb` merges each delivery's
   score deltas into the per-agent `evalScores` / `evalStatusCounts` under
   optimistic locking on an `evalAggVersion` counter, since the merge touches
