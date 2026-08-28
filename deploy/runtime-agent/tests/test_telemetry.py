@@ -40,7 +40,7 @@ def _load_anchor_helper():
         (
             node
             for node in tree.body
-            if isinstance(node, ast.FunctionDef)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name == "_emit_session_anchor_span"
         ),
         None,
@@ -167,7 +167,7 @@ class BlockingModel(FakeModel):
 def test_anchor_span_exported_without_agent_loop(span_exporter):
     """The anchor alone — no Agent run at all — yields one ENDED, exported,
     spec-compliant invoke_agent span carrying the eval-packager keys."""
-    _load_anchor_helper()("test_agent", "sess-123", "wf-1", "T-1")
+    asyncio.run(_load_anchor_helper()("test_agent", "sess-123", "wf-1", "T-1"))
 
     spans = span_exporter.get_finished_spans()
     assert len(spans) == 1, f"expected exactly one span, got {[s.name for s in spans]}"
@@ -180,12 +180,24 @@ def test_anchor_span_exported_without_agent_loop(span_exporter):
     assert span.end_time is not None, "anchor span must be ENDED at emission time"
 
 
+def test_anchor_span_session_id_falls_back_to_workflow_id(span_exporter):
+    """No runtime session_id (direct_code_deploy fallback path): the anchor
+    must key itself as wf-<workflow_id> — the same fallback the SDK span's
+    trace_attributes use — because an unkeyed span is invisible to the eval
+    service."""
+    asyncio.run(_load_anchor_helper()("test_agent", None, "wf-1", "T-1"))
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1, f"expected exactly one span, got {[s.name for s in spans]}"
+    assert spans[0].attributes.get("session.id") == "wf-wf-1"
+
+
 @pytest.mark.asyncio
 async def test_interrupted_agent_loop_still_yields_invoke_agent_span(span_exporter):
     """Simulated microVM death mid-loop: cancel the Agent task while its model
     stream is blocked. The exporter must already hold an invoke_agent span
     keyed by session.id — the anchor, emitted before the loop started."""
-    _load_anchor_helper()("test_agent", "sess-dead", "wf-1", "T-1")
+    await _load_anchor_helper()("test_agent", "sess-dead", "wf-1", "T-1")
 
     agent = Agent(
         model=BlockingModel(),
@@ -221,7 +233,7 @@ async def test_interrupted_agent_loop_still_yields_invoke_agent_span(span_export
 def test_anchor_plus_completed_run_yields_both_spans(span_exporter):
     """Happy path: anchor + completed run coexist, distinguishable by the
     agentcore.hub.anchor attribute (so eval tooling can prefer the real one)."""
-    _load_anchor_helper()("test_agent", "sess-123", "wf-1", "T-1")
+    asyncio.run(_load_anchor_helper()("test_agent", "sess-123", "wf-1", "T-1"))
     _invoke_agent(name="test_agent", trace_attributes={"session.id": "sess-123"})
 
     spans = [
