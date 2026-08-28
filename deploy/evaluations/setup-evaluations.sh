@@ -67,22 +67,28 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 #        truthful for the next reader.
 # -----------------------------------------------------------------------------
 
-# --- Fleet span_missing health alarm (TEAM-3103) ---------------------------
+# --- Fleet span_missing health alarm (TEAM-3103, reworked TEAM-3386) --------
 # deploy/evaluations/span-missing-alarm.json watches the EMF metrics that
 # lambda/eval-packager/index.mjs now emits (EvalSessionsTotal /
 # EvalSessionsSpanMissing in the AgentCoreHub/Evaluations namespace) and
 # fires when >50% of eval sessions across the fleet have no invoke_agent
-# span. Apply it with:
+# span. The alarm reads the DIMENSIONLESS fleet-rollup series (TEAM-3386) via
+# plain MetricStat entries — CloudWatch rejects alarms built on SEARCH()
+# expressions, so the per-agent SUM(SEARCH(...)) shape is dashboard-only. The
+# ratio is guarded with IF(total > 0, ...) so an all-duplicates delivery
+# (EvalSessionsTotal=0) reads as ratio 0, non-breaching. Apply it with:
 #
 #   aws cloudwatch put-metric-alarm --cli-input-json file://span-missing-alarm.json
 #
 # Rollout constraint: create this alarm ONLY AFTER the runtime telemetry fix
-# (R1/R2 — Strands/ADOT tracer wiring) is deployed AND at least one healthy
-# eval batch with non-zero EvalSessionsTotal has been observed in CloudWatch.
+# (R1/R2 — Strands/ADOT tracer wiring) AND the TEAM-3386 eval-packager
+# (dimensionless-rollup emitter) are deployed AND at least one healthy eval
+# batch with non-zero EvalSessionsTotal has been observed in CloudWatch.
 # Creating it earlier means every session is span_missing by definition and
-# the alarm fires immediately on stale data. Add AlarmActions (the
-# environment's SNS topic ARN) to the JSON at apply time — it's intentionally
-# omitted here since it's environment-specific.
+# the alarm fires immediately on stale data (or, pre-TEAM-3386 packager, the
+# dimensionless series doesn't exist and the alarm sits in INSUFFICIENT_DATA).
+# Add AlarmActions (the environment's SNS topic ARN) to the JSON at apply
+# time — it's intentionally omitted here since it's environment-specific.
 # -----------------------------------------------------------------------------
 
 # --- Eval health dashboard + success-rate alarm (TEAM-3368 §4.2/§4.3) -------
@@ -90,7 +96,11 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 # record emitted by lambda/eval-packager (EvalSessionsTotal / SpanMissing /
 # Error, EvalThrottleCount, EvalDuplicateResultCount) and
 # deploy/evaluations/eval-success-rate-alarm.json fires when the fleet's
-# (total - span_missing - errors) / total success rate drops below 0.8.
+# IF(total > 0, (total - span_missing - errors) / total, 1) success rate
+# drops below 0.8. Like the span_missing alarm it reads the DIMENSIONLESS
+# fleet-rollup series (TEAM-3386) via plain MetricStat entries — alarms can't
+# use SEARCH() — and the IF() guard treats a zero-total period
+# (all-duplicates delivery) as healthy (rate 1, non-breaching).
 #
 # Dashboard — safe to apply ANY time (widgets simply stay empty until the new
 # metrics flow; region is hardcoded us-east-1 in the JSON — substitute the
@@ -101,7 +111,8 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 #
 # Success-rate alarm — same rollout constraint as the span_missing alarm
 # above, plus the packager side: apply ONLY AFTER the P0-A runtime telemetry
-# fix AND the P0-B eval-packager fix are deployed, AND at least one healthy
+# fix AND the P0-B eval-packager fix AND the TEAM-3386 packager
+# (dimensionless-rollup emitter) are deployed, AND at least one healthy
 # batch with non-zero EvalSessionsTotal carrying the three new metrics
 # (EvalSessionsError, EvalThrottleCount, EvalDuplicateResultCount) has been
 # observed in CloudWatch. Applying earlier evaluates the rate on stale/partial

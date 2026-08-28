@@ -1,6 +1,6 @@
 {
   "AlarmName": "agentcore-hub-eval-success-rate",
-  "AlarmDescription": "Fleet eval success rate (total - span_missing - errors) / total dropped below 0.8. Covers BOTH failure modes: span_missing (runtime telemetry broken — no invoke_agent span) AND error sessions, including judge throttling (ThrottlingException) and validation failures. Fires on 3 of 4 hourly datapoints. DEPLOYMENT ORDER (TEAM-3376): apply only AFTER (a) the runtime anchor-span fix is deployed to the fleet and (b) at least one healthy batch with non-zero EvalSessionsTotal and the EvalSessionsError metric has been observed in CloudWatch — earlier, the rate computes over pre-fix data and fires immediately. INSUFFICIENT_DATA when no eval sessions arrive (quiet hours) — expected, do not page on it. Add AlarmActions (environment SNS topic ARN) at apply time.",
+  "AlarmDescription": "Fleet eval success rate IF(total > 0, (total - span_missing - errors) / total, 1) dropped below 0.8. Covers BOTH failure modes: span_missing (runtime telemetry broken — no invoke_agent span) AND error sessions, including judge throttling (ThrottlingException) and validation failures. Reads the dimensionless fleet-rollup series the eval-packager emits (TEAM-3386) — CloudWatch rejects alarms built on SEARCH() expressions, so per-agent SUM(SEARCH(...)) is not an option. A zero-total period (e.g. an all-duplicates delivery, which emits EvalSessionsTotal=0) is explicitly treated as healthy: the IF() guard pins the rate to 1, non-breaching for LessThanThreshold 0.8. Fires on 3 of 4 hourly datapoints. DEPLOYMENT ORDER (TEAM-3376/TEAM-3386): apply only AFTER (a) the runtime anchor-span fix is deployed to the fleet, (b) the eval-packager version that emits the dimensionless rollup (TEAM-3386) is deployed, and (c) at least one healthy batch with non-zero EvalSessionsTotal and the EvalSessionsError metric has been observed in CloudWatch — earlier, the rate computes over pre-fix data and fires immediately. INSUFFICIENT_DATA when no eval sessions arrive (quiet hours) — expected, do not page on it. Add AlarmActions (environment SNS topic ARN) at apply time.",
   "ActionsEnabled": true,
   "EvaluationPeriods": 4,
   "DatapointsToAlarm": 3,
@@ -10,22 +10,46 @@
   "Metrics": [
     {
       "Id": "total",
-      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 3600))",
+      "MetricStat": {
+        "Metric": {
+          "Namespace": "AgentCoreHub/Evaluations",
+          "MetricName": "EvalSessionsTotal",
+          "Dimensions": []
+        },
+        "Period": 3600,
+        "Stat": "Sum"
+      },
       "ReturnData": false
     },
     {
       "Id": "missing",
-      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsSpanMissing\"', 'Sum', 3600))",
+      "MetricStat": {
+        "Metric": {
+          "Namespace": "AgentCoreHub/Evaluations",
+          "MetricName": "EvalSessionsSpanMissing",
+          "Dimensions": []
+        },
+        "Period": 3600,
+        "Stat": "Sum"
+      },
       "ReturnData": false
     },
     {
       "Id": "errors",
-      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsError\"', 'Sum', 3600))",
+      "MetricStat": {
+        "Metric": {
+          "Namespace": "AgentCoreHub/Evaluations",
+          "MetricName": "EvalSessionsError",
+          "Dimensions": []
+        },
+        "Period": 3600,
+        "Stat": "Sum"
+      },
       "ReturnData": false
     },
     {
       "Id": "rate",
-      "Expression": "(total - missing - errors) / total",
+      "Expression": "IF(total > 0, (total - missing - errors) / total, 1)",
       "Label": "eval success rate (fleet)",
       "ReturnData": true
     }

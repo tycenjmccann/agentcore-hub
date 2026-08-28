@@ -1066,9 +1066,10 @@ export function countThrottles(entries) {
  * TEAM-3368 §4.1 extends the TEAM-3103 record (Total/SpanMissing) with
  * EvalSessionsError, EvalThrottleCount, EvalDuplicateResultCount, plus
  * EvalDepChainExcludedCount (the Part A scope filter's removals). Still ONE
- * record: the eval-health dashboard and the success-rate alarm SEARCH this
- * namespace, and healthy batches must write explicit 0 datapoints (a metric
- * that goes silent is indistinguishable from a broken emitter).
+ * record: the eval-health dashboard SEARCHes this namespace and the eval
+ * alarms read the dimensionless fleet-rollup series, and healthy batches must
+ * write explicit 0 datapoints (a metric that goes silent is indistinguishable
+ * from a broken emitter).
  */
 export function emitEvalMetrics(
   agentName,
@@ -1091,7 +1092,12 @@ export function emitEvalMetrics(
       Timestamp: Date.now(),
       CloudWatchMetrics: [{
         Namespace: 'AgentCoreHub/Evaluations',
-        Dimensions: [['AgentName']],
+        // TEAM-3386: the second (empty) dimension set publishes every metric
+        // as a dimensionless fleet-rollup series alongside the per-agent one
+        // (same pattern as lib/classify.mjs emfRecord). The eval alarms use
+        // plain metric math over the rollup — CloudWatch rejects alarms built
+        // on SEARCH() expressions.
+        Dimensions: [['AgentName'], []],
         Metrics: [
           { Name: 'EvalSessionsTotal', Unit: 'Count' },
           { Name: 'EvalSessionsSpanMissing', Unit: 'Count' },

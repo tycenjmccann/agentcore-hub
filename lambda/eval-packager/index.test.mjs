@@ -1016,7 +1016,9 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
     const emf = record._aws.CloudWatchMetrics;
     expect(emf).toHaveLength(1);
     expect(emf[0].Namespace).toBe('AgentCoreHub/Evaluations');
-    expect(emf[0].Dimensions).toEqual([['AgentName']]);
+    // TEAM-3386: exactly two dimension sets — per-agent plus the dimensionless
+    // fleet rollup the alarms read (alarms can't use SEARCH expressions).
+    expect(emf[0].Dimensions).toEqual([['AgentName'], []]);
     expect(emf[0].Metrics.map((m) => m.Name).sort()).toEqual([
       'EvalDepChainExcludedCount',
       'EvalDuplicateResultCount',
@@ -1591,7 +1593,7 @@ describe('eval health metrics (TEAM-3368 §4)', () => {
     const [record] = records;
     const [directive] = record._aws.CloudWatchMetrics;
     expect(directive.Namespace).toBe('AgentCoreHub/Evaluations');
-    expect(directive.Dimensions).toEqual([['AgentName']]);
+    expect(directive.Dimensions).toEqual([['AgentName'], []]);
     // TEAM-3376 adds the two dimensionless session-rate metrics; everything
     // else stays a Count.
     expect(
@@ -1705,15 +1707,162 @@ describe('eval health metrics (TEAM-3368 §4)', () => {
     );
     expect(alarm.AlarmName).toBe('agentcore-hub-eval-success-rate');
     expect(alarm.ComparisonOperator).toBe('LessThanThreshold');
-    expect(alarm.Metrics.find((m) => m.ReturnData).Expression).toBe('(total - missing - errors) / total');
+    // TEAM-3386: IF() zero-guard — a total=0 hour (all-duplicates delivery)
+    // reads as healthy instead of dividing by zero into missing data.
+    expect(alarm.Metrics.find((m) => m.ReturnData).Expression).toBe(
+      'IF(total > 0, (total - missing - errors) / total, 1)'
+    );
 
-    const rate = (total, missing, errors) => (total - missing - errors) / total;
+    const rate = (total, missing, errors) =>
+      total > 0 ? (total - missing - errors) / total : 1;
     const fires = (r) => r < alarm.Threshold;
 
     expect(rate(10, 0, 0)).toBe(1.0);
     expect(fires(rate(10, 0, 0))).toBe(false); // healthy batch: no fire
     expect(rate(10, 3, 4)).toBeCloseTo(0.3);
     expect(fires(rate(10, 3, 4))).toBe(true); // broken batch: 0.3 < 0.8 fires
+    expect(rate(0, 0, 0)).toBe(1); // zero-total hour: guarded, healthy
+    expect(fires(rate(0, 0, 0))).toBe(false);
+  });
+});
+
+// ─── TEAM-3386: alarm assets — dimensionless MetricStat + IF() zero-guard ────
+// CloudWatch rejects alarms built on SEARCH() expressions, so both alarm JSONs
+// must use plain MetricStat entries against the dimensionless fleet-rollup
+// series the packager emits (Dimensions [['AgentName'], []]), and the ratio
+// expressions must be IF()-guarded so a total=0 hour (all-duplicates delivery)
+// evaluates as a healthy datapoint instead of a divide-by-zero gap.
+
+describe('TEAM-3386: alarm asset shape + 3-of-4 alarm math', () => {
+  const loadAlarm = (file) =>
+    JSON.parse(readFileSync(new URL(`../../deploy/evaluations/${file}`, import.meta.url), 'utf8'));
+
+  const ALARMS = [
+    {
+      file: 'eval-success-rate-alarm.json',
+      guard: 'IF(total > 0, (total - missing - errors) / total, 1)',
+      metricNames: ['EvalSessionsTotal', 'EvalSessionsSpanMissing', 'EvalSessionsError'],
+    },
+    {
+      file: 'span-missing-alarm.json',
+      guard: 'IF(total > 0, missing / total, 0)',
+      metricNames: ['EvalSessionsSpanMissing', 'EvalSessionsTotal'],
+    },
+  ];
+
+  it.each(ALARMS)('$file: no Metrics entry uses SEARCH', ({ file }) => {
+    const alarm = loadAlarm(file);
+    for (const entry of alarm.Metrics) {
+      expect(JSON.stringify(entry)).not.toMatch(/SEARCH/);
+    }
+  });
+
+  it.each(ALARMS)(
+    '$file: every non-expression entry is a dimensionless hourly-Sum MetricStat with ReturnData false',
+    ({ file, metricNames }) => {
+      const alarm = loadAlarm(file);
+      const stats = alarm.Metrics.filter((m) => !m.Expression);
+      expect(stats.map((m) => m.MetricStat.Metric.MetricName)).toEqual(metricNames);
+      for (const entry of stats) {
+        expect(entry.MetricStat.Metric.Namespace).toBe('AgentCoreHub/Evaluations');
+        expect(entry.MetricStat.Metric.Dimensions).toEqual([]);
+        expect(entry.MetricStat.Period).toBe(3600);
+        expect(entry.MetricStat.Stat).toBe('Sum');
+        expect(entry.ReturnData).toBe(false);
+      }
+    }
+  );
+
+  it.each(ALARMS)('$file: the single ReturnData entry is the IF() zero-guard', ({ file, guard }) => {
+    const alarm = loadAlarm(file);
+    const returned = alarm.Metrics.filter((m) => m.ReturnData);
+    expect(returned).toHaveLength(1);
+    expect(returned[0].Expression).toBe(guard);
+  });
+
+  // Pure-JS evaluator of the alarms' N-of-M semantics: a window of the last
+  // EvaluationPeriods hourly datapoints alarms when at least DatapointsToAlarm
+  // of them breach the threshold under the alarm's comparison operator.
+  const alarmState = (alarm, rates) => {
+    const window = rates.slice(-alarm.EvaluationPeriods);
+    const breaches =
+      alarm.ComparisonOperator === 'LessThanThreshold'
+        ? window.filter((r) => r < alarm.Threshold)
+        : window.filter((r) => r > alarm.Threshold);
+    return breaches.length >= alarm.DatapointsToAlarm ? 'ALARM' : 'OK';
+  };
+
+  it('success rate 3-of-4: healthy OK, 3 breaching hours ALARM', () => {
+    const alarm = loadAlarm('eval-success-rate-alarm.json');
+    expect(alarm.EvaluationPeriods).toBe(4);
+    expect(alarm.DatapointsToAlarm).toBe(3);
+    const rate = ({ total, missing, errors }) =>
+      total > 0 ? (total - missing - errors) / total : 1;
+
+    const healthy = [
+      { total: 10, missing: 0, errors: 0 },
+      { total: 8, missing: 0, errors: 0 },
+      { total: 12, missing: 0, errors: 0 },
+      { total: 10, missing: 0, errors: 0 },
+    ].map(rate);
+    expect(healthy).toEqual([1, 1, 1, 1]);
+    expect(alarmState(alarm, healthy)).toBe('OK');
+
+    const broken = [
+      { total: 10, missing: 0, errors: 0 }, // 1.0 — healthy hour
+      { total: 10, missing: 3, errors: 4 }, // 0.3 — breach
+      { total: 10, missing: 5, errors: 2 }, // 0.3 — breach
+      { total: 10, missing: 4, errors: 4 }, // 0.2 — breach
+    ].map(rate);
+    expect(broken).toEqual([1, 0.3, 0.3, 0.2]);
+    expect(alarmState(alarm, broken)).toBe('ALARM');
+  });
+
+  it('success rate: a total=0 hour between breaching hours reads rate=1, so 2-of-4 does NOT alarm', () => {
+    const alarm = loadAlarm('eval-success-rate-alarm.json');
+    const rate = ({ total, missing, errors }) =>
+      total > 0 ? (total - missing - errors) / total : 1;
+
+    // Unguarded, the total=0 hour is 0/0 = NaN — the datapoint silently
+    // vanishes and the alarm evaluates 3-of-3 breaching over what remains.
+    expect((0 - 0 - 0) / 0).toBeNaN();
+
+    const series = [
+      { total: 10, missing: 3, errors: 4 }, // 0.3 — breach
+      { total: 0, missing: 0, errors: 0 },  // all-duplicates delivery: guard ⇒ 1
+      { total: 10, missing: 5, errors: 2 }, // 0.3 — breach
+      { total: 10, missing: 0, errors: 0 }, // 1.0 — healthy
+    ].map(rate);
+    expect(series).toEqual([0.3, 1, 0.3, 1]);
+    expect(series[1]).toBe(1); // the zero-total hour is explicitly non-breaching
+    expect(alarmState(alarm, series)).toBe('OK'); // 2 of 4 < DatapointsToAlarm 3
+  });
+
+  it('span-missing ratio: total=0 hour reads ratio 0 (non-breaching for >0.5), 3-of-4 still fires', () => {
+    const alarm = loadAlarm('span-missing-alarm.json');
+    expect(alarm.ComparisonOperator).toBe('GreaterThanThreshold');
+    expect(alarm.Threshold).toBe(0.5);
+    const ratio = ({ total, missing }) => (total > 0 ? missing / total : 0);
+
+    // total=0 ⇒ spanMissing is necessarily 0 too: guard pins the ratio to 0.
+    const guarded = [
+      { total: 10, missing: 6 }, // 0.6 — breach
+      { total: 0, missing: 0 },  // all-duplicates delivery: guard ⇒ 0
+      { total: 10, missing: 6 }, // 0.6 — breach
+      { total: 10, missing: 0 }, // 0.0 — healthy
+    ].map(ratio);
+    expect(guarded).toEqual([0.6, 0, 0.6, 0]);
+    expect(guarded[1]).toBe(0); // the zero-total hour is explicitly non-breaching
+    expect(alarmState(alarm, guarded)).toBe('OK'); // 2 of 4
+
+    const broken = [
+      { total: 10, missing: 6 }, // 0.6 — breach
+      { total: 10, missing: 9 }, // 0.9 — breach
+      { total: 10, missing: 0 }, // 0.0 — healthy
+      { total: 10, missing: 8 }, // 0.8 — breach
+    ].map(ratio);
+    expect(broken).toEqual([0.6, 0.9, 0, 0.8]);
+    expect(alarmState(alarm, broken)).toBe('ALARM'); // 3 of 4
   });
 });
 
@@ -2116,7 +2265,7 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
     const emf = lastEvalMetrics();
     const [directive] = emf._aws.CloudWatchMetrics;
     expect(directive.Namespace).toBe('AgentCoreHub/Evaluations');
-    expect(directive.Dimensions).toEqual([['AgentName']]);
+    expect(directive.Dimensions).toEqual([['AgentName'], []]);
     expect(emf.AgentName).toBe(AGENT_ID);
     expect(emf.EvalSessionsTotal).toBe(1);
     expect(emf.EvalThrottleRate).toBe(1);
@@ -2171,7 +2320,7 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
     const emf = lastEvalMetrics();
     const [directive] = emf._aws.CloudWatchMetrics;
     expect(directive.Namespace).toBe('AgentCoreHub/Evaluations');
-    expect(directive.Dimensions).toEqual([['AgentName']]);
+    expect(directive.Dimensions).toEqual([['AgentName'], []]);
     expect(directive.Metrics.map((m) => m.Name)).toContain('EvalThrottleRate');
     expect(emf.EvalSessionsTotal).toBe(2);
     expect(emf.EvalThrottleRate).toBe(0);

@@ -26,7 +26,7 @@
           [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 3600))", "id": "total", "visible": false } ],
           [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsSpanMissing\"', 'Sum', 3600))", "id": "missing", "visible": false } ],
           [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsError\"', 'Sum', 3600))", "id": "errors", "visible": false } ],
-          [ { "expression": "(total - missing - errors) / total", "id": "rate", "label": "eval success rate (fleet)" } ]
+          [ { "expression": "IF(total > 0, (total - missing - errors) / total, 1)", "id": "rate", "label": "eval success rate (fleet)" } ]
         ],
         "yAxis": { "left": { "min": 0, "max": 1 } },
         "annotations": {
@@ -71,7 +71,7 @@
         "metrics": [
           [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsSpanMissing\"', 'Sum', 3600))", "id": "smissing", "visible": false } ],
           [ { "expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 3600))", "id": "stotal", "visible": false } ],
-          [ { "expression": "smissing / stotal", "id": "sratio", "label": "span_missing ratio (fleet)" } ]
+          [ { "expression": "IF(stotal > 0, smissing / stotal, 0)", "id": "sratio", "label": "span_missing ratio (fleet)" } ]
         ],
         "yAxis": { "left": { "min": 0, "max": 1 } },
         "annotations": {
