@@ -30,9 +30,11 @@ permissions: {}
 jobs:
   baseline:
     runs-on: ubuntu-latest
-    # ~3× the gate battery's budget: --repeat 3 runs every case three times to
-    # stabilize per-evaluator means.
-    timeout-minutes: 30
+    # Must exceed the runner's own watchdog (BATTERY_RUN_DEADLINE_SECONDS=2400s
+    # on the regenerate step, i.e. 40 min) plus checkout/npm ci overhead, so the
+    # runner always dies cleanly on its own deadline — with a spend report and
+    # per-case evidence — instead of being SIGKILLed by the job timeout.
+    timeout-minutes: 50
     permissions:
       contents: write # commit-back of baseline.json
       id-token: write # OIDC role assumption
@@ -76,6 +78,13 @@ jobs:
           role-session-name: gha-baseline-${{ github.run_id }}
 
       - name: Regenerate baseline (repeat 3)
+        # Explicit run deadline (beats the runner's baseline-mode auto-scale of
+        # 780s × repeat = 2340s): 2400s < the 50-min job timeout above, keeping
+        # the ordering runner watchdog < job timeout — the watchdog aborts the
+        # run cleanly (results + spend total printed) rather than the job
+        # runner SIGKILLing the process mid-write.
+        env:
+          BATTERY_RUN_DEADLINE_SECONDS: "2400"
         run: node evals/battery/run-battery.mjs --baseline-mode --repeat 3 --out evals/battery/baseline.json
 
       # C3 provenance: source_commit is the sha the baseline was GENERATED

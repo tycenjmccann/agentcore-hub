@@ -2,7 +2,7 @@
   "id": "qa-verifier-regression-001",
   "title": "QA verification: blueprint-first verification with report_completion verdict, never self-transitioning (motivating incident case)",
   "targetAgentId": "agentcore_hub_qa_verifier",
-  "taskPrompt": "# Your Assignment: QA verification: archive-workflow feature branch\n\n## Ticket\nID: BATT-110\nDescription: Verify the dev work summarized in dev-output.md against the acceptance criteria in ticket.json (both in your input files).\n\n## Workflow Context\nworkflow_id: wf_battery_qa_regression_001\nepic_id: BATT-100\nticket_id: BATT-110\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_qa_regression_001/shared/\nyour_workspace: workflows/wf_battery_qa_regression_001/agents/agentcore_hub_qa_verifier/",
+  "taskPrompt": "# Your Assignment: QA verification: archive-workflow feature branch\n\n## Ticket\nID: BATT-110\nDescription: Verify the dev work summarized in dev-output.md against the acceptance criteria in ticket.json (both in your input files). Deliver your verdict with per-criterion evidence via WorkflowOutput___report_completion. Do NOT transition the ticket yourself — the orchestrator owns ticket status.\n\n## Workflow Context\nworkflow_id: wf_battery_qa_regression_001\nepic_id: BATT-100\nticket_id: BATT-110\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_qa_regression_001/shared/\nyour_workspace: workflows/wf_battery_qa_regression_001/agents/agentcore_hub_qa_verifier/",
   "referenceInputs": {
     "expectedOutcomes": [
       "Loads the qa-verifier blueprint before doing any verification work",

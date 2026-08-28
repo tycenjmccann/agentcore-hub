@@ -31,7 +31,8 @@ import { execFileSync } from "node:child_process";
 import { preflight, resolveGateConfig, SCORING_BACKEND as CASES_BACKEND } from "./lib/cases.mjs";
 import { evaluateSuite } from "./lib/thresholds.mjs";
 import { createRegistry, FORBIDDEN_TOOLS } from "./lib/registry.mjs";
-import { runCase, systemPromptPath, MODEL_TIERS, MAX_TRANSPORT_RETRIES, BATTERY_TENANT } from "./lib/agent-runner.mjs";
+import { runCase, systemPromptPath, requiredToolFailureError, MODEL_TIERS, MAX_TRANSPORT_RETRIES, BATTERY_TENANT } from "./lib/agent-runner.mjs";
+import { baselineQuorum, aggregateBaselineCase, topUpCase, MAX_TOPUP_RUNS, resolveRunDeadline, DEFAULT_RUN_DEADLINE_SECONDS } from "./lib/baseline.mjs";
 import { configFingerprint, appendFlakeLedger, readFlakeLedger, flagFlakyCases } from "./lib/flake.mjs";
 import { createSpendLedger } from "./lib/spend.mjs";
 import { createConverseTransport, scoreCase, SCORING_BACKEND } from "./lib/scoring.mjs";
@@ -57,7 +58,10 @@ const envInt = (name, fallback) => {
 const BEDROCK_CONCURRENCY = envInt("BATTERY_BEDROCK_CONCURRENCY", 3);
 // Whole-run watchdog: past this, outstanding work is aborted, unfinished cases
 // report timed_out, and the results/summary files are STILL written (FAIL).
-const RUN_DEADLINE_SECONDS = envInt("BATTERY_RUN_DEADLINE_SECONDS", 13 * 60);
+// Baseline mode runs every case --repeat times, so its DEFAULT deadline scales
+// with repeat (TEAM-3405, lib/baseline.mjs); an explicit env value always wins
+// verbatim.
+const EXPLICIT_RUN_DEADLINE_SECONDS = envInt("BATTERY_RUN_DEADLINE_SECONDS", 0) || null;
 // End-to-end per-case deadline (agent loop + judge scoring). Default derives
 // from the case's own agent timeout plus a judge budget per evaluator.
 const CASE_DEADLINE_SECONDS = envInt("BATTERY_CASE_DEADLINE_SECONDS", 0) || null;
@@ -67,6 +71,15 @@ const MAX_CASE_TRANSPORT_RETRIES = envInt("BATTERY_MAX_TRANSPORT_RETRIES", MAX_T
 const caseDeadlineSeconds = (def) =>
   CASE_DEADLINE_SECONDS ?? def.timeoutSeconds + JUDGE_BUDGET_SECONDS_PER_EVALUATOR * def.evaluators.length;
 const clock = () => new Date().toISOString().slice(11, 19);
+
+// TEAM-3405: every exit path that could have spent Bedrock money must report
+// the ledger total — including the watchdog handler and the top-level crash
+// handler, hence a module-level reference set the moment the ledger exists.
+let activeLedger = null;
+const printSpend = (log = console.error) => {
+  if (activeLedger)
+    log(`Total spend: $${activeLedger.spentUsd.toFixed(4)} (ceiling $${activeLedger.maxUsd.toFixed(2)})`);
+};
 
 // ─── Flags ───────────────────────────────────────────────────────────────────
 
@@ -330,17 +343,29 @@ async function main() {
   // artifact — progress lines carry runner error strings.
   const progress = (record) => appendFileSync(progressPath, redactText(JSON.stringify(record)).text + "\n");
 
+  // Effective whole-run deadline (TEAM-3405): baseline mode's default scales
+  // with --repeat (a repeat-3 baseline run is ~3× a gate run); an explicit
+  // BATTERY_RUN_DEADLINE_SECONDS is honored verbatim in every mode.
+  const { seconds: runDeadlineSeconds, autoScaled: runDeadlineScaled } = resolveRunDeadline({
+    baselineMode: flags.baselineMode,
+    repeat: flags.repeat,
+    explicitSeconds: EXPLICIT_RUN_DEADLINE_SECONDS,
+  });
+
   // Whole-run watchdog: when it fires, every case deadline linked to it aborts,
   // in-flight cases report timed_out/unscored, unstarted cases report timed_out
   // immediately — and the suite still completes and writes its results (FAIL).
   const runWatchdog = new AbortController();
   const runTimer = setTimeout(
-    () => runWatchdog.abort(new Error(`run deadline of ${RUN_DEADLINE_SECONDS}s exceeded`)),
-    RUN_DEADLINE_SECONDS * 1000
+    () => runWatchdog.abort(new Error(`run deadline of ${runDeadlineSeconds}s exceeded`)),
+    runDeadlineSeconds * 1000
   );
   runWatchdog.signal.addEventListener(
     "abort",
-    () => console.error(`[${clock()}] RUN DEADLINE — aborting outstanding cases (${RUN_DEADLINE_SECONDS}s)`),
+    () => {
+      console.error(`[${clock()}] RUN DEADLINE — aborting outstanding cases (${runDeadlineSeconds}s)`);
+      printSpend();
+    },
     { once: true }
   );
 
@@ -362,9 +387,11 @@ async function main() {
   // Baseline mode runs every case `--repeat` times, so its ceiling scales.
   const spendCeilingUsd = flags.baselineMode ? thresholds.maxRunUsd * flags.repeat : thresholds.maxRunUsd;
   const ledger = createSpendLedger({ maxUsd: spendCeilingUsd });
+  activeLedger = ledger;
   console.log(`Spend ceiling: $${spendCeilingUsd.toFixed(2)} (maxRunUsd from ${gate ? `${gate.baseRef} ` : "PR-head "}thresholds.json)`);
   console.log(
-    `Limits: bedrock concurrency ${BEDROCK_CONCURRENCY}, run deadline ${RUN_DEADLINE_SECONDS}s, ` +
+    `Limits: bedrock concurrency ${BEDROCK_CONCURRENCY}, run deadline ${runDeadlineSeconds}s` +
+      `${runDeadlineScaled ? ` (auto-scaled: ${DEFAULT_RUN_DEADLINE_SECONDS}s × repeat ${flags.repeat}, baseline mode)` : ""}, ` +
       `case deadline ${CASE_DEADLINE_SECONDS ? `${CASE_DEADLINE_SECONDS}s` : `timeoutSeconds + ${JUDGE_BUDGET_SECONDS_PER_EVALUATOR}s/evaluator`}, ` +
       `transport retries/case ${MAX_CASE_TRANSPORT_RETRIES}. Progress: ${progressPath}`
   );
@@ -402,6 +429,7 @@ async function main() {
       runtimeSeconds,
       scores: final.scores,
       error: final.error ?? null,
+      infraRetried: final.infraRetried === true,
     });
     return final;
   }
@@ -463,7 +491,7 @@ async function main() {
       } else if (run.status === "failed_forbidden_tool") {
         error = `forbidden tool(s) called: ${run.forbiddenHits.join(", ")}`;
       } else if (run.status === "failed_required_tool") {
-        error = `required tool(s) never called: ${run.missingRequiredTools.join(", ")}`;
+        error = requiredToolFailureError(run);
       }
       return finishCase(
         def,
@@ -489,43 +517,84 @@ async function main() {
         "warn: --out points at the canonical evals/battery/baseline.json — allowed only because it was passed explicitly (merge-to-main baseline workflow)."
       );
     }
-    console.log(`Baseline mode: ${selected.length} case(s) × ${flags.repeat} run(s) → ${outPath}`);
+    // Baseline repeat robustness (TEAM-3405): a single flaky run out of N must
+    // not sink the whole generation. A case is baseline-eligible when at least
+    // ceil(2N/3) of its N runs scored (2-of-3 for repeat 3); the per-evaluator
+    // means are computed over the SCORED runs only (lib/baseline.mjs).
+    // Below-quorum still fails the whole run — an unsound baseline is never
+    // written.
+    const quorum = baselineQuorum(flags.repeat);
+    console.log(
+      `Baseline mode: ${selected.length} case(s) × ${flags.repeat} run(s) → ${outPath} (quorum: ${quorum}/${flags.repeat} scored runs per case)`
+    );
     const runs = selected.flatMap((def) => Array.from({ length: flags.repeat }, () => def));
     const results = await runPool(runs, POOL_SIZE, executeAndScore, onWorkerError);
+
+    // Per-case top-up pass (TEAM-3405): a case still below quorum after the
+    // main pass gets up to MAX_TOPUP_RUNS extra runs, stopping at quorum.
+    // The run watchdog stays armed and executeAndScore re-checks the deadline
+    // and the spend ceiling before every top-up run, so top-ups spend from
+    // the same budgets — never past them. Exhausted top-ups still fail the
+    // whole baseline below.
+    const topUpCounts = new Map();
+    if (!runWatchdog.signal.aborted) {
+      const needsTopUp = selected.filter(
+        (def) => results.filter((r) => r.id === def.id && r.status === "scored").length < quorum
+      );
+      if (needsTopUp.length > 0) {
+        console.log(
+          `Top-up pass: ${needsTopUp.length} case(s) below quorum after the main pass (max ${MAX_TOPUP_RUNS} extra run(s) each)`
+        );
+        await runPool(
+          needsTopUp,
+          POOL_SIZE,
+          async (def) => {
+            const used = await topUpCase({
+              def,
+              results,
+              quorum,
+              repeat: flags.repeat,
+              runOnce: executeAndScore,
+              log: (msg) => console.log(`[${clock()}] ${msg}`),
+            });
+            topUpCounts.set(def.id, used);
+          },
+          () => null
+        );
+      }
+    }
     clearTimeout(runTimer);
     if (runWatchdog.signal.aborted) {
       console.error(`Baseline generation FAILED — ${runWatchdog.signal.reason?.message}; not writing a partial baseline.`);
+      printSpend();
       process.exit(1);
     }
     const cases = {};
     let anyFailure = false;
     for (const def of selected) {
-      const mine = results.filter((r) => r.id === def.id && r.status === "scored");
-      if (mine.length < flags.repeat) {
+      const topUpRuns = topUpCounts.get(def.id) || 0;
+      const agg = aggregateBaselineCase({ def, results, quorum, topUpRuns });
+      const topUpNote = topUpRuns > 0 ? `, ${topUpRuns} top-up(s)` : "";
+      if (agg.belowQuorum) {
         anyFailure = true;
-        console.error(`  ✗ ${def.id}: only ${mine.length}/${flags.repeat} scored runs — baseline would be unsound`);
+        console.error(
+          `  ✗ ${def.id}: scored ${agg.runsScored}/${agg.runsAttempted} (quorum ${quorum}${topUpNote}) — baseline would be unsound`
+        );
         continue;
       }
-      const evaluators = {};
-      for (const evaluator of def.evaluators) {
-        const xs = mine.map((r) => r.scores[evaluator]).filter((x) => typeof x === "number");
-        evaluators[evaluator] = {
-          mean: Math.round((xs.reduce((a, b) => a + b, 0) / xs.length) * 100) / 100,
-          min: Math.min(...xs),
-          max: Math.max(...xs),
-          n: xs.length,
-        };
-      }
-      cases[def.id] = { evaluators };
+      console.log(`  ✓ ${def.id}: scored ${agg.runsScored}/${agg.runsAttempted} (quorum ${quorum}${topUpNote})`);
+      cases[def.id] = agg.entry;
     }
     if (ledger.exceeded) {
       console.error(
         `Baseline generation FAILED — ${ledger.message("remaining runs were abandoned")}; not writing a partial baseline.`
       );
+      printSpend();
       process.exit(1);
     }
     if (anyFailure) {
       console.error("Baseline generation FAILED — not writing an unsound baseline.");
+      printSpend();
       process.exit(1);
     }
     // C2: redact at the write-time choke point — nothing forbidden may land
@@ -548,7 +617,8 @@ async function main() {
         2
       ) + "\n"
     );
-    console.log(`Candidate baseline written to ${outPath} (cost ~$${ledger.spentUsd.toFixed(2)})`);
+    console.log(`Candidate baseline written to ${outPath}`);
+    printSpend(console.log);
     process.exit(0);
   }
 
@@ -641,6 +711,7 @@ async function main() {
 
   console.log(`\n${renderCheckSummary(results)}`);
   console.log(`Results: ${resultsPath}\nCheck summary: ${summaryPath}`);
+  printSpend(console.log);
   process.exit(results.verdict === "PASS" ? 0 : 1);
 }
 
@@ -655,5 +726,6 @@ if (CASES_BACKEND !== SCORING_BACKEND) {
 
 main().catch((err) => {
   console.error(`battery runner crashed: ${err.stack || err}`);
+  printSpend();
   process.exit(1);
 });

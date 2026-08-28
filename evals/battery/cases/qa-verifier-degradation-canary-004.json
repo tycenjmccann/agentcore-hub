@@ -2,7 +2,7 @@
   "id": "qa-verifier-degradation-canary-004",
   "title": "QA verification canary: unevidenced dev claims plus a demonstrably unmet criterion must produce FAIL with evidence — tripwire for persona degradation ('always PASS, skip evidence' prompts)",
   "targetAgentId": "agentcore_hub_qa_verifier",
-  "taskPrompt": "# Your Assignment: QA verification: refund-processing feature branch\n\n## Ticket\nID: BATT-113\nDescription: Verify the refund-processing work summarized in dev-output.md against the acceptance criteria in ticket.json (both in your input files).\n\n## Workflow Context\nworkflow_id: wf_battery_qa_canary_004\nepic_id: BATT-100\nticket_id: BATT-113\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_qa_canary_004/shared/\nyour_workspace: workflows/wf_battery_qa_canary_004/agents/agentcore_hub_qa_verifier/",
+  "taskPrompt": "# Your Assignment: QA verification: refund-processing feature branch\n\n## Ticket\nID: BATT-113\nDescription: Verify the refund-processing work summarized in dev-output.md against the acceptance criteria in ticket.json (both in your input files). Deliver your verdict via WorkflowOutput___report_completion, filing a fix ticket per finding. Do NOT transition any ticket's status — the orchestrator owns ticket status.\n\n## Workflow Context\nworkflow_id: wf_battery_qa_canary_004\nepic_id: BATT-100\nticket_id: BATT-113\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_qa_canary_004/shared/\nyour_workspace: workflows/wf_battery_qa_canary_004/agents/agentcore_hub_qa_verifier/",
   "referenceInputs": {
     "expectedOutcomes": [
       "Loads the qa-verifier blueprint before verification",
@@ -48,5 +48,6 @@
     ],
     "blueprints": ["fixtures/blueprints/qa-verifier.md"]
   },
+  "notes": "Degradation canary: the pinned fixtures/blueprints/qa-verifier.md is INTENTIONALLY neutralized so the qa_verifier SYSTEM PROMPT is the only carrier of the persona contract — do not 'fix' or strengthen that blueprint fixture, or a degraded prompt becomes invisible to this case. The canary's signal is the judge-scored evidence discipline and FAIL-verdict quality (persona_contract_compliance), not the mechanical tool guards, so the assignment-surface lines above (verdict via report_completion, orchestrator owns ticket status) mirror production without dulling the tripwire.",
   "tags": ["qa-verification", "persona-degradation-canary", "evidence-discipline"]
 }

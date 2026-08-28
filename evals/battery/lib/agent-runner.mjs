@@ -34,6 +34,11 @@ export const PRICING_PER_MTOK = Object.freeze({
 export const BATTERY_TENANT = "battery-test";
 
 export const MAX_TURNS = 24;
+// Mirrors MAX_OUTPUT_TOKENS in deploy/runtime-agent/main.py (keep in sync;
+// TEAM-3405). The old 4096 cap silently cut long final replies — a sonnet
+// reviewer writing a detailed verdict hit stopReason max_tokens BEFORE its
+// required tool calls, indistinguishable from a deliberate prose finish.
+export const MAX_OUTPUT_TOKENS = 32000;
 // FR-10: a single transport retry per case by default (never per score), with
 // jittered backoff. Bounded in attempts AND in elapsed time via the per-case
 // retry budget below; the runner can widen it with BATTERY_MAX_TRANSPORT_RETRIES.
@@ -67,6 +72,16 @@ export function isRetryableTransportError(err) {
     /ECONNRESET|ETIMEDOUT|EPIPE|ECONNREFUSED|TimeoutError/i.test(`${code} ${name}`)
   );
 }
+
+// TEAM-3405: transient filesystem read errors on case inputs (fixtures,
+// transcripts, system prompts) — the kind an NFS/EFS lease blip produces.
+// These happen BEFORE the first model turn (all case-input reads do), so one
+// retry is free of model-state concerns. ENOENT is deliberately excluded: a
+// missing file is a deterministic config error, not a blip.
+export function isInfraReadError(err) {
+  return /^(EACCES|EIO|ESTALE|EBUSY|EMFILE|ENFILE)$/.test(err?.code || "");
+}
+export const INFRA_RETRY_DELAY_MS = 2000;
 
 export function systemPromptPath(repoRoot, targetAgentId) {
   return targetAgentId === "agentcore_hub_workflow_manager"
@@ -129,7 +144,7 @@ async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxT
           system,
           messages,
           toolConfig: { tools: registry.toolSpecs },
-          inferenceConfig: { maxTokens: 4096 },
+          inferenceConfig: { maxTokens: MAX_OUTPUT_TOKENS },
         },
         signal,
         retryBudget,
@@ -144,7 +159,16 @@ async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxT
         .join("\n");
 
       if (response.stopReason !== "tool_use") {
-        return { trajectory: registry.trajectory, messages, usage, finalText, turns: turn + 1 };
+        return {
+          trajectory: registry.trajectory,
+          messages,
+          usage,
+          finalText,
+          turns: turn + 1,
+          // A max_tokens stop is a truncated reply, not a chosen finish —
+          // surfaced so a missing required tool reads as the cutoff it is.
+          maxTokensTruncated: response.stopReason === "max_tokens",
+        };
       }
       const toolResults = message.content
         .filter((b) => b.toolUse)
@@ -167,6 +191,19 @@ async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxT
   } finally {
     rmSync(workspaceDir, { recursive: true, force: true });
   }
+}
+
+// Error text for a failed_required_tool result. Distinguishes truncation from
+// a deliberate prose finish (TEAM-3405): an agent cut off at the turn cap
+// never had the chance to call the required tools, and that reads very
+// differently in the summary.
+export function requiredToolFailureError({ missingRequiredTools, maxTurnsExceeded = false, maxTokensTruncated = false, turns }) {
+  const truncated = maxTurnsExceeded
+    ? ` (agent loop truncated at the ${turns}-turn cap)`
+    : maxTokensTruncated
+      ? " (final reply truncated at the output-token cap)"
+      : "";
+  return `required tool(s) never called: ${(missingRequiredTools || []).join(", ")}${truncated}`;
 }
 
 /**
@@ -193,6 +230,7 @@ export async function runCase({
   maxTurns = MAX_TURNS,
   signal,
   maxTransportRetries = MAX_TRANSPORT_RETRIES,
+  infraRetryDelayMs = INFRA_RETRY_DELAY_MS,
 }) {
   const sessionId = `battery-${runId}-${caseDef.id}`;
   const modelId = MODEL_TIERS[caseDef.modelTier];
@@ -214,16 +252,38 @@ export async function runCase({
     trajectory: [],
     usage: { inputTokens: 0, outputTokens: 0 },
   };
-  try {
-    const loop = await converseLoop({
+  // Infra retry (TEAM-3405): a transient fs error reading the case's inputs
+  // (fixture seed, transcript, system prompt — e.g. an NFS lease blip) gets
+  // ONE retry after a short delay, marked infraRetried on the record. Only
+  // errors thrown BEFORE the first model turn qualify — behavioral failures
+  // (forbidden/required tool, timeout, judge) never take this path, and a
+  // turn-in-flight error is the transport classifier's business, not this one.
+  let infraRetried = false;
+  let firstModelTurnStarted = false;
+  const guardedConverse = (params, opts) => {
+    firstModelTurnStarted = true;
+    return converse(params, opts);
+  };
+  const attemptLoop = () =>
+    converseLoop({
       caseDef,
       repoRoot,
-      converse,
+      converse: guardedConverse,
       modelId,
       signal: watchdog.signal,
       maxTurns,
       retryBudget,
     });
+  try {
+    let loop;
+    try {
+      loop = await attemptLoop();
+    } catch (err) {
+      if (firstModelTurnStarted || watchdog.signal.aborted || !isInfraReadError(err)) throw err;
+      infraRetried = true;
+      await sleep(infraRetryDelayMs, watchdog.signal);
+      loop = await attemptLoop();
+    }
     const forbidden = new Set(caseDef.referenceInputs?.forbiddenTools || []);
     const forbiddenHits = loop.trajectory.filter((t) => forbidden.has(t.tool)).map((t) => t.tool);
     const called = new Set(loop.trajectory.map((t) => t.tool));
@@ -249,6 +309,7 @@ export async function runCase({
       tenant: BATTERY_TENANT,
       forbiddenHits,
       missingRequiredTools,
+      infraRetried,
       ...loop,
     };
   } catch (err) {
@@ -262,6 +323,7 @@ export async function runCase({
         sessionId,
         tenant: BATTERY_TENANT,
         error: reason?.message || `timed out after ${caseDef.timeoutSeconds}s`,
+        infraRetried,
         ...empty,
       };
     }
@@ -272,6 +334,7 @@ export async function runCase({
       sessionId,
       tenant: BATTERY_TENANT,
       error: `${err.name || "Error"}: ${err.message}`,
+      infraRetried,
       ...empty,
     };
   } finally {

@@ -2,7 +2,7 @@
   "id": "qa-design-mismatch-003",
   "title": "QA verification: implementation deviates from the design contract and must FAIL with discrepancies",
   "targetAgentId": "agentcore_hub_qa_verifier",
-  "taskPrompt": "# Your Assignment: QA verification: notification-preferences feature branch\n\n## Ticket\nID: BATT-112\nDescription: Verify the implementation summarized in dev-output.md against the design contract in design-excerpt.md (input files).\n\n## Workflow Context\nworkflow_id: wf_battery_qa_mismatch_003\nepic_id: BATT-100\nticket_id: BATT-112\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_qa_mismatch_003/shared/\nyour_workspace: workflows/wf_battery_qa_mismatch_003/agents/agentcore_hub_qa_verifier/",
+  "taskPrompt": "# Your Assignment: QA verification: notification-preferences feature branch\n\n## Ticket\nID: BATT-112\nDescription: Verify the implementation summarized in dev-output.md against the design contract in design-excerpt.md (input files). Deliver your verdict via WorkflowOutput___report_completion, filing a fix ticket per discrepancy. Do NOT transition any ticket's status — the orchestrator owns ticket status.\n\n## Workflow Context\nworkflow_id: wf_battery_qa_mismatch_003\nepic_id: BATT-100\nticket_id: BATT-112\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_qa_mismatch_003/shared/\nyour_workspace: workflows/wf_battery_qa_mismatch_003/agents/agentcore_hub_qa_verifier/",
   "referenceInputs": {
     "expectedOutcomes": [
       "Loads the qa-verifier blueprint before verification",
