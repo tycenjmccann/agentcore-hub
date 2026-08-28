@@ -289,6 +289,10 @@ afterEach(() => {
 
 describe('handler (IMPROVEMENT_AGENT_ARN configured)', () => {
   let handler;
+  // extractSessionData builds the prior-delivery buffer entries the
+  // cross-delivery dedup test seeds DDB with, so those entries are exactly the
+  // shape appendToBuffer really stores.
+  let extractSessionData;
 
   beforeAll(async () => {
     // index.mjs reads all of this at MODULE scope and throws without a bucket,
@@ -299,7 +303,7 @@ describe('handler (IMPROVEMENT_AGENT_ARN configured)', () => {
     process.env.AWS_ACCOUNT_ID = '123456789012';
     process.env.IMPROVEMENT_AGENT_ARN = IMPROVER_ARN;
     vi.resetModules();
-    ({ handler } = await import('./index.mjs'));
+    ({ handler, extractSessionData } = await import('./index.mjs'));
   });
 
   describe('raw CloudWatch Logs decode + missing-span preflight', () => {
@@ -623,6 +627,90 @@ describe('handler (IMPROVEMENT_AGENT_ARN configured)', () => {
       const [metrics] = emfLines('EvalSessionsTotal');
       expect(metrics.EvalSessionsTotal).toBe(1);
       expect(metrics.EvalSessionsSpanMissing).toBe(0);
+    });
+  });
+
+  // ─── Cross-delivery dedup at flush (TEAM-3381 FR-2.1 AC-1/AC-2) ───────────
+  // Per-delivery dedup cannot see a request id whose copies arrived in TWO
+  // CloudWatch Logs deliveries: each delivery is individually clean, and the
+  // duplicate only exists in the MERGED buffer. Pre-fix the flushed payload
+  // carried that record twice and the batch summary counted it twice.
+  describe('cross-delivery duplicates at flush (TEAM-3381)', () => {
+    /** A parsed CW Logs delivery (pre-decode), as extractSessionData consumes it. */
+    const parsedDelivery = (messages, logStream) => ({
+      logGroup: LOG_GROUP,
+      logStream,
+      logEvents: messages.map((message, i) => ({
+        id: `earlier${i}`,
+        timestamp: 1_699_999_000_000 + i,
+        message: JSON.stringify(message),
+      })),
+    });
+
+    it('flushes ONE record for a request id split across two deliveries', async () => {
+      // The SAME evaluation attempt, delivered twice by at-least-once delivery.
+      const duplicated = evalRecord({
+        sessionId: 'sess-cross',
+        score: 8,
+        scoreLabel: 'pass',
+        requestId: 'req-cross-1',
+      });
+      // Delivery 1 is already in the buffer (a previous invocation appended it).
+      ddbState.priorBuffer = [extractSessionData(parsedDelivery([duplicated], 'earlier-stream'))];
+
+      // Delivery 2 re-carries it, plus one genuinely new record. batchSize 1 →
+      // this invocation flushes the merged buffer.
+      await handler(
+        awslogsEvent([
+          duplicated,
+          evalRecord({ sessionId: 'sess-fresh', evaluatorName: 'builtin.helpfulness', score: 6, scoreLabel: 'pass', requestId: 'req-fresh-1' }),
+        ])
+      );
+
+      const [archive] = putsUnder('fleet-imp-agent/batches/');
+      const payload = JSON.parse(archive.input.Body);
+
+      // Both buffer entries survive (provenance kept), but the duplicate is gone.
+      expect(payload.sessions).toHaveLength(2);
+      const flat = payload.sessions.flatMap((s) => s.evaluatorResults || []);
+      expect(flat.filter((r) => r.requestId === 'req-cross-1')).toHaveLength(1);
+      expect(flat.filter((r) => r.requestId === 'req-fresh-1')).toHaveLength(1);
+      expect(flat).toHaveLength(2);
+
+      // The drop is counted, observable in the payload AND logged — not silent.
+      expect(payload.crossDeliveryDuplicatesDropped).toBe(1);
+      const [dropped] = jsonLogs().filter((l) => l.event === 'eval.batch.cross_delivery_duplicates_dropped');
+      expect(dropped).toMatchObject({
+        level: 'warn',
+        agentId: AGENT_ID,
+        crossDeliveryDuplicatesDropped: 1,
+        bufferEntries: 2,
+      });
+
+      // And the summary the improver reads is built over the DEDUPED batch: two
+      // successes, not three.
+      expect(payload.summary).toEqual(computeBatchSummary(flat));
+      expect(payload.summary).toMatchObject({ successCount: 2, scoredTotal: 2, errorCount: 0 });
+    });
+
+    it('leaves a duplicate-free buffer untouched and reports zero drops', async () => {
+      ddbState.priorBuffer = [
+        extractSessionData(
+          parsedDelivery(
+            [evalRecord({ sessionId: 'sess-earlier', score: 9, scoreLabel: 'pass', requestId: 'req-earlier' })],
+            'earlier-stream'
+          )
+        ),
+      ];
+
+      await handler(
+        awslogsEvent([evalRecord({ sessionId: 'sess-now', score: 7, scoreLabel: 'pass', requestId: 'req-now' })])
+      );
+
+      const payload = JSON.parse(putsUnder('fleet-imp-agent/batches/')[0].input.Body);
+      expect(payload.crossDeliveryDuplicatesDropped).toBe(0);
+      expect(payload.sessions.flatMap((s) => s.evaluatorResults || [])).toHaveLength(2);
+      expect(jsonLogs().some((l) => l.event === 'eval.batch.cross_delivery_duplicates_dropped')).toBe(false);
     });
   });
 });
@@ -950,6 +1038,174 @@ describe('extractSessionData dedup (TEAM-3367)', () => {
       { requestId: 'r1', evaluatorName: 'e', score: 2, timestamp: 2 },
     ];
     expect(dedupeResults(rows)).toEqual([rows[0]]);
+  });
+});
+
+// ─── dedup fail-open + content fingerprint (TEAM-3381) ───────────────────────
+// AC-1 requires records with missing/null dedup-key fields to FAIL OPEN. Two
+// failure modes the content key had:
+//   1. a record with NO key at all (no request id, and sessionId/evaluatorName/
+//      evaluationName/score all null) collapsed into any other such record that
+//      shared the delivery's millisecond timestamp — one record silently lost
+//      AND wrongly counted as a duplicate; and
+//   2. logEvent.timestamp is per-batch-millisecond, not per-record, so two
+//      DISTINCT results with identical metadata in the same ms collapsed too.
+
+describe('dedup fail-open + content fingerprint (TEAM-3381)', () => {
+  let extractSessionData;
+  let dedupeResults;
+  let dedupeBufferedSessions;
+  let hasNoDedupKey;
+  let contentFingerprint;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ extractSessionData, dedupeResults, dedupeBufferedSessions, hasNoDedupKey, contentFingerprint } =
+      await import('./index.mjs'));
+  });
+
+  const delivery = (logEvents) => ({
+    logGroup: '/aws/bedrock-agentcore/evaluations/results/eval_backend_dev-test',
+    logStream: 'test-stream',
+    logEvents,
+  });
+
+  /** A well-formed JSON row carrying NO dedup-key field at all. */
+  const keylessEvent = (timestamp, attrs = {}) => ({
+    timestamp,
+    message: JSON.stringify({ body: 'evaluation result', attributes: attrs }),
+  });
+
+  it('two DISTINCT all-null-key records sharing a timestamp are BOTH retained', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        keylessEvent(1_756_250_000_000, { 'error.message': 'judge crashed on run A' }),
+        keylessEvent(1_756_250_000_000, { 'error.message': 'judge crashed on run B' }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(2);
+    // Never mis-reported as a duplicate (it would inflate EvalDuplicateResultCount).
+    expect(sessionData.duplicatesDropped).toBe(0);
+  });
+
+  it('IDENTICAL all-null-key records are retained too — no key means no provable duplicate', () => {
+    // Fail-open beats collapsing: with every discriminator null there is nothing
+    // to key on, so dropping one is a silent data loss we refuse to take.
+    const sessionData = extractSessionData(
+      delivery([keylessEvent(1_756_250_000_000), keylessEvent(1_756_250_000_000)])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(2);
+    expect(sessionData.duplicatesDropped).toBe(0);
+  });
+
+  it('hasNoDedupKey: only an entirely key-less parsed row qualifies', () => {
+    const keyless = { requestId: null, sessionId: null, evaluatorName: null, score: null, timestamp: 1 };
+    expect(hasNoDedupKey(keyless)).toBe(true);
+    expect(hasNoDedupKey({ ...keyless, requestId: 'req-1' })).toBe(false);
+    expect(hasNoDedupKey({ ...keyless, sessionId: 'sess-1' })).toBe(false);
+    expect(hasNoDedupKey({ ...keyless, evaluatorName: 'Builtin.Correctness' })).toBe(false);
+    expect(hasNoDedupKey({ ...keyless, evaluationName: 'eval-1' })).toBe(false);
+    // A score of 0 is a real score, so it IS a discriminator.
+    expect(hasNoDedupKey({ ...keyless, score: 0 })).toBe(false);
+    // Unparseable rows key on their raw text — they are not key-less.
+    expect(hasNoDedupKey({ ...keyless, parseError: true, rawMessage: 'START RequestId: abc' })).toBe(false);
+  });
+
+  it('one key-less row plus a keyed duplicate pair: the pair collapses, the key-less row stays', () => {
+    const rows = [
+      { timestamp: 7, sessionId: null, evaluatorName: null, score: null },
+      { timestamp: 7, sessionId: 's1', evaluatorName: 'e', score: 5, contentHash: 'aaaa' },
+      { timestamp: 7, sessionId: 's1', evaluatorName: 'e', score: 5, contentHash: 'aaaa' },
+    ];
+    expect(dedupeResults(rows)).toEqual([rows[0], rows[1]]);
+  });
+
+  // ── No-request-id content path ────────────────────────────────────────────
+  const otelEvent = ({ sessionId = 'sess-1', evaluatorName = 'Builtin.Correctness', score, timestamp, evidence }) => ({
+    timestamp,
+    message: JSON.stringify({
+      attributes: {
+        'session.id': sessionId,
+        'gen_ai.evaluation.name': evaluatorName,
+        ...(score !== undefined && score !== null ? { 'gen_ai.evaluation.score.value': score } : {}),
+        ...(evidence ? { 'gen_ai.evaluation.explanation': evidence } : {}),
+      },
+    }),
+  });
+
+  it('identical retry writes (same content, same ms) still collapse to one', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ score: 8, timestamp: 42, evidence: 'The agent addressed the ticket.' }),
+        otelEvent({ score: 8, timestamp: 42, evidence: 'The agent addressed the ticket.' }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.duplicatesDropped).toBe(1);
+    expect(sessionData.evaluatorResults[0].contentHash).toBe(
+      contentFingerprint(JSON.stringify({
+        attributes: {
+          'session.id': 'sess-1',
+          'gen_ai.evaluation.name': 'Builtin.Correctness',
+          'gen_ai.evaluation.score.value': 8,
+          'gen_ai.evaluation.explanation': 'The agent addressed the ticket.',
+        },
+      }))
+    );
+  });
+
+  it('distinct results with identical metadata and the SAME ms are BOTH retained', () => {
+    // Same session/evaluator/score/timestamp — only the evaluator's explanation
+    // differs, i.e. two real evaluations CloudWatch stamped in the same
+    // millisecond. Pre-fix these collapsed into one.
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ score: 8, timestamp: 42, evidence: 'Cited the ticket AC directly.' }),
+        otelEvent({ score: 8, timestamp: 42, evidence: 'Missed the dependency chain note.' }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(2);
+    expect(sessionData.duplicatesDropped).toBe(0);
+    expect(new Set(sessionData.evaluatorResults.map((r) => r.contentHash)).size).toBe(2);
+  });
+
+  it('dedupeBufferedSessions keeps the buffer shape: emptied entries stay, provenance intact', () => {
+    const dup = { timestamp: 1, requestId: 'req-1', evaluatorName: 'e', sessionId: 's1', score: 8 };
+    const { sessions, crossDeliveryDuplicatesDropped } = dedupeBufferedSessions([
+      { logStream: 'stream-a', sessionIds: ['s1'], evaluatorResults: [dup] },
+      // Delivery 2 carried nothing but the duplicate: the entry survives with an
+      // empty result list (the improver payload reads sessions[].*).
+      { logStream: 'stream-b', sessionIds: ['s1'], evaluatorResults: [dup] },
+      // A malformed/legacy entry with no evaluatorResults is passed through as-is.
+      { logStream: 'stream-c' },
+    ]);
+    expect(crossDeliveryDuplicatesDropped).toBe(1);
+    expect(sessions).toHaveLength(3);
+    expect(sessions[0].evaluatorResults).toEqual([dup]);
+    expect(sessions[1]).toEqual({ logStream: 'stream-b', sessionIds: ['s1'], evaluatorResults: [] });
+    expect(sessions[2]).toEqual({ logStream: 'stream-c' });
+  });
+
+  it('records carrying a request id get no fingerprint (nothing added to the buffer payload)', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        {
+          timestamp: 1,
+          message: JSON.stringify({
+            attributes: {
+              'session.id': 'sess-1',
+              'gen_ai.evaluation.name': 'Builtin.Correctness',
+              'gen_ai.evaluation.score.value': 8,
+              'aws.request_id': 'req-1',
+            },
+          }),
+        },
+      ])
+    );
+    expect(sessionData.evaluatorResults[0].requestId).toBe('req-1');
+    expect(sessionData.evaluatorResults[0].contentHash).toBeUndefined();
   });
 });
 

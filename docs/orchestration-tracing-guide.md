@@ -287,6 +287,16 @@ delivery into the `AgentCoreHub/Evaluations` namespace (dimension
 (One more, `EvalDepChainExcludedCount`, counts dependency-chain evaluator rows
 dropped for out-of-scope roles — TEAM-3368 §3.2 config-drift guard.)
 
+> **Cross-delivery duplicates.** `EvalDuplicateResultCount` covers in-delivery
+> drops plus the drops made by the TEAM-3376 DynamoDB seen-set
+> (`agentcore-hub-eval-seen`, conditional writes, fail-open), which closed the
+> DDB-rolling-aggregate exposure TEAM-3381 had deferred — see
+> [eval-infrastructure-reliability-design.md §2.2](./eval-infrastructure-reliability-design.md#ac-2-ddb-aggregate-deferral-disposition-team-3381)
+> for the original disposition. Flush-time dedup independently logs any
+> stragglers (`eval.batch.cross_delivery_duplicates_dropped`, e.g. records the
+> seen-set failed OPEN on); to verify the seen-set end-to-end, use that
+> design doc's §2.2 Logs Insights query grouped by logStream.
+
 Healthy batches emit explicit `0` datapoints for all of them; nothing is
 emitted when a delivery contains no sessions.
 
