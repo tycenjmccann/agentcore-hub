@@ -502,10 +502,13 @@ before its first S3 write or docker build. Semantics against HEAD:
 - **Queued/in-progress** → refused: wait for the gate.
 - **Failure/cancelled/timed-out** → refused, with the check URL and the
   failing evaluator lines from the summary.
-- **Absent** → refused if HEAD (or any of the last 20 first-parent commits
-  without an intervening green check) touched the target's gated globs — that
-  means the gate was bypassed. Proceeds with a note only when nothing gated
-  changed.
+- **Absent** → refused if HEAD or any scanned first-parent ancestor (back to
+  a green anchor) touched the target's gated globs — that means the gate was
+  bypassed. Also refused, fail-closed, if the scan hits the
+  `EVAL_GATE_BELT_MAX` cap (100 first-parent commits, see
+  `deploy/lib/check-eval-gate.sh`) with history still unexamined and no green
+  anchor or gated-path touch found. Proceeds with a note only when nothing
+  gated changed across a fully-scanned history or since a green anchor.
 - A **dirty working tree** touching gated paths always refuses: deploys ship
   committed, gated state only.
 
