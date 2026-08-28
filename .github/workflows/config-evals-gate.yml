@@ -61,11 +61,11 @@ jobs:
             // Keep in sync with config-evals-baseline.yml `on.push.paths`.
             const gatedPrefixes = [
               "deploy/runtime-agent/prompts/", // deploy/runtime-agent/prompts/**
+              "deploy/workflow-manager/",      // deploy/workflow-manager/** (TEAM-3295: whole dir, not just system-prompt.md)
               "blueprints/",                   // blueprints/**
               "evals/battery/",                // evals/battery/**
             ];
             const gatedFiles = [
-              "deploy/workflow-manager/system-prompt.md",
               "src/config/workflows.json",
               "src/config/agents.json",
               // The gate workflows themselves: changes to the gate run the gate.
@@ -238,11 +238,17 @@ jobs:
                 "closed: re-run the workflow (transient API failure) or investigate " +
                 "the changed-paths job log.";
             } else if (!results) {
-              title = `FAIL — no battery results (battery job: ${jobResult})`;
+              // Infra death before results existed — ERRORED, not a score FAIL.
+              // Conclusion stays "failure" (fail closed; never neutral).
+              title = `ERRORED — no battery results (battery job: ${jobResult})`;
               summaryMd = summaryMd ||
                 `The battery job finished with status \`${jobResult}\` and produced no ` +
                 "results artifact (crash, timeout, or cancellation before scoring " +
                 "completed). The gate fails closed: re-run the job or fix the battery.";
+            } else if (results.verdict === "ERRORED") {
+              // Battery ran but infra/timeout corrupted cases — distinct from a
+              // score-based FAIL so operators re-run instead of chasing scores.
+              title = `ERRORED — infra/timeout during battery (battery job: ${jobResult})`;
             } else {
               title = `FAIL — battery verdict ${results.verdict} (battery job: ${jobResult})`;
             }

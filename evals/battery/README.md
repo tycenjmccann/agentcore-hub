@@ -12,7 +12,7 @@ and in each deploy script's `require_eval_gate` call — always the `src/config/
 copies, never the S3 ones):
 
 - `deploy/runtime-agent/prompts/**` — per-persona system prompts
-- `deploy/workflow-manager/system-prompt.md` — the Workflow Manager prompt
+- `deploy/workflow-manager/**` — the Workflow Manager prompt, skills, and toolkit
 - `src/config/agents.json` — agent roster (ids, tiers, routing)
 - `src/config/workflows.json` — workflow definitions
 - `blueprints/**` — task blueprints served to agents at runtime
@@ -183,6 +183,36 @@ Converse-shaped transport, so a future `on-demand` backend slots in behind the
 same interface. The active backend name is recorded in both `baseline.json`
 and every results file — **a backend mismatch between baseline and current run
 is a gate failure** (fail closed; scores across backends are not comparable).
+
+## CI AWS credentials (one-time setup)
+
+The `battery` job in `.github/workflows/config-evals-gate.yml` (and the
+baseline workflow) authenticates via GitHub OIDC only — there are no static
+AWS keys anywhere in CI. Until the pieces below are provisioned, the battery
+job fails at the credentials step and the gate **fails closed** (the publish
+job posts a failing `config-evals-gate` check). One-time setup:
+
+1. **GitHub OIDC provider** in the target account:
+   `token.actions.githubusercontent.com` (audience `sts.amazonaws.com`).
+2. **IAM role** for the gate, `MaxSessionDuration` 900 (the job needs one
+   short session), with a trust policy pinned to this repo's same-repo
+   `pull_request` runs — condition
+   `token.actions.githubusercontent.com:sub` like
+   `repo:tycenjmccann/agentcore-hub:pull_request` (plus `:ref:refs/heads/main`
+   for the baseline workflow's push runs).
+3. **Least-privilege permissions** matching what the runner actually calls
+   (CRED-5): `bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream`
+   on the task-model inference profiles
+   (`us.anthropic.claude-haiku-4-5-20251001-v1:0`,
+   `us.anthropic.claude-sonnet-5`) and the judge
+   (`us.anthropic.claude-opus-4-7`) ONLY — no `s3`, `lambda`, `dynamodb`,
+   `logs`, and expressly no `bedrock-agentcore` permissions. (The baseline
+   workflow's role additionally needs nothing from AWS — the baseline commit
+   uses the GitHub token, not AWS.)
+4. **Repo variable** `AWS_EVAL_GATE_ROLE_ARN` = the role's ARN
+   (Settings → Secrets and variables → Actions → Variables).
+5. **GitHub environment** `config-evals` (the battery job runs in it; add
+   reviewers/branch restrictions there if desired).
 
 ## Baseline lifecycle
 

@@ -61,10 +61,14 @@ describe("renderCheckSummary", () => {
 
   it("includes verdict, baseline SHA, responsible evaluators, delta table, retired + informational sections", () => {
     const results = makeResults();
-    expect(results.verdict).toBe("FAIL");
+    // The fixture's timed_out case makes the suite ERRORED (infra), which
+    // outranks the coexisting floor breach — still a failing, red verdict.
+    expect(results.verdict).toBe("ERRORED");
+    expect(results.infraCases).toEqual(["case-dead"]);
     const md = renderCheckSummary(results);
 
-    expect(md).toContain("❌ FAIL"); // verdict
+    expect(md).toContain("❌ ERRORED"); // verdict
+    expect(md).toContain("infra/timeout corrupted 1 case(s)"); // ERRORED marker line
     expect(md).toContain("baselinesha123"); // baseline SHA
     expect(md).toContain("configsha456");
     // floor violation names the responsible evaluator

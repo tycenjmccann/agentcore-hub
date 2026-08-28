@@ -112,8 +112,10 @@ describe("floor rule", () => {
 });
 
 describe("partial runs never pass", () => {
-  for (const status of ["errored", "timed_out", "skipped", "unscored", "failed_forbidden_tool"]) {
-    it(`FAILs when a case is ${status}`, () => {
+  // Infra statuses ⇒ verdict ERRORED (TEAM-3295): still failing (never
+  // neutral, exit 1, red check), but distinct from a score-based FAIL.
+  for (const status of ["errored", "timed_out", "skipped", "unscored"]) {
+    it(`ERRORs when a case is ${status} — a failing verdict, distinct from score FAIL`, () => {
       const suite = run({
         baseline: baselineWith({ a: { "Builtin.Correctness": 90 }, bad: { "Builtin.Correctness": 90 } }),
         caseResults: [
@@ -121,10 +123,38 @@ describe("partial runs never pass", () => {
           { id: "bad", status, error: "boom" },
         ],
       });
-      expect(suite.verdict).toBe("FAIL");
+      expect(suite.verdict).toBe("ERRORED");
+      expect(suite.verdict).not.toBe("PASS");
+      expect(suite.infraCases).toEqual(["bad"]);
       expect(suite.failureReasons.join()).toContain(`case bad: status '${status}'`);
     });
   }
+
+  it("FAILs (not ERRORED) when a case is failed_forbidden_tool — behavioral, not infra", () => {
+    const suite = run({
+      baseline: baselineWith({ a: { "Builtin.Correctness": 90 }, bad: { "Builtin.Correctness": 90 } }),
+      caseResults: [
+        { id: "a", status: "scored", scores: { "Builtin.Correctness": 90 } },
+        { id: "bad", status: "failed_forbidden_tool", error: "boom" },
+      ],
+    });
+    expect(suite.verdict).toBe("FAIL");
+    expect(suite.infraCases).toEqual([]);
+    expect(suite.failureReasons.join()).toContain("case bad: status 'failed_forbidden_tool'");
+  });
+
+  it("ERRORED wins when infra loss and a floor breach coincide — both reasons still listed", () => {
+    const suite = run({
+      baseline: baselineWith({ a: { "Builtin.Correctness": 80 }, bad: { "Builtin.Correctness": 90 } }),
+      caseResults: [
+        { id: "a", status: "scored", scores: { "Builtin.Correctness": 60 } }, // floor 70 → breach
+        { id: "bad", status: "timed_out", error: "deadline" },
+      ],
+    });
+    expect(suite.verdict).toBe("ERRORED");
+    expect(suite.failureReasons.join()).toContain("floor");
+    expect(suite.failureReasons.join()).toContain("case bad: status 'timed_out'");
+  });
 });
 
 describe("baseline coverage (fail closed)", () => {
@@ -168,13 +198,14 @@ describe("new-case semantics", () => {
     expect(suite.informationalCases).toContain("fresh");
   });
 
-  it("still FAILs when a new case errored", () => {
+  it("still fails (as ERRORED — infra) when a new case errored", () => {
     const suite = run({
       baseline: baselineWith({}),
       newCaseIds: ["fresh"],
       caseResults: [{ id: "fresh", status: "errored", error: "boom" }],
     });
-    expect(suite.verdict).toBe("FAIL");
+    expect(suite.verdict).toBe("ERRORED");
+    expect(suite.verdict).not.toBe("PASS");
     expect(suite.failureReasons.join()).toContain("case fresh");
   });
 

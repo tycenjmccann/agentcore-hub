@@ -11,9 +11,10 @@ set -e
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "${REPO_ROOT}/deploy/config.sh"
 
-# Eval gate (FR-7): the workflow-manager system prompt is a gated artifact.
+# Eval gate (FR-7): everything this script ships (system prompt, skills,
+# toolkit) is gated — TEAM-3295 widened the glob from system-prompt.md.
 source "${REPO_ROOT}/deploy/lib/check-eval-gate.sh"
-require_eval_gate "deploy/workflow-manager/system-prompt.md"
+require_eval_gate "deploy/workflow-manager/**"
 
 BUCKET="$ARTIFACT_BUCKET"
 ROLE_ARN="$LAMBDA_ROLE_ARN"
