@@ -240,7 +240,16 @@ beforeEach(() => {
   // interleaving test catch the data loss. Anything else is unconditional.
   const conditionHolds = (cond, values) => {
     if (cond.includes('bufferVersion = :expectedVersion')) {
-      return ddbState.bufferVersion === values[':expectedVersion'];
+      if (ddbState.bufferVersion !== values[':expectedVersion']) return false;
+      // TEAM-3410 (PR #187 G1): the flush claim's cooldown arm — the reset also
+      // loses when the STORED lastFlushedAt is inside the cooldown window,
+      // however stale the invocation's own config read was. ISO strings compare
+      // lexicographically in timestamp order, matching real DynamoDB.
+      if (cond.includes(':cooldownCutoff')) {
+        const last = ddbState.config.lastFlushedAt;
+        return last === undefined || last <= values[':cooldownCutoff'];
+      }
+      return true;
     }
     if (cond.includes('attribute_not_exists(lastFlushedAt)')) return ddbState.config.lastFlushedAt === undefined;
     if (cond.includes('lastFlushedAt = :expected')) return ddbState.config.lastFlushedAt === values[':expected'];
@@ -3176,5 +3185,125 @@ describe('TEAM-3406 F2: scored supersedes non-scored seen-set claims', () => {
     );
     expect(appendWrites()).toHaveLength(2);
     expect(rowsOf(appendWrites()[1])).toHaveLength(0);
+  });
+});
+
+// ─── TEAM-3410 (PR #187 G1): cooldown bypass via stale lastFlushedAt read ────
+// The handler reads config.lastFlushedAt ONCE at invocation start, and since
+// TEAM-3406 the flush claim CASed on bufferVersion ALONE — so an invocation
+// that appends AFTER another's reset holds a fresh bufferVersion (the version
+// CAS cannot object) AND a stale pre-reset lastFlushedAt (its cooldown gate
+// cannot object either), and pre-fix flushed a second batch — a second improver
+// invocation — inside the cooldown window the P0-B mitigation exists to close.
+// This is a DIFFERENT interleaving from the existing coverage: the "holds the
+// batch" test reads an unexpired cooldown at invocation start (handler
+// fast-path), and the F1 test appends BEFORE the rival's reset (version CAS).
+// Here B appends AFTER A's reset — only the claim's cooldown arm can stop it.
+
+describe('TEAM-3410 G1: flush claim enforces the cooldown against the STORED lastFlushedAt', () => {
+  let handler;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET = 'agentcore-hub-artifacts-123456789012-us-east-1';
+    process.env.EVAL_CONFIG_TABLE = 'agentcore-hub-eval-config';
+    process.env.AWS_REGION = 'us-east-1';
+    process.env.AWS_ACCOUNT_ID = '123456789012';
+    process.env.IMPROVEMENT_AGENT_ARN = IMPROVER_ARN;
+    process.env.EVAL_SEEN_TABLE = 'agentcore-hub-eval-seen-test';
+    vi.resetModules();
+    ({ handler } = await import('./index.mjs'));
+  });
+
+  const flushClaims = () => ddbState.flushResets;
+
+  it("B appends after A's reset (fresh bufferVersion) but holds a stale pre-reset lastFlushedAt: B must NOT flush inside the cooldown window", async () => {
+    // The last flush was long ago, so BOTH invocations' invocation-start
+    // cooldown checks pass; the 60-minute window only re-closes when A's reset
+    // writes a fresh lastFlushedAt — which B's config snapshot never sees.
+    const staleLastFlushedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    ddbState.config = {
+      ...ddbState.config,
+      flushCooldownMinutes: 60,
+      lastFlushedAt: staleLastFlushedAt,
+    };
+
+    const deferred = () => {
+      let resolve;
+      const promise = new Promise((r) => (resolve = r));
+      return { promise, resolve };
+    };
+    const bHasStaleConfig = deferred(); // B's invocation-start config read done
+    const aFlushed = deferred(); // A has fully flushed and reset
+
+    // Promise gates pin the interleaving: B takes its config snapshot (stale
+    // pre-reset lastFlushedAt) FIRST, then A runs to completion (append v1 →
+    // flush → reset, lastFlushedAt = now), then B resumes — appending v2 into
+    // the FRESH post-reset buffer, passing its stale fast-path cooldown check,
+    // and reaching the flush claim holding the LATEST bufferVersion.
+    const baseImpl = ddbSend.getMockImplementation();
+    let configReads = 0;
+    ddbSend.mockImplementation(async (cmd) => {
+      const isConfigRead = cmd.constructor.name === 'GetCommand' && !cmd.input.ProjectionExpression;
+      if (isConfigRead) {
+        configReads += 1;
+        if (configReads === 1) {
+          const result = await baseImpl(cmd); // B's snapshot: pre-reset config
+          bHasStaleConfig.resolve();
+          await aFlushed.promise; // hold B until A has flushed + reset
+          return result;
+        }
+      }
+      return baseImpl(cmd);
+    });
+
+    const pB = handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-cd-B', score: 5, scoreLabel: 'pass', requestId: 'req-cd-B' })])
+    );
+    await bHasStaleConfig.promise;
+    const resA = await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-cd-A', score: 8, scoreLabel: 'pass', requestId: 'req-cd-A' })])
+    );
+    expect(resA).toEqual({ statusCode: 200, body: 'ok' });
+    const lastFlushedByA = ddbState.config.lastFlushedAt;
+    expect(lastFlushedByA).not.toBe(staleLastFlushedAt); // A's reset re-armed the cooldown
+    aFlushed.resolve();
+    const resB = await pB;
+    expect(resB).toEqual({ statusCode: 200, body: 'ok' });
+
+    // THE FIX: exactly ONE batch, ONE PRD, ONE improver invocation — A's.
+    // Pre-fix, B's claim won on the version CAS alone (it held the latest
+    // bufferVersion) and a second batch + improver call landed here, inside
+    // A's cooldown window.
+    expect(putsUnder('fleet-imp-agent/batches/')).toHaveLength(1);
+    expect(putsUnder('fleet-imp-agent/prd/')).toHaveLength(1);
+    expect(httpsRequest).toHaveBeenCalledTimes(1);
+
+    // Both claims carried the cooldown arm alongside the version CAS — the
+    // bufferVersion CAS itself is untouched (F1 stays fixed).
+    expect(flushClaims()).toHaveLength(2);
+    for (const claim of flushClaims()) {
+      expect(claim.ConditionExpression).toBe(
+        'bufferVersion = :expectedVersion AND ' +
+          '(attribute_not_exists(lastFlushedAt) OR lastFlushedAt <= :cooldownCutoff)'
+      );
+    }
+    // A won at version 1. B's claim held the LATEST version (2 — appended after
+    // A's reset), so the version CAS could not object: only the cooldown arm
+    // lost B the claim (A's fresh lastFlushedAt is younger than B's cutoff).
+    expect(flushClaims()[0].ExpressionAttributeValues[':expectedVersion']).toBe(1);
+    expect(flushClaims()[1].ExpressionAttributeValues[':expectedVersion']).toBe(2);
+    expect(ddbState.bufferVersion).toBe(2);
+    expect(flushClaims()[1].ExpressionAttributeValues[':cooldownCutoff'] < lastFlushedByA).toBe(true);
+
+    // B's rows are NOT lost: they stay in the buffer, held for the flush after
+    // the cooldown — the same hold the handler's own gate gives — and B never
+    // overwrote A's lastFlushedAt.
+    expect(ddbState.priorBuffer).toHaveLength(1);
+    expect(ddbState.priorBuffer[0].evaluatorResults.map((r) => r.requestId)).toEqual(['req-cd-B']);
+    expect(ddbState.config.lastFlushedAt).toBe(lastFlushedByA);
+
+    const claimLost = jsonLogs().filter((l) => l.event === 'eval.flush.claim_lost');
+    expect(claimLost).toHaveLength(1);
+    expect(claimLost[0].expectedBufferVersion).toBe(2);
   });
 });
