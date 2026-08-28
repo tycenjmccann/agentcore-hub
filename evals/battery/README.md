@@ -264,10 +264,20 @@ job posts a failing `config-evals-gate` check). One-time setup:
 - **Per-case quorum (TEAM-3405).** In `--baseline-mode --repeat N` a case is
   baseline-eligible when at least `ceil(2N/3)` of its N runs scored (2-of-3 for
   repeat 3); the per-evaluator means are computed over the scored runs only,
-  and each baseline case records `runsScored`/`runsAttempted` so the artifact
-  is honest about its sample size. A case below quorum still fails the whole
-  baseline run — an unsound baseline is never written. Gate mode is
-  unaffected: any non-`scored` case fails the gate.
+  and each baseline case records `runsScored`/`runsAttempted`/`topUpRuns` so
+  the artifact is honest about its sample size. A case below quorum still
+  fails the whole baseline run — an unsound baseline is never written. Gate
+  mode is unaffected: any non-`scored` case fails the gate.
+- **Per-case top-up runs (TEAM-3405, baseline mode ONLY).** After the main
+  N-run pass, a case still below quorum gets up to 2 extra runs, stopping the
+  moment quorum is reached (logged as `↻ top-up run for <case> …`). Top-up
+  runs draw from the same run deadline and spend ceiling (both re-checked
+  before every run — the ceiling is never raised), count into `runsAttempted`,
+  and the means stay computed over scored runs only. The math: with per-run
+  failure rate p = 0.3, P(case below quorum) is ~22% with a bare 3-run pass
+  (`p³ + 3(1−p)p² ≈ 0.216`) but ~3% with 3+2 runs (`p⁵ + 5(1−p)p⁴ ≈ 0.031`).
+  A case that exhausts its top-ups below quorum still fails the whole
+  baseline. Gate mode has no top-ups — a gate case runs exactly once.
 
 - **Bootstrap state.** `bootstrap: true` with `runs_per_case: 0` and empty
   `cases` means no real baseline has been recorded yet; every case runs

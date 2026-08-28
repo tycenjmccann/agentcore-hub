@@ -32,7 +32,7 @@ import { preflight, resolveGateConfig, SCORING_BACKEND as CASES_BACKEND } from "
 import { evaluateSuite } from "./lib/thresholds.mjs";
 import { createRegistry, FORBIDDEN_TOOLS } from "./lib/registry.mjs";
 import { runCase, systemPromptPath, requiredToolFailureError, MODEL_TIERS, MAX_TRANSPORT_RETRIES, BATTERY_TENANT } from "./lib/agent-runner.mjs";
-import { baselineQuorum, aggregateBaselineCase, resolveRunDeadline, DEFAULT_RUN_DEADLINE_SECONDS } from "./lib/baseline.mjs";
+import { baselineQuorum, aggregateBaselineCase, topUpCase, MAX_TOPUP_RUNS, resolveRunDeadline, DEFAULT_RUN_DEADLINE_SECONDS } from "./lib/baseline.mjs";
 import { configFingerprint, appendFlakeLedger, readFlakeLedger, flagFlakyCases } from "./lib/flake.mjs";
 import { createSpendLedger } from "./lib/spend.mjs";
 import { createConverseTransport, scoreCase, SCORING_BACKEND } from "./lib/scoring.mjs";
@@ -529,6 +529,40 @@ async function main() {
     );
     const runs = selected.flatMap((def) => Array.from({ length: flags.repeat }, () => def));
     const results = await runPool(runs, POOL_SIZE, executeAndScore, onWorkerError);
+
+    // Per-case top-up pass (TEAM-3405): a case still below quorum after the
+    // main pass gets up to MAX_TOPUP_RUNS extra runs, stopping at quorum.
+    // The run watchdog stays armed and executeAndScore re-checks the deadline
+    // and the spend ceiling before every top-up run, so top-ups spend from
+    // the same budgets — never past them. Exhausted top-ups still fail the
+    // whole baseline below.
+    const topUpCounts = new Map();
+    if (!runWatchdog.signal.aborted) {
+      const needsTopUp = selected.filter(
+        (def) => results.filter((r) => r.id === def.id && r.status === "scored").length < quorum
+      );
+      if (needsTopUp.length > 0) {
+        console.log(
+          `Top-up pass: ${needsTopUp.length} case(s) below quorum after the main pass (max ${MAX_TOPUP_RUNS} extra run(s) each)`
+        );
+        await runPool(
+          needsTopUp,
+          POOL_SIZE,
+          async (def) => {
+            const used = await topUpCase({
+              def,
+              results,
+              quorum,
+              repeat: flags.repeat,
+              runOnce: executeAndScore,
+              log: (msg) => console.log(`[${clock()}] ${msg}`),
+            });
+            topUpCounts.set(def.id, used);
+          },
+          () => null
+        );
+      }
+    }
     clearTimeout(runTimer);
     if (runWatchdog.signal.aborted) {
       console.error(`Baseline generation FAILED — ${runWatchdog.signal.reason?.message}; not writing a partial baseline.`);
@@ -538,13 +572,17 @@ async function main() {
     const cases = {};
     let anyFailure = false;
     for (const def of selected) {
-      const agg = aggregateBaselineCase({ def, results, quorum });
+      const topUpRuns = topUpCounts.get(def.id) || 0;
+      const agg = aggregateBaselineCase({ def, results, quorum, topUpRuns });
+      const topUpNote = topUpRuns > 0 ? `, ${topUpRuns} top-up(s)` : "";
       if (agg.belowQuorum) {
         anyFailure = true;
-        console.error(`  ✗ ${def.id}: scored ${agg.runsScored}/${agg.runsAttempted} (quorum ${quorum}) — baseline would be unsound`);
+        console.error(
+          `  ✗ ${def.id}: scored ${agg.runsScored}/${agg.runsAttempted} (quorum ${quorum}${topUpNote}) — baseline would be unsound`
+        );
         continue;
       }
-      console.log(`  ✓ ${def.id}: scored ${agg.runsScored}/${agg.runsAttempted} (quorum ${quorum})`);
+      console.log(`  ✓ ${def.id}: scored ${agg.runsScored}/${agg.runsAttempted} (quorum ${quorum}${topUpNote})`);
       cases[def.id] = agg.entry;
     }
     if (ledger.exceeded) {
