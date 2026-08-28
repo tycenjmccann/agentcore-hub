@@ -110,6 +110,47 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 #
 #   aws cloudwatch put-metric-alarm \
 #     --cli-input-json file://deploy/evaluations/eval-success-rate-alarm.json
+#
+# TEAM-3376 also adds session-level EvalThrottleRate /
+# EvalValidationExceptionRate to the same EMF record — the dashboard's rate
+# widgets read them, and they must be visible in CloudWatch before the alarm
+# is applied (covered by the healthy-batch precondition above).
+# -----------------------------------------------------------------------------
+
+# --- Reconciling live configs after a matrix/sampling change (TEAM-3376) ---
+# `agentcore eval online create` does not update in place: re-running this
+# script against an account that already has configs leaves the OLD configs
+# live (create fails or duplicates, per CLI version). To reconcile after a
+# change to the evaluator matrix, sampling tiers, or fleet redeployment:
+#
+#   1. List what's live and diff against expectation — exactly one config per
+#      fleet agent (eval_<agentId>), 5 evaluators each, the custom
+#      dependency-chain evaluator ONLY on eval_agentcore_hub_requirements_analyst:
+#        agentcore eval online list
+#   2. Delete every config that mismatches (wrong evaluator set, wrong
+#      sampling rate, stale agent id from a previous fleet deployment):
+#        agentcore eval online delete --config-id <id>
+#   3. If the fleet was redeployed, regenerate runtime ids FIRST so this
+#      script reads fresh agent ids:
+#        deploy/runtime-agent/refresh-agents-json.sh
+#   4. Re-run this script to recreate the deleted configs, then re-run
+#      refresh-agents-json.sh so agents.json picks up the new evalConfigNames.
+#   5. Record the resulting config ids in
+#      deploy/evaluations/eval-config-ids.json (snapshot only, but keep it
+#      truthful for the next reader).
+#
+# The whole procedure is idempotent: a config that already matches the
+# expected shape is left alone, and re-running create for a deleted name just
+# mints a fresh account-suffixed id.
+# -----------------------------------------------------------------------------
+
+# --- Eval judge throttling (quota) — OPERATOR action, NOT CI ---------------
+# If eval results show ThrottlingException storms (EvalThrottleRate /
+# EvalThrottleCount climbing on the eval-health dashboard), the Opus judge
+# model's RPM quota needs an increase via AWS Service Quotas. Full runbook:
+# "Eval judge throttling (quota)" in docs/orchestration-tracing-guide.md.
+# Never automate the quota request from CI — it needs a human to pick the
+# value and own the AWS support conversation.
 # -----------------------------------------------------------------------------
 
 # Agents scoped to the custom dependency-chain evaluator (TEAM-3368,

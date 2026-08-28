@@ -174,6 +174,7 @@ def test_anchor_span_exported_without_agent_loop(span_exporter):
     span = spans[0]
     assert span.attributes.get("gen_ai.operation.name") == "invoke_agent"
     assert span.name == "invoke_agent test_agent"
+    assert span.attributes.get("gen_ai.agent.name") == "test_agent"
     assert span.attributes.get("session.id") == "sess-123"
     assert span.attributes.get("agentcore.hub.anchor") is True
     assert span.end_time is not None, "anchor span must be ENDED at emission time"

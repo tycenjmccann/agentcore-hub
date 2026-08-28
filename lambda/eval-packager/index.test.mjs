@@ -49,6 +49,7 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
   DynamoDBDocumentClient: { from: () => ({ send: (cmd) => ddbSend(cmd) }) },
   GetCommand: class GetCommand extends FakeCommand {},
   UpdateCommand: class UpdateCommand extends FakeCommand {},
+  PutCommand: class PutCommand extends FakeCommand {},
 }));
 
 vi.mock('@aws-sdk/client-s3', () => ({
@@ -100,7 +101,7 @@ const MISSING_SPAN_MESSAGE =
  * payload lives entirely in `attributes` under gen_ai.* keys. Reading
  * top-level .score/.evidence instead is what produced all-null batches.
  */
-function evalRecord({ sessionId, evaluatorName = 'builtin.correctness', score, scoreLabel, errorType, errorMessage, requestId }) {
+function evalRecord({ sessionId, evaluatorName = 'builtin.correctness', score, scoreLabel, errorType, errorMessage, requestId, extraAttrs }) {
   const attributes = { 'session.id': sessionId, 'gen_ai.evaluation.name': evaluatorName };
   if (requestId) attributes['aws.request_id'] = requestId;
   if (score !== undefined && score !== null) attributes['gen_ai.evaluation.score.value'] = score;
@@ -110,6 +111,7 @@ function evalRecord({ sessionId, evaluatorName = 'builtin.correctness', score, s
   }
   if (errorType) attributes['error.type'] = errorType;
   if (errorMessage) attributes['error.message'] = errorMessage;
+  if (extraAttrs) Object.assign(attributes, extraAttrs);
   return { severityText: errorType ? 'ERROR' : 'INFO', body: 'evaluation result', attributes };
 }
 
@@ -187,12 +189,35 @@ beforeEach(() => {
     },
     bufferSessions: new Set(['sess-from-an-earlier-delivery']),
     priorBuffer: [],
+    // TEAM-3376 seen-set table. Puts are recorded and succeed by default;
+    // a test that wants real DynamoDB conditional-write semantics (repeat
+    // dedupKey → ConditionalCheckFailedException) opts in via the flag, so
+    // suites that replay the same request ids across handler calls (e.g. the
+    // duplicate-aggregation tests above) aren't cross-delivery-deduped.
+    seenKeys: new Set(),
+    seenPuts: [],
+    seenSetConditional: false,
   };
 
   ddbSend.mockReset();
   ddbSend.mockImplementation(async (cmd) => {
     const name = cmd.constructor.name;
     if (name === 'GetCommand') return { Item: ddbState.config };
+    if (name === 'PutCommand') {
+      const key = cmd.input.Item?.dedupKey;
+      ddbState.seenPuts.push(cmd.input);
+      if (
+        ddbState.seenSetConditional &&
+        cmd.input.ConditionExpression === 'attribute_not_exists(dedupKey)' &&
+        ddbState.seenKeys.has(key)
+      ) {
+        const err = new Error('The conditional request failed');
+        err.name = 'ConditionalCheckFailedException';
+        throw err;
+      }
+      ddbState.seenKeys.add(key);
+      return {};
+    }
     if (name === 'UpdateCommand') {
       // appendToBuffer asks for ALL_NEW; mirror DDB's list_append so the flush
       // sees the delivery that was just appended.
@@ -880,6 +905,8 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
       'EvalSessionsSpanMissing',
       'EvalSessionsTotal',
       'EvalThrottleCount',
+      'EvalThrottleRate',
+      'EvalValidationExceptionRate',
     ]);
     expect(typeof record._aws.Timestamp).toBe('number');
     expect(record.AgentName).toBe('agentcore_hub_backend_dev');
@@ -1348,7 +1375,7 @@ describe('eval health metrics (TEAM-3368 §4)', () => {
     }),
   });
 
-  it('one EMF record carries all metrics with Count units', () => {
+  it('one EMF record carries all metrics: counts as Count, rates as None', () => {
     emitEvalMetrics('agentcore_hub_backend_dev', {
       total: 5, spanMissing: 1, errors: 2, throttles: 3, duplicates: 4, depChainExcluded: 1,
     });
@@ -1358,7 +1385,11 @@ describe('eval health metrics (TEAM-3368 §4)', () => {
     const [directive] = record._aws.CloudWatchMetrics;
     expect(directive.Namespace).toBe('AgentCoreHub/Evaluations');
     expect(directive.Dimensions).toEqual([['AgentName']]);
-    expect(directive.Metrics.every((m) => m.Unit === 'Count')).toBe(true);
+    // TEAM-3376 adds the two dimensionless session-rate metrics; everything
+    // else stays a Count.
+    expect(
+      directive.Metrics.every((m) => m.Unit === (m.Name.endsWith('Rate') ? 'None' : 'Count'))
+    ).toBe(true);
     expect(record.EvalSessionsTotal).toBe(5);
     expect(record.EvalSessionsSpanMissing).toBe(1);
     expect(record.EvalSessionsError).toBe(2);
@@ -1603,5 +1634,421 @@ describe('invokeImprover retry (TEAM-3367)', () => {
     expect(isRetryableImproverError(Object.assign(new Error('x'), { statusCode: 400 }))).toBe(false);
     expect(isRetryableImproverError(Object.assign(new Error('x'), { statusCode: 403 }))).toBe(false);
     expect(isRetryableImproverError(new Error('improver returned empty output'))).toBe(false);
+  });
+});
+
+// ─── TEAM-3376: dedup fail-open, seen-set, role guard, error split ───────────
+// Layered on the TEAM-3367/3368 behavior above: rows with NO usable identity
+// fail OPEN through dedup (retained + counted), a DynamoDB seen-set extends
+// dedup across deliveries/concurrent invocations, and error sessions split
+// into throttle/validation/generic for the EMF rate metrics.
+
+describe('TEAM-3376: dedup fail-open + seen-set + error split (pure helpers)', () => {
+  let extractSessionData;
+  let dedupeAgainstSeenSet;
+  let classifySessions;
+  let setSeenSetClient;
+  let applyRoleGuard;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({
+      extractSessionData,
+      dedupeAgainstSeenSet,
+      classifySessions,
+      setSeenSetClient,
+      applyRoleGuard,
+    } = await import('./index.mjs'));
+  });
+
+  afterEach(() => {
+    setSeenSetClient(null); // back to the module's own (mocked) doc client
+  });
+
+  const deliveryOf = (logEvents) => ({ logGroup: LOG_GROUP, logStream: 'test-stream', logEvents });
+  const otelEvent = ({ timestamp = 1_756_250_000_000, sessionId, evaluatorName = 'Builtin.Correctness', score, errorType, errorMessage, requestId }) => ({
+    timestamp,
+    message: JSON.stringify({
+      attributes: {
+        ...(sessionId ? { 'session.id': sessionId } : {}),
+        ...(evaluatorName ? { 'gen_ai.evaluation.name': evaluatorName } : {}),
+        ...(score !== undefined && score !== null ? { 'gen_ai.evaluation.score.value': score } : {}),
+        ...(errorType ? { 'error.type': errorType } : {}),
+        ...(errorMessage ? { 'error.message': errorMessage } : {}),
+        ...(requestId ? { 'aws.request_id': requestId } : {}),
+      },
+    }),
+  });
+
+  it('fails open when every dedup-key field is null/missing: retained + counted', () => {
+    const bare = (ts) => ({ timestamp: ts, message: JSON.stringify({ attributes: {} }) });
+    const sessionData = extractSessionData(deliveryOf([bare(null), bare(null)]));
+    expect(sessionData.evaluatorResults).toHaveLength(2);
+    expect(sessionData.duplicatesDropped).toBe(0);
+    expect(sessionData.dedupMissingKeyCount).toBe(2);
+    expect(sessionData.evaluatorResults.every((r) => r.dedupKey === null)).toBe(true);
+  });
+
+  it('fails open on a seen-set hard error (non-conditional): record retained', async () => {
+    setSeenSetClient({
+      send: async () => {
+        throw new Error('ProvisionedThroughputExceededException: table on fire');
+      },
+    });
+    const sessionData = extractSessionData(
+      deliveryOf([otelEvent({ sessionId: 's1', score: 8, requestId: 'req-hard-error' })])
+    );
+    await dedupeAgainstSeenSet(sessionData, AGENT_ID);
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.duplicatesDropped).toBe(0);
+    expect(textLogs()).toContain('failed open');
+  });
+
+  it('dedup never flips classification: 8 duplicates of a throttled session classify like the duplicate-free delivery', () => {
+    const throttledEvent = (i = 0) =>
+      otelEvent({
+        timestamp: 1_756_250_000_000 + i,
+        sessionId: 'sess-throttled',
+        score: null,
+        errorType: 'ThrottlingException',
+        errorMessage: 'Rate exceeded',
+        requestId: 'req-2222',
+      });
+
+    const deduped = classifySessions(
+      extractSessionData(deliveryOf(Array.from({ length: 9 }, (_, i) => throttledEvent(i))))
+    );
+    const clean = classifySessions(extractSessionData(deliveryOf([throttledEvent()])));
+
+    expect(deduped.statuses.get('sess-throttled')).toBe('error');
+    expect(deduped.total).toBe(1);
+    expect(deduped.throttled).toBe(1);
+    expect(deduped).toEqual(clean);
+  });
+
+  it('classifySessions splits throttled / validation / generic errors by error.type suffix, span_missing untouched', () => {
+    const row = (sessionId, score, errorType = null) => ({
+      sessionId,
+      evaluatorName: 'Builtin.Correctness',
+      score,
+      errorType,
+      errorMessage: null,
+    });
+    const { statuses, total, spanMissing, errors, throttled, validationErrors, genericErrors } =
+      classifySessions({
+        evaluatorResults: [
+          row('s-throttled', null, 'ThrottlingException'),
+          // Namespaced variant must also count as throttle.
+          row('s-throttled-ns', null, 'com.amazonaws.bedrock#ThrottlingException'),
+          row('s-validation', null, 'ValidationException'),
+          row('s-generic', null, 'JudgeTimeout'),
+          row('s-missing', null),
+          row('s-scored', 9),
+        ],
+      });
+
+    expect(throttled).toBe(2);
+    expect(validationErrors).toBe(1);
+    expect(genericErrors).toBe(1);
+    expect(errors).toBe(4);
+    // The coarse statuses map and span_missing/total semantics are unchanged.
+    expect(statuses.get('s-throttled')).toBe('error');
+    expect(statuses.get('s-validation')).toBe('error');
+    expect(statuses.get('s-generic')).toBe('error');
+    expect(statuses.get('s-missing')).toBe('span_missing');
+    expect(statuses.get('s-scored')).toBe('scored');
+    expect(total).toBe(6);
+    expect(spanMissing).toBe(1);
+  });
+
+  it('applyRoleGuard drops out-of-scope dep-chain rows only, keeps siblings and in-scope rows', () => {
+    const backendSid = 'TEAM-3200_wf_1756240000000_ab12cd-agentcore_hub_backend_dev-1756240012345';
+    const analystSid = 'wf_1756240000000_xy34zz-agentcore_hub_requirements_analyst-1756240099999';
+    const row = (sessionId, evaluatorName, score) => ({
+      sessionId,
+      evaluatorName,
+      score,
+      errorType: null,
+      errorMessage: null,
+    });
+    const depBackend = row(backendSid, 'dependency_chain_compliance_online_v1', 2);
+    const sibling = row(backendSid, 'Builtin.Correctness', 8);
+    const depAnalyst = row(analystSid, 'dependency_chain_compliance_online_v1', 9);
+
+    const guarded = applyRoleGuard([depBackend, sibling, depAnalyst]);
+    expect(guarded.excluded).toBe(1);
+    expect(guarded.records).toEqual([sibling, depAnalyst]);
+
+    // The exclusion flips no session's classification.
+    const after = classifySessions({ evaluatorResults: guarded.records });
+    expect(after.statuses.get(backendSid)).toBe('scored');
+    expect(after.total).toBe(2);
+    expect(after.spanMissing).toBe(0);
+  });
+});
+
+// ─── TEAM-3376: handler wiring — seen-set, dedup metrics, aggregation ────────
+
+describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', () => {
+  let handler;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET = 'agentcore-hub-artifacts-123456789012-us-east-1';
+    process.env.EVAL_CONFIG_TABLE = 'agentcore-hub-eval-config';
+    process.env.AWS_REGION = 'us-east-1';
+    process.env.AWS_ACCOUNT_ID = '123456789012';
+    process.env.IMPROVEMENT_AGENT_ARN = IMPROVER_ARN;
+    process.env.EVAL_SEEN_TABLE = 'agentcore-hub-eval-seen-test';
+    vi.resetModules();
+    ({ handler } = await import('./index.mjs'));
+  });
+
+  beforeEach(() => {
+    // No flush in these tests: they assert the ingest path, not synthesis.
+    ddbState.config = { ...ddbState.config, batchSize: 10 };
+  });
+
+  const aggregateWrites = () =>
+    sentCommands(ddbSend, 'UpdateCommand').filter((c) => c.input.ExpressionAttributeValues?.[':scores']);
+  const appendWrites = () =>
+    sentCommands(ddbSend, 'UpdateCommand').filter((c) => c.input.ReturnValues === 'ALL_NEW');
+  const lastEvalMetrics = () => emfLines('EvalSessionsTotal').at(-1);
+
+  it('drops a duplicate split across two deliveries via the seen-set (1 retained overall)', async () => {
+    ddbState.seenSetConditional = true; // real DDB conditional-write semantics
+    const event = awslogsEvent([
+      evalRecord({ sessionId: 'sess-x', score: 8, scoreLabel: 'pass', requestId: 'req-shared' }),
+    ]);
+
+    await handler(event); // delivery A: fresh → conditional put succeeds
+    await handler(event); // delivery B: same dedupKey → ConditionalCheckFailedException → dropped
+
+    const appends = appendWrites();
+    expect(appends).toHaveLength(2);
+    expect(appends[0].input.ExpressionAttributeValues[':new'][0].evaluatorResults).toHaveLength(1);
+    expect(appends[1].input.ExpressionAttributeValues[':new'][0].evaluatorResults).toHaveLength(0);
+
+    // Both deliveries attempted the conditional put; only the first landed.
+    expect(ddbState.seenPuts).toHaveLength(2);
+    expect(ddbState.seenPuts[0].ConditionExpression).toBe('attribute_not_exists(dedupKey)');
+    expect(typeof ddbState.seenPuts[0].Item.expiresAt).toBe('number');
+
+    // Delivery B's EMF: the drop is counted, and rates guard divide-by-zero
+    // (all rows gone → total 0 → rates 0, not NaN).
+    const emf = lastEvalMetrics();
+    expect(emf.EvalDuplicateResultCount).toBe(1);
+    expect(emf.EvalSessionsTotal).toBe(0);
+    expect(emf.EvalThrottleRate).toBe(0);
+    expect(emf.EvalValidationExceptionRate).toBe(0);
+
+    // Nothing aggregated twice: delivery B contributed no score deltas.
+    expect(aggregateWrites()).toHaveLength(1);
+  });
+
+  it('aggregation deltas are identical for a clean delivery and the same delivery duplicated 8×, across handler calls', async () => {
+    const rows = (prefix) => [
+      { sessionId: 'sess-1', evaluatorName: 'builtin.correctness', score: 8, requestId: `${prefix}-1` },
+      { sessionId: 'sess-1', evaluatorName: 'builtin.helpfulness', score: 6, requestId: `${prefix}-2` },
+      { sessionId: 'sess-2', evaluatorName: 'builtin.correctness', score: 9, requestId: `${prefix}-3` },
+    ];
+    const toRecord = (r) =>
+      evalRecord({
+        sessionId: r.sessionId,
+        evaluatorName: r.evaluatorName,
+        score: r.score,
+        scoreLabel: 'pass',
+        requestId: r.requestId,
+      });
+
+    await handler(awslogsEvent(rows('a').map(toRecord)));
+    const clean = aggregateWrites().at(-1).input.ExpressionAttributeValues;
+
+    // Same shape, but every record delivered 9 times (8 injected duplicates),
+    // with fresh request ids so the seen-set doesn't interfere.
+    const duplicated = rows('b').flatMap((r) => Array.from({ length: 9 }, () => toRecord(r)));
+    await handler(awslogsEvent(duplicated));
+    const deduped = aggregateWrites().at(-1).input.ExpressionAttributeValues;
+
+    expect(deduped[':scores']).toEqual(clean[':scores']);
+    expect(deduped[':scores']).toEqual({
+      'builtin.correctness': { sum: 17, count: 2 },
+      'builtin.helpfulness': { sum: 6, count: 1 },
+    });
+    expect(deduped[':sc']).toEqual(clean[':sc']);
+    expect(deduped[':statusCounts']).toEqual(clean[':statusCounts']);
+  });
+
+  it('EMF for a THROTTLED delivery: throttle rate 1, validation 0, duplicates 0', async () => {
+    await handler(
+      awslogsEvent([
+        evalRecord({ sessionId: 'sess-t', score: null, errorType: 'ThrottlingException', errorMessage: 'Rate exceeded' }),
+      ])
+    );
+    const emf = lastEvalMetrics();
+    const [directive] = emf._aws.CloudWatchMetrics;
+    expect(directive.Namespace).toBe('AgentCoreHub/Evaluations');
+    expect(directive.Dimensions).toEqual([['AgentName']]);
+    expect(emf.AgentName).toBe(AGENT_ID);
+    expect(emf.EvalSessionsTotal).toBe(1);
+    expect(emf.EvalThrottleRate).toBe(1);
+    expect(emf.EvalValidationExceptionRate).toBe(0);
+    expect(emf.EvalDuplicateResultCount).toBe(0);
+    expect(emf.EvalSessionsError).toBe(1);
+  });
+
+  it('EMF for a VALIDATION-FAILED delivery: validation rate 1, throttle 0', async () => {
+    await handler(
+      awslogsEvent([
+        evalRecord({ sessionId: 'sess-v', score: null, errorType: 'ValidationException', errorMessage: MISSING_SPAN_MESSAGE }),
+      ])
+    );
+    const emf = lastEvalMetrics();
+    expect(emf.EvalSessionsTotal).toBe(1);
+    expect(emf.EvalThrottleRate).toBe(0);
+    expect(emf.EvalValidationExceptionRate).toBe(1);
+    expect(emf.EvalDuplicateResultCount).toBe(0);
+    expect(emf.EvalSessionsError).toBe(1);
+  });
+
+  it('EMF for a DUPLICATED delivery: healthy rates, dropped count surfaced', async () => {
+    const nine = Array.from({ length: 9 }, () =>
+      evalRecord({ sessionId: 'sess-d', score: 8, scoreLabel: 'pass', requestId: 'req-dup-emf' })
+    );
+    await handler(awslogsEvent(nine));
+    const emf = lastEvalMetrics();
+    expect(emf.EvalSessionsTotal).toBe(1);
+    expect(emf.EvalThrottleRate).toBe(0);
+    expect(emf.EvalValidationExceptionRate).toBe(0);
+    expect(emf.EvalDuplicateResultCount).toBe(8);
+    expect(emf.EvalSessionsError).toBe(0);
+  });
+
+  it('EMF for a HEALTHY delivery: all rate/duplicate metrics present and zero', async () => {
+    await handler(
+      awslogsEvent([
+        evalRecord({ sessionId: 'sess-h1', score: 9, scoreLabel: 'pass', requestId: 'req-h1' }),
+        evalRecord({ sessionId: 'sess-h2', score: 7, scoreLabel: 'pass', requestId: 'req-h2' }),
+      ])
+    );
+    const emf = lastEvalMetrics();
+    const [directive] = emf._aws.CloudWatchMetrics;
+    expect(directive.Namespace).toBe('AgentCoreHub/Evaluations');
+    expect(directive.Dimensions).toEqual([['AgentName']]);
+    expect(directive.Metrics.map((m) => m.Name)).toContain('EvalThrottleRate');
+    expect(emf.EvalSessionsTotal).toBe(2);
+    expect(emf.EvalThrottleRate).toBe(0);
+    expect(emf.EvalValidationExceptionRate).toBe(0);
+    expect(emf.EvalDuplicateResultCount).toBe(0);
+    expect(emf.EvalSessionsError).toBe(0);
+  });
+});
+
+// ─── TEAM-3376: setRetryHooks injection for invokeImprover ───────────────────
+// The deps-param injection is covered above (TEAM-3367); these pin the
+// module-level hook layer for callers that can't thread deps through.
+
+describe('TEAM-3376: invokeImprover setRetryHooks injection', () => {
+  let invokeImprover;
+  let setRetryHooks;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ invokeImprover, setRetryHooks } = await import('./index.mjs'));
+  });
+
+  /** An https.request mock that answers with `statusCode` and raw `bodyText`. */
+  const respondWith = (statusCode, bodyText = '') => (options, callback) => {
+    const res = new EventEmitter();
+    res.statusCode = statusCode;
+    const req = {
+      on() {
+        return req;
+      },
+      write() {},
+      end() {
+        process.nextTick(() => {
+          if (bodyText) res.emit('data', Buffer.from(bodyText));
+          res.emit('end');
+        });
+      },
+    };
+    callback(res);
+    return req;
+  };
+  const sseSuccess = respondWith(
+    200,
+    `data: ${JSON.stringify({ event: { contentBlockDelta: { delta: { text: 'the PRD' } } } })}\n\n`
+  );
+
+  it('retries a throttle (429) once with full-jitter backoff, then succeeds', async () => {
+    const sleeps = [];
+    setRetryHooks({
+      sleep: (ms) => {
+        sleeps.push(ms);
+        return Promise.resolve();
+      },
+      random: () => 0.5,
+      now: (() => {
+        let t = 0;
+        return () => (t += 1000);
+      })(),
+    });
+    httpsRequest
+      .mockReset()
+      .mockImplementationOnce(respondWith(429, 'data: {"message":"ThrottlingException"}\n\n'))
+      .mockImplementationOnce(sseSuccess);
+
+    const text = await invokeImprover(IMPROVER_ARN, 'synthesize', AGENT_ID);
+
+    expect(text).toBe('the PRD');
+    expect(httpsRequest).toHaveBeenCalledTimes(2);
+    // One sleep, deterministic under random()=0.5: 0.5 · min(60000, 2000·2⁰) = 1000,
+    // inside the first retry's full-jitter bound [0, 2000).
+    expect(sleeps).toEqual([1000]);
+  });
+
+  it('never retries a non-throttle 4xx', async () => {
+    const sleeps = [];
+    setRetryHooks({
+      sleep: (ms) => {
+        sleeps.push(ms);
+        return Promise.resolve();
+      },
+      random: () => 0.5,
+      now: () => 0,
+    });
+    httpsRequest.mockReset().mockImplementation(respondWith(400, ''));
+
+    await expect(invokeImprover(IMPROVER_ARN, 'synthesize', AGENT_ID)).rejects.toThrow(
+      /improver returned 400/
+    );
+    expect(httpsRequest).toHaveBeenCalledTimes(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it('stops before attempt 3 when the 520s budget cannot fit another 240s attempt', async () => {
+    const sleeps = [];
+    // now(): start=0; before attempt 2: 100s elapsed (retry fits: 100+240 ≤ 520);
+    // before attempt 3: 300s elapsed (300+240 > 520 → abandon).
+    const ticks = [0, 100_000, 300_000];
+    setRetryHooks({
+      sleep: (ms) => {
+        sleeps.push(ms);
+        return Promise.resolve();
+      },
+      random: () => 0.5,
+      now: () => (ticks.length > 1 ? ticks.shift() : ticks[0]),
+    });
+    httpsRequest.mockReset().mockImplementation(respondWith(429, ''));
+
+    await expect(invokeImprover(IMPROVER_ARN, 'synthesize', AGENT_ID)).rejects.toThrow(
+      /improver retry abandoned/
+    );
+    expect(httpsRequest).toHaveBeenCalledTimes(2); // attempt 3 never started
+    expect(sleeps).toHaveLength(1); // only the first retry slept
   });
 });

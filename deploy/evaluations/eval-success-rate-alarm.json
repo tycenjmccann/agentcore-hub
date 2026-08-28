@@ -1,6 +1,6 @@
 {
   "AlarmName": "agentcore-hub-eval-success-rate",
-  "AlarmDescription": "Fleet eval success rate (total - span_missing - errors) / total dropped below 0.8. Fires on 3 of 4 hourly datapoints. INSUFFICIENT_DATA when no eval sessions arrive (quiet hours) — expected, do not page on it. Add AlarmActions (environment SNS topic ARN) at apply time.",
+  "AlarmDescription": "Fleet eval success rate (total - span_missing - errors) / total dropped below 0.8. Covers BOTH failure modes: span_missing (runtime telemetry broken — no invoke_agent span) AND error sessions, including judge throttling (ThrottlingException) and validation failures. Fires on 3 of 4 hourly datapoints. DEPLOYMENT ORDER (TEAM-3376): apply only AFTER (a) the runtime anchor-span fix is deployed to the fleet and (b) at least one healthy batch with non-zero EvalSessionsTotal and the EvalSessionsError metric has been observed in CloudWatch — earlier, the rate computes over pre-fix data and fires immediately. INSUFFICIENT_DATA when no eval sessions arrive (quiet hours) — expected, do not page on it. Add AlarmActions (environment SNS topic ARN) at apply time.",
   "ActionsEnabled": true,
   "EvaluationPeriods": 4,
   "DatapointsToAlarm": 3,

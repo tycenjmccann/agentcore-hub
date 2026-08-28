@@ -46,6 +46,10 @@ const s3 = new S3Client({});
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 const TABLE = process.env.EVAL_CONFIG_TABLE || 'agentcore-hub-eval-config';
+// Cross-delivery dedup seen-set (TEAM-3376). Set EVAL_SEEN_TABLE='' to disable
+// the persistent check entirely (in-memory per-delivery dedup still applies).
+const SEEN_TABLE = process.env.EVAL_SEEN_TABLE ?? 'agentcore-hub-eval-seen';
+const SEEN_TTL_SECONDS = 24 * 60 * 60;
 const BUCKET = process.env.ARTIFACTS_BUCKET || process.env.ARTIFACT_BUCKET;
 if (!BUCKET) {
   throw new Error(
@@ -133,8 +137,15 @@ export const handler = async (event) => {
   // be measured on ALL deliveries, not just the sampled subset that gets buffered.
   const sessionData = extractSessionData(parsed);
 
-  const { statuses, total, spanMissing, errors } = classifySessions(sessionData);
-  if (total > 0) {
+  // TEAM-3376: cross-delivery/concurrent dedup runs BEFORE classification,
+  // aggregation and buffering — everything downstream sees the filtered view.
+  await dedupeAgainstSeenSet(sessionData, agentId);
+
+  const { statuses, total, spanMissing, errors, throttled, validationErrors } =
+    classifySessions(sessionData);
+  // duplicatesDropped > 0 with total 0 still emits: a delivery whose every row
+  // was a cross-delivery duplicate must surface in EvalDuplicateResultCount.
+  if (total > 0 || (sessionData.duplicatesDropped || 0) > 0) {
     emitEvalMetrics(agentId, {
       total,
       spanMissing,
@@ -142,6 +153,8 @@ export const handler = async (event) => {
       throttles: countThrottles(sessionData.evaluatorResults),
       duplicates: sessionData.duplicatesDropped,
       depChainExcluded: sessionData.depChainExcluded,
+      throttledSessions: throttled,
+      validationSessions: validationErrors,
     });
     sessionData.sessionStatus = Object.fromEntries(statuses);
     if (spanMissing > 0) sessionData.status = 'span_missing';
@@ -163,24 +176,18 @@ export const handler = async (event) => {
 
   // 5. Aggregate eval scores into DDB (for instant dashboard loads)
   //
-  // ── KNOWN GAP, DEFERRED (TEAM-3381, design §2.2 decision rule) ────────────
-  // This runs PER DELIVERY on per-delivery-deduped rows, so the DDB rolling
-  // aggregates (evalScores / evalSessionCount / evalStatusCounts) can still
-  // double-count a duplicate that spans TWO CloudWatch Logs deliveries. Only
-  // the flushed batch payload is protected (dedupeBufferedSessions re-dedupes
-  // the merged buffer at flush time).
-  //
-  // The fix — an `agentcore-hub-eval-seen` conditional-write seen-set — is
-  // deferred pending a 1-week measurement, per §2.2. IMPORTANT: the
-  // EvalDuplicateResultCount metric structurally CANNOT measure this. It counts
-  // per-delivery drops only, so cross-delivery duplicates are invisible to it
-  // and a flat/zero series is NOT evidence the gap is harmless. The measurement
-  // instrument is the §2.2 Logs Insights verification query grouped by
-  // logStream (see docs/eval-infrastructure-reliability-design.md §2.2). Run it
-  // after 1 week: if >1% of records fall in cross-delivery duplicate groups,
-  // implement the seen-set — PK dedupKey, ConditionExpression
-  // attribute_not_exists(dedupKey), TTL 24h, FAIL-OPEN (a seen-set error must
-  // never cost a record).
+  // Cross-delivery protection (TEAM-3381 §2.2 gap, closed by TEAM-3376):
+  // this runs on rows already filtered by BOTH dedup layers — the in-memory
+  // per-delivery pass in extractSessionData and the `agentcore-hub-eval-seen`
+  // conditional-write seen-set above (dedupeAgainstSeenSet: PK dedupKey,
+  // attribute_not_exists, TTL 24h, FAIL-OPEN) — so the rolling aggregates
+  // (evalScores / evalSessionCount / evalStatusCounts) no longer double-count
+  // a duplicate that spans two CloudWatch Logs deliveries. The flush-time
+  // dedupeBufferedSessions pass remains as defense-in-depth for the batch
+  // payload (it also covers records the seen-set failed OPEN on). NOTE from
+  // §2.2 still holds: EvalDuplicateResultCount now includes seen-set drops,
+  // but to VERIFY the seen-set is working use the §2.2 Logs Insights query
+  // grouped by logStream (docs/eval-infrastructure-reliability-design.md).
   await aggregateScoresToDdb(agentId, sessionData.evaluatorResults);
 
   // 6. Append to sessionBuffer, counting distinct runs toward batchSize
@@ -283,6 +290,36 @@ export function hasNoDedupKey(r) {
 }
 
 /**
+ * TEAM-3376: the stable dedup key for one evaluator-result row — the single
+ * keying rule shared by the in-memory pass (dedupeResults), the flush-time
+ * re-dedup (dedupeBufferedSessions), and the cross-delivery DynamoDB seen-set
+ * (dedupeAgainstSeenSet), whose partition key it is — so it must be stable
+ * across deliveries (contentFingerprint is byte-derived, so it is).
+ *
+ * Keyed by requestId when the record carried one; unparseable rows key on
+ * their raw text; everything else takes the content key, whose trailing
+ * contentHash separates two distinct results that share metadata AND the
+ * delivery's millisecond timestamp (TEAM-3381) while a genuine retry write
+ * re-sends the same bytes and still collapses.
+ *
+ * Returns null for a row with no usable identity at all (hasNoDedupKey above)
+ * — such rows FAIL OPEN through every dedup layer: retaining a possible
+ * duplicate beats discarding real data.
+ */
+export function dedupKeyFor(r) {
+  if (hasNoDedupKey(r)) return null; // FAIL-OPEN: no identity → never deduped
+  if (r.requestId) {
+    // evaluatorName rides along with the request id: every metric record an
+    // eval run emits about ONE evaluated span (correctness, helpfulness, …)
+    // can share that span's trace/span ids, and those are distinct results,
+    // not duplicates. Retries of the same record share both fields.
+    return `req|${r.requestId}|${r.evaluatorName ?? ''}`;
+  }
+  if (r.parseError) return `raw|${r.timestamp}|${r.rawMessage}`;
+  return `content|${r.sessionId}|${r.evaluatorName}|${r.evaluationName ?? ''}|${r.score}|${r.timestamp}|${r.contentHash ?? ''}`;
+}
+
+/**
  * TEAM-3367: drop duplicate evaluator-result rows (first occurrence wins).
  * Keyed by requestId when the record carried one; otherwise by a content key —
  * timestamp inclusion keeps genuinely distinct same-score evaluations apart,
@@ -293,33 +330,21 @@ export function hasNoDedupKey(r) {
  * TEAM-3381: pass `seen` to dedupe ACROSS calls — flushBuffer reuses one set
  * over every buffered delivery so a request id split across two CloudWatch
  * deliveries reaches the flushed payload once (see dedupeBufferedSessions).
- * In-memory only: the cross-INVOCATION seen-set that would also protect the DDB
- * rolling aggregates is deferred — see the deferral note at the
- * aggregateScoresToDdb call site in the handler.
+ * TEAM-3376 layers the cross-INVOCATION DynamoDB seen-set on top
+ * (dedupeAgainstSeenSet), which also protects the DDB rolling aggregates.
  */
 export function dedupeResults(records, seen = new Set()) {
   const out = [];
   for (const r of records || []) {
-    // Fail open before any keying: no key exists, so no duplicate can be proven.
-    if (hasNoDedupKey(r)) {
-      out.push(r);
-      continue;
+    // Rows carry their key pre-stamped by extractSessionData (the seen-set
+    // needs it persisted); hand-built rows in tests compute it on the fly.
+    // A null key means hasNoDedupKey → fail open: no key exists, so no
+    // duplicate can be proven.
+    const key = r.dedupKey !== undefined ? r.dedupKey : dedupKeyFor(r);
+    if (key) {
+      if (seen.has(key)) continue;
+      seen.add(key);
     }
-    const key = r.requestId
-      // evaluatorName rides along with the request id: every metric record an
-      // eval run emits about ONE evaluated span (correctness, helpfulness, …)
-      // can share that span's trace/span ids, and those are distinct results,
-      // not duplicates. Retries of the same record share both fields.
-      ? `req|${r.requestId}|${r.evaluatorName ?? ''}`
-      : r.parseError
-        ? `raw|${r.timestamp}|${r.rawMessage}`
-        // contentFingerprint (extractSessionData sets it on request-id-less rows)
-        // is what separates two distinct results that share metadata AND the
-        // delivery's millisecond timestamp; a genuine retry write re-sends the
-        // same bytes, so its fingerprint matches and it still collapses.
-        : `content|${r.sessionId}|${r.evaluatorName}|${r.evaluationName ?? ''}|${r.score}|${r.timestamp}|${r.contentHash ?? ''}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
     out.push(r);
   }
   return out;
@@ -392,6 +417,20 @@ export function isOutOfScopeDepChain(row) {
 }
 
 /**
+ * Drop out-of-scope dep-chain rows. Other evaluators' records are never
+ * affected, whatever the role parse says. Returns { records, excluded }.
+ */
+export function applyRoleGuard(records) {
+  const kept = [];
+  let excluded = 0;
+  for (const row of records || []) {
+    if (isOutOfScopeDepChain(row)) excluded += 1;
+    else kept.push(row);
+  }
+  return { records: kept, excluded };
+}
+
+/**
  * Extract session data from parsed CW Logs event.
  * Parses each logEvent.message as JSON to extract evaluator scores,
  * evaluator name, and evidence. Stores parsed results (not raw event metadata)
@@ -448,7 +487,11 @@ export function extractSessionData(parsed) {
       };
       // status/statusReason let the improver (and the dashboard) tell an un-scored
       // run apart from a badly-scored one instead of averaging nulls into zeros.
-      sessionBuffer.push({ ...entry, ...classifyEntry(entry) });
+      const row = { ...entry, ...classifyEntry(entry) };
+      // dedupKey stamped onto the row (TEAM-3376): the in-memory pass below and
+      // the cross-delivery seen-set (dedupeAgainstSeenSet) both key off it.
+      row.dedupKey = dedupKeyFor(row);
+      sessionBuffer.push(row);
     } catch {
       // If message is not valid JSON, include it as raw text with a flag
       const entry = {
@@ -456,13 +499,16 @@ export function extractSessionData(parsed) {
         rawMessage: event.message,
         parseError: true,
       };
-      sessionBuffer.push({ ...entry, ...classifyEntry(entry) });
+      const row = { ...entry, ...classifyEntry(entry) };
+      row.dedupKey = dedupKeyFor(row);
+      sessionBuffer.push(row);
     }
   }
 
   const deduped = dedupeResults(sessionBuffer);
-  const evaluatorResults = deduped.filter((r) => !isOutOfScopeDepChain(r));
-  const depChainExcluded = deduped.length - evaluatorResults.length;
+  const guarded = applyRoleGuard(deduped);
+  const evaluatorResults = guarded.records;
+  const depChainExcluded = guarded.excluded;
   if (depChainExcluded > 0) {
     console.log(JSON.stringify({
       level: 'warn',
@@ -479,8 +525,89 @@ export function extractSessionData(parsed) {
     sessionIds: [...sessionIds],
     evaluatorResults,
     duplicatesDropped: sessionBuffer.length - deduped.length,
+    // Rows that failed OPEN through dedup (no request id and no usable content
+    // key) — a rising count means the evaluator's log shape changed under us.
+    dedupMissingKeyCount: sessionBuffer.filter((r) => r.dedupKey === null).length,
     depChainExcluded,
   };
+}
+
+// Injectable DynamoDB client for the seen-set (tests swap in a fake without
+// touching the buffer/config client above). Defaults to the module's doc client.
+let seenSetClient = null;
+export function setSeenSetClient(client) {
+  seenSetClient = client;
+}
+
+/**
+ * Cross-delivery + concurrent-invocation dedup (TEAM-3376). CW Logs can
+ * re-deliver the same log events in a second subscription batch, and two
+ * concurrent Lambda invocations can each see a copy — the in-memory pass in
+ * extractSessionData can't catch either. Persistent seen-set: one conditional
+ * PutItem per keyed record; ConditionalCheckFailedException means another
+ * delivery already claimed this dedupKey → drop the row before classification,
+ * aggregation and buffering. TTL'd at 24h so the table self-cleans.
+ *
+ * FAIL-OPEN throughout, matching aggregateScoresToDdb's non-fatal posture:
+ * table unset/missing, SDK unavailable, or any non-conditional DDB error →
+ * the record is treated as fresh (double-count beats data loss).
+ *
+ * Mutates sessionData in place: filters evaluatorResults and adds the drops to
+ * duplicatesDropped so the EMF duplicate count covers both dedup layers.
+ */
+export async function dedupeAgainstSeenSet(sessionData, agentId = '') {
+  const records = sessionData?.evaluatorResults || [];
+  const keyed = records.filter((r) => r.dedupKey);
+  if (!SEEN_TABLE || keyed.length === 0) return sessionData;
+
+  let PutCommand;
+  try {
+    ({ PutCommand } = await import('@aws-sdk/lib-dynamodb'));
+  } catch {
+    PutCommand = undefined;
+  }
+  if (!PutCommand) return sessionData; // SDK unavailable → skip gracefully
+
+  const client = seenSetClient || ddb;
+  const expiresAt = Math.floor(Date.now() / 1000) + SEEN_TTL_SECONDS;
+  const duplicateKeys = new Set();
+  let failedOpen = 0;
+
+  for (const record of keyed) {
+    try {
+      await client.send(
+        new PutCommand({
+          TableName: SEEN_TABLE,
+          Item: { dedupKey: record.dedupKey, expiresAt },
+          ConditionExpression: 'attribute_not_exists(dedupKey)',
+        })
+      );
+    } catch (err) {
+      if (err?.name === 'ConditionalCheckFailedException') {
+        duplicateKeys.add(record.dedupKey);
+      } else {
+        failedOpen += 1; // any other error → fresh
+      }
+    }
+  }
+
+  if (failedOpen > 0) {
+    console.warn(
+      `[eval-packager] ${agentId}: seen-set check failed open for ${failedOpen} record(s) ` +
+        `(table=${SEEN_TABLE}) — retained; duplicates may double-count.`
+    );
+  }
+  if (duplicateKeys.size > 0) {
+    const before = records.length;
+    sessionData.evaluatorResults = records.filter((r) => !duplicateKeys.has(r.dedupKey));
+    sessionData.duplicatesDropped =
+      (sessionData.duplicatesDropped || 0) + (before - sessionData.evaluatorResults.length);
+    console.log(
+      `[eval-packager] ${agentId}: dropped ${before - sessionData.evaluatorResults.length} ` +
+        'cross-delivery duplicate record(s) via seen-set.'
+    );
+  }
+  return sessionData;
 }
 
 /**
@@ -529,7 +656,15 @@ function emitMissingSpanAlerts(agentId, entries) {
 
 /**
  * Classify each distinct session in this delivery.
- * Returns { statuses: Map<sessionId, 'scored'|'span_missing'|'error'>, total, spanMissing }
+ * Returns { statuses: Map<sessionId, 'scored'|'span_missing'|'error'>, total,
+ * spanMissing, errors, throttled, validationErrors, genericErrors }.
+ *
+ * TEAM-3376: throttled/validationErrors/genericErrors partition the `errors`
+ * sessions by error.type suffix — throttle first (a throttled judge often also
+ * reports a validation-shaped message downstream), then validation, then
+ * everything else. The statuses map keeps the coarse 'error' value: nothing
+ * downstream (buffer, dashboard) may flip on the subtype; only the EMF rates
+ * read the partition.
  */
 export function classifySessions(sessionData) {
   const bySession = new Map();
@@ -539,16 +674,27 @@ export function classifySessions(sessionData) {
     bySession.get(r.sessionId).push(r);
   }
   const statuses = new Map();
+  let throttled = 0;
+  let validationErrors = 0;
+  let genericErrors = 0;
   for (const [sid, rows] of bySession) {
     const allNull = rows.every((r) => r.score === null);
     const hasError = rows.some((r) => r.errorType);
     statuses.set(sid, !allNull ? 'scored' : hasError ? 'error' : 'span_missing');
+    if (statuses.get(sid) === 'error') {
+      if (rows.some((r) => THROTTLE_RE.test(r.errorType ?? ''))) throttled += 1;
+      else if (rows.some((r) => VALIDATION_ERROR_RE.test(r.errorType ?? ''))) validationErrors += 1;
+      else genericErrors += 1;
+    }
   }
   return {
     statuses,
     total: bySession.size,
     spanMissing: [...statuses.values()].filter((s) => s === 'span_missing').length,
-    errors: [...statuses.values()].filter((s) => s === 'error').length,
+    errors: throttled + validationErrors + genericErrors,
+    throttled,
+    validationErrors,
+    genericErrors,
   };
 }
 
@@ -561,6 +707,9 @@ export function classifySessions(sessionData) {
  * prefix we guessed wrong.
  */
 export const THROTTLE_RE = /ThrottlingException$/;
+// Same suffix-matching rationale as THROTTLE_RE (TEAM-3376): tolerate a
+// namespaced error.type rather than miss validation failures on a bad guess.
+export const VALIDATION_ERROR_RE = /ValidationException$/;
 
 export function countThrottles(entries) {
   return (entries || []).filter((r) => THROTTLE_RE.test(r?.errorType ?? '')).length;
@@ -580,7 +729,19 @@ export function countThrottles(entries) {
  */
 export function emitEvalMetrics(
   agentName,
-  { total, spanMissing, errors = 0, throttles = 0, duplicates = 0, depChainExcluded = 0 }
+  {
+    total,
+    spanMissing,
+    errors = 0,
+    throttles = 0,
+    duplicates = 0,
+    depChainExcluded = 0,
+    // TEAM-3376: SESSION-level partitions of `errors`, for the rate metrics
+    // below (rates over sessions, not records — a single throttled session
+    // retried 8 times must read as one throttled session, not eight).
+    throttledSessions = 0,
+    validationSessions = 0,
+  }
 ) {
   console.log(JSON.stringify({
     _aws: {
@@ -593,6 +754,8 @@ export function emitEvalMetrics(
           { Name: 'EvalSessionsSpanMissing', Unit: 'Count' },
           { Name: 'EvalSessionsError', Unit: 'Count' },
           { Name: 'EvalThrottleCount', Unit: 'Count' },
+          { Name: 'EvalThrottleRate', Unit: 'None' },
+          { Name: 'EvalValidationExceptionRate', Unit: 'None' },
           { Name: 'EvalDuplicateResultCount', Unit: 'Count' },
           { Name: 'EvalDepChainExcludedCount', Unit: 'Count' },
         ],
@@ -603,6 +766,8 @@ export function emitEvalMetrics(
     EvalSessionsSpanMissing: spanMissing,
     EvalSessionsError: errors,
     EvalThrottleCount: throttles,
+    EvalThrottleRate: total > 0 ? throttledSessions / total : 0,
+    EvalValidationExceptionRate: total > 0 ? validationSessions / total : 0,
     EvalDuplicateResultCount: duplicates,
     EvalDepChainExcludedCount: depChainExcluded,
   }));
@@ -671,10 +836,10 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
  * the second raw parse was where duplicate records re-entered and
  * double-counted the rolling sum/count and the session tally.
  *
- * TEAM-3381: that dedup is PER DELIVERY, so these aggregates remain exposed to
- * duplicates that span deliveries — deferred per design §2.2; the full
- * disposition (and why EvalDuplicateResultCount can't measure it) is at the
- * call site in the handler.
+ * TEAM-3381 flagged the remaining PER-DELIVERY exposure (duplicates spanning
+ * two deliveries); TEAM-3376 closes it — the handler runs dedupeAgainstSeenSet
+ * (DynamoDB conditional-write seen-set, fail-open) before this call, so the
+ * entries are cross-delivery-deduped too. Details at the call site.
  *
  * @param {Array<object>} [entries] classified evaluator-result entries for this
  *   delivery (from extractSessionData, deduped). Optional — omitted or empty
@@ -1063,14 +1228,26 @@ export function isRetryableImproverError(err) {
   return /ThrottlingException/i.test(String(err?.message || ''));
 }
 
+// TEAM-3376: module-level default timing hooks, below the per-call `deps`
+// override. Two injection styles for the same knobs: setRetryHooks() suits
+// callers that can't thread deps through (and tests written against it);
+// per-call deps win when both are set.
+let retryHooks = {};
+export function setRetryHooks({ sleep, random, now } = {}) {
+  if (sleep) retryHooks.sleep = sleep;
+  if (random) retryHooks.random = random;
+  if (now) retryHooks.now = now;
+}
+
 /**
  * Invoke the improver with bounded, deadline-aware retries (TEAM-3367).
- * `deps` exists for tests: { sleep, random, now } all default to the real thing.
+ * `deps` exists for tests: { sleep, random, now } all default to the hooks
+ * installed via setRetryHooks(), then to the real thing.
  */
 export async function invokeImprover(runtimeArn, prompt, agentId, deps = {}) {
-  const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const random = deps.random || Math.random;
-  const now = deps.now || Date.now;
+  const sleep = deps.sleep || retryHooks.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const random = deps.random || retryHooks.random || Math.random;
+  const now = deps.now || retryHooks.now || Date.now;
 
   const start = now();
   let lastErr = null;

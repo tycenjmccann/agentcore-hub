@@ -218,9 +218,16 @@
 > idempotent to re-request (each call opens a new support case).
 
 **Symptom**: eval results log groups fill with `ThrottlingException` from the
-Opus judge; sessions classify as `error` in eval batches; the
+Opus judge; sessions classify as `error` in eval batches; `EvalThrottleRate` /
+`EvalThrottleCount` climb on the `agentcore-hub-eval-health` dashboard and the
 `eval.batch.null_or_error_rate` metric climbs even though agent telemetry
 (`invoke_agent` spans) is healthy.
+
+**First response (no quota change needed)**: verify the load-reduction
+mitigations are actually applied — the trimmed 5-evaluator matrix and tiered
+sampling (100% gate roles / 25% others) in
+`deploy/evaluations/setup-evaluations.sh`, reconciled against the live configs
+per that script's reconciliation section. That alone cuts judge calls ~4-8×.
 
 **Step 1 — identify the exact quota (grep, don't guess).** Quota names vary by
 model/version, so list them and filter rather than assuming a code:
@@ -248,6 +255,8 @@ aws service-quotas request-service-quota-increase \
 
 Track the resulting case with
 `aws service-quotas list-requested-service-quota-change-history --service-code bedrock`.
+After the grant, watch `EvalThrottleRate` on the eval-health dashboard for a
+full batch window before considering raising sampling rates back up.
 
 **Note — shared on-demand pool.** Check whether online evaluations draw from
 the same on-demand InvokeModel pool as the fleet's own model calls: fleet
@@ -271,17 +280,22 @@ delivery into the `AgentCoreHub/Evaluations` namespace (dimension
 | `EvalSessionsSpanMissing` | Sessions with all-null scores and no `error.type` — the `invoke_agent` span never reached the evaluator (telemetry failure, not agent quality) |
 | `EvalSessionsError` | Sessions whose results carry an `error.type` (judge/eval failure) |
 | `EvalThrottleCount` | Result records whose `error.type` ends in `ThrottlingException` — judge quota pressure (see the quota section above) |
-| `EvalDuplicateResultCount` | Duplicate result rows dropped by the TEAM-3367 dedup (at-least-once delivery / evaluator retries) |
+| `EvalDuplicateResultCount` | Duplicate result rows dropped by dedup (at-least-once delivery / evaluator retries — in-memory per delivery, TEAM-3367, plus the cross-delivery DynamoDB seen-set, TEAM-3376) |
+| `EvalThrottleRate` | Throttled sessions / total sessions for the delivery (TEAM-3376; session-level, so 8 retries of one throttled session read as one) |
+| `EvalValidationExceptionRate` | Validation-error sessions / total sessions for the delivery (TEAM-3376) |
 
-(A sixth, `EvalDepChainExcludedCount`, counts dependency-chain evaluator rows
+(One more, `EvalDepChainExcludedCount`, counts dependency-chain evaluator rows
 dropped for out-of-scope roles — TEAM-3368 §3.2 config-drift guard.)
 
-> **`EvalDuplicateResultCount` counts PER-DELIVERY drops only.** A duplicate
-> split across two CloudWatch Logs deliveries is invisible to it, so a zero
-> series is not evidence there are none. Flush-time dedup logs those separately
-> (`eval.batch.cross_delivery_duplicates_dropped`), and the DDB rolling
-> aggregates remain exposed to them by an explicit deferral — see
-> [eval-infrastructure-reliability-design.md §2.2](./eval-infrastructure-reliability-design.md#ac-2-ddb-aggregate-deferral-disposition-team-3381).
+> **Cross-delivery duplicates.** `EvalDuplicateResultCount` covers in-delivery
+> drops plus the drops made by the TEAM-3376 DynamoDB seen-set
+> (`agentcore-hub-eval-seen`, conditional writes, fail-open), which closed the
+> DDB-rolling-aggregate exposure TEAM-3381 had deferred — see
+> [eval-infrastructure-reliability-design.md §2.2](./eval-infrastructure-reliability-design.md#ac-2-ddb-aggregate-deferral-disposition-team-3381)
+> for the original disposition. Flush-time dedup independently logs any
+> stragglers (`eval.batch.cross_delivery_duplicates_dropped`, e.g. records the
+> seen-set failed OPEN on); to verify the seen-set end-to-end, use that
+> design doc's §2.2 Logs Insights query grouped by logStream.
 
 Healthy batches emit explicit `0` datapoints for all of them; nothing is
 emitted when a delivery contains no sessions.

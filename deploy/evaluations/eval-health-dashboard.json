@@ -103,6 +103,40 @@
       "type": "metric",
       "x": 0,
       "y": 14,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Session throttle rate (EvalThrottleRate, fleet avg — TEAM-3376)",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "period": 3600,
+        "metrics": [
+          [ { "expression": "AVG(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalThrottleRate\"', 'Average', 3600))", "id": "sthrottle", "label": "throttled sessions / total (fleet avg)" } ]
+        ],
+        "yAxis": { "left": { "min": 0, "max": 1 } }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 14,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Validation-exception rate (EvalValidationExceptionRate, fleet avg — TEAM-3376)",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "period": 3600,
+        "metrics": [
+          [ { "expression": "AVG(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalValidationExceptionRate\"', 'Average', 3600))", "id": "svalidation", "label": "validation-error sessions / total (fleet avg)" } ]
+        ],
+        "yAxis": { "left": { "min": 0, "max": 1 } }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 20,
       "width": 24,
       "height": 8,
       "properties": {
