@@ -243,8 +243,21 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
   };
   for (const fn of Object.values(executors)) fn.isStub = true;
 
+  // Descriptions mirror the production docstrings in deploy/runtime-agent/
+  // main.py (TEAM-3405): the model under test must see the same instruction
+  // surface production gives it — e.g. report_completion's "do NOT call
+  // Tickets___transition_ticket" cue — or the battery measures the stub's
+  // vagueness instead of the config under test.
   const toolSpecs = [
-    spec("Tickets___create_ticket", "Create a new ticket in the project tracker.",
+    spec("Tickets___create_ticket",
+      "Create a new ticket in the project tracker.\n\n" +
+        "MANDATORY TICKETS (create these for EVERY workflow, no exceptions):\n" +
+        '  - agentcore_hub_code_reviewer: "Review: [feature]" — blocked_by=ALL dev ticket IDs\n' +
+        '  - agentcore_hub_qa_verifier: "QA: Verify [feature]" — blocked_by=code reviewer ticket ID\n' +
+        '  - agentcore_hub_ci_agent: "CI: Validate build and tests for [feature]" — blocked_by=QA ticket ID\n\n' +
+        "TICKET TYPE — pick by what the PARENT is: parent is an EPIC → ticket_type=\"task\" " +
+        "(the default); parent is a BUG → ticket_type=\"subtask\" (bug-fix runs ONLY). " +
+        "Jira REJECTS the wrong pairing. When unsure, the parent is an Epic → use \"task\".",
       { title: str("Ticket title"), description: str("Ticket description"), parent_id: str("Parent epic/story id"),
         assignee: str("Agent id to assign"), ticket_type: str("task|bug|story"),
         blocked_by: str("Comma-separated blocking ticket ids"), workflow_id: str("Workflow id") },
@@ -261,7 +274,7 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
     spec("Tickets___search_issues", "Search for tickets matching a query.",
       { query: str("Search query"), max_results: { type: "integer" } }, ["query"]),
     spec("WorkflowOutput___report_completion",
-      "Report that your work is complete. Saves your summary and transitions your ticket — do NOT call Tickets___transition_ticket on your own ticket.",
+      "Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.",
       { ticket_id: str("Your assigned ticket id"), summary: str("Concise outcome summary"),
         artifacts: str("Comma-separated artifact paths"), branch: str("Git branch"), commit_sha: str("Commit sha"),
         pr_url: str("PR URL") },
@@ -271,7 +284,7 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
         doc_type: str("design|requirements|spec") },
       ["workflow_id", "agent_id", "content"]),
     spec("WorkflowOutput___submit_ticket_plan",
-      "Persist your ticket plan. Does NOT create tickets — follow with Tickets___create_ticket per ticket.",
+      "Persist your ticket plan as a record. This does NOT create tickets. After calling this, you MUST call Tickets___create_ticket once per ticket in the plan to actually create them under the epic. The orchestration engine reacts to ticket status changes — it does not expand plans.",
       { workflow_id: str("Workflow id"), epic_id: str("Epic id"), tickets: str("JSON array of ticket objects") },
       ["workflow_id", "epic_id", "tickets"]),
     spec("S3Storage___list_objects", "List objects under a prefix.", { prefix: str("Key prefix") }),
@@ -279,7 +292,7 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
     spec("S3Storage___write_object", "Write an object.",
       { key: str("Object key"), content: str("Content") }, ["key", "content"]),
     spec("load_blueprint",
-      "Load a process blueprint with step-by-step workflow instructions for your role. Call this FIRST when starting a ticket.",
+      "Load a process blueprint with step-by-step workflow instructions for your role. Call this FIRST when starting a new ticket to get your detailed process instructions. Blueprints tell you HOW to approach your work (e.g., what tools to use, what order to follow, what artifacts to produce).",
       { blueprint_name: str("Blueprint name, e.g. 'qa-verifier'") }, ["blueprint_name"]),
     spec("claude_code", "Delegate a coding task to the Claude Code engine (clone, edit, test, commit).",
       { task: str("The coding task"), repo: str("Repo (owner/name)"), resume_session: str("Ported session id") },
