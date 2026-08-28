@@ -34,7 +34,7 @@ plus an `IF(total > 0, ..., ...)` zero-guard on each ratio.
 
 - `aws` CLI: **not installed** in this workspace (`aws: command not found`).
 - Python `boto3 1.43.81` / `botocore 1.43.81` available, with live credentials:
-  `arn:aws:sts::838829463875:assumed-role/agentcore-hub-coding-runtime-role/BedrockAgentCore-02f02adf-6862-4917-9f4b-70ef0da954ef`
+  `arn:aws:sts::<ACCOUNT_ID>:assumed-role/agentcore-hub-coding-runtime-role/BedrockAgentCore-<SESSION_ID>`
   (via `sts get-caller-identity`).
 - The CLI's `--cli-input-json` payload maps 1:1 to the `PutMetricAlarm` API
   parameters, so `boto3.client('cloudwatch').put_metric_alarm(**json.load(f))`
@@ -54,13 +54,15 @@ for f in ['deploy/evaluations/eval-success-rate-alarm.json',
 
 Output, verbatim:
 
+*(Account ID and runtime-session ID redacted from the verbatim output.)*
+
 ```
 --- put_metric_alarm <- deploy/evaluations/eval-success-rate-alarm.json (region us-east-1)
 ERROR: ClientError
-ClientError('An error occurred (AccessDenied) when calling the PutMetricAlarm operation: User: arn:aws:sts::838829463875:assumed-role/agentcore-hub-coding-runtime-role/BedrockAgentCore-02f02adf-6862-4917-9f4b-70ef0da954ef is not authorized to perform: cloudwatch:PutMetricAlarm on resource: arn:aws:cloudwatch:us-east-1:838829463875:alarm:agentcore-hub-eval-success-rate because no identity-based policy allows the cloudwatch:PutMetricAlarm action')
+ClientError('An error occurred (AccessDenied) when calling the PutMetricAlarm operation: User: arn:aws:sts::<ACCOUNT_ID>:assumed-role/agentcore-hub-coding-runtime-role/BedrockAgentCore-<SESSION_ID> is not authorized to perform: cloudwatch:PutMetricAlarm on resource: arn:aws:cloudwatch:us-east-1:<ACCOUNT_ID>:alarm:agentcore-hub-eval-success-rate because no identity-based policy allows the cloudwatch:PutMetricAlarm action')
 --- put_metric_alarm <- deploy/evaluations/span-missing-alarm.json (region us-east-1)
 ERROR: ClientError
-ClientError('An error occurred (AccessDenied) when calling the PutMetricAlarm operation: User: arn:aws:sts::838829463875:assumed-role/agentcore-hub-coding-runtime-role/BedrockAgentCore-02f02adf-6862-4917-9f4b-70ef0da954ef is not authorized to perform: cloudwatch:PutMetricAlarm on resource: arn:aws:cloudwatch:us-east-1:838829463875:alarm:agentcore-hub-eval-span-missing-ratio because no identity-based policy allows the cloudwatch:PutMetricAlarm action')
+ClientError('An error occurred (AccessDenied) when calling the PutMetricAlarm operation: User: arn:aws:sts::<ACCOUNT_ID>:assumed-role/agentcore-hub-coding-runtime-role/BedrockAgentCore-<SESSION_ID> is not authorized to perform: cloudwatch:PutMetricAlarm on resource: arn:aws:cloudwatch:us-east-1:<ACCOUNT_ID>:alarm:agentcore-hub-eval-span-missing-ratio because no identity-based policy allows the cloudwatch:PutMetricAlarm action')
 ```
 
 **What this proves.** The `AccessDenied` came from the CloudWatch endpoint,
