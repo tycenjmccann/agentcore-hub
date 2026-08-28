@@ -276,6 +276,13 @@ delivery into the `AgentCoreHub/Evaluations` namespace (dimension
 (A sixth, `EvalDepChainExcludedCount`, counts dependency-chain evaluator rows
 dropped for out-of-scope roles — TEAM-3368 §3.2 config-drift guard.)
 
+> **`EvalDuplicateResultCount` counts PER-DELIVERY drops only.** A duplicate
+> split across two CloudWatch Logs deliveries is invisible to it, so a zero
+> series is not evidence there are none. Flush-time dedup logs those separately
+> (`eval.batch.cross_delivery_duplicates_dropped`), and the DDB rolling
+> aggregates remain exposed to them by an explicit deferral — see
+> [eval-infrastructure-reliability-design.md §2.2](./eval-infrastructure-reliability-design.md#ac-2-ddb-aggregate-deferral-disposition-team-3381).
+
 Healthy batches emit explicit `0` datapoints for all of them; nothing is
 emitted when a delivery contains no sessions.
 

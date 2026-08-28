@@ -29,6 +29,7 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { gunzipSync } from 'zlib';
+import { createHash } from 'node:crypto';
 import {
   classifyEntry,
   computeBatchSummary,
@@ -161,6 +162,25 @@ export const handler = async (event) => {
   }
 
   // 5. Aggregate eval scores into DDB (for instant dashboard loads)
+  //
+  // ── KNOWN GAP, DEFERRED (TEAM-3381, design §2.2 decision rule) ────────────
+  // This runs PER DELIVERY on per-delivery-deduped rows, so the DDB rolling
+  // aggregates (evalScores / evalSessionCount / evalStatusCounts) can still
+  // double-count a duplicate that spans TWO CloudWatch Logs deliveries. Only
+  // the flushed batch payload is protected (dedupeBufferedSessions re-dedupes
+  // the merged buffer at flush time).
+  //
+  // The fix — an `agentcore-hub-eval-seen` conditional-write seen-set — is
+  // deferred pending a 1-week measurement, per §2.2. IMPORTANT: the
+  // EvalDuplicateResultCount metric structurally CANNOT measure this. It counts
+  // per-delivery drops only, so cross-delivery duplicates are invisible to it
+  // and a flat/zero series is NOT evidence the gap is harmless. The measurement
+  // instrument is the §2.2 Logs Insights verification query grouped by
+  // logStream (see docs/eval-infrastructure-reliability-design.md §2.2). Run it
+  // after 1 week: if >1% of records fall in cross-delivery duplicate groups,
+  // implement the seen-set — PK dedupKey, ConditionExpression
+  // attribute_not_exists(dedupKey), TTL 24h, FAIL-OPEN (a seen-set error must
+  // never cost a record).
   await aggregateScoresToDdb(agentId, sessionData.evaluatorResults);
 
   // 6. Append to sessionBuffer, counting distinct runs toward batchSize
@@ -230,20 +250,61 @@ function extractRequestId(parsedMessage, attrs) {
 }
 
 /**
- * TEAM-3367: drop duplicate evaluator-result rows within one delivery (first
- * occurrence wins). Keyed by requestId when the record carried one; otherwise
- * by a content key — timestamp inclusion keeps genuinely distinct same-score
- * evaluations apart, while identical retry writes share all five fields.
- * Unparseable rows key on their raw text so two different platform lines that
- * happen to share a timestamp never collapse into one.
- *
- * In-memory (per delivery) only by design decision: cross-delivery dedup via a
- * DynamoDB seen-set is a follow-up, not this ticket.
+ * Short content fingerprint of a raw log message, used by the no-request-id
+ * content key below (TEAM-3381). `timestamp` is logEvent.timestamp, which is a
+ * millisecond value shared by every record CloudWatch batched into the same ms
+ * — so metadata + timestamp alone cannot tell two distinct results apart.
+ * Truncated to 16 hex chars: enough to separate distinct payloads, small enough
+ * to ride along in the DDB buffer / S3 batch without bloating it.
  */
-export function dedupeResults(records) {
-  const seen = new Set();
+export function contentFingerprint(rawMessage) {
+  return createHash('sha256').update(String(rawMessage)).digest('hex').slice(0, 16);
+}
+
+const isBlankKeyField = (v) => v === null || v === undefined || v === '';
+
+/**
+ * TEAM-3381 (AC-1 fail-open): a record with NO usable dedup key at all —
+ * no requestId and every content-key discriminator (sessionId, evaluatorName,
+ * evaluationName, score) null/absent. Two such records are indistinguishable by
+ * key, so deduping them would silently destroy one AND mis-report it as a
+ * duplicate. They are always retained instead. Unparseable rows are excluded:
+ * they DO have a key (their raw text, see below).
+ */
+export function hasNoDedupKey(r) {
+  return (
+    !r.requestId &&
+    !r.parseError &&
+    isBlankKeyField(r.sessionId) &&
+    isBlankKeyField(r.evaluatorName) &&
+    isBlankKeyField(r.evaluationName) &&
+    isBlankKeyField(r.score)
+  );
+}
+
+/**
+ * TEAM-3367: drop duplicate evaluator-result rows (first occurrence wins).
+ * Keyed by requestId when the record carried one; otherwise by a content key —
+ * timestamp inclusion keeps genuinely distinct same-score evaluations apart,
+ * while identical retry writes share all the fields. Unparseable rows key on
+ * their raw text so two different platform lines that happen to share a
+ * timestamp never collapse into one.
+ *
+ * TEAM-3381: pass `seen` to dedupe ACROSS calls — flushBuffer reuses one set
+ * over every buffered delivery so a request id split across two CloudWatch
+ * deliveries reaches the flushed payload once (see dedupeBufferedSessions).
+ * In-memory only: the cross-INVOCATION seen-set that would also protect the DDB
+ * rolling aggregates is deferred — see the deferral note at the
+ * aggregateScoresToDdb call site in the handler.
+ */
+export function dedupeResults(records, seen = new Set()) {
   const out = [];
   for (const r of records || []) {
+    // Fail open before any keying: no key exists, so no duplicate can be proven.
+    if (hasNoDedupKey(r)) {
+      out.push(r);
+      continue;
+    }
     const key = r.requestId
       // evaluatorName rides along with the request id: every metric record an
       // eval run emits about ONE evaluated span (correctness, helpfulness, …)
@@ -252,12 +313,50 @@ export function dedupeResults(records) {
       ? `req|${r.requestId}|${r.evaluatorName ?? ''}`
       : r.parseError
         ? `raw|${r.timestamp}|${r.rawMessage}`
-        : `content|${r.sessionId}|${r.evaluatorName}|${r.evaluationName ?? ''}|${r.score}|${r.timestamp}`;
+        // contentFingerprint (extractSessionData sets it on request-id-less rows)
+        // is what separates two distinct results that share metadata AND the
+        // delivery's millisecond timestamp; a genuine retry write re-sends the
+        // same bytes, so its fingerprint matches and it still collapses.
+        : `content|${r.sessionId}|${r.evaluatorName}|${r.evaluationName ?? ''}|${r.score}|${r.timestamp}|${r.contentHash ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(r);
   }
   return out;
+}
+
+/**
+ * TEAM-3381 (FR-2.1 AC-1/AC-2): re-dedupe a CLAIMED flush buffer across all the
+ * deliveries it accumulated. dedupeResults already ran per delivery inside
+ * extractSessionData, so every drop here is a CROSS-DELIVERY duplicate: the same
+ * request id delivered twice by at-least-once CloudWatch Logs delivery, which
+ * pre-fix appeared twice in the flushed batch payload and double-counted in the
+ * batch summary the improver reads.
+ *
+ * Race-free by construction: it runs on the ALL_NEW snapshot flushBuffer already
+ * owns, purely in memory, so no DDB read-modify-write is involved.
+ *
+ * Buffer-entry shape is PRESERVED (the improver payload reads `sessions[].*`,
+ * and callers flatMap `evaluatorResults`): an entry whose rows were all dropped
+ * stays in place with an empty `evaluatorResults`, keeping its logStream /
+ * sessionIds provenance instead of silently vanishing from the batch.
+ */
+export function dedupeBufferedSessions(buffer) {
+  const seen = new Set();
+  const sessions = [];
+  let crossDeliveryDuplicatesDropped = 0;
+
+  for (const entry of buffer || []) {
+    if (!entry || !Array.isArray(entry.evaluatorResults)) {
+      sessions.push(entry);
+      continue;
+    }
+    const kept = dedupeResults(entry.evaluatorResults, seen);
+    crossDeliveryDuplicatesDropped += entry.evaluatorResults.length - kept.length;
+    sessions.push({ ...entry, evaluatorResults: kept });
+  }
+
+  return { sessions, crossDeliveryDuplicatesDropped };
 }
 
 /**
@@ -323,9 +422,14 @@ export function extractSessionData(parsed) {
       // produced all-null batches the improver couldn't synthesize from.
       const rawScore = attrs['gen_ai.evaluation.score.value'];
       const numericScore = rawScore !== undefined && rawScore !== null ? Number(rawScore) : null;
+      const requestId = extractRequestId(parsedMessage, attrs);
       const entry = {
         timestamp: event.timestamp,
-        requestId: extractRequestId(parsedMessage, attrs),
+        requestId,
+        // TEAM-3381: only the content-key path needs a fingerprint, and only
+        // records without a request id take it. undefined (like errorFlag below)
+        // so it vanishes from JSON/DDB for the common request-id case.
+        contentHash: requestId ? undefined : contentFingerprint(event.message),
         sessionId: sid,
         evaluatorName: attrs['gen_ai.evaluation.name'] || parsedMessage.evaluatorName || null,
         // Number(rawScore) coerces non-numeric garbage (e.g. "not-a-number") to
@@ -567,6 +671,11 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
  * the second raw parse was where duplicate records re-entered and
  * double-counted the rolling sum/count and the session tally.
  *
+ * TEAM-3381: that dedup is PER DELIVERY, so these aggregates remain exposed to
+ * duplicates that span deliveries — deferred per design §2.2; the full
+ * disposition (and why EvalDuplicateResultCount can't measure it) is at the
+ * call site in the handler.
+ *
  * @param {Array<object>} [entries] classified evaluator-result entries for this
  *   delivery (from extractSessionData, deduped). Optional — omitted or empty
  *   leaves the status tally alone.
@@ -669,6 +778,8 @@ async function aggregateScoresToDdb(agentId, entries = []) {
 
 /**
  * Flush the session buffer. ORDER MATTERS:
+ *   0. Re-dedupe the merged buffer in memory (TEAM-3381) — pure computation on
+ *      the already-claimed batch, so it changes nothing about the ordering below.
  *   1. Reset the DDB buffer FIRST (the batch is already captured in memory).
  *   2. Archive the raw batch to batches/.
  *   3. Synthesize a PRD via the Fleet Improver and write it to prd/ — UNLESS the
@@ -685,11 +796,28 @@ async function aggregateScoresToDdb(agentId, entries = []) {
 async function flushBuffer(agentId, buffer, batchSize) {
   const timestamp = new Date().toISOString();
 
+  // TEAM-3381 (FR-2.1 AC-1/AC-2): re-dedupe the MERGED buffer before anything
+  // reads it. Per-delivery dedup (extractSessionData) cannot see a request id
+  // that arrived in two separate CloudWatch Logs deliveries; without this the
+  // flushed payload carried that record twice and the summary counted it twice.
+  // Runs on the already-claimed in-memory batch, so it is race-free, and it is
+  // NOT silent: the drop count is logged and rides along in the payload.
+  const { sessions, crossDeliveryDuplicatesDropped } = dedupeBufferedSessions(buffer);
+  if (crossDeliveryDuplicatesDropped > 0) {
+    console.log(JSON.stringify({
+      level: 'warn',
+      event: 'eval.batch.cross_delivery_duplicates_dropped',
+      agentId,
+      crossDeliveryDuplicatesDropped,
+      bufferEntries: sessions.length,
+    }));
+  }
+
   // Roll the whole batch up so the improver prompt leads with "how much of this
   // batch actually got scored" instead of having to infer it from raw records.
   // Pure computation — nothing here touches DDB, so the claim below stays first.
   const summary = computeBatchSummary(
-    (buffer || []).flatMap((s) => s?.evaluatorResults || [])
+    sessions.flatMap((s) => s?.evaluatorResults || [])
   );
 
   const batchPayload = {
@@ -697,7 +825,8 @@ async function flushBuffer(agentId, buffer, batchSize) {
     batchSize,
     flushedAt: timestamp,
     summary,
-    sessions: buffer,
+    crossDeliveryDuplicatesDropped,
+    sessions,
   };
 
   // Batch health metric — the agentcore-hub-eval-null-or-error-rate-high alarm
@@ -747,7 +876,8 @@ async function flushBuffer(agentId, buffer, batchSize) {
     })
   );
   console.log(
-    `[eval-packager] FLUSHED | agent=${agentId} | batchSize=${buffer.length} | archived=${batchKey}`
+    `[eval-packager] FLUSHED | agent=${agentId} | batchSize=${sessions.length} | ` +
+      `crossDeliveryDuplicatesDropped=${crossDeliveryDuplicatesDropped} | archived=${batchKey}`
   );
 
   // 3. Evidence guard — do NOT synthesize a PRD from a batch that contains no
