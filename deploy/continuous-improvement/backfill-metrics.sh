@@ -215,9 +215,13 @@ for agent in agents:
                     # NotApplicable rubric verdict (score 2.0 / NotApplicable
                     # label / NOT_APPLICABLE-prefixed explanation) means
                     # \"nothing to judge\" — never averaged into sum/count.
+                    # The bare numeric 2.0 is the dependency_chain rubric's
+                    # PRIVATE encoding — gated on the evaluator name so any
+                    # other evaluator legitimately scoring 2 still aggregates
+                    # (TEAM-3383). Label/explanation checks stay universal.
                     is_na = (
                         re.match(r'not[\s_-]?applicable\$', score_label.strip(), re.I) is not None
-                        or numeric == 2.0
+                        or (numeric == 2.0 and re.search(r'dependency_chain', evaluator, re.I) is not None)
                         or explanation.startswith('NOT_APPLICABLE')
                     )
 

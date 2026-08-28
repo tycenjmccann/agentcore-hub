@@ -906,8 +906,19 @@ describe('classifyError / isNotApplicable / dedupe / computeScoreDeltas (TEAM-33
       expect(isNotApplicable({ scoreLabel: 'not-applicable' })).toBe(true);
     });
 
-    it('matches the numerical rubric sentinel score 2.0', () => {
-      expect(isNotApplicable({ score: 2 })).toBe(true);
+    it('matches the numerical sentinel 2.0 ONLY for the dependency_chain rubric that defines it', () => {
+      // The live registered names (deploy/evaluations/eval-config-ids.json).
+      expect(
+        isNotApplicable({ score: 2, evaluatorName: 'dependency_chain_compliance_online' })
+      ).toBe(true);
+      expect(
+        isNotApplicable({ score: 2, evaluatorName: 'dependency_chain_compliance_ondemand' })
+      ).toBe(true);
+      // 2.0 from any other evaluator is a real score, not the private N/A encoding.
+      expect(isNotApplicable({ score: 2 })).toBe(false);
+      expect(
+        isNotApplicable({ score: 2, evaluatorName: 'SomeOtherEvaluator', scoreLabel: 'High' })
+      ).toBe(false);
     });
 
     it('matches the NOT_APPLICABLE explanation sentinel', () => {
@@ -976,6 +987,64 @@ describe('classifyError / isNotApplicable / dedupe / computeScoreDeltas (TEAM-33
       expect(scoreDeltas['Builtin.ToolSelectionAccuracy']).toMatchObject({ sum: 2, count: 2 });
     });
 
+    it('does NOT collapse distinct verdicts sharing one gen_ai.response.id (success-path fan-out, TEAM-3383)', () => {
+      // Same fan-out as above, but WITH a shared response id: one evaluator
+      // request emits one row per tool call, all stamped with the same
+      // gen_ai.response.id. The req-based key must not swallow them.
+      const RESPONSE_ID = 'a7b8c9d0-1111-4222-8333-444455556666';
+      const events = [
+        resultEvent({
+          sessionId: 'sess-fan',
+          evaluator: 'Builtin.ToolSelectionAccuracy',
+          score: 1.0,
+          scoreLabel: 'Yes',
+          explanation: 'Tool call 1: file_list was the correct tool for enumerating the repo.',
+          responseId: RESPONSE_ID,
+        }),
+        resultEvent({
+          sessionId: 'sess-fan',
+          evaluator: 'Builtin.ToolSelectionAccuracy',
+          score: 1.0,
+          scoreLabel: 'Yes',
+          explanation: 'Tool call 2: file_read was the correct tool for inspecting the diff.',
+          responseId: RESPONSE_ID,
+        }),
+      ];
+      const sessionData = extractSessionData(delivery(events));
+      expect(sessionData.evaluatorResults).toHaveLength(2);
+
+      // Same delivery through the scorecard path: both verdicts count.
+      const { scoreDeltas } = computeScoreDeltas(events);
+      expect(scoreDeltas['Builtin.ToolSelectionAccuracy']).toMatchObject({ sum: 2, count: 2 });
+    });
+
+    it('still collapses true duplicates sharing a response id AND identical verdict content', () => {
+      const RESPONSE_ID = 'b1c2d3e4-5555-4666-8777-888899990000';
+      const twin = () =>
+        resultEvent({
+          sessionId: 'sess-dup',
+          score: 1.0,
+          scoreLabel: 'Yes',
+          explanation: 'Identical verdict text.',
+          responseId: RESPONSE_ID,
+        });
+      const sessionData = extractSessionData(delivery([twin(), twin()]));
+      expect(sessionData.evaluatorResults).toHaveLength(1);
+      // Identical verdict fields hash identically → one verdict-suffixed key.
+      expect(sessionData.evaluatorResults[0].dedupeKey).toMatch(
+        new RegExp(`^sess-dup\\|Builtin\\.Correctness\\|req:${RESPONSE_ID}\\|v:[0-9a-f]{12}$`)
+      );
+    });
+
+    it('throttle clusters (error rows, no verdict content) keep the bare req key and still collapse', () => {
+      const cluster = Array.from({ length: 4 }, () => throttledEvent('sess-tc2', UUID_B));
+      const sessionData = extractSessionData(delivery(cluster));
+      expect(sessionData.evaluatorResults).toHaveLength(1);
+      expect(sessionData.evaluatorResults[0].dedupeKey).toBe(
+        `sess-tc2|Builtin.Correctness|req:${UUID_B}`
+      );
+    });
+
     it('collapses true content duplicates via the sha1 fallback (no request id)', () => {
       const twin = () =>
         resultEvent({
@@ -1033,6 +1102,42 @@ describe('classifyError / isNotApplicable / dedupe / computeScoreDeltas (TEAM-33
       const { scoreDeltas } = computeScoreDeltas(events);
       expect(scoreDeltas['Custom.DependencyChain']).toEqual({ sum: 0, count: 0, naCount: 2 });
       expect(scoreDeltas['Builtin.Correctness']).toMatchObject({ sum: 0.8, count: 1 });
+    });
+
+    it('score 2 from an evaluator WITHOUT the numeric-N/A rubric aggregates normally (TEAM-3383)', () => {
+      const { scoreDeltas } = computeScoreDeltas([
+        resultEvent({
+          sessionId: 'sess-two',
+          evaluator: 'SomeOtherEvaluator',
+          score: 2,
+          scoreLabel: 'High',
+          explanation: 'Scored 2 on a 0-4 rubric — a real datum, not N/A.',
+        }),
+      ]);
+      expect(scoreDeltas['SomeOtherEvaluator']).toEqual({ sum: 2, count: 1, naCount: 0 });
+    });
+
+    it('score 2 from the dependency_chain evaluator is still N/A, with or without the label', () => {
+      const { scoreDeltas } = computeScoreDeltas([
+        resultEvent({
+          sessionId: 'sess-dc1',
+          evaluator: 'dependency_chain_compliance_online',
+          score: 2,
+          scoreLabel: 'NotApplicable',
+          explanation: 'No create_ticket tool calls are present in the session.',
+        }),
+        resultEvent({
+          sessionId: 'sess-dc2',
+          evaluator: 'dependency_chain_compliance_online',
+          score: 2,
+          explanation: 'No tickets were created; dependency chain cannot be assessed.',
+        }),
+      ]);
+      expect(scoreDeltas['dependency_chain_compliance_online']).toEqual({
+        sum: 0,
+        count: 0,
+        naCount: 2,
+      });
     });
 
     it('maps categorical Correct/Partial/Failed labels only when score.value is absent — never Yes/No', () => {

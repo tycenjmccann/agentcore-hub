@@ -239,17 +239,28 @@ export function classifyError(errorType, errorMessage) {
  * dependencies). Covers the three shapes we expect to see:
  *   - a categorical label ("NotApplicable" / "not_applicable" / "Not Applicable"),
  *   - the numerical rubric's 4th entry value 2.0 labelled "NotApplicable"
- *     (verified accepted by the live online-evaluations service), and
+ *     (verified accepted by the live online-evaluations service) — gated on
+ *     the evaluator name, because 2.0=NotApplicable is a PRIVATE encoding of
+ *     the dependency_chain rubric (see NUMERIC_NA_EVALUATOR_RE), and
  *   - the NOT_APPLICABLE sentinel prefix in the explanation text.
- * N/A is a verdict, not a failure: it must never enter sum/count and never
- * count toward error rates.
+ * The label and explanation signals stay evaluator-agnostic — they are
+ * self-describing. N/A is a verdict, not a failure: it must never enter
+ * sum/count and never count toward error rates.
  */
+
+/** Only the dependency_chain rubric (deploy/evaluations/
+ *  dependency_chain_evaluator.json, registered as
+ *  dependency_chain_compliance_online / _ondemand) encodes NotApplicable as
+ *  the bare numeric score 2.0. Any other evaluator legitimately emitting 2
+ *  must aggregate, not be silently reclassified as N/A (TEAM-3383). */
+const NUMERIC_NA_EVALUATOR_RE = /dependency_chain/i;
+
 export function isNotApplicable(entry) {
   const e = entry || {};
   if (typeof e.scoreLabel === 'string' && /^not[\s_-]?applicable$/i.test(e.scoreLabel.trim())) {
     return true;
   }
-  if (e.score === 2) return true;
+  if (e.score === 2 && NUMERIC_NA_EVALUATOR_RE.test(e.evaluatorName ?? '')) return true;
   const explanation = e.evidence ?? e.explanation;
   if (typeof explanation === 'string' && explanation.startsWith('NOT_APPLICABLE')) return true;
   return false;
@@ -271,7 +282,15 @@ const THROTTLE_REQUEST_RE = /Request\s+([0-9a-fA-F-]{36})\s+is being throttled/;
  * Identity, in preference order:
  *   1. requestId — gen_ai.response.id when present (~27% of entries), else the
  *      UUID embedded in the throttle message. Distinct evaluator invocations
- *      have distinct request UUIDs, so this never collapses separate calls.
+ *      have distinct request UUIDs, so this never collapses separate calls —
+ *      but ONE invocation fans out into one result row per tool call, and those
+ *      rows can share the response id while differing only in explanation
+ *      (TEAM-3383). So verdict-bearing rows (finite score, label, or evidence)
+ *      get a short hash of (score, scoreLabel, evidence) appended to the req
+ *      key: true duplicates share every verdict field and still collapse to
+ *      one, while distinct verdicts sharing a request id all survive.
+ *      Error-only rows carry no verdict fields and keep the bare req key, so
+ *      a throttle cluster still counts once.
  *   2. content hash — sha1 over (sessionId, evaluator, timestamp, errorMessage,
  *      score, scoreLabel, explanation). The explanation is MANDATORY in the
  *      hash: legitimate distinct TOOL_CALL results for the same (session,
@@ -303,15 +322,30 @@ export function dedupeEntries(entries) {
     const requestId =
       entry.requestId ?? entry.errorMessage?.match(THROTTLE_REQUEST_RE)?.[1] ?? null;
     const timestamp = entry.timeUnixNano ?? entry.timestamp;
-    entry.dedupeKey = requestId
-      ? `${entry.sessionId}|${entry.evaluatorName}|req:${requestId}`
-      : 'sha1:' +
+    if (requestId) {
+      // Verdict-bearing rows need verdict identity in the key (see bullet 1
+      // above): the success-path fan-out shares one response id across N real
+      // verdicts that differ only in explanation.
+      const hasVerdict =
+        Number.isFinite(entry.score) || entry.scoreLabel != null || entry.evidence != null;
+      const verdictHash = hasVerdict
+        ? '|v:' +
+          createHash('sha1')
+            .update(`${entry.score ?? ''}|${entry.scoreLabel ?? ''}|${entry.evidence ?? ''}`)
+            .digest('hex')
+            .slice(0, 12)
+        : '';
+      entry.dedupeKey = `${entry.sessionId}|${entry.evaluatorName}|req:${requestId}${verdictHash}`;
+    } else {
+      entry.dedupeKey =
+        'sha1:' +
         createHash('sha1')
           .update(
             `${entry.sessionId}|${entry.evaluatorName}|${timestamp}|${entry.errorMessage ?? ''}|` +
               `${entry.score ?? ''}|${entry.scoreLabel ?? ''}|${entry.evidence ?? ''}`
           )
           .digest('hex');
+    }
     if (seen.has(entry.dedupeKey)) continue;
     seen.add(entry.dedupeKey);
     deduped.push(entry);
