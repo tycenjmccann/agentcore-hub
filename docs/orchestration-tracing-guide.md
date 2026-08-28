@@ -271,8 +271,12 @@ treating 200 as sufficient.
 ## Eval health monitoring (dashboard + success-rate alarm)
 
 TEAM-3368 §4: `lambda/eval-packager/index.mjs` emits one EMF record per log
-delivery into the `AgentCoreHub/Evaluations` namespace (dimension
-`AgentName`), with five health metrics:
+delivery into the `AgentCoreHub/Evaluations` namespace with five health
+metrics. The record declares two dimension sets, `[["AgentName"], []]`
+(TEAM-3386), so every metric lands both as a per-`AgentName` series (the
+dashboard SEARCHes these) and as a dimensionless fleet-rollup series (the
+alarms read these — CloudWatch does not allow alarms on SEARCH()
+expressions):
 
 | Metric | Meaning |
 |---|---|
@@ -309,19 +313,27 @@ aws cloudwatch put-dashboard --dashboard-name agentcore-hub-eval-health \
 ```
 
 Apply the success-rate alarm — fires when fleet
-`(total - span_missing - errors) / total` < 0.8 on 3 of 4 hourly datapoints:
+`IF(total > 0, (total - span_missing - errors) / total, 1)` < 0.8 on 3 of 4
+hourly datapoints. Both alarms use plain `MetricStat` entries against the
+dimensionless fleet-rollup series (TEAM-3386) rather than `SUM(SEARCH(...))`
+— CloudWatch rejects alarms built on SEARCH expressions (SEARCH is
+dashboard-only). The `IF()` guard treats a zero-total period (an
+all-duplicates delivery emits `EvalSessionsTotal=0`) as healthy: success rate
+pins to 1 and the span_missing ratio to 0, both non-breaching.
 
 ```bash
 aws cloudwatch put-metric-alarm \
   --cli-input-json file://deploy/evaluations/eval-success-rate-alarm.json
 ```
 
-**Rollout order:** apply the alarm ONLY AFTER the P0-A runtime telemetry fix
-and the P0-B eval-packager fix are deployed AND at least one healthy batch
-with non-zero `EvalSessionsTotal` carrying the three new metrics has been
-observed — earlier, the rate evaluates on stale/partial data and fires
-immediately. Add `AlarmActions` (the environment's SNS topic ARN) to the JSON
-at apply time; it is intentionally omitted from the repo copy.
+**Rollout order:** apply the alarm ONLY AFTER the P0-A runtime telemetry fix,
+the P0-B eval-packager fix, and the TEAM-3386 packager (which emits the
+dimensionless rollup the alarms read) are deployed AND at least one healthy
+batch with non-zero `EvalSessionsTotal` carrying the three new metrics has
+been observed — earlier, the rate evaluates on stale/partial data and fires
+immediately (or the dimensionless series doesn't exist yet and the alarm sits
+in INSUFFICIENT_DATA). Add `AlarmActions` (the environment's SNS topic ARN)
+to the JSON at apply time; it is intentionally omitted from the repo copy.
 
 **INSUFFICIENT_DATA during quiet hours is expected** — both eval alarms use
 `TreatMissingData: missing`, and no eval sessions means no datapoints. Do not
