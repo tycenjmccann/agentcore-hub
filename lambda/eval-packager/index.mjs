@@ -155,7 +155,14 @@ export const handler = async (event) => {
     classifySessions(sessionData);
   // duplicatesDropped > 0 with total 0 still emits: a delivery whose every row
   // was a cross-delivery duplicate must surface in EvalDuplicateResultCount.
-  if (total > 0 || (sessionData.duplicatesDropped || 0) > 0) {
+  // Same for depChainExcluded > 0 with total 0: a delivery whose every row was
+  // an out-of-scope dependency_chain_compliance row (applyRoleGuard excluded
+  // all of them) must still surface in EvalDepChainExcludedCount.
+  if (
+    total > 0 ||
+    (sessionData.duplicatesDropped || 0) > 0 ||
+    (sessionData.depChainExcluded || 0) > 0
+  ) {
     emitEvalMetrics(agentId, {
       total,
       spanMissing,
