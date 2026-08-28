@@ -196,7 +196,7 @@ async function getAgentConfig(agentId) {
  * evaluator name, and evidence. Stores parsed results (not raw event metadata)
  * so the improver agent can synthesize actionable insights from batch payloads.
  */
-function extractSessionData(parsed) {
+export function extractSessionData(parsed) {
   const logEvents = parsed.logEvents || [];
   const sessionBuffer = [];
   const sessionIds = new Set();
@@ -301,7 +301,7 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
  * Maintains a rolling scorecard: { evaluatorName: { sum, count } }
  * and a session count. Read-modify-write with low contention.
  */
-async function aggregateScoresToDdb(agentId, parsed) {
+export async function aggregateScoresToDdb(agentId, parsed) {
   const logEvents = parsed.logEvents || [];
   const sessions = new Set();
   const scoreDeltas = {}; // { evaluatorName: { sum, count } }
@@ -313,6 +313,13 @@ async function aggregateScoresToDdb(agentId, parsed) {
       const evaluator = attrs['gen_ai.evaluation.name'];
       const score = attrs['gen_ai.evaluation.score.value'];
       const sessionId = attrs['session.id'] || '';
+      // TEAM-3390: earliest-possible skip for battery sessions — they must never
+      // count toward the per-agent session total or evaluator score aggregates
+      // the dashboard reads (mirrors the TEAM-3090 guard in extractSessionData).
+      if (isBatterySession(sessionId)) {
+        console.log(`[eval-packager] Skipping battery session ${sessionId} in score aggregation (config-evals battery guard)`);
+        continue;
+      }
       const hasError = attrs['error'] === 1 || attrs['error.type'];
 
       if (sessionId) sessions.add(sessionId);
