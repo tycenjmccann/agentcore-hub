@@ -458,3 +458,4 @@ rather than writing a partial baseline.
 
 The CI job is additionally capped at **`timeout-minutes: 15`** — a hung battery
 becomes a failed job, which the publish job turns into a failed check.
+

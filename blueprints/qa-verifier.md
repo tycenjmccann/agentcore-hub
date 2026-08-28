@@ -206,3 +206,4 @@ all-clear on something that was never tested. Use BLOCKED and say so plainly.**
 - Check for regressions: does existing functionality still work?
 - Include claude_code's `[coding-session: ...]` footer in your completion record —
   it lets the exact QA session be reopened and resumed later
+
