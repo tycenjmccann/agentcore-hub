@@ -101,7 +101,11 @@ describe('classifyEntry', () => {
     expect(result.statusReason).toBe('judge declined to score (label=skipped)');
   });
 
-  it.each(['skip', 'SKIPPED', 'skipped_no_input', 'declined', 'not_applicable', 'N/A', 'unable to evaluate'])(
+  // TEAM-3391: 'not_applicable' and 'N/A' left this list — they are N/A
+  // verdicts ("nothing to judge"), not judge declines, and now classify as
+  // 'na' (see the block below). Counting them as skipped put every healthy
+  // ticketless dependency_chain session into the nullOrErrorRate numerator.
+  it.each(['skip', 'SKIPPED', 'skipped_no_input', 'declined', 'unable to evaluate', 'unable_to_evaluate'])(
     'treats score label %s as a judge decline',
     (label) => {
       expect(classifyEntry(scored({ score: null, scoreLabel: label })).status).toBe('skipped');
@@ -116,6 +120,60 @@ describe('classifyEntry', () => {
       expect(classifyEntry(scored({ score: null, scoreLabel: label })).status).toBe('pending');
     }
   );
+
+  it('classifies a NotApplicable verdict as na, not skipped (TEAM-3391)', () => {
+    // The dependency_chain rubric answers NotApplicable for every session that
+    // created no tickets — a healthy run, not a decline and not a failure.
+    const result = classifyEntry(scored({ score: 2, scoreLabel: 'NotApplicable' }));
+    expect(result.status).toBe('na');
+    expect(result.statusReason).toBe('evaluator verdict: not applicable (label=NotApplicable)');
+  });
+
+  it.each(['NotApplicable', 'not_applicable', 'not-applicable', 'notapplicable', 'Not Applicable', 'N/A', 'na', 'not_applicable_no_tickets'])(
+    'treats score label %s as an N/A verdict',
+    (label) => {
+      // Same (?![a-z0-9]) end-anchoring contract as the decline regex: the
+      // suffixed variant still matches, "notably_applicable_rule" never does.
+      expect(classifyEntry(scored({ score: null, scoreLabel: label })).status).toBe('na');
+    }
+  );
+
+  it('does not treat a label that merely starts with the N/A letters as a verdict', () => {
+    expect(classifyEntry(scored({ score: null, scoreLabel: 'notably_applicable_rule' })).status).toBe('pending');
+    expect(classifyEntry(scored({ score: null, scoreLabel: 'nan' })).status).toBe('pending');
+  });
+
+  it('classifies dependency_chain\'s score-encoded N/A (bare 2.0, no label) as na', () => {
+    // The rubric's PRIVATE encoding: 2.0 = NotApplicable, but only for the
+    // dependency_chain evaluators (isNotApplicable gates on the name).
+    const result = classifyEntry(
+      scored({ score: 2, scoreLabel: null, evaluatorName: 'dependency_chain_compliance_online' })
+    );
+    expect(result.status).toBe('na');
+    expect(result.statusReason).toBe('evaluator verdict: not applicable (score-encoded)');
+    // A 2.0 from any other evaluator is a real score.
+    expect(classifyEntry(scored({ score: 2, scoreLabel: null, evidence: null })).status).toBe('success');
+  });
+
+  it('lets na win over the delivered 2.0 score', () => {
+    // Like a decline label beating its accompanying score: the 2.0 riding
+    // alongside NotApplicable is an encoding, not a quality datum.
+    expect(classifyEntry(scored({ score: 2, scoreLabel: 'NotApplicable' })).status).toBe('na');
+  });
+
+  it('lets error win over an N/A label', () => {
+    expect(
+      classifyEntry(scored({ score: null, scoreLabel: 'NotApplicable', errorType: 'ThrottlingException' })).status
+    ).toBe('error');
+  });
+
+  it('does not read an N/A label off a record with no evaluator behind it', () => {
+    // Mirrors the evaluator-bearing guard on the decline branch: an N/A label
+    // with no evaluator behind it is not a verdict.
+    expect(
+      classifyEntry({ sessionId: 'sess-x', evaluatorName: null, scoreLabel: 'NotApplicable', score: null }).status
+    ).toBe('pending');
+  });
 
   it('lets a decline label win over a delivered score', () => {
     // If the judge says it skipped, its accompanying 0 is not a quality datum —
@@ -267,6 +325,7 @@ describe('computeBatchSummary', () => {
       errorCount: 4,
       nullCount: 6,
       skippedCount: 0,
+      naCount: 0, // key added with TEAM-3391 — same semantics as before here
       // pending is in NEITHER the numerator nor the denominator: 4 of 4
       // evaluator-attempted entries failed.
       scoredTotal: 4,
@@ -328,6 +387,7 @@ describe('computeBatchSummary', () => {
       errorCount: 0,
       nullCount: 0,
       skippedCount: 0,
+      naCount: 0, // key added with TEAM-3391 — same semantics as before here
       scoredTotal: 0,
       totalCount: 0,
       nullOrErrorRate: 100,
@@ -371,18 +431,85 @@ describe('computeBatchSummary', () => {
     );
   });
 
-  it('keeps scoredTotal = success + error + skipped and totalCount = every entry', () => {
+  // TEAM-3391: the identity now includes naCount — an N/A verdict is an
+  // attempted entry (the pipeline provably delivered a verdict for it).
+  it('keeps scoredTotal = success + error + skipped + na and totalCount = every entry', () => {
     const summary = computeBatchSummary([
       { status: 'success' },
       { status: 'error' },
       { status: 'skipped' },
+      { status: 'na' },
       { status: 'pending' },
     ]);
-    expect(summary.scoredTotal).toBe(summary.successCount + summary.errorCount + summary.skippedCount);
-    expect(summary.scoredTotal).toBe(3);
+    expect(summary.scoredTotal).toBe(
+      summary.successCount + summary.errorCount + summary.skippedCount + summary.naCount
+    );
+    expect(summary.scoredTotal).toBe(4);
     // totalCount stays in the output for the dashboard/improver prompt that read it.
-    expect(summary.totalCount).toBe(4);
-    expect(summary.nullOrErrorRate).toBe(67);
+    expect(summary.totalCount).toBe(5);
+    // numerator is still error + skipped only: 2 of 4 attempted → 50.
+    expect(summary.nullOrErrorRate).toBe(50);
+  });
+
+  it('keeps an N/A-heavy batch well under the 50% alarm threshold (TEAM-3391)', () => {
+    // The false-alarm shape from the ticket: 6 legit NotApplicable verdicts +
+    // 4 successes used to read 60% and page BOTH null-or-error-rate alarms
+    // (fleet + per-agent, threshold 50 in deploy/continuous-improvement/
+    // deploy.sh) on a perfectly healthy pipeline.
+    const entries = [
+      ...Array.from({ length: 6 }, () => scored({ score: 2, scoreLabel: 'NotApplicable' })),
+      ...Array.from({ length: 4 }, () => scored()),
+    ];
+    expect(computeBatchSummary(entries)).toMatchObject({
+      successCount: 4,
+      naCount: 6,
+      skippedCount: 0,
+      scoredTotal: 10,
+      nullOrErrorRate: 0,
+    });
+  });
+
+  it('reports a healthy rate 0 for an all-N/A batch — the pipeline is provably alive (TEAM-3391)', () => {
+    // Every evaluator ATTEMPTED and delivered a definitive verdict, so
+    // scoredTotal > 0 and the rate is 0 — flushBuffer's PRD-suppression guard
+    // (scoredTotal === 0 || rate >= 100) must not read this as a dead pipeline.
+    const summary = computeBatchSummary(
+      Array.from({ length: 5 }, () => scored({ score: 2, scoreLabel: 'NotApplicable' }))
+    );
+    expect(summary).toMatchObject({ naCount: 5, scoredTotal: 5, nullOrErrorRate: 0 });
+    expect(summary.scoredTotal === 0 || summary.nullOrErrorRate >= 100).toBe(false);
+  });
+
+  it('still reports 100% for a batch of genuine judge-declines, by label (TEAM-3391)', () => {
+    // The broken-pipeline guard must NOT weaken: skip/unable labels are the
+    // judge refusing to score, and a batch of nothing but refusals still pages.
+    const entries = [
+      ...Array.from({ length: 3 }, () => scored({ score: null, scoreLabel: 'skipped' })),
+      ...Array.from({ length: 2 }, () => scored({ score: null, scoreLabel: 'unable_to_evaluate' })),
+    ];
+    expect(computeBatchSummary(entries)).toMatchObject({
+      skippedCount: 5,
+      naCount: 0,
+      scoredTotal: 5,
+      nullOrErrorRate: 100,
+    });
+  });
+
+  it('mixed N/A + declines + errors: only the declines and errors count against the rate', () => {
+    const entries = [
+      scored({ score: 2, scoreLabel: 'NotApplicable' }),
+      scored({ score: 2, scoreLabel: 'NotApplicable' }),
+      scored({ score: null, scoreLabel: 'skipped' }),
+      scored({ score: null, errorType: 'ThrottlingException', errorMessage: 'Rate exceeded' }),
+    ];
+    // numerator 2 (1 skipped + 1 error) over denominator 4 → 50.
+    expect(computeBatchSummary(entries)).toMatchObject({
+      naCount: 2,
+      skippedCount: 1,
+      errorCount: 1,
+      scoredTotal: 4,
+      nullOrErrorRate: 50,
+    });
   });
 });
 
