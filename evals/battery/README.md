@@ -201,6 +201,13 @@ is a gate failure** (fail closed; scores across backends are not comparable).
 - **Regenerated ONLY by `.github/workflows/config-evals-baseline.yml`** on
   merge to `main` (or manual dispatch). PR runs never write it — the runner
   has no baseline-writing code path outside `--baseline-mode --out`.
+- **Baseline publication (ops prerequisite).** For the first real baseline to
+  land, the `config-evals` GitHub environment and the
+  `AWS_EVAL_GATE_ROLE_ARN` repo variable must exist, and branch protection on
+  `main` must allow pushes from the `github-actions[bot]` app (or the commit
+  step's token swapped for a narrowly-scoped deploy key) — see the SECRET-4
+  comment in the baseline workflow. Until that run succeeds, the committed
+  baseline stays `bootstrap: true` and every gate run correctly FAILs.
 - **Missing or unparseable baseline = gate failure.** So is a *pre-existing*
   case absent from the baseline (drift or hand-editing).
 - **New-in-PR cases run informational**: scores are reported in the check
@@ -329,16 +336,29 @@ regression.**
 
 ## Flake retirement policy (FR-10)
 
-**Retire, don't retry.**
+**Retire, don't retry.** The exact rule:
 
-- The runner performs **at most one retry per case per run**, and only for
-  *typed transport errors* — throttling, 5xx, connection reset/timeout
-  (classified by error type in `lib/agent-runner.mjs`, never by score).
-  Score variance is never a retry reason.
-- A case that flips verdicts on unchanged config is flaky, and flaky cases
-  erode the gate's authority. The fix is a PR that sets `status: "retired"`
-  with a `retirement_reason`, and removes the id from `manifest.json`
-  `activeCases`.
+- **Max 1 retry per case per run, transient errors only** — throttling, 5xx,
+  connection reset/timeout (classified by error type in
+  `lib/agent-runner.mjs`, never by score). Score variance is never a retry
+  reason.
+- **Verdict flips ≥ 2 of the last 5 runs on unchanged config ⇒ flagged** in
+  the check summary ("Flaky candidates") and in the flake ledger. "Unchanged
+  config" is a fingerprint over the case's effective definition + the system
+  prompt it ran against (`lib/flake.mjs configFingerprint`); a fingerprint
+  change resets the flip window, so a deliberate config change never reads as
+  flake. Errored/timed-out runs count as fails for flip purposes.
+- **Flagging is informational only** — it never changes the gate verdict.
+  Verdict history lives in `flake-ledger.jsonl` (JSONL, one line per run ×
+  case, written through the same C2 redaction as `battery-progress.jsonl`).
+  Locally it lands next to the results file (override with
+  `--flake-ledger <path>` or `BATTERY_FLAKE_LEDGER`); in CI the gate job
+  restores the previous ledger best-effort via `actions/cache`, appends this
+  run, saves it back, and uploads it with the results artifact. A stale or
+  missing ledger only costs flag history, never a verdict.
+- **Retirement is the fix**: a PR that sets `status: "retired"` with a
+  `retirement_reason`, and removes the id from `manifest.json` `activeCases`.
+  A case that flips verdicts on unchanged config erodes the gate's authority.
 - Retired cases are excluded from gating but **listed in every check summary
   with their reason** — retirement is visible, never silent.
 - **Retirement takes effect only after merge.** The retirement PR's own gate run
@@ -365,6 +385,17 @@ A battery run executes **zero real side effects**:
 - **Session ids are `battery-<runId>-<caseId>`** — never containing `eval_`,
   so the eval-packager Lambda's `resolveAgentId` substring match can never
   mistake a battery session for an online eval session (unit-tested).
+- **Synthetic test tenant** (TEAM-3090): every case result records
+  `tenant: "battery-test"` (`BATTERY_TENANT` in `lib/agent-runner.mjs`). No
+  AgentCore runtime session is ever created — cases are direct Bedrock
+  Converse calls — so the tenant exists purely to mark battery traffic as
+  non-prod; the hermeticity self-test refuses a tenant that doesn't start
+  with `battery-` or that looks prod-like.
+- **Packager belt-and-suspenders** (TEAM-3090): battery runs emit no OTEL and
+  never reach the eval-results log groups by design, but
+  `lambda/eval-packager/index.mjs` additionally skips any record whose session
+  id starts with `battery-` (`isBatterySession`) — it can never be buffered to
+  DynamoDB, batched to S3, or counted toward the improver flush.
 - **Sanitized fixtures** enforced by `npm run battery:lint`.
 - **CI credential preflight**: the gate job checks out with
   `persist-credentials: false` and asserts no git credential survives on disk
