@@ -34,8 +34,14 @@ import {
   classifyEntry,
   computeBatchSummary,
   emfRecord,
+  isNotApplicable,
   sessionsMissingSpan,
 } from './lib/classify.mjs';
+
+// Re-exported for existing consumers/tests that import it from here. The
+// definition moved to lib/classify.mjs (TEAM-3391) so classifyEntry and the
+// classifySessions/computeScoreDeltas paths share ONE definition of N/A.
+export { isNotApplicable };
 
 // ─── Clients ────────────────────────────────────────────────────────────────
 const ddbRaw = new DynamoDBClient({});
@@ -231,39 +237,6 @@ export function classifyError(errorType, errorMessage) {
   }
   if (errorType !== null && errorType !== undefined) return 'other';
   return null;
-}
-
-/**
- * True when the evaluator's verdict for this entry is "not applicable" — the
- * rubric had nothing to judge (e.g. dependency_chain on a run with no
- * dependencies). Covers the three shapes we expect to see:
- *   - a categorical label ("NotApplicable" / "not_applicable" / "Not Applicable"),
- *   - the numerical rubric's 4th entry value 2.0 labelled "NotApplicable"
- *     (verified accepted by the live online-evaluations service) — gated on
- *     the evaluator name, because 2.0=NotApplicable is a PRIVATE encoding of
- *     the dependency_chain rubric (see NUMERIC_NA_EVALUATOR_RE), and
- *   - the NOT_APPLICABLE sentinel prefix in the explanation text.
- * The label and explanation signals stay evaluator-agnostic — they are
- * self-describing. N/A is a verdict, not a failure: it must never enter
- * sum/count and never count toward error rates.
- */
-
-/** Only the dependency_chain rubric (deploy/evaluations/
- *  dependency_chain_evaluator.json, registered as
- *  dependency_chain_compliance_online / _ondemand) encodes NotApplicable as
- *  the bare numeric score 2.0. Any other evaluator legitimately emitting 2
- *  must aggregate, not be silently reclassified as N/A (TEAM-3383). */
-const NUMERIC_NA_EVALUATOR_RE = /dependency_chain/i;
-
-export function isNotApplicable(entry) {
-  const e = entry || {};
-  if (typeof e.scoreLabel === 'string' && /^not[\s_-]?applicable$/i.test(e.scoreLabel.trim())) {
-    return true;
-  }
-  if (e.score === 2 && NUMERIC_NA_EVALUATOR_RE.test(e.evaluatorName ?? '')) return true;
-  const explanation = e.evidence ?? e.explanation;
-  if (typeof explanation === 'string' && explanation.startsWith('NOT_APPLICABLE')) return true;
-  return false;
 }
 
 /** The throttled evaluator's own message carries the request UUID — the one
@@ -721,7 +694,7 @@ export function computeScoreDeltas(logEvents) {
  * additive field — the dashboard route reads only sum/count, so older rows
  * without it stay readable.
  *
- * Additionally maintains a rolling { success, error, pending, skipped } tally
+ * Additionally maintains a rolling { success, error, pending, skipped, na } tally
  * (evalStatusCounts) plus the last error's timestamp/reason, so a dashboard can
  * say "8 of 10 runs never scored" instead of showing an average built from two
  * data points. The score aggregation above is deliberately untouched: a run that
@@ -766,12 +739,14 @@ async function aggregateScoresToDdb(agentId, parsed, entries = []) {
       error: 0,
       pending: 0,
       skipped: 0,
+      na: 0,
       ...(Item?.evalStatusCounts || {}),
     };
     statusCounts.success += deliverySummary.successCount;
     statusCounts.error += deliverySummary.errorCount;
     statusCounts.pending += deliverySummary.nullCount;
     statusCounts.skipped += deliverySummary.skippedCount;
+    statusCounts.na += deliverySummary.naCount;
 
     const now = new Date().toISOString();
     const updateExpr = [
@@ -807,7 +782,8 @@ async function aggregateScoresToDdb(agentId, parsed, entries = []) {
     console.log(
       `[eval-packager] ${agentId}: aggregated ${Object.keys(scoreDeltas).length} evaluators, ${sessions.size} sessions ` +
         `(delivery: ${deliverySummary.successCount} success / ${deliverySummary.errorCount} error / ` +
-        `${deliverySummary.nullCount} pending / ${deliverySummary.skippedCount} skipped)`
+        `${deliverySummary.nullCount} pending / ${deliverySummary.skippedCount} skipped / ` +
+        `${deliverySummary.naCount} na)`
     );
   } catch (err) {
     // Non-fatal — don't break the buffer/flush pipeline
@@ -858,6 +834,7 @@ async function flushBuffer(agentId, buffer, batchSize) {
           errorCount: summary.errorCount,
           nullCount: summary.nullCount,
           skippedCount: summary.skippedCount,
+          naCount: summary.naCount,
           scoredTotal: summary.scoredTotal,
           totalCount: summary.totalCount,
         })
@@ -908,6 +885,9 @@ async function flushBuffer(agentId, buffer, batchSize) {
   //    debugging, we just don't act on it. Checked here rather than inside
   //    synthesizeAndWritePrd so the suppression is logged whether or not
   //    IMPROVER_ARN is configured.
+  //    An all-N/A batch does NOT suppress (TEAM-3391): N/A is a delivered
+  //    verdict, so scoredTotal > 0 and the rate is 0 — the pipeline is
+  //    provably alive, and the improver can still act on the sessions.
   if (summary.scoredTotal === 0 || summary.nullOrErrorRate >= 100) {
     console.log(
       JSON.stringify({
@@ -924,6 +904,7 @@ async function flushBuffer(agentId, buffer, batchSize) {
         errorCount: summary.errorCount,
         nullCount: summary.nullCount,
         skippedCount: summary.skippedCount,
+        naCount: summary.naCount,
         totalCount: summary.totalCount,
         archivedKey: batchKey,
       })

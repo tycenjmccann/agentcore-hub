@@ -417,6 +417,7 @@ describe('handler (IMPROVEMENT_AGENT_ARN configured)', () => {
         successCount: 3,
         errorCount: 1,
         skippedCount: 0,
+        naCount: 0,
         scoredTotal: 4,
         nullOrErrorRate: 25,
       });
@@ -511,6 +512,97 @@ describe('handler (IMPROVEMENT_AGENT_ARN configured)', () => {
       expect(suppressed.reason).toContain('nullOrErrorRate at maximum');
       expect(httpsRequest).not.toHaveBeenCalled();
       expect(putsUnder('fleet-imp-agent/prd/')).toEqual([]);
+    });
+
+    it('SUPPRESSES synthesis when every entry is a genuine judge decline (TEAM-3391 guard intact)', async () => {
+      // skip/unable labels are the judge REFUSING to score — unlike N/A they
+      // stay in the rate's numerator, so an all-decline batch still reads as a
+      // broken pipeline and must not reach the improver.
+      await handler(
+        awslogsEvent([
+          evalRecord({ sessionId: 'sess-d1', score: null, scoreLabel: 'skipped' }),
+          evalRecord({ sessionId: 'sess-d2', score: null, scoreLabel: 'unable_to_evaluate' }),
+        ])
+      );
+
+      const payload = JSON.parse(putsUnder('fleet-imp-agent/batches/')[0].input.Body);
+      expect(payload.summary).toMatchObject({ skippedCount: 2, naCount: 0, scoredTotal: 2, nullOrErrorRate: 100 });
+
+      const [suppressed] = jsonLogs().filter((l) => l.event === 'eval.prd.synthesis_suppressed');
+      expect(suppressed.reason).toContain('nullOrErrorRate at maximum');
+      expect(httpsRequest).not.toHaveBeenCalled();
+      expect(putsUnder('fleet-imp-agent/prd/')).toEqual([]);
+    });
+
+    it('keeps an N/A-heavy batch far below the 50% alarm threshold (TEAM-3391)', async () => {
+      // The false-page shape from the ticket: 6 legit NotApplicable verdicts
+      // (dependency_chain on ticketless sessions) + 4 successes used to emit
+      // rate 60 and page both null-or-error-rate alarms (threshold 50 in
+      // deploy/continuous-improvement/deploy.sh) on a healthy pipeline.
+      await handler(
+        awslogsEvent([
+          ...Array.from({ length: 6 }, (_, i) =>
+            evalRecord({
+              sessionId: `sess-na-${i}`,
+              evaluatorName: 'dependency_chain_compliance_online',
+              score: 2,
+              scoreLabel: 'NotApplicable',
+            })
+          ),
+          ...Array.from({ length: 4 }, (_, i) =>
+            evalRecord({ sessionId: `sess-ok-${i}`, score: 8, scoreLabel: 'pass' })
+          ),
+        ])
+      );
+
+      const payload = JSON.parse(putsUnder('fleet-imp-agent/batches/')[0].input.Body);
+      expect(payload.summary).toMatchObject({
+        successCount: 4,
+        naCount: 6,
+        skippedCount: 0,
+        scoredTotal: 10,
+        nullOrErrorRate: 0,
+      });
+
+      // The metric value the alarms actually see, with naCount riding along
+      // beside its sibling counts for Logs Insights.
+      const [rate] = emfLines('eval.batch.null_or_error_rate');
+      expect(rate['eval.batch.null_or_error_rate']).toBeLessThan(50);
+      expect(rate['eval.batch.null_or_error_rate']).toBe(0);
+      expect(rate).toMatchObject({ naCount: 6, skippedCount: 0, scoredTotal: 10 });
+    });
+
+    it('does NOT suppress synthesis for an all-N/A batch — the pipeline is provably alive (TEAM-3391)', async () => {
+      // Every evaluator attempted and delivered a definitive "nothing to
+      // judge" verdict: scoredTotal > 0 and rate 0, so neither arm of the
+      // evidence guard (scoredTotal === 0 || rate >= 100) fires. Before
+      // TEAM-3391 these classified as skipped → rate 100 → a healthy batch
+      // was wrongly archived as "pipeline dead" with no PRD.
+      await handler(
+        awslogsEvent([
+          evalRecord({
+            sessionId: 'sess-na-a',
+            evaluatorName: 'dependency_chain_compliance_online',
+            score: 2,
+            scoreLabel: 'NotApplicable',
+          }),
+          evalRecord({
+            sessionId: 'sess-na-b',
+            evaluatorName: 'dependency_chain_compliance_online',
+            score: 2,
+            scoreLabel: 'NotApplicable',
+          }),
+        ])
+      );
+
+      const payload = JSON.parse(putsUnder('fleet-imp-agent/batches/')[0].input.Body);
+      expect(payload.summary).toMatchObject({ naCount: 2, scoredTotal: 2, nullOrErrorRate: 0 });
+
+      expect(jsonLogs().some((l) => l.event === 'eval.prd.synthesis_suppressed')).toBe(false);
+      // Synthesis proceeded: the improver was invoked and the PRD landed.
+      expect(httpsRequest).toHaveBeenCalledTimes(1);
+      expect(putsUnder('fleet-imp-agent/prd/')).toHaveLength(1);
+      expect(emfLines('eval.batch.null_or_error_rate')[0]['eval.batch.null_or_error_rate']).toBe(0);
     });
 
     it('holds the batch instead of flushing while the cooldown is unexpired', async () => {
@@ -904,6 +996,14 @@ describe('classifyError / isNotApplicable / dedupe / computeScoreDeltas (TEAM-33
       expect(isNotApplicable({ scoreLabel: 'not_applicable' })).toBe(true);
       expect(isNotApplicable({ scoreLabel: 'Not Applicable' })).toBe(true);
       expect(isNotApplicable({ scoreLabel: 'not-applicable' })).toBe(true);
+      // TEAM-3391: the label check moved to lib/classify.mjs and now shares
+      // NA_LABEL_RE with classifyEntry — a strict superset of the old exact
+      // match that also covers the n/a variants (previously misread as judge
+      // declines by the flush path) and suffixed labels, with the same
+      // (?![a-z0-9]) end-anchoring as the decline regex.
+      expect(isNotApplicable({ scoreLabel: 'N/A' })).toBe(true);
+      expect(isNotApplicable({ scoreLabel: 'na' })).toBe(true);
+      expect(isNotApplicable({ scoreLabel: 'not_applicable_no_tickets' })).toBe(true);
     });
 
     it('matches the numerical sentinel 2.0 ONLY for the dependency_chain rubric that defines it', () => {
