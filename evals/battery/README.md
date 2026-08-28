@@ -160,8 +160,12 @@ knobs (all optional):
 | --- | --- | --- |
 | `BATTERY_BEDROCK_CONCURRENCY` | `3` | Global cap on in-flight Converse calls (agent turns + judge calls combined) across all case workers. |
 | `BATTERY_CASE_DEADLINE_SECONDS` | `timeoutSeconds + 60 × evaluators` | End-to-end per-case deadline covering the agent loop AND judge scoring; firing during scoring ⇒ `unscored` (gate FAIL), suite continues. |
-| `BATTERY_RUN_DEADLINE_SECONDS` | `780` (13 min) | Whole-run watchdog: aborts outstanding work, marks unfinished cases `timed_out`, and still writes results + check summary (FAIL). |
+| `BATTERY_RUN_DEADLINE_SECONDS` | `780` (13 min); in `--baseline-mode` auto-scaled to `780 × repeat` (2340s for repeat 3) | Whole-run watchdog: aborts outstanding work, marks unfinished cases `timed_out`, and still writes results + check summary (FAIL). An explicit env value is honored verbatim in every mode (no scaling); the startup `Limits:` line logs the effective value and notes when it was auto-scaled. |
 | `BATTERY_MAX_TRANSPORT_RETRIES` | `1` | Per-case transport retry budget (jittered backoff, elapsed-capped); retries re-run the failed turn, never the whole case. |
+
+Every exit path that could have spent Bedrock money — gate PASS/FAIL, baseline
+success or failure, watchdog abort, spend-ceiling abort, even a runner crash —
+prints `Total spend: $X.XXXX (ceiling $Y.YY)` from the live ledger.
 
 ## Scoring backend
 
@@ -247,6 +251,14 @@ job posts a failing `config-evals-gate` check). One-time setup:
 
 `baseline.json` holds per-case per-evaluator means (`runs_per_case: 3`), the
 `source_commit` it was generated from, and the `scoringBackend`.
+
+- **Per-case quorum (TEAM-3405).** In `--baseline-mode --repeat N` a case is
+  baseline-eligible when at least `ceil(2N/3)` of its N runs scored (2-of-3 for
+  repeat 3); the per-evaluator means are computed over the scored runs only,
+  and each baseline case records `runsScored`/`runsAttempted` so the artifact
+  is honest about its sample size. A case below quorum still fails the whole
+  baseline run — an unsound baseline is never written. Gate mode is
+  unaffected: any non-`scored` case fails the gate.
 
 - **Bootstrap state.** `bootstrap: true` with `runs_per_case: 0` and empty
   `cases` means no real baseline has been recorded yet; every case runs

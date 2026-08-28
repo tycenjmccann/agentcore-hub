@@ -169,6 +169,15 @@ async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxT
   }
 }
 
+// Error text for a failed_required_tool result. Distinguishes truncation from
+// a deliberate prose finish (TEAM-3405): an agent cut off at the turn cap
+// never had the chance to call the required tools, and that reads very
+// differently in the summary.
+export function requiredToolFailureError({ missingRequiredTools, maxTurnsExceeded, turns }) {
+  const truncated = maxTurnsExceeded ? ` (agent loop truncated at the ${turns}-turn cap)` : "";
+  return `required tool(s) never called: ${(missingRequiredTools || []).join(", ")}${truncated}`;
+}
+
 /**
  * Run one case end to end. Returns:
  * { id, status: completed|errored|timed_out|failed_forbidden_tool|failed_required_tool,
