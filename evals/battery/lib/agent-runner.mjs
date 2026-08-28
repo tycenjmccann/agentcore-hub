@@ -25,6 +25,14 @@ export const PRICING_PER_MTOK = Object.freeze({
   judge: { input: 5, output: 25 },
 });
 
+// TEAM-3090: synthetic test tenant recorded on every battery result. No
+// AgentCore runtime session is ever created (cases are direct Converse calls),
+// so the tenant exists purely to mark battery traffic as non-prod; the
+// hermeticity self-test asserts it can never look like a prod tenant. The
+// session id format `battery-<runId>-<caseId>` is unchanged — tests and the
+// eval-packager isolation guarantees key off that prefix.
+export const BATTERY_TENANT = "battery-test";
+
 export const MAX_TURNS = 24;
 // FR-10: a single transport retry per case by default (never per score), with
 // jittered backoff. Bounded in attempts AND in elapsed time via the per-case
@@ -238,6 +246,7 @@ export async function runCase({
       status,
       attempt: retryBudget.used + 1,
       sessionId,
+      tenant: BATTERY_TENANT,
       forbiddenHits,
       missingRequiredTools,
       ...loop,
@@ -251,6 +260,7 @@ export async function runCase({
         status: "timed_out",
         attempt: retryBudget.used + 1,
         sessionId,
+        tenant: BATTERY_TENANT,
         error: reason?.message || `timed out after ${caseDef.timeoutSeconds}s`,
         ...empty,
       };
@@ -260,6 +270,7 @@ export async function runCase({
       status: "errored",
       attempt: retryBudget.used + 1,
       sessionId,
+      tenant: BATTERY_TENANT,
       error: `${err.name || "Error"}: ${err.message}`,
       ...empty,
     };

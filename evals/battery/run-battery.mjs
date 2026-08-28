@@ -2,6 +2,7 @@
 // Battery CLI (FR-2/FR-3/FR-9/FR-10/FR-12).
 //   --all (default) | --case <id> (repeatable) | --dry-run | --mock
 //   --results <path> | --base-ref <ref> | --baseline-mode --repeat N --out <path>
+//   --flake-ledger <path> (or BATTERY_FLAKE_LEDGER; default <results-dir>/flake-ledger.jsonl)
 //
 // --mock (TEAM-3295): full pipeline with a deterministic local transport and a
 // synthetic in-memory baseline — zero AWS calls. Demonstrates RED (degraded
@@ -30,7 +31,8 @@ import { execFileSync } from "node:child_process";
 import { preflight, resolveGateConfig, SCORING_BACKEND as CASES_BACKEND } from "./lib/cases.mjs";
 import { evaluateSuite } from "./lib/thresholds.mjs";
 import { createRegistry, FORBIDDEN_TOOLS } from "./lib/registry.mjs";
-import { runCase, MODEL_TIERS, MAX_TRANSPORT_RETRIES } from "./lib/agent-runner.mjs";
+import { runCase, systemPromptPath, MODEL_TIERS, MAX_TRANSPORT_RETRIES, BATTERY_TENANT } from "./lib/agent-runner.mjs";
+import { configFingerprint, appendFlakeLedger, readFlakeLedger, flagFlakyCases } from "./lib/flake.mjs";
 import { createSpendLedger } from "./lib/spend.mjs";
 import { createConverseTransport, scoreCase, SCORING_BACKEND } from "./lib/scoring.mjs";
 import { createMockTransport, buildMockBaseline, MOCK_SCORING_BACKEND } from "./lib/mock-transport.mjs";
@@ -69,7 +71,7 @@ const clock = () => new Date().toISOString().slice(11, 19);
 // ─── Flags ───────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const flags = { cases: [], dryRun: false, mock: false, baselineMode: false, repeat: 3, results: null, baseRef: null, out: null };
+  const flags = { cases: [], dryRun: false, mock: false, baselineMode: false, repeat: 3, results: null, baseRef: null, out: null, flakeLedger: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--all") continue;
@@ -77,6 +79,7 @@ function parseArgs(argv) {
     else if (a === "--dry-run") flags.dryRun = true;
     else if (a === "--mock") flags.mock = true;
     else if (a === "--results") flags.results = argv[++i];
+    else if (a === "--flake-ledger") flags.flakeLedger = argv[++i];
     else if (a === "--base-ref") flags.baseRef = argv[++i];
     else if (a === "--baseline-mode") flags.baselineMode = true;
     else if (a === "--repeat") flags.repeat = parseInt(argv[++i], 10);
@@ -117,6 +120,12 @@ function hermeticitySelfTest(runId, activeCases) {
     const sessionId = `battery-${runId}-${def.id}`;
     if (sessionId.includes("eval_")) errors.push(`session id '${sessionId}' contains 'eval_'`);
   }
+
+  // TEAM-3090: the synthetic test tenant recorded on every result must never
+  // look like prod traffic (and must share the battery- marker the packager's
+  // defense-in-depth filter keys on).
+  if (!BATTERY_TENANT.startsWith("battery-") || /prod/i.test(BATTERY_TENANT) || BATTERY_TENANT.includes("eval_"))
+    errors.push(`test tenant '${BATTERY_TENANT}' does not look like a synthetic battery tenant`);
 
   // No on-disk git credentials (HERM-1): no CI-injected auth header that a
   // compromised prompt could exfiltrate or use to push.
@@ -365,6 +374,7 @@ async function main() {
     status,
     attempt,
     sessionId: null,
+    tenant: BATTERY_TENANT,
     forbiddenHits: [],
     trajectory: [],
     usage: { inputTokens: 0, outputTokens: 0 },
@@ -562,6 +572,50 @@ async function main() {
     scoringBackend: activeBackend,
     costCeilingReasons: ledger.failureReasons(),
   });
+
+  // Flake bookkeeping (TEAM-3090, FR-10): append this run's per-case verdicts
+  // to the flake ledger and flag verdict flips on unchanged config. Flags are
+  // INFORMATIONAL ONLY — they never touch the gate verdict (retirement stays
+  // the status:retired PR process) — so bookkeeping failures must cost a
+  // warning, never the run. Never reached for --dry-run (exits above), and
+  // skipped for --mock: synthetic mock verdicts say nothing about real judge
+  // flakiness and must not pollute a ledger a real run might later read.
+  let flakyFlags = [];
+  if (!flags.mock) try {
+    const flakeLedgerPath = resolve(
+      flags.flakeLedger || process.env.BATTERY_FLAKE_LEDGER || join(dirname(resultsPath), "flake-ledger.jsonl")
+    );
+    const priorEntries = readFlakeLedger(flakeLedgerPath);
+    const nowIso = new Date().toISOString();
+    const runEntries = caseResults.map((r) => {
+      const def = selected.find((d) => d.id === r.id);
+      let promptText = "";
+      try {
+        promptText = readFileSync(systemPromptPath(REPO_ROOT, def.targetAgentId), "utf8");
+      } catch {
+        /* a missing prompt already failed preflight; fingerprint the case alone */
+      }
+      const breached = suite.deltaRows.some((row) => row.case === r.id && row.verdict === "floor_breach");
+      return {
+        ts: nowIso,
+        runId,
+        caseId: r.id,
+        fingerprint: configFingerprint(def, promptText),
+        // errored/timed_out/skipped/unscored/forbidden all land as fail.
+        verdict: r.status === "scored" && !breached ? "pass" : "fail",
+      };
+    });
+    appendFlakeLedger(flakeLedgerPath, runEntries);
+    flakyFlags = flagFlakyCases([...priorEntries, ...runEntries]);
+    console.log(`Flake ledger: ${flakeLedgerPath} (${priorEntries.length + runEntries.length} entries)`);
+    if (flakyFlags.length > 0)
+      console.warn(
+        `warn: ${flakyFlags.length} flaky candidate(s) flagged (informational only): ${flakyFlags.map((f) => f.caseId).join(", ")}`
+      );
+  } catch (err) {
+    console.warn(`warn: flake-ledger bookkeeping failed (informational only, run continues): ${err.message}`);
+  }
+
   const results = buildResults({
     runId,
     configSha,
@@ -573,6 +627,7 @@ async function main() {
     costEstimateUsd,
     runtimeSeconds,
     configSources: gate ? { baseRef: gate.baseRef, ...gate.sources } : { baseRef: null, all: "pr-head (local/manual run)" },
+    flakyFlags,
   });
 
   // C2: redact at the write-time choke point. check-summary.md is published

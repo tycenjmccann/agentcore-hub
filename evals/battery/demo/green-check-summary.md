@@ -1,8 +1,8 @@
 # Config-evals battery: ✅ PASS
 
-- **Run:** `mtc8ejyubtid` @ `6d5cd44649fdce0077b798d6c5a256e2874fde0f`
+- **Run:** `mtc9c9witqvd` @ `cff23d5a0201bfb6a328280eb931419edd5f2834`
 - **Baseline:** `mock-synthetic-baseline` (backend: mock)
-- **Cost:** $0.4 — **Runtime:** 1.27s
+- **Cost:** $0.4 — **Runtime:** 1.33s
 - **Gating cases:** 13 compared against the baseline
 - **Overall:** baseline 85.6 → current 85.6 (Δ 0, scale 0-100)
 

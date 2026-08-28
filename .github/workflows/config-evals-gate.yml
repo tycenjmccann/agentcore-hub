@@ -154,12 +154,39 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
         run: git fetch --no-tags --depth=1 origin "$BASE_REF"
 
+      - name: Restore flake ledger (best-effort, TEAM-3090)
+        # Cross-run verdict history for flake flagging. The ledger only feeds
+        # INFORMATIONAL flaky-candidate flags (lib/flake.mjs is report-only;
+        # nothing read from it can alter the gate verdict), so a stale or
+        # PR-poisoned cache cannot green-light or block a PR. No new
+        # permissions: actions/cache needs only the job's existing
+        # contents:read. The run_id key never hits, so restore always falls
+        # through to the newest prior ledger via the prefix restore-key.
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/flake-ledger.jsonl
+          key: config-evals-flake-ledger-${{ github.run_id }}
+          restore-keys: |
+            config-evals-flake-ledger-
+
       - name: Run battery
         env:
           BASE_REF: ${{ github.base_ref }}
         # run-battery.mjs writes check-summary.md next to --results and exits
         # non-zero on a FAIL verdict, so a red battery job ⇔ red gate.
-        run: node evals/battery/run-battery.mjs --results "$RUNNER_TEMP/battery-results.json" --base-ref "origin/$BASE_REF"
+        run: node evals/battery/run-battery.mjs --results "$RUNNER_TEMP/battery-results.json" --base-ref "origin/$BASE_REF" --flake-ledger "$RUNNER_TEMP/flake-ledger.jsonl"
+
+      - name: Save flake ledger (best-effort, TEAM-3090)
+        # Unique per-run key so the save never conflicts; the next run's
+        # restore picks the newest via the prefix restore-key. always():
+        # a FAILing run's verdict is exactly what the flip counter needs.
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/flake-ledger.jsonl
+          key: config-evals-flake-ledger-${{ github.run_id }}
 
       - name: Upload results
         # always(): the publish job needs the artifact even (especially) when
@@ -171,6 +198,7 @@ jobs:
           path: |
             ${{ runner.temp }}/battery-results.json
             ${{ runner.temp }}/check-summary.md
+            ${{ runner.temp }}/flake-ledger.jsonl
           if-no-files-found: ignore
 
   # Publishes the `config-evals-gate` check run. Runs NO PR code — no checkout

@@ -1,6 +1,6 @@
 {
-  "runId": "mtc8eyhno997",
-  "configSha": "6d5cd44649fdce0077b798d6c5a256e2874fde0f",
+  "runId": "mtc9cbadxgfm",
+  "configSha": "cff23d5a0201bfb6a328280eb931419edd5f2834",
   "baselineSha": "mock-synthetic-baseline",
   "scoringBackend": "mock",
   "verdict": "FAIL",
@@ -42,7 +42,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "haiku",
-      "sessionId": "battery-mtc8eyhno997-fix-null-session-crash-001",
+      "sessionId": "battery-mtc9cbadxgfm-fix-null-session-crash-001",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "claude_code",
@@ -147,7 +148,7 @@
       "forbiddenHits": [],
       "missingRequiredTools": [],
       "error": null,
-      "runtimeSeconds": 0.08,
+      "runtimeSeconds": 0.1,
       "informational": false
     },
     {
@@ -155,7 +156,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "haiku",
-      "sessionId": "battery-mtc8eyhno997-fix-pagination-offbyone-002",
+      "sessionId": "battery-mtc9cbadxgfm-fix-pagination-offbyone-002",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "claude_code",
@@ -260,7 +262,7 @@
       "forbiddenHits": [],
       "missingRequiredTools": [],
       "error": null,
-      "runtimeSeconds": 0.08,
+      "runtimeSeconds": 0.1,
       "informational": false
     },
     {
@@ -268,7 +270,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "sonnet",
-      "sessionId": "battery-mtc8eyhno997-fix-race-condition-cas-003",
+      "sessionId": "battery-mtc9cbadxgfm-fix-race-condition-cas-003",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "claude_code",
@@ -373,7 +376,7 @@
       "forbiddenHits": [],
       "missingRequiredTools": [],
       "error": null,
-      "runtimeSeconds": 0.08,
+      "runtimeSeconds": 0.1,
       "informational": false
     },
     {
@@ -381,7 +384,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "haiku",
-      "sessionId": "battery-mtc8eyhno997-qa-build-verification-002",
+      "sessionId": "battery-mtc9cbadxgfm-qa-build-verification-002",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "load_blueprint",
@@ -507,7 +511,7 @@
       "forbiddenHits": [],
       "missingRequiredTools": [],
       "error": null,
-      "runtimeSeconds": 0.12,
+      "runtimeSeconds": 0.14,
       "informational": false
     },
     {
@@ -515,7 +519,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "haiku",
-      "sessionId": "battery-mtc8eyhno997-qa-design-mismatch-003",
+      "sessionId": "battery-mtc9cbadxgfm-qa-design-mismatch-003",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "load_blueprint",
@@ -641,7 +646,7 @@
       "forbiddenHits": [],
       "missingRequiredTools": [],
       "error": null,
-      "runtimeSeconds": 0.12,
+      "runtimeSeconds": 0.13,
       "informational": false
     },
     {
@@ -649,7 +654,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "haiku",
-      "sessionId": "battery-mtc8eyhno997-qa-verifier-degradation-canary-004",
+      "sessionId": "battery-mtc9cbadxgfm-qa-verifier-degradation-canary-004",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "load_blueprint",
@@ -758,7 +764,7 @@
       "forbiddenHits": [],
       "missingRequiredTools": [],
       "error": null,
-      "runtimeSeconds": 0.08,
+      "runtimeSeconds": 0.09,
       "informational": false
     },
     {
@@ -766,7 +772,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "haiku",
-      "sessionId": "battery-mtc8eyhno997-qa-verifier-regression-001",
+      "sessionId": "battery-mtc9cbadxgfm-qa-verifier-regression-001",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "load_blueprint",
@@ -871,7 +878,7 @@
       "forbiddenHits": [],
       "missingRequiredTools": [],
       "error": null,
-      "runtimeSeconds": 0.09,
+      "runtimeSeconds": 0.1,
       "informational": false
     },
     {
@@ -879,7 +886,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "haiku",
-      "sessionId": "battery-mtc8eyhno997-review-error-handling-001",
+      "sessionId": "battery-mtc9cbadxgfm-review-error-handling-001",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "Tickets___create_ticket",
@@ -984,7 +992,7 @@
       "forbiddenHits": [],
       "missingRequiredTools": [],
       "error": null,
-      "runtimeSeconds": 0.09,
+      "runtimeSeconds": 0.1,
       "informational": false
     },
     {
@@ -992,7 +1000,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "haiku",
-      "sessionId": "battery-mtc8eyhno997-review-eventual-consistency-003",
+      "sessionId": "battery-mtc9cbadxgfm-review-eventual-consistency-003",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "WorkflowOutput___report_completion",
@@ -1101,7 +1110,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "sonnet",
-      "sessionId": "battery-mtc8eyhno997-review-injection-vuln-002",
+      "sessionId": "battery-mtc9cbadxgfm-review-injection-vuln-002",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "Tickets___create_ticket",
@@ -1214,7 +1224,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "sonnet",
-      "sessionId": "battery-mtc8eyhno997-triage-crash-chain-001",
+      "sessionId": "battery-mtc9cbadxgfm-triage-crash-chain-001",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "Tickets___create_ticket",
@@ -1319,7 +1330,7 @@
       "forbiddenHits": [],
       "missingRequiredTools": [],
       "error": null,
-      "runtimeSeconds": 0.09,
+      "runtimeSeconds": 0.1,
       "informational": false
     },
     {
@@ -1327,7 +1338,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "haiku",
-      "sessionId": "battery-mtc8eyhno997-triage-flaky-upload-002",
+      "sessionId": "battery-mtc9cbadxgfm-triage-flaky-upload-002",
+      "tenant": "battery-test",
       "toolTrajectory": [],
       "scores": {
         "Builtin.InstructionFollowing": 85,
@@ -1431,7 +1443,8 @@
       "status": "scored",
       "attempt": 1,
       "modelTier": "haiku",
-      "sessionId": "battery-mtc8eyhno997-triage-rootcause-comment-003",
+      "sessionId": "battery-mtc9cbadxgfm-triage-rootcause-comment-003",
+      "tenant": "battery-test",
       "toolTrajectory": [
         {
           "tool": "Tickets___add_comment",
@@ -1550,6 +1563,7 @@
       "retirement_reason": "template file — never runs; copy, edit, set status:active"
     }
   ],
+  "flakyFlags": [],
   "costEstimateUsd": 0.4,
-  "runtimeSeconds": 1.25
+  "runtimeSeconds": 1.3
 }

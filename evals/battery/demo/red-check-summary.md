@@ -1,8 +1,8 @@
 # Config-evals battery: ❌ FAIL
 
-- **Run:** `mtc8eyhno997` @ `6d5cd44649fdce0077b798d6c5a256e2874fde0f`
+- **Run:** `mtc9cbadxgfm` @ `cff23d5a0201bfb6a328280eb931419edd5f2834`
 - **Baseline:** `mock-synthetic-baseline` (backend: mock)
-- **Cost:** $0.4 — **Runtime:** 1.25s
+- **Cost:** $0.4 — **Runtime:** 1.3s
 - **Gating cases:** 13 compared against the baseline
 - **Overall:** baseline 85.6 → current 77.24 (Δ -8.36, scale 0-100)
 
@@ -90,13 +90,21 @@
 
 ## Floor violations
 - **qa-build-verification-002** / **Builtin.InstructionFollowing**: 20 < floor 80
+  - Judge: mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 43% of the reference persona contract (threshold 55%)
 - **qa-build-verification-002** / **persona_contract_compliance**: 20 < floor 80
+  - Judge: mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 43% of the reference persona contract (threshold 55%)
 - **qa-design-mismatch-003** / **Builtin.InstructionFollowing**: 20 < floor 80
+  - Judge: mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 29% of the reference persona contract (threshold 55%)
 - **qa-design-mismatch-003** / **persona_contract_compliance**: 20 < floor 80
+  - Judge: mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 29% of the reference persona contract (threshold 55%)
 - **qa-verifier-degradation-canary-004** / **Builtin.InstructionFollowing**: 20 < floor 80
+  - Judge: mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 33% of the reference persona contract (threshold 55%)
 - **qa-verifier-degradation-canary-004** / **persona_contract_compliance**: 20 < floor 80
+  - Judge: mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 33% of the reference persona contract (threshold 55%)
 - **qa-verifier-regression-001** / **Builtin.InstructionFollowing**: 20 < floor 80
+  - Judge: mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 33% of the reference persona contract (threshold 55%)
 - **qa-verifier-regression-001** / **persona_contract_compliance**: 20 < floor 80
+  - Judge: mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 33% of the reference persona contract (threshold 55%)
 
 ## Retired cases (excluded from execution — retirement is visible, never silent)
 - **template-copy-me-and-rename**: template file — never runs; copy, edit, set status:active

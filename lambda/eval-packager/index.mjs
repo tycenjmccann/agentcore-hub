@@ -92,6 +92,19 @@ function resolveAgentId(logGroup, agentList) {
   return match?.agentId || null;
 }
 
+/**
+ * TEAM-3090 defense-in-depth: config-evals battery sessions are hermetic
+ * (direct Bedrock Converse calls — they emit no OTEL and never reach these
+ * log groups by design), but if a battery-shaped session id ever shows up it
+ * must never be buffered to DynamoDB, batched to S3, or counted toward the
+ * improver flush. Battery session ids are `battery-<runId>-<caseId>`
+ * (evals/battery/lib/agent-runner.mjs). Exported pure so it is unit-testable
+ * without AWS mocks.
+ */
+export function isBatterySession(sessionId) {
+  return typeof sessionId === 'string' && sessionId.startsWith('battery-');
+}
+
 // ─── Handler ────────────────────────────────────────────────────────────────
 export const handler = async (event) => {
   // Decode CloudWatch Logs payload
@@ -196,6 +209,12 @@ function extractSessionData(parsed) {
       // batch counts RUNS, not log deliveries.
       const attrs = parsedMessage.attributes || {};
       const sid = attrs['session.id'] || parsedMessage['session.id'] || null;
+      // TEAM-3090: earliest-possible skip for battery sessions — the record
+      // never enters the buffer and never counts toward the improver flush.
+      if (isBatterySession(sid)) {
+        console.log(`[eval-packager] Skipping battery session ${sid} (config-evals battery guard)`);
+        continue;
+      }
       if (sid) sessionIds.add(sid);
       // Eval results are OTEL log records: everything lives in attributes under
       // gen_ai.* keys, NOT top-level fields. Reading parsedMessage.score/.evidence

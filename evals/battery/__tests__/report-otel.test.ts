@@ -38,10 +38,34 @@ describe("renderCheckSummary", () => {
       },
     };
     const caseResults = [
-      { id: "case-a", status: "scored", scores: { "Builtin.Correctness": 88 }, trajectory: [], modelTier: "haiku", attempt: 1 },
-      { id: "case-b", status: "scored", scores: { "Builtin.Helpfulness": 55 }, trajectory: [], modelTier: "haiku", attempt: 1 },
+      {
+        id: "case-a",
+        status: "scored",
+        scores: { "Builtin.Correctness": 88 },
+        details: { "Builtin.Correctness": { score: 88, label: "correct", explanation: "PASSING-CELL-EXPLANATION must stay out of the summary" } },
+        trajectory: [],
+        modelTier: "haiku",
+        attempt: 1,
+      },
+      {
+        id: "case-b",
+        status: "scored",
+        scores: { "Builtin.Helpfulness": 55 },
+        details: { "Builtin.Helpfulness": { score: 55, label: "partial", explanation: "BREACH-EXPLANATION: the agent skipped evidence gathering entirely" } },
+        trajectory: [],
+        modelTier: "haiku",
+        attempt: 1,
+      },
       { id: "case-new", status: "scored", scores: { "Builtin.Correctness": 91 }, trajectory: [], modelTier: "sonnet", attempt: 1 },
-      { id: "case-dead", status: "timed_out", error: "timed out after 180s", trajectory: [], modelTier: "haiku", attempt: 1 },
+      {
+        id: "case-dead",
+        status: "timed_out",
+        error: "timed out after 180s",
+        details: { "Builtin.Coherence": { score: 100, label: "coherent", explanation: `DEAD-CASE-EXPLANATION ${"x".repeat(500)}` } },
+        trajectory: [],
+        modelTier: "haiku",
+        attempt: 1,
+      },
     ];
     const suite = evaluateSuite({
       thresholds, baseline, caseResults, newCaseIds: ["case-new"], costEstimateUsd: 2.5, scoringBackend: "local-judge",
@@ -102,5 +126,55 @@ describe("renderCheckSummary", () => {
     expect(results.cases[0].attempt).toBe(1);
     expect(results.failureReasons.join()).toMatch(/case-b.*Builtin\.Helpfulness.*55.*70/);
     expect(results.scoringBackend).toBe("local-judge");
+  });
+
+  // TEAM-3090: judge explanations for failing cells, in the check text itself.
+  it("surfaces the judge explanation for a floor-breaching evaluator and keeps passing-cell explanations out", () => {
+    const md = renderCheckSummary(makeResults());
+    expect(md).toMatch(/Floor violations[\s\S]*case-b[\s\S]*Judge: BREACH-EXPLANATION/);
+    expect(md).not.toContain("PASSING-CELL-EXPLANATION");
+  });
+
+  it("surfaces collected explanations for non-scored cases, truncated to the cap", () => {
+    const md = renderCheckSummary(makeResults());
+    const section = md.split("## Non-scored cases")[1];
+    expect(section).toContain("DEAD-CASE-EXPLANATION");
+    expect(section).toContain("Builtin.Coherence");
+    expect(section).toContain("…"); // 500-char explanation is truncated
+    expect(section).not.toContain("x".repeat(450));
+  });
+
+  // TEAM-3090: flaky candidates are rendered, and only when present.
+  it("renders flaky candidates as informational and omits the section when none are flagged", () => {
+    const noFlags = renderCheckSummary(makeResults());
+    expect(noFlags).not.toContain("Flaky candidates");
+
+    const results = makeResults();
+    results.flakyFlags = [
+      {
+        caseId: "case-a",
+        flips: 2,
+        fingerprint: "fp-1",
+        window: [
+          { runId: "r1", ts: "t1", verdict: "pass" },
+          { runId: "r2", ts: "t2", verdict: "fail" },
+          { runId: "r3", ts: "t3", verdict: "pass" },
+        ],
+      },
+    ];
+    const md = renderCheckSummary(results);
+    expect(md).toMatch(/Flaky candidates \(informational — never changes the gate verdict\)/);
+    expect(md).toContain("status:retired PR");
+    expect(md).toMatch(/case-a.*2 flip\(s\).*\[pass → fail → pass\]/);
+    // flags never touch the verdict fields (the shared fixture's timed_out
+    // case makes the verdict ERRORED per TEAM-3295 — still unaffected by flags)
+    expect(results.verdict).toBe("ERRORED");
+    expect(results.failureReasons.join()).not.toContain("flaky");
+  });
+
+  // TEAM-3090 item 4: tenant plumbing is carried per case.
+  it("carries the per-case tenant field (null when the runner did not set one)", () => {
+    const results = makeResults();
+    expect(results.cases.every((c: any) => "tenant" in c)).toBe(true);
   });
 });
