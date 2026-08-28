@@ -76,15 +76,26 @@ The shipped design (`checkSeenSet` / `claimSeenSet` in
   (TEAM-3385 finding 2). Instead:
   - `checkSeenSet` — read-only `BatchGetItem` (100 distinct keys per request),
     run before classification, aggregation and buffering. A hit is a duplicate
-    unless the stored claim is an `error` and the incoming row is `scored` — a
-    success supersedes an error claim for the same attempt (TEAM-3385
-    finding 3). Drops are filtered out of `evaluatorResults` and added to
+    unless the incoming row is `scored` and the stored claim is anything but
+    `scored` — a success supersedes every non-`scored` claim (`error`, `other`,
+    or a legacy item with no `outcome` attribute at all) for the same attempt,
+    mirroring `OUTCOME_RANK` (`scored` > `other` > `error`)
+    (`lambda/eval-packager/index.mjs:805-813`). TEAM-3385 finding 3 established
+    the original scored-beats-error rule; TEAM-3406 (F2) widened it from
+    error-only to all non-scored claims, since a pending row or a sampled-out
+    delivery also claims its keys with `other`, and under the old rule a later
+    scored row for the same attempt was dropped as a duplicate instead of
+    superseding it. Drops are filtered out of `evaluatorResults` and added to
     `duplicatesDropped`.
   - `claimSeenSet` — per-key conditional `PutItem`
-    (`attribute_not_exists(dedupKey)`; a `scored` claim may also overwrite an
-    `error` claim), storing `{dedupKey, expiresAt, outcome}`, run only after
-    the delivery is durably buffered (or finally discarded by the sample-rate
-    gate);
+    (`attribute_not_exists(dedupKey)` for a non-`scored` claim; a `scored`
+    claim instead uses `attribute_not_exists(dedupKey) OR
+    attribute_not_exists(#outcome) OR #outcome <> :scored`, so it may overwrite
+    any existing non-`scored` claim — including a legacy claim with no
+    `outcome` attribute, since DynamoDB treats a comparison against a missing
+    attribute as false — `lambda/eval-packager/index.mjs:894-902`), storing
+    `{dedupKey, expiresAt, outcome}`, run only after the delivery is durably
+    buffered (or finally discarded by the sample-rate gate);
 - TTL 24h on `expiresAt` (a duplicate arriving later than that is not a
   delivery artifact);
 - **fail-open**, as originally specified: table unset/missing, SDK unavailable,
