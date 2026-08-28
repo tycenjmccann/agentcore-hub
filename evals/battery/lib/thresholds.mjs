@@ -23,6 +23,13 @@ export function deriveFloor({ baselineMean, thresholds, override }) {
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 const round2 = (x) => Math.round(x * 100) / 100;
 
+// Statuses caused by infrastructure (transport failure, deadline, aborted
+// run), as opposed to behavioral failures (forbidden/required tool) or score
+// breaches. They make the suite verdict ERRORED instead of FAIL — still a
+// failing outcome (exit 1, red check), but operators know to re-run rather
+// than hunt for a score regression.
+const INFRA_STATUSES = new Set(["errored", "timed_out", "skipped", "unscored"]);
+
 /**
  * caseResults: [{ id, status, scores: {evaluator: 0-100}, evaluator_floors?, error? }]
  *   status ∈ scored | errored | timed_out | skipped | unscored |
@@ -47,6 +54,7 @@ export function evaluateSuite({
 }) {
   const failureReasons = [];
   const deltaRows = [];
+  const infraCases = [];
   const bootstrapBaseline = baseline?.bootstrap === true;
   const newIds = new Set(bootstrapBaseline ? caseResults.map((c) => c.id) : newCaseIds || []);
   /** Cases that were scored AND compared against a baseline entry (B3). */
@@ -79,6 +87,7 @@ export function evaluateSuite({
       failureReasons.push(
         `case ${result.id}: status '${result.status}'${result.error ? ` (${result.error})` : ""} — non-scored case fails the gate`
       );
+      if (INFRA_STATUSES.has(result.status)) infraCases.push(result.id);
       continue;
     }
 
@@ -165,10 +174,18 @@ export function evaluateSuite({
     );
   }
 
+  // Verdict is never neutral: ERRORED and FAIL both exit non-zero and publish
+  // a red check. ERRORED means infra/timeout corrupted the run (re-run it);
+  // FAIL means the run completed and the scores (or guards) said no. Infra
+  // wins when both apply — an incomplete run can't render a score verdict.
+  let verdict = "PASS";
+  if (failureReasons.length > 0) verdict = infraCases.length > 0 ? "ERRORED" : "FAIL";
+
   return {
-    verdict: failureReasons.length === 0 ? "PASS" : "FAIL",
+    verdict,
     failureReasons,
     deltaRows,
+    infraCases,
     informationalCases: [...newIds].filter((id) => caseResults.some((c) => c.id === id)),
     gatingCases: [...gatingCaseIds],
     bootstrapBaseline,

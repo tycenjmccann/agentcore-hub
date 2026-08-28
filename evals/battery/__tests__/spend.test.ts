@@ -86,7 +86,9 @@ describe("mid-run ceiling inside a case", () => {
     expect(i).toBe(2); // third turn never dispatched
     expect(ledger.exceeded).toBe(true);
 
-    // The runner then skips whatever had not started, and the suite must FAIL.
+    // The runner then skips whatever had not started, and the suite must fail
+    // — as ERRORED (TEAM-3295): the aborted run is an infra outcome, not a
+    // score verdict. Still red, still exit 1.
     ledger.noteAborted("case-c");
     const suite = evaluateSuite({
       thresholds: THRESHOLDS,
@@ -101,7 +103,8 @@ describe("mid-run ceiling inside a case", () => {
       scoringBackend: "local-judge",
       costCeilingReasons: ledger.failureReasons(),
     });
-    expect(suite.verdict).toBe("FAIL");
+    expect(suite.verdict).toBe("ERRORED");
+    expect(suite.verdict).not.toBe("PASS");
     const reasons = suite.failureReasons.join("\n");
     expect(reasons).toContain("run spend ceiling exceeded");
     expect(reasons).toContain("Aborted/unrun case(s):");

@@ -32,6 +32,9 @@ export function buildResults({
     scoringBackend,
     verdict: suite.verdict,
     failureReasons: suite.failureReasons,
+    // Cases lost to infra (transport/deadline/abort) — what made an ERRORED
+    // verdict ERRORED instead of FAIL. Still a failing outcome either way.
+    infraCases: suite.infraCases ?? [],
     // Where the gating rules came from (base ref vs PR head) and whether the
     // baseline was still a bootstrap placeholder — both decide the verdict.
     configSources: configSources ?? null,
@@ -69,6 +72,12 @@ export function renderCheckSummary(results) {
   const icon = results.verdict === "PASS" ? "✅" : "❌";
   lines.push(`# Config-evals battery: ${icon} ${results.verdict}`);
   lines.push("");
+  if (results.verdict === "ERRORED") {
+    lines.push(
+      `- ⚠️ **ERRORED** — infra/timeout corrupted ${(results.infraCases || []).length} case(s) ` +
+        "(see Non-scored cases). Still a failing check (fail closed); re-run the job rather than hunting for a score regression."
+    );
+  }
   lines.push(`- **Run:** \`${results.runId}\` @ \`${results.configSha}\``);
   lines.push(`- **Baseline:** \`${results.baselineSha}\` (backend: ${results.scoringBackend})`);
   lines.push(`- **Cost:** $${results.costEstimateUsd} — **Runtime:** ${results.runtimeSeconds}s`);

@@ -59,7 +59,9 @@
 # Both variables are required; an empty reason still refuses. The override is
 # recorded to s3://$ARTIFACT_BUCKET/eval-gate/overrides/<ts>-<sha>.txt AND to
 # .eval-gate-overrides.log (gitignored). If the S3 write fails you must type
-# OVERRIDE-UNAUDITED at a real tty; non-interactive + unaudited refuses.
+# OVERRIDE-UNAUDITED at a real tty — and the LOCAL log append must have
+# succeeded (some audit record must exist somewhere). Non-interactive + no S3
+# audit refuses; S3 AND local both failing refuses even at a tty (TEAM-3295).
 
 EVAL_GATE_CHECK_NAME="config-evals-gate"
 EVAL_GATE_BELT_MAX=100
@@ -271,9 +273,10 @@ _eval_gate_break_glass() {
   fi
 
   log_file="$repo_root/.eval-gate-overrides.log"
-  local_ok=1
-  if ! printf '%s\n' "$record" >>"$log_file" 2>/dev/null; then
-    local_ok=0
+  local_ok=0
+  if printf '%s\n' "$record" >>"$log_file" 2>/dev/null; then
+    local_ok=1
+  else
     echo "eval-gate: WARNING — could not append to $log_file" >&2
   fi
 
@@ -290,10 +293,12 @@ _eval_gate_break_glass() {
 
   if [ "$s3_ok" != "1" ]; then
     echo "eval-gate: S3 audit write FAILED (ARTIFACT_BUCKET='${ARTIFACT_BUCKET:-unset}')." >&2
+    # BG-3/FR-3.3 (TEAM-3295 + TEAM-3388): proceeding without the S3 record
+    # requires that the LOCAL audit record exists. Both writes failed ⇒ no
+    # durable audit record can be written ⇒ no audit record exists anywhere ⇒
+    # refuse unconditionally, interactive or not.
     if [ "$local_ok" != "1" ]; then
-      # FR-3.3: both audit sinks failed — ZERO durable record of this override
-      # would exist. Refuse outright, even at an interactive tty.
-      echo "eval-gate: the local append to $log_file ALSO failed — no durable audit record of this override can be written; refusing (FR-3.3: an override with zero audit trail is never allowed)." >&2
+      echo "eval-gate: the local audit append to $log_file ALSO failed — no durable audit record of this override can be written; no audit record exists anywhere; refusing (BG-3/FR-3.3: an override with zero audit trail is never allowed)." >&2
       return 1
     fi
     if { true </dev/tty; } 2>/dev/null; then
