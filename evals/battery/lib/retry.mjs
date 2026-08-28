@@ -34,6 +34,7 @@ export function sleep(ms, signal) {
  * A retry budget bounded in both attempts and wall-clock elapsed time.
  * `tryConsume()` returns false once either bound is spent — the caller then
  * surfaces the original error instead of retrying.
+ * @param {{ maxRetries: number, maxElapsedMs?: number, now?: () => number }} budget
  */
 export function createRetryBudget({ maxRetries, maxElapsedMs = Infinity, now = () => Date.now() } = {}) {
   const startedAt = now();

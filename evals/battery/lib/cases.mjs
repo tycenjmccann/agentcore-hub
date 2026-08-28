@@ -388,7 +388,7 @@ export function resolveGateConfig({ repoRoot, baseRef, head, gitShow }) {
   const resurrectedCases = [];
   /** id → case def with the base-ref gating knobs applied. */
   const effectiveCaseDefs = new Map();
-  /** id → where this case's gating knobs came from. */
+  /** id → where this case's gating knobs came from. @type {Record<string, string>} */
   const caseSources = {};
   for (const id of baseActiveIds || []) {
     const headCase = headById.get(id);

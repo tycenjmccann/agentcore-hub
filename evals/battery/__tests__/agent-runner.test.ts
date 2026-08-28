@@ -24,6 +24,10 @@ const NO_TRAJECTORY_CASE = {
   referenceInputs: { ...QA_CASE.referenceInputs, expectedToolTrajectory: [] },
 };
 
+// runCase requires the runner's end-to-end deadline signal. These tests drive
+// timeouts via caseDef.timeoutSeconds, so this signal never aborts.
+const signal = new AbortController().signal;
+
 const endTurn = (text = "Done.") => ({
   stopReason: "end_turn",
   usage: { inputTokens: 100, outputTokens: 10 },
@@ -43,7 +47,7 @@ describe("happy path", () => {
       endTurn(),
     ];
     let i = 0;
-    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t1", converse: async () => script[i++] });
+    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t1", converse: async () => script[i++], signal });
     expect(run.status).toBe("completed");
     expect(run.attempt).toBe(1);
     expect(run.trajectory.map((t: any) => t.tool)).toEqual(["load_blueprint", "WorkflowOutput___report_completion"]);
@@ -60,7 +64,7 @@ describe("forbidden-tool enforcement (mechanical, no judge)", () => {
       endTurn(),
     ];
     let i = 0;
-    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t2", converse: async () => script[i++] });
+    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t2", converse: async () => script[i++], signal });
     // Status alone gates scoring: run-battery only judges 'completed' cases,
     // so a forbidden hit is a case FAIL with zero judge spend.
     expect(run.status).toBe("failed_forbidden_tool");
@@ -77,9 +81,10 @@ describe("timeout watchdog", () => {
         signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
       });
     const fastCase = { ...QA_CASE, timeoutSeconds: 0.05 };
-    const run = await runCase({ caseDef: fastCase, repoRoot: REPO_ROOT, runId: "t3", converse: hang });
+    const run = await runCase({ caseDef: fastCase, repoRoot: REPO_ROOT, runId: "t3", converse: hang, signal });
     expect(run.status).toBe("timed_out");
     expect(run.attempt).toBe(1);
+    if (!("error" in run)) throw new Error(`expected a timed_out run with an error, got '${run.status}'`);
     expect(run.error).toContain("timed out");
     expect(calls).toBe(1);
   });
@@ -93,7 +98,7 @@ describe("transport retry policy (FR-10: single retry, typed errors only)", () =
       if (calls === 1) throw Object.assign(new Error("slow down"), { name: "ThrottlingException" });
       return endTurn();
     };
-    const run = await runCase({ caseDef: NO_TRAJECTORY_CASE, repoRoot: REPO_ROOT, runId: "t4", converse });
+    const run = await runCase({ caseDef: NO_TRAJECTORY_CASE, repoRoot: REPO_ROOT, runId: "t4", converse, signal });
     expect(run.status).toBe("completed");
     expect(run.attempt).toBe(2);
     expect(calls).toBe(2);
@@ -105,7 +110,7 @@ describe("transport retry policy (FR-10: single retry, typed errors only)", () =
       calls++;
       throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
     };
-    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t5", converse });
+    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t5", converse, signal });
     expect(run.status).toBe("errored");
     expect(run.attempt).toBe(2);
     expect(calls).toBe(2);
@@ -117,7 +122,7 @@ describe("transport retry policy (FR-10: single retry, typed errors only)", () =
       calls++;
       throw Object.assign(new Error("bad input"), { name: "ValidationException" });
     };
-    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t6", converse });
+    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t6", converse, signal });
     expect(run.status).toBe("errored");
     expect(run.attempt).toBe(1);
     expect(calls).toBe(1);
@@ -147,7 +152,7 @@ describe("required-tool enforcement (mechanical, no judge)", () => {
   it("fails a run that never calls a non-optional expectedToolTrajectory tool", async () => {
     // QA_CASE requires load_blueprint and WorkflowOutput___report_completion;
     // this agent answers in prose without touching either.
-    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t7", converse: async () => endTurn() });
+    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t7", converse: async () => endTurn(), signal });
     expect(run.status).toBe("failed_required_tool");
     expect(run.missingRequiredTools).toEqual(["load_blueprint", "WorkflowOutput___report_completion"]);
   });
@@ -165,7 +170,7 @@ describe("required-tool enforcement (mechanical, no judge)", () => {
     };
     const script = [toolUse("load_blueprint", { blueprint_name: "qa-verifier" }), endTurn()];
     let i = 0;
-    const run = await runCase({ caseDef, repoRoot: REPO_ROOT, runId: "t8", converse: async () => script[i++] });
+    const run = await runCase({ caseDef, repoRoot: REPO_ROOT, runId: "t8", converse: async () => script[i++], signal });
     expect(run.status).toBe("completed");
     expect(run.missingRequiredTools).toEqual([]);
   });
@@ -176,7 +181,7 @@ describe("required-tool enforcement (mechanical, no judge)", () => {
       endTurn(),
     ];
     let i = 0;
-    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t9", converse: async () => script[i++] });
+    const run = await runCase({ caseDef: QA_CASE, repoRoot: REPO_ROOT, runId: "t9", converse: async () => script[i++], signal });
     expect(run.status).toBe("failed_forbidden_tool");
   });
 });

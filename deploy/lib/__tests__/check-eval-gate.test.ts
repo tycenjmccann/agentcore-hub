@@ -133,6 +133,7 @@ function runGate(
       cwd: repo,
       encoding: "utf8",
       env: {
+        NODE_ENV: "test",
         PATH: `${binDir}:/usr/local/bin:/usr/bin:/bin`,
         HOME: fakeHome,
         GH_CALL_LOG: callLog,
