@@ -184,6 +184,35 @@ same interface. The active backend name is recorded in both `baseline.json`
 and every results file — **a backend mismatch between baseline and current run
 is a gate failure** (fail closed; scores across backends are not comparable).
 
+## Mock mode / local demo (TEAM-3295)
+
+`node evals/battery/run-battery.mjs --mock` runs the FULL pipeline — case
+loading, hermetic stub registry, mechanical required/forbidden-tool checks,
+gate math, check summary, exit codes — with a deterministic local transport
+(`lib/mock-transport.mjs`) and a synthetic in-memory baseline. **Zero AWS
+calls** (the Bedrock transport is never constructed; unit-asserted), ~1s for
+all 13 cases.
+
+The mock judge is sensitive to working-tree prompt degradation via the
+TEAM-3352 mechanism: for cases pinning `referenceInputs.personaContract`, the
+contract-sensitive evaluators (`persona_contract_compliance`,
+`Builtin.InstructionFollowing`) score healthy only while the target agent's
+working-tree prompt still carries its contract clauses (token-coverage
+heuristic, calibrated margins). So:
+
+- **innocuous edit** (whitespace/comment) → scores reproduce the synthetic
+  baseline → **PASS**;
+- **degraded qa-verifier prompt** (FIRST STEP / CRITICAL RULES stripped) →
+  floor breaches on the qa-* cases naming the responsible evaluators →
+  **FAIL**, exit 1.
+
+Captured demo output for both scenarios lives in `demo/` (see
+`demo/README.md` to regenerate). `--mock` is refused alongside
+`--baseline-mode`/`--base-ref`: it is a local demo, never gate evidence — mock
+results are stamped `scoringBackend: "mock"` and can never be compared against
+a `local-judge` baseline (backend mismatch fails closed). The committed
+bootstrap `baseline.json` and its B1 guard are untouched by mock runs.
+
 ## CI AWS credentials (one-time setup)
 
 The `battery` job in `.github/workflows/config-evals-gate.yml` (and the
