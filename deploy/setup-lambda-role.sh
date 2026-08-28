@@ -27,6 +27,10 @@ REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ROLE_NAME="agentcore-hub-lambda-role"
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+# eval-packager's cross-delivery dedup seen-set. Overridable, and the default
+# must match index.mjs's SEEN_TABLE fallback + the table
+# deploy/continuous-improvement/deploy-all.sh creates.
+EVAL_SEEN_TABLE="${EVAL_SEEN_TABLE:-agentcore-hub-eval-seen}"
 
 # Trust policy — Lambda service can assume this role.
 TRUST_POLICY=$(cat <<EOF
@@ -70,6 +74,11 @@ echo "   ✓ Attached AWSLambdaBasicExecutionRole"
 #   agentcore-hub-workflows     (orchestrator, agent-invoker)
 #   agentcore-hub-events        (orchestrator, events-writer, workflow-output)
 #   agentcore-hub-eval-config   (eval-packager, token-aggregator)
+#   agentcore-hub-eval-seen     (eval-packager dedup seen-set — conditional
+#                                PutItem per keyed evaluator-result row, plus
+#                                Get/BatchGet for the read-before-claim path.
+#                                Without this grant every PutItem is denied and
+#                                the seen-set fails OPEN, i.e. dedup is inert.)
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "DynamoDBAccess" \
@@ -103,10 +112,23 @@ aws iam put-role-policy \
           \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-workflow-analyses\",
           \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-workflow-analyses/index/*\"
         ]
+      },
+      {
+        \"Sid\": \"EvalSeenSetDedup\",
+        \"Effect\": \"Allow\",
+        \"Action\": [
+          \"dynamodb:GetItem\",
+          \"dynamodb:BatchGetItem\",
+          \"dynamodb:PutItem\",
+          \"dynamodb:DeleteItem\",
+          \"dynamodb:DescribeTable\"
+        ],
+        \"Resource\": \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${EVAL_SEEN_TABLE}\"
       }
     ]
   }"
 echo "   ✓ Attached DynamoDB CRUD (tickets, workflows, events, eval-config, workflow-analyses)"
+echo "   ✓ Attached DynamoDB dedup access on ${EVAL_SEEN_TABLE} (Get/BatchGet/Put/Delete)"
 
 # ─── DynamoDB Streams read (orchestrator trigger on tickets) ─────────────────
 aws iam put-role-policy \

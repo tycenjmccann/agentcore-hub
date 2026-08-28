@@ -1,5 +1,23 @@
 #!/bin/bash
 # Deploy the Continuous Improvement Loop
+#
+# DEPLOY ORDER (see .claude-plugin/bin/run-module.sh, module `evaluations`):
+#   1. deploy/setup-lambda-role.sh          — the shared Lambda role, incl. the
+#                                             DynamoDB grants on eval-config and
+#                                             the eval-seen dedup table
+#   2. deploy/continuous-improvement/deploy-all.sh
+#                                           — creates BOTH DynamoDB tables
+#                                             (agentcore-hub-eval-config and
+#                                             agentcore-hub-eval-seen, the latter
+#                                             with TTL on expiresAt) and seeds
+#                                             one config row per fleet agent
+#   3. deploy/evaluations/setup-evaluations.sh
+#   4. THIS SCRIPT                          — the Lambdas, CW Logs subscriptions,
+#                                             alarms and S3/EventBridge wiring
+# Running this before step 2 leaves eval-packager pointed at a table that does
+# not exist: every seen-set PutItem throws, dedup fails OPEN (see
+# dedupeAgainstSeenSet in lambda/eval-packager/index.mjs) and cross-delivery
+# duplicates double-count the rolling eval aggregates.
 set -e
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -9,6 +27,9 @@ BUCKET="$ARTIFACT_BUCKET"
 ROLE_ARN="$LAMBDA_ROLE_ARN"
 WORKFLOW_API="${DEPLOYMENT_URL:-}"
 FLEET_REPO="$FLEET_REPO_URL"
+# Cross-delivery dedup seen-set (config.sh defaults it to agentcore-hub-eval-seen,
+# matching index.mjs and the table deploy-all.sh creates).
+SEEN_TABLE="$EVAL_SEEN_TABLE"
 
 # Resolve the Fleet Improver runtime ARN dynamically (no hardcoded suffix —
 # the runtime id is account-specific). eval-packager invokes this on flush to
@@ -93,8 +114,15 @@ deploy_lambda() {
 # 600s timeout: invokeImprover allows up to 240s, and the handleOverflow path can
 # chain a second flush (its own synthesis) before retrying the append. 300s left
 # no margin for that worst case; 600s clears it plus DDB/S3/CW Logs overhead.
+#
+# EVAL_SEEN_TABLE names the cross-delivery dedup seen-set (PK dedupKey, TTL on
+# expiresAt). index.mjs defaults to the same name, but it must be set EXPLICITLY:
+# the table's existence is a deploy-order dependency on ./deploy-all.sh (which
+# creates it) and on deploy/setup-lambda-role.sh (which grants Put/Get on it) —
+# naming it here makes the wiring visible in the function config instead of
+# hiding a silently fail-open dedup layer behind a code default.
 deploy_lambda "eval-packager" "eval-packager" 600 512 \
-  "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ARN=${IMPROVER_ARN},AWS_ACCOUNT_ID=${ACCOUNT_ID}}"
+  "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ARN=${IMPROVER_ARN},AWS_ACCOUNT_ID=${ACCOUNT_ID},EVAL_SEEN_TABLE=${SEEN_TABLE}}"
 
 deploy_lambda "prd-submitter" "prd-submitter" 30 256 \
   "{ARTIFACT_BUCKET=${BUCKET},WORKFLOW_API_URL=${WORKFLOW_API},FLEET_REPO_URL=${FLEET_REPO}}"

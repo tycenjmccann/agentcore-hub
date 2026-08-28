@@ -14,6 +14,12 @@
  *
  * Environment Variables:
  *   EVAL_CONFIG_TABLE       — DynamoDB table name (default: agentcore-hub-eval-config)
+ *   EVAL_SEEN_TABLE         — cross-delivery dedup seen-set table
+ *                             (default: agentcore-hub-eval-seen; PK dedupKey,
+ *                             TTL on expiresAt). Created by
+ *                             deploy/continuous-improvement/deploy-all.sh and
+ *                             set on the Lambda by that directory's deploy.sh.
+ *                             Set to '' to disable the persistent check.
  *   ARTIFACTS_BUCKET        — S3 bucket for batch + PRD output
  *   IMPROVEMENT_AGENT_ARN   — Fleet Improver runtime ARN (preferred). If unset,
  *                             flush archives the raw batch but skips synthesis.
@@ -290,17 +296,44 @@ export function hasNoDedupKey(r) {
 }
 
 /**
+ * A DynamoDB partition-key value caps at 2048 BYTES, and dedupKey is the seen-set
+ * table's partition key — an oversized key makes every conditional PutItem throw
+ * ValidationException, i.e. the whole seen-set fails open permanently and silently
+ * (TEAM-3385). The unparseable-row path was the guaranteed offender (it embedded
+ * the raw log line; contentFingerprint replaces it below), but nothing bounds a
+ * pathological requestId / evaluatorName / sessionId either, so every key is
+ * passed through this cap. 1024 bytes leaves generous headroom under the limit.
+ */
+const DEDUP_KEY_MAX_BYTES = 1024;
+// Chars, not bytes, for the truncated prefix: 400 UTF-16 chars is at most ~1600
+// UTF-8 bytes, so prefix + '|' + 16-hex fingerprint stays well under the cap
+// whatever the encoding.
+const DEDUP_KEY_PREFIX_CHARS = 400;
+
+/**
+ * Cap a dedup key at DEDUP_KEY_MAX_BYTES, keeping a readable prefix and
+ * appending a fingerprint of the WHOLE key — so two over-long keys sharing a
+ * prefix stay distinct, and the same over-long key re-delivered still collapses.
+ */
+function boundDedupKey(key) {
+  if (Buffer.byteLength(key, 'utf8') <= DEDUP_KEY_MAX_BYTES) return key;
+  return `${key.slice(0, DEDUP_KEY_PREFIX_CHARS)}|${contentFingerprint(key)}`;
+}
+
+/**
  * TEAM-3376: the stable dedup key for one evaluator-result row — the single
  * keying rule shared by the in-memory pass (dedupeResults), the flush-time
  * re-dedup (dedupeBufferedSessions), and the cross-delivery DynamoDB seen-set
  * (dedupeAgainstSeenSet), whose partition key it is — so it must be stable
  * across deliveries (contentFingerprint is byte-derived, so it is).
  *
- * Keyed by requestId when the record carried one; unparseable rows key on
- * their raw text; everything else takes the content key, whose trailing
- * contentHash separates two distinct results that share metadata AND the
- * delivery's millisecond timestamp (TEAM-3381) while a genuine retry write
- * re-sends the same bytes and still collapses.
+ * Keyed by requestId when the record carried one; unparseable rows key on a
+ * FINGERPRINT of their raw text (TEAM-3385 — the raw text itself is unbounded
+ * and blew the 2048-byte partition-key limit, see boundDedupKey above);
+ * everything else takes the content key, whose trailing contentHash separates
+ * two distinct results that share metadata AND the delivery's millisecond
+ * timestamp (TEAM-3381) while a genuine retry write re-sends the same bytes and
+ * still collapses.
  *
  * Returns null for a row with no usable identity at all (hasNoDedupKey above)
  * — such rows FAIL OPEN through every dedup layer: retaining a possible
@@ -313,10 +346,15 @@ export function dedupKeyFor(r) {
     // eval run emits about ONE evaluated span (correctness, helpfulness, …)
     // can share that span's trace/span ids, and those are distinct results,
     // not duplicates. Retries of the same record share both fields.
-    return `req|${r.requestId}|${r.evaluatorName ?? ''}`;
+    return boundDedupKey(`req|${r.requestId}|${r.evaluatorName ?? ''}`);
   }
-  if (r.parseError) return `raw|${r.timestamp}|${r.rawMessage}`;
-  return `content|${r.sessionId}|${r.evaluatorName}|${r.evaluationName ?? ''}|${r.score}|${r.timestamp}|${r.contentHash ?? ''}`;
+  // Byte-derived, so two different platform lines that happen to share a
+  // timestamp still get distinct keys and a re-delivered line keeps the same one
+  // — the same guarantee the raw text gave, in a constant ~35 chars.
+  if (r.parseError) return `raw|${r.timestamp}|${contentFingerprint(r.rawMessage)}`;
+  return boundDedupKey(
+    `content|${r.sessionId}|${r.evaluatorName}|${r.evaluationName ?? ''}|${r.score}|${r.timestamp}|${r.contentHash ?? ''}`
+  );
 }
 
 /**

@@ -1057,13 +1057,20 @@ describe('dedup fail-open + content fingerprint (TEAM-3381)', () => {
   let dedupeBufferedSessions;
   let hasNoDedupKey;
   let contentFingerprint;
+  let dedupKeyFor;
 
   beforeAll(async () => {
     process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
     process.env.AWS_REGION ??= 'us-east-1';
     vi.resetModules();
-    ({ extractSessionData, dedupeResults, dedupeBufferedSessions, hasNoDedupKey, contentFingerprint } =
-      await import('./index.mjs'));
+    ({
+      extractSessionData,
+      dedupeResults,
+      dedupeBufferedSessions,
+      hasNoDedupKey,
+      contentFingerprint,
+      dedupKeyFor,
+    } = await import('./index.mjs'));
   });
 
   const delivery = (logEvents) => ({
@@ -1186,6 +1193,87 @@ describe('dedup fail-open + content fingerprint (TEAM-3381)', () => {
     expect(sessions[0].evaluatorResults).toEqual([dup]);
     expect(sessions[1]).toEqual({ logStream: 'stream-b', sessionIds: ['s1'], evaluatorResults: [] });
     expect(sessions[2]).toEqual({ logStream: 'stream-c' });
+  });
+
+  // ── dedupKey size bound (TEAM-3385 finding 4) ─────────────────────────────
+  // dedupKey is the seen-set table's PARTITION KEY, and DynamoDB caps a partition
+  // key at 2048 bytes. The parseError path used to embed the whole raw log line,
+  // so any line over ~2KB made every conditional PutItem throw
+  // ValidationException — the seen-set then failed OPEN forever and dedup was
+  // silently inert. The fingerprint keeps the same identity guarantees at a
+  // constant size.
+  describe('dedupKey stays inside the DynamoDB 2048-byte partition-key limit', () => {
+    /** A log line that is not JSON, so extractSessionData takes the parseError path. */
+    const unparseableEvent = (timestamp, rawMessage) => ({ timestamp, message: rawMessage });
+
+    it('a >4KB unparseable line produces a dedupKey under 256 chars', () => {
+      const huge = `START RequestId: ${'x'.repeat(4096)}`;
+      const [row] = extractSessionData(delivery([unparseableEvent(1_756_250_000_000, huge)]))
+        .evaluatorResults;
+
+      expect(row.parseError).toBe(true);
+      expect(row.dedupKey.length).toBeLessThan(256);
+      // The raw text itself must not ride along in the key.
+      expect(row.dedupKey).not.toContain('xxxx');
+      expect(row.dedupKey).toBe(`raw|1756250000000|${contentFingerprint(huge)}`);
+    });
+
+    it('two DIFFERENT raw messages sharing a timestamp still get distinct keys', () => {
+      const rows = extractSessionData(
+        delivery([
+          unparseableEvent(1_756_250_000_000, `REPORT Duration: 1 ms ${'a'.repeat(5000)}`),
+          unparseableEvent(1_756_250_000_000, `REPORT Duration: 2 ms ${'a'.repeat(5000)}`),
+        ])
+      ).evaluatorResults;
+
+      expect(rows).toHaveLength(2);
+      expect(rows[0].dedupKey).not.toBe(rows[1].dedupKey);
+    });
+
+    it('the IDENTICAL raw message re-delivered gets the SAME key (so it still collapses)', () => {
+      const line = `START RequestId: ${'y'.repeat(3000)}`;
+      const first = extractSessionData(delivery([unparseableEvent(1_756_250_000_000, line)]));
+      // A second CloudWatch delivery of the same log event: same ms, same bytes.
+      const second = extractSessionData(delivery([unparseableEvent(1_756_250_000_000, line)]));
+
+      expect(first.evaluatorResults[0].dedupKey).toBe(second.evaluatorResults[0].dedupKey);
+      // And within ONE delivery the pair collapses in the in-memory pass.
+      const sameDelivery = extractSessionData(
+        delivery([
+          unparseableEvent(1_756_250_000_000, line),
+          unparseableEvent(1_756_250_000_000, line),
+        ])
+      );
+      expect(sameDelivery.evaluatorResults).toHaveLength(1);
+      expect(sameDelivery.duplicatesDropped).toBe(1);
+    });
+
+    it('no dedupKey variant exceeds the limit, even with pathological field values', () => {
+      const long = 'z'.repeat(9000);
+      const keys = [
+        // request-id path
+        dedupKeyFor({ timestamp: 1, requestId: long, evaluatorName: long }),
+        // content path
+        dedupKeyFor({
+          timestamp: 1,
+          sessionId: long,
+          evaluatorName: long,
+          evaluationName: long,
+          score: 8,
+          contentHash: 'abcd',
+        }),
+        // unparseable path
+        dedupKeyFor({ timestamp: 1, parseError: true, rawMessage: long }),
+      ];
+      for (const key of keys) {
+        expect(Buffer.byteLength(key, 'utf8')).toBeLessThanOrEqual(2048);
+      }
+      // Truncation is fingerprint-suffixed, so two over-long keys sharing a
+      // prefix stay distinct instead of colliding into one.
+      const a = dedupKeyFor({ timestamp: 1, requestId: `${long}-a`, evaluatorName: 'e' });
+      const b = dedupKeyFor({ timestamp: 1, requestId: `${long}-b`, evaluatorName: 'e' });
+      expect(a).not.toBe(b);
+    });
   });
 
   it('records carrying a request id get no fingerprint (nothing added to the buffer payload)', () => {
