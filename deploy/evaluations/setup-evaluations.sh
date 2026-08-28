@@ -130,9 +130,10 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
 
 # --- Reconciling live configs after a matrix/sampling change (TEAM-3376) ---
 # `agentcore eval online create` does not update in place: re-running this
-# script against an account that already has configs leaves the OLD configs
-# live (create fails or duplicates, per CLI version). To reconcile after a
-# change to the evaluator matrix, sampling tiers, or fleet redeployment:
+# script against an account that already has configs SKIPS every existing
+# eval_<name> config (TEAM-3389 idempotency guard in the loop below) and
+# leaves the OLD configs live. To reconcile after a change to the evaluator
+# matrix, sampling tiers, or fleet redeployment:
 #
 #   1. List what's live and diff against expectation — exactly one config per
 #      fleet agent (eval_<agentId>), 5 evaluators each, the custom
@@ -188,16 +189,45 @@ echo "Reading agent IDs from: $FLEET_FILE"
 
 # The custom dependency-chain evaluator is created per-account and is NOT
 # provisioned by any deploy step in this repo (its ID is account-specific).
-# Probe for it once. If it's missing, requirements_analyst gracefully falls
-# back to 5 built-in evaluators (adding Builtin.Helpfulness in the fifth slot,
-# like every other agent) instead of emitting a config that the API rejects
-# with "Evaluators not found".
+# Probe for it once, fail-loud (TEAM-3389): the Builtin.Helpfulness fallback
+# for requirements_analyst fires ONLY on a CONFIRMED absence — a list call
+# that succeeded and genuinely lacks the evaluator id. If the list command
+# itself fails (expired creds, missing CLI, API error) or its output looks
+# truncated, this script ABORTS instead of silently recreating
+# requirements_analyst's live config without the dependency-chain evaluator.
 CUSTOM_EVALUATOR_AVAILABLE=false
-if AGENTCORE_SUPPRESS_RECOMMENDATION=1 agentcore eval evaluator list --max-results 100 2>/dev/null \
-     | grep -q "$CUSTOM_EVALUATOR"; then
+evaluator_list_out=$(AGENTCORE_SUPPRESS_RECOMMENDATION=1 agentcore eval evaluator list --max-results 100 2>&1) \
+  && evaluator_list_rc=0 || evaluator_list_rc=$?
+
+if [ "$evaluator_list_rc" -ne 0 ]; then
+  echo ""
+  echo "✗ ERROR: 'agentcore eval evaluator list' failed (exit ${evaluator_list_rc}):"
+  echo "$evaluator_list_out" | sed 's/^/      /'
+  echo "  ABORTING: cannot tell whether custom evaluator '$CUSTOM_EVALUATOR'"
+  echo "  exists, so refusing to silently downgrade requirements_analyst to"
+  echo "  Builtin.Helpfulness. Fix the CLI/credentials issue and re-run."
+  exit 1
+fi
+
+if echo "$evaluator_list_out" | grep -q "$CUSTOM_EVALUATOR"; then
   CUSTOM_EVALUATOR_AVAILABLE=true
   echo "Custom evaluator present: $CUSTOM_EVALUATOR"
 else
+  # Pagination guard: the list above is capped at --max-results 100 and we do
+  # NOT paginate ourselves (the pagination flags vary by CLI version and
+  # guessing them wrong is worse than failing loudly). If the output carries
+  # a next-token / more-results marker, the evaluator may exist beyond this
+  # page — treat that like a probe failure and abort rather than silently
+  # falling back to Builtin.Helpfulness.
+  if echo "$evaluator_list_out" | grep -qiE 'next[-_ ]?token|more results'; then
+    echo ""
+    echo "✗ ERROR: evaluator list appears TRUNCATED at --max-results 100 (the"
+    echo "  output contains a next-token / more-results marker):"
+    echo "$evaluator_list_out" | sed 's/^/      /'
+    echo "  ABORTING: '$CUSTOM_EVALUATOR' was not on this page but may exist on"
+    echo "  a later one — refusing to silently downgrade requirements_analyst."
+    exit 1
+  fi
   echo ""
   echo "⚠️  WARNING: custom evaluator '$CUSTOM_EVALUATOR' not found in this account."
   echo "    requirements_analyst will use 5 built-in evaluators (Helpfulness substituted"
@@ -230,11 +260,43 @@ echo "Sampling: 100% for gate roles (requirements_analyst, qa_verifier, ci_agent
 echo "Judge model: Opus 4.7"
 echo ""
 
-# Loop via process substitution (not a pipe) so FAILED_CONFIGS set inside the
-# loop survives into the parent shell for the final summary / exit code.
+# TEAM-3389 idempotency guard: `agentcore eval online create` is not
+# idempotent — a re-run against existing configs can mint a SECOND live
+# config per agent (double judge load, duplicate result records). List what's
+# live ONCE up front so the loop can skip agents that already have an
+# eval_<name> config. If the list itself fails, ABORT: creating blind risks
+# duplicating every config.
+EXISTING_CONFIGS_OUT=$(agentcore eval online list 2>&1) \
+  && existing_list_rc=0 || existing_list_rc=$?
+if [ "$existing_list_rc" -ne 0 ]; then
+  echo ""
+  echo "✗ ERROR: 'agentcore eval online list' failed (exit ${existing_list_rc}):"
+  echo "$EXISTING_CONFIGS_OUT" | sed 's/^/      /'
+  echo "  ABORTING: cannot tell which eval configs already exist, and creating"
+  echo "  without knowing risks minting duplicate live configs. Fix the"
+  echo "  CLI/credentials issue and re-run."
+  exit 1
+fi
+
+# Loop via process substitution (not a pipe) so FAILED_CONFIGS/SKIPPED_CONFIGS
+# set inside the loop survive into the parent shell for the final summary /
+# exit code.
 FAILED_CONFIGS=""
+SKIPPED_CONFIGS=""
 while read name agent_id; do
   config_name="eval_${name}"
+
+  # Skip agents whose eval_<name> config already exists (idempotent re-run).
+  # The match is anchored on non-word characters because config names can be
+  # prefixes of each other in principle — a bare substring grep would let
+  # eval_agentcore_hub_ci_agent false-match a longer name.
+  if echo "$EXISTING_CONFIGS_OUT" | grep -Eq "(^|[^A-Za-z0-9_])${config_name}([^A-Za-z0-9_]|$)"; then
+    echo "→ ${config_name} already exists — skipping (delete and re-run to"
+    echo "  recreate; see the reconciliation runbook above)."
+    SKIPPED_CONFIGS="${SKIPPED_CONFIGS} ${name}"
+    echo ""
+    continue
+  fi
 
   echo "→ Creating config for ${name} (${agent_id})..."
 
@@ -285,6 +347,15 @@ done < <(echo "$AGENTS")
 
 echo "Done! Listing all configs:"
 agentcore eval online list
+
+if [ -n "$SKIPPED_CONFIGS" ]; then
+  echo ""
+  echo "↷ Skipped (already existed):${SKIPPED_CONFIGS}"
+  echo "  Skips are idempotent successes, not failures. If a skipped config's"
+  echo "  shape is stale (wrong evaluator set or sampling rate), follow the"
+  echo "  'Reconciling live configs' runbook near the top of this script:"
+  echo "  delete the config and re-run."
+fi
 
 if [ -n "$FAILED_CONFIGS" ]; then
   echo ""
