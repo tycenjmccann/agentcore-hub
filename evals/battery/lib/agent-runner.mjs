@@ -34,6 +34,11 @@ export const PRICING_PER_MTOK = Object.freeze({
 export const BATTERY_TENANT = "battery-test";
 
 export const MAX_TURNS = 24;
+// Mirrors MAX_OUTPUT_TOKENS in deploy/runtime-agent/main.py (keep in sync;
+// TEAM-3405). The old 4096 cap silently cut long final replies — a sonnet
+// reviewer writing a detailed verdict hit stopReason max_tokens BEFORE its
+// required tool calls, indistinguishable from a deliberate prose finish.
+export const MAX_OUTPUT_TOKENS = 32000;
 // FR-10: a single transport retry per case by default (never per score), with
 // jittered backoff. Bounded in attempts AND in elapsed time via the per-case
 // retry budget below; the runner can widen it with BATTERY_MAX_TRANSPORT_RETRIES.
@@ -139,7 +144,7 @@ async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxT
           system,
           messages,
           toolConfig: { tools: registry.toolSpecs },
-          inferenceConfig: { maxTokens: 4096 },
+          inferenceConfig: { maxTokens: MAX_OUTPUT_TOKENS },
         },
         signal,
         retryBudget,
@@ -154,7 +159,16 @@ async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxT
         .join("\n");
 
       if (response.stopReason !== "tool_use") {
-        return { trajectory: registry.trajectory, messages, usage, finalText, turns: turn + 1 };
+        return {
+          trajectory: registry.trajectory,
+          messages,
+          usage,
+          finalText,
+          turns: turn + 1,
+          // A max_tokens stop is a truncated reply, not a chosen finish —
+          // surfaced so a missing required tool reads as the cutoff it is.
+          maxTokensTruncated: response.stopReason === "max_tokens",
+        };
       }
       const toolResults = message.content
         .filter((b) => b.toolUse)
@@ -183,8 +197,12 @@ async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxT
 // a deliberate prose finish (TEAM-3405): an agent cut off at the turn cap
 // never had the chance to call the required tools, and that reads very
 // differently in the summary.
-export function requiredToolFailureError({ missingRequiredTools, maxTurnsExceeded, turns }) {
-  const truncated = maxTurnsExceeded ? ` (agent loop truncated at the ${turns}-turn cap)` : "";
+export function requiredToolFailureError({ missingRequiredTools, maxTurnsExceeded = false, maxTokensTruncated = false, turns }) {
+  const truncated = maxTurnsExceeded
+    ? ` (agent loop truncated at the ${turns}-turn cap)`
+    : maxTokensTruncated
+      ? " (final reply truncated at the output-token cap)"
+      : "";
   return `required tool(s) never called: ${(missingRequiredTools || []).join(", ")}${truncated}`;
 }
 

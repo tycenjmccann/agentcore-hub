@@ -154,6 +154,11 @@
       "type": "array",
       "items": { "type": "string" }
     },
+    "notes": {
+      "type": "string",
+      "minLength": 20,
+      "description": "Curator notes: intent and editing constraints a future maintainer must know (e.g. which surfaces are intentionally degraded and must not be 'fixed')."
+    },
     "retirement_reason": {
       "type": "string",
       "minLength": 20
