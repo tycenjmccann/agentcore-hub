@@ -429,6 +429,7 @@ async function main() {
       runtimeSeconds,
       scores: final.scores,
       error: final.error ?? null,
+      infraRetried: final.infraRetried === true,
     });
     return final;
   }

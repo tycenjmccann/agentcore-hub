@@ -68,6 +68,16 @@ export function isRetryableTransportError(err) {
   );
 }
 
+// TEAM-3405: transient filesystem read errors on case inputs (fixtures,
+// transcripts, system prompts) — the kind an NFS/EFS lease blip produces.
+// These happen BEFORE the first model turn (all case-input reads do), so one
+// retry is free of model-state concerns. ENOENT is deliberately excluded: a
+// missing file is a deterministic config error, not a blip.
+export function isInfraReadError(err) {
+  return /^(EACCES|EIO|ESTALE|EBUSY|EMFILE|ENFILE)$/.test(err?.code || "");
+}
+export const INFRA_RETRY_DELAY_MS = 2000;
+
 export function systemPromptPath(repoRoot, targetAgentId) {
   return targetAgentId === "agentcore_hub_workflow_manager"
     ? join(repoRoot, "deploy", "workflow-manager", "system-prompt.md")
@@ -202,6 +212,7 @@ export async function runCase({
   maxTurns = MAX_TURNS,
   signal,
   maxTransportRetries = MAX_TRANSPORT_RETRIES,
+  infraRetryDelayMs = INFRA_RETRY_DELAY_MS,
 }) {
   const sessionId = `battery-${runId}-${caseDef.id}`;
   const modelId = MODEL_TIERS[caseDef.modelTier];
@@ -223,16 +234,38 @@ export async function runCase({
     trajectory: [],
     usage: { inputTokens: 0, outputTokens: 0 },
   };
-  try {
-    const loop = await converseLoop({
+  // Infra retry (TEAM-3405): a transient fs error reading the case's inputs
+  // (fixture seed, transcript, system prompt — e.g. an NFS lease blip) gets
+  // ONE retry after a short delay, marked infraRetried on the record. Only
+  // errors thrown BEFORE the first model turn qualify — behavioral failures
+  // (forbidden/required tool, timeout, judge) never take this path, and a
+  // turn-in-flight error is the transport classifier's business, not this one.
+  let infraRetried = false;
+  let firstModelTurnStarted = false;
+  const guardedConverse = (params, opts) => {
+    firstModelTurnStarted = true;
+    return converse(params, opts);
+  };
+  const attemptLoop = () =>
+    converseLoop({
       caseDef,
       repoRoot,
-      converse,
+      converse: guardedConverse,
       modelId,
       signal: watchdog.signal,
       maxTurns,
       retryBudget,
     });
+  try {
+    let loop;
+    try {
+      loop = await attemptLoop();
+    } catch (err) {
+      if (firstModelTurnStarted || watchdog.signal.aborted || !isInfraReadError(err)) throw err;
+      infraRetried = true;
+      await sleep(infraRetryDelayMs, watchdog.signal);
+      loop = await attemptLoop();
+    }
     const forbidden = new Set(caseDef.referenceInputs?.forbiddenTools || []);
     const forbiddenHits = loop.trajectory.filter((t) => forbidden.has(t.tool)).map((t) => t.tool);
     const called = new Set(loop.trajectory.map((t) => t.tool));
@@ -258,6 +291,7 @@ export async function runCase({
       tenant: BATTERY_TENANT,
       forbiddenHits,
       missingRequiredTools,
+      infraRetried,
       ...loop,
     };
   } catch (err) {
@@ -271,6 +305,7 @@ export async function runCase({
         sessionId,
         tenant: BATTERY_TENANT,
         error: reason?.message || `timed out after ${caseDef.timeoutSeconds}s`,
+        infraRetried,
         ...empty,
       };
     }
@@ -281,6 +316,7 @@ export async function runCase({
       sessionId,
       tenant: BATTERY_TENANT,
       error: `${err.name || "Error"}: ${err.message}`,
+      infraRetried,
       ...empty,
     };
   } finally {

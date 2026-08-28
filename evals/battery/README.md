@@ -167,6 +167,15 @@ Every exit path that could have spent Bedrock money — gate PASS/FAIL, baseline
 success or failure, watchdog abort, spend-ceiling abort, even a runner crash —
 prints `Total spend: $X.XXXX (ceiling $Y.YY)` from the live ledger.
 
+**Infra read retry (TEAM-3405).** A transient filesystem error reading a
+case's inputs (fixture seed, transcript, system prompt) — `EACCES`, `EIO`,
+`ESTALE`, `EBUSY`, `EMFILE`, `ENFILE`, the kind an NFS/EFS lease blip
+produces — gets ONE retry after a 2s delay, and the run's record carries
+`infraRetried: true` (also in `battery-progress.jsonl`). Only errors thrown
+BEFORE the first model turn qualify; behavioral failures (forbidden/required
+tool, timeout, judge scoring) are never retried, and `ENOENT` is excluded — a
+missing file is a deterministic config error, not a blip.
+
 ## Scoring backend
 
 `scoringBackend: "local-judge"` — each evaluator is scored by **Claude Opus 4.7
