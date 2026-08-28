@@ -1,17 +1,16 @@
 {
   "created": "2026-05-22",
   "updated": "2026-08-27",
-  "sampling_rate": "tiered (TEAM-3376): 100% gate roles (requirements_analyst, qa_verifier, ci_agent), 25% all others",
+  "sampling_rate": "tiered (TEAM-3366 §2.4 / TEAM-3376): 100% for gate roles (requirements_analyst, qa_verifier, ci_agent), 25% for all other agents",
   "judge_model": "us.anthropic.claude-opus-4-7",
   "evaluators": [
     "Builtin.ToolSelectionAccuracy (TOOL_CALL)",
     "Builtin.InstructionFollowing (TRACE)",
     "Builtin.Correctness (TRACE)",
-    "Builtin.Helpfulness (TRACE) — standard agents only; requirements_analyst swaps it for the custom evaluator",
     "Builtin.GoalSuccessRate (SESSION)",
-    "dependency_chain_compliance_online-mbLh2kEFhw (SESSION, custom) — requirements_analyst only"
+    "5th slot: dependency_chain_compliance_online-mbLh2kEFhw (SESSION, custom) for requirements_analyst; Builtin.Helpfulness (TRACE) for all other agents"
   ],
-  "evaluators_dropped_TEAM_3376": [
+  "evaluators_dropped": [
     "Builtin.ToolParameterAccuracy",
     "Builtin.Coherence",
     "Builtin.Faithfulness",
@@ -44,10 +43,9 @@
   "notes": {
     "trajectory_evaluators": "TrajectoryInOrderMatch/ExactOrderMatch/AnyOrderMatch require reference inputs — only usable in on-demand evaluations, not online",
     "custom_evaluator_note": "dependency_chain_compliance (on-demand version) uses {actual_tool_trajectory} placeholder — use for scheduled batch evaluations",
-    "dependency_chain_agents": "TEAM-3376 design §3.1: ONLY requirements_analyst has the custom evaluator — it is the sole role that creates the ticket dependency graph. qa_verifier and ci_agent were removed (they only transition tickets; scoring them on chain compliance produced guaranteed failures). lambda/eval-packager/index.mjs role-guards against drift here.",
-    "evaluator_matrix": "TEAM-3376: trimmed 10 -> 5 per config (each evaluator is an Opus judge call per sampled session). Standard agents: ToolSelectionAccuracy, InstructionFollowing, Correctness, Helpfulness, GoalSuccessRate. requirements_analyst: same minus Helpfulness, plus dependency_chain_compliance_online.",
-    "sampling": "TEAM-3376 tiered sampling: gate roles (requirements_analyst, qa_verifier, ci_agent) at 100%, all other agents at 25% — keeps the Opus judge under its RPM quota. See 'Eval judge throttling (quota)' in docs/orchestration-tracing-guide.md.",
-    "monitoring_region": "eval-success-rate-alarm.json and eval-health-dashboard.json hard-code us-east-1 (pure JSON can't carry comments); substitute the region at apply time — see the TEAM-3376 comment block in setup-evaluations.sh.",
-    "max_evaluators": "API limit is 10 evaluators per config; the TEAM-3376 matrix uses 5, so the limit is no longer binding."
+    "dependency_chain_agents": "TEAM-3368/TEAM-3376: only requirements_analyst has the custom evaluator — it is the only role that CREATES the ticket dependency graph; qa_verifier/ci_agent reassign rather than construct chains and scored rubric-mismatch zeros. Other agents get Builtin.Helpfulness in the fifth slot. lambda/eval-packager/index.mjs role-guards against config drift here.",
+    "sampling": "Tiered sampling keeps the Opus judge under its RPM quota. If throttling persists anyway, see 'Eval judge throttling (quota)' in docs/orchestration-tracing-guide.md for the operator quota-increase runbook.",
+    "monitoring_region": "eval-success-rate-alarm.json and eval-health-dashboard.json hard-code us-east-1 (pure JSON can't carry comments); substitute the region at apply time — see the monitoring comment blocks in setup-evaluations.sh.",
+    "max_evaluators": "API limit is 10 evaluators per config; TEAM-3366 §2.4 trimmed every config to 5 to cut Opus-judge load."
   }
 }

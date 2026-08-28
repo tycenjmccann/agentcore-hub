@@ -212,57 +212,110 @@
 
 ## Eval judge throttling (quota)
 
-**Symptom**: eval results log groups (`/aws/bedrock-agentcore/evaluations/results/eval_*`) fill with
-`error.type=ThrottlingException` / "Rate exceeded" records; `EvalThrottleRate` climbs on the
-`agentcore-hub-eval-health` dashboard; the `agentcore-hub-eval-success-rate` alarm fires with
-error-heavy (not span_missing-heavy) sessions.
+> **OPERATOR ACTION (TEAM-3366 §2.5)** — this is a one-time, account-level AWS
+> Service Quotas change run by a human operator with quota permissions. It is
+> NOT performed by CI, any deploy script, or agent code, and it is not
+> idempotent to re-request (each call opens a new support case).
 
-**Root cause**: every sampled session costs one Opus judge call *per evaluator* in its eval config.
-The judge model's requests-per-minute Service Quota is shared with everything else in the account
-using that model, and a busy fleet burst exceeds it. The evaluator retries each throttled call 8-10
-times, so throttling also multiplies log volume (the eval-packager dedups those retries, but the
-underlying judge calls are still lost).
+**Symptom**: eval results log groups fill with `ThrottlingException` from the
+Opus judge; sessions classify as `error` in eval batches; `EvalThrottleRate` /
+`EvalThrottleCount` climb on the `agentcore-hub-eval-health` dashboard and the
+`eval.batch.null_or_error_rate` metric climbs even though agent telemetry
+(`invoke_agent` spans) is healthy.
 
-**First response (no quota change needed)**: verify the TEAM-3376 mitigations are actually applied —
-the trimmed 5-evaluator matrix and tiered sampling (100% gate roles / 25% others) in
-`deploy/evaluations/setup-evaluations.sh`, reconciled against the live configs per that script's
-reconciliation section. That alone cuts judge calls ~4-8×.
+**First response (no quota change needed)**: verify the load-reduction
+mitigations are actually applied — the trimmed 5-evaluator matrix and tiered
+sampling (100% gate roles / 25% others) in
+`deploy/evaluations/setup-evaluations.sh`, reconciled against the live configs
+per that script's reconciliation section. That alone cuts judge calls ~4-8×.
 
-**Quota increase — OPERATOR action, never CI.** A quota request needs a human to pick the value and
-own the AWS support conversation; do not script it into any pipeline.
+**Step 1 — identify the exact quota (grep, don't guess).** Quota names vary by
+model/version, so list them and filter rather than assuming a code:
 
-1. Find the quota for the judge model (Opus). Record the `QuotaCode` and current `Value`:
+```bash
+aws service-quotas list-service-quotas --service-code bedrock --output json \
+ | jq -r '.Quotas[] | select(.QuotaName|test("Opus";"i"))
+          | [.QuotaCode, .QuotaName, (.Value|tostring)] | @tsv'
+```
 
-   ```bash
-   aws service-quotas list-service-quotas \
-     --service-code bedrock \
-     --query "Quotas[?contains(QuotaName, 'Opus')].{Name:QuotaName,Code:QuotaCode,Value:Value}" \
-     --output table
-   ```
+The judge quota's expected name pattern is
+**"On-demand InvokeModel requests per minute for Anthropic Claude Opus 4.7"**.
+Record the `QuotaCode` and the current `Value` before requesting anything.
 
-   Look for the on-demand **requests per minute** quota matching the judge model id in
-   `deploy/evaluations/eval-config-ids.json` (`us.anthropic.claude-opus-4-7`). If the list is empty
-   in your region, drop the `--query` filter and grep the full output for "Opus".
+**Step 2 — request an increase to 200 requests/minute.** Design derivation
+(TEAM-3366 §2.5): after the §2.4 load reduction (5 evaluators, tiered
+sampling) the judge runs at roughly ~16 RPM sustained, but two sessions
+completing simultaneously can burst to ~162 RPM — so 200 RPM gives headroom
+without over-asking:
 
-2. Request the increase to **200 requests/minute**:
+```bash
+aws service-quotas request-service-quota-increase \
+  --service-code bedrock --quota-code <QuotaCode from above> --desired-value 200
+```
 
-   ```bash
-   aws service-quotas request-service-quota-increase \
-     --service-code bedrock \
-     --quota-code <QuotaCode-from-step-1> \
-     --desired-value 200
-   ```
+Track the resulting case with
+`aws service-quotas list-requested-service-quota-change-history --service-code bedrock`.
+After the grant, watch `EvalThrottleRate` on the eval-health dashboard for a
+full batch window before considering raising sampling rates back up.
 
-3. Track the request until it's granted (large increases route to AWS Support for human review):
+**Note — shared on-demand pool.** Check whether online evaluations draw from
+the same on-demand InvokeModel pool as the fleet's own model calls: fleet
+model overrides include Opus 4.6/4.7, and if the judge and the fleet share one
+quota, the 200 RPM target must be re-derived with the fleet's RPM added on
+top. Compare the judge's throttling timestamps against fleet invocation spikes
+(or ask AWS support which quota the evaluations service consumes) before
+treating 200 as sufficient.
 
-   ```bash
-   aws service-quotas list-requested-service-quota-change-history \
-     --service-code bedrock \
-     --query "RequestedQuotas[?QuotaCode=='<QuotaCode>'].{Status:Status,Requested:DesiredValue}"
-   ```
+---
 
-4. After the grant, watch `EvalThrottleRate` on the eval-health dashboard for a full batch window
-   before considering raising sampling rates back up.
+## Eval health monitoring (dashboard + success-rate alarm)
+
+TEAM-3368 §4: `lambda/eval-packager/index.mjs` emits one EMF record per log
+delivery into the `AgentCoreHub/Evaluations` namespace (dimension
+`AgentName`), with five health metrics:
+
+| Metric | Meaning |
+|---|---|
+| `EvalSessionsTotal` | Distinct eval sessions seen in the delivery |
+| `EvalSessionsSpanMissing` | Sessions with all-null scores and no `error.type` — the `invoke_agent` span never reached the evaluator (telemetry failure, not agent quality) |
+| `EvalSessionsError` | Sessions whose results carry an `error.type` (judge/eval failure) |
+| `EvalThrottleCount` | Result records whose `error.type` ends in `ThrottlingException` — judge quota pressure (see the quota section above) |
+| `EvalDuplicateResultCount` | Duplicate result rows dropped by dedup (at-least-once delivery / evaluator retries — in-memory per delivery, TEAM-3367, plus the cross-delivery DynamoDB seen-set, TEAM-3376) |
+| `EvalThrottleRate` | Throttled sessions / total sessions for the delivery (TEAM-3376; session-level, so 8 retries of one throttled session read as one) |
+| `EvalValidationExceptionRate` | Validation-error sessions / total sessions for the delivery (TEAM-3376) |
+
+(One more, `EvalDepChainExcludedCount`, counts dependency-chain evaluator rows
+dropped for out-of-scope roles — TEAM-3368 §3.2 config-drift guard.)
+
+Healthy batches emit explicit `0` datapoints for all of them; nothing is
+emitted when a delivery contains no sessions.
+
+Apply the dashboard (safe any time — widgets stay empty until metrics flow;
+the JSON hardcodes `us-east-1`, substitute the target region at apply time):
+
+```bash
+aws cloudwatch put-dashboard --dashboard-name agentcore-hub-eval-health \
+  --dashboard-body file://deploy/evaluations/eval-health-dashboard.json
+```
+
+Apply the success-rate alarm — fires when fleet
+`(total - span_missing - errors) / total` < 0.8 on 3 of 4 hourly datapoints:
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --cli-input-json file://deploy/evaluations/eval-success-rate-alarm.json
+```
+
+**Rollout order:** apply the alarm ONLY AFTER the P0-A runtime telemetry fix
+and the P0-B eval-packager fix are deployed AND at least one healthy batch
+with non-zero `EvalSessionsTotal` carrying the three new metrics has been
+observed — earlier, the rate evaluates on stale/partial data and fires
+immediately. Add `AlarmActions` (the environment's SNS topic ARN) to the JSON
+at apply time; it is intentionally omitted from the repo copy.
+
+**INSUFFICIENT_DATA during quiet hours is expected** — both eval alarms use
+`TreatMissingData: missing`, and no eval sessions means no datapoints. Do not
+page on INSUFFICIENT_DATA.
 
 ---
 

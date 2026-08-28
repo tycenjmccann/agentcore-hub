@@ -23,6 +23,7 @@
 
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import { gzipSync } from 'zlib';
+import { readFileSync } from 'fs';
 import { EventEmitter } from 'events';
 import { computeBatchSummary } from './lib/classify.mjs';
 
@@ -100,8 +101,9 @@ const MISSING_SPAN_MESSAGE =
  * payload lives entirely in `attributes` under gen_ai.* keys. Reading
  * top-level .score/.evidence instead is what produced all-null batches.
  */
-function evalRecord({ sessionId, evaluatorName = 'builtin.correctness', score, scoreLabel, errorType, errorMessage, extraAttrs }) {
+function evalRecord({ sessionId, evaluatorName = 'builtin.correctness', score, scoreLabel, errorType, errorMessage, requestId, extraAttrs }) {
   const attributes = { 'session.id': sessionId, 'gen_ai.evaluation.name': evaluatorName };
+  if (requestId) attributes['aws.request_id'] = requestId;
   if (score !== undefined && score !== null) attributes['gen_ai.evaluation.score.value'] = score;
   if (scoreLabel) attributes['gen_ai.evaluation.score.label'] = scoreLabel;
   if (score !== undefined && score !== null) {
@@ -187,10 +189,14 @@ beforeEach(() => {
     },
     bufferSessions: new Set(['sess-from-an-earlier-delivery']),
     priorBuffer: [],
-    // TEAM-3376 seen-set table: simulate DDB's conditional-write semantics so
-    // the cross-delivery dedup path behaves exactly as in production.
+    // TEAM-3376 seen-set table. Puts are recorded and succeed by default;
+    // a test that wants real DynamoDB conditional-write semantics (repeat
+    // dedupKey → ConditionalCheckFailedException) opts in via the flag, so
+    // suites that replay the same request ids across handler calls (e.g. the
+    // duplicate-aggregation tests above) aren't cross-delivery-deduped.
     seenKeys: new Set(),
     seenPuts: [],
+    seenSetConditional: false,
   };
 
   ddbSend.mockReset();
@@ -200,7 +206,11 @@ beforeEach(() => {
     if (name === 'PutCommand') {
       const key = cmd.input.Item?.dedupKey;
       ddbState.seenPuts.push(cmd.input);
-      if (cmd.input.ConditionExpression === 'attribute_not_exists(dedupKey)' && ddbState.seenKeys.has(key)) {
+      if (
+        ddbState.seenSetConditional &&
+        cmd.input.ConditionExpression === 'attribute_not_exists(dedupKey)' &&
+        ddbState.seenKeys.has(key)
+      ) {
         const err = new Error('The conditional request failed');
         err.name = 'ConditionalCheckFailedException';
         throw err;
@@ -552,6 +562,69 @@ describe('handler (IMPROVEMENT_AGENT_ARN configured)', () => {
       expect(s3Send.mock.calls.every((c) => c[0].constructor.name === 'GetObjectCommand')).toBe(true);
     });
   });
+
+  // ─── Delivery dedup through the shipped pipeline (TEAM-3367) ──────────────
+  // CW Logs subscription delivery is at-least-once and the evaluator retries,
+  // so one evaluation attempt can appear in a delivery N times. Pre-fix, the
+  // aggregation re-parsed the raw logEvents and double-counted every dup into
+  // the rolling scorecard; classification and the buffered batch saw them too.
+  describe('duplicate records: aggregation + classification (TEAM-3367)', () => {
+    const scoresUpdate = () =>
+      sentCommands(ddbSend, 'UpdateCommand').find((c) => c.input.UpdateExpression.includes('evalScores'));
+
+    it('aggregation totals are unchanged when every record arrives duplicated 8×', async () => {
+      // batchSize 10 → no flush; this test is about the aggregation write only.
+      ddbState.config = { ...ddbState.config, batchSize: 10 };
+      const records = () => [
+        evalRecord({ sessionId: 'sess-1', score: 8, scoreLabel: 'pass', requestId: 'req-corr-1' }),
+        evalRecord({ sessionId: 'sess-2', evaluatorName: 'builtin.helpfulness', score: 6, scoreLabel: 'pass', requestId: 'req-help-1' }),
+      ];
+
+      await handler(awslogsEvent(records()));
+      const clean = scoresUpdate();
+      const cleanScores = clean.input.ExpressionAttributeValues[':scores'];
+      const cleanSessions = clean.input.ExpressionAttributeValues[':sc'];
+      expect(cleanScores).toEqual({
+        'builtin.correctness': { sum: 8, count: 1 },
+        'builtin.helpfulness': { sum: 6, count: 1 },
+      });
+      expect(cleanSessions).toBe(2);
+
+      // Same delivery, but each record repeated 9× (8 injected duplicates).
+      // awslogsEvent gives every copy a distinct timestamp, so only the shared
+      // request id can collapse them.
+      ddbSend.mockClear();
+      await handler(awslogsEvent(records().flatMap((r) => Array(9).fill(r))));
+      const dup = scoresUpdate();
+      expect(dup.input.ExpressionAttributeValues[':scores']).toEqual(cleanScores);
+      expect(dup.input.ExpressionAttributeValues[':sc']).toBe(cleanSessions);
+    });
+
+    it('classifySessions sees deduped input: a throttled session with 8 duplicates is ONE error session', async () => {
+      ddbState.config = { ...ddbState.config, batchSize: 10 };
+      const throttled = evalRecord({
+        sessionId: 'sess-throttled',
+        score: null,
+        errorType: 'ThrottlingException',
+        errorMessage: 'Rate exceeded',
+        requestId: 'req-throttle-1',
+      });
+
+      await handler(awslogsEvent(Array(9).fill(throttled)));
+
+      // The buffered batch carries ONE row, not nine.
+      const append = sentCommands(ddbSend, 'UpdateCommand').find((c) => c.input.ReturnValues === 'ALL_NEW');
+      const sessionData = append.input.ExpressionAttributeValues[':new'][0];
+      expect(sessionData.evaluatorResults).toHaveLength(1);
+      expect(sessionData.duplicatesDropped).toBe(8);
+      expect(sessionData.sessionStatus).toEqual({ 'sess-throttled': 'error' });
+
+      // And the fleet tally counts one session — an error one, not span_missing.
+      const [metrics] = emfLines('EvalSessionsTotal');
+      expect(metrics.EvalSessionsTotal).toBe(1);
+      expect(metrics.EvalSessionsSpanMissing).toBe(0);
+    });
+  });
 });
 
 // ─── Without the improver configured ────────────────────────────────────────
@@ -727,7 +800,7 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
     expect(spanMissing).toBe(0);
   });
 
-  it('emitEvalMetrics emits a single EMF record with both metrics', () => {
+  it('emitEvalMetrics emits a single EMF record carrying all health metrics', () => {
     emitEvalMetrics('agentcore_hub_backend_dev', { total: 4, spanMissing: 0 });
 
     const records = emfLines('EvalSessionsTotal');
@@ -738,10 +811,12 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
     expect(emf[0].Namespace).toBe('AgentCoreHub/Evaluations');
     expect(emf[0].Dimensions).toEqual([['AgentName']]);
     expect(emf[0].Metrics.map((m) => m.Name).sort()).toEqual([
+      'EvalDepChainExcludedCount',
       'EvalDuplicateResultCount',
       'EvalSessionsError',
       'EvalSessionsSpanMissing',
       'EvalSessionsTotal',
+      'EvalThrottleCount',
       'EvalThrottleRate',
       'EvalValidationExceptionRate',
     ]);
@@ -760,20 +835,563 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
   });
 });
 
-// ─── TEAM-3376: dedup, role guard, error-typed classification (pure helpers) ─
-// The evaluator retries a throttled judge call 8-10 times and every retry lands
-// as its own log record; CW Logs can additionally re-deliver whole batches.
-// These tests pin the two dedup layers (in-memory per delivery, DDB seen-set
-// across deliveries), the role guard for eval-config drift, and the
-// throttle/validation error split — all against the exported helpers.
+// ─── extractSessionData dedup (TEAM-3367) ────────────────────────────────────
+// Request-id extraction chain, ranked: (a) OTEL envelope traceId+spanId,
+// (b) attributes['aws.request_id'], (c) attributes['gen_ai.response.id'];
+// content-key fallback when a record carries none of them.
 
-describe('TEAM-3376: dedup + role guard + error-typed classification', () => {
+describe('extractSessionData dedup (TEAM-3367)', () => {
+  let extractSessionData;
+  let dedupeResults;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ extractSessionData, dedupeResults } = await import('./index.mjs'));
+  });
+
+  const delivery = (logEvents) => ({
+    logGroup: '/aws/bedrock-agentcore/evaluations/results/eval_backend_dev-test',
+    logStream: 'test-stream',
+    logEvents,
+  });
+
+  /** OTEL eval log record with full control over envelope ids and timestamps. */
+  const otelEvent = ({
+    sessionId = 'sess-1',
+    evaluatorName = 'Builtin.Correctness',
+    score,
+    timestamp = 1_756_250_000_000,
+    envelope = {},
+    attrs = {},
+  }) => ({
+    timestamp,
+    message: JSON.stringify({
+      ...envelope,
+      attributes: {
+        'session.id': sessionId,
+        'gen_ai.evaluation.name': evaluatorName,
+        ...(score !== undefined && score !== null ? { 'gen_ai.evaluation.score.value': score } : {}),
+        ...attrs,
+      },
+    }),
+  });
+
+  it('collapses 9 records sharing a request id (aws.request_id) to one', () => {
+    // Distinct timestamps on every copy: only the shared id can collapse them.
+    const events = Array.from({ length: 9 }, (_, i) =>
+      otelEvent({ score: 8, timestamp: 1_756_250_000_000 + i, attrs: { 'aws.request_id': 'req-abc' } })
+    );
+    const sessionData = extractSessionData(delivery(events));
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.duplicatesDropped).toBe(8);
+    expect(sessionData.evaluatorResults[0]).toMatchObject({ requestId: 'req-abc', score: 8 });
+  });
+
+  it('envelope traceId+spanId identify duplicates and outrank aws.request_id', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        // Same evaluated span, two delivery copies — the differing aws.request_id
+        // must not keep them apart, because the envelope ids rank first.
+        otelEvent({ score: 7, timestamp: 1, envelope: { traceId: 'trace-1', spanId: 'span-1' }, attrs: { 'aws.request_id': 'req-1' } }),
+        otelEvent({ score: 7, timestamp: 2, envelope: { traceId: 'trace-1', spanId: 'span-1' }, attrs: { 'aws.request_id': 'req-2' } }),
+        // Same span ids but a DIFFERENT evaluator: a distinct result, kept.
+        otelEvent({ evaluatorName: 'Builtin.Helpfulness', score: 5, timestamp: 3, envelope: { traceId: 'trace-1', spanId: 'span-1' } }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(2);
+    expect(sessionData.duplicatesDropped).toBe(1);
+    expect(sessionData.evaluatorResults[0].requestId).toBe('trace-1:span-1');
+  });
+
+  it('falls back to gen_ai.response.id when the envelope carries no ids', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ score: 9, timestamp: 1, attrs: { 'gen_ai.response.id': 'resp-1' } }),
+        otelEvent({ score: 9, timestamp: 2, attrs: { 'gen_ai.response.id': 'resp-1' } }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.duplicatesDropped).toBe(1);
+  });
+
+  it('preserves distinct records: same session, different evaluators/scores/request ids', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ score: 8, timestamp: 1, attrs: { 'aws.request_id': 'req-1' } }),
+        otelEvent({ evaluatorName: 'Builtin.Helpfulness', score: 6, timestamp: 2, attrs: { 'aws.request_id': 'req-2' } }),
+        otelEvent({ evaluatorName: 'Builtin.Faithfulness', score: 4, timestamp: 3, attrs: { 'aws.request_id': 'req-3' } }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(3);
+    expect(sessionData.duplicatesDropped).toBe(0);
+  });
+
+  it('content-key fallback: identical no-id rows collapse; rows differing only in timestamp do not', () => {
+    // Two byte-identical retry writes (no request id anywhere) → one row.
+    const identical = extractSessionData(
+      delivery([otelEvent({ score: 8, timestamp: 42 }), otelEvent({ score: 8, timestamp: 42 })])
+    );
+    expect(identical.evaluatorResults).toHaveLength(1);
+    expect(identical.duplicatesDropped).toBe(1);
+
+    // Same score, DIFFERENT timestamps → genuinely distinct evaluations, kept.
+    const distinct = extractSessionData(
+      delivery([otelEvent({ score: 8, timestamp: 42 }), otelEvent({ score: 8, timestamp: 43 })])
+    );
+    expect(distinct.evaluatorResults).toHaveLength(2);
+    expect(distinct.duplicatesDropped).toBe(0);
+  });
+
+  it('dedupeResults is exported and keeps first occurrence', () => {
+    const rows = [
+      { requestId: 'r1', evaluatorName: 'e', score: 1, timestamp: 1 },
+      { requestId: 'r1', evaluatorName: 'e', score: 2, timestamp: 2 },
+    ];
+    expect(dedupeResults(rows)).toEqual([rows[0]]);
+  });
+});
+
+// ─── dependency-chain role scoping (TEAM-3368) ───────────────────────────────
+// The custom dependency_chain_compliance evaluator is scoped to
+// requirements_analyst (setup-evaluations.sh); this guard drops rows the live
+// configs may still emit for other roles (config drift). FAIL-OPEN: an
+// unparseable session id or a non-dep-chain evaluator never costs a record.
+
+describe('dependency-chain role scoping (TEAM-3368)', () => {
+  let extractSessionData;
+  let classifySessions;
+  let roleFromSessionId;
+  let isOutOfScopeDepChain;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ extractSessionData, classifySessions, roleFromSessionId, isOutOfScopeDepChain } =
+      await import('./index.mjs'));
+  });
+
+  const delivery = (logEvents) => ({
+    logGroup: '/aws/bedrock-agentcore/evaluations/results/eval_backend_dev-test',
+    logStream: 'test-stream',
+    logEvents,
+  });
+
+  const otelEvent = ({ sessionId, evaluatorName, score, timestamp, attrs = {} }) => ({
+    timestamp,
+    message: JSON.stringify({
+      attributes: {
+        'session.id': sessionId,
+        'gen_ai.evaluation.name': evaluatorName,
+        ...(score !== undefined && score !== null ? { 'gen_ai.evaluation.score.value': score } : {}),
+        ...attrs,
+      },
+    }),
+  });
+
+  const DEP_CHAIN_EVALUATOR = 'dependency_chain_compliance_online-mbLh2kEFhw';
+  const BACKEND_SID = 'wf_1756240000000_ab12cd-agentcore_hub_backend_dev-1756240012345';
+  const ANALYST_SID = 'TEAM-3201_wf_1756240000000_ab12cd-agentcore_hub_requirements_analyst-1756240012345';
+
+  it('roleFromSessionId parses orchestrator session ids, with and without ticket prefix', () => {
+    expect(
+      roleFromSessionId('TEAM-3200_wf_1756240000000_ab12cd-agentcore_hub_frontend_dev-1756240012345')
+    ).toBe('agentcore_hub_frontend_dev');
+    expect(roleFromSessionId(BACKEND_SID)).toBe('agentcore_hub_backend_dev');
+  });
+
+  it('roleFromSessionId returns null on malformed/absent/non-workflow ids', () => {
+    expect(roleFromSessionId('si-agentcore_hub_backend_dev-123')).toBe(null); // short ms suffix
+    expect(roleFromSessionId('cc-b46ff2c0237e4516ab3eaefbd724f9d9')).toBe(null);
+    expect(roleFromSessionId(null)).toBe(null);
+    expect(roleFromSessionId('')).toBe(null);
+  });
+
+  it('isOutOfScopeDepChain fails open on a null role', () => {
+    expect(
+      isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: 'si-something-123' })
+    ).toBe(false);
+    expect(isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: null })).toBe(false);
+  });
+
+  it('isOutOfScopeDepChain never touches non-dep-chain evaluators, whatever the role', () => {
+    expect(isOutOfScopeDepChain({ evaluatorName: 'Builtin.Correctness', sessionId: BACKEND_SID })).toBe(false);
+    expect(isOutOfScopeDepChain({ evaluatorName: null, sessionId: BACKEND_SID })).toBe(false);
+    expect(isOutOfScopeDepChain({ sessionId: BACKEND_SID })).toBe(false);
+  });
+
+  it('flags a dep-chain row for an out-of-scope role, keeps one for requirements_analyst', () => {
+    expect(isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: BACKEND_SID })).toBe(true);
+    expect(isOutOfScopeDepChain({ evaluatorName: DEP_CHAIN_EVALUATOR, sessionId: ANALYST_SID })).toBe(false);
+  });
+
+  it('extractSessionData excludes an out-of-scope dep-chain row and leaves the rest intact', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({
+          sessionId: BACKEND_SID,
+          evaluatorName: DEP_CHAIN_EVALUATOR,
+          score: 0,
+          timestamp: 1,
+          attrs: { 'aws.request_id': 'req-dep' },
+        }),
+        otelEvent({
+          sessionId: BACKEND_SID,
+          evaluatorName: 'Builtin.Correctness',
+          score: 8,
+          timestamp: 2,
+          attrs: { 'aws.request_id': 'req-corr' },
+        }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.evaluatorResults[0]).toMatchObject({
+      evaluatorName: 'Builtin.Correctness',
+      score: 8,
+    });
+    expect(sessionData.depChainExcluded).toBe(1);
+    expect(sessionData.duplicatesDropped).toBe(0); // scope removals don't count as dupes
+
+    // Classification sees only the retained row: one scored session, no noise.
+    const { statuses, total, spanMissing } = classifySessions(sessionData);
+    expect(total).toBe(1);
+    expect(spanMissing).toBe(0);
+    expect(statuses.get(BACKEND_SID)).toBe('scored');
+  });
+
+  it('extractSessionData retains a dep-chain row for requirements_analyst', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({
+          sessionId: ANALYST_SID,
+          evaluatorName: DEP_CHAIN_EVALUATOR,
+          score: 7,
+          timestamp: 1,
+          attrs: { 'aws.request_id': 'req-dep-ra' },
+        }),
+      ])
+    );
+    expect(sessionData.evaluatorResults).toHaveLength(1);
+    expect(sessionData.evaluatorResults[0]).toMatchObject({
+      evaluatorName: DEP_CHAIN_EVALUATOR,
+      score: 7,
+    });
+    expect(sessionData.depChainExcluded).toBe(0);
+  });
+});
+
+// ─── eval health metrics (TEAM-3368 §4) ──────────────────────────────────────
+// emitEvalMetrics extended to Error/Throttle/Duplicate (+ DepChainExcluded) in
+// the SAME single EMF record; classifySessions grows an `errors` count; the
+// success-rate alarm's metric math is restated in pure JS against its JSON.
+
+describe('eval health metrics (TEAM-3368 §4)', () => {
+  let classifySessions;
+  let emitEvalMetrics;
+  let extractSessionData;
+  let countThrottles;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ classifySessions, emitEvalMetrics, extractSessionData, countThrottles } =
+      await import('./index.mjs'));
+  });
+
+  const delivery = (logEvents) => ({
+    logGroup: '/aws/bedrock-agentcore/evaluations/results/eval_backend_dev-test',
+    logStream: 'test-stream',
+    logEvents,
+  });
+
+  const otelEvent = ({ sessionId = 'sess-1', evaluatorName = 'Builtin.Correctness', score, timestamp, attrs = {} }) => ({
+    timestamp,
+    message: JSON.stringify({
+      attributes: {
+        'session.id': sessionId,
+        'gen_ai.evaluation.name': evaluatorName,
+        ...(score !== undefined && score !== null ? { 'gen_ai.evaluation.score.value': score } : {}),
+        ...attrs,
+      },
+    }),
+  });
+
+  it('one EMF record carries all metrics: counts as Count, rates as None', () => {
+    emitEvalMetrics('agentcore_hub_backend_dev', {
+      total: 5, spanMissing: 1, errors: 2, throttles: 3, duplicates: 4, depChainExcluded: 1,
+    });
+    const records = emfLines('EvalSessionsTotal');
+    expect(records).toHaveLength(1);
+    const [record] = records;
+    const [directive] = record._aws.CloudWatchMetrics;
+    expect(directive.Namespace).toBe('AgentCoreHub/Evaluations');
+    expect(directive.Dimensions).toEqual([['AgentName']]);
+    // TEAM-3376 adds the two dimensionless session-rate metrics; everything
+    // else stays a Count.
+    expect(
+      directive.Metrics.every((m) => m.Unit === (m.Name.endsWith('Rate') ? 'None' : 'Count'))
+    ).toBe(true);
+    expect(record.EvalSessionsTotal).toBe(5);
+    expect(record.EvalSessionsSpanMissing).toBe(1);
+    expect(record.EvalSessionsError).toBe(2);
+    expect(record.EvalThrottleCount).toBe(3);
+    expect(record.EvalDuplicateResultCount).toBe(4);
+    expect(record.EvalDepChainExcludedCount).toBe(1);
+  });
+
+  it('throttled delivery: throttle records count AND their session classifies error', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ sessionId: 's-throttled', timestamp: 1, attrs: { 'error.type': 'ThrottlingException' } }),
+        otelEvent({ sessionId: 's-throttled', evaluatorName: 'Builtin.Helpfulness', timestamp: 2, attrs: { 'error.type': 'ThrottlingException' } }),
+        otelEvent({ sessionId: 's-ok', score: 0.9, timestamp: 3 }),
+      ])
+    );
+    const { total, spanMissing, errors } = classifySessions(sessionData);
+    const throttles = countThrottles(sessionData.evaluatorResults);
+    expect(throttles).toBe(2);
+    expect(errors).toBe(1);
+
+    emitEvalMetrics('agentcore_hub_backend_dev', {
+      total, spanMissing, errors, throttles, duplicates: sessionData.duplicatesDropped,
+    });
+    const [record] = emfLines('EvalSessionsTotal');
+    expect(record.EvalSessionsTotal).toBe(2);
+    expect(record.EvalSessionsError).toBe(1);
+    expect(record.EvalThrottleCount).toBe(2);
+    expect(record.EvalSessionsSpanMissing).toBe(0);
+  });
+
+  it('namespaced throttle form still counts; other error types do not', () => {
+    expect(
+      countThrottles([
+        { errorType: 'com.amazonaws#ThrottlingException' },
+        { errorType: 'ThrottlingException' },
+        { errorType: 'AccessDenied' },
+        { errorType: null },
+        {},
+      ])
+    ).toBe(2);
+  });
+
+  it('duplicated delivery: duplicatesDropped flows to EvalDuplicateResultCount', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ score: 8, timestamp: 1, attrs: { 'aws.request_id': 'req-dup' } }),
+        otelEvent({ score: 8, timestamp: 2, attrs: { 'aws.request_id': 'req-dup' } }),
+        otelEvent({ score: 8, timestamp: 3, attrs: { 'aws.request_id': 'req-dup' } }),
+      ])
+    );
+    expect(sessionData.duplicatesDropped).toBe(2);
+
+    const { total, spanMissing, errors } = classifySessions(sessionData);
+    emitEvalMetrics('agentcore_hub_backend_dev', {
+      total, spanMissing, errors, throttles: 0, duplicates: sessionData.duplicatesDropped,
+    });
+    const [record] = emfLines('EvalSessionsTotal');
+    expect(record.EvalDuplicateResultCount).toBe(2);
+  });
+
+  it('healthy delivery emits explicit zeros for SpanMissing/Error/Throttle/Duplicate', () => {
+    const sessionData = extractSessionData(
+      delivery([
+        otelEvent({ sessionId: 'h-1', score: 0.9, timestamp: 1, attrs: { 'aws.request_id': 'r1' } }),
+        otelEvent({ sessionId: 'h-2', score: 0.7, timestamp: 2, attrs: { 'aws.request_id': 'r2' } }),
+      ])
+    );
+    const { total, spanMissing, errors } = classifySessions(sessionData);
+    emitEvalMetrics('agentcore_hub_backend_dev', {
+      total, spanMissing, errors,
+      throttles: countThrottles(sessionData.evaluatorResults),
+      duplicates: sessionData.duplicatesDropped,
+    });
+    const [record] = emfLines('EvalSessionsTotal');
+    expect(record.EvalSessionsTotal).toBe(2);
+    expect(record.EvalSessionsSpanMissing).toBe(0);
+    expect(record.EvalSessionsError).toBe(0);
+    expect(record.EvalThrottleCount).toBe(0);
+    expect(record.EvalDuplicateResultCount).toBe(0);
+  });
+
+  it('classifySessions counts error sessions', () => {
+    const evRow = (sessionId, score, extra = {}) => ({
+      timestamp: 1, sessionId, evaluatorName: 'Builtin.Correctness', score,
+      errorType: null, ...extra,
+    });
+    const { total, spanMissing, errors } = classifySessions({
+      evaluatorResults: [
+        evRow('a', 0.9),
+        evRow('b', null, { errorType: 'ThrottlingException' }),
+        evRow('c', null, { errorType: 'JudgeTimeout' }),
+        evRow('d', null),
+      ],
+    });
+    expect(total).toBe(4);
+    expect(errors).toBe(2);
+    expect(spanMissing).toBe(1);
+  });
+
+  it('success-rate alarm math: healthy stays quiet, broken batch fires', () => {
+    // Pure-JS restatement of eval-success-rate-alarm.json's metric math,
+    // reading Threshold/operator from the JSON so drift breaks this test.
+    const alarm = JSON.parse(
+      readFileSync(new URL('../../deploy/evaluations/eval-success-rate-alarm.json', import.meta.url), 'utf8')
+    );
+    expect(alarm.AlarmName).toBe('agentcore-hub-eval-success-rate');
+    expect(alarm.ComparisonOperator).toBe('LessThanThreshold');
+    expect(alarm.Metrics.find((m) => m.ReturnData).Expression).toBe('(total - missing - errors) / total');
+
+    const rate = (total, missing, errors) => (total - missing - errors) / total;
+    const fires = (r) => r < alarm.Threshold;
+
+    expect(rate(10, 0, 0)).toBe(1.0);
+    expect(fires(rate(10, 0, 0))).toBe(false); // healthy batch: no fire
+    expect(rate(10, 3, 4)).toBeCloseTo(0.3);
+    expect(fires(rate(10, 3, 4))).toBe(true); // broken batch: 0.3 < 0.8 fires
+  });
+});
+
+// ─── invokeImprover retry (TEAM-3367) ────────────────────────────────────────
+// Exponential backoff with FULL jitter (base 2s, cap 60s, 3 attempts), retrying
+// only transient failures, deadline-aware under the Lambda's 600s timeout.
+
+describe('invokeImprover retry (TEAM-3367)', () => {
+  let invokeImprover;
+  let improverBackoffDelayMs;
+  let isRetryableImproverError;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
+    process.env.AWS_REGION ??= 'us-east-1';
+    vi.resetModules();
+    ({ invokeImprover, improverBackoffDelayMs, isRetryableImproverError } = await import('./index.mjs'));
+  });
+
+  const ARN = 'arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/improver-Test01';
+
+  /** An attempt answered with `statusCode` and an optional SSE body. */
+  const respondWith = (statusCode, body = '') => (options, callback) => {
+    const res = new EventEmitter();
+    res.statusCode = statusCode;
+    const req = {
+      on() { return req; },
+      write() {},
+      end() {
+        process.nextTick(() => {
+          if (body) res.emit('data', Buffer.from(body));
+          res.emit('end');
+        });
+      },
+    };
+    callback(res);
+    return req;
+  };
+
+  /** An attempt that dies at the socket with `code` before any response. */
+  const failSocket = (code) => (options) => {
+    const handlers = {};
+    const req = {
+      on(evt, fn) { handlers[evt] = fn; return req; },
+      write() {},
+      end() {
+        process.nextTick(() => {
+          const err = new Error(`socket hang up`);
+          err.code = code;
+          handlers.error?.(err);
+        });
+      },
+    };
+    return req;
+  };
+
+  const sseBody = `data: ${JSON.stringify({ event: { contentBlockDelta: { delta: { text: 'hello' } } } })}\n\n`;
+
+  it('retries a 5xx with full-jitter backoff, then gives up after 3 attempts', async () => {
+    httpsRequest.mockImplementation(respondWith(500));
+    const sleeps = [];
+    const deps = { sleep: async (ms) => sleeps.push(ms), random: () => 0.5 };
+
+    await expect(invokeImprover(ARN, 'p', 'agent-x', deps)).rejects.toThrow(/improver returned 500/);
+
+    expect(httpsRequest).toHaveBeenCalledTimes(3);
+    // random()=0.5 → half of min(60s, 2s·2^attempt): 1s before retry 1, 2s before retry 2.
+    expect(sleeps).toEqual([1000, 2000]);
+  });
+
+  it('retries a 429 throttle', async () => {
+    httpsRequest.mockImplementation(respondWith(429));
+    await expect(invokeImprover(ARN, 'p', 'agent-x', { sleep: async () => {}, random: () => 0 }))
+      .rejects.toThrow(/improver returned 429/);
+    expect(httpsRequest).toHaveBeenCalledTimes(3);
+  });
+
+  it('retries a connection reset and succeeds on the second attempt', async () => {
+    httpsRequest
+      .mockImplementationOnce(failSocket('ECONNRESET'))
+      .mockImplementationOnce(respondWith(200, sseBody));
+    const sleeps = [];
+
+    const text = await invokeImprover(ARN, 'p', 'agent-x', { sleep: async (ms) => sleeps.push(ms), random: () => 0.5 });
+
+    expect(text).toBe('hello');
+    expect(httpsRequest).toHaveBeenCalledTimes(2);
+    expect(sleeps).toEqual([1000]);
+  });
+
+  it('does NOT retry a 4xx validation error', async () => {
+    httpsRequest.mockImplementation(respondWith(400));
+    const sleep = vi.fn();
+
+    await expect(invokeImprover(ARN, 'p', 'agent-x', { sleep })).rejects.toThrow(/improver returned 400/);
+
+    expect(httpsRequest).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('abandons a retry that could not finish inside the 520s deadline', async () => {
+    httpsRequest.mockImplementation(respondWith(500));
+    // start=0; by the first retry check 300s have elapsed → 300+240 > 520.
+    const now = vi.fn().mockReturnValueOnce(0).mockReturnValue(300_000);
+    const sleep = vi.fn();
+
+    await expect(invokeImprover(ARN, 'p', 'agent-x', { now, sleep })).rejects.toThrow(/deadline/);
+
+    expect(httpsRequest).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('backoff calculator: full jitter over min(cap, base·2^attempt)', () => {
+    expect(improverBackoffDelayMs(0, () => 1)).toBe(2000);
+    expect(improverBackoffDelayMs(1, () => 1)).toBe(4000);
+    expect(improverBackoffDelayMs(10, () => 1)).toBe(60_000); // capped
+    expect(improverBackoffDelayMs(0, () => 0)).toBe(0); // jitter floor is zero
+  });
+
+  it('classifies retryability: throttle/5xx/socket-reset yes, 4xx no', () => {
+    expect(isRetryableImproverError(Object.assign(new Error('x'), { statusCode: 429 }))).toBe(true);
+    expect(isRetryableImproverError(Object.assign(new Error('x'), { statusCode: 503 }))).toBe(true);
+    expect(isRetryableImproverError(Object.assign(new Error('x'), { code: 'ECONNRESET' }))).toBe(true);
+    expect(isRetryableImproverError(new Error('ThrottlingException: rate exceeded'))).toBe(true);
+    expect(isRetryableImproverError(Object.assign(new Error('x'), { statusCode: 400 }))).toBe(false);
+    expect(isRetryableImproverError(Object.assign(new Error('x'), { statusCode: 403 }))).toBe(false);
+    expect(isRetryableImproverError(new Error('improver returned empty output'))).toBe(false);
+  });
+});
+
+// ─── TEAM-3376: dedup fail-open, seen-set, role guard, error split ───────────
+// Layered on the TEAM-3367/3368 behavior above: rows with NO usable identity
+// fail OPEN through dedup (retained + counted), a DynamoDB seen-set extends
+// dedup across deliveries/concurrent invocations, and error sessions split
+// into throttle/validation/generic for the EMF rate metrics.
+
+describe('TEAM-3376: dedup fail-open + seen-set + error split (pure helpers)', () => {
   let extractSessionData;
   let dedupeAgainstSeenSet;
   let classifySessions;
   let setSeenSetClient;
-  let roleFromSessionId;
-  let isOutOfScopeDepChain;
   let applyRoleGuard;
 
   beforeAll(async () => {
@@ -785,8 +1403,6 @@ describe('TEAM-3376: dedup + role guard + error-typed classification', () => {
       dedupeAgainstSeenSet,
       classifySessions,
       setSeenSetClient,
-      roleFromSessionId,
-      isOutOfScopeDepChain,
       applyRoleGuard,
     } = await import('./index.mjs'));
   });
@@ -795,21 +1411,10 @@ describe('TEAM-3376: dedup + role guard + error-typed classification', () => {
     setSeenSetClient(null); // back to the module's own (mocked) doc client
   });
 
-  // Full control over timestamp/attributes/envelope — awslogsEvent can't emit
-  // two records with the SAME timestamp, which the content-key tests need.
-  const otelEvent = ({
-    timestamp = 1_756_250_000_000,
-    sessionId,
-    evaluatorName = 'Builtin.Correctness',
-    score,
-    errorType,
-    errorMessage,
-    requestId,
-    envelope = {},
-  }) => ({
+  const deliveryOf = (logEvents) => ({ logGroup: LOG_GROUP, logStream: 'test-stream', logEvents });
+  const otelEvent = ({ timestamp = 1_756_250_000_000, sessionId, evaluatorName = 'Builtin.Correctness', score, errorType, errorMessage, requestId }) => ({
     timestamp,
     message: JSON.stringify({
-      ...envelope,
       attributes: {
         ...(sessionId ? { 'session.id': sessionId } : {}),
         ...(evaluatorName ? { 'gen_ai.evaluation.name': evaluatorName } : {}),
@@ -819,49 +1424,6 @@ describe('TEAM-3376: dedup + role guard + error-typed classification', () => {
         ...(requestId ? { 'aws.request_id': requestId } : {}),
       },
     }),
-  });
-  const deliveryOf = (logEvents) => ({ logGroup: LOG_GROUP, logStream: 'test-stream', logEvents });
-
-  it('collapses 9 throttle-retry records sharing one request id to 1 (duplicatesDropped=8)', () => {
-    const events = Array.from({ length: 9 }, (_, i) =>
-      otelEvent({
-        timestamp: 1_756_250_000_000 + i, // retries arrive at distinct timestamps
-        sessionId: 'sess-throttled',
-        score: null,
-        errorType: 'ThrottlingException',
-        errorMessage: 'Rate exceeded',
-        requestId: 'req-1111',
-      })
-    );
-    const sessionData = extractSessionData(deliveryOf(events));
-    expect(sessionData.evaluatorResults).toHaveLength(1);
-    expect(sessionData.duplicatesDropped).toBe(8);
-  });
-
-  it('never collapses records with distinct request ids', () => {
-    const sessionData = extractSessionData(
-      deliveryOf([
-        otelEvent({ sessionId: 's1', score: 8, requestId: 'req-a' }),
-        otelEvent({ sessionId: 's1', score: 8, requestId: 'req-b' }),
-        otelEvent({ sessionId: 's1', score: 8, requestId: 'req-c' }),
-      ])
-    );
-    expect(sessionData.evaluatorResults).toHaveLength(3);
-    expect(sessionData.duplicatesDropped).toBe(0);
-  });
-
-  it('falls back to the content key without a request id: identical rows collapse, timestamp-differing rows do not', () => {
-    const sessionData = extractSessionData(
-      deliveryOf([
-        // Byte-identical re-delivery (same timestamp) → collapses…
-        otelEvent({ timestamp: 1_756_250_000_000, sessionId: 's1', score: 7 }),
-        otelEvent({ timestamp: 1_756_250_000_000, sessionId: 's1', score: 7 }),
-        // …but a genuine retry at a later timestamp is kept.
-        otelEvent({ timestamp: 1_756_250_000_500, sessionId: 's1', score: 7 }),
-      ])
-    );
-    expect(sessionData.evaluatorResults).toHaveLength(2);
-    expect(sessionData.duplicatesDropped).toBe(1);
   });
 
   it('fails open when every dedup-key field is null/missing: retained + counted', () => {
@@ -889,14 +1451,14 @@ describe('TEAM-3376: dedup + role guard + error-typed classification', () => {
   });
 
   it('dedup never flips classification: 8 duplicates of a throttled session classify like the duplicate-free delivery', () => {
-    const throttledEvent = (i = 0, requestId = 'req-2222') =>
+    const throttledEvent = (i = 0) =>
       otelEvent({
         timestamp: 1_756_250_000_000 + i,
         sessionId: 'sess-throttled',
         score: null,
         errorType: 'ThrottlingException',
         errorMessage: 'Rate exceeded',
-        requestId,
+        requestId: 'req-2222',
       });
 
     const deduped = classifySessions(
@@ -918,7 +1480,7 @@ describe('TEAM-3376: dedup + role guard + error-typed classification', () => {
       errorType,
       errorMessage: null,
     });
-    const { statuses, total, spanMissing, throttled, validationErrors, genericErrors } =
+    const { statuses, total, spanMissing, errors, throttled, validationErrors, genericErrors } =
       classifySessions({
         evaluatorResults: [
           row('s-throttled', null, 'ThrottlingException'),
@@ -934,6 +1496,7 @@ describe('TEAM-3376: dedup + role guard + error-typed classification', () => {
     expect(throttled).toBe(2);
     expect(validationErrors).toBe(1);
     expect(genericErrors).toBe(1);
+    expect(errors).toBe(4);
     // The coarse statuses map and span_missing/total semantics are unchanged.
     expect(statuses.get('s-throttled')).toBe('error');
     expect(statuses.get('s-validation')).toBe('error');
@@ -944,31 +1507,7 @@ describe('TEAM-3376: dedup + role guard + error-typed classification', () => {
     expect(spanMissing).toBe(1);
   });
 
-  it('roleFromSessionId parses the persona role with and without a ticket prefix', () => {
-    expect(
-      roleFromSessionId('TEAM-3200_wf_1756240000000_ab12cd-agentcore_hub_frontend_dev-1756240012345')
-    ).toBe('agentcore_hub_frontend_dev');
-    expect(
-      roleFromSessionId('wf_1756240000000_ab12cd-agentcore_hub_frontend_dev-1756240012345')
-    ).toBe('agentcore_hub_frontend_dev');
-  });
-
-  it('fails open on malformed session ids: null role, never excluded', () => {
-    const malformed = [
-      'si-agentcore_hub_backend_dev-123', // improver session: ms suffix too short
-      'cc-abcdef0123456789abcdef0123456789', // coding-runtime session
-      null,
-      '',
-    ];
-    for (const sid of malformed) {
-      expect(roleFromSessionId(sid)).toBe(null);
-      expect(
-        isOutOfScopeDepChain({ evaluatorName: 'dependency_chain_compliance_online', sessionId: sid })
-      ).toBe(false);
-    }
-  });
-
-  it('excludes out-of-scope dep-chain rows only; siblings and in-scope rows survive, classification unaffected', () => {
+  it('applyRoleGuard drops out-of-scope dep-chain rows only, keeps siblings and in-scope rows', () => {
     const backendSid = 'TEAM-3200_wf_1756240000000_ab12cd-agentcore_hub_backend_dev-1756240012345';
     const analystSid = 'wf_1756240000000_xy34zz-agentcore_hub_requirements_analyst-1756240099999';
     const row = (sessionId, evaluatorName, score) => ({
@@ -986,18 +1525,15 @@ describe('TEAM-3376: dedup + role guard + error-typed classification', () => {
     expect(guarded.excluded).toBe(1);
     expect(guarded.records).toEqual([sibling, depAnalyst]);
 
-    // Other evaluators are never touched, whatever the role parse says…
-    expect(isOutOfScopeDepChain(sibling)).toBe(false);
-    // …and the exclusion flips no session's classification.
-    const before = classifySessions({ evaluatorResults: [depBackend, sibling, depAnalyst] });
+    // The exclusion flips no session's classification.
     const after = classifySessions({ evaluatorResults: guarded.records });
     expect(after.statuses.get(backendSid)).toBe('scored');
-    expect(after.total).toBe(before.total);
-    expect(after.spanMissing).toBe(before.spanMissing);
+    expect(after.total).toBe(2);
+    expect(after.spanMissing).toBe(0);
   });
 });
 
-// ─── TEAM-3376: handler wiring — seen-set, dedup metrics, aggregation ───────
+// ─── TEAM-3376: handler wiring — seen-set, dedup metrics, aggregation ────────
 
 describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', () => {
   let handler;
@@ -1025,8 +1561,9 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
   const lastEvalMetrics = () => emfLines('EvalSessionsTotal').at(-1);
 
   it('drops a duplicate split across two deliveries via the seen-set (1 retained overall)', async () => {
+    ddbState.seenSetConditional = true; // real DDB conditional-write semantics
     const event = awslogsEvent([
-      evalRecord({ sessionId: 'sess-x', score: 8, scoreLabel: 'pass', extraAttrs: { 'aws.request_id': 'req-shared' } }),
+      evalRecord({ sessionId: 'sess-x', score: 8, scoreLabel: 'pass', requestId: 'req-shared' }),
     ]);
 
     await handler(event); // delivery A: fresh → conditional put succeeds
@@ -1054,7 +1591,7 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
     expect(aggregateWrites()).toHaveLength(1);
   });
 
-  it('aggregation deltas are identical for a clean delivery and the same delivery duplicated 8×', async () => {
+  it('aggregation deltas are identical for a clean delivery and the same delivery duplicated 8×, across handler calls', async () => {
     const rows = (prefix) => [
       { sessionId: 'sess-1', evaluatorName: 'builtin.correctness', score: 8, requestId: `${prefix}-1` },
       { sessionId: 'sess-1', evaluatorName: 'builtin.helpfulness', score: 6, requestId: `${prefix}-2` },
@@ -1066,7 +1603,7 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
         evaluatorName: r.evaluatorName,
         score: r.score,
         scoreLabel: 'pass',
-        extraAttrs: { 'aws.request_id': r.requestId },
+        requestId: r.requestId,
       });
 
     await handler(awslogsEvent(rows('a').map(toRecord)));
@@ -1121,7 +1658,7 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
 
   it('EMF for a DUPLICATED delivery: healthy rates, dropped count surfaced', async () => {
     const nine = Array.from({ length: 9 }, () =>
-      evalRecord({ sessionId: 'sess-d', score: 8, scoreLabel: 'pass', extraAttrs: { 'aws.request_id': 'req-dup-emf' } })
+      evalRecord({ sessionId: 'sess-d', score: 8, scoreLabel: 'pass', requestId: 'req-dup-emf' })
     );
     await handler(awslogsEvent(nine));
     const emf = lastEvalMetrics();
@@ -1132,11 +1669,11 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
     expect(emf.EvalSessionsError).toBe(0);
   });
 
-  it('EMF for a HEALTHY delivery: all new metrics present and zero', async () => {
+  it('EMF for a HEALTHY delivery: all rate/duplicate metrics present and zero', async () => {
     await handler(
       awslogsEvent([
-        evalRecord({ sessionId: 'sess-h1', score: 9, scoreLabel: 'pass', extraAttrs: { 'aws.request_id': 'req-h1' } }),
-        evalRecord({ sessionId: 'sess-h2', score: 7, scoreLabel: 'pass', extraAttrs: { 'aws.request_id': 'req-h2' } }),
+        evalRecord({ sessionId: 'sess-h1', score: 9, scoreLabel: 'pass', requestId: 'req-h1' }),
+        evalRecord({ sessionId: 'sess-h2', score: 7, scoreLabel: 'pass', requestId: 'req-h2' }),
       ])
     );
     const emf = lastEvalMetrics();
@@ -1152,9 +1689,11 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
   });
 });
 
-// ─── TEAM-3376: improver retry (design §2.3) ─────────────────────────────────
+// ─── TEAM-3376: setRetryHooks injection for invokeImprover ───────────────────
+// The deps-param injection is covered above (TEAM-3367); these pin the
+// module-level hook layer for callers that can't thread deps through.
 
-describe('TEAM-3376: invokeImprover retry', () => {
+describe('TEAM-3376: invokeImprover setRetryHooks injection', () => {
   let invokeImprover;
   let setRetryHooks;
 
@@ -1211,9 +1750,9 @@ describe('TEAM-3376: invokeImprover retry', () => {
 
     expect(text).toBe('the PRD');
     expect(httpsRequest).toHaveBeenCalledTimes(2);
-    // One sleep, deterministic under random()=0.5: floor(0.5 · min(60000, 2000·2¹)) = 2000,
-    // inside the full-jitter bound [0, 4000).
-    expect(sleeps).toEqual([2000]);
+    // One sleep, deterministic under random()=0.5: 0.5 · min(60000, 2000·2⁰) = 1000,
+    // inside the first retry's full-jitter bound [0, 2000).
+    expect(sleeps).toEqual([1000]);
   });
 
   it('never retries a non-throttle 4xx', async () => {
@@ -1237,8 +1776,8 @@ describe('TEAM-3376: invokeImprover retry', () => {
 
   it('stops before attempt 3 when the 520s budget cannot fit another 240s attempt', async () => {
     const sleeps = [];
-    // now(): startedAt=0; after attempt 1: 100s elapsed (retry fits: 100+240 ≤ 520);
-    // after attempt 2: 300s elapsed (300+240 > 520 → abandon).
+    // now(): start=0; before attempt 2: 100s elapsed (retry fits: 100+240 ≤ 520);
+    // before attempt 3: 300s elapsed (300+240 > 520 → abandon).
     const ticks = [0, 100_000, 300_000];
     setRetryHooks({
       sleep: (ms) => {
@@ -1251,10 +1790,9 @@ describe('TEAM-3376: invokeImprover retry', () => {
     httpsRequest.mockReset().mockImplementation(respondWith(429, ''));
 
     await expect(invokeImprover(IMPROVER_ARN, 'synthesize', AGENT_ID)).rejects.toThrow(
-      /improver returned 429/
+      /improver retry abandoned/
     );
     expect(httpsRequest).toHaveBeenCalledTimes(2); // attempt 3 never started
     expect(sleeps).toHaveLength(1); // only the first retry slept
-    expect(textLogs()).toContain('improver retry abandoned');
   });
 });
