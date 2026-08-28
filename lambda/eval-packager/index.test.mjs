@@ -205,12 +205,59 @@ beforeEach(() => {
     // DDB throttle / 400KB-item rejection does, so a test can prove that a
     // failed invocation claimed nothing and its re-delivery is processed.
     appendFailures: 0,
+    // TEAM-3385 finding 6: every conditional buffer-reset ("flush claim") the
+    // handler attempts, won or lost. `stealFlushClaim` makes a rival invocation
+    // move lastFlushedAt between our config read and our claim (see GetCommand).
+    flushResets: [],
+    stealFlushClaim: false,
+    // TEAM-3385 finding 7: the scorecard merge is optimistic-locked on
+    // evalAggVersion. `aggWrites` records the accepted writes; setting
+    // `aggConflicts` makes the next N merge writes lose the version check the way
+    // a concurrent invocation would — the fake applies that invocation's write
+    // (bumping the version and merging `concurrentAggDelta`) and *then* throws, so
+    // a retry that fails to re-read is visible as a lost delta.
+    aggWrites: [],
+    aggConflicts: 0,
+    concurrentAggDelta: {},
+    // Persisting the merged scorecard back into `config` is opt-in: the
+    // duplicate-aggregation suites replay the same delivery and assert on the raw
+    // per-call deltas, which a stateful scorecard would compound.
+    aggPersist: false,
+  };
+
+  // Evaluate the two conditional-write shapes index.mjs uses against the fake
+  // item. Anything else is unconditional.
+  const conditionHolds = (cond, values) => {
+    if (cond.includes('attribute_not_exists(lastFlushedAt)')) return ddbState.config.lastFlushedAt === undefined;
+    if (cond.includes('lastFlushedAt = :expected')) return ddbState.config.lastFlushedAt === values[':expected'];
+    if (cond.includes('attribute_not_exists(evalAggVersion)')) return ddbState.config.evalAggVersion === undefined;
+    if (cond.includes('evalAggVersion = :expectedVersion')) {
+      return ddbState.config.evalAggVersion === values[':expectedVersion'];
+    }
+    return true;
+  };
+  const conditionalCheckFailed = () => {
+    const err = new Error('The conditional request failed');
+    err.name = 'ConditionalCheckFailedException';
+    return err;
   };
 
   ddbSend.mockReset();
   ddbSend.mockImplementation(async (cmd) => {
     const name = cmd.constructor.name;
-    if (name === 'GetCommand') return { Item: ddbState.config };
+    if (name === 'GetCommand') {
+      const snapshot = ddbState.config;
+      // TEAM-3385 finding 6: model the race itself. A concurrent invocation wins
+      // the flush AFTER this read and BEFORE our claim, so the value we based the
+      // cooldown decision on is already stale by the time we compare-and-swap.
+      if (ddbState.stealFlushClaim) {
+        ddbState.config = { ...snapshot, lastFlushedAt: '2026-08-28T00:00:00.000Z' };
+      }
+      // Cloned, because a real Get deserializes a fresh object every call: handing
+      // out the stored reference would let a caller's in-place merge mutate the
+      // "table" and make a retried read see its own half-applied write.
+      return { Item: structuredClone(snapshot) };
+    }
     if (name === 'BatchGetCommand') {
       // Real BatchGetItem returns only the keys that exist, in no guaranteed
       // order, and rejects a request that repeats a key.
@@ -261,6 +308,46 @@ beforeEach(() => {
             bufferSessions: ddbState.bufferSessions,
           },
         };
+      }
+
+      const values = cmd.input.ExpressionAttributeValues || {};
+      const cond = cmd.input.ConditionExpression || '';
+
+      // flushBuffer's flush claim: reset the buffer iff lastFlushedAt still holds
+      // the value the cooldown decision was made from (TEAM-3385 finding 6).
+      if (values[':empty']) {
+        ddbState.flushResets.push(cmd.input);
+        if (!conditionHolds(cond, values)) throw conditionalCheckFailed();
+        ddbState.config = { ...ddbState.config, lastFlushedAt: values[':ts'] };
+        ddbState.priorBuffer = [];
+        return {};
+      }
+
+      // aggregateScoresToDdb's optimistic-locked scorecard merge (finding 7).
+      if (values[':scores']) {
+        if (ddbState.aggConflicts > 0) {
+          ddbState.aggConflicts -= 1;
+          ddbState.config = {
+            ...ddbState.config,
+            evalAggVersion: (ddbState.config.evalAggVersion ?? 0) + 1,
+            evalScores: { ...(ddbState.config.evalScores || {}), ...ddbState.concurrentAggDelta },
+          };
+          throw conditionalCheckFailed();
+        }
+        if (!conditionHolds(cond, values)) throw conditionalCheckFailed();
+        ddbState.aggWrites.push(cmd.input);
+        // The version always persists — that is what makes the compare-and-swap
+        // real across handler calls. The merged data only when aggPersist is set.
+        ddbState.config = { ...ddbState.config, evalAggVersion: values[':nextVersion'] };
+        if (ddbState.aggPersist) {
+          ddbState.config = {
+            ...ddbState.config,
+            evalScores: values[':scores'],
+            evalSessionCount: values[':sc'],
+            evalStatusCounts: values[':statusCounts'],
+          };
+        }
+        return {};
       }
       return {};
     }
@@ -2038,10 +2125,18 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
     expect(emf.EvalSessionsError).toBe(1);
   });
 
+  // The errorMessage matters, not just the errorType: a ValidationException whose
+  // message is the missing-span text is a TELEMETRY failure and is counted under
+  // EvalSessionsSpanMissing instead (TEAM-3385 finding 5, asserted below).
   it('EMF for a VALIDATION-FAILED delivery: validation rate 1, throttle 0', async () => {
     await handler(
       awslogsEvent([
-        evalRecord({ sessionId: 'sess-v', score: null, errorType: 'ValidationException', errorMessage: MISSING_SPAN_MESSAGE }),
+        evalRecord({
+          sessionId: 'sess-v',
+          score: null,
+          errorType: 'ValidationException',
+          errorMessage: 'The value at judgeModelId failed to satisfy constraint: member must not be blank',
+        }),
       ])
     );
     const emf = lastEvalMetrics();
@@ -2050,6 +2145,7 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
     expect(emf.EvalValidationExceptionRate).toBe(1);
     expect(emf.EvalDuplicateResultCount).toBe(0);
     expect(emf.EvalSessionsError).toBe(1);
+    expect(emf.EvalSessionsSpanMissing).toBe(0);
   });
 
   it('EMF for a DUPLICATED delivery: healthy rates, dropped count surfaced', async () => {
@@ -2393,5 +2489,288 @@ describe('TEAM-3376: invokeImprover setRetryHooks injection', () => {
     );
     expect(httpsRequest).toHaveBeenCalledTimes(2); // attempt 3 never started
     expect(sleeps).toHaveLength(1); // only the first retry slept
+  });
+});
+
+// ─── TEAM-3385: span-missing classification + concurrency claims ──────────────
+// Three more adversarial-review findings, all about a decision made from stale or
+// unguarded state:
+//   finding 5 — a missing-span failure arrives as errorType=ValidationException,
+//               so classifySessions filed the fleet's single largest failure class
+//               under EvalValidationExceptionRate and left EvalSessionsSpanMissing
+//               at 0 while spans were still missing.
+//   finding 6 — the flush's buffer reset was unconditional and the cooldown was
+//               decided from a config read that is stale by the whole per-record
+//               loop, so two concurrent invocations could both flush the same
+//               sessions (duplicate PRD, duplicate workflow) and the second reset
+//               wiped whatever was appended between the two.
+//   finding 7 — the scorecard merge was a plain Get-then-Set, so two concurrent
+//               deliveries raced and one delivery's score deltas vanished.
+
+describe('TEAM-3385: span-missing classification + concurrency claims', () => {
+  let handler;
+  let extractSessionData;
+  let classifySessions;
+  let setRetryHooks;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET = 'agentcore-hub-artifacts-123456789012-us-east-1';
+    process.env.EVAL_CONFIG_TABLE = 'agentcore-hub-eval-config';
+    process.env.AWS_REGION = 'us-east-1';
+    process.env.AWS_ACCOUNT_ID = '123456789012';
+    process.env.IMPROVEMENT_AGENT_ARN = IMPROVER_ARN;
+    process.env.EVAL_SEEN_TABLE = 'agentcore-hub-eval-seen-test';
+    vi.resetModules();
+    ({ handler, extractSessionData, classifySessions, setRetryHooks } = await import('./index.mjs'));
+  });
+
+  beforeEach(() => {
+    // Deterministic, instant retry timing for the finding-7 optimistic-locking
+    // loop (the module's own hooks, same as the invokeImprover suite uses).
+    setRetryHooks({ sleep: () => Promise.resolve(), random: () => 0.5 });
+  });
+
+  const deliveryOf = (records) => ({
+    logGroup: LOG_GROUP,
+    logStream: 'team-3385-concurrency-stream',
+    logEvents: records.map((r, i) => ({
+      timestamp: 1_756_260_000_000 + i,
+      message: JSON.stringify(r),
+    })),
+  });
+  const classify = (records) => classifySessions(extractSessionData(deliveryOf(records)));
+  const lastEvalMetrics = () => emfLines('EvalSessionsTotal').at(-1);
+  const flushClaims = () => ddbState.flushResets;
+  const appendWrites = () =>
+    sentCommands(ddbSend, 'UpdateCommand').filter((c) => c.input.ReturnValues === 'ALL_NEW');
+
+  // ── finding 5: a ValidationException that is really a missing span ─────────
+  it('a ValidationException carrying the missing-span message is span_missing, not a validation error', () => {
+    const result = classify([
+      evalRecord({
+        sessionId: 'sess-ms',
+        score: null,
+        errorType: 'ValidationException',
+        errorMessage: MISSING_SPAN_MESSAGE,
+        requestId: 'req-ms-1',
+      }),
+    ]);
+
+    expect(result.statuses.get('sess-ms')).toBe('span_missing');
+    expect(result.spanMissing).toBe(1);
+    // Excluded from EVERY error subtotal: it is a telemetry failure, and counting
+    // it as a validation error is what hid the 38.4% failure class.
+    expect(result.validationErrors).toBe(0);
+    expect(result.throttled).toBe(0);
+    expect(result.genericErrors).toBe(0);
+    expect(result.errors).toBe(0);
+    expect(result.total).toBe(1);
+  });
+
+  it('a genuine ValidationException (any other message) still counts as a validation error', () => {
+    const result = classify([
+      evalRecord({
+        sessionId: 'sess-gv',
+        score: null,
+        errorType: 'ValidationException',
+        errorMessage: 'The value at judgeModelId failed to satisfy constraint: member must not be blank',
+        requestId: 'req-gv-1',
+      }),
+    ]);
+
+    expect(result.statuses.get('sess-gv')).toBe('error');
+    expect(result.validationErrors).toBe(1);
+    expect(result.spanMissing).toBe(0);
+    expect(result.errors).toBe(1);
+  });
+
+  it('an allNull session with no errorType at all is still span_missing (unchanged)', () => {
+    const result = classify([evalRecord({ sessionId: 'sess-quiet', score: null, requestId: 'req-q-1' })]);
+    expect(result.statuses.get('sess-quiet')).toBe('span_missing');
+    expect(result.spanMissing).toBe(1);
+    expect(result.errors).toBe(0);
+  });
+
+  // Pins the documented tie-break: THROTTLE WINS. A throttled judge is a
+  // plausible source of missing-span-shaped noise, the throttle is the actionable
+  // signal, and it keeps `throttled` continuous with the pre-fix metric.
+  it('throttle beats missing-span when a session has both rows (documented tie-break)', () => {
+    const result = classify([
+      evalRecord({
+        sessionId: 'sess-both',
+        evaluatorName: 'builtin.correctness',
+        score: null,
+        errorType: 'ThrottlingException',
+        errorMessage: 'Rate exceeded',
+        requestId: 'req-both-1',
+      }),
+      evalRecord({
+        sessionId: 'sess-both',
+        evaluatorName: 'builtin.helpfulness',
+        score: null,
+        errorType: 'ValidationException',
+        errorMessage: MISSING_SPAN_MESSAGE,
+        requestId: 'req-both-2',
+      }),
+    ]);
+
+    expect(result.statuses.get('sess-both')).toBe('error');
+    expect(result.throttled).toBe(1);
+    expect(result.spanMissing).toBe(0);
+    expect(result.validationErrors).toBe(0);
+    expect(result.errors).toBe(1);
+  });
+
+  it('EMF wiring: the handler publishes the corrected span_missing / validation split', async () => {
+    await handler(
+      awslogsEvent([
+        evalRecord({
+          sessionId: 'sess-emf-ms',
+          score: null,
+          errorType: 'ValidationException',
+          errorMessage: MISSING_SPAN_MESSAGE,
+          requestId: 'req-emf-ms',
+        }),
+        evalRecord({
+          sessionId: 'sess-emf-gv',
+          score: null,
+          errorType: 'ValidationException',
+          errorMessage: 'judgeModelId must not be blank',
+          requestId: 'req-emf-gv',
+        }),
+      ])
+    );
+
+    const emf = lastEvalMetrics();
+    expect(emf.EvalSessionsTotal).toBe(2);
+    expect(emf.EvalSessionsSpanMissing).toBe(1);
+    expect(emf.EvalSessionsError).toBe(1);
+    expect(emf.EvalValidationExceptionRate).toBe(0.5);
+    expect(emf.EvalThrottleRate).toBe(0);
+  });
+
+  // ── finding 6: the flush claim ─────────────────────────────────────────────
+  it('the losing invocation of a concurrent double-flush archives nothing and synthesizes nothing', async () => {
+    ddbState.config = { ...ddbState.config, lastFlushedAt: '2026-08-27T00:00:00.000Z' };
+    ddbState.stealFlushClaim = true; // a rival flushes between our read and our claim
+
+    const result = await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-lost', score: 8, scoreLabel: 'pass', requestId: 'req-lost' })])
+    );
+
+    // It tried to claim, on exactly the value its cooldown decision was made from.
+    expect(flushClaims()).toHaveLength(1);
+    expect(flushClaims()[0].ConditionExpression).toBe('lastFlushedAt = :expected');
+    expect(flushClaims()[0].ExpressionAttributeValues[':expected']).toBe('2026-08-27T00:00:00.000Z');
+
+    // ...and having lost it, produced no side effects at all beyond that write.
+    expect(putsUnder('fleet-imp-agent/batches/')).toEqual([]);
+    expect(putsUnder('fleet-imp-agent/prd/')).toEqual([]);
+    expect(httpsRequest).not.toHaveBeenCalled();
+    // No batch datapoint either: a Maximum-statistic alarm on a double-counted
+    // batch is a false page.
+    expect(emfLines('eval.batch.null_or_error_rate')).toEqual([]);
+    // The delivery itself succeeded — the rows are buffered for the winner.
+    expect(result).toEqual({ statusCode: 200, body: 'ok' });
+
+    const claimLost = jsonLogs().filter((l) => l.event === 'eval.flush.claim_lost');
+    expect(claimLost).toHaveLength(1);
+    expect(claimLost[0].agentId).toBe(AGENT_ID);
+    expect(claimLost[0].expectedLastFlushedAt).toBe('2026-08-27T00:00:00.000Z');
+  });
+
+  it('the winning invocation still archives, meters and synthesizes (claim path unchanged)', async () => {
+    const result = await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-won', score: 8, scoreLabel: 'pass', requestId: 'req-won' })])
+    );
+
+    // Never flushed before → the claim guards on absence rather than a value.
+    expect(flushClaims()).toHaveLength(1);
+    expect(flushClaims()[0].ConditionExpression).toBe('attribute_not_exists(lastFlushedAt)');
+    expect(flushClaims()[0].ExpressionAttributeValues[':expected']).toBeUndefined();
+
+    expect(putsUnder('fleet-imp-agent/batches/')).toHaveLength(1);
+    expect(putsUnder('fleet-imp-agent/prd/')).toHaveLength(1);
+    expect(emfLines('eval.batch.null_or_error_rate')).toHaveLength(1);
+    expect(result).toEqual({ statusCode: 200, body: 'ok' });
+    expect(jsonLogs().filter((l) => l.event === 'eval.flush.claim_lost')).toEqual([]);
+  });
+
+  // ── finding 7: the optimistic-locked scorecard merge ───────────────────────
+  it('a lost version check re-reads and re-merges, so no delivery’s score deltas are dropped', async () => {
+    ddbState.config = { ...ddbState.config, batchSize: 10 }; // no flush; aggregation only
+    ddbState.aggPersist = true;
+
+    await handler(
+      awslogsEvent([
+        evalRecord({
+          sessionId: 'sess-agg-a',
+          evaluatorName: 'builtin.correctness',
+          score: 8,
+          scoreLabel: 'pass',
+          requestId: 'req-agg-a',
+        }),
+      ])
+    );
+    expect(ddbState.config.evalScores).toEqual({ 'builtin.correctness': { sum: 8, count: 1 } });
+    expect(ddbState.config.evalAggVersion).toBe(1);
+
+    // Delivery B loses the version check once. The rival's write lands first and
+    // carries its own delta, which B can only preserve by RE-READING.
+    ddbState.aggConflicts = 1;
+    ddbState.concurrentAggDelta = { 'builtin.groundedness': { sum: 5, count: 1 } };
+
+    await handler(
+      awslogsEvent([
+        evalRecord({
+          sessionId: 'sess-agg-b',
+          evaluatorName: 'builtin.helpfulness',
+          score: 6,
+          scoreLabel: 'pass',
+          requestId: 'req-agg-b',
+        }),
+      ])
+    );
+
+    // All three deltas survive: A's, the rival's, and B's.
+    expect(ddbState.config.evalScores).toEqual({
+      'builtin.correctness': { sum: 8, count: 1 },
+      'builtin.groundedness': { sum: 5, count: 1 },
+      'builtin.helpfulness': { sum: 6, count: 1 },
+    });
+    expect(ddbState.config.evalSessionCount).toBe(2);
+    // v1 (A) → v2 (rival) → v3 (B's retry).
+    expect(ddbState.config.evalAggVersion).toBe(3);
+    expect(ddbState.aggWrites).toHaveLength(2);
+    expect(ddbState.aggWrites[1].ConditionExpression).toBe('evalAggVersion = :expectedVersion');
+    expect(ddbState.aggWrites[1].ExpressionAttributeValues[':expectedVersion']).toBe(2);
+    expect(textLogs()).toMatch(/lost the version check \(attempt 1\/3\)/);
+  });
+
+  it('the first-ever merge guards on the version being absent', async () => {
+    ddbState.config = { ...ddbState.config, batchSize: 10 };
+
+    await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-first', score: 7, scoreLabel: 'pass', requestId: 'req-first' })])
+    );
+
+    expect(ddbState.aggWrites).toHaveLength(1);
+    expect(ddbState.aggWrites[0].ConditionExpression).toBe('attribute_not_exists(evalAggVersion)');
+    expect(ddbState.aggWrites[0].ExpressionAttributeValues[':nextVersion']).toBe(1);
+  });
+
+  it('exhausting the aggregation retries is non-fatal: the delivery is still buffered and flushed', async () => {
+    ddbState.aggConflicts = 3; // every attempt loses
+
+    const result = await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-hot', score: 9, scoreLabel: 'pass', requestId: 'req-hot' })])
+    );
+
+    expect(ddbState.aggWrites).toEqual([]); // nothing was ever accepted
+    expect(textLogs()).toMatch(/score aggregation failed after 3 contended attempts/);
+    // The scorecard is a dashboard tally; the batch is the pipeline. It still ran.
+    expect(appendWrites()).toHaveLength(1);
+    expect(putsUnder('fleet-imp-agent/batches/')).toHaveLength(1);
+    expect(result).toEqual({ statusCode: 200, body: 'ok' });
   });
 });

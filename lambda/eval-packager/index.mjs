@@ -40,6 +40,7 @@ import {
   classifyEntry,
   computeBatchSummary,
   emfRecord,
+  isMissingSpanError,
   sessionsMissingSpan,
 } from './lib/classify.mjs';
 
@@ -238,8 +239,13 @@ export const handler = async (event) => {
       );
       return { statusCode: 200, body: 'cooldown' };
     }
-    // 7. Batch is full → flush to S3 + synthesize PRD
-    await flushBuffer(agentId, appended.buffer, batchSize);
+    // 7. Batch is full → flush to S3 + synthesize PRD.
+    //    config.lastFlushedAt is the value the cooldown decision above was made
+    //    from, and it is already stale by the whole per-record loop. Passing it
+    //    through turns the flush's buffer reset into a compare-and-swap on
+    //    exactly that value, so of two concurrent invocations that both decided
+    //    to flush, only one actually does (TEAM-3385 finding 6).
+    await flushBuffer(agentId, appended.buffer, batchSize, config.lastFlushedAt);
   }
 
   return { statusCode: 200, body: 'ok' };
@@ -967,6 +973,28 @@ function emitMissingSpanAlerts(agentId, entries) {
  * everything else. The statuses map keeps the coarse 'error' value: nothing
  * downstream (buffer, dashboard) may flip on the subtype; only the EMF rates
  * read the partition.
+ *
+ * TEAM-3385 finding 5: a CONFIRMED missing-span session is 'span_missing', not
+ * an error, even though it arrives WITH an error.type. The evaluations service
+ * reports "none of the spans contain the required agent invocation" as
+ * error.type=ValidationException, so the old order (allNull && hasError →
+ * 'error' → matches VALIDATION_ERROR_RE) filed the single biggest failure class
+ * in the RCA (38.4% of runs) under EvalValidationExceptionRate, while
+ * EvalSessionsSpanMissing only ever counted allNull sessions with NO errorType.
+ * Two metrics lied at once: the validation rate conflated a broken telemetry
+ * pipeline with genuine bad-request failures, and "EvalSessionsSpanMissing = 0"
+ * passed trivially while spans were still missing. The message, not the type, is
+ * the discriminator — hence isMissingSpanError (lib/classify.mjs), the same
+ * predicate emitMissingSpanAlerts and sessionsMissingSpan already used, so the
+ * per-session alarm and the fleet metric can no longer disagree.
+ *
+ * ORDER: throttle is still checked FIRST, so a session carrying BOTH a throttle
+ * row and a missing-span row counts as throttled and NOT as span_missing. A
+ * throttled judge is a plausible CAUSE of the missing-span-shaped noise (it can
+ * fail before it ever reads the span), the throttle is the actionable signal, and
+ * throttles are self-limiting where a genuinely missing span is a deploy bug. It
+ * also keeps `throttled` continuous with the pre-fix metric. Missing-span
+ * therefore wins only when no throttle row exists in the session.
  */
 export function classifySessions(sessionData) {
   const bySession = new Map();
@@ -982,12 +1010,25 @@ export function classifySessions(sessionData) {
   for (const [sid, rows] of bySession) {
     const allNull = rows.every((r) => r.score === null);
     const hasError = rows.some((r) => r.errorType);
-    statuses.set(sid, !allNull ? 'scored' : hasError ? 'error' : 'span_missing');
-    if (statuses.get(sid) === 'error') {
-      if (rows.some((r) => THROTTLE_RE.test(r.errorType ?? ''))) throttled += 1;
-      else if (rows.some((r) => VALIDATION_ERROR_RE.test(r.errorType ?? ''))) validationErrors += 1;
-      else genericErrors += 1;
+    if (!allNull) {
+      statuses.set(sid, 'scored');
+      continue;
     }
+    if (!hasError) {
+      statuses.set(sid, 'span_missing');
+      continue;
+    }
+    const isThrottled = rows.some((r) => THROTTLE_RE.test(r.errorType ?? ''));
+    // Confirmed missing span (and no throttle to blame it on) → a telemetry
+    // failure, tallied as span_missing and excluded from every error subtotal.
+    if (!isThrottled && rows.some((r) => isMissingSpanError(r))) {
+      statuses.set(sid, 'span_missing');
+      continue;
+    }
+    statuses.set(sid, 'error');
+    if (isThrottled) throttled += 1;
+    else if (rows.some((r) => VALIDATION_ERROR_RE.test(r.errorType ?? ''))) validationErrors += 1;
+    else genericErrors += 1;
   }
   return {
     statuses,
@@ -1146,10 +1187,34 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
  * (TEAM-3385 finding 2 — an over-count beats the permanent data loss the
  * claim-first ordering caused). Details at the call site.
  *
+ * TEAM-3385 finding 7: this is a Get-merge-Set, and CloudWatch Logs can invoke
+ * the packager concurrently for the SAME agent. Two deliveries that read the
+ * same scorecard both computed `stored + own delta` and the second write
+ * clobbered the first — one delivery's evalScores, evalSessionCount and
+ * evalStatusCounts deltas vanished silently. Guarded with OPTIMISTIC LOCKING on
+ * an `evalAggVersion` counter (atomic ADD can't reach the nested evalScores map
+ * paths without a per-evaluator SET that fails on first write anyway): read the
+ * version, write conditionally on it, and on a lost condition re-read and
+ * re-merge, bounded by AGG_RETRY. Losing all attempts is logged and non-fatal,
+ * matching the existing posture.
+ *
+ * evalSessionCount stays APPROXIMATE regardless: CloudWatch Logs delivery is
+ * at-least-once and the seen-set claim happens after this call, so a re-delivered
+ * batch can count a session twice. It is a dashboard tally, not a ledger — the
+ * version guard is here to stop CONCURRENT writes from losing data, not to make
+ * the count exact.
+ *
  * @param {Array<object>} [entries] classified evaluator-result entries for this
  *   delivery (from extractSessionData, deduped). Optional — omitted or empty
  *   leaves the status tally alone.
  */
+// Optimistic-locking retry for the scorecard merge (TEAM-3385 finding 7).
+// Contention here is two Lambda invocations, not a queue, so the delays are
+// milliseconds — just enough to de-correlate the re-reads. Full jitter, same
+// shape as improverBackoffDelayMs, and it reuses the setRetryHooks sleep/random
+// so tests stay deterministic and fast.
+const AGG_RETRY = { maxAttempts: 3, baseDelayMs: 25 };
+
 async function aggregateScoresToDdb(agentId, entries = []) {
   const sessions = new Set();
   const scoreDeltas = {}; // { evaluatorName: { sum, count } }
@@ -1170,88 +1235,127 @@ async function aggregateScoresToDdb(agentId, entries = []) {
 
   if (Object.keys(scoreDeltas).length === 0 && sessions.size === 0) return;
 
-  try {
-    // Read current scorecard
-    const { Item } = await ddb.send(new GetCommand({
-      TableName: TABLE,
-      Key: { agentId },
-      ProjectionExpression: 'evalScores, evalSessionCount, evalStatusCounts',
-    }));
+  const deliverySummary = computeBatchSummary(entries);
+  const sleep =
+    retryHooks.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const random = retryHooks.random || Math.random;
 
-    const existing = Item?.evalScores || {};
-    const existingSessions = Item?.evalSessionCount || 0;
+  for (let attempt = 0; attempt < AGG_RETRY.maxAttempts; attempt += 1) {
+    try {
+      // Read current scorecard AND its version. Every field this function merges
+      // is read here, so a retry re-merges against whatever the winner wrote.
+      const { Item } = await ddb.send(new GetCommand({
+        TableName: TABLE,
+        Key: { agentId },
+        ProjectionExpression:
+          'evalScores, evalSessionCount, evalStatusCounts, evalAggVersion',
+      }));
 
-    // Merge deltas
-    for (const [evaluator, delta] of Object.entries(scoreDeltas)) {
-      if (!existing[evaluator]) existing[evaluator] = { sum: 0, count: 0 };
-      existing[evaluator].sum += delta.sum;
-      existing[evaluator].count += delta.count;
+      const expectedVersion =
+        typeof Item?.evalAggVersion === 'number' ? Item.evalAggVersion : null;
+      const existing = Item?.evalScores || {};
+      const existingSessions = Item?.evalSessionCount || 0;
+
+      // Merge deltas
+      for (const [evaluator, delta] of Object.entries(scoreDeltas)) {
+        if (!existing[evaluator]) existing[evaluator] = { sum: 0, count: 0 };
+        existing[evaluator].sum += delta.sum;
+        existing[evaluator].count += delta.count;
+      }
+
+      // Merge this delivery's status tally on top of the stored one. Same
+      // read-modify-write shape as evalScores above, and it can't fail on a
+      // first write the way a nested `evalStatusCounts.success` path update would.
+      const statusCounts = {
+        success: 0,
+        error: 0,
+        pending: 0,
+        skipped: 0,
+        ...(Item?.evalStatusCounts || {}),
+      };
+      statusCounts.success += deliverySummary.successCount;
+      statusCounts.error += deliverySummary.errorCount;
+      statusCounts.pending += deliverySummary.nullCount;
+      statusCounts.skipped += deliverySummary.skippedCount;
+
+      const now = new Date().toISOString();
+      const updateExpr = [
+        'evalScores = :scores',
+        'evalSessionCount = :sc',
+        'evalLastScoredAt = :now',
+        'evalStatusCounts = :statusCounts',
+        'evalAggVersion = :nextVersion',
+      ];
+      const values = {
+        ':scores': existing,
+        ':sc': existingSessions + sessions.size,
+        ':now': now,
+        ':statusCounts': statusCounts,
+        ':nextVersion': (expectedVersion ?? 0) + 1,
+      };
+      if (expectedVersion !== null) values[':expectedVersion'] = expectedVersion;
+
+      // Only stamp the last-error fields when this delivery actually errored —
+      // otherwise a clean delivery would erase the breadcrumb we need to debug.
+      if (deliverySummary.errorCount > 0) {
+        const firstError = (entries || []).find((e) => e.status === 'error');
+        updateExpr.push('evalLastErrorAt = :errAt', 'evalLastErrorReason = :errReason');
+        values[':errAt'] = now;
+        values[':errReason'] = String(firstError?.statusReason || 'unknown eval error').slice(0, 200);
+      }
+
+      // Write the merged scorecard, but ONLY if nobody else wrote between the
+      // read above and now (TEAM-3385 finding 7).
+      await ddb.send(new UpdateCommand({
+        TableName: TABLE,
+        Key: { agentId },
+        UpdateExpression: 'SET ' + updateExpr.join(', '),
+        ConditionExpression:
+          expectedVersion !== null
+            ? 'evalAggVersion = :expectedVersion'
+            : 'attribute_not_exists(evalAggVersion)',
+        ExpressionAttributeValues: values,
+      }));
+
+      console.log(
+        `[eval-packager] ${agentId}: aggregated ${Object.keys(scoreDeltas).length} evaluators, ${sessions.size} sessions ` +
+          `(delivery: ${deliverySummary.successCount} success / ${deliverySummary.errorCount} error / ` +
+          `${deliverySummary.nullCount} pending / ${deliverySummary.skippedCount} skipped)`
+      );
+      return;
+    } catch (err) {
+      const lost = err?.name === 'ConditionalCheckFailedException';
+      if (lost && attempt < AGG_RETRY.maxAttempts - 1) {
+        // Someone else merged first. Re-read and re-merge onto THEIR value; the
+        // deltas above are this delivery's own and are unaffected by the loss.
+        const delayMs = random() * AGG_RETRY.baseDelayMs * 2 ** attempt;
+        console.log(
+          `[eval-packager] ${agentId}: score aggregation lost the version check ` +
+            `(attempt ${attempt + 1}/${AGG_RETRY.maxAttempts}) — re-reading in ${Math.round(delayMs)}ms.`
+        );
+        await sleep(delayMs);
+        continue;
+      }
+      // Non-fatal — don't break the buffer/flush pipeline. A dropped aggregate is
+      // a stale dashboard number; a thrown error here would re-deliver the batch.
+      console.error(
+        `[eval-packager] ${agentId} score aggregation failed` +
+          `${lost ? ` after ${AGG_RETRY.maxAttempts} contended attempts` : ''}:`,
+        err.message
+      );
+      return;
     }
-
-    // Merge this delivery's status tally on top of the stored one. Same
-    // read-modify-write shape as evalScores above, and it can't fail on a
-    // first write the way a nested `evalStatusCounts.success` path update would.
-    const deliverySummary = computeBatchSummary(entries);
-    const statusCounts = {
-      success: 0,
-      error: 0,
-      pending: 0,
-      skipped: 0,
-      ...(Item?.evalStatusCounts || {}),
-    };
-    statusCounts.success += deliverySummary.successCount;
-    statusCounts.error += deliverySummary.errorCount;
-    statusCounts.pending += deliverySummary.nullCount;
-    statusCounts.skipped += deliverySummary.skippedCount;
-
-    const now = new Date().toISOString();
-    const updateExpr = [
-      'evalScores = :scores',
-      'evalSessionCount = :sc',
-      'evalLastScoredAt = :now',
-      'evalStatusCounts = :statusCounts',
-    ];
-    const values = {
-      ':scores': existing,
-      ':sc': existingSessions + sessions.size,
-      ':now': now,
-      ':statusCounts': statusCounts,
-    };
-
-    // Only stamp the last-error fields when this delivery actually errored —
-    // otherwise a clean delivery would erase the breadcrumb we need to debug.
-    if (deliverySummary.errorCount > 0) {
-      const firstError = (entries || []).find((e) => e.status === 'error');
-      updateExpr.push('evalLastErrorAt = :errAt', 'evalLastErrorReason = :errReason');
-      values[':errAt'] = now;
-      values[':errReason'] = String(firstError?.statusReason || 'unknown eval error').slice(0, 200);
-    }
-
-    // Write merged scorecard
-    await ddb.send(new UpdateCommand({
-      TableName: TABLE,
-      Key: { agentId },
-      UpdateExpression: 'SET ' + updateExpr.join(', '),
-      ExpressionAttributeValues: values,
-    }));
-
-    console.log(
-      `[eval-packager] ${agentId}: aggregated ${Object.keys(scoreDeltas).length} evaluators, ${sessions.size} sessions ` +
-        `(delivery: ${deliverySummary.successCount} success / ${deliverySummary.errorCount} error / ` +
-        `${deliverySummary.nullCount} pending / ${deliverySummary.skippedCount} skipped)`
-    );
-  } catch (err) {
-    // Non-fatal — don't break the buffer/flush pipeline
-    console.error(`[eval-packager] ${agentId} score aggregation failed:`, err.message);
   }
 }
 
 /**
  * Flush the session buffer. ORDER MATTERS:
- *   0. Re-dedupe the merged buffer in memory (TEAM-3381) — pure computation on
- *      the already-claimed batch, so it changes nothing about the ordering below.
- *   1. Reset the DDB buffer FIRST (the batch is already captured in memory).
- *   2. Archive the raw batch to batches/.
+ *   0. Re-dedupe the merged buffer in memory (TEAM-3381) — pure computation, no
+ *      side effects, so it is safe to do before the claim below.
+ *   1. CLAIM the batch with a CONDITIONAL reset of the DDB buffer. Losing the
+ *      condition means another invocation is already flushing this batch → return
+ *      immediately, having done nothing observable.
+ *   2. Archive the raw batch to batches/ and emit the batch health metric.
  *   3. Synthesize a PRD via the Fleet Improver and write it to prd/ — UNLESS the
  *      batch carries no evidence (see the evidence guard below), in which case
  *      the batch is archived and the loop stops here.
@@ -1260,10 +1364,28 @@ async function aggregateScoresToDdb(agentId, entries = []) {
  * came last, the run set would stay at batchSize for the whole synthesis
  * window — any concurrent invocation for the same agent would see
  * shouldFlush=true, re-read the SAME batch, and flush it again → duplicate
- * PRD + duplicate workflow. Resetting first keeps the duplicate window at one
- * DDB write (~100ms).
+ * PRD + duplicate workflow.
+ *
+ * TEAM-3385 finding 6: resetting first shrank that window to one DDB write but
+ * did not close it, because the reset was UNCONDITIONAL and the handler's
+ * cooldown gate reads `lastFlushedAt` from the GetCommand at the START of the
+ * invocation — stale by the whole per-record loop. Two concurrent invocations
+ * could both see runCount >= batchSize with the cooldown elapsed, both reset, and
+ * both flush overlapping ALL_NEW snapshots: a duplicate batch payload, a
+ * duplicate PRD (so a duplicate 14-agent workflow), and worse — the second reset
+ * wiped any delivery appended between the two resets.
+ *
+ * So the reset is now a compare-and-swap on the very value the cooldown decision
+ * was made from: `lastFlushedAt = :expected`, or attribute_not_exists for an agent
+ * that has never flushed. Exactly one concurrent invocation can win it. The loser
+ * produces NO side effects beyond its failed conditional write — no archive, no
+ * batch metric, no synthesis — and its rows are not lost: they stay in the
+ * winner's snapshot or in the fresh buffer the winner just created.
+ *
+ * @param {string|undefined} expectedLastFlushedAt the `lastFlushedAt` this
+ *   invocation's flush decision was based on (undefined = never flushed).
  */
-async function flushBuffer(agentId, buffer, batchSize) {
+async function flushBuffer(agentId, buffer, batchSize, expectedLastFlushedAt) {
   const timestamp = new Date().toISOString();
 
   // TEAM-3381 (FR-2.1 AC-1/AC-2): re-dedupe the MERGED buffer before anything
@@ -1299,8 +1421,54 @@ async function flushBuffer(agentId, buffer, batchSize) {
     sessions,
   };
 
-  // Batch health metric — the agentcore-hub-eval-null-or-error-rate-high alarm
-  // watches this. Non-fatal: never lose a batch over a metric line.
+  // 1. CLAIM the batch: reset sessionBuffer AND the distinct-run set, but only if
+  //    lastFlushedAt still holds the value this flush decision was made from.
+  //    Concurrent invocations then append into a fresh buffer instead of
+  //    re-flushing this one, and only the winner proceeds past here.
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { agentId },
+        UpdateExpression:
+          'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts REMOVE bufferSessions',
+        ConditionExpression: expectedLastFlushedAt
+          ? 'lastFlushedAt = :expected'
+          : 'attribute_not_exists(lastFlushedAt)',
+        ExpressionAttributeValues: {
+          ':empty': [],
+          ':ts': timestamp,
+          ...(expectedLastFlushedAt ? { ':expected': expectedLastFlushedAt } : {}),
+        },
+      })
+    );
+  } catch (err) {
+    if (err?.name !== 'ConditionalCheckFailedException') throw err;
+    // Lost the race. Another invocation owns this batch: it has the snapshot (or
+    // a superset of it) and will archive and synthesize from it. Emitting the
+    // batch metric or archiving here would double-count a single batch, so stop
+    // before ANY side effect.
+    console.log(
+      JSON.stringify({
+        level: 'warn',
+        event: 'eval.flush.claim_lost',
+        agentId,
+        expectedLastFlushedAt: expectedLastFlushedAt ?? null,
+        bufferEntries: sessions.length,
+        reason:
+          'another invocation claimed this flush (lastFlushedAt moved since the ' +
+          'cooldown check) — no archive, no batch metric, no PRD from this one',
+      })
+    );
+    return;
+  }
+  console.log(`[eval-packager] Agent ${agentId}: buffer + run set reset (batch claimed for flush).`);
+
+  // 2. Batch health metric — the agentcore-hub-eval-null-or-error-rate-high alarm
+  //    watches this. Emitted only by the invocation that WON the claim, so one
+  //    flushed batch produces exactly one datapoint (a Maximum-statistic alarm on
+  //    a double-counted batch is a false page). Non-fatal: never lose a batch
+  //    over a metric line.
   try {
     console.log(
       JSON.stringify(
@@ -1318,24 +1486,7 @@ async function flushBuffer(agentId, buffer, batchSize) {
     console.error(`[eval-packager] ${agentId} batch metric emit failed:`, err.message);
   }
 
-  // 1. Reset sessionBuffer AND the distinct-run set in DDB FIRST — claim the
-  //    batch so concurrent invocations append into a fresh buffer instead of
-  //    re-flushing this one.
-  await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE,
-      Key: { agentId },
-      UpdateExpression:
-        'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts REMOVE bufferSessions',
-      ExpressionAttributeValues: {
-        ':empty': [],
-        ':ts': timestamp,
-      },
-    })
-  );
-  console.log(`[eval-packager] Agent ${agentId}: buffer + run set reset (batch claimed for flush).`);
-
-  // 2. Archive the raw batch (batches/ prefix — does NOT trigger prd-submitter)
+  // 3. Archive the raw batch (batches/ prefix — does NOT trigger prd-submitter)
   const batchKey = `${BATCH_PREFIX}/batch-${agentId}-${timestamp}.json`;
   await s3.send(
     new PutObjectCommand({
@@ -1350,7 +1501,7 @@ async function flushBuffer(agentId, buffer, batchSize) {
       `crossDeliveryDuplicatesDropped=${crossDeliveryDuplicatesDropped} | archived=${batchKey}`
   );
 
-  // 3. Evidence guard — do NOT synthesize a PRD from a batch that contains no
+  // 4. Evidence guard — do NOT synthesize a PRD from a batch that contains no
   //    evidence. Two shapes qualify: nothing was ever scored (scoredTotal === 0)
   //    or everything the evaluator attempted failed (rate at the 100 maximum).
   //    Both mean the runtime/telemetry pipeline is broken, and a PRD built from
@@ -1388,7 +1539,7 @@ async function flushBuffer(agentId, buffer, batchSize) {
     return;
   }
 
-  // 4. Synthesize a PRD from the batch and write it to prd/ (triggers the loop).
+  // 5. Synthesize a PRD from the batch and write it to prd/ (triggers the loop).
   //    Best-effort: a transient improver failure leaves the batch archived and
   //    the buffer already reset, so the flush never wedges.
   try {
