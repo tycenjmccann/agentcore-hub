@@ -350,6 +350,145 @@ def test_bounding_is_fail_open() -> None:
         Tracer.end_tool_call_span = original
 
 
+# ─── TEAM-3384: total serialized bound + non-text ({"json": ...}) blocks ──────
+#
+# Per-block text bounding alone left two gaps: (1) many blocks each under the
+# per-block cap still serialize past the attribute limit; (2) non-text blocks
+# ({"json": ...} — the shape test_completion_gate.py exercises) rode through
+# unbounded. Either way the SDK truncates the serialized JSON mid-string →
+# the same ToolSpanMappingException.
+
+# 12 blocks, each well under the per-block cap (SIMULATED_LIMIT // 4 == 256),
+# but ~2.4k serialized in total — per-block bounding alone would not engage.
+MANY_SMALL_BLOCKS = [{"text": f"block {i}: " + "y" * 180} for i in range(12)]
+BIG_JSON_PAYLOAD = {"rows": [{"i": i, "data": "z" * 40} for i in range(200)]}  # ~12k serialized
+
+
+@tool
+def multi_block_tool(task: str) -> dict:
+    """Stub tool returning many small text blocks (each under the per-block cap)."""
+    return {"status": "success", "content": [dict(b) for b in MANY_SMALL_BLOCKS]}
+
+
+@tool
+def json_block_tool(task: str) -> dict:
+    """Stub tool returning one oversized {"json": ...} block (code-interpreter shape)."""
+    return {"status": "success", "content": [{"json": BIG_JSON_PAYLOAD}]}
+
+
+def _model_visible_tool_blocks(model: ToolCallingModel) -> list[dict]:
+    blocks = []
+    for message in model.seen_messages[-1]:
+        for block in message.get("content", []) or []:
+            if isinstance(block, dict) and "toolResult" in block:
+                blocks.extend(block["toolResult"].get("content", []) or [])
+    return blocks
+
+
+@pytest.mark.asyncio
+async def test_many_small_blocks_are_bounded_in_total_e2e(
+    limited_span_exporter: InMemorySpanExporter, bounding_ns: dict[str, Any]
+) -> None:
+    model = await _run_tool_agent(multi_block_tool, "multi_block_tool")
+
+    message = _tool_output_attr(limited_span_exporter)
+    assert len(message) < SIMULATED_LIMIT, "total bound must keep the value under the SDK limit"
+    parsed = json.loads(message)  # the eval service's "parse tool_output" step
+    assert isinstance(parsed, list)
+    assert parsed[0]["text"].startswith("block 0:"), "leading blocks must survive intact"
+    assert "more blocks omitted for telemetry" in parsed[-1]["text"]
+
+    # The model-visible tool result is NOT truncated — all 12 blocks, in full.
+    blocks = _model_visible_tool_blocks(model)
+    assert [b.get("text") for b in blocks] == [b["text"] for b in MANY_SMALL_BLOCKS]
+
+
+@pytest.mark.asyncio
+async def test_oversized_json_block_is_stubbed_e2e(
+    limited_span_exporter: InMemorySpanExporter, bounding_ns: dict[str, Any]
+) -> None:
+    model = await _run_tool_agent(json_block_tool, "json_block_tool")
+
+    message = _tool_output_attr(limited_span_exporter)
+    assert len(message) < SIMULATED_LIMIT
+    parsed = json.loads(message)
+    assert isinstance(parsed, list)
+    assert "json block omitted for telemetry" in parsed[0]["text"]
+
+    # The model still sees the real json block — telemetry only.
+    blocks = _model_visible_tool_blocks(model)
+    assert any(b.get("json") == BIG_JSON_PAYLOAD for b in blocks)
+
+
+def test_bound_serialized_total_for_many_small_blocks(bounding_ns, monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", str(SIMULATED_LIMIT))
+    bound = bounding_ns["_bound_tool_result_for_telemetry"]
+    # Each block is under the per-block cap, so layer-1 bounding never fires.
+    assert all(len(b["text"]) < bounding_ns["_tool_span_text_limit"]() for b in MANY_SMALL_BLOCKS)
+    result = {"toolUseId": "t1", "status": "success", "content": [dict(b) for b in MANY_SMALL_BLOCKS]}
+    out = bound(result)
+
+    assert out is not result
+    assert result["content"] == MANY_SMALL_BLOCKS, "original must never be mutated"
+    serialized = json.dumps(out["content"], ensure_ascii=False)
+    assert len(serialized) < bounding_ns["_tool_span_serialized_budget"]()
+    parsed = json.loads(serialized)
+    assert parsed[0] == MANY_SMALL_BLOCKS[0]
+    assert "more blocks omitted for telemetry" in parsed[-1]["text"]
+    assert out["toolUseId"] == "t1" and out["status"] == "success"
+
+
+def test_bound_stubs_oversized_json_block(bounding_ns, monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", str(SIMULATED_LIMIT))
+    bound = bounding_ns["_bound_tool_result_for_telemetry"]
+    result = {"toolUseId": "t1", "status": "success", "content": [{"json": BIG_JSON_PAYLOAD}]}
+    out = bound(result)
+
+    assert out is not result
+    assert result["content"][0]["json"] is BIG_JSON_PAYLOAD, "original must never be mutated"
+    serialized = json.dumps(out["content"], ensure_ascii=False)
+    assert len(serialized) < bounding_ns["_tool_span_serialized_budget"]()
+    parsed = json.loads(serialized)
+    assert "json block omitted for telemetry" in parsed[0]["text"]
+
+
+def test_bound_stubs_huge_json_block_even_without_env_limit(bounding_ns, monkeypatch) -> None:
+    """With no OTEL limit configured the default total budget still applies."""
+    monkeypatch.delenv("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", raising=False)
+    monkeypatch.delenv("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", raising=False)
+    bound = bounding_ns["_bound_tool_result_for_telemetry"]
+    result = {"status": "success", "content": [{"json": {"rows": ["z" * 100] * 1000}}]}
+    out = bound(result)
+
+    serialized = json.dumps(out["content"], ensure_ascii=False)
+    assert len(serialized) < bounding_ns["_TOOL_SPAN_SERIALIZED_BUDGET_DEFAULT"]
+    assert "json block omitted for telemetry" in json.loads(serialized)[0]["text"]
+
+
+def test_serialized_budget_defaults_and_tracks_the_env_limit(bounding_ns, monkeypatch) -> None:
+    budget = bounding_ns["_tool_span_serialized_budget"]
+    monkeypatch.delenv("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", raising=False)
+    monkeypatch.delenv("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", raising=False)
+    assert budget() == bounding_ns["_TOOL_SPAN_SERIALIZED_BUDGET_DEFAULT"]
+
+    # Safety margin under the smallest configured limit, so the SDK-level
+    # truncation (which produces the mid-string cut) can never engage.
+    monkeypatch.setenv("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", str(SIMULATED_LIMIT))
+    assert budget() < SIMULATED_LIMIT
+
+    monkeypatch.setenv("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", "8192")
+    monkeypatch.setenv("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", "4096")
+    assert budget() < 4096, "the smallest of the two limit vars wins"
+
+    # Absurdly small limits floor at 256; generous limits never raise the
+    # budget past the default.
+    monkeypatch.setenv("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", "10")
+    monkeypatch.delenv("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", raising=False)
+    assert budget() == 256
+    monkeypatch.setenv("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", "1000000")
+    assert budget() == bounding_ns["_TOOL_SPAN_SERIALIZED_BUDGET_DEFAULT"]
+
+
 def test_install_is_idempotent() -> None:
     """Re-running the installer must not stack wrappers (warm re-exec shape)."""
     from strands.telemetry.tracer import Tracer

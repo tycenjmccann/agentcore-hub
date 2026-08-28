@@ -256,14 +256,26 @@ _init_telemetry()
 # serialized JSON mid-string, producing unparseable tool_output.
 #
 # Fix at the tool-telemetry boundary ONLY: end_tool_call_span is wrapped so
-# the copy mirrored into span attributes has its text blocks bounded (the
-# JSON is then valid at any plausible limit). The tool_result object itself is
-# NEVER mutated — the model still receives the full tool output; tool return
-# values are unchanged. Fail-open per R1.4 throughout.
+# the copy mirrored into span attributes is bounded (the JSON is then valid at
+# any plausible limit). Bounding is layered (TEAM-3384): first each oversized
+# text block is truncated; then, if the SERIALIZED content list would still
+# exceed the smallest configured attribute limit (many small blocks, or
+# non-text blocks such as {"json": ...} from code-interpreter / structured API
+# results), oversized non-text blocks are stubbed with a marker text block and
+# trailing blocks are folded into one omission-marker block — so the mirrored
+# value is ALWAYS parseable JSON and the SDK-level truncation never engages.
+# The tool_result object itself is NEVER mutated — the model still receives
+# the full tool output; tool return values are unchanged. Fail-open per R1.4
+# throughout.
 
 # Default per-text-block cap. Well under CloudWatch/X-Ray span budgets while
 # leaving the judge plenty of transcript to reason over.
 _TOOL_SPAN_TEXT_LIMIT_DEFAULT = 8192
+
+# Default TOTAL budget for the serialized telemetry copy of the content list,
+# used when no SDK attribute limit is configured: a few per-block-cap blocks'
+# worth. Keeps the mirror bounded even where the SDK would not truncate.
+_TOOL_SPAN_SERIALIZED_BUDGET_DEFAULT = 4 * _TOOL_SPAN_TEXT_LIMIT_DEFAULT
 
 
 def _tool_span_text_limit() -> int:
@@ -286,15 +298,48 @@ def _tool_span_text_limit() -> int:
     return cap
 
 
+def _tool_span_serialized_budget() -> int:
+    """Total char budget for the SERIALIZED telemetry copy of the content list.
+
+    Per-block bounding alone cannot keep the mirrored attribute under the SDK
+    limit: many small blocks (or non-text blocks) still serialize past it and
+    get truncated mid-string. When a limit is configured, stay a safety margin
+    under the smallest one so the SDK-level truncation never engages; floored
+    at 256 and never raised past the default, like _tool_span_text_limit().
+    """
+    limits = []
+    for var in ("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT"):
+        raw = os.environ.get(var, "").strip()
+        if raw.isdigit():
+            limits.append(int(raw))
+    budget = _TOOL_SPAN_SERIALIZED_BUDGET_DEFAULT
+    if limits:
+        budget = min(budget, max(min(limits) - 128, 256))
+    return budget
+
+
 def _bound_tool_result_for_telemetry(tool_result):
-    """Return a COPY of tool_result with oversized text blocks bounded, for
-    span mirroring only. Returns the original object untouched when nothing
-    needs bounding (or the shape is unexpected — never guess)."""
+    """Return a COPY of tool_result bounded for span mirroring only.
+
+    Layer 1 truncates oversized text blocks to _tool_span_text_limit(). Layer 2
+    then enforces _tool_span_serialized_budget() on the whole content list:
+    non-text blocks whose own serialization is oversized (e.g. {"json": ...})
+    are stubbed with a marker text block, and any still-over-budget tail is
+    folded into one omission-marker block. Returns the original object
+    untouched when nothing needs bounding (or the shape is unexpected — never
+    guess)."""
     if not isinstance(tool_result, dict):
         return tool_result
     content = tool_result.get("content")
     if not isinstance(content, list):
         return tool_result
+    # Local import: the exec-based test harness provides only os/logger.
+    import json
+
+    def _size(obj) -> int:
+        # Mirrors strands' serialize(): json.dumps(..., ensure_ascii=False).
+        return len(json.dumps(obj, ensure_ascii=False, default=str))
+
     limit = _tool_span_text_limit()
     changed = False
     bounded = []
@@ -309,6 +354,45 @@ def _bound_tool_result_for_telemetry(tool_result):
             changed = True
         else:
             bounded.append(block)
+
+    budget = _tool_span_serialized_budget()
+    if _size(bounded) > budget:
+        # Layer 2a: a single oversized non-text block ({"json": ...} et al.)
+        # defeats per-text bounding entirely — stub it.
+        stubbed = []
+        for block in bounded:
+            if not (isinstance(block, dict) and isinstance(block.get("text"), str)):
+                block_size = _size(block)
+                if block_size > limit:
+                    kind = "json" if isinstance(block, dict) and "json" in block else "non-text"
+                    stubbed.append(
+                        {"text": f"[{kind} block omitted for telemetry: {block_size} chars]"}
+                    )
+                    changed = True
+                    continue
+            stubbed.append(block)
+        bounded = stubbed
+        # Layer 2b: still over budget → keep the longest prefix that fits and
+        # fold the rest into one omission-marker block, so the final list is
+        # guaranteed to serialize under the budget (i.e. always valid JSON).
+        if _size(bounded) > budget:
+            marker_reserve = 160  # marker block's own JSON size, worst case
+            kept = []
+            for block in bounded:
+                if _size(kept + [block]) + marker_reserve > budget:
+                    break
+                kept.append(block)
+            omitted = bounded[len(kept):]
+            omitted_chars = sum(_size(b) for b in omitted)
+            kept.append(
+                {
+                    "text": f"[{len(omitted)} more blocks omitted for telemetry: "
+                    f"{omitted_chars} chars; the model received the full output]"
+                }
+            )
+            bounded = kept
+            changed = True
+
     if not changed:
         return tool_result
     return {**tool_result, "content": bounded}
