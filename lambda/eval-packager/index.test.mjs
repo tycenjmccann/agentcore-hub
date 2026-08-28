@@ -3474,3 +3474,62 @@ describe('TEAM-3415: duplicate-only deliveries do not append or consume the cool
     expect(skipped[0].expectedBufferVersion).toBe(7);
   });
 });
+
+// ─── TEAM-3417: all-excluded dep-chain delivery must still surface EMF ───────
+// Ship-review round 5 of PR #187: a delivery whose every row is an
+// out-of-scope dependency_chain_compliance row (applyRoleGuard excludes all of
+// them) drove total=0 AND duplicatesDropped=0 — the pre-fix EMF gate only
+// checked those two, so depChainExcluded > 0 emitted NOTHING and
+// EvalDepChainExcludedCount silently went dark for exactly the batches the
+// epic AC cares about (zero dependency_chain results for non-ticket-creating
+// roles).
+
+describe('TEAM-3417: all-excluded dep-chain delivery still emits EMF', () => {
+  let handler;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET = 'agentcore-hub-artifacts-123456789012-us-east-1';
+    process.env.EVAL_CONFIG_TABLE = 'agentcore-hub-eval-config';
+    process.env.AWS_REGION = 'us-east-1';
+    process.env.AWS_ACCOUNT_ID = '123456789012';
+    process.env.IMPROVEMENT_AGENT_ARN = IMPROVER_ARN;
+    vi.resetModules();
+    ({ handler } = await import('./index.mjs'));
+  });
+
+  it('emits exactly one EMF record with EvalDepChainExcludedCount == N and still returns no-surviving-rows', async () => {
+    const DEP_CHAIN_EVALUATOR = 'dependency_chain_compliance_online_v1';
+    const rows = [
+      evalRecord({
+        sessionId: 'tkt-wf_x-agentcore_hub_qa_verifier-1700000000000',
+        evaluatorName: DEP_CHAIN_EVALUATOR,
+        score: 0,
+        requestId: 'req-dc-1',
+      }),
+      evalRecord({
+        sessionId: 'tkt-wf_y-agentcore_hub_qa_verifier-1700000000001',
+        evaluatorName: DEP_CHAIN_EVALUATOR,
+        score: 0,
+        requestId: 'req-dc-2',
+      }),
+    ];
+    const event = awslogsEvent(rows);
+
+    const result = await handler(event);
+
+    // TEAM-3415's early return still fires (nothing survived to buffer) — the
+    // EMF emission above must have already happened by the time it does.
+    expect(result).toEqual({ statusCode: 200, body: 'no-surviving-rows' });
+
+    const excludedLines = emfLines('EvalDepChainExcludedCount');
+    expect(excludedLines).toHaveLength(1);
+    const emf = excludedLines[0];
+    expect(emf._aws.CloudWatchMetrics[0].Namespace).toBe('AgentCoreHub/Evaluations');
+    expect(emf.EvalDepChainExcludedCount).toBe(rows.length);
+    expect(emf.EvalSessionsTotal).toBe(0);
+    expect(emf.EvalDuplicateResultCount).toBe(0);
+
+    // Exactly one EMF record total for this invocation, not one per metric name.
+    expect(emfLines('EvalSessionsTotal')).toHaveLength(1);
+  });
+});
