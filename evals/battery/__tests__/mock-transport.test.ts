@@ -47,9 +47,21 @@ async function runMockCanary(promptText: string) {
     cases: [CANARY],
     promptFor: () => promptText,
   });
-  const run = await runCase({ caseDef: CANARY, repoRoot: REPO_ROOT, runId: "mocktest", converse: transport });
+  const run = await runCase({
+    caseDef: CANARY,
+    repoRoot: REPO_ROOT,
+    runId: "mocktest",
+    converse: transport,
+    signal: undefined,
+  });
   expect(run.status).toBe("completed"); // mechanical required/forbidden checks pass for real
-  const scored = await scoreCase({ caseDef: CANARY, runResult: run, transport, repoRoot: REPO_ROOT });
+  const scored = await scoreCase({
+    caseDef: CANARY,
+    runResult: run,
+    transport,
+    repoRoot: REPO_ROOT,
+    signal: undefined,
+  });
   expect(scored.status).toBe("scored");
   return scored;
 }

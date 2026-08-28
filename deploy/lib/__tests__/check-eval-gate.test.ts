@@ -402,6 +402,7 @@ exit 1
         encoding: "utf8",
         input,
         env: {
+          NODE_ENV: "test",
           PATH: `${binDir}:/usr/local/bin:/usr/bin:/bin`,
           HOME: fakeHome,
           ...gitEnv,
@@ -421,6 +422,7 @@ exit 1
         cwd: repo,
         encoding: "utf8",
         env: {
+          NODE_ENV: "test",
           PATH: `${binDir}:/usr/local/bin:/usr/bin:/bin`,
           HOME: fakeHome,
           ...gitEnv,
