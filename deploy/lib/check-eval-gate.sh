@@ -22,25 +22,36 @@
 # refuse. The guard is READ-ONLY — it never mutates git state, S3, or the
 # agents.json runtimeArn merge contract.
 #
-# Latch (TEAM-3337 A2/A4): EVAL_GATE_CHECKED holds the VERIFIED head sha, not
-# "1". A repeat call in the same process tree (deploy-fleet.sh → 14 ×
-# deploy-one.sh) short-circuits ONLY when the latch equals the current HEAD,
-# and always prints a loud "latched" line — never a silent return. A latch
-# value that does not match HEAD (including the legacy "1") is loudly IGNORED
-# and the full check runs. The latch is set only on (a) verified-green
-# verdicts for HEAD — direct or via merged-PR resolution; green covers the
-# whole tree at that sha, so a sha-keyed latch is safe across targets with
-# different globs — and (b) audited break-glass override proceeds, so the
-# override is audited once and each subsequent short-circuit is loud. The
-# informational "nothing gated changed" proceed is NOT latched: that verdict
-# is specific to one target's globs.
+# Latch (TEAM-3337 A2/A4, hardened TEAM-3388): the latch is a per-invocation
+# UNFORGEABLE TOKEN, not a bare env var. When the gate verifies green (or an
+# audited break-glass override proceeds), _eval_gate_set_latch writes
+# "<head_sha> <nonce>" — nonce from /dev/urandom — to a chmod-600 temp file
+# created by the verifying process, and exports EVAL_GATE_CHECKED (the
+# verified head sha) plus EVAL_GATE_LATCH_FILE and EVAL_GATE_LATCH_NONCE. A
+# repeat call in the same process tree (deploy-fleet.sh → 14 × deploy-one.sh)
+# short-circuits ONLY when ALL of these hold: EVAL_GATE_CHECKED equals the
+# current HEAD, the latch file is set and exists, and its content round-trips
+# as "<HEAD> <nonce>" — and it always prints a loud "latched" line, never a
+# silent return. Anything else — a stale sha, the legacy "1", a foreign
+# checkout, or a hand-exported EVAL_GATE_CHECKED=$(git rev-parse HEAD) with no
+# valid token — is loudly called out as invalid/forged, IGNORED, and the full
+# check runs: a bare env var is NO LONGER honored. The latch is set only on
+# (a) verified-green verdicts for HEAD — direct or via merged-PR resolution;
+# green covers the whole tree at that sha, so a sha-keyed latch is safe across
+# targets with different globs — and (b) audited break-glass override
+# proceeds, so the override is audited once and each subsequent short-circuit
+# is loud. The informational "nothing gated changed" proceed is NOT latched:
+# that verdict is specific to one target's globs.
 #
-# Belt (TEAM-3337 A3): when HEAD carries no check, first-parent ancestors are
-# scanned back to a green anchor — the newest gated-path-touching commit,
-# which must carry green evidence (direct check or merged-PR resolution) —
-# with a hard safety cap of 100 commits. Residual risk (documented): a gated
-# direct push deeper than 100 first-parent commits below HEAD is unexamined;
-# hitting the cap prints an explicit warning instead of failing.
+# Belt (TEAM-3337 A3, enforced TEAM-3388): when HEAD carries no check,
+# first-parent ancestors are scanned back to a green anchor — the newest
+# gated-path-touching commit, which must carry green evidence (direct check or
+# merged-PR resolution) — with a hard safety cap of 100 commits. The cap is
+# now ENFORCED, not a documented residual: when first-parent history extends
+# beyond the cap and the scan finds neither a green anchor nor a gated touch,
+# the guard REFUSES (fail closed) — deploy a commit with a green check, or use
+# the audited break-glass. A scan that covers the FULL first-parent history
+# (history no deeper than the cap) still proceeds informationally.
 #
 # Break-glass (TEAM-3066 BG-2/BG-3 — audited, never silent):
 #   EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON="INC-123: hotfix, gate is
@@ -162,11 +173,44 @@ _eval_gate_any_match() {
 
 # Files touched by commit $2's first-parent diff (repo root $1). Falls back to
 # the commit's full file list at history boundaries (root commit / shallow
-# clone graft) — deliberately over-matching there, which fails closed.
+# clone graft) — deliberately over-matching there, which fails closed. Returns
+# non-zero when BOTH fail: callers must refuse (an unreadable commit must not
+# masquerade as "touched nothing" — that would fail open).
 _eval_gate_commit_files() {
   git -C "$1" diff --name-only "$2^" "$2" 2>/dev/null \
-    || git -C "$1" show --pretty=format: --name-only "$2" 2>/dev/null \
-    || true
+    || git -C "$1" show --pretty=format: --name-only "$2" 2>/dev/null
+}
+
+# Latch setter (A2/A4 — see the header): record verified head sha $1 as this
+# process tree's latch. Writes "<sha> <nonce>" to a chmod-600 mktemp file (the
+# audit/latch temp file is one of the guard's only writes) and exports
+# EVAL_GATE_CHECKED + EVAL_GATE_LATCH_FILE + EVAL_GATE_LATCH_NONCE. If the
+# token cannot be created, nothing is exported — the gate simply re-runs on
+# the next target instead of latching (safe, just slower). Never returns
+# non-zero: callers run under `set -e` deploy scripts.
+_eval_gate_set_latch() {
+  local _egsl_sha="$1" _egsl_nonce="" _egsl_file=""
+  if [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
+    _egsl_nonce="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"
+  fi
+  if [ -z "$_egsl_nonce" ]; then
+    # Weak fallback for hosts without /dev/urandom or od — still per-process
+    # and unguessable enough to beat a copy-pasted env var.
+    _egsl_nonce="fallback-$$-${RANDOM}${RANDOM}${RANDOM}-$(date -u +%s%N 2>/dev/null || echo 0)"
+  fi
+  if ! _egsl_file="$(mktemp "${TMPDIR:-/tmp}/eval-gate-latch.XXXXXX" 2>/dev/null)"; then
+    echo "eval-gate: WARNING — cannot create the latch token file; the gate will re-run per target instead of latching." >&2
+    return 0
+  fi
+  chmod 600 "$_egsl_file" 2>/dev/null || true
+  if ! printf '%s %s\n' "$_egsl_sha" "$_egsl_nonce" >"$_egsl_file" 2>/dev/null; then
+    echo "eval-gate: WARNING — cannot write the latch token file; the gate will re-run per target instead of latching." >&2
+    rm -f "$_egsl_file" 2>/dev/null || true
+    return 0
+  fi
+  export EVAL_GATE_CHECKED="$_egsl_sha"
+  export EVAL_GATE_LATCH_FILE="$_egsl_file"
+  export EVAL_GATE_LATCH_NONCE="$_egsl_nonce"
 }
 
 _eval_gate_fetch_check() {
@@ -195,7 +239,7 @@ _eval_gate_resolve_merged_pr_head() {
 # the operator declined the unaudited confirmation).
 _eval_gate_break_glass() {
   local refusal="$1"
-  local ts sha ident record repo_root log_file s3_ok
+  local ts sha ident record repo_root log_file s3_ok local_ok
   repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   sha="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -227,7 +271,9 @@ _eval_gate_break_glass() {
   fi
 
   log_file="$repo_root/.eval-gate-overrides.log"
+  local_ok=1
   if ! printf '%s\n' "$record" >>"$log_file" 2>/dev/null; then
+    local_ok=0
     echo "eval-gate: WARNING — could not append to $log_file" >&2
   fi
 
@@ -235,11 +281,21 @@ _eval_gate_break_glass() {
   if [ -n "${ARTIFACT_BUCKET:-}" ] \
     && printf '%s\n' "$record" | aws s3 cp - "s3://${ARTIFACT_BUCKET}/eval-gate/overrides/${ts}-${sha}.txt" >/dev/null 2>&1; then
     s3_ok=1
-    echo "eval-gate: override audited to s3://${ARTIFACT_BUCKET}/eval-gate/overrides/${ts}-${sha}.txt and $log_file" >&2
+    if [ "$local_ok" = "1" ]; then
+      echo "eval-gate: override audited to s3://${ARTIFACT_BUCKET}/eval-gate/overrides/${ts}-${sha}.txt and $log_file" >&2
+    else
+      echo "eval-gate: override audited to s3://${ARTIFACT_BUCKET}/eval-gate/overrides/${ts}-${sha}.txt (local append to $log_file FAILED)" >&2
+    fi
   fi
 
   if [ "$s3_ok" != "1" ]; then
     echo "eval-gate: S3 audit write FAILED (ARTIFACT_BUCKET='${ARTIFACT_BUCKET:-unset}')." >&2
+    if [ "$local_ok" != "1" ]; then
+      # FR-3.3: both audit sinks failed — ZERO durable record of this override
+      # would exist. Refuse outright, even at an interactive tty.
+      echo "eval-gate: the local append to $log_file ALSO failed — no durable audit record of this override can be written; refusing (FR-3.3: an override with zero audit trail is never allowed)." >&2
+      return 1
+    fi
     if { true </dev/tty; } 2>/dev/null; then
       local answer=""
       printf 'eval-gate: type OVERRIDE-UNAUDITED to proceed with only the local audit record: ' >&2
@@ -338,17 +394,24 @@ $_egv_failing}"
 }
 
 require_eval_gate() {
-  # Latch (A2): the latch value is the VERIFIED head sha. Short-circuit only
-  # when it matches the current HEAD, and never silently; anything else
-  # (stale sha, legacy "1", foreign checkout) is loudly ignored.
-  local _egr_latch_head
+  # Latch (A2, hardened TEAM-3388): honor the latch ONLY when the full token
+  # round-trips — EVAL_GATE_CHECKED == HEAD, the latch file exists, and its
+  # content is exactly "<HEAD> <EVAL_GATE_LATCH_NONCE>". A bare env var (e.g.
+  # a hand-exported `EVAL_GATE_CHECKED=$(git rev-parse HEAD)`) is a forgeable
+  # bypass and is loudly ignored; never silently short-circuit.
+  local _egr_latch_head _egr_latch_content
   _egr_latch_head="$(git rev-parse HEAD 2>/dev/null || true)"
   if [ -n "${EVAL_GATE_CHECKED:-}" ]; then
-    if [ -n "$_egr_latch_head" ] && [ "$EVAL_GATE_CHECKED" = "$_egr_latch_head" ]; then
-      echo "eval-gate: ✓ latched — $_egr_latch_head already verified in this process tree (EVAL_GATE_CHECKED)."
-      return 0
+    if [ -n "$_egr_latch_head" ] && [ "$EVAL_GATE_CHECKED" = "$_egr_latch_head" ] \
+      && [ -n "${EVAL_GATE_LATCH_FILE:-}" ] && [ -f "${EVAL_GATE_LATCH_FILE}" ] \
+      && [ -n "${EVAL_GATE_LATCH_NONCE:-}" ]; then
+      _egr_latch_content="$(cat "$EVAL_GATE_LATCH_FILE" 2>/dev/null || true)"
+      if [ "$_egr_latch_content" = "$_egr_latch_head ${EVAL_GATE_LATCH_NONCE}" ]; then
+        echo "eval-gate: ✓ latched — $_egr_latch_head already verified in this process tree (EVAL_GATE_CHECKED + latch token)."
+        return 0
+      fi
     fi
-    echo "eval-gate: WARNING — EVAL_GATE_CHECKED='${EVAL_GATE_CHECKED}' does not match HEAD (${_egr_latch_head:-<unresolvable>}) — IGNORING the stale/foreign latch and running the full check." >&2
+    echo "eval-gate: WARNING — EVAL_GATE_CHECKED='${EVAL_GATE_CHECKED}' has no valid latch token for HEAD (${_egr_latch_head:-<unresolvable>}): the latch is stale, foreign, or FORGED (a bare EVAL_GATE_CHECKED env var is not honored — the gate requires the nonce file written by the verifying process). IGNORING it and running the full check." >&2
   fi
   if [ "$#" -eq 0 ]; then
     echo "require_eval_gate: called with no gated globs — refusing (fail closed)." >&2
@@ -377,7 +440,7 @@ require_eval_gate() {
     _eval_gate_refuse "working tree has uncommitted changes to gated path '$dirty_hit'" \
       "  Deploys ship only committed, gated state. Commit the change, let the
   config-evals-gate PR check run green, merge, then deploy — or stash it."
-    export EVAL_GATE_CHECKED="$head_sha"
+    _eval_gate_set_latch "$head_sha"
     return 0
   fi
 
@@ -385,19 +448,19 @@ require_eval_gate() {
   if ! command -v gh >/dev/null 2>&1; then
     _eval_gate_refuse "GitHub CLI 'gh' is not installed — cannot query the gate check" \
       "  Install it (https://cli.github.com/), run 'gh auth login', and retry."
-    export EVAL_GATE_CHECKED="$head_sha"
+    _eval_gate_set_latch "$head_sha"
     return 0
   fi
   if ! command -v jq >/dev/null 2>&1; then
     _eval_gate_refuse "'jq' is not installed — cannot parse the check-runs API response" \
       "  Install jq (https://jqlang.github.io/jq/) and retry."
-    export EVAL_GATE_CHECKED="$head_sha"
+    _eval_gate_set_latch "$head_sha"
     return 0
   fi
   if ! gh auth status >/dev/null 2>&1; then
     _eval_gate_refuse "'gh' is not authenticated — cannot query the gate check" \
       "  Run 'gh auth login' (or export GH_TOKEN=<token with repo read>) and retry."
-    export EVAL_GATE_CHECKED="$head_sha"
+    _eval_gate_set_latch "$head_sha"
     return 0
   fi
 
@@ -406,7 +469,7 @@ require_eval_gate() {
   if [ -z "$origin_url" ] || ! owner_repo="$(eval_gate_owner_repo "$origin_url")"; then
     _eval_gate_refuse "cannot derive owner/repo from the 'origin' remote (url: '$(eval_gate_redact_url "${origin_url:-<none>}")')" \
       "  The guard needs a github.com origin remote to look up check runs."
-    export EVAL_GATE_CHECKED="$head_sha"
+    _eval_gate_set_latch "$head_sha"
     return 0
   fi
 
@@ -418,11 +481,11 @@ require_eval_gate() {
   case "$verdict" in
     0)
       echo "eval-gate: ✓ ${EVAL_GATE_CHECK_NAME} is green on HEAD ($head_sha)."
-      export EVAL_GATE_CHECKED="$head_sha"
+      _eval_gate_set_latch "$head_sha"
       return 0
       ;;
     3)
-      export EVAL_GATE_CHECKED="$head_sha"
+      _eval_gate_set_latch "$head_sha"
       return 0
       ;;
   esac
@@ -442,11 +505,11 @@ require_eval_gate() {
     case "$verdict" in
       0)
         echo "eval-gate: ✓ ${EVAL_GATE_CHECK_NAME} green on PR #$pr_number head $pr_head_sha, merged as HEAD $head_sha."
-        export EVAL_GATE_CHECKED="$head_sha"
+        _eval_gate_set_latch "$head_sha"
         return 0
         ;;
       3)
-        export EVAL_GATE_CHECKED="$head_sha"
+        _eval_gate_set_latch "$head_sha"
         return 0
         ;;
     esac
@@ -454,28 +517,46 @@ require_eval_gate() {
   fi
 
   # No check on HEAD directly or via its merged PR — only acceptable when
-  # nothing gated changed.
-  local hit
-  if hit="$(_eval_gate_commit_files "$repo_root" "$head_sha" | _eval_gate_any_match "$@")"; then
+  # nothing gated changed. Capture the file list FIRST: a pipe would discard
+  # _eval_gate_commit_files' exit status, and an unreadable commit must refuse
+  # (fail closed), not pass as "touched nothing".
+  local hit _egr_files
+  if ! _egr_files="$(_eval_gate_commit_files "$repo_root" "$head_sha")"; then
+    _eval_gate_refuse "cannot read the file list for HEAD ($head_sha) — git diff and git show both failed" \
+      "  Unreadable history cannot prove the gate holds. Check the clone
+  (shallow/corrupt?) and retry."
+    _eval_gate_set_latch "$head_sha"
+    return 0
+  fi
+  if hit="$(printf '%s\n' "$_egr_files" | _eval_gate_any_match "$@")"; then
     _eval_gate_refuse "no ${EVAL_GATE_CHECK_NAME} check exists on HEAD ($head_sha) or via a merged PR resolving to it, but HEAD's diff touches gated path '$hit'" \
       "  The gate was bypassed (direct push?). Land gated-path changes through a
   PR so ${EVAL_GATE_CHECK_NAME} runs, and deploy only a green commit."
-    export EVAL_GATE_CHECKED="$head_sha"
+    _eval_gate_set_latch "$head_sha"
     return 0
   fi
 
-  # Belt (A3): scan first-parent ancestors (skip HEAD) back to a green anchor
-  # — the NEWEST gated-path touch, which must carry green evidence (direct
-  # check, or merged-PR resolution) or we refuse. A green verdict covered the
-  # whole tree at that sha, so the scan can stop there; commits above it
-  # changed nothing gated (or we'd have refused already). Hard cap of
-  # EVAL_GATE_BELT_MAX commits — a gated direct push deeper than that is
-  # unexamined (documented residual; hitting the cap warns explicitly).
-  local c anchor="" anchor_via="" scanned=0
+  # Belt (A3, enforced): scan first-parent ancestors (skip HEAD) back to a
+  # green anchor — the NEWEST gated-path touch, which must carry green
+  # evidence (direct check, or merged-PR resolution) or we refuse. A green
+  # verdict covered the whole tree at that sha, so the scan can stop there;
+  # commits above it changed nothing gated (or we'd have refused already).
+  # Hard cap of EVAL_GATE_BELT_MAX commits — total is computed up front so the
+  # verdict below can tell "scanned everything (history fits the cap)" apart
+  # from "capped with history left unexamined", which now REFUSES.
+  local c anchor="" anchor_via="" scanned=0 total=0
+  total="$(git -C "$repo_root" rev-list --first-parent --count HEAD 2>/dev/null || echo 0)"
   for c in $(git -C "$repo_root" rev-list --first-parent \
       --max-count="$EVAL_GATE_BELT_MAX" --skip=1 HEAD 2>/dev/null || true); do
     scanned=$((scanned + 1))
-    if hit="$(_eval_gate_commit_files "$repo_root" "$c" | _eval_gate_any_match "$@")"; then
+    if ! _egr_files="$(_eval_gate_commit_files "$repo_root" "$c")"; then
+      _eval_gate_refuse "cannot read the file list for ancestor commit $c — git diff and git show both failed" \
+        "  Unreadable history cannot prove the gate holds. Check the clone
+  (shallow/corrupt?) and retry."
+      _eval_gate_set_latch "$head_sha"
+      return 0
+    fi
+    if hit="$(printf '%s\n' "$_egr_files" | _eval_gate_any_match "$@")"; then
       verdict=0
       _eval_gate_verdict "$owner_repo" "$c" "ancestor $c (gated path '$hit')" || verdict=$?
       case "$verdict" in
@@ -485,7 +566,7 @@ require_eval_gate() {
           break
           ;;
         3)
-          export EVAL_GATE_CHECKED="$head_sha"
+          _eval_gate_set_latch "$head_sha"
           return 0
           ;;
       esac
@@ -504,7 +585,7 @@ require_eval_gate() {
             break
             ;;
           3)
-            export EVAL_GATE_CHECKED="$head_sha"
+            _eval_gate_set_latch "$head_sha"
             return 0
             ;;
         esac
@@ -512,18 +593,30 @@ require_eval_gate() {
       _eval_gate_refuse "ancestor commit $c touched gated path '$hit' without a green ${EVAL_GATE_CHECK_NAME} check (direct or via a merged PR)" \
         "  The gate was bypassed between that commit and HEAD ($head_sha). Land
   gated-path changes through a PR and deploy only green commits."
-      export EVAL_GATE_CHECKED="$head_sha"
+      _eval_gate_set_latch "$head_sha"
       return 0
     fi
   done
 
-  # A4: NONE of these informational proceeds latch — the verdict below is
+  # A4: the informational proceeds below do NOT latch — those verdicts are
   # specific to THIS target's gated globs, and a different target in the same
-  # fan-out must run its own scan.
+  # fan-out must run its own scan. Hitting the cap with history left beyond it
+  # REFUSES (A3 enforced, TEAM-3388): the unexamined tail could hide a gated
+  # direct push, and proceeding there was a fail-open hole.
   if [ -n "$anchor" ]; then
     echo "eval-gate: ✓ green anchor at ancestor $anchor (via $anchor_via); no ${EVAL_GATE_CHECK_NAME} check on HEAD ($head_sha) but nothing gated changed since the anchor — proceeding (informational, not latched)."
-  elif [ "$scanned" -ge "$EVAL_GATE_BELT_MAX" ]; then
-    echo "eval-gate: WARNING — no ${EVAL_GATE_CHECK_NAME} check on HEAD ($head_sha) and no gated-path touch or green anchor in the last $EVAL_GATE_BELT_MAX first-parent commits (hard cap reached). Residual risk: a gated direct push deeper than $EVAL_GATE_BELT_MAX commits is unexamined. Proceeding (informational, not latched)." >&2
+  elif [ "$scanned" -ge "$EVAL_GATE_BELT_MAX" ] \
+    && { [ "$total" -le 0 ] || [ "$((total - 1))" -gt "$EVAL_GATE_BELT_MAX" ]; }; then
+    # total<=0 means the depth could not be measured — treat as beyond-cap
+    # (fail closed) rather than assuming the scan covered everything.
+    local total_desc="unknown"
+    if [ "$total" -gt 0 ]; then total_desc="$((total - 1))"; fi
+    _eval_gate_refuse "no ${EVAL_GATE_CHECK_NAME} check on HEAD ($head_sha) and the first-parent scan hit the $EVAL_GATE_BELT_MAX-commit cap without finding a green anchor or a gated-path touch" \
+      "  History beyond the cap ($total_desc first-parent ancestors in total) is
+  unexamined, so the gate cannot prove it holds. Deploy a commit that carries a
+  green ${EVAL_GATE_CHECK_NAME} check, or use the audited break-glass override."
+    _eval_gate_set_latch "$head_sha"
+    return 0
   else
     echo "eval-gate: no ${EVAL_GATE_CHECK_NAME} check on HEAD ($head_sha), and no first-parent ancestor (full history scanned: $scanned commits) touched this target's gated paths — proceeding (informational, not latched)."
   fi
