@@ -15,9 +15,9 @@
 #   4. THIS SCRIPT                          — the Lambdas, CW Logs subscriptions,
 #                                             alarms and S3/EventBridge wiring
 # Running this before step 2 leaves eval-packager pointed at a table that does
-# not exist: every seen-set PutItem throws, dedup fails OPEN (see
-# dedupeAgainstSeenSet in lambda/eval-packager/index.mjs) and cross-delivery
-# duplicates double-count the rolling eval aggregates.
+# not exist: every seen-set read and write throws, dedup fails OPEN (see
+# checkSeenSet / claimSeenSet in lambda/eval-packager/index.mjs) and
+# cross-delivery duplicates double-count the rolling eval aggregates.
 set -e
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

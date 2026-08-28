@@ -73,12 +73,13 @@ else
 fi
 
 # ─── Dedup seen-set table ────────────────────────────────────────────────────
-# The eval-packager writes ONE conditional PutItem per keyed evaluator-result row
-# (dedupeAgainstSeenSet in lambda/eval-packager/index.mjs): a
-# ConditionalCheckFailedException means another CloudWatch Logs delivery — or a
-# concurrent invocation — already claimed that dedupKey, so the row is dropped
-# before it can double-count the rolling DDB aggregates. Without this table every
-# PutItem throws and the seen-set fails OPEN, i.e. dedup is silently inert.
+# The eval-packager reads this table (BatchGetItem, checkSeenSet in
+# lambda/eval-packager/index.mjs) before classifying a delivery: a hit means
+# another CloudWatch Logs delivery — or a concurrent invocation — already claimed
+# that dedupKey, so the row is dropped before it can double-count the rolling DDB
+# aggregates. It then writes one conditional PutItem per surviving key
+# (claimSeenSet) once the rows are durably buffered. Without this table every read
+# and write throws and the seen-set fails OPEN, i.e. dedup is silently inert.
 #
 # Rows are pure dedup bookkeeping with a 24h TTL (SEEN_TTL_SECONDS in index.mjs);
 # TTL is OPT-IN per table, so without the update-time-to-live call below the

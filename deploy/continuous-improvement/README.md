@@ -37,10 +37,25 @@ CloudWatch Logs → eval-packager Lambda → DynamoDB buffer
      concurrent invocations can each see a copy of the same evaluator result. The
      in-memory per-delivery dedup in `extractSessionData` cannot catch either, so
      duplicates double-counted the rolling `evalScores` / `evalSessionCount` /
-     `evalStatusCounts` aggregates. `dedupeAgainstSeenSet` writes one conditional
-     `PutItem` per keyed row; a `ConditionalCheckFailedException` means another
-     delivery already claimed that key, and the row is dropped **before**
-     classification, aggregation and buffering.
+     `evalStatusCounts` aggregates. Two phases: `checkSeenSet` reads the table
+     (`BatchGetItem`, 100 keys per request) **before** classification, aggregation
+     and buffering and drops rows whose key is already present; `claimSeenSet`
+     then writes one conditional `PutItem` per surviving key **after** the buffer
+     append succeeds.
+   - **Items** are `{ dedupKey, expiresAt, outcome }`, where `outcome` is
+     `scored` / `error` / `other`. It exists so a *scored* row supersedes an
+     earlier *error* claim for the same evaluation attempt: an eval retry storm
+     emits a throttled ERROR record and then the real SCORED record with the same
+     trace/span/evaluator, and dropping the second one would misclassify the
+     session as an error and lose the score.
+   - **Check-then-claim, never claim-then-process**: the claim is deliberately
+     ordered after `appendToBuffer`. Claiming first meant that an invocation which
+     threw *after* claiming (a DDB throttle, or the 400KB item cap on a long
+     cooldown hold) poisoned its own CloudWatch re-delivery — the retry saw every
+     key claimed and dropped every row permanently. The cost of the safe ordering
+     is that a crashed invocation's rows can be counted twice in the rolling
+     aggregates, and that two truly concurrent invocations can both pass the check
+     before either claims. Both are recoverable; lost evaluations are not.
    - **Partition key**: `dedupKey` (S) — no sort key, no GSI. The key is built by
      `dedupKeyFor` in `index.mjs`: `req|<requestId>|<evaluatorName>` when the
      record carried a request id, `raw|<timestamp>|<sha256-16 of the raw line>`
@@ -53,8 +68,9 @@ CloudWatch Logs → eval-packager Lambda → DynamoDB buffer
      `aws dynamodb update-time-to-live` call in `deploy-all.sh` the table grows
      without bound.
    - **Billing**: `PAY_PER_REQUEST` (one small write per evaluator-result row).
-   - **Fail-open**: a missing table, a denied `PutItem`, or any non-conditional
-     DynamoDB error treats the record as fresh — double-counting beats data loss.
+   - **Fail-open**: a missing table, a denied `BatchGetItem`/`PutItem`, or any
+     non-conditional DynamoDB error treats the record as fresh — double-counting
+     beats data loss.
      The consequence is that a *misconfigured* seen-set is invisible in the
      happy path; the `failed open for N record(s)` warning in the packager's logs
      is the signal to check the table and the IAM grant.
