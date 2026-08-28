@@ -13,6 +13,10 @@ import {
 
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 
+// scoreCase requires the case's end-to-end deadline signal; these tests never
+// abort it (deadline behavior is exercised elsewhere).
+const signal = new AbortController().signal;
+
 const CASE_DEF = {
   id: "score-test-case",
   taskPrompt: "Verify the thing and report via WorkflowOutput___report_completion.",
@@ -47,7 +51,7 @@ describe("judge response parsing + normalization", () => {
       calls.push(req);
       return judgeReply(calls.length === 1 ? 1.0 : 0.5, "Partial", "half done");
     };
-    const scored = await scoreCase({ caseDef: CASE_DEF, runResult: RUN_RESULT, transport, repoRoot: REPO_ROOT });
+    const scored = await scoreCase({ caseDef: CASE_DEF, runResult: RUN_RESULT, transport, repoRoot: REPO_ROOT, signal });
     expect(scored.status).toBe("scored");
     expect(scored.scores).toEqual({ "Builtin.Correctness": 100, "Builtin.GoalSuccessRate": 50 });
     expect(scored.details["Builtin.GoalSuccessRate"].label).toBe("Partial");
@@ -79,7 +83,7 @@ describe("transport retry policy (single retry, transport errors only)", () => {
       return judgeReply(1.0);
     };
     const oneEvaluator = { ...CASE_DEF, evaluators: ["Builtin.Correctness"] };
-    const scored = await scoreCase({ caseDef: oneEvaluator, runResult: RUN_RESULT, transport, repoRoot: REPO_ROOT });
+    const scored = await scoreCase({ caseDef: oneEvaluator, runResult: RUN_RESULT, transport, repoRoot: REPO_ROOT, signal });
     expect(scored.status).toBe("scored");
     expect(scored.details["Builtin.Correctness"].attempt).toBe(2);
     expect(calls).toBe(2);
@@ -93,7 +97,7 @@ describe("transport retry policy (single retry, transport errors only)", () => {
       err.$metadata = { httpStatusCode: 503 };
       throw err;
     };
-    const scored = await scoreCase({ caseDef: CASE_DEF, runResult: RUN_RESULT, transport, repoRoot: REPO_ROOT });
+    const scored = await scoreCase({ caseDef: CASE_DEF, runResult: RUN_RESULT, transport, repoRoot: REPO_ROOT, signal });
     expect(scored.status).toBe("unscored");
     expect(scored.error).toContain("Builtin.Correctness");
     expect(calls).toBe(2); // 1 attempt + 1 retry for the first evaluator, then stop — no spend on the rest
@@ -106,7 +110,7 @@ describe("transport retry policy (single retry, transport errors only)", () => {
       return { output: { message: { content: [{ text: "I think it went well overall!" }] } } };
     };
     const oneEvaluator = { ...CASE_DEF, evaluators: ["Builtin.Correctness"] };
-    const scored = await scoreCase({ caseDef: oneEvaluator, runResult: RUN_RESULT, transport, repoRoot: REPO_ROOT });
+    const scored = await scoreCase({ caseDef: oneEvaluator, runResult: RUN_RESULT, transport, repoRoot: REPO_ROOT, signal });
     expect(scored.status).toBe("unscored");
     expect(calls).toBe(1); // parse failure is not a transport error — no retry
   });
@@ -118,7 +122,7 @@ describe("transport retry policy (single retry, transport errors only)", () => {
       return { output: { message: { content: [{ text: '{"label": "Correct"}' }] } } };
     };
     const oneEvaluator = { ...CASE_DEF, evaluators: ["Builtin.Correctness"] };
-    const scored = await scoreCase({ caseDef: oneEvaluator, runResult: RUN_RESULT, transport, repoRoot: REPO_ROOT });
+    const scored = await scoreCase({ caseDef: oneEvaluator, runResult: RUN_RESULT, transport, repoRoot: REPO_ROOT, signal });
     expect(scored.status).toBe("unscored");
     expect(calls).toBe(1);
   });
@@ -186,7 +190,7 @@ describe("judge prompt construction", () => {
     expect(text).toContain("task success is NOT contract compliance");
     expect(text).toContain("Files a fix ticket per finding.");
     // Scores through the normal pipeline like any evaluator.
-    const scored = await scoreCase({ caseDef, runResult: RUN_RESULT, transport: async () => judgeReply(0.5), repoRoot: REPO_ROOT });
+    const scored = await scoreCase({ caseDef, runResult: RUN_RESULT, transport: async () => judgeReply(0.5), repoRoot: REPO_ROOT, signal });
     expect(scored.status).toBe("scored");
     expect(scored.scores[PERSONA_EVALUATOR_ID]).toBe(50);
   });

@@ -80,6 +80,7 @@ describe("renderCheckSummary", () => {
       retiredCases: [{ id: "old-flake-001", retirement_reason: "flaked three times; retired pending rework" }],
       costEstimateUsd: 2.5,
       runtimeSeconds: 61.234,
+      configSources: null,
     });
   }
 

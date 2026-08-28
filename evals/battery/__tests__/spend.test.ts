@@ -13,6 +13,10 @@ const QA_CASE = JSON.parse(
   readFileSync(join(REPO_ROOT, "evals/battery/cases/qa-verifier-regression-001.json"), "utf8")
 );
 
+// runCase requires the runner's end-to-end deadline signal; this test's
+// ceiling breach comes from the ledger, so the signal never aborts.
+const signal = new AbortController().signal;
+
 const THRESHOLDS = { overallDropMaxPoints: 5, floorRule: { floorDelta: 10, minAbsoluteFloor: 40 }, maxRunUsd: 20 };
 const BASELINE = {
   schemaVersion: 1,
@@ -78,9 +82,11 @@ describe("mid-run ceiling inside a case", () => {
       repoRoot: REPO_ROOT,
       runId: "spend1",
       converse: ledger.meter(async () => script[i++], QA_CASE.modelTier, QA_CASE.id),
+      signal,
     });
     expect(run.status).toBe("errored");
     expect(run.attempt).toBe(1); // typed-transport retries only — a ceiling breach is not one
+    if (!("error" in run)) throw new Error(`expected an errored run with an error, got '${run.status}'`);
     expect(run.error).toContain("run spend ceiling reached");
     expect(run.error).toContain(`aborting case '${QA_CASE.id}'`);
     expect(i).toBe(2); // third turn never dispatched
