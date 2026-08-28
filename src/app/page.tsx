@@ -1,4 +1,5 @@
 "use client";
+// QA TEAM-3092: ungated-path E2E marker (no gated path touched; safe to remove)
 
 import { useState, useEffect } from "react";
 import { Brain, Cpu, ArrowRight } from "lucide-react";
