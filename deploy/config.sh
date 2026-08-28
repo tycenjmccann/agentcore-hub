@@ -42,6 +42,11 @@ export TICKETS_TABLE="${TICKETS_TABLE:-agentcore-hub-tickets}"
 export WORKFLOWS_TABLE="${WORKFLOWS_TABLE:-agentcore-hub-workflows}"
 export CLOUD_CODE_TABLE="${CLOUD_CODE_TABLE:-agentcore-hub-cloud-code-sessions}"
 export ROUTINES_TABLE="${ROUTINES_TABLE:-agentcore-hub-routines}"
+# eval-packager's cross-delivery dedup seen-set (PK dedupKey, TTL on expiresAt).
+# Created by deploy/continuous-improvement/deploy-all.sh, granted by
+# deploy/setup-lambda-role.sh, and passed to the Lambda as EVAL_SEEN_TABLE by
+# deploy/continuous-improvement/deploy.sh. Must match index.mjs's default.
+export EVAL_SEEN_TABLE="${EVAL_SEEN_TABLE:-agentcore-hub-eval-seen}"
 
 # Routines — scheduled workflows. Runner Lambda + scheduler role ARNs are set by
 # lambda/routines-runner/deploy.sh; the schedule group holds all routine schedules.

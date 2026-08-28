@@ -32,6 +32,88 @@ CloudWatch Logs → eval-packager Lambda → DynamoDB buffer
    - Accumulates sessions in `sessionBuffer` list attribute
    - Flushes when buffer reaches configured `batchSize`
 
+3b. **DynamoDB dedup seen-set** (`agentcore-hub-eval-seen` table):
+   - **Purpose**: CloudWatch Logs subscription delivery is at-least-once, and two
+     concurrent invocations can each see a copy of the same evaluator result. The
+     in-memory per-delivery dedup in `extractSessionData` cannot catch either, so
+     duplicates double-counted the rolling `evalScores` / `evalSessionCount` /
+     `evalStatusCounts` aggregates. Two phases: `checkSeenSet` reads the table
+     (`BatchGetItem`, 100 keys per request) **before** classification, aggregation
+     and buffering and drops rows whose key is already present; `claimSeenSet`
+     then writes one conditional `PutItem` per surviving key **after** the buffer
+     append succeeds.
+   - **Items** are `{ dedupKey, expiresAt, outcome }`, where `outcome` is
+     `scored` / `error` / `other`. It exists so a *scored* row supersedes an
+     earlier *error* claim for the same evaluation attempt: an eval retry storm
+     emits a throttled ERROR record and then the real SCORED record with the same
+     trace/span/evaluator, and dropping the second one would misclassify the
+     session as an error and lose the score.
+   - **Check-then-claim, never claim-then-process**: the claim is deliberately
+     ordered after `appendToBuffer`. Claiming first meant that an invocation which
+     threw *after* claiming (a DDB throttle, or the 400KB item cap on a long
+     cooldown hold) poisoned its own CloudWatch re-delivery — the retry saw every
+     key claimed and dropped every row permanently. The cost of the safe ordering
+     is that a crashed invocation's rows can be counted twice in the rolling
+     aggregates, and that two truly concurrent invocations can both pass the check
+     before either claims. Both are recoverable; lost evaluations are not.
+   - **Partition key**: `dedupKey` (S) — no sort key, no GSI. The key is built by
+     `dedupKeyFor` in `index.mjs`: `req|<requestId>|<evaluatorName>` when the
+     record carried a request id, `raw|<timestamp>|<sha256-16 of the raw line>`
+     for an unparseable line, else a `content|…` key ending in the content
+     fingerprint. Every variant is capped well under DynamoDB's 2048-byte
+     partition-key limit — an oversized key would make every `PutItem` throw
+     `ValidationException`, silently disabling dedup for good.
+   - **TTL**: enabled on the `expiresAt` attribute (24h, `SEEN_TTL_SECONDS`).
+     DynamoDB TTL is **opt-in per table**: without the
+     `aws dynamodb update-time-to-live` call in `deploy-all.sh` the table grows
+     without bound.
+   - **Billing**: `PAY_PER_REQUEST` (one small write per evaluator-result row).
+   - **Fail-open**: a missing table, a denied `BatchGetItem`/`PutItem`, or any
+     non-conditional DynamoDB error treats the record as fresh — double-counting
+     beats data loss.
+     The consequence is that a *misconfigured* seen-set is invisible in the
+     happy path; the `failed open for N record(s)` warning in the packager's logs
+     is the signal to check the table and the IAM grant.
+   - **Env var**: `EVAL_SEEN_TABLE` on the eval-packager Lambda (set by
+     `deploy.sh`, defaulted in `deploy/config.sh`). Set it to the empty string to
+     disable the persistent check and keep only per-delivery dedup.
+   - **Deploy order**: `deploy/setup-lambda-role.sh` (IAM grant) →
+     `deploy-all.sh` (creates the table + TTL) → `deploy.sh` (sets the env var).
+     Deploying the Lambda before the table exists is exactly the permanent
+     fail-open above.
+
+### Concurrency model (TEAM-3385)
+
+The packager has no lock on the whole pipeline — CloudWatch Logs subscription
+delivery is at-least-once and concurrent invocations for the same agent are
+expected, so every piece of shared state is either idempotent or
+conditionally written instead of being globally serialized:
+
+- **Seen-set (above)**: check-then-claim, never claim-then-process. The claim
+  is a conditional `PutItem` ordered strictly *after* the buffer append
+  succeeds, so an invocation that crashes between check and claim leaves its
+  rows unclaimed — the next CloudWatch redelivery reprocesses them instead of
+  finding them permanently marked seen. The cost is a possible double-count in
+  the rolling aggregates; per the fail-open posture used throughout this
+  pipeline, that is preferred over silently losing an evaluation.
+- **Flush claim**: `flushBuffer`'s buffer-reset `UpdateItem` is conditioned on
+  `lastFlushedAt` holding the exact value the caller's cooldown decision was
+  made from (`attribute_not_exists(lastFlushedAt)` on the very first flush).
+  Of two invocations that both decide to flush, only one wins that
+  compare-and-swap; the loser gets `ConditionalCheckFailedException`, logs
+  `eval.flush.claim_lost`, and returns immediately with **no** S3 archive, no
+  batch metric and no PRD synthesis — a losing invocation has zero side
+  effects beyond the failed conditional write.
+- **Scorecard aggregation**: `aggregateScoresToDdb` merges each delivery's
+  score deltas into the per-agent `evalScores` / `evalStatusCounts` under
+  optimistic locking on an `evalAggVersion` counter, since the merge touches
+  nested map paths that atomic `ADD` can't reach. A lost version check
+  re-reads and re-merges, bounded at 3 attempts with jittered backoff;
+  exhausting the retries is non-fatal (the write is skipped, logged, and the
+  handler carries on) because the scorecard is a dashboard tally, not a
+  ledger. `evalSessionCount` in particular stays **approximate** under
+  at-least-once delivery regardless of locking — that's accepted, not chased.
+
 4. **S3 Batch Archive** (`fleet-imp-agent/batches/`):
    - The raw flushed batch (`{agentId, batchSize, flushedAt, sessions[]}`)
    - Named: `batch-<agentId>-<timestamp>.json`
@@ -130,7 +212,12 @@ before this synthesis step existed.
 
 ### What it does
 
-1. **Creates DynamoDB table** (`agentcore-hub-eval-config`) with on-demand billing if it doesn't exist
+1. **Creates both DynamoDB tables** with on-demand billing if they don't exist:
+   - `agentcore-hub-eval-config` (PK `agentId`) — per-agent controls + session buffer
+   - `agentcore-hub-eval-seen` (PK `dedupKey`) — the dedup seen-set, with TTL
+     enabled on `expiresAt`. Both the create and the TTL enable are idempotent:
+     a re-run skips an existing table and an already-`ENABLED` TTL rather than
+     aborting under `set -e`.
 2. **Seeds 14 agent rows** from `src/config/agents.json` with default eval configuration:
    - `enabled: true`
    - `sampleRate: 100` (100%)
@@ -138,6 +225,10 @@ before this synthesis step existed.
    - Empty `sessionBuffer`
 
 The seed is idempotent — existing rows are not overwritten (`attribute_not_exists(agentId)` condition).
+
+Run `deploy-all.sh` **before** `deploy.sh`: the latter points the eval-packager
+Lambda's `EVAL_SEEN_TABLE` at the seen table created here (see the deploy-order
+comment at the top of `deploy.sh`).
 
 ### DDB Rows Created
 

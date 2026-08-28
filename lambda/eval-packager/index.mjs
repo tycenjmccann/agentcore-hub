@@ -14,6 +14,12 @@
  *
  * Environment Variables:
  *   EVAL_CONFIG_TABLE       — DynamoDB table name (default: agentcore-hub-eval-config)
+ *   EVAL_SEEN_TABLE         — cross-delivery dedup seen-set table
+ *                             (default: agentcore-hub-eval-seen; PK dedupKey,
+ *                             TTL on expiresAt). Created by
+ *                             deploy/continuous-improvement/deploy-all.sh and
+ *                             set on the Lambda by that directory's deploy.sh.
+ *                             Set to '' to disable the persistent check.
  *   ARTIFACTS_BUCKET        — S3 bucket for batch + PRD output
  *   IMPROVEMENT_AGENT_ARN   — Fleet Improver runtime ARN (preferred). If unset,
  *                             flush archives the raw batch but skips synthesis.
@@ -34,6 +40,7 @@ import {
   classifyEntry,
   computeBatchSummary,
   emfRecord,
+  isMissingSpanError,
   sessionsMissingSpan,
 } from './lib/classify.mjs';
 
@@ -137,9 +144,12 @@ export const handler = async (event) => {
   // be measured on ALL deliveries, not just the sampled subset that gets buffered.
   const sessionData = extractSessionData(parsed);
 
-  // TEAM-3376: cross-delivery/concurrent dedup runs BEFORE classification,
+  // TEAM-3376: cross-delivery/concurrent dedup CHECK runs BEFORE classification,
   // aggregation and buffering — everything downstream sees the filtered view.
-  await dedupeAgainstSeenSet(sessionData, agentId);
+  // Read-only: the matching claimSeenSet call happens only after this delivery is
+  // durably buffered (TEAM-3385 finding 2), so a crash in between re-delivers
+  // instead of losing the rows.
+  await checkSeenSet(sessionData, agentId);
 
   const { statuses, total, spanMissing, errors, throttled, validationErrors } =
     classifySessions(sessionData);
@@ -171,6 +181,10 @@ export const handler = async (event) => {
   const sampleRate = config.sampleRate ?? 100;
   if (Math.random() * 100 >= sampleRate) {
     console.log(`[eval-packager] Agent ${agentId} sample-rate miss (rate=${sampleRate}%). Skipping.`);
+    // Dropping the delivery is a FINAL decision, so claim its keys: without this
+    // a re-delivery of the same rows would roll the sample dice again and could
+    // buffer rows this invocation already accounted for in the EMF metrics above.
+    await claimSeenSet(sessionData, agentId);
     return { statusCode: 200, body: 'sampled-out' };
   }
 
@@ -179,20 +193,34 @@ export const handler = async (event) => {
   // Cross-delivery protection (TEAM-3381 §2.2 gap, closed by TEAM-3376):
   // this runs on rows already filtered by BOTH dedup layers — the in-memory
   // per-delivery pass in extractSessionData and the `agentcore-hub-eval-seen`
-  // conditional-write seen-set above (dedupeAgainstSeenSet: PK dedupKey,
-  // attribute_not_exists, TTL 24h, FAIL-OPEN) — so the rolling aggregates
-  // (evalScores / evalSessionCount / evalStatusCounts) no longer double-count
-  // a duplicate that spans two CloudWatch Logs deliveries. The flush-time
-  // dedupeBufferedSessions pass remains as defense-in-depth for the batch
-  // payload (it also covers records the seen-set failed OPEN on). NOTE from
-  // §2.2 still holds: EvalDuplicateResultCount now includes seen-set drops,
-  // but to VERIFY the seen-set is working use the §2.2 Logs Insights query
-  // grouped by logStream (docs/eval-infrastructure-reliability-design.md).
+  // seen-set CHECK above (checkSeenSet: read-only BatchGetItem on PK dedupKey,
+  // FAIL-OPEN) — so the rolling aggregates (evalScores / evalSessionCount /
+  // evalStatusCounts) no longer double-count a duplicate that spans two
+  // CloudWatch Logs deliveries. The flush-time dedupeBufferedSessions pass
+  // remains as defense-in-depth for the batch payload (it also covers records
+  // the seen-set failed OPEN on).
+  //
+  // These aggregates are the one thing that runs BEFORE the keys are claimed
+  // (claimSeenSet below), so if appendToBuffer then throws, the re-delivery
+  // re-counts them here. That is the deliberate trade of TEAM-3385 finding 2:
+  // claiming first made a failed invocation poison its own retry and lose the
+  // rows for good, and an over-count in a rolling aggregate is recoverable
+  // where a dropped evaluation is not.
+  //
+  // NOTE from §2.2 still holds: EvalDuplicateResultCount includes seen-set
+  // drops, but to VERIFY the seen-set is working use the §2.2 Logs Insights
+  // query grouped by logStream (docs/eval-infrastructure-reliability-design.md).
   await aggregateScoresToDdb(agentId, sessionData.evaluatorResults);
 
   // 6. Append to sessionBuffer, counting distinct runs toward batchSize
   const batchSize = config.batchSize || 10;
   const appended = await appendToBuffer(agentId, sessionData, batchSize);
+
+  // 6b. The rows are now durable in the DDB buffer → claim their dedup keys so a
+  // re-delivery is dropped by checkSeenSet. Ordered after the append, and before
+  // the flush: a flush failure doesn't lose anything (the rows are in the buffer
+  // and the batch is re-flushed later), whereas an append failure must re-deliver.
+  await claimSeenSet(sessionData, agentId);
 
   if (appended.shouldFlush) {
     // Flush cooldown: batchSize alone doesn't bound PRD rate — every persona
@@ -211,8 +239,13 @@ export const handler = async (event) => {
       );
       return { statusCode: 200, body: 'cooldown' };
     }
-    // 7. Batch is full → flush to S3 + synthesize PRD
-    await flushBuffer(agentId, appended.buffer, batchSize);
+    // 7. Batch is full → flush to S3 + synthesize PRD.
+    //    config.lastFlushedAt is the value the cooldown decision above was made
+    //    from, and it is already stale by the whole per-record loop. Passing it
+    //    through turns the flush's buffer reset into a compare-and-swap on
+    //    exactly that value, so of two concurrent invocations that both decided
+    //    to flush, only one actually does (TEAM-3385 finding 6).
+    await flushBuffer(agentId, appended.buffer, batchSize, config.lastFlushedAt);
   }
 
   return { statusCode: 200, body: 'ok' };
@@ -290,17 +323,50 @@ export function hasNoDedupKey(r) {
 }
 
 /**
+ * A DynamoDB partition-key value caps at 2048 BYTES, and dedupKey is the seen-set
+ * table's partition key — an oversized key makes every conditional PutItem throw
+ * ValidationException, i.e. the whole seen-set fails open permanently and silently
+ * (TEAM-3385). The unparseable-row path was the guaranteed offender (it embedded
+ * the raw log line; contentFingerprint replaces it below), but nothing bounds a
+ * pathological requestId / evaluatorName / sessionId either, so every key is
+ * passed through this cap. 1024 bytes leaves generous headroom under the limit.
+ */
+const DEDUP_KEY_MAX_BYTES = 1024;
+// Chars, not bytes, for the truncated prefix: 400 UTF-16 chars is at most ~1600
+// UTF-8 bytes, so prefix + '|' + 16-hex fingerprint stays well under the cap
+// whatever the encoding.
+const DEDUP_KEY_PREFIX_CHARS = 400;
+
+/**
+ * Cap a dedup key at DEDUP_KEY_MAX_BYTES, keeping a readable prefix and
+ * appending a fingerprint of the WHOLE key — so two over-long keys sharing a
+ * prefix stay distinct, and the same over-long key re-delivered still collapses.
+ */
+function boundDedupKey(key) {
+  if (Buffer.byteLength(key, 'utf8') <= DEDUP_KEY_MAX_BYTES) return key;
+  return `${key.slice(0, DEDUP_KEY_PREFIX_CHARS)}|${contentFingerprint(key)}`;
+}
+
+/**
  * TEAM-3376: the stable dedup key for one evaluator-result row — the single
  * keying rule shared by the in-memory pass (dedupeResults), the flush-time
  * re-dedup (dedupeBufferedSessions), and the cross-delivery DynamoDB seen-set
- * (dedupeAgainstSeenSet), whose partition key it is — so it must be stable
- * across deliveries (contentFingerprint is byte-derived, so it is).
+ * (checkSeenSet / claimSeenSet), whose partition key it is — so it must be
+ * stable across deliveries (contentFingerprint is byte-derived, so it is).
  *
- * Keyed by requestId when the record carried one; unparseable rows key on
- * their raw text; everything else takes the content key, whose trailing
- * contentHash separates two distinct results that share metadata AND the
- * delivery's millisecond timestamp (TEAM-3381) while a genuine retry write
- * re-sends the same bytes and still collapses.
+ * Deliberately OUTCOME-BLIND (TEAM-3385 finding 3): the key identifies the
+ * evaluation ATTEMPT, not how it turned out, so a throttled ERROR record and
+ * the eventual SCORED record for the same span collide — which is what lets
+ * recordOutcome below pick the better of the two instead of letting whichever
+ * copy landed first win.
+ *
+ * Keyed by requestId when the record carried one; unparseable rows key on a
+ * FINGERPRINT of their raw text (TEAM-3385 — the raw text itself is unbounded
+ * and blew the 2048-byte partition-key limit, see boundDedupKey above);
+ * everything else takes the content key, whose trailing contentHash separates
+ * two distinct results that share metadata AND the delivery's millisecond
+ * timestamp (TEAM-3381) while a genuine retry write re-sends the same bytes and
+ * still collapses.
  *
  * Returns null for a row with no usable identity at all (hasNoDedupKey above)
  * — such rows FAIL OPEN through every dedup layer: retaining a possible
@@ -313,27 +379,76 @@ export function dedupKeyFor(r) {
     // eval run emits about ONE evaluated span (correctness, helpfulness, …)
     // can share that span's trace/span ids, and those are distinct results,
     // not duplicates. Retries of the same record share both fields.
-    return `req|${r.requestId}|${r.evaluatorName ?? ''}`;
+    return boundDedupKey(`req|${r.requestId}|${r.evaluatorName ?? ''}`);
   }
-  if (r.parseError) return `raw|${r.timestamp}|${r.rawMessage}`;
-  return `content|${r.sessionId}|${r.evaluatorName}|${r.evaluationName ?? ''}|${r.score}|${r.timestamp}|${r.contentHash ?? ''}`;
+  // Byte-derived, so two different platform lines that happen to share a
+  // timestamp still get distinct keys and a re-delivered line keeps the same one
+  // — the same guarantee the raw text gave, in a constant ~35 chars.
+  if (r.parseError) return `raw|${r.timestamp}|${contentFingerprint(r.rawMessage)}`;
+  return boundDedupKey(
+    `content|${r.sessionId}|${r.evaluatorName}|${r.evaluationName ?? ''}|${r.score}|${r.timestamp}|${r.contentHash ?? ''}`
+  );
 }
 
 /**
- * TEAM-3367: drop duplicate evaluator-result rows (first occurrence wins).
+ * How an evaluator-result row TURNED OUT, independent of its dedupKey
+ * (TEAM-3385 finding 3).
+ *
+ *   'scored' — a real numeric score and no error: the row a dashboard wants
+ *   'error'  — the evaluator failed (throttle, validation, missing span, …)
+ *   'other'  — neither: no score yet, no error (e.g. a pending/skipped row)
+ */
+export function recordOutcome(r) {
+  if (Number.isFinite(r?.score) && !r?.errorType) return 'scored';
+  if (r?.errorType) return 'error';
+  return 'other';
+}
+
+/**
+ * Preference order for two rows sharing a dedupKey: scored > other > error.
+ *
+ * WHY a scored row must beat an error row (TEAM-3385 finding 3): an eval retry
+ * storm emits a ThrottlingException record and then, on retry, the SCORED
+ * record for the same trace/span/evaluator. Those share a dedupKey, and under
+ * the old first-occurrence-wins rule whichever copy CloudWatch happened to
+ * deliver first won — so a delivery ordered [error, success] classified the
+ * session as an error and dropped the score on the floor, while the
+ * duplicate-free delivery [success] classified it as scored. That is exactly
+ * the invariant FR-2.1 AC-3 forbids breaking: dedup must never change a
+ * session's classification versus a delivery with no duplicates in it.
+ *
+ * Among rows of EQUAL outcome, first occurrence still wins (retries of the same
+ * scored record are byte-identical, so there is nothing to choose between them).
+ */
+const OUTCOME_RANK = { scored: 2, other: 1, error: 0 };
+
+function outcomeBeats(candidate, incumbent) {
+  return OUTCOME_RANK[candidate] > OUTCOME_RANK[incumbent];
+}
+
+/**
+ * TEAM-3367: collapse duplicate evaluator-result rows, KEEPING THE BEST OUTCOME
+ * per dedupKey (TEAM-3385 finding 3 — it used to keep the first occurrence).
  * Keyed by requestId when the record carried one; otherwise by a content key —
  * timestamp inclusion keeps genuinely distinct same-score evaluations apart,
  * while identical retry writes share all the fields. Unparseable rows key on
  * their raw text so two different platform lines that happen to share a
  * timestamp never collapse into one.
  *
- * TEAM-3381: pass `seen` to dedupe ACROSS calls — flushBuffer reuses one set
- * over every buffered delivery so a request id split across two CloudWatch
- * deliveries reaches the flushed payload once (see dedupeBufferedSessions).
- * TEAM-3376 layers the cross-INVOCATION DynamoDB seen-set on top
- * (dedupeAgainstSeenSet), which also protects the DDB rolling aggregates.
+ * Order is preserved: a later, better row REPLACES the kept row at its original
+ * index rather than being appended, so the deduped list keeps delivery order and
+ * the drop count stays `input.length - output.length` however the collisions
+ * were ordered.
+ *
+ * `seen` (a Map of dedupKey → bookkeeping) can be shared across calls to dedupe
+ * ACROSS collections. Caveat: a better row arriving in a LATER call cannot
+ * retroactively evict the row an earlier call already returned, which is exactly
+ * why dedupeBufferedSessions below does its own global best-per-key pass instead
+ * of threading one Map through per-entry calls.
+ * TEAM-3376 layers the cross-INVOCATION DynamoDB seen-set on top (checkSeenSet /
+ * claimSeenSet), which also protects the DDB rolling aggregates.
  */
-export function dedupeResults(records, seen = new Set()) {
+export function dedupeResults(records, seen = new Map()) {
   const out = [];
   for (const r of records || []) {
     // Rows carry their key pre-stamped by extractSessionData (the seen-set
@@ -341,11 +456,22 @@ export function dedupeResults(records, seen = new Set()) {
     // A null key means hasNoDedupKey → fail open: no key exists, so no
     // duplicate can be proven.
     const key = r.dedupKey !== undefined ? r.dedupKey : dedupKeyFor(r);
-    if (key) {
-      if (seen.has(key)) continue;
-      seen.add(key);
+    if (!key) {
+      out.push(r);
+      continue;
     }
-    out.push(r);
+    const outcome = recordOutcome(r);
+    const prior = seen.get(key);
+    if (!prior) {
+      seen.set(key, { outcome, out, index: out.length });
+      out.push(r);
+      continue;
+    }
+    // Duplicate: it never adds an output row, it can only upgrade the kept one.
+    if (prior.out === out && outcomeBeats(outcome, prior.outcome)) {
+      prior.out[prior.index] = r;
+      prior.outcome = outcome;
+    }
   }
   return out;
 }
@@ -358,6 +484,11 @@ export function dedupeResults(records, seen = new Set()) {
  * pre-fix appeared twice in the flushed batch payload and double-counted in the
  * batch summary the improver reads.
  *
+ * KEEP-BEST across entries (TEAM-3385 finding 3): the winner for a key is chosen
+ * over the WHOLE buffer first, so an error row buffered from delivery A can't
+ * evict the scored row from delivery B just by having been buffered earlier.
+ * Hence the two passes rather than one shared-Map walk.
+ *
  * Race-free by construction: it runs on the ALL_NEW snapshot flushBuffer already
  * owns, purely in memory, so no DDB read-modify-write is involved.
  *
@@ -367,16 +498,46 @@ export function dedupeResults(records, seen = new Set()) {
  * sessionIds provenance instead of silently vanishing from the batch.
  */
 export function dedupeBufferedSessions(buffer) {
-  const seen = new Set();
+  const entries = buffer || [];
+  const keyOf = (r) => (r?.dedupKey !== undefined ? r.dedupKey : dedupKeyFor(r));
+
+  // Pass 1: the winning ROW INSTANCE per key, across every entry.
+  const best = new Map();
+  for (const entry of entries) {
+    if (!entry || !Array.isArray(entry.evaluatorResults)) continue;
+    for (const r of entry.evaluatorResults) {
+      const key = keyOf(r);
+      if (!key) continue; // fail open: no key → never deduped
+      const outcome = recordOutcome(r);
+      const prior = best.get(key);
+      if (!prior || outcomeBeats(outcome, prior.outcome)) best.set(key, { row: r, outcome });
+    }
+  }
+
+  // Pass 2: emit only the winners, preserving entry shape and order. The
+  // identity check (`prior.row === r`) plus `claimed` means that when the very
+  // same row object was buffered twice — or two rows tie on outcome — the FIRST
+  // occurrence is the one kept.
+  const claimed = new Set();
   const sessions = [];
   let crossDeliveryDuplicatesDropped = 0;
-
-  for (const entry of buffer || []) {
+  for (const entry of entries) {
     if (!entry || !Array.isArray(entry.evaluatorResults)) {
       sessions.push(entry);
       continue;
     }
-    const kept = dedupeResults(entry.evaluatorResults, seen);
+    const kept = [];
+    for (const r of entry.evaluatorResults) {
+      const key = keyOf(r);
+      if (!key) {
+        kept.push(r);
+        continue;
+      }
+      if (best.get(key)?.row === r && !claimed.has(key)) {
+        claimed.add(key);
+        kept.push(r);
+      }
+    }
     crossDeliveryDuplicatesDropped += entry.evaluatorResults.length - kept.length;
     sessions.push({ ...entry, evaluatorResults: kept });
   }
@@ -489,7 +650,7 @@ export function extractSessionData(parsed) {
       // run apart from a badly-scored one instead of averaging nulls into zeros.
       const row = { ...entry, ...classifyEntry(entry) };
       // dedupKey stamped onto the row (TEAM-3376): the in-memory pass below and
-      // the cross-delivery seen-set (dedupeAgainstSeenSet) both key off it.
+      // the cross-delivery seen-set (checkSeenSet/claimSeenSet) both key off it.
       row.dedupKey = dedupKeyFor(row);
       sessionBuffer.push(row);
     } catch {
@@ -539,64 +700,102 @@ export function setSeenSetClient(client) {
   seenSetClient = client;
 }
 
+// BatchGetItem takes at most 100 keys per request; the check phase chunks to it.
+const SEEN_BATCH_GET_CHUNK = 100;
+// Claims are per-item conditional PutItems (BatchWriteItem supports no
+// ConditionExpression), so they run in bounded-concurrency waves instead of one
+// serial round-trip per row — the claim sits on the invocation's critical path.
+const SEEN_CLAIM_CONCURRENCY = 10;
+
 /**
- * Cross-delivery + concurrent-invocation dedup (TEAM-3376). CW Logs can
- * re-deliver the same log events in a second subscription batch, and two
- * concurrent Lambda invocations can each see a copy — the in-memory pass in
- * extractSessionData can't catch either. Persistent seen-set: one conditional
- * PutItem per keyed record; ConditionalCheckFailedException means another
- * delivery already claimed this dedupKey → drop the row before classification,
- * aggregation and buffering. TTL'd at 24h so the table self-cleans.
+ * Cross-delivery + concurrent-invocation dedup, phase 1 of 2: CHECK (TEAM-3376,
+ * redesigned in TEAM-3385 finding 2). CW Logs can re-deliver the same log events
+ * in a second subscription batch, and two concurrent Lambda invocations can each
+ * see a copy — the in-memory pass in extractSessionData can't catch either.
+ *
+ * READ-ONLY BY CONSTRUCTION. It used to probe the seen-set with a conditional
+ * PutItem, which CLAIMED every key before anything durable had happened: if a
+ * later step threw (appendToBuffer's UpdateCommand can hit a throttle or the
+ * 400KB item cap), CW Logs re-delivered the batch and the retry found every key
+ * already claimed by the invocation that FAILED — so every row was dropped as a
+ * "duplicate" and the data was lost permanently. Claiming now happens in
+ * claimSeenSet, after the buffer append succeeds.
+ *
+ * One BatchGetItem per 100 keys, not one round-trip per row.
+ *
+ * A hit is a duplicate UNLESS the stored claim is an 'error' and the incoming row
+ * is 'scored': a success supersedes an error claim for the same evaluation
+ * attempt (TEAM-3385 finding 3 — see OUTCOME_RANK). The claim phase then
+ * overwrites the stored outcome, so the NEXT re-delivery of that success is
+ * dropped normally.
  *
  * FAIL-OPEN throughout, matching aggregateScoresToDdb's non-fatal posture:
- * table unset/missing, SDK unavailable, or any non-conditional DDB error →
- * the record is treated as fresh (double-count beats data loss).
+ * table unset/missing, SDK unavailable, any DDB error, or keys left in
+ * UnprocessedKeys → the record is treated as fresh (double-count beats data loss).
  *
  * Mutates sessionData in place: filters evaluatorResults and adds the drops to
  * duplicatesDropped so the EMF duplicate count covers both dedup layers.
  */
-export async function dedupeAgainstSeenSet(sessionData, agentId = '') {
+export async function checkSeenSet(sessionData, agentId = '') {
   const records = sessionData?.evaluatorResults || [];
   const keyed = records.filter((r) => r.dedupKey);
   if (!SEEN_TABLE || keyed.length === 0) return sessionData;
 
-  let PutCommand;
+  let BatchGetCommand;
   try {
-    ({ PutCommand } = await import('@aws-sdk/lib-dynamodb'));
+    ({ BatchGetCommand } = await import('@aws-sdk/lib-dynamodb'));
   } catch {
-    PutCommand = undefined;
+    BatchGetCommand = undefined;
   }
-  if (!PutCommand) return sessionData; // SDK unavailable → skip gracefully
+  if (!BatchGetCommand) return sessionData; // SDK unavailable → skip gracefully
 
   const client = seenSetClient || ddb;
-  const expiresAt = Math.floor(Date.now() / 1000) + SEEN_TTL_SECONDS;
-  const duplicateKeys = new Set();
-  let failedOpen = 0;
+  // Distinct keys only: BatchGetItem REJECTS a request containing the same key
+  // twice, and rows sharing a key can survive the in-memory pass (a null-keyed
+  // row is filtered out above, but hand-built callers aren't guaranteed unique).
+  const keys = [...new Set(keyed.map((r) => r.dedupKey))];
+  const storedOutcome = new Map();
 
-  for (const record of keyed) {
-    try {
-      await client.send(
-        new PutCommand({
-          TableName: SEEN_TABLE,
-          Item: { dedupKey: record.dedupKey, expiresAt },
-          ConditionExpression: 'attribute_not_exists(dedupKey)',
+  try {
+    for (let i = 0; i < keys.length; i += SEEN_BATCH_GET_CHUNK) {
+      const chunk = keys.slice(i, i + SEEN_BATCH_GET_CHUNK);
+      const result = await client.send(
+        new BatchGetCommand({
+          RequestItems: {
+            [SEEN_TABLE]: {
+              Keys: chunk.map((dedupKey) => ({ dedupKey })),
+              // `outcome` is aliased in every expression: the DynamoDB reserved
+              // word list is long and not worth betting a silent
+              // ValidationException on.
+              ProjectionExpression: '#dedupKey, #outcome',
+              ExpressionAttributeNames: { '#dedupKey': 'dedupKey', '#outcome': 'outcome' },
+            },
+          },
         })
       );
-    } catch (err) {
-      if (err?.name === 'ConditionalCheckFailedException') {
-        duplicateKeys.add(record.dedupKey);
-      } else {
-        failedOpen += 1; // any other error → fresh
+      for (const item of result?.Responses?.[SEEN_TABLE] || []) {
+        // Items written before the outcome attribute existed read as 'other',
+        // i.e. they still block a re-delivery but never block a scored upgrade.
+        if (item?.dedupKey) storedOutcome.set(item.dedupKey, item.outcome ?? 'other');
       }
+      // UnprocessedKeys are simply absent from storedOutcome → fail open.
     }
+  } catch (err) {
+    console.warn(
+      `[eval-packager] ${agentId}: seen-set check failed open for ${keys.length} key(s) ` +
+        `(table=${SEEN_TABLE}): ${err?.message} — retained; duplicates may double-count.`
+    );
+    return sessionData;
   }
 
-  if (failedOpen > 0) {
-    console.warn(
-      `[eval-packager] ${agentId}: seen-set check failed open for ${failedOpen} record(s) ` +
-        `(table=${SEEN_TABLE}) — retained; duplicates may double-count.`
-    );
+  const duplicateKeys = new Set();
+  for (const record of keyed) {
+    const prior = storedOutcome.get(record.dedupKey);
+    if (prior === undefined) continue; // fresh key
+    if (prior === 'error' && recordOutcome(record) === 'scored') continue; // success supersedes
+    duplicateKeys.add(record.dedupKey);
   }
+
   if (duplicateKeys.size > 0) {
     const before = records.length;
     sessionData.evaluatorResults = records.filter((r) => !duplicateKeys.has(r.dedupKey));
@@ -608,6 +807,115 @@ export async function dedupeAgainstSeenSet(sessionData, agentId = '') {
     );
   }
   return sessionData;
+}
+
+/**
+ * Cross-delivery dedup, phase 2 of 2: CLAIM (TEAM-3385 finding 2). Records the
+ * surviving rows in the seen-set so a FUTURE delivery of the same rows is
+ * dropped by checkSeenSet. TTL'd at 24h so the table self-cleans.
+ *
+ * MUST be called only once this delivery's rows are durably persisted (i.e. after
+ * appendToBuffer resolves) or once the delivery has been finally discarded (the
+ * sample-rate skip). Everything about the ordering is deliberate:
+ *
+ *   - Throw before/inside appendToBuffer → nothing is claimed → CW Logs
+ *     re-delivers and the retry processes the batch normally. At-least-once, so
+ *     aggregateScoresToDdb may have counted the failed attempt's rows and the
+ *     rolling aggregates can double-count — fail-open by design, and
+ *     dedupeBufferedSessions still collapses the flushed batch payload. The old
+ *     claimed-but-never-persisted permanent data loss is impossible by
+ *     construction.
+ *   - Two genuinely concurrent invocations can both pass the check before either
+ *     claims, so both may process a copy. Accepted trade: a double-count in the
+ *     aggregates beats dropping a real evaluation, and the ConditionExpression
+ *     still makes the claim itself single-writer.
+ *
+ * Entirely FAIL-OPEN and non-fatal: a failed claim only means a future duplicate
+ * may slip through, so nothing here is allowed to throw into the handler.
+ */
+export async function claimSeenSet(sessionData, agentId = '') {
+  try {
+    const records = sessionData?.evaluatorResults || [];
+    const keyed = records.filter((r) => r.dedupKey);
+    if (!SEEN_TABLE || keyed.length === 0) return;
+
+    let PutCommand;
+    try {
+      ({ PutCommand } = await import('@aws-sdk/lib-dynamodb'));
+    } catch {
+      PutCommand = undefined;
+    }
+    if (!PutCommand) return; // SDK unavailable → skip gracefully
+
+    const client = seenSetClient || ddb;
+    const expiresAt = Math.floor(Date.now() / 1000) + SEEN_TTL_SECONDS;
+
+    // One claim per DISTINCT key, carrying the best outcome among the rows that
+    // share it — that outcome is what a later delivery is compared against.
+    const bestByKey = new Map();
+    for (const r of keyed) {
+      const outcome = recordOutcome(r);
+      const prior = bestByKey.get(r.dedupKey);
+      if (prior === undefined || outcomeBeats(outcome, prior)) bestByKey.set(r.dedupKey, outcome);
+    }
+
+    const claims = [...bestByKey];
+    let claimed = 0;
+    let alreadyClaimed = 0;
+    let failedOpen = 0;
+
+    const putClaim = async ([dedupKey, outcome]) => {
+      // A fresh key always claims. A 'scored' claim may ALSO overwrite an
+      // existing 'error' claim — the mirror of checkSeenSet's supersede rule,
+      // and the reason the outcome is stored at all. Any other lost condition is
+      // a benign concurrent claim by another invocation: the key is spoken for,
+      // which is exactly the state we wanted.
+      const supersedes = outcome === 'scored';
+      try {
+        await client.send(
+          new PutCommand({
+            TableName: SEEN_TABLE,
+            Item: { dedupKey, expiresAt, outcome },
+            ConditionExpression: supersedes
+              ? 'attribute_not_exists(dedupKey) OR #outcome = :error'
+              : 'attribute_not_exists(dedupKey)',
+            ...(supersedes
+              ? {
+                  ExpressionAttributeNames: { '#outcome': 'outcome' },
+                  ExpressionAttributeValues: { ':error': 'error' },
+                }
+              : {}),
+          })
+        );
+        claimed += 1;
+      } catch (err) {
+        if (err?.name === 'ConditionalCheckFailedException') alreadyClaimed += 1;
+        else failedOpen += 1;
+      }
+    };
+
+    // Bounded waves; each putClaim swallows its own error, so this never rejects.
+    for (let i = 0; i < claims.length; i += SEEN_CLAIM_CONCURRENCY) {
+      await Promise.all(claims.slice(i, i + SEEN_CLAIM_CONCURRENCY).map(putClaim));
+    }
+
+    if (failedOpen > 0) {
+      console.warn(
+        `[eval-packager] ${agentId}: seen-set claim failed open for ${failedOpen} of ` +
+          `${claims.length} key(s) (table=${SEEN_TABLE}) — a re-delivery of those rows ` +
+          'will not be deduped.'
+      );
+    }
+    console.log(
+      `[eval-packager] ${agentId}: seen-set claimed ${claimed}/${claims.length} key(s) ` +
+        `(${alreadyClaimed} already claimed concurrently).`
+    );
+  } catch (err) {
+    // Belt and braces: the claim is an optimization for FUTURE deliveries, and
+    // this delivery is already durably persisted. Never fail the invocation here
+    // — that would re-deliver rows we just buffered.
+    console.warn(`[eval-packager] ${agentId}: seen-set claim skipped: ${err?.message}`);
+  }
 }
 
 /**
@@ -665,6 +973,28 @@ function emitMissingSpanAlerts(agentId, entries) {
  * everything else. The statuses map keeps the coarse 'error' value: nothing
  * downstream (buffer, dashboard) may flip on the subtype; only the EMF rates
  * read the partition.
+ *
+ * TEAM-3385 finding 5: a CONFIRMED missing-span session is 'span_missing', not
+ * an error, even though it arrives WITH an error.type. The evaluations service
+ * reports "none of the spans contain the required agent invocation" as
+ * error.type=ValidationException, so the old order (allNull && hasError →
+ * 'error' → matches VALIDATION_ERROR_RE) filed the single biggest failure class
+ * in the RCA (38.4% of runs) under EvalValidationExceptionRate, while
+ * EvalSessionsSpanMissing only ever counted allNull sessions with NO errorType.
+ * Two metrics lied at once: the validation rate conflated a broken telemetry
+ * pipeline with genuine bad-request failures, and "EvalSessionsSpanMissing = 0"
+ * passed trivially while spans were still missing. The message, not the type, is
+ * the discriminator — hence isMissingSpanError (lib/classify.mjs), the same
+ * predicate emitMissingSpanAlerts and sessionsMissingSpan already used, so the
+ * per-session alarm and the fleet metric can no longer disagree.
+ *
+ * ORDER: throttle is still checked FIRST, so a session carrying BOTH a throttle
+ * row and a missing-span row counts as throttled and NOT as span_missing. A
+ * throttled judge is a plausible CAUSE of the missing-span-shaped noise (it can
+ * fail before it ever reads the span), the throttle is the actionable signal, and
+ * throttles are self-limiting where a genuinely missing span is a deploy bug. It
+ * also keeps `throttled` continuous with the pre-fix metric. Missing-span
+ * therefore wins only when no throttle row exists in the session.
  */
 export function classifySessions(sessionData) {
   const bySession = new Map();
@@ -680,12 +1010,25 @@ export function classifySessions(sessionData) {
   for (const [sid, rows] of bySession) {
     const allNull = rows.every((r) => r.score === null);
     const hasError = rows.some((r) => r.errorType);
-    statuses.set(sid, !allNull ? 'scored' : hasError ? 'error' : 'span_missing');
-    if (statuses.get(sid) === 'error') {
-      if (rows.some((r) => THROTTLE_RE.test(r.errorType ?? ''))) throttled += 1;
-      else if (rows.some((r) => VALIDATION_ERROR_RE.test(r.errorType ?? ''))) validationErrors += 1;
-      else genericErrors += 1;
+    if (!allNull) {
+      statuses.set(sid, 'scored');
+      continue;
     }
+    if (!hasError) {
+      statuses.set(sid, 'span_missing');
+      continue;
+    }
+    const isThrottled = rows.some((r) => THROTTLE_RE.test(r.errorType ?? ''));
+    // Confirmed missing span (and no throttle to blame it on) → a telemetry
+    // failure, tallied as span_missing and excluded from every error subtotal.
+    if (!isThrottled && rows.some((r) => isMissingSpanError(r))) {
+      statuses.set(sid, 'span_missing');
+      continue;
+    }
+    statuses.set(sid, 'error');
+    if (isThrottled) throttled += 1;
+    else if (rows.some((r) => VALIDATION_ERROR_RE.test(r.errorType ?? ''))) validationErrors += 1;
+    else genericErrors += 1;
   }
   return {
     statuses,
@@ -837,14 +1180,41 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
  * double-counted the rolling sum/count and the session tally.
  *
  * TEAM-3381 flagged the remaining PER-DELIVERY exposure (duplicates spanning
- * two deliveries); TEAM-3376 closes it — the handler runs dedupeAgainstSeenSet
- * (DynamoDB conditional-write seen-set, fail-open) before this call, so the
- * entries are cross-delivery-deduped too. Details at the call site.
+ * two deliveries); TEAM-3376 closes it — the handler runs checkSeenSet (a
+ * read-only DynamoDB seen-set lookup, fail-open) before this call, so the
+ * entries are cross-delivery-deduped too. The matching claim happens AFTER the
+ * buffer append, which means a failed append re-delivers and re-counts here
+ * (TEAM-3385 finding 2 — an over-count beats the permanent data loss the
+ * claim-first ordering caused). Details at the call site.
+ *
+ * TEAM-3385 finding 7: this is a Get-merge-Set, and CloudWatch Logs can invoke
+ * the packager concurrently for the SAME agent. Two deliveries that read the
+ * same scorecard both computed `stored + own delta` and the second write
+ * clobbered the first — one delivery's evalScores, evalSessionCount and
+ * evalStatusCounts deltas vanished silently. Guarded with OPTIMISTIC LOCKING on
+ * an `evalAggVersion` counter (atomic ADD can't reach the nested evalScores map
+ * paths without a per-evaluator SET that fails on first write anyway): read the
+ * version, write conditionally on it, and on a lost condition re-read and
+ * re-merge, bounded by AGG_RETRY. Losing all attempts is logged and non-fatal,
+ * matching the existing posture.
+ *
+ * evalSessionCount stays APPROXIMATE regardless: CloudWatch Logs delivery is
+ * at-least-once and the seen-set claim happens after this call, so a re-delivered
+ * batch can count a session twice. It is a dashboard tally, not a ledger — the
+ * version guard is here to stop CONCURRENT writes from losing data, not to make
+ * the count exact.
  *
  * @param {Array<object>} [entries] classified evaluator-result entries for this
  *   delivery (from extractSessionData, deduped). Optional — omitted or empty
  *   leaves the status tally alone.
  */
+// Optimistic-locking retry for the scorecard merge (TEAM-3385 finding 7).
+// Contention here is two Lambda invocations, not a queue, so the delays are
+// milliseconds — just enough to de-correlate the re-reads. Full jitter, same
+// shape as improverBackoffDelayMs, and it reuses the setRetryHooks sleep/random
+// so tests stay deterministic and fast.
+const AGG_RETRY = { maxAttempts: 3, baseDelayMs: 25 };
+
 async function aggregateScoresToDdb(agentId, entries = []) {
   const sessions = new Set();
   const scoreDeltas = {}; // { evaluatorName: { sum, count } }
@@ -865,88 +1235,127 @@ async function aggregateScoresToDdb(agentId, entries = []) {
 
   if (Object.keys(scoreDeltas).length === 0 && sessions.size === 0) return;
 
-  try {
-    // Read current scorecard
-    const { Item } = await ddb.send(new GetCommand({
-      TableName: TABLE,
-      Key: { agentId },
-      ProjectionExpression: 'evalScores, evalSessionCount, evalStatusCounts',
-    }));
+  const deliverySummary = computeBatchSummary(entries);
+  const sleep =
+    retryHooks.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const random = retryHooks.random || Math.random;
 
-    const existing = Item?.evalScores || {};
-    const existingSessions = Item?.evalSessionCount || 0;
+  for (let attempt = 0; attempt < AGG_RETRY.maxAttempts; attempt += 1) {
+    try {
+      // Read current scorecard AND its version. Every field this function merges
+      // is read here, so a retry re-merges against whatever the winner wrote.
+      const { Item } = await ddb.send(new GetCommand({
+        TableName: TABLE,
+        Key: { agentId },
+        ProjectionExpression:
+          'evalScores, evalSessionCount, evalStatusCounts, evalAggVersion',
+      }));
 
-    // Merge deltas
-    for (const [evaluator, delta] of Object.entries(scoreDeltas)) {
-      if (!existing[evaluator]) existing[evaluator] = { sum: 0, count: 0 };
-      existing[evaluator].sum += delta.sum;
-      existing[evaluator].count += delta.count;
+      const expectedVersion =
+        typeof Item?.evalAggVersion === 'number' ? Item.evalAggVersion : null;
+      const existing = Item?.evalScores || {};
+      const existingSessions = Item?.evalSessionCount || 0;
+
+      // Merge deltas
+      for (const [evaluator, delta] of Object.entries(scoreDeltas)) {
+        if (!existing[evaluator]) existing[evaluator] = { sum: 0, count: 0 };
+        existing[evaluator].sum += delta.sum;
+        existing[evaluator].count += delta.count;
+      }
+
+      // Merge this delivery's status tally on top of the stored one. Same
+      // read-modify-write shape as evalScores above, and it can't fail on a
+      // first write the way a nested `evalStatusCounts.success` path update would.
+      const statusCounts = {
+        success: 0,
+        error: 0,
+        pending: 0,
+        skipped: 0,
+        ...(Item?.evalStatusCounts || {}),
+      };
+      statusCounts.success += deliverySummary.successCount;
+      statusCounts.error += deliverySummary.errorCount;
+      statusCounts.pending += deliverySummary.nullCount;
+      statusCounts.skipped += deliverySummary.skippedCount;
+
+      const now = new Date().toISOString();
+      const updateExpr = [
+        'evalScores = :scores',
+        'evalSessionCount = :sc',
+        'evalLastScoredAt = :now',
+        'evalStatusCounts = :statusCounts',
+        'evalAggVersion = :nextVersion',
+      ];
+      const values = {
+        ':scores': existing,
+        ':sc': existingSessions + sessions.size,
+        ':now': now,
+        ':statusCounts': statusCounts,
+        ':nextVersion': (expectedVersion ?? 0) + 1,
+      };
+      if (expectedVersion !== null) values[':expectedVersion'] = expectedVersion;
+
+      // Only stamp the last-error fields when this delivery actually errored —
+      // otherwise a clean delivery would erase the breadcrumb we need to debug.
+      if (deliverySummary.errorCount > 0) {
+        const firstError = (entries || []).find((e) => e.status === 'error');
+        updateExpr.push('evalLastErrorAt = :errAt', 'evalLastErrorReason = :errReason');
+        values[':errAt'] = now;
+        values[':errReason'] = String(firstError?.statusReason || 'unknown eval error').slice(0, 200);
+      }
+
+      // Write the merged scorecard, but ONLY if nobody else wrote between the
+      // read above and now (TEAM-3385 finding 7).
+      await ddb.send(new UpdateCommand({
+        TableName: TABLE,
+        Key: { agentId },
+        UpdateExpression: 'SET ' + updateExpr.join(', '),
+        ConditionExpression:
+          expectedVersion !== null
+            ? 'evalAggVersion = :expectedVersion'
+            : 'attribute_not_exists(evalAggVersion)',
+        ExpressionAttributeValues: values,
+      }));
+
+      console.log(
+        `[eval-packager] ${agentId}: aggregated ${Object.keys(scoreDeltas).length} evaluators, ${sessions.size} sessions ` +
+          `(delivery: ${deliverySummary.successCount} success / ${deliverySummary.errorCount} error / ` +
+          `${deliverySummary.nullCount} pending / ${deliverySummary.skippedCount} skipped)`
+      );
+      return;
+    } catch (err) {
+      const lost = err?.name === 'ConditionalCheckFailedException';
+      if (lost && attempt < AGG_RETRY.maxAttempts - 1) {
+        // Someone else merged first. Re-read and re-merge onto THEIR value; the
+        // deltas above are this delivery's own and are unaffected by the loss.
+        const delayMs = random() * AGG_RETRY.baseDelayMs * 2 ** attempt;
+        console.log(
+          `[eval-packager] ${agentId}: score aggregation lost the version check ` +
+            `(attempt ${attempt + 1}/${AGG_RETRY.maxAttempts}) — re-reading in ${Math.round(delayMs)}ms.`
+        );
+        await sleep(delayMs);
+        continue;
+      }
+      // Non-fatal — don't break the buffer/flush pipeline. A dropped aggregate is
+      // a stale dashboard number; a thrown error here would re-deliver the batch.
+      console.error(
+        `[eval-packager] ${agentId} score aggregation failed` +
+          `${lost ? ` after ${AGG_RETRY.maxAttempts} contended attempts` : ''}:`,
+        err.message
+      );
+      return;
     }
-
-    // Merge this delivery's status tally on top of the stored one. Same
-    // read-modify-write shape as evalScores above, and it can't fail on a
-    // first write the way a nested `evalStatusCounts.success` path update would.
-    const deliverySummary = computeBatchSummary(entries);
-    const statusCounts = {
-      success: 0,
-      error: 0,
-      pending: 0,
-      skipped: 0,
-      ...(Item?.evalStatusCounts || {}),
-    };
-    statusCounts.success += deliverySummary.successCount;
-    statusCounts.error += deliverySummary.errorCount;
-    statusCounts.pending += deliverySummary.nullCount;
-    statusCounts.skipped += deliverySummary.skippedCount;
-
-    const now = new Date().toISOString();
-    const updateExpr = [
-      'evalScores = :scores',
-      'evalSessionCount = :sc',
-      'evalLastScoredAt = :now',
-      'evalStatusCounts = :statusCounts',
-    ];
-    const values = {
-      ':scores': existing,
-      ':sc': existingSessions + sessions.size,
-      ':now': now,
-      ':statusCounts': statusCounts,
-    };
-
-    // Only stamp the last-error fields when this delivery actually errored —
-    // otherwise a clean delivery would erase the breadcrumb we need to debug.
-    if (deliverySummary.errorCount > 0) {
-      const firstError = (entries || []).find((e) => e.status === 'error');
-      updateExpr.push('evalLastErrorAt = :errAt', 'evalLastErrorReason = :errReason');
-      values[':errAt'] = now;
-      values[':errReason'] = String(firstError?.statusReason || 'unknown eval error').slice(0, 200);
-    }
-
-    // Write merged scorecard
-    await ddb.send(new UpdateCommand({
-      TableName: TABLE,
-      Key: { agentId },
-      UpdateExpression: 'SET ' + updateExpr.join(', '),
-      ExpressionAttributeValues: values,
-    }));
-
-    console.log(
-      `[eval-packager] ${agentId}: aggregated ${Object.keys(scoreDeltas).length} evaluators, ${sessions.size} sessions ` +
-        `(delivery: ${deliverySummary.successCount} success / ${deliverySummary.errorCount} error / ` +
-        `${deliverySummary.nullCount} pending / ${deliverySummary.skippedCount} skipped)`
-    );
-  } catch (err) {
-    // Non-fatal — don't break the buffer/flush pipeline
-    console.error(`[eval-packager] ${agentId} score aggregation failed:`, err.message);
   }
 }
 
 /**
  * Flush the session buffer. ORDER MATTERS:
- *   0. Re-dedupe the merged buffer in memory (TEAM-3381) — pure computation on
- *      the already-claimed batch, so it changes nothing about the ordering below.
- *   1. Reset the DDB buffer FIRST (the batch is already captured in memory).
- *   2. Archive the raw batch to batches/.
+ *   0. Re-dedupe the merged buffer in memory (TEAM-3381) — pure computation, no
+ *      side effects, so it is safe to do before the claim below.
+ *   1. CLAIM the batch with a CONDITIONAL reset of the DDB buffer. Losing the
+ *      condition means another invocation is already flushing this batch → return
+ *      immediately, having done nothing observable.
+ *   2. Archive the raw batch to batches/ and emit the batch health metric.
  *   3. Synthesize a PRD via the Fleet Improver and write it to prd/ — UNLESS the
  *      batch carries no evidence (see the evidence guard below), in which case
  *      the batch is archived and the loop stops here.
@@ -955,10 +1364,28 @@ async function aggregateScoresToDdb(agentId, entries = []) {
  * came last, the run set would stay at batchSize for the whole synthesis
  * window — any concurrent invocation for the same agent would see
  * shouldFlush=true, re-read the SAME batch, and flush it again → duplicate
- * PRD + duplicate workflow. Resetting first keeps the duplicate window at one
- * DDB write (~100ms).
+ * PRD + duplicate workflow.
+ *
+ * TEAM-3385 finding 6: resetting first shrank that window to one DDB write but
+ * did not close it, because the reset was UNCONDITIONAL and the handler's
+ * cooldown gate reads `lastFlushedAt` from the GetCommand at the START of the
+ * invocation — stale by the whole per-record loop. Two concurrent invocations
+ * could both see runCount >= batchSize with the cooldown elapsed, both reset, and
+ * both flush overlapping ALL_NEW snapshots: a duplicate batch payload, a
+ * duplicate PRD (so a duplicate 14-agent workflow), and worse — the second reset
+ * wiped any delivery appended between the two resets.
+ *
+ * So the reset is now a compare-and-swap on the very value the cooldown decision
+ * was made from: `lastFlushedAt = :expected`, or attribute_not_exists for an agent
+ * that has never flushed. Exactly one concurrent invocation can win it. The loser
+ * produces NO side effects beyond its failed conditional write — no archive, no
+ * batch metric, no synthesis — and its rows are not lost: they stay in the
+ * winner's snapshot or in the fresh buffer the winner just created.
+ *
+ * @param {string|undefined} expectedLastFlushedAt the `lastFlushedAt` this
+ *   invocation's flush decision was based on (undefined = never flushed).
  */
-async function flushBuffer(agentId, buffer, batchSize) {
+async function flushBuffer(agentId, buffer, batchSize, expectedLastFlushedAt) {
   const timestamp = new Date().toISOString();
 
   // TEAM-3381 (FR-2.1 AC-1/AC-2): re-dedupe the MERGED buffer before anything
@@ -994,8 +1421,54 @@ async function flushBuffer(agentId, buffer, batchSize) {
     sessions,
   };
 
-  // Batch health metric — the agentcore-hub-eval-null-or-error-rate-high alarm
-  // watches this. Non-fatal: never lose a batch over a metric line.
+  // 1. CLAIM the batch: reset sessionBuffer AND the distinct-run set, but only if
+  //    lastFlushedAt still holds the value this flush decision was made from.
+  //    Concurrent invocations then append into a fresh buffer instead of
+  //    re-flushing this one, and only the winner proceeds past here.
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { agentId },
+        UpdateExpression:
+          'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts REMOVE bufferSessions',
+        ConditionExpression: expectedLastFlushedAt
+          ? 'lastFlushedAt = :expected'
+          : 'attribute_not_exists(lastFlushedAt)',
+        ExpressionAttributeValues: {
+          ':empty': [],
+          ':ts': timestamp,
+          ...(expectedLastFlushedAt ? { ':expected': expectedLastFlushedAt } : {}),
+        },
+      })
+    );
+  } catch (err) {
+    if (err?.name !== 'ConditionalCheckFailedException') throw err;
+    // Lost the race. Another invocation owns this batch: it has the snapshot (or
+    // a superset of it) and will archive and synthesize from it. Emitting the
+    // batch metric or archiving here would double-count a single batch, so stop
+    // before ANY side effect.
+    console.log(
+      JSON.stringify({
+        level: 'warn',
+        event: 'eval.flush.claim_lost',
+        agentId,
+        expectedLastFlushedAt: expectedLastFlushedAt ?? null,
+        bufferEntries: sessions.length,
+        reason:
+          'another invocation claimed this flush (lastFlushedAt moved since the ' +
+          'cooldown check) — no archive, no batch metric, no PRD from this one',
+      })
+    );
+    return;
+  }
+  console.log(`[eval-packager] Agent ${agentId}: buffer + run set reset (batch claimed for flush).`);
+
+  // 2. Batch health metric — the agentcore-hub-eval-null-or-error-rate-high alarm
+  //    watches this. Emitted only by the invocation that WON the claim, so one
+  //    flushed batch produces exactly one datapoint (a Maximum-statistic alarm on
+  //    a double-counted batch is a false page). Non-fatal: never lose a batch
+  //    over a metric line.
   try {
     console.log(
       JSON.stringify(
@@ -1013,24 +1486,7 @@ async function flushBuffer(agentId, buffer, batchSize) {
     console.error(`[eval-packager] ${agentId} batch metric emit failed:`, err.message);
   }
 
-  // 1. Reset sessionBuffer AND the distinct-run set in DDB FIRST — claim the
-  //    batch so concurrent invocations append into a fresh buffer instead of
-  //    re-flushing this one.
-  await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE,
-      Key: { agentId },
-      UpdateExpression:
-        'SET sessionBuffer = :empty, lastFlushedAt = :ts, lastUpdatedAt = :ts REMOVE bufferSessions',
-      ExpressionAttributeValues: {
-        ':empty': [],
-        ':ts': timestamp,
-      },
-    })
-  );
-  console.log(`[eval-packager] Agent ${agentId}: buffer + run set reset (batch claimed for flush).`);
-
-  // 2. Archive the raw batch (batches/ prefix — does NOT trigger prd-submitter)
+  // 3. Archive the raw batch (batches/ prefix — does NOT trigger prd-submitter)
   const batchKey = `${BATCH_PREFIX}/batch-${agentId}-${timestamp}.json`;
   await s3.send(
     new PutObjectCommand({
@@ -1045,7 +1501,7 @@ async function flushBuffer(agentId, buffer, batchSize) {
       `crossDeliveryDuplicatesDropped=${crossDeliveryDuplicatesDropped} | archived=${batchKey}`
   );
 
-  // 3. Evidence guard — do NOT synthesize a PRD from a batch that contains no
+  // 4. Evidence guard — do NOT synthesize a PRD from a batch that contains no
   //    evidence. Two shapes qualify: nothing was ever scored (scoredTotal === 0)
   //    or everything the evaluator attempted failed (rate at the 100 maximum).
   //    Both mean the runtime/telemetry pipeline is broken, and a PRD built from
@@ -1083,7 +1539,7 @@ async function flushBuffer(agentId, buffer, batchSize) {
     return;
   }
 
-  // 4. Synthesize a PRD from the batch and write it to prd/ (triggers the loop).
+  // 5. Synthesize a PRD from the batch and write it to prd/ (triggers the loop).
   //    Best-effort: a transient improver failure leaves the batch archived and
   //    the buffer already reset, so the flush never wedges.
   try {

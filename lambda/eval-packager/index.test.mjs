@@ -50,6 +50,8 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
   GetCommand: class GetCommand extends FakeCommand {},
   UpdateCommand: class UpdateCommand extends FakeCommand {},
   PutCommand: class PutCommand extends FakeCommand {},
+  // TEAM-3385: the seen-set CHECK phase reads with BatchGetItem.
+  BatchGetCommand: class BatchGetCommand extends FakeCommand {},
 }));
 
 vi.mock('@aws-sdk/client-s3', () => ({
@@ -189,39 +191,116 @@ beforeEach(() => {
     },
     bufferSessions: new Set(['sess-from-an-earlier-delivery']),
     priorBuffer: [],
-    // TEAM-3376 seen-set table. Puts are recorded and succeed by default;
-    // a test that wants real DynamoDB conditional-write semantics (repeat
-    // dedupKey → ConditionalCheckFailedException) opts in via the flag, so
-    // suites that replay the same request ids across handler calls (e.g. the
-    // duplicate-aggregation tests above) aren't cross-delivery-deduped.
-    seenKeys: new Set(),
+    // TEAM-3376 seen-set table, TEAM-3385 two-phase (check-then-claim).
+    // `seenItems` is the fake table: dedupKey → { dedupKey, outcome, expiresAt }.
+    // Reads and conditional-write semantics are only HONOURED when
+    // seenSetPersistent is set, so suites that replay the same request ids across
+    // handler calls (e.g. the duplicate-aggregation tests) aren't
+    // cross-delivery-deduped. Puts and gets are always recorded.
+    seenItems: new Map(),
     seenPuts: [],
-    seenSetConditional: false,
+    seenGets: [],
+    seenSetPersistent: false,
+    // TEAM-3385 finding 2: make the next N buffer appends throw the way a real
+    // DDB throttle / 400KB-item rejection does, so a test can prove that a
+    // failed invocation claimed nothing and its re-delivery is processed.
+    appendFailures: 0,
+    // TEAM-3385 finding 6: every conditional buffer-reset ("flush claim") the
+    // handler attempts, won or lost. `stealFlushClaim` makes a rival invocation
+    // move lastFlushedAt between our config read and our claim (see GetCommand).
+    flushResets: [],
+    stealFlushClaim: false,
+    // TEAM-3385 finding 7: the scorecard merge is optimistic-locked on
+    // evalAggVersion. `aggWrites` records the accepted writes; setting
+    // `aggConflicts` makes the next N merge writes lose the version check the way
+    // a concurrent invocation would — the fake applies that invocation's write
+    // (bumping the version and merging `concurrentAggDelta`) and *then* throws, so
+    // a retry that fails to re-read is visible as a lost delta.
+    aggWrites: [],
+    aggConflicts: 0,
+    concurrentAggDelta: {},
+    // Persisting the merged scorecard back into `config` is opt-in: the
+    // duplicate-aggregation suites replay the same delivery and assert on the raw
+    // per-call deltas, which a stateful scorecard would compound.
+    aggPersist: false,
+  };
+
+  // Evaluate the two conditional-write shapes index.mjs uses against the fake
+  // item. Anything else is unconditional.
+  const conditionHolds = (cond, values) => {
+    if (cond.includes('attribute_not_exists(lastFlushedAt)')) return ddbState.config.lastFlushedAt === undefined;
+    if (cond.includes('lastFlushedAt = :expected')) return ddbState.config.lastFlushedAt === values[':expected'];
+    if (cond.includes('attribute_not_exists(evalAggVersion)')) return ddbState.config.evalAggVersion === undefined;
+    if (cond.includes('evalAggVersion = :expectedVersion')) {
+      return ddbState.config.evalAggVersion === values[':expectedVersion'];
+    }
+    return true;
+  };
+  const conditionalCheckFailed = () => {
+    const err = new Error('The conditional request failed');
+    err.name = 'ConditionalCheckFailedException';
+    return err;
   };
 
   ddbSend.mockReset();
   ddbSend.mockImplementation(async (cmd) => {
     const name = cmd.constructor.name;
-    if (name === 'GetCommand') return { Item: ddbState.config };
+    if (name === 'GetCommand') {
+      const snapshot = ddbState.config;
+      // TEAM-3385 finding 6: model the race itself. A concurrent invocation wins
+      // the flush AFTER this read and BEFORE our claim, so the value we based the
+      // cooldown decision on is already stale by the time we compare-and-swap.
+      if (ddbState.stealFlushClaim) {
+        ddbState.config = { ...snapshot, lastFlushedAt: '2026-08-28T00:00:00.000Z' };
+      }
+      // Cloned, because a real Get deserializes a fresh object every call: handing
+      // out the stored reference would let a caller's in-place merge mutate the
+      // "table" and make a retried read see its own half-applied write.
+      return { Item: structuredClone(snapshot) };
+    }
+    if (name === 'BatchGetCommand') {
+      // Real BatchGetItem returns only the keys that exist, in no guaranteed
+      // order, and rejects a request that repeats a key.
+      const [table, request] = Object.entries(cmd.input.RequestItems)[0];
+      const keys = request.Keys.map((k) => k.dedupKey);
+      ddbState.seenGets.push({ table, keys });
+      if (new Set(keys).size !== keys.length) {
+        const err = new Error('Provided list of item keys contains duplicates');
+        err.name = 'ValidationException';
+        throw err;
+      }
+      const items = ddbState.seenSetPersistent
+        ? keys.filter((k) => ddbState.seenItems.has(k)).map((k) => ddbState.seenItems.get(k))
+        : [];
+      return { Responses: { [table]: items }, UnprocessedKeys: {} };
+    }
     if (name === 'PutCommand') {
       const key = cmd.input.Item?.dedupKey;
       ddbState.seenPuts.push(cmd.input);
-      if (
-        ddbState.seenSetConditional &&
-        cmd.input.ConditionExpression === 'attribute_not_exists(dedupKey)' &&
-        ddbState.seenKeys.has(key)
-      ) {
-        const err = new Error('The conditional request failed');
-        err.name = 'ConditionalCheckFailedException';
-        throw err;
+      if (ddbState.seenSetPersistent) {
+        const existing = ddbState.seenItems.get(key);
+        // The claim's condition is `attribute_not_exists(dedupKey)`, optionally
+        // `OR #outcome = :error` when the incoming row is scored.
+        const supersedesError = (cmd.input.ConditionExpression || '').includes('#outcome = :error');
+        if (existing && !(supersedesError && existing.outcome === 'error')) {
+          const err = new Error('The conditional request failed');
+          err.name = 'ConditionalCheckFailedException';
+          throw err;
+        }
+        ddbState.seenItems.set(key, { ...cmd.input.Item });
       }
-      ddbState.seenKeys.add(key);
       return {};
     }
     if (name === 'UpdateCommand') {
       // appendToBuffer asks for ALL_NEW; mirror DDB's list_append so the flush
       // sees the delivery that was just appended.
       if (cmd.input.ReturnValues === 'ALL_NEW') {
+        if (ddbState.appendFailures > 0) {
+          ddbState.appendFailures -= 1;
+          const err = new Error('ProvisionedThroughputExceededException: buffer append throttled');
+          err.name = 'ProvisionedThroughputExceededException';
+          throw err;
+        }
         const appended = cmd.input.ExpressionAttributeValues[':new'] || [];
         return {
           Attributes: {
@@ -229,6 +308,46 @@ beforeEach(() => {
             bufferSessions: ddbState.bufferSessions,
           },
         };
+      }
+
+      const values = cmd.input.ExpressionAttributeValues || {};
+      const cond = cmd.input.ConditionExpression || '';
+
+      // flushBuffer's flush claim: reset the buffer iff lastFlushedAt still holds
+      // the value the cooldown decision was made from (TEAM-3385 finding 6).
+      if (values[':empty']) {
+        ddbState.flushResets.push(cmd.input);
+        if (!conditionHolds(cond, values)) throw conditionalCheckFailed();
+        ddbState.config = { ...ddbState.config, lastFlushedAt: values[':ts'] };
+        ddbState.priorBuffer = [];
+        return {};
+      }
+
+      // aggregateScoresToDdb's optimistic-locked scorecard merge (finding 7).
+      if (values[':scores']) {
+        if (ddbState.aggConflicts > 0) {
+          ddbState.aggConflicts -= 1;
+          ddbState.config = {
+            ...ddbState.config,
+            evalAggVersion: (ddbState.config.evalAggVersion ?? 0) + 1,
+            evalScores: { ...(ddbState.config.evalScores || {}), ...ddbState.concurrentAggDelta },
+          };
+          throw conditionalCheckFailed();
+        }
+        if (!conditionHolds(cond, values)) throw conditionalCheckFailed();
+        ddbState.aggWrites.push(cmd.input);
+        // The version always persists — that is what makes the compare-and-swap
+        // real across handler calls. The merged data only when aggPersist is set.
+        ddbState.config = { ...ddbState.config, evalAggVersion: values[':nextVersion'] };
+        if (ddbState.aggPersist) {
+          ddbState.config = {
+            ...ddbState.config,
+            evalScores: values[':scores'],
+            evalSessionCount: values[':sc'],
+            evalStatusCounts: values[':statusCounts'],
+          };
+        }
+        return {};
       }
       return {};
     }
@@ -1057,13 +1176,20 @@ describe('dedup fail-open + content fingerprint (TEAM-3381)', () => {
   let dedupeBufferedSessions;
   let hasNoDedupKey;
   let contentFingerprint;
+  let dedupKeyFor;
 
   beforeAll(async () => {
     process.env.ARTIFACTS_BUCKET ??= 'test-bucket';
     process.env.AWS_REGION ??= 'us-east-1';
     vi.resetModules();
-    ({ extractSessionData, dedupeResults, dedupeBufferedSessions, hasNoDedupKey, contentFingerprint } =
-      await import('./index.mjs'));
+    ({
+      extractSessionData,
+      dedupeResults,
+      dedupeBufferedSessions,
+      hasNoDedupKey,
+      contentFingerprint,
+      dedupKeyFor,
+    } = await import('./index.mjs'));
   });
 
   const delivery = (logEvents) => ({
@@ -1186,6 +1312,87 @@ describe('dedup fail-open + content fingerprint (TEAM-3381)', () => {
     expect(sessions[0].evaluatorResults).toEqual([dup]);
     expect(sessions[1]).toEqual({ logStream: 'stream-b', sessionIds: ['s1'], evaluatorResults: [] });
     expect(sessions[2]).toEqual({ logStream: 'stream-c' });
+  });
+
+  // ── dedupKey size bound (TEAM-3385 finding 4) ─────────────────────────────
+  // dedupKey is the seen-set table's PARTITION KEY, and DynamoDB caps a partition
+  // key at 2048 bytes. The parseError path used to embed the whole raw log line,
+  // so any line over ~2KB made every conditional PutItem throw
+  // ValidationException — the seen-set then failed OPEN forever and dedup was
+  // silently inert. The fingerprint keeps the same identity guarantees at a
+  // constant size.
+  describe('dedupKey stays inside the DynamoDB 2048-byte partition-key limit', () => {
+    /** A log line that is not JSON, so extractSessionData takes the parseError path. */
+    const unparseableEvent = (timestamp, rawMessage) => ({ timestamp, message: rawMessage });
+
+    it('a >4KB unparseable line produces a dedupKey under 256 chars', () => {
+      const huge = `START RequestId: ${'x'.repeat(4096)}`;
+      const [row] = extractSessionData(delivery([unparseableEvent(1_756_250_000_000, huge)]))
+        .evaluatorResults;
+
+      expect(row.parseError).toBe(true);
+      expect(row.dedupKey.length).toBeLessThan(256);
+      // The raw text itself must not ride along in the key.
+      expect(row.dedupKey).not.toContain('xxxx');
+      expect(row.dedupKey).toBe(`raw|1756250000000|${contentFingerprint(huge)}`);
+    });
+
+    it('two DIFFERENT raw messages sharing a timestamp still get distinct keys', () => {
+      const rows = extractSessionData(
+        delivery([
+          unparseableEvent(1_756_250_000_000, `REPORT Duration: 1 ms ${'a'.repeat(5000)}`),
+          unparseableEvent(1_756_250_000_000, `REPORT Duration: 2 ms ${'a'.repeat(5000)}`),
+        ])
+      ).evaluatorResults;
+
+      expect(rows).toHaveLength(2);
+      expect(rows[0].dedupKey).not.toBe(rows[1].dedupKey);
+    });
+
+    it('the IDENTICAL raw message re-delivered gets the SAME key (so it still collapses)', () => {
+      const line = `START RequestId: ${'y'.repeat(3000)}`;
+      const first = extractSessionData(delivery([unparseableEvent(1_756_250_000_000, line)]));
+      // A second CloudWatch delivery of the same log event: same ms, same bytes.
+      const second = extractSessionData(delivery([unparseableEvent(1_756_250_000_000, line)]));
+
+      expect(first.evaluatorResults[0].dedupKey).toBe(second.evaluatorResults[0].dedupKey);
+      // And within ONE delivery the pair collapses in the in-memory pass.
+      const sameDelivery = extractSessionData(
+        delivery([
+          unparseableEvent(1_756_250_000_000, line),
+          unparseableEvent(1_756_250_000_000, line),
+        ])
+      );
+      expect(sameDelivery.evaluatorResults).toHaveLength(1);
+      expect(sameDelivery.duplicatesDropped).toBe(1);
+    });
+
+    it('no dedupKey variant exceeds the limit, even with pathological field values', () => {
+      const long = 'z'.repeat(9000);
+      const keys = [
+        // request-id path
+        dedupKeyFor({ timestamp: 1, requestId: long, evaluatorName: long }),
+        // content path
+        dedupKeyFor({
+          timestamp: 1,
+          sessionId: long,
+          evaluatorName: long,
+          evaluationName: long,
+          score: 8,
+          contentHash: 'abcd',
+        }),
+        // unparseable path
+        dedupKeyFor({ timestamp: 1, parseError: true, rawMessage: long }),
+      ];
+      for (const key of keys) {
+        expect(Buffer.byteLength(key, 'utf8')).toBeLessThanOrEqual(2048);
+      }
+      // Truncation is fingerprint-suffixed, so two over-long keys sharing a
+      // prefix stay distinct instead of colliding into one.
+      const a = dedupKeyFor({ timestamp: 1, requestId: `${long}-a`, evaluatorName: 'e' });
+      const b = dedupKeyFor({ timestamp: 1, requestId: `${long}-b`, evaluatorName: 'e' });
+      expect(a).not.toBe(b);
+    });
   });
 
   it('records carrying a request id get no fingerprint (nothing added to the buffer payload)', () => {
@@ -1645,7 +1852,8 @@ describe('invokeImprover retry (TEAM-3367)', () => {
 
 describe('TEAM-3376: dedup fail-open + seen-set + error split (pure helpers)', () => {
   let extractSessionData;
-  let dedupeAgainstSeenSet;
+  let checkSeenSet;
+  let claimSeenSet;
   let classifySessions;
   let setSeenSetClient;
   let applyRoleGuard;
@@ -1656,7 +1864,8 @@ describe('TEAM-3376: dedup fail-open + seen-set + error split (pure helpers)', (
     vi.resetModules();
     ({
       extractSessionData,
-      dedupeAgainstSeenSet,
+      checkSeenSet,
+      claimSeenSet,
       classifySessions,
       setSeenSetClient,
       applyRoleGuard,
@@ -1700,10 +1909,23 @@ describe('TEAM-3376: dedup fail-open + seen-set + error split (pure helpers)', (
     const sessionData = extractSessionData(
       deliveryOf([otelEvent({ sessionId: 's1', score: 8, requestId: 'req-hard-error' })])
     );
-    await dedupeAgainstSeenSet(sessionData, AGENT_ID);
+    await checkSeenSet(sessionData, AGENT_ID);
     expect(sessionData.evaluatorResults).toHaveLength(1);
     expect(sessionData.duplicatesDropped).toBe(0);
     expect(textLogs()).toContain('failed open');
+  });
+
+  it('a failing CLAIM never throws into the handler: the delivery is already durable', async () => {
+    setSeenSetClient({
+      send: async () => {
+        throw new Error('AccessDeniedException: no PutItem on the seen table');
+      },
+    });
+    const sessionData = extractSessionData(
+      deliveryOf([otelEvent({ sessionId: 's1', score: 8, requestId: 'req-claim-denied' })])
+    );
+    await expect(claimSeenSet(sessionData, AGENT_ID)).resolves.toBeUndefined();
+    expect(textLogs()).toContain('seen-set claim failed open');
   });
 
   it('dedup never flips classification: 8 duplicates of a throttled session classify like the duplicate-free delivery', () => {
@@ -1817,23 +2039,28 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
   const lastEvalMetrics = () => emfLines('EvalSessionsTotal').at(-1);
 
   it('drops a duplicate split across two deliveries via the seen-set (1 retained overall)', async () => {
-    ddbState.seenSetConditional = true; // real DDB conditional-write semantics
+    ddbState.seenSetPersistent = true; // the fake table really remembers claims
     const event = awslogsEvent([
       evalRecord({ sessionId: 'sess-x', score: 8, scoreLabel: 'pass', requestId: 'req-shared' }),
     ]);
 
-    await handler(event); // delivery A: fresh → conditional put succeeds
-    await handler(event); // delivery B: same dedupKey → ConditionalCheckFailedException → dropped
+    await handler(event); // delivery A: check finds nothing → claimed after append
+    await handler(event); // delivery B: check finds the claim → dropped
 
     const appends = appendWrites();
     expect(appends).toHaveLength(2);
     expect(appends[0].input.ExpressionAttributeValues[':new'][0].evaluatorResults).toHaveLength(1);
     expect(appends[1].input.ExpressionAttributeValues[':new'][0].evaluatorResults).toHaveLength(0);
 
-    // Both deliveries attempted the conditional put; only the first landed.
-    expect(ddbState.seenPuts).toHaveLength(2);
-    expect(ddbState.seenPuts[0].ConditionExpression).toBe('attribute_not_exists(dedupKey)');
+    // Only delivery A claimed: B had no surviving keyed row left to claim.
+    expect(ddbState.seenPuts).toHaveLength(1);
+    expect(ddbState.seenPuts[0].ConditionExpression).toBe(
+      'attribute_not_exists(dedupKey) OR #outcome = :error'
+    );
+    expect(ddbState.seenPuts[0].Item.outcome).toBe('scored');
     expect(typeof ddbState.seenPuts[0].Item.expiresAt).toBe('number');
+    // Both deliveries READ the table — the check phase is what does the dropping.
+    expect(ddbState.seenGets).toHaveLength(2);
 
     // Delivery B's EMF: the drop is counted, and rates guard divide-by-zero
     // (all rows gone → total 0 → rates 0, not NaN).
@@ -1898,10 +2125,18 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
     expect(emf.EvalSessionsError).toBe(1);
   });
 
+  // The errorMessage matters, not just the errorType: a ValidationException whose
+  // message is the missing-span text is a TELEMETRY failure and is counted under
+  // EvalSessionsSpanMissing instead (TEAM-3385 finding 5, asserted below).
   it('EMF for a VALIDATION-FAILED delivery: validation rate 1, throttle 0', async () => {
     await handler(
       awslogsEvent([
-        evalRecord({ sessionId: 'sess-v', score: null, errorType: 'ValidationException', errorMessage: MISSING_SPAN_MESSAGE }),
+        evalRecord({
+          sessionId: 'sess-v',
+          score: null,
+          errorType: 'ValidationException',
+          errorMessage: 'The value at judgeModelId failed to satisfy constraint: member must not be blank',
+        }),
       ])
     );
     const emf = lastEvalMetrics();
@@ -1910,6 +2145,7 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
     expect(emf.EvalValidationExceptionRate).toBe(1);
     expect(emf.EvalDuplicateResultCount).toBe(0);
     expect(emf.EvalSessionsError).toBe(1);
+    expect(emf.EvalSessionsSpanMissing).toBe(0);
   });
 
   it('EMF for a DUPLICATED delivery: healthy rates, dropped count surfaced', async () => {
@@ -1942,6 +2178,209 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
     expect(emf.EvalValidationExceptionRate).toBe(0);
     expect(emf.EvalDuplicateResultCount).toBe(0);
     expect(emf.EvalSessionsError).toBe(0);
+  });
+});
+
+// ─── TEAM-3385: check-then-claim seen-set + keep-best dedup ──────────────────
+// Two adversarial-review findings against the TEAM-3376 seen-set, fixed as one
+// redesign because both change its semantics:
+//   finding 2 — the claim ran BEFORE anything durable, so an invocation that
+//               threw afterwards poisoned its own CloudWatch re-delivery and the
+//               rows were lost for good.
+//   finding 3 — first-occurrence-wins dedup on an outcome-blind key let a
+//               throttled ERROR record shadow the SCORED record for the same
+//               evaluation attempt, flipping the session's classification.
+
+describe('TEAM-3385: seen-set check-then-claim + keep-best dedup', () => {
+  let handler;
+  let extractSessionData;
+  let dedupeResults;
+  let dedupeBufferedSessions;
+  let classifySessions;
+  let recordOutcome;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET = 'agentcore-hub-artifacts-123456789012-us-east-1';
+    process.env.EVAL_CONFIG_TABLE = 'agentcore-hub-eval-config';
+    process.env.AWS_REGION = 'us-east-1';
+    process.env.AWS_ACCOUNT_ID = '123456789012';
+    process.env.IMPROVEMENT_AGENT_ARN = IMPROVER_ARN;
+    process.env.EVAL_SEEN_TABLE = 'agentcore-hub-eval-seen-test';
+    vi.resetModules();
+    ({ handler, extractSessionData, dedupeResults, dedupeBufferedSessions, classifySessions, recordOutcome } =
+      await import('./index.mjs'));
+  });
+
+  beforeEach(() => {
+    // No flush in these tests: they assert the ingest path, not synthesis.
+    ddbState.config = { ...ddbState.config, batchSize: 10 };
+  });
+
+  const appendWrites = () =>
+    sentCommands(ddbSend, 'UpdateCommand').filter((c) => c.input.ReturnValues === 'ALL_NEW');
+  /** The evaluator rows one appendToBuffer call carried. */
+  const rowsOf = (append) => append.input.ExpressionAttributeValues[':new'][0].evaluatorResults;
+
+  const deliveryOf = (records) => ({
+    logGroup: LOG_GROUP,
+    logStream: 'team-3385-stream',
+    logEvents: records.map((r, i) => ({
+      timestamp: 1_756_250_000_000 + i,
+      message: JSON.stringify(r),
+    })),
+  });
+  const throttled = (requestId, sessionId) =>
+    evalRecord({ sessionId, score: null, errorType: 'ThrottlingException', errorMessage: 'Rate exceeded', requestId });
+  const scored = (requestId, sessionId, score = 8) =>
+    evalRecord({ sessionId, score, scoreLabel: 'pass', requestId });
+
+  // ── recordOutcome ─────────────────────────────────────────────────────────
+  it('recordOutcome: a score with no error is scored, an errorType is error, neither is other', () => {
+    expect(recordOutcome({ score: 8, errorType: null })).toBe('scored');
+    expect(recordOutcome({ score: 0, errorType: null })).toBe('scored'); // 0 is a score
+    expect(recordOutcome({ score: null, errorType: 'ThrottlingException' })).toBe('error');
+    // A score alongside an error is not trustworthy — the error wins.
+    expect(recordOutcome({ score: 8, errorType: 'ValidationException' })).toBe('error');
+    expect(recordOutcome({ score: null, errorType: null })).toBe('other');
+    expect(recordOutcome({})).toBe('other');
+  });
+
+  // ── finding 3: within one delivery ────────────────────────────────────────
+  it('within a delivery, a scored row beats an error row on the same key whichever order they arrive (finding 3)', () => {
+    const err = throttled('req-w3', 'sess-w3');
+    const ok = scored('req-w3', 'sess-w3');
+
+    for (const order of [[err, ok], [ok, err]]) {
+      const sessionData = extractSessionData(deliveryOf(order));
+      expect(sessionData.evaluatorResults).toHaveLength(1);
+      expect(sessionData.duplicatesDropped).toBe(1);
+      expect(sessionData.evaluatorResults[0].score).toBe(8);
+      expect(sessionData.evaluatorResults[0].errorType).toBeFalsy();
+      // AC-3: the classification matches a delivery that held no duplicates.
+      expect(classifySessions(sessionData).statuses.get('sess-w3')).toBe('scored');
+    }
+
+    // And it matches the duplicate-FREE delivery exactly, which is the invariant.
+    const clean = classifySessions(extractSessionData(deliveryOf([ok])));
+    expect(classifySessions(extractSessionData(deliveryOf([err, ok])))).toEqual(clean);
+  });
+
+  it('keep-best does not regress plain dedup: identical duplicates collapse first-wins, distinct rows survive', () => {
+    const first = { sessionId: 's', evaluatorName: 'e', score: 8, errorType: null, dedupKey: 'k1' };
+    const retry = { ...first }; // a byte-identical re-delivery
+    const other = { sessionId: 's', evaluatorName: 'e2', score: 5, errorType: null, dedupKey: 'k2' };
+
+    const kept = dedupeResults([first, retry, other]);
+    expect(kept).toEqual([first, other]);
+    expect(kept[0]).toBe(first); // ties → the FIRST instance is the one kept
+
+    // A later upgrade replaces the kept row IN PLACE, so order is preserved.
+    const err = { sessionId: 's', evaluatorName: 'e', score: null, errorType: 'ThrottlingException', dedupKey: 'k3' };
+    const ok = { sessionId: 's', evaluatorName: 'e', score: 9, errorType: null, dedupKey: 'k3' };
+    expect(dedupeResults([err, other, ok])).toEqual([ok, other]);
+    // Downgrades are ignored.
+    expect(dedupeResults([ok, other, err])).toEqual([ok, other]);
+  });
+
+  // ── finding 3: flush time ─────────────────────────────────────────────────
+  it('at flush time the scored row wins across buffer entries, and the loser entry keeps its provenance (finding 3)', () => {
+    const err = { sessionId: 's', evaluatorName: 'e', score: null, errorType: 'ThrottlingException', dedupKey: 'req|k|e' };
+    const ok = { sessionId: 's', evaluatorName: 'e', score: 8, errorType: null, dedupKey: 'req|k|e' };
+
+    const { sessions, crossDeliveryDuplicatesDropped } = dedupeBufferedSessions([
+      { logStream: 'delivery-a', sessionIds: ['s'], evaluatorResults: [err] },
+      { logStream: 'delivery-b', sessionIds: ['s'], evaluatorResults: [ok] },
+    ]);
+
+    expect(crossDeliveryDuplicatesDropped).toBe(1);
+    expect(sessions[0].evaluatorResults).toEqual([]);
+    expect(sessions[0].logStream).toBe('delivery-a'); // entry shape preserved
+    expect(sessions[1].evaluatorResults).toEqual([ok]);
+  });
+
+  // ── finding 2: the claim is ordered after durable persistence ─────────────
+  it('a failed buffer append claims NOTHING, so the re-delivery processes the rows in full (finding 2)', async () => {
+    ddbState.seenSetPersistent = true;
+    ddbState.appendFailures = 1;
+    const event = awslogsEvent([scored('req-f2', 'sess-f2')]);
+
+    await expect(handler(event)).rejects.toThrow(/ProvisionedThroughputExceeded/);
+
+    // The check phase is read-only: the failed invocation read the table and
+    // wrote nothing. Under the old claim-first ordering this was one claimed key.
+    expect(ddbState.seenGets).toHaveLength(1);
+    expect(ddbState.seenPuts).toEqual([]);
+    expect(ddbState.seenItems.size).toBe(0);
+
+    // CloudWatch Logs re-delivers the batch. The row must be processed, NOT
+    // dropped as a "duplicate" of the invocation that failed.
+    await handler(event);
+    const appends = appendWrites();
+    expect(appends).toHaveLength(2); // the failed attempt + the successful retry
+    expect(rowsOf(appends[1])).toHaveLength(1);
+    expect(rowsOf(appends[1])[0].score).toBe(8);
+
+    // Only now, with the rows durable, is the key claimed.
+    expect(ddbState.seenPuts).toHaveLength(1);
+    expect(ddbState.seenPuts[0].Item.outcome).toBe('scored');
+    expect(ddbState.seenPuts[0].Item.dedupKey).toMatch(/^req\|req-f2\|/);
+    expect(typeof ddbState.seenPuts[0].Item.expiresAt).toBe('number');
+  });
+
+  it('the sample-rate skip still claims: the delivery was finally discarded, not deferred', async () => {
+    ddbState.seenSetPersistent = true;
+    ddbState.config = { ...ddbState.config, sampleRate: 0 };
+    const event = awslogsEvent([scored('req-sampled', 'sess-sampled')]);
+
+    const res = await handler(event);
+    expect(res.body).toBe('sampled-out');
+    expect(appendWrites()).toHaveLength(0);
+    expect(ddbState.seenPuts).toHaveLength(1);
+    expect(ddbState.seenPuts[0].Item.dedupKey).toMatch(/^req\|req-sampled\|/);
+  });
+
+  // ── finding 3: across deliveries, through the real seen-set ───────────────
+  it('a scored record supersedes an ERROR claim from an earlier delivery; its own re-delivery is then dropped (finding 3)', async () => {
+    ddbState.seenSetPersistent = true;
+    const errEvent = awslogsEvent([throttled('req-x3', 'sess-x3')]);
+    const okEvent = awslogsEvent([scored('req-x3', 'sess-x3')]);
+
+    await handler(errEvent); // claims the key with outcome 'error'
+    await handler(okEvent); // retained: a success supersedes an error claim
+    await handler(okEvent); // now a genuine duplicate of a scored claim → dropped
+
+    const appends = appendWrites();
+    expect(appends).toHaveLength(3);
+    expect(rowsOf(appends[0])).toHaveLength(1);
+    expect(rowsOf(appends[0])[0].errorType).toBe('ThrottlingException');
+    expect(rowsOf(appends[1])).toHaveLength(1);
+    expect(rowsOf(appends[1])[0].score).toBe(8);
+    expect(rowsOf(appends[2])).toHaveLength(0);
+
+    // The stored claim was upgraded in place, error → scored.
+    expect([...ddbState.seenItems.values()].map((i) => i.outcome)).toEqual(['scored']);
+    // Only the scored claim asks to supersede; the error claim can't.
+    expect(ddbState.seenPuts.map((p) => p.ConditionExpression)).toEqual([
+      'attribute_not_exists(dedupKey)',
+      'attribute_not_exists(dedupKey) OR #outcome = :error',
+    ]);
+  });
+
+  it('the check phase reads with BatchGetItem — one round-trip for many rows, distinct keys only', async () => {
+    ddbState.seenSetPersistent = true;
+    await handler(
+      awslogsEvent([
+        scored('req-b1', 'sess-b1'),
+        scored('req-b2', 'sess-b2'),
+        scored('req-b1', 'sess-b1'), // an in-delivery duplicate of the first
+      ])
+    );
+
+    expect(ddbState.seenGets).toHaveLength(1);
+    // Two distinct keys, and no repeat — BatchGetItem rejects repeated keys.
+    expect(ddbState.seenGets[0].keys).toHaveLength(2);
+    expect(new Set(ddbState.seenGets[0].keys).size).toBe(2);
+    expect(ddbState.seenGets[0].table).toBe('agentcore-hub-eval-seen-test');
   });
 });
 
@@ -2050,5 +2489,288 @@ describe('TEAM-3376: invokeImprover setRetryHooks injection', () => {
     );
     expect(httpsRequest).toHaveBeenCalledTimes(2); // attempt 3 never started
     expect(sleeps).toHaveLength(1); // only the first retry slept
+  });
+});
+
+// ─── TEAM-3385: span-missing classification + concurrency claims ──────────────
+// Three more adversarial-review findings, all about a decision made from stale or
+// unguarded state:
+//   finding 5 — a missing-span failure arrives as errorType=ValidationException,
+//               so classifySessions filed the fleet's single largest failure class
+//               under EvalValidationExceptionRate and left EvalSessionsSpanMissing
+//               at 0 while spans were still missing.
+//   finding 6 — the flush's buffer reset was unconditional and the cooldown was
+//               decided from a config read that is stale by the whole per-record
+//               loop, so two concurrent invocations could both flush the same
+//               sessions (duplicate PRD, duplicate workflow) and the second reset
+//               wiped whatever was appended between the two.
+//   finding 7 — the scorecard merge was a plain Get-then-Set, so two concurrent
+//               deliveries raced and one delivery's score deltas vanished.
+
+describe('TEAM-3385: span-missing classification + concurrency claims', () => {
+  let handler;
+  let extractSessionData;
+  let classifySessions;
+  let setRetryHooks;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET = 'agentcore-hub-artifacts-123456789012-us-east-1';
+    process.env.EVAL_CONFIG_TABLE = 'agentcore-hub-eval-config';
+    process.env.AWS_REGION = 'us-east-1';
+    process.env.AWS_ACCOUNT_ID = '123456789012';
+    process.env.IMPROVEMENT_AGENT_ARN = IMPROVER_ARN;
+    process.env.EVAL_SEEN_TABLE = 'agentcore-hub-eval-seen-test';
+    vi.resetModules();
+    ({ handler, extractSessionData, classifySessions, setRetryHooks } = await import('./index.mjs'));
+  });
+
+  beforeEach(() => {
+    // Deterministic, instant retry timing for the finding-7 optimistic-locking
+    // loop (the module's own hooks, same as the invokeImprover suite uses).
+    setRetryHooks({ sleep: () => Promise.resolve(), random: () => 0.5 });
+  });
+
+  const deliveryOf = (records) => ({
+    logGroup: LOG_GROUP,
+    logStream: 'team-3385-concurrency-stream',
+    logEvents: records.map((r, i) => ({
+      timestamp: 1_756_260_000_000 + i,
+      message: JSON.stringify(r),
+    })),
+  });
+  const classify = (records) => classifySessions(extractSessionData(deliveryOf(records)));
+  const lastEvalMetrics = () => emfLines('EvalSessionsTotal').at(-1);
+  const flushClaims = () => ddbState.flushResets;
+  const appendWrites = () =>
+    sentCommands(ddbSend, 'UpdateCommand').filter((c) => c.input.ReturnValues === 'ALL_NEW');
+
+  // ── finding 5: a ValidationException that is really a missing span ─────────
+  it('a ValidationException carrying the missing-span message is span_missing, not a validation error', () => {
+    const result = classify([
+      evalRecord({
+        sessionId: 'sess-ms',
+        score: null,
+        errorType: 'ValidationException',
+        errorMessage: MISSING_SPAN_MESSAGE,
+        requestId: 'req-ms-1',
+      }),
+    ]);
+
+    expect(result.statuses.get('sess-ms')).toBe('span_missing');
+    expect(result.spanMissing).toBe(1);
+    // Excluded from EVERY error subtotal: it is a telemetry failure, and counting
+    // it as a validation error is what hid the 38.4% failure class.
+    expect(result.validationErrors).toBe(0);
+    expect(result.throttled).toBe(0);
+    expect(result.genericErrors).toBe(0);
+    expect(result.errors).toBe(0);
+    expect(result.total).toBe(1);
+  });
+
+  it('a genuine ValidationException (any other message) still counts as a validation error', () => {
+    const result = classify([
+      evalRecord({
+        sessionId: 'sess-gv',
+        score: null,
+        errorType: 'ValidationException',
+        errorMessage: 'The value at judgeModelId failed to satisfy constraint: member must not be blank',
+        requestId: 'req-gv-1',
+      }),
+    ]);
+
+    expect(result.statuses.get('sess-gv')).toBe('error');
+    expect(result.validationErrors).toBe(1);
+    expect(result.spanMissing).toBe(0);
+    expect(result.errors).toBe(1);
+  });
+
+  it('an allNull session with no errorType at all is still span_missing (unchanged)', () => {
+    const result = classify([evalRecord({ sessionId: 'sess-quiet', score: null, requestId: 'req-q-1' })]);
+    expect(result.statuses.get('sess-quiet')).toBe('span_missing');
+    expect(result.spanMissing).toBe(1);
+    expect(result.errors).toBe(0);
+  });
+
+  // Pins the documented tie-break: THROTTLE WINS. A throttled judge is a
+  // plausible source of missing-span-shaped noise, the throttle is the actionable
+  // signal, and it keeps `throttled` continuous with the pre-fix metric.
+  it('throttle beats missing-span when a session has both rows (documented tie-break)', () => {
+    const result = classify([
+      evalRecord({
+        sessionId: 'sess-both',
+        evaluatorName: 'builtin.correctness',
+        score: null,
+        errorType: 'ThrottlingException',
+        errorMessage: 'Rate exceeded',
+        requestId: 'req-both-1',
+      }),
+      evalRecord({
+        sessionId: 'sess-both',
+        evaluatorName: 'builtin.helpfulness',
+        score: null,
+        errorType: 'ValidationException',
+        errorMessage: MISSING_SPAN_MESSAGE,
+        requestId: 'req-both-2',
+      }),
+    ]);
+
+    expect(result.statuses.get('sess-both')).toBe('error');
+    expect(result.throttled).toBe(1);
+    expect(result.spanMissing).toBe(0);
+    expect(result.validationErrors).toBe(0);
+    expect(result.errors).toBe(1);
+  });
+
+  it('EMF wiring: the handler publishes the corrected span_missing / validation split', async () => {
+    await handler(
+      awslogsEvent([
+        evalRecord({
+          sessionId: 'sess-emf-ms',
+          score: null,
+          errorType: 'ValidationException',
+          errorMessage: MISSING_SPAN_MESSAGE,
+          requestId: 'req-emf-ms',
+        }),
+        evalRecord({
+          sessionId: 'sess-emf-gv',
+          score: null,
+          errorType: 'ValidationException',
+          errorMessage: 'judgeModelId must not be blank',
+          requestId: 'req-emf-gv',
+        }),
+      ])
+    );
+
+    const emf = lastEvalMetrics();
+    expect(emf.EvalSessionsTotal).toBe(2);
+    expect(emf.EvalSessionsSpanMissing).toBe(1);
+    expect(emf.EvalSessionsError).toBe(1);
+    expect(emf.EvalValidationExceptionRate).toBe(0.5);
+    expect(emf.EvalThrottleRate).toBe(0);
+  });
+
+  // ── finding 6: the flush claim ─────────────────────────────────────────────
+  it('the losing invocation of a concurrent double-flush archives nothing and synthesizes nothing', async () => {
+    ddbState.config = { ...ddbState.config, lastFlushedAt: '2026-08-27T00:00:00.000Z' };
+    ddbState.stealFlushClaim = true; // a rival flushes between our read and our claim
+
+    const result = await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-lost', score: 8, scoreLabel: 'pass', requestId: 'req-lost' })])
+    );
+
+    // It tried to claim, on exactly the value its cooldown decision was made from.
+    expect(flushClaims()).toHaveLength(1);
+    expect(flushClaims()[0].ConditionExpression).toBe('lastFlushedAt = :expected');
+    expect(flushClaims()[0].ExpressionAttributeValues[':expected']).toBe('2026-08-27T00:00:00.000Z');
+
+    // ...and having lost it, produced no side effects at all beyond that write.
+    expect(putsUnder('fleet-imp-agent/batches/')).toEqual([]);
+    expect(putsUnder('fleet-imp-agent/prd/')).toEqual([]);
+    expect(httpsRequest).not.toHaveBeenCalled();
+    // No batch datapoint either: a Maximum-statistic alarm on a double-counted
+    // batch is a false page.
+    expect(emfLines('eval.batch.null_or_error_rate')).toEqual([]);
+    // The delivery itself succeeded — the rows are buffered for the winner.
+    expect(result).toEqual({ statusCode: 200, body: 'ok' });
+
+    const claimLost = jsonLogs().filter((l) => l.event === 'eval.flush.claim_lost');
+    expect(claimLost).toHaveLength(1);
+    expect(claimLost[0].agentId).toBe(AGENT_ID);
+    expect(claimLost[0].expectedLastFlushedAt).toBe('2026-08-27T00:00:00.000Z');
+  });
+
+  it('the winning invocation still archives, meters and synthesizes (claim path unchanged)', async () => {
+    const result = await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-won', score: 8, scoreLabel: 'pass', requestId: 'req-won' })])
+    );
+
+    // Never flushed before → the claim guards on absence rather than a value.
+    expect(flushClaims()).toHaveLength(1);
+    expect(flushClaims()[0].ConditionExpression).toBe('attribute_not_exists(lastFlushedAt)');
+    expect(flushClaims()[0].ExpressionAttributeValues[':expected']).toBeUndefined();
+
+    expect(putsUnder('fleet-imp-agent/batches/')).toHaveLength(1);
+    expect(putsUnder('fleet-imp-agent/prd/')).toHaveLength(1);
+    expect(emfLines('eval.batch.null_or_error_rate')).toHaveLength(1);
+    expect(result).toEqual({ statusCode: 200, body: 'ok' });
+    expect(jsonLogs().filter((l) => l.event === 'eval.flush.claim_lost')).toEqual([]);
+  });
+
+  // ── finding 7: the optimistic-locked scorecard merge ───────────────────────
+  it('a lost version check re-reads and re-merges, so no delivery’s score deltas are dropped', async () => {
+    ddbState.config = { ...ddbState.config, batchSize: 10 }; // no flush; aggregation only
+    ddbState.aggPersist = true;
+
+    await handler(
+      awslogsEvent([
+        evalRecord({
+          sessionId: 'sess-agg-a',
+          evaluatorName: 'builtin.correctness',
+          score: 8,
+          scoreLabel: 'pass',
+          requestId: 'req-agg-a',
+        }),
+      ])
+    );
+    expect(ddbState.config.evalScores).toEqual({ 'builtin.correctness': { sum: 8, count: 1 } });
+    expect(ddbState.config.evalAggVersion).toBe(1);
+
+    // Delivery B loses the version check once. The rival's write lands first and
+    // carries its own delta, which B can only preserve by RE-READING.
+    ddbState.aggConflicts = 1;
+    ddbState.concurrentAggDelta = { 'builtin.groundedness': { sum: 5, count: 1 } };
+
+    await handler(
+      awslogsEvent([
+        evalRecord({
+          sessionId: 'sess-agg-b',
+          evaluatorName: 'builtin.helpfulness',
+          score: 6,
+          scoreLabel: 'pass',
+          requestId: 'req-agg-b',
+        }),
+      ])
+    );
+
+    // All three deltas survive: A's, the rival's, and B's.
+    expect(ddbState.config.evalScores).toEqual({
+      'builtin.correctness': { sum: 8, count: 1 },
+      'builtin.groundedness': { sum: 5, count: 1 },
+      'builtin.helpfulness': { sum: 6, count: 1 },
+    });
+    expect(ddbState.config.evalSessionCount).toBe(2);
+    // v1 (A) → v2 (rival) → v3 (B's retry).
+    expect(ddbState.config.evalAggVersion).toBe(3);
+    expect(ddbState.aggWrites).toHaveLength(2);
+    expect(ddbState.aggWrites[1].ConditionExpression).toBe('evalAggVersion = :expectedVersion');
+    expect(ddbState.aggWrites[1].ExpressionAttributeValues[':expectedVersion']).toBe(2);
+    expect(textLogs()).toMatch(/lost the version check \(attempt 1\/3\)/);
+  });
+
+  it('the first-ever merge guards on the version being absent', async () => {
+    ddbState.config = { ...ddbState.config, batchSize: 10 };
+
+    await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-first', score: 7, scoreLabel: 'pass', requestId: 'req-first' })])
+    );
+
+    expect(ddbState.aggWrites).toHaveLength(1);
+    expect(ddbState.aggWrites[0].ConditionExpression).toBe('attribute_not_exists(evalAggVersion)');
+    expect(ddbState.aggWrites[0].ExpressionAttributeValues[':nextVersion']).toBe(1);
+  });
+
+  it('exhausting the aggregation retries is non-fatal: the delivery is still buffered and flushed', async () => {
+    ddbState.aggConflicts = 3; // every attempt loses
+
+    const result = await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-hot', score: 9, scoreLabel: 'pass', requestId: 'req-hot' })])
+    );
+
+    expect(ddbState.aggWrites).toEqual([]); // nothing was ever accepted
+    expect(textLogs()).toMatch(/score aggregation failed after 3 contended attempts/);
+    // The scorecard is a dashboard tally; the batch is the pipeline. It still ran.
+    expect(appendWrites()).toHaveLength(1);
+    expect(putsUnder('fleet-imp-agent/batches/')).toHaveLength(1);
+    expect(result).toEqual({ statusCode: 200, body: 'ok' });
   });
 });
