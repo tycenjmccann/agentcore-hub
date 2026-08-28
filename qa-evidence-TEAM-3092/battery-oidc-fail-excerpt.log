@@ -1,0 +1,12 @@
+battery	Run npm ci	2026-08-28T01:55:15.2857074Z   npm audit fix --force
+battery	Run npm ci	2026-08-28T01:55:15.2857379Z 
+battery	Run npm ci	2026-08-28T01:55:15.2857629Z Run `npm audit` for details.
+battery	Assume eval-gate role via OIDC	﻿2026-08-28T01:55:15.3799638Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3801046Z ##[group]Run aws-actions/configure-aws-credentials@v4
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3801410Z with:
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3801657Z   aws-region: us-east-1
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3801955Z   role-session-name: gha-33134285719-tycenjmccann
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3802297Z   audience: sts.amazonaws.com
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3802594Z   output-env-credentials: true
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3802874Z ##[endgroup]
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.5092306Z ##[error]Credentials could not be loaded, please check your action inputs: Could not load credentials from any providers

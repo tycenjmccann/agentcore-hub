@@ -1,0 +1,92 @@
+changed-paths	Set up job	﻿2026-08-28T02:07:51.8002265Z Current runner version: '2.336.0'
+changed-paths	Set up job	2026-08-28T02:07:51.8038698Z ##[group]Runner Image Provisioner
+changed-paths	Set up job	2026-08-28T02:07:51.8040313Z Hosted Compute Agent
+changed-paths	Set up job	2026-08-28T02:07:51.8041237Z Version: 20260819.586
+changed-paths	Set up job	2026-08-28T02:07:51.8042252Z Commit: 3cc4a88dfa507ef76119ad1bb3eccc6378bb2b76
+changed-paths	Set up job	2026-08-28T02:07:51.8043409Z Build Date: 2026-08-18T23:20:18Z
+changed-paths	Set up job	2026-08-28T02:07:51.8044445Z Worker ID: {af268dab-21e5-44d6-ab51-07cc1addb4dc}
+changed-paths	Set up job	2026-08-28T02:07:51.8045663Z Azure Region: eastus
+changed-paths	Set up job	2026-08-28T02:07:51.8046562Z ##[endgroup]
+changed-paths	Set up job	2026-08-28T02:07:51.8049381Z ##[group]Operating System
+changed-paths	Set up job	2026-08-28T02:07:51.8050392Z Ubuntu
+changed-paths	Set up job	2026-08-28T02:07:51.8051162Z 24.04.4
+changed-paths	Set up job	2026-08-28T02:07:51.8052100Z LTS
+changed-paths	Set up job	2026-08-28T02:07:51.8052879Z ##[endgroup]
+changed-paths	Set up job	2026-08-28T02:07:51.8053757Z ##[group]Runner Image
+changed-paths	Set up job	2026-08-28T02:07:51.8054706Z Image: ubuntu-24.04
+changed-paths	Set up job	2026-08-28T02:07:51.8055563Z Version: 20260823.283.1
+changed-paths	Set up job	2026-08-28T02:07:51.8057425Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md
+changed-paths	Set up job	2026-08-28T02:07:51.8060442Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283
+changed-paths	Set up job	2026-08-28T02:07:51.8061947Z ##[endgroup]
+changed-paths	Set up job	2026-08-28T02:07:51.8063822Z ##[group]GITHUB_TOKEN Permissions
+changed-paths	Set up job	2026-08-28T02:07:51.8066661Z Metadata: read
+changed-paths	Set up job	2026-08-28T02:07:51.8067645Z PullRequests: read
+changed-paths	Set up job	2026-08-28T02:07:51.8068544Z ##[endgroup]
+changed-paths	Set up job	2026-08-28T02:07:51.8071655Z Secret source: Actions
+changed-paths	Set up job	2026-08-28T02:07:51.8073318Z Prepare workflow directory
+changed-paths	Set up job	2026-08-28T02:07:51.8522931Z Prepare all required actions
+changed-paths	Set up job	2026-08-28T02:07:51.8589935Z Getting action download info
+changed-paths	Set up job	2026-08-28T02:07:52.0263773Z Download action repository 'actions/github-script@v7' (SHA:f28e40c7f34bde8b3046d885e986cb6290c5673b)
+changed-paths	Set up job	2026-08-28T02:07:52.3235655Z Complete job name: changed-paths
+changed-paths	Detect gated-path changes	﻿2026-08-28T02:07:52.3929058Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.3937828Z ##[group]Run actions/github-script@v7
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.3938615Z with:
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.3946812Z   script: // Keep in sync with config-evals-baseline.yml `on.push.paths`.
+changed-paths	Detect gated-path changes	const gatedPrefixes = [
+changed-paths	Detect gated-path changes	  "deploy/runtime-agent/prompts/", // deploy/runtime-agent/prompts/**
+changed-paths	Detect gated-path changes	  "blueprints/",                   // blueprints/**
+changed-paths	Detect gated-path changes	  "evals/battery/",                // evals/battery/**
+changed-paths	Detect gated-path changes	];
+changed-paths	Detect gated-path changes	const gatedFiles = [
+changed-paths	Detect gated-path changes	  "deploy/workflow-manager/system-prompt.md",
+changed-paths	Detect gated-path changes	  "src/config/workflows.json",
+changed-paths	Detect gated-path changes	  "src/config/agents.json",
+changed-paths	Detect gated-path changes	  // The gate workflows themselves: changes to the gate run the gate.
+changed-paths	Detect gated-path changes	  ".github/workflows/config-evals-gate.yml",
+changed-paths	Detect gated-path changes	  ".github/workflows/config-evals-baseline.yml",
+changed-paths	Detect gated-path changes	];
+changed-paths	Detect gated-path changes	const isGated = (name) =>
+changed-paths	Detect gated-path changes	  typeof name === "string" &&
+changed-paths	Detect gated-path changes	  (gatedFiles.includes(name) ||
+changed-paths	Detect gated-path changes	    gatedPrefixes.some((p) => name.startsWith(p)));
+changed-paths	Detect gated-path changes	
+changed-paths	Detect gated-path changes	// FAIL CLOSED: no try/catch — if listing files throws, this job
+changed-paths	Detect gated-path changes	// fails, the `gated` output stays empty, and publish/fork-guard
+changed-paths	Detect gated-path changes	// (`gated != 'false'`) treat the PR as gated.
+changed-paths	Detect gated-path changes	const files = await github.paginate(github.rest.pulls.listFiles, {
+changed-paths	Detect gated-path changes	  owner: context.repo.owner,
+changed-paths	Detect gated-path changes	  repo: context.repo.repo,
+changed-paths	Detect gated-path changes	  pull_number: context.payload.pull_request.number,
+changed-paths	Detect gated-path changes	  per_page: 100,
+changed-paths	Detect gated-path changes	});
+changed-paths	Detect gated-path changes	
+changed-paths	Detect gated-path changes	// A rename out of a gated path changes gated content too, so
+changed-paths	Detect gated-path changes	// previous_filename counts as well (matches git-diff semantics).
+changed-paths	Detect gated-path changes	const hits = files
+changed-paths	Detect gated-path changes	  .filter((f) => isGated(f.filename) || isGated(f.previous_filename))
+changed-paths	Detect gated-path changes	  .map((f) => f.filename);
+changed-paths	Detect gated-path changes	const gated = hits.length > 0;
+changed-paths	Detect gated-path changes	core.info(
+changed-paths	Detect gated-path changes	  gated
+changed-paths	Detect gated-path changes	    ? `Gated paths changed (${hits.length}):\n${hits.join("\n")}`
+changed-paths	Detect gated-path changes	    : `No gated paths among ${files.length} changed file(s).`
+changed-paths	Detect gated-path changes	);
+changed-paths	Detect gated-path changes	core.setOutput("gated", gated ? "true" : "false");
+changed-paths	Detect gated-path changes	
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.3959354Z   github-token: ***
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.3959865Z   debug: false
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.3960357Z   user-agent: actions/github-script
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.3960949Z   result-encoding: json
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.3961451Z   retries: 0
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.3962245Z   retry-exempt-status-codes: 400,401,403,404,422
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.3963167Z ##[endgroup]
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.7426319Z Gated paths changed (5):
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.7428081Z blueprints/qa-verifier.md
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.7429563Z deploy/workflow-manager/system-prompt.md
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.7430883Z evals/battery/README.md
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.7431911Z src/config/agents.json
+changed-paths	Detect gated-path changes	2026-08-28T02:07:52.7432961Z src/config/workflows.json
+changed-paths	Complete job	﻿2026-08-28T02:07:52.7863544Z Evaluate and set job outputs
+changed-paths	Complete job	2026-08-28T02:07:52.7872567Z Set output 'gated'
+changed-paths	Complete job	2026-08-28T02:07:52.7875261Z Cleaning up orphan processes
+changed-paths	Complete job	2026-08-28T02:07:52.8237185Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/github-script@v7. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/

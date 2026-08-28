@@ -1,0 +1,268 @@
+battery	Set up job	﻿2026-08-28T01:54:42.7393338Z Current runner version: '2.336.0'
+battery	Set up job	2026-08-28T01:54:42.7422265Z ##[group]Runner Image Provisioner
+battery	Set up job	2026-08-28T01:54:42.7423272Z Hosted Compute Agent
+battery	Set up job	2026-08-28T01:54:42.7423890Z Version: 20260819.586
+battery	Set up job	2026-08-28T01:54:42.7424521Z Commit: 3cc4a88dfa507ef76119ad1bb3eccc6378bb2b76
+battery	Set up job	2026-08-28T01:54:42.7425345Z Build Date: 2026-08-18T23:20:18Z
+battery	Set up job	2026-08-28T01:54:42.7426076Z Worker ID: {cde24c85-77da-4d5a-ba6f-e25ba32d1b7c}
+battery	Set up job	2026-08-28T01:54:42.7427829Z Azure Region: westus2
+battery	Set up job	2026-08-28T01:54:42.7428479Z ##[endgroup]
+battery	Set up job	2026-08-28T01:54:42.7430133Z ##[group]Operating System
+battery	Set up job	2026-08-28T01:54:42.7430910Z Ubuntu
+battery	Set up job	2026-08-28T01:54:42.7431443Z 24.04.4
+battery	Set up job	2026-08-28T01:54:42.7432028Z LTS
+battery	Set up job	2026-08-28T01:54:42.7432567Z ##[endgroup]
+battery	Set up job	2026-08-28T01:54:42.7433120Z ##[group]Runner Image
+battery	Set up job	2026-08-28T01:54:42.7433768Z Image: ubuntu-24.04
+battery	Set up job	2026-08-28T01:54:42.7434339Z Version: 20260823.283.1
+battery	Set up job	2026-08-28T01:54:42.7435511Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md
+battery	Set up job	2026-08-28T01:54:42.7437753Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283
+battery	Set up job	2026-08-28T01:54:42.7438853Z ##[endgroup]
+battery	Set up job	2026-08-28T01:54:42.7440042Z ##[group]GITHUB_TOKEN Permissions
+battery	Set up job	2026-08-28T01:54:42.7442740Z Contents: read
+battery	Set up job	2026-08-28T01:54:42.7443384Z Metadata: read
+battery	Set up job	2026-08-28T01:54:42.7444071Z ##[endgroup]
+battery	Set up job	2026-08-28T01:54:42.7447032Z Secret source: Actions
+battery	Set up job	2026-08-28T01:54:42.7448435Z Prepare workflow directory
+battery	Set up job	2026-08-28T01:54:42.7812289Z Prepare all required actions
+battery	Set up job	2026-08-28T01:54:42.7866948Z Getting action download info
+battery	Set up job	2026-08-28T01:54:43.1440780Z Download action repository 'actions/checkout@v4' (SHA:11d5960a326750d5838078e36cf38b85af677262)
+battery	Set up job	2026-08-28T01:54:43.2971548Z Download action repository 'actions/setup-node@v4' (SHA:49933ea5288caeca8642d1e84afbd3f7d6820020)
+battery	Set up job	2026-08-28T01:54:43.3898197Z Download action repository 'aws-actions/configure-aws-credentials@v4' (SHA:7474bc4690e29a8392af63c5b98e7449536d5c3a)
+battery	Set up job	2026-08-28T01:54:43.6332032Z Download action repository 'actions/cache@v4' (SHA:0057852bfaa89a56745cba8c7296529d2fc39830)
+battery	Set up job	2026-08-28T01:54:43.7269321Z Download action repository 'actions/upload-artifact@v4' (SHA:ea165f8d65b6e75b540449e92b4886f43607fa02)
+battery	Set up job	2026-08-28T01:54:43.9511306Z Complete job name: battery
+battery	Run actions/checkout@v4	﻿2026-08-28T01:54:44.0529470Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0539130Z ##[group]Run actions/checkout@v4
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0540053Z with:
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0540533Z   persist-credentials: false
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0541085Z   repository: tycenjmccann/agentcore-hub
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0545251Z   token: ***
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0545689Z   ssh-strict: true
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0546130Z   ssh-user: git
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0546771Z   clean: true
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0547243Z   sparse-checkout-cone-mode: true
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0547770Z   fetch-depth: 1
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0548191Z   fetch-tags: false
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0548634Z   show-progress: true
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0549079Z   lfs: false
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0549485Z   submodules: false
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0549964Z   set-safe-directory: true
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0550466Z   allow-unsafe-pr-checkout: false
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.0551280Z ##[endgroup]
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1635830Z Syncing repository: tycenjmccann/agentcore-hub
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1639441Z ##[group]Getting Git version info
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1640887Z Working directory is '/home/runner/work/agentcore-hub/agentcore-hub'
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1642457Z [command]/usr/bin/git version
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1715128Z git version 2.55.0
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1740393Z ##[endgroup]
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1757939Z Temporarily overriding HOME='/home/runner/work/_temp/34ca3356-359a-43c1-835a-96958adbb696' before making global git config changes
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1760607Z Adding repository directory to the temporary git global config as a safe directory
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1764525Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/agentcore-hub/agentcore-hub
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1863903Z Deleting the contents of '/home/runner/work/agentcore-hub/agentcore-hub'
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1874197Z ##[group]Initializing the repository
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.1884269Z [command]/usr/bin/git init /home/runner/work/agentcore-hub/agentcore-hub
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2005089Z hint: Using 'master' as the name for the initial branch. This default branch name
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2007419Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2009144Z hint: to use in all of your new repositories, which will suppress this warning,
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2010555Z hint: call:
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2011410Z hint:
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2012454Z hint: 	git config --global init.defaultBranch <name>
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2013647Z hint:
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2014904Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2016883Z hint: 'development'. The just-created branch can be renamed via this command:
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2018396Z hint:
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2019326Z hint: 	git branch -m <name>
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2020353Z hint:
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2021605Z hint: Disable this message with "git config set advice.defaultBranchName false"
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2023738Z Initialized empty Git repository in /home/runner/work/agentcore-hub/agentcore-hub/.git/
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2029248Z [command]/usr/bin/git remote add origin https://github.com/tycenjmccann/agentcore-hub
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2089256Z ##[endgroup]
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2090135Z ##[group]Disabling automatic garbage collection
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2094722Z [command]/usr/bin/git config --local gc.auto 0
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2128161Z ##[endgroup]
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2129012Z ##[group]Setting up auth
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2137174Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2176775Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2585082Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2627544Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2862197Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.2903315Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.3142368Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.3183898Z ##[endgroup]
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.3184753Z ##[group]Fetching the repository
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.3194156Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +b5f0fec101e11128719a431115befa5190f90a3e:refs/remotes/pull/179/merge
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.8927777Z From https://github.com/tycenjmccann/agentcore-hub
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.8930364Z  * [new ref]         b5f0fec101e11128719a431115befa5190f90a3e -> pull/179/merge
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.8944961Z ##[endgroup]
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.8950887Z ##[group]Determining the checkout info
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.8953409Z ##[endgroup]
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.8954733Z [command]/usr/bin/git sparse-checkout disable
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9012922Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9046090Z ##[group]Checking out the ref
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9049656Z [command]/usr/bin/git checkout --progress --force refs/remotes/pull/179/merge
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9584900Z Note: switching to 'refs/remotes/pull/179/merge'.
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9586961Z 
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9588439Z You are in 'detached HEAD' state. You can look around, make experimental
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9591741Z changes and commit them, and you can discard any commits you make in this
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9594109Z state without impacting any branches by switching back to a branch.
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9595361Z 
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9596515Z If you want to create a new branch to retain commits you create, you may
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9599215Z do so (now or later) by using -c with the switch command. Example:
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9600467Z 
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9600941Z   git switch -c <new-branch-name>
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9601836Z 
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9602447Z Or undo this operation with:
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9603265Z 
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9603708Z   git switch -
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9604300Z 
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9605286Z Turn off this advice by setting config variable advice.detachedHead to false
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9607078Z 
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9608713Z HEAD is now at b5f0fec Merge d9768b74d1c051c930826dd04614da7171b17271 into 31f4662a7f42f478415277ca5c579e794e1c09fe
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9613832Z ##[endgroup]
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9652295Z [command]/usr/bin/git log -1 --format=%H
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9683818Z b5f0fec101e11128719a431115befa5190f90a3e
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9696002Z ##[group]Removing auth
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9701689Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9741011Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+battery	Run actions/checkout@v4	2026-08-28T01:54:44.9986604Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+battery	Run actions/checkout@v4	2026-08-28T01:54:45.0017483Z http.https://github.com/.extraheader
+battery	Run actions/checkout@v4	2026-08-28T01:54:45.0026711Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+battery	Run actions/checkout@v4	2026-08-28T01:54:45.0066766Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+battery	Run actions/checkout@v4	2026-08-28T01:54:45.0306863Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+battery	Run actions/checkout@v4	2026-08-28T01:54:45.0343983Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+battery	Run actions/checkout@v4	2026-08-28T01:54:45.0622633Z ##[endgroup]
+battery	Assert no on-disk git credential (HERM-1)	﻿2026-08-28T01:54:45.0859394Z ##[group]Run set -euo pipefail
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0860568Z ^[[36;1mset -euo pipefail^[[0m
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0861929Z ^[[36;1mextraheader="$(git config --get http.https://github.com/.extraheader || true)"^[[0m
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0863215Z ^[[36;1mif [ -n "$extraheader" ]; then^[[0m
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0864660Z ^[[36;1m  echo "::error::git http extraheader credential persisted despite persist-credentials:false — refusing to run PR code"^[[0m
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0866086Z ^[[36;1m  exit 1^[[0m
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0867219Z ^[[36;1mfi^[[0m
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0868153Z ^[[36;1mif grep -qi authorization .git/config; then^[[0m
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0869418Z ^[[36;1m  echo "::error::authorization header present in .git/config — refusing to run PR code"^[[0m
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0870590Z ^[[36;1m  exit 1^[[0m
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0871408Z ^[[36;1mfi^[[0m
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0914651Z shell: /usr/bin/bash -e {0}
+battery	Assert no on-disk git credential (HERM-1)	2026-08-28T01:54:45.0915603Z ##[endgroup]
+battery	Run actions/setup-node@v4	﻿2026-08-28T01:54:45.1200275Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.1203413Z ##[group]Run actions/setup-node@v4
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.1204334Z with:
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.1205127Z   node-version: 20
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.1206467Z   cache: npm
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.1207312Z   always-auth: false
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.1208153Z   check-latest: false
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.1211930Z   token: ***
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.1212752Z ##[endgroup]
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.2832026Z Attempting to download 20...
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.2952793Z (node:2295) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.2954840Z (Use `node --trace-deprecation ...` to show where the warning was created)
+battery	Run actions/setup-node@v4	2026-08-28T01:54:45.9109160Z Acquiring 20.20.2 - x64 from https://github.com/actions/node-versions/releases/download/20.20.2-23521894959/node-20.20.2-linux-x64.tar.gz
+battery	Run actions/setup-node@v4	2026-08-28T01:54:46.4042818Z Extracting ...
+battery	Run actions/setup-node@v4	2026-08-28T01:54:46.4254437Z [command]/usr/bin/tar xz --strip 1 --warning=no-unknown-keyword --overwrite -C /home/runner/work/_temp/8c7cf889-4ad1-4733-9fb6-b142cb1b6004 -f /home/runner/work/_temp/ed8e1f12-3d8d-4d09-99bd-72248b100cf1
+battery	Run actions/setup-node@v4	2026-08-28T01:54:47.4633517Z Adding to the cache ...
+battery	Run actions/setup-node@v4	2026-08-28T01:54:49.3645964Z ##[group]Environment details
+battery	Run actions/setup-node@v4	2026-08-28T01:54:49.5981616Z node: v20.20.2
+battery	Run actions/setup-node@v4	2026-08-28T01:54:49.5982347Z npm: 10.8.2
+battery	Run actions/setup-node@v4	2026-08-28T01:54:49.5982554Z yarn: 1.22.22
+battery	Run actions/setup-node@v4	2026-08-28T01:54:49.5983048Z ##[endgroup]
+battery	Run actions/setup-node@v4	2026-08-28T01:54:49.6005845Z [command]/opt/hostedtoolcache/node/20.20.2/x64/bin/npm config get cache
+battery	Run actions/setup-node@v4	2026-08-28T01:54:49.7117509Z /home/runner/.npm
+battery	Run actions/setup-node@v4	2026-08-28T01:54:49.9745260Z Cache hit for: node-cache-Linux-x64-npm-4f26d2c4f71af2456455d7c7bfe7db10d93e79ca2110b1aa80b78f39406b3e24
+battery	Run actions/setup-node@v4	2026-08-28T01:54:49.9884045Z (node:2295) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+battery	Run actions/setup-node@v4	2026-08-28T01:54:51.2773023Z Received 0 of 171797586 (0.0%), 0.0 MBs/sec
+battery	Run actions/setup-node@v4	2026-08-28T01:54:52.2779571Z Received 104857600 of 171797586 (61.0%), 50.0 MBs/sec
+battery	Run actions/setup-node@v4	2026-08-28T01:54:52.9384406Z Received 171797586 of 171797586 (100.0%), 61.5 MBs/sec
+battery	Run actions/setup-node@v4	2026-08-28T01:54:52.9385522Z Cache Size: ~164 MB (171797586 B)
+battery	Run actions/setup-node@v4	2026-08-28T01:54:52.9514102Z [command]/usr/bin/tar -xf /home/runner/work/_temp/7e91fe43-6d78-4fe6-b9cb-f6ffca07257d/cache.tzst -P -C /home/runner/work/agentcore-hub/agentcore-hub --use-compress-program unzstd
+battery	Run actions/setup-node@v4	2026-08-28T01:54:53.4461035Z Cache restored successfully
+battery	Run actions/setup-node@v4	2026-08-28T01:54:53.4552096Z Cache restored from key: node-cache-Linux-x64-npm-4f26d2c4f71af2456455d7c7bfe7db10d93e79ca2110b1aa80b78f39406b3e24
+battery	Run npm ci	﻿2026-08-28T01:54:53.4740670Z ##[group]Run npm ci
+battery	Run npm ci	2026-08-28T01:54:53.4741000Z ^[[36;1mnpm ci^[[0m
+battery	Run npm ci	2026-08-28T01:54:53.4783288Z shell: /usr/bin/bash -e {0}
+battery	Run npm ci	2026-08-28T01:54:53.4783600Z ##[endgroup]
+battery	Run npm ci	2026-08-28T01:54:58.0594049Z npm warn deprecated inflight@1.0.6: This module is not supported, and leaks memory. Do not use it. Check out lru-cache if you want a good and tested way to coalesce async requests by a key value, which is much more comprehensive and powerful.
+battery	Run npm ci	2026-08-28T01:54:58.2310013Z npm warn deprecated @humanwhocodes/config-array@0.13.0: Use @eslint/config-array instead
+battery	Run npm ci	2026-08-28T01:54:58.2407464Z npm warn deprecated rimraf@3.0.2: Rimraf versions prior to v4 are no longer supported
+battery	Run npm ci	2026-08-28T01:54:58.3989258Z npm warn deprecated @humanwhocodes/object-schema@2.0.3: Use @eslint/object-schema instead
+battery	Run npm ci	2026-08-28T01:54:58.4046118Z npm warn deprecated glob@7.2.3: Old versions of glob are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
+battery	Run npm ci	2026-08-28T01:54:59.8534149Z npm warn deprecated glob@10.3.10: Old versions of glob are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
+battery	Run npm ci	2026-08-28T01:55:01.8250032Z npm warn deprecated eslint@8.57.1: This version is no longer supported. Please see https://eslint.org/version-support for other options.
+battery	Run npm ci	2026-08-28T01:55:15.0745915Z 
+battery	Run npm ci	2026-08-28T01:55:15.0747040Z added 788 packages, and audited 789 packages in 22s
+battery	Run npm ci	2026-08-28T01:55:15.0747547Z 
+battery	Run npm ci	2026-08-28T01:55:15.0747853Z 260 packages are looking for funding
+battery	Run npm ci	2026-08-28T01:55:15.0748364Z   run `npm fund` for details
+battery	Run npm ci	2026-08-28T01:55:15.2851638Z 
+battery	Run npm ci	2026-08-28T01:55:15.2853526Z 12 vulnerabilities (3 moderate, 8 high, 1 critical)
+battery	Run npm ci	2026-08-28T01:55:15.2854106Z 
+battery	Run npm ci	2026-08-28T01:55:15.2854584Z To address issues that do not require attention, run:
+battery	Run npm ci	2026-08-28T01:55:15.2855258Z   npm audit fix
+battery	Run npm ci	2026-08-28T01:55:15.2855588Z 
+battery	Run npm ci	2026-08-28T01:55:15.2856008Z To address all issues (including breaking changes), run:
+battery	Run npm ci	2026-08-28T01:55:15.2857074Z   npm audit fix --force
+battery	Run npm ci	2026-08-28T01:55:15.2857379Z 
+battery	Run npm ci	2026-08-28T01:55:15.2857629Z Run `npm audit` for details.
+battery	Assume eval-gate role via OIDC	﻿2026-08-28T01:55:15.3799638Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3801046Z ##[group]Run aws-actions/configure-aws-credentials@v4
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3801410Z with:
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3801657Z   aws-region: us-east-1
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3801955Z   role-session-name: gha-33134285719-tycenjmccann
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3802297Z   audience: sts.amazonaws.com
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3802594Z   output-env-credentials: true
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.3802874Z ##[endgroup]
+battery	Assume eval-gate role via OIDC	2026-08-28T01:55:15.5092306Z ##[error]Credentials could not be loaded, please check your action inputs: Could not load credentials from any providers
+battery	Save flake ledger (best-effort, TEAM-3090)	﻿2026-08-28T01:55:15.5271477Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.5274077Z ##[group]Run actions/cache/save@v4
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.5274652Z with:
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.5275161Z   path: /home/runner/work/_temp/flake-ledger.jsonl
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.5275953Z   key: config-evals-flake-ledger-33134285719
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.5276830Z   enableCrossOsArchive: false
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.5277410Z env:
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.5277854Z   AWS_DEFAULT_REGION: us-east-1
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.5278412Z   AWS_REGION: us-east-1
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.5278883Z ##[endgroup]
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.6451541Z (node:2432) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.6452583Z (Use `node --trace-deprecation ...` to show where the warning was created)
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.6585687Z [warning]Path Validation Error: Path(s) specified in the action for caching do(es) not exist, hence no cache is being saved.
+battery	Save flake ledger (best-effort, TEAM-3090)	2026-08-28T01:55:15.6590760Z ##[warning]Cache save failed.
+battery	Upload results	﻿2026-08-28T01:55:15.6707698Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+battery	Upload results	2026-08-28T01:55:15.6709056Z ##[group]Run actions/upload-artifact@v4
+battery	Upload results	2026-08-28T01:55:15.6709334Z with:
+battery	Upload results	2026-08-28T01:55:15.6709534Z   name: battery-results
+battery	Upload results	2026-08-28T01:55:15.6710118Z   path: /home/runner/work/_temp/battery-results.json
+battery	Upload results	/home/runner/work/_temp/check-summary.md
+battery	Upload results	/home/runner/work/_temp/flake-ledger.jsonl
+battery	Upload results	
+battery	Upload results	2026-08-28T01:55:15.6710754Z   if-no-files-found: ignore
+battery	Upload results	2026-08-28T01:55:15.6711005Z   compression-level: 6
+battery	Upload results	2026-08-28T01:55:15.6711237Z   overwrite: false
+battery	Upload results	2026-08-28T01:55:15.6711468Z   include-hidden-files: false
+battery	Upload results	2026-08-28T01:55:15.6711709Z env:
+battery	Upload results	2026-08-28T01:55:15.6711907Z   AWS_DEFAULT_REGION: us-east-1
+battery	Upload results	2026-08-28T01:55:15.6712152Z   AWS_REGION: us-east-1
+battery	Upload results	2026-08-28T01:55:15.6712410Z ##[endgroup]
+battery	Upload results	2026-08-28T01:55:15.8511484Z (node:2445) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+battery	Upload results	2026-08-28T01:55:15.8512619Z (Use `node --trace-deprecation ...` to show where the warning was created)
+battery	Upload results	2026-08-28T01:55:15.8567333Z Multiple search paths detected. Calculating the least common ancestor of all paths
+battery	Upload results	2026-08-28T01:55:15.8570765Z The least common ancestor is /home/runner/work/_temp. This will be the root directory of the artifact
+battery	Upload results	2026-08-28T01:55:15.8572253Z No files were found with the provided path: /home/runner/work/_temp/battery-results.json
+battery	Upload results	2026-08-28T01:55:15.8573190Z /home/runner/work/_temp/check-summary.md
+battery	Upload results	2026-08-28T01:55:15.8574151Z /home/runner/work/_temp/flake-ledger.jsonl. No artifacts will be uploaded.
+battery	Post Assume eval-gate role via OIDC	﻿2026-08-28T01:55:15.8767820Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+battery	Post Assume eval-gate role via OIDC	2026-08-28T01:55:15.8769147Z Post job cleanup.
+battery	Post Run actions/checkout@v4	﻿2026-08-28T01:55:16.0056536Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.0057864Z Post job cleanup.
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.0950235Z [command]/usr/bin/git version
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.0997569Z git version 2.55.0
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.1073653Z Temporarily overriding HOME='/home/runner/work/_temp/2aa5ba33-8471-4bd8-872f-fbe63e5ada4b' before making global git config changes
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.1075658Z Adding repository directory to the temporary git global config as a safe directory
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.1082290Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/agentcore-hub/agentcore-hub
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.1127746Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.1169553Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.1437976Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.1503761Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.1789008Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+battery	Post Run actions/checkout@v4	2026-08-28T01:55:16.1837309Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+battery	Complete job	﻿2026-08-28T01:55:16.2253759Z Cleaning up orphan processes
+battery	Complete job	2026-08-28T01:55:16.2674036Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/cache/save@v4, actions/checkout@v4, actions/setup-node@v4, actions/upload-artifact@v4, aws-actions/configure-aws-credentials@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/

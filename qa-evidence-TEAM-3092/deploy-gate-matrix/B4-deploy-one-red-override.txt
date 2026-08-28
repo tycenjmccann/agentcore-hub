@@ -1,0 +1,15 @@
+
+╔════════════════════════════════════════════════════════════════════╗
+║          EVAL GATE BREAK-GLASS OVERRIDE — DEPLOYING UNGATED         ║
+╚════════════════════════════════════════════════════════════════════╝
+  refused for : the config-evals-gate check on HEAD (d9768b74d1c051c930826dd04614da7171b17271) concluded 'failure'
+  sha         : d9768b74d1c051c930826dd04614da7171b17271
+  script      : ./deploy/runtime-agent/deploy-one.sh
+  identity    : arn:aws:sts::000000000000:assumed-role/qa-stub-role/qa-session
+  reason      : QA TEAM-3092 break-glass verification test
+
+eval-gate: override audited to s3://qa-fake-artifact-bucket/eval-gate/overrides/20260828T021146Z-d9768b74d1c051c930826dd04614da7171b17271.txt and /mnt/efs/sessions/cc-138a79a1a11f4a45b22bb9e30d30af37/tycenjmccann-agentcore-hub/.eval-gate-overrides.log
+eval-gate: proceeding under break-glass override.
+FAIL agentcore_hub_qa_verifier (status check failed)
+
+exit=0

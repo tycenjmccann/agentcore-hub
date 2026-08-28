@@ -1,0 +1,6 @@
+
+✗ EVAL GATE REFUSED: the config-evals-gate check on HEAD (d9768b74d1c051c930826dd04614da7171b17271) concluded 'failure'
+  Check run: https://github.com/tycenjmccann/agentcore-hub/runs/98730806149
+
+  Break-glass (audited): EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON='<incident/why>' <deploy cmd>
+exit=1

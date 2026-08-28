@@ -1,0 +1,4 @@
+#!/bin/bash
+echo "docker $*" >> "/mnt/efs/sessions/cc-138a79a1a11f4a45b22bb9e30d30af37/tycenjmccann-agentcore-hub/qa-evidence/deploy-gate-matrix/mutation-calls.log"
+if [ "$1" = "s3" ] && [ "$2" = "cp" ] && [ "$3" = "-" ]; then cat > /dev/null; fi
+exit 0

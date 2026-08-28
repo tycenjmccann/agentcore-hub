@@ -1,0 +1,11 @@
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+DescribeTable agentcore-hub-eval-config FAIL: AccessDeniedException: User: arn:aws:sts::838829463875:assumed-role/agentcore-hub-coding-runtime-role/BedrockAgentCore-54b61708-ed26-45f2-af80-020b21500826 is not authorized to perform: dynamodb:DescribeTable on resource: arn:aws:dynamodb:us-east-1:838829463875:table/agentcore-hub-eval-config because no identity-based policy allows the dynamodb:DescribeTable action
+GetItem agentcore-hub-eval-config FAIL: AccessDeniedException: User: arn:aws:sts::838829463875:assumed-role/agentcore-hub-coding-runtime-role/BedrockAgentCore-54b61708-ed26-45f2-af80-020b21500826 is not authorized to perform: dynamodb:GetItem on resource: arn:aws:dynamodb:us-east-1:838829463875:table/agentcore-hub-eval-config because no identity-based policy allows the dynamodb:GetItem action
+Bedrock Converse OK: {"text":"ok","usage":{"inputTokens":14,"outputTokens":4,"totalTokens":18,"cacheReadInputTokens":0,"cacheWriteInputTokens":0},"stopReason":"end_turn"}

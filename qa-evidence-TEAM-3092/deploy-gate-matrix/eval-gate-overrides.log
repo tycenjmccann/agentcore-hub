@@ -1,0 +1,1 @@
+{"timestamp":"20260828T021146Z","sha":"d9768b74d1c051c930826dd04614da7171b17271","identity":"arn:aws:sts::000000000000:assumed-role/qa-stub-role/qa-session","script":"./deploy/runtime-agent/deploy-one.sh","reason":"QA TEAM-3092 break-glass verification test"}

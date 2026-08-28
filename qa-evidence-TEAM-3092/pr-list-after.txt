@@ -1,0 +1,20 @@
+182 OPEN qa/TEAM-3092-gated-multi | QA TEST — DO NOT MERGE — TEAM-3092: touches all five gated p
+181 OPEN qa/TEAM-3092-ungated | QA TEST — DO NOT MERGE — TEAM-3092: ungated path only (skip 
+180 OPEN qa/TEAM-3092-green-innocuous | QA TEST — DO NOT MERGE — TEAM-3092: whitespace-only prompt e
+179 OPEN qa/TEAM-3092-red-degraded | QA TEST — DO NOT MERGE — TEAM-3092: degraded qa_verifier pro
+178 MERGED feature/TEAM-3390-backend-dev | TEAM-3390: battery-session guard in aggregateScoresToDdb + b
+177 MERGED feature/TEAM-3385-backend-dev | TEAM-3385: fix eval-packager dedup/DDB review findings (seen
+176 MERGED feature/TEAM-3388-backend-dev | TEAM-3388: Fix 4 review findings in deploy gate (deploy-one.
+175 MERGED feature/TEAM-3391-backend-dev | fix(eval-packager): NotApplicable verdicts no longer inflate
+174 MERGED feature/TEAM-3295-backend-dev | TEAM-3295: config evals gate — close audit gaps (paths, ERRO
+173 OPEN feature/TEAM-3355--si-improve-agentcore-hub-agent-based-on | feat: Evaluation infrastructure improvements — throttling, f
+172 MERGED feature/TEAM-3384-backend-dev | TEAM-3384: bound serialized total + non-text blocks in tool-
+171 MERGED feature/TEAM-3090-backend-dev | TEAM-3090: config-evals-gate — close remaining ticket deltas
+170 MERGED feature/TEAM-3383-backend-dev | TEAM-3383: fix requestId dedupe over-collapse (P1) + scope s
+169 MERGED feature/TEAM-3381-backend-dev | TEAM-3381: eval-packager — cross-delivery dedup in flushBuff
+168 MERGED feature/TEAM-3376-backend-dev | TEAM-3376: Eval infrastructure reliability — anchor span, pa
+167 MERGED feature/TEAM-3382-backend-dev | TEAM-3382: Fix eval alarm JSONs — CloudWatch rejects alarms 
+166 MERGED feature/TEAM-3359-backend-dev | TEAM-3359: Evaluation infrastructure fixes (eval-packager, r
+165 MERGED feature/TEAM-3368-backend-dev | TEAM-3368: role-scope dependency_chain evaluator (P1) + eval
+164 MERGED feature/TEAM-3367-backend-dev | TEAM-3367: Fix invoke_agent span emission (runtime telemetry
+163 MERGED feature/TEAM-3352-backend-dev | TEAM-3352: battery runner — fix full-run hang (5m35s demonst

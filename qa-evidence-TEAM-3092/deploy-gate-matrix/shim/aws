@@ -1,0 +1,10 @@
+#!/bin/bash
+echo "aws $*" >> "/mnt/efs/sessions/cc-138a79a1a11f4a45b22bb9e30d30af37/tycenjmccann-agentcore-hub/qa-evidence/deploy-gate-matrix/mutation-calls.log"
+argv="$*"
+case "$argv" in
+  *"sts get-caller-identity"*"--query Account"*) echo "000000000000";;
+  *"sts get-caller-identity"*"--query Arn"*) echo "arn:aws:sts::000000000000:assumed-role/qa-stub-role/qa-session";;
+  *"sts get-caller-identity"*) echo '{"UserId":"QASTUB","Account":"000000000000","Arn":"arn:aws:sts::000000000000:assumed-role/qa-stub-role/qa-session"}';;
+  *" s3 cp - "*|*"s3 cp -"*) cat > /dev/null;;
+esac
+exit 0

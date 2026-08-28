@@ -1,0 +1,65 @@
+
+> agentcore-hub@1.0.0 test:unit
+> vitest run
+
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-138a79a1a11f4a45b22bb9e30d30af37/tycenjmccann-agentcore-hub
+
+ ✓ deploy/lib/__tests__/check-eval-gate.test.ts (30 tests) 1633ms
+ ✓ evals/battery/__tests__/gate-config.test.ts (14 tests) 19ms
+ ✓ evals/battery/__tests__/cases.test.ts (21 tests) 891ms
+ ✓ evals/battery/__tests__/agent-runner.test.ts (15 tests) 823ms
+   ✓ transport retry policy (FR-10: single retry, typed errors only) > retries once on throttling with zero model output, then succeeds 327ms
+   ✓ transport retry policy (FR-10: single retry, typed errors only) > gives up after exactly one retry on persistent connection resets 360ms
+ ✓ evals/battery/__tests__/scoring.test.ts (12 tests) 828ms
+   ✓ transport retry policy (single retry, transport errors only) > retries exactly once on throttling then succeeds, recording the attempt 343ms
+   ✓ transport retry policy (single retry, transport errors only) > marks the case unscored after persistent transport failure (never a silent partial pass) 467ms
+ ✓ evals/battery/__tests__/thresholds.test.ts (19 tests) 16ms
+ ✓ evals/battery/__tests__/redact.test.ts (15 tests) 26ms
+ ✓ evals/battery/__tests__/registry.test.ts (11 tests) 53ms
+ ✓ evals/battery/__tests__/report-otel.test.ts (9 tests) 19ms
+ ✓ evals/battery/__tests__/spend.test.ts (4 tests) 25ms
+ ✓ src/lib/cloud-code/mutate-session.test.ts (5 tests) 87ms
+ ✓ evals/battery/__tests__/flake.test.ts (12 tests) 20ms
+ ✓ evals/battery/__tests__/verdict-guards.test.ts (8 tests) 12ms
+ ✓ evals/battery/__tests__/sentinel-prompt.test.ts (3 tests) 15ms
+ ✓ evals/battery/__tests__/retry.test.ts (11 tests) 76ms
+(node:2678) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ src/lib/cloud-code/github-state.test.ts (9 tests) 975ms
+ ✓ src/lib/cloud-code/s3keys.test.ts (10 tests) 7ms
+ ✓ src/lib/routines/cron.test.ts (10 tests) 9ms
+ ✓ src/lib/sse.test.ts (9 tests) 28ms
+ ✓ evals/battery/__tests__/lint-fixtures.test.ts (3 tests) 1390ms
+   ✓ battery:lint > passes on the checked-in tree 469ms
+   ✓ battery:lint > fails on a duplicate case id, naming the id and both files (B4) 465ms
+   ✓ battery:lint > scans the committed baseline.json for forbidden patterns (C2) 454ms
+ ✓ src/lib/models/harness-models.test.ts (8 tests) 8ms
+(node:2849) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ evals/battery/__tests__/packager-filter.test.ts (2 tests) 7ms
+ ✓ src/lib/routines/routines.test.ts (7 tests) 9ms
+ ✓ src/components/workflow/__tests__/WorkflowBoard.scroll.test.ts (4 tests) 6ms
+ ✓ src/components/workflow/__tests__/WorkflowBoard.pipelinescroll.test.ts (3 tests) 4ms
+
+ Test Files  25 passed (25)
+      Tests  254 passed (254)
+   Start at  01:18:33
+   Duration  28.70s (transform 1.93s, setup 0ms, collect 8.32s, tests 6.99s, environment 7ms, prepare 2.91s)
+
+exit=0

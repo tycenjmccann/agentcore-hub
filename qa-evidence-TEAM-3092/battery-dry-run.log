@@ -1,0 +1,19 @@
+Preflight OK — 13 runnable case(s), 1 retired.
+Hermeticity self-test OK. Fixture lint OK. Zero Bedrock calls made.
+
+Plan (runId mtc8xkv98d4b, HEAD 31f4662a7f42):
+  - fix-null-session-crash-001  agent=agentcore_hub_bug_fixer  tier=haiku (us.anthropic.claude-haiku-4-5-20251001-v1:0)  evaluators=5  timeout=300s [informational: new case]
+  - fix-pagination-offbyone-002  agent=agentcore_hub_backend_dev  tier=haiku (us.anthropic.claude-haiku-4-5-20251001-v1:0)  evaluators=5  timeout=300s [informational: new case]
+  - fix-race-condition-cas-003  agent=agentcore_hub_bug_fixer  tier=sonnet (us.anthropic.claude-sonnet-5)  evaluators=5  timeout=300s [informational: new case]
+  - qa-build-verification-002  agent=agentcore_hub_qa_verifier  tier=haiku (us.anthropic.claude-haiku-4-5-20251001-v1:0)  evaluators=6  timeout=300s [informational: new case]
+  - qa-design-mismatch-003  agent=agentcore_hub_qa_verifier  tier=haiku (us.anthropic.claude-haiku-4-5-20251001-v1:0)  evaluators=6  timeout=240s [informational: new case]
+  - qa-verifier-degradation-canary-004  agent=agentcore_hub_qa_verifier  tier=haiku (us.anthropic.claude-haiku-4-5-20251001-v1:0)  evaluators=5  timeout=240s [informational: new case]
+  - qa-verifier-regression-001  agent=agentcore_hub_qa_verifier  tier=haiku (us.anthropic.claude-haiku-4-5-20251001-v1:0)  evaluators=5  timeout=240s [informational: new case]
+  - review-error-handling-001  agent=agentcore_hub_code_reviewer  tier=haiku (us.anthropic.claude-haiku-4-5-20251001-v1:0)  evaluators=5  timeout=240s [informational: new case]
+  - review-eventual-consistency-003  agent=agentcore_hub_code_reviewer  tier=haiku (us.anthropic.claude-haiku-4-5-20251001-v1:0)  evaluators=5  timeout=240s [informational: new case]
+  - review-injection-vuln-002  agent=agentcore_hub_code_reviewer  tier=sonnet (us.anthropic.claude-sonnet-5)  evaluators=5  timeout=240s [informational: new case]
+  - triage-crash-chain-001  agent=agentcore_hub_requirements_analyst  tier=sonnet (us.anthropic.claude-sonnet-5)  evaluators=5  timeout=240s [informational: new case]
+  - triage-flaky-upload-002  agent=agentcore_hub_requirements_analyst  tier=haiku (us.anthropic.claude-haiku-4-5-20251001-v1:0)  evaluators=5  timeout=180s [informational: new case]
+  - triage-rootcause-comment-003  agent=agentcore_hub_bug_fixer  tier=haiku (us.anthropic.claude-haiku-4-5-20251001-v1:0)  evaluators=5  timeout=180s [informational: new case]
+  - template-copy-me-and-rename  RETIRED: template file — never runs; copy, edit, set status:active
+exit=0

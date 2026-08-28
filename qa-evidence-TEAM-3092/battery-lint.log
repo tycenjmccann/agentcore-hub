@@ -1,0 +1,6 @@
+
+> agentcore-hub@1.0.0 battery:lint
+> node evals/battery/lint-fixtures.mjs
+
+battery:lint OK — 14 case file(s) checked (13 active), fixtures sanitized, manifest consistent
+exit=0

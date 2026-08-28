@@ -1,0 +1,11 @@
+(node:3034) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+STS OK: {"Account":"838829463875","Arn":"arn:aws:sts::838829463875:assumed-role/agentcore-hub-coding-runtime-role/BedrockAgentCore-54b61708-ed26-45f2-af80-020b21500826","UserId":"AROA4GTRB3FB7BNZHTOBC:BedrockAgentCore-54b61708-ed26-45f2-af80-020b21500826"}
+DDB FAIL: AccessDeniedException User: arn:aws:sts::838829463875:assumed-role/agentcore-hub-coding-runtime-role/BedrockAgentCore-54b61708-ed26-45f2-af80-020b21500826 is not authorized to perform: dynamodb:ListTables on resource: arn:aws:dynamodb:us-east-1:838829463875:table/* because no identity-based policy allows the dynamodb:ListTables action
