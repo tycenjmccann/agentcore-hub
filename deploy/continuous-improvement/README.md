@@ -82,6 +82,38 @@ CloudWatch Logs → eval-packager Lambda → DynamoDB buffer
      Deploying the Lambda before the table exists is exactly the permanent
      fail-open above.
 
+### Concurrency model (TEAM-3385)
+
+The packager has no lock on the whole pipeline — CloudWatch Logs subscription
+delivery is at-least-once and concurrent invocations for the same agent are
+expected, so every piece of shared state is either idempotent or
+conditionally written instead of being globally serialized:
+
+- **Seen-set (above)**: check-then-claim, never claim-then-process. The claim
+  is a conditional `PutItem` ordered strictly *after* the buffer append
+  succeeds, so an invocation that crashes between check and claim leaves its
+  rows unclaimed — the next CloudWatch redelivery reprocesses them instead of
+  finding them permanently marked seen. The cost is a possible double-count in
+  the rolling aggregates; per the fail-open posture used throughout this
+  pipeline, that is preferred over silently losing an evaluation.
+- **Flush claim**: `flushBuffer`'s buffer-reset `UpdateItem` is conditioned on
+  `lastFlushedAt` holding the exact value the caller's cooldown decision was
+  made from (`attribute_not_exists(lastFlushedAt)` on the very first flush).
+  Of two invocations that both decide to flush, only one wins that
+  compare-and-swap; the loser gets `ConditionalCheckFailedException`, logs
+  `eval.flush.claim_lost`, and returns immediately with **no** S3 archive, no
+  batch metric and no PRD synthesis — a losing invocation has zero side
+  effects beyond the failed conditional write.
+- **Scorecard aggregation**: `aggregateScoresToDdb` merges each delivery's
+  score deltas into the per-agent `evalScores` / `evalStatusCounts` under
+  optimistic locking on an `evalAggVersion` counter, since the merge touches
+  nested map paths that atomic `ADD` can't reach. A lost version check
+  re-reads and re-merges, bounded at 3 attempts with jittered backoff;
+  exhausting the retries is non-fatal (the write is skipped, logged, and the
+  handler carries on) because the scorecard is a dashboard tally, not a
+  ledger. `evalSessionCount` in particular stays **approximate** under
+  at-least-once delivery regardless of locking — that's accepted, not chased.
+
 4. **S3 Batch Archive** (`fleet-imp-agent/batches/`):
    - The raw flushed batch (`{agentId, batchSize, flushedAt, sessions[]}`)
    - Named: `batch-<agentId>-<timestamp>.json`
