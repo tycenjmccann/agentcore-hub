@@ -35,6 +35,9 @@ and the break-glass procedure. All deploy targets that ship gated artifacts
 `deploy/workflow-manager/deploy.sh`, `deploy/apprunner/deploy.sh`,
 `deploy/ecs-express/deploy.sh`) source `deploy/lib/check-eval-gate.sh` and
 refuse to run unless HEAD carries a green `config-evals-gate` check run.
+The gate's CI job assumes an OIDC IAM role — one-time provisioning is
+documented in [`evals/battery/README.md`](evals/battery/README.md) under
+"CI AWS credentials (one-time setup)".
 
 ## Staging deploy
 
@@ -43,6 +46,10 @@ targets and verifying before the app rollout completes traffic shift.
 
 ```bash
 # 1. Orchestrator Lambda — CODE ONLY (never its deploy.sh; see Required secrets)
+#    PRE-STEP: the zip ships no gated config, but all three targets run the
+#    gate so the contract is uniform (the sha latch makes repeat checks free):
+source deploy/lib/check-eval-gate.sh
+require_eval_gate "src/config/agents.json" "src/config/workflows.json"
 cd lambda/orchestrator && npm ci --omit=dev && zip -qr /tmp/orchestrator.zip . && cd ../..
 aws lambda update-function-code --function-name agentcore-hub-orchestrator \
   --zip-file fileb:///tmp/orchestrator.zip --region "$AWS_REGION"
@@ -54,7 +61,7 @@ aws lambda update-function-code --function-name agentcore-hub-orchestrator \
 #    the eval-gate check yourself before syncing:
 source deploy/lib/check-eval-gate.sh
 require_eval_gate "blueprints/**" "deploy/runtime-agent/prompts/**" \
-  "deploy/workflow-manager/system-prompt.md" "src/config/agents.json" "src/config/workflows.json"
+  "deploy/workflow-manager/**" "src/config/agents.json" "src/config/workflows.json"
 aws s3 sync blueprints/ "s3://$ARTIFACT_BUCKET/blueprints/"
 aws s3 sync deploy/runtime-agent/prompts/ "s3://$ARTIFACT_BUCKET/prompts/"
 aws s3 cp src/config/workflows.json "s3://$ARTIFACT_BUCKET/config/workflows.json"

@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 // Battery CLI (FR-2/FR-3/FR-9/FR-10/FR-12).
-//   --all (default) | --case <id> (repeatable) | --dry-run | --results <path>
-//   --base-ref <ref> | --baseline-mode --repeat N --out <path>
+//   --all (default) | --case <id> (repeatable) | --dry-run | --mock
+//   --results <path> | --base-ref <ref> | --baseline-mode --repeat N --out <path>
 //   --flake-ledger <path> (or BATTERY_FLAKE_LEDGER; default <results-dir>/flake-ledger.jsonl)
+//
+// --mock (TEAM-3295): full pipeline with a deterministic local transport and a
+// synthetic in-memory baseline — zero AWS calls. Demonstrates RED (degraded
+// persona prompt → floor breach naming the evaluator) and GREEN (innocuous
+// edit → PASS) locally; see lib/mock-transport.mjs and the README.
 // Gate mode NEVER writes evals/battery/baseline.json — only the merge-to-main
 // baseline workflow regenerates it (via --baseline-mode with an explicit --out).
 //
@@ -30,6 +35,7 @@ import { runCase, systemPromptPath, MODEL_TIERS, MAX_TRANSPORT_RETRIES, BATTERY_
 import { configFingerprint, appendFlakeLedger, readFlakeLedger, flagFlakyCases } from "./lib/flake.mjs";
 import { createSpendLedger } from "./lib/spend.mjs";
 import { createConverseTransport, scoreCase, SCORING_BACKEND } from "./lib/scoring.mjs";
+import { createMockTransport, buildMockBaseline, MOCK_SCORING_BACKEND } from "./lib/mock-transport.mjs";
 import { createSemaphore, linkAbort } from "./lib/retry.mjs";
 import { buildResults, renderCheckSummary } from "./lib/report.mjs";
 import { writeRedacted, redactText } from "./lib/redact.mjs";
@@ -65,12 +71,13 @@ const clock = () => new Date().toISOString().slice(11, 19);
 // ─── Flags ───────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const flags = { cases: [], dryRun: false, baselineMode: false, repeat: 3, results: null, baseRef: null, out: null, flakeLedger: null };
+  const flags = { cases: [], dryRun: false, mock: false, baselineMode: false, repeat: 3, results: null, baseRef: null, out: null, flakeLedger: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--all") continue;
     else if (a === "--case") flags.cases.push(argv[++i]);
     else if (a === "--dry-run") flags.dryRun = true;
+    else if (a === "--mock") flags.mock = true;
     else if (a === "--results") flags.results = argv[++i];
     else if (a === "--flake-ledger") flags.flakeLedger = argv[++i];
     else if (a === "--base-ref") flags.baseRef = argv[++i];
@@ -241,8 +248,15 @@ async function main() {
     process.exit(1);
   }
 
+  // Mock mode is a local zero-AWS demo — never a baseline writer, never gate
+  // evidence (gate mode's base-ref rules would be judged against mock scores).
+  if (flags.mock && (flags.baselineMode || flags.baseRef)) {
+    console.error("--mock is incompatible with --baseline-mode and --base-ref (local demo only)");
+    process.exit(2);
+  }
+
   const thresholds = gate?.thresholds || pf.thresholds;
-  const baseline = gate?.baseline || pf.baseline;
+  let baseline = gate?.baseline || pf.baseline;
 
   // Case selection. Cases active at the base ref but retired by this PR still
   // run and still gate — retirement only takes effect once it has landed. And
@@ -262,6 +276,11 @@ async function main() {
     }
     selected = runnable.filter((c) => flags.cases.includes(c.id));
   }
+
+  // Mock runs compare against a synthetic healthy baseline so PASS is
+  // reachable locally; the committed bootstrap baseline.json and its strict
+  // B1 guard are untouched for real runs.
+  if (flags.mock) baseline = buildMockBaseline({ cases: selected });
 
   const hermErrors = hermeticitySelfTest(runId, selected);
   if (hermErrors.length > 0) {
@@ -329,7 +348,13 @@ async function main() {
   // across ALL case workers (agent turns + judge calls), so the pool of
   // POOL_SIZE cannot stampede the model quotas into throttling.
   const bedrockGate = createSemaphore(BEDROCK_CONCURRENCY);
-  const rawTransport = await createConverseTransport();
+  // MOCK: the deterministic local transport slots in behind the exact seam
+  // the Bedrock transport uses; createConverseTransport (the only AWS SDK
+  // import in the battery) is never called in mock mode.
+  if (flags.mock) console.log("MOCK MODE — deterministic local transport, synthetic baseline, ZERO AWS calls.");
+  const rawTransport = flags.mock
+    ? createMockTransport({ repoRoot: REPO_ROOT, cases: selected })
+    : await createConverseTransport();
   const transport = (params, opts) => bedrockGate.run(() => rawTransport(params, opts));
   // B5: maxRunUsd is a live ceiling, not a post-hoc verdict check. The ledger
   // meters every Converse response and refuses the next call once the ceiling
@@ -534,13 +559,17 @@ async function main() {
 
   const runtimeSeconds = (Date.now() - startedAt) / 1000;
   const costEstimateUsd = ledger.spentUsd;
+  // Results are stamped with the ACTIVE backend, so mock results can never be
+  // confused with (or compared against) local-judge scores — a backend
+  // mismatch is a gate failure by construction.
+  const activeBackend = flags.mock ? MOCK_SCORING_BACKEND : SCORING_BACKEND;
   const suite = evaluateSuite({
     thresholds,
     baseline,
     caseResults,
     newCaseIds,
     costEstimateUsd,
-    scoringBackend: SCORING_BACKEND,
+    scoringBackend: activeBackend,
     costCeilingReasons: ledger.failureReasons(),
   });
 
@@ -548,9 +577,11 @@ async function main() {
   // to the flake ledger and flag verdict flips on unchanged config. Flags are
   // INFORMATIONAL ONLY — they never touch the gate verdict (retirement stays
   // the status:retired PR process) — so bookkeeping failures must cost a
-  // warning, never the run. Never reached for --dry-run (exits above).
+  // warning, never the run. Never reached for --dry-run (exits above), and
+  // skipped for --mock: synthetic mock verdicts say nothing about real judge
+  // flakiness and must not pollute a ledger a real run might later read.
   let flakyFlags = [];
-  try {
+  if (!flags.mock) try {
     const flakeLedgerPath = resolve(
       flags.flakeLedger || process.env.BATTERY_FLAKE_LEDGER || join(dirname(resultsPath), "flake-ledger.jsonl")
     );
@@ -589,7 +620,7 @@ async function main() {
     runId,
     configSha,
     baselineSha: baseline.source_commit,
-    scoringBackend: SCORING_BACKEND,
+    scoringBackend: activeBackend,
     suite,
     caseResults,
     retiredCases,

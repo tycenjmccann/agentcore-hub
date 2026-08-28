@@ -370,6 +370,112 @@ describe("belt loop (A3)", () => {
   });
 });
 
+describe("break-glass audit fail-closed (TEAM-3295)", () => {
+  // A fake `aws` so the break-glass path is hermetic: sts fails (identity
+  // falls back to whoami) and s3 cp fails (the S3 audit write is the failure
+  // under test). ARTIFACT_BUCKET is set so the s3 path is actually attempted.
+  const AWS_SHIM = `#!/bin/bash
+exit 1
+`;
+
+  // Env that reaches _eval_gate_break_glass: a red check on HEAD plus a
+  // requested, explained override.
+  const breakGlassEnv = (head: string) => ({
+    [`CHECK_${head.slice(0, 7)}`]: "red",
+    EVAL_GATE_OVERRIDE: "1",
+    EVAL_GATE_OVERRIDE_REASON: "INC-999: test override",
+    ARTIFACT_BUCKET: "test-bucket",
+  });
+
+  /**
+   * Run require_eval_gate under a pseudo-tty (util-linux `script`) so the
+   * guard's `</dev/tty` probe sees a real terminal; `input` is fed to the
+   * pty and reaches the OVERRIDE-UNAUDITED prompt.
+   */
+  function runGateTty(repo: string, extraEnv: Record<string, string>, input: string) {
+    const inner = `source '${SCRIPT}'; require_eval_gate 'conf/**'`;
+    const res = spawnSync(
+      "script",
+      ["-qec", `bash -c "${inner}"`, "/dev/null"],
+      {
+        cwd: repo,
+        encoding: "utf8",
+        input,
+        env: {
+          NODE_ENV: "test",
+          PATH: `${binDir}:/usr/local/bin:/usr/bin:/bin`,
+          HOME: fakeHome,
+          ...gitEnv,
+          ...extraEnv,
+        },
+      },
+    );
+    return { status: res.status, out: (res.stdout ?? "") + (res.stderr ?? "") };
+  }
+
+  /** Run with NO controlling terminal (setsid) — the non-interactive path. */
+  function runGateNoTty(repo: string, extraEnv: Record<string, string>) {
+    const res = spawnSync(
+      "setsid",
+      ["bash", "-c", `source '${SCRIPT}'; require_eval_gate 'conf/**'`],
+      {
+        cwd: repo,
+        encoding: "utf8",
+        env: {
+          NODE_ENV: "test",
+          PATH: `${binDir}:/usr/local/bin:/usr/bin:/bin`,
+          HOME: fakeHome,
+          ...gitEnv,
+          ...extraEnv,
+        },
+      },
+    );
+    return { status: res.status, out: (res.stdout ?? "") + (res.stderr ?? "") };
+  }
+
+  beforeAll(() => {
+    writeFileSync(join(binDir, "aws"), AWS_SHIM);
+    chmodSync(join(binDir, "aws"), 0o755);
+  });
+
+  it("S3 audit fail + local log OK + interactive OVERRIDE-UNAUDITED confirm → proceeds loudly", () => {
+    const repo = makeRepo(
+      "bg-local-ok",
+      `echo b > ungated.txt && git add . && git commit -qm c1`,
+    );
+    const r = runGateTty(repo, breakGlassEnv(sha(repo)), "OVERRIDE-UNAUDITED\n");
+    expect(r.status).toBe(0);
+    expect(r.out).toContain("S3 audit write FAILED");
+    expect(r.out).toContain("proceeding UNAUDITED on interactive confirmation");
+    // The local audit record must actually exist.
+    expect(existsSync(join(repo, ".eval-gate-overrides.log"))).toBe(true);
+    expect(readFileSync(join(repo, ".eval-gate-overrides.log"), "utf8")).toContain("INC-999");
+  });
+
+  it("S3 audit fail + local log fail → refuses even at a tty with the confirmation typed", () => {
+    const repo = makeRepo(
+      "bg-both-fail",
+      `echo b > ungated.txt && git add . && git commit -qm c1
+       mkdir .eval-gate-overrides.log`, // a directory: the append can never succeed
+    );
+    const r = runGateTty(repo, breakGlassEnv(sha(repo)), "OVERRIDE-UNAUDITED\n");
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("no audit record exists anywhere");
+    expect(r.out).toContain("EVAL GATE REFUSED");
+  });
+
+  it("S3 audit fail + non-interactive → refuses (BG-3 preserved)", () => {
+    const repo = makeRepo(
+      "bg-nontty",
+      `echo b > ungated.txt && git add . && git commit -qm c1`,
+    );
+    const r = runGateNoTty(repo, breakGlassEnv(sha(repo)));
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("non-interactive and the S3 audit failed");
+    expect(r.out).toContain("EVAL GATE REFUSED");
+  });
+});
+
 describe("credentialed origin URLs (TEAM-3351)", () => {
   const FAKE_TOKEN = "FAKETOKEN123";
 

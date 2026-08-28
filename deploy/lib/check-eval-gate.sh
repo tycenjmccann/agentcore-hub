@@ -48,7 +48,9 @@
 # Both variables are required; an empty reason still refuses. The override is
 # recorded to s3://$ARTIFACT_BUCKET/eval-gate/overrides/<ts>-<sha>.txt AND to
 # .eval-gate-overrides.log (gitignored). If the S3 write fails you must type
-# OVERRIDE-UNAUDITED at a real tty; non-interactive + unaudited refuses.
+# OVERRIDE-UNAUDITED at a real tty — and the LOCAL log append must have
+# succeeded (some audit record must exist somewhere). Non-interactive + no S3
+# audit refuses; S3 AND local both failing refuses even at a tty (TEAM-3295).
 
 EVAL_GATE_CHECK_NAME="config-evals-gate"
 EVAL_GATE_BELT_MAX=100
@@ -195,7 +197,7 @@ _eval_gate_resolve_merged_pr_head() {
 # the operator declined the unaudited confirmation).
 _eval_gate_break_glass() {
   local refusal="$1"
-  local ts sha ident record repo_root log_file s3_ok
+  local ts sha ident record repo_root log_file s3_ok local_ok
   repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   sha="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -227,7 +229,10 @@ _eval_gate_break_glass() {
   fi
 
   log_file="$repo_root/.eval-gate-overrides.log"
-  if ! printf '%s\n' "$record" >>"$log_file" 2>/dev/null; then
+  local_ok=0
+  if printf '%s\n' "$record" >>"$log_file" 2>/dev/null; then
+    local_ok=1
+  else
     echo "eval-gate: WARNING — could not append to $log_file" >&2
   fi
 
@@ -240,6 +245,13 @@ _eval_gate_break_glass() {
 
   if [ "$s3_ok" != "1" ]; then
     echo "eval-gate: S3 audit write FAILED (ARTIFACT_BUCKET='${ARTIFACT_BUCKET:-unset}')." >&2
+    # BG-3 (TEAM-3295): proceeding without the S3 record requires that the
+    # LOCAL audit record exists. Both writes failed ⇒ no audit anywhere ⇒
+    # refuse unconditionally, interactive or not.
+    if [ "$local_ok" != "1" ]; then
+      echo "eval-gate: the local audit append ALSO failed — no audit record exists anywhere; refusing (BG-3: never proceed unaudited)." >&2
+      return 1
+    fi
     if { true </dev/tty; } 2>/dev/null; then
       local answer=""
       printf 'eval-gate: type OVERRIDE-UNAUDITED to proceed with only the local audit record: ' >&2

@@ -11,7 +11,7 @@ on:
     branches: [main]
     paths:
       - "deploy/runtime-agent/prompts/**"
-      - "deploy/workflow-manager/system-prompt.md"
+      - "deploy/workflow-manager/**"
       - "src/config/workflows.json"
       - "src/config/agents.json"
       - "blueprints/**"
