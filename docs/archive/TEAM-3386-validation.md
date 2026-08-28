@@ -1,3 +1,12 @@
+> **ARCHIVED — point-in-time validation transcript, not operator
+> documentation.** This is the validation evidence for TEAM-3386 as captured on
+> 2026-08-28 on branch `feature/TEAM-3386-backend-dev`. Its statements reflect
+> that snapshot and may not match current head. In particular, the "contain no
+> SEARCH anywhere" claim below referred to `SEARCH()` metric-math expressions
+> in the alarm JSONs' `Metrics` arrays — at head the *word* SEARCH does appear
+> in prose/`AlarmDescription` text, which is fine (only `SEARCH()` expressions
+> in alarm metric math are rejected by CloudWatch).
+
 # TEAM-3386 — validation evidence for the reworked eval alarms
 
 **Date:** 2026-08-28

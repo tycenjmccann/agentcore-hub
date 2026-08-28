@@ -8,7 +8,9 @@ records the *procedures*.
 
 Implementation history: TEAM-3366 (analysis), TEAM-3367 (anchor span, dedup,
 improver retry), TEAM-3368 (dep-chain role scoping, eval health metrics),
-TEAM-3381 (cross-delivery dedup at flush, dedup fail-open).
+TEAM-3381 (cross-delivery dedup at flush, dedup fail-open), TEAM-3376
+(cross-invocation DynamoDB seen-set), TEAM-3385 (seen-set infrastructure —
+table creation, TTL, IAM, env wiring — and the check-then-claim redesign).
 
 ---
 
@@ -38,7 +40,7 @@ verification of which identifier production carries was IAM-blocked):
 |---|---|---|
 | Per-delivery rows (classification, EMF metrics, buffered entry) | duplicates *within* one delivery | `dedupeResults` via `extractSessionData` |
 | Flushed batch payload + batch summary (what the improver reads) | duplicates *across* every delivery in the flush buffer | `dedupeBufferedSessions` in `flushBuffer` (TEAM-3381) |
-| DDB rolling aggregates | duplicates within one delivery only — **cross-delivery gap remains, deferred** | see the disposition below |
+| DDB rolling aggregates | duplicates within one delivery *and* across deliveries/concurrent invocations — the cross-delivery seen-set check runs before aggregation | in-memory `dedupeResults`, then `checkSeenSet` ahead of `aggregateScoresToDdb` (TEAM-3376 / TEAM-3385) |
 
 **Fail-open rule (AC-1).** Dedup must never cost a record it cannot prove is a
 duplicate. Two consequences, both load-bearing:
@@ -53,47 +55,89 @@ duplicate. Two consequences, both load-bearing:
   same millisecond stay apart, while a genuine retry write — identical bytes —
   still collapses.
 
-**Decision rule for the cross-invocation seen-set.** Do not build the DDB
-seen-set on suspicion. Measure for 1 week with the verification query below; if
-more than **1%** of evaluator-result records fall into cross-delivery duplicate
-groups, implement it:
+**Decision rule for the cross-invocation seen-set — SUPERSEDED BY
+IMPLEMENTATION.** The seen-set is now shipped: TEAM-3376 built it, TEAM-3385
+added the infrastructure that made it live (table creation, TTL, IAM grants,
+`EVAL_SEEN_TABLE` env wiring) and redesigned the write pattern. The decision was
+made ahead of the 1-week measurement this section originally called for.
 
-- table `agentcore-hub-eval-seen`, PK `dedupKey`;
-- conditional write, `ConditionExpression: attribute_not_exists(dedupKey)` — the
-  condition failure *is* the duplicate signal;
-- TTL 24h (a duplicate arriving later than that is not a delivery artifact);
-- **fail-open**: any seen-set error (throttle, timeout, IAM) retains the record.
-  Losing eval signal is worse than double-counting it.
+The shipped design (`checkSeenSet` / `claimSeenSet` in
+`lambda/eval-packager/index.mjs`):
 
-### AC-2 DDB-aggregate deferral disposition (TEAM-3381)
+- table `agentcore-hub-eval-seen` (env `EVAL_SEEN_TABLE`; `''` disables), PK
+  `dedupKey` (S), PAY_PER_REQUEST — created by
+  `deploy/continuous-improvement/deploy-all.sh`, IAM in
+  `deploy/setup-lambda-role.sh`, env set by
+  `deploy/continuous-improvement/deploy.sh`;
+- **two phases, not the single conditional-write probe originally planned.**
+  The planned "condition failure *is* the duplicate signal" write claimed keys
+  before anything was durable: if the buffer append then threw, the CW Logs
+  re-delivery found its own keys claimed and every row was dropped for good
+  (TEAM-3385 finding 2). Instead:
+  - `checkSeenSet` — read-only `BatchGetItem` (100 distinct keys per request),
+    run before classification, aggregation and buffering. A hit is a duplicate
+    unless the stored claim is an `error` and the incoming row is `scored` — a
+    success supersedes an error claim for the same attempt (TEAM-3385
+    finding 3). Drops are filtered out of `evaluatorResults` and added to
+    `duplicatesDropped`.
+  - `claimSeenSet` — per-key conditional `PutItem`
+    (`attribute_not_exists(dedupKey)`; a `scored` claim may also overwrite an
+    `error` claim), storing `{dedupKey, expiresAt, outcome}`, run only after
+    the delivery is durably buffered (or finally discarded by the sample-rate
+    gate);
+- TTL 24h on `expiresAt` (a duplicate arriving later than that is not a
+  delivery artifact);
+- **fail-open**, as originally specified: table unset/missing, SDK unavailable,
+  any DDB error, or `UnprocessedKeys` → the record is retained and treated as
+  fresh. Losing eval signal is worse than double-counting it.
 
-TEAM-3381 fixed the flushed batch payload only. **The DDB rolling aggregates can
-still double-count a duplicate that spans two deliveries**, because
-`aggregateScoresToDdb` runs once per delivery on per-delivery-deduped rows
-(`lambda/eval-packager/index.mjs`, step 5 of the handler, where this is also
-flagged in-code). This is a known, accepted gap, deferred per the §2.2 decision
-rule above — not an oversight, and not fixed by the flush-time dedup.
+*Historical record:* the original rule was "do not build the DDB seen-set on
+suspicion — measure for 1 week with the verification query below; if more than
+**1%** of evaluator-result records fall into cross-delivery duplicate groups,
+implement it." The queries below remain useful for monitoring (see the
+"Monitoring query" section).
 
-**The `EvalDuplicateResultCount` metric CANNOT measure this gap.** It counts
-`dedupeResults` drops *within a single delivery*; a duplicate split across two
-deliveries produces two individually-clean deliveries and therefore **zero**
-duplicate drops. A flat or zero `EvalDuplicateResultCount` series is *not*
-evidence the gap is harmless.
+### AC-2 DDB-aggregate disposition (TEAM-3381, closed by TEAM-3376/TEAM-3385)
 
-The instruments that can observe it:
+*Superseded by implementation — this was recorded as a deferred gap when
+TEAM-3381 shipped; the seen-set has since closed it.* TEAM-3381 fixed the
+flushed batch payload only, and at that point the DDB rolling aggregates could
+still double-count a duplicate that spanned two deliveries. At head,
+`checkSeenSet` runs before `aggregateScoresToDdb` (step 5 of the handler), so
+cross-delivery and concurrent-invocation duplicates are dropped before they can
+reach the rolling aggregates. Two residual, deliberate exposures remain, both
+fail-open by design (see the handler comments at the `aggregateScoresToDdb`
+call site):
 
-1. **Primary — the Logs Insights verification query below**, run over the eval
-   results log groups (`/aws/bedrock-agentcore/evaluations/results/*`) after
-   1 week, grouped by `logStream`.
-2. **Corroborating — the `crossDeliveryDuplicatesDropped` field** on the
-   `eval.batch.cross_delivery_duplicates_dropped` warn line and in the archived
-   batch payload (TEAM-3381). It counts cross-delivery duplicates *within one
-   flush window*, so it is a **lower bound** on the aggregate exposure: the DDB
-   aggregates are exposed to duplicates across any two deliveries, including two
-   that land in different flush windows.
+- the aggregates run *before* `claimSeenSet`, so if the buffer append throws,
+  the re-delivery re-counts those rows — an over-count in a rolling aggregate
+  is recoverable where a dropped evaluation is not (TEAM-3385 finding 2);
+- two genuinely concurrent invocations can both pass the check before either
+  claims, so both may count a copy.
 
-**Verification query** (Logs Insights, one eval results log group at a time, or
-all of them via the log-group prefix; window: 1 week):
+**What `EvalDuplicateResultCount` now measures.** Seen-set drops feed
+`duplicatesDropped`, so the metric counts drops from *both* dedup layers: the
+in-memory `dedupeResults` pass (within one delivery) and the `checkSeenSet`
+pass (across deliveries and concurrent invocations). A delivery whose every row
+is a cross-delivery duplicate still emits the metric (the handler emits when
+`duplicatesDropped > 0` even at `total = 0`). The earlier statement that this
+metric "cannot measure" cross-delivery duplicates described the pre-seen-set
+implementation and no longer holds. Caveat: because the seen-set fails open, a
+zero series means "no duplicates *detected*" — to independently verify the
+seen-set itself is working, use the Logs Insights query below grouped by
+`logStream`.
+
+Corroborating signal: the **`crossDeliveryDuplicatesDropped` field** on the
+`eval.batch.cross_delivery_duplicates_dropped` warn line and in the archived
+batch payload (TEAM-3381). The flush-time `dedupeBufferedSessions` pass remains
+as defense-in-depth for the batch payload; it also catches records the
+seen-set failed open on within one flush window.
+
+**Monitoring query** (Logs Insights, one eval results log group at a time, or
+all of them via the log-group prefix; window: 1 week). Originally the
+measurement that would have triggered the seen-set decision; still useful to
+verify the seen-set is doing its job — duplicate groups found here should show
+up as `EvalDuplicateResultCount` drops, not as inflated aggregates:
 
 ```
 fields @timestamp, @logStream as stream,
@@ -115,8 +159,10 @@ Read it as: each row is a duplicate group; `streams > 1` (or `lastSeen` far from
 `firstSeen`) means the copies could not have shared one delivery, i.e. exactly
 the case the per-delivery dedup misses.
 
-Then compute the ratio the 1% rule is stated against — duplicate records over
-all evaluator-result records, same window:
+Then compute the cross-delivery duplicate ratio — duplicate records over all
+evaluator-result records, same window (this is the ratio the original 1%
+decision rule was stated against; today it sizes how hard the seen-set is
+working):
 
 ```
 fields coalesce(concat(traceId, ':', spanId),
@@ -128,9 +174,11 @@ fields coalesce(concat(traceId, ':', spanId),
 | stats sum(copies) as totalRecords, sum(copies - 1) as duplicateRecords
 ```
 
-`duplicateRecords / totalRecords > 0.01` → build the seen-set described above.
-At or below 1%, re-record the measurement here and leave the gap deferred; the
-flushed batch (what actually drives PRD synthesis) is already protected.
+These queries measure duplicates in the *log groups*, upstream of the packager
+— the seen-set does not change what they return. A high ratio here with a flat
+`EvalDuplicateResultCount` series is the signal that the seen-set is failing
+open (check the `seen-set check failed open` / `seen-set claim failed open`
+warn lines in the packager logs).
 
 **Records with no dedup key are out of scope of this measurement** — they are
 retained by design (fail-open, AC-1) and `ispresent(dedupKey)` excludes them
