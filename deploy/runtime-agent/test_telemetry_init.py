@@ -10,6 +10,7 @@ its heavyweight neighbors.
 Run: python3 -m unittest deploy/runtime-agent/test_telemetry_init.py
 """
 
+import asyncio
 import os
 import sys
 import types
@@ -34,7 +35,7 @@ def _extract_anchor_helper():
     """The shipped _emit_session_anchor_span (TEAM-3366 P0-A), from def to the
     next module-level def — same extract-and-exec approach as the init block."""
     src = _MAIN.read_text()
-    start = src.index("def _emit_session_anchor_span")
+    start = src.index("async def _emit_session_anchor_span")
     end = src.index("\ndef ", start)
     return src[start:end]
 
@@ -144,9 +145,9 @@ class TestTelemetryInit(unittest.TestCase):
         ns = {"logger": logger}
         with mock.patch.dict(sys.modules, fake):
             exec(compile(_extract_anchor_helper(), str(_MAIN), "exec"), ns)
-            result = ns["_emit_session_anchor_span"](
+            result = asyncio.run(ns["_emit_session_anchor_span"](
                 "test_agent", "sess-123", "wf-1", "T-1"
-            )
+            ))
         self.assertIsNone(result)
         logger.warning.assert_called_once()
 
@@ -180,7 +181,7 @@ class TestSessionAnchorSpan(unittest.TestCase):
 
         def call(*args):
             with mock.patch.dict(sys.modules, {"opentelemetry": fake_otel}):
-                return ns["_emit_session_anchor_span"](*args)
+                return asyncio.run(ns["_emit_session_anchor_span"](*args))
 
         return call
 
@@ -220,6 +221,20 @@ class TestSessionAnchorSpan(unittest.TestCase):
         self.assertEqual(span.attributes.get("gen_ai.operation.name"), "invoke_agent")
         self.assertEqual(span.attributes.get("session.id"), "sess-123")
         self.assertIs(span.attributes.get("agentcore.hub.anchor"), True)
+
+    def test_anchor_session_id_falls_back_to_workflow_id(self):
+        # TEAM-3387: no runtime session_id (direct_code_deploy fallback path)
+        # → the anchor keys itself as wf-<workflow_id>, the same fallback the
+        # SDK span's trace_attributes use, because an unkeyed span is
+        # invisible to the eval service.
+        _provider, exporter, fake_trace = self._sdk_provider_and_exporter()
+        helper = self._load_helper(fake_trace)
+
+        helper("test_agent", None, "wf-1", "TEAM-1")
+
+        spans = exporter.get_finished_spans()
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0].attributes.get("session.id"), "wf-wf-1")
 
     def test_anchor_fail_open_on_tracer_error(self):
         # get_tracer exploding must neither raise out of the helper (it runs

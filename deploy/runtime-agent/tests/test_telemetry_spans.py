@@ -474,6 +474,11 @@ def _load_production_entrypoints() -> dict[str, Any]:
         """Stub of the codex delegation tool."""
         return "stub"
 
+    # The shipped call site awaits the anchor helper (TEAM-3387), so the stub
+    # must be a coroutine function.
+    async def _anchor_stub(agent_id, session_id, workflow_id, ticket_id):
+        return None
+
     namespace: dict[str, Any] = {
         # Real collaborators — the Agent construction is the thing under test.
         "Agent": Agent,
@@ -493,15 +498,13 @@ def _load_production_entrypoints() -> dict[str, Any]:
         # pinning the SDK's own loop span in isolation (exactly one
         # invoke_agent span per run); the anchor helper itself is exercised
         # in test_telemetry_init.py and tests/test_telemetry.py.
-        "_emit_session_anchor_span": (
-            lambda agent_id, session_id, workflow_id, ticket_id: None
-        ),
+        "_emit_session_anchor_span": _anchor_stub,
         "_publish_agent_started": lambda workflow_id, agent_id: None,
         "_publish_agent_error": lambda workflow_id, agent_id, error: None,
         # TEAM-3367: stubbed so the "exactly one invoke_agent span" assertions
         # below keep pinning the SDK loop span alone; the anchor span has its
         # own coverage in tests/test_telemetry.py.
-        "_emit_session_anchor_span": lambda agent_id, session_id, workflow_id, ticket_id: None,
+        "_emit_session_anchor_span": _anchor_stub,
         "_load_builtin_tools": lambda: [],
         "LAMBDA_TOOLS": [],
         "claude_code": claude_code,
