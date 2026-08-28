@@ -4,6 +4,14 @@
 
 const round2 = (x) => (typeof x === "number" ? Math.round(x * 100) / 100 : x);
 
+// Judge explanations are free-form model output; cap each one so a rambling
+// judge cannot bloat the check run (which is capped at 60k chars downstream).
+const EXPLANATION_MAX_CHARS = 400;
+const truncate = (s, max = EXPLANATION_MAX_CHARS) => {
+  const text = String(s);
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+};
+
 export function buildResults({
   runId,
   configSha,
@@ -15,6 +23,7 @@ export function buildResults({
   costEstimateUsd,
   runtimeSeconds,
   configSources,
+  flakyFlags = [],
 }) {
   return {
     runId,
@@ -34,6 +43,7 @@ export function buildResults({
       attempt: c.attempt ?? null,
       modelTier: c.modelTier,
       sessionId: c.sessionId ?? null,
+      tenant: c.tenant ?? null,
       toolTrajectory: (c.trajectory || []).map((t) => ({ tool: t.tool, argsDigest: t.argsDigest })),
       scores: c.scores || {},
       scoreDetails: c.details || {},
@@ -47,6 +57,8 @@ export function buildResults({
     summary: suite.summary,
     informationalCases: suite.informationalCases,
     retiredCases,
+    // Flaky candidates (TEAM-3090): informational only — never part of the verdict.
+    flakyFlags: flakyFlags ?? [],
     costEstimateUsd: round2(costEstimateUsd),
     runtimeSeconds: round2(runtimeSeconds),
   };
@@ -97,11 +109,18 @@ export function renderCheckSummary(results) {
     lines.push("");
   }
 
+  const caseById = new Map(results.cases.map((c) => [c.id, c]));
   const floorBreaches = gatedRows.filter((r) => r.verdict === "floor_breach");
   if (floorBreaches.length > 0) {
     lines.push("## Floor violations");
-    for (const r of floorBreaches)
+    for (const r of floorBreaches) {
       lines.push(`- **${r.case}** / **${r.evaluator}**: ${r.current} < floor ${r.floor}`);
+      // TEAM-3090: the responsible evaluator's judge explanation, so a reviewer
+      // sees WHY the cell fell without opening the results artifact. This text
+      // still flows through the writeRedacted choke point before publication.
+      const explanation = caseById.get(r.case)?.scoreDetails?.[r.evaluator]?.explanation;
+      if (explanation) lines.push(`  - Judge: ${truncate(explanation)}`);
+    }
     lines.push("");
   }
 
@@ -120,7 +139,29 @@ export function renderCheckSummary(results) {
   const broken = results.cases.filter((c) => c.status !== "scored" && !c.informational);
   if (broken.length > 0) {
     lines.push("## Non-scored cases");
-    for (const c of broken) lines.push(`- **${c.id}**: ${c.status}${c.error ? ` — ${c.error}` : ""}`);
+    for (const c of broken) {
+      lines.push(`- **${c.id}**: ${c.status}${c.error ? ` — ${c.error}` : ""}`);
+      // Judge explanations collected before the case failed (e.g. the
+      // evaluators that DID score before an unscored/errored exit) are the
+      // only per-evaluator evidence a broken case has — surface them.
+      for (const [evaluator, detail] of Object.entries(c.scoreDetails || {})) {
+        if (detail?.explanation) lines.push(`  - ${evaluator}: ${truncate(detail.explanation)}`);
+      }
+    }
+    lines.push("");
+  }
+
+  if ((results.flakyFlags || []).length > 0) {
+    lines.push("## Flaky candidates (informational — never changes the gate verdict)");
+    lines.push(
+      "Verdict flipped ≥2 times in the last 5 runs on unchanged config. " +
+        "Retire via a status:retired PR per evals/battery/README.md."
+    );
+    for (const f of results.flakyFlags)
+      lines.push(
+        `- **${f.caseId}**: ${f.flips} flip(s) over the last ${f.window.length} run(s) ` +
+          `[${f.window.map((w) => w.verdict).join(" → ")}]`
+      );
     lines.push("");
   }
 
