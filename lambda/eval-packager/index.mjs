@@ -177,6 +177,42 @@ export const handler = async (event) => {
   // the flush hides a broken runtime for a whole batch.
   emitMissingSpanAlerts(agentId, sessionData.evaluatorResults);
 
+  // TEAM-3415: a delivery with ZERO surviving evaluator rows — every row was
+  // dropped as a cross-delivery duplicate by checkSeenSet (or by the in-memory
+  // dedup/scope passes) — carries nothing the pipeline hasn't already accounted
+  // for. Buffering it anyway re-ADDed sessionData.sessionIds (built from the
+  // RAW log events, so still naming the dropped rows' sessions) into
+  // bufferSessions: a CloudWatch Logs redelivery arriving AFTER the original
+  // batch was flushed/reset pushed already-flushed run ids into the fresh
+  // buffer, and enough duplicate-only deliveries reached batchSize and flushed
+  // a junk batch — archiving rowless sessions and burning the cooldown window
+  // real improvement batches wait on. Stop here instead: nothing to aggregate,
+  // nothing to buffer, and nothing to claim (every surviving-claimable row was
+  // claimed by the invocation that first processed it; claimSeenSet on zero
+  // rows is a no-op). Fail-open is preserved: a row with no dedup key is never
+  // dropped by any layer, so a delivery of only unkeyable rows still has rows
+  // here and still buffers. The EMF metrics above already ran, so the
+  // duplicate drop is counted even though the delivery goes no further.
+  if (sessionData.evaluatorResults.length === 0) {
+    console.log(
+      `[eval-packager] ${agentId}: no evaluator rows survived dedup/scoping — ` +
+        'nothing to buffer (append skipped; session ids stay retired).'
+    );
+    return { statusCode: 200, body: 'no-surviving-rows' };
+  }
+
+  // TEAM-3415: only sessions with at least one SURVIVING row may count toward
+  // batchSize. sessionIds was collected from the raw log events, so after the
+  // dedup layers it can still name a session whose every row was dropped —
+  // ADDing that id to bufferSessions would inflate the distinct-run count the
+  // flush decision reads with a run this buffer holds no evidence for.
+  const survivingSessionIds = new Set(
+    sessionData.evaluatorResults.map((r) => r.sessionId).filter(Boolean)
+  );
+  sessionData.sessionIds = (sessionData.sessionIds || []).filter((sid) =>
+    survivingSessionIds.has(sid)
+  );
+
   // 4. Sample rate check
   const sampleRate = config.sampleRate ?? 100;
   if (Math.random() * 100 >= sampleRate) {
@@ -1165,6 +1201,11 @@ export function emitEvalMetrics(
  * predates bufferVersion gets the attribute on its first post-deploy append —
  * meaning every ALL_NEW this function returns carries a numeric bufferVersion.
  *
+ * TEAM-3415: the handler only calls this with at least one surviving evaluator
+ * row, and with sessionData.sessionIds already narrowed to the sessions those
+ * surviving rows belong to — so bufferSessions never re-accumulates the run id
+ * of a session whose every row was dropped as a cross-delivery duplicate.
+ *
  * Returns { shouldFlush: boolean, buffer: array | null, bufferVersion: number }
  */
 async function appendToBuffer(agentId, sessionData, batchSize) {
@@ -1394,7 +1435,9 @@ async function aggregateScoresToDdb(agentId, entries = []) {
 /**
  * Flush the session buffer. ORDER MATTERS:
  *   0. Re-dedupe the merged buffer in memory (TEAM-3381) — pure computation, no
- *      side effects, so it is safe to do before the claim below.
+ *      side effects, so it is safe to do before the claim below. If the deduped
+ *      batch holds ZERO evaluator rows, stop here entirely — no claim, no
+ *      archive, no cooldown consumed (TEAM-3415 backstop; see below).
  *   1. CLAIM the batch with a CONDITIONAL reset of the DDB buffer. Losing the
  *      condition means another invocation is already flushing this batch → return
  *      immediately, having done nothing observable.
@@ -1485,8 +1528,11 @@ async function aggregateScoresToDdb(agentId, entries = []) {
  *   snapshot in `buffer` (from appendToBuffer) — the CAS token for the reset.
  * @param {number} [cooldownMinutes] the agent's flushCooldownMinutes — the
  *   claim loses if the stored lastFlushedAt is younger than this (TEAM-3410).
+ *
+ * Exported for tests (the TEAM-3415 rowless-buffer backstop is unreachable
+ * through the handler by construction — see the guard's comment).
  */
-async function flushBuffer(agentId, buffer, batchSize, expectedBufferVersion, cooldownMinutes = 0) {
+export async function flushBuffer(agentId, buffer, batchSize, expectedBufferVersion, cooldownMinutes = 0) {
   const timestamp = new Date().toISOString();
 
   // TEAM-3381 (FR-2.1 AC-1/AC-2): re-dedupe the MERGED buffer before anything
@@ -1504,6 +1550,41 @@ async function flushBuffer(agentId, buffer, batchSize, expectedBufferVersion, co
       crossDeliveryDuplicatesDropped,
       bufferEntries: sessions.length,
     }));
+  }
+
+  // TEAM-3415 backstop: a batch holding ZERO evaluator rows must not claim the
+  // flush at all — the claim's reset writes lastFlushedAt (burning the cooldown
+  // window real batches wait on) and the archive would be pure junk (rowless
+  // session ids), previously caught only AFTER both side effects by the
+  // no-evidence suppression below. With the handler's no-surviving-rows skip in
+  // place this state is unreachable through the handler: every buffered entry
+  // was appended with at least one surviving row (null-key rows are never
+  // dropped by any dedup layer, so fail-open deliveries still carry theirs),
+  // and dedupeBufferedSessions keeps at least one winner per duplicate group —
+  // so a non-empty buffer always flushes with >= 1 row. It CAN still fire on
+  // state written by pre-TEAM-3415 code (or a mid-deploy old-code append) whose
+  // entries are all rowless. Leaving the buffer intact is safe and un-wedges
+  // itself: the next delivery with real rows appends, and its flush carries
+  // everything — junk entries included — in one evidenced batch.
+  const survivingRowCount = sessions.reduce(
+    (count, entry) => count + (entry?.evaluatorResults?.length || 0),
+    0
+  );
+  if (survivingRowCount === 0) {
+    console.log(
+      JSON.stringify({
+        level: 'warn',
+        event: 'eval.flush.rowless_buffer_skipped',
+        agentId,
+        bufferEntries: sessions.length,
+        expectedBufferVersion: expectedBufferVersion ?? null,
+        reason:
+          'every buffered entry is rowless (legacy/pre-TEAM-3415 state) — no ' +
+          'claim, no archive, no cooldown consumed; buffer left intact for the ' +
+          'next evidenced delivery to flush',
+      })
+    );
+    return;
   }
 
   // Roll the whole batch up so the improver prompt leads with "how much of this

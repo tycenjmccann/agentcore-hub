@@ -2230,12 +2230,14 @@ describe('TEAM-3376: handler wiring (seen-set dedup, EMF rates, aggregation)', (
     ]);
 
     await handler(event); // delivery A: check finds nothing → claimed after append
-    await handler(event); // delivery B: check finds the claim → dropped
+    const resB = await handler(event); // delivery B: check finds the claim → dropped
 
+    // TEAM-3415: delivery B, with NO surviving rows, does not append at all —
+    // it used to append an empty entry AND re-ADD sess-x to bufferSessions.
+    expect(resB).toEqual({ statusCode: 200, body: 'no-surviving-rows' });
     const appends = appendWrites();
-    expect(appends).toHaveLength(2);
+    expect(appends).toHaveLength(1);
     expect(appends[0].input.ExpressionAttributeValues[':new'][0].evaluatorResults).toHaveLength(1);
-    expect(appends[1].input.ExpressionAttributeValues[':new'][0].evaluatorResults).toHaveLength(0);
 
     // Only delivery A claimed: B had no surviving keyed row left to claim.
     expect(ddbState.seenPuts).toHaveLength(1);
@@ -2532,15 +2534,17 @@ describe('TEAM-3385: seen-set check-then-claim + keep-best dedup', () => {
 
     await handler(errEvent); // claims the key with outcome 'error'
     await handler(okEvent); // retained: a success supersedes an error claim
-    await handler(okEvent); // now a genuine duplicate of a scored claim → dropped
+    const res3 = await handler(okEvent); // now a genuine duplicate of a scored claim → dropped
 
+    // TEAM-3415: the duplicate-only re-delivery does not append (it used to
+    // append an empty entry and re-ADD the session id to bufferSessions).
+    expect(res3).toEqual({ statusCode: 200, body: 'no-surviving-rows' });
     const appends = appendWrites();
-    expect(appends).toHaveLength(3);
+    expect(appends).toHaveLength(2);
     expect(rowsOf(appends[0])).toHaveLength(1);
     expect(rowsOf(appends[0])[0].errorType).toBe('ThrottlingException');
     expect(rowsOf(appends[1])).toHaveLength(1);
     expect(rowsOf(appends[1])[0].score).toBe(8);
-    expect(rowsOf(appends[2])).toHaveLength(0);
 
     // The stored claim was upgraded in place, error → scored.
     expect([...ddbState.seenItems.values()].map((i) => i.outcome)).toEqual(['scored']);
@@ -3179,12 +3183,13 @@ describe('TEAM-3406 F2: scored supersedes non-scored seen-set claims', () => {
     // The stored claim was upgraded in place, other → scored.
     expect([...ddbState.seenItems.values()].map((i) => i.outcome)).toEqual(['scored']);
 
-    // Delivery 3: a re-delivery of the scored row is now a genuine duplicate.
-    await handler(
+    // Delivery 3: a re-delivery of the scored row is now a genuine duplicate —
+    // and a duplicate-only delivery does not append at all (TEAM-3415).
+    const res3 = await handler(
       awslogsEvent([evalRecord({ sessionId: 'sess-po', score: 8, scoreLabel: 'pass', requestId: 'req-po' })])
     );
-    expect(appendWrites()).toHaveLength(2);
-    expect(rowsOf(appendWrites()[1])).toHaveLength(0);
+    expect(res3).toEqual({ statusCode: 200, body: 'no-surviving-rows' });
+    expect(appendWrites()).toHaveLength(1);
   });
 });
 
@@ -3305,5 +3310,167 @@ describe('TEAM-3410 G1: flush claim enforces the cooldown against the STORED las
     const claimLost = jsonLogs().filter((l) => l.event === 'eval.flush.claim_lost');
     expect(claimLost).toHaveLength(1);
     expect(claimLost[0].expectedBufferVersion).toBe(2);
+  });
+});
+
+// ─── TEAM-3415: duplicate-only deliveries must not re-buffer session ids ─────
+// PR #187 ship-review round 4 (P2): checkSeenSet removes only the evaluator
+// ROWS, but the handler continued unconditionally into aggregation and
+// buffering, and appendToBuffer ADDed sessionData.sessionIds — built from the
+// RAW log events, so still naming the dropped rows' sessions — into
+// bufferSessions. A CloudWatch Logs redelivery arriving AFTER the original
+// batch was flushed/reset therefore re-added already-flushed run ids into the
+// fresh buffer; enough duplicate-only deliveries reached batchSize and flushed
+// a junk batch — archiving rowless sessions, overwriting lastFlushedAt (burning
+// the cooldown window real batches wait on), with the no-evidence suppression
+// firing only AFTER both side effects. Fixed two ways: the handler skips
+// aggregation + buffering when zero rows survive (and narrows sessionIds to the
+// surviving sessions on partial survival), and flushBuffer grew a backstop that
+// refuses to claim/archive a batch with zero evaluator rows (reachable only via
+// legacy pre-fix buffer state — see its comment).
+
+describe('TEAM-3415: duplicate-only deliveries do not append or consume the cooldown', () => {
+  let handler;
+  let flushBuffer;
+
+  beforeAll(async () => {
+    process.env.ARTIFACTS_BUCKET = 'agentcore-hub-artifacts-123456789012-us-east-1';
+    process.env.EVAL_CONFIG_TABLE = 'agentcore-hub-eval-config';
+    process.env.AWS_REGION = 'us-east-1';
+    process.env.AWS_ACCOUNT_ID = '123456789012';
+    process.env.IMPROVEMENT_AGENT_ARN = IMPROVER_ARN;
+    process.env.EVAL_SEEN_TABLE = 'agentcore-hub-eval-seen-test';
+    vi.resetModules();
+    ({ handler, flushBuffer } = await import('./index.mjs'));
+  });
+
+  const appendWrites = () =>
+    sentCommands(ddbSend, 'UpdateCommand').filter((c) => c.input.ReturnValues === 'ALL_NEW');
+  const rowsOf = (append) => append.input.ExpressionAttributeValues[':new'][0].evaluatorResults;
+  const flushClaims = () => ddbState.flushResets;
+
+  // The exact interleaving from the finding: flush + reset, THEN a redelivery
+  // whose every row the seen-set drops. Pre-fix the redelivery appended an
+  // empty entry, re-ADDed the flushed session id into the fresh buffer, hit
+  // shouldFlush again (batchSize 1) and claimed a second, junk flush —
+  // overwriting lastFlushedAt and archiving a rowless batch.
+  it('post-flush redelivery: a duplicate-only delivery leaves the buffer empty and never claims a junk flush', async () => {
+    ddbState.seenSetPersistent = true;
+    const event = awslogsEvent([
+      evalRecord({ sessionId: 'sess-rd', score: 8, scoreLabel: 'pass', requestId: 'req-rd' }),
+    ]);
+
+    // Delivery 1: buffered, claimed, flushed, buffer reset (batchSize 1).
+    const res1 = await handler(event);
+    expect(res1).toEqual({ statusCode: 200, body: 'ok' });
+    expect(appendWrites()).toHaveLength(1);
+    expect(flushClaims()).toHaveLength(1);
+    expect(ddbState.priorBuffer).toEqual([]); // flushed + reset
+    expect(putsUnder('fleet-imp-agent/batches/')).toHaveLength(1);
+    const lastFlushedAt = ddbState.config.lastFlushedAt;
+    expect(lastFlushedAt).toBeDefined();
+
+    // Delivery 2: CloudWatch redelivers the SAME rows after the reset. The
+    // seen-set drops them all → the delivery must add NOTHING back.
+    const res2 = await handler(event);
+    expect(res2).toEqual({ statusCode: 200, body: 'no-surviving-rows' });
+
+    // No append: the buffer stays empty and no session id was re-ADDed.
+    expect(appendWrites()).toHaveLength(1);
+    expect(ddbState.priorBuffer).toEqual([]);
+    // No junk flush-claim side effects: lastFlushedAt (the cooldown clock) is
+    // untouched, nothing more was archived, no second improver invocation.
+    expect(flushClaims()).toHaveLength(1);
+    expect(ddbState.config.lastFlushedAt).toBe(lastFlushedAt);
+    expect(putsUnder('fleet-imp-agent/batches/')).toHaveLength(1);
+    expect(putsUnder('fleet-imp-agent/prd/')).toHaveLength(1);
+    expect(httpsRequest).toHaveBeenCalledTimes(1);
+
+    // The drop is still observable: the redelivery's EMF line counts it.
+    const emf = emfLines('EvalSessionsTotal').at(-1);
+    expect(emf.EvalDuplicateResultCount).toBe(1);
+    expect(emf.EvalSessionsTotal).toBe(0);
+  });
+
+  it("partial survival: only the surviving sessions' ids are appended to the run set", async () => {
+    ddbState.seenSetPersistent = true;
+    ddbState.config = { ...ddbState.config, batchSize: 10 }; // no flush
+
+    // Delivery 1 buffers and claims sess-p1's row.
+    await handler(
+      awslogsEvent([evalRecord({ sessionId: 'sess-p1', score: 8, scoreLabel: 'pass', requestId: 'req-p1' })])
+    );
+    // Delivery 2: a redelivery of sess-p1's row rides along with a FRESH
+    // session's row. Only sess-p2 may count toward batchSize.
+    await handler(
+      awslogsEvent([
+        evalRecord({ sessionId: 'sess-p1', score: 8, scoreLabel: 'pass', requestId: 'req-p1' }),
+        evalRecord({ sessionId: 'sess-p2', score: 6, scoreLabel: 'pass', requestId: 'req-p2' }),
+      ])
+    );
+
+    const appends = appendWrites();
+    expect(appends).toHaveLength(2);
+    expect(rowsOf(appends[1])).toHaveLength(1);
+    expect(rowsOf(appends[1])[0].sessionId).toBe('sess-p2');
+    // The ADD carries only the surviving session, and the buffered entry's
+    // provenance matches what was actually counted.
+    expect(appends[1].input.UpdateExpression).toContain('ADD bufferVersion :one, bufferSessions :sids');
+    expect(appends[1].input.ExpressionAttributeValues[':sids']).toEqual(new Set(['sess-p2']));
+    expect(appends[1].input.ExpressionAttributeValues[':new'][0].sessionIds).toEqual(['sess-p2']);
+  });
+
+  it('fail-open preserved: a delivery of only null-key rows still buffers, on every delivery', async () => {
+    ddbState.seenSetPersistent = true;
+    ddbState.config = { ...ddbState.config, batchSize: 10 }; // no flush
+
+    // No request id, no session id, no evaluator name, no score → no dedup key
+    // at all (hasNoDedupKey): the row must never be dropped by ANY layer, so
+    // the skip must not fire even though nothing is claimable.
+    const unkeyable = { severityText: 'INFO', body: 'evaluation result', attributes: {} };
+    const event = awslogsEvent([unkeyable]);
+
+    await handler(event);
+    await handler(event); // a re-delivery fails open too: no key, no dedup
+
+    const appends = appendWrites();
+    expect(appends).toHaveLength(2);
+    expect(rowsOf(appends[0])).toHaveLength(1);
+    expect(rowsOf(appends[0])[0].dedupKey).toBeNull();
+    expect(rowsOf(appends[1])).toHaveLength(1);
+    // No session ids to count — the ADD clause carries the version bump only.
+    expect(appends[0].input.UpdateExpression).not.toContain('bufferSessions');
+    expect(ddbState.seenPuts).toEqual([]); // nothing claimable was claimed
+  });
+
+  // The backstop is unreachable through the handler once the skip is in place
+  // (every buffered entry now carries >= 1 row, and dedupeBufferedSessions
+  // keeps >= 1 winner per duplicate group), so it is exercised directly with
+  // the legacy state that CAN still produce it: a buffer populated by pre-fix
+  // code whose entries are all rowless.
+  it('flushBuffer backstop: a rowless legacy buffer neither claims, archives, synthesizes, nor touches lastFlushedAt', async () => {
+    const legacyBuffer = [
+      { logStream: 'legacy-1', sessionIds: ['stale-a'], evaluatorResults: [] },
+      { logStream: 'legacy-2', sessionIds: ['stale-b'], evaluatorResults: [] },
+    ];
+    ddbState.priorBuffer = [...legacyBuffer];
+    ddbState.bufferVersion = 7;
+
+    await flushBuffer(AGENT_ID, legacyBuffer, 2, 7, 60);
+
+    // No claim was even attempted: lastFlushedAt (the cooldown clock) is
+    // untouched and the buffer is left intact for the next evidenced delivery.
+    expect(flushClaims()).toEqual([]);
+    expect(ddbState.config.lastFlushedAt).toBeUndefined();
+    expect(ddbState.priorBuffer).toEqual(legacyBuffer);
+    expect(putsUnder('fleet-imp-agent/batches/')).toEqual([]);
+    expect(putsUnder('fleet-imp-agent/prd/')).toEqual([]);
+    expect(httpsRequest).not.toHaveBeenCalled();
+
+    const skipped = jsonLogs().filter((l) => l.event === 'eval.flush.rowless_buffer_skipped');
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0].agentId).toBe(AGENT_ID);
+    expect(skipped[0].bufferEntries).toBe(2);
+    expect(skipped[0].expectedBufferVersion).toBe(7);
   });
 });
