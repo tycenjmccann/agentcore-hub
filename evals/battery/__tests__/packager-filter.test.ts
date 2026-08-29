@@ -10,10 +10,12 @@
 // @aws-sdk/lib-dynamodb) so aggregateScoresToDdb runs hermetically and we can
 // assert on the exact UpdateCommand it writes.
 //
-// TEAM-3427 adds: (finding 5) the handler must not buffer an empty envelope
-// for a battery-only delivery — the S3 client is also mocked so the REAL
-// handler can run end-to-end on a gzipped CW Logs payload; (finding 6) the
-// aggregation guard must catch battery ids in the legacy top-level shape.
+// TEAM-3427 adds handler-level coverage: (finding 5) an all-battery CloudWatch
+// Logs delivery must produce ZERO DynamoDB calls of any kind — not even the
+// agent-config GetCommand — while parse-error-only deliveries still buffer;
+// (finding 6) the aggregation guard must catch battery ids in the legacy
+// top-level shape. The S3 client is also mocked so the REAL handler can run
+// end-to-end on a gzipped CW Logs payload.
 import { describe, it, expect, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
@@ -40,9 +42,8 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
       // Scorecard read (has a ProjectionExpression): blank Item, so
       // aggregateScoresToDdb merges deltas into an empty scorecard.
       if (cmd.input.ProjectionExpression) return { Item: undefined };
-      // Agent-config read (handler step 2): enabled, never sampled out, so the
-      // handler proceeds to extraction. sent[] still records this read — the
-      // TEAM-3427 isolation contract is about WRITES (UpdateCommand).
+      // Agent-config read: enabled, never sampled out, so the handler
+      // proceeds past the config/enabled/sample checks.
       return {
         Item: { agentId: cmd.input.Key.agentId, enabled: true, sampleRate: 100, batchSize: 10 },
       };
@@ -95,6 +96,15 @@ const { isBatterySession, extractSessionData, aggregateScoresToDdb, handler } =
   await import("../../../lambda/eval-packager/index.mjs");
 
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
+
+/** Wrap a parsed CW Logs payload into the awslogs event shape Lambda receives. */
+function awslogsEvent(payload: object) {
+  return {
+    awslogs: {
+      data: gzipSync(Buffer.from(JSON.stringify(payload))).toString("base64"),
+    },
+  };
+}
 
 /** Log event shaped like a real OTEL eval record delivered via CW Logs. */
 function otelLogEvent(sessionId: string, evaluator: string, score: number, timestamp = 1724800000000) {
@@ -240,34 +250,54 @@ describe("empty battery envelope is never buffered (TEAM-3427 finding 5, NFR-1.3
     expect(appendAt).toBeGreaterThan(guardAt);
   });
 
-  it("real handler: an all-battery CW Logs delivery produces zero DynamoDB writes", async () => {
+  it("real handler: an all-battery CW Logs delivery produces ZERO DynamoDB calls of any kind", async () => {
     ddbMock.sent.length = 0;
-    const event = {
-      awslogs: { data: gzipSync(JSON.stringify(allBatteryBatch)).toString("base64") },
-    };
-    const result = await handler(event);
+    const result = await handler(awslogsEvent(allBatteryBatch));
 
     expect(result).toEqual({ statusCode: 200, body: "battery-filtered" });
-    // The handler reads agent config (GetCommand) before extraction — the
-    // NFR-1.3 isolation contract is about WRITES: zero UpdateCommand of any
-    // kind (no buffer append, no score aggregation, no flush).
-    const writes = ddbMock.sent.filter((cmd) => cmd.constructor.name === "UpdateCommand");
-    expect(writes).toHaveLength(0);
+    // Extraction runs BEFORE the agent-config read, so an all-battery delivery
+    // issues no reads and no writes — not even the config GetCommand.
+    expect(ddbMock.sent).toHaveLength(0);
+  });
+
+  it("real handler: a mixed batch still reads config and buffers only the non-battery run", async () => {
+    ddbMock.sent.length = 0;
+    await handler(
+      awslogsEvent({
+        logGroup: "/aws/bedrock-agentcore/evaluations/results/eval_test-agent-abc",
+        logStream: "stream-1",
+        logEvents: [
+          otelLogEvent("battery-run1-case1", "helpfulness", 0.2),
+          otelLogEvent("prod-run-42", "helpfulness", 0.9),
+        ],
+      })
+    );
+
+    // Normal path is intact: config GetCommand + aggregation + buffer append.
+    const sentNames = ddbMock.sent.map((cmd) => cmd.constructor.name);
+    expect(sentNames).toContain("GetCommand");
+    const append = ddbMock.sent.find(
+      (cmd) =>
+        cmd.constructor.name === "UpdateCommand" &&
+        cmd.input.UpdateExpression?.includes("sessionBuffer")
+    );
+    expect(append).toBeDefined();
+    // The appended envelope carries only the non-battery run.
+    const envelope = append.input.ExpressionAttributeValues[":new"][0];
+    expect(envelope.sessionIds).toEqual(["prod-run-42"]);
   });
 
   it("still buffers a delivery that only carries parse-error records", async () => {
     // The early return must trigger ONLY when nothing was retained: parse-error
     // records land in evaluatorResults (no sessionIds) and must buffer as before.
     ddbMock.sent.length = 0;
-    const parseErrorBatch = {
-      logGroup: "/aws/bedrock-agentcore/evaluations/results/eval_test-agent-abc",
-      logStream: "stream-1",
-      logEvents: [{ timestamp: 1724800000000, message: "not-json {" }],
-    };
-    const event = {
-      awslogs: { data: gzipSync(JSON.stringify(parseErrorBatch)).toString("base64") },
-    };
-    const result = await handler(event);
+    const result = await handler(
+      awslogsEvent({
+        logGroup: "/aws/bedrock-agentcore/evaluations/results/eval_test-agent-abc",
+        logStream: "stream-1",
+        logEvents: [{ timestamp: 1724800000000, message: "not-json {" }],
+      })
+    );
 
     expect(result).toEqual({ statusCode: 200, body: "ok" });
     const writes = ddbMock.sent.filter((cmd) => cmd.constructor.name === "UpdateCommand");
