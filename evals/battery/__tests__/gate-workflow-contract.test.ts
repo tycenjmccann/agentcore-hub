@@ -129,6 +129,23 @@ describe("battery job — trusted-base harness (TRUST-1)", () => {
     expect(files).toContain("src/config/agents.json");
   });
 
+  it("overlay REJECTS symlinks/non-regular head files before any copy (TEAM-3438)", () => {
+    // cp -R preserves symlinks, so a head-committed symlink under an overlaid
+    // path would alias a file outside the overlay (e.g. /proc/self/environ
+    // once OIDC creds exist) into the battery's model payload. The guard must
+    // run before the first cp and fail the job rather than dereference.
+    const guard = battery.indexOf("-type l");
+    const firstCopy = battery.indexOf("cp -R");
+    expect(guard, "battery overlay carries a -type l find rejection").toBeGreaterThan(-1);
+    expect(firstCopy).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(firstCopy);
+    // Single-file entries need an explicit -L test: plain -f follows links.
+    expect(battery).toMatch(/\[ -L "pr-head\/\$f" \]/);
+    // Detection is fatal, inside the guard block (before any copy).
+    const block = battery.slice(guard, firstCopy);
+    expect(block).toContain("exit 1");
+  });
+
   it("pr-head/ is deleted after the overlay so nothing later can reach head code", () => {
     expect(battery).toContain("rm -rf pr-head");
   });

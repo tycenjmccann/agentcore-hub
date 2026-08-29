@@ -243,6 +243,39 @@ jobs:
             "src/config/workflows.json"
             "src/config/agents.json"
           )
+          # ---- Symlink / non-regular-file rejection (TEAM-3438 Finding 1) ----
+          # Trust boundary: `cp -R` preserves symlinks, so a PR-committed
+          # symlink under an overlaid path would alias a file OUTSIDE the
+          # overlay — e.g. /proc/self/environ once OIDC credentials are
+          # exported later in this job — into the prompt/blueprint payload the
+          # battery reads and sends to the model. The gate REJECTS (fails the
+          # job) instead of dereferencing, so the attempt is visible and
+          # reviewable on the PR. Anything that is neither a regular file nor
+          # a directory (fifos, sockets, device nodes) is rejected for the
+          # same reason. The scan iterates the SAME allowlist arrays the copy
+          # loops below use, so every future allowlist addition is covered
+          # automatically. This block must stay BEFORE any copy.
+          offenders=""
+          for dir in "${OVERLAY_DIRS[@]}"; do
+            if [ -e "pr-head/$dir" ] || [ -L "pr-head/$dir" ]; then
+              found="$(find "pr-head/$dir" \( -type l -o ! -type d ! -type f \) -print)"
+              if [ -n "$found" ]; then
+                offenders="${offenders}${found}"$'\n'
+              fi
+            fi
+          done
+          for f in "${OVERLAY_FILES[@]}"; do
+            # -f follows symlinks, so test -L explicitly: a symlink to a
+            # regular file must be rejected, not copied.
+            if [ -L "pr-head/$f" ] || { [ -e "pr-head/$f" ] && [ ! -f "pr-head/$f" ]; }; then
+              offenders="${offenders}pr-head/$f"$'\n'
+            fi
+          done
+          if [ -n "$offenders" ]; then
+            printf '%s\n' "$offenders"
+            echo "::error::PR head contains symlinks or non-regular files in overlaid candidate paths (listed in the step log) — refusing to overlay them into the workspace"
+            exit 1
+          fi
           # Directories are replaced wholesale (remove base copy, then copy the
           # head copy) so files the PR DELETES do not linger from base. A
           # directory absent at head stays deleted.

@@ -16,9 +16,11 @@
 //           PR may hold checks:write or call checks.create; check publication
 //           (publish / skip-publish) is same-repo only, and the fork jobs run
 //           with permissions: {}.
-import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { describe, it, expect, afterEach } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
@@ -88,6 +90,30 @@ describe("battery job — harness from trusted base (HERM-3)", () => {
       expect(run, `overlay must not reference ${forbidden}`).not.toContain(forbidden);
   });
 
+  it("rejects symlinks and non-regular PR-head files BEFORE any copy (TEAM-3438)", () => {
+    const run: string = overlay.run;
+    // The guard must sit before the first copy so nothing PR-controlled
+    // crosses the boundary once a symlink/special file is present anywhere.
+    const guardIdx = run.indexOf("-type l");
+    // The literal copy command, not just "cp -R" — the guard's own trust
+    // comment legitimately mentions cp -R.
+    const firstCopyIdx = run.indexOf('cp -R "pr-head/$dir"');
+    expect(guardIdx, "overlay must contain a -type l find rejection").toBeGreaterThan(-1);
+    expect(firstCopyIdx).toBeGreaterThan(-1);
+    expect(guardIdx).toBeLessThan(firstCopyIdx);
+    // Deep scan iterates the SAME OVERLAY_DIRS array the copy loop uses, so
+    // future allowlist additions are covered automatically; the predicate
+    // rejects symlinks and anything neither regular file nor directory.
+    expect(run).toMatch(/find "pr-head\/\$dir" \\\( -type l -o ! -type d ! -type f \\\) -print/);
+    // Single-file entries: -f follows symlinks, so an explicit -L test is
+    // required to reject a symlink that points at a regular file.
+    expect(run).toMatch(/\[ -L "pr-head\/\$f" \]/);
+    // Detection is fatal — the job fails visibly instead of dereferencing.
+    const guardBlock = run.slice(guardIdx, firstCopyIdx);
+    expect(guardBlock).toContain("::error::");
+    expect(guardBlock).toMatch(/^\s*exit 1\s*$/m);
+  });
+
   it("deletes pr-head in the overlay step, before the battery runs", () => {
     expect(overlay.run).toMatch(/^\s*rm -rf pr-head\s*$/m);
     const names = steps(battery).map((s) => String(s.name ?? ""));
@@ -102,6 +128,87 @@ describe("battery job — harness from trusted base (HERM-3)", () => {
     expect(String(battery.if)).toContain(SAME_REPO);
     expect(String(battery.if)).toContain("gated == 'true'");
     expect(battery.permissions ?? {}).not.toHaveProperty("checks");
+  });
+});
+
+describe("overlay symlink rejection — the real inline script, executed (TEAM-3438)", () => {
+  // Same subprocess pattern as lint-fixtures.test.ts: run the EXACT bash the
+  // workflow runs (the overlay step's `run` block, straight from the parsed
+  // YAML) against a throwaway workspace, so the guard is tested as code, not
+  // just pinned as text. No AWS, no network.
+  const overlayRun: string = steps(jobs.battery).find((s) => /overlay/i.test(String(s.name ?? "")))!.run;
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
+  });
+
+  function workspace(): string {
+    const root = mkdtempSync(join(tmpdir(), "gate-overlay-"));
+    roots.push(root);
+    return root;
+  }
+
+  function write(root: string, rel: string, content: string): void {
+    mkdirSync(join(root, dirname(rel)), { recursive: true });
+    writeFileSync(join(root, rel), content);
+  }
+
+  function runOverlay(root: string): { code: number; output: string } {
+    try {
+      const output = execFileSync("bash", ["-c", overlayRun], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, HEAD_SHA: "headsha", BASE_SHA: "basesha" },
+      });
+      return { code: 0, output };
+    } catch (err: any) {
+      return { code: err.status ?? 1, output: `${err.stdout || ""}${err.stderr || ""}` };
+    }
+  }
+
+  it("fails the job on a symlink inside an overlaid directory, copying nothing", () => {
+    const root = workspace();
+    write(root, "deploy/runtime-agent/prompts/base.txt", "base prompt");
+    mkdirSync(join(root, "pr-head/deploy/runtime-agent/prompts"), { recursive: true });
+    symlinkSync("/proc/self/environ", join(root, "pr-head/deploy/runtime-agent/prompts/evil.txt"));
+    const { code, output } = runOverlay(root);
+    expect(code).toBe(1);
+    expect(output).toContain("::error::");
+    expect(output).toContain("pr-head/deploy/runtime-agent/prompts/evil.txt");
+    // Guard fired before the copy loops: the base file was never clobbered.
+    expect(readFileSync(join(root, "deploy/runtime-agent/prompts/base.txt"), "utf8")).toBe("base prompt");
+  });
+
+  it("fails on a symlink at a single-file overlay entry, even one pointing at a regular file", () => {
+    const root = workspace();
+    write(root, "pr-head/decoy.json", "{}"); // regular target — plain -f would pass
+    mkdirSync(join(root, "pr-head/src/config"), { recursive: true });
+    symlinkSync(join(root, "pr-head/decoy.json"), join(root, "pr-head/src/config/workflows.json"));
+    const { code, output } = runOverlay(root);
+    expect(code).toBe(1);
+    expect(output).toContain("pr-head/src/config/workflows.json");
+  });
+
+  it("fails when an allowlisted directory itself is a symlink", () => {
+    const root = workspace();
+    mkdirSync(join(root, "pr-head/deploy/runtime-agent"), { recursive: true });
+    symlinkSync("/etc", join(root, "pr-head/deploy/runtime-agent/prompts"));
+    const { code } = runOverlay(root);
+    expect(code).toBe(1);
+  });
+
+  it("passes a clean head: regular files overlay and pr-head is removed", () => {
+    const root = workspace();
+    write(root, "deploy/runtime-agent/prompts/stale.txt", "deleted at head");
+    write(root, "pr-head/deploy/runtime-agent/prompts/new.txt", "candidate prompt");
+    write(root, "pr-head/src/config/workflows.json", "{}");
+    const { code, output } = runOverlay(root);
+    expect(code, output).toBe(0);
+    expect(readFileSync(join(root, "deploy/runtime-agent/prompts/new.txt"), "utf8")).toBe("candidate prompt");
+    expect(existsSync(join(root, "deploy/runtime-agent/prompts/stale.txt"))).toBe(false);
+    expect(readFileSync(join(root, "src/config/workflows.json"), "utf8")).toBe("{}");
+    expect(existsSync(join(root, "pr-head"))).toBe(false);
   });
 });
 
