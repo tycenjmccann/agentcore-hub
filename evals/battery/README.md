@@ -525,13 +525,35 @@ before its first S3 write or docker build. Semantics against HEAD:
 - A **dirty working tree** touching gated paths always refuses: deploys ship
   committed, gated state only.
 
-Break-glass (audited — BG-2/BG-3): set **both** `EVAL_GATE_OVERRIDE=1` and a
-non-empty `EVAL_GATE_OVERRIDE_REASON`. The override prints a loud banner and
-writes `{timestamp, sha, identity (STS caller ARN), script, reason}` to
+Break-glass (audited — BG-2/BG-3) has two equivalent forms:
+
+```bash
+# CLI form (deploy/runtime-agent/deploy.sh and deploy-one.sh)
+./deploy/runtime-agent/deploy.sh --force --force-reason "INC-123: hotfix, gate red on an unrelated case" backend_dev
+
+# Env-var form (every gated target, including the raw require_eval_gate calls in DEPLOY.md)
+EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON="INC-123: hotfix, gate red on an unrelated case" \
+  ./deploy/ecs-express/deploy.sh
+```
+
+`--force`/`--force-reason` (parsed by the shared `deploy/lib/parse-force-args.sh`,
+also accepted as `--force-reason=<why>`) is pure sugar: it exports
+`EVAL_GATE_OVERRIDE=1` and `EVAL_GATE_OVERRIDE_REASON` before the gate runs, so
+both forms land in the **same** audited path with the same audit trail. `--force`
+without a non-empty reason is refused up front, before any gate or deploy work
+(an inherited non-empty `EVAL_GATE_OVERRIDE_REASON` counts as the reason; a
+`--force-reason` on the command line always wins over it). Any other unknown
+`--flag` is rejected rather than misparsed as an agent name.
+
+The override prints a loud banner and writes
+`{timestamp, sha, identity (STS caller ARN), script, reason}` to
 `s3://$ARTIFACT_BUCKET/eval-gate/overrides/<ts>-<sha>.txt` **and**
 `.eval-gate-overrides.log` (gitignored). If the S3 write fails you must type
 `OVERRIDE-UNAUDITED` at a real tty; non-interactive unaudited overrides are
-refused. An empty reason is refused outright.
+refused, and an override with no durable record at all is refused outright. An
+empty reason is refused outright. From `deploy.sh` the override is spent once —
+the parent gate call audits and then latches, so its 14 `deploy-one.sh` children
+short-circuit on the latch token instead of writing 14 audit records.
 
 ## Cost budget
 

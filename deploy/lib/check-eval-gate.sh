@@ -363,6 +363,7 @@ _eval_gate_refuse() {
       printf '%s\n' "$detail"
     fi
     echo "  Break-glass (audited): EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON='<incident/why>' <deploy cmd>"
+    echo "  ...or, on deploy.sh / deploy-one.sh: --force --force-reason '<incident/why>' (same audit trail)"
   } >&2
   exit 1
 }
