@@ -53,9 +53,22 @@
 # the audited break-glass. A scan that covers the FULL first-parent history
 # (history no deeper than the cap) still proceeds informationally.
 #
+# Skipped-success (TEAM-3426): the gate workflow publishes a SUCCESS check
+# titled "SKIPPED — no gated paths changed" for PRs that touch no gated path.
+# That check proves NOTHING about the tree at its sha — the battery never ran
+# — so only a REAL battery pass ("PASS — config evals battery held the
+# baseline") may green-light HEAD, anchor the belt scan, or set the latch. A
+# SKIPPED success is INFORMATIONAL and treated exactly like an absent check:
+# resolution falls through to merged-PR lookup / gated-diff inspection, and
+# the belt scan continues past it (an ancestor whose only evidence is a
+# SKIPPED success still triggers the bypass refusal). A success check with no
+# output payload at all still counts as a real green.
+#
 # Break-glass (TEAM-3066 BG-2/BG-3 — audited, never silent):
 #   EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON="INC-123: hotfix, gate is
 #   red on an unrelated case" ./deploy/...
+#   CLI equivalent (routed to the same audited path by the deploy scripts):
+#   ./deploy/... --force --force-reason "INC-123: hotfix, ..."
 # Both variables are required; an empty reason still refuses. The override is
 # recorded to s3://$ARTIFACT_BUCKET/eval-gate/overrides/<ts>-<sha>.txt AND to
 # .eval-gate-overrides.log (gitignored). If the S3 write fails you must type
@@ -347,15 +360,21 @@ _eval_gate_refuse() {
 # the shared green/running/red verdict logic. $3 describes where the evidence
 # lives, for logs and refusal messages (e.g. "HEAD (abc)" or "PR #7 head def
 # (merged as HEAD abc)"). Return codes:
-#   0 — green: the caller proceeds (and latches when the sha covers HEAD)
+#   0 — green: a REAL battery pass; the caller proceeds (and latches when the
+#       sha covers HEAD)
 #   2 — absent (total_count=0): the caller decides what absence means there
 #   3 — a refusal fired but the audited break-glass override let it return:
 #       the caller latches HEAD and proceeds
+#   4 — skipped-success (TEAM-3426): conclusion=success but the check is the
+#       workflow's "SKIPPED — no gated paths changed" publication — no
+#       evaluation evidence. Callers MUST treat this exactly like 2/absent:
+#       never latch, never anchor, never green-light; fall through to
+#       merged-PR resolution / gated-diff inspection / the belt scan.
 # Every other outcome (API error, unparseable response, still-running check,
 # red check) refuses inside _eval_gate_refuse — fail closed.
 _eval_gate_verdict() {
   local _egv_repo="$1" _egv_sha="$2" _egv_where="$3"
-  local _egv_json _egv_total _egv_status _egv_conclusion _egv_url _egv_failing
+  local _egv_json _egv_total _egv_status _egv_conclusion _egv_url _egv_failing _egv_title
   if ! _egv_json="$(_eval_gate_fetch_check "$_egv_repo" "$_egv_sha")"; then
     _eval_gate_refuse "GitHub API error while querying check runs for $_egv_where" \
       "  $_egv_json"
@@ -374,8 +393,24 @@ _eval_gate_verdict() {
   _egv_conclusion="$(printf '%s' "$_egv_json" | jq -r '.check_runs[0].conclusion // ""')"
   _egv_url="$(printf '%s' "$_egv_json" | jq -r '.check_runs[0].html_url // ""')"
 
-  # Green ⇒ let the caller proceed.
+  # Green ⇒ let the caller proceed — unless it is the workflow's SKIPPED
+  # success (published when a PR touches no gated path), which proves nothing:
+  # the battery never ran at that sha. The workflow's machine-readable marker
+  # is a title starting with "SKIPPED" (a real pass is titled "PASS — config
+  # evals battery held the baseline"); fall back to the summary when the
+  # title is empty. A success with NO output payload at all still counts as a
+  # real green (minimal API responses omit output entirely).
   if [ "$_egv_conclusion" = "success" ]; then
+    _egv_title="$(printf '%s' "$_egv_json" | jq -r '.check_runs[0].output.title // ""')"
+    if [ -z "$_egv_title" ]; then
+      _egv_title="$(printf '%s' "$_egv_json" | jq -r '.check_runs[0].output.summary // ""')"
+    fi
+    case "$_egv_title" in
+      SKIPPED*)
+        echo "eval-gate: the ${EVAL_GATE_CHECK_NAME} success on $_egv_where is '${_egv_title%%[$'\n']*}' — the battery never ran there, so a skipped success is NOT evaluation evidence; continuing as if no check existed." >&2
+        return 4
+        ;;
+    esac
     return 0
   fi
 
@@ -479,7 +514,9 @@ require_eval_gate() {
   fi
 
   # 2–5. Latest config-evals-gate check run on HEAD: green ⇒ proceed + latch;
-  # running/red/API error ⇒ refuse inside _eval_gate_verdict.
+  # running/red/API error ⇒ refuse inside _eval_gate_verdict. Verdicts 2
+  # (absent) and 4 (skipped-success — no evaluation evidence) both fall
+  # through to merged-PR resolution below.
   local verdict
   verdict=0
   _eval_gate_verdict "$owner_repo" "$head_sha" "HEAD ($head_sha)" || verdict=$?
@@ -518,10 +555,11 @@ require_eval_gate() {
         return 0
         ;;
     esac
-    echo "eval-gate: HEAD ($head_sha) resolved to merged PR #$pr_number (head $pr_head_sha) but that head carries no ${EVAL_GATE_CHECK_NAME} check — treating the check as absent." >&2
+    echo "eval-gate: HEAD ($head_sha) resolved to merged PR #$pr_number (head $pr_head_sha) but that head carries no real ${EVAL_GATE_CHECK_NAME} evidence (check absent or a SKIPPED success) — treating the check as absent." >&2
   fi
 
-  # No check on HEAD directly or via its merged PR — only acceptable when
+  # No real check evidence on HEAD directly or via its merged PR (absent or a
+  # skipped success either way) — only acceptable when
   # nothing gated changed. Capture the file list FIRST: a pipe would discard
   # _eval_gate_commit_files' exit status, and an unreadable commit must refuse
   # (fail closed), not pass as "touched nothing".
@@ -543,8 +581,12 @@ require_eval_gate() {
 
   # Belt (A3, enforced): scan first-parent ancestors (skip HEAD) back to a
   # green anchor — the NEWEST gated-path touch, which must carry green
-  # evidence (direct check, or merged-PR resolution) or we refuse. A green
-  # verdict covered the whole tree at that sha, so the scan can stop there;
+  # evidence (direct check, or merged-PR resolution) or we refuse. Only a
+  # REAL battery pass (verdict 0) anchors: a skipped success (verdict 4)
+  # falls through like an absent check (verdict 2), so a gated-touching
+  # ancestor whose only "evidence" is SKIPPED still hits the bypass refusal
+  # below. A green verdict covered the whole tree at that sha, so the scan can
+  # stop there;
   # commits above it changed nothing gated (or we'd have refused already).
   # Hard cap of EVAL_GATE_BELT_MAX commits — total is computed up front so the
   # verdict below can tell "scanned everything (history fits the cap)" apart
@@ -575,8 +617,9 @@ require_eval_gate() {
           return 0
           ;;
       esac
-      # No direct check — the ancestor may itself be a merge/squash commit
-      # whose evidence lives on its PR's head sha (A1).
+      # No direct real check (absent, or a skipped success) — the ancestor may
+      # itself be a merge/squash commit whose evidence lives on its PR's head
+      # sha (A1). That evidence must equally be a real pass, not SKIPPED.
       if pr_resolved="$(_eval_gate_resolve_merged_pr_head "$owner_repo" "$c")"; then
         pr_number="${pr_resolved%% *}"
         pr_head_sha="${pr_resolved##* }"
