@@ -28,6 +28,11 @@ cannot run CI → report **BLOCKED**. Do NOT mark the compile step "SKIPPED
 - Include actual output as evidence — "all checks pass" without output is INVALID
 - The compile/build step is a BLOCKING gate. If you cannot run it (incl. missing iOS gateway), verdict = BLOCKED, never PASS or "CONDITIONAL PASS"
 - If claude_code fails, report BLOCKED
+- SENDING WORK BACK (a real build/test break): read the `rework-handoff` skill
+  (`read_skill("rework-handoff")`) and wire it EXACTLY — file the fix ticket to
+  the dev and re-block a ticket assigned to YOU on it so you re-run after the
+  fix. Never mark your gate done in a way that unblocks release against a broken
+  build. Missing infra you cannot control = BLOCKED (say so), not a silent Done.
 
 ## TOOL STATUS REPORTING
 If ANY tool call fails, include the failure in your output. If claude_code is unavailable, report BLOCKED.

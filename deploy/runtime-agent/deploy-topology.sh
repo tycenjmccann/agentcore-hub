@@ -52,6 +52,17 @@ aws s3 sync "$PROMPTS_DIR" "s3://${ARTIFACT_BUCKET}/prompts/" \
   --exclude "*" --include "*.txt" \
   --only-show-errors
 
+# Shared cross-role skills (read at invoke time via read_skill) live alongside
+# prompts. Synced regardless of topology so S3 stays authoritative.
+SKILLS_DIR="$SCRIPT_DIR/skills"
+if [[ -d "$SKILLS_DIR" ]]; then
+  echo "→ Syncing team skills to s3://${ARTIFACT_BUCKET}/skills/"
+  aws s3 sync "$SKILLS_DIR" "s3://${ARTIFACT_BUCKET}/skills/" \
+    --region "$AWS_REGION" \
+    --exclude "*" --include "*.md" \
+    --only-show-errors
+fi
+
 if [[ "$COUNT" == "14" ]]; then
   # deploy-fleet.sh refreshes the local agents.json (via refresh-agents-json.sh)
   # but does not upload it to S3. We do that ourselves so the orchestrator/Jira

@@ -16,8 +16,10 @@ table, so it shows on the board timeline and in the next run analysis.
 
 `escalate` is idempotent: an identical open (unacknowledged) escalation is
 never appended twice, so the manager can't re-raise the same flag every pass.
-When a run is dead and shouldn't keep paging, the manager decides to `mute` it —
-that judgment is the agent's, not a coded cap.
+When a run is dead and shouldn't keep paging, the manager `mute`s it — a
+TIME-BOXED snooze (wmMuteUntil = now + N h), never a permanent kill. The mute
+lapses so a still-stuck run is reconsidered instead of silently abandoned; the
+only permanent watch-off is the human's `managerWatch` UI toggle.
 
 The two stuck-agent decisions (the common case) are `retry` and `mark-done`:
   - work is NOT done (no deliverable) → `retry` the agent
@@ -32,7 +34,7 @@ Usage:
   python3 intervene.py comment   <workflowId> <ticketId> <text>
   python3 intervene.py escalate  <workflowId> <message>
   python3 intervene.py complete  <workflowId> [--reason "..."]
-  python3 intervene.py mute      <workflowId> [--note "..."]
+  python3 intervene.py mute      <workflowId> [--note "..."] [--hours 6]   (time-boxed snooze, not permanent)
   python3 intervene.py cancel    <workflowId> --reason "..."   (explicit user request ONLY)
   python3 intervene.py start     --title "..." [--description "..."] [--repo owner/name] [--branch main]
   python3 intervene.py file-bug  <workflowId> --title "..." --description "<RCA>" --agent <agentId> [--repo owner/name]
@@ -169,14 +171,6 @@ def cmd_comment(args):
     print(json.dumps({"action": "comment", "ticketId": args.ticket_id, **result}, indent=2))
 
 
-def _set_manager_watch(workflow_id, on):
-    dynamodb.Table(WORKFLOWS_TABLE).update_item(
-        Key={"workflowId": workflow_id},
-        UpdateExpression="SET managerWatch = :w",
-        ExpressionAttributeValues={":w": on},
-    )
-
-
 def cmd_dispatch(args):
     """Re-queue a ticket that was never picked up (in the roster but no agent
     ever ran it — no agent.started, no error). Distinct from `retry`, which
@@ -253,13 +247,23 @@ def cmd_mark_done(args):
 
 
 def cmd_mute(args):
-    """Circuit breaker: stop watching a run that cannot be moved (no diagnosable
-    cause, work not verifiably done). Sets managerWatch=false so the watch
-    scheduler skips it and it stops paging — without touching any ticket or
-    faking completion. A human can re-enable by clearing the flag."""
-    _set_manager_watch(args.workflow_id, False)
-    publish_intervention(args.workflow_id, "mute", {"note": args.note})
-    print(json.dumps({"action": "mute", "workflowId": args.workflow_id, "managerWatch": False}, indent=2))
+    """Circuit breaker: stop paging on a run that cannot be moved right now (no
+    diagnosable cause, work not verifiably done). This is a TIME-BOXED snooze —
+    it sets wmMuteUntil = now + N hours so the watch scheduler skips the run
+    until then, then reconsiders it. It does NOT permanently disable watch
+    (that is the human's `managerWatch` UI toggle); a mute that expires means a
+    still-stuck run gets looked at again instead of being silently abandoned.
+    Re-muting a run that is genuinely dead is fine — but a mute is never forever."""
+    hours = max(1, int(args.hours))
+    until = datetime.now(timezone.utc).timestamp() + hours * 3600
+    until_iso = datetime.fromtimestamp(until, tz=timezone.utc).isoformat()
+    dynamodb.Table(WORKFLOWS_TABLE).update_item(
+        Key={"workflowId": args.workflow_id},
+        UpdateExpression="SET wmMuteUntil = :u",
+        ExpressionAttributeValues={":u": until_iso},
+    )
+    publish_intervention(args.workflow_id, "mute", {"note": args.note, "muteUntil": until_iso})
+    print(json.dumps({"action": "mute", "workflowId": args.workflow_id, "muteUntil": until_iso}, indent=2))
 
 
 def cmd_cancel(args):
@@ -449,6 +453,8 @@ def main():
     p = sub.add_parser("mute")
     p.add_argument("workflow_id")
     p.add_argument("--note", default="")
+    p.add_argument("--hours", type=int, default=6,
+                   help="Time-box the mute (default 6h). The run is reconsidered after this.")
     p.set_defaults(func=cmd_mute)
 
     p = sub.add_parser("cancel")

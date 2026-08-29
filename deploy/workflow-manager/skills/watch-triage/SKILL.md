@@ -92,8 +92,11 @@ python3 /mnt/workspace/toolkit/intervene.py mute      <wfId> --note "why"
    choice only a person can make)? → `escalate` ONCE with the specific
    decision needed. A LAST resort, not a reflex — you resolve stuck agents
    yourself via `mark-done`/`retry`; you do not page a human to read logs.
-6. **Truly nothing actionable and already escalated?** → `mute` (circuit
-   breaker) so it stops paging. Do not re-escalate the same thing.
+6. **Truly nothing actionable and already escalated?** → `mute` (a TIME-BOXED
+   snooze — default 6h, `--hours N` to extend) so it stops paging for now. The
+   mute LAPSES and the run is reconsidered — so a run you mute today gets
+   another look, never silently abandoned. Do not re-escalate the same thing;
+   just let the mute ride and re-mute if it's still dead next time.
 
 ## Rules (some also enforced in code — do not attempt workarounds)
 

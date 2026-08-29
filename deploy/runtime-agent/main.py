@@ -1280,6 +1280,41 @@ def load_blueprint(blueprint_name: str) -> str:
         return f"ERROR loading blueprint: {e}"
 
 
+# ─── Skill Loader Tool ────────────────────────────────────────────────────────
+# Skills are cross-role protocols (HOW to do a shared procedure correctly), kept
+# in S3 at s3://{ARTIFACT_BUCKET}/skills/{name}.md so a gate agent can pull the
+# exact steps on demand instead of every prompt carrying the full text. Distinct
+# from blueprints (per-role process) and Claude Code skills (code-gen domain).
+
+@tool
+def read_skill(skill_name: str) -> str:
+    """Read a shared team skill — a step-by-step protocol for a cross-role procedure.
+
+    Call this when your prompt tells you to (e.g. 'read the rework-handoff skill
+    before sending work back'). The skill is the authoritative, current
+    instructions — follow it literally.
+
+    Args:
+        skill_name: Name of the skill to read (e.g. 'rework-handoff').
+    """
+    if not ARTIFACT_BUCKET:
+        return "ERROR: No artifact bucket configured. Cannot read skill."
+    s3_key = f"skills/{skill_name}.md"
+    try:
+        s3 = boto3.client("s3", region_name=REGION)
+        resp = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=s3_key)
+        return resp["Body"].read().decode("utf-8")
+    except s3.exceptions.NoSuchKey:
+        try:
+            objs = s3.list_objects_v2(Bucket=ARTIFACT_BUCKET, Prefix="skills/", Delimiter="/")
+            available = [o["Key"].replace("skills/", "").replace(".md", "") for o in objs.get("Contents", [])]
+            return f"Skill '{skill_name}' not found. Available: {', '.join(available)}"
+        except Exception:
+            return f"Skill '{skill_name}' not found at s3://{ARTIFACT_BUCKET}/{s3_key}"
+    except Exception as e:
+        return f"ERROR reading skill: {e}"
+
+
 # ─── External Tool Integration (via MCP — GitHub, GitLab, Jira, etc.) ────────
 
 # AgentCore Gateways authorize with AWS_IAM, so requests must be SigV4-signed —
@@ -1931,6 +1966,8 @@ LAMBDA_TOOLS = [
     WorkflowOutput___submit_ticket_plan,
     # Blueprint (Lambda-backed) — process/workflow instructions for the agent's role
     load_blueprint,
+    # Skill (S3-backed) — shared cross-role protocols (e.g. rework-handoff)
+    read_skill,
     # GitHub tools come from MCPClient (remote MCP) — not Lambda-backed
 ]
 
