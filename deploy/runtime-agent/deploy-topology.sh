@@ -52,14 +52,15 @@ aws s3 sync "$PROMPTS_DIR" "s3://${ARTIFACT_BUCKET}/prompts/" \
   --exclude "*" --include "*.txt" \
   --only-show-errors
 
-# Shared cross-role skills (read at invoke time via read_skill) live alongside
-# prompts. Synced regardless of topology so S3 stays authoritative.
-SKILLS_DIR="$SCRIPT_DIR/skills"
-if [[ -d "$SKILLS_DIR" ]]; then
-  echo "→ Syncing team skills to s3://${ARTIFACT_BUCKET}/skills/"
-  aws s3 sync "$SKILLS_DIR" "s3://${ARTIFACT_BUCKET}/skills/" \
+# Process blueprints (loaded hot at invoke time via load_blueprint) live in the
+# repo-root blueprints/ dir. Sync them here too so a topology deploy keeps S3
+# authoritative even when run-module.sh's sync path isn't taken.
+BLUEPRINTS_DIR="$REPO_ROOT/blueprints"
+if [[ -d "$BLUEPRINTS_DIR" ]]; then
+  echo "→ Syncing blueprints to s3://${ARTIFACT_BUCKET}/blueprints/"
+  aws s3 cp "$BLUEPRINTS_DIR" "s3://${ARTIFACT_BUCKET}/blueprints/" \
+    --recursive --exclude "*" --include "*.md" \
     --region "$AWS_REGION" \
-    --exclude "*" --include "*.md" \
     --only-show-errors
 fi
 

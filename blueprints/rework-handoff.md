@@ -9,7 +9,7 @@ The orchestrator is deliberately dumb. It only reacts to **ticket status
 transitions**, and it re-dispatches a ticket **only** when a ticket in that
 ticket's `blocked_by` list transitions to `done`/`cancelled` AND every other
 blocker is also resolved. If you don't wire the blocker, nothing re-runs. This
-skill is the exact protocol. Follow it literally.
+blueprint is the exact protocol. Follow it literally.
 
 ## The one rule that prevents every stall
 

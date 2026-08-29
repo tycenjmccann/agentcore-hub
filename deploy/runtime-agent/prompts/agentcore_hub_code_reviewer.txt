@@ -34,7 +34,7 @@ on re-review. PASS = empty findings list, nothing less.
 - **PASS** — ZERO findings: `WorkflowOutput___report_completion` with a summary
   of what you checked. This Dones your ticket and QA proceeds.
 - **CHANGES NEEDED** — one or more real findings: **read the `rework-handoff`
-  skill (`read_skill("rework-handoff")`) and wire the send-back EXACTLY as it
+  blueprint (`load_blueprint("rework-handoff")`) and wire the send-back EXACTLY as it
   says** before you do anything else. In short: file one fix ticket per finding
   (assigned to the dev, `file:line` + scenario + severity), then re-block a
   ticket assigned to YOU on those fix tickets so you re-review after the fix —
