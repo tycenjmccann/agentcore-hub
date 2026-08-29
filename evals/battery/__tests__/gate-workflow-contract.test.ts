@@ -121,12 +121,56 @@ describe("battery job — trusted-base harness (TRUST-1)", () => {
         /thresholds\.json|baseline\.json|evals\/battery\/schema/,
       );
     }
-    // Positive shape: the candidate config paths the gate exists to test.
+    // Positive shape: the candidate config paths the gate exists to test,
+    // plus the battery corpus DATA (TEAM-3438 Finding 2) — a PR editing a
+    // case/fixture/manifest must be scored against ITS corpus, not base's.
+    // resolveGateConfig still takes the gating knobs from the base ref, so
+    // the overlaid corpus cannot drop/retire/soften a base-active case.
     expect(dirs).toContain("deploy/runtime-agent/prompts");
     expect(dirs).toContain("deploy/workflow-manager");
     expect(dirs).toContain("blueprints");
+    expect(dirs).toContain("evals/battery/cases");
+    expect(dirs).toContain("evals/battery/fixtures");
     expect(files).toContain("src/config/workflows.json");
     expect(files).toContain("src/config/agents.json");
+    expect(files).toContain("evals/battery/manifest.json");
+  });
+
+  it("pr-head sparse checkout materializes corpus DATA but never battery code (TEAM-3438)", () => {
+    const head = checkouts[1];
+    // Non-cone mode: cone patterns are directory-only and would drag every
+    // immediate file of listed dirs' parents (runner, lockfiles) into pr-head.
+    expect(head).toContain("sparse-checkout-cone-mode: false");
+    for (const pattern of [
+      "/deploy/runtime-agent/prompts/",
+      "/deploy/workflow-manager/",
+      "/blueprints/",
+      "/src/config/",
+      "/evals/battery/cases/",
+      "/evals/battery/fixtures/",
+      "/evals/battery/manifest.json",
+    ])
+      expect(head).toContain(pattern);
+    expect(head).not.toMatch(/evals\/battery\/lib/);
+    // No blanket battery pattern that would sweep in the runner and rules.
+    expect(head).not.toMatch(/^\s*\/?evals\/battery\/?\s*$/m);
+  });
+
+  it("overlay REJECTS symlinks/non-regular head files before any copy (TEAM-3438)", () => {
+    // cp -R preserves symlinks, so a head-committed symlink under an overlaid
+    // path would alias a file outside the overlay (e.g. /proc/self/environ
+    // once OIDC creds exist) into the battery's model payload. The guard must
+    // run before the first cp and fail the job rather than dereference.
+    const guard = battery.indexOf("-type l");
+    const firstCopy = battery.indexOf("cp -R");
+    expect(guard, "battery overlay carries a -type l find rejection").toBeGreaterThan(-1);
+    expect(firstCopy).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(firstCopy);
+    // Single-file entries need an explicit -L test: plain -f follows links.
+    expect(battery).toMatch(/\[ -L "pr-head\/\$f" \]/);
+    // Detection is fatal, inside the guard block (before any copy).
+    const block = battery.slice(guard, firstCopy);
+    expect(block).toContain("exit 1");
   });
 
   it("pr-head/ is deleted after the overlay so nothing later can reach head code", () => {
@@ -142,17 +186,19 @@ describe("battery job — trusted-base harness (TRUST-1)", () => {
 });
 
 describe("check publication restrictions (CRED-2 — same-repo-only gate)", () => {
-  it("fork-guard publishes nothing: no checks:write, no checks.create — it fails the job instead", () => {
-    const fg = job("fork-guard");
+  it("fork-notice publishes nothing: no checks:write, no checks.create — the trusted publisher posts the check (TEAM-3438)", () => {
+    const fn = job("fork-notice");
     // A fork run's read-only GITHUB_TOKEN cannot create check runs, so any
     // reappearing checks.create here would be a silent 403, not a guard.
-    expect(fg).not.toMatch(/^\s*checks:\s*write/m);
-    expect(fg).not.toContain("checks.create");
-    expect(fg).toContain("permissions: {}");
-    expect(fg).toContain(
+    expect(fn).not.toMatch(/^\s*checks:\s*write/m);
+    expect(fn).not.toContain("checks.create");
+    expect(fn).toContain("permissions: {}");
+    expect(fn).toContain(
       "github.event.pull_request.head.repo.full_name != github.repository",
     );
-    expect(fg).toContain("exit 1");
+    // Informational: never exit 1 — for gated fork PRs the merge block is the
+    // trusted fork publisher's explicit FAILURE check.
+    expect(fn).not.toMatch(/^\s*exit 1\s*$/m);
   });
 
   it("skip-publish is same-repo-only (fork ungated PRs stay blocked by check absence)", () => {

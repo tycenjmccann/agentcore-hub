@@ -16,9 +16,11 @@
 //           PR may hold checks:write or call checks.create; check publication
 //           (publish / skip-publish) is same-repo only, and the fork jobs run
 //           with permissions: {}.
-import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { describe, it, expect, afterEach } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
@@ -28,10 +30,18 @@ const workflow = parse(
 );
 const jobs: Record<string, any> = workflow.jobs;
 
-// The exact candidate-config allowlist the gate exists to score (FR-2.2).
+// The exact candidate allowlist the gate exists to score (FR-2.2): candidate
+// config plus, since TEAM-3438 Finding 2, the battery corpus DATA (cases,
+// fixtures, manifest) — read by the base harness, never imported or executed.
 // Keep in sync with the overlay step AND the gated-path list in changed-paths.
-const OVERLAY_DIRS = ["deploy/runtime-agent/prompts", "deploy/workflow-manager", "blueprints"];
-const OVERLAY_FILES = ["src/config/workflows.json", "src/config/agents.json"];
+const OVERLAY_DIRS = [
+  "deploy/runtime-agent/prompts",
+  "deploy/workflow-manager",
+  "blueprints",
+  "evals/battery/cases",
+  "evals/battery/fixtures",
+];
+const OVERLAY_FILES = ["src/config/workflows.json", "src/config/agents.json", "evals/battery/manifest.json"];
 
 const SAME_REPO = "github.event.pull_request.head.repo.full_name == github.repository";
 const FORK_ONLY = "github.event.pull_request.head.repo.full_name != github.repository";
@@ -83,9 +93,75 @@ describe("battery job — harness from trusted base (HERM-3)", () => {
     const sources = run.match(/pr-head\/[^\s"']*/g) ?? [];
     expect(sources.length).toBeGreaterThan(0);
     for (const src of sources) expect(["pr-head/$dir", "pr-head/$f"]).toContain(src);
-    // Executable/harness paths must never appear as overlay sources.
-    for (const forbidden of ["evals/battery", ".github", "package.json", "package-lock.json"])
+    // Executable/harness paths and the gate's own rules must never appear as
+    // overlay sources. (Corpus DATA under evals/battery — cases, fixtures,
+    // manifest.json — is legitimately overlaid since TEAM-3438 Finding 2, so
+    // the forbidden list names the battery's code and rule files precisely.)
+    for (const forbidden of [
+      "evals/battery/lib",
+      "run-battery",
+      "evals/battery/schema",
+      "thresholds.json",
+      "baseline.json",
+      ".github",
+      "package.json",
+      "package-lock.json",
+    ])
       expect(run, `overlay must not reference ${forbidden}`).not.toContain(forbidden);
+  });
+
+  it("sparse-checks-out exactly what the overlay allowlist needs — never battery code (TEAM-3438)", () => {
+    const side = checkouts.filter((s) => s.with?.path);
+    // Non-cone mode: cone patterns are directory-only and pull in parent-dir
+    // files, which would put the runner and lib/ inside pr-head.
+    expect(side[0].with?.["sparse-checkout-cone-mode"]).toBe(false);
+    const patterns = String(side[0].with?.["sparse-checkout"] ?? "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const covers = (pattern: string, path: string) => {
+      const p = pattern.replace(/^\//, "").replace(/\/$/, "");
+      return p === path || path.startsWith(`${p}/`);
+    };
+    // Every overlay source must actually exist in pr-head…
+    for (const entry of [...OVERLAY_DIRS, ...OVERLAY_FILES])
+      expect(patterns.some((p) => covers(p, entry)), `sparse-checkout must cover ${entry}`).toBe(true);
+    // …and nothing executable or rule-bearing may be materialized there.
+    for (const path of [
+      "evals/battery/lib",
+      "evals/battery/run-battery.mjs",
+      "evals/battery/schema",
+      "evals/battery/thresholds.json",
+      "evals/battery/baseline.json",
+      ".github",
+      "package.json",
+      "package-lock.json",
+    ])
+      expect(patterns.some((p) => covers(p, path)), `sparse-checkout must not cover ${path}`).toBe(false);
+  });
+
+  it("rejects symlinks and non-regular PR-head files BEFORE any copy (TEAM-3438)", () => {
+    const run: string = overlay.run;
+    // The guard must sit before the first copy so nothing PR-controlled
+    // crosses the boundary once a symlink/special file is present anywhere.
+    const guardIdx = run.indexOf("-type l");
+    // The literal copy command, not just "cp -R" — the guard's own trust
+    // comment legitimately mentions cp -R.
+    const firstCopyIdx = run.indexOf('cp -R "pr-head/$dir"');
+    expect(guardIdx, "overlay must contain a -type l find rejection").toBeGreaterThan(-1);
+    expect(firstCopyIdx).toBeGreaterThan(-1);
+    expect(guardIdx).toBeLessThan(firstCopyIdx);
+    // Deep scan iterates the SAME OVERLAY_DIRS array the copy loop uses, so
+    // future allowlist additions are covered automatically; the predicate
+    // rejects symlinks and anything neither regular file nor directory.
+    expect(run).toMatch(/find "pr-head\/\$dir" \\\( -type l -o ! -type d ! -type f \\\) -print/);
+    // Single-file entries: -f follows symlinks, so an explicit -L test is
+    // required to reject a symlink that points at a regular file.
+    expect(run).toMatch(/\[ -L "pr-head\/\$f" \]/);
+    // Detection is fatal — the job fails visibly instead of dereferencing.
+    const guardBlock = run.slice(guardIdx, firstCopyIdx);
+    expect(guardBlock).toContain("::error::");
+    expect(guardBlock).toMatch(/^\s*exit 1\s*$/m);
   });
 
   it("deletes pr-head in the overlay step, before the battery runs", () => {
@@ -102,6 +178,106 @@ describe("battery job — harness from trusted base (HERM-3)", () => {
     expect(String(battery.if)).toContain(SAME_REPO);
     expect(String(battery.if)).toContain("gated == 'true'");
     expect(battery.permissions ?? {}).not.toHaveProperty("checks");
+  });
+});
+
+describe("overlay symlink rejection — the real inline script, executed (TEAM-3438)", () => {
+  // Same subprocess pattern as lint-fixtures.test.ts: run the EXACT bash the
+  // workflow runs (the overlay step's `run` block, straight from the parsed
+  // YAML) against a throwaway workspace, so the guard is tested as code, not
+  // just pinned as text. No AWS, no network.
+  const overlayRun: string = steps(jobs.battery).find((s) => /overlay/i.test(String(s.name ?? "")))!.run;
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
+  });
+
+  function workspace(): string {
+    const root = mkdtempSync(join(tmpdir(), "gate-overlay-"));
+    roots.push(root);
+    return root;
+  }
+
+  function write(root: string, rel: string, content: string): void {
+    mkdirSync(join(root, dirname(rel)), { recursive: true });
+    writeFileSync(join(root, rel), content);
+  }
+
+  function runOverlay(root: string): { code: number; output: string } {
+    try {
+      const output = execFileSync("bash", ["-c", overlayRun], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, HEAD_SHA: "headsha", BASE_SHA: "basesha" },
+      });
+      return { code: 0, output };
+    } catch (err: any) {
+      return { code: err.status ?? 1, output: `${err.stdout || ""}${err.stderr || ""}` };
+    }
+  }
+
+  it("fails the job on a symlink inside an overlaid directory, copying nothing", () => {
+    const root = workspace();
+    write(root, "deploy/runtime-agent/prompts/base.txt", "base prompt");
+    mkdirSync(join(root, "pr-head/deploy/runtime-agent/prompts"), { recursive: true });
+    symlinkSync("/proc/self/environ", join(root, "pr-head/deploy/runtime-agent/prompts/evil.txt"));
+    const { code, output } = runOverlay(root);
+    expect(code).toBe(1);
+    expect(output).toContain("::error::");
+    expect(output).toContain("pr-head/deploy/runtime-agent/prompts/evil.txt");
+    // Guard fired before the copy loops: the base file was never clobbered.
+    expect(readFileSync(join(root, "deploy/runtime-agent/prompts/base.txt"), "utf8")).toBe("base prompt");
+  });
+
+  it("fails on a symlink at a single-file overlay entry, even one pointing at a regular file", () => {
+    const root = workspace();
+    write(root, "pr-head/decoy.json", "{}"); // regular target — plain -f would pass
+    mkdirSync(join(root, "pr-head/src/config"), { recursive: true });
+    symlinkSync(join(root, "pr-head/decoy.json"), join(root, "pr-head/src/config/workflows.json"));
+    const { code, output } = runOverlay(root);
+    expect(code).toBe(1);
+    expect(output).toContain("pr-head/src/config/workflows.json");
+  });
+
+  it("fails on a symlink planted under the battery corpus overlay (Finding 2 dirs are guarded too)", () => {
+    // The guard iterates OVERLAY_DIRS, so the corpus paths added by TEAM-3438
+    // Finding 2 must be covered without any guard change.
+    const root = workspace();
+    mkdirSync(join(root, "pr-head/evals/battery/cases"), { recursive: true });
+    symlinkSync("/proc/self/environ", join(root, "pr-head/evals/battery/cases/evil.json"));
+    const { code, output } = runOverlay(root);
+    expect(code).toBe(1);
+    expect(output).toContain("::error::");
+    expect(output).toContain("pr-head/evals/battery/cases/evil.json");
+  });
+
+  it("fails when an allowlisted directory itself is a symlink", () => {
+    const root = workspace();
+    mkdirSync(join(root, "pr-head/deploy/runtime-agent"), { recursive: true });
+    symlinkSync("/etc", join(root, "pr-head/deploy/runtime-agent/prompts"));
+    const { code } = runOverlay(root);
+    expect(code).toBe(1);
+  });
+
+  it("passes a clean head: regular files overlay and pr-head is removed", () => {
+    const root = workspace();
+    write(root, "deploy/runtime-agent/prompts/stale.txt", "deleted at head");
+    write(root, "pr-head/deploy/runtime-agent/prompts/new.txt", "candidate prompt");
+    write(root, "pr-head/src/config/workflows.json", "{}");
+    // Battery corpus data (TEAM-3438 Finding 2) overlays the same way.
+    write(root, "evals/battery/cases/stale-case.json", "deleted at head");
+    write(root, "pr-head/evals/battery/cases/new-case.json", '{"id":"new-case"}');
+    write(root, "pr-head/evals/battery/manifest.json", '{"activeCases":["new-case"]}');
+    const { code, output } = runOverlay(root);
+    expect(code, output).toBe(0);
+    expect(readFileSync(join(root, "deploy/runtime-agent/prompts/new.txt"), "utf8")).toBe("candidate prompt");
+    expect(existsSync(join(root, "deploy/runtime-agent/prompts/stale.txt"))).toBe(false);
+    expect(readFileSync(join(root, "src/config/workflows.json"), "utf8")).toBe("{}");
+    expect(readFileSync(join(root, "evals/battery/cases/new-case.json"), "utf8")).toBe('{"id":"new-case"}');
+    expect(existsSync(join(root, "evals/battery/cases/stale-case.json"))).toBe(false);
+    expect(readFileSync(join(root, "evals/battery/manifest.json"), "utf8")).toBe('{"activeCases":["new-case"]}');
+    expect(existsSync(join(root, "pr-head"))).toBe(false);
   });
 });
 
@@ -122,22 +298,25 @@ describe("fork safety — no fork-reachable job can touch checks.create (CRED-2)
       expect(job.permissions?.checks).toBe("write");
   });
 
-  it("fork-guard fails visibly for gated-or-undetermined fork PRs, with zero permissions", () => {
-    const guard = jobs["fork-guard"];
-    expect(String(guard.if)).toContain(FORK_ONLY);
-    // `gated != 'false'` (not == 'true'): a failed path detection must still
-    // fail visibly for a fork PR (fail closed).
-    expect(String(guard.if)).toContain("gated != 'false'");
-    expect(guard.permissions).toEqual({});
-    expect(stepCode(guard)).toMatch(/^\s*exit 1\s*$/m);
-  });
-
-  it("fork-notice covers ungated fork PRs informationally, with zero permissions", () => {
+  it("fork-notice covers ALL fork PRs informationally, with zero permissions (TEAM-3438)", () => {
     const notice = jobs["fork-notice"];
     expect(String(notice.if)).toContain(FORK_ONLY);
-    expect(String(notice.if)).toContain("gated == 'false'");
+    // always() and NO gated condition: gated, ungated, and undetermined fork
+    // PRs all get the in-run explanation. The actual check (FAILURE when
+    // gated, SKIPPED success when not) comes from the trusted fork publisher.
+    expect(String(notice.if)).toContain("always()");
+    expect(String(notice.if)).not.toContain("gated ==");
+    expect(String(notice.if)).not.toContain("gated !=");
     expect(notice.permissions).toEqual({});
+    // Informational only — the merge block for gated fork PRs is the
+    // publisher's explicit FAILURE check (or the required check's absence if
+    // even that publish failed), never this job's exit status.
     expect(stepCode(notice)).not.toMatch(/^\s*exit 1\s*$/m);
+    expect(stepCode(notice)).toContain("config-evals-gate-fork-publish.yml");
+  });
+
+  it("the old exit-1 fork-guard job is gone (replaced by fork-notice + the trusted publisher)", () => {
+    expect(jobs["fork-guard"]).toBeUndefined();
   });
 });
 
