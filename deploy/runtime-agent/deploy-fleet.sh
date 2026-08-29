@@ -12,6 +12,7 @@
 #
 # Usage:
 #   ./deploy-fleet.sh [--region us-east-1] [--role-arn arn:aws:iam::ACCOUNT:role/X]
+#                     [--force --force-reason '<incident>: <why>']
 #
 
 set -e
@@ -19,7 +20,10 @@ set -e
 # Source project env vars (GITHUB_PAT, etc.) so agents get MCP access
 ENV_FILE="$(cd "$(dirname "$0")/../.." && pwd)/.env.local"
 if [ -f "$ENV_FILE" ]; then
-  set -a; source "$ENV_FILE"; set +a
+  set -a
+  # shellcheck disable=SC1090 # user-local env file, resolved at runtime
+  source "$ENV_FILE"
+  set +a
   echo "Loaded env from $ENV_FILE"
 fi
 
@@ -28,7 +32,49 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$SCRIPT_DIR"
 DEPLOY_MODE="${DEPLOY_MODE:-lightweight}"
 
+# CLI break-glass (TEAM-3426): extract --force/--force-reason BEFORE the gate
+# runs so the exports are visible to require_eval_gate below (and to every
+# child deploy-one.sh). Sugar for the audited EVAL_GATE_OVERRIDE env vars —
+# same banner/S3+local audit path — not a second override mechanism. Other
+# args pass through to the main parse loop further down.
+FORCE_REQUESTED=0
+FLEET_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force)
+      FORCE_REQUESTED=1
+      shift
+      ;;
+    --force-reason)
+      if [ $# -lt 2 ]; then
+        echo "ERROR: --force-reason requires a value" >&2
+        exit 1
+      fi
+      export EVAL_GATE_OVERRIDE_REASON="$2"
+      shift 2
+      ;;
+    --force-reason=*)
+      export EVAL_GATE_OVERRIDE_REASON="${1#--force-reason=}"
+      shift
+      ;;
+    *)
+      FLEET_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+if [ "$FORCE_REQUESTED" = "1" ]; then
+  if [ -z "${EVAL_GATE_OVERRIDE_REASON:-}" ]; then
+    echo "ERROR: --force requires a non-empty reason — pass --force-reason '<incident>: <why>' (or set EVAL_GATE_OVERRIDE_REASON). An unexplained override is refused (BG-2)." >&2
+    exit 1
+  fi
+  export EVAL_GATE_OVERRIDE=1
+  echo "⚠️  EVAL-GATE BREAK-GLASS REQUESTED VIA --force (reason: ${EVAL_GATE_OVERRIDE_REASON}) — if the gate refuses, the override will be audited (banner + S3 + local log) before proceeding." >&2
+fi
+set -- ${FLEET_ARGS[@]+"${FLEET_ARGS[@]}"}
+
 # Eval gate (FR-7): refuse to ship ungated prompt/agents.json changes.
+# shellcheck disable=SC1091 # resolved relative to this script at runtime
 source "$SCRIPT_DIR/../lib/check-eval-gate.sh"
 require_eval_gate "deploy/runtime-agent/prompts/**" "src/config/agents.json"
 
@@ -36,6 +82,7 @@ require_eval_gate "deploy/runtime-agent/prompts/**" "src/config/agents.json"
 if [ -z "${AGENTCORE_ROLE_ARN:-}" ]; then
   echo "AGENTCORE_ROLE_ARN not set — creating runtime role..."
   echo ""
+  # shellcheck disable=SC1091 # resolved relative to this script at runtime
   source "$SCRIPT_DIR/../setup-runtime-role.sh"
   echo ""
 fi
@@ -167,13 +214,13 @@ echo "════════════════════════�
 echo ""
 echo "Environment variables for orchestrator Lambda:"
 echo "───────────────────────────────────────────────"
-cat "$RESULTS_FILE" | python3 -c "
+python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 for name, arn in data.items():
     env_key = 'RUNTIME_ARN_' + name.upper()
     print(f'{env_key}={arn}')
-"
+" < "$RESULTS_FILE"
 
 # Sync agents.json + fleet-runtime-ids.json from AWS. Delegating to the
 # standalone refresh script keeps a single source of truth for this logic

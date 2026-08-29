@@ -499,6 +499,11 @@ before its first S3 write or docker build. Semantics against HEAD:
 
 - **Green** `config-evals-gate` check → deploy proceeds (latched in
   `EVAL_GATE_CHECKED` so a 14-agent fleet fan-out queries GitHub once).
+  Only a REAL battery pass (check title `PASS — config evals battery held
+  the baseline`) counts: a success check titled `SKIPPED — no gated paths
+  changed` means the battery never ran and is treated exactly like an
+  **absent** check — it never latches, never anchors the ancestor scan, and
+  never green-lights HEAD.
 - **Queued/in-progress** → refused: wait for the gate.
 - **Failure/cancelled/timed-out** → refused, with the check URL and the
   failing evaluator lines from the summary.
@@ -513,7 +518,13 @@ before its first S3 write or docker build. Semantics against HEAD:
   committed, gated state only.
 
 Break-glass (audited — BG-2/BG-3): set **both** `EVAL_GATE_OVERRIDE=1` and a
-non-empty `EVAL_GATE_OVERRIDE_REASON`. The override prints a loud banner and
+non-empty `EVAL_GATE_OVERRIDE_REASON` — or, on the runtime-agent deploy
+scripts (`deploy.sh`, `deploy-one.sh`, `deploy-fleet.sh`), pass the CLI
+equivalent `--force --force-reason "INC-123: why"`, which exports the same
+two env vars and routes through the SAME audited path (there is no second
+override mechanism). `--force` without a reason is refused, and gated
+scripts that take no CLI args reject `--force` with an error pointing at the
+env form. The override prints a loud banner and
 writes `{timestamp, sha, identity (STS caller ARN), script, reason}` to
 `s3://$ARTIFACT_BUCKET/eval-gate/overrides/<ts>-<sha>.txt` **and**
 `.eval-gate-overrides.log` (gitignored). If the S3 write fails you must type
