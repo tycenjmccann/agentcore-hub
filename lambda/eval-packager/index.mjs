@@ -144,6 +144,18 @@ export const handler = async (event) => {
   // Extract session data from log events (enriched with parsed evaluator results)
   const sessionData = extractSessionData(parsed);
 
+  // TEAM-3427 / NFR-1.3: a battery-only (or otherwise empty) delivery must leave
+  // ZERO buffer entries — appending the empty envelope would still list_append
+  // into sessionBuffer and grow the DDB item on every delivery. Only skip when
+  // NOTHING was retained: parse-error records land in evaluatorResults, so a
+  // delivery carrying them still buffers as before.
+  if (sessionData.evaluatorResults.length === 0 && sessionData.sessionIds.length === 0) {
+    console.log(
+      `[eval-packager] Agent ${agentId}: nothing retained after battery filter — skipping buffer write.`
+    );
+    return { statusCode: 200, body: 'battery-filtered' };
+  }
+
   // 5. Aggregate eval scores into DDB (for instant dashboard loads)
   await aggregateScoresToDdb(agentId, parsed);
 
@@ -312,7 +324,10 @@ export async function aggregateScoresToDdb(agentId, parsed) {
       const attrs = record.attributes || {};
       const evaluator = attrs['gen_ai.evaluation.name'];
       const score = attrs['gen_ai.evaluation.score.value'];
-      const sessionId = attrs['session.id'] || '';
+      // TEAM-3427: resolve the session id with the same attributes-or-top-level
+      // fallback extractSessionData uses — a battery record in the legacy
+      // top-level shape must hit the guard below, not slip past it with ''.
+      const sessionId = attrs['session.id'] || record['session.id'] || '';
       // TEAM-3390: earliest-possible skip for battery sessions — they must never
       // count toward the per-agent session total or evaluator score aggregates
       // the dashboard reads (mirrors the TEAM-3090 guard in extractSessionData).
