@@ -8,13 +8,16 @@
 #   ./deploy.sh 10                  # Deploy agent #10 (agentcore_hub_backend_dev)
 #   ./deploy.sh 10 11 12            # Deploy agents #10, #11, #12
 #   ./deploy.sh backend_dev api_dev # Deploy by name
-#   ./deploy.sh --force --force-reason 'INC-123: why' 10
+#   ./deploy.sh --force --force-reason "INC-1: hotfix" backend_dev
 #                                   # Audited eval-gate break-glass (CLI form of
 #                                   # EVAL_GATE_OVERRIDE=1 + EVAL_GATE_OVERRIDE_REASON)
 #
 # Environment:
 #   AWS_PROFILE    — Which AWS profile to use (required)
 #   GATEWAY_ARN    — Override gateway ARN (optional, auto-detected if not set)
+#   EVAL_GATE_OVERRIDE / EVAL_GATE_OVERRIDE_REASON
+#                  — env-var form of --force / --force-reason; both routes end
+#                    up in the same audited break-glass helper
 #
 # The script sources deploy/config.sh which derives ACCOUNT_ID, ROLE_ARN,
 # and ARTIFACT_BUCKET from your active AWS credentials.
@@ -24,6 +27,14 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Break-glass flag parsing (TEAM-3426 FINDING 4) — one shared parser with
+# deploy-one.sh so the two can't drift, and one place that documents the flags.
+# Sourced early: it needs no AWS creds, so --help/--list and bad-flag errors all
+# work without credentials.
+# shellcheck disable=SC1091 # resolved relative to this script at runtime
+source "$REPO_ROOT/deploy/lib/parse-force-args.sh" \
+  || { echo "FATAL: cannot load arg parser ($REPO_ROOT/deploy/lib/parse-force-args.sh) — refusing to deploy ungated" >&2; exit 1; }
 
 # Agent list — numbered 1-15
 AGENTS=(
@@ -44,88 +55,60 @@ AGENTS=(
   "agentcore_hub_ci_agent"               # 15
 )
 
-# --- Handle flags early (no AWS creds needed) ---
-# --force/--force-reason (TEAM-3426) are CLI sugar for the audited eval-gate
-# break-glass env vars (EVAL_GATE_OVERRIDE=1 + EVAL_GATE_OVERRIDE_REASON) —
-# same banner/S3+local audit path, not a second override mechanism. They are
-# parsed before config.sh so the exports reach require_eval_gate below and
-# every child deploy-one.sh, and are stripped from the positional args used
-# for target resolution. Unknown flags are rejected so a misspelled flag is
-# never misparsed as an agent name.
-FORCE_REQUESTED=0
-POSITIONAL=()
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --list | -l)
-      echo "Agent fleet:"
-      for i in "${!AGENTS[@]}"; do
-        printf "  %2d  %s\n" $((i+1)) "${AGENTS[$i]}"
-      done
-      exit 0
-      ;;
-    --help | -h)
-      echo "Usage: ./deploy.sh [--force --force-reason '<incident>: <why>'] [agents...]"
-      echo ""
-      echo "  No args        Deploy all 14 agents"
-      echo "  <number>       Deploy by index (1-14)"
-      echo "  <name>         Deploy by name (agentcore_hub_ prefix optional)"
-      echo "  --list, -l     Show numbered agent list"
-      echo "  --force        Audited eval-gate break-glass — requires a reason via"
-      echo "                 --force-reason (or EVAL_GATE_OVERRIDE_REASON). Equivalent to"
-      echo "                 EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON='...' ./deploy.sh:"
-      echo "                 same loud banner, S3 + local audit log, and refusal when no"
-      echo "                 durable audit sink is available."
-      echo "  --force-reason <reason>   Why the gate is being overridden (e.g. 'INC-123: ...')"
-      echo ""
-      echo "Examples:"
-      echo "  ./deploy.sh 10              # backend_dev"
-      echo "  ./deploy.sh 10 11 12        # backend_dev, api_dev, frontend_dev"
-      echo "  ./deploy.sh backend_dev     # by name"
-      echo "  ./deploy.sh ios_designer    # agentcore_hub_ prefix is optional"
-      echo "  ./deploy.sh --force --force-reason 'INC-123: gate red on unrelated case' 10"
-      exit 0
-      ;;
-    --force)
-      FORCE_REQUESTED=1
-      shift
-      ;;
-    --force-reason)
-      if [ $# -lt 2 ]; then
-        echo "ERROR: --force-reason requires a value — see ./deploy.sh --help" >&2
-        exit 1
-      fi
-      export EVAL_GATE_OVERRIDE_REASON="$2"
-      shift 2
-      ;;
-    --force-reason=*)
-      export EVAL_GATE_OVERRIDE_REASON="${1#--force-reason=}"
-      shift
-      ;;
-    -*)
-      echo "ERROR: unknown flag '$1' — see ./deploy.sh --help" >&2
-      exit 1
-      ;;
-    *)
-      POSITIONAL+=("$1")
-      shift
-      ;;
-  esac
-done
-if [ "$FORCE_REQUESTED" = "1" ]; then
-  if [ -z "${EVAL_GATE_OVERRIDE_REASON:-}" ]; then
-    echo "ERROR: --force requires a non-empty reason — pass --force-reason '<incident>: <why>' (or set EVAL_GATE_OVERRIDE_REASON). An unexplained override is refused (BG-2)." >&2
-    exit 1
+# --- Handle --list and --help early (no AWS creds needed) ---
+for arg in "$@"; do
+  if [ "$arg" = "--list" ] || [ "$arg" = "-l" ]; then
+    echo "Agent fleet:"
+    for i in "${!AGENTS[@]}"; do
+      printf "  %2d  %s\n" $((i+1)) "${AGENTS[$i]}"
+    done
+    exit 0
+  elif [ "$arg" = "--help" ] || [ "$arg" = "-h" ]; then
+    echo "Usage: ./deploy.sh [--force --force-reason \"<why>\"] [agents...]"
+    echo ""
+    echo "  No args               Deploy all 14 agents"
+    echo "  <number>              Deploy by index (1-14)"
+    echo "  <name>                Deploy by name (agentcore_hub_ prefix optional)"
+    echo "  --list, -l            Show numbered agent list"
+    eval_gate_force_usage_lines
+    echo ""
+    echo "Examples:"
+    echo "  ./deploy.sh 10              # backend_dev"
+    echo "  ./deploy.sh 10 11 12        # backend_dev, api_dev, frontend_dev"
+    echo "  ./deploy.sh backend_dev     # by name"
+    echo "  ./deploy.sh ios_designer    # agentcore_hub_ prefix is optional"
+    echo "  ./deploy.sh --force --force-reason 'INC-1: hotfix' backend_dev"
+    exit 0
   fi
-  export EVAL_GATE_OVERRIDE=1
-  echo "⚠️  EVAL-GATE BREAK-GLASS REQUESTED VIA --force (reason: ${EVAL_GATE_OVERRIDE_REASON}) — if the gate refuses, the override will be audited (banner + S3 + local log) before proceeding." >&2
+done
+# --- Break-glass flags (TEAM-3426 FINDING 4) ---
+# On --force this exports EVAL_GATE_OVERRIDE=1 + EVAL_GATE_OVERRIDE_REASON before
+# the gate runs, so the override goes through the SAME audited
+# _eval_gate_break_glass path as the env-var form. Any unknown --flag is rejected
+# here rather than falling through to the agent-name loop below (which used to
+# report it as an "Unknown agent"). Parsed before config.sh so a bad flag is
+# caught without AWS creds.
+parse_force_args "$@" || {
+  echo "Run ./deploy.sh --help for usage." >&2
+  exit 1
+}
+# Because the exports are inherited, the override also reaches the deploy-one.sh
+# children spawned below — no flag forwarding needed.
+if [ "${#FORCE_ARGS_POSITIONAL[@]}" -gt 0 ]; then
+  set -- "${FORCE_ARGS_POSITIONAL[@]}"
+else
+  set --
 fi
-set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
 
 # --- Source config (derives ACCOUNT_ID, ROLE_ARN, BUCKET from credentials) ---
 # shellcheck disable=SC1091 # resolved relative to this script at runtime
 source "$REPO_ROOT/deploy/config.sh"
 
 # Eval gate (FR-7): this script ships per-agent prompts via deploy-one.sh.
+# This call is where an override is actually spent: it does the audited
+# break-glass here and then latches, so the deploy-one.sh children short-circuit
+# on the latch token (loudly, once) instead of re-auditing per agent. That is
+# the designed behavior — see check-eval-gate.sh's latch notes.
 # shellcheck disable=SC1091 # resolved relative to this script at runtime
 source "$REPO_ROOT/deploy/lib/check-eval-gate.sh"
 require_eval_gate "deploy/runtime-agent/prompts/**"

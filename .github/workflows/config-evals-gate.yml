@@ -12,6 +12,21 @@
 # Path detection FAILS CLOSED: if changed-paths cannot list the PR's files,
 # the PR is treated as gated (publish/fork-guard use `gated != 'false'`).
 #
+# Machine-readable verdict marker (TEAM-3426): because the SKIPPED check above
+# is a SUCCESS, `conclusion == "success"` alone does NOT prove the tree was
+# evaluated. EVERY check run published here therefore starts its output summary
+# with a single marker line
+#
+#   config-evals-gate-verdict: PASS | SKIPPED | FAIL | ERRORED
+#
+# (fork PRs get no check at all — CRED-2 below — so every published check
+# carries a marker). Consumers (deploy/lib/check-eval-gate.sh) can then tell a
+# real battery PASS apart from a skipped success without parsing prose. The marker is prepended
+# BEFORE the 60000-char slice so it can never be truncated away. Never change
+# the marker's spelling or move it off the first line without updating the
+# deploy guard — it fails closed on an unrecognizable success, so a broken
+# marker blocks deploys rather than letting them through.
+#
 # Hardened per the TEAM-3066 security review (TRUST-1 added and CRED-2
 # reworked by TEAM-3425):
 #   HERM-1  The job that runs the battery has NO checks:write and no on-disk
@@ -372,8 +387,13 @@ jobs:
             // "failure".
             let conclusion = "failure";
             let title;
+            // Machine-readable verdict for the deploy guard (TEAM-3426). PASS
+            // is the ONLY value that proves the battery ran and held; every
+            // other branch below sets FAIL or ERRORED.
+            let verdict = "FAIL";
             if (results && results.verdict === "PASS" && jobResult === "success") {
               conclusion = "success";
+              verdict = "PASS";
               title = "PASS — config evals battery held the baseline";
             } else if (jobResult === "skipped" && pathsResult !== "success") {
               // The battery only skips inside this job's `if` when
@@ -389,6 +409,7 @@ jobs:
             } else if (!results) {
               // Infra death before results existed — ERRORED, not a score FAIL.
               // Conclusion stays "failure" (fail closed; never neutral).
+              verdict = "ERRORED";
               title = `ERRORED — no battery results (battery job: ${jobResult})`;
               summaryMd = summaryMd ||
                 `The battery job finished with status \`${jobResult}\` and produced no ` +
@@ -397,10 +418,15 @@ jobs:
             } else if (results.verdict === "ERRORED") {
               // Battery ran but infra/timeout corrupted cases — distinct from a
               // score-based FAIL so operators re-run instead of chasing scores.
+              verdict = "ERRORED";
               title = `ERRORED — infra/timeout during battery (battery job: ${jobResult})`;
             } else {
               title = `FAIL — battery verdict ${results.verdict} (battery job: ${jobResult})`;
             }
+
+            // Marker FIRST, then slice: the deploy guard reads the marker line
+            // and must never lose it to truncation of a long battery summary.
+            const summary = `config-evals-gate-verdict: ${verdict}\n\n${summaryMd || title}`;
 
             await github.rest.checks.create({
               owner: context.repo.owner,
@@ -411,7 +437,7 @@ jobs:
               conclusion,
               output: {
                 title,
-                summary: (summaryMd || title).slice(0, 60000),
+                summary: summary.slice(0, 60000),
               },
             });
 
@@ -481,7 +507,11 @@ jobs:
               conclusion: "success",
               output: {
                 title: "SKIPPED — no gated paths changed",
-                summary: "This PR touches none of the gated paths (prompts, workflow/agent " +
+                // The marker line is what stops deploy/lib/check-eval-gate.sh
+                // from reading this SUCCESS as proof the tree was evaluated
+                // (TEAM-3426 FINDING 3 — it proves nothing of the sort).
+                summary: "config-evals-gate-verdict: SKIPPED\n\n" +
+                  "This PR touches none of the gated paths (prompts, workflow/agent " +
                   "config, blueprints, eval battery, or the gate workflows themselves), so " +
                   "the config evals battery did not run. This success check exists so " +
                   "`config-evals-gate` can be a required status check in branch protection " +

@@ -16,12 +16,13 @@ import { join, resolve } from "node:path";
  * bash subprocesses, throwaway git fixture repos, PATH-shimmed fake `gh`/`aws`.
  *
  * Findings under test:
- *   Finding 3 (P1, gate bypass) — a `conclusion=success` check whose
- *     output.title starts with "SKIPPED" (the workflow's skip-publish check
- *     for PRs touching no gated path) is NOT evaluation evidence: it must
- *     never latch, never anchor the belt scan, and never green-light HEAD.
- *     A success with no output payload at all stays a real green (the
- *     original gh-shim contract).
+ *   Finding 3 (P1, gate bypass) — a `conclusion=success` check identified as
+ *     SKIPPED (the workflow's skip-publish check for PRs touching no gated
+ *     path) is NOT evaluation evidence: it must never latch, never anchor the
+ *     belt scan, and never green-light HEAD. Only a success carrying the
+ *     `config-evals-gate-verdict: PASS` marker (or, pre-marker, a title
+ *     starting with PASS) is green; a success with no output payload at all
+ *     fails CLOSED and reads as absent.
  *   Finding 4 (P3, contract gap) — --force / --force-reason CLI break-glass
  *     on the runtime-agent deploy scripts routes to the SAME audited
  *     EVAL_GATE_OVERRIDE path; --force without a reason and unknown flags
@@ -35,10 +36,13 @@ const DEPLOY_SH = resolve(__dirname, "../../runtime-agent/deploy.sh");
 const WM_DEPLOY = resolve(__dirname, "../../workflow-manager/deploy.sh");
 
 // Env-keyed gh shim, extended from the gate-hardening protocol:
-//   CHECK_<sha7>=green|pass|skipped|red|absent → commits/<sha>/check-runs.
-//   green   — success with NO output field (the original shim contract:
-//             must still count as a real green).
-//   pass    — success with the real battery-pass title.
+//   CHECK_<sha7>=green|pass|bare|skipped|red|absent → commits/<sha>/check-runs.
+//   green   — success with the `config-evals-gate-verdict: PASS` marker
+//             (what the workflow publishes for a real battery pass).
+//   pass    — success with the battery-pass TITLE but no marker (a pre-marker
+//             historical check: green via the title fallback).
+//   bare    — success with NO output field at all: unidentifiable, must fail
+//             CLOSED and read as absent (TEAM-3426 FINDING 3).
 //   skipped — success with the skip-publish check's output, matching
 //             .github/workflows/config-evals-gate.yml's skip-publish job.
 // pulls always resolves to [] (no merged-PR evidence anywhere).
@@ -54,7 +58,8 @@ case "$1" in
       */check-runs*)
         var="CHECK_$key"; mode="\${!var:-absent}"
         case "$mode" in
-          green)   echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x"}]}' ;;
+          green)   echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x","output":{"title":"PASS — config evals battery held the baseline","summary":"config-evals-gate-verdict: PASS\\n\\n- all cases held the baseline"}}]}' ;;
+          bare)    echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x"}]}' ;;
           pass)    echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x","output":{"title":"PASS — config evals battery held the baseline","summary":"all cases held"}}]}' ;;
           skipped) echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x","output":{"title":"SKIPPED — no gated paths changed","summary":"This PR touches no gated path; the battery did not run."}}]}' ;;
           red)     echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"failure","html_url":"http://check/x","output":{"summary":"- CRED-2 failed"}}]}' ;;
@@ -237,13 +242,14 @@ describe("Finding 3: a SKIPPED success is not evaluation evidence", () => {
     expect(r.out).toContain(`ancestor commit ${bypassAncestor}`);
     expect(r.out).toContain("touched gated path 'conf/gated.txt'");
     expect(r.out).toContain("without a green");
-    // The operator info line explains WHY the success was not accepted.
-    expect(r.out).toContain("skipped success is NOT evaluation evidence");
+    // The operator NOTE explains WHY the success was not accepted.
+    expect(r.out).toContain("is a SKIPPED success");
+    expect(r.out).toContain("NOT evidence that the tree was evaluated");
     expect(r.out).not.toContain("green anchor");
     expect(r.out).not.toContain("proceeding (informational");
   });
 
-  it("contrast: the same shape with a REAL green (no-output success) on the ancestor anchors and proceeds", () => {
+  it("contrast: the same shape with a REAL marker-verified PASS on the ancestor anchors and proceeds", () => {
     const r = runGate(repoBypass, {
       [`CHECK_${bypassAncestor.slice(0, 7)}`]: "green",
     });
@@ -258,8 +264,8 @@ describe("Finding 3: a SKIPPED success is not evaluation evidence", () => {
       [`CHECK_${gatedHead.slice(0, 7)}`]: "skipped",
     });
     expect(r.status).toBe(1);
-    expect(r.out).toContain("skipped success is NOT evaluation evidence");
-    expect(r.out).toContain("continuing as if no check existed");
+    expect(r.out).toContain("is a SKIPPED success");
+    expect(r.out).toContain("Treating it as absent evidence");
     expect(r.out).toContain("EVAL GATE REFUSED");
     expect(r.out).toContain("touches gated path 'conf/gated.txt'");
     expect(r.out).not.toContain("is green on HEAD");
@@ -270,13 +276,13 @@ describe("Finding 3: a SKIPPED success is not evaluation evidence", () => {
       [`CHECK_${ungatedHead.slice(0, 7)}`]: "skipped",
     });
     expect(r.status).toBe(0);
-    expect(r.out).toContain("skipped success is NOT evaluation evidence");
+    expect(r.out).toContain("is a SKIPPED success");
     expect(r.out).toContain("proceeding (informational, not latched)");
     expect(r.out).toContain("LATCH=unset");
     expect(r.out).not.toContain("EVAL GATE REFUSED");
   });
 
-  it("a real battery PASS title on HEAD is green and latches", () => {
+  it("a pre-marker check with a PASS title (no marker) is still green via the title fallback and latches", () => {
     const r = runGate(repoGatedHead, {
       [`CHECK_${gatedHead.slice(0, 7)}`]: "pass",
     });
@@ -286,14 +292,14 @@ describe("Finding 3: a SKIPPED success is not evaluation evidence", () => {
     expect(r.out).not.toContain("EVAL GATE REFUSED");
   });
 
-  it("a success with NO output field on HEAD stays a real green and latches (gh-shim contract)", () => {
+  it("a success with NO output field on a gated HEAD fails CLOSED — unidentifiable is not green", () => {
     const r = runGate(repoGatedHead, {
-      [`CHECK_${gatedHead.slice(0, 7)}`]: "green",
+      [`CHECK_${gatedHead.slice(0, 7)}`]: "bare",
     });
-    expect(r.status).toBe(0);
-    expect(r.out).toContain(`is green on HEAD (${gatedHead})`);
-    expect(r.out).toContain(`LATCH=${gatedHead}`);
-    expect(r.out).not.toContain("NOT evaluation evidence");
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("NOT identifiable as a battery PASS");
+    expect(r.out).toContain("EVAL GATE REFUSED");
+    expect(r.out).not.toContain("is green on HEAD");
   });
 });
 
@@ -307,8 +313,8 @@ describe("Finding 4: --force CLI break-glass on deploy-one.sh", () => {
       sentinelToolDir,
     );
     expect(r.status).toBe(1);
-    expect(r.out).toContain("--force requires a non-empty reason");
-    expect(r.out).toContain("BG-2");
+    expect(r.out).toContain("--force requires --force-reason");
+    expect(r.out).toContain("(BG-2)");
     expect(r.ghCalls).toHaveLength(0); // died before the gate, let alone deploy
     expect(existsSync(sentinel)).toBe(false);
   });
@@ -322,8 +328,8 @@ describe("Finding 4: --force CLI break-glass on deploy-one.sh", () => {
       sentinelToolDir,
     );
     expect(r.status).toBe(1);
-    expect(r.out).toContain("unknown flag '--frce'");
-    expect(r.out).toContain("usage: deploy-one.sh");
+    expect(r.out).toContain("unknown option '--frce'");
+    expect(r.out).toContain("Usage: deploy-one.sh");
     expect(r.out).not.toContain("FAIL --frce"); // the old misparse symptom
     expect(existsSync(sentinel)).toBe(false);
   });
@@ -344,7 +350,9 @@ describe("Finding 4: --force CLI break-glass on deploy-one.sh", () => {
         AWS_S3_EXIT: "0",
       },
     );
-    expect(r.out).toContain("EVAL-GATE BREAK-GLASS REQUESTED VIA --force");
+    expect(r.out).toContain(
+      "--force break-glass requested — routing through the audited eval-gate override",
+    );
     expect(r.out).toContain("EVAL GATE BREAK-GLASS OVERRIDE — DEPLOYING UNGATED");
     expect(r.out).toContain("reason      : INC-1: test");
     expect(r.out).toContain(
@@ -371,8 +379,8 @@ describe("Finding 4: --force CLI break-glass on deploy.sh", () => {
       sentinelToolDir,
     );
     expect(r.status).toBe(1);
-    expect(r.out).toContain("--force requires a non-empty reason");
-    expect(r.out).toContain("BG-2");
+    expect(r.out).toContain("--force requires --force-reason");
+    expect(r.out).toContain("(BG-2)");
     expect(r.out).not.toContain("Deploying"); // never reached target resolution
     expect(existsSync(sentinel)).toBe(false);
   });
@@ -386,7 +394,7 @@ describe("Finding 4: --force CLI break-glass on deploy.sh", () => {
       sentinelToolDir,
     );
     expect(r.status).toBe(1);
-    expect(r.out).toContain("unknown flag '--forc'");
+    expect(r.out).toContain("unknown option '--forc'");
     expect(r.out).toContain("--help");
     expect(existsSync(sentinel)).toBe(false);
   });

@@ -1,82 +1,55 @@
 #!/bin/bash
 # Deploy a single agent to AgentCore Runtime
-# Usage: ./deploy-one.sh [--force --force-reason '<incident>: <why>'] <agent_name>
+# Usage: ./deploy-one.sh [--force --force-reason "<why>"] <agent_name>
 
 set -euo pipefail
 
-usage() {
-  {
-    echo "usage: deploy-one.sh [--force --force-reason '<incident>: <why>'] <agent_name>"
-    echo "  --force                   audited eval-gate break-glass (same path as EVAL_GATE_OVERRIDE=1)"
-    echo "  --force-reason <reason>   required with --force (same as EVAL_GATE_OVERRIDE_REASON)"
-  } >&2
-}
-
-# CLI break-glass (TEAM-3426): --force/--force-reason are sugar for the
-# audited EVAL_GATE_OVERRIDE env vars — same banner, S3 + local audit, and
-# refusal without a durable audit sink (_eval_gate_break_glass), NOT a second
-# override mechanism. Any other -/-- flag is rejected so a misspelled flag can
-# never be silently consumed as the agent name.
-FORCE_REQUESTED=0
-POSITIONAL=()
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --force)
-      FORCE_REQUESTED=1
-      shift
-      ;;
-    --force-reason)
-      if [ $# -lt 2 ]; then
-        echo "ERROR: --force-reason requires a value" >&2
-        usage
-        exit 1
-      fi
-      export EVAL_GATE_OVERRIDE_REASON="$2"
-      shift 2
-      ;;
-    --force-reason=*)
-      export EVAL_GATE_OVERRIDE_REASON="${1#--force-reason=}"
-      shift
-      ;;
-    -*)
-      echo "ERROR: unknown flag '$1'" >&2
-      usage
-      exit 1
-      ;;
-    *)
-      POSITIONAL+=("$1")
-      shift
-      ;;
-  esac
-done
-if [ "$FORCE_REQUESTED" = "1" ]; then
-  if [ -z "${EVAL_GATE_OVERRIDE_REASON:-}" ]; then
-    echo "ERROR: --force requires a non-empty reason — pass --force-reason '<incident>: <why>' (or set EVAL_GATE_OVERRIDE_REASON). An unexplained override is refused (BG-2)." >&2
-    usage
-    exit 1
-  fi
-  export EVAL_GATE_OVERRIDE=1
-  echo "⚠️  EVAL-GATE BREAK-GLASS REQUESTED VIA --force (reason: ${EVAL_GATE_OVERRIDE_REASON}) — if the gate refuses, the override will be audited (banner + S3 + local log) before proceeding." >&2
-fi
-if [ "${#POSITIONAL[@]}" -gt 1 ]; then
-  echo "ERROR: expected exactly one agent name, got: ${POSITIONAL[*]}" >&2
-  usage
-  exit 1
-fi
-set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
-
-AGENT_NAME="${1:?usage: deploy-one.sh [--force --force-reason '<reason>'] <agent_name>}"
-ROLE_ARN="${AGENTCORE_ROLE_ARN:?Set AGENTCORE_ROLE_ARN to your AgentCore execution role ARN}"
-REGION="${AWS_REGION:-us-east-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+usage() {
+  echo "Usage: deploy-one.sh [--force --force-reason \"<why>\"] <agent_name>"
+  echo ""
+  echo "Options:"
+  eval_gate_force_usage_lines
+}
 
 # Eval gate (FR-7): refuse to ship ungated prompt changes. No-ops when
 # deploy-fleet.sh already latched the gate token for this process tree.
 # Explicit-fail on source (TEAM-3388): the gate must never be skippable via a
 # failed source + command-not-found, even if set -e is ever removed above.
+# Sourced BEFORE arg parsing so a missing/broken gate helper is still the first
+# thing that kills the run — loading these files only defines functions.
 # shellcheck disable=SC1091 # resolved relative to this script at runtime
 source "$SCRIPT_DIR/../lib/check-eval-gate.sh" \
   || { echo "FATAL: cannot load eval gate helper ($SCRIPT_DIR/../lib/check-eval-gate.sh) — refusing to deploy ungated" >&2; exit 1; }
+# --force / --force-reason parsing lives in one shared helper (TEAM-3426
+# FINDING 4) so this script and deploy.sh cannot drift. Before the fix, $1 was
+# assigned straight to AGENT_NAME, so `deploy-one.sh --force <agent>` silently
+# treated "--force" as the agent name and ran the normal gate.
+# shellcheck disable=SC1091 # resolved relative to this script at runtime
+source "$SCRIPT_DIR/../lib/parse-force-args.sh" \
+  || { echo "FATAL: cannot load arg parser ($SCRIPT_DIR/../lib/parse-force-args.sh) — refusing to deploy ungated" >&2; exit 1; }
+
+# Parse before any gate/deploy work: --force exports EVAL_GATE_OVERRIDE and
+# EVAL_GATE_OVERRIDE_REASON so require_eval_gate below takes the SAME audited
+# break-glass path as the env-var form. Unknown flags are rejected outright,
+# never misparsed as an agent name.
+parse_force_args "$@" || { usage >&2; exit 1; }
+if [ "${#FORCE_ARGS_POSITIONAL[@]}" -gt 0 ]; then
+  set -- "${FORCE_ARGS_POSITIONAL[@]}"
+else
+  set --
+fi
+if [ "$#" -ne 1 ]; then
+  echo "ERROR: expected exactly one agent name, got $# positional argument(s)." >&2
+  usage >&2
+  exit 1
+fi
+
+AGENT_NAME="$1"
+ROLE_ARN="${AGENTCORE_ROLE_ARN:?Set AGENTCORE_ROLE_ARN to your AgentCore execution role ARN}"
+REGION="${AWS_REGION:-us-east-1}"
+
 require_eval_gate "deploy/runtime-agent/prompts/**"
 
 # DEPLOY_MODE selects between two deploy paths:
