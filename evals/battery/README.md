@@ -19,16 +19,44 @@ copies, never the S3 ones):
 - `evals/battery/**` — the battery itself (cases, thresholds, runner)
 
 The PR check is a check run named exactly **`config-evals-gate`**, published by
-a credential-isolated job (see the HERM-1/CRED-2/CRED-3 comments in the
-workflow). It is `success` only when every active case ran, scored, and held
-the thresholds; every other state — battery crash, timeout, missing results,
-fork PR — is an explicit **failure**, never neutral or absent.
+a credential-isolated job (see the HERM-1/HERM-3/CRED-2/CRED-3 comments in the
+workflow). For same-repo PRs it is `success` only when every active case ran,
+scored, and held the thresholds; every other state — battery crash, timeout,
+missing results — is an explicit **failure**, never neutral. Fork PRs are the
+one deliberate exception: no check can be published for them at all, and its
+*absence* is what blocks the merge (see the next section).
 
 There is no neutral verdict anywhere in this pipeline: the publish job maps
 everything that is not `verdict: "PASS"` + a successful battery job onto
 `conclusion: failure`, and the deploy guard treats anything but a green check
 as "refuse to ship". So every "the gate proved nothing" condition below is a
 **FAIL with an explicit `failureReason`**, not a neutral conclusion.
+
+### Fork PRs — the gate is same-repo only (CRED-2, TEAM-3425)
+
+The gate cannot run for fork PRs, by two independent mechanisms, so it is
+**formally restricted to same-repo PRs**:
+
+- Fork PRs cannot assume the OIDC eval role, so the battery has no Bedrock
+  credentials to score anything with.
+- On fork `pull_request` events GitHub downgrades `GITHUB_TOKEN` to
+  **read-only** and does not honor a job-level `checks: write` request, so the
+  workflow cannot publish a `config-evals-gate` check run for a fork PR at
+  all — `checks.create` returns 403. (An earlier design had a fork-guard job
+  "publish an explicit failing check" for gated fork PRs; that call could
+  never succeed and the design is superseded.)
+
+**Enforcement is the required check's absence.** With `config-evals-gate` set
+as a required status check in branch protection, a fork PR never acquires the
+check and sits at "Expected — waiting" — it cannot merge (fail closed). On top
+of that, a fork PR that touches gated paths (or whose path detection failed)
+gets a visibly **failing `fork-guard` job** — a plain `exit 1` with an
+explanatory `::error::`, no `checks.create` attempt — and an ungated fork PR
+gets an informational `fork-notice` job explaining the same constraint.
+
+**Maintainer workflow for fork contributions:** to gate a fork contribution, a
+maintainer pushes the fork branch to the base repository and opens a same-repo
+PR from it; the battery then runs and publishes the check normally.
 
 ### What can never produce a PASS
 
@@ -488,8 +516,17 @@ A battery run executes **zero real side effects**:
   DynamoDB, batched to S3, or counted toward the improver flush.
 - **Sanitized fixtures** enforced by `npm run battery:lint`.
 - **CI credential preflight**: the gate job checks out with
-  `persist-credentials: false` and asserts no git credential survives on disk
-  before running any PR code.
+  `persist-credentials: false` (both the workspace and the pr-head side
+  checkout) and asserts no git credential survives on disk before the battery
+  runs.
+- **Harness from the trusted base revision** (HERM-3, TEAM-3425): in CI the
+  battery job's workspace is checked out at the PR's *base* sha — the runner,
+  `lib/`, scoring code, and `package*.json` are always pre-merge-reviewed
+  code. Only the candidate config paths (prompts, `deploy/workflow-manager/`,
+  `blueprints/`, `src/config/workflows.json`, `src/config/agents.json`) are
+  overlaid from the PR head before the run, so a PR that edits
+  `evals/battery/**` cannot fabricate its own verdict — a harness change is
+  exercised by the gate only after it merges.
 
 ## Deploy gate + break-glass
 
