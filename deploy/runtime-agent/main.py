@@ -10,7 +10,9 @@ Agent identity (system prompt, tools, model) is fixed at deploy time.
 
 Key advantages over Harness:
   - We control botocore read_timeout (1200s) so Opus can think without being killed
-  - OTel auto-instrumentation is enabled via the CMD in deployment
+  - OTel telemetry is initialized in-process at module import (StrandsTelemetry
+    below), so spans flow even under direct_code_deploy's plain `python main.py`;
+    the container path additionally auto-instruments via the Dockerfile CMD
   - Streaming responses via async generator entrypoint
   - All gateway tools (Tickets, GitHub MCP, WorkflowOutput) via Lambda invocation
 """
@@ -169,6 +171,78 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentcore-hub-pipeline-agent")
 
+
+# Span EMISSION half of the telemetry fix (R1) is the init block below; the
+# span DELIVERY half (force_flush before microVM freeze) lives in
+# _run_agent_invocation's finally block — see the comment there (R5).
+# --- OTel telemetry init (TEAM-3102) ---------------------------------------
+# Under the Dockerfile's `opentelemetry-instrument` wrapper, ADOT's
+# aws_configurator has ALREADY installed the global TracerProvider + OTLP
+# pipeline before this module imports. Strands' Tracer binds the global
+# provider (strands/telemetry/tracer.py:119), so in that case we must attach
+# NOTHING — a no-arg StrandsTelemetry() would log "Overriding of current
+# TracerProvider is not allowed", orphan its own provider, and clobber the
+# baggage,xray,tracecontext propagators (drops session.id stamping).
+# The StrandsTelemetry fallback exists only for runs without
+# auto-instrumentation (bare `python main.py`, direct_code_deploy without
+# ADOT), and it is gated on AGENT_OBSERVABILITY_ENABLED=true: without a real
+# TracerProvider the `invoke_agent` span is never exported and eval batches
+# score 0/10, so when the gate blocks we log the exact warning string the
+# DEPLOY.md startup probe and verify-fleet.sh grep for.
+
+_TELEMETRY_INITIALIZED = False
+
+
+def _init_telemetry() -> None:
+    global _TELEMETRY_INITIALIZED
+    # globals().get(): tests exec this function in a bare namespace where the
+    # module-level `_TELEMETRY_INITIALIZED = False` assignment is absent, and
+    # the guard runs before the try block below.
+    if globals().get("_TELEMETRY_INITIALIZED", False):
+        return
+    # TEAM-3313: this runs at module import — any exception here would abort
+    # the import before `app = BedrockAgentCoreApp()` and turn a telemetry
+    # failure into a total agent outage. Swallow and log instead.
+    try:
+        import os as _os
+
+        from opentelemetry import trace as _otel_trace_api
+
+        provider = _otel_trace_api.get_tracer_provider()
+        provider_cls = f"{provider.__class__.__module__}.{provider.__class__.__name__}"
+        if hasattr(provider, "add_span_processor"):
+            # Real SDK provider → opentelemetry-instrument/ADOT own the pipeline.
+            logger.info(
+                f"[telemetry] existing global TracerProvider: {provider_cls} — "
+                "ADOT/auto-instrumentation owns the pipeline; skipping StrandsTelemetry init"
+            )
+        elif _os.getenv("AGENT_OBSERVABILITY_ENABLED", "").lower() != "true":
+            logger.warning(
+                f"[telemetry] no TracerProvider and AGENT_OBSERVABILITY_ENABLED != true — "
+                f"spans will NOT be exported (provider={provider_cls})"
+            )
+        else:
+            from strands.telemetry import StrandsTelemetry
+
+            StrandsTelemetry().setup_otlp_exporter()  # honors OTEL_EXPORTER_OTLP_* env vars
+            logger.warning(
+                "[telemetry] auto-instrumentation absent — StrandsTelemetry OTLP fallback active "
+                f"(was {provider_cls}, now {_otel_trace_api.get_tracer_provider().__class__.__name__})"
+            )
+    except Exception:
+        logger.warning(
+            "telemetry: init failed — continuing without telemetry",
+            exc_info=True,
+        )
+    finally:
+        # Mark initialized even on failure: a retry would run against
+        # partially-mutated global OTel state, so one attempt only.
+        _TELEMETRY_INITIALIZED = True
+
+
+_init_telemetry()
+# ---------------------------------------------------------------------------
+
 # Per-invocation prompt cache for shared-runtime topologies (1 or 4 runtimes
 # hosting many personas). First call for an agent_id reads
 # s3://{ARTIFACT_BUCKET}/prompts/{agent_id}.txt; subsequent calls in the same
@@ -264,6 +338,19 @@ REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "600"))
 # verdict reaches us via the journal instead of us giving up first.
 REMOTE_CODING_POLL_S = int(os.getenv("REMOTE_CODING_POLL_S", "20"))
 REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "2700"))
+# Outer wall-clock deadline on ONE ENTIRE nested coding turn: submit (including
+# lost-submit recovery probes), every poll, and the single automatic vm-death
+# resubmit. The poll loop bounds each CYCLE (budget, 2x hard stop), but cycles
+# and recovery sleeps stack — worst case ran to hours of silent blocking with
+# no event emitted (TEAM-3119). The default sits above one full worst-case
+# cycle (submit read timeout + the poll loop's hard stop) so it never preempts
+# a provably-live runner; on expiry the turn fails loudly (agent.error event +
+# ERROR string to the persona) instead of pinning it. Follow-up (not here):
+# periodic agent.streaming heartbeats while a coding turn is being polled.
+REMOTE_CODING_TURN_DEADLINE_S = int(os.getenv(
+    "REMOTE_CODING_TURN_DEADLINE_S",
+    str(REMOTE_CODING_READ_TIMEOUT + 2 * REMOTE_CODING_TURN_BUDGET_S),
+))
 
 # Tenant the workflow session rows belong to. Multi-tenant deployments must set
 # this to the tenant that owns the fleet, or the Cloud Code tab (which scopes
@@ -429,7 +516,22 @@ def _coding_invoke(client, payload: dict) -> dict:
     return json.loads(resp["response"].read().decode("utf-8"))
 
 
-def _poll_coding_turn(client, turn_id: str) -> dict:
+def _deadline_expired_error() -> dict:
+    """The terminal record for a turn cut off by REMOTE_CODING_TURN_DEADLINE_S —
+    shared by the poll loop and the pre-submit guard so both exits carry the
+    same verify-first instructions (TEAM-3307)."""
+    return {"error": f"coding turn exceeded the {REMOTE_CODING_TURN_DEADLINE_S}s "
+                     f"overall deadline with no verdict. Its work may already "
+                     f"exist and a runner may still be finishing. Do NOT re-run "
+                     f"the task and do NOT start another coding call yet: wait a "
+                     f"few minutes, then check the branch on GitHub "
+                     f"(get_file_contents / list commits) to see whether the "
+                     f"work landed before deciding anything",
+            "deadline_exceeded": True,
+            "no_retry_hint": True}
+
+
+def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None) -> dict:
     """Poll an async coding turn to its terminal state. Returns the done record
     ({response, claude_session_id, artifacts?} or {error}).
 
@@ -439,13 +541,19 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
     sub-second invocation, so wall-clock turn length no longer matters. A poll
     also confirms the microVM is alive: 'dead' (stale heartbeat) and 'unknown'
     (journal gone) both mean the turn will never finish — fail fast, don't wait
-    out the budget."""
+    out the budget.
+
+    outer_deadline is a time.monotonic() timestamp bounding the whole turn
+    (REMOTE_CODING_TURN_DEADLINE_S): unlike the budget, it is NEVER extended by
+    a live heartbeat, so a runner that reports "running" forever cannot pin the
+    persona past it (TEAM-3119)."""
     deadline = time.time() + REMOTE_CODING_TURN_BUDGET_S
     # Live heartbeats extend the deadline (terminal work is unbounded), but a
     # wedged-yet-heartbeating runner must not pin this persona forever.
     hard_stop = time.time() + 2 * REMOTE_CODING_TURN_BUDGET_S
     unknowns = 0
-    while time.time() < min(deadline, hard_stop):
+    while time.time() < min(deadline, hard_stop) and (
+            outer_deadline is None or time.monotonic() < outer_deadline):
         time.sleep(REMOTE_CODING_POLL_S)
         try:
             status = _poll_once(client, turn_id)
@@ -494,13 +602,19 @@ def _poll_coding_turn(client, turn_id: str) -> dict:
     # turn may STILL have completed its work — a blind re-run is not safe.
     # Probe once more, then tell the persona to VERIFY STATE WITHOUT running a
     # coding turn (a fresh CLI call would race a still-live runner in the same
-    # workspace).
+    # workspace). Skip the probe once the outer deadline has expired: the
+    # deadline is a HARD bound, and one more blocking call (up to the poll
+    # client's ~40s connect+read window) would overshoot it (TEAM-3307).
+    if outer_deadline is not None and time.monotonic() >= outer_deadline:
+        return _deadline_expired_error()
     try:
         final = _poll_once(client, turn_id)
         if final.get("status") == "done":
             return final
     except Exception:  # noqa: BLE001
         pass
+    if outer_deadline is not None and time.monotonic() >= outer_deadline:
+        return _deadline_expired_error()
     return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget "
                      f"with no verdict. Its work may already exist and a runner "
                      f"may still be finishing. Do NOT re-run the task and do NOT "
@@ -533,7 +647,7 @@ def _poll_once(client, turn_id: str) -> dict:
     })
 
 
-def _recover_lost_submit(client, payload: dict):
+def _recover_lost_submit(client, payload: dict, outer_deadline: float | None = None):
     """The submit's response was lost client-side. What the server did is
     unknown — AND the server itself may be a legacy build that ignores
     mode/turn_id and is still executing the turn synchronously (no dedupe, so a
@@ -546,16 +660,36 @@ def _recover_lost_submit(client, payload: dict):
       - legacy runtime → poll comes back an error/no-status → NOT safe to
         resubmit; give up with an explicit error (the persona's retry guidance
         stands, and the workspace is preserved).
-    Returns a submit-shaped dict, or None when recovery is unsafe."""
+    Returns a submit-shaped dict, or None when recovery is unsafe.
+
+    outer_deadline bounds recovery just like the poll loop (TEAM-3307): a
+    submit that times out AFTER the deadline lands here, and without the check
+    the probe loop (5 × ~40s) plus a recovery resubmit (up to ~630s) would blow
+    straight past the supposedly hard bound. On expiry, hand the turn_id back
+    as submitted — _poll_coding_turn re-checks the deadline immediately and
+    returns the deadline-expired error without another blocking call."""
+    def _expired() -> bool:
+        return outer_deadline is not None and time.monotonic() >= outer_deadline
+
     probe = None
     for attempt in range(5):  # a throttled probe is transient — keep asking
+        if _expired():
+            return {"submitted": True, "turn_id": payload["turn_id"]}
         try:
             probe = _poll_once(client, payload["turn_id"])
             break
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[remote-coding] recovery probe failed "
                            f"({attempt + 1}/5): {str(e)[:200]}")
-            time.sleep(REMOTE_CODING_POLL_S)
+            # Backoff capped to the time left: a probe that failed just past
+            # the deadline must not tack a full poll interval onto the
+            # overshoot before the loop's own expiry check runs.
+            if _expired():
+                return {"submitted": True, "turn_id": payload["turn_id"]}
+            sleep_s = REMOTE_CODING_POLL_S
+            if outer_deadline is not None:
+                sleep_s = min(sleep_s, max(0.0, outer_deadline - time.monotonic()))
+            time.sleep(sleep_s)
     if probe is None:
         # Every probe hit a transient failure — still zero evidence about the
         # runner. The poll loop tolerates transient errors until its budget, so
@@ -566,6 +700,10 @@ def _recover_lost_submit(client, payload: dict):
     if state in ("running", "done", "transient"):
         return {"submitted": True, "turn_id": payload["turn_id"]}
     if state == "unknown":
+        if _expired():
+            # No evidence the turn started and no time left to start it — the
+            # poll loop's deadline check turns this into the expired error.
+            return {"submitted": True, "turn_id": payload["turn_id"]}
         try:
             return _coding_invoke(client, payload)  # deduped server-side
         except Exception as e:  # noqa: BLE001
@@ -585,7 +723,7 @@ def _recover_lost_submit(client, payload: dict):
     return None
 
 
-def _submit_and_poll(client, payload: dict) -> dict:
+def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None) -> dict:
     """Submit one async coding turn and poll it to a terminal record.
 
     The turn_id is generated HERE and sent with the submit, making submission
@@ -594,11 +732,17 @@ def _submit_and_poll(client, payload: dict) -> dict:
     re-submit with the same id is acknowledged as a dedupe instead of running
     the prompt a second time in the same workspace."""
     payload = {**payload, "turn_id": f"turn-{uuid.uuid4().hex}"}
+    # HARD deadline check before the blocking submit: this client's
+    # connect+read window is ~630s, all of which would land PAST an
+    # already-expired deadline (worst case: a vm-death resubmit racing the
+    # deadline). Expired means don't start the call at all (TEAM-3307).
+    if outer_deadline is not None and time.monotonic() >= outer_deadline:
+        return _deadline_expired_error()
     try:
         submitted = _coding_invoke(client, payload)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[remote-coding] submit response lost: {str(e)[:200]}")
-        submitted = _recover_lost_submit(client, payload)
+        submitted = _recover_lost_submit(client, payload, outer_deadline)
         if submitted is None:
             return {"error": "submit response lost and could not be safely "
                              "recovered (see logs)"}
@@ -608,7 +752,7 @@ def _submit_and_poll(client, payload: dict) -> dict:
         # Runtime predates async mode (or ran a legacy path) and executed the
         # turn synchronously — its result is already complete.
         return submitted
-    return _poll_coding_turn(client, submitted["turn_id"])
+    return _poll_coding_turn(client, submitted["turn_id"], outer_deadline)
 
 
 def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") -> str:
@@ -667,29 +811,41 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         f"[remote-coding] {cli} turn on {_CODING_SESSION['session_id']} "
         f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')}, mode=async)"
     )
+    # One monotonic deadline for the WHOLE nested turn — submit, recovery,
+    # polls, and the automatic vm-death resubmit all check against it, so no
+    # combination of inner retries can silently block this persona past it.
+    turn_deadline = time.monotonic() + REMOTE_CODING_TURN_DEADLINE_S
     try:
         client = boto3.client(
             "bedrock-agentcore", region_name=REGION,
             config=BotocoreConfig(read_timeout=REMOTE_CODING_READ_TIMEOUT,
+                                  connect_timeout=30,
                                   retries={"max_attempts": 0}),
         )
-        result = _submit_and_poll(client, payload)
+        result = _submit_and_poll(client, payload, turn_deadline)
         # A dead/vanished verdict means the microVM recycled mid-turn — the
         # workspace and transcript are on EFS, so one automatic resubmit (same
         # conversation id) is cheap and usually completes. A second death is a
         # real failure the persona should see.
         if result.get("retryable_vm_death"):
-            logger.warning(f"[remote-coding] {result.get('error')} — resubmitting once")
-            result = _submit_and_poll(client, payload)
+            if time.monotonic() < turn_deadline:
+                logger.warning(f"[remote-coding] {result.get('error')} — resubmitting once")
+                result = _submit_and_poll(client, payload, turn_deadline)
             result.pop("retryable_vm_death", None)
     except Exception as e:  # noqa: BLE001
         # Do NOT fall back to a local CLI run: the session's workspace lives on
         # the coding runtime, and a local run would fork it (split-brain).
         logger.warning(f"[remote-coding] turn failed: {str(e)[:300]}")
+        _publish_agent_error(_CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID,
+                             f"remote {cli} turn failed: {str(e)[:300]}",
+                             ticket_id=_CURRENT_TICKET_ID)
         return (f"ERROR: remote {cli} turn failed: {str(e)[:300]}. "
                 f"Retry this same {cli} call — the session workspace is preserved.")
 
     if result.get("error"):
+        _publish_agent_error(_CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID,
+                             f"remote {cli} turn failed: {str(result['error'])[:600]}",
+                             ticket_id=_CURRENT_TICKET_ID)
         if result.get("no_retry_hint"):
             # The turn's work may already exist in the workspace — the error
             # text itself carries the verify-first instructions.
@@ -1912,6 +2068,41 @@ class _OperatorMailbox:
             _publish_operator_delivery(self._wf, self._agent, m)
 
 
+class _CompletionGate:
+    """R3.2: after a SUCCESSFUL WorkflowOutput___report_completion, drop later
+    text deltas (final_text + DDB type=text) — they duplicate the summary the
+    tool already delivered. A FAILED report_completion must NOT engage (and
+    disengages a prior engage): persona TOOL STATUS REPORTING requires the
+    model's failure report to surface. Best-effort: never raises."""
+
+    TOOL = "WorkflowOutput___report_completion"
+
+    def __init__(self):
+        self.engaged = False
+
+    def register_hooks(self, registry, **kwargs):
+        from strands.hooks import AfterToolCallEvent
+        registry.add_callback(AfterToolCallEvent, self._on_tool_result)
+
+    @staticmethod
+    def _succeeded(result) -> bool:
+        if not isinstance(result, dict) or result.get("status") != "success":
+            return False  # ToolResult error status, or an Exception instance
+        for block in result.get("content") or []:
+            text = (block.get("text") or "") if isinstance(block, dict) else ""
+            if text.strip().lower().startswith("error"):
+                return False  # _invoke_lambda maps Lambda errorMessage -> "Error: ..."
+        return True
+
+    def _on_tool_result(self, event):
+        try:
+            if (getattr(event, "tool_use", None) or {}).get("name") != self.TOOL:
+                return
+            self.engaged = self._succeeded(getattr(event, "result", None))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"completion gate hook failed (non-fatal): {e}")
+
+
 def _save_memory_event(agent_id: str, session_id: str, user_text: str, assistant_text: str):
     """Persist the invocation turn to AgentCore Memory (no-op if MEMORY_ID unset).
 
@@ -1990,6 +2181,10 @@ async def agent_invocation(payload, context):
                 except Exception:  # noqa: BLE001
                     pass
             finally:
+                # Span flush before complete_async_task happens inside
+                # _run_agent_invocation's own finally (which unwinds before we
+                # get here), so the microVM can't be reaped with the final
+                # invoke_agent span still queued — no second flush needed.
                 app.complete_async_task(task_id)
                 _DETACHED_TASKS.discard(asyncio.current_task())
 
@@ -2008,26 +2203,70 @@ async def agent_invocation(payload, context):
         yield event
 
 
-def _publish_agent_error(workflow_id: str, agent_id: str, error: str) -> None:
-    """Surface a detached-run crash to the events table so the workflow board
-    and nudge system can see it (a detached task has no caller to error to)."""
+# A lost agent.error is an invisible failure — retry the publish a few times.
+# Backoff lives in a module constant so tests can zero it out (TEAM-3307).
+_AGENT_ERROR_PUBLISH_ATTEMPTS = 3
+_AGENT_ERROR_PUBLISH_BACKOFF_S = (0.5, 1.0)
+
+
+def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
+                         ticket_id: str = "") -> None:
+    """Surface a failure to the events table so the workflow board and nudge
+    system can see it — a detached-run crash (a detached task has no caller to
+    error to) or a failed nested coding-runtime handoff (TEAM-3119: those used
+    to fail silently and orphan their ticket).
+
+    Best-effort by contract: callers sit on failure paths (including inside
+    except blocks of code that must never raise), so this swallows its own
+    errors instead of letting error surfacing break the turn it reports.
+    Best-effort is not single-shot, though: a throttle or network blip here
+    loses the only record of the failure, so the put is retried a couple of
+    times with short backoff before giving up (TEAM-3307)."""
     import time as _t
-    # Random suffix on both keys: two personas failing in the same millisecond
-    # (shared-outage case) must not overwrite each other's error item. The
-    # timestamp's fractional part must stay NUMERIC — workflow-analyzer
-    # Date.parse()s it, so hex there would poison lastSignificantEventAge().
-    digits = f"{uuid.uuid4().int % 10**6:06d}"
-    _ddb_events_client.put_item(
-        TableName=_EVENTS_TABLE,
-        Item={
-            "workflowId": {"S": workflow_id},
-            "eventId": {"S": f"{int(_t.time() * 1000)}-err-{digits}"},
-            "type": {"S": "agent.error"},
-            "detail": {"M": {"agentId": {"S": agent_id}, "error": {"S": error}}},
-            "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
-                          + f".{digits}Z"},
-        },
-    )
+    try:
+        for attempt in range(1, _AGENT_ERROR_PUBLISH_ATTEMPTS + 1):
+            try:
+                # Random suffix on both keys: two personas failing in the same millisecond
+                # (shared-outage case) must not overwrite each other's error item. The
+                # timestamp's fractional part must stay NUMERIC — workflow-analyzer
+                # Date.parse()s it, so hex there would poison lastSignificantEventAge().
+                digits = f"{uuid.uuid4().int % 10**6:06d}"
+                _ddb_events_client.put_item(
+                    TableName=_EVENTS_TABLE,
+                    Item={
+                        "workflowId": {"S": workflow_id or "unknown"},
+                        "eventId": {"S": f"{int(_t.time() * 1000)}-err-{digits}"},
+                        "type": {"S": "agent.error"},
+                        "detail": {"M": {
+                            "agentId": {"S": agent_id},
+                            "workflowId": {"S": workflow_id or "unknown"},
+                            "ticketId": {"S": ticket_id or ""},
+                            "error": {"S": (error or "")[:1000]},
+                        }},
+                        "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
+                                      + f".{digits}Z"},
+                    },
+                )
+                logger.info(f"[{agent_id}] Published agent.error event")
+                return
+            except Exception as e:  # noqa: BLE001
+                if attempt == _AGENT_ERROR_PUBLISH_ATTEMPTS:
+                    logger.warning(
+                        f"[{agent_id}] Failed to publish agent.error after "
+                        f"{attempt} attempts (workflow_id={workflow_id or 'unknown'}, "
+                        f"ticket_id={ticket_id or 'n/a'}): {e}")
+                    return
+                logger.warning(
+                    f"[{agent_id}] agent.error publish attempt {attempt}/"
+                    f"{_AGENT_ERROR_PUBLISH_ATTEMPTS} failed "
+                    f"(workflow_id={workflow_id or 'unknown'}, "
+                    f"ticket_id={ticket_id or 'n/a'}) — retrying: {e}")
+                _t.sleep(_AGENT_ERROR_PUBLISH_BACKOFF_S[
+                    min(attempt - 1, len(_AGENT_ERROR_PUBLISH_BACKOFF_S) - 1)])
+    except Exception as e:  # noqa: BLE001 — error surfacing must never fail the turn
+        logger.warning(f"[{agent_id}] Failed to publish agent.error "
+                       f"(workflow_id={workflow_id or 'unknown'}, "
+                       f"ticket_id={ticket_id or 'n/a'}): {e}")
 
 
 async def _run_agent_invocation(payload, context):
@@ -2055,230 +2294,276 @@ async def _run_agent_invocation(payload, context):
     _CURRENT_WORKFLOW_ID = workflow_id
     _CURRENT_AGENT_ID = agent_id
     _CURRENT_TICKET_ID = payload.get("ticket_id", "")
-    # Fresh coding session per agent-task: a warm microVM reuses this module, so
-    # without a reset the next task would resume the PREVIOUS task's workspace.
-    _CODING_SESSION.update(
-        {"session_id": None, "conversation_ids": {}, "repo": None, "recorded": False,
-         "resume_transcript": None, "resume_session_id": None, "branch": None,
-         "git_mode": None, "clone_url": None}
-    )
 
-    logger.info(f"[{agent_id}] Starting invocation for workflow {workflow_id}")
-    logger.info(f"[{agent_id}] Model: {model_override or MODEL_ID}, read_timeout: {READ_TIMEOUT}s")
+    # Stamp session.id into OTel baggage so any future ADOT-side processors can
+    # also correlate this invocation's spans with the runtime session.
+    try:
+        if _bag_session_id := getattr(context, "session_id", None):
+            from opentelemetry import baggage as _otel_baggage, context as _otel_context
+            _otel_context.attach(_otel_baggage.set_baggage("session.id", _bag_session_id))
+    except Exception:  # noqa: BLE001 — telemetry must never break the invocation (R1.4)
+        pass
 
-    # Publish "agent started" event so UI immediately shows this agent as running/pulsing
-    _publish_agent_started(workflow_id, agent_id)
-
-    # Use model override if provided (orchestrator can specify per-agent)
-    MODEL_ALIASES = {
-        "opus": "us.anthropic.claude-opus-4-6-v1",
-        "sonnet": "us.anthropic.claude-sonnet-4-6",
-        "haiku": "us.anthropic.claude-haiku-4-5-20251001",
-        "claude-opus-46": "us.anthropic.claude-opus-4-6-v1",
-        "claude-sonnet-46": "us.anthropic.claude-sonnet-4-6",
-    }
-    active_model = model
-    if model_override and model_override != MODEL_ID:
-        resolved_model_id = MODEL_ALIASES.get(model_override, model_override)
-        override_config = BotocoreConfig(
-            read_timeout=READ_TIMEOUT,
-            connect_timeout=30,
-            retries={"max_attempts": 2},
+    try:
+        # Fresh coding session per agent-task: a warm microVM reuses this module, so
+        # without a reset the next task would resume the PREVIOUS task's workspace.
+        _CODING_SESSION.update(
+            {"session_id": None, "conversation_ids": {}, "repo": None, "recorded": False,
+             "resume_transcript": None, "resume_session_id": None, "branch": None,
+             "git_mode": None, "clone_url": None}
         )
-        active_model = BedrockModel(
-            model_id=resolved_model_id,
-            region_name=REGION,
-            boto_client_config=override_config,
-            streaming=True,
-            max_tokens=MAX_OUTPUT_TOKENS,
+
+        logger.info(f"[{agent_id}] Starting invocation for workflow {workflow_id}")
+        logger.info(f"[{agent_id}] Model: {model_override or MODEL_ID}, read_timeout: {READ_TIMEOUT}s")
+
+        # Publish "agent started" event so UI immediately shows this agent as running/pulsing
+        _publish_agent_started(workflow_id, agent_id)
+
+        # Use model override if provided (orchestrator can specify per-agent)
+        MODEL_ALIASES = {
+            "opus": "us.anthropic.claude-opus-4-6-v1",
+            "sonnet": "us.anthropic.claude-sonnet-4-6",
+            "haiku": "us.anthropic.claude-haiku-4-5-20251001",
+            "claude-opus-46": "us.anthropic.claude-opus-4-6-v1",
+            "claude-sonnet-46": "us.anthropic.claude-sonnet-4-6",
+        }
+        active_model = model
+        if model_override and model_override != MODEL_ID:
+            resolved_model_id = MODEL_ALIASES.get(model_override, model_override)
+            override_config = BotocoreConfig(
+                read_timeout=READ_TIMEOUT,
+                connect_timeout=30,
+                retries={"max_attempts": 2},
+            )
+            active_model = BedrockModel(
+                model_id=resolved_model_id,
+                region_name=REGION,
+                boto_client_config=override_config,
+                streaming=True,
+                max_tokens=MAX_OUTPUT_TOKENS,
+            )
+            # NOTE: the persona's board model governs its own reasoning only. The
+            # coding CLI's model is chosen per-delegation via claude_code(model=...)
+            # or falls back to the coding runtime's CLAUDE_MODEL default.
+            logger.info(f"[{agent_id}] Model override: {model_override} → {resolved_model_id}")
+
+        # Load built-in tools (lazy — avoids 30s init timeout)
+        builtin_tools = _load_builtin_tools()
+        all_tools = builtin_tools + LAMBDA_TOOLS + [claude_code, codex]
+
+        # Connectors bound to this agent: export env creds + collect MCP/gateway targets.
+        conn = _apply_connectors(agent_id, payload_connectors)
+
+        # External tools via MCP (GitHub, GitLab, Jira, Asana, etc.) + connectors.
+        # Strands Agent manages MCPClient lifecycle internally (start/stop)
+        mcp_clients = _create_mcp_clients(
+            extra_servers=conn["mcp_servers"], extra_gateways=conn["gateways"]
         )
-        # NOTE: the persona's board model governs its own reasoning only. The
-        # coding CLI's model is chosen per-delegation via claude_code(model=...)
-        # or falls back to the coding runtime's CLAUDE_MODEL default.
-        logger.info(f"[{agent_id}] Model override: {model_override} → {resolved_model_id}")
+        if mcp_clients:
+            all_tools.extend(mcp_clients)
+            logger.info(f"[{agent_id}] {len(mcp_clients)} MCP server(s) attached")
+        else:
+            logger.warning(f"[{agent_id}] No MCP servers configured — external tools unavailable")
 
-    # Load built-in tools (lazy — avoids 30s init timeout)
-    builtin_tools = _load_builtin_tools()
-    all_tools = builtin_tools + LAMBDA_TOOLS + [claude_code, codex]
+        # Collect tool_use events via callback handler AND publish them in real-time to the
+        # events table so the UI can flash tool icons as they happen (not just at the end).
+        tool_events = []
 
-    # Connectors bound to this agent: export env creds + collect MCP/gateway targets.
-    conn = _apply_connectors(agent_id, payload_connectors)
+        class ToolTrackingHandler:
+            """Callback handler that records tool invocations and text output, publishing to DynamoDB for real-time UI."""
+            def __init__(self):
+                self.previous_tool_use = None
+                self._seq = 0
 
-    # External tools via MCP (GitHub, GitLab, Jira, Asana, etc.) + connectors.
-    # Strands Agent manages MCPClient lifecycle internally (start/stop)
-    mcp_clients = _create_mcp_clients(
-        extra_servers=conn["mcp_servers"], extra_gateways=conn["gateways"]
-    )
-    if mcp_clients:
-        all_tools.extend(mcp_clients)
-        logger.info(f"[{agent_id}] {len(mcp_clients)} MCP server(s) attached")
-    else:
-        logger.warning(f"[{agent_id}] No MCP servers configured — external tools unavailable")
+            def _publish_event(self, event_type: str, detail: dict):
+                """Publish an event to the DynamoDB events table (fire-and-forget).
+                Skips writing if no workflow context (chat/ad-hoc invocations).
+                IMPORTANT: Table sort key is `timestamp` — must be unique per item."""
+                if not workflow_id or workflow_id == "unknown":
+                    return
+                try:
+                    import time
+                    self._seq += 1
+                    event_id = f"{int(time.time() * 1000)}-{self._seq:06d}"
+                    # Unique timestamp with sequence suffix (sort key must never collide)
+                    unique_ts = f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())}.{self._seq:04d}Z"
+                    detail_map = {}
+                    for k, v in detail.items():
+                        if v is not None:
+                            detail_map[k] = {"S": str(v)}
+                    _ddb_events_client.put_item(
+                        TableName=_EVENTS_TABLE,
+                        Item={
+                            "workflowId": {"S": workflow_id},
+                            "eventId": {"S": event_id},
+                            "type": {"S": event_type},
+                            "detail": {"M": detail_map},
+                            "timestamp": {"S": unique_ts},
+                        },
+                    )
+                except Exception as e:
+                    logger.warning(f"[{agent_id}] Failed to publish {event_type} event: {e}")
 
-    # Collect tool_use events via callback handler AND publish them in real-time to the
-    # events table so the UI can flash tool icons as they happen (not just at the end).
-    tool_events = []
+            def __call__(self, **kwargs):
+                current_tool_use = kwargs.get("current_tool_use", {})
+                data = kwargs.get("data", "")
+                reasoning_text = kwargs.get("reasoningText", "")
 
-    class ToolTrackingHandler:
-        """Callback handler that records tool invocations and text output, publishing to DynamoDB for real-time UI."""
-        def __init__(self):
-            self.previous_tool_use = None
-            self._seq = 0
+                # Tool use events
+                if current_tool_use and current_tool_use.get("name"):
+                    if self.previous_tool_use != current_tool_use:
+                        self.previous_tool_use = current_tool_use
+                        tool_name = current_tool_use["name"]
+                        tool_events.append(tool_name)
+                        logger.info(f"[{agent_id}] Tool call: {tool_name}")
+                        self._publish_event("agent.streaming", {
+                            "agentId": agent_id,
+                            "type": "trace",
+                            "toolName": tool_name,
+                            "workflowId": workflow_id,
+                        })
 
-        def _publish_event(self, event_type: str, detail: dict):
-            """Publish an event to the DynamoDB events table (fire-and-forget).
-            Skips writing if no workflow context (chat/ad-hoc invocations).
-            IMPORTANT: Table sort key is `timestamp` — must be unique per item."""
-            if not workflow_id or workflow_id == "unknown":
-                return
-            try:
-                import time
-                self._seq += 1
-                event_id = f"{int(time.time() * 1000)}-{self._seq:06d}"
-                # Unique timestamp with sequence suffix (sort key must never collide)
-                unique_ts = f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())}.{self._seq:04d}Z"
-                detail_map = {}
-                for k, v in detail.items():
-                    if v is not None:
-                        detail_map[k] = {"S": str(v)}
-                _ddb_events_client.put_item(
-                    TableName=_EVENTS_TABLE,
-                    Item={
-                        "workflowId": {"S": workflow_id},
-                        "eventId": {"S": event_id},
-                        "type": {"S": event_type},
-                        "detail": {"M": detail_map},
-                        "timestamp": {"S": unique_ts},
-                    },
-                )
-            except Exception as e:
-                logger.warning(f"[{agent_id}] Failed to publish {event_type} event: {e}")
-
-        def __call__(self, **kwargs):
-            current_tool_use = kwargs.get("current_tool_use", {})
-            data = kwargs.get("data", "")
-            reasoning_text = kwargs.get("reasoningText", "")
-
-            # Tool use events
-            if current_tool_use and current_tool_use.get("name"):
-                if self.previous_tool_use != current_tool_use:
-                    self.previous_tool_use = current_tool_use
-                    tool_name = current_tool_use["name"]
-                    tool_events.append(tool_name)
-                    logger.info(f"[{agent_id}] Tool call: {tool_name}")
+                # Text output events (agent's visible response text)
+                if data:
                     self._publish_event("agent.streaming", {
                         "agentId": agent_id,
-                        "type": "trace",
-                        "toolName": tool_name,
+                        "type": "text",
+                        "content": data,
                         "workflowId": workflow_id,
                     })
 
-            # Text output events (agent's visible response text)
-            if data:
-                self._publish_event("agent.streaming", {
+                # Reasoning/thinking events
+                if reasoning_text:
+                    self._publish_event("agent.streaming", {
+                        "agentId": agent_id,
+                        "type": "reasoning",
+                        "content": reasoning_text,
+                        "workflowId": workflow_id,
+                    })
+
+        # Create agent — we publish events from stream_async loop directly.
+        # Prompt resolves per-invocation: shared-runtime topologies (1 or 4 runtimes)
+        # need the right persona prompt for the agent_id in this payload; 14-runtime
+        # mode short-circuits to the deployed SYSTEM_PROMPT.
+        tracker = ToolTrackingHandler()
+        persona_prompt = _load_prompt_for_agent(agent_id)
+        # name → gen_ai.agent.name on the SDK's auto-emitted invoke_agent span;
+        # trace_attributes → session.id correlation so online evaluations find the
+        # span on the session's traces. session.id falls back to wf-<workflow_id>
+        # so the span stays keyed for the eval-packager even when ADOT header
+        # injection is absent (direct_code_deploy fallback path) — an unkeyed
+        # span is invisible to it.
+        _session_id = getattr(context, "session_id", None)
+        _trace_attrs = {k: v for k, v in {
+            "session.id": _session_id or f"wf-{workflow_id}",
+            "workflow.id": workflow_id,
+            "agent.id": agent_id,
+            "gen_ai.agent.id": agent_id,
+            "ticket.id": _CURRENT_TICKET_ID,
+        }.items() if v}
+        completion_gate = _CompletionGate()
+        agent = Agent(
+            model=active_model,
+            system_prompt=persona_prompt,
+            tools=all_tools,
+            callback_handler=None,
+            hooks=[_OperatorMailbox(workflow_id, agent_id), completion_gate],
+            name=agent_id,
+            trace_attributes=_trace_attrs,
+        )
+
+        # Iterate stream_async — write events to DDB in real-time as they arrive.
+        # Each event gets a unique timestamp (ISO second + sequence suffix) to avoid
+        # sort key collisions. Text is buffered briefly to reduce DDB writes.
+        final_text = ""
+        result = None
+        _text_buffer = ""
+        _FLUSH_THRESHOLD = 200  # chars before flushing text to DDB
+
+        def _flush_text_buffer():
+            nonlocal _text_buffer
+            if _text_buffer:
+                tracker._publish_event("agent.streaming", {
                     "agentId": agent_id,
                     "type": "text",
-                    "content": data,
+                    "content": _text_buffer,
                     "workflowId": workflow_id,
                 })
+                _text_buffer = ""
 
-            # Reasoning/thinking events
-            if reasoning_text:
-                self._publish_event("agent.streaming", {
+        async for event in agent.stream_async(prompt):
+            if "data" in event and event["data"]:
+                # R3.2: post-completion text duplicates the report_completion summary
+                if not completion_gate.engaged:
+                    final_text += event["data"]
+                    _text_buffer += event["data"]
+                    if len(_text_buffer) >= _FLUSH_THRESHOLD:
+                        _flush_text_buffer()
+            elif "current_tool_use" in event:
+                _flush_text_buffer()  # flush pending text before tool event
+                current_tool_use = event["current_tool_use"]
+                if current_tool_use and current_tool_use.get("name"):
+                    if tracker.previous_tool_use != current_tool_use:
+                        tracker.previous_tool_use = current_tool_use
+                        tool_name = current_tool_use["name"]
+                        tool_events.append(tool_name)
+                        logger.info(f"[{agent_id}] Tool call: {tool_name}")
+                        tracker._publish_event("agent.streaming", {
+                            "agentId": agent_id,
+                            "type": "trace",
+                            "toolName": tool_name,
+                            "workflowId": workflow_id,
+                        })
+            elif "reasoningText" in event and event["reasoningText"]:
+                _flush_text_buffer()  # flush pending text before reasoning event
+                tracker._publish_event("agent.streaming", {
                     "agentId": agent_id,
                     "type": "reasoning",
-                    "content": reasoning_text,
+                    "content": event["reasoningText"],
                     "workflowId": workflow_id,
                 })
+            if "result" in event:
+                result = event["result"]
 
-    # Create agent — we publish events from stream_async loop directly.
-    # Prompt resolves per-invocation: shared-runtime topologies (1 or 4 runtimes)
-    # need the right persona prompt for the agent_id in this payload; 14-runtime
-    # mode short-circuits to the deployed SYSTEM_PROMPT.
-    tracker = ToolTrackingHandler()
-    persona_prompt = _load_prompt_for_agent(agent_id)
-    agent = Agent(
-        model=active_model,
-        system_prompt=persona_prompt,
-        tools=all_tools,
-        callback_handler=None,
-        hooks=[_OperatorMailbox(workflow_id, agent_id)],
-    )
+        # Flush any remaining buffered text after stream ends
+        _flush_text_buffer()
 
-    # Iterate stream_async — write events to DDB in real-time as they arrive.
-    # Each event gets a unique timestamp (ISO second + sequence suffix) to avoid
-    # sort key collisions. Text is buffered briefly to reduce DDB writes.
-    final_text = ""
-    result = None
-    _text_buffer = ""
-    _FLUSH_THRESHOLD = 200  # chars before flushing text to DDB
+        # Extract final text from result if stream didn't produce text (fallback).
+        # Gated on the completion gate so it can't resurrect suppressed text (R3.2).
+        if not final_text and result and not completion_gate.engaged:
+            msg = getattr(result, "message", None) or (result if isinstance(result, dict) else None)
+            if msg:
+                content = msg.get("content", []) if isinstance(msg, dict) else getattr(msg, "content", [])
+                for block in (content or []):
+                    if isinstance(block, dict) and "text" in block:
+                        final_text += block["text"]
 
-    def _flush_text_buffer():
-        nonlocal _text_buffer
-        if _text_buffer:
-            tracker._publish_event("agent.streaming", {
-                "agentId": agent_id,
-                "type": "text",
-                "content": _text_buffer,
-                "workflowId": workflow_id,
-            })
-            _text_buffer = ""
+        logger.info(f"[{agent_id}] Invocation complete for workflow {workflow_id}, output: {len(final_text)} chars, tools used: {len(tool_events)}")
 
-    async for event in agent.stream_async(prompt):
-        if "data" in event and event["data"]:
-            final_text += event["data"]
-            _text_buffer += event["data"]
-            if len(_text_buffer) >= _FLUSH_THRESHOLD:
-                _flush_text_buffer()
-        elif "current_tool_use" in event:
-            _flush_text_buffer()  # flush pending text before tool event
-            current_tool_use = event["current_tool_use"]
-            if current_tool_use and current_tool_use.get("name"):
-                if tracker.previous_tool_use != current_tool_use:
-                    tracker.previous_tool_use = current_tool_use
-                    tool_name = current_tool_use["name"]
-                    tool_events.append(tool_name)
-                    logger.info(f"[{agent_id}] Tool call: {tool_name}")
-                    tracker._publish_event("agent.streaming", {
-                        "agentId": agent_id,
-                        "type": "trace",
-                        "toolName": tool_name,
-                        "workflowId": workflow_id,
-                    })
-        elif "reasoningText" in event and event["reasoningText"]:
-            _flush_text_buffer()  # flush pending text before reasoning event
-            tracker._publish_event("agent.streaming", {
-                "agentId": agent_id,
-                "type": "reasoning",
-                "content": event["reasoningText"],
-                "workflowId": workflow_id,
-            })
-        if "result" in event:
-            result = event["result"]
+        # Persist this turn to AgentCore Memory (no-op without MEMORY_ID env var)
+        _save_memory_event(agent_id, getattr(context, "session_id", None), prompt, final_text)
 
-    # Flush any remaining buffered text after stream ends
-    _flush_text_buffer()
+        # Emit tool_use events FIRST so the agent-invoker can publish them for real-time UI flashing.
+        for tool_name in tool_events:
+            yield {"event": {"contentBlockStart": {"start": {"toolUse": {"name": tool_name}}}}}
 
-    # Extract final text from result if stream didn't produce text (fallback)
-    if not final_text and result:
-        msg = getattr(result, "message", None) or (result if isinstance(result, dict) else None)
-        if msg:
-            content = msg.get("content", []) if isinstance(msg, dict) else getattr(msg, "content", [])
-            for block in (content or []):
-                if isinstance(block, dict) and "text" in block:
-                    final_text += block["text"]
-
-    logger.info(f"[{agent_id}] Invocation complete for workflow {workflow_id}, output: {len(final_text)} chars, tools used: {len(tool_events)}")
-
-    # Persist this turn to AgentCore Memory (no-op without MEMORY_ID env var)
-    _save_memory_event(agent_id, getattr(context, "session_id", None), prompt, final_text)
-
-    # Emit tool_use events FIRST so the agent-invoker can publish them for real-time UI flashing.
-    for tool_name in tool_events:
-        yield {"event": {"contentBlockStart": {"start": {"toolUse": {"name": tool_name}}}}}
-
-    # Then emit the final text as a single contentBlockDelta event
-    yield {"event": {"contentBlockDelta": {"delta": {"text": final_text}}}}
+        # Then emit the final text as a single contentBlockDelta event
+        yield {"event": {"contentBlockDelta": {"delta": {"text": final_text}}}}
+    finally:
+        # Deliver queued spans before the microVM becomes freeze-eligible.
+        # BatchSpanProcessor exports on a daemon thread on a 5s batch delay;
+        # after complete_async_task the microVM may freeze immediately, so
+        # spans ended in the final <=5s window would be lost for short
+        # sessions (this explains partial eval failures). force_flush blocks
+        # its caller, hence asyncio.to_thread. Fail-open per R1.4.
+        try:
+            import asyncio as _flush_asyncio
+            from opentelemetry import trace as _flush_trace_api
+            provider = _flush_trace_api.get_tracer_provider()
+            if hasattr(provider, "force_flush"):
+                await _flush_asyncio.to_thread(provider.force_flush, 5000)  # timeout_millis
+        except Exception as e:  # noqa: BLE001 — R1.4
+            logger.warning(f"[{agent_id}] telemetry flush failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":

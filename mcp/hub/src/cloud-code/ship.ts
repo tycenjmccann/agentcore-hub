@@ -28,6 +28,9 @@ import { detectArtifacts, uploadArtifact, stageArtifactLocally, ensureCloudCodeE
 
 const ShipSchema = z.object({
   title: z.string().min(1),
+  // Imperative directive for the intake agent. `description` kept as a
+  // back-compat alias for older callers; instructions wins when both are set.
+  instructions: z.string().optional(),
   description: z.string().optional(),
   branch: z.string().optional(),
   commitMessage: z.string().optional(),
@@ -55,11 +58,12 @@ export const SHIP_TOOL = {
     required: ["title"],
     properties: {
       title: { type: "string", description: "Workflow title — one line describing what to build." },
-      description: {
+      instructions: {
         type: "string",
         description:
-          "Summary of the plan for the intake agent: goal, decisions already made, constraints, done-when. " +
-          "The full context travels in the session transcript; this is the orientation layer on top.",
+          "Imperative directive to the intake agent — tell it what to do, not just what happened: " +
+          "goal, decisions already locked, hard constraints, done-when, and whether to deploy or stop at a PR. " +
+          "The full context travels in the session transcript; this is the marching order on top of it.",
       },
       branch: { type: "string", description: "Branch to push the in-flight work to. Defaults to the current branch (or feat/ship-<id> when on the default branch)." },
       commitMessage: { type: "string", description: "Commit message for the in-flight snapshot." },
@@ -201,7 +205,7 @@ export async function runShip(rawArgs: unknown) {
     body: JSON.stringify({
       title: args.title,
       description:
-        (args.description || "").trim() ||
+        (args.instructions ?? args.description ?? "").trim() ||
         `Pre-planned in a live coding session (resume it for the full context). Continue the work on branch ${handoff.branch}.`,
       repoConfig: {
         layout: "monorepo",

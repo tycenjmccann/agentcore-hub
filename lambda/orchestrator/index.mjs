@@ -2377,12 +2377,18 @@ async function ensureFeatureBranch(workflow) {
 // ─── EventBridge Publishing ────────────────────────────────────────────────────
 
 async function publishEvent(ticketId, detailType, detail) {
+  // ONE timestamp for both writes (and inside detail): the anomaly-watcher
+  // dedupes the EventBridge copy against the direct copy by
+  // (workflowId, type, timestamp, ticketId, agentId) — two generated
+  // timestamps would give the copies different keys and double every sample.
+  const timestamp = new Date().toISOString();
+  const stamped = { ...detail, ticketId, timestamp };
   try {
     await events.send(new PutEventsCommand({
       Entries: [{
         Source: "agentcore-hub.orchestrator",
         DetailType: detailType,
-        Detail: JSON.stringify({ ...detail, ticketId, timestamp: new Date().toISOString() }),
+        Detail: JSON.stringify(stamped),
         EventBusName: EVENT_BUS,
       }],
     }));
@@ -2399,8 +2405,8 @@ async function publishEvent(ticketId, detailType, detail) {
           workflowId: detail.workflowId || ticketId,
           eventId: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           type: detailType,
-          detail,
-          timestamp: new Date().toISOString(),
+          detail: stamped,
+          timestamp,
         },
       }));
     } catch { /* non-fatal */ }

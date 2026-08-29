@@ -165,7 +165,11 @@ AGENTS=(
 
 RESULTS_FILE="$SCRIPT_DIR/fleet-runtime-ids.json"
 
-# Deploy in parallel using deploy-one.sh helper
+# Deploy in parallel using deploy-one.sh helper.
+# Every runtime env var — including the OTel/observability set
+# (AGENT_OBSERVABILITY_ENABLED, OTEL_PYTHON_DISTRO, OTEL_SERVICE_NAME, …) —
+# comes from deploy-one.sh (lightweight) or deploy-one-robust.py (robust).
+# This script never configures a runtime itself, so there is nothing to mirror here.
 echo "Deploying ${#AGENTS[@]} agents (3 concurrent)..."
 echo ""
 

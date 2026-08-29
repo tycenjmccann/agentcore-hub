@@ -29,6 +29,12 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { gunzipSync } from 'zlib';
+import {
+  classifyEntry,
+  computeBatchSummary,
+  emfRecord,
+  sessionsMissingSpan,
+} from './lib/classify.mjs';
 
 // ─── Clients ────────────────────────────────────────────────────────────────
 const ddbRaw = new DynamoDBClient({});
@@ -146,17 +152,37 @@ export const handler = async (event) => {
     return { statusCode: 200, body: 'disabled' };
   }
 
-  // 5. Sample rate check
+  // 5. Classify this delivery's sessions and emit telemetry-health metrics.
+  //    Done BEFORE the sample-rate gate below: telemetry health (span_missing)
+  //    must be measured on ALL deliveries, not just the sampled subset that
+  //    gets buffered. sessionData was already extracted at step 2 (before any
+  //    DDB access), so battery rows are filtered out of evaluatorResults and
+  //    never reach the classifiers.
+  const { statuses, total, spanMissing } = classifySessions(sessionData);
+  if (total > 0) {
+    emitEvalMetrics(agentId, { total, spanMissing });
+    sessionData.sessionStatus = Object.fromEntries(statuses);
+    if (spanMissing > 0) sessionData.status = 'span_missing';
+    console.log(`[eval-packager] ${agentId}: sessions=${total} span_missing=${spanMissing}`);
+  }
+
+  // Preflight alert: any session whose invoke_agent span never arrived is a
+  // telemetry failure, not a quality failure. Surface it at INGEST time (and,
+  // like the session tally above, before the sample-rate gate) — waiting for
+  // the flush hides a broken runtime for a whole batch.
+  emitMissingSpanAlerts(agentId, sessionData.evaluatorResults);
+
+  // 6. Sample rate check
   const sampleRate = config.sampleRate ?? 100;
   if (Math.random() * 100 >= sampleRate) {
     console.log(`[eval-packager] Agent ${agentId} sample-rate miss (rate=${sampleRate}%). Skipping.`);
     return { statusCode: 200, body: 'sampled-out' };
   }
 
-  // 6. Aggregate eval scores into DDB (for instant dashboard loads)
-  await aggregateScoresToDdb(agentId, parsed);
+  // 7. Aggregate eval scores into DDB (for instant dashboard loads)
+  await aggregateScoresToDdb(agentId, parsed, sessionData.evaluatorResults);
 
-  // 7. Append to sessionBuffer, counting distinct runs toward batchSize
+  // 8. Append to sessionBuffer, counting distinct runs toward batchSize
   const batchSize = config.batchSize || 10;
   const appended = await appendToBuffer(agentId, sessionData, batchSize);
 
@@ -177,7 +203,7 @@ export const handler = async (event) => {
       );
       return { statusCode: 200, body: 'cooldown' };
     }
-    // 8. Batch is full → flush to S3 + synthesize PRD
+    // 9. Batch is full → flush to S3 + synthesize PRD
     await flushBuffer(agentId, appended.buffer, batchSize);
   }
 
@@ -229,23 +255,32 @@ export function extractSessionData(parsed) {
       // gen_ai.* keys, NOT top-level fields. Reading parsedMessage.score/.evidence
       // produced all-null batches the improver couldn't synthesize from.
       const rawScore = attrs['gen_ai.evaluation.score.value'];
-      sessionBuffer.push({
+      const numericScore = rawScore !== undefined && rawScore !== null ? Number(rawScore) : null;
+      const entry = {
         timestamp: event.timestamp,
         sessionId: sid,
         evaluatorName: attrs['gen_ai.evaluation.name'] || parsedMessage.evaluatorName || null,
-        score: rawScore !== undefined && rawScore !== null ? Number(rawScore) : null,
+        // Number(rawScore) coerces non-numeric garbage (e.g. "not-a-number") to
+        // NaN, and NaN !== null — that defeated classifySessions' allNull check
+        // and marked span_missing sessions as "scored". Store null instead so
+        // malformed scores participate in null/error/span_missing classification.
+        score: Number.isFinite(numericScore) ? numericScore : null,
         scoreLabel: attrs['gen_ai.evaluation.score.label'] || null,
         evidence: attrs['gen_ai.evaluation.explanation'] || parsedMessage.evidence || null,
         errorType: attrs['error.type'] || null,
         errorMessage: attrs['error.message'] || null,
-      });
+      };
+      // status/statusReason let the improver (and the dashboard) tell an un-scored
+      // run apart from a badly-scored one instead of averaging nulls into zeros.
+      sessionBuffer.push({ ...entry, ...classifyEntry(entry) });
     } catch {
       // If message is not valid JSON, include it as raw text with a flag
-      sessionBuffer.push({
+      const entry = {
         timestamp: event.timestamp,
         rawMessage: event.message,
         parseError: true,
-      });
+      };
+      sessionBuffer.push({ ...entry, ...classifyEntry(entry) });
     }
   }
 
@@ -256,6 +291,98 @@ export function extractSessionData(parsed) {
     sessionIds: [...sessionIds],
     evaluatorResults: sessionBuffer,
   };
+}
+
+/**
+ * Emit one combined structured-log + EMF record per session whose agent
+ * invocation span never reached the evaluator.
+ *
+ * Deliberately narrower than classifySessions below: this fires only on a
+ * CONFIRMED missing-span error (or all-null scores alongside an errorType),
+ * feeding the per-session agentcore-hub-eval-missing-span alarm, while
+ * classifySessions tallies every session for the fleet-level
+ * EvalSessionsSpanMissing metric.
+ *
+ * The single JSON line is doing two jobs: it's greppable in CloudWatch Logs
+ * Insights (level/event/agentId/sessionId) AND it publishes the
+ * `eval.preflight.missing_span` metric via EMF, which the
+ * agentcore-hub-eval-missing-span alarm watches. No PutMetricData call, so no
+ * extra IAM and no added latency on the ingest path.
+ *
+ * Non-fatal by construction: an alerting failure must never cost us the batch.
+ */
+function emitMissingSpanAlerts(agentId, entries) {
+  try {
+    const affected = sessionsMissingSpan(entries);
+    for (const session of affected) {
+      console.log(
+        JSON.stringify(
+          emfRecord('eval.preflight.missing_span', 1, 'Count', agentId, {
+            level: 'error',
+            event: 'eval.preflight.missing_span',
+            sessionId: session.sessionId,
+            statusReason: session.reason,
+          })
+        )
+      );
+    }
+    if (affected.length > 0) {
+      console.warn(
+        `[eval-packager] ${agentId}: ${affected.length} session(s) missing the invoke_agent span ` +
+          '— these runs were never scored (check runtime telemetry, not agent quality).'
+      );
+    }
+  } catch (err) {
+    console.error(`[eval-packager] ${agentId} missing-span alert failed:`, err.message);
+  }
+}
+
+/**
+ * Classify each distinct session in this delivery.
+ * Returns { statuses: Map<sessionId, 'scored'|'span_missing'|'error'>, total, spanMissing }
+ */
+export function classifySessions(sessionData) {
+  const bySession = new Map();
+  for (const r of sessionData.evaluatorResults) {
+    if (r.parseError || !r.sessionId) continue;      // unattributable rows
+    if (!bySession.has(r.sessionId)) bySession.set(r.sessionId, []);
+    bySession.get(r.sessionId).push(r);
+  }
+  const statuses = new Map();
+  for (const [sid, rows] of bySession) {
+    const allNull = rows.every((r) => r.score === null);
+    const hasError = rows.some((r) => r.errorType);
+    statuses.set(sid, !allNull ? 'scored' : hasError ? 'error' : 'span_missing');
+  }
+  return {
+    statuses,
+    total: bySession.size,
+    spanMissing: [...statuses.values()].filter((s) => s === 'span_missing').length,
+  };
+}
+
+/**
+ * Emit fleet span_missing health metrics as a single EMF log record.
+ * CloudWatch Logs auto-extracts these into the AgentCoreHub/Evaluations
+ * namespace — no CloudWatch SDK call, no new dependency.
+ */
+export function emitEvalMetrics(agentName, { total, spanMissing }) {
+  console.log(JSON.stringify({
+    _aws: {
+      Timestamp: Date.now(),
+      CloudWatchMetrics: [{
+        Namespace: 'AgentCoreHub/Evaluations',
+        Dimensions: [['AgentName']],
+        Metrics: [
+          { Name: 'EvalSessionsTotal', Unit: 'Count' },
+          { Name: 'EvalSessionsSpanMissing', Unit: 'Count' },
+        ],
+      }],
+    },
+    AgentName: agentName,
+    EvalSessionsTotal: total,
+    EvalSessionsSpanMissing: spanMissing,
+  }));
 }
 
 /**
@@ -309,8 +436,18 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
  * Aggregate evaluation scores into DDB for instant dashboard reads.
  * Maintains a rolling scorecard: { evaluatorName: { sum, count } }
  * and a session count. Read-modify-write with low contention.
+ *
+ * Additionally maintains a rolling { success, error, pending, skipped } tally
+ * (evalStatusCounts) plus the last error's timestamp/reason, so a dashboard can
+ * say "8 of 10 runs never scored" instead of showing an average built from two
+ * data points. The score aggregation above is deliberately untouched: a run that
+ * errored still must not contribute to evalScores.
+ *
+ * @param {Array<object>} [entries] classified evaluator-result entries for this
+ *   delivery (from extractSessionData). Optional — omitted or empty leaves the
+ *   status tally alone.
  */
-export async function aggregateScoresToDdb(agentId, parsed) {
+export async function aggregateScoresToDdb(agentId, parsed, entries = []) {
   const logEvents = parsed.logEvents || [];
   const sessions = new Set();
   const scoreDeltas = {}; // { evaluatorName: { sum, count } }
@@ -335,9 +472,12 @@ export async function aggregateScoresToDdb(agentId, parsed) {
       const hasError = attrs['error'] === 1 || attrs['error.type'];
 
       if (sessionId) sessions.add(sessionId);
-      if (evaluator && score !== undefined && score !== null && !hasError) {
+      const numericScore = score !== undefined && score !== null ? Number(score) : null;
+      // Number.isFinite gate: non-numeric garbage coerces to NaN, which would
+      // otherwise poison the rolling sum/count in the DDB scorecard.
+      if (evaluator && Number.isFinite(numericScore) && !hasError) {
         if (!scoreDeltas[evaluator]) scoreDeltas[evaluator] = { sum: 0, count: 0 };
-        scoreDeltas[evaluator].sum += Number(score);
+        scoreDeltas[evaluator].sum += numericScore;
         scoreDeltas[evaluator].count += 1;
       }
     } catch { /* skip */ }
@@ -350,7 +490,7 @@ export async function aggregateScoresToDdb(agentId, parsed) {
     const { Item } = await ddb.send(new GetCommand({
       TableName: TABLE,
       Key: { agentId },
-      ProjectionExpression: 'evalScores, evalSessionCount',
+      ProjectionExpression: 'evalScores, evalSessionCount, evalStatusCounts',
     }));
 
     const existing = Item?.evalScores || {};
@@ -363,19 +503,58 @@ export async function aggregateScoresToDdb(agentId, parsed) {
       existing[evaluator].count += delta.count;
     }
 
+    // Merge this delivery's status tally on top of the stored one. Same
+    // read-modify-write shape as evalScores above, and it can't fail on a
+    // first write the way a nested `evalStatusCounts.success` path update would.
+    const deliverySummary = computeBatchSummary(entries);
+    const statusCounts = {
+      success: 0,
+      error: 0,
+      pending: 0,
+      skipped: 0,
+      ...(Item?.evalStatusCounts || {}),
+    };
+    statusCounts.success += deliverySummary.successCount;
+    statusCounts.error += deliverySummary.errorCount;
+    statusCounts.pending += deliverySummary.nullCount;
+    statusCounts.skipped += deliverySummary.skippedCount;
+
+    const now = new Date().toISOString();
+    const updateExpr = [
+      'evalScores = :scores',
+      'evalSessionCount = :sc',
+      'evalLastScoredAt = :now',
+      'evalStatusCounts = :statusCounts',
+    ];
+    const values = {
+      ':scores': existing,
+      ':sc': existingSessions + sessions.size,
+      ':now': now,
+      ':statusCounts': statusCounts,
+    };
+
+    // Only stamp the last-error fields when this delivery actually errored —
+    // otherwise a clean delivery would erase the breadcrumb we need to debug.
+    if (deliverySummary.errorCount > 0) {
+      const firstError = (entries || []).find((e) => e.status === 'error');
+      updateExpr.push('evalLastErrorAt = :errAt', 'evalLastErrorReason = :errReason');
+      values[':errAt'] = now;
+      values[':errReason'] = String(firstError?.statusReason || 'unknown eval error').slice(0, 200);
+    }
+
     // Write merged scorecard
     await ddb.send(new UpdateCommand({
       TableName: TABLE,
       Key: { agentId },
-      UpdateExpression: 'SET evalScores = :scores, evalSessionCount = :sc, evalLastScoredAt = :now',
-      ExpressionAttributeValues: {
-        ':scores': existing,
-        ':sc': existingSessions + sessions.size,
-        ':now': new Date().toISOString(),
-      },
+      UpdateExpression: 'SET ' + updateExpr.join(', '),
+      ExpressionAttributeValues: values,
     }));
 
-    console.log(`[eval-packager] ${agentId}: aggregated ${Object.keys(scoreDeltas).length} evaluators, ${sessions.size} sessions`);
+    console.log(
+      `[eval-packager] ${agentId}: aggregated ${Object.keys(scoreDeltas).length} evaluators, ${sessions.size} sessions ` +
+        `(delivery: ${deliverySummary.successCount} success / ${deliverySummary.errorCount} error / ` +
+        `${deliverySummary.nullCount} pending / ${deliverySummary.skippedCount} skipped)`
+    );
   } catch (err) {
     // Non-fatal — don't break the buffer/flush pipeline
     console.error(`[eval-packager] ${agentId} score aggregation failed:`, err.message);
@@ -386,7 +565,9 @@ export async function aggregateScoresToDdb(agentId, parsed) {
  * Flush the session buffer. ORDER MATTERS:
  *   1. Reset the DDB buffer FIRST (the batch is already captured in memory).
  *   2. Archive the raw batch to batches/.
- *   3. Synthesize a PRD via the Fleet Improver and write it to prd/.
+ *   3. Synthesize a PRD via the Fleet Improver and write it to prd/ — UNLESS the
+ *      batch carries no evidence (see the evidence guard below), in which case
+ *      the batch is archived and the loop stops here.
  *
  * The reset must happen before the (60–240s) synthesis call, not after. If it
  * came last, the run set would stay at batchSize for the whole synthesis
@@ -398,12 +579,39 @@ export async function aggregateScoresToDdb(agentId, parsed) {
 async function flushBuffer(agentId, buffer, batchSize) {
   const timestamp = new Date().toISOString();
 
+  // Roll the whole batch up so the improver prompt leads with "how much of this
+  // batch actually got scored" instead of having to infer it from raw records.
+  // Pure computation — nothing here touches DDB, so the claim below stays first.
+  const summary = computeBatchSummary(
+    (buffer || []).flatMap((s) => s?.evaluatorResults || [])
+  );
+
   const batchPayload = {
     agentId,
     batchSize,
     flushedAt: timestamp,
+    summary,
     sessions: buffer,
   };
+
+  // Batch health metric — the agentcore-hub-eval-null-or-error-rate-high alarm
+  // watches this. Non-fatal: never lose a batch over a metric line.
+  try {
+    console.log(
+      JSON.stringify(
+        emfRecord('eval.batch.null_or_error_rate', summary.nullOrErrorRate, 'Percent', agentId, {
+          successCount: summary.successCount,
+          errorCount: summary.errorCount,
+          nullCount: summary.nullCount,
+          skippedCount: summary.skippedCount,
+          scoredTotal: summary.scoredTotal,
+          totalCount: summary.totalCount,
+        })
+      )
+    );
+  } catch (err) {
+    console.error(`[eval-packager] ${agentId} batch metric emit failed:`, err.message);
+  }
 
   // 1. Reset sessionBuffer AND the distinct-run set in DDB FIRST — claim the
   //    batch so concurrent invocations append into a fresh buffer instead of
@@ -436,7 +644,45 @@ async function flushBuffer(agentId, buffer, batchSize) {
     `[eval-packager] FLUSHED | agent=${agentId} | batchSize=${buffer.length} | archived=${batchKey}`
   );
 
-  // 3. Synthesize a PRD from the batch and write it to prd/ (triggers the loop).
+  // 3. Evidence guard — do NOT synthesize a PRD from a batch that contains no
+  //    evidence. Two shapes qualify: nothing was ever scored (scoredTotal === 0)
+  //    or everything the evaluator attempted failed (rate at the 100 maximum).
+  //    Both mean the runtime/telemetry pipeline is broken, and a PRD built from
+  //    them is the improver hallucinating quality findings out of zero data —
+  //    which then starts a 14-agent workflow and opens a PR against a phantom.
+  //    The archive above is deliberately untouched: the batch stays on S3 for
+  //    debugging, we just don't act on it. Checked here rather than inside
+  //    synthesizeAndWritePrd so the suppression is logged whether or not
+  //    IMPROVER_ARN is configured.
+  if (summary.scoredTotal === 0 || summary.nullOrErrorRate >= 100) {
+    console.log(
+      JSON.stringify({
+        level: 'warn',
+        event: 'eval.prd.synthesis_suppressed',
+        agentId,
+        reason:
+          summary.scoredTotal === 0
+            ? 'no evaluator-attempted entries in batch (scoredTotal=0)'
+            : 'every evaluator-attempted entry failed (nullOrErrorRate at maximum)',
+        scoredTotal: summary.scoredTotal,
+        nullOrErrorRate: summary.nullOrErrorRate,
+        successCount: summary.successCount,
+        errorCount: summary.errorCount,
+        nullCount: summary.nullCount,
+        skippedCount: summary.skippedCount,
+        totalCount: summary.totalCount,
+        archivedKey: batchKey,
+      })
+    );
+    console.warn(
+      `[eval-packager] ${agentId}: PRD synthesis SUPPRESSED — scoredTotal=${summary.scoredTotal}, ` +
+        `nullOrErrorRate=${summary.nullOrErrorRate}%. Batch archived at ${batchKey}; no workflow triggered. ` +
+        'Fix the eval/telemetry pipeline, not the agent.'
+    );
+    return;
+  }
+
+  // 4. Synthesize a PRD from the batch and write it to prd/ (triggers the loop).
   //    Best-effort: a transient improver failure leaves the batch archived and
   //    the buffer already reset, so the flush never wedges.
   try {

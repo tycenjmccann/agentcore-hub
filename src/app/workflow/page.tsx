@@ -7,6 +7,7 @@ import WorkflowManagerChat from "@/components/workflow/WorkflowManagerChat";
 import IntakeForm from "@/components/workflow/IntakeForm";
 import type { WorkflowState, WorkflowInput } from "@/lib/workflow/types";
 import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
+import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
 import DeleteConfirmationModal from "@/components/workflow/DeleteConfirmationModal";
 
 interface WorkflowSummary {
@@ -18,6 +19,7 @@ interface WorkflowSummary {
   completedAt?: string;
   workflowType?: "feature" | "bug";
   workflowDefId?: string;
+  sdlcFramework?: "playbook" | "aidlc";
 }
 
 function BugIcon({ className }: { className?: string }) {
@@ -83,6 +85,9 @@ export default function WorkflowPage() {
           completedAt: w.completedAt,
           workflowType: w.workflowType,
           workflowDefId: w.workflowDefId,
+          // The summary is a client-side pick of the raw DDB item (the list API
+          // returns items unprojected) — carry sdlcFramework so the badge has data.
+          sdlcFramework: w.sdlcFramework ?? w.input?.sdlcFramework,
         }))
         .filter((w: WorkflowSummary) => w.id);
       // Sort: active first, then by date descending
@@ -445,6 +450,7 @@ export default function WorkflowPage() {
         open={chatOpen}
         onClose={() => { setChatOpen(false); setChatSeedWorkflowId(null); }}
         selectedWorkflowId={selectedId}
+        selectedWorkflowPhase={workflows.find((w) => w.id === selectedId)?.phase ?? null}
         seedWorkflowId={chatSeedWorkflowId}
       />
 
@@ -496,6 +502,7 @@ function WorkflowListItem({
   const timeStr = formatRelativeTime(workflow.startedAt);
   const def = getWorkflowDef(workflow.workflowDefId);
   const defLabel = def.displayName || def.name;
+  const fw = resolveSdlcFramework(workflow.sdlcFramework);
 
   return (
     <div
@@ -582,11 +589,14 @@ function WorkflowListItem({
             </div>
           )}
           <div className="flex items-center justify-between mt-1">
-            <span
-              className="text-[9px] px-1.5 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)] border border-[var(--color-border)] font-medium uppercase tracking-wider truncate"
-              title={def.name}
-            >
-              {defLabel}
+            <span className="flex items-center gap-1 min-w-0">
+              <span
+                className="text-[9px] px-1.5 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)] border border-[var(--color-border)] font-medium uppercase tracking-wider truncate"
+                title={def.name}
+              >
+                {defLabel}
+              </span>
+              <span className={SDLC_BADGE_META[fw].listClassName} title={SDLC_BADGE_META[fw].tooltip} aria-label={SDLC_BADGE_META[fw].tooltip}>{SDLC_BADGE_META[fw].label}</span>
             </span>
             {!isRunning && onDelete && (
               <button

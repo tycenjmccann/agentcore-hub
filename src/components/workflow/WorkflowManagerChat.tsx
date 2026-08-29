@@ -18,6 +18,8 @@ interface Props {
   open: boolean;
   onClose: () => void;
   selectedWorkflowId?: string | null;
+  /** Phase of the selected workflow — drives run-scoped quick prompts. */
+  selectedWorkflowPhase?: string | null;
   /** Seeded when the user clicks "Ask about this run"; scopes the next message. */
   seedWorkflowId?: string | null;
 }
@@ -28,11 +30,39 @@ interface ChatMessage {
   tool?: string;
 }
 
-const QUICK_PROMPTS = [
+const FLEET_PROMPTS = [
   "What's our biggest bottleneck across recent runs?",
   "Compare our last two workflow runs.",
   "Which review gates cost the most time?",
 ];
+
+// When the drawer opens on a specific run, ask about THAT run — the questions a
+// PM actually has when staring at an in-flight board.
+const ACTIVE_RUN_PROMPTS = [
+  "Why is this workflow stalled? Check what it's waiting on.",
+  "What's the current progress — which agents are done, running, or blocked?",
+  "Check the tickets — is the re-work laid out correctly?",
+  "Is anything waiting on me (a review gate or human approval)?",
+];
+
+const DONE_RUN_PROMPTS = [
+  "Give me a quick read on this run — what went well and what didn't?",
+  "Where did this run lose the most time?",
+  "Did all the work actually ship, or did anything slip through?",
+];
+
+const FAILED_RUN_PROMPTS = [
+  "Why did this run fail? Walk me through the root cause.",
+  "What was completed before the failure, and what's salvageable?",
+  "Should we retry this run or start over?",
+];
+
+function promptsFor(workflowId?: string | null, phase?: string | null): string[] {
+  if (!workflowId) return FLEET_PROMPTS;
+  if (phase === "error" || phase === "cancelled") return FAILED_RUN_PROMPTS;
+  if (phase === "complete") return DONE_RUN_PROMPTS;
+  return ACTIVE_RUN_PROMPTS;
+}
 
 function getConversationId(): string {
   const KEY = "wm-chat-conversation-id";
@@ -44,7 +74,7 @@ function getConversationId(): string {
   return id;
 }
 
-export default function WorkflowManagerChat({ open, onClose, selectedWorkflowId, seedWorkflowId }: Props) {
+export default function WorkflowManagerChat({ open, onClose, selectedWorkflowId, selectedWorkflowPhase, seedWorkflowId }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -167,9 +197,9 @@ export default function WorkflowManagerChat({ open, onClose, selectedWorkflowId,
         <div className="wmc-messages" ref={scrollRef}>
           {messages.length === 0 && (
             <div className="wmc-intro">
-              <p>Ask about any workflow, run, bottleneck, or trend.</p>
+              <p>{selectedWorkflowId ? "Ask about this run — or any workflow, bottleneck, or trend." : "Ask about any workflow, run, bottleneck, or trend."}</p>
               <div className="wmc-quick">
-                {QUICK_PROMPTS.map((p) => (
+                {promptsFor(selectedWorkflowId, selectedWorkflowPhase).map((p) => (
                   <button key={p} className="wmc-quick-btn" onClick={() => send(p)} disabled={streaming}>{p}</button>
                 ))}
               </div>

@@ -201,6 +201,18 @@ PROMPT_ENV="--env SYSTEM_PROMPT_S3_KEY=${PROMPT_S3_KEY}"
 
 # Run `agentcore deploy`, retrying once if S3 races with another concurrent
 # fleet deploy (the toolkit creates a shared codebuild bucket internally).
+#
+# OTel note (TEAM-3103/TEAM-3313): these are Runtime-hosted agents — the
+# platform injects ADOT and with it AGENT_OBSERVABILITY_ENABLED, the
+# OTEL_PYTHON_* distro/configurator vars, the OTLP endpoint, auth headers and
+# resource attributes. Only the per-persona vars are ours to set. In
+# particular do NOT set OTEL_RESOURCE_ATTRIBUTES — the platform ADOT default
+# carries aws.log.group.names, and a deploy-time value REPLACES (never merges
+# with) the platform one, breaking CloudWatch log-group correlation.
+# OTEL_SERVICE_NAME takes precedence over service.name in resource attributes
+# per the OTel spec, so per-persona identity is preserved without it. NEVER
+# set DISABLE_ADOT_OBSERVABILITY: without ADOT the invoke_agent span is never
+# exported and eval batches score 0/10.
 run_deploy() {
   # shellcheck disable=SC2086 # PROMPT_ENV/MCP_ENV deliberately word-split into --env args
   agentcore deploy \
@@ -221,6 +233,9 @@ run_deploy() {
     --env "PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers" \
     --env "HOME=/tmp" \
     --env "TMPDIR=/tmp" \
+    --env "UNIFIED_TRACES_DESTINATION_ENABLED=true" \
+    --env "OTEL_SERVICE_NAME=${AGENT_NAME}" \
+    --env "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true" \
     ${FLEET_MEMORY_ID:+--env "MEMORY_ID=${FLEET_MEMORY_ID}"} \
     ${IOS_TEST_GATEWAY_URL:+--env "IOS_TEST_GATEWAY_URL=${IOS_TEST_GATEWAY_URL}"} \
     ${CODING_AGENT_RUNTIME_ARN:+--env "CODING_AGENT_RUNTIME_ARN=${CODING_AGENT_RUNTIME_ARN}"} \

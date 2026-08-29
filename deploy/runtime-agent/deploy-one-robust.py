@@ -66,6 +66,22 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         "HOME": "/root",
         "TMPDIR": "/tmp",
         "SYSTEM_PROMPT_S3_KEY": prompt_key,
+        # ─── OTel / AgentCore observability (TEAM-3102/TEAM-3103/TEAM-3313) ──
+        # This is a Runtime-hosted agent: the platform injects ADOT and with it
+        # AGENT_OBSERVABILITY_ENABLED, the OTEL_PYTHON_* distro/configurator
+        # vars, the OTLP endpoint, auth headers and resource attributes. Only
+        # the per-persona vars are ours to set (test_build_env_vars.py pins
+        # the platform-managed list). In particular do NOT set
+        # OTEL_RESOURCE_ATTRIBUTES — the platform ADOT default carries
+        # aws.log.group.names, and a deploy-time value REPLACES (never merges
+        # with) the platform one, breaking CloudWatch log-group correlation.
+        # OTEL_SERVICE_NAME takes precedence over service.name in resource
+        # attributes per the OTel spec, so per-persona identity is preserved
+        # without it. NEVER set DISABLE_ADOT_OBSERVABILITY: without ADOT the
+        # invoke_agent span is never exported and eval batches score 0/10.
+        "UNIFIED_TRACES_DESTINATION_ENABLED": "true",
+        "OTEL_SERVICE_NAME": agent_name,
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true",
     }
     if gw := os.environ.get("GATEWAY_ARN"):
         env["GATEWAY_ARN"] = gw

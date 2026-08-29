@@ -14,6 +14,7 @@
 
 import { NextRequest } from "next/server";
 import { invokeHarnessAgent, DEFAULT_REGION } from "@/lib/agentcore-sdk";
+import { getWorkflowFromDynamo, getLastEventForWorkflow } from "@/lib/workflow/dynamo-read";
 import {
   BedrockAgentCoreControlClient,
   ListHarnessesCommand,
@@ -36,6 +37,60 @@ async function resolveHarnessArn(region: string): Promise<string | null> {
   return cachedHarnessArn;
 }
 
+/**
+ * Live snapshot of the viewed workflow, injected into the prompt so the WM
+ * doesn't burn its first minute re-orienting (listing tables, re-pulling the
+ * dossier) before answering "why is this stalled?". Best-effort: any read
+ * failure degrades to the bare id line.
+ */
+async function buildWorkflowContext(workflowId: string): Promise<string> {
+  try {
+    const [wf, lastEvent] = await Promise.all([
+      getWorkflowFromDynamo(workflowId),
+      getLastEventForWorkflow(workflowId).catch(() => null),
+    ]);
+    if (!wf) return `Context: currently viewing workflow ${workflowId}`;
+
+    const lines = [
+      `Context: currently viewing workflow ${workflowId} — live snapshot (already fetched for you; verify with the toolkit only if you need more depth):`,
+      `- title: ${(wf.input as { title?: string })?.title || "(untitled)"}`,
+      `- phase: ${wf.phase}${wf.error ? ` (error: ${wf.error})` : ""}`,
+      `- epic: ${wf.epicId || "none"} | def: ${wf.workflowDefId || "default"} | type: ${wf.workflowType || "feature"}`,
+      `- started: ${wf.startedAt}${wf.completedAt ? ` | completed: ${wf.completedAt}` : ""}`,
+    ];
+
+    const tasks = Object.values(
+      (wf.agentTasks || {}) as Record<string, { agentId?: string; ticketId?: string; status?: string; startedAt?: string; completedAt?: string; error?: string }>,
+    );
+    if (tasks.length) {
+      const active = tasks.filter((t) => t.status === "running" || t.status === "waiting_response" || t.status === "pending");
+      const failed = tasks.filter((t) => t.status === "error");
+      const byStatus = tasks.reduce<Record<string, number>>((acc, t) => {
+        const s = t.status || "unknown";
+        acc[s] = (acc[s] || 0) + 1;
+        return acc;
+      }, {});
+      lines.push(`- agent tasks: ${tasks.length} total (${Object.entries(byStatus).map(([s, n]) => `${n} ${s}`).join(", ")})`);
+      for (const t of active) {
+        lines.push(`  - ACTIVE ${t.agentId || "?"} [${t.status}] ticket ${t.ticketId || "?"}${t.startedAt ? ` since ${t.startedAt}` : ""}`);
+      }
+      for (const t of failed) {
+        lines.push(`  - FAILED ${t.agentId || "?"} ticket ${t.ticketId || "?"}: ${(t.error || "").slice(0, 200)}`);
+      }
+    }
+
+    const isRunning = !["complete", "error", "cancelled"].includes(wf.phase as string);
+    if (lastEvent?.timestamp) {
+      const silentMin = Math.round((Date.now() - new Date(lastEvent.timestamp as string).getTime()) / 60000);
+      lines.push(`- last event: ${lastEvent.type || "?"} at ${lastEvent.timestamp}${isRunning ? ` (${silentMin} min ago${silentMin >= 10 ? " — LIKELY STALLED" : ""})` : ""}`);
+    }
+
+    return lines.join("\n");
+  } catch {
+    return `Context: currently viewing workflow ${workflowId}`;
+  }
+}
+
 export async function POST(req: NextRequest) {
   const region = process.env.AWS_REGION || DEFAULT_REGION;
   const { conversationId, message, workflowId } = await req.json().catch(() => ({}));
@@ -56,9 +111,8 @@ export async function POST(req: NextRequest) {
 
   // sessionId must be >= 33 chars for AgentCore.
   const sessionId = `wmchat-${conversationId}`.padEnd(33, "0");
-  const prompt = workflowId
-    ? `Context: currently viewing workflow ${workflowId}\n\n${message}`
-    : message;
+  const contextBlock = workflowId ? await buildWorkflowContext(workflowId) : null;
+  const prompt = contextBlock ? `${contextBlock}\n\n${message}` : message;
 
   const stream = await invokeHarnessAgent({
     harnessArn,
