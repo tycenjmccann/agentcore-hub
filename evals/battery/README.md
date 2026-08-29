@@ -577,39 +577,65 @@ Every deploy target that ships gated artifacts sources
 `deploy/lib/check-eval-gate.sh` and calls `require_eval_gate <globs...>`
 before its first S3 write or docker build. Semantics against HEAD:
 
-- **Green** `config-evals-gate` check → deploy proceeds (latched in
-  `EVAL_GATE_CHECKED` so a 14-agent fleet fan-out queries GitHub once).
-  Only a REAL battery pass (check title `PASS — config evals battery held
-  the baseline`) counts: a success check titled `SKIPPED — no gated paths
-  changed` means the battery never ran and is treated exactly like an
-  **absent** check — it never latches, never anchors the ancestor scan, and
-  never green-lights HEAD.
+- **Verified battery PASS** → deploy proceeds (latched in `EVAL_GATE_CHECKED`
+  so a 14-agent fleet fan-out queries GitHub once). A `success` conclusion is
+  NOT enough (TEAM-3426): `skip-publish` publishes a SUCCESS check for PRs that
+  touch no gated path, so `config-evals-gate` can be a required status check,
+  and that skipped-success proves nothing about the tree. The guard accepts a
+  success only when it carries the `config-evals-gate-verdict: PASS` marker line
+  in its check-run summary — emitted by every branch of
+  `config-evals-gate.yml` — or, for pre-marker historical checks, an output
+  title starting with `PASS`.
+- **SKIPPED success** (marker `SKIPPED`, or a title starting with `SKIPPED`) →
+  informational only, treated as **absent**: it never proceeds, never latches,
+  and never anchors the ancestor scan. Any other success that is neither
+  identifiably PASS nor SKIPPED is also treated as absent (fail closed), with a
+  loud warning.
 - **Queued/in-progress** → refused: wait for the gate.
 - **Failure/cancelled/timed-out** → refused, with the check URL and the
   failing evaluator lines from the summary.
-- **Absent** → refused if HEAD or any scanned first-parent ancestor (back to
-  a green anchor) touched the target's gated globs — that means the gate was
-  bypassed. Also refused, fail-closed, if the scan hits the
+- **Absent** (no check, or a non-PASS success as above) → refused if HEAD or
+  any scanned first-parent ancestor (back to a PASS anchor) touched the
+  target's gated globs — that means the gate was bypassed. Also refused,
+  fail-closed, if the scan hits the
   `EVAL_GATE_BELT_MAX` cap (100 first-parent commits, see
-  `deploy/lib/check-eval-gate.sh`) with history still unexamined and no green
+  `deploy/lib/check-eval-gate.sh`) with history still unexamined and no PASS
   anchor or gated-path touch found. Proceeds with a note only when nothing
-  gated changed across a fully-scanned history or since a green anchor.
+  gated changed across a fully-scanned history or since a PASS anchor.
 - A **dirty working tree** touching gated paths always refuses: deploys ship
   committed, gated state only.
 
-Break-glass (audited — BG-2/BG-3): set **both** `EVAL_GATE_OVERRIDE=1` and a
-non-empty `EVAL_GATE_OVERRIDE_REASON` — or, on the runtime-agent deploy
-scripts (`deploy.sh`, `deploy-one.sh`, `deploy-fleet.sh`), pass the CLI
-equivalent `--force --force-reason "INC-123: why"`, which exports the same
-two env vars and routes through the SAME audited path (there is no second
-override mechanism). `--force` without a reason is refused, and gated
-scripts that take no CLI args reject `--force` with an error pointing at the
-env form. The override prints a loud banner and
-writes `{timestamp, sha, identity (STS caller ARN), script, reason}` to
+Break-glass (audited — BG-2/BG-3) has two equivalent forms:
+
+```bash
+# CLI form (deploy/runtime-agent/deploy.sh, deploy-one.sh, and deploy-fleet.sh)
+./deploy/runtime-agent/deploy.sh --force --force-reason "INC-123: hotfix, gate red on an unrelated case" backend_dev
+
+# Env-var form (every gated target, including the raw require_eval_gate calls in DEPLOY.md)
+EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON="INC-123: hotfix, gate red on an unrelated case" \
+  ./deploy/ecs-express/deploy.sh
+```
+
+`--force`/`--force-reason` (parsed by the shared `deploy/lib/parse-force-args.sh`,
+also accepted as `--force-reason=<why>`) is pure sugar: it exports
+`EVAL_GATE_OVERRIDE=1` and `EVAL_GATE_OVERRIDE_REASON` before the gate runs, so
+both forms land in the **same** audited path with the same audit trail. `--force`
+without a non-empty reason is refused up front, before any gate or deploy work
+(an inherited non-empty `EVAL_GATE_OVERRIDE_REASON` counts as the reason; a
+`--force-reason` on the command line always wins over it). Any other unknown
+`--flag` is rejected rather than misparsed as an agent name, and gated scripts
+that take no CLI args (`deploy-topology.sh`, `workflow-manager`, `apprunner`,
+`ecs-express`) reject `--force` with an error pointing at the env form.
+
+The override prints a loud banner and writes
+`{timestamp, sha, identity (STS caller ARN), script, reason}` to
 `s3://$ARTIFACT_BUCKET/eval-gate/overrides/<ts>-<sha>.txt` **and**
 `.eval-gate-overrides.log` (gitignored). If the S3 write fails you must type
 `OVERRIDE-UNAUDITED` at a real tty; non-interactive unaudited overrides are
-refused. An empty reason is refused outright.
+refused, and an override with no durable record at all is refused outright. An
+empty reason is refused outright. From `deploy.sh` the override is spent once —
+the parent gate call audits and then latches, so its 14 `deploy-one.sh` children
+short-circuit on the latch token instead of writing 14 audit records.
 
 ## Cost budget
 
