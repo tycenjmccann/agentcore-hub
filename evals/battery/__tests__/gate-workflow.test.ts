@@ -298,22 +298,25 @@ describe("fork safety — no fork-reachable job can touch checks.create (CRED-2)
       expect(job.permissions?.checks).toBe("write");
   });
 
-  it("fork-guard fails visibly for gated-or-undetermined fork PRs, with zero permissions", () => {
-    const guard = jobs["fork-guard"];
-    expect(String(guard.if)).toContain(FORK_ONLY);
-    // `gated != 'false'` (not == 'true'): a failed path detection must still
-    // fail visibly for a fork PR (fail closed).
-    expect(String(guard.if)).toContain("gated != 'false'");
-    expect(guard.permissions).toEqual({});
-    expect(stepCode(guard)).toMatch(/^\s*exit 1\s*$/m);
-  });
-
-  it("fork-notice covers ungated fork PRs informationally, with zero permissions", () => {
+  it("fork-notice covers ALL fork PRs informationally, with zero permissions (TEAM-3438)", () => {
     const notice = jobs["fork-notice"];
     expect(String(notice.if)).toContain(FORK_ONLY);
-    expect(String(notice.if)).toContain("gated == 'false'");
+    // always() and NO gated condition: gated, ungated, and undetermined fork
+    // PRs all get the in-run explanation. The actual check (FAILURE when
+    // gated, SKIPPED success when not) comes from the trusted fork publisher.
+    expect(String(notice.if)).toContain("always()");
+    expect(String(notice.if)).not.toContain("gated ==");
+    expect(String(notice.if)).not.toContain("gated !=");
     expect(notice.permissions).toEqual({});
+    // Informational only — the merge block for gated fork PRs is the
+    // publisher's explicit FAILURE check (or the required check's absence if
+    // even that publish failed), never this job's exit status.
     expect(stepCode(notice)).not.toMatch(/^\s*exit 1\s*$/m);
+    expect(stepCode(notice)).toContain("config-evals-gate-fork-publish.yml");
+  });
+
+  it("the old exit-1 fork-guard job is gone (replaced by fork-notice + the trusted publisher)", () => {
+    expect(jobs["fork-guard"]).toBeUndefined();
   });
 });
 

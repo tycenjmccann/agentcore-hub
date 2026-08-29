@@ -32,10 +32,9 @@ everything that is not `verdict: "PASS"` + a successful battery job onto
 as "refuse to ship". So every "the gate proved nothing" condition below is a
 **FAIL with an explicit `failureReason`**, not a neutral conclusion.
 
-### Fork PRs — the gate is same-repo only (FR-2 fork-safety decision; CRED-2, TEAM-3425)
+### Fork PRs — the battery is same-repo only; a trusted publisher posts the check (CRED-2, TEAM-3425; publisher added by TEAM-3438)
 
-The gate cannot run for fork PRs, by two independent mechanisms, so it is
-**formally restricted to same-repo PRs**:
+The **battery** cannot run for fork PRs, by two independent mechanisms:
 
 - Fork PRs cannot assume the OIDC eval role, so the battery has no Bedrock
   credentials to score anything with.
@@ -47,14 +46,34 @@ The gate cannot run for fork PRs, by two independent mechanisms, so it is
   a fork-guard job "publish an explicit failing check" for gated fork PRs;
   that call could never succeed and the design is superseded.)
 
-**Enforcement is the required check's absence.** With `config-evals-gate` set
-as a required status check in branch protection, a fork PR never acquires the
-check and sits at "Expected — waiting" — it cannot merge (fail closed by check
-**absence**, not by a published failure). On top of that, a fork PR that
-touches gated paths (or whose path detection failed) gets a visibly **failing
-`fork-guard` job** — a plain `exit 1` with an explanatory `::error::` and a
-step-summary write-up, no `checks.create` attempt — and an ungated fork PR
-gets an informational exit-0 `fork-notice` job explaining the same constraint.
+**The check comes from the trusted fork publisher instead**
+(`.github/workflows/config-evals-gate-fork-publish.yml`): a `workflow_run`
+workflow that fires when a "Config Evals Gate" run completes. `workflow_run`
+executes the **default-branch** definition of the workflow (a fork PR cannot
+edit the copy that runs) with a base-repo token whose permissions ARE honored.
+It never checks out or executes any fork code, never downloads or trusts
+artifacts from the fork run, resolves the PR through base-repo API lookups
+(`workflow_run.pull_requests` is often empty for forks), and **recomputes
+gated-path detection itself** via `pulls.listFiles` against the same gated
+list as `changed-paths` (a contract test pins the two lists equal). It then
+publishes on the run's head sha:
+
+- **gated fork PR ⇒ explicit FAILURE** (marker `config-evals-gate-verdict:
+  FAIL`) — the battery cannot score it, so it stays merge-blocked by a red
+  check;
+- **ungated fork PR ⇒ SKIPPED success** (marker `config-evals-gate-verdict:
+  SKIPPED`) — mirroring `skip-publish`, so a doc-only fork PR is mergeable
+  and the deploy guard still treats it as non-evidence;
+- **resolution/detection errors ⇒ FAILURE with marker
+  `config-evals-gate-verdict: ERRORED`** (fail closed). If even that publish
+  fails, the required check stays **absent** and branch protection holds the
+  PR at "Expected — waiting" — still fail closed.
+
+Inside the gate run itself, fork PRs get the informational exit-0
+`fork-notice` job explaining where the verdict will appear. Deploy caveat:
+`workflow_run` triggers fire only once the publisher file is on the default
+branch; until it lands there, fork PRs remain checkless (the prior fail-closed
+behavior).
 
 **Maintainer workflow for fork contributions:** to gate a fork contribution, a
 maintainer pushes the fork branch to the base repository

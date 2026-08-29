@@ -186,17 +186,19 @@ describe("battery job — trusted-base harness (TRUST-1)", () => {
 });
 
 describe("check publication restrictions (CRED-2 — same-repo-only gate)", () => {
-  it("fork-guard publishes nothing: no checks:write, no checks.create — it fails the job instead", () => {
-    const fg = job("fork-guard");
+  it("fork-notice publishes nothing: no checks:write, no checks.create — the trusted publisher posts the check (TEAM-3438)", () => {
+    const fn = job("fork-notice");
     // A fork run's read-only GITHUB_TOKEN cannot create check runs, so any
     // reappearing checks.create here would be a silent 403, not a guard.
-    expect(fg).not.toMatch(/^\s*checks:\s*write/m);
-    expect(fg).not.toContain("checks.create");
-    expect(fg).toContain("permissions: {}");
-    expect(fg).toContain(
+    expect(fn).not.toMatch(/^\s*checks:\s*write/m);
+    expect(fn).not.toContain("checks.create");
+    expect(fn).toContain("permissions: {}");
+    expect(fn).toContain(
       "github.event.pull_request.head.repo.full_name != github.repository",
     );
-    expect(fg).toContain("exit 1");
+    // Informational: never exit 1 — for gated fork PRs the merge block is the
+    // trusted fork publisher's explicit FAILURE check.
+    expect(fn).not.toMatch(/^\s*exit 1\s*$/m);
   });
 
   it("skip-publish is same-repo-only (fork ungated PRs stay blocked by check absence)", () => {
