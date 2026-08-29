@@ -3,6 +3,7 @@
 //   --all (default) | --case <id> (repeatable) | --dry-run | --mock
 //   --results <path> | --base-ref <ref> | --baseline-mode --repeat N --out <path>
 //   --flake-ledger <path> (or BATTERY_FLAKE_LEDGER; default <results-dir>/flake-ledger.jsonl)
+//   --config-sha <sha> (report this sha as the config under test; default HEAD)
 //
 // --mock (TEAM-3295): full pipeline with a deterministic local transport and a
 // synthetic in-memory baseline — zero AWS calls. Demonstrates RED (degraded
@@ -16,6 +17,14 @@
 // from the BASE REF, never from the PR checkout (B2), spend is capped live at
 // maxRunUsd (B5), and a bootstrap baseline (B1) or a suite with no
 // baseline-compared case (B3) can never produce a PASS.
+//
+// In CI the WORKING TREE is itself the base revision with only the candidate
+// config paths overlaid from the PR head (TEAM-3425 — the harness that runs must
+// not be PR-controlled; see .github/workflows/config-evals-gate.yml). So gate
+// mode makes no assumption that HEAD is the PR head: everything base-side is
+// read with `git show <base-ref>:…`, everything candidate-side is read from the
+// working tree, and --config-sha carries the sha of the config under test for
+// reporting (HEAD, i.e. the harness revision, is the default for local runs).
 //
 // Runtime reliability (TEAM-3352): per-case progress lines + an incremental
 // battery-progress.jsonl, an end-to-end per-case deadline, a whole-run
@@ -84,7 +93,7 @@ const printSpend = (log = console.error) => {
 // ─── Flags ───────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const flags = { cases: [], dryRun: false, mock: false, baselineMode: false, repeat: 3, results: null, baseRef: null, out: null, flakeLedger: null };
+  const flags = { cases: [], dryRun: false, mock: false, baselineMode: false, repeat: 3, results: null, baseRef: null, out: null, flakeLedger: null, configSha: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--all") continue;
@@ -94,6 +103,7 @@ function parseArgs(argv) {
     else if (a === "--results") flags.results = argv[++i];
     else if (a === "--flake-ledger") flags.flakeLedger = argv[++i];
     else if (a === "--base-ref") flags.baseRef = argv[++i];
+    else if (a === "--config-sha") flags.configSha = argv[++i];
     else if (a === "--baseline-mode") flags.baselineMode = true;
     else if (a === "--repeat") flags.repeat = parseInt(argv[++i], 10);
     else if (a === "--out") flags.out = argv[++i];
@@ -168,7 +178,14 @@ function detectNewCaseIds({ baseline, baseRef, activeCases }) {
   const ref = baseRef || process.env.GITHUB_BASE_REF || null;
   if (!ref) return [];
   try {
-    const out = git("diff", "--name-status", "--diff-filter=A", `${ref}...HEAD`, "--", "evals/battery/cases/");
+    // WORKING TREE vs the base ref (two-dot, no second commit): the candidate
+    // config is not necessarily committed on top of HEAD. In CI gate mode the
+    // checkout IS the base revision and the candidate paths are overlaid into
+    // the worktree (TEAM-3425); locally, a case file you have only staged counts
+    // too. Both are "added relative to base", which is what makes a case
+    // informational. (This is the fallback path — with a base-ref manifest,
+    // gateNewCaseIds decides instead.)
+    const out = git("diff", "--name-status", "--diff-filter=A", ref, "--", "evals/battery/cases/");
     return out
       .split("\n")
       .filter(Boolean)
@@ -267,6 +284,18 @@ async function main() {
     console.error("--mock is incompatible with --baseline-mode and --base-ref (local demo only)");
     process.exit(2);
   }
+  if (flags.configSha && !/^[0-9a-f]{7,40}$/.test(flags.configSha)) {
+    // It lands verbatim in battery-results.json and in the public check summary.
+    console.error(`--config-sha must be a hex git sha (got '${flags.configSha}')`);
+    process.exit(2);
+  }
+  if (flags.baselineMode && flags.configSha) {
+    // A baseline's source_commit must be the real sha of the tree it was
+    // generated from — the baseline workflow asserts it equals $GITHUB_SHA
+    // before committing, and nothing overlays config in that workflow.
+    console.error("--config-sha is not allowed with --baseline-mode (source_commit must be the checkout's own sha)");
+    process.exit(2);
+  }
 
   const thresholds = gate?.thresholds || pf.thresholds;
   let baseline = gate?.baseline || pf.baseline;
@@ -302,7 +331,14 @@ async function main() {
     process.exit(1);
   }
 
-  const configSha = git("rev-parse", "HEAD");
+  // The revision whose CONFIG was scored, for the results file and the check
+  // summary. In CI gate mode the working tree is the base revision with the
+  // candidate config overlaid, so HEAD is the HARNESS sha and the workflow passes
+  // the PR head sha as --config-sha. Local runs default to HEAD as before.
+  const harnessSha = git("rev-parse", "HEAD");
+  const configSha = flags.configSha || harnessSha;
+  if (configSha !== harnessSha)
+    console.log(`Config under test: ${configSha} (candidate config overlaid onto harness revision ${harnessSha})`);
   const newCaseIds =
     gate && gate.baseActiveIds
       ? gateNewCaseIds({ gate, baseline, selected })
@@ -311,7 +347,7 @@ async function main() {
   if (flags.dryRun) {
     console.log(`Preflight OK — ${selected.length} runnable case(s), ${retiredCases.length} retired.`);
     console.log(`Hermeticity self-test OK. Fixture lint OK. Zero Bedrock calls made.\n`);
-    console.log(`Plan (runId ${runId}, HEAD ${configSha.slice(0, 12)}):`);
+    console.log(`Plan (runId ${runId}, config ${configSha.slice(0, 12)}):`);
     for (const def of selected) {
       const marker = newCaseIds.includes(def.id) ? " [informational: new case]" : "";
       console.log(

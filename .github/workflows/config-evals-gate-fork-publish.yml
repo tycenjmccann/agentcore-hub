@@ -1,0 +1,260 @@
+# Config Evals Gate Fork Publisher (CRED-2, TEAM-3425) — publishes the
+# `config-evals-gate` check run for FORK pull requests.
+#
+# WHY THIS FILE EXISTS
+# For a `pull_request` event raised from a fork, GitHub downgrades GITHUB_TOKEN
+# to read-only for the whole run: a job-level `permissions: checks: write`
+# request is NOT honored (it is silently reduced), so `checks.create` returns
+# 403. The fork guard that used to live in config-evals-gate.yml therefore could
+# never publish anything — the run just errored and the required
+# `config-evals-gate` check was ABSENT, which is precisely the "gated fork PR
+# with no verdict" hole it was written to close.
+#
+# `workflow_run` is the supported way out:
+#   * it runs the workflow definition from the DEFAULT BRANCH, not from the PR —
+#     the fork cannot influence the code in this file;
+#   * its GITHUB_TOKEN is a base-repo token, so `checks: write` IS granted;
+#   * it starts only after the gate run has completed, so it can report on it.
+#
+# TRUST RULES (non-negotiable — this job holds a write token):
+#   1. NEVER check out, run, install, or source anything from the fork. There is
+#      no `actions/checkout` in this workflow at all.
+#   2. NEVER trust artifacts, outputs, job names, or step logs from the
+#      triggering run. A fork PR can edit config-evals-gate.yml itself, so
+#      everything that run produced is attacker-controlled — including any
+#      "battery-results" artifact claiming `{"verdict":"PASS"}`. Nothing is
+#      downloaded here.
+#   3. The gated/ungated decision is RECOMPUTED from the trusted API
+#      (`pulls.listFiles` against the base repo) using a copy of
+#      config-evals-gate.yml's gated-path list. The fork run's own
+#      `changed-paths` output is never read.
+#   4. FAIL CLOSED: if the PR cannot be resolved or its files cannot be listed,
+#      publish a FAILING check; if even that call fails, the job fails loudly.
+#
+# So the only outcomes are: FAILING check (gated fork PR — a maintainer must
+# push the branch to the base repo to gate it), SUCCESS check (ungated fork PR,
+# same SKIPPED messaging as the gate's skip-publish job), or FAILING check +
+# failing job (could not decide).
+#
+# DEPLOY CAVEAT: `workflow_run` only fires for workflow files that exist on the
+# repository's DEFAULT BRANCH. Until this file is merged to `main`, fork PRs get
+# NO `config-evals-gate` check at all — the required check stays "Expected —
+# waiting" and the PR cannot merge (fail closed, but opaque). After merge, the
+# publisher fires for every completed Config Evals Gate run. Also note that a
+# fork PR that CHANGES this file exercises the default-branch copy, not its own
+# — like every workflow_run workflow, changes take effect only once merged.
+name: Config Evals Gate Fork Publisher
+
+on:
+  workflow_run:
+    workflows: ["Config Evals Gate"]
+    types: [completed]
+
+# One publisher per gate run; never cancel one mid-publish (an unpublished
+# check is a missing required check).
+concurrency:
+  group: config-evals-gate-fork-publish-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  # Fork `pull_request` runs only. Same-repo PRs publish their own check from
+  # inside config-evals-gate.yml (publish / skip-publish), where the token does
+  # have `checks: write`; re-publishing them here would duplicate the check run.
+  publish-fork-check:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write # publish the config-evals-gate check on the fork's head sha
+      pull-requests: read # resolve the PR and list its files
+    steps:
+      - name: Recompute gatedness and publish the fork check (fail closed)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = run.head_sha;
+            const headRepo = run.head_repository?.full_name || null;
+            core.info(
+              `Gate run ${run.id} (${run.conclusion}) from fork ${headRepo}` +
+                ` branch '${run.head_branch}' @ ${headSha}`
+            );
+
+            // Keep in sync with config-evals-gate.yml's `changed-paths` job (and
+            // with config-evals-baseline.yml `on.push.paths`). Copied, not
+            // imported: this workflow must not read anything out of the fork's
+            // tree, and workflow_run gives us no trusted checkout to read the
+            // base copy from. Divergence would mean a fork PR gets a different
+            // verdict than the same PR pushed to the base repo — so both lists
+            // change together.
+            const gatedPrefixes = [
+              "deploy/runtime-agent/prompts/", // deploy/runtime-agent/prompts/**
+              "deploy/workflow-manager/",      // deploy/workflow-manager/**
+              "blueprints/",                   // blueprints/**
+              "evals/battery/",                // evals/battery/**
+            ];
+            const gatedFiles = [
+              "src/config/workflows.json",
+              "src/config/agents.json",
+              // The gate workflows themselves: changes to the gate run the gate.
+              ".github/workflows/config-evals-gate.yml",
+              ".github/workflows/config-evals-baseline.yml",
+              ".github/workflows/config-evals-gate-fork-publish.yml",
+            ];
+            const isGated = (name) =>
+              typeof name === "string" &&
+              (gatedFiles.includes(name) ||
+                gatedPrefixes.some((p) => name.startsWith(p)));
+
+            const publish = async (conclusion, title, summary) => {
+              // No try/catch: a failed publish must fail this job loudly rather
+              // than leave the PR with a silently missing required check.
+              await github.rest.checks.create({
+                owner,
+                repo,
+                name: "config-evals-gate",
+                head_sha: headSha,
+                status: "completed",
+                conclusion,
+                output: { title, summary: summary.slice(0, 60000) },
+              });
+              core.info(`Published config-evals-gate: ${conclusion} — ${title}`);
+            };
+
+            // `workflow_run.pull_requests` is empty for fork PRs in practice, so
+            // treat it as a fast path only and fall back to API lookups keyed on
+            // the immutable head sha. Every source here is base-repo data; the
+            // fork controls none of it.
+            const matchesHead = (pr) =>
+              pr?.head?.sha === headSha && (!headRepo || pr?.head?.repo?.full_name === headRepo);
+
+            const resolvePullNumber = async () => {
+              for (const pr of run.pull_requests || []) {
+                if (typeof pr.number === "number") return pr.number;
+              }
+              // PRs associated with the head commit — the cheapest reliable
+              // lookup for a fork head sha (it lives in refs/pull/N/head here).
+              // Best-effort: this endpoint sits under the commits API, so if the
+              // job's token scopes ever stop covering it we degrade to the list
+              // lookups below rather than failing the whole publication closed.
+              try {
+                const associated = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner,
+                  repo,
+                  commit_sha: headSha,
+                  per_page: 100,
+                });
+                const byCommit = (associated.data || []).find(matchesHead);
+                if (byCommit) return byCommit.number;
+              } catch (err) {
+                core.info(`commit→PR lookup unavailable (${err.message}); falling back to pulls.list`);
+              }
+
+              // Then the branch-filtered list, then a bounded unfiltered scan of
+              // the most recently updated PRs (covers a branch renamed after the
+              // run). Bounded on purpose: an unbounded paginate over a large PR
+              // history could outlive the job timeout, and a timeout publishes
+              // nothing at all.
+              const MAX_PAGES = 5;
+              const attempts = [];
+              if (headRepo && run.head_branch)
+                attempts.push({ head: `${headRepo.split("/")[0]}:${run.head_branch}` });
+              attempts.push({ sort: "updated", direction: "desc" });
+              for (const extra of attempts) {
+                for (let page = 1; page <= MAX_PAGES; page++) {
+                  const { data } = await github.rest.pulls.list({
+                    owner,
+                    repo,
+                    state: "all",
+                    per_page: 100,
+                    page,
+                    ...extra,
+                  });
+                  const match = data.find(matchesHead);
+                  if (match) return match.number;
+                  if (data.length < 100) break;
+                }
+              }
+              return null;
+            };
+
+            let gated;
+            let hits = [];
+            let pullNumber = null;
+            try {
+              pullNumber = await resolvePullNumber();
+              if (pullNumber === null)
+                throw new Error(`no pull request found with head ${headRepo}@${headSha}`);
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner,
+                repo,
+                pull_number: pullNumber,
+                per_page: 100,
+              });
+              // A rename out of a gated path changes gated content too, so
+              // previous_filename counts as well (matches changed-paths).
+              hits = files
+                .filter((f) => isGated(f.filename) || isGated(f.previous_filename))
+                .map((f) => f.filename);
+              gated = hits.length > 0;
+              core.info(
+                gated
+                  ? `PR #${pullNumber}: gated paths changed (${hits.length}):\n${hits.join("\n")}`
+                  : `PR #${pullNumber}: no gated paths among ${files.length} changed file(s).`
+              );
+            } catch (err) {
+              // FAIL CLOSED: we could not prove the PR touches no gated path.
+              await publish(
+                "failure",
+                "FAIL — could not determine whether this fork PR touches gated paths",
+                "The fork publisher could not recompute the gated-path decision for this " +
+                  `pull request (\`${err.message}\`), so the gate cannot prove the PR is safe. ` +
+                  "It fails closed. Re-run the **Config Evals Gate Fork Publisher** workflow " +
+                  "for this run (transient API failure), or push the branch to the base " +
+                  "repository so the gate can run normally."
+              );
+              core.setFailed(`fork gate publication failed closed: ${err.message}`);
+              return;
+            }
+
+            if (gated) {
+              // Filenames come from a fork-authored diff and land in a public
+              // check summary, so strip anything that could break out of the
+              // inline-code span, and cap the list.
+              const shown = hits
+                .slice(0, 50)
+                .map((h) => `- \`${String(h).replace(/[`\r\n]/g, "")}\``)
+                .join("\n");
+              const more = hits.length > 50 ? `\n- …and ${hits.length - 50} more` : "";
+              // Same messaging the in-workflow fork guard used to post, plus the
+              // paths that made this PR gated.
+              await publish(
+                "failure",
+                "Fork PRs cannot run the config evals gate",
+                "Fork PRs cannot run the config evals gate (no credentials). A maintainer " +
+                  "must push this branch to the base repository to gate it.\n\n" +
+                  `Gated paths changed (${hits.length}):\n\n` +
+                  shown +
+                  more
+              );
+            } else {
+              // Byte-for-byte the same verdict an ungated same-repo PR gets from
+              // config-evals-gate.yml's skip-publish job.
+              await publish(
+                "success",
+                "SKIPPED — no gated paths changed",
+                "This PR touches none of the gated paths (prompts, workflow/agent " +
+                  "config, blueprints, eval battery, or the gate workflows themselves), so " +
+                  "the config evals battery did not run. This success check exists so " +
+                  "`config-evals-gate` can be a required status check in branch protection " +
+                  "without blocking unrelated PRs: every PR gets exactly one completed " +
+                  "check — PASS/FAIL from the battery when gated paths change, this " +
+                  "SKIPPED success when they don't."
+              );
+            }

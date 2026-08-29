@@ -7,51 +7,54 @@
 # unusable as a required status check in branch protection (every unrelated PR
 # would hang on "Expected — waiting"). Instead, the skip-publish job publishes
 # an explicit SUCCESS check ("SKIPPED — no gated paths changed") for ungated
-# same-repo PRs, so the check is always present and can safely be marked
-# required. (Fork PRs are the deliberate exception — see CRED-2.)
+# PRs, so the check is always present and can safely be marked required.
 # Path detection FAILS CLOSED: if changed-paths cannot list the PR's files,
-# the PR is treated as gated (publish/fork-guard use `gated != 'false'`).
+# the PR is treated as gated (publish uses `gated != 'false'`, and the fork
+# publisher workflow fails closed the same way).
 #
 # Hardened per the TEAM-3066 security review:
 #   HERM-1  The job that executes PR code (battery) has NO checks:write and no
 #           on-disk git credential (persist-credentials: false + preflight
 #           assertion). Check publication happens in a separate job (publish)
 #           that checks out nothing and executes zero PR code.
-#   HERM-3  (TEAM-3425) Everything EXECUTABLE in the battery job comes from the
-#           TRUSTED BASE revision: the workspace is checked out at
-#           pull_request.base.sha, so the harness (evals/battery/** runner,
-#           lib, scoring), npm ci's package*.json, and the workflow-adjacent
-#           tooling are all pre-merge-reviewed code the PR cannot modify. The
-#           PR head is checked out into a side directory and ONLY the gated
-#           CANDIDATE CONFIG paths (prompts, workflow-manager config,
-#           blueprints, workflows/agents JSON) are overlaid into the workspace
-#           before the battery runs (FR-2.2: the gate scores PR-head config).
-#           Without this, a same-repo PR editing evals/battery/** would run its
-#           own evaluator and could fabricate the PASS artifact that publish
-#           trusts — the HERM-1 job split alone is not a trust boundary around
-#           an attacker-controlled artifact. Consequence: a PR that changes the
-#           runner/harness is exercised by the BASE harness; the runner change
-#           takes effect only after it merges.
-#   CRED-2  (revised by TEAM-3425) Fork PRs never receive credentials and never
-#           run the battery — the gate is formally SAME-REPO ONLY. On fork
-#           `pull_request` events GitHub downgrades GITHUB_TOKEN to read-only
-#           and does NOT honor a job-level `checks: write` request, so this
-#           workflow can never publish a `config-evals-gate` check run for a
-#           fork PR. (This supersedes the previous "publish an explicit failing
-#           check" fork-guard design, which could never execute — its
-#           checks.create always returned 403.) Enforcement is the required
-#           check's ABSENCE: with `config-evals-gate` required in branch
-#           protection, a fork PR sits at "Expected — waiting" and cannot merge
-#           (fail closed). fork-guard fails visibly for gated-or-undetermined
-#           fork PRs (plain exit 1 — no checks.create attempt) to say why;
-#           ungated fork PRs get the informational fork-notice job instead.
-#           Maintainers gate a fork contribution by pushing its branch to the
-#           base repository and opening a same-repo PR.
+#   CRED-2  Fork PRs never receive credentials and never run, and no job in THIS
+#           workflow tries to publish a check for them: for `pull_request` runs
+#           from a fork, GITHUB_TOKEN is read-only and a job-level
+#           `permissions: checks: write` request is silently NOT granted, so
+#           `checks.create` would 403 and the required check would simply be
+#           absent. The fork check is published instead by
+#           `.github/workflows/config-evals-gate-fork-publish.yml`, a
+#           `workflow_run` workflow that runs the DEFAULT-branch definition with
+#           a real write token, executes zero fork code, and RECOMPUTES
+#           gatedness from the API (never trusting this run's artifacts).
+#           Gated fork PR ⇒ explicit FAILING check; ungated fork PR ⇒ the same
+#           SKIPPED success this workflow's skip-publish posts for same-repo PRs.
 #   CRED-3  The OIDC role session is named gha-<run_id>-<actor> so every
 #           Bedrock/S3 call in CloudTrail attributes to a specific run + human.
 #
 # Trigger is `pull_request` — NEVER `pull_request_target`, which would run
 # PR-controlled code with base-repo credentials (HERM-1).
+#
+# Trust boundary — HARNESS FROM BASE, CONFIG FROM HEAD (TEAM-3425):
+# the battery job's working tree is the PR's BASE revision
+# (`pull_request.base.sha`), and only the candidate-input paths the battery
+# scores (prompts, workflow-manager, blueprints, src/config/{workflows,agents}
+# .json) are overlaid from `pull_request.head.sha`. Everything that EXECUTES —
+# `evals/battery/**`, `package.json`/`package-lock.json` (so `npm ci` installs
+# the base lockfile's deps), and this workflow's own logic — comes from base.
+# Otherwise a same-repo PR could replace run-battery.mjs with `echo
+# '{"verdict":"PASS"}'` and self-approve, because the publish job trusts the
+# battery artifact. FR-2.2 (score PR-head CONFIG) still holds: the config under
+# test is head's; only the referee is base's.
+#   Consequence: a PR that edits `evals/battery/**` is still GATED — changed-paths
+#   flags it and the battery runs — but it runs the BASE harness, so the PR's own
+#   harness changes have no effect on its own gate run (the same merge-lag the
+#   base-ref gating knobs already have, see the README). That includes case
+#   files: a case ADDED by the PR is not in the tree, so it does not run in that
+#   PR either. New harness code first executes after merge, in
+#   config-evals-baseline.yml's post-merge baseline run and in every subsequent
+#   PR's gate run. Harness diffs are reviewed by reading them, not by trusting a
+#   green check the diff itself produced.
 name: Config Evals Gate
 
 on:
@@ -69,8 +72,8 @@ jobs:
   # Decides whether this PR touches any gated path. Runs for ALL PRs — same-repo
   # AND forks — which is safe because it executes zero PR code (github-script
   # against the API only, no checkout). The path list must stay EXACTLY in sync
-  # with config-evals-baseline.yml's push paths, plus the two workflow files
-  # themselves: a PR that edits the gate must run the gate (fail closed).
+  # with config-evals-baseline.yml's push paths, plus the three gate workflow
+  # files themselves: a PR that edits the gate must run the gate (fail closed).
   changed-paths:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -84,7 +87,10 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // Keep in sync with config-evals-baseline.yml `on.push.paths`.
+            // Keep in sync with config-evals-baseline.yml `on.push.paths` AND
+            // with the copy of this list in config-evals-gate-fork-publish.yml
+            // (that workflow recomputes gatedness for fork PRs and must reach
+            // the same verdict this job would).
             const gatedPrefixes = [
               "deploy/runtime-agent/prompts/", // deploy/runtime-agent/prompts/**
               "deploy/workflow-manager/",      // deploy/workflow-manager/** (TEAM-3295: whole dir, not just system-prompt.md)
@@ -97,6 +103,7 @@ jobs:
               // The gate workflows themselves: changes to the gate run the gate.
               ".github/workflows/config-evals-gate.yml",
               ".github/workflows/config-evals-baseline.yml",
+              ".github/workflows/config-evals-gate-fork-publish.yml",
             ];
             const isGated = (name) =>
               typeof name === "string" &&
@@ -104,8 +111,8 @@ jobs:
                 gatedPrefixes.some((p) => name.startsWith(p)));
 
             // FAIL CLOSED: no try/catch — if listing files throws, this job
-            // fails, the `gated` output stays empty, and publish/fork-guard
-            // (`gated != 'false'`) treat the PR as gated.
+            // fails, the `gated` output stays empty, and publish
+            // (`gated != 'false'`) treats the PR as gated.
             const files = await github.paginate(github.rest.pulls.listFiles, {
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -126,11 +133,17 @@ jobs:
             );
             core.setOutput("gated", gated ? "true" : "false");
 
-  # The ONLY job that touches PR content. Even here nothing PR-controlled ever
-  # EXECUTES: the harness runs from the trusted base revision and only reads
-  # the PR's candidate config as data (HERM-3). It cannot publish checks
-  # (HERM-1) and only runs for same-repo branches (CRED-2 — forks get
-  # fork-guard instead).
+  # The ONLY job that runs the battery. It cannot publish checks (HERM-1) and
+  # only runs for same-repo branches (CRED-2 — fork PRs get their check from
+  # config-evals-gate-fork-publish.yml instead).
+  #
+  # It executes NO code from the PR head: the working tree is the base revision
+  # and only the candidate-config paths are overlaid from head (see the trust
+  # boundary note in the header). PR-authored *config* is still fully in play —
+  # prompts, blueprints and agent/workflow JSON are exactly what the PR proposes,
+  # which is the whole point of the gate — so the credential isolation below
+  # (persist-credentials: false, no checks:write, OIDC role scoped to Bedrock)
+  # stays exactly as strict as when the harness itself came from the PR.
   battery:
     needs: changed-paths
     if: needs.changed-paths.outputs.gated == 'true' && github.event.pull_request.head.repo.full_name == github.repository
@@ -144,19 +157,23 @@ jobs:
       # NO checks:write here (HERM-1): PR code must not be able to green-light itself.
     environment: config-evals
     steps:
-      # HERM-3: the WORKSPACE is the trusted base revision — the harness that
-      # computes the verdict is always pre-merge-reviewed code. PR-head config
-      # is overlaid below; evals/battery/** is deliberately NOT.
-      - uses: actions/checkout@v4
+      # The TRUSTED working tree: the PR's base revision. This is the harness
+      # (evals/battery/**), the dependency lockfile npm ci installs from, and the
+      # config the overlay step below selectively replaces. `base.sha` — the
+      # exact commit the PR is diffed against — not `github.base_ref`, whose tip
+      # can move mid-run.
+      - name: Checkout trusted base revision (harness + baseline config)
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
-          # HERM-1: leave no token on disk for PR code to exfiltrate.
+          # HERM-1: leave no token on disk for the battery to exfiltrate.
           persist-credentials: false
 
-      # PR head goes into a SIDE directory only. Nothing in here is executed;
-      # the overlay step copies out the candidate config paths and deletes the
-      # rest (including this copy of evals/battery/** and .github/**).
-      - uses: actions/checkout@v4
+      # PR-head tree as DATA ONLY, into a subdirectory. Nothing here is ever
+      # executed, imported, or installed from; the next step copies an allowlist
+      # of config paths out of it and deletes it.
+      - name: Checkout PR head into pr-head/ (data only, never executed)
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: pr-head
@@ -165,48 +182,74 @@ jobs:
       - name: Assert no on-disk git credential (HERM-1)
         run: |
           set -euo pipefail
-          for repo in . pr-head; do
-            extraheader="$(git -C "$repo" config --get http.https://github.com/.extraheader || true)"
-            if [ -n "$extraheader" ]; then
-              echo "::error::git http extraheader credential persisted in $repo despite persist-credentials:false — refusing to run PR code"
-              exit 1
-            fi
-            if grep -qi authorization "$repo/.git/config"; then
-              echo "::error::authorization header present in $repo/.git/config — refusing to run PR code"
-              exit 1
-            fi
-          done
+          extraheader="$(git config --get http.https://github.com/.extraheader || true)"
+          if [ -n "$extraheader" ]; then
+            echo "::error::git http extraheader credential persisted despite persist-credentials:false — refusing to run PR code"
+            exit 1
+          fi
+          if grep -qi authorization .git/config; then
+            echo "::error::authorization header present in .git/config — refusing to run PR code"
+            exit 1
+          fi
 
-      - name: Overlay candidate config from PR head (HERM-3 / FR-2.2)
-        # Trust boundary: ONLY the gated CONFIG paths cross from pr-head into
-        # the workspace — exactly what the gate exists to score. Executable
-        # paths (evals/battery/**, .github/**, package*.json, src code) stay at
-        # the base revision, so a PR mutating the runner/evaluator cannot
-        # influence the verdict artifact the publish job trusts.
+      # Overlay the CANDIDATE CONFIG from the PR head onto the trusted base tree.
+      # Plain shell, allowlist-only, no PR-controlled script or action involved.
+      # After this step the tree is: base harness + head config, and pr-head/ is
+      # gone — so nothing from the PR head is even on disk when node starts,
+      # except the config files under test.
+      - name: Overlay PR-head candidate config (allowlist only)
+        env:
+          HEAD_DIR: pr-head
         run: |
           set -euo pipefail
-          # Directories are replaced wholesale (remove base copy, then copy the
-          # head copy) so files the PR DELETES do not linger from base. A
-          # directory absent at head stays deleted.
-          for dir in deploy/runtime-agent/prompts deploy/workflow-manager blueprints; do
-            rm -rf "$dir"
-            if [ -d "pr-head/$dir" ]; then
-              mkdir -p "$(dirname "$dir")"
-              cp -R "pr-head/$dir" "$dir"
-            fi
-          done
-          # Single files: head copy wins; absent at head means the PR deleted it.
-          for f in src/config/workflows.json src/config/agents.json; do
-            if [ -f "pr-head/$f" ]; then
-              mkdir -p "$(dirname "$f")"
-              cp "pr-head/$f" "$f"
+          # EXACTLY the candidate-input paths the battery scores. Keep in sync
+          # with changed-paths' gated list MINUS the harness/workflow entries:
+          # evals/battery/**, .github/**, package.json and package-lock.json are
+          # NEVER copied from the PR head — they execute, so they stay at base.
+          candidates=(
+            "deploy/runtime-agent/prompts"
+            "deploy/workflow-manager"
+            "blueprints"
+            "src/config/workflows.json"
+            "src/config/agents.json"
+          )
+          for p in "${candidates[@]}"; do
+            # rm-then-copy, so adds, modifies, deletes and renames inside the
+            # path all land: the base copy is discarded wholesale and only what
+            # the PR head actually has is restored. A path the PR deletes stays
+            # deleted (and fails preflight, which is the correct verdict).
+            rm -rf -- "$p"
+            if [ -e "$HEAD_DIR/$p" ]; then
+              mkdir -p -- "$(dirname -- "$p")"
+              cp -R -- "$HEAD_DIR/$p" "$p"
+              echo "overlaid from PR head: $p"
             else
-              rm -f "$f"
+              echo "absent at PR head, removed from the tree: $p"
             fi
           done
-          # Nothing else may be read from the PR head: drop it (and its .git)
-          # before any harness code runs.
-          rm -rf pr-head
+          rm -rf -- "$HEAD_DIR"
+          echo "Overlay complete — harness is base, config is PR head. Worktree diff vs base:"
+          git status --porcelain
+
+      # The commit the harness came from must still be the base revision — and no
+      # base-ref fetch is needed because of it: `git show <base.sha>:<path>` (how
+      # the runner reads the gating rules) and `git diff <base.sha> -- <path>`
+      # (how it sees the candidate changes in the overlaid worktree) both resolve
+      # locally. Refuse to spend a cent on a harness of unknown provenance.
+      - name: Assert the working tree is the base revision
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          checked_out="$(git rev-parse HEAD)"
+          if [ "$checked_out" != "$BASE_SHA" ]; then
+            echo "::error::working tree is at $checked_out, expected base revision $BASE_SHA — refusing to run a harness of unknown provenance"
+            exit 1
+          fi
+          if [ -e pr-head ]; then
+            echo "::error::pr-head/ still present after the overlay step — refusing to run with PR-head code on disk"
+            exit 1
+          fi
 
       - uses: actions/setup-node@v4
         with:
@@ -242,15 +285,21 @@ jobs:
 
       - name: Run battery
         env:
+          # The base SHA itself, not `origin/<branch>`: it is the commit this
+          # tree was checked out at, and it cannot drift mid-run the way a
+          # branch tip can. Gate-mode rule resolution (`git show
+          # <base-ref>:evals/battery/...`) therefore reads the same revision the
+          # harness came from, and new-case detection diffs the overlaid
+          # worktree against it.
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # The config revision under test — reported in the check summary and
+          # battery-results.json. Without it the runner would stamp results with
+          # `git rev-parse HEAD`, i.e. the base harness sha, which is not what
+          # was scored.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         # run-battery.mjs writes check-summary.md next to --results and exits
         # non-zero on a FAIL verdict, so a red battery job ⇔ red gate.
-        # --base-ref is the base sha the workspace itself is checked out at
-        # (HERM-3): resolveGateConfig's `git show <ref>:<path>` reads of
-        # baseline/thresholds/manifest/case gating knobs (B2) resolve against
-        # that commit, which the depth-1 checkout guarantees is present — no
-        # separate fetch needed.
-        run: node evals/battery/run-battery.mjs --results "$RUNNER_TEMP/battery-results.json" --base-ref "$BASE_SHA" --flake-ledger "$RUNNER_TEMP/flake-ledger.jsonl"
+        run: node evals/battery/run-battery.mjs --results "$RUNNER_TEMP/battery-results.json" --base-ref "$BASE_SHA" --config-sha "$HEAD_SHA" --flake-ledger "$RUNNER_TEMP/flake-ledger.jsonl"
 
       - name: Save flake ledger (best-effort, TEAM-3090)
         # Unique per-run key so the save never conflicts; the next run's
@@ -370,51 +419,49 @@ jobs:
             });
 
   # CRED-2: fork PRs cannot assume the OIDC role, so the battery cannot run —
-  # and on fork pull_request events GITHUB_TOKEN is read-only (job-level
-  # `checks: write` is not honored), so this workflow cannot publish ANY
-  # `config-evals-gate` check for them either. The gate is same-repo only.
-  # This job exists purely to say so VISIBLY: a plain failing job (exit 1, no
-  # checks.create attempt — it would 403) on every gated-or-undetermined fork
-  # PR. The actual merge block is the required check's ABSENCE: branch
-  # protection holds the PR at "Expected — waiting" (fail closed).
-  # `gated != 'false'` for the same fail-closed reason as publish: a fork PR
-  # whose path detection failed must still fail visibly. No checkout: zero PR
-  # code executes.
-  fork-guard:
-    needs: changed-paths
-    if: always() && needs.changed-paths.outputs.gated != 'false' && github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions: {}
-    steps:
-      - name: Fail visibly — fork PRs cannot be gated
-        run: |
-          echo "::error::This PR touches gated config paths but comes from a fork. The config evals gate is same-repo only: fork pull_request runs get a read-only GITHUB_TOKEN, so the required 'config-evals-gate' check run cannot be published from this workflow (and the OIDC eval role cannot be assumed to run the battery). The absent required check blocks the merge. To gate this contribution, a maintainer must push the branch to the base repository and open a same-repo PR."
-          exit 1
-
-  # Companion to fork-guard for UNGATED fork PRs: nothing needs scoring, but
-  # the required `config-evals-gate` check still cannot be published (read-only
-  # token), so the PR still cannot merge as-is. This job succeeds (exit 0) and
-  # explains the maintainer workflow instead of failing noisily. No checkout:
-  # zero PR code executes.
+  # and this workflow CANNOT publish their check either. On a `pull_request` run
+  # from a fork the GITHUB_TOKEN is read-only no matter what a job's
+  # `permissions:` block asks for, so any `checks.create` here 403s and the
+  # required check ends up absent (the exact hole an explicit failing check was
+  # meant to close). The check is published out-of-band instead, by
+  # `.github/workflows/config-evals-gate-fork-publish.yml` (`workflow_run`, runs
+  # the default-branch definition with a genuine `checks: write` token, executes
+  # zero fork code, recomputes gatedness from the API). This job requests NO
+  # permissions and only leaves a breadcrumb in the fork's own run log, so a
+  # contributor looking at their run learns where the check comes from.
   fork-notice:
     needs: changed-paths
-    if: needs.changed-paths.outputs.gated == 'false' && github.event.pull_request.head.repo.full_name != github.repository
+    if: always() && github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
     steps:
-      - name: Explain — no check can be published for fork PRs
+      - name: Explain fork handling
+        env:
+          GATED: ${{ needs.changed-paths.outputs.gated }}
         run: |
-          echo "::notice::This fork PR touches no gated config paths, but the 'config-evals-gate' check run cannot be published for fork PRs (GITHUB_TOKEN is read-only on fork pull_request events), so branch protection will hold the PR at 'Expected — waiting'. A maintainer must push the branch to the base repository and open a same-repo PR to get the required check (it would publish as SKIPPED success)."
+          set -euo pipefail
+          echo "Fork PR: the config evals battery does not run (no credentials are ever"
+          echo "issued to fork code), and this run cannot publish a check run either —"
+          echo "GITHUB_TOKEN is read-only for pull_request runs from forks."
+          echo
+          echo "The 'config-evals-gate' check for this PR is published by the"
+          echo "'Config Evals Gate Fork Publisher' workflow, which starts when this run"
+          echo "completes and recomputes the gated-path decision from the API:"
+          echo "  gated paths changed  -> FAILING check; a maintainer must push this branch"
+          echo "                          to the base repository to gate it."
+          echo "  no gated paths       -> SUCCESS check (SKIPPED — nothing to gate)."
+          echo
+          echo "changed-paths gated output for this run: '${GATED}' (empty = detection failed, treated as gated)."
 
   # Neutral-publisher (C1 / FR-2.6): a PR that touches NO gated path still gets
   # a completed `config-evals-gate` check — an explicit SUCCESS — so the check
   # can be marked REQUIRED in branch protection without blocking unrelated PRs
-  # on "Expected — waiting". SAME-REPO only (CRED-2/TEAM-3425): on fork PRs the
-  # read-only GITHUB_TOKEN makes checks.create 403, so attempting it here would
-  # just fail — ungated fork PRs get fork-notice instead. No checkout: zero PR
-  # code executes.
+  # on "Expected — waiting". No checkout: zero PR code executes.
+  # SAME-REPO ONLY (CRED-2): for fork PRs this job's `checks: write` request is
+  # not honored and `checks.create` would 403, failing the job instead of
+  # publishing anything. Ungated FORK PRs get the identical SKIPPED success from
+  # the fork publisher workflow.
   skip-publish:
     needs: changed-paths
     if: needs.changed-paths.outputs.gated == 'false' && github.event.pull_request.head.repo.full_name == github.repository

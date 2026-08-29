@@ -19,44 +19,21 @@ copies, never the S3 ones):
 - `evals/battery/**` — the battery itself (cases, thresholds, runner)
 
 The PR check is a check run named exactly **`config-evals-gate`**, published by
-a credential-isolated job (see the HERM-1/HERM-3/CRED-2/CRED-3 comments in the
-workflow). For same-repo PRs it is `success` only when every active case ran,
-scored, and held the thresholds; every other state — battery crash, timeout,
-missing results — is an explicit **failure**, never neutral. Fork PRs are the
-one deliberate exception: no check can be published for them at all, and its
-*absence* is what blocks the merge (see the next section).
+a credential-isolated job (see the HERM-1/CRED-2/CRED-3 comments in the
+workflow). It is `success` only when every active case ran, scored, and held
+the thresholds; every other state — battery crash, timeout, missing results,
+gated-path fork PR — is an explicit **failure**, never neutral or absent. Two
+trust boundaries make that verdict meaningful, both described under
+[Trust boundaries](#trust-boundaries-what-runs-what-and-who-publishes): the
+**harness comes from the base revision** (only the config under test comes from
+the PR head), and the **fork check is published out-of-band** by a
+`workflow_run` workflow, because a fork PR's own run holds a read-only token.
 
 There is no neutral verdict anywhere in this pipeline: the publish job maps
 everything that is not `verdict: "PASS"` + a successful battery job onto
 `conclusion: failure`, and the deploy guard treats anything but a green check
 as "refuse to ship". So every "the gate proved nothing" condition below is a
 **FAIL with an explicit `failureReason`**, not a neutral conclusion.
-
-### Fork PRs — the gate is same-repo only (CRED-2, TEAM-3425)
-
-The gate cannot run for fork PRs, by two independent mechanisms, so it is
-**formally restricted to same-repo PRs**:
-
-- Fork PRs cannot assume the OIDC eval role, so the battery has no Bedrock
-  credentials to score anything with.
-- On fork `pull_request` events GitHub downgrades `GITHUB_TOKEN` to
-  **read-only** and does not honor a job-level `checks: write` request, so the
-  workflow cannot publish a `config-evals-gate` check run for a fork PR at
-  all — `checks.create` returns 403. (An earlier design had a fork-guard job
-  "publish an explicit failing check" for gated fork PRs; that call could
-  never succeed and the design is superseded.)
-
-**Enforcement is the required check's absence.** With `config-evals-gate` set
-as a required status check in branch protection, a fork PR never acquires the
-check and sits at "Expected — waiting" — it cannot merge (fail closed). On top
-of that, a fork PR that touches gated paths (or whose path detection failed)
-gets a visibly **failing `fork-guard` job** — a plain `exit 1` with an
-explanatory `::error::`, no `checks.create` attempt — and an ungated fork PR
-gets an informational `fork-notice` job explaining the same constraint.
-
-**Maintainer workflow for fork contributions:** to gate a fork contribution, a
-maintainer pushes the fork branch to the base repository and opens a same-repo
-PR from it; the battery then runs and publishes the check normally.
 
 ### What can never produce a PASS
 
@@ -165,7 +142,9 @@ npm run battery:lint
 # Run one case against your own AWS credentials (Bedrock Converse in us-east-1):
 node evals/battery/run-battery.mjs --case triage-crash-chain-001 --results /tmp/results.json
 
-# Full gate run, comparing added-vs-base cases like CI does:
+# Full gate run, comparing added-vs-base cases like CI does. CI passes the base
+# SHA (its working tree IS the base revision) plus --config-sha <pr-head-sha>;
+# locally a branch ref against your own checkout is what you want:
 node evals/battery/run-battery.mjs --results /tmp/results.json --base-ref origin/main
 
 # Regenerate a baseline locally (NEVER commit the output from a laptop —
@@ -371,9 +350,9 @@ tip and supersedes whatever is committed.
 ### Where the gating rules come from (gate mode)
 
 A PR can edit the battery's own config, so in **gate mode** — whenever
-`--base-ref <ref>` is passed, as CI does — the runner refuses to referee itself
-with PR-controlled rules. It reads these from `git show <base-ref>:<path>`
-instead of the PR checkout:
+`--base-ref <ref>` is passed, as CI does (with the base **sha**) — the runner
+refuses to referee itself with PR-controlled rules. It reads these from
+`git show <base-ref>:<path>` instead of the PR checkout:
 
 | File | What comes from the base ref |
 | --- | --- |
@@ -411,6 +390,13 @@ Consequences for a PR that touches the battery:
 
 Without `--base-ref` (local/manual runs) everything comes from the working tree,
 which is what you want when iterating on a case.
+
+In **CI** this deferral goes further: the working tree itself is the base
+revision, so the entire harness — not just these rule files — is base-controlled
+and only the candidate config is overlaid from the PR head. The table above still
+describes what wins when they differ; see
+[Trust boundaries](#trust-boundaries-what-runs-what-and-who-publishes) for the
+mechanism and the merge-lag consequences.
 
 ### Gate thresholds (`thresholds.json`)
 
@@ -488,6 +474,109 @@ regression.**
   retirement PR that would go under fails its own gate (preflight) until a
   replacement case lands in the same PR.
 
+## Trust boundaries: what runs, what and who publishes
+
+Two things about the PR gate are decided by *who controls the bytes*, not by the
+battery's scores. Both were tightened in TEAM-3425 (ship-review of PR #199).
+
+### 1. The harness comes from the BASE revision, the config from the PR head
+
+The gate publishes a check that branch protection and the deploy guard treat as
+proof. The publisher job trusts the battery job's artifact, so if the battery job
+ran a PR-supplied runner, a same-repo PR could replace `run-battery.mjs` with a
+script that prints `{"verdict":"PASS"}` and self-approve. It therefore runs the
+harness from the base revision:
+
+| Path | Comes from | Why |
+| --- | --- | --- |
+| `evals/battery/**` (runner, libs, cases, thresholds, baseline, manifest) | `pull_request.base.sha` | it executes, and it decides the verdict |
+| `package.json`, `package-lock.json` (what `npm ci` installs) | `pull_request.base.sha` | a dependency is executable code |
+| `.github/workflows/**` | base (`pull_request` always runs the base copy of the workflow file for same-repo PRs) | the job graph itself |
+| `deploy/runtime-agent/prompts/**`, `deploy/workflow-manager/**`, `blueprints/**`, `src/config/workflows.json`, `src/config/agents.json` | `pull_request.head.sha` | this **is** the artifact under test (FR-2.2) |
+
+Mechanically (`battery` job in `config-evals-gate.yml`): checkout `base.sha` as
+the working tree, checkout `head.sha` into `pr-head/` as **data only**, then a
+plain-shell **allowlist** overlay step `rm -rf`s each candidate path and copies
+the head copy over it (so adds, modifies, deletes and renames all land), deletes
+`pr-head/`, and asserts the working tree is still exactly `base.sha`. Nothing
+outside that allowlist is ever copied, and no PR-authored script or action runs
+at any point. Both checkouts use `persist-credentials: false` and the HERM-1
+no-credential assertion still runs before anything else.
+
+The runner needs no `origin/<branch>` fetch any more — the base revision *is* the
+checkout, so `--base-ref` is passed the base **sha**:
+
+- base-side rules are read as before, with `git show <base-sha>:<path>`
+  (identical to the worktree copy now, which is the point);
+- candidate-side content is read from the working tree;
+- new-case detection diffs the **working tree** against the base sha
+  (`git diff <base-sha> -- evals/battery/cases/`), not `base...HEAD`;
+- `--config-sha <sha>` (new, gate-mode only — rejected with `--baseline-mode`)
+  makes the results file and the check summary name the *config* revision under
+  test instead of `git rev-parse HEAD`, which is now the harness revision.
+
+**Merge lag — the consequence to know about.** A PR that touches
+`evals/battery/**` is still gated (changed-paths flags it, the battery runs), but
+it runs the **base** harness, so its own harness edits have no effect on its own
+gate run. This is the same deferral the base-ref gating knobs already had, now
+extended to the whole harness:
+
+- runner/lib changes, new or edited cases, fixtures, thresholds, manifest edits:
+  no effect on the PR's own verdict;
+- a case **added** by the PR does not run in that PR at all (it isn't in the
+  tree). The "new-in-PR cases run informational" path above therefore only
+  applies to local/manual runs and to the post-merge baseline run;
+- new harness code first executes after merge — in
+  `config-evals-baseline.yml`'s baseline run, and in every later PR's gate run.
+
+So harness diffs are reviewed by **reading them**. A green
+`config-evals-gate` on a harness PR says "the base harness still holds the
+baseline against this PR's config", never "this PR's harness works".
+
+### 2. Fork PRs: the check is published by a separate `workflow_run` workflow
+
+For a `pull_request` event raised from a fork, GitHub downgrades `GITHUB_TOKEN`
+to read-only for the entire run, and a job-level `permissions: checks: write`
+request is silently **not** granted. The old in-workflow `fork-guard` job could
+therefore never publish anything: `checks.create` returned 403, the job errored,
+and the required `config-evals-gate` check was simply **absent** — exactly the
+hole the explicit fork failure was written to close. Same for `skip-publish` on
+an ungated fork PR.
+
+The fork check now comes from `.github/workflows/config-evals-gate-fork-publish.yml`
+(**Config Evals Gate Fork Publisher**), triggered by
+`workflow_run: workflows: ["Config Evals Gate"], types: [completed]`:
+
+- it runs the **default-branch** copy of that workflow definition with a
+  base-repo token, so `checks: write` + `pull-requests: read` are really granted;
+- it **checks out nothing** — there is no `actions/checkout` in the file — and
+  executes zero fork code;
+- it **ignores everything the fork's run produced**. A fork PR can edit
+  `config-evals-gate.yml` itself, so that run's artifacts, outputs and logs are
+  attacker-controlled; a `battery-results` artifact claiming `verdict: "PASS"` is
+  never downloaded, let alone believed;
+- it **recomputes** gatedness from the trusted API: resolve the PR (from
+  `workflow_run.pull_requests`, falling back to lookups by head sha — that field
+  is usually empty for forks), paginate `pulls.listFiles`, and apply a **copy of
+  the changed-paths gated list** (both copies carry a keep-in-sync comment);
+- gated ⇒ `failure`, "Fork PRs cannot run the config evals gate" (a maintainer
+  must push the branch to the base repo to gate it), plus the gated paths;
+  ungated ⇒ `success` with the same SKIPPED messaging same-repo PRs get;
+- **fail closed**: if the PR or its file list cannot be resolved it publishes a
+  *failing* check and marks the job failed; if even publishing fails, the job
+  fails loudly rather than leaving a PR silently uncovered.
+
+Inside `config-evals-gate.yml`, fork PRs now hit no `checks.create` at all:
+`changed-paths` still runs (read-only API), `battery`/`publish`/`skip-publish`
+are same-repo only, and a permission-less `fork-notice` job just prints where the
+check comes from, in the fork's own run log.
+
+**Deploy caveat:** `workflow_run` only fires for workflow files present on the
+**default branch**. Until this publisher is merged to `main`, fork PRs get no
+`config-evals-gate` check at all — the required check stays "Expected — waiting"
+and the PR cannot merge (fail closed, but opaque). Likewise, a fork PR that edits
+the publisher exercises `main`'s copy, not its own.
+
 ## Hermeticity
 
 A battery run executes **zero real side effects**:
@@ -516,17 +605,11 @@ A battery run executes **zero real side effects**:
   DynamoDB, batched to S3, or counted toward the improver flush.
 - **Sanitized fixtures** enforced by `npm run battery:lint`.
 - **CI credential preflight**: the gate job checks out with
-  `persist-credentials: false` (both the workspace and the pr-head side
-  checkout) and asserts no git credential survives on disk before the battery
-  runs.
-- **Harness from the trusted base revision** (HERM-3, TEAM-3425): in CI the
-  battery job's workspace is checked out at the PR's *base* sha — the runner,
-  `lib/`, scoring code, and `package*.json` are always pre-merge-reviewed
-  code. Only the candidate config paths (prompts, `deploy/workflow-manager/`,
-  `blueprints/`, `src/config/workflows.json`, `src/config/agents.json`) are
-  overlaid from the PR head before the run, so a PR that edits
-  `evals/battery/**` cannot fabricate its own verdict — a harness change is
-  exercised by the gate only after it merges.
+  `persist-credentials: false` (both checkouts) and asserts no git credential
+  survives on disk before it runs.
+- **No PR-supplied code executes at all** in CI: the harness comes from the base
+  revision and only the config under test is overlaid from the PR head — see
+  [Trust boundaries](#trust-boundaries-what-runs-what-and-who-publishes).
 
 ## Deploy gate + break-glass
 
