@@ -303,6 +303,13 @@ async function main() {
   }
 
   const configSha = git("rev-parse", "HEAD");
+  // TRUST-1 (TEAM-3425): in CI the battery job's checkout is the trusted BASE
+  // revision — the PR head only overlays candidate data — so configSha above
+  // records the HARNESS revision, not the candidate. The workflow passes the
+  // PR head sha in GATE_CANDIDATE_SHA; it is recorded in the results as
+  // candidateSha so the artifact stays attributable to the config under test.
+  // Unset (local/manual runs) it is simply omitted.
+  const candidateSha = process.env.GATE_CANDIDATE_SHA || null;
   const newCaseIds =
     gate && gate.baseActiveIds
       ? gateNewCaseIds({ gate, baseline, selected })
@@ -699,6 +706,7 @@ async function main() {
     configSources: gate ? { baseRef: gate.baseRef, ...gate.sources } : { baseRef: null, all: "pr-head (local/manual run)" },
     flakyFlags,
   });
+  if (candidateSha) results.candidateSha = candidateSha;
 
   // C2: redact at the write-time choke point. check-summary.md is published
   // verbatim into a public check run, and battery-results.json is uploaded as
