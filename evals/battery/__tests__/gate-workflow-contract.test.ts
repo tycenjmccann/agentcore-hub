@@ -15,10 +15,10 @@ import { resolve } from "node:path";
  * publication restrictions) so a future PR that weakens the workflow fails
  * the unit suite instead of silently reopening the hole.
  *
- * The repo carries no YAML dependency, so the workflow is checked
- * structurally: job blocks are sliced by their two-space-indented keys under
- * `jobs:` and asserted with string/regex matches against the literal
- * expressions GitHub evaluates.
+ * The workflow is checked structurally here: job blocks are sliced by their
+ * two-space-indented keys under `jobs:` and asserted with string/regex matches
+ * against the literal expressions GitHub evaluates. A complementary
+ * YAML-parsed view of the same boundary lives in gate-workflow.test.ts.
  */
 
 const workflowPath = resolve(
