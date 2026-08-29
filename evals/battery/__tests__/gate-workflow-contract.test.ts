@@ -121,12 +121,39 @@ describe("battery job — trusted-base harness (TRUST-1)", () => {
         /thresholds\.json|baseline\.json|evals\/battery\/schema/,
       );
     }
-    // Positive shape: the candidate config paths the gate exists to test.
+    // Positive shape: the candidate config paths the gate exists to test,
+    // plus the battery corpus DATA (TEAM-3438 Finding 2) — a PR editing a
+    // case/fixture/manifest must be scored against ITS corpus, not base's.
+    // resolveGateConfig still takes the gating knobs from the base ref, so
+    // the overlaid corpus cannot drop/retire/soften a base-active case.
     expect(dirs).toContain("deploy/runtime-agent/prompts");
     expect(dirs).toContain("deploy/workflow-manager");
     expect(dirs).toContain("blueprints");
+    expect(dirs).toContain("evals/battery/cases");
+    expect(dirs).toContain("evals/battery/fixtures");
     expect(files).toContain("src/config/workflows.json");
     expect(files).toContain("src/config/agents.json");
+    expect(files).toContain("evals/battery/manifest.json");
+  });
+
+  it("pr-head sparse checkout materializes corpus DATA but never battery code (TEAM-3438)", () => {
+    const head = checkouts[1];
+    // Non-cone mode: cone patterns are directory-only and would drag every
+    // immediate file of listed dirs' parents (runner, lockfiles) into pr-head.
+    expect(head).toContain("sparse-checkout-cone-mode: false");
+    for (const pattern of [
+      "/deploy/runtime-agent/prompts/",
+      "/deploy/workflow-manager/",
+      "/blueprints/",
+      "/src/config/",
+      "/evals/battery/cases/",
+      "/evals/battery/fixtures/",
+      "/evals/battery/manifest.json",
+    ])
+      expect(head).toContain(pattern);
+    expect(head).not.toMatch(/evals\/battery\/lib/);
+    // No blanket battery pattern that would sweep in the runner and rules.
+    expect(head).not.toMatch(/^\s*\/?evals\/battery\/?\s*$/m);
   });
 
   it("overlay REJECTS symlinks/non-regular head files before any copy (TEAM-3438)", () => {

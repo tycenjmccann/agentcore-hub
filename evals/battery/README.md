@@ -421,11 +421,14 @@ stops it from rewriting the **referee**. In CI the battery job checks out the
 package.json/lockfile, and before any PR-head byte exists on disk),
 `run-battery.mjs`, and everything under `evals/battery/lib/` execute from
 base — and the PR head contributes **data only**: a fixed allow-list of
-candidate config is mirrored in from a second `pr-head/` checkout (which is
+candidate paths is mirrored in from a second `pr-head/` checkout (which is
 deleted before the runner starts):
 
 - `deploy/runtime-agent/prompts/`, `deploy/workflow-manager/`, `blueprints/`
 - `src/config/workflows.json`, `src/config/agents.json`
+- `evals/battery/cases/`, `evals/battery/fixtures/`,
+  `evals/battery/manifest.json` (TEAM-3438 Finding 2 — the battery **corpus**,
+  read as data, never imported or executed)
 
 So the artifact the publish job trusts was always produced by base-revision
 code reading base-revision rules. In this mode `battery-results.json` records
@@ -433,19 +436,24 @@ code reading base-revision rules. In this mode `battery-results.json` records
 `git rev-parse HEAD`) **and** `candidateSha` (the PR head sha, passed in via
 `GATE_CANDIDATE_SHA`).
 
-Consequences for a PR that touches `evals/battery/**`: **nothing under
-`evals/battery/` is overlaid** — runner, lib/, schema/, cases/, fixtures/,
-manifest.json, thresholds.json, and baseline.json are all read from base in
-the PR's own gate run. Harness, case, and rule changes are *not* exercised
-pre-merge by the gate itself; they take effect post-merge (the merge-to-main
-baseline workflow and every subsequent PR's gate run use them). Pre-merge
-coverage for battery changes comes from the unit suite
+Consequences for a PR that touches `evals/battery/**`: the **corpus** (cases/,
+fixtures/, manifest.json) is overlaid, so a PR editing a case, fixture, or the
+manifest is scored against **its** candidate corpus pre-merge — with the
+base-ref guards above still in force (deleting a base-active case is a
+preflight error, retiring one resurrects it into the run set, gating knobs
+inside base-active cases come from base, and the overlaid corpus gets full
+schema/set-equality preflight validation). Battery **code and rules** are NOT
+overlaid — runner, lib/, schema/, thresholds.json, and baseline.json are all
+read from base in the PR's own gate run; those changes take effect post-merge
+(the merge-to-main baseline workflow and every subsequent PR's gate run use
+them). Pre-merge coverage for harness/rule changes comes from the unit suite
 (`evals/battery/__tests__/`) and local `--mock`/`--dry-run` runs. The gate
 still runs on such PRs (the path filter includes `evals/battery/**`, fail
-closed) — it just scores base config with the base harness.
+closed).
 
 The trust-boundary invariants (base-sha root checkout, head-to-`pr-head/`-only
-checkout, the exact overlay allow-list never containing the harness, `npm ci`
+checkout, the exact overlay allow-list never containing the harness or its
+rules, `npm ci`
 before the head checkout, pr-head deletion before the run, no `checks: write`
 on any fork-reachable job) are pinned by
 `evals/battery/__tests__/gate-workflow.test.ts` and
@@ -565,11 +573,13 @@ A battery run executes **zero real side effects**:
 - **Harness from the trusted base revision** (HERM-3, TEAM-3425): in CI the
   battery job's workspace is checked out at the PR's *base* sha — the runner,
   `lib/`, scoring code, and `package*.json` are always pre-merge-reviewed
-  code. Only the candidate config paths (prompts, `deploy/workflow-manager/`,
-  `blueprints/`, `src/config/workflows.json`, `src/config/agents.json`) are
-  overlaid from the PR head before the run, so a PR that edits
-  `evals/battery/**` cannot fabricate its own verdict — a harness change is
-  exercised by the gate only after it merges.
+  code. Only the candidate paths (prompts, `deploy/workflow-manager/`,
+  `blueprints/`, `src/config/workflows.json`, `src/config/agents.json`, and —
+  TEAM-3438 — the corpus data `cases/`, `fixtures/`, `manifest.json`) are
+  overlaid from the PR head before the run, so a PR that edits battery *code*
+  cannot fabricate its own verdict — a harness change is exercised by the
+  gate only after it merges, while a corpus change IS scored pre-merge under
+  the base-ref gating guards.
 
 ## Deploy gate + break-glass
 

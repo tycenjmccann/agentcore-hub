@@ -30,10 +30,18 @@ const workflow = parse(
 );
 const jobs: Record<string, any> = workflow.jobs;
 
-// The exact candidate-config allowlist the gate exists to score (FR-2.2).
+// The exact candidate allowlist the gate exists to score (FR-2.2): candidate
+// config plus, since TEAM-3438 Finding 2, the battery corpus DATA (cases,
+// fixtures, manifest) — read by the base harness, never imported or executed.
 // Keep in sync with the overlay step AND the gated-path list in changed-paths.
-const OVERLAY_DIRS = ["deploy/runtime-agent/prompts", "deploy/workflow-manager", "blueprints"];
-const OVERLAY_FILES = ["src/config/workflows.json", "src/config/agents.json"];
+const OVERLAY_DIRS = [
+  "deploy/runtime-agent/prompts",
+  "deploy/workflow-manager",
+  "blueprints",
+  "evals/battery/cases",
+  "evals/battery/fixtures",
+];
+const OVERLAY_FILES = ["src/config/workflows.json", "src/config/agents.json", "evals/battery/manifest.json"];
 
 const SAME_REPO = "github.event.pull_request.head.repo.full_name == github.repository";
 const FORK_ONLY = "github.event.pull_request.head.repo.full_name != github.repository";
@@ -85,9 +93,51 @@ describe("battery job — harness from trusted base (HERM-3)", () => {
     const sources = run.match(/pr-head\/[^\s"']*/g) ?? [];
     expect(sources.length).toBeGreaterThan(0);
     for (const src of sources) expect(["pr-head/$dir", "pr-head/$f"]).toContain(src);
-    // Executable/harness paths must never appear as overlay sources.
-    for (const forbidden of ["evals/battery", ".github", "package.json", "package-lock.json"])
+    // Executable/harness paths and the gate's own rules must never appear as
+    // overlay sources. (Corpus DATA under evals/battery — cases, fixtures,
+    // manifest.json — is legitimately overlaid since TEAM-3438 Finding 2, so
+    // the forbidden list names the battery's code and rule files precisely.)
+    for (const forbidden of [
+      "evals/battery/lib",
+      "run-battery",
+      "evals/battery/schema",
+      "thresholds.json",
+      "baseline.json",
+      ".github",
+      "package.json",
+      "package-lock.json",
+    ])
       expect(run, `overlay must not reference ${forbidden}`).not.toContain(forbidden);
+  });
+
+  it("sparse-checks-out exactly what the overlay allowlist needs — never battery code (TEAM-3438)", () => {
+    const side = checkouts.filter((s) => s.with?.path);
+    // Non-cone mode: cone patterns are directory-only and pull in parent-dir
+    // files, which would put the runner and lib/ inside pr-head.
+    expect(side[0].with?.["sparse-checkout-cone-mode"]).toBe(false);
+    const patterns = String(side[0].with?.["sparse-checkout"] ?? "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const covers = (pattern: string, path: string) => {
+      const p = pattern.replace(/^\//, "").replace(/\/$/, "");
+      return p === path || path.startsWith(`${p}/`);
+    };
+    // Every overlay source must actually exist in pr-head…
+    for (const entry of [...OVERLAY_DIRS, ...OVERLAY_FILES])
+      expect(patterns.some((p) => covers(p, entry)), `sparse-checkout must cover ${entry}`).toBe(true);
+    // …and nothing executable or rule-bearing may be materialized there.
+    for (const path of [
+      "evals/battery/lib",
+      "evals/battery/run-battery.mjs",
+      "evals/battery/schema",
+      "evals/battery/thresholds.json",
+      "evals/battery/baseline.json",
+      ".github",
+      "package.json",
+      "package-lock.json",
+    ])
+      expect(patterns.some((p) => covers(p, path)), `sparse-checkout must not cover ${path}`).toBe(false);
   });
 
   it("rejects symlinks and non-regular PR-head files BEFORE any copy (TEAM-3438)", () => {
@@ -190,6 +240,18 @@ describe("overlay symlink rejection — the real inline script, executed (TEAM-3
     expect(output).toContain("pr-head/src/config/workflows.json");
   });
 
+  it("fails on a symlink planted under the battery corpus overlay (Finding 2 dirs are guarded too)", () => {
+    // The guard iterates OVERLAY_DIRS, so the corpus paths added by TEAM-3438
+    // Finding 2 must be covered without any guard change.
+    const root = workspace();
+    mkdirSync(join(root, "pr-head/evals/battery/cases"), { recursive: true });
+    symlinkSync("/proc/self/environ", join(root, "pr-head/evals/battery/cases/evil.json"));
+    const { code, output } = runOverlay(root);
+    expect(code).toBe(1);
+    expect(output).toContain("::error::");
+    expect(output).toContain("pr-head/evals/battery/cases/evil.json");
+  });
+
   it("fails when an allowlisted directory itself is a symlink", () => {
     const root = workspace();
     mkdirSync(join(root, "pr-head/deploy/runtime-agent"), { recursive: true });
@@ -203,11 +265,18 @@ describe("overlay symlink rejection — the real inline script, executed (TEAM-3
     write(root, "deploy/runtime-agent/prompts/stale.txt", "deleted at head");
     write(root, "pr-head/deploy/runtime-agent/prompts/new.txt", "candidate prompt");
     write(root, "pr-head/src/config/workflows.json", "{}");
+    // Battery corpus data (TEAM-3438 Finding 2) overlays the same way.
+    write(root, "evals/battery/cases/stale-case.json", "deleted at head");
+    write(root, "pr-head/evals/battery/cases/new-case.json", '{"id":"new-case"}');
+    write(root, "pr-head/evals/battery/manifest.json", '{"activeCases":["new-case"]}');
     const { code, output } = runOverlay(root);
     expect(code, output).toBe(0);
     expect(readFileSync(join(root, "deploy/runtime-agent/prompts/new.txt"), "utf8")).toBe("candidate prompt");
     expect(existsSync(join(root, "deploy/runtime-agent/prompts/stale.txt"))).toBe(false);
     expect(readFileSync(join(root, "src/config/workflows.json"), "utf8")).toBe("{}");
+    expect(readFileSync(join(root, "evals/battery/cases/new-case.json"), "utf8")).toBe('{"id":"new-case"}');
+    expect(existsSync(join(root, "evals/battery/cases/stale-case.json"))).toBe(false);
+    expect(readFileSync(join(root, "evals/battery/manifest.json"), "utf8")).toBe('{"activeCases":["new-case"]}');
     expect(existsSync(join(root, "pr-head"))).toBe(false);
   });
 });

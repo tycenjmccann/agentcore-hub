@@ -40,9 +40,21 @@
 #           tooling are all pre-merge-reviewed code the PR cannot modify
 #           (`npm ci` runs before any PR-head byte exists on disk). The PR
 #           head is checked out into a side directory and ONLY the gated
-#           CANDIDATE CONFIG paths (prompts, workflow-manager config,
-#           blueprints, workflows/agents JSON) are overlaid into the workspace
-#           before the battery runs (FR-2.2: the gate scores PR-head config).
+#           CANDIDATE paths — config (prompts, workflow-manager config,
+#           blueprints, workflows/agents JSON) plus the battery CORPUS DATA
+#           (evals/battery/cases, evals/battery/fixtures, manifest.json;
+#           TEAM-3438 Finding 2) — are overlaid into the workspace before the
+#           battery runs (FR-2.2: the gate scores PR-head config, and a PR
+#           editing a case/fixture/manifest is scored against ITS corpus, not
+#           base's). Corpus files are read as data, never imported or
+#           executed; the runner, evals/battery/lib, schema/, thresholds.json,
+#           baseline.json, and lockfiles stay at the base revision, and
+#           resolveGateConfig (B2) still reads the gating knobs (base-active
+#           case set, minActiveCases, floors/evaluators inside base-active
+#           cases) from the base ref — so an overlaid manifest/case cannot
+#           drop, retire, or soften a base-active gating case (deletion is a
+#           preflight error, retirement resurrects, set-equality and schema
+#           validation run against the overlaid corpus).
 #           Without this, a same-repo PR editing evals/battery/** would run its
 #           own evaluator and could fabricate the PASS artifact that publish
 #           trusts — the HERM-1 job split alone is not a trust boundary around
@@ -167,7 +179,9 @@ jobs:
     steps:
       # HERM-3: the WORKSPACE is the trusted base revision — the harness that
       # computes the verdict is always pre-merge-reviewed code. PR-head config
-      # is overlaid below; evals/battery/** is deliberately NOT.
+      # and battery corpus DATA (cases/fixtures/manifest) are overlaid below;
+      # battery CODE (run-battery.mjs, lib/, schema/) and the gate rules
+      # (thresholds.json, baseline.json) are deliberately NOT.
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
@@ -199,17 +213,26 @@ jobs:
 
       # PR head goes into a SIDE directory only, sparse-checked-out to just the
       # candidate paths. Nothing in here is executed; the overlay step copies
-      # out the candidate config paths and deletes the rest.
+      # out the candidate config paths and deletes the rest. Non-cone mode
+      # (TEAM-3438 Finding 2): cone patterns are directory-only and would drag
+      # in every immediate file of listed dirs' parents — anchored non-cone
+      # patterns express the exact allowlist, including the single-file
+      # manifest.json, and keep evals/battery/lib + the runner out of pr-head
+      # entirely. Keep this list covering OVERLAY_DIRS + OVERLAY_FILES below.
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: pr-head
           persist-credentials: false
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
-            deploy/runtime-agent/prompts
-            deploy/workflow-manager
-            blueprints
-            src/config
+            /deploy/runtime-agent/prompts/
+            /deploy/workflow-manager/
+            /blueprints/
+            /src/config/
+            /evals/battery/cases/
+            /evals/battery/fixtures/
+            /evals/battery/manifest.json
 
       - name: Assert no on-disk git credential (HERM-1)
         run: |
@@ -227,21 +250,30 @@ jobs:
           done
 
       - name: Overlay candidate config from PR head (HERM-3 / FR-2.2)
-        # Trust boundary: ONLY the gated CONFIG paths cross from pr-head into
-        # the workspace — exactly what the gate exists to score. Executable
-        # paths (evals/battery/**, .github/**, package*.json, src code) stay at
-        # the base revision, so a PR mutating the runner/evaluator cannot
-        # influence the verdict artifact the publish job trusts.
+        # Trust boundary: ONLY the gated CANDIDATE paths cross from pr-head
+        # into the workspace — the config the gate exists to score, plus the
+        # battery corpus DATA (cases/, fixtures/, manifest.json; TEAM-3438
+        # Finding 2) so a PR editing the corpus is scored against its own
+        # candidate corpus. Corpus files are read, never imported/executed,
+        # and resolveGateConfig still takes the gating knobs from the base
+        # ref. Executable paths (evals/battery/lib, run-battery.mjs,
+        # .github/**, package*.json, src code) and the gate rules
+        # (thresholds.json, baseline.json, schema/) stay at the base revision,
+        # so a PR mutating the runner/evaluator/rules cannot influence the
+        # verdict artifact the publish job trusts.
         run: |
           set -euo pipefail
           OVERLAY_DIRS=(
             "deploy/runtime-agent/prompts"
             "deploy/workflow-manager"
             "blueprints"
+            "evals/battery/cases"
+            "evals/battery/fixtures"
           )
           OVERLAY_FILES=(
             "src/config/workflows.json"
             "src/config/agents.json"
+            "evals/battery/manifest.json"
           )
           # ---- Symlink / non-regular-file rejection (TEAM-3438 Finding 1) ----
           # Trust boundary: `cp -R` preserves symlinks, so a PR-committed
