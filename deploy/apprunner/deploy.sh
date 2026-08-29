@@ -27,6 +27,15 @@
 
 set -euo pipefail
 
+# TEAM-3426: this script takes no CLI arguments — reject anything passed (in
+# particular --force) rather than silently ignoring it. The audited eval-gate
+# break-glass here is env-var-only.
+if [ "$#" -gt 0 ]; then
+  echo "ERROR: $0 takes no arguments (got: $*)." >&2
+  echo "  Eval-gate break-glass (audited): EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON='INC-123: why' $0" >&2
+  exit 1
+fi
+
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 

@@ -70,13 +70,14 @@ describe("battery job — harness from trusted base (HERM-3)", () => {
   it("overlays exactly the candidate-config allowlist from the PR head", () => {
     expect(overlay, "battery job must have an overlay step").toBeTruthy();
     const run: string = overlay.run;
-    // The two loops ARE the allowlist — assert them exactly.
-    const dirLoop = run.match(/for dir in ([^\n;]+);/);
-    expect(dirLoop, "overlay must loop over the candidate directories").toBeTruthy();
-    expect(dirLoop![1].trim().split(/\s+/)).toEqual(OVERLAY_DIRS);
-    const fileLoop = run.match(/for f in ([^\n;]+);/);
-    expect(fileLoop, "overlay must loop over the candidate files").toBeTruthy();
-    expect(fileLoop![1].trim().split(/\s+/)).toEqual(OVERLAY_FILES);
+    // The two bash arrays ARE the allowlist — assert them exactly.
+    const bashArray = (name: string): string[] => {
+      const m = run.match(new RegExp(`${name}=\\(([^)]*)\\)`));
+      expect(m, `overlay must declare the ${name} allowlist array`).toBeTruthy();
+      return [...m![1].matchAll(/"([^"]+)"/g)].map((x) => x[1]);
+    };
+    expect(bashArray("OVERLAY_DIRS")).toEqual(OVERLAY_DIRS);
+    expect(bashArray("OVERLAY_FILES")).toEqual(OVERLAY_FILES);
     // Every pr-head/… reference must be a loop variable — no path can cross
     // the boundary outside the allowlist above.
     const sources = run.match(/pr-head\/[^\s"']*/g) ?? [];

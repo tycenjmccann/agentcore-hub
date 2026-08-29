@@ -35,6 +35,19 @@ and the break-glass procedure. All deploy targets that ship gated artifacts
 `deploy/workflow-manager/deploy.sh`, `deploy/apprunner/deploy.sh`,
 `deploy/ecs-express/deploy.sh`) source `deploy/lib/check-eval-gate.sh` and
 refuse to run unless HEAD carries a green `config-evals-gate` check run.
+Only a REAL battery pass counts as green: the workflow's
+"SKIPPED — no gated paths changed" success check is informational and is
+treated like an absent check (it can never anchor or green-light a deploy).
+
+Break-glass (audited): `deploy/runtime-agent/deploy.sh`, `deploy-one.sh`, and
+`deploy-fleet.sh` accept `--force --force-reason "INC-123: why"`; every gated
+script equally honors the env form
+`EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON="INC-123: why"`. Both are the
+SAME audited path — a loud banner, an override record written to S3 and to
+`.eval-gate-overrides.log`, and a refusal when no durable audit sink is
+available. A `--force` with no reason is refused, and the remaining gated
+scripts reject `--force` (and any other argument) with an error instead of
+silently ignoring it.
 The gate's CI job assumes an OIDC IAM role — one-time provisioning is
 documented in [`evals/battery/README.md`](evals/battery/README.md) under
 "CI AWS credentials (one-time setup)".
