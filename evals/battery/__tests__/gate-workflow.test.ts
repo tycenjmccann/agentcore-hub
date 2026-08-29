@@ -140,3 +140,30 @@ describe("fork safety — no fork-reachable job can touch checks.create (CRED-2)
     expect(stepCode(notice)).not.toMatch(/^\s*exit 1\s*$/m);
   });
 });
+
+describe("gated-path list — keep-in-sync contract with config-evals-baseline.yml", () => {
+  // changed-paths' comment promises its list stays in sync with the baseline
+  // workflow's push paths; a baseline-regenerating path the gate ignores
+  // would let ungated PRs drift the config the baseline is generated from.
+  it("the gate's gated-path list covers every baseline-workflow push path", () => {
+    const script: string = jobs["changed-paths"].steps[0].with.script;
+    const grab = (name: string): string[] => {
+      const m = script.match(new RegExp(`${name} = \\[([\\s\\S]*?)\\];`));
+      expect(m, `${name} array not found in changed-paths script`).toBeTruthy();
+      return [...m![1].matchAll(/"([^"]+)"/g)].map((x) => x[1]);
+    };
+    const prefixes = grab("gatedPrefixes");
+    const files = grab("gatedFiles");
+    const baselineWf = parse(
+      readFileSync(join(REPO_ROOT, ".github/workflows/config-evals-baseline.yml"), "utf8")
+    );
+    const pushPaths: string[] = baselineWf.on.push.paths;
+    expect(pushPaths.length).toBeGreaterThan(0);
+    for (const p of pushPaths) {
+      const covered = p.endsWith("/**")
+        ? prefixes.includes(p.slice(0, -2)) // "x/**" ⇒ prefix "x/"
+        : files.includes(p);
+      expect(covered, `baseline push path '${p}' not covered by the gated list`).toBe(true);
+    }
+  });
+});

@@ -159,6 +159,20 @@ jobs:
           # HERM-1: leave no token on disk for the battery to exfiltrate.
           persist-credentials: false
 
+      # Provenance belt-and-suspenders: if a future edit ever changes the
+      # checkout ref above, refuse to run rather than execute a harness of
+      # unknown provenance.
+      - name: Assert the working tree is the base revision (HERM-3)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          checked_out="$(git rev-parse HEAD)"
+          if [ "$checked_out" != "$BASE_SHA" ]; then
+            echo "::error::working tree is at $checked_out, expected base revision $BASE_SHA — refusing to run a harness of unknown provenance"
+            exit 1
+          fi
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
