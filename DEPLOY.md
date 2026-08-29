@@ -50,7 +50,7 @@ script, reason}` to `s3://$ARTIFACT_BUCKET/eval-gate/overrides/` **and**
 `.eval-gate-overrides.log`; refused if no durable record can be written):
 
 ```bash
-# CLI form — deploy/runtime-agent/deploy.sh and deploy-one.sh
+# CLI form — deploy/runtime-agent/deploy.sh, deploy-one.sh, and deploy-fleet.sh
 ./deploy/runtime-agent/deploy.sh --force --force-reason "INC-123: why" backend_dev
 
 # Env-var form — every gated target, including the raw require_eval_gate calls below
@@ -60,7 +60,10 @@ EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON="INC-123: why" ./deploy/ecs-expre
 A reason is mandatory: `--force` without a non-empty `--force-reason` (or an
 inherited non-empty `EVAL_GATE_OVERRIDE_REASON`) is refused before any gate or
 deploy work, and unknown `--flags` are rejected rather than misread as an agent
-name. Full semantics: "Deploy gate + break-glass" in
+name. The remaining gated scripts (`deploy-topology.sh`, `workflow-manager`,
+`apprunner`, `ecs-express`) take no CLI arguments and reject `--force` (and
+anything else) with an error pointing at the env-var form. Full semantics:
+"Deploy gate + break-glass" in
 [`evals/battery/README.md`](evals/battery/README.md).
 
 ## Staging deploy

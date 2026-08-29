@@ -9,7 +9,8 @@
 #   ./deploy.sh 10 11 12            # Deploy agents #10, #11, #12
 #   ./deploy.sh backend_dev api_dev # Deploy by name
 #   ./deploy.sh --force --force-reason "INC-1: hotfix" backend_dev
-#                                   # Audited eval-gate break-glass (see below)
+#                                   # Audited eval-gate break-glass (CLI form of
+#                                   # EVAL_GATE_OVERRIDE=1 + EVAL_GATE_OVERRIDE_REASON)
 #
 # Environment:
 #   AWS_PROFILE    — Which AWS profile to use (required)
@@ -80,7 +81,6 @@ for arg in "$@"; do
     exit 0
   fi
 done
-
 # --- Break-glass flags (TEAM-3426 FINDING 4) ---
 # On --force this exports EVAL_GATE_OVERRIDE=1 + EVAL_GATE_OVERRIDE_REASON before
 # the gate runs, so the override goes through the SAME audited

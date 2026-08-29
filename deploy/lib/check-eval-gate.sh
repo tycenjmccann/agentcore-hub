@@ -80,6 +80,8 @@
 # Break-glass (TEAM-3066 BG-2/BG-3 — audited, never silent):
 #   EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON="INC-123: hotfix, gate is
 #   red on an unrelated case" ./deploy/...
+#   CLI equivalent (routed to the same audited path by the deploy scripts):
+#   ./deploy/... --force --force-reason "INC-123: hotfix, ..."
 # Both variables are required; an empty reason still refuses. The override is
 # recorded to s3://$ARTIFACT_BUCKET/eval-gate/overrides/<ts>-<sha>.txt AND to
 # .eval-gate-overrides.log (gitignored). If the S3 write fails you must type
@@ -597,7 +599,8 @@ require_eval_gate() {
     echo "eval-gate: HEAD ($head_sha) resolved to merged PR #$pr_number (head $pr_head_sha) but that head carries no ${EVAL_GATE_CHECK_NAME} battery PASS (no check at all, or a non-PASS success — see above) — treating the check as absent." >&2
   fi
 
-  # No check on HEAD directly or via its merged PR — only acceptable when
+  # No real check evidence on HEAD directly or via its merged PR (absent or a
+  # skipped success either way) — only acceptable when
   # nothing gated changed. Capture the file list FIRST: a pipe would discard
   # _eval_gate_commit_files' exit status, and an unreadable commit must refuse
   # (fail closed), not pass as "touched nothing".
@@ -654,8 +657,9 @@ require_eval_gate() {
           return 0
           ;;
       esac
-      # No direct check — the ancestor may itself be a merge/squash commit
-      # whose evidence lives on its PR's head sha (A1).
+      # No direct real check (absent, or a skipped success) — the ancestor may
+      # itself be a merge/squash commit whose evidence lives on its PR's head
+      # sha (A1). That evidence must equally be a real pass, not SKIPPED.
       if pr_resolved="$(_eval_gate_resolve_merged_pr_head "$owner_repo" "$c")"; then
         pr_number="${pr_resolved%% *}"
         pr_head_sha="${pr_resolved##* }"

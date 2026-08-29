@@ -19,10 +19,13 @@ copies, never the S3 ones):
 - `evals/battery/**` — the battery itself (cases, thresholds, runner)
 
 The PR check is a check run named exactly **`config-evals-gate`**, published by
-a credential-isolated job (see the HERM-1/CRED-2/CRED-3 comments in the
-workflow). It is `success` only when every active case ran, scored, and held
-the thresholds; every other state — battery crash, timeout, missing results,
-fork PR — is an explicit **failure**, never neutral or absent.
+a credential-isolated job (see the HERM-1/TRUST-1/CRED-2/CRED-3 comments in the
+workflow). For same-repo PRs it is `success` only when every active case ran,
+scored, and held the thresholds; every other state — battery crash, timeout,
+missing results — is an explicit **failure**, never neutral. Fork PRs are the
+one deliberate exception: **no check is published at all**, and the required
+check's *absence* is what blocks the merge — see
+"Fork PRs (FR-2 fork-safety decision)" below.
 
 There is no neutral verdict anywhere in this pipeline: the publish job maps
 everything that is not `verdict: "PASS"` + a successful battery job onto
@@ -40,6 +43,29 @@ as "refuse to ship". So every "the gate proved nothing" condition below is a
 | Duplicate case ids across `cases/*.json` | Preflight failure, before any spend. |
 | Accumulated spend above `maxRunUsd` | The runner aborts remaining work and fails the suite. |
 | A case active at the base ref that the PR deletes | Preflight failure — a PR cannot remove a gating case. |
+
+### Fork PRs (FR-2 fork-safety decision)
+
+The gate is formally **same-repo-only** (TEAM-3425). On fork `pull_request`
+events GitHub hands the workflow a **read-only `GITHUB_TOKEN`** and does not
+honor workflow- or job-level permission requests (`checks: write` included), so
+`checks.create` returns 403: publishing *any* `config-evals-gate` check run —
+failing or passing — from a fork-triggered run is impossible by platform
+design. (The earlier fork-guard that tried to publish an explicit failing
+check could never have worked.) The fork contract is therefore:
+
+- **No `config-evals-gate` check is ever published for a fork PR**, gated or
+  not. Because the check is required in branch protection, its absence keeps
+  the PR on "Expected — waiting" and the merge stays blocked — fail-closed is
+  preserved by check **absence**, not by a published failure.
+- For fork PRs touching gated paths, the `fork-guard` job fails **red** with
+  this explanation in its step summary, so the situation is visible on the
+  PR's checks tab even though no check run is created. Ungated fork PRs get
+  no red job, just the absent required check.
+- **Maintainer workflow:** to gate a fork contribution, push the branch to
+  this repository (`git push origin <sha>:refs/heads/<branch>`) and open (or
+  retarget) the PR from the same-repo branch; the battery then runs with OIDC
+  credentials as usual.
 
 ## Case format
 
@@ -381,6 +407,50 @@ Consequences for a PR that touches the battery:
 - Every run prints a `Gate config resolution` block naming the source of each
   file, and `battery-results.json` records it under `configSources`.
 
+#### Trusted-base harness in CI (TRUST-1, TEAM-3425)
+
+Base-ref rule reading (above) stops a PR from rewriting the **rules**; TRUST-1
+stops it from rewriting the **referee**. In CI the battery job checks out the
+**base revision** at the workspace root — `npm ci` (against base's
+package.json/lockfile), `run-battery.mjs`, and everything under
+`evals/battery/lib/` execute from base — and the PR head contributes **data
+only**: a fixed allow-list is mirrored in from a second `pr-head/` checkout
+(which is deleted before the runner starts):
+
+- `deploy/runtime-agent/prompts/`, `deploy/workflow-manager/`, `blueprints/`
+- `src/config/workflows.json`, `src/config/agents.json`
+- `evals/battery/cases/`, `evals/battery/fixtures/`,
+  `evals/battery/manifest.json` — pure data (cases are schema-validated JSON;
+  fixtures are inert specimen content the harness only ever reads, never
+  imports or executes; cases and manifest must move together because preflight
+  cross-checks them for exact set equality)
+
+So the artifact the publish job trusts was always produced by base-revision
+code. In this mode `battery-results.json` records `configSha` (the base sha
+the harness ran from — the runner's own `git rev-parse HEAD`) **and**
+`candidateSha` (the PR head sha, passed in via `GATE_CANDIDATE_SHA`).
+
+Consequences for a PR that touches `evals/battery/**`:
+
+- **cases/, fixtures/, manifest.json are candidate data and ARE overlaid** — a
+  new case still runs informational in its own PR, exactly as before.
+- **run-battery.mjs, lib/, schema/, thresholds.json, and baseline.json are NOT
+  overlaid** — the PR's own gate run executes/reads the base copies, so
+  harness and rule changes are *not* exercised pre-merge by the gate itself;
+  they take effect post-merge (the merge-to-main baseline workflow and every
+  subsequent PR's gate run use them). Pre-merge coverage for harness changes
+  comes from the unit suite (`evals/battery/__tests__/`) and local `--mock`
+  runs. Note the gate then evaluates base *harness/rules* against head
+  *config*; a case that needs a schema change (e.g. a new evaluator name)
+  must land the schema change first, because its own gate run validates cases
+  against the base schema.
+
+The trust-boundary invariants (base-sha root checkout, head-to-`pr-head/`-only
+checkout, the overlay allow-list never containing the harness, `npm ci` before
+the head checkout, no `checks: write` on the battery job) are pinned by
+`evals/battery/__tests__/gate-workflow-contract.test.ts` — weakening the
+workflow fails the unit suite.
+
 Without `--base-ref` (local/manual runs) everything comes from the working tree,
 which is what you want when iterating on a case.
 
@@ -528,7 +598,7 @@ before its first S3 write or docker build. Semantics against HEAD:
 Break-glass (audited — BG-2/BG-3) has two equivalent forms:
 
 ```bash
-# CLI form (deploy/runtime-agent/deploy.sh and deploy-one.sh)
+# CLI form (deploy/runtime-agent/deploy.sh, deploy-one.sh, and deploy-fleet.sh)
 ./deploy/runtime-agent/deploy.sh --force --force-reason "INC-123: hotfix, gate red on an unrelated case" backend_dev
 
 # Env-var form (every gated target, including the raw require_eval_gate calls in DEPLOY.md)
@@ -543,7 +613,9 @@ both forms land in the **same** audited path with the same audit trail. `--force
 without a non-empty reason is refused up front, before any gate or deploy work
 (an inherited non-empty `EVAL_GATE_OVERRIDE_REASON` counts as the reason; a
 `--force-reason` on the command line always wins over it). Any other unknown
-`--flag` is rejected rather than misparsed as an agent name.
+`--flag` is rejected rather than misparsed as an agent name, and gated scripts
+that take no CLI args (`deploy-topology.sh`, `workflow-manager`, `apprunner`,
+`ecs-express`) reject `--force` with an error pointing at the env form.
 
 The override prints a loud banner and writes
 `{timestamp, sha, identity (STS caller ARN), script, reason}` to

@@ -121,33 +121,42 @@ export const handler = async (event) => {
   }
   console.log(`[eval-packager] Processing event for agent: ${agentId}`);
 
-  // 2. Read agent config from DynamoDB
+  // 2. Extract session data from log events (enriched with parsed evaluator
+  //    results). Runs BEFORE any DynamoDB access: if the battery guard filters
+  //    every record (TEAM-3427 / NFR-1.3), an all-battery delivery must produce
+  //    zero DDB calls of any kind — no config read, no buffer append.
+  const sessionData = extractSessionData(parsed);
+  if (sessionData.evaluatorResults.length === 0 && sessionData.sessionIds.length === 0) {
+    console.log(
+      '[eval-packager] delivery retained zero records after battery filtering — skipping all DDB writes'
+    );
+    return { statusCode: 200, body: 'battery-filtered' };
+  }
+
+  // 3. Read agent config from DynamoDB
   const config = await getAgentConfig(agentId);
   if (!config) {
     console.log(`[eval-packager] No config found for agent: ${agentId}. Skipping.`);
     return { statusCode: 200, body: 'no-config' };
   }
 
-  // 3. Check enabled flag
+  // 4. Check enabled flag
   if (config.enabled === false) {
     console.log(`[eval-packager] Agent ${agentId} is disabled. Skipping.`);
     return { statusCode: 200, body: 'disabled' };
   }
 
-  // 4. Sample rate check
+  // 5. Sample rate check
   const sampleRate = config.sampleRate ?? 100;
   if (Math.random() * 100 >= sampleRate) {
     console.log(`[eval-packager] Agent ${agentId} sample-rate miss (rate=${sampleRate}%). Skipping.`);
     return { statusCode: 200, body: 'sampled-out' };
   }
 
-  // Extract session data from log events (enriched with parsed evaluator results)
-  const sessionData = extractSessionData(parsed);
-
-  // 5. Aggregate eval scores into DDB (for instant dashboard loads)
+  // 6. Aggregate eval scores into DDB (for instant dashboard loads)
   await aggregateScoresToDdb(agentId, parsed);
 
-  // 6. Append to sessionBuffer, counting distinct runs toward batchSize
+  // 7. Append to sessionBuffer, counting distinct runs toward batchSize
   const batchSize = config.batchSize || 10;
   const appended = await appendToBuffer(agentId, sessionData, batchSize);
 
@@ -168,7 +177,7 @@ export const handler = async (event) => {
       );
       return { statusCode: 200, body: 'cooldown' };
     }
-    // 7. Batch is full → flush to S3 + synthesize PRD
+    // 8. Batch is full → flush to S3 + synthesize PRD
     await flushBuffer(agentId, appended.buffer, batchSize);
   }
 
@@ -312,7 +321,10 @@ export async function aggregateScoresToDdb(agentId, parsed) {
       const attrs = record.attributes || {};
       const evaluator = attrs['gen_ai.evaluation.name'];
       const score = attrs['gen_ai.evaluation.score.value'];
-      const sessionId = attrs['session.id'] || '';
+      // TEAM-3427: resolve the id from attributes OR the legacy top-level shape
+      // (same fallback as extractSessionData) — a top-level battery id must not
+      // slip past the guard below with an empty string.
+      const sessionId = attrs['session.id'] || record['session.id'] || '';
       // TEAM-3390: earliest-possible skip for battery sessions — they must never
       // count toward the per-agent session total or evaluator score aggregates
       // the dashboard reads (mirrors the TEAM-3090 guard in extractSessionData).

@@ -8,11 +8,22 @@
 #   aws events disable-rule --name agentcore-hub-workflow-watch-schedule
 set -e
 
+# TEAM-3426: this script takes no CLI arguments — reject anything passed (in
+# particular --force) rather than silently ignoring it. The audited eval-gate
+# break-glass here is env-var-only.
+if [ "$#" -gt 0 ]; then
+  echo "ERROR: $0 takes no arguments (got: $*)." >&2
+  echo "  Eval-gate break-glass (audited): EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON='INC-123: why' $0" >&2
+  exit 1
+fi
+
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck disable=SC1091 # resolved relative to this script at runtime
 source "${REPO_ROOT}/deploy/config.sh"
 
 # Eval gate (FR-7): everything this script ships (system prompt, skills,
 # toolkit) is gated — TEAM-3295 widened the glob from system-prompt.md.
+# shellcheck disable=SC1091 # resolved relative to this script at runtime
 source "${REPO_ROOT}/deploy/lib/check-eval-gate.sh"
 require_eval_gate "deploy/workflow-manager/**"
 
