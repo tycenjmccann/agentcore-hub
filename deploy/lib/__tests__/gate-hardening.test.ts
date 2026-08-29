@@ -37,7 +37,10 @@ const SCRIPT = resolve(__dirname, "../check-eval-gate.sh");
 const DEPLOY_ONE = resolve(__dirname, "../../runtime-agent/deploy-one.sh");
 
 // Same env-keyed gh shim protocol as check-eval-gate.test.ts:
-//   CHECK_<sha7>=green|red|absent → commits/<sha>/check-runs; pulls always [].
+//   CHECK_<sha7>=green|skipped|bare|red|absent → commits/<sha>/check-runs;
+// pulls always []. `green` carries the TEAM-3426 `config-evals-gate-verdict:
+// PASS` marker (a bare `success` is NOT green — that's `bare`, which must fail
+// closed; `skipped` is skip-publish's ungated-PR SUCCESS).
 const GH_SHIM = `#!/bin/bash
 if [ -n "\${GH_CALL_LOG:-}" ]; then echo "$*" >> "\$GH_CALL_LOG"; fi
 case "$1" in
@@ -50,9 +53,11 @@ case "$1" in
       */check-runs*)
         var="CHECK_$key"; mode="\${!var:-absent}"
         case "$mode" in
-          green)  echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x"}]}' ;;
-          red)    echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"failure","html_url":"http://check/x","output":{"summary":"- CRED-2 failed"}}]}' ;;
-          absent) echo '{"total_count":0,"check_runs":[]}' ;;
+          green)   echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x","output":{"title":"PASS — config evals battery held the baseline","summary":"config-evals-gate-verdict: PASS\\n\\n# Config evals battery\\n- all cases held the baseline"}}]}' ;;
+          skipped) echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x","output":{"title":"SKIPPED — no gated paths changed","summary":"config-evals-gate-verdict: SKIPPED\\n\\nThis PR touches none of the gated paths, so the config evals battery did not run."}}]}' ;;
+          bare)    echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x"}]}' ;;
+          red)     echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"failure","html_url":"http://check/x","output":{"title":"FAIL — battery verdict FAIL (battery job: success)","summary":"config-evals-gate-verdict: FAIL\\n\\n- CRED-2 failed"}}]}' ;;
+          absent)  echo '{"total_count":0,"check_runs":[]}' ;;
         esac ;;
       */pulls) echo '[]' ;;
       *) echo '{}' ;;

@@ -20,8 +20,21 @@ import { join, resolve } from "node:path";
  * fixture repo, with a PATH-shimmed fake `gh` whose responses are selected by
  * env vars keyed on the first 7 chars of the queried sha:
  *
- *   CHECK_<sha7>=green|red|running|absent|error   → commits/<sha>/check-runs
+ *   CHECK_<sha7>=green|skipped|bare|red|running|absent|error
+ *                                                 → commits/<sha>/check-runs
  *   PULLS_<sha7>=merged|merged2|none|error        → commits/<sha>/pulls
+ *
+ * The three SUCCESS modes are the TEAM-3426 (FINDING 3) distinction — a
+ * `conclusion: "success"` alone proves nothing:
+ *   green   — a REAL battery PASS: `config-evals-gate-verdict: PASS` marker
+ *             line in the summary + a "PASS — …" title. The only mode that may
+ *             proceed, latch, or anchor the belt scan.
+ *   skipped — skip-publish's SUCCESS for a PR touching no gated path
+ *             (`…-verdict: SKIPPED` + "SKIPPED — no gated paths changed").
+ *             Informational; must read as ABSENT.
+ *   bare    — a success with NO `output` at all (a pre-marker historical check
+ *             with no PASS title, or anything unrecognizable). Must fail closed
+ *             and read as ABSENT.
  *
  * Global/system git config is neutralized (GIT_CONFIG_GLOBAL=/dev/null) so
  * environment-level url.insteadOf rewrites can't mangle the fixture's
@@ -48,8 +61,12 @@ case "$1" in
       */check-runs*)
         var="CHECK_$key"; mode="\${!var:-absent}"
         case "$mode" in
-          green)   echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x"}]}' ;;
-          red)     echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"failure","html_url":"http://check/x","output":{"summary":"- CRED-2 failed"}}]}' ;;
+          green)   echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x","output":{"title":"PASS — config evals battery held the baseline","summary":"config-evals-gate-verdict: PASS\\n\\n# Config evals battery\\n- all cases held the baseline"}}]}' ;;
+          skipped) echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x","output":{"title":"SKIPPED — no gated paths changed","summary":"config-evals-gate-verdict: SKIPPED\\n\\nThis PR touches none of the gated paths, so the config evals battery did not run."}}]}' ;;
+          bare)    echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x"}]}' ;;
+          legacypass) echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x","output":{"title":"PASS — config evals battery held the baseline","summary":"battery held the baseline (pre-marker check, prose only)"}}]}' ;;
+          prose)   echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success","html_url":"http://check/x","output":{"title":"Something else entirely","summary":"we normally emit config-evals-gate-verdict: PASS on its own line"}}]}' ;;
+          red)     echo '{"total_count":1,"check_runs":[{"status":"completed","conclusion":"failure","html_url":"http://check/x","output":{"title":"FAIL — battery verdict FAIL (battery job: success)","summary":"config-evals-gate-verdict: FAIL\\n\\n- CRED-2 failed"}}]}' ;;
           running) echo '{"total_count":1,"check_runs":[{"status":"in_progress","conclusion":null,"html_url":"http://check/x"}]}' ;;
           absent)  echo '{"total_count":0,"check_runs":[]}' ;;
           error)   echo "gh: HTTP 403 rate limit" >&2; exit 1 ;;
@@ -387,6 +404,151 @@ describe("belt loop (A3)", () => {
     expect(r.out).toContain("EVAL GATE REFUSED");
     expect(r.out).toContain("hit the 100-commit cap without finding a green anchor or a gated-path touch");
     expect(r.out).toContain("unexamined");
+  });
+});
+
+/**
+ * TEAM-3426 FINDING 3 (P1, gate bypass). `_eval_gate_verdict` used to return
+ * green for EVERY check run whose conclusion was "success". The gate workflow's
+ * skip-publish job publishes a SUCCESS check ("SKIPPED — no gated paths
+ * changed") for PRs that touch no gated path, so `config-evals-gate` can be a
+ * required status check in branch protection — and that skipped-success proves
+ * NOTHING about the tree having been evaluated.
+ *
+ * The bypass it opened, straight from the ship review:
+ *   (a) an ungated direct push to main modifies a gated path (no check runs on
+ *       direct pushes);
+ *   (b) a later, unrelated PR merges carrying a SKIPPED-success check;
+ *   (c) the deploy guard resolves that skipped-success — on HEAD via merged-PR
+ *       resolution, or as a belt-scan "green anchor" — and proceeds/latches, so
+ *       the unevaluated gated change ships.
+ *
+ * Now only a REAL battery PASS may proceed/latch/anchor: the marker line
+ * `config-evals-gate-verdict: PASS`, or (for pre-marker historical checks) a
+ * title starting with "PASS". A SKIPPED success is informational/ABSENT, and a
+ * success that is neither identifiably PASS nor SKIPPED fails closed the same
+ * way.
+ */
+describe("skipped/unidentifiable successes are not evidence (TEAM-3426 FINDING 3)", () => {
+  it("BYPASS REPRO: refuses when a gated ancestor's only evidence is a skipped-success and HEAD carries no check", () => {
+    // repoBasic: c1 touched conf/ (the ungated direct push), HEAD = ungated c2
+    // (the later unrelated PR). c1 carries only skip-publish's SUCCESS.
+    const r = runGate(repoBasic, {
+      [`CHECK_${basicC1.slice(0, 7)}`]: "skipped",
+    });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("is a SKIPPED success");
+    expect(r.out).toContain("NOT evidence that the tree was evaluated");
+    expect(r.out).toContain(`ancestor commit ${basicC1} touched gated path`);
+    expect(r.out).toContain("without a green config-evals-gate check");
+    expect(r.out).toContain("EVAL GATE REFUSED");
+    expect(r.latch).toBe("unset");
+  });
+
+  it("BYPASS REPRO: refuses when HEAD's gated diff resolves to a merged PR carrying only a skipped-success", () => {
+    // The other half of the ship-review scenario: the skipped-success is
+    // reached through merged-PR resolution rather than the belt scan.
+    const r = runGate(repoGatedHead, {
+      [`PULLS_${gatedHead.slice(0, 7)}`]: "merged",
+      FULLSHA_FOR_PULLS: gatedHead,
+      PR_HEAD_SHA: PR_HEAD,
+      [`CHECK_${PR_HEAD7}`]: "skipped",
+    });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("is a SKIPPED success");
+    expect(r.out).toContain("treating the check as absent");
+    expect(r.out).toContain("no config-evals-gate check exists on HEAD");
+    expect(r.out).toContain("HEAD's diff touches gated path 'conf/gated.txt'");
+    expect(r.out).toContain("EVAL GATE REFUSED");
+  });
+
+  it("refuses when HEAD itself touches gated paths and carries only a skipped-success", () => {
+    const r = runGate(repoGatedHead, {
+      [`CHECK_${gatedHead.slice(0, 7)}`]: "skipped",
+    });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("is a SKIPPED success");
+    expect(r.out).toContain("The gate was bypassed (direct push?)");
+    expect(r.out).not.toContain("is green on HEAD");
+  });
+
+  it("never anchors the belt scan on a skipped-success: refuses at that ancestor without scanning deeper", () => {
+    // repoAnchor's newest gated ancestor carries the skipped-success. It must
+    // NOT anchor — and the refusal fires there, so the deeper gated commit is
+    // never even queried.
+    const r = runGate(repoAnchor, {
+      [`CHECK_${anchorSha.slice(0, 7)}`]: "skipped",
+    });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("does NOT anchor the ancestor scan");
+    expect(r.out).toContain(`ancestor commit ${anchorSha} touched gated path`);
+    expect(r.out).not.toContain("green anchor at ancestor");
+    expect(r.ghCalls.join("\n")).not.toContain(anchorDeepGated);
+  });
+
+  it("falls through a skipped-success on HEAD and proceeds informationally on a real PASS anchor (not latched)", () => {
+    const r = runGate(repoBasic, {
+      [`CHECK_${basicHead.slice(0, 7)}`]: "skipped",
+      [`CHECK_${basicC1.slice(0, 7)}`]: "green",
+    });
+    expect(r.status).toBe(0);
+    expect(r.out).toContain("is a SKIPPED success");
+    expect(r.out).toContain("does NOT count as green");
+    expect(r.out).toContain(`green anchor at ancestor ${basicC1}`);
+    expect(r.out).not.toContain("is green on HEAD");
+    // A skipped-success must never latch — the glob-specific informational
+    // proceed below it doesn't either (A4).
+    expect(r.latch).toBe("unset");
+  });
+
+  it("treats a bare success with no output as absent — a gated ancestor with one refuses (fail closed)", () => {
+    const r = runGate(repoBasic, {
+      [`CHECK_${basicC1.slice(0, 7)}`]: "bare",
+    });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("NOT identifiable as a battery PASS");
+    expect(r.out).toContain("fail closed");
+    expect(r.out).toContain(`ancestor commit ${basicC1} touched gated path`);
+    expect(r.out).toContain("EVAL GATE REFUSED");
+  });
+
+  it("treats a bare success on a gated HEAD as absent — refuses (fail closed)", () => {
+    const r = runGate(repoGatedHead, {
+      [`CHECK_${gatedHead.slice(0, 7)}`]: "bare",
+    });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("NOT identifiable as a battery PASS");
+    expect(r.out).toContain("The gate was bypassed (direct push?)");
+    expect(r.out).not.toContain("is green on HEAD");
+  });
+
+  it("does not accept a marker mentioned only in prose — the marker must own its line", () => {
+    const r = runGate(repoGatedHead, {
+      [`CHECK_${gatedHead.slice(0, 7)}`]: "prose",
+    });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("NOT identifiable as a battery PASS");
+    expect(r.out).toContain("The gate was bypassed (direct push?)");
+  });
+
+  it("a real battery PASS marker still greens HEAD and latches", () => {
+    const r = runGate(repoGatedHead, {
+      [`CHECK_${gatedHead.slice(0, 7)}`]: "green",
+    });
+    expect(r.status).toBe(0);
+    expect(r.out).toContain("is green on HEAD");
+    expect(r.out).not.toContain("SKIPPED");
+    expect(r.out).not.toContain("NOT identifiable");
+    expect(r.latch).toBe(gatedHead);
+  });
+
+  it("accepts a pre-marker historical check whose title starts with PASS (documented fallback)", () => {
+    const r = runGate(repoGatedHead, {
+      [`CHECK_${gatedHead.slice(0, 7)}`]: "legacypass",
+    });
+    expect(r.status).toBe(0);
+    expect(r.out).toContain("is green on HEAD");
+    expect(r.latch).toBe(gatedHead);
   });
 });
 
