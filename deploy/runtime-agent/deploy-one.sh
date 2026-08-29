@@ -1,10 +1,71 @@
 #!/bin/bash
 # Deploy a single agent to AgentCore Runtime
-# Usage: ./deploy-one.sh <agent_name>
+# Usage: ./deploy-one.sh [--force --force-reason '<incident>: <why>'] <agent_name>
 
 set -euo pipefail
 
-AGENT_NAME="${1:?usage: deploy-one.sh <agent_name>}"
+usage() {
+  {
+    echo "usage: deploy-one.sh [--force --force-reason '<incident>: <why>'] <agent_name>"
+    echo "  --force                   audited eval-gate break-glass (same path as EVAL_GATE_OVERRIDE=1)"
+    echo "  --force-reason <reason>   required with --force (same as EVAL_GATE_OVERRIDE_REASON)"
+  } >&2
+}
+
+# CLI break-glass (TEAM-3426): --force/--force-reason are sugar for the
+# audited EVAL_GATE_OVERRIDE env vars — same banner, S3 + local audit, and
+# refusal without a durable audit sink (_eval_gate_break_glass), NOT a second
+# override mechanism. Any other -/-- flag is rejected so a misspelled flag can
+# never be silently consumed as the agent name.
+FORCE_REQUESTED=0
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force)
+      FORCE_REQUESTED=1
+      shift
+      ;;
+    --force-reason)
+      if [ $# -lt 2 ]; then
+        echo "ERROR: --force-reason requires a value" >&2
+        usage
+        exit 1
+      fi
+      export EVAL_GATE_OVERRIDE_REASON="$2"
+      shift 2
+      ;;
+    --force-reason=*)
+      export EVAL_GATE_OVERRIDE_REASON="${1#--force-reason=}"
+      shift
+      ;;
+    -*)
+      echo "ERROR: unknown flag '$1'" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+if [ "$FORCE_REQUESTED" = "1" ]; then
+  if [ -z "${EVAL_GATE_OVERRIDE_REASON:-}" ]; then
+    echo "ERROR: --force requires a non-empty reason — pass --force-reason '<incident>: <why>' (or set EVAL_GATE_OVERRIDE_REASON). An unexplained override is refused (BG-2)." >&2
+    usage
+    exit 1
+  fi
+  export EVAL_GATE_OVERRIDE=1
+  echo "⚠️  EVAL-GATE BREAK-GLASS REQUESTED VIA --force (reason: ${EVAL_GATE_OVERRIDE_REASON}) — if the gate refuses, the override will be audited (banner + S3 + local log) before proceeding." >&2
+fi
+if [ "${#POSITIONAL[@]}" -gt 1 ]; then
+  echo "ERROR: expected exactly one agent name, got: ${POSITIONAL[*]}" >&2
+  usage
+  exit 1
+fi
+set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+
+AGENT_NAME="${1:?usage: deploy-one.sh [--force --force-reason '<reason>'] <agent_name>}"
 ROLE_ARN="${AGENTCORE_ROLE_ARN:?Set AGENTCORE_ROLE_ARN to your AgentCore execution role ARN}"
 REGION="${AWS_REGION:-us-east-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
