@@ -497,18 +497,31 @@ Every deploy target that ships gated artifacts sources
 `deploy/lib/check-eval-gate.sh` and calls `require_eval_gate <globs...>`
 before its first S3 write or docker build. Semantics against HEAD:
 
-- **Green** `config-evals-gate` check → deploy proceeds (latched in
-  `EVAL_GATE_CHECKED` so a 14-agent fleet fan-out queries GitHub once).
+- **Verified battery PASS** → deploy proceeds (latched in `EVAL_GATE_CHECKED`
+  so a 14-agent fleet fan-out queries GitHub once). A `success` conclusion is
+  NOT enough (TEAM-3426): `skip-publish` publishes a SUCCESS check for PRs that
+  touch no gated path, so `config-evals-gate` can be a required status check,
+  and that skipped-success proves nothing about the tree. The guard accepts a
+  success only when it carries the `config-evals-gate-verdict: PASS` marker line
+  in its check-run summary — emitted by every branch of
+  `config-evals-gate.yml` — or, for pre-marker historical checks, an output
+  title starting with `PASS`.
+- **SKIPPED success** (marker `SKIPPED`, or a title starting with `SKIPPED`) →
+  informational only, treated as **absent**: it never proceeds, never latches,
+  and never anchors the ancestor scan. Any other success that is neither
+  identifiably PASS nor SKIPPED is also treated as absent (fail closed), with a
+  loud warning.
 - **Queued/in-progress** → refused: wait for the gate.
 - **Failure/cancelled/timed-out** → refused, with the check URL and the
   failing evaluator lines from the summary.
-- **Absent** → refused if HEAD or any scanned first-parent ancestor (back to
-  a green anchor) touched the target's gated globs — that means the gate was
-  bypassed. Also refused, fail-closed, if the scan hits the
+- **Absent** (no check, or a non-PASS success as above) → refused if HEAD or
+  any scanned first-parent ancestor (back to a PASS anchor) touched the
+  target's gated globs — that means the gate was bypassed. Also refused,
+  fail-closed, if the scan hits the
   `EVAL_GATE_BELT_MAX` cap (100 first-parent commits, see
-  `deploy/lib/check-eval-gate.sh`) with history still unexamined and no green
+  `deploy/lib/check-eval-gate.sh`) with history still unexamined and no PASS
   anchor or gated-path touch found. Proceeds with a note only when nothing
-  gated changed across a fully-scanned history or since a green anchor.
+  gated changed across a fully-scanned history or since a PASS anchor.
 - A **dirty working tree** touching gated paths always refuses: deploys ship
   committed, gated state only.
 

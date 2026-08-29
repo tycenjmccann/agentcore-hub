@@ -34,7 +34,10 @@ and the break-glass procedure. All deploy targets that ship gated artifacts
 (`deploy/runtime-agent/deploy{,-one,-fleet,-topology}.sh`,
 `deploy/workflow-manager/deploy.sh`, `deploy/apprunner/deploy.sh`,
 `deploy/ecs-express/deploy.sh`) source `deploy/lib/check-eval-gate.sh` and
-refuse to run unless HEAD carries a green `config-evals-gate` check run.
+refuse to run unless HEAD carries a `config-evals-gate` check run that is a
+verified battery **PASS** — a bare `success` conclusion is not enough, since the
+gate also publishes a SKIPPED success for PRs touching no gated path (see
+"Deploy gate + break-glass" in `evals/battery/README.md`).
 The gate's CI job assumes an OIDC IAM role — one-time provisioning is
 documented in [`evals/battery/README.md`](evals/battery/README.md) under
 "CI AWS credentials (one-time setup)".
