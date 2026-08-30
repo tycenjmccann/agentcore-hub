@@ -1,7 +1,10 @@
 /**
  * DELETE /api/workflow/[id]
  *
- * Deletes a terminal-state workflow and all its events from DynamoDB.
+ * "Deletes" a terminal-state workflow: its events are removed, but the workflow
+ * row itself is TOMBSTONED (deleted=true, heavy fields stripped) rather than
+ * removed. Jira tickets keep `wf:<id>` labels forever; hard-deleting the row
+ * broke ticket→workflow-type resolution and dashboard tickets showed as "Other".
  * Only workflows in 'complete', 'error', or 'cancelled' phase can be deleted.
  */
 
@@ -10,7 +13,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
   GetCommand,
-  DeleteCommand,
+  PutCommand,
   QueryCommand,
   BatchWriteCommand,
 } from "@aws-sdk/lib-dynamodb";
@@ -98,11 +101,25 @@ export async function DELETE(
       eventsDeleted += batch.length;
     }
 
-    // 5. Delete the workflow row
+    // 5. Tombstone the workflow row — keep just what metrics/type-resolution
+    //    need; drop messages, agentTasks, and other heavy state. epicId is
+    //    deliberately dropped: the epicId-index GSI is sparse, so omitting it
+    //    keeps tombstones out of epic→workflow lookups (bug re-filing
+    //    idempotency, orchestrator findWorkflowByEpic).
     await ddb.send(
-      new DeleteCommand({
+      new PutCommand({
         TableName: WORKFLOWS_TABLE,
-        Key: { workflowId },
+        Item: {
+          workflowId,
+          id: workflowId,
+          deleted: true,
+          deletedAt: new Date().toISOString(),
+          phase: workflow.phase,
+          workflowDefId: workflow.workflowDefId,
+          startedAt: workflow.startedAt,
+          completedAt: workflow.completedAt,
+          ...(workflow.humanReviewMs !== undefined ? { humanReviewMs: workflow.humanReviewMs } : {}),
+        },
       })
     );
 

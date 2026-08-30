@@ -176,6 +176,9 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef) {
     description: `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
     assignee: def.intakeAgentId,
     blockedBy: [],
+    // wfdef stamp keeps the ticket classifiable on the dashboard even if the
+    // workflow row is later deleted.
+    extraLabels: [`wfdef:${def.id}`],
   }, workflowId);
 
   // Requirements ticket has no blockers — transition to "Ready" so the webhook fires

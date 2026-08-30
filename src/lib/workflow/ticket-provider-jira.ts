@@ -86,7 +86,11 @@ export class JiraCloudProvider implements TicketProvider {
         description: this.toADF(input.description),
         issuetype: { name: "Task" },
         parent: { key: input.parentId },
-        labels: workflowId ? ["agentcore-hub-workflow", `wf:${workflowId}`] : ["agentcore-hub-workflow"],
+        labels: [
+          "agentcore-hub-workflow",
+          ...(workflowId ? [`wf:${workflowId}`] : []),
+          ...(input.extraLabels || []),
+        ],
       },
     };
 

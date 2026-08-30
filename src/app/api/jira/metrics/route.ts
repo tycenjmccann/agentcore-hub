@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { loadWorkflowDefs } from "@/lib/workflow/defs-loader";
+import { humanWaitIntervals, unionMs, type Interval } from "@/lib/metrics/gate-dwell";
+import { summarizeThroughput, type ThroughputRow } from "@/lib/metrics/throughput";
 
 export const dynamic = "force-dynamic";
 
@@ -15,15 +17,6 @@ interface FlowBucket {
   resolved: number;
   /** resolved count per workflow-type display name (for the stacked bars) */
   byType: Record<string, number>;
-}
-
-interface ThroughputRow {
-  type: string;
-  count: number;
-  /** median end-to-end minutes per completed workflow */
-  e2eMin: number;
-  aiMin: number;
-  humanMin: number;
 }
 
 interface ActivityItem {
@@ -119,13 +112,6 @@ function bucketIndex(spec: BucketSpec, iso: string): number {
   return -1;
 }
 
-function median(values: number[]): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
 // ─── Workflow-type resolution ───────────────────────────────────────────────
 
 const OTHER_TYPE = "Other";
@@ -133,6 +119,7 @@ const OTHER_TYPE = "Other";
 /** workflowId → display type name, via the workflows table + live defs. */
 async function buildWorkflowTypeMap(): Promise<{
   typeOf: Map<string, string>;
+  defName: Map<string, string>;
   workflows: Array<{ workflowId: string; type: string; startedAt?: string; completedAt?: string; humanReviewMs?: number }>;
 }> {
   const [defs, rows] = await Promise.all([
@@ -143,17 +130,51 @@ async function buildWorkflowTypeMap(): Promise<{
   for (const d of defs) defName.set(d.id, (d as { displayName?: string; name?: string }).displayName || d.name || d.id);
 
   const typeOf = new Map<string, string>();
-  const workflows = rows.map((w) => {
+  const workflows: Array<{ workflowId: string; type: string; startedAt?: string; completedAt?: string; humanReviewMs?: number }> = [];
+  for (const w of rows) {
     const type = (w.workflowDefId && defName.get(w.workflowDefId)) || OTHER_TYPE;
     typeOf.set(w.workflowId, type);
-    return { workflowId: w.workflowId, type, startedAt: w.startedAt, completedAt: w.completedAt, humanReviewMs: w.humanReviewMs };
-  });
-  return { typeOf, workflows };
+    // Tombstoned rows (deleted from the board) keep classifying their tickets
+    // but must not count as completed work in the throughput lanes.
+    if (w.deleted) continue;
+    workflows.push({ workflowId: w.workflowId, type, startedAt: w.startedAt, completedAt: w.completedAt, humanReviewMs: w.humanReviewMs });
+  }
+  return { typeOf, defName, workflows };
 }
 
 function wfIdFromLabels(labels: string[]): string | null {
   const l = labels.find((x) => x.startsWith("wf:"));
   return l ? l.slice(3) : null;
+}
+
+/**
+ * Resolve a ticket's workflow type. Order:
+ *   1. wf: label → workflows-table row (tombstones included)
+ *   2. wfdef: label stamped at intake (survives workflow-row loss entirely)
+ *   3. Bug heuristic — a Bug, or a subtask under one, is the bug-fix pipeline
+ *      (covers tickets whose workflow rows were deleted before tombstoning)
+ */
+function typeForIssue(
+  issue: JiraIssue,
+  typeOf: Map<string, string>,
+  defName: Map<string, string>
+): string {
+  const labels = (issue.fields?.labels as string[]) || [];
+  const wfId = wfIdFromLabels(labels);
+  const mapped = wfId ? typeOf.get(wfId) : undefined;
+  if (mapped) return mapped;
+  const defLabel = labels.find((l) => l.startsWith("wfdef:"));
+  if (defLabel) {
+    const name = defName.get(defLabel.slice(6));
+    if (name) return name;
+  }
+  const issuetype = (issue.fields?.issuetype as { name?: string })?.name;
+  const parentType = (issue.fields?.parent as { fields?: { issuetype?: { name?: string } } })
+    ?.fields?.issuetype?.name;
+  if (issuetype === "Bug" || parentType === "Bug") {
+    return defName.get("bug-fix") || "Bug-Fix";
+  }
+  return OTHER_TYPE;
 }
 
 // ─── Jira Provider ──────────────────────────────────────────────────────────
@@ -212,35 +233,6 @@ async function jiraFetchAll(jql: string, fields: string, opts?: { expand?: strin
   return issues;
 }
 
-/** Total ms an issue spent in "In Review", from its status changelog. Open dwell counts up to now. */
-function reviewDwellMs(issue: JiraIssue): number {
-  const transitions: Array<{ at: number; from?: string; to?: string }> = [];
-  for (const h of issue.changelog?.histories || []) {
-    for (const item of h.items || []) {
-      if (item.field === "status") {
-        // "toString" collides with Object.prototype in TS — index access avoids the method type
-        transitions.push({
-          at: new Date(h.created).getTime(),
-          from: item["fromString"] as string,
-          to: item["toString"] as unknown as string,
-        });
-      }
-    }
-  }
-  transitions.sort((a, b) => a.at - b.at);
-  let total = 0;
-  let enteredAt: number | null = null;
-  for (const t of transitions) {
-    if (t.to === "In Review") enteredAt = t.at;
-    else if (t.from === "In Review" && enteredAt !== null) {
-      total += t.at - enteredAt;
-      enteredAt = null;
-    }
-  }
-  if (enteredAt !== null) total += Date.now() - enteredAt;
-  return total;
-}
-
 function activityAction(statusName: string): ActivityItem["action"] {
   if (statusName === "Done") return "resolved";
   if (statusName === "In Review") return "in_review";
@@ -260,16 +252,34 @@ async function getMetricsFromJira(timeframe: Timeframe): Promise<MetricsResult> 
 
   // Epics are containers — their child stories are the countable work, so they
   // stay out of the flow counts entirely.
-  const [resolvedIssues, createdIssues, inProgressIssues, gateIssues, activityIssues, wfMap] = await Promise.all([
-    jiraFetchAll(`project = ${project} AND issuetype != Epic AND status = Done AND resolved >= ${since}`, "resolutiondate,created,labels"),
+  const [resolvedIssues, createdIssues, inProgressIssues, activityIssues, wfMap] = await Promise.all([
+    jiraFetchAll(`project = ${project} AND issuetype != Epic AND status = Done AND resolved >= ${since}`, "resolutiondate,created,labels,issuetype,parent"),
     jiraFetchAll(`project = ${project} AND issuetype != Epic AND created >= ${since}`, "created,labels"),
     jiraFetchAll(`project = ${project} AND issuetype != Epic AND status = "In Progress"`, "labels", { cap: 300 }),
-    jiraFetchAll(`project = ${project} AND labels = "human-review" AND updated >= ${since}`, "labels", { expand: "changelog", cap: 300 }),
     jiraFetchAll(`project = ${project} AND issuetype != Epic AND labels = "agentcore-hub-workflow" ORDER BY updated DESC`, "summary,status,updated", { cap: 100 }),
     buildWorkflowTypeMap(),
   ]);
 
+  // Gate tickets need their own window: dwell belongs to workflows that
+  // COMPLETED in the window, whose gates may have closed before it started —
+  // so anchor the gate query at the earliest such workflow's start. Also fetch
+  // gates still open regardless of last update: a gate untouched for a week is
+  // exactly the dwell we must not miss.
+  const inWindowStarts = wfMap.workflows
+    .filter((w) => w.completedAt && w.startedAt && new Date(w.completedAt) >= cutoff)
+    .map((w) => new Date(w.startedAt!).getTime())
+    .filter((t) => !Number.isNaN(t));
+  const gateSince = new Date(Math.min(cutoff.getTime(), ...inWindowStarts)).toISOString().slice(0, 10);
+  const gateIssues = await jiraFetchAll(
+    `project = ${project} AND labels = "human-review" AND (updated >= "${gateSince}" OR statusCategory != Done)`,
+    "labels",
+    { expand: "changelog", cap: 300 }
+  );
+
   // ── Flow buckets: created + resolved per bucket, resolved stacked by type ──
+  // The JQL `-7d` window is a rolling superset of the midnight-aligned buckets;
+  // everything is counted through bucketIndex so the KPIs, the stacked bars,
+  // and the created-vs-resolved chart all agree on one window.
   const buckets: FlowBucket[] = spec.labels.map((label) => ({ label, created: 0, resolved: 0, byType: {} }));
   for (const issue of resolvedIssues) {
     const resolved = issue.fields?.resolutiondate as string | undefined;
@@ -277,8 +287,7 @@ async function getMetricsFromJira(timeframe: Timeframe): Promise<MetricsResult> 
     const idx = bucketIndex(spec, resolved);
     if (idx < 0) continue;
     buckets[idx].resolved++;
-    const wfId = wfIdFromLabels((issue.fields?.labels as string[]) || []);
-    const type = (wfId && wfMap.typeOf.get(wfId)) || OTHER_TYPE;
+    const type = typeForIssue(issue, wfMap.typeOf, wfMap.defName);
     buckets[idx].byType[type] = (buckets[idx].byType[type] || 0) + 1;
   }
   for (const issue of createdIssues) {
@@ -288,43 +297,47 @@ async function getMetricsFromJira(timeframe: Timeframe): Promise<MetricsResult> 
     if (idx >= 0) buckets[idx].created++;
   }
 
-  // ── Human-review dwell per workflow ──
-  const humanMsByWf = new Map<string, number>();
+  // ── Human-review dwell per workflow (In Review + Blocked; see gate-dwell.ts) ──
+  // Kept as raw intervals: a workflow can have several gate tickets parked at
+  // once (round-N queued while round N-1 is still open) — that overlap is one
+  // human wait, not two, so per-workflow dwell is a UNION, clipped below to
+  // the workflow's own start→completion window.
+  const nowMs = Date.now();
+  const intervalsByWf = new Map<string, Interval[]>();
   for (const issue of gateIssues) {
     const wfId = wfIdFromLabels((issue.fields?.labels as string[]) || []);
     if (!wfId) continue;
-    humanMsByWf.set(wfId, (humanMsByWf.get(wfId) || 0) + reviewDwellMs(issue));
+    const list = intervalsByWf.get(wfId) || [];
+    list.push(...humanWaitIntervals(issue.changelog, nowMs));
+    intervalsByWf.set(wfId, list);
   }
 
   // ── Throughput per type: completed workflows in window ──
-  const byType = new Map<string, { e2e: number[]; human: number[] }>();
-  let completedCount = 0;
   let humanTouched = 0;
+  const durations = [];
   for (const wf of wfMap.workflows) {
     if (!wf.completedAt || !wf.startedAt) continue;
     if (new Date(wf.completedAt) < cutoff) continue;
-    const e2e = new Date(wf.completedAt).getTime() - new Date(wf.startedAt).getTime();
-    if (e2e <= 0) continue;
-    completedCount++;
-    // Live source: "In Review" dwell mined from gate-ticket changelogs.
+    const startMs = new Date(wf.startedAt).getTime();
+    const endMs = new Date(wf.completedAt).getTime();
+    const e2eMs = endMs - startMs;
+    if (e2eMs <= 0) continue;
+    // Live source: gate-ticket dwell, clipped to the workflow window (a gate
+    // left open past completion must not keep accruing against this run).
     // Fallback: a humanReviewMs override stored on the workflow row (backfill/seed).
-    const humanMs = Math.min(Math.max(humanMsByWf.get(wf.workflowId) || 0, wf.humanReviewMs || 0), e2e);
+    const gateMs = unionMs(
+      (intervalsByWf.get(wf.workflowId) || [])
+        .map((iv) => ({ start: Math.max(iv.start, startMs), end: Math.min(iv.end, endMs) }))
+        .filter((iv) => iv.end > iv.start)
+    );
+    const humanMs = Math.min(Math.max(gateMs, wf.humanReviewMs || 0), e2eMs);
     if (humanMs > 60000) humanTouched++;
-    const entry = byType.get(wf.type) || { e2e: [], human: [] };
-    entry.e2e.push(e2e);
-    entry.human.push(humanMs);
-    byType.set(wf.type, entry);
+    durations.push({ type: wf.type, e2eMs, humanMs });
   }
-  const throughputByType: ThroughputRow[] = [...byType.entries()]
-    .map(([type, v]) => {
-      const e2eMin = Math.round(median(v.e2e) / 60000);
-      const humanMin = Math.round(median(v.human) / 60000);
-      return { type, count: v.e2e.length, e2eMin, humanMin, aiMin: Math.max(0, e2eMin - humanMin) };
-    })
-    .sort((a, b) => b.count - a.count);
+  const throughputByType = summarizeThroughput(durations);
 
-  const automationRate = completedCount > 0
-    ? Math.round(((completedCount - humanTouched) / completedCount) * 100)
+  const automationRate = durations.length > 0
+    ? Math.round(((durations.length - humanTouched) / durations.length) * 100)
     : null;
 
   // ── Activity feed ──
@@ -340,24 +353,26 @@ async function getMetricsFromJira(timeframe: Timeframe): Promise<MetricsResult> 
   });
 
   // ── Aggregates ──
-  const ticketsResolved = resolvedIssues.length;
-  const ticketsCreated = createdIssues.length;
+  // Counted from the buckets (not the raw JQL result) so the KPI numbers, the
+  // backlog gap, and the created-vs-resolved chart can never disagree.
+  const ticketsResolved = buckets.reduce((s, b) => s + b.resolved, 0);
+  const ticketsCreated = buckets.reduce((s, b) => s + b.created, 0);
   const ticketsInProgress = inProgressIssues.length;
   const inFlightWfIds = new Set(
     inProgressIssues.map((i) => wfIdFromLabels((i.fields?.labels as string[]) || [])).filter(Boolean)
   );
 
+  // Average over the same bucketed population the resolved KPI counts.
   let avgResolutionTime = 0;
-  if (resolvedIssues.length > 0) {
+  {
     let totalMs = 0;
     let count = 0;
     for (const issue of resolvedIssues) {
       const created = issue.fields?.created as string | undefined;
       const resolutiondate = issue.fields?.resolutiondate as string | undefined;
-      if (created && resolutiondate) {
-        totalMs += new Date(resolutiondate).getTime() - new Date(created).getTime();
-        count++;
-      }
+      if (!created || !resolutiondate || bucketIndex(spec, resolutiondate) < 0) continue;
+      totalMs += new Date(resolutiondate).getTime() - new Date(created).getTime();
+      count++;
     }
     if (count > 0) avgResolutionTime = Math.round(totalMs / count / 60000);
   }
@@ -412,6 +427,8 @@ interface DDBWorkflow {
   completedAt?: string;
   /** Optional override: total human-review dwell for this workflow (backfilled rows). */
   humanReviewMs?: number;
+  /** Tombstone flag — row was "deleted" from the board but kept for ticket-type mapping. */
+  deleted?: boolean;
 }
 
 async function scanAll<T>(table: string): Promise<T[]> {
@@ -458,26 +475,20 @@ async function getMetricsFromDDB(timeframe: Timeframe): Promise<MetricsResult> {
     const idx = bucketIndex(spec, t.createdAt!);
     if (idx >= 0) buckets[idx].created++;
   }
+  // Keep KPI counts and the chart on the same bucket window (see Jira provider).
+  const resolvedCount = buckets.reduce((s, b) => s + b.resolved, 0);
+  const createdCount = buckets.reduce((s, b) => s + b.created, 0);
 
-  // No changelog in DDB mode → human dwell unknown; report AI-only throughput.
-  const byType = new Map<string, number[]>();
-  let completedCount = 0;
+  // No changelog in DDB mode → human dwell unknown beyond a stored override.
+  const durations = [];
   for (const wf of wfMap.workflows) {
     if (!wf.completedAt || !wf.startedAt) continue;
     if (new Date(wf.completedAt) < cutoff) continue;
-    const e2e = new Date(wf.completedAt).getTime() - new Date(wf.startedAt).getTime();
-    if (e2e <= 0) continue;
-    completedCount++;
-    const arr = byType.get(wf.type) || [];
-    arr.push(e2e);
-    byType.set(wf.type, arr);
+    const e2eMs = new Date(wf.completedAt).getTime() - new Date(wf.startedAt).getTime();
+    if (e2eMs <= 0) continue;
+    durations.push({ type: wf.type, e2eMs, humanMs: wf.humanReviewMs || 0 });
   }
-  const throughputByType: ThroughputRow[] = [...byType.entries()]
-    .map(([type, e2es]) => {
-      const e2eMin = Math.round(median(e2es) / 60000);
-      return { type, count: e2es.length, e2eMin, humanMin: 0, aiMin: e2eMin };
-    })
-    .sort((a, b) => b.count - a.count);
+  const throughputByType = summarizeThroughput(durations);
 
   const activity: ActivityItem[] = tasks
     .filter((t) => t.updatedAt)
@@ -490,8 +501,9 @@ async function getMetricsFromDDB(timeframe: Timeframe): Promise<MetricsResult> {
       at: t.updatedAt!,
     }));
 
+  // Average over the same bucketed population the resolved KPI counts.
   let avgResolutionTime = 0;
-  const sample = resolved.slice(0, 50);
+  const sample = resolved.filter((t) => bucketIndex(spec, t.updatedAt!) >= 0).slice(0, 50);
   if (sample.length > 0) {
     let totalMs = 0;
     let count = 0;
@@ -505,13 +517,15 @@ async function getMetricsFromDDB(timeframe: Timeframe): Promise<MetricsResult> {
   }
 
   return {
-    ticketsResolved: resolved.length,
-    ticketsCreated: created.length,
+    ticketsResolved: resolvedCount,
+    ticketsCreated: createdCount,
     ticketsInProgress: inProgress.length,
     inFlightWorkflows: new Set(inProgress.map((t) => t.workflowId).filter(Boolean)).size,
     avgResolutionTime,
-    automationRate: completedCount > 0 ? 100 : null,
-    throughput: Math.round((resolved.length / getTimeframeDivisor(timeframe)) * 10) / 10,
+    automationRate: durations.length > 0
+      ? Math.round(((durations.length - durations.filter((d) => d.humanMs > 60000).length) / durations.length) * 100)
+      : null,
+    throughput: Math.round((resolvedCount / getTimeframeDivisor(timeframe)) * 10) / 10,
     timeframe,
     buckets,
     throughputByType,
