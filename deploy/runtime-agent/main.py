@@ -1936,9 +1936,64 @@ LAMBDA_TOOLS = [
 
 logger.info(f"Loaded {len(LAMBDA_TOOLS)} Lambda-backed tools + GitHub MCP (built-in tools loaded at invocation time)")
 
+
 # --- DynamoDB client for real-time event publishing ---
 _ddb_events_client = boto3.client("dynamodb", region_name=REGION)
 _EVENTS_TABLE = os.getenv("EVENTS_TABLE", "agentcore-hub-events")
+
+
+# --- Session anchor span (TEAM-3366 P0-A) -----------------------------------
+# The Strands SDK emits exactly ONE `invoke_agent {agent_name}` span around the
+# WHOLE agent loop. Detached workflow-persona runs with remote-coding turns
+# keep that loop open for hours; if the microVM is interrupted before the
+# handler's finally-flush, the never-ended SDK span is never exported and
+# online evals fail with "none of the spans contain the required agent
+# invocation (gen_ai.operation.name=invoke_agent)". This anchor span is
+# spec-compliant, ends immediately, and is force-flushed BEFORE the long loop
+# starts, so every session has >=1 exported invoke_agent span no matter how
+# the microVM dies later.
+async def _emit_session_anchor_span(agent_id: str, session_id: str | None,
+                                    workflow_id: str, ticket_id: str) -> None:
+    """TEAM-3366 P0-A: guarantee >=1 EXPORTED invoke_agent span per session.
+
+    Uses only whatever TracerProvider is already global (get_tracer /
+    get_tracer_provider) — never constructs a provider or exporter, so the
+    _init_telemetry() invariants (TEAM-3102/TEAM-3313: ADOT owns the pipeline)
+    are untouched. Fail-open — telemetry must never break the invocation.
+    """
+    try:
+        import asyncio as _anchor_asyncio
+        from opentelemetry import trace as _t
+
+        tracer = _t.get_tracer("agentcore-hub-pipeline-agent")
+        attrs = {k: v for k, v in {
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.agent.name": agent_id,
+            "gen_ai.agent.id": agent_id,
+            # Same fallback as the SDK span's trace_attributes below: an
+            # unkeyed span is invisible to the eval-packager, and the anchor
+            # exists precisely for the direct_code_deploy fallback path where
+            # ADOT header injection (and thus session_id) may be absent.
+            "session.id": session_id or f"wf-{workflow_id}",
+            "workflow.id": workflow_id,
+            "ticket.id": ticket_id,
+            "agentcore.hub.anchor": True,
+        }.items() if v}
+        with tracer.start_as_current_span(f"invoke_agent {agent_id}",
+                                          kind=_t.SpanKind.INTERNAL,
+                                          attributes=attrs):
+            pass  # ends immediately — exportable from this moment on
+
+        provider = _t.get_tracer_provider()
+        if hasattr(provider, "force_flush"):
+            # force_flush blocks its caller (see the handler's finally-flush),
+            # hence asyncio.to_thread — an unreachable collector must stall
+            # only this coroutine, never the event loop.
+            await _anchor_asyncio.to_thread(provider.force_flush, 5000)  # deliver NOW, before the long loop
+    except Exception:  # noqa: BLE001 — fail-open, never break the run
+        logger.warning("telemetry: session anchor span failed (non-fatal)",
+                       exc_info=True)
+# ---------------------------------------------------------------------------
 
 
 def _publish_agent_started(workflow_id: str, agent_id: str):
@@ -2303,6 +2358,13 @@ async def _run_agent_invocation(payload, context):
             _otel_context.attach(_otel_baggage.set_baggage("session.id", _bag_session_id))
     except Exception:  # noqa: BLE001 — telemetry must never break the invocation (R1.4)
         pass
+
+    # TEAM-3366 P0-A: anchor span — ended + force-flushed BEFORE the (possibly
+    # hours-long) agent loop below, so online evals see an invoke_agent span
+    # even if the microVM is interrupted mid-loop and the SDK's own
+    # loop-spanning invoke_agent span never gets exported.
+    await _emit_session_anchor_span(agent_id, getattr(context, "session_id", None),
+                                    workflow_id, _CURRENT_TICKET_ID)
 
     try:
         # Fresh coding session per agent-task: a warm microVM reuses this module, so

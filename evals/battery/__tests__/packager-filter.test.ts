@@ -161,6 +161,25 @@ describe("eval-packager battery guard (TEAM-3090)", () => {
   });
 });
 
+/**
+ * Build classified-entry rows the way a caller that BYPASSED extractSessionData
+ * would (TEAM-3353 changed aggregateScoresToDdb to consume extracted entries
+ * instead of re-parsing raw logEvents). Deliberately NOT battery-filtered and
+ * using the same attrs-or-top-level id resolution extraction uses — these rows
+ * exercise aggregateScoresToDdb's OWN defense-in-depth guard.
+ */
+function legacyEntriesFrom(batch: { logEvents: Array<{ message: string }> }) {
+  return batch.logEvents.map((e) => {
+    const m = JSON.parse(e.message);
+    const attrs = m.attributes || {};
+    return {
+      sessionId: attrs["session.id"] || m["session.id"] || null,
+      evaluatorName: attrs["gen_ai.evaluation.name"] || null,
+      score: attrs["gen_ai.evaluation.score.value"] ?? null,
+    };
+  });
+}
+
 describe("eval-packager battery guard — behavioral, both paths (TEAM-3390)", () => {
   const mixedBatch = {
     logGroup: "/aws/bedrock-agentcore/evaluations/results/eval_test-agent-abc",
@@ -189,7 +208,7 @@ describe("eval-packager battery guard — behavioral, both paths (TEAM-3390)", (
 
   it("aggregateScoresToDdb excludes battery sessions from session count and score deltas", async () => {
     ddbMock.sent.length = 0;
-    await aggregateScoresToDdb("test-agent", mixedBatch);
+    await aggregateScoresToDdb("test-agent", legacyEntriesFrom(mixedBatch));
 
     const update = ddbMock.sent.find((cmd) => cmd.constructor.name === "UpdateCommand");
     expect(update).toBeDefined();
@@ -208,14 +227,15 @@ describe("eval-packager battery guard — behavioral, both paths (TEAM-3390)", (
 
   it("aggregateScoresToDdb writes nothing at all for a battery-only batch", async () => {
     ddbMock.sent.length = 0;
-    await aggregateScoresToDdb("test-agent", {
-      logGroup: "/aws/bedrock-agentcore/evaluations/results/eval_test-agent-abc",
-      logStream: "stream-1",
-      logEvents: [
-        otelLogEvent("battery-run1-case1", "helpfulness", 0.2),
-        otelLogEvent("battery-run1-case2", "correctness", 0.1),
-      ],
-    });
+    await aggregateScoresToDdb(
+      "test-agent",
+      legacyEntriesFrom({
+        logEvents: [
+          otelLogEvent("battery-run1-case1", "helpfulness", 0.2),
+          otelLogEvent("battery-run1-case2", "correctness", 0.1),
+        ],
+      })
+    );
 
     expect(ddbMock.sent).toHaveLength(0);
   });
@@ -312,12 +332,15 @@ describe("top-level session.id hits the aggregation battery guard (TEAM-3427 fin
   const logGroup = "/aws/bedrock-agentcore/evaluations/results/eval_test-agent-abc";
 
   it("excludes a battery record in the legacy top-level shape from score aggregates", async () => {
-    // Pre-fix, aggregateScoresToDdb resolved the session id ONLY from
+    // Pre-fix, the aggregation path resolved the session id ONLY from
     // attributes['session.id'], so this battery record resolved to '' →
     // bypassed isBatterySession and its 0.05 score polluted helpfulness
-    // ({sum: 0.95, count: 2}). This test FAILS against that code.
+    // ({sum: 0.95, count: 2}). Post-TEAM-3353 the aggregation consumes
+    // extraction's entries, so run the REAL pipeline (extract → aggregate):
+    // extraction's attrs-or-top-level fallback must catch the battery id
+    // before the scorecard write.
     ddbMock.sent.length = 0;
-    await aggregateScoresToDdb("test-agent", {
+    const data = extractSessionData({
       logGroup,
       logStream: "stream-1",
       logEvents: [
@@ -326,6 +349,7 @@ describe("top-level session.id hits the aggregation battery guard (TEAM-3427 fin
         otelLogEvent("prod-run-43", "correctness", 0.8),
       ],
     });
+    await aggregateScoresToDdb("test-agent", data.evaluatorResults);
 
     const update = ddbMock.sent.find((cmd) => cmd.constructor.name === "UpdateCommand");
     expect(update).toBeDefined();
@@ -339,7 +363,7 @@ describe("top-level session.id hits the aggregation battery guard (TEAM-3427 fin
 
   it("counts a non-battery top-level session id toward the session set (matches extraction)", async () => {
     ddbMock.sent.length = 0;
-    await aggregateScoresToDdb("test-agent", {
+    const data = extractSessionData({
       logGroup,
       logStream: "stream-1",
       logEvents: [
@@ -347,6 +371,7 @@ describe("top-level session.id hits the aggregation battery guard (TEAM-3427 fin
         otelLogEvent("prod-run-42", "helpfulness", 0.75),
       ],
     });
+    await aggregateScoresToDdb("test-agent", data.evaluatorResults);
 
     const update = ddbMock.sent.find((cmd) => cmd.constructor.name === "UpdateCommand");
     expect(update).toBeDefined();
