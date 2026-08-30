@@ -4,7 +4,12 @@
  * Human-review gate tickets park in DIFFERENT statuses depending on how the
  * gate was filed: release-manager merge approvals sit in "Blocked" until the
  * Telegram ✅ flips them, while spec/plan gates go straight to "In Review".
- * Both are time a human is the bottleneck, so both count as waiting-on-human.
+ *
+ * "Blocked" is ambiguous, though — a gate can also be Blocked on upstream
+ * rework tickets. The exit transition disambiguates: leaving Blocked for
+ * "Ready" means dependencies completed (dependency wait — not counted);
+ * leaving for In Review/Done, or still sitting Blocked, means a human was the
+ * bottleneck (counted).
  */
 
 export interface StatusTransition {
@@ -14,8 +19,12 @@ export interface StatusTransition {
   to?: string;
 }
 
-/** Statuses that mean "a human owns this ticket right now" for gate tickets. */
-export const HUMAN_WAIT_STATUSES: ReadonlySet<string> = new Set(["In Review", "Blocked"]);
+export interface Interval {
+  start: number;
+  end: number;
+  /** status the ticket moved to when this interval closed; undefined = still open */
+  exitTo?: string;
+}
 
 interface JiraChangelog {
   histories?: Array<{ created: string; items?: Array<Record<string, unknown>> }>;
@@ -41,29 +50,23 @@ export function extractStatusTransitions(changelog: JiraChangelog | undefined): 
   return transitions;
 }
 
-export interface Interval {
-  start: number;
-  end: number;
-}
-
 /**
- * Intervals the ticket spent in any of `statuses`. Consecutive counted
- * statuses (e.g. Blocked → In Review) accrue as one continuous interval. An
- * interval still open at `nowMs` runs to `nowMs`.
+ * Intervals the ticket spent in `status`. An interval still open at `nowMs`
+ * runs to `nowMs` with no `exitTo`.
  */
-export function dwellIntervals(
+export function statusIntervals(
   transitions: StatusTransition[],
-  statuses: ReadonlySet<string>,
+  status: string,
   nowMs: number
 ): Interval[] {
   const intervals: Interval[] = [];
   let enteredAt: number | null = null;
   for (const t of transitions) {
-    const entering = t.to !== undefined && statuses.has(t.to);
+    const entering = t.to === status;
     if (entering && enteredAt === null) {
       enteredAt = t.at;
     } else if (!entering && enteredAt !== null) {
-      if (t.at > enteredAt) intervals.push({ start: enteredAt, end: t.at });
+      if (t.at > enteredAt) intervals.push({ start: enteredAt, end: t.at, exitTo: t.to });
       enteredAt = null;
     }
   }
@@ -71,19 +74,12 @@ export function dwellIntervals(
   return intervals;
 }
 
-/** Total ms the ticket spent in any of `statuses`. */
-export function dwellMs(
-  transitions: StatusTransition[],
-  statuses: ReadonlySet<string>,
-  nowMs: number
-): number {
-  return dwellIntervals(transitions, statuses, nowMs).reduce((s, i) => s + (i.end - i.start), 0);
-}
-
 /**
  * Total ms covered by the union of intervals. A workflow can have several gate
  * tickets open at once (round-N approval queued in Blocked while round N-1 is
- * In Review) — summing per-ticket dwell double-counts those overlaps.
+ * In Review) — summing per-ticket dwell double-counts those overlaps. Touching
+ * intervals (Blocked ending exactly when In Review starts) merge into one
+ * continuous wait.
  */
 export function unionMs(intervals: Interval[]): number {
   const sorted = [...intervals].sort((a, b) => a.start - b.start);
@@ -103,12 +99,19 @@ export function unionMs(intervals: Interval[]): number {
   return total;
 }
 
-/** Waiting-on-human intervals for a gate ticket's changelog. */
+/**
+ * Waiting-on-human intervals for a gate ticket's changelog: all In Review
+ * time, plus Blocked time that did NOT resolve by dependencies completing
+ * (exit to "Ready").
+ */
 export function humanWaitIntervals(changelog: JiraChangelog | undefined, nowMs = Date.now()): Interval[] {
-  return dwellIntervals(extractStatusTransitions(changelog), HUMAN_WAIT_STATUSES, nowMs);
+  const transitions = extractStatusTransitions(changelog);
+  const inReview = statusIntervals(transitions, "In Review", nowMs);
+  const blocked = statusIntervals(transitions, "Blocked", nowMs).filter((iv) => iv.exitTo !== "Ready");
+  return [...inReview, ...blocked];
 }
 
 /** Convenience: waiting-on-human ms for a single gate ticket's changelog. */
 export function humanWaitMs(changelog: JiraChangelog | undefined, nowMs = Date.now()): number {
-  return dwellMs(extractStatusTransitions(changelog), HUMAN_WAIT_STATUSES, nowMs);
+  return unionMs(humanWaitIntervals(changelog, nowMs));
 }

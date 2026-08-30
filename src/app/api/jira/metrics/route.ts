@@ -252,16 +252,29 @@ async function getMetricsFromJira(timeframe: Timeframe): Promise<MetricsResult> 
 
   // Epics are containers — their child stories are the countable work, so they
   // stay out of the flow counts entirely.
-  // Gate tickets: also fetch ones still open regardless of last update — a gate
-  // that sat untouched for a week is exactly the dwell we must not miss.
-  const [resolvedIssues, createdIssues, inProgressIssues, gateIssues, activityIssues, wfMap] = await Promise.all([
+  const [resolvedIssues, createdIssues, inProgressIssues, activityIssues, wfMap] = await Promise.all([
     jiraFetchAll(`project = ${project} AND issuetype != Epic AND status = Done AND resolved >= ${since}`, "resolutiondate,created,labels,issuetype,parent"),
     jiraFetchAll(`project = ${project} AND issuetype != Epic AND created >= ${since}`, "created,labels"),
     jiraFetchAll(`project = ${project} AND issuetype != Epic AND status = "In Progress"`, "labels", { cap: 300 }),
-    jiraFetchAll(`project = ${project} AND labels = "human-review" AND (updated >= ${since} OR statusCategory != Done)`, "labels", { expand: "changelog", cap: 300 }),
     jiraFetchAll(`project = ${project} AND issuetype != Epic AND labels = "agentcore-hub-workflow" ORDER BY updated DESC`, "summary,status,updated", { cap: 100 }),
     buildWorkflowTypeMap(),
   ]);
+
+  // Gate tickets need their own window: dwell belongs to workflows that
+  // COMPLETED in the window, whose gates may have closed before it started —
+  // so anchor the gate query at the earliest such workflow's start. Also fetch
+  // gates still open regardless of last update: a gate untouched for a week is
+  // exactly the dwell we must not miss.
+  const inWindowStarts = wfMap.workflows
+    .filter((w) => w.completedAt && w.startedAt && new Date(w.completedAt) >= cutoff)
+    .map((w) => new Date(w.startedAt!).getTime())
+    .filter((t) => !Number.isNaN(t));
+  const gateSince = new Date(Math.min(cutoff.getTime(), ...inWindowStarts)).toISOString().slice(0, 10);
+  const gateIssues = await jiraFetchAll(
+    `project = ${project} AND labels = "human-review" AND (updated >= "${gateSince}" OR statusCategory != Done)`,
+    "labels",
+    { expand: "changelog", cap: 300 }
+  );
 
   // ── Flow buckets: created + resolved per bucket, resolved stacked by type ──
   // The JQL `-7d` window is a rolling superset of the midnight-aligned buckets;
@@ -349,17 +362,17 @@ async function getMetricsFromJira(timeframe: Timeframe): Promise<MetricsResult> 
     inProgressIssues.map((i) => wfIdFromLabels((i.fields?.labels as string[]) || [])).filter(Boolean)
   );
 
+  // Average over the same bucketed population the resolved KPI counts.
   let avgResolutionTime = 0;
-  if (resolvedIssues.length > 0) {
+  {
     let totalMs = 0;
     let count = 0;
     for (const issue of resolvedIssues) {
       const created = issue.fields?.created as string | undefined;
       const resolutiondate = issue.fields?.resolutiondate as string | undefined;
-      if (created && resolutiondate) {
-        totalMs += new Date(resolutiondate).getTime() - new Date(created).getTime();
-        count++;
-      }
+      if (!created || !resolutiondate || bucketIndex(spec, resolutiondate) < 0) continue;
+      totalMs += new Date(resolutiondate).getTime() - new Date(created).getTime();
+      count++;
     }
     if (count > 0) avgResolutionTime = Math.round(totalMs / count / 60000);
   }
@@ -488,8 +501,9 @@ async function getMetricsFromDDB(timeframe: Timeframe): Promise<MetricsResult> {
       at: t.updatedAt!,
     }));
 
+  // Average over the same bucketed population the resolved KPI counts.
   let avgResolutionTime = 0;
-  const sample = resolved.slice(0, 50);
+  const sample = resolved.filter((t) => bucketIndex(spec, t.updatedAt!) >= 0).slice(0, 50);
   if (sample.length > 0) {
     let totalMs = 0;
     let count = 0;

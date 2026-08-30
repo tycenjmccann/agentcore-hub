@@ -48,6 +48,9 @@ export async function getWorkflowFromDynamo(workflowId: string) {
     TableName: WORKFLOWS_TABLE,
     Key: { workflowId },
   }));
+  // Tombstones (see DELETE /api/workflow/[id]) are metrics-only rows — for
+  // every operational purpose the workflow no longer exists.
+  if (result.Item?.deleted === true) return null;
   return result.Item || null;
 }
 

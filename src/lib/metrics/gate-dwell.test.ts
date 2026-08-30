@@ -1,11 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
   extractStatusTransitions,
-  dwellMs,
-  dwellIntervals,
+  statusIntervals,
   unionMs,
+  humanWaitIntervals,
   humanWaitMs,
-  HUMAN_WAIT_STATUSES,
 } from "./gate-dwell";
 
 const T0 = Date.parse("2026-08-29T00:00:00Z");
@@ -49,45 +48,67 @@ describe("extractStatusTransitions", () => {
   });
 });
 
-describe("dwellMs", () => {
-  it("counts a closed In Review interval", () => {
-    const log = changelog([
-      [0, "To Do", "In Review"],
-      [30, "In Review", "Done"],
-    ]);
-    expect(dwellMs(extractStatusTransitions(log), HUMAN_WAIT_STATUSES, T0 + min(60))).toBe(min(30));
-  });
-
-  it("counts Blocked dwell — merge-approval gates park in Blocked, not In Review", () => {
-    const log = changelog([
-      [0, "To Do", "Blocked"],
-      [45, "Blocked", "Done"],
-    ]);
-    expect(dwellMs(extractStatusTransitions(log), HUMAN_WAIT_STATUSES, T0 + min(60))).toBe(min(45));
-  });
-
-  it("treats Blocked → In Review as one continuous human wait, not two", () => {
-    const log = changelog([
-      [0, "To Do", "Blocked"],
-      [20, "Blocked", "In Review"],
-      [50, "In Review", "Done"],
-    ]);
-    expect(dwellMs(extractStatusTransitions(log), HUMAN_WAIT_STATUSES, T0 + min(60))).toBe(min(50));
-  });
-
-  it("accrues an open interval up to now", () => {
-    const log = changelog([[0, "To Do", "Blocked"]]);
-    expect(dwellMs(extractStatusTransitions(log), HUMAN_WAIT_STATUSES, T0 + min(90))).toBe(min(90));
-  });
-
-  it("sums multiple separate intervals", () => {
+describe("statusIntervals", () => {
+  it("captures closed intervals with exit status", () => {
     const log = changelog([
       [0, "To Do", "In Review"],
       [10, "In Review", "In Progress"],
       [40, "In Progress", "In Review"],
       [55, "In Review", "Done"],
     ]);
-    expect(dwellMs(extractStatusTransitions(log), HUMAN_WAIT_STATUSES, T0 + min(60))).toBe(min(25));
+    expect(statusIntervals(extractStatusTransitions(log), "In Review", T0 + min(60))).toEqual([
+      { start: T0, end: T0 + min(10), exitTo: "In Progress" },
+      { start: T0 + min(40), end: T0 + min(55), exitTo: "Done" },
+    ]);
+  });
+
+  it("leaves an open interval running to now with no exitTo", () => {
+    const log = changelog([[0, "To Do", "Blocked"]]);
+    expect(statusIntervals(extractStatusTransitions(log), "Blocked", T0 + min(90))).toEqual([
+      { start: T0, end: T0 + min(90) },
+    ]);
+  });
+});
+
+describe("humanWaitMs", () => {
+  it("counts a closed In Review interval", () => {
+    const log = changelog([
+      [0, "To Do", "In Review"],
+      [30, "In Review", "Done"],
+    ]);
+    expect(humanWaitMs(log, T0 + min(60))).toBe(min(30));
+  });
+
+  it("counts Blocked dwell that a human resolved — merge-approval gates park in Blocked", () => {
+    const log = changelog([
+      [0, "To Do", "Blocked"],
+      [45, "Blocked", "Done"],
+    ]);
+    expect(humanWaitMs(log, T0 + min(60))).toBe(min(45));
+  });
+
+  it("does NOT count Blocked time that ended by dependencies completing (exit to Ready)", () => {
+    const log = changelog([
+      [0, "To Do", "Blocked"],
+      [30, "Blocked", "Ready"],
+      [35, "Ready", "In Review"],
+      [50, "In Review", "Done"],
+    ]);
+    expect(humanWaitMs(log, T0 + min(60))).toBe(min(15));
+  });
+
+  it("counts an open Blocked interval up to now (human still owns it)", () => {
+    const log = changelog([[0, "To Do", "Blocked"]]);
+    expect(humanWaitMs(log, T0 + min(90))).toBe(min(90));
+  });
+
+  it("merges touching Blocked→In Review into one continuous wait", () => {
+    const log = changelog([
+      [0, "To Do", "Blocked"],
+      [20, "Blocked", "In Review"],
+      [50, "In Review", "Done"],
+    ]);
+    expect(humanWaitMs(log, T0 + min(60))).toBe(min(50));
   });
 
   it("returns 0 when the ticket never enters a counted status", () => {
@@ -95,30 +116,20 @@ describe("dwellMs", () => {
       [0, "To Do", "In Progress"],
       [10, "In Progress", "Done"],
     ]);
-    expect(dwellMs(extractStatusTransitions(log), HUMAN_WAIT_STATUSES, T0 + min(60))).toBe(0);
+    expect(humanWaitMs(log, T0 + min(60))).toBe(0);
   });
 });
 
-describe("humanWaitMs", () => {
-  it("computes wait from a raw changelog", () => {
+describe("humanWaitIntervals", () => {
+  it("returns In Review plus non-dependency Blocked intervals", () => {
     const log = changelog([
       [0, "To Do", "Blocked"],
-      [15, "Blocked", "Done"],
+      [10, "Blocked", "Ready"], // dependency wait — excluded
+      [20, "Ready", "In Review"],
+      [30, "In Review", "Done"],
     ]);
-    expect(humanWaitMs(log, T0 + min(60))).toBe(min(15));
-  });
-});
-
-describe("dwellIntervals", () => {
-  it("returns the underlying intervals", () => {
-    const log = changelog([
-      [0, "To Do", "In Review"],
-      [10, "In Review", "In Progress"],
-      [40, "In Progress", "Blocked"],
-    ]);
-    expect(dwellIntervals(extractStatusTransitions(log), HUMAN_WAIT_STATUSES, T0 + min(60))).toEqual([
-      { start: T0, end: T0 + min(10) },
-      { start: T0 + min(40), end: T0 + min(60) },
+    expect(humanWaitIntervals(log, T0 + min(60))).toEqual([
+      { start: T0 + min(20), end: T0 + min(30), exitTo: "Done" },
     ]);
   });
 });
