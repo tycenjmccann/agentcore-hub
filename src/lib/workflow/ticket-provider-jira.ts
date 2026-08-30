@@ -95,12 +95,19 @@ export class JiraCloudProvider implements TicketProvider {
     };
 
     if (input.assignee) {
-      // Jira expects accountId; if the caller passes an agent name, store as label
+      // Jira expects accountId; assignees are carried as labels instead.
+      // "human:<who>" = a human approval gate — stamp the same human-review +
+      // reviewer:<who> labels the agentcore-hub-jira Lambda uses, so every
+      // gate is discoverable by the dashboard's dwell mining regardless of
+      // which path created it. Anything else is an agent assignee.
+      const gateLabels = input.assignee.startsWith("human:")
+        ? ["human-review", `reviewer:${input.assignee.slice("human:".length)}`]
+        : [`agent:${input.assignee}`];
       body.fields = {
         ...(body.fields as Record<string, unknown>),
         labels: [
           ...((body.fields as Record<string, unknown>).labels as string[]),
-          `agent:${input.assignee}`,
+          ...gateLabels,
         ],
       };
     }

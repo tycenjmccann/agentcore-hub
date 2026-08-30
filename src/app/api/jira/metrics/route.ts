@@ -272,7 +272,7 @@ async function getMetricsFromJira(timeframe: Timeframe): Promise<MetricsResult> 
   const gateSince = new Date(Math.min(cutoff.getTime(), ...inWindowStarts)).toISOString().slice(0, 10);
   const gateIssues = await jiraFetchAll(
     `project = ${project} AND labels = "human-review" AND (updated >= "${gateSince}" OR statusCategory != Done)`,
-    "labels",
+    "labels,status,issuelinks",
     { expand: "changelog", cap: 300 }
   );
 
@@ -307,8 +307,16 @@ async function getMetricsFromJira(timeframe: Timeframe): Promise<MetricsResult> 
   for (const issue of gateIssues) {
     const wfId = wfIdFromLabels((issue.fields?.labels as string[]) || []);
     if (!wfId) continue;
+    // A gate sitting in Blocked RIGHT NOW with an unresolved blocker is waiting
+    // on upstream work, not on a human — classify its open interval accordingly.
+    const links = (issue.fields?.issuelinks as Array<Record<string, unknown>>) || [];
+    const hasOpenBlocker = links.some((l) => {
+      const type = (l.type as { name?: string })?.name;
+      const inward = l.inwardIssue as { fields?: { status?: { statusCategory?: { key?: string } } } } | undefined;
+      return type === "Blocks" && inward && inward.fields?.status?.statusCategory?.key !== "done";
+    });
     const list = intervalsByWf.get(wfId) || [];
-    list.push(...humanWaitIntervals(issue.changelog, nowMs));
+    list.push(...humanWaitIntervals(issue.changelog, nowMs, { openBlockedIsDependency: hasOpenBlocker }));
     intervalsByWf.set(wfId, list);
   }
 

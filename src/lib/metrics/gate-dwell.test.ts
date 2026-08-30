@@ -132,6 +132,14 @@ describe("humanWaitIntervals", () => {
       { start: T0 + min(20), end: T0 + min(30), exitTo: "Done" },
     ]);
   });
+
+  it("classifies an open Blocked interval as dependency wait when told the ticket has open blockers", () => {
+    const log = changelog([[0, "To Do", "Blocked"]]);
+    expect(humanWaitIntervals(log, T0 + min(90), { openBlockedIsDependency: true })).toEqual([]);
+    expect(humanWaitIntervals(log, T0 + min(90), { openBlockedIsDependency: false })).toEqual([
+      { start: T0, end: T0 + min(90) },
+    ]);
+  });
 });
 
 describe("unionMs", () => {
