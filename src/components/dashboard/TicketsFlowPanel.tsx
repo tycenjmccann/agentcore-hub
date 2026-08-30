@@ -18,9 +18,12 @@ interface FlowBucket {
 interface ThroughputRow {
   type: string;
   count: number;
+  /** median e2e minutes per workflow */
   e2eMin: number;
-  aiMin: number;
-  humanMin: number;
+  /** summed minutes across all completed workflows of this type */
+  totalE2eMin: number;
+  totalAiMin: number;
+  totalHumanMin: number;
 }
 
 interface ActivityItem {
@@ -110,7 +113,8 @@ export default function TicketsFlowPanel() {
       .finally(() => setLoading(false));
   }, [timeframe]);
 
-  const backlogGap = data ? data.ticketsCreated - data.ticketsResolved : 0;
+  // Same buckets the chart plots, so the KPI and the chart's "backlog" hint agree.
+  const backlogGap = (data?.buckets ?? []).reduce((s, b) => s + b.created - b.resolved, 0);
   const typeOrder = orderedTypes(data);
   const ticketsByType: Record<string, number> = {};
   for (const b of data?.buckets ?? []) {
@@ -337,7 +341,7 @@ function ThroughputLanes({ rows, tickets, loading }: {
   const shown = rows.slice(0, 5);
   return (
     <div>
-      <SectionTitle hint="median e2e, completed workflows">Where the time goes · AI vs human</SectionTitle>
+      <SectionTitle hint="total time, completed workflows">Where the time goes · AI vs human</SectionTitle>
       <div className="flex gap-4 mb-2">
         <span className="text-[10px] text-[var(--color-text-muted)]">bar = 100% of workflow time · type color = AI working</span>
         <span className="text-[10px] text-[var(--color-text-muted)] flex items-center gap-1.5">
@@ -349,10 +353,10 @@ function ThroughputLanes({ rows, tickets, loading }: {
       ) : (
         <div>
           {shown.map((r, i) => {
-            const aiPct = r.e2eMin > 0 ? Math.round((r.aiMin / r.e2eMin) * 100) : 100;
+            const aiPct = r.totalE2eMin > 0 ? Math.round((r.totalAiMin / r.totalE2eMin) * 100) : 100;
             const typeColor = colorForType(r.type, i);
             const nTickets = tickets[r.type] || 0;
-            const minPerTicket = nTickets > 0 ? Math.round((r.e2eMin * r.count) / nTickets) : 0;
+            const minPerTicket = nTickets > 0 ? Math.round(r.totalE2eMin / nTickets) : 0;
             return (
               <div key={r.type} className={`py-2.5 ${i > 0 ? "border-t border-surface-4/60" : ""}`}>
                 <div className="flex items-baseline justify-between mb-1.5">
@@ -360,7 +364,7 @@ function ThroughputLanes({ rows, tickets, loading }: {
                     <i className="inline-block w-2 h-2 rounded-[3px] flex-shrink-0" style={{ background: typeColor }} />
                     {r.type}
                     <span className="text-[10px] text-[var(--color-text-muted)]">
-                      {r.count} wf · {formatCount(nTickets)} tickets{minPerTicket > 0 ? ` · ~${formatMinutes(minPerTicket)}/ticket` : ""}
+                      {r.count} wf · {formatCount(nTickets)} tickets{minPerTicket > 0 ? ` · ~${formatMinutes(minPerTicket)}/ticket` : ""} · med {formatMinutes(r.e2eMin)}/wf
                     </span>
                   </span>
                   <span className="text-[15px] font-bold" style={{ color: aiPct >= 90 ? "var(--color-text-primary)" : HUMAN_COLOR }}>
@@ -368,16 +372,16 @@ function ThroughputLanes({ rows, tickets, loading }: {
                   </span>
                 </div>
                 <div className="h-[20px] rounded-md flex overflow-hidden bg-surface-3"
-                  title={`AI ${formatMinutes(r.aiMin)} · human ${formatMinutes(r.humanMin)} · ${formatMinutes(r.e2eMin)} e2e`}>
+                  title={`AI ${formatMinutes(r.totalAiMin)} · human ${formatMinutes(r.totalHumanMin)} · ${formatMinutes(r.totalE2eMin)} total`}>
                   <div className="h-full flex items-center px-2 min-w-0" style={{ width: `${aiPct}%`, background: typeColor, opacity: 0.85 }}>
                     <span className="text-[9.5px] font-semibold text-black/70 whitespace-nowrap overflow-hidden">
-                      AI · {formatMinutes(r.aiMin)}
+                      AI · {formatMinutes(r.totalAiMin)}
                     </span>
                   </div>
-                  {r.humanMin > 0 && (
+                  {r.totalHumanMin > 0 && (
                     <div className="h-full flex items-center justify-end px-2 min-w-0" style={{ width: `${100 - aiPct}%`, background: HUMAN_COLOR }}>
                       <span className="text-[9.5px] font-semibold text-black/70 whitespace-nowrap overflow-hidden">
-                        {formatMinutes(r.humanMin)}
+                        {formatMinutes(r.totalHumanMin)}
                       </span>
                     </div>
                   )}

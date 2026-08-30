@@ -23,6 +23,8 @@ export interface CreateTicketInput {
   description: string;
   assignee: string;
   blockedBy?: string[];
+  /** Extra labels to stamp on the ticket (e.g. `wfdef:<id>` for metrics type resolution). */
+  extraLabels?: string[];
 }
 
 export interface TicketProvider {

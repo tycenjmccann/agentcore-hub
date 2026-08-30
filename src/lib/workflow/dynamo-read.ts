@@ -31,6 +31,10 @@ export async function listWorkflowsFromDynamo(options?: { includeArchived?: bool
   // Sort by startedAt descending
   items.sort((a, b) => new Date(b.startedAt as string).getTime() - new Date(a.startedAt as string).getTime());
 
+  // Tombstoned rows exist only so dashboard metrics can still resolve a
+  // deleted workflow's type from its tickets — never list them.
+  items = items.filter(item => item.deleted !== true);
+
   // Filter out archived workflows unless includeArchived is true
   if (!options?.includeArchived) {
     items = items.filter(item => item.archived !== true);
