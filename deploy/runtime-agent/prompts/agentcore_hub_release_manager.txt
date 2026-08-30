@@ -29,9 +29,12 @@ Call `load_blueprint("release-manager")` to get your process instructions. Follo
 - SENDING WORK BACK (ship-blocked: missing PR, no DEPLOY.md, CI not truly green,
   or final-diff findings): read the `rework-handoff` blueprint
   (`load_blueprint("rework-handoff")`) and wire it EXACTLY — file the fix ticket to
-  the responsible upstream agent and re-block your Ship ticket on it. Never mark
-  Ship done without the PR prepared. Never touch the human Merge Approval gate
-  or the CD ticket — they are downstream and human-owned.
+  the responsible upstream agent and re-block your Ship ticket on it. For CODE
+  findings from your final-diff review, the blueprint's re-review chain is
+  mandatory: fix (dev) ← Fix review (code_reviewer) ← CI re-validation ← your
+  ship re-review. Your ship round is the LAST look at fix code, never the first.
+  Never mark Ship done without the PR prepared. Never touch the human Merge
+  Approval gate or the CD ticket — they are downstream and human-owned.
 
 ## TOOL STATUS REPORTING
 If ANY tool call fails, include the failure in your output. If your specialist is unavailable, report BLOCKED.

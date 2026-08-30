@@ -37,6 +37,28 @@ Concretely, when you (a gate) fail work and file a fix ticket for the dev:
    re-verify ticket is what closes the gate, they stay parked until the fix is
    actually verified — never running against un-fixed code.
 
+## CODE fixes must re-enter code review — no unreviewed code may reach a later gate
+
+Fix-ticket code is NEW code, and it is usually the riskiest code in the run
+(concurrency reworks, error-path changes written under review pressure). If it
+only re-enters the pipeline at YOUR gate, every gate between the dev and you is
+skipped — the exact failure mode that turns one review round into six: each
+later round does first-pass review of the previous round's unreviewed fixes.
+
+So when your fix ticket changes **code** (source, tests, deploy scripts, IaC —
+anything executable; NOT docs/redaction/comment-only edits):
+
+1. Create the fix ticket for the dev as above (`blocked_by=""`).
+2. **Also create a `Fix review: <batch>` ticket assigned to the code_reviewer
+   agent with `blocked_by="<fix ticket id(s)>"`** — one review ticket per fix
+   batch, not per finding. Skip this step ONLY if you ARE the code_reviewer
+   (your own re-verify ticket from step 2 above IS the re-review).
+3. Chain your own re-verify ticket `blocked_by` the **Fix review** ticket (not
+   the raw fix), so you re-run only after the fix has passed review.
+
+Docs-only / redaction / comment-only fixes skip the review link: re-block your
+re-verify directly on the fix ticket.
+
 ### Why not just file the ticket and `report_completion` PASS-style?
 
 Because `report_completion` marks YOUR ticket `done`, which unblocks the NEXT
@@ -56,11 +78,19 @@ assigned to you `blocked_by` the fix.
   (e.g. no iOS gateway), you cannot pass or fail — report BLOCKED in your
   completion text and, if no one can act, this is an escalation case, not a
   silent Done.
-- **release_manager (ship blocked):** if you cannot ship because an upstream
-  artifact is missing/wrong (no PR, no DEPLOY.md, CI not actually green), file a
-  fix ticket to the responsible upstream agent and re-block your ship ticket on
-  it. Never mark ship `done` without the PR prepared. Never touch the human
-  Merge Approval gate or CD ticket — those are downstream and human-owned.
+- **release_manager (ship blocked):** two cases.
+  - *Missing/wrong upstream artifact* (no PR, no DEPLOY.md, CI not actually
+    green): file a fix ticket to the responsible upstream agent and re-block
+    your ship ticket on it.
+  - *Code findings from your final-diff review:* these fixes are unreviewed
+    code — apply the "CODE fixes must re-enter code review" chain above IN
+    FULL: fix ticket (dev) ← `Fix review` ticket (code_reviewer) ← CI
+    re-validation ticket (ci_agent) ← your ship re-review. Your ship round
+    must be the LAST look at the fix, never the first. Docs/redaction-only
+    findings skip the review+CI links.
+
+  Either way: never mark ship `done` without the PR prepared. Never touch the
+  human Merge Approval gate or CD ticket — those are downstream and human-owned.
 
 ## Sanity check before you finish
 
