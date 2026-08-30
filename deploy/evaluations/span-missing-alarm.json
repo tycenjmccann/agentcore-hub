@@ -1,6 +1,6 @@
 {
   "AlarmName": "agentcore-hub-eval-span-missing-ratio",
-  "AlarmDescription": "More than 50% of eval sessions have no invoke_agent span (all evaluator scores null with no error.type). Fires on 3 of 4 hourly datapoints. INSUFFICIENT_DATA when no eval sessions arrive.",
+  "AlarmDescription": "More than 50% of eval sessions have no invoke_agent span (all evaluator scores null with no error.type). Ratio is IF(total > 0, span_missing / total, 0) over the dimensionless fleet-rollup series the eval-packager emits (TEAM-3386) — CloudWatch rejects alarms built on SEARCH() expressions. A zero-total period (e.g. an all-duplicates delivery, which emits EvalSessionsTotal=0) necessarily has span_missing=0, so the IF() guard pins the ratio to 0, non-breaching for GreaterThanThreshold 0.5. Fires on 3 of 4 hourly datapoints. Requires the eval-packager version that emits the dimensionless rollup (TEAM-3386) to be deployed first. INSUFFICIENT_DATA when no eval sessions arrive.",
   "ActionsEnabled": true,
   "EvaluationPeriods": 4,
   "DatapointsToAlarm": 3,
@@ -10,17 +10,33 @@
   "Metrics": [
     {
       "Id": "missing",
-      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsSpanMissing\"', 'Sum', 3600))",
+      "MetricStat": {
+        "Metric": {
+          "Namespace": "AgentCoreHub/Evaluations",
+          "MetricName": "EvalSessionsSpanMissing",
+          "Dimensions": []
+        },
+        "Period": 3600,
+        "Stat": "Sum"
+      },
       "ReturnData": false
     },
     {
       "Id": "total",
-      "Expression": "SUM(SEARCH('{AgentCoreHub/Evaluations,AgentName} MetricName=\"EvalSessionsTotal\"', 'Sum', 3600))",
+      "MetricStat": {
+        "Metric": {
+          "Namespace": "AgentCoreHub/Evaluations",
+          "MetricName": "EvalSessionsTotal",
+          "Dimensions": []
+        },
+        "Period": 3600,
+        "Stat": "Sum"
+      },
       "ReturnData": false
     },
     {
       "Id": "ratio",
-      "Expression": "missing / total",
+      "Expression": "IF(total > 0, missing / total, 0)",
       "Label": "span_missing ratio (fleet)",
       "ReturnData": true
     }

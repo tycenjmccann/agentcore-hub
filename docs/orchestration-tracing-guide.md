@@ -210,6 +210,137 @@
 
 ---
 
+## Eval judge throttling (quota)
+
+> **OPERATOR ACTION (TEAM-3366 §2.5)** — this is a one-time, account-level AWS
+> Service Quotas change run by a human operator with quota permissions. It is
+> NOT performed by CI, any deploy script, or agent code, and it is not
+> idempotent to re-request (each call opens a new support case).
+
+**Symptom**: eval results log groups fill with `ThrottlingException` from the
+Opus judge; sessions classify as `error` in eval batches; `EvalThrottleRate` /
+`EvalThrottleCount` climb on the `agentcore-hub-eval-health` dashboard and the
+`eval.batch.null_or_error_rate` metric climbs even though agent telemetry
+(`invoke_agent` spans) is healthy.
+
+**First response (no quota change needed)**: verify the load-reduction
+mitigations are actually applied — the trimmed 5-evaluator matrix and tiered
+sampling (100% gate roles / 25% others) in
+`deploy/evaluations/setup-evaluations.sh`, reconciled against the live configs
+per that script's reconciliation section. That alone cuts judge calls ~4-8×.
+
+**Step 1 — identify the exact quota (grep, don't guess).** Quota names vary by
+model/version, so list them and filter rather than assuming a code:
+
+```bash
+aws service-quotas list-service-quotas --service-code bedrock --output json \
+ | jq -r '.Quotas[] | select(.QuotaName|test("Opus";"i"))
+          | [.QuotaCode, .QuotaName, (.Value|tostring)] | @tsv'
+```
+
+The judge quota's expected name pattern is
+**"On-demand InvokeModel requests per minute for Anthropic Claude Opus 4.7"**.
+Record the `QuotaCode` and the current `Value` before requesting anything.
+
+**Step 2 — request an increase to 200 requests/minute.** Design derivation
+(TEAM-3366 §2.5): after the §2.4 load reduction (5 evaluators, tiered
+sampling) the judge runs at roughly ~16 RPM sustained, but two sessions
+completing simultaneously can burst to ~162 RPM — so 200 RPM gives headroom
+without over-asking:
+
+```bash
+aws service-quotas request-service-quota-increase \
+  --service-code bedrock --quota-code <QuotaCode from above> --desired-value 200
+```
+
+Track the resulting case with
+`aws service-quotas list-requested-service-quota-change-history --service-code bedrock`.
+After the grant, watch `EvalThrottleRate` on the eval-health dashboard for a
+full batch window before considering raising sampling rates back up.
+
+**Note — shared on-demand pool.** Check whether online evaluations draw from
+the same on-demand InvokeModel pool as the fleet's own model calls: fleet
+model overrides include Opus 4.6/4.7, and if the judge and the fleet share one
+quota, the 200 RPM target must be re-derived with the fleet's RPM added on
+top. Compare the judge's throttling timestamps against fleet invocation spikes
+(or ask AWS support which quota the evaluations service consumes) before
+treating 200 as sufficient.
+
+---
+
+## Eval health monitoring (dashboard + success-rate alarm)
+
+TEAM-3368 §4: `lambda/eval-packager/index.mjs` emits one EMF record per log
+delivery into the `AgentCoreHub/Evaluations` namespace with five health
+metrics. The record declares two dimension sets, `[["AgentName"], []]`
+(TEAM-3386), so every metric lands both as a per-`AgentName` series (the
+dashboard SEARCHes these) and as a dimensionless fleet-rollup series (the
+alarms read these — CloudWatch does not allow alarms on SEARCH()
+expressions):
+
+| Metric | Meaning |
+|---|---|
+| `EvalSessionsTotal` | Distinct eval sessions seen in the delivery |
+| `EvalSessionsSpanMissing` | Sessions with all-null scores and no `error.type` — the `invoke_agent` span never reached the evaluator (telemetry failure, not agent quality) |
+| `EvalSessionsError` | Sessions whose results carry an `error.type` (judge/eval failure) |
+| `EvalThrottleCount` | Result records whose `error.type` ends in `ThrottlingException` — judge quota pressure (see the quota section above) |
+| `EvalDuplicateResultCount` | Duplicate result rows dropped by dedup (at-least-once delivery / evaluator retries — in-memory per delivery, TEAM-3367, plus the cross-delivery DynamoDB seen-set, TEAM-3376) |
+| `EvalThrottleRate` | Throttled sessions / total sessions for the delivery (TEAM-3376; session-level, so 8 retries of one throttled session read as one) |
+| `EvalValidationExceptionRate` | Validation-error sessions / total sessions for the delivery (TEAM-3376) |
+
+(One more, `EvalDepChainExcludedCount`, counts dependency-chain evaluator rows
+dropped for out-of-scope roles — TEAM-3368 §3.2 config-drift guard.)
+
+> **Cross-delivery duplicates.** `EvalDuplicateResultCount` covers in-delivery
+> drops plus the drops made by the TEAM-3376 DynamoDB seen-set
+> (`agentcore-hub-eval-seen`, conditional writes, fail-open), which closed the
+> DDB-rolling-aggregate exposure TEAM-3381 had deferred — see
+> [eval-infrastructure-reliability-design.md §2.2](./eval-infrastructure-reliability-design.md#ac-2-ddb-aggregate-deferral-disposition-team-3381)
+> for the original disposition. Flush-time dedup independently logs any
+> stragglers (`eval.batch.cross_delivery_duplicates_dropped`, e.g. records the
+> seen-set failed OPEN on); to verify the seen-set end-to-end, use that
+> design doc's §2.2 Logs Insights query grouped by logStream.
+
+Healthy batches emit explicit `0` datapoints for all of them; nothing is
+emitted when a delivery contains no sessions.
+
+Apply the dashboard (safe any time — widgets stay empty until metrics flow;
+the JSON hardcodes `us-east-1`, substitute the target region at apply time):
+
+```bash
+aws cloudwatch put-dashboard --dashboard-name agentcore-hub-eval-health \
+  --dashboard-body file://deploy/evaluations/eval-health-dashboard.json
+```
+
+Apply the success-rate alarm — fires when fleet
+`IF(total > 0, (total - span_missing - errors) / total, 1)` < 0.8 on 3 of 4
+hourly datapoints. Both alarms use plain `MetricStat` entries against the
+dimensionless fleet-rollup series (TEAM-3386) rather than `SUM(SEARCH(...))`
+— CloudWatch rejects alarms built on SEARCH expressions (SEARCH is
+dashboard-only). The `IF()` guard treats a zero-total period (an
+all-duplicates delivery emits `EvalSessionsTotal=0`) as healthy: success rate
+pins to 1 and the span_missing ratio to 0, both non-breaching.
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --cli-input-json file://deploy/evaluations/eval-success-rate-alarm.json
+```
+
+**Rollout order:** apply the alarm ONLY AFTER the P0-A runtime telemetry fix,
+the P0-B eval-packager fix, and the TEAM-3386 packager (which emits the
+dimensionless rollup the alarms read) are deployed AND at least one healthy
+batch with non-zero `EvalSessionsTotal` carrying the three new metrics has
+been observed — earlier, the rate evaluates on stale/partial data and fires
+immediately (or the dimensionless series doesn't exist yet and the alarm sits
+in INSUFFICIENT_DATA). Add `AlarmActions` (the environment's SNS topic ARN)
+to the JSON at apply time; it is intentionally omitted from the repo copy.
+
+**INSUFFICIENT_DATA during quiet hours is expected** — both eval alarms use
+`TreatMissingData: missing`, and no eval sessions means no datapoints. Do not
+page on INSUFFICIENT_DATA.
+
+---
+
 ## Tracing Script
 
 Use `scripts/trace-workflow.sh` to pull all logs for a workflow run in one shot.
