@@ -33,11 +33,17 @@ Existence is not access. Do BOTH, in order, and stop at the first failure:
 1. **Name check** — confirm the exact secret name the code reads exists (you may
    already do this in the external-API step). Wrong/missing name → fix the name
    or file it.
-2. **Read check** — confirm THIS runtime can actually read it. The cheap probe
-   is a `DescribeSecret` / `GetSecretValue` on the secret from inside the
-   runtime (your `claude_code`/`codex` specialist can run the AWS CLI, or the
-   code's own load path). `AccessDenied` here is the trap — it means the role
-   lacks the grant, and no retry will fix it.
+2. **Read check** — confirm THIS runtime can actually read it. Probe with
+   `GetSecretValue` from inside the runtime (your `claude_code`/`codex`
+   specialist can run the AWS CLI, or the code's own load path) — but the
+   default CLI output prints the decrypted `SecretString` into the tool
+   transcript, which violates the never-print rule even on success. Always
+   select non-secret fields only:
+   `aws secretsmanager get-secret-value --secret-id <name> --query '{arn:ARN,version:VersionId}' --output json`
+   (`DescribeSecret` alone is NOT a read check — it needs no `GetSecretValue`
+   permission, so it can pass while the real read is denied.) `AccessDenied`
+   here is the trap — it means the role lacks the grant, and no retry will
+   fix it.
 
 If the read check fails with AccessDenied (or the secret is absent and you own
 the value elsewhere), **STOP and report BLOCKED** — do not limp forward, do not

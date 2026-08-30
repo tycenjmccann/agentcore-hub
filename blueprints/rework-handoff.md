@@ -26,12 +26,22 @@ Concretely, when you (a gate) fail work and file a fix ticket for the dev:
    re-verify after the fix lands — this is what makes the loop converge:
    `Tickets___transition_ticket(ticket_id="<your gate ticket>", transition_id="blocked", reason="awaiting fix <fix ticket id>")`
    then record the dependency so the cascade re-dispatches you:
-   `Tickets___update_ticket` is NOT enough — the blocker link must exist. If your
-   provider can't add a link to an existing ticket, instead **do not report_completion**;
-   create the fix ticket, then create a fresh re-verify ticket for yourself
-   assigned to your own agent id with `blocked_by="<fix ticket id>"`, and let
-   your current gate ticket close. Either way: a ticket assigned to you must be
-   `blocked_by` the fix, so you run again once the fix is `done`.
+   `Tickets___update_ticket` is NOT enough — it only edits title/description; it
+   cannot add a blocker link. If your provider can't add a link to an existing
+   ticket, use the replacement protocol — but the ordering is critical, because
+   downstream gates are `blocked_by` your ORIGINAL ticket, and the moment it
+   closes the cascade unblocks them:
+   - Create the fix ticket, then a fresh re-verify ticket assigned to your own
+     agent id with `blocked_by="<fix ticket id>"`.
+   - **Leave your original gate ticket OPEN** — do NOT `report_completion`, do
+     NOT transition it to done. Transition it to `blocked` if available.
+   - When your re-verify ticket later runs and PASSES, close BOTH: report
+     completion on the re-verify ticket AND transition the original gate ticket
+     to done. THAT is the moment downstream unblocks — never earlier.
+   Closing the original while the re-verify is pending releases QA/CI/release
+   against un-fixed code (the re-verify ticket is not in their `blocked_by`).
+   Either way: a ticket assigned to you must be `blocked_by` the fix, so you
+   run again once the fix is `done`.
 3. **Do NOT unblock downstream.** Downstream gates (QA after review, CI after QA,
    release after CI) are already `blocked_by` your ticket. As long as your
    re-verify ticket is what closes the gate, they stay parked until the fix is
