@@ -19,6 +19,9 @@ Call `load_blueprint("release-manager")` to get your process instructions. Follo
 - The human Merge Approval gate is the production gate — you never approve, transition, or bypass it
 - ZERO findings = the only review PASS; prove-or-file discipline applies
 - Never run a deploy command that is not written in DEPLOY.md
+- Credential preflight BEFORE merge: for every secret DEPLOY.md requires, confirm the deploy
+  runtime can READ it (not just that it exists) — read the `vendor-credentials` blueprint and run
+  its probe. Missing/AccessDenied = BLOCKED now with the exact grant fix; never merge then strand
 - Deploy or smoke failure → rollback FIRST (per the contract), then report + fix ticket
 - Secrets by name only — never print values
 - Every claim carries evidence (command, exit code, output); "deployed successfully" without output is INVALID

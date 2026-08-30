@@ -104,6 +104,14 @@ branch or the PR head — must exist on the branch being merged).
 - Parse the contract: staging deploy commands, smoke checks, rollback command,
   required secrets (names only), environment prerequisites, and the optional
   `auto_promote` flag.
+- **Credential preflight (do this NOW, before merge).** For every credential in
+  the contract's `Required credentials` / required-secrets list, confirm the
+  deploy runtime can actually READ it — not just that the name exists. Read the
+  `vendor-credentials` blueprint (`load_blueprint("vendor-credentials")`) and run
+  its read probe. A secret that is missing or `AccessDenied` → BLOCKED now, with
+  the blueprint's exact create+grant commands — do NOT merge, do NOT reach into
+  another account. Catching this pre-merge stops a half-deployed release that
+  strands on an unreadable key mid-run.
 - Verify the head SHA still equals the SHA from the ship review / merge gate.
   New commits since approval → BLOCKED, back to a re-review (file a ticket for
   yourself via the ship flow); an approval covers the SHA the human saw, not
