@@ -199,7 +199,7 @@ async function getSpanLogGroups(region: string): Promise<string[]> {
  */
 function normalizeModelName(raw: string): string {
   return raw
-    .replace(/^(us\.|eu\.|apac\.)?anthropic\./, "")
+    .replace(/^(us\.|eu\.|apac\.|global\.)?anthropic\./, "")
     .replace(/^claude-/, "")
     .replace(/-v\d+(:\d+)?$/, "")
     .replace(/-\d{8}$/, "");
