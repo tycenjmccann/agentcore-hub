@@ -114,3 +114,51 @@ Invariants 1, 4 and 5 passing is the important part of the diagnosis: everything
 around the audio delivery works. The defect is confined to *how* the bytes are
 handed to the stream — pacing and termination — which is exactly what invariants
 2 and 3 pin down.
+
+## Fixed code — PASSING
+
+`transcribeVoice(fileId, durationSec)` now derives a chunk size from the clip's
+own byte rate, sleeps `CHUNK_MS` between frames, and closes the audio stream with
+an explicit empty `AudioEvent`. Same command, exit code **0**:
+
+```
+npx vitest run deploy/telegram-bug-intake --reporter=verbose
+```
+
+```
+The CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-03b3e727938b4822ac01de76b4f5f2c2/tycenjmccann-agentcore-hub
+
+ ✓ deploy/telegram-bug-intake/__tests__/transcribe-voice.test.mjs > transcribeVoice — Transcribe streaming delivery contract > declares the Telegram container natively and delivers the bytes intact
+ ✓ deploy/telegram-bug-intake/__tests__/transcribe-voice.test.mjs > transcribeVoice — Transcribe streaming delivery contract > delivers the audio in real-time-sized chunks, paced to wall clock
+ ✓ deploy/telegram-bug-intake/__tests__/transcribe-voice.test.mjs > transcribeVoice — Transcribe streaming delivery contract > terminates the stream with an explicit empty end-of-audio event
+ ✓ deploy/telegram-bug-intake/__tests__/transcribe-voice.test.mjs > transcribeVoice — Transcribe streaming delivery contract > returns the final transcript
+ ✓ deploy/telegram-bug-intake/__tests__/transcribe-voice.test.mjs > transcribeVoice — transcript assembly > returns an empty string when only partial results arrive 2809ms
+
+ Test Files  1 passed (1)
+      Tests  5 passed (5)
+   Start at  21:52:15
+   Duration  7.93s (transform 198ms, setup 0ms, collect 144ms, tests 5.71s, environment 0ms, prepare 141ms)
+```
+
+### Delivery profile for the 3 s fixture
+
+12,140 bytes / 3.0 s = 4,046.67 B/s, `CHUNK_MS = 200`:
+
+| | |
+|---|---|
+| `chunkBytes` | `ceil(4046.67 * 200 / 1000)` = **810 B** = 200.2 ms of audio (inside the 50-200 ms window) |
+| Audio frames | **15** (14 x 810 B + a 800 B remainder) |
+| Total events | **16** — the 15 audio frames plus the empty end-of-audio `AudioChunk` |
+| Sleeps | 14 x 200 ms = 2,800 ms expected |
+| Measured delivery wall time | **2,809 ms** for a 3.0 s clip — 94% of real time |
+
+The clamp `max(256, min(16 KiB, ...))` bounds the frame for pathological
+durations: a bogus/zero `duration` falls back to a 4,000 B/s estimate (~32 kbps,
+Telegram's usual voice bitrate) rather than to a full-file blast, and a very long
+clip with a high byte rate still tops out at one 16 KiB frame per 200 ms.
+
+Streaming now costs roughly the clip's own duration in Lambda wall time (a 10 min
+note, the handler's cap, is ~10 min of streaming against a 900 s timeout — the
+pre-existing 600 s guard in `routeMessage` keeps that inside the budget).

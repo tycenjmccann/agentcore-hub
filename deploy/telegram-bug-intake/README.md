@@ -21,11 +21,16 @@ history. It was retrieved verbatim from the deployed code
 | Deployed code LastModified | 2026-08-27 |
 | `sha256(index.mjs)` as deployed | `5eb0bb40a824f57f0b86dfdef99dfeb26a9cabbc35b0bf95066cc74fbe762f81` |
 
-**The only textual difference from the deployed bytes** is `export` added to
-`async function transcribeVoice(fileId)` (line 716) so the unit tests can import
-it directly. Nothing else was touched; `diff` against the deployed `index.mjs`
-shows that one line and nothing more. Keep it that way: when editing, the diff
-against the running function should always be reviewable line-by-line.
+The import commit (`52bbd12`) was byte-identical to the deployed code apart from
+one line — `export` on `transcribeVoice` so the tests can import it. Everything
+after that is a reviewable diff against the running function; keep it that way.
+
+Changes on top of the imported baseline:
+
+- **TEAM-3464** — `transcribeVoice` now paces audio into Transcribe streaming in
+  ~200 ms chunks and terminates the stream with an empty `AudioEvent`. The
+  deployed function still has the old full-file blast until this ships, so
+  **the running Lambda is behind this file by that fix.**
 
 ## Architecture
 

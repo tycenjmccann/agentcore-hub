@@ -184,7 +184,7 @@ async function routeMessage(msg, buffers, context) {
       return;
     }
     await tgAction(chatId, "typing");
-    const transcript = await transcribeVoice(msg.voice.file_id);
+    const transcript = await transcribeVoice(msg.voice.file_id, msg.voice.duration || 0);
     if (!transcript) {
       await tgSend(chatId, "🎙️ Couldn't make out any speech in that voice note — try again?");
       return;
@@ -713,17 +713,29 @@ async function attachScreenshot(issueKey, fileId, n) {
 // Telegram voice notes are OGG/Opus @48kHz — Transcribe streaming takes that
 // container natively, so no transcoding layer is needed.
 
-export async function transcribeVoice(fileId) {
+export async function transcribeVoice(fileId, durationSec) {
   const meta = await tgCall("getFile", { file_id: fileId });
   const res = await fetch(`${TG_FILE}/${meta.file_path}`);
   if (!res.ok) throw new Error(`Telegram voice download ${res.status}`);
   const bytes = new Uint8Array(await res.arrayBuffer());
 
+  // Amazon Transcribe streaming is a REAL-TIME service: audio must arrive in
+  // uniform ~50-200ms chunks at ~real-time pace, and the audio stream must be
+  // terminated with an explicit empty AudioEvent. Blasting the whole file and
+  // closing (the old behavior) trips the service's ~20s insufficient-audio
+  // watchdog regardless of clip length (TEAM-3460).
+  //   https://docs.aws.amazon.com/transcribe/latest/dg/streaming.html
+  //   https://docs.aws.amazon.com/transcribe/latest/dg/streaming-setting-up.html (step 6)
+  const CHUNK_MS = 200;
+  const byteRate = durationSec > 0 ? bytes.length / durationSec : 4000; // ~32kbps fallback
+  const chunkBytes = Math.max(256, Math.min(16 * 1024, Math.ceil((byteRate * CHUNK_MS) / 1000)));
+
   async function* audioStream() {
-    const CHUNK = 16 * 1024;
-    for (let i = 0; i < bytes.length; i += CHUNK) {
-      yield { AudioEvent: { AudioChunk: bytes.subarray(i, i + CHUNK) } };
+    for (let i = 0; i < bytes.length; i += chunkBytes) {
+      yield { AudioEvent: { AudioChunk: bytes.subarray(i, i + chunkBytes) } };
+      if (i + chunkBytes < bytes.length) await sleep(CHUNK_MS);
     }
+    yield { AudioEvent: { AudioChunk: new Uint8Array(0) } }; // end-of-audio signal
   }
 
   const out = await transcribe.send(new StartStreamTranscriptionCommand({
