@@ -152,6 +152,19 @@ def deploy(agent_name: str) -> None:
     lifecycle = {"idleRuntimeSessionTimeout": 3600, "maxLifetime": 3600}
 
     runtime_id = find_runtime(control, agent_name)
+    # update_agent_runtime REPLACES lifecycle wholesale — a bare deploy would cut
+    # an existing runtime's tuned maxLifetime (prod shared runtime = 28800s) down
+    # to this 3600 default and kill long detached persona runs. Carry the live
+    # lifecycle forward on update.
+    if runtime_id is not None:
+        try:
+            existing_lifecycle = control.get_agent_runtime(
+                agentRuntimeId=runtime_id
+            ).get("lifecycleConfiguration")
+            if existing_lifecycle:
+                lifecycle = existing_lifecycle
+        except ClientError:
+            pass
     try:
         if runtime_id is None:
             resp = control.create_agent_runtime(
