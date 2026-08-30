@@ -34,6 +34,15 @@
 
 set -euo pipefail
 
+# TEAM-3426: this script takes no CLI arguments — reject anything passed (in
+# particular --force) rather than silently ignoring it. The audited eval-gate
+# break-glass here is env-var-only.
+if [ "$#" -gt 0 ]; then
+  echo "ERROR: $0 takes no arguments (got: $*)." >&2
+  echo "  Eval-gate break-glass (audited): EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON='INC-123: why' $0" >&2
+  exit 1
+fi
+
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -44,6 +53,11 @@ if [[ -f .env.local ]]; then
   source .env.local
   set +a
 fi
+
+# Eval gate (FR-7): the container bakes in agents.json/workflows.json — refuse
+# to build/push ungated config. Runs before the docker build and S3 reads.
+source "$REPO_ROOT/deploy/lib/check-eval-gate.sh"
+require_eval_gate "src/config/agents.json" "src/config/workflows.json"
 
 : "${AWS_REGION:?AWS_REGION must be set}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -372,9 +386,11 @@ PRIMARY_CONTAINER="{\"image\":\"${FULL_TAG}\",\"containerPort\":8080,\"environme
 # Optional explicit networking (only when there's no usable default VPC).
 NET_ARG=()
 if [[ -n "${EXPRESS_SUBNETS:-}" ]]; then
+  # shellcheck disable=SC2086 # deliberate word-split: one %s per comma-separated id
   SUBNETS_JSON=$(printf '"%s",' ${EXPRESS_SUBNETS//,/ }); SUBNETS_JSON="[${SUBNETS_JSON%,}]"
   SG_JSON="[]"
   if [[ -n "${EXPRESS_SECURITY_GROUPS:-}" ]]; then
+    # shellcheck disable=SC2086 # deliberate word-split: one %s per comma-separated id
     SG_JSON=$(printf '"%s",' ${EXPRESS_SECURITY_GROUPS//,/ }); SG_JSON="[${SG_JSON%,}]"
   fi
   NET_ARG=(--network-configuration "{\"subnets\":${SUBNETS_JSON},\"securityGroups\":${SG_JSON}}")

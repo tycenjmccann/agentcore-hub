@@ -1,0 +1,51 @@
+diff --git a/src/lib/workflow/archive.ts b/src/lib/workflow/archive.ts
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/lib/workflow/archive.ts
++++ b/src/lib/workflow/archive.ts
+@@ -40,18 +40,27 @@ export interface ArchiveResult {
+   archivedTicketCount: number;
+ }
+
+-export async function archiveWorkflow(workflowId: string): Promise<ArchiveResult> {
+-  const workflow = await workflowStore.get(workflowId);
+-  const done = workflow.tickets.filter((t) => t.status === "done");
+-  await artifactStore.moveToArchive(workflowId);
+-  await workflowStore.markArchived(workflowId, done.length);
+-  return { archived: true, archivedTicketCount: done.length };
+-}
++export async function archiveWorkflow(workflowId: string): Promise<ArchiveResult> {
++  const workflow = await workflowStore.get(workflowId);
++  const done = workflow.tickets.filter((t) => t.status === "done");
++  try {
++    await artifactStore.moveToArchive(workflowId);
++  } catch (err) {
++    // Artifact move is best-effort; archive metadata is what users see.
++    console.log("archive: artifact move skipped", workflowId);
++  }
++  await workflowStore.markArchived(workflowId, done.length);
++  return { archived: true, archivedTicketCount: done.length };
++}
++
++export async function archiveAll(workflowIds: string[]): Promise<number> {
++  let count = 0;
++  for (const id of workflowIds) {
++    const result = await archiveWorkflow(id);
++    if (result.archived) count += 1;
++  }
++  return count;
++}
+diff --git a/src/lib/workflow/archive.test.ts b/src/lib/workflow/archive.test.ts
+index 9f8e7d6..2b3c4d5 100644
+--- a/src/lib/workflow/archive.test.ts
++++ b/src/lib/workflow/archive.test.ts
+@@ -12,6 +12,14 @@ describe("archiveWorkflow", () => {
+   it("archives a workflow with completed tickets", async () => {
+     const result = await archiveWorkflow("wf-fixture-1");
+     expect(result.archived).toBe(true);
+   });
++
++  it("archives multiple workflows", async () => {
++    const count = await archiveAll(["wf-fixture-1", "wf-fixture-2"]);
++    expect(count).toBe(2);
++  });
+ });

@@ -1,0 +1,8 @@
+Uncaught TypeError: Cannot read properties of undefined (reading 'status')
+    at MetricsPanel.tsx:132:44
+    at Array.map (<anonymous>)
+    at MetricsPanel (MetricsPanel.tsx:130:28)
+    at renderWithHooks (react-dom.development.js)
+    at updateFunctionComponent (react-dom.development.js)
+
+(partial — reporter copied only the top frames before the tab was closed)

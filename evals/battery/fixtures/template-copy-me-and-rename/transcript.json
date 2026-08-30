@@ -1,0 +1,10 @@
+[
+  {
+    "role": "user",
+    "content": "Placeholder transcript entry — replace with the sanitized conversation your case replays. Transcripts are JSON arrays of {role, content}."
+  },
+  {
+    "role": "assistant",
+    "content": "Placeholder reply — delete this file if your case has no transcript input."
+  }
+]

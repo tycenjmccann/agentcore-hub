@@ -17,10 +17,17 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    // lambda/**: the eval-packager's classifiers are pure ESM with zero AWS
-    // imports precisely so they can be unit-tested here rather than in a
-    // per-Lambda jest setup.
-    include: ["src/**/*.test.ts", "lambda/eval-packager/**/*.test.mjs"],
+    include: [
+      "src/**/*.test.ts",
+      "evals/battery/**/*.test.ts",
+      // Deploy-guard tests: bash subprocess + fixture repos + PATH-shimmed
+      // fake gh — still hermetic (no AWS, no network).
+      "deploy/lib/__tests__/**/*.test.ts",
+      // lambda/**: the eval-packager's classifiers are pure ESM with zero AWS
+      // imports precisely so they can be unit-tested here rather than in a
+      // per-Lambda jest setup.
+      "lambda/eval-packager/**/*.test.mjs",
+    ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
   },

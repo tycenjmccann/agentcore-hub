@@ -39,6 +39,46 @@ NOT rewritten by the commands below. That is deliberate:
   set — it rewrites function env vars and would blank prod Jira credentials.**
   The staging deploy below is code-only for exactly this reason.
 
+## Config evals gate
+
+Prompt/config/blueprint changes are gated by the config-evals battery — see
+[`evals/battery/README.md`](evals/battery/README.md) for cases, thresholds,
+and the break-glass procedure. All deploy targets that ship gated artifacts
+(`deploy/runtime-agent/deploy{,-one,-fleet,-topology}.sh`,
+`deploy/workflow-manager/deploy.sh`, `deploy/apprunner/deploy.sh`,
+`deploy/ecs-express/deploy.sh`) source `deploy/lib/check-eval-gate.sh` and
+refuse to run unless HEAD carries a `config-evals-gate` check run that is a
+verified battery **PASS** — a bare `success` conclusion is not enough, since the
+gate also publishes a SKIPPED success for PRs touching no gated path (see
+"Deploy gate + break-glass" in `evals/battery/README.md`).
+The gate's CI job assumes an OIDC IAM role — one-time provisioning is
+documented in [`evals/battery/README.md`](evals/battery/README.md) under
+"CI AWS credentials (one-time setup)".
+
+### Break-glass
+
+Two equivalent forms — the CLI flags are sugar over the env vars, and both route
+through the same audited override (loud banner, `{timestamp, sha, STS identity,
+script, reason}` to `s3://$ARTIFACT_BUCKET/eval-gate/overrides/` **and**
+`.eval-gate-overrides.log`; refused if no durable record can be written):
+
+```bash
+# CLI form — deploy/runtime-agent/deploy.sh, deploy-one.sh, and deploy-fleet.sh
+./deploy/runtime-agent/deploy.sh --force --force-reason "INC-123: why" backend_dev
+
+# Env-var form — every gated target, including the raw require_eval_gate calls below
+EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON="INC-123: why" ./deploy/ecs-express/deploy.sh
+```
+
+A reason is mandatory: `--force` without a non-empty `--force-reason` (or an
+inherited non-empty `EVAL_GATE_OVERRIDE_REASON`) is refused before any gate or
+deploy work, and unknown `--flags` are rejected rather than misread as an agent
+name. The remaining gated scripts (`deploy-topology.sh`, `workflow-manager`,
+`apprunner`, `ecs-express`) take no CLI arguments and reject `--force` (and
+anything else) with an error pointing at the env-var form. Full semantics:
+"Deploy gate + break-glass" in
+[`evals/battery/README.md`](evals/battery/README.md).
+
 ## Staging deploy
 
 The hub has no separate staging account; "staging" = deploying code-only
@@ -46,6 +86,10 @@ targets and verifying before the app rollout completes traffic shift.
 
 ```bash
 # 1. Orchestrator Lambda — CODE ONLY (never its deploy.sh; see Required secrets)
+#    PRE-STEP: the zip ships no gated config, but all three targets run the
+#    gate so the contract is uniform (the sha latch makes repeat checks free):
+source deploy/lib/check-eval-gate.sh
+require_eval_gate "src/config/agents.json" "src/config/workflows.json"
 cd lambda/orchestrator && npm ci --omit=dev && zip -qr /tmp/orchestrator.zip . && cd ../..
 aws lambda update-function-code --function-name agentcore-hub-orchestrator \
   --zip-file fileb:///tmp/orchestrator.zip --region "$AWS_REGION"
@@ -53,6 +97,11 @@ aws lambda update-function-code --function-name agentcore-hub-orchestrator \
 # 2. Blueprints + prompts + config → S3 artifact bucket
 #    (blueprints/prompts are safe to cp; agents.json must be MERGED onto the S3
 #    copy — the S3 version carries deploy-injected runtimeArns the repo nulls out)
+#    PRE-STEP: this target ships gated artifacts raw (no deploy script), so run
+#    the eval-gate check yourself before syncing:
+source deploy/lib/check-eval-gate.sh
+require_eval_gate "blueprints/**" "deploy/runtime-agent/prompts/**" \
+  "deploy/workflow-manager/**" "src/config/agents.json" "src/config/workflows.json"
 aws s3 sync blueprints/ "s3://$ARTIFACT_BUCKET/blueprints/"
 aws s3 sync deploy/runtime-agent/prompts/ "s3://$ARTIFACT_BUCKET/prompts/"
 aws s3 cp src/config/workflows.json "s3://$ARTIFACT_BUCKET/config/workflows.json"

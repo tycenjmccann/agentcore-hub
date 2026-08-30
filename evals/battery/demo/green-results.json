@@ -1,0 +1,1559 @@
+{
+  "runId": "mtc9c9witqvd",
+  "configSha": "cff23d5a0201bfb6a328280eb931419edd5f2834",
+  "baselineSha": "mock-synthetic-baseline",
+  "scoringBackend": "mock",
+  "verdict": "PASS",
+  "failureReasons": [],
+  "infraCases": [],
+  "configSources": {
+    "baseRef": null,
+    "all": "pr-head (local/manual run)"
+  },
+  "bootstrapBaseline": false,
+  "gatingCases": [
+    "fix-null-session-crash-001",
+    "fix-pagination-offbyone-002",
+    "fix-race-condition-cas-003",
+    "qa-build-verification-002",
+    "qa-design-mismatch-003",
+    "qa-verifier-degradation-canary-004",
+    "qa-verifier-regression-001",
+    "review-error-handling-001",
+    "review-eventual-consistency-003",
+    "review-injection-vuln-002",
+    "triage-crash-chain-001",
+    "triage-flaky-upload-002",
+    "triage-rootcause-comment-003"
+  ],
+  "cases": [
+    {
+      "id": "fix-null-session-crash-001",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "haiku",
+      "sessionId": "battery-mtc9c9witqvd-fix-null-session-crash-001",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "claude_code",
+          "argsDigest": "44136fa355b3"
+        },
+        {
+          "tool": "WorkflowOutput___report_completion",
+          "argsDigest": "6232b4864709"
+        }
+      ],
+      "scores": {
+        "Builtin.ToolSelectionAccuracy": 85,
+        "Builtin.ToolParameterAccuracy": 85,
+        "Builtin.InstructionFollowing": 85,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.Correctness": 85
+      },
+      "scoreDetails": {
+        "Builtin.ToolSelectionAccuracy": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.ToolSelectionAccuracy (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.ToolParameterAccuracy": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.ToolParameterAccuracy (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.InstructionFollowing (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Correctness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Correctness (not contract-sensitive)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "fix-null-session-crash-001",
+          "evaluator": "Builtin.ToolSelectionAccuracy",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-null-session-crash-001",
+          "evaluator": "Builtin.ToolParameterAccuracy",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-null-session-crash-001",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-null-session-crash-001",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-null-session-crash-001",
+          "evaluator": "Builtin.Correctness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.11,
+      "informational": false
+    },
+    {
+      "id": "fix-pagination-offbyone-002",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "haiku",
+      "sessionId": "battery-mtc9c9witqvd-fix-pagination-offbyone-002",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "claude_code",
+          "argsDigest": "44136fa355b3"
+        },
+        {
+          "tool": "WorkflowOutput___report_completion",
+          "argsDigest": "3feaae5ca3cd"
+        }
+      ],
+      "scores": {
+        "Builtin.ToolSelectionAccuracy": 85,
+        "Builtin.InstructionFollowing": 85,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.Correctness": 85,
+        "Builtin.Coherence": 85
+      },
+      "scoreDetails": {
+        "Builtin.ToolSelectionAccuracy": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.ToolSelectionAccuracy (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.InstructionFollowing (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Correctness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Correctness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Coherence": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Coherence (not contract-sensitive)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "fix-pagination-offbyone-002",
+          "evaluator": "Builtin.ToolSelectionAccuracy",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-pagination-offbyone-002",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-pagination-offbyone-002",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-pagination-offbyone-002",
+          "evaluator": "Builtin.Correctness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-pagination-offbyone-002",
+          "evaluator": "Builtin.Coherence",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.11,
+      "informational": false
+    },
+    {
+      "id": "fix-race-condition-cas-003",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "sonnet",
+      "sessionId": "battery-mtc9c9witqvd-fix-race-condition-cas-003",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "claude_code",
+          "argsDigest": "44136fa355b3"
+        },
+        {
+          "tool": "WorkflowOutput___report_completion",
+          "argsDigest": "ad90d33dedcf"
+        }
+      ],
+      "scores": {
+        "Builtin.ToolSelectionAccuracy": 85,
+        "Builtin.InstructionFollowing": 85,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.Correctness": 85,
+        "Builtin.Coherence": 85
+      },
+      "scoreDetails": {
+        "Builtin.ToolSelectionAccuracy": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.ToolSelectionAccuracy (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.InstructionFollowing (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Correctness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Correctness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Coherence": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Coherence (not contract-sensitive)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "fix-race-condition-cas-003",
+          "evaluator": "Builtin.ToolSelectionAccuracy",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-race-condition-cas-003",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-race-condition-cas-003",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-race-condition-cas-003",
+          "evaluator": "Builtin.Correctness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "fix-race-condition-cas-003",
+          "evaluator": "Builtin.Coherence",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.1,
+      "informational": false
+    },
+    {
+      "id": "qa-build-verification-002",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "haiku",
+      "sessionId": "battery-mtc9c9witqvd-qa-build-verification-002",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "load_blueprint",
+          "argsDigest": "66c77eadd304"
+        },
+        {
+          "tool": "claude_code",
+          "argsDigest": "44136fa355b3"
+        },
+        {
+          "tool": "WorkflowOutput___report_completion",
+          "argsDigest": "8ec0ee0bb2a3"
+        }
+      ],
+      "scores": {
+        "Builtin.ToolSelectionAccuracy": 85,
+        "Builtin.ToolParameterAccuracy": 85,
+        "Builtin.InstructionFollowing": 90,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.Correctness": 85,
+        "persona_contract_compliance": 90
+      },
+      "scoreDetails": {
+        "Builtin.ToolSelectionAccuracy": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.ToolSelectionAccuracy (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.ToolParameterAccuracy": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.ToolParameterAccuracy (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.9,
+          "score": 90,
+          "label": "contract-intact",
+          "explanation": "mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 71% of the reference persona contract (threshold 55%)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Correctness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Correctness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "persona_contract_compliance": {
+          "rawScore": 0.9,
+          "score": 90,
+          "label": "contract-intact",
+          "explanation": "mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 71% of the reference persona contract (threshold 55%)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "qa-build-verification-002",
+          "evaluator": "Builtin.ToolSelectionAccuracy",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-build-verification-002",
+          "evaluator": "Builtin.ToolParameterAccuracy",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-build-verification-002",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 90,
+          "current": 90,
+          "delta": 0,
+          "floor": 80,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-build-verification-002",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-build-verification-002",
+          "evaluator": "Builtin.Correctness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-build-verification-002",
+          "evaluator": "persona_contract_compliance",
+          "baseline": 90,
+          "current": 90,
+          "delta": 0,
+          "floor": 80,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.14,
+      "informational": false
+    },
+    {
+      "id": "qa-design-mismatch-003",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "haiku",
+      "sessionId": "battery-mtc9c9witqvd-qa-design-mismatch-003",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "load_blueprint",
+          "argsDigest": "66c77eadd304"
+        },
+        {
+          "tool": "Tickets___create_ticket",
+          "argsDigest": "66783debecf2"
+        },
+        {
+          "tool": "WorkflowOutput___report_completion",
+          "argsDigest": "185551fe262e"
+        }
+      ],
+      "scores": {
+        "Builtin.InstructionFollowing": 90,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.Correctness": 85,
+        "Builtin.Faithfulness": 85,
+        "Builtin.Helpfulness": 85,
+        "persona_contract_compliance": 90
+      },
+      "scoreDetails": {
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.9,
+          "score": 90,
+          "label": "contract-intact",
+          "explanation": "mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 86% of the reference persona contract (threshold 55%)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Correctness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Correctness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Faithfulness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Faithfulness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Helpfulness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Helpfulness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "persona_contract_compliance": {
+          "rawScore": 0.9,
+          "score": 90,
+          "label": "contract-intact",
+          "explanation": "mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 86% of the reference persona contract (threshold 55%)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "qa-design-mismatch-003",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 90,
+          "current": 90,
+          "delta": 0,
+          "floor": 80,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-design-mismatch-003",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-design-mismatch-003",
+          "evaluator": "Builtin.Correctness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-design-mismatch-003",
+          "evaluator": "Builtin.Faithfulness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-design-mismatch-003",
+          "evaluator": "Builtin.Helpfulness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-design-mismatch-003",
+          "evaluator": "persona_contract_compliance",
+          "baseline": 90,
+          "current": 90,
+          "delta": 0,
+          "floor": 80,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.13,
+      "informational": false
+    },
+    {
+      "id": "qa-verifier-degradation-canary-004",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "haiku",
+      "sessionId": "battery-mtc9c9witqvd-qa-verifier-degradation-canary-004",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "load_blueprint",
+          "argsDigest": "66c77eadd304"
+        },
+        {
+          "tool": "Tickets___create_ticket",
+          "argsDigest": "5601a840c77c"
+        },
+        {
+          "tool": "WorkflowOutput___report_completion",
+          "argsDigest": "b1d99b76575c"
+        }
+      ],
+      "scores": {
+        "Builtin.InstructionFollowing": 90,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.Correctness": 85,
+        "Builtin.Faithfulness": 85,
+        "persona_contract_compliance": 90
+      },
+      "scoreDetails": {
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.9,
+          "score": 90,
+          "label": "contract-intact",
+          "explanation": "mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 83% of the reference persona contract (threshold 55%)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Correctness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Correctness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Faithfulness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Faithfulness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "persona_contract_compliance": {
+          "rawScore": 0.9,
+          "score": 90,
+          "label": "contract-intact",
+          "explanation": "mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 83% of the reference persona contract (threshold 55%)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "qa-verifier-degradation-canary-004",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 90,
+          "current": 90,
+          "delta": 0,
+          "floor": 80,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-verifier-degradation-canary-004",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-verifier-degradation-canary-004",
+          "evaluator": "Builtin.Correctness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-verifier-degradation-canary-004",
+          "evaluator": "Builtin.Faithfulness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-verifier-degradation-canary-004",
+          "evaluator": "persona_contract_compliance",
+          "baseline": 90,
+          "current": 90,
+          "delta": 0,
+          "floor": 80,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.09,
+      "informational": false
+    },
+    {
+      "id": "qa-verifier-regression-001",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "haiku",
+      "sessionId": "battery-mtc9c9witqvd-qa-verifier-regression-001",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "load_blueprint",
+          "argsDigest": "66c77eadd304"
+        },
+        {
+          "tool": "WorkflowOutput___report_completion",
+          "argsDigest": "f38ff64c9a6f"
+        }
+      ],
+      "scores": {
+        "Builtin.ToolSelectionAccuracy": 85,
+        "Builtin.InstructionFollowing": 90,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.Correctness": 85,
+        "persona_contract_compliance": 90
+      },
+      "scoreDetails": {
+        "Builtin.ToolSelectionAccuracy": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.ToolSelectionAccuracy (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.9,
+          "score": 90,
+          "label": "contract-intact",
+          "explanation": "mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 83% of the reference persona contract (threshold 55%)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Correctness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Correctness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "persona_contract_compliance": {
+          "rawScore": 0.9,
+          "score": 90,
+          "label": "contract-intact",
+          "explanation": "mock judge: working-tree prompt for agentcore_hub_qa_verifier covers 83% of the reference persona contract (threshold 55%)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "qa-verifier-regression-001",
+          "evaluator": "Builtin.ToolSelectionAccuracy",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-verifier-regression-001",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 90,
+          "current": 90,
+          "delta": 0,
+          "floor": 80,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-verifier-regression-001",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-verifier-regression-001",
+          "evaluator": "Builtin.Correctness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "qa-verifier-regression-001",
+          "evaluator": "persona_contract_compliance",
+          "baseline": 90,
+          "current": 90,
+          "delta": 0,
+          "floor": 80,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.09,
+      "informational": false
+    },
+    {
+      "id": "review-error-handling-001",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "haiku",
+      "sessionId": "battery-mtc9c9witqvd-review-error-handling-001",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "Tickets___create_ticket",
+          "argsDigest": "491b958bced7"
+        },
+        {
+          "tool": "WorkflowOutput___report_completion",
+          "argsDigest": "9e9751e465f2"
+        }
+      ],
+      "scores": {
+        "Builtin.ToolSelectionAccuracy": 85,
+        "Builtin.InstructionFollowing": 85,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.Correctness": 85,
+        "Builtin.Faithfulness": 85
+      },
+      "scoreDetails": {
+        "Builtin.ToolSelectionAccuracy": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.ToolSelectionAccuracy (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.InstructionFollowing (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Correctness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Correctness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Faithfulness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Faithfulness (not contract-sensitive)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "review-error-handling-001",
+          "evaluator": "Builtin.ToolSelectionAccuracy",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-error-handling-001",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-error-handling-001",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-error-handling-001",
+          "evaluator": "Builtin.Correctness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-error-handling-001",
+          "evaluator": "Builtin.Faithfulness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.1,
+      "informational": false
+    },
+    {
+      "id": "review-eventual-consistency-003",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "haiku",
+      "sessionId": "battery-mtc9c9witqvd-review-eventual-consistency-003",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "WorkflowOutput___report_completion",
+          "argsDigest": "452bafd2432a"
+        }
+      ],
+      "scores": {
+        "Builtin.InstructionFollowing": 85,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.Correctness": 85,
+        "Builtin.Faithfulness": 85,
+        "Builtin.Coherence": 85
+      },
+      "scoreDetails": {
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.InstructionFollowing (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Correctness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Correctness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Faithfulness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Faithfulness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Coherence": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Coherence (not contract-sensitive)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "review-eventual-consistency-003",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-eventual-consistency-003",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-eventual-consistency-003",
+          "evaluator": "Builtin.Correctness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-eventual-consistency-003",
+          "evaluator": "Builtin.Faithfulness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-eventual-consistency-003",
+          "evaluator": "Builtin.Coherence",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.1,
+      "informational": false
+    },
+    {
+      "id": "review-injection-vuln-002",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "sonnet",
+      "sessionId": "battery-mtc9c9witqvd-review-injection-vuln-002",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "Tickets___create_ticket",
+          "argsDigest": "66ef4ca8029d"
+        },
+        {
+          "tool": "WorkflowOutput___report_completion",
+          "argsDigest": "176e9f81e8de"
+        }
+      ],
+      "scores": {
+        "Builtin.Correctness": 85,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.InstructionFollowing": 85,
+        "Builtin.Faithfulness": 85,
+        "Builtin.Helpfulness": 85
+      },
+      "scoreDetails": {
+        "Builtin.Correctness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Correctness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.InstructionFollowing (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Faithfulness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Faithfulness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Helpfulness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Helpfulness (not contract-sensitive)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "review-injection-vuln-002",
+          "evaluator": "Builtin.Correctness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-injection-vuln-002",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-injection-vuln-002",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-injection-vuln-002",
+          "evaluator": "Builtin.Faithfulness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "review-injection-vuln-002",
+          "evaluator": "Builtin.Helpfulness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.11,
+      "informational": false
+    },
+    {
+      "id": "triage-crash-chain-001",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "sonnet",
+      "sessionId": "battery-mtc9c9witqvd-triage-crash-chain-001",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "Tickets___create_ticket",
+          "argsDigest": "4de7a6ac9708"
+        },
+        {
+          "tool": "WorkflowOutput___submit_ticket_plan",
+          "argsDigest": "0a92829d815d"
+        }
+      ],
+      "scores": {
+        "Builtin.ToolSelectionAccuracy": 85,
+        "Builtin.ToolParameterAccuracy": 85,
+        "Builtin.InstructionFollowing": 85,
+        "Builtin.GoalSuccessRate": 85,
+        "dependency_chain_compliance-VyBv7H2bCi": 85
+      },
+      "scoreDetails": {
+        "Builtin.ToolSelectionAccuracy": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.ToolSelectionAccuracy (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.ToolParameterAccuracy": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.ToolParameterAccuracy (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.InstructionFollowing (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "dependency_chain_compliance-VyBv7H2bCi": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for unidentified evaluator (not contract-sensitive)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "triage-crash-chain-001",
+          "evaluator": "Builtin.ToolSelectionAccuracy",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-crash-chain-001",
+          "evaluator": "Builtin.ToolParameterAccuracy",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-crash-chain-001",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-crash-chain-001",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-crash-chain-001",
+          "evaluator": "dependency_chain_compliance-VyBv7H2bCi",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.11,
+      "informational": false
+    },
+    {
+      "id": "triage-flaky-upload-002",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "haiku",
+      "sessionId": "battery-mtc9c9witqvd-triage-flaky-upload-002",
+      "tenant": "battery-test",
+      "toolTrajectory": [],
+      "scores": {
+        "Builtin.InstructionFollowing": 85,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.Correctness": 85,
+        "Builtin.Faithfulness": 85,
+        "Builtin.Coherence": 85
+      },
+      "scoreDetails": {
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.InstructionFollowing (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Correctness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Correctness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Faithfulness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Faithfulness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Coherence": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Coherence (not contract-sensitive)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "triage-flaky-upload-002",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-flaky-upload-002",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-flaky-upload-002",
+          "evaluator": "Builtin.Correctness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-flaky-upload-002",
+          "evaluator": "Builtin.Faithfulness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-flaky-upload-002",
+          "evaluator": "Builtin.Coherence",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.07,
+      "informational": false
+    },
+    {
+      "id": "triage-rootcause-comment-003",
+      "status": "scored",
+      "attempt": 1,
+      "modelTier": "haiku",
+      "sessionId": "battery-mtc9c9witqvd-triage-rootcause-comment-003",
+      "tenant": "battery-test",
+      "toolTrajectory": [
+        {
+          "tool": "Tickets___add_comment",
+          "argsDigest": "9cd09f14e481"
+        }
+      ],
+      "scores": {
+        "Builtin.ToolSelectionAccuracy": 85,
+        "Builtin.InstructionFollowing": 85,
+        "Builtin.GoalSuccessRate": 85,
+        "Builtin.Helpfulness": 85,
+        "Builtin.Conciseness": 85
+      },
+      "scoreDetails": {
+        "Builtin.ToolSelectionAccuracy": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.ToolSelectionAccuracy (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.InstructionFollowing": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.InstructionFollowing (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.GoalSuccessRate": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.GoalSuccessRate (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Helpfulness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Helpfulness (not contract-sensitive)",
+          "attempt": 1
+        },
+        "Builtin.Conciseness": {
+          "rawScore": 0.85,
+          "score": 85,
+          "label": "mock-flat",
+          "explanation": "mock judge: flat score for Builtin.Conciseness (not contract-sensitive)",
+          "attempt": 1
+        }
+      },
+      "deltas": [
+        {
+          "case": "triage-rootcause-comment-003",
+          "evaluator": "Builtin.ToolSelectionAccuracy",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-rootcause-comment-003",
+          "evaluator": "Builtin.InstructionFollowing",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-rootcause-comment-003",
+          "evaluator": "Builtin.GoalSuccessRate",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-rootcause-comment-003",
+          "evaluator": "Builtin.Helpfulness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        },
+        {
+          "case": "triage-rootcause-comment-003",
+          "evaluator": "Builtin.Conciseness",
+          "baseline": 85,
+          "current": 85,
+          "delta": 0,
+          "floor": 75,
+          "verdict": "pass"
+        }
+      ],
+      "forbiddenHits": [],
+      "missingRequiredTools": [],
+      "error": null,
+      "runtimeSeconds": 0.04,
+      "informational": false
+    }
+  ],
+  "summary": {
+    "overallBaseline": 85.6,
+    "overallCurrent": 85.6,
+    "overallDelta": 0,
+    "scale": "0-100"
+  },
+  "informationalCases": [],
+  "retiredCases": [
+    {
+      "id": "template-copy-me-and-rename",
+      "file": "evals/battery/cases/_template.json",
+      "retirement_reason": "template file — never runs; copy, edit, set status:active"
+    }
+  ],
+  "flakyFlags": [],
+  "costEstimateUsd": 0.4,
+  "runtimeSeconds": 1.33
+}

@@ -25,11 +25,26 @@
 
 set -euo pipefail
 
+# TEAM-3426: this script takes no CLI arguments — reject anything passed (in
+# particular --force) rather than silently ignoring it. The audited eval-gate
+# break-glass here is env-var-only.
+if [ "$#" -gt 0 ]; then
+  echo "ERROR: $0 takes no arguments (got: $*)." >&2
+  echo "  Eval-gate break-glass (audited): EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON='INC-123: why' $0" >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 AGENTS_JSON="$REPO_ROOT/src/config/agents.json"
 WORKFLOWS_JSON="$REPO_ROOT/src/config/workflows.json"
 PROMPTS_DIR="$SCRIPT_DIR/prompts"
+
+# Eval gate (FR-7): runs before the prompt/config S3 syncs below. Read-only —
+# does not touch the agents.json runtimeArn merge this script performs later.
+# shellcheck disable=SC1091 # resolved relative to this script at runtime
+source "$SCRIPT_DIR/../lib/check-eval-gate.sh"
+require_eval_gate "deploy/runtime-agent/prompts/**" "src/config/agents.json" "src/config/workflows.json"
 
 : "${AWS_REGION:?AWS_REGION must be set}"
 : "${ARTIFACT_BUCKET:?ARTIFACT_BUCKET must be set}"
