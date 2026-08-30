@@ -61,6 +61,13 @@ async function processInBatches<T, R>(
   return results;
 }
 
+interface ModelUsage {
+  model: string;
+  tokensIn: number;
+  tokensOut: number;
+  calls: number;
+}
+
 interface AgentMetrics {
   id: string;
   name: string;
@@ -70,6 +77,7 @@ interface AgentMetrics {
   avgDuration: number; // seconds
   totalDuration: number; // seconds
   invocations: number;
+  models: ModelUsage[];
 }
 
 /**
@@ -104,7 +112,7 @@ export async function GET(req: NextRequest) {
         ? `harness_${agent.name}.DEFAULT`
         : `${agent.name}.DEFAULT`;
 
-      const tokens = tokensByAgent[serviceName] || { input: 0, output: 0, calls: 0 };
+      const tokens = tokensByAgent[serviceName] || { input: 0, output: 0, calls: 0, models: {} };
       const cw = cwMetricsByAgent[agent.id] || { invocations: 0 };
       const stats = sessionStats[agent.id] || { sessions: 0, totalDurationSec: 0 };
 
@@ -117,8 +125,28 @@ export async function GET(req: NextRequest) {
         avgDuration: stats.sessions > 0 ? Math.round(stats.totalDurationSec / stats.sessions) : 0,
         totalDuration: Math.round(stats.totalDurationSec),
         invocations: cw.invocations,
+        models: Object.entries(tokens.models)
+          .map(([model, m]) => ({ model, tokensIn: m.input, tokensOut: m.output, calls: m.calls }))
+          .sort((a, b) => b.calls - a.calls),
       };
     });
+
+    // Fleet-wide model totals across every span source, including services
+    // (e.g. the coding runtime's per-delegation CLIs) that don't map to a
+    // discovered agent — the model split is exactly where those matter.
+    const modelTotals: Record<string, { tokensIn: number; tokensOut: number; calls: number }> = {};
+    for (const usage of Object.values(tokensByAgent)) {
+      for (const [model, m] of Object.entries(usage.models)) {
+        const t = modelTotals[model] || { tokensIn: 0, tokensOut: 0, calls: 0 };
+        t.tokensIn += m.input;
+        t.tokensOut += m.output;
+        t.calls += m.calls;
+        modelTotals[model] = t;
+      }
+    }
+    const modelMetrics: ModelUsage[] = Object.entries(modelTotals)
+      .map(([model, t]) => ({ model, ...t }))
+      .sort((a, b) => b.calls - a.calls);
 
     // Aggregate totals
     const totalSessions = agentMetrics.reduce((sum, a) => sum + a.sessions, 0);
@@ -141,6 +169,7 @@ export async function GET(req: NextRequest) {
         totalAgents: agents.length,
       },
       agentMetrics,
+      modelMetrics,
     };
 
     metricsCaches.set(region, { data: result, ts: Date.now() });
@@ -162,10 +191,32 @@ async function getSpanLogGroups(region: string): Promise<string[]> {
 }
 
 /**
- * Query span log groups for per-agent token usage.
+ * Model ids arrive in several spellings depending on the emitter: Strands
+ * spans carry Bedrock inference-profile ids (us.anthropic.claude-fable-5),
+ * the coding CLI reports bare API names (claude-fable-5,
+ * claude-haiku-4-5-20251001). Collapse them to one display name so the same
+ * model doesn't show up as three rows.
  */
-async function getTokenUsageFromSpans(region: string): Promise<Record<string, { input: number; output: number; calls: number }>> {
-  const empty: Record<string, { input: number; output: number; calls: number }> = {};
+function normalizeModelName(raw: string): string {
+  return raw
+    .replace(/^(us\.|eu\.|apac\.|global\.)?anthropic\./, "")
+    .replace(/^claude-/, "")
+    .replace(/-v\d+(:\d+)?$/, "")
+    .replace(/-\d{8}$/, "");
+}
+
+interface SvcTokenUsage {
+  input: number;
+  output: number;
+  calls: number;
+  models: Record<string, { input: number; output: number; calls: number }>;
+}
+
+/**
+ * Query span log groups for per-agent token usage, broken down by model.
+ */
+async function getTokenUsageFromSpans(region: string): Promise<Record<string, SvcTokenUsage>> {
+  const empty: Record<string, SvcTokenUsage> = {};
 
   try {
     const client = getLogsClient(region);
@@ -179,10 +230,12 @@ async function getTokenUsageFromSpans(region: string): Promise<Record<string, { 
     // "chat <model>") and Claude Code CLI api_request log events (coding
     // runtime — its collector normalizes input_tokens -> gen_ai.usage.* and
     // event.name arrives as "api_request", body carries the claude_code prefix).
+    // Both shapes stamp gen_ai.request.model, so grouping by it gives the
+    // per-model split (e.g. which tier each claude_code delegation picked).
     const query = `
-      fields \`attributes.gen_ai.usage.input_tokens\` as inp, \`attributes.gen_ai.usage.output_tokens\` as outp, \`resource.attributes.service.name\` as svc
+      fields \`attributes.gen_ai.usage.input_tokens\` as inp, \`attributes.gen_ai.usage.output_tokens\` as outp, \`resource.attributes.service.name\` as svc, coalesce(\`attributes.gen_ai.request.model\`, "unknown") as model
       | filter name like /^chat / or \`attributes.event.name\` = "api_request"
-      | stats sum(inp) as inputTokens, sum(outp) as outputTokens, count(*) as calls by svc
+      | stats sum(inp) as inputTokens, sum(outp) as outputTokens, count(*) as calls by svc, model
     `;
 
     const startRes = await client.send(
@@ -199,7 +252,7 @@ async function getTokenUsageFromSpans(region: string): Promise<Record<string, { 
     const results = await pollQuery(client, startRes.queryId, 15);
     if (!results || results.length === 0) return empty;
 
-    const agents: Record<string, { input: number; output: number; calls: number }> = {};
+    const agents: Record<string, SvcTokenUsage> = {};
 
     for (const row of results) {
       const svc = row.svc;
@@ -207,7 +260,18 @@ async function getTokenUsageFromSpans(region: string): Promise<Record<string, { 
       const input = Number(row.inputTokens || 0);
       const output = Number(row.outputTokens || 0);
       const calls = Number(row.calls || 0);
-      agents[svc] = { input, output, calls };
+      const model = normalizeModelName(row.model || "unknown");
+
+      if (!agents[svc]) agents[svc] = { input: 0, output: 0, calls: 0, models: {} };
+      agents[svc].input += input;
+      agents[svc].output += output;
+      agents[svc].calls += calls;
+
+      const m = agents[svc].models[model] || { input: 0, output: 0, calls: 0 };
+      m.input += input;
+      m.output += output;
+      m.calls += calls;
+      agents[svc].models[model] = m;
     }
 
     return agents;

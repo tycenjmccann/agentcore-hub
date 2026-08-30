@@ -102,12 +102,21 @@ export function unionMs(intervals: Interval[]): number {
 /**
  * Waiting-on-human intervals for a gate ticket's changelog: all In Review
  * time, plus Blocked time that did NOT resolve by dependencies completing
- * (exit to "Ready").
+ * (exit to "Ready"). An interval still open in Blocked is ambiguous — pass
+ * `openBlockedIsDependency: true` (ticket currently has unresolved blockers)
+ * to classify it as a dependency wait instead of a human one.
  */
-export function humanWaitIntervals(changelog: JiraChangelog | undefined, nowMs = Date.now()): Interval[] {
+export function humanWaitIntervals(
+  changelog: JiraChangelog | undefined,
+  nowMs = Date.now(),
+  opts?: { openBlockedIsDependency?: boolean }
+): Interval[] {
   const transitions = extractStatusTransitions(changelog);
   const inReview = statusIntervals(transitions, "In Review", nowMs);
-  const blocked = statusIntervals(transitions, "Blocked", nowMs).filter((iv) => iv.exitTo !== "Ready");
+  const blocked = statusIntervals(transitions, "Blocked", nowMs).filter((iv) => {
+    if (iv.exitTo !== undefined) return iv.exitTo !== "Ready";
+    return !opts?.openBlockedIsDependency;
+  });
   return [...inReview, ...blocked];
 }
 
