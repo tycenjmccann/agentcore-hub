@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { loadWorkflowDefs } from "@/lib/workflow/defs-loader";
-import { humanWaitMs } from "@/lib/metrics/gate-dwell";
+import { humanWaitIntervals, unionMs, type Interval } from "@/lib/metrics/gate-dwell";
 import { summarizeThroughput, type ThroughputRow } from "@/lib/metrics/throughput";
 
 export const dynamic = "force-dynamic";
@@ -285,34 +285,46 @@ async function getMetricsFromJira(timeframe: Timeframe): Promise<MetricsResult> 
   }
 
   // ── Human-review dwell per workflow (In Review + Blocked; see gate-dwell.ts) ──
+  // Kept as raw intervals: a workflow can have several gate tickets parked at
+  // once (round-N queued while round N-1 is still open) — that overlap is one
+  // human wait, not two, so per-workflow dwell is a UNION, clipped below to
+  // the workflow's own start→completion window.
   const nowMs = Date.now();
-  const humanMsByWf = new Map<string, number>();
+  const intervalsByWf = new Map<string, Interval[]>();
   for (const issue of gateIssues) {
     const wfId = wfIdFromLabels((issue.fields?.labels as string[]) || []);
     if (!wfId) continue;
-    humanMsByWf.set(wfId, (humanMsByWf.get(wfId) || 0) + humanWaitMs(issue.changelog, nowMs));
+    const list = intervalsByWf.get(wfId) || [];
+    list.push(...humanWaitIntervals(issue.changelog, nowMs));
+    intervalsByWf.set(wfId, list);
   }
 
   // ── Throughput per type: completed workflows in window ──
-  let completedCount = 0;
   let humanTouched = 0;
   const durations = [];
   for (const wf of wfMap.workflows) {
     if (!wf.completedAt || !wf.startedAt) continue;
     if (new Date(wf.completedAt) < cutoff) continue;
-    const e2eMs = new Date(wf.completedAt).getTime() - new Date(wf.startedAt).getTime();
+    const startMs = new Date(wf.startedAt).getTime();
+    const endMs = new Date(wf.completedAt).getTime();
+    const e2eMs = endMs - startMs;
     if (e2eMs <= 0) continue;
-    completedCount++;
-    // Live source: gate-ticket dwell mined from changelogs.
+    // Live source: gate-ticket dwell, clipped to the workflow window (a gate
+    // left open past completion must not keep accruing against this run).
     // Fallback: a humanReviewMs override stored on the workflow row (backfill/seed).
-    const humanMs = Math.min(Math.max(humanMsByWf.get(wf.workflowId) || 0, wf.humanReviewMs || 0), e2eMs);
+    const gateMs = unionMs(
+      (intervalsByWf.get(wf.workflowId) || [])
+        .map((iv) => ({ start: Math.max(iv.start, startMs), end: Math.min(iv.end, endMs) }))
+        .filter((iv) => iv.end > iv.start)
+    );
+    const humanMs = Math.min(Math.max(gateMs, wf.humanReviewMs || 0), e2eMs);
     if (humanMs > 60000) humanTouched++;
     durations.push({ type: wf.type, e2eMs, humanMs });
   }
   const throughputByType = summarizeThroughput(durations);
 
-  const automationRate = completedCount > 0
-    ? Math.round(((completedCount - humanTouched) / completedCount) * 100)
+  const automationRate = durations.length > 0
+    ? Math.round(((durations.length - humanTouched) / durations.length) * 100)
     : null;
 
   // ── Activity feed ──
@@ -456,13 +468,11 @@ async function getMetricsFromDDB(timeframe: Timeframe): Promise<MetricsResult> {
 
   // No changelog in DDB mode → human dwell unknown beyond a stored override.
   const durations = [];
-  let completedCount = 0;
   for (const wf of wfMap.workflows) {
     if (!wf.completedAt || !wf.startedAt) continue;
     if (new Date(wf.completedAt) < cutoff) continue;
     const e2eMs = new Date(wf.completedAt).getTime() - new Date(wf.startedAt).getTime();
     if (e2eMs <= 0) continue;
-    completedCount++;
     durations.push({ type: wf.type, e2eMs, humanMs: wf.humanReviewMs || 0 });
   }
   const throughputByType = summarizeThroughput(durations);
@@ -498,8 +508,8 @@ async function getMetricsFromDDB(timeframe: Timeframe): Promise<MetricsResult> {
     ticketsInProgress: inProgress.length,
     inFlightWorkflows: new Set(inProgress.map((t) => t.workflowId).filter(Boolean)).size,
     avgResolutionTime,
-    automationRate: completedCount > 0
-      ? Math.round(((completedCount - durations.filter((d) => d.humanMs > 60000).length) / completedCount) * 100)
+    automationRate: durations.length > 0
+      ? Math.round(((durations.length - durations.filter((d) => d.humanMs > 60000).length) / durations.length) * 100)
       : null,
     throughput: Math.round((resolvedCount / getTimeframeDivisor(timeframe)) * 10) / 10,
     timeframe,

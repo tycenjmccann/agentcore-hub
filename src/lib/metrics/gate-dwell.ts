@@ -41,32 +41,74 @@ export function extractStatusTransitions(changelog: JiraChangelog | undefined): 
   return transitions;
 }
 
+export interface Interval {
+  start: number;
+  end: number;
+}
+
 /**
- * Total ms the ticket spent in any of `statuses`. Consecutive counted statuses
- * (e.g. Blocked → In Review) accrue as one continuous interval. An interval
- * still open at `nowMs` counts up to `nowMs`.
+ * Intervals the ticket spent in any of `statuses`. Consecutive counted
+ * statuses (e.g. Blocked → In Review) accrue as one continuous interval. An
+ * interval still open at `nowMs` runs to `nowMs`.
  */
-export function dwellMs(
+export function dwellIntervals(
   transitions: StatusTransition[],
   statuses: ReadonlySet<string>,
   nowMs: number
-): number {
-  let total = 0;
+): Interval[] {
+  const intervals: Interval[] = [];
   let enteredAt: number | null = null;
   for (const t of transitions) {
     const entering = t.to !== undefined && statuses.has(t.to);
     if (entering && enteredAt === null) {
       enteredAt = t.at;
     } else if (!entering && enteredAt !== null) {
-      total += t.at - enteredAt;
+      if (t.at > enteredAt) intervals.push({ start: enteredAt, end: t.at });
       enteredAt = null;
     }
   }
-  if (enteredAt !== null) total += Math.max(0, nowMs - enteredAt);
+  if (enteredAt !== null && nowMs > enteredAt) intervals.push({ start: enteredAt, end: nowMs });
+  return intervals;
+}
+
+/** Total ms the ticket spent in any of `statuses`. */
+export function dwellMs(
+  transitions: StatusTransition[],
+  statuses: ReadonlySet<string>,
+  nowMs: number
+): number {
+  return dwellIntervals(transitions, statuses, nowMs).reduce((s, i) => s + (i.end - i.start), 0);
+}
+
+/**
+ * Total ms covered by the union of intervals. A workflow can have several gate
+ * tickets open at once (round-N approval queued in Blocked while round N-1 is
+ * In Review) — summing per-ticket dwell double-counts those overlaps.
+ */
+export function unionMs(intervals: Interval[]): number {
+  const sorted = [...intervals].sort((a, b) => a.start - b.start);
+  let total = 0;
+  let curStart = -Infinity;
+  let curEnd = -Infinity;
+  for (const iv of sorted) {
+    if (iv.start > curEnd) {
+      if (curEnd > curStart) total += curEnd - curStart;
+      curStart = iv.start;
+      curEnd = iv.end;
+    } else if (iv.end > curEnd) {
+      curEnd = iv.end;
+    }
+  }
+  if (curEnd > curStart) total += curEnd - curStart;
   return total;
 }
 
-/** Convenience: waiting-on-human ms for a gate ticket's changelog. */
+/** Waiting-on-human intervals for a gate ticket's changelog. */
+export function humanWaitIntervals(changelog: JiraChangelog | undefined, nowMs = Date.now()): Interval[] {
+  return dwellIntervals(extractStatusTransitions(changelog), HUMAN_WAIT_STATUSES, nowMs);
+}
+
+/** Convenience: waiting-on-human ms for a single gate ticket's changelog. */
 export function humanWaitMs(changelog: JiraChangelog | undefined, nowMs = Date.now()): number {
   return dwellMs(extractStatusTransitions(changelog), HUMAN_WAIT_STATUSES, nowMs);
 }

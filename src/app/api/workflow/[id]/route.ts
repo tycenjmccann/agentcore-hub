@@ -102,7 +102,10 @@ export async function DELETE(
     }
 
     // 5. Tombstone the workflow row — keep just what metrics/type-resolution
-    //    need; drop messages, agentTasks, and other heavy state.
+    //    need; drop messages, agentTasks, and other heavy state. epicId is
+    //    deliberately dropped: the epicId-index GSI is sparse, so omitting it
+    //    keeps tombstones out of epic→workflow lookups (bug re-filing
+    //    idempotency, orchestrator findWorkflowByEpic).
     await ddb.send(
       new PutCommand({
         TableName: WORKFLOWS_TABLE,
@@ -112,7 +115,6 @@ export async function DELETE(
           deleted: true,
           deletedAt: new Date().toISOString(),
           phase: workflow.phase,
-          epicId: workflow.epicId,
           workflowDefId: workflow.workflowDefId,
           startedAt: workflow.startedAt,
           completedAt: workflow.completedAt,

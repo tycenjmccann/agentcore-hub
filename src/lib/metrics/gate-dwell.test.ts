@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { extractStatusTransitions, dwellMs, humanWaitMs, HUMAN_WAIT_STATUSES } from "./gate-dwell";
+import {
+  extractStatusTransitions,
+  dwellMs,
+  dwellIntervals,
+  unionMs,
+  humanWaitMs,
+  HUMAN_WAIT_STATUSES,
+} from "./gate-dwell";
 
 const T0 = Date.parse("2026-08-29T00:00:00Z");
 const min = (n: number) => n * 60000;
@@ -99,5 +106,43 @@ describe("humanWaitMs", () => {
       [15, "Blocked", "Done"],
     ]);
     expect(humanWaitMs(log, T0 + min(60))).toBe(min(15));
+  });
+});
+
+describe("dwellIntervals", () => {
+  it("returns the underlying intervals", () => {
+    const log = changelog([
+      [0, "To Do", "In Review"],
+      [10, "In Review", "In Progress"],
+      [40, "In Progress", "Blocked"],
+    ]);
+    expect(dwellIntervals(extractStatusTransitions(log), HUMAN_WAIT_STATUSES, T0 + min(60))).toEqual([
+      { start: T0, end: T0 + min(10) },
+      { start: T0 + min(40), end: T0 + min(60) },
+    ]);
+  });
+});
+
+describe("unionMs", () => {
+  it("merges overlapping gate intervals — two open gates count once", () => {
+    expect(unionMs([
+      { start: 0, end: min(60) },
+      { start: min(30), end: min(90) },
+    ])).toBe(min(90));
+  });
+
+  it("sums disjoint intervals", () => {
+    expect(unionMs([
+      { start: 0, end: min(10) },
+      { start: min(20), end: min(30) },
+    ])).toBe(min(20));
+  });
+
+  it("handles containment and empty input", () => {
+    expect(unionMs([])).toBe(0);
+    expect(unionMs([
+      { start: 0, end: min(100) },
+      { start: min(10), end: min(20) },
+    ])).toBe(min(100));
   });
 });
