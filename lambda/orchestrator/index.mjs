@@ -187,7 +187,42 @@ export const handler = async (event) => {
   await loadAgentRoster();
   await loadWorkflowDefs();
 
-  // Direct invocation from Jira webhook (TICKET_PROVIDER=jira ONLY)
+  // SQS FIFO command queue (R1 — docs/race-condition-study.md). One message
+  // group per workflow root, so commands for a run arrive strictly in order
+  // and never concurrently. Partial-batch failure reporting keeps a failed
+  // command (and everything behind it in its group) on the queue for retry.
+  if (event.Records?.[0]?.eventSource === "aws:sqs") {
+    const batchItemFailures = [];
+    for (let i = 0; i < event.Records.length; i++) {
+      const record = event.Records[i];
+      try {
+        const cmd = JSON.parse(record.body);
+        if (cmd.source === "jira-webhook") {
+          if (TICKET_PROVIDER !== "jira") {
+            console.log(`[orchestrator] Ignoring queued Jira command — TICKET_PROVIDER=${TICKET_PROVIDER}`);
+            continue;
+          }
+          console.log(`[orchestrator] Command: ${cmd.ticketId} → ${cmd.newStatus} (group ${record.attributes?.MessageGroupId})`);
+          await processStatusChange(cmd.ticketId, cmd.newStatus, cmd.oldStatus);
+        } else {
+          console.warn(`[orchestrator] Unknown command source "${cmd.source}" — dropping`);
+        }
+      } catch (err) {
+        // FIFO: stop at the first failure and fail everything behind it too —
+        // processing a later command past a failed one would break the very
+        // per-group ordering this queue exists to provide.
+        console.error(`[orchestrator] Command failed (will retry):`, err);
+        for (let j = i; j < event.Records.length; j++) {
+          batchItemFailures.push({ itemIdentifier: event.Records[j].messageId });
+        }
+        break;
+      }
+    }
+    return { batchItemFailures };
+  }
+
+  // Direct invocation from Jira webhook (legacy path — installs without the
+  // command queue; see WORKFLOW_COMMAND_QUEUE_URL on the app)
   if (event.source === "jira-webhook") {
     if (TICKET_PROVIDER !== "jira") {
       console.log(`[orchestrator] Ignoring Jira webhook — TICKET_PROVIDER=${TICKET_PROVIDER}, using DDB stream`);
