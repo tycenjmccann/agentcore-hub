@@ -420,13 +420,20 @@ async function invokeRuntimeAgent(runtimeArn, sessionId, prompt, workflowId, age
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 async function findTicketForAgent(workflowId, agentId) {
-  // Look up workflow to find the ticket ID
+  // agentTasks is keyed by TICKET id. Prefer this agent's ACTIVE entry —
+  // under fix-ticket fan-out one agent holds several entries and "any entry"
+  // cross-wires the wrong ticket.
   const wf = await ddb.send(new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId } }));
-  const task = wf.Item?.agentTasks?.[agentId];
-  if (task?.ticketId) return task.ticketId;
+  const candidates = Object.values(wf.Item?.agentTasks || {})
+    .filter((t) => t.agentId === agentId && t.ticketId)
+    .sort((a, b) => {
+      const active = (t) => (t.status === "running" || t.status === "in_progress" ? 0 : 1);
+      if (active(a) !== active(b)) return active(a) - active(b);
+      return String(b.startedAt || "").localeCompare(String(a.startedAt || ""));
+    });
+  if (candidates[0]?.ticketId) return candidates[0].ticketId;
 
-  // Fallback: scan tickets table for this agent's assigned ticket (race condition workaround)
-  // The orchestrator may have written the ticketId but a concurrent updateWorkflowTask overwrote it
+  // Fallback: scan tickets table for this agent's assigned in-progress ticket.
   const epicId = wf.Item?.epicId;
   if (epicId) {
     const result = await ddb.send(new QueryCommand({

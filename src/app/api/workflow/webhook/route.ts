@@ -66,7 +66,7 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
         }));
 
         if (body.branch || body.commit_sha || body.pr_url) {
-          await updateWorkflowTaskMetadata(workflowId, agentId, {
+          await updateWorkflowTaskMetadata(workflowId, ticketId, {
             branch: body.branch as string,
             commitSha: body.commit_sha as string,
             prUrl: body.pr_url as string,
@@ -153,9 +153,22 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
 
 // ─── Shared Helpers ──────────────────────────────────────────────────────────────
 
+/**
+ * agentTasks is keyed by TICKET id (the orchestrator's claim key). Resolve the
+ * agent's ACTIVE ticket — with fix-ticket fan-out one agent can hold several
+ * entries, and "any entry for this agent" picks the wrong one.
+ */
 async function findTicketForAgent(workflowId: string, agentId: string): Promise<string | null> {
   const wf = await getWorkflowFromDynamo(workflowId);
-  return wf?.agentTasks?.[agentId]?.ticketId || null;
+  const tasks: Record<string, Record<string, unknown>> = wf?.agentTasks || {};
+  const candidates = Object.values(tasks)
+    .filter((t) => t.agentId === agentId && t.ticketId)
+    .sort((a, b) => {
+      const active = (t: Record<string, unknown>) => (t.status === "running" || t.status === "in_progress" ? 0 : 1);
+      if (active(a) !== active(b)) return active(a) - active(b);
+      return String(b.startedAt || "").localeCompare(String(a.startedAt || ""));
+    });
+  return (candidates[0]?.ticketId as string) || null;
 }
 
 async function getWorkflowFromDynamo(workflowId: string) {
@@ -163,19 +176,42 @@ async function getWorkflowFromDynamo(workflowId: string) {
   return result.Item || null;
 }
 
-async function updateWorkflowTaskMetadata(workflowId: string, agentId: string, metadata: Record<string, unknown>) {
-  const wf = await getWorkflowFromDynamo(workflowId);
-  if (!wf) return;
-  const tasks = wf.agentTasks || {};
-  tasks[agentId] = { ...tasks[agentId], ...metadata, status: "complete", completedAt: new Date().toISOString() };
-
-  await ddb.send(new UpdateCommand({
-    TableName: WORKFLOWS_TABLE,
-    Key: { workflowId },
-    UpdateExpression: "SET #at = :at, #u = :u",
-    ExpressionAttributeNames: { "#at": "agentTasks", "#u": "updatedAt" },
-    ExpressionAttributeValues: { ":at": tasks, ":u": new Date().toISOString() },
-  }));
+/**
+ * Scoped per-field merge into agentTasks[ticketId]. The previous version
+ * rewrote the ENTIRE agentTasks map from a read snapshot (keyed by agentId,
+ * doubly wrong) — resurrecting pre-claim state over concurrent sibling
+ * invocation claims (study P1).
+ */
+async function updateWorkflowTaskMetadata(workflowId: string, ticketId: string, metadata: Record<string, unknown>) {
+  const names: Record<string, string> = { "#tid": ticketId, "#u": "updatedAt" };
+  const values: Record<string, unknown> = { ":u": new Date().toISOString() };
+  const sets = ["#u = :u"];
+  let i = 0;
+  for (const [k, v] of Object.entries({
+    ...metadata,
+    status: "complete",
+    completedAt: new Date().toISOString(),
+  })) {
+    if (v === undefined || v === null) continue;
+    i++;
+    names[`#f${i}`] = k;
+    values[`:v${i}`] = v;
+    sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
+  }
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+      UpdateExpression: `SET ${sets.join(", ")}`,
+      ConditionExpression: "attribute_exists(agentTasks.#tid)",
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+    }));
+  } catch (err) {
+    // Entry not tracked yet — drop the metadata rather than materializing a
+    // partial entry the orchestrator's claim path doesn't own.
+    console.warn(`[webhook:lambda] task metadata skipped for ${ticketId}: ${(err as Error).message}`);
+  }
 }
 
 async function nextTicketId(): Promise<string> {
