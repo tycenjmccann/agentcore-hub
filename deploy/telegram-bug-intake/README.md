@@ -16,7 +16,7 @@ history. It was retrieved verbatim from the deployed code
 
 | | |
 |---|---|
-| Function | `telegram-bug-intake` (account `838829463875`, `us-east-1`) |
+| Function | `telegram-bug-intake` (account `<ACCOUNT_ID>`, `us-east-1`) |
 | Runtime | `nodejs20.x`, ESM, handler `index.handler` |
 | Deployed code LastModified | 2026-08-27 |
 | `sha256(index.mjs)` as deployed | `5eb0bb40a824f57f0b86dfdef99dfeb26a9cabbc35b0bf95066cc74fbe762f81` |
@@ -31,6 +31,12 @@ Changes on top of the imported baseline:
   ~200 ms chunks and terminates the stream with an empty `AudioEvent`. The
   deployed function still has the old full-file blast until this ships, so
   **the running Lambda is behind this file by that fix.**
+- **TEAM-3493** — ship-review P1 fixes: voice transcription is budgeted against
+  the remaining Lambda clock (deferred to the next invocation, or rejected if it
+  could never fit, instead of dying mid-transcription and replaying forever);
+  `ALLOWED_CHAT_IDS` fails closed when empty; review-gate callbacks require an
+  allowlisted chat; a gate's 30-day notification claim is released when zero
+  pings were delivered.
 
 ## Architecture
 
@@ -59,7 +65,11 @@ Required: `TELEGRAM_BOT_TOKEN`, `JIRA_SITE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`,
 `JIRA_PROJECT_KEY`, `GITHUB_TOKEN`, `GITHUB_USER`, `PENDING_TABLE`,
 `HUB_API_URL`.
 
-Optional: `ALLOWED_CHAT_IDS`, `BEDROCK_MODEL_ID`, `CONFIDENCE_THRESHOLD`,
+`ALLOWED_CHAT_IDS` is fail-closed: if it is unset or empty, NO chat is
+authorized (messages and review-gate buttons are both rejected), so it must be
+populated for the bot to do anything.
+
+Optional: `BEDROCK_MODEL_ID`, `CONFIDENCE_THRESHOLD`,
 `TRANSCRIBE_LANGUAGE`, `CHAT_SETTLE_MS`, `CHAT_BUFFER_MAX_MS`,
 `WM_MIN_BUDGET_MS`, `WM_RELAY_TIMEOUT_MS`.
 

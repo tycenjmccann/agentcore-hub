@@ -84,6 +84,9 @@ const FLUSH_MIN_MS = 60_000;
 
 // Stop long-polling when this much runtime remains for in-flight processing.
 const POLL_RESERVE_MS = 30_000;
+// Paced transcription (TEAM-3464) costs ~the note's own duration in wall clock;
+// this margin covers Transcribe connect/latency overhead on top of that.
+const TRANSCRIBE_OVERHEAD_MS = 30_000;
 // A chat's buffered messages are processed only after this much silence from
 // that chat. Telegram splits albums AND long pastes into separate messages;
 // one burst must become one ticket.
@@ -102,7 +105,18 @@ const transcribe = new TranscribeStreamingClient({});
 
 // ─── Entry: poll loop ────────────────────────────────────────────────────────
 
+// Sentinel: routeMessage had no runtime budget left for this update. The poll
+// loop must stop BEFORE it — offset not advanced past it — so Telegram
+// redelivers into the next invocation, which starts with a fresh clock.
+const DEFER_UPDATE = Symbol("defer-update");
+
+// Remaining time observed at handler entry ≈ the configured function timeout.
+// Used to tell "no budget left THIS invocation" (defer) apart from "would not
+// fit in ANY invocation" (reject), so a defer can never loop forever.
+let invocationBudgetMs = 15 * 60_000;
+
 export const handler = async (event, context) => {
+  invocationBudgetMs = context.getRemainingTimeInMillis();
   let offset = await loadOffset();
   const buffers = await loadBuffers(); // chatId -> { chatId, parts, firstAt, lastAt }
 
@@ -139,18 +153,25 @@ export const handler = async (event, context) => {
       throw err;
     }
 
+    let deferred = false;
     for (const u of updates) {
-      offset = Math.max(offset, u.update_id);
       try {
         if (u.callback_query) await handleCallback(u.callback_query);
-        else if (u.message) await routeMessage(u.message, buffers, context);
+        else if (u.message) {
+          if ((await routeMessage(u.message, buffers, context)) === DEFER_UPDATE) {
+            deferred = true;
+            break; // offset stays BEFORE this update → next invocation retries it
+          }
+        }
       } catch (err) {
         console.error("[telegram-bug-intake]", err);
         const chatId = u.message?.chat?.id || u.callback_query?.message?.chat?.id;
         if (chatId) await tgSend(chatId, `⚠️ Failed to process: ${err.message}`).catch(() => {});
       }
+      offset = Math.max(offset, u.update_id);
     }
     if (updates.length) await saveOffset(offset);
+    if (deferred) break;
   }
 
   // Unsettled buffers survive in DDB; the next invocation (≤1 min away)
@@ -167,7 +188,8 @@ export const handler = async (event, context) => {
 async function routeMessage(msg, buffers, context) {
   const chatId = msg.chat.id;
 
-  if (ALLOWED_CHAT_IDS.length && !ALLOWED_CHAT_IDS.includes(String(chatId))) {
+  // Fail closed: an empty/unset allowlist authorizes NOBODY, not everybody.
+  if (!ALLOWED_CHAT_IDS.includes(String(chatId))) {
     await tgSend(chatId, `Not authorized. Your chat id is \`${chatId}\` — add it to ALLOWED_CHAT_IDS.`);
     return;
   }
@@ -179,9 +201,25 @@ async function routeMessage(msg, buffers, context) {
   // Native voice note → transcribe, echo what was heard, then treat the
   // transcript exactly like typed text (classification, buffering, wm relay).
   if (msg.voice) {
-    if ((msg.voice.duration || 0) > 600) {
+    const durationSec = msg.voice.duration || 0;
+    if (durationSec > 600) {
       await tgSend(chatId, "🎙️ That voice note is over 10 minutes — send a shorter one.");
       return;
+    }
+    // Paced streaming (TEAM-3464) means transcription takes ~the note's own
+    // duration in wall clock. Budget it against the Lambda clock BEFORE
+    // starting, or the invocation dies mid-transcription, the offset is never
+    // saved, and Telegram redelivers the note forever (duplicate Transcribe
+    // cost each round).
+    const transcribeEstMs = durationSec * 1000 + TRANSCRIBE_OVERHEAD_MS;
+    if (transcribeEstMs > invocationBudgetMs - POLL_RESERVE_MS) {
+      // Would not fit even in a fresh invocation — reject, offset advances.
+      await tgSend(chatId, "🎙️ That voice note is too long to transcribe in one run — send a shorter one.");
+      return;
+    }
+    if (transcribeEstMs > context.getRemainingTimeInMillis() - POLL_RESERVE_MS) {
+      // Fits in a fresh invocation, just not in what's left of this one.
+      return DEFER_UPDATE;
     }
     await tgAction(chatId, "typing");
     const transcript = await transcribeVoice(msg.voice.file_id, msg.voice.duration || 0);
@@ -418,6 +456,7 @@ async function scanReviewGates() {
     chats = chats || (await listChats());
     if (!chats.length) {
       console.warn("[telegram-bug-intake] gate ticket but no registered chats to notify");
+      await releaseGate(notif.ticketId); // nobody was pinged — let a later scan retry
       continue;
     }
 
@@ -472,10 +511,14 @@ async function scanReviewGates() {
       }
     } catch { /* buttons are a bonus, never block the ping */ }
 
+    let delivered = 0;
     for (const chatId of chats) {
-      try { await tgSend(chatId, text, { reply_markup: keyboard }); }
+      try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
       catch (err) { console.error(`[telegram-bug-intake] gate ping to ${chatId}`, err.message); }
     }
+    // The claim was written before delivery was proven; if every send failed,
+    // keeping it would silently skip this gate for 30 days.
+    if (!delivered) await releaseGate(notif.ticketId);
   }
 }
 
@@ -497,7 +540,23 @@ async function claimGate(ticketId) {
   }
 }
 
+/** Drop a gate's notification claim so a later scan can retry the ping. */
+async function releaseGate(ticketId) {
+  await ddb.send(new DeleteItemCommand({
+    TableName: PENDING_TABLE,
+    Key: { id: { S: `${GATE_KEY_PREFIX}${ticketId}` } },
+  }));
+}
+
 async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
+  // Gate pings go to every registered chat, but only allowlisted chats may
+  // transition tickets. Ack the tap (or Telegram re-sends the callback query)
+  // without acting on it.
+  if (!ALLOWED_CHAT_IDS.includes(String(chatId))) {
+    console.warn(`[telegram-bug-intake] unauthorized gate callback from chat ${chatId} for ${ticketId}`);
+    await tgAnswer(cb.id, "Not authorized to review gates.");
+    return;
+  }
   if (action === "gok") {
     await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
     await tgAnswer(cb.id, `Approved ${ticketId}`);
