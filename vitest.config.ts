@@ -20,7 +20,13 @@ export default defineConfig({
     // lambda/**: the eval-packager's classifiers are pure ESM with zero AWS
     // imports precisely so they can be unit-tested here rather than in a
     // per-Lambda jest setup.
-    include: ["src/**/*.test.ts", "lambda/eval-packager/**/*.test.mjs"],
+    // deploy/telegram-bug-intake/**: the intake Lambda's AWS imports are mocked
+    // at the module seam, so its voice/Transcribe contract is testable here too.
+    include: [
+      "src/**/*.test.ts",
+      "lambda/eval-packager/**/*.test.mjs",
+      "deploy/telegram-bug-intake/**/*.test.mjs",
+    ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
   },
