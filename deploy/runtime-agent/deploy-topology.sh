@@ -52,6 +52,18 @@ aws s3 sync "$PROMPTS_DIR" "s3://${ARTIFACT_BUCKET}/prompts/" \
   --exclude "*" --include "*.txt" \
   --only-show-errors
 
+# Process blueprints (loaded hot at invoke time via load_blueprint) live in the
+# repo-root blueprints/ dir. Sync them here too so a topology deploy keeps S3
+# authoritative even when run-module.sh's sync path isn't taken.
+BLUEPRINTS_DIR="$REPO_ROOT/blueprints"
+if [[ -d "$BLUEPRINTS_DIR" ]]; then
+  echo "→ Syncing blueprints to s3://${ARTIFACT_BUCKET}/blueprints/"
+  aws s3 cp "$BLUEPRINTS_DIR" "s3://${ARTIFACT_BUCKET}/blueprints/" \
+    --recursive --exclude "*" --include "*.md" \
+    --region "$AWS_REGION" \
+    --only-show-errors
+fi
+
 if [[ "$COUNT" == "14" ]]; then
   # deploy-fleet.sh refreshes the local agents.json (via refresh-agents-json.sh)
   # but does not upload it to S3. We do that ourselves so the orchestrator/Jira

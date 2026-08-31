@@ -147,11 +147,19 @@ async function watchScan() {
   do {
     const page = await ddb.send(new ScanCommand({
       TableName: WORKFLOWS_TABLE,
-      ProjectionExpression: "workflowId, phase, archived, managerWatch, wmLastWatchAt, startedAt, workflowDefId",
+      ProjectionExpression: "workflowId, phase, archived, managerWatch, wmMuteUntil, wmLastWatchAt, startedAt, workflowDefId",
       ExclusiveStartKey,
     }));
     active.push(...(page.Items || []).filter(
-      (w) => !TERMINAL_PHASES.has(w.phase) && !w.archived && w.managerWatch !== false
+      // managerWatch === false is the human's permanent opt-out (UI toggle / set
+      // on complete). wmMuteUntil is the WM's OWN time-boxed circuit breaker — a
+      // snooze, not a kill: once it lapses the run is reconsidered so a still-stuck
+      // run can never be silently abandoned forever (the multi-day-stall bug).
+      (w) =>
+        !TERMINAL_PHASES.has(w.phase) &&
+        !w.archived &&
+        w.managerWatch !== false &&
+        !(w.wmMuteUntil && Date.parse(w.wmMuteUntil) > now)
     ));
     ExclusiveStartKey = page.LastEvaluatedKey;
   } while (ExclusiveStartKey);
@@ -179,7 +187,12 @@ async function watchScan() {
     const prompt =
       `WATCH ${wf.workflowId} (defId=${wf.workflowDefId || "software-delivery"}, phase=${wf.phase})\n` +
       `No significant events for ${Math.round(staleAge / 60000)} minutes. ` +
-      `Diagnose and unstick if warranted.`;
+      `Diagnose and unstick if warranted. Load the watch-triage skill first. ` +
+      `A ticket sitting in_progress/running with NO live session and NO error — ` +
+      `often a re-opened-for-rework ticket whose re-dispatch was dropped — is the ` +
+      `#1 silent stall: it is invisible to the nudge scan, so YOU must find it by ` +
+      `reading the tickets, then dispatch/retry/mark-done per the deliverable test. ` +
+      `Do not conclude "nothing actionable" without checking each non-done ticket.`;
     try {
       const result = await invokeHarness(prompt, sessionId("wmwatch", wf.workflowId));
       console.log(`[analyzer] WATCH ${wf.workflowId} stopReason=${result.stopReason}`);
