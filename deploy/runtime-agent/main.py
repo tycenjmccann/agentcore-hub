@@ -1261,6 +1261,22 @@ def Tickets___add_comment(ticket_id: str, comment: str) -> str:
 
 
 @tool
+def Tickets___get_issue(ticket_id: str) -> str:
+    """Get full details of a ticket: status, description, and all comments.
+    Use this to read a gate/escalation ticket's status and parse human
+    DECISION: lines from its comments.
+
+    Args:
+        ticket_id: The ticket ID to fetch (e.g., "TEAM-42")
+    """
+    # Send both key names: the Jira backend reads `issue_key`, the DDB backend
+    # reads `issue_key || ticket_id`. Passing both keeps the tool backend-agnostic.
+    return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___get_issue", {
+        "ticket_id": ticket_id, "issue_key": ticket_id
+    })
+
+
+@tool
 def Tickets___search_issues(query: str, max_results: int = 20) -> str:
     """Search for tickets matching a query.
 
@@ -2025,6 +2041,7 @@ LAMBDA_TOOLS = [
     Tickets___update_ticket,
     Tickets___list_tickets,
     Tickets___add_comment,
+    Tickets___get_issue,
     Tickets___search_issues,
     # Workflow (Lambda-backed)
     WorkflowOutput___report_completion,

@@ -470,6 +470,17 @@ const tools = [
     },
   },
   {
+    name: "Tickets___get_issue",
+    description: "Get full details of a ticket including its status and all comments. Use to read a gate/escalation ticket's status and parse human DECISION: lines from its comments.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ticket_id: { type: "string", description: "Ticket ID (e.g., 'TEAM-42')" },
+      },
+      required: ["ticket_id"],
+    },
+  },
+  {
     name: "Tickets___list_tickets",
     description: "List tickets filtered by parent epic, assignee, workflow, or status.",
     inputSchema: {
