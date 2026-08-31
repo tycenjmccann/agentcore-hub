@@ -54,6 +54,23 @@ QUEUE_ARN=$(aws sqs get-queue-attributes --queue-url "$QUEUE_URL" \
   --query 'Attributes.QueueArn' --output text)
 echo "  ✓ $QUEUE_ARN"
 
+echo "=== Orchestrator role: SQS receive permissions ==="
+# The event source mapping below is rejected unless the orchestrator's
+# execution role can already poll the queue (Receive/Delete/GetQueueAttributes).
+LAMBDA_ROLE_NAME="${LAMBDA_ROLE_ARN##*/}"
+aws iam put-role-policy \
+  --role-name "$LAMBDA_ROLE_NAME" \
+  --policy-name "WorkflowCommandQueueConsume" \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Effect\": \"Allow\",
+      \"Action\": [\"sqs:ReceiveMessage\", \"sqs:DeleteMessage\", \"sqs:GetQueueAttributes\"],
+      \"Resource\": \"${QUEUE_ARN}\"
+    }]
+  }"
+echo "  ✓ WorkflowCommandQueueConsume on $LAMBDA_ROLE_NAME"
+
 echo "=== Event source mapping → $ORCHESTRATOR_FN ==="
 EXISTING=$(aws lambda list-event-source-mappings \
   --function-name "$ORCHESTRATOR_FN" \
@@ -65,21 +82,31 @@ if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
 else
   # BatchSize 10 + ReportBatchItemFailures: the handler fails the remainder of
   # a batch after the first error, preserving per-group ordering on retry.
-  aws lambda create-event-source-mapping \
-    --function-name "$ORCHESTRATOR_FN" \
-    --event-source-arn "$QUEUE_ARN" \
-    --batch-size 10 \
-    --function-response-types ReportBatchItemFailures \
-    --region "$AWS_REGION" \
-    --query 'UUID' --output text
-  echo "  ✓ mapping created"
+  # Retry loop: freshly attached IAM policies take a few seconds to propagate,
+  # and create-event-source-mapping validates the role's SQS access up front.
+  for attempt in 1 2 3 4 5; do
+    if aws lambda create-event-source-mapping \
+      --function-name "$ORCHESTRATOR_FN" \
+      --event-source-arn "$QUEUE_ARN" \
+      --batch-size 10 \
+      --function-response-types ReportBatchItemFailures \
+      --region "$AWS_REGION" \
+      --query 'UUID' --output text; then
+      echo "  ✓ mapping created"
+      break
+    elif [ "$attempt" = 5 ]; then
+      echo "  ✗ mapping creation failed after 5 attempts" >&2
+      exit 1
+    else
+      echo "  … role not ready yet (IAM propagation), retrying in 10s"
+      sleep 10
+    fi
+  done
 fi
 
 echo ""
 echo "Queue URL (set as WORKFLOW_COMMAND_QUEUE_URL on the app):"
 echo "  $QUEUE_URL"
 echo ""
-echo "NOTE: the orchestrator Lambda role needs sqs:ReceiveMessage/DeleteMessage/"
-echo "GetQueueAttributes on ${QUEUE_ARN}, and the app task role needs"
-echo "sqs:SendMessage. If the roles use broad policies this is already covered;"
-echo "verify with: aws lambda get-function-configuration --function-name $ORCHESTRATOR_FN"
+echo "NOTE: the app task role needs sqs:SendMessage on ${QUEUE_ARN} —"
+echo "deploy/ecs-express/deploy.sh grants it via AgentCoreHubRuntimePerms."
