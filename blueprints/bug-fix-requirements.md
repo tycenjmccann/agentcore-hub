@@ -57,7 +57,10 @@ You do NOT have code-reading tools — your job is triage and dispatch, not root
   repo is frozen at workflow creation — this run cannot be re-pointed), do NOT
   create the fix sub-task chain, and report BLOCKED. The pipeline is
   single-repo per run — a fix chain aimed at the wrong repo produces a PR that
-  cannot contain the defect.
+  cannot contain the defect. Unlike the feature flow's net-new carve-out
+  (requirements-analyst Step 2c), a bug's symptom code must already exist —
+  absence of the named code here is always evidence of a wrong repo, never of
+  net-new work.
 - If a stack trace is present, the topmost in-app frame names the file the dev should start from. Quote it in the analysis.
 
 Write your triage to: `workflows/{workflow_id}/shared/bug-analysis.md` with sections:

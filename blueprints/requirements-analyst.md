@@ -84,24 +84,42 @@ failure has occurred. Verify BEFORE writing tickets:
 
 1. Take the scoped repo from your `## Repository` context (owner/repo/default
    branch).
-2. Prove the subsystem named by the request exists THERE: `search_code` /
-   `get_file_contents` against that repo for the components, routes, files, or
-   error-message strings the request names. Keep the concrete file paths you
-   found.
+2. Verify the work belongs to the scoped repo, branching on the scope
+   classification from Step 2 — a NET NEW component has no code anywhere yet,
+   so demanding proof of its existence would force a false MISMATCH:
+   - **MODIFY EXISTING** — prove the subsystem named by the request exists
+     THERE: `search_code` / `get_file_contents` against that repo for the
+     components, routes, files, or error-message strings the request names.
+     Keep the concrete file paths you found.
+   - **NET NEW** — the requested component cannot exist yet, so require
+     evidence that CAN exist pre-implementation: that the scoped repo is the
+     owning project for this kind of component. `search_code` /
+     `get_file_contents` for the integration points the new code will attach
+     to (adjacent/analogous subsystems, routes, config, lambda dirs, deploy
+     targets) and repo metadata / README / DEPLOY.md showing the deployment
+     target matches — keep those file paths. Absence of the requested new
+     component alone MUST NOT produce a MISMATCH.
 3. Write a **Repo-Scope Verification** section into the requirements doc —
    REQUIRED, the doc is invalid without it:
    - Scoped repo: `{owner}/{repo}` (from repoConfig — the run's single target)
-   - Evidence: the file paths (with one-line relevance notes) proving the
-     affected code lives in this repo
+   - Evidence: for MODIFY EXISTING, the file paths (with one-line relevance
+     notes) proving the affected code lives in this repo; for NET NEW, the
+     integration-point / ownership file paths (with notes) proving this repo
+     is where the new component belongs (mark it "NET NEW — verified via
+     integration points")
    - Verdict: CONFIRMED | MISMATCH
    - Note verbatim: "This pipeline targets a single repository (repos[0]);
      work spanning other repos needs a separate run scoped to each."
-4. **On MISMATCH — do not scope tickets against the wrong repo.** If your
-   evidence shows the subsystem lives elsewhere, name the repo you believe is
-   correct (with the evidence), add a ⚠ REPO-SCOPE MISMATCH comment on the
-   epic, and report BLOCKED via `report_completion` stating exactly what must
-   change (re-run the workflow scoped to the correct repo). A run scoped to
-   the wrong repo is worse than a blocked run.
+4. **On MISMATCH — do not scope tickets against the wrong repo.** MISMATCH
+   requires POSITIVE evidence the work belongs elsewhere: for MODIFY EXISTING,
+   the named subsystem lives in another repo; for NET NEW, the named
+   integration points / owning project demonstrably live in a different repo
+   (never the mere absence of the new component). If your evidence shows the
+   work belongs elsewhere, name the repo you believe is correct (with the
+   evidence), add a ⚠ REPO-SCOPE MISMATCH comment on the epic, and report
+   BLOCKED via `report_completion` stating exactly what must change (re-run
+   the workflow scoped to the correct repo). A run scoped to the wrong repo is
+   worse than a blocked run.
 
 ### Step 3: Delegate to Claude Code
 Call `claude_code` to produce the requirements document and agent selection:
