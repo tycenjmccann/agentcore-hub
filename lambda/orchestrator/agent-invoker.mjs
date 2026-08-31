@@ -44,12 +44,14 @@ export const handler = async (event) => {
     } else {
       // Legacy harness agents still use synchronous invocation (to be migrated)
       const output = await invokeHarnessAgent(harnessArn, sessionId, prompt, workflowId, agentId, modelOverride);
-      // For legacy agents that don't call report_completion, write done ourselves
-      const ticketId = await findTicketForAgent(workflowId, agentId);
-      if (ticketId) {
+      // For legacy agents that don't call report_completion, write done ourselves.
+      // The invocation event carries the exact ticket — the lookup is only a
+      // fallback for old callers that didn't pass it.
+      const doneTicketId = ticketId || await findTicketForAgent(workflowId, agentId);
+      if (doneTicketId) {
         await ddb.send(new UpdateCommand({
           TableName: TICKETS_TABLE,
-          Key: { ticketId },
+          Key: { ticketId: doneTicketId },
           UpdateExpression: "SET #s = :s, #u = :u",
           ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
           ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
@@ -65,11 +67,11 @@ export const handler = async (event) => {
 
     // Only mark blocked if the Runtime REJECTED the request (connection refused, 4xx, etc.)
     // If the agent was accepted but crashes later, nudge handles it.
-    const ticketId = await findTicketForAgent(workflowId, agentId);
-    if (ticketId) {
+    const failedTicketId = ticketId || await findTicketForAgent(workflowId, agentId);
+    if (failedTicketId) {
       await ddb.send(new UpdateCommand({
         TableName: TICKETS_TABLE,
-        Key: { ticketId },
+        Key: { ticketId: failedTicketId },
         UpdateExpression: "SET #s = :s, #u = :u, #e = :e",
         ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt", "#e": "error" },
         ExpressionAttributeValues: { ":s": "blocked", ":u": new Date().toISOString(), ":e": error },
