@@ -92,9 +92,9 @@ Every Ship invocation begins and ends with the round ledger,
 `workflows/{workflow_id}/shared/ship-review-state.json` (`S3Storage___read_object`;
 missing = empty state, round 1):
 
-0. **Escalation pending?** If the ledger has an `escalation` with `decision: null`,
-   a human gate is open or just resolved — go to "After the escalation gate"
-   below instead of reviewing.
+0. **Escalation pending?** If the ledger's `escalations` array has an entry
+   with `decision: null`, a human gate is open or just resolved — go to "After
+   the escalation gate" below instead of reviewing.
 1. **Record this round** into the ledger: round number = max prior round + 1
    (SAME number if the PR head SHA equals the latest recorded round's SHA — you
    are re-running that round; overwrite its entry, never append a duplicate),
@@ -133,12 +133,20 @@ missing = empty state, round 1):
         (`S3Storage___write_object`, content_type text/markdown): every round,
         all findings grouped by component, each REGRESSION-OF-FIX with the
         prior-round fix it reverted, and the full fix-ticket lineage.
-     b. Idempotency check BEFORE creating anything: if the ledger already
-        records an escalation gate, or `Tickets___list_tickets` on your parent
-        shows a non-done ticket titled "Escalation: ship-review not
-        converging…", adopt it — never create a second gate.
+     b. Compute this cycle's escalation sequence: `escalationSeq` = 1 + the
+        number of prior escalation entries in the ledger's `escalations`
+        array (escalations are append-only history — resolved ones keep their
+        entries). Then the idempotency check BEFORE creating anything: if the
+        ledger's pending escalation already records a gate, or
+        `Tickets___list_tickets` on your parent shows a non-done ticket whose
+        summary EXACTLY matches THIS cycle's summary from step c (same
+        escalationSeq and round), adopt it. A ticket with merely a similar
+        escalation title — an older cycle's gate, done or stale — is NOT
+        yours; never adopt it and never create a second gate for this cycle.
      c. `Tickets___create_ticket`: summary EXACTLY
-        `Escalation: ship-review not converging ({EPIC})`, assignee
+        `Escalation #{escalationSeq}: ship-review not converging ({EPIC}, round {pendingRound})`
+        — cycle-unique on purpose: a reused summary would collide with a prior
+        cycle's gate under Jira summary-dedupe. Assignee
         `human:engineer`, same parent as your ticket, `ticket_type "subtask"`
         if the parent is a Bug else `"task"`, `blocked_by: ""` (REQUIRED — a
         blocker would both suppress the review notification and wire the gate
@@ -146,25 +154,55 @@ missing = empty state, round 1):
         template below (digest + state links, the three DECISION options with
         exact syntax, the approve-then-unblock instructions, the "no Request
         changes" warning).
-     d. Record `{gateTicketId, pendingRound, digestKey, createdAt,
-        decision: null}` in the ledger and write it.
+     d. Append `{gateTicketId, escalationSeq, pendingRound, digestKey,
+        createdAt, decision: null}` to the ledger's `escalations` array and
+        write it.
      e. Park: transition YOUR OWN ticket to `blocked` and exit WITHOUT
-        `report_completion`. The orchestrator notifies the reviewer; the
-        human's instructions bring your ticket back to Ready.
+        `report_completion` — reporting completion would Done the Ship ticket
+        and un-park the Merge Approval gate, which only a real PASS may do.
+        The orchestrator notifies the reviewer; the human's instructions bring
+        your ticket back to Ready. Know the cost of parking this way: your
+        invocation claim stays `running` in the orchestrator's `agentTasks`,
+        so after the human moves your ticket Blocked → Ready the automatic
+        re-dispatch is refused as "already claimed" until the claim goes
+        stale — the board path clears on its own only once the claim is older
+        than 2× the lease TTL (`WORKFLOW_LEASE_TTL_MINUTES`, default 30 →
+        60 minutes). The immediate path is the workflow nudge targeted at your
+        ticket with `force: true`: you parked deliberately and your session is
+        gone, so the forced takeover cannot duplicate a live agent. Without
+        force, the nudge steals the claim once no agent activity has been seen
+        for 1× the TTL (default 30 minutes); before that it returns 409
+        LEASE_LIVE. This latency is a documented, tolerated state — the gate
+        template below tells the human exactly this.
 
 **After the escalation gate (re-invocation with a pending escalation):**
-Read the gate via `Tickets___get_issue`:
+Read the gate via `Tickets___get_issue` — the ticket whose `gateTicketId` is
+recorded in the ledger's pending escalation, and ONLY that one. The DECISION
+never comes from an older escalation gate or any other ticket with a similar
+title.
 - Gate still `in_review` → you were re-invoked early (nudge). Transition your
   ticket back to `blocked` and exit. Change nothing.
-- Gate `done` → parse the decision from its comments: the LAST line matching
-  `DECISION: continue` / `DECISION: merge-with-known-findings` /
-  `DECISION: cancel` (case-insensitive, the line contains nothing else) wins;
-  no or malformed DECISION = `continue` (comment on the gate that the default
-  applied).
+- Gate `done` + the response carries a `comments_error` field (the Jira lambda
+  could not fetch the gate's comments) → the comments are UNKNOWN, not empty.
+  Retry `get_issue` a couple of times with a brief backoff. Still erroring →
+  the decision is unresolved: comment on the gate that the decision could not
+  be read, transition your ticket back to `blocked`, exit. NEVER treat
+  unreadable comments as "no DECISION".
+- Gate `done` with comments retrieved → parse the decision: the LAST line
+  matching `DECISION: continue` / `DECISION: merge-with-known-findings` /
+  `DECISION: cancel` (case-insensitive, the line contains nothing else) wins.
+  NO well-formed DECISION line → FAIL CLOSED, never default to `continue`:
+  comment on the gate asking the human to add exactly one `DECISION: ...` line
+  (quote the three options), note that a bare approval does not authorize
+  continuing, transition your ticket back to `blocked`, exit. Only an explicit
+  `DECISION: continue` ever resets the effective round count or spawns the
+  deferred fix tickets.
   - **continue** → append the authorization to the ledger
     (`{gateTicketId, decision, decidedAt, authorizedBy, resetAtRound: <the
-    escalated round>}`) — the effective count is now 0 — clear the pending
-    escalation, write the ledger, then spawn the DEFERRED fix tickets for the
+    escalated round>}`) — the effective count is now 0 — resolve the pending
+    escalation by setting its `decision` (the entry stays in the `escalations`
+    history; it is what future `escalationSeq` values count), write the
+    ledger, then spawn the DEFERRED fix tickets for the
     escalated round exactly per the CHANGES-NEEDED rules above, record their
     keys, write the ledger again, and resume the normal loop.
   - **merge-with-known-findings** → record the decision, write the final
@@ -207,11 +245,18 @@ this ticket (transition it to Done):
       Do not merge. Cancel the workflow from the console (Cancel workflow) —
       that is the decision; the comment is for the audit trail.
 
-If you approve (Done) without a DECISION comment, the decision defaults to
-"continue".
+WARNING: approving (Done) WITHOUT a DECISION comment does NOT continue the
+loop. The release manager will re-ask on this ticket and stay parked until
+exactly one DECISION line exists.
 
 AFTER approving: move the Ship ticket {shipTicketId} from Blocked to Ready so
-the release manager resumes (board: Blocked → Ready; or run the workflow nudge).
+the release manager resumes. NOTE: the release manager parked while still
+holding its invocation claim, so the board move alone may be refused as
+"already claimed" until the claim goes stale (up to 2× the workflow lease TTL
+— 60 minutes by default; a targeted nudge on the Ship ticket works after 1×,
+i.e. 30 minutes). For an immediate resume, run that targeted nudge with
+force=true — the release manager parked deliberately and its session has
+exited, so the forced takeover is safe.
 
 Do NOT use "Request changes" (→ Blocked) on this ticket — it has no rework
 target and will just stall the escalation until moved back to review.
@@ -317,6 +362,7 @@ actual, pass/fail), evidence key, rollback status if invoked.
 - Include the `[coding-session: ...]` footer from your specialist's output in your completion record
 - Ship convergence: the round ledger is read at the start and written at the end
   of EVERY ship round; effective count >= 3 = escalate BEFORE spawning that
-  round's fix tickets; only a human DECISION resets the count
+  round's fix tickets; only an explicit human `DECISION: continue` resets the
+  count — a Done gate with no DECISION line fails closed and stays parked
 - The escalation gate always has `blocked_by: ""`, and you never transition it —
   the gate is the human's, like the merge gate
