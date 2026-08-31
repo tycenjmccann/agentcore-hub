@@ -45,6 +45,13 @@ The hub has no separate staging account; "staging" = deploying code-only
 targets and verifying before the app rollout completes traffic shift.
 
 ```bash
+# 0. Workflow command queue (one-time infra; idempotent). Creates the SQS FIFO
+#    queue + DLQ + event source mapping onto the orchestrator, and prints the
+#    queue URL. Set that URL as WORKFLOW_COMMAND_QUEUE_URL in .env.local BEFORE
+#    the ECS app deploy (step below) — without it the webhook route falls back
+#    to the legacy direct Lambda invoke (still functional, not serialized).
+./scripts/create-command-queue.sh
+
 # 1. Orchestrator Lambda — CODE ONLY (never its deploy.sh; see Required secrets)
 cd lambda/orchestrator && npm ci --omit=dev && zip -qr /tmp/orchestrator.zip . && cd ../..
 aws lambda update-function-code --function-name agentcore-hub-orchestrator \
@@ -184,6 +191,15 @@ curl -sf "$DEPLOYMENT_URL/api/agentcore/traces/health"        # expect HTTP 200
 # Orchestrator lambda healthy on the new code
 aws lambda get-function --function-name agentcore-hub-orchestrator \
   --query 'Configuration.[State,LastUpdateStatus]' --output text  # expect: Active Successful
+
+# Command queue wired (R1): mapping enabled, DLQ empty
+aws lambda list-event-source-mappings --function-name agentcore-hub-orchestrator \
+  --query 'EventSourceMappings[?contains(EventSourceArn, `workflow-commands`)].State' \
+  --output text                                                    # expect: Enabled
+aws sqs get-queue-attributes \
+  --queue-url "$(aws sqs get-queue-url --queue-name agentcore-hub-workflow-commands-dlq.fifo --query QueueUrl --output text)" \
+  --attribute-names ApproximateNumberOfMessages \
+  --query 'Attributes.ApproximateNumberOfMessages' --output text   # expect: 0
 
 # Config landed with ARNs intact (never null after a merge)
 aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" - | \
