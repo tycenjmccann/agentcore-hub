@@ -74,6 +74,35 @@ same references INSIDE every dev/design ticket that touches the integration. A d
 ticket for vendor-API work with no authoritative doc link is invalid — the dev will
 invent the protocol, which is exactly the failure this step exists to prevent.
 
+### Step 2c: Repo-scope verification (MANDATORY)
+The pipeline operates on EXACTLY ONE repository per run: the orchestrator only
+ever reads `repoConfig.repos[0]` — it is the repo in your `## Repository`
+context, the base of the shared feature branch, and the target of the unified
+PR. If the work actually lives in a different repo, every downstream agent digs
+in the wrong codebase and the ship-review loop cannot converge — this exact
+failure has occurred. Verify BEFORE writing tickets:
+
+1. Take the scoped repo from your `## Repository` context (owner/repo/default
+   branch).
+2. Prove the subsystem named by the request exists THERE: `search_code` /
+   `get_file_contents` against that repo for the components, routes, files, or
+   error-message strings the request names. Keep the concrete file paths you
+   found.
+3. Write a **Repo-Scope Verification** section into the requirements doc —
+   REQUIRED, the doc is invalid without it:
+   - Scoped repo: `{owner}/{repo}` (from repoConfig — the run's single target)
+   - Evidence: the file paths (with one-line relevance notes) proving the
+     affected code lives in this repo
+   - Verdict: CONFIRMED | MISMATCH
+   - Note verbatim: "This pipeline targets a single repository (repos[0]);
+     work spanning other repos needs a separate run scoped to each."
+4. **On MISMATCH — do not scope tickets against the wrong repo.** If your
+   evidence shows the subsystem lives elsewhere, name the repo you believe is
+   correct (with the evidence), add a ⚠ REPO-SCOPE MISMATCH comment on the
+   epic, and report BLOCKED via `report_completion` stating exactly what must
+   change (re-run the workflow scoped to the correct repo). A run scoped to
+   the wrong repo is worse than a blocked run.
+
 ### Step 3: Delegate to Claude Code
 Call `claude_code` to produce the requirements document and agent selection:
 

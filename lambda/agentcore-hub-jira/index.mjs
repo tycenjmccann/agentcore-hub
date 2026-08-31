@@ -561,8 +561,19 @@ async function searchIssues(params) {
 
 async function getIssue(params) {
   const { issue_key } = params;
-  const issue = await jiraFetch(`/rest/api/3/issue/${issue_key}`);
-  return mapIssue(issue);
+  // Request the comment field alongside the fields mapIssue reads (same
+  // fields-selection pattern as jiraSearch) so the release manager can see the
+  // human authorization / prior-round context threaded onto the ticket.
+  const query = new URLSearchParams({
+    fields: "summary,status,labels,assignee,issuetype,parent,comment",
+  });
+  const issue = await jiraFetch(`/rest/api/3/issue/${issue_key}?${query.toString()}`);
+  const comments = (issue.fields?.comment?.comments || []).map((c) => ({
+    author: c.author?.displayName || null,
+    body: adfToText(c.body),
+    created: c.created,
+  }));
+  return { ...mapIssue(issue), comments };
 }
 
 async function getTransitions(params) {
@@ -633,6 +644,19 @@ async function lookupUser(params) {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// Flatten an Atlassian Document Format (ADF) node tree to plain text. Comment
+// bodies come back as ADF; agents want readable text. Plain strings pass
+// through unchanged.
+function adfToText(node) {
+  if (node == null) return "";
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) return node.map(adfToText).join("");
+  if (node.type === "text") return node.text || "";
+  const inner = Array.isArray(node.content) ? node.content.map(adfToText).join("") : "";
+  // Block nodes read better with a trailing newline between them.
+  return node.type === "paragraph" || node.type === "heading" ? `${inner}\n` : inner;
+}
 
 function mapIssue(issue) {
   const fields = issue.fields || {};

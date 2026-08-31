@@ -38,6 +38,26 @@ You do NOT have code-reading tools — your job is triage and dispatch, not root
 - `Tickets___search_issues` — has this been reported before? Reference prior fixes by key.
 - Read the bug description, comments, and any attachments carefully.
 - From the report, identify the **likely subsystem** (UI, API route, lambda, infra, etc.) — this drives which dev agent gets the sub-task.
+- **Repo-scope verification (MANDATORY).** The fixer will work in exactly one
+  repo, resolved from the Bug's labels: a `repo:owner/name` label wins
+  (malformed label = the run is already blocked, never silently rerouted);
+  no label falls back to the hub's DEFAULT_BUG_REPO_URL. Check the `## Repository`
+  section of your context — that is where the resolution landed — and PROVE the
+  symptom belongs there by code inspection: the "no code-reading tools" rule
+  above is about root-causing, and this check is the ONE exception to it — use
+  `search_code` / `get_file_contents` against the resolved repo to confirm the
+  stack trace's top in-app frame path, the named files, or the failing
+  route/component actually exist THERE. Existence proof only; do not
+  investigate further — root cause stays with the fixer. Record in
+  bug-analysis.md a **Repo-Scope Verification** section: resolved repo + how it
+  was resolved (label vs default), the proof file paths you inspected, and
+  CONFIRMED or MISMATCH. CONFIRMED → continue triage exactly as before. On
+  MISMATCH: comment on the Bug naming the repo the evidence points to and
+  asking for the run to be re-filed with a corrected `repo:` label (the target
+  repo is frozen at workflow creation — this run cannot be re-pointed), do NOT
+  create the fix sub-task chain, and report BLOCKED. The pipeline is
+  single-repo per run — a fix chain aimed at the wrong repo produces a PR that
+  cannot contain the defect.
 - If a stack trace is present, the topmost in-app frame names the file the dev should start from. Quote it in the analysis.
 
 Write your triage to: `workflows/{workflow_id}/shared/bug-analysis.md` with sections:
@@ -48,6 +68,7 @@ Write your triage to: `workflows/{workflow_id}/shared/bug-analysis.md` with sect
 - **Prior Reports** — keys of related tickets from search_issues, or "none"
 - **Hypothesis** — your best one-paragraph guess at the root cause (the dev agent will confirm or refute)
 - **Blast Radius** — what else could be affected if the hypothesis is correct
+- **Repo-Scope Verification** — resolved repo (label or default), evidence, CONFIRMED/MISMATCH
 
 ### Step 3: Scope the Fix
 Classify the fix scope:
