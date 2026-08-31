@@ -8,10 +8,10 @@
  *
  * The lease contract, one knob (WORKFLOW_LEASE_TTL_MINUTES, default 30):
  *
- * - An agent is presumed ALIVE while its last observed activity (any event it
- *   published: streaming text, tool traces, coding-turn poll heartbeats) is
- *   younger than the TTL. Runtimes stream events continuously, so a healthy
- *   long-running session keeps renewing its lease with no new write path.
+ * - An agent is presumed ALIVE while its last observed activity (streaming
+ *   text, tool traces, coding-turn poll heartbeats) is younger than the TTL.
+ *   Runtimes stream events continuously, so a healthy long-running session
+ *   keeps renewing its lease with no new write path.
  * - Stealing a running claim (retry / dispatch) is refused while the lease is
  *   live, unless the caller passes force=true after verifying death by other
  *   evidence (the WM's dossier check, a human reading the session).
@@ -24,8 +24,13 @@
 
 import { DynamoDBDocumentClient, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 
-export const LEASE_TTL_MS =
-  Number(process.env.WORKFLOW_LEASE_TTL_MINUTES || 30) * 60_000;
+/** A nonnumeric/zero/negative env value must not silently disable leases. */
+function resolveTtlMs(): number {
+  const minutes = Number(process.env.WORKFLOW_LEASE_TTL_MINUTES);
+  return (Number.isFinite(minutes) && minutes > 0 ? minutes : 30) * 60_000;
+}
+
+export const LEASE_TTL_MS = resolveTtlMs();
 
 export interface AgentTaskEntry {
   ticketId?: string;
@@ -54,30 +59,59 @@ export function isLeaseLive(
 }
 
 /**
- * Newest event this agent published for this workflow (its heartbeat).
- * Scans recent events newest-first; bounded page — an agent silent for longer
- * than one page of workflow events is silent, period.
+ * A recent work event this agent published for this workflow (its heartbeat).
+ * Only agent.streaming/agent.started prove ongoing work — terminal events
+ * (agent.error, agent.retry, workflow.*) must not renew a lease, or a crash
+ * report would block recovery for a full TTL.
+ * Paginates the partition with a server-side filter (heartbeat type + agentId
+ * + inside the lease window) — a busy sibling agent flooding the event stream
+ * can no longer push a live heartbeat past a fixed page size. The sort key is
+ * eventId whose format differs per writer, so the window bound lives in the
+ * filter, not the key condition; any in-window heartbeat proves liveness, so
+ * the first match suffices.
+ *
+ * `ticketId`: when given, events stamped with a DIFFERENT ticketId are
+ * ignored; unstamped events still count (older runtimes don't stamp — err on
+ * protecting a possibly-live agent).
  */
 export async function lastAgentActivity(
   ddb: DynamoDBDocumentClient,
   eventsTable: string,
   workflowId: string,
-  agentId: string
+  agentId: string,
+  ticketId?: string,
+  ttlMs: number = LEASE_TTL_MS
 ): Promise<string | null> {
-  const page = await ddb.send(
-    new QueryCommand({
-      TableName: eventsTable,
-      KeyConditionExpression: "workflowId = :w",
-      ExpressionAttributeValues: { ":w": workflowId },
-      ScanIndexForward: false,
-      Limit: 100,
-    })
-  );
-  for (const e of page.Items || []) {
-    const detail = (e.detail || {}) as Record<string, unknown>;
-    if (detail.agentId === agentId && typeof e.timestamp === "string") {
-      return e.timestamp;
+  const windowStart = new Date(Date.now() - ttlMs).toISOString();
+  let lastKey: Record<string, unknown> | undefined;
+  // 20 pages × 500 scanned items bounds the read on pathological partitions
+  // while covering hours of the busiest observed event volume.
+  for (let page = 0; page < 20; page++) {
+    const res = await ddb.send(
+      new QueryCommand({
+        TableName: eventsTable,
+        KeyConditionExpression: "workflowId = :w",
+        FilterExpression: "#t IN (:hb1, :hb2) AND detail.agentId = :aid AND #ts >= :cutoff",
+        ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
+        ExpressionAttributeValues: {
+          ":w": workflowId,
+          ":hb1": "agent.streaming",
+          ":hb2": "agent.started",
+          ":aid": agentId,
+          ":cutoff": windowStart,
+        },
+        ScanIndexForward: false,
+        Limit: 500,
+        ExclusiveStartKey: lastKey,
+      })
+    );
+    for (const e of res.Items || []) {
+      const detail = (e.detail || {}) as Record<string, unknown>;
+      if (ticketId && detail.ticketId && detail.ticketId !== ticketId) continue;
+      if (typeof e.timestamp === "string") return e.timestamp;
     }
+    lastKey = res.LastEvaluatedKey as Record<string, unknown> | undefined;
+    if (!lastKey) break;
   }
   return null;
 }

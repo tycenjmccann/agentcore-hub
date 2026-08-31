@@ -51,7 +51,7 @@ async function leaseAwareRelease(
   force: boolean
 ) {
   if (!force) {
-    const lastActivity = await lastAgentActivity(ddb, EVENTS_TABLE, workflowId, agentId);
+    const lastActivity = await lastAgentActivity(ddb, EVENTS_TABLE, workflowId, agentId, ticketId);
     if (isLeaseLive(task, lastActivity, Date.now())) {
       throw new LeaseLiveError(agentId, lastActivity);
     }
@@ -205,7 +205,10 @@ export async function POST(
     });
   } catch (err) {
     console.error("[retry] Error:", err);
-    const status = (err as Error).name === "LeaseLiveError" ? 409 : 500;
-    return NextResponse.json({ error: (err as Error).message }, { status });
+    const leaseLive = (err as Error).name === "LeaseLiveError";
+    return NextResponse.json(
+      { error: (err as Error).message, ...(leaseLive ? { code: "LEASE_LIVE" } : {}) },
+      { status: leaseLive ? 409 : 500 }
+    );
   }
 }

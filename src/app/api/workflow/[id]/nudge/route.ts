@@ -138,7 +138,7 @@ async function releaseInvocationClaim(
     if (!force) {
       const agentId = String(task.agentId || "");
       const lastActivity = agentId
-        ? await lastAgentActivity(ddb, EVENTS_TABLE, workflowId, agentId)
+        ? await lastAgentActivity(ddb, EVENTS_TABLE, workflowId, agentId, ticketId)
         : null;
       if (isLeaseLive(task, lastActivity, Date.now())) {
         const err = new Error(
@@ -150,7 +150,15 @@ async function releaseInvocationClaim(
         throw err;
       }
     }
-    await stealClaim(ddb, WORKFLOWS_TABLE, workflowId, ticketId, task.startedAt as string | undefined);
+    const stolen = await stealClaim(ddb, WORKFLOWS_TABLE, workflowId, ticketId, task.startedAt as string | undefined);
+    if (!stolen) {
+      // The claim moved between our read and the CAS (completed or re-issued).
+      // Proceeding would transition the ticket to Ready anyway — reopening
+      // finished work or duplicating a live agent. Abort the dispatch.
+      throw new Error(
+        `Claim on ${ticketId} moved while dispatching (completed or re-claimed) — nothing to dispatch.`
+      );
+    }
     return;
   }
 
@@ -320,7 +328,10 @@ export async function POST(
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Unknown error";
     console.error(`[nudge] Error for workflow ${workflowId}:`, message);
-    const status = err instanceof Error && err.name === "LeaseLiveError" ? 409 : 500;
-    return NextResponse.json({ error: message }, { status });
+    const leaseLive = err instanceof Error && err.name === "LeaseLiveError";
+    return NextResponse.json(
+      { error: message, ...(leaseLive ? { code: "LEASE_LIVE" } : {}) },
+      { status: leaseLive ? 409 : 500 }
+    );
   }
 }

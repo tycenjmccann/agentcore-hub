@@ -98,7 +98,15 @@ def api_post(path, body=None):
             return json.loads(res.read().decode() or "{}")
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:500]
-        if e.code == 409:
+        # Only a lease refusal carries code=LEASE_LIVE — other 409s (e.g.
+        # completing an already-terminal workflow) have no --force escape and
+        # must not be reported as one.
+        lease_live = False
+        try:
+            lease_live = json.loads(detail).get("code") == "LEASE_LIVE"
+        except (ValueError, AttributeError):
+            pass
+        if e.code == 409 and lease_live:
             # Live invocation lease (R3): the agent is likely still working.
             raise SystemExit(
                 f"REFUSED (lease live): {detail}\n"

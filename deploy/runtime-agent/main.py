@@ -2449,6 +2449,10 @@ async def _run_agent_invocation(payload, context):
                     event_id = f"{int(time.time() * 1000)}-{self._seq:06d}"
                     # Unique timestamp with sequence suffix (sort key must never collide)
                     unique_ts = f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())}.{self._seq:04d}Z"
+                    # Stamp the ticket so lease liveness (R3) can scope activity
+                    # to the claimed ticket when one agent runs siblings.
+                    if _CURRENT_TICKET_ID and "ticketId" not in detail:
+                        detail = {**detail, "ticketId": _CURRENT_TICKET_ID}
                     detail_map = {}
                     for k, v in detail.items():
                         if v is not None:

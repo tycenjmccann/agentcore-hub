@@ -484,7 +484,8 @@ async function claimTicketInvocation(workflow, ticketId, assignee) {
   // able to re-dispatch without the retry endpoint. 2× the lease TTL (R3):
   // same knob as the lease-aware retry/dispatch endpoints, doubled because
   // this path has no activity signal — only the claim's age.
-  const leaseTtlMs = Number(process.env.WORKFLOW_LEASE_TTL_MINUTES || 30) * 60_000;
+  const ttlMinutes = Number(process.env.WORKFLOW_LEASE_TTL_MINUTES);
+  const leaseTtlMs = (Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? ttlMinutes : 30) * 60_000;
   const staleBefore = new Date(Date.now() - 2 * leaseTtlMs).toISOString();
   const entry = {
     ...(workflow.agentTasks?.[ticketId] || {}),

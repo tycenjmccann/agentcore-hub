@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isLeaseLive, stealClaim } from "./lease";
+import { isLeaseLive, lastAgentActivity, stealClaim } from "./lease";
 import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 
 /**
@@ -35,6 +35,55 @@ describe("isLeaseLive", () => {
   it("no lease: missing entry or no timestamps at all", () => {
     expect(isLeaseLive(undefined, null, NOW, TTL)).toBe(false);
     expect(isLeaseLive({ status: "running" }, null, NOW, TTL)).toBe(false);
+  });
+});
+
+describe("lastAgentActivity", () => {
+  function eventsStub(pages: Array<{ Items: Array<Record<string, unknown>>; LastEvaluatedKey?: Record<string, unknown> }>) {
+    const inputs: Array<Record<string, unknown>> = [];
+    let i = 0;
+    const ddb = {
+      async send(cmd: { input: Record<string, unknown> }) {
+        inputs.push(cmd.input);
+        return pages[Math.min(i++, pages.length - 1)];
+      },
+    } as unknown as DynamoDBDocumentClient;
+    return { ddb, inputs };
+  }
+
+  it("filters server-side to heartbeat types + agentId within the TTL window", async () => {
+    const { ddb, inputs } = eventsStub([{ Items: [] }]);
+    await lastAgentActivity(ddb, "events", "wf_1", "dev_agent", undefined, TTL);
+    const q = inputs[0];
+    expect(q.FilterExpression).toContain("#t IN (:hb1, :hb2)");
+    expect(q.FilterExpression).toContain("detail.agentId = :aid");
+    expect(q.FilterExpression).toContain("#ts >= :cutoff");
+    const vals = q.ExpressionAttributeValues as Record<string, string>;
+    expect(vals[":hb1"]).toBe("agent.streaming");
+    expect(vals[":hb2"]).toBe("agent.started");
+  });
+
+  it("paginates past pages the filter emptied (busy sibling flood)", async () => {
+    const heartbeat = {
+      type: "agent.streaming",
+      timestamp: iso(60_000),
+      detail: { agentId: "dev_agent" },
+    };
+    const { ddb, inputs } = eventsStub([
+      { Items: [], LastEvaluatedKey: { workflowId: "wf_1", eventId: "x" } },
+      { Items: [heartbeat] },
+    ]);
+    const ts = await lastAgentActivity(ddb, "events", "wf_1", "dev_agent", undefined, TTL);
+    expect(ts).toBe(heartbeat.timestamp);
+    expect(inputs.length).toBe(2);
+  });
+
+  it("skips events stamped with a different ticket, keeps unstamped ones", async () => {
+    const sibling = { type: "agent.streaming", timestamp: iso(30_000), detail: { agentId: "dev_agent", ticketId: "TEAM-9" } };
+    const unstamped = { type: "agent.streaming", timestamp: iso(90_000), detail: { agentId: "dev_agent" } };
+    const { ddb } = eventsStub([{ Items: [sibling, unstamped] }]);
+    const ts = await lastAgentActivity(ddb, "events", "wf_1", "dev_agent", "TEAM-2", TTL);
+    expect(ts).toBe(unstamped.timestamp);
   });
 });
 
