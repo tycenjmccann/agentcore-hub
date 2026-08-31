@@ -1058,11 +1058,40 @@ def _touch_workflow_marker(session_id: str | None) -> None:
         logger.warning("wf_marker_failed", extra={"error": str(exc)[:200]})
 
 
+def _ensure_sessions_writable() -> bool:
+    """Confirm {WORKSPACE_ROOT}/sessions is present and writable by THIS microVM;
+    self-heal if not. The EFS access point pins uid/gid 1000 and creates
+    /workspace at 0755, so sessions/ should always be writable — but a transient
+    EFS/ownership degrade on one VM turns every journal write into EACCES, which
+    makes the submit path 503 and silently stalls the run. Probe with a real
+    write; on failure try one chmod 0o770 and re-probe. Returns True if writable.
+    Never raises."""
+    sessions_root = os.path.join(WORKSPACE_ROOT, "sessions")
+    def _probe() -> bool:
+        try:
+            os.makedirs(sessions_root, exist_ok=True)
+            probe = os.path.join(sessions_root, f".wprobe-{os.getpid()}")
+            with open(probe, "w") as f:
+                f.write("1")
+            os.unlink(probe)
+            return True
+        except OSError:
+            return False
+    if _probe():
+        return True
+    try:
+        os.chmod(sessions_root, 0o770)
+    except OSError as exc:
+        logger.warning("sessions_chmod_failed", extra={"error": str(exc)[:200]})
+    return _probe()
+
+
 def _gc_stale_sessions() -> None:
     """Best-effort TTL sweep of {WORKSPACE_ROOT}/sessions/*. Only dirs carrying
     the workflow-origin marker are candidates — human Cloud Code sessions must
     stay resumable indefinitely. Staleness = marker mtime older than the TTL.
-    Never raises."""
+    Never touches a session that is running on THIS VM (in _ACTIVE_TURNS), never
+    the sessions/ root itself. Never raises."""
     if SESSION_TTL_DAYS <= 0:
         return
     try:
@@ -1075,14 +1104,24 @@ def _gc_stale_sessions() -> None:
         with open(_GC_MARKER, "w") as f:
             f.write(str(int(now)))
         sessions_root = os.path.join(WORKSPACE_ROOT, "sessions")
+        os.makedirs(sessions_root, exist_ok=True)
         if not os.path.isdir(sessions_root):
             return
+        # Session dirs of turns still executing on this VM, so GC can't rmtree a
+        # live workspace out from under a runner thread (a race that would EACCES
+        # the runner's own subsequent writes).
+        live_dirs = {
+            os.path.basename(_session_dir(r.get("session_id")))
+            for r in _ACTIVE_TURNS.values() if r.get("session_id")
+        }
         cutoff = now - SESSION_TTL_DAYS * 86400
         removed = 0
         for name in os.listdir(sessions_root):
             path = os.path.join(sessions_root, name)
             if not os.path.isdir(path):
                 continue
+            if name in live_dirs:
+                continue  # running on this VM — never GC
             marker = os.path.join(path, _WF_ORIGIN_MARKER)
             try:
                 if not os.path.isfile(marker):
@@ -2109,7 +2148,7 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
                 if r.get("status") == "done" and int(r.get("finished_at") or 0) < cutoff]:
         _ACTIVE_TURNS.pop(tid, None)
     _ACTIVE_TURNS[turn_id] = {"status": "running", "turn_id": turn_id, "cli": cli,
-                              "started_at": int(time.time())}
+                              "session_id": session_id, "started_at": int(time.time())}
     beat = {"status": "running", "turn_id": turn_id, "cli": cli,
             "started_at": int(time.time()), "heartbeat": int(time.time())}
     stop_beating = threading.Event()
@@ -2556,14 +2595,26 @@ async def invocations(request: Request):
         # "unknown" for a turn we accepted. If the seed can't be written the
         # turn must NOT start: an accepted-but-unjournaled turn polls as
         # "unknown" and gets resubmitted while the original still runs.
-        seeded = _journal_write(journal, {"status": "running", "turn_id": turn_id,
-                                          "cli": cli, "started_at": int(time.time()),
-                                          "heartbeat": int(time.time())})
+        def _seed() -> bool:
+            return _journal_write(journal, {"status": "running", "turn_id": turn_id,
+                                            "cli": cli, "started_at": int(time.time()),
+                                            "heartbeat": int(time.time())})
+        seeded = _seed()
         if not seeded:
-            logger.error("turn_submit_seed_failed", extra={"turn_id": turn_id})
-            return JSONResponse(
-                {"error": "turn journal unwritable (EFS degraded) — turn not started"},
-                status_code=503)
+            # One self-heal attempt: a transient EFS/ownership degrade on this VM
+            # makes every journal write EACCES and would 503 the turn to death.
+            # Re-establish a writable sessions/ root and retry once before giving up.
+            healed = _ensure_sessions_writable()
+            seeded = _seed() if healed else False
+            if not seeded:
+                # Distinct, alarmable signal: this VM's EFS is degraded and the
+                # run is NOT silently stalling — it's a visible failure to page on.
+                logger.error("efs_write_degraded", extra={"turn_id": turn_id,
+                                                           "session_id": session_id,
+                                                           "healed": healed})
+                return JSONResponse(
+                    {"error": "turn journal unwritable (EFS degraded) — turn not started"},
+                    status_code=503)
         threading.Thread(
             target=_run_turn_async,
             args=(turn_id, journal, cli, prompt, workdir, claude_session_id,
