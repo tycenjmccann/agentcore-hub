@@ -1551,7 +1551,12 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
     All your claude_code calls in this task share ONE workspace and ONE
     conversation — a later call remembers the earlier calls and their files.
     Do NOT reference absolute paths like /tmp/... across calls; say "in the
-    same workspace as the previous call" instead.
+    same workspace as the previous call" instead. Files under /tmp do NOT
+    survive between calls — the microVM may recycle, wiping /tmp — so a later
+    call that reads a /tmp file a prior call wrote will fail with the file gone.
+    Persist any deliverable to S3 (S3Storage___write_object) or the repo
+    workspace in the SAME turn that produces it; never stash it in /tmp and
+    fetch it back on a later turn.
 
     The workspace is REMOTE — you cannot file_read/image_reader its files
     directly. Files it produces (screenshots, mockups, diagrams) are harvested
@@ -2449,6 +2454,10 @@ async def _run_agent_invocation(payload, context):
                     event_id = f"{int(time.time() * 1000)}-{self._seq:06d}"
                     # Unique timestamp with sequence suffix (sort key must never collide)
                     unique_ts = f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())}.{self._seq:04d}Z"
+                    # Stamp the ticket so lease liveness (R3) can scope activity
+                    # to the claimed ticket when one agent runs siblings.
+                    if _CURRENT_TICKET_ID and "ticketId" not in detail:
+                        detail = {**detail, "ticketId": _CURRENT_TICKET_ID}
                     detail_map = {}
                     for k, v in detail.items():
                         if v is not None:

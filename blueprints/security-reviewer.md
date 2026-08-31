@@ -13,7 +13,7 @@ You lead security review. You identify what needs reviewing (code changes, archi
 ### Step 2: Delegate to Claude Code
 ```
 claude_code(
-    task="Perform a security review of this [design/code].\n\n[PASTE DESIGN DOC OR CODE]\n\nCheck for:\n1. Authentication/authorization gaps\n2. Input validation issues (injection, XSS, SSRF)\n3. Data exposure (logs, error messages, API responses)\n4. Secrets management (hardcoded keys, env var handling)\n5. OWASP Top 10 applicability\n6. Data privacy concerns (PII handling, encryption at rest/transit)\n7. Rate limiting and abuse prevention\n\nFor each finding: severity (Critical/High/Medium/Low), description, specific location, remediation."
+    task="Perform a security review of this [design/code].\n\n[PASTE DESIGN DOC OR CODE]\n\nCheck for:\n1. Authentication/authorization gaps\n2. Input validation issues (injection, XSS, SSRF)\n3. Data exposure (logs, error messages, API responses)\n4. Secrets management (hardcoded keys, env var handling)\n5. OWASP Top 10 applicability\n6. Data privacy concerns (PII handling, encryption at rest/transit)\n7. Rate limiting and abuse prevention\n\nFor each finding: severity (Critical/High/Medium/Low), description, specific location, remediation.\n\nReturn the full findings INLINE in your result text. Do NOT write them to a file and do NOT reference /tmp/... — files under /tmp do not survive between calls, and the lead persists your findings to S3."
 )
 ```
 
@@ -23,7 +23,7 @@ claude_code(
 - Determine if any are blocking vs advisory
 
 ### Step 4: Deliver
-- Save security review document with all findings and remediation guidance
+- Save the security review: `S3Storage___write_object` to `workflows/{workflow_id}/shared/security-review.md` with all findings and remediation guidance. NEVER write the deliverable to `/tmp` or ask `claude_code` to save it to a file — take the findings from the `claude_code` result text and write them to S3 yourself.
 - `WorkflowOutput___report_completion` with pass/fail verdict — Critical/High findings make the verdict FAIL
 
 ## Rules

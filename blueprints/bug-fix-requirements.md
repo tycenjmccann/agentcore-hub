@@ -69,10 +69,18 @@ Your Step 2 suspected-subsystem and stack-trace top frame still matter: put them
 in the fix ticket so the fixer starts in the right place. But the assignee is
 always `agentcore_hub_bug_fixer`.
 
-### Step 5: Create Four Sub-Tasks Under the Bug
+### Step 5: Create the Sub-Task Chain Under the Bug
 
-Create exactly four sub-tasks — no design phase, no top-level tickets. The chain
-is fix → code review → QA → CI:
+**Before creating anything, check for an existing chain.** This run may be a
+re-invocation; blindly recreating sub-tasks produces a duplicate chain that wedges
+the whole bug-fix. Call `Tickets___list_tickets(<Bug key>)` and inspect the `agent:*`
+assignees already present:
+- If sub-tasks for the same assignees already exist, the chain was created on a prior
+  invocation. Create only genuinely-missing sub-tasks; do not recreate ones that exist.
+- If none exist, create the full chain below.
+
+Create the sub-tasks — no design phase, no top-level tickets. The chain
+is fix → code review → QA → CI → ship → merge approval → CD:
 
 1. **Fix sub-task**
    - `assignee`: `agentcore_hub_bug_fixer`
@@ -153,6 +161,10 @@ is fix → code review → QA → CI:
    - `blocked_by`: `{merge-approval-subtask-key}`
 
 ### Step 6: Wrap Up
+- **Verify after creating:** call `Tickets___list_tickets(<Bug key>)` and confirm exactly ONE
+  sub-task per assignee (exception: `agentcore_hub_release_manager` has TWO — Ship + CD). If any
+  assignee appears twice, you created a duplicate chain: `Tickets___add_comment` on the Bug flagging
+  the duplicate keys and report the anomaly in `report_completion` instead of leaving it silent.
 - Comment on the Bug ticket: "Bug-fix flow — assigned to {dev-agent}. Root cause hypothesis: {one-line}. Sub-task chain: {fix-key} (fix) → {review-key} (review) → {qa-key} (QA) → {ci-key} (CI) → {ship-key} (ship) → {gate-key} (merge approval) → {cd-key} (CD)."
 - Transition your own sub-task to `done`
 - `WorkflowOutput___report_completion`

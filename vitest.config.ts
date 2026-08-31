@@ -26,6 +26,9 @@ export default defineConfig({
       "src/**/*.test.ts",
       "lambda/eval-packager/**/*.test.mjs",
       "deploy/telegram-bug-intake/**/*.test.mjs",
+      // workflow-store is pure DDB-command construction — unit-testable with a
+      // stub client, same rationale as the eval-packager classifiers.
+      "lambda/orchestrator/workflow-store.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

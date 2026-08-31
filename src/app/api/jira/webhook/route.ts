@@ -1,25 +1,39 @@
 /**
  * POST /api/jira/webhook — Jira Cloud Webhook Receiver
  *
- * Thin adapter: receives Jira webhook, extracts the status change,
- * and invokes the SAME orchestrator Lambda used by the DynamoDB path.
+ * Thin adapter: receives Jira webhook, extracts the status change, and
+ * enqueues a command on the workflow FIFO queue (WORKFLOW_COMMAND_QUEUE_URL).
+ * MessageGroupId = the workflow's root issue key, so all commands for one
+ * workflow are processed strictly in order by the orchestrator — concurrent
+ * webhook deliveries for the same run can no longer race each other
+ * (R1 of docs/race-condition-study.md). Content-based dedup on
+ * (issueKey, status, Jira event timestamp) absorbs at-least-once redeliveries.
  *
  * The orchestrator handles ALL logic (context building, agent invocation,
  * cascade, phase advancement). This route just translates the Jira event
  * into the orchestrator's input format.
+ *
+ * Fallback: when WORKFLOW_COMMAND_QUEUE_URL is unset, invokes the
+ * orchestrator Lambda directly (pre-R1 behavior) so the app keeps working
+ * against an install that hasn't created the queue yet.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
+import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { mapJiraStatusToInternal } from "@/lib/workflow/jira-client";
+import { commandGroupId, commandDedupId } from "@/lib/workflow/command-queue";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const ORCHESTRATOR_LAMBDA = process.env.ORCHESTRATOR_LAMBDA || "agentcore-hub-orchestrator";
+const COMMAND_QUEUE_URL = process.env.WORKFLOW_COMMAND_QUEUE_URL || "";
 
 const lambda = new LambdaClient({ region: REGION });
+const sqs = new SQSClient({ region: REGION });
 
 interface JiraWebhookPayload {
   webhookEvent?: string;
+  timestamp?: number;
   issue?: {
     key: string;
     fields: {
@@ -37,6 +51,36 @@ interface JiraWebhookPayload {
       toString: string;
     }>;
   };
+}
+
+async function dispatchCommand(
+  payload: JiraWebhookPayload,
+  issueKey: string,
+  newStatus: string,
+  oldStatus: string
+) {
+  const command = { source: "jira-webhook", ticketId: issueKey, newStatus, oldStatus };
+
+  if (COMMAND_QUEUE_URL) {
+    await sqs.send(
+      new SendMessageCommand({
+        QueueUrl: COMMAND_QUEUE_URL,
+        MessageBody: JSON.stringify(command),
+        MessageGroupId: commandGroupId(issueKey, payload.issue?.fields?.parent?.key),
+        MessageDeduplicationId: commandDedupId(issueKey, newStatus, payload.timestamp),
+      })
+    );
+    return;
+  }
+
+  // Legacy direct invoke (no queue configured).
+  await lambda.send(
+    new InvokeCommand({
+      FunctionName: ORCHESTRATOR_LAMBDA,
+      InvocationType: "Event",
+      Payload: JSON.stringify(command),
+    })
+  );
 }
 
 export async function POST(req: NextRequest) {
@@ -59,21 +103,10 @@ export async function POST(req: NextRequest) {
     console.log(`[jira-webhook] ${issueKey}: CREATED (${newStatus})`);
 
     try {
-      await lambda.send(
-        new InvokeCommand({
-          FunctionName: ORCHESTRATOR_LAMBDA,
-          InvocationType: "Event",
-          Payload: JSON.stringify({
-            source: "jira-webhook",
-            ticketId: issueKey,
-            newStatus,
-            oldStatus: "new",
-          }),
-        })
-      );
+      await dispatchCommand(payload, issueKey, newStatus, "new");
       return NextResponse.json({ received: true, processed: true, issueKey, newStatus });
     } catch (err) {
-      console.error(`[jira-webhook] Error invoking orchestrator for ${issueKey}:`, err);
+      console.error(`[jira-webhook] Error dispatching command for ${issueKey}:`, err);
       return NextResponse.json({ error: (err as Error).message }, { status: 500 });
     }
   }
@@ -95,23 +128,8 @@ export async function POST(req: NextRequest) {
 
   console.log(`[jira-webhook] ${issueKey}: "${statusChange.fromString}" → "${statusChange.toString}" (${oldStatus} → ${newStatus})`);
 
-  // Invoke the orchestrator Lambda with the status change — same Lambda,
-  // same logic as DDB stream path. The orchestrator checks TICKET_PROVIDER
-  // and reads from Jira or DynamoDB accordingly.
   try {
-    await lambda.send(
-      new InvokeCommand({
-        FunctionName: ORCHESTRATOR_LAMBDA,
-        InvocationType: "Event", // Async — don't block the webhook response
-        Payload: JSON.stringify({
-          source: "jira-webhook",
-          ticketId: issueKey,
-          newStatus,
-          oldStatus,
-        }),
-      })
-    );
-
+    await dispatchCommand(payload, issueKey, newStatus, oldStatus);
     return NextResponse.json({
       received: true,
       processed: true,
@@ -119,7 +137,7 @@ export async function POST(req: NextRequest) {
       newStatus,
     });
   } catch (err) {
-    console.error(`[jira-webhook] Error invoking orchestrator for ${issueKey}:`, err);
+    console.error(`[jira-webhook] Error dispatching command for ${issueKey}:`, err);
     return NextResponse.json(
       { error: (err as Error).message },
       { status: 500 }

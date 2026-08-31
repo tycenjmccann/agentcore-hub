@@ -10,6 +10,7 @@ import awsIcons from "@/lib/aws-icons.json";
 import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePhaseConfig } from "@/lib/pipeline-config";
 import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
+import { applyAgentStatus, applyAgentComplete, shouldForceTicketDone } from "@/lib/workflow/board-state";
 import { Square, ClipboardCheck } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
@@ -57,35 +58,12 @@ function applyEventToState(s: WorkflowState, event: WorkflowEvent): WorkflowStat
     case "phase_change":
       return { ...s, phase: event.phase };
     case "agent_status": {
-      const tasks = { ...s.agentTasks };
-      if (tasks[event.agentId]) {
-        // Never regress a completed agent back to running — unless this is a
-        // NEW ticket (e.g. QA fix-it), which is a legitimate re-invocation.
-        const isNewTicket = !!event.ticketId && event.ticketId !== tasks[event.agentId].ticketId;
-        if (tasks[event.agentId].status === "complete" && !isNewTicket) return s;
-        tasks[event.agentId] = {
-          ...tasks[event.agentId],
-          status: event.status,
-          ...(isNewTicket ? { ticketId: event.ticketId } : {}),
-        };
-      } else {
-        tasks[event.agentId] = { id: `task_${Date.now()}`, agentId: event.agentId, ticketId: event.ticketId || "", status: event.status, input: "" };
-      }
-      return { ...s, agentTasks: tasks };
+      const tasks = applyAgentStatus(s.agentTasks, event);
+      return tasks ? { ...s, agentTasks: tasks } : s;
     }
     case "agent_complete": {
-      const tasks = { ...s.agentTasks };
-      if (tasks[event.agentId]) {
-        tasks[event.agentId] = {
-          ...tasks[event.agentId],
-          status: "complete",
-          // Only overwrite output if the event actually has content (events often have empty/truncated output)
-          output: event.output || tasks[event.agentId].output,
-          branch: event.branch,
-          commitSha: event.commitSha,
-        };
-      }
-      return { ...s, agentTasks: tasks };
+      const tasks = applyAgentComplete(s.agentTasks, event);
+      return tasks ? { ...s, agentTasks: tasks } : s;
     }
     case "workflow_complete":
       return { ...s, phase: "complete" };
@@ -392,10 +370,12 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                 assignee: ticket.assignee,
               };
             }
-            // Override with DDB agentTasks — Jira search index can lag behind actual status
+            // Override with DDB agentTasks — Jira search index can lag behind
+            // actual status. NOT when the ticket was updated after the agent
+            // completed: a review-gate rework reopened it and it's really open.
             if (state?.agentTasks) {
-              for (const task of Object.values(state.agentTasks) as Array<{ ticketId?: string; status?: string }>) {
-                if (task.ticketId && task.status === "complete" && map[task.ticketId] && map[task.ticketId].status !== "done") {
+              for (const task of Object.values(state.agentTasks) as Array<{ ticketId?: string; status?: string; completedAt?: string }>) {
+                if (task.ticketId && shouldForceTicketDone(task, map[task.ticketId])) {
                   map[task.ticketId] = { ...map[task.ticketId], status: "done" };
                 }
               }
@@ -665,27 +645,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         }
         setState((s) => {
           if (!s) return s;
-          const tasks = { ...s.agentTasks };
-          if (tasks[event.agentId]) {
-            // Never regress a completed agent back to running (late/duplicate
-            // events) — unless a NEW ticketId means a real re-invocation (fix-it).
-            const isNewTicket = !!event.ticketId && event.ticketId !== tasks[event.agentId].ticketId;
-            if (tasks[event.agentId].status === "complete" && !isNewTicket) return s;
-            tasks[event.agentId] = {
-              ...tasks[event.agentId],
-              status: event.status,
-              ...(isNewTicket ? { ticketId: event.ticketId } : {}),
-            };
-          } else {
-            tasks[event.agentId] = {
-              id: `task_${Date.now()}`,
-              agentId: event.agentId,
-              ticketId: event.ticketId || "",
-              status: event.status,
-              input: "",
-            };
-          }
-          return { ...s, agentTasks: tasks };
+          const tasks = applyAgentStatus(s.agentTasks, event);
+          return tasks ? { ...s, agentTasks: tasks } : s;
         });
         if (event.agentId) {
           setLastEventPerAgent((prev) => ({ ...prev, [event.agentId]: `Agent ${event.status}` }));
@@ -728,23 +689,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
       case "agent_complete":
         setState((s) => {
           if (!s) return s;
-          const tasks = { ...s.agentTasks };
-          const key = tasks[event.agentId]
-            ? event.agentId
-            : Object.keys(tasks).find((k) => tasks[k].agentId === event.agentId);
-          if (key) {
-            // Preserve accumulated streaming text — only use event.output if it's longer
-            const existingOutput = tasks[key].output || "";
-            const newOutput = event.output || "";
-            tasks[key] = {
-              ...tasks[key],
-              status: "complete",
-              output: newOutput.length > existingOutput.length ? newOutput : existingOutput,
-              branch: event.branch,
-              commitSha: event.commitSha,
-            };
-          }
-          return { ...s, agentTasks: tasks };
+          const tasks = applyAgentComplete(s.agentTasks, event);
+          return tasks ? { ...s, agentTasks: tasks } : s;
         });
         // Don't delete streamingText — it may be the best source until API fetch completes
         break;
@@ -1151,6 +1097,13 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     );
   }
 
+  // During rework a phase EARLIER than workflow.phase goes active again (a
+  // review gate reopened its ticket). workflow.phase is monotonic by design,
+  // so the header derives its label from live phase statuses instead.
+  const earliestActiveIdx = pipelinePhases.findIndex((_, i) => getPhaseStatus(i) === "active");
+  const displayPhaseIdx =
+    earliestActiveIdx >= 0 && earliestActiveIdx < currentPhaseIndex ? earliestActiveIdx : currentPhaseIndex;
+
   // Human-review gates currently awaiting a person: tickets parked in_review
   // with a human:* assignee. Rendered as a small card inside the phase the gate
   // guards (def.reviewGates.afterPhase → pipeline phase id), so the signal is
@@ -1296,7 +1249,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
               // Phase "complete" with open fix-it tickets → name the phase still working
               (state.phase === "complete"
                 ? pipelinePhases.find((p) => p.agents.some((a) => openTicketByAgent.has(a.agentId)))?.name
-                : pipelinePhases[currentPhaseIndex]?.name) || state.phase
+                : pipelinePhases[displayPhaseIdx]?.name) || state.phase
             }`}
           </div>
 

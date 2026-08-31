@@ -82,6 +82,12 @@ python3 /mnt/workspace/toolkit/intervene.py mute      <wfId> --note "why"
    `mark-done` its ticket with the evidence. This is the #1 case and your #1
    job — get the pipeline moving again.
 2. **Silent/crashed agent whose work did NOT ship?** → `retry` it.
+   `retry`/`dispatch` are LEASE-GATED: they refuse (409, "lease live") while
+   the agent published any event within the lease TTL — a slow agent is not a
+   dead agent, and stealing its ticket spawns a duplicate. On a 409: re-check
+   `lastStreamAt`/`lastText` in the dossier. Still producing → leave it alone.
+   Provably dead despite recent events (e.g. its runtime session is gone) →
+   re-run with `--force` and cite the evidence in `--note`.
 3. **Orphan ticket never dispatched (no agent event ever)?** →
    `unstick`/`dispatch` it.
 4. **All non-epic children done/cancelled but the run still shows
