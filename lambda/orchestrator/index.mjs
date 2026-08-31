@@ -481,9 +481,12 @@ async function claimTicketInvocation(workflow, ticketId, assignee) {
   const taskId = workflow.agentTasks?.[ticketId]?.id || `task_${Date.now()}_${assignee}`;
   // Stale-claim escape hatch: a claim older than this is a crashed session, not
   // a live one — a human moving the ticket back to Ready on the board must be
-  // able to re-dispatch without the retry endpoint. Longest legitimate agent
-  // session is ~25 min (claude_code hard-caps at 15); 60 min is safely past it.
-  const staleBefore = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  // able to re-dispatch without the retry endpoint. 2× the lease TTL (R3):
+  // same knob as the lease-aware retry/dispatch endpoints, doubled because
+  // this path has no activity signal — only the claim's age.
+  const ttlMinutes = Number(process.env.WORKFLOW_LEASE_TTL_MINUTES);
+  const leaseTtlMs = (Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? ttlMinutes : 30) * 60_000;
+  const staleBefore = new Date(Date.now() - 2 * leaseTtlMs).toISOString();
   const entry = {
     ...(workflow.agentTasks?.[ticketId] || {}),
     id: taskId,
