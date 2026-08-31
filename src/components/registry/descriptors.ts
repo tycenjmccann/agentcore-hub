@@ -72,11 +72,6 @@ export interface CustomForm {
   description: string;
   dataJson: string;
 }
-export interface SkillsForm {
-  markdown: string;
-  definitionJson: string; // optional skill definition JSON
-}
-
 export function emptyMcpForm(): McpForm {
   return { name: "", description: "", version: "1.0.0" };
 }

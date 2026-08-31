@@ -143,15 +143,6 @@ export interface RepoTarget {
   platform: "ios" | "backend" | "android" | "shared";
 }
 
-// ─── Agent Workspace ─────────────────────────────────────────────────────────
-
-export interface AgentWorkspace {
-  s3Bucket: string;
-  s3Prefix: string;              // workflow-scoped prefix
-  codeInterpreterSessionId?: string;
-  gitBranch?: string;
-}
-
 // ─── Agent-to-Agent Messages ─────────────────────────────────────────────────
 
 export type MessageType = "question" | "answer" | "notification";
