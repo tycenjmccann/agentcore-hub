@@ -50,6 +50,62 @@ describe("effectiveRoundCount", () => {
   it("two continue authorizations → the max resetAtRound wins", () => {
     expect(effectiveRoundCount([cn(1), cn(2), cn(3), cn(4)], [cont(1), cont(3)])).toBe(1);
   });
+
+  it("CN round whose findings entirely omit regressionOf (key absent, not null) → contributes 1, not 2", () => {
+    const noKey: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      findings: [{}, {}],
+    };
+    expect(effectiveRoundCount([noKey])).toBe(1);
+    const noKey2: ShipRoundLike = {
+      round: 2,
+      verdict: "CHANGES-NEEDED",
+      findings: [{}],
+    };
+    expect(effectiveRoundCount([noKey, noKey2])).toBe(2);
+  });
+
+  it("CN round with findings: [] → contributes 1", () => {
+    expect(effectiveRoundCount([cn(1)])).toBe(1);
+  });
+
+  it("CN round with regressionOf: null explicitly → contributes 1 (existing behavior preserved)", () => {
+    const explicitNull: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      findings: [{ regressionOf: null }],
+    };
+    expect(effectiveRoundCount([explicitNull])).toBe(1);
+  });
+
+  it("CN round with regressionOf set to an object → still contributes 2 (regression detection preserved)", () => {
+    expect(effectiveRoundCount([cn(1, 1)])).toBe(2);
+  });
+
+  it("malformed rounds do not throw: missing findings array, and null/non-object finding entries → counted as plain", () => {
+    const missingFindings = { round: 1, verdict: "CHANGES-NEEDED" } as unknown as ShipRoundLike;
+    expect(() => effectiveRoundCount([missingFindings])).not.toThrow();
+    expect(effectiveRoundCount([missingFindings])).toBe(1);
+
+    const junkFindings: ShipRoundLike = {
+      round: 2,
+      verdict: "CHANGES-NEEDED",
+      findings: [null, 42 as unknown as { regressionOf?: Record<string, unknown> | null }],
+    };
+    expect(() => effectiveRoundCount([junkFindings])).not.toThrow();
+    expect(effectiveRoundCount([junkFindings])).toBe(1);
+  });
+
+  it("duplicate round numbers in the ledger: the last entry per round wins and the round is counted once", () => {
+    const round1First = cn(1); // plain
+    const round1Second = cn(1, 1); // same round number, later entry has a regression
+    expect(effectiveRoundCount([round1First, round1Second])).toBe(2);
+
+    const round1Dup = cn(1);
+    const round1DupAgain = cn(1);
+    expect(effectiveRoundCount([round1Dup, round1DupAgain])).toBe(1);
+  });
 });
 
 describe("mergeRound", () => {
