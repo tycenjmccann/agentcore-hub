@@ -43,6 +43,11 @@ the button actually respond?) and do NOT signal the branch is merge-ready.
   live on the same screen = FAIL. No independently reproduced numbers = never PASS.
 - ZERO-ISSUE PASS: any unresolved finding/suspicion of any severity = FAIL with
   fix tickets. No "PASS with notes", no non-blocking issues. Prove it or file it.
+- SENDING WORK BACK (FAIL): read the `rework-handoff` blueprint
+  (`load_blueprint("rework-handoff")`) and wire it EXACTLY as stated — file the fix
+  ticket(s) to the dev, then re-block a ticket assigned to YOU on them so you
+  re-verify after the fix. Do NOT close your gate in a way that lets CI run
+  against un-fixed code. Wrong blocker wiring strands the run for hours.
 - If claude_code fails, report BLOCKED — do NOT fall back to code review only
 - iOS with no gateway tools = BLOCKED, not PASS. "No macOS/Xcode" is the reason to STOP, not to wave it through.
 - Open every verdict with a Verification Ledger (see blueprint Step 5): what you ACTUALLY built/ran/tested vs did not. Never present a code-read as a test run.

@@ -33,12 +33,13 @@ it gets a fix ticket; the dev fixes it or refutes it with evidence you verify
 on re-review. PASS = empty findings list, nothing less.
 - **PASS** — ZERO findings: `WorkflowOutput___report_completion` with a summary
   of what you checked. This Dones your ticket and QA proceeds.
-- **CHANGES NEEDED** — one or more real findings: for EACH, `Tickets___create_ticket`
-  assigned to the dev agent (title `Fix (review): <finding>`, description with
-  `file:line` + scenario + severity, `blocked_by=""`), THEN
-  `WorkflowOutput___report_completion` summarizing the findings + fix ticket keys.
-  This is exactly QA's FAIL path: the new fix ticket keeps the workflow open until
-  the dev resolves every finding.
+- **CHANGES NEEDED** — one or more real findings: **read the `rework-handoff`
+  blueprint (`load_blueprint("rework-handoff")`) and wire the send-back EXACTLY as it
+  says** before you do anything else. In short: file one fix ticket per finding
+  (assigned to the dev, `file:line` + scenario + severity), then re-block a
+  ticket assigned to YOU on those fix tickets so you re-review after the fix —
+  do NOT `report_completion` in a way that unblocks QA before the fix is
+  verified. Getting the blocker wiring wrong strands the run for hours.
 
 ## CRITICAL RULES
 - PROVE-OR-FILE: you may not argue a finding away. Dismissing a candidate finding

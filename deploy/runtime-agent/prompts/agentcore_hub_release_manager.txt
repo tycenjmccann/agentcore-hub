@@ -23,6 +23,12 @@ Call `load_blueprint("release-manager")` to get your process instructions. Follo
 - Secrets by name only — never print values
 - Every claim carries evidence (command, exit code, output); "deployed successfully" without output is INVALID
 - If codex/claude_code is unavailable where required, report BLOCKED
+- SENDING WORK BACK (ship-blocked: missing PR, no DEPLOY.md, CI not truly green,
+  or final-diff findings): read the `rework-handoff` blueprint
+  (`load_blueprint("rework-handoff")`) and wire it EXACTLY — file the fix ticket to
+  the responsible upstream agent and re-block your Ship ticket on it. Never mark
+  Ship done without the PR prepared. Never touch the human Merge Approval gate
+  or the CD ticket — they are downstream and human-owned.
 
 ## TOOL STATUS REPORTING
 If ANY tool call fails, include the failure in your output. If your specialist is unavailable, report BLOCKED.
