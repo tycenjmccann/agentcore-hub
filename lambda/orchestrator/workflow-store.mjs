@@ -132,6 +132,28 @@ export async function putTaskEntry(workflowId, ticketId, entry) {
   }));
 }
 
+/**
+ * Mark a task complete touching ONLY completion-owned fields. Replacing the
+ * entry from a read snapshot races the webhook's concurrent metadata merge
+ * (branch/commitSha/prUrl/output) — whichever write lands last would erase the
+ * other's fields. When the entry was never tracked, seed it whole instead.
+ */
+export async function completeTaskEntry(workflowId, ticketId, seedEntry) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET agentTasks.#tid.#st = :s, agentTasks.#tid.completedAt = :ts",
+      ConditionExpression: "attribute_exists(agentTasks.#tid)",
+      ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
+      ExpressionAttributeValues: { ":s": "complete", ":ts": seedEntry.completedAt },
+    }));
+  } catch (err) {
+    if (err.name !== "ConditionalCheckFailedException") throw err;
+    await putTaskEntry(workflowId, ticketId, seedEntry);
+  }
+}
+
 /** Merge metadata fields (branch/commit/prUrl/output) into one task entry. */
 export async function mergeTaskMetadata(workflowId, ticketId, fields) {
   const names = { "#tid": ticketId };
@@ -236,14 +258,19 @@ export async function removeResumeContext(workflowId, ticketId) {
   }
 }
 
-/** Append a human notification atomically (no full-array rewrite). */
+/**
+ * Append a human notification atomically (no full-array rewrite). Bumps
+ * notifVersion in the same write so a concurrent ackNotifications CAS that
+ * read the pre-append list fails and re-reads instead of overwriting the
+ * fresh notification with its stale copy.
+ */
 export async function appendNotification(workflowId, notification) {
   await _ddb.send(new UpdateCommand({
     TableName: _table,
     Key: { workflowId },
     UpdateExpression:
-      "SET humanNotifications = list_append(if_not_exists(humanNotifications, :empty), :n)",
-    ExpressionAttributeValues: { ":empty": [], ":n": [notification] },
+      "SET humanNotifications = list_append(if_not_exists(humanNotifications, :empty), :n), notifVersion = if_not_exists(notifVersion, :zero) + :one",
+    ExpressionAttributeValues: { ":empty": [], ":n": [notification], ":zero": 0, ":one": 1 },
   }));
 }
 
@@ -304,6 +331,45 @@ export async function completeWorkflow(workflowId, completedAt) {
         ":ts": completedAt,
         ":cancelled": "cancelled",
         ":error": "error",
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/** Record that completion side effects (PR, epic roll-up, event) finished. */
+export async function markFinalized(workflowId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET finalizedAt = :ts",
+    ExpressionAttributeValues: { ":ts": new Date().toISOString() },
+  }));
+}
+
+/**
+ * Take over finalization of a workflow whose completing invocation died
+ * between the completion claim and its side effects (phase=complete but no
+ * finalizedAt after the stale window). Claim-first: the CAS on finalizedAt
+ * means exactly one retry runs the takeover; the side effects themselves are
+ * idempotent (duplicate PR create 422s and is caught, Done transition and the
+ * completion event are harmless to repeat).
+ */
+export async function claimFinalization(workflowId, staleBefore) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET finalizedAt = :ts",
+      ConditionExpression:
+        "phase = :complete AND attribute_not_exists(finalizedAt) AND completedAt < :staleBefore",
+      ExpressionAttributeValues: {
+        ":ts": new Date().toISOString(),
+        ":complete": "complete",
+        ":staleBefore": staleBefore,
       },
     }));
     return true;

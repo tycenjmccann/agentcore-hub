@@ -289,6 +289,12 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": [\"secretsmanager:GetSecretValue\", \"secretsmanager:CreateSecret\", \"secretsmanager:PutSecretValue\"],
         \"Resource\": \"arn:aws:secretsmanager:${AWS_REGION}:${ACCOUNT_ID}:secret:cloud-code/github-app*\"
+      },
+      {
+        \"Sid\": \"WorkflowCommandQueue\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"sqs:SendMessage\",
+        \"Resource\": \"arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:agentcore-hub-workflow-commands.fifo\"
       }
     ]
   }"

@@ -51,7 +51,15 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
           return NextResponse.json({ error: "workflow_id and agent_id required" }, { status: 400 });
         }
 
-        const ticketId = await findTicketForAgent(workflowId, agentId);
+        // Prefer the ticket_id carried on the request — with fix-ticket
+        // fan-out one agent can hold several concurrent entries and the
+        // newest-active heuristic below can pick a sibling.
+        let ticketId = (body.ticket_id as string) || null;
+        if (ticketId) {
+          const wf = await getWorkflowFromDynamo(workflowId);
+          if (!wf?.agentTasks?.[ticketId]) ticketId = null;
+        }
+        if (!ticketId) ticketId = await findTicketForAgent(workflowId, agentId);
         if (!ticketId) {
           return NextResponse.json({ received: true, warning: "Ticket not found" });
         }
@@ -209,8 +217,10 @@ async function updateWorkflowTaskMetadata(workflowId: string, ticketId: string, 
     }));
   } catch (err) {
     // Entry not tracked yet — drop the metadata rather than materializing a
-    // partial entry the orchestrator's claim path doesn't own.
-    console.warn(`[webhook:lambda] task metadata skipped for ${ticketId}: ${(err as Error).message}`);
+    // partial entry the orchestrator's claim path doesn't own. Anything else
+    // (throttle, auth, service error) must propagate so the delivery retries.
+    if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
+    console.warn(`[webhook:lambda] task metadata skipped for ${ticketId}: no tracked entry`);
   }
 }
 

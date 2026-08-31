@@ -469,7 +469,9 @@ async function markTaskComplete(workflow, ticketId, assignee) {
     status: "complete",
     completedAt: now,
   };
-  await store.putTaskEntry(workflow.id, ticketId, entry);
+  // Field-scoped: the webhook's metadata merge (branch/prUrl/output) can land
+  // between our read and this write — a whole-entry put would erase it.
+  await store.completeTaskEntry(workflow.id, ticketId, entry);
   if (!workflow.agentTasks) workflow.agentTasks = {};
   workflow.agentTasks[ticketId] = entry;
 }
@@ -1230,8 +1232,16 @@ async function completeWorkflow(workflow) {
   const completedAt = new Date().toISOString();
   const won = await store.completeWorkflow(workflow.id, completedAt);
   if (!won) {
-    console.log(`[orchestrator] Workflow ${workflow.id} already completed/terminal — skipping duplicate completion.`);
-    return;
+    // A previous completer may have died between the claim and its side
+    // effects (Lambda timeout/kill). If the row is complete but never
+    // finalized and the claim is old, take over finalization exactly once.
+    const staleBefore = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const takeover = await store.claimFinalization(workflow.id, staleBefore);
+    if (!takeover) {
+      console.log(`[orchestrator] Workflow ${workflow.id} already completed/terminal — skipping duplicate completion.`);
+      return;
+    }
+    console.log(`[orchestrator] Workflow ${workflow.id} complete but unfinalized — taking over side effects.`);
   }
   console.log(`[orchestrator] Workflow ${workflow.id} complete!`);
 
@@ -1278,6 +1288,10 @@ async function completeWorkflow(workflow) {
     featureBranch: workflow.featureBranch,
     prUrl,
   });
+
+  // Durable marker that the side effects above all ran — the takeover path's
+  // claim checks this so a completer killed mid-finalization gets resumed.
+  await store.markFinalized(workflow.id);
 }
 
 // ─── Agent Invocation ──────────────────────────────────────────────────────────
@@ -1680,7 +1694,11 @@ async function bootstrapBugWorkflow(bugTicket) {
     console.warn(`[orchestrator] Bootstrap idempotency check failed (continuing): ${err.message}`);
   }
 
-  const workflowId = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  // Deterministic id keyed by the bug: concurrent duplicate deliveries mint
+  // the SAME id, so createWorkflow's attribute_not_exists condition is a real
+  // once-per-bug lock (the epicId-index scan above is eventually consistent
+  // and can miss a just-created row).
+  const workflowId = `wf_bug_${bugKey}`;
   console.log(`[orchestrator] Bootstrapping bug workflow ${workflowId} for ${bugKey}`);
 
   // 1. Create workflow row. The target repo travels ON the Bug ticket as a
@@ -1734,9 +1752,8 @@ async function bootstrapBugWorkflow(bugTicket) {
     intakeChannel: "jira-webhook",
     workflowType: "bug",
   };
-  // Create-once on the row key. Cross-delivery duplicate bootstraps (which
-  // would mint different ids) are prevented upstream: the epicId-index check
-  // above plus the command queue serializing this bug's events (R1).
+  // Create-once on the deterministic row key — the atomic dedup for
+  // concurrent duplicate deliveries.
   const created = await store.createWorkflow(workflow);
   if (!created) {
     console.log(`[orchestrator] Workflow ${workflowId} already exists — skipping duplicate bootstrap.`);

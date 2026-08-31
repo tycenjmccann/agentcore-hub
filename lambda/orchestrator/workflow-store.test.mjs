@@ -5,6 +5,7 @@ import {
   claimInvocation,
   trackTicket,
   mergeTaskMetadata,
+  completeTaskEntry,
   setTaskStatus,
   advancePhase,
   setResumeContext,
@@ -148,6 +149,29 @@ describe("appendNotification", () => {
   it("uses list_append, never a full-array rewrite", async () => {
     await appendNotification("wf_1", { id: "n1" });
     expect(writes()[0].input.UpdateExpression).toContain("list_append(if_not_exists(humanNotifications");
+  });
+
+  it("bumps notifVersion so a concurrent ack CAS fails and re-reads", async () => {
+    await appendNotification("wf_1", { id: "n1" });
+    expect(writes()[0].input.UpdateExpression).toContain("notifVersion = if_not_exists(notifVersion, :zero) + :one");
+  });
+});
+
+describe("completeTaskEntry", () => {
+  it("touches only status + completedAt when the entry exists", async () => {
+    await completeTaskEntry("wf_1", "TEAM-2", { status: "complete", completedAt: "2026-01-01T00:00:00Z" });
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("SET agentTasks.#tid.#st = :s, agentTasks.#tid.completedAt = :ts");
+    expect(w.input.ConditionExpression).toBe("attribute_exists(agentTasks.#tid)");
+  });
+
+  it("seeds the whole entry only when untracked (condition fails)", async () => {
+    failNextCondition = true;
+    const seed = { id: "t1", agentId: "dev", ticketId: "TEAM-2", status: "complete", completedAt: "2026-01-01T00:00:00Z" };
+    await completeTaskEntry("wf_1", "TEAM-2", seed);
+    const last = writes()[writes().length - 1];
+    expect(last.input.UpdateExpression).toBe("SET agentTasks.#tid = :task");
+    expect(last.input.ExpressionAttributeValues[":task"]).toEqual(seed);
   });
 });
 
