@@ -423,6 +423,16 @@ async function handleCallback(cb) {
   const chatId = cb.message.chat.id;
   const [action, id, idx] = (cb.data || "").split("|");
 
+  // Fail closed, same as routeMessage: an empty/unset allowlist authorizes
+  // NOBODY. Inline buttons outlive de-allowlisting — a revoked chat tapping an
+  // old repo-picker button must not file tickets or cancel pending bugs. Ack
+  // the tap (or Telegram re-sends the callback query) without acting on it.
+  if (!ALLOWED_CHAT_IDS.includes(String(chatId))) {
+    console.warn(`[telegram-bug-intake] unauthorized callback from chat ${chatId}: ${cb.data}`);
+    await tgAnswer(cb.id, "Not authorized.");
+    return;
+  }
+
   // Review-gate buttons: gok|<ticketId>|<workflowId> / gno|<ticketId>|<workflowId>
   if (action === "gok" || action === "gno") {
     await handleGateCallback(cb, chatId, action, id, idx);
