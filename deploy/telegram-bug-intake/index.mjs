@@ -496,76 +496,85 @@ async function scanReviewGates() {
     const claimed = await claimGate(notif.ticketId);
     if (!claimed) continue;
 
-    // The chat registry is historical — chat# rows outlive de-allowlisting.
-    // Gate pings must respect the same allowlist as inbound messages, or the
-    // ping leaks workflow titles/links to revoked chats AND their delivery
-    // counts toward `delivered`, suppressing the retry for real reviewers.
-    chats = chats || (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
-    if (!chats.length) {
-      console.warn("[telegram-bug-intake] gate ticket but no allowlisted chats to notify");
-      await releaseGate(notif.ticketId); // nobody was pinged — let a later scan retry
-      continue;
-    }
-
-    // Pull the gate ticket for its title only — it names the gate (e.g.
-    // "Spec Approval"). We deliberately do NOT surface the ticket description:
-    // agents write ad-hoc prose with raw workflows/…md paths that render as
-    // broken links in Telegram. The canonical link to the deliverable is the
-    // doc button below; the ping stays on a fixed template.
-    let title = notif.ticketId;
+    // The claim is written before delivery is proven, so ANY throw between
+    // here and a delivered ping (e.g. a transient listChats Scan failure)
+    // must release it — a stranded claim silences this gate for 30 days.
     try {
-      const tRes = await fetch(`${HUB_API_URL}/api/workflow/${wf.workflowId}/tickets`);
-      if (tRes.ok) {
-        const { tickets = [] } = await tRes.json();
-        const t = tickets.find((x) => x.ticketId === notif.ticketId);
-        if (t?.title) title = t.title;
+      // The chat registry is historical — chat# rows outlive de-allowlisting.
+      // Gate pings must respect the same allowlist as inbound messages, or the
+      // ping leaks workflow titles/links to revoked chats AND their delivery
+      // counts toward `delivered`, suppressing the retry for real reviewers.
+      chats = chats || (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
+      if (!chats.length) {
+        console.warn("[telegram-bug-intake] gate ticket but no allowlisted chats to notify");
+        await releaseGate(notif.ticketId); // nobody was pinged — let a later scan retry
+        continue;
       }
-    } catch { /* ping still goes out with the id */ }
 
-    const reviewer = notif.reviewer || "reviewer";
-    const text =
-      `🚦 *Review gate — ${esc(title)}*\n` +
-      `📋 Run: ${esc(wf.input?.title || wf.workflowId)}\n` +
-      `👤 Awaiting: \`${reviewer}\`\n` +
-      `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})\n\n` +
-      `Open the document below to review, then *Approve* or *Request changes*. ` +
-      `The pipeline is paused on you.`;
-    const keyboard = { inline_keyboard: [[
-      { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
-      { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
-    ]] };
-
-    // Deep-link the deliverables under review: the freshest markdown artifacts
-    // open straight into the hub's artifact viewer (read/edit/save), so the
-    // reviewer can read the actual spec/plan from their phone before tapping
-    // Approve. Best-effort — the ping goes out without buttons if the list 404s.
-    try {
-      const aRes = await fetch(
-        `${HUB_API_URL}/api/workflow/artifacts?workflowId=${encodeURIComponent(wf.workflowId)}`
-      );
-      if (aRes.ok) {
-        const { artifacts = [] } = await aRes.json();
-        const docs = artifacts
-          .filter((a) => a.filename?.toLowerCase().endsWith(".md"))
-          .sort((a, b) => new Date(b.lastModified || 0) - new Date(a.lastModified || 0))
-          .slice(0, 3);
-        for (const doc of docs) {
-          keyboard.inline_keyboard.push([{
-            text: `📄 ${doc.filename}`,
-            url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&artifact=${encodeURIComponent(doc.key)}`,
-          }]);
+      // Pull the gate ticket for its title only — it names the gate (e.g.
+      // "Spec Approval"). We deliberately do NOT surface the ticket description:
+      // agents write ad-hoc prose with raw workflows/…md paths that render as
+      // broken links in Telegram. The canonical link to the deliverable is the
+      // doc button below; the ping stays on a fixed template.
+      let title = notif.ticketId;
+      try {
+        const tRes = await fetch(`${HUB_API_URL}/api/workflow/${wf.workflowId}/tickets`);
+        if (tRes.ok) {
+          const { tickets = [] } = await tRes.json();
+          const t = tickets.find((x) => x.ticketId === notif.ticketId);
+          if (t?.title) title = t.title;
         }
-      }
-    } catch { /* buttons are a bonus, never block the ping */ }
+      } catch { /* ping still goes out with the id */ }
 
-    let delivered = 0;
-    for (const chatId of chats) {
-      try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
-      catch (err) { console.error(`[telegram-bug-intake] gate ping to ${chatId}`, err.message); }
+      const reviewer = notif.reviewer || "reviewer";
+      const text =
+        `🚦 *Review gate — ${esc(title)}*\n` +
+        `📋 Run: ${esc(wf.input?.title || wf.workflowId)}\n` +
+        `👤 Awaiting: \`${reviewer}\`\n` +
+        `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})\n\n` +
+        `Open the document below to review, then *Approve* or *Request changes*. ` +
+        `The pipeline is paused on you.`;
+      const keyboard = { inline_keyboard: [[
+        { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
+        { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
+      ]] };
+
+      // Deep-link the deliverables under review: the freshest markdown artifacts
+      // open straight into the hub's artifact viewer (read/edit/save), so the
+      // reviewer can read the actual spec/plan from their phone before tapping
+      // Approve. Best-effort — the ping goes out without buttons if the list 404s.
+      try {
+        const aRes = await fetch(
+          `${HUB_API_URL}/api/workflow/artifacts?workflowId=${encodeURIComponent(wf.workflowId)}`
+        );
+        if (aRes.ok) {
+          const { artifacts = [] } = await aRes.json();
+          const docs = artifacts
+            .filter((a) => a.filename?.toLowerCase().endsWith(".md"))
+            .sort((a, b) => new Date(b.lastModified || 0) - new Date(a.lastModified || 0))
+            .slice(0, 3);
+          for (const doc of docs) {
+            keyboard.inline_keyboard.push([{
+              text: `📄 ${doc.filename}`,
+              url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&artifact=${encodeURIComponent(doc.key)}`,
+            }]);
+          }
+        }
+      } catch { /* buttons are a bonus, never block the ping */ }
+
+      let delivered = 0;
+      for (const chatId of chats) {
+        try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
+        catch (err) { console.error(`[telegram-bug-intake] gate ping to ${chatId}`, err.message); }
+      }
+      // The claim was written before delivery was proven; if every send failed,
+      // keeping it would silently skip this gate for 30 days.
+      if (!delivered) await releaseGate(notif.ticketId);
+    } catch (err) {
+      await releaseGate(notif.ticketId).catch((relErr) =>
+        console.error("[telegram-bug-intake] releaseGate after gate failure", relErr.message));
+      throw err;
     }
-    // The claim was written before delivery was proven; if every send failed,
-    // keeping it would silently skip this gate for 30 days.
-    if (!delivered) await releaseGate(notif.ticketId);
   }
 }
 
