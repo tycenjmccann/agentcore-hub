@@ -1,0 +1,6 @@
+{
+  "defaultTtlMinutes": 30,
+  "staleClaimMultiplier": 2,
+  "heartbeatEventTypes": ["agent.streaming", "agent.started"],
+  "liveClaimStatuses": ["running", "in_progress"]
+}

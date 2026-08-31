@@ -29,6 +29,7 @@ import {
   InvokeAgentCommand,
 } from "@aws-sdk/client-bedrock-agent-runtime";
 import * as store from "./workflow-store.mjs";
+import { DEFAULT_TTL_MINUTES, STALE_CLAIM_MULTIPLIER } from "./lease.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -485,8 +486,8 @@ async function claimTicketInvocation(workflow, ticketId, assignee) {
   // same knob as the lease-aware retry/dispatch endpoints, doubled because
   // this path has no activity signal — only the claim's age.
   const ttlMinutes = Number(process.env.WORKFLOW_LEASE_TTL_MINUTES);
-  const leaseTtlMs = (Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? ttlMinutes : 30) * 60_000;
-  const staleBefore = new Date(Date.now() - 2 * leaseTtlMs).toISOString();
+  const leaseTtlMs = (Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? ttlMinutes : DEFAULT_TTL_MINUTES) * 60_000;
+  const staleBefore = new Date(Date.now() - STALE_CLAIM_MULTIPLIER * leaseTtlMs).toISOString();
   const entry = {
     ...(workflow.agentTasks?.[ticketId] || {}),
     id: taskId,

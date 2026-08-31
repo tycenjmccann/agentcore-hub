@@ -46,7 +46,14 @@ npm install --omit=dev --no-audit --no-fund --silent
 
 echo "=== Creating deployment zip ==="
 rm -f function.zip
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs package.json node_modules/
+# lease.mjs (TEAM-3618) reads its constants from src/config/lease-constants.json
+# — the SINGLE source of truth shared with the app (src/lib/workflow/lease.ts).
+# The zip only carries files from this directory, so copy the JSON in beside
+# lease.mjs; the module prefers this local copy and falls back to the repo path
+# for local/test runs. Do NOT fork the values — always copy from the repo.
+cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json package.json node_modules/
+rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"

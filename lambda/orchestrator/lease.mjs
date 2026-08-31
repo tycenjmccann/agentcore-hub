@@ -1,61 +1,60 @@
 /**
- * Invocation leases (R3 of docs/race-condition-study.md).
+ * Invocation leases — orchestrator (Lambda) port of src/lib/workflow/lease.ts.
  *
- * "Is the agent dead?" was guessed from silence in three places with three
- * thresholds — and retry/dispatch released the invocation claim with NO proof
- * the old session was dead. A live agent whose ticket got re-Readied means two
- * agents working the same ticket: duplicate PRs, duplicate commits.
+ * TEAM-3618: hand-port of isLeaseLive / lastAgentActivity / stealClaim with
+ * IDENTICAL semantics to the app-side module (R3 of docs/race-condition-study.md
+ * — never re-implement lease semantics). The parity contract test
+ * (src/lib/workflow/lease-parity.test.ts) feeds identical fixtures through both
+ * copies of isLeaseLive and asserts identical booleans.
  *
- * The lease contract, one knob (WORKFLOW_LEASE_TTL_MINUTES, default 30):
- *
- * - An agent is presumed ALIVE while its last observed activity (streaming
- *   text, tool traces, coding-turn poll heartbeats) is younger than the TTL.
- *   Runtimes stream events continuously, so a healthy long-running session
- *   keeps renewing its lease with no new write path.
- * - Stealing a running claim (retry / dispatch) is refused while the lease is
- *   live, unless the caller passes force=true after verifying death by other
- *   evidence (the WM's dossier check, a human reading the session).
- * - The steal itself is a CAS on the claim's startedAt generation — two
- *   concurrent stealers resolve to one winner, and a steal can never clobber
- *   a claim that was re-issued in between.
- * - The orchestrator's claim-stale escape hatch (crashed sessions blocking a
- *   board re-Ready) is 2× TTL on startedAt — same knob, documented multiple.
+ * Both copies read the SAME constants file (src/config/lease-constants.json) —
+ * one source of truth, no forked values. In the repo it lives two directories
+ * up; the orchestrator deploy zip (deploy.sh) copies it in beside this module,
+ * so the deployed copy is preferred and the repo path is the fallback.
  */
 
-import { DynamoDBDocumentClient, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
-import leaseConstants from "../../config/lease-constants.json";
+import { QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
-// Single source of truth shared with the orchestrator Lambda (lambda/
-// orchestrator/lease.mjs reads the SAME file). TEAM-3618: constants extraction
-// only — the values are identical to the literals they replaced.
-const { defaultTtlMinutes, heartbeatEventTypes, liveClaimStatuses } = leaseConstants;
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+function loadLeaseConstants() {
+  const candidates = ["./lease-constants.json", "../../src/config/lease-constants.json"];
+  let lastErr;
+  for (const rel of candidates) {
+    try {
+      return JSON.parse(readFileSync(join(HERE, rel), "utf8"));
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw new Error(`lease-constants.json not found (tried ${candidates.join(", ")}): ${lastErr?.message}`);
+}
+
+const { defaultTtlMinutes, staleClaimMultiplier, heartbeatEventTypes, liveClaimStatuses } = loadLeaseConstants();
 const [HEARTBEAT_TYPE_1, HEARTBEAT_TYPE_2] = heartbeatEventTypes;
 
+// Re-exported for the orchestrator's claim-stale escape hatch
+// (index.mjs claimTicketInvocation), so it reads the same knob + multiple as
+// the lease-aware endpoints instead of re-hardcoding them.
+export const DEFAULT_TTL_MINUTES = defaultTtlMinutes;
+export const STALE_CLAIM_MULTIPLIER = staleClaimMultiplier;
+
 /** A nonnumeric/zero/negative env value must not silently disable leases. */
-function resolveTtlMs(): number {
+function resolveTtlMs() {
   const minutes = Number(process.env.WORKFLOW_LEASE_TTL_MINUTES);
   return (Number.isFinite(minutes) && minutes > 0 ? minutes : defaultTtlMinutes) * 60_000;
 }
 
 export const LEASE_TTL_MS = resolveTtlMs();
 
-export interface AgentTaskEntry {
-  ticketId?: string;
-  agentId?: string;
-  status?: string;
-  startedAt?: string;
-}
-
 /**
  * Pure liveness check. A claim is live when it is running AND the newer of
  * (claim start, last observed agent activity) is within the TTL.
  */
-export function isLeaseLive(
-  task: AgentTaskEntry | undefined,
-  lastActivityIso: string | null,
-  nowMs: number,
-  ttlMs: number = LEASE_TTL_MS
-): boolean {
+export function isLeaseLive(task, lastActivityIso, nowMs, ttlMs = LEASE_TTL_MS) {
   if (!task) return false;
   if (!task.status || !liveClaimStatuses.includes(task.status)) return false;
   const started = task.startedAt ? Date.parse(task.startedAt) : 0;
@@ -81,16 +80,9 @@ export function isLeaseLive(
  * ignored; unstamped events still count (older runtimes don't stamp — err on
  * protecting a possibly-live agent).
  */
-export async function lastAgentActivity(
-  ddb: DynamoDBDocumentClient,
-  eventsTable: string,
-  workflowId: string,
-  agentId: string,
-  ticketId?: string,
-  ttlMs: number = LEASE_TTL_MS
-): Promise<string | null> {
+export async function lastAgentActivity(ddb, eventsTable, workflowId, agentId, ticketId, ttlMs = LEASE_TTL_MS) {
   const windowStart = new Date(Date.now() - ttlMs).toISOString();
-  let lastKey: Record<string, unknown> | undefined;
+  let lastKey;
   // 20 pages × 500 scanned items bounds the read on pathological partitions
   // while covering hours of the busiest observed event volume.
   for (let page = 0; page < 20; page++) {
@@ -113,11 +105,11 @@ export async function lastAgentActivity(
       })
     );
     for (const e of res.Items || []) {
-      const detail = (e.detail || {}) as Record<string, unknown>;
+      const detail = e.detail || {};
       if (ticketId && detail.ticketId && detail.ticketId !== ticketId) continue;
       if (typeof e.timestamp === "string") return e.timestamp;
     }
-    lastKey = res.LastEvaluatedKey as Record<string, unknown> | undefined;
+    lastKey = res.LastEvaluatedKey;
     if (!lastKey) break;
   }
   return null;
@@ -129,13 +121,7 @@ export async function lastAgentActivity(
  * winner under concurrent stealers; never clobbers a re-issued claim.
  * Returns false when the claim moved (completed, re-claimed, already stolen).
  */
-export async function stealClaim(
-  ddb: DynamoDBDocumentClient,
-  workflowsTable: string,
-  workflowId: string,
-  ticketId: string,
-  expectedStartedAt: string | undefined
-): Promise<boolean> {
+export async function stealClaim(ddb, workflowsTable, workflowId, ticketId, expectedStartedAt) {
   try {
     await ddb.send(
       new UpdateCommand({
@@ -156,7 +142,7 @@ export async function stealClaim(
     );
     return true;
   } catch (err) {
-    if ((err as Error).name === "ConditionalCheckFailedException") return false;
+    if (err?.name === "ConditionalCheckFailedException") return false;
     throw err;
   }
 }

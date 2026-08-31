@@ -29,6 +29,11 @@ export default defineConfig({
       // workflow-store is pure DDB-command construction — unit-testable with a
       // stub client, same rationale as the eval-packager classifiers.
       "lambda/orchestrator/workflow-store.test.mjs",
+      // lease.mjs is the orchestrator port of the lease primitives (TEAM-3618)
+      // — pure liveness math + DDB-command construction, stub-client testable.
+      // Its parity with src/lib/workflow/lease.ts is asserted by the auto-
+      // included src/lib/workflow/lease-parity.test.ts.
+      "lambda/orchestrator/lease.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
