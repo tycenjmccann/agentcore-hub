@@ -87,6 +87,11 @@ const POLL_RESERVE_MS = 30_000;
 // Paced transcription (TEAM-3464) costs ~the note's own duration in wall clock;
 // this margin covers Transcribe connect/latency overhead on top of that.
 const TRANSCRIBE_OVERHEAD_MS = 30_000;
+// When Telegram omits the duration, transcribeVoice paces by FILE SIZE at this
+// assumed byte rate (~32kbps OGG/Opus). The pre-flight budget estimate must use
+// the SAME assumption, or a no-duration note bypasses the check and the paced
+// stream dies mid-invocation.
+const VOICE_FALLBACK_BYTE_RATE = 4000;
 // A chat's buffered messages are processed only after this much silence from
 // that chat. Telegram splits albums AND long pastes into separate messages;
 // one burst must become one ticket.
@@ -201,7 +206,31 @@ async function routeMessage(msg, buffers, context) {
   // Native voice note → transcribe, echo what was heard, then treat the
   // transcript exactly like typed text (classification, buffering, wm relay).
   if (msg.voice) {
-    const durationSec = msg.voice.duration || 0;
+    let durationSec = msg.voice.duration;
+    // Telegram can omit/zero the duration. transcribeVoice then paces by file
+    // size, so the budget below must estimate the SAME wall clock from the
+    // same byte rate — a zero here would collapse the estimate to overhead
+    // only, let a huge note pass pre-flight, and die mid-stream before
+    // saveOffset (redelivery loop).
+    if (!(Number.isFinite(durationSec) && durationSec > 0)) {
+      let fileSize = Number.isFinite(msg.voice.file_size) && msg.voice.file_size > 0
+        ? msg.voice.file_size : 0;
+      if (!fileSize) {
+        try {
+          const meta = await tgCall("getFile", { file_id: msg.voice.file_id });
+          if (Number.isFinite(meta?.file_size) && meta.file_size > 0) fileSize = meta.file_size;
+        } catch (err) {
+          console.error("[telegram-bug-intake] voice size lookup", err.message);
+        }
+      }
+      if (!fileSize) {
+        // Neither duration nor size — unbudgetable, so it must never be
+        // replayed. Reject; the offset advances past it.
+        await tgSend(chatId, "🎙️ Couldn't determine that voice note's length to transcribe it — try sending it again, or type the report.");
+        return;
+      }
+      durationSec = fileSize / VOICE_FALLBACK_BYTE_RATE;
+    }
     if (durationSec > 600) {
       await tgSend(chatId, "🎙️ That voice note is over 10 minutes — send a shorter one.");
       return;
@@ -453,9 +482,13 @@ async function scanReviewGates() {
     const claimed = await claimGate(notif.ticketId);
     if (!claimed) continue;
 
-    chats = chats || (await listChats());
+    // The chat registry is historical — chat# rows outlive de-allowlisting.
+    // Gate pings must respect the same allowlist as inbound messages, or the
+    // ping leaks workflow titles/links to revoked chats AND their delivery
+    // counts toward `delivered`, suppressing the retry for real reviewers.
+    chats = chats || (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
     if (!chats.length) {
-      console.warn("[telegram-bug-intake] gate ticket but no registered chats to notify");
+      console.warn("[telegram-bug-intake] gate ticket but no allowlisted chats to notify");
       await releaseGate(notif.ticketId); // nobody was pinged — let a later scan retry
       continue;
     }
@@ -786,7 +819,7 @@ export async function transcribeVoice(fileId, durationSec) {
   //   https://docs.aws.amazon.com/transcribe/latest/dg/streaming.html
   //   https://docs.aws.amazon.com/transcribe/latest/dg/streaming-setting-up.html (step 6)
   const CHUNK_MS = 200;
-  const byteRate = durationSec > 0 ? bytes.length / durationSec : 4000; // ~32kbps fallback
+  const byteRate = durationSec > 0 ? bytes.length / durationSec : VOICE_FALLBACK_BYTE_RATE;
   const chunkBytes = Math.max(256, Math.min(16 * 1024, Math.ceil((byteRate * CHUNK_MS) / 1000)));
 
   async function* audioStream() {
