@@ -46,7 +46,7 @@ npm install --omit=dev --no-audit --no-fund --silent
 
 echo "=== Creating deployment zip ==="
 rm -f function.zip
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs package.json node_modules/
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"

@@ -31,6 +31,12 @@ jobs:
       - name: Unit tests (hermetic — no AWS)
         run: npm run test:unit
 
+      # R2 (docs/race-condition-study.md): the workflows table may only be
+      # written through lambda/orchestrator/workflow-store.mjs — ad-hoc writes
+      # are the read-modify-write clobber class behind most workflow races.
+      - name: Workflow-table write guard
+        run: ./scripts/check-workflow-writes.sh
+
       - name: Build
         run: npm run build
 

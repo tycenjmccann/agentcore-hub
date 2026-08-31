@@ -28,6 +28,7 @@ import {
   BedrockAgentRuntimeClient,
   InvokeAgentCommand,
 } from "@aws-sdk/client-bedrock-agent-runtime";
+import * as store from "./workflow-store.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -54,6 +55,7 @@ const JIRA_AUTH = JIRA_EMAIL && JIRA_API_TOKEN
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
 });
+store.initWorkflowStore(ddb, WORKFLOWS_TABLE);
 const lambda = new LambdaClient({ region: REGION });
 const s3 = new S3Client({ region: REGION });
 const events = new EventBridgeClient({ region: REGION });
@@ -467,19 +469,9 @@ async function markTaskComplete(workflow, ticketId, assignee) {
     status: "complete",
     completedAt: now,
   };
-  await ddb.send(new UpdateCommand({
-    TableName: WORKFLOWS_TABLE,
-    Key: { workflowId: workflow.id },
-    UpdateExpression: "SET agentTasks = if_not_exists(agentTasks, :empty)",
-    ExpressionAttributeValues: { ":empty": {} },
-  }));
-  await ddb.send(new UpdateCommand({
-    TableName: WORKFLOWS_TABLE,
-    Key: { workflowId: workflow.id },
-    UpdateExpression: "SET agentTasks.#tid = :task",
-    ExpressionAttributeNames: { "#tid": ticketId },
-    ExpressionAttributeValues: { ":task": entry },
-  }));
+  // Field-scoped: the webhook's metadata merge (branch/prUrl/output) can land
+  // between our read and this write — a whole-entry put would erase it.
+  await store.completeTaskEntry(workflow.id, ticketId, entry);
   if (!workflow.agentTasks) workflow.agentTasks = {};
   workflow.agentTasks[ticketId] = entry;
 }
@@ -492,44 +484,20 @@ async function claimTicketInvocation(workflow, ticketId, assignee) {
   // able to re-dispatch without the retry endpoint. Longest legitimate agent
   // session is ~25 min (claude_code hard-caps at 15); 60 min is safely past it.
   const staleBefore = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-  try {
-    // Ensure the map + entry exist without disturbing a concurrent claim.
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId: workflow.id },
-      UpdateExpression: "SET agentTasks = if_not_exists(agentTasks, :empty)",
-      ExpressionAttributeValues: { ":empty": {} },
-    }));
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId: workflow.id },
-      UpdateExpression: "SET agentTasks.#tid = :task",
-      ConditionExpression:
-        "attribute_not_exists(agentTasks.#tid) OR agentTasks.#tid.#st <> :running OR agentTasks.#tid.startedAt < :staleBefore",
-      ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
-      ExpressionAttributeValues: {
-        ":task": {
-          ...(workflow.agentTasks?.[ticketId] || {}),
-          id: taskId,
-          agentId: assignee,
-          ticketId,
-          status: "running",
-          startedAt: now,
-        },
-        ":running": "running",
-        ":staleBefore": staleBefore,
-      },
-    }));
+  const entry = {
+    ...(workflow.agentTasks?.[ticketId] || {}),
+    id: taskId,
+    agentId: assignee,
+    ticketId,
+    status: "running",
+    startedAt: now,
+  };
+  const claimed = await store.claimInvocation(workflow.id, ticketId, entry, staleBefore);
+  if (claimed) {
     if (!workflow.agentTasks) workflow.agentTasks = {};
-    workflow.agentTasks[ticketId] = {
-      ...(workflow.agentTasks[ticketId] || {}),
-      id: taskId, agentId: assignee, ticketId, status: "running", startedAt: now,
-    };
-    return true;
-  } catch (err) {
-    if (err.name === "ConditionalCheckFailedException") return false;
-    throw err;
+    workflow.agentTasks[ticketId] = entry;
   }
+  return claimed;
 }
 
 /**
@@ -568,7 +536,7 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
       console.log(`[orchestrator] ${ticketId} already has an open review notification — skipping duplicate.`);
       return;
     }
-    workflow.humanNotifications.push({
+    const notification = {
       id: `notif_${ticketId}_${new Date().toISOString()}`,
       type: "review_needed",
       title: `Review needed: ${ticketId}`,
@@ -577,8 +545,11 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
       reviewer,
       timestamp: new Date().toISOString(),
       acknowledged: false,
-    });
-    await saveWorkflow(workflow);
+    };
+    workflow.humanNotifications.push(notification);
+    // Atomic append — a full-row save here would clobber concurrent scoped
+    // writes (sibling claims, resume contexts) with this stale snapshot.
+    await store.appendNotification(workflow.id, notification);
   }
 
   await publishEvent(ticketId, "review.needed", {
@@ -599,10 +570,16 @@ async function handleReviewRejection(gateTicket) {
 
   // Acknowledge this gate's open review notification — the review concluded, and
   // clearing it lets a later cycle (after rework) create a fresh notification.
+  // Persisted via CAS: the previous in-memory-only mutation never landed, so
+  // every rework cycle was blocked from creating its fresh notification.
   if (Array.isArray(workflow.humanNotifications)) {
     for (const n of workflow.humanNotifications) {
       if (n.ticketId === gateTicket.ticketId && n.type === "review_needed") n.acknowledged = true;
     }
+    await store.ackNotifications(
+      workflow.id,
+      (n) => n.ticketId === gateTicket.ticketId && n.type === "review_needed"
+    );
   }
 
   // The gate's blockedBy lists the agent tickets it reviewed. Their shared agent
@@ -653,7 +630,7 @@ async function handleReviewRejection(gateTicket) {
         `conversation with its context intact — or omit it to start fresh. Resume is best-effort.`
       : "";
     const resumeNote = `## Review feedback (changes requested)\n${feedback}\n\nAddress this feedback and redo your work.${sessionHint}`;
-    await setResumeContext(workflow.id, up.ticketId, resumeNote);
+    await store.setResumeContext(workflow.id, up.ticketId, resumeNote);
     reopened.push(up.ticketId);
   }
 
@@ -710,42 +687,9 @@ async function findCodingSession(workflowId, agentId) {
 async function consumeResumeContext(workflow, ticketId) {
   const note = workflow.resumeContexts?.[ticketId];
   if (!note) return null;
-  // Atomic per-key REMOVE on the resumeContexts map — NOT a full-object put.
-  // Multiple reworked tickets re-run concurrently; a full put here would clobber
-  // sibling updates. Scoping the write to one map key keeps them independent.
   delete workflow.resumeContexts[ticketId];
-  try {
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId: workflow.id },
-      UpdateExpression: "REMOVE resumeContexts.#k",
-      ExpressionAttributeNames: { "#k": ticketId },
-    }));
-  } catch (err) {
-    // Fall back to a full save if the map attribute doesn't exist yet.
-    console.warn(`[orchestrator] atomic resumeContext remove failed (${ticketId}): ${err.message}`);
-    await saveWorkflow(workflow);
-  }
+  await store.removeResumeContext(workflow.id, ticketId);
   return note;
-}
-
-/** Atomically set resumeContexts[ticketId] without overwriting the whole row. */
-async function setResumeContext(workflowId, ticketId, note) {
-  // Ensure the map exists (no-op if already present), then set just our key.
-  // Two scoped updates avoid clobbering concurrent sibling writes.
-  await ddb.send(new UpdateCommand({
-    TableName: WORKFLOWS_TABLE,
-    Key: { workflowId },
-    UpdateExpression: "SET resumeContexts = if_not_exists(resumeContexts, :empty)",
-    ExpressionAttributeValues: { ":empty": {} },
-  }));
-  await ddb.send(new UpdateCommand({
-    TableName: WORKFLOWS_TABLE,
-    Key: { workflowId },
-    UpdateExpression: "SET resumeContexts.#k = :note",
-    ExpressionAttributeNames: { "#k": ticketId },
-    ExpressionAttributeValues: { ":note": note },
-  }));
 }
 
 /**
@@ -839,19 +783,7 @@ async function handleTicketReadyUnified(ticketId, ticket) {
       workflow.featureBranch = await ensureFeatureBranch(workflow);
     }
 
-    // Scoped write — a full-row put here would clobber concurrent sibling
-    // claims (many tickets of the same phase go ready in the same second).
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId: workflow.id },
-      UpdateExpression: workflow.featureBranch
-        ? "SET phase = :p, featureBranch = if_not_exists(featureBranch, :fb)"
-        : "SET phase = :p",
-      ExpressionAttributeValues: {
-        ":p": workflow.phase,
-        ...(workflow.featureBranch ? { ":fb": workflow.featureBranch } : {}),
-      },
-    }));
+    await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
   // Build context and invoke — SAME buildAgentContext for both paths
@@ -880,7 +812,7 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
   await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: agentDef.phase, workflowId: workflow.id });
 
-  await invokeAgent(agentDef, context, workflow);
+  await invokeAgent(agentDef, context, workflow, ticketId);
 }
 
 /**
@@ -1044,8 +976,6 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
   // Already tracked (e.g., from a retry/re-delivery) — don't overwrite
   if (workflow.agentTasks?.[ticketId]) return;
 
-  // Scoped per-key write — tickets are created in bursts concurrent with
-  // sibling invocation claims; a full-row put here would clobber them.
   const entry = {
     id: `task_${Date.now()}_${assignee}`,
     agentId: assignee,
@@ -1053,25 +983,8 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
     status: "pending",
     createdAt: new Date().toISOString(),
   };
-  await ddb.send(new UpdateCommand({
-    TableName: WORKFLOWS_TABLE,
-    Key: { workflowId: workflow.id },
-    UpdateExpression: "SET agentTasks = if_not_exists(agentTasks, :empty)",
-    ExpressionAttributeValues: { ":empty": {} },
-  }));
-  try {
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId: workflow.id },
-      UpdateExpression: "SET agentTasks.#tid = :task",
-      ConditionExpression: "attribute_not_exists(agentTasks.#tid)",
-      ExpressionAttributeNames: { "#tid": ticketId },
-      ExpressionAttributeValues: { ":task": entry },
-    }));
-  } catch (err) {
-    if (err.name !== "ConditionalCheckFailedException") throw err;
-    return; // concurrently tracked — keep the existing entry
-  }
+  const created = await store.trackTicket(workflow.id, ticketId, entry);
+  if (!created) return; // concurrently tracked — keep the existing entry
   if (!workflow.agentTasks) workflow.agentTasks = {};
   workflow.agentTasks[ticketId] = entry;
   console.log(`[orchestrator] Tracked new ticket ${ticketId} (${assignee}) in workflow ${workflow.id}`);
@@ -1241,18 +1154,7 @@ async function handleTicketReady(ticketId, image) {
       workflow.featureBranch = await ensureFeatureBranch(workflow);
     }
 
-    // Scoped write — full-row put would clobber concurrent sibling claims.
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId: workflow.id },
-      UpdateExpression: workflow.featureBranch
-        ? "SET phase = :p, featureBranch = if_not_exists(featureBranch, :fb)"
-        : "SET phase = :p",
-      ExpressionAttributeValues: {
-        ":p": workflow.phase,
-        ...(workflow.featureBranch ? { ":fb": workflow.featureBranch } : {}),
-      },
-    }));
+    await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
   // Build context and invoke agent
@@ -1283,34 +1185,10 @@ async function handleTicketReady(ticketId, image) {
 
   // Fire-and-forget: invoke agent via AgentCore Harness
   // The agent will call report_completion when done → writes "done" to DynamoDB → triggers this Lambda again
-  await invokeAgent(agentDef, context, workflow);
+  await invokeAgent(agentDef, context, workflow, ticketId);
 }
 
 // ─── QA Gate ───────────────────────────────────────────────────────────────────
-
-async function shouldCreateQaTicket(epicId, workflow) {
-  const children = await getChildTickets(epicId);
-
-  // Check if QA ticket already exists (active OR done — never create more than one)
-  const hasQaTicket = children.some(
-    (t) => t.assignee === "agentcore_hub_qa_verifier" && t.status !== "blocked"
-  );
-  if (hasQaTicket) return false;
-
-  // Check if all dev tickets are done
-  const devTickets = children.filter(
-    (t) => t.assignee && (t.assignee.endsWith("_dev") || t.assignee.endsWith("_frontend"))
-  );
-  if (devTickets.length === 0) return false;
-  const allDevsDone = devTickets.every((t) => t.status === "done");
-  if (!allDevsDone) return false;
-
-  // Check if design tickets are done
-  const designTickets = children.filter((t) => t.assignee && t.assignee.endsWith("_designer"));
-  const allDesignDone = designTickets.every((t) => t.status === "done");
-
-  return allDevsDone && allDesignDone;
-}
 
 async function isWorkflowComplete(epicId, workflow) {
   const children = await getChildTickets(epicId);
@@ -1341,66 +1219,32 @@ async function isWorkflowComplete(epicId, workflow) {
   return children.every((t) => t.status === "done");
 }
 
-async function createQaVerificationTicket(workflow) {
-  console.log(`[orchestrator] All dev agents complete. Creating QA ticket...`);
-
-  workflow.phase = "verification";
-  await saveWorkflow(workflow);
-  await publishEvent(workflow.epicId, "workflow.phase_change", { phase: "verification", workflowId: workflow.id });
-
-  const children = await getChildTickets(workflow.epicId);
-  const devTickets = children.filter((t) => t.assignee && t.assignee.endsWith("_dev"));
-  const devSummaries = devTickets.map((t) => `- ${t.title} (${t.assignee}): ${t.status}`).join("\n");
-  const inputSources = (workflow.input?.sources || []).map((s) => `- ${s.type}: ${s.value}`).join("\n");
-
-  const qaDescription = `## QA Verification: ${workflow.input.title}
-
-### What was built:
-${devSummaries}
-
-### Feature branch: \`${workflow.featureBranch || "unknown"}\`
-
-### Original input/mockups:
-${inputSources}
-
-### Your job:
-1. Build and run the app on the feature branch
-2. Visually compare EVERY affected page against the original mockups
-3. Run functional tests
-4. Run regression tests
-5. If all passes → report_completion
-6. If anything fails → request_fix back to the dev agent with evidence`;
-
-  // Create QA ticket (status=todo, no blockers → stream will fire handleTicketReady)
-  const ticketId = await nextTicketId();
-  await ddb.send(new PutCommand({
-    TableName: TICKETS_TABLE,
-    Item: {
-      ticketId,
-      type: "task",
-      title: "QA: Visual & functional verification",
-      description: qaDescription,
-      status: "todo",
-      assignee: "agentcore_hub_qa_verifier",
-      parentId: workflow.epicId,
-      workflowId: workflow.id,
-      comments: [],
-      artifacts: [],
-      blockedBy: [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    },
-  }));
-
-  console.log(`[orchestrator] Created QA ticket ${ticketId}`);
-}
-
 async function completeWorkflow(workflow) {
   if (workflow.phase === "complete") return;
+
+  // Atomic completion claim FIRST — only the winner runs the side effects
+  // (PR creation, epic roll-up, the workflow.complete event). Previously the
+  // guard was the stale in-memory phase + a full-row put: two concurrent
+  // "last ticket done" cascades both passed it, double-firing the side
+  // effects and clobbering concurrent scoped writes (study P1).
+  const completedAt = new Date().toISOString();
+  const won = await store.completeWorkflow(workflow.id, completedAt);
+  if (!won) {
+    // A previous completer may have died between the claim and its side
+    // effects (Lambda timeout/kill). If the row is complete but never
+    // finalized and the claim is old, take over finalization exactly once.
+    const staleBefore = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const takeover = await store.claimFinalization(workflow.id, staleBefore);
+    if (!takeover) {
+      console.log(`[orchestrator] Workflow ${workflow.id} already completed/terminal — skipping duplicate completion.`);
+      return;
+    }
+    console.log(`[orchestrator] Workflow ${workflow.id} complete but unfinalized — taking over side effects.`);
+  }
   console.log(`[orchestrator] Workflow ${workflow.id} complete!`);
 
   workflow.phase = "complete";
-  workflow.completedAt = new Date().toISOString();
+  workflow.completedAt = completedAt;
 
   // Create unified PR if feature branch exists — unless the def has a "ship"
   // phase: there the release manager owns the PR, and by completion time the
@@ -1437,12 +1281,15 @@ async function completeWorkflow(workflow) {
     }
   }
 
-  await saveWorkflow(workflow);
   await publishEvent(workflow.epicId, "workflow.complete", {
     workflowId: workflow.id,
     featureBranch: workflow.featureBranch,
     prUrl,
   });
+
+  // Durable marker that the side effects above all ran — the takeover path's
+  // claim checks this so a completer killed mid-finalization gets resumed.
+  await store.markFinalized(workflow.id);
 }
 
 // ─── Agent Invocation ──────────────────────────────────────────────────────────
@@ -1452,25 +1299,24 @@ async function completeWorkflow(workflow) {
  * Fire-and-forget: agent runs asynchronously. When done, it calls report_completion
  * which writes "done" to DynamoDB, triggering this Lambda again via the stream.
  */
-async function invokeAgent(agentDef, context, workflow) {
+async function invokeAgent(agentDef, context, workflow, ticketId) {
   // Discover agent ARN — prefer runtimeArn from roster, then env var lookup
   const runtimeEnvKey = `RUNTIME_ARN_${agentDef.agentId.toUpperCase()}`;
   const harnessEnvKey = `HARNESS_ARN_${agentDef.agentId.toUpperCase()}`;
   const harnessArn = agentDef.runtimeArn || process.env[runtimeEnvKey] || process.env[harnessEnvKey];
   if (!harnessArn) {
     console.error(`[orchestrator] No ARN for agent: ${agentDef.agentId}. Tried ${runtimeEnvKey} and ${harnessEnvKey}. Marking ticket blocked.`);
-    const task = Object.values(workflow.agentTasks || {}).find(t => t.agentId === agentDef.agentId && t.status === "running");
     // Publish the error FIRST — the ticket-blocking below can fail (e.g. the
     // tickets table doesn't exist in Jira mode) and the Workflow Manager needs
     // an agent.error event to distinguish "never started" from "hung".
     await publishEvent(workflow.epicId, "agent.error", {
       agentId: agentDef.agentId,
       workflowId: workflow.id,
-      ticketId: task?.ticketId || "",
+      ticketId: ticketId || "",
       error: `No runtime ARN configured. Set ${runtimeEnvKey} env var on orchestrator Lambda.`,
     });
-    await releaseClaimOnFailure(workflow.id, task?.ticketId);
-    await blockTicketForFailedInvoke(task?.ticketId, "no runtime ARN configured");
+    await releaseClaimOnFailure(workflow.id, ticketId);
+    await blockTicketForFailedInvoke(ticketId, "no runtime ARN configured");
     return;
   }
   console.log(`[orchestrator] Using ${harnessArn.includes("/runtime/") ? "Runtime" : "Harness"} for ${agentDef.agentId}`);
@@ -1498,8 +1344,7 @@ async function invokeAgent(agentDef, context, workflow) {
     // The agent stream will run to completion. When done, the agent's report_completion
     // tool writes "done" status to DynamoDB, which triggers this Lambda via stream.
     // Prefix with ticketId so OTEL traces are discoverable by Jira ticket in the Ticket History page
-    const task = Object.values(workflow.agentTasks || {}).find(t => t.agentId === agentDef.agentId && t.status === "running");
-    const ticketPrefix = task?.ticketId ? `${task.ticketId}_` : "";
+    const ticketPrefix = ticketId ? `${ticketId}_` : "";
     const sessionId = `${ticketPrefix}${workflow.id}-${agentDef.agentId}-${Date.now()}`;
 
     const command = new InvokeAgentCommand({
@@ -1521,7 +1366,7 @@ async function invokeAgent(agentDef, context, workflow) {
         prompt: context,
         workflowId: workflow.id,
         agentId: agentDef.agentId,
-        ticketId: task?.ticketId || "",
+        ticketId: ticketId || "",
         modelOverride: modelConfig,
         // Routine-scoped connectors travel with the workflow → each agent invoke.
         connectors: workflow.connectors,
@@ -1531,8 +1376,8 @@ async function invokeAgent(agentDef, context, workflow) {
     console.log(`[orchestrator] Async invoke sent for ${agentDef.agentId} (session: ${sessionId})`);
 
     // Journey log: agent invocation dispatched
-    await publishEvent(task?.ticketId || agentDef.agentId, "orchestrator.agent_invoked", {
-      ticketId: task?.ticketId || "", agentId: agentDef.agentId, sessionId,
+    await publishEvent(ticketId || agentDef.agentId, "orchestrator.agent_invoked", {
+      ticketId: ticketId || "", agentId: agentDef.agentId, sessionId,
       workflowId: workflow.id, runtimeArn: harnessArn,
     });
 
@@ -1542,23 +1387,22 @@ async function invokeAgent(agentDef, context, workflow) {
         sessionId,
         runtimeArn: harnessArn,
         invokedAt: new Date().toISOString(),
-        ticketId: Object.values(workflow.agentTasks || {}).find(t => t.agentId === agentDef.agentId && t.status === "running")?.ticketId,
+        ticketId,
       });
     } catch (err) {
       console.warn(`[orchestrator] Manifest session write failed (non-fatal): ${err.message}`);
     }
   } catch (err) {
     console.error(`[orchestrator] Failed to invoke ${agentDef.agentId}:`, err);
-    const task = Object.values(workflow.agentTasks || {}).find(t => t.agentId === agentDef.agentId && t.status === "running");
     // Error event first — see the no-ARN path above for why.
     await publishEvent(workflow.epicId, "agent.error", {
       agentId: agentDef.agentId,
       workflowId: workflow.id,
-      ticketId: task?.ticketId || "",
+      ticketId: ticketId || "",
       error: `Invoke failed: ${err.message}`,
     });
-    await releaseClaimOnFailure(workflow.id, task?.ticketId);
-    await blockTicketForFailedInvoke(task?.ticketId, `invoke failed: ${err.message}`);
+    await releaseClaimOnFailure(workflow.id, ticketId);
+    await blockTicketForFailedInvoke(ticketId, `invoke failed: ${err.message}`);
   }
 }
 
@@ -1571,14 +1415,7 @@ async function invokeAgent(agentDef, context, workflow) {
 async function releaseClaimOnFailure(workflowId, ticketId) {
   if (!ticketId) return;
   try {
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: "SET agentTasks.#tid.#st = :s",
-      ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
-      ExpressionAttributeValues: { ":s": "error" },
-      ConditionExpression: "attribute_exists(agentTasks.#tid)",
-    }));
+    await store.setTaskStatus(workflowId, ticketId, "error");
   } catch (err) {
     console.warn(`[orchestrator] releaseClaimOnFailure(${ticketId}): ${err.message}`);
   }
@@ -1773,9 +1610,7 @@ async function buildAgentContext(ticket, workflow) {
 // ─── DynamoDB Helpers ──────────────────────────────────────────────────────────
 
 async function getWorkflow(id) {
-  if (!id || typeof id !== "string") return null;
-  const result = await ddb.send(new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: id }, ConsistentRead: true }));
-  return result.Item || null;
+  return store.getWorkflow(id);
 }
 
 /**
@@ -1823,10 +1658,6 @@ async function resolveWorkflow(workflowId, parentId) {
   return null;
 }
 
-async function saveWorkflow(workflow) {
-  await ddb.send(new PutCommand({ TableName: WORKFLOWS_TABLE, Item: { ...workflow, workflowId: workflow.id } }));
-}
-
 /**
  * Bootstrap a workflow when a Bug is filed directly in Jira (not via /api/workflow/start).
  * The Bug ticket itself is the workflow root — there is no separate Epic wrapper.
@@ -1861,7 +1692,11 @@ async function bootstrapBugWorkflow(bugTicket) {
     console.warn(`[orchestrator] Bootstrap idempotency check failed (continuing): ${err.message}`);
   }
 
-  const workflowId = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  // Deterministic id keyed by the bug: concurrent duplicate deliveries mint
+  // the SAME id, so createWorkflow's attribute_not_exists condition is a real
+  // once-per-bug lock (the epicId-index scan above is eventually consistent
+  // and can miss a just-created row).
+  const workflowId = `wf_bug_${bugKey}`;
   console.log(`[orchestrator] Bootstrapping bug workflow ${workflowId} for ${bugKey}`);
 
   // 1. Create workflow row. The target repo travels ON the Bug ticket as a
@@ -1915,7 +1750,13 @@ async function bootstrapBugWorkflow(bugTicket) {
     intakeChannel: "jira-webhook",
     workflowType: "bug",
   };
-  await saveWorkflow(workflow);
+  // Create-once on the deterministic row key — the atomic dedup for
+  // concurrent duplicate deliveries.
+  const created = await store.createWorkflow(workflow);
+  if (!created) {
+    console.log(`[orchestrator] Workflow ${workflowId} already exists — skipping duplicate bootstrap.`);
+    return;
+  }
 
   // 2. Label the Bug ticket itself with `wf:<id>` so future webhooks can resolve the workflow
   try {
@@ -2369,12 +2210,7 @@ async function ensureFeatureBranch(workflow) {
   const ported = workflow.input?.portedSession;
   if (ported?.branch) {
     try {
-      await ddb.send(new UpdateCommand({
-        TableName: WORKFLOWS_TABLE,
-        Key: { workflowId: workflow.id },
-        UpdateExpression: "SET featureBranch = if_not_exists(featureBranch, :fb)",
-        ExpressionAttributeValues: { ":fb": ported.branch },
-      }));
+      await store.adoptFeatureBranch(workflow.id, ported.branch);
       console.log(`[orchestrator] Adopted ported-session branch as shared feature branch: ${ported.branch}`);
       return ported.branch;
     } catch (err) {
@@ -2389,12 +2225,7 @@ async function ensureFeatureBranch(workflow) {
     const slug = (workflow.input?.title || workflow.id).toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40).replace(/-$/, "");
     const branchName = `feature/${workflow.epicId}-${slug}`;
     await callGitHub("create_branch", { owner, repo, branch_name: branchName, from_branch: baseBranch });
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId: workflow.id },
-      UpdateExpression: "SET featureBranch = if_not_exists(featureBranch, :fb)",
-      ExpressionAttributeValues: { ":fb": branchName },
-    }));
+    await store.adoptFeatureBranch(workflow.id, branchName);
     console.log(`[orchestrator] Shared feature branch ready: ${branchName}`);
     return branchName;
   } catch (err) {
