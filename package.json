@@ -48,6 +48,7 @@
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
+    "@aws-sdk/client-transcribe-streaming": "^3.1049.0",
     "@playwright/test": "^1.60.0",
     "@tailwindcss/typography": "^0.5.19",
     "@types/node": "^20.0.0",
