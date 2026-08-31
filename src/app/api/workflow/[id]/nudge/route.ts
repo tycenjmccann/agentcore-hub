@@ -18,6 +18,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, UpdateCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { JiraClient, mapJiraStatusToInternal, blockersFromLinks } from "@/lib/workflow/jira-client";
+import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -88,7 +89,7 @@ const DISPATCH_TERMINAL = new Set(["done", "cancelled"]);
  * workflow's epic) so `/workflow/A/nudge` can't move a ticket that belongs to
  * workflow B and mis-record the intervention against A.
  */
-async function dispatchJira(ticketKey: string, epicId: string | undefined, workflowId: string) {
+async function dispatchJira(ticketKey: string, epicId: string | undefined, workflowId: string, force: boolean) {
   const jira = JiraClient.fromEnv();
   const issue = await jira.getIssue(ticketKey, ["status", "parent"]);
   const parentKey = (issue.fields.parent as { key?: string } | undefined)?.key;
@@ -102,17 +103,65 @@ async function dispatchJira(ticketKey: string, epicId: string | undefined, workf
   if (internal === "in_review") {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketKey} is in review — human-owned` };
   }
-  await releaseInvocationClaim(workflowId, ticketKey);
+  await releaseInvocationClaim(workflowId, ticketKey, force);
   await jira.transitionIssue(ticketKey, "Ready");
   return { ticketsScanned: 1, nudged: [`${ticketKey} (dispatch→ready)`] };
 }
 
 /**
- * Reset agentTasks[ticketId].status so the orchestrator's atomic invocation
- * claim (status=running) doesn't reject the re-dispatch as a duplicate.
- * Best-effort: a missing map/entry just means there is no claim to release.
+ * Lease-aware claim release (R3 — docs/race-condition-study.md). The old
+ * release was unconditional: dispatching a ticket whose agent was slow but
+ * ALIVE released its claim and re-invoked — two agents on one ticket. Now a
+ * RUNNING claim is only stolen when its lease has expired (no event from the
+ * agent within the TTL, or force), via a CAS on the claim generation. A
+ * non-running entry (error/pending) has no lease and is reset directly.
+ * Throws on a live lease so the dispatch caller reports instead of duplicating.
  */
-async function releaseInvocationClaim(workflowId: string, ticketId: string) {
+async function releaseInvocationClaim(
+  workflowId: string,
+  ticketId: string,
+  force = false
+) {
+  let task: Record<string, unknown> | undefined;
+  try {
+    const wf = await ddb.send(new GetCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+      ConsistentRead: true,
+    }));
+    task = wf.Item?.agentTasks?.[ticketId];
+  } catch { /* no workflow row — nothing to release */ }
+  if (!task) return;
+
+  const running = task.status === "running" || task.status === "in_progress";
+  if (running) {
+    if (!force) {
+      const agentId = String(task.agentId || "");
+      const lastActivity = agentId
+        ? await lastAgentActivity(ddb, EVENTS_TABLE, workflowId, agentId, ticketId)
+        : null;
+      if (isLeaseLive(task, lastActivity, Date.now())) {
+        const err = new Error(
+          `Ticket ${ticketId} is held by ${agentId} with a LIVE lease ` +
+          `(last activity ${lastActivity || "at claim"}, TTL ${Math.round(LEASE_TTL_MS / 60000)}m) — ` +
+          `dispatching now would spawn a duplicate agent. Pass force=true only with evidence the session is dead.`
+        );
+        err.name = "LeaseLiveError";
+        throw err;
+      }
+    }
+    const stolen = await stealClaim(ddb, WORKFLOWS_TABLE, workflowId, ticketId, task.startedAt as string | undefined);
+    if (!stolen) {
+      // The claim moved between our read and the CAS (completed or re-issued).
+      // Proceeding would transition the ticket to Ready anyway — reopening
+      // finished work or duplicating a live agent. Abort the dispatch.
+      throw new Error(
+        `Claim on ${ticketId} moved while dispatching (completed or re-claimed) — nothing to dispatch.`
+      );
+    }
+    return;
+  }
+
   try {
     await ddb.send(new UpdateCommand({
       TableName: WORKFLOWS_TABLE,
@@ -125,7 +174,7 @@ async function releaseInvocationClaim(workflowId: string, ticketId: string) {
   } catch { /* no claim to release */ }
 }
 
-async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: string | undefined) {
+async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: string | undefined, force: boolean) {
   const got = await ddb.send(new GetCommand({ TableName: TICKETS_TABLE, Key: { ticketId } }));
   const ticket = got.Item;
   if (!ticket) return { ticketsScanned: 0, nudged: [], skipped: `${ticketId} not found` };
@@ -142,7 +191,7 @@ async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: st
   if (status === "in_review" || String(ticket.assignee || "").startsWith("human:")) {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} is human-owned` };
   }
-  await releaseInvocationClaim(workflowId, ticketId);
+  await releaseInvocationClaim(workflowId, ticketId, force);
   await ddb.send(new UpdateCommand({
     TableName: TICKETS_TABLE,
     Key: { ticketId },
@@ -213,10 +262,12 @@ export async function POST(
   // Optional targeted dispatch: { ticketId, force } forces one specific orphan
   // ticket to Ready. Bodyless POST keeps the original broad-scan behaviour.
   let targetTicketId: string | undefined;
+  let force = false;
   try {
     const body = await req.json();
     if (body && typeof body.ticketId === "string" && body.ticketId.trim()) {
       targetTicketId = body.ticketId.trim();
+      force = body.force === true;
     }
   } catch {
     /* no body — broad scan */
@@ -240,8 +291,8 @@ export async function POST(
 
     if (targetTicketId) {
       result = ticketProvider === "jira"
-        ? await dispatchJira(targetTicketId, epicId, workflowId)
-        : await dispatchDynamoDB(targetTicketId, workflowId, epicId);
+        ? await dispatchJira(targetTicketId, epicId, workflowId, force)
+        : await dispatchDynamoDB(targetTicketId, workflowId, epicId, force);
     } else if (ticketProvider === "jira") {
       if (!epicId) {
         return NextResponse.json({ error: "Workflow has no epicId — cannot query Jira" }, { status: 400 });
@@ -277,6 +328,10 @@ export async function POST(
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Unknown error";
     console.error(`[nudge] Error for workflow ${workflowId}:`, message);
-    return NextResponse.json({ error: message }, { status: 500 });
+    const leaseLive = err instanceof Error && err.name === "LeaseLiveError";
+    return NextResponse.json(
+      { error: message, ...(leaseLive ? { code: "LEASE_LIVE" } : {}) },
+      { status: leaseLive ? 409 : 500 }
+    );
   }
 }

@@ -46,7 +46,7 @@ npm install --omit=dev --no-audit --no-fund --silent
 
 echo "=== Creating deployment zip ==="
 rm -f function.zip
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs package.json node_modules/
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"
@@ -73,7 +73,14 @@ fi
 # agent-invoker reads just the table/bucket/provider vars, so it deliberately
 # omits ${JIRA_VARS}${GITHUB_VARS}: keeping a long-lived JIRA_API_TOKEN/GITHUB_PAT
 # off a function that never uses them limits where those credentials are exposed.
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}}"
+# Same lease knob as the app (deploy/ecs-express/deploy.sh) — a mismatch lets a
+# board Ready transition bypass a lease the API endpoints still consider live.
+LEASE_VARS=""
+if [ -n "${WORKFLOW_LEASE_TTL_MINUTES:-}" ]; then
+  LEASE_VARS=",WORKFLOW_LEASE_TTL_MINUTES=${WORKFLOW_LEASE_TTL_MINUTES}"
+fi
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}}"
 

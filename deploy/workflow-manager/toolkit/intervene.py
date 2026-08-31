@@ -93,8 +93,27 @@ def api_post(path, body=None):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as res:
-        return json.loads(res.read().decode() or "{}")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            return json.loads(res.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:500]
+        # Only a lease refusal carries code=LEASE_LIVE — other 409s (e.g.
+        # completing an already-terminal workflow) have no --force escape and
+        # must not be reported as one.
+        lease_live = False
+        try:
+            lease_live = json.loads(detail).get("code") == "LEASE_LIVE"
+        except (ValueError, AttributeError):
+            pass
+        if e.code == 409 and lease_live:
+            # Live invocation lease (R3): the agent is likely still working.
+            raise SystemExit(
+                f"REFUSED (lease live): {detail}\n"
+                "Verify death first (pull_dossier lastText / session logs). "
+                "If genuinely dead, re-run with --force."
+            )
+        raise SystemExit(f"API {e.code}: {detail}")
 
 
 def get_ticket(ticket_id):
@@ -139,7 +158,10 @@ def cmd_retry(args):
         for tid, task in (wf.get("agentTasks") or {}).items():
             if task.get("agentId") == args.agent_id or task.get("assignee") == args.agent_id:
                 refuse_if_protected(get_ticket(tid) or {"ticketId": tid})
-    result = api_post(f"/api/workflow/{args.workflow_id}/retry", {"agentId": args.agent_id})
+    body = {"agentId": args.agent_id}
+    if getattr(args, "force", False):
+        body["force"] = True
+    result = api_post(f"/api/workflow/{args.workflow_id}/retry", body)
     publish_intervention(args.workflow_id, "retry", {
         "agentId": args.agent_id, "ticketId": result.get("ticketId"), "note": args.note,
     })
@@ -184,8 +206,10 @@ def cmd_dispatch(args):
     same provider-aware nudge endpoint the UI uses, so it works in Jira mode."""
     if TICKET_PROVIDER != "jira":
         refuse_if_protected(get_ticket(args.ticket_id))
-    result = api_post(f"/api/workflow/{args.workflow_id}/nudge",
-                      {"ticketId": args.ticket_id})
+    body = {"ticketId": args.ticket_id}
+    if getattr(args, "force", False):
+        body["force"] = True
+    result = api_post(f"/api/workflow/{args.workflow_id}/nudge", body)
     publish_intervention(args.workflow_id, "dispatch", {
         "ticketId": args.ticket_id, "note": args.note,
         "nudged": result.get("nudged"),
@@ -415,12 +439,16 @@ def main():
     p.add_argument("workflow_id")
     p.add_argument("agent_id")
     p.add_argument("--note", default="")
+    p.add_argument("--force", action="store_true",
+                   help="steal a LIVE lease — only with evidence the session is dead")
     p.set_defaults(func=cmd_retry)
 
     p = sub.add_parser("dispatch")
     p.add_argument("workflow_id")
     p.add_argument("ticket_id")
     p.add_argument("--note", default="")
+    p.add_argument("--force", action="store_true",
+                   help="steal a LIVE lease — only with evidence the session is dead")
     p.set_defaults(func=cmd_dispatch)
 
     p = sub.add_parser("comment")
