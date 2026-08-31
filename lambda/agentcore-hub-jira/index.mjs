@@ -559,20 +559,36 @@ async function searchIssues(params) {
   return { tickets };
 }
 
-async function getIssue(params) {
+export async function getIssue(params) {
   const { issue_key } = params;
-  // Request the comment field alongside the fields mapIssue reads (same
-  // fields-selection pattern as jiraSearch) so the release manager can see the
-  // human authorization / prior-round context threaded onto the ticket.
+  // Read only the fields mapIssue needs. Comments are NOT requested here: the
+  // embedded `comment` container paginates ASCENDING, so on long threads the
+  // NEWEST comments (where the release manager's DECISION lives) get cut off.
   const query = new URLSearchParams({
-    fields: "summary,status,labels,assignee,issuetype,parent,comment",
+    fields: "summary,status,labels,assignee,issuetype,parent",
   });
   const issue = await jiraFetch(`/rest/api/3/issue/${issue_key}?${query.toString()}`);
-  const comments = (issue.fields?.comment?.comments || []).map((c) => ({
-    author: c.author?.displayName || null,
-    body: adfToText(c.body),
-    created: c.created,
-  }));
+
+  // Fetch comments via the dedicated endpoint newest-first so the latest/decision
+  // comments are always in the first page, then reverse to chronological
+  // (oldest→newest) — callers parse the LAST matching DECISION line, so ordering
+  // matters. Comments are supplementary context: if the fetch fails, log and
+  // return comments: [] rather than failing the whole getIssue.
+  let comments = [];
+  try {
+    const commentQuery = new URLSearchParams({ orderBy: "-created", maxResults: "50" });
+    const data = await jiraFetch(`/rest/api/3/issue/${issue_key}/comment?${commentQuery.toString()}`);
+    comments = (data?.comments || [])
+      .map((c) => ({
+        author: c.author?.displayName || null,
+        body: adfToText(c.body),
+        created: c.created,
+      }))
+      .reverse();
+  } catch (err) {
+    console.log(`[jira-tools] could not fetch comments for ${issue_key}: ${err.message}`);
+  }
+
   return { ...mapIssue(issue), comments };
 }
 
@@ -648,15 +664,38 @@ async function lookupUser(params) {
 // Flatten an Atlassian Document Format (ADF) node tree to plain text. Comment
 // bodies come back as ADF; agents want readable text. Plain strings pass
 // through unchanged.
-function adfToText(node) {
+export function adfToText(node) {
   if (node == null) return "";
   if (typeof node === "string") return node;
   if (Array.isArray(node)) return node.map(adfToText).join("");
   if (node.type === "text") return node.text || "";
+  // A hardBreak (Shift+Enter inside a comment) is a logical line break with no
+  // content — without this it flattens to "" and two lines merge into one, which
+  // can silently join an isolated `DECISION:` line to its rationale.
+  if (node.type === "hardBreak") return "\n";
   const inner = Array.isArray(node.content) ? node.content.map(adfToText).join("") : "";
-  // Block nodes read better with a trailing newline between them.
-  return node.type === "paragraph" || node.type === "heading" ? `${inner}\n` : inner;
+  // Block-level nodes each end on their own line so every logical line in the ADF
+  // doc lands on its own line in the flattened text (the release manager parses an
+  // isolated `DECISION: <value>` line). The endsWith guard avoids gratuitous double
+  // blank lines when a block already ends in a newline (e.g. a listItem whose only
+  // child is a paragraph that already added its own trailing "\n").
+  if (BLOCK_NODES.has(node.type)) {
+    return inner.endsWith("\n") ? inner : `${inner}\n`;
+  }
+  return inner;
 }
+
+// Block-level ADF node types that should each terminate a line when flattened.
+// bulletList/orderedList are intentionally omitted: their separation comes from
+// each child listItem's trailing newline, so listing them here would only add
+// blank lines between lists.
+const BLOCK_NODES = new Set([
+  "paragraph",
+  "heading",
+  "listItem",
+  "blockquote",
+  "codeBlock",
+]);
 
 function mapIssue(issue) {
   const fields = issue.fields || {};

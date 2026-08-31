@@ -1,5 +1,11 @@
 {
   "name": "agentcore-hub-jira",
   "version": "1.0.0",
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1121.0"
+  }
 }
