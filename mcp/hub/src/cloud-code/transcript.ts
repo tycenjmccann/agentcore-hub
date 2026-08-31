@@ -88,23 +88,6 @@ export async function installLocalTranscript(
   return { path: dest, overwrote, backup };
 }
 
-function textFromContent(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    // Assistant content is blocks; keep text blocks, summarize tool_use briefly.
-    return content
-      .map((b: any) => {
-        if (b?.type === "text") return b.text || "";
-        if (b?.type === "tool_use") return `[used tool: ${b.name}]`;
-        if (b?.type === "tool_result") return ""; // tool output is noise for handoff
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
-  }
-  return "";
-}
-
 /** The Claude session id for a transcript = its filename (verified: the
  *  filename always equals the `sessionId` field inside the records). */
 export function sessionIdForTranscript(file: string): string {
