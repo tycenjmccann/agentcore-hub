@@ -87,7 +87,27 @@ claude_code(
 - Verify agent selection is justified (no unnecessary agents)
 - Verify dependency chain is correct
 - Save requirements: `S3Storage___write_object` to `workflows/{workflow_id}/shared/requirements.md`
-- Create tickets via `Tickets___create_ticket` with correct blocked_by chains
+
+Then create the tickets using a **list-first / verify-after** discipline — this run
+may be a RE-INVOCATION (a retry/replay), and blindly re-creating the chain produces
+a full duplicate set of tickets that wedges the whole run:
+
+- **4a — Check for an existing chain BEFORE creating.** Call `Tickets___list_tickets(epic_id)`.
+  Look at the `agent:*` assignees already present under this epic:
+  - If tickets for the SAME assignees your plan calls for already exist, the chain
+    was already created on a prior invocation. Do NOT recreate it. Create only the
+    genuinely-missing tickets (an assignee in your plan with no ticket yet), then go
+    to 4c. If the full chain is already present, skip creation entirely.
+  - If none exist, this is a fresh run — proceed to 4b.
+- **4b — Create the missing tickets** via `Tickets___create_ticket` with correct
+  `blocked_by` chains (the tiers from Step 3).
+- **4c — Verify after creating.** Call `Tickets___list_tickets(epic_id)` again and confirm:
+  - Exactly ONE ticket per planned assignee. Expected exceptions: `agentcore_hub_release_manager`
+    has TWO (Ship + CD); a dev surface intentionally split into serially-chained tickets has more.
+  - No two tickets share the same `agent:*` assignee at the same tier (that is a duplicate chain).
+  - If you find a duplicate assignee/tier, do NOT proceed silently: `Tickets___add_comment` on the
+    epic flagging the duplicate ticket keys, and report the anomaly in `report_completion` so a human
+    can cancel the extra chain.
 - `WorkflowOutput___report_completion`
 
 ## Rules

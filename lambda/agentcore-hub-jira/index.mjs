@@ -236,9 +236,15 @@ async function createTicket(params) {
       const existingSearch = await jiraSearch(jql, ["summary", "status", "labels", "assignee", "issuetype", "parent"], 5);
       const wantAgentLabel = assignee && !isHumanReviewer ? `agent:${assignee}` : null;
       const wantReviewerLabel = isHumanReviewer ? `reviewer:${assignee.slice("human:".length)}` : null;
+      // Normalize so cosmetic rewordings of the SAME planned ticket dedupe:
+      // trim, collapse internal whitespace, lowercase, drop a trailing period.
+      // (A full re-plan with materially different titles is caught upstream by
+      // the analyst's list-first/verify-after step, not here.)
+      const normSummary = (s) =>
+        (s || "").trim().replace(/\s+/g, " ").toLowerCase().replace(/\.$/, "");
+      const wantSummary = normSummary(summary);
       const dup = (existingSearch.issues || []).find((iss) => {
-        const s = (iss.fields?.summary || "").trim();
-        if (s !== summary.trim()) return false; // summary ~ is fuzzy; require exact
+        if (normSummary(iss.fields?.summary) !== wantSummary) return false; // summary ~ is fuzzy; require normalized-exact
         const labs = iss.fields?.labels || [];
         if (wantAgentLabel) return labs.includes(wantAgentLabel);
         if (wantReviewerLabel) return labs.includes(wantReviewerLabel);
