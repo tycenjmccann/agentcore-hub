@@ -71,10 +71,21 @@ function referencedColorVars(): Map<string, string[]> {
   return refs;
 }
 
+/** Extracts the declaration body of a top-level CSS block (no nested braces). */
+function extractBlock(css: string, selector: RegExp): string {
+  const match = css.match(selector);
+  if (!match) {
+    throw new Error(`Could not find block for selector ${selector} in globals.css`);
+  }
+  return match[1];
+}
+
 describe('theme CSS variable presence (TEAM-3507)', () => {
   const css = fs.readFileSync(GLOBALS_CSS, 'utf-8');
   const defined = definedColorVars(css);
   const referenced = referencedColorVars();
+  const rootBlock = extractBlock(css, /:root\s*\{([\s\S]*?)\n\}/);
+  const darkBlock = extractBlock(css, /\[data-theme="dark"\]\s*\{([\s\S]*?)\n\}/);
 
   it('defines every --color-* variable referenced via var() in the source', () => {
     const undefinedRefs: string[] = [];
@@ -94,9 +105,14 @@ describe('theme CSS variable presence (TEAM-3507)', () => {
     expect(defined.has('--color-bg-secondary')).toBe(true);
   });
 
-  it('defines --color-bg-secondary in both the light (:root) and dark theme blocks', () => {
-    // Two declarations — one per theme block — so the modal is opaque in both.
-    const count = (css.match(/--color-bg-secondary\s*:/g) ?? []).length;
-    expect(count).toBeGreaterThanOrEqual(2);
+  it.each([
+    ['--color-bg-secondary', 'light (:root)', () => rootBlock],
+    ['--color-bg-secondary', 'dark ([data-theme="dark"])', () => darkBlock],
+    ['--color-bg-tertiary', 'light (:root)', () => rootBlock],
+    ['--color-bg-tertiary', 'dark ([data-theme="dark"])', () => darkBlock],
+  ])('declares %s in the %s theme block', (varName, _label, getBlock) => {
+    const block = getBlock();
+    const pattern = new RegExp(`${varName}\\s*:`);
+    expect(pattern.test(block)).toBe(true);
   });
 });
