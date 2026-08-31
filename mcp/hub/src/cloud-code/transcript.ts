@@ -1,11 +1,11 @@
 /**
- * Extract a compact conversation context from the local Claude Code transcript.
+ * Locate and install local Claude Code transcript files for cloud handoff.
  *
  * Claude Code stores one .jsonl per session under
  *   ~/.claude/projects/<cwd-with-slashes-as-dashes>/<sessionId>.jsonl
- * The raw file is large (tool calls, file snapshots, attachments, mode records).
- * For the cloud handoff we only need the human↔assistant thread, so we keep
- * `user` and `assistant` text and drop everything else, then tail it to a budget.
+ * This module resolves the per-project transcript directory, finds the newest
+ * session file, derives its session id, and places pulled cloud transcripts back
+ * where `claude --resume <sessionId>` can pick them up.
  */
 import { readdir, readFile, stat, realpath, mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
