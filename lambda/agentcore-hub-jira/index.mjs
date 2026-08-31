@@ -243,7 +243,17 @@ async function createTicket(params) {
       const normSummary = (s) =>
         (s || "").trim().replace(/\s+/g, " ").toLowerCase().replace(/\.$/, "");
       const wantSummary = normSummary(summary);
+      // A same-summary ticket that is already Done/Closed must NOT be treated as
+      // a duplicate. Escalation gates (e.g. "ship-review not converging") are
+      // recreated on purpose; if we returned the prior, resolved gate its stale
+      // "DECISION: continue" comment gets re-parsed and the round cap resets
+      // forever without a fresh human decision. A terminal status → create anew.
+      const isDoneStatus = (iss) => {
+        const internal = mapStatusToInternal(iss.fields?.status?.name || "");
+        return internal === "done" || internal === "closed";
+      };
       const dup = (existingSearch.issues || []).find((iss) => {
+        if (isDoneStatus(iss)) return false; // completed gate is not a live duplicate
         if (normSummary(iss.fields?.summary) !== wantSummary) return false; // summary ~ is fuzzy; require normalized-exact
         const labs = iss.fields?.labels || [];
         if (wantAgentLabel) return labs.includes(wantAgentLabel);
@@ -560,25 +570,59 @@ async function searchIssues(params) {
 }
 
 export async function getIssue(params) {
-  const { issue_key } = params;
+  // Accept both `issue_key` (agent-facing tool schema) and `ticket_id` (the
+  // gateway tool schema for Tickets___get_issue exposes ONLY ticket_id). Without
+  // this, a schema-conforming gateway-direct call hits Jira with `undefined`.
+  const key = params.issue_key || params.ticket_id;
+  if (!key) {
+    throw new Error("get_issue requires an issue_key (or ticket_id)");
+  }
   // Read only the fields mapIssue needs. Comments are NOT requested here: the
   // embedded `comment` container paginates ASCENDING, so on long threads the
   // NEWEST comments (where the release manager's DECISION lives) get cut off.
   const query = new URLSearchParams({
     fields: "summary,status,labels,assignee,issuetype,parent",
   });
-  const issue = await jiraFetch(`/rest/api/3/issue/${issue_key}?${query.toString()}`);
+  const issue = await jiraFetch(`/rest/api/3/issue/${key}?${query.toString()}`);
 
-  // Fetch comments via the dedicated endpoint newest-first so the latest/decision
-  // comments are always in the first page, then reverse to chronological
-  // (oldest→newest) — callers parse the LAST matching DECISION line, so ordering
-  // matters. Comments are supplementary context: if the fetch fails, log and
-  // return comments: [] rather than failing the whole getIssue.
+  // Fetch comments via the dedicated endpoint newest-first, paginating until ALL
+  // comments are retrieved, then reverse to chronological (oldest→newest) —
+  // callers parse the LAST matching DECISION line, so ordering matters AND a
+  // DECISION older than the first page must not be missed.
+  //
+  // This is a HUMAN-AUTHORITY gate: the release manager parses the last DECISION:
+  // line and treats "no DECISION" as `continue`. A comment-fetch failure that
+  // returned a silent comments: [] (or a truncated list) would turn a human
+  // "DECISION: cancel" into `continue`. So FAIL CLOSED: on ANY page failure,
+  // surface `comments_error` (distinguishable) instead of a silent empty/partial
+  // list. `comments: []` is kept for callers that don't inspect comments.
   let comments = [];
+  let commentsError = null;
   try {
-    const commentQuery = new URLSearchParams({ orderBy: "-created", maxResults: "50" });
-    const data = await jiraFetch(`/rest/api/3/issue/${issue_key}/comment?${commentQuery.toString()}`);
-    comments = (data?.comments || [])
+    const collected = [];
+    const pageSize = 50;
+    let startAt = 0;
+    let total = Infinity;
+    let guard = 0;
+    while (startAt < total) {
+      if (++guard > 1000) {
+        throw new Error("comment pagination exceeded guard limit — aborting to avoid infinite loop");
+      }
+      const commentQuery = new URLSearchParams({
+        orderBy: "-created",
+        startAt: String(startAt),
+        maxResults: String(pageSize),
+      });
+      const data = await jiraFetch(`/rest/api/3/issue/${key}/comment?${commentQuery.toString()}`);
+      const page = data?.comments || [];
+      collected.push(...page);
+      total = typeof data?.total === "number" ? data.total : collected.length;
+      if (page.length === 0) break; // no progress → stop rather than loop forever
+      startAt += page.length;
+    }
+    // Pages arrive newest-first (orderBy=-created), and each later page is older,
+    // so `collected` is newest→oldest overall; reverse to chronological.
+    comments = collected
       .map((c) => ({
         author: c.author?.displayName || null,
         body: adfToText(c.body),
@@ -586,10 +630,13 @@ export async function getIssue(params) {
       }))
       .reverse();
   } catch (err) {
-    console.log(`[jira-tools] could not fetch comments for ${issue_key}: ${err.message}`);
+    console.log(`[jira-tools] could not fetch comments for ${key}: ${err.message}`);
+    commentsError = err.message;
   }
 
-  return { ...mapIssue(issue), comments };
+  const out = { ...mapIssue(issue), comments };
+  if (commentsError) out.comments_error = commentsError;
+  return out;
 }
 
 async function getTransitions(params) {
