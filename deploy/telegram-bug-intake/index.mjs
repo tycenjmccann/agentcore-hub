@@ -207,6 +207,10 @@ async function routeMessage(msg, buffers, context) {
   // transcript exactly like typed text (classification, buffering, wm relay).
   if (msg.voice) {
     let durationSec = msg.voice.duration;
+    // Pre-flight getFile result, handed to transcribeVoice so the metadata
+    // lookup happens ONCE per note — a second call could transiently fail and
+    // drop a note that already passed the budget check.
+    let voiceMeta = null;
     // Telegram can omit/zero the duration. transcribeVoice then paces by file
     // size, so the budget below must estimate the SAME wall clock from the
     // same byte rate — a zero here would collapse the estimate to overhead
@@ -217,8 +221,8 @@ async function routeMessage(msg, buffers, context) {
         ? msg.voice.file_size : 0;
       if (!fileSize) {
         try {
-          const meta = await tgCall("getFile", { file_id: msg.voice.file_id });
-          if (Number.isFinite(meta?.file_size) && meta.file_size > 0) fileSize = meta.file_size;
+          voiceMeta = await tgCall("getFile", { file_id: msg.voice.file_id });
+          if (Number.isFinite(voiceMeta?.file_size) && voiceMeta.file_size > 0) fileSize = voiceMeta.file_size;
         } catch (err) {
           console.error("[telegram-bug-intake] voice size lookup", err.message);
         }
@@ -251,7 +255,7 @@ async function routeMessage(msg, buffers, context) {
       return DEFER_UPDATE;
     }
     await tgAction(chatId, "typing");
-    const transcript = await transcribeVoice(msg.voice.file_id, msg.voice.duration || 0);
+    const transcript = await transcribeVoice(msg.voice.file_id, msg.voice.duration || 0, voiceMeta);
     if (!transcript) {
       await tgSend(chatId, "🎙️ Couldn't make out any speech in that voice note — try again?");
       return;
@@ -648,12 +652,28 @@ async function registerChat(chatId) {
 }
 
 async function listChats() {
-  const res = await ddb.send(new ScanCommand({
+  const items = await scanAllPages({
     TableName: PENDING_TABLE,
     FilterExpression: "begins_with(id, :p)",
     ExpressionAttributeValues: { ":p": { S: CHAT_KEY_PREFIX } },
-  }));
-  return (res.Items || []).map((i) => Number(i.chatId.N)).filter(Boolean);
+  });
+  return items.map((i) => Number(i.chatId.N)).filter(Boolean);
+}
+
+// Scan returns at most 1MB per page; rows past the first page are invisible
+// without following LastEvaluatedKey (a chat#/buf# row landing there would
+// silently drop gate pings / buffered messages).
+async function scanAllPages(input) {
+  const items = [];
+  let lastKey;
+  do {
+    const res = await ddb.send(new ScanCommand(
+      lastKey ? { ...input, ExclusiveStartKey: lastKey } : input,
+    ));
+    items.push(...(res.Items || []));
+    lastKey = res.LastEvaluatedKey;
+  } while (lastKey);
+  return items;
 }
 
 // ─── LLM structuring ─────────────────────────────────────────────────────────
@@ -805,8 +825,10 @@ async function attachScreenshot(issueKey, fileId, n) {
 // Telegram voice notes are OGG/Opus @48kHz — Transcribe streaming takes that
 // container natively, so no transcoding layer is needed.
 
-export async function transcribeVoice(fileId, durationSec) {
-  const meta = await tgCall("getFile", { file_id: fileId });
+export async function transcribeVoice(fileId, durationSec, fileMeta = null) {
+  // fileMeta is the caller's pre-flight getFile result (no-duration notes);
+  // reuse it rather than asking Telegram twice. Fetched lazily otherwise.
+  const meta = fileMeta?.file_path ? fileMeta : await tgCall("getFile", { file_id: fileId });
   const res = await fetch(`${TG_FILE}/${meta.file_path}`);
   if (!res.ok) throw new Error(`Telegram voice download ${res.status}`);
   const bytes = new Uint8Array(await res.arrayBuffer());
@@ -998,12 +1020,12 @@ const tgAction = (chatId, action) => tgCall("sendChatAction", { chat_id: chatId,
 
 async function loadBuffers() {
   const buffers = new Map();
-  const res = await ddb.send(new ScanCommand({
+  const items = await scanAllPages({
     TableName: PENDING_TABLE,
     FilterExpression: "begins_with(id, :p)",
     ExpressionAttributeValues: { ":p": { S: BUFFER_KEY_PREFIX } },
-  }));
-  for (const item of res.Items || []) {
+  });
+  for (const item of items) {
     const b = JSON.parse(item.buffer.S);
     buffers.set(b.chatId, b);
   }
