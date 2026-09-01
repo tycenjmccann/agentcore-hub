@@ -43,17 +43,20 @@ const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 
-// TEAM-3619 D4a: the deliverable-evidence gate. DEFAULT OFF — this is a
-// deliberate rollout posture, NOT an oversight: the design (§X.5 step 6)
-// mandates "evidence check behind COMPLETION_EVIDENCE_REQUIRED flag (shadow-log
-// first)". With the flag off a run missing evidence still completes but we
-// shadow-log what WOULD have been blocked, so the check can be observed in prod
-// before it's enforced; only an explicit on/true/1 turns the 409 on. Do not
-// flip this default without advancing the rollout step. This mirrors the flag
-// posture of the other lifecycle guards; there is deliberately NO force/bypass
-// parameter regardless of the flag.
-const COMPLETION_EVIDENCE_REQUIRED = /^(on|true|1)$/i.test(
-  process.env.COMPLETION_EVIDENCE_REQUIRED || ""
+// TEAM-3619 D4a / TEAM-3690: the deliverable-evidence gate. DEFAULT ON
+// (ENFORCE). The design (§X.5 step 6) mandated "evidence check behind
+// COMPLETION_EVIDENCE_REQUIRED flag (shadow-log first)"; that shadow-first
+// observation step is now COMPLETE. Per QA finding F2 (AC-D4.1: "a ticket with
+// an empty completion record cannot close") the rollout has advanced to
+// enforce-by-default — a run missing evidence gets a 409, not a shadow-log.
+// Shadow mode remains ONLY as an explicit emergency opt-OUT: set
+// COMPLETION_EVIDENCE_REQUIRED=off|false|0 (case-insensitive) to fall back to
+// shadow-log-and-complete. This is fail-closed: any other value — unset, empty,
+// or unrecognized garbage — ENFORCES, so an unparseable value can never
+// silently disable the invariant. As with the other lifecycle guards there is
+// deliberately still NO force/bypass request parameter regardless of the flag.
+const COMPLETION_EVIDENCE_REQUIRED = !/^(off|false|0)$/i.test(
+  (process.env.COMPLETION_EVIDENCE_REQUIRED || "").trim()
 );
 
 // agentId → agent phase, from the bundled roster (same doc the pipeline reads).
@@ -250,8 +253,10 @@ export async function POST(
 
     // 2b. TEAM-3619 D4a: deliverable-evidence gate. Every done ticket in a
     //     completion-required phase must have real work behind it (task output or
-    //     an artifact). Flag OFF → shadow-log and continue; flag ON → 409. No
-    //     bypass parameter: the same reason the open-children gate has none.
+    //     an artifact). Enforced by default (TEAM-3690): missing evidence → 409.
+    //     Only the explicit opt-out COMPLETION_EVIDENCE_REQUIRED=off|false|0 falls
+    //     back to shadow-log-and-continue. No bypass parameter: the same reason
+    //     the open-children gate has none.
     try {
       const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
       const requiredPhases = def?.completionRequiresAgentPhases || [];
@@ -265,7 +270,7 @@ export async function POST(
           return NextResponse.json({ error: "missing_evidence", tickets: missing }, { status: 409 });
         }
         console.warn(
-          `[complete] ${workflowId} would be blocked for missing evidence (flag off): ` +
+          `[complete] ${workflowId} would be blocked for missing evidence (shadow opt-out): ` +
             missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ")
         );
       }

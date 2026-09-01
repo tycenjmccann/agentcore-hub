@@ -3,10 +3,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 /**
  * TEAM-3686 F3 + F4 — the orchestrator's completion gates.
  *
- * F3: completeWorkflow runs the deliverable-evidence check (same semantics as
- * the HTTP complete route) BEFORE the completion claim: flag off → shadow-log
- * the would-block outcome and proceed; flag on → abort with
- * CompletionRejectedMissingEvidence and never touch store.completeWorkflow.
+ * F3 / TEAM-3690: completeWorkflow runs the deliverable-evidence check (same
+ * semantics as the HTTP complete route) BEFORE the completion claim. It now
+ * ENFORCES by default (AC-D4.1): missing evidence → abort with
+ * CompletionRejectedMissingEvidence, never touching store.completeWorkflow.
+ * Unset/empty/unrecognized values all enforce (fail-closed). Only the explicit
+ * opt-out COMPLETION_EVIDENCE_REQUIRED=off|false|0 shadow-logs and proceeds.
  *
  * F4: isWorkflowComplete re-verifies a passing verdict after a bounded delay
  * when the trigger ticket's kind can spawn fix tickets (verification/review/
@@ -194,7 +196,40 @@ describe("isWorkflowComplete — fix-spawn re-check (TEAM-3686 F4)", () => {
 });
 
 describe("completeWorkflow — evidence gate wiring (TEAM-3686 F3)", () => {
-  it("flag OFF (default): shadow-logs the would-block outcome and completes anyway", async () => {
+  it("AC-D4.1 (TEAM-3690): flag UNSET (default ON) aborts before the completion claim on missing evidence", async () => {
+    // The regression F2 named: the DEFAULT/production config must REJECT an
+    // empty completion record, not shadow-log it. Env var deleted in beforeEach
+    // → the true default → enforce.
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: {} }; // no evidence anywhere
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(0); // never claimed completion
+    expect(h.state.finalized.length).toBe(0); // no side effects
+    const rejected = error.mock.calls.find((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"));
+    expect(rejected).toBeTruthy();
+    expect(String(rejected[0])).toContain("T-1@development");
+    error.mockRestore();
+  });
+
+  it("fail-closed: an unrecognized value (\"banana\") also aborts on missing evidence", async () => {
+    process.env.COMPLETION_EVIDENCE_REQUIRED = "banana";
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: {} };
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(h.state.finalized.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(true);
+    error.mockRestore();
+  });
+
+  it("explicit opt-out (=off): shadow-logs the would-block outcome and completes anyway", async () => {
+    // Shadow mode is no longer the default (TEAM-3690); it requires an explicit
+    // emergency opt-out (off|false|0). Here we assert off.
+    process.env.COMPLETION_EVIDENCE_REQUIRED = "off";
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     h.state.snapshots = [DONE];
     h.state.freshWorkflow = { id: "wf_1", agentTasks: {} }; // no evidence anywhere
