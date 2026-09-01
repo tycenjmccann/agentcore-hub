@@ -63,15 +63,19 @@ const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "sh
 // (live → nudge only; stale → steal + re-dispatch through the claim CAS) and an
 // in_review gate is re-woken. Any value other than "on"/"true"/"1" stays OFF.
 const CASCADE_EXTENDED_STATES = /^(on|true|1)$/i.test(process.env.CASCADE_EXTENDED_STATES || "");
-// TEAM-3686 Finding 3: deliverable-evidence gate on the orchestrator completion
-// path — same flag, same default-off shadow posture as the HTTP complete route
+// TEAM-3686 Finding 3 / TEAM-3690: deliverable-evidence gate on the orchestrator
+// completion path — same flag, same semantics as the HTTP complete route
 // (TEAM-3619 D4a, design §X.5 step 6: "evidence check behind
-// COMPLETION_EVIDENCE_REQUIRED flag (shadow-log first)"). Flag off: the check
-// still runs and shadow-logs what WOULD have been blocked; only an explicit
-// on/true/1 makes it abort completion. Do not flip the default here — the
-// rollout step (TEAM-3690) owns that. No force/bypass parameter either way.
-const COMPLETION_EVIDENCE_REQUIRED = /^(on|true|1)$/i.test(
-  process.env.COMPLETION_EVIDENCE_REQUIRED || ""
+// COMPLETION_EVIDENCE_REQUIRED flag (shadow-log first)"). The shadow-first
+// observation step is now COMPLETE: per QA finding F2 (AC-D4.1) this DEFAULTS ON
+// (ENFORCE) — a completion missing evidence aborts. Shadow mode remains ONLY as
+// an explicit emergency opt-OUT: COMPLETION_EVIDENCE_REQUIRED=off|false|0
+// (case-insensitive, trimmed) falls back to shadow-log-and-continue. Fail-closed:
+// any other value — unset, empty, unrecognized garbage — ENFORCES, so an
+// unparseable value can never silently disable the invariant. No force/bypass
+// parameter either way.
+const COMPLETION_EVIDENCE_REQUIRED = !/^(off|false|0)$/i.test(
+  (process.env.COMPLETION_EVIDENCE_REQUIRED || "").trim()
 );
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
@@ -1506,8 +1510,9 @@ export async function completeWorkflow(workflow) {
   // TEAM-3686 Finding 3: deliverable-evidence gate — same semantics as the HTTP
   // complete route (TEAM-3619 D4a). Every done ticket in a completion-required
   // phase must have real work behind it (non-empty agentTasks output or an
-  // artifact). Flag off → shadow-log the would-block outcome and continue; flag
-  // on → abort completion. Read-only (R2): children via the provider read,
+  // artifact). Enforced by default (TEAM-3690): missing evidence → abort
+  // completion. Only the explicit opt-out COMPLETION_EVIDENCE_REQUIRED=off|false|0
+  // falls back to shadow-log-and-continue. Read-only (R2): children via the provider read,
   // agentTasks via a consistent workflow re-read (the in-memory copy can lag
   // the webhook's output merge). Mirroring the route, a FAILURE of the check
   // itself never blocks a legitimate completion — it only tightens when it can
@@ -1533,7 +1538,7 @@ export async function completeWorkflow(workflow) {
           return;
         }
         console.warn(
-          `[orchestrator] ${workflow.id} would be blocked for missing evidence (flag off): ${offenders}`
+          `[orchestrator] ${workflow.id} would be blocked for missing evidence (shadow opt-out): ${offenders}`
         );
       }
     }
