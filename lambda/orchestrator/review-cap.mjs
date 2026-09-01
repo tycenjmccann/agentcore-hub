@@ -20,8 +20,16 @@
  *      re-open, never a human's own transition.
  *
  * Every effect is injected (store / event publisher / roster lookup / gate
- * parking / metric emitter / clock), so the decision logic is unit-testable
+ * parking / metric emitters / clock), so the decision logic is unit-testable
  * with stubs — same DI shape as cascade.mjs and dead-session-detector.mjs.
+ *
+ * WHEN THE LEDGER ITSELF FAILS (TEAM-3685): enforcement fails OPEN — rework
+ * proceeds — because a bug in the cap must not wedge every review gate in the
+ * fleet. But only for REVIEW_CAP_FAIL_OPEN_LIMIT consecutive failures per gate,
+ * tracked in a per-container Map; past that it fails CLOSED and parks the gate,
+ * because a ledger that cannot be written is exactly the state in which the
+ * unbounded rework loop would otherwise run forever. Every fail-open cycle emits
+ * ReviewCapFailOpen so the branch is observable. See `enforce`.
  *
  * WHERE THE LEDGER LIVES: on the workflow row, under
  * `reviewGateHistory[gateTicketId] = { rounds, authorizations, escalations }`,
@@ -44,18 +52,30 @@ export const REVIEW_GATE_CAP_DEFAULTS = {
   onCapReached: "escalate",
 };
 
+/** Hard ceiling on an honored `maxRounds`. Keep in sync with
+ * REVIEW_GATE_MAX_ROUNDS_CEILING in src/lib/workflow/workflow-defs.ts. */
+export const REVIEW_GATE_MAX_ROUNDS_CEILING = 20;
+
 /**
  * Resolve a review gate's convergence-cap settings, applying the defaults
  * (3 / true / "escalate"). The .mjs twin of resolveReviewGateCap in
  * src/lib/workflow/workflow-defs.ts — same fallback rules, including the
  * "only honor a finite maxRounds >= 1" guard, so a hand-edited workflows.json
  * cannot produce a cap that fires on round 1 or never fires at all.
+ *
+ * The same guard also CLAMPS at REVIEW_GATE_MAX_ROUNDS_CEILING (20): the lower
+ * guard rejected the obvious "disable the cap" values (0, -1, NaN) but happily
+ * honored `maxRounds: 1e9`, which is the same unbounded rework loop with a
+ * config that reads as deliberate. Over-ceiling values clamp DOWN to 20 rather
+ * than falling back to the default 3, because "someone asked for a lot of
+ * rounds" is closer to 20 than to 3 — the intent is preserved, only the
+ * unbounded part is removed.
  */
 export function resolveReviewGateCap(gate) {
   const raw = gate?.maxRounds;
   const maxRounds =
     typeof raw === "number" && Number.isFinite(raw) && raw >= 1
-      ? Math.floor(raw)
+      ? Math.min(Math.floor(raw), REVIEW_GATE_MAX_ROUNDS_CEILING)
       : REVIEW_GATE_CAP_DEFAULTS.maxRounds;
   return {
     maxRounds,
@@ -95,11 +115,38 @@ function hash32(str) {
  * never escalates a healthy run.
  */
 export function fingerprintFinding(ticketId, feedback) {
-  const normalized = String(feedback || "")
+  return `${ticketId || "gate"}:${hash32(normalizeFeedback(feedback))}`;
+}
+
+/**
+ * The one normalization both fingerprints use: lowercase, whitespace collapsed,
+ * trimmed. Extracted so the round-level fingerprint below cannot drift from
+ * fingerprintFinding's notion of "the same complaint".
+ */
+function normalizeFeedback(feedback) {
+  return String(feedback || "")
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
-  return `${ticketId || "gate"}:${hash32(normalized)}`;
+}
+
+/**
+ * Fingerprint the CONTENT of a whole rejection cycle: which upstream tickets are
+ * being reworked plus the normalized feedback. This is the round's idempotency
+ * key for the case where no head SHA exists to play that role (see
+ * buildRoundRecord) — two appends carrying the same fingerprint are the same
+ * rejection delivered twice, not two rounds of rework.
+ *
+ * The ids are sorted so a provider that returns `blockedBy` in a different order
+ * on redelivery still fingerprints identically, and falsy ids are dropped so a
+ * gate with no upstream agent tickets fingerprints on the feedback alone.
+ */
+export function roundContentFingerprint({ upstreamIds, feedback }) {
+  const ids = (Array.isArray(upstreamIds) ? upstreamIds : [])
+    .filter(Boolean)
+    .map(String)
+    .sort();
+  return hash32(`${ids.join(",")}|${normalizeFeedback(feedback)}`);
 }
 
 /**
@@ -184,6 +231,38 @@ const fingerprintsOf = (round) =>
  * provider that supplies no SHA (DynamoDB mode, or a gate with no PR) would
  * compare null === null, reuse round 1 forever, and the cap would never trip.
  *
+ * NULL-SHA IDEMPOTENCY (TEAM-3685 Finding 1). That guard left the no-SHA case
+ * with no idempotency key at all, and the store's append is unconditional
+ * list_append: every REDELIVERY of the SAME rejection became a brand-new round,
+ * inflating the count and escalating a gate that had only been reworked once.
+ * The exposure is real because dedupe upstream is partial — R1's FIFO queue
+ * dedupes a Jira redelivery only inside SQS's 5-minute window, and the legacy
+ * direct-invoke webhook fallback (taken when WORKFLOW_COMMAND_QUEUE_URL is
+ * unset) has no dedupe whatsoever.
+ *
+ * So when BOTH this cycle and the latest prior round have no SHA, the round's
+ * `contentFingerprint` (sorted upstream ids + normalized feedback) arbitrates:
+ * an identical fingerprint is the same rejection arriving twice and REUSES the
+ * round number, exactly like the same-SHA path — and by the same mechanism the
+ * duplicate append is then harmless, because effectiveRoundCount keeps the last
+ * entry per round number.
+ *
+ * Reusing the number is NOT sufficient on its own, though: the duplicate entry
+ * also has to WEIGH the same as the entry it replaces, and it would not, because
+ * the reused round's own earlier verdict would be scanned as an "earlier round"
+ * and every redelivered finding labelled a regression — double weight. So the
+ * reused round is excluded from that scan on this path; see `skipRounds` below.
+ *
+ * A prior round written before this field existed has no
+ * fingerprint to compare, so it reads as NOT the same round: over-counting fails
+ * safe (the cap trips early and a human can authorize more rounds), whereas
+ * under-counting is the unbounded loop.
+ *
+ * The fingerprint ONLY arbitrates the no-SHA case. When SHAs are present nothing
+ * changes: re-reviewing the same SHA reuses the round even if the feedback is
+ * completely different, and a non-empty SHA facing a null one (either direction)
+ * is still a NEW round.
+ *
  * A finding is marked as a REGRESSION when its fingerprint appeared in some
  * earlier round but was ABSENT from the immediately preceding one — i.e. it was
  * fixed and has come back, which is the "passed in round N-1, failing again
@@ -192,16 +271,44 @@ const fingerprintsOf = (round) =>
 export function buildRoundRecord({ priorRounds, upstreamIds, feedback, reviewedHeadSha, nowIso }) {
   const prior = dedupedSortedRounds(priorRounds);
   const latest = prior[prior.length - 1];
+  const contentFingerprint = roundContentFingerprint({ upstreamIds, feedback });
   const sameSha =
     !!reviewedHeadSha && !!latest?.reviewedHeadSha && latest.reviewedHeadSha === reviewedHeadSha;
-  const round = latest ? (sameSha ? latest.round : latest.round + 1) : 1;
+  // Redelivery of the same rejection when neither side has a SHA to compare.
+  const sameNullShaContent =
+    !reviewedHeadSha &&
+    !latest?.reviewedHeadSha &&
+    !!latest?.contentFingerprint &&
+    latest.contentFingerprint === contentFingerprint;
+  const sameRound = sameSha || sameNullShaContent;
+  const round = latest ? (sameRound ? latest.round : latest.round + 1) : 1;
 
   // "Passed in the previous round" = absent from the previous round's findings.
-  const previous = sameSha ? prior[prior.length - 2] : latest;
+  // Reusing a round number means `latest` IS this round's earlier verdict, so
+  // the round before it is the comparison point — for the null-SHA reuse path
+  // just as for the same-SHA one.
+  const previous = sameRound ? prior[prior.length - 2] : latest;
   const previousFps = fingerprintsOf(previous);
+  const skipRounds = new Set();
+  if (previous) skipRounds.add(previous.round);
+  if (sameNullShaContent) {
+    // A null-SHA redelivery is ONE rejection arriving twice: by construction its
+    // content fingerprint equals the reused round's, so every finding in this
+    // cycle also sits in that round's own earlier entry. Scanning it as an
+    // "earlier round" would label every redelivered finding a REGRESSION, and a
+    // regression weighs double — which is how the redelivery would go on
+    // inflating the count even with the round number reused, escalating a gate
+    // that had been rejected once. Nothing can have regressed between two
+    // deliveries of the same rejection, because nothing was reworked in between.
+    //
+    // Deliberately scoped to this path: the same-SHA path keeps its existing
+    // labeling byte-for-byte (a re-review of one SHA is a genuinely new verdict
+    // that may legitimately re-find something), so this changes no SHA behavior.
+    skipRounds.add(latest.round);
+  }
   const earlierFps = new Map(); // fingerprint → the round it last appeared in
   for (const r of prior) {
-    if (previous && r.round === previous.round) continue;
+    if (skipRounds.has(r.round)) continue;
     for (const fp of fingerprintsOf(r)) earlierFps.set(fp, r.round);
   }
 
@@ -220,6 +327,9 @@ export function buildRoundRecord({ priorRounds, upstreamIds, feedback, reviewedH
   return {
     round,
     reviewedHeadSha: reviewedHeadSha || null,
+    // Persisted so the NEXT cycle can recognize a redelivery of THIS one; kept
+    // on every round (not just no-SHA ones) so the ledger is uniform.
+    contentFingerprint,
     verdict: "CHANGES-NEEDED",
     findings,
     recordedAt: nowIso,
@@ -244,6 +354,7 @@ export function emitReviewCapMetrics(m) {
           { Name: "ReviewCapEscalations", Unit: "Count" },
           { Name: "ReviewEffectiveRounds", Unit: "Count" },
           { Name: "ReviewRegressionRounds", Unit: "Count" },
+          { Name: "ReviewCapFailOpen", Unit: "Count" },
         ],
       }],
     },
@@ -253,8 +364,59 @@ export function emitReviewCapMetrics(m) {
     ReviewEffectiveRounds: m.effectiveRounds,
     ReviewRegressionRounds: m.regressionRounds,
     ReviewMaxRounds: m.maxRounds,
+    // Explicit 0 on the healthy path: an alarm on ReviewCapFailOpen > 0 then
+    // fires on the fail-open record below rather than on the ABSENCE of data.
+    ReviewCapFailOpen: 0,
   }));
 }
+
+/**
+ * Emit the ledger-failure branch as its own EMF record (same namespace, same
+ * dimensions/properties as emitReviewCapMetrics) — TEAM-3685 Finding 2a.
+ *
+ * A separate emitter rather than a flag on the normal record because the two are
+ * mutually exclusive: when the ledger write fails there is no round, no
+ * effective count and no cap decision to report, so the normal record's fields
+ * would all be lies. `ReviewCapFailClosed` distinguishes the bounded backstop
+ * (the Nth consecutive failure for one gate, which stops the loop) from the
+ * fail-open cycles before it, and `ReviewCapConsecutiveFailures` is what tells
+ * an operator whether this is a blip or an IAM/throttling regression.
+ */
+export function emitReviewCapFailOpenMetrics(m) {
+  console.log(JSON.stringify({
+    _aws: {
+      Timestamp: Date.now(),
+      CloudWatchMetrics: [{
+        Namespace: "AgentCoreHub/Orchestrator",
+        Dimensions: [[]],
+        Metrics: [
+          { Name: "ReviewCapFailOpen", Unit: "Count" },
+          { Name: "ReviewCapFailClosed", Unit: "Count" },
+          { Name: "ReviewCapConsecutiveFailures", Unit: "Count" },
+        ],
+      }],
+    },
+    ReviewGateTicket: m.gateTicketId,
+    ReviewGatePhase: m.afterPhase || "unknown",
+    ReviewCapFailOpen: 1,
+    ReviewCapFailClosed: m.failClosed ? 1 : 0,
+    ReviewCapConsecutiveFailures: m.consecutiveFailures || 0,
+    ReviewCapError: m.error || "unknown",
+  }));
+}
+
+/**
+ * How many CONSECUTIVE ledger failures for one gate are tolerated before the cap
+ * stops failing open and parks the gate instead (TEAM-3685 Finding 2b).
+ * Overridable per instance via `deps.failOpenLimit`.
+ *
+ * 3 because the failures worth failing open for are transient (a throttle, a
+ * retried write) and clear within a cycle or two, while the failures worth
+ * failing closed for are structural (a revoked IAM policy, a deleted table) and
+ * never clear on their own — after three rejections in a row that could not be
+ * recorded, "the ledger is broken" is a better explanation than "unlucky".
+ */
+export const REVIEW_CAP_FAIL_OPEN_LIMIT = 3;
 
 export function createReviewCap(deps) {
   const {
@@ -264,9 +426,25 @@ export function createReviewCap(deps) {
     parkGateForHuman,
     commentOnGate = async () => false,
     emitMetrics = emitReviewCapMetrics,
+    emitFailOpenMetrics = emitReviewCapFailOpenMetrics,
+    failOpenLimit = REVIEW_CAP_FAIL_OPEN_LIMIT,
     now = () => new Date(),
     log = () => {},
   } = deps;
+
+  /**
+   * gateTicketId → consecutive ledger failures, reset on the first success.
+   *
+   * BEST-EFFORT, PER-CONTAINER, BY DESIGN. This is in-memory state on one Lambda
+   * container: a cold start clears it, and two concurrent containers count
+   * independently, so a gate can fail open more than `failOpenLimit` times in
+   * total. That is acceptable because this is a BACKSTOP, not a guarantee — the
+   * guarantee is the ledger itself, and this only bounds how long a BROKEN
+   * ledger can keep the unbounded rework loop alive. Persisting the counter
+   * would mean writing to the very table that is failing (and would break R2's
+   * single-writer rule), which is why it is not persisted.
+   */
+  const consecutiveLedgerFailures = new Map();
 
   /**
    * Pick the human who owns the escalation, using the gate's existing fallback
@@ -341,11 +519,25 @@ export function createReviewCap(deps) {
    * `escalated` is true. Everything else in the return value is for logging and
    * tests.
    *
-   * Fails OPEN on an unexpected error: if the ledger write or the arithmetic
-   * blows up we let the rework proceed rather than wedging every review gate in
-   * the fleet on a bug in the cap. The cap is a safety rail, not a gate of
-   * record — the release manager's own escalation (blueprint Step 4) is the
-   * belt to this suspenders.
+   * Fails OPEN on an unexpected error, but only for a BOUNDED number of tries
+   * (TEAM-3685 Finding 2). If the ledger write or the arithmetic blows up we let
+   * the rework proceed rather than wedging every review gate in the fleet on a
+   * bug in the cap — the cap is a safety rail, not a gate of record, and the
+   * release manager's own escalation (blueprint Step 4) is the belt to this
+   * suspenders. Every fail-open cycle now emits ReviewCapFailOpen so the branch
+   * is visible instead of living in a console line nobody reads.
+   *
+   * After `failOpenLimit` CONSECUTIVE failures for the same gate it fails CLOSED
+   * instead: `{ escalated: true, failClosed: true }`, which stops the caller's
+   * re-open loop, plus a best-effort park + comment so a human finds the gate. A
+   * persistently unwritable ledger (revoked IAM, deleted table, sustained
+   * throttling) is precisely the condition under which the unbounded rework loop
+   * D2 exists to stop would otherwise run forever. Failing closed is the safe
+   * direction: the cap never blocks a human's OWN transition, so approving the
+   * gate always gets the change set moving, and once the table write recovers
+   * the next rejection records normally (the streak resets on the first success)
+   * and rework resumes on its own. A runaway loop, by contrast, burns agent
+   * invocations until somebody notices.
    */
   async function enforce({ workflow, gateTicket, gateCfg, upstreamIds, feedback, reviewedHeadSha }) {
     const cap = resolveReviewGateCap(gateCfg);
@@ -373,9 +565,60 @@ export function createReviewCap(deps) {
       // this invocation read — two concurrent rejection cycles both see their
       // own round included.
       history = await store.appendReviewRound(workflow.id, gateTicketId, round);
+      // The ledger is writable again — forget this gate's failure streak.
+      consecutiveLedgerFailures.delete(gateTicketId);
     } catch (err) {
-      log(`[review-cap] ledger write failed for ${gateTicketId} — allowing rework: ${err.message}`);
-      return { escalated: false, error: err.message };
+      const failures = (consecutiveLedgerFailures.get(gateTicketId) || 0) + 1;
+      consecutiveLedgerFailures.set(gateTicketId, failures);
+      const failClosed = failures >= failOpenLimit;
+      emitFailOpenMetrics({
+        gateTicketId,
+        afterPhase,
+        failClosed,
+        consecutiveFailures: failures,
+        error: err.message,
+      });
+
+      if (!failClosed) {
+        log(
+          `[review-cap] ledger write failed for ${gateTicketId} (${failures}/${failOpenLimit}) — ` +
+            `allowing rework: ${err.message}`
+        );
+        return { escalated: false, error: err.message, consecutiveFailures: failures };
+      }
+
+      // Fail closed. No review.cap_reached event and no escalation record: both
+      // describe a round count this invocation was unable to establish, and the
+      // escalation record would need the same broken table. The park + comment
+      // are the whole handoff, and both are best-effort — throwing out of here
+      // would propagate into handleReviewRejection, whose contract is a
+      // `{ escalated }` answer, not an exception.
+      log(
+        `[review-cap] ${gateTicketId}: ${failures} consecutive ledger failures (limit ${failOpenLimit}) — ` +
+          `FAILING CLOSED, rework loop stopped and gate handed to a human: ${err.message}`
+      );
+      try {
+        const assignee = await resolveEscalationAssignee(gateCfg);
+        await parkGateForHuman(gateTicketId, assignee, workflow);
+        await commentOnGate(
+          gateTicketId,
+          `Review round cap enforcement is persistently unable to record review rounds for this gate ` +
+            `(${failures} consecutive ledger failures; last error: ${err.message}). Because the round ` +
+            `count cannot be trusted, requesting changes will NOT re-open the upstream work — a human ` +
+            `must resolve this gate.\n\n` +
+            `Choose one:\n` +
+            `- Approve this gate (transition it to Done) to accept the change set as it stands.\n` +
+            `- Cancel the workflow if the change set should be abandoned.\n` +
+            `- Fix the underlying write failure, then request changes again: once the round can be ` +
+            `recorded, the rework loop resumes automatically.\n\n` +
+            `The cause is infrastructure — the workflow row write is failing (IAM, throttling, or a ` +
+            `missing table) — and is worth investigating: see the ReviewCapFailOpen / ` +
+            `ReviewCapFailClosed metrics in AgentCoreHub/Orchestrator.`
+        );
+      } catch (parkErr) {
+        log(`[review-cap] could not park ${gateTicketId} after failing closed: ${parkErr.message}`);
+      }
+      return { escalated: true, failClosed: true, error: err.message, consecutiveFailures: failures };
     }
 
     const rounds = history?.rounds?.length ? history.rounds : [round];

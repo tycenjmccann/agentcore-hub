@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   REVIEW_GATE_CAP_DEFAULTS,
+  REVIEW_GATE_MAX_ROUNDS_CEILING,
   resolveReviewGateCap,
   WORKFLOW_DEFS,
   getWorkflowDef,
@@ -75,6 +76,51 @@ describe("resolveReviewGateCap — config override (AC-D2.2a)", () => {
 
   it("a fractional maxRounds floors to a whole round", () => {
     expect(resolveReviewGateCap(bareGate({ maxRounds: 4.7 })).maxRounds).toBe(4);
+  });
+});
+
+describe("resolveReviewGateCap — upper clamp (TEAM-3685 Finding 3)", () => {
+  it("clamps an over-ceiling maxRounds to the ceiling, NOT to the default", () => {
+    // `maxRounds: 1e9` passed every earlier guard — a cap that never fires,
+    // configured in a way that reads as intentional. Clamping down preserves the
+    // "lots of rounds" intent while removing the unboundedness; falling back to 3
+    // would silently contradict the config instead.
+    expect(REVIEW_GATE_MAX_ROUNDS_CEILING).toBe(20);
+    for (const huge of [21, 100, 1e9, Number.MAX_SAFE_INTEGER]) {
+      expect(resolveReviewGateCap(bareGate({ maxRounds: huge })).maxRounds).toBe(
+        REVIEW_GATE_MAX_ROUNDS_CEILING
+      );
+      expect(resolveReviewGateCap(bareGate({ maxRounds: huge })).maxRounds).not.toBe(
+        REVIEW_GATE_CAP_DEFAULTS.maxRounds
+      );
+    }
+    // A fractional over-ceiling value floors and clamps to the same place.
+    expect(resolveReviewGateCap(bareGate({ maxRounds: 20.9 })).maxRounds).toBe(20);
+    expect(resolveReviewGateCap(bareGate({ maxRounds: 1e9 + 0.5 })).maxRounds).toBe(20);
+  });
+
+  it("values at or under the ceiling are untouched", () => {
+    for (const ok of [1, 2, 3, 5, 19, 20]) {
+      expect(resolveReviewGateCap(bareGate({ maxRounds: ok })).maxRounds).toBe(ok);
+    }
+  });
+
+  it("Infinity is not finite, so it takes the default rather than the ceiling", () => {
+    // The lower guard runs first: Number.isFinite(Infinity) is false, so this is
+    // a malformed value (default 3), not a huge-but-honest one (clamp to 20).
+    expect(resolveReviewGateCap(bareGate({ maxRounds: Infinity })).maxRounds).toBe(
+      REVIEW_GATE_CAP_DEFAULTS.maxRounds
+    );
+    expect(resolveReviewGateCap(bareGate({ maxRounds: Infinity })).maxRounds).not.toBe(
+      REVIEW_GATE_MAX_ROUNDS_CEILING
+    );
+    expect(resolveReviewGateCap(bareGate({ maxRounds: -Infinity })).maxRounds).toBe(3);
+  });
+
+  it("the ceiling leaves the other two fields alone", () => {
+    expect(
+      resolveReviewGateCap(bareGate({ maxRounds: 1e9, regressionCountsDouble: false }))
+    ).toEqual({ maxRounds: 20, regressionCountsDouble: false, onCapReached: "escalate" });
   });
 });
 
