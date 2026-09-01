@@ -33,6 +33,30 @@ export interface JiraTicket {
   artifacts: Artifact[];
   createdAt: string;
   updatedAt: string;
+  /**
+   * TEAM-3619 D4c: the agent phase this ticket's work belongs to. Stamped on a
+   * spawned fix ticket with its originating upstream phase (so a ship-review fix
+   * filed against a dev still gates the SHIP phase); for ordinary agent tickets
+   * the phase is derived from the assignee's roster entry instead. Optional —
+   * legacy/unstamped tickets fall back to assignee-derived phase.
+   */
+  phase?: string;
+  /**
+   * TEAM-3619 D4c: marks a fix/rework ticket so completion re-verify
+   * (completion.mjs condition iii) refuses to close the run while the fix is
+   * open. `kind` records which pipeline spawned it; the accompanying id names
+   * the originating ticket. Today only the review-gate rework path writes this
+   * (kind "review_fix", gateTicketId — see index.mjs handleReviewRejection);
+   * "qa_fix" (qaTicketId) and "codex_fix" are recognised by the reader but have
+   * no producer in this codebase yet (the QA-retry cycle is unwired and QA fix
+   * tickets are agent-created via the Tickets API, not the orchestrator).
+   */
+  spawnedBy?: {
+    kind: "review_fix" | "qa_fix" | "codex_fix";
+    gateTicketId?: string;
+    qaTicketId?: string;
+    codexTicketId?: string;
+  };
 }
 
 export interface JiraComment {

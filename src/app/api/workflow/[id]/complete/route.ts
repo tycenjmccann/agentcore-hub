@@ -43,11 +43,15 @@ const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 
-// TEAM-3619 D4a: the deliverable-evidence gate. DEFAULT OFF — with the flag off
-// a run missing evidence still completes but we shadow-log what would have been
-// blocked, so the check can be observed in prod before it's enforced. Only an
-// explicit on/true/1 turns the 409 on. This mirrors the flag posture of the
-// other lifecycle guards; there is deliberately NO force/bypass parameter.
+// TEAM-3619 D4a: the deliverable-evidence gate. DEFAULT OFF — this is a
+// deliberate rollout posture, NOT an oversight: the design (§X.5 step 6)
+// mandates "evidence check behind COMPLETION_EVIDENCE_REQUIRED flag (shadow-log
+// first)". With the flag off a run missing evidence still completes but we
+// shadow-log what WOULD have been blocked, so the check can be observed in prod
+// before it's enforced; only an explicit on/true/1 turns the 409 on. Do not
+// flip this default without advancing the rollout step. This mirrors the flag
+// posture of the other lifecycle guards; there is deliberately NO force/bypass
+// parameter regardless of the flag.
 const COMPLETION_EVIDENCE_REQUIRED = /^(on|true|1)$/i.test(
   process.env.COMPLETION_EVIDENCE_REQUIRED || ""
 );

@@ -193,4 +193,32 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
     const res = await post();
     expect(res.status).toBe(200);
   });
+
+  it("cancelled children in a required phase owe no evidence, flag ON", async () => {
+    // A cancelled ticket is finished-and-abandoned, not a phantom deliverable —
+    // the evidence gate scopes to DONE tickets only (route: cancelled excluded).
+    // Its empty task must NOT block completion even with the flag on.
+    process.env.COMPLETION_EVIDENCE_REQUIRED = "true";
+    h.state.workflow = {
+      workflowId: "wf_1",
+      phase: "ship",
+      workflowDefId: "software-delivery",
+      // One cancelled ship ticket (no evidence) + one done ship ticket WITH
+      // evidence, so phase (i)/(iii) integrity holds and only the cancellation
+      // exemption is under test.
+      agentTasks: {
+        "T-5": { ticketId: "T-5", output: "" },
+        "T-6": { ticketId: "T-6", output: "opened PR #34" },
+      },
+    };
+    h.state.tickets = [
+      { ticketId: "T-5", type: "task", status: "cancelled", phase: "ship", assignee: "rm" },
+      { ticketId: "T-6", type: "task", status: "done", phase: "ship", assignee: "rm" },
+    ];
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+    expect(h.state.updates.length).toBe(1);
+  });
 });
