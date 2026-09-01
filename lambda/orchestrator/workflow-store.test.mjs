@@ -33,6 +33,24 @@ let failNextCondition = false;
 
 const stubDdb = {
   async send(cmd) {
+    // Mirror the DocumentClient (removeUndefinedValues: true) + DynamoDB
+    // validation: undefined attribute values are stripped client-side, and an
+    // expression referencing a placeholder with no remaining value is a
+    // ValidationException — the failure class TEAM-3683 F3 fixed.
+    const present = new Set(
+      Object.entries(cmd.input.ExpressionAttributeValues || {})
+        .filter(([, v]) => v !== undefined)
+        .map(([k]) => k)
+    );
+    const exprs = [cmd.input.ConditionExpression, cmd.input.UpdateExpression]
+      .filter(Boolean).join(" ");
+    for (const ph of exprs.match(/:[A-Za-z0-9_]+/g) || []) {
+      if (!present.has(ph)) {
+        const err = new Error(`ExpressionAttributeValues missing ${ph}`);
+        err.name = "ValidationException";
+        throw err;
+      }
+    }
     sent.push({ type: cmd.constructor.name, input: cmd.input });
     if (failNextCondition && cmd.input.ConditionExpression) {
       failNextCondition = false;
@@ -146,6 +164,20 @@ describe("markDeadSessionDetected", () => {
   it("returns false when the claim moved or was already stamped", async () => {
     failNextCondition = true;
     expect(await markDeadSessionDetected("wf_1", "TEAM-2", "x")).toBe(false);
+  });
+
+  it("falls back to attribute_not_exists(startedAt) when the claim has no startedAt (TEAM-3683 F3)", async () => {
+    // A legacy running task without startedAt must not produce an expression
+    // referencing :expected after removeUndefinedValues strips it — the stub
+    // throws ValidationException on exactly that mismatch.
+    const won = await markDeadSessionDetected("wf_1", "TEAM-2", undefined);
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.ConditionExpression).toBe(
+      "attribute_not_exists(agentTasks.#tid.startedAt) AND attribute_not_exists(agentTasks.#tid.deadSessionDetectedAt)"
+    );
+    expect(w.input.ConditionExpression).not.toContain(":expected");
+    expect(w.input.ExpressionAttributeValues).not.toHaveProperty(":expected");
   });
 });
 

@@ -8,6 +8,12 @@ import { createDetector } from "./dead-session-detector.mjs";
  * steal/error/dispatch inside a live lease), the trigger sequence is CAS →
  * steal → error → retry-once → escalate, shadow mode writes nothing, and the
  * silence threshold is floored at the lease TTL with a low-sample fallback.
+ *
+ * TEAM-3683 adds: the completion check paginates with DynamoDB's real
+ * limit-BEFORE-filter semantics (the stub models them), one failing candidate
+ * never aborts the sweep, stolen-but-stalled tasks are re-driven, a pre-steal
+ * liveness re-check catches mid-sweep resurrections, and the mode gate fails
+ * safe on unknown values.
  */
 
 const TTL_MS = 30 * 60 * 1000; // 30 min — matches lease-constants default
@@ -18,18 +24,40 @@ const DEAD_STARTED = "2026-09-01T00:00:00Z"; // 12h before NOW → far past any 
 const deadTask = { id: "task_1", agentId: "dev", ticketId: "TEAM-2", status: "running", startedAt: DEAD_STARTED };
 const leafTicket = { ticketId: "TEAM-2", type: "task", status: "in_progress", assignee: "dev" };
 
-/** Fake DocumentClient: workflows Scan → the given rows; events Scan/Query → empty. */
-function makeDdb({ workflows = [], medianEvents = [], completions = [] } = {}) {
+/**
+ * Fake DocumentClient: workflows Scan → the given rows; events Scan →
+ * medianEvents; events Query → a page over `events` with REAL DynamoDB
+ * semantics (TEAM-3683 F1): the key condition picks the partition, Limit
+ * applies to raw items BEFORE the FilterExpression, and LastEvaluatedKey /
+ * ExclusiveStartKey page through the remainder — so a Limit:1 query only ever
+ * examines the partition's first event, exactly like the real service.
+ */
+function makeDdb({ workflows = [], medianEvents = [], events = [] } = {}) {
   return {
     send: vi.fn(async (cmd) => {
       const kind = cmd.constructor.name;
       const table = cmd.input.TableName;
       if (kind === "ScanCommand" && table === "workflows") return { Items: workflows };
       if (kind === "ScanCommand" && table === "events") return { Items: medianEvents };
-      if (kind === "QueryCommand" && table === "events") return { Items: completions };
+      if (kind === "QueryCommand" && table === "events") return queryEventsPage(events, cmd.input);
       return { Items: [] };
     }),
   };
+}
+
+/** One Query page: partition → slice(Limit) → THEN hasCompletionSince's filter. */
+function queryEventsPage(events, input) {
+  const v = input.ExpressionAttributeValues || {};
+  const partition = events.filter((e) => e.workflowId === v[":w"]);
+  const start = input.ExclusiveStartKey ? input.ExclusiveStartKey.idx : 0;
+  const raw = partition.slice(start, start + (input.Limit ?? partition.length));
+  const Items = raw.filter((e) =>
+    e.type === v[":complete"] &&
+    e.detail?.ticketId === v[":tid"] &&
+    String(e.timestamp || "") >= String(v[":since"] || ""));
+  const res = { Items };
+  if (start + raw.length < partition.length) res.LastEvaluatedKey = { idx: start + raw.length };
+  return res;
 }
 
 function makeDeps(overrides = {}) {
@@ -38,6 +66,7 @@ function makeDeps(overrides = {}) {
     incrementDeadSessionRetry: vi.fn(async () => 1),
     setTaskStatus: vi.fn(async () => {}),
     appendNotification: vi.fn(async () => {}),
+    getWorkflow: vi.fn(async () => null), // backstop's fresh read — tests override
   };
   const lease = {
     LEASE_TTL_MS: TTL_MS,
@@ -241,12 +270,24 @@ describe("candidate filtering", () => {
   });
 });
 
+// Events-partition fixtures for the completion check (timestamps ≥ DEAD_STARTED).
+const completeEvt = () => ({
+  workflowId: "wf_1", type: "agent.complete", detail: { ticketId: "TEAM-2" },
+  timestamp: "2026-09-01T06:00:00Z",
+});
+const noiseEvt = (i) => ({
+  workflowId: "wf_1", type: "agent.streaming", detail: { ticketId: "TEAM-2" },
+  timestamp: "2026-09-01T05:00:00Z", eventId: `noise_${i}`,
+});
+
 describe("completion race", () => {
-  it("skips a candidate whose agent.complete already landed for this generation", async () => {
+  it("skips a candidate whose agent.complete landed DEEPER than the partition's first event (TEAM-3683 F1 regression)", async () => {
+    // Limit-before-filter: the old Limit:1 query only ever saw noise_0 and
+    // would have missed this completion, stealing a finished session.
     const { deps, store } = makeDeps({
       ddb: makeDdb({
         workflows: [makeWorkflow()],
-        completions: [{ workflowId: "wf_1", type: "agent.complete", detail: { ticketId: "TEAM-2" } }],
+        events: [noiseEvt(0), noiseEvt(1), completeEvt()],
       }),
     });
     const { runSweep } = createDetector(deps);
@@ -254,6 +295,34 @@ describe("completion race", () => {
     expect(m.candidates).toBe(1); // counted, then dropped by the completion check
     expect(m.fired).toBe(0);
     expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+  });
+});
+
+describe("hasCompletionSince pagination (TEAM-3683 F1)", () => {
+  const detectorFor = (events) => {
+    const { deps } = makeDeps({ ddb: makeDdb({ workflows: [], events }) });
+    return { detector: createDetector(deps), deps };
+  };
+
+  it("pages past a full 500-item page of noise to reach the completion", async () => {
+    const events = [...Array.from({ length: 501 }, (_, i) => noiseEvt(i)), completeEvt()];
+    const { detector, deps } = detectorFor(events);
+    expect(await detector.hasCompletionSince("wf_1", "TEAM-2", DEAD_STARTED)).toBe(true);
+    // Page 1 (500 noise items) filtered to nothing → must have followed
+    // LastEvaluatedKey into page 2.
+    expect(deps.ddb.send.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(deps.ddb.send.mock.calls[1][0].input.ExclusiveStartKey).toEqual({ idx: 500 });
+  });
+
+  it("returns false when the partition holds no matching completion", async () => {
+    const { detector } = detectorFor(Array.from({ length: 3 }, (_, i) => noiseEvt(i)));
+    expect(await detector.hasCompletionSince("wf_1", "TEAM-2", DEAD_STARTED)).toBe(false);
+  });
+
+  it("ignores a completion from BEFORE the claim generation", async () => {
+    const stale = { ...completeEvt(), timestamp: "2026-08-31T00:00:00Z" }; // < startedAt
+    const { detector } = detectorFor([noiseEvt(0), stale]);
+    expect(await detector.hasCompletionSince("wf_1", "TEAM-2", DEAD_STARTED)).toBe(false);
   });
 });
 
@@ -310,4 +379,204 @@ describe("sweep truncation", () => {
     const m = await runSweep("shadow");
     expect(m.truncated).toBe(true);
   });
+});
+
+describe("per-candidate error isolation (TEAM-3683 F2)", () => {
+  const secondWorkflow = () => makeWorkflow({
+    id: "wf_2", workflowId: "wf_2",
+    agentTasks: { "TEAM-9": { ...deadTask, ticketId: "TEAM-9" } },
+  });
+  const secondTicket = { ...leafTicket, ticketId: "TEAM-9" };
+
+  it("a candidate whose getTicket throws is counted and does NOT abort the sweep", async () => {
+    const { deps, store } = makeDeps({
+      ddb: makeDdb({ workflows: [makeWorkflow(), secondWorkflow()] }),
+      getTicket: vi.fn(async (id) => {
+        if (id === "TEAM-2") throw new Error("tickets API down");
+        return secondTicket;
+      }),
+    });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.candidateErrors).toBe(1);
+    // The later workflow's candidate was still fully recovered.
+    expect(store.markDeadSessionDetected).toHaveBeenCalledWith("wf_2", "TEAM-9", DEAD_STARTED);
+    expect(m.retries).toBe(1);
+  });
+
+  it("a redispatch that throws AFTER the steal is counted and later candidates still sweep", async () => {
+    const { deps, store, lease } = makeDeps({
+      ddb: makeDdb({ workflows: [makeWorkflow(), secondWorkflow()] }),
+      getTicket: vi.fn(async (id) => (id === "TEAM-2" ? leafTicket : secondTicket)),
+      redispatch: vi.fn(async (wf, ticket) => {
+        if (ticket.ticketId === "TEAM-2") throw new Error("invoke failed");
+        return true;
+      }),
+    });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.candidateErrors).toBe(1);
+    expect(lease.stealClaim).toHaveBeenCalledTimes(2); // both candidates reached the steal
+    expect(store.markDeadSessionDetected).toHaveBeenCalledWith("wf_2", "TEAM-9", DEAD_STARTED);
+    expect(m.retries).toBe(1); // wf_2 only
+  });
+});
+
+describe("stolen-but-stalled backstop (TEAM-3683 F2)", () => {
+  const STAMPED = "2026-09-01T06:00:00Z";
+  const stalledWorkflow = (extra = {}) => makeWorkflow({
+    agentTasks: { "TEAM-2": { ...deadTask, status: "ready", deadSessionDetectedAt: STAMPED } },
+    ...extra,
+  });
+
+  it("re-drives retry when priorRetries is 0 — redispatch, no new stamp/steal", async () => {
+    const wf = stalledWorkflow();
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
+    store.getWorkflow.mockResolvedValue(wf);
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(store.getWorkflow).toHaveBeenCalledWith("wf_1");
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(m.retries).toBe(1);
+    // The stamp + steal already happened last sweep — never repeated.
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+  });
+
+  it("escalates when priorRetries ≥ 1 — no redispatch", async () => {
+    const wf = stalledWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
+    store.getWorkflow.mockResolvedValue(wf);
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    const esc = eventsOfType(deps.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    expect(esc[0][2].detectorMeta.recoveredStalledSteal).toBe(true);
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    expect(store.appendNotification).toHaveBeenCalledTimes(1);
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(m.escalations).toBe(1);
+    expect(m.retries).toBe(0);
+  });
+
+  it("skips when the claim generation moved since the scan snapshot", async () => {
+    const wf = stalledWorkflow();
+    const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
+    // Fresh read shows the ticket was re-claimed — a new live generation.
+    store.getWorkflow.mockResolvedValue(makeWorkflow({
+      agentTasks: { "TEAM-2": { ...deadTask, startedAt: "2026-09-01T11:00:00Z" } },
+    }));
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(m.retries).toBe(0);
+    expect(m.escalations).toBe(0);
+    expect(m.candidateErrors).toBe(0);
+  });
+
+  it("is observe-only in shadow mode — zero reads-for-recovery, zero writes", async () => {
+    const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [stalledWorkflow()] }) });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("shadow");
+
+    expect(m.candidates).toBe(1);
+    expect(store.getWorkflow).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(deps.blockTicket).not.toHaveBeenCalled();
+    expect(deps.publishEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe("resurrection TOCTOU re-check (TEAM-3683 F4)", () => {
+  it("a heartbeat between the first liveness read and the steal skips the steal", async () => {
+    const { deps, store, lease } = makeDeps();
+    // First activity read (guard 1): silence. Second (pre-steal re-check): a
+    // fresh heartbeat — the agent resurrected mid-sweep.
+    lease.lastAgentActivity
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(new Date(NOW - 1000).toISOString());
+    lease.isLeaseLive.mockImplementation((task, activityIso) => activityIso != null);
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(store.markDeadSessionDetected).toHaveBeenCalledTimes(1); // stamp landed first
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
+    expect(m.skippedLiveLease).toBe(1);
+    expect(m.fired).toBe(0);
+  });
+});
+
+describe("mode normalization (TEAM-3683 F5)", () => {
+  it('"OFF" behaves as off — sweep skipped entirely', async () => {
+    const { deps, store } = makeDeps();
+    const { runSweep } = createDetector(deps);
+    const m = await runSweep("OFF");
+    expect(m.mode).toBe("off");
+    expect(deps.ddb.send).not.toHaveBeenCalled();
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+  });
+
+  it('"Shadow " (case + trailing space) behaves as shadow — flagged event, zero writes', async () => {
+    const { deps, store, lease } = makeDeps();
+    const { runSweep } = createDetector(deps);
+    const m = await runSweep("Shadow ");
+    expect(m.mode).toBe("shadow");
+    const errs = eventsOfType(deps.publishEvent, "agent.error");
+    expect(errs).toHaveLength(1);
+    expect(errs[0][2].shadow).toBe(true);
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+  });
+
+  it('" ENFORCE " normalizes to enforce — the full trigger path runs', async () => {
+    const { deps, store } = makeDeps();
+    const { runSweep } = createDetector(deps);
+    const m = await runSweep(" ENFORCE ");
+    expect(m.mode).toBe("enforce");
+    expect(store.markDeadSessionDetected).toHaveBeenCalled();
+    expect(m.retries).toBe(1);
+  });
+
+  it.each(["enfrce", "", "definitely-not-a-mode"])(
+    "unknown mode %j coerces to shadow with a warning — zero writes",
+    async (raw) => {
+      const log = vi.fn();
+      const { deps, store, lease } = makeDeps({ log });
+      const { runSweep } = createDetector(deps);
+
+      const m = await runSweep(raw);
+
+      expect(m.mode).toBe("shadow");
+      expect(log.mock.calls.some(([msg]) => msg.includes("detector.unknown_mode"))).toBe(true);
+      expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+      expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+      expect(store.setTaskStatus).not.toHaveBeenCalled();
+      expect(lease.stealClaim).not.toHaveBeenCalled();
+      expect(deps.redispatch).not.toHaveBeenCalled();
+      // Still swept: the would-fire lands as a shadow-flagged event.
+      const errs = eventsOfType(deps.publishEvent, "agent.error");
+      expect(errs).toHaveLength(1);
+      expect(errs[0][2].shadow).toBe(true);
+    }
+  );
 });

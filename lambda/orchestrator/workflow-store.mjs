@@ -199,8 +199,10 @@ export async function setTaskStatus(workflowId, ticketId, status) {
 /**
  * Sweep idempotency for the dead-session detector (TEAM-3618 D1.2). Stamp
  * deadSessionDetectedAt on the task ONLY IF the entry still holds the exact
- * claim generation the sweep inspected (same startedAt) and has not already
- * been stamped. This is the FIRST write on the trigger path — losing the CAS
+ * claim generation the sweep inspected (same startedAt — or, mirroring
+ * stealClaim, still no startedAt at all for a legacy task that never recorded
+ * one) and has not already been stamped. This is the FIRST write on the
+ * trigger path — losing the CAS
  * (the claim moved, or a concurrent sweep already stamped it) means another
  * actor owns this generation, so the caller stops. Scoped to the task's own
  * map keys; never a full-map replacement (R2). Returns true when this caller
@@ -212,12 +214,13 @@ export async function markDeadSessionDetected(workflowId, ticketId, expectedStar
       TableName: _table,
       Key: { workflowId },
       UpdateExpression: "SET agentTasks.#tid.deadSessionDetectedAt = :now",
-      ConditionExpression:
-        "agentTasks.#tid.startedAt = :expected AND attribute_not_exists(agentTasks.#tid.deadSessionDetectedAt)",
+      ConditionExpression: expectedStartedAt
+        ? "agentTasks.#tid.startedAt = :expected AND attribute_not_exists(agentTasks.#tid.deadSessionDetectedAt)"
+        : "attribute_not_exists(agentTasks.#tid.startedAt) AND attribute_not_exists(agentTasks.#tid.deadSessionDetectedAt)",
       ExpressionAttributeNames: { "#tid": ticketId },
       ExpressionAttributeValues: {
         ":now": new Date().toISOString(),
-        ":expected": expectedStartedAt,
+        ...(expectedStartedAt ? { ":expected": expectedStartedAt } : {}),
       },
     }));
     return true;
