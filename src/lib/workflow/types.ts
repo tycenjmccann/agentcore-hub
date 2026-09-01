@@ -45,11 +45,12 @@ export interface JiraTicket {
    * TEAM-3619 D4c: marks a fix/rework ticket so completion re-verify
    * (completion.mjs condition iii) refuses to close the run while the fix is
    * open. `kind` records which pipeline spawned it; the accompanying id names
-   * the originating ticket. Today only the review-gate rework path writes this
-   * (kind "review_fix", gateTicketId — see index.mjs handleReviewRejection);
-   * "qa_fix" (qaTicketId) and "codex_fix" are recognised by the reader but have
-   * no producer in this codebase yet (the QA-retry cycle is unwired and QA fix
-   * tickets are agent-created via the Tickets API, not the orchestrator).
+   * the originating ticket. Two producer paths write this: the orchestrator's
+   * review-gate rework path (kind "review_fix", gateTicketId — see index.mjs
+   * handleReviewRejection), and agent-filed fix tickets created through the
+   * Tickets API create_ticket pass-through (kind "qa_fix"/qaTicketId from the QA
+   * verifier, "codex_fix"/codexTicketId from the code reviewer — validated
+   * lambda-side, see agentcore-hub-tickets sanitizeSpawnedBy).
    */
   spawnedBy?: {
     kind: "review_fix" | "qa_fix" | "codex_fix";

@@ -180,7 +180,11 @@ PASS on that dimension. Do not describe a code-read as if it were a test run.
   per failure.** Parallel agents fixing the same file produce conflicting siloed
   PRs. If two fix tickets touch the same files or go to the same agent, chain
   them with `blocked_by` so they run serially. Attach exact failure details +
-  screenshot evidence per finding.
+  screenshot evidence per finding. On EVERY fix ticket you file, set
+  `spawned_by_kind="qa_fix"`, `spawned_by_origin_id=<your QA ticket ID>`, and
+  `phase=<the upstream phase being re-verified>` (usually `"development"`) — this
+  is what keeps the run's completion guard from declaring the workflow done while
+  a QA fix is still open.
 - **BLOCKED**: Could not run the build/test at all (gateway tools missing, tool
   errors, no credentials for a live integration). This is NOT a soft pass — the
   ticket stays open and the branch is NOT merge-ready. State precisely what was

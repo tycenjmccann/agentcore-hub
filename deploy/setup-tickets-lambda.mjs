@@ -438,6 +438,18 @@ const tools = [
         blocked_by: { type: "array", items: { type: "string" }, description: "List of ticket IDs that must complete first" },
         type: { type: "string", enum: ["task", "story", "bug"], description: "Ticket type (default: task)" },
         workflow_id: { type: "string", description: "Associated workflow ID" },
+        phase: { type: "string", description: "Agent phase this fix ticket re-verifies (e.g. 'development', 'ship'). Set on a fix ticket to the ORIGINATING upstream phase so completion gates that phase until the fix closes." },
+        spawned_by: {
+          type: "object",
+          description: "Provenance for a QA/review fix ticket — makes the run's completion guard refuse to close while this fix is open. Only set when filing a fix.",
+          properties: {
+            kind: { type: "string", enum: ["qa_fix", "codex_fix", "review_fix"], description: "Which pipeline spawned this fix." },
+            qaTicketId: { type: "string", description: "Originating QA verification ticket (for kind 'qa_fix')." },
+            codexTicketId: { type: "string", description: "Originating code-review ticket (for kind 'codex_fix')." },
+            gateTicketId: { type: "string", description: "Originating review-gate ticket (for kind 'review_fix')." },
+          },
+          required: ["kind"],
+        },
       },
       required: ["title", "assignee"],
     },

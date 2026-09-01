@@ -701,7 +701,7 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
  * upstream agent tickets this gate reviewed (its blockedBy) so the agents redo
  * the work with the reviewer's comment as resume context. "hold" → just pause.
  */
-async function handleReviewRejection(gateTicket) {
+export async function handleReviewRejection(gateTicket) {
   const workflow = await resolveWorkflow(gateTicket.workflowId, gateTicket.parentId);
   if (!workflow) return;
 

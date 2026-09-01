@@ -55,6 +55,14 @@ export default defineConfig({
       // isWorkflowComplete (done work + approved gates + no open fixes). Plain
       // data in, boolean out; no AWS.
       "lambda/orchestrator/completion.test.mjs",
+      // review-rejection (TEAM-3619 D2c/D4c) — the orchestrator caller of the
+      // review cap: escalation short-circuit + the review_fix reopen stamp.
+      // index.mjs imported for real with its AWS/store/cap seams mocked.
+      "lambda/orchestrator/review-rejection.test.mjs",
+      // agentcore-hub-tickets create_ticket (TEAM-3619 D4c) — the spawnedBy/phase
+      // pass-through that lets agent-filed QA/review fixes gate completion.
+      // Handler driven with a stub DDB doc client; no AWS.
+      "lambda/agentcore-hub-tickets/index.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
