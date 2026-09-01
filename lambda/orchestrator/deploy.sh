@@ -52,7 +52,11 @@ rm -f function.zip
 # lease.mjs; the module prefers this local copy and falls back to the repo path
 # for local/test runs. Do NOT fork the values — always copy from the repo.
 cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs package.json node_modules/
+# Manifest must include the full transitive local-import closure of index.mjs,
+# agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
+# at cold start with ERR_MODULE_NOT_FOUND. Verify with
+# ./scripts/check-lambda-zip-manifest.sh before changing this line.
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
