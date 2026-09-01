@@ -426,6 +426,53 @@ export async function appendNotification(workflowId, notification) {
 }
 
 /**
+ * Append a review_needed notification for `ticketId` at most once WHILE ONE IS
+ * STILL OPEN (TEAM-3684 Finding 2). Concurrent last-blocker completions each
+ * re-wake the same review gate carrying a stale in-memory snapshot, so a plain
+ * appendNotification would create duplicate reviewer notifications (and let the
+ * caller re-emit review.reawakened twice). DynamoDB can't scan a list inside a
+ * ConditionExpression, so the idempotency check rides the same optimistic
+ * notifVersion CAS used by ackNotifications: read fresh → if an unacknowledged
+ * review_needed for this ticket already exists, do nothing → else append under
+ * `notifVersion = :cur`. A concurrent append/ack bumps the version, our CAS
+ * fails, we re-read and now observe the open notification and stand down.
+ *
+ * Reuses the existing acknowledged-based open/closed lifecycle, so a gate that
+ * was reviewed (notification acked) and later reopened re-notifies correctly.
+ * Returns true only when THIS caller appended the notification.
+ */
+export async function appendReviewNotificationOnce(workflowId, ticketId, notification, maxAttempts = 3) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const wf = await getWorkflow(workflowId);
+    if (!wf) return false;
+    const list = Array.isArray(wf.humanNotifications) ? wf.humanNotifications : [];
+    const alreadyOpen = list.some(
+      (n) => n.ticketId === ticketId && n.type === "review_needed" && !n.acknowledged
+    );
+    if (alreadyOpen) return false;
+    try {
+      await _ddb.send(new UpdateCommand({
+        TableName: _table,
+        Key: { workflowId },
+        UpdateExpression: "SET humanNotifications = :n, notifVersion = :next",
+        ConditionExpression: "attribute_not_exists(notifVersion) OR notifVersion = :cur",
+        ExpressionAttributeValues: {
+          ":n": [...list, notification],
+          ":next": (wf.notifVersion || 0) + 1,
+          ":cur": wf.notifVersion || 0,
+        },
+      }));
+      return true;
+    } catch (err) {
+      if (err.name !== "ConditionalCheckFailedException") throw err;
+      // Concurrent append/ack — re-read, re-check the open-notification guard.
+    }
+  }
+  console.warn(`[workflow-store] appendReviewNotificationOnce(${workflowId}, ${ticketId}): CAS retries exhausted`);
+  return false;
+}
+
+/**
  * Acknowledge matching notifications. DynamoDB can't update list items by
  * predicate, so this is the one unavoidable read-modify-write — guarded by an
  * optimistic version CAS with bounded retry.

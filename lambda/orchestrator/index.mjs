@@ -560,7 +560,19 @@ async function handleTicketDoneUnified(ticketId) {
   // Unblock dependents via the shared cascade (TEAM-3618 D3). The helper owns
   // the blocker predicate, provider branching, and orchestrator.unblocked
   // journal events — identical to the DDB-stream twin (handleTicketDone).
-  const unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
+  //
+  // TEAM-3684 Finding 1: guard the whole invocation. The cascade isolates
+  // per-dependent errors internally, but an UNEXPECTED throw (e.g. getChildTickets
+  // failing) must never skip the agent.complete publish or the completion check
+  // below — otherwise a completed run could silently never be finalized. Treat a
+  // cascade failure as "unblocked nothing" and proceed. (Symmetric with the
+  // DDB-stream twin handleTicketDone.)
+  let unblocked = [];
+  try {
+    unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
+  } catch (err) {
+    console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
+  }
 
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
 
@@ -663,16 +675,16 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
   // Idempotency is tracked on the SIDE EFFECT (the notification), not the ticket
   // status — the status write and the notification aren't atomic, so a redelivery
   // after a status-write-but-save-failure must still create the missing one.
-  // Only skip when an unacknowledged review_needed notification already exists.
+  // Only notify when no unacknowledged review_needed already exists.
+  //
+  // TEAM-3684 Finding 2: the open-notification check + append must be ATOMIC, not
+  // a scan of the passed-in (possibly stale) snapshot. Concurrent last-blocker
+  // completions re-wake the same gate from separate stale copies; the store's
+  // appendReviewNotificationOnce runs the check under the notifVersion CAS so
+  // exactly one caller appends. It returns whether THIS call notified, which the
+  // cascade's re-wake uses to publish review.reawakened at most once.
+  let notified = false;
   if (workflow) {
-    if (!Array.isArray(workflow.humanNotifications)) workflow.humanNotifications = [];
-    const alreadyNotified = workflow.humanNotifications.some(
-      (n) => n.ticketId === ticketId && n.type === "review_needed" && !n.acknowledged
-    );
-    if (alreadyNotified) {
-      console.log(`[orchestrator] ${ticketId} already has an open review notification — skipping duplicate.`);
-      return;
-    }
     const notification = {
       id: `notif_${ticketId}_${new Date().toISOString()}`,
       type: "review_needed",
@@ -683,16 +695,21 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
       timestamp: new Date().toISOString(),
       acknowledged: false,
     };
-    workflow.humanNotifications.push(notification);
-    // Atomic append — a full-row save here would clobber concurrent scoped
-    // writes (sibling claims, resume contexts) with this stale snapshot.
-    await store.appendNotification(workflow.id, notification);
+    notified = await store.appendReviewNotificationOnce(workflow.id, ticketId, notification);
+    if (notified && Array.isArray(workflow.humanNotifications)) {
+      workflow.humanNotifications.push(notification); // keep the in-memory copy consistent
+    }
+    if (!notified) {
+      console.log(`[orchestrator] ${ticketId} already has an open review notification — skipping duplicate.`);
+      return false;
+    }
   }
 
   await publishEvent(ticketId, "review.needed", {
     ticketId, reviewer, workflowId: workflow?.id,
   });
   console.log(`[orchestrator] ${ticketId} parked for human review (${reviewer}) — not invoking an agent.`);
+  return notified;
 }
 
 /**
@@ -805,6 +822,16 @@ export async function handleReviewRejection(gateTicket) {
 
   // Re-open each upstream ticket so its agent re-runs. Done has no direct path to
   // Ready — in Jira it must hop Done → To Do (Reopen) → Ready.
+  //
+  // TEAM-3684 Finding 3 (converse risk, ACCEPTED): the cascade reads the sibling
+  // statuses from the eventually-consistent parentId-index GSI. A reopen here
+  // (done → todo) that hasn't yet propagated to that GSI could let a racing
+  // cascadeUnblock still observe this blocker as "done" and PREMATURELY Ready a
+  // dependent. This is the mirror of the missed-last-unblock the cascade's
+  // bounded re-fetch guards against, and it is deliberately NOT handled: a
+  // premature Ready is self-correcting (the reopened blocker re-blocks and the
+  // agent re-runs), whereas the missed unblock is terminal. Documented so the
+  // asymmetry is a choice, not an oversight.
   //
   // TEAM-3619 D4c: stamp the re-opened ticket as a review-fix routed under the
   // gated phase (`spawnedBy` + `phase`). `isWorkflowComplete` then treats this
@@ -1226,7 +1253,17 @@ async function handleTicketDone(ticketId, image) {
   // Jira-webhook twin (handleTicketDoneUnified) — this path previously matched
   // only "blocked" dependents and emitted no orchestrator.unblocked events; the
   // shared helper fixes both divergences (now {blocked, todo} → Ready + journal).
-  const unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
+  //
+  // TEAM-3684 Finding 1: guard the invocation (symmetric with the webhook twin).
+  // An unexpected throw must never skip the agent.complete publish or the
+  // completion check below — treat a cascade failure as "unblocked nothing" so
+  // the last ticket to close can still finalize the run.
+  let unblocked = [];
+  try {
+    unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
+  } catch (err) {
+    console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
+  }
 
   // Publish event for UI
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });

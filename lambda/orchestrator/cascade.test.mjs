@@ -24,6 +24,9 @@ function makeDeps(overrides = {}) {
   const publishEvent = overrides.publishEvent || vi.fn(async () => {});
   const jiraTransition = overrides.jiraTransition || vi.fn(async () => {});
   const getChildTickets = overrides.getChildTickets || vi.fn(async () => []);
+  // Injectable, zero-delay sleep so the stale-GSI retry (Finding 3) never waits
+  // real time in tests and its invocation is assertable.
+  const sleep = overrides.sleep || vi.fn(async () => {});
   const deps = {
     ddb,
     ticketsTable: "tickets",
@@ -33,8 +36,24 @@ function makeDeps(overrides = {}) {
     publishEvent,
     now: () => NOW,
     log: () => {},
+    sleep,
+    ...(overrides.retryDelayMs !== undefined ? { retryDelayMs: overrides.retryDelayMs } : {}),
   };
-  return { deps, ddb, publishEvent, jiraTransition, getChildTickets };
+  return { deps, ddb, publishEvent, jiraTransition, getChildTickets, sleep };
+}
+
+// emitCascadeMetrics writes a single EMF record straight to console.log (the
+// cascade's own `log` dep is a no-op here), so any captured `_aws` record IS a
+// metrics emission. Returns the parsed records + a restore().
+function captureMetrics() {
+  const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+  return {
+    records: () =>
+      spy.mock.calls
+        .map((c) => { try { return JSON.parse(c[0]); } catch { return null; } })
+        .filter((r) => r && r._aws),
+    restore: () => spy.mockRestore(),
+  };
 }
 
 const workflow = { id: "wf_1", workflowId: "wf_1" };
@@ -198,7 +217,10 @@ function makeExtDeps(overrides = {}) {
     ...overrides.lease,
   };
   const redispatch = overrides.redispatch || vi.fn(async () => true);
-  const reawakenGate = overrides.reawakenGate || vi.fn(async () => {});
+  // Default resolves TRUTHY: reawakenGate (handleHumanReviewGate) returns whether
+  // THIS call (re)notified, and the re-wake now publishes review.reawakened only
+  // on a truthy result (TEAM-3684 Finding 2). "Gate notified" is the normal case.
+  const reawakenGate = overrides.reawakenGate || vi.fn(async () => true);
   const deps = {
     ...base.deps,
     extendedStates: overrides.extendedStates !== undefined ? overrides.extendedStates : true,
@@ -407,5 +429,197 @@ describe("both call sites exercise identical helper behavior", () => {
     expect(eventsOfType(a.publishEvent, "orchestrator.unblocked").length).toBe(
       eventsOfType(b.publishEvent, "orchestrator.unblocked").length
     );
+  });
+});
+
+/**
+ * TEAM-3684 Finding 1 — per-dependent error isolation. One dependent that throws
+ * mid-transition must not strand its siblings or reject the whole cascade (which
+ * at the call site would skip agent.complete + the completion check). The failed
+ * dependent is counted (CascadeDependentErrors) and excluded from `unblocked`.
+ */
+describe("Finding 1 — per-dependent error isolation", () => {
+  it("a dependent whose Ready transition throws is skipped; later dependents still Ready", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-FAIL", status: "blocked", blockedBy: [DONE] },
+      { ticketId: "TEAM-OK", status: "blocked", blockedBy: [DONE] },
+    ];
+    // DDB status write throws only for TEAM-FAIL; TEAM-OK writes fine.
+    const ddb = {
+      send: vi.fn(async (cmd) => {
+        if (cmd?.input?.Key?.ticketId === "TEAM-FAIL") throw new Error("ddb boom");
+        return {};
+      }),
+    };
+    const { deps, publishEvent } = makeDeps({ ddb, getChildTickets: vi.fn(async () => siblings) });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", workflow);
+    const records = cap.records();
+    cap.restore();
+
+    // Loop continued past the failure: TEAM-OK Readied, TEAM-FAIL excluded.
+    expect(unblocked).toEqual(["TEAM-OK"]);
+    const journal = eventsOfType(publishEvent, "orchestrator.unblocked");
+    expect(journal).toHaveLength(1);
+    expect(journal[0][2]).toMatchObject({ ticketId: "TEAM-OK" });
+    expect(journal.some((c) => c[2].ticketId === "TEAM-FAIL")).toBe(false);
+    // The error was counted and surfaced as a metric.
+    expect(records).toHaveLength(1);
+    expect(records[0].CascadeDependentErrors).toBe(1);
+  });
+
+  it("a throwing in_progress (extended-state) handler is isolated too", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+      { ticketId: "TEAM-3", status: "blocked", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      lease: { lastAgentActivity: vi.fn(async () => { throw new Error("lease boom"); }) },
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    // TEAM-2's handler threw but TEAM-3 was still Readied.
+    expect(unblocked).toEqual(["TEAM-3"]);
+    expect(eventsOfType(publishEvent, "orchestrator.unblocked")).toHaveLength(1);
+    expect(records[0].CascadeDependentErrors).toBe(1);
+  });
+
+  it("never rejects for a per-dependent failure (protects the caller's completion check)", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-FAIL", status: "blocked", blockedBy: [DONE] },
+    ];
+    const ddb = { send: vi.fn(async () => { throw new Error("every write boom"); }) };
+    const { deps } = makeDeps({ ddb, getChildTickets: vi.fn(async () => siblings) });
+    const { cascadeUnblock } = createCascade(deps);
+
+    await expect(cascadeUnblock(DONE, "EPIC-1", workflow)).resolves.toEqual([]);
+  });
+});
+
+/**
+ * TEAM-3684 Finding 2 — idempotent in_review re-wake. Concurrent last-blocker
+ * completions must not each emit review.reawakened + re-notify the reviewer. The
+ * gate (reawakenGate) is the single arbiter via its CAS-guarded notification:
+ * only when it reports it actually (re)notified does the cascade emit the event.
+ */
+describe("Finding 2 — idempotent in_review re-wake", () => {
+  it("reawakenGate falsy (CAS lost / already open) → NO event, metric not incremented", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      reawakenGate: vi.fn(async () => false),
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    expect(reawakenGate).toHaveBeenCalledWith("GATE-1", "human:reviewer", extWorkflow);
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+    // reviewReawakened stayed 0 → no metric record claims a re-wake.
+    expect(records.some((r) => r.CascadeReviewReawaken > 0)).toBe(false);
+  });
+
+  it("reawakenGate truthy → EXACTLY one review.reawakened + metric counts one", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      reawakenGate: vi.fn(async () => true),
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(1);
+    expect(records[0].CascadeReviewReawaken).toBe(1);
+  });
+});
+
+/**
+ * TEAM-3684 Finding 3 — bounded single retry against the eventually-consistent
+ * parentId-index GSI. A blocker that already closed but hasn't propagated to the
+ * snapshot would otherwise permanently miss the last unblock. One re-fetch (after
+ * an injectable sleep) re-evaluates only the deferred dependents.
+ */
+describe("Finding 3 — bounded stale-GSI retry", () => {
+  it("re-fetches once and Readies the dependent when the blocker resolves on the retry", async () => {
+    const stale = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-9", status: "in_progress" }, // not done in the first snapshot
+      { ticketId: "TEAM-2", status: "blocked", blockedBy: [DONE, "TEAM-9"] },
+    ];
+    const fresh = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-9", status: "done" }, // GSI caught up
+      { ticketId: "TEAM-2", status: "blocked", blockedBy: [DONE, "TEAM-9"] },
+    ];
+    const getChildTickets = vi.fn().mockResolvedValueOnce(stale).mockResolvedValueOnce(fresh);
+    const { deps, publishEvent, sleep } = makeDeps({ getChildTickets, retryDelayMs: 250 });
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", workflow);
+
+    expect(unblocked).toEqual(["TEAM-2"]);
+    expect(getChildTickets).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(250);
+    expect(eventsOfType(publishEvent, "orchestrator.unblocked")).toHaveLength(1);
+  });
+
+  it("still-unresolved after the retry → skipped, with EXACTLY one re-fetch", async () => {
+    const stale = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-9", status: "in_progress" },
+      { ticketId: "TEAM-2", status: "blocked", blockedBy: [DONE, "TEAM-9"] },
+    ];
+    // Second snapshot STILL shows TEAM-9 open — genuinely still blocked.
+    const getChildTickets = vi.fn().mockResolvedValueOnce(stale).mockResolvedValueOnce(stale);
+    const { deps, publishEvent, sleep } = makeDeps({ getChildTickets });
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", workflow);
+
+    expect(unblocked).toEqual([]);
+    expect(getChildTickets).toHaveBeenCalledTimes(2); // one bounded re-fetch, no more
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(eventsOfType(publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+  });
+
+  it("no retry / no sleep when every dependent resolves on the first pass", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "blocked", blockedBy: [DONE] },
+    ];
+    const getChildTickets = vi.fn(async () => siblings);
+    const { deps, sleep } = makeDeps({ getChildTickets });
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", workflow);
+
+    expect(unblocked).toEqual(["TEAM-2"]);
+    expect(getChildTickets).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
   });
 });

@@ -43,6 +43,11 @@ export function createCascade(deps) {
     publishEvent,
     now = () => Date.now(),
     log = () => {},
+    // Bounded stale-GSI retry (Finding 3 / TEAM-3684). Both injectable so tests
+    // use a fake, zero-delay sleep. retryDelayMs gives the eventually-consistent
+    // parentId-index a moment to catch up before the single re-fetch.
+    retryDelayMs = 300,
+    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     // Extended-states (commit 4b) — all optional; guarded by extendedStates.
     extendedStates = false,
     lease,
@@ -67,43 +72,93 @@ export function createCascade(deps) {
   async function cascadeUnblock(ticketId, parentId, workflow) {
     const siblings = await getChildTickets(parentId);
     const unblocked = [];
-    const m = { nudged: 0, skippedLiveLease: 0, redispatched: 0, reviewReawakened: 0 };
+    const m = { nudged: 0, skippedLiveLease: 0, redispatched: 0, reviewReawakened: 0, dependentErrors: 0 };
+
+    // Dependents whose blocker set wasn't fully resolved in the FIRST snapshot.
+    // That snapshot comes from the eventually-consistent parentId-index GSI, so a
+    // sibling blocker that already closed can still read non-terminal here — and
+    // because that closing ticket won't cascade again, the last unblock would be
+    // permanently missed (Finding 3 / TEAM-3684). We collect those and retry ONCE
+    // against a fresh snapshot before giving up.
+    const deferred = [];
+
+    // Blocker-resolution predicate — UNCHANGED from both original copies: every
+    // blockedBy entry is done/cancelled (this one just closed). Evaluated against
+    // a supplied snapshot rather than a fresh per-blocker lookup (matches prior
+    // code); the retry pass simply re-runs it against a re-fetched snapshot.
+    const allBlockersResolved = (sibling, snapshot) =>
+      (sibling.blockedBy || []).every((bid) => {
+        if (bid === ticketId) return true; // this one is done
+        const blocker = snapshot.find((s) => s.ticketId === bid);
+        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
+      });
+
+    // Handle one dependent whose blockers are all resolved. Per-dependent error
+    // isolation (Finding 1 / TEAM-3684): a throw here is logged + counted and the
+    // cascade moves on, so one dependent that fails to transition can neither
+    // strand its siblings nor abort the caller's agent.complete + completion
+    // check. A dependent that threw is NOT added to `unblocked` (no
+    // orchestrator.unblocked for a transition that didn't happen).
+    const handleDependent = async (sibling) => {
+      try {
+        // Commit 4a (union). The stream twin previously matched only "blocked";
+        // Readying a parked "todo" dependent here is the divergence fix.
+        if (sibling.status === "blocked" || sibling.status === "todo") {
+          await transitionToReady(sibling);
+          unblocked.push(sibling.ticketId);
+          return;
+        }
+        // Commit 4b (CASCADE_EXTENDED_STATES). The last blocker of an ALREADY-
+        // MOVING dependent just resolved. Off by default → no-op (commit-4a only).
+        if (!extendedStates) return;
+        if (sibling.status === "in_progress") {
+          await handleInProgressDependent(sibling, ticketId, workflow, m);
+        } else if (sibling.status === "in_review") {
+          await handleInReviewDependent(sibling, ticketId, workflow, m);
+        }
+        // done / cancelled / any other terminal state → no-op.
+      } catch (err) {
+        m.dependentErrors++;
+        log(`[orchestrator] cascade dependent error — ${sibling.ticketId}: ${err?.message || err}`);
+      }
+    };
 
     for (const sibling of siblings) {
       if (sibling.ticketId === ticketId) continue;
       const blockers = sibling.blockedBy || [];
       if (!blockers.includes(ticketId)) continue;
 
-      // Blocker-resolution predicate — UNCHANGED from both original copies:
-      // every blockedBy entry is done/cancelled (this one just closed). Uses the
-      // siblings snapshot, not a fresh per-blocker lookup (matches prior code).
-      const allResolved = blockers.every((bid) => {
-        if (bid === ticketId) return true; // this one is done
-        const blocker = siblings.find((s) => s.ticketId === bid);
-        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
-      });
-      if (!allResolved) continue;
-
-      // Commit 4a (union). The stream twin previously matched only "blocked";
-      // Readying a parked "todo" dependent here is the divergence fix.
-      if (sibling.status === "blocked" || sibling.status === "todo") {
-        await transitionToReady(sibling);
-        unblocked.push(sibling.ticketId);
+      if (!allBlockersResolved(sibling, siblings)) {
+        // Unresolved means at least one blocker isn't done/cancelled in this
+        // snapshot. The ONLY terminal states are done/cancelled, so every
+        // unresolved blocker is non-terminal-or-missing — exactly the shape a
+        // stale GSI read produces for a blocker that just closed. Defer for one
+        // bounded re-fetch rather than skipping outright.
+        deferred.push(sibling);
         continue;
       }
-
-      // Commit 4b (CASCADE_EXTENDED_STATES). The last blocker of an ALREADY-
-      // MOVING dependent just resolved. Off by default → no-op (commit-4a only).
-      if (!extendedStates) continue;
-      if (sibling.status === "in_progress") {
-        await handleInProgressDependent(sibling, ticketId, workflow, m);
-      } else if (sibling.status === "in_review") {
-        await handleInReviewDependent(sibling, ticketId, workflow, m);
-      }
-      // done / cancelled / any other terminal state → no-op.
+      await handleDependent(sibling);
     }
 
-    log(`[orchestrator] ${ticketId} cascade — unblocked=[${unblocked.join(", ")}]` +
+    // Bounded single retry (Finding 3): re-fetch the sibling snapshot ONCE and
+    // re-evaluate ONLY the deferred dependents. If a blocker's completion simply
+    // hadn't propagated to the GSI yet, the fresh read now sees it and the
+    // dependent unblocks; anything still unresolved is skipped as before — no
+    // further retries (a genuinely-open blocker will cascade on its own close).
+    if (deferred.length) {
+      await sleep(retryDelayMs);
+      const fresh = await getChildTickets(parentId);
+      for (const stale of deferred) {
+        // Prefer the fresh row (status may have advanced); fall back to the
+        // deferred copy if the GSI momentarily doesn't return it.
+        const sibling = fresh.find((s) => s.ticketId === stale.ticketId) || stale;
+        if (sibling.ticketId === ticketId) continue;
+        if (!allBlockersResolved(sibling, fresh)) continue;
+        await handleDependent(sibling);
+      }
+    }
+
+    log(`[orchestrator] ${ticketId} cascade — unblocked=[${unblocked.join(", ")}] errors=${m.dependentErrors}` +
       (extendedStates ? ` nudged=${m.nudged} redispatched=${m.redispatched} reviewReawakened=${m.reviewReawakened}` : ""));
 
     // Journey log: one orchestrator.unblocked per Ready transition. The helper
@@ -115,7 +170,7 @@ export function createCascade(deps) {
       });
     }
 
-    if (m.nudged || m.skippedLiveLease || m.redispatched || m.reviewReawakened) {
+    if (m.nudged || m.skippedLiveLease || m.redispatched || m.reviewReawakened || m.dependentErrors) {
       emitCascadeMetrics(m);
     }
 
@@ -173,12 +228,24 @@ export function createCascade(deps) {
    * logic itself decides.
    */
   async function handleInReviewDependent(sibling, unblockedBy, workflow, m) {
+    // Idempotent re-wake (Finding 2 / TEAM-3684). Concurrent last-blocker
+    // completions each carry a stale in-memory snapshot, so both could re-notify
+    // and re-emit review.reawakened for the SAME gate. Run the gate FIRST and let
+    // it be the single arbiter: reawakenGate creates the reviewer notification
+    // under a CAS keyed on "no open review_needed for this gate" and returns
+    // whether THIS call actually (re)notified. Only the winner publishes
+    // review.reawakened + counts the metric, so a duplicate is a silent no-op.
+    // reawakenGate still never invokes an agent — it only parks + notifies.
+    const notified = reawakenGate
+      ? await reawakenGate(sibling.ticketId, sibling.assignee, workflow)
+      : false;
+    if (!notified) {
+      log(`[orchestrator] cascade review re-wake — ${sibling.ticketId} (already open, skipped)`);
+      return;
+    }
     await publishEvent(sibling.ticketId, "review.reawakened", {
       gateTicketId: sibling.ticketId, unblockedBy, workflowId: workflow?.id,
     });
-    if (reawakenGate) {
-      await reawakenGate(sibling.ticketId, sibling.assignee, workflow);
-    }
     m.reviewReawakened++;
     log(`[orchestrator] cascade review re-wake — ${sibling.ticketId}`);
   }
@@ -222,6 +289,7 @@ export function emitCascadeMetrics(m) {
           { Name: "CascadeSkippedLiveLease", Unit: "Count" },
           { Name: "CascadeRedispatch", Unit: "Count" },
           { Name: "CascadeReviewReawaken", Unit: "Count" },
+          { Name: "CascadeDependentErrors", Unit: "Count" },
         ],
       }],
     },
@@ -229,5 +297,6 @@ export function emitCascadeMetrics(m) {
     CascadeSkippedLiveLease: m.skippedLiveLease,
     CascadeRedispatch: m.redispatched,
     CascadeReviewReawaken: m.reviewReawakened,
+    CascadeDependentErrors: m.dependentErrors || 0,
   }));
 }
