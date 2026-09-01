@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
 import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
@@ -11,14 +12,21 @@ import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
  * def forks a new run; a request with no sourceTicket is untouched; and a marker
  * whose canonical run is terminal is atomically re-pointed at a fresh run.
  *
+ * TEAM-3699 adds the overlap window: the marker is claimed BEFORE the workflow
+ * row is written, so a concurrent start can see marker-without-row. A FRESH
+ * marker in that state means the winner is in-flight (coalesce, no second
+ * epic); a STALE one means it died mid-start (re-point, fresh run).
+ *
  * The DDB seam is a small in-memory store that honors the two conditional-put
- * guards (attribute_not_exists(workflowId), canonicalWorkflowId = :old).
+ * guards (attribute_not_exists(workflowId), canonicalWorkflowId = :old) and
+ * records every PutCommand item so tests can assert nothing was written.
  */
 
 const h = vi.hoisted(() => {
   const store = new Map<string, Record<string, unknown>>();
   const invokes: Array<{ tool_name: string }> = [];
-  return { store, invokes };
+  const puts: Array<Record<string, unknown>> = [];
+  return { store, invokes, puts };
 });
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
@@ -57,6 +65,7 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             if (!existing || existing.canonicalWorkflowId !== old) fail();
           }
           if (cond?.includes("attribute_not_exists(canonicalWorkflowId)") && existing?.canonicalWorkflowId) fail();
+          h.puts.push(item);
           h.store.set(id, item);
           return {};
         },
@@ -106,6 +115,7 @@ let POST: typeof import("./route").POST;
 beforeEach(async () => {
   h.store.clear();
   h.invokes.length = 0;
+  h.puts.length = 0;
   process.env.TICKET_PROVIDER = "dynamodb";
   vi.resetModules();
   ({ POST } = await import("./route"));
@@ -184,6 +194,88 @@ describe("POST /api/workflow/start — dedup on (sourceTicket, defId) (D4b)", ()
     // Marker now points at the fresh run.
     const marker = [...h.store.values()].find((i) => String(i.workflowId).startsWith("wfdedup_"));
     expect(marker?.canonicalWorkflowId).toBe(body.workflowId);
+    expect(h.invokes.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * TEAM-3699 — the overlap window. Request A claims the marker and is still
+ * creating its epic/workflow row when request B arrives for the same
+ * (sourceTicket, defId). B sees marker-present / canonical-row-ABSENT: before
+ * the fix it fell through to the terminal-run re-point path and double-created.
+ *
+ * The in-flight winner is simulated by seeding ONLY the marker row (that is
+ * exactly A's state between its two writes) with a controlled createdAt.
+ */
+const CANON = "wf_1700000000000_canon1";
+
+/** Marker id for (sourceTicket, defId) — must match resolveDedup's hash. */
+function markerIdFor(sourceTicket: string, defId: string) {
+  return `wfdedup_${createHash("sha256").update(`${sourceTicket}:${defId}`).digest("hex")}`;
+}
+
+/** Seed an in-flight winner: marker only, no canonical workflow row. */
+function seedMarkerOnly(createdAt: string | undefined) {
+  h.store.set(markerIdFor("TEAM-9", "software-delivery"), {
+    workflowId: markerIdFor("TEAM-9", "software-delivery"),
+    canonicalWorkflowId: CANON,
+    sourceTicket: "TEAM-9",
+    defId: "software-delivery",
+    ...(createdAt ? { createdAt } : {}),
+  });
+}
+
+describe("POST /api/workflow/start — dedup overlap window (TEAM-3699, AC-D4.2)", () => {
+  it("marker fresh + canonical row not yet written → coalesces on the in-flight run, creates nothing", async () => {
+    seedMarkerOnly(new Date(Date.now() - 5_000).toISOString());
+
+    const res = await post({ title: "t overlap", sourceTicket: "TEAM-9", workflowDefId: "software-delivery" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ workflowId: CANON, deduplicated: true });
+
+    // No second epic/intake ticket...
+    expect(h.invokes).toEqual([]);
+    // ...no second workflow row, and no marker re-point.
+    expect(h.puts).toEqual([]);
+    expect(h.store.get(markerIdFor("TEAM-9", "software-delivery"))?.canonicalWorkflowId).toBe(CANON);
+    expect([...h.store.keys()].some((k) => k.startsWith("wf_") && k !== CANON)).toBe(false);
+  });
+
+  it("marker stale (beyond the grace window) + canonical row absent → re-points and starts a fresh run", async () => {
+    seedMarkerOnly(new Date(Date.now() - 10 * 60_000).toISOString());
+
+    const res = await post({ title: "t stillborn", sourceTicket: "TEAM-9", workflowDefId: "software-delivery" });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.deduplicated).toBeUndefined();
+    expect(body.workflowId).toMatch(/^wf_/);
+    expect(body.workflowId).not.toBe(CANON);
+    // Marker re-pointed at the fresh run, and that run really was created.
+    expect(h.store.get(markerIdFor("TEAM-9", "software-delivery"))?.canonicalWorkflowId).toBe(body.workflowId);
+    expect(h.invokes.length).toBeGreaterThan(0);
+  });
+
+  it("marker with no createdAt → treated as stale (re-point allowed, never wedged)", async () => {
+    seedMarkerOnly(undefined);
+
+    const res = await post({ title: "t no stamp", sourceTicket: "TEAM-9", workflowDefId: "software-delivery" });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.deduplicated).toBeUndefined();
+    expect(body.workflowId).not.toBe(CANON);
+    expect(h.store.get(markerIdFor("TEAM-9", "software-delivery"))?.canonicalWorkflowId).toBe(body.workflowId);
+  });
+
+  it("fresh marker does NOT block re-running a canonical run that already finished", async () => {
+    seedMarkerOnly(new Date(Date.now() - 5_000).toISOString());
+    // Same fresh marker, but this time the canonical row exists and is terminal.
+    h.store.set(CANON, { workflowId: CANON, phase: "complete" });
+
+    const res = await post({ title: "t redo", sourceTicket: "TEAM-9", workflowDefId: "software-delivery" });
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.deduplicated).toBeUndefined();
+    expect(body.workflowId).not.toBe(CANON);
     expect(h.invokes.length).toBeGreaterThan(0);
   });
 });

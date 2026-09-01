@@ -43,6 +43,15 @@ const lambda = new LambdaClient({ region: REGION });
 
 const TERMINAL_PHASES = new Set(["complete", "error", "cancelled"]);
 
+// TEAM-3699: how long after a dedup marker is claimed the canonical run is
+// still presumed IN-FLIGHT when its workflow row hasn't appeared yet. The
+// marker is written before the epic/workflow row (see resolveDedup), so a
+// concurrent start can legitimately observe marker-without-row for as long as
+// epic creation + the row write take. Beyond this window an absent row means
+// the winner died between the two writes (stillborn) and a fresh run is let
+// through.
+const DEDUP_INFLIGHT_GRACE_MS = 120_000;
+
 function secretMatches(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
@@ -52,6 +61,17 @@ function secretMatches(provided: string, expected: string): boolean {
 
 function mintWorkflowId(): string {
   return `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * Age of a dedup marker from its `createdAt` stamp, or null when the stamp is
+ * missing/unparseable (an old marker written before the field existed, or a
+ * corrupted row) — callers must treat null as "too old to trust".
+ */
+function markerAgeMs(createdAt: unknown): number | null {
+  if (typeof createdAt !== "string") return null;
+  const t = Date.parse(createdAt);
+  return Number.isNaN(t) ? null : Date.now() - t;
 }
 
 /**
@@ -68,6 +88,21 @@ function mintWorkflowId(): string {
  *                                 atomically re-pointed the marker); create with
  *                                 exactly this workflowId.
  * Works identically for both ticket providers (the marker is app state).
+ *
+ * TEAM-3699 (AC-D4.2) in-flight grace window: because the marker is claimed
+ * BEFORE the epic/workflow row is written, two overlapping starts can leave the
+ * loser looking at a marker whose canonical workflow ROW DOES NOT EXIST YET.
+ * That state is indistinguishable, from the row alone, from a winner that
+ * crashed between the marker write and the row write. Marker age disambiguates:
+ *   - marker younger than DEDUP_INFLIGHT_GRACE_MS → canonical run is presumed
+ *     in-flight → COALESCE onto it (no second epic/workflow — this is what stops
+ *     the double-create race).
+ *   - marker older, or its createdAt missing/unparseable → presumed stillborn →
+ *     fall through to the re-point path so a fresh run can start.
+ * Marker age is only consulted when the row is ABSENT. A canonical row that
+ * exists and is terminal (or deleted) still re-points immediately regardless of
+ * marker age — re-running a finished run is legitimate, and the TEAM-3686
+ * stillborn→phase=error recovery depends on it.
  */
 async function resolveDedup(
   sourceTicket: string,
@@ -109,6 +144,16 @@ async function resolveDedup(
     // A live (non-terminal) canonical run owns this key — coalesce onto it.
     if (canon && !TERMINAL_PHASES.has(String(canon.phase)) && canon.deleted !== true) {
       return { coalesce: priorCanonical };
+    }
+    // TEAM-3699: no canonical row at all. Within the grace window the winner is
+    // still between its marker write and its row write — coalesce so we don't
+    // create a second epic/workflow for the same key. Past the window (or with
+    // an unusable createdAt) treat it as stillborn and let the re-point run.
+    if (!canon) {
+      const ageMs = markerAgeMs(markerRes.Item?.createdAt);
+      if (ageMs !== null && ageMs < DEDUP_INFLIGHT_GRACE_MS) {
+        return { coalesce: priorCanonical };
+      }
     }
   }
 
