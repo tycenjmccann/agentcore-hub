@@ -30,6 +30,7 @@ import {
 } from "@aws-sdk/client-bedrock-agent-runtime";
 import * as store from "./workflow-store.mjs";
 import { DEFAULT_TTL_MINUTES, STALE_CLAIM_MULTIPLIER } from "./lease.mjs";
+import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -97,6 +98,9 @@ async function loadAgentRoster() {
       Key: "config/agents.json",
     }));
     const config = JSON.parse(await res.Body.transformToString());
+    // Feed the same S3 config to the watchdog resolver (D1.1) — per-agent +
+    // defaults watchdog blocks, resolved without a second fetch.
+    setWatchdogSource(config);
     _agentRoster = config.agents.map((a) => ({
       agentId: a.agentId,
       phase: a.phase,
@@ -1374,6 +1378,9 @@ async function invokeAgent(agentDef, context, workflow, ticketId) {
         modelOverride: modelConfig,
         // Routine-scoped connectors travel with the workflow → each agent invoke.
         connectors: workflow.connectors,
+        // Fleet-wide watchdog knobs (D1.1), resolved from the S3 agents.json
+        // config: heartbeat cadence + tool/turn deadlines the runtime enforces.
+        watchdog: resolveWatchdog(agentDef.agentId),
       }),
     }));
 

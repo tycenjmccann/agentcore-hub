@@ -34,6 +34,9 @@ export default defineConfig({
       // Its parity with src/lib/workflow/lease.ts is asserted by the auto-
       // included src/lib/workflow/lease-parity.test.ts.
       "lambda/orchestrator/lease.test.mjs",
+      // watchdog.mjs mirrors the TS watchdog resolver (TEAM-3618 D1.1) — pure
+      // config resolution, unit-testable via setWatchdogSource().
+      "lambda/orchestrator/watchdog.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

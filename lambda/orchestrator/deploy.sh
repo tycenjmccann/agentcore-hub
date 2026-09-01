@@ -52,7 +52,7 @@ rm -f function.zip
 # lease.mjs; the module prefers this local copy and falls back to the repo path
 # for local/test runs. Do NOT fork the values — always copy from the repo.
 cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')

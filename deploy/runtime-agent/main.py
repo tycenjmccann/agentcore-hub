@@ -314,6 +314,77 @@ _CURRENT_WORKFLOW_ID = "unknown"
 _CURRENT_AGENT_ID = "unknown"
 _CURRENT_TICKET_ID = ""
 
+# ─── Watchdog config (D1.1 of TEAM-3618) ─────────────────────────────────────
+# Fleet-wide heartbeat / deadline knobs, resolved payload-first → env → the
+# legacy hardcoded constants (byte-identical when the invoke omits `watchdog`).
+# The orchestrator resolves per-agent + defaults from agents.json and ships the
+# result in the invoke payload; this runtime just honours it. `enabled: false`
+# disables ACTIVE enforcement (the subprocess deadline kill) — it must NEVER
+# disable heartbeat EMISSION, because invocation leases (R3) presume the agent
+# alive from its agent.streaming/agent.started events.
+_WATCHDOG_LEGACY = {
+    "enabled": True,
+    "heartbeatIntervalMs": 15000,
+    "toolDeadlineSecs": 600,
+    "turnTimeoutSecs": 1500,
+}
+_WATCHDOG = dict(_WATCHDOG_LEGACY)
+
+
+def _wd_num(*candidates) -> "int | None":
+    """First finite, positive candidate wins; zero/negative/unparsable skipped."""
+    for c in candidates:
+        if c is None or c == "":
+            continue
+        try:
+            n = int(float(c))
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return None
+
+
+def _wd_bool(v) -> "bool | None":
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s == "":
+        return None
+    return s not in ("false", "0", "no", "off")
+
+
+def _resolve_watchdog(payload: dict) -> dict:
+    """Resolve the effective watchdog config for this invocation.
+
+    Order per field: payload watchdog.<field> → env override → legacy constant.
+    (The orchestrator has already folded per-agent + defaults from agents.json
+    into the payload block, so payload-first here == the fleet resolution.)
+    """
+    wd = payload.get("watchdog") if isinstance(payload, dict) else None
+    wd = wd if isinstance(wd, dict) else {}
+
+    enabled = _wd_bool(wd.get("enabled"))
+    if enabled is None:
+        enabled = _wd_bool(os.getenv("WATCHDOG_ENABLED"))
+    if enabled is None:
+        enabled = _WATCHDOG_LEGACY["enabled"]
+
+    return {
+        "enabled": enabled,
+        "heartbeatIntervalMs": _wd_num(
+            wd.get("heartbeatIntervalMs"), os.getenv("WATCHDOG_HEARTBEAT_INTERVAL_MS")
+        ) or _WATCHDOG_LEGACY["heartbeatIntervalMs"],
+        "toolDeadlineSecs": _wd_num(
+            wd.get("toolDeadlineSecs"), os.getenv("WATCHDOG_TOOL_DEADLINE_SECS")
+        ) or _WATCHDOG_LEGACY["toolDeadlineSecs"],
+        "turnTimeoutSecs": _wd_num(
+            wd.get("turnTimeoutSecs"), os.getenv("WATCHDOG_TURN_TIMEOUT_SECS")
+        ) or _WATCHDOG_LEGACY["turnTimeoutSecs"],
+    }
+
 # ─── Remote coding runtime (Cloud Code) ──────────────────────────────────────
 # When enabled, claude_code/codex delegate to the standalone coding-agent
 # runtime instead of spawning the CLI in this microVM. The coding runtime keeps
@@ -1658,12 +1729,18 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
         # condvar that wakes regardless of selector state, so it always fires.
         # Once we killpg the process group, pipe EOF unblocks communicate().
         # Deadline kept under AgentCore's 900s idleSessionTimeout.
-        DEADLINE_SECS = 600
+        # D1.1: resolved payload-first → env → legacy 600. `enabled: false`
+        # skips the active kill (subprocess runs to natural completion) —
+        # heartbeat emission is separate and always continues.
+        DEADLINE_SECS = _WATCHDOG["toolDeadlineSecs"]
+        _wd_enforce = _WATCHDOG["enabled"]
         watchdog_done = threading.Event()
         watchdog_fired = {"value": False}
 
         def _watchdog():
             if not watchdog_done.wait(timeout=DEADLINE_SECS):
+                if not _wd_enforce:
+                    return  # enforcement disabled — never kill
                 # Deadline expired — kill the whole process group.
                 watchdog_fired["value"] = True
                 try:
@@ -1682,7 +1759,8 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
         try:
             # Belt-and-suspenders: also pass a timeout slightly past the
             # watchdog so if communicate ever DOES wake, we don't hang here.
-            stdout, stderr = proc.communicate(timeout=DEADLINE_SECS + 30)
+            # When enforcement is disabled there is no deadline to belt against.
+            stdout, stderr = proc.communicate(timeout=(DEADLINE_SECS + 30) if _wd_enforce else None)
         except subprocess.TimeoutExpired:
             # Watchdog should have killed it; force-kill in case it didn't.
             try:
@@ -1819,7 +1897,9 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
     # give the engine time to warm (it can take several attempts over ~30-60s).
     import time as _time
     import re as _re_codex
-    DEADLINE_SECS = 600
+    # D1.1: resolved payload-first → env → legacy 600 (see claude_code above).
+    DEADLINE_SECS = _WATCHDOG["toolDeadlineSecs"]
+    _wd_enforce = _WATCHDOG["enabled"]
     ATTEMPTS = int(os.getenv("CODEX_ENGINE_RETRIES", "20"))
     BACKOFF_SECS = int(os.getenv("CODEX_ENGINE_BACKOFF", "8"))
     last_output = ""
@@ -1838,6 +1918,8 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
 
             def _watchdog():
                 if not watchdog_done.wait(timeout=DEADLINE_SECS):
+                    if not _wd_enforce:
+                        return  # enforcement disabled — never kill
                     watchdog_fired["value"] = True
                     try:
                         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -1850,7 +1932,7 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
             wd = threading.Thread(target=_watchdog, daemon=True)
             wd.start()
             try:
-                stdout, stderr = proc.communicate(timeout=DEADLINE_SECS + 30)
+                stdout, stderr = proc.communicate(timeout=(DEADLINE_SECS + 30) if _wd_enforce else None)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -2344,7 +2426,7 @@ async def _run_agent_invocation(payload, context):
     The system prompt is NOT in the payload — it's baked into the agent at deploy time
     via the SYSTEM_PROMPT env var. The orchestrator is dumb and only passes task context.
     """
-    global _CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID, _CURRENT_TICKET_ID
+    global _CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID, _CURRENT_TICKET_ID, _WATCHDOG
     prompt = payload.get("prompt", "")
     workflow_id = payload.get("workflow_id", "unknown")
     agent_id = payload.get("agent_id", "unknown")
@@ -2354,6 +2436,8 @@ async def _run_agent_invocation(payload, context):
     _CURRENT_WORKFLOW_ID = workflow_id
     _CURRENT_AGENT_ID = agent_id
     _CURRENT_TICKET_ID = payload.get("ticket_id", "")
+    # Fleet-wide watchdog knobs (D1.1) — payload-first → env → legacy constants.
+    _WATCHDOG = _resolve_watchdog(payload)
 
     # Stamp session.id into OTel baggage so any future ADOT-side processors can
     # also correlate this invocation's spans with the runtime session.
