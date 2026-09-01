@@ -109,14 +109,31 @@ CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
 # A single coding turn can be long; cap so a wedged CLI can't pin the microVM.
 # This IS the fleet-wide watchdog `turnTimeoutSecs` (TEAM-3618 D1.1) — the per-turn
 # wall-clock the orchestrator resolves per agent (agents.json watchdog → env →
-# legacy 1500). The orchestrator can't set this runtime's env per-invocation
-# (InvokeAgentRuntime carries only a JSON payload), so the canonical fleet knob
-# WATCHDOG_TURN_TIMEOUT_SECS is honored here as the env override, ahead of the
-# legacy TURN_TIMEOUT_S env and the hardcoded 1500 default — same order as the
-# resolver's env → legacy tail.
+# legacy 1500). InvokeAgentRuntime carries only a JSON payload, so the resolved
+# per-agent value is now forwarded per-turn as the `turn_timeout_secs` payload
+# field (TEAM-3687) and honored by _resolve_turn_timeout below (payload-first).
+# This constant remains the fleet-wide fallback when a turn omits the field: the
+# canonical env knob WATCHDOG_TURN_TIMEOUT_SECS ahead of the legacy TURN_TIMEOUT_S
+# env and the hardcoded 1500 default — same order as the resolver's env → legacy tail.
 TURN_TIMEOUT_S = _safe_int_env(
     "WATCHDOG_TURN_TIMEOUT_SECS", _safe_int_env("TURN_TIMEOUT_S", 1500)
 )
+
+
+def _resolve_turn_timeout(payload_val) -> int:
+    """Per-turn wall-clock cap: the payload's `turn_timeout_secs` when it is a
+    positive number, else the module TURN_TIMEOUT_S (which already encodes the
+    env → legacy 1500 fleet fallback). The orchestrator resolves this per agent
+    (agents.json watchdog.turnTimeoutSecs) and forwards it in the submit payload
+    (TEAM-3687); a zero/negative/unparsable/absent value degrades to the fleet
+    default rather than disabling the cap."""
+    if payload_val is None:
+        return TURN_TIMEOUT_S
+    try:
+        n = int(float(payload_val))
+    except (ValueError, TypeError):
+        return TURN_TIMEOUT_S
+    return n if n > 0 else TURN_TIMEOUT_S
 # Async (submit+poll) turns: journal heartbeat cadence and the staleness bar a
 # poll uses to declare a running turn dead (VM crashed mid-turn). The heartbeat
 # is written by the runner thread; 120s of silence >> one 15s beat, so a stale
@@ -1766,7 +1783,8 @@ def _otel_turn_env(session_id: str | None) -> dict:
 
 
 def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
-                session_id: str | None = None, model: str | None = None) -> dict:
+                session_id: str | None = None, model: str | None = None,
+                turn_timeout_s: int = TURN_TIMEOUT_S) -> dict:
     """Run one Claude Code turn. Resume the conversation when a prior
     claude_session_id is supplied (same microVM keeps its ~/.claude state)."""
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
@@ -1780,7 +1798,7 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
            **_otel_turn_env(session_id)}
 
     proc = subprocess.run(args, cwd=workdir, env=env, capture_output=True,
-                          text=True, timeout=TURN_TIMEOUT_S, stdin=subprocess.DEVNULL)
+                          text=True, timeout=turn_timeout_s, stdin=subprocess.DEVNULL)
     if proc.returncode != 0:
         raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[:600]}")
     try:
@@ -1815,7 +1833,7 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
 
 def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None,
                    session_id: str | None = None, tenant_id: str | None = None,
-                   model: str | None = None):
+                   model: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S):
     """Generator yielding SSE lines for a Claude turn as it runs.
 
     Parses claude stream-json line-by-line: assistant text deltas → 'text'
@@ -1843,7 +1861,7 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     def _kill_on_timeout():
         timed_out.set()
         proc.kill()
-    watchdog = threading.Timer(TURN_TIMEOUT_S, _kill_on_timeout)
+    watchdog = threading.Timer(turn_timeout_s, _kill_on_timeout)
     watchdog.start()
     new_session_id: str | None = claude_session_id
     full_text: list[str] = []
@@ -1890,7 +1908,7 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     finally:
         watchdog.cancel()
     if timed_out.is_set():
-        err = f"claude timed out after {TURN_TIMEOUT_S}s"
+        err = f"claude timed out after {turn_timeout_s}s"
         yield sse({"type": "error", "error": err})
         yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": new_session_id})
         return
@@ -1919,7 +1937,8 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
 
 
 def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
-               session_id: str | None = None, model: str | None = None) -> dict:
+               session_id: str | None = None, model: str | None = None,
+               turn_timeout_s: int = TURN_TIMEOUT_S) -> dict:
     """Run one Codex turn via the Mantle launcher (GPT-5.5). Resumes the prior
     conversation when codex_session_id (a codex thread_id) is supplied.
 
@@ -1932,7 +1951,7 @@ def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
     if codex_session_id:
         args.append(codex_session_id)
     proc = subprocess.run(args, cwd=workdir, env=env, capture_output=True,
-                          text=True, timeout=TURN_TIMEOUT_S, stdin=subprocess.DEVNULL)
+                          text=True, timeout=turn_timeout_s, stdin=subprocess.DEVNULL)
     if proc.returncode != 0:
         # codex exec --json writes its real failure to STDOUT (a {"type":"error"}
         # / {"type":"turn.failed"} JSONL frame), not stderr — stderr only carries
@@ -1977,7 +1996,7 @@ def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
 
 def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
                   repo: str | None = None, session_id: str | None = None,
-                  tenant_id: str | None = None):
+                  tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S):
     """Generator yielding SSE lines for a Codex turn as it runs.
 
     codex exec --json emits per-STEP JSONL (not token deltas): thread.started,
@@ -2009,7 +2028,7 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
     def _kill_on_timeout():
         timed_out.set()
         proc.kill()
-    watchdog = threading.Timer(TURN_TIMEOUT_S, _kill_on_timeout)
+    watchdog = threading.Timer(turn_timeout_s, _kill_on_timeout)
     watchdog.start()
     thread_id: str | None = codex_session_id
     reply_parts: list[str] = []          # only agent_message text = the actual reply
@@ -2066,7 +2085,7 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
     finally:
         watchdog.cancel()
     if timed_out.is_set():
-        err = f"codex timed out after {TURN_TIMEOUT_S}s"
+        err = f"codex timed out after {turn_timeout_s}s"
         yield sse({"type": "error", "error": err})
         yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": thread_id})
         return
@@ -2144,7 +2163,7 @@ def _journal_write(path: str, record: dict) -> bool:
 def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: str,
                     claude_session_id: str | None, repo: str | None,
                     session_id: str | None, tenant_id: str | None,
-                    model: str | None) -> None:
+                    model: str | None, turn_timeout_s: int = TURN_TIMEOUT_S) -> None:
     """Runner thread body: drive one CLI turn via the existing streaming
     generators (they carry the watchdog, artifact harvest, and session-id
     bookkeeping), heartbeat the journal while it runs, then journal the terminal
@@ -2183,10 +2202,11 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
     result: dict = {}
     last_error = ""
     try:
-        gen = (_stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
+        gen = (_stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
+                             turn_timeout_s)
                if cli == "codex"
                else _stream_claude(prompt, workdir, claude_session_id, repo,
-                                   session_id, tenant_id, model))
+                                   session_id, tenant_id, model, turn_timeout_s))
         for line in gen:
             if not line.startswith("data:"):
                 continue
@@ -2367,6 +2387,10 @@ async def invocations(request: Request):
     claude_session_id = payload.get("claude_session_id")
     # Per-turn model override (pipeline personas run on their own model).
     model = (payload.get("model") or "").strip() or None
+    # Per-turn watchdog wall-clock: the orchestrator resolves turnTimeoutSecs per
+    # agent (agents.json watchdog) and forwards it here (TEAM-3687). Falls back to
+    # the fleet default TURN_TIMEOUT_S (env → legacy 1500) when absent/invalid.
+    turn_timeout_s = _resolve_turn_timeout(payload.get("turn_timeout_secs"))
     user_id = payload.get("user_id")
     tenant_id = payload.get("tenant_id")  # S3 isolation boundary (see _tenant_root)
     config_version = payload.get("config_version")
@@ -2627,7 +2651,7 @@ async def invocations(request: Request):
         threading.Thread(
             target=_run_turn_async,
             args=(turn_id, journal, cli, prompt, workdir, claude_session_id,
-                  repo, session_id, tenant_id, model),
+                  repo, session_id, tenant_id, model, turn_timeout_s),
             daemon=True,
         ).start()
         logger.info("turn_submitted", extra={"cli": cli, "turn_id": turn_id})
@@ -2638,22 +2662,24 @@ async def invocations(request: Request):
     # async/sync generator response as text/event-stream through InvokeAgentRuntime.
     if stream and cli in ("claude", "codex"):
         gen = (
-            _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
+            _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
+                          turn_timeout_s)
             if cli == "codex"
-            else _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id, model)
+            else _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
+                                model, turn_timeout_s)
         )
         return StreamingResponse(gen, media_type="text/event-stream")
 
     try:
         if cli == "codex":
-            result = _run_codex(prompt, workdir, claude_session_id, session_id, model)
+            result = _run_codex(prompt, workdir, claude_session_id, session_id, model, turn_timeout_s)
         elif cli == "claude":
-            result = _run_claude(prompt, workdir, claude_session_id, session_id, model)
+            result = _run_claude(prompt, workdir, claude_session_id, session_id, model, turn_timeout_s)
         else:
             return JSONResponse({"error": f"unknown cli '{cli}'"}, status_code=400)
     except subprocess.TimeoutExpired:
-        logger.error("turn_timeout", extra={"cli": cli, "timeout_s": TURN_TIMEOUT_S})
-        return JSONResponse({"error": f"{cli} timed out after {TURN_TIMEOUT_S}s"}, status_code=504)
+        logger.error("turn_timeout", extra={"cli": cli, "timeout_s": turn_timeout_s})
+        return JSONResponse({"error": f"{cli} timed out after {turn_timeout_s}s"}, status_code=504)
     except Exception as exc:  # noqa: BLE001 — surface any failure to the caller
         logger.error("turn_failed", extra={"cli": cli, "error": str(exc)[:600]})
         return JSONResponse({"error": str(exc)[:600]}, status_code=500)
