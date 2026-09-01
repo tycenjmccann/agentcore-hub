@@ -19,6 +19,7 @@ Globals:
         GITHUB_LAMBDA: !Ref GitHubLambdaName
         EVENT_BUS: !Ref EventBus
         PROJECT_KEY: TEAM
+        DEAD_SESSION_DETECTOR_MODE: !Ref DeadSessionDetectorMode
 
 Parameters:
   TicketsTableName:
@@ -50,6 +51,15 @@ Parameters:
     Type: String
     Default: default
     Description: EventBridge bus name for publishing workflow events
+
+  DeadSessionDetectorMode:
+    Type: String
+    Default: shadow
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Dead-session detector rollout (TEAM-3618 D1.2). off = skip the sweep;
+      shadow = observe + metrics + shadow-flagged events, no writes;
+      enforce = steal stale claims, retry once, then escalate.
 
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────
@@ -102,6 +112,16 @@ Resources:
             FilterCriteria:
               Filters:
                 - Pattern: '{"eventName":["INSERT","MODIFY"]}'
+        # Dead-session sweep (TEAM-3618 D1.2). SAM creates the rule + the
+        # lambda:InvokeFunction permission for events.amazonaws.com. The sentinel
+        # Input is what index.mjs branches on before any stream/webhook parsing.
+        DeadSessionSweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Name: agentcore-hub-dead-session-sweep
+            Description: Invoke the orchestrator to sweep for dead agent sessions.
+            Input: '{"source":"orchestrator.sweep","action":"dead_session_sweep"}'
 
   # ─── Agent Invoker Lambda (async, long-running) ────────────────────────────────
   AgentInvokerFunction:

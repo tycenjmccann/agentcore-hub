@@ -52,7 +52,7 @@ rm -f function.zip
 # lease.mjs; the module prefers this local copy and falls back to the repo path
 # for local/test runs. Do NOT fork the values — always copy from the repo.
 cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -87,7 +87,15 @@ if [ -n "${WORKFLOW_LEASE_TTL_MINUTES:-}" ]; then
   LEASE_VARS=",WORKFLOW_LEASE_TTL_MINUTES=${WORKFLOW_LEASE_TTL_MINUTES}"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}}"
+# Dead-session detector rollout (TEAM-3618 D1.2): off | shadow | enforce. The
+# code defaults to shadow when unset — only forward an explicit override so the
+# safe default is never accidentally flipped by a stale config.sh value.
+DETECTOR_VARS=""
+if [ -n "${DEAD_SESSION_DETECTOR_MODE:-}" ]; then
+  DETECTOR_VARS=",DEAD_SESSION_DETECTOR_MODE=${DEAD_SESSION_DETECTOR_MODE}"
+fi
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}}"
 
@@ -212,6 +220,51 @@ else
     --region "$AWS_REGION" \
     --output text --query 'Statement' >/dev/null
   echo "  ✓ events-writer EventBridge invoke permission added"
+fi
+
+# ── EventBridge: scheduled dead-session sweep → orchestrator ──────────────────
+# Mirrors DeadSessionSweepRule + permission in template.yaml. A rate(5 minutes)
+# rule invokes the orchestrator with the sentinel payload; index.mjs branches on
+# it before any stream/webhook parsing (TEAM-3618 D1.2). Scheduled rules live on
+# the default bus only.
+echo "=== Wiring dead-session sweep trigger (EventBridge schedule) ==="
+SWEEP_RULE="agentcore-hub-dead-session-sweep"
+ORCH_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-orchestrator"
+
+aws events put-rule \
+  --name "$SWEEP_RULE" \
+  --schedule-expression "rate(5 minutes)" \
+  --state ENABLED \
+  --region "$AWS_REGION" \
+  --output text --query 'RuleArn' >/dev/null
+echo "  ✓ Rule $SWEEP_RULE upserted (rate(5 minutes))"
+
+# JSON list form (not the key=value shorthand): the Input JSON contains commas,
+# which the shorthand parser would mis-split on. Input is a JSON *string*.
+aws events put-targets \
+  --rule "$SWEEP_RULE" \
+  --targets '[{"Id":"orchestrator","Arn":"'"$ORCH_ARN"'","Input":"{\"source\":\"orchestrator.sweep\",\"action\":\"dead_session_sweep\"}"}]' \
+  --region "$AWS_REGION" \
+  --output text --query 'FailedEntryCount' >/dev/null
+echo "  ✓ Target orchestrator attached to $SWEEP_RULE"
+
+SWEEP_RULE_ARN="arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:rule/${SWEEP_RULE}"
+SWEEP_PERM_SID="agentcore-hub-orchestrator-dead-session-sweep"
+if aws lambda get-policy \
+     --function-name agentcore-hub-orchestrator \
+     --region "$AWS_REGION" \
+     --output text --query 'Policy' 2>/dev/null | grep -q "\"Sid\":\"$SWEEP_PERM_SID\""; then
+  echo "  ✓ orchestrator sweep invoke permission already present"
+else
+  aws lambda add-permission \
+    --function-name agentcore-hub-orchestrator \
+    --statement-id "$SWEEP_PERM_SID" \
+    --action lambda:InvokeFunction \
+    --principal events.amazonaws.com \
+    --source-arn "$SWEEP_RULE_ARN" \
+    --region "$AWS_REGION" \
+    --output text --query 'Statement' >/dev/null
+  echo "  ✓ orchestrator sweep invoke permission added"
 fi
 
 rm -f function.zip

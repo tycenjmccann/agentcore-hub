@@ -29,8 +29,16 @@ import {
   InvokeAgentCommand,
 } from "@aws-sdk/client-bedrock-agent-runtime";
 import * as store from "./workflow-store.mjs";
-import { DEFAULT_TTL_MINUTES, STALE_CLAIM_MULTIPLIER } from "./lease.mjs";
+import {
+  DEFAULT_TTL_MINUTES,
+  STALE_CLAIM_MULTIPLIER,
+  LEASE_TTL_MS,
+  isLeaseLive,
+  lastAgentActivity,
+  stealClaim,
+} from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
+import { createDetector } from "./dead-session-detector.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -42,6 +50,10 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 const GITHUB_LAMBDA = process.env.GITHUB_LAMBDA || "agentcore-hub-github-mcp";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const MAX_QA_RETRIES = 3;
+// Dead-session detector rollout flag (TEAM-3618 D1.2): off = skip the sweep,
+// shadow (default) = observe + metrics + shadow-flagged events but ZERO writes,
+// enforce = steal/retry/escalate for real.
+const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
@@ -187,12 +199,58 @@ function getWorkflowDef(id) {
   return defs[id] || defs[DEFAULT_WORKFLOW_DEF_ID] || FALLBACK_WORKFLOW_DEF;
 }
 
+// ─── Dead-session detector (TEAM-3618 D1.2) ──────────────────────────────────
+
+/**
+ * Re-dispatch a ticket through the NORMAL invocation path (claim CAS → invoke).
+ * Used by the dead-session detector's retry-once step after it has stolen the
+ * stale claim (status→ready). The claim CAS is the final arbiter — a live
+ * concurrent claim wins and this returns false. Best-effort context build.
+ */
+async function redispatchTicket(workflow, ticket) {
+  const agentDef = getAgentDef(ticket.assignee);
+  if (!agentDef) return false;
+  const claimed = await claimTicketInvocation(workflow, ticket.ticketId, ticket.assignee);
+  if (!claimed) return false;
+  const context = await buildAgentContext(ticket, workflow);
+  await invokeAgent(agentDef, context, workflow, ticket.ticketId);
+  return true;
+}
+
+// One detector per warm container so its per-agent median cache is reused
+// across the 5-minute sweeps (rebuilt from scratch on a cold start).
+let _detector = null;
+function getDetector() {
+  if (_detector) return _detector;
+  _detector = createDetector({
+    ddb,
+    workflowsTable: WORKFLOWS_TABLE,
+    eventsTable: EVENTS_TABLE,
+    store,
+    lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
+    getTicket,
+    getAgentDef,
+    publishEvent,
+    redispatch: redispatchTicket,
+    blockTicket: blockTicketForFailedInvoke,
+  });
+  return _detector;
+}
+
 // ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
 
 export const handler = async (event) => {
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
+
+  // Scheduled dead-session sweep (TEAM-3618 D1.2). A rate(5 minutes) EventBridge
+  // rule fires this sentinel. Branch BEFORE any stream/webhook parsing — it is a
+  // synthetic invocation with no Records/source-webhook shape.
+  if (event?.source === "orchestrator.sweep" && event?.action === "dead_session_sweep") {
+    console.log(`[orchestrator] dead-session sweep (mode=${DEAD_SESSION_DETECTOR_MODE})`);
+    return getDetector().runSweep(DEAD_SESSION_DETECTOR_MODE);
+  }
 
   // SQS FIFO command queue (R1 — docs/race-condition-study.md). One message
   // group per workflow root, so commands for a run arrive strictly in order

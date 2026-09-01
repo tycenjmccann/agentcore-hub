@@ -117,6 +117,13 @@ export interface WorkflowState {
   featureBranch?: string;
   /** QA verification retry counter (max 3 fix cycles before human escalation) */
   qaRetryCount?: number;
+  /**
+   * Per-ticket dead-session auto-retry counter (TEAM-3618 D1.2). The
+   * orchestrator's dead-session detector re-dispatches a crashed session ONCE;
+   * a second detected death for the same ticket escalates instead of looping.
+   * Keyed by ticketId, incremented independently of qaRetryCount.
+   */
+  deadSessionRetries?: Record<string, number>;
   /** Routine-scoped connector ids forwarded to agent invocations for this run. */
   connectors?: string[];
   /** Persisted event log for replay (populated during live runs) */

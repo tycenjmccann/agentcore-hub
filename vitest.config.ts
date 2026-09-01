@@ -37,6 +37,10 @@ export default defineConfig({
       // watchdog.mjs mirrors the TS watchdog resolver (TEAM-3618 D1.1) — pure
       // config resolution, unit-testable via setWatchdogSource().
       "lambda/orchestrator/watchdog.test.mjs",
+      // dead-session-detector.mjs (TEAM-3618 D1.2) — the sweep is fully
+      // dependency-injected (stub ddb/store/lease + fake clock), so its
+      // guard/trigger/retry/escalate logic is unit-testable with no AWS.
+      "lambda/orchestrator/dead-session-detector.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
