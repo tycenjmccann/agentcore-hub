@@ -1765,6 +1765,12 @@
   ],
   "defaults": {
     "intakeAgentId": "agentcore_hub_requirements_analyst",
-    "defaultAssigneeId": "agentcore_hub_backend_designer"
+    "defaultAssigneeId": "agentcore_hub_backend_designer",
+    "watchdog": {
+      "enabled": true,
+      "heartbeatIntervalMs": 15000,
+      "toolDeadlineSecs": 600,
+      "turnTimeoutSecs": 1500
+    }
   }
 }

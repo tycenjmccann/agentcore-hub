@@ -19,6 +19,8 @@ Globals:
         GITHUB_LAMBDA: !Ref GitHubLambdaName
         EVENT_BUS: !Ref EventBus
         PROJECT_KEY: TEAM
+        DEAD_SESSION_DETECTOR_MODE: !Ref DeadSessionDetectorMode
+        CASCADE_EXTENDED_STATES: !Ref CascadeExtendedStates
 
 Parameters:
   TicketsTableName:
@@ -50,6 +52,26 @@ Parameters:
     Type: String
     Default: default
     Description: EventBridge bus name for publishing workflow events
+
+  DeadSessionDetectorMode:
+    Type: String
+    Default: shadow
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Dead-session detector rollout (TEAM-3618 D1.2). off = skip the sweep;
+      shadow = observe + metrics + shadow-flagged events, no writes;
+      enforce = steal stale claims, retry once, then escalate.
+
+  CascadeExtendedStates:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: >
+      Cascade extended-states rollout (TEAM-3618 D3 commit 4b). off = the unblock
+      cascade only re-Readies {blocked, todo} dependents. on = a dependent
+      in_progress whose last blocker resolves is lease-guarded (live lease →
+      orchestrator.nudge only; stale lease → steal + re-dispatch via the claim
+      CAS) and an in_review gate is re-woken (review.reawakened + gate re-run).
 
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────
@@ -102,6 +124,16 @@ Resources:
             FilterCriteria:
               Filters:
                 - Pattern: '{"eventName":["INSERT","MODIFY"]}'
+        # Dead-session sweep (TEAM-3618 D1.2). SAM creates the rule + the
+        # lambda:InvokeFunction permission for events.amazonaws.com. The sentinel
+        # Input is what index.mjs branches on before any stream/webhook parsing.
+        DeadSessionSweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Name: agentcore-hub-dead-session-sweep
+            Description: Invoke the orchestrator to sweep for dead agent sessions.
+            Input: '{"source":"orchestrator.sweep","action":"dead_session_sweep"}'
 
   # ─── Agent Invoker Lambda (async, long-running) ────────────────────────────────
   AgentInvokerFunction:

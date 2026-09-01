@@ -197,6 +197,62 @@ export async function setTaskStatus(workflowId, ticketId, status) {
 }
 
 /**
+ * Sweep idempotency for the dead-session detector (TEAM-3618 D1.2). Stamp
+ * deadSessionDetectedAt on the task ONLY IF the entry still holds the exact
+ * claim generation the sweep inspected (same startedAt) and has not already
+ * been stamped. This is the FIRST write on the trigger path — losing the CAS
+ * (the claim moved, or a concurrent sweep already stamped it) means another
+ * actor owns this generation, so the caller stops. Scoped to the task's own
+ * map keys; never a full-map replacement (R2). Returns true when this caller
+ * won the stamp.
+ */
+export async function markDeadSessionDetected(workflowId, ticketId, expectedStartedAt) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET agentTasks.#tid.deadSessionDetectedAt = :now",
+      ConditionExpression:
+        "agentTasks.#tid.startedAt = :expected AND attribute_not_exists(agentTasks.#tid.deadSessionDetectedAt)",
+      ExpressionAttributeNames: { "#tid": ticketId },
+      ExpressionAttributeValues: {
+        ":now": new Date().toISOString(),
+        ":expected": expectedStartedAt,
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * Increment the per-ticket dead-session retry counter (TEAM-3618 D1.2), scoped
+ * to deadSessionRetries[ticketId] so it never touches qaRetryCount or sibling
+ * tickets. The map is seeded first (if_not_exists on the map is illegal inside
+ * the same SET that indexes into it), then the leaf is bumped with
+ * if_not_exists so the first detection reads 0 → 1. Returns the new count.
+ */
+export async function incrementDeadSessionRetry(workflowId, ticketId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET deadSessionRetries = if_not_exists(deadSessionRetries, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  const res = await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET deadSessionRetries.#tid = if_not_exists(deadSessionRetries.#tid, :zero) + :one",
+    ExpressionAttributeNames: { "#tid": ticketId },
+    ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
+    ReturnValues: "UPDATED_NEW",
+  }));
+  return res.Attributes?.deadSessionRetries?.[ticketId];
+}
+
+/**
  * Advance the workflow phase, optionally pinning the shared feature branch.
  * if_not_exists on the branch keeps the first winner under concurrent
  * same-phase claims; the monotonic phase check happened caller-side against a

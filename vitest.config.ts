@@ -29,6 +29,23 @@ export default defineConfig({
       // workflow-store is pure DDB-command construction — unit-testable with a
       // stub client, same rationale as the eval-packager classifiers.
       "lambda/orchestrator/workflow-store.test.mjs",
+      // lease.mjs is the orchestrator port of the lease primitives (TEAM-3618)
+      // — pure liveness math + DDB-command construction, stub-client testable.
+      // Its parity with src/lib/workflow/lease.ts is asserted by the auto-
+      // included src/lib/workflow/lease-parity.test.ts.
+      "lambda/orchestrator/lease.test.mjs",
+      // watchdog.mjs mirrors the TS watchdog resolver (TEAM-3618 D1.1) — pure
+      // config resolution, unit-testable via setWatchdogSource().
+      "lambda/orchestrator/watchdog.test.mjs",
+      // dead-session-detector.mjs (TEAM-3618 D1.2) — the sweep is fully
+      // dependency-injected (stub ddb/store/lease + fake clock), so its
+      // guard/trigger/retry/escalate logic is unit-testable with no AWS.
+      "lambda/orchestrator/dead-session-detector.test.mjs",
+      // cascade.mjs (TEAM-3618 D3) — the shared unblock cascade behind both
+      // "ticket done" paths. Fully dependency-injected (stub ddb/provider/event
+      // publisher + fake clock), so the union + extended-state logic is
+      // unit-testable with no AWS.
+      "lambda/orchestrator/cascade.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

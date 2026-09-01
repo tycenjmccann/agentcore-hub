@@ -7,6 +7,8 @@ import {
   mergeTaskMetadata,
   completeTaskEntry,
   setTaskStatus,
+  markDeadSessionDetected,
+  incrementDeadSessionRetry,
   advancePhase,
   setResumeContext,
   appendNotification,
@@ -122,6 +124,37 @@ describe("setTaskStatus", () => {
     const w = writes()[0];
     expect(w.input.UpdateExpression).toBe("SET agentTasks.#tid.#st = :s");
     expect(w.input.ConditionExpression).toBe("attribute_exists(agentTasks.#tid)");
+  });
+});
+
+describe("markDeadSessionDetected", () => {
+  it("stamps under a CAS on the exact claim generation (startedAt) + not-yet-stamped", async () => {
+    const won = await markDeadSessionDetected("wf_1", "TEAM-2", "2026-08-30T00:00:00Z");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("SET agentTasks.#tid.deadSessionDetectedAt = :now");
+    expect(w.input.ConditionExpression).toBe(
+      "agentTasks.#tid.startedAt = :expected AND attribute_not_exists(agentTasks.#tid.deadSessionDetectedAt)"
+    );
+    expect(w.input.ExpressionAttributeValues[":expected"]).toBe("2026-08-30T00:00:00Z");
+  });
+
+  it("returns false when the claim moved or was already stamped", async () => {
+    failNextCondition = true;
+    expect(await markDeadSessionDetected("wf_1", "TEAM-2", "x")).toBe(false);
+  });
+});
+
+describe("incrementDeadSessionRetry", () => {
+  it("seeds the map then bumps the per-ticket leaf with if_not_exists (never touches qaRetryCount)", async () => {
+    await incrementDeadSessionRetry("wf_1", "TEAM-2");
+    expect(writes()[0].input.UpdateExpression).toContain("if_not_exists(deadSessionRetries, :empty)");
+    const bump = writes()[1];
+    expect(bump.input.UpdateExpression).toBe(
+      "SET deadSessionRetries.#tid = if_not_exists(deadSessionRetries.#tid, :zero) + :one"
+    );
+    expect(bump.input.ExpressionAttributeNames["#tid"]).toBe("TEAM-2");
+    expect(bump.input.ReturnValues).toBe("UPDATED_NEW");
   });
 });
 

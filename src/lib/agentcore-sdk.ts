@@ -35,13 +35,16 @@ import {
   CloudWatchLogsClient,
   DescribeLogGroupsCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
+import { resolveWatchdog } from "./workflow/watchdog";
 
 export const DEFAULT_REGION = process.env.AWS_REGION || "us-east-1";
 
 // SSE keep-alive cadence for long harness tool loops. Well under the ~120s
 // idle window App Runner and typical proxies enforce, so a silent "researching"
-// turn never trips the connection.
-const HARNESS_HEARTBEAT_MS = 15_000;
+// turn never trips the connection. Resolved from the fleet-wide watchdog config
+// (TEAM-3618 D1.1); the legacy 15_000 is the fallback baked into resolveWatchdog,
+// so an agents.json without a watchdog block keeps today's exact cadence.
+const HARNESS_HEARTBEAT_MS = resolveWatchdog().heartbeatIntervalMs;
 
 // Per-region client cache (avoids recreating clients on every call)
 const bedrockClients = new Map<string, BedrockRuntimeClient>();

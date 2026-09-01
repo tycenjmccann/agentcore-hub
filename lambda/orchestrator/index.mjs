@@ -29,6 +29,17 @@ import {
   InvokeAgentCommand,
 } from "@aws-sdk/client-bedrock-agent-runtime";
 import * as store from "./workflow-store.mjs";
+import {
+  DEFAULT_TTL_MINUTES,
+  STALE_CLAIM_MULTIPLIER,
+  LEASE_TTL_MS,
+  isLeaseLive,
+  lastAgentActivity,
+  stealClaim,
+} from "./lease.mjs";
+import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
+import { createDetector } from "./dead-session-detector.mjs";
+import { createCascade } from "./cascade.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -40,6 +51,16 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 const GITHUB_LAMBDA = process.env.GITHUB_LAMBDA || "agentcore-hub-github-mcp";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const MAX_QA_RETRIES = 3;
+// Dead-session detector rollout flag (TEAM-3618 D1.2): off = skip the sweep,
+// shadow (default) = observe + metrics + shadow-flagged events but ZERO writes,
+// enforce = steal/retry/escalate for real.
+const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
+// Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b). OFF by default:
+// the cascade only re-Readies {blocked, todo} dependents (commit-4a behavior).
+// ON: an in_progress dependent whose last blocker resolves is lease-guarded
+// (live → nudge only; stale → steal + re-dispatch through the claim CAS) and an
+// in_review gate is re-woken. Any value other than "on"/"true"/"1" stays OFF.
+const CASCADE_EXTENDED_STATES = /^(on|true|1)$/i.test(process.env.CASCADE_EXTENDED_STATES || "");
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
@@ -96,6 +117,9 @@ async function loadAgentRoster() {
       Key: "config/agents.json",
     }));
     const config = JSON.parse(await res.Body.transformToString());
+    // Feed the same S3 config to the watchdog resolver (D1.1) — per-agent +
+    // defaults watchdog blocks, resolved without a second fetch.
+    setWatchdogSource(config);
     _agentRoster = config.agents.map((a) => ({
       agentId: a.agentId,
       phase: a.phase,
@@ -182,12 +206,84 @@ function getWorkflowDef(id) {
   return defs[id] || defs[DEFAULT_WORKFLOW_DEF_ID] || FALLBACK_WORKFLOW_DEF;
 }
 
+// ─── Dead-session detector (TEAM-3618 D1.2) ──────────────────────────────────
+
+/**
+ * Re-dispatch a ticket through the NORMAL invocation path (claim CAS → invoke).
+ * Used by the dead-session detector's retry-once step after it has stolen the
+ * stale claim (status→ready). The claim CAS is the final arbiter — a live
+ * concurrent claim wins and this returns false. Best-effort context build.
+ */
+async function redispatchTicket(workflow, ticket) {
+  const agentDef = getAgentDef(ticket.assignee);
+  if (!agentDef) return false;
+  const claimed = await claimTicketInvocation(workflow, ticket.ticketId, ticket.assignee);
+  if (!claimed) return false;
+  const context = await buildAgentContext(ticket, workflow);
+  await invokeAgent(agentDef, context, workflow, ticket.ticketId);
+  return true;
+}
+
+// One detector per warm container so its per-agent median cache is reused
+// across the 5-minute sweeps (rebuilt from scratch on a cold start).
+let _detector = null;
+function getDetector() {
+  if (_detector) return _detector;
+  _detector = createDetector({
+    ddb,
+    workflowsTable: WORKFLOWS_TABLE,
+    eventsTable: EVENTS_TABLE,
+    store,
+    lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
+    getTicket,
+    getAgentDef,
+    publishEvent,
+    redispatch: redispatchTicket,
+    blockTicket: blockTicketForFailedInvoke,
+  });
+  return _detector;
+}
+
+// ─── Unblock cascade (TEAM-3618 D3) ──────────────────────────────────────────
+
+// One shared cascade helper behind BOTH "ticket done" paths (Jira-webhook and
+// DDB-stream), wired with the real provider/DDB/event effects. Lazy singleton
+// so warm containers reuse it (mirrors getDetector()).
+let _cascade = null;
+function getCascade() {
+  if (_cascade) return _cascade;
+  _cascade = createCascade({
+    ddb,
+    ticketsTable: TICKETS_TABLE,
+    provider: TICKET_PROVIDER,
+    jiraTransition,
+    getChildTickets,
+    publishEvent,
+    // Extended states (commit 4b) — behind CASCADE_EXTENDED_STATES.
+    extendedStates: CASCADE_EXTENDED_STATES,
+    lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
+    eventsTable: EVENTS_TABLE,
+    workflowsTable: WORKFLOWS_TABLE,
+    redispatch: redispatchTicket,
+    reawakenGate: handleHumanReviewGate,
+  });
+  return _cascade;
+}
+
 // ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
 
 export const handler = async (event) => {
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
+
+  // Scheduled dead-session sweep (TEAM-3618 D1.2). A rate(5 minutes) EventBridge
+  // rule fires this sentinel. Branch BEFORE any stream/webhook parsing — it is a
+  // synthetic invocation with no Records/source-webhook shape.
+  if (event?.source === "orchestrator.sweep" && event?.action === "dead_session_sweep") {
+    console.log(`[orchestrator] dead-session sweep (mode=${DEAD_SESSION_DETECTOR_MODE})`);
+    return getDetector().runSweep(DEAD_SESSION_DETECTOR_MODE);
+  }
 
   // SQS FIFO command queue (R1 — docs/race-condition-study.md). One message
   // group per workflow root, so commands for a run arrive strictly in order
@@ -387,48 +483,12 @@ async function handleTicketDoneUnified(ticketId) {
   // a pre-claim snapshot (double invocation).
   await markTaskComplete(workflow, ticketId, assignee);
 
-  // Unblock dependents
-  const siblings = await getChildTickets(parentId);
-  const unblocked = [];
+  // Unblock dependents via the shared cascade (TEAM-3618 D3). The helper owns
+  // the blocker predicate, provider branching, and orchestrator.unblocked
+  // journal events — identical to the DDB-stream twin (handleTicketDone).
+  const unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
 
-  for (const sibling of siblings) {
-    if (sibling.ticketId === ticketId) continue;
-    const blockers = sibling.blockedBy || [];
-    if (blockers.includes(ticketId)) {
-      // Check if all blockers are now resolved (done) — keep blockedBy intact like Jira does
-      const allResolved = blockers.every(bid => {
-        if (bid === ticketId) return true; // this one is done
-        const blocker = siblings.find(s => s.ticketId === bid);
-        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
-      });
-      if (allResolved && (sibling.status === "blocked" || sibling.status === "todo")) {
-        // All blockers resolved — transition to ready (keep blockedBy as historical record)
-        if (TICKET_PROVIDER === "jira") {
-          await jiraTransition(sibling.ticketId, "Ready");
-        } else {
-          await ddb.send(new UpdateCommand({
-            TableName: TICKETS_TABLE,
-            Key: { ticketId: sibling.ticketId },
-            UpdateExpression: "SET #s = :s, #u = :u",
-            ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-            ExpressionAttributeValues: { ":s": "todo", ":u": new Date().toISOString() },
-          }));
-        }
-        unblocked.push(sibling.ticketId);
-      }
-      // blockedBy array is never modified — it's a permanent record of dependencies
-    }
-  }
-
-  console.log(`[orchestrator] ${ticketId} done. Unblocked: [${unblocked.join(", ")}]`);
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
-
-  // Journey log: record each unblock for at-a-glance traceability
-  for (const unblockedId of unblocked) {
-    await publishEvent(unblockedId, "orchestrator.unblocked", {
-      ticketId: unblockedId, unblockedBy: ticketId, workflowId: workflow?.id,
-    });
-  }
 
   // Always check workflow completion — the last ticket to close triggers this
   if (await isWorkflowComplete(parentId, workflow)) {
@@ -485,8 +545,8 @@ async function claimTicketInvocation(workflow, ticketId, assignee) {
   // same knob as the lease-aware retry/dispatch endpoints, doubled because
   // this path has no activity signal — only the claim's age.
   const ttlMinutes = Number(process.env.WORKFLOW_LEASE_TTL_MINUTES);
-  const leaseTtlMs = (Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? ttlMinutes : 30) * 60_000;
-  const staleBefore = new Date(Date.now() - 2 * leaseTtlMs).toISOString();
+  const leaseTtlMs = (Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? ttlMinutes : DEFAULT_TTL_MINUTES) * 60_000;
+  const staleBefore = new Date(Date.now() - STALE_CLAIM_MULTIPLIER * leaseTtlMs).toISOString();
   const entry = {
     ...(workflow.agentTasks?.[ticketId] || {}),
     id: taskId,
@@ -1038,36 +1098,11 @@ async function handleTicketDone(ticketId, image) {
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);
 
-  // Unblock dependents: find tickets blocked by this one
-  const siblings = await getChildTickets(parentId);
-  const unblocked = [];
-
-  for (const sibling of siblings) {
-    if (sibling.ticketId === ticketId) continue;
-    const blockers = sibling.blockedBy || [];
-    if (blockers.includes(ticketId)) {
-      // Check if all blockers are now resolved — keep blockedBy intact (like Jira issue links)
-      const allResolved = blockers.every(bid => {
-        if (bid === ticketId) return true; // this one is done
-        const blocker = siblings.find(s => s.ticketId === bid);
-        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
-      });
-      if (allResolved && sibling.status === "blocked") {
-        // All blockers resolved — transition to todo (keep blockedBy as historical record)
-        await ddb.send(new UpdateCommand({
-          TableName: TICKETS_TABLE,
-          Key: { ticketId: sibling.ticketId },
-          UpdateExpression: "SET #s = :s, #u = :u",
-          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-          ExpressionAttributeValues: { ":s": "todo", ":u": new Date().toISOString() },
-        }));
-        unblocked.push(sibling.ticketId);
-      }
-      // blockedBy array is never modified — it's a permanent record of dependencies
-    }
-  }
-
-  console.log(`[orchestrator] ${ticketId} done. Unblocked: [${unblocked.join(", ")}]`);
+  // Unblock dependents via the shared cascade (TEAM-3618 D3). Same helper as the
+  // Jira-webhook twin (handleTicketDoneUnified) — this path previously matched
+  // only "blocked" dependents and emitted no orchestrator.unblocked events; the
+  // shared helper fixes both divergences (now {blocked, todo} → Ready + journal).
+  const unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
 
   // Publish event for UI
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
@@ -1373,6 +1408,9 @@ async function invokeAgent(agentDef, context, workflow, ticketId) {
         modelOverride: modelConfig,
         // Routine-scoped connectors travel with the workflow → each agent invoke.
         connectors: workflow.connectors,
+        // Fleet-wide watchdog knobs (D1.1), resolved from the S3 agents.json
+        // config: heartbeat cadence + tool/turn deadlines the runtime enforces.
+        watchdog: resolveWatchdog(agentDef.agentId),
       }),
     }));
 
