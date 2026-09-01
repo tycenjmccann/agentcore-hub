@@ -165,7 +165,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "claudeSessionId is required (the id of the transcript being ported)" }, { status: 400 });
     }
 
-    const cli: CloudCodeCli = body.cli === "codex" ? "codex" : "claude";
+    const cli: CloudCodeCli =
+      body.cli === "codex" ? "codex" : body.cli === "kiro" ? "kiro" : "claude";
     // Both bundle (commits-on-top) and selfContained (whole-repo --all) upload a
     // bundle; the runtime tells them apart by gitMode.
     const wantBundleUpload: boolean =

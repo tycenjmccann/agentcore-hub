@@ -41,6 +41,10 @@ export async function handler(event) {
     return { statusCode: 200, body: "Rejected: not a synthesized PRD" };
   }
 
+  // System-SI PRDs (WM si-synthesis skill) target the hub repo, not the agent
+  // fleet — prd.repoUrl overrides. Same [SI] banner either way.
+  const repoUrl = typeof prd.repoUrl === "string" && prd.repoUrl.startsWith("https://") ? prd.repoUrl : FLEET_REPO;
+
   // Submit to workflow API
   const payload = {
     title: `[SI] ${prd.title}`,
@@ -48,7 +52,7 @@ export async function handler(event) {
     repoConfig: {
       layout: "monorepo",
       repos: [{
-        url: FLEET_REPO,
+        url: repoUrl,
         defaultBranch: "main",
         platform: "backend",
       }],

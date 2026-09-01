@@ -1,0 +1,1 @@
+Round one. A bug. This tic-tac-toe game has a missing win pattern — three on the anti-diagonal should win. It doesn't. We file a Jira bug. The webhook fires. Three agents take over — analyst, developer, Q-A. You're watching the developer reason in real time. Tool calls, file writes, all traced. Pull request opens. We merge. We reload. Bug, gone.

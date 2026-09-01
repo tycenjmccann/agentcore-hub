@@ -246,6 +246,10 @@ const harnessConfig = {
   allowedTools: ["*"],
   truncation: { strategy: "sliding_window", config: { slidingWindow: { messagesCount: 150 } } },
   maxIterations: 75,
+  // Default per-response output cap is far too low for ANALYZE: writing
+  // analysis.json/summary chunks hits max_tokens mid-tool-call and Strands
+  // MaxTokensReachedException kills the whole session (no analysis persisted).
+  maxTokens: 32000,
   timeoutSeconds: 3600,
   memory: { agentCoreMemoryConfiguration: { arn: memoryArn, messagesCount: 20 } },
   environment: {
@@ -278,6 +282,7 @@ if (existing && existing.status === "READY") {
     harnessId,
     systemPrompt: [{ text: SYSTEM_PROMPT }],
     skills: SKILLS,
+    maxTokens: 32000,
   }));
   for (let i = 0; i < 24; i++) {
     await sleep(5000);

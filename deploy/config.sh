@@ -28,6 +28,8 @@ export DEPLOYMENT_URL="${DEPLOYMENT_URL:-}"
 # GitHub
 export GITHUB_OWNER="${GITHUB_OWNER:-}"
 export FLEET_REPO_URL="${FLEET_REPO_URL:-https://github.com/${GITHUB_OWNER}/agentcore-hub-fleet.git}"
+# Hub (this) repo — target for system-SI PRDs (agent SI targets FLEET_REPO_URL).
+export HUB_REPO_URL="${HUB_REPO_URL:-https://github.com/${GITHUB_OWNER}/agentcore-hub.git}"
 
 # IAM roles (convention-based defaults)
 export AGENTCORE_ROLE_ARN="${AGENTCORE_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-agentcore-role}"

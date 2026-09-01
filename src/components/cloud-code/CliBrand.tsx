@@ -1,9 +1,10 @@
 import type { CloudCodeCli } from "@/lib/cloud-code/types";
 
-// Brand palette for the two coding agents. Centralized so the sidebar row,
+// Brand palette for the coding agents. Centralized so the sidebar row,
 // session header, new-session modal, and agent-turn label all stay in sync.
 //   Claude  → Anthropic coral/clay (#D97757)
 //   Codex   → OpenAI monochrome; on a dark theme that reads as near-white/neutral
+//   Kiro    → AWS Kiro purple (#8B5CF6)
 // Marks below are the official Simple Icons (MIT) brand paths, fill=currentColor.
 export const CLI_BRAND: Record<
   CloudCodeCli,
@@ -19,6 +20,11 @@ export const CLI_BRAND: Record<
     label: "Codex",
     chip: "bg-white/10 text-[var(--color-text-secondary)]",
     dot: "text-[var(--color-text-secondary)]",
+  },
+  kiro: {
+    label: "Kiro",
+    chip: "bg-[#8B5CF6]/15 text-[#A78BFA]",
+    dot: "text-[#8B5CF6]",
   },
 };
 
@@ -42,13 +48,33 @@ function CodexMark({ className }: { className?: string }) {
   );
 }
 
+// Kiro — a simple geometric spark mark (Kiro has no Simple Icons entry yet).
+function KiroMark({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="currentColor" aria-hidden="true">
+      <path d="M12 1.5l2.7 6.9 6.9 2.7-6.9 2.7L12 22.5l-2.7-6.9L2.4 12l6.9-2.7L12 1.5z" />
+    </svg>
+  );
+}
+
+// Brand lookup that never returns undefined. A session row can carry a `cli`
+// this build doesn't know yet (a newer runtime persisted it, or an env still
+// running an older bundle) — indexing CLI_BRAND directly then yields undefined
+// and `.chip`/`.dot` throws, white-screening the whole page. Fall back to the
+// neutral (codex) palette so an unknown engine degrades gracefully.
+export function brandOf(cli: CloudCodeCli) {
+  return CLI_BRAND[cli] ?? CLI_BRAND.codex;
+}
+
 export function CliMark({ cli, className = "w-3.5 h-3.5" }: { cli: CloudCodeCli; className?: string }) {
-  return cli === "claude" ? <ClaudeMark className={className} /> : <CodexMark className={className} />;
+  if (cli === "claude") return <ClaudeMark className={className} />;
+  if (cli === "kiro") return <KiroMark className={className} />;
+  return <CodexMark className={className} />;
 }
 
 // Small brand chip: logo mark + name, brand-tinted. `size` toggles padding.
 export function CliBadge({ cli, className = "" }: { cli: CloudCodeCli; className?: string }) {
-  const b = CLI_BRAND[cli];
+  const b = brandOf(cli);
   return (
     <span
       className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-semibold ${b.chip} ${className}`}

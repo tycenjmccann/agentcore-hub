@@ -1,13 +1,13 @@
 /**
  * Cloud Code — types for the standalone resumable coding agent.
  *
- * A "session" is one conversation with a cloud-hosted coding CLI (Claude Code or
- * Codex) running on the AgentCore coding runtime. It maps 1:1 to a
+ * A "session" is one conversation with a cloud-hosted coding CLI (Claude Code,
+ * Codex, or Kiro) running on the AgentCore coding runtime. It maps 1:1 to a
  * runtimeSessionId (which selects the warm microVM + /mnt/workspace) and carries
  * the claude_session_id used to resume the CLI's own conversation.
  */
 
-export type CloudCodeCli = "claude" | "codex";
+export type CloudCodeCli = "claude" | "codex" | "kiro";
 
 /** Liveness of the underlying microVM, derived from last activity. */
 export type SessionWarmth = "warm" | "idle" | "cold";

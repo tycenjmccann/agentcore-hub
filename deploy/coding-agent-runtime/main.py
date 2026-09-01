@@ -33,6 +33,7 @@ import re
 import shlex
 import shutil
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -131,12 +132,28 @@ def _tenant_root(tenant_id: str | None) -> str:
     return "cloud-code" if tid == DEFAULT_TENANT_ID else f"cloud-code/t/{tid}"
 CLAUDE_CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
 CODEX_HOME = os.environ.get("CODEX_HOME", os.path.join(WORKSPACE_ROOT, ".codex"))
+# Kiro keeps sessions in a SQLite DB under its data dir; KIRO_HOME relocates it.
+KIRO_HOME = os.environ.get("KIRO_HOME", os.path.join(WORKSPACE_ROOT, ".kiro-data"))
 # Marker so we only materialize a given (user, version) once per warm microVM.
 _CONFIG_MARKER = os.path.join(WORKSPACE_ROOT, ".config-applied")
 BEDROCK_MANTLE_REGION = os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2")
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "openai.gpt-5.5")
+# Kiro is bring-your-own-key only (no Bedrock). Unlike Claude/Codex, there is no
+# per-user credential upload path in the hub — the runtime carries ONE shared
+# access key on its env (mirrors how GITHUB_PAT is wired). Empty model → omit
+# --model and let the account default win (kiro's own opus-class model).
+KIRO_API_KEY = os.environ.get("KIRO_API_KEY", "")
+KIRO_MODEL = os.environ.get("KIRO_MODEL", "")
 
-_CODING_PROC_NAMES = ("claude", "codex", "node")
+# Strips ANSI escape / color sequences from a CLI's raw terminal output (kiro
+# prints its reply with them) so streamed SSE text renders clean in the browser.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+# Kiro prints a per-turn billing footer ("▸ Credits: 0.30 • Time: 5s"). Credits
+# are kiro's only usage unit — it never reports token counts.
+_KIRO_CREDITS_RE = re.compile(r"Credits:\s*([0-9.]+)")
+
+_CODING_PROC_NAMES = ("claude", "codex", "kiro", "kiro-cli", "node")
 COLLECTOR_BIN = "/usr/bin/otelcol-contrib"
 COLLECTOR_CFG = "/app/otel-collector-config.yaml"
 
@@ -493,7 +510,8 @@ RESUME_HINT_NAME = ".resume-launch.sh"
 
 def _write_resume_launch_hint(workdir: str, resume_sid: str,
                               runtime_session_id: str | None,
-                              cli: str = "claude") -> bool:
+                              cli: str = "claude",
+                              kiro_home: str | None = None) -> bool:
     """Write the hint the interactive shell reads on launch to
     `cd <workdir> && <cli> --resume <resume_sid>` itself — so the browser never
     types the resume command into an already-running TUI on reattach.
@@ -502,12 +520,20 @@ def _write_resume_launch_hint(workdir: str, resume_sid: str,
     `runtime_session_id` is the AgentCore runtimeSessionId that keys the
     per-session EFS dir AND is what _restore_resume_launch_hint looks up later.
     They differ, so the durable copy MUST be keyed by the runtime id or restore
-    would miss it on a recycled VM."""
+    would miss it on a recycled VM.
+
+    For kiro we also carry the per-session home (CC_RESUME_KIRO_HOME, the
+    _kiro_home_for dir): the PTY shell otherwise only sees the deploy-default
+    home and would read a different — shared, cross-session — session store than
+    the chat path wrote. shell-init exports it so the Terminal resumes the same
+    conversation this session created."""
     body = (
         f"CC_RESUME_DIR={shlex.quote(os.path.realpath(workdir))}\n"
         f"CC_RESUME_SID={shlex.quote(resume_sid)}\n"
         f"CC_RESUME_CLI={shlex.quote(cli)}\n"
     )
+    if cli == "kiro" and kiro_home:
+        body += f"CC_RESUME_KIRO_HOME={shlex.quote(kiro_home)}\n"
     ok = False
     try:
         with open(RESUME_HINT_PATH, "w") as f:
@@ -808,23 +834,131 @@ def _install_artifacts(artifact_prefix: str, workdir: str, session_id: str | Non
     return restored
 
 
-def _checkpoint_transcript(session_id: str, workdir: str, tenant_id: str | None = None) -> dict:
-    """Reverse of install: read the (now-grown) Claude transcript off EFS and
-    upload it to S3 so the laptop can pull it back and `claude --resume` locally.
+# ── Kiro session store (SQLite) ───────────────────────────────────────────────
+# kiro-cli keeps every conversation as ONE ROW in conversations_v2
+# (key=cwd, conversation_id=uuid, value=conversation JSON). Each hub session gets
+# its own per-session workdir (sessions/<id>/…), so keying by cwd already isolates
+# sessions within a single shared KIRO_HOME — no per-session home is needed (this
+# mirrors how the hub runs Codex against one shared CODEX_HOME).
+# kiro's verbatim DDL — we create the table ourselves so an upsert works even on a
+# fresh KIRO_HOME kiro hasn't migrated yet (our IF NOT EXISTS matches its schema).
+_KIRO_DDL = """
+CREATE TABLE IF NOT EXISTS conversations_v2 (
+  key TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  value TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (key, conversation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_v2_key_updated ON conversations_v2(key, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_v2_updated_at ON conversations_v2(updated_at DESC);
+"""
 
-    The transcript lives at {CLAUDE_CONFIG_DIR}/projects/<slug>/<session_id>.jsonl
+
+def _kiro_db_path(kiro_home: str | None = None) -> str:
+    """Kiro stores its SQLite under $XDG_DATA_HOME/kiro-cli/ (NOT $KIRO_HOME). We
+    point XDG_DATA_HOME at KIRO_HOME (see _run_kiro), so the DB lands in
+    <home>/kiro-cli/data.sqlite3 — match that here so install/discovery/checkpoint
+    all read the same file kiro actually wrote."""
+    return os.path.join(kiro_home or KIRO_HOME, "kiro-cli", "data.sqlite3")
+
+
+def _kiro_newest_id(workdir: str, kiro_home: str | None = None) -> str | None:
+    """The conversation_id of the newest kiro row for a cwd, or None. Used to learn
+    the resume id after a NEW kiro turn (kiro has no JSON output to report it)."""
+    db_path = _kiro_db_path(kiro_home)
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT conversation_id FROM conversations_v2 WHERE key=? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (os.path.realpath(workdir),),
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("kiro_newest_id_failed", extra={"error": str(exc)[:200]})
+        return None
+
+
+def _install_kiro_resume_transcript(s3_key: str, session_id: str, workdir: str,
+                                    kiro_home: str | None = None) -> bool:
+    """Kiro analog of _install_resume_transcript. Download a ported conversation
+    `value` JSON from S3 and UPSERT it into the DB, rewriting `key` to the cloud
+    workdir cwd so `kiro-cli chat --resume-id <uuid>` (scoped to cwd) finds it.
+    Idempotent: a re-pull overwrites the row in place."""
+    if not (s3_key and session_id and ARTIFACT_BUCKET):
+        return False
+    db_path = _kiro_db_path(kiro_home)
+    try:
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        value = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=s3_key)["Body"].read().decode("utf-8")
+        key = os.path.realpath(workdir)
+        now = int(time.time() * 1000)
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(_KIRO_DDL)
+            conn.execute(
+                "INSERT INTO conversations_v2 (key, conversation_id, value, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(key, conversation_id) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (key, session_id, value, now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info("kiro_resume_transcript_installed", extra={"session": session_id})
+        return True
+    except Exception as exc:  # noqa: BLE001 — non-fatal; fall back to a cold turn
+        logger.warning("kiro_resume_transcript_install_failed",
+                       extra={"key": s3_key, "error": str(exc)[:200]})
+        return False
+
+
+def _checkpoint_transcript(session_id: str, workdir: str, tenant_id: str | None = None,
+                           cli: str = "claude") -> dict:
+    """Reverse of install: read the (now-grown) transcript off EFS and upload it
+    to S3 so the laptop can pull it back and resume locally.
+
+    Per-CLI on-disk layout:
+      claude → {CLAUDE_CONFIG_DIR}/projects/<slug>/<session_id>.jsonl
+      kiro   → conversations_v2 row (value JSON) in the kiro SQLite DB
+    The Claude transcript lives at {CLAUDE_CONFIG_DIR}/projects/<slug>/<session_id>.jsonl
     — the same file the cloud appended to during the session. Returns
     {key, bytes, branch?} for the caller to presign a GET. The branch (current
     checkout) lets the laptop pull the cloud's commits before resuming."""
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
-    src = os.path.join(config_dir, "projects", _claude_project_slug(workdir), f"{session_id}.jsonl")
-    if not os.path.isfile(src):
-        raise FileNotFoundError(f"no transcript at {src} (session never resumed on this VM?)")
+    if cli == "kiro":
+        db_path = _kiro_db_path()
+        if not os.path.isfile(db_path):
+            raise FileNotFoundError(f"no kiro DB at {db_path} (session never ran on this VM?)")
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT value FROM conversations_v2 WHERE conversation_id=? "
+                "ORDER BY updated_at DESC LIMIT 1", (session_id,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            raise FileNotFoundError(
+                f"no kiro conversation {session_id} in {db_path} "
+                "(session never resumed on this VM?)")
+        data = row[0].encode("utf-8") if isinstance(row[0], str) else row[0]
+    else:
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
+        src = os.path.join(config_dir, "projects", _claude_project_slug(workdir), f"{session_id}.jsonl")
+        if not os.path.isfile(src):
+            raise FileNotFoundError(f"no transcript at {src} (session never resumed on this VM?)")
+        with open(src, "rb") as f:
+            data = f.read()
     if not ARTIFACT_BUCKET:
         raise RuntimeError("ARTIFACT_BUCKET not set")
     key = f"{_tenant_root(tenant_id)}/checkpoint/{session_id}/{session_id}.jsonl"
-    with open(src, "rb") as f:
-        data = f.read()
     s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
     s3.put_object(Bucket=ARTIFACT_BUCKET, Key=key, Body=data, ContentType="application/x-ndjson")
     branch = None
@@ -1591,7 +1725,27 @@ def _purge_session(session_id: str, conversation_id: str | None = None,
         # otherwise expand and delete EVERY session's transcript. The directory
         # components stay literal; only the id substring is escaped.
         glob_cid = glob.escape(conversation_id)
-        if cli == "codex":
+        if cli == "kiro":
+            # Kiro's transcript is a ROW in the shared conversations_v2 table, not a
+            # file — delete the row so the checkpointed conversation doesn't linger.
+            patterns = []
+            try:
+                db_path = _kiro_db_path()
+                if os.path.isfile(db_path):
+                    conn = sqlite3.connect(db_path)
+                    try:
+                        cur = conn.execute(
+                            "DELETE FROM conversations_v2 WHERE conversation_id=?",
+                            (conversation_id,))
+                        conn.commit()
+                        removed["transcripts"] += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                    finally:
+                        conn.close()
+            except sqlite3.Error as exc:
+                removed["ok"] = False
+                logger.warning("purge_kiro_row_failed",
+                               extra={"session": session_id, "error": str(exc)[:200]})
+        elif cli == "codex":
             # Codex rollout files persist under $CODEX_HOME/sessions/**; the id is
             # embedded in the filename (rollout-...-<uuid>.jsonl). Match it
             # anywhere in the tree, and also try the sanitized id form.
@@ -1909,6 +2063,27 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     yield sse(done)
 
 
+def _log_coding_usage(cli: str, session_id: str | None, *, model: str = "",
+                      input_tokens: int = 0, output_tokens: int = 0,
+                      cached_input_tokens: int = 0, credits: float = 0.0) -> None:
+    """Structured usage record for engines with no OTEL path (codex reports
+    usage only in its JSONL turn.completed frame; kiro bills in credits and
+    never reports tokens). Lands in this runtime's log group where the
+    cost-report Lambda's Insights query picks it up and joins
+    coding_session_id → workflow via the cloud-code sessions table. Claude
+    needs none of this — its api_request OTEL events carry gen_ai.usage.*."""
+    try:
+        logger.info("coding_usage", extra={
+            "cli": cli, "coding_session_id": session_id or "",
+            "model": model, "input_tokens": int(input_tokens or 0),
+            "output_tokens": int(output_tokens or 0),
+            "cached_input_tokens": int(cached_input_tokens or 0),
+            "credits": float(credits or 0.0),
+        })
+    except Exception:  # noqa: BLE001 — usage bookkeeping must never fail a turn
+        pass
+
+
 def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
                session_id: str | None = None, model: str | None = None) -> dict:
     """Run one Codex turn via the Mantle launcher (GPT-5.5). Resumes the prior
@@ -1955,6 +2130,12 @@ def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
             continue
         if obj.get("type") == "thread.started" and obj.get("thread_id"):
             thread_id = obj["thread_id"]
+        if obj.get("type") == "turn.completed" and isinstance(obj.get("usage"), dict):
+            u = obj["usage"]
+            _log_coding_usage("codex", session_id, model=model or CODEX_MODEL,
+                              input_tokens=u.get("input_tokens", 0),
+                              output_tokens=u.get("output_tokens", 0),
+                              cached_input_tokens=u.get("cached_input_tokens", 0))
         item = obj.get("item") or obj.get("msg") or obj
         if item.get("type") == "agent_message":
             msg = item.get("text") or item.get("message")
@@ -2028,6 +2209,12 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
                 continue
             if t == "turn.completed":
                 fail_detail = None  # a completed turn supersedes any earlier attempt's error
+                if isinstance(obj.get("usage"), dict):
+                    u = obj["usage"]
+                    _log_coding_usage("codex", session_id, model=CODEX_MODEL,
+                                      input_tokens=u.get("input_tokens", 0),
+                                      output_tokens=u.get("output_tokens", 0),
+                                      cached_input_tokens=u.get("cached_input_tokens", 0))
                 continue
             # item.started/completed carry the step payload. Older codex builds
             # wrap it as {"msg":{...}} with NO top-level type — treat a msg-shaped
@@ -2084,6 +2271,130 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
     if artifact_keys:
         done["artifacts"] = artifact_keys
     logger.info("turn_done", extra={"cli": "codex", "chars": len(done["response"]), "stream": True})
+    yield sse(done)
+
+
+def _kiro_env(workdir: str) -> dict:
+    """Env for a kiro subprocess. Kiro is bring-your-own-key only (no Bedrock):
+    the runtime carries ONE shared KIRO_API_KEY. Kiro's SQLite session store
+    follows $XDG_DATA_HOME/kiro-cli/ (NOT $KIRO_HOME), so pin BOTH at KIRO_HOME
+    so the DB lands where _kiro_db_path looks."""
+    os.makedirs(KIRO_HOME, exist_ok=True)
+    return {**os.environ, "KIRO_HOME": KIRO_HOME, "XDG_DATA_HOME": KIRO_HOME,
+            "KIRO_API_KEY": KIRO_API_KEY}
+
+
+def _kiro_args(prompt: str, kiro_session_id: str | None) -> list[str]:
+    args = ["kiro-cli", "chat", "--no-interactive", "--trust-all-tools"]
+    if KIRO_MODEL:
+        args += ["--model", KIRO_MODEL]
+    if kiro_session_id:
+        args += ["--resume-id", kiro_session_id]
+    args.append(prompt)
+    return args
+
+
+def _run_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
+              session_id: str | None = None, model: str | None = None) -> dict:
+    """Run one Kiro turn on the shared KIRO_API_KEY access key (no Bedrock
+    fallback). Resumes the prior conversation when kiro_session_id (a kiro
+    conversation uuid) is supplied. Kiro chat has no JSON output, so we parse
+    plain stdout and learn the conversation_id by reading the newest
+    conversations_v2 row for this workdir after the turn. Surfaced through the
+    same `claude_session_id` field for a CLI-agnostic resume handle."""
+    if not KIRO_API_KEY:
+        raise RuntimeError("KIRO_API_KEY not set on the runtime — kiro has no Bedrock fallback")
+    env = _kiro_env(workdir)
+    proc = subprocess.run(_kiro_args(prompt, kiro_session_id), cwd=workdir, env=env,
+                          capture_output=True, text=True, timeout=TURN_TIMEOUT_S,
+                          stdin=subprocess.DEVNULL)
+    if proc.returncode != 0:
+        raise RuntimeError(f"kiro exited {proc.returncode}: {proc.stderr.strip()[:600]}")
+    text = _ANSI_RE.sub("", proc.stdout).strip()
+    # The "▸ Credits: N" billing footer goes to STDERR, not the reply stream.
+    m = _KIRO_CREDITS_RE.search(_ANSI_RE.sub("", proc.stderr or ""))
+    if m:
+        _log_coding_usage("kiro", session_id, model=KIRO_MODEL or "auto",
+                          credits=float(m.group(1)))
+    conv_id = kiro_session_id or _kiro_newest_id(workdir)
+    return {"response": text, "claude_session_id": conv_id}
+
+
+def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
+                 repo: str | None = None, session_id: str | None = None,
+                 tenant_id: str | None = None):
+    """Generator yielding SSE lines for a Kiro turn as it runs.
+
+    Kiro chat has no JSON event stream — it prints the reply to stdout as it
+    generates. We strip ANSI, stream stdout line-by-line as 'text' frames (live
+    output, no buffering → no proxy idle-timeout), then learn the conversation id
+    from the newest conversations_v2 row and emit the terminal 'done'."""
+    def sse(obj: dict) -> str:
+        return f"data: {json.dumps(obj)}\n\n"
+
+    if not KIRO_API_KEY:
+        err = "KIRO_API_KEY not set on the runtime — kiro has no Bedrock fallback"
+        yield sse({"type": "error", "error": err})
+        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": kiro_session_id})
+        return
+    env = _kiro_env(workdir)
+    proc = subprocess.Popen(_kiro_args(prompt, kiro_session_id), cwd=workdir, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            stdin=subprocess.DEVNULL, bufsize=1)
+    timed_out = threading.Event()
+
+    def _kill_on_timeout():
+        timed_out.set()
+        proc.kill()
+    watchdog = threading.Timer(TURN_TIMEOUT_S, _kill_on_timeout)
+    watchdog.start()
+    full_text: list[str] = []
+    try:
+        for line in proc.stdout:
+            clean = _ANSI_RE.sub("", line)
+            if not clean.strip():
+                continue
+            full_text.append(clean)
+            yield sse({"type": "text", "text": clean})
+        proc.wait(timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        yield sse({"type": "error", "error": str(exc)[:600]})
+        return
+    finally:
+        watchdog.cancel()
+    if timed_out.is_set():
+        err = f"kiro timed out after {TURN_TIMEOUT_S}s"
+        yield sse({"type": "error", "error": err})
+        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": kiro_session_id})
+        return
+    if proc.returncode not in (0, None):
+        err = ((proc.stderr.read() or "")[:400] if proc.stderr else "") or f"kiro exited {proc.returncode}"
+        yield sse({"type": "error", "error": f"kiro: {err}"})
+        yield sse({"type": "done", "response": f"⚠ kiro: {err}", "claude_session_id": kiro_session_id})
+        return
+    # The "▸ Credits: N" billing footer goes to STDERR, not the reply stream.
+    try:
+        stderr_tail = _ANSI_RE.sub("", proc.stderr.read() or "") if proc.stderr else ""
+    except Exception:  # noqa: BLE001
+        stderr_tail = ""
+    m = _KIRO_CREDITS_RE.search(stderr_tail) or _KIRO_CREDITS_RE.search("".join(full_text))
+    if m:
+        _log_coding_usage("kiro", session_id, model=KIRO_MODEL or "auto",
+                          credits=float(m.group(1)))
+    conv_id = kiro_session_id or _kiro_newest_id(workdir)
+    _remember_session(conv_id, repo)
+    if conv_id:
+        _write_resume_launch_hint(workdir, conv_id, session_id, cli="kiro", kiro_home=KIRO_HOME)
+    artifact_keys: list = []
+    try:
+        artifact_keys = _sync_turn_artifacts(session_id, workdir, tenant_id).get("keys") or []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
+    done = {"type": "done", "response": "".join(full_text).strip(),
+            "claude_session_id": conv_id}
+    if artifact_keys:
+        done["artifacts"] = artifact_keys
+    logger.info("turn_done", extra={"cli": "kiro", "chars": len(done["response"]), "stream": True})
     yield sse(done)
 
 
@@ -2174,10 +2485,13 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
     result: dict = {}
     last_error = ""
     try:
-        gen = (_stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
-               if cli == "codex"
-               else _stream_claude(prompt, workdir, claude_session_id, repo,
-                                   session_id, tenant_id, model))
+        if cli == "codex":
+            gen = _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
+        elif cli == "kiro":
+            gen = _stream_kiro(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
+        else:
+            gen = _stream_claude(prompt, workdir, claude_session_id, repo,
+                                 session_id, tenant_id, model)
         for line in gen:
             if not line.startswith("data:"):
                 continue
@@ -2497,10 +2811,14 @@ async def invocations(request: Request):
                                       "error": _scrub_git_url(str(exc))[:300],
                                       "workdir": workdir})
         # Install a ported transcript and resume it natively. On success the turn
-        # runs as `claude --resume` / `codex resume` — true continuation.
+        # runs as `claude --resume` / `codex resume` / `kiro-cli --resume-id` — a
+        # true continuation.
         if resume_transcript and resume_session_id:
             if cli == "codex":
                 if _install_codex_resume_transcript(resume_transcript, resume_session_id):
+                    claude_session_id = claude_session_id or resume_session_id
+            elif cli == "kiro":
+                if _install_kiro_resume_transcript(resume_transcript, resume_session_id, workdir):
                     claude_session_id = claude_session_id or resume_session_id
             elif _install_resume_transcript(resume_transcript, resume_session_id, workdir):
                 claude_session_id = claude_session_id or resume_session_id
@@ -2526,9 +2844,10 @@ async def invocations(request: Request):
         # already-running claude never re-fires), so the resume launches
         # server-side instead of the browser typing it into a live TUI input box.
         resume_ready = False
-        if claude_session_id and cli in ("claude", "codex"):
-            resume_ready = _write_resume_launch_hint(workdir, claude_session_id,
-                                                     session_id, cli=cli)
+        if claude_session_id and cli in ("claude", "codex", "kiro"):
+            resume_ready = _write_resume_launch_hint(
+                workdir, claude_session_id, session_id, cli=cli,
+                kiro_home=KIRO_HOME if cli == "kiro" else None)
     except ValueError as ve:  # bad repo field — caller error, not a 500
         return JSONResponse({"error": str(ve)}, status_code=400)
     except Exception as exc:  # noqa: BLE001
@@ -2542,7 +2861,7 @@ async def invocations(request: Request):
         if not cp_id:
             return JSONResponse({"error": "checkpoint needs a session id"}, status_code=400)
         try:
-            info = _checkpoint_transcript(cp_id, workdir, tenant_id)
+            info = _checkpoint_transcript(cp_id, workdir, tenant_id, cli=cli)
         except FileNotFoundError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         except Exception as exc:  # noqa: BLE001
@@ -2574,7 +2893,7 @@ async def invocations(request: Request):
     # ~15-min idle-stream kill can't strand anyone. Setup errors above still
     # fail THIS call synchronously (bad repo, clone failure), which is what the
     # caller can act on.
-    if payload.get("mode") == "async" and cli in ("claude", "codex"):
+    if payload.get("mode") == "async" and cli in ("claude", "codex", "kiro"):
         # Idempotency: the caller supplies turn_id so a client-side timeout +
         # resubmit of the same turn can't double-run it — if this id is already
         # live (or already finished), acknowledge the existing turn instead of
@@ -2627,17 +2946,20 @@ async def invocations(request: Request):
 
     # Streaming path: yield SSE as the turn runs. The runtime forwards an
     # async/sync generator response as text/event-stream through InvokeAgentRuntime.
-    if stream and cli in ("claude", "codex"):
-        gen = (
-            _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
-            if cli == "codex"
-            else _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id, model)
-        )
+    if stream and cli in ("claude", "codex", "kiro"):
+        if cli == "codex":
+            gen = _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
+        elif cli == "kiro":
+            gen = _stream_kiro(prompt, workdir, claude_session_id, repo, session_id, tenant_id)
+        else:
+            gen = _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id, model)
         return StreamingResponse(gen, media_type="text/event-stream")
 
     try:
         if cli == "codex":
             result = _run_codex(prompt, workdir, claude_session_id, session_id, model)
+        elif cli == "kiro":
+            result = _run_kiro(prompt, workdir, claude_session_id, session_id, model)
         elif cli == "claude":
             result = _run_claude(prompt, workdir, claude_session_id, session_id, model)
         else:
@@ -2655,8 +2977,10 @@ async def invocations(request: Request):
     # A brand-new chat learns its claude_session_id only now (it was unset on
     # entry, so the pre-run hint above was skipped). Write it here too, so opening
     # the Terminal for this session also auto-resumes the conversation.
-    if result.get("claude_session_id") and cli in ("claude", "codex"):
-        _write_resume_launch_hint(workdir, result["claude_session_id"], session_id, cli=cli)
+    if result.get("claude_session_id") and cli in ("claude", "codex", "kiro"):
+        _write_resume_launch_hint(
+            workdir, result["claude_session_id"], session_id, cli=cli,
+            kiro_home=KIRO_HOME if cli == "kiro" else None)
 
     # Harvest any deliverables this turn produced to the resume prefix so they show
     # in the web Artifacts tab immediately — no pull-home required. Best-effort.
@@ -2689,6 +3013,7 @@ def _export_runtime_env() -> None:
         "GITHUB_PAT", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_NAME",
         "AWS_REGION", "BEDROCK_MANTLE_REGION", "ANTHROPIC_MODEL", "CLAUDE_MODEL",
         "CODEX_MODEL", "ARTIFACT_BUCKET", "WORKSPACE_ROOT",
+        "KIRO_API_KEY", "KIRO_MODEL", "KIRO_HOME",
     ]
     body = "".join(
         f"export {k}={shlex.quote(os.environ[k])}\n" for k in keys if os.environ.get(k)

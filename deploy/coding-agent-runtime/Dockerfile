@@ -66,6 +66,20 @@ USER bedrock_agentcore
 RUN curl -fsSL -o /tmp/claude-install.sh https://claude.ai/install.sh \
     && bash /tmp/claude-install.sh \
     && rm /tmp/claude-install.sh
+
+# Kiro CLI — standalone Rust binaries (no Node). The aarch64 Linux zip carries
+# kiro-cli + kiro-cli-chat + kiro-cli-term; `kiro-cli chat` dispatches to the
+# chat binary, so all three must land on PATH — install.sh handles that, dropping
+# them in ~/.local/bin. KIRO_CLI_SKIP_SETUP=1 skips the interactive shell-
+# integration setup we don't want in a headless container. Base is glibc >= 2.34
+# (Debian trixie-slim), so the standard (non-musl) build is correct. Installed as
+# the runtime user. (Adds ~840 MB to the image — the chat binary is large.)
+ARG KIRO_CLI_URL=https://desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-aarch64-linux.zip
+RUN curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/kirocli.zip "${KIRO_CLI_URL}" \
+    && unzip -q /tmp/kirocli.zip -d /tmp/kirocli-extract \
+    && KIRO_CLI_SKIP_SETUP=1 bash /tmp/kirocli-extract/kirocli/install.sh \
+    && rm -rf /tmp/kirocli.zip /tmp/kirocli-extract \
+    && "$HOME/.local/bin/kiro-cli" --version
 USER root
 
 # Python deps (health server + OTel + codex bedrock token generator)

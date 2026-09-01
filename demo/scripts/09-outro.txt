@@ -1,0 +1,1 @@
+Six modules. Pick what you need. Dashboard, Agents, Build, and Evaluations stand alone — manage your AgentCore stack from one place. And when you're ready to go fully autonomous, the Workflow module is right there. AgentCore Hub. Code on the repo.

@@ -34,6 +34,22 @@ const COOLDOWN_MS = Number(process.env.WM_WATCH_COOLDOWN_MINUTES || 15) * 60_000
 const ANALYZE_DELAY_MS = Number(process.env.WM_ANALYZE_DELAY_MS || 30_000);
 
 const TERMINAL_PHASES = new Set(["complete", "cancelled", "error"]);
+/** 1-2 rework loops are normal; the 3rd fix ticket marks a loop anomaly. */
+const LOOP_ANOMALY_FIX_TICKETS = Number(process.env.WM_LOOP_ANOMALY_FIX_TICKETS || 3);
+
+// ─── System-SI batching (mirrors the agent SI loop's eval batching) ───────────
+// Analyses accumulate with no siBatchedAt; at SI_BATCH_SIZE pending — or
+// immediately when any pending analysis carries a critical finding / P0
+// recommendation — a SYNTHESIZE session batches them into one [SI] PRD.
+const SI_BATCH_SIZE = Number(process.env.SI_BATCH_SIZE || 5);
+const SI_COOLDOWN_MS = Number(process.env.SI_COOLDOWN_HOURS || 12) * 3_600_000;
+/** Hub repo the system-SI PRD targets (agent SI targets the fleet repo). */
+const HUB_REPO_URL = process.env.HUB_REPO_URL || "";
+/** Claim row keys inside the analyses table — excluded from pending scans. */
+const SI_CLAIM_PK = "#si-synthesis";
+const SI_CLAIM_SK = "claim";
+/** Cap the pairs listed in one SYNTHESIZE prompt; the rest ride the next batch. */
+const SI_MAX_BATCH = 20;
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
@@ -108,19 +124,147 @@ async function analyze(workflowId, trigger) {
 
   const defId = workflow.workflowDefId || "software-delivery";
   const phase = TERMINAL_PHASES.has(workflow.phase) ? workflow.phase : "complete";
+  const fixTickets = await countFixTickets(workflowId);
+  // One rework loop (review/QA/CI sends work back once) is expected; a third
+  // "Fix:" ticket means the same work bounced repeatedly — that run gets the
+  // deep loop root-cause directive instead of the standard rubric alone.
+  const loopDirective =
+    fixTickets >= LOOP_ANOMALY_FIX_TICKETS
+      ? `\nLOOP ANOMALY: this run created ${fixTickets} fix tickets. Trace the full ` +
+        `rework chain start to finish: for EACH fix loop, identify what was rejected, ` +
+        `by whom (review/CI/QA/release), whether it was a new defect or the same one ` +
+        `resurfacing, and the root cause of why it took multiple loops. Lead the ` +
+        `analysis with this.`
+      : "";
   const prompt =
     `ANALYZE ${workflowId} (defId=${defId}, outcome=${phase}, trigger=${trigger})\n` +
-    `Title: ${workflow.input?.title || "(untitled)"}`;
+    `Title: ${workflow.input?.title || "(untitled)"}${loopDirective}`;
 
   try {
     // Let the final completions/*.json S3 writes land before the dossier pull.
     if (trigger === "auto") await sleep(ANALYZE_DELAY_MS);
     const result = await invokeHarness(prompt, sessionId("wm", workflowId));
     console.log(`[analyzer] ANALYZE ${workflowId} stopReason=${result.stopReason} chars=${result.text.length}`);
-    return { workflowId, trigger, stopReason: result.stopReason, summary: result.text.slice(0, 500) };
+    // System-SI check rides the ANALYZE that just persisted a new analysis.
+    // Failures are logged, never thrown: a synthesis hiccup must not release
+    // the auto-claim and re-run a completed analysis.
+    let synthesis = null;
+    try {
+      synthesis = await maybeSynthesize();
+    } catch (err) {
+      console.error(`[analyzer] SI synthesis check failed:`, err.message);
+    }
+    return { workflowId, trigger, stopReason: result.stopReason, synthesis, summary: result.text.slice(0, 500) };
   } catch (err) {
     if (trigger === "auto") await releaseAutoClaim(workflowId);
     throw err; // let EventBridge retry a released run
+  }
+}
+
+// ─── System-SI synthesis trigger ───────────────────────────────────────────────
+
+/** True when an analysis carries a critical finding or a P0 recommendation. */
+function isCriticalAnalysis(item) {
+  return (
+    (item.findings || []).some((f) => f?.severity === "critical") ||
+    (item.recommendations || []).some((r) => r?.priority === "P0")
+  );
+}
+
+/**
+ * Batch pending analyses into one SYNTHESIZE session when SI_BATCH_SIZE have
+ * accumulated, or immediately when any pending one is critical. Cooldown +
+ * conditional claim (a row inside the analyses table) keep concurrent ANALYZE
+ * completions from double-firing; the skill stamps siBatchedAt on each row.
+ */
+async function maybeSynthesize() {
+  if (!HUB_REPO_URL) return { skipped: "HUB_REPO_URL not set" };
+
+  const pending = [];
+  let ExclusiveStartKey;
+  do {
+    const page = await ddb.send(new ScanCommand({
+      TableName: ANALYSES_TABLE,
+      FilterExpression: "attribute_not_exists(siBatchedAt) AND workflowId <> :claim",
+      ExpressionAttributeValues: { ":claim": SI_CLAIM_PK },
+      ExclusiveStartKey,
+    }));
+    pending.push(...(page.Items || []));
+    ExclusiveStartKey = page.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+
+  const critical = pending.some(isCriticalAnalysis);
+  if (pending.length < SI_BATCH_SIZE && !critical) {
+    return { skipped: `pending ${pending.length}/${SI_BATCH_SIZE}, no critical` };
+  }
+
+  // Conditional claim: one synthesis per cooldown window, fleet-wide.
+  const now = Date.now();
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: ANALYSES_TABLE,
+      Key: { workflowId: SI_CLAIM_PK, analysisId: SI_CLAIM_SK },
+      UpdateExpression: "SET claimedAt = :now",
+      ConditionExpression: "attribute_not_exists(claimedAt) OR claimedAt < :cutoff",
+      ExpressionAttributeValues: {
+        ":now": now,
+        ":cutoff": now - SI_COOLDOWN_MS,
+      },
+    }));
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") {
+      return { skipped: "cooldown/claim held" };
+    }
+    throw err;
+  }
+
+  const batch = pending
+    .sort((a, b) => (isCriticalAnalysis(b) ? 1 : 0) - (isCriticalAnalysis(a) ? 1 : 0))
+    .slice(0, SI_MAX_BATCH);
+  const pairs = batch.map((i) => `${i.workflowId}/${i.analysisId}`);
+  const prompt =
+    `SYNTHESIZE system-improvement PRD (trigger=${critical ? "critical" : "batch"})\n` +
+    `Hub repo: ${HUB_REPO_URL}\n` +
+    `Pending analyses (workflowId/analysisId):\n` +
+    pairs.map((p) => `- ${p}`).join("\n") +
+    (pending.length > batch.length ? `\n(${pending.length - batch.length} more ride the next batch)` : "");
+
+  console.log(`[analyzer] SYNTHESIZE: ${pairs.length} analyses (critical=${critical})`);
+  const result = await invokeHarness(prompt, sessionId("wmsi", String(now)));
+  console.log(`[analyzer] SYNTHESIZE stopReason=${result.stopReason}`);
+  return { batched: pairs.length, critical, stopReason: result.stopReason };
+}
+
+/**
+ * Count "Fix:" tickets created during a run. Paged full read of the run's
+ * events — bounded (a few hundred items) and only at completion time. A read
+ * failure returns 0: the analysis still runs, just without the loop directive.
+ */
+async function countFixTickets(workflowId) {
+  try {
+    // Unique ticket ids: ticket.created lands twice per ticket (direct write +
+    // EventBridge relay), and agents vary the title ("Fix:", "Fix (review):",
+    // "Fix ship-review-r4 …") — match the leading word, dedupe by id.
+    const fixIds = new Set();
+    let ExclusiveStartKey;
+    do {
+      const page = await ddb.send(new QueryCommand({
+        TableName: EVENTS_TABLE,
+        KeyConditionExpression: "workflowId = :w",
+        ExpressionAttributeValues: { ":w": workflowId },
+        ExclusiveStartKey,
+      }));
+      for (const e of page.Items || []) {
+        const ticket = e.detail?.ticket;
+        if (e.type !== "ticket.created" || !/^Fix\b/i.test(ticket?.title || "")) continue;
+        fixIds.add(ticket.id || ticket.title);
+      }
+      ExclusiveStartKey = page.LastEvaluatedKey;
+    } while (ExclusiveStartKey);
+    return fixIds.size;
+  } catch (err) {
+    console.warn(`[analyzer] fix-ticket count failed for ${workflowId}:`, err.message);
+    return 0;
   }
 }
 
@@ -140,6 +284,20 @@ async function releaseAutoClaim(workflowId) {
 
 // ─── WATCH ─────────────────────────────────────────────────────────────────────
 
+/**
+ * Parked on a human: an unacknowledged review gate or manager escalation.
+ * These are HUMAN gates — the watchdog must not burn WM sessions re-diagnosing
+ * them (the failure mode that led to permanent mutes). The skip is self-healing:
+ * review_needed is acknowledged by the orchestrator when the gate ticket
+ * transitions, manager_escalation by the human via the Telegram resolve button
+ * (PATCH /api/workflow/[id]/escalations) — watching resumes on the ack.
+ */
+function parkedOnHuman(wf) {
+  return (wf.humanNotifications || []).some(
+    (n) => !n?.acknowledged && (n?.type === "review_needed" || n?.type === "manager_escalation")
+  );
+}
+
 async function watchScan() {
   const now = Date.now();
   const active = [];
@@ -147,11 +305,11 @@ async function watchScan() {
   do {
     const page = await ddb.send(new ScanCommand({
       TableName: WORKFLOWS_TABLE,
-      ProjectionExpression: "workflowId, phase, archived, managerWatch, wmLastWatchAt, startedAt, workflowDefId",
+      ProjectionExpression: "workflowId, phase, archived, managerWatch, wmLastWatchAt, startedAt, workflowDefId, humanNotifications",
       ExclusiveStartKey,
     }));
     active.push(...(page.Items || []).filter(
-      (w) => !TERMINAL_PHASES.has(w.phase) && !w.archived && w.managerWatch !== false
+      (w) => !TERMINAL_PHASES.has(w.phase) && !w.archived && w.managerWatch !== false && !parkedOnHuman(w)
     ));
     ExclusiveStartKey = page.LastEvaluatedKey;
   } while (ExclusiveStartKey);

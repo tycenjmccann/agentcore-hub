@@ -1912,6 +1912,44 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
     return last_output or "ERROR: Codex unavailable after retries (Bedrock Mantle preview — cold engine or rate limit)."
 
 
+@tool
+def kiro(task: str, working_directory: str = "/tmp", repo: str = "", resume_session: str = "") -> str:
+    """Delegate a coding task to Kiro — AWS's agentic coding CLI.
+
+    A peer to claude_code and codex — same contract, third engine. Useful for a
+    second/third opinion, code review, or spec-driven implementation. Runs on
+    the shared Cloud Code runtime with its own access key (no Bedrock).
+
+    All your kiro calls in this task share ONE workspace and ONE conversation —
+    a later call remembers the earlier calls and their files. Do NOT reference
+    absolute paths like /tmp/... across calls.
+
+    The workspace is REMOTE — you cannot file_read/image_reader its files
+    directly. Files it produces are harvested to S3 and listed in a
+    [coding-artifacts: ...] footer on the result; fetch with download_s3_file(key).
+
+    Args:
+        task: Complete description of what to do (repo URL/branch, what to build
+              or review, acceptance criteria, constraints).
+        working_directory: Directory to operate in (default: /tmp; ignored when
+              the coding runtime hosts the session)
+        repo: Repository as owner/name or clone URL. Pass on your FIRST call so
+              the workspace is cloned; later calls reuse it automatically.
+        resume_session: A PRIOR task's coding-session id ("cc-..." from a
+              [coding-session: ...] footer in your ticket history) to continue
+              that conversation on rework instead of rebuilding context. Leave
+              empty for a fresh session; best-effort. Only honored on your
+              FIRST coding call of this task.
+    """
+    # Kiro has no in-container fallback: the CLI is only installed on the coding
+    # runtime image and needs its access key from that runtime's env.
+    if not _remote_coding_enabled():
+        return ("ERROR: kiro requires the remote coding runtime "
+                "(REMOTE_CODING_PERSONAS). Use claude_code or codex instead.")
+    _maybe_resume_session(resume_session)
+    return _remote_coding_turn(task, "kiro", repo)
+
+
 # ─── All pipeline tools ───────────────────────────────────────────────────────
 
 LAMBDA_TOOLS = [
@@ -2416,7 +2454,7 @@ async def _run_agent_invocation(payload, context):
 
         # Load built-in tools (lazy — avoids 30s init timeout)
         builtin_tools = _load_builtin_tools()
-        all_tools = builtin_tools + LAMBDA_TOOLS + [claude_code, codex]
+        all_tools = builtin_tools + LAMBDA_TOOLS + [claude_code, codex, kiro]
 
         # Connectors bound to this agent: export env creds + collect MCP/gateway targets.
         conn = _apply_connectors(agent_id, payload_connectors)

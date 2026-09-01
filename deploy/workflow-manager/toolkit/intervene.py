@@ -16,8 +16,9 @@ table, so it shows on the board timeline and in the next run analysis.
 
 `escalate` is idempotent: an identical open (unacknowledged) escalation is
 never appended twice, so the manager can't re-raise the same flag every pass.
-When a run is dead and shouldn't keep paging, the manager decides to `mute` it —
-that judgment is the agent's, not a coded cap.
+An open escalation IS a human gate: the watch scheduler skips the run until a
+human resolves it (Telegram "Resolved" button / escalations API), so escalating
+both alerts the human and stops the watch loop from re-firing.
 
 The two stuck-agent decisions (the common case) are `retry` and `mark-done`:
   - work is NOT done (no deliverable) → `retry` the agent
@@ -32,7 +33,6 @@ Usage:
   python3 intervene.py comment   <workflowId> <ticketId> <text>
   python3 intervene.py escalate  <workflowId> <message>
   python3 intervene.py complete  <workflowId> [--reason "..."]
-  python3 intervene.py mute      <workflowId> [--note "..."]
   python3 intervene.py cancel    <workflowId> --reason "..."   (explicit user request ONLY)
   python3 intervene.py start     --title "..." [--description "..."] [--repo owner/name] [--branch main]
   python3 intervene.py file-bug  <workflowId> --title "..." --description "<RCA>" --agent <agentId> [--repo owner/name]
@@ -191,14 +191,6 @@ def cmd_comment(args):
     print(json.dumps({"action": "comment", "ticketId": args.ticket_id, **result}, indent=2))
 
 
-def _set_manager_watch(workflow_id, on):
-    dynamodb.Table(WORKFLOWS_TABLE).update_item(
-        Key={"workflowId": workflow_id},
-        UpdateExpression="SET managerWatch = :w",
-        ExpressionAttributeValues={":w": on},
-    )
-
-
 def cmd_dispatch(args):
     """Re-queue a ticket that was never picked up (in the roster but no agent
     ever ran it — no agent.started, no error). Distinct from `retry`, which
@@ -274,16 +266,6 @@ def cmd_mark_done(args):
         "action": "mark_done", "ticketId": args.ticket_id,
         "commented": comment.get("success", False), **result,
     }, indent=2))
-
-
-def cmd_mute(args):
-    """Circuit breaker: stop watching a run that cannot be moved (no diagnosable
-    cause, work not verifiably done). Sets managerWatch=false so the watch
-    scheduler skips it and it stops paging — without touching any ticket or
-    faking completion. A human can re-enable by clearing the flag."""
-    _set_manager_watch(args.workflow_id, False)
-    publish_intervention(args.workflow_id, "mute", {"note": args.note})
-    print(json.dumps({"action": "mute", "workflowId": args.workflow_id, "managerWatch": False}, indent=2))
 
 
 def cmd_cancel(args):
@@ -380,8 +362,10 @@ def cmd_escalate(args):
     # Idempotent: never append a second copy of an already-open (unacknowledged)
     # escalation with the same message. This stops the manager re-raising the
     # identical flag every pass — the source of the 400+ duplicate escalations
-    # that bloated stuck records. Judgment about WHEN to stop escalating and mute
-    # a dead run is the manager's (via the `mute` action), not a coded cap.
+    # that bloated stuck records. An OPEN escalation is a human gate: the watch
+    # scheduler skips this run until a human resolves it, and the Telegram bot
+    # pings the human with a Resolved button — so one escalate both alerts and
+    # quiets the loop.
     wf = dynamodb.Table(WORKFLOWS_TABLE).get_item(
         Key={"workflowId": args.workflow_id}
     ).get("Item") or {}
@@ -473,11 +457,6 @@ def main():
     p.add_argument("--evidence", default="",
                    help="REQUIRED: the shipped deliverable (S3 key, PR URL, or streamed PASS verdict)")
     p.set_defaults(func=cmd_mark_done)
-
-    p = sub.add_parser("mute")
-    p.add_argument("workflow_id")
-    p.add_argument("--note", default="")
-    p.set_defaults(func=cmd_mute)
 
     p = sub.add_parser("cancel")
     p.add_argument("workflow_id")

@@ -43,7 +43,30 @@ Read your knowledge file for this workflow definition:
 
 ## 3. Write the analysis
 
-`/mnt/workspace/<wfId>/analysis.json` with EXACTLY these fields
+NEVER write analysis.json in one tool call — a large run's report will hit the
+model's output-token cap mid-call, the truncated tool input is discarded, and
+the whole ANALYZE invocation dies (this killed every auto-analysis of big
+runs). Write it in parts, each tool call small:
+
+1. `/mnt/workspace/<wfId>/summary.md` — the report body. Append it in chunks
+   of at most ~60 lines per call (`cat >> summary.md <<'EOF' ...`). Keep the
+   whole report under ~300 lines; long evidence belongs in findings, not prose.
+2. `/mnt/workspace/<wfId>/analysis-body.json` — everything EXCEPT
+   summaryMarkdown. If findings + recommendations are long, append the arrays
+   in pieces with python, not one giant heredoc.
+3. Assemble:
+
+```bash
+python3 - <<'EOF'
+import json
+w = "/mnt/workspace/<wfId>"
+body = json.load(open(f"{w}/analysis-body.json"))
+body["summaryMarkdown"] = open(f"{w}/summary.md").read()
+json.dump(body, open(f"{w}/analysis.json", "w"), indent=1)
+EOF
+```
+
+`analysis.json` must have EXACTLY these fields
 (`save_analysis.py` rejects anything malformed):
 
 ```json
@@ -80,6 +103,11 @@ python3 /mnt/workspace/toolkit/save_analysis.py <wfId> --trigger <auto|manual>
 ```
 
 ## 5. Curate your knowledge file
+
+Same chunking rule as step 3: build the file locally with several small
+appends (≤60 lines per tool call), then upload with `aws s3 cp` — one giant
+heredoc dies at the output-token cap and kills the session (the analysis
+survives; this step doesn't).
 
 Rewrite (not append) `workflow-manager/knowledge/<workflowDefId>.md` in S3:
 durable patterns for this workflow def only. Recurring bottlenecks with run

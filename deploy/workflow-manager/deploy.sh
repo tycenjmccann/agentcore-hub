@@ -64,7 +64,7 @@ aws iam put-role-policy --role-name agentcore-hub-lambda-role \
       {
         \"Sid\": \"AnalysesTable\",
         \"Effect\": \"Allow\",
-        \"Action\": [\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\"],
+        \"Action\": [\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:Scan\",\"dynamodb:UpdateItem\"],
         \"Resource\": [
           \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${ANALYSES_TABLE}\",
           \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${ANALYSES_TABLE}/index/*\"
@@ -97,7 +97,7 @@ echo "✓ Skills: s3://${BUCKET}/workflow-manager/skills/"
 
 # ─── Trigger Lambda ───────────────────────────────────────────────────────────
 LAMBDA_NAME="agentcore-hub-workflow-analyzer"
-ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},WM_STALE_MINUTES=${WM_STALE_MINUTES:-10},WM_WATCH_COOLDOWN_MINUTES=${WM_WATCH_COOLDOWN_MINUTES:-15}}"
+ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},WM_STALE_MINUTES=${WM_STALE_MINUTES:-10},WM_WATCH_COOLDOWN_MINUTES=${WM_WATCH_COOLDOWN_MINUTES:-15},HUB_REPO_URL=${HUB_REPO_URL:-},SI_BATCH_SIZE=${SI_BATCH_SIZE:-5},SI_COOLDOWN_HOURS=${SI_COOLDOWN_HOURS:-12}}"
 
 cd "${REPO_ROOT}/lambda/workflow-analyzer" && rm -f function.zip
 npm install --omit=dev --no-audit --no-fund --silent

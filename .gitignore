@@ -71,3 +71,8 @@ __pycache__/
 # Claude Code
 .claude/
 .recovered/
+
+# Local demo render artifacts + span dumps (large binaries)
+demo/video/
+demo/audio/
+workflow-spans.json

@@ -1,0 +1,1 @@
+Round two. A feature. Dark mode. Different ticket type, different blueprint. Thirteen agents fan out. Four designers in parallel. Security, legal, localisation, analytics review in parallel. Three developers ship the code. Q-A verifies. C-I greenlights. We just watched a whole team think a feature through, in about two minutes. Merge. Reload. Toggle. Dark mode.
