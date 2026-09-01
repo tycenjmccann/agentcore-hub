@@ -107,7 +107,16 @@ CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
     "CLAUDE_MODEL", "us.anthropic.claude-fable-5"
 )
 # A single coding turn can be long; cap so a wedged CLI can't pin the microVM.
-TURN_TIMEOUT_S = _safe_int_env("TURN_TIMEOUT_S", 1500)
+# This IS the fleet-wide watchdog `turnTimeoutSecs` (TEAM-3618 D1.1) — the per-turn
+# wall-clock the orchestrator resolves per agent (agents.json watchdog → env →
+# legacy 1500). The orchestrator can't set this runtime's env per-invocation
+# (InvokeAgentRuntime carries only a JSON payload), so the canonical fleet knob
+# WATCHDOG_TURN_TIMEOUT_SECS is honored here as the env override, ahead of the
+# legacy TURN_TIMEOUT_S env and the hardcoded 1500 default — same order as the
+# resolver's env → legacy tail.
+TURN_TIMEOUT_S = _safe_int_env(
+    "WATCHDOG_TURN_TIMEOUT_SECS", _safe_int_env("TURN_TIMEOUT_S", 1500)
+)
 # Async (submit+poll) turns: journal heartbeat cadence and the staleness bar a
 # poll uses to declare a running turn dead (VM crashed mid-turn). The heartbeat
 # is written by the runner thread; 120s of silence >> one 15s beat, so a stale

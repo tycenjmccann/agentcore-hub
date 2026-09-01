@@ -322,6 +322,20 @@ _CURRENT_TICKET_ID = ""
 # disables ACTIVE enforcement (the subprocess deadline kill) — it must NEVER
 # disable heartbeat EMISSION, because invocation leases (R3) presume the agent
 # alive from its agent.streaming/agent.started events.
+#
+# Enforcement points for the resolved fields:
+#   - toolDeadlineSecs → DEADLINE_SECS, the per-tool subprocess kill in the local
+#     claude_code / codex runners below (payload → env → legacy).
+#   - turnTimeoutSecs  → the per-turn wall-clock. This directing persona has no
+#     turn of its own to bound (its work is tool subprocesses + nested coding
+#     turns, capped by DEADLINE_SECS and REMOTE_CODING_TURN_DEADLINE_S resp.);
+#     the actual turn wall-clock lives in the coding runtime it invokes, as that
+#     runtime's TURN_TIMEOUT_S. That runtime is reached via InvokeAgentRuntime
+#     (JSON payload, no per-call env) and is not forwarded the resolved value
+#     today, so the fleet knob is enforced there via the canonical
+#     WATCHDOG_TURN_TIMEOUT_SECS env override (coding-agent-runtime/main.py). The
+#     copy resolved here records fleet intent and is the propagation point should
+#     a future turn-scoped enforcement be added to this persona.
 _WATCHDOG_LEGACY = {
     "enabled": True,
     "heartbeatIntervalMs": 15000,

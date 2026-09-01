@@ -188,6 +188,11 @@ export function createDetector(deps) {
    * (so it can never fire inside a live lease) and capped at 6h. Below
    * MIN_SAMPLES the median is untrustworthy — fall back to 2× TTL, the same
    * conservative window the stale-claim escape hatch uses.
+   *
+   * Deliberately does NOT consume resolveWatchdog()/agents.json watchdog config:
+   * the detection threshold is anchored to the R3 lease TTL + observed durations
+   * so per-agent config can never undercut the lease (design TEAM-3617
+   * §D1.2/§D1.3).
    */
   function computeThreshold(medianMs, sampleCount) {
     if (sampleCount < MIN_SAMPLES) return FALLBACK_MULTIPLIER * lease.LEASE_TTL_MS;
