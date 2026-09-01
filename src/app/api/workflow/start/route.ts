@@ -569,12 +569,22 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
       `[start] dedup fence LOST for ${workflowId} — marker now points at ${fence.winner}. ` +
         `Coalescing onto ${fence.winner}; cancelling orphan epic ${epicId}.`
     );
+    // TEAM-3708: the audit comment is cosmetic — it must never block the
+    // terminal transition, which is the actual cancellation. Its own try/catch
+    // means a comment failure only loses the audit trail, not the cancel.
     try {
       await invokeTicketLambda("Tickets___add_comment", {
         ticket_id: epicId,
         author: "system",
-        body: `Cancelled: duplicate start lost the dedup ownership fence; superseded by workflow ${fence.winner}.`,
+        comment: `Cancelled: duplicate start lost the dedup ownership fence; superseded by workflow ${fence.winner}.`,
       });
+    } catch (commentErr) {
+      console.error(
+        `[start] FAILED to add cancellation audit comment on orphan epic ${epicId} ` +
+          `(${(commentErr as Error).message}) — proceeding with the done transition anyway.`
+      );
+    }
+    try {
       const cancelResult = await invokeTicketLambda("Tickets___transition_ticket", {
         ticket_id: epicId,
         transition_id: "done",
