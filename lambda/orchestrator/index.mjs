@@ -794,13 +794,16 @@ export async function handleReviewRejection(gateTicket) {
   // so it is normally absent and every rejection is therefore its own round.
   // When a provider does carry it, re-reviewing the same SHA reuses that round.
   //
-  // changeSet is the PR's --name-status file list (release-manager.md Step 4),
-  // best-effort like reviewedHeadSha: normally absent (the orchestrator doesn't
-  // compute the diff), in which case the diff-scope guard is inert and behavior
-  // is byte-identical. When a provider does carry it, review-cap diff-scopes the
-  // round so a rejection whose only findings are OUTSIDE the change set neither
-  // counts toward the cap nor re-opens upstream work.
+  // Diff-scoped gate (TEAM-3689, release-manager.md Step 4): changeSet is the
+  // PR's --name-status file list and reviewFindings are the reviewer's classified
+  // findings (each with its cited files). Both are best-effort like
+  // reviewedHeadSha — normally absent, because the orchestrator does not compute
+  // the diff, in which case the guard is inert and behavior is byte-identical.
+  // When a provider does carry them, review-cap downgrades out-of-diff findings
+  // and reports `gated: false` for a rejection whose findings are ALL out-of-diff,
+  // which must neither count toward the cap nor re-open upstream work.
   const changeSet = gateTicket.changeSet || gateTicket.metadata?.changeSet || null;
+  const reviewFindings = gateTicket.reviewFindings || gateTicket.metadata?.reviewFindings || null;
   const capResult = await getReviewCap().enforce({
     workflow,
     gateTicket,
@@ -809,6 +812,7 @@ export async function handleReviewRejection(gateTicket) {
     feedback,
     reviewedHeadSha: gateTicket.reviewedHeadSha || gateTicket.metadata?.headSha || null,
     changeSet,
+    findings: reviewFindings,
   });
   if (capResult.escalated) {
     await publishEvent(gateTicket.ticketId, "review.rejected", {

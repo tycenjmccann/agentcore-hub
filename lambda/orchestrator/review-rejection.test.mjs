@@ -125,6 +125,37 @@ describe("handleReviewRejection — cap escalation short-circuit (D2c)", () => {
   });
 });
 
+describe("handleReviewRejection — diff-scoped non-gating rejection (TEAM-3689)", () => {
+  it("does NOT reopen and fires review.rejected(noInDiffFindings) when the cap reports gated:false", async () => {
+    // A rejection whose findings are all out-of-diff: the cap downgraded it, so
+    // enforce returns escalated:false but gated:false — the caller must treat it
+    // like the escalation short-circuit and skip the re-open loop.
+    h.state.enforce = vi.fn(async () => ({ escalated: false, gated: false, effectiveRounds: 0, maxRounds: 3 }));
+
+    await handleReviewRejection(GATE);
+
+    expect(h.state.enforce).toHaveBeenCalledTimes(1);
+    // No UpdateCommand → no upstream ticket reopened.
+    expect(h.state.updates.length).toBe(0);
+    const rejected = h.state.events.find((e) => e.type === "review.rejected");
+    expect(rejected).toBeTruthy();
+    expect(rejected.detail.noInDiffFindings).toBe(true);
+    expect(rejected.detail.reopened).toEqual([]);
+    expect(rejected.detail.capReached).toBeUndefined();
+  });
+
+  it("still reopens when gated is true (the default the cap returns without change-set data)", async () => {
+    h.state.enforce = vi.fn(async () => ({ escalated: false, gated: true }));
+
+    await handleReviewRejection(GATE);
+
+    expect(h.state.updates.length).toBe(1);
+    const rejected = h.state.events.find((e) => e.type === "review.rejected");
+    expect(rejected.detail.reopened).toEqual(["TEAM-10"]);
+    expect(rejected.detail.noInDiffFindings).toBeUndefined();
+  });
+});
+
 describe("handleReviewRejection — review-fix stamp on reopen (D4c)", () => {
   it("stamps spawnedBy={kind:review_fix,gateTicketId} + phase on the reopened ticket", async () => {
     h.state.enforce = vi.fn(async () => ({ escalated: false }));

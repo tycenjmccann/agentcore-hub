@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { effectiveRoundCount, mergeRound } from "./ship-review";
+import {
+  effectiveRoundCount,
+  effectiveRoundCountDiffScoped,
+  enforceDiffScope,
+  diffScopeRounds,
+  mergeRound,
+} from "./ship-review";
 import type { ShipRoundLike, AuthorizationLike } from "./ship-review";
 
 function cn(round: number, regressions = 0): ShipRoundLike {
@@ -147,6 +153,300 @@ describe("effectiveRoundCount — regressionCountsDouble opt", () => {
     expect(effectiveRoundCount(twoRegressions, [], { regressionCountsDouble: false }) >= cap).toBe(
       false
     );
+  });
+});
+
+// ── Diff-scoped gate (TEAM-3689 / AC-D2.1) ───────────────────────────────────
+// The deterministic enforcement of release-manager.md Step 4's DIFF-SCOPED GATE:
+// a finding gates only if EVERY file it cites is inside the PR change set;
+// everything else is downgraded to ADVISORY and can never flip the verdict.
+describe("enforceDiffScope — diff-scoped gate (AC-D2.1)", () => {
+  it("AC1: keeps CHANGES-NEEDED on an in-diff finding, downgrades an out-of-diff one to ADVISORY and strips its regressionOf", () => {
+    const round: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: ["src/a.ts", "src/b.ts"],
+      findings: [
+        // in-diff blocking finding, itself a regression
+        { citedFiles: ["src/a.ts"], regressionOf: { round: 0, seam: "parser" } },
+        // out-of-diff hygiene finding (pre-existing file), also labelled a regression
+        { citedFiles: ["vendor/legacy.ts"], regressionOf: { round: 0, seam: "legacy" } },
+      ],
+    };
+    const out = enforceDiffScope(round, round.changeSet);
+
+    // The in-diff finding still gates.
+    expect(out.verdict).toBe("CHANGES-NEEDED");
+    expect(out.findings![0]).toMatchObject({
+      classification: "IN-DIFF",
+      citedFiles: ["src/a.ts"],
+      regressionOf: { round: 0, seam: "parser" }, // kept: IN-DIFF findings may regress
+    });
+    // The out-of-diff finding is forced ADVISORY and can never gate or weigh double.
+    expect(out.findings![1]).toMatchObject({
+      classification: "ADVISORY",
+      citedFiles: ["vendor/legacy.ts"],
+    });
+    expect(out.findings![1]).not.toHaveProperty("regressionOf");
+    // The round still gates and (having an IN-DIFF regression) still weighs double.
+    expect(effectiveRoundCountDiffScoped([round])).toBe(2);
+  });
+
+  it("defaults changeSet to the round's own changeSet field when the arg is omitted", () => {
+    const round: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: ["src/a.ts"],
+      findings: [{ citedFiles: ["src/a.ts"] }, { citedFiles: ["out/x.ts"] }],
+    };
+    const out = enforceDiffScope(round);
+    expect(out.findings!.map(f => f!.classification)).toEqual(["IN-DIFF", "ADVISORY"]);
+    expect(out.verdict).toBe("CHANGES-NEEDED");
+  });
+
+  it("AC2: a CHANGES-NEEDED round whose ONLY findings are out-of-diff downgrades and counts as 0", () => {
+    const round: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: ["src/a.ts"],
+      findings: [{ citedFiles: ["other/x.ts"] }, { citedFiles: ["other/y.ts"] }],
+    };
+    const out = enforceDiffScope(round);
+    // Advisory findings remain → non-blocking form, not PASS.
+    expect(out.verdict).toBe("PASS-with-known-findings");
+    expect(out.findings!.every(f => f!.classification === "ADVISORY")).toBe(true);
+    expect(effectiveRoundCountDiffScoped([round])).toBe(0);
+  });
+
+  it("AC2 (no findings): CHANGES-NEEDED with an empty findings array + a change set downgrades to PASS", () => {
+    const round: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: ["src/a.ts"],
+      findings: [],
+    };
+    expect(enforceDiffScope(round).verdict).toBe("PASS");
+    expect(effectiveRoundCountDiffScoped([round])).toBe(0);
+  });
+
+  it("a finding is IN-DIFF only if EVERY cited file is in the change set (one stray file → advisory)", () => {
+    const round: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: ["src/a.ts", "src/b.ts"],
+      findings: [
+        { citedFiles: ["src/a.ts", "src/b.ts"] }, // all in → IN-DIFF
+        { citedFiles: ["src/a.ts", "out/c.ts"] }, // one out → ADVISORY
+      ],
+    };
+    const out = enforceDiffScope(round);
+    expect(out.findings!.map(f => f!.classification)).toEqual(["IN-DIFF", "ADVISORY"]);
+    expect(out.verdict).toBe("CHANGES-NEEDED");
+  });
+
+  it("AC-c: rename/copy entries count as BOTH paths (raw --name-status R100/C075 tab form and `old -> new` arrow form)", () => {
+    const changeSet = [
+      "R100\told/path.ts\tnew/path.ts", // renamed: both paths in-diff
+      "C075\tsrc/base.ts\tsrc/copy.ts", // copied: both paths in-diff
+      "moved-old.ts -> moved-new.ts", // arrow form: both paths in-diff
+      "M\tsrc/plain.ts", // status-prefixed plain path
+      "./src/dotslash.ts", // normalized (leading ./ dropped)
+    ];
+    const inDiffCitations = [
+      ["old/path.ts"],
+      ["new/path.ts"],
+      ["src/base.ts"],
+      ["src/copy.ts"],
+      ["moved-old.ts"],
+      ["moved-new.ts"],
+      ["src/plain.ts"],
+      ["src/dotslash.ts"],
+    ];
+    for (const citedFiles of inDiffCitations) {
+      const round: ShipRoundLike = {
+        round: 1,
+        verdict: "CHANGES-NEEDED",
+        changeSet,
+        findings: [{ citedFiles }],
+      };
+      const out = enforceDiffScope(round);
+      expect(out.findings![0]!.classification, `expected IN-DIFF for ${citedFiles[0]}`).toBe(
+        "IN-DIFF"
+      );
+      expect(out.verdict).toBe("CHANGES-NEEDED");
+    }
+    // A path that is on neither side of any rename stays advisory.
+    const outside: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet,
+      findings: [{ citedFiles: ["unrelated.ts"] }],
+    };
+    expect(enforceDiffScope(outside).findings![0]!.classification).toBe("ADVISORY");
+    expect(enforceDiffScope(outside).verdict).toBe("PASS-with-known-findings");
+  });
+
+  it("AC-d: tolerant of malformed input — never throws, and malformed findings cannot block", () => {
+    // Finding citing no files → advisory (cannot gate).
+    const noFiles: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: ["src/a.ts"],
+      findings: [{ severity: "P1" } as unknown as NonNullable<ShipRoundLike["findings"]>[number]],
+    };
+    expect(() => enforceDiffScope(noFiles)).not.toThrow();
+    expect(enforceDiffScope(noFiles).findings![0]!.classification).toBe("ADVISORY");
+    expect(enforceDiffScope(noFiles).verdict).toBe("PASS-with-known-findings");
+
+    // Non-object finding entries + a genuinely empty finding → all advisory.
+    const junk: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: ["src/a.ts"],
+      findings: [
+        null,
+        42 as unknown as NonNullable<ShipRoundLike["findings"]>[number],
+        {},
+      ],
+    };
+    expect(() => enforceDiffScope(junk)).not.toThrow();
+    expect(effectiveRoundCountDiffScoped([junk])).toBe(0); // nothing can block
+
+    // Missing findings array entirely.
+    const missing = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: ["src/a.ts"],
+    } as unknown as ShipRoundLike;
+    expect(() => enforceDiffScope(missing)).not.toThrow();
+    expect(enforceDiffScope(missing).verdict).toBe("PASS"); // no in-diff findings, none at all
+
+    // Non-array changeSet → treated as empty set (every finding out-of-diff),
+    // still never throws.
+    const badChangeSet: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      findings: [{ citedFiles: ["src/a.ts"] }],
+    };
+    expect(() => enforceDiffScope(badChangeSet, "not-an-array")).not.toThrow();
+    expect(enforceDiffScope(badChangeSet, "not-an-array").findings![0]!.classification).toBe(
+      "ADVISORY"
+    );
+
+    // A non-object round is returned untouched rather than throwing.
+    expect(() => enforceDiffScope(null as unknown as ShipRoundLike, [])).not.toThrow();
+    expect(enforceDiffScope(null as unknown as ShipRoundLike, [])).toBeNull();
+  });
+
+  it("AC-e: pure — the input round and its findings are not mutated", () => {
+    const round: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: ["src/a.ts"],
+      findings: [
+        { citedFiles: ["out/x.ts"], regressionOf: { round: 0 } },
+        { citedFiles: ["src/a.ts"] },
+      ],
+    };
+    const snapshot = JSON.parse(JSON.stringify(round));
+    const out = enforceDiffScope(round);
+    expect(round).toEqual(snapshot); // input unchanged
+    expect(out).not.toBe(round); // fresh object returned
+    expect(out.findings![0]).not.toBe(round.findings![0]);
+  });
+
+  it("AC-g: an out-of-diff regression can NOT weigh double; only an in-diff regression does", () => {
+    const cs = ["src/a.ts"];
+    // Only finding is an out-of-diff regression → downgraded, counts 0.
+    const outOnly: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: cs,
+      findings: [{ citedFiles: ["other.ts"], regressionOf: { round: 0 } }],
+    };
+    expect(effectiveRoundCountDiffScoped([outOnly])).toBe(0);
+
+    // In-diff plain finding + out-of-diff regression → gates but does NOT double
+    // (the regression is stripped when the finding is downgraded to advisory).
+    const mixed: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: cs,
+      findings: [
+        { citedFiles: ["src/a.ts"] },
+        { citedFiles: ["other.ts"], regressionOf: { round: 0 } },
+      ],
+    };
+    expect(effectiveRoundCountDiffScoped([mixed])).toBe(1);
+
+    // In-diff regression → doubles (contrast).
+    const inDiffRegression: ShipRoundLike = {
+      round: 1,
+      verdict: "CHANGES-NEEDED",
+      changeSet: cs,
+      findings: [{ citedFiles: ["src/a.ts"], regressionOf: { round: 0 } }],
+    };
+    expect(effectiveRoundCountDiffScoped([inDiffRegression])).toBe(2);
+  });
+});
+
+describe("diffScopeRounds / effectiveRoundCountDiffScoped — inertness (backward compat)", () => {
+  it("AC-f: a round WITHOUT a changeSet passes through byte-identical (same reference)", () => {
+    const rounds: ShipRoundLike[] = [
+      { round: 1, verdict: "CHANGES-NEEDED", findings: [{ regressionOf: { of: "x" } }] },
+      { round: 2, verdict: "PASS", findings: [] },
+    ];
+    const scoped = diffScopeRounds(rounds);
+    expect(scoped).toEqual(rounds);
+    // Pass-through must not clone: the guard is truly inert for these rounds.
+    expect(scoped[0]).toBe(rounds[0]);
+    expect(scoped[1]).toBe(rounds[1]);
+  });
+
+  it("AC-f: a round with a NON-ARRAY changeSet is also treated as unscoped (inert)", () => {
+    const rounds: ShipRoundLike[] = [
+      { round: 1, verdict: "CHANGES-NEEDED", findings: [{}], changeSet: "M src/a.ts" },
+    ];
+    const scoped = diffScopeRounds(rounds);
+    expect(scoped[0]).toBe(rounds[0]); // untouched
+  });
+
+  it("AC-f: effectiveRoundCountDiffScoped === effectiveRoundCount for a changeSet-free ledger", () => {
+    const ledgers: Array<{
+      rounds: ShipRoundLike[];
+      auths?: AuthorizationLike[];
+      opts?: { regressionCountsDouble?: boolean };
+    }> = [
+      { rounds: [] },
+      { rounds: [cn(1), cn(2), cn(3)] },
+      { rounds: [cn(1, 1), cn(2)] },
+      { rounds: [cn(1), pass(2, "PASS"), cn(3)] },
+      { rounds: [cn(1), cn(2), cn(3), cn(4)], auths: [cont(3)] },
+      { rounds: [cn(1, 1), cn(2, 1)], opts: { regressionCountsDouble: false } },
+    ];
+    for (const { rounds, auths = [], opts = {} } of ledgers) {
+      expect(effectiveRoundCountDiffScoped(rounds, auths, opts)).toBe(
+        effectiveRoundCount(rounds, auths, opts)
+      );
+    }
+  });
+
+  it("mixes scoped and unscoped rounds in one ledger: only the changeSet-carrying round is diff-scoped", () => {
+    const rounds: ShipRoundLike[] = [
+      // legacy fingerprint-style round, no changeSet → counts as a plain CN round
+      { round: 1, verdict: "CHANGES-NEEDED", findings: [{}] },
+      // release-manager round whose only finding is out-of-diff → downgraded to 0
+      {
+        round: 2,
+        verdict: "CHANGES-NEEDED",
+        changeSet: ["src/a.ts"],
+        findings: [{ citedFiles: ["out/x.ts"] }],
+      },
+    ];
+    // 1 (round 1 counts) + 0 (round 2 downgraded) = 1
+    expect(effectiveRoundCountDiffScoped(rounds)).toBe(1);
+    // Without diff-scoping both would have counted.
+    expect(effectiveRoundCount(rounds)).toBe(2);
   });
 });
 

@@ -250,6 +250,159 @@ describe("enforce — below the cap", () => {
   });
 });
 
+describe("enforce — diff-scoped gate (TEAM-3689, release-manager.md Step 4)", () => {
+  // The reviewer's classified findings, each carrying its cited files. When both
+  // these and the PR change set reach enforce, an out-of-diff-only rejection is
+  // non-gating: it records no round and does not re-open upstream work.
+  const CHANGE_SET = ["src/a.ts", "src/b.ts"];
+
+  it("AC3a: change set + mixed findings → gated, only the in-diff finding gates and the round is recorded", async () => {
+    const { deps, store, parkGateForHuman, publishEvent } = makeDeps();
+    const res = await createReviewCap(deps).enforce({
+      workflow: workflowWith(null),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "Null deref in the new parser + a nit in a pre-existing helper.",
+      changeSet: CHANGE_SET,
+      findings: [
+        { citedFiles: ["src/a.ts"] }, // IN-DIFF → this is what gates
+        { citedFiles: ["vendor/legacy.ts"] }, // out-of-diff → advisory
+      ],
+    });
+
+    expect(res.gated).toBe(true);
+    expect(res.escalated).toBe(false);
+    expect(res.effectiveRounds).toBe(1); // the round counts
+    expect(store.appendReviewRound).toHaveBeenCalledTimes(1);
+    expect(parkGateForHuman).not.toHaveBeenCalled();
+    expect(call(publishEvent, "review.cap_reached")).toHaveLength(0);
+  });
+
+  it("AC3b: change set + ONLY out-of-diff findings → NOT gated, no round recorded, count unchanged", async () => {
+    const { deps, store, parkGateForHuman, emitMetrics } = makeDeps();
+    const res = await createReviewCap(deps).enforce({
+      workflow: workflowWith(null),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "Style nits in files this PR never touched.",
+      changeSet: CHANGE_SET,
+      findings: [{ citedFiles: ["other/x.ts"] }, { citedFiles: ["other/y.ts"] }],
+    });
+
+    expect(res.gated).toBe(false);
+    expect(res.escalated).toBe(false);
+    expect(res.effectiveRounds).toBe(0);
+    // The whole point: an out-of-diff complaint is not a rework round.
+    expect(store.appendReviewRound).not.toHaveBeenCalled();
+    expect(parkGateForHuman).not.toHaveBeenCalled();
+    // Still emits a metric (an explicit zero) so the non-gating cycle is visible.
+    expect(emitMetrics).toHaveBeenCalledTimes(1);
+    expect(emitMetrics.mock.calls[0][0]).toMatchObject({ escalated: false, effectiveRounds: 0 });
+  });
+
+  it("AC3b: a non-gating rejection does not inflate an existing count and cannot trip the cap", async () => {
+    // Two prior rounds under a cap of 3: a genuine third rejection would escalate,
+    // but an out-of-diff-only one must leave the count at 2 and NOT escalate.
+    const state = ledger({ rounds: [priorRound(1), priorRound(2)] });
+    const { deps, store, parkGateForHuman } = makeDeps({ ledger: state });
+    const res = await createReviewCap(deps).enforce({
+      workflow: workflowWith(state),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "Complaint about an untouched file.",
+      changeSet: CHANGE_SET,
+      findings: [{ citedFiles: ["untouched/legacy.ts"] }],
+    });
+
+    expect(res.gated).toBe(false);
+    expect(res.escalated).toBe(false);
+    expect(res.effectiveRounds).toBe(2); // the prior count, unchanged
+    expect(store.appendReviewRound).not.toHaveBeenCalled();
+    expect(parkGateForHuman).not.toHaveBeenCalled();
+  });
+
+  it("AC3a at the cap: change set + an in-diff finding still escalates when the count is reached", async () => {
+    const state = ledger({ rounds: [priorRound(1), priorRound(2)] });
+    const { deps, store, parkGateForHuman } = makeDeps({ ledger: state });
+    const res = await createReviewCap(deps).enforce({
+      workflow: workflowWith(state),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "Third round, still broken in the diff.",
+      changeSet: CHANGE_SET,
+      findings: [{ citedFiles: ["src/a.ts"] }],
+    });
+
+    expect(res.gated).toBe(true);
+    expect(res.escalated).toBe(true);
+    expect(res.effectiveRounds).toBe(3);
+    expect(store.appendReviewRound).toHaveBeenCalledTimes(1);
+    expect(parkGateForHuman).toHaveBeenCalledTimes(1);
+  });
+
+  it("AC3c: no change set → gated (backward-compat pin), round recorded exactly as before", async () => {
+    const { deps, store } = makeDeps();
+    const res = await createReviewCap(deps).enforce({
+      workflow: workflowWith(null),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "Missing null check.",
+    });
+    expect(res.gated).toBe(true);
+    expect(res.escalated).toBe(false);
+    expect(res.effectiveRounds).toBe(1);
+    expect(store.appendReviewRound).toHaveBeenCalledTimes(1);
+  });
+
+  it("is inert unless BOTH change set and findings are present (either alone → gated)", async () => {
+    // change set but no findings
+    const a = makeDeps();
+    const resA = await createReviewCap(a.deps).enforce({
+      workflow: workflowWith(null),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "x",
+      changeSet: CHANGE_SET,
+    });
+    expect(resA.gated).toBe(true);
+    expect(a.store.appendReviewRound).toHaveBeenCalledTimes(1);
+
+    // findings but no change set (nothing to scope against)
+    const b = makeDeps();
+    const resB = await createReviewCap(b.deps).enforce({
+      workflow: workflowWith(null),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "x",
+      findings: [{ citedFiles: ["other/x.ts"] }],
+    });
+    expect(resB.gated).toBe(true);
+    expect(b.store.appendReviewRound).toHaveBeenCalledTimes(1);
+  });
+
+  it("malformed findings cannot fabricate a gate: null/non-object/no-files entries → non-gating", async () => {
+    const { deps, store } = makeDeps();
+    const res = await createReviewCap(deps).enforce({
+      workflow: workflowWith(null),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "junk findings",
+      changeSet: CHANGE_SET,
+      findings: [null, 42, { severity: "P1" }, {}],
+    });
+    expect(res.gated).toBe(false);
+    expect(store.appendReviewRound).not.toHaveBeenCalled();
+  });
+});
+
 describe("enforce — at the cap", () => {
   const atCapState = () => ledger({ rounds: [priorRound(1), priorRound(2)] });
 
