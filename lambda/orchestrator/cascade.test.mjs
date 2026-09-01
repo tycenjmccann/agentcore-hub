@@ -359,6 +359,37 @@ describe("commit 4b — flag OFF leaves extended-state dependents untouched", ()
   });
 });
 
+describe("commit 4b — terminal-state dependent is a no-op even with the flag ON", () => {
+  it("done / cancelled dependents whose blockers resolved fall through untouched", async () => {
+    // Both list the just-closed ticket as their (only) blocker, so the
+    // blocker-resolution predicate passes — but a dependent already in a
+    // terminal state must not be Readied, nudged, stolen, or re-woken. Guards
+    // the fall-through at cascade.mjs (neither blocked/todo nor in_progress/
+    // in_review), which the other 4b cases never exercise.
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "done", assignee: "dev", blockedBy: [DONE] },
+      { ticketId: "TEAM-3", status: "cancelled", assignee: "dev", blockedBy: [DONE] },
+    ];
+    const { deps, ddb, publishEvent, lease, redispatch, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(unblocked).toEqual([]);
+    expect(statusWrites(ddb)).toHaveLength(0);
+    expect(lease.lastAgentActivity).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(reawakenGate).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(0);
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+    expect(eventsOfType(publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+  });
+});
+
 describe("both call sites exercise identical helper behavior", () => {
   it("two independent cascade instances (webhook + stream wiring) produce identical output", async () => {
     const siblings = () => [
