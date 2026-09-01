@@ -97,6 +97,16 @@ Fold their findings in at their severity. None configured → skip silently.
 ### Step 4: Verdict — diff-scoped, with convergence accounting
 **DIFF-SCOPED GATE: any finding whose cited files are ALL within the PR change set (the --name-status file list from Step 1's diff) = CHANGES NEEDED, at any severity. A finding citing any file OUTSIDE the change set is ADVISORY: file it as a backlog ticket labelled "advisory" (one per finding group, assigned to the owning dev, NOT blocked_by-chained into this run) and do not count it toward the verdict. Never let an advisory finding flip PASS to CHANGES NEEDED.**
 
+This rule is now ALSO enforced deterministically, not just by your compliance
+with this prose: `enforceDiffScope` in `src/lib/workflow/ship-review.ts` (and its
+`lambda/orchestrator/ship-review.mjs` twin) reclassifies findings against the
+recorded change set and DOWNGRADES any out-of-diff blocking finding to advisory —
+so a round can never present CHANGES-NEEDED unless at least one finding is
+genuinely in-diff, regardless of what a finding's prose classification says. For
+that guard to have its input you MUST record the change set on the round entry
+(see step 1 below, `changeSet`); without it the guard is inert and only this prose
+governs. Record it accurately and let the two agree.
+
 Classify EVERY finding before you count anything:
 - **IN-DIFF** — every file it cites is on the change set recorded in Step 2.
   These are the only findings that set the verdict, spawn blocking fix tickets,
@@ -126,11 +136,14 @@ missing = empty state, round 1):
    SAME number if the PR head SHA equals the latest recorded round's SHA — you
    are re-running that round; overwrite its entry, never append a duplicate),
    plus `reviewedHeadSha`, timestamp, `verdict`
-   (`CHANGES-NEEDED` / `PASS` / `PASS-with-known-findings`), and the full
-   `findings` array with each finding's severity, cited files, IN-DIFF vs
-   ADVISORY classification, and `regressionOf` set per Step 2's regression
-   check (omit the key entirely on non-regressions — do NOT write
-   `regressionOf: null`).
+   (`CHANGES-NEEDED` / `PASS` / `PASS-with-known-findings`), the full
+   `findings` array with each finding's severity, cited files (as `citedFiles`),
+   IN-DIFF vs ADVISORY classification, and `regressionOf` set per Step 2's
+   regression check (omit the key entirely on non-regressions — do NOT write
+   `regressionOf: null`), and `changeSet` — the exact `--name-status` file list
+   from Step 2 (renames as BOTH paths; a raw name-status line or a bare path both
+   parse). `changeSet` is what `enforceDiffScope` scopes the verdict against, so
+   a round without it is NOT deterministically guarded — always record it.
 2. **Compute the effective round count** over the rounds AFTER the latest human
    `continue` authorization (`resetAtRound`): each round whose verdict is
    `CHANGES-NEEDED` contributes +1, or +2 when `regressionCountsDouble` is on

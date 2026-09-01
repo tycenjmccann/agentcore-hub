@@ -42,7 +42,7 @@
  * fingerprintFinding below.
  */
 
-import { effectiveRoundCount } from "./ship-review.mjs";
+import { effectiveRoundCount, diffScopeRounds, enforceDiffScope } from "./ship-review.mjs";
 
 /** Defaults for the convergence-cap fields of a ReviewGate. Keep in sync with
  * REVIEW_GATE_CAP_DEFAULTS in src/lib/workflow/workflow-defs.ts. */
@@ -268,7 +268,7 @@ const fingerprintsOf = (round) =>
  * fixed and has come back, which is the "passed in round N-1, failing again
  * now" rule the cap's double-weighting is for.
  */
-export function buildRoundRecord({ priorRounds, upstreamIds, feedback, reviewedHeadSha, nowIso }) {
+export function buildRoundRecord({ priorRounds, upstreamIds, feedback, reviewedHeadSha, nowIso, changeSet }) {
   const prior = dedupedSortedRounds(priorRounds);
   const latest = prior[prior.length - 1];
   const contentFingerprint = roundContentFingerprint({ upstreamIds, feedback });
@@ -332,6 +332,11 @@ export function buildRoundRecord({ priorRounds, upstreamIds, feedback, reviewedH
     contentFingerprint,
     verdict: "CHANGES-NEEDED",
     findings,
+    // The diff-scope guard's input (release-manager.md Step 4). Stamped ONLY
+    // when the caller supplies a change set, so a round with no change-set data
+    // is byte-identical to what this wrote before enforceDiffScope existed —
+    // the guard is inert for it (see diffScopeRounds / enforce below).
+    ...(Array.isArray(changeSet) ? { changeSet } : {}),
     recordedAt: nowIso,
   };
 }
@@ -539,7 +544,7 @@ export function createReviewCap(deps) {
    * and rework resumes on its own. A runaway loop, by contrast, burns agent
    * invocations until somebody notices.
    */
-  async function enforce({ workflow, gateTicket, gateCfg, upstreamIds, feedback, reviewedHeadSha }) {
+  async function enforce({ workflow, gateTicket, gateCfg, upstreamIds, feedback, reviewedHeadSha, changeSet }) {
     const cap = resolveReviewGateCap(gateCfg);
     const gateTicketId = gateTicket.ticketId;
     const afterPhase = gateCfg?.afterPhase;
@@ -559,6 +564,7 @@ export function createReviewCap(deps) {
         feedback,
         reviewedHeadSha,
         nowIso: now().toISOString(),
+        changeSet,
       });
       // The append RETURNS the post-write history, so the count is computed
       // from what actually landed rather than from the possibly-stale snapshot
@@ -623,12 +629,27 @@ export function createReviewCap(deps) {
 
     const rounds = history?.rounds?.length ? history.rounds : [round];
     const authorizations = history?.authorizations || [];
-    const effectiveRounds = effectiveRoundCount(rounds, authorizations, {
+    // Diff-scope the ledger BEFORE counting (release-manager.md Step 4): a round
+    // whose only findings cite files outside its recorded change set is
+    // downgraded off CHANGES-NEEDED and stops counting toward the cap. Inert for
+    // rounds with no `changeSet` (every round the orchestrator writes today), so
+    // this changes nothing until a producer records a change set — see
+    // diffScopeRounds.
+    const scopedRounds = diffScopeRounds(rounds);
+    const effectiveRounds = effectiveRoundCount(scopedRounds, authorizations, {
       regressionCountsDouble: cap.regressionCountsDouble,
     });
-    const regressionRounds = dedupedSortedRounds(rounds).filter(
+    const regressionRounds = dedupedSortedRounds(scopedRounds).filter(
       (r) => Array.isArray(r.findings) && r.findings.some((f) => f?.regressionOf != null)
     ).length;
+
+    // Does THIS rejection still gate after diff-scoping? A CHANGES-NEEDED round
+    // whose only findings are out-of-diff downgrades, and the caller must skip
+    // the rework re-open for it. `gated` is true whenever there is no change set
+    // to scope against, so the re-open path is unchanged for old ledgers.
+    const gated = Array.isArray(round.changeSet)
+      ? enforceDiffScope(round).verdict === "CHANGES-NEEDED"
+      : true;
 
     const escalated = effectiveRounds >= cap.maxRounds;
     emitMetrics({
@@ -642,9 +663,10 @@ export function createReviewCap(deps) {
 
     if (!escalated) {
       log(
-        `[review-cap] ${gateTicketId} round ${round.round}: effective ${effectiveRounds}/${cap.maxRounds} — rework proceeds.`
+        `[review-cap] ${gateTicketId} round ${round.round}: effective ${effectiveRounds}/${cap.maxRounds} — ` +
+          `${gated ? "rework proceeds" : "no in-diff findings, non-gating — rework suppressed"}.`
       );
-      return { escalated: false, effectiveRounds, maxRounds: cap.maxRounds, round, authorization };
+      return { escalated: false, gated, effectiveRounds, maxRounds: cap.maxRounds, round, authorization };
     }
 
     if (cap.onCapReached !== "escalate") {

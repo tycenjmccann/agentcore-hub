@@ -793,6 +793,14 @@ export async function handleReviewRejection(gateTicket) {
   // reviewedHeadSha is best-effort: the orchestrator doesn't track the PR head,
   // so it is normally absent and every rejection is therefore its own round.
   // When a provider does carry it, re-reviewing the same SHA reuses that round.
+  //
+  // changeSet is the PR's --name-status file list (release-manager.md Step 4),
+  // best-effort like reviewedHeadSha: normally absent (the orchestrator doesn't
+  // compute the diff), in which case the diff-scope guard is inert and behavior
+  // is byte-identical. When a provider does carry it, review-cap diff-scopes the
+  // round so a rejection whose only findings are OUTSIDE the change set neither
+  // counts toward the cap nor re-opens upstream work.
+  const changeSet = gateTicket.changeSet || gateTicket.metadata?.changeSet || null;
   const capResult = await getReviewCap().enforce({
     workflow,
     gateTicket,
@@ -800,6 +808,7 @@ export async function handleReviewRejection(gateTicket) {
     upstreamIds: upstream.map((up) => up.ticketId),
     feedback,
     reviewedHeadSha: gateTicket.reviewedHeadSha || gateTicket.metadata?.headSha || null,
+    changeSet,
   });
   if (capResult.escalated) {
     await publishEvent(gateTicket.ticketId, "review.rejected", {
@@ -810,6 +819,24 @@ export async function handleReviewRejection(gateTicket) {
       capReached: true,
       effectiveRounds: capResult.effectiveRounds,
       maxRounds: capResult.maxRounds,
+    });
+    return;
+  }
+
+  // Diff-scoped gate (TEAM-3689): a CHANGES-NEEDED verdict whose only findings
+  // cite files OUTSIDE the recorded change set is non-gating — it must NOT
+  // re-open upstream work. `gated` is true whenever there is no change set to
+  // scope against, so this branch is inert for old ledgers.
+  if (capResult.gated === false) {
+    console.log(
+      `[orchestrator] Review gate ${gateTicket.ticketId} rejected but all findings are out-of-diff (advisory) — not reopening.`
+    );
+    await publishEvent(gateTicket.ticketId, "review.rejected", {
+      ticketId: gateTicket.ticketId,
+      onReject,
+      reopened: [],
+      workflowId: workflow.id,
+      noInDiffFindings: true,
     });
     return;
   }
