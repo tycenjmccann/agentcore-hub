@@ -12,7 +12,7 @@
 import { timingSafeEqual, createHash } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { validateIntakeSources } from "@/lib/workflow/intake";
 import type { WorkflowInput } from "@/lib/workflow/types";
@@ -140,6 +140,40 @@ async function resolveDedup(
     );
     const winner = reread.Item?.canonicalWorkflowId as string | undefined;
     return winner ? { coalesce: winner } : { proceed: candidateWorkflowId };
+  }
+}
+
+/**
+ * TEAM-3686: mark a just-created workflow row terminal when intake-ticket
+ * creation fails. The dedup marker (D4b) coalesces every future trigger for
+ * the same (sourceTicket, defId) onto the marker's canonical run while it is
+ * non-terminal — so a workflow row that exists with zero tickets would own
+ * the key forever and no run could ever start. Flipping it to phase=error
+ * lets the next trigger's terminal-run re-point CAS mint a fresh run.
+ * Best-effort: if this write also fails, log both errors and let the caller
+ * rethrow the ORIGINAL failure.
+ */
+async function markWorkflowStartError(workflowId: string, cause: unknown): Promise<void> {
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: WORKFLOWS_TABLE,
+        Key: { workflowId },
+        UpdateExpression: "SET #phase = :error, erroredAt = :ts, startError = :msg",
+        ExpressionAttributeNames: { "#phase": "phase" },
+        ExpressionAttributeValues: {
+          ":error": "error",
+          ":ts": new Date().toISOString(),
+          ":msg": `intake ticket creation failed: ${String((cause as Error)?.message || cause).slice(0, 500)}`,
+        },
+      })
+    );
+    console.error(`[start] workflow ${workflowId} marked error — intake ticket creation failed: ${(cause as Error)?.message}`);
+  } catch (markErr) {
+    console.error(
+      `[start] FAILED to mark workflow ${workflowId} as error (${(markErr as Error).message}) ` +
+        `after intake-ticket failure (${(cause as Error)?.message}) — dedup key may stay wedged on this run`
+    );
   }
 }
 
@@ -277,22 +311,32 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
     },
   }));
 
-  // 3. Create the intake ticket in Jira (assigned to the workflow's intake agent)
-  const reqTicket = await jira.createTicket({
-    parentId: epicId,
-    title: `${def.phases.find((p) => p.type === "agent")?.name || "Intake"}: ${def.intakeAgentId} — ${body.title}`,
-    description: `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
-    assignee: def.intakeAgentId,
-    blockedBy: [],
-    // wfdef stamp keeps the ticket classifiable on the dashboard even if the
-    // workflow row is later deleted.
-    extraLabels: [`wfdef:${def.id}`],
-  }, workflowId);
+  // 3. Create the intake ticket in Jira (assigned to the workflow's intake agent).
+  //    TEAM-3686: the workflow row above already exists — if this fails, mark the
+  //    row terminal before rethrowing, or the dedup marker coalesces every future
+  //    trigger onto a stillborn run with zero tickets. The Ready transition is in
+  //    the same window: a ticket that never goes Ready never fires the webhook,
+  //    which is the same stillborn state.
+  try {
+    const reqTicket = await jira.createTicket({
+      parentId: epicId,
+      title: `${def.phases.find((p) => p.type === "agent")?.name || "Intake"}: ${def.intakeAgentId} — ${body.title}`,
+      description: `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
+      assignee: def.intakeAgentId,
+      blockedBy: [],
+      // wfdef stamp keeps the ticket classifiable on the dashboard even if the
+      // workflow row is later deleted.
+      extraLabels: [`wfdef:${def.id}`],
+    }, workflowId);
 
-  // Requirements ticket has no blockers — transition to "Ready" so the webhook fires
-  // and the orchestrator invokes the agent (same flow as all other tickets in the pipeline)
-  await jira.transitionTo(reqTicket.id, "Ready");
-  console.log(`[start/jira] Workflow ${workflowId} created. Epic: ${epicId}. Req ticket: ${reqTicket.id} → Ready.`);
+    // Requirements ticket has no blockers — transition to "Ready" so the webhook fires
+    // and the orchestrator invokes the agent (same flow as all other tickets in the pipeline)
+    await jira.transitionTo(reqTicket.id, "Ready");
+    console.log(`[start/jira] Workflow ${workflowId} created. Epic: ${epicId}. Req ticket: ${reqTicket.id} → Ready.`);
+  } catch (err) {
+    await markWorkflowStartError(workflowId, err);
+    throw err;
+  }
 
   return NextResponse.json({ workflowId, epicId });
 }
@@ -349,17 +393,28 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
 
   // 4. Create the intake ticket via ticket tools Lambda
   //    DDB write triggers Stream → orchestrator Lambda picks it up
-  const reqResult = await invokeTicketLambda("Tickets___create_ticket", {
-    summary: `${intakePhaseName}: ${def.intakeAgentId} — ${body.title}`,
-    description: `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
-    issue_type: "Task",
-    parent_key: epicId,
-    assignee: def.intakeAgentId,
-    workflow_id: workflowId,
-  });
+  //    TEAM-3686: the workflow row above already exists — if this fails, mark
+  //    the row terminal before rethrowing, or the dedup marker coalesces every
+  //    future trigger onto a stillborn run with zero tickets.
+  let reqResult: Record<string, unknown>;
+  try {
+    reqResult = await invokeTicketLambda("Tickets___create_ticket", {
+      summary: `${intakePhaseName}: ${def.intakeAgentId} — ${body.title}`,
+      description: `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
+      issue_type: "Task",
+      parent_key: epicId,
+      assignee: def.intakeAgentId,
+      workflow_id: workflowId,
+    });
+  } catch (err) {
+    await markWorkflowStartError(workflowId, err);
+    throw err;
+  }
 
   if (reqResult.error) {
-    throw new Error(`Failed to create requirements ticket: ${reqResult.error}`);
+    const err = new Error(`Failed to create requirements ticket: ${reqResult.error}`);
+    await markWorkflowStartError(workflowId, err);
+    throw err;
   }
 
   const reqTicketId = (reqResult.key || reqResult.ticketId) as string;

@@ -54,12 +54,20 @@ export async function getWorkflowFromDynamo(workflowId: string) {
   return result.Item || null;
 }
 
-export async function getTicketsForWorkflowFromDynamo(workflowId: string) {
-  // Query tickets by workflowId using a scan with filter (no GSI yet)
+export async function getTicketsForWorkflowFromDynamo(
+  workflowId: string,
+  options?: { consistentRead?: boolean }
+) {
+  // Query tickets by workflowId using a scan with filter (no GSI yet).
+  // TEAM-3686 Finding 4: callers gating an irreversible decision (the complete
+  // route) opt into ConsistentRead so a just-created fix ticket can't be
+  // invisible to the snapshot — a base-table Scan supports it (a GSI wouldn't).
+  // Default stays eventually consistent for the cheap dashboard reads.
   const result = await ddb.send(new ScanCommand({
     TableName: TICKETS_TABLE,
     FilterExpression: "workflowId = :wid",
     ExpressionAttributeValues: { ":wid": workflowId },
+    ...(options?.consistentRead ? { ConsistentRead: true } : {}),
   }));
   return (result.Items || []).filter(t => t.ticketId !== "__COUNTER__");
 }

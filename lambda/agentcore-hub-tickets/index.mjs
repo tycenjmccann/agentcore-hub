@@ -90,6 +90,73 @@ async function loadValidAgents() {
   return VALID_AGENTS;
 }
 
+// TEAM-3686: known workflow phases, for validating the `phase` stamp on
+// fix-kind tickets. completion.mjs's open-fix gate matches fix tickets
+// per-phase (`phaseOf(t) === p` for each required phase p), so a fix ticket
+// stamped with a phase outside the known set is invisible to EVERY required
+// phase's check — the workflow could complete with the fix still open. The
+// valid set is derived from the same S3 configs the orchestrator reads:
+// roster phases from config/agents.json (what getAgentPhase resolves) and
+// each workflow def's agentPhases + completionRequiresAgentPhases from
+// config/workflows.json. Fallback mirrors the orchestrator's FALLBACK_ROSTER.
+const FALLBACK_PHASES = new Set([
+  "requirements",
+  "design",
+  "development",
+  "verification",
+  "review",
+  "ship",
+]);
+
+let VALID_PHASES = null;
+
+async function loadValidPhases() {
+  if (VALID_PHASES) return VALID_PHASES;
+  if (!ARTIFACT_BUCKET) {
+    console.warn("[agentcore-hub-tickets] No ARTIFACT_BUCKET — using fallback phase set");
+    VALID_PHASES = FALLBACK_PHASES;
+    return VALID_PHASES;
+  }
+  const phases = new Set();
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: "config/agents.json",
+    }));
+    const config = JSON.parse(await res.Body.transformToString());
+    for (const a of config.agents || []) {
+      if (typeof a.phase === "string" && a.phase) phases.add(a.phase);
+    }
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] Failed to load agent phases from S3: ${err.message}`);
+  }
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: "config/workflows.json",
+    }));
+    const config = JSON.parse(await res.Body.transformToString());
+    for (const w of config.workflows || []) {
+      for (const p of w.phases || []) {
+        if (typeof p.agentPhase === "string" && p.agentPhase) phases.add(p.agentPhase);
+      }
+      for (const p of w.completionRequiresAgentPhases || []) {
+        if (typeof p === "string" && p) phases.add(p);
+      }
+    }
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] Failed to load workflow phases from S3: ${err.message}`);
+  }
+  if (phases.size === 0) {
+    console.warn("[agentcore-hub-tickets] No phases loaded from S3 — using fallback phase set");
+    VALID_PHASES = FALLBACK_PHASES;
+  } else {
+    VALID_PHASES = phases;
+    console.log(`[agentcore-hub-tickets] Loaded ${phases.size} valid phases from S3 config`);
+  }
+  return VALID_PHASES;
+}
+
 // Valid status transitions
 // Simplified flow: todo → ready → in_progress → done  (+blocked as escape hatch)
 const TRANSITIONS = {
@@ -218,6 +285,23 @@ async function createTicket(args) {
   const spawn = sanitizeSpawnedBy(spawned_by);
   if (spawn.error) return textResult(`Error: ${spawn.error}`);
   const phaseStamp = typeof phase === "string" && phase.trim() ? phase.trim() : undefined;
+
+  // TEAM-3686: a fix-kind ticket's `phase` stamp is trusted FIRST by
+  // completion.mjs's phaseOf(), and its open-fix gate only blocks completion
+  // when the stamp matches a required phase exactly. An unknown phase (e.g.
+  // "zz_nonexistent") therefore bypasses the gate entirely — the run can be
+  // declared complete while the fix is still open. Reject rather than
+  // normalize so the caller learns immediately which phases are legal.
+  if (spawn.value && phaseStamp) {
+    const validPhases = await loadValidPhases();
+    if (!validPhases.has(phaseStamp)) {
+      return textResult(
+        `Error: 'phase' "${phaseStamp}" is not a known workflow phase — a fix ticket ` +
+        `with an unknown phase would be invisible to the completion open-fix gate. ` +
+        `Valid phases: ${[...validPhases].sort().join(", ")}`
+      );
+    }
+  }
 
   // Validate assignee against known agent roster. "human:<who>" assignees are
   // human-review gates — not agents — and are always allowed (the orchestrator

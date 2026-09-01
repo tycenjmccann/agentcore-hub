@@ -41,7 +41,7 @@ import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReviewCap } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets } from "./completion.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -63,6 +63,16 @@ const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "sh
 // (live → nudge only; stale → steal + re-dispatch through the claim CAS) and an
 // in_review gate is re-woken. Any value other than "on"/"true"/"1" stays OFF.
 const CASCADE_EXTENDED_STATES = /^(on|true|1)$/i.test(process.env.CASCADE_EXTENDED_STATES || "");
+// TEAM-3686 Finding 3: deliverable-evidence gate on the orchestrator completion
+// path — same flag, same default-off shadow posture as the HTTP complete route
+// (TEAM-3619 D4a, design §X.5 step 6: "evidence check behind
+// COMPLETION_EVIDENCE_REQUIRED flag (shadow-log first)"). Flag off: the check
+// still runs and shadow-logs what WOULD have been blocked; only an explicit
+// on/true/1 makes it abort completion. Do not flip the default here — the
+// rollout step (TEAM-3690) owns that. No force/bypass parameter either way.
+const COMPLETION_EVIDENCE_REQUIRED = /^(on|true|1)$/i.test(
+  process.env.COMPLETION_EVIDENCE_REQUIRED || ""
+);
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
@@ -577,7 +587,7 @@ async function handleTicketDoneUnified(ticketId) {
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
 
   // Always check workflow completion — the last ticket to close triggers this
-  if (await isWorkflowComplete(parentId, workflow)) {
+  if (await isWorkflowComplete(parentId, workflow, assignee)) {
     await completeWorkflow(workflow);
   }
 }
@@ -1270,7 +1280,7 @@ async function handleTicketDone(ticketId, image) {
 
   // Check if workflow is complete (all tickets done)
   if (unblocked.length === 0) {
-    if (await isWorkflowComplete(parentId, workflow)) {
+    if (await isWorkflowComplete(parentId, workflow, assignee)) {
       await completeWorkflow(workflow);
     }
   }
@@ -1389,7 +1399,41 @@ async function handleTicketReady(ticketId, image) {
 
 // ─── QA Gate ───────────────────────────────────────────────────────────────────
 
-async function isWorkflowComplete(epicId, workflow) {
+// TEAM-3686 Finding 4: completion can race a just-filed fix ticket. The
+// children read behind the completion verdict goes through the eventually-
+// consistent parentId-index GSI (Jira search is likewise lagged), so a
+// reviewer/QA/ship agent that files a fix ticket and then reports its own
+// ticket done can trigger a completion check against a snapshot where the fix
+// isn't visible yet. When the trigger ticket belongs to a kind that spawns
+// fixes (roster phases below, or a human review gate), a passing verdict is
+// re-verified once after a short bounded delay before completion proceeds.
+const FIX_SPAWNING_PHASES = new Set(["verification", "review", "ship"]);
+const COMPLETION_RECHECK_DELAY_MS = 1500;
+
+function mayHaveJustSpawnedFixes(assignee) {
+  if (isHumanAssignee(assignee)) return true;
+  const phase = getAgentDef(assignee)?.phase;
+  return phase !== undefined && FIX_SPAWNING_PHASES.has(phase);
+}
+
+// Exported solely so completion-gates.test.mjs can drive the re-check seam.
+export async function isWorkflowComplete(epicId, workflow, triggerAssignee) {
+  if (!(await evaluateCompletionSnapshot(epicId, workflow))) return false;
+  if (mayHaveJustSpawnedFixes(triggerAssignee)) {
+    await new Promise((r) => setTimeout(r, COMPLETION_RECHECK_DELAY_MS));
+    if (!(await evaluateCompletionSnapshot(epicId, workflow))) {
+      console.warn(
+        `[orchestrator] CompletionRecheckFlipped ${workflow?.id}: verdict after ` +
+          `${triggerAssignee} did not hold on re-read — a just-spawned fix ticket ` +
+          `was invisible to the first snapshot; completion deferred.`
+      );
+      return false;
+    }
+  }
+  return true;
+}
+
+async function evaluateCompletionSnapshot(epicId, workflow) {
   const children = await getChildTickets(epicId);
   if (children.length === 0) return false;
 
@@ -1418,8 +1462,47 @@ async function isWorkflowComplete(epicId, workflow) {
   });
 }
 
-async function completeWorkflow(workflow) {
+// Exported solely so completion-gates.test.mjs can drive the evidence gate.
+export async function completeWorkflow(workflow) {
   if (workflow.phase === "complete") return;
+
+  // TEAM-3686 Finding 3: deliverable-evidence gate — same semantics as the HTTP
+  // complete route (TEAM-3619 D4a). Every done ticket in a completion-required
+  // phase must have real work behind it (non-empty agentTasks output or an
+  // artifact). Flag off → shadow-log the would-block outcome and continue; flag
+  // on → abort completion. Read-only (R2): children via the provider read,
+  // agentTasks via a consistent workflow re-read (the in-memory copy can lag
+  // the webhook's output merge). Mirroring the route, a FAILURE of the check
+  // itself never blocks a legitimate completion — it only tightens when it can
+  // prove a phantom deliverable.
+  try {
+    const wfDef = getWorkflowDef(workflow?.workflowDefId);
+    const requiredPhases = wfDef.completionRequiresAgentPhases || [];
+    if (requiredPhases.length > 0) {
+      const children = await getChildTickets(workflow.epicId);
+      const freshWf = await store.getWorkflow(workflow.id);
+      const missing = missingEvidenceTickets(
+        children,
+        freshWf?.agentTasks || workflow.agentTasks || {},
+        requiredPhases,
+        { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase }
+      );
+      if (missing.length > 0) {
+        const offenders = missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ");
+        if (COMPLETION_EVIDENCE_REQUIRED) {
+          console.error(
+            `[orchestrator] CompletionRejectedMissingEvidence ${workflow.id}: ${offenders}`
+          );
+          return;
+        }
+        console.warn(
+          `[orchestrator] ${workflow.id} would be blocked for missing evidence (flag off): ${offenders}`
+        );
+      }
+    }
+  } catch (err) {
+    console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
+  }
 
   // Atomic completion claim FIRST — only the winner runs the side effects
   // (PR creation, epic roll-up, the workflow.complete event). Previously the

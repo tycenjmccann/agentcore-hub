@@ -59,6 +59,10 @@ export default defineConfig({
       // review cap: escalation short-circuit + the review_fix reopen stamp.
       // index.mjs imported for real with its AWS/store/cap seams mocked.
       "lambda/orchestrator/review-rejection.test.mjs",
+      // completion-gates (TEAM-3686 F3/F4) — the orchestrator's evidence gate
+      // in completeWorkflow and the fix-spawn completion re-check. Same harness
+      // as review-rejection: index.mjs real, AWS/store seams mocked.
+      "lambda/orchestrator/completion-gates.test.mjs",
       // agentcore-hub-tickets create_ticket (TEAM-3619 D4c) — the spawnedBy/phase
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.
