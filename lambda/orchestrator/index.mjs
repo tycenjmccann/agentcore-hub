@@ -40,6 +40,7 @@ import {
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
+import { createReviewCap } from "./review-cap.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -268,6 +269,78 @@ function getCascade() {
     reawakenGate: handleHumanReviewGate,
   });
   return _cascade;
+}
+
+// ─── Review-gate round cap (TEAM-3619 D2c) ───────────────────────────────────
+
+// Bounds the review→rework loop: after `maxRounds` effective rounds the gate is
+// handed to a human instead of re-opening the upstream work yet again. Lazy
+// singleton, same shape as getCascade()/getDetector().
+let _reviewCap = null;
+function getReviewCap() {
+  if (_reviewCap) return _reviewCap;
+  _reviewCap = createReviewCap({
+    store,
+    publishEvent,
+    listReviewers,
+    parkGateForHuman,
+    commentOnGate: addTicketComment,
+    log: (msg) => console.log(`[orchestrator] ${msg}`),
+  });
+  return _reviewCap;
+}
+
+/**
+ * Hand an escalated review gate to a human: owned by `assignee`, parked in
+ * in_review, with the decision instructions on the ticket.
+ *
+ * The gate is the only exit from a capped loop, so the human has to be able to
+ * find it AND to know the syntax that re-authorizes rework — hence the comment,
+ * not just the in-app notification.
+ *
+ * Assignment is provider-limited: DynamoDB mode writes the assignee field for
+ * real, Jira mode cannot (the ticket-tools Lambda's update_ticket only carries
+ * summary/description, and Jira's assignee needs an accountId). In Jira the
+ * ownership therefore lives in the comment + the review_needed notification.
+ */
+async function parkGateForHuman(gateTicketId, assignee, workflow) {
+  if (TICKET_PROVIDER !== "jira") {
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId: gateTicketId },
+      UpdateExpression: "SET #s = :s, #a = :a, #u = :u",
+      ExpressionAttributeNames: { "#s": "status", "#a": "assignee", "#u": "updatedAt" },
+      ExpressionAttributeValues: {
+        ":s": "in_review",
+        ":a": assignee,
+        ":u": new Date().toISOString(),
+      },
+    }));
+  }
+  // Transition (idempotent), notification, review.needed event — the same path
+  // the "ready" flow uses, so the board state is identical to a normal gate.
+  await handleHumanReviewGate(gateTicketId, assignee, workflow);
+}
+
+/**
+ * Post a comment on a ticket via the ticket-tools Lambda. Best-effort: a failed
+ * comment must not fail the escalation that is already recorded and parked.
+ */
+async function addTicketComment(ticketId, comment) {
+  if (TICKET_PROVIDER !== "jira") return false;
+  try {
+    await lambda.send(new InvokeCommand({
+      FunctionName: TICKET_TOOLS_LAMBDA,
+      Payload: JSON.stringify({
+        tool_name: "Tickets___add_comment",
+        parameters: { ticket_id: ticketId, comment },
+      }),
+    }));
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] addTicketComment(${ticketId}) failed: ${err.message}`);
+    return false;
+  }
 }
 
 // ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
@@ -677,6 +750,38 @@ async function handleReviewRejection(gateTicket) {
     gateTicket.reviewComment ||
     (gateTicket.comments || []).slice(-1)[0]?.content ||
     "Reviewer requested changes.";
+
+  // Convergence cap (TEAM-3619 D2c) — BEFORE any rework side effect. Records
+  // this rejection as a review round and, once the gate's effective round count
+  // reaches its `maxRounds`, hands the gate to a human and stops the loop here:
+  // no resume contexts, no re-open, no further automatic cycles. A human's own
+  // transition still works (approving the gate continues the flow; an explicit
+  // `DECISION: continue` in a later rejection re-authorizes rework), so this
+  // suppresses only the AUTOMATIC re-open.
+  //
+  // reviewedHeadSha is best-effort: the orchestrator doesn't track the PR head,
+  // so it is normally absent and every rejection is therefore its own round.
+  // When a provider does carry it, re-reviewing the same SHA reuses that round.
+  const capResult = await getReviewCap().enforce({
+    workflow,
+    gateTicket,
+    gateCfg: gateCfg ? { ...gateCfg, afterPhase: gateCfg.afterPhase ?? gatePhase } : gateCfg,
+    upstreamIds: upstream.map((up) => up.ticketId),
+    feedback,
+    reviewedHeadSha: gateTicket.reviewedHeadSha || gateTicket.metadata?.headSha || null,
+  });
+  if (capResult.escalated) {
+    await publishEvent(gateTicket.ticketId, "review.rejected", {
+      ticketId: gateTicket.ticketId,
+      onReject,
+      reopened: [],
+      workflowId: workflow.id,
+      capReached: true,
+      effectiveRounds: capResult.effectiveRounds,
+      maxRounds: capResult.maxRounds,
+    });
+    return;
+  }
 
   // Persist each ticket's feedback atomically (per-key, no full-row put) BEFORE
   // reopening, so a fast re-invocation always finds its resume context.

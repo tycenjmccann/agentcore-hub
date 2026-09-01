@@ -46,6 +46,11 @@ export default defineConfig({
       // publisher + fake clock), so the union + extended-state logic is
       // unit-testable with no AWS.
       "lambda/orchestrator/cascade.test.mjs",
+      // review-cap.mjs (TEAM-3619 D2c) — the review→rework round cap. Same DI
+      // shape as the cascade (stub store/event publisher/roster + fake clock).
+      // Its ship-review.mjs arithmetic port is pinned against the TS original by
+      // the auto-included src/lib/workflow/ship-review-parity.test.ts.
+      "lambda/orchestrator/review-cap.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

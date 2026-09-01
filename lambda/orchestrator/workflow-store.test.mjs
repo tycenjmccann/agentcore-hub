@@ -14,6 +14,9 @@ import {
   appendNotification,
   ackNotifications,
   completeWorkflow,
+  appendReviewRound,
+  appendReviewCapEscalation,
+  appendReviewAuthorization,
 } from "./workflow-store.mjs";
 
 /**
@@ -268,5 +271,62 @@ describe("completeWorkflow", () => {
   it("returns false for the losing concurrent completion", async () => {
     failNextCondition = true;
     expect(await completeWorkflow("wf_1", "x")).toBe(false);
+  });
+});
+
+describe("review gate ledger (TEAM-3619 D2c)", () => {
+  const round = { round: 1, verdict: "CHANGES-NEEDED", findings: [] };
+
+  it("seeds the map and the per-gate entry with if_not_exists, then list_appends the round", async () => {
+    await appendReviewRound("wf_1", "TEAM-900", round);
+    const w = writes();
+    expect(w[0].input.UpdateExpression).toContain("if_not_exists(reviewGateHistory, :empty)");
+    expect(w[1].input.UpdateExpression).toBe(
+      "SET reviewGateHistory.#g = if_not_exists(reviewGateHistory.#g, :seed)"
+    );
+    expect(w[1].input.ExpressionAttributeValues[":seed"]).toEqual({
+      rounds: [], authorizations: [], escalations: [],
+    });
+    expect(w[1].input.ExpressionAttributeNames["#g"]).toBe("TEAM-900");
+    // A lost round is a cap that trips late — append, never rewrite the array.
+    expect(w[2].input.UpdateExpression).toBe(
+      "SET reviewGateHistory.#g.rounds = list_append(if_not_exists(reviewGateHistory.#g.rounds, :empty), :r)"
+    );
+    expect(w[2].input.ExpressionAttributeValues[":r"]).toEqual([round]);
+  });
+
+  it("returns the POST-write ledger so the caller counts a concurrent cycle's round too", async () => {
+    const ledger = { rounds: [round], authorizations: [], escalations: [] };
+    initWorkflowStore(
+      {
+        async send(cmd) {
+          sent.push({ type: cmd.constructor.name, input: cmd.input });
+          return cmd.input.ReturnValues === "ALL_NEW"
+            ? { Attributes: { workflowId: "wf_1", reviewGateHistory: { "TEAM-900": ledger } } }
+            : {};
+        },
+      },
+      "workflows-test"
+    );
+    expect(await appendReviewRound("wf_1", "TEAM-900", round)).toEqual(ledger);
+    expect(writes()[2].input.ReturnValues).toBe("ALL_NEW");
+  });
+
+  it("returns null when the row is gone rather than inventing an empty ledger", async () => {
+    // The stub returns {} (no Attributes) — a caller must not read that as
+    // "zero rounds so far", which would silently reset the cap.
+    expect(await appendReviewRound("wf_1", "TEAM-900", round)).toBeNull();
+  });
+
+  it("append-onlys escalations and authorizations under the same gate key", async () => {
+    await appendReviewCapEscalation("wf_1", "TEAM-900", { escalatedAtRound: 3, decision: null });
+    expect(writes()[2].input.UpdateExpression).toBe(
+      "SET reviewGateHistory.#g.escalations = list_append(if_not_exists(reviewGateHistory.#g.escalations, :empty), :e)"
+    );
+    sent.length = 0;
+    await appendReviewAuthorization("wf_1", "TEAM-900", { decision: "continue", resetAtRound: 3 });
+    expect(writes()[2].input.UpdateExpression).toBe(
+      "SET reviewGateHistory.#g.authorizations = list_append(if_not_exists(reviewGateHistory.#g.authorizations, :empty), :a)"
+    );
   });
 });
