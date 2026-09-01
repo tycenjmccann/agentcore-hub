@@ -97,15 +97,29 @@ Fold their findings in at their severity. None configured → skip silently.
 ### Step 4: Verdict — diff-scoped, with convergence accounting
 **DIFF-SCOPED GATE: any finding whose cited files are ALL within the PR change set (the --name-status file list from Step 1's diff) = CHANGES NEEDED, at any severity. A finding citing any file OUTSIDE the change set is ADVISORY: file it as a backlog ticket labelled "advisory" (one per finding group, assigned to the owning dev, NOT blocked_by-chained into this run) and do not count it toward the verdict. Never let an advisory finding flip PASS to CHANGES NEEDED.**
 
-This rule is now ALSO enforced deterministically, not just by your compliance
-with this prose: `enforceDiffScope` in `src/lib/workflow/ship-review.ts` (and its
-`lambda/orchestrator/ship-review.mjs` twin) reclassifies findings against the
-recorded change set and DOWNGRADES any out-of-diff blocking finding to advisory —
-so a round can never present CHANGES-NEEDED unless at least one finding is
-genuinely in-diff, regardless of what a finding's prose classification says. For
-that guard to have its input you MUST record the change set on the round entry
-(see step 1 below, `changeSet`); without it the guard is inert and only this prose
-governs. Record it accurately and let the two agree.
+This rule is backed by a deterministic function, not only by your compliance with
+this prose: `enforceDiffScope` in `src/lib/workflow/ship-review.ts` (and its
+`lambda/orchestrator/ship-review.mjs` twin) reclassifies a round's findings and
+DOWNGRADES any out-of-diff blocking finding to advisory — so a round can never
+present CHANGES-NEEDED unless at least one finding is genuinely in-diff, whatever
+a finding's prose classification says. It reads exactly two things: each finding's
+`citedFiles` (the files it cites; `files` is accepted as an alias) and the
+`changeSet` (the `--name-status` file list); a finding is IN-DIFF only if EVERY
+file it cites is in that change set (renames counting as both paths).
+
+Where it runs today: the orchestrator's rework-loop cap (`enforce` in
+`lambda/orchestrator/review-cap.mjs`) calls `enforceDiffScope` to decide whether a
+rejection actually gates — but it reads the change set and the classified findings
+off the GATE TICKET (`gateTicket.changeSet` + `gateTicket.reviewFindings`), NOT off
+this S3 ledger. Nothing populates those two gate-ticket fields yet, so that guard
+is currently DORMANT: a deliberate flag-off rollout where absent inputs make
+`enforce` byte-identical to its pre-guard behavior. It activates only once the gate
+plumbing forwards the change set and the classified findings onto the gate ticket.
+Until then this prose — plus the `changeSet` and per-finding `citedFiles` you
+record on the round entry (step 1 below) — is what governs the verdict. Record
+them accurately with the SAME field names so the ledger is already correct for when
+the deterministic layer is switched on, and so `effectiveRoundCount`'s IN-DIFF
+regression accounting (step 2) lines up with your classification.
 
 Classify EVERY finding before you count anything:
 - **IN-DIFF** — every file it cites is on the change set recorded in Step 2.
@@ -142,8 +156,9 @@ missing = empty state, round 1):
    regression check (omit the key entirely on non-regressions — do NOT write
    `regressionOf: null`), and `changeSet` — the exact `--name-status` file list
    from Step 2 (renames as BOTH paths; a raw name-status line or a bare path both
-   parse). `changeSet` is what `enforceDiffScope` scopes the verdict against, so
-   a round without it is NOT deterministically guarded — always record it.
+   parse). `changeSet` and each finding's `citedFiles` are the exact fields
+   `enforceDiffScope` reads (see Step 4's note on where that guard runs today), so
+   record them on every round — a round without them can never be diff-scoped.
 2. **Compute the effective round count** over the rounds AFTER the latest human
    `continue` authorization (`resetAtRound`): each round whose verdict is
    `CHANGES-NEEDED` contributes +1, or +2 when `regressionCountsDouble` is on

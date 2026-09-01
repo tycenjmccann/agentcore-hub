@@ -1,13 +1,16 @@
 /**
- * Ship-review convergence arithmetic — the orchestrator (Lambda) port of
- * src/lib/workflow/ship-review.ts.
+ * Ship-review convergence arithmetic AND the diff-scoped gate — the orchestrator
+ * (Lambda) port of src/lib/workflow/ship-review.ts.
  *
- * TEAM-3619 D2c. The orchestrator is plain .mjs with no build step, so it
- * cannot import the TS module the web app and the blueprint contract share.
- * This is a HAND PORT and must agree with the TS original bit-for-bit — a
- * drift means the orchestrator's cap enforcement and the release manager's own
- * round accounting disagree about when the loop is over, which is exactly the
- * runaway-rework bug the cap closes.
+ * TEAM-3619 D2c (convergence cap) + TEAM-3689 (`enforceDiffScope` /
+ * `diffScopeRounds` / `effectiveRoundCountDiffScoped`, the deterministic form of
+ * release-manager.md Step 4's DIFF-SCOPED GATE). The orchestrator is plain .mjs
+ * with no build step, so it cannot import the TS module the web app and the
+ * blueprint contract share. This is a HAND PORT and must agree with the TS
+ * original bit-for-bit — a drift means the orchestrator's cap enforcement and
+ * diff-scope classification disagree with the release manager's own round
+ * accounting about when the loop is over and which findings gate, which is
+ * exactly the runaway-rework bug the cap closes.
  *
  * Same hand-port pattern (and same obligation) as lease.mjs ↔ lease.ts from
  * TEAM-3618; parity is asserted by src/lib/workflow/ship-review-parity.test.ts,
