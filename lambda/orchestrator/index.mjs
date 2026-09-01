@@ -629,8 +629,8 @@ async function handleReviewRejection(gateTicket) {
     const priorSession = await findCodingSession(workflow.id, up.assignee);
     const sessionHint = priorSession
       ? `\n\nYour previous coding session for this work: ${priorSession}. ` +
-        `You MAY pass it as resume_session on your first claude_code/codex call to continue that ` +
-        `conversation with its context intact — or omit it to start fresh. Resume is best-effort.`
+        `DEFAULT: pass it as resume_session on your first claude_code/codex/kiro call — it continues that ` +
+        `conversation with its context intact. Start fresh only if the feedback demands a restart. Resume is best-effort.`
       : "";
     const resumeNote = `## Review feedback (changes requested)\n${feedback}\n\nAddress this feedback and redo your work.${sessionHint}`;
     await store.setResumeContext(workflow.id, up.ticketId, resumeNote);
@@ -1484,6 +1484,25 @@ async function buildAgentContext(ticket, workflow) {
     context += `Dev agents: resume it and continue the work in place. `;
     context += `Review/QA: verify the branch independently — do NOT resume the dev conversation; inspect the code and run your own checks.\n\n`;
   }
+
+  // This agent's OWN prior coding session in this workflow (fix tickets,
+  // re-reviews, serially-chained tickets). Default = resume: the conversation
+  // already holds the repo context, findings, and decisions — rebuilding it
+  // from scratch every loop burns tokens and loses what the agent knew.
+  // findCodingSession is per (workflow, agentId), so a reviewer only ever gets
+  // its own review session back, never the dev's conversation.
+  try {
+    const priorSession = await findCodingSession(workflow.id, ticket.assignee);
+    if (priorSession) {
+      context += `## Prior Coding Session (resume by DEFAULT)\n`;
+      context += `You already have a coding session in this workflow: ${priorSession}\n`;
+      context += `Pass resume_session="${priorSession}" on your FIRST claude_code/codex/kiro call — it restores YOUR prior conversation and workspace (the code you wrote or reviewed, your findings, your decisions) instead of rebuilding that context from scratch.\n`;
+      context += `- Fix ticket from review/QA: ALWAYS resume — you are continuing the same work.\n`;
+      context += `- Re-review / re-verify after fixes: resume — you know what you found; verify it was fixed.\n`;
+      context += `- Start fresh ONLY if the ticket explicitly calls for a clean-slate redo of a rejected approach.\n`;
+      context += `Resume is best-effort: if the session is gone you start fresh automatically. This supersedes any Ported Session instruction above — your own session already contains it.\n\n`;
+    }
+  } catch { /* hint is optional */ }
 
   // For the intake agent only: provide the valid agent roster (registry data),
   // scoped to agents belonging to this workflow definition.

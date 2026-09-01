@@ -14,6 +14,18 @@ same model that wrote it. Use `codex` by default for every step below. Only if
 `claude_code` — same contract, same commands. Either way it provides real
 command output as evidence.
 
+## Re-review (check FIRST)
+If your context includes a `## Prior Coding Session` block, this is a RE-REVIEW:
+you already reviewed this diff, filed fix tickets, and the fixes are now in.
+Pass that id as `resume_session=` on your FIRST `codex`/`claude_code` call —
+the session already holds the diff you read, every finding you filed, and every
+refutation the devs posted. Re-review = pull latest base_branch in that same
+workspace, verify each of YOUR findings is fixed (or its refutation holds), and
+review the NEW fix commits with the same rigor as the original diff. Do NOT
+re-review the whole diff from scratch in a cold session — that is how findings
+get re-litigated and re-discovered at full token cost. Start fresh ONLY if the
+session is gone (resume is best-effort).
+
 ## Process
 
 ### Step 1: Find the branch (same as QA)

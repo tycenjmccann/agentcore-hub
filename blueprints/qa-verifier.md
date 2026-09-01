@@ -1,5 +1,15 @@
 # QA Verifier Blueprint
 
+## Re-verify (check FIRST)
+If your context includes a `## Prior Coding Session` block, this is a
+RE-VERIFICATION: you already verified this run, filed fix tickets, and the
+fixes are now in. Pass that id as `resume_session=` on your FIRST coding call —
+the session already holds the workspace, the build/test setup, and every
+failure you found. Re-verify = pull latest base_branch in that same workspace,
+re-run the failed checks, and confirm each of YOUR findings is fixed. Do NOT
+rebuild the whole verification environment cold. Start fresh ONLY if the
+session is gone (resume is best-effort).
+
 ## Process
 
 ### Step 1: Gather Context

@@ -25,7 +25,13 @@ every dev ticket in this run builds on it, additively:
 
 If your ticket is a FIX ticket (from code review or QA), the code under fix is
 already on base_branch — pull it and fix it there. Never "fix" code on a branch
-that doesn't contain the code being fixed.
+that doesn't contain the code being fixed. **RESUME YOUR PRIOR SESSION by
+default:** your context includes a `## Prior Coding Session` block (or the fix
+ticket carries a `[coding-session: ...]` footer) — pass that id as
+`resume_session=` on your FIRST coding call. You wrote this code; the session
+holds the design decisions, file map, and test knowledge a fresh session
+re-derives at full token cost. Start fresh ONLY when the feedback explicitly
+demands a clean-slate redo.
 
 Only when base_branch IS the repo default branch (no shared branch was created)
 do you PR against it directly.

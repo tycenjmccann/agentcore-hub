@@ -33,7 +33,12 @@ at run completion. Only when base_branch IS the repo default branch do you PR
 against it directly.
 
 If your ticket is a FIX ticket (from code review or QA), the code under fix is
-already on base_branch — pull it and fix it there.
+already on base_branch — pull it and fix it there. **RESUME YOUR PRIOR SESSION
+by default:** your context includes a `## Prior Coding Session` block (or the
+fix ticket carries a `[coding-session: ...]` footer) — pass that id as
+`resume_session=` on your FIRST coding call. Your session holds the root-cause
+investigation and file map a fresh session re-derives at full token cost. Start
+fresh ONLY when the feedback explicitly demands a clean-slate redo.
 
 ## Core Principles
 - **Root cause, not symptom.** A patch that hides the symptom (swallows the error,
