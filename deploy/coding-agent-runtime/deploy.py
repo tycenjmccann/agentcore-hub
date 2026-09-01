@@ -195,6 +195,16 @@ def main() -> None:
     # GitHub auth for private repo clone/push (launchers configure git from it).
     if gh_pat := os.environ.get("GITHUB_PAT"):
         env_vars["GITHUB_PAT"] = gh_pat
+    # Kiro is bring-your-own-key only (no Bedrock fallback). Unlike Claude/Codex,
+    # there is no per-user upload path in the hub — the runtime carries ONE shared
+    # access key on its env (mirrors GITHUB_PAT). Without it, `kiro` is installed
+    # but every turn fails fast with a clear "KIRO_API_KEY not set" error.
+    if kiro_key := os.environ.get("KIRO_API_KEY"):
+        env_vars["KIRO_API_KEY"] = kiro_key
+    # "auto" = kiro's server-side model routing (its differentiator vs pinned
+    # Claude/Codex models). Override with KIRO_MODEL to pin a specific model.
+    env_vars["KIRO_MODEL"] = os.environ.get("KIRO_MODEL", "auto")
+    env_vars["KIRO_HOME"] = f"{EFS_MOUNT}/.kiro-data"
 
     print("=" * 63)
     print(f"  Deploying {RUNTIME_NAME}")

@@ -1,0 +1,1 @@
+The Agents tab. Auto-discovered. Anything in your AgentCore account shows up here — harnesses, runtimes, the lot. Status, tools, sessions, token spend, last activity. No registration step. No config file. If AWS knows about it, Hub knows about it.

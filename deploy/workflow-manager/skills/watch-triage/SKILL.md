@@ -75,7 +75,6 @@ python3 /mnt/workspace/toolkit/intervene.py dispatch  <wfId> <ticketId> --note "
 python3 /mnt/workspace/toolkit/intervene.py comment   <wfId> <ticketId> "observation"
 python3 /mnt/workspace/toolkit/intervene.py complete  <wfId> --reason "why"
 python3 /mnt/workspace/toolkit/intervene.py escalate  <wfId> "what a human must decide"
-python3 /mnt/workspace/toolkit/intervene.py mute      <wfId> --note "why"
 ```
 
 1. **Silent agent that already did the work (deliverable shipped)?** →
@@ -95,19 +94,21 @@ python3 /mnt/workspace/toolkit/intervene.py mute      <wfId> --note "why"
    REFUSES in code unless every child is done, so you cannot fake it; trust
    a 409.
 5. **Genuinely blocked on a human decision** (ambiguous requirements, a real
-   choice only a person can make)? → `escalate` ONCE with the specific
-   decision needed. A LAST resort, not a reflex — you resolve stuck agents
-   yourself via `mark-done`/`retry`; you do not page a human to read logs.
-6. **Truly nothing actionable and already escalated?** → `mute` (circuit
-   breaker) so it stops paging. Do not re-escalate the same thing.
+   choice only a person can make), or nothing agent-side is actionable
+   (crash-loop with retries exhausted, systemic infra fault)? → `escalate`
+   ONCE with the specific decision or fact the human needs. A LAST resort,
+   not a reflex — you resolve stuck agents yourself via `mark-done`/`retry`;
+   you do not page a human to read logs. An open escalation IS a human gate:
+   the human gets a Telegram ping, and the watch scheduler skips this run
+   until they resolve it — so you will not be re-invoked on it, and there is
+   nothing further to silence.
 
 ## Rules (some also enforced in code — do not attempt workarounds)
 
 - Never touch `in_review` tickets or any ticket assigned `human:*`.
 - `cancel` and `start` are for explicit user requests ONLY (see the
   `run-control` skill) — never use them autonomously in WATCH. A stuck run
-  gets dispatched, completed, escalated, or muted; not cancelled on your
-  judgment.
+  gets dispatched, completed, or escalated; not cancelled on your judgment.
 - `complete`/`dispatch`/`retry` are real management actions — USE them when
   the situation fits. Your job is to manage to completion; the code gates
   prevent dishonest closes.
@@ -117,8 +118,10 @@ python3 /mnt/workspace/toolkit/intervene.py mute      <wfId> --note "why"
 - `mark-done` REQUIRES `--evidence` naming the shipped deliverable — the tool
   refuses without it. No proof = not done = `retry`.
 - A slow agent still streaming is not a dead agent — give it time.
-- `escalate` is idempotent in code. It does NOT auto-stop — YOU decide when a
-  run is dead and `mute` it.
+- `escalate` is idempotent in code, pages the human via Telegram, and parks
+  the run as a human gate (the watchdog skips it until the human resolves).
+  Escalating is how you hand off a run you cannot move — never fake
+  completion and never stop watching by any other means.
 - One decisive intervention pass per invocation: diagnose → act → report →
   stop.
 

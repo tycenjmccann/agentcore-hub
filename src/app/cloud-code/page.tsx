@@ -5,7 +5,7 @@ import { Plus, Cloud, Send, Trash2, GitBranch, Loader2, Radio, MessageSquare, Te
 import dynamic from "next/dynamic";
 import { sseData } from "@/lib/sse";
 import { MarkdownRenderer } from "@/components/workflow/MarkdownRenderer";
-import { CliBadge, CliMark, CLI_BRAND } from "@/components/cloud-code/CliBrand";
+import { CliBadge, CliMark, brandOf } from "@/components/cloud-code/CliBrand";
 
 // xterm touches the DOM/window — load only in the browser.
 const ShellTerminal = dynamic(() => import("@/components/cloud-code/ShellTerminal"), { ssr: false });
@@ -972,9 +972,9 @@ export default function CloudCodePage() {
                   // Agent turns: no bubble — full content width (esp. on mobile),
                   // just a brand label above. Matches ChatGPT/Claude's UI.
                   <div key={i} data-testid="cc-agent-turn" className="self-stretch w-full">
-                    <div className={`flex items-center gap-1 text-[10.5px] font-semibold mb-1.5 ${CLI_BRAND[active.cli].dot}`}>
+                    <div className={`flex items-center gap-1 text-[10.5px] font-semibold mb-1.5 ${brandOf(active.cli).dot}`}>
                       <CliMark cli={active.cli} className="w-3 h-3" />
-                      <span className="tracking-wide">{CLI_BRAND[active.cli].label}</span>
+                      <span className="tracking-wide">{brandOf(active.cli).label}</span>
                     </div>
                     <div className="text-sm leading-relaxed">
                       <MarkdownRenderer content={t.text} />
@@ -1162,7 +1162,7 @@ function NewSessionModal({
 
         <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1.5">Agent</label>
         <div className="flex gap-2 mb-4">
-          {(["claude", "codex"] as CloudCodeCli[]).map((c) => (
+          {(["claude", "codex", "kiro"] as CloudCodeCli[]).map((c) => (
             <button
               key={c}
               onClick={() => setCli(c)}
@@ -1173,7 +1173,7 @@ function NewSessionModal({
                   : "border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)]"
               }`}
             >
-              {c === "claude" ? "Claude Code" : "Codex (GPT-5.5)"}
+              {c === "claude" ? "Claude Code" : c === "codex" ? "Codex (GPT-5.5)" : "Kiro"}
             </button>
           ))}
         </div>

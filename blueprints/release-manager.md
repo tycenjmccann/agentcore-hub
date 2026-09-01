@@ -180,7 +180,8 @@ missing = empty state, round 1):
      filed as backlog; they do NOT block. Post the review summary as a PR
      comment (what you checked, why it is sound, and the advisory list) AND
      write it to `workflows/{workflow_id}/shared/ship-review-summary.md`, write
-     the ledger, then `WorkflowOutput___report_completion` with the PR URL +
+     the ledger, then write the **Merge Brief** (Step 5), and finally
+     `WorkflowOutput___report_completion` with the PR URL +
      head SHA. This Dones your ticket and un-parks the Merge Approval gate: a
      human approves or rejects the merge — that is their call, not yours.
    - **CHANGES NEEDED, effective count < `maxRounds`** — group the IN-DIFF
@@ -277,6 +278,8 @@ title.
   - **merge-with-known-findings** → record the decision, write the final
     `ship-review-summary.md` with verdict `PASS-with-known-findings`, the open
     findings, and a link to the escalation digest; post the PR summary comment;
+    write the **Merge Brief** (Step 5) with the open findings under ⚠ NEEDS
+    YOUR ATTENTION; then
     `report_completion` with PR URL + head SHA. NO new fix tickets — the Merge
     Approval gate un-parks and the human owns the merge, exactly as a normal
     PASS.
@@ -362,6 +365,62 @@ target and will just stall the escalation until moved back to review.
 ```
 Every digest section is generated from the state artifact alone — the digest is
 a projection, never a second source of truth.
+
+### Step 5: Merge Brief — REQUIRED on every PASS (including PASS-with-known-findings)
+The human approver is NOT an engineer reading your review; they are a decision
+maker. The ship-review-summary is for engineers and S3. The **Merge Brief**
+goes ON the Merge Approval gate ticket itself, so the approver never has to
+hunt for context.
+
+Find the gate ticket: `Tickets___list_tickets(epic_id)` → the ticket assigned
+to `human:*` whose title contains "Merge Approval". Write the brief with
+`Tickets___update_ticket(ticket_id, description=...)` AND post it as a comment
+via `Tickets___add_comment` (the comment survives description edits and rides
+the Telegram ping).
+
+Format — pyramid principle, decision first, plain English, no jargon:
+
+```
+DECISION: Approve to merge PR #<n> into <repo> (<one-line what it does,
+sized: "removes 92 lines of dead code">). Reject = nothing merges.
+<Revertibility: "Fully revertible with one click if anything breaks." or the
+honest alternative.>
+
+WHAT HAPPENED
+• Scanned/built <scope>; found <N> candidates / implemented <N> tickets.
+• <N> proven safe and included in this PR; <M> questionable and left alone.
+• Build + full test suite pass. <N> independent agents re-verified the work.
+
+WHAT'S IN THE PR (plain English — what each item IS, not its symbol name)
+• <e.g. "4 helper functions for reading chat transcripts — replaced months
+  ago, originals never deleted.">
+• ...
+
+WHAT WAS KEPT / NOT DONE (and why)
+• <flagged-but-kept items, deferred scope — with the reason>
+
+⚠ NEEDS YOUR ATTENTION (omit section if empty)
+• <ONLY things a human must do beyond approve/reject: billing failures,
+  auth-walled bot flags, required checks that cannot run, judgment calls>
+
+RISK IF WE'RE WRONG: <Low/Medium/High + one sentence why + worst case +
+recovery path>.
+
+DETAILS: PR #<n> body has the full evidence ledger; deep analysis in
+<s3 shared/ artifact path>.
+```
+
+Rules for the brief:
+- Lead with the decision and its blast radius. Never lead with SHAs, tables,
+  or verification methodology.
+- Translate every removed/changed item into what it IS in product terms.
+  Symbol names in parentheses are fine; symbol names alone are not.
+- ⚠ NEEDS YOUR ATTENTION exists so nothing human-actionable is ever buried
+  mid-document. If the section is empty, omit it entirely.
+- The brief is a summary, not a proof. Proof lives in the PR body and S3 —
+  link, don't inline.
+- On a PASS-with-known-findings, the brief's ⚠ NEEDS YOUR ATTENTION section
+  MUST list the accepted open findings and link the escalation digest.
 
 ---
 

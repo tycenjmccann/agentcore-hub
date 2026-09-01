@@ -104,6 +104,17 @@ async function dispatchJira(ticketKey: string, epicId: string | undefined, workf
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketKey} is in review — human-owned` };
   }
   await releaseInvocationClaim(workflowId, ticketKey, force);
+  // The orchestrator's invoke is EDGE-triggered: processStatusChange bails on
+  // `newStatus === oldStatus`. A ticket already resting in Ready (e.g. a review
+  // "changes requested" reopen that never got re-invoked) is a dead zone — a
+  // plain transition→"Ready" is a Ready→Ready self-loop on boards that allow it,
+  // which fires a webhook the orchestrator drops. Hop out-and-back so Jira emits
+  // a real To Do→Ready edge that actually re-invokes the agent.
+  if (internal === "ready") {
+    await jira.transitionIssue(ticketKey, "To Do");
+    await jira.transitionIssue(ticketKey, "Ready");
+    return { ticketsScanned: 1, nudged: [`${ticketKey} (dispatch: ready→todo→ready re-edge)`] };
+  }
   await jira.transitionIssue(ticketKey, "Ready");
   return { ticketsScanned: 1, nudged: [`${ticketKey} (dispatch→ready)`] };
 }

@@ -1,0 +1,1 @@
+Need a new agent? Don't write boto3. Tell the Builder what you want. It generates the harness configuration live, on the right. Tools, model, system prompt, memory wiring — all materialised as you chat. When it looks right, hit Deploy. The new agent lands on the dashboard about thirty seconds later. Bedrock, building Bedrock.

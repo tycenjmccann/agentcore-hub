@@ -7,8 +7,8 @@ description: Cancel, restart, or start workflow runs on an explicit user request
 
 These are explicit user instructions, so act on them. But `cancel` and `start`
 are CHAT-mode tools for user requests ONLY — never use them autonomously in
-WATCH mode. A stuck run gets dispatched, completed, escalated, or muted; it
-does not get cancelled on your judgment.
+WATCH mode. A stuck run gets dispatched, completed, or escalated; it does not
+get cancelled on your judgment.
 
 ## Cancel ("kill that run")
 

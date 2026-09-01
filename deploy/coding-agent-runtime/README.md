@@ -1,4 +1,4 @@
-# Coding Agent Runtime (resumable Claude Code + Codex)
+# Coding Agent Runtime (resumable Claude Code + Codex + Kiro)
 
 A dedicated Amazon Bedrock AgentCore Runtime that hosts coding CLIs server-side
 with a **persistent per-repo workspace** (`/mnt/workspace`) and **OTel →
@@ -44,7 +44,7 @@ resume = same runtimeSessionId  → same warm microVM + /mnt/workspace
 |---|---|
 | `main.py` | Resumable `/invocations` FastAPI server + `/ping` health (HealthyBusy while a CLI runs) |
 | `run-codex.sh` | Codex launcher — routes GPT-5.5 through Bedrock Mantle (no OpenAI key) |
-| `Dockerfile` | ARM64 image: git, Node/npx, **uv/uvx**, pip, **headless chromium**, Claude Code, Codex, otelcol-contrib. Carries the MCP launchers (not specific servers) so a user's synced servers self-install |
+| `Dockerfile` | ARM64 image: git, Node/npx, **uv/uvx**, pip, **headless chromium**, Claude Code, Codex, **Kiro CLI**, otelcol-contrib. Carries the MCP launchers (not specific servers) so a user's synced servers self-install |
 | `otel-collector-config.yaml` | SigV4 OTLP → CloudWatch `aws/spans` |
 | `setup-coding-runtime-role.sh` | IAM execution role (Bedrock + Mantle + ECR + observability) |
 | `build-and-push.sh` | Build/push ARM64 image to ECR (account/region from `config.sh`) |
@@ -80,6 +80,9 @@ python3 deploy/coding-agent-runtime/invoke.py \
 
 # Codex (GPT-5.5 via Bedrock Mantle) instead of Claude:
 python3 deploy/coding-agent-runtime/invoke.py --cli codex --repo owner/name "..."
+
+# Kiro (bring-your-own-key — requires KIRO_API_KEY on the runtime, no Bedrock fallback):
+python3 deploy/coding-agent-runtime/invoke.py --cli kiro --repo owner/name "..."
 ```
 
 ## Payload contract
@@ -90,7 +93,7 @@ python3 deploy/coding-agent-runtime/invoke.py --cli codex --repo owner/name "...
 |---|---|---|
 | `prompt` | yes* | The task / message for this turn (*not required when `warm` or `checkpoint`) |
 | `repo` | no | `owner/name` or clone URL. Cloned on first turn; recovered from the session map on resume |
-| `cli` | no | `claude` (default) or `codex` |
+| `cli` | no | `claude` (default), `codex`, or `kiro` |
 | `claude_session_id` | no | From a prior turn's response → resumes that Claude Code conversation |
 | `session_id` | no | runtimeSessionId — isolates this session's checkout under `/mnt/efs/sessions/<id>` |
 | `stream` | no | `true` → SSE token stream (claude only) |
@@ -129,6 +132,17 @@ server returns a `StreamingResponse` of `data:` frames (`{type:text|done|error}`
 that AgentCore forwards through `InvokeAgentRuntime` (accept `text/event-stream`).
 The Next.js chat consumes it via the shared SSE reader. See
 [docs/streaming-sse.md](../../docs/streaming-sse.md). Codex stays buffered.
+
+## Kiro notes
+- **Auth is bring-your-own-key ONLY** — set `KIRO_API_KEY` (ksk_… from kiro.dev) in
+  `.env.local` before `deploy.py`; there is no Bedrock fallback, and without the key
+  every kiro turn fails fast with "KIRO_API_KEY not set".
+- **Model:** `KIRO_MODEL` defaults to `auto` (kiro's server-side routing). Set a
+  specific model id to pin.
+- **Resume:** full conversation resume via `kiro-cli chat --resume-id` — the returned
+  `claude_session_id` field carries the kiro conversation uuid (CLI-agnostic handle).
+- **Billing:** kiro meters credits, not tokens. The per-turn credits footer is parsed
+  into structured `coding_usage` log records for the cost-report Lambda.
 
 ## Known gaps / next
 - **Codex resume:** each Codex turn is independent (no `--resume` wired) — Claude has full resume.

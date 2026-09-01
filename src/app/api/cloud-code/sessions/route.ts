@@ -36,7 +36,8 @@ export async function POST(request: NextRequest) {
   try {
     const { userId, tenantId } = getIdentity(request);
     const body = await request.json().catch(() => ({}));
-    const cli: CloudCodeCli = body.cli === "codex" ? "codex" : "claude";
+    const cli: CloudCodeCli =
+      body.cli === "codex" ? "codex" : body.cli === "kiro" ? "kiro" : "claude";
     const repo: string | undefined = body.repo?.trim() || undefined;
     const title: string = (body.title?.trim() || "New session").slice(0, 120);
 

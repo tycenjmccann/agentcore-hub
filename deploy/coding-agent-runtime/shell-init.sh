@@ -69,6 +69,17 @@ PY
 }
 codextoken
 
+# ── Kiro → the shared access key (no Bedrock; bring-your-own-key only) ──
+# The runtime carries ONE KIRO_API_KEY on its env (exported to .runtime-env.sh),
+# so bare `kiro-cli chat` runs without a login. KIRO_HOME points at the SQLite
+# session store; XDG_DATA_HOME must match it (kiro's DB follows $XDG_DATA_HOME).
+export KIRO_HOME="${KIRO_HOME:-$WORKSPACE_ROOT/.kiro-data}"
+export XDG_DATA_HOME="$KIRO_HOME"
+mkdir -p "$KIRO_HOME" 2>/dev/null || true
+if [ -n "${KIRO_API_KEY:-}" ]; then
+  _KIRO_STATUS=" · 'kiro' (your access key)"
+fi
+
 # ── GitHub CLI / git → authenticated via the PAT (no `gh auth login`) ──
 if [ -n "${GITHUB_PAT:-}" ]; then
   export GH_TOKEN="$GITHUB_PAT"
@@ -78,7 +89,7 @@ if [ -n "${GITHUB_PAT:-}" ]; then
 fi
 
 if [ -t 1 ]; then
-  echo "Coding agents ready: 'claude' (Bedrock) · 'codex' (GPT-5.5 via Mantle) · 'gh' (authed). No login needed."
+  echo "Coding agents ready: 'claude' (Bedrock) · 'codex' (GPT-5.5 via Mantle)${_KIRO_STATUS:-} · 'gh' (authed). No login needed."
   echo "Workspace: $WORKSPACE_ROOT   (run 'codextoken' if codex auth expires)"
 fi
 
@@ -100,6 +111,11 @@ if [ -t 1 ] && [ -t 0 ] && [ -f "$_resume_hint" ]; then
     cd "${CC_RESUME_DIR:-$WORKSPACE_ROOT}" 2>/dev/null || cd "$WORKSPACE_ROOT"
     case "${CC_RESUME_CLI:-claude}" in
       codex) exec codex resume "$CC_RESUME_SID" ;;
+      kiro)
+        # Kiro's SQLite store follows $XDG_DATA_HOME; the chat path pins it at the
+        # session's KIRO_HOME. Match it so the Terminal resumes the same convo.
+        [ -n "${CC_RESUME_KIRO_HOME:-}" ] && export KIRO_HOME="$CC_RESUME_KIRO_HOME" && export XDG_DATA_HOME="$CC_RESUME_KIRO_HOME"
+        exec kiro-cli chat --resume-id "$CC_RESUME_SID" ;;
       *) exec claude --resume "$CC_RESUME_SID" ;;
     esac
   fi

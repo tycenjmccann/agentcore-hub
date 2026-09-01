@@ -1,0 +1,1 @@
+And now — the optional closer. The Workflow module. This is the fully autonomous pipeline. One ticket in. One pull request out. No keystrokes between. We're showing Jira intake here because that's what most teams use — but Hub also ships with a built-in DynamoDB ticket store if you want to run it standalone, no ticket system at all.

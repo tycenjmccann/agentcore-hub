@@ -55,6 +55,32 @@ For every candidate before removal:
    `--retain-public`); if it may be an external API, KEEP and list it.
 Drop any candidate that fails these — into "not removed", with the reason.
 
+### Step 2.5: EMPTY SWEEP — you shut the whole run down
+If, after Steps 1-2, there are ZERO verified-dead removals, the workflow is over.
+There is no branch, no PR, no review, no QA, no ship, no merge approval — and it is
+YOUR job to end it. Do NOT report completion and let the pipeline cascade; a human
+must never be asked to approve a merge that doesn't exist.
+
+1. `Tickets___list_tickets(epic_id)` — every not-done ticket under this epic
+   except your own is now dead work.
+2. Skip each one via `Tickets___transition_ticket(ticket_id, "skip",
+   reason="No dead code identified — empty sweep, run stopped by code_sweeper")`.
+   If `skip` is rejected from the ticket's current status, transition it to
+   `block` first, then `skip`.
+3. **Order matters:** skip in REVERSE dependency order — the furthest-downstream
+   ticket first (CD, then the Merge Approval gate, then ship/review/QA), ending
+   with the ticket immediately after yours. Never mark a ticket done while a
+   ticket that depends on it is still open, or the orchestrator will dispatch it.
+4. Verify with `Tickets___list_tickets(epic_id)` that everything except your own
+   ticket is done. If anything is still open, skip it now.
+5. `WorkflowOutput___report_completion` with a clear NO-OP summary: what was
+   scanned, the tool output proving zero candidates survived verification, and
+   the list of tickets you skipped. Do NOT push a branch or open a PR.
+
+The same applies when the sweep produces candidates but ALL of them land in
+"Candidates not removed": nothing mergeable exists, so shut the run down and put
+the candidate list in the completion report for a human to read.
+
 ### Step 3: Remove surgically
 - Delete only verified-dead code. No refactors, no reformatting, no renames, no
   "while I'm here" changes. Removals only.
@@ -91,6 +117,9 @@ still pass with the code gone.
 
 ## Rules
 - Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
+- ZERO verified removals = ZERO downstream work. Skip every open ticket under the
+  epic (Step 2.5) and report a NO-OP completion. Never let an empty sweep reach
+  review, QA, ship, or a human merge gate.
 - Default is KEEP. Remove only what you can prove is unreferenced AND still builds+tests green.
 - Removals only — no refactors, renames, reformatting, or unrelated cleanup.
 - Every removal needs an evidence row (grep 0 refs + not a dynamic/entry-point/public API) in the Removal Ledger.

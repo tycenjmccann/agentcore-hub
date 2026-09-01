@@ -9,6 +9,7 @@ import { NextResponse } from "next/server";
 import { headers } from "next/headers";
 import { getAllEvalConfigs } from "@/lib/eval-config";
 import agentsConfig from "@/config/agents.json";
+import pricingConfig from "@/config/pricing.json";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -21,15 +22,11 @@ function normalizeEvaluatorName(raw: string): string {
   return raw;
 }
 
-// Per-model pricing (per 1M tokens)
-const MODEL_PRICING: Record<string, { input: number; output: number }> = {
-  "us.anthropic.claude-opus-4-6-v1": { input: 15, output: 75 },
-  "us.anthropic.claude-opus-4-7": { input: 15, output: 75 },
-  "us.anthropic.claude-sonnet-4-6": { input: 3, output: 15 },
-  "us.anthropic.claude-sonnet-4-5-20250929-v1:0": { input: 3, output: 15 },
-  "us.anthropic.claude-haiku-4-5-20251001-v1:0": { input: 0.80, output: 4 },
-};
-const DEFAULT_PRICING = { input: 15, output: 75 };
+// Per-model pricing (per 1M tokens) — src/config/pricing.json is the single
+// source of truth, shared with the cost-report Lambda via the S3 config prefix.
+const MODEL_PRICING: Record<string, { input: number; output: number }> =
+  pricingConfig.models;
+const DEFAULT_PRICING = pricingConfig.default;
 
 // Agent ID → display name map
 const AGENT_DISPLAY_NAMES = new Map(

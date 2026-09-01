@@ -1,0 +1,1 @@
+Every ticket worked by every agent — searchable, filterable, replayable. Click a session, get the full execution trace. This is your audit log. This is your post-mortem. This is how you answer the question, "what was the agent thinking?"
