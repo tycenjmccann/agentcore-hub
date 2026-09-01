@@ -222,7 +222,9 @@ export async function POST(
       tickets =
         TICKET_PROVIDER === "jira"
           ? await getTicketsForWorkflowFromJira(workflowId)
-          : await getTicketsForWorkflowFromDynamo(workflowId);
+          : // TEAM-3686 Finding 4: consistent read — a fix ticket filed moments
+            // before this completion call must be visible to the gates below.
+            await getTicketsForWorkflowFromDynamo(workflowId, { consistentRead: true });
     } catch (err) {
       return NextResponse.json(
         { error: `Could not load tickets to verify completion: ${(err as Error).message}` },
@@ -303,8 +305,12 @@ export async function POST(
           UpdateExpression:
             "SET #phase = :complete, completedAt = :ts, previousPhase = :prev, managerWatch = :false, humanNotifications = :notifs" +
             (reason ? ", completeReason = :reason" : ""),
+          // TEAM-3686: also CAS-guard on cancelledAt — a cancel landing between
+          // the pre-read above (which serves the friendly 409) and this write
+          // stamps cancelledAt before phase flips, and must not be overwritten
+          // to complete. Mirrors workflow-store.mjs completeWorkflow.
           ConditionExpression:
-            "#phase <> :complete AND #phase <> :error AND #phase <> :alreadyCancelled",
+            "#phase <> :complete AND #phase <> :error AND #phase <> :alreadyCancelled AND attribute_not_exists(cancelledAt)",
           ExpressionAttributeNames: { "#phase": "phase" },
           ExpressionAttributeValues: {
             ":complete": "complete",
@@ -320,6 +326,31 @@ export async function POST(
       );
     } catch (err: unknown) {
       if ((err as { name?: string }).name === "ConditionalCheckFailedException") {
+        // Distinguish a cancel that raced in after our pre-read from a phase
+        // that was already terminal — the caller needs workflow_cancelled to
+        // know completion lost to cancellation, not that it double-completed.
+        try {
+          const recheck = await ddb.send(
+            new GetCommand({
+              TableName: WORKFLOWS_TABLE,
+              Key: { workflowId },
+              ConsistentRead: true,
+            })
+          );
+          if (recheck.Item?.cancelledAt) {
+            return NextResponse.json(
+              {
+                error: "workflow_cancelled",
+                cancelledAt: recheck.Item.cancelledAt,
+                detail:
+                  "cancellation precedes completion; a cancelled run cannot be completed",
+              },
+              { status: 409 }
+            );
+          }
+        } catch {
+          /* best-effort recheck — fall through to the generic 409 */
+        }
         return NextResponse.json(
           { error: "Workflow already in terminal state", phase: workflow.phase },
           { status: 409 }

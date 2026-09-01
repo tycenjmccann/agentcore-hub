@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isWorkflowComplete } from "./completion.mjs";
+import { isWorkflowComplete, missingEvidenceTickets } from "./completion.mjs";
 
 /**
  * TEAM-3619 D4c — per-phase completion re-verify. These pin the three rules
@@ -137,5 +137,86 @@ describe("isWorkflowComplete — legacy heuristic (no completionRequiresAgentPha
 describe("isWorkflowComplete — guards", () => {
   it("returns false for an empty child list", () => {
     expect(isWorkflowComplete([], DEF, opts)).toBe(false);
+  });
+});
+
+/**
+ * TEAM-3686 F3 — the deliverable-evidence check behind the orchestrator's
+ * completion path (hand-port of the route's missingEvidenceTickets; the route
+ * copy is pinned by src/app/api/workflow/[id]/complete/route.test.ts). A done
+ * ticket in a required phase must carry proof of work in its agentTasks entry:
+ * a non-empty `output` OR an `artifactKey`. Cancelled tickets and phases the
+ * def doesn't require owe nothing.
+ */
+describe("missingEvidenceTickets — deliverable evidence (TEAM-3686 F3)", () => {
+  const REQUIRED = ["development", "verification"];
+  const evOpts = { getAgentPhase };
+
+  it("flags a done required-phase ticket with empty output and no artifact", () => {
+    const children = [{ ticketId: "T-1", assignee: "dev", status: "done" }];
+    const tasks = { "T-1": { ticketId: "T-1", output: "   " } };
+    expect(missingEvidenceTickets(children, tasks, REQUIRED, evOpts)).toEqual([
+      { ticketId: "T-1", phase: "development" },
+    ]);
+  });
+
+  it("flags a done required-phase ticket with NO agentTasks entry at all", () => {
+    const children = [{ ticketId: "T-1", assignee: "dev", status: "done" }];
+    expect(missingEvidenceTickets(children, {}, REQUIRED, evOpts)).toEqual([
+      { ticketId: "T-1", phase: "development" },
+    ]);
+  });
+
+  it("accepts non-empty output as evidence", () => {
+    const children = [{ ticketId: "T-1", assignee: "dev", status: "done" }];
+    const tasks = { "T-1": { ticketId: "T-1", output: "opened PR #7" } };
+    expect(missingEvidenceTickets(children, tasks, REQUIRED, evOpts)).toEqual([]);
+  });
+
+  it("accepts an artifactKey as evidence in place of output", () => {
+    const children = [{ ticketId: "T-1", assignee: "dev", status: "done" }];
+    const tasks = { "T-1": { ticketId: "T-1", output: "", artifactKey: "workflows/wf_1/x.md" } };
+    expect(missingEvidenceTickets(children, tasks, REQUIRED, evOpts)).toEqual([]);
+  });
+
+  it("never flags cancelled tickets — finished-and-abandoned owes no evidence", () => {
+    const children = [{ ticketId: "T-1", assignee: "dev", status: "cancelled" }];
+    expect(missingEvidenceTickets(children, {}, REQUIRED, evOpts)).toEqual([]);
+  });
+
+  it("never flags tickets outside the required phases (or with unresolvable phase)", () => {
+    const children = [
+      { ticketId: "T-1", assignee: "rm", status: "done" }, // ship — not required here
+      { ticketId: "T-2", assignee: "someone_unknown", status: "done" }, // no phase
+    ];
+    expect(missingEvidenceTickets(children, {}, REQUIRED, evOpts)).toEqual([]);
+  });
+
+  it("skips epics", () => {
+    const children = [{ ticketId: "E-1", type: "epic", assignee: "dev", status: "done" }];
+    expect(missingEvidenceTickets(children, {}, REQUIRED, evOpts)).toEqual([]);
+  });
+
+  it("an explicit phase stamp wins over the assignee's roster phase", () => {
+    // Roster says verification, stamp says ship — ship isn't required, so clean.
+    const children = [{ ticketId: "T-1", assignee: "qa", phase: "ship", status: "done" }];
+    expect(missingEvidenceTickets(children, {}, REQUIRED, evOpts)).toEqual([]);
+  });
+
+  it("resolves agentTasks keyed by ticketId OR by task id with a ticketId field", () => {
+    const children = [
+      { ticketId: "T-1", assignee: "dev", status: "done" },
+      { ticketId: "T-2", assignee: "qa", status: "done" },
+    ];
+    const tasks = {
+      "T-1": { ticketId: "T-1", output: "did the work" }, // keyed by ticketId
+      task_123_qa: { ticketId: "T-2", output: "verified it" }, // keyed by task id
+    };
+    expect(missingEvidenceTickets(children, tasks, REQUIRED, evOpts)).toEqual([]);
+  });
+
+  it("returns [] when the def requires no phases (legacy runs)", () => {
+    const children = [{ ticketId: "T-1", assignee: "dev", status: "done" }];
+    expect(missingEvidenceTickets(children, {}, [], evOpts)).toEqual([]);
   });
 });

@@ -22,7 +22,13 @@ const h = vi.hoisted(() => {
     tickets: Array<Record<string, unknown>>;
     def: Record<string, unknown>;
     updates: Array<Record<string, unknown>>;
-  } = { workflow: {}, tickets: [], def: {}, updates: [] };
+    // TEAM-3686 F1: simulate the terminal write losing its CAS. When set, the
+    // UpdateCommand throws with this error name — after first swapping the
+    // stored workflow for `workflowAfterFail` (the racing writer's result), so
+    // the route's re-read sees what actually won.
+    updateError: string | null;
+    workflowAfterFail: Record<string, unknown> | null;
+  } = { workflow: {}, tickets: [], def: {}, updates: [], updateError: null, workflowAfterFail: null };
   return { state };
 });
 
@@ -48,6 +54,12 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           const name = cmd.constructor.name;
           if (name === "GetCommand") return { Item: h.state.workflow };
           if (name === "UpdateCommand") {
+            if (h.state.updateError) {
+              if (h.state.workflowAfterFail) h.state.workflow = h.state.workflowAfterFail;
+              const e = new Error("conditional check failed");
+              e.name = h.state.updateError;
+              throw e;
+            }
             h.state.updates.push(cmd.input);
             return {};
           }
@@ -92,6 +104,8 @@ async function load() {
 
 beforeEach(() => {
   h.state.updates.length = 0;
+  h.state.updateError = null;
+  h.state.workflowAfterFail = null;
   h.state.def = { completionRequiresAgentPhases: ["ship"] };
   for (const k of SAVED) saved[k] = process.env[k];
   process.env.TICKET_PROVIDER = "dynamodb";
@@ -122,6 +136,60 @@ describe("POST complete — cancellation guard (D4a)", () => {
     expect(body.error).toBe("workflow_cancelled");
     expect(body.cancelledAt).toBe("2026-08-30T00:00:00Z");
     expect(h.state.updates.length).toBe(0);
+  });
+});
+
+describe("POST complete — cancel/complete race CAS guard (TEAM-3686 F1)", () => {
+  const CLEAN_WF = { workflowId: "wf_1", phase: "ship", agentTasks: {} };
+
+  it("guards the terminal write with attribute_not_exists(cancelledAt)", async () => {
+    h.state.workflow = { ...CLEAN_WF };
+    h.state.tickets = [];
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect(h.state.updates.length).toBe(1);
+    expect(String(h.state.updates[0].ConditionExpression)).toContain(
+      "attribute_not_exists(cancelledAt)"
+    );
+  });
+
+  it("a cancel landing between pre-read and write yields 409 workflow_cancelled", async () => {
+    h.state.workflow = { ...CLEAN_WF };
+    h.state.tickets = [];
+    // The CAS loses; the re-read reveals the racing cancel's stamp.
+    h.state.updateError = "ConditionalCheckFailedException";
+    h.state.workflowAfterFail = { ...CLEAN_WF, cancelledAt: "2026-08-31T00:00:00Z" };
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("workflow_cancelled");
+    expect(body.cancelledAt).toBe("2026-08-31T00:00:00Z");
+    expect(h.state.updates.length).toBe(0);
+  });
+
+  it("a lost CAS without a cancel stamp yields the generic terminal 409", async () => {
+    h.state.workflow = { ...CLEAN_WF };
+    h.state.tickets = [];
+    // Another completer won — terminal phase, no cancelledAt.
+    h.state.updateError = "ConditionalCheckFailedException";
+    h.state.workflowAfterFail = { ...CLEAN_WF, phase: "complete" };
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("Workflow already in terminal state");
+  });
+
+  it("a non-CAS write error still propagates as a 500", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.workflow = { ...CLEAN_WF };
+    h.state.tickets = [];
+    h.state.updateError = "ProvisionedThroughputExceededException";
+    await load();
+    const res = await post();
+    expect(res.status).toBe(500);
+    error.mockRestore();
   });
 });
 
