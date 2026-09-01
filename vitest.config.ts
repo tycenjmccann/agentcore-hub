@@ -46,6 +46,11 @@ export default defineConfig({
       // publisher + fake clock), so the union + extended-state logic is
       // unit-testable with no AWS.
       "lambda/orchestrator/cascade.test.mjs",
+      // done-handlers-cascade (TEAM-3688 F3) — HANDLER-level cascade coverage.
+      // Invokes the REAL handleTicketDoneUnified + handleTicketDone from index.mjs
+      // through the REAL cascade (cascade.mjs/lease.mjs unmocked; only AWS/store
+      // seams stubbed), proving BOTH done paths drive the unblock cascade.
+      "lambda/orchestrator/done-handlers-cascade.test.mjs",
       // review-cap.mjs (TEAM-3619 D2c) — the review→rework round cap. Same DI
       // shape as the cascade (stub store/event publisher/roster + fake clock).
       // Its ship-review.mjs arithmetic port is pinned against the TS original by

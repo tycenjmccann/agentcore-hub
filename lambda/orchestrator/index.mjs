@@ -535,8 +535,11 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
 /**
  * Unified "ticket done" handler — works with both DynamoDB and Jira backends.
  * Called from processStatusChange (Jira webhook path).
+ *
+ * Exported solely so done-handlers-cascade.test.mjs can drive the REAL handler
+ * end-to-end through the REAL cascade (TEAM-3688). No behavior change.
  */
-async function handleTicketDoneUnified(ticketId) {
+export async function handleTicketDoneUnified(ticketId) {
   const ticket = await getTicket(ticketId);
   if (!ticket) return;
 
@@ -1238,8 +1241,11 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
 
 /**
  * A ticket was marked "done". Unblock dependents, check QA gate, check completion.
+ *
+ * Exported solely so done-handlers-cascade.test.mjs can drive the REAL handler
+ * end-to-end through the REAL cascade (TEAM-3688). No behavior change.
  */
-async function handleTicketDone(ticketId, image) {
+export async function handleTicketDone(ticketId, image) {
   const parentId = unwrapDdbValue(image.parentId);
   const workflowId = unwrapDdbValue(image.workflowId);
   const assignee = unwrapDdbValue(image.assignee);
