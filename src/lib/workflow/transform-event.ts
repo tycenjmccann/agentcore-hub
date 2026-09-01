@@ -52,6 +52,13 @@ export function transformEvent(
     case "agent.error":
       return base({ type: "error", agentId, error: detail.error, timestamp });
 
+    case "dead_session.shadow":
+      // Dead-session detector running in shadow mode (its default): an
+      // observation that the sweep WOULD have fired, not a failure and not a UI
+      // event. Explicit case on purpose — the default branch would pass it
+      // through as an unknown event type and leak it into the stream.
+      return null;
+
     case "agent.started":
     case "agent.invoked":
       return base({

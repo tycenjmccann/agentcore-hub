@@ -18,8 +18,11 @@
  *        the sweep inspected (its startedAt), so a re-issued claim is safe.
  *
  * Modes (DEAD_SESSION_DETECTOR_MODE): off = skip; shadow (default) = full sweep
- * + logs/metrics + would-fire agent.error flagged shadow:true, but ZERO writes
- * (no steal, no retry, no status change); enforce = full behavior. The gate
+ * + logs/metrics + a would-fire dead_session.shadow event (its own type, NOT
+ * agent.error — shadow is the default, and every agent.error consumer reads that
+ * type as a real failure: UI error cards, anomaly agent_error_retry_rate), but
+ * ZERO writes (no steal, no retry, no status change); enforce = full behavior,
+ * and only enforce ever publishes a real agent.error. The gate
  * fails SAFE: the value is trimmed + lowercased, and anything that is not
  * exactly off|shadow|enforce is coerced to shadow with a loud warning — only
  * the literal normalized "enforce" may write.
@@ -405,9 +408,15 @@ export function createDetector(deps) {
           };
 
           // ── SHADOW: observe only. Would-fire, flagged, no writes. ────────────
+          // The would-fire event is published as dead_session.shadow, NOT
+          // agent.error (TEAM-3698): shadow is the DEFAULT mode, and every
+          // agent.error consumer treats the type as a real failure — the UI
+          // stream maps it to an error card and the anomaly watcher counts it in
+          // agent_error_retry_rate. A distinct type keeps the full observation
+          // payload without polluting either. Detail is unchanged.
           if (mode === "shadow") {
             m.fired++;
-            await publishEvent(ticketId, "agent.error", {
+            await publishEvent(ticketId, "dead_session.shadow", {
               workflowId: workflow.id, ticketId, agentId,
               reason: "dead_session", shadow: true, detectorMeta,
             });
@@ -425,16 +434,26 @@ export function createDetector(deps) {
           // 1b. TOCTOU re-check (TEAM-3683): guard 1 read liveness BEFORE the
           // median/completion work above — an agent that resurrected (heart-
           // beated) in between must not be stolen. Re-read activity now; if the
-          // lease is live again, leave it alone. The stamp just written stays on
-          // this generation — acceptable: markDeadSessionDetected admits one
-          // decision per generation, and a resurrected agent that later
-          // completes moves the status off "running" anyway.
+          // lease is live again, leave it alone — and CLEAR the stamp we just
+          // wrote (TEAM-3698). Leaving it would permanently suppress recovery:
+          // every later sweep skips a stamped live task, so if this same claim
+          // generation then dies silently it is never retried and never
+          // escalated (FR-D1.2). The clear is CAS'd to this exact generation, so
+          // a claim that moved on in the meantime keeps its own state.
           const recheckActivity = await lease.lastAgentActivity(
             ddb, eventsTable, workflow.id, agentId, ticketId
           );
           if (lease.isLeaseLive(task, recheckActivity, now())) {
             m.skippedLiveLease++;
-            log(`detector.resurrected — ${ticketId} lease live again after stamp; skipping steal (sweep ${sweepId})`);
+            const cleared = await store.clearDeadSessionDetected(workflow.id, ticketId, task.startedAt);
+            if (cleared) {
+              log(`detector.resurrected — ${ticketId} lease live again after stamp; skipping steal, stamp cleared, remains recoverable (sweep ${sweepId})`);
+            } else {
+              // Generation moved between the stamp and the clear (re-claimed,
+              // completed, escalated) — safe either way: the stamp we wrote is
+              // gone with the old generation, or a new owner holds this entry.
+              log(`detector.resurrected — ${ticketId} lease live again after stamp; skipping steal, stamp clear CAS lost (claim moved) (sweep ${sweepId})`);
+            }
             continue;
           }
           // 2. Steal the stale claim (never forced — exact generation only).

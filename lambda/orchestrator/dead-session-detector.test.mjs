@@ -63,6 +63,7 @@ function queryEventsPage(events, input) {
 function makeDeps(overrides = {}) {
   const store = {
     markDeadSessionDetected: vi.fn(async () => true),
+    clearDeadSessionDetected: vi.fn(async () => true),
     incrementDeadSessionRetry: vi.fn(async () => 1),
     setTaskStatus: vi.fn(async () => {}),
     appendNotification: vi.fn(async () => {}),
@@ -170,15 +171,18 @@ describe("second dead session, same ticket (retry exhausted)", () => {
 });
 
 describe("shadow mode", () => {
-  it("emits a shadow-flagged agent.error and writes NOTHING", async () => {
+  it("emits a shadow-flagged dead_session.shadow and writes NOTHING", async () => {
     const { deps, store, lease } = makeDeps();
     const { runSweep } = createDetector(deps);
 
     const m = await runSweep("shadow");
 
-    const errs = eventsOfType(deps.publishEvent, "agent.error");
-    expect(errs).toHaveLength(1);
-    expect(errs[0][2].shadow).toBe(true);
+    const obs = eventsOfType(deps.publishEvent, "dead_session.shadow");
+    expect(obs).toHaveLength(1);
+    expect(obs[0][2].shadow).toBe(true);
+    // TEAM-3698: never agent.error — the UI error stream and the anomaly
+    // watcher's agent_error_retry_rate both read that type as a real failure.
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
     expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
     expect(lease.stealClaim).not.toHaveBeenCalled();
     expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
@@ -541,9 +545,9 @@ describe("mode normalization (TEAM-3683 F5)", () => {
     const { runSweep } = createDetector(deps);
     const m = await runSweep("Shadow ");
     expect(m.mode).toBe("shadow");
-    const errs = eventsOfType(deps.publishEvent, "agent.error");
-    expect(errs).toHaveLength(1);
-    expect(errs[0][2].shadow).toBe(true);
+    const obs = eventsOfType(deps.publishEvent, "dead_session.shadow");
+    expect(obs).toHaveLength(1);
+    expect(obs[0][2].shadow).toBe(true);
     expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
     expect(lease.stealClaim).not.toHaveBeenCalled();
   });
@@ -574,9 +578,9 @@ describe("mode normalization (TEAM-3683 F5)", () => {
       expect(lease.stealClaim).not.toHaveBeenCalled();
       expect(deps.redispatch).not.toHaveBeenCalled();
       // Still swept: the would-fire lands as a shadow-flagged event.
-      const errs = eventsOfType(deps.publishEvent, "agent.error");
-      expect(errs).toHaveLength(1);
-      expect(errs[0][2].shadow).toBe(true);
+      const obs = eventsOfType(deps.publishEvent, "dead_session.shadow");
+      expect(obs).toHaveLength(1);
+      expect(obs[0][2].shadow).toBe(true);
     }
   );
 });
