@@ -284,14 +284,23 @@ describe("candidate filtering", () => {
     expect(m.candidates).toBe(0);
   });
 
-  it("skips a task already stamped with deadSessionDetectedAt", async () => {
+  it("re-evaluates (not skips) a running task already stamped with deadSessionDetectedAt (TEAM-3702)", async () => {
+    // Old behavior skipped stamped live-status tasks unconditionally — which
+    // permanently exempted a generation whose resurrected-path clear failed,
+    // or whose stamping sweep crashed pre-steal. New contract: the held stamp
+    // is reused (no re-stamp — the attribute_not_exists CAS would lose
+    // forever) and the dead lease is recovered normally.
     const wf = makeWorkflow({
       agentTasks: { "TEAM-2": { ...deadTask, deadSessionDetectedAt: "2026-09-01T06:00:00Z" } },
     });
-    const { deps } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
     const { runSweep } = createDetector(deps);
     const m = await runSweep("enforce");
-    expect(m.candidates).toBe(0);
+    expect(m.candidates).toBe(1);
+    expect(m.fired).toBe(1);
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled(); // stamp held, never re-written
+    expect(lease.stealClaim).toHaveBeenCalledWith(deps.ddb, "workflows", "wf_1", "TEAM-2", DEAD_STARTED);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -650,6 +659,94 @@ describe("recovery is never permanently suppressed (TEAM-3698 F1)", () => {
     expect(m.fired).toBe(0);
     expect(m.candidateErrors).toBe(0); // a lost clear CAS is not an error
     expect(log.mock.calls.some(([msg]) => msg.includes("detector.resurrected"))).toBe(true);
+  });
+});
+
+describe("a failed stamp-clear never permanently suppresses detection (TEAM-3702)", () => {
+  it("clear throws ThrottlingException on the resurrected path; a later silent death on the SAME claim still fires + retries", async () => {
+    let clock = NOW;
+    const wf = makeWorkflow();
+    const task = wf.agentTasks["TEAM-2"];
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), now: () => clock });
+    // Stateful stamp stub: persist onto the scanned row like the real table,
+    // so sweep 2 sees the stamp sweep 1 left behind.
+    store.markDeadSessionDetected.mockImplementation(async () => {
+      if (task.deadSessionDetectedAt) return false;
+      task.deadSessionDetectedAt = new Date(clock).toISOString();
+      return true;
+    });
+    // Sweep 1's clear dies on a NON-conditional error (throttling) — the
+    // detector's per-candidate catch swallows it, leaving the stamp stuck.
+    const throttle = Object.assign(new Error("Rate exceeded"), { name: "ThrottlingException" });
+    store.clearDeadSessionDetected.mockRejectedValueOnce(throttle);
+    lease.isLeaseLive.mockImplementation((t, activityIso) => activityIso != null);
+    const { runSweep } = createDetector(deps);
+
+    // ── Sweep 1: dead at guard 1, resurrected before the steal, clear THROWS. ─
+    lease.lastAgentActivity
+      .mockResolvedValueOnce(null)                                // guard 1: silent
+      .mockResolvedValueOnce(new Date(NOW - 1000).toISOString()); // re-check: resurrected
+    const m1 = await runSweep("enforce");
+
+    expect(m1.candidateErrors).toBe(1);              // swallowed, sweep continued
+    expect(m1.fired).toBe(0);
+    expect(lease.stealClaim).not.toHaveBeenCalled(); // R3: nothing acted on the live lease
+    expect(task.deadSessionDetectedAt).toBeTruthy(); // the stamp is stuck on a running task
+
+    // ── Sweep 2 (later): SAME claim generation, still stamped, dies silently. ─
+    // No queued activity → null from the base stub: dead at guard 1 AND at the
+    // re-check.
+    clock = NOW + 10 * 60 * 1000;
+    const m2 = await runSweep("enforce");
+
+    // Detected + recovered — the stamped generation is re-driven, not skipped.
+    expect(lease.stealClaim).toHaveBeenCalledWith(deps.ddb, "workflows", "wf_1", "TEAM-2", DEAD_STARTED);
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(1);
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(m2.fired).toBe(1);
+    expect(m2.retries).toBe(1);
+    // The held stamp was reused: markDeadSessionDetected ran only on sweep 1.
+    expect(store.markDeadSessionDetected).toHaveBeenCalledTimes(1);
+  });
+
+  it("a stamped task whose lease is LIVE retries the CAS'd clear each sweep and touches nothing else (R3)", async () => {
+    const log = vi.fn();
+    const wf = makeWorkflow({
+      agentTasks: { "TEAM-2": { ...deadTask, deadSessionDetectedAt: "2026-09-01T06:00:00Z" } },
+    });
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), log });
+    lease.isLeaseLive.mockReturnValue(true); // live at guard 1
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    // The residual stamp is retried off, scoped to the exact generation…
+    expect(store.clearDeadSessionDetected).toHaveBeenCalledWith("wf_1", "TEAM-2", DEAD_STARTED);
+    expect(log.mock.calls.some(([msg]) => msg.includes("detector.stale_stamp_cleared"))).toBe(true);
+    // …and NOTHING acts against the live lease.
+    expect(m.skippedLiveLease).toBe(1);
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
+  });
+
+  it("shadow mode: a stamped live task logs the would-clear and writes NOTHING", async () => {
+    const log = vi.fn();
+    const wf = makeWorkflow({
+      agentTasks: { "TEAM-2": { ...deadTask, deadSessionDetectedAt: "2026-09-01T06:00:00Z" } },
+    });
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), log });
+    lease.isLeaseLive.mockReturnValue(true);
+    const { runSweep } = createDetector(deps);
+
+    await runSweep("shadow");
+
+    expect(log.mock.calls.some(([msg]) => msg.includes("detector.would_clear_stale_stamp"))).toBe(true);
+    expect(store.clearDeadSessionDetected).not.toHaveBeenCalled();
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
   });
 });
 

@@ -33,6 +33,13 @@
  * decision — otherwise those tasks stall silently forever ("ready" is not a
  * live status).
  *
+ * Backstop (TEAM-3702): a RUNNING task that still carries a stamp (the
+ * resurrected-path clear failed on a transient DynamoDB error, or a sweep
+ * crashed between stamp and steal) is re-evaluated on every sweep, never
+ * skipped: the clear is retried while the lease is live, and recovery is
+ * re-driven on the held stamp once the lease is dead. No state permanently
+ * exempts a generation from detection.
+ *
  * Testability: all effects (ddb, store, lease, publishEvent, redispatch,
  * blockTicket, getTicket, getAgentDef, clock) are injected via `deps`, so the
  * sweep runs against a stub client + stub store with no AWS.
@@ -321,10 +328,16 @@ export function createDetector(deps) {
         // state no other path revisits ("ready" is not a live status).
         const stalledSteal = task.status === "ready" && !!task.deadSessionDetectedAt;
         if (!live && !stalledSteal) continue;
-        // Already stamped for this still-live generation — the CAS below is
-        // the real arbiter, but skip the reads when the flag is plainly
-        // present.
-        if (live && task.deadSessionDetectedAt) continue;
+        // Already stamped for this still-live-STATUS generation (TEAM-3702):
+        // never skip it outright. The stamp can be residue of a resurrected-
+        // path clear that failed on a transient DynamoDB error (the TEAM-3698
+        // clear rethrows anything non-conditional and the catch below swallows
+        // it), or of a sweep that crashed between stamp and steal — an
+        // unconditional skip would leave this generation permanently exempt
+        // from detection. Re-evaluate instead: guard 1 retries the CAS'd clear
+        // when the lease is live (and does nothing else — R3), and the enforce
+        // path treats the held stamp as already won when the lease is dead.
+        const alreadyStamped = live && !!task.deadSessionDetectedAt;
 
         // Per-candidate isolation (TEAM-3683): one failing candidate must not
         // abort the rest of the sweep — log it, count it, move on.
@@ -379,6 +392,23 @@ export function createDetector(deps) {
           );
           if (lease.isLeaseLive(task, lastActivity, startedAtMs)) {
             m.skippedLiveLease++;
+            // A stamp on a LIVE lease is residue of a clear that failed or
+            // raced (TEAM-3702) — retry the generation-CAS'd clear so the
+            // task stays cheaply detectable, and do NOTHING else against the
+            // live lease (R3). A retry that fails again just repeats here
+            // next sweep; even a never-clearing stamp is only hygiene now,
+            // because the enforce path below re-drives a stamped generation
+            // once its lease actually dies.
+            if (alreadyStamped) {
+              if (mode === "enforce") {
+                const cleared = await store.clearDeadSessionDetected(workflow.id, ticketId, task.startedAt);
+                log(cleared
+                  ? `detector.stale_stamp_cleared — ${ticketId} stamped but lease live; residual stamp cleared (sweep ${sweepId})`
+                  : `detector.stale_stamp_clear_lost — ${ticketId} stamped but lease live; clear CAS lost (claim moved) (sweep ${sweepId})`);
+              } else {
+                log(`detector.would_clear_stale_stamp (shadow) — ${ticketId} stamped but lease live (sweep ${sweepId})`);
+              }
+            }
             continue;
           }
 
@@ -426,7 +456,15 @@ export function createDetector(deps) {
 
           // ── ENFORCE: recover the dead session. ───────────────────────────────
           // 1. Sweep-idempotency CAS on the exact claim generation. Lose → skip.
-          const stamped = await store.markDeadSessionDetected(workflow.id, ticketId, task.startedAt);
+          //    A generation that already carries the stamp (TEAM-3702: residue
+          //    of a failed clear, or of a sweep that crashed between stamp and
+          //    steal) holds it instead of re-stamping — the attribute_not_exists
+          //    arm of markDeadSessionDetected would lose forever. The steal CAS
+          //    below still arbitrates on the exact generation, so a stale scan
+          //    snapshot (stamp since cleared / claim re-issued) stays safe, and
+          //    concurrent sweeps racing through here resolve at the steal.
+          const stamped = alreadyStamped
+            || await store.markDeadSessionDetected(workflow.id, ticketId, task.startedAt);
           if (!stamped) {
             log(`detector.cas_lost — ${ticketId} (claim moved or already detected) (sweep ${sweepId})`);
             continue;
@@ -435,11 +473,12 @@ export function createDetector(deps) {
           // median/completion work above — an agent that resurrected (heart-
           // beated) in between must not be stolen. Re-read activity now; if the
           // lease is live again, leave it alone — and CLEAR the stamp we just
-          // wrote (TEAM-3698). Leaving it would permanently suppress recovery:
-          // every later sweep skips a stamped live task, so if this same claim
-          // generation then dies silently it is never retried and never
-          // escalated (FR-D1.2). The clear is CAS'd to this exact generation, so
-          // a claim that moved on in the meantime keeps its own state.
+          // wrote (TEAM-3698), CAS'd to this exact generation so a claim that
+          // moved on in the meantime keeps its own state. The clear is hygiene,
+          // not the last line of defense: if it fails (transient DynamoDB
+          // error) or loses its CAS, later sweeps re-evaluate the stamped
+          // generation instead of skipping it (TEAM-3702) — the clear retried
+          // while the lease is live, recovery re-driven once it is dead.
           const recheckActivity = await lease.lastAgentActivity(
             ddb, eventsTable, workflow.id, agentId, ticketId
           );
