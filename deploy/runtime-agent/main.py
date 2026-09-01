@@ -331,11 +331,12 @@ _CURRENT_TICKET_ID = ""
 #     turns, capped by DEADLINE_SECS and REMOTE_CODING_TURN_DEADLINE_S resp.);
 #     the actual turn wall-clock lives in the coding runtime it invokes, as that
 #     runtime's TURN_TIMEOUT_S. That runtime is reached via InvokeAgentRuntime
-#     (JSON payload, no per-call env) and is not forwarded the resolved value
-#     today, so the fleet knob is enforced there via the canonical
-#     WATCHDOG_TURN_TIMEOUT_SECS env override (coding-agent-runtime/main.py). The
-#     copy resolved here records fleet intent and is the propagation point should
-#     a future turn-scoped enforcement be added to this persona.
+#     (JSON payload, no per-call env), so the resolved per-agent value IS now
+#     forwarded per-turn in the submit payload as `turn_timeout_secs` (TEAM-3687);
+#     the coding runtime resolves payload → env → legacy 1500, with the canonical
+#     WATCHDOG_TURN_TIMEOUT_SECS env still the fleet-wide fallback there. Nothing
+#     turn-scoped is enforced locally by this persona — the copy resolved here is
+#     what we ship to the runtime and what scales the nested-turn poll budget.
 _WATCHDOG_LEGACY = {
     "enabled": True,
     "heartbeatIntervalMs": 15000,
@@ -422,6 +423,11 @@ REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "600"))
 # harvest (can be GBs) and the journal-write retry loop — so the runner's own
 # verdict reaches us via the journal instead of us giving up first.
 REMOTE_CODING_POLL_S = int(os.getenv("REMOTE_CODING_POLL_S", "20"))
+# The 2700 default is exactly the legacy 1500s turn cap + ~1200s of terminal-work
+# headroom (artifact harvest — can be GBs — plus the journal-write retry loop).
+# When a per-agent turnTimeoutSecs is forwarded ABOVE 1500 (TEAM-3687), the
+# effective budget in _remote_coding_turn widens by the excess so the runner's
+# own verdict still reaches us via the journal before we give up.
 REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "2700"))
 # Outer wall-clock deadline on ONE ENTIRE nested coding turn: submit (including
 # lost-submit recovery probes), every poll, and the single automatic vm-death
@@ -616,7 +622,8 @@ def _deadline_expired_error() -> dict:
             "no_retry_hint": True}
 
 
-def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None) -> dict:
+def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
+                      budget_s: int | None = None) -> dict:
     """Poll an async coding turn to its terminal state. Returns the done record
     ({response, claude_session_id, artifacts?} or {error}).
 
@@ -631,11 +638,17 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None)
     outer_deadline is a time.monotonic() timestamp bounding the whole turn
     (REMOTE_CODING_TURN_DEADLINE_S): unlike the budget, it is NEVER extended by
     a live heartbeat, so a runner that reports "running" forever cannot pin the
-    persona past it (TEAM-3119)."""
-    deadline = time.time() + REMOTE_CODING_TURN_BUDGET_S
+    persona past it (TEAM-3119).
+
+    budget_s overrides the fleet REMOTE_CODING_TURN_BUDGET_S for this turn — the
+    caller scales it up when a per-agent turnTimeoutSecs was forwarded above the
+    1500s the default budget assumes (TEAM-3687). Defaults to the global so
+    existing callers are unchanged."""
+    budget = REMOTE_CODING_TURN_BUDGET_S if budget_s is None else budget_s
+    deadline = time.time() + budget
     # Live heartbeats extend the deadline (terminal work is unbounded), but a
     # wedged-yet-heartbeating runner must not pin this persona forever.
-    hard_stop = time.time() + 2 * REMOTE_CODING_TURN_BUDGET_S
+    hard_stop = time.time() + 2 * budget
     unknowns = 0
     while time.time() < min(deadline, hard_stop) and (
             outer_deadline is None or time.monotonic() < outer_deadline):
@@ -700,7 +713,7 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None)
         pass
     if outer_deadline is not None and time.monotonic() >= outer_deadline:
         return _deadline_expired_error()
-    return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget "
+    return {"error": f"coding turn exceeded {budget}s budget "
                      f"with no verdict. Its work may already exist and a runner "
                      f"may still be finishing. Do NOT re-run the task and do NOT "
                      f"start another coding call yet: wait a few minutes, then "
@@ -808,14 +821,18 @@ def _recover_lost_submit(client, payload: dict, outer_deadline: float | None = N
     return None
 
 
-def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None) -> dict:
+def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None,
+                     budget_s: int | None = None) -> dict:
     """Submit one async coding turn and poll it to a terminal record.
 
     The turn_id is generated HERE and sent with the submit, making submission
     idempotent: if the submit's response is lost client-side (read timeout on a
     slow cold-clone setup) while the server accepted and started the turn, the
     re-submit with the same id is acknowledged as a dedupe instead of running
-    the prompt a second time in the same workspace."""
+    the prompt a second time in the same workspace.
+
+    budget_s is forwarded to the poll loop so a turn with an elevated per-agent
+    turnTimeoutSecs gets a proportionally larger poll budget (TEAM-3687)."""
     payload = {**payload, "turn_id": f"turn-{uuid.uuid4().hex}"}
     # HARD deadline check before the blocking submit: this client's
     # connect+read window is ~630s, all of which would land PAST an
@@ -837,7 +854,7 @@ def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None)
         # Runtime predates async mode (or ran a legacy path) and executed the
         # turn synchronously — its result is already complete.
         return submitted
-    return _poll_coding_turn(client, submitted["turn_id"], outer_deadline)
+    return _poll_coding_turn(client, submitted["turn_id"], outer_deadline, budget_s)
 
 
 def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") -> str:
@@ -864,6 +881,11 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         "session_id": _CODING_SESSION["session_id"],
         "model": resolved_model if cli == "claude" else "",
         "origin": "workflow",  # coding runtime exempts human sessions from GC
+        # Forward the resolved per-agent turn wall-clock so the coding runtime
+        # bounds THIS turn's CLI at the fleet-resolved value instead of only its
+        # own env/legacy default (TEAM-3687). Unknown to legacy far sides — they
+        # ignore the extra field and keep enforcing WATCHDOG_TURN_TIMEOUT_SECS.
+        "turn_timeout_secs": _WATCHDOG["turnTimeoutSecs"],
     }
     if _CODING_SESSION.get("repo"):
         payload["repo"] = _CODING_SESSION["repo"]
@@ -896,10 +918,25 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         f"[remote-coding] {cli} turn on {_CODING_SESSION['session_id']} "
         f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')}, mode=async)"
     )
+    # Scale the poll budget + outer deadline when the forwarded per-agent turn
+    # cap exceeds the 1500s the fleet defaults already assume (TEAM-3687). The
+    # far side's CLI may now run up to turnTimeoutSecs, so widen both bounds by
+    # exactly the EXCESS above that baseline: the budget carries its terminal-work
+    # headroom (already baked into REMOTE_CODING_TURN_BUDGET_S = 1500 + margin),
+    # and the deadline clears the wider budget (2x, matching its own default
+    # READ_TIMEOUT + 2*budget shape). A delta — not max(turnTimeoutSecs+margin,
+    # …) — keeps this a TRUE no-op at the default cap: the fleet globals
+    # (REMOTE_CODING_TURN_BUDGET_S / _DEADLINE_S, both env-tunable) stay
+    # authoritative and an operator can still lower them, whereas a hardcoded
+    # 1500+margin floor would silently clamp any override below ~2700/6000.
+    _budget_excess = max(0, _WATCHDOG["turnTimeoutSecs"]
+                         - _WATCHDOG_LEGACY["turnTimeoutSecs"])
+    eff_budget = REMOTE_CODING_TURN_BUDGET_S + _budget_excess
+    eff_deadline_s = REMOTE_CODING_TURN_DEADLINE_S + 2 * _budget_excess
     # One monotonic deadline for the WHOLE nested turn — submit, recovery,
     # polls, and the automatic vm-death resubmit all check against it, so no
     # combination of inner retries can silently block this persona past it.
-    turn_deadline = time.monotonic() + REMOTE_CODING_TURN_DEADLINE_S
+    turn_deadline = time.monotonic() + eff_deadline_s
     try:
         client = boto3.client(
             "bedrock-agentcore", region_name=REGION,
@@ -907,7 +944,7 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
                                   connect_timeout=30,
                                   retries={"max_attempts": 0}),
         )
-        result = _submit_and_poll(client, payload, turn_deadline)
+        result = _submit_and_poll(client, payload, turn_deadline, eff_budget)
         # A dead/vanished verdict means the microVM recycled mid-turn — the
         # workspace and transcript are on EFS, so one automatic resubmit (same
         # conversation id) is cheap and usually completes. A second death is a
@@ -915,7 +952,7 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         if result.get("retryable_vm_death"):
             if time.monotonic() < turn_deadline:
                 logger.warning(f"[remote-coding] {result.get('error')} — resubmitting once")
-                result = _submit_and_poll(client, payload, turn_deadline)
+                result = _submit_and_poll(client, payload, turn_deadline, eff_budget)
             result.pop("retryable_vm_death", None)
     except Exception as e:  # noqa: BLE001
         # Do NOT fall back to a local CLI run: the session's workspace lives on

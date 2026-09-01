@@ -412,5 +412,106 @@ class TestAgentErrorPublishRetry(RemoteCodingTestCase):
         )
 
 
+class TestTurnTimeoutForwarded(RemoteCodingTestCase):
+    """TEAM-3687 — the resolved per-agent watchdog turnTimeoutSecs must ride the
+    submit payload as `turn_timeout_secs` so the coding runtime bounds the CLI
+    at the fleet-resolved value (before this it advertised a silently-inert
+    per-agent knob). Asserted for the default AND an override."""
+
+    def _submit_payload_for_turn(self):
+        captured = []
+
+        def submit(**kw):
+            payload = json.loads(kw["payload"])
+            captured.append(payload)
+            return _invoke_response(
+                {"submitted": True, "turn_id": payload["turn_id"]}
+            )
+
+        submit_client = mock.MagicMock()
+        submit_client.invoke_agent_runtime.side_effect = submit
+        poll_client = mock.MagicMock()
+        poll_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
+            {"status": "done", "response": "ok", "claude_session_id": "s-1"}
+        )
+        events_client = mock.MagicMock()
+        with mock.patch.object(main.boto3, "client", return_value=submit_client), \
+             mock.patch.object(main, "_POLL_CLIENT", poll_client, create=True), \
+             mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01):
+            main._remote_coding_turn("implement the widget", "claude")
+        # poll rides _POLL_CLIENT, so submit_client only ever sees the submit.
+        self.assertTrue(captured, "no submit payload was sent")
+        return captured[-1]
+
+    def test_default_turn_timeout_is_forwarded(self):
+        payload = self._submit_payload_for_turn()
+        self.assertEqual(payload["turn_timeout_secs"],
+                         main._WATCHDOG["turnTimeoutSecs"])
+        self.assertEqual(payload["turn_timeout_secs"], 1500,
+                         "default resolves to the legacy fleet value")
+
+    def test_override_turn_timeout_is_forwarded(self):
+        with mock.patch.object(main, "_WATCHDOG",
+                               {**main._WATCHDOG, "turnTimeoutSecs": 3600}):
+            payload = self._submit_payload_for_turn()
+        self.assertEqual(payload["turn_timeout_secs"], 3600,
+                         "a per-agent override must be forwarded verbatim")
+
+
+class TestPollBudgetScaling(RemoteCodingTestCase):
+    """TEAM-3687 — a per-agent turnTimeoutSecs above the 1500s the fleet budget
+    assumes must widen BOTH the poll budget and the outer deadline by the excess,
+    so the persona doesn't declare the turn dead while the far side's CLI is
+    still legitimately running. It's a DELTA off the fleet globals, so the
+    default cap is byte-identical AND those globals stay authoritative (a
+    hardcoded floor would clamp an operator-lowered override)."""
+
+    def _capture_scaling(self):
+        captured = {}
+
+        def fake_submit_and_poll(client, payload, outer_deadline=None,
+                                 budget_s=None):
+            captured["budget_s"] = budget_s
+            captured["outer_deadline"] = outer_deadline
+            return {"status": "done", "response": "ok", "claude_session_id": "s-1"}
+
+        events_client = mock.MagicMock()
+        with mock.patch.object(main.boto3, "client", return_value=mock.MagicMock()), \
+             mock.patch.object(main, "_submit_and_poll",
+                               side_effect=fake_submit_and_poll), \
+             mock.patch.object(main, "_ddb_events_client", events_client):
+            t0 = time.monotonic()
+            main._remote_coding_turn("implement the widget", "claude")
+        captured["deadline_from_now"] = captured["outer_deadline"] - t0
+        return captured
+
+    def test_default_budget_and_deadline_are_byte_identical(self):
+        cap = self._capture_scaling()
+        # excess = 0 at the default cap → the fleet globals pass through verbatim.
+        self.assertEqual(cap["budget_s"], main.REMOTE_CODING_TURN_BUDGET_S)
+        self.assertEqual(cap["budget_s"], 2700,
+                         "default turnTimeoutSecs must not shrink the fleet budget")
+        self.assertAlmostEqual(cap["deadline_from_now"],
+                               main.REMOTE_CODING_TURN_DEADLINE_S, delta=1.0)
+
+    def test_override_widens_budget_and_deadline_by_the_excess(self):
+        with mock.patch.object(main, "_WATCHDOG",
+                               {**main._WATCHDOG, "turnTimeoutSecs": 3600}):
+            cap = self._capture_scaling()
+        excess = 3600 - main._WATCHDOG_LEGACY["turnTimeoutSecs"]  # 3600 - 1500
+        # eff_budget = 2700 + 2100 = 4800 (== turnTimeoutSecs + 1200 headroom).
+        self.assertEqual(cap["budget_s"], 4800)
+        self.assertEqual(cap["budget_s"], main.REMOTE_CODING_TURN_BUDGET_S + excess)
+        # eff_deadline = 6000 + 2*2100 = 10200.
+        self.assertAlmostEqual(cap["deadline_from_now"],
+                               main.REMOTE_CODING_TURN_DEADLINE_S + 2 * excess,
+                               delta=1.0)
+        # The deadline must clear the scaled budget (else the outer bound would
+        # cut off a turn the budget still considers live).
+        self.assertGreater(cap["deadline_from_now"],
+                           main.REMOTE_CODING_TURN_DEADLINE_S)
+
+
 if __name__ == "__main__":
     unittest.main()
