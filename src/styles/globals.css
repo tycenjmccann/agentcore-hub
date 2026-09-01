@@ -13,7 +13,14 @@
   --color-surface-2: #e9ecef;
   --color-surface-3: #dee2e6;
   --color-surface-4: #ced4da;
-  
+
+  /* Compat aliases for the surface scale (TEAM-3507): component markup
+     references --color-bg-* names that predate the --color-surface-* tokens.
+     Without these, bg-[var(--color-bg-secondary)] resolves to transparent,
+     making modals/panels see-through. Keep in sync with both theme blocks. */
+  --color-bg-secondary: var(--color-surface-1);
+  --color-bg-tertiary: var(--color-surface-2);
+
   --color-text-primary: #212529;
   --color-text-secondary: #495057;
   --color-text-muted: #6c757d;
@@ -57,7 +64,11 @@
   --color-surface-2: #1a1a25;
   --color-surface-3: #222230;
   --color-surface-4: #2a2a3a;
-  
+
+  /* Compat aliases for the surface scale (TEAM-3507) — see :root block above. */
+  --color-bg-secondary: var(--color-surface-1);
+  --color-bg-tertiary: var(--color-surface-2);
+
   --color-text-primary: #f8f9fa;
   --color-text-secondary: #d1d5db;
   --color-text-muted: #9ca3af;
