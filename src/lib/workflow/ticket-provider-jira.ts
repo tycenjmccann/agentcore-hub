@@ -212,6 +212,17 @@ export class JiraCloudProvider implements TicketProvider {
     };
   }
 
+  /**
+   * TEAM-3705: hard-delete an issue. Used only for compensating cleanup of an
+   * orphan epic created by a start that then lost the dedup ownership fence —
+   * at that point the epic has no children and no workflow row references it,
+   * so deletion is safe. Requires the Jira "Delete issues" permission; callers
+   * treat failure as best-effort (log, never fail the request).
+   */
+  async deleteIssue(issueKey: string): Promise<void> {
+    await this.request("DELETE", `/rest/api/3/issue/${issueKey}`);
+  }
+
   async isWorkflowComplete(epicId: string): Promise<boolean> {
     // Search for all child issues of the epic using new /search/jql endpoint
     const jql = `parent = ${epicId} AND project = ${this.projectKey}`;

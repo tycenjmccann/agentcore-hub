@@ -456,15 +456,24 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
 
   if (!fence.won) {
     // Lost the dedup fence: the marker was re-pointed at another run while we
-    // were creating the epic. No workflow row was written. The epic we just
-    // created in Jira is now orphaned — no cheap/safe cancel transition exists
-    // on the provider, so log its id LOUDLY for cleanup rather than guess at a
-    // status name. Coalesce onto the winner (never let the loser's run proceed).
+    // were creating the epic. No workflow row was written. TEAM-3705: the epic
+    // we just created in Jira is an orphan — it has no children yet and no row
+    // references it, so delete it as compensating cleanup. Best-effort only:
+    // a cleanup failure (e.g. missing Delete-issues permission) is logged and
+    // never fails the deduplicated-success response.
     console.warn(
       `[start/jira] dedup fence LOST for ${workflowId} — marker now points at ${fence.winner}. ` +
-        `ORPHANED Jira epic ${epicId} created by this loser was NOT wired to a workflow row; ` +
-        `manual cleanup may be required. Coalescing onto ${fence.winner}.`
+        `Coalescing onto ${fence.winner}; cleaning up orphan Jira epic ${epicId}.`
     );
+    try {
+      await jira.deleteIssue(epicId);
+      console.log(`[start/jira] orphan epic ${epicId} deleted (dedup fence loss cleanup)`);
+    } catch (cleanupErr) {
+      console.error(
+        `[start/jira] FAILED to delete orphan Jira epic ${epicId} after dedup fence loss ` +
+          `(${(cleanupErr as Error).message}) — manual cleanup required.`
+      );
+    }
     return NextResponse.json({ workflowId: fence.winner, deduplicated: true });
   }
 
@@ -550,14 +559,42 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
 
   if (!fence.won) {
     // Lost the dedup fence: the marker was re-pointed at another run while we
-    // were creating/transitioning the epic. No workflow row was written. The epic
-    // ticket we created is orphaned — log its id LOUDLY for cleanup (no safe cheap
-    // cancel transition to rely on) and coalesce onto the winner.
+    // were creating/transitioning the epic. No workflow row was written.
+    // TEAM-3705: the epic ticket we created is an orphan — the ticket Lambda has
+    // no delete tool, so cancel it via its terminal transition (it is in
+    // in_progress from step 2, whose only terminal exit is "done") with an audit
+    // comment explaining why. Best-effort only: cleanup failure is logged and
+    // never fails the deduplicated-success response.
     console.warn(
       `[start] dedup fence LOST for ${workflowId} — marker now points at ${fence.winner}. ` +
-        `ORPHANED epic ${epicId} created by this loser was NOT wired to a workflow row; ` +
-        `manual cleanup may be required. Coalescing onto ${fence.winner}.`
+        `Coalescing onto ${fence.winner}; cancelling orphan epic ${epicId}.`
     );
+    try {
+      await invokeTicketLambda("Tickets___add_comment", {
+        ticket_id: epicId,
+        author: "system",
+        body: `Cancelled: duplicate start lost the dedup ownership fence; superseded by workflow ${fence.winner}.`,
+      });
+      const cancelResult = await invokeTicketLambda("Tickets___transition_ticket", {
+        ticket_id: epicId,
+        transition_id: "done",
+      });
+      // Success shape is { status: "transitioned", ... }; failures come back as
+      // { error } or a textResult { content: [{ text: "Invalid transition ..." }] }.
+      if (cancelResult.status !== "transitioned") {
+        const detail =
+          cancelResult.error ||
+          (cancelResult.content as Array<{ text?: string }> | undefined)?.[0]?.text ||
+          JSON.stringify(cancelResult);
+        throw new Error(String(detail));
+      }
+      console.log(`[start] orphan epic ${epicId} cancelled via terminal transition (dedup fence loss cleanup)`);
+    } catch (cleanupErr) {
+      console.error(
+        `[start] FAILED to cancel orphan epic ${epicId} after dedup fence loss ` +
+          `(${(cleanupErr as Error).message}) — manual cleanup required.`
+      );
+    }
     return NextResponse.json({ workflowId: fence.winner, deduplicated: true });
   }
 
