@@ -12,7 +12,7 @@
 import { timingSafeEqual, createHash } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { validateIntakeSources } from "@/lib/workflow/intake";
 import type { WorkflowInput } from "@/lib/workflow/types";
@@ -48,8 +48,19 @@ const TERMINAL_PHASES = new Set(["complete", "error", "cancelled"]);
 // marker is written before the epic/workflow row (see resolveDedup), so a
 // concurrent start can legitimately observe marker-without-row for as long as
 // epic creation + the row write take. Beyond this window an absent row means
-// the winner died between the two writes (stillborn) and a fresh run is let
-// through.
+// the winner probably died between the two writes (stillborn) and a fresh run
+// is let through.
+//
+// TEAM-3703: this window is now ONLY a coalesce heuristic — it decides whether
+// a marker-without-row racer waits for the presumed-live owner or re-points the
+// marker at itself. It is no longer load-bearing for correctness. Correctness
+// comes from the ownership FENCE (see putWorkflowRowFenced): every dedup workflow
+// row is written inside a TransactWriteCommand whose ConditionCheck proves the
+// marker STILL points at this workflowId. So even if the heuristic guesses wrong
+// (a slow-but-alive owner takes >120s to create its epic, and a racer re-points
+// the marker meanwhile), the slow owner's fenced row write fails and it coalesces
+// onto the winner instead of double-creating. The window can therefore be tuned
+// freely for latency without reopening the double-create race.
 const DEDUP_INFLIGHT_GRACE_MS = 120_000;
 
 function secretMatches(provided: string, expected: string): boolean {
@@ -81,13 +92,21 @@ function markerAgeMs(createdAt: unknown): number | null {
  * workflows table itself and is claimed with `attribute_not_exists(workflowId)`
  * BEFORE any epic/workflow is created — so a redelivered start for the same
  * (sourceTicket, def) can't fork a second run. Returns one of:
- *   - { coalesce: workflowId }  → an existing non-terminal run owns this key;
- *                                 the caller should return it verbatim.
- *   - { proceed: workflowId }   → this caller owns the key (fresh claim, or the
- *                                 prior canonical run was terminal and we
- *                                 atomically re-pointed the marker); create with
- *                                 exactly this workflowId.
+ *   - { coalesce: workflowId }        → an existing non-terminal run owns this
+ *                                       key; the caller should return it verbatim.
+ *   - { proceed: workflowId, markerId } → this caller owns the key (fresh claim,
+ *                                       or the prior canonical run was terminal
+ *                                       and we atomically re-pointed the marker);
+ *                                       create with exactly this workflowId and
+ *                                       FENCE the row write on markerId (below).
  * Works identically for both ticket providers (the marker is app state).
+ *
+ * TEAM-3703: markerId is returned on the proceed path so the caller can prove,
+ * atomically with the workflow-row write, that the marker STILL points at this
+ * workflowId. The re-point CAS below hands ownership to at most one racer at a
+ * time, but "owns the marker right now" and "still owns it when I finally write
+ * my row" are different facts — a slow owner can be re-pointed away between the
+ * two. The fence closes that gap; this function only decides who proceeds.
  *
  * TEAM-3699 (AC-D4.2) in-flight grace window: because the marker is claimed
  * BEFORE the epic/workflow row is written, two overlapping starts can leave the
@@ -107,7 +126,7 @@ function markerAgeMs(createdAt: unknown): number | null {
 async function resolveDedup(
   sourceTicket: string,
   defId: string
-): Promise<{ coalesce?: string; proceed?: string }> {
+): Promise<{ coalesce?: string; proceed?: string; markerId?: string }> {
   const idemKey = createHash("sha256").update(`${sourceTicket}:${defId}`).digest("hex");
   const markerId = `wfdedup_${idemKey}`;
   const candidateWorkflowId = mintWorkflowId();
@@ -126,7 +145,7 @@ async function resolveDedup(
         ConditionExpression: "attribute_not_exists(workflowId)",
       })
     );
-    return { proceed: candidateWorkflowId };
+    return { proceed: candidateWorkflowId, markerId };
   } catch (err) {
     if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
   }
@@ -177,14 +196,88 @@ async function resolveDedup(
         ...(priorCanonical ? { ExpressionAttributeValues: { ":old": priorCanonical } } : {}),
       })
     );
-    return { proceed: candidateWorkflowId };
+    return { proceed: candidateWorkflowId, markerId };
   } catch (err) {
     if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
     const reread = await ddb.send(
       new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: markerId }, ConsistentRead: true })
     );
     const winner = reread.Item?.canonicalWorkflowId as string | undefined;
-    return winner ? { coalesce: winner } : { proceed: candidateWorkflowId };
+    return winner ? { coalesce: winner } : { proceed: candidateWorkflowId, markerId };
+  }
+}
+
+/**
+ * TEAM-3703: write the canonical workflow row behind an atomic ownership FENCE.
+ *
+ * The dedup marker is claimed/re-pointed BEFORE the epic + workflow row are
+ * created (resolveDedup). Those external steps can take arbitrarily long, so by
+ * the time this caller writes its row the marker may have been re-pointed at a
+ * different racer (a legitimate recovery when the first owner looked dead). A
+ * plain PutCommand here would land the loser's row anyway → two live workflows
+ * for one (sourceTicket, defId). The old grace window only NARROWED that race.
+ *
+ * The fix makes ownership a precondition of the write, not a prior guess: for a
+ * dedup start (markerId present) the row is put inside a TransactWriteCommand
+ * whose ConditionCheck requires `marker.canonicalWorkflowId = this workflowId`.
+ * If the marker no longer points at us the whole transaction is cancelled and
+ * the row is NOT written — we lost the fence and must coalesce onto the winner.
+ * Non-dedup starts (no marker) keep the plain unconditioned PutCommand.
+ *
+ * Returns:
+ *   - { won: true }               → the row was written; caller proceeds.
+ *   - { won: false, winner }      → fence lost; caller must NOT keep its row
+ *                                   (none was written) and should coalesce onto
+ *                                   `winner` (the marker's current canonical id).
+ * Throws on any non-fence error (including a TransactionCanceledException whose
+ * re-read still shows US as owner — that is a transient conflict, not a loss).
+ */
+async function putWorkflowRowFenced(
+  item: Record<string, unknown>,
+  markerId: string | undefined
+): Promise<{ won: true } | { won: false; winner: string | undefined }> {
+  const workflowId = item.workflowId as string;
+
+  // Non-dedup start (human/API caller with no sourceTicket): nothing to fence.
+  if (!markerId) {
+    await ddb.send(new PutCommand({ TableName: WORKFLOWS_TABLE, Item: item }));
+    return { won: true };
+  }
+
+  try {
+    await ddb.send(
+      new TransactWriteCommand({
+        TransactItems: [
+          // Put is unconditioned (same as the legacy PutCommand) — the row's
+          // workflowId is freshly minted per start, so there is nothing to
+          // collide with; the marker ConditionCheck is the only guard.
+          { Put: { TableName: WORKFLOWS_TABLE, Item: item } },
+          {
+            ConditionCheck: {
+              TableName: WORKFLOWS_TABLE,
+              Key: { workflowId: markerId },
+              ConditionExpression: "canonicalWorkflowId = :me",
+              ExpressionAttributeValues: { ":me": workflowId },
+            },
+          },
+        ],
+      })
+    );
+    return { won: true };
+  } catch (err) {
+    if ((err as { name?: string }).name !== "TransactionCanceledException") throw err;
+    // The transaction was cancelled. The only conditioned item is the marker
+    // ConditionCheck, so a cancel means either the marker was re-pointed away
+    // (fence loss) or a transient transaction conflict. Disambiguate by re-reading
+    // the marker: if it still points at us this was a conflict, not a loss —
+    // rethrow so the caller surfaces it (the outer POST catch returns 500 and the
+    // trigger redelivers). Otherwise we genuinely lost ownership.
+    const reread = await ddb.send(
+      new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: markerId }, ConsistentRead: true })
+    );
+    const winner = reread.Item?.canonicalWorkflowId as string | undefined;
+    if (winner === workflowId) throw err;
+    return { won: false, winner };
   }
 }
 
@@ -299,18 +392,23 @@ export async function POST(req: NextRequest) {
     // mint-a-new-run behavior. The marker is claimed before any epic/workflow
     // exists, so a redelivery coalesces instead of forking a duplicate run.
     let workflowId: string | undefined;
+    let markerId: string | undefined;
     if (body.sourceTicket) {
       const dedup = await resolveDedup(body.sourceTicket, def.id);
       if (dedup.coalesce) {
         return NextResponse.json({ workflowId: dedup.coalesce, deduplicated: true });
       }
       workflowId = dedup.proceed;
+      // TEAM-3703: markerId is set iff this run was minted through dedup — the
+      // start functions fence their workflow-row write on it (proving we still
+      // own the marker) so a re-pointed loser can't double-create.
+      markerId = dedup.markerId;
     }
 
     if (TICKET_PROVIDER === "jira") {
-      return await startWithJira(body, def, workflowId);
+      return await startWithJira(body, def, workflowId, markerId);
     } else {
-      return await startWithDynamoDB(body, def, workflowId);
+      return await startWithDynamoDB(body, def, workflowId, markerId);
     }
   } catch (err) {
     console.error("Workflow start error:", err);
@@ -320,7 +418,7 @@ export async function POST(req: NextRequest) {
 
 // ─── Jira Cloud Backend ────────────────────────────────────────────────────────
 
-async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string) {
+async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string) {
   const { JiraCloudProvider } = await import("@/lib/workflow/ticket-provider-jira");
   const jira = new JiraCloudProvider();
 
@@ -332,29 +430,43 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
   const epicId = epic.id;
 
   // 2. Create workflow metadata in DynamoDB (this is app state, not tickets —
-  //    the orchestrator needs it for context building regardless of ticket backend)
-  await ddb.send(new PutCommand({
-    TableName: WORKFLOWS_TABLE,
-    Item: {
-      workflowId,
-      id: workflowId,
-      phase: intakePhase,
-      epicId,
-      repoConfig: body.repoConfig,
-      // Routine-scoped connectors (if any) — forwarded to each agent invoke so
-      // the runtime loads their creds/tools for this workflow's run only.
-      connectors: body.connectors,
-      input: body,
-      agentTasks: {},
-      messages: [],
-      humanNotifications: [],
-      startedAt: new Date().toISOString(),
-      ticketProvider: "jira",
-      workflowType: body.workflowType || "feature",
-      workflowDefId: def.id,
-      ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
-    },
-  }));
+  //    the orchestrator needs it for context building regardless of ticket backend).
+  //    TEAM-3703: for a dedup run this write is FENCED on the marker (see
+  //    putWorkflowRowFenced) — if we lost the marker while creating the epic above,
+  //    the row is NOT written and we coalesce onto the winner instead.
+  const fence = await putWorkflowRowFenced({
+    workflowId,
+    id: workflowId,
+    phase: intakePhase,
+    epicId,
+    repoConfig: body.repoConfig,
+    // Routine-scoped connectors (if any) — forwarded to each agent invoke so
+    // the runtime loads their creds/tools for this workflow's run only.
+    connectors: body.connectors,
+    input: body,
+    agentTasks: {},
+    messages: [],
+    humanNotifications: [],
+    startedAt: new Date().toISOString(),
+    ticketProvider: "jira",
+    workflowType: body.workflowType || "feature",
+    workflowDefId: def.id,
+    ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
+  }, markerId);
+
+  if (!fence.won) {
+    // Lost the dedup fence: the marker was re-pointed at another run while we
+    // were creating the epic. No workflow row was written. The epic we just
+    // created in Jira is now orphaned — no cheap/safe cancel transition exists
+    // on the provider, so log its id LOUDLY for cleanup rather than guess at a
+    // status name. Coalesce onto the winner (never let the loser's run proceed).
+    console.warn(
+      `[start/jira] dedup fence LOST for ${workflowId} — marker now points at ${fence.winner}. ` +
+        `ORPHANED Jira epic ${epicId} created by this loser was NOT wired to a workflow row; ` +
+        `manual cleanup may be required. Coalescing onto ${fence.winner}.`
+    );
+    return NextResponse.json({ workflowId: fence.winner, deduplicated: true });
+  }
 
   // 3. Create the intake ticket in Jira (assigned to the workflow's intake agent).
   //    TEAM-3686: the workflow row above already exists — if this fails, mark the
@@ -388,7 +500,7 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
 
 // ─── DynamoDB Backend (via ticket tools Lambda) ──────────────────────────────
 
-async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string) {
+async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string) {
   const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
   const intakePhaseName = def.phases.find((p) => p.type === "agent")?.name || "Intake";
   const workflowId = presetWorkflowId || mintWorkflowId();
@@ -413,28 +525,41 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
     transition_id: "in_progress",
   });
 
-  // 3. Create workflow metadata in workflows table
-  await ddb.send(new PutCommand({
-    TableName: WORKFLOWS_TABLE,
-    Item: {
-      workflowId,
-      id: workflowId,
-      phase: intakePhase,
-      epicId,
-      repoConfig: body.repoConfig,
-      // Routine-scoped connectors (if any) — forwarded to each agent invoke so
-      // the runtime loads their creds/tools for this workflow's run only.
-      connectors: body.connectors,
-      input: body,
-      agentTasks: {},
-      messages: [],
-      humanNotifications: [],
-      startedAt: new Date().toISOString(),
-      workflowType: body.workflowType || "feature",
-      workflowDefId: def.id,
-      ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
-    },
-  }));
+  // 3. Create workflow metadata in workflows table.
+  //    TEAM-3703: for a dedup run this write is FENCED on the marker (see
+  //    putWorkflowRowFenced) — if we lost the marker while creating/transitioning
+  //    the epic above, the row is NOT written and we coalesce onto the winner.
+  const fence = await putWorkflowRowFenced({
+    workflowId,
+    id: workflowId,
+    phase: intakePhase,
+    epicId,
+    repoConfig: body.repoConfig,
+    // Routine-scoped connectors (if any) — forwarded to each agent invoke so
+    // the runtime loads their creds/tools for this workflow's run only.
+    connectors: body.connectors,
+    input: body,
+    agentTasks: {},
+    messages: [],
+    humanNotifications: [],
+    startedAt: new Date().toISOString(),
+    workflowType: body.workflowType || "feature",
+    workflowDefId: def.id,
+    ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
+  }, markerId);
+
+  if (!fence.won) {
+    // Lost the dedup fence: the marker was re-pointed at another run while we
+    // were creating/transitioning the epic. No workflow row was written. The epic
+    // ticket we created is orphaned — log its id LOUDLY for cleanup (no safe cheap
+    // cancel transition to rely on) and coalesce onto the winner.
+    console.warn(
+      `[start] dedup fence LOST for ${workflowId} — marker now points at ${fence.winner}. ` +
+        `ORPHANED epic ${epicId} created by this loser was NOT wired to a workflow row; ` +
+        `manual cleanup may be required. Coalescing onto ${fence.winner}.`
+    );
+    return NextResponse.json({ workflowId: fence.winner, deduplicated: true });
+  }
 
   // 4. Create the intake ticket via ticket tools Lambda
   //    DDB write triggers Stream → orchestrator Lambda picks it up
