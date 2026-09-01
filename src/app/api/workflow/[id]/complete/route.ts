@@ -34,12 +34,31 @@ import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge
 import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
+import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
+import agentsConfig from "@/config/agents.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
+
+// TEAM-3619 D4a: the deliverable-evidence gate. DEFAULT OFF — with the flag off
+// a run missing evidence still completes but we shadow-log what would have been
+// blocked, so the check can be observed in prod before it's enforced. Only an
+// explicit on/true/1 turns the 409 on. This mirrors the flag posture of the
+// other lifecycle guards; there is deliberately NO force/bypass parameter.
+const COMPLETION_EVIDENCE_REQUIRED = /^(on|true|1)$/i.test(
+  process.env.COMPLETION_EVIDENCE_REQUIRED || ""
+);
+
+// agentId → agent phase, from the bundled roster (same doc the pipeline reads).
+// Used to route a child ticket to its agent phase when the ticket carries no
+// explicit `phase` stamp (TEAM-3619 D4c stamps spawned fixes; agent tickets are
+// derived from their assignee, exactly as the orchestrator does).
+const AGENT_PHASE_BY_ID: Record<string, string> = Object.fromEntries(
+  (agentsConfig.agents as Array<{ agentId: string; phase: string }>).map((a) => [a.agentId, a.phase])
+);
 
 const TERMINAL_PHASES = ["complete", "error", "cancelled"] as const;
 const DONE_STATUSES = new Set(["done", "cancelled"]);
@@ -61,6 +80,57 @@ function openChildren(tickets: Ticket[]): Ticket[] {
     const status = String(t.status || "").toLowerCase();
     return !DONE_STATUSES.has(status);
   });
+}
+
+/** The agent phase a child ticket belongs to: an explicit `phase` stamp wins
+ *  (TEAM-3619 D4c routes spawned fixes to their originating upstream phase),
+ *  else derive it from the assignee's roster phase. Undefined for humans/unknowns. */
+function phaseOfTicket(t: Ticket): string | undefined {
+  if (typeof t.phase === "string" && t.phase) return t.phase;
+  const assignee = typeof t.assignee === "string" ? t.assignee : "";
+  return AGENT_PHASE_BY_ID[assignee];
+}
+
+interface AgentTaskLike {
+  ticketId?: string;
+  output?: unknown;
+  artifactKey?: unknown;
+}
+
+/**
+ * TEAM-3619 D4a deliverable-evidence check. For every DONE (not cancelled) child
+ * ticket whose phase is one the def requires for completion, assert its agentTask
+ * entry carries proof of work: a non-empty `output` OR an `artifactKey`. A "done"
+ * ticket with an empty task is a phantom deliverable — the very thing a mistaken
+ * or injected `complete` call would rubber-stamp. Returns the offenders (empty =
+ * clean). Tickets whose phase we can't resolve, or that aren't a required phase,
+ * are left alone — this only tightens, never invents work.
+ */
+function missingEvidenceTickets(
+  tickets: Ticket[],
+  agentTasks: Record<string, AgentTaskLike>,
+  requiredPhases: string[]
+): Array<{ ticketId: string; phase: string }> {
+  if (!requiredPhases.length) return [];
+  const required = new Set(requiredPhases);
+  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
+  const byTicketId = new Map<string, AgentTaskLike>();
+  for (const entry of Object.values(tasks)) {
+    if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
+  }
+  const missing: Array<{ ticketId: string; phase: string }> = [];
+  for (const t of tickets) {
+    if (t.type === "epic") continue;
+    if (String(t.status || "").toLowerCase() !== "done") continue; // cancelled excluded
+    const phase = phaseOfTicket(t);
+    if (!phase || !required.has(phase)) continue;
+    const ticketId = String(t.ticketId || "");
+    const entry = tasks[ticketId] || byTicketId.get(ticketId);
+    const hasOutput = typeof entry?.output === "string" && entry.output.trim().length > 0;
+    const hasArtifact = typeof entry?.artifactKey === "string" && entry.artifactKey.length > 0;
+    if (!hasOutput && !hasArtifact) missing.push({ ticketId, phase });
+  }
+  return missing;
 }
 
 /**
@@ -120,6 +190,21 @@ export async function POST(
     }
     const workflow = wfResult.Item;
 
+    // TEAM-3619 D4a: cancellation strictly precedes completion. If the run was
+    // cancelled, refuse with a specific error — a cancelled run cannot be
+    // "completed" (its phase attribute may still lag behind the cancelledAt
+    // stamp, so we gate on the stamp, not only on phase === "cancelled").
+    if (workflow.cancelledAt) {
+      return NextResponse.json(
+        {
+          error: "workflow_cancelled",
+          cancelledAt: workflow.cancelledAt,
+          detail: "cancellation precedes completion; a cancelled run cannot be completed",
+        },
+        { status: 409 }
+      );
+    }
+
     if (TERMINAL_PHASES.includes(workflow.phase as (typeof TERMINAL_PHASES)[number])) {
       return NextResponse.json(
         { error: "Workflow already in terminal state", phase: workflow.phase },
@@ -155,6 +240,33 @@ export async function POST(
         },
         { status: 409 }
       );
+    }
+
+    // 2b. TEAM-3619 D4a: deliverable-evidence gate. Every done ticket in a
+    //     completion-required phase must have real work behind it (task output or
+    //     an artifact). Flag OFF → shadow-log and continue; flag ON → 409. No
+    //     bypass parameter: the same reason the open-children gate has none.
+    try {
+      const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
+      const requiredPhases = def?.completionRequiresAgentPhases || [];
+      const missing = missingEvidenceTickets(
+        tickets,
+        (workflow.agentTasks as Record<string, AgentTaskLike>) || {},
+        requiredPhases
+      );
+      if (missing.length > 0) {
+        if (COMPLETION_EVIDENCE_REQUIRED) {
+          return NextResponse.json({ error: "missing_evidence", tickets: missing }, { status: 409 });
+        }
+        console.warn(
+          `[complete] ${workflowId} would be blocked for missing evidence (flag off): ` +
+            missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ")
+        );
+      }
+    } catch (err) {
+      // Never let evidence resolution (def load) turn a legitimate completion into
+      // a 500 — the gate only tightens when it can prove a phantom deliverable.
+      console.warn(`[complete] evidence check skipped: ${(err as Error).message}`);
     }
 
     const completedAt = new Date().toISOString();

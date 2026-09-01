@@ -466,6 +466,12 @@ export async function ackNotifications(workflowId, predicate, maxAttempts = 3) {
  * /api/workflow/[id]/complete route — the orchestrator path previously used a
  * full-row put guarded only by a stale in-memory phase check (study P1).
  * Returns true when this caller performed the completion.
+ *
+ * TEAM-3619 D4a: the CAS also refuses when `cancelledAt` is stamped, so a
+ * cancellation that landed after this caller's phase read (the phase attribute
+ * itself may lag behind the cancelledAt stamp) can never be overwritten by a
+ * completion. A lost CAS is a graceful no-op (returns false, never throws) —
+ * some other actor already reached a terminal decision for this run.
  */
 export async function completeWorkflow(workflowId, completedAt) {
   try {
@@ -473,7 +479,8 @@ export async function completeWorkflow(workflowId, completedAt) {
       TableName: _table,
       Key: { workflowId },
       UpdateExpression: "SET phase = :complete, completedAt = :ts",
-      ConditionExpression: "phase <> :complete AND phase <> :cancelled AND phase <> :error",
+      ConditionExpression:
+        "phase <> :complete AND phase <> :cancelled AND phase <> :error AND attribute_not_exists(cancelledAt)",
       ExpressionAttributeValues: {
         ":complete": "complete",
         ":ts": completedAt,
@@ -483,7 +490,10 @@ export async function completeWorkflow(workflowId, completedAt) {
     }));
     return true;
   } catch (err) {
-    if (err.name === "ConditionalCheckFailedException") return false;
+    if (err.name === "ConditionalCheckFailedException") {
+      console.log(`[workflow-store] completeWorkflow(${workflowId}): CAS lost — already terminal or cancelled, no-op.`);
+      return false;
+    }
     throw err;
   }
 }
@@ -513,7 +523,7 @@ export async function claimFinalization(workflowId, staleBefore) {
       Key: { workflowId },
       UpdateExpression: "SET finalizedAt = :ts",
       ConditionExpression:
-        "phase = :complete AND attribute_not_exists(finalizedAt) AND completedAt < :staleBefore",
+        "phase = :complete AND attribute_not_exists(finalizedAt) AND attribute_not_exists(cancelledAt) AND completedAt < :staleBefore",
       ExpressionAttributeValues: {
         ":ts": new Date().toISOString(),
         ":complete": "complete",

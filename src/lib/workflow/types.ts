@@ -218,6 +218,14 @@ export interface WorkflowInput {
    * Absent → attribute omitted entirely; human/API callers are unaffected.
    */
   intakeChannel?: string;
+  /**
+   * The upstream ticket that triggered this run (e.g. a Bug being auto-filed, or
+   * an anomaly ticket). When present, POST /api/workflow/start is idempotent on
+   * (sourceTicket, workflowDefId): a redelivery for the same pair coalesces onto
+   * the still-running canonical workflow instead of forking a duplicate run.
+   * Absent → no dedup (human/API callers keep the mint-a-new-run behavior).
+   */
+  sourceTicket?: string;
 }
 
 export interface PortedSession {

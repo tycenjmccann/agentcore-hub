@@ -14,6 +14,7 @@ import {
   appendNotification,
   ackNotifications,
   completeWorkflow,
+  claimFinalization,
   appendReviewRound,
   appendReviewCapEscalation,
   appendReviewAuthorization,
@@ -268,9 +269,33 @@ describe("completeWorkflow", () => {
     expect(w.input.ConditionExpression).toContain("phase <> :cancelled");
   });
 
+  it("refuses to complete a cancelled run (TEAM-3619 D4a — cancelledAt guard)", async () => {
+    const won = await completeWorkflow("wf_1", "2026-08-30T00:00:00Z");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(cancelledAt)");
+  });
+
   it("returns false for the losing concurrent completion", async () => {
     failNextCondition = true;
     expect(await completeWorkflow("wf_1", "x")).toBe(false);
+  });
+});
+
+describe("claimFinalization", () => {
+  it("takes over a stale completion under a finalizedAt CAS that also excludes cancelled runs", async () => {
+    const won = await claimFinalization("wf_1", "2026-08-30T00:00:00Z");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.ConditionExpression).toContain("phase = :complete");
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(finalizedAt)");
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(cancelledAt)");
+    expect(w.input.ConditionExpression).toContain("completedAt < :staleBefore");
+  });
+
+  it("returns false when another retry already claimed finalization", async () => {
+    failNextCondition = true;
+    expect(await claimFinalization("wf_1", "x")).toBe(false);
   });
 });
 

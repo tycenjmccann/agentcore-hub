@@ -51,6 +51,10 @@ export default defineConfig({
       // Its ship-review.mjs arithmetic port is pinned against the TS original by
       // the auto-included src/lib/workflow/ship-review-parity.test.ts.
       "lambda/orchestrator/review-cap.test.mjs",
+      // completion.mjs (TEAM-3619 D4c) — the pure per-phase re-verify behind
+      // isWorkflowComplete (done work + approved gates + no open fixes). Plain
+      // data in, boolean out; no AWS.
+      "lambda/orchestrator/completion.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

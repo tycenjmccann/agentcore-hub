@@ -41,6 +41,7 @@ import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReviewCap } from "./review-cap.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete } from "./completion.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -804,6 +805,15 @@ async function handleReviewRejection(gateTicket) {
 
   // Re-open each upstream ticket so its agent re-runs. Done has no direct path to
   // Ready — in Jira it must hop Done → To Do (Reopen) → Ready.
+  //
+  // TEAM-3619 D4c: stamp the re-opened ticket as a review-fix routed under the
+  // gated phase (`spawnedBy` + `phase`). `isWorkflowComplete` then treats this
+  // as an open fix under `gatePhase`, so the run cannot be declared complete
+  // while a rework cycle is in flight — even if the gate ticket itself is done.
+  // (Jira tickets can't carry arbitrary columns; the reopen path re-derives
+  // phase from the assignee and the workflow row records the round, so the DDB
+  // stamp is where this metadata lands.)
+  const spawnedBy = { gateTicketId: gateTicket.ticketId, kind: "review_fix" };
   for (const up of upstream) {
     if (TICKET_PROVIDER === "jira") {
       await jiraReopenToReady(up.ticketId);
@@ -811,9 +821,18 @@ async function handleReviewRejection(gateTicket) {
       await ddb.send(new UpdateCommand({
         TableName: TICKETS_TABLE,
         Key: { ticketId: up.ticketId },
-        UpdateExpression: "SET #s = :s, #u = :u",
-        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-        ExpressionAttributeValues: { ":s": "todo", ":u": new Date().toISOString() },
+        UpdateExpression: "SET #s = :s, #u = :u, spawnedBy = :sb" + (gatePhase ? ", #ph = :ph" : ""),
+        ExpressionAttributeNames: {
+          "#s": "status",
+          "#u": "updatedAt",
+          ...(gatePhase ? { "#ph": "phase" } : {}),
+        },
+        ExpressionAttributeValues: {
+          ":s": "todo",
+          ":u": new Date().toISOString(),
+          ":sb": spawnedBy,
+          ...(gatePhase ? { ":ph": gatePhase } : {}),
+        },
       }));
     }
   }
@@ -1337,29 +1356,29 @@ async function isWorkflowComplete(epicId, workflow) {
   const children = await getChildTickets(epicId);
   if (children.length === 0) return false;
 
-  // Gate: at least one ticket in a "terminal" agent phase must be done — so a
-  // workflow isn't declared complete after only requirements/design finish.
   const wfDef = getWorkflowDef(workflow?.workflowDefId);
-  const terminalPhases = wfDef.completionRequiresAgentPhases || [];
 
-  let hasTerminalDone;
-  if (terminalPhases.length > 0) {
-    // Config-driven: map each ticket's assignee → agent phase via the roster.
-    hasTerminalDone = children.some((t) => {
-      if (t.status !== "done" || !t.assignee) return false;
-      const def = getAgentDef(t.assignee);
-      return def && terminalPhases.includes(def.phase);
-    });
-  } else {
-    // Legacy suffix heuristic (software-delivery shape) — preserved as fallback.
-    hasTerminalDone = children.some((t) => {
-      const assignee = t.assignee || "";
-      const isDevOrQa = assignee.endsWith("_dev") || assignee.includes("_qa") || assignee.includes("_ci");
-      return isDevOrQa && t.status === "done";
-    });
-  }
-  if (!hasTerminalDone) return false;
-  return children.every((t) => t.status === "done");
+  // Resolve a gate ticket's guarded phase the same way handleReviewRejection
+  // does — from the agent phase of the upstream tickets it blocks. Prefer any
+  // in-memory child (no fetch); fall back to a lookup for out-of-batch upstreams.
+  const childById = new Map(children.map((t) => [t.ticketId, t]));
+  const gatePhaseOf = (gateTicket) => {
+    if (typeof gateTicket.phase === "string" && gateTicket.phase) return gateTicket.phase;
+    for (const upId of gateTicket.blockedBy || []) {
+      const up = childById.get(upId);
+      const phase = up && getAgentDef(up.assignee)?.phase;
+      if (phase) return phase;
+    }
+    return undefined;
+  };
+
+  // TEAM-3619 D4c: per-phase re-verify (done work + approved gates + no open
+  // fixes), or the legacy heuristic when the def declares no required phases.
+  return evaluateWorkflowComplete(children, wfDef, {
+    getAgentPhase: (assignee) => getAgentDef(assignee)?.phase,
+    gatePhaseOf,
+    requestedGates: workflow?.input?.reviewGates || [],
+  });
 }
 
 async function completeWorkflow(workflow) {
