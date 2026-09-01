@@ -50,6 +50,9 @@ const h = vi.hoisted(() => {
     tickets: new Map<string, { type: string; status: string }>(),
     ticketSeq: 0,
     failDoneTransitionOnce: false,
+    // TEAM-3708: force the next Tickets___add_comment call to reject, to prove
+    // the (cosmetic) audit comment can never block the terminal done transition.
+    failAddCommentOnce: false,
     epicSeq: 0,
     jiraDeleted: [] as string[],
     failJiraDeleteOnce: false,
@@ -175,6 +178,10 @@ vi.mock("@aws-sdk/client-lambda", () => {
           result = { key: p.ticket_id, status: "transitioned", to: p.transition_id };
         }
       } else if (call.tool_name === "Tickets___add_comment") {
+        if (h.failAddCommentOnce) {
+          h.failAddCommentOnce = false;
+          throw new Error("injected add_comment failure");
+        }
         result = { id: "comment-1" };
       }
       // TEAM-3703: interpose a concurrent racer exactly once, mid-start, to model
@@ -253,6 +260,7 @@ beforeEach(async () => {
   h.tickets.clear();
   h.ticketSeq = 0;
   h.failDoneTransitionOnce = false;
+  h.failAddCommentOnce = false;
   h.epicSeq = 0;
   h.jiraDeleted.length = 0;
   h.failJiraDeleteOnce = false;
@@ -604,10 +612,13 @@ describe("POST /api/workflow/start — orphan-epic cleanup on fence loss (TEAM-3
     const loserEpic = epicKeys().find((k) => k !== bBody.epicId)!;
     expect(loserEpic).toBeTruthy();
 
-    // Audit comment on the loser's epic names the winning workflow.
+    // Audit comment on the loser's epic names the winning workflow. TEAM-3708:
+    // the real Tickets___add_comment contract (deploy/runtime-agent/main.py:1312,
+    // lambda/agentcore-hub-jira/index.mjs:534) takes `comment`, not `body`.
     const comment = h.invokes.find((i) => i.tool_name === "Tickets___add_comment");
     expect(comment?.parameters?.ticket_id).toBe(loserEpic);
-    expect(comment?.parameters?.body).toContain(bBody.workflowId);
+    expect(comment?.parameters?.comment).toContain(bBody.workflowId);
+    expect(comment?.parameters?.body).toBeUndefined();
 
     // Terminal transition was requested for the loser's epic and applied.
     const done = h.invokes.find(
@@ -622,6 +633,31 @@ describe("POST /api/workflow/start — orphan-epic cleanup on fence loss (TEAM-3
     // Net effect: exactly one persistent (non-cancelled) epic — the winner's.
     expect(h.tickets.get(bBody.epicId!)?.status).toBe("in_progress");
     expect(liveEpicKeys()).toEqual([bBody.epicId]);
+    errSpy.mockRestore();
+  });
+
+  it("dynamodb: add_comment throws/rejects → done transition still executes, orphan is still cancelled", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.failAddCommentOnce = true;
+    const { aRes, aBody, bBody } = await raceOverlap(post);
+
+    // The comment call rejected, but that is cosmetic — the response is
+    // unaffected and the terminal transition still ran.
+    expect(aRes.status).toBe(200);
+    expect(aBody).toMatchObject({ workflowId: bBody.workflowId, deduplicated: true });
+
+    const loserEpic = epicKeys().find((k) => k !== bBody.epicId)!;
+    const done = h.invokes.find(
+      (i) => i.tool_name === "Tickets___transition_ticket" && i.parameters?.transition_id === "done"
+    );
+    expect(done?.parameters?.ticket_id).toBe(loserEpic);
+    expect(h.tickets.get(loserEpic)?.status).toBe("done");
+    expect(liveEpicKeys()).toEqual([bBody.epicId]);
+
+    // The comment failure was logged, but as a comment failure — never as a
+    // cancel/manual-cleanup failure (the cancellation itself succeeded).
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("FAILED to add cancellation audit comment"));
+    expect(errSpy).not.toHaveBeenCalledWith(expect.stringContaining("FAILED to cancel orphan epic"));
     errSpy.mockRestore();
   });
 
