@@ -24,7 +24,7 @@ import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
 
 const h = vi.hoisted(() => {
   const store = new Map<string, Record<string, unknown>>();
-  const invokes: Array<{ tool_name: string }> = [];
+  const invokes: Array<{ tool_name: string; parameters?: Record<string, string> }> = [];
   const puts: Array<Record<string, unknown>> = [];
   // TEAM-3703: every TransactWriteCommand input recorded so tests can assert the
   // marker ConditionCheck (fence) shape.
@@ -41,6 +41,18 @@ const h = vi.hoisted(() => {
     //    WITHOUT mutating the store (simulates a transient transaction conflict).
     onInvoke: null as null | (() => Promise<void>),
     failTransactOnce: false,
+    // TEAM-3705: epic-level state so orphan cleanup can be asserted.
+    //  - tickets: every ticket the DDB Lambda "created", with its live status
+    //    (create → todo, transition_ticket → target status).
+    //  - failDoneTransitionOnce: next transition_id="done" returns the Lambda's
+    //    textResult failure shape (drives the cleanup-failure path).
+    //  - jiraDeleted / failJiraDeleteOnce: same pair for JiraCloudProvider.deleteIssue.
+    tickets: new Map<string, { type: string; status: string }>(),
+    ticketSeq: 0,
+    failDoneTransitionOnce: false,
+    epicSeq: 0,
+    jiraDeleted: [] as string[],
+    failJiraDeleteOnce: false,
   };
 });
 
@@ -141,7 +153,30 @@ vi.mock("@aws-sdk/client-lambda", () => {
   }
   class LambdaClient {
     async send(cmd: InstanceType<typeof InvokeCommand>) {
-      h.invokes.push(JSON.parse(Buffer.from(cmd.Payload).toString("utf8")));
+      const call = JSON.parse(Buffer.from(cmd.Payload).toString("utf8"));
+      h.invokes.push(call);
+      const p = (call.parameters ?? {}) as Record<string, string>;
+      // TEAM-3705: compute the result (and assign create keys) BEFORE the
+      // interpose hook runs, so a stalled request's epic keeps its own key even
+      // though the racer completes first.
+      let result: Record<string, unknown> = { key: "TEAM-100" };
+      if (call.tool_name === "Tickets___create_ticket") {
+        const key = `TEAM-${100 + h.ticketSeq++}`;
+        h.tickets.set(key, { type: p.issue_type || "Task", status: "todo" });
+        result = { key };
+      } else if (call.tool_name === "Tickets___transition_ticket") {
+        if (p.transition_id === "done" && h.failDoneTransitionOnce) {
+          h.failDoneTransitionOnce = false;
+          // The real Lambda's failure shape for an invalid transition.
+          result = { content: [{ text: 'Invalid transition "done" — injected cleanup failure' }] };
+        } else {
+          const row = h.tickets.get(p.ticket_id);
+          if (row) row.status = p.transition_id;
+          result = { key: p.ticket_id, status: "transitioned", to: p.transition_id };
+        }
+      } else if (call.tool_name === "Tickets___add_comment") {
+        result = { id: "comment-1" };
+      }
       // TEAM-3703: interpose a concurrent racer exactly once, mid-start, to model
       // a request that stalls during slow external (epic) work before its row write.
       if (h.onInvoke) {
@@ -149,7 +184,7 @@ vi.mock("@aws-sdk/client-lambda", () => {
         h.onInvoke = null;
         await f();
       }
-      return { Payload: new TextEncoder().encode(JSON.stringify({ key: "TEAM-100" })) };
+      return { Payload: new TextEncoder().encode(JSON.stringify(result)) };
     }
   }
   return { LambdaClient, InvokeCommand };
@@ -160,17 +195,28 @@ vi.mock("@aws-sdk/client-lambda", () => {
 vi.mock("@/lib/workflow/ticket-provider-jira", () => {
   class JiraCloudProvider {
     async createEpic() {
+      // TEAM-3705: unique per-call id, assigned BEFORE the interpose hook so the
+      // stalled loser and the racing winner get distinguishable epics.
+      const id = `JIRA-EPIC-${++h.epicSeq}`;
       if (h.onInvoke) {
         const f = h.onInvoke;
         h.onInvoke = null;
         await f();
       }
-      return { id: "JIRA-EPIC-1" };
+      return { id };
     }
     async createTicket() {
       return { id: "JIRA-TICKET-1" };
     }
     async transitionTo() {}
+    // TEAM-3705: orphan-epic cleanup seam.
+    async deleteIssue(issueKey: string) {
+      if (h.failJiraDeleteOnce) {
+        h.failJiraDeleteOnce = false;
+        throw new Error(`Jira API error 403 Forbidden on DELETE /rest/api/3/issue/${issueKey}: no permission`);
+      }
+      h.jiraDeleted.push(issueKey);
+    }
   }
   return { JiraCloudProvider };
 });
@@ -204,6 +250,12 @@ beforeEach(async () => {
   h.transacts.length = 0;
   h.onInvoke = null;
   h.failTransactOnce = false;
+  h.tickets.clear();
+  h.ticketSeq = 0;
+  h.failDoneTransitionOnce = false;
+  h.epicSeq = 0;
+  h.jiraDeleted.length = 0;
+  h.failJiraDeleteOnce = false;
   process.env.TICKET_PROVIDER = "dynamodb";
   vi.resetModules();
   ({ POST } = await import("./route"));
@@ -507,5 +559,140 @@ describe("POST /api/workflow/start — ownership fence under the Jira backend (T
     expect(aBody).toMatchObject({ workflowId: bBody!.workflowId, deduplicated: true });
     expect(wfRows()).toEqual([bBody!.workflowId]);
     expect(h.store.get(markerId9())?.canonicalWorkflowId).toBe(bBody!.workflowId);
+  });
+});
+
+/**
+ * TEAM-3705 — orphan-epic cleanup on fence loss (P2 residual of TEAM-3703).
+ *
+ * The fence stops the loser's workflow ROW, but the loser has already created a
+ * persistent EXTERNAL epic before losing. These tests drive the same >grace
+ * overlap interleaving as the TEAM-3703 tests and assert EPIC-level cleanup:
+ * the loser's epic is deleted (Jira) or cancelled via its terminal transition
+ * with an audit comment (DynamoDB), the winner's epic is untouched, and cleanup
+ * failure degrades to a logged manual-cleanup warning — never a failed response.
+ */
+describe("POST /api/workflow/start — orphan-epic cleanup on fence loss (TEAM-3705)", () => {
+  /** Run the >grace overlap: A stalls in epic creation, B runs to completion. */
+  async function raceOverlap(send: (body: Record<string, unknown>) => Promise<Response>) {
+    let bBody: { workflowId: string; epicId?: string; deduplicated?: boolean } | undefined;
+    h.onInvoke = async () => {
+      const m = h.store.get(markerId9())!;
+      m.createdAt = new Date(Date.now() - 10 * 60_000).toISOString();
+      h.store.set(markerId9(), m);
+      bBody = await (await send({ title: "B", sourceTicket: "TEAM-9", workflowDefId: "software-delivery" })).json();
+    };
+    const aRes = await send({ title: "A", sourceTicket: "TEAM-9", workflowDefId: "software-delivery" });
+    return { aRes, aBody: await aRes.json(), bBody: bBody! };
+  }
+
+  const epicKeys = () => [...h.tickets.entries()].filter(([, t]) => t.type === "Epic").map(([k]) => k);
+  const liveEpicKeys = () =>
+    [...h.tickets.entries()].filter(([, t]) => t.type === "Epic" && t.status !== "done").map(([k]) => k);
+
+  it("dynamodb: loser's orphan epic gets the audit comment and a done transition; winner's epic is the only live one", async () => {
+    const errSpy = vi.spyOn(console, "error");
+    const { aRes, aBody, bBody } = await raceOverlap(post);
+
+    expect(bBody.deduplicated).toBeUndefined();
+    expect(aRes.status).toBe(200);
+    expect(aBody).toMatchObject({ workflowId: bBody.workflowId, deduplicated: true });
+
+    // Two epics were created during the race; the loser's is the one that is
+    // NOT the winner's epicId.
+    expect(epicKeys()).toHaveLength(2);
+    const loserEpic = epicKeys().find((k) => k !== bBody.epicId)!;
+    expect(loserEpic).toBeTruthy();
+
+    // Audit comment on the loser's epic names the winning workflow.
+    const comment = h.invokes.find((i) => i.tool_name === "Tickets___add_comment");
+    expect(comment?.parameters?.ticket_id).toBe(loserEpic);
+    expect(comment?.parameters?.body).toContain(bBody.workflowId);
+
+    // Terminal transition was requested for the loser's epic and applied.
+    const done = h.invokes.find(
+      (i) => i.tool_name === "Tickets___transition_ticket" && i.parameters?.transition_id === "done"
+    );
+    expect(done?.parameters?.ticket_id).toBe(loserEpic);
+    expect(h.tickets.get(loserEpic)?.status).toBe("done");
+    // The route verified the { status: "transitioned" } success shape — no
+    // manual-cleanup error was logged.
+    expect(errSpy).not.toHaveBeenCalledWith(expect.stringContaining("FAILED to cancel orphan epic"));
+
+    // Net effect: exactly one persistent (non-cancelled) epic — the winner's.
+    expect(h.tickets.get(bBody.epicId!)?.status).toBe("in_progress");
+    expect(liveEpicKeys()).toEqual([bBody.epicId]);
+    errSpy.mockRestore();
+  });
+
+  it("dynamodb: cleanup transition fails → still deduplicated success, manual-cleanup logged, loser epic left as-is", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.failDoneTransitionOnce = true;
+    const { aRes, aBody, bBody } = await raceOverlap(post);
+
+    // The response is unaffected by the cleanup failure.
+    expect(aRes.status).toBe(200);
+    expect(aBody).toMatchObject({ workflowId: bBody.workflowId, deduplicated: true });
+    expect(wfRows()).toEqual([bBody.workflowId]);
+
+    // The failure was logged for manual cleanup, and the loser's epic was not
+    // silently marked done.
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("FAILED to cancel orphan epic"));
+    const loserEpic = epicKeys().find((k) => k !== bBody.epicId)!;
+    expect(h.tickets.get(loserEpic)?.status).not.toBe("done");
+    errSpy.mockRestore();
+  });
+
+  describe("jira backend", () => {
+    let jiraPost: (body: Record<string, unknown>) => ReturnType<typeof POST>;
+
+    beforeEach(async () => {
+      process.env.TICKET_PROVIDER = "jira";
+      vi.resetModules();
+      const mod = await import("./route");
+      jiraPost = (body) =>
+        mod.POST(
+          new NextRequest("http://localhost/api/workflow/start", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          })
+        );
+    });
+
+    it("jira: loser's epic is deleted via deleteIssue; winner's epic is never deleted", async () => {
+      const errSpy = vi.spyOn(console, "error");
+      const { aRes, aBody, bBody } = await raceOverlap(jiraPost);
+
+      expect(bBody.deduplicated).toBeUndefined();
+      expect(aRes.status).toBe(200);
+      expect(aBody).toMatchObject({ workflowId: bBody.workflowId, deduplicated: true });
+
+      // A created JIRA-EPIC-1 (stalled), B created JIRA-EPIC-2 (winner).
+      expect(bBody.epicId).toBe("JIRA-EPIC-2");
+      expect(h.jiraDeleted).toEqual(["JIRA-EPIC-1"]);
+      expect(h.jiraDeleted).not.toContain(bBody.epicId);
+      expect(errSpy).not.toHaveBeenCalledWith(expect.stringContaining("FAILED to delete orphan Jira epic"));
+
+      // Net effect: of the two epics created, exactly one persists.
+      const persistent = ["JIRA-EPIC-1", "JIRA-EPIC-2"].filter((id) => !h.jiraDeleted.includes(id));
+      expect(persistent).toEqual([bBody.epicId]);
+      errSpy.mockRestore();
+    });
+
+    it("jira: deleteIssue throws (403) → still deduplicated success, manual-cleanup logged", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      h.failJiraDeleteOnce = true;
+      const { aRes, aBody, bBody } = await raceOverlap(jiraPost);
+
+      expect(aRes.status).toBe(200);
+      expect(aBody).toMatchObject({ workflowId: bBody.workflowId, deduplicated: true });
+      expect(wfRows()).toEqual([bBody.workflowId]);
+
+      // Nothing was deleted, and the orphan was logged for manual cleanup.
+      expect(h.jiraDeleted).toEqual([]);
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("FAILED to delete orphan Jira epic JIRA-EPIC-1"));
+      errSpy.mockRestore();
+    });
   });
 });
