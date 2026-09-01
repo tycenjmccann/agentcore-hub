@@ -63,6 +63,7 @@ function queryEventsPage(events, input) {
 function makeDeps(overrides = {}) {
   const store = {
     markDeadSessionDetected: vi.fn(async () => true),
+    clearDeadSessionDetected: vi.fn(async () => true),
     incrementDeadSessionRetry: vi.fn(async () => 1),
     setTaskStatus: vi.fn(async () => {}),
     appendNotification: vi.fn(async () => {}),
@@ -170,21 +171,45 @@ describe("second dead session, same ticket (retry exhausted)", () => {
 });
 
 describe("shadow mode", () => {
-  it("emits a shadow-flagged agent.error and writes NOTHING", async () => {
+  it("emits a shadow-flagged dead_session.shadow and writes NOTHING", async () => {
     const { deps, store, lease } = makeDeps();
     const { runSweep } = createDetector(deps);
 
     const m = await runSweep("shadow");
 
-    const errs = eventsOfType(deps.publishEvent, "agent.error");
-    expect(errs).toHaveLength(1);
-    expect(errs[0][2].shadow).toBe(true);
+    const obs = eventsOfType(deps.publishEvent, "dead_session.shadow");
+    expect(obs).toHaveLength(1);
+    // Full observation payload is preserved (TEAM-3698 F2) — only the type changed.
+    expect(obs[0][2].shadow).toBe(true);
+    expect(obs[0][2].reason).toBe("dead_session");
+    expect(obs[0][2]).toMatchObject({ workflowId: "wf_1", ticketId: "TEAM-2", agentId: "dev" });
+    expect(obs[0][2].detectorMeta).toBeDefined();
+    expect(obs[0][2].detectorMeta.claimStartedAt).toBe(DEAD_STARTED);
+    // TEAM-3698: never agent.error — the UI error stream and the anomaly
+    // watcher's agent_error_retry_rate both read that type as a real failure.
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
     expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
     expect(lease.stealClaim).not.toHaveBeenCalled();
     expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
     expect(deps.redispatch).not.toHaveBeenCalled();
     expect(store.setTaskStatus).not.toHaveBeenCalled();
     expect(m.fired).toBe(1);
+  });
+});
+
+describe("enforce publishes a real agent.error (TEAM-3698 F2)", () => {
+  it("the death announcement is agent.error with NO shadow flag and no dead_session.shadow", async () => {
+    const { deps } = makeDeps();
+    const { runSweep } = createDetector(deps);
+
+    await runSweep("enforce");
+
+    const errs = eventsOfType(deps.publishEvent, "agent.error");
+    expect(errs).toHaveLength(1);
+    expect(errs[0][2].reason).toBe("dead_session");
+    expect(errs[0][2].shadow).toBeUndefined();
+    // Enforce mode never emits the shadow-only observation type.
+    expect(eventsOfType(deps.publishEvent, "dead_session.shadow")).toHaveLength(0);
   });
 });
 
@@ -449,6 +474,9 @@ describe("stolen-but-stalled backstop (TEAM-3683 F2)", () => {
     // The stamp + steal already happened last sweep — never repeated.
     expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
     expect(lease.stealClaim).not.toHaveBeenCalled();
+    // TEAM-3698: the clear is a resurrected-path-only concern — the backstop
+    // re-drives on the stamp, so it must NEVER clear it.
+    expect(store.clearDeadSessionDetected).not.toHaveBeenCalled();
   });
 
   it("escalates when priorRetries ≥ 1 — no redispatch", async () => {
@@ -523,6 +551,105 @@ describe("resurrection TOCTOU re-check (TEAM-3683 F4)", () => {
     expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
     expect(m.skippedLiveLease).toBe(1);
     expect(m.fired).toBe(0);
+    // TEAM-3698: the stamp we just wrote is CLEARED on the exact generation, so
+    // a later silent death on this same claim is not permanently suppressed.
+    expect(store.clearDeadSessionDetected).toHaveBeenCalledWith("wf_1", "TEAM-2", DEAD_STARTED);
+  });
+});
+
+describe("recovery is never permanently suppressed (TEAM-3698 F1)", () => {
+  it("resurrect-then-die: stamp cleared on resurrection, a later sweep on the SAME claim fires + retries", async () => {
+    // A mutable clock so the second sweep is genuinely "later" — the claim is
+    // never re-issued, so silence is still measured from the same startedAt.
+    let clock = NOW;
+    const { deps, store, lease } = makeDeps({ now: () => clock });
+    // Liveness is decided purely by whether a heartbeat is visible.
+    lease.isLeaseLive.mockImplementation((task, activityIso) => activityIso != null);
+    const { runSweep } = createDetector(deps);
+
+    // ── Sweep 1: dead at guard 1, then a heartbeat lands before the steal. ──
+    lease.lastAgentActivity
+      .mockResolvedValueOnce(null)                                  // guard 1: silent
+      .mockResolvedValueOnce(new Date(NOW - 1000).toISOString());   // re-check: resurrected
+    const m1 = await runSweep("enforce");
+
+    expect(m1.skippedLiveLease).toBe(1);
+    expect(m1.fired).toBe(0);
+    expect(store.markDeadSessionDetected).toHaveBeenCalledTimes(1);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
+    // The stamp came back OFF, scoped to this exact claim generation.
+    expect(store.clearDeadSessionDetected).toHaveBeenCalledTimes(1);
+    expect(store.clearDeadSessionDetected).toHaveBeenCalledWith("wf_1", "TEAM-2", DEAD_STARTED);
+
+    // ── Sweep 2 (later): the SAME claim generation goes silent again. ───────
+    // No mockResolvedValueOnce queued → lastAgentActivity returns null (the
+    // base stub): dead at guard 1 AND at the re-check.
+    clock = NOW + 10 * 60 * 1000;
+    const m2 = await runSweep("enforce");
+
+    // It fires: not suppressed. Stamp → steal (same generation) → error.
+    expect(store.markDeadSessionDetected).toHaveBeenCalledTimes(2);
+    expect(lease.stealClaim).toHaveBeenCalledWith(deps.ddb, "workflows", "wf_1", "TEAM-2", DEAD_STARTED);
+    const errs = eventsOfType(deps.publishEvent, "agent.error");
+    expect(errs).toHaveLength(1);
+    expect(errs[0][2].shadow).toBeUndefined();
+    // Retry-once: prior retries 0 → increment + redispatch.
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(m2.fired).toBe(1);
+    expect(m2.retries).toBe(1);
+    expect(m2.escalations).toBe(0);
+    // The clear fired only on the resurrected sweep, never on the firing sweep.
+    expect(store.clearDeadSessionDetected).toHaveBeenCalledTimes(1);
+  });
+
+  it("resurrect-then-die with retries already 1: the later sweep ESCALATES, not retries", async () => {
+    let clock = NOW;
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), now: () => clock });
+    lease.isLeaseLive.mockImplementation((task, activityIso) => activityIso != null);
+    const { runSweep } = createDetector(deps);
+
+    lease.lastAgentActivity
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(new Date(NOW - 1000).toISOString());
+    const m1 = await runSweep("enforce");
+    expect(store.clearDeadSessionDetected).toHaveBeenCalledWith("wf_1", "TEAM-2", DEAD_STARTED);
+    expect(m1.fired).toBe(0);
+
+    clock = NOW + 10 * 60 * 1000;
+    const m2 = await runSweep("enforce");
+
+    const esc = eventsOfType(deps.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    expect(esc[0][2].reason).toBe("dead_session_retry_exhausted");
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(m2.escalations).toBe(1);
+    expect(m2.retries).toBe(0);
+  });
+
+  it("clear CAS loses (generation moved between stamp and clear): logs, no steal, no throw", async () => {
+    const log = vi.fn();
+    const { deps, store, lease } = makeDeps({ log });
+    store.clearDeadSessionDetected.mockResolvedValue(false); // CAS lost
+    lease.lastAgentActivity
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(new Date(NOW - 1000).toISOString());
+    lease.isLeaseLive.mockImplementation((task, activityIso) => activityIso != null);
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce"); // must not throw
+
+    expect(store.clearDeadSessionDetected).toHaveBeenCalledTimes(1);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
+    expect(m.skippedLiveLease).toBe(1);
+    expect(m.fired).toBe(0);
+    expect(m.candidateErrors).toBe(0); // a lost clear CAS is not an error
+    expect(log.mock.calls.some(([msg]) => msg.includes("detector.resurrected"))).toBe(true);
   });
 });
 
@@ -541,9 +668,9 @@ describe("mode normalization (TEAM-3683 F5)", () => {
     const { runSweep } = createDetector(deps);
     const m = await runSweep("Shadow ");
     expect(m.mode).toBe("shadow");
-    const errs = eventsOfType(deps.publishEvent, "agent.error");
-    expect(errs).toHaveLength(1);
-    expect(errs[0][2].shadow).toBe(true);
+    const obs = eventsOfType(deps.publishEvent, "dead_session.shadow");
+    expect(obs).toHaveLength(1);
+    expect(obs[0][2].shadow).toBe(true);
     expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
     expect(lease.stealClaim).not.toHaveBeenCalled();
   });
@@ -574,9 +701,9 @@ describe("mode normalization (TEAM-3683 F5)", () => {
       expect(lease.stealClaim).not.toHaveBeenCalled();
       expect(deps.redispatch).not.toHaveBeenCalled();
       // Still swept: the would-fire lands as a shadow-flagged event.
-      const errs = eventsOfType(deps.publishEvent, "agent.error");
-      expect(errs).toHaveLength(1);
-      expect(errs[0][2].shadow).toBe(true);
+      const obs = eventsOfType(deps.publishEvent, "dead_session.shadow");
+      expect(obs).toHaveLength(1);
+      expect(obs[0][2].shadow).toBe(true);
     }
   );
 });

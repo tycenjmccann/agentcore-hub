@@ -76,6 +76,16 @@ async function ensureAgentTasksMap(workflowId) {
  */
 export async function claimInvocation(workflowId, ticketId, entry, staleBefore) {
   await ensureAgentTasksMap(workflowId);
+  // TEAM-3698: a FRESH claim generation must never inherit the previous
+  // generation's deadSessionDetectedAt stamp. Callers build the entry by
+  // spreading the prior task (index.mjs claimTicketInvocation), so the stamp
+  // would ride along onto a new startedAt — and the dead-session detector skips
+  // any live task that is already stamped, permanently suppressing recovery for
+  // that new generation. This write replaces the whole entry, so dropping the
+  // key here IS the REMOVE (DynamoDB rejects a SET and a REMOVE on overlapping
+  // document paths in one expression). Enforced here, in the sole writer (R2),
+  // so no caller can reintroduce the inheritance.
+  const { deadSessionDetectedAt: _staleStamp, ...task } = entry || {};
   try {
     await _ddb.send(new UpdateCommand({
       TableName: _table,
@@ -85,7 +95,7 @@ export async function claimInvocation(workflowId, ticketId, entry, staleBefore) 
         "attribute_not_exists(agentTasks.#tid) OR agentTasks.#tid.#st <> :running OR agentTasks.#tid.startedAt < :staleBefore",
       ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
       ExpressionAttributeValues: {
-        ":task": entry,
+        ":task": task,
         ":running": "running",
         ":staleBefore": staleBefore,
       },
@@ -222,6 +232,42 @@ export async function markDeadSessionDetected(workflowId, ticketId, expectedStar
         ":now": new Date().toISOString(),
         ...(expectedStartedAt ? { ":expected": expectedStartedAt } : {}),
       },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * Un-stamp a dead-session detection (TEAM-3698). The detector stamps BEFORE its
+ * TOCTOU lease re-check; when that re-check finds the agent resurrected
+ * (heartbeated after the stamp), the stamp must come back off — a stamped live
+ * task is skipped by every later sweep, so leaving it would permanently suppress
+ * recovery if that same claim generation dies silently later.
+ *
+ * REMOVEs deadSessionDetectedAt ONLY IF the entry still holds the exact claim
+ * generation the sweep inspected (same startedAt — or, mirroring
+ * markDeadSessionDetected/stealClaim, still no startedAt at all) and is in fact
+ * stamped. Losing the CAS means the generation moved on (re-claimed, completed,
+ * escalated) and the stamp is no longer ours to clear — the caller just logs.
+ * Scoped to the task's own map keys; never a full-map replacement (R2). Returns
+ * true when this caller cleared the stamp.
+ */
+export async function clearDeadSessionDetected(workflowId, ticketId, expectedStartedAt) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE agentTasks.#tid.deadSessionDetectedAt",
+      ConditionExpression: expectedStartedAt
+        ? "agentTasks.#tid.startedAt = :expected AND attribute_exists(agentTasks.#tid.deadSessionDetectedAt)"
+        : "attribute_not_exists(agentTasks.#tid.startedAt) AND attribute_exists(agentTasks.#tid.deadSessionDetectedAt)",
+      ExpressionAttributeNames: { "#tid": ticketId },
+      // A REMOVE with no placeholder needs NO values map at all — an empty
+      // ExpressionAttributeValues is a validation error, so omit the key.
+      ...(expectedStartedAt ? { ExpressionAttributeValues: { ":expected": expectedStartedAt } } : {}),
     }));
     return true;
   } catch (err) {

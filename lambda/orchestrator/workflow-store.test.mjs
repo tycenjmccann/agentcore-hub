@@ -8,6 +8,7 @@ import {
   completeTaskEntry,
   setTaskStatus,
   markDeadSessionDetected,
+  clearDeadSessionDetected,
   incrementDeadSessionRetry,
   advancePhase,
   setResumeContext,
@@ -95,6 +96,19 @@ describe("claimInvocation", () => {
     expect(claim.input.ConditionExpression).toContain("agentTasks.#tid.startedAt < :staleBefore");
   });
 
+  it("strips a stale deadSessionDetectedAt so a FRESH generation never inherits it (TEAM-3698 F1)", async () => {
+    // A caller that spreads the prior task (index.mjs claimTicketInvocation)
+    // could carry the previous generation's stamp onto the new startedAt — the
+    // detector then skips the live+stamped task forever. The sole writer drops it.
+    const inherited = { ...entry, startedAt: "2026-08-31T00:00:00Z", deadSessionDetectedAt: "2026-08-30T12:00:00Z" };
+    await claimInvocation("wf_1", "TEAM-2", inherited, "2026-08-30T23:00:00Z");
+    const claim = writes().find((c) => c.input.ConditionExpression?.includes(":running"));
+    expect(claim.input.ExpressionAttributeValues[":task"]).not.toHaveProperty("deadSessionDetectedAt");
+    // The rest of the fresh entry is untouched.
+    expect(claim.input.ExpressionAttributeValues[":task"].startedAt).toBe("2026-08-31T00:00:00Z");
+    expect(claim.input.ExpressionAttributeValues[":task"].status).toBe("running");
+  });
+
   it("loses to a live concurrent claim", async () => {
     failNextCondition = true;
     // first send is the ensure-map write (no condition) — make the claim fail
@@ -179,6 +193,37 @@ describe("markDeadSessionDetected", () => {
     );
     expect(w.input.ConditionExpression).not.toContain(":expected");
     expect(w.input.ExpressionAttributeValues).not.toHaveProperty(":expected");
+  });
+});
+
+describe("clearDeadSessionDetected (TEAM-3698 F1)", () => {
+  it("REMOVEs the stamp under a CAS on the exact claim generation + attribute_exists", async () => {
+    const won = await clearDeadSessionDetected("wf_1", "TEAM-2", "2026-08-30T00:00:00Z");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("REMOVE agentTasks.#tid.deadSessionDetectedAt");
+    expect(w.input.ConditionExpression).toBe(
+      "agentTasks.#tid.startedAt = :expected AND attribute_exists(agentTasks.#tid.deadSessionDetectedAt)"
+    );
+    expect(w.input.ExpressionAttributeValues[":expected"]).toBe("2026-08-30T00:00:00Z");
+  });
+
+  it("returns false when the generation moved between stamp and clear", async () => {
+    failNextCondition = true;
+    expect(await clearDeadSessionDetected("wf_1", "TEAM-2", "x")).toBe(false);
+  });
+
+  it("falls back to attribute_not_exists(startedAt) and omits ExpressionAttributeValues when no startedAt", async () => {
+    // No placeholder in the expression → the values map must be ABSENT (an empty
+    // map is a ValidationException); the stub also rejects any dangling placeholder.
+    const won = await clearDeadSessionDetected("wf_1", "TEAM-2", undefined);
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.ConditionExpression).toBe(
+      "attribute_not_exists(agentTasks.#tid.startedAt) AND attribute_exists(agentTasks.#tid.deadSessionDetectedAt)"
+    );
+    expect(w.input.ConditionExpression).not.toContain(":expected");
+    expect(w.input.ExpressionAttributeValues).toBeUndefined();
   });
 });
 

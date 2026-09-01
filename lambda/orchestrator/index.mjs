@@ -650,8 +650,14 @@ async function claimTicketInvocation(workflow, ticketId, assignee) {
   const ttlMinutes = Number(process.env.WORKFLOW_LEASE_TTL_MINUTES);
   const leaseTtlMs = (Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? ttlMinutes : DEFAULT_TTL_MINUTES) * 60_000;
   const staleBefore = new Date(Date.now() - STALE_CLAIM_MULTIPLIER * leaseTtlMs).toISOString();
+  // TEAM-3698: drop any deadSessionDetectedAt from the PRIOR generation — this
+  // is a new claim (new startedAt), so a stamp carried over would make the
+  // dead-session detector skip it as "already handled" forever. The store
+  // strips it on the write too (R2, sole writer); this keeps the in-memory
+  // snapshot handed back to the caller honest.
+  const { deadSessionDetectedAt: _priorStamp, ...priorEntry } = workflow.agentTasks?.[ticketId] || {};
   const entry = {
-    ...(workflow.agentTasks?.[ticketId] || {}),
+    ...priorEntry,
     id: taskId,
     agentId: assignee,
     ticketId,
