@@ -1160,7 +1160,7 @@ def S3Storage___list_objects(prefix: str = "", bucket: str = "") -> str:
 # ─── Ticket Tools ────────────────────────────────────────────────────────────
 
 @tool
-def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "") -> str:
+def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "") -> str:
     """Create a new ticket in the project tracker.
 
     MANDATORY TICKETS (create these for EVERY workflow, no exceptions):
@@ -1194,16 +1194,40 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
             "epic", "story". Do NOT use "subtask" under an Epic.
         blocked_by: Comma-separated list of ticket IDs this ticket is blocked by (e.g., "TEAM-401,TEAM-402")
         workflow_id: Workflow ID this ticket belongs to
+        phase: ONLY for a fix ticket you file after a failed QA/review. Set it to the
+            ORIGINATING upstream phase being re-verified (e.g. "development", "ship")
+            so the run's completion guard keeps that phase open until the fix closes.
+            Leave "" for ordinary phase tickets.
+        spawned_by_kind: ONLY for a fix ticket. One of "qa_fix" (you are the QA verifier),
+            "codex_fix" (you are the code reviewer), or "review_fix". Leave "" otherwise.
+        spawned_by_origin_id: The ticket ID this fix originates from — your own QA ticket
+            (qa_fix), review ticket (codex_fix), or gate ticket (review_fix). Required when
+            spawned_by_kind is set.
     """
     blockers = [b.strip() for b in blocked_by.split(",") if b.strip()] if blocked_by else []
     # Auto-inject workflow_id from invocation context if agent didn't pass one —
     # without the wf:<id> label, the ticket is invisible to the workflow UI.
     effective_workflow_id = workflow_id or _CURRENT_WORKFLOW_ID
-    return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___create_ticket", {
+    payload = {
         "summary": title, "description": description, "parent_key": parent_id,
         "assignee": assignee, "issue_type": ticket_type, "blocked_by": blockers,
         "workflow_id": effective_workflow_id
-    })
+    }
+    if phase.strip():
+        payload["phase"] = phase.strip()
+    # TEAM-3619 D4c: assemble the fix-ticket provenance marker the lambda validates
+    # and completion re-verify reads. The origin id maps to the kind-specific key.
+    if spawned_by_kind.strip():
+        origin_key = {
+            "qa_fix": "qaTicketId",
+            "codex_fix": "codexTicketId",
+            "review_fix": "gateTicketId",
+        }.get(spawned_by_kind.strip())
+        spawned_by = {"kind": spawned_by_kind.strip()}
+        if origin_key and spawned_by_origin_id.strip():
+            spawned_by[origin_key] = spawned_by_origin_id.strip()
+        payload["spawned_by"] = spawned_by
+    return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___create_ticket", payload)
 
 
 @tool
@@ -1257,6 +1281,22 @@ def Tickets___add_comment(ticket_id: str, comment: str) -> str:
     """
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___add_comment", {
         "ticket_id": ticket_id, "comment": comment
+    })
+
+
+@tool
+def Tickets___get_issue(ticket_id: str) -> str:
+    """Get full details of a ticket: status, description, and all comments.
+    Use this to read a gate/escalation ticket's status and parse human
+    DECISION: lines from its comments.
+
+    Args:
+        ticket_id: The ticket ID to fetch (e.g., "TEAM-42")
+    """
+    # Send both key names: the Jira backend reads `issue_key`, the DDB backend
+    # reads `issue_key || ticket_id`. Passing both keeps the tool backend-agnostic.
+    return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___get_issue", {
+        "ticket_id": ticket_id, "issue_key": ticket_id
     })
 
 
@@ -2025,6 +2065,7 @@ LAMBDA_TOOLS = [
     Tickets___update_ticket,
     Tickets___list_tickets,
     Tickets___add_comment,
+    Tickets___get_issue,
     Tickets___search_issues,
     # Workflow (Lambda-backed)
     WorkflowOutput___report_completion,

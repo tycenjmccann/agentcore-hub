@@ -9,10 +9,10 @@
  * The Next.js app does NOT invoke any agents directly.
  */
 
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual, createHash } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { validateIntakeSources } from "@/lib/workflow/intake";
 import type { WorkflowInput } from "@/lib/workflow/types";
@@ -41,11 +41,106 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 });
 const lambda = new LambdaClient({ region: REGION });
 
+const TERMINAL_PHASES = new Set(["complete", "error", "cancelled"]);
+
 function secretMatches(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
   if (a.length !== b.length) return false;
   return timingSafeEqual(a, b);
+}
+
+function mintWorkflowId(): string {
+  return `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * TEAM-3619 D4b: start idempotency on (sourceTicket, workflowDefId).
+ *
+ * A dedup marker row (`wfdedup_<sha256(sourceTicket:defId)>`) lives in the
+ * workflows table itself and is claimed with `attribute_not_exists(workflowId)`
+ * BEFORE any epic/workflow is created — so a redelivered start for the same
+ * (sourceTicket, def) can't fork a second run. Returns one of:
+ *   - { coalesce: workflowId }  → an existing non-terminal run owns this key;
+ *                                 the caller should return it verbatim.
+ *   - { proceed: workflowId }   → this caller owns the key (fresh claim, or the
+ *                                 prior canonical run was terminal and we
+ *                                 atomically re-pointed the marker); create with
+ *                                 exactly this workflowId.
+ * Works identically for both ticket providers (the marker is app state).
+ */
+async function resolveDedup(
+  sourceTicket: string,
+  defId: string
+): Promise<{ coalesce?: string; proceed?: string }> {
+  const idemKey = createHash("sha256").update(`${sourceTicket}:${defId}`).digest("hex");
+  const markerId = `wfdedup_${idemKey}`;
+  const candidateWorkflowId = mintWorkflowId();
+
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: WORKFLOWS_TABLE,
+        Item: {
+          workflowId: markerId,
+          canonicalWorkflowId: candidateWorkflowId,
+          sourceTicket,
+          defId,
+          createdAt: new Date().toISOString(),
+        },
+        ConditionExpression: "attribute_not_exists(workflowId)",
+      })
+    );
+    return { proceed: candidateWorkflowId };
+  } catch (err) {
+    if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
+  }
+
+  // The marker already exists — inspect the canonical run it points to.
+  const markerRes = await ddb.send(
+    new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: markerId }, ConsistentRead: true })
+  );
+  const priorCanonical = markerRes.Item?.canonicalWorkflowId as string | undefined;
+  if (priorCanonical) {
+    const canonRes = await ddb.send(
+      new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: priorCanonical }, ConsistentRead: true })
+    );
+    const canon = canonRes.Item;
+    // A live (non-terminal) canonical run owns this key — coalesce onto it.
+    if (canon && !TERMINAL_PHASES.has(String(canon.phase)) && canon.deleted !== true) {
+      return { coalesce: priorCanonical };
+    }
+  }
+
+  // The prior run is terminal (or gone). Atomically re-point the marker at a
+  // fresh run, guarded on the exact canonical id we just read so a concurrent
+  // racer can't double-claim. If that guard loses, re-read and coalesce.
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: WORKFLOWS_TABLE,
+        Item: {
+          workflowId: markerId,
+          canonicalWorkflowId: candidateWorkflowId,
+          sourceTicket,
+          defId,
+          createdAt: new Date().toISOString(),
+        },
+        ConditionExpression: priorCanonical
+          ? "canonicalWorkflowId = :old"
+          : "attribute_not_exists(canonicalWorkflowId)",
+        ...(priorCanonical ? { ExpressionAttributeValues: { ":old": priorCanonical } } : {}),
+      })
+    );
+    return { proceed: candidateWorkflowId };
+  } catch (err) {
+    if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
+    const reread = await ddb.send(
+      new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: markerId }, ConsistentRead: true })
+    );
+    const winner = reread.Item?.canonicalWorkflowId as string | undefined;
+    return winner ? { coalesce: winner } : { proceed: candidateWorkflowId };
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -120,10 +215,23 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // TEAM-3619 D4b: idempotency on (sourceTicket, defId). Only requests that
+    // carry a sourceTicket are deduplicated — human/API callers keep the plain
+    // mint-a-new-run behavior. The marker is claimed before any epic/workflow
+    // exists, so a redelivery coalesces instead of forking a duplicate run.
+    let workflowId: string | undefined;
+    if (body.sourceTicket) {
+      const dedup = await resolveDedup(body.sourceTicket, def.id);
+      if (dedup.coalesce) {
+        return NextResponse.json({ workflowId: dedup.coalesce, deduplicated: true });
+      }
+      workflowId = dedup.proceed;
+    }
+
     if (TICKET_PROVIDER === "jira") {
-      return await startWithJira(body, def);
+      return await startWithJira(body, def, workflowId);
     } else {
-      return await startWithDynamoDB(body, def);
+      return await startWithDynamoDB(body, def, workflowId);
     }
   } catch (err) {
     console.error("Workflow start error:", err);
@@ -133,12 +241,12 @@ export async function POST(req: NextRequest) {
 
 // ─── Jira Cloud Backend ────────────────────────────────────────────────────────
 
-async function startWithJira(body: WorkflowInput, def: WorkflowDef) {
+async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string) {
   const { JiraCloudProvider } = await import("@/lib/workflow/ticket-provider-jira");
   const jira = new JiraCloudProvider();
 
   const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
-  const workflowId = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const workflowId = presetWorkflowId || mintWorkflowId();
 
   // 1. Create epic in Jira
   const epic = await jira.createEpic({ title: body.title, description: body.description });
@@ -191,10 +299,10 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef) {
 
 // ─── DynamoDB Backend (via ticket tools Lambda) ──────────────────────────────
 
-async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef) {
+async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string) {
   const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
   const intakePhaseName = def.phases.find((p) => p.type === "agent")?.name || "Intake";
-  const workflowId = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const workflowId = presetWorkflowId || mintWorkflowId();
 
   // 1. Create the epic via ticket tools Lambda
   const epicResult = await invokeTicketLambda("Tickets___create_ticket", {

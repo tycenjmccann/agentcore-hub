@@ -33,6 +33,31 @@ export interface JiraTicket {
   artifacts: Artifact[];
   createdAt: string;
   updatedAt: string;
+  /**
+   * TEAM-3619 D4c: the agent phase this ticket's work belongs to. Stamped on a
+   * spawned fix ticket with its originating upstream phase (so a ship-review fix
+   * filed against a dev still gates the SHIP phase); for ordinary agent tickets
+   * the phase is derived from the assignee's roster entry instead. Optional —
+   * legacy/unstamped tickets fall back to assignee-derived phase.
+   */
+  phase?: string;
+  /**
+   * TEAM-3619 D4c: marks a fix/rework ticket so completion re-verify
+   * (completion.mjs condition iii) refuses to close the run while the fix is
+   * open. `kind` records which pipeline spawned it; the accompanying id names
+   * the originating ticket. Two producer paths write this: the orchestrator's
+   * review-gate rework path (kind "review_fix", gateTicketId — see index.mjs
+   * handleReviewRejection), and agent-filed fix tickets created through the
+   * Tickets API create_ticket pass-through (kind "qa_fix"/qaTicketId from the QA
+   * verifier, "codex_fix"/codexTicketId from the code reviewer — validated
+   * lambda-side, see agentcore-hub-tickets sanitizeSpawnedBy).
+   */
+  spawnedBy?: {
+    kind: "review_fix" | "qa_fix" | "codex_fix";
+    gateTicketId?: string;
+    qaTicketId?: string;
+    codexTicketId?: string;
+  };
 }
 
 export interface JiraComment {
@@ -218,6 +243,14 @@ export interface WorkflowInput {
    * Absent → attribute omitted entirely; human/API callers are unaffected.
    */
   intakeChannel?: string;
+  /**
+   * The upstream ticket that triggered this run (e.g. a Bug being auto-filed, or
+   * an anomaly ticket). When present, POST /api/workflow/start is idempotent on
+   * (sourceTicket, workflowDefId): a redelivery for the same pair coalesces onto
+   * the still-running canonical workflow instead of forking a duplicate run.
+   * Absent → no dedup (human/API callers keep the mint-a-new-run behavior).
+   */
+  sourceTicket?: string;
 }
 
 export interface PortedSession {

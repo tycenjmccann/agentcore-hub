@@ -315,6 +315,98 @@ export async function removeResumeContext(workflowId, ticketId) {
 }
 
 /**
+ * Ensure reviewGateHistory[gateTicketId] exists as an empty ledger.
+ *
+ * Two writes, not one: a single expression cannot both create the
+ * reviewGateHistory map and index into it (same constraint setResumeContext
+ * works around). Both are if_not_exists, so concurrent rejection cycles for the
+ * same gate seed idempotently instead of clobbering each other's rounds.
+ */
+async function ensureReviewGateLedger(workflowId, gateTicketId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET reviewGateHistory = if_not_exists(reviewGateHistory, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET reviewGateHistory.#g = if_not_exists(reviewGateHistory.#g, :seed)",
+    ExpressionAttributeNames: { "#g": gateTicketId },
+    ExpressionAttributeValues: { ":seed": { rounds: [], authorizations: [], escalations: [] } },
+  }));
+}
+
+/**
+ * Append one review round to a gate's convergence ledger (TEAM-3619 D2c) and
+ * return the gate's post-write ledger `{ rounds, authorizations, escalations }`.
+ *
+ * list_append, never a whole-array rewrite: two rejection cycles landing at
+ * once must both be counted, because a lost round is a cap that trips late —
+ * i.e. the runaway loop this ledger exists to stop.
+ *
+ * Callers MUST use the returned ledger (not their pre-write workflow snapshot)
+ * to compute the effective round count, so a concurrent cycle's round is
+ * included. Duplicate round numbers are fine: effectiveRoundCount dedupes by
+ * round number, last entry winning, which is how a re-run of the same head SHA
+ * replaces its earlier verdict.
+ *
+ * ALL_NEW rather than UPDATED_NEW because the caller needs `authorizations`
+ * (human "continue" decisions reset the count) and `escalations` (an already-
+ * open escalation makes this a no-op) from the SAME post-write snapshot;
+ * UPDATED_NEW returns only the rounds path.
+ */
+export async function appendReviewRound(workflowId, gateTicketId, round) {
+  await ensureReviewGateLedger(workflowId, gateTicketId);
+  const res = await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression:
+      "SET reviewGateHistory.#g.rounds = list_append(if_not_exists(reviewGateHistory.#g.rounds, :empty), :r)",
+    ExpressionAttributeNames: { "#g": gateTicketId },
+    ExpressionAttributeValues: { ":empty": [], ":r": [round] },
+    ReturnValues: "ALL_NEW",
+  }));
+  return res.Attributes?.reviewGateHistory?.[gateTicketId] || null;
+}
+
+/**
+ * Record that a gate hit its round cap and was handed to a human. Audit trail
+ * plus the idempotency key for the escalation: an entry with `decision: null`
+ * means the escalation is still open, so a subsequent rejection cycle re-parks
+ * the gate without re-publishing review.cap_reached.
+ */
+export async function appendReviewCapEscalation(workflowId, gateTicketId, escalation) {
+  await ensureReviewGateLedger(workflowId, gateTicketId);
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression:
+      "SET reviewGateHistory.#g.escalations = list_append(if_not_exists(reviewGateHistory.#g.escalations, :empty), :e)",
+    ExpressionAttributeNames: { "#g": gateTicketId },
+    ExpressionAttributeValues: { ":empty": [], ":e": [escalation] },
+  }));
+}
+
+/**
+ * Append a human authorization to a gate's ledger — the escalation's exit.
+ * A `continue` decision carries `resetAtRound`, which is what makes the cap
+ * count start over from that round (see effectiveRoundCount).
+ */
+export async function appendReviewAuthorization(workflowId, gateTicketId, authorization) {
+  await ensureReviewGateLedger(workflowId, gateTicketId);
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression:
+      "SET reviewGateHistory.#g.authorizations = list_append(if_not_exists(reviewGateHistory.#g.authorizations, :empty), :a)",
+    ExpressionAttributeNames: { "#g": gateTicketId },
+    ExpressionAttributeValues: { ":empty": [], ":a": [authorization] },
+  }));
+}
+
+/**
  * Append a human notification atomically (no full-array rewrite). Bumps
  * notifVersion in the same write so a concurrent ackNotifications CAS that
  * read the pre-append list fails and re-reads instead of overwriting the
@@ -374,6 +466,12 @@ export async function ackNotifications(workflowId, predicate, maxAttempts = 3) {
  * /api/workflow/[id]/complete route — the orchestrator path previously used a
  * full-row put guarded only by a stale in-memory phase check (study P1).
  * Returns true when this caller performed the completion.
+ *
+ * TEAM-3619 D4a: the CAS also refuses when `cancelledAt` is stamped, so a
+ * cancellation that landed after this caller's phase read (the phase attribute
+ * itself may lag behind the cancelledAt stamp) can never be overwritten by a
+ * completion. A lost CAS is a graceful no-op (returns false, never throws) —
+ * some other actor already reached a terminal decision for this run.
  */
 export async function completeWorkflow(workflowId, completedAt) {
   try {
@@ -381,7 +479,8 @@ export async function completeWorkflow(workflowId, completedAt) {
       TableName: _table,
       Key: { workflowId },
       UpdateExpression: "SET phase = :complete, completedAt = :ts",
-      ConditionExpression: "phase <> :complete AND phase <> :cancelled AND phase <> :error",
+      ConditionExpression:
+        "phase <> :complete AND phase <> :cancelled AND phase <> :error AND attribute_not_exists(cancelledAt)",
       ExpressionAttributeValues: {
         ":complete": "complete",
         ":ts": completedAt,
@@ -391,7 +490,10 @@ export async function completeWorkflow(workflowId, completedAt) {
     }));
     return true;
   } catch (err) {
-    if (err.name === "ConditionalCheckFailedException") return false;
+    if (err.name === "ConditionalCheckFailedException") {
+      console.log(`[workflow-store] completeWorkflow(${workflowId}): CAS lost — already terminal or cancelled, no-op.`);
+      return false;
+    }
     throw err;
   }
 }
@@ -421,7 +523,7 @@ export async function claimFinalization(workflowId, staleBefore) {
       Key: { workflowId },
       UpdateExpression: "SET finalizedAt = :ts",
       ConditionExpression:
-        "phase = :complete AND attribute_not_exists(finalizedAt) AND completedAt < :staleBefore",
+        "phase = :complete AND attribute_not_exists(finalizedAt) AND attribute_not_exists(cancelledAt) AND completedAt < :staleBefore",
       ExpressionAttributeValues: {
         ":ts": new Date().toISOString(),
         ":complete": "complete",

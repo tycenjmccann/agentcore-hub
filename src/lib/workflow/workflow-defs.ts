@@ -65,6 +65,47 @@ export interface ReviewGate {
   condition: "always" | "flagged";
   /** On "Request changes": "rework" re-opens the upstream work, "hold" just pauses. */
   onReject: "rework" | "hold";
+  /** Max effective review rounds before onCapReached fires. Default 3. */
+  maxRounds?: number;
+  /** A rework round that REGRESSES previously-passing findings counts as 2 rounds. Default true (matches ship-review.ts behavior). */
+  regressionCountsDouble?: boolean;
+  /** Behavior at the cap. Only "escalate" is defined: emit review.cap_reached, reassign the gate ticket to a human, stop the rework loop. Default "escalate". */
+  onCapReached?: "escalate";
+}
+
+/** Defaults for the convergence-cap fields of {@link ReviewGate}. */
+export const REVIEW_GATE_CAP_DEFAULTS: {
+  maxRounds: number;
+  regressionCountsDouble: boolean;
+  onCapReached: "escalate";
+} = { maxRounds: 3, regressionCountsDouble: true, onCapReached: "escalate" };
+
+/**
+ * Resolve a review gate's convergence-cap settings, applying the defaults
+ * (3 / true / "escalate"). Every consumer — the orchestrator's cap enforcement,
+ * the release manager's prose contract, and `effectiveRoundCount`'s `opts` —
+ * MUST resolve through here so a config change lands identically everywhere.
+ *
+ * `maxRounds` is only honored when it is a finite number >= 1; anything else
+ * (0, negative, NaN, a non-number from hand-edited JSON) falls back to the
+ * default rather than producing a cap that fires immediately or never.
+ */
+export function resolveReviewGateCap(gate: ReviewGate): {
+  maxRounds: number;
+  regressionCountsDouble: boolean;
+  onCapReached: "escalate";
+} {
+  const raw = gate.maxRounds;
+  const maxRounds =
+    typeof raw === "number" && Number.isFinite(raw) && raw >= 1
+      ? Math.floor(raw)
+      : REVIEW_GATE_CAP_DEFAULTS.maxRounds;
+  return {
+    maxRounds,
+    regressionCountsDouble:
+      gate.regressionCountsDouble ?? REVIEW_GATE_CAP_DEFAULTS.regressionCountsDouble,
+    onCapReached: gate.onCapReached ?? REVIEW_GATE_CAP_DEFAULTS.onCapReached,
+  };
 }
 
 export interface WorkflowDef {

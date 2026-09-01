@@ -179,9 +179,45 @@ export const handler = async (event) => {
 
 // ─── Tool Implementations ──────────────────────────────────────────────────
 
+// TEAM-3619 D4c: the fix-ticket kinds the completion re-verify (completion.mjs
+// condition iii) recognizes, and the origin-id keys each may carry. A fix ticket
+// created by the QA verifier / code reviewer stamps this so an in-flight fix
+// keeps the run from being declared complete. Kept in lockstep with
+// completion.mjs's FIX_KINDS and index.mjs:816's review_fix shape.
+const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
+const SPAWN_ORIGIN_KEYS = ["gateTicketId", "qaTicketId", "codexTicketId"];
+
+/**
+ * Normalize an agent-supplied `spawned_by` marker. Returns { value } for a clean
+ * marker, { error } for a malformed one (unknown kind / not an object), or {}
+ * when absent (backward-compatible — no field written). Only the known `kind`
+ * and origin-id keys survive; arbitrary extra keys are dropped so agents can't
+ * write junk onto the ticket record.
+ */
+function sanitizeSpawnedBy(raw) {
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return { error: "'spawned_by' must be an object like { kind: 'qa_fix', qaTicketId: 'TEAM-42' }" };
+  }
+  if (!FIX_KINDS.has(raw.kind)) {
+    return { error: `'spawned_by.kind' must be one of: ${[...FIX_KINDS].join(", ")}` };
+  }
+  const value = { kind: raw.kind };
+  for (const k of SPAWN_ORIGIN_KEYS) {
+    if (typeof raw[k] === "string" && raw[k]) value[k] = raw[k];
+  }
+  return { value };
+}
+
 async function createTicket(args) {
-  const { summary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id } = args;
+  const { summary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase } = args;
   if (!summary) return textResult("Error: 'summary' is required");
+
+  // TEAM-3619 D4c: optional fix-ticket provenance. Validate before minting so a
+  // bad marker is a clear error, not a silently-dropped/garbage field.
+  const spawn = sanitizeSpawnedBy(spawned_by);
+  if (spawn.error) return textResult(`Error: ${spawn.error}`);
+  const phaseStamp = typeof phase === "string" && phase.trim() ? phase.trim() : undefined;
 
   // Validate assignee against known agent roster. "human:<who>" assignees are
   // human-review gates — not agents — and are always allowed (the orchestrator
@@ -216,6 +252,12 @@ async function createTicket(args) {
     blockedBy: blockers,
     createdAt: now,
     updatedAt: now,
+    // TEAM-3619 D4c: fix-ticket provenance, persisted in the exact shape the
+    // orchestrator's completion re-verify reads (completion.mjs condition iii)
+    // and index.mjs handleReviewRejection writes. Omitted entirely when absent,
+    // so a plain ticket is byte-for-byte what it was before.
+    ...(spawn.value ? { spawnedBy: spawn.value } : {}),
+    ...(phaseStamp ? { phase: phaseStamp } : {}),
   };
 
   await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
@@ -235,6 +277,8 @@ async function createTicket(args) {
       parent: parent_key || null,
       blocked_by: blockers,
       created: now,
+      ...(spawn.value ? { spawned_by: spawn.value } : {}),
+      ...(phaseStamp ? { phase: phaseStamp } : {}),
     },
   };
 }
