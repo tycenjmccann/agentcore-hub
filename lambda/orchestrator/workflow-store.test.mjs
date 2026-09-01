@@ -12,6 +12,7 @@ import {
   advancePhase,
   setResumeContext,
   appendNotification,
+  appendReviewNotificationOnce,
   ackNotifications,
   completeWorkflow,
   claimFinalization,
@@ -223,6 +224,115 @@ describe("appendNotification", () => {
   it("bumps notifVersion so a concurrent ack CAS fails and re-reads", async () => {
     await appendNotification("wf_1", { id: "n1" });
     expect(writes()[0].input.UpdateExpression).toContain("notifVersion = if_not_exists(notifVersion, :zero) + :one");
+  });
+});
+
+describe("appendReviewNotificationOnce (TEAM-3684 Finding 2)", () => {
+  it("appends under a notifVersion CAS when no open review_needed exists", async () => {
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      if (cmd.constructor.name === "GetCommand") {
+        return { Item: { workflowId: "wf_1", notifVersion: 2, humanNotifications: [] } };
+      }
+      return {};
+    };
+    let appended;
+    try {
+      appended = await appendReviewNotificationOnce("wf_1", "GATE-1", {
+        id: "n1", ticketId: "GATE-1", type: "review_needed", acknowledged: false,
+      });
+    } finally {
+      stubDdb.send = origSend;
+    }
+    expect(appended).toBe(true);
+    const w = sent.find((c) => c.type === "UpdateCommand");
+    expect(w.input.UpdateExpression).toBe("SET humanNotifications = :n, notifVersion = :next");
+    expect(w.input.ConditionExpression).toContain("notifVersion = :cur");
+    expect(w.input.ExpressionAttributeValues[":cur"]).toBe(2);
+    expect(w.input.ExpressionAttributeValues[":next"]).toBe(3);
+    expect(w.input.ExpressionAttributeValues[":n"]).toHaveLength(1);
+    expect(w.input.ExpressionAttributeValues[":n"][0].id).toBe("n1");
+  });
+
+  it("is a no-op when an unacknowledged review_needed already exists (no write)", async () => {
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      if (cmd.constructor.name === "GetCommand") {
+        return { Item: { workflowId: "wf_1", notifVersion: 4, humanNotifications: [
+          { id: "open", ticketId: "GATE-1", type: "review_needed", acknowledged: false },
+        ] } };
+      }
+      return {};
+    };
+    let appended;
+    try {
+      appended = await appendReviewNotificationOnce("wf_1", "GATE-1", {
+        id: "dup", ticketId: "GATE-1", type: "review_needed", acknowledged: false,
+      });
+    } finally {
+      stubDdb.send = origSend;
+    }
+    expect(appended).toBe(false);
+    expect(sent.filter((c) => c.type === "UpdateCommand")).toHaveLength(0);
+  });
+
+  it("re-notifies once a prior review_needed was acknowledged (reopened gate)", async () => {
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      if (cmd.constructor.name === "GetCommand") {
+        return { Item: { workflowId: "wf_1", notifVersion: 7, humanNotifications: [
+          { id: "old", ticketId: "GATE-1", type: "review_needed", acknowledged: true },
+        ] } };
+      }
+      return {};
+    };
+    let appended;
+    try {
+      appended = await appendReviewNotificationOnce("wf_1", "GATE-1", {
+        id: "fresh", ticketId: "GATE-1", type: "review_needed", acknowledged: false,
+      });
+    } finally {
+      stubDdb.send = origSend;
+    }
+    expect(appended).toBe(true);
+    const w = sent.find((c) => c.type === "UpdateCommand");
+    // Old (acked) + fresh are both retained; the append never rewrites history away.
+    expect(w.input.ExpressionAttributeValues[":n"]).toHaveLength(2);
+  });
+
+  it("stands down on CAS loss when the re-read now shows a concurrent open notification", async () => {
+    let gets = 0;
+    let updates = 0;
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      if (cmd.constructor.name === "GetCommand") {
+        gets++;
+        // First read: clear. Second read (after our CAS loss): a concurrent
+        // completion already appended an open review_needed → we must stand down.
+        return gets === 1
+          ? { Item: { workflowId: "wf_1", notifVersion: 5, humanNotifications: [] } }
+          : { Item: { workflowId: "wf_1", notifVersion: 6, humanNotifications: [
+              { id: "concurrent", ticketId: "GATE-1", type: "review_needed", acknowledged: false },
+            ] } };
+      }
+      updates++;
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      const err = new Error("cas"); err.name = "ConditionalCheckFailedException"; throw err;
+    };
+    let appended;
+    try {
+      appended = await appendReviewNotificationOnce("wf_1", "GATE-1", {
+        id: "mine", ticketId: "GATE-1", type: "review_needed", acknowledged: false,
+      });
+    } finally {
+      stubDdb.send = origSend;
+    }
+    expect(appended).toBe(false);
+    expect(updates).toBe(1); // exactly one write attempt — no duplicate append
+    expect(gets).toBe(2);    // re-read after the CAS loss, then stood down
   });
 });
 
