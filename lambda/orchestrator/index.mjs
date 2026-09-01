@@ -39,6 +39,7 @@ import {
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
+import { createCascade } from "./cascade.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -235,6 +236,25 @@ function getDetector() {
     blockTicket: blockTicketForFailedInvoke,
   });
   return _detector;
+}
+
+// ─── Unblock cascade (TEAM-3618 D3) ──────────────────────────────────────────
+
+// One shared cascade helper behind BOTH "ticket done" paths (Jira-webhook and
+// DDB-stream), wired with the real provider/DDB/event effects. Lazy singleton
+// so warm containers reuse it (mirrors getDetector()).
+let _cascade = null;
+function getCascade() {
+  if (_cascade) return _cascade;
+  _cascade = createCascade({
+    ddb,
+    ticketsTable: TICKETS_TABLE,
+    provider: TICKET_PROVIDER,
+    jiraTransition,
+    getChildTickets,
+    publishEvent,
+  });
+  return _cascade;
 }
 
 // ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
@@ -450,48 +470,12 @@ async function handleTicketDoneUnified(ticketId) {
   // a pre-claim snapshot (double invocation).
   await markTaskComplete(workflow, ticketId, assignee);
 
-  // Unblock dependents
-  const siblings = await getChildTickets(parentId);
-  const unblocked = [];
+  // Unblock dependents via the shared cascade (TEAM-3618 D3). The helper owns
+  // the blocker predicate, provider branching, and orchestrator.unblocked
+  // journal events — identical to the DDB-stream twin (handleTicketDone).
+  const unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
 
-  for (const sibling of siblings) {
-    if (sibling.ticketId === ticketId) continue;
-    const blockers = sibling.blockedBy || [];
-    if (blockers.includes(ticketId)) {
-      // Check if all blockers are now resolved (done) — keep blockedBy intact like Jira does
-      const allResolved = blockers.every(bid => {
-        if (bid === ticketId) return true; // this one is done
-        const blocker = siblings.find(s => s.ticketId === bid);
-        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
-      });
-      if (allResolved && (sibling.status === "blocked" || sibling.status === "todo")) {
-        // All blockers resolved — transition to ready (keep blockedBy as historical record)
-        if (TICKET_PROVIDER === "jira") {
-          await jiraTransition(sibling.ticketId, "Ready");
-        } else {
-          await ddb.send(new UpdateCommand({
-            TableName: TICKETS_TABLE,
-            Key: { ticketId: sibling.ticketId },
-            UpdateExpression: "SET #s = :s, #u = :u",
-            ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-            ExpressionAttributeValues: { ":s": "todo", ":u": new Date().toISOString() },
-          }));
-        }
-        unblocked.push(sibling.ticketId);
-      }
-      // blockedBy array is never modified — it's a permanent record of dependencies
-    }
-  }
-
-  console.log(`[orchestrator] ${ticketId} done. Unblocked: [${unblocked.join(", ")}]`);
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
-
-  // Journey log: record each unblock for at-a-glance traceability
-  for (const unblockedId of unblocked) {
-    await publishEvent(unblockedId, "orchestrator.unblocked", {
-      ticketId: unblockedId, unblockedBy: ticketId, workflowId: workflow?.id,
-    });
-  }
 
   // Always check workflow completion — the last ticket to close triggers this
   if (await isWorkflowComplete(parentId, workflow)) {
@@ -1101,36 +1085,11 @@ async function handleTicketDone(ticketId, image) {
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);
 
-  // Unblock dependents: find tickets blocked by this one
-  const siblings = await getChildTickets(parentId);
-  const unblocked = [];
-
-  for (const sibling of siblings) {
-    if (sibling.ticketId === ticketId) continue;
-    const blockers = sibling.blockedBy || [];
-    if (blockers.includes(ticketId)) {
-      // Check if all blockers are now resolved — keep blockedBy intact (like Jira issue links)
-      const allResolved = blockers.every(bid => {
-        if (bid === ticketId) return true; // this one is done
-        const blocker = siblings.find(s => s.ticketId === bid);
-        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
-      });
-      if (allResolved && sibling.status === "blocked") {
-        // All blockers resolved — transition to todo (keep blockedBy as historical record)
-        await ddb.send(new UpdateCommand({
-          TableName: TICKETS_TABLE,
-          Key: { ticketId: sibling.ticketId },
-          UpdateExpression: "SET #s = :s, #u = :u",
-          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-          ExpressionAttributeValues: { ":s": "todo", ":u": new Date().toISOString() },
-        }));
-        unblocked.push(sibling.ticketId);
-      }
-      // blockedBy array is never modified — it's a permanent record of dependencies
-    }
-  }
-
-  console.log(`[orchestrator] ${ticketId} done. Unblocked: [${unblocked.join(", ")}]`);
+  // Unblock dependents via the shared cascade (TEAM-3618 D3). Same helper as the
+  // Jira-webhook twin (handleTicketDoneUnified) — this path previously matched
+  // only "blocked" dependents and emitted no orchestrator.unblocked events; the
+  // shared helper fixes both divergences (now {blocked, todo} → Ready + journal).
+  const unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
 
   // Publish event for UI
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });

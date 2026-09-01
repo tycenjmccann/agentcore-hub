@@ -41,6 +41,11 @@ export default defineConfig({
       // dependency-injected (stub ddb/store/lease + fake clock), so its
       // guard/trigger/retry/escalate logic is unit-testable with no AWS.
       "lambda/orchestrator/dead-session-detector.test.mjs",
+      // cascade.mjs (TEAM-3618 D3) — the shared unblock cascade behind both
+      // "ticket done" paths. Fully dependency-injected (stub ddb/provider/event
+      // publisher + fake clock), so the union + extended-state logic is
+      // unit-testable with no AWS.
+      "lambda/orchestrator/cascade.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
