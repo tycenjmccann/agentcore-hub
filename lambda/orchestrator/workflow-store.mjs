@@ -243,9 +243,11 @@ export async function markDeadSessionDetected(workflowId, ticketId, expectedStar
 /**
  * Un-stamp a dead-session detection (TEAM-3698). The detector stamps BEFORE its
  * TOCTOU lease re-check; when that re-check finds the agent resurrected
- * (heartbeated after the stamp), the stamp must come back off — a stamped live
- * task is skipped by every later sweep, so leaving it would permanently suppress
- * recovery if that same claim generation dies silently later.
+ * (heartbeated after the stamp), the stamp comes back off so the generation
+ * stays cheaply detectable. A clear that fails or loses its CAS is not fatal:
+ * the detector re-evaluates stamped live-status tasks on every sweep
+ * (TEAM-3702) — retrying this clear while the lease is live, re-driving
+ * recovery on the held stamp once it is dead.
  *
  * REMOVEs deadSessionDetectedAt ONLY IF the entry still holds the exact claim
  * generation the sweep inspected (same startedAt — or, mirroring
