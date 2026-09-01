@@ -55,6 +55,12 @@ const MAX_QA_RETRIES = 3;
 // shadow (default) = observe + metrics + shadow-flagged events but ZERO writes,
 // enforce = steal/retry/escalate for real.
 const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
+// Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b). OFF by default:
+// the cascade only re-Readies {blocked, todo} dependents (commit-4a behavior).
+// ON: an in_progress dependent whose last blocker resolves is lease-guarded
+// (live → nudge only; stale → steal + re-dispatch through the claim CAS) and an
+// in_review gate is re-woken. Any value other than "on"/"true"/"1" stays OFF.
+const CASCADE_EXTENDED_STATES = /^(on|true|1)$/i.test(process.env.CASCADE_EXTENDED_STATES || "");
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
@@ -253,6 +259,13 @@ function getCascade() {
     jiraTransition,
     getChildTickets,
     publishEvent,
+    // Extended states (commit 4b) — behind CASCADE_EXTENDED_STATES.
+    extendedStates: CASCADE_EXTENDED_STATES,
+    lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
+    eventsTable: EVENTS_TABLE,
+    workflowsTable: WORKFLOWS_TABLE,
+    redispatch: redispatchTicket,
+    reawakenGate: handleHumanReviewGate,
   });
   return _cascade;
 }

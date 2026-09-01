@@ -19,6 +19,16 @@
  * Every effect is injected (ddb / provider / event publisher / child lookup),
  * so the cascade is unit-testable with stubs and a fake clock — same DI shape
  * as dead-session-detector.mjs.
+ *
+ * TEAM-3618 D3 commit 4b (behind CASCADE_EXTENDED_STATES, default OFF): when the
+ * LAST blocker of an ALREADY-MOVING dependent resolves, cascadeUnblock also
+ *   - in_progress: lease-guarded. LIVE lease → orchestrator.nudge only (context
+ *     signal, ZERO steal/claim attempts). STALE lease → stealClaim CAS on the
+ *     generation, and on a win re-dispatch through the normal claim CAS (the
+ *     claim CAS is the final arbiter — a live claim always wins, AC-D3.3).
+ *   - in_review: re-wake the parked/reopened human-review gate — emit
+ *     review.reawakened and re-run the existing gate readiness path.
+ * Off by default → these are no-ops and only the commit-4a union runs.
  */
 
 import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
@@ -33,6 +43,13 @@ export function createCascade(deps) {
     publishEvent,
     now = () => Date.now(),
     log = () => {},
+    // Extended-states (commit 4b) — all optional; guarded by extendedStates.
+    extendedStates = false,
+    lease,
+    eventsTable,
+    workflowsTable,
+    redispatch,
+    reawakenGate,
   } = deps;
 
   /**
@@ -50,6 +67,7 @@ export function createCascade(deps) {
   async function cascadeUnblock(ticketId, parentId, workflow) {
     const siblings = await getChildTickets(parentId);
     const unblocked = [];
+    const m = { nudged: 0, skippedLiveLease: 0, redispatched: 0, reviewReawakened: 0 };
 
     for (const sibling of siblings) {
       if (sibling.ticketId === ticketId) continue;
@@ -71,12 +89,22 @@ export function createCascade(deps) {
       if (sibling.status === "blocked" || sibling.status === "todo") {
         await transitionToReady(sibling);
         unblocked.push(sibling.ticketId);
+        continue;
       }
-      // Any other status (in_progress / in_review / terminal) is untouched in
-      // commit 4a — extended-state handling arrives behind a flag in 4b.
+
+      // Commit 4b (CASCADE_EXTENDED_STATES). The last blocker of an ALREADY-
+      // MOVING dependent just resolved. Off by default → no-op (commit-4a only).
+      if (!extendedStates) continue;
+      if (sibling.status === "in_progress") {
+        await handleInProgressDependent(sibling, ticketId, workflow, m);
+      } else if (sibling.status === "in_review") {
+        await handleInReviewDependent(sibling, ticketId, workflow, m);
+      }
+      // done / cancelled / any other terminal state → no-op.
     }
 
-    log(`[orchestrator] ${ticketId} cascade — unblocked=[${unblocked.join(", ")}]`);
+    log(`[orchestrator] ${ticketId} cascade — unblocked=[${unblocked.join(", ")}]` +
+      (extendedStates ? ` nudged=${m.nudged} redispatched=${m.redispatched} reviewReawakened=${m.reviewReawakened}` : ""));
 
     // Journey log: one orchestrator.unblocked per Ready transition. The helper
     // OWNS this event so BOTH call sites emit an identical journal trail (the
@@ -87,7 +115,72 @@ export function createCascade(deps) {
       });
     }
 
+    if (m.nudged || m.skippedLiveLease || m.redispatched || m.reviewReawakened) {
+      emitCascadeMetrics(m);
+    }
+
     return unblocked;
+  }
+
+  /**
+   * A dependent already in_progress whose last blocker just resolved. NEVER
+   * steal a live lease and NEVER attempt a claim against one — a live agent is
+   * doing the work; a re-dispatch would duplicate the session. The lease check
+   * (R3, lease.mjs) is the sole authority for liveness.
+   */
+  async function handleInProgressDependent(sibling, unblockedBy, workflow, m) {
+    const agentId = sibling.assignee;
+    const task = workflow?.agentTasks?.[sibling.ticketId];
+    const lastActivity = await lease.lastAgentActivity(
+      ddb, eventsTable, workflow?.id, agentId, sibling.ticketId
+    );
+    if (lease.isLeaseLive(task, lastActivity, now())) {
+      // LIVE lease — context signal ONLY. Zero steal, zero claim (AC-D3.3).
+      await publishEvent(sibling.ticketId, "orchestrator.nudge", {
+        agentId, unblockedBy, workflowId: workflow?.id,
+      });
+      m.nudged++;
+      m.skippedLiveLease++;
+      log(`[orchestrator] cascade nudge (live lease) — ${sibling.ticketId} agent=${agentId}`);
+      return;
+    }
+    // STALE lease — steal the exact generation (CAS on startedAt), then
+    // re-dispatch through the normal claim CAS. Both CAS steps are arbiters: a
+    // fresh claim that raced in makes the steal OR the re-dispatch lose, and we
+    // stop — a re-dispatch against a live lease is structurally refused.
+    const stole = await lease.stealClaim(
+      ddb, workflowsTable, workflow?.id, sibling.ticketId, task?.startedAt
+    );
+    if (!stole) {
+      log(`[orchestrator] cascade steal lost — ${sibling.ticketId} (claim moved)`);
+      return;
+    }
+    const dispatched = await redispatch(workflow, sibling);
+    if (dispatched) {
+      m.redispatched++;
+      log(`[orchestrator] cascade re-dispatch — ${sibling.ticketId} agent=${agentId}`);
+    } else {
+      log(`[orchestrator] cascade re-dispatch refused — ${sibling.ticketId} (claim CAS lost)`);
+    }
+  }
+
+  /**
+   * A dependent parked in_review (a human-review gate) whose last blocker just
+   * resolved — e.g. a reopened gate whose rework fix children have all closed.
+   * Re-wake the gate: emit review.reawakened and re-run the EXISTING gate
+   * readiness path (re-parks in_review idempotently + refreshes the reviewer
+   * notification if none is open). No ticket-status write beyond what that gate
+   * logic itself decides.
+   */
+  async function handleInReviewDependent(sibling, unblockedBy, workflow, m) {
+    await publishEvent(sibling.ticketId, "review.reawakened", {
+      gateTicketId: sibling.ticketId, unblockedBy, workflowId: workflow?.id,
+    });
+    if (reawakenGate) {
+      await reawakenGate(sibling.ticketId, sibling.assignee, workflow);
+    }
+    m.reviewReawakened++;
+    log(`[orchestrator] cascade review re-wake — ${sibling.ticketId}`);
   }
 
   /**
@@ -109,4 +202,32 @@ export function createCascade(deps) {
   }
 
   return { cascadeUnblock };
+}
+
+/**
+ * Emit the extended-state cascade actions as a single EMF record
+ * (AgentCoreHub/Orchestrator namespace) — same emitter shape as the detector's
+ * emitMetrics. Only called when at least one extended action fired, so the
+ * commit-4a-only path stays silent.
+ */
+export function emitCascadeMetrics(m) {
+  console.log(JSON.stringify({
+    _aws: {
+      Timestamp: Date.now(),
+      CloudWatchMetrics: [{
+        Namespace: "AgentCoreHub/Orchestrator",
+        Dimensions: [[]],
+        Metrics: [
+          { Name: "CascadeNudgeLiveLease", Unit: "Count" },
+          { Name: "CascadeSkippedLiveLease", Unit: "Count" },
+          { Name: "CascadeRedispatch", Unit: "Count" },
+          { Name: "CascadeReviewReawaken", Unit: "Count" },
+        ],
+      }],
+    },
+    CascadeNudgeLiveLease: m.nudged,
+    CascadeSkippedLiveLease: m.skippedLiveLease,
+    CascadeRedispatch: m.redispatched,
+    CascadeReviewReawaken: m.reviewReawakened,
+  }));
 }

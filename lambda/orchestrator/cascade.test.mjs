@@ -178,6 +178,187 @@ describe("provider branching", () => {
   });
 });
 
+/**
+ * Commit 4b — extended states behind CASCADE_EXTENDED_STATES. When the LAST
+ * blocker of an ALREADY-MOVING dependent resolves:
+ *   - in_progress → lease-guarded (live → nudge only; stale → steal + dispatch)
+ *   - in_review   → re-wake the gate (review.reawakened + gate re-run)
+ * Off by default → those dependents are untouched.
+ */
+const TTL_MS = 30 * 60 * 1000;
+const STALE_STARTED = "2026-09-01T00:00:00Z"; // 12h before NOW → any lease is stale
+
+function makeExtDeps(overrides = {}) {
+  const base = makeDeps(overrides);
+  const lease = {
+    LEASE_TTL_MS: TTL_MS,
+    isLeaseLive: vi.fn(() => false), // stale by default
+    lastAgentActivity: vi.fn(async () => null),
+    stealClaim: vi.fn(async () => true),
+    ...overrides.lease,
+  };
+  const redispatch = overrides.redispatch || vi.fn(async () => true);
+  const reawakenGate = overrides.reawakenGate || vi.fn(async () => {});
+  const deps = {
+    ...base.deps,
+    extendedStates: overrides.extendedStates !== undefined ? overrides.extendedStates : true,
+    lease,
+    eventsTable: "events",
+    workflowsTable: "workflows",
+    redispatch,
+    reawakenGate,
+  };
+  return { ...base, deps, lease, redispatch, reawakenGate };
+}
+
+// A workflow carrying a running claim for the in_progress dependent.
+const extWorkflow = {
+  id: "wf_1",
+  workflowId: "wf_1",
+  agentTasks: { "TEAM-2": { id: "t2", agentId: "dev", ticketId: "TEAM-2", status: "running", startedAt: STALE_STARTED } },
+};
+
+describe("commit 4b — in_progress dependent, LIVE lease (AC-D3.3)", () => {
+  it("nudges only — ZERO steal, ZERO claim, ZERO re-dispatch", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    ];
+    const { deps, ddb, publishEvent, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      lease: { isLeaseLive: vi.fn(() => true) },
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(unblocked).toEqual([]); // not a Ready transition
+    const nudges = eventsOfType(publishEvent, "orchestrator.nudge");
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0][2]).toMatchObject({ agentId: "dev", unblockedBy: DONE, workflowId: "wf_1" });
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(statusWrites(ddb)).toHaveLength(0);
+  });
+});
+
+describe("commit 4b — in_progress dependent, STALE lease", () => {
+  it("steals on the exact generation then re-dispatches through the claim CAS", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(lease.stealClaim).toHaveBeenCalledWith(deps.ddb, "workflows", "wf_1", "TEAM-2", STALE_STARTED);
+    expect(redispatch).toHaveBeenCalledTimes(1);
+    expect(redispatch.mock.calls[0][1].ticketId).toBe("TEAM-2");
+    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(0);
+  });
+
+  it("does NOT re-dispatch when the steal loses (claim moved)", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    ];
+    const { deps, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      lease: { stealClaim: vi.fn(async () => false) },
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(redispatch).not.toHaveBeenCalled();
+  });
+
+  it("tolerates a re-dispatch refused by the claim CAS (returns false)", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    ];
+    const { deps, lease } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      redispatch: vi.fn(async () => false), // live claim raced in, CAS lost
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    expect(unblocked).toEqual([]);
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("commit 4b — in_review gate re-wake (AC-D3.1 / AC-D3.2)", () => {
+  it("AC-D3.1: last blocker done → review.reawakened + gate re-invoked in the same cascade", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(unblocked).toEqual([]); // not a Ready transition
+    const reawaken = eventsOfType(publishEvent, "review.reawakened");
+    expect(reawaken).toHaveLength(1);
+    expect(reawaken[0][2]).toMatchObject({ gateTicketId: "GATE-1", unblockedBy: DONE, workflowId: "wf_1" });
+    expect(reawakenGate).toHaveBeenCalledWith("GATE-1", "human:reviewer", extWorkflow);
+  });
+
+  it("AC-D3.2: reopened gate blocked by fix children — last child done re-dispatches the SAME cycle", async () => {
+    // Rework loop-back: the gate was reopened and blocked_by-chained to fix + CI
+    // re-validate children. The last child closing resolves all gate blockers.
+    const siblings = [
+      { ticketId: "FIX-1", status: "done" },
+      { ticketId: "CI-1", status: "done" }, // the last child, just closed = DONE below
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: ["FIX-1", "CI-1"] },
+    ];
+    const { deps, publishEvent, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock("CI-1", "EPIC-1", extWorkflow);
+
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(1);
+    expect(reawakenGate).toHaveBeenCalledWith("GATE-1", "human:reviewer", extWorkflow);
+  });
+});
+
+describe("commit 4b — flag OFF leaves extended-state dependents untouched", () => {
+  it("in_progress + in_review are no-ops when extendedStates is false", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent, lease, redispatch, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      extendedStates: false,
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(unblocked).toEqual([]);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(lease.lastAgentActivity).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(reawakenGate).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(0);
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+  });
+});
+
 describe("both call sites exercise identical helper behavior", () => {
   it("two independent cascade instances (webhook + stream wiring) produce identical output", async () => {
     const siblings = () => [
