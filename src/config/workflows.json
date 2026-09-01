@@ -43,7 +43,10 @@
           "condition": "always",
           "onReject": "rework",
           "reviewerRole": "Code Owner",
-          "assignee": "human:engineer"
+          "assignee": "human:engineer",
+          "maxRounds": 3,
+          "regressionCountsDouble": true,
+          "onCapReached": "escalate"
         }
       ],
       "phases": [
@@ -107,7 +110,10 @@
           "condition": "always",
           "onReject": "rework",
           "reviewerRole": "Code Owner",
-          "assignee": "human:engineer"
+          "assignee": "human:engineer",
+          "maxRounds": 3,
+          "regressionCountsDouble": true,
+          "onCapReached": "escalate"
         }
       ],
       "phases": [
@@ -189,7 +195,10 @@
           "condition": "always",
           "onReject": "rework",
           "reviewerRole": "Code Owner",
-          "assignee": "human:engineer"
+          "assignee": "human:engineer",
+          "maxRounds": 3,
+          "regressionCountsDouble": true,
+          "onCapReached": "escalate"
         }
       ]
     },

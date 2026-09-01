@@ -108,6 +108,48 @@ describe("effectiveRoundCount", () => {
   });
 });
 
+// The `opts` param mirrors the reviewGate config field of the same name
+// (workflow-defs.ts resolveReviewGateCap). Omitting it must be byte-identical
+// to the pre-opts behavior: regressions always double.
+describe("effectiveRoundCount — regressionCountsDouble opt", () => {
+  it("omitted opts / empty opts / explicit true all double a regression round identically", () => {
+    const rounds = [cn(1, 1), cn(2)]; // regression round + plain round
+    expect(effectiveRoundCount(rounds)).toBe(3);
+    expect(effectiveRoundCount(rounds, [])).toBe(3);
+    expect(effectiveRoundCount(rounds, [], {})).toBe(3);
+    expect(effectiveRoundCount(rounds, [], { regressionCountsDouble: undefined })).toBe(3);
+    expect(effectiveRoundCount(rounds, [], { regressionCountsDouble: true })).toBe(3);
+  });
+
+  it("regressionCountsDouble: false → a regression round weighs 1, not 2", () => {
+    expect(effectiveRoundCount([cn(1, 1)], [], { regressionCountsDouble: false })).toBe(1);
+    // 2 regression rounds: 4 when doubling, 2 when not.
+    expect(effectiveRoundCount([cn(1, 1), cn(2, 1)])).toBe(4);
+    expect(effectiveRoundCount([cn(1, 1), cn(2, 1)], [], { regressionCountsDouble: false })).toBe(2);
+  });
+
+  it("regressionCountsDouble: false leaves non-regression accounting untouched", () => {
+    const off = { regressionCountsDouble: false };
+    // plain CN rounds are unaffected either way
+    expect(effectiveRoundCount([cn(1), cn(2), cn(3)], [], off)).toBe(3);
+    // PASS rounds still contribute 0
+    expect(effectiveRoundCount([cn(1), pass(2, "PASS"), cn(3)], [], off)).toBe(2);
+    // the reset boundary still applies
+    expect(effectiveRoundCount([cn(1, 1), cn(2, 1), cn(3), cn(4)], [cont(3)], off)).toBe(1);
+    // dedupe still applies (last entry per round wins)
+    expect(effectiveRoundCount([cn(1), cn(1, 1)], [], off)).toBe(1);
+  });
+
+  it("the opt changes WHEN the cap trips: 2 regression rounds reach 4 with doubling but only 2 without", () => {
+    const twoRegressions = [cn(1, 1), cn(2, 1)];
+    const cap = 3;
+    expect(effectiveRoundCount(twoRegressions) >= cap).toBe(true);
+    expect(effectiveRoundCount(twoRegressions, [], { regressionCountsDouble: false }) >= cap).toBe(
+      false
+    );
+  });
+});
+
 describe("mergeRound", () => {
   it("overwrites in place on same round (same or new SHA), appends new rounds, never mutates input", () => {
     const r1 = { round: 1, reviewedHeadSha: "aaa" };
