@@ -107,14 +107,37 @@ Enable flag: `PIPELINE_ENABLED` (env, forwarded to the ECS container and read by
 blueprints via the orchestrator context). Absent/`0` → module hidden, blueprints
 behave exactly as today. This is the whole opt-out.
 
-### Two pipeline uses (name them, build one)
+### Pipelines are split by independently-deployable component
 
-- **(a) Deploy the hub app itself** — the pilot. One repo, concrete, proves the
-  full loop (CI check → merge → pipeline deploy of the Lambda + ECS targets).
-- **(b) The fleet stands up pipelines in the *target repos* it builds features
-  for** — the bigger long-term play. Same module, a templating pass over (a).
-  Out of scope for the pilot; the CDK stack is parameterized by repo so (b) is a
-  later `cdk deploy` per target, not a rewrite.
+The hub is not one deployable — it is an **app** (Next.js + orchestrator Lambda +
+`config/*`) and a **fleet + eval-infra** (14 runtime agents + evaluator config +
+alarms + eval-packager, i.e. DEPLOY.md steps 4-9). These have different blast
+radius, cadence, secrets, and IAM. Coupling them into one deploy forces one role
+to hold everything — the least-privilege violation that surfaced repeatedly in
+review. So they get **separate pipelines from the same parameterized CDK stack**:
+
+- **App pipeline (this pilot).** Deploys Lambda code + S3 config + ECS roll.
+  Narrow role: `lambda:UpdateFunctionCode` (+ waiter read), S3 on the artifact
+  bucket, `ecs:UpdateExpressGatewayService`. Triggered by `src/`,
+  `lambda/orchestrator/`, `deploy/ecs-express/`, `src/config/*.json`. A changeset
+  that also touches fleet/eval files **BLOCKS in pre_build before any prod
+  mutation** — a human runs DEPLOY.md steps 4-9 (the documented deploy-contract
+  handoff), never a silent skip.
+- **Fleet + eval pipeline (follow-up).** A second `cdk deploy` of the same stack
+  with `{component: "fleet-eval"}`: its own buildspec, its own broader-but-
+  isolated role (AgentCore control-plane, fleet-role PassRole, GitHub/MCP secrets
+  from Secrets Manager, the `agentcore` CLI in its build image), triggered by
+  `deploy/runtime-agent/`, `blueprints/`, `deploy/evaluations/`,
+  `lambda/eval-packager/`. Deploys DEPLOY.md steps 4-9 with the ordering the
+  contract requires.
+
+Then **(b)**, the longer play: the fleet stands up this same parameterized stack
+in the *target repos* it builds features for — a templating pass, not a rewrite.
+
+Enable flags: `NEXT_PUBLIC_PIPELINE_ENABLED` (build-time; shows the `/pipeline`
+nav tab) and `PIPELINE_ENABLED` (fleet/orchestrator context; blueprints read
+pipeline results instead of shelling builds). Both unset → module hidden,
+blueprints behave exactly as today. That is the whole opt-out.
 
 ---
 
@@ -130,14 +153,16 @@ GitHub: tycenjmccann/agentcore-hub
    │                               → posts a required commit status
    │                               → branch protection on `main` blocks merge if red
    │
-   └── on merge to main ───────► CodePipeline: agentcore-hub-deploy
+   └── on merge to main ───────► CodePipeline: agentcore-hub-deploy (APP pipeline)
                                    ├─ Source   (CodeConnections, main)
                                    ├─ Build    buildspec-ci.yml again (build-once)
                                    │           → artifacts: orchestrator.zip (+ digest),
-                                   │             ECR image (by digest), eval zips
+                                   │             ECR image (by digest)
                                    ├─ Approval  ManualApproval → SNS → Telegram
                                    └─ Deploy   buildspec-deploy.yml
-                                               (promotes the exact artifacts by digest)
+                                               (Lambda code + S3 config + ECS roll,
+                                                promote-by-digest; fleet/eval change
+                                                → BLOCK for the fleet+eval pipeline)
 ```
 
 - **Build-once / promote-by-digest:** the Deploy stage never rebuilds. It
@@ -252,13 +277,14 @@ Notes (implemented):
   because with `PIPELINE_ENABLED` the blueprints skip their own mechanical tests
   on a green result; a missing gate here would let unit/race/telemetry
   regressions merge. Kept in lockstep with `.github/workflows/ci.yml`.
-- **Eval-infra targets (DEPLOY.md steps 4–9)** run via
-  `deploy/pipeline/deploy-eval-targets.sh`, **conditional** on the changeset
-  touching eval files (`pipeline-out/changed-files.txt`). Ordering preserved
-  (packager step 4 before rubric step 6; alarms step 8 last + gated on a healthy
-  batch). If the `agentcore` CLI is absent from the deploy image, steps 5–9 FAIL
-  LOUDLY (BLOCKED) rather than silently skip — no reporting success on stale
-  evaluator config.
+- **Eval-infra targets (DEPLOY.md steps 4–9) are OUT of the app pipeline.** They
+  belong to the separate fleet+eval pipeline (its own role/secrets/CLI). The app
+  pipeline's Deploy stage checks `pipeline-out/changed-files.txt` in **pre_build**
+  and, if the changeset touches fleet/eval paths, **BLOCKS before any prod
+  mutation** so a human runs steps 4-9 — the documented handoff, not a silent
+  skip. The changed-file list is computed from the last successfully deployed SHA
+  (recorded in S3), so a multi-commit push cannot hide an eval change; an unknown
+  range forces the block conservatively.
 - **ECS roll is conditional** on `ECS_SERVICE_ARN` being set (Lambda/blueprint-
   only changes skip the image promote), and the roll is **verified**: the Deploy
   stage polls the service to ACTIVE-with-endpoint and curls the app health

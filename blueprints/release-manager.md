@@ -456,20 +456,30 @@ deploy contract. Nothing else.
 3. **Deploy = the pipeline, not you.** The merge to the default branch triggers
    the CodePipeline Source stage. (If it does not auto-trigger, start it:
    `aws codepipeline start-pipeline-execution --name agentcore-hub-deploy`.) The
-   pipeline runs Build → its own ManualApproval → Deploy (the three `DEPLOY.md`
-   targets) → smoke checks, under its IAM role. You do NOT run any deploy
-   command yourself — the role is what keeps orchestrator config (Jira creds)
-   safe, and running commands here would bypass build-once/promote-by-digest.
-4. **Watch to terminal:** poll `aws codepipeline get-pipeline-state --name
+   **app** pipeline runs Build → its own ManualApproval → Deploy (Lambda code +
+   S3 config + ECS roll) → smoke checks, under its IAM role. You do NOT run any
+   deploy command yourself — the role is what keeps orchestrator config (Jira
+   creds) safe, and running commands here would bypass build-once/promote-by-
+   digest.
+4. **Fleet/eval changes are a SEPARATE handoff.** The app pipeline deploys ONLY
+   the app targets; it BLOCKS if the changeset touches fleet/eval-infra
+   (DEPLOY.md steps 4-9: `deploy/runtime-agent/`, `blueprints/`,
+   `deploy/evaluations/`, `lambda/eval-packager/`). If your PR touched those, the
+   pipeline's Deploy stage fails with a BLOCKED message naming the files — treat
+   that as expected: report the app deploy result AND that steps 4-9 need the
+   fleet+eval pipeline (once stood up) or a human to run them per DEPLOY.md. Do
+   NOT try to run steps 4-9 yourself.
+5. **Watch to terminal:** poll `aws codepipeline get-pipeline-state --name
    agentcore-hub-deploy` (or `Pipeline___*`) until every stage is Succeeded or
    one Failed. The pipeline's own approval action is a SECOND gate beyond the
    merge gate — surface that it is waiting so a human can approve the deploy of
    the built artifacts.
-5. **Report:** `WorkflowOutput___report_completion` with the merge SHA, the
+6. **Report:** `WorkflowOutput___report_completion` with the merge SHA, the
    pipeline execution id, each stage's status, the smoke-check outcome from the
-   Deploy stage log, and (if the pipeline ran rollback) the rollback status.
-   A stage failure → verdict FAIL with the failing stage's log link + a fix
-   ticket. Do NOT improvise a manual deploy to "help" a failed pipeline.
+   Deploy stage log, and (if the pipeline ran rollback) the rollback status. A
+   stage failure → verdict FAIL with the failing stage's log link + a fix ticket;
+   a fleet/eval BLOCK → note it per step 4. Do NOT improvise a manual deploy to
+   "help" a failed pipeline.
 
 ---
 

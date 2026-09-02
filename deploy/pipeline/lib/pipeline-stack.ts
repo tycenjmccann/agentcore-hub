@@ -198,9 +198,10 @@ export class PipelineStack extends Stack {
         ECR_REPO: { value: "agentcore-hub-frontend" },
         BUILD_APP_IMAGE: { value: "true" },
         // Baked into the image client bundle; flip to "1" to show the /pipeline
-        // nav tab (Codex PR #263 P2). Empty = hidden.
+        // nav tab. Read the SAME documented var name the README + deploy.sh use
+        // (Codex PR #263 round-4 P2). Empty = hidden.
         NEXT_PUBLIC_PIPELINE_ENABLED: {
-          value: process.env.PIPELINE_NAV_ENABLED || "",
+          value: process.env.NEXT_PUBLIC_PIPELINE_ENABLED || "",
         },
       },
       timeout: Duration.minutes(40),
@@ -483,51 +484,15 @@ function grantDeployPerms(
     })
   );
 
-  // ── Eval-target actions (DEPLOY.md steps 4-9), used ONLY when the changeset
-  // touches eval files and the agentcore CLI is present (Codex #263 round-3 P1).
-  // deploy-eval-targets.sh calls: sns:CreateTopic, cloudwatch:PutMetricAlarm,
-  // dynamodb:UpdateItem on the eval-config table, and the fleet redeploy needs
-  // AgentCore control-plane + a PassRole for bedrock-agentcore.amazonaws.com.
-  statements.push(
-    new iam.PolicyStatement({
-      sid: "EvalAlarmsAndTopic",
-      actions: [
-        "sns:CreateTopic",
-        "cloudwatch:PutMetricAlarm",
-        "cloudwatch:DescribeAlarms",
-      ],
-      resources: ["*"], // PutMetricAlarm/DescribeAlarms are not resource-scoped; CreateTopic is idempotent-by-name
-    }),
-    new iam.PolicyStatement({
-      sid: "EvalConfigTable",
-      actions: ["dynamodb:UpdateItem", "dynamodb:GetItem"],
-      resources: [
-        `arn:aws:dynamodb:${ctx.region}:${ctx.account}:table/agentcore-hub-eval-config`,
-      ],
-    }),
-    new iam.PolicyStatement({
-      sid: "EvalFleetControlPlane",
-      actions: [
-        "bedrock-agentcore:UpdateAgentRuntime",
-        "bedrock-agentcore:GetAgentRuntime",
-        "bedrock-agentcore:ListAgentRuntimes",
-        "bedrock-agentcore:UpdateOnlineEvaluationConfig",
-        "bedrock-agentcore:GetOnlineEvaluationConfig",
-        "bedrock-agentcore:ListOnlineEvaluationConfigs",
-      ],
-      resources: ["*"],
-    }),
-    new iam.PolicyStatement({
-      sid: "PassFleetRuntimeRole",
-      actions: ["iam:PassRole"],
-      resources: [
-        `arn:aws:iam::${ctx.account}:role/agentcore-hub-agentcore-role`,
-      ],
-      conditions: {
-        StringEquals: { "iam:PassedToService": "bedrock-agentcore.amazonaws.com" },
-      },
-    })
-  );
+  // NOTE: the eval-infra targets (DEPLOY.md steps 4-9) are deliberately OUT of
+  // this pilot's CD scope. Running them needs the agentcore CLI in the image,
+  // the fleet role, MCP/GitHub secrets, and broad AgentCore + IAM-create perms —
+  // which would defeat the narrow-role principle and balloon the pilot. When a
+  // merge touches eval files the Deploy stage BLOCKS loudly (not silently skips)
+  // so a human runs steps 4-9 per DEPLOY.md — exactly the documented
+  // no-DEPLOY.md handoff (Codex PR #263 round-4). Templating eval CD in is a
+  // follow-up once the app-deploy loop is proven. So the deploy role stays
+  // app-only: Lambda code, S3 config, ECS roll.
 
   role.attachInlinePolicy(
     new iam.Policy(scope, "DeployPerms", { statements })

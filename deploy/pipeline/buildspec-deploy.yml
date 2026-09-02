@@ -23,6 +23,23 @@ phases:
         if [ -n "${EXPECTED_ACCOUNT_ID:-}" ] && [ "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT_ID" ]; then
           echo "ERROR: account $ACCOUNT_ID != EXPECTED_ACCOUNT_ID $EXPECTED_ACCOUNT_ID" >&2; exit 1
         fi
+      # ── Scope guard: this is the APP pipeline (Lambda + S3 config + ECS only).
+      # Fleet + eval-infra (DEPLOY.md steps 4-9) belong to a SEPARATE fleet+eval
+      # pipeline with its own role/secrets. If the changeset touches those files,
+      # REFUSE BEFORE deploying anything (pre_build = before the rollback trap and
+      # before any prod mutation) so a human runs DEPLOY.md 4-9 — the documented
+      # deploy-contract handoff, never a silent skip (Codex PR #263 round-4).
+      # This runs at the START so we never half-deploy then block.
+      - |
+        CHANGED="$(cat pipeline-out/changed-files.txt 2>/dev/null || true)"
+        if printf '%s' "$CHANGED" | grep -qE '^(lambda/eval-packager/|deploy/evaluations/|deploy/continuous-improvement/|deploy/runtime-agent/)'; then
+          echo "BLOCKED: changeset touches fleet/eval-infra files (DEPLOY.md steps 4-9)," >&2
+          echo "         which this APP pipeline does not deploy. Nothing has been" >&2
+          echo "         deployed. A human must run DEPLOY.md steps 4-9 (or the" >&2
+          echo "         fleet+eval pipeline, once stood up). Offending files:" >&2
+          printf '%s\n' "$CHANGED" | grep -E '^(lambda/eval-packager/|deploy/evaluations/|deploy/continuous-improvement/|deploy/runtime-agent/)' | sed 's/^/           - /' >&2
+          exit 1
+        fi
 
   build:
     commands:
@@ -39,9 +56,23 @@ phases:
         # DEPLOY.md manual rollback = re-point Lambda at prior zip + ECS at prior
         # image. rollback.sh restores from these; run on ANY failure via trap.
         mkdir -p /tmp/rollback
-        aws s3api get-object --bucket "$ARTIFACT_BUCKET" --key "pipeline-artifacts/orchestrator-current.zip" \
-          /tmp/rollback/orchestrator-prev.zip --region "$AWS_REGION_HUB" >/dev/null 2>&1 \
-          && echo "captured prior orchestrator zip" || echo "no prior orchestrator zip (first pipeline deploy)"
+        if aws s3api get-object --bucket "$ARTIFACT_BUCKET" --key "pipeline-artifacts/orchestrator-current.zip" \
+             /tmp/rollback/orchestrator-prev.zip --region "$AWS_REGION_HUB" >/dev/null 2>&1; then
+          echo "captured prior orchestrator zip from snapshot"
+        else
+          # FIRST pipeline run: no snapshot yet, but a prod orchestrator already
+          # exists. Seed the rollback source from the LIVE Lambda code so a failed
+          # first deploy can still restore pre-pipeline code (Codex #263 round-4 P1).
+          echo "no prior snapshot — seeding rollback from LIVE orchestrator code"
+          LIVE_URL="$(aws lambda get-function --function-name agentcore-hub-orchestrator \
+            --region "$AWS_REGION_HUB" --query 'Code.Location' --output text 2>/dev/null || true)"
+          if [ -n "$LIVE_URL" ] && [ "$LIVE_URL" != "None" ]; then
+            curl -sf "$LIVE_URL" -o /tmp/rollback/orchestrator-prev.zip && echo "seeded rollback from live Lambda" \
+              || echo "WARN: could not download live Lambda code — rollback of orchestrator unavailable this run"
+          else
+            echo "WARN: no live orchestrator to seed from — rollback of orchestrator unavailable this run"
+          fi
+        fi
         if [ -n "${ECS_SERVICE_ARN:-}" ]; then
           aws ecs describe-express-gateway-service --service-arn "$ECS_SERVICE_ARN" --region "$AWS_REGION_HUB" --output json 2>/dev/null \
             | python3 -c "import json,sys; d=json.load(sys.stdin); pc=(d.get('service',{}).get('activeConfigurations') or [{}])[0].get('primaryContainer',{}); print(pc.get('image',''))" \
@@ -79,14 +110,8 @@ phases:
           echo "ECS_SERVICE_ARN unset — skipping app roll (Lambda/blueprint-only deploy)"
         fi
 
-        # ── Eval-infra targets (DEPLOY.md steps 4-9), CONDITIONAL on changeset ──
-        CHANGED="$(cat pipeline-out/changed-files.txt 2>/dev/null || true)"
-        if printf '%s' "$CHANGED" | grep -qE '^(lambda/eval-packager/|deploy/evaluations/|deploy/continuous-improvement/|deploy/runtime-agent/)'; then
-          echo "Eval files changed → running DEPLOY.md eval targets (steps 4-9)"
-          bash deploy/pipeline/deploy-eval-targets.sh
-        else
-          echo "No eval files in changeset → skipping eval targets (per DEPLOY.md)"
-        fi
+        # (Fleet/eval-infra scope guard already ran in pre_build — a changeset
+        # touching those files refused BEFORE any prod mutation.)
 
         # ── Smoke checks (DEPLOY.md) — failures here also hit the rollback trap ──
         echo "Smoke checks"
@@ -114,5 +139,8 @@ phases:
         # ── SUCCESS: only NOW advance the rollback snapshot to this artifact ──
         # (Codex #263 round-3 P2: never label a failed deploy as "current".)
         aws s3 cp pipeline-out/orchestrator.zip "s3://$ARTIFACT_BUCKET/pipeline-artifacts/orchestrator-current.zip" --region "$AWS_REGION_HUB"
+        # Record the deployed SHA so the NEXT build diffs the full push range from
+        # here (Codex #263 round-4 P2 — the changed-files guard reads this).
+        printf '%s' "$GIT_SHA" | aws s3 cp - "s3://$ARTIFACT_BUCKET/pipeline-artifacts/last-deployed-sha.txt" --region "$AWS_REGION_HUB"
         trap - EXIT
         echo "── Deploy complete ──"

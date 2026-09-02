@@ -19,9 +19,24 @@ merge to main ─► CodePipeline "agentcore-hub-deploy":
   merge. This is the deterministic work the CI agent used to shell out.
 - **Deploy CodePipeline** builds ONCE (Build stage emits the orchestrator zip +
   app image by digest) and the Deploy stage promotes those exact artifacts via
-  `buildspec-deploy.yml` — the machine form of `DEPLOY.md`'s three targets, run
-  under a narrow IAM role that **cannot** rewrite orchestrator config (so it
-  cannot blank prod Jira creds).
+  `buildspec-deploy.yml` — the machine form of `DEPLOY.md`'s **app** targets
+  (Lambda code + S3 config + ECS roll), run under a narrow IAM role that
+  **cannot** rewrite orchestrator config (so it cannot blank prod Jira creds).
+
+### Scope: app pipeline only (this pilot)
+
+The hub splits into two independently-deployable components with different blast
+radius + IAM, so they get **separate pipelines from this same parameterized
+stack**:
+- **App pipeline (here):** Lambda + S3 config + ECS. Narrow role.
+- **Fleet + eval pipeline (follow-up):** the 14 runtime agents + evaluator config
+  + alarms + eval-packager (DEPLOY.md steps 4-9). Its own broader-but-isolated
+  role, secrets, and `agentcore` CLI.
+
+If a merge touches fleet/eval files (`deploy/runtime-agent/`, `blueprints/`,
+`deploy/evaluations/`, `lambda/eval-packager/`), the app pipeline's Deploy stage
+**BLOCKS in pre_build before any prod mutation** — a human runs DEPLOY.md steps
+4-9 (the documented handoff), never a silent skip.
 
 ## Files
 
@@ -33,6 +48,8 @@ merge to main ─► CodePipeline "agentcore-hub-deploy":
 | `buildspec-deploy.yml` | Deploy stage: the 3-target `DEPLOY.md`, promote-by-digest, smoke checks |
 | `merge-agents-json.py` | the agents.json merge (extracted from `DEPLOY.md` step 2 — single source) |
 | `ecs-primary-container.py` | builds the ECS roll container JSON, reusing live env, swapping image→digest |
+| `ecs-health.py` | parses `describe-express-gateway-service` → status + ingress URL for the rollout health poll |
+| `rollback.sh` | on any Deploy-phase failure, restores the prior orchestrator zip + ECS image (snapshotted pre-deploy) |
 | `deploy.sh` | idempotent `cdk deploy` wrapper (sources `deploy/config.sh` for the account guard) |
 
 ## Deploy

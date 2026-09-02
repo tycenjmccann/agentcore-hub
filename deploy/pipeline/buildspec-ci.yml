@@ -92,9 +92,15 @@ phases:
           ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
           aws ecr get-login-password --region "$AWS_REGION_HUB" \
             | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com"
-          # Bundle the DEPLOYED agents.json (real ARNs) for the image build only.
-          aws s3 cp "s3://${ARTIFACT_BUCKET}/config/agents.json" /tmp/agents.s3.json --region "$AWS_REGION_HUB" || true
-          if [ -f /tmp/agents.s3.json ]; then cp src/config/agents.json /tmp/agents.git.json; cp /tmp/agents.s3.json src/config/agents.json; fi
+          # Build the image from the CANDIDATE roster with only the live runtimeArns
+          # merged in — NOT the stale deployed S3 doc (Codex #263 round-4 P1). This
+          # is the same merge the Deploy stage uploads, so the baked bundle and the
+          # deployed S3 config agree on the roster.
+          if aws s3 cp "s3://${ARTIFACT_BUCKET}/config/agents.json" /tmp/agents.s3.json --region "$AWS_REGION_HUB"; then
+            cp src/config/agents.json /tmp/agents.git.json
+            python3 deploy/pipeline/merge-agents-json.py /tmp/agents.s3.json src/config/agents.json /tmp/agents.merged.json
+            cp /tmp/agents.merged.json src/config/agents.json
+          fi
           # CodePipeline's CodeStar source is a ZIP artifact with no .git — use the
           # pipeline-resolved source revision, not `git rev-parse` (Codex #263 P1).
           GIT_SHA="${CODEBUILD_RESOLVED_SOURCE_VERSION:-$(git rev-parse --short HEAD 2>/dev/null || echo nogit)}"
@@ -113,13 +119,19 @@ phases:
           cp /tmp/orchestrator.zip pipeline-out/orchestrator.zip
           printf '%s' "$IMAGE_DIGEST" > pipeline-out/image-digest.txt
           printf '%s' "$GIT_SHA" > pipeline-out/git-sha.txt
-          # Changed-file list vs the previous commit — the Deploy stage uses it to
-          # decide whether to run the conditional eval targets (DEPLOY.md 4-9).
-          # codeBuildCloneOutput gives us a real .git; fall back to "everything"
-          # (forces eval targets to run) if the diff can't be computed.
-          ( git diff --name-only HEAD~1..HEAD 2>/dev/null \
-            || git show --name-only --pretty=format: HEAD 2>/dev/null \
-            || echo "deploy/runtime-agent/FORCE" ) > pipeline-out/changed-files.txt
+          # Changed-file list the Deploy stage uses for the fleet/eval scope guard.
+          # Must cover the WHOLE push, not just the tip: a multi-commit push where
+          # an EARLIER commit touched eval files would be missed by HEAD~1..HEAD
+          # and wrongly pass the guard (Codex #263 round-4 P2). Diff from the last
+          # SUCCESSFULLY DEPLOYED revision (recorded in S3 by a prior deploy); if
+          # that is unknown, emit the sentinel so the guard conservatively BLOCKS
+          # (forces a human to confirm scope) rather than under-reporting.
+          LAST_DEPLOYED="$(aws s3 cp "s3://${ARTIFACT_BUCKET}/pipeline-artifacts/last-deployed-sha.txt" - --region "$AWS_REGION_HUB" 2>/dev/null || true)"
+          if [ -n "$LAST_DEPLOYED" ] && git cat-file -e "${LAST_DEPLOYED}^{commit}" 2>/dev/null; then
+            git diff --name-only "${LAST_DEPLOYED}..HEAD" > pipeline-out/changed-files.txt
+          else
+            echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files.txt
+          fi
         fi
 
 # For the deploy pipeline Build stage, these are the promote-by-digest artifacts.
