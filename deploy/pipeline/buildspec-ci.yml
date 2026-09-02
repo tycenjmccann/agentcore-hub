@@ -15,6 +15,10 @@
 # (Codex PR #263 round-3). Keep the quotes; avoid raw ": " in echo text.
 version: 0.2
 
+# Pin bash — CodeBuild defaults to /bin/sh (dash). Parity with buildspec-deploy,
+# which MUST have bash (its `set -o pipefail` + here-strings die under dash).
+shell: bash
+
 phases:
   install:
     runtime-versions:
