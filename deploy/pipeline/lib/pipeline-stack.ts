@@ -117,28 +117,68 @@ export class PipelineStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
+    // Explicit CI service role with the connection perms baked in as an inline
+    // policy AT CONSTRUCTION — so they exist before CreateProject validates the
+    // CODECONNECTIONS source auth. Passing perms via role.inlinePolicies (not a
+    // separately-attached Policy) avoids both the create-time race AND the
+    // circular dependency an addDependency on the project would introduce.
+    const connectionActions = [
+      "codeconnections:UseConnection",
+      "codeconnections:GetConnection",
+      "codeconnections:GetConnectionToken",
+      "codestar-connections:UseConnection",
+      "codestar-connections:GetConnection",
+      "codestar-connections:GetConnectionToken",
+    ];
+    const ciRole = new iam.Role(this, "CiProjectRole", {
+      assumedBy: new iam.ServicePrincipal("codebuild.amazonaws.com"),
+      description: "AgentCore Hub CI CodeBuild role (PR check; connection + read-only).",
+      inlinePolicies: {
+        connection: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              sid: "UseCodeConnection",
+              actions: connectionActions,
+              resources: [connectionArn],
+            }),
+          ],
+        }),
+      },
+    });
+
+    // The PR-check webhook (CodeBuild's CreateWebhook) requires the GitHub App to
+    // be installed on the repo WITH webhook permission — a repo-level install
+    // step beyond the OAuth handshake. Gate it: PIPELINE_CI_WEBHOOK=1 turns the
+    // PR trigger on once the app is installed; default OFF ships the project
+    // (buildspec + role) without the webhook so the CD pipeline can deploy first
+    // and the PR-check is enabled as a one-line follow-up. Branch protection can
+    // reference the check either way.
+    const ciWebhook =
+      process.env.PIPELINE_CI_WEBHOOK === "1" ||
+      process.env.PIPELINE_CI_WEBHOOK === "true";
+
     const ciProject = new codebuild.Project(this, "CiProject", {
       projectName: "agentcore-hub-ci",
+      role: ciRole,
       description: "PR check: tsc, build, test, lint, lambda-zip manifest gate, dep scan.",
       source: codebuild.Source.gitHub({
         owner: githubOwner,
         repo: githubRepo,
         // Report the build status back onto the PR commit → required check.
-        reportBuildStatus: true,
-        webhook: true,
-        webhookFilters: [
-          codebuild.FilterGroup.inEventOf(
-            codebuild.EventAction.PULL_REQUEST_CREATED,
-            codebuild.EventAction.PULL_REQUEST_UPDATED,
-            codebuild.EventAction.PULL_REQUEST_REOPENED
-          ),
-        ],
+        reportBuildStatus: ciWebhook,
+        webhook: ciWebhook,
+        ...(ciWebhook
+          ? {
+              webhookFilters: [
+                codebuild.FilterGroup.inEventOf(
+                  codebuild.EventAction.PULL_REQUEST_CREATED,
+                  codebuild.EventAction.PULL_REQUEST_UPDATED,
+                  codebuild.EventAction.PULL_REQUEST_REOPENED
+                ),
+              ],
+            }
+          : {}),
       }),
-      // Authorize this GitHub source via the SAME CodeConnections link the
-      // pipeline Source action uses — otherwise the PR-check project has no
-      // credential to clone or post the required status and silently relies on a
-      // pre-existing account-level OAuth token (Codex PR #263 P1). Set as a
-      // source-level auth override below via the L1 escape hatch.
       buildSpec: codebuild.BuildSpec.fromSourceFilename(
         "deploy/pipeline/buildspec-ci.yml"
       ),
@@ -160,7 +200,8 @@ export class PipelineStack extends Stack {
       Resource: connectionArn,
     });
 
-    // CI role: read-only beyond logs. It must NOT deploy anything.
+    // Read-only artifact access (does NOT gate CreateProject, so a normal
+    // attached policy is fine — no cycle). Deploy nothing.
     ciProject.role!.attachInlinePolicy(
       new iam.Policy(this, "CiReadArtifacts", {
         statements: [
@@ -171,12 +212,6 @@ export class PipelineStack extends Stack {
               artifactBucket.bucketArn,
               `${artifactBucket.bucketArn}/config/*`,
             ],
-          }),
-          // Use the CodeConnections link (clone + status post).
-          new iam.PolicyStatement({
-            sid: "UseCodeConnection",
-            actions: ["codeconnections:UseConnection", "codestar-connections:UseConnection"],
-            resources: [connectionArn],
           }),
         ],
       })
@@ -334,12 +369,17 @@ function grantBuildArtifactPerms(
     new iam.Policy(scope, "BuildArtifactPerms", {
       statements: [
         // With codeBuildCloneOutput the Build stage downloads a git clone via the
-        // connection, so its role needs UseConnection too (Codex #263 round-2 P1).
+        // connection, so its role needs the connection actions too (Codex #263
+        // round-2 P1). Full trio like the CI role — clone needs the token.
         new iam.PolicyStatement({
           sid: "UseCodeConnection",
           actions: [
             "codeconnections:UseConnection",
+            "codeconnections:GetConnection",
+            "codeconnections:GetConnectionToken",
             "codestar-connections:UseConnection",
+            "codestar-connections:GetConnection",
+            "codestar-connections:GetConnectionToken",
           ],
           resources: [ctx.connectionArn],
         }),

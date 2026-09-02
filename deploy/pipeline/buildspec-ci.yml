@@ -15,17 +15,18 @@
 # (Codex PR #263 round-3). Keep the quotes; avoid raw ": " in echo text.
 version: 0.2
 
-env:
-  variables:
-    NODE_ENV: "development"   # need devDeps (tsc, eslint, playwright) at build time
-
 phases:
   install:
     runtime-versions:
       nodejs: 20
     commands:
+      # Do NOT set NODE_ENV=development globally — that makes `next build` render
+      # with the dev runtime and crashes prerender on client pages
+      # ("Cannot read properties of null (reading 'useContext')"). npm ci installs
+      # devDeps regardless of NODE_ENV, and next build must run in production mode.
+      # Mirrors .github/workflows/ci.yml, which sets nothing. (PR #263 pilot fix.)
       - "node --version && npm --version"
-      - "npm ci"
+      - "npm ci --include=dev"
       # Playwright needs a real browser + OS deps on the clean CodeBuild image
       # (mirrors .github/workflows/ci.yml). Without this the test gates error.
       - "npx playwright install --with-deps chromium"
