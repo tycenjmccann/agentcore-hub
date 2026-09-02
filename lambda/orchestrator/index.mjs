@@ -1953,6 +1953,13 @@ async function blockTicketForFailedInvoke(ticketId, reason) {
 
 // ─── Context Builder ───────────────────────────────────────────────────────────
 
+// TEAM-3738: deploy.sh forwards PIPELINE_ENABLED verbatim, so whitespace or
+// casing variants ("1 ", " true", "TRUE") must not be silently read as disabled.
+export function isPipelineEnabled(raw) {
+  const v = (raw ?? "").trim().toLowerCase();
+  return v === "1" || v === "true";
+}
+
 async function buildAgentContext(ticket, workflow) {
   let context = `# Your Assignment: ${ticket.title}\n\n`;
   context += `## Ticket\nID: ${ticket.ticketId}\nDescription: ${ticket.description}\n\n`;
@@ -2077,7 +2084,7 @@ async function buildAgentContext(ticket, workflow) {
   // branch on this: set → read CodeBuild/CodePipeline results instead of shelling
   // builds/deploys; absent → legacy self-run. An env var alone is invisible to
   // the model, so surface it EXPLICITLY in the task context (Codex #263 round-5).
-  if (process.env.PIPELINE_ENABLED === "1" || process.env.PIPELINE_ENABLED === "true") {
+  if (isPipelineEnabled(process.env.PIPELINE_ENABLED)) {
     context += `## Pipeline Mode\nPIPELINE_ENABLED: true\n`;
     context += `A CodeBuild PR-check + CodePipeline deploy own this repo's `;
     context += `deterministic build/test/deploy. Follow the PIPELINE_ENABLED path `;

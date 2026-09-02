@@ -77,6 +77,11 @@ export default defineConfig({
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.
       "lambda/agentcore-hub-tickets/index.test.mjs",
+      // pipeline-enabled (TEAM-3738, same defect class as TEAM-3723) — the
+      // orchestrator's PIPELINE_ENABLED predicate that gates the "## Pipeline
+      // Mode" context block. index.mjs imports cleanly with no AWS mocks needed
+      // (clients are constructed lazily); isPipelineEnabled is pure, no I/O.
+      "lambda/orchestrator/pipeline-enabled.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
