@@ -126,10 +126,11 @@ process.env.RUNTIME_ARN_AGENTCORE_HUB_BACKEND_DEV =
 
 let handleTicketDoneUnified;
 let handleTicketDone;
+let handler;
 
 async function load() {
   vi.resetModules();
-  ({ handleTicketDoneUnified, handleTicketDone } = await import("./index.mjs"));
+  ({ handleTicketDoneUnified, handleTicketDone, handler } = await import("./index.mjs"));
 }
 
 const DONE = "TEAM-1"; // the ticket that just closed
@@ -255,5 +256,30 @@ describe("handleTicketDone (DDB-stream path) drives the real cascade", () => {
     inReviewChildren();
     await handleTicketDone(DONE, streamImage());
     expectGateReawakened();
+  });
+});
+
+/**
+ * TEAM-3747 D1 — the scheduled reconciliation-sweep sentinel route. A dedicated
+ * EventBridge rule fires { source: "orchestrator.sweep", action:
+ * "reconcile_sweep" }; the handler must branch to the reconcile sweep BEFORE any
+ * stream/webhook parsing (the event has no Records) and return the sweep's
+ * metrics summary. Here the workflows Scan is mocked empty, so the sweep runs to
+ * completion with zero candidates — proof the route dispatched the sweep rather
+ * than falling through. Default mode is shadow (RECONCILE_SWEEP_MODE unset), so
+ * the sweep touches nothing.
+ */
+describe("reconcile-sweep sentinel route (TEAM-3747 D1)", () => {
+  it("routes { orchestrator.sweep, reconcile_sweep } to the sweep and returns its summary", async () => {
+    const result = await handler({ source: "orchestrator.sweep", action: "reconcile_sweep" });
+
+    // The sweep ran (returned its metrics), not a stream/webhook path.
+    expect(typeof result.sweepId).toBe("string");
+    expect(result.mode).toBe("shadow"); // RECONCILE_SWEEP_MODE unset → fail-safe default
+    expect(result.candidates).toBe(0);  // Scan mocked empty → no candidates
+    // A sweep is not a ticket-done fan-out: no agent dispatch, no board writes.
+    expect(h.state.lambdaInvokes).toHaveLength(0);
+    expect(h.state.updates).toHaveLength(0);
+    expect(eventsOfType("agent.complete")).toHaveLength(0);
   });
 });

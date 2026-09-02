@@ -82,6 +82,21 @@ export type AgentPhase = "requirements" | "design" | "development" | "verificati
 
 // ─── Workflow State ──────────────────────────────────────────────────────────
 
+// TEAM-3747 D2 — lifecycle-integrity terminal outcomes ("no green close over
+// unshipped work"). A run whose ship/CD work did not actually ship closes on one
+// of these HONEST terminal verdicts instead of a green "complete":
+//   - "deploy-blocked"  : a deploy/preflight was attempted and blocked.
+//   - "static-ci-only"  : CI was green but nothing was merged/deployed.
+// These are ADDITIVE members of WorkflowPhase; legacy records (which never carry
+// them, and older runs with no such phase) deserialize/render exactly as before.
+//
+// PARITY — this list is the single source of truth. Mirror ANY change in:
+//   - lambda/orchestrator/completion.mjs           (SHIP_BLOCKED_OUTCOMES)
+//   - deploy/workflow-manager/toolkit/save_analysis.py (RUN_OUTCOMES)
+// (.mjs cannot import this TS module, and the toolkit is Python — hence mirrors.)
+export const SHIP_BLOCKED_OUTCOMES = ["deploy-blocked", "static-ci-only"] as const;
+export type ShipBlockedOutcome = (typeof SHIP_BLOCKED_OUTCOMES)[number];
+
 export type WorkflowPhase =
   | "intake"
   | "requirements"
@@ -92,7 +107,22 @@ export type WorkflowPhase =
   | "ship"
   | "complete"
   | "error"
-  | "cancelled";
+  | "cancelled"
+  | ShipBlockedOutcome;
+
+// Every phase in which a run is FINISHED — the shared definition of "not open".
+// TEAM-3747 D2 folds the ship-blocked outcomes in additively, so a deploy-blocked
+// / static-ci-only run reads as terminal everywhere isTerminalPhase is used
+// (workflow list running/past split, etc.). The .mjs fleet (anomaly-watcher,
+// workflow-analyzer) and the /complete route keep their own literal mirrors of
+// this set — see the PARITY note above.
+export const TERMINAL_PHASES = ["complete", "error", "cancelled", ...SHIP_BLOCKED_OUTCOMES] as const;
+
+/** Whether a workflow phase is terminal (the run is finished). Unknown/legacy
+ *  values are treated as non-terminal, exactly as before this helper existed. */
+export function isTerminalPhase(phase: string | null | undefined): boolean {
+  return !!phase && (TERMINAL_PHASES as readonly string[]).includes(phase);
+}
 
 export type AgentTaskStatus =
   | "pending"

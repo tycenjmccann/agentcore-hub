@@ -5,7 +5,7 @@ import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical
 import WorkflowBoard from "@/components/workflow/WorkflowBoard";
 import WorkflowManagerChat from "@/components/workflow/WorkflowManagerChat";
 import IntakeForm from "@/components/workflow/IntakeForm";
-import type { WorkflowState, WorkflowInput } from "@/lib/workflow/types";
+import { type WorkflowState, type WorkflowInput, isTerminalPhase } from "@/lib/workflow/types";
 import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
 import DeleteConfirmationModal from "@/components/workflow/DeleteConfirmationModal";
@@ -156,8 +156,8 @@ export default function WorkflowPage() {
     );
   });
 
-  const activeWorkflows = filtered.filter((w) => w.phase !== "complete" && w.phase !== "error" && w.phase !== "cancelled");
-  const pastWorkflows = filtered.filter((w) => w.phase === "complete" || w.phase === "error" || w.phase === "cancelled");
+  const activeWorkflows = filtered.filter((w) => !isTerminalPhase(w.phase));
+  const pastWorkflows = filtered.filter((w) => isTerminalPhase(w.phase));
 
   const handleSelectWorkflow = (id: string) => {
     setSelectedId(id);
@@ -498,7 +498,7 @@ function WorkflowListItem({
   onDelete?: (id: string) => void;
 }) {
   const isBug = workflow.workflowType === "bug";
-  const isRunning = workflow.phase !== "complete" && workflow.phase !== "error" && workflow.phase !== "cancelled";
+  const isRunning = !isTerminalPhase(workflow.phase);
   const timeStr = formatRelativeTime(workflow.startedAt);
   const def = getWorkflowDef(workflow.workflowDefId);
   const defLabel = def.displayName || def.name;

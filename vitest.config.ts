@@ -73,6 +73,20 @@ export default defineConfig({
       // has something to read on the done cascade. Same harness as
       // done-handlers-cascade: real handlers, mocked I/O seams.
       "lambda/orchestrator/evidence-harvest.test.mjs",
+      // reconcile-sweep.mjs (TEAM-3747 D1) — the scheduled missed-unblock sweep.
+      // Fully dependency-injected (stub ddb/cascade/lease + fake clock), same
+      // shape as the dead-session detector: shadow/enforce modes, per-candidate
+      // classification, and the metrics summary.
+      "lambda/orchestrator/reconcile-sweep.test.mjs",
+      // replay-d1 (TEAM-3747 D1, AC-D1.2) — three real stalled production runs
+      // replayed through the cascade + sweep as plain-object fixtures; asserts
+      // ZERO manual re-dispatches. DI only, no AWS.
+      "lambda/orchestrator/replay-d1.test.mjs",
+      // replay-d2 (TEAM-3747 D2, AC-D2.1/2/3) — three real runs that closed
+      // GREEN over unshipped work, replayed through the REAL completeWorkflow;
+      // asserts each closes on an honest terminal outcome instead. Same harness
+      // as completion-gates: index.mjs real, AWS/store seams mocked.
+      "lambda/orchestrator/replay-d2.test.mjs",
       // agentcore-hub-tickets create_ticket (TEAM-3619 D4c) — the spawnedBy/phase
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.

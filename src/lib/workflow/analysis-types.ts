@@ -8,8 +8,14 @@
  * authored by the agent.
  */
 
+import type { ShipBlockedOutcome } from "./types";
+
 export type AnalysisTrigger = "auto" | "manual" | "watch";
-export type RunOutcome = "complete" | "cancelled" | "error";
+// TEAM-3747 D2 — additively includes the lifecycle-integrity terminal outcomes
+// ("deploy-blocked" | "static-ci-only") so a blocked run is analyzed HONESTLY
+// rather than recorded as "complete". Legacy analyses (only complete/cancelled/
+// error) are unaffected. Parity: save_analysis.py RUN_OUTCOMES + WorkflowPhase.
+export type RunOutcome = "complete" | "cancelled" | "error" | ShipBlockedOutcome;
 export type FindingKind = "bottleneck" | "failure" | "success" | "risk";
 export type FindingSeverity = "critical" | "high" | "medium" | "low";
 export type RecommendationPriority = "P0" | "P1" | "P2";
