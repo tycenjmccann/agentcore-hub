@@ -23,11 +23,18 @@
  */
 
 import { DynamoDBDocumentClient, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import leaseConstants from "../../config/lease-constants.json";
+
+// Single source of truth shared with the orchestrator Lambda (lambda/
+// orchestrator/lease.mjs reads the SAME file). TEAM-3618: constants extraction
+// only — the values are identical to the literals they replaced.
+const { defaultTtlMinutes, heartbeatEventTypes, liveClaimStatuses } = leaseConstants;
+const [HEARTBEAT_TYPE_1, HEARTBEAT_TYPE_2] = heartbeatEventTypes;
 
 /** A nonnumeric/zero/negative env value must not silently disable leases. */
 function resolveTtlMs(): number {
   const minutes = Number(process.env.WORKFLOW_LEASE_TTL_MINUTES);
-  return (Number.isFinite(minutes) && minutes > 0 ? minutes : 30) * 60_000;
+  return (Number.isFinite(minutes) && minutes > 0 ? minutes : defaultTtlMinutes) * 60_000;
 }
 
 export const LEASE_TTL_MS = resolveTtlMs();
@@ -50,7 +57,7 @@ export function isLeaseLive(
   ttlMs: number = LEASE_TTL_MS
 ): boolean {
   if (!task) return false;
-  if (task.status !== "running" && task.status !== "in_progress") return false;
+  if (!task.status || !liveClaimStatuses.includes(task.status)) return false;
   const started = task.startedAt ? Date.parse(task.startedAt) : 0;
   const lastActivity = lastActivityIso ? Date.parse(lastActivityIso) : 0;
   const freshest = Math.max(started, lastActivity);
@@ -95,8 +102,8 @@ export async function lastAgentActivity(
         ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
         ExpressionAttributeValues: {
           ":w": workflowId,
-          ":hb1": "agent.streaming",
-          ":hb2": "agent.started",
+          ":hb1": HEARTBEAT_TYPE_1,
+          ":hb2": HEARTBEAT_TYPE_2,
           ":aid": agentId,
           ":cutoff": windowStart,
         },
@@ -141,8 +148,8 @@ export async function stealClaim(
         ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
         ExpressionAttributeValues: {
           ":ready": "ready",
-          ":running": "running",
-          ":inprog": "in_progress",
+          ":running": liveClaimStatuses[0],
+          ":inprog": liveClaimStatuses[1],
           ...(expectedStartedAt ? { ":exp": expectedStartedAt } : {}),
         },
       })

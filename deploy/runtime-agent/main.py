@@ -314,6 +314,92 @@ _CURRENT_WORKFLOW_ID = "unknown"
 _CURRENT_AGENT_ID = "unknown"
 _CURRENT_TICKET_ID = ""
 
+# ─── Watchdog config (D1.1 of TEAM-3618) ─────────────────────────────────────
+# Fleet-wide heartbeat / deadline knobs, resolved payload-first → env → the
+# legacy hardcoded constants (byte-identical when the invoke omits `watchdog`).
+# The orchestrator resolves per-agent + defaults from agents.json and ships the
+# result in the invoke payload; this runtime just honours it. `enabled: false`
+# disables ACTIVE enforcement (the subprocess deadline kill) — it must NEVER
+# disable heartbeat EMISSION, because invocation leases (R3) presume the agent
+# alive from its agent.streaming/agent.started events.
+#
+# Enforcement points for the resolved fields:
+#   - toolDeadlineSecs → DEADLINE_SECS, the per-tool subprocess kill in the local
+#     claude_code / codex runners below (payload → env → legacy).
+#   - turnTimeoutSecs  → the per-turn wall-clock. This directing persona has no
+#     turn of its own to bound (its work is tool subprocesses + nested coding
+#     turns, capped by DEADLINE_SECS and REMOTE_CODING_TURN_DEADLINE_S resp.);
+#     the actual turn wall-clock lives in the coding runtime it invokes, as that
+#     runtime's TURN_TIMEOUT_S. That runtime is reached via InvokeAgentRuntime
+#     (JSON payload, no per-call env), so the resolved per-agent value IS now
+#     forwarded per-turn in the submit payload as `turn_timeout_secs` (TEAM-3687);
+#     the coding runtime resolves payload → env → legacy 1500, with the canonical
+#     WATCHDOG_TURN_TIMEOUT_SECS env still the fleet-wide fallback there. Nothing
+#     turn-scoped is enforced locally by this persona — the copy resolved here is
+#     what we ship to the runtime and what scales the nested-turn poll budget.
+_WATCHDOG_LEGACY = {
+    "enabled": True,
+    "heartbeatIntervalMs": 15000,
+    "toolDeadlineSecs": 600,
+    "turnTimeoutSecs": 1500,
+}
+_WATCHDOG = dict(_WATCHDOG_LEGACY)
+
+
+def _wd_num(*candidates) -> "int | None":
+    """First finite, positive candidate wins; zero/negative/unparsable skipped."""
+    for c in candidates:
+        if c is None or c == "":
+            continue
+        try:
+            n = int(float(c))
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return None
+
+
+def _wd_bool(v) -> "bool | None":
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s == "":
+        return None
+    return s not in ("false", "0", "no", "off")
+
+
+def _resolve_watchdog(payload: dict) -> dict:
+    """Resolve the effective watchdog config for this invocation.
+
+    Order per field: payload watchdog.<field> → env override → legacy constant.
+    (The orchestrator has already folded per-agent + defaults from agents.json
+    into the payload block, so payload-first here == the fleet resolution.)
+    """
+    wd = payload.get("watchdog") if isinstance(payload, dict) else None
+    wd = wd if isinstance(wd, dict) else {}
+
+    enabled = _wd_bool(wd.get("enabled"))
+    if enabled is None:
+        enabled = _wd_bool(os.getenv("WATCHDOG_ENABLED"))
+    if enabled is None:
+        enabled = _WATCHDOG_LEGACY["enabled"]
+
+    return {
+        "enabled": enabled,
+        "heartbeatIntervalMs": _wd_num(
+            wd.get("heartbeatIntervalMs"), os.getenv("WATCHDOG_HEARTBEAT_INTERVAL_MS")
+        ) or _WATCHDOG_LEGACY["heartbeatIntervalMs"],
+        "toolDeadlineSecs": _wd_num(
+            wd.get("toolDeadlineSecs"), os.getenv("WATCHDOG_TOOL_DEADLINE_SECS")
+        ) or _WATCHDOG_LEGACY["toolDeadlineSecs"],
+        "turnTimeoutSecs": _wd_num(
+            wd.get("turnTimeoutSecs"), os.getenv("WATCHDOG_TURN_TIMEOUT_SECS")
+        ) or _WATCHDOG_LEGACY["turnTimeoutSecs"],
+    }
+
 # ─── Remote coding runtime (Cloud Code) ──────────────────────────────────────
 # When enabled, claude_code/codex delegate to the standalone coding-agent
 # runtime instead of spawning the CLI in this microVM. The coding runtime keeps
@@ -337,6 +423,11 @@ REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "600"))
 # harvest (can be GBs) and the journal-write retry loop — so the runner's own
 # verdict reaches us via the journal instead of us giving up first.
 REMOTE_CODING_POLL_S = int(os.getenv("REMOTE_CODING_POLL_S", "20"))
+# The 2700 default is exactly the legacy 1500s turn cap + ~1200s of terminal-work
+# headroom (artifact harvest — can be GBs — plus the journal-write retry loop).
+# When a per-agent turnTimeoutSecs is forwarded ABOVE 1500 (TEAM-3687), the
+# effective budget in _remote_coding_turn widens by the excess so the runner's
+# own verdict still reaches us via the journal before we give up.
 REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "2700"))
 # Outer wall-clock deadline on ONE ENTIRE nested coding turn: submit (including
 # lost-submit recovery probes), every poll, and the single automatic vm-death
@@ -531,7 +622,8 @@ def _deadline_expired_error() -> dict:
             "no_retry_hint": True}
 
 
-def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None) -> dict:
+def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
+                      budget_s: int | None = None) -> dict:
     """Poll an async coding turn to its terminal state. Returns the done record
     ({response, claude_session_id, artifacts?} or {error}).
 
@@ -546,11 +638,17 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None)
     outer_deadline is a time.monotonic() timestamp bounding the whole turn
     (REMOTE_CODING_TURN_DEADLINE_S): unlike the budget, it is NEVER extended by
     a live heartbeat, so a runner that reports "running" forever cannot pin the
-    persona past it (TEAM-3119)."""
-    deadline = time.time() + REMOTE_CODING_TURN_BUDGET_S
+    persona past it (TEAM-3119).
+
+    budget_s overrides the fleet REMOTE_CODING_TURN_BUDGET_S for this turn — the
+    caller scales it up when a per-agent turnTimeoutSecs was forwarded above the
+    1500s the default budget assumes (TEAM-3687). Defaults to the global so
+    existing callers are unchanged."""
+    budget = REMOTE_CODING_TURN_BUDGET_S if budget_s is None else budget_s
+    deadline = time.time() + budget
     # Live heartbeats extend the deadline (terminal work is unbounded), but a
     # wedged-yet-heartbeating runner must not pin this persona forever.
-    hard_stop = time.time() + 2 * REMOTE_CODING_TURN_BUDGET_S
+    hard_stop = time.time() + 2 * budget
     unknowns = 0
     while time.time() < min(deadline, hard_stop) and (
             outer_deadline is None or time.monotonic() < outer_deadline):
@@ -615,7 +713,7 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None)
         pass
     if outer_deadline is not None and time.monotonic() >= outer_deadline:
         return _deadline_expired_error()
-    return {"error": f"coding turn exceeded {REMOTE_CODING_TURN_BUDGET_S}s budget "
+    return {"error": f"coding turn exceeded {budget}s budget "
                      f"with no verdict. Its work may already exist and a runner "
                      f"may still be finishing. Do NOT re-run the task and do NOT "
                      f"start another coding call yet: wait a few minutes, then "
@@ -723,14 +821,18 @@ def _recover_lost_submit(client, payload: dict, outer_deadline: float | None = N
     return None
 
 
-def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None) -> dict:
+def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None,
+                     budget_s: int | None = None) -> dict:
     """Submit one async coding turn and poll it to a terminal record.
 
     The turn_id is generated HERE and sent with the submit, making submission
     idempotent: if the submit's response is lost client-side (read timeout on a
     slow cold-clone setup) while the server accepted and started the turn, the
     re-submit with the same id is acknowledged as a dedupe instead of running
-    the prompt a second time in the same workspace."""
+    the prompt a second time in the same workspace.
+
+    budget_s is forwarded to the poll loop so a turn with an elevated per-agent
+    turnTimeoutSecs gets a proportionally larger poll budget (TEAM-3687)."""
     payload = {**payload, "turn_id": f"turn-{uuid.uuid4().hex}"}
     # HARD deadline check before the blocking submit: this client's
     # connect+read window is ~630s, all of which would land PAST an
@@ -752,7 +854,7 @@ def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None)
         # Runtime predates async mode (or ran a legacy path) and executed the
         # turn synchronously — its result is already complete.
         return submitted
-    return _poll_coding_turn(client, submitted["turn_id"], outer_deadline)
+    return _poll_coding_turn(client, submitted["turn_id"], outer_deadline, budget_s)
 
 
 def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") -> str:
@@ -779,6 +881,11 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         "session_id": _CODING_SESSION["session_id"],
         "model": resolved_model if cli == "claude" else "",
         "origin": "workflow",  # coding runtime exempts human sessions from GC
+        # Forward the resolved per-agent turn wall-clock so the coding runtime
+        # bounds THIS turn's CLI at the fleet-resolved value instead of only its
+        # own env/legacy default (TEAM-3687). Unknown to legacy far sides — they
+        # ignore the extra field and keep enforcing WATCHDOG_TURN_TIMEOUT_SECS.
+        "turn_timeout_secs": _WATCHDOG["turnTimeoutSecs"],
     }
     if _CODING_SESSION.get("repo"):
         payload["repo"] = _CODING_SESSION["repo"]
@@ -811,10 +918,25 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         f"[remote-coding] {cli} turn on {_CODING_SESSION['session_id']} "
         f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')}, mode=async)"
     )
+    # Scale the poll budget + outer deadline when the forwarded per-agent turn
+    # cap exceeds the 1500s the fleet defaults already assume (TEAM-3687). The
+    # far side's CLI may now run up to turnTimeoutSecs, so widen both bounds by
+    # exactly the EXCESS above that baseline: the budget carries its terminal-work
+    # headroom (already baked into REMOTE_CODING_TURN_BUDGET_S = 1500 + margin),
+    # and the deadline clears the wider budget (2x, matching its own default
+    # READ_TIMEOUT + 2*budget shape). A delta — not max(turnTimeoutSecs+margin,
+    # …) — keeps this a TRUE no-op at the default cap: the fleet globals
+    # (REMOTE_CODING_TURN_BUDGET_S / _DEADLINE_S, both env-tunable) stay
+    # authoritative and an operator can still lower them, whereas a hardcoded
+    # 1500+margin floor would silently clamp any override below ~2700/6000.
+    _budget_excess = max(0, _WATCHDOG["turnTimeoutSecs"]
+                         - _WATCHDOG_LEGACY["turnTimeoutSecs"])
+    eff_budget = REMOTE_CODING_TURN_BUDGET_S + _budget_excess
+    eff_deadline_s = REMOTE_CODING_TURN_DEADLINE_S + 2 * _budget_excess
     # One monotonic deadline for the WHOLE nested turn — submit, recovery,
     # polls, and the automatic vm-death resubmit all check against it, so no
     # combination of inner retries can silently block this persona past it.
-    turn_deadline = time.monotonic() + REMOTE_CODING_TURN_DEADLINE_S
+    turn_deadline = time.monotonic() + eff_deadline_s
     try:
         client = boto3.client(
             "bedrock-agentcore", region_name=REGION,
@@ -822,7 +944,7 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
                                   connect_timeout=30,
                                   retries={"max_attempts": 0}),
         )
-        result = _submit_and_poll(client, payload, turn_deadline)
+        result = _submit_and_poll(client, payload, turn_deadline, eff_budget)
         # A dead/vanished verdict means the microVM recycled mid-turn — the
         # workspace and transcript are on EFS, so one automatic resubmit (same
         # conversation id) is cheap and usually completes. A second death is a
@@ -830,7 +952,7 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         if result.get("retryable_vm_death"):
             if time.monotonic() < turn_deadline:
                 logger.warning(f"[remote-coding] {result.get('error')} — resubmitting once")
-                result = _submit_and_poll(client, payload, turn_deadline)
+                result = _submit_and_poll(client, payload, turn_deadline, eff_budget)
             result.pop("retryable_vm_death", None)
     except Exception as e:  # noqa: BLE001
         # Do NOT fall back to a local CLI run: the session's workspace lives on
@@ -1075,7 +1197,7 @@ def S3Storage___list_objects(prefix: str = "", bucket: str = "") -> str:
 # ─── Ticket Tools ────────────────────────────────────────────────────────────
 
 @tool
-def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "") -> str:
+def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "") -> str:
     """Create a new ticket in the project tracker.
 
     MANDATORY TICKETS (create these for EVERY workflow, no exceptions):
@@ -1109,16 +1231,40 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
             "epic", "story". Do NOT use "subtask" under an Epic.
         blocked_by: Comma-separated list of ticket IDs this ticket is blocked by (e.g., "TEAM-401,TEAM-402")
         workflow_id: Workflow ID this ticket belongs to
+        phase: ONLY for a fix ticket you file after a failed QA/review. Set it to the
+            ORIGINATING upstream phase being re-verified (e.g. "development", "ship")
+            so the run's completion guard keeps that phase open until the fix closes.
+            Leave "" for ordinary phase tickets.
+        spawned_by_kind: ONLY for a fix ticket. One of "qa_fix" (you are the QA verifier),
+            "codex_fix" (you are the code reviewer), or "review_fix". Leave "" otherwise.
+        spawned_by_origin_id: The ticket ID this fix originates from — your own QA ticket
+            (qa_fix), review ticket (codex_fix), or gate ticket (review_fix). Required when
+            spawned_by_kind is set.
     """
     blockers = [b.strip() for b in blocked_by.split(",") if b.strip()] if blocked_by else []
     # Auto-inject workflow_id from invocation context if agent didn't pass one —
     # without the wf:<id> label, the ticket is invisible to the workflow UI.
     effective_workflow_id = workflow_id or _CURRENT_WORKFLOW_ID
-    return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___create_ticket", {
+    payload = {
         "summary": title, "description": description, "parent_key": parent_id,
         "assignee": assignee, "issue_type": ticket_type, "blocked_by": blockers,
         "workflow_id": effective_workflow_id
-    })
+    }
+    if phase.strip():
+        payload["phase"] = phase.strip()
+    # TEAM-3619 D4c: assemble the fix-ticket provenance marker the lambda validates
+    # and completion re-verify reads. The origin id maps to the kind-specific key.
+    if spawned_by_kind.strip():
+        origin_key = {
+            "qa_fix": "qaTicketId",
+            "codex_fix": "codexTicketId",
+            "review_fix": "gateTicketId",
+        }.get(spawned_by_kind.strip())
+        spawned_by = {"kind": spawned_by_kind.strip()}
+        if origin_key and spawned_by_origin_id.strip():
+            spawned_by[origin_key] = spawned_by_origin_id.strip()
+        payload["spawned_by"] = spawned_by
+    return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___create_ticket", payload)
 
 
 @tool
@@ -1172,6 +1318,22 @@ def Tickets___add_comment(ticket_id: str, comment: str) -> str:
     """
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___add_comment", {
         "ticket_id": ticket_id, "comment": comment
+    })
+
+
+@tool
+def Tickets___get_issue(ticket_id: str) -> str:
+    """Get full details of a ticket: status, description, and all comments.
+    Use this to read a gate/escalation ticket's status and parse human
+    DECISION: lines from its comments.
+
+    Args:
+        ticket_id: The ticket ID to fetch (e.g., "TEAM-42")
+    """
+    # Send both key names: the Jira backend reads `issue_key`, the DDB backend
+    # reads `issue_key || ticket_id`. Passing both keeps the tool backend-agnostic.
+    return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___get_issue", {
+        "ticket_id": ticket_id, "issue_key": ticket_id
     })
 
 
@@ -1658,12 +1820,18 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
         # condvar that wakes regardless of selector state, so it always fires.
         # Once we killpg the process group, pipe EOF unblocks communicate().
         # Deadline kept under AgentCore's 900s idleSessionTimeout.
-        DEADLINE_SECS = 600
+        # D1.1: resolved payload-first → env → legacy 600. `enabled: false`
+        # skips the active kill (subprocess runs to natural completion) —
+        # heartbeat emission is separate and always continues.
+        DEADLINE_SECS = _WATCHDOG["toolDeadlineSecs"]
+        _wd_enforce = _WATCHDOG["enabled"]
         watchdog_done = threading.Event()
         watchdog_fired = {"value": False}
 
         def _watchdog():
             if not watchdog_done.wait(timeout=DEADLINE_SECS):
+                if not _wd_enforce:
+                    return  # enforcement disabled — never kill
                 # Deadline expired — kill the whole process group.
                 watchdog_fired["value"] = True
                 try:
@@ -1682,7 +1850,8 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
         try:
             # Belt-and-suspenders: also pass a timeout slightly past the
             # watchdog so if communicate ever DOES wake, we don't hang here.
-            stdout, stderr = proc.communicate(timeout=DEADLINE_SECS + 30)
+            # When enforcement is disabled there is no deadline to belt against.
+            stdout, stderr = proc.communicate(timeout=(DEADLINE_SECS + 30) if _wd_enforce else None)
         except subprocess.TimeoutExpired:
             # Watchdog should have killed it; force-kill in case it didn't.
             try:
@@ -1819,7 +1988,9 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
     # give the engine time to warm (it can take several attempts over ~30-60s).
     import time as _time
     import re as _re_codex
-    DEADLINE_SECS = 600
+    # D1.1: resolved payload-first → env → legacy 600 (see claude_code above).
+    DEADLINE_SECS = _WATCHDOG["toolDeadlineSecs"]
+    _wd_enforce = _WATCHDOG["enabled"]
     ATTEMPTS = int(os.getenv("CODEX_ENGINE_RETRIES", "20"))
     BACKOFF_SECS = int(os.getenv("CODEX_ENGINE_BACKOFF", "8"))
     last_output = ""
@@ -1838,6 +2009,8 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
 
             def _watchdog():
                 if not watchdog_done.wait(timeout=DEADLINE_SECS):
+                    if not _wd_enforce:
+                        return  # enforcement disabled — never kill
                     watchdog_fired["value"] = True
                     try:
                         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -1850,7 +2023,7 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
             wd = threading.Thread(target=_watchdog, daemon=True)
             wd.start()
             try:
-                stdout, stderr = proc.communicate(timeout=DEADLINE_SECS + 30)
+                stdout, stderr = proc.communicate(timeout=(DEADLINE_SECS + 30) if _wd_enforce else None)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -1967,6 +2140,7 @@ LAMBDA_TOOLS = [
     Tickets___update_ticket,
     Tickets___list_tickets,
     Tickets___add_comment,
+    Tickets___get_issue,
     Tickets___search_issues,
     # Workflow (Lambda-backed)
     WorkflowOutput___report_completion,
@@ -2382,7 +2556,7 @@ async def _run_agent_invocation(payload, context):
     The system prompt is NOT in the payload — it's baked into the agent at deploy time
     via the SYSTEM_PROMPT env var. The orchestrator is dumb and only passes task context.
     """
-    global _CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID, _CURRENT_TICKET_ID
+    global _CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID, _CURRENT_TICKET_ID, _WATCHDOG
     prompt = payload.get("prompt", "")
     workflow_id = payload.get("workflow_id", "unknown")
     agent_id = payload.get("agent_id", "unknown")
@@ -2392,6 +2566,8 @@ async def _run_agent_invocation(payload, context):
     _CURRENT_WORKFLOW_ID = workflow_id
     _CURRENT_AGENT_ID = agent_id
     _CURRENT_TICKET_ID = payload.get("ticket_id", "")
+    # Fleet-wide watchdog knobs (D1.1) — payload-first → env → legacy constants.
+    _WATCHDOG = _resolve_watchdog(payload)
 
     # Stamp session.id into OTel baggage so any future ADOT-side processors can
     # also correlate this invocation's spans with the runtime session.

@@ -65,6 +65,66 @@ export interface ReviewGate {
   condition: "always" | "flagged";
   /** On "Request changes": "rework" re-opens the upstream work, "hold" just pauses. */
   onReject: "rework" | "hold";
+  /**
+   * Max effective review rounds before onCapReached fires. Default 3, clamped to
+   * {@link REVIEW_GATE_MAX_ROUNDS_CEILING} (20) — a larger value cannot be used
+   * to disable the cap.
+   */
+  maxRounds?: number;
+  /** A rework round that REGRESSES previously-passing findings counts as 2 rounds. Default true (matches ship-review.ts behavior). */
+  regressionCountsDouble?: boolean;
+  /** Behavior at the cap. Only "escalate" is defined: emit review.cap_reached, reassign the gate ticket to a human, stop the rework loop. Default "escalate". */
+  onCapReached?: "escalate";
+}
+
+/** Defaults for the convergence-cap fields of {@link ReviewGate}. */
+export const REVIEW_GATE_CAP_DEFAULTS: {
+  maxRounds: number;
+  regressionCountsDouble: boolean;
+  onCapReached: "escalate";
+} = { maxRounds: 3, regressionCountsDouble: true, onCapReached: "escalate" };
+
+/**
+ * Hard ceiling on an honored `maxRounds`. Pairs with
+ * {@link REVIEW_GATE_CAP_DEFAULTS}: keep both in sync with the twin constants in
+ * lambda/orchestrator/review-cap.mjs.
+ */
+export const REVIEW_GATE_MAX_ROUNDS_CEILING = 20;
+
+/**
+ * Resolve a review gate's convergence-cap settings, applying the defaults
+ * (3 / true / "escalate"). Every consumer — the orchestrator's cap enforcement,
+ * the release manager's prose contract, and `effectiveRoundCount`'s `opts` —
+ * MUST resolve through here so a config change lands identically everywhere.
+ *
+ * `maxRounds` is only honored when it is a finite number >= 1; anything else
+ * (0, negative, NaN, a non-number from hand-edited JSON) falls back to the
+ * default rather than producing a cap that fires immediately or never.
+ *
+ * An honored value is additionally CLAMPED to
+ * {@link REVIEW_GATE_MAX_ROUNDS_CEILING} (20). The lower guard caught the
+ * obvious ways to disable the cap but not `maxRounds: 1e9`, which is the same
+ * unbounded rework loop wearing a config that reads as deliberate. Over-ceiling
+ * values clamp DOWN to 20 rather than falling back to 3: "a lot of rounds" is
+ * closer to 20 than to 3, so the intent survives and only the unboundedness
+ * is removed.
+ */
+export function resolveReviewGateCap(gate: ReviewGate): {
+  maxRounds: number;
+  regressionCountsDouble: boolean;
+  onCapReached: "escalate";
+} {
+  const raw = gate.maxRounds;
+  const maxRounds =
+    typeof raw === "number" && Number.isFinite(raw) && raw >= 1
+      ? Math.min(Math.floor(raw), REVIEW_GATE_MAX_ROUNDS_CEILING)
+      : REVIEW_GATE_CAP_DEFAULTS.maxRounds;
+  return {
+    maxRounds,
+    regressionCountsDouble:
+      gate.regressionCountsDouble ?? REVIEW_GATE_CAP_DEFAULTS.regressionCountsDouble,
+    onCapReached: gate.onCapReached ?? REVIEW_GATE_CAP_DEFAULTS.onCapReached,
+  };
 }
 
 export interface WorkflowDef {

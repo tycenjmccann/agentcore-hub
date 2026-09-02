@@ -76,6 +76,16 @@ async function ensureAgentTasksMap(workflowId) {
  */
 export async function claimInvocation(workflowId, ticketId, entry, staleBefore) {
   await ensureAgentTasksMap(workflowId);
+  // TEAM-3698: a FRESH claim generation must never inherit the previous
+  // generation's deadSessionDetectedAt stamp. Callers build the entry by
+  // spreading the prior task (index.mjs claimTicketInvocation), so the stamp
+  // would ride along onto a new startedAt — and the dead-session detector skips
+  // any live task that is already stamped, permanently suppressing recovery for
+  // that new generation. This write replaces the whole entry, so dropping the
+  // key here IS the REMOVE (DynamoDB rejects a SET and a REMOVE on overlapping
+  // document paths in one expression). Enforced here, in the sole writer (R2),
+  // so no caller can reintroduce the inheritance.
+  const { deadSessionDetectedAt: _staleStamp, ...task } = entry || {};
   try {
     await _ddb.send(new UpdateCommand({
       TableName: _table,
@@ -85,7 +95,7 @@ export async function claimInvocation(workflowId, ticketId, entry, staleBefore) 
         "attribute_not_exists(agentTasks.#tid) OR agentTasks.#tid.#st <> :running OR agentTasks.#tid.startedAt < :staleBefore",
       ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
       ExpressionAttributeValues: {
-        ":task": entry,
+        ":task": task,
         ":running": "running",
         ":staleBefore": staleBefore,
       },
@@ -197,6 +207,103 @@ export async function setTaskStatus(workflowId, ticketId, status) {
 }
 
 /**
+ * Sweep idempotency for the dead-session detector (TEAM-3618 D1.2). Stamp
+ * deadSessionDetectedAt on the task ONLY IF the entry still holds the exact
+ * claim generation the sweep inspected (same startedAt — or, mirroring
+ * stealClaim, still no startedAt at all for a legacy task that never recorded
+ * one) and has not already been stamped. This is the FIRST write on the
+ * trigger path — losing the CAS
+ * (the claim moved, or a concurrent sweep already stamped it) means another
+ * actor owns this generation, so the caller stops. Scoped to the task's own
+ * map keys; never a full-map replacement (R2). Returns true when this caller
+ * won the stamp.
+ */
+export async function markDeadSessionDetected(workflowId, ticketId, expectedStartedAt) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET agentTasks.#tid.deadSessionDetectedAt = :now",
+      ConditionExpression: expectedStartedAt
+        ? "agentTasks.#tid.startedAt = :expected AND attribute_not_exists(agentTasks.#tid.deadSessionDetectedAt)"
+        : "attribute_not_exists(agentTasks.#tid.startedAt) AND attribute_not_exists(agentTasks.#tid.deadSessionDetectedAt)",
+      ExpressionAttributeNames: { "#tid": ticketId },
+      ExpressionAttributeValues: {
+        ":now": new Date().toISOString(),
+        ...(expectedStartedAt ? { ":expected": expectedStartedAt } : {}),
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * Un-stamp a dead-session detection (TEAM-3698). The detector stamps BEFORE its
+ * TOCTOU lease re-check; when that re-check finds the agent resurrected
+ * (heartbeated after the stamp), the stamp comes back off so the generation
+ * stays cheaply detectable. A clear that fails or loses its CAS is not fatal:
+ * the detector re-evaluates stamped live-status tasks on every sweep
+ * (TEAM-3702) — retrying this clear while the lease is live, re-driving
+ * recovery on the held stamp once it is dead.
+ *
+ * REMOVEs deadSessionDetectedAt ONLY IF the entry still holds the exact claim
+ * generation the sweep inspected (same startedAt — or, mirroring
+ * markDeadSessionDetected/stealClaim, still no startedAt at all) and is in fact
+ * stamped. Losing the CAS means the generation moved on (re-claimed, completed,
+ * escalated) and the stamp is no longer ours to clear — the caller just logs.
+ * Scoped to the task's own map keys; never a full-map replacement (R2). Returns
+ * true when this caller cleared the stamp.
+ */
+export async function clearDeadSessionDetected(workflowId, ticketId, expectedStartedAt) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE agentTasks.#tid.deadSessionDetectedAt",
+      ConditionExpression: expectedStartedAt
+        ? "agentTasks.#tid.startedAt = :expected AND attribute_exists(agentTasks.#tid.deadSessionDetectedAt)"
+        : "attribute_not_exists(agentTasks.#tid.startedAt) AND attribute_exists(agentTasks.#tid.deadSessionDetectedAt)",
+      ExpressionAttributeNames: { "#tid": ticketId },
+      // A REMOVE with no placeholder needs NO values map at all — an empty
+      // ExpressionAttributeValues is a validation error, so omit the key.
+      ...(expectedStartedAt ? { ExpressionAttributeValues: { ":expected": expectedStartedAt } } : {}),
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * Increment the per-ticket dead-session retry counter (TEAM-3618 D1.2), scoped
+ * to deadSessionRetries[ticketId] so it never touches qaRetryCount or sibling
+ * tickets. The map is seeded first (if_not_exists on the map is illegal inside
+ * the same SET that indexes into it), then the leaf is bumped with
+ * if_not_exists so the first detection reads 0 → 1. Returns the new count.
+ */
+export async function incrementDeadSessionRetry(workflowId, ticketId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET deadSessionRetries = if_not_exists(deadSessionRetries, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  const res = await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET deadSessionRetries.#tid = if_not_exists(deadSessionRetries.#tid, :zero) + :one",
+    ExpressionAttributeNames: { "#tid": ticketId },
+    ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
+    ReturnValues: "UPDATED_NEW",
+  }));
+  return res.Attributes?.deadSessionRetries?.[ticketId];
+}
+
+/**
  * Advance the workflow phase, optionally pinning the shared feature branch.
  * if_not_exists on the branch keeps the first winner under concurrent
  * same-phase claims; the monotonic phase check happened caller-side against a
@@ -259,6 +366,98 @@ export async function removeResumeContext(workflowId, ticketId) {
 }
 
 /**
+ * Ensure reviewGateHistory[gateTicketId] exists as an empty ledger.
+ *
+ * Two writes, not one: a single expression cannot both create the
+ * reviewGateHistory map and index into it (same constraint setResumeContext
+ * works around). Both are if_not_exists, so concurrent rejection cycles for the
+ * same gate seed idempotently instead of clobbering each other's rounds.
+ */
+async function ensureReviewGateLedger(workflowId, gateTicketId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET reviewGateHistory = if_not_exists(reviewGateHistory, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET reviewGateHistory.#g = if_not_exists(reviewGateHistory.#g, :seed)",
+    ExpressionAttributeNames: { "#g": gateTicketId },
+    ExpressionAttributeValues: { ":seed": { rounds: [], authorizations: [], escalations: [] } },
+  }));
+}
+
+/**
+ * Append one review round to a gate's convergence ledger (TEAM-3619 D2c) and
+ * return the gate's post-write ledger `{ rounds, authorizations, escalations }`.
+ *
+ * list_append, never a whole-array rewrite: two rejection cycles landing at
+ * once must both be counted, because a lost round is a cap that trips late —
+ * i.e. the runaway loop this ledger exists to stop.
+ *
+ * Callers MUST use the returned ledger (not their pre-write workflow snapshot)
+ * to compute the effective round count, so a concurrent cycle's round is
+ * included. Duplicate round numbers are fine: effectiveRoundCount dedupes by
+ * round number, last entry winning, which is how a re-run of the same head SHA
+ * replaces its earlier verdict.
+ *
+ * ALL_NEW rather than UPDATED_NEW because the caller needs `authorizations`
+ * (human "continue" decisions reset the count) and `escalations` (an already-
+ * open escalation makes this a no-op) from the SAME post-write snapshot;
+ * UPDATED_NEW returns only the rounds path.
+ */
+export async function appendReviewRound(workflowId, gateTicketId, round) {
+  await ensureReviewGateLedger(workflowId, gateTicketId);
+  const res = await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression:
+      "SET reviewGateHistory.#g.rounds = list_append(if_not_exists(reviewGateHistory.#g.rounds, :empty), :r)",
+    ExpressionAttributeNames: { "#g": gateTicketId },
+    ExpressionAttributeValues: { ":empty": [], ":r": [round] },
+    ReturnValues: "ALL_NEW",
+  }));
+  return res.Attributes?.reviewGateHistory?.[gateTicketId] || null;
+}
+
+/**
+ * Record that a gate hit its round cap and was handed to a human. Audit trail
+ * plus the idempotency key for the escalation: an entry with `decision: null`
+ * means the escalation is still open, so a subsequent rejection cycle re-parks
+ * the gate without re-publishing review.cap_reached.
+ */
+export async function appendReviewCapEscalation(workflowId, gateTicketId, escalation) {
+  await ensureReviewGateLedger(workflowId, gateTicketId);
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression:
+      "SET reviewGateHistory.#g.escalations = list_append(if_not_exists(reviewGateHistory.#g.escalations, :empty), :e)",
+    ExpressionAttributeNames: { "#g": gateTicketId },
+    ExpressionAttributeValues: { ":empty": [], ":e": [escalation] },
+  }));
+}
+
+/**
+ * Append a human authorization to a gate's ledger — the escalation's exit.
+ * A `continue` decision carries `resetAtRound`, which is what makes the cap
+ * count start over from that round (see effectiveRoundCount).
+ */
+export async function appendReviewAuthorization(workflowId, gateTicketId, authorization) {
+  await ensureReviewGateLedger(workflowId, gateTicketId);
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression:
+      "SET reviewGateHistory.#g.authorizations = list_append(if_not_exists(reviewGateHistory.#g.authorizations, :empty), :a)",
+    ExpressionAttributeNames: { "#g": gateTicketId },
+    ExpressionAttributeValues: { ":empty": [], ":a": [authorization] },
+  }));
+}
+
+/**
  * Append a human notification atomically (no full-array rewrite). Bumps
  * notifVersion in the same write so a concurrent ackNotifications CAS that
  * read the pre-append list fails and re-reads instead of overwriting the
@@ -272,6 +471,53 @@ export async function appendNotification(workflowId, notification) {
       "SET humanNotifications = list_append(if_not_exists(humanNotifications, :empty), :n), notifVersion = if_not_exists(notifVersion, :zero) + :one",
     ExpressionAttributeValues: { ":empty": [], ":n": [notification], ":zero": 0, ":one": 1 },
   }));
+}
+
+/**
+ * Append a review_needed notification for `ticketId` at most once WHILE ONE IS
+ * STILL OPEN (TEAM-3684 Finding 2). Concurrent last-blocker completions each
+ * re-wake the same review gate carrying a stale in-memory snapshot, so a plain
+ * appendNotification would create duplicate reviewer notifications (and let the
+ * caller re-emit review.reawakened twice). DynamoDB can't scan a list inside a
+ * ConditionExpression, so the idempotency check rides the same optimistic
+ * notifVersion CAS used by ackNotifications: read fresh → if an unacknowledged
+ * review_needed for this ticket already exists, do nothing → else append under
+ * `notifVersion = :cur`. A concurrent append/ack bumps the version, our CAS
+ * fails, we re-read and now observe the open notification and stand down.
+ *
+ * Reuses the existing acknowledged-based open/closed lifecycle, so a gate that
+ * was reviewed (notification acked) and later reopened re-notifies correctly.
+ * Returns true only when THIS caller appended the notification.
+ */
+export async function appendReviewNotificationOnce(workflowId, ticketId, notification, maxAttempts = 3) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const wf = await getWorkflow(workflowId);
+    if (!wf) return false;
+    const list = Array.isArray(wf.humanNotifications) ? wf.humanNotifications : [];
+    const alreadyOpen = list.some(
+      (n) => n.ticketId === ticketId && n.type === "review_needed" && !n.acknowledged
+    );
+    if (alreadyOpen) return false;
+    try {
+      await _ddb.send(new UpdateCommand({
+        TableName: _table,
+        Key: { workflowId },
+        UpdateExpression: "SET humanNotifications = :n, notifVersion = :next",
+        ConditionExpression: "attribute_not_exists(notifVersion) OR notifVersion = :cur",
+        ExpressionAttributeValues: {
+          ":n": [...list, notification],
+          ":next": (wf.notifVersion || 0) + 1,
+          ":cur": wf.notifVersion || 0,
+        },
+      }));
+      return true;
+    } catch (err) {
+      if (err.name !== "ConditionalCheckFailedException") throw err;
+      // Concurrent append/ack — re-read, re-check the open-notification guard.
+    }
+  }
+  console.warn(`[workflow-store] appendReviewNotificationOnce(${workflowId}, ${ticketId}): CAS retries exhausted`);
+  return false;
 }
 
 /**
@@ -318,6 +564,12 @@ export async function ackNotifications(workflowId, predicate, maxAttempts = 3) {
  * /api/workflow/[id]/complete route — the orchestrator path previously used a
  * full-row put guarded only by a stale in-memory phase check (study P1).
  * Returns true when this caller performed the completion.
+ *
+ * TEAM-3619 D4a: the CAS also refuses when `cancelledAt` is stamped, so a
+ * cancellation that landed after this caller's phase read (the phase attribute
+ * itself may lag behind the cancelledAt stamp) can never be overwritten by a
+ * completion. A lost CAS is a graceful no-op (returns false, never throws) —
+ * some other actor already reached a terminal decision for this run.
  */
 export async function completeWorkflow(workflowId, completedAt) {
   try {
@@ -325,7 +577,8 @@ export async function completeWorkflow(workflowId, completedAt) {
       TableName: _table,
       Key: { workflowId },
       UpdateExpression: "SET phase = :complete, completedAt = :ts",
-      ConditionExpression: "phase <> :complete AND phase <> :cancelled AND phase <> :error",
+      ConditionExpression:
+        "phase <> :complete AND phase <> :cancelled AND phase <> :error AND attribute_not_exists(cancelledAt)",
       ExpressionAttributeValues: {
         ":complete": "complete",
         ":ts": completedAt,
@@ -335,7 +588,10 @@ export async function completeWorkflow(workflowId, completedAt) {
     }));
     return true;
   } catch (err) {
-    if (err.name === "ConditionalCheckFailedException") return false;
+    if (err.name === "ConditionalCheckFailedException") {
+      console.log(`[workflow-store] completeWorkflow(${workflowId}): CAS lost — already terminal or cancelled, no-op.`);
+      return false;
+    }
     throw err;
   }
 }
@@ -365,7 +621,7 @@ export async function claimFinalization(workflowId, staleBefore) {
       Key: { workflowId },
       UpdateExpression: "SET finalizedAt = :ts",
       ConditionExpression:
-        "phase = :complete AND attribute_not_exists(finalizedAt) AND completedAt < :staleBefore",
+        "phase = :complete AND attribute_not_exists(finalizedAt) AND attribute_not_exists(cancelledAt) AND completedAt < :staleBefore",
       ExpressionAttributeValues: {
         ":ts": new Date().toISOString(),
         ":complete": "complete",

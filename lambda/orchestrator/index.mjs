@@ -29,6 +29,19 @@ import {
   InvokeAgentCommand,
 } from "@aws-sdk/client-bedrock-agent-runtime";
 import * as store from "./workflow-store.mjs";
+import {
+  DEFAULT_TTL_MINUTES,
+  STALE_CLAIM_MULTIPLIER,
+  LEASE_TTL_MS,
+  isLeaseLive,
+  lastAgentActivity,
+  stealClaim,
+} from "./lease.mjs";
+import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
+import { createDetector } from "./dead-session-detector.mjs";
+import { createCascade } from "./cascade.mjs";
+import { createReviewCap } from "./review-cap.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets } from "./completion.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -40,6 +53,30 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 const GITHUB_LAMBDA = process.env.GITHUB_LAMBDA || "agentcore-hub-github-mcp";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const MAX_QA_RETRIES = 3;
+// Dead-session detector rollout flag (TEAM-3618 D1.2): off = skip the sweep,
+// shadow (default) = observe + metrics + shadow-flagged events but ZERO writes,
+// enforce = steal/retry/escalate for real.
+const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
+// Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b). OFF by default:
+// the cascade only re-Readies {blocked, todo} dependents (commit-4a behavior).
+// ON: an in_progress dependent whose last blocker resolves is lease-guarded
+// (live → nudge only; stale → steal + re-dispatch through the claim CAS) and an
+// in_review gate is re-woken. Any value other than "on"/"true"/"1" stays OFF.
+const CASCADE_EXTENDED_STATES = /^(on|true|1)$/i.test(process.env.CASCADE_EXTENDED_STATES || "");
+// TEAM-3686 Finding 3 / TEAM-3690: deliverable-evidence gate on the orchestrator
+// completion path — same flag, same semantics as the HTTP complete route
+// (TEAM-3619 D4a, design §X.5 step 6: "evidence check behind
+// COMPLETION_EVIDENCE_REQUIRED flag (shadow-log first)"). The shadow-first
+// observation step is now COMPLETE: per QA finding F2 (AC-D4.1) this DEFAULTS ON
+// (ENFORCE) — a completion missing evidence aborts. Shadow mode remains ONLY as
+// an explicit emergency opt-OUT: COMPLETION_EVIDENCE_REQUIRED=off|false|0
+// (case-insensitive, trimmed) falls back to shadow-log-and-continue. Fail-closed:
+// any other value — unset, empty, unrecognized garbage — ENFORCES, so an
+// unparseable value can never silently disable the invariant. No force/bypass
+// parameter either way.
+const COMPLETION_EVIDENCE_REQUIRED = !/^(off|false|0)$/i.test(
+  (process.env.COMPLETION_EVIDENCE_REQUIRED || "").trim()
+);
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
@@ -96,6 +133,9 @@ async function loadAgentRoster() {
       Key: "config/agents.json",
     }));
     const config = JSON.parse(await res.Body.transformToString());
+    // Feed the same S3 config to the watchdog resolver (D1.1) — per-agent +
+    // defaults watchdog blocks, resolved without a second fetch.
+    setWatchdogSource(config);
     _agentRoster = config.agents.map((a) => ({
       agentId: a.agentId,
       phase: a.phase,
@@ -182,12 +222,156 @@ function getWorkflowDef(id) {
   return defs[id] || defs[DEFAULT_WORKFLOW_DEF_ID] || FALLBACK_WORKFLOW_DEF;
 }
 
+// ─── Dead-session detector (TEAM-3618 D1.2) ──────────────────────────────────
+
+/**
+ * Re-dispatch a ticket through the NORMAL invocation path (claim CAS → invoke).
+ * Used by the dead-session detector's retry-once step after it has stolen the
+ * stale claim (status→ready). The claim CAS is the final arbiter — a live
+ * concurrent claim wins and this returns false. Best-effort context build.
+ */
+async function redispatchTicket(workflow, ticket) {
+  const agentDef = getAgentDef(ticket.assignee);
+  if (!agentDef) return false;
+  const claimed = await claimTicketInvocation(workflow, ticket.ticketId, ticket.assignee);
+  if (!claimed) return false;
+  const context = await buildAgentContext(ticket, workflow);
+  await invokeAgent(agentDef, context, workflow, ticket.ticketId);
+  return true;
+}
+
+// One detector per warm container so its per-agent median cache is reused
+// across the 5-minute sweeps (rebuilt from scratch on a cold start).
+let _detector = null;
+function getDetector() {
+  if (_detector) return _detector;
+  _detector = createDetector({
+    ddb,
+    workflowsTable: WORKFLOWS_TABLE,
+    eventsTable: EVENTS_TABLE,
+    store,
+    lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
+    getTicket,
+    getAgentDef,
+    publishEvent,
+    redispatch: redispatchTicket,
+    blockTicket: blockTicketForFailedInvoke,
+  });
+  return _detector;
+}
+
+// ─── Unblock cascade (TEAM-3618 D3) ──────────────────────────────────────────
+
+// One shared cascade helper behind BOTH "ticket done" paths (Jira-webhook and
+// DDB-stream), wired with the real provider/DDB/event effects. Lazy singleton
+// so warm containers reuse it (mirrors getDetector()).
+let _cascade = null;
+function getCascade() {
+  if (_cascade) return _cascade;
+  _cascade = createCascade({
+    ddb,
+    ticketsTable: TICKETS_TABLE,
+    provider: TICKET_PROVIDER,
+    jiraTransition,
+    getChildTickets,
+    publishEvent,
+    // Extended states (commit 4b) — behind CASCADE_EXTENDED_STATES.
+    extendedStates: CASCADE_EXTENDED_STATES,
+    lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
+    eventsTable: EVENTS_TABLE,
+    workflowsTable: WORKFLOWS_TABLE,
+    redispatch: redispatchTicket,
+    reawakenGate: handleHumanReviewGate,
+  });
+  return _cascade;
+}
+
+// ─── Review-gate round cap (TEAM-3619 D2c) ───────────────────────────────────
+
+// Bounds the review→rework loop: after `maxRounds` effective rounds the gate is
+// handed to a human instead of re-opening the upstream work yet again. Lazy
+// singleton, same shape as getCascade()/getDetector().
+let _reviewCap = null;
+function getReviewCap() {
+  if (_reviewCap) return _reviewCap;
+  _reviewCap = createReviewCap({
+    store,
+    publishEvent,
+    listReviewers,
+    parkGateForHuman,
+    commentOnGate: addTicketComment,
+    log: (msg) => console.log(`[orchestrator] ${msg}`),
+  });
+  return _reviewCap;
+}
+
+/**
+ * Hand an escalated review gate to a human: owned by `assignee`, parked in
+ * in_review, with the decision instructions on the ticket.
+ *
+ * The gate is the only exit from a capped loop, so the human has to be able to
+ * find it AND to know the syntax that re-authorizes rework — hence the comment,
+ * not just the in-app notification.
+ *
+ * Assignment is provider-limited: DynamoDB mode writes the assignee field for
+ * real, Jira mode cannot (the ticket-tools Lambda's update_ticket only carries
+ * summary/description, and Jira's assignee needs an accountId). In Jira the
+ * ownership therefore lives in the comment + the review_needed notification.
+ */
+async function parkGateForHuman(gateTicketId, assignee, workflow) {
+  if (TICKET_PROVIDER !== "jira") {
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId: gateTicketId },
+      UpdateExpression: "SET #s = :s, #a = :a, #u = :u",
+      ExpressionAttributeNames: { "#s": "status", "#a": "assignee", "#u": "updatedAt" },
+      ExpressionAttributeValues: {
+        ":s": "in_review",
+        ":a": assignee,
+        ":u": new Date().toISOString(),
+      },
+    }));
+  }
+  // Transition (idempotent), notification, review.needed event — the same path
+  // the "ready" flow uses, so the board state is identical to a normal gate.
+  await handleHumanReviewGate(gateTicketId, assignee, workflow);
+}
+
+/**
+ * Post a comment on a ticket via the ticket-tools Lambda. Best-effort: a failed
+ * comment must not fail the escalation that is already recorded and parked.
+ */
+async function addTicketComment(ticketId, comment) {
+  if (TICKET_PROVIDER !== "jira") return false;
+  try {
+    await lambda.send(new InvokeCommand({
+      FunctionName: TICKET_TOOLS_LAMBDA,
+      Payload: JSON.stringify({
+        tool_name: "Tickets___add_comment",
+        parameters: { ticket_id: ticketId, comment },
+      }),
+    }));
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] addTicketComment(${ticketId}) failed: ${err.message}`);
+    return false;
+  }
+}
+
 // ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
 
 export const handler = async (event) => {
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
+
+  // Scheduled dead-session sweep (TEAM-3618 D1.2). A rate(5 minutes) EventBridge
+  // rule fires this sentinel. Branch BEFORE any stream/webhook parsing — it is a
+  // synthetic invocation with no Records/source-webhook shape.
+  if (event?.source === "orchestrator.sweep" && event?.action === "dead_session_sweep") {
+    console.log(`[orchestrator] dead-session sweep (mode=${DEAD_SESSION_DETECTOR_MODE})`);
+    return getDetector().runSweep(DEAD_SESSION_DETECTOR_MODE);
+  }
 
   // SQS FIFO command queue (R1 — docs/race-condition-study.md). One message
   // group per workflow root, so commands for a run arrive strictly in order
@@ -355,8 +539,11 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
 /**
  * Unified "ticket done" handler — works with both DynamoDB and Jira backends.
  * Called from processStatusChange (Jira webhook path).
+ *
+ * Exported solely so done-handlers-cascade.test.mjs can drive the REAL handler
+ * end-to-end through the REAL cascade (TEAM-3688). No behavior change.
  */
-async function handleTicketDoneUnified(ticketId) {
+export async function handleTicketDoneUnified(ticketId) {
   const ticket = await getTicket(ticketId);
   if (!ticket) return;
 
@@ -387,51 +574,27 @@ async function handleTicketDoneUnified(ticketId) {
   // a pre-claim snapshot (double invocation).
   await markTaskComplete(workflow, ticketId, assignee);
 
-  // Unblock dependents
-  const siblings = await getChildTickets(parentId);
-  const unblocked = [];
-
-  for (const sibling of siblings) {
-    if (sibling.ticketId === ticketId) continue;
-    const blockers = sibling.blockedBy || [];
-    if (blockers.includes(ticketId)) {
-      // Check if all blockers are now resolved (done) — keep blockedBy intact like Jira does
-      const allResolved = blockers.every(bid => {
-        if (bid === ticketId) return true; // this one is done
-        const blocker = siblings.find(s => s.ticketId === bid);
-        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
-      });
-      if (allResolved && (sibling.status === "blocked" || sibling.status === "todo")) {
-        // All blockers resolved — transition to ready (keep blockedBy as historical record)
-        if (TICKET_PROVIDER === "jira") {
-          await jiraTransition(sibling.ticketId, "Ready");
-        } else {
-          await ddb.send(new UpdateCommand({
-            TableName: TICKETS_TABLE,
-            Key: { ticketId: sibling.ticketId },
-            UpdateExpression: "SET #s = :s, #u = :u",
-            ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-            ExpressionAttributeValues: { ":s": "todo", ":u": new Date().toISOString() },
-          }));
-        }
-        unblocked.push(sibling.ticketId);
-      }
-      // blockedBy array is never modified — it's a permanent record of dependencies
-    }
+  // Unblock dependents via the shared cascade (TEAM-3618 D3). The helper owns
+  // the blocker predicate, provider branching, and orchestrator.unblocked
+  // journal events — identical to the DDB-stream twin (handleTicketDone).
+  //
+  // TEAM-3684 Finding 1: guard the whole invocation. The cascade isolates
+  // per-dependent errors internally, but an UNEXPECTED throw (e.g. getChildTickets
+  // failing) must never skip the agent.complete publish or the completion check
+  // below — otherwise a completed run could silently never be finalized. Treat a
+  // cascade failure as "unblocked nothing" and proceed. (Symmetric with the
+  // DDB-stream twin handleTicketDone.)
+  let unblocked = [];
+  try {
+    unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
+  } catch (err) {
+    console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
   }
 
-  console.log(`[orchestrator] ${ticketId} done. Unblocked: [${unblocked.join(", ")}]`);
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
 
-  // Journey log: record each unblock for at-a-glance traceability
-  for (const unblockedId of unblocked) {
-    await publishEvent(unblockedId, "orchestrator.unblocked", {
-      ticketId: unblockedId, unblockedBy: ticketId, workflowId: workflow?.id,
-    });
-  }
-
   // Always check workflow completion — the last ticket to close triggers this
-  if (await isWorkflowComplete(parentId, workflow)) {
+  if (await isWorkflowComplete(parentId, workflow, assignee)) {
     await completeWorkflow(workflow);
   }
 }
@@ -485,10 +648,16 @@ async function claimTicketInvocation(workflow, ticketId, assignee) {
   // same knob as the lease-aware retry/dispatch endpoints, doubled because
   // this path has no activity signal — only the claim's age.
   const ttlMinutes = Number(process.env.WORKFLOW_LEASE_TTL_MINUTES);
-  const leaseTtlMs = (Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? ttlMinutes : 30) * 60_000;
-  const staleBefore = new Date(Date.now() - 2 * leaseTtlMs).toISOString();
+  const leaseTtlMs = (Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? ttlMinutes : DEFAULT_TTL_MINUTES) * 60_000;
+  const staleBefore = new Date(Date.now() - STALE_CLAIM_MULTIPLIER * leaseTtlMs).toISOString();
+  // TEAM-3698: drop any deadSessionDetectedAt from the PRIOR generation — this
+  // is a new claim (new startedAt), so a stamp carried over would make the
+  // dead-session detector skip it as "already handled" forever. The store
+  // strips it on the write too (R2, sole writer); this keeps the in-memory
+  // snapshot handed back to the caller honest.
+  const { deadSessionDetectedAt: _priorStamp, ...priorEntry } = workflow.agentTasks?.[ticketId] || {};
   const entry = {
-    ...(workflow.agentTasks?.[ticketId] || {}),
+    ...priorEntry,
     id: taskId,
     agentId: assignee,
     ticketId,
@@ -529,16 +698,16 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
   // Idempotency is tracked on the SIDE EFFECT (the notification), not the ticket
   // status — the status write and the notification aren't atomic, so a redelivery
   // after a status-write-but-save-failure must still create the missing one.
-  // Only skip when an unacknowledged review_needed notification already exists.
+  // Only notify when no unacknowledged review_needed already exists.
+  //
+  // TEAM-3684 Finding 2: the open-notification check + append must be ATOMIC, not
+  // a scan of the passed-in (possibly stale) snapshot. Concurrent last-blocker
+  // completions re-wake the same gate from separate stale copies; the store's
+  // appendReviewNotificationOnce runs the check under the notifVersion CAS so
+  // exactly one caller appends. It returns whether THIS call notified, which the
+  // cascade's re-wake uses to publish review.reawakened at most once.
+  let notified = false;
   if (workflow) {
-    if (!Array.isArray(workflow.humanNotifications)) workflow.humanNotifications = [];
-    const alreadyNotified = workflow.humanNotifications.some(
-      (n) => n.ticketId === ticketId && n.type === "review_needed" && !n.acknowledged
-    );
-    if (alreadyNotified) {
-      console.log(`[orchestrator] ${ticketId} already has an open review notification — skipping duplicate.`);
-      return;
-    }
     const notification = {
       id: `notif_${ticketId}_${new Date().toISOString()}`,
       type: "review_needed",
@@ -549,16 +718,21 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
       timestamp: new Date().toISOString(),
       acknowledged: false,
     };
-    workflow.humanNotifications.push(notification);
-    // Atomic append — a full-row save here would clobber concurrent scoped
-    // writes (sibling claims, resume contexts) with this stale snapshot.
-    await store.appendNotification(workflow.id, notification);
+    notified = await store.appendReviewNotificationOnce(workflow.id, ticketId, notification);
+    if (notified && Array.isArray(workflow.humanNotifications)) {
+      workflow.humanNotifications.push(notification); // keep the in-memory copy consistent
+    }
+    if (!notified) {
+      console.log(`[orchestrator] ${ticketId} already has an open review notification — skipping duplicate.`);
+      return false;
+    }
   }
 
   await publishEvent(ticketId, "review.needed", {
     ticketId, reviewer, workflowId: workflow?.id,
   });
   console.log(`[orchestrator] ${ticketId} parked for human review (${reviewer}) — not invoking an agent.`);
+  return notified;
 }
 
 /**
@@ -567,7 +741,7 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
  * upstream agent tickets this gate reviewed (its blockedBy) so the agents redo
  * the work with the reviewer's comment as resume context. "hold" → just pause.
  */
-async function handleReviewRejection(gateTicket) {
+export async function handleReviewRejection(gateTicket) {
   const workflow = await resolveWorkflow(gateTicket.workflowId, gateTicket.parentId);
   if (!workflow) return;
 
@@ -618,6 +792,69 @@ async function handleReviewRejection(gateTicket) {
     (gateTicket.comments || []).slice(-1)[0]?.content ||
     "Reviewer requested changes.";
 
+  // Convergence cap (TEAM-3619 D2c) — BEFORE any rework side effect. Records
+  // this rejection as a review round and, once the gate's effective round count
+  // reaches its `maxRounds`, hands the gate to a human and stops the loop here:
+  // no resume contexts, no re-open, no further automatic cycles. A human's own
+  // transition still works (approving the gate continues the flow; an explicit
+  // `DECISION: continue` in a later rejection re-authorizes rework), so this
+  // suppresses only the AUTOMATIC re-open.
+  //
+  // reviewedHeadSha is best-effort: the orchestrator doesn't track the PR head,
+  // so it is normally absent and every rejection is therefore its own round.
+  // When a provider does carry it, re-reviewing the same SHA reuses that round.
+  //
+  // Diff-scoped gate (TEAM-3689, release-manager.md Step 4): changeSet is the
+  // PR's --name-status file list and reviewFindings are the reviewer's classified
+  // findings (each with its cited files). Both are best-effort like
+  // reviewedHeadSha — normally absent, because the orchestrator does not compute
+  // the diff, in which case the guard is inert and behavior is byte-identical.
+  // When a provider does carry them, review-cap downgrades out-of-diff findings
+  // and reports `gated: false` for a rejection whose findings are ALL out-of-diff,
+  // which must neither count toward the cap nor re-open upstream work.
+  const changeSet = gateTicket.changeSet || gateTicket.metadata?.changeSet || null;
+  const reviewFindings = gateTicket.reviewFindings || gateTicket.metadata?.reviewFindings || null;
+  const capResult = await getReviewCap().enforce({
+    workflow,
+    gateTicket,
+    gateCfg: gateCfg ? { ...gateCfg, afterPhase: gateCfg.afterPhase ?? gatePhase } : gateCfg,
+    upstreamIds: upstream.map((up) => up.ticketId),
+    feedback,
+    reviewedHeadSha: gateTicket.reviewedHeadSha || gateTicket.metadata?.headSha || null,
+    changeSet,
+    findings: reviewFindings,
+  });
+  if (capResult.escalated) {
+    await publishEvent(gateTicket.ticketId, "review.rejected", {
+      ticketId: gateTicket.ticketId,
+      onReject,
+      reopened: [],
+      workflowId: workflow.id,
+      capReached: true,
+      effectiveRounds: capResult.effectiveRounds,
+      maxRounds: capResult.maxRounds,
+    });
+    return;
+  }
+
+  // Diff-scoped gate (TEAM-3689): a CHANGES-NEEDED verdict whose only findings
+  // cite files OUTSIDE the recorded change set is non-gating — it must NOT
+  // re-open upstream work. `gated` is true whenever there is no change set to
+  // scope against, so this branch is inert for old ledgers.
+  if (capResult.gated === false) {
+    console.log(
+      `[orchestrator] Review gate ${gateTicket.ticketId} rejected but all findings are out-of-diff (advisory) — not reopening.`
+    );
+    await publishEvent(gateTicket.ticketId, "review.rejected", {
+      ticketId: gateTicket.ticketId,
+      onReject,
+      reopened: [],
+      workflowId: workflow.id,
+      noInDiffFindings: true,
+    });
+    return;
+  }
+
   // Persist each ticket's feedback atomically (per-key, no full-row put) BEFORE
   // reopening, so a fast re-invocation always finds its resume context.
   const reopened = [];
@@ -639,6 +876,25 @@ async function handleReviewRejection(gateTicket) {
 
   // Re-open each upstream ticket so its agent re-runs. Done has no direct path to
   // Ready — in Jira it must hop Done → To Do (Reopen) → Ready.
+  //
+  // TEAM-3684 Finding 3 (converse risk, ACCEPTED): the cascade reads the sibling
+  // statuses from the eventually-consistent parentId-index GSI. A reopen here
+  // (done → todo) that hasn't yet propagated to that GSI could let a racing
+  // cascadeUnblock still observe this blocker as "done" and PREMATURELY Ready a
+  // dependent. This is the mirror of the missed-last-unblock the cascade's
+  // bounded re-fetch guards against, and it is deliberately NOT handled: a
+  // premature Ready is self-correcting (the reopened blocker re-blocks and the
+  // agent re-runs), whereas the missed unblock is terminal. Documented so the
+  // asymmetry is a choice, not an oversight.
+  //
+  // TEAM-3619 D4c: stamp the re-opened ticket as a review-fix routed under the
+  // gated phase (`spawnedBy` + `phase`). `isWorkflowComplete` then treats this
+  // as an open fix under `gatePhase`, so the run cannot be declared complete
+  // while a rework cycle is in flight — even if the gate ticket itself is done.
+  // (Jira tickets can't carry arbitrary columns; the reopen path re-derives
+  // phase from the assignee and the workflow row records the round, so the DDB
+  // stamp is where this metadata lands.)
+  const spawnedBy = { gateTicketId: gateTicket.ticketId, kind: "review_fix" };
   for (const up of upstream) {
     if (TICKET_PROVIDER === "jira") {
       await jiraReopenToReady(up.ticketId);
@@ -646,9 +902,18 @@ async function handleReviewRejection(gateTicket) {
       await ddb.send(new UpdateCommand({
         TableName: TICKETS_TABLE,
         Key: { ticketId: up.ticketId },
-        UpdateExpression: "SET #s = :s, #u = :u",
-        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-        ExpressionAttributeValues: { ":s": "todo", ":u": new Date().toISOString() },
+        UpdateExpression: "SET #s = :s, #u = :u, spawnedBy = :sb" + (gatePhase ? ", #ph = :ph" : ""),
+        ExpressionAttributeNames: {
+          "#s": "status",
+          "#u": "updatedAt",
+          ...(gatePhase ? { "#ph": "phase" } : {}),
+        },
+        ExpressionAttributeValues: {
+          ":s": "todo",
+          ":u": new Date().toISOString(),
+          ":sb": spawnedBy,
+          ...(gatePhase ? { ":ph": gatePhase } : {}),
+        },
       }));
     }
   }
@@ -1017,8 +1282,11 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
 
 /**
  * A ticket was marked "done". Unblock dependents, check QA gate, check completion.
+ *
+ * Exported solely so done-handlers-cascade.test.mjs can drive the REAL handler
+ * end-to-end through the REAL cascade (TEAM-3688). No behavior change.
  */
-async function handleTicketDone(ticketId, image) {
+export async function handleTicketDone(ticketId, image) {
   const parentId = unwrapDdbValue(image.parentId);
   const workflowId = unwrapDdbValue(image.workflowId);
   const assignee = unwrapDdbValue(image.assignee);
@@ -1038,43 +1306,28 @@ async function handleTicketDone(ticketId, image) {
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);
 
-  // Unblock dependents: find tickets blocked by this one
-  const siblings = await getChildTickets(parentId);
-  const unblocked = [];
-
-  for (const sibling of siblings) {
-    if (sibling.ticketId === ticketId) continue;
-    const blockers = sibling.blockedBy || [];
-    if (blockers.includes(ticketId)) {
-      // Check if all blockers are now resolved — keep blockedBy intact (like Jira issue links)
-      const allResolved = blockers.every(bid => {
-        if (bid === ticketId) return true; // this one is done
-        const blocker = siblings.find(s => s.ticketId === bid);
-        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
-      });
-      if (allResolved && sibling.status === "blocked") {
-        // All blockers resolved — transition to todo (keep blockedBy as historical record)
-        await ddb.send(new UpdateCommand({
-          TableName: TICKETS_TABLE,
-          Key: { ticketId: sibling.ticketId },
-          UpdateExpression: "SET #s = :s, #u = :u",
-          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-          ExpressionAttributeValues: { ":s": "todo", ":u": new Date().toISOString() },
-        }));
-        unblocked.push(sibling.ticketId);
-      }
-      // blockedBy array is never modified — it's a permanent record of dependencies
-    }
+  // Unblock dependents via the shared cascade (TEAM-3618 D3). Same helper as the
+  // Jira-webhook twin (handleTicketDoneUnified) — this path previously matched
+  // only "blocked" dependents and emitted no orchestrator.unblocked events; the
+  // shared helper fixes both divergences (now {blocked, todo} → Ready + journal).
+  //
+  // TEAM-3684 Finding 1: guard the invocation (symmetric with the webhook twin).
+  // An unexpected throw must never skip the agent.complete publish or the
+  // completion check below — treat a cascade failure as "unblocked nothing" so
+  // the last ticket to close can still finalize the run.
+  let unblocked = [];
+  try {
+    unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
+  } catch (err) {
+    console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
   }
-
-  console.log(`[orchestrator] ${ticketId} done. Unblocked: [${unblocked.join(", ")}]`);
 
   // Publish event for UI
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
 
   // Check if workflow is complete (all tickets done)
   if (unblocked.length === 0) {
-    if (await isWorkflowComplete(parentId, workflow)) {
+    if (await isWorkflowComplete(parentId, workflow, assignee)) {
       await completeWorkflow(workflow);
     }
   }
@@ -1193,37 +1446,111 @@ async function handleTicketReady(ticketId, image) {
 
 // ─── QA Gate ───────────────────────────────────────────────────────────────────
 
-async function isWorkflowComplete(epicId, workflow) {
+// TEAM-3686 Finding 4: completion can race a just-filed fix ticket. The
+// children read behind the completion verdict goes through the eventually-
+// consistent parentId-index GSI (Jira search is likewise lagged), so a
+// reviewer/QA/ship agent that files a fix ticket and then reports its own
+// ticket done can trigger a completion check against a snapshot where the fix
+// isn't visible yet. When the trigger ticket belongs to a kind that spawns
+// fixes (roster phases below, or a human review gate), a passing verdict is
+// re-verified once after a short bounded delay before completion proceeds.
+const FIX_SPAWNING_PHASES = new Set(["verification", "review", "ship"]);
+const COMPLETION_RECHECK_DELAY_MS = 1500;
+
+function mayHaveJustSpawnedFixes(assignee) {
+  if (isHumanAssignee(assignee)) return true;
+  const phase = getAgentDef(assignee)?.phase;
+  return phase !== undefined && FIX_SPAWNING_PHASES.has(phase);
+}
+
+// Exported solely so completion-gates.test.mjs can drive the re-check seam.
+export async function isWorkflowComplete(epicId, workflow, triggerAssignee) {
+  if (!(await evaluateCompletionSnapshot(epicId, workflow))) return false;
+  if (mayHaveJustSpawnedFixes(triggerAssignee)) {
+    await new Promise((r) => setTimeout(r, COMPLETION_RECHECK_DELAY_MS));
+    if (!(await evaluateCompletionSnapshot(epicId, workflow))) {
+      console.warn(
+        `[orchestrator] CompletionRecheckFlipped ${workflow?.id}: verdict after ` +
+          `${triggerAssignee} did not hold on re-read — a just-spawned fix ticket ` +
+          `was invisible to the first snapshot; completion deferred.`
+      );
+      return false;
+    }
+  }
+  return true;
+}
+
+async function evaluateCompletionSnapshot(epicId, workflow) {
   const children = await getChildTickets(epicId);
   if (children.length === 0) return false;
 
-  // Gate: at least one ticket in a "terminal" agent phase must be done — so a
-  // workflow isn't declared complete after only requirements/design finish.
   const wfDef = getWorkflowDef(workflow?.workflowDefId);
-  const terminalPhases = wfDef.completionRequiresAgentPhases || [];
 
-  let hasTerminalDone;
-  if (terminalPhases.length > 0) {
-    // Config-driven: map each ticket's assignee → agent phase via the roster.
-    hasTerminalDone = children.some((t) => {
-      if (t.status !== "done" || !t.assignee) return false;
-      const def = getAgentDef(t.assignee);
-      return def && terminalPhases.includes(def.phase);
-    });
-  } else {
-    // Legacy suffix heuristic (software-delivery shape) — preserved as fallback.
-    hasTerminalDone = children.some((t) => {
-      const assignee = t.assignee || "";
-      const isDevOrQa = assignee.endsWith("_dev") || assignee.includes("_qa") || assignee.includes("_ci");
-      return isDevOrQa && t.status === "done";
-    });
-  }
-  if (!hasTerminalDone) return false;
-  return children.every((t) => t.status === "done");
+  // Resolve a gate ticket's guarded phase the same way handleReviewRejection
+  // does — from the agent phase of the upstream tickets it blocks. Prefer any
+  // in-memory child (no fetch); fall back to a lookup for out-of-batch upstreams.
+  const childById = new Map(children.map((t) => [t.ticketId, t]));
+  const gatePhaseOf = (gateTicket) => {
+    if (typeof gateTicket.phase === "string" && gateTicket.phase) return gateTicket.phase;
+    for (const upId of gateTicket.blockedBy || []) {
+      const up = childById.get(upId);
+      const phase = up && getAgentDef(up.assignee)?.phase;
+      if (phase) return phase;
+    }
+    return undefined;
+  };
+
+  // TEAM-3619 D4c: per-phase re-verify (done work + approved gates + no open
+  // fixes), or the legacy heuristic when the def declares no required phases.
+  return evaluateWorkflowComplete(children, wfDef, {
+    getAgentPhase: (assignee) => getAgentDef(assignee)?.phase,
+    gatePhaseOf,
+    requestedGates: workflow?.input?.reviewGates || [],
+  });
 }
 
-async function completeWorkflow(workflow) {
+// Exported solely so completion-gates.test.mjs can drive the evidence gate.
+export async function completeWorkflow(workflow) {
   if (workflow.phase === "complete") return;
+
+  // TEAM-3686 Finding 3: deliverable-evidence gate — same semantics as the HTTP
+  // complete route (TEAM-3619 D4a). Every done ticket in a completion-required
+  // phase must have real work behind it (non-empty agentTasks output or an
+  // artifact). Enforced by default (TEAM-3690): missing evidence → abort
+  // completion. Only the explicit opt-out COMPLETION_EVIDENCE_REQUIRED=off|false|0
+  // falls back to shadow-log-and-continue. Read-only (R2): children via the provider read,
+  // agentTasks via a consistent workflow re-read (the in-memory copy can lag
+  // the webhook's output merge). Mirroring the route, a FAILURE of the check
+  // itself never blocks a legitimate completion — it only tightens when it can
+  // prove a phantom deliverable.
+  try {
+    const wfDef = getWorkflowDef(workflow?.workflowDefId);
+    const requiredPhases = wfDef.completionRequiresAgentPhases || [];
+    if (requiredPhases.length > 0) {
+      const children = await getChildTickets(workflow.epicId);
+      const freshWf = await store.getWorkflow(workflow.id);
+      const missing = missingEvidenceTickets(
+        children,
+        freshWf?.agentTasks || workflow.agentTasks || {},
+        requiredPhases,
+        { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase }
+      );
+      if (missing.length > 0) {
+        const offenders = missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ");
+        if (COMPLETION_EVIDENCE_REQUIRED) {
+          console.error(
+            `[orchestrator] CompletionRejectedMissingEvidence ${workflow.id}: ${offenders}`
+          );
+          return;
+        }
+        console.warn(
+          `[orchestrator] ${workflow.id} would be blocked for missing evidence (shadow opt-out): ${offenders}`
+        );
+      }
+    }
+  } catch (err) {
+    console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
+  }
 
   // Atomic completion claim FIRST — only the winner runs the side effects
   // (PR creation, epic roll-up, the workflow.complete event). Previously the
@@ -1373,6 +1700,9 @@ async function invokeAgent(agentDef, context, workflow, ticketId) {
         modelOverride: modelConfig,
         // Routine-scoped connectors travel with the workflow → each agent invoke.
         connectors: workflow.connectors,
+        // Fleet-wide watchdog knobs (D1.1), resolved from the S3 agents.json
+        // config: heartbeat cadence + tool/turn deadlines the runtime enforces.
+        watchdog: resolveWatchdog(agentDef.agentId),
       }),
     }));
 

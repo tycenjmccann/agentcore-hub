@@ -880,6 +880,7 @@
         "S3Storage___write_object",
         "Tickets___add_comment",
         "Tickets___create_ticket",
+        "Tickets___get_issue",
         "Tickets___list_tickets",
         "Tickets___search_issues",
         "Tickets___transition_ticket",
@@ -1765,6 +1766,12 @@
   ],
   "defaults": {
     "intakeAgentId": "agentcore_hub_requirements_analyst",
-    "defaultAssigneeId": "agentcore_hub_backend_designer"
+    "defaultAssigneeId": "agentcore_hub_backend_designer",
+    "watchdog": {
+      "enabled": true,
+      "heartbeatIntervalMs": 15000,
+      "toolDeadlineSecs": 600,
+      "turnTimeoutSecs": 1500
+    }
   }
 }

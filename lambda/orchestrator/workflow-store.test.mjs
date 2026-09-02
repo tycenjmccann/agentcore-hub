@@ -7,11 +7,19 @@ import {
   mergeTaskMetadata,
   completeTaskEntry,
   setTaskStatus,
+  markDeadSessionDetected,
+  clearDeadSessionDetected,
+  incrementDeadSessionRetry,
   advancePhase,
   setResumeContext,
   appendNotification,
+  appendReviewNotificationOnce,
   ackNotifications,
   completeWorkflow,
+  claimFinalization,
+  appendReviewRound,
+  appendReviewCapEscalation,
+  appendReviewAuthorization,
 } from "./workflow-store.mjs";
 
 /**
@@ -27,6 +35,24 @@ let failNextCondition = false;
 
 const stubDdb = {
   async send(cmd) {
+    // Mirror the DocumentClient (removeUndefinedValues: true) + DynamoDB
+    // validation: undefined attribute values are stripped client-side, and an
+    // expression referencing a placeholder with no remaining value is a
+    // ValidationException — the failure class TEAM-3683 F3 fixed.
+    const present = new Set(
+      Object.entries(cmd.input.ExpressionAttributeValues || {})
+        .filter(([, v]) => v !== undefined)
+        .map(([k]) => k)
+    );
+    const exprs = [cmd.input.ConditionExpression, cmd.input.UpdateExpression]
+      .filter(Boolean).join(" ");
+    for (const ph of exprs.match(/:[A-Za-z0-9_]+/g) || []) {
+      if (!present.has(ph)) {
+        const err = new Error(`ExpressionAttributeValues missing ${ph}`);
+        err.name = "ValidationException";
+        throw err;
+      }
+    }
     sent.push({ type: cmd.constructor.name, input: cmd.input });
     if (failNextCondition && cmd.input.ConditionExpression) {
       failNextCondition = false;
@@ -68,6 +94,19 @@ describe("claimInvocation", () => {
     const claim = writes().find((c) => c.input.ConditionExpression?.includes(":running"));
     expect(claim.input.UpdateExpression).toBe("SET agentTasks.#tid = :task");
     expect(claim.input.ConditionExpression).toContain("agentTasks.#tid.startedAt < :staleBefore");
+  });
+
+  it("strips a stale deadSessionDetectedAt so a FRESH generation never inherits it (TEAM-3698 F1)", async () => {
+    // A caller that spreads the prior task (index.mjs claimTicketInvocation)
+    // could carry the previous generation's stamp onto the new startedAt — the
+    // detector then skips the live+stamped task forever. The sole writer drops it.
+    const inherited = { ...entry, startedAt: "2026-08-31T00:00:00Z", deadSessionDetectedAt: "2026-08-30T12:00:00Z" };
+    await claimInvocation("wf_1", "TEAM-2", inherited, "2026-08-30T23:00:00Z");
+    const claim = writes().find((c) => c.input.ConditionExpression?.includes(":running"));
+    expect(claim.input.ExpressionAttributeValues[":task"]).not.toHaveProperty("deadSessionDetectedAt");
+    // The rest of the fresh entry is untouched.
+    expect(claim.input.ExpressionAttributeValues[":task"].startedAt).toBe("2026-08-31T00:00:00Z");
+    expect(claim.input.ExpressionAttributeValues[":task"].status).toBe("running");
   });
 
   it("loses to a live concurrent claim", async () => {
@@ -125,6 +164,82 @@ describe("setTaskStatus", () => {
   });
 });
 
+describe("markDeadSessionDetected", () => {
+  it("stamps under a CAS on the exact claim generation (startedAt) + not-yet-stamped", async () => {
+    const won = await markDeadSessionDetected("wf_1", "TEAM-2", "2026-08-30T00:00:00Z");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("SET agentTasks.#tid.deadSessionDetectedAt = :now");
+    expect(w.input.ConditionExpression).toBe(
+      "agentTasks.#tid.startedAt = :expected AND attribute_not_exists(agentTasks.#tid.deadSessionDetectedAt)"
+    );
+    expect(w.input.ExpressionAttributeValues[":expected"]).toBe("2026-08-30T00:00:00Z");
+  });
+
+  it("returns false when the claim moved or was already stamped", async () => {
+    failNextCondition = true;
+    expect(await markDeadSessionDetected("wf_1", "TEAM-2", "x")).toBe(false);
+  });
+
+  it("falls back to attribute_not_exists(startedAt) when the claim has no startedAt (TEAM-3683 F3)", async () => {
+    // A legacy running task without startedAt must not produce an expression
+    // referencing :expected after removeUndefinedValues strips it — the stub
+    // throws ValidationException on exactly that mismatch.
+    const won = await markDeadSessionDetected("wf_1", "TEAM-2", undefined);
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.ConditionExpression).toBe(
+      "attribute_not_exists(agentTasks.#tid.startedAt) AND attribute_not_exists(agentTasks.#tid.deadSessionDetectedAt)"
+    );
+    expect(w.input.ConditionExpression).not.toContain(":expected");
+    expect(w.input.ExpressionAttributeValues).not.toHaveProperty(":expected");
+  });
+});
+
+describe("clearDeadSessionDetected (TEAM-3698 F1)", () => {
+  it("REMOVEs the stamp under a CAS on the exact claim generation + attribute_exists", async () => {
+    const won = await clearDeadSessionDetected("wf_1", "TEAM-2", "2026-08-30T00:00:00Z");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("REMOVE agentTasks.#tid.deadSessionDetectedAt");
+    expect(w.input.ConditionExpression).toBe(
+      "agentTasks.#tid.startedAt = :expected AND attribute_exists(agentTasks.#tid.deadSessionDetectedAt)"
+    );
+    expect(w.input.ExpressionAttributeValues[":expected"]).toBe("2026-08-30T00:00:00Z");
+  });
+
+  it("returns false when the generation moved between stamp and clear", async () => {
+    failNextCondition = true;
+    expect(await clearDeadSessionDetected("wf_1", "TEAM-2", "x")).toBe(false);
+  });
+
+  it("falls back to attribute_not_exists(startedAt) and omits ExpressionAttributeValues when no startedAt", async () => {
+    // No placeholder in the expression → the values map must be ABSENT (an empty
+    // map is a ValidationException); the stub also rejects any dangling placeholder.
+    const won = await clearDeadSessionDetected("wf_1", "TEAM-2", undefined);
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.ConditionExpression).toBe(
+      "attribute_not_exists(agentTasks.#tid.startedAt) AND attribute_exists(agentTasks.#tid.deadSessionDetectedAt)"
+    );
+    expect(w.input.ConditionExpression).not.toContain(":expected");
+    expect(w.input.ExpressionAttributeValues).toBeUndefined();
+  });
+});
+
+describe("incrementDeadSessionRetry", () => {
+  it("seeds the map then bumps the per-ticket leaf with if_not_exists (never touches qaRetryCount)", async () => {
+    await incrementDeadSessionRetry("wf_1", "TEAM-2");
+    expect(writes()[0].input.UpdateExpression).toContain("if_not_exists(deadSessionRetries, :empty)");
+    const bump = writes()[1];
+    expect(bump.input.UpdateExpression).toBe(
+      "SET deadSessionRetries.#tid = if_not_exists(deadSessionRetries.#tid, :zero) + :one"
+    );
+    expect(bump.input.ExpressionAttributeNames["#tid"]).toBe("TEAM-2");
+    expect(bump.input.ReturnValues).toBe("UPDATED_NEW");
+  });
+});
+
 describe("advancePhase", () => {
   it("pins the feature branch with if_not_exists", async () => {
     await advancePhase("wf_1", "development", "feature/x");
@@ -154,6 +269,115 @@ describe("appendNotification", () => {
   it("bumps notifVersion so a concurrent ack CAS fails and re-reads", async () => {
     await appendNotification("wf_1", { id: "n1" });
     expect(writes()[0].input.UpdateExpression).toContain("notifVersion = if_not_exists(notifVersion, :zero) + :one");
+  });
+});
+
+describe("appendReviewNotificationOnce (TEAM-3684 Finding 2)", () => {
+  it("appends under a notifVersion CAS when no open review_needed exists", async () => {
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      if (cmd.constructor.name === "GetCommand") {
+        return { Item: { workflowId: "wf_1", notifVersion: 2, humanNotifications: [] } };
+      }
+      return {};
+    };
+    let appended;
+    try {
+      appended = await appendReviewNotificationOnce("wf_1", "GATE-1", {
+        id: "n1", ticketId: "GATE-1", type: "review_needed", acknowledged: false,
+      });
+    } finally {
+      stubDdb.send = origSend;
+    }
+    expect(appended).toBe(true);
+    const w = sent.find((c) => c.type === "UpdateCommand");
+    expect(w.input.UpdateExpression).toBe("SET humanNotifications = :n, notifVersion = :next");
+    expect(w.input.ConditionExpression).toContain("notifVersion = :cur");
+    expect(w.input.ExpressionAttributeValues[":cur"]).toBe(2);
+    expect(w.input.ExpressionAttributeValues[":next"]).toBe(3);
+    expect(w.input.ExpressionAttributeValues[":n"]).toHaveLength(1);
+    expect(w.input.ExpressionAttributeValues[":n"][0].id).toBe("n1");
+  });
+
+  it("is a no-op when an unacknowledged review_needed already exists (no write)", async () => {
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      if (cmd.constructor.name === "GetCommand") {
+        return { Item: { workflowId: "wf_1", notifVersion: 4, humanNotifications: [
+          { id: "open", ticketId: "GATE-1", type: "review_needed", acknowledged: false },
+        ] } };
+      }
+      return {};
+    };
+    let appended;
+    try {
+      appended = await appendReviewNotificationOnce("wf_1", "GATE-1", {
+        id: "dup", ticketId: "GATE-1", type: "review_needed", acknowledged: false,
+      });
+    } finally {
+      stubDdb.send = origSend;
+    }
+    expect(appended).toBe(false);
+    expect(sent.filter((c) => c.type === "UpdateCommand")).toHaveLength(0);
+  });
+
+  it("re-notifies once a prior review_needed was acknowledged (reopened gate)", async () => {
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      if (cmd.constructor.name === "GetCommand") {
+        return { Item: { workflowId: "wf_1", notifVersion: 7, humanNotifications: [
+          { id: "old", ticketId: "GATE-1", type: "review_needed", acknowledged: true },
+        ] } };
+      }
+      return {};
+    };
+    let appended;
+    try {
+      appended = await appendReviewNotificationOnce("wf_1", "GATE-1", {
+        id: "fresh", ticketId: "GATE-1", type: "review_needed", acknowledged: false,
+      });
+    } finally {
+      stubDdb.send = origSend;
+    }
+    expect(appended).toBe(true);
+    const w = sent.find((c) => c.type === "UpdateCommand");
+    // Old (acked) + fresh are both retained; the append never rewrites history away.
+    expect(w.input.ExpressionAttributeValues[":n"]).toHaveLength(2);
+  });
+
+  it("stands down on CAS loss when the re-read now shows a concurrent open notification", async () => {
+    let gets = 0;
+    let updates = 0;
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      if (cmd.constructor.name === "GetCommand") {
+        gets++;
+        // First read: clear. Second read (after our CAS loss): a concurrent
+        // completion already appended an open review_needed → we must stand down.
+        return gets === 1
+          ? { Item: { workflowId: "wf_1", notifVersion: 5, humanNotifications: [] } }
+          : { Item: { workflowId: "wf_1", notifVersion: 6, humanNotifications: [
+              { id: "concurrent", ticketId: "GATE-1", type: "review_needed", acknowledged: false },
+            ] } };
+      }
+      updates++;
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      const err = new Error("cas"); err.name = "ConditionalCheckFailedException"; throw err;
+    };
+    let appended;
+    try {
+      appended = await appendReviewNotificationOnce("wf_1", "GATE-1", {
+        id: "mine", ticketId: "GATE-1", type: "review_needed", acknowledged: false,
+      });
+    } finally {
+      stubDdb.send = origSend;
+    }
+    expect(appended).toBe(false);
+    expect(updates).toBe(1); // exactly one write attempt — no duplicate append
+    expect(gets).toBe(2);    // re-read after the CAS loss, then stood down
   });
 });
 
@@ -232,8 +456,89 @@ describe("completeWorkflow", () => {
     expect(w.input.ConditionExpression).toContain("phase <> :cancelled");
   });
 
+  it("refuses to complete a cancelled run (TEAM-3619 D4a — cancelledAt guard)", async () => {
+    const won = await completeWorkflow("wf_1", "2026-08-30T00:00:00Z");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(cancelledAt)");
+  });
+
   it("returns false for the losing concurrent completion", async () => {
     failNextCondition = true;
     expect(await completeWorkflow("wf_1", "x")).toBe(false);
+  });
+});
+
+describe("claimFinalization", () => {
+  it("takes over a stale completion under a finalizedAt CAS that also excludes cancelled runs", async () => {
+    const won = await claimFinalization("wf_1", "2026-08-30T00:00:00Z");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.ConditionExpression).toContain("phase = :complete");
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(finalizedAt)");
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(cancelledAt)");
+    expect(w.input.ConditionExpression).toContain("completedAt < :staleBefore");
+  });
+
+  it("returns false when another retry already claimed finalization", async () => {
+    failNextCondition = true;
+    expect(await claimFinalization("wf_1", "x")).toBe(false);
+  });
+});
+
+describe("review gate ledger (TEAM-3619 D2c)", () => {
+  const round = { round: 1, verdict: "CHANGES-NEEDED", findings: [] };
+
+  it("seeds the map and the per-gate entry with if_not_exists, then list_appends the round", async () => {
+    await appendReviewRound("wf_1", "TEAM-900", round);
+    const w = writes();
+    expect(w[0].input.UpdateExpression).toContain("if_not_exists(reviewGateHistory, :empty)");
+    expect(w[1].input.UpdateExpression).toBe(
+      "SET reviewGateHistory.#g = if_not_exists(reviewGateHistory.#g, :seed)"
+    );
+    expect(w[1].input.ExpressionAttributeValues[":seed"]).toEqual({
+      rounds: [], authorizations: [], escalations: [],
+    });
+    expect(w[1].input.ExpressionAttributeNames["#g"]).toBe("TEAM-900");
+    // A lost round is a cap that trips late — append, never rewrite the array.
+    expect(w[2].input.UpdateExpression).toBe(
+      "SET reviewGateHistory.#g.rounds = list_append(if_not_exists(reviewGateHistory.#g.rounds, :empty), :r)"
+    );
+    expect(w[2].input.ExpressionAttributeValues[":r"]).toEqual([round]);
+  });
+
+  it("returns the POST-write ledger so the caller counts a concurrent cycle's round too", async () => {
+    const ledger = { rounds: [round], authorizations: [], escalations: [] };
+    initWorkflowStore(
+      {
+        async send(cmd) {
+          sent.push({ type: cmd.constructor.name, input: cmd.input });
+          return cmd.input.ReturnValues === "ALL_NEW"
+            ? { Attributes: { workflowId: "wf_1", reviewGateHistory: { "TEAM-900": ledger } } }
+            : {};
+        },
+      },
+      "workflows-test"
+    );
+    expect(await appendReviewRound("wf_1", "TEAM-900", round)).toEqual(ledger);
+    expect(writes()[2].input.ReturnValues).toBe("ALL_NEW");
+  });
+
+  it("returns null when the row is gone rather than inventing an empty ledger", async () => {
+    // The stub returns {} (no Attributes) — a caller must not read that as
+    // "zero rounds so far", which would silently reset the cap.
+    expect(await appendReviewRound("wf_1", "TEAM-900", round)).toBeNull();
+  });
+
+  it("append-onlys escalations and authorizations under the same gate key", async () => {
+    await appendReviewCapEscalation("wf_1", "TEAM-900", { escalatedAtRound: 3, decision: null });
+    expect(writes()[2].input.UpdateExpression).toBe(
+      "SET reviewGateHistory.#g.escalations = list_append(if_not_exists(reviewGateHistory.#g.escalations, :empty), :e)"
+    );
+    sent.length = 0;
+    await appendReviewAuthorization("wf_1", "TEAM-900", { decision: "continue", resetAtRound: 3 });
+    expect(writes()[2].input.UpdateExpression).toBe(
+      "SET reviewGateHistory.#g.authorizations = list_append(if_not_exists(reviewGateHistory.#g.authorizations, :empty), :a)"
+    );
   });
 });

@@ -90,6 +90,73 @@ async function loadValidAgents() {
   return VALID_AGENTS;
 }
 
+// TEAM-3686: known workflow phases, for validating the `phase` stamp on
+// fix-kind tickets. completion.mjs's open-fix gate matches fix tickets
+// per-phase (`phaseOf(t) === p` for each required phase p), so a fix ticket
+// stamped with a phase outside the known set is invisible to EVERY required
+// phase's check — the workflow could complete with the fix still open. The
+// valid set is derived from the same S3 configs the orchestrator reads:
+// roster phases from config/agents.json (what getAgentPhase resolves) and
+// each workflow def's agentPhases + completionRequiresAgentPhases from
+// config/workflows.json. Fallback mirrors the orchestrator's FALLBACK_ROSTER.
+const FALLBACK_PHASES = new Set([
+  "requirements",
+  "design",
+  "development",
+  "verification",
+  "review",
+  "ship",
+]);
+
+let VALID_PHASES = null;
+
+async function loadValidPhases() {
+  if (VALID_PHASES) return VALID_PHASES;
+  if (!ARTIFACT_BUCKET) {
+    console.warn("[agentcore-hub-tickets] No ARTIFACT_BUCKET — using fallback phase set");
+    VALID_PHASES = FALLBACK_PHASES;
+    return VALID_PHASES;
+  }
+  const phases = new Set();
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: "config/agents.json",
+    }));
+    const config = JSON.parse(await res.Body.transformToString());
+    for (const a of config.agents || []) {
+      if (typeof a.phase === "string" && a.phase) phases.add(a.phase);
+    }
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] Failed to load agent phases from S3: ${err.message}`);
+  }
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: "config/workflows.json",
+    }));
+    const config = JSON.parse(await res.Body.transformToString());
+    for (const w of config.workflows || []) {
+      for (const p of w.phases || []) {
+        if (typeof p.agentPhase === "string" && p.agentPhase) phases.add(p.agentPhase);
+      }
+      for (const p of w.completionRequiresAgentPhases || []) {
+        if (typeof p === "string" && p) phases.add(p);
+      }
+    }
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] Failed to load workflow phases from S3: ${err.message}`);
+  }
+  if (phases.size === 0) {
+    console.warn("[agentcore-hub-tickets] No phases loaded from S3 — using fallback phase set");
+    VALID_PHASES = FALLBACK_PHASES;
+  } else {
+    VALID_PHASES = phases;
+    console.log(`[agentcore-hub-tickets] Loaded ${phases.size} valid phases from S3 config`);
+  }
+  return VALID_PHASES;
+}
+
 // Valid status transitions
 // Simplified flow: todo → ready → in_progress → done  (+blocked as escape hatch)
 const TRANSITIONS = {
@@ -179,9 +246,62 @@ export const handler = async (event) => {
 
 // ─── Tool Implementations ──────────────────────────────────────────────────
 
+// TEAM-3619 D4c: the fix-ticket kinds the completion re-verify (completion.mjs
+// condition iii) recognizes, and the origin-id keys each may carry. A fix ticket
+// created by the QA verifier / code reviewer stamps this so an in-flight fix
+// keeps the run from being declared complete. Kept in lockstep with
+// completion.mjs's FIX_KINDS and index.mjs:816's review_fix shape.
+const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
+const SPAWN_ORIGIN_KEYS = ["gateTicketId", "qaTicketId", "codexTicketId"];
+
+/**
+ * Normalize an agent-supplied `spawned_by` marker. Returns { value } for a clean
+ * marker, { error } for a malformed one (unknown kind / not an object), or {}
+ * when absent (backward-compatible — no field written). Only the known `kind`
+ * and origin-id keys survive; arbitrary extra keys are dropped so agents can't
+ * write junk onto the ticket record.
+ */
+function sanitizeSpawnedBy(raw) {
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return { error: "'spawned_by' must be an object like { kind: 'qa_fix', qaTicketId: 'TEAM-42' }" };
+  }
+  if (!FIX_KINDS.has(raw.kind)) {
+    return { error: `'spawned_by.kind' must be one of: ${[...FIX_KINDS].join(", ")}` };
+  }
+  const value = { kind: raw.kind };
+  for (const k of SPAWN_ORIGIN_KEYS) {
+    if (typeof raw[k] === "string" && raw[k]) value[k] = raw[k];
+  }
+  return { value };
+}
+
 async function createTicket(args) {
-  const { summary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id } = args;
+  const { summary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase } = args;
   if (!summary) return textResult("Error: 'summary' is required");
+
+  // TEAM-3619 D4c: optional fix-ticket provenance. Validate before minting so a
+  // bad marker is a clear error, not a silently-dropped/garbage field.
+  const spawn = sanitizeSpawnedBy(spawned_by);
+  if (spawn.error) return textResult(`Error: ${spawn.error}`);
+  const phaseStamp = typeof phase === "string" && phase.trim() ? phase.trim() : undefined;
+
+  // TEAM-3686: a fix-kind ticket's `phase` stamp is trusted FIRST by
+  // completion.mjs's phaseOf(), and its open-fix gate only blocks completion
+  // when the stamp matches a required phase exactly. An unknown phase (e.g.
+  // "zz_nonexistent") therefore bypasses the gate entirely — the run can be
+  // declared complete while the fix is still open. Reject rather than
+  // normalize so the caller learns immediately which phases are legal.
+  if (spawn.value && phaseStamp) {
+    const validPhases = await loadValidPhases();
+    if (!validPhases.has(phaseStamp)) {
+      return textResult(
+        `Error: 'phase' "${phaseStamp}" is not a known workflow phase — a fix ticket ` +
+        `with an unknown phase would be invisible to the completion open-fix gate. ` +
+        `Valid phases: ${[...validPhases].sort().join(", ")}`
+      );
+    }
+  }
 
   // Validate assignee against known agent roster. "human:<who>" assignees are
   // human-review gates — not agents — and are always allowed (the orchestrator
@@ -216,6 +336,12 @@ async function createTicket(args) {
     blockedBy: blockers,
     createdAt: now,
     updatedAt: now,
+    // TEAM-3619 D4c: fix-ticket provenance, persisted in the exact shape the
+    // orchestrator's completion re-verify reads (completion.mjs condition iii)
+    // and index.mjs handleReviewRejection writes. Omitted entirely when absent,
+    // so a plain ticket is byte-for-byte what it was before.
+    ...(spawn.value ? { spawnedBy: spawn.value } : {}),
+    ...(phaseStamp ? { phase: phaseStamp } : {}),
   };
 
   await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
@@ -235,6 +361,8 @@ async function createTicket(args) {
       parent: parent_key || null,
       blocked_by: blockers,
       created: now,
+      ...(spawn.value ? { spawned_by: spawn.value } : {}),
+      ...(phaseStamp ? { phase: phaseStamp } : {}),
     },
   };
 }

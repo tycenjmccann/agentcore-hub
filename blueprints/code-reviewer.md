@@ -157,6 +157,10 @@ discipline above.
   - `blocked_by`: `""` — EXCEPT when two fix tickets touch the same files or one
     agent gets multiple tickets: chain them (`blocked_by`: the previous ticket)
     so they run serially instead of racing each other on the same code.
+  - `spawned_by_kind`: `"codex_fix"`, `spawned_by_origin_id`: your own review
+    ticket ID, and `phase`: the upstream phase being re-verified (usually
+    `"development"`). This marks the ticket as an open review fix so the run's
+    completion guard won't declare the workflow done until it closes.
   Then `WorkflowOutput___report_completion` summarizing the findings + the fix
   ticket keys you filed.
 
