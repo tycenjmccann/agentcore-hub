@@ -121,13 +121,20 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   phaseOrderRef.current = phaseOrder;
 
   // Poll the deploy pipeline for a waiting approval, but only for a ship-phase
-  // run that isn't already complete/cancelled (the deploy gate only exists after
-  // merge). One poll on mount + every 20s; clears when nothing awaits.
+  // run that isn't already terminal (the deploy gate only exists after merge).
+  // One poll on mount + every 20s; clears when nothing awaits.
   const defHasShip = useMemo(
     () => (getWorkflowDef(workflowDefId).completionRequiresAgentPhases || []).includes("ship"),
     [workflowDefId]
   );
-  const runActive = !!state && state.phase !== "complete" && !state.cancelledAt;
+  // TEAM-3767 F8: use the shared terminal predicate so the epic's HONEST
+  // ship-blocked terminals (deploy-blocked / static-ci-only) stop polling and
+  // never render the amber banner, alongside complete/error/cancelled — a
+  // finished run has no live deploy gate. The distinct cancelledAt timestamp
+  // guard is preserved so a run cancelled before its phase flips to "cancelled"
+  // still stops (no weakening of #293). Active ship-phase runs are unaffected:
+  // !isTerminalPhase("ship") stays true, so they poll + banner exactly as before.
+  const runActive = !!state && !isTerminalPhase(state.phase) && !state.cancelledAt;
   useEffect(() => {
     if (!defHasShip || !runActive) { setDeployGate(null); return; }
     let cancelled = false;

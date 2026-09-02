@@ -58,6 +58,71 @@ describe('F6 — WorkflowBoard header controls gate on the SHARED terminal set',
   });
 });
 
+/**
+ * TEAM-3767 F8 — the THIRD hand-rolled terminal check, added by main's PR #293
+ * (deploy-gate polling): `runActive` gated the /api/pipeline/status poll and the
+ * amber "Deploy gate — awaiting approval" banner on `state.phase !== "complete"`
+ * only. After the epic added the ship-blocked terminals, a deploy-blocked /
+ * static-ci-only run — already finished — would keep polling every 20s and could
+ * still render the banner. The fix routes `runActive` through the shared
+ * isTerminalPhase predicate (same convention as F6's Cancel button), so all of
+ * complete/error/cancelled/deploy-blocked/static-ci-only stop polling and clear
+ * the banner, while active ship-phase runs are unchanged.
+ *
+ * Same source-content convention as F6 above (no render harness for the 4k-line
+ * board); the expected semantics are DERIVED from the shared list so a sixth
+ * terminal phase makes these fail rather than silently pass.
+ */
+describe('F8 — deploy-gate polling gates on the SHARED terminal set (TEAM-3767)', () => {
+  // The poll/banner guard is the `runActive` binding; isolate its definition so
+  // assertions can't be satisfied by the unrelated `isActive` column logic that
+  // legitimately still tests phase !== "complete".
+  const runActiveDef = (() => {
+    const idx = boardContent.indexOf('const runActive =');
+    expect(idx).toBeGreaterThan(-1);
+    return boardContent.slice(idx, boardContent.indexOf(';', idx));
+  })();
+
+  it('runActive is derived from the shared !isTerminalPhase(state.phase) predicate', () => {
+    expect(runActiveDef).toContain('!isTerminalPhase(state.phase)');
+  });
+
+  it('does NOT gate the poll on the old weaker complete-only literal (the F8 bug shape)', () => {
+    expect(runActiveDef).not.toContain('state.phase !== "complete"');
+  });
+
+  it('the poll effect early-returns (no fetch) and clears the banner when !runActive', () => {
+    // `if (!defHasShip || !runActive) { setDeployGate(null); return; }` — so a
+    // terminal run neither fetches /api/pipeline/status nor keeps a banner; the
+    // amber banner only renders from the deployGate state this clears.
+    const effectIdx = boardContent.indexOf('fetch("/api/pipeline/status"');
+    expect(effectIdx).toBeGreaterThan(-1);
+    const before = boardContent.slice(0, effectIdx);
+    const guard = before.slice(before.lastIndexOf('if (!defHasShip'));
+    expect(guard).toContain('!runActive');
+    expect(guard).toContain('setDeployGate(null)');
+    expect(guard).toContain('return;');
+    // The banner itself is downstream of that state — no deployGate, no banner.
+    expect(boardContent).toContain('{deployGate && (');
+  });
+
+  it('every ship-blocked outcome reads terminal → no polling, no banner (deploy-blocked, static-ci-only)', () => {
+    // Because runActive uses isTerminalPhase, each of these forces runActive=false
+    // → the effect clears deployGate and never polls.
+    expect(isTerminalPhase('deploy-blocked')).toBe(true);
+    expect(isTerminalPhase('static-ci-only')).toBe(true);
+    for (const outcome of SHIP_BLOCKED_OUTCOMES) {
+      expect(isTerminalPhase(outcome)).toBe(true);
+    }
+  });
+
+  it('an active ship-phase run still polls + can show the banner (no #293 regression)', () => {
+    // "ship" is not terminal → runActive stays true for a live ship run, so the
+    // deploy-gate poll + amber banner behave exactly as #293 shipped them.
+    expect(isTerminalPhase('ship')).toBe(false);
+  });
+});
+
 describe('F5 — the analyzer EventBridge rule fires on every terminal outcome', () => {
   const deploySh = fs.readFileSync(
     path.join(REPO_ROOT, 'deploy/workflow-manager/deploy.sh'),
