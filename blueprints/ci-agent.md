@@ -26,11 +26,14 @@ The build is not yours to run; it is authoritative and already done. Do this:
 1. Identify the run's SHARED integration branch (`feature/{EPIC}-...`) and its
    head SHA (`git rev-parse` via `claude_code` is fine, or the dev completion
    records).
-2. Read the CodeBuild PR-check for that head SHA. Use the `Pipeline___*` tools
-   if present, else `claude_code` with the authenticated AWS CLI:
-   `aws codebuild list-builds-for-project --project-name agentcore-hub-ci` →
-   `aws codebuild batch-get-builds --ids <recent>` and match the build whose
-   `sourceVersion` is the branch/head SHA. Read `buildStatus` and `logs.deepLink`.
+2. Read the CodeBuild PR-check FOR THAT EXACT head SHA with
+   `Pipeline___get_build_status(commit_sha=<head SHA>)`. It scans recent CI builds
+   and matches on `resolvedSourceVersion` (the real git commit CodeBuild built —
+   NOT `sourceVersion`, which for a PR build can be a `pr/<id>` ref). Use its
+   `match` + `succeededForCommit`: a green build whose `resolvedSourceVersion` is
+   NOT your head SHA does not count. (The coding runtime is denied direct
+   CodeBuild CLI access, so use this tool, not `aws codebuild ...`.) For the
+   failing build's log detail, use `Pipeline___get_build_log`.
 
 ### P2: Verdict
 - **CodeBuild `SUCCEEDED` for the head SHA → PASS.** Record the tested head SHA
@@ -75,10 +78,15 @@ STOP and file a dev ticket instead):**
 2. **Run the tool, don't hand-edit.** Apply the fix by running the formatter/linter
    itself via `claude_code`, never by manually rewriting code. If the tool can't
    fix it automatically (`--fix` leaves errors), it's a dev ticket.
-3. **Re-verify before claiming green.** After the auto-fix commit, the build MUST
-   be re-run and come back `SUCCEEDED` on the new head SHA. A still-red build after
-   one auto-fix pass → stop auto-fixing, file a dev ticket with the residual
-   failures. Never loop auto-fix more than once.
+3. **Re-verify before claiming green — on the NEW head SHA.** After the auto-fix
+   commit+push, get the new head SHA (`git rev-parse HEAD` in the same
+   `claude_code` session), wait for the CI build to run, then confirm with
+   `Pipeline___get_build_status(commit_sha=<new head SHA>)` that
+   `succeededForCommit` is true AND `match.resolvedSourceVersion` equals the new
+   head. "The latest build is green" is NOT enough — it must be green FOR your
+   auto-fix commit. A still-red build (or no build for the new SHA) after one
+   auto-fix pass → stop, file a dev ticket with the residual failures. Never loop
+   auto-fix more than once.
 4. **Commit is visible + attributed.** Commit to the shared integration branch with
    a clear message (`chore(ci): auto-remediate lint/format — <tool>`), push, and
    record the commit SHA + what you ran in your report. The change rides the same
