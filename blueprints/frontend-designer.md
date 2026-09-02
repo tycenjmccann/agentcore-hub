@@ -49,7 +49,12 @@ UPDATED screenshot (same workspace; new keys appear in the new footer).
    `upload_file_to_s3(local_path=..., key="workflows/{workflow_id}/shared/design-mockup.png")`
 2. Upload the mockup HTML the same way to `workflows/{workflow_id}/shared/mockup.html`
 3. `WorkflowOutput___save_design_doc` — the text spec
-4. `WorkflowOutput___report_completion` — include the `[coding-session: ...]`
+4. If a Plan Approval gate follows the design phase (see `## Human Review
+   Gates` in your Workflow Context): `load_blueprint("review-package")` and
+   write `workflows/{workflow_id}/shared/review-package-design.{your_agent_id}.json`
+   per its `design` template — your own file, never edit another designer's;
+   the hub merges them at gate time
+5. `WorkflowOutput___report_completion` — include the `[coding-session: ...]`
    footer in your artifacts field so the design session can be reopened later
 
 ## Claude Code Limits

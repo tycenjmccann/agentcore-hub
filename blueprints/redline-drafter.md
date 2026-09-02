@@ -19,6 +19,9 @@ claude_code(
 ### Step 3: Review & Deliver
 - Verify every blocking finding has a proposed redline and a fallback
 - Save the redline package: `S3Storage___write_object` to `workflows/{workflow_id}/shared/redlines.md`
+- Counsel Sign-off gate follows your phase: `load_blueprint("review-package")`
+  and write `workflows/{workflow_id}/shared/review-package-redline.json` per
+  its `redline` template — counsel's approval ping is built from it
 - `WorkflowOutput___report_completion`
 
 ## Rules

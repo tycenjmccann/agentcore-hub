@@ -108,6 +108,10 @@ a full duplicate set of tickets that wedges the whole run:
   - If you find a duplicate assignee/tier, do NOT proceed silently: `Tickets___add_comment` on the
     epic flagging the duplicate ticket keys, and report the anomaly in `report_completion` so a human
     can cancel the extra chain.
+- If a Spec Approval gate follows your phase (see `## Human Review Gates` in
+  your Workflow Context): `load_blueprint("review-package")` and write
+  `workflows/{workflow_id}/shared/review-package-requirements.json` per its
+  `requirements` template — the human's approval ping is built from it
 - `WorkflowOutput___report_completion`
 
 ## Rules

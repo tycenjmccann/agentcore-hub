@@ -10,7 +10,7 @@ import {
   Send,
   ExternalLink,
 } from "lucide-react";
-import type { JiraTicket, TicketStatus, TicketType } from "@/lib/workflow/types";
+import type { HumanNotification, JiraTicket, TicketStatus, TicketType } from "@/lib/workflow/types";
 
 // ─── Props ──────────────────────────────────────────────────────────────────
 
@@ -19,6 +19,9 @@ interface TicketDetailModalProps {
   workflowId: string;
   isOpen: boolean;
   onClose: () => void;
+  /** review_needed notification for this ticket, when it's a human gate —
+   *  renders the review package (summary/bullets/links) above the description. */
+  reviewNotification?: HumanNotification | null;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -263,6 +266,7 @@ export default function TicketDetailModal({
   workflowId,
   isOpen,
   onClose,
+  reviewNotification,
 }: TicketDetailModalProps) {
   const [ticket, setTicket] = useState<JiraTicket | null>(null);
   const [allTickets, setAllTickets] = useState<JiraTicket[]>([]);
@@ -579,6 +583,39 @@ export default function TicketDetailModal({
                 <div className="px-5 pt-3 pb-2 flex items-center gap-2 text-[11px]">
                   <span className="text-muted">Assigned to</span>
                   <span className="text-secondary font-medium">{formatAgentName(ticket.assignee)}</span>
+                </div>
+              )}
+
+              {/* ─── Review package (human gate) ─── */}
+              {reviewNotification?.summary && (
+                <div className="px-5 py-3 border-b border-theme bg-purple-500/5">
+                  <p className="text-[10px] uppercase tracking-wider text-purple-600 dark:text-purple-300 mb-1.5">
+                    Review package
+                  </p>
+                  <p className="text-[12px] text-secondary leading-relaxed mb-1.5">
+                    {reviewNotification.summary}
+                  </p>
+                  {(reviewNotification.bullets?.length ?? 0) > 0 && (
+                    <ul className="text-[12px] text-secondary space-y-0.5 mb-2 list-disc pl-4">
+                      {reviewNotification.bullets!.map((b, i) => <li key={i}>{b}</li>)}
+                    </ul>
+                  )}
+                  {(reviewNotification.links?.length ?? 0) > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {reviewNotification.links!.map((l, i) => (
+                        <a
+                          key={i}
+                          href={l.url || `/workflow?id=${encodeURIComponent(workflowId)}&artifact=${encodeURIComponent(l.artifactKey || "")}`}
+                          target={l.url ? "_blank" : undefined}
+                          rel={l.url ? "noopener noreferrer" : undefined}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded border border-theme text-[11px] text-secondary hover:text-primary hover:border-purple-400 transition-colors"
+                        >
+                          <ExternalLink className="w-3 h-3" />
+                          {l.label}
+                        </a>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 

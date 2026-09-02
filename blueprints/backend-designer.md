@@ -50,7 +50,13 @@ Execute these steps IN ORDER — do not skip any:
 1. **Upload diagram**: `download_s3_file(<key>)` then
    `upload_file_to_s3(local_path=..., key="workflows/{workflow_id}/shared/architecture-diagram.png")`
 2. **Save design doc**: `WorkflowOutput___save_design_doc`
-3. **Report completion**: `WorkflowOutput___report_completion` — include the
+3. **Review package**: if a Plan Approval gate follows the design phase (see
+   `## Human Review Gates` in your Workflow Context),
+   `load_blueprint("review-package")` and write
+   `workflows/{workflow_id}/shared/review-package-design.{your_agent_id}.json`
+   per its `design` template — your own file, never edit another designer's;
+   the hub merges them at gate time
+4. **Report completion**: `WorkflowOutput___report_completion` — include the
    `[coding-session: ...]` footer in your artifacts field — then STOP. Do not
    add any text after this call.
 

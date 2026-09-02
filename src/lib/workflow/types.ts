@@ -275,6 +275,14 @@ export type NotificationType =
   | "pr_ready"
   | "error";
 
+/** Curated link in a review package — artifactKey opens the hub's artifact
+ *  viewer (/workflow?id=X&artifact=<key>), url is external (PR, preview). */
+export interface ReviewPackageLink {
+  label: string;
+  url?: string;
+  artifactKey?: string;
+}
+
 export interface HumanNotification {
   id: string;
   type: NotificationType;
@@ -282,6 +290,14 @@ export interface HumanNotification {
   details: string;
   timestamp: string;
   acknowledged: boolean;
+  /** review_needed only — set when the pre-gate agent wrote a review package
+   *  (blueprints/review-package.md); consumers fall back to `details`. */
+  ticketId?: string;
+  reviewer?: string;
+  gate?: string;
+  summary?: string;
+  bullets?: string[];
+  links?: ReviewPackageLink[];
 }
 
 // One dispatch of an agent within a workflow — its own ticket, streamed text,

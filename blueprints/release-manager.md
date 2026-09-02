@@ -180,7 +180,8 @@ missing = empty state, round 1):
      filed as backlog; they do NOT block. Post the review summary as a PR
      comment (what you checked, why it is sound, and the advisory list) AND
      write it to `workflows/{workflow_id}/shared/ship-review-summary.md`, write
-     the ledger, then write the **Merge Brief** (Step 5), and finally
+     the ledger, then write the **Merge Brief** (Step 5) and the **review
+     package** (Step 6), and finally
      `WorkflowOutput___report_completion` with the PR URL +
      head SHA. This Dones your ticket and un-parks the Merge Approval gate: a
      human approves or rejects the merge — that is their call, not yours.
@@ -279,7 +280,7 @@ title.
     `ship-review-summary.md` with verdict `PASS-with-known-findings`, the open
     findings, and a link to the escalation digest; post the PR summary comment;
     write the **Merge Brief** (Step 5) with the open findings under ⚠ NEEDS
-    YOUR ATTENTION; then
+    YOUR ATTENTION and the **review package** (Step 6); then
     `report_completion` with PR URL + head SHA. NO new fix tickets — the Merge
     Approval gate un-parks and the human owns the merge, exactly as a normal
     PASS.
@@ -421,6 +422,14 @@ Rules for the brief:
   link, don't inline.
 - On a PASS-with-known-findings, the brief's ⚠ NEEDS YOUR ATTENTION section
   MUST list the accepted open findings and link the escalation digest.
+
+### Step 6: Review package — the Merge Approval ping
+`load_blueprint("review-package")` and write
+`workflows/{workflow_id}/shared/review-package-ship.json` per its `ship`
+template. The Merge Approval ping the human receives (summary, bullets, PR
+link) is built from this file — without it the ping is a bare template with
+no context. The package is the phone-sized distillation of the Merge Brief:
+same decision, PR link first, then `shared/ship-review-summary.md`.
 
 ---
 
