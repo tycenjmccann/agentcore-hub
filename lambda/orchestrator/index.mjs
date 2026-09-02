@@ -208,7 +208,10 @@ const FALLBACK_WORKFLOW_DEF = {
 
 let _workflowDefs = null;
 
-async function loadWorkflowDefs() {
+// Exported for tests to seed a ship-phase def (completion-gates.test.mjs drives
+// the TEAM-3721 merge gate, which only engages for defs whose
+// completionRequiresAgentPhases includes "ship").
+export async function loadWorkflowDefs() {
   if (_workflowDefs) return _workflowDefs;
   _workflowDefs = { [DEFAULT_WORKFLOW_DEF_ID]: FALLBACK_WORKFLOW_DEF };
   if (!ARTIFACT_BUCKET) return _workflowDefs;
@@ -2099,6 +2102,20 @@ export async function completeWorkflow(workflow) {
     console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
   }
 
+  // ── TEAM-3760: TWO ship gates run here, in this order, both at full strength.
+  //   1. TEAM-3747 D2 ship-verdict gate (below): INTERNAL evidence, fail-CLOSED.
+  //      A done ship ticket with no merge/deploy verdict closes the run on an
+  //      honest TERMINAL outcome (deploy-blocked / static-ci-only).
+  //   2. TEAM-3721 SHIP_MERGE_VERIFY gate (after it): EXTERNAL GitHub ground
+  //      truth, fail-OPEN. A branch PROVABLY unmerged leaves the run OPEN
+  //      (workflow.cd_unmerged) for the RM/WM to repair.
+  // D2 must run first: it terminally closes the "nothing recorded shipped" runs,
+  // so merge-verify only ever sees runs whose recorded evidence CLAIMS a ship —
+  // and then cross-checks that claim against GitHub. Reversed, an unmerged run
+  // with no ship verdict would be left open by gate 2 and never reach gate 1 —
+  // exactly the silent CD dead-zone stall D2 exists to kill. (D2 first is also
+  // free: local reads, no GitHub call, for runs that will terminally close.)
+
   // TEAM-3747 D2 — ship/CD merge-verdict gate: NO green close over unshipped work.
   // If the def has a ship phase, a done ship ticket must carry a merge/deploy
   // verdict (merge commit) OR an explicit deploy-blocked outcome. When neither is
@@ -2136,6 +2153,42 @@ export async function completeWorkflow(workflow) {
     // Never let the ship-verdict resolution itself turn a legitimate completion
     // into a stall — it only diverts when it can prove work never shipped.
     console.warn(`[orchestrator] ship-verdict check skipped for ${workflow.id}: ${err?.message || err}`);
+  }
+
+  // Ship-phase merge gate (TEAM-3721 CD dead-zone): a def with a "ship" phase
+  // has the release manager own the merge, and the CD ticket can be marked done
+  // even though the PR was never actually merged (RM BLOCKs in preflight, or the
+  // merge step silently no-ops). Trusting ticket status alone let such a run
+  // finalize as "complete" with main untouched — the exact false-complete we hit.
+  // Before claiming completion, verify against GitHub that the feature branch is
+  // truly merged. Not merged → abort completion so the run stays open (the CD
+  // ticket / WM surfaces it) instead of lying. Best-effort: a GitHub/API failure
+  // (or no PAT) never blocks a legitimate completion — it only tightens when it
+  // can PROVE the branch is unmerged. Opt-out: SHIP_MERGE_VERIFY=off.
+  const shipMergeVerify = !["off", "false", "0"].includes(
+    String(process.env.SHIP_MERGE_VERIFY || "").trim().toLowerCase()
+  );
+  if (
+    shipMergeVerify &&
+    defHasShipPhase(workflow) &&
+    workflow.featureBranch &&
+    workflow.repoConfig &&
+    process.env.GITHUB_PAT
+  ) {
+    const unmerged = await featureBranchUnmerged(workflow);
+    if (unmerged) {
+      console.error(
+        `[orchestrator] CompletionRejectedUnmergedBranch ${workflow.id}: ` +
+          `feature branch ${workflow.featureBranch} is not merged into the base ` +
+          `(${unmerged}). CD did not land the merge — leaving run open.`
+      );
+      await publishEvent(workflow.epicId, "workflow.cd_unmerged", {
+        workflowId: workflow.id,
+        featureBranch: workflow.featureBranch,
+        reason: unmerged,
+      });
+      return;
+    }
   }
 
   // Atomic completion claim FIRST — only the winner runs the side effects
@@ -3167,6 +3220,54 @@ async function listReviewers(role) {
 // completion silently failed. That single silent WARN is what degraded runs
 // into one-branch-per-ticket + one-PR-per-ticket. The Lambda proxy is kept as
 // a fallback for installs that do deploy it.
+
+// True when this workflow's def declares a "ship" completion phase (the release
+// manager owns the merge). Used by the ship-phase merge gate in completeWorkflow.
+function defHasShipPhase(workflow) {
+  return (
+    getWorkflowDef(workflow?.workflowDefId).completionRequiresAgentPhases || []
+  ).includes("ship");
+}
+
+// Ship-phase merge gate helper (TEAM-3721). Returns a short reason string when
+// the feature branch is PROVABLY not merged into the base branch, else "" (merged
+// or can't-tell). Squash merges leave the branch commits absent from base, so we
+// trust the PR's `merged` flag first (authoritative for both squash and merge
+// commits); only if no PR is found do we fall back to the compare API. Any API
+// error returns "" (fail-open — never block a legitimate completion on a transient).
+async function featureBranchUnmerged(workflow) {
+  try {
+    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+    const base = workflow.repoConfig.repos?.[0]?.defaultBranch || "main";
+    const head = workflow.featureBranch;
+
+    // 1) Authoritative: any PR from this head that is merged?
+    const prs = await githubApi(
+      `/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(head)}&state=all&per_page=20`
+    );
+    if (Array.isArray(prs) && prs.length > 0) {
+      if (prs.some((p) => p.merged_at)) return ""; // merged — clean
+      // PRs exist but none merged. Still cross-check compare in case the branch
+      // was merged via a differently-headed PR / direct push.
+    }
+
+    // 2) Fallback: does base already contain the head? compare status
+    //    "identical" or "behind" means head is an ancestor of base (merged).
+    const cmp = await githubApi(
+      `/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`
+    );
+    // status is head-relative to base: "behind"/"identical" → head ⊆ base (merged);
+    // "ahead"/"diverged" → head has commits not in base (not merged).
+    if (cmp?.status === "identical" || cmp?.status === "behind") return "";
+    if (cmp?.status === "ahead" || cmp?.status === "diverged") {
+      return `branch ${cmp.ahead_by} commit(s) ahead of ${base} (status=${cmp.status})`;
+    }
+    return ""; // unknown status — fail open
+  } catch (err) {
+    console.warn(`[orchestrator] merge-verify skipped for ${workflow.id}: ${err.message}`);
+    return ""; // fail open
+  }
+}
 
 async function githubApi(path, method = "GET", body = null) {
   const pat = process.env.GITHUB_PAT;

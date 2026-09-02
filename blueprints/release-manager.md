@@ -464,41 +464,56 @@ deploy contract. Nothing else.
 
 ### Pipeline mode (trigger + watch) — only when `PIPELINE_ENABLED`
 
-1. **Preflight (still applies):** read `DEPLOY.md` at the repo root and confirm
-   a pipeline is configured for this repo (the `Pipeline___*` tools resolve, or
-   `aws codepipeline get-pipeline --name agentcore-hub-deploy` succeeds). No
-   `DEPLOY.md` OR no pipeline configured → **BLOCKED**, do NOT merge. Verify the
-   PR head SHA still equals the ship-review / merge-gate SHA; drift → BLOCKED.
+You drive the pipeline through the **`Pipeline___*` tools** — NOT shell. The
+coding runtime's IAM role is AccessDenied on CodePipeline/CodeBuild, so
+`aws codepipeline ...` in `claude_code` will fail; that is why these tools exist.
+Use them directly (they are in your tool list).
+
+1. **Preflight:** call `Pipeline___get_state`. `configured:false` → **BLOCKED**,
+   do NOT merge (file a ticket: "No deploy pipeline configured for {repo}").
+   Also verify the PR head SHA still equals the ship-review / merge-gate SHA;
+   drift → BLOCKED. (Reading `DEPLOY.md` for context is fine, but the pipeline —
+   not DEPLOY.md — is the deploy authority in this mode.)
 2. **Merge:** via `claude_code` (`gh` authenticated): `gh pr merge <n> --squash`.
    Record the merge commit SHA. Conflict / failed required check → BLOCKED, file
-   a fix ticket, never force.
-3. **Deploy = the pipeline, not you.** The merge to the default branch triggers
-   the CodePipeline Source stage. (If it does not auto-trigger, start it:
-   `aws codepipeline start-pipeline-execution --name agentcore-hub-deploy`.) The
-   **app** pipeline runs Build → its own ManualApproval → Deploy (Lambda code +
-   S3 config + ECS roll) → smoke checks, under its IAM role. You do NOT run any
-   deploy command yourself — the role is what keeps orchestrator config (Jira
-   creds) safe, and running commands here would bypass build-once/promote-by-
+   a fix ticket, never force. **You MUST complete the merge — a CD ticket left
+   un-merged is the dead-zone the completion gate now catches and refuses to
+   finalize. If you cannot merge, report BLOCKED explicitly; never report
+   completion as if the merge happened.**
+3. **Trigger the deploy:** the merge does NOT auto-trigger the pipeline (the
+   GitHub push webhook is not wired), so call `Pipeline___start_deploy` after the
+   merge lands. Record the returned `pipelineExecutionId`. The **app** pipeline
+   runs Build (+ its own manifest/scope gates) → ManualApproval (deploy gate) →
+   Deploy (Lambda code + S3 config + ECS roll) → smoke checks, under its IAM
+   role. You do NOT run any deploy command yourself — the role is what keeps
+   orchestrator config (Jira creds) safe and preserves build-once/promote-by-
    digest.
-4. **Fleet/eval changes are a SEPARATE handoff.** The app pipeline deploys ONLY
-   the app targets; it BLOCKS if the changeset touches fleet/eval-infra
-   (DEPLOY.md steps 4-9: `deploy/runtime-agent/`, `blueprints/`,
-   `deploy/evaluations/`, `lambda/eval-packager/`). If your PR touched those, the
-   pipeline's Deploy stage fails with a BLOCKED message naming the files — treat
-   that as expected: report the app deploy result AND that steps 4-9 need the
-   fleet+eval pipeline (once stood up) or a human to run them per DEPLOY.md. Do
-   NOT try to run steps 4-9 yourself.
-5. **Watch to terminal:** poll `aws codepipeline get-pipeline-state --name
-   agentcore-hub-deploy` (or `Pipeline___*`) until every stage is Succeeded or
-   one Failed. The pipeline's own approval action is a SECOND gate beyond the
-   merge gate — surface that it is waiting so a human can approve the deploy of
-   the built artifacts.
+4. **Watch to terminal:** poll `Pipeline___get_state` until `terminal:true`.
+   - **Build FAILED** → call `Pipeline___get_build_log` (pass the failing
+     action's `externalExecutionId` from `actionDetails` as `build_id`). Read the
+     phase contexts + log tail, then **file a precise fix ticket** (file:line +
+     the failing command) routed back to the bug_fixer/dev — do NOT hand-fix the
+     deploy yourself. When that fix merges to the default branch, call
+     `Pipeline___start_deploy` again to re-run. This trigger→watch→fix→re-run
+     loop is YOURS to own until the pipeline is green or a fix is genuinely
+     blocked.
+   - **ManualApproval waiting** (`Approve_deploy` InProgress) → this is a SECOND
+     gate beyond the merge gate: a HUMAN approves the deploy (bridged to
+     Telegram). Surface that it is waiting; do NOT approve it — you have no
+     approval tool and must never approve your own deploy.
+   - **Deploy FAILED** → verdict FAIL with the stage's log link + a fix ticket.
+5. **Fleet/eval changes are a SEPARATE handoff.** The app pipeline deploys ONLY
+   the app targets; its Deploy stage BLOCKS if the changeset touches fleet/eval-
+   infra (DEPLOY.md steps 4-9: `deploy/runtime-agent/`, `blueprints/`,
+   `deploy/evaluations/`, `lambda/eval-packager/`). If your PR touched those,
+   treat the BLOCK as expected: report the app deploy result AND that steps 4-9
+   need the fleet+eval pipeline (once stood up) or a human per DEPLOY.md. Do NOT
+   try to run steps 4-9 yourself.
 6. **Report:** `WorkflowOutput___report_completion` with the merge SHA, the
-   pipeline execution id, each stage's status, the smoke-check outcome from the
-   Deploy stage log, and (if the pipeline ran rollback) the rollback status. A
-   stage failure → verdict FAIL with the failing stage's log link + a fix ticket;
-   a fleet/eval BLOCK → note it per step 4. Do NOT improvise a manual deploy to
-   "help" a failed pipeline.
+   `pipelineExecutionId`, each stage's terminal status, the smoke-check outcome,
+   and (if rollback ran) its status. A stage failure → verdict FAIL with the
+   failing stage's log link + the fix ticket you filed. Do NOT improvise a manual
+   deploy to "help" a failed pipeline.
 
 ---
 

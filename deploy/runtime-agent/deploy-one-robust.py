@@ -54,6 +54,7 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         "AWS_REGION": "us-east-1",
         "EVENTS_TABLE": "agentcore-hub-events",
         "TICKET_TOOLS_LAMBDA": os.environ.get("TICKET_TOOLS_LAMBDA", "agentcore-hub-jira"),
+        "PIPELINE_TOOLS_LAMBDA": os.environ.get("PIPELINE_TOOLS_LAMBDA", "agentcore-hub-pipeline-tools"),
         "AGENTCORE_HUB_ARTIFACT_BUCKET": os.environ["ARTIFACT_BUCKET"],
         "CLAUDE_CODE_USE_BEDROCK": "1",
         "CLAUDE_MODEL": "us.anthropic.claude-fable-5",
