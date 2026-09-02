@@ -42,6 +42,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReviewCap } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets } from "./completion.mjs";
+import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -1952,13 +1953,6 @@ async function blockTicketForFailedInvoke(ticketId, reason) {
 }
 
 // ─── Context Builder ───────────────────────────────────────────────────────────
-
-// TEAM-3738: deploy.sh forwards PIPELINE_ENABLED verbatim, so whitespace or
-// casing variants ("1 ", " true", "TRUE") must not be silently read as disabled.
-export function isPipelineEnabled(raw) {
-  const v = (raw ?? "").trim().toLowerCase();
-  return v === "1" || v === "true";
-}
 
 async function buildAgentContext(ticket, workflow) {
   let context = `# Your Assignment: ${ticket.title}\n\n`;

@@ -79,8 +79,9 @@ export default defineConfig({
       "lambda/agentcore-hub-tickets/index.test.mjs",
       // pipeline-enabled (TEAM-3738, same defect class as TEAM-3723) — the
       // orchestrator's PIPELINE_ENABLED predicate that gates the "## Pipeline
-      // Mode" context block. index.mjs imports cleanly with no AWS mocks needed
-      // (clients are constructed lazily); isPipelineEnabled is pure, no I/O.
+      // Mode" context block. Lives in its own side-effect-free pipeline-enabled.mjs
+      // (TEAM-3744) so this test never imports index.mjs's module-load AWS
+      // client construction; isPipelineEnabled is pure, no I/O.
       "lambda/orchestrator/pipeline-enabled.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.

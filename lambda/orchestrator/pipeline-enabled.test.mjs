@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isPipelineEnabled } from "./index.mjs";
+import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 
 /**
  * TEAM-3738 (same defect class as TEAM-3723): deploy.sh forwards PIPELINE_ENABLED
