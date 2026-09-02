@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createCascade } from "./cascade.mjs";
+import { createCascade, normalizeExtendedMode } from "./cascade.mjs";
 
 /**
  * TEAM-3618 D3 — the shared unblock cascade. Both "ticket done" paths
@@ -621,5 +621,211 @@ describe("Finding 3 — bounded stale-GSI retry", () => {
     expect(unblocked).toEqual(["TEAM-2"]);
     expect(getChildTickets).toHaveBeenCalledTimes(1);
     expect(sleep).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * TEAM-3747 D1 — the extended-state path is now a tri-state safe rollout
+ * (off | shadow | enforce, fail-safe default shadow) mirroring
+ * DEAD_SESSION_DETECTOR_MODE. These blocks pin:
+ *   - normalizeExtendedMode's exact coercion table (the ONE place mode is decided);
+ *   - AC-D1.1: a parked in_progress dependent whose LAST blocker closes is
+ *     re-dispatched EXACTLY once under enforce, and CascadeRedispatch == 1;
+ *   - AC-D1.3: the same dependent under a LIVE lease — zero steal, zero
+ *     re-dispatch, exactly one orchestrator.nudge, CascadeRedispatch == 0;
+ *   - shadow — the extended path is fully evaluated + would-* metrics are
+ *     emitted, but ZERO state-mutating effects fire (no steal / redispatch /
+ *     nudge / reawaken, no ticket write).
+ */
+describe("TEAM-3747 D1 — normalizeExtendedMode coercion table", () => {
+  it("legacy boolean true → enforce", () => {
+    expect(normalizeExtendedMode(true)).toBe("enforce");
+  });
+
+  it("unset (undefined / null / empty string) and false → off", () => {
+    expect(normalizeExtendedMode(undefined)).toBe("off");
+    expect(normalizeExtendedMode(null)).toBe("off");
+    expect(normalizeExtendedMode("")).toBe("off");
+    expect(normalizeExtendedMode(false)).toBe("off");
+  });
+
+  it("legacy string truthies on / true / 1 → enforce (case + whitespace tolerant)", () => {
+    expect(normalizeExtendedMode("on")).toBe("enforce");
+    expect(normalizeExtendedMode("true")).toBe("enforce");
+    expect(normalizeExtendedMode("1")).toBe("enforce");
+    expect(normalizeExtendedMode("  ON  ")).toBe("enforce");
+    expect(normalizeExtendedMode("True")).toBe("enforce");
+  });
+
+  it("canonical off / shadow / enforce pass through (case + whitespace tolerant)", () => {
+    expect(normalizeExtendedMode("off")).toBe("off");
+    expect(normalizeExtendedMode("shadow")).toBe("shadow");
+    expect(normalizeExtendedMode("enforce")).toBe("enforce");
+    expect(normalizeExtendedMode(" SHADOW ")).toBe("shadow");
+    expect(normalizeExtendedMode("Enforce")).toBe("enforce");
+  });
+
+  it("anything unrecognized fails SAFE to shadow (observe-only)", () => {
+    expect(normalizeExtendedMode("enfrce")).toBe("shadow");
+    expect(normalizeExtendedMode("garbage")).toBe("shadow");
+    expect(normalizeExtendedMode("0")).toBe("shadow");
+    expect(normalizeExtendedMode("no")).toBe("shadow");
+    expect(normalizeExtendedMode(42)).toBe("shadow");
+  });
+
+  it("createCascade surfaces the normalized mode on extendedMode", () => {
+    expect(createCascade(makeExtDeps({ extendedStates: "enforce" }).deps).extendedMode).toBe("enforce");
+    expect(createCascade(makeExtDeps({ extendedStates: "shadow" }).deps).extendedMode).toBe("shadow");
+    expect(createCascade(makeExtDeps({ extendedStates: "off" }).deps).extendedMode).toBe("off");
+    expect(createCascade(makeExtDeps({ extendedStates: "gibberish" }).deps).extendedMode).toBe("shadow");
+  });
+});
+
+describe("TEAM-3747 D1 — AC-D1.1: enforce re-dispatches a parked in_progress dependent exactly once", () => {
+  it("last blocker done → steal the stale generation + redispatch once; CascadeRedispatch == 1", async () => {
+    // A ship-phase dependent parked in_progress on a stale lease, its ONLY
+    // blocker just closed. Under enforce this is the missed-unblock recovery.
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    ];
+    const { deps, ddb, publishEvent, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      extendedStates: "enforce",
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock, extendedMode } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    expect(extendedMode).toBe("enforce");
+    // Exactly one steal on the exact claim generation, then exactly one dispatch.
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(lease.stealClaim).toHaveBeenCalledWith(deps.ddb, "workflows", "wf_1", "TEAM-2", STALE_STARTED);
+    expect(redispatch).toHaveBeenCalledTimes(1);
+    expect(redispatch.mock.calls[0][1].ticketId).toBe("TEAM-2");
+    // A re-dispatch is NOT a Ready transition → no orchestrator.nudge, no board write.
+    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(0);
+    expect(statusWrites(ddb)).toHaveLength(0);
+    // The metric proves exactly one recovery.
+    expect(records).toHaveLength(1);
+    expect(records[0].CascadeRedispatch).toBe(1);
+    expect(records[0].CascadeNudgeLiveLease).toBe(0);
+  });
+});
+
+describe("TEAM-3747 D1 — AC-D1.3: a LIVE lease is nudge-only (never re-dispatched)", () => {
+  it("live lease → zero steal, zero redispatch, exactly one nudge; CascadeRedispatch == 0", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    ];
+    const { deps, ddb, publishEvent, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      extendedStates: "enforce",
+      lease: { isLeaseLive: vi.fn(() => true) },
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    const nudges = eventsOfType(publishEvent, "orchestrator.nudge");
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0][2]).toMatchObject({ agentId: "dev", unblockedBy: DONE, workflowId: "wf_1" });
+    expect(statusWrites(ddb)).toHaveLength(0);
+    expect(records).toHaveLength(1);
+    expect(records[0].CascadeRedispatch).toBe(0);
+    expect(records[0].CascadeNudgeLiveLease).toBe(1);
+    expect(records[0].CascadeSkippedLiveLease).toBe(1);
+  });
+});
+
+describe("TEAM-3747 D1 — shadow mode evaluates + emits would-* metrics but writes NOTHING", () => {
+  it("stale in_progress → would-steal + would-redispatch metrics, ZERO writes", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    ];
+    const { deps, ddb, publishEvent, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      extendedStates: "shadow",
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock, extendedMode } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    expect(extendedMode).toBe("shadow");
+    expect(unblocked).toEqual([]);
+    // The path is EVALUATED (liveness is read) but NO state-mutating effect fires.
+    expect(lease.lastAgentActivity).toHaveBeenCalledTimes(1);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(0);
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+    expect(statusWrites(ddb)).toHaveLength(0);
+    // …but the shadow would-* counters were emitted.
+    expect(records).toHaveLength(1);
+    expect(records[0].CascadeWouldSteal).toBe(1);
+    expect(records[0].CascadeWouldRedispatch).toBe(1);
+    expect(records[0].CascadeRedispatch).toBe(0);
+  });
+
+  it("live in_progress → would-nudge + skipped-live-lease metrics, ZERO nudge published", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      extendedStates: "shadow",
+      lease: { isLeaseLive: vi.fn(() => true) },
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(0);
+    expect(records).toHaveLength(1);
+    expect(records[0].CascadeWouldNudge).toBe(1);
+    expect(records[0].CascadeSkippedLiveLease).toBe(1);
+    expect(records[0].CascadeNudgeLiveLease).toBe(0);
+  });
+
+  it("shadow in_review → would-reawaken metric, reawakenGate never called, no event", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      extendedStates: "shadow",
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    expect(reawakenGate).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+    expect(records).toHaveLength(1);
+    expect(records[0].CascadeWouldReviewReawaken).toBe(1);
+    expect(records[0].CascadeReviewReawaken).toBe(0);
   });
 });
