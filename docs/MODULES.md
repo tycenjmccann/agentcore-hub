@@ -244,6 +244,58 @@ See [mcp/hub/README.md](../mcp/hub/README.md).
 
 ---
 
+## Module: Pipeline (optional)
+
+AWS-native CI/CD for a repo the hub builds into (pilot: the hub's own repo). A
+bolt-on that moves the deterministic build/test/deploy work OUT of the SDLC
+agents and INTO CodeBuild + CodePipeline, so the agents only author/judge/react.
+Full design + rationale: [`cicd-pipeline-module-design.md`](./cicd-pipeline-module-design.md).
+
+**Gated + inert by default.** Nothing runs unless you both deploy the CDK stack
+AND set the enable flags. With them unset the `/pipeline` nav entry is hidden and
+the CI/QA/release-manager blueprints run their legacy self-build path unchanged.
+
+**UI routes**
+- `src/app/pipeline/` — read-only status board (CI builds + deploy pipeline stages).
+
+**API routes** (under `src/app/api/pipeline/`)
+- `/status` — recent CodeBuild builds + CodePipeline stage state (pure reads).
+
+**Lib**
+- `src/lib/pipeline/status.ts` — CodeBuild + CodePipeline SDK reads (server-side).
+
+**Infra (CDK, self-contained)** — `deploy/pipeline/`:
+- `bin/pipeline.ts` + `lib/pipeline-stack.ts` — CodeConnections link, CI CodeBuild
+  (PR check → required commit status), Build + Deploy CodeBuild projects,
+  CodePipeline (Source → Build → ManualApproval/SNS → Deploy), scoped IAM,
+  cdk-nag. Imports NOTHING from `src/`.
+- `buildspec-ci.yml` (gates + build-once artifact emission), `buildspec-deploy.yml`
+  (the 3-target `DEPLOY.md`, promote-by-digest, smoke checks).
+- `merge-agents-json.py` (single source of the agents.json merge, extracted from
+  `DEPLOY.md`), `ecs-primary-container.py`, `deploy.sh`. See
+  [`deploy/pipeline/README.md`](../deploy/pipeline/README.md).
+
+**AWS services** — CodeConnections, CodeBuild, CodePipeline, SNS (approval),
+CloudWatch Logs. Deploy role is deliberately narrow (Lambda code-only, no
+`UpdateFunctionConfiguration`, no `iam:*`).
+
+**Enable flags**
+- `NEXT_PUBLIC_PIPELINE_ENABLED=1` — shows the `/pipeline` nav entry + tab (app).
+- `PIPELINE_ENABLED=1` — on the fleet/orchestrator context: CI/QA/release-manager
+  blueprints read pipeline results instead of shelling builds.
+
+**Removing the module**
+- Delete the `/pipeline` nav entry tagged `module: "pipeline"` (and the
+  `enabledBy`/`moduleEnabled` gating) in `src/config/modules.ts`
+- `rm -rf src/app/pipeline src/app/api/pipeline src/lib/pipeline deploy/pipeline`
+- Drop `@aws-sdk/client-codebuild` + `@aws-sdk/client-codepipeline` from
+  `package.json` if nothing else uses them
+- Revert the `PIPELINE_ENABLED` blocks in `blueprints/{ci-agent,qa-verifier,release-manager}.md`
+- If deployed: `cdk destroy` the `AgentcoreHubPipeline` stack
+- `npx tsc --noEmit && npm run build`
+
+---
+
 ## Shared seams
 
 These are the three places where modules touch shared ground. A cherry-picker

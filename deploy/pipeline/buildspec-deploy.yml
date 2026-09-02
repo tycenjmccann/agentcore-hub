@@ -1,0 +1,73 @@
+# buildspec-deploy.yml — the Deploy stage. The machine form of DEPLOY.md's
+# three targets, run under the pipeline's NARROW IAM role (no laptop, no
+# tycenj-prod profile, Jira creds never touched — the role literally cannot
+# UpdateFunctionConfiguration). Consumes the Build stage's artifacts by digest;
+# it never rebuilds. See docs/cicd-pipeline-module-design.md §6.
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - node --version
+
+  pre_build:
+    commands:
+      - ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+      # Account guard — mirror deploy/config.sh: refuse a wrong account.
+      - |
+        if [ -n "${EXPECTED_ACCOUNT_ID:-}" ] && [ "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT_ID" ]; then
+          echo "ERROR: account $ACCOUNT_ID != EXPECTED_ACCOUNT_ID $EXPECTED_ACCOUNT_ID" >&2; exit 1
+        fi
+      - IMAGE_DIGEST="$(cat pipeline-out/image-digest.txt)"
+      - GIT_SHA="$(cat pipeline-out/git-sha.txt)"
+      - ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
+      - echo "Promoting image ${ECR_URI}@${IMAGE_DIGEST} (built from ${GIT_SHA})"
+
+  build:
+    commands:
+      # ── Target 1: orchestrator Lambda — CODE ONLY (prebuilt zip from Build stage) ──
+      - echo "── Target 1/3: orchestrator Lambda (code-only) ──"
+      - aws lambda update-function-code --function-name agentcore-hub-orchestrator
+          --zip-file fileb://pipeline-out/orchestrator.zip --region "$AWS_REGION_HUB"
+      - aws lambda wait function-updated --function-name agentcore-hub-orchestrator --region "$AWS_REGION_HUB"
+
+      # ── Target 2: config/blueprints → S3 (agents.json MERGED, never cp'd) ──
+      - echo "── Target 2/3: config + blueprints → S3 ──"
+      - aws s3 sync blueprints/ "s3://$ARTIFACT_BUCKET/blueprints/"
+      - aws s3 sync deploy/runtime-agent/prompts/ "s3://$ARTIFACT_BUCKET/prompts/" || true
+      - aws s3 cp src/config/workflows.json "s3://$ARTIFACT_BUCKET/config/workflows.json"
+      - aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" /tmp/agents-s3.json
+      - python3 deploy/pipeline/merge-agents-json.py /tmp/agents-s3.json src/config/agents.json /tmp/agents-merged.json
+      - aws s3 cp /tmp/agents-merged.json "s3://$ARTIFACT_BUCKET/config/agents.json"
+
+      # ── Target 3: ECS Express app — roll to the promoted image BY DIGEST ──
+      - echo "── Target 3/3: ECS Express roll-by-digest ──"
+      - |
+        if [ -n "${ECS_SERVICE_ARN:-}" ]; then
+          # Reuse the live container env/roles; swap only the image to the digest.
+          DESC="$(aws ecs describe-express-gateway-service --service-arn "$ECS_SERVICE_ARN" --region "$AWS_REGION_HUB" --output json)"
+          PRIMARY="$(python3 deploy/pipeline/ecs-primary-container.py "$DESC" "${ECR_URI}@${IMAGE_DIGEST}")"
+          aws ecs update-express-gateway-service --service-arn "$ECS_SERVICE_ARN" \
+            --region "$AWS_REGION_HUB" --primary-container "$PRIMARY" --output text >/dev/null
+          echo "ECS roll started to ${ECR_URI}@${IMAGE_DIGEST}"
+        else
+          echo "ECS_SERVICE_ARN unset — skipping app roll (Lambda/blueprint-only deploy)."
+        fi
+
+  post_build:
+    commands:
+      - echo "── Smoke checks (DEPLOY.md) ──"
+      # Orchestrator healthy on the new code (guards the INIT-crash class).
+      - |
+        aws lambda invoke --function-name agentcore-hub-orchestrator \
+          --payload "$(printf '{}' | base64)" --region "$AWS_REGION_HUB" /tmp/o.json >/tmp/o.meta 2>&1
+        if grep -q '"FunctionError"' /tmp/o.meta; then echo "ORCHESTRATOR INIT SMOKE FAILED"; cat /tmp/o.meta; exit 1; fi
+        echo "orchestrator invoke OK (no FunctionError)"
+      - aws lambda get-function --function-name agentcore-hub-orchestrator
+          --query 'Configuration.[State,LastUpdateStatus]' --output text --region "$AWS_REGION_HUB"
+      # Config landed with ARNs intact (merge did not clobber).
+      - |
+        aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" - | python3 -c "import json,sys; a=json.load(sys.stdin); assert all(x.get('runtimeArn') for x in a['agents'] if x.get('type')=='runtime'), 'null runtimeArn — merge clobbered ARNs'; print('config ok')"
+      - echo "── Deploy complete ──"

@@ -1,0 +1,95 @@
+# buildspec-ci.yml — PR check AND the deploy pipeline's Build stage.
+#
+# Two callers, one file:
+#   - CodeBuild "agentcore-hub-ci" (PR webhook): runs the gates, posts a commit
+#     status back onto the PR → branch protection blocks merge if red.
+#   - CodePipeline "Build" stage (BUILD_APP_IMAGE=true): runs the SAME gates,
+#     then emits the deploy artifacts (orchestrator zip + app image BY DIGEST)
+#     so the Deploy stage promotes exactly what was built here (build-once).
+#
+# The gates are the deterministic work that used to run inside the CI agent.
+# Any red here = build fails = no merge. See docs/cicd-pipeline-module-design.md.
+version: 0.2
+
+env:
+  variables:
+    NODE_ENV: "development"   # need devDeps (tsc, eslint, playwright) at build time
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - node --version && npm --version
+      - npm ci
+
+  pre_build:
+    commands:
+      - echo "── Gate 1/2: TypeScript (blocking) ──"
+      - npx tsc --noEmit
+      - echo "── Gate: lint ──"
+      - npm run lint
+
+  build:
+    commands:
+      - echo "── Gate 2/2: production build (also the module-removal smoke test) ──"
+      - npm run build
+      - echo "── Gate: fast test suite (tab UI + API smoke) ──"
+      - npm test
+      - echo "── HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed) ──"
+      - bash scripts/check-lambda-zip-manifest.sh
+
+  post_build:
+    commands:
+      - echo "── Dependency scan (report-only until baselined) ──"
+      - npm audit --audit-level=high || true
+      # ── Deploy-pipeline Build stage only: emit artifacts by digest ──
+      - |
+        if [ "${BUILD_APP_IMAGE:-false}" = "true" ]; then
+          echo "── Build stage: packaging orchestrator zip (deploy.sh explicit file list) ──"
+          cp src/config/lease-constants.json lambda/orchestrator/lease-constants.json
+          ( cd lambda/orchestrator && npm ci --omit=dev && \
+            zip -rq /tmp/orchestrator.zip index.mjs agent-invoker.mjs events-writer.mjs \
+              workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs \
+              dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs \
+              completion.mjs package.json node_modules/ )
+          rm -f lambda/orchestrator/lease-constants.json
+          echo "── Re-assert manifest on the actual zip about to ship ──"
+          bash scripts/check-lambda-zip-manifest.sh
+          echo "── Build + push app image to ECR, capture the DIGEST for promote-by-digest ──"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
+          aws ecr get-login-password --region "$AWS_REGION_HUB" \
+            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com"
+          # Bundle the DEPLOYED agents.json (real ARNs) for the image build only.
+          aws s3 cp "s3://${ARTIFACT_BUCKET}/config/agents.json" /tmp/agents.s3.json --region "$AWS_REGION_HUB" || true
+          if [ -f /tmp/agents.s3.json ]; then cp src/config/agents.json /tmp/agents.git.json; cp /tmp/agents.s3.json src/config/agents.json; fi
+          GIT_SHA="$(git rev-parse --short HEAD)"
+          docker buildx build --platform linux/amd64 \
+            --tag "${ECR_URI}:${GIT_SHA}" --tag "${ECR_URI}:latest" \
+            --push --file Dockerfile . --provenance=false
+          if [ -f /tmp/agents.git.json ]; then cp /tmp/agents.git.json src/config/agents.json; fi
+          IMAGE_DIGEST="$(aws ecr describe-images --repository-name "$ECR_REPO" \
+            --image-ids imageTag="$GIT_SHA" --region "$AWS_REGION_HUB" \
+            --query 'imageDetails[0].imageDigest' --output text)"
+          echo "Resolved image digest: $IMAGE_DIGEST"
+          # Hand the exact artifacts to the Deploy stage.
+          mkdir -p pipeline-out
+          cp /tmp/orchestrator.zip pipeline-out/orchestrator.zip
+          printf '%s' "$IMAGE_DIGEST" > pipeline-out/image-digest.txt
+          printf '%s' "$GIT_SHA" > pipeline-out/git-sha.txt
+        fi
+
+# For the deploy pipeline Build stage, these are the promote-by-digest artifacts.
+# (The PR-check invocation ignores artifacts — it only cares about pass/fail.)
+artifacts:
+  base-directory: .
+  files:
+    - pipeline-out/orchestrator.zip
+    - pipeline-out/image-digest.txt
+    - pipeline-out/git-sha.txt
+    # carry the source tree the Deploy stage needs (blueprints, config, scripts)
+    - blueprints/**/*
+    - deploy/**/*
+    - scripts/**/*
+    - src/config/**/*

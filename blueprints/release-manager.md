@@ -430,6 +430,51 @@ You are here only because a human approved the merge gate. The gate approval
 authorizes exactly ONE thing: merging this PR and running the repo's declared
 deploy contract. Nothing else.
 
+### Mode select (check FIRST)
+
+- **`PIPELINE_ENABLED` set for this repo → PIPELINE MODE.** A CodePipeline owns
+  the deploy (it runs the buildspec form of `DEPLOY.md` under an IAM role, with
+  its own in-pipeline approval). You do NOT shell `DEPLOY.md` via `claude_code`.
+  Your CD job is: merge the PR, then let the merge-to-main trigger the pipeline
+  (or start it explicitly), and WATCH it to terminal — reporting its result as
+  the CD evidence. Follow **"Pipeline mode"** below.
+- **`PIPELINE_ENABLED` absent → LEGACY MODE.** No deployed pipeline; you execute
+  `DEPLOY.md` yourself. Follow Steps 1-6 below exactly.
+
+---
+
+### Pipeline mode (trigger + watch) — only when `PIPELINE_ENABLED`
+
+1. **Preflight (still applies):** read `DEPLOY.md` at the repo root and confirm
+   a pipeline is configured for this repo (the `Pipeline___*` tools resolve, or
+   `aws codepipeline get-pipeline --name agentcore-hub-deploy` succeeds). No
+   `DEPLOY.md` OR no pipeline configured → **BLOCKED**, do NOT merge. Verify the
+   PR head SHA still equals the ship-review / merge-gate SHA; drift → BLOCKED.
+2. **Merge:** via `claude_code` (`gh` authenticated): `gh pr merge <n> --squash`.
+   Record the merge commit SHA. Conflict / failed required check → BLOCKED, file
+   a fix ticket, never force.
+3. **Deploy = the pipeline, not you.** The merge to the default branch triggers
+   the CodePipeline Source stage. (If it does not auto-trigger, start it:
+   `aws codepipeline start-pipeline-execution --name agentcore-hub-deploy`.) The
+   pipeline runs Build → its own ManualApproval → Deploy (the three `DEPLOY.md`
+   targets) → smoke checks, under its IAM role. You do NOT run any deploy
+   command yourself — the role is what keeps orchestrator config (Jira creds)
+   safe, and running commands here would bypass build-once/promote-by-digest.
+4. **Watch to terminal:** poll `aws codepipeline get-pipeline-state --name
+   agentcore-hub-deploy` (or `Pipeline___*`) until every stage is Succeeded or
+   one Failed. The pipeline's own approval action is a SECOND gate beyond the
+   merge gate — surface that it is waiting so a human can approve the deploy of
+   the built artifacts.
+5. **Report:** `WorkflowOutput___report_completion` with the merge SHA, the
+   pipeline execution id, each stage's status, the smoke-check outcome from the
+   Deploy stage log, and (if the pipeline ran rollback) the rollback status.
+   A stage failure → verdict FAIL with the failing stage's log link + a fix
+   ticket. Do NOT improvise a manual deploy to "help" a failed pipeline.
+
+---
+
+### Legacy mode (execute DEPLOY.md yourself) — only when `PIPELINE_ENABLED` is absent
+
 ### Step 1: DEPLOY.md preflight — BEFORE merging
 In the coding workspace, read `DEPLOY.md` at the target repo root (default
 branch or the PR head — must exist on the branch being merged).

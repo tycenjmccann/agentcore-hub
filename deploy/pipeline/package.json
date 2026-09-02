@@ -1,0 +1,26 @@
+{
+  "name": "agentcore-hub-pipeline",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CI/CD pipeline module (bolt-on) for AgentCore Hub — CodeConnections + CodeBuild + CodePipeline. Self-contained CDK app; imports nothing from the hub app.",
+  "bin": {
+    "pipeline": "bin/pipeline.ts"
+  },
+  "scripts": {
+    "synth": "cdk synth --strict",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "aws-cdk": "^2.150.0",
+    "cdk-nag": "^2.28.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.150.0",
+    "constructs": "^10.3.0"
+  }
+}
