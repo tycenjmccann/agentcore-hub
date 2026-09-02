@@ -1393,6 +1393,29 @@ def Pipeline___start_deploy(pipeline_name: str = "") -> str:
 
 
 @tool
+def Pipeline___get_build_status(commit_sha: str = "", project: str = "", scan: int = 15) -> str:
+    """Prove a build's status for a SPECIFIC commit. Scans recent builds of the
+    CI project and returns each with its resolvedSourceVersion (the real git commit
+    CodeBuild built — NOT sourceVersion, which can be a pr/<id> ref). Pass
+    commit_sha to get the matching build + succeededForCommit boolean.
+
+    Use this to confirm a green build belongs to the EXACT head SHA (e.g. after a
+    CI auto-remediation push) instead of trusting "the latest build is green".
+
+    Args:
+        commit_sha: The head SHA to match against resolvedSourceVersion.
+        project: CodeBuild project (defaults to the CI project).
+        scan: How many recent builds to scan (max 50).
+    """
+    args = {"scan": scan}
+    if commit_sha:
+        args["commit_sha"] = commit_sha
+    if project:
+        args["project"] = project
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___get_build_status", args)
+
+
+@tool
 def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: int = 120) -> str:
     """For a Failed Build stage: return the CodeBuild build's phase contexts
     (which phase/command failed) and a tail of its CloudWatch log. Use the failing
@@ -2208,6 +2231,7 @@ LAMBDA_TOOLS = [
     # CI/CD Pipeline (Lambda-backed) — release_manager PIPELINE mode
     Pipeline___get_state,
     Pipeline___start_deploy,
+    Pipeline___get_build_status,
     Pipeline___get_build_log,
     # Workflow (Lambda-backed)
     WorkflowOutput___report_completion,
