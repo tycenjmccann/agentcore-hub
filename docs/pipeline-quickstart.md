@@ -31,11 +31,11 @@ orchestrator Lambda zip plus the application image, promoted by its ECR
 digest rather than rebuilt. This build-once, promote-by-digest approach
 means the artifacts a reviewer approved are byte-identical to the ones that
 reach production, since the Deploy stage never rebuilds anything. After
-promotion, the Deploy stage runs the smoke checks documented in `DEPLOY.md`'s
-`## Smoke checks` section, including the traces health check and the
-orchestrator invoke that guards against the INIT-crash failure class. See
-the design doc's [buildspecs](cicd-pipeline-module-design.md#6-buildspecs--porting-deploymd-into-the-pipeline)
-section for how each command maps back to `DEPLOY.md`.
+promotion, the Deploy stage runs `DEPLOY.md`'s `## Smoke checks` (the traces
+health check and orchestrator health checks) as ported into the pipeline's
+deploy buildspec, which additionally invokes the orchestrator to guard
+against the INIT-crash failure class. See the design doc's
+[buildspecs](cicd-pipeline-module-design.md#6-buildspecs--porting-deploymd-into-the-pipeline) section for how each command maps back to `DEPLOY.md`.
 
 For the broader rollout plan, see the design doc's [pilot rollout plan](cicd-pipeline-module-design.md#9-pilot-rollout-plan-hub-repo).
 For the exact smoke-check contract, see [`DEPLOY.md`](../DEPLOY.md).
