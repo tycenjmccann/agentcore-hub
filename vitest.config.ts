@@ -68,6 +68,11 @@ export default defineConfig({
       // in completeWorkflow and the fix-spawn completion re-check. Same harness
       // as review-rejection: index.mjs real, AWS/store seams mocked.
       "lambda/orchestrator/completion-gates.test.mjs",
+      // evidence-harvest — markTaskComplete pulls the agent's report_completion
+      // record (S3 completions/{tid}.json) into agentTasks so the evidence gate
+      // has something to read on the done cascade. Same harness as
+      // done-handlers-cascade: real handlers, mocked I/O seams.
+      "lambda/orchestrator/evidence-harvest.test.mjs",
       // agentcore-hub-tickets create_ticket (TEAM-3619 D4c) — the spawnedBy/phase
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.
