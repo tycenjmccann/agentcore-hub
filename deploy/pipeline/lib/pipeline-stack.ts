@@ -209,6 +209,7 @@ export class PipelineStack extends Stack {
       account,
       region,
       artifactBucket,
+      connectionArn,
     });
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -321,11 +322,26 @@ export class PipelineStack extends Stack {
 function grantBuildArtifactPerms(
   scope: Construct,
   role: iam.IRole,
-  ctx: { account: string; region: string; artifactBucket: s3.IBucket }
+  ctx: {
+    account: string;
+    region: string;
+    artifactBucket: s3.IBucket;
+    connectionArn: string;
+  }
 ) {
   role.attachInlinePolicy(
     new iam.Policy(scope, "BuildArtifactPerms", {
       statements: [
+        // With codeBuildCloneOutput the Build stage downloads a git clone via the
+        // connection, so its role needs UseConnection too (Codex #263 round-2 P1).
+        new iam.PolicyStatement({
+          sid: "UseCodeConnection",
+          actions: [
+            "codeconnections:UseConnection",
+            "codestar-connections:UseConnection",
+          ],
+          resources: [ctx.connectionArn],
+        }),
         // Push the built app image to ECR (by digest, consumed by Deploy).
         new iam.PolicyStatement({
           sid: "EcrAuth",

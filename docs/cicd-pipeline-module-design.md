@@ -244,19 +244,30 @@ phases:
       - aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" - | python3 -c "..."  # ARNs intact
 ```
 
-Notes:
-- The **eval-infra targets (DEPLOY.md steps 4–9)** become a second deploy action
-  or a conditional block, gated on whether the merged changeset touches eval
-  files — exactly the "skipped when no eval files" behavior the contract already
-  has. Ordering (packager before rubric; alarms last, gated) is preserved as
-  action order.
-- **ECS roll is conditional** on the changeset touching app code — a Lambda-only
-  or blueprint-only change skips the image promote (matches how the hub is
-  deployed by hand today).
-- **Rollback** = a pipeline action that re-points Lambda at the prior zip S3
-  version and ECS at the prior image digest (both already versioned). This is
-  the `deploy/local/rollback.sh` gap `DEPLOY.md` names as outstanding — the
-  pipeline is where it gets automated.
+Notes (implemented):
+- **CI gate parity.** `buildspec-ci.yml` runs EVERY blocking gate the GitHub CI
+  workflow runs — `lint`, `tsc --noEmit`, `test:unit` (vitest),
+  `check-workflow-writes.sh`, `next build`, the fast Playwright suite, and the
+  runtime-agent telemetry pytest — plus the lambda-zip manifest gate. It has to,
+  because with `PIPELINE_ENABLED` the blueprints skip their own mechanical tests
+  on a green result; a missing gate here would let unit/race/telemetry
+  regressions merge. Kept in lockstep with `.github/workflows/ci.yml`.
+- **Eval-infra targets (DEPLOY.md steps 4–9)** run via
+  `deploy/pipeline/deploy-eval-targets.sh`, **conditional** on the changeset
+  touching eval files (`pipeline-out/changed-files.txt`). Ordering preserved
+  (packager step 4 before rubric step 6; alarms step 8 last + gated on a healthy
+  batch). If the `agentcore` CLI is absent from the deploy image, steps 5–9 FAIL
+  LOUDLY (BLOCKED) rather than silently skip — no reporting success on stale
+  evaluator config.
+- **ECS roll is conditional** on `ECS_SERVICE_ARN` being set (Lambda/blueprint-
+  only changes skip the image promote), and the roll is **verified**: the Deploy
+  stage polls the service to ACTIVE-with-endpoint and curls the app health
+  endpoint (200) before declaring success — a container that fails to start
+  fails the pipeline.
+- **Rollback** (`deploy/pipeline/rollback.sh`) is automatic: pre_build snapshots
+  the current orchestrator zip + ECS image; a Deploy-phase failure restores both
+  (S3-versioned config is surfaced for manual restore). Closes the
+  `deploy/local/rollback.sh` gap `DEPLOY.md` names as outstanding.
 
 ---
 

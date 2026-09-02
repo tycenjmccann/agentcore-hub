@@ -24,6 +24,25 @@ phases:
       - GIT_SHA="$(cat pipeline-out/git-sha.txt)"
       - ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
       - echo "Promoting image ${ECR_URI}@${IMAGE_DIGEST} (built from ${GIT_SHA})"
+      # ── Capture the CURRENT prod state for rollback (Codex PR #263 round-2 P1) ──
+      # DEPLOY.md's manual rollback = re-point Lambda at prior zip + ECS at prior
+      # image digest. We snapshot both BEFORE touching anything; a build-phase
+      # failure triggers deploy/pipeline/rollback.sh in post_build (which always
+      # runs). No CodePipeline rollback API dependency; artifacts are S3-versioned.
+      - mkdir -p /tmp/rollback
+      - |
+        aws s3api get-object --bucket "$ARTIFACT_BUCKET" --key "pipeline-artifacts/orchestrator-current.zip" \
+          /tmp/rollback/orchestrator-prev.zip --region "$AWS_REGION_HUB" >/dev/null 2>&1 \
+          && echo "captured prior orchestrator zip" || echo "no prior orchestrator zip snapshot (first pipeline deploy)"
+      - |
+        if [ -n "${ECS_SERVICE_ARN:-}" ]; then
+          aws ecs describe-express-gateway-service --service-arn "$ECS_SERVICE_ARN" --region "$AWS_REGION_HUB" --output json \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); pc=(d.get('service',{}).get('activeConfigurations') or [{}])[0].get('primaryContainer',{}); print(pc.get('image',''))" \
+            > /tmp/rollback/ecs-prev-image.txt 2>/dev/null || true
+          echo "captured prior ECS image: $(cat /tmp/rollback/ecs-prev-image.txt 2>/dev/null)"
+        fi
+      # Snapshot the NEW orchestrator zip as the next deploy's rollback source.
+      - aws s3 cp pipeline-out/orchestrator.zip "s3://$ARTIFACT_BUCKET/pipeline-artifacts/orchestrator-current.zip" --region "$AWS_REGION_HUB"
 
   build:
     commands:
@@ -56,8 +75,32 @@ phases:
           echo "ECS_SERVICE_ARN unset — skipping app roll (Lambda/blueprint-only deploy)."
         fi
 
+      # ── Eval-infra targets (DEPLOY.md steps 4-9), CONDITIONAL on the changeset ──
+      # DEPLOY.md gates these on the merge touching eval files; when it does,
+      # pipeline mode still owns them (the release manager no longer runs
+      # DEPLOY.md), so skipping them would leave prod on old eval code (Codex
+      # #263 round-2 P1). Ordering preserved: packager (4) before rubric (6);
+      # alarms (8) last and gated. Runs only when eval files changed.
+      - |
+        CHANGED="$(cat pipeline-out/changed-files.txt 2>/dev/null || true)"
+        if printf '%s' "$CHANGED" | grep -qE '^(lambda/eval-packager/|deploy/evaluations/|deploy/continuous-improvement/|deploy/runtime-agent/)'; then
+          echo "── Eval files changed → running DEPLOY.md eval targets (steps 4-9) ──"
+          bash deploy/pipeline/deploy-eval-targets.sh
+        else
+          echo "── No eval files in changeset → skipping eval targets (per DEPLOY.md) ──"
+        fi
+
   post_build:
     commands:
+      # CodeBuild's default post_build runs even after a build-phase failure.
+      # A build-phase failure = a partially-applied deploy → roll prod back to the
+      # snapshot captured in pre_build, then fail the action (Codex #263 round-2).
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" != "1" ]; then
+          echo "── Build phase FAILED after partial deploy → rolling back ──"
+          bash deploy/pipeline/rollback.sh || echo "rollback encountered errors — inspect manually"
+          exit 1
+        fi
       - echo "── Smoke checks (DEPLOY.md) ──"
       # Orchestrator healthy on the new code (guards the INIT-crash class).
       - |
@@ -70,4 +113,25 @@ phases:
       # Config landed with ARNs intact (merge did not clobber).
       - |
         aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" - | python3 -c "import json,sys; a=json.load(sys.stdin); assert all(x.get('runtimeArn') for x in a['agents'] if x.get('type')=='runtime'), 'null runtimeArn — merge clobbered ARNs'; print('config ok')"
+      # ── ECS rollout health verification (DEPLOY.md smoke; Codex #263 round-2) ──
+      # Starting the roll is not deploying it. Poll the service until it is ACTIVE
+      # with an ingress endpoint AND the app health endpoint returns 200 — matching
+      # deploy/ecs-express/deploy.sh + DEPLOY.md. A container that fails to start
+      # must FAIL the pipeline, not pass.
+      - |
+        if [ -n "${ECS_SERVICE_ARN:-}" ]; then
+          echo "── Verifying ECS rollout health ──"
+          URL=""
+          for i in $(seq 1 60); do
+            DESC="$(aws ecs describe-express-gateway-service --service-arn "$ECS_SERVICE_ARN" --region "$AWS_REGION_HUB" --output json 2>/dev/null || echo '{}')"
+            read -r STATUS URL <<<"$(python3 deploy/pipeline/ecs-health.py "$DESC")"
+            if [ "$STATUS" = "ACTIVE" ] && [ -n "$URL" ]; then break; fi
+            sleep 10
+            if [ "$i" = "60" ]; then echo "ECS did not reach ACTIVE with an endpoint"; exit 1; fi
+          done
+          case "$URL" in http*) : ;; *) URL="https://$URL" ;; esac
+          echo "service ACTIVE at $URL — checking app health"
+          curl -sf "$URL/api/agentcore/traces/health" >/dev/null || { echo "app health check FAILED"; exit 1; }
+          echo "ECS rollout healthy"
+        fi
       - echo "── Deploy complete ──"

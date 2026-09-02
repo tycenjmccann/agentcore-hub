@@ -29,14 +29,23 @@ phases:
 
   pre_build:
     commands:
-      - echo "── Gate 1/2: TypeScript (blocking) ──"
-      - npx tsc --noEmit
+      # This project is the authoritative required check, so it must run EVERY
+      # blocking gate the GitHub CI workflow runs — otherwise the blueprints skip
+      # their own mechanical tests on a green result and unit/race/telemetry
+      # regressions merge (Codex PR #263 round-2 P1). Kept in lockstep with
+      # .github/workflows/ci.yml.
       - echo "── Gate: lint ──"
       - npm run lint
+      - echo "── Gate: TypeScript (blocking) ──"
+      - npx tsc --noEmit
+      - echo "── Gate: unit tests (vitest, hermetic) ──"
+      - npm run test:unit
+      - echo "── Gate: workflow-table write guard (race study R2) ──"
+      - ./scripts/check-workflow-writes.sh
 
   build:
     commands:
-      - echo "── Gate 2/2: production build (also the module-removal smoke test) ──"
+      - echo "── Gate: production build (also the module-removal smoke test) ──"
       - npm run build
       # The fast Playwright suite hits localhost:3000 and defines no webServer,
       # so boot `next start` first and wait for readiness (mirrors the GH job).
@@ -48,8 +57,16 @@ phases:
           sleep 2
           if [ "$i" = "30" ]; then echo "server did not come up"; cat /tmp/next-server.log; exit 1; fi
         done
-      - echo "── Gate: fast test suite (tab UI + API smoke) ──"
+      - echo "── Gate: fast Playwright suite (tab UI + API smoke) ──"
       - PLAYWRIGHT_BASE_URL=http://localhost:3000 npm test
+      - echo "── Gate: runtime-agent telemetry pytest (hermetic, no AWS) ──"
+      - |
+        python3 -m venv /tmp/pyci && . /tmp/pyci/bin/activate
+        pip install -q -r deploy/runtime-agent/tests/requirements-test.txt
+        pytest -q deploy/runtime-agent/tests \
+          deploy/runtime-agent/test_telemetry_init.py \
+          deploy/runtime-agent/test_build_env_vars.py
+        deactivate
       - echo "── HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed) ──"
       - bash scripts/check-lambda-zip-manifest.sh
 
@@ -99,6 +116,13 @@ phases:
           cp /tmp/orchestrator.zip pipeline-out/orchestrator.zip
           printf '%s' "$IMAGE_DIGEST" > pipeline-out/image-digest.txt
           printf '%s' "$GIT_SHA" > pipeline-out/git-sha.txt
+          # Changed-file list vs the previous commit — the Deploy stage uses it to
+          # decide whether to run the conditional eval targets (DEPLOY.md 4-9).
+          # codeBuildCloneOutput gives us a real .git; fall back to "everything"
+          # (forces eval targets to run) if the diff can't be computed.
+          ( git diff --name-only HEAD~1..HEAD 2>/dev/null \
+            || git show --name-only --pretty=format: HEAD 2>/dev/null \
+            || echo "deploy/runtime-agent/FORCE" ) > pipeline-out/changed-files.txt
         fi
 
 # For the deploy pipeline Build stage, these are the promote-by-digest artifacts.
@@ -109,6 +133,7 @@ artifacts:
     - pipeline-out/orchestrator.zip
     - pipeline-out/image-digest.txt
     - pipeline-out/git-sha.txt
+    - pipeline-out/changed-files.txt
     # carry the source tree the Deploy stage needs (blueprints, config, scripts)
     - blueprints/**/*
     - deploy/**/*
