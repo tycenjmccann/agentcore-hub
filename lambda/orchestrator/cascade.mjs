@@ -45,6 +45,14 @@
  * stealAndRedispatch helpers below — so the reconciliation sweep
  * (reconcile-sweep.mjs, TEAM-3747 D1) can reuse it via the exported
  * reconcileDependent() rather than re-implementing lease/steal semantics.
+ *
+ * TEAM-3755 — two guards on the enforce path, both documented at their call site:
+ *   F7: a TOCTOU liveness RE-CHECK immediately before every stealClaim (the steal
+ *       CAS keys on the claim generation, which an agent that heart-beats in the
+ *       read→steal window still holds — so only a fresh read can refuse it).
+ *   F9: a strongly-consistent per-blocker CONFIRM before the event path acts on
+ *       an in_progress dependent (the sibling snapshot is an eventually-consistent
+ *       GSI page; the sweep has a quiet period, the event path does not).
  */
 
 import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
@@ -52,6 +60,10 @@ import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
 // Extended-state rollout modes (TEAM-3747 D1) — same vocabulary + fail-safe
 // default (shadow) as DEAD_SESSION_DETECTOR_MODE.
 const KNOWN_EXTENDED_MODES = ["off", "shadow", "enforce"];
+
+// The only ticket statuses that resolve a blocker. Same pair the snapshot
+// predicate uses; named here for the TEAM-3755 F9 point-read confirm.
+const RESOLVED_BLOCKER_STATUSES = new Set(["done", "cancelled"]);
 
 /**
  * Normalize the `extendedStates` dep into off | shadow | enforce. Backwards
@@ -91,6 +103,12 @@ export function createCascade(deps) {
     workflowsTable,
     redispatch,
     reawakenGate,
+    // TEAM-3755 F9 — STRONGLY-CONSISTENT single-ticket read, used to confirm a
+    // dependent's blockers really are resolved before the event path steals a
+    // lease and re-dispatches (the snapshot that got us here is an eventually-
+    // consistent GSI page). Optional: when unwired the confirm is skipped and
+    // behavior is exactly what it was before F9.
+    getTicketConsistent,
   } = deps;
 
   // One normalization per cascade instance. The commit-4a union (blocked/todo →
@@ -203,7 +221,8 @@ export function createCascade(deps) {
     log(`[orchestrator] ${ticketId} cascade — unblocked=[${unblocked.join(", ")}] errors=${m.dependentErrors}` +
       (extendedMode !== "off"
         ? ` mode=${extendedMode} nudged=${m.nudged} redispatched=${m.redispatched} reviewReawakened=${m.reviewReawakened}` +
-          ` wouldNudge=${m.wouldNudge} wouldSteal=${m.wouldSteal} wouldRedispatch=${m.wouldRedispatch} wouldReviewReawaken=${m.wouldReviewReawaken}`
+          ` wouldNudge=${m.wouldNudge} wouldSteal=${m.wouldSteal} wouldRedispatch=${m.wouldRedispatch} wouldReviewReawaken=${m.wouldReviewReawaken}` +
+          ` blockerConfirmAborted=${m.blockerConfirmAborted}`
         : ""));
 
     // Journey log: one orchestrator.unblocked per Ready transition. The helper
@@ -263,8 +282,18 @@ export function createCascade(deps) {
    * through the normal claim CAS. Both CAS steps are arbiters: a fresh claim that
    * raced in makes the steal OR the re-dispatch lose, and we stop — a re-dispatch
    * against a live lease is structurally refused. In shadow mode: observe only.
+   *
+   * TEAM-3755 F7 — TOCTOU re-check before the steal, mirroring the dead-session
+   * detector (dead-session-detector.mjs step 1b). The steal CAS keys on the claim
+   * GENERATION (startedAt), so an agent that was merely SILENT when we read
+   * liveness and then heart-beated in the read→steal window keeps the SAME
+   * generation: its claim satisfies the CAS and gets stolen + re-dispatched,
+   * double-invoking a live session (R1). The generation CAS cannot see that — only
+   * a fresh liveness read can. So re-read activity immediately before the steal
+   * and, if the lease came back to life, abort and treat it as what the
+   * non-racing ordering would have done: a nudge, zero steal (AC-D3.3).
    */
-  async function stealAndRedispatch(sibling, workflow, m, mode) {
+  async function stealAndRedispatch(sibling, unblockedBy, workflow, m, mode) {
     const agentId = sibling.assignee;
     const task = workflow?.agentTasks?.[sibling.ticketId];
     if (mode !== "enforce") {
@@ -272,6 +301,10 @@ export function createCascade(deps) {
       m.wouldRedispatch++;
       log(`[orchestrator] cascade would-steal+redispatch (shadow, stale lease) — ${sibling.ticketId} agent=${agentId}`);
       return "would-steal";
+    }
+    if (await leaseIsLive(sibling, workflow)) {
+      log(`[orchestrator] cascade steal aborted (lease live again on re-check) — ${sibling.ticketId} agent=${agentId}`);
+      return emitNudge(sibling, unblockedBy, workflow, m, mode);
     }
     const stole = await lease.stealClaim(
       ddb, workflowsTable, workflow?.id, sibling.ticketId, task?.startedAt
@@ -291,16 +324,60 @@ export function createCascade(deps) {
   }
 
   /**
+   * TEAM-3755 F9 — confirm a dependent's blockers really ARE resolved, with a
+   * STRONGLY-CONSISTENT point-read per blocker, before the event path steals a
+   * lease and re-dispatches.
+   *
+   * Why the snapshot isn't enough: allBlockersResolved evaluates the
+   * parentId-index GSI page this cascade was handed (index.mjs getChildTickets,
+   * no ConsistentRead). A stale page can show a blocker that was JUST reopened
+   * for rework as still done, or omit a fix ticket that was just filed as a new
+   * blocker — and under CASCADE_EXTENDED_STATES=enforce that drives a steal +
+   * re-dispatch of an in_progress dependent whose inputs are not actually fixed
+   * yet. The reconciliation sweep is protected by its leaseTtlMs quiet period;
+   * the event path fires within seconds of the blocker closing and has none, so
+   * it confirms by key instead.
+   *
+   * A blocker that reads non-terminal — or that the point-read cannot find at all
+   * — counts as UNRESOLVED: refusing to re-dispatch is the safe direction (the
+   * dependent's own unblock will cascade again when the blocker really closes,
+   * and the reconcile sweep is the backstop). Returns true when the confirm is
+   * unavailable (dep unwired) so the pre-F9 behavior is preserved.
+   */
+  async function blockersConfirmedResolved(sibling) {
+    const blockers = sibling.blockedBy || [];
+    if (!getTicketConsistent || !blockers.length) return true;
+    for (const bid of blockers) {
+      const blocker = await getTicketConsistent(bid);
+      if (!blocker || !RESOLVED_BLOCKER_STATUSES.has(blocker.status)) {
+        log(`[orchestrator] cascade blocker not confirmed resolved — ${sibling.ticketId} blocker=${bid} status=${blocker?.status ?? "missing"}`);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
    * A dependent already in_progress whose last blocker just resolved. NEVER
    * steal a live lease and NEVER attempt a claim against one — a live agent is
    * doing the work; a re-dispatch would duplicate the session. The lease check
    * (R3, lease.mjs) is the sole authority for liveness.
+   *
+   * The F9 blocker confirm runs FIRST and in every mode (it is read-only, and
+   * shadow must predict what enforce would do): an unconfirmed blocker means we
+   * touch this dependent in no way at all — no nudge either, because the premise
+   * of the nudge ("your last blocker resolved") is what turned out to be stale.
    */
   async function handleInProgressDependent(sibling, unblockedBy, workflow, m, mode = "enforce") {
+    if (!(await blockersConfirmedResolved(sibling))) {
+      m.blockerConfirmAborted++;
+      log(`[orchestrator] cascade extended-state action skipped (stale blocker snapshot) — ${sibling.ticketId}`);
+      return "blockers-unconfirmed";
+    }
     if (await leaseIsLive(sibling, workflow)) {
       return emitNudge(sibling, unblockedBy, workflow, m, mode);
     }
-    return stealAndRedispatch(sibling, workflow, m, mode);
+    return stealAndRedispatch(sibling, unblockedBy, workflow, m, mode);
   }
 
   /**
@@ -366,7 +443,7 @@ export function createCascade(deps) {
       return handleInReviewDependent(sibling, unblockedBy, workflow, m, mode);
     }
     if (sibling.status === "in_progress") {
-      return stealAndRedispatch(sibling, workflow, m, mode);
+      return stealAndRedispatch(sibling, unblockedBy, workflow, m, mode);
     }
     // ready / todo / blocked — unblocked (or unblockable) but never dispatched.
     // No live claim to steal (the lease gate above already returned for a live
@@ -427,6 +504,9 @@ export function newMetrics() {
     wouldSteal: 0,
     wouldRedispatch: 0,
     wouldReviewReawaken: 0,
+    // TEAM-3755 F9 — extended-state actions refused because a strongly-consistent
+    // re-read showed a blocker was NOT actually resolved (stale GSI snapshot).
+    blockerConfirmAborted: 0,
   };
 }
 
@@ -435,7 +515,7 @@ export function hasCascadeActivity(m) {
   return !!(
     m.nudged || m.skippedLiveLease || m.redispatched || m.reviewReawakened ||
     m.dependentErrors || m.wouldNudge || m.wouldSteal || m.wouldRedispatch ||
-    m.wouldReviewReawaken
+    m.wouldReviewReawaken || m.blockerConfirmAborted
   );
 }
 
@@ -462,6 +542,7 @@ export function emitCascadeMetrics(m) {
           { Name: "CascadeWouldSteal", Unit: "Count" },
           { Name: "CascadeWouldRedispatch", Unit: "Count" },
           { Name: "CascadeWouldReviewReawaken", Unit: "Count" },
+          { Name: "CascadeBlockerConfirmAborted", Unit: "Count" },
         ],
       }],
     },
@@ -474,5 +555,6 @@ export function emitCascadeMetrics(m) {
     CascadeWouldSteal: m.wouldSteal || 0,
     CascadeWouldRedispatch: m.wouldRedispatch || 0,
     CascadeWouldReviewReawaken: m.wouldReviewReawaken || 0,
+    CascadeBlockerConfirmAborted: m.blockerConfirmAborted || 0,
   }));
 }

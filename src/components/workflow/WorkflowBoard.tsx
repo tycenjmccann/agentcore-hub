@@ -1302,7 +1302,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
               <span className="hidden md:inline">{managerWatch ? "Manager watching" : "Manager off"}</span>
             </button>
           )}
-          {state && state.phase !== "complete" && state.phase !== "error" && state.phase !== "cancelled" && (
+          {/* TEAM-3755 F6: gate on the SHARED terminal set, not three literals —
+              the hand-rolled list predated the ship-blocked outcomes, so Cancel
+              stayed rendered on an already-finished deploy-blocked /
+              static-ci-only run. Same gate as the manager-watch toggle above. */}
+          {state && !isTerminalPhase(state.phase) && (
             <button
               onClick={() => { setCancelError(null); setShowCancelModal(true); }}
               disabled={cancelLoading}

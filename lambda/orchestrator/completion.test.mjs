@@ -6,6 +6,8 @@ import {
   evaluateShipVerdict,
   SHIP_BLOCKED_OUTCOMES,
   SHIP_PHASES,
+  TERMINAL_WORKFLOW_PHASES,
+  notTerminalPhaseGuard,
 } from "./completion.mjs";
 
 /**
@@ -250,8 +252,21 @@ describe("shipVerdictOf — one harvested ship entry (TEAM-3747 D2)", () => {
     expect(shipVerdictOf({ ticketId: "T-4", mergeCommit: "9f1c2ab" })).toBe("shipped");
   });
 
-  it("a commit sha on the merged/release PR also counts as shipped", () => {
-    expect(shipVerdictOf({ ticketId: "T-4", commitSha: "abc1234" })).toBe("shipped");
+  it("TEAM-3755 F1: a commit sha ALONE is NOT a merge verdict", () => {
+    // This assertion is inverted from its original form on purpose. commitSha is
+    // harvested from record.commit_sha on EVERY dev/ship completion record and is
+    // the HEAD of the still-unmerged feature branch — accepting it as "shipped"
+    // is exactly what let a run close "complete" over work that never landed
+    // (the 29g73c failure; FR-D2.2 / AC-D2.4). Only a merge commit or the
+    // release manager's explicit outcome proves the merge.
+    expect(shipVerdictOf({ ticketId: "T-4", commitSha: "abc1234" })).toBeNull();
+  });
+
+  it("TEAM-3755 F1: a commit sha alongside a real merge commit still ships", () => {
+    // The realistic shape of a landed release record — both fields present. The
+    // narrowing must not lose the positive case.
+    expect(shipVerdictOf({ ticketId: "T-4", commitSha: "abc1234", mergeCommit: "9f1c2ab" }))
+      .toBe("shipped");
   });
 
   it('an explicit outcome "shipped" counts even with no commit recorded', () => {
@@ -479,5 +494,49 @@ describe("AC-D2.5 — legacy records evaluate exactly as before D2", () => {
     expect(SHIP_BLOCKED_OUTCOMES).toEqual(["deploy-blocked", "static-ci-only"]);
     expect(SHIP_PHASES.has("ship")).toBe(true);
     expect(SHIP_PHASES.has("review")).toBe(false);
+  });
+});
+
+/**
+ * TEAM-3755 F2 — the ONE terminal-phase list both terminal-claim CASes derive
+ * their guard from. Before this, completeWorkflow and claimTerminalOutcome each
+ * spelled the list out by hand and had drifted: completeWorkflow omitted the two
+ * D2 outcomes, so a completion racing in behind an honest deploy-blocked /
+ * static-ci-only close overwrote the verdict with "complete".
+ */
+describe("terminal-phase guard (TEAM-3755 F2)", () => {
+  it("the list is exactly the five phases a run can already be closed on", () => {
+    expect([...TERMINAL_WORKFLOW_PHASES]).toEqual([
+      "complete",
+      "cancelled",
+      "error",
+      "deploy-blocked",
+      "static-ci-only",
+    ]);
+  });
+
+  it("derives from SHIP_BLOCKED_OUTCOMES, so a sixth outcome cannot be forgotten", () => {
+    for (const outcome of SHIP_BLOCKED_OUTCOMES) {
+      expect(TERMINAL_WORKFLOW_PHASES).toContain(outcome);
+    }
+  });
+
+  it("builds a condition refusing every phase, with no unbound or unused values", () => {
+    const { condition, values } = notTerminalPhaseGuard("phase");
+    // DynamoDB rejects an ExpressionAttributeValues entry the expression never
+    // references, so the two sets must match exactly in both directions.
+    const referenced = Object.keys(values).filter((k) => condition.includes(`phase <> ${k}`));
+    expect(referenced.sort()).toEqual(Object.keys(values).sort());
+    expect(Object.values(values).sort()).toEqual([...TERMINAL_WORKFLOW_PHASES].sort());
+  });
+
+  it("honours an aliased name ref (#phase) for callers that reserve the word", () => {
+    const { condition } = notTerminalPhaseGuard("#phase");
+    expect(condition.startsWith("#phase <> :tp0")).toBe(true);
+    expect(condition).not.toContain(" phase <> ");
+  });
+
+  it("the list is frozen — a caller cannot mutate the shared guard", () => {
+    expect(Object.isFrozen(TERMINAL_WORKFLOW_PHASES)).toBe(true);
   });
 });

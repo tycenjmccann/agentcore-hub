@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createCascade, normalizeExtendedMode } from "./cascade.mjs";
+import { createCascade, normalizeExtendedMode, newMetrics } from "./cascade.mjs";
 
 /**
  * TEAM-3618 D3 — the shared unblock cascade. Both "ticket done" paths
@@ -221,6 +221,12 @@ function makeExtDeps(overrides = {}) {
   // THIS call (re)notified, and the re-wake now publishes review.reawakened only
   // on a truthy result (TEAM-3684 Finding 2). "Gate notified" is the normal case.
   const reawakenGate = overrides.reawakenGate || vi.fn(async () => true);
+  // TEAM-3755 F9 — the strongly-consistent blocker confirm (index.mjs
+  // getTicketConsistent). Default agrees with the snapshot (the blocker really is
+  // done), so every pre-F9 expectation in this file stands; the F9 block below
+  // overrides it to model a stale GSI page.
+  const getTicketConsistent =
+    overrides.getTicketConsistent || vi.fn(async (ticketId) => ({ ticketId, status: "done" }));
   const deps = {
     ...base.deps,
     extendedStates: overrides.extendedStates !== undefined ? overrides.extendedStates : true,
@@ -229,8 +235,9 @@ function makeExtDeps(overrides = {}) {
     workflowsTable: "workflows",
     redispatch,
     reawakenGate,
+    ...(overrides.getTicketConsistent === null ? {} : { getTicketConsistent }),
   };
-  return { ...base, deps, lease, redispatch, reawakenGate };
+  return { ...base, deps, lease, redispatch, reawakenGate, getTicketConsistent };
 }
 
 // A workflow carrying a running claim for the in_progress dependent.
@@ -827,5 +834,268 @@ describe("TEAM-3747 D1 — shadow mode evaluates + emits would-* metrics but wri
     expect(records).toHaveLength(1);
     expect(records[0].CascadeWouldReviewReawaken).toBe(1);
     expect(records[0].CascadeReviewReawaken).toBe(0);
+  });
+});
+
+/**
+ * TEAM-3755 F7 (P1) — TOCTOU liveness re-check before every stealClaim.
+ *
+ * leaseIsLive reads lastAgentActivity ONCE, then the steal CAS keys on the claim
+ * GENERATION (startedAt). An agent that was merely silent when we read liveness
+ * and heart-beats in the read→steal window keeps the SAME generation, so its
+ * claim SATISFIES the CAS: it gets stolen and the ticket re-dispatched while the
+ * original session is still running — a double-invoke (R1). The dead-session
+ * detector already re-checks liveness immediately before its steal
+ * (dead-session-detector.mjs step 1b); the cascade did not. These pin that it now
+ * does, on BOTH paths that reach stealAndRedispatch (event + sweep).
+ */
+describe("TEAM-3755 F7 — liveness is re-checked immediately before the steal", () => {
+  const inProgressSiblings = [
+    { ticketId: DONE, status: "done" },
+    { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+  ];
+
+  it("event path: an agent that heart-beats in the read→steal window is NOT stolen", async () => {
+    // First read: stale (this is what classified the lease dead). Second read —
+    // the F7 re-check — live: the agent resurrected.
+    const isLeaseLive = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const { deps, ddb, publishEvent, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => inProgressSiblings),
+      extendedStates: "enforce",
+      lease: { isLeaseLive },
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    // The whole point: no steal, no re-dispatch, no second session.
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(statusWrites(ddb)).toHaveLength(0);
+    // Two independent liveness reads — the classification and the re-check.
+    expect(lease.lastAgentActivity).toHaveBeenCalledTimes(2);
+    expect(isLeaseLive).toHaveBeenCalledTimes(2);
+    // It degrades to exactly what the non-racing ordering would have done
+    // (AC-D3.3): a context nudge for the live agent.
+    const nudges = eventsOfType(publishEvent, "orchestrator.nudge");
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0][2]).toMatchObject({ agentId: "dev", unblockedBy: DONE, workflowId: "wf_1" });
+    expect(records[0].CascadeRedispatch).toBe(0);
+    expect(records[0].CascadeNudgeLiveLease).toBe(1);
+  });
+
+  it("a lease still stale on the re-check steals + re-dispatches exactly once", async () => {
+    const { deps, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => inProgressSiblings),
+      extendedStates: "enforce",
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    // The guard costs one extra read; it must not cost (or duplicate) a recovery.
+    expect(lease.lastAgentActivity).toHaveBeenCalledTimes(2);
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(lease.stealClaim).toHaveBeenCalledWith(deps.ddb, "workflows", "wf_1", "TEAM-2", STALE_STARTED);
+    expect(redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("sweep path (reconcileDependent) gets the same guard", async () => {
+    // The sweep routes in_progress candidates straight to stealAndRedispatch, so
+    // the re-check has to live THERE, not in the event-path branch — otherwise the
+    // reconcile sweep keeps the double-invoke window.
+    const isLeaseLive = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const { deps, publishEvent, lease, redispatch } = makeExtDeps({ lease: { isLeaseLive } });
+    const { reconcileDependent } = createCascade(deps);
+    const m = newMetrics();
+
+    const outcome = await reconcileDependent(
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+      "reconcile-sweep", extWorkflow, m, "enforce"
+    );
+
+    expect(outcome).toBe("nudged");
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(1);
+    expect(m.skippedLiveLease).toBe(1);
+    expect(m.redispatched).toBe(0);
+  });
+
+  it("shadow mode still performs ZERO liveness re-checks and zero writes", async () => {
+    // Shadow returns before the steal, so there is nothing to re-check — the guard
+    // must not add a second read (or any write) on the observe-only path.
+    const { deps, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => inProgressSiblings),
+      extendedStates: "shadow",
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(lease.lastAgentActivity).toHaveBeenCalledTimes(1);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * TEAM-3755 F9 (P2) — strongly-consistent per-blocker confirm on the EVENT path.
+ *
+ * allBlockersResolved judges the sibling snapshot, which comes from the
+ * eventually-consistent parentId-index GSI (index.mjs getChildTickets, no
+ * ConsistentRead). A stale page can still show a blocker that was JUST reopened
+ * for rework as done — and under enforce that drove a steal + RE-DISPATCH of an
+ * in_progress dependent whose inputs are not fixed yet, so the agent re-runs
+ * against known-bad inputs. The reconcile sweep is shielded by its leaseTtlMs
+ * quiet period; the event path fires seconds after the blocker closes and has
+ * none, so it confirms each blocker by key before acting.
+ */
+describe("TEAM-3755 F9 — blockers are confirmed by consistent point-read before an extended-state action", () => {
+  const stalePage = [
+    { ticketId: DONE, status: "done" },      // GSI says done…
+    { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+  ];
+
+  it("a blocker reopened for rework (stale snapshot) → NO steal, NO redispatch, NO nudge", async () => {
+    // …the authoritative read says it was reopened.
+    const getTicketConsistent = vi.fn(async (ticketId) => ({ ticketId, status: "in_progress" }));
+    const { deps, ddb, publishEvent, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => stalePage),
+      extendedStates: "enforce",
+      getTicketConsistent,
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    expect(getTicketConsistent).toHaveBeenCalledWith(DONE);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(statusWrites(ddb)).toHaveLength(0);
+    // Not even a nudge: the premise of the nudge ("your last blocker resolved")
+    // is the thing that turned out to be stale. Liveness is never even read.
+    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(0);
+    expect(lease.lastAgentActivity).not.toHaveBeenCalled();
+    expect(records[0].CascadeBlockerConfirmAborted).toBe(1);
+    expect(records[0].CascadeRedispatch).toBe(0);
+  });
+
+  it("a blocker the point-read cannot find counts as UNRESOLVED (fail safe)", async () => {
+    // A just-filed fix ticket / a blocker outside this epic's GSI page: absence is
+    // not proof of resolution, so we refuse to re-dispatch.
+    const { deps, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => stalePage),
+      extendedStates: "enforce",
+      getTicketConsistent: vi.fn(async () => null),
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+  });
+
+  it("EVERY blocker is confirmed, and a genuinely resolved set proceeds to the steal", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "FIX-1", status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE, "FIX-1"] },
+    ];
+    const getTicketConsistent = vi.fn(async (ticketId) => ({ ticketId, status: "cancelled" }));
+    const { deps, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      extendedStates: "enforce",
+      getTicketConsistent,
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    // Both blockers point-read (cancelled resolves a blocker, same as done)…
+    expect(getTicketConsistent.mock.calls.map((c) => c[0]).sort()).toEqual(["FIX-1", DONE].sort());
+    // …then the normal stale-lease recovery runs, unchanged.
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("shadow mode confirms too, so would-* metrics predict enforce honestly", async () => {
+    const { deps, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => stalePage),
+      extendedStates: "shadow",
+      getTicketConsistent: vi.fn(async (ticketId) => ({ ticketId, status: "in_progress" })),
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    // A would-steal here would be a LIE: enforce would have refused this one.
+    expect(records[0].CascadeWouldSteal).toBe(0);
+    expect(records[0].CascadeWouldRedispatch).toBe(0);
+    expect(records[0].CascadeBlockerConfirmAborted).toBe(1);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+  });
+
+  it("a dependent with NO blockers needs no confirm (no point-read at all)", async () => {
+    // in_progress reached via a sibling that lists the closed ticket but carries an
+    // empty blockedBy is impossible here, so use the sweep entry point: it accepts
+    // candidates whose blockedBy is vacuously satisfied.
+    const getTicketConsistent = vi.fn(async () => null);
+    const { deps, lease } = makeExtDeps({ getTicketConsistent });
+    const { handleInProgressDependent } = createCascade(deps);
+
+    await handleInProgressDependent(
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev" },
+      DONE, extWorkflow, newMetrics(), "enforce"
+    );
+
+    expect(getTicketConsistent).not.toHaveBeenCalled();
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it("unwired getTicketConsistent → pre-F9 behavior (no confirm, steal proceeds)", async () => {
+    // Back-compat for any caller that constructs a cascade without the dep.
+    const { deps, lease, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => stalePage),
+      extendedStates: "enforce",
+      getTicketConsistent: null,
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("the SWEEP path is deliberately not confirmed (its quiet period is the guard)", async () => {
+    // Scope boundary, pinned on purpose: reconcileDependent must keep recovering a
+    // long-parked candidate even when a blocker reads non-terminal — that is the
+    // missed-DISPATCH case the sweep exists for, and parkedLongEnough (leaseTtlMs)
+    // is what keeps it from racing a live cascade.
+    const getTicketConsistent = vi.fn(async (ticketId) => ({ ticketId, status: "in_progress" }));
+    const { deps, lease, redispatch } = makeExtDeps({ getTicketConsistent });
+    const { reconcileDependent } = createCascade(deps);
+
+    const outcome = await reconcileDependent(
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+      "reconcile-sweep", extWorkflow, newMetrics(), "enforce"
+    );
+
+    expect(outcome).toBe("redispatched");
+    expect(getTicketConsistent).not.toHaveBeenCalled();
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(redispatch).toHaveBeenCalledTimes(1);
   });
 });

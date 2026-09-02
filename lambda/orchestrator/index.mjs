@@ -310,6 +310,9 @@ function getCascade() {
     workflowsTable: WORKFLOWS_TABLE,
     redispatch: redispatchTicket,
     reawakenGate: handleHumanReviewGate,
+    // TEAM-3755 F9 — the strongly-consistent blocker confirm the extended-state
+    // event path runs before it steals a lease and re-dispatches.
+    getTicketConsistent,
   });
   return _cascade;
 }
@@ -676,6 +679,36 @@ function isHumanAssignee(assignee) {
 /**
  * Mark a ticket's agentTasks entry complete with per-key writes (never a full
  * row put — completion cascades run concurrently with sibling claims).
+ *
+ * TEAM-3755 F3 — INVARIANT: a ticket-level "done" is NOT a lifecycle verdict.
+ *
+ * This function deliberately marks the task complete unconditionally, even when
+ * the harvested completion record carries a SHIP_BLOCKED outcome
+ * (deploy-blocked / static-ci-only). That is by design, not an oversight:
+ *
+ *   - A ticket status is the AGENT's report that its turn is over. The CD agent
+ *     genuinely finished — it ran, it found the deploy blocked, and it said so.
+ *     Diverting the ticket to a non-done status here would strand the run: the
+ *     unblock cascade keys off `done` to release dependents, and completion's
+ *     per-phase check requires a done agent ticket in every required phase, so a
+ *     "blocked" CD ticket would wedge the epic open forever instead of closing
+ *     it honestly.
+ *   - The RUN-level verdict is the single enforcement point (FR-D2.1/FR-D2.2).
+ *     harvestCompletionEvidence (called on the line below) lifts outcome +
+ *     blockReason + mergeCommit off the S3 completion record onto
+ *     agentTasks[ticketId] BEFORE completeWorkflow re-reads them, so
+ *     evaluateShipVerdict sees the block in the SAME pass that this done
+ *     triggered, and completeWorkflow closes the run on the honest terminal
+ *     phase (claimTerminalOutcome → "deploy-blocked") instead of "complete".
+ *
+ * So the guarantee is: ticket done + a SHIP_BLOCKED outcome ALWAYS yields a
+ * blocked terminal workflow phase, never "complete". That is what makes the
+ * unconditional mark safe, and it depends on two things staying true — the
+ * harvest running before the completion check, and shipVerdictOf treating only a
+ * mergeCommit/explicit "shipped" as proof (TEAM-3755 F1; commitSha is the
+ * unmerged branch HEAD and must never count). Both are pinned by
+ * lambda/orchestrator/ticket-done-blocked-terminal.test.mjs — if you change this
+ * function, that suite is the contract to keep green.
  */
 async function markTaskComplete(workflow, ticketId, assignee) {
   const now = new Date().toISOString();
@@ -2624,6 +2657,24 @@ async function getTicket(ticketId) {
     result.Item.issueType = result.Item.type;
   }
   return result.Item;
+}
+
+/**
+ * TEAM-3755 F9 — one ticket read by KEY with ConsistentRead, for callers that
+ * must not act on the eventually-consistent parentId-index snapshot (the cascade's
+ * blocker confirm). Jira has no read-consistency knob: its REST GET is already a
+ * fresh authoritative read, so the provider branch is the same shape as getTicket.
+ */
+async function getTicketConsistent(ticketId) {
+  if (TICKET_PROVIDER === "jira") {
+    return await getTicketFromJira(ticketId);
+  }
+  const result = await ddb.send(new GetCommand({
+    TableName: TICKETS_TABLE,
+    Key: { ticketId },
+    ConsistentRead: true,
+  }));
+  return result.Item || null;
 }
 
 async function getChildTickets(parentId) {

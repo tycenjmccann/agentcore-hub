@@ -5,8 +5,12 @@
  * decides WHEN to invoke it.
  *
  * Trigger shapes:
- *   1. EventBridge {source: "agentcore-hub.orchestrator", detail-type:
- *      "workflow.complete"} → ANALYZE (auto, idempotent)
+ *   1. EventBridge {source: "agentcore-hub.orchestrator", detail-type: any
+ *      TERMINAL workflow outcome — "workflow.complete",
+ *      "workflow.deploy_blocked", "workflow.static_ci_only" (TEAM-3755 F5; the
+ *      rule pattern lives in deploy/workflow-manager/deploy.sh)} → ANALYZE
+ *      (auto, idempotent). Only source + detail.workflowId are read, so the
+ *      detail-type set is a deploy-time concern, not a code branch.
  *   2. Direct invoke {workflowId, trigger: "manual"} → ANALYZE (re-runs allowed)
  *   3. EventBridge schedule {action: "watch"} → scan live runs, WATCH stale ones
  *

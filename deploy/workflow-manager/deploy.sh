@@ -121,10 +121,16 @@ fi
 rm -rf function.zip node_modules
 ANALYZER_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:${LAMBDA_NAME}"
 
-# ─── EventBridge: workflow.complete → ANALYZE ────────────────────────────────
+# ─── EventBridge: every TERMINAL workflow outcome → ANALYZE ──────────────────
+# TEAM-3755 F5: the rule listed only workflow.complete, so the TEAM-3747 D2
+# honest-close outcomes (closeWorkflowBlocked publishes workflow.deploy_blocked /
+# workflow.static_ci_only instead of a fake "complete") never triggered auto
+# analysis — exactly the runs most worth analyzing were the only ones silently
+# skipped. The analyzer already handles them: it keys off source +
+# detail.workflowId, and its TERMINAL_PHASES set carries both phases.
 aws events put-rule \
   --name "agentcore-hub-workflow-analyzer-trigger" \
-  --event-pattern '{"source":["agentcore-hub.orchestrator"],"detail-type":["workflow.complete"]}' \
+  --event-pattern '{"source":["agentcore-hub.orchestrator"],"detail-type":["workflow.complete","workflow.deploy_blocked","workflow.static_ci_only"]}' \
   --state ENABLED --output text >/dev/null
 
 aws events put-targets --rule "agentcore-hub-workflow-analyzer-trigger" \
@@ -135,7 +141,7 @@ aws lambda add-permission \
   --action lambda:InvokeFunction --principal events.amazonaws.com \
   --source-arn "arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:rule/agentcore-hub-workflow-analyzer-trigger" \
   --output text 2>/dev/null || true
-echo "✓ Rule: workflow.complete → ANALYZE"
+echo "✓ Rule: workflow.complete / deploy_blocked / static_ci_only → ANALYZE"
 
 # ─── EventBridge: rate(5 minutes) → WATCH scan ───────────────────────────────
 aws events put-rule \

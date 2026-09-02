@@ -16,6 +16,10 @@ import {
   PutCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
+// TEAM-3755 F2: both terminal-claim CASes below derive their "not already
+// terminal" guard from the ONE list in completion.mjs. completion.mjs is pure
+// (no store import), so this cannot cycle.
+import { notTerminalPhaseGuard } from "./completion.mjs";
 
 let _ddb = null;
 let _table = null;
@@ -570,20 +574,24 @@ export async function ackNotifications(workflowId, predicate, maxAttempts = 3) {
  * itself may lag behind the cancelledAt stamp) can never be overwritten by a
  * completion. A lost CAS is a graceful no-op (returns false, never throws) —
  * some other actor already reached a terminal decision for this run.
+ *
+ * TEAM-3755 F2: the guard now refuses ALL FIVE terminal phases (shared list in
+ * completion.mjs), not just complete/cancelled/error. It previously omitted
+ * "deploy-blocked" / "static-ci-only", so a completion racing in behind an
+ * honest blocked close overwrote it with "complete".
  */
 export async function completeWorkflow(workflowId, completedAt) {
+  const guard = notTerminalPhaseGuard("phase");
   try {
     await _ddb.send(new UpdateCommand({
       TableName: _table,
       Key: { workflowId },
       UpdateExpression: "SET phase = :complete, completedAt = :ts",
-      ConditionExpression:
-        "phase <> :complete AND phase <> :cancelled AND phase <> :error AND attribute_not_exists(cancelledAt)",
+      ConditionExpression: `${guard.condition} AND attribute_not_exists(cancelledAt)`,
       ExpressionAttributeValues: {
         ":complete": "complete",
         ":ts": completedAt,
-        ":cancelled": "cancelled",
-        ":error": "error",
+        ...guard.values,
       },
     }));
     return true;
@@ -603,25 +611,23 @@ export async function completeWorkflow(workflowId, completedAt) {
  * (complete/error/cancelled or an already-recorded block outcome) is a harmless
  * no-op. Records the block reason when supplied. Cancellation still precedes
  * everything (attribute_not_exists(cancelledAt)).
+ *
+ * TEAM-3755 F2: this CAS already excluded all five phases by hand; it now derives
+ * them from the SAME shared list as completeWorkflow so the two can never drift.
  */
 export async function claimTerminalOutcome(workflowId, outcome, completedAt, reason) {
+  const guard = notTerminalPhaseGuard("phase");
   try {
     await _ddb.send(new UpdateCommand({
       TableName: _table,
       Key: { workflowId },
       UpdateExpression:
         "SET phase = :outcome, completedAt = :ts" + (reason ? ", blockReason = :reason" : ""),
-      ConditionExpression:
-        "phase <> :complete AND phase <> :cancelled AND phase <> :error " +
-        "AND phase <> :deployBlocked AND phase <> :staticCi AND attribute_not_exists(cancelledAt)",
+      ConditionExpression: `${guard.condition} AND attribute_not_exists(cancelledAt)`,
       ExpressionAttributeValues: {
         ":outcome": outcome,
         ":ts": completedAt,
-        ":complete": "complete",
-        ":cancelled": "cancelled",
-        ":error": "error",
-        ":deployBlocked": "deploy-blocked",
-        ":staticCi": "static-ci-only",
+        ...guard.values,
         ...(reason ? { ":reason": String(reason).slice(0, 500) } : {}),
       },
     }));
