@@ -1,13 +1,17 @@
 /**
- * TEAM-3748 D4 — DEAD_SESSION_DETECTOR_MODE default flip (index.mjs level).
+ * TEAM-3763 F1 — DEAD_SESSION_DETECTOR_MODE default is SHADOW (index.mjs level).
  *
  * The detector's OWN fail-safe coercion (unknown→shadow, shadow→zero-writes) is
  * pinned in dead-session-detector.test.mjs. What lives ONLY in index.mjs is the
  * default the sweep dispatch resolves the env var to before handing it to
- * runSweep:  `process.env.DEAD_SESSION_DETECTOR_MODE || "enforce"`. This suite
- * drives the real orchestrator `handler` with the dead_session_sweep sentinel
- * and asserts the exact mode string index passes through — the detector is
- * mocked so we observe the argument, not the sweep behavior.
+ * runSweep:  `process.env.DEAD_SESSION_DETECTOR_MODE || "shadow"`. Per the
+ * FR-D4.1 rollout, shadow → enforce is an explicit operator action, so an unset
+ * install (production today; deploy.sh forwards the var only when set) MUST stay
+ * observe-only — a fresh deploy that omits the var can never silently begin
+ * stealing/retrying sessions. This suite drives the real orchestrator `handler`
+ * with the dead_session_sweep sentinel and asserts the exact mode string index
+ * passes through — the detector is mocked so we observe the argument, not the
+ * sweep behavior.
  *
  * ARTIFACT_BUCKET is left unset so loadAgentRoster / loadWorkflowDefs fall back
  * to their in-code rosters with zero S3 calls; the AWS SDK seams are mocked to
@@ -72,18 +76,29 @@ beforeEach(() => {
 });
 
 describe("DEAD_SESSION_DETECTOR_MODE default (index.mjs sweep dispatch)", () => {
-  it("UNSET → the sweep runs in enforce (the new default)", async () => {
+  it("UNSET → the sweep runs in shadow (the safe, observe-only default)", async () => {
     delete process.env.DEAD_SESSION_DETECTOR_MODE;
     const handler = await loadHandler();
 
     const result = await handler({ ...SWEEP_EVENT });
 
-    expect(h.modes).toEqual(["enforce"]);
-    expect(result.mode).toBe("enforce");
+    // shadow → observe + metrics, ZERO writes. Promotion to enforce is an
+    // explicit operator action (FR-D4.1), never a deploy-time default.
+    expect(h.modes).toEqual(["shadow"]);
+    expect(result.mode).toBe("shadow");
   });
 
-  it('empty string → falsy → coalesces to enforce', async () => {
+  it('empty string → falsy → coalesces to shadow', async () => {
     process.env.DEAD_SESSION_DETECTOR_MODE = "";
+    const handler = await loadHandler();
+
+    await handler({ ...SWEEP_EVENT });
+
+    expect(h.modes).toEqual(["shadow"]);
+  });
+
+  it('explicit "enforce" is passed through verbatim (opt-in only)', async () => {
+    process.env.DEAD_SESSION_DETECTOR_MODE = "enforce";
     const handler = await loadHandler();
 
     await handler({ ...SWEEP_EVENT });
@@ -91,7 +106,7 @@ describe("DEAD_SESSION_DETECTOR_MODE default (index.mjs sweep dispatch)", () => 
     expect(h.modes).toEqual(["enforce"]);
   });
 
-  it('explicit "shadow" is passed through verbatim (not overridden by the default)', async () => {
+  it('explicit "shadow" is passed through verbatim (matches the default)', async () => {
     process.env.DEAD_SESSION_DETECTOR_MODE = "shadow";
     const handler = await loadHandler();
 

@@ -55,41 +55,55 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 const GITHUB_LAMBDA = process.env.GITHUB_LAMBDA || "agentcore-hub-github-mcp";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const MAX_QA_RETRIES = 3;
-// Dead-session detector rollout flag (TEAM-3618 D1.2; promoted to enforce by
-// default in TEAM-3748 D4.1): off = skip the sweep, shadow = observe + metrics
-// + shadow-flagged events but ZERO writes, enforce (the NEW DEFAULT — the
-// silent-death watchdog now recovers for real) = steal/retry/escalate. The
+// Dead-session detector rollout flag (TEAM-3618 D1.2): off = skip the sweep,
+// shadow = observe + metrics + shadow-flagged events but ZERO writes, enforce =
+// steal/retry/escalate. Unset/empty DEFAULTS TO SHADOW (TEAM-3763 F1): per the
+// FR-D4.1 rollout, shadow → enforce is an explicit operator action, not a
+// deploy-time flip. A fresh deploy that omits the var must stay observe-only —
+// deploy.sh:94-99 forwards the var only when explicitly set, so an unset install
+// (production today) must NOT silently begin stealing/retrying sessions. The
 // fail-safe coercion still holds: runSweep normalizes (trim+lowercase) and
 // coerces anything not exactly off|shadow|enforce back to shadow, so a typo in
 // the env var can only ever DOWNGRADE to observe-only, never grant a rogue mode.
-const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "enforce";
+const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
 // Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b; tri-state as of
 // TEAM-3747 D1). off = the cascade only re-Readies {blocked, todo} dependents
-// (commit-4a behavior); shadow (the NEW DEFAULT — ships dark-but-observing) =
-// evaluate the extended-state path and emit would-nudge/would-steal/would-
-// reawaken metrics but perform ZERO writes; enforce = an in_progress dependent
-// whose last blocker resolves is lease-guarded (live → nudge only; stale → steal
-// + re-dispatch through the claim CAS) and an in_review gate is re-woken for
-// real. Same vocabulary + fail-safe default (shadow) as DEAD_SESSION_DETECTOR_MODE.
-// Backwards compatible: the legacy boolean "true"/"1"/"on" maps to enforce; an
-// unset or unrecognized value falls back to shadow (never silently enforces).
+// (commit-4a behavior — the PRE-EPIC production path); shadow = evaluate the
+// extended-state path and emit would-nudge/would-steal/would-reawaken metrics
+// but perform ZERO writes; enforce = an in_progress dependent whose last blocker
+// resolves is lease-guarded (live → nudge only; stale → steal + re-dispatch
+// through the claim CAS) and an in_review gate is re-woken for real.
+// Unset/empty DEFAULTS TO OFF (TEAM-3763 F6): "off" is the ONLY value that is
+// byte-identical to pre-epic — shadow is not, because cascade.mjs's extended
+// path issues extra DDB reads (the F9 strongly-consistent blocker confirm +
+// lease-liveness lastAgentActivity read) before its no-write mode check. So an
+// unset install (production today) must perform ZERO extra reads. Explicit "off"
+// short-circuits in cascade.mjs before any of those reads (cascade.mjs:173).
+// Backwards compatible: the legacy boolean "true"/"1"/"on" maps to enforce.
 const CASCADE_EXTENDED_STATES_MODE = resolveCascadeMode(process.env.CASCADE_EXTENDED_STATES);
-// Missed-unblock reconciliation sweep (TEAM-3747 D1). Same tri-state + fail-safe
-// default; governed independently of the cascade's own mode (it is a separate
-// safety-net rollout). Normalized inside reconcile-sweep.runSweep.
-const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "shadow";
+// Missed-unblock reconciliation sweep (TEAM-3747 D1). Tri-state, governed
+// independently of the cascade's own mode (a separate safety-net rollout).
+// Unset/empty DEFAULTS TO OFF (TEAM-3763 F2): the sweep is now scheduled
+// (deploy.sh wires a reconcile_sweep EventBridge target), so a dark default is
+// what keeps a fresh deploy byte-identical to pre-epic. runSweep("off")
+// short-circuits before its first ScanCommand (reconcile-sweep.mjs:165) — ZERO
+// DDB reads/writes. shadow/enforce only when the operator explicitly sets the
+// var (deploy.sh forwards it only when set).
+const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
- * ("true"/"1"/"on"/"enforce") → enforce; explicit "off" → off; unset, "false",
- * "0", "shadow", or anything unrecognized → shadow (the safe, observe-only
- * default). Trimmed + lowercased so a casing slip can never grant write access.
+ * ("true"/"1"/"on"/"enforce") → enforce; explicit "shadow" → shadow; unset, "",
+ * "off", "false", "0", or anything unrecognized → off (the pre-epic passthrough,
+ * TEAM-3763 F6). shadow/enforce are granted ONLY on an explicit, recognized
+ * value so an unset or typo'd var can never add the extended path's extra DDB
+ * reads. Trimmed + lowercased so a casing slip can never grant write access.
  */
 function resolveCascadeMode(raw) {
   const v = String(raw ?? "").trim().toLowerCase();
-  if (v === "off") return "off";
   if (v === "enforce" || v === "on" || v === "true" || v === "1") return "enforce";
-  return "shadow"; // "", "shadow", "false", "0", or garbage → shadow
+  if (v === "shadow") return "shadow";
+  return "off"; // "", unset, "off", "false", "0", or garbage → off (pre-epic)
 }
 // TEAM-3686 Finding 3 / TEAM-3690: deliverable-evidence gate on the orchestrator
 // completion path — same flag, same semantics as the HTTP complete route

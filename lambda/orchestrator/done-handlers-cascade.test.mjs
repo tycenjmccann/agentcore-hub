@@ -264,10 +264,11 @@ describe("handleTicketDone (DDB-stream path) drives the real cascade", () => {
  * EventBridge rule fires { source: "orchestrator.sweep", action:
  * "reconcile_sweep" }; the handler must branch to the reconcile sweep BEFORE any
  * stream/webhook parsing (the event has no Records) and return the sweep's
- * metrics summary. Here the workflows Scan is mocked empty, so the sweep runs to
- * completion with zero candidates — proof the route dispatched the sweep rather
- * than falling through. Default mode is shadow (RECONCILE_SWEEP_MODE unset), so
- * the sweep touches nothing.
+ * metrics summary — proof the route dispatched the sweep rather than falling
+ * through. Default mode is OFF (RECONCILE_SWEEP_MODE unset — TEAM-3763 F2): now
+ * that the sweep is SCHEDULED, dark-by-default keeps a fresh deploy byte-
+ * identical to pre-epic, so runSweep short-circuits before its first Scan and
+ * touches nothing.
  */
 describe("reconcile-sweep sentinel route (TEAM-3747 D1)", () => {
   it("routes { orchestrator.sweep, reconcile_sweep } to the sweep and returns its summary", async () => {
@@ -275,8 +276,8 @@ describe("reconcile-sweep sentinel route (TEAM-3747 D1)", () => {
 
     // The sweep ran (returned its metrics), not a stream/webhook path.
     expect(typeof result.sweepId).toBe("string");
-    expect(result.mode).toBe("shadow"); // RECONCILE_SWEEP_MODE unset → fail-safe default
-    expect(result.candidates).toBe(0);  // Scan mocked empty → no candidates
+    expect(result.mode).toBe("off");    // RECONCILE_SWEEP_MODE unset → dark default (F2)
+    expect(result.candidates).toBe(0);  // off short-circuits before the Scan
     // A sweep is not a ticket-done fan-out: no agent dispatch, no board writes.
     expect(h.state.lambdaInvokes).toHaveLength(0);
     expect(h.state.updates).toHaveLength(0);
