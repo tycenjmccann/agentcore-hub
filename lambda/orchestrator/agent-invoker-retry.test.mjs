@@ -393,4 +393,88 @@ describe("TEAM-3756 F4 — runtime retry re-checks liveness before re-sending", 
     expect(blockedUpdates()).toHaveLength(0);
     expect(errorEntries()).toHaveLength(0);
   });
+
+  /**
+   * TEAM-3764 F3 — the re-check must PAGE through the events, not trust one
+   * newest-first Limit-50 page. A busy run (parallel fan-out, streaming) holds
+   * dozens of events newer than the heartbeat; a single-page guard read the
+   * running session as "not started" and duplicated it on retry (FR-D4.4 / R1).
+   */
+  describe("TEAM-3764 F3 — liveness re-check paginates past unrelated events", () => {
+    // An unrelated but FRESH event (different ticket/agent), timestamped now so
+    // the time-horizon early-exit never fires while these fill the pages.
+    const unrelatedEvent = (i) => ({
+      type: i % 3 === 0 ? "agent.streaming" : "workflow.event",
+      timestamp: new Date().toISOString(),
+      detail: { ticketId: `TEAM-OTHER-${i}`, agentId: `other_agent_${i % 7}` },
+    });
+    // queryImpl emulating real DynamoDB pagination over `allEvents` (newest
+    // first): honors Limit and ExclusiveStartKey, returns LastEvaluatedKey
+    // while more rows remain.
+    const paginatedQuery = (allEvents) => async (input) => {
+      const start = input.ExclusiveStartKey ? input.ExclusiveStartKey.idx : 0;
+      const page = allEvents.slice(start, start + (input.Limit || 50));
+      const next = start + page.length;
+      return {
+        Items: page,
+        ...(next < allEvents.length ? { LastEvaluatedKey: { idx: next } } : {}),
+      };
+    };
+
+    it("finds the heartbeat buried behind >50 newer unrelated events → NO duplicate invoke", async () => {
+      // 60 unrelated events crowd out page one entirely; the real agent.started
+      // for TEAM-42 sits on page two.
+      const buried = [
+        ...Array.from({ length: 60 }, (_, i) => unrelatedEvent(i)),
+        startedEvent(),
+      ];
+      h.state.httpImpl = resetAfterWrite();
+      h.state.queryImpl = paginatedQuery(buried);
+
+      const handler = await loadHandler();
+      await handler({ ...RUNTIME_EVENT });
+
+      expect(h.state.httpCalls).toBe(1);            // the session was NOT duplicated
+      expect(h.state.queries.length).toBeGreaterThanOrEqual(2); // ...because the guard paged past page one
+      expect(blockedUpdates()).toHaveLength(0);     // treated as success (it started)
+      expect(errorEntries()).toHaveLength(0);
+    });
+
+    it("page bound exhausted inside the window (no heartbeat found) → UNKNOWABLE: no retry, escalate once", async () => {
+      // 400 fresh unrelated events — more than 6 pages × 50 — and no heartbeat
+      // anywhere. The guard cannot reach the time horizon within its bound, so
+      // the answer is unknowable and R7 wins: never re-send on maybe-started.
+      const flood = Array.from({ length: 400 }, (_, i) => unrelatedEvent(i));
+      h.state.httpImpl = resetAfterWrite();
+      h.state.queryImpl = paginatedQuery(flood);
+
+      const handler = await loadHandler();
+      await handler({ ...RUNTIME_EVENT });
+
+      expect(h.state.httpCalls).toBe(1);        // no blind retry
+      expect(h.state.queries).toHaveLength(6);  // the documented page bound
+      expect(blockedUpdates()).toHaveLength(1); // normal terminal-failure escalation
+      expect(errorEntries()).toHaveLength(1);
+    });
+
+    it("a stale run (all events older than the window) still proves NOT-started on page one → retry proceeds", async () => {
+      // Horizon early-exit: page one's oldest row already predates the window,
+      // so later pages provably cannot hold a fresh heartbeat — exactly one
+      // query, and the FR-D4.2 bounded retry is preserved.
+      const old = new Date(Date.now() - 120_000).toISOString();
+      const staleOnly = Array.from({ length: 50 }, (_, i) => ({
+        ...unrelatedEvent(i),
+        timestamp: old,
+      }));
+      h.state.httpImpl = perCall(resetAfterWrite, accept);
+      h.state.queryImpl = paginatedQuery([...staleOnly, ...staleOnly]);
+
+      const handler = await loadHandler();
+      await handler({ ...RUNTIME_EVENT });
+
+      expect(h.state.httpCalls).toBe(2);       // retried and succeeded
+      expect(h.state.queries).toHaveLength(1); // horizon crossed on page one
+      expect(errorEntries()).toHaveLength(0);
+    });
+  });
 });

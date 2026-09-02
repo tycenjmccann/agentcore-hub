@@ -585,13 +585,25 @@ function mayHaveStartedError(err) {
 // clock skew between this Lambda and the runtime's event timestamps.
 const LIVENESS_CLOCK_SLACK_MS = 5_000;
 
+// TEAM-3764 F3 — the liveness re-check pages through the workflow's events
+// instead of trusting one newest-first page: a busy run (parallel design fan-out,
+// streaming events) can hold >50 rows NEWER than the heartbeat, and a guard that
+// stops at page one would read a running session as "not started" and duplicate
+// it on retry (FR-D4.4 / R1). Paging is bounded two ways: by the time horizon
+// (newest-first — once a page bottoms out below `sinceMs`, no later page can
+// hold a fresh heartbeat: provably NOT started) and by a hard page cap, past
+// which the answer is UNKNOWABLE (null → caller refuses the retry, fail-safe).
+const LIVENESS_QUERY_PAGE_LIMIT = 50;
+const LIVENESS_QUERY_MAX_PAGES = 6;
+
 /**
  * Did an agent session for this (workflow, ticket) demonstrably START since
  * `sinceMs`? Reads the same heartbeat rows the dead-session detector's
  * lease.lastAgentActivity reads (agent.started / agent.streaming in
  * EVENTS_TABLE — runtime agents write them directly from main.py).
  *
- * Returns true / false / null(unknown: ids missing or the query failed).
+ * Returns true / false / null(unknown: ids missing, the query failed, or the
+ * page bound ran out before the scan reached the time window).
  * Callers must treat null as "assume it started": the cost of a wrong "not
  * started" is a duplicate session (R7 violation, unrecoverable), while the cost
  * of a wrong "started" is one stalled claim the dead-session detector already
@@ -600,26 +612,43 @@ const LIVENESS_CLOCK_SLACK_MS = 5_000;
 async function agentStartedSince(liveness, sinceMs) {
   if (!liveness?.workflowId || !(liveness.ticketId || liveness.agentId)) return null;
   try {
-    const res = await ddb.send(new QueryCommand({
-      TableName: EVENTS_TABLE,
-      KeyConditionExpression: "workflowId = :w",
-      ExpressionAttributeValues: { ":w": liveness.workflowId },
-      ScanIndexForward: false, // newest first — startup events are the newest
-      Limit: 50,
-    }));
-    for (const e of res.Items || []) {
-      if (e.type !== "agent.started" && e.type !== "agent.streaming") continue;
-      const d = e.detail || {};
-      // Ticket-scoped match preferred; an event carrying no ticketId still
-      // counts when it is unambiguously this agent's (same agentId).
-      const matches = liveness.ticketId && d.ticketId
-        ? d.ticketId === liveness.ticketId
-        : !!liveness.agentId && d.agentId === liveness.agentId;
-      if (!matches) continue;
-      const t = Date.parse(e.timestamp || d.timestamp || "");
-      if (Number.isFinite(t) && t >= sinceMs) return true;
+    let lastKey;
+    for (let page = 0; page < LIVENESS_QUERY_MAX_PAGES; page++) {
+      const res = await ddb.send(new QueryCommand({
+        TableName: EVENTS_TABLE,
+        KeyConditionExpression: "workflowId = :w",
+        ExpressionAttributeValues: { ":w": liveness.workflowId },
+        ScanIndexForward: false, // newest first — startup events are the newest
+        Limit: LIVENESS_QUERY_PAGE_LIMIT,
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }));
+      let pageOldestMs = Infinity;
+      for (const e of res.Items || []) {
+        const d = e.detail || {};
+        const t = Date.parse(e.timestamp || d.timestamp || "");
+        if (Number.isFinite(t) && t < pageOldestMs) pageOldestMs = t;
+        if (e.type !== "agent.started" && e.type !== "agent.streaming") continue;
+        // Ticket-scoped match preferred; an event carrying no ticketId still
+        // counts when it is unambiguously this agent's (same agentId).
+        const matches = liveness.ticketId && d.ticketId
+          ? d.ticketId === liveness.ticketId
+          : !!liveness.agentId && d.agentId === liveness.agentId;
+        if (!matches) continue;
+        if (Number.isFinite(t) && t >= sinceMs) return true;
+      }
+      // Time horizon crossed: everything on later pages is older still, so a
+      // fresh heartbeat provably does not exist. The extra slack keeps a
+      // slightly-disordered page boundary from flipping this to a false "not
+      // started" (the unrecoverable direction).
+      if (pageOldestMs < sinceMs - LIVENESS_CLOCK_SLACK_MS) return false;
+      lastKey = res.LastEvaluatedKey;
+      if (!lastKey) return false; // table exhausted inside the window — no heartbeat
     }
-    return false;
+    console.warn(
+      `[agent-invoker] liveness re-check exhausted ${LIVENESS_QUERY_MAX_PAGES} pages ` +
+        `without reaching the time window — treating as maybe-started`
+    );
+    return null;
   } catch (err) {
     console.warn(`[agent-invoker] liveness re-check failed (${err?.message || err}) — treating as maybe-started`);
     return null;
