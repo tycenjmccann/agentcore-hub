@@ -99,12 +99,26 @@ if [ -n "${DEAD_SESSION_DETECTOR_MODE:-}" ]; then
   DETECTOR_VARS=",DEAD_SESSION_DETECTOR_MODE=${DEAD_SESSION_DETECTOR_MODE}"
 fi
 
-# Cascade extended-states rollout (TEAM-3618 D3 commit 4b): on | off. The code
-# defaults to OFF (commit-4a behavior) when unset — only forward an explicit
-# override so a stale config.sh value can never silently flip it on.
+# Cascade extended-states rollout (TEAM-3618 D3 commit 4b; tri-state off|shadow|
+# enforce as of TEAM-3747 D1). The code defaults to OFF (commit-4a behavior — the
+# pre-epic path, zero extra DDB reads) when unset; shadow/enforce are opt-in and
+# NOT byte-identical to off (shadow's extended path issues extra reads). Only
+# forward an explicit override so a stale config.sh value can never silently
+# flip it off OFF. (TEAM-3763 F6: aligns code default with this doc.)
 CASCADE_VARS=""
 if [ -n "${CASCADE_EXTENDED_STATES:-}" ]; then
   CASCADE_VARS=",CASCADE_EXTENDED_STATES=${CASCADE_EXTENDED_STATES}"
+fi
+
+# Missed-unblock reconciliation sweep rollout (TEAM-3747 D1; scheduled by the
+# reconcile_sweep EventBridge target wired below). Tri-state off|shadow|enforce.
+# The code defaults to OFF (dark — runSweep short-circuits before its first
+# DynamoDB scan) when unset, so a fresh deploy performs ZERO extra reads/writes;
+# shadow (observe-only scan) and enforce (re-drive stalled dependents) are opt-in.
+# Only forward an explicit override (TEAM-3763 F2).
+RECONCILE_VARS=""
+if [ -n "${RECONCILE_SWEEP_MODE:-}" ]; then
+  RECONCILE_VARS=",RECONCILE_SWEEP_MODE=${RECONCILE_SWEEP_MODE}"
 fi
 
 # CI/CD pipeline mode (PR #263): when set, buildAgentContext surfaces a
@@ -116,7 +130,7 @@ if [ -n "${PIPELINE_ENABLED:-}" ]; then
   PIPELINE_VARS=",PIPELINE_ENABLED=${PIPELINE_ENABLED}"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${PIPELINE_VARS}}"
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}}"
 
@@ -243,12 +257,21 @@ else
   echo "  ✓ events-writer EventBridge invoke permission added"
 fi
 
-# ── EventBridge: scheduled dead-session sweep → orchestrator ──────────────────
+# ── EventBridge: scheduled sweeps → orchestrator ──────────────────────────────
 # Mirrors DeadSessionSweepRule + permission in template.yaml. A rate(5 minutes)
-# rule invokes the orchestrator with the sentinel payload; index.mjs branches on
-# it before any stream/webhook parsing (TEAM-3618 D1.2). Scheduled rules live on
-# the default bus only.
-echo "=== Wiring dead-session sweep trigger (EventBridge schedule) ==="
+# rule invokes the orchestrator with a sentinel payload; index.mjs branches on it
+# before any stream/webhook parsing. ONE rule fans out to TWO targets, each with
+# its own Input action — a separate synthetic invocation per sweep:
+#   - action "dead_session_sweep"  → getDetector().runSweep       (TEAM-3618 D1.2)
+#   - action "reconcile_sweep"      → getReconcileSweep().runSweep (TEAM-3747 D1;
+#     wired here by TEAM-3763 F2 — the handler existed but was never scheduled,
+#     leaving the missed-unblock backstop FR-D1.3 dormant in production).
+# Both sweeps are gated by their own rollout-mode env var and default DARK when
+# unset (DEAD_SESSION_DETECTOR_MODE=shadow, RECONCILE_SWEEP_MODE=off), so firing
+# them on a fresh deploy changes nothing until an operator opts in. Scheduled
+# rules live on the default bus only; the single rule ARN below covers both
+# targets, so one add-permission statement authorizes both.
+echo "=== Wiring scheduled sweep triggers (EventBridge schedule) ==="
 SWEEP_RULE="agentcore-hub-dead-session-sweep"
 ORCH_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-orchestrator"
 
@@ -261,13 +284,14 @@ aws events put-rule \
 echo "  ✓ Rule $SWEEP_RULE upserted (rate(5 minutes))"
 
 # JSON list form (not the key=value shorthand): the Input JSON contains commas,
-# which the shorthand parser would mis-split on. Input is a JSON *string*.
+# which the shorthand parser would mis-split on. Input is a JSON *string*. Two
+# targets on the one rule — the dead-session sweep and the reconcile sweep.
 aws events put-targets \
   --rule "$SWEEP_RULE" \
-  --targets '[{"Id":"orchestrator","Arn":"'"$ORCH_ARN"'","Input":"{\"source\":\"orchestrator.sweep\",\"action\":\"dead_session_sweep\"}"}]' \
+  --targets '[{"Id":"orchestrator","Arn":"'"$ORCH_ARN"'","Input":"{\"source\":\"orchestrator.sweep\",\"action\":\"dead_session_sweep\"}"},{"Id":"reconcile","Arn":"'"$ORCH_ARN"'","Input":"{\"source\":\"orchestrator.sweep\",\"action\":\"reconcile_sweep\"}"}]' \
   --region "$AWS_REGION" \
   --output text --query 'FailedEntryCount' >/dev/null
-echo "  ✓ Target orchestrator attached to $SWEEP_RULE"
+echo "  ✓ Targets orchestrator (dead_session_sweep + reconcile_sweep) attached to $SWEEP_RULE"
 
 SWEEP_RULE_ARN="arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:rule/${SWEEP_RULE}"
 SWEEP_PERM_SID="agentcore-hub-orchestrator-dead-session-sweep"

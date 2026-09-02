@@ -41,11 +41,18 @@ export default defineConfig({
       // dependency-injected (stub ddb/store/lease + fake clock), so its
       // guard/trigger/retry/escalate logic is unit-testable with no AWS.
       "lambda/orchestrator/dead-session-detector.test.mjs",
-      // detector-mode-default (TEAM-3748 D4) — the index.mjs sweep-dispatch
-      // default flip: DEAD_SESSION_DETECTOR_MODE now coalesces to "enforce" when
-      // unset (was shadow). Drives the real handler with the sweep sentinel and
-      // a mocked detector to observe the exact mode forwarded to runSweep.
+      // detector-mode-default (TEAM-3763 F1) — the index.mjs sweep-dispatch
+      // default: DEAD_SESSION_DETECTOR_MODE coalesces to "shadow" (observe-only)
+      // when unset, so a fresh deploy stays dark. Drives the real handler with
+      // the sweep sentinel and a mocked detector to observe the exact mode
+      // forwarded to runSweep.
       "lambda/orchestrator/detector-mode-default.test.mjs",
+      // sweep-mode-defaults (TEAM-3763 F2/F6) — the index.mjs defaults for the two
+      // dark-by-default sweeps: RECONCILE_SWEEP_MODE unset → "off" (the sweep is
+      // now scheduled) and CASCADE_EXTENDED_STATES unset → "off". Drives the real
+      // handler with the reconcile_sweep sentinel (mocked cascade + reconcile
+      // factories) to observe the modes index resolves before dispatch.
+      "lambda/orchestrator/sweep-mode-defaults.test.mjs",
       // agent-invoker-retry (TEAM-3748 D4.2) — bounded transient-5xx retry at the
       // invoke boundary + the D4.3 publishAgentEvent dual-write. Drives the real
       // agent-invoker handler through the harness path with the AgentCore client
