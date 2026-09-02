@@ -69,6 +69,15 @@ const RAW_NAV_ITEMS: NavItem[] = [
   { href: "/tickets", label: "Ticket History", icon: History, module: "workflow" },
 ];
 
+// TEAM-3739: NEXT_PUBLIC_PIPELINE_ENABLED is forwarded verbatim, so whitespace
+// or casing variants ("1 ", " true", "TRUE") must not silently hide the nav
+// tab. Mirrors isPipelineEnabled() in src/lib/pipeline/status.ts — kept local
+// (not imported) because status.ts pulls in server-only AWS SDK clients.
+export function isModuleFlagEnabled(v: string | undefined): boolean {
+  const raw = (v ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true";
+}
+
 function moduleEnabled(item: NavItem): boolean {
   if (!item.enabledBy) return true;
   // NEXT_PUBLIC_* are inlined at build time; read them by literal key so Next's
@@ -76,8 +85,7 @@ function moduleEnabled(item: NavItem): boolean {
   const flags: Record<string, string | undefined> = {
     NEXT_PUBLIC_PIPELINE_ENABLED: process.env.NEXT_PUBLIC_PIPELINE_ENABLED,
   };
-  const v = flags[item.enabledBy];
-  return v === "1" || v === "true";
+  return isModuleFlagEnabled(flags[item.enabledBy]);
 }
 
 export const NAV_ITEMS: NavItem[] = RAW_NAV_ITEMS.filter(moduleEnabled);
