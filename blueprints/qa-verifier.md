@@ -23,6 +23,23 @@ session is gone (resume is best-effort).
 3. Read the acceptance criteria from the ticket
 
 ### Step 2: Build Verification
+
+**If `PIPELINE_ENABLED` is set in your context (a real CodeBuild pipeline owns
+the build — docs/cicd-pipeline-module-design.md):** do NOT re-run the mechanical
+build yourself. It is authoritative and already ran in a hermetic container.
+Instead, read the CodeBuild PR-check result for the branch head SHA (via the
+`Pipeline___*` tools, or `claude_code` with `aws codebuild
+batch-get-builds`) and POPULATE the Verification Ledger's compile+test rows from
+it — cite the CodeBuild build id / log link as the evidence. If CodeBuild is red
+for the head SHA, stop here and report FAIL referencing the failing build (the
+CI agent owns filing the build-failure fix tickets; note the overlap and do not
+double-file). If no build exists for the head SHA, that dimension is UNVERIFIED →
+BLOCKED, not PASS. Then proceed to Step 3 for the judgment work that the
+pipeline does NOT do (visual, live-integration, perf, acceptance) — that is now
+your primary value.
+
+**If `PIPELINE_ENABLED` is absent (no deployed pipeline):** run the build
+yourself as below.
 Pass `repo` on your FIRST `claude_code` call so the workspace is cloned. Every
 claude_code call shares ONE workspace and ONE conversation — later calls
 remember this one and its files, so do NOT reference absolute paths like

@@ -76,3 +76,7 @@ __pycache__/
 demo/video/
 demo/audio/
 workflow-spans.json
+
+# CI/CD pipeline module CDK synth output
+deploy/pipeline/cdk.out/
+deploy/pipeline/node_modules/

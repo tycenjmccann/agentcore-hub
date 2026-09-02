@@ -14,6 +14,12 @@ COPY package.json package-lock.json* ./
 RUN npm ci
 COPY . .
 ENV TICKET_PROVIDER=jira
+# NEXT_PUBLIC_* are inlined at build time, so the pipeline module's nav flag must
+# be a build ARG — setting it only on the running service can't change the
+# already-baked client bundle (Codex PR #263 P2). Off by default; the pipeline's
+# Build stage passes --build-arg NEXT_PUBLIC_PIPELINE_ENABLED=1 when enabling it.
+ARG NEXT_PUBLIC_PIPELINE_ENABLED=""
+ENV NEXT_PUBLIC_PIPELINE_ENABLED=${NEXT_PUBLIC_PIPELINE_ENABLED}
 RUN npm run build
 
 # Production image

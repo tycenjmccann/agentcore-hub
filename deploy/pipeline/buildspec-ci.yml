@@ -1,0 +1,155 @@
+# buildspec-ci.yml — PR check AND the deploy pipeline's Build stage.
+#
+# Two callers, one file:
+#   - CodeBuild "agentcore-hub-ci" (PR webhook): runs the gates, posts a commit
+#     status back onto the PR -> branch protection blocks merge if red.
+#   - CodePipeline "Build" stage (BUILD_APP_IMAGE=true): runs the SAME gates,
+#     then emits the deploy artifacts (orchestrator zip + app image BY DIGEST)
+#     so the Deploy stage promotes exactly what was built here (build-once).
+#
+# The gates are the deterministic work that used to run inside the CI agent.
+# Any red here = build fails = no merge. See docs/cicd-pipeline-module-design.md.
+#
+# NOTE: every command is a QUOTED YAML scalar. An unquoted "echo foo: bar" parses
+# as a YAML mapping, not a string, and CodeBuild rejects the commands array
+# (Codex PR #263 round-3). Keep the quotes; avoid raw ": " in echo text.
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      # Do NOT set NODE_ENV=development globally — that makes `next build` render
+      # with the dev runtime and crashes prerender on client pages
+      # ("Cannot read properties of null (reading 'useContext')"). npm ci installs
+      # devDeps regardless of NODE_ENV, and next build must run in production mode.
+      # Mirrors .github/workflows/ci.yml, which sets nothing. (PR #263 pilot fix.)
+      - "node --version && npm --version"
+      - "npm ci --include=dev"
+      # Playwright needs a real browser + OS deps on the clean CodeBuild image
+      # (mirrors .github/workflows/ci.yml). Without this the test gates error.
+      - "npx playwright install --with-deps chromium"
+
+  pre_build:
+    commands:
+      # Authoritative required check -> must run EVERY blocking gate the GitHub CI
+      # workflow runs, else the blueprints skip their own mechanical tests on a
+      # green result and unit/race/telemetry regressions merge (Codex #263 r2).
+      # Kept in lockstep with .github/workflows/ci.yml.
+      - "npm run lint"
+      - "npx tsc --noEmit"
+      - "npm run test:unit"
+      - "./scripts/check-workflow-writes.sh"
+
+  build:
+    commands:
+      # production build == the module-removal smoke test
+      - "npm run build"
+      # Boot `next start` for the HERMETIC Playwright suite. Note: `npm test`
+      # (tabs + e2e-api-routes) makes REAL AWS-backed calls (DynamoDB workflow
+      # list/start) and CANNOT pass in a credential-less CI container — it is a
+      # live-deployment smoke test, NOT a hermetic gate, and .github/workflows/ci.yml
+      # does not run it as a blocking job either. The authoritative UI gate that
+      # IS hermetic is the Cloud Code suite (every backend call page.route-mocked).
+      - "nohup npm run start -- -p 3000 > /tmp/next-server.log 2>&1 &"
+      - |
+        for i in $(seq 1 30); do
+          if curl -sf -o /dev/null http://localhost:3000/; then echo "server up"; break; fi
+          sleep 2
+          if [ "$i" = "30" ]; then echo "server did not come up"; cat /tmp/next-server.log; exit 1; fi
+        done
+      # Cloud Code UI regression suite — the hermetic (mocked) blocking UI job
+      # from GH CI. This is the UI gate; the AWS-backed tab/api specs are not.
+      - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:cloud-code -- --trace retain-on-failure"
+      # runtime-agent telemetry pytest (hermetic, no AWS)
+      - |
+        python3 -m venv /tmp/pyci && . /tmp/pyci/bin/activate
+        pip install -q -r deploy/runtime-agent/tests/requirements-test.txt
+        pytest -q deploy/runtime-agent/tests \
+          deploy/runtime-agent/test_telemetry_init.py \
+          deploy/runtime-agent/test_build_env_vars.py
+        deactivate
+      # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
+      - "bash scripts/check-lambda-zip-manifest.sh"
+
+  post_build:
+    commands:
+      # dependency scan (report-only until baselined)
+      - "npm audit --audit-level=high || true"
+      # ── Deploy-pipeline Build stage only: emit artifacts by digest ──
+      - |
+        if [ "${BUILD_APP_IMAGE:-false}" = "true" ]; then
+          echo "Build stage: packaging orchestrator zip via lambda/orchestrator/deploy.sh's OWN file list"
+          # Reuse deploy.sh's exact `zip -rq function.zip ...` line — do NOT keep a
+          # second copy of the file list here (Codex #263 P2: two lists drift).
+          cp src/config/lease-constants.json lambda/orchestrator/lease-constants.json
+          ( cd lambda/orchestrator && npm ci --omit=dev )
+          ZIP_ARGS="$(grep -oE 'zip -rq function\.zip .*' lambda/orchestrator/deploy.sh | sed 's/^zip -rq function\.zip //')"
+          ( cd lambda/orchestrator && zip -rq /tmp/orchestrator.zip $ZIP_ARGS )
+          rm -f lambda/orchestrator/lease-constants.json
+          echo "Validate the ACTUAL built archive (not just deploy.sh's line)"
+          bash scripts/check-lambda-zip-manifest.sh --zip /tmp/orchestrator.zip
+          echo "Build + push app image to ECR, capture the DIGEST for promote-by-digest"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
+          aws ecr get-login-password --region "$AWS_REGION_HUB" \
+            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com"
+          # Build the image from the CANDIDATE roster with only the live runtimeArns
+          # merged in — NOT the stale deployed S3 doc (Codex #263 round-4 P1). This
+          # is the same merge the Deploy stage uploads, so the baked bundle and the
+          # deployed S3 config agree on the roster.
+          if aws s3 cp "s3://${ARTIFACT_BUCKET}/config/agents.json" /tmp/agents.s3.json --region "$AWS_REGION_HUB"; then
+            cp src/config/agents.json /tmp/agents.git.json
+            python3 deploy/pipeline/merge-agents-json.py /tmp/agents.s3.json src/config/agents.json /tmp/agents.merged.json
+            cp /tmp/agents.merged.json src/config/agents.json
+          fi
+          # CodePipeline's CodeStar source is a ZIP artifact with no .git — use the
+          # pipeline-resolved source revision, not `git rev-parse` (Codex #263 P1).
+          GIT_SHA="${CODEBUILD_RESOLVED_SOURCE_VERSION:-$(git rev-parse --short HEAD 2>/dev/null || echo nogit)}"
+          GIT_SHA="$(printf '%s' "$GIT_SHA" | cut -c1-12)"
+          docker buildx build --platform linux/amd64 \
+            --build-arg NEXT_PUBLIC_PIPELINE_ENABLED="${NEXT_PUBLIC_PIPELINE_ENABLED:-}" \
+            --tag "${ECR_URI}:${GIT_SHA}" --tag "${ECR_URI}:latest" \
+            --push --file Dockerfile . --provenance=false
+          if [ -f /tmp/agents.git.json ]; then cp /tmp/agents.git.json src/config/agents.json; fi
+          IMAGE_DIGEST="$(aws ecr describe-images --repository-name "$ECR_REPO" \
+            --image-ids imageTag="$GIT_SHA" --region "$AWS_REGION_HUB" \
+            --query 'imageDetails[0].imageDigest' --output text)"
+          echo "Resolved image digest: $IMAGE_DIGEST"
+          # Hand the exact artifacts to the Deploy stage.
+          mkdir -p pipeline-out
+          cp /tmp/orchestrator.zip pipeline-out/orchestrator.zip
+          printf '%s' "$IMAGE_DIGEST" > pipeline-out/image-digest.txt
+          printf '%s' "$GIT_SHA" > pipeline-out/git-sha.txt
+          # Changed-file list the Deploy stage uses for the fleet/eval scope guard.
+          # Must cover the WHOLE push, not just the tip: a multi-commit push where
+          # an EARLIER commit touched eval files would be missed by HEAD~1..HEAD
+          # and wrongly pass the guard (Codex #263 round-4 P2). Diff from the last
+          # SUCCESSFULLY DEPLOYED revision (recorded in S3 by a prior deploy); if
+          # that is unknown, emit the sentinel so the guard conservatively BLOCKS
+          # (forces a human to confirm scope) rather than under-reporting.
+          LAST_DEPLOYED="$(aws s3 cp "s3://${ARTIFACT_BUCKET}/pipeline-artifacts/last-deployed-sha.txt" - --region "$AWS_REGION_HUB" 2>/dev/null || true)"
+          if [ -n "$LAST_DEPLOYED" ] && git cat-file -e "${LAST_DEPLOYED}^{commit}" 2>/dev/null; then
+            git diff --name-only "${LAST_DEPLOYED}..HEAD" > pipeline-out/changed-files.txt
+          else
+            echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files.txt
+          fi
+        fi
+
+# For the deploy pipeline Build stage, these are the promote-by-digest artifacts.
+# (The PR-check invocation ignores artifacts — it only cares about pass/fail.)
+# lambda/** IS included: the Deploy stage's eval targets cd into lambda/eval-packager
+# (Codex #263 round-3 P1).
+artifacts:
+  base-directory: .
+  files:
+    - "pipeline-out/orchestrator.zip"
+    - "pipeline-out/image-digest.txt"
+    - "pipeline-out/git-sha.txt"
+    - "pipeline-out/changed-files.txt"
+    - "blueprints/**/*"
+    - "deploy/**/*"
+    - "scripts/**/*"
+    - "src/config/**/*"
+    - "lambda/**/*"

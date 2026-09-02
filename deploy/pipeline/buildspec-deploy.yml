@@ -1,0 +1,165 @@
+# buildspec-deploy.yml — the Deploy stage. The machine form of DEPLOY.md's
+# three targets (+ conditional eval targets), run under the pipeline's NARROW
+# IAM role (no laptop, no tycenj-prod profile, Jira creds never touched — the
+# role literally cannot UpdateFunctionConfiguration). Consumes the Build stage's
+# artifacts by digest; it never rebuilds. See docs/cicd-pipeline-module-design.md.
+#
+# The entire deploy runs inside ONE build-phase block with a bash `trap` so that
+# ANY failure — orchestrator update, S3 merge, ECS roll, eval targets, OR a
+# post-deploy smoke check — triggers rollback (Codex PR #263 round-3). The
+# rollback snapshot of orchestrator-current.zip is only advanced AFTER full
+# success, so a failed deploy never poisons the next run's rollback source.
+#
+# NOTE: commands are QUOTED YAML scalars; unquoted "echo foo: bar" parses as a
+# mapping and CodeBuild rejects it (Codex #263 round-3).
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - "ACCOUNT_ID=\"$(aws sts get-caller-identity --query Account --output text)\""
+      # Account guard — mirror deploy/config.sh: refuse a wrong account.
+      - |
+        if [ -n "${EXPECTED_ACCOUNT_ID:-}" ] && [ "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT_ID" ]; then
+          echo "ERROR: account $ACCOUNT_ID != EXPECTED_ACCOUNT_ID $EXPECTED_ACCOUNT_ID" >&2; exit 1
+        fi
+      # ── Scope guard (DETECT only, don't exit): this is the APP pipeline (Lambda
+      # + S3 config + ECS). Fleet + eval-infra (DEPLOY.md steps 4-9) belong to a
+      # separate pipeline. We do NOT exit here — that would wedge the pipeline,
+      # because the baseline SHA only advances after a successful app deploy, so
+      # the same range would re-block forever (Codex PR #263 round-5). Instead we
+      # DEPLOY THE APP (never skip it), advance the baseline, and THEN signal the
+      # eval handoff as a terminal non-rollback failure at the end of the build.
+      - |
+        CHANGED="$(cat pipeline-out/changed-files.txt 2>/dev/null || true)"
+        EVAL_HANDOFF=0
+        EVAL_FILES=""
+        if printf '%s' "$CHANGED" | grep -qE '^(lambda/eval-packager/|deploy/evaluations/|deploy/continuous-improvement/|deploy/runtime-agent/)'; then
+          EVAL_HANDOFF=1
+          EVAL_FILES="$(printf '%s\n' "$CHANGED" | grep -E '^(lambda/eval-packager/|deploy/evaluations/|deploy/continuous-improvement/|deploy/runtime-agent/)')"
+        fi
+        # Hand the flag to the build phase (env doesn't persist across CodeBuild
+        # phase boundaries; write it to a file the build block reads).
+        printf '%s' "$EVAL_HANDOFF" > /tmp/eval-handoff
+        printf '%s' "$EVAL_FILES" > /tmp/eval-files
+
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        export AWS_REGION_HUB ACCOUNT_ID ARTIFACT_BUCKET ECR_REPO ECS_SERVICE_ARN
+
+        IMAGE_DIGEST="$(cat pipeline-out/image-digest.txt)"
+        GIT_SHA="$(cat pipeline-out/git-sha.txt)"
+        ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
+        echo "Promoting image ${ECR_URI}@${IMAGE_DIGEST} (built from ${GIT_SHA})"
+
+        # ── Snapshot CURRENT prod for rollback BEFORE touching anything ──
+        # DEPLOY.md manual rollback = re-point Lambda at prior zip + ECS at prior
+        # image. rollback.sh restores from these; run on ANY failure via trap.
+        mkdir -p /tmp/rollback
+        if aws s3api get-object --bucket "$ARTIFACT_BUCKET" --key "pipeline-artifacts/orchestrator-current.zip" \
+             /tmp/rollback/orchestrator-prev.zip --region "$AWS_REGION_HUB" >/dev/null 2>&1; then
+          echo "captured prior orchestrator zip from snapshot"
+        else
+          # FIRST pipeline run: no snapshot yet, but a prod orchestrator already
+          # exists. Seed the rollback source from the LIVE Lambda code so a failed
+          # first deploy can still restore pre-pipeline code (Codex #263 round-4 P1).
+          echo "no prior snapshot — seeding rollback from LIVE orchestrator code"
+          LIVE_URL="$(aws lambda get-function --function-name agentcore-hub-orchestrator \
+            --region "$AWS_REGION_HUB" --query 'Code.Location' --output text 2>/dev/null || true)"
+          if [ -n "$LIVE_URL" ] && [ "$LIVE_URL" != "None" ]; then
+            curl -sf "$LIVE_URL" -o /tmp/rollback/orchestrator-prev.zip && echo "seeded rollback from live Lambda" \
+              || echo "WARN: could not download live Lambda code — rollback of orchestrator unavailable this run"
+          else
+            echo "WARN: no live orchestrator to seed from — rollback of orchestrator unavailable this run"
+          fi
+        fi
+        if [ -n "${ECS_SERVICE_ARN:-}" ]; then
+          aws ecs describe-express-gateway-service --service-arn "$ECS_SERVICE_ARN" --region "$AWS_REGION_HUB" --output json 2>/dev/null \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); pc=(d.get('service',{}).get('activeConfigurations') or [{}])[0].get('primaryContainer',{}); print(pc.get('image',''))" \
+            > /tmp/rollback/ecs-prev-image.txt 2>/dev/null || true
+          echo "captured prior ECS image: $(cat /tmp/rollback/ecs-prev-image.txt 2>/dev/null)"
+        fi
+
+        # Roll back on ANY failure from here on (deploy target OR smoke check).
+        trap 'rc=$?; if [ $rc -ne 0 ]; then echo "── deploy failed (rc=$rc) → rolling back ──"; bash deploy/pipeline/rollback.sh || echo "rollback errored — inspect"; fi; exit $rc' EXIT
+
+        # ── Target 1: orchestrator Lambda — CODE ONLY (prebuilt zip) ──
+        echo "Target 1/3 orchestrator Lambda code-only"
+        aws lambda update-function-code --function-name agentcore-hub-orchestrator \
+          --zip-file fileb://pipeline-out/orchestrator.zip --region "$AWS_REGION_HUB"
+        aws lambda wait function-updated --function-name agentcore-hub-orchestrator --region "$AWS_REGION_HUB"
+
+        # ── Target 2: config/blueprints → S3 (agents.json MERGED, never cp'd) ──
+        echo "Target 2/3 config + blueprints to S3"
+        aws s3 sync blueprints/ "s3://$ARTIFACT_BUCKET/blueprints/"
+        aws s3 sync deploy/runtime-agent/prompts/ "s3://$ARTIFACT_BUCKET/prompts/" || true
+        aws s3 cp src/config/workflows.json "s3://$ARTIFACT_BUCKET/config/workflows.json"
+        aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" /tmp/agents-s3.json
+        python3 deploy/pipeline/merge-agents-json.py /tmp/agents-s3.json src/config/agents.json /tmp/agents-merged.json
+        aws s3 cp /tmp/agents-merged.json "s3://$ARTIFACT_BUCKET/config/agents.json"
+
+        # ── Target 3: ECS Express app — roll to the promoted image BY DIGEST ──
+        echo "Target 3/3 ECS Express roll-by-digest"
+        if [ -n "${ECS_SERVICE_ARN:-}" ]; then
+          DESC="$(aws ecs describe-express-gateway-service --service-arn "$ECS_SERVICE_ARN" --region "$AWS_REGION_HUB" --output json)"
+          PRIMARY="$(python3 deploy/pipeline/ecs-primary-container.py "$DESC" "${ECR_URI}@${IMAGE_DIGEST}")"
+          aws ecs update-express-gateway-service --service-arn "$ECS_SERVICE_ARN" \
+            --region "$AWS_REGION_HUB" --primary-container "$PRIMARY" --output text >/dev/null
+          echo "ECS roll started to ${ECR_URI}@${IMAGE_DIGEST}"
+        else
+          echo "ECS_SERVICE_ARN unset — skipping app roll (Lambda/blueprint-only deploy)"
+        fi
+
+        # (Fleet/eval-infra detected in pre_build is handled AFTER a successful
+        # app deploy + baseline advance — see the handoff signal below — so the
+        # app always ships and the same commits never re-block.)
+
+        # ── Smoke checks (DEPLOY.md) — failures here also hit the rollback trap ──
+        echo "Smoke checks"
+        aws lambda invoke --function-name agentcore-hub-orchestrator \
+          --payload "$(printf '{}' | base64)" --region "$AWS_REGION_HUB" /tmp/o.json >/tmp/o.meta 2>&1
+        if grep -q '"FunctionError"' /tmp/o.meta; then echo "ORCHESTRATOR INIT SMOKE FAILED"; cat /tmp/o.meta; exit 1; fi
+        echo "orchestrator invoke OK (no FunctionError)"
+        aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" - | python3 -c "import json,sys; a=json.load(sys.stdin); assert all(x.get('runtimeArn') for x in a['agents'] if x.get('type')=='runtime'), 'null runtimeArn — merge clobbered ARNs'; print('config ok')"
+        if [ -n "${ECS_SERVICE_ARN:-}" ]; then
+          echo "Verifying ECS rollout health"
+          URL=""
+          for i in $(seq 1 60); do
+            DESC="$(aws ecs describe-express-gateway-service --service-arn "$ECS_SERVICE_ARN" --region "$AWS_REGION_HUB" --output json 2>/dev/null || echo '{}')"
+            read -r STATUS URL <<<"$(python3 deploy/pipeline/ecs-health.py "$DESC")"
+            if [ "$STATUS" = "ACTIVE" ] && [ -n "$URL" ]; then break; fi
+            sleep 10
+            if [ "$i" = "60" ]; then echo "ECS did not reach ACTIVE with an endpoint"; exit 1; fi
+          done
+          case "$URL" in http*) : ;; *) URL="https://$URL" ;; esac
+          echo "service ACTIVE at $URL — checking app health"
+          curl -sf "$URL/api/agentcore/traces/health" >/dev/null || { echo "app health check FAILED"; exit 1; }
+          echo "ECS rollout healthy"
+        fi
+
+        # ── APP DEPLOY SUCCEEDED: advance the rollback snapshot + baseline NOW ──
+        # (Codex #263 round-3 P2: never label a failed deploy "current". Round-5:
+        # the baseline advances on EVERY successful app deploy — including one that
+        # also carried eval files — so the eval handoff below never re-blocks the
+        # same commits.)
+        aws s3 cp pipeline-out/orchestrator.zip "s3://$ARTIFACT_BUCKET/pipeline-artifacts/orchestrator-current.zip" --region "$AWS_REGION_HUB"
+        printf '%s' "$GIT_SHA" | aws s3 cp - "s3://$ARTIFACT_BUCKET/pipeline-artifacts/last-deployed-sha.txt" --region "$AWS_REGION_HUB"
+        trap - EXIT
+        echo "── App deploy complete ──"
+
+        # ── Eval/fleet handoff: app shipped + baseline advanced; NOW fail the
+        # action (no rollback — the app deploy is good and permanent) so the
+        # release manager reports the eval part as a human handoff. Because the
+        # baseline already moved to this SHA, the NEXT run starts from here and
+        # will NOT re-block these commits (Codex #263 round-5).
+        if [ "$(cat /tmp/eval-handoff 2>/dev/null)" = "1" ]; then
+          echo "── HANDOFF: app deployed OK, but the changeset also touched fleet/eval-infra ──" >&2
+          echo "This APP pipeline does not deploy DEPLOY.md steps 4-9. A human (or the" >&2
+          echo "fleet+eval pipeline, once stood up) must deploy these files:" >&2
+          sed 's/^/  - /' /tmp/eval-files >&2
+          echo "The app targets (Lambda/S3/ECS) are deployed + verified and the baseline" >&2
+          echo "has advanced, so re-running will not re-block these commits." >&2
+          exit 2
+        fi

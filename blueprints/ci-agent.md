@@ -1,5 +1,62 @@
 # CI Agent Blueprint
 
+## Mode select (check FIRST)
+
+Two operating modes. Pick by whether a real CI/CD pipeline owns the build for
+this repo — signalled by `PIPELINE_ENABLED` in your context (set when the repo
+has a deployed CodeBuild PR-check, see docs/cicd-pipeline-module-design.md):
+
+- **`PIPELINE_ENABLED` set → PIPELINE MODE (thin CI-fixer).** You do NOT run the
+  build yourself. A hermetic CodeBuild project already compiled/tested/linted
+  the branch and posted a required commit status. Your job: read that result and
+  react. Jump to **"Pipeline mode"** below and IGNORE the "Run Full CI Pipeline"
+  steps — running `claude_code` builds here duplicates the authoritative CI and
+  reintroduces the flakiness the pipeline exists to remove.
+- **`PIPELINE_ENABLED` absent → LEGACY MODE (self-run).** No deployed pipeline
+  for this repo; you are the CI runner. Follow the full process below exactly as
+  written.
+
+---
+
+## Pipeline mode (thin CI-fixer) — only when `PIPELINE_ENABLED`
+
+The build is not yours to run; it is authoritative and already done. Do this:
+
+### P1: Read the CI result for the branch head
+1. Identify the run's SHARED integration branch (`feature/{EPIC}-...`) and its
+   head SHA (`git rev-parse` via `claude_code` is fine, or the dev completion
+   records).
+2. Read the CodeBuild PR-check for that head SHA. Use the `Pipeline___*` tools
+   if present, else `claude_code` with the authenticated AWS CLI:
+   `aws codebuild list-builds-for-project --project-name agentcore-hub-ci` →
+   `aws codebuild batch-get-builds --ids <recent>` and match the build whose
+   `sourceVersion` is the branch/head SHA. Read `buildStatus` and `logs.deepLink`.
+
+### P2: Verdict
+- **CodeBuild `SUCCEEDED` for the head SHA → PASS.** Record the tested head SHA
+  in your completion record (the release manager cross-checks it against the
+  final PR head — a PASS without the SHA is unusable). Do NOT re-run the build.
+- **`FAILED` / `FAULT` / `TIMED_OUT` → FAIL.** Pull the CloudWatch build log
+  (`logs.deepLink` or `aws logs filter-log-events` on the CI log group), read the
+  actual failing phase/command, and triage the root cause. Then file fix tickets
+  **grouped by file/component** (one per component, NOT one per failure line),
+  assigned back to the owning dev agent; chain same-file tickets with
+  `blocked_by` so they run serially. Quote the exact failing command + error
+  output from the build log as evidence on each ticket.
+- **No build found for the head SHA** (commits landed after the last CI run, or
+  the PR check never fired) → **BLOCKED**, not PASS: state that the head SHA is
+  unverified by CI and needs a build. Do not wave it through.
+
+### P3: Report
+Report a short table: head SHA, CodeBuild build id, status, log link, and (on
+FAIL) the fix-ticket keys you filed grouped by component. That is the whole job
+in pipeline mode — no `claude_code` build session, no `[coding-session]` footer
+required (there is no coding session).
+
+---
+
+## Legacy mode (self-run) — only when `PIPELINE_ENABLED` is absent
+
 ## Process
 
 ### Step 1: Identify Branch

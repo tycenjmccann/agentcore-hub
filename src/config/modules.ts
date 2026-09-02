@@ -9,6 +9,7 @@ import {
   Cloud,
   CalendarClock,
   Plug,
+  Rocket,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -32,7 +33,8 @@ export type ModuleId =
   | "connectors"
   | "evaluations"
   | "registry"
-  | "cloud-code";
+  | "cloud-code"
+  | "pipeline";
 
 export interface NavItem {
   href: string;
@@ -40,9 +42,17 @@ export interface NavItem {
   icon: LucideIcon;
   /** Which feature module owns this nav entry. "core" is always present. */
   module: ModuleId;
+  /**
+   * When set, the nav entry is only rendered if this env var is truthy
+   * ("1"/"true"). Used by bolt-on modules whose backing infra is optional and
+   * deployed out-of-band — with the flag unset the surface is hidden and the
+   * app behaves as if the module were removed. Only NEXT_PUBLIC_* vars are
+   * readable client-side, so gated modules must use that prefix.
+   */
+  enabledBy?: string;
 }
 
-export const NAV_ITEMS: NavItem[] = [
+const RAW_NAV_ITEMS: NavItem[] = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard, module: "core" },
   { href: "/agents", label: "Agents", icon: Bot, module: "core" },
   { href: "/registry", label: "Registry", icon: Boxes, module: "registry" },
@@ -52,8 +62,25 @@ export const NAV_ITEMS: NavItem[] = [
   { href: "/connectors", label: "Connectors", icon: Plug, module: "connectors" },
   { href: "/cloud-code", label: "Cloud Code", icon: Cloud, module: "cloud-code" },
   { href: "/evaluations", label: "Evaluations", icon: BarChart3, module: "evaluations" },
+  // CI/CD Pipeline (bolt-on). Hidden unless NEXT_PUBLIC_PIPELINE_ENABLED is set,
+  // because its backing infra (deploy/pipeline CDK stack) is deployed
+  // out-of-band and entirely optional. See docs/cicd-pipeline-module-design.md.
+  { href: "/pipeline", label: "Pipeline", icon: Rocket, module: "pipeline", enabledBy: "NEXT_PUBLIC_PIPELINE_ENABLED" },
   { href: "/tickets", label: "Ticket History", icon: History, module: "workflow" },
 ];
+
+function moduleEnabled(item: NavItem): boolean {
+  if (!item.enabledBy) return true;
+  // NEXT_PUBLIC_* are inlined at build time; read them by literal key so Next's
+  // static replacement works (dynamic process.env[...] is not inlined).
+  const flags: Record<string, string | undefined> = {
+    NEXT_PUBLIC_PIPELINE_ENABLED: process.env.NEXT_PUBLIC_PIPELINE_ENABLED,
+  };
+  const v = flags[item.enabledBy];
+  return v === "1" || v === "true";
+}
+
+export const NAV_ITEMS: NavItem[] = RAW_NAV_ITEMS.filter(moduleEnabled);
 
 /**
  * Path -> page title lookup used by the Header. Derived from the nav registry
