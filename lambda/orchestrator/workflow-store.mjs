@@ -596,6 +596,45 @@ export async function completeWorkflow(workflowId, completedAt) {
   }
 }
 
+/**
+ * TEAM-3747 D2 — atomically close a run on an HONEST NON-"complete" terminal
+ * outcome ("deploy-blocked" / "static-ci-only"). Same CAS shape + idempotency as
+ * completeWorkflow: only the first caller wins, and a run that is already terminal
+ * (complete/error/cancelled or an already-recorded block outcome) is a harmless
+ * no-op. Records the block reason when supplied. Cancellation still precedes
+ * everything (attribute_not_exists(cancelledAt)).
+ */
+export async function claimTerminalOutcome(workflowId, outcome, completedAt, reason) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression:
+        "SET phase = :outcome, completedAt = :ts" + (reason ? ", blockReason = :reason" : ""),
+      ConditionExpression:
+        "phase <> :complete AND phase <> :cancelled AND phase <> :error " +
+        "AND phase <> :deployBlocked AND phase <> :staticCi AND attribute_not_exists(cancelledAt)",
+      ExpressionAttributeValues: {
+        ":outcome": outcome,
+        ":ts": completedAt,
+        ":complete": "complete",
+        ":cancelled": "cancelled",
+        ":error": "error",
+        ":deployBlocked": "deploy-blocked",
+        ":staticCi": "static-ci-only",
+        ...(reason ? { ":reason": String(reason).slice(0, 500) } : {}),
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") {
+      console.log(`[workflow-store] claimTerminalOutcome(${workflowId}, ${outcome}): CAS lost — already terminal, no-op.`);
+      return false;
+    }
+    throw err;
+  }
+}
+
 /** Record that completion side effects (PR, epic roll-up, event) finished. */
 export async function markFinalized(workflowId) {
   await _ddb.send(new UpdateCommand({

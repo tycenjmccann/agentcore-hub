@@ -34,7 +34,11 @@ SEVERITIES = {"critical", "high", "medium", "low"}
 PRIORITIES = {"P0", "P1", "P2"}
 REC_TYPES = {"workflow-def", "prompt", "gate-config", "process", "tooling"}
 SCORE_KEYS = {"overall", "planning", "execution", "reviewEfficiency", "reworkDiscipline"}
-RUN_OUTCOMES = {"complete", "cancelled", "error"}
+# TEAM-3747 D2 — includes the lifecycle-integrity terminal outcomes so a run
+# closed as deploy-blocked / static-ci-only is recorded HONESTLY (mapping the
+# phase straight through below) instead of masquerading as "complete". PARITY:
+# src/lib/workflow/types.ts SHIP_BLOCKED_OUTCOMES + analysis-types.ts RunOutcome.
+RUN_OUTCOMES = {"complete", "cancelled", "error", "deploy-blocked", "static-ci-only"}
 
 
 def fail(msg):

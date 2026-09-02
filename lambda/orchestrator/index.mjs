@@ -42,7 +42,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES } from "./completion.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -715,7 +715,16 @@ async function harvestCompletionEvidence(workflow, ticketId) {
   const hasEvidence =
     (typeof entry?.output === "string" && entry.output.trim().length > 0) ||
     (typeof entry?.artifactKey === "string" && entry.artifactKey.length > 0);
-  if (hasEvidence) return;
+  // TEAM-3747 D2: the ship/CD merge-verdict gate needs the merge commit / outcome
+  // signals, and a ship ticket almost ALWAYS has a summary (so hasEvidence is
+  // true). Harvesting must therefore run when EITHER the deliverable evidence OR
+  // the ship-verdict signal is still absent — a plain `if (hasEvidence) return`
+  // would starve the ship gate and false-block every shipped run.
+  const hasShipSignal =
+    (typeof entry?.mergeCommit === "string" && entry.mergeCommit.trim().length > 0) ||
+    (typeof entry?.commitSha === "string" && entry.commitSha.trim().length > 0) ||
+    (typeof entry?.outcome === "string" && entry.outcome.trim().length > 0);
+  if (hasEvidence && hasShipSignal) return;
   try {
     const res = await s3.send(new GetObjectCommand({
       Bucket: ARTIFACT_BUCKET,
@@ -723,11 +732,27 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     }));
     const record = JSON.parse(await res.Body.transformToString());
     const fields = {};
-    const summary = typeof record.summary === "string" ? record.summary.trim() : "";
-    if (summary) fields.output = summary.slice(0, 10000);
-    if (record.branch) fields.branch = record.branch;
-    if (record.commit_sha) fields.commitSha = record.commit_sha;
-    if (record.pr_url) fields.prUrl = record.pr_url;
+    // Deliverable evidence — only fill when absent (a webhook metadata merge that
+    // DID land wins), exactly as before.
+    if (!hasEvidence) {
+      const summary = typeof record.summary === "string" ? record.summary.trim() : "";
+      if (summary) fields.output = summary.slice(0, 10000);
+      if (record.branch) fields.branch = record.branch;
+    }
+    // Ship/CD verdict signals — harvested regardless of deliverable evidence,
+    // each filled only when the entry doesn't already carry it (additive; legacy
+    // records simply lack these keys). commit_sha/pr_url kept here too so the
+    // ship gate + the final PR label can find them.
+    if (record.commit_sha && !entry?.commitSha) fields.commitSha = record.commit_sha;
+    if (record.pr_url && !entry?.prUrl) fields.prUrl = record.pr_url;
+    if (record.merge_commit && !entry?.mergeCommit) fields.mergeCommit = record.merge_commit;
+    if (typeof record.outcome === "string" && !entry?.outcome) {
+      const oc = record.outcome.trim().toLowerCase();
+      if (SHIP_BLOCKED_OUTCOMES.includes(oc) || oc === "shipped") fields.outcome = oc;
+    }
+    if (record.block_reason && !entry?.blockReason) {
+      fields.blockReason = String(record.block_reason).slice(0, 500);
+    }
     if (Object.keys(fields).length === 0) return;
     await store.mergeTaskMetadata(workflow.id, ticketId, fields);
     if (entry) Object.assign(entry, fields);
@@ -1770,6 +1795,45 @@ export async function completeWorkflow(workflow) {
     console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
   }
 
+  // TEAM-3747 D2 — ship/CD merge-verdict gate: NO green close over unshipped work.
+  // If the def has a ship phase, a done ship ticket must carry a merge/deploy
+  // verdict (merge commit) OR an explicit deploy-blocked outcome. When neither is
+  // present the run did NOT actually ship, so we close it on the HONEST terminal
+  // outcome (deploy-blocked when a block was recorded, else static-ci-only) and
+  // emit a TERMINAL verdict event — never a silent stall, never a fake "complete".
+  // Reuses COMPLETION_EVIDENCE_REQUIRED (fail-closed: enforce by default; a
+  // fail-open here would defeat the whole deliverable). The explicit opt-out
+  // COMPLETION_EVIDENCE_REQUIRED=off|false|0 only shadow-logs and proceeds.
+  try {
+    const wfDef = getWorkflowDef(workflow?.workflowDefId);
+    const requiredPhases = wfDef.completionRequiresAgentPhases || [];
+    const shipPhases = requiredPhases.filter((p) => SHIP_PHASES.has(p));
+    if (shipPhases.length > 0) {
+      const children = await getChildTickets(workflow.epicId);
+      const freshWf = await store.getWorkflow(workflow.id);
+      const verdict = evaluateShipVerdict(
+        children,
+        freshWf?.agentTasks || workflow.agentTasks || {},
+        shipPhases,
+        { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase }
+      );
+      if (verdict.required && !verdict.shipped) {
+        const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
+        if (COMPLETION_EVIDENCE_REQUIRED) {
+          await closeWorkflowBlocked(workflow, verdict);
+          return;
+        }
+        console.warn(
+          `[orchestrator] ${workflow.id} would close as ${verdict.outcome} (shadow opt-out) — ship verdict missing: ${offenders}`
+        );
+      }
+    }
+  } catch (err) {
+    // Never let the ship-verdict resolution itself turn a legitimate completion
+    // into a stall — it only diverts when it can prove work never shipped.
+    console.warn(`[orchestrator] ship-verdict check skipped for ${workflow.id}: ${err?.message || err}`);
+  }
+
   // Atomic completion claim FIRST — only the winner runs the side effects
   // (PR creation, epic roll-up, the workflow.complete event). Previously the
   // guard was the stale in-memory phase + a full-row put: two concurrent
@@ -1838,6 +1902,83 @@ export async function completeWorkflow(workflow) {
   // Durable marker that the side effects above all ran — the takeover path's
   // claim checks this so a completer killed mid-finalization gets resumed.
   await store.markFinalized(workflow.id);
+}
+
+/**
+ * TEAM-3747 D2 — close a run on an HONEST terminal ship outcome instead of a fake
+ * "complete". Mirrors completeWorkflow's side-effect discipline: an ATOMIC,
+ * idempotent phase claim (store.claimTerminalOutcome CASes off any terminal phase,
+ * so concurrent cascades and stream re-deliveries yield exactly one winner), then
+ * — winner only — a best-effort PR label, a TERMINAL verdict event, and the
+ * finalized marker. The event type is workflow.deploy_blocked / workflow.static_ci_only
+ * but ALSO carries an `outcome` field, so a consumer that only knows
+ * "workflow.complete" can still branch on `outcome` — the close is never silent.
+ */
+async function closeWorkflowBlocked(workflow, verdict) {
+  const outcome = verdict.outcome; // one of SHIP_BLOCKED_OUTCOMES
+  const completedAt = new Date().toISOString();
+  const won = await store.claimTerminalOutcome(workflow.id, outcome, completedAt, verdict.blockReason);
+  if (!won) {
+    console.log(`[orchestrator] Workflow ${workflow.id} already terminal — skipping duplicate ${outcome} close.`);
+    return;
+  }
+  const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
+  console.error(`[orchestrator] Workflow ${workflow.id} closed ${outcome} (not shipped): ${offenders}`);
+
+  workflow.phase = outcome;
+  workflow.completedAt = completedAt;
+  if (verdict.blockReason) workflow.blockReason = verdict.blockReason;
+
+  // Find a PR to label — prefer a prUrl harvested onto an offending ship ticket
+  // (harvestCompletionEvidence stashes record.pr_url there). Re-read for freshness.
+  let prUrl = "";
+  try {
+    const freshWf = await store.getWorkflow(workflow.id);
+    const tasks = freshWf?.agentTasks || workflow.agentTasks || {};
+    for (const o of verdict.offenders) {
+      const entry = tasks[o.ticketId];
+      if (entry && typeof entry.prUrl === "string" && entry.prUrl) { prUrl = entry.prUrl; break; }
+    }
+  } catch { /* best-effort */ }
+
+  // Surface the block on the review surface via a PR label. Best-effort by
+  // contract: a missing PAT / label / PR must never turn the terminal close
+  // into a throw (that would leave the run wedged, the exact failure we fix).
+  if (prUrl) {
+    try {
+      await labelPullRequest(prUrl, outcome);
+    } catch (err) {
+      console.warn(`[orchestrator] PR label ${outcome} skipped for ${prUrl}: ${err?.message || err}`);
+    }
+  }
+
+  await publishEvent(
+    workflow.epicId,
+    outcome === "deploy-blocked" ? "workflow.deploy_blocked" : "workflow.static_ci_only",
+    {
+      workflowId: workflow.id,
+      outcome,
+      reason: verdict.blockReason || null,
+      offenders: verdict.offenders,
+      prUrl,
+      featureBranch: workflow.featureBranch,
+    }
+  );
+
+  await store.markFinalized(workflow.id);
+}
+
+/**
+ * TEAM-3747 D2 — add a label to the PR behind a github.com/{owner}/{repo}/pull/{N}
+ * URL (issues + PRs share the labels endpoint). Validates the URL so a malformed
+ * prUrl throws to the caller's warn rather than hitting the wrong endpoint; the
+ * label is created on demand by GitHub if it doesn't exist yet.
+ */
+async function labelPullRequest(prUrl, label) {
+  const m = String(prUrl || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  if (!m) throw new Error(`unrecognized PR url: ${prUrl}`);
+  const [, owner, repo, number] = m;
+  await githubApi(`/repos/${owner}/${repo}/issues/${number}/labels`, "POST", { labels: [label] });
 }
 
 // ─── Agent Invocation ──────────────────────────────────────────────────────────

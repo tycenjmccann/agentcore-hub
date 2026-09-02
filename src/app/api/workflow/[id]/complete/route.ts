@@ -35,6 +35,7 @@ import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
+import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
 import agentsConfig from "@/config/agents.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -67,8 +68,15 @@ const AGENT_PHASE_BY_ID: Record<string, string> = Object.fromEntries(
   (agentsConfig.agents as Array<{ agentId: string; phase: string }>).map((a) => [a.agentId, a.phase])
 );
 
-const TERMINAL_PHASES = ["complete", "error", "cancelled"] as const;
+// TEAM-3747 D2: the lifecycle-integrity ship outcomes are ALSO terminal — a run
+// closed deploy-blocked / static-ci-only cannot be re-"completed" out from under
+// its honest verdict (the early guard below returns 409). Additive: legacy runs
+// never carry these phases, so their behavior is unchanged.
+const TERMINAL_PHASES = ["complete", "error", "cancelled", ...SHIP_BLOCKED_OUTCOMES] as const;
 const DONE_STATUSES = new Set(["done", "cancelled"]);
+// PARITY with lambda/orchestrator/completion.mjs SHIP_PHASES — the phases whose
+// done tickets owe a merge/deploy verdict rather than mere output.
+const SHIP_PHASES = new Set(["ship"]);
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
@@ -140,6 +148,93 @@ function missingEvidenceTickets(
   return missing;
 }
 
+interface ShipTaskLike extends AgentTaskLike {
+  mergeCommit?: unknown;
+  commitSha?: unknown;
+  outcome?: unknown;
+  blockReason?: unknown;
+}
+
+interface ShipVerdict {
+  required: boolean;
+  shipped: boolean;
+  outcome: string | null;
+  blockReason: string | null;
+  offenders: Array<{ ticketId: string; phase: string; verdict: string }>;
+}
+
+/**
+ * TEAM-3747 D2 PARITY — hand-port of lambda/orchestrator/completion.mjs
+ * `shipVerdictOf`. Classify ONE ship-phase agentTasks entry: "shipped" (a merge
+ * commit / commit_sha, or an explicit outcome==="shipped"), a SHIP_BLOCKED_OUTCOMES
+ * value (an explicit terminal block), or null (a phantom green close — CI may be
+ * green but nothing merged/deployed and no block declared). Unlike
+ * missingEvidenceTickets, mere output/artifact is NOT proof the work shipped.
+ * Keep in agreement with completion.mjs.
+ */
+function shipVerdictOf(entry: ShipTaskLike | undefined): string | null {
+  if (!entry || typeof entry !== "object") return null;
+  const outcome = typeof entry.outcome === "string" ? entry.outcome.trim().toLowerCase() : "";
+  if ((SHIP_BLOCKED_OUTCOMES as readonly string[]).includes(outcome)) return outcome;
+  const merged =
+    (typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0) ||
+    (typeof entry.commitSha === "string" && entry.commitSha.trim().length > 0);
+  if (merged || outcome === "shipped") return "shipped";
+  return null;
+}
+
+/**
+ * TEAM-3747 D2 PARITY — hand-port of lambda/orchestrator/completion.mjs
+ * `evaluateShipVerdict`. Decide the ship/CD verdict for the whole run: every done
+ * ship AGENT ticket must carry a positive merge/deploy verdict. Same discipline as
+ * the orchestrator twin — "cannot prove a phantom with nothing to inspect → stay
+ * green"; human review-gate tickets owe no verdict; "deploy-blocked" outranks
+ * "static-ci-only". Runs with no ship phase return required=false (untouched).
+ * Keep this in agreement with completion.mjs.
+ */
+function evaluateShipVerdict(
+  tickets: Ticket[],
+  agentTasks: Record<string, ShipTaskLike>,
+  requiredPhases: string[]
+): ShipVerdict {
+  const inert: ShipVerdict = { required: false, shipped: true, outcome: null, blockReason: null, offenders: [] };
+  const shipPhases = requiredPhases.filter((p) => SHIP_PHASES.has(p));
+  if (!shipPhases.length) return inert;
+  const phases = new Set(shipPhases);
+  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
+  const byTicketId = new Map<string, ShipTaskLike>();
+  for (const entry of Object.values(tasks)) {
+    if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
+  }
+  const isHuman = (a: unknown) => typeof a === "string" && a.startsWith("human:");
+  const shipTickets = tickets.filter(
+    (t) =>
+      t.type !== "epic" &&
+      String(t.status || "").toLowerCase() === "done" &&
+      !isHuman(t.assignee) &&
+      phases.has(phaseOfTicket(t) as string)
+  );
+  if (shipTickets.length === 0) return { ...inert, required: true };
+  let blocked: string | null = null;
+  let blockReason: string | null = null;
+  const offenders: ShipVerdict["offenders"] = [];
+  for (const t of shipTickets) {
+    const ticketId = String(t.ticketId || "");
+    const entry = tasks[ticketId] || byTicketId.get(ticketId);
+    const verdict = shipVerdictOf(entry);
+    if (verdict === "shipped") continue;
+    offenders.push({ ticketId, phase: phaseOfTicket(t) as string, verdict: verdict || "none" });
+    if (verdict === "deploy-blocked") {
+      blocked = "deploy-blocked";
+      if (!blockReason && entry && typeof entry.blockReason === "string") blockReason = entry.blockReason;
+    } else if (!blocked) {
+      blocked = "static-ci-only";
+    }
+  }
+  if (offenders.length === 0) return { required: true, shipped: true, outcome: null, blockReason: null, offenders: [] };
+  return { required: true, shipped: false, outcome: blocked || "static-ci-only", blockReason, offenders };
+}
+
 /**
  * Compact humanNotifications so the terminal write SHRINKS the record instead
  * of growing it. Runaway `manager_escalation` entries are the bloat that pushes
@@ -162,6 +257,113 @@ function compactNotifications(notifs: Notification[]): Notification[] {
   }
   // Keep the 3 most recent escalations for traceability; drop the rest.
   return [...kept, ...recentEscalations.slice(-3)];
+}
+
+/**
+ * TEAM-3747 D2 PARITY (mirrors the orchestrator's closeWorkflowBlocked) — close a
+ * run on an HONEST terminal ship outcome instead of a fake "complete". A
+ * conditional write to the blocked phase (same CAS shape as the complete write, so
+ * it never clobbers a cancel or an already-terminal run) followed by a TERMINAL
+ * verdict event on both sinks. The event type is workflow.deploy_blocked /
+ * workflow.static_ci_only but ALSO carries an `outcome` field so a
+ * workflow.complete-shaped consumer can branch on it — the close is never silent.
+ * No epic roll-up: the work did NOT ship, so the epic must not be marked Done.
+ */
+async function closeBlocked(
+  workflowId: string,
+  workflow: Record<string, unknown>,
+  verdict: ShipVerdict,
+  reason: string | undefined
+): Promise<NextResponse> {
+  const outcome = verdict.outcome as string; // a SHIP_BLOCKED_OUTCOMES value
+  const completedAt = new Date().toISOString();
+  const blockReason = verdict.blockReason || reason || null;
+  const compacted = compactNotifications((workflow.humanNotifications as Notification[]) || []);
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: WORKFLOWS_TABLE,
+        Key: { workflowId },
+        UpdateExpression:
+          "SET #phase = :outcome, completedAt = :ts, previousPhase = :prev, managerWatch = :false, humanNotifications = :notifs" +
+          (blockReason ? ", blockReason = :reason" : ""),
+        ConditionExpression:
+          "#phase <> :complete AND #phase <> :error AND #phase <> :alreadyCancelled " +
+          "AND #phase <> :deployBlocked AND #phase <> :staticCi AND attribute_not_exists(cancelledAt)",
+        ExpressionAttributeNames: { "#phase": "phase" },
+        ExpressionAttributeValues: {
+          ":outcome": outcome,
+          ":ts": completedAt,
+          ":prev": workflow.phase,
+          ":false": false,
+          ":notifs": compacted,
+          ":complete": "complete",
+          ":error": "error",
+          ":alreadyCancelled": "cancelled",
+          ":deployBlocked": "deploy-blocked",
+          ":staticCi": "static-ci-only",
+          ...(blockReason ? { ":reason": blockReason } : {}),
+        },
+      })
+    );
+  } catch (err: unknown) {
+    if ((err as { name?: string }).name === "ConditionalCheckFailedException") {
+      return NextResponse.json(
+        { error: "Workflow already in terminal state", phase: workflow.phase },
+        { status: 409 }
+      );
+    }
+    throw err;
+  }
+
+  const detailType = outcome === "deploy-blocked" ? "workflow.deploy_blocked" : "workflow.static_ci_only";
+  const detail = {
+    workflowId,
+    outcome,
+    completedAt,
+    previousPhase: workflow.phase,
+    closedBy: "workflow-manager",
+    reason: blockReason,
+    offenders: verdict.offenders,
+  };
+  try {
+    await eventBridge.send(
+      new PutEventsCommand({
+        Entries: [
+          {
+            Source: "agentcore-hub.orchestrator",
+            DetailType: detailType,
+            Detail: JSON.stringify({ ...detail, timestamp: completedAt }),
+            EventBusName: EVENT_BUS,
+          },
+        ],
+      })
+    );
+  } catch (err) {
+    console.warn(`[complete] EventBridge publish failed: ${(err as Error).message}`);
+  }
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: EVENTS_TABLE,
+        Item: {
+          workflowId,
+          eventId: `${Date.now()}-${outcome}-${Math.random().toString(36).slice(2, 6)}`,
+          timestamp: completedAt,
+          type: detailType,
+          detail,
+        },
+      })
+    );
+  } catch {
+    /* event publish is non-fatal */
+  }
+
+  console.log(`[complete] Workflow ${workflowId} closed ${outcome} (was: ${workflow.phase}) — not shipped`);
+  return NextResponse.json(
+    { status: outcome, completedAt, outcome, offenders: verdict.offenders, ...(blockReason ? { reason: blockReason } : {}) },
+    { status: 200 }
+  );
 }
 
 export async function POST(
@@ -278,6 +480,37 @@ export async function POST(
       // Never let evidence resolution (def load) turn a legitimate completion into
       // a 500 — the gate only tightens when it can prove a phantom deliverable.
       console.warn(`[complete] evidence check skipped: ${(err as Error).message}`);
+    }
+
+    // 2c. TEAM-3747 D2 — ship/CD merge-verdict gate ("no green close over
+    //     unshipped work"), PARITY with the orchestrator's completeWorkflow. If the
+    //     def has a ship phase, a done ship ticket must carry a merge/deploy verdict
+    //     OR an explicit SHIP_BLOCKED_OUTCOMES outcome — "done + output" is NOT
+    //     proof it shipped. When a ship phase isn't shipped this route must NOT fake
+    //     "complete": it closes on the honest terminal phase and emits a terminal
+    //     event (see closeBlocked). Same COMPLETION_EVIDENCE_REQUIRED gate — enforce
+    //     by default; the explicit opt-out only shadow-logs and completes.
+    try {
+      const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
+      const requiredPhases = def?.completionRequiresAgentPhases || [];
+      const verdict = evaluateShipVerdict(
+        tickets,
+        (workflow.agentTasks as Record<string, ShipTaskLike>) || {},
+        requiredPhases
+      );
+      if (verdict.required && !verdict.shipped) {
+        const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
+        if (COMPLETION_EVIDENCE_REQUIRED) {
+          return await closeBlocked(workflowId, workflow, verdict, reason);
+        }
+        console.warn(
+          `[complete] ${workflowId} would close as ${verdict.outcome} (shadow opt-out) — ship verdict missing: ${offenders}`
+        );
+      }
+    } catch (err) {
+      // A failure resolving the ship verdict must never turn a legitimate
+      // completion into a stall — it only diverts when it can prove nothing shipped.
+      console.warn(`[complete] ship-verdict check skipped: ${(err as Error).message}`);
     }
 
     const completedAt = new Date().toISOString();

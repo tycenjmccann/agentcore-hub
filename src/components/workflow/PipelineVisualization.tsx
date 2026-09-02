@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import type { WorkflowState, WorkflowPhase, AgentTask, WorkflowEvent } from "@/lib/workflow/types";
+import { type WorkflowState, type WorkflowPhase, type AgentTask, type WorkflowEvent, SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
 import awsIcons from "@/lib/aws-icons.json";
 import { BRAND_NAME } from "@/config/brand";
 
@@ -272,6 +272,10 @@ function getPhaseVisualState(phaseKey: WorkflowPhase, currentPhase: WorkflowPhas
   const thisIdx = PHASE_ORDER.indexOf(phaseKey);
 
   if (currentPhase === "complete") return "done";
+  // TEAM-3747 D2: a ship-blocked terminal — every pipeline phase's agent work DID
+  // finish (the block is at deploy/CD, past this pipeline), so show the pipeline as
+  // done; the status header below names the block. Additive; legacy runs unaffected.
+  if ((SHIP_BLOCKED_OUTCOMES as readonly string[]).includes(currentPhase)) return "done";
   if (currentPhase === "error") {
     return thisIdx <= currentIdx ? "done" : "idle";
   }
@@ -315,6 +319,10 @@ function getStatusDescription(phase: WorkflowPhase): { label: string; text: stri
       return { label: "Complete", text: "Workflow finished successfully!" };
     case "error":
       return { label: "Error", text: "Workflow encountered an error." };
+    case "deploy-blocked":
+      return { label: "Deploy Blocked", text: "CI passed but the deploy/preflight was blocked — nothing shipped." };
+    case "static-ci-only":
+      return { label: "CI-Only (Not Shipped)", text: "CI was green but no merge/deploy happened — work is not shipped." };
     default:
       return { label: "Idle", text: "Waiting to start..." };
   }

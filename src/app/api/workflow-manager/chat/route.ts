@@ -15,6 +15,7 @@
 import { NextRequest } from "next/server";
 import { invokeHarnessAgent, DEFAULT_REGION } from "@/lib/agentcore-sdk";
 import { getWorkflowFromDynamo, getLastEventForWorkflow } from "@/lib/workflow/dynamo-read";
+import { isTerminalPhase } from "@/lib/workflow/types";
 import {
   BedrockAgentCoreControlClient,
   ListHarnessesCommand,
@@ -79,7 +80,9 @@ async function buildWorkflowContext(workflowId: string): Promise<string> {
       }
     }
 
-    const isRunning = !["complete", "error", "cancelled"].includes(wf.phase as string);
+    // TEAM-3747 D2: deploy-blocked / static-ci-only are terminal too, so a blocked
+    // run is not reported to the manager as running/"LIKELY STALLED".
+    const isRunning = !isTerminalPhase(wf.phase as string);
     if (lastEvent?.timestamp) {
       const silentMin = Math.round((Date.now() - new Date(lastEvent.timestamp as string).getTime()) / 60000);
       lines.push(`- last event: ${lastEvent.type || "?"} at ${lastEvent.timestamp}${isRunning ? ` (${silentMin} min ago${silentMin >= 10 ? " — LIKELY STALLED" : ""})` : ""}`);

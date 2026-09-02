@@ -33,7 +33,12 @@ const STALE_MS = Number(process.env.WM_STALE_MINUTES || 10) * 60_000;
 const COOLDOWN_MS = Number(process.env.WM_WATCH_COOLDOWN_MINUTES || 15) * 60_000;
 const ANALYZE_DELAY_MS = Number(process.env.WM_ANALYZE_DELAY_MS || 30_000);
 
-const TERMINAL_PHASES = new Set(["complete", "cancelled", "error"]);
+// TEAM-3747 D2: includes the lifecycle-integrity ship outcomes so a blocked run
+// is recorded HONESTLY (the dossier carries phase deploy-blocked / static-ci-only,
+// which save_analysis.py maps straight through RUN_OUTCOMES) instead of the line
+// ~126 fallback rewriting it to "complete", and so the watch loop treats it as
+// terminal. Additive; parity with completion.mjs SHIP_BLOCKED_OUTCOMES.
+const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only"]);
 /** 1-2 rework loops are normal; the 3rd fix ticket marks a loop anomaly. */
 const LOOP_ANOMALY_FIX_TICKETS = Number(process.env.WM_LOOP_ANOMALY_FIX_TICKETS || 3);
 
