@@ -46,7 +46,7 @@ jobs:
   # silent 0/10. These tests use a stub model and an in-memory span exporter —
   # no AWS, no credentials, no network.
   python-telemetry-tests:
-    name: Runtime agent telemetry (hermetic — no AWS)
+    name: Python unit tests (hermetic — no AWS)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -67,12 +67,20 @@ jobs:
       # tests/ plus the TEAM-3096 unittest suites that live next to the code
       # they extract from (test_telemetry_init.py execs main.py's init block,
       # test_build_env_vars.py imports deploy-one-robust.py).
-      - name: Telemetry span tests
+      #
+      # TEAM-3758: the workflow-manager toolkit tests run here too. Both are
+      # hermetic under this job's slim deps (no boto3): test_metrics imports only
+      # the stdlib-pure compute_metrics, and test_save_analysis stubs boto3 in
+      # sys.modules before importing save_analysis. This finally executes
+      # test_metrics.py — which had no CI job at all — and the new
+      # test_save_analysis.py (AC-D2.5 RunOutcome mapping).
+      - name: Python unit tests (hermetic — no AWS)
         run: >
           pytest -q
           deploy/runtime-agent/tests
           deploy/runtime-agent/test_telemetry_init.py
           deploy/runtime-agent/test_build_env_vars.py
+          deploy/workflow-manager/toolkit
 
   cloud-code-ui:
     name: Cloud Code UI (mocked, no AWS)
