@@ -1017,26 +1017,89 @@ async function attachPackageToTicket(ticketId, pkg) {
 }
 
 /**
- * Best-effort PR url for the change set under review (TEAM-3748 D3). The gate
- * ticket's own field wins; otherwise a prUrl harvested onto a reviewed-upstream
- * task entry (harvestCompletionEvidence stashes record.pr_url there), then any
- * task entry in the run. Returns "" when no PR is known — the caller then leaves
- * the change set unresolved and the diff-scoped gate stays inert (legacy path).
+ * Post a plain-text comment on a ticket, either provider (TEAM-3756 F3b audit
+ * trail). Same write shapes as attachPackageToTicket; throws to the caller —
+ * every current caller treats the comment as best-effort and catches.
+ */
+async function commentOnTicket(ticketId, text) {
+  const lines = String(text).split("\n");
+  if (TICKET_PROVIDER === "jira") {
+    await jiraFetch(`/rest/api/3/issue/${ticketId}/comment`, "POST", {
+      body: {
+        type: "doc", version: 1,
+        content: lines.map((t) => ({ type: "paragraph", content: [{ type: "text", text: t }] })),
+      },
+    });
+  } else {
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId },
+      UpdateExpression: "SET #c = list_append(if_not_exists(#c, :empty), :n), #u = :u",
+      ExpressionAttributeNames: { "#c": "comments", "#u": "updatedAt" },
+      ExpressionAttributeValues: {
+        ":n": [{ id: `comment-${Date.now()}`, author: "orchestrator", content: String(text), timestamp: new Date().toISOString() }],
+        ":empty": [],
+        ":u": new Date().toISOString(),
+      },
+    }));
+  }
+}
+
+/**
+ * PR url for the change set under review (TEAM-3748 D3) — CONFIDENT matches
+ * only (TEAM-3756 F2). Resolution order:
+ *
+ *   1. the gate ticket's own prUrl — the provider explicitly forwarded the PR
+ *      this gate reviews;
+ *   2. a task entry whose recorded head (commitSha/mergeCommit, harvested off
+ *      the completion record) EQUALS the gate's reviewedHeadSha — that PR is
+ *      the one whose head the reviewer looked at, by definition;
+ *   3. the ship-phase ticket's PR (the integration PR the ship review is of),
+ *      but only when it is UNAMBIGUOUS — exactly one distinct prUrl across the
+ *      run's ship-phase task entries (reviewed-upstream ship entries preferred).
+ *
+ * The old "any task's prUrl" fallback is deliberately GONE: a stale per-ticket
+ * feature-PR url harvested onto an upstream dev task could win over the actual
+ * ship/integration PR, so the change set was computed from the WRONG diff —
+ * genuine findings then classified out-of-diff and the reopen was suppressed.
+ * Scoping against the wrong PR is strictly worse than not scoping at all:
+ * returning "" fails OPEN (changeSet stays null → enforceDiffScope stays inert →
+ * every finding gates), which can never suppress a genuine rework round.
  */
 function resolvePrUrlForReview(workflow, gateTicket, upstream) {
   const direct =
     gateTicket.prUrl || gateTicket.metadata?.prUrl ||
     gateTicket.pr_url || gateTicket.metadata?.pr_url;
   if (typeof direct === "string" && direct) return direct;
+
   const tasks = workflow?.agentTasks || {};
   const upIds = new Set((upstream || []).map((u) => u.ticketId));
-  // Prefer a reviewed-upstream ticket's PR, then fall back to any task's PR.
-  for (const preferUpstream of [true, false]) {
-    for (const [tid, entry] of Object.entries(tasks)) {
-      if (preferUpstream !== upIds.has(tid)) continue;
-      if (entry && typeof entry.prUrl === "string" && entry.prUrl) return entry.prUrl;
+  const entries = Object.entries(tasks).filter(
+    ([, e]) => e && typeof e.prUrl === "string" && e.prUrl
+  );
+
+  // 2. Head-SHA match — the PR whose recorded head IS what the reviewer reviewed.
+  const reviewedHeadSha = gateTicket.reviewedHeadSha || gateTicket.metadata?.headSha || null;
+  if (reviewedHeadSha) {
+    for (const preferUpstream of [true, false]) {
+      for (const [tid, e] of entries) {
+        if (preferUpstream !== upIds.has(tid)) continue;
+        if (e.commitSha === reviewedHeadSha || e.mergeCommit === reviewedHeadSha) return e.prUrl;
+      }
     }
   }
+
+  // 3. The ship ticket's integration PR — only when there is exactly one to name.
+  for (const upstreamOnly of [true, false]) {
+    const shipUrls = new Set();
+    for (const [tid, e] of entries) {
+      if (upstreamOnly && !upIds.has(tid)) continue;
+      if (getAgentDef(e.agentId)?.phase === "ship") shipUrls.add(e.prUrl);
+    }
+    if (shipUrls.size === 1) return [...shipUrls][0];
+    if (shipUrls.size > 1) break; // ambiguous even among upstream → widening can't help
+  }
+
   return "";
 }
 
@@ -1072,6 +1135,75 @@ async function computeReviewChangeSet(prUrl) {
     console.warn(`[orchestrator] change-set fetch skipped for ${prUrl}: ${err?.message || err}`);
     return null;
   }
+}
+
+/**
+ * Structured review findings are USABLE for diff-scoping only when every entry
+ * is an object and at least ONE cites a resolvable file (TEAM-3756 F1). The
+ * threshold matters because of which way each failure cuts: findings that gate
+ * spuriously merely keep legacy behavior, but findings that classify all-advisory
+ * SUPPRESS a reopen — so prose-only findings (nobody cited files) must never be
+ * treated as a classification, or every human rejection would read as advisory.
+ */
+function usableReviewFindings(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return false;
+  if (!arr.every((f) => f && typeof f === "object" && !Array.isArray(f))) return false;
+  return arr.some((f) => {
+    const files = Array.isArray(f.citedFiles) ? f.citedFiles : Array.isArray(f.files) ? f.files : [];
+    return files.some((p) => typeof p === "string" && p.trim());
+  });
+}
+
+/**
+ * Derive the reviewer's classified findings when the gate ticket does not carry
+ * them (TEAM-3756 F1) — the same "compute it in the Lambda" pattern as
+ * computeReviewChangeSet, closing the gap that left the diff-scoped gate DORMANT
+ * in production (nothing ever wrote gateTicket.reviewFindings, so `gated` was
+ * always true and FR-D3.2/D3.3 never fired).
+ *
+ * Two sources, in order:
+ *   1. a fenced JSON block in the rejection feedback itself — `{"findings": [...]}`
+ *      or a bare findings array — for a reviewer/agent that pastes its
+ *      classification into the comment;
+ *   2. the release manager's own round ledger,
+ *      workflows/{id}/shared/ship-review-state.json — blueprint Step 4.1 has it
+ *      record every round's `findings` (each with `citedFiles`) precisely "so the
+ *      ledger is already correct for when the deterministic layer is switched
+ *      on". Only the LATEST round is trusted, only when its verdict is
+ *      CHANGES-NEEDED (this rejection is that verdict's delivery), and only when
+ *      its reviewedHeadSha does not CONTRADICT the gate's (both known and
+ *      different = the ledger describes some other round — use nothing).
+ *
+ * Returns null when neither source yields usable findings: the caller passes
+ * null through and the diff-scoped gate stays inert (fail-open, R4) — exactly
+ * the pre-derivation behavior.
+ */
+async function deriveReviewFindings(workflow, gateTicket, feedback) {
+  // 1. Fenced JSON in the feedback.
+  const fence = /```(?:json)?\s*([\s\S]*?)```/g;
+  let m;
+  while ((m = fence.exec(String(feedback || ""))) !== null) {
+    try {
+      const parsed = JSON.parse(m[1]);
+      const arr = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? parsed.findings : null;
+      if (usableReviewFindings(arr)) return arr;
+    } catch { /* not JSON — keep scanning */ }
+  }
+
+  // 2. The release manager's recorded round.
+  const raw = await readS3Artifact(workflow.id, "shared/ship-review-state.json");
+  if (!raw) return null;
+  let state;
+  try { state = JSON.parse(raw); } catch { return null; }
+  const rounds = (Array.isArray(state?.rounds) ? state.rounds : []).filter(
+    (r) => r && typeof r === "object"
+  );
+  if (!rounds.length) return null;
+  const latest = rounds.reduce((a, b) => (Number(b.round) > Number(a.round) ? b : a));
+  if (latest.verdict !== "CHANGES-NEEDED") return null;
+  const gateSha = gateTicket.reviewedHeadSha || gateTicket.metadata?.headSha || null;
+  if (gateSha && latest.reviewedHeadSha && latest.reviewedHeadSha !== gateSha) return null;
+  return usableReviewFindings(latest.findings) ? latest.findings : null;
 }
 
 /**
@@ -1145,15 +1277,16 @@ export async function handleReviewRejection(gateTicket) {
   //
   // Diff-scoped gate (TEAM-3689 scaffolding, activated by TEAM-3748 D3): changeSet
   // is the PR's file list and reviewFindings are the reviewer's classified findings
-  // (each with its cited files). changeSet comes off the gate ticket if a provider
-  // forwarded it, ELSE the orchestrator computes it from the PR diff below (D3);
-  // reviewFindings are still best-effort like reviewedHeadSha. When BOTH are known,
+  // (each with its cited files). Each comes off the gate ticket if a provider
+  // forwarded it, ELSE the orchestrator computes/derives it itself — the change
+  // set from the PR diff (D3), the findings from the feedback's JSON block or the
+  // release manager's recorded round (TEAM-3756 F1). When BOTH are known,
   // review-cap downgrades out-of-diff findings and reports `gated: false` for a
   // rejection whose findings are ALL out-of-diff, which must neither count toward
   // the cap nor re-open upstream work. Absent either input the guard stays inert
   // and behavior is byte-identical to before (R4).
   let changeSet = gateTicket.changeSet || gateTicket.metadata?.changeSet || null;
-  const reviewFindings = gateTicket.reviewFindings || gateTicket.metadata?.reviewFindings || null;
+  let reviewFindings = gateTicket.reviewFindings || gateTicket.metadata?.reviewFindings || null;
   // D3 (TEAM-3748, FR-D3.1): when the event carries no change set, compute it
   // from the PR diff so review is scoped to what the PR changed rather than the
   // whole assembled repo. Fail-open — no PR / GitHub error leaves changeSet null,
@@ -1161,6 +1294,12 @@ export async function handleReviewRejection(gateTicket) {
   if (!Array.isArray(changeSet)) {
     const prUrl = resolvePrUrlForReview(workflow, gateTicket, upstream);
     changeSet = (prUrl && (await computeReviewChangeSet(prUrl))) || null;
+  }
+  // TEAM-3756 F1: derive the classified findings the same way — but only when a
+  // change set exists to scope against (without one the findings are never read,
+  // so the S3 lookup would be a wasted call on every legacy rejection).
+  if (!Array.isArray(reviewFindings) && Array.isArray(changeSet)) {
+    reviewFindings = await deriveReviewFindings(workflow, gateTicket, feedback);
   }
   const capResult = await getReviewCap().enforce({
     workflow,
@@ -1189,10 +1328,70 @@ export async function handleReviewRejection(gateTicket) {
   // cite files OUTSIDE the recorded change set is non-gating — it must NOT
   // re-open upstream work. `gated` is true whenever there is no change set to
   // scope against, so this branch is inert for old ledgers.
+  //
+  // TEAM-3756 F3b — the non-gating rejection gets a DEFINED next state:
+  // APPROVE-WITH-ADVISORY. Before, this branch published the event and returned,
+  // leaving the gate in `blocked` with nothing scheduled to touch it again — a
+  // silent stall. Auto-approving is the blueprint's own verdict, not an
+  // override of the human: with F3a, `gated:false` is reachable ONLY when every
+  // finding AFFIRMATIVELY cites out-of-diff files (unattributed/prose findings
+  // now gate), and Step 4's rule for exactly that state is
+  // PASS-with-known-findings — "Never let an advisory finding flip PASS to
+  // CHANGES NEEDED". Chosen over the cap-escalation primitive because
+  // escalation means "a human must decide"; here the deterministic gate HAS
+  // decided, and parking it would recreate the same stall one hop later. The
+  // done transition takes the identical path a human approval takes (DDB
+  // stream / Jira webhook → done cascade), so dependents unblock through the
+  // one existing machinery. A reviewer who wants to force rework can: any
+  // finding without out-of-diff citations gates.
   if (capResult.gated === false) {
     console.log(
-      `[orchestrator] Review gate ${gateTicket.ticketId} rejected but all findings are out-of-diff (advisory) — not reopening.`
+      `[orchestrator] Review gate ${gateTicket.ticketId} rejected but all findings are out-of-diff (advisory) — ` +
+        `approving with known findings instead of reopening.`
     );
+    // Audit trail first: the advisory findings land on the ticket even if the
+    // transition below fails (best-effort — a comment failure must not stall
+    // the approval this branch exists to guarantee).
+    const advisoryLines = (Array.isArray(reviewFindings) ? reviewFindings : []).map((f) => {
+      const files = Array.isArray(f?.citedFiles) ? f.citedFiles : Array.isArray(f?.files) ? f.files : [];
+      const label = f?.title || f?.summary || f?.severity || "finding";
+      return `• ${label} — cites ${files.join(", ") || "(no files)"} (outside the PR change set)`;
+    });
+    try {
+      await commentOnTicket(
+        gateTicket.ticketId,
+        `Auto-approved with known findings: the reviewer requested changes, but every finding cites ` +
+          `files outside the PR change set (advisory — release-manager.md Step 4). ` +
+          `No rework round was recorded and upstream work was not reopened.\n` +
+          `Advisory findings (filed for audit, not gating):\n${advisoryLines.join("\n")}`
+      );
+    } catch (err) {
+      console.warn(`[orchestrator] advisory audit comment failed for ${gateTicket.ticketId}: ${err?.message || err}`);
+    }
+    // Approve: the same transition a human approval makes, so the done cascade
+    // (unblock dependents, completion checks) runs through the normal path.
+    try {
+      if (TICKET_PROVIDER === "jira") {
+        await jiraTransition(gateTicket.ticketId, "Done");
+      } else {
+        await ddb.send(new UpdateCommand({
+          TableName: TICKETS_TABLE,
+          Key: { ticketId: gateTicket.ticketId },
+          UpdateExpression: "SET #s = :s, #u = :u",
+          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+          ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
+        }));
+      }
+      await publishEvent(gateTicket.ticketId, "review.approved_with_advisory", {
+        ticketId: gateTicket.ticketId,
+        workflowId: workflow.id,
+        advisoryFindings: Array.isArray(reviewFindings) ? reviewFindings : [],
+      });
+    } catch (err) {
+      // The approval could not land — surface loudly; the review.rejected event
+      // below still records the non-gating verdict for observability.
+      console.error(`[orchestrator] auto-approve failed for ${gateTicket.ticketId}: ${err?.message || err}`);
+    }
     await publishEvent(gateTicket.ticketId, "review.rejected", {
       ticketId: gateTicket.ticketId,
       onReject,

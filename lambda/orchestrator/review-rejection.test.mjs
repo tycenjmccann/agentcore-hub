@@ -25,6 +25,9 @@ const h = vi.hoisted(() => ({
     events: /** @type {any[]} */ ([]),
     ebEvents: /** @type {any[]} */ ([]),
     enforce: /** @type {any} */ (null),
+    // S3 objects by key — readS3Artifact(workflowId, path) reads
+    // workflows/{id}/{path}; used by the F1 findings-derivation tests.
+    s3Objects: /** @type {Record<string, string>} */ ({}),
   },
 }));
 
@@ -58,7 +61,19 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
 
 vi.mock("@aws-sdk/client-lambda", () => ({ LambdaClient: class {}, InvokeCommand: class { constructor(i) { this.input = i; } } }));
 vi.mock("@aws-sdk/client-s3", () => ({
-  S3Client: class {},
+  // GetObject serves h.state.s3Objects by key (the F1 findings derivation reads
+  // shared/ship-review-state.json through readS3Artifact); a missing key throws,
+  // which readS3Artifact swallows into null — the real NoSuchKey shape.
+  S3Client: class {
+    async send(cmd) {
+      if (cmd.constructor.name === "GetObjectCommand") {
+        const body = h.state.s3Objects[cmd.input.Key];
+        if (body === undefined) throw new Error("NoSuchKey");
+        return { Body: { transformToString: async () => body } };
+      }
+      return {};
+    }
+  },
   GetObjectCommand: class { constructor(i) { this.input = i; } },
   PutObjectCommand: class { constructor(i) { this.input = i; } },
   // index.mjs also imports ListObjectsV2Command (loadReviewPackage). Native-ESM
@@ -103,11 +118,15 @@ beforeEach(async () => {
   h.state.updates.length = 0;
   h.state.events.length = 0;
   h.state.ebEvents.length = 0;
+  h.state.s3Objects = {};
   // agentcore_hub_api_dev is a "development"-phase agent in the fallback roster.
   h.state.tickets = {
     "TEAM-10": { ticketId: "TEAM-10", assignee: "agentcore_hub_api_dev", type: "task", status: "done" },
   };
   h.state.workflow = { id: "wf_1", workflowDefId: "software-delivery", humanNotifications: [], resumeContexts: {} };
+  // Set BEFORE the import — index.mjs snapshots it at module load. Needed so
+  // readS3Artifact (the F1 ledger derivation) actually hits the S3 mock.
+  process.env.ARTIFACT_BUCKET = "test-bucket";
   vi.resetModules();
   ({ handleReviewRejection } = await import("./index.mjs"));
 });
@@ -118,6 +137,7 @@ const ORIGINAL_FETCH = global.fetch;
 afterEach(() => {
   global.fetch = ORIGINAL_FETCH;
   delete process.env.GITHUB_PAT;
+  delete process.env.ARTIFACT_BUCKET;
 });
 
 describe("handleReviewRejection — cap escalation short-circuit (D2c)", () => {
@@ -136,18 +156,40 @@ describe("handleReviewRejection — cap escalation short-circuit (D2c)", () => {
   });
 });
 
-describe("handleReviewRejection — diff-scoped non-gating rejection (TEAM-3689)", () => {
-  it("does NOT reopen and fires review.rejected(noInDiffFindings) when the cap reports gated:false", async () => {
+describe("handleReviewRejection — diff-scoped non-gating rejection (TEAM-3689 + TEAM-3756 F3b)", () => {
+  it("does NOT reopen; auto-approves the gate with known findings so the run has a defined next state", async () => {
     // A rejection whose findings are all out-of-diff: the cap downgraded it, so
-    // enforce returns escalated:false but gated:false — the caller must treat it
-    // like the escalation short-circuit and skip the re-open loop.
+    // enforce returns escalated:false but gated:false — the caller must skip the
+    // re-open loop AND (F3b) resolve the gate. Before, it published the event
+    // and returned, leaving the gate parked in `blocked` with nothing scheduled
+    // to touch it again — a silent stall.
     h.state.enforce = vi.fn(async () => ({ escalated: false, gated: false, effectiveRounds: 0, maxRounds: 3 }));
 
-    await handleReviewRejection(GATE);
+    await handleReviewRejection({
+      ...GATE,
+      reviewFindings: [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }],
+    });
 
     expect(h.state.enforce).toHaveBeenCalledTimes(1);
-    // No UpdateCommand → no upstream ticket reopened.
-    expect(h.state.updates.length).toBe(0);
+    // No write touches the upstream ticket — the reopen stays suppressed.
+    expect(h.state.updates.filter((u) => u.Key.ticketId === "TEAM-10")).toHaveLength(0);
+    // F3b: the gate itself is transitioned done (approval-with-known-findings),
+    // the same path a human approval takes, so the done cascade continues the run.
+    const gateDone = h.state.updates.filter(
+      (u) => u.Key.ticketId === "TEAM-900" && u.ExpressionAttributeValues?.[":s"] === "done"
+    );
+    expect(gateDone).toHaveLength(1);
+    // The advisory findings land on the ticket as an audit comment...
+    const comments = h.state.updates.filter(
+      (u) => u.Key.ticketId === "TEAM-900" && String(u.UpdateExpression).includes("list_append")
+    );
+    expect(comments).toHaveLength(1);
+    expect(comments[0].ExpressionAttributeValues[":n"][0].content).toContain("vendor/untouched.ts");
+    // ...and the distinct approval event carries them too.
+    const approved = h.state.events.find((e) => e.type === "review.approved_with_advisory");
+    expect(approved).toBeTruthy();
+    expect(approved.detail.advisoryFindings).toEqual([{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }]);
+    // The legacy observability event is preserved unchanged.
     const rejected = h.state.events.find((e) => e.type === "review.rejected");
     expect(rejected).toBeTruthy();
     expect(rejected.detail.noInDiffFindings).toBe(true);
@@ -264,5 +306,193 @@ describe("handleReviewRejection — changeSet threading to the cap (TEAM-3748 D3
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(enforceArg().changeSet).toBeNull();
     expect(h.state.updates.length).toBe(1); // legacy reopen
+  });
+});
+
+/**
+ * TEAM-3756 F2 — resolvePrUrlForReview only names a PR it can be CONFIDENT is
+ * the one under review: the gate's own field, a head-SHA match, or the (single)
+ * ship-phase ticket's integration PR. The old "any task's prUrl" guess is gone —
+ * a stale feature-PR url on a dev task must never pick the diff a ship review is
+ * scoped against (wrong diff → genuine findings classify out-of-diff → reopen
+ * suppressed). No confident match FAILS OPEN: null changeSet, gate inert.
+ */
+describe("resolvePrUrlForReview — confident matches only (TEAM-3756 F2)", () => {
+  const enforceArg = () => h.state.enforce.mock.calls[0][0];
+  const fetchedUrls = (fetchSpy) => fetchSpy.mock.calls.map((c) => String(c[0]));
+  const prFilesPage = (files) => async (url) => ({
+    ok: true, status: 200, text: async () => JSON.stringify(files),
+  });
+
+  beforeEach(() => {
+    h.state.enforce = vi.fn(async () => ({ escalated: false }));
+    process.env.GITHUB_PAT = "test-pat";
+  });
+
+  it("a dev task's stale prUrl is NOT used (the removed any-task guess) — fail-open, legacy reopen", async () => {
+    // The upstream dev task carries a leftover per-ticket feature-PR url. Old
+    // behavior fetched it and scoped the ship review against the WRONG diff.
+    h.state.workflow.agentTasks = {
+      "TEAM-10": { agentId: "agentcore_hub_api_dev", prUrl: "https://github.com/acme/widgets/pull/7" },
+    };
+    const fetchSpy = vi.fn(async () => { throw new Error("must not fetch the stale dev PR"); });
+    global.fetch = fetchSpy;
+
+    await handleReviewRejection(GATE);
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(enforceArg().changeSet).toBeNull(); // fail-open: unscoped, everything gates
+    expect(h.state.updates.length).toBe(1);    // legacy reopen proceeds
+  });
+
+  it("a task entry whose commitSha matches the gate's reviewedHeadSha wins — that PR IS what was reviewed", async () => {
+    h.state.workflow.agentTasks = {
+      "TEAM-10": { agentId: "agentcore_hub_api_dev", prUrl: "https://github.com/acme/widgets/pull/7", commitSha: "stale000" },
+      "TEAM-20": { agentId: "agentcore_hub_api_dev", prUrl: "https://github.com/acme/widgets/pull/42", commitSha: "abc123" },
+    };
+    const fetchSpy = vi.fn(prFilesPage([{ filename: "src/a.ts" }]));
+    global.fetch = fetchSpy;
+
+    await handleReviewRejection({ ...GATE, reviewedHeadSha: "abc123" });
+
+    expect(fetchedUrls(fetchSpy)[0]).toContain("/repos/acme/widgets/pulls/42/files");
+    expect(enforceArg().changeSet).toEqual(["src/a.ts"]);
+  });
+
+  it("the ship-phase ticket's integration PR wins over a dev task's PR when no SHA is known", async () => {
+    h.state.workflow.agentTasks = {
+      "TEAM-10": { agentId: "agentcore_hub_api_dev", prUrl: "https://github.com/acme/widgets/pull/7" },
+      "TEAM-30": { agentId: "agentcore_hub_release_manager", prUrl: "https://github.com/acme/widgets/pull/99" },
+    };
+    const fetchSpy = vi.fn(prFilesPage([{ filename: "src/b.ts" }]));
+    global.fetch = fetchSpy;
+
+    await handleReviewRejection(GATE);
+
+    expect(fetchedUrls(fetchSpy)[0]).toContain("/repos/acme/widgets/pulls/99/files");
+    expect(enforceArg().changeSet).toEqual(["src/b.ts"]);
+  });
+
+  it("TWO distinct ship-phase PRs and no SHA → ambiguous → no fetch, fail-open", async () => {
+    h.state.workflow.agentTasks = {
+      "TEAM-30": { agentId: "agentcore_hub_release_manager", prUrl: "https://github.com/acme/widgets/pull/99" },
+      "TEAM-31": { agentId: "agentcore_hub_release_manager", prUrl: "https://github.com/acme/widgets/pull/100" },
+    };
+    const fetchSpy = vi.fn(async () => { throw new Error("ambiguous — must not guess"); });
+    global.fetch = fetchSpy;
+
+    await handleReviewRejection(GATE);
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(enforceArg().changeSet).toBeNull();
+    expect(h.state.updates.length).toBe(1); // still fail-open: legacy reopen
+  });
+
+  it("the gate ticket's own prUrl still beats everything", async () => {
+    h.state.workflow.agentTasks = {
+      "TEAM-30": { agentId: "agentcore_hub_release_manager", prUrl: "https://github.com/acme/widgets/pull/99" },
+    };
+    const fetchSpy = vi.fn(prFilesPage([{ filename: "src/c.ts" }]));
+    global.fetch = fetchSpy;
+
+    await handleReviewRejection({ ...GATE, prUrl: "https://github.com/acme/widgets/pull/42" });
+
+    expect(fetchedUrls(fetchSpy)[0]).toContain("/repos/acme/widgets/pulls/42/files");
+  });
+});
+
+/**
+ * TEAM-3756 F1 — the classified findings are DERIVED in the Lambda when the gate
+ * ticket does not carry them (nothing in production ever wrote
+ * gateTicket.reviewFindings, so `gated` was always true and the diff-scoped gate
+ * was inert). Sources: a JSON block in the rejection feedback, then the release
+ * manager's recorded round in shared/ship-review-state.json. These pin what
+ * index.mjs hands enforce as `findings`; the cap's use of them is
+ * review-cap.test.mjs's job.
+ */
+describe("handleReviewRejection — findings derivation (TEAM-3756 F1)", () => {
+  const enforceArg = () => h.state.enforce.mock.calls[0][0];
+  // Derivation only runs when a change set exists to scope against; carry one on
+  // the gate so no PR fetch is involved.
+  const GATE_WITH_DIFF = { ...GATE, changeSet: ["src/parser.ts"] };
+  const LEDGER_KEY = "workflows/wf_1/shared/ship-review-state.json";
+
+  beforeEach(() => {
+    h.state.enforce = vi.fn(async () => ({ escalated: false }));
+  });
+
+  it("parses a ```json findings block out of the rejection feedback", async () => {
+    await handleReviewRejection({
+      ...GATE_WITH_DIFF,
+      reviewComment:
+        "Round 2: the parser seam is still broken.\n" +
+        '```json\n{"findings":[{"severity":"P1","citedFiles":["src/parser.ts"]}]}\n```',
+    });
+
+    expect(enforceArg().findings).toEqual([{ severity: "P1", citedFiles: ["src/parser.ts"] }]);
+  });
+
+  it("falls back to the release manager's recorded round (ship-review-state.json)", async () => {
+    h.state.s3Objects[LEDGER_KEY] = JSON.stringify({
+      rounds: [
+        { round: 1, verdict: "CHANGES-NEEDED", findings: [{ citedFiles: ["old/round1.ts"] }] },
+        { round: 2, verdict: "CHANGES-NEEDED", findings: [{ citedFiles: ["src/parser.ts"] }] },
+      ],
+    });
+
+    await handleReviewRejection(GATE_WITH_DIFF);
+
+    // The LATEST round's findings, not round 1's.
+    expect(enforceArg().findings).toEqual([{ citedFiles: ["src/parser.ts"] }]);
+  });
+
+  it("a ledger whose latest round SHA contradicts the gate's reviewedHeadSha is NOT trusted", async () => {
+    h.state.s3Objects[LEDGER_KEY] = JSON.stringify({
+      rounds: [{ round: 1, verdict: "CHANGES-NEEDED", reviewedHeadSha: "other999", findings: [{ citedFiles: ["src/parser.ts"] }] }],
+    });
+
+    await handleReviewRejection({ ...GATE_WITH_DIFF, reviewedHeadSha: "abc123" });
+
+    expect(enforceArg().findings).toBeNull(); // stale ledger → derive nothing → gate inert
+  });
+
+  it("prose-only findings (nobody cited a file) are NOT usable — deriving them would suppress every reopen", async () => {
+    h.state.s3Objects[LEDGER_KEY] = JSON.stringify({
+      rounds: [{ round: 1, verdict: "CHANGES-NEEDED", findings: [{ note: "please be better" }] }],
+    });
+
+    await handleReviewRejection(GATE_WITH_DIFF);
+
+    expect(enforceArg().findings).toBeNull();
+  });
+
+  it("no structured source at all → findings null, byte-identical legacy behavior", async () => {
+    await handleReviewRejection(GATE_WITH_DIFF);
+
+    expect(enforceArg().findings).toBeNull();
+    expect(h.state.updates.length).toBe(1); // reopen exactly as before
+  });
+
+  it("gate-ticket reviewFindings still win over derivation", async () => {
+    h.state.s3Objects[LEDGER_KEY] = JSON.stringify({
+      rounds: [{ round: 1, verdict: "CHANGES-NEEDED", findings: [{ citedFiles: ["from/ledger.ts"] }] }],
+    });
+
+    await handleReviewRejection({
+      ...GATE_WITH_DIFF,
+      reviewFindings: [{ citedFiles: ["from/ticket.ts"] }],
+    });
+
+    expect(enforceArg().findings).toEqual([{ citedFiles: ["from/ticket.ts"] }]);
+  });
+
+  it("no change set → derivation is skipped entirely (the findings would never be read)", async () => {
+    h.state.s3Objects[LEDGER_KEY] = JSON.stringify({
+      rounds: [{ round: 1, verdict: "CHANGES-NEEDED", findings: [{ citedFiles: ["src/parser.ts"] }] }],
+    });
+
+    await handleReviewRejection(GATE); // no changeSet anywhere, no PR url
+
+    expect(enforceArg().findings).toBeNull();
   });
 });
