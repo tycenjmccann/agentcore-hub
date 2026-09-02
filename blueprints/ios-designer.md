@@ -18,10 +18,18 @@ conversation — later calls remember earlier ones; never reference `/tmp/...` p
 Understand the full picture before anything else:
 
 1. **Parse the ticket** — What exactly is being asked? What are the acceptance criteria?
-2. **Check existing work** — Use `get_file_contents` to read repo structure, existing patterns, related components
-3. **Gather visual references** — If mockups exist (URLs → `browser`, S3 images → `download_s3_file` + `image_reader`), review them and note key details
-4. **Check related context** — Search tickets for related work, check S3 for prior design docs on this feature
-5. **Identify constraints** — iOS version target, existing patterns to follow, dependencies on other work
+2. **Dedupe check (MANDATORY, before any design work)** — List existing design docs:
+   `S3Storage___list_objects(prefix="workflows/{workflow_id}/shared/")`. If a design
+   doc covering this ticket's scope already exists (e.g. from a duplicate ticket or a
+   prior session of yours), do NOT author a parallel doc. Read it, and either
+   (a) it fully covers the scope → `report_completion` referencing the existing doc,
+   noting the ticket duplicates already-delivered design work, or (b) it partially
+   covers → update/extend THE SAME doc (same title = same filename overwrites in place).
+   Never leave two competing design docs for one feature.
+3. **Check existing work** — Use `get_file_contents` to read repo structure, existing patterns, related components
+4. **Gather visual references** — If mockups exist (URLs → `browser`, S3 images → `download_s3_file` + `image_reader`), review them and note key details
+5. **Check related context** — Search tickets for related work, check S3 for prior design docs on this feature
+6. **Identify constraints** — iOS version target, existing patterns to follow, dependencies on other work
 
 ### Step 2: Brief & Delegate to Claude Code
 Package everything you gathered into a clear brief and call `claude_code`.

@@ -244,12 +244,23 @@ export interface HumanNotification {
   acknowledged: boolean;
 }
 
+// One dispatch of an agent within a workflow — its own ticket, streamed text,
+// and completion summary. Returned by GET /api/workflow/[id]/agent-output.
+export interface AgentRun {
+  ticketId: string;
+  stream: string;
+  summary: string;
+  startedAt: string;
+  endedAt: string;
+  chunks: number;
+}
+
 // ─── SSE Events ──────────────────────────────────────────────────────────────
 
 export type WorkflowEvent = (
   | { type: "phase_change"; phase: WorkflowPhase }
   | { type: "agent_status"; agentId: string; status: AgentTaskStatus; ticketId?: string }
-  | { type: "agent_output"; agentId: string; chunk: string }
+  | { type: "agent_output"; agentId: string; chunk: string; ticketId?: string }
   | { type: "tool_use"; agentId: string; toolName: string }
   | { type: "tool_end"; agentId: string; toolName: string; durationMs?: number }
   | { type: "token_usage"; agentId: string; inputTokens: number; outputTokens: number }

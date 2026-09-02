@@ -16,6 +16,11 @@ ones; never reference `/tmp/...` paths.
 ## Process
 
 ### Step 1: Context Gathering
+- **Dedupe check (MANDATORY, first)** — `S3Storage___list_objects(prefix="workflows/{workflow_id}/shared/")`.
+  If a design doc covering this ticket's scope already exists (duplicate ticket, prior
+  session), do NOT author a parallel doc: fully covered → `report_completion` referencing
+  the existing doc; partial → update/extend the SAME doc (same title = same filename,
+  overwrites in place). Never leave two competing design docs for one feature.
 - Check repo for existing service structure, API patterns, data models
 - Identify AWS services currently in use
 - Check for existing CDK constructs or infrastructure code

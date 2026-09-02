@@ -55,27 +55,48 @@ async function submitTicketPlan({ workflow_id, requirements, tickets }) {
   };
 }
 
-async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "markdown" }) {
+async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "markdown", doc_type }) {
   const ext = format === "json" ? "json" : "md";
-  const filename = title
-    ? title.toLowerCase().replace(/[^a-z0-9]+/g, "-") + `.${ext}`
-    : `design-doc-${Date.now()}.${ext}`;
+  // Deterministic filename: an agent re-saving (retry, crash recovery, duplicate
+  // ticket) overwrites its own doc in place instead of accreting a new
+  // design-doc-<timestamp> copy on every call.
+  const slug = title
+    ? title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")
+    : ["design-doc", agent_id, doc_type && doc_type !== "design" ? doc_type : null]
+        .filter(Boolean).join("-");
+  const filename = `${slug}.${ext}`;
   const key = `workflows/${workflow_id}/${agent_id}/${filename}`;
+  const sharedKey = `workflows/${workflow_id}/shared/${filename}`;
+
+  // Detect pre-existing docs so the caller knows whether it is updating its own
+  // doc or about to add a doc alongside another agent's — dup-ticket guard.
+  let existed = false;
+  let otherDocs = [];
+  try {
+    const sharedPrefix = `workflows/${workflow_id}/shared/`;
+    const r = await s3.send(new ListObjectsV2Command({ Bucket: BUCKET, Prefix: sharedPrefix }));
+    const docs = (r.Contents || [])
+      .map((o) => o.Key.slice(sharedPrefix.length))
+      .filter((k) => /\.(md|json)$/.test(k) && /design|spec/i.test(k));
+    existed = docs.includes(filename);
+    otherDocs = docs.filter((f) => f !== filename);
+  } catch { /* non-fatal */ }
+
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
     Body: content,
     ContentType: format === "json" ? "application/json" : "text/markdown",
   }));
-  const sharedKey = `workflows/${workflow_id}/shared/${filename}`;
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: sharedKey,
     Body: content,
     ContentType: format === "json" ? "application/json" : "text/markdown",
   }));
-  // Update manifest with design doc reference
-  if (workflow_id && agent_id) {
+  // Update manifest with design doc reference (skip when overwriting — the
+  // existing manifest entry already points at this key)
+  if (workflow_id && agent_id && !existed) {
     try {
       await updateManifest(workflow_id, agent_id, [{
         type: "design-doc", format: format === "json" ? "json" : "markdown",
@@ -85,10 +106,16 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
   }
 
   return {
-    status: "saved",
+    status: existed ? "updated" : "saved",
     location: `s3://${BUCKET}/${key}`,
     shared_location: `s3://${BUCKET}/${sharedKey}`,
-    message: `Design doc saved. Other agents can read it from the shared location.`,
+    existing_design_docs: otherDocs,
+    message: existed
+      ? `Updated your existing design doc in place (${filename} overwritten).`
+      : `Design doc saved. Other agents can read it from the shared location.` +
+        (otherDocs.length
+          ? ` NOTE: other design docs already exist for this workflow (${otherDocs.join(", ")}). If your ticket duplicates one of them, reference/update the existing doc instead of authoring a parallel one.`
+          : ""),
   };
 }
 

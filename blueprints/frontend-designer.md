@@ -15,6 +15,11 @@ conversation — later calls remember earlier ones; never reference `/tmp/...` p
 ## Process
 
 ### Step 1: Context Gathering
+- **Dedupe check (MANDATORY, first)** — `S3Storage___list_objects(prefix="workflows/{workflow_id}/shared/")`.
+  If a design doc covering this ticket's scope already exists (duplicate ticket, prior
+  session), do NOT author a parallel doc: fully covered → `report_completion` referencing
+  the existing doc; partial → update/extend the SAME doc (same title = same filename,
+  overwrites in place). Never leave two competing design docs for one feature.
 - Check repo for existing components, CSS approach, design system
 - If mockups provided: `browser` for URLs, `download_s3_file` + `image_reader` for S3 images
 - Check S3 for branding kit (`branding-kit/brand-system.md`)

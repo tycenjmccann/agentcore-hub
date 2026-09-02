@@ -31,7 +31,7 @@ export function transformEvent(
     case "agent.streaming": {
       const subType = detail.type as string;
       if (subType === "text") {
-        return base({ type: "agent_output", agentId, chunk: detail.content, timestamp });
+        return base({ type: "agent_output", agentId, chunk: detail.content, ticketId: detail.ticketId, timestamp });
       }
       if (subType === "trace") {
         return base({ type: "tool_use", agentId, toolName: detail.toolName, timestamp });

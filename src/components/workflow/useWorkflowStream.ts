@@ -17,8 +17,15 @@ export interface UseWorkflowStreamOptions {
   onStateRecovered?: (state: WorkflowState) => void;
 }
 
+/** Key under which a run's live streamed text is accumulated: `${agentId}::${ticketId}`.
+ *  An agent dispatched N times gets N keys, so re-runs never concatenate into one blob. */
+export function runKey(agentId: string, ticketId?: string): string {
+  return `${agentId}::${ticketId || ""}`;
+}
+
 export interface UseWorkflowStreamReturn {
   streamStatus: StreamStatus;
+  /** Live streamed text keyed by runKey(agentId, ticketId) — one entry per dispatch. */
   streamingText: Record<string, string>;
   clearStreamingText: (agentId: string) => void;
   lastEventTime: number;
@@ -55,9 +62,11 @@ export function useWorkflowStream({
 
   const clearStreamingText = useCallback((agentId: string) => {
     setStreamingText((prev) => {
-      if (!prev[agentId]) return prev;
+      const prefix = `${agentId}::`;
+      const keys = Object.keys(prev).filter((k) => k === agentId || k.startsWith(prefix));
+      if (keys.length === 0) return prev;
       const next = { ...prev };
-      delete next[agentId];
+      for (const k of keys) delete next[k];
       return next;
     });
   }, []);
@@ -98,11 +107,13 @@ export function useWorkflowStream({
             cursorRef.current = data.eventId;
           }
 
-          // Accumulate streaming text for agent_output events
+          // Accumulate streaming text per RUN (agentId + ticketId), so an agent
+          // dispatched multiple times keeps each run's text separate.
           if (data.type === "agent_output" && data.agentId && data.chunk) {
+            const key = runKey(data.agentId, data.ticketId);
             setStreamingText((prev) => ({
               ...prev,
-              [data.agentId]: (prev[data.agentId] || "") + data.chunk,
+              [key]: (prev[key] || "") + data.chunk,
             }));
           }
 

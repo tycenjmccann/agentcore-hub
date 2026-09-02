@@ -362,6 +362,99 @@
 
 .modal-footer-error { color: var(--pipeline-error); }
 
+/* ─── Per-run output cards ─────────────────────────────────────────────── */
+.run-list { display: flex; flex-direction: column; gap: 12px; }
+.run-list-caption {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--pipeline-text-dim);
+  padding: 0 2px 2px;
+}
+
+.run-card {
+  border: 1px solid var(--pipeline-border);
+  border-radius: 10px;
+  background: var(--pipeline-card-bg);
+  overflow: hidden;
+  transition: border-color 0.2s;
+}
+.run-card-live {
+  border-color: color-mix(in srgb, var(--pipeline-active) 55%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--pipeline-active) 25%, transparent);
+}
+
+.run-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 14px;
+  background: color-mix(in srgb, var(--pipeline-bg) 60%, transparent);
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  color: var(--pipeline-text);
+  text-align: left;
+}
+.run-card-header:hover { background: color-mix(in srgb, var(--pipeline-active) 8%, transparent); }
+.run-card-header:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--pipeline-active); }
+
+.run-card-chevron { flex-shrink: 0; color: var(--pipeline-text-muted); transition: transform 0.18s ease; }
+.run-card-chevron.open { transform: rotate(90deg); }
+
+.run-card-index { font-size: 13px; font-weight: 600; }
+.run-card-of { color: var(--pipeline-text-dim); font-weight: 400; }
+
+.run-card-ticket {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--pipeline-text-secondary);
+  background: color-mix(in srgb, var(--pipeline-text-muted) 15%, transparent);
+  padding: 2px 7px;
+  border-radius: 5px;
+}
+
+.run-card-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.run-card-badge.live {
+  color: var(--pipeline-active);
+  background: color-mix(in srgb, var(--pipeline-active) 16%, transparent);
+}
+.run-card-badge.done {
+  color: var(--pipeline-done);
+  background: color-mix(in srgb, var(--pipeline-done) 14%, transparent);
+}
+
+.run-card-spacer { flex: 1; }
+.run-card-time { font-size: 11px; color: var(--pipeline-text-dim); font-variant-numeric: tabular-nums; }
+
+.run-card-body {
+  padding: 14px 16px;
+  border-top: 1px solid var(--pipeline-border);
+}
+.run-card-stream { font-size: 13px; }
+.run-card-summary {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--pipeline-border);
+}
+.run-card-summary-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--pipeline-done);
+  margin-bottom: 8px;
+}
+.run-card-empty { font-size: 12px; color: var(--pipeline-text-dim); font-style: italic; }
+
 /* Code Block */
 .code-block-wrapper {
   position: relative;
