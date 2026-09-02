@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 /**
  * TEAM-3619 D2c + D4c — the orchestrator side of handleReviewRejection.
@@ -61,6 +61,9 @@ vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {},
   GetObjectCommand: class { constructor(i) { this.input = i; } },
   PutObjectCommand: class { constructor(i) { this.input = i; } },
+  // index.mjs also imports ListObjectsV2Command (loadReviewPackage). Native-ESM
+  // strict-linking requires every imported name on the mock; harmless in vitest.
+  ListObjectsV2Command: class { constructor(i) { this.input = i; } },
 }));
 vi.mock("@aws-sdk/client-eventbridge", () => ({
   EventBridgeClient: class { async send(cmd) { h.state.ebEvents.push(cmd.input); return {}; } },
@@ -107,6 +110,14 @@ beforeEach(async () => {
   h.state.workflow = { id: "wf_1", workflowDefId: "software-delivery", humanNotifications: [], resumeContexts: {} };
   vi.resetModules();
   ({ handleReviewRejection } = await import("./index.mjs"));
+});
+
+// The change-set threading tests below toggle GITHUB_PAT + global.fetch; restore
+// both so the fetch-free suites above/around them are unaffected.
+const ORIGINAL_FETCH = global.fetch;
+afterEach(() => {
+  global.fetch = ORIGINAL_FETCH;
+  delete process.env.GITHUB_PAT;
 });
 
 describe("handleReviewRejection — cap escalation short-circuit (D2c)", () => {
@@ -175,5 +186,83 @@ describe("handleReviewRejection — review-fix stamp on reopen (D4c)", () => {
     // And it advertises the reopen on review.rejected.
     const rejected = h.state.events.find((e) => e.type === "review.rejected");
     expect(rejected.detail.reopened).toEqual(["TEAM-10"]);
+  });
+});
+
+/**
+ * TEAM-3748 D3 (FR-D3.1) — the caller now RESOLVES the change set before calling
+ * enforce: the gate's own field wins, else it computes one from the PR's file
+ * list, else it passes none (fail-open, byte-identical to the pre-D3 loop). The
+ * cap's diff-scoping of that change set is review-cap.test.mjs's job; these pin
+ * only what index.mjs hands enforce as `changeSet`.
+ */
+describe("handleReviewRejection — changeSet threading to the cap (TEAM-3748 D3)", () => {
+  const enforceArg = () => h.state.enforce.mock.calls[0][0];
+
+  it("(a) forwards a changeSet carried on the gate ticket straight to enforce — no PR fetch", async () => {
+    h.state.enforce = vi.fn(async () => ({ escalated: false }));
+    process.env.GITHUB_PAT = "test-pat";
+    const fetchSpy = vi.fn(async () => { throw new Error("PR fetch should not run when the gate carries a change set"); });
+    global.fetch = fetchSpy;
+
+    await handleReviewRejection({ ...GATE, changeSet: ["src/a.ts", "src/b.ts"] });
+
+    expect(h.state.enforce).toHaveBeenCalledTimes(1);
+    expect(enforceArg().changeSet).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(fetchSpy).not.toHaveBeenCalled(); // the gate field short-circuits the diff computation
+  });
+
+  it("(b) computes the changeSet from the PR's files when the gate carries none — a rename contributes BOTH paths", async () => {
+    h.state.enforce = vi.fn(async () => ({ escalated: false }));
+    process.env.GITHUB_PAT = "test-pat";
+    // list_pr_files shape: one added file + one rename carrying previous_filename.
+    const files = [
+      { filename: "src/new-feature.ts", status: "added" },
+      { filename: "src/renamed-new.ts", previous_filename: "src/renamed-old.ts", status: "renamed" },
+    ];
+    const fetchSpy = vi.fn(async (url) => {
+      // GitHub REST for the PR's files, paginated (this PR fits in one page).
+      expect(String(url)).toContain("/repos/acme/widgets/pulls/42/files");
+      return { ok: true, status: 200, text: async () => JSON.stringify(files) };
+    });
+    global.fetch = fetchSpy;
+
+    await handleReviewRejection({ ...GATE, prUrl: "https://github.com/acme/widgets/pull/42" });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1); // 2 files (<100) → a single page
+    // The rename's new AND previous path are both in-diff, matching
+    // enforceDiffScope's rename handling.
+    expect(enforceArg().changeSet).toEqual([
+      "src/new-feature.ts",
+      "src/renamed-new.ts",
+      "src/renamed-old.ts",
+    ]);
+  });
+
+  it("(c) fails open on a GitHub error — enforce is called with changeSet absent, reopen proceeds as legacy", async () => {
+    h.state.enforce = vi.fn(async () => ({ escalated: false }));
+    process.env.GITHUB_PAT = "test-pat";
+    global.fetch = vi.fn(async () => ({ ok: false, status: 502, text: async () => "bad gateway" }));
+
+    await handleReviewRejection({ ...GATE, prUrl: "https://github.com/acme/widgets/pull/42" });
+
+    // computeReviewChangeSet swallowed the error and returned null → the diff-scoped
+    // gate stays inert and the rejection re-opens exactly as before it existed.
+    expect(enforceArg().changeSet).toBeNull();
+    expect(h.state.updates.length).toBe(1);
+    expect(h.state.events.find((e) => e.type === "review.rejected").detail.reopened).toEqual(["TEAM-10"]);
+  });
+
+  it("(c) fails open when no PR url is resolvable — no fetch, changeSet absent, reopen proceeds", async () => {
+    h.state.enforce = vi.fn(async () => ({ escalated: false }));
+    process.env.GITHUB_PAT = "test-pat";
+    const fetchSpy = vi.fn(async () => { throw new Error("no PR to fetch"); });
+    global.fetch = fetchSpy;
+
+    await handleReviewRejection(GATE); // no prUrl on the gate, no task-entry PRs
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(enforceArg().changeSet).toBeNull();
+    expect(h.state.updates.length).toBe(1); // legacy reopen
   });
 });

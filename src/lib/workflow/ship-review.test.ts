@@ -388,6 +388,47 @@ describe("enforceDiffScope — diff-scoped gate (AC-D2.1)", () => {
     };
     expect(effectiveRoundCountDiffScoped([inDiffRegression])).toBe(2);
   });
+
+  // AC-D3.2 — the load-bearing invariant, stated once directly rather than
+  // inferred from the cases above: for ANY change set, enforceDiffScope's output
+  // obeys "CHANGES-NEEDED ⟺ at least one surviving IN-DIFF finding". A round can
+  // never remain blocking on out-of-diff nits alone, and a downgraded round can
+  // never count toward the cap. Every row is a CHANGES-NEEDED input; the column
+  // records whether ANY cited finding is genuinely in-diff.
+  it("AC-D3.2 invariant: post-enforce, CHANGES-NEEDED ⟺ ≥1 in-diff finding, and a downgrade always counts 0", () => {
+    const cs = ["src/a.ts", "src/b.ts"];
+    const rows: Array<{ name: string; findings: ShipRoundLike["findings"]; hasInDiff: boolean }> = [
+      { name: "only out-of-diff", findings: [{ citedFiles: ["x/y.ts"] }], hasInDiff: false },
+      { name: "no files cited", findings: [{ severity: "P1" } as unknown as NonNullable<ShipRoundLike["findings"]>[number]], hasInDiff: false },
+      { name: "empty findings", findings: [], hasInDiff: false },
+      // A single finding straddling the diff boundary is NOT in-diff (every cited
+      // file must be in the set) → the whole round downgrades.
+      { name: "one stray file in an otherwise in-diff finding", findings: [{ citedFiles: ["src/a.ts", "x/y.ts"] }], hasInDiff: false },
+      { name: "one in-diff finding", findings: [{ citedFiles: ["src/a.ts"] }], hasInDiff: true },
+      { name: "in-diff + out-of-diff mixed", findings: [{ citedFiles: ["src/b.ts"] }, { citedFiles: ["x/y.ts"] }], hasInDiff: true },
+    ];
+
+    for (const { name, findings, hasInDiff } of rows) {
+      const round: ShipRoundLike = { round: 1, verdict: "CHANGES-NEEDED", changeSet: cs, findings };
+      const out = enforceDiffScope(round, cs);
+      const survivingInDiff = (out.findings ?? []).some(
+        (f) => f && (f as { classification?: string }).classification === "IN-DIFF"
+      );
+
+      // The invariant, both directions.
+      expect(survivingInDiff, `${name}: surviving in-diff should be ${hasInDiff}`).toBe(hasInDiff);
+      if (hasInDiff) {
+        expect(out.verdict, `${name}: keeps blocking`).toBe("CHANGES-NEEDED");
+        expect(effectiveRoundCountDiffScoped([round]), `${name}: gating round counts`).toBeGreaterThan(0);
+      } else {
+        // No in-diff finding survives → the verdict is a non-blocking form and the
+        // round is inert against the cap (this is why out-of-diff rounds are free).
+        expect(out.verdict, `${name}: downgraded, never CHANGES-NEEDED`).not.toBe("CHANGES-NEEDED");
+        expect(["PASS", "PASS-with-known-findings"], `${name}: non-blocking verdict`).toContain(out.verdict);
+        expect(effectiveRoundCountDiffScoped([round]), `${name}: downgraded round counts 0`).toBe(0);
+      }
+    }
+  });
 });
 
 describe("diffScopeRounds / effectiveRoundCountDiffScoped — inertness (backward compat)", () => {

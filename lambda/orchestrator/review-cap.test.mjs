@@ -403,6 +403,131 @@ describe("enforce — diff-scoped gate (TEAM-3689, release-manager.md Step 4)", 
   });
 });
 
+/**
+ * TEAM-3748 D3 — the diff-scoped gate driven END-TO-END through enforce.
+ *
+ * The AC3a/AC3b tests above pin single-cycle behavior with a preset ledger; these
+ * replay a SEQUENCE of enforce calls sharing one accumulating ledger, so the cap
+ * arithmetic (AC-D3.3) and the "out-of-diff cycle doesn't count" rule (AC-D3.2)
+ * are exercised the way handleReviewRejection actually calls them.
+ */
+describe("AC-D3.2 / AC-D3.3 — diff-scoped rounds through the cap end-to-end", () => {
+  const CHANGE_SET = ["src/parser.ts"];
+  const inDiff = { changeSet: CHANGE_SET, findings: [{ citedFiles: ["src/parser.ts"] }] };
+  const outOfDiff = { changeSet: CHANGE_SET, findings: [{ citedFiles: ["vendor/legacy.ts"] }] };
+  const baseFor = (state) => ({
+    workflow: workflowWith(state),
+    gateTicket: { ticketId: GATE },
+    gateCfg: SHIP_GATE,
+    upstreamIds: ["TEAM-1"],
+  });
+
+  it("AC-D3.3: three IN-DIFF CHANGES-NEEDED rounds trip the cap (1 → 2 → 3 → escalate)", async () => {
+    const state = ledger();
+    const { deps, parkGateForHuman, publishEvent, store } = makeDeps({ ledger: state });
+    const cap = createReviewCap(deps);
+    const base = baseFor(state);
+
+    // Feedback differs per round so each is a genuine round (identical feedback
+    // under a null SHA would be treated as one redelivered rejection).
+    const r1 = await cap.enforce({ ...base, feedback: "in-diff seam A", ...inDiff });
+    const r2 = await cap.enforce({ ...base, feedback: "in-diff seam B", ...inDiff });
+    const r3 = await cap.enforce({ ...base, feedback: "in-diff seam C", ...inDiff });
+
+    expect([r1.gated, r2.gated, r3.gated]).toEqual([true, true, true]);
+    expect([r1.effectiveRounds, r2.effectiveRounds, r3.effectiveRounds]).toEqual([1, 2, 3]);
+    expect([r1.escalated, r2.escalated]).toEqual([false, false]);
+    expect(r3.escalated).toBe(true);
+    expect(store.appendReviewRound).toHaveBeenCalledTimes(3); // every in-diff round recorded
+    expect(parkGateForHuman).toHaveBeenCalledTimes(1);
+    expect(call(publishEvent, "review.cap_reached")).toHaveLength(1);
+  });
+
+  it("AC-D3.2: an out-of-diff-only cycle between in-diff rounds records nothing and does not advance the count", async () => {
+    const state = ledger();
+    const { deps, store, parkGateForHuman } = makeDeps({ ledger: state });
+    const cap = createReviewCap(deps);
+    const base = baseFor(state);
+
+    const a = await cap.enforce({ ...base, feedback: "in-diff 1", ...inDiff }); // counts → 1
+    const b = await cap.enforce({ ...base, feedback: "nit in an untouched file", ...outOfDiff }); // downgraded
+    const c = await cap.enforce({ ...base, feedback: "in-diff 2", ...inDiff }); // counts → 2
+
+    expect([a.gated, b.gated, c.gated]).toEqual([true, false, true]);
+    expect([a.effectiveRounds, b.effectiveRounds, c.effectiveRounds]).toEqual([1, 1, 2]);
+    expect(b.escalated).toBe(false);
+    expect(c.escalated).toBe(false); // still under the cap: the out-of-diff cycle never counted
+    // Only the two in-diff cycles wrote a round — the out-of-diff one did not.
+    expect(store.appendReviewRound).toHaveBeenCalledTimes(2);
+    expect(parkGateForHuman).not.toHaveBeenCalled();
+  });
+
+  it("AC-D3.3: DECISION: continue after a diff-scoped escalation authorizes ANOTHER full maxRounds of in-diff rework", async () => {
+    const state = ledger();
+    const { deps } = makeDeps({ ledger: state });
+    const cap = createReviewCap(deps);
+    const base = baseFor(state);
+
+    await cap.enforce({ ...base, feedback: "A", ...inDiff });
+    await cap.enforce({ ...base, feedback: "B", ...inDiff });
+    const tripped = await cap.enforce({ ...base, feedback: "C", ...inDiff });
+    expect(tripped.escalated).toBe(true);
+
+    // The human re-rejects WITH the override → count resets; round D is the first
+    // of the new allowance.
+    const resumed = await cap.enforce({
+      ...base,
+      feedback: "D: fix the seam properly this time.\nDECISION: continue",
+      ...inDiff,
+    });
+    expect(resumed.escalated).toBe(false);
+    expect(resumed.effectiveRounds).toBe(1);
+
+    // The new allowance is a FULL maxRounds: two more in-diff rounds proceed, the
+    // third re-trips the cap.
+    const e = await cap.enforce({ ...base, feedback: "E", ...inDiff });
+    const f = await cap.enforce({ ...base, feedback: "F", ...inDiff });
+    expect([e.effectiveRounds, f.effectiveRounds]).toEqual([2, 3]);
+    expect(e.escalated).toBe(false);
+    expect(f.escalated).toBe(true);
+  });
+
+  it("(D3d) a stored ledger round carries no change set, so diff-scoping is inert on history (counts as legacy)", async () => {
+    // buildRoundRecord never stamps a changeSet on the rounds it records, so
+    // effectiveRoundCountDiffScoped counts stored history exactly as
+    // effectiveRoundCount does. Proven by running the SAME two-prior-round ledger
+    // once with diff-scope inputs on the current cycle and once without: the
+    // stored rounds count identically, because the diff-scope only ever acts on
+    // the CURRENT rejection, not on recorded history. (The pure-function inertness
+    // is pinned by src/lib/workflow/ship-review.test.ts AC-f.)
+    const priors = () => [priorRound(1), priorRound(2)];
+
+    const s1 = ledger({ rounds: priors() });
+    const scoped = await createReviewCap(makeDeps({ ledger: s1 }).deps).enforce({
+      workflow: workflowWith(s1),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "third, in-diff",
+      changeSet: ["src/a.ts"],
+      findings: [{ citedFiles: ["src/a.ts"] }],
+    });
+
+    const s2 = ledger({ rounds: priors() });
+    const legacy = await createReviewCap(makeDeps({ ledger: s2 }).deps).enforce({
+      workflow: workflowWith(s2),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "third, in-diff",
+    });
+
+    expect(scoped.effectiveRounds).toBe(legacy.effectiveRounds);
+    expect(scoped.effectiveRounds).toBe(3); // 2 legacy stored rounds + this gating round
+    expect([scoped.escalated, legacy.escalated]).toEqual([true, true]);
+  });
+});
+
 describe("enforce — at the cap", () => {
   const atCapState = () => ledger({ rounds: [priorRound(1), priorRound(2)] });
 
