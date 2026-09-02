@@ -11,10 +11,13 @@ set -uo pipefail
 echo "── ROLLBACK ──"
 
 # 1. Orchestrator Lambda → prior zip
+# --output text --query suppresses the full-config dump: update-function-code
+# otherwise echoes plaintext env vars (JIRA_API_TOKEN, GITHUB_PAT) into the log.
 if [ -f /tmp/rollback/orchestrator-prev.zip ]; then
   echo "restoring orchestrator to prior zip"
   aws lambda update-function-code --function-name agentcore-hub-orchestrator \
     --zip-file fileb:///tmp/rollback/orchestrator-prev.zip --region "$AWS_REGION_HUB" \
+    --output text --query 'LastUpdateStatus' >/dev/null \
     && aws lambda wait function-updated --function-name agentcore-hub-orchestrator --region "$AWS_REGION_HUB" \
     && echo "orchestrator rolled back" || echo "orchestrator rollback FAILED — inspect"
 else
