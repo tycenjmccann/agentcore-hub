@@ -36,22 +36,68 @@ The build is not yours to run; it is authoritative and already done. Do this:
 - **CodeBuild `SUCCEEDED` for the head SHA → PASS.** Record the tested head SHA
   in your completion record (the release manager cross-checks it against the
   final PR head — a PASS without the SHA is unusable). Do NOT re-run the build.
-- **`FAILED` / `FAULT` / `TIMED_OUT` → FAIL.** Pull the CloudWatch build log
-  (`logs.deepLink` or `aws logs filter-log-events` on the CI log group), read the
-  actual failing phase/command, and triage the root cause. Then file fix tickets
-  **grouped by file/component** (one per component, NOT one per failure line),
-  assigned back to the owning dev agent; chain same-file tickets with
-  `blocked_by` so they run serially. Quote the exact failing command + error
-  output from the build log as evidence on each ticket.
+- **`FAILED` / `FAULT` / `TIMED_OUT` → classify the failure first (P2a).** Pull
+  the CloudWatch build log (`logs.deepLink` or `aws logs filter-log-events` on the
+  CI log group), read the actual failing phase/command, and split the failures
+  into two lanes: **mechanical** (auto-remediable, see P2a) vs **logic** (a real
+  defect → fix ticket to dev, see below). A single build can have both; handle
+  the mechanical lane yourself, file tickets for the rest.
+  - **Logic-lane fix tickets** (test assertion failures, type errors from real
+    code changes, runtime/behavior errors, build/compile errors from source,
+    anything requiring judgment): file **grouped by file/component** (one per
+    component, NOT one per failure line), assigned back to the owning dev agent;
+    chain same-file tickets with `blocked_by` so they run serially. Quote the
+    exact failing command + error output as evidence. These re-enter the full
+    review/QA/CI loop after the dev fixes them.
 - **No build found for the head SHA** (commits landed after the last CI run, or
   the PR check never fired) → **BLOCKED**, not PASS: state that the head SHA is
   unverified by CI and needs a build. Do not wave it through.
 
+### P2a: Auto-remediate the mechanical lane (self-fix, don't ticket)
+Real CI/CD auto-fixes the deterministic, zero-judgment class (formatters, linters,
+import sorters, lockfiles) and commits it directly — nobody files a ticket for a
+missing semicolon. You do the same, but ONLY for the whitelist below. This exists
+to kill ticket churn, NOT to bypass review of real changes.
+
+**AUTO-FIX WHITELIST (exhaustive — if a fix needs anything not on this list,
+STOP and file a dev ticket instead):**
+- Formatter: `prettier --write` / `npm run format` (or the repo's declared formatter)
+- Linter autofix: `eslint --fix` / `npm run lint -- --fix` — auto-fixable rules ONLY
+- Import ordering / unused-import removal that the linter fixes mechanically
+- Lockfile drift: regenerate `package-lock.json` via `npm install` when the only
+  failure is an out-of-sync lockfile
+
+**HARD RULES (default-deny):**
+1. **Whitelist-only.** If the failing command is not one of the above, or the fix
+   would touch source **logic** (function bodies, conditionals, test assertions,
+   types beyond an auto-import), it is NOT mechanical → file a dev ticket. When in
+   doubt, it's a dev ticket.
+2. **Run the tool, don't hand-edit.** Apply the fix by running the formatter/linter
+   itself via `claude_code`, never by manually rewriting code. If the tool can't
+   fix it automatically (`--fix` leaves errors), it's a dev ticket.
+3. **Re-verify before claiming green.** After the auto-fix commit, the build MUST
+   be re-run and come back `SUCCEEDED` on the new head SHA. A still-red build after
+   one auto-fix pass → stop auto-fixing, file a dev ticket with the residual
+   failures. Never loop auto-fix more than once.
+4. **Commit is visible + attributed.** Commit to the shared integration branch with
+   a clear message (`chore(ci): auto-remediate lint/format — <tool>`), push, and
+   record the commit SHA + what you ran in your report. The change rides the same
+   branch and is covered by the still-pending human Merge Approval gate — it is
+   NOT a bypass of review, just a mechanical cleanup the reviewer sees in the diff.
+5. **Scope cap.** Auto-fix only files already in the diff/changeset. Never
+   reformat untouched files (no repo-wide format sweep).
+
+Mechanical fully resolved + build green → treat as PASS (record the new head SHA).
+Mechanical mixed with logic failures → auto-fix the mechanical, file dev tickets
+for the logic, verdict FAIL until the dev tickets land.
+
 ### P3: Report
-Report a short table: head SHA, CodeBuild build id, status, log link, and (on
-FAIL) the fix-ticket keys you filed grouped by component. That is the whole job
-in pipeline mode — no `claude_code` build session, no `[coding-session]` footer
-required (there is no coding session).
+Report a short table: head SHA, CodeBuild build id, status, log link. On any
+**auto-remediation**: the tool(s) run, the auto-fix commit SHA, and the re-run
+build result. On **FAIL**: the fix-ticket keys you filed grouped by component.
+No `claude_code` build session for reading results; a `claude_code` session IS
+used when you auto-remediate (to run the formatter/linter + commit) — include its
+`[coding-session]` footer then.
 
 ---
 
