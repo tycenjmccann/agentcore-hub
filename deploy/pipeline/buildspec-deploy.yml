@@ -23,23 +23,25 @@ phases:
         if [ -n "${EXPECTED_ACCOUNT_ID:-}" ] && [ "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT_ID" ]; then
           echo "ERROR: account $ACCOUNT_ID != EXPECTED_ACCOUNT_ID $EXPECTED_ACCOUNT_ID" >&2; exit 1
         fi
-      # ── Scope guard: this is the APP pipeline (Lambda + S3 config + ECS only).
-      # Fleet + eval-infra (DEPLOY.md steps 4-9) belong to a SEPARATE fleet+eval
-      # pipeline with its own role/secrets. If the changeset touches those files,
-      # REFUSE BEFORE deploying anything (pre_build = before the rollback trap and
-      # before any prod mutation) so a human runs DEPLOY.md 4-9 — the documented
-      # deploy-contract handoff, never a silent skip (Codex PR #263 round-4).
-      # This runs at the START so we never half-deploy then block.
+      # ── Scope guard (DETECT only, don't exit): this is the APP pipeline (Lambda
+      # + S3 config + ECS). Fleet + eval-infra (DEPLOY.md steps 4-9) belong to a
+      # separate pipeline. We do NOT exit here — that would wedge the pipeline,
+      # because the baseline SHA only advances after a successful app deploy, so
+      # the same range would re-block forever (Codex PR #263 round-5). Instead we
+      # DEPLOY THE APP (never skip it), advance the baseline, and THEN signal the
+      # eval handoff as a terminal non-rollback failure at the end of the build.
       - |
         CHANGED="$(cat pipeline-out/changed-files.txt 2>/dev/null || true)"
+        EVAL_HANDOFF=0
+        EVAL_FILES=""
         if printf '%s' "$CHANGED" | grep -qE '^(lambda/eval-packager/|deploy/evaluations/|deploy/continuous-improvement/|deploy/runtime-agent/)'; then
-          echo "BLOCKED: changeset touches fleet/eval-infra files (DEPLOY.md steps 4-9)," >&2
-          echo "         which this APP pipeline does not deploy. Nothing has been" >&2
-          echo "         deployed. A human must run DEPLOY.md steps 4-9 (or the" >&2
-          echo "         fleet+eval pipeline, once stood up). Offending files:" >&2
-          printf '%s\n' "$CHANGED" | grep -E '^(lambda/eval-packager/|deploy/evaluations/|deploy/continuous-improvement/|deploy/runtime-agent/)' | sed 's/^/           - /' >&2
-          exit 1
+          EVAL_HANDOFF=1
+          EVAL_FILES="$(printf '%s\n' "$CHANGED" | grep -E '^(lambda/eval-packager/|deploy/evaluations/|deploy/continuous-improvement/|deploy/runtime-agent/)')"
         fi
+        # Hand the flag to the build phase (env doesn't persist across CodeBuild
+        # phase boundaries; write it to a file the build block reads).
+        printf '%s' "$EVAL_HANDOFF" > /tmp/eval-handoff
+        printf '%s' "$EVAL_FILES" > /tmp/eval-files
 
   build:
     commands:
@@ -110,8 +112,9 @@ phases:
           echo "ECS_SERVICE_ARN unset — skipping app roll (Lambda/blueprint-only deploy)"
         fi
 
-        # (Fleet/eval-infra scope guard already ran in pre_build — a changeset
-        # touching those files refused BEFORE any prod mutation.)
+        # (Fleet/eval-infra detected in pre_build is handled AFTER a successful
+        # app deploy + baseline advance — see the handoff signal below — so the
+        # app always ships and the same commits never re-block.)
 
         # ── Smoke checks (DEPLOY.md) — failures here also hit the rollback trap ──
         echo "Smoke checks"
@@ -136,11 +139,27 @@ phases:
           echo "ECS rollout healthy"
         fi
 
-        # ── SUCCESS: only NOW advance the rollback snapshot to this artifact ──
-        # (Codex #263 round-3 P2: never label a failed deploy as "current".)
+        # ── APP DEPLOY SUCCEEDED: advance the rollback snapshot + baseline NOW ──
+        # (Codex #263 round-3 P2: never label a failed deploy "current". Round-5:
+        # the baseline advances on EVERY successful app deploy — including one that
+        # also carried eval files — so the eval handoff below never re-blocks the
+        # same commits.)
         aws s3 cp pipeline-out/orchestrator.zip "s3://$ARTIFACT_BUCKET/pipeline-artifacts/orchestrator-current.zip" --region "$AWS_REGION_HUB"
-        # Record the deployed SHA so the NEXT build diffs the full push range from
-        # here (Codex #263 round-4 P2 — the changed-files guard reads this).
         printf '%s' "$GIT_SHA" | aws s3 cp - "s3://$ARTIFACT_BUCKET/pipeline-artifacts/last-deployed-sha.txt" --region "$AWS_REGION_HUB"
         trap - EXIT
-        echo "── Deploy complete ──"
+        echo "── App deploy complete ──"
+
+        # ── Eval/fleet handoff: app shipped + baseline advanced; NOW fail the
+        # action (no rollback — the app deploy is good and permanent) so the
+        # release manager reports the eval part as a human handoff. Because the
+        # baseline already moved to this SHA, the NEXT run starts from here and
+        # will NOT re-block these commits (Codex #263 round-5).
+        if [ "$(cat /tmp/eval-handoff 2>/dev/null)" = "1" ]; then
+          echo "── HANDOFF: app deployed OK, but the changeset also touched fleet/eval-infra ──" >&2
+          echo "This APP pipeline does not deploy DEPLOY.md steps 4-9. A human (or the" >&2
+          echo "fleet+eval pipeline, once stood up) must deploy these files:" >&2
+          sed 's/^/  - /' /tmp/eval-files >&2
+          echo "The app targets (Lambda/S3/ECS) are deployed + verified and the baseline" >&2
+          echo "has advanced, so re-running will not re-block these commits." >&2
+          exit 2
+        fi

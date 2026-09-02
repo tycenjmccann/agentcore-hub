@@ -279,12 +279,15 @@ Notes (implemented):
   regressions merge. Kept in lockstep with `.github/workflows/ci.yml`.
 - **Eval-infra targets (DEPLOY.md steps 4–9) are OUT of the app pipeline.** They
   belong to the separate fleet+eval pipeline (its own role/secrets/CLI). The app
-  pipeline's Deploy stage checks `pipeline-out/changed-files.txt` in **pre_build**
-  and, if the changeset touches fleet/eval paths, **BLOCKS before any prod
-  mutation** so a human runs steps 4-9 — the documented handoff, not a silent
-  skip. The changed-file list is computed from the last successfully deployed SHA
-  (recorded in S3), so a multi-commit push cannot hide an eval change; an unknown
-  range forces the block conservatively.
+  pipeline detects a fleet/eval change (`pipeline-out/changed-files.txt`) but does
+  NOT block up front — it **deploys the app targets, advances the baseline SHA,
+  then fails the action as a terminal non-rollback handoff** so a human runs steps
+  4-9. This ordering is deliberate: the baseline only advances on a successful app
+  deploy, so blocking *before* the deploy would wedge the pipeline (same range
+  re-blocks forever). Deploying-then-signalling means the app always ships and the
+  same commits never re-block. The changed-file list is computed from the last
+  successfully deployed SHA (recorded in S3), so a multi-commit push cannot hide
+  an eval change; an unknown range forces the handoff conservatively.
 - **ECS roll is conditional** on `ECS_SERVICE_ARN` being set (Lambda/blueprint-
   only changes skip the image promote), and the roll is **verified**: the Deploy
   stage polls the service to ACTIVE-with-endpoint and curls the app health

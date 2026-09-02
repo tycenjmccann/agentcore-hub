@@ -1907,6 +1907,18 @@ async function buildAgentContext(ticket, workflow) {
     context += `## Repository\nowner: ${owner}\nrepo: ${repo}\ndefault_branch: ${defaultBranch}\n\n`;
   }
 
+  // CI/CD pipeline mode signal (PR #263). The CI/QA/release-manager blueprints
+  // branch on this: set → read CodeBuild/CodePipeline results instead of shelling
+  // builds/deploys; absent → legacy self-run. An env var alone is invisible to
+  // the model, so surface it EXPLICITLY in the task context (Codex #263 round-5).
+  if (process.env.PIPELINE_ENABLED === "1" || process.env.PIPELINE_ENABLED === "true") {
+    context += `## Pipeline Mode\nPIPELINE_ENABLED: true\n`;
+    context += `A CodeBuild PR-check + CodePipeline deploy own this repo's `;
+    context += `deterministic build/test/deploy. Follow the PIPELINE_ENABLED path `;
+    context += `in your blueprint (read CI/pipeline results; do NOT shell builds or `;
+    context += `run DEPLOY.md yourself).\n\n`;
+  }
+
   // S3 workspace paths (scope)
   const agentDef = getAgentDef(ticket.assignee);
   context += `## S3 Workspace\n`;
