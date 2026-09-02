@@ -310,6 +310,9 @@ function getCascade() {
     workflowsTable: WORKFLOWS_TABLE,
     redispatch: redispatchTicket,
     reawakenGate: handleHumanReviewGate,
+    // TEAM-3755 F9 — the strongly-consistent blocker confirm the extended-state
+    // event path runs before it steals a lease and re-dispatches.
+    getTicketConsistent,
   });
   return _cascade;
 }
@@ -2654,6 +2657,24 @@ async function getTicket(ticketId) {
     result.Item.issueType = result.Item.type;
   }
   return result.Item;
+}
+
+/**
+ * TEAM-3755 F9 — one ticket read by KEY with ConsistentRead, for callers that
+ * must not act on the eventually-consistent parentId-index snapshot (the cascade's
+ * blocker confirm). Jira has no read-consistency knob: its REST GET is already a
+ * fresh authoritative read, so the provider branch is the same shape as getTicket.
+ */
+async function getTicketConsistent(ticketId) {
+  if (TICKET_PROVIDER === "jira") {
+    return await getTicketFromJira(ticketId);
+  }
+  const result = await ddb.send(new GetCommand({
+    TableName: TICKETS_TABLE,
+    Key: { ticketId },
+    ConsistentRead: true,
+  }));
+  return result.Item || null;
 }
 
 async function getChildTickets(parentId) {

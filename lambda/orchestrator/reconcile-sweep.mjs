@@ -41,6 +41,9 @@
 
 import { ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { newMetrics as newCascadeMetrics } from "./cascade.mjs";
+// The ONE terminal-phase list (TEAM-3755 F2/F8). completion.mjs is pure — no AWS
+// clients, no store import — so importing it here cannot cycle.
+import { notTerminalPhaseFilter } from "./completion.mjs";
 
 const SWEEP_CAP = 50;                 // workflows inspected per sweep (most recent first)
 const WORKFLOW_SCAN_PAGES = 20;       // bound the workflows scan
@@ -80,20 +83,26 @@ export function createReconcileSweep(deps) {
    * Scan workflows in a non-terminal phase, newest first, capped at SWEEP_CAP.
    * Returns { workflows, matched } so the caller can flag truncation. Identical
    * shape/bounds to dead-session-detector.scanNonTerminalWorkflows.
+   *
+   * TEAM-3755 F8: the filter is DERIVED from the shared TERMINAL_WORKFLOW_PHASES
+   * list (completion.mjs) rather than spelled out here. It previously named only
+   * complete/cancelled/error, so a run already closed deploy-blocked /
+   * static-ci-only (the TEAM-3747 D2 honest closes) still scanned as "open" —
+   * and in enforce mode the sweep could steal a lease and RE-DISPATCH a parked
+   * candidate inside a terminally-blocked run, resurrecting work after the
+   * verdict. Deriving it means a sixth terminal phase can never be added to the
+   * completion gate and forgotten here.
    */
   async function scanNonTerminalWorkflows() {
     const matched = [];
     let lastKey;
+    const openOnly = notTerminalPhaseFilter("#p");
     for (let page = 0; page < WORKFLOW_SCAN_PAGES; page++) {
       const res = await ddb.send(new ScanCommand({
         TableName: workflowsTable,
-        FilterExpression: "NOT (#p IN (:complete, :cancelled, :error))",
+        FilterExpression: openOnly.filter,
         ExpressionAttributeNames: { "#p": "phase" },
-        ExpressionAttributeValues: {
-          ":complete": "complete",
-          ":cancelled": "cancelled",
-          ":error": "error",
-        },
+        ExpressionAttributeValues: { ...openOnly.values },
         ExclusiveStartKey: lastKey,
       }));
       for (const w of res.Items || []) matched.push(w);

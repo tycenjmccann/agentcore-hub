@@ -20,6 +20,7 @@ import {
   QueryCommand,
   PutCommand,
 } from "@aws-sdk/lib-dynamodb";
+import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
@@ -27,7 +28,29 @@ const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 
-const TERMINAL_PHASES = ["complete", "error", "cancelled"] as const;
+// TEAM-3755 — the ship-blocked outcomes are ALSO terminal: cancelling a run
+// that already closed deploy-blocked / static-ci-only would overwrite its
+// honest verdict with "cancelled". PARITY with TERMINAL_PHASES in
+// complete/route.ts and completion.mjs; the F6 UI fix (WorkflowBoard hiding
+// Cancel) only removes the button — this route is the actual enforcement.
+const TERMINAL_PHASES = ["complete", "error", "cancelled", ...SHIP_BLOCKED_OUTCOMES] as const;
+
+/**
+ * TEAM-3755 — build the "not already terminal" ConditionExpression from the
+ * ONE list above, mirroring terminalPhaseGuard() in complete/route.ts so the
+ * cancel CAS refuses the SAME five phases the early guard checks.
+ * Positional placeholders (:tp0…) so they never collide with the write's own
+ * ExpressionAttributeValues.
+ */
+function terminalPhaseGuard(): { condition: string; values: Record<string, string> } {
+  const values: Record<string, string> = {};
+  const condition = TERMINAL_PHASES.map((phase, i) => {
+    const key = `:tp${i}`;
+    values[key] = phase;
+    return `#phase <> ${key}`;
+  }).join(" AND ");
+  return { condition, values };
+}
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
@@ -313,6 +336,7 @@ export async function POST(
 
     // 3. Conditional write — set phase to "cancelled"
     const cancelledAt = new Date().toISOString();
+    const guard = terminalPhaseGuard();
     try {
       await ddb.send(
         new UpdateCommand({
@@ -321,16 +345,13 @@ export async function POST(
           UpdateExpression:
             "SET #phase = :cancelled, cancelledAt = :ts, previousPhase = :prev" +
             (reason ? ", cancelReason = :reason" : ""),
-          ConditionExpression:
-            "#phase <> :complete AND #phase <> :error AND #phase <> :alreadyCancelled",
+          ConditionExpression: guard.condition,
           ExpressionAttributeNames: { "#phase": "phase" },
           ExpressionAttributeValues: {
             ":cancelled": "cancelled",
             ":ts": cancelledAt,
             ":prev": workflow.phase,
-            ":complete": "complete",
-            ":error": "error",
-            ":alreadyCancelled": "cancelled",
+            ...guard.values,
             ...(reason ? { ":reason": reason } : {}),
           },
         })

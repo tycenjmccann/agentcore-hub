@@ -81,6 +81,30 @@ export function notTerminalPhaseGuard(nameRef = "phase") {
 }
 
 /**
+ * TEAM-3755 F8 — the SCAN counterpart of notTerminalPhaseGuard: the
+ * "still open" FilterExpression the background sweeps (reconcile-sweep.mjs, the
+ * dead-session detector) use to skip finished runs, derived from the SAME
+ * TERMINAL_WORKFLOW_PHASES list so a sweep can never re-drive work inside a run
+ * that already closed deploy-blocked / static-ci-only.
+ *
+ * Deliberately the `NOT (#p IN (…))` form the sweeps already used, NOT the
+ * guard's chain of `<>`: for an item with NO phase attribute the two differ —
+ * `IN` evaluates false so `NOT (…)` KEEPS the row, whereas every `<>` would
+ * evaluate false and DROP it. Rows in the workflows table that carry no phase
+ * (e.g. the start-route dedup markers) must keep reading as non-terminal exactly
+ * as before; this helper changes which phases are excluded, nothing else.
+ */
+export function notTerminalPhaseFilter(nameRef = "#p") {
+  const values = {};
+  const keys = TERMINAL_WORKFLOW_PHASES.map((phase, i) => {
+    const key = `:tp${i}`;
+    values[key] = phase;
+    return key;
+  });
+  return { filter: `NOT (${nameRef} IN (${keys.join(", ")}))`, values };
+}
+
+/**
  * Agent phases whose done tickets owe a MERGE/DEPLOY verdict rather than mere
  * output (the ship / CD stage). A def opts in by listing "ship" in its
  * completionRequiresAgentPhases; runs with no ship phase are wholly unaffected.
