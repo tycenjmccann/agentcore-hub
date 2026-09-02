@@ -17,8 +17,11 @@ version: 0.2
 # CodeBuild defaults Linux command execution to /bin/sh (dash). The deploy block
 # opens with `set -euo pipefail` and uses bash here-strings (`read <<<`), both of
 # which dash rejects — the first line aborts before Target 1 and NOTHING deploys
-# (pilot run 2cc3f811: "set: Illegal option -o pipefail"). Pin bash explicitly.
-shell: bash
+# (pilot runs 2cc3f811 / bd4a5888: "set: Illegal option -o pipefail"). The shell
+# selector is a FIELD OF env: in buildspec 0.2, not a top-level key — a top-level
+# `shell:` is silently ignored and the block still runs under dash.
+env:
+  shell: bash
 
 phases:
   pre_build:
