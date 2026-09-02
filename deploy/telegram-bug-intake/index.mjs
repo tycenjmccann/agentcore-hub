@@ -749,13 +749,20 @@ async function scanDeployApprovals() {
   // marks the *stage* InProgress and the action has a latestExecution.token
   // only while it waits; the token is required by PutApprovalResult.
   let pending = null;
+  // The commit being deployed — the Source stage's currentRevision. Used to
+  // enrich the ping with the actual commit / PR / scope (esbuild the SHA once).
+  const sourceRevisionId = (state.stageStates || [])
+    .flatMap((s) => s.actionStates || [])
+    .map((a) => a.currentRevision?.revisionId)
+    .find(Boolean);
   for (const stage of state.stageStates || []) {
     for (const action of stage.actionStates || []) {
       const token = action.latestExecution?.token;
       const status = action.latestExecution?.status;
       if (token && status === "InProgress") {
         pending = { stageName: stage.stageName, actionName: action.actionName, token,
-          revisionUrl: action.entityUrl || action.revisionUrl };
+          revisionUrl: action.entityUrl || action.revisionUrl,
+          commitSha: sourceRevisionId || null };
         break;
       }
     }
@@ -776,18 +783,45 @@ async function scanDeployApprovals() {
       return;
     }
 
-    const text =
-      `🚀 *Deploy approval — ${esc(DEPLOY_PIPELINE_NAME)}*\n` +
-      `The build passed every gate and is waiting on you to ship it to prod. ` +
-      `This is the irreversible production deploy — the merge was already approved.\n\n` +
-      `Review the built commit, then *Approve* to deploy or *Reject* to stop.`;
+    // Enrich the ping with what's actually shipping: the commit subject, the PR
+    // (title + workflow/epic + one-line summary from the body), and the file
+    // scope. Best-effort — a GitHub hiccup falls back to the terse message.
+    const brief = await buildDeployBrief(pending.commitSha).catch((e) => {
+      console.warn("[telegram-bug-intake] deploy brief enrich failed:", e.message);
+      return null;
+    });
+
+    const header = `🚀 *Deploy approval — ${esc(DEPLOY_PIPELINE_NAME)}*`;
+    const body = brief
+      ? [
+          header,
+          brief.prTitle ? `*${esc(brief.prTitle)}*` : (brief.commitSubject ? `*${esc(brief.commitSubject)}*` : ""),
+          brief.workflowLine ? brief.workflowLine : "",       // e.g. "Workflow: TEAM-3721 (bug-fix)"
+          brief.summary ? esc(brief.summary) : "",            // one-line what/why from the PR body
+          brief.scopeLine ? brief.scopeLine : "",             // e.g. "Scope: 8 files (+147/-4)"
+          brief.commitLine ? brief.commitLine : "",           // e.g. "Commit: a1b2c3d"
+          "",
+          `This is the *irreversible production deploy* — the merge was already approved.`,
+          `*Approve* to ship or *Reject* to stop.`,
+        ].filter((l) => l !== "").join("\n")
+      : [
+          header,
+          `The build passed every gate and is waiting on you to ship it to prod. ` +
+            `This is the irreversible production deploy — the merge was already approved.`,
+          ``,
+          `Review the built commit, then *Approve* to deploy or *Reject* to stop.`,
+        ].join("\n");
+    const text = body;
+
     const rows = [[
       { text: "🚀 Approve deploy", callback_data: `dok|${claimed.key}` },
       { text: "🛑 Reject", callback_data: `dno|${claimed.key}` },
     ]];
-    if (pending.revisionUrl) {
-      rows.push([{ text: "🔗 View commit", url: pending.revisionUrl }]);
-    }
+    const linkRow = [];
+    if (brief?.prUrl) linkRow.push({ text: "🔗 View PR", url: brief.prUrl });
+    if (pending.revisionUrl) linkRow.push({ text: "🔗 View commit", url: pending.revisionUrl });
+    else if (brief?.commitUrl) linkRow.push({ text: "🔗 View commit", url: brief.commitUrl });
+    if (linkRow.length) rows.push(linkRow);
     const keyboard = { inline_keyboard: rows };
 
     let delivered = 0;
@@ -801,6 +835,75 @@ async function scanDeployApprovals() {
       console.error("[telegram-bug-intake] releaseDeployApproval after failure", relErr.message));
     throw err;
   }
+}
+
+/**
+ * Build a rich "what's shipping" brief for the deploy-approval ping from the
+ * commit being deployed: the commit subject, its associated PR (title + body),
+ * the workflow/epic key parsed from the PR body/title, a one-line summary, and
+ * the file scope (count + additions/deletions). All best-effort against the
+ * GitHub API with GITHUB_TOKEN; any failure returns partial/null and the caller
+ * falls back to the terse message. Returns null if no commit SHA is known.
+ */
+async function buildDeployBrief(commitSha) {
+  if (!commitSha) return null;
+  const repo = `${GITHUB_USER}/agentcore-hub`;
+  const gh = async (path) => {
+    const r = await fetch(`https://api.github.com/repos/${repo}${path}`, {
+      headers: {
+        Authorization: `token ${GITHUB_TOKEN}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "agentcore-hub-telegram-intake",
+      },
+    });
+    if (!r.ok) throw new Error(`GitHub ${path} ${r.status}`);
+    return r.json();
+  };
+
+  const short = String(commitSha).slice(0, 7);
+  const brief = {
+    commitLine: `Commit: \`${short}\``,
+    commitUrl: `https://github.com/${repo}/commit/${commitSha}`,
+    commitSubject: null, prTitle: null, prUrl: null,
+    workflowLine: null, summary: null, scopeLine: null,
+  };
+
+  // Commit → subject + file scope.
+  try {
+    const commit = await gh(`/commits/${commitSha}`);
+    brief.commitSubject = (commit.commit?.message || "").split("\n")[0].slice(0, 140) || null;
+    const stats = commit.stats || {};
+    const files = Array.isArray(commit.files) ? commit.files.length : null;
+    if (files != null) {
+      brief.scopeLine = `Scope: ${files} file${files === 1 ? "" : "s"}` +
+        (stats.additions != null ? ` (+${stats.additions}/-${stats.deletions})` : "");
+    }
+  } catch (e) { /* keep going — subject/scope optional */ }
+
+  // Commit → its PR (title + body). The body carries the epic/workflow + summary.
+  try {
+    const prs = await gh(`/commits/${commitSha}/pulls`);
+    const pr = Array.isArray(prs) && prs[0];
+    if (pr) {
+      brief.prTitle = (pr.title || "").slice(0, 140) || null;
+      brief.prUrl = pr.html_url || null;
+      // Workflow/epic key: TEAM-#### from the PR title or body.
+      const key = (pr.title + " " + (pr.body || "")).match(/\b([A-Z][A-Z0-9]+-\d+)\b/);
+      // Workflow type hint (bug-fix / SDLC / dead-code) from title prefix.
+      const typeHint = /bug|fix\(/i.test(pr.title) ? "bug-fix"
+        : /dead.?code|sweep/i.test(pr.title) ? "dead-code"
+        : "SDLC";
+      if (key) brief.workflowLine = `Workflow: ${key[1]} (${typeHint})`;
+      // One-line summary: first non-empty, non-heading line of the PR body.
+      const bodyLine = (pr.body || "")
+        .split("\n")
+        .map((l) => l.trim())
+        .find((l) => l && !l.startsWith("#") && !l.startsWith("<!--") && !l.startsWith("|"));
+      if (bodyLine) brief.summary = bodyLine.replace(/^[*\-\s]+/, "").slice(0, 200);
+    }
+  } catch (e) { /* PR optional — commit subject already covers the headline */ }
+
+  return brief;
 }
 
 /**

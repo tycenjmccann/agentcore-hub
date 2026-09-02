@@ -34,6 +34,11 @@ export interface StageState {
   status: string; // Succeeded | Failed | InProgress | ... | Unknown
   lastUpdated?: string;
   revisionSummary?: string;
+  // A ManualApproval action in this stage currently awaiting a human decision
+  // (has a token + InProgress). Powers the "deploy gate waiting" signal in the
+  // workflow board — otherwise the post-merge deploy gate is invisible in the UI.
+  awaitingApproval?: boolean;
+  approvalUrl?: string; // the action's entityUrl (view-commit / review link)
 }
 
 export interface PipelineStatus {
@@ -108,12 +113,20 @@ async function pipelineStages(cp: CodePipelineClient): Promise<StageState[]> {
   const st = await cp.send(
     new GetPipelineStateCommand({ name: DEPLOY_PIPELINE })
   );
-  return (st.stageStates || []).map((s) => ({
-    name: s.stageName || "",
-    status: s.latestExecution?.status || "Unknown",
-    lastUpdated:
-      s.actionStates?.[0]?.latestExecution?.lastStatusChange?.toISOString(),
-    revisionSummary:
-      s.actionStates?.[0]?.currentRevision?.revisionId?.slice(0, 12),
-  }));
+  return (st.stageStates || []).map((s) => {
+    // A ManualApproval action awaiting a decision has a token + InProgress status.
+    const approvalAction = (s.actionStates || []).find(
+      (a) => a.latestExecution?.token && a.latestExecution?.status === "InProgress"
+    );
+    return {
+      name: s.stageName || "",
+      status: s.latestExecution?.status || "Unknown",
+      lastUpdated:
+        s.actionStates?.[0]?.latestExecution?.lastStatusChange?.toISOString(),
+      revisionSummary:
+        s.actionStates?.[0]?.currentRevision?.revisionId?.slice(0, 12),
+      awaitingApproval: !!approvalAction,
+      approvalUrl: approvalAction?.entityUrl,
+    };
+  });
 }
