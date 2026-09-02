@@ -219,6 +219,36 @@ echo "   ✓ EFS mount access"
 # THAT in the invoke payload; the agent never sees the key. Do not add a
 # Secrets Manager grant here. See docs/github-app-auth.md.
 
+# ─── CodePipeline Observe (CD preflight from the coding runtime) ────────────
+# Lets a coding-runtime turn (e.g. a release-manager CD ticket) OBSERVE the
+# deploy pipeline — execution id, stage statuses, smoke results — and start it
+# as a fallback when a merge doesn't auto-trigger. codepipeline:PutApprovalResult
+# is DELIBERATELY NOT granted here: the ManualApproval stage is the human-only
+# deploy gate (Telegram bridge, TEAM-3740) — do not add it.
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name "CodePipelineObserve" \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Sid\": \"ObserveDeployPipeline\",
+      \"Effect\": \"Allow\",
+      \"Action\": [
+        \"codepipeline:GetPipeline\",
+        \"codepipeline:GetPipelineState\",
+        \"codepipeline:GetPipelineExecution\",
+        \"codepipeline:ListPipelineExecutions\",
+        \"codepipeline:ListActionExecutions\",
+        \"codepipeline:StartPipelineExecution\"
+      ],
+      \"Resource\": [
+        \"arn:aws:codepipeline:${REGION}:${ACCOUNT_ID}:agentcore-hub-deploy\",
+        \"arn:aws:codepipeline:${REGION}:${ACCOUNT_ID}:agentcore-hub-deploy/*\"
+      ]
+    }]
+  }"
+echo "   ✓ CodePipeline observe + start (no PutApprovalResult)"
+
 echo ""
 echo "   ⏳ Waiting 10s for IAM propagation..."
 sleep 10

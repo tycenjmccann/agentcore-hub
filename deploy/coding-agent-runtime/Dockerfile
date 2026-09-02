@@ -34,6 +34,16 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# AWS CLI v2 — pipeline-mode CD preflight needs `aws codepipeline get-pipeline`
+# from inside the coding runtime (TEAM-3741); the base image ships no `aws`
+# binary, so agents were pip-installing v1 ad hoc. `unzip` is already
+# installed above.
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/awscliv2.zip /tmp/aws \
+    && aws --version
+
 # OpenTelemetry Collector Contrib — sidecar that SigV4-signs the CLIs' OTLP
 # telemetry and forwards it to CloudWatch. Includes sigv4auth + transform (OTTL)
 # processors that ADOT lacks.
