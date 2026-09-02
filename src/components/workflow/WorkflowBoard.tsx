@@ -205,6 +205,15 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     }
   }, [workflowId]);
 
+  // Deep link: /workflow?id=X&ticket=<id> opens the ticket detail modal
+  // directly (e.g. a Telegram gate ping's "Open approval" button jumping
+  // straight to the review-package view on the gate ticket).
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const ticketParam = params.get("ticket");
+    if (ticketParam) setOpenTicketModal({ ticketId: ticketParam, workflowId });
+  }, [workflowId]);
+
   const handleCancelWorkflow = useCallback(async () => {
     setCancelLoading(true);
     setCancelError(null);
@@ -1707,7 +1716,15 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             ticketId={openTicketModal.ticketId}
             workflowId={openTicketModal.workflowId}
             isOpen={true}
-            onClose={() => setOpenTicketModal(null)}
+            onClose={() => {
+              setOpenTicketModal(null);
+              // Drop the ticket param so refresh/back doesn't reopen the modal
+              const url = new URL(window.location.href);
+              if (url.searchParams.has("ticket")) {
+                url.searchParams.delete("ticket");
+                window.history.replaceState({}, "", url.toString());
+              }
+            }}
             reviewNotification={
               (state?.humanNotifications || []).find(
                 (n) => n.type === "review_needed" && !n.acknowledged &&

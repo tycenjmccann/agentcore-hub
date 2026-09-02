@@ -377,7 +377,11 @@ Find the gate ticket: `Tickets___list_tickets(epic_id)` → the ticket assigned
 to `human:*` whose title contains "Merge Approval". Write the brief with
 `Tickets___update_ticket(ticket_id, description=...)` AND post it as a comment
 via `Tickets___add_comment` (the comment survives description edits and rides
-the Telegram ping).
+the Telegram ping). ALSO save the identical brief to
+`workflows/{workflow_id}/shared/merge-brief.md` (`S3Storage___write_object`,
+content_type text/markdown) — that S3 copy is the approval DOC the review
+package (Step 6) links to, so the reviewer's phone ping opens the brief
+directly instead of the engineer-facing review history.
 
 Format — pyramid principle, decision first, plain English, no jargon:
 
@@ -429,7 +433,9 @@ Rules for the brief:
 template. The Merge Approval ping the human receives (summary, bullets, PR
 link) is built from this file — without it the ping is a bare template with
 no context. The package is the phone-sized distillation of the Merge Brief:
-same decision, PR link first, then `shared/ship-review-summary.md`.
+same decision. Links in review priority order: `shared/merge-brief.md` FIRST
+(the approval doc — what the reviewer reads to decide), then the PR url, then
+`shared/ship-review-summary.md` only if the brief points the reviewer at it.
 
 ---
 

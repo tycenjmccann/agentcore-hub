@@ -92,9 +92,10 @@ The reviewer decides: "does this merge and deploy?"
 - bullets: what changed (component-level, not file-level), test/QA evidence
   (counts, not adjectives), anything the reviewer should look at extra hard,
   deploy impact (migrations, env vars, flags).
-- links: the PR url FIRST (that's the review surface), then
-  `shared/ship-review-summary.md`. Do not link intermediate dev artifacts —
-  the PR diff supersedes them.
+- links: `shared/merge-brief.md` FIRST (the decision document — the reviewer
+  reads THAT, not the review history), then the PR url, then
+  `shared/ship-review-summary.md` only if the brief refers to it. Do not link
+  intermediate dev artifacts — the PR diff supersedes them.
 
 ### `redline` — Counsel Sign-off (reviewer: Legal)
 The reviewer decides: "do these redlines go to the counterparty?"
