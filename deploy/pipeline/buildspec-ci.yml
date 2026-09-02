@@ -46,8 +46,12 @@ phases:
     commands:
       # production build == the module-removal smoke test
       - "npm run build"
-      # The Playwright suites hit localhost:3000 and define no webServer, so boot
-      # `next start` first and wait for readiness (mirrors the GH job).
+      # Boot `next start` for the HERMETIC Playwright suite. Note: `npm test`
+      # (tabs + e2e-api-routes) makes REAL AWS-backed calls (DynamoDB workflow
+      # list/start) and CANNOT pass in a credential-less CI container — it is a
+      # live-deployment smoke test, NOT a hermetic gate, and .github/workflows/ci.yml
+      # does not run it as a blocking job either. The authoritative UI gate that
+      # IS hermetic is the Cloud Code suite (every backend call page.route-mocked).
       - "nohup npm run start -- -p 3000 > /tmp/next-server.log 2>&1 &"
       - |
         for i in $(seq 1 30); do
@@ -55,10 +59,8 @@ phases:
           sleep 2
           if [ "$i" = "30" ]; then echo "server did not come up"; cat /tmp/next-server.log; exit 1; fi
         done
-      # fast suite (tab UI + API smoke)
-      - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm test"
-      # Cloud Code UI regression suite — a separate blocking job in GH CI that
-      # `npm test`'s narrower glob does not cover (Codex #263 round-3 P1).
+      # Cloud Code UI regression suite — the hermetic (mocked) blocking UI job
+      # from GH CI. This is the UI gate; the AWS-backed tab/api specs are not.
       - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:cloud-code -- --trace retain-on-failure"
       # runtime-agent telemetry pytest (hermetic, no AWS)
       - |

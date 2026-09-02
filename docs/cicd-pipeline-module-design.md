@@ -203,7 +203,8 @@ phases:
   build:
     commands:
       - npm run build           # next build == module-removal smoke test
-      - npm test                # fast Playwright: tab UI + API smoke
+      - npm run test:cloud-code # hermetic (page.route-mocked) UI gate — NOT the
+                                # AWS-backed tab/api specs, which need live creds
       # HARD GATE: the exact guard DEPLOY.md's inline zip bypassed
       - bash scripts/check-lambda-zip-manifest.sh
   post_build:
@@ -272,7 +273,7 @@ phases:
 Notes (implemented):
 - **CI gate parity.** `buildspec-ci.yml` runs EVERY blocking gate the GitHub CI
   workflow runs — `lint`, `tsc --noEmit`, `test:unit` (vitest),
-  `check-workflow-writes.sh`, `next build`, the fast Playwright suite, and the
+  `check-workflow-writes.sh`, `next build`, the hermetic Cloud Code UI suite, and the
   runtime-agent telemetry pytest — plus the lambda-zip manifest gate. It has to,
   because with `PIPELINE_ENABLED` the blueprints skip their own mechanical tests
   on a green result; a missing gate here would let unit/race/telemetry
