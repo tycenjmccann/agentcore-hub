@@ -22,6 +22,10 @@ phases:
     commands:
       - node --version && npm --version
       - npm ci
+      # Playwright needs a real browser + OS deps on the clean CodeBuild image
+      # (mirrors .github/workflows/ci.yml). Without this `npm test` errors before
+      # any gate runs.
+      - npx playwright install --with-deps chromium
 
   pre_build:
     commands:
@@ -34,8 +38,18 @@ phases:
     commands:
       - echo "── Gate 2/2: production build (also the module-removal smoke test) ──"
       - npm run build
+      # The fast Playwright suite hits localhost:3000 and defines no webServer,
+      # so boot `next start` first and wait for readiness (mirrors the GH job).
+      - echo "── Boot app for the Playwright smoke suite ──"
+      - nohup npm run start -- -p 3000 > /tmp/next-server.log 2>&1 &
+      - |
+        for i in $(seq 1 30); do
+          if curl -sf -o /dev/null http://localhost:3000/; then echo "server up"; break; fi
+          sleep 2
+          if [ "$i" = "30" ]; then echo "server did not come up"; cat /tmp/next-server.log; exit 1; fi
+        done
       - echo "── Gate: fast test suite (tab UI + API smoke) ──"
-      - npm test
+      - PLAYWRIGHT_BASE_URL=http://localhost:3000 npm test
       - echo "── HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed) ──"
       - bash scripts/check-lambda-zip-manifest.sh
 
@@ -46,16 +60,16 @@ phases:
       # ── Deploy-pipeline Build stage only: emit artifacts by digest ──
       - |
         if [ "${BUILD_APP_IMAGE:-false}" = "true" ]; then
-          echo "── Build stage: packaging orchestrator zip (deploy.sh explicit file list) ──"
+          echo "── Build stage: packaging orchestrator zip via lambda/orchestrator/deploy.sh's OWN file list ──"
+          # Reuse deploy.sh's exact `zip -rq function.zip ...` line — do NOT keep a
+          # second copy of the file list here (Codex PR #263 P2: two lists drift).
           cp src/config/lease-constants.json lambda/orchestrator/lease-constants.json
-          ( cd lambda/orchestrator && npm ci --omit=dev && \
-            zip -rq /tmp/orchestrator.zip index.mjs agent-invoker.mjs events-writer.mjs \
-              workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs \
-              dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs \
-              completion.mjs package.json node_modules/ )
+          ( cd lambda/orchestrator && npm ci --omit=dev )
+          ZIP_ARGS="$(grep -oE 'zip -rq function\.zip .*' lambda/orchestrator/deploy.sh | sed 's/^zip -rq function\.zip //')"
+          ( cd lambda/orchestrator && zip -rq /tmp/orchestrator.zip $ZIP_ARGS )
           rm -f lambda/orchestrator/lease-constants.json
-          echo "── Re-assert manifest on the actual zip about to ship ──"
-          bash scripts/check-lambda-zip-manifest.sh
+          echo "── Validate the ACTUAL built archive (not just deploy.sh's line) ──"
+          bash scripts/check-lambda-zip-manifest.sh --zip /tmp/orchestrator.zip
           echo "── Build + push app image to ECR, capture the DIGEST for promote-by-digest ──"
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
@@ -64,8 +78,15 @@ phases:
           # Bundle the DEPLOYED agents.json (real ARNs) for the image build only.
           aws s3 cp "s3://${ARTIFACT_BUCKET}/config/agents.json" /tmp/agents.s3.json --region "$AWS_REGION_HUB" || true
           if [ -f /tmp/agents.s3.json ]; then cp src/config/agents.json /tmp/agents.git.json; cp /tmp/agents.s3.json src/config/agents.json; fi
-          GIT_SHA="$(git rev-parse --short HEAD)"
+          # CodePipeline's CodeStar source is a ZIP artifact with no .git — use the
+          # pipeline-resolved source revision, not `git rev-parse` (Codex #263 P1).
+          GIT_SHA="${CODEBUILD_RESOLVED_SOURCE_VERSION:-$(git rev-parse --short HEAD 2>/dev/null || echo nogit)}"
+          GIT_SHA="$(printf '%s' "$GIT_SHA" | cut -c1-12)"
+          # Bake the pipeline nav flag into the client bundle (Codex #263 P2):
+          # NEXT_PUBLIC_* are inlined at build time, so it must be a build-arg,
+          # not a runtime env var. Defaults empty (hidden) when the var is unset.
           docker buildx build --platform linux/amd64 \
+            --build-arg NEXT_PUBLIC_PIPELINE_ENABLED="${NEXT_PUBLIC_PIPELINE_ENABLED:-}" \
             --tag "${ECR_URI}:${GIT_SHA}" --tag "${ECR_URI}:latest" \
             --push --file Dockerfile . --provenance=false
           if [ -f /tmp/agents.git.json ]; then cp /tmp/agents.git.json src/config/agents.json; fi

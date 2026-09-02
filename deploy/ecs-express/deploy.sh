@@ -295,6 +295,16 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": \"sqs:SendMessage\",
         \"Resource\": \"arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:agentcore-hub-workflow-commands.fifo\"
+      },
+      {
+        \"Sid\": \"PipelineModuleReads\",
+        \"Effect\": \"Allow\",
+        \"Action\": [
+          \"codebuild:ListBuildsForProject\",
+          \"codebuild:BatchGetBuilds\",
+          \"codepipeline:GetPipelineState\"
+        ],
+        \"Resource\": \"*\"
       }
     ]
   }"

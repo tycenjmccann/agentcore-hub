@@ -134,6 +134,11 @@ export class PipelineStack extends Stack {
           ),
         ],
       }),
+      // Authorize this GitHub source via the SAME CodeConnections link the
+      // pipeline Source action uses — otherwise the PR-check project has no
+      // credential to clone or post the required status and silently relies on a
+      // pre-existing account-level OAuth token (Codex PR #263 P1). Set as a
+      // source-level auth override below via the L1 escape hatch.
       buildSpec: codebuild.BuildSpec.fromSourceFilename(
         "deploy/pipeline/buildspec-ci.yml"
       ),
@@ -143,6 +148,18 @@ export class PipelineStack extends Stack {
       timeout: Duration.minutes(30),
       concurrentBuildLimit: 4,
     });
+    // Bind the CI project's GitHub source auth to the CodeConnections link
+    // (Codex PR #263 P1). CDK L2 has no prop for CODECONNECTIONS source auth, so
+    // set it on the L1 Source.Auth via escape hatch. Once the connection's
+    // handshake is completed this credential clones + posts the required status;
+    // without it the project would fall back to an account OAuth token that may
+    // not exist.
+    const cfnCiProject = ciProject.node.defaultChild as codebuild.CfnProject;
+    cfnCiProject.addPropertyOverride("Source.Auth", {
+      Type: "CODECONNECTIONS",
+      Resource: connectionArn,
+    });
+
     // CI role: read-only beyond logs. It must NOT deploy anything.
     ciProject.role!.attachInlinePolicy(
       new iam.Policy(this, "CiReadArtifacts", {
@@ -154,6 +171,12 @@ export class PipelineStack extends Stack {
               artifactBucket.bucketArn,
               `${artifactBucket.bucketArn}/config/*`,
             ],
+          }),
+          // Use the CodeConnections link (clone + status post).
+          new iam.PolicyStatement({
+            sid: "UseCodeConnection",
+            actions: ["codeconnections:UseConnection", "codestar-connections:UseConnection"],
+            resources: [connectionArn],
           }),
         ],
       })
@@ -174,6 +197,11 @@ export class PipelineStack extends Stack {
         ...commonEnvVars,
         ECR_REPO: { value: "agentcore-hub-frontend" },
         BUILD_APP_IMAGE: { value: "true" },
+        // Baked into the image client bundle; flip to "1" to show the /pipeline
+        // nav tab (Codex PR #263 P2). Empty = hidden.
+        NEXT_PUBLIC_PIPELINE_ENABLED: {
+          value: process.env.PIPELINE_NAV_ENABLED || "",
+        },
       },
       timeout: Duration.minutes(40),
     });
@@ -228,6 +256,11 @@ export class PipelineStack extends Stack {
               connectionArn,
               output: sourceOutput,
               triggerOnPush: true,
+              // Emit a full git clone (not the default flat ZIP) so the Build
+              // stage has a real .git — the image tag falls back to
+              // `git rev-parse` when CODEBUILD_RESOLVED_SOURCE_VERSION is unset
+              // (Codex PR #263 P1, defense in depth with the buildspec fix).
+              codeBuildCloneOutput: true,
             }),
           ],
         },
@@ -349,7 +382,15 @@ function grantDeployPerms(
   const statements: iam.PolicyStatement[] = [
     new iam.PolicyStatement({
       sid: "LambdaCodeOnly",
-      actions: ["lambda:UpdateFunctionCode", "lambda:GetFunction"],
+      // GetFunctionConfiguration is REQUIRED by `aws lambda wait function-updated`
+      // (it polls that API) — without it the deploy fails after updating code,
+      // leaving prod half-deployed (Codex PR #263 P1). Still NO
+      // UpdateFunctionConfiguration → cannot rewrite env / blank Jira creds.
+      actions: [
+        "lambda:UpdateFunctionCode",
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+      ],
       resources: [
         `arn:aws:lambda:${ctx.region}:${ctx.account}:function:agentcore-hub-*`,
       ],
