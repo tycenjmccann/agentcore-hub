@@ -1,5 +1,9 @@
 # Next.js App Runner Deployment
-FROM node:22-alpine AS base
+# Pull the base from ECR Public (AWS's mirror of Docker Hub's official image)
+# instead of docker.io — the CI build is unauthenticated to Docker Hub and hits
+# HTTP 429 "Too Many Requests" rate limits that flake the pipeline build. ECR
+# Public has no anonymous-pull rate limit from within AWS.
+FROM public.ecr.aws/docker/library/node:22-alpine AS base
 
 # Install dependencies only
 FROM base AS deps
