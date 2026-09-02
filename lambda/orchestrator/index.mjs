@@ -40,6 +40,7 @@ import {
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
+import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets } from "./completion.mjs";
 
@@ -57,12 +58,34 @@ const MAX_QA_RETRIES = 3;
 // shadow (default) = observe + metrics + shadow-flagged events but ZERO writes,
 // enforce = steal/retry/escalate for real.
 const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
-// Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b). OFF by default:
-// the cascade only re-Readies {blocked, todo} dependents (commit-4a behavior).
-// ON: an in_progress dependent whose last blocker resolves is lease-guarded
-// (live → nudge only; stale → steal + re-dispatch through the claim CAS) and an
-// in_review gate is re-woken. Any value other than "on"/"true"/"1" stays OFF.
-const CASCADE_EXTENDED_STATES = /^(on|true|1)$/i.test(process.env.CASCADE_EXTENDED_STATES || "");
+// Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b; tri-state as of
+// TEAM-3747 D1). off = the cascade only re-Readies {blocked, todo} dependents
+// (commit-4a behavior); shadow (the NEW DEFAULT — ships dark-but-observing) =
+// evaluate the extended-state path and emit would-nudge/would-steal/would-
+// reawaken metrics but perform ZERO writes; enforce = an in_progress dependent
+// whose last blocker resolves is lease-guarded (live → nudge only; stale → steal
+// + re-dispatch through the claim CAS) and an in_review gate is re-woken for
+// real. Same vocabulary + fail-safe default (shadow) as DEAD_SESSION_DETECTOR_MODE.
+// Backwards compatible: the legacy boolean "true"/"1"/"on" maps to enforce; an
+// unset or unrecognized value falls back to shadow (never silently enforces).
+const CASCADE_EXTENDED_STATES_MODE = resolveCascadeMode(process.env.CASCADE_EXTENDED_STATES);
+// Missed-unblock reconciliation sweep (TEAM-3747 D1). Same tri-state + fail-safe
+// default; governed independently of the cascade's own mode (it is a separate
+// safety-net rollout). Normalized inside reconcile-sweep.runSweep.
+const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "shadow";
+
+/**
+ * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
+ * ("true"/"1"/"on"/"enforce") → enforce; explicit "off" → off; unset, "false",
+ * "0", "shadow", or anything unrecognized → shadow (the safe, observe-only
+ * default). Trimmed + lowercased so a casing slip can never grant write access.
+ */
+function resolveCascadeMode(raw) {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (v === "off") return "off";
+  if (v === "enforce" || v === "on" || v === "true" || v === "1") return "enforce";
+  return "shadow"; // "", "shadow", "false", "0", or garbage → shadow
+}
 // TEAM-3686 Finding 3 / TEAM-3690: deliverable-evidence gate on the orchestrator
 // completion path — same flag, same semantics as the HTTP complete route
 // (TEAM-3619 D4a, design §X.5 step 6: "evidence check behind
@@ -275,8 +298,8 @@ function getCascade() {
     jiraTransition,
     getChildTickets,
     publishEvent,
-    // Extended states (commit 4b) — behind CASCADE_EXTENDED_STATES.
-    extendedStates: CASCADE_EXTENDED_STATES,
+    // Extended states (commit 4b) — off | shadow | enforce (TEAM-3747 D1).
+    extendedStates: CASCADE_EXTENDED_STATES_MODE,
     lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
     eventsTable: EVENTS_TABLE,
     workflowsTable: WORKFLOWS_TABLE,
@@ -284,6 +307,26 @@ function getCascade() {
     reawakenGate: handleHumanReviewGate,
   });
   return _cascade;
+}
+
+// ─── Missed-unblock reconciliation sweep (TEAM-3747 D1) ──────────────────────
+
+// Periodic safety net for cascades that never fired (orchestrator crash, dropped
+// stream/webhook delivery, or a stale-GSI miss past the cascade's one bounded
+// retry). Reuses the cascade's reconcileDependent so the R3 invariant
+// (live → nudge; stale → steal + re-dispatch) has exactly one implementation.
+// Lazy singleton, same shape as getCascade()/getDetector().
+let _reconcileSweep = null;
+function getReconcileSweep() {
+  if (_reconcileSweep) return _reconcileSweep;
+  _reconcileSweep = createReconcileSweep({
+    ddb,
+    workflowsTable: WORKFLOWS_TABLE,
+    cascade: getCascade(),
+    getChildTickets,
+    leaseTtlMs: LEASE_TTL_MS,
+  });
+  return _reconcileSweep;
 }
 
 // ─── Review-gate round cap (TEAM-3619 D2c) ───────────────────────────────────
@@ -371,6 +414,15 @@ export const handler = async (event) => {
   if (event?.source === "orchestrator.sweep" && event?.action === "dead_session_sweep") {
     console.log(`[orchestrator] dead-session sweep (mode=${DEAD_SESSION_DETECTOR_MODE})`);
     return getDetector().runSweep(DEAD_SESSION_DETECTOR_MODE);
+  }
+
+  // Scheduled missed-unblock reconciliation sweep (TEAM-3747 D1). Same
+  // sentinel-event pattern as the dead-session sweep above — a scheduled
+  // EventBridge rule fires { source: "orchestrator.sweep",
+  // action: "reconcile_sweep" }. Branch BEFORE any stream/webhook parsing.
+  if (event?.source === "orchestrator.sweep" && event?.action === "reconcile_sweep") {
+    console.log(`[orchestrator] reconcile sweep (mode=${RECONCILE_SWEEP_MODE})`);
+    return getReconcileSweep().runSweep(RECONCILE_SWEEP_MODE);
   }
 
   // SQS FIFO command queue (R1 — docs/race-condition-study.md). One message
