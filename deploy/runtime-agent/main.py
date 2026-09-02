@@ -308,6 +308,7 @@ lambda_client = boto3.client("lambda", region_name=REGION)
 TICKET_TOOLS_LAMBDA = os.getenv("TICKET_TOOLS_LAMBDA", "agentcore-hub-tickets")
 BUILDER_TOOLS_LAMBDA = os.getenv("BUILDER_TOOLS_LAMBDA", "agentcore-hub-builder-tools")
 WORKFLOW_OUTPUT_LAMBDA = os.getenv("WORKFLOW_OUTPUT_LAMBDA", "agentcore-hub-workflow-output")
+PIPELINE_TOOLS_LAMBDA = os.getenv("PIPELINE_TOOLS_LAMBDA", "agentcore-hub-pipeline-tools")
 
 # Set per-invocation by agent_invocation() — used by tools to pass context to Lambdas
 _CURRENT_WORKFLOW_ID = "unknown"
@@ -1350,6 +1351,68 @@ def Tickets___search_issues(query: str, max_results: int = 20) -> str:
     })
 
 
+# ─── CI/CD Pipeline Tools (release_manager, PIPELINE mode) ────────────────────
+# The coding-runtime IAM role is AccessDenied on CodePipeline/CodeBuild, so the
+# release manager drives the deploy pipeline through this narrowly-scoped Lambda
+# (read + trigger only — the deploy gate is a HUMAN approval via Telegram, never
+# an agent). See blueprints/release-manager.md "Pipeline mode".
+
+@tool
+def Pipeline___get_state(pipeline_name: str = "") -> str:
+    """Get the CI/CD deploy pipeline's current state: whether it is configured,
+    each stage's status, whether the latest execution is terminal/succeeded/failed,
+    and per-action failure summaries + log URLs.
+
+    Use this for BOTH the CD preflight ("is a pipeline configured for this repo?"
+    — configured:false means BLOCK, do not merge) AND the watch-to-terminal poll
+    after triggering a deploy. If a stage failed, read actionDetails for the
+    failing action, then call Pipeline___get_build_log.
+
+    Args:
+        pipeline_name: Override the pipeline name (defaults to the deploy pipeline).
+    """
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___get_state",
+                          {"pipeline_name": pipeline_name} if pipeline_name else {})
+
+
+@tool
+def Pipeline___start_deploy(pipeline_name: str = "") -> str:
+    """Trigger a deploy pipeline execution. Call this AFTER merging the PR (the
+    GitHub push auto-trigger is not wired) and again after a build-failure fix has
+    landed on the default branch, to re-run. Returns the pipelineExecutionId.
+
+    The Deploy stage has an in-pipeline ManualApproval (the deploy gate) that a
+    HUMAN approves via Telegram — you do NOT approve it. After starting, poll
+    Pipeline___get_state until terminal and report the result as CD evidence.
+
+    Args:
+        pipeline_name: Override the pipeline name (defaults to the deploy pipeline).
+    """
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___start_deploy",
+                          {"pipeline_name": pipeline_name} if pipeline_name else {})
+
+
+@tool
+def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: int = 120) -> str:
+    """For a Failed Build stage: return the CodeBuild build's phase contexts
+    (which phase/command failed) and a tail of its CloudWatch log. Use the failing
+    action's externalExecutionId (from Pipeline___get_state actionDetails) as
+    build_id; omit it to read the project's most recent build. File a precise fix
+    ticket from this — do NOT hand-fix the deploy yourself.
+
+    Args:
+        build_id: CodeBuild build id (from get_state actionDetails.externalExecutionId).
+        project: CodeBuild project (defaults to the build project).
+        tail_lines: How many trailing log lines to return (max 300).
+    """
+    args = {"tail_lines": tail_lines}
+    if build_id:
+        args["build_id"] = build_id
+    if project:
+        args["project"] = project
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___get_build_log", args)
+
+
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
@@ -2142,6 +2205,10 @@ LAMBDA_TOOLS = [
     Tickets___add_comment,
     Tickets___get_issue,
     Tickets___search_issues,
+    # CI/CD Pipeline (Lambda-backed) — release_manager PIPELINE mode
+    Pipeline___get_state,
+    Pipeline___start_deploy,
+    Pipeline___get_build_log,
     # Workflow (Lambda-backed)
     WorkflowOutput___report_completion,
     WorkflowOutput___save_design_doc,

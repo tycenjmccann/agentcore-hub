@@ -82,6 +82,12 @@ claude_code(
 - Did claude_code implement everything from the design?
 - Are tests passing?
 - Any issues to flag?
+- **Lambda zip manifest (agentcore-hub only):** if the change ADDS a new local
+  module imported by a Lambda entrypoint (e.g. a new `.mjs` under
+  `lambda/*/`), it MUST be added to that Lambda's `deploy.sh` zip file list, and
+  `bash scripts/check-lambda-zip-manifest.sh` must exit 0. A module missing from
+  the manifest cold-start-crashes the Lambda (`ERR_MODULE_NOT_FOUND`) and the
+  deploy pipeline's build gate will block the deploy — catch it here.
 
 If incomplete, call `claude_code` again with specific corrections (no `repo`
 needed — it continues in the same workspace and remembers what it already did).
