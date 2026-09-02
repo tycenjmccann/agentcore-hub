@@ -100,6 +100,13 @@ function managerPulseText(
 export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoardProps) {
   const [state, setState] = useState<WorkflowState | null>(null);
 
+  // Deploy-gate signal: the post-merge production deploy waits on an in-pipeline
+  // ManualApproval that lives in CodePipeline, NOT in the ticket system — so it
+  // was invisible on the board (a run looked "stalled" while it was really just
+  // waiting for a human to approve the deploy). Poll the pipeline status while a
+  // ship-phase run is active and surface it as a banner.
+  const [deployGate, setDeployGate] = useState<{ stage: string; url?: string } | null>(null);
+
   // Phases + ordering are derived from the running workflow's definition so the
   // board reflects the actual workflow (e.g. social-media) instead of the
   // hardcoded software-delivery pipeline.
@@ -112,6 +119,39 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   pipelinePhasesRef.current = pipelinePhases;
   const phaseOrderRef = useRef(phaseOrder);
   phaseOrderRef.current = phaseOrder;
+
+  // Poll the deploy pipeline for a waiting approval, but only for a ship-phase
+  // run that isn't already terminal (the deploy gate only exists after merge).
+  // One poll on mount + every 20s; clears when nothing awaits.
+  const defHasShip = useMemo(
+    () => (getWorkflowDef(workflowDefId).completionRequiresAgentPhases || []).includes("ship"),
+    [workflowDefId]
+  );
+  // TEAM-3767 F8: use the shared terminal predicate so the epic's HONEST
+  // ship-blocked terminals (deploy-blocked / static-ci-only) stop polling and
+  // never render the amber banner, alongside complete/error/cancelled — a
+  // finished run has no live deploy gate. The distinct cancelledAt timestamp
+  // guard is preserved so a run cancelled before its phase flips to "cancelled"
+  // still stops (no weakening of #293). Active ship-phase runs are unaffected:
+  // !isTerminalPhase("ship") stays true, so they poll + banner exactly as before.
+  const runActive = !!state && !isTerminalPhase(state.phase) && !state.cancelledAt;
+  useEffect(() => {
+    if (!defHasShip || !runActive) { setDeployGate(null); return; }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch("/api/pipeline/status", { cache: "no-store" });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const waiting = (data.stages || []).find((s: { awaitingApproval?: boolean }) => s.awaitingApproval);
+        setDeployGate(waiting ? { stage: waiting.name, url: waiting.approvalUrl } : null);
+      } catch { /* pipeline module may be absent — silent */ }
+    };
+    poll();
+    const id = setInterval(poll, 20000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [defHasShip, runActive]);
   const [celebrating, setCelebrating] = useState(false);
   // Workflow Manager watchdog toggle for this run (default on).
   const [managerWatch, setManagerWatch] = useState(true);
@@ -1183,6 +1223,29 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         </div>
       )}
 
+      {/* Deploy gate — the post-merge production deploy is waiting on a human
+          approval in CodePipeline (no ticket, so it would otherwise look stalled). */}
+      {deployGate && (
+        <div className="review-banner" role="status">
+          <a
+            className="review-banner-item deploy-gate-item"
+            href={deployGate.url || undefined}
+            target="_blank"
+            rel="noreferrer"
+            title="Production deploy is awaiting approval (approve in Telegram or the pipeline console)"
+          >
+            <span className="review-avatar" aria-hidden>🚀</span>
+            <span className="review-banner-text">
+              <span className="review-banner-label">Deploy gate — awaiting approval</span>
+              <span className="review-banner-detail">
+                {deployGate.stage} stage · production deploy · approve in Telegram or console
+              </span>
+            </span>
+            <span className="review-banner-cta">Open →</span>
+          </a>
+        </div>
+      )}
+
       {/* Fallback top banner — only for gates we couldn't place on a phase card. */}
       {unplacedReviews.length > 0 && (
         <div className="review-banner" role="status">
@@ -1792,6 +1855,12 @@ const REVIEW_BANNER_STYLES = `
 .review-inline-label{font-size:11px;font-weight:700;color:#38bdf8;line-height:1.2}
 .review-inline-detail{font-size:10px;color:var(--pipeline-text-muted,#94a3b8);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .review-inline-cta{flex-shrink:0;font-size:10px;font-weight:600;color:#38bdf8}
+/* Deploy gate — amber, distinct from the blue human-review banner */
+.deploy-gate-item{border-color:rgba(245,158,11,0.55)!important;background:rgba(245,158,11,0.10)!important;text-decoration:none}
+.deploy-gate-item:hover{background:rgba(245,158,11,0.18)!important}
+.deploy-gate-item .review-avatar{background:linear-gradient(135deg,#f59e0b,#ef4444)}
+.deploy-gate-item .review-banner-label{color:#fbbf24}
+.deploy-gate-item .review-banner-cta{color:#fbbf24}
 `;
 
 export const PIPELINE_STYLES = `

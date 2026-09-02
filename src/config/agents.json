@@ -853,7 +853,8 @@
         "shell",
         "Pipeline___get_state",
         "Pipeline___start_deploy",
-        "Pipeline___get_build_log"
+        "Pipeline___get_build_log",
+        "Pipeline___get_build_status"
       ],
       "skills": [
         "ci-cd-pipelines"
@@ -918,7 +919,8 @@
         "shell",
         "Pipeline___get_state",
         "Pipeline___start_deploy",
-        "Pipeline___get_build_log"
+        "Pipeline___get_build_log",
+        "Pipeline___get_build_status"
       ],
       "skills": [],
       "blueprints": [
