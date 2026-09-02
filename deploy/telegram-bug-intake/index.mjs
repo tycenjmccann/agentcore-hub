@@ -55,6 +55,7 @@
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { DynamoDBClient, GetItemCommand, PutItemCommand, DeleteItemCommand, ScanCommand } from "@aws-sdk/client-dynamodb";
 import { TranscribeStreamingClient, StartStreamTranscriptionCommand } from "@aws-sdk/client-transcribe-streaming";
+import { CodePipelineClient, GetPipelineStateCommand, PutApprovalResultCommand } from "@aws-sdk/client-codepipeline";
 
 const TELEGRAM_BOT_TOKEN = requireEnv("TELEGRAM_BOT_TOKEN");
 const ALLOWED_CHAT_IDS   = (process.env.ALLOWED_CHAT_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -70,6 +71,9 @@ const GITHUB_USER  = requireEnv("GITHUB_USER");
 
 const PENDING_TABLE = requireEnv("PENDING_TABLE");
 const HUB_API_URL = requireEnv("HUB_API_URL"); // e.g. https://ag-....ecs.us-east-1.on.aws
+// Optional: the CI/CD deploy pipeline whose ManualApproval gate this bot bridges
+// to Telegram. Unset (OSS / accounts without the pipeline) = no deploy pings.
+const DEPLOY_PIPELINE_NAME = process.env.DEPLOY_PIPELINE_NAME || "";
 const MODEL_ID = process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-sonnet-4-6";
 const CONFIDENCE_THRESHOLD = parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.75");
 const TRANSCRIBE_LANGUAGE = process.env.TRANSCRIBE_LANGUAGE || "en-US";
@@ -107,6 +111,7 @@ const OFFSET_KEY = "tg#offset";
 const bedrock = new BedrockRuntimeClient({});
 const ddb = new DynamoDBClient({});
 const transcribe = new TranscribeStreamingClient({});
+const codepipeline = new CodePipelineClient({});
 
 // ─── Entry: poll loop ────────────────────────────────────────────────────────
 
@@ -130,12 +135,14 @@ export const handler = async (event, context) => {
   // Re-scan every 60s INSIDE the loop too: one invocation long-polls ~14.5 min,
   // so a start-only scan made gate pings lag up to 15 min behind the gate.
   try { await scanReviewGates(); } catch (err) { console.error("[telegram-bug-intake] gate scan", err); }
+  try { await scanDeployApprovals(); } catch (err) { console.error("[telegram-bug-intake] deploy approval scan", err); }
   let lastGateScan = Date.now();
 
   while (context.getRemainingTimeInMillis() > POLL_RESERVE_MS) {
     if (Date.now() - lastGateScan > 60_000) {
       lastGateScan = Date.now();
       try { await scanReviewGates(); } catch (err) { console.error("[telegram-bug-intake] gate scan", err); }
+      try { await scanDeployApprovals(); } catch (err) { console.error("[telegram-bug-intake] deploy approval scan", err); }
     }
     await flushSettledBuffers(buffers, context);
 
@@ -433,6 +440,14 @@ async function handleCallback(cb) {
     return;
   }
 
+  // Deploy-approval buttons: dok|<approvalKey> / dno|<approvalKey>
+  // (approvalKey indexes the CodePipeline token stashed in DDB — the token is
+  // too long for Telegram's 64-byte callback_data limit.)
+  if (action === "dok" || action === "dno") {
+    await handleDeployApprovalCallback(cb, chatId, action, id);
+    return;
+  }
+
   // Review-gate buttons: gok|<ticketId>|<workflowId> / gno|<ticketId>|<workflowId>
   if (action === "gok" || action === "gno") {
     await handleGateCallback(cb, chatId, action, id, idx);
@@ -701,6 +716,181 @@ async function scanAllPages(input) {
     lastKey = res.LastEvaluatedKey;
   } while (lastKey);
   return items;
+}
+
+// ─── CI/CD deploy approval bridge ────────────────────────────────────────────
+// The AWS-native deploy pipeline (agentcore-hub-deploy) pauses on a
+// ManualApproval action — the irreversible production act. The account blocks
+// public Lambda endpoints, so an SNS→HTTPS subscription is out; instead this
+// poller reuses the review-gate pattern: it polls the pipeline state for an
+// approval action stuck "in progress", pings Telegram with Approve / Reject
+// buttons, and maps the tap back to codepipeline:PutApprovalResult. The claim
+// key (dep#<token>) both dedupes the ping and carries the token the button
+// callback needs (callback_data can't hold the full token). Unset
+// DEPLOY_PIPELINE_NAME (OSS / no pipeline) makes this a no-op.
+
+const DEPLOY_KEY_PREFIX = "dep#";
+
+async function scanDeployApprovals() {
+  if (!DEPLOY_PIPELINE_NAME) return;
+
+  let state;
+  try {
+    state = await codepipeline.send(new GetPipelineStateCommand({ name: DEPLOY_PIPELINE_NAME }));
+  } catch (err) {
+    // A missing pipeline (wrong account, torn down) must not spam the log every
+    // 60s — warn once-ish and bail. Any other error propagates to the caller's
+    // try/catch, which already logs and continues the poll loop.
+    if (err.name === "PipelineNotFoundException") return;
+    throw err;
+  }
+
+  // Find the ManualApproval action currently awaiting a decision. CodePipeline
+  // marks the *stage* InProgress and the action has a latestExecution.token
+  // only while it waits; the token is required by PutApprovalResult.
+  let pending = null;
+  for (const stage of state.stageStates || []) {
+    for (const action of stage.actionStates || []) {
+      const token = action.latestExecution?.token;
+      const status = action.latestExecution?.status;
+      if (token && status === "InProgress") {
+        pending = { stageName: stage.stageName, actionName: action.actionName, token,
+          revisionUrl: action.entityUrl || action.revisionUrl };
+        break;
+      }
+    }
+    if (pending) break;
+  }
+  if (!pending) return;
+
+  // Claim on the token: a new pipeline execution mints a fresh token, so this
+  // naturally re-pings each run while never double-pinging the same wait.
+  const claimed = await claimDeployApproval(pending);
+  if (!claimed) return;
+
+  try {
+    const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
+    if (!chats.length) {
+      console.warn("[telegram-bug-intake] deploy approval but no allowlisted chats to notify");
+      await releaseDeployApproval(claimed.key);
+      return;
+    }
+
+    const text =
+      `🚀 *Deploy approval — ${esc(DEPLOY_PIPELINE_NAME)}*\n` +
+      `The build passed every gate and is waiting on you to ship it to prod. ` +
+      `This is the irreversible production deploy — the merge was already approved.\n\n` +
+      `Review the built commit, then *Approve* to deploy or *Reject* to stop.`;
+    const rows = [[
+      { text: "🚀 Approve deploy", callback_data: `dok|${claimed.key}` },
+      { text: "🛑 Reject", callback_data: `dno|${claimed.key}` },
+    ]];
+    if (pending.revisionUrl) {
+      rows.push([{ text: "🔗 View commit", url: pending.revisionUrl }]);
+    }
+    const keyboard = { inline_keyboard: rows };
+
+    let delivered = 0;
+    for (const chatId of chats) {
+      try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
+      catch (err) { console.error(`[telegram-bug-intake] deploy approval ping to ${chatId}`, err.message); }
+    }
+    if (!delivered) await releaseDeployApproval(claimed.key);
+  } catch (err) {
+    await releaseDeployApproval(claimed.key).catch((relErr) =>
+      console.error("[telegram-bug-intake] releaseDeployApproval after failure", relErr.message));
+    throw err;
+  }
+}
+
+/**
+ * Atomically claim a deploy approval for notification, keyed by the approval
+ * TOKEN (unique per pipeline wait). Returns { key, ... } on first claim, false
+ * if already pinged. The DDB row stores the pipeline/stage/action/token the
+ * button callback needs, since callback_data can't carry the token itself.
+ */
+async function claimDeployApproval(pending) {
+  // A short, callback_data-safe key derived from the token (which can exceed
+  // Telegram's 64-byte callback_data budget). The token stays in the DDB item.
+  const key = `dp${hashToken(pending.token)}`;
+  try {
+    await ddb.send(new PutItemCommand({
+      TableName: PENDING_TABLE,
+      Item: {
+        id: { S: `${DEPLOY_KEY_PREFIX}${key}` },
+        pipelineName: { S: DEPLOY_PIPELINE_NAME },
+        stageName: { S: pending.stageName },
+        actionName: { S: pending.actionName },
+        token: { S: pending.token },
+        ttl: { N: String(Math.floor(Date.now() / 1000) + 7 * 86400) },
+      },
+      ConditionExpression: "attribute_not_exists(id)",
+    }));
+    return { key, ...pending };
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+async function releaseDeployApproval(key) {
+  await ddb.send(new DeleteItemCommand({
+    TableName: PENDING_TABLE,
+    Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
+  }));
+}
+
+/** Small non-crypto hash → short stable key for the token. */
+function hashToken(token) {
+  let h = 5381;
+  for (let i = 0; i < token.length; i++) h = ((h << 5) + h + token.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+async function handleDeployApprovalCallback(cb, chatId, action, key) {
+  if (!ALLOWED_CHAT_IDS.includes(String(chatId))) {
+    console.warn(`[telegram-bug-intake] unauthorized deploy approval callback from chat ${chatId}`);
+    await tgAnswer(cb.id, "Not authorized to approve deploys.");
+    return;
+  }
+  const item = await ddb.send(new GetItemCommand({
+    TableName: PENDING_TABLE, Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
+  }));
+  if (!item.Item) {
+    await tgAnswer(cb.id, "This approval expired or was already actioned.");
+    await tgEdit(chatId, cb.message.message_id, `${cb.message.text}\n\n⏱️ Expired / already actioned.`);
+    return;
+  }
+  const approve = action === "dok";
+  try {
+    await codepipeline.send(new PutApprovalResultCommand({
+      pipelineName: item.Item.pipelineName.S,
+      stageName: item.Item.stageName.S,
+      actionName: item.Item.actionName.S,
+      token: item.Item.token.S,
+      result: {
+        status: approve ? "Approved" : "Rejected",
+        summary: `${approve ? "Approved" : "Rejected"} via Telegram by chat ${chatId}`,
+      },
+    }));
+  } catch (err) {
+    // Token already consumed (approved elsewhere, or the wait timed out) →
+    // ApprovalAlreadyCompletedException. Report it and clear the claim.
+    await ddb.send(new DeleteItemCommand({
+      TableName: PENDING_TABLE, Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
+    })).catch(() => {});
+    await tgAnswer(cb.id, "Could not record — it may already be actioned.");
+    await tgEdit(chatId, cb.message.message_id,
+      `${cb.message.text}\n\n⚠️ ${esc(err.name || "Error")}: ${esc(err.message || "")}`.slice(0, 4000));
+    return;
+  }
+  // One-shot: the token is now spent. Drop the claim so the row can't linger.
+  await ddb.send(new DeleteItemCommand({
+    TableName: PENDING_TABLE, Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
+  })).catch(() => {});
+  await tgAnswer(cb.id, approve ? "Deploy approved" : "Deploy rejected");
+  await tgEdit(chatId, cb.message.message_id,
+    `${cb.message.text}\n\n${approve ? "🚀 Approved — deploying to prod." : "🛑 Rejected — deploy stopped."}`);
 }
 
 // ─── LLM structuring ─────────────────────────────────────────────────────────
