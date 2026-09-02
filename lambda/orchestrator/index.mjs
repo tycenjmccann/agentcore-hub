@@ -54,10 +54,14 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 const GITHUB_LAMBDA = process.env.GITHUB_LAMBDA || "agentcore-hub-github-mcp";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const MAX_QA_RETRIES = 3;
-// Dead-session detector rollout flag (TEAM-3618 D1.2): off = skip the sweep,
-// shadow (default) = observe + metrics + shadow-flagged events but ZERO writes,
-// enforce = steal/retry/escalate for real.
-const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
+// Dead-session detector rollout flag (TEAM-3618 D1.2; promoted to enforce by
+// default in TEAM-3748 D4.1): off = skip the sweep, shadow = observe + metrics
+// + shadow-flagged events but ZERO writes, enforce (the NEW DEFAULT — the
+// silent-death watchdog now recovers for real) = steal/retry/escalate. The
+// fail-safe coercion still holds: runSweep normalizes (trim+lowercase) and
+// coerces anything not exactly off|shadow|enforce back to shadow, so a typo in
+// the env var can only ever DOWNGRADE to observe-only, never grant a rogue mode.
+const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "enforce";
 // Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b; tri-state as of
 // TEAM-3747 D1). off = the cascade only re-Readies {blocked, todo} dependents
 // (commit-4a behavior); shadow (the NEW DEFAULT — ships dark-but-observing) =
