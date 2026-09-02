@@ -16,6 +16,7 @@ import {
   appendReviewNotificationOnce,
   ackNotifications,
   completeWorkflow,
+  claimTerminalOutcome,
   claimFinalization,
   appendReviewRound,
   appendReviewCapEscalation,
@@ -466,6 +467,55 @@ describe("completeWorkflow", () => {
   it("returns false for the losing concurrent completion", async () => {
     failNextCondition = true;
     expect(await completeWorkflow("wf_1", "x")).toBe(false);
+  });
+});
+
+/**
+ * TEAM-3747 D2 — the HONEST terminal close ("no green close over unshipped work").
+ * Same conditional-write discipline as completeWorkflow: exactly one winner, a lost
+ * CAS is a graceful no-op (so a duplicate closeWorkflowBlocked writes nothing and
+ * emits nothing), and cancellation still precedes everything.
+ */
+describe("claimTerminalOutcome (TEAM-3747 D2)", () => {
+  it("claims the blocked phase, CASing off EVERY terminal phase (including the D2 pair)", async () => {
+    const won = await claimTerminalOutcome("wf_1", "deploy-blocked", "2026-09-01T00:00:00Z");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toContain("SET phase = :outcome");
+    expect(w.input.ExpressionAttributeValues[":outcome"]).toBe("deploy-blocked");
+    expect(w.input.ExpressionAttributeValues[":ts"]).toBe("2026-09-01T00:00:00Z");
+    for (const guard of [
+      "phase <> :complete",
+      "phase <> :cancelled",
+      "phase <> :error",
+      "phase <> :deployBlocked",
+      "phase <> :staticCi",
+      "attribute_not_exists(cancelledAt)",
+    ]) {
+      expect(w.input.ConditionExpression).toContain(guard);
+    }
+  });
+
+  it("with no reason it writes no blockReason (and leaves no dangling placeholder)", async () => {
+    // The stub client throws ValidationException on an unbound placeholder, so a
+    // passing call is itself the assertion that :reason is absent, not undefined.
+    await claimTerminalOutcome("wf_1", "static-ci-only", "2026-09-01T00:00:00Z");
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).not.toContain("blockReason");
+    expect(w.input.ExpressionAttributeValues[":reason"]).toBeUndefined();
+    expect(w.input.ExpressionAttributeValues[":outcome"]).toBe("static-ci-only");
+  });
+
+  it("records the block reason when supplied, clamped to 500 chars", async () => {
+    await claimTerminalOutcome("wf_1", "deploy-blocked", "2026-09-01T00:00:00Z", "x".repeat(700));
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toContain("blockReason = :reason");
+    expect(w.input.ExpressionAttributeValues[":reason"]).toHaveLength(500);
+  });
+
+  it("idempotent: the losing racer gets false and never throws (duplicate close = no-op)", async () => {
+    failNextCondition = true;
+    expect(await claimTerminalOutcome("wf_1", "deploy-blocked", "ts")).toBe(false);
   });
 });
 
