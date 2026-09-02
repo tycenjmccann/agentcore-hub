@@ -32,6 +32,7 @@ const h = vi.hoisted(() => ({
     getWorkflowThrows: false,
     storeCompletions: /** @type {any[]} */ ([]),
     finalized: /** @type {any[]} */ ([]),
+    workflowsConfig: /** @type {any} */ (null),
   },
 }));
 
@@ -62,8 +63,22 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
 });
 
 vi.mock("@aws-sdk/client-lambda", () => ({ LambdaClient: class {}, InvokeCommand: class { constructor(i) { this.input = i; } } }));
+// S3 GetObject serves config/workflows.json so loadWorkflowDefs() can register a
+// ship-phase def (the TEAM-3721 merge gate only engages when the def requires
+// "ship"). h.state.workflowsConfig is the served body; null → not-found (throws,
+// loadWorkflowDefs falls back — matching the evidence-gate tests that use the
+// fallback software-delivery def with no ship phase).
 vi.mock("@aws-sdk/client-s3", () => ({
-  S3Client: class {},
+  S3Client: class {
+    async send(cmd) {
+      const key = cmd?.input?.Key;
+      if (key === "config/workflows.json") {
+        if (!h.state.workflowsConfig) { const e = new Error("NoSuchKey"); e.name = "NoSuchKey"; throw e; }
+        return { Body: { transformToString: async () => JSON.stringify(h.state.workflowsConfig) } };
+      }
+      return {};
+    }
+  },
   GetObjectCommand: class { constructor(i) { this.input = i; } },
   PutObjectCommand: class { constructor(i) { this.input = i; } },
 }));
@@ -93,9 +108,12 @@ vi.mock("./workflow-store.mjs", () => ({
 let isWorkflowComplete;
 let completeWorkflow;
 
+let _mod;
 async function load() {
   vi.resetModules();
-  ({ isWorkflowComplete, completeWorkflow } = await import("./index.mjs"));
+  _mod = await import("./index.mjs");
+  ({ isWorkflowComplete, completeWorkflow } = _mod);
+  return _mod;
 }
 
 // Fallback roster phases: backend_dev→development, qa_verifier→verification,
@@ -128,6 +146,7 @@ beforeEach(() => {
   h.state.getWorkflowThrows = false;
   h.state.storeCompletions.length = 0;
   h.state.finalized.length = 0;
+  h.state.workflowsConfig = null;
   delete process.env.COMPLETION_EVIDENCE_REQUIRED;
 });
 
@@ -284,5 +303,152 @@ describe("completeWorkflow — evidence gate wiring (TEAM-3686 F3)", () => {
     expect(h.state.storeCompletions.length).toBe(1);
     expect(warn.mock.calls.some((c) => String(c[0]).includes("evidence check skipped"))).toBe(true);
     warn.mockRestore();
+  });
+});
+
+/**
+ * TEAM-3721 CD dead-zone: a ship-phase run must not finalize as "complete" when
+ * its feature branch was never actually merged (RM's CD ticket can go done
+ * without landing the merge). completeWorkflow verifies the branch against
+ * GitHub before claiming completion. Fail-open on API errors / no PAT.
+ *
+ * A ship-def workflow requires the "ship" phase; the bug-fix def in workflows.json
+ * declares completionRequiresAgentPhases including "ship". We give every required
+ * phase real evidence so ONLY the merge gate can block, and drive GitHub via a
+ * mocked global.fetch.
+ */
+describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
+  const SHIP_WF = {
+    id: "wf_1",
+    phase: "verification",
+    workflowDefId: "bug-fix",
+    epicId: "EPIC-1",
+    input: { title: "t" },
+    featureBranch: "feature/EPIC-1-fix",
+    repoConfig: { layout: "multi-repo", repos: [{ platform: "backend", url: "https://github.com/o/r", defaultBranch: "main" }] },
+  };
+  // bug-fix requires development, verification, review, ship — one done agent
+  // ticket per phase, each with evidence, plus the human Merge Approval gate done.
+  const SHIP_CHILDREN = [
+    { ticketId: "B-1", assignee: "agentcore_hub_bug_fixer", type: "task", status: "done", phase: "development" },
+    { ticketId: "B-2", assignee: "agentcore_hub_qa_verifier", type: "task", status: "done", phase: "verification" },
+    { ticketId: "B-3", assignee: "agentcore_hub_code_reviewer", type: "task", status: "done", phase: "review" },
+    { ticketId: "B-4", assignee: "agentcore_hub_release_manager", type: "task", status: "done", phase: "ship" },
+    { ticketId: "B-5", assignee: "human:engineer", type: "task", status: "done", phase: "ship" },
+  ];
+  const SHIP_TASKS = {
+    "B-1": { ticketId: "B-1", output: "fixed" },
+    "B-2": { ticketId: "B-2", output: "verified" },
+    "B-3": { ticketId: "B-3", output: "reviewed" },
+    "B-4": { ticketId: "B-4", output: "shipped", prUrl: "https://github.com/o/r/pull/9" },
+    "B-5": { ticketId: "B-5", output: "approved" },
+  };
+
+  // A minimal workflows.json whose bug-fix def requires the ship phase, so
+  // defHasShipPhase(bug-fix) is true after loadWorkflowDefs() reads it from the
+  // (mocked) S3 config.
+  const SHIP_CONFIG = {
+    workflows: [
+      {
+        id: "bug-fix",
+        intakeAgentId: "agentcore_hub_requirements_analyst",
+        completionRequiresAgentPhases: ["development", "verification", "review", "ship"],
+        reviewGates: [],
+        phases: [
+          { agentPhase: "requirements" },
+          { agentPhase: "development" },
+          { agentPhase: "verification", extraAgentPhases: ["review", "ship"] },
+        ],
+      },
+    ],
+  };
+
+  // Seed the ship def, then let index.mjs read it via the mocked S3.
+  async function loadShip() {
+    h.state.workflowsConfig = SHIP_CONFIG;
+    // loadWorkflowDefs early-returns unless ARTIFACT_BUCKET is set (read at
+    // module load), so set it before importing index.mjs.
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    const mod = await load();
+    await mod.loadWorkflowDefs();
+  }
+
+  let realFetch;
+  beforeEach(() => {
+    realFetch = global.fetch;
+    process.env.GITHUB_PAT = "ghp_test";
+    delete process.env.SHIP_MERGE_VERIFY;
+  });
+  afterEach(() => {
+    global.fetch = realFetch;
+    delete process.env.GITHUB_PAT;
+    delete process.env.SHIP_MERGE_VERIFY;
+    delete process.env.ARTIFACT_BUCKET;
+  });
+
+  const mockGitHub = ({ prs = [], compareStatus = "ahead", aheadBy = 3 } = {}) => {
+    global.fetch = vi.fn(async (url) => {
+      const u = String(url);
+      const body = u.includes("/pulls?")
+        ? prs
+        : u.includes("/compare/")
+        ? { status: compareStatus, ahead_by: aheadBy }
+        : {};
+      return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+    });
+  };
+
+  it("BLOCKS finalize when the branch is unmerged (no merged PR + compare ahead)", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    mockGitHub({ prs: [{ merged_at: null }], compareStatus: "ahead", aheadBy: 2 });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(0); // never claimed
+    expect(h.state.finalized.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedUnmergedBranch"))).toBe(true);
+    error.mockRestore();
+  });
+
+  it("completes when a PR from the branch is merged", async () => {
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    mockGitHub({ prs: [{ merged_at: "2026-09-02T10:00:00Z" }] });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("completes when compare says base already contains the branch (squash-safe)", async () => {
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    mockGitHub({ prs: [], compareStatus: "identical" });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("fail-open: a GitHub error never blocks a legitimate completion", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    global.fetch = vi.fn(async () => ({ ok: false, status: 500, text: async () => "boom" }));
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+    warn.mockRestore();
+  });
+
+  it("opt-out SHIP_MERGE_VERIFY=off skips the check entirely", async () => {
+    process.env.SHIP_MERGE_VERIFY = "off";
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    // fetch would say unmerged, but the gate is off so it must not even be called.
+    global.fetch = vi.fn(async () => ({ ok: true, status: 200, text: async () => JSON.stringify([{ merged_at: null }]) }));
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 });

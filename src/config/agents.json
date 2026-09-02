@@ -850,7 +850,10 @@
         "retrieve",
         "search_code",
         "search_repositories",
-        "shell"
+        "shell",
+        "Pipeline___get_state",
+        "Pipeline___start_deploy",
+        "Pipeline___get_build_log"
       ],
       "skills": [
         "ci-cd-pipelines"
@@ -912,7 +915,10 @@
         "retrieve",
         "search_code",
         "search_repositories",
-        "shell"
+        "shell",
+        "Pipeline___get_state",
+        "Pipeline___start_deploy",
+        "Pipeline___get_build_log"
       ],
       "skills": [],
       "blueprints": [

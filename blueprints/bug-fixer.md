@@ -94,6 +94,12 @@ authoritative docs — never from memory, a blog/launch post, or a plausible gue
 - Add/extend the regression test. Run it: show it FAILS on base_branch (stash your
   fix or run on a clean checkout) and PASSES with your fix applied.
 - Run the project's existing test + build/lint commands and confirm they still pass.
+- **Lambda zip manifest (agentcore-hub only):** if you ADD a new local module
+  imported by a Lambda entrypoint (e.g. a new `.mjs` under `lambda/orchestrator/`),
+  you MUST add it to that Lambda's `deploy.sh` zip file list AND run
+  `bash scripts/check-lambda-zip-manifest.sh` (exit 0). A module missing from the
+  manifest cold-start-crashes the Lambda with `ERR_MODULE_NOT_FOUND` — the deploy
+  pipeline's build gate will (correctly) block the deploy, so catch it here.
 
 ### Step 3b: Performance bugs — MEASURE, don't assert
 If the defect is performance ("slow", "takes too long", "N+1", "excessive
