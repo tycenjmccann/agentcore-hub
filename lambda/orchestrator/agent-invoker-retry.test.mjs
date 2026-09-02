@@ -24,6 +24,12 @@ const h = vi.hoisted(() => ({
     ebEntries: [],    // EventBridge PutEventsCommand entries
     invokeCalls: 0,   // how many times the harness client.send fired
     invokeImpl: async () => ({}),
+    // TEAM-3756 F4 — the liveness re-check's Query seam (agentStartedSince) and
+    // the runtime path's raw-HTTPS seam.
+    queries: [],      // QueryCommand inputs → EVENTS_TABLE
+    queryImpl: async () => ({ Items: [] }),
+    httpCalls: 0,     // how many https requests the runtime path sent
+    httpImpl: null,   // (options, cb) => req — per-test behavior
   },
 }));
 
@@ -39,7 +45,7 @@ vi.mock("@aws-sdk/lib-dynamodb", () => ({
         if (n === "UpdateCommand") { h.state.updates.push(cmd.input); return {}; }
         if (n === "PutCommand") { h.state.puts.push(cmd.input); return {}; }
         if (n === "GetCommand") return { Item: null };
-        if (n === "QueryCommand") return { Items: [] };
+        if (n === "QueryCommand") { h.state.queries.push(cmd.input); return h.state.queryImpl(cmd.input); }
         return {};
       },
     }),
@@ -69,6 +75,19 @@ vi.mock("@aws-sdk/client-bedrock-agentcore", () => ({
 vi.mock("@smithy/node-http-handler", () => ({
   NodeHttpHandler: class { constructor() {} },
 }));
+
+// The runtime path's dynamically-imported seams (TEAM-3756 F4 tests): raw
+// https + SigV4 signing. The signer passes the request through untouched.
+vi.mock("https", () => ({
+  default: {
+    request: (options, cb) => { h.state.httpCalls++; return h.state.httpImpl(options, cb); },
+  },
+}));
+vi.mock("@smithy/signature-v4", () => ({
+  SignatureV4: class { async sign(req) { return req; } },
+}));
+vi.mock("@aws-crypto/sha256-js", () => ({ Sha256: class {} }));
+vi.mock("@aws-sdk/credential-provider-node", () => ({ defaultProvider: () => () => ({}) }));
 
 const HARNESS_EVENT = {
   // No ":runtime/" segment → legacy harness path.
@@ -106,6 +125,10 @@ beforeEach(() => {
   h.state.ebEntries = [];
   h.state.invokeCalls = 0;
   h.state.invokeImpl = async () => ({});
+  h.state.queries = [];
+  h.state.queryImpl = async () => ({ Items: [] });
+  h.state.httpCalls = 0;
+  h.state.httpImpl = null;
   // Bounded to 3 attempts, zero backoff so retries are instant.
   process.env.AGENT_INVOKE_MAX_ATTEMPTS = "3";
   process.env.AGENT_INVOKE_BACKOFF_BASE_MS = "0";
@@ -176,8 +199,13 @@ describe("AC-D4.2(d) — isRetriableInvokeError classification (through the hand
     ["statusCode 429", 3, () => makeErr({ statusCode: 429 })],
     ["name ThrottlingException", 3, () => makeErr({ name: "ThrottlingException" })],
     ["name ServiceUnavailableException", 3, () => makeErr({ name: "ServiceUnavailableException" })],
-    ["code ECONNRESET", 3, () => makeErr({ code: "ECONNRESET" })],
-    ["message-only timeout", 3, () => makeErr({ message: "connection timed out" })],
+    // TEAM-3756 F4: post-write-ambiguous failures (reset/timeout with no HTTP
+    // response) are NOT retried on the synchronous harness path — the first
+    // request may already have been accepted, and this path has no liveness
+    // view to prove otherwise (no-duplicate-session, R7/FR-D4.4). These two
+    // previously ran the full bound of 3, which was the F4 double-send bug.
+    ["code ECONNRESET (post-write ambiguous)", 1, () => makeErr({ code: "ECONNRESET" })],
+    ["message-only timeout (post-write ambiguous)", 1, () => makeErr({ message: "connection timed out" })],
     ["statusCode 400", 1, () => makeErr({ statusCode: 400 })],
     ["statusCode 403", 1, () => makeErr({ statusCode: 403 })],
     ["statusCode 404", 1, () => makeErr({ statusCode: 404 })],
@@ -236,5 +264,133 @@ describe("D4.3 liveness — publishAgentEvent dual-writes + threads ticketId", (
     expect(errPuts).toHaveLength(1);
     // Item.workflowId = workflowId || agentId.
     expect(errPuts[0].Item.workflowId).toBe("agentcore_hub_api_dev");
+  });
+});
+
+/**
+ * TEAM-3756 F4 — the no-duplicate-session retry guard on the fire-and-forget
+ * RUNTIME path (R7 / FR-D4.4). A post-write connection failure leaves it
+ * unknowable whether the runtime accepted the request and started the agent;
+ * re-sending with the SAME sessionId would double-start it. Before each such
+ * retry the invoker now re-checks EVENTS_TABLE for agent.started/agent.streaming
+ * heartbeats for this ticket:
+ *   started      → the first attempt succeeded: no retry, treated as success;
+ *   not started  → the bounded transient retry proceeds (FR-D4.2 retained);
+ *   unknowable   → no retry (the dead-session detector recovers a lost claim; a
+ *                  duplicate session cannot be recalled).
+ * A failure carrying an HTTP status (5xx/429) is a PROVEN rejection — the
+ * runtime answered, so nothing started — and stays a blind bounded retry with
+ * no liveness query at all.
+ */
+describe("TEAM-3756 F4 — runtime retry re-checks liveness before re-sending", () => {
+  const RUNTIME_EVENT = {
+    ...HARNESS_EVENT,
+    harnessArn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-runtime",
+  };
+
+  // (options, cb) → req whose end() fails post-write with ECONNRESET.
+  const resetAfterWrite = () => (options, cb) => {
+    const handlers = {};
+    const req = {
+      on: (ev, fn) => { handlers[ev] = fn; return req; },
+      write: () => {},
+      end: () => setTimeout(() => handlers.error?.(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" })), 0),
+    };
+    return req;
+  };
+  // (options, cb) → req that is accepted with HTTP 200.
+  const accept = () => (options, cb) => {
+    const req = {
+      on: () => req,
+      write: () => {},
+      end: () => setTimeout(() => cb({ statusCode: 200, destroy: () => {}, on: () => {} }), 0),
+    };
+    return req;
+  };
+  // (options, cb) → req answered with an HTTP 503 (proven rejection).
+  const reject503 = () => (options, cb) => {
+    const req = {
+      on: () => req,
+      write: () => {},
+      end: () => setTimeout(() => {
+        const resHandlers = {};
+        cb({ statusCode: 503, destroy: () => {}, on: (ev, fn) => { resHandlers[ev] = fn; } });
+        setTimeout(() => { resHandlers.data?.(Buffer.from("unavailable")); resHandlers.end?.(); }, 0);
+      }, 0),
+    };
+    return req;
+  };
+  const startedEvent = (overrides = {}) => ({
+    type: "agent.started",
+    timestamp: new Date().toISOString(),
+    detail: { ticketId: "TEAM-42", agentId: "agentcore_hub_api_dev" },
+    ...overrides,
+  });
+  const perCall = (...impls) => {
+    let i = 0;
+    return (options, cb) => impls[Math.min(i++, impls.length - 1)]()(options, cb);
+  };
+
+  it("post-write reset + agent.started observed → NO second request, treated as success", async () => {
+    h.state.httpImpl = resetAfterWrite();
+    h.state.queryImpl = async () => ({ Items: [startedEvent()] });
+
+    const handler = await loadHandler();
+    await handler({ ...RUNTIME_EVENT });
+
+    expect(h.state.httpCalls).toBe(1);        // the retry never fired
+    expect(h.state.queries).toHaveLength(1);  // ...because the re-check proved a start
+    expect(blockedUpdates()).toHaveLength(0); // success: no escalation of any kind
+    expect(errorEntries()).toHaveLength(0);
+  });
+
+  it("post-write reset + NO heartbeat → bounded retry proceeds and succeeds (FR-D4.2 retained)", async () => {
+    h.state.httpImpl = perCall(resetAfterWrite, accept);
+
+    const handler = await loadHandler();
+    await handler({ ...RUNTIME_EVENT });
+
+    expect(h.state.httpCalls).toBe(2);
+    expect(h.state.queries.length).toBeGreaterThanOrEqual(1); // the guard ran before the retry
+    expect(blockedUpdates()).toHaveLength(0);
+    expect(errorEntries()).toHaveLength(0);
+  });
+
+  it("a STALE heartbeat (before this invocation) does not suppress the retry", async () => {
+    h.state.httpImpl = perCall(resetAfterWrite, accept);
+    // A heartbeat from the ticket's PREVIOUS session, two minutes old.
+    h.state.queryImpl = async () => ({
+      Items: [startedEvent({ timestamp: new Date(Date.now() - 120_000).toISOString() })],
+    });
+
+    const handler = await loadHandler();
+    await handler({ ...RUNTIME_EVENT });
+
+    expect(h.state.httpCalls).toBe(2); // old event ignored → retry proceeds
+    expect(errorEntries()).toHaveLength(0);
+  });
+
+  it("post-write reset + liveness UNKNOWABLE (query fails) → no retry, existing escalation runs once", async () => {
+    h.state.httpImpl = resetAfterWrite();
+    h.state.queryImpl = async () => { throw new Error("ThrottlingException"); };
+
+    const handler = await loadHandler();
+    await handler({ ...RUNTIME_EVENT });
+
+    expect(h.state.httpCalls).toBe(1);        // R7 wins: never re-send on maybe-started
+    expect(blockedUpdates()).toHaveLength(1); // the normal terminal-failure path
+    expect(errorEntries()).toHaveLength(1);
+  });
+
+  it("a PROVEN rejection (HTTP 503) is still a blind bounded retry — no liveness query", async () => {
+    h.state.httpImpl = perCall(reject503, accept);
+
+    const handler = await loadHandler();
+    await handler({ ...RUNTIME_EVENT });
+
+    expect(h.state.httpCalls).toBe(2);       // retried as before F4
+    expect(h.state.queries).toHaveLength(0); // the runtime answered → nothing could have started
+    expect(blockedUpdates()).toHaveLength(0);
+    expect(errorEntries()).toHaveLength(0);
   });
 });

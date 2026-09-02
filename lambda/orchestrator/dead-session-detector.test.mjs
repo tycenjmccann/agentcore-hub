@@ -969,3 +969,112 @@ describe("AC-D4.4 — a second sweep over a recovered ticket is a no-op", () => 
     expect(lease.stealClaim).toHaveBeenCalledTimes(2); // both passes reached the steal
   });
 });
+
+/**
+ * TEAM-3756 F5 — the detector must not scan runs that already CLOSED.
+ *
+ * Same gap (and same fix) as the reconcile sweep's TEAM-3755 F8: the scan's
+ * FilterExpression named only complete/cancelled/error, so a run closed on a
+ * TEAM-3747 D2 honest outcome (deploy-blocked / static-ci-only) still read as
+ * "open" — and in enforce mode (the default) a stale agentTask inside a
+ * terminally-blocked run could be stolen, re-dispatched or escalated AFTER the
+ * verdict. The filter is now DERIVED from the shared TERMINAL_WORKFLOW_PHASES
+ * list (completion.mjs notTerminalPhaseFilter), so the consumers cannot drift.
+ */
+describe("TEAM-3756 F5 — the detector's workflow scan excludes EVERY terminal phase", () => {
+  /** Which phase values the emitted FilterExpression actually refuses (placeholder-agnostic). */
+  const refusedPhases = (input) => {
+    const inList = String(input.FilterExpression).match(/IN \(([^)]*)\)/)?.[1] || "";
+    const keys = inList.split(",").map((k) => k.trim());
+    return keys.map((k) => input.ExpressionAttributeValues[k]).sort();
+  };
+  const ALL_TERMINAL_PHASES = ["cancelled", "complete", "deploy-blocked", "error", "static-ci-only"];
+
+  /**
+   * A ddb stub that EMULATES the server-side filter (makeDdb returns every row
+   * regardless), mirroring `NOT (#p IN (…))`: a row with NO phase attribute is
+   * KEPT, exactly as DynamoDB evaluates it.
+   */
+  function makeFilteringDdb(workflows) {
+    return {
+      send: vi.fn(async (cmd) => {
+        if (cmd.constructor.name !== "ScanCommand") return { Items: [] };
+        if (cmd.input.TableName !== "workflows") return { Items: [] };
+        const refused = new Set(refusedPhases(cmd.input));
+        return { Items: workflows.filter((w) => !(w.phase && refused.has(w.phase))) };
+      }),
+    };
+  }
+
+  it("refuses all five terminal phases, derived from the shared list", async () => {
+    const { deps } = makeDeps();
+    const { runSweep } = createDetector(deps);
+    await runSweep("enforce");
+
+    const scans = deps.ddb.send.mock.calls
+      .filter((c) => c[0].constructor.name === "ScanCommand" && c[0].input.TableName === "workflows")
+      .map((c) => c[0].input);
+    expect(scans).toHaveLength(1);
+    expect(refusedPhases(scans[0])).toEqual(ALL_TERMINAL_PHASES);
+    expect(scans[0].ExpressionAttributeNames).toEqual({ "#p": "phase" });
+    // Every declared value is referenced by the filter and vice-versa.
+    expect(Object.keys(scans[0].ExpressionAttributeValues)).toHaveLength(ALL_TERMINAL_PHASES.length);
+  });
+
+  it("a dead task inside a deploy-blocked run is NEVER stolen/re-dispatched (enforce)", async () => {
+    // Identical to the "first dead session" scenario except the run already
+    // closed deploy-blocked. Before F5 this claim was stolen + re-dispatched.
+    const { deps, store, lease } = makeDeps({
+      ddb: makeFilteringDdb([makeWorkflow({ phase: "deploy-blocked" })]),
+    });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.candidates).toBe(0);
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("a static-ci-only run is skipped too", async () => {
+    const { deps, lease } = makeDeps({
+      ddb: makeFilteringDdb([makeWorkflow({ phase: "static-ci-only" })]),
+    });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.candidates).toBe(0);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+  });
+
+  it("an OPEN run beside two blocked ones is still recovered", async () => {
+    // The filter must narrow the scan, not empty it.
+    const { deps } = makeDeps({
+      ddb: makeFilteringDdb([
+        makeWorkflow({ id: "wf_b1", workflowId: "wf_b1", phase: "deploy-blocked" }),
+        makeWorkflow(),
+        makeWorkflow({ id: "wf_b2", workflowId: "wf_b2", phase: "static-ci-only" }),
+      ]),
+    });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("a row with NO phase attribute still scans as open (unchanged semantics)", async () => {
+    // The `NOT (#p IN (…))` form is kept deliberately: a chain of `#p <> :v`
+    // would silently DROP phase-less rows (e.g. the start-route dedup markers).
+    const { phase, ...noPhase } = makeWorkflow();
+    const { deps } = makeDeps({ ddb: makeFilteringDdb([noPhase]) });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+  });
+});

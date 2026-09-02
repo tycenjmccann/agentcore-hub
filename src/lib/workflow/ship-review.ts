@@ -27,7 +27,7 @@ export interface ShipFindingLike {
   files?: unknown;
   // Set authoritatively by enforceDiffScope. LLM-written entries may carry a
   // prose classification; the deterministic guard overwrites it.
-  classification?: "IN-DIFF" | "ADVISORY" | string;
+  classification?: "IN-DIFF" | "ADVISORY" | "UNATTRIBUTED" | string;
 }
 export interface ShipRoundLike {
   round: number;
@@ -118,15 +118,20 @@ export function mergeRound<T extends { round: number; reviewedHeadSha: string }>
 
 // ── Diff-scoped gate (release-manager.md Step 4, "DIFF-SCOPED GATE") ──────────
 //
-// The blueprint's rule — a finding gates only if EVERY file it cites is inside
-// the PR change set; anything else is advisory and can never flip the verdict —
-// lived ONLY as LLM prose, with no deterministic enforcement (QA finding F1).
-// `enforceDiffScope` is that enforcement: it downgrades any out-of-diff blocking
-// finding to advisory regardless of what the reviewer wrote, so a CHANGES-NEEDED
-// verdict can never survive without at least one genuinely in-diff finding.
+// The blueprint's rule — a finding whose citations are entirely OUTSIDE the PR
+// change set is advisory and can never flip the verdict — lived ONLY as LLM
+// prose, with no deterministic enforcement (QA finding F1). `enforceDiffScope`
+// is that enforcement: it downgrades any affirmatively out-of-diff blocking
+// finding to advisory regardless of what the reviewer wrote, so a
+// CHANGES-NEEDED verdict can never survive without at least one gating finding
+// (in-diff, or unattributable — see the classification rules on enforceDiffScope).
 
 const CLASSIFICATION_IN_DIFF = "IN-DIFF";
 const CLASSIFICATION_ADVISORY = "ADVISORY";
+// TEAM-3756 F3a: an object finding citing NO resolvable files. It GATES (see
+// enforceDiffScope) — "we could not attribute this finding to files" must never
+// read as "this finding is out-of-diff".
+const CLASSIFICATION_UNATTRIBUTED = "UNATTRIBUTED";
 
 /** Normalize a path for change-set membership: coerce, trim, drop a leading
  *  `./` or `/` so `./src/a.ts`, `/src/a.ts` and `src/a.ts` all compare equal. */
@@ -178,7 +183,7 @@ function changeSetToPathSet(changeSet: unknown): Set<string> {
 
 /** The normalized files a finding cites: `citedFiles` preferred, `files` as an
  *  alias. A missing/non-array list yields `[]` — which makes the finding
- *  advisory (it cites no resolvable file). */
+ *  UNATTRIBUTED (it cites no resolvable file, so it gates; TEAM-3756 F3a). */
 function citedFilesOf(finding: ShipFindingLike): string[] {
   const raw = Array.isArray(finding.citedFiles)
     ? finding.citedFiles
@@ -197,20 +202,35 @@ function citedFilesOf(finding: ShipFindingLike): string[] {
  * Deterministically apply the diff-scoped gate to one round. PURE — the input
  * round and its findings are never mutated; a fresh normalized round is
  * returned. Tolerant of malformed LLM-written entries in the exact spirit of
- * `effectiveRoundCount`: it NEVER throws, and every ambiguity fails toward
- * advisory / non-blocking so a malformed finding can never gate.
+ * `effectiveRoundCount`: it NEVER throws.
+ *
+ * Which way an ambiguity fails is CLASSIFICATION-SPECIFIC (TEAM-3756 F3a),
+ * because the two errors are not symmetric: a finding that gates spuriously
+ * costs one avoidable rework round, but a finding downgraded spuriously
+ * SUPPRESSES the reopen — a genuine CHANGES-NEEDED silently becomes PASS.
  *
  * Rules (mirror release-manager.md Step 4's classification):
- *  - a finding is IN-DIFF only if it cites ≥1 file AND every cited file is in
- *    `changeSet` (paths normalized; renames count as both paths);
- *  - any other finding — one citing a file outside the change set, OR citing no
- *    resolvable files, OR a non-object entry — is forced to ADVISORY, and its
- *    `regressionOf` is stripped (blueprint: only IN-DIFF findings can be a
- *    regression for cap purposes), so it can neither gate nor weigh double;
- *  - if the verdict is CHANGES-NEEDED but ZERO findings remain IN-DIFF it is
- *    downgraded — to PASS when no findings remain at all, else to the
- *    non-blocking PASS-with-known-findings. Invariant: the returned round can
- *    never present CHANGES-NEEDED without at least one IN-DIFF finding.
+ *  - IN-DIFF — cites ≥1 file AND every cited file is in `changeSet` (paths
+ *    normalized; renames count as both paths). Gates.
+ *  - ADVISORY — AFFIRMATIVELY cites at least one file OUTSIDE the change set.
+ *    Only this positive evidence may downgrade: the finding's `regressionOf` is
+ *    stripped (only in-diff findings can be a regression for cap purposes), so
+ *    it can neither gate nor weigh double.
+ *  - UNATTRIBUTED — an object finding citing NO resolvable files (prose-only
+ *    citations, or none at all). GATES, keeping its `regressionOf`: failing to
+ *    parse the reviewer's citation is our defect, not evidence the finding is
+ *    out-of-diff. (Same asymmetry as the orchestrator's usableReviewFindings
+ *    rule, which refuses to derive findings nobody attached files to.)
+ *    Exception: an entry with no substantive content at all — a NON-OBJECT, or
+ *    an object whose only key is a `classification` left by a previous enforce
+ *    pass — is ledger corruption, not a reviewer's finding; it stays ADVISORY
+ *    (the AC-d "malformed input cannot block" tolerance), which also keeps
+ *    enforce idempotent (a prior pass's advisory sentinel cannot be promoted).
+ *  - if the verdict is CHANGES-NEEDED but ZERO findings gate, it is downgraded —
+ *    to PASS when no findings remain at all, else to the non-blocking
+ *    PASS-with-known-findings. Invariant: the returned round can never present
+ *    CHANGES-NEEDED without at least one gating (IN-DIFF or UNATTRIBUTED)
+ *    finding.
  *
  * `changeSet` defaults to the round's own `changeSet` field when omitted.
  */
@@ -219,26 +239,36 @@ export function enforceDiffScope(round: ShipRoundLike, changeSet?: unknown): Shi
   if (!round || typeof round !== "object") return round;
   const paths = changeSetToPathSet(changeSet !== undefined ? changeSet : round.changeSet);
   const rawFindings = Array.isArray(round.findings) ? round.findings : [];
-  let inDiffCount = 0;
+  let gatingCount = 0;
   const findings: Array<ShipFindingLike> = rawFindings.map(f => {
     if (!f || typeof f !== "object") {
-      // Malformed finding: cannot cite anything → advisory, cannot gate.
+      // Malformed entry: not a finding at all → advisory, cannot gate.
       return { classification: CLASSIFICATION_ADVISORY };
     }
     const cited = citedFilesOf(f);
-    const inDiff = cited.length >= 1 && cited.every(c => paths.has(c));
+    if (cited.length === 0) {
+      const substantive = Object.keys(f).some(k => k !== "classification");
+      if (substantive) {
+        // TEAM-3756 F3a: unattributable — gates, regression weight intact.
+        gatingCount++;
+        return { ...f, classification: CLASSIFICATION_UNATTRIBUTED };
+      }
+      return { classification: CLASSIFICATION_ADVISORY };
+    }
+    const inDiff = cited.every(c => paths.has(c));
     if (inDiff) {
-      inDiffCount++;
+      gatingCount++;
       return { ...f, classification: CLASSIFICATION_IN_DIFF };
     }
-    // Downgrade: force ADVISORY and drop regressionOf (advisory findings are
-    // never regressions), so the round can neither gate nor weigh double on it.
+    // Affirmatively out-of-diff: force ADVISORY and drop regressionOf (advisory
+    // findings are never regressions), so the round can neither gate nor weigh
+    // double on it.
     const { regressionOf: _dropped, ...rest } = f;
     return { ...rest, classification: CLASSIFICATION_ADVISORY };
   });
 
   let verdict = round.verdict;
-  if (verdict === "CHANGES-NEEDED" && inDiffCount === 0) {
+  if (verdict === "CHANGES-NEEDED" && gatingCount === 0) {
     verdict = findings.length === 0 ? "PASS" : "PASS-with-known-findings";
   }
   return { ...round, findings, verdict };

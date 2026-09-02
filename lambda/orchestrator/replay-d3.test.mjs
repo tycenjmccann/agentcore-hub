@@ -120,15 +120,22 @@ const CHANGED_FILE = "src/parser.ts";
  * feedback differs per round so each is a genuine new round, not a redelivery of
  * one rejection (the cap's null-SHA content fingerprint would otherwise collapse
  * identical feedback onto a single round).
+ *
+ * TEAM-3756 F1: the gate ticket deliberately does NOT carry reviewFindings —
+ * nothing in production ever wrote that field, so a replay that pre-populated it
+ * proved a path that could not occur. The findings ride as the JSON block in the
+ * rejection comment (the release manager's structured classification), and the
+ * orchestrator DERIVES them — the same end-to-end path production takes.
  */
-const rejection = (comment) => ({
+const findingsBlock = (files) =>
+  "\n```json\n" + JSON.stringify({ findings: files.map((f) => ({ citedFiles: [f] })) }) + "\n```";
+const rejection = (comment, citedFile = CHANGED_FILE) => ({
   ticketId: GATE_ID,
   workflowId: "wf_1",
   parentId: "TEAM-1",
   blockedBy: [UPSTREAM],
-  reviewComment: comment,
+  reviewComment: comment + findingsBlock([citedFile]),
   changeSet: [CHANGED_FILE],
-  reviewFindings: [{ citedFiles: [CHANGED_FILE] }],
 });
 
 // A `todo` write on the upstream dev ticket == the rework loop re-opening it.
@@ -217,5 +224,46 @@ describe("AC-D3.1 replay — ztc61f (ship review that never converges is capped,
     for (const u of h.state.updates.slice(updatesBefore)) {
       expect(u.Key.ticketId).toBe(GATE_ID);
     }
+  });
+});
+
+describe("AC-D3.2 replay — an out-of-diff rejection with DERIVED findings gates nothing (TEAM-3756 F1)", () => {
+  it("no reopen, no recorded round, and the advisory cycle never advances the cap", async () => {
+    // Round 1: a genuine in-diff rejection — counts and reopens.
+    await handleReviewRejection(rejection("Round 1: null deref in the new parser path."));
+    expect(reopenUpdates()).toHaveLength(1);
+    expect(h.state.ledger.rounds).toHaveLength(1);
+    // FR-D3.3: the recorded round carries its diff-scope inputs — derived, not
+    // pre-populated — so recounting can re-classify it later.
+    expect(h.state.ledger.rounds[0].changeSet).toEqual([CHANGED_FILE]);
+    expect(h.state.ledger.rounds[0].findings[0].citedFiles).toEqual([CHANGED_FILE]);
+
+    // Round 2: the reviewer complains about a file the PR never touched. The
+    // orchestrator derives that classification from the comment's JSON block
+    // (gateTicket.reviewFindings is ABSENT) and must treat the cycle as advisory.
+    await handleReviewRejection(
+      rejection("Nit: vendor code style could be nicer.", "vendor/untouched-legacy.ts")
+    );
+
+    expect(reopenUpdates()).toHaveLength(1);          // no new reopen
+    expect(h.state.ledger.rounds).toHaveLength(1);    // no round recorded — the cap did not advance
+    const advisory = eventsOfType("review.rejected").find((e) => e.detail?.noInDiffFindings);
+    expect(advisory).toBeTruthy();
+    expect(advisory.detail.reopened).toEqual([]);
+    // TEAM-3756 F3b: the non-gating rejection resolves the gate instead of
+    // stranding it in blocked — approved-with-known-findings, via the same done
+    // transition a human approval makes.
+    const gateDone = h.state.updates.filter(
+      (u) => u.Key.ticketId === GATE_ID && u.ExpressionAttributeValues?.[":s"] === "done"
+    );
+    expect(gateDone).toHaveLength(1);
+    expect(eventsOfType("review.approved_with_advisory")).toHaveLength(1);
+
+    // Round 3: back in-diff — the loop resumes exactly where it left off (round 2,
+    // not 3: the advisory cycle left no trace in the count).
+    await handleReviewRejection(rejection("Round 2 for real: the parser seam still fails."));
+    expect(reopenUpdates()).toHaveLength(2);
+    expect(h.state.ledger.rounds).toHaveLength(2);
+    expect(eventsOfType("review.cap_reached")).toHaveLength(0); // 2 of 3 — under the cap
   });
 });

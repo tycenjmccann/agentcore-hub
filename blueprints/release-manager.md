@@ -109,17 +109,16 @@ file it cites is in that change set (renames counting as both paths).
 
 Where it runs today: the orchestrator's rework-loop cap (`enforce` in
 `lambda/orchestrator/review-cap.mjs`) calls `enforceDiffScope` to decide whether a
-rejection actually gates — but it reads the change set and the classified findings
-off the GATE TICKET (`gateTicket.changeSet` + `gateTicket.reviewFindings`), NOT off
-this S3 ledger. Nothing populates those two gate-ticket fields yet, so that guard
-is currently DORMANT: a deliberate flag-off rollout where absent inputs make
-`enforce` byte-identical to its pre-guard behavior. It activates only once the gate
-plumbing forwards the change set and the classified findings onto the gate ticket.
-Until then this prose — plus the `changeSet` and per-finding `citedFiles` you
-record on the round entry (step 1 below) — is what governs the verdict. Record
-them accurately with the SAME field names so the ledger is already correct for when
-the deterministic layer is switched on, and so `effectiveRoundCount`'s IN-DIFF
-regression accounting (step 2) lines up with your classification.
+rejection actually gates. It is LIVE (TEAM-3748 D3 + TEAM-3756 F1): the gate
+ticket's `changeSet`/`reviewFindings` still win when a provider forwards them,
+but when absent the orchestrator computes the change set from the PR diff itself
+and derives the classified findings from the rejection feedback's JSON block or
+— this matters to YOU — from the LATEST round of this very S3 ledger
+(`ship-review-state.json`). So the `changeSet` and per-finding `citedFiles` you
+record on the round entry (step 1 below) are not just bookkeeping: they are the
+deterministic gate's inputs. Record them accurately with the SAME field names,
+and so `effectiveRoundCount`'s IN-DIFF regression accounting (step 2) lines up
+with your classification.
 
 Classify EVERY finding before you count anything:
 - **IN-DIFF** — every file it cites is on the change set recorded in Step 2.
@@ -131,6 +130,11 @@ Classify EVERY finding before you count anything:
   it, you just file it as backlog. Advisory tickets get the label `advisory`,
   no `blocked_by` into this run, and never appear in the effective round count.
   List them in the summary under "Advisory (not gating)" so the human sees them.
+- A finding you can't attribute to files is NOT advisory — it GATES
+  (`enforceDiffScope` classifies it `UNATTRIBUTED`). Advisory requires the
+  positive evidence of an out-of-diff citation; "no files recorded" only proves
+  the citation is missing. So always record `citedFiles` — an unattributed
+  finding costs the run a rework round the citation could have scoped away.
 
 The convergence knobs come from the workflow definition's `reviewGate` config
 for this gate (`src/config/workflows.json`, the gate whose `afterPhase` is

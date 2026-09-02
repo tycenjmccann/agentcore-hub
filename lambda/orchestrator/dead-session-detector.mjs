@@ -46,6 +46,9 @@
  */
 
 import { QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
+// The ONE terminal-phase list (TEAM-3755 F8 / TEAM-3756 F5). completion.mjs is
+// pure — no AWS clients, no store import — so importing it here cannot cycle.
+import { notTerminalPhaseFilter } from "./completion.mjs";
 
 // Sweep bounds and threshold knobs. The silence threshold is derived per-agent
 // from its own recent run durations; these frame that derivation.
@@ -101,20 +104,25 @@ export function createDetector(deps) {
   /**
    * Scan workflows in a non-terminal phase, newest first, capped at SWEEP_CAP.
    * Returns { workflows, matched } so the caller can flag truncation.
+   *
+   * TEAM-3756 F5: the filter is DERIVED from the shared TERMINAL_WORKFLOW_PHASES
+   * list (completion.mjs), the same fix TEAM-3755 F8 made to the reconcile
+   * sweep's identical scan. The hand-rolled list here named only
+   * complete/cancelled/error, so a run already closed deploy-blocked /
+   * static-ci-only still scanned as "open" — and in enforce mode (the default)
+   * a stale agentTask inside a terminally-blocked run could be retried or
+   * escalated after the run's honest close.
    */
   async function scanNonTerminalWorkflows() {
     const matched = [];
     let lastKey;
+    const openOnly = notTerminalPhaseFilter("#p");
     for (let page = 0; page < WORKFLOW_SCAN_PAGES; page++) {
       const res = await ddb.send(new ScanCommand({
         TableName: workflowsTable,
-        FilterExpression: "NOT (#p IN (:complete, :cancelled, :error))",
+        FilterExpression: openOnly.filter,
         ExpressionAttributeNames: { "#p": "phase" },
-        ExpressionAttributeValues: {
-          ":complete": "complete",
-          ":cancelled": "cancelled",
-          ":error": "error",
-        },
+        ExpressionAttributeValues: { ...openOnly.values },
         ExclusiveStartKey: lastKey,
       }));
       for (const w of res.Items || []) matched.push(w);
