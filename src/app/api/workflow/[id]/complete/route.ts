@@ -74,6 +74,29 @@ const AGENT_PHASE_BY_ID: Record<string, string> = Object.fromEntries(
 // never carry these phases, so their behavior is unchanged.
 const TERMINAL_PHASES = ["complete", "error", "cancelled", ...SHIP_BLOCKED_OUTCOMES] as const;
 const DONE_STATUSES = new Set(["done", "cancelled"]);
+
+/**
+ * TEAM-3755 F2 — build the "not already terminal" half of a terminal-claim
+ * ConditionExpression from the ONE list above, so both of this route's terminal
+ * writes (the green complete and closeBlocked) refuse the SAME five phases.
+ *
+ * The bug: the complete write listed only complete/error/cancelled by hand, so a
+ * completion racing in behind an honest deploy-blocked / static-ci-only close
+ * overwrote it with "complete" and destroyed the FR-D2.2 evidence. PARITY with
+ * notTerminalPhaseGuard in lambda/orchestrator/completion.mjs.
+ *
+ * Placeholders are positional (:tp0…) so they cannot collide with a caller's SET
+ * values, and each declared value IS referenced — DynamoDB rejects unused ones.
+ */
+function terminalPhaseGuard(): { condition: string; values: Record<string, string> } {
+  const values: Record<string, string> = {};
+  const condition = TERMINAL_PHASES.map((phase, i) => {
+    const key = `:tp${i}`;
+    values[key] = phase;
+    return `#phase <> ${key}`;
+  }).join(" AND ");
+  return { condition, values };
+}
 // PARITY with lambda/orchestrator/completion.mjs SHIP_PHASES — the phases whose
 // done tickets owe a merge/deploy verdict rather than mere output.
 const SHIP_PHASES = new Set(["ship"]);
@@ -148,6 +171,41 @@ function missingEvidenceTickets(
   return missing;
 }
 
+/**
+ * TEAM-3755 F4 — PARITY with the per-required-phase branch of
+ * lambda/orchestrator/completion.mjs `isWorkflowComplete`: for EVERY phase the
+ * def requires, at least one AGENT (non-human) ticket in that phase must be
+ * `done`. Returns the required phases that have no such ticket (empty = clean).
+ *
+ * The divergence this closes: this route's only structural gate was
+ * openChildren(), and its DONE_STATUSES counts "cancelled" as closed. So a run
+ * whose single ship ticket was CANCELLED had no open children, produced ZERO
+ * done ship tickets, and evaluateShipVerdict's "nothing to inspect" branch
+ * returned green — the route completed a run whose required ship phase never
+ * ran, while the orchestrator twin refused it. `done` is checked strictly here
+ * (completion.mjs `isDone` is status === "done"), so cancelled can never satisfy
+ * a required phase.
+ *
+ * Deliberately NOT ported: completion.mjs also requires every ACTIVE BLOCKING
+ * review gate for the phase to be approved. That clause needs the def's
+ * reviewGates + gate-ticket resolution and is a separate finding — this helper
+ * closes only the cancelled/empty-phase hole.
+ */
+function requiredPhasesMissingDoneAgent(tickets: Ticket[], requiredPhases: string[]): string[] {
+  if (!requiredPhases.length) return [];
+  const isHuman = (a: unknown) => typeof a === "string" && a.startsWith("human:");
+  return requiredPhases.filter(
+    (phase) =>
+      !tickets.some(
+        (t) =>
+          t.type !== "epic" &&
+          !isHuman(t.assignee) &&
+          phaseOfTicket(t) === phase &&
+          String(t.status || "").toLowerCase() === "done"
+      )
+  );
+}
+
 interface ShipTaskLike extends AgentTaskLike {
   mergeCommit?: unknown;
   commitSha?: unknown;
@@ -165,20 +223,24 @@ interface ShipVerdict {
 
 /**
  * TEAM-3747 D2 PARITY — hand-port of lambda/orchestrator/completion.mjs
- * `shipVerdictOf`. Classify ONE ship-phase agentTasks entry: "shipped" (a merge
- * commit / commit_sha, or an explicit outcome==="shipped"), a SHIP_BLOCKED_OUTCOMES
- * value (an explicit terminal block), or null (a phantom green close — CI may be
- * green but nothing merged/deployed and no block declared). Unlike
- * missingEvidenceTickets, mere output/artifact is NOT proof the work shipped.
- * Keep in agreement with completion.mjs.
+ * `shipVerdictOf`. Classify ONE ship-phase agentTasks entry: "shipped" (a
+ * non-empty mergeCommit, or an explicit outcome==="shipped"), a
+ * SHIP_BLOCKED_OUTCOMES value (an explicit terminal block), or null (a phantom
+ * green close — CI may be green but nothing merged/deployed and no block
+ * declared). Unlike missingEvidenceTickets, mere output/artifact is NOT proof
+ * the work shipped. Keep in agreement with completion.mjs.
+ *
+ * TEAM-3755 F1 (P0): `commitSha` is deliberately NOT a merge signal, in BOTH
+ * twins. It is the HEAD of the still-unmerged feature branch and is harvested
+ * onto every dev/ship completion record, so accepting it returned "shipped" for
+ * unmerged work and let the gate close a run "complete" over an unshipped branch
+ * (the 29g73c failure; FR-D2.2 / AC-D2.4).
  */
 function shipVerdictOf(entry: ShipTaskLike | undefined): string | null {
   if (!entry || typeof entry !== "object") return null;
   const outcome = typeof entry.outcome === "string" ? entry.outcome.trim().toLowerCase() : "";
   if ((SHIP_BLOCKED_OUTCOMES as readonly string[]).includes(outcome)) return outcome;
-  const merged =
-    (typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0) ||
-    (typeof entry.commitSha === "string" && entry.commitSha.trim().length > 0);
+  const merged = typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0;
   if (merged || outcome === "shipped") return "shipped";
   return null;
 }
@@ -214,6 +276,13 @@ function evaluateShipVerdict(
       !isHuman(t.assignee) &&
       phases.has(phaseOfTicket(t) as string)
   );
+  // No done ship AGENT ticket to inspect: keep the twin's "cannot prove a
+  // phantom" stance (completion.mjs evaluateShipVerdict does the same) rather
+  // than inventing a block here. TEAM-3755 F4: this branch is no longer a way to
+  // complete a run whose required ship phase never produced a done ticket — the
+  // requiredPhasesMissingDoneAgent gate refuses that case UPSTREAM of this call,
+  // exactly as isWorkflowComplete does on the orchestrator side. Reaching here
+  // with required=true and shipped=true now means only "nothing owed a verdict".
   if (shipTickets.length === 0) return { ...inert, required: true };
   let blocked: string | null = null;
   let blockReason: string | null = null;
@@ -279,6 +348,9 @@ async function closeBlocked(
   const completedAt = new Date().toISOString();
   const blockReason = verdict.blockReason || reason || null;
   const compacted = compactNotifications((workflow.humanNotifications as Notification[]) || []);
+  // TEAM-3755 F2: same derived guard as the green complete write above — one list,
+  // both terminal writes.
+  const guard = terminalPhaseGuard();
   try {
     await ddb.send(
       new UpdateCommand({
@@ -287,9 +359,7 @@ async function closeBlocked(
         UpdateExpression:
           "SET #phase = :outcome, completedAt = :ts, previousPhase = :prev, managerWatch = :false, humanNotifications = :notifs" +
           (blockReason ? ", blockReason = :reason" : ""),
-        ConditionExpression:
-          "#phase <> :complete AND #phase <> :error AND #phase <> :alreadyCancelled " +
-          "AND #phase <> :deployBlocked AND #phase <> :staticCi AND attribute_not_exists(cancelledAt)",
+        ConditionExpression: `${guard.condition} AND attribute_not_exists(cancelledAt)`,
         ExpressionAttributeNames: { "#phase": "phase" },
         ExpressionAttributeValues: {
           ":outcome": outcome,
@@ -297,11 +367,7 @@ async function closeBlocked(
           ":prev": workflow.phase,
           ":false": false,
           ":notifs": compacted,
-          ":complete": "complete",
-          ":error": "error",
-          ":alreadyCancelled": "cancelled",
-          ":deployBlocked": "deploy-blocked",
-          ":staticCi": "static-ci-only",
+          ...guard.values,
           ...(blockReason ? { ":reason": blockReason } : {}),
         },
       })
@@ -482,6 +548,37 @@ export async function POST(
       console.warn(`[complete] evidence check skipped: ${(err as Error).message}`);
     }
 
+    // 2b′. TEAM-3755 F4 — structural parity with completion.mjs
+    //      isWorkflowComplete: every required agent phase must have a DONE agent
+    //      ticket. openChildren() alone cannot see this, because it counts a
+    //      CANCELLED ticket as closed — so a required ship phase whose only
+    //      ticket was cancelled passed every gate and completed green here while
+    //      the orchestrator twin refused. Enforced unconditionally (no
+    //      COMPLETION_EVIDENCE_REQUIRED opt-out): this is a structural
+    //      "the work never ran" refusal, the same class as the open-children
+    //      gate, not an evidence heuristic.
+    try {
+      const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
+      const requiredPhases = def?.completionRequiresAgentPhases || [];
+      const unrun = requiredPhasesMissingDoneAgent(tickets, requiredPhases);
+      if (unrun.length > 0) {
+        return NextResponse.json(
+          {
+            error: "required_phase_incomplete",
+            phases: unrun,
+            hint:
+              "These required phases have no completed agent ticket (a cancelled ticket " +
+              "does not count). Finish the phase — completion has no bypass.",
+          },
+          { status: 409 }
+        );
+      }
+    } catch (err) {
+      // A def that will not resolve must not turn a legitimate completion into a
+      // 500 — same discipline as the evidence gate: only tighten when provable.
+      console.warn(`[complete] required-phase check skipped: ${(err as Error).message}`);
+    }
+
     // 2c. TEAM-3747 D2 — ship/CD merge-verdict gate ("no green close over
     //     unshipped work"), PARITY with the orchestrator's completeWorkflow. If the
     //     def has a ship phase, a done ship ticket must carry a merge/deploy verdict
@@ -535,6 +632,7 @@ export async function POST(
     const compacted = compactNotifications(
       (workflow.humanNotifications as Notification[]) || []
     );
+    const completeGuard = terminalPhaseGuard();
     try {
       await ddb.send(
         new UpdateCommand({
@@ -547,8 +645,10 @@ export async function POST(
           // the pre-read above (which serves the friendly 409) and this write
           // stamps cancelledAt before phase flips, and must not be overwritten
           // to complete. Mirrors workflow-store.mjs completeWorkflow.
-          ConditionExpression:
-            "#phase <> :complete AND #phase <> :error AND #phase <> :alreadyCancelled AND attribute_not_exists(cancelledAt)",
+          // TEAM-3755 F2: the phase half of the guard now covers ALL FIVE
+          // terminal phases (it omitted the D2 blocked outcomes), derived from
+          // TERMINAL_PHASES so it cannot drift from closeBlocked's guard.
+          ConditionExpression: `${completeGuard.condition} AND attribute_not_exists(cancelledAt)`,
           ExpressionAttributeNames: { "#phase": "phase" },
           ExpressionAttributeValues: {
             ":complete": "complete",
@@ -556,8 +656,7 @@ export async function POST(
             ":prev": workflow.phase,
             ":false": false,
             ":notifs": compacted,
-            ":error": "error",
-            ":alreadyCancelled": "cancelled",
+            ...completeGuard.values,
             ...(reason ? { ":reason": reason } : {}),
           },
         })

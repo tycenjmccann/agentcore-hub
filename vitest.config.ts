@@ -84,6 +84,13 @@ export default defineConfig({
       // has something to read on the done cascade. Same harness as
       // done-handlers-cascade: real handlers, mocked I/O seams.
       "lambda/orchestrator/evidence-harvest.test.mjs",
+      // ticket-done-blocked-terminal (TEAM-3755 F3) — the contract behind
+      // markTaskComplete's unconditional "done": a ticket done whose completion
+      // record carries a SHIP_BLOCKED outcome must ALWAYS close the run on a
+      // blocked terminal phase, never "complete". Drives BOTH done handlers
+      // end-to-end (real markTaskComplete → harvest → ship gate →
+      // closeWorkflowBlocked) and pins F1 (commit_sha alone is not a merge).
+      "lambda/orchestrator/ticket-done-blocked-terminal.test.mjs",
       // reconcile-sweep.mjs (TEAM-3747 D1) — the scheduled missed-unblock sweep.
       // Fully dependency-injected (stub ddb/cascade/lease + fake clock), same
       // shape as the dead-session detector: shadow/enforce modes, per-candidate

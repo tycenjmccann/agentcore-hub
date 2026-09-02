@@ -37,6 +37,50 @@ const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
 export const SHIP_BLOCKED_OUTCOMES = ["deploy-blocked", "static-ci-only"];
 
 /**
+ * TEAM-3755 F2 — the ONE list of phases a run can already be closed on. Every
+ * terminal-claim CAS must refuse ALL of them, or a later write can overwrite an
+ * earlier honest verdict.
+ *
+ * The bug this fixes: completeWorkflow's ConditionExpression excluded only
+ * complete/cancelled/error, so a run already closed "deploy-blocked" or
+ * "static-ci-only" (the TEAM-3747 D2 honest-close outcomes) still satisfied the
+ * condition — a completion racing in behind the block silently overwrote the
+ * blocked phase with "complete", destroying the FR-D2.2 evidence that nothing
+ * shipped. claimTerminalOutcome already listed all five; the two writes had
+ * drifted apart because each spelled the list out by hand.
+ *
+ * Derived from SHIP_BLOCKED_OUTCOMES so a sixth outcome cannot be added to one
+ * write and forgotten in the other. PARITY MIRROR of the TERMINAL_PHASES in
+ * src/lib/workflow/types.ts (same five values, same purpose).
+ */
+export const TERMINAL_WORKFLOW_PHASES = Object.freeze([
+  "complete",
+  "cancelled",
+  "error",
+  ...SHIP_BLOCKED_OUTCOMES,
+]);
+
+/**
+ * Build the "not already terminal" half of a terminal-claim ConditionExpression
+ * from TERMINAL_WORKFLOW_PHASES. Returns { condition, values } to splice into an
+ * UpdateCommand; `nameRef` is how the caller refers to the phase attribute
+ * ("phase" bare, or "#phase" when it is aliased).
+ *
+ * Placeholders are positional (:tp0…) so they can never collide with a caller's
+ * own SET values, and every declared value IS referenced by the condition —
+ * DynamoDB rejects an unused ExpressionAttributeValues entry.
+ */
+export function notTerminalPhaseGuard(nameRef = "phase") {
+  const values = {};
+  const condition = TERMINAL_WORKFLOW_PHASES.map((phase, i) => {
+    const key = `:tp${i}`;
+    values[key] = phase;
+    return `${nameRef} <> ${key}`;
+  }).join(" AND ");
+  return { condition, values };
+}
+
+/**
  * Agent phases whose done tickets owe a MERGE/DEPLOY verdict rather than mere
  * output (the ship / CD stage). A def opts in by listing "ship" in its
  * completionRequiresAgentPhases; runs with no ship phase are wholly unaffected.
@@ -172,8 +216,20 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
  * shipped — only a merge commit / deploy verdict is. This is the crucial
  * difference from missingEvidenceTickets (which accepts any output/artifact).
  * Classifies the entry into one of:
- *   "shipped"          → carries a positive merge/deploy signal
- *                        (mergeCommit, or commit_sha on the merged/release PR).
+ *   "shipped"          → carries a positive merge/deploy signal: a non-empty
+ *                        `mergeCommit`, or an EXPLICIT outcome==="shipped".
+ *
+ *                        TEAM-3755 F1 (P0): `commitSha` is deliberately NOT a
+ *                        merge signal. harvestCompletionEvidence stores every
+ *                        agent's record.commit_sha — that is the HEAD of the
+ *                        (still unmerged) feature branch, present on literally
+ *                        every dev/ship completion record. Accepting it made
+ *                        shipVerdictOf return "shipped" for unmerged work, so
+ *                        the D2 gate passed and the run closed "complete" over
+ *                        an unshipped branch — the exact 29g73c failure this
+ *                        gate exists to stop (FR-D2.2 / AC-D2.4). Only a merge
+ *                        commit (or the release manager's explicit verdict)
+ *                        proves the work landed.
  *   <a SHIP_BLOCKED_OUTCOMES value> → the agent recorded an EXPLICIT terminal
  *                        block ("deploy-blocked" / "static-ci-only").
  *   null               → neither: a phantom green close (CI may be green, but
@@ -187,9 +243,10 @@ export function shipVerdictOf(entry) {
   if (!entry || typeof entry !== "object") return null;
   const outcome = typeof entry.outcome === "string" ? entry.outcome.trim().toLowerCase() : "";
   if (SHIP_BLOCKED_OUTCOMES.includes(outcome)) return outcome;
-  const merged =
-    (typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0) ||
-    (typeof entry.commitSha === "string" && entry.commitSha.trim().length > 0);
+  // A merge commit is the ONLY harvested field that proves the work landed.
+  // commitSha is NOT consulted (see the F1 note above) — it is the unmerged
+  // branch HEAD and is present on every completion record.
+  const merged = typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0;
   if (merged || outcome === "shipped") return "shipped";
   return null;
 }
