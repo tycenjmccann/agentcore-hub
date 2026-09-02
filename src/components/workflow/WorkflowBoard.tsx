@@ -1708,6 +1708,12 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             workflowId={openTicketModal.workflowId}
             isOpen={true}
             onClose={() => setOpenTicketModal(null)}
+            reviewNotification={
+              (state?.humanNotifications || []).find(
+                (n) => n.type === "review_needed" && !n.acknowledged &&
+                  n.ticketId === openTicketModal.ticketId
+              ) ?? null
+            }
           />
         )}
       </div>

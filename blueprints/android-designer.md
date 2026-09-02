@@ -26,6 +26,11 @@ claude_code(
 ### Step 3: Review & Deliver
 - Verify against requirements and mockups
 - `WorkflowOutput___save_design_doc`
+- If a Plan Approval gate follows the design phase (see `## Human Review
+  Gates` in your Workflow Context): `load_blueprint("review-package")` and
+  write `workflows/{workflow_id}/shared/review-package-design.{your_agent_id}.json`
+  per its `design` template — your own file, never edit another designer's;
+  the hub merges them at gate time
 - `WorkflowOutput___report_completion`
 
 ## Rules

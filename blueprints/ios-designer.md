@@ -60,7 +60,12 @@ If something is missing or wrong, call `claude_code` again with specific correct
 1. Upload mockup screenshot: `download_s3_file(<key>)` then
    `upload_file_to_s3(local_path=..., key="workflows/{workflow_id}/shared/ios-design-mockup.png")`
 2. `WorkflowOutput___save_design_doc` — save the final design
-3. `WorkflowOutput___report_completion` — summary of what was delivered; include
+3. If a Plan Approval gate follows the design phase (see `## Human Review
+   Gates` in your Workflow Context): `load_blueprint("review-package")` and
+   write `workflows/{workflow_id}/shared/review-package-design.{your_agent_id}.json`
+   per its `design` template — your own file, never edit another designer's;
+   the hub merges them at gate time
+4. `WorkflowOutput___report_completion` — summary of what was delivered; include
    the `[coding-session: ...]` footer in your artifacts field
 
 Do NOT create implementation, dev, QA, or CI tickets. The requirements analyst already authored the full ticket chain; your job is to deliver the design, not to schedule downstream work.

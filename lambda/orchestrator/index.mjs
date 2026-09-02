@@ -22,7 +22,7 @@ import {
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
-import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import {
   BedrockAgentRuntimeClient,
@@ -708,13 +708,19 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
   // cascade's re-wake uses to publish review.reawakened at most once.
   let notified = false;
   if (workflow) {
+    // Review package: the upstream agent that closed the phase wrote a curated
+    // summary/bullets/links file (blueprints/review-package.md). Best-effort —
+    // a missing or malformed package must never delay the gate ping.
+    const pkg = await loadReviewPackage(workflow, ticketId);
+
     const notification = {
       id: `notif_${ticketId}_${new Date().toISOString()}`,
       type: "review_needed",
       title: `Review needed: ${ticketId}`,
-      details: `Ticket ${ticketId} is awaiting review by ${reviewer}.`,
+      details: pkg?.summary || `Ticket ${ticketId} is awaiting review by ${reviewer}.`,
       ticketId,
       reviewer,
+      ...(pkg ? { summary: pkg.summary, bullets: pkg.bullets, links: pkg.links, gate: pkg.gate } : {}),
       timestamp: new Date().toISOString(),
       acknowledged: false,
     };
@@ -726,6 +732,15 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
       console.log(`[orchestrator] ${ticketId} already has an open review notification — skipping duplicate.`);
       return false;
     }
+
+    // Mirror the package onto the gate ticket so the dashboard reviewer sees
+    // the same context when they open it (Jira: comment; DDB: comment row).
+    // Only the caller that actually appended attaches — a losing CAS racer
+    // returned above, so redeliveries can't double-comment the ticket.
+    if (pkg) {
+      try { await attachPackageToTicket(ticketId, pkg); }
+      catch (err) { console.warn(`[orchestrator] could not attach review package to ${ticketId}: ${err.message}`); }
+    }
   }
 
   await publishEvent(ticketId, "review.needed", {
@@ -733,6 +748,112 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
   });
   console.log(`[orchestrator] ${ticketId} parked for human review (${reviewer}) — not invoking an agent.`);
   return notified;
+}
+
+/**
+ * Load the review package the pre-gate agent wrote for this gate
+ * (shared/review-package-<phase>.json). The gate's phase comes from the agent
+ * tickets it is blockedBy — same resolution as handleReviewRejection. Returns
+ * a validated {gate, summary, bullets, links} or null; never throws.
+ */
+async function loadReviewPackage(workflow, gateTicketId) {
+  try {
+    const gateTicket = await getTicket(gateTicketId);
+    let phase;
+    for (const upId of gateTicket?.blockedBy || []) {
+      const up = await getTicket(upId);
+      const def = up && getAgentDef(up.assignee);
+      if (def?.phase) { phase = def.phase; break; }
+    }
+    if (!phase || !ARTIFACT_BUCKET) return null;
+
+    // Parallel pre-gate agents (design) each write their own
+    // review-package-<phase>.<agentId>.json — read-merge-write on one shared
+    // object would lose updates. Merge every matching file here instead.
+    const listed = await s3.send(new ListObjectsV2Command({
+      Bucket: ARTIFACT_BUCKET,
+      Prefix: `workflows/${workflow.id}/shared/review-package-${phase}`,
+    }));
+    const keys = (listed.Contents || [])
+      .map((o) => o.Key)
+      .filter((k) => k.endsWith(".json"))
+      .sort(); // deterministic merge order across redeliveries
+    const parts = [];
+    for (const key of keys) {
+      const raw = await readS3Artifact(workflow.id, key.replace(`workflows/${workflow.id}/`, ""));
+      if (!raw) continue;
+      try {
+        const p = JSON.parse(raw);
+        if (typeof p.summary === "string" && p.summary.trim()) parts.push(p);
+      } catch { /* one malformed part must not sink the rest */ }
+    }
+    if (!parts.length) return null;
+
+    const merged = {
+      summary: parts.map((p) => p.summary.trim()).join(" · "),
+      bullets: parts.flatMap((p) => (Array.isArray(p.bullets) ? p.bullets : [])),
+      links: parts.flatMap((p) => (Array.isArray(p.links) ? p.links : [])),
+    };
+    // Clamp to the contract so a rambling agent can't flood the ping: bullets
+    // are one-liners, links carry either an in-run artifactKey or an https url.
+    // Multi-part merges get proportionally wider caps, still phone-sized.
+    const maxBullets = Math.min(6 * parts.length, 10);
+    const maxLinks = Math.min(4 * parts.length, 8);
+    const seen = new Set();
+    const bullets = merged.bullets
+      .filter((b) => typeof b === "string" && b.trim())
+      .map((b) => b.trim().slice(0, 200))
+      .slice(0, maxBullets);
+    const links = merged.links
+      .filter((l) => l && typeof l.label === "string" &&
+        (typeof l.url === "string" && /^https:\/\//.test(l.url) ||
+         typeof l.artifactKey === "string" && l.artifactKey.startsWith(`workflows/${workflow.id}/`)))
+      .map((l) => ({
+        label: l.label.trim().slice(0, 60),
+        ...(l.url ? { url: l.url } : { artifactKey: l.artifactKey }),
+      }))
+      .filter((l) => {
+        const target = l.url || l.artifactKey;
+        if (seen.has(target)) return false; // designers may all link the same shared doc
+        seen.add(target);
+        return true;
+      })
+      .slice(0, maxLinks);
+    return { gate: phase, summary: merged.summary.slice(0, 500), bullets, links };
+  } catch (err) {
+    console.warn(`[orchestrator] review package load failed for ${gateTicketId}: ${err.message}`);
+    return null;
+  }
+}
+
+/** Post the review package onto the gate ticket as a comment (both providers). */
+async function attachPackageToTicket(ticketId, pkg) {
+  const lines = [
+    `Review package — ${pkg.summary}`,
+    ...pkg.bullets.map((b) => `• ${b}`),
+    ...pkg.links.map((l) => `→ ${l.label}: ${l.url || l.artifactKey}`),
+  ];
+  const text = lines.join("\n");
+  if (TICKET_PROVIDER === "jira") {
+    await jiraFetch(`/rest/api/3/issue/${ticketId}/comment`, "POST", {
+      body: {
+        type: "doc", version: 1,
+        content: lines.map((t) => ({ type: "paragraph", content: [{ type: "text", text: t }] })),
+      },
+    });
+  } else {
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId },
+      UpdateExpression: "SET #c = list_append(if_not_exists(#c, :empty), :n), #u = :u",
+      ExpressionAttributeNames: { "#c": "comments", "#u": "updatedAt" },
+      ExpressionAttributeValues: {
+        ":n": [{ id: `comment-${Date.now()}`, author: "orchestrator", content: text, timestamp: new Date().toISOString() }],
+        ":empty": [],
+        ":u": new Date().toISOString(),
+      },
+    }));
+  }
 }
 
 /**
