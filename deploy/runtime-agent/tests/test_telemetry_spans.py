@@ -462,6 +462,30 @@ def _load_production_entrypoints() -> dict[str, Any]:
     )
     assert gate_cls is not None, f"_CompletionGate is not defined at module scope in {MAIN_PY}"
 
+    # _run_agent_invocation resolves the fleet watchdog config on entry (D1.1);
+    # extract the real shipped resolver + its pure helpers rather than stubbing —
+    # like _CompletionGate they only depend on `os`, which the namespace carries.
+    watchdog_names = {"_wd_num", "_wd_bool", "_resolve_watchdog"}
+    watchdog_defs = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in watchdog_names
+    ]
+    missing_wd = watchdog_names - {func.name for func in watchdog_defs}
+    assert not missing_wd, f"{sorted(missing_wd)} not defined at module scope in {MAIN_PY}"
+    watchdog_legacy = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "_WATCHDOG_LEGACY" for t in node.targets
+            )
+        ),
+        None,
+    )
+    assert watchdog_legacy is not None, f"_WATCHDOG_LEGACY is not assigned at module scope in {MAIN_PY}"
+
     # The mock model never emits toolUse, so these delegation-tool stubs exist
     # only to satisfy the `all_tools` assembly in the shipped source.
     @tool
@@ -474,6 +498,11 @@ def _load_production_entrypoints() -> dict[str, Any]:
         """Stub of the codex delegation tool."""
         return "stub"
 
+    @tool
+    def kiro(task: str) -> str:
+        """Stub of the kiro delegation tool."""
+        return "stub"
+
     # The shipped call site awaits the anchor helper (TEAM-3387), so the stub
     # must be a coroutine function.
     async def _anchor_stub(agent_id, session_id, workflow_id, ticket_id):
@@ -484,6 +513,8 @@ def _load_production_entrypoints() -> dict[str, Any]:
         "Agent": Agent,
         "logger": logging.getLogger("test-prod-entrypoint"),
         "model": MockModel(),
+        # The shipped watchdog resolver reads env overrides via os.getenv.
+        "os": os,
         # Module-scope config the functions read.
         "MODEL_ID": "mock-model",
         "READ_TIMEOUT": 300,
@@ -509,6 +540,7 @@ def _load_production_entrypoints() -> dict[str, Any]:
         "LAMBDA_TOOLS": [],
         "claude_code": claude_code,
         "codex": codex,
+        "kiro": kiro,
         "_apply_connectors": lambda agent_id, connectors=None: {
             "mcp_servers": [],
             "gateways": [],
@@ -522,7 +554,9 @@ def _load_production_entrypoints() -> dict[str, Any]:
         "_DETACHED_TASKS": set(),
         "app": _RecordingApp(),
     }
-    module = ast.Module(body=[gate_cls, *funcs], type_ignores=[])
+    module = ast.Module(
+        body=[watchdog_legacy, *watchdog_defs, gate_cls, *funcs], type_ignores=[]
+    )
     exec(compile(module, str(MAIN_PY), "exec"), namespace)  # noqa: S102
     return namespace
 
@@ -662,10 +696,16 @@ async def test_router_detached_path_flushes_spans_before_completing_task(
     assert len(tasks) == 1, "detached path must register exactly one background task"
     await asyncio.gather(*tasks)
 
-    assert [call[0] for call in app.calls] == ["flush", "complete"], (
-        f"flush must precede complete_async_task, got {app.calls}"
+    # strands >=1.22 force_flushes inside Tracer.end_span, so the recorder may
+    # see SDK-internal flushes too. The design contract is narrower: the
+    # handler's OWN bounded 5s flush runs, and every flush precedes
+    # complete_async_task — nothing may complete the task with spans queued.
+    assert ("flush", "5000") in app.calls, (
+        f"the handler's bounded 5s flush never ran, got {app.calls}"
     )
-    assert app.calls[0][1] == "5000"  # the bounded flush the design specifies
+    assert [c for c in app.calls if c[0] == "complete"] == [app.calls[-1]], (
+        f"complete_async_task must come last, after every flush, got {app.calls}"
+    )
 
     (span,) = [
         s
