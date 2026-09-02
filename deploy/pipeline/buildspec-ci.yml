@@ -119,9 +119,27 @@ phases:
             --tag "${ECR_URI}:${GIT_SHA}" --tag "${ECR_URI}:latest" \
             --push --file Dockerfile . --provenance=false
           if [ -f /tmp/agents.git.json ]; then cp /tmp/agents.git.json src/config/agents.json; fi
-          IMAGE_DIGEST="$(aws ecr describe-images --repository-name "$ECR_REPO" \
-            --image-ids imageTag="$GIT_SHA" --region "$AWS_REGION_HUB" \
-            --query 'imageDetails[0].imageDigest' --output text)"
+          # Resolve the pushed image's digest. ECR describe-images is
+          # eventually-consistent right after a push and can briefly return
+          # nothing / "None" — writing that empty string through to the Deploy
+          # stage produced a broken "${ECR_URI}@" image ref that ECS rejects with
+          # "Container.image is incomplete", failing the deploy AFTER approval.
+          # Retry until we get a real sha256 digest, and HARD-FAIL the build if we
+          # never do — an empty digest must never reach the Deploy stage.
+          IMAGE_DIGEST=""
+          for attempt in 1 2 3 4 5 6; do
+            IMAGE_DIGEST="$(aws ecr describe-images --repository-name "$ECR_REPO" \
+              --image-ids imageTag="$GIT_SHA" --region "$AWS_REGION_HUB" \
+              --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)"
+            case "$IMAGE_DIGEST" in
+              sha256:*) break ;;
+              *) echo "digest not ready (attempt $attempt): '$IMAGE_DIGEST' — retrying"; IMAGE_DIGEST=""; sleep 5 ;;
+            esac
+          done
+          if [ -z "$IMAGE_DIGEST" ]; then
+            echo "FATAL: could not resolve a sha256 image digest for tag $GIT_SHA after retries" >&2
+            exit 1
+          fi
           echo "Resolved image digest: $IMAGE_DIGEST"
           # Hand the exact artifacts to the Deploy stage.
           mkdir -p pipeline-out
