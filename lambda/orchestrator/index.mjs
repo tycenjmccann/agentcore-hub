@@ -637,6 +637,51 @@ async function markTaskComplete(workflow, ticketId, assignee) {
   await store.completeTaskEntry(workflow.id, ticketId, entry);
   if (!workflow.agentTasks) workflow.agentTasks = {};
   workflow.agentTasks[ticketId] = entry;
+  await harvestCompletionEvidence(workflow, ticketId);
+}
+
+/**
+ * Harvest deliverable evidence into agentTasks[ticketId] from the completion
+ * record the agent's report_completion already writes to S3
+ * (completions/{ticketId}.json — summary/branch/commit_sha/pr_url).
+ *
+ * The completion evidence gate (TEAM-3690, completion.mjs missingEvidenceTickets)
+ * requires agentTasks output/artifactKey, but the only other writer of those
+ * fields — the agent_completion webhook's metadata merge — has no live caller,
+ * so every gated run stranded non-terminal with CompletionRejectedMissingEvidence
+ * (first observed: wf coc7es/TEAM-3611). This closes the loop on the done
+ * cascade itself: runs before completeWorkflow's fresh agentTasks re-read, so
+ * the gate sees it in the same pass.
+ *
+ * Fills only when the entry has no evidence yet (a webhook merge that DID land
+ * wins), and never throws — a missing record (human gates, legacy tickets)
+ * just means the gate won't see harvested evidence for this ticket.
+ */
+async function harvestCompletionEvidence(workflow, ticketId) {
+  if (!ARTIFACT_BUCKET) return;
+  const entry = workflow.agentTasks?.[ticketId];
+  const hasEvidence =
+    (typeof entry?.output === "string" && entry.output.trim().length > 0) ||
+    (typeof entry?.artifactKey === "string" && entry.artifactKey.length > 0);
+  if (hasEvidence) return;
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: `completions/${ticketId}.json`,
+    }));
+    const record = JSON.parse(await res.Body.transformToString());
+    const fields = {};
+    const summary = typeof record.summary === "string" ? record.summary.trim() : "";
+    if (summary) fields.output = summary.slice(0, 10000);
+    if (record.branch) fields.branch = record.branch;
+    if (record.commit_sha) fields.commitSha = record.commit_sha;
+    if (record.pr_url) fields.prUrl = record.pr_url;
+    if (Object.keys(fields).length === 0) return;
+    await store.mergeTaskMetadata(workflow.id, ticketId, fields);
+    if (entry) Object.assign(entry, fields);
+  } catch (err) {
+    console.warn(`[orchestrator] evidence harvest skipped for ${ticketId}: ${err?.message || err}`);
+  }
 }
 
 async function claimTicketInvocation(workflow, ticketId, assignee) {
