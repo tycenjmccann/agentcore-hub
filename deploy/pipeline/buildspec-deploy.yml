@@ -61,6 +61,14 @@ phases:
         IMAGE_DIGEST="$(cat pipeline-out/image-digest.txt)"
         GIT_SHA="$(cat pipeline-out/git-sha.txt)"
         ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
+        # Guard: a blank/malformed digest yields a "${ECR_URI}@" ref that ECS
+        # rejects mid-deploy ("Container.image is incomplete"). Refuse BEFORE
+        # touching prod so nothing needs rolling back (the Build stage should
+        # never emit this, but defend the irreversible step anyway).
+        case "$IMAGE_DIGEST" in
+          sha256:*) : ;;
+          *) echo "FATAL: image-digest.txt is not a sha256 digest ('$IMAGE_DIGEST') — refusing to deploy" >&2; exit 1 ;;
+        esac
         echo "Promoting image ${ECR_URI}@${IMAGE_DIGEST} (built from ${GIT_SHA})"
 
         # ── Snapshot CURRENT prod for rollback BEFORE touching anything ──
