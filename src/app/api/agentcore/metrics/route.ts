@@ -43,6 +43,10 @@ function getCWClient(region: string): CloudWatchClient {
 const metricsCaches = new Map<string, { data: unknown; ts: number }>();
 const CACHE_TTL = 120_000;
 
+// Last result whose span queries completed, kept indefinitely per region.
+// Served when a span query times out so the dashboard never flashes zeros.
+const lastGoodCaches = new Map<string, unknown>();
+
 // Max agents to fetch detailed metrics for (avoids rate limiting)
 const MAX_AGENTS_FOR_METRICS = 20;
 
@@ -105,6 +109,15 @@ export async function GET(req: NextRequest) {
       getSessionStats(agents, region),
     ]);
 
+    // A null span result means the Insights query timed out or failed —
+    // serve the last complete result instead of caching a page of zeros.
+    if (tokensByAgent === null || sessionStats === null) {
+      const lastGood = lastGoodCaches.get(region);
+      if (lastGood) return NextResponse.json(lastGood);
+    }
+    const tokens_ = tokensByAgent ?? {};
+    const stats_ = sessionStats ?? {};
+
     // Build per-agent metrics
     const agentMetrics: AgentMetrics[] = agents.map((agent) => {
       // Match agent to span service name: harnesses use "harness_<name>.<endpoint>", runtimes use "<name>.<endpoint>"
@@ -112,9 +125,9 @@ export async function GET(req: NextRequest) {
         ? `harness_${agent.name}.DEFAULT`
         : `${agent.name}.DEFAULT`;
 
-      const tokens = tokensByAgent[serviceName] || { input: 0, output: 0, calls: 0, models: {} };
+      const tokens = tokens_[serviceName] || { input: 0, output: 0, calls: 0, models: {} };
       const cw = cwMetricsByAgent[agent.id] || { invocations: 0 };
-      const stats = sessionStats[agent.id] || { sessions: 0, totalDurationSec: 0 };
+      const stats = stats_[agent.id] || { sessions: 0, totalDurationSec: 0 };
 
       return {
         id: agent.id,
@@ -135,7 +148,7 @@ export async function GET(req: NextRequest) {
     // (e.g. the coding runtime's per-delegation CLIs) that don't map to a
     // discovered agent — the model split is exactly where those matter.
     const modelTotals: Record<string, { tokensIn: number; tokensOut: number; calls: number }> = {};
-    for (const usage of Object.values(tokensByAgent)) {
+    for (const usage of Object.values(tokens_)) {
       for (const [model, m] of Object.entries(usage.models)) {
         const t = modelTotals[model] || { tokensIn: 0, tokensOut: 0, calls: 0 };
         t.tokensIn += m.input;
@@ -173,9 +186,14 @@ export async function GET(req: NextRequest) {
     };
 
     metricsCaches.set(region, { data: result, ts: Date.now() });
+    if (tokensByAgent !== null && sessionStats !== null) {
+      lastGoodCaches.set(region, result);
+    }
     return NextResponse.json(result);
   } catch (error) {
     console.error("Metrics error:", error);
+    const lastGood = lastGoodCaches.get(region);
+    if (lastGood) return NextResponse.json(lastGood);
     return NextResponse.json({ error: "Failed to fetch metrics" }, { status: 500 });
   }
 }
@@ -214,10 +232,10 @@ interface SvcTokenUsage {
 
 /**
  * Query span log groups for per-agent token usage, broken down by model.
+ * Returns null when the query fails or times out (as opposed to genuinely
+ * matching zero spans) so the caller can fall back to last-good data.
  */
-async function getTokenUsageFromSpans(region: string): Promise<Record<string, SvcTokenUsage>> {
-  const empty: Record<string, SvcTokenUsage> = {};
-
+async function getTokenUsageFromSpans(region: string): Promise<Record<string, SvcTokenUsage> | null> {
   try {
     const client = getLogsClient(region);
     const endTime = Math.floor(Date.now() / 1000);
@@ -247,10 +265,10 @@ async function getTokenUsageFromSpans(region: string): Promise<Record<string, Sv
       })
     );
 
-    if (!startRes.queryId) return empty;
+    if (!startRes.queryId) return null;
 
-    const results = await pollQuery(client, startRes.queryId, 15);
-    if (!results || results.length === 0) return empty;
+    const results = await pollQuery(client, startRes.queryId, 30);
+    if (results === null) return null;
 
     const agents: Record<string, SvcTokenUsage> = {};
 
@@ -277,7 +295,7 @@ async function getTokenUsageFromSpans(region: string): Promise<Record<string, Sv
     return agents;
   } catch (err) {
     console.error("Token spans query error:", err);
-    return empty;
+    return null;
   }
 }
 
@@ -368,7 +386,7 @@ async function getCWMetricsForAgents(
 async function getSessionStats(
   agents: Array<{ id: string; name: string; type: string }>,
   region: string
-): Promise<Record<string, { sessions: number; totalDurationSec: number }>> {
+): Promise<Record<string, { sessions: number; totalDurationSec: number }> | null> {
   const result: Record<string, { sessions: number; totalDurationSec: number }> = {};
   // Initialize all to 0
   for (const agent of agents) result[agent.id] = { sessions: 0, totalDurationSec: 0 };
@@ -394,10 +412,10 @@ async function getSessionStats(
       })
     );
 
-    if (!startRes.queryId) return result;
+    if (!startRes.queryId) return null;
 
-    const rows = await pollQuery(client, startRes.queryId, 15);
-    if (!rows || rows.length === 0) return result;
+    const rows = await pollQuery(client, startRes.queryId, 30);
+    if (rows === null) return null;
 
     // Map service names back to agent IDs
     const svcToAgent = new Map<string, string>();
@@ -419,12 +437,14 @@ async function getSessionStats(
     return result;
   } catch (err) {
     console.error("Session stats from spans error:", err);
-    return result;
+    return null;
   }
 }
 
 /**
  * Poll CloudWatch Logs Insights query until complete.
+ * Returns rows on Complete (possibly []), null on Failed or timeout — callers
+ * use null to fall back to last-good data rather than reporting zeros.
  */
 async function pollQuery(
   client: CloudWatchLogsClient,
@@ -437,9 +457,12 @@ async function pollQuery(
     attempts++;
 
     const res = await client.send(new GetQueryResultsCommand({ queryId }));
-    if (res.status === "Complete" || res.status === "Failed") {
-      if (!res.results || res.results.length === 0) return null;
-      return res.results.map((row) => {
+    if (res.status === "Failed" || res.status === "Cancelled") {
+      console.error(`Insights query ${queryId} ${res.status}`);
+      return null;
+    }
+    if (res.status === "Complete") {
+      return (res.results || []).map((row) => {
         const fields: Record<string, string> = {};
         for (const f of row) {
           if (f.field && f.value) fields[f.field] = f.value;
@@ -448,5 +471,6 @@ async function pollQuery(
       });
     }
   }
+  console.error(`Insights query ${queryId} timed out after ${maxSeconds}s`);
   return null;
 }
