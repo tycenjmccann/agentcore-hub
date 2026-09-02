@@ -1,8 +1,17 @@
 /**
- * GET /api/workflow/[id]/agent-output?agentId=agentcore_hub_frontend_dev
+ * GET /api/workflow/[id]/agent-output?agentId=agentcore_hub_ci_agent
  *
- * Returns ALL text output for a specific agent in a workflow.
- * Streaming chunks: agentcore-hub-events table
+ * Returns per-RUN output for an agent, not one flattened blob. An agent can be
+ * dispatched many times in a workflow (each dispatch = its own ticket: CI here
+ * ran 7×, TEAM-3622/3692/3697/3701/3704/3706/3709). Every streaming chunk is
+ * stamped with its ticketId (runtime main.py:2497), and every run writes its
+ * own completions/{ticketId}.json summary — so runs are fully separable.
+ *
+ * Response:
+ *   runs: [{ ticketId, stream, summary, startedAt, endedAt, chunks }]  ← ascending by startedAt
+ *   output: string   ← legacy: all runs concatenated (back-compat)
+ *
+ * Streaming chunks: agentcore-hub-events table (agent_output / agent.streaming text)
  * Summary: S3 completions/${ticketId}.json (written by report_completion)
  */
 
@@ -22,6 +31,22 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 });
 const s3 = new S3Client({ region: REGION });
 
+interface RawRun {
+  ticketId: string;
+  chunks: string[];
+  startedAt: string; // first chunk timestamp (ISO)
+  endedAt: string; // last chunk timestamp (ISO)
+}
+
+interface AgentRun {
+  ticketId: string;
+  stream: string;
+  summary: string;
+  startedAt: string;
+  endedAt: string;
+  chunks: number;
+}
+
 export async function GET(
   req: NextRequest,
   { params }: { params: { id: string } }
@@ -33,68 +58,97 @@ export async function GET(
     return NextResponse.json({ error: "agentId query param required" }, { status: 400 });
   }
 
-  // Fetch streaming chunks and summary in parallel
-  const [textChunks, summaryText] = await Promise.all([
-    fetchStreamingChunks(workflowId, agentId),
-    fetchSummaryFromS3(workflowId, agentId),
-  ]);
+  const rawRuns = await fetchRunsFromStream(workflowId, agentId);
 
-  // Token-level chunks join directly — text already contains its own formatting
-  const streamedOutput = textChunks.join("");
+  // Fetch each run's own summary in parallel (one S3 object per run ticket).
+  const summaries = await Promise.all(
+    rawRuns.map((r) => fetchSummaryFromS3(r.ticketId))
+  );
 
-  // Always prefer S3 summary (clean markdown) over inline stream summary (garbled from buffering).
-  // If stream contains a "## Summary" section, strip it and use S3 version instead.
-  let cleanStream = streamedOutput;
-  if (summaryText) {
-    // Remove any inline summary the agent wrote (it's garbled from buffer concatenation)
-    const summaryMatch = cleanStream.match(/\n*#{1,3}\s*Summary[\s\S]*$/);
-    if (summaryMatch && summaryMatch.index !== undefined) {
-      cleanStream = cleanStream.slice(0, summaryMatch.index).trimEnd();
+  const runs: AgentRun[] = rawRuns.map((r, i) => {
+    const streamedOutput = r.chunks.join("");
+    const summary = summaries[i];
+
+    // The clean S3 summary supersedes any inline "## Summary" the agent streamed
+    // (the streamed one is garbled by buffer concatenation) — strip it from the stream.
+    let cleanStream = streamedOutput;
+    if (summary) {
+      const m = cleanStream.match(/\n*#{1,3}\s*Summary[\s\S]*$/);
+      if (m && m.index !== undefined) cleanStream = cleanStream.slice(0, m.index).trimEnd();
     }
-  }
 
-  const fullOutput = cleanStream && summaryText
-    ? cleanStream + "\n\n---\n\n## Summary\n\n" + summaryText
-    : cleanStream || summaryText;
-
-  return NextResponse.json({
-    agentId,
-    workflowId,
-    output: fullOutput,
-    chunks: textChunks.length,
-  }, {
-    headers: { "Cache-Control": "no-store" },
+    return {
+      ticketId: r.ticketId,
+      stream: cleanStream,
+      summary,
+      startedAt: r.startedAt,
+      endedAt: r.endedAt,
+      chunks: r.chunks.length,
+    };
   });
+
+  // Legacy single-string output: runs concatenated with clear separators, so any
+  // older consumer still shows everything (just without the per-run affordances).
+  const output = runs
+    .map((r) => {
+      const head = r.stream || "";
+      const tail = r.summary ? `\n\n---\n\n## Summary\n\n${r.summary}` : "";
+      return (head + tail).trim();
+    })
+    .filter(Boolean)
+    .join("\n\n---\n\n");
+
+  return NextResponse.json(
+    { agentId, workflowId, runs, output, chunks: runs.reduce((n, r) => n + r.chunks, 0) },
+    { headers: { "Cache-Control": "no-store" } }
+  );
 }
 
-async function fetchStreamingChunks(workflowId: string, agentId: string): Promise<string[]> {
-  const textChunks: string[] = [];
-  let lastKey: Record<string, unknown> | undefined;
+/** Walk the events table once, bucketing this agent's text chunks by the
+ *  ticketId stamped on each event. Runs are ordered by first-chunk time. */
+async function fetchRunsFromStream(workflowId: string, agentId: string): Promise<RawRun[]> {
+  const byTicket = new Map<string, RawRun>();
+  // Chunks with no ticketId (older events) collapse into one implicit run so
+  // nothing is dropped; keyed by "" and sorted first.
+  const push = (ticketId: string, chunk: string, ts: string) => {
+    if (!chunk) return;
+    let run = byTicket.get(ticketId);
+    if (!run) {
+      run = { ticketId, chunks: [], startedAt: ts, endedAt: ts };
+      byTicket.set(ticketId, run);
+    }
+    run.chunks.push(chunk);
+    if (ts && ts < run.startedAt) run.startedAt = ts;
+    if (ts && ts > run.endedAt) run.endedAt = ts;
+  };
 
+  let lastKey: Record<string, unknown> | undefined;
   do {
-    const result = await ddb.send(new QueryCommand({
-      TableName: EVENTS_TABLE,
-      KeyConditionExpression: "workflowId = :wid",
-      ExpressionAttributeValues: { ":wid": workflowId },
-      ScanIndexForward: true,
-      ExclusiveStartKey: lastKey,
-    }));
+    const result = await ddb.send(
+      new QueryCommand({
+        TableName: EVENTS_TABLE,
+        KeyConditionExpression: "workflowId = :wid",
+        ExpressionAttributeValues: { ":wid": workflowId },
+        ScanIndexForward: true,
+        ExclusiveStartKey: lastKey,
+      })
+    );
 
     for (const item of result.Items || []) {
       const eventType = item.type as string;
-      const itemAgentId = item.agentId as string | undefined;
+      const ts = (item.timestamp as string) || "";
 
-      if (eventType === "agent_output" && itemAgentId === agentId) {
-        const chunk = item.chunk as string;
-        if (chunk) textChunks.push(chunk);
+      // Current format: top-level agent_output row
+      if (eventType === "agent_output" && (item.agentId as string) === agentId) {
+        push((item.ticketId as string) || "", item.chunk as string, ts);
+        continue;
       }
 
-      // Legacy format
-      if (eventType === "agent.streaming" && !itemAgentId) {
+      // agent.streaming text (the live pipeline format) — ticketId is in detail
+      if (eventType === "agent.streaming") {
         const detail = (item.detail || {}) as Record<string, unknown>;
         if (detail.agentId === agentId && detail.type === "text") {
-          const content = detail.content as string;
-          if (content) textChunks.push(content);
+          push((detail.ticketId as string) || "", detail.content as string, ts);
         }
       }
     }
@@ -102,47 +156,20 @@ async function fetchStreamingChunks(workflowId: string, agentId: string): Promis
     lastKey = result.LastEvaluatedKey;
   } while (lastKey);
 
-  return textChunks;
+  return [...byTicket.values()].sort((a, b) => a.startedAt.localeCompare(b.startedAt));
 }
 
-async function fetchSummaryFromS3(workflowId: string, agentId: string): Promise<string> {
+async function fetchSummaryFromS3(ticketId: string): Promise<string> {
+  if (!ticketId || !BUCKET) return "";
   try {
-    // Get ticket IDs for this agent from the workflow state (agentTasks map)
-    const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
-    const wfResult = await ddb.send(new QueryCommand({
-      TableName: WORKFLOWS_TABLE,
-      KeyConditionExpression: "workflowId = :wid",
-      ExpressionAttributeValues: { ":wid": workflowId },
-    }));
-
-    const workflow = wfResult.Items?.[0];
-    if (!workflow) return "";
-
-    const agentTasks = (workflow.agentTasks || {}) as Record<string, { agentId?: string }>;
-    const ticketIds = Object.entries(agentTasks)
-      .filter(([, task]) => task.agentId === agentId)
-      .map(([ticketId]) => ticketId);
-
-    if (ticketIds.length === 0) return "";
-
-    // Read completion report from S3 (try each ticket — agent may have multiple)
-    for (const ticketId of ticketIds) {
-      try {
-        const obj = await s3.send(new GetObjectCommand({
-          Bucket: BUCKET,
-          Key: `completions/${ticketId}.json`,
-        }));
-        const body = await obj.Body?.transformToString();
-        if (body) {
-          const report = JSON.parse(body);
-          if (report.summary) return report.summary;
-        }
-      } catch {
-        // No completion file for this ticket — try next
-      }
-    }
-    return "";
+    const obj = await s3.send(
+      new GetObjectCommand({ Bucket: BUCKET, Key: `completions/${ticketId}.json` })
+    );
+    const body = await obj.Body?.transformToString();
+    if (!body) return "";
+    const report = JSON.parse(body);
+    return report.summary || "";
   } catch {
-    return "";
+    return ""; // no completion file for this run (e.g. still running)
   }
 }

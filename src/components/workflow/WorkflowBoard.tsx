@@ -5,6 +5,7 @@ import type {
   WorkflowState,
   WorkflowEvent,
   TicketStatus,
+  AgentRun,
 } from "@/lib/workflow/types";
 import awsIcons from "@/lib/aws-icons.json";
 import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePhaseConfig } from "@/lib/pipeline-config";
@@ -18,7 +19,7 @@ import CancelConfirmationModal from "./CancelConfirmationModal";
 import TicketStatusBadge from "./TicketStatusBadge";
 import TicketDetailModal from "./TicketDetailModal";
 import WorkflowManagerPanel from "./WorkflowManagerPanel";
-import { useWorkflowStream } from "./useWorkflowStream";
+import { useWorkflowStream, runKey } from "./useWorkflowStream";
 
 interface WorkflowBoardProps {
   workflowId: string;
@@ -115,6 +116,9 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   const [expandedAgent, setExpandedAgent] = useState<string | null>(null);
   // Full agent output fetched directly from DDB (independent of replay scrubber)
   const [agentFullOutput, setAgentFullOutput] = useState<Record<string, string>>({});
+  // Per-run output (agentId → runs[]), so a multi-dispatch agent (e.g. CI ran 7×)
+  // shows one card per run instead of one flattened blob.
+  const [agentRuns, setAgentRuns] = useState<Record<string, AgentRun[]>>({});
   // Tool flash state: maps "phaseId:iconKey" to a timeout so items flash when tools fire
   const [toolFlashes, setToolFlashes] = useState<Record<string, boolean>>({});
   const toolFlashTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
@@ -262,7 +266,10 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                   if (task.agentId && task.status === "complete") {
                     fetch(`/api/workflow/${workflowId}/agent-output?agentId=${task.agentId}`)
                       .then((r) => r.json())
-                      .then((d) => { if (d.output) setAgentFullOutput((prev) => ({ ...prev, [task.agentId!]: d.output })); })
+                      .then((d) => {
+                        if (d.output) setAgentFullOutput((prev) => ({ ...prev, [task.agentId!]: d.output }));
+                        if (d.runs) setAgentRuns((prev) => ({ ...prev, [task.agentId!]: d.runs }));
+                      })
                       .catch(() => {});
                   }
                 }
@@ -406,9 +413,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
       fetch(`/api/workflow/${workflowId}/agent-output?agentId=${expandedAgent}`)
         .then((r) => r.json())
         .then((d) => {
-          if (d.output) {
-            setAgentFullOutput((prev) => ({ ...prev, [expandedAgent]: d.output }));
-          }
+          if (d.output) setAgentFullOutput((prev) => ({ ...prev, [expandedAgent]: d.output }));
+          if (d.runs) setAgentRuns((prev) => ({ ...prev, [expandedAgent]: d.runs }));
         })
         .catch(() => {});
     };
@@ -1444,9 +1450,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                                   fetch(`/api/workflow/${workflowId}/agent-output?agentId=${targetAgent}`)
                                     .then((r) => r.json())
                                     .then((data) => {
-                                      if (data.output) {
-                                        setAgentFullOutput((prev) => ({ ...prev, [targetAgent]: data.output }));
-                                      }
+                                      if (data.output) setAgentFullOutput((prev) => ({ ...prev, [targetAgent]: data.output }));
+                                      if (data.runs) setAgentRuns((prev) => ({ ...prev, [targetAgent]: data.runs }));
                                     })
                                     .catch(() => {});
                                 }
@@ -1493,7 +1498,10 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                                         setExpandedAgent(agent.agentId);
                                         fetch(`/api/workflow/${workflowId}/agent-output?agentId=${agent.agentId}`)
                                           .then((r) => r.json())
-                                          .then((data) => { if (data.output) setAgentFullOutput((prev) => ({ ...prev, [agent.agentId]: data.output })); })
+                                          .then((data) => {
+                                            if (data.output) setAgentFullOutput((prev) => ({ ...prev, [agent.agentId]: data.output }));
+                                            if (data.runs) setAgentRuns((prev) => ({ ...prev, [agent.agentId]: data.runs }));
+                                          })
                                           .catch(() => {});
                                       }
                                     }
@@ -1622,6 +1630,31 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             }
             lastActivityRef.current = Date.now();
           }}
+          runs={expandedAgent ? (() => {
+            const agentTask = Object.values(state.agentTasks).find((t) => t.agentId === expandedAgent);
+            const currentTicketId = agentTask?.ticketId || "";
+            const serverRuns = agentRuns[expandedAgent] || [];
+            // Merge live SSE text onto the matching run (server poll lags a few seconds).
+            const merged: AgentRun[] = serverRuns.map((r) => {
+              const live = streamingText[runKey(expandedAgent, r.ticketId)] || "";
+              return live.length > r.stream.length ? { ...r, stream: live } : r;
+            });
+            // A just-started run may have no server row yet — synthesize it from live text
+            // (or the legacy single-blob fallbacks) so nothing is invisible.
+            if (currentTicketId && !merged.some((r) => r.ticketId === currentTicketId)) {
+              const live = streamingText[runKey(expandedAgent, currentTicketId)] || "";
+              const fallback = live
+                || agentFullOutput[expandedAgent]
+                || agentTask?.output
+                || originalOutputsRef.current[expandedAgent]
+                || "";
+              if (fallback) {
+                merged.push({ ticketId: currentTicketId, stream: fallback, summary: "", startedAt: "", endedAt: "", chunks: 0 });
+              }
+            }
+            return merged;
+          })() : []}
+          currentTicketId={expandedAgent ? (Object.values(state.agentTasks).find((t) => t.agentId === expandedAgent)?.ticketId || "") : ""}
           task={expandedAgent ? {
             id: `task_${expandedAgent}`,
             agentId: expandedAgent,
@@ -1631,7 +1664,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             output: (() => {
               const agentTask = Object.values(state.agentTasks).find((t) => t.agentId === expandedAgent);
               const isRunning = agentTask?.status === "running" || agentTask?.status === "waiting_response";
-              const live = streamingText[expandedAgent] || "";
+              const live = streamingText[runKey(expandedAgent, agentTask?.ticketId)] || streamingText[expandedAgent] || "";
               const polled = agentFullOutput[expandedAgent] || "";
               // For running agents, prefer whichever is longer (live SSE vs polled full output)
               if (isRunning) return live.length >= polled.length ? live : polled;

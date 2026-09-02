@@ -2,13 +2,17 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { X, AlertCircle, FileText, TerminalSquare, Send } from "lucide-react";
-import type { AgentTask } from "@/lib/workflow/types";
+import { X, AlertCircle, FileText, TerminalSquare, Send, ChevronRight } from "lucide-react";
+import type { AgentTask, AgentRun } from "@/lib/workflow/types";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import "./pipeline.css";
 
 interface AgentOutputPanelProps {
   task: AgentTask | null;
+  /** Per-run output (newest handling done in-panel). One card per dispatch. */
+  runs?: AgentRun[];
+  /** Ticket id of the run that is currently live (auto-expanded, marked "Working"). */
+  currentTicketId?: string;
   isOpen: boolean;
   onClose: () => void;
   isLoading?: boolean;
@@ -20,6 +24,20 @@ interface AgentOutputPanelProps {
   lastActivityTime?: number; // Date.now() timestamp of last streaming activity
   staleThreshold?: number; // ms — threshold for stale detection (720_000 or 180_000)
   onRestart?: () => void;
+}
+
+/** Insert paragraph breaks between statements jammed together by buffer
+ *  concatenation (e.g. "...implementation:Let me" → two paragraphs). */
+function unjam(text: string): string {
+  return text.replace(/(:)([A-Z])/g, "$1\n\n$2");
+}
+
+function fmtClock(iso: string): string {
+  if (!iso) return "";
+  // Timestamps are "YYYY-MM-DDTHH:MM:SS.nnnnZ" (UTC) — show HH:MM local.
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 /** Remote coding sessions leave a footer in the agent's output:
@@ -50,8 +68,75 @@ function formatAgentName(agentId: string): string {
     .join(" ");
 }
 
+/** One collapsible card = one dispatch of the agent. Its own streamed text +
+ *  its own summary, so re-runs never bleed into each other. */
+function RunCard({
+  run,
+  index,
+  total,
+  isCurrent,
+  defaultOpen,
+}: {
+  run: AgentRun;
+  index: number; // 1-based, in chronological order
+  total: number;
+  isCurrent: boolean;
+  defaultOpen: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  // Keep the live run expanded as it streams even if props re-mount.
+  useEffect(() => {
+    if (isCurrent) setOpen(true);
+  }, [isCurrent]);
+
+  const stream = run.stream ? unjam(run.stream) : "";
+  const started = fmtClock(run.startedAt);
+
+  return (
+    <div className={`run-card ${isCurrent ? "run-card-live" : ""}`}>
+      <button
+        type="button"
+        className="run-card-header"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
+        <ChevronRight size={14} className={`run-card-chevron ${open ? "open" : ""}`} aria-hidden="true" />
+        <span className="run-card-index">Run {index}<span className="run-card-of">/{total}</span></span>
+        {run.ticketId && <span className="run-card-ticket">{run.ticketId}</span>}
+        <span className={`run-card-badge ${isCurrent ? "live" : "done"}`}>
+          {isCurrent ? "Working" : "Done"}
+        </span>
+        <span className="run-card-spacer" />
+        {started && <span className="run-card-time">{started}</span>}
+      </button>
+      {open && (
+        <div className="run-card-body">
+          {stream && (
+            <div className="run-card-stream">
+              <MarkdownRenderer content={stream} />
+            </div>
+          )}
+          {run.summary && (
+            <div className="run-card-summary">
+              <div className="run-card-summary-label">Summary</div>
+              <MarkdownRenderer content={run.summary} />
+            </div>
+          )}
+          {!stream && !run.summary && (
+            <div className="run-card-empty">
+              {isCurrent ? "Waiting for output…" : "No output recorded for this run."}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function AgentOutputPanel({
   task,
+  runs = [],
+  currentTicketId = "",
   isOpen,
   onClose,
   isLoading,
@@ -376,54 +461,30 @@ export default function AgentOutputPanel({
               </div>
             </div>
           )}
-          {task?.output ? (
-            <>
-              {(() => {
-                // Try our explicit divider first (new format)
-                const SUMMARY_DIVIDER = "\n\n---\n\n## Summary\n\n";
-                let dividerIdx = task.output.indexOf(SUMMARY_DIVIDER);
-                let dividerLen = SUMMARY_DIVIDER.length;
-
-                // Fallback: detect "## Summary" in raw concatenated text (old format)
-                if (dividerIdx === -1) {
-                  const fallbackMatch = task.output.match(/(:|\.)?\s*#{1,3}\s*Summary\s*\n?/);
-                  if (fallbackMatch && fallbackMatch.index !== undefined) {
-                    dividerIdx = fallbackMatch.index;
-                    dividerLen = fallbackMatch[0].length;
-                  }
-                }
-
-                if (dividerIdx === -1) {
-                  // Insert paragraph breaks between jammed statements (e.g. "...implementation:Let me")
-                  const cleaned = task.output.replace(/(:)([A-Z])/g, "$1\n\n$2");
-                  return <MarkdownRenderer content={cleaned} />;
-                }
-
-                // Insert paragraph breaks in the stream portion only
-                const rawStream = task.output.slice(0, dividerIdx);
-                const streamPart = rawStream.replace(/(:)([A-Z])/g, "$1\n\n$2");
-                const summaryPart = task.output.slice(dividerIdx + dividerLen);
-                return (
-                  <>
-                    {streamPart && <MarkdownRenderer content={streamPart} />}
-                    <div ref={summaryRef} className="mt-4 pt-4 border-t border-[var(--pipeline-border)]">
-                      <h3 className="text-lg font-semibold text-[var(--pipeline-text)] mb-2">Summary</h3>
-                      <MarkdownRenderer content={summaryPart} />
-                    </div>
-                  </>
-                );
-              })()}
-              {isRunning && (
-                <div className="streaming-indicator" aria-hidden="true">
-                  <span className="streaming-cursor" />
-                  <span className="streaming-dots">
-                    <span className="streaming-dot" />
-                    <span className="streaming-dot" />
-                    <span className="streaming-dot" />
-                  </span>
+          {runs.length > 0 ? (
+            <div className="run-list">
+              {runs.length > 1 && (
+                <div className="run-list-caption">
+                  {runs.length} runs · newest first
                 </div>
               )}
-            </>
+              {/* Newest on top. The run matching the live ticket (while the agent
+                  is running) is the current one — auto-expanded and badged Working. */}
+              {[...runs].reverse().map((run, revIdx) => {
+                const chronoIndex = runs.length - revIdx; // 1-based chronological
+                const isCurrent = isRunning && !!currentTicketId && run.ticketId === currentTicketId;
+                return (
+                  <RunCard
+                    key={run.ticketId || `run-${chronoIndex}`}
+                    run={run}
+                    index={chronoIndex}
+                    total={runs.length}
+                    isCurrent={isCurrent}
+                    defaultOpen={isCurrent || revIdx === 0}
+                  />
+                );
+              })}
+            </div>
           ) : isRunning ? (
             <div className="flex flex-col items-center justify-center h-48 text-center">
               <div className="streaming-indicator" aria-hidden="true">
