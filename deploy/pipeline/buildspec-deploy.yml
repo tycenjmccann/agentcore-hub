@@ -95,9 +95,14 @@ phases:
         trap 'rc=$?; if [ $rc -ne 0 ]; then echo "── deploy failed (rc=$rc) → rolling back ──"; bash deploy/pipeline/rollback.sh || echo "rollback errored — inspect"; fi; exit $rc' EXIT
 
         # ── Target 1: orchestrator Lambda — CODE ONLY (prebuilt zip) ──
+        # update-function-code echoes the FULL function config, incl. plaintext
+        # env vars (JIRA_API_TOKEN, GITHUB_PAT) → CloudWatch. Suppress stdout so
+        # those secrets never land in the build log (pilot run b6cdd247 leaked
+        # them). --output text --query keeps only the state we assert on.
         echo "Target 1/3 orchestrator Lambda code-only"
         aws lambda update-function-code --function-name agentcore-hub-orchestrator \
-          --zip-file fileb://pipeline-out/orchestrator.zip --region "$AWS_REGION_HUB"
+          --zip-file fileb://pipeline-out/orchestrator.zip --region "$AWS_REGION_HUB" \
+          --output text --query 'LastUpdateStatus' >/dev/null
         aws lambda wait function-updated --function-name agentcore-hub-orchestrator --region "$AWS_REGION_HUB"
 
         # ── Target 2: config/blueprints → S3 (agents.json MERGED, never cp'd) ──

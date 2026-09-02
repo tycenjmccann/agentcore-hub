@@ -509,6 +509,21 @@ function grantDeployPerms(
         : [`arn:aws:ecs:${ctx.region}:${ctx.account}:service/*`],
     })
   );
+  // UpdateExpressGatewayService registers a new task-definition revision under
+  // the hood when the primary-container image changes (pilot run b6cdd247 failed
+  // Target 3 on the missing ecs:RegisterTaskDefinition). RegisterTaskDefinition
+  // does NOT support resource-level permissions in IAM — it must be "*". This is
+  // still narrow: no run/create/delete-service, no cluster mutation.
+  statements.push(
+    new iam.PolicyStatement({
+      sid: "EcsRegisterTaskDef",
+      actions: [
+        "ecs:RegisterTaskDefinition",
+        "ecs:DescribeTaskDefinition",
+      ],
+      resources: ["*"],
+    })
+  );
   // PassRole ONLY for the two ECS roles the roll needs — never a wildcard.
   statements.push(
     new iam.PolicyStatement({
