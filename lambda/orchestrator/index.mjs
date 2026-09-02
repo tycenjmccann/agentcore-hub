@@ -54,10 +54,14 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 const GITHUB_LAMBDA = process.env.GITHUB_LAMBDA || "agentcore-hub-github-mcp";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const MAX_QA_RETRIES = 3;
-// Dead-session detector rollout flag (TEAM-3618 D1.2): off = skip the sweep,
-// shadow (default) = observe + metrics + shadow-flagged events but ZERO writes,
-// enforce = steal/retry/escalate for real.
-const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
+// Dead-session detector rollout flag (TEAM-3618 D1.2; promoted to enforce by
+// default in TEAM-3748 D4.1): off = skip the sweep, shadow = observe + metrics
+// + shadow-flagged events but ZERO writes, enforce (the NEW DEFAULT — the
+// silent-death watchdog now recovers for real) = steal/retry/escalate. The
+// fail-safe coercion still holds: runSweep normalizes (trim+lowercase) and
+// coerces anything not exactly off|shadow|enforce back to shadow, so a typo in
+// the env var can only ever DOWNGRADE to observe-only, never grant a rogue mode.
+const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "enforce";
 // Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b; tri-state as of
 // TEAM-3747 D1). off = the cascade only re-Readies {blocked, todo} dependents
 // (commit-4a behavior); shadow (the NEW DEFAULT — ships dark-but-observing) =
@@ -979,6 +983,64 @@ async function attachPackageToTicket(ticketId, pkg) {
 }
 
 /**
+ * Best-effort PR url for the change set under review (TEAM-3748 D3). The gate
+ * ticket's own field wins; otherwise a prUrl harvested onto a reviewed-upstream
+ * task entry (harvestCompletionEvidence stashes record.pr_url there), then any
+ * task entry in the run. Returns "" when no PR is known — the caller then leaves
+ * the change set unresolved and the diff-scoped gate stays inert (legacy path).
+ */
+function resolvePrUrlForReview(workflow, gateTicket, upstream) {
+  const direct =
+    gateTicket.prUrl || gateTicket.metadata?.prUrl ||
+    gateTicket.pr_url || gateTicket.metadata?.pr_url;
+  if (typeof direct === "string" && direct) return direct;
+  const tasks = workflow?.agentTasks || {};
+  const upIds = new Set((upstream || []).map((u) => u.ticketId));
+  // Prefer a reviewed-upstream ticket's PR, then fall back to any task's PR.
+  for (const preferUpstream of [true, false]) {
+    for (const [tid, entry] of Object.entries(tasks)) {
+      if (preferUpstream !== upIds.has(tid)) continue;
+      if (entry && typeof entry.prUrl === "string" && entry.prUrl) return entry.prUrl;
+    }
+  }
+  return "";
+}
+
+/**
+ * Compute the PR's change set — the `--name-status`-equivalent file list the
+ * diff-scoped ship review scopes against (TEAM-3748 D3, FR-D3.1). This is the
+ * "gate plumbing" release-manager.md Step 4 waits on: it lets the deterministic
+ * enforceDiffScope activate so review is scoped to what the PR actually changed
+ * instead of the whole assembled repo.
+ *
+ * FAIL-OPEN by contract (R4): a missing/unrecognized PR url or ANY GitHub error
+ * returns null. A null change set is passed to enforce as undefined, which keeps
+ * enforceDiffScope inert and the rework loop byte-identical to its pre-guard
+ * behavior — the diff-scope gate must never be able to WEDGE a review, only
+ * narrow it when the diff is knowable. Renames contribute BOTH paths, matching
+ * enforceDiffScope's rename handling.
+ */
+async function computeReviewChangeSet(prUrl) {
+  const m = String(prUrl || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  if (!m) return null;
+  const [, owner, repo, number] = m;
+  try {
+    const files = await callGitHub("list_pr_files", { owner, repo, pull_number: Number(number) });
+    if (!Array.isArray(files) || files.length === 0) return null;
+    const paths = [];
+    for (const f of files) {
+      if (typeof f?.filename === "string" && f.filename) paths.push(f.filename);
+      // A rename cites both endpoints; enforceDiffScope treats each as in-diff.
+      if (typeof f?.previous_filename === "string" && f.previous_filename) paths.push(f.previous_filename);
+    }
+    return paths.length ? paths : null;
+  } catch (err) {
+    console.warn(`[orchestrator] change-set fetch skipped for ${prUrl}: ${err?.message || err}`);
+    return null;
+  }
+}
+
+/**
  * A human "requested changes" on a review-gate ticket (moved it to blocked).
  * Look up the gate's config for the run; if onReject is "rework", re-open the
  * upstream agent tickets this gate reviewed (its blockedBy) so the agents redo
@@ -1047,16 +1109,25 @@ export async function handleReviewRejection(gateTicket) {
   // so it is normally absent and every rejection is therefore its own round.
   // When a provider does carry it, re-reviewing the same SHA reuses that round.
   //
-  // Diff-scoped gate (TEAM-3689, release-manager.md Step 4): changeSet is the
-  // PR's --name-status file list and reviewFindings are the reviewer's classified
-  // findings (each with its cited files). Both are best-effort like
-  // reviewedHeadSha — normally absent, because the orchestrator does not compute
-  // the diff, in which case the guard is inert and behavior is byte-identical.
-  // When a provider does carry them, review-cap downgrades out-of-diff findings
-  // and reports `gated: false` for a rejection whose findings are ALL out-of-diff,
-  // which must neither count toward the cap nor re-open upstream work.
-  const changeSet = gateTicket.changeSet || gateTicket.metadata?.changeSet || null;
+  // Diff-scoped gate (TEAM-3689 scaffolding, activated by TEAM-3748 D3): changeSet
+  // is the PR's file list and reviewFindings are the reviewer's classified findings
+  // (each with its cited files). changeSet comes off the gate ticket if a provider
+  // forwarded it, ELSE the orchestrator computes it from the PR diff below (D3);
+  // reviewFindings are still best-effort like reviewedHeadSha. When BOTH are known,
+  // review-cap downgrades out-of-diff findings and reports `gated: false` for a
+  // rejection whose findings are ALL out-of-diff, which must neither count toward
+  // the cap nor re-open upstream work. Absent either input the guard stays inert
+  // and behavior is byte-identical to before (R4).
+  let changeSet = gateTicket.changeSet || gateTicket.metadata?.changeSet || null;
   const reviewFindings = gateTicket.reviewFindings || gateTicket.metadata?.reviewFindings || null;
+  // D3 (TEAM-3748, FR-D3.1): when the event carries no change set, compute it
+  // from the PR diff so review is scoped to what the PR changed rather than the
+  // whole assembled repo. Fail-open — no PR / GitHub error leaves changeSet null,
+  // which keeps enforceDiffScope inert and the loop byte-identical to legacy (R4).
+  if (!Array.isArray(changeSet)) {
+    const prUrl = resolvePrUrlForReview(workflow, gateTicket, upstream);
+    changeSet = (prUrl && (await computeReviewChangeSet(prUrl))) || null;
+  }
   const capResult = await getReviewCap().enforce({
     workflow,
     gateTicket,
@@ -2903,6 +2974,23 @@ async function callGitHub(toolName, args) {
         }
         throw err;
       }
+    }
+    if (toolName === "list_pr_files") {
+      // The PR's changed-file list (TEAM-3748 D3): what the diff-scoped ship
+      // review scopes against. Paginate — files come 100/page — but cap the walk
+      // so a pathological PR can't spin the Lambda; the change set is a scoping
+      // hint, not an audit, and any short read just fails open at the caller.
+      const { owner, repo, pull_number } = args;
+      const files = [];
+      for (let page = 1; page <= 30; page++) {
+        const batch = await githubApi(
+          `/repos/${owner}/${repo}/pulls/${pull_number}/files?per_page=100&page=${page}`
+        );
+        if (!Array.isArray(batch) || batch.length === 0) break;
+        files.push(...batch);
+        if (batch.length < 100) break;
+      }
+      return files;
     }
   }
   // Legacy fallback: proxy through the github-mcp Lambda if an install has one.

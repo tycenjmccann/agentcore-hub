@@ -41,6 +41,17 @@ export default defineConfig({
       // dependency-injected (stub ddb/store/lease + fake clock), so its
       // guard/trigger/retry/escalate logic is unit-testable with no AWS.
       "lambda/orchestrator/dead-session-detector.test.mjs",
+      // detector-mode-default (TEAM-3748 D4) — the index.mjs sweep-dispatch
+      // default flip: DEAD_SESSION_DETECTOR_MODE now coalesces to "enforce" when
+      // unset (was shadow). Drives the real handler with the sweep sentinel and
+      // a mocked detector to observe the exact mode forwarded to runSweep.
+      "lambda/orchestrator/detector-mode-default.test.mjs",
+      // agent-invoker-retry (TEAM-3748 D4.2) — bounded transient-5xx retry at the
+      // invoke boundary + the D4.3 publishAgentEvent dual-write. Drives the real
+      // agent-invoker handler through the harness path with the AgentCore client
+      // mocked to throw controlled errors; classification + escalation + the
+      // EventBridge/EVENTS_TABLE dual-write are all exercised end-to-end.
+      "lambda/orchestrator/agent-invoker-retry.test.mjs",
       // cascade.mjs (TEAM-3618 D3) — the shared unblock cascade behind both
       // "ticket done" paths. Fully dependency-injected (stub ddb/provider/event
       // publisher + fake clock), so the union + extended-state logic is
@@ -87,6 +98,12 @@ export default defineConfig({
       // asserts each closes on an honest terminal outcome instead. Same harness
       // as completion-gates: index.mjs real, AWS/store seams mocked.
       "lambda/orchestrator/replay-d2.test.mjs",
+      // replay-d3 (TEAM-3748 D3, AC-D3.1) — the ztc61f ship review that never
+      // converges, replayed through the REAL review-cap via handleReviewRejection
+      // (review-cap.mjs unmocked; only AWS/store seams stubbed). The inverse of
+      // replay-d1/d2: asserts 3 in-diff CHANGES-NEEDED rounds STOP the loop —
+      // cap-reached fires once, the upstream re-open is suppressed, no round 4.
+      "lambda/orchestrator/replay-d3.test.mjs",
       // agentcore-hub-tickets create_ticket (TEAM-3619 D4c) — the spawnedBy/phase
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.

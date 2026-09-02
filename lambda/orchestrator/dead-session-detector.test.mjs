@@ -106,6 +106,29 @@ function makeWorkflow(extra = {}) {
 
 const eventsOfType = (fn, type) => fn.mock.calls.filter((c) => c[1] === type);
 
+/**
+ * Run `fn` while capturing the single EMF record emitMetrics() writes to
+ * console.log (the injected `log` is a no-op, so emitMetrics is the only thing
+ * that reaches console.log). Returns { result, emf } — emf is the parsed EMF
+ * object (the one carrying the `_aws` block), or null if none was emitted.
+ */
+async function captureEmf(fn) {
+  const orig = console.log;
+  const lines = [];
+  console.log = (...args) => { if (typeof args[0] === "string") lines.push(args[0]); };
+  let result;
+  try {
+    result = await fn();
+  } finally {
+    console.log = orig;
+  }
+  let emf = null;
+  for (const l of lines) {
+    if (l.includes('"_aws"')) { try { emf = JSON.parse(l); } catch { /* not the EMF line */ } }
+  }
+  return { result, emf };
+}
+
 beforeEach(() => vi.clearAllMocks());
 
 describe("live-lease guard (HARD INVARIANT)", () => {
@@ -803,4 +826,146 @@ describe("mode normalization (TEAM-3683 F5)", () => {
       expect(obs[0][2].shadow).toBe(true);
     }
   );
+});
+
+describe("AC-D4.1 — hung tool-call death classification", () => {
+  it('streamed_then_silent: a session that heartbeat AFTER its claim start then went silent fires ONCE, auto-retries, and tags the hung-tool-call class', async () => {
+    // A heartbeat 2h after the 00:00 claim start, then 10h of silence (>> the
+    // 60min fallback threshold): the mid-turn-hang / hung-tool-call class.
+    const streamedActivity = "2026-09-01T02:00:00Z";
+    const { deps, store, lease } = makeDeps();
+    lease.lastAgentActivity.mockResolvedValue(streamedActivity); // guard 1 AND the pre-steal re-check
+    // isLeaseLive stays false (default): 10h silence is well past the TTL.
+    const { runSweep } = createDetector(deps);
+
+    const { result: m, emf } = await captureEmf(() => runSweep("enforce"));
+
+    // Exactly one agent.error, then a single auto-retry (priorRetries 0).
+    const errs = eventsOfType(deps.publishEvent, "agent.error");
+    expect(errs).toHaveLength(1);
+    expect(errs[0][2].reason).toBe("dead_session");
+    expect(errs[0][2].detectorMeta.deathClass).toBe("streamed_then_silent");
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledTimes(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+
+    // Metric surface: fired=1, retries=1, and the new hung-tool-call tag.
+    expect(m.fired).toBe(1);
+    expect(m.retries).toBe(1);
+    expect(m.hungToolCalls).toBe(1);
+    expect(emf).toBeTruthy();
+    expect(emf.DetectorFired).toBe(1);
+    expect(emf.DetectorRetries).toBe(1);
+    expect(emf.DetectorHungToolCalls).toBe(1);
+    // The metric is declared in the EMF metric directive too, not just as a field.
+    const declared = emf._aws.CloudWatchMetrics[0].Metrics.map((x) => x.Name);
+    expect(declared).toContain("DetectorHungToolCalls");
+  });
+
+  it('silent_since_start: a claim that never heartbeat past its start fires but is NOT counted as a hung tool-call', async () => {
+    // Default lastAgentActivity → null: no heartbeat ever cleared the claim start.
+    const { deps, store } = makeDeps();
+    const { runSweep } = createDetector(deps);
+
+    const { result: m, emf } = await captureEmf(() => runSweep("enforce"));
+
+    const errs = eventsOfType(deps.publishEvent, "agent.error");
+    expect(errs).toHaveLength(1);
+    expect(errs[0][2].detectorMeta.deathClass).toBe("silent_since_start");
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledTimes(1);
+    expect(m.fired).toBe(1);
+    expect(m.retries).toBe(1);
+    expect(m.hungToolCalls).toBe(0);
+    expect(emf.DetectorHungToolCalls).toBe(0);
+  });
+});
+
+describe("AC-D4.3 — slow-but-alive is never stolen", () => {
+  it("a heartbeat within the lease TTL (live lease) skips recovery: DetectorSkippedLiveLease++, zero steal, zero agent.error, zero retry", async () => {
+    const { deps, store, lease } = makeDeps();
+    // A fresh heartbeat 1min ago — well within the 30min TTL: slow, not dead.
+    lease.lastAgentActivity.mockResolvedValue(new Date(NOW - 60 * 1000).toISOString());
+    lease.isLeaseLive.mockImplementation((task, activityIso) => activityIso != null);
+    const { runSweep } = createDetector(deps);
+
+    const { result: m, emf } = await captureEmf(() => runSweep("enforce"));
+
+    expect(m.candidates).toBe(1);
+    expect(m.skippedLiveLease).toBe(1);
+    expect(m.fired).toBe(0);
+    expect(m.retries).toBe(0);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
+    expect(emf.DetectorSkippedLiveLease).toBe(1);
+    expect(emf.DetectorFired).toBe(0);
+  });
+});
+
+describe("AC-D4.4 — a second sweep over a recovered ticket is a no-op", () => {
+  it("completion detected on pass 2: the recovered agent finished → zero additional writes", async () => {
+    // Shared, mutable events partition: empty on pass 1 (nothing to complete),
+    // then the recovered agent's completion lands before pass 2.
+    const events = [];
+    const { deps, store, lease } = makeDeps({
+      ddb: makeDdb({ workflows: [makeWorkflow()], events }),
+    });
+    const { runSweep } = createDetector(deps);
+
+    // ── Pass 1: dead session recovered (stamp → steal → error → retry). ──
+    const m1 = await runSweep("enforce");
+    expect(m1.fired).toBe(1);
+    expect(m1.retries).toBe(1);
+
+    const snap = {
+      mark: store.markDeadSessionDetected.mock.calls.length,
+      steal: lease.stealClaim.mock.calls.length,
+      redispatch: deps.redispatch.mock.calls.length,
+      increment: store.incrementDeadSessionRetry.mock.calls.length,
+      errors: eventsOfType(deps.publishEvent, "agent.error").length,
+    };
+
+    // The redispatched agent reports completion before the next sweep.
+    events.push(completeEvt());
+
+    // ── Pass 2: the completion check short-circuits before ANY write. ──
+    const m2 = await runSweep("enforce");
+
+    expect(m2.candidates).toBe(1);   // still inspected…
+    expect(m2.fired).toBe(0);        // …but nothing fired
+    // Zero additional writes on pass 2 — every counter is unchanged.
+    expect(store.markDeadSessionDetected.mock.calls.length).toBe(snap.mark);
+    expect(lease.stealClaim.mock.calls.length).toBe(snap.steal);
+    expect(deps.redispatch.mock.calls.length).toBe(snap.redispatch);
+    expect(store.incrementDeadSessionRetry.mock.calls.length).toBe(snap.increment);
+    expect(eventsOfType(deps.publishEvent, "agent.error").length).toBe(snap.errors);
+  });
+
+  it("claim CAS lost on pass 2: the stale-generation steal loses harmlessly → no duplicate recovery", async () => {
+    const { deps, store, lease } = makeDeps();
+    // Steal wins once (pass 1), then loses (pass 2: the claim generation moved
+    // when the recovered agent re-claimed).
+    lease.stealClaim.mockResolvedValue(false);
+    lease.stealClaim.mockResolvedValueOnce(true);
+    const { runSweep } = createDetector(deps);
+
+    const m1 = await runSweep("enforce");
+    expect(m1.fired).toBe(1);
+    expect(m1.retries).toBe(1);
+
+    const errorsAfter1 = eventsOfType(deps.publishEvent, "agent.error").length;
+    const redispatchAfter1 = deps.redispatch.mock.calls.length;
+    const incrementAfter1 = store.incrementDeadSessionRetry.mock.calls.length;
+
+    const m2 = await runSweep("enforce");
+
+    // The steal CAS lost → recovery bailed before announcing/retrying again.
+    expect(m2.fired).toBe(0);
+    expect(m2.retries).toBe(0);
+    expect(eventsOfType(deps.publishEvent, "agent.error").length).toBe(errorsAfter1);
+    expect(deps.redispatch.mock.calls.length).toBe(redispatchAfter1);
+    expect(store.incrementDeadSessionRetry.mock.calls.length).toBe(incrementAfter1);
+    expect(lease.stealClaim).toHaveBeenCalledTimes(2); // both passes reached the steal
+  });
 });
