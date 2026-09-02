@@ -71,8 +71,10 @@ export const handler = async (event) => {
         return await startDeploy(args);
       case "get_build_log":
         return await getBuildLog(args);
+      case "get_build_status":
+        return await getBuildStatus(args);
       default: {
-        const message = `Unknown tool: "${toolName}". Available: get_state, start_deploy, get_build_log`;
+        const message = `Unknown tool: "${toolName}". Available: get_state, start_deploy, get_build_log, get_build_status`;
         return { error: message, content: [{ text: message }] };
       }
     }
@@ -236,12 +238,65 @@ async function getBuildLog(args = {}) {
   return jsonResult({
     buildId,
     project,
+    // resolvedSourceVersion is the actual commit SHA CodeBuild built (the AWS SDK
+    // documents this — NOT sourceVersion, which for a PR build can be a pr/<id>
+    // ref). Callers proving "green belongs to the new head" must match on this.
+    resolvedSourceVersion: build.resolvedSourceVersion || null,
+    sourceVersion: build.sourceVersion || null,
     buildStatus: build.buildStatus,
     currentPhase: build.currentPhase,
     phases,
     logGroup: lg,
     logStream: ls,
     logTail,
+  });
+}
+
+// ─── get_build_status ─────────────────────────────────────────────────────────
+// Prove a build's status for a SPECIFIC commit — the CI agent uses this to
+// confirm a green build belongs to the exact head SHA (e.g. after an auto-fix
+// push) instead of trusting "the latest build is green". Scans the N most recent
+// builds of the project and returns each with its resolvedSourceVersion (the real
+// git commit CodeBuild built — sourceVersion may be a pr/<id> ref). If commit_sha
+// is given, also returns the matching build + a boolean succeededForCommit.
+async function getBuildStatus(args = {}) {
+  const project = args.project || CI_PROJECT;
+  const commit = (args.commit_sha || "").trim();
+  const scan = Math.min(Number(args.scan) || 15, 50);
+
+  const list = await cb.send(
+    new ListBuildsForProjectCommand({ projectName: project, sortOrder: "DESCENDING" })
+  );
+  const ids = (list.ids || []).slice(0, scan);
+  if (ids.length === 0) return jsonResult({ project, builds: [], match: null });
+
+  const { builds } = await cb.send(new BatchGetBuildsCommand({ ids }));
+  const rows = (builds || []).map((b) => ({
+    buildId: b.id,
+    buildStatus: b.buildStatus,
+    resolvedSourceVersion: b.resolvedSourceVersion || null,
+    sourceVersion: b.sourceVersion || null,
+    endTime: b.endTime,
+  }));
+
+  let match = null;
+  if (commit) {
+    // Match on resolvedSourceVersion (full or short SHA prefix), newest first.
+    match = rows.find(
+      (r) =>
+        r.resolvedSourceVersion &&
+        (r.resolvedSourceVersion === commit ||
+          r.resolvedSourceVersion.startsWith(commit) ||
+          commit.startsWith(r.resolvedSourceVersion))
+    ) || null;
+  }
+
+  return jsonResult({
+    project,
+    requestedCommit: commit || null,
+    match,
+    succeededForCommit: !!(match && match.buildStatus === "SUCCEEDED"),
+    builds: rows,
   });
 }
 
