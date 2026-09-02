@@ -539,6 +539,14 @@ async function scanReviewGates() {
         { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
       ]] };
 
+      // Direct jump to the gate ticket's review view in the hub — the one
+      // screen with the full formatted breakout (review package + Merge
+      // Brief) and the approve controls.
+      keyboard.inline_keyboard.push([{
+        text: "📱 Open approval in hub",
+        url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&ticket=${encodeURIComponent(notif.ticketId)}`,
+      }]);
+
       // Deep-link the deliverables under review: the freshest markdown artifacts
       // open straight into the hub's artifact viewer (read/edit/save), so the
       // reviewer can read the actual spec/plan from their phone before tapping

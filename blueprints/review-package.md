@@ -120,8 +120,8 @@ The reviewer decides: "do these redlines go to the counterparty?"
     "QA: 12 new unit tests, e2e gate ping verified against staging bot"
   ],
   "links": [
-    { "label": "PR #162", "url": "https://github.com/acme/hub/pull/162" },
-    { "label": "Ship review summary", "artifactKey": "workflows/wf_123/shared/ship-review-summary.md" }
+    { "label": "Merge Brief", "artifactKey": "workflows/wf_123/shared/merge-brief.md" },
+    { "label": "PR #162", "url": "https://github.com/acme/hub/pull/162" }
   ]
 }
 ```
