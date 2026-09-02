@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createReconcileSweep } from "./reconcile-sweep.mjs";
+import { createReconcileSweep, SWEEP_ROTATION_QUANTUM_MS } from "./reconcile-sweep.mjs";
 import { createCascade } from "./cascade.mjs";
 
 /**
@@ -94,7 +94,7 @@ function makeSweep(overrides = {}) {
     cascade,
     getChildTickets,
     leaseTtlMs: overrides.leaseTtlMs !== undefined ? overrides.leaseTtlMs : TTL_MS,
-    now: () => NOW,
+    now: overrides.now || (() => NOW),
     log: () => {},
   });
   return { ...sweep, ddb, getChildTickets, cascade, publishEvent, lease, redispatch, reawakenGate };
@@ -348,6 +348,73 @@ describe("sweep truncation", () => {
     const s = makeSweep({ workflows: many, siblings: [] });
     const m = await s.runSweep("shadow");
     expect(m.truncated).toBe(true);
+  });
+});
+
+/**
+ * TEAM-3764 F5 — a capped scan must not starve older workflows. Before this fix
+ * every sweep re-inspected the same newest-50 slice, so with >50 open workflows
+ * the older parked ones were NEVER reached. The window now rotates: chunk k of
+ * the recency-sorted list this rotation quantum, chunk k+1 the next, wrapping —
+ * so every open workflow is inspected within ceil(N / 50) quanta. The rotation
+ * derives from the injected clock (stateless — zero writes, shadow stays
+ * write-free; a cold start computes the same window a warm one would).
+ */
+describe("TEAM-3764 F5 — the capped window rotates so older workflows are inspected", () => {
+  // 120 open workflows, newest first (wf_0 newest … wf_119 oldest) → 3 chunks.
+  const N = 120;
+  const PAGES = Math.ceil(N / 50);
+  const fleet = () =>
+    Array.from({ length: N }, (_, i) =>
+      workflow({
+        id: `wf_${i}`, workflowId: `wf_${i}`, epicId: `EPIC-${i}`,
+        updatedAt: new Date(NOW - (i + 1) * 60_000).toISOString(),
+      }));
+
+  it("a workflow OUTSIDE the first window is inspected within ceil(N/cap) sweeps", async () => {
+    const clock = { v: NOW };
+    const getChildTickets = vi.fn(async () => []);
+    const s = makeSweep({ workflows: fleet(), getChildTickets, now: () => clock.v });
+
+    const inspected = new Set();
+    for (let sweep = 0; sweep < PAGES; sweep++) {
+      const before = getChildTickets.mock.calls.length;
+      await s.runSweep("shadow");
+      const thisSweep = getChildTickets.mock.calls.slice(before).map((c) => c[0]);
+      expect(thisSweep.length).toBeLessThanOrEqual(50); // the cap still holds per sweep
+      thisSweep.forEach((e) => inspected.add(e));
+      clock.v += SWEEP_ROTATION_QUANTUM_MS; // next sweep lands in the next quantum
+    }
+
+    // wf_119 (oldest — deepest chunk, unreachable before this fix) was inspected…
+    expect(inspected.has(`EPIC-${N - 1}`)).toBe(true);
+    // …and so was EVERY open workflow, within ceil(N/cap)=3 sweeps.
+    expect(inspected.size).toBe(N);
+  });
+
+  it("sweeps within the SAME quantum re-inspect the same window (deterministic)", async () => {
+    const clock = { v: NOW };
+    const getChildTickets = vi.fn(async () => []);
+    const s = makeSweep({ workflows: fleet(), getChildTickets, now: () => clock.v });
+
+    await s.runSweep("shadow");
+    const first = getChildTickets.mock.calls.map((c) => c[0]);
+    getChildTickets.mockClear();
+    clock.v += 1_000; // one second later — same quantum
+    await s.runSweep("shadow");
+    const second = getChildTickets.mock.calls.map((c) => c[0]);
+    expect(second).toEqual(first);
+  });
+
+  it("under the cap the window is the whole set (rotation is a no-op)", async () => {
+    const few = Array.from({ length: 5 }, (_, i) =>
+      workflow({ id: `wf_${i}`, workflowId: `wf_${i}`, epicId: `EPIC-${i}` }));
+    const getChildTickets = vi.fn(async () => []);
+    // A clock deep into some arbitrary quantum — must not slice a 5-row set.
+    const s = makeSweep({ workflows: few, getChildTickets, now: () => NOW + 7 * SWEEP_ROTATION_QUANTUM_MS });
+    const m = await s.runSweep("shadow");
+    expect(m.truncated).toBe(false);
+    expect(getChildTickets.mock.calls.length).toBe(5);
   });
 });
 
