@@ -46,10 +46,15 @@ export interface PipelineStatus {
   error?: string;
 }
 
+export function isPipelineEnabled(value = process.env.PIPELINE_ENABLED): boolean {
+  const raw = (value ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true";
+}
+
 export async function getPipelineStatus(): Promise<PipelineStatus> {
   const region = DEFAULT_REGION;
   const base: PipelineStatus = {
-    enabled: process.env.PIPELINE_ENABLED === "1" || process.env.PIPELINE_ENABLED === "true",
+    enabled: isPipelineEnabled(),
     region,
     ciProject: CI_PROJECT,
     deployPipeline: DEPLOY_PIPELINE,

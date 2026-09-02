@@ -43,6 +43,7 @@ import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES } from "./completion.mjs";
+import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -2341,7 +2342,7 @@ async function buildAgentContext(ticket, workflow) {
   // branch on this: set → read CodeBuild/CodePipeline results instead of shelling
   // builds/deploys; absent → legacy self-run. An env var alone is invisible to
   // the model, so surface it EXPLICITLY in the task context (Codex #263 round-5).
-  if (process.env.PIPELINE_ENABLED === "1" || process.env.PIPELINE_ENABLED === "true") {
+  if (isPipelineEnabled(process.env.PIPELINE_ENABLED)) {
     context += `## Pipeline Mode\nPIPELINE_ENABLED: true\n`;
     context += `A CodeBuild PR-check + CodePipeline deploy own this repo's `;
     context += `deterministic build/test/deploy. Follow the PIPELINE_ENABLED path `;
