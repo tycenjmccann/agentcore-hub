@@ -46,15 +46,21 @@ fi
 echo "── Eval step 7: reduced sampling/evaluator load profile ──"
 ./deploy/evaluations/setup-evaluations.sh
 
-echo "── Eval step 8: health alarms (GATED on a non-zero batch) ──"
+echo "── Eval step 8: health alarms (GATED on a POSITIVE batch) ──"
+# DEPLOY.md gate: BOTH metrics must have a non-zero Sum. An empty response OR a
+# datapoint whose sum is 0/0.0 both fail the gate (Codex #263 round-3 P2 — a
+# `0` datapoint is nonempty but is NOT a healthy batch).
 GATE_OK=1
 for metric in EvalSessionsTotal EvalResultsTotal; do
-  SUM="$(aws cloudwatch get-metric-statistics --namespace AgentCoreHub/Evaluations \
+  SUMS="$(aws cloudwatch get-metric-statistics --namespace AgentCoreHub/Evaluations \
     --metric-name "$metric" --statistics Sum --period 86400 \
     --start-time "$(date -u -v-24H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)" \
     --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --query 'Datapoints[].Sum' --output text 2>/dev/null || true)"
-  [ -z "$SUM" ] && GATE_OK=0
+  # Require at least one strictly-positive sum for this metric.
+  if ! printf '%s\n' $SUMS | awk 'BEGIN{ok=0} {if ($1+0 > 0) ok=1} END{exit ok?0:1}'; then
+    GATE_OK=0
+  fi
 done
 if [ "$GATE_OK" = "1" ]; then
   ALERT_TOPIC_ARN="$(aws sns create-topic --name agentcore-hub-alerts --query TopicArn --output text)"

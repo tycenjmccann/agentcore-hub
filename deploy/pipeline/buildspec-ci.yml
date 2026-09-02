@@ -2,13 +2,17 @@
 #
 # Two callers, one file:
 #   - CodeBuild "agentcore-hub-ci" (PR webhook): runs the gates, posts a commit
-#     status back onto the PR → branch protection blocks merge if red.
+#     status back onto the PR -> branch protection blocks merge if red.
 #   - CodePipeline "Build" stage (BUILD_APP_IMAGE=true): runs the SAME gates,
 #     then emits the deploy artifacts (orchestrator zip + app image BY DIGEST)
 #     so the Deploy stage promotes exactly what was built here (build-once).
 #
 # The gates are the deterministic work that used to run inside the CI agent.
 # Any red here = build fails = no merge. See docs/cicd-pipeline-module-design.md.
+#
+# NOTE: every command is a QUOTED YAML scalar. An unquoted "echo foo: bar" parses
+# as a YAML mapping, not a string, and CodeBuild rejects the commands array
+# (Codex PR #263 round-3). Keep the quotes; avoid raw ": " in echo text.
 version: 0.2
 
 env:
@@ -20,46 +24,42 @@ phases:
     runtime-versions:
       nodejs: 20
     commands:
-      - node --version && npm --version
-      - npm ci
+      - "node --version && npm --version"
+      - "npm ci"
       # Playwright needs a real browser + OS deps on the clean CodeBuild image
-      # (mirrors .github/workflows/ci.yml). Without this `npm test` errors before
-      # any gate runs.
-      - npx playwright install --with-deps chromium
+      # (mirrors .github/workflows/ci.yml). Without this the test gates error.
+      - "npx playwright install --with-deps chromium"
 
   pre_build:
     commands:
-      # This project is the authoritative required check, so it must run EVERY
-      # blocking gate the GitHub CI workflow runs — otherwise the blueprints skip
-      # their own mechanical tests on a green result and unit/race/telemetry
-      # regressions merge (Codex PR #263 round-2 P1). Kept in lockstep with
-      # .github/workflows/ci.yml.
-      - echo "── Gate: lint ──"
-      - npm run lint
-      - echo "── Gate: TypeScript (blocking) ──"
-      - npx tsc --noEmit
-      - echo "── Gate: unit tests (vitest, hermetic) ──"
-      - npm run test:unit
-      - echo "── Gate: workflow-table write guard (race study R2) ──"
-      - ./scripts/check-workflow-writes.sh
+      # Authoritative required check -> must run EVERY blocking gate the GitHub CI
+      # workflow runs, else the blueprints skip their own mechanical tests on a
+      # green result and unit/race/telemetry regressions merge (Codex #263 r2).
+      # Kept in lockstep with .github/workflows/ci.yml.
+      - "npm run lint"
+      - "npx tsc --noEmit"
+      - "npm run test:unit"
+      - "./scripts/check-workflow-writes.sh"
 
   build:
     commands:
-      - echo "── Gate: production build (also the module-removal smoke test) ──"
-      - npm run build
-      # The fast Playwright suite hits localhost:3000 and defines no webServer,
-      # so boot `next start` first and wait for readiness (mirrors the GH job).
-      - echo "── Boot app for the Playwright smoke suite ──"
-      - nohup npm run start -- -p 3000 > /tmp/next-server.log 2>&1 &
+      # production build == the module-removal smoke test
+      - "npm run build"
+      # The Playwright suites hit localhost:3000 and define no webServer, so boot
+      # `next start` first and wait for readiness (mirrors the GH job).
+      - "nohup npm run start -- -p 3000 > /tmp/next-server.log 2>&1 &"
       - |
         for i in $(seq 1 30); do
           if curl -sf -o /dev/null http://localhost:3000/; then echo "server up"; break; fi
           sleep 2
           if [ "$i" = "30" ]; then echo "server did not come up"; cat /tmp/next-server.log; exit 1; fi
         done
-      - echo "── Gate: fast Playwright suite (tab UI + API smoke) ──"
-      - PLAYWRIGHT_BASE_URL=http://localhost:3000 npm test
-      - echo "── Gate: runtime-agent telemetry pytest (hermetic, no AWS) ──"
+      # fast suite (tab UI + API smoke)
+      - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm test"
+      # Cloud Code UI regression suite — a separate blocking job in GH CI that
+      # `npm test`'s narrower glob does not cover (Codex #263 round-3 P1).
+      - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:cloud-code -- --trace retain-on-failure"
+      # runtime-agent telemetry pytest (hermetic, no AWS)
       - |
         python3 -m venv /tmp/pyci && . /tmp/pyci/bin/activate
         pip install -q -r deploy/runtime-agent/tests/requirements-test.txt
@@ -67,27 +67,27 @@ phases:
           deploy/runtime-agent/test_telemetry_init.py \
           deploy/runtime-agent/test_build_env_vars.py
         deactivate
-      - echo "── HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed) ──"
-      - bash scripts/check-lambda-zip-manifest.sh
+      # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
+      - "bash scripts/check-lambda-zip-manifest.sh"
 
   post_build:
     commands:
-      - echo "── Dependency scan (report-only until baselined) ──"
-      - npm audit --audit-level=high || true
+      # dependency scan (report-only until baselined)
+      - "npm audit --audit-level=high || true"
       # ── Deploy-pipeline Build stage only: emit artifacts by digest ──
       - |
         if [ "${BUILD_APP_IMAGE:-false}" = "true" ]; then
-          echo "── Build stage: packaging orchestrator zip via lambda/orchestrator/deploy.sh's OWN file list ──"
+          echo "Build stage: packaging orchestrator zip via lambda/orchestrator/deploy.sh's OWN file list"
           # Reuse deploy.sh's exact `zip -rq function.zip ...` line — do NOT keep a
-          # second copy of the file list here (Codex PR #263 P2: two lists drift).
+          # second copy of the file list here (Codex #263 P2: two lists drift).
           cp src/config/lease-constants.json lambda/orchestrator/lease-constants.json
           ( cd lambda/orchestrator && npm ci --omit=dev )
           ZIP_ARGS="$(grep -oE 'zip -rq function\.zip .*' lambda/orchestrator/deploy.sh | sed 's/^zip -rq function\.zip //')"
           ( cd lambda/orchestrator && zip -rq /tmp/orchestrator.zip $ZIP_ARGS )
           rm -f lambda/orchestrator/lease-constants.json
-          echo "── Validate the ACTUAL built archive (not just deploy.sh's line) ──"
+          echo "Validate the ACTUAL built archive (not just deploy.sh's line)"
           bash scripts/check-lambda-zip-manifest.sh --zip /tmp/orchestrator.zip
-          echo "── Build + push app image to ECR, capture the DIGEST for promote-by-digest ──"
+          echo "Build + push app image to ECR, capture the DIGEST for promote-by-digest"
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
           aws ecr get-login-password --region "$AWS_REGION_HUB" \
@@ -99,9 +99,6 @@ phases:
           # pipeline-resolved source revision, not `git rev-parse` (Codex #263 P1).
           GIT_SHA="${CODEBUILD_RESOLVED_SOURCE_VERSION:-$(git rev-parse --short HEAD 2>/dev/null || echo nogit)}"
           GIT_SHA="$(printf '%s' "$GIT_SHA" | cut -c1-12)"
-          # Bake the pipeline nav flag into the client bundle (Codex #263 P2):
-          # NEXT_PUBLIC_* are inlined at build time, so it must be a build-arg,
-          # not a runtime env var. Defaults empty (hidden) when the var is unset.
           docker buildx build --platform linux/amd64 \
             --build-arg NEXT_PUBLIC_PIPELINE_ENABLED="${NEXT_PUBLIC_PIPELINE_ENABLED:-}" \
             --tag "${ECR_URI}:${GIT_SHA}" --tag "${ECR_URI}:latest" \
@@ -127,15 +124,17 @@ phases:
 
 # For the deploy pipeline Build stage, these are the promote-by-digest artifacts.
 # (The PR-check invocation ignores artifacts — it only cares about pass/fail.)
+# lambda/** IS included: the Deploy stage's eval targets cd into lambda/eval-packager
+# (Codex #263 round-3 P1).
 artifacts:
   base-directory: .
   files:
-    - pipeline-out/orchestrator.zip
-    - pipeline-out/image-digest.txt
-    - pipeline-out/git-sha.txt
-    - pipeline-out/changed-files.txt
-    # carry the source tree the Deploy stage needs (blueprints, config, scripts)
-    - blueprints/**/*
-    - deploy/**/*
-    - scripts/**/*
-    - src/config/**/*
+    - "pipeline-out/orchestrator.zip"
+    - "pipeline-out/image-digest.txt"
+    - "pipeline-out/git-sha.txt"
+    - "pipeline-out/changed-files.txt"
+    - "blueprints/**/*"
+    - "deploy/**/*"
+    - "scripts/**/*"
+    - "src/config/**/*"
+    - "lambda/**/*"

@@ -483,6 +483,52 @@ function grantDeployPerms(
     })
   );
 
+  // ── Eval-target actions (DEPLOY.md steps 4-9), used ONLY when the changeset
+  // touches eval files and the agentcore CLI is present (Codex #263 round-3 P1).
+  // deploy-eval-targets.sh calls: sns:CreateTopic, cloudwatch:PutMetricAlarm,
+  // dynamodb:UpdateItem on the eval-config table, and the fleet redeploy needs
+  // AgentCore control-plane + a PassRole for bedrock-agentcore.amazonaws.com.
+  statements.push(
+    new iam.PolicyStatement({
+      sid: "EvalAlarmsAndTopic",
+      actions: [
+        "sns:CreateTopic",
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DescribeAlarms",
+      ],
+      resources: ["*"], // PutMetricAlarm/DescribeAlarms are not resource-scoped; CreateTopic is idempotent-by-name
+    }),
+    new iam.PolicyStatement({
+      sid: "EvalConfigTable",
+      actions: ["dynamodb:UpdateItem", "dynamodb:GetItem"],
+      resources: [
+        `arn:aws:dynamodb:${ctx.region}:${ctx.account}:table/agentcore-hub-eval-config`,
+      ],
+    }),
+    new iam.PolicyStatement({
+      sid: "EvalFleetControlPlane",
+      actions: [
+        "bedrock-agentcore:UpdateAgentRuntime",
+        "bedrock-agentcore:GetAgentRuntime",
+        "bedrock-agentcore:ListAgentRuntimes",
+        "bedrock-agentcore:UpdateOnlineEvaluationConfig",
+        "bedrock-agentcore:GetOnlineEvaluationConfig",
+        "bedrock-agentcore:ListOnlineEvaluationConfigs",
+      ],
+      resources: ["*"],
+    }),
+    new iam.PolicyStatement({
+      sid: "PassFleetRuntimeRole",
+      actions: ["iam:PassRole"],
+      resources: [
+        `arn:aws:iam::${ctx.account}:role/agentcore-hub-agentcore-role`,
+      ],
+      conditions: {
+        StringEquals: { "iam:PassedToService": "bedrock-agentcore.amazonaws.com" },
+      },
+    })
+  );
+
   role.attachInlinePolicy(
     new iam.Policy(scope, "DeployPerms", { statements })
   );
