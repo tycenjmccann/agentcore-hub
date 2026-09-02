@@ -71,7 +71,29 @@ populated for the bot to do anything.
 
 Optional: `BEDROCK_MODEL_ID`, `CONFIDENCE_THRESHOLD`,
 `TRANSCRIBE_LANGUAGE`, `CHAT_SETTLE_MS`, `CHAT_BUFFER_MAX_MS`,
-`WM_MIN_BUDGET_MS`, `WM_RELAY_TIMEOUT_MS`.
+`WM_MIN_BUDGET_MS`, `WM_RELAY_TIMEOUT_MS`, `DEPLOY_PIPELINE_NAME`.
+
+`DEPLOY_PIPELINE_NAME` enables the CI/CD deploy-approval bridge (TEAM-3740):
+the poller watches this CodePipeline for a `ManualApproval` action awaiting a
+decision, pings allowlisted chats with Approve / Reject buttons, and maps the
+tap to `codepipeline:PutApprovalResult`. It is **fail-closed**: unset (OSS /
+accounts without the pipeline) makes the whole path a no-op, so the variable is
+purely additive. Set it to the deploy pipeline name (`agentcore-hub-deploy`).
+
+## IAM
+
+This function is account-local — its execution role is managed out of band (see
+Provenance), not by a repo-tracked SAM/CDK stack — so the role's statements are
+documented here rather than declared in infra. Beyond the DynamoDB /
+Bedrock / Transcribe access the intake paths need, the deploy-approval bridge
+requires two CodePipeline actions, scoped least-privilege to the deploy pipeline
+ARN (`arn:aws:codepipeline:<region>:<account>:agentcore-hub-deploy`):
+
+- `codepipeline:GetPipelineState` — poll for an approval action awaiting a decision.
+- `codepipeline:PutApprovalResult` — record the Approve / Reject tap.
+
+Both are unused while `DEPLOY_PIPELINE_NAME` is unset; grant them only where the
+pipeline exists.
 
 ## Deploy
 

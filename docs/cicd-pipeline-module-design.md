@@ -1,9 +1,11 @@
 # CI/CD Pipeline Module — Design Spec
 
-Status: **DESIGN — not implemented.** Pilot target: the hub's own repo
-(`agentcore-hub`). No code lands from this doc; it defines the module boundary,
-the AWS-native pipeline, the buildspecs that port `DEPLOY.md`, and how three
-agent blueprints re-scope once a real pipeline owns the deterministic work.
+Status: **IMPLEMENTED — pipeline live.** Pilot target: the hub's own repo
+(`agentcore-hub`). This doc defines the module boundary, the AWS-native
+pipeline, the buildspecs that port `DEPLOY.md`, and how three agent
+blueprints re-scope now that a real pipeline owns the deterministic work.
+
+See [Pipeline quickstart](pipeline-quickstart.md) for the short operator-facing walkthrough.
 
 ---
 
