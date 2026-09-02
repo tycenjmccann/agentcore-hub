@@ -55,6 +55,13 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 const GITHUB_LAMBDA = process.env.GITHUB_LAMBDA || "agentcore-hub-github-mcp";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const MAX_QA_RETRIES = 3;
+// TEAM-3765 F4 — bound the advisory auto-approval transition retry. The
+// auto-approve is the ONLY thing that moves an all-advisory review gate out of
+// `blocked`; a swallowed transition failure stalls the gate forever. Bounded so
+// a persistently-failing transition can't spin. Backoff is env-tunable (pinned
+// to 0 in tests) — a false/throw from the transition is a transient candidate.
+const ADVISORY_APPROVE_MAX_ATTEMPTS = Number(process.env.ADVISORY_APPROVE_MAX_ATTEMPTS) || 3;
+const ADVISORY_APPROVE_BACKOFF_MS = Number(process.env.ADVISORY_APPROVE_BACKOFF_MS ?? 250);
 // Dead-session detector rollout flag (TEAM-3618 D1.2): off = skip the sweep,
 // shadow = observe + metrics + shadow-flagged events but ZERO writes, enforce =
 // steal/retry/escalate. Unset/empty DEFAULTS TO SHADOW (TEAM-3763 F1): per the
@@ -1387,28 +1394,81 @@ export async function handleReviewRejection(gateTicket) {
     }
     // Approve: the same transition a human approval makes, so the done cascade
     // (unblock dependents, completion checks) runs through the normal path.
-    try {
-      if (TICKET_PROVIDER === "jira") {
-        await jiraTransition(gateTicket.ticketId, "Done");
-      } else {
-        await ddb.send(new UpdateCommand({
-          TableName: TICKETS_TABLE,
-          Key: { ticketId: gateTicket.ticketId },
-          UpdateExpression: "SET #s = :s, #u = :u",
-          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-          ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
-        }));
+    //
+    // TEAM-3765 F4 — this transition is the ONLY exit from `blocked` for an
+    // all-advisory gate. It used to be fire-and-forget: a Jira transition
+    // returns false (it never throws) on a failed/absent transition, and the DDB
+    // write's throw was caught and merely logged — then review.rejected was
+    // published and the command acked as success REGARDLESS. A transient
+    // transition/write failure therefore left the gate stuck in `blocked` with
+    // nothing scheduled to re-drive it: a permanent stall (the D1 class this
+    // epic exists to fix).
+    //
+    // Fix (option a — bounded retry + escalation event). Chosen over option b
+    // (throw so the event source retries) because this handler is reached from
+    // THREE sources with DIFFERENT retry semantics: the SQS FIFO command queue
+    // retries a throw and the direct Jira webhook propagates it, but the DEFAULT
+    // DDB-stream path (TICKET_PROVIDER=dynamodb) swallows per-record throws in
+    // the handler loop — so a throw there is a silent no-retry. An explicit
+    // escalation event is path-independent: it is human/alert-visible AND leaves
+    // the gate `blocked` (never marked done, never acked as approved) so the
+    // reconcile sweep can re-drive it. The transition stays idempotent — an
+    // unconditional SET to a constant `done` (DDB) / a no-op "Done" transition
+    // once already there (Jira) — and we STOP at the first observed success, so a
+    // retry after a partial success cannot double-approve.
+    let approved = false;
+    let lastApproveErr = null;
+    for (let attempt = 1; attempt <= ADVISORY_APPROVE_MAX_ATTEMPTS && !approved; attempt++) {
+      try {
+        if (TICKET_PROVIDER === "jira") {
+          // jiraTransition returns false (does NOT throw) when the transition is
+          // missing or the POST fails — a false is as much a non-landing as a
+          // throw, so both count as "not approved" and drive a retry.
+          approved = await jiraTransition(gateTicket.ticketId, "Done");
+        } else {
+          await ddb.send(new UpdateCommand({
+            TableName: TICKETS_TABLE,
+            Key: { ticketId: gateTicket.ticketId },
+            UpdateExpression: "SET #s = :s, #u = :u",
+            ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+            ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
+          }));
+          approved = true;
+        }
+      } catch (err) {
+        lastApproveErr = err;
+        console.warn(`[orchestrator] advisory auto-approve attempt ${attempt}/${ADVISORY_APPROVE_MAX_ATTEMPTS} for ${gateTicket.ticketId} failed: ${err?.message || err}`);
       }
-      await publishEvent(gateTicket.ticketId, "review.approved_with_advisory", {
+      if (!approved && attempt < ADVISORY_APPROVE_MAX_ATTEMPTS && ADVISORY_APPROVE_BACKOFF_MS > 0) {
+        await new Promise((r) => setTimeout(r, ADVISORY_APPROVE_BACKOFF_MS * attempt));
+      }
+    }
+
+    if (!approved) {
+      // The approval never landed after the bounded retry. Do NOT ack success and
+      // do NOT publish review.rejected as if the gate resolved — that ordering
+      // (rejected + ack while `blocked` persists) is the bug. Emit an explicit
+      // escalation instead: an OBSERVABLE recovery signal for alerting + a human,
+      // while the gate stays `blocked` so the reconcile sweep remains eligible to
+      // re-drive it.
+      console.error(`[orchestrator] advisory auto-approve for ${gateTicket.ticketId} did NOT land after ${ADVISORY_APPROVE_MAX_ATTEMPTS} attempts — escalating (gate left blocked): ${lastApproveErr?.message || "transition returned false"}`);
+      await publishEvent(gateTicket.ticketId, "review.escalated", {
         ticketId: gateTicket.ticketId,
         workflowId: workflow.id,
+        reason: "advisory_auto_approve_failed",
+        attempts: ADVISORY_APPROVE_MAX_ATTEMPTS,
+        error: lastApproveErr?.message || "transition returned false",
         advisoryFindings: Array.isArray(reviewFindings) ? reviewFindings : [],
       });
-    } catch (err) {
-      // The approval could not land — surface loudly; the review.rejected event
-      // below still records the non-gating verdict for observability.
-      console.error(`[orchestrator] auto-approve failed for ${gateTicket.ticketId}: ${err?.message || err}`);
+      return;
     }
+
+    // Approval landed — record it, then the legacy observability event.
+    await publishEvent(gateTicket.ticketId, "review.approved_with_advisory", {
+      ticketId: gateTicket.ticketId,
+      workflowId: workflow.id,
+      advisoryFindings: Array.isArray(reviewFindings) ? reviewFindings : [],
+    });
     await publishEvent(gateTicket.ticketId, "review.rejected", {
       ticketId: gateTicket.ticketId,
       onReject,

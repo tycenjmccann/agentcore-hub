@@ -28,6 +28,11 @@ const h = vi.hoisted(() => ({
     // S3 objects by key — readS3Artifact(workflowId, path) reads
     // workflows/{id}/{path}; used by the F1 findings-derivation tests.
     s3Objects: /** @type {Record<string, string>} */ ({}),
+    // TEAM-3765 F4: transient-failure injection for the advisory auto-approval
+    // transition. failGateDone = how many gate done-writes to throw before
+    // letting one land; gateDoneAttempts = every attempt (thrown or not).
+    failGateDone: 0,
+    gateDoneAttempts: 0,
   },
 }));
 
@@ -49,7 +54,24 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             return { Item: h.state.tickets[cmd.input.Key.ticketId] || null };
           }
           if (name === "ScanCommand") return { Items: [] }; // findCodingSession → none
-          if (name === "UpdateCommand") { h.state.updates.push(cmd.input); return {}; }
+          if (name === "UpdateCommand") {
+            // TEAM-3765 F4: let a test inject transient failures on the gate's
+            // done-approval write (Key TEAM-900, :s === "done") to exercise the
+            // bounded-retry / escalation path. Every attempt is counted; a
+            // remaining `failGateDone` budget throws before the write records.
+            const isGateDone =
+              cmd.input.Key?.ticketId === "TEAM-900" &&
+              cmd.input.ExpressionAttributeValues?.[":s"] === "done";
+            if (isGateDone) {
+              h.state.gateDoneAttempts++;
+              if (h.state.failGateDone > 0) {
+                h.state.failGateDone--;
+                throw new Error("transient DDB failure");
+              }
+            }
+            h.state.updates.push(cmd.input);
+            return {};
+          }
           if (name === "PutCommand") { h.state.events.push(cmd.input.Item); return {}; }
           if (name === "QueryCommand") return { Items: [] };
           return {};
@@ -119,6 +141,10 @@ beforeEach(async () => {
   h.state.events.length = 0;
   h.state.ebEvents.length = 0;
   h.state.s3Objects = {};
+  h.state.failGateDone = 0;
+  h.state.gateDoneAttempts = 0;
+  // TEAM-3765 F4: zero backoff so the bounded auto-approve retry is instant.
+  process.env.ADVISORY_APPROVE_BACKOFF_MS = "0";
   // agentcore_hub_api_dev is a "development"-phase agent in the fallback roster.
   h.state.tickets = {
     "TEAM-10": { ticketId: "TEAM-10", assignee: "agentcore_hub_api_dev", type: "task", status: "done" },
@@ -138,6 +164,7 @@ afterEach(() => {
   global.fetch = ORIGINAL_FETCH;
   delete process.env.GITHUB_PAT;
   delete process.env.ARTIFACT_BUCKET;
+  delete process.env.ADVISORY_APPROVE_BACKOFF_MS;
 });
 
 describe("handleReviewRejection — cap escalation short-circuit (D2c)", () => {
@@ -206,6 +233,83 @@ describe("handleReviewRejection — diff-scoped non-gating rejection (TEAM-3689 
     const rejected = h.state.events.find((e) => e.type === "review.rejected");
     expect(rejected.detail.reopened).toEqual(["TEAM-10"]);
     expect(rejected.detail.noInDiffFindings).toBeUndefined();
+  });
+});
+
+/**
+ * TEAM-3765 F4 — a failed advisory auto-approval must NOT be swallowed. The
+ * transition (DDB done-write / Jira "Done") is the only exit from `blocked` for
+ * an all-advisory gate; before this fix a transient failure was logged, then
+ * review.rejected was published and the command acked as success anyway —
+ * leaving the gate stuck in `blocked` forever. The fix bounds-retries the
+ * transition and, on exhaustion, emits an OBSERVABLE escalation event instead of
+ * the silent success+rejected path, leaving the gate blocked for the reconcile
+ * sweep / a human to recover. The transition stays idempotent — we stop at the
+ * first observed success, so a retry after a partial failure cannot double-approve.
+ *
+ * These tests drive the DDB path (TICKET_PROVIDER defaults to dynamodb), where
+ * the transition is the gate's status→done UpdateCommand.
+ */
+describe("handleReviewRejection — advisory auto-approval failure is not swallowed (TEAM-3765 F4)", () => {
+  // The all-advisory verdict: escalated:false + gated:false → the auto-approve branch.
+  const advisoryEnforce = () => vi.fn(async () => ({ escalated: false, gated: false }));
+  const ADVISORY_GATE = { ...GATE, reviewFindings: [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }] };
+  const gateDoneWrites = () =>
+    h.state.updates.filter(
+      (u) => u.Key.ticketId === "TEAM-900" && u.ExpressionAttributeValues?.[":s"] === "done"
+    );
+
+  it("transition keeps failing → escalates observably, NOT the silent success+review.rejected path", async () => {
+    h.state.enforce = advisoryEnforce();
+    h.state.failGateDone = 99; // every done-write throws → retry is exhausted
+
+    await handleReviewRejection(ADVISORY_GATE);
+
+    // Bounded retry was actually attempted (3 attempts, no infinite spin).
+    expect(h.state.gateDoneAttempts).toBe(3);
+    // The gate was NEVER marked done — no successful transition landed.
+    expect(gateDoneWrites()).toHaveLength(0);
+    // The observable recovery signal fired...
+    const escalated = h.state.events.find((e) => e.type === "review.escalated");
+    expect(escalated).toBeTruthy();
+    expect(escalated.detail.reason).toBe("advisory_auto_approve_failed");
+    expect(escalated.detail.attempts).toBe(3);
+    // ...and it is NOT the buggy silent success path: no approval, no
+    // review.rejected acking the gate as resolved.
+    expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeUndefined();
+    expect(h.state.events.find((e) => e.type === "review.rejected")).toBeUndefined();
+  });
+
+  it("happy path unchanged: transition lands first try → approve+advisory events, no escalation", async () => {
+    h.state.enforce = advisoryEnforce();
+    // failGateDone stays 0 → the first attempt succeeds.
+
+    await handleReviewRejection(ADVISORY_GATE);
+
+    expect(h.state.gateDoneAttempts).toBe(1);       // single attempt, byte-identical
+    expect(gateDoneWrites()).toHaveLength(1);        // approved once
+    const approved = h.state.events.find((e) => e.type === "review.approved_with_advisory");
+    expect(approved).toBeTruthy();
+    expect(approved.detail.advisoryFindings).toEqual([{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }]);
+    const rejected = h.state.events.find((e) => e.type === "review.rejected");
+    expect(rejected.detail.noInDiffFindings).toBe(true);
+    expect(h.state.events.find((e) => e.type === "review.escalated")).toBeUndefined();
+  });
+
+  it("retry stays CAS-idempotent: fails twice then succeeds → exactly one approval, no double-approve", async () => {
+    h.state.enforce = advisoryEnforce();
+    h.state.failGateDone = 2; // two transient failures, then the write lands
+
+    await handleReviewRejection(ADVISORY_GATE);
+
+    expect(h.state.gateDoneAttempts).toBe(3);        // 2 failures + 1 success
+    // Idempotency: only ONE done-write landed — the retry after partial failure
+    // did not double-approve the gate.
+    expect(gateDoneWrites()).toHaveLength(1);
+    const approvals = h.state.events.filter((e) => e.type === "review.approved_with_advisory");
+    expect(approvals).toHaveLength(1);
+    expect(h.state.events.filter((e) => e.type === "review.rejected")).toHaveLength(1);
+    expect(h.state.events.find((e) => e.type === "review.escalated")).toBeUndefined();
   });
 });
 
