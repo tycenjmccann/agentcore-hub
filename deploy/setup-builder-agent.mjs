@@ -284,6 +284,7 @@ const {
   CreateHarnessCommand,
   GetHarnessCommand,
   ListHarnessesCommand,
+  UpdateHarnessCommand,
   CreateMemoryCommand,
   GetMemoryCommand,
   ListMemoriesCommand,
@@ -311,9 +312,33 @@ const existingReady = (list.harnesses || []).find(
 );
 
 if (existingReady) {
-  console.log(`  Already exists: ${existingReady.harnessId} (READY)`);
-  await verifyHarness(existingReady.harnessId);
-  printDone(existingReady.harnessId);
+  const existingId = existingReady.harnessId;
+  console.log(`  Already exists: ${existingId} (READY) — updating model in place`);
+  // Model bump: re-pin the live builder to MODEL_ID. Without this, a model-bump
+  // deploy over an existing harness was a silent no-op (verify + exit, model
+  // never touched). model is passed plainly — no optionalValue wrapper (that's
+  // only for the memory attachment on Update).
+  await agentcore.send(new UpdateHarnessCommand({
+    harnessId: existingId,
+    model: buildHarnessModelConfig(MODEL_ID),
+  }));
+  for (let i = 0; i < 24; i++) {
+    await sleep(5000);
+    const status = await agentcore.send(new GetHarnessCommand({ harnessId: existingId }));
+    const s = status.harness?.status;
+    if (s === "READY") break;
+    if (s === "UPDATE_FAILED") {
+      console.error(`  Model update failed: ${status.harness?.failureReason || "unknown"}`);
+      process.exit(1);
+    }
+    if (i === 23) {
+      console.error("  Timed out waiting for READY after model update");
+      process.exit(1);
+    }
+  }
+  console.log(`  ✓ Model updated to ${MODEL_ID} — READY`);
+  await verifyHarness(existingId);
+  printDone(existingId);
   process.exit(0);
 }
 

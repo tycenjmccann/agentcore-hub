@@ -293,9 +293,11 @@ One-off runbook for rotating the pinned Claude model ids fleet-wide (e.g.
 TEAM-3849/3851). NOT part of the routine staging deploy above and not run on
 every merge — run this section top to bottom, in order, whenever
 `src/lib/models/harness-models.json` / `CODING_MODEL_TIERS` / persona env
-defaults change. Six independent deploy targets carry a model id; the order
+defaults change. Several independent deploy targets carry a model id; the order
 below avoids a window where the orchestrator, harnesses, and runtimes disagree
-about which id is current.
+about which id is current. The custom eval judge (step 7) is out-of-band — it
+scores after the fact, so it goes last and is not part of the disagreement
+window.
 
 1. Orchestrator Lambda, code only — identical command to staging step 1 above
    (explicit `zip -rq` file list ported from `deploy.sh`; **never** `zip -qr .`
@@ -322,7 +324,10 @@ about which id is current.
    ./deploy/ecs-express/deploy.sh
    ```
 
-4. Harness personas — Workflow Manager first, builder second:
+4. Harness personas — Workflow Manager, builder, routine builder. Each setup
+   script now updates an EXISTING harness's model in place (previously WM/builder
+   ignored the model on re-run and routine-builder did nothing at all — a silent
+   no-op that left the live harness on its old pin), so re-running is enough:
    ```bash
    # WM: BLOCKING smoke — a chat turn's post-tool-call text must stream live,
    # not arrive as one frozen blob at the end. If the new model buffers,
@@ -332,10 +337,26 @@ about which id is current.
 
    # Builder — pin explicitly rather than trusting the script's baked-in default:
    node deploy/setup-builder-agent.mjs --model-id us.anthropic.claude-sonnet-5
+
+   # Routine builder — pin explicitly (baked-in default is opus-5):
+   node deploy/routine-builder/setup-routine-builder.mjs --model-id us.anthropic.claude-opus-5
    ```
    `UpdateHarness`'s memory attachment needs the `optionalValue` wrapper; the
    `model` field does not — don't copy that wrapper onto the model update by
    reflex.
+
+   Verify each harness is CONFIGURED on the new id (a green setup run only
+   proves the invoke succeeded, not that the pin changed). `GetHarness` reads
+   back the live model:
+   ```bash
+   for h in agentcore_hub_workflow_manager agentcore_hub_builder agentcore_hub_routine_builder; do
+     id=$(aws bedrock-agentcore-control list-harnesses \
+       --query "harnesses[?harnessName=='$h'].harnessId | [0]" --output text)
+     model=$(aws bedrock-agentcore-control get-harness --harness-id "$id" \
+       --query 'harness.model.bedrockModelConfig.modelId' --output text)
+     echo "$h -> $model"   # expect: WM=fable-5-1, builder=sonnet-5, routine-builder=opus-5
+   done
+   ```
 
 5. Coding-agent runtime — rebuild and deploy with both env vars pinned
    explicitly on the command line (don't rely on the script's baked-in
@@ -355,6 +376,25 @@ about which id is current.
    wholesale on every call — read back the current `MEMORY_ID`, EFS mount, and
    lifecycle config first and pass them through unchanged, or a "just bump the
    model" deploy silently drops the EFS mount.
+
+7. Custom eval judge — out-of-band, editing
+   `deploy/evaluations/dependency_chain_evaluator.json` alone changes NOTHING in
+   the account (`setup-evaluations.sh` only PROBES for the evaluator id, it never
+   creates or updates it). After the JSON's `modelId` is bumped, roll the change
+   to the live evaluator explicitly (verify the exact verb against your installed
+   CLI — `agentcore eval evaluator update --help` — the fallback is create + swap
+   `CUSTOM_EVALUATOR`; full procedure in `deploy/evaluations/setup-evaluations.sh`
+   "Re-registering a corrected evaluator rubric"):
+   ```bash
+   agentcore eval evaluator update \
+     --evaluator-id dependency_chain_compliance_online-mbLh2kEFhw \
+     --config-file deploy/evaluations/dependency_chain_evaluator.json
+   # Verify the live evaluator now reports the new judge model. The exact
+   # get/describe verb varies by CLI version (run `agentcore eval evaluator
+   # --help`); confirm the returned config's
+   # llmAsAJudge.modelConfig.bedrockEvaluatorModelConfig.modelId is
+   # us.anthropic.claude-opus-5, not a pre-bump id.
+   ```
 
 ### Post-deploy smoke (model bump)
 

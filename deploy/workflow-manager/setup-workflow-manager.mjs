@@ -275,12 +275,16 @@ if (existing && existing.status === "READY") {
   harnessId = existing.harnessId;
   harnessArn = existing.arn;
   console.log(`   ✓ Harness exists: ${harnessId} (READY) — updating in place`);
-  // Update prompt + skills in place. env/memory/tools are left as-is (env is a
-  // replace-all on Update and the live harness may carry values this script
-  // doesn't know; memory needs the optionalValue wrapper — neither is worth
-  // touching for a prompt/skills rollout).
+  // Update prompt + skills + model in place. The model MUST be included: a
+  // model-bump deploy that omitted it would be a silent no-op on an existing
+  // harness (the live harness would keep its old pin). model is passed plainly
+  // — no optionalValue wrapper (that's only needed for the memory attachment).
+  // env/memory/tools are left as-is (env is a replace-all on Update and the
+  // live harness may carry values this script doesn't know; memory needs the
+  // optionalValue wrapper — neither is worth touching for this rollout).
   await agentcore.send(new UpdateHarnessCommand({
     harnessId,
+    model: { bedrockModelConfig: { modelId: MODEL_ID } },
     systemPrompt: [{ text: SYSTEM_PROMPT }],
     skills: SKILLS,
     maxTokens: 32000,
@@ -295,7 +299,7 @@ if (existing && existing.status === "READY") {
     }
     if (i === 23) throw new Error("Timed out waiting for harness READY after update");
   }
-  console.log("   ✓ Harness updated (system prompt + skills) — READY");
+  console.log(`   ✓ Harness updated (model=${MODEL_ID} + system prompt + skills) — READY`);
 } else if (existing) {
   throw new Error(`Harness ${HARNESS_NAME} exists in status ${existing.status} — resolve manually (delete or wait), then re-run.`);
 } else {
