@@ -11,6 +11,7 @@ describe("harness model catalog", () => {
     const defaults = HARNESS_MODELS.filter((m) => m.isDefault);
     expect(defaults).toHaveLength(1);
     expect(defaults[0].id).toBe(DEFAULT_HARNESS_MODEL_ID);
+    expect(DEFAULT_HARNESS_MODEL_ID).toBe("claude-fable-5-1");
   });
 
   it("has unique ids and modelIds", () => {

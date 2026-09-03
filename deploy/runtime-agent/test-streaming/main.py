@@ -38,7 +38,7 @@ async def handler(payload_str, context):
 
     # Create a simple agent with no tools
     agent = Agent(
-        model="us.anthropic.claude-opus-4-6-v1",
+        model="us.anthropic.claude-opus-5",
         system_prompt="You are a helpful assistant. Write clear, detailed responses.",
         tools=[],
         callback_handler=None,

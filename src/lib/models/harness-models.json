@@ -1,5 +1,5 @@
 {
-  "$comment": "Single source of truth for the harness model catalog. Consumed by both TS (harness-models.ts) and deploy scripts (harness-models.mjs). Each entry pins a model to a known-good (provider, apiFormat) pair so the AgentCore harness loop produces a request shape valid for THAT model's endpoint. See harness-models.ts for the full rationale.",
+  "$comment": "Single source of truth for the harness model catalog. Consumed by both TS (harness-models.ts) and deploy scripts (harness-models.mjs). Each entry pins a model to a known-good (provider, apiFormat) pair so the AgentCore harness loop produces a request shape valid for THAT model's endpoint. See harness-models.ts for the full rationale. Pre-bump entries are retained for backward compat — existing harness configs and historical references still resolve them; do not remove.",
   "defaultId": "claude-fable-5-1",
   "models": [
     {
