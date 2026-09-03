@@ -1770,6 +1770,51 @@
       "skills": [],
       "blueprints": [],
       "workflowDefIds": []
+    },
+    {
+      "agentId": "agentcore_hub_coding_runtime",
+      "displayName": "Coding Runtime",
+      "description": "Dedicated observable runtime hosting the coding CLIs (Claude Code, Codex, Kiro) invoked by fleet personas.",
+      "phase": "platform",
+      "type": "runtime",
+      "model": "Claude Fable 5",
+      "evaluationsEnabled": true,
+      "evalConfigName": "eval_agentcore_hub_coding_runtime",
+      "runtimeArn": null,
+      "tools": [],
+      "skills": [],
+      "blueprints": [],
+      "workflowDefIds": []
+    },
+    {
+      "agentId": "personal_assistant_agent",
+      "displayName": "Personal Assistant",
+      "description": "Personal assistant harness.",
+      "phase": "platform",
+      "type": "harness",
+      "model": "Claude Fable 5",
+      "evaluationsEnabled": true,
+      "evalConfigName": "eval_personal_assistant_agent",
+      "runtimeArn": null,
+      "tools": [],
+      "skills": [],
+      "blueprints": [],
+      "workflowDefIds": []
+    },
+    {
+      "agentId": "agentcore_hub_fleet_improver",
+      "displayName": "Fleet Improver",
+      "description": "Self-improvement agent that turns low eval scores into PRDs for the delivery pipeline.",
+      "phase": "platform",
+      "type": "runtime",
+      "model": "Claude Fable 5",
+      "evaluationsEnabled": true,
+      "evalConfigName": "eval_agentcore_hub_fleet_improver",
+      "runtimeArn": null,
+      "tools": [],
+      "skills": [],
+      "blueprints": [],
+      "workflowDefIds": []
     }
   ],
   "defaults": {
