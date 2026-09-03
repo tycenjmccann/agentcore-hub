@@ -2,7 +2,7 @@
   "llmAsAJudge": {
     "modelConfig": {
       "bedrockEvaluatorModelConfig": {
-        "modelId": "us.anthropic.claude-opus-4-7",
+        "modelId": "us.anthropic.claude-opus-5",
         "inferenceConfig": {
           "maxTokens": 1000
         }

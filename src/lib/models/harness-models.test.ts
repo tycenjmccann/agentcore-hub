@@ -11,6 +11,7 @@ describe("harness model catalog", () => {
     const defaults = HARNESS_MODELS.filter((m) => m.isDefault);
     expect(defaults).toHaveLength(1);
     expect(defaults[0].id).toBe(DEFAULT_HARNESS_MODEL_ID);
+    expect(DEFAULT_HARNESS_MODEL_ID).toBe("claude-fable-5-1");
   });
 
   it("has unique ids and modelIds", () => {
@@ -46,6 +47,21 @@ describe("harness model catalog", () => {
     expect(cfg.bedrockModelConfig).toEqual({
       modelId: "us.anthropic.claude-opus-4-8",
       apiFormat: "chat_completions",
+    });
+  });
+
+  it("resolves the fable-5-1, opus-5, and sonnet-5 catalog entries", () => {
+    expect(buildHarnessModelConfig("claude-fable-5-1").bedrockModelConfig).toEqual({
+      modelId: "us.anthropic.claude-fable-5-1",
+      apiFormat: "converse_stream",
+    });
+    expect(buildHarnessModelConfig("claude-opus-5").bedrockModelConfig).toEqual({
+      modelId: "us.anthropic.claude-opus-5",
+      apiFormat: "converse_stream",
+    });
+    expect(buildHarnessModelConfig("claude-sonnet-5").bedrockModelConfig).toEqual({
+      modelId: "us.anthropic.claude-sonnet-5",
+      apiFormat: "converse_stream",
     });
   });
 

@@ -16,7 +16,7 @@
  *
  * Usage:
  *   node deploy/routine-builder/setup-routine-builder.mjs \
- *     [--model-id us.anthropic.claude-opus-4-8]
+ *     [--model-id us.anthropic.claude-opus-5]
  *
  * Requires: npm install at repo root.
  */
@@ -42,8 +42,11 @@ const getArg = (name) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
-// Opus streams post-tool-call text live (fable buffers it) — matches the WM choice.
-const MODEL_ID = getArg("model-id") || "us.anthropic.claude-opus-4-8";
+// Opus streams post-tool-call text live (fable buffers it) — matches the WM's
+// pre-bump choice. NOTE: WM has since moved to fable-5-1 pending a live
+// streaming smoke test (see setup-workflow-manager.mjs); revisit this default
+// once that's confirmed one way or the other.
+const MODEL_ID = getArg("model-id") || "us.anthropic.claude-opus-5";
 const HARNESS_NAME = "agentcore_hub_routine_builder";
 const MEMORY_NAME = "agentcore_hub_routine_builder_memory";
 const ROLE_NAME = "agentcore-hub-harness-role";
@@ -167,6 +170,7 @@ const {
   CreateHarnessCommand,
   GetHarnessCommand,
   ListHarnessesCommand,
+  UpdateHarnessCommand,
   CreateMemoryCommand,
   GetMemoryCommand,
   ListMemoriesCommand,
@@ -248,7 +252,25 @@ let harnessArn;
 if (existing && existing.status === "READY") {
   harnessId = existing.harnessId;
   harnessArn = existing.arn;
-  console.log(`   ✓ Harness exists: ${harnessId} (READY)`);
+  console.log(`   ✓ Harness exists: ${harnessId} (READY) — updating model in place`);
+  // Model bump: re-pin the live harness to MODEL_ID so a model-bump deploy
+  // isn't a silent no-op on an existing routine builder. model is passed
+  // plainly — no optionalValue wrapper (that's only for the memory attachment
+  // on Update). System prompt/env are left as-is; delete and re-run to change
+  // those.
+  await agentcore.send(new UpdateHarnessCommand({
+    harnessId,
+    model: { bedrockModelConfig: { modelId: MODEL_ID } },
+  }));
+  for (let i = 0; i < 24; i++) {
+    await sleep(5000);
+    const status = await agentcore.send(new GetHarnessCommand({ harnessId }));
+    const s = status.harness?.status;
+    if (s === "READY") break;
+    if (s === "UPDATE_FAILED") throw new Error(`Model update failed: ${status.harness?.failureReason || "unknown"}`);
+    if (i === 23) throw new Error("Timed out waiting for harness READY after model update");
+  }
+  console.log(`   ✓ Model updated to ${MODEL_ID} — READY`);
   console.log("   ℹ To pick up a changed system prompt/env, delete and re-run, or use UpdateHarness.");
 } else if (existing) {
   throw new Error(`Harness ${HARNESS_NAME} exists in status ${existing.status} — resolve manually, then re-run.`);

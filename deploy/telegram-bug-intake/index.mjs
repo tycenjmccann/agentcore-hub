@@ -74,7 +74,7 @@ const HUB_API_URL = requireEnv("HUB_API_URL"); // e.g. https://ag-....ecs.us-eas
 // Optional: the CI/CD deploy pipeline whose ManualApproval gate this bot bridges
 // to Telegram. Unset (OSS / accounts without the pipeline) = no deploy pings.
 const DEPLOY_PIPELINE_NAME = process.env.DEPLOY_PIPELINE_NAME || "";
-const MODEL_ID = process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-sonnet-4-6";
+const MODEL_ID = process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-sonnet-5";
 const CONFIDENCE_THRESHOLD = parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.75");
 const TRANSCRIBE_LANGUAGE = process.env.TRANSCRIBE_LANGUAGE || "en-US";
 

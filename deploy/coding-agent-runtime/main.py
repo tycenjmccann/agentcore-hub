@@ -105,7 +105,7 @@ _MIRROR_LOCK_STALE_S = max(1800, MIRROR_BUILD_TIMEOUT_S + 300)
 
 DEFAULT_CLI = "claude"
 CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
-    "CLAUDE_MODEL", "us.anthropic.claude-fable-5"
+    "CLAUDE_MODEL", "us.anthropic.claude-fable-5-1"
 )
 # A single coding turn can be long; cap so a wedged CLI can't pin the microVM.
 # This IS the fleet-wide watchdog `turnTimeoutSecs` (TEAM-3618 D1.1) — the per-turn

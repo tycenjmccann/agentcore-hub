@@ -2,7 +2,7 @@
   "created": "2026-05-22",
   "updated": "2026-08-27",
   "sampling_rate": "tiered (TEAM-3366 §2.4 / TEAM-3376): 100% for gate roles (requirements_analyst, qa_verifier, ci_agent), 25% for all other agents",
-  "judge_model": "us.anthropic.claude-opus-4-7",
+  "judge_model": "us.anthropic.claude-opus-5",
   "evaluators": [
     "Builtin.ToolSelectionAccuracy (TOOL_CALL)",
     "Builtin.InstructionFollowing (TRACE)",

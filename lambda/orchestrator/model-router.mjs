@@ -20,15 +20,16 @@
 
 // ── Tier catalog ─────────────────────────────────────────────────────────────
 // Bedrock inference-profile ids (bare model ids 500 on this account).
-// Opus tier pins 4.6: 4.8 requires the Mantle Responses lane in the harness
-// catalog and can't take the Converse prefill turn.
+// Opus tier pins opus-5 (family bump per TEAM-3849); pre-flight verified via
+// Bedrock Converse in us-east-1. (Previously pinned 4.6 because 4.8 required
+// the Mantle Responses lane and couldn't take the Converse prefill turn.)
 export const TIERS = ["haiku", "sonnet", "opus", "fable"];
 
 export const TIER_MODELS = {
   haiku: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-  sonnet: "us.anthropic.claude-sonnet-4-6",
-  opus: "us.anthropic.claude-opus-4-6-v1",
-  fable: "us.anthropic.claude-fable-5",
+  sonnet: "us.anthropic.claude-sonnet-5",
+  opus: "us.anthropic.claude-opus-5",
+  fable: "us.anthropic.claude-fable-5-1",
 };
 
 const TIER_RANK = Object.fromEntries(TIERS.map((t, i) => [t, i]));

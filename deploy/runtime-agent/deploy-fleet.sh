@@ -38,7 +38,7 @@ fi
 
 ROLE_ARN="${AGENTCORE_ROLE_ARN}"
 GATEWAY_ARN="${GATEWAY_ARN:-}"  # Optional: AgentCore MCP gateway ARN
-MODEL_ID="us.anthropic.claude-opus-4-6-v1"
+MODEL_ID="us.anthropic.claude-fable-5-1"
 
 # Robust mode: build & push the image ONCE before the parallel agent loop.
 # All 14 agents share the same image; deploy-one-robust.py just points

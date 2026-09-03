@@ -487,7 +487,7 @@ const SAVE_CONFIG_TOOL = {
         type: "object",
         properties: {
           agent_name: { type: "string", description: "Snake_case agent name matching [a-zA-Z][a-zA-Z0-9_]{0,47}" },
-          model_id: { type: "string", description: "Bedrock model ID (e.g. global.anthropic.claude-sonnet-4-5-20250929-v1:0)" },
+          model_id: { type: "string", description: "Bedrock model ID (e.g. us.anthropic.claude-sonnet-5)" },
           system_prompt: { type: "string", description: "The full system prompt for the agent" },
           tools: { type: "array", items: { type: "string" }, description: "List of tool names available to the agent" },
           gateway_id: { type: "string", description: "Gateway ID for tool access" },

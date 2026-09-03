@@ -72,7 +72,7 @@ let MEMORY_ID = getArg("memory-id");
 const NO_MEMORY = args.includes("--no-memory");
 const MEMORY_NAME = "agentcore_hub_builder_memory";
 const MCP_URLS = getAllArgs("mcp-url");
-const MODEL_ID = getArg("model-id") || "us.anthropic.claude-sonnet-4-6";
+const MODEL_ID = getArg("model-id") || "us.anthropic.claude-sonnet-5";
 const ROLE_NAME = "agentcore-hub-harness-role";
 
 // --- Resolve account ID ---
@@ -284,6 +284,7 @@ const {
   CreateHarnessCommand,
   GetHarnessCommand,
   ListHarnessesCommand,
+  UpdateHarnessCommand,
   CreateMemoryCommand,
   GetMemoryCommand,
   ListMemoriesCommand,
@@ -311,9 +312,33 @@ const existingReady = (list.harnesses || []).find(
 );
 
 if (existingReady) {
-  console.log(`  Already exists: ${existingReady.harnessId} (READY)`);
-  await verifyHarness(existingReady.harnessId);
-  printDone(existingReady.harnessId);
+  const existingId = existingReady.harnessId;
+  console.log(`  Already exists: ${existingId} (READY) — updating model in place`);
+  // Model bump: re-pin the live builder to MODEL_ID. Without this, a model-bump
+  // deploy over an existing harness was a silent no-op (verify + exit, model
+  // never touched). model is passed plainly — no optionalValue wrapper (that's
+  // only for the memory attachment on Update).
+  await agentcore.send(new UpdateHarnessCommand({
+    harnessId: existingId,
+    model: buildHarnessModelConfig(MODEL_ID),
+  }));
+  for (let i = 0; i < 24; i++) {
+    await sleep(5000);
+    const status = await agentcore.send(new GetHarnessCommand({ harnessId: existingId }));
+    const s = status.harness?.status;
+    if (s === "READY") break;
+    if (s === "UPDATE_FAILED") {
+      console.error(`  Model update failed: ${status.harness?.failureReason || "unknown"}`);
+      process.exit(1);
+    }
+    if (i === 23) {
+      console.error("  Timed out waiting for READY after model update");
+      process.exit(1);
+    }
+  }
+  console.log(`  ✓ Model updated to ${MODEL_ID} — READY`);
+  await verifyHarness(existingId);
+  printDone(existingId);
   process.exit(0);
 }
 
@@ -469,7 +494,7 @@ client = boto3.client("bedrock-agentcore-control", region_name="${REGION}")
 response = client.create_harness(
     harnessName="my_new_agent",
     executionRoleArn="${HARNESS_ROLE_ARN}",
-    model={"bedrockModelConfig": {"modelId": "global.anthropic.claude-sonnet-4-5-20250929-v1:0"}},
+    model={"bedrockModelConfig": {"modelId": "us.anthropic.claude-sonnet-5"}},
     systemPrompt=[{"text": "Your system prompt here..."}],
     tools=[
         # Add remote_mcp for each MCP server the agent needs:
@@ -488,8 +513,8 @@ print(f"Created: {response['harness']['harnessId']}")
 
 - **Naming**: snake_case, descriptive: \`customer_support_agent\`, \`code_review_agent\`
 - **Models**:
-  - \`global.anthropic.claude-sonnet-4-5-20250929-v1:0\` — Fast, good for most tasks (default)
-  - \`global.anthropic.claude-opus-4-6-v1\` — Most capable, complex reasoning
+  - \`us.anthropic.claude-sonnet-5\` — Fast, good for most tasks (default)
+  - \`us.anthropic.claude-opus-5\` — Most capable, complex reasoning
   - \`global.anthropic.claude-haiku-4-5-20251001-v1:0\` — Fastest, cheapest
 - **System Prompts**: Clear role, specific capabilities, when/how to use tools
 - **Tool Wiring**: Use \`remote_mcp\` to connect agents to MCP servers. The URL is all that's needed — the agent discovers available tools at runtime.
