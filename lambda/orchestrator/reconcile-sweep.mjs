@@ -39,24 +39,14 @@
  * detector and the cascade.
  */
 
-import { ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { newMetrics as newCascadeMetrics } from "./cascade.mjs";
-// The ONE terminal-phase list (TEAM-3755 F2/F8). completion.mjs is pure — no AWS
-// clients, no store import — so importing it here cannot cycle.
-import { notTerminalPhaseFilter } from "./completion.mjs";
+// The ONE open-workflow scan, shared with dead-session-detector.mjs
+// (TEAM-3839). Carries the TEAM-3764 F5 rotating window and the TEAM-3755
+// F8-derived terminal-phase filter. SWEEP_ROTATION_QUANTUM_MS is re-exported
+// unchanged for existing importers.
+import { SWEEP_CAP, SWEEP_ROTATION_QUANTUM_MS, createOpenWorkflowScan } from "./sweep-scan.mjs";
+export { SWEEP_ROTATION_QUANTUM_MS };
 
-const SWEEP_CAP = 50;                 // workflows inspected per sweep (most recent first)
-const WORKFLOW_SCAN_PAGES = 20;       // bound the workflows scan
-// TEAM-3764 F5 — when more than SWEEP_CAP workflows are open, the capped window
-// ROTATES across sweeps instead of always re-inspecting the newest 50 (which
-// starved older parked workflows forever). The rotation index is derived from
-// the injected clock in quanta of this size — stateless (a cold start computes
-// the same window a warm one would; zero writes, so shadow mode stays
-// write-free) and deterministic for tests. The quantum sits above the sweep
-// schedule (rate(5 minutes), mirroring the dead-session rule), so the index
-// advances by at most 1 between sweeps and every chunk of ceil(N/SWEEP_CAP) is
-// inspected within ceil(N/SWEEP_CAP) quanta.
-export const SWEEP_ROTATION_QUANTUM_MS = 10 * 60 * 1000;
 const KNOWN_MODES = ["off", "shadow", "enforce"];
 
 // A dependent is a candidate only once it has been parked longer than this —
@@ -91,52 +81,14 @@ export function createReconcileSweep(deps) {
 
   /**
    * Scan workflows in a non-terminal phase, newest first, capped at SWEEP_CAP.
-   * Returns { workflows, matched, rotation, pages } so the caller can flag
-   * truncation. Identical shape/bounds to
-   * dead-session-detector.scanNonTerminalWorkflows, except that an over-cap
-   * result rotates which SWEEP_CAP-sized chunk is returned (TEAM-3764 F5) so
-   * every open workflow is eventually inspected.
-   *
-   * TEAM-3755 F8: the filter is DERIVED from the shared TERMINAL_WORKFLOW_PHASES
-   * list (completion.mjs) rather than spelled out here. It previously named only
-   * complete/cancelled/error, so a run already closed deploy-blocked /
-   * static-ci-only (the TEAM-3747 D2 honest closes) still scanned as "open" —
-   * and in enforce mode the sweep could steal a lease and RE-DISPATCH a parked
-   * candidate inside a terminally-blocked run, resurrecting work after the
-   * verdict. Deriving it means a sixth terminal phase can never be added to the
-   * completion gate and forgotten here.
+   * Shared implementation (sweep-scan.mjs, TEAM-3839) — identical semantics to
+   * the local copy it replaces: an over-cap result rotates which
+   * SWEEP_CAP-sized chunk is returned (TEAM-3764 F5) so every open workflow is
+   * eventually inspected, and the phase filter is derived from the shared
+   * TERMINAL_WORKFLOW_PHASES list (TEAM-3755 F8). Returns
+   * { workflows, matched, rotation, pages } so the caller can flag truncation.
    */
-  async function scanNonTerminalWorkflows() {
-    const matched = [];
-    let lastKey;
-    const openOnly = notTerminalPhaseFilter("#p");
-    for (let page = 0; page < WORKFLOW_SCAN_PAGES; page++) {
-      const res = await ddb.send(new ScanCommand({
-        TableName: workflowsTable,
-        FilterExpression: openOnly.filter,
-        ExpressionAttributeNames: { "#p": "phase" },
-        ExpressionAttributeValues: { ...openOnly.values },
-        ExclusiveStartKey: lastKey,
-      }));
-      for (const w of res.Items || []) matched.push(w);
-      lastKey = res.LastEvaluatedKey;
-      if (!lastKey) break;
-    }
-    const recency = (w) => String(w.updatedAt || w.completedAt || w.startedAt || "");
-    matched.sort((a, b) => recency(b).localeCompare(recency(a)));
-    // TEAM-3764 F5 — rotate the capped window: chunk k of the recency-sorted
-    // list this quantum, chunk k+1 the next, wrapping. Under the cap this is
-    // exactly the old slice(0, SWEEP_CAP).
-    const pages = Math.max(1, Math.ceil(matched.length / SWEEP_CAP));
-    const rotation = pages === 1 ? 0 : Math.floor(now() / SWEEP_ROTATION_QUANTUM_MS) % pages;
-    const start = rotation * SWEEP_CAP;
-    return {
-      workflows: matched.slice(start, start + SWEEP_CAP),
-      matched: matched.length,
-      rotation,
-      pages,
-    };
-  }
+  const scanNonTerminalWorkflows = createOpenWorkflowScan({ ddb, workflowsTable, now });
 
   /**
    * Every blockedBy entry of `ticket` reads done/cancelled in `snapshot`. Same
