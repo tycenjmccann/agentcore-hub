@@ -179,10 +179,13 @@ GitHub: tycenjmccann/agentcore-hub
   inline buttons whose taps map to `PutApprovalResult`. Gated by
   `DEPLOY_PIPELINE_NAME` on that Lambda — unset makes the whole path a no-op.
   (The CDK stack still provisions an SNS topic as an email fallback.)
-- **Merge does NOT auto-trigger the pipeline in prod.** The CDK stack sets
-  `triggerOnPush: true`, but the CodeConnections GitHub App webhook permission
-  is not installed, so the trigger never fires. The release manager starts the
-  pipeline explicitly via `Pipeline___start_deploy` after merging.
+- **Merge does NOT auto-trigger the pipeline — the agent-owned trigger
+  contract.** The CDK stack deliberately sets `triggerOnPush: false` on the
+  Source stage: leaving it `true` would double-trigger every merge (auto +
+  RM) once the GitHub App gains webhook permission. The release manager
+  starts the pipeline explicitly via `Pipeline___start_deploy` after merging,
+  and the ManualApproval action in the Deploy stage remains the human deploy
+  gate (approved via Telegram).
 - **PR-check webhook is gated OFF by default.** The CodeBuild PR webhook only
   turns on with `PIPELINE_CI_WEBHOOK=1` at CDK deploy time. The required PR
   checks today are the GitHub Actions in `.github/workflows/ci.yml`.
