@@ -52,6 +52,40 @@ class ZeroCandidateFailsClosed(unittest.TestCase):
         self._assert_fail_closed('{"service": {"activeConfigurations": [{"foo": "bar"}]}}')
 
 
+class PartialCandidateFailsClosed(unittest.TestCase):
+    """TEAM-3846: a candidate that EXISTS but has a missing/null/empty
+    environment (or missing/null containerPort) is a degraded/partial describe
+    response — prod always carries both — and must fail closed: non-zero exit,
+    byte-empty stdout, diagnostic on stderr. Never `"environment": []`."""
+
+    def _candidate(self, **pc):
+        return json.dumps({"service": {"activeConfigurations": [{"primaryContainer": pc}]}})
+
+    def _assert_fail_closed(self, describe_json):
+        r = run(describe_json, TARGET)
+        self.assertNotEqual(r.returncode, 0, f"expected non-zero exit for {describe_json!r}")
+        self.assertEqual(r.stdout, "", f"stdout must be byte-empty for {describe_json!r}, got {r.stdout!r}")
+        self.assertNotEqual(r.stderr, "", "expected a diagnostic on stderr")
+
+    def test_missing_environment_key(self):
+        self._assert_fail_closed(self._candidate(image="old", containerPort=9090))
+
+    def test_null_environment(self):
+        self._assert_fail_closed(self._candidate(image="old", containerPort=9090, environment=None))
+
+    def test_explicit_empty_environment(self):
+        # Prod always carries env vars, so an explicit [] is suspicious too.
+        self._assert_fail_closed(self._candidate(image="old", containerPort=9090, environment=[]))
+
+    def test_missing_container_port(self):
+        env = [{"name": "GITHUB_PAT", "value": "ghp_zzz"}]
+        self._assert_fail_closed(self._candidate(image="old", environment=env))
+
+    def test_null_container_port(self):
+        env = [{"name": "GITHUB_PAT", "value": "ghp_zzz"}]
+        self._assert_fail_closed(self._candidate(image="old", containerPort=None, environment=env))
+
+
 class ValidPassthrough(unittest.TestCase):
     """(c)(d) A live primaryContainer → exit 0, image swapped, port+env preserved verbatim."""
 

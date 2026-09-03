@@ -13,7 +13,10 @@ Fail-closed: if the describe JSON yields no live primaryContainer (or is
 malformed), print NOTHING to stdout and return non-zero. Synthesizing a
 default spec would emit an EMPTY environment and wipe the live runtime env
 (Jira/GitHub/Telegram creds) on the next roll — the opposite of the
-"never rewrite env" rule above — so we never do it.
+"never rewrite env" rule above — so we never do it. The same refusal applies
+to a candidate whose containerPort or environment is missing/null, or whose
+environment is an empty list: prod always carries both, so a partial spec can
+only be a degraded describe read (TEAM-3846).
 """
 import json
 import sys
@@ -48,8 +51,24 @@ def main() -> int:
         return 1
 
     pc = candidates[0]
-    port = pc.get("containerPort", 8080)
-    environment = pc.get("environment", []) or []
+    # A candidate that EXISTS but lacks containerPort or environment is a
+    # degraded/partial describe response, not a legitimate spec — the prod
+    # service always carries both. Fail closed rather than default the port or
+    # emit an env-wiping empty environment (TEAM-3846).
+    port = pc.get("containerPort")
+    if not isinstance(port, int) or isinstance(port, bool):
+        print(f"primaryContainer has missing/invalid containerPort ({port!r}) — degraded describe response, refusing", file=sys.stderr)
+        return 1
+    environment = pc.get("environment")
+    if not isinstance(environment, list):
+        print(f"primaryContainer has missing/invalid environment ({type(environment).__name__}) — degraded describe response, refusing", file=sys.stderr)
+        return 1
+    # Explicit `"environment": []` is treated as suspicious too: prod always
+    # carries env vars (JIRA_*, GITHUB_PAT, TELEGRAM_*), so an empty list can
+    # only be a partial read — rolling with it would wipe the runtime env.
+    if not environment:
+        print("primaryContainer has empty environment — prod always carries env vars, refusing to emit an env-wiping spec", file=sys.stderr)
+        return 1
 
     primary = {"image": image, "containerPort": port, "environment": environment}
     sys.stdout.write(json.dumps(primary))

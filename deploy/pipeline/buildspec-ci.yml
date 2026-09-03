@@ -75,6 +75,7 @@ phases:
         pytest -q deploy/runtime-agent/tests \
           deploy/runtime-agent/test_telemetry_init.py \
           deploy/runtime-agent/test_build_env_vars.py \
+          deploy/workflow-manager/toolkit \
           deploy/pipeline/test_ecs_primary_container.py
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
