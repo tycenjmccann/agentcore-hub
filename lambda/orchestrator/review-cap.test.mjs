@@ -11,6 +11,7 @@ import {
   REVIEW_GATE_MAX_ROUNDS_CEILING,
   REVIEW_CAP_FAIL_OPEN_LIMIT,
 } from "./review-cap.mjs";
+import { effectiveRoundCountDiffScoped } from "./ship-review.mjs";
 
 /**
  * TEAM-3619 D2c — the review→rework loop is bounded.
@@ -387,7 +388,11 @@ describe("enforce — diff-scoped gate (TEAM-3689, release-manager.md Step 4)", 
     expect(b.store.appendReviewRound).toHaveBeenCalledTimes(1);
   });
 
-  it("malformed findings cannot fabricate a gate: null/non-object/no-files entries → non-gating", async () => {
+  it("TEAM-3756 F3a: an unattributable finding among junk GATES — non-gating requires affirmative out-of-diff citations", async () => {
+    // Before F3a this cycle was non-gating: {severity:"P1"} classified ADVISORY
+    // because it cited no files, so a genuine prose rejection suppressed its own
+    // reopen. Now only corruption (null/42/{}) stays advisory; the substantive
+    // no-files finding is UNATTRIBUTED and the rejection gates as legacy did.
     const { deps, store } = makeDeps();
     const res = await createReviewCap(deps).enforce({
       workflow: workflowWith(null),
@@ -398,8 +403,203 @@ describe("enforce — diff-scoped gate (TEAM-3689, release-manager.md Step 4)", 
       changeSet: CHANGE_SET,
       findings: [null, 42, { severity: "P1" }, {}],
     });
+    expect(res.gated).toBe(true);
+    expect(store.appendReviewRound).toHaveBeenCalledTimes(1);
+  });
+
+  it("pure corruption (null/non-object/contentless entries only) still cannot fabricate a verdict either way — stays non-gating", async () => {
+    const { deps, store } = makeDeps();
+    const res = await createReviewCap(deps).enforce({
+      workflow: workflowWith(null),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "junk findings",
+      changeSet: CHANGE_SET,
+      findings: [null, 42, {}],
+    });
     expect(res.gated).toBe(false);
     expect(store.appendReviewRound).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * TEAM-3748 D3 — the diff-scoped gate driven END-TO-END through enforce.
+ *
+ * The AC3a/AC3b tests above pin single-cycle behavior with a preset ledger; these
+ * replay a SEQUENCE of enforce calls sharing one accumulating ledger, so the cap
+ * arithmetic (AC-D3.3) and the "out-of-diff cycle doesn't count" rule (AC-D3.2)
+ * are exercised the way handleReviewRejection actually calls them.
+ */
+describe("AC-D3.2 / AC-D3.3 — diff-scoped rounds through the cap end-to-end", () => {
+  const CHANGE_SET = ["src/parser.ts"];
+  const inDiff = { changeSet: CHANGE_SET, findings: [{ citedFiles: ["src/parser.ts"] }] };
+  const outOfDiff = { changeSet: CHANGE_SET, findings: [{ citedFiles: ["vendor/legacy.ts"] }] };
+  const baseFor = (state) => ({
+    workflow: workflowWith(state),
+    gateTicket: { ticketId: GATE },
+    gateCfg: SHIP_GATE,
+    upstreamIds: ["TEAM-1"],
+  });
+
+  it("AC-D3.3: three IN-DIFF CHANGES-NEEDED rounds trip the cap (1 → 2 → 3 → escalate)", async () => {
+    const state = ledger();
+    const { deps, parkGateForHuman, publishEvent, store } = makeDeps({ ledger: state });
+    const cap = createReviewCap(deps);
+    const base = baseFor(state);
+
+    // Feedback differs per round so each is a genuine round (identical feedback
+    // under a null SHA would be treated as one redelivered rejection).
+    const r1 = await cap.enforce({ ...base, feedback: "in-diff seam A", ...inDiff });
+    const r2 = await cap.enforce({ ...base, feedback: "in-diff seam B", ...inDiff });
+    const r3 = await cap.enforce({ ...base, feedback: "in-diff seam C", ...inDiff });
+
+    expect([r1.gated, r2.gated, r3.gated]).toEqual([true, true, true]);
+    expect([r1.effectiveRounds, r2.effectiveRounds, r3.effectiveRounds]).toEqual([1, 2, 3]);
+    expect([r1.escalated, r2.escalated]).toEqual([false, false]);
+    expect(r3.escalated).toBe(true);
+    expect(store.appendReviewRound).toHaveBeenCalledTimes(3); // every in-diff round recorded
+    expect(parkGateForHuman).toHaveBeenCalledTimes(1);
+    expect(call(publishEvent, "review.cap_reached")).toHaveLength(1);
+  });
+
+  it("AC-D3.2: an out-of-diff-only cycle between in-diff rounds records nothing and does not advance the count", async () => {
+    const state = ledger();
+    const { deps, store, parkGateForHuman } = makeDeps({ ledger: state });
+    const cap = createReviewCap(deps);
+    const base = baseFor(state);
+
+    const a = await cap.enforce({ ...base, feedback: "in-diff 1", ...inDiff }); // counts → 1
+    const b = await cap.enforce({ ...base, feedback: "nit in an untouched file", ...outOfDiff }); // downgraded
+    const c = await cap.enforce({ ...base, feedback: "in-diff 2", ...inDiff }); // counts → 2
+
+    expect([a.gated, b.gated, c.gated]).toEqual([true, false, true]);
+    expect([a.effectiveRounds, b.effectiveRounds, c.effectiveRounds]).toEqual([1, 1, 2]);
+    expect(b.escalated).toBe(false);
+    expect(c.escalated).toBe(false); // still under the cap: the out-of-diff cycle never counted
+    // Only the two in-diff cycles wrote a round — the out-of-diff one did not.
+    expect(store.appendReviewRound).toHaveBeenCalledTimes(2);
+    expect(parkGateForHuman).not.toHaveBeenCalled();
+  });
+
+  it("AC-D3.3: DECISION: continue after a diff-scoped escalation authorizes ANOTHER full maxRounds of in-diff rework", async () => {
+    const state = ledger();
+    const { deps } = makeDeps({ ledger: state });
+    const cap = createReviewCap(deps);
+    const base = baseFor(state);
+
+    await cap.enforce({ ...base, feedback: "A", ...inDiff });
+    await cap.enforce({ ...base, feedback: "B", ...inDiff });
+    const tripped = await cap.enforce({ ...base, feedback: "C", ...inDiff });
+    expect(tripped.escalated).toBe(true);
+
+    // The human re-rejects WITH the override → count resets; round D is the first
+    // of the new allowance.
+    const resumed = await cap.enforce({
+      ...base,
+      feedback: "D: fix the seam properly this time.\nDECISION: continue",
+      ...inDiff,
+    });
+    expect(resumed.escalated).toBe(false);
+    expect(resumed.effectiveRounds).toBe(1);
+
+    // The new allowance is a FULL maxRounds: two more in-diff rounds proceed, the
+    // third re-trips the cap.
+    const e = await cap.enforce({ ...base, feedback: "E", ...inDiff });
+    const f = await cap.enforce({ ...base, feedback: "F", ...inDiff });
+    expect([e.effectiveRounds, f.effectiveRounds]).toEqual([2, 3]);
+    expect(e.escalated).toBe(false);
+    expect(f.escalated).toBe(true);
+  });
+
+  it("(D3d) legacy stored rounds (no change set) still count exactly as before; only rounds RECORDED with diff-scope inputs re-classify", async () => {
+    // TEAM-3756 F1 rewrote this pin. The old test asserted the F1 gap itself —
+    // "buildRoundRecord never stamps a changeSet on the rounds it records" — so
+    // recorded history could never be diff-scoped (FR-D3.3 undelivered). The
+    // preserved half of the pin: rounds WITHOUT a changeSet (all legacy history)
+    // pass through diffScopeRounds untouched and count as they always did.
+    const priors = () => [priorRound(1), priorRound(2)];
+
+    const s1 = ledger({ rounds: priors() });
+    const scoped = await createReviewCap(makeDeps({ ledger: s1 }).deps).enforce({
+      workflow: workflowWith(s1),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "third, in-diff",
+      changeSet: ["src/a.ts"],
+      findings: [{ citedFiles: ["src/a.ts"] }],
+    });
+
+    const s2 = ledger({ rounds: priors() });
+    const legacy = await createReviewCap(makeDeps({ ledger: s2 }).deps).enforce({
+      workflow: workflowWith(s2),
+      gateTicket: { ticketId: GATE },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "third, in-diff",
+    });
+
+    expect(scoped.effectiveRounds).toBe(legacy.effectiveRounds);
+    expect(scoped.effectiveRounds).toBe(3); // 2 legacy stored rounds + this gating round
+    expect([scoped.escalated, legacy.escalated]).toEqual([true, true]);
+
+    // The NEW half (FR-D3.3): the diff-scoped cycle's recorded round carries the
+    // change set and in-diff cited files, so on the next cycle's recount it
+    // re-classifies instead of passing through as legacy; the no-input cycle's
+    // recorded round is byte-shaped like legacy (no changeSet key at all).
+    const recordedScoped = s1.rounds[s1.rounds.length - 1];
+    expect(recordedScoped.changeSet).toEqual(["src/a.ts"]);
+    expect(recordedScoped.findings.every((f) => Array.isArray(f.citedFiles))).toBe(true);
+    const recordedLegacy = s2.rounds[s2.rounds.length - 1];
+    expect(recordedLegacy).not.toHaveProperty("changeSet");
+    expect(recordedLegacy.findings.every((f) => !("citedFiles" in f))).toBe(true);
+  });
+
+  it("FR-D3.3: a recorded diff-scoped round still counts on RECOUNT (in-diff cited files survive re-classification)", async () => {
+    // The load-bearing invariant of persisting changeSet: the recorded round must
+    // not silently un-count itself when effectiveRoundCountDiffScoped re-runs
+    // enforceDiffScope over it next cycle. Three diff-scoped rounds each recount
+    // all prior recorded rounds — the count reaching 3 (and escalating) proves
+    // every recorded round re-classified as still-gating.
+    const state = ledger();
+    const { deps } = makeDeps({ ledger: state });
+    const cap = createReviewCap(deps);
+    const base = baseFor(state);
+    const scoped = { changeSet: CHANGE_SET, findings: [{ citedFiles: ["src/parser.ts"] }] };
+
+    const r1 = await cap.enforce({ ...base, feedback: "seam A", ...scoped });
+    const r2 = await cap.enforce({ ...base, feedback: "seam B", ...scoped });
+    const r3 = await cap.enforce({ ...base, feedback: "seam C", ...scoped });
+    expect(state.rounds.every((r) => Array.isArray(r.changeSet))).toBe(true); // all recorded diff-scoped
+    expect([r1.effectiveRounds, r2.effectiveRounds, r3.effectiveRounds]).toEqual([1, 2, 3]);
+    expect(r3.escalated).toBe(true);
+  });
+
+  it("FR-D3.3: an advisory round that somehow reached the ledger WITH its change set counts ZERO on recount", async () => {
+    // enforce() itself never records an out-of-diff cycle (gated:false returns
+    // first) — but the release manager or a redelivery bug could land one. The
+    // recount must refuse it: a stored round whose findings all cite files
+    // outside its OWN recorded changeSet is downgraded by diffScopeRounds and
+    // contributes 0, so it can never hold the cap tripped.
+    const advisoryStored = {
+      round: 1,
+      reviewedHeadSha: null,
+      verdict: "CHANGES-NEEDED",
+      changeSet: ["src/parser.ts"],
+      findings: [{ fingerprint: "x", citedFiles: ["vendor/untouched.ts"] }],
+    };
+    const state = ledger({ rounds: [advisoryStored] });
+    const { deps } = makeDeps({ ledger: state });
+    const res = await createReviewCap(deps).enforce({
+      ...baseFor(state),
+      feedback: "a genuine in-diff finding",
+      changeSet: CHANGE_SET,
+      findings: [{ citedFiles: ["src/parser.ts"] }],
+    });
+    // Only THIS cycle counts; the stored advisory round was diff-scoped out.
+    expect(res.effectiveRounds).toBe(1);
+    expect(res.escalated).toBe(false);
   });
 });
 
@@ -788,6 +988,79 @@ describe("buildRoundRecord", () => {
     const r = buildRoundRecord({ priorRounds: [], upstreamIds: [], feedback: "a", nowIso: NOW_ISO });
     expect(r.findings).toHaveLength(1);
     expect(r.findings[0].ticketId).toBeUndefined();
+  });
+
+  describe("diff-scope persistence (TEAM-3756 F1, FR-D3.3)", () => {
+    const args = (extra = {}) => ({
+      priorRounds: [],
+      upstreamIds: ["TEAM-1"],
+      feedback: "the parser seam is broken",
+      nowIso: NOW_ISO,
+      ...extra,
+    });
+
+    it("persists changeSet + stamps in-diff cited files on the fingerprint findings when both inputs are present", () => {
+      const r = buildRoundRecord(args({
+        changeSet: ["src/parser.ts", "src/util.ts"],
+        reviewFindings: [
+          { citedFiles: ["src/parser.ts"] },              // in-diff
+          { citedFiles: ["vendor/untouched.ts"] },        // advisory — its file must NOT be stamped
+        ],
+      }));
+      expect(r.changeSet).toEqual(["src/parser.ts", "src/util.ts"]);
+      // Only the IN-DIFF findings' citations land on the fingerprint finding, so
+      // on recount it classifies IN-DIFF (every cited file inside the change set).
+      expect(r.findings[0].citedFiles).toEqual(["src/parser.ts"]);
+      // The classified reviewer findings ride along for audit.
+      expect(r.reviewFindings.map((f) => f.classification)).toEqual(["IN-DIFF", "ADVISORY"]);
+    });
+
+    it("omits both keys entirely when either input is absent — legacy round shape byte-identical", () => {
+      for (const extra of [
+        {},
+        { changeSet: ["src/parser.ts"] },
+        { reviewFindings: [{ citedFiles: ["src/parser.ts"] }] },
+      ]) {
+        const r = buildRoundRecord(args(extra));
+        expect(r).not.toHaveProperty("changeSet");
+        expect(r).not.toHaveProperty("reviewFindings");
+        expect(r.findings[0]).not.toHaveProperty("citedFiles");
+      }
+    });
+
+    it("all-out-of-diff reviewer findings → legacy round (no changeSet), so it still COUNTS if it ever reaches the ledger", () => {
+      // enforce() returns gated:false before recording such a cycle; if a direct
+      // caller records one anyway, persisting the changeSet with no in-diff
+      // citations would make the round count ZERO on recount — the silent
+      // un-counting (unbounded-loop) direction. Legacy shape fails toward
+      // over-counting instead.
+      const r = buildRoundRecord(args({
+        changeSet: ["src/parser.ts"],
+        reviewFindings: [{ citedFiles: ["vendor/untouched.ts"] }],
+      }));
+      expect(r).not.toHaveProperty("changeSet");
+      expect(r.findings[0]).not.toHaveProperty("citedFiles");
+    });
+
+    it("a recorded diff-scoped regression round still weighs DOUBLE on recount (regressionOf survives diff-scoping)", () => {
+      const fp = fingerprintFinding("TEAM-1", "same complaint");
+      const r = buildRoundRecord({
+        priorRounds: [
+          { round: 1, verdict: "CHANGES-NEEDED", findings: [{ fingerprint: fp }] },
+          { round: 2, verdict: "CHANGES-NEEDED", findings: [{ fingerprint: "unrelated" }] },
+        ],
+        upstreamIds: ["TEAM-1"],
+        feedback: "same complaint",
+        nowIso: NOW_ISO,
+        changeSet: ["src/parser.ts"],
+        reviewFindings: [{ citedFiles: ["src/parser.ts"] }],
+      });
+      expect(r.findings[0].regressionOf).toMatchObject({ round: 1 });
+      expect(r.findings[0].citedFiles).toEqual(["src/parser.ts"]);
+      // In-diff cited files keep the finding IN-DIFF under enforceDiffScope, so
+      // regressionOf is not stripped and the round contributes 2, not 1.
+      expect(effectiveRoundCountDiffScoped([r], [], { regressionCountsDouble: true })).toBe(2);
+    });
   });
 });
 

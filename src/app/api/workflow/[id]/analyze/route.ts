@@ -13,7 +13,10 @@ import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const ANALYZER_FUNCTION = process.env.WORKFLOW_ANALYZER_FUNCTION || "agentcore-hub-workflow-analyzer";
-const TERMINAL_PHASES = new Set(["complete", "cancelled", "error"]);
+// TEAM-3747 D2: a run closed on a lifecycle-integrity ship outcome
+// (deploy-blocked / static-ci-only) is terminal and analyzable, exactly like
+// complete/error/cancelled. Additive; parity with completion.mjs SHIP_BLOCKED_OUTCOMES.
+const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only"]);
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },

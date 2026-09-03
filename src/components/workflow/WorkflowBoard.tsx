@@ -1,11 +1,13 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
-import type {
-  WorkflowState,
-  WorkflowEvent,
-  TicketStatus,
-  AgentRun,
+import {
+  type WorkflowState,
+  type WorkflowEvent,
+  type TicketStatus,
+  type AgentRun,
+  SHIP_BLOCKED_OUTCOMES,
+  isTerminalPhase,
 } from "@/lib/workflow/types";
 import awsIcons from "@/lib/aws-icons.json";
 import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePhaseConfig } from "@/lib/pipeline-config";
@@ -119,13 +121,20 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   phaseOrderRef.current = phaseOrder;
 
   // Poll the deploy pipeline for a waiting approval, but only for a ship-phase
-  // run that isn't already complete/cancelled (the deploy gate only exists after
-  // merge). One poll on mount + every 20s; clears when nothing awaits.
+  // run that isn't already terminal (the deploy gate only exists after merge).
+  // One poll on mount + every 20s; clears when nothing awaits.
   const defHasShip = useMemo(
     () => (getWorkflowDef(workflowDefId).completionRequiresAgentPhases || []).includes("ship"),
     [workflowDefId]
   );
-  const runActive = !!state && state.phase !== "complete" && !state.cancelledAt;
+  // TEAM-3767 F8: use the shared terminal predicate so the epic's HONEST
+  // ship-blocked terminals (deploy-blocked / static-ci-only) stop polling and
+  // never render the amber banner, alongside complete/error/cancelled — a
+  // finished run has no live deploy gate. The distinct cancelledAt timestamp
+  // guard is preserved so a run cancelled before its phase flips to "cancelled"
+  // still stops (no weakening of #293). Active ship-phase runs are unaffected:
+  // !isTerminalPhase("ship") stays true, so they poll + banner exactly as before.
+  const runActive = !!state && !isTerminalPhase(state.phase) && !state.cancelledAt;
   useEffect(() => {
     if (!defHasShip || !runActive) { setDeployGate(null); return; }
     let cancelled = false;
@@ -438,7 +447,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     // Poll every 15s while workflow is active (no SSE ticket_update events yet).
     // Keep polling a "complete" run while fix-it tickets remain open so the
     // board un-freezes itself when QA follow-ups finally close.
-    const isActive = state?.phase && (state.phase !== "complete" || hasOpenTickets);
+    // TEAM-3747 D2: a ship-blocked run is terminal with no open tickets — stop
+    // polling it, exactly as a settled "complete" run. error/cancelled polling is
+    // left unchanged (additive).
+    const phaseBlocked = state?.phase && (SHIP_BLOCKED_OUTCOMES as readonly string[]).includes(state.phase);
+    const isActive = state?.phase && !phaseBlocked && (state.phase !== "complete" || hasOpenTickets);
     if (!isActive) return;
     const interval = setInterval(fetchTickets, 15_000);
     return () => clearInterval(interval);
@@ -861,6 +874,17 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // QA can file follow-ups after every phase has passed once.
   const isComplete = state?.phase === "complete" && !hasOpenTickets;
   const isSettled = isComplete && !celebrating;
+  // TEAM-3747 D2: a run closed on a lifecycle-integrity ship outcome. Rendered as
+  // its own terminal state in the header (NOT "In Progress: deploy-blocked") with
+  // a human label. Legacy runs never carry these phases, so this is inert for them.
+  const shipBlockedPhase =
+    state?.phase && (SHIP_BLOCKED_OUTCOMES as readonly string[]).includes(state.phase)
+      ? state.phase
+      : null;
+  const shipBlockedLabel =
+    shipBlockedPhase === "deploy-blocked" ? "Deploy Blocked"
+    : shipBlockedPhase === "static-ci-only" ? "CI-Only (Not Shipped)"
+    : null;
 
   // Trigger connector animation when activeConnector changes
   useEffect(() => {
@@ -1312,11 +1336,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             </div>
           )}
 
-          <div className={`pipeline-status-header ${isComplete ? "settled" : ""} ${state.phase === "cancelled" ? "cancelled" : ""}`}>
+          <div className={`pipeline-status-header ${isComplete ? "settled" : ""} ${(state.phase === "cancelled" || shipBlockedPhase) ? "cancelled" : ""}`}>
             <span className={SDLC_BADGE_META[fw].boardClassName} title={SDLC_BADGE_META[fw].tooltip} aria-label={SDLC_BADGE_META[fw].tooltip}>
               {SDLC_BADGE_META[fw].label}
             </span>
-            {isComplete ? "Complete" : state.phase === "cancelled" ? "Cancelled" : state.phase === "error" ? "Error" : `In Progress: ${
+            {isComplete ? "Complete" : shipBlockedLabel ? shipBlockedLabel : state.phase === "cancelled" ? "Cancelled" : state.phase === "error" ? "Error" : `In Progress: ${
               // Phase "complete" with open fix-it tickets → name the phase still working
               (state.phase === "complete"
                 ? pipelinePhases.find((p) => p.agents.some((a) => openTicketByAgent.has(a.agentId)))?.name
@@ -1326,7 +1350,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
 
 
           {/* Manager watch toggle + Cancel — only for active (non-terminal) workflows */}
-          {state && state.phase !== "complete" && state.phase !== "error" && state.phase !== "cancelled" && (
+          {state && !isTerminalPhase(state.phase) && (
             <button
               onClick={toggleManagerWatch}
               className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium border transition-all duration-150 ${
@@ -1341,7 +1365,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
               <span className="hidden md:inline">{managerWatch ? "Manager watching" : "Manager off"}</span>
             </button>
           )}
-          {state && state.phase !== "complete" && state.phase !== "error" && state.phase !== "cancelled" && (
+          {/* TEAM-3755 F6: gate on the SHARED terminal set, not three literals —
+              the hand-rolled list predated the ship-blocked outcomes, so Cancel
+              stayed rendered on an already-finished deploy-blocked /
+              static-ci-only run. Same gate as the manager-watch toggle above. */}
+          {state && !isTerminalPhase(state.phase) && (
             <button
               onClick={() => { setCancelError(null); setShowCancelModal(true); }}
               disabled={cancelLoading}

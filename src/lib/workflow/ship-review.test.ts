@@ -286,8 +286,12 @@ describe("enforceDiffScope — diff-scoped gate (AC-D2.1)", () => {
     expect(enforceDiffScope(outside).verdict).toBe("PASS-with-known-findings");
   });
 
-  it("AC-d: tolerant of malformed input — never throws, and malformed findings cannot block", () => {
-    // Finding citing no files → advisory (cannot gate).
+  it("AC-d: tolerant of malformed input — never throws, and contentless entries cannot block", () => {
+    // TEAM-3756 F3a: a finding with substance but NO resolvable files is
+    // UNATTRIBUTED and GATES — "we couldn't parse the citation" is not evidence
+    // the finding is out-of-diff. (Before, prose-only citations classified
+    // ADVISORY, so a genuine CHANGES-NEEDED with inDiffCount 0 silently
+    // downgraded to PASS and the reopen was suppressed.)
     const noFiles: ShipRoundLike = {
       round: 1,
       verdict: "CHANGES-NEEDED",
@@ -295,10 +299,13 @@ describe("enforceDiffScope — diff-scoped gate (AC-D2.1)", () => {
       findings: [{ severity: "P1" } as unknown as NonNullable<ShipRoundLike["findings"]>[number]],
     };
     expect(() => enforceDiffScope(noFiles)).not.toThrow();
-    expect(enforceDiffScope(noFiles).findings![0]!.classification).toBe("ADVISORY");
-    expect(enforceDiffScope(noFiles).verdict).toBe("PASS-with-known-findings");
+    expect(enforceDiffScope(noFiles).findings![0]!.classification).toBe("UNATTRIBUTED");
+    expect(enforceDiffScope(noFiles).verdict).toBe("CHANGES-NEEDED");
+    expect(effectiveRoundCountDiffScoped([noFiles])).toBe(1); // still a rework round
 
-    // Non-object finding entries + a genuinely empty finding → all advisory.
+    // Non-object finding entries + a genuinely CONTENTLESS finding ({} — no
+    // substantive keys) → all advisory: ledger corruption, not a reviewer's
+    // finding. This is where "malformed cannot block" still holds.
     const junk: ShipRoundLike = {
       round: 1,
       verdict: "CHANGES-NEEDED",
@@ -387,6 +394,73 @@ describe("enforceDiffScope — diff-scoped gate (AC-D2.1)", () => {
       findings: [{ citedFiles: ["src/a.ts"], regressionOf: { round: 0 } }],
     };
     expect(effectiveRoundCountDiffScoped([inDiffRegression])).toBe(2);
+  });
+
+  // AC-D3.2 — the load-bearing invariant, stated once directly rather than
+  // inferred from the cases above: for ANY change set, enforceDiffScope's output
+  // obeys "CHANGES-NEEDED ⟺ at least one surviving IN-DIFF finding". A round can
+  // never remain blocking on out-of-diff nits alone, and a downgraded round can
+  // never count toward the cap. Every row is a CHANGES-NEEDED input; the column
+  // records whether ANY cited finding is genuinely in-diff.
+  it("AC-D3.2 invariant: post-enforce, CHANGES-NEEDED ⟺ ≥1 gating (IN-DIFF or UNATTRIBUTED) finding, and a downgrade always counts 0", () => {
+    const cs = ["src/a.ts", "src/b.ts"];
+    const rows: Array<{ name: string; findings: ShipRoundLike["findings"]; gates: boolean }> = [
+      { name: "only out-of-diff", findings: [{ citedFiles: ["x/y.ts"] }], gates: false },
+      // TEAM-3756 F3a: no resolvable files ≠ out-of-diff — an unattributable
+      // finding GATES rather than silently downgrading a genuine rejection.
+      { name: "no files cited (UNATTRIBUTED)", findings: [{ severity: "P1" } as unknown as NonNullable<ShipRoundLike["findings"]>[number]], gates: true },
+      { name: "empty findings", findings: [], gates: false },
+      // A single finding straddling the diff boundary affirmatively cites an
+      // out-of-diff file → advisory → the whole round downgrades.
+      { name: "one stray file in an otherwise in-diff finding", findings: [{ citedFiles: ["src/a.ts", "x/y.ts"] }], gates: false },
+      { name: "one in-diff finding", findings: [{ citedFiles: ["src/a.ts"] }], gates: true },
+      { name: "in-diff + out-of-diff mixed", findings: [{ citedFiles: ["src/b.ts"] }, { citedFiles: ["x/y.ts"] }], gates: true },
+    ];
+
+    for (const { name, findings, gates } of rows) {
+      const round: ShipRoundLike = { round: 1, verdict: "CHANGES-NEEDED", changeSet: cs, findings };
+      const out = enforceDiffScope(round, cs);
+      const survivingGating = (out.findings ?? []).some(
+        (f) => f && ["IN-DIFF", "UNATTRIBUTED"].includes((f as { classification?: string }).classification ?? "")
+      );
+
+      // The invariant, both directions.
+      expect(survivingGating, `${name}: surviving gating finding should be ${gates}`).toBe(gates);
+      if (gates) {
+        expect(out.verdict, `${name}: keeps blocking`).toBe("CHANGES-NEEDED");
+        expect(effectiveRoundCountDiffScoped([round]), `${name}: gating round counts`).toBeGreaterThan(0);
+      } else {
+        // No gating finding survives → the verdict is a non-blocking form and the
+        // round is inert against the cap (this is why out-of-diff rounds are free).
+        expect(out.verdict, `${name}: downgraded, never CHANGES-NEEDED`).not.toBe("CHANGES-NEEDED");
+        expect(["PASS", "PASS-with-known-findings"], `${name}: non-blocking verdict`).toContain(out.verdict);
+        expect(effectiveRoundCountDiffScoped([round]), `${name}: downgraded round counts 0`).toBe(0);
+      }
+    }
+  });
+
+  it("TEAM-3756 F3a: an unattributed finding keeps its regressionOf (weighs double) and re-enforcing is idempotent", () => {
+    const round: ShipRoundLike = {
+      round: 2,
+      verdict: "CHANGES-NEEDED",
+      changeSet: ["src/a.ts"],
+      findings: [
+        { severity: "P1", regressionOf: { round: 1 } } as unknown as NonNullable<ShipRoundLike["findings"]>[number],
+        null, // corruption sentinel-to-be
+      ],
+    };
+    const once = enforceDiffScope(round);
+    expect(once.findings![0]!.classification).toBe("UNATTRIBUTED");
+    expect((once.findings![0] as { regressionOf?: unknown }).regressionOf).toEqual({ round: 1 });
+    expect(effectiveRoundCountDiffScoped([round])).toBe(2); // gates AND weighs double
+
+    // Idempotent: a second pass must not promote the first pass's advisory
+    // sentinel ({classification} only) to UNATTRIBUTED.
+    const twice = enforceDiffScope(once);
+    expect(twice.findings!.map((f) => f!.classification)).toEqual(
+      once.findings!.map((f) => f!.classification)
+    );
+    expect(twice.verdict).toBe(once.verdict);
   });
 });
 

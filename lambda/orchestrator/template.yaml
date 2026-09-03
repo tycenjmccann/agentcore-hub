@@ -21,6 +21,7 @@ Globals:
         PROJECT_KEY: TEAM
         DEAD_SESSION_DETECTOR_MODE: !Ref DeadSessionDetectorMode
         CASCADE_EXTENDED_STATES: !Ref CascadeExtendedStates
+        RECONCILE_SWEEP_MODE: !Ref ReconcileSweepMode
 
 Parameters:
   TicketsTableName:
@@ -72,6 +73,19 @@ Parameters:
       in_progress whose last blocker resolves is lease-guarded (live lease →
       orchestrator.nudge only; stale lease → steal + re-dispatch via the claim
       CAS) and an in_review gate is re-woken (review.reawakened + gate re-run).
+
+  ReconcileSweepMode:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Missed-unblock reconciliation sweep rollout (TEAM-3747 D1 / FR-D1.3
+      backstop). off = dark: runSweep short-circuits before its first DynamoDB
+      scan, so ZERO extra reads/writes; shadow = observe-only scan (metrics/logs
+      of what WOULD be re-driven, no writes); enforce = re-drive stalled
+      dependents. Default "off" matches the code's unset default, so the backstop
+      ships dark — same rollout posture as deploy.sh (TEAM-3763 F2), which only
+      forwards RECONCILE_SWEEP_MODE when explicitly set.
 
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────
@@ -134,6 +148,26 @@ Resources:
             Name: agentcore-hub-dead-session-sweep
             Description: Invoke the orchestrator to sweep for dead agent sessions.
             Input: '{"source":"orchestrator.sweep","action":"dead_session_sweep"}'
+        # Missed-unblock reconciliation sweep (TEAM-3747 D1 / FR-D1.3 backstop).
+        # Same sentinel-Input pattern as DeadSessionSweep — index.mjs branches on
+        # action=reconcile_sweep before any stream/webhook parsing. Dark by
+        # default: RECONCILE_SWEEP_MODE=off (runSweep short-circuits before its
+        # first scan), so scheduling it costs nothing until an operator opts in.
+        #
+        # SHAPE DIFFERENCE (do NOT "fix" one to match the other blindly): a SAM
+        # Schedule event creates its OWN EventBridge rule, so this needs a rule
+        # Name distinct from the dead-session rule. deploy.sh takes the other
+        # valid shape — ONE rule (agentcore-hub-dead-session-sweep) with TWO
+        # targets (dead_session_sweep + reconcile_sweep) — see deploy.sh
+        # (TEAM-3763 F2). Both schedule the same reconcile_sweep action every 5m;
+        # keep template.yaml and deploy.sh in agreement on that behavior.
+        ReconcileSweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Name: agentcore-hub-reconcile-sweep
+            Description: Invoke the orchestrator to run the missed-unblock reconciliation sweep (TEAM-3747 D1 / FR-D1.3 backstop).
+            Input: '{"source":"orchestrator.sweep","action":"reconcile_sweep"}'
 
   # ─── Agent Invoker Lambda (async, long-running) ────────────────────────────────
   AgentInvokerFunction:

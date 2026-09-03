@@ -53,8 +53,12 @@ import { BUCKET_MS, durationToMs, validateBands } from "./bands-schema.mjs";
 export const LOG_PREFIX = "[anomaly-watcher]";
 /** Canonical cycle length. Must match the schedule's rate(10 minutes) (§5). */
 export const CYCLE_MS = 600_000;
-/** workflow-analyzer/index.mjs:36 — the fleet's definition of "not open". */
-export const TERMINAL_PHASES = new Set(["complete", "cancelled", "error"]);
+/** workflow-analyzer/index.mjs:36 — the fleet's definition of "not open".
+ *  TEAM-3747 D2: the lifecycle-integrity ship outcomes are terminal too — a run
+ *  closed deploy-blocked / static-ci-only is FINISHED, so the watcher must not
+ *  count it as open or nudge/escalate it. Additive; parity with
+ *  completion.mjs SHIP_BLOCKED_OUTCOMES. */
+export const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only"]);
 /** §6 — max OPEN anomaly-filed workflows fleet-wide. */
 export const OPEN_WORKFLOW_CAP = 3;
 /** TEAM-3334 F3: how many recent ratelimit cycle items supplement the GSI count. */

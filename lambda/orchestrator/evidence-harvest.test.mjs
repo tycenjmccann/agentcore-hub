@@ -183,8 +183,31 @@ describe("completion-evidence harvest on the done cascade", () => {
     expect(h.state.merges[0].fields.output).toBe("Implemented the feature and pushed the branch.");
   });
 
-  it("existing evidence wins — no S3 read, no merge", async () => {
+  it("existing evidence wins for the deliverable — but the ship signals are still harvested", async () => {
+    // TEAM-3747 D2 changed the early return from `hasEvidence` to
+    // `hasEvidence && hasShipSignal`: a landed webhook merge still owns `output`,
+    // yet the record's merge/deploy signals must reach the entry or the ship gate
+    // would false-block a run that really did ship.
     h.state.workflow = makeWorkflow({ output: "webhook merge landed first" });
+    h.state.s3Objects[COMPLETION_KEY] = RECORD;
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.s3Gets).toContain(COMPLETION_KEY);
+    expect(h.state.merges).toHaveLength(1);
+    // output/branch untouched (the webhook's deliverable wins) …
+    expect(h.state.merges[0].fields.output).toBeUndefined();
+    expect(h.state.merges[0].fields.branch).toBeUndefined();
+    // … only the ship-verdict signals are filled.
+    expect(h.state.merges[0].fields).toEqual({
+      commitSha: "abc123",
+      prUrl: "https://github.com/o/r/pull/7",
+    });
+    expect(h.state.workflow.agentTasks[DONE].output).toBe("webhook merge landed first");
+  });
+
+  it("evidence AND a ship signal already present — no S3 read, no merge", async () => {
+    // Both halves satisfied is the only short-circuit left; it must still hold or
+    // every done ticket re-reads S3 on every cascade.
+    h.state.workflow = makeWorkflow({ output: "webhook merge landed first", mergeCommit: "9f1c2ab" });
     h.state.s3Objects[COMPLETION_KEY] = RECORD;
     await handleTicketDoneUnified(DONE);
     expect(h.state.s3Gets).not.toContain(COMPLETION_KEY);
@@ -209,5 +232,104 @@ describe("completion-evidence harvest on the done cascade", () => {
     h.state.s3Objects[COMPLETION_KEY] = JSON.stringify({ ticket_id: DONE, summary: "x".repeat(20000) });
     await handleTicketDoneUnified(DONE);
     expect(h.state.merges[0].fields.output).toHaveLength(10000);
+  });
+});
+
+/**
+ * TEAM-3747 D2 — the ship/CD verdict signals. The merge-verdict gate reads
+ * agentTasks[tid].mergeCommit / .outcome / .blockReason, and the ONLY writer that
+ * runs on the live cascade is this harvest. If merge_commit stopped being picked
+ * up, every shipped run would false-close static-ci-only; if outcome/block_reason
+ * stopped, a genuinely blocked deploy would degrade to the vaguer verdict with no
+ * reason for the human. Each is filled only when the entry lacks it (additive —
+ * legacy records simply have no such keys).
+ */
+const harvest = (record) => { h.state.s3Objects[COMPLETION_KEY] = JSON.stringify({ ticket_id: DONE, ...record }); };
+
+describe("ship-verdict harvest — merge_commit / outcome / block_reason (TEAM-3747 D2)", () => {
+  it("harvests merge_commit + a shipped outcome alongside the deliverable evidence", async () => {
+    harvest({ summary: "Merged and deployed.", branch: "feature/x", commit_sha: "abc123", pr_url: "https://github.com/o/r/pull/7", merge_commit: "9f1c2ab", outcome: "shipped" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges).toEqual([{
+      wfId: "wf_1",
+      tid: DONE,
+      fields: {
+        output: "Merged and deployed.",
+        branch: "feature/x",
+        commitSha: "abc123",
+        prUrl: "https://github.com/o/r/pull/7",
+        mergeCommit: "9f1c2ab",
+        outcome: "shipped",
+      },
+    }]);
+    // The in-memory entry the same invoke's ship gate will read.
+    expect(h.state.workflow.agentTasks[DONE].mergeCommit).toBe("9f1c2ab");
+    expect(h.state.workflow.agentTasks[DONE].outcome).toBe("shipped");
+  });
+
+  it("harvests a deploy-blocked outcome WITH its block reason", async () => {
+    harvest({ summary: "Pre-merge preflight BLOCKED.", outcome: "deploy-blocked", block_reason: "required check cd/deploy-staging is failing — refusing to merge" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.outcome).toBe("deploy-blocked");
+    expect(h.state.merges[0].fields.blockReason).toBe("required check cd/deploy-staging is failing — refusing to merge");
+    // Nothing merged pretends the work shipped.
+    expect(h.state.merges[0].fields.mergeCommit).toBeUndefined();
+  });
+
+  it("static-ci-only is harvested too (the other honest terminal outcome)", async () => {
+    harvest({ summary: "CI green, nothing deployed.", outcome: "STATIC-CI-ONLY  " });
+    await handleTicketDoneUnified(DONE);
+    // Normalized on the way in, so the gate's comparison never depends on casing.
+    expect(h.state.merges[0].fields.outcome).toBe("static-ci-only");
+  });
+
+  it("an unrecognized outcome is DROPPED, not stored — the rest still harvests", async () => {
+    // A garbage or future-schema outcome must not become a verdict the gate then
+    // trusts; the
+    // entry stays verdict-less, which the gate reads as "not shipped".
+    harvest({ summary: "done-ish", outcome: "kinda-shipped", merge_commit: "9f1c2ab" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.outcome).toBeUndefined();
+    expect(h.state.merges[0].fields.mergeCommit).toBe("9f1c2ab");
+  });
+
+  it("a non-string outcome is ignored", async () => {
+    harvest({ summary: "done-ish", outcome: 200 });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.outcome).toBeUndefined();
+  });
+
+  it("an oversized block_reason is clamped to 500 chars", async () => {
+    // The store clamps too; clamping here keeps the in-memory entry identical to
+    // the persisted one (and the reason ends up in a DDB expression value).
+    harvest({ summary: "blocked", outcome: "deploy-blocked", block_reason: "y".repeat(2000) });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.blockReason).toHaveLength(500);
+  });
+
+  it("verdict signals already on the entry are never overwritten", async () => {
+    // A ship signal is present, but no deliverable evidence → the harvest still
+    // runs (for output/branch) and must leave the existing verdict alone: the
+    // agent's own later report wins over a stale completion record.
+    h.state.workflow = makeWorkflow({ mergeCommit: "already11", outcome: "shipped", blockReason: "prior reason" });
+    harvest({ summary: "s", merge_commit: "different22", outcome: "deploy-blocked", block_reason: "new reason" });
+    await handleTicketDoneUnified(DONE);
+    const fields = h.state.merges[0].fields;
+    expect(fields.output).toBe("s"); // the missing half IS filled
+    expect(fields.mergeCommit).toBeUndefined();
+    expect(fields.outcome).toBeUndefined();
+    expect(fields.blockReason).toBeUndefined();
+    expect(h.state.workflow.agentTasks[DONE].mergeCommit).toBe("already11");
+  });
+
+  it("a legacy record with none of the D2 keys harvests exactly as before (AC-D2.5)", async () => {
+    harvest({ summary: "Implemented the feature and pushed the branch.", branch: "feature/x", commit_sha: "abc123", pr_url: "https://github.com/o/r/pull/7" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields).toEqual({
+      output: "Implemented the feature and pushed the branch.",
+      branch: "feature/x",
+      commitSha: "abc123",
+      prUrl: "https://github.com/o/r/pull/7",
+    });
   });
 });

@@ -26,6 +26,92 @@
 const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
 
 /**
+ * TEAM-3747 D2 — lifecycle-integrity terminal outcomes ("no green close over
+ * unshipped work"). PARITY MIRROR of src/lib/workflow/types.ts SHIP_BLOCKED_OUTCOMES
+ * (this .mjs module cannot import the TS module). Also mirrored in
+ * deploy/workflow-manager/toolkit/save_analysis.py RUN_OUTCOMES. Keep the three
+ * lists in agreement — a value here must exist there and vice-versa.
+ *   - "deploy-blocked" : a deploy/preflight was attempted and blocked.
+ *   - "static-ci-only" : CI was green but nothing was merged/deployed.
+ */
+export const SHIP_BLOCKED_OUTCOMES = ["deploy-blocked", "static-ci-only"];
+
+/**
+ * TEAM-3755 F2 — the ONE list of phases a run can already be closed on. Every
+ * terminal-claim CAS must refuse ALL of them, or a later write can overwrite an
+ * earlier honest verdict.
+ *
+ * The bug this fixes: completeWorkflow's ConditionExpression excluded only
+ * complete/cancelled/error, so a run already closed "deploy-blocked" or
+ * "static-ci-only" (the TEAM-3747 D2 honest-close outcomes) still satisfied the
+ * condition — a completion racing in behind the block silently overwrote the
+ * blocked phase with "complete", destroying the FR-D2.2 evidence that nothing
+ * shipped. claimTerminalOutcome already listed all five; the two writes had
+ * drifted apart because each spelled the list out by hand.
+ *
+ * Derived from SHIP_BLOCKED_OUTCOMES so a sixth outcome cannot be added to one
+ * write and forgotten in the other. PARITY MIRROR of the TERMINAL_PHASES in
+ * src/lib/workflow/types.ts (same five values, same purpose).
+ */
+export const TERMINAL_WORKFLOW_PHASES = Object.freeze([
+  "complete",
+  "cancelled",
+  "error",
+  ...SHIP_BLOCKED_OUTCOMES,
+]);
+
+/**
+ * Build the "not already terminal" half of a terminal-claim ConditionExpression
+ * from TERMINAL_WORKFLOW_PHASES. Returns { condition, values } to splice into an
+ * UpdateCommand; `nameRef` is how the caller refers to the phase attribute
+ * ("phase" bare, or "#phase" when it is aliased).
+ *
+ * Placeholders are positional (:tp0…) so they can never collide with a caller's
+ * own SET values, and every declared value IS referenced by the condition —
+ * DynamoDB rejects an unused ExpressionAttributeValues entry.
+ */
+export function notTerminalPhaseGuard(nameRef = "phase") {
+  const values = {};
+  const condition = TERMINAL_WORKFLOW_PHASES.map((phase, i) => {
+    const key = `:tp${i}`;
+    values[key] = phase;
+    return `${nameRef} <> ${key}`;
+  }).join(" AND ");
+  return { condition, values };
+}
+
+/**
+ * TEAM-3755 F8 — the SCAN counterpart of notTerminalPhaseGuard: the
+ * "still open" FilterExpression the background sweeps (reconcile-sweep.mjs, the
+ * dead-session detector) use to skip finished runs, derived from the SAME
+ * TERMINAL_WORKFLOW_PHASES list so a sweep can never re-drive work inside a run
+ * that already closed deploy-blocked / static-ci-only.
+ *
+ * Deliberately the `NOT (#p IN (…))` form the sweeps already used, NOT the
+ * guard's chain of `<>`: for an item with NO phase attribute the two differ —
+ * `IN` evaluates false so `NOT (…)` KEEPS the row, whereas every `<>` would
+ * evaluate false and DROP it. Rows in the workflows table that carry no phase
+ * (e.g. the start-route dedup markers) must keep reading as non-terminal exactly
+ * as before; this helper changes which phases are excluded, nothing else.
+ */
+export function notTerminalPhaseFilter(nameRef = "#p") {
+  const values = {};
+  const keys = TERMINAL_WORKFLOW_PHASES.map((phase, i) => {
+    const key = `:tp${i}`;
+    values[key] = phase;
+    return key;
+  });
+  return { filter: `NOT (${nameRef} IN (${keys.join(", ")}))`, values };
+}
+
+/**
+ * Agent phases whose done tickets owe a MERGE/DEPLOY verdict rather than mere
+ * output (the ship / CD stage). A def opts in by listing "ship" in its
+ * completionRequiresAgentPhases; runs with no ship phase are wholly unaffected.
+ */
+export const SHIP_PHASES = new Set(["ship"]);
+
+/**
  * TEAM-3686 Finding 3: deliverable-evidence check for the orchestrator's
  * completion path. Hand-port of the HTTP route's missingEvidenceTickets
  * (src/app/api/workflow/[id]/complete/route.ts) — same semantics: for every
@@ -145,4 +231,118 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
 
     return true;
   });
+}
+
+/**
+ * TEAM-3747 D2 — ship/CD merge-verdict for ONE harvested agentTasks entry.
+ *
+ * For a ship-phase ticket, "done + non-empty output" is NOT proof the work
+ * shipped — only a merge commit / deploy verdict is. This is the crucial
+ * difference from missingEvidenceTickets (which accepts any output/artifact).
+ * Classifies the entry into one of:
+ *   "shipped"          → carries a positive merge/deploy signal: a non-empty
+ *                        `mergeCommit`, or an EXPLICIT outcome==="shipped".
+ *
+ *                        TEAM-3755 F1 (P0): `commitSha` is deliberately NOT a
+ *                        merge signal. harvestCompletionEvidence stores every
+ *                        agent's record.commit_sha — that is the HEAD of the
+ *                        (still unmerged) feature branch, present on literally
+ *                        every dev/ship completion record. Accepting it made
+ *                        shipVerdictOf return "shipped" for unmerged work, so
+ *                        the D2 gate passed and the run closed "complete" over
+ *                        an unshipped branch — the exact 29g73c failure this
+ *                        gate exists to stop (FR-D2.2 / AC-D2.4). Only a merge
+ *                        commit (or the release manager's explicit verdict)
+ *                        proves the work landed.
+ *   <a SHIP_BLOCKED_OUTCOMES value> → the agent recorded an EXPLICIT terminal
+ *                        block ("deploy-blocked" / "static-ci-only").
+ *   null               → neither: a phantom green close (CI may be green, but
+ *                        nothing merged/deployed and no block was declared).
+ *
+ * Reads only harvested fields (see harvestCompletionEvidence in index.mjs), so it
+ * is pure + testable with plain data. Legacy entries (no outcome/mergeCommit)
+ * classify as null — the caller decides how to treat a missing verdict.
+ */
+export function shipVerdictOf(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const outcome = typeof entry.outcome === "string" ? entry.outcome.trim().toLowerCase() : "";
+  if (SHIP_BLOCKED_OUTCOMES.includes(outcome)) return outcome;
+  // A merge commit is the ONLY harvested field that proves the work landed.
+  // commitSha is NOT consulted (see the F1 note above) — it is the unmerged
+  // branch HEAD and is present on every completion record.
+  const merged = typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0;
+  if (merged || outcome === "shipped") return "shipped";
+  return null;
+}
+
+/**
+ * TEAM-3747 D2 — decide the ship/CD verdict for a whole run. Given the epic's
+ * children, the harvested agentTasks, and the def's ship phases, returns:
+ *   {
+ *     required:    boolean — the run actually has a ship phase to verify.
+ *     shipped:     boolean — every done ship AGENT ticket carries a positive
+ *                            merge/deploy verdict (true also when required=false).
+ *     outcome:     when NOT shipped, the HONEST terminal phase to close on —
+ *                  "deploy-blocked" if any ship ticket recorded an explicit
+ *                  block, else "static-ci-only" (green but nothing merged).
+ *     blockReason: first recorded block reason (null if none).
+ *     offenders:   [{ ticketId, phase, verdict }] — ship tickets missing a verdict.
+ *   }
+ *
+ * Mirrors the "only tightens when it can prove" discipline of
+ * missingEvidenceTickets: with no done ship agent ticket to inspect it returns
+ * shipped=true (it cannot prove a phantom). Human review-gate tickets in a ship
+ * phase owe no merge verdict — only agent tickets are inspected. A ticket's phase
+ * is its explicit `phase` stamp when present, else the assignee's roster phase.
+ */
+export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {}) {
+  const phases = shipPhases instanceof Set ? shipPhases : new Set(shipPhases || []);
+  const inert = { required: false, shipped: true, outcome: null, blockReason: null, offenders: [] };
+  if (!Array.isArray(children) || phases.size === 0) return inert;
+
+  const getAgentPhase = opts.getAgentPhase || (() => undefined);
+  const phaseOf = (t) =>
+    typeof t.phase === "string" && t.phase ? t.phase : getAgentPhase(t.assignee);
+  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
+  const byTicketId = new Map();
+  for (const entry of Object.values(tasks)) {
+    if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
+  }
+
+  const shipTickets = children.filter(
+    (t) =>
+      t.type !== "epic" &&
+      String(t.status || "").toLowerCase() === "done" &&
+      !isHuman(t.assignee) &&
+      phases.has(phaseOf(t))
+  );
+  // Cannot prove a phantom with nothing to inspect — stay green (isWorkflowComplete
+  // already requires a done agent ticket per required phase, so this is defensive).
+  if (shipTickets.length === 0) return { ...inert, required: true };
+
+  let blocked = null;
+  let blockReason = null;
+  const offenders = [];
+  for (const t of shipTickets) {
+    const ticketId = String(t.ticketId || "");
+    const entry = tasks[ticketId] || byTicketId.get(ticketId);
+    const verdict = shipVerdictOf(entry);
+    if (verdict === "shipped") continue;
+    offenders.push({ ticketId, phase: phaseOf(t), verdict: verdict || "none" });
+    // deploy-blocked outranks static-ci-only (an attempted+blocked deploy is the
+    // more specific, more urgent verdict).
+    if (verdict === "deploy-blocked") {
+      blocked = "deploy-blocked";
+      if (!blockReason && entry && typeof entry.blockReason === "string") {
+        blockReason = entry.blockReason;
+      }
+    } else if (!blocked) {
+      blocked = "static-ci-only";
+    }
+  }
+
+  if (offenders.length === 0) {
+    return { required: true, shipped: true, outcome: null, blockReason: null, offenders: [] };
+  }
+  return { required: true, shipped: false, outcome: blocked || "static-ci-only", blockReason, offenders };
 }

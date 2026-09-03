@@ -37,9 +37,11 @@
  * workflows-table writer). This is the ORCHESTRATOR's ledger of what it
  * observed. It is deliberately NOT the same artifact as the release manager's
  * own `ship-review-state.json` in S3: that one is written by the agent and
- * carries structured per-file findings this Lambda never sees. The two agree on
- * the arithmetic (same ported function) but not on finding granularity — see
- * fingerprintFinding below.
+ * carries structured per-file findings. The two agree on the arithmetic (same
+ * ported function) but not on finding granularity — see fingerprintFinding
+ * below. (Since TEAM-3756 F1 the orchestrator DOES read the S3 ledger's latest
+ * round as a findings source — index.mjs deriveReviewFindings — but what it
+ * RECORDS remains this workflow-row ledger.)
  */
 
 import { effectiveRoundCountDiffScoped, enforceDiffScope } from "./ship-review.mjs";
@@ -267,8 +269,35 @@ const fingerprintsOf = (round) =>
  * earlier round but was ABSENT from the immediately preceding one — i.e. it was
  * fixed and has come back, which is the "passed in round N-1, failing again
  * now" rule the cap's double-weighting is for.
+ *
+ * DIFF-SCOPE PERSISTENCE (TEAM-3756 F1, FR-D3.3). When the cycle carries BOTH a
+ * `changeSet` and the reviewer's classified `reviewFindings`, the recorded round
+ * persists the change set and stamps each fingerprint finding with the cited
+ * files of the IN-DIFF reviewer findings, and carries the classified reviewer
+ * findings as `reviewFindings` (audit — no arithmetic reads them). That is what
+ * lets `effectiveRoundCountDiffScoped` actually diff-scope RECORDED history:
+ * `diffScopeRounds` only acts on rounds carrying an Array `changeSet`, so before
+ * this every recorded round passed through unscoped and an advisory round, once
+ * recorded, inflated the cap forever.
+ *
+ * The two-part rule is load-bearing:
+ *  - changeSet is persisted ONLY when the fingerprint findings could also be
+ *    stamped with in-diff cited files. A round carrying a changeSet whose
+ *    findings cite nothing would classify all-ADVISORY on recount and the round
+ *    would count ZERO — silently un-counting a genuinely gating round is the
+ *    unbounded-loop direction, the one failure this module must never have.
+ *  - the stamped files are the IN-DIFF reviewer findings' citations (all inside
+ *    the change set by construction), so on recount the fingerprint findings
+ *    classify IN-DIFF, the round still counts, and its `regressionOf` survives
+ *    diff-scoping (advisory findings get regressionOf stripped) — the
+ *    double-weight arithmetic is unchanged.
+ * A cycle whose reviewer findings are ALL out-of-diff therefore records a
+ * legacy-shaped round (no changeSet) that counts as 1 — fail toward
+ * over-counting, per this module's convention (the cap trips early and a human
+ * can authorize more; under-counting is the unbounded loop). In practice
+ * `enforce` never records such a cycle at all: it returns `gated: false` first.
  */
-export function buildRoundRecord({ priorRounds, upstreamIds, feedback, reviewedHeadSha, nowIso }) {
+export function buildRoundRecord({ priorRounds, upstreamIds, feedback, reviewedHeadSha, nowIso, changeSet, reviewFindings }) {
   const prior = dedupedSortedRounds(priorRounds);
   const latest = prior[prior.length - 1];
   const contentFingerprint = roundContentFingerprint({ upstreamIds, feedback });
@@ -324,6 +353,26 @@ export function buildRoundRecord({ priorRounds, upstreamIds, feedback, reviewedH
     return finding;
   });
 
+  // TEAM-3756 F1 — see "DIFF-SCOPE PERSISTENCE" above. classify via the SAME
+  // function the recount uses, so "in-diff at record time" and "in-diff at count
+  // time" can never disagree.
+  let scope = {};
+  if (Array.isArray(changeSet) && Array.isArray(reviewFindings)) {
+    const scoped = enforceDiffScope(
+      { verdict: "CHANGES-NEEDED", findings: reviewFindings },
+      changeSet
+    );
+    const inDiffFiles = [...new Set(
+      scoped.findings
+        .filter((f) => f?.classification === "IN-DIFF")
+        .flatMap((f) => (Array.isArray(f.citedFiles) ? f.citedFiles : Array.isArray(f.files) ? f.files : []))
+    )];
+    if (inDiffFiles.length) {
+      for (const f of findings) f.citedFiles = inDiffFiles;
+      scope = { changeSet, reviewFindings: scoped.findings };
+    }
+  }
+
   return {
     round,
     reviewedHeadSha: reviewedHeadSha || null,
@@ -332,6 +381,7 @@ export function buildRoundRecord({ priorRounds, upstreamIds, feedback, reviewedH
     contentFingerprint,
     verdict: "CHANGES-NEEDED",
     findings,
+    ...scope,
     recordedAt: nowIso,
   };
 }
@@ -525,9 +575,11 @@ export function createReviewCap(deps) {
    * this rejection actually gates: if every finding cites files OUTSIDE the
    * change set it is non-gating (`gated: false`), and this cycle records NO cap
    * round and does not re-open upstream work — an out-of-diff complaint is not a
-   * rework round. Absent either input (every rejection today, since the
-   * orchestrator does not compute the diff) the rejection is `gated: true` and
-   * everything below is byte-identical to before.
+   * rework round. The caller now supplies both in production: the change set is
+   * computed from the PR diff (TEAM-3748 D3) and the findings are derived from
+   * the feedback / the release manager's recorded round (TEAM-3756 F1). Absent
+   * either input the rejection is `gated: true` and everything below is
+   * byte-identical to before.
    *
    * Fails OPEN on an unexpected error, but only for a BOUNDED number of tries
    * (TEAM-3685 Finding 2). If the ledger write or the arithmetic blows up we let
@@ -604,6 +656,10 @@ export function createReviewCap(deps) {
         feedback,
         reviewedHeadSha,
         nowIso: now().toISOString(),
+        // TEAM-3756 F1 (FR-D3.3): persist the diff-scope inputs onto the round
+        // so recorded history diff-scopes on recount, not only the live cycle.
+        changeSet,
+        reviewFindings: findings,
       });
       // The append RETURNS the post-write history, so the count is computed
       // from what actually landed rather than from the possibly-stale snapshot
@@ -668,11 +724,12 @@ export function createReviewCap(deps) {
 
     const rounds = history?.rounds?.length ? history.rounds : [round];
     const authorizations = history?.authorizations || [];
-    // effectiveRoundCountDiffScoped is a drop-in for effectiveRoundCount that
-    // diff-scopes any ledger round CARRYING a change set before counting. The
-    // orchestrator's own rounds never carry one (fingerprint findings have no
-    // cited files), so this is inert here today — used so the count routes
-    // through the documented enforcement entry point rather than diverging.
+    // effectiveRoundCountDiffScoped diff-scopes any ledger round CARRYING a
+    // change set before counting. LIVE since TEAM-3756 F1: buildRoundRecord now
+    // persists the change set (with in-diff cited files on the fingerprint
+    // findings) whenever the cycle had both diff-scope inputs, so recorded
+    // rounds re-classify on every recount; rounds recorded without them (all
+    // legacy history) still pass through untouched and count exactly as before.
     const effectiveRounds = effectiveRoundCountDiffScoped(rounds, authorizations, {
       regressionCountsDouble: cap.regressionCountsDouble,
     });

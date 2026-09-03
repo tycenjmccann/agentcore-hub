@@ -41,6 +41,24 @@ export default defineConfig({
       // dependency-injected (stub ddb/store/lease + fake clock), so its
       // guard/trigger/retry/escalate logic is unit-testable with no AWS.
       "lambda/orchestrator/dead-session-detector.test.mjs",
+      // detector-mode-default (TEAM-3763 F1) — the index.mjs sweep-dispatch
+      // default: DEAD_SESSION_DETECTOR_MODE coalesces to "shadow" (observe-only)
+      // when unset, so a fresh deploy stays dark. Drives the real handler with
+      // the sweep sentinel and a mocked detector to observe the exact mode
+      // forwarded to runSweep.
+      "lambda/orchestrator/detector-mode-default.test.mjs",
+      // sweep-mode-defaults (TEAM-3763 F2/F6) — the index.mjs defaults for the two
+      // dark-by-default sweeps: RECONCILE_SWEEP_MODE unset → "off" (the sweep is
+      // now scheduled) and CASCADE_EXTENDED_STATES unset → "off". Drives the real
+      // handler with the reconcile_sweep sentinel (mocked cascade + reconcile
+      // factories) to observe the modes index resolves before dispatch.
+      "lambda/orchestrator/sweep-mode-defaults.test.mjs",
+      // agent-invoker-retry (TEAM-3748 D4.2) — bounded transient-5xx retry at the
+      // invoke boundary + the D4.3 publishAgentEvent dual-write. Drives the real
+      // agent-invoker handler through the harness path with the AgentCore client
+      // mocked to throw controlled errors; classification + escalation + the
+      // EventBridge/EVENTS_TABLE dual-write are all exercised end-to-end.
+      "lambda/orchestrator/agent-invoker-retry.test.mjs",
       // cascade.mjs (TEAM-3618 D3) — the shared unblock cascade behind both
       // "ticket done" paths. Fully dependency-injected (stub ddb/provider/event
       // publisher + fake clock), so the union + extended-state logic is
@@ -73,6 +91,33 @@ export default defineConfig({
       // has something to read on the done cascade. Same harness as
       // done-handlers-cascade: real handlers, mocked I/O seams.
       "lambda/orchestrator/evidence-harvest.test.mjs",
+      // ticket-done-blocked-terminal (TEAM-3755 F3) — the contract behind
+      // markTaskComplete's unconditional "done": a ticket done whose completion
+      // record carries a SHIP_BLOCKED outcome must ALWAYS close the run on a
+      // blocked terminal phase, never "complete". Drives BOTH done handlers
+      // end-to-end (real markTaskComplete → harvest → ship gate →
+      // closeWorkflowBlocked) and pins F1 (commit_sha alone is not a merge).
+      "lambda/orchestrator/ticket-done-blocked-terminal.test.mjs",
+      // reconcile-sweep.mjs (TEAM-3747 D1) — the scheduled missed-unblock sweep.
+      // Fully dependency-injected (stub ddb/cascade/lease + fake clock), same
+      // shape as the dead-session detector: shadow/enforce modes, per-candidate
+      // classification, and the metrics summary.
+      "lambda/orchestrator/reconcile-sweep.test.mjs",
+      // replay-d1 (TEAM-3747 D1, AC-D1.2) — three real stalled production runs
+      // replayed through the cascade + sweep as plain-object fixtures; asserts
+      // ZERO manual re-dispatches. DI only, no AWS.
+      "lambda/orchestrator/replay-d1.test.mjs",
+      // replay-d2 (TEAM-3747 D2, AC-D2.1/2/3) — three real runs that closed
+      // GREEN over unshipped work, replayed through the REAL completeWorkflow;
+      // asserts each closes on an honest terminal outcome instead. Same harness
+      // as completion-gates: index.mjs real, AWS/store seams mocked.
+      "lambda/orchestrator/replay-d2.test.mjs",
+      // replay-d3 (TEAM-3748 D3, AC-D3.1) — the ztc61f ship review that never
+      // converges, replayed through the REAL review-cap via handleReviewRejection
+      // (review-cap.mjs unmocked; only AWS/store seams stubbed). The inverse of
+      // replay-d1/d2: asserts 3 in-diff CHANGES-NEEDED rounds STOP the loop —
+      // cap-reached fires once, the upstream re-open is suppressed, no round 4.
+      "lambda/orchestrator/replay-d3.test.mjs",
       // agentcore-hub-tickets create_ticket (TEAM-3619 D4c) — the spawnedBy/phase
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.

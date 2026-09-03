@@ -46,6 +46,9 @@
  */
 
 import { QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
+// The ONE terminal-phase list (TEAM-3755 F8 / TEAM-3756 F5). completion.mjs is
+// pure — no AWS clients, no store import — so importing it here cannot cycle.
+import { notTerminalPhaseFilter } from "./completion.mjs";
 
 // Sweep bounds and threshold knobs. The silence threshold is derived per-agent
 // from its own recent run durations; these frame that derivation.
@@ -101,20 +104,25 @@ export function createDetector(deps) {
   /**
    * Scan workflows in a non-terminal phase, newest first, capped at SWEEP_CAP.
    * Returns { workflows, matched } so the caller can flag truncation.
+   *
+   * TEAM-3756 F5: the filter is DERIVED from the shared TERMINAL_WORKFLOW_PHASES
+   * list (completion.mjs), the same fix TEAM-3755 F8 made to the reconcile
+   * sweep's identical scan. The hand-rolled list here named only
+   * complete/cancelled/error, so a run already closed deploy-blocked /
+   * static-ci-only still scanned as "open" — and in enforce mode (the default)
+   * a stale agentTask inside a terminally-blocked run could be retried or
+   * escalated after the run's honest close.
    */
   async function scanNonTerminalWorkflows() {
     const matched = [];
     let lastKey;
+    const openOnly = notTerminalPhaseFilter("#p");
     for (let page = 0; page < WORKFLOW_SCAN_PAGES; page++) {
       const res = await ddb.send(new ScanCommand({
         TableName: workflowsTable,
-        FilterExpression: "NOT (#p IN (:complete, :cancelled, :error))",
+        FilterExpression: openOnly.filter,
         ExpressionAttributeNames: { "#p": "phase" },
-        ExpressionAttributeValues: {
-          ":complete": "complete",
-          ":cancelled": "cancelled",
-          ":error": "error",
-        },
+        ExpressionAttributeValues: { ...openOnly.values },
         ExclusiveStartKey: lastKey,
       }));
       for (const w of res.Items || []) matched.push(w);
@@ -300,6 +308,13 @@ export function createDetector(deps) {
       candidates: 0,
       skippedLiveLease: 0,
       fired: 0,
+      // Of the fired deaths, how many were the "streamed-then-silent" class
+      // (FR-D4.1's hung-tool-call target: activity AFTER start, then silence
+      // past threshold — a mid-turn hang) vs "silent-since-start" (never
+      // heartbeat past the claim). A classification tag on detectorMeta, not a
+      // change to detection: both classes were already recovered by the
+      // silence-vs-threshold math; this only makes the class observable.
+      hungToolCalls: 0,
       retries: 0,
       escalations: 0,
       candidateErrors: 0,
@@ -428,11 +443,19 @@ export function createDetector(deps) {
           const lastHeartbeatAt = lastHeartbeatMs
             ? new Date(lastHeartbeatMs).toISOString()
             : null;
+          // Classify the death (FR-D4.1). "streamed_then_silent" = the session
+          // emitted a heartbeat AFTER its claim start (activityMs > startedMs)
+          // then fell silent — the hung-tool-call class the watchdog exists to
+          // catch. "silent_since_start" = no heartbeat ever cleared the claim
+          // start. Both are recovered identically; the tag is purely for
+          // observability (metric + event payload), so detection is unchanged.
+          const deathClass = activityMs > startedMs ? "streamed_then_silent" : "silent_since_start";
           const detectorMeta = {
             lastHeartbeatAt,
             medianMs,
             sampleCount,
             threshold,
+            deathClass,
             claimStartedAt: task.startedAt || null,
             sweepId,
           };
@@ -446,6 +469,7 @@ export function createDetector(deps) {
           // payload without polluting either. Detail is unchanged.
           if (mode === "shadow") {
             m.fired++;
+            if (deathClass === "streamed_then_silent") m.hungToolCalls++;
             await publishEvent(ticketId, "dead_session.shadow", {
               workflowId: workflow.id, ticketId, agentId,
               reason: "dead_session", shadow: true, detectorMeta,
@@ -507,6 +531,7 @@ export function createDetector(deps) {
             reason: "dead_session", detectorMeta,
           });
           m.fired++;
+          if (deathClass === "streamed_then_silent") m.hungToolCalls++;
 
           // 4/5. Retry ONCE, else escalate. The pre-read snapshot count decides;
           // markDeadSessionDetected guarantees one decision per generation.
@@ -523,7 +548,7 @@ export function createDetector(deps) {
 
     m.durationMs = now() - startedAtMs;
     emitMetrics(m);
-    log(`dead-session sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} fired=${m.fired} retries=${m.retries} escalations=${m.escalations} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
+    log(`dead-session sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} fired=${m.fired} hungToolCalls=${m.hungToolCalls} retries=${m.retries} escalations=${m.escalations} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
     return m;
   }
 
@@ -548,6 +573,7 @@ export function emitMetrics(m) {
           { Name: "DetectorCandidates", Unit: "Count" },
           { Name: "DetectorSkippedLiveLease", Unit: "Count" },
           { Name: "DetectorFired", Unit: "Count" },
+          { Name: "DetectorHungToolCalls", Unit: "Count" },
           { Name: "DetectorRetries", Unit: "Count" },
           { Name: "DetectorEscalations", Unit: "Count" },
           { Name: "DetectorCandidateErrors", Unit: "Count" },
@@ -560,6 +586,7 @@ export function emitMetrics(m) {
     DetectorCandidates: m.candidates,
     DetectorSkippedLiveLease: m.skippedLiveLease,
     DetectorFired: m.fired,
+    DetectorHungToolCalls: m.hungToolCalls || 0,
     DetectorRetries: m.retries,
     DetectorEscalations: m.escalations,
     DetectorCandidateErrors: m.candidateErrors || 0,

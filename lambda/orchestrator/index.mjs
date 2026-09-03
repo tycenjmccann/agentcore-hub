@@ -40,8 +40,9 @@ import {
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
+import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
@@ -54,16 +55,63 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 const GITHUB_LAMBDA = process.env.GITHUB_LAMBDA || "agentcore-hub-github-mcp";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const MAX_QA_RETRIES = 3;
+// TEAM-3765 F4 — bound the advisory auto-approval transition retry. The
+// auto-approve is the ONLY thing that moves an all-advisory review gate out of
+// `blocked`; a swallowed transition failure stalls the gate forever. Bounded so
+// a persistently-failing transition can't spin. Backoff is env-tunable (pinned
+// to 0 in tests) — a false/throw from the transition is a transient candidate.
+const ADVISORY_APPROVE_MAX_ATTEMPTS = Number(process.env.ADVISORY_APPROVE_MAX_ATTEMPTS) || 3;
+const ADVISORY_APPROVE_BACKOFF_MS = Number(process.env.ADVISORY_APPROVE_BACKOFF_MS ?? 250);
 // Dead-session detector rollout flag (TEAM-3618 D1.2): off = skip the sweep,
-// shadow (default) = observe + metrics + shadow-flagged events but ZERO writes,
-// enforce = steal/retry/escalate for real.
+// shadow = observe + metrics + shadow-flagged events but ZERO writes, enforce =
+// steal/retry/escalate. Unset/empty DEFAULTS TO SHADOW (TEAM-3763 F1): per the
+// FR-D4.1 rollout, shadow → enforce is an explicit operator action, not a
+// deploy-time flip. A fresh deploy that omits the var must stay observe-only —
+// deploy.sh:94-99 forwards the var only when explicitly set, so an unset install
+// (production today) must NOT silently begin stealing/retrying sessions. The
+// fail-safe coercion still holds: runSweep normalizes (trim+lowercase) and
+// coerces anything not exactly off|shadow|enforce back to shadow, so a typo in
+// the env var can only ever DOWNGRADE to observe-only, never grant a rogue mode.
 const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
-// Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b). OFF by default:
-// the cascade only re-Readies {blocked, todo} dependents (commit-4a behavior).
-// ON: an in_progress dependent whose last blocker resolves is lease-guarded
-// (live → nudge only; stale → steal + re-dispatch through the claim CAS) and an
-// in_review gate is re-woken. Any value other than "on"/"true"/"1" stays OFF.
-const CASCADE_EXTENDED_STATES = /^(on|true|1)$/i.test(process.env.CASCADE_EXTENDED_STATES || "");
+// Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b; tri-state as of
+// TEAM-3747 D1). off = the cascade only re-Readies {blocked, todo} dependents
+// (commit-4a behavior — the PRE-EPIC production path); shadow = evaluate the
+// extended-state path and emit would-nudge/would-steal/would-reawaken metrics
+// but perform ZERO writes; enforce = an in_progress dependent whose last blocker
+// resolves is lease-guarded (live → nudge only; stale → steal + re-dispatch
+// through the claim CAS) and an in_review gate is re-woken for real.
+// Unset/empty DEFAULTS TO OFF (TEAM-3763 F6): "off" is the ONLY value that is
+// byte-identical to pre-epic — shadow is not, because cascade.mjs's extended
+// path issues extra DDB reads (the F9 strongly-consistent blocker confirm +
+// lease-liveness lastAgentActivity read) before its no-write mode check. So an
+// unset install (production today) must perform ZERO extra reads. Explicit "off"
+// short-circuits in cascade.mjs before any of those reads (cascade.mjs:173).
+// Backwards compatible: the legacy boolean "true"/"1"/"on" maps to enforce.
+const CASCADE_EXTENDED_STATES_MODE = resolveCascadeMode(process.env.CASCADE_EXTENDED_STATES);
+// Missed-unblock reconciliation sweep (TEAM-3747 D1). Tri-state, governed
+// independently of the cascade's own mode (a separate safety-net rollout).
+// Unset/empty DEFAULTS TO OFF (TEAM-3763 F2): the sweep is now scheduled
+// (deploy.sh wires a reconcile_sweep EventBridge target), so a dark default is
+// what keeps a fresh deploy byte-identical to pre-epic. runSweep("off")
+// short-circuits before its first ScanCommand (reconcile-sweep.mjs:165) — ZERO
+// DDB reads/writes. shadow/enforce only when the operator explicitly sets the
+// var (deploy.sh forwards it only when set).
+const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
+
+/**
+ * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
+ * ("true"/"1"/"on"/"enforce") → enforce; explicit "shadow" → shadow; unset, "",
+ * "off", "false", "0", or anything unrecognized → off (the pre-epic passthrough,
+ * TEAM-3763 F6). shadow/enforce are granted ONLY on an explicit, recognized
+ * value so an unset or typo'd var can never add the extended path's extra DDB
+ * reads. Trimmed + lowercased so a casing slip can never grant write access.
+ */
+function resolveCascadeMode(raw) {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (v === "enforce" || v === "on" || v === "true" || v === "1") return "enforce";
+  if (v === "shadow") return "shadow";
+  return "off"; // "", unset, "off", "false", "0", or garbage → off (pre-epic)
+}
 // TEAM-3686 Finding 3 / TEAM-3690: deliverable-evidence gate on the orchestrator
 // completion path — same flag, same semantics as the HTTP complete route
 // (TEAM-3619 D4a, design §X.5 step 6: "evidence check behind
@@ -279,15 +327,38 @@ function getCascade() {
     jiraTransition,
     getChildTickets,
     publishEvent,
-    // Extended states (commit 4b) — behind CASCADE_EXTENDED_STATES.
-    extendedStates: CASCADE_EXTENDED_STATES,
+    // Extended states (commit 4b) — off | shadow | enforce (TEAM-3747 D1).
+    extendedStates: CASCADE_EXTENDED_STATES_MODE,
     lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
     eventsTable: EVENTS_TABLE,
     workflowsTable: WORKFLOWS_TABLE,
     redispatch: redispatchTicket,
     reawakenGate: handleHumanReviewGate,
+    // TEAM-3755 F9 — the strongly-consistent blocker confirm the extended-state
+    // event path runs before it steals a lease and re-dispatches.
+    getTicketConsistent,
   });
   return _cascade;
+}
+
+// ─── Missed-unblock reconciliation sweep (TEAM-3747 D1) ──────────────────────
+
+// Periodic safety net for cascades that never fired (orchestrator crash, dropped
+// stream/webhook delivery, or a stale-GSI miss past the cascade's one bounded
+// retry). Reuses the cascade's reconcileDependent so the R3 invariant
+// (live → nudge; stale → steal + re-dispatch) has exactly one implementation.
+// Lazy singleton, same shape as getCascade()/getDetector().
+let _reconcileSweep = null;
+function getReconcileSweep() {
+  if (_reconcileSweep) return _reconcileSweep;
+  _reconcileSweep = createReconcileSweep({
+    ddb,
+    workflowsTable: WORKFLOWS_TABLE,
+    cascade: getCascade(),
+    getChildTickets,
+    leaseTtlMs: LEASE_TTL_MS,
+  });
+  return _reconcileSweep;
 }
 
 // ─── Review-gate round cap (TEAM-3619 D2c) ───────────────────────────────────
@@ -375,6 +446,15 @@ export const handler = async (event) => {
   if (event?.source === "orchestrator.sweep" && event?.action === "dead_session_sweep") {
     console.log(`[orchestrator] dead-session sweep (mode=${DEAD_SESSION_DETECTOR_MODE})`);
     return getDetector().runSweep(DEAD_SESSION_DETECTOR_MODE);
+  }
+
+  // Scheduled missed-unblock reconciliation sweep (TEAM-3747 D1). Same
+  // sentinel-event pattern as the dead-session sweep above — a scheduled
+  // EventBridge rule fires { source: "orchestrator.sweep",
+  // action: "reconcile_sweep" }. Branch BEFORE any stream/webhook parsing.
+  if (event?.source === "orchestrator.sweep" && event?.action === "reconcile_sweep") {
+    console.log(`[orchestrator] reconcile sweep (mode=${RECONCILE_SWEEP_MODE})`);
+    return getReconcileSweep().runSweep(RECONCILE_SWEEP_MODE);
   }
 
   // SQS FIFO command queue (R1 — docs/race-condition-study.md). One message
@@ -623,6 +703,36 @@ function isHumanAssignee(assignee) {
 /**
  * Mark a ticket's agentTasks entry complete with per-key writes (never a full
  * row put — completion cascades run concurrently with sibling claims).
+ *
+ * TEAM-3755 F3 — INVARIANT: a ticket-level "done" is NOT a lifecycle verdict.
+ *
+ * This function deliberately marks the task complete unconditionally, even when
+ * the harvested completion record carries a SHIP_BLOCKED outcome
+ * (deploy-blocked / static-ci-only). That is by design, not an oversight:
+ *
+ *   - A ticket status is the AGENT's report that its turn is over. The CD agent
+ *     genuinely finished — it ran, it found the deploy blocked, and it said so.
+ *     Diverting the ticket to a non-done status here would strand the run: the
+ *     unblock cascade keys off `done` to release dependents, and completion's
+ *     per-phase check requires a done agent ticket in every required phase, so a
+ *     "blocked" CD ticket would wedge the epic open forever instead of closing
+ *     it honestly.
+ *   - The RUN-level verdict is the single enforcement point (FR-D2.1/FR-D2.2).
+ *     harvestCompletionEvidence (called on the line below) lifts outcome +
+ *     blockReason + mergeCommit off the S3 completion record onto
+ *     agentTasks[ticketId] BEFORE completeWorkflow re-reads them, so
+ *     evaluateShipVerdict sees the block in the SAME pass that this done
+ *     triggered, and completeWorkflow closes the run on the honest terminal
+ *     phase (claimTerminalOutcome → "deploy-blocked") instead of "complete".
+ *
+ * So the guarantee is: ticket done + a SHIP_BLOCKED outcome ALWAYS yields a
+ * blocked terminal workflow phase, never "complete". That is what makes the
+ * unconditional mark safe, and it depends on two things staying true — the
+ * harvest running before the completion check, and shipVerdictOf treating only a
+ * mergeCommit/explicit "shipped" as proof (TEAM-3755 F1; commitSha is the
+ * unmerged branch HEAD and must never count). Both are pinned by
+ * lambda/orchestrator/ticket-done-blocked-terminal.test.mjs — if you change this
+ * function, that suite is the contract to keep green.
  */
 async function markTaskComplete(workflow, ticketId, assignee) {
   const now = new Date().toISOString();
@@ -667,7 +777,16 @@ async function harvestCompletionEvidence(workflow, ticketId) {
   const hasEvidence =
     (typeof entry?.output === "string" && entry.output.trim().length > 0) ||
     (typeof entry?.artifactKey === "string" && entry.artifactKey.length > 0);
-  if (hasEvidence) return;
+  // TEAM-3747 D2: the ship/CD merge-verdict gate needs the merge commit / outcome
+  // signals, and a ship ticket almost ALWAYS has a summary (so hasEvidence is
+  // true). Harvesting must therefore run when EITHER the deliverable evidence OR
+  // the ship-verdict signal is still absent — a plain `if (hasEvidence) return`
+  // would starve the ship gate and false-block every shipped run.
+  const hasShipSignal =
+    (typeof entry?.mergeCommit === "string" && entry.mergeCommit.trim().length > 0) ||
+    (typeof entry?.commitSha === "string" && entry.commitSha.trim().length > 0) ||
+    (typeof entry?.outcome === "string" && entry.outcome.trim().length > 0);
+  if (hasEvidence && hasShipSignal) return;
   try {
     const res = await s3.send(new GetObjectCommand({
       Bucket: ARTIFACT_BUCKET,
@@ -675,11 +794,27 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     }));
     const record = JSON.parse(await res.Body.transformToString());
     const fields = {};
-    const summary = typeof record.summary === "string" ? record.summary.trim() : "";
-    if (summary) fields.output = summary.slice(0, 10000);
-    if (record.branch) fields.branch = record.branch;
-    if (record.commit_sha) fields.commitSha = record.commit_sha;
-    if (record.pr_url) fields.prUrl = record.pr_url;
+    // Deliverable evidence — only fill when absent (a webhook metadata merge that
+    // DID land wins), exactly as before.
+    if (!hasEvidence) {
+      const summary = typeof record.summary === "string" ? record.summary.trim() : "";
+      if (summary) fields.output = summary.slice(0, 10000);
+      if (record.branch) fields.branch = record.branch;
+    }
+    // Ship/CD verdict signals — harvested regardless of deliverable evidence,
+    // each filled only when the entry doesn't already carry it (additive; legacy
+    // records simply lack these keys). commit_sha/pr_url kept here too so the
+    // ship gate + the final PR label can find them.
+    if (record.commit_sha && !entry?.commitSha) fields.commitSha = record.commit_sha;
+    if (record.pr_url && !entry?.prUrl) fields.prUrl = record.pr_url;
+    if (record.merge_commit && !entry?.mergeCommit) fields.mergeCommit = record.merge_commit;
+    if (typeof record.outcome === "string" && !entry?.outcome) {
+      const oc = record.outcome.trim().toLowerCase();
+      if (SHIP_BLOCKED_OUTCOMES.includes(oc) || oc === "shipped") fields.outcome = oc;
+    }
+    if (record.block_reason && !entry?.blockReason) {
+      fields.blockReason = String(record.block_reason).slice(0, 500);
+    }
     if (Object.keys(fields).length === 0) return;
     await store.mergeTaskMetadata(workflow.id, ticketId, fields);
     if (entry) Object.assign(entry, fields);
@@ -906,6 +1041,196 @@ async function attachPackageToTicket(ticketId, pkg) {
 }
 
 /**
+ * Post a plain-text comment on a ticket, either provider (TEAM-3756 F3b audit
+ * trail). Same write shapes as attachPackageToTicket; throws to the caller —
+ * every current caller treats the comment as best-effort and catches.
+ */
+async function commentOnTicket(ticketId, text) {
+  const lines = String(text).split("\n");
+  if (TICKET_PROVIDER === "jira") {
+    await jiraFetch(`/rest/api/3/issue/${ticketId}/comment`, "POST", {
+      body: {
+        type: "doc", version: 1,
+        content: lines.map((t) => ({ type: "paragraph", content: [{ type: "text", text: t }] })),
+      },
+    });
+  } else {
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId },
+      UpdateExpression: "SET #c = list_append(if_not_exists(#c, :empty), :n), #u = :u",
+      ExpressionAttributeNames: { "#c": "comments", "#u": "updatedAt" },
+      ExpressionAttributeValues: {
+        ":n": [{ id: `comment-${Date.now()}`, author: "orchestrator", content: String(text), timestamp: new Date().toISOString() }],
+        ":empty": [],
+        ":u": new Date().toISOString(),
+      },
+    }));
+  }
+}
+
+/**
+ * PR url for the change set under review (TEAM-3748 D3) — CONFIDENT matches
+ * only (TEAM-3756 F2). Resolution order:
+ *
+ *   1. the gate ticket's own prUrl — the provider explicitly forwarded the PR
+ *      this gate reviews;
+ *   2. a task entry whose recorded head (commitSha/mergeCommit, harvested off
+ *      the completion record) EQUALS the gate's reviewedHeadSha — that PR is
+ *      the one whose head the reviewer looked at, by definition;
+ *   3. the ship-phase ticket's PR (the integration PR the ship review is of),
+ *      but only when it is UNAMBIGUOUS — exactly one distinct prUrl across the
+ *      run's ship-phase task entries (reviewed-upstream ship entries preferred).
+ *
+ * The old "any task's prUrl" fallback is deliberately GONE: a stale per-ticket
+ * feature-PR url harvested onto an upstream dev task could win over the actual
+ * ship/integration PR, so the change set was computed from the WRONG diff —
+ * genuine findings then classified out-of-diff and the reopen was suppressed.
+ * Scoping against the wrong PR is strictly worse than not scoping at all:
+ * returning "" fails OPEN (changeSet stays null → enforceDiffScope stays inert →
+ * every finding gates), which can never suppress a genuine rework round.
+ */
+function resolvePrUrlForReview(workflow, gateTicket, upstream) {
+  const direct =
+    gateTicket.prUrl || gateTicket.metadata?.prUrl ||
+    gateTicket.pr_url || gateTicket.metadata?.pr_url;
+  if (typeof direct === "string" && direct) return direct;
+
+  const tasks = workflow?.agentTasks || {};
+  const upIds = new Set((upstream || []).map((u) => u.ticketId));
+  const entries = Object.entries(tasks).filter(
+    ([, e]) => e && typeof e.prUrl === "string" && e.prUrl
+  );
+
+  // 2. Head-SHA match — the PR whose recorded head IS what the reviewer reviewed.
+  const reviewedHeadSha = gateTicket.reviewedHeadSha || gateTicket.metadata?.headSha || null;
+  if (reviewedHeadSha) {
+    for (const preferUpstream of [true, false]) {
+      for (const [tid, e] of entries) {
+        if (preferUpstream !== upIds.has(tid)) continue;
+        if (e.commitSha === reviewedHeadSha || e.mergeCommit === reviewedHeadSha) return e.prUrl;
+      }
+    }
+  }
+
+  // 3. The ship ticket's integration PR — only when there is exactly one to name.
+  for (const upstreamOnly of [true, false]) {
+    const shipUrls = new Set();
+    for (const [tid, e] of entries) {
+      if (upstreamOnly && !upIds.has(tid)) continue;
+      if (getAgentDef(e.agentId)?.phase === "ship") shipUrls.add(e.prUrl);
+    }
+    if (shipUrls.size === 1) return [...shipUrls][0];
+    if (shipUrls.size > 1) break; // ambiguous even among upstream → widening can't help
+  }
+
+  return "";
+}
+
+/**
+ * Compute the PR's change set — the `--name-status`-equivalent file list the
+ * diff-scoped ship review scopes against (TEAM-3748 D3, FR-D3.1). This is the
+ * "gate plumbing" release-manager.md Step 4 waits on: it lets the deterministic
+ * enforceDiffScope activate so review is scoped to what the PR actually changed
+ * instead of the whole assembled repo.
+ *
+ * FAIL-OPEN by contract (R4): a missing/unrecognized PR url or ANY GitHub error
+ * returns null. A null change set is passed to enforce as undefined, which keeps
+ * enforceDiffScope inert and the rework loop byte-identical to its pre-guard
+ * behavior — the diff-scope gate must never be able to WEDGE a review, only
+ * narrow it when the diff is knowable. Renames contribute BOTH paths, matching
+ * enforceDiffScope's rename handling.
+ */
+async function computeReviewChangeSet(prUrl) {
+  const m = String(prUrl || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  if (!m) return null;
+  const [, owner, repo, number] = m;
+  try {
+    const files = await callGitHub("list_pr_files", { owner, repo, pull_number: Number(number) });
+    if (!Array.isArray(files) || files.length === 0) return null;
+    const paths = [];
+    for (const f of files) {
+      if (typeof f?.filename === "string" && f.filename) paths.push(f.filename);
+      // A rename cites both endpoints; enforceDiffScope treats each as in-diff.
+      if (typeof f?.previous_filename === "string" && f.previous_filename) paths.push(f.previous_filename);
+    }
+    return paths.length ? paths : null;
+  } catch (err) {
+    console.warn(`[orchestrator] change-set fetch skipped for ${prUrl}: ${err?.message || err}`);
+    return null;
+  }
+}
+
+/**
+ * Structured review findings are USABLE for diff-scoping only when every entry
+ * is an object and at least ONE cites a resolvable file (TEAM-3756 F1). The
+ * threshold matters because of which way each failure cuts: findings that gate
+ * spuriously merely keep legacy behavior, but findings that classify all-advisory
+ * SUPPRESS a reopen — so prose-only findings (nobody cited files) must never be
+ * treated as a classification, or every human rejection would read as advisory.
+ */
+function usableReviewFindings(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return false;
+  if (!arr.every((f) => f && typeof f === "object" && !Array.isArray(f))) return false;
+  return arr.some((f) => {
+    const files = Array.isArray(f.citedFiles) ? f.citedFiles : Array.isArray(f.files) ? f.files : [];
+    return files.some((p) => typeof p === "string" && p.trim());
+  });
+}
+
+/**
+ * Derive the reviewer's classified findings when the gate ticket does not carry
+ * them (TEAM-3756 F1) — the same "compute it in the Lambda" pattern as
+ * computeReviewChangeSet, closing the gap that left the diff-scoped gate DORMANT
+ * in production (nothing ever wrote gateTicket.reviewFindings, so `gated` was
+ * always true and FR-D3.2/D3.3 never fired).
+ *
+ * Two sources, in order:
+ *   1. a fenced JSON block in the rejection feedback itself — `{"findings": [...]}`
+ *      or a bare findings array — for a reviewer/agent that pastes its
+ *      classification into the comment;
+ *   2. the release manager's own round ledger,
+ *      workflows/{id}/shared/ship-review-state.json — blueprint Step 4.1 has it
+ *      record every round's `findings` (each with `citedFiles`) precisely "so the
+ *      ledger is already correct for when the deterministic layer is switched
+ *      on". Only the LATEST round is trusted, only when its verdict is
+ *      CHANGES-NEEDED (this rejection is that verdict's delivery), and only when
+ *      its reviewedHeadSha does not CONTRADICT the gate's (both known and
+ *      different = the ledger describes some other round — use nothing).
+ *
+ * Returns null when neither source yields usable findings: the caller passes
+ * null through and the diff-scoped gate stays inert (fail-open, R4) — exactly
+ * the pre-derivation behavior.
+ */
+async function deriveReviewFindings(workflow, gateTicket, feedback) {
+  // 1. Fenced JSON in the feedback.
+  const fence = /```(?:json)?\s*([\s\S]*?)```/g;
+  let m;
+  while ((m = fence.exec(String(feedback || ""))) !== null) {
+    try {
+      const parsed = JSON.parse(m[1]);
+      const arr = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? parsed.findings : null;
+      if (usableReviewFindings(arr)) return arr;
+    } catch { /* not JSON — keep scanning */ }
+  }
+
+  // 2. The release manager's recorded round.
+  const raw = await readS3Artifact(workflow.id, "shared/ship-review-state.json");
+  if (!raw) return null;
+  let state;
+  try { state = JSON.parse(raw); } catch { return null; }
+  const rounds = (Array.isArray(state?.rounds) ? state.rounds : []).filter(
+    (r) => r && typeof r === "object"
+  );
+  if (!rounds.length) return null;
+  const latest = rounds.reduce((a, b) => (Number(b.round) > Number(a.round) ? b : a));
+  if (latest.verdict !== "CHANGES-NEEDED") return null;
+  const gateSha = gateTicket.reviewedHeadSha || gateTicket.metadata?.headSha || null;
+  if (gateSha && latest.reviewedHeadSha && latest.reviewedHeadSha !== gateSha) return null;
+  return usableReviewFindings(latest.findings) ? latest.findings : null;
+}
+
+/**
  * A human "requested changes" on a review-gate ticket (moved it to blocked).
  * Look up the gate's config for the run; if onReject is "rework", re-open the
  * upstream agent tickets this gate reviewed (its blockedBy) so the agents redo
@@ -974,16 +1299,32 @@ export async function handleReviewRejection(gateTicket) {
   // so it is normally absent and every rejection is therefore its own round.
   // When a provider does carry it, re-reviewing the same SHA reuses that round.
   //
-  // Diff-scoped gate (TEAM-3689, release-manager.md Step 4): changeSet is the
-  // PR's --name-status file list and reviewFindings are the reviewer's classified
-  // findings (each with its cited files). Both are best-effort like
-  // reviewedHeadSha — normally absent, because the orchestrator does not compute
-  // the diff, in which case the guard is inert and behavior is byte-identical.
-  // When a provider does carry them, review-cap downgrades out-of-diff findings
-  // and reports `gated: false` for a rejection whose findings are ALL out-of-diff,
-  // which must neither count toward the cap nor re-open upstream work.
-  const changeSet = gateTicket.changeSet || gateTicket.metadata?.changeSet || null;
-  const reviewFindings = gateTicket.reviewFindings || gateTicket.metadata?.reviewFindings || null;
+  // Diff-scoped gate (TEAM-3689 scaffolding, activated by TEAM-3748 D3): changeSet
+  // is the PR's file list and reviewFindings are the reviewer's classified findings
+  // (each with its cited files). Each comes off the gate ticket if a provider
+  // forwarded it, ELSE the orchestrator computes/derives it itself — the change
+  // set from the PR diff (D3), the findings from the feedback's JSON block or the
+  // release manager's recorded round (TEAM-3756 F1). When BOTH are known,
+  // review-cap downgrades out-of-diff findings and reports `gated: false` for a
+  // rejection whose findings are ALL out-of-diff, which must neither count toward
+  // the cap nor re-open upstream work. Absent either input the guard stays inert
+  // and behavior is byte-identical to before (R4).
+  let changeSet = gateTicket.changeSet || gateTicket.metadata?.changeSet || null;
+  let reviewFindings = gateTicket.reviewFindings || gateTicket.metadata?.reviewFindings || null;
+  // D3 (TEAM-3748, FR-D3.1): when the event carries no change set, compute it
+  // from the PR diff so review is scoped to what the PR changed rather than the
+  // whole assembled repo. Fail-open — no PR / GitHub error leaves changeSet null,
+  // which keeps enforceDiffScope inert and the loop byte-identical to legacy (R4).
+  if (!Array.isArray(changeSet)) {
+    const prUrl = resolvePrUrlForReview(workflow, gateTicket, upstream);
+    changeSet = (prUrl && (await computeReviewChangeSet(prUrl))) || null;
+  }
+  // TEAM-3756 F1: derive the classified findings the same way — but only when a
+  // change set exists to scope against (without one the findings are never read,
+  // so the S3 lookup would be a wasted call on every legacy rejection).
+  if (!Array.isArray(reviewFindings) && Array.isArray(changeSet)) {
+    reviewFindings = await deriveReviewFindings(workflow, gateTicket, feedback);
+  }
   const capResult = await getReviewCap().enforce({
     workflow,
     gateTicket,
@@ -1011,10 +1352,123 @@ export async function handleReviewRejection(gateTicket) {
   // cite files OUTSIDE the recorded change set is non-gating — it must NOT
   // re-open upstream work. `gated` is true whenever there is no change set to
   // scope against, so this branch is inert for old ledgers.
+  //
+  // TEAM-3756 F3b — the non-gating rejection gets a DEFINED next state:
+  // APPROVE-WITH-ADVISORY. Before, this branch published the event and returned,
+  // leaving the gate in `blocked` with nothing scheduled to touch it again — a
+  // silent stall. Auto-approving is the blueprint's own verdict, not an
+  // override of the human: with F3a, `gated:false` is reachable ONLY when every
+  // finding AFFIRMATIVELY cites out-of-diff files (unattributed/prose findings
+  // now gate), and Step 4's rule for exactly that state is
+  // PASS-with-known-findings — "Never let an advisory finding flip PASS to
+  // CHANGES NEEDED". Chosen over the cap-escalation primitive because
+  // escalation means "a human must decide"; here the deterministic gate HAS
+  // decided, and parking it would recreate the same stall one hop later. The
+  // done transition takes the identical path a human approval takes (DDB
+  // stream / Jira webhook → done cascade), so dependents unblock through the
+  // one existing machinery. A reviewer who wants to force rework can: any
+  // finding without out-of-diff citations gates.
   if (capResult.gated === false) {
     console.log(
-      `[orchestrator] Review gate ${gateTicket.ticketId} rejected but all findings are out-of-diff (advisory) — not reopening.`
+      `[orchestrator] Review gate ${gateTicket.ticketId} rejected but all findings are out-of-diff (advisory) — ` +
+        `approving with known findings instead of reopening.`
     );
+    // Audit trail first: the advisory findings land on the ticket even if the
+    // transition below fails (best-effort — a comment failure must not stall
+    // the approval this branch exists to guarantee).
+    const advisoryLines = (Array.isArray(reviewFindings) ? reviewFindings : []).map((f) => {
+      const files = Array.isArray(f?.citedFiles) ? f.citedFiles : Array.isArray(f?.files) ? f.files : [];
+      const label = f?.title || f?.summary || f?.severity || "finding";
+      return `• ${label} — cites ${files.join(", ") || "(no files)"} (outside the PR change set)`;
+    });
+    try {
+      await commentOnTicket(
+        gateTicket.ticketId,
+        `Auto-approved with known findings: the reviewer requested changes, but every finding cites ` +
+          `files outside the PR change set (advisory — release-manager.md Step 4). ` +
+          `No rework round was recorded and upstream work was not reopened.\n` +
+          `Advisory findings (filed for audit, not gating):\n${advisoryLines.join("\n")}`
+      );
+    } catch (err) {
+      console.warn(`[orchestrator] advisory audit comment failed for ${gateTicket.ticketId}: ${err?.message || err}`);
+    }
+    // Approve: the same transition a human approval makes, so the done cascade
+    // (unblock dependents, completion checks) runs through the normal path.
+    //
+    // TEAM-3765 F4 — this transition is the ONLY exit from `blocked` for an
+    // all-advisory gate. It used to be fire-and-forget: a Jira transition
+    // returns false (it never throws) on a failed/absent transition, and the DDB
+    // write's throw was caught and merely logged — then review.rejected was
+    // published and the command acked as success REGARDLESS. A transient
+    // transition/write failure therefore left the gate stuck in `blocked` with
+    // nothing scheduled to re-drive it: a permanent stall (the D1 class this
+    // epic exists to fix).
+    //
+    // Fix (option a — bounded retry + escalation event). Chosen over option b
+    // (throw so the event source retries) because this handler is reached from
+    // THREE sources with DIFFERENT retry semantics: the SQS FIFO command queue
+    // retries a throw and the direct Jira webhook propagates it, but the DEFAULT
+    // DDB-stream path (TICKET_PROVIDER=dynamodb) swallows per-record throws in
+    // the handler loop — so a throw there is a silent no-retry. An explicit
+    // escalation event is path-independent: it is human/alert-visible AND leaves
+    // the gate `blocked` (never marked done, never acked as approved) so the
+    // reconcile sweep can re-drive it. The transition stays idempotent — an
+    // unconditional SET to a constant `done` (DDB) / a no-op "Done" transition
+    // once already there (Jira) — and we STOP at the first observed success, so a
+    // retry after a partial success cannot double-approve.
+    let approved = false;
+    let lastApproveErr = null;
+    for (let attempt = 1; attempt <= ADVISORY_APPROVE_MAX_ATTEMPTS && !approved; attempt++) {
+      try {
+        if (TICKET_PROVIDER === "jira") {
+          // jiraTransition returns false (does NOT throw) when the transition is
+          // missing or the POST fails — a false is as much a non-landing as a
+          // throw, so both count as "not approved" and drive a retry.
+          approved = await jiraTransition(gateTicket.ticketId, "Done");
+        } else {
+          await ddb.send(new UpdateCommand({
+            TableName: TICKETS_TABLE,
+            Key: { ticketId: gateTicket.ticketId },
+            UpdateExpression: "SET #s = :s, #u = :u",
+            ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+            ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
+          }));
+          approved = true;
+        }
+      } catch (err) {
+        lastApproveErr = err;
+        console.warn(`[orchestrator] advisory auto-approve attempt ${attempt}/${ADVISORY_APPROVE_MAX_ATTEMPTS} for ${gateTicket.ticketId} failed: ${err?.message || err}`);
+      }
+      if (!approved && attempt < ADVISORY_APPROVE_MAX_ATTEMPTS && ADVISORY_APPROVE_BACKOFF_MS > 0) {
+        await new Promise((r) => setTimeout(r, ADVISORY_APPROVE_BACKOFF_MS * attempt));
+      }
+    }
+
+    if (!approved) {
+      // The approval never landed after the bounded retry. Do NOT ack success and
+      // do NOT publish review.rejected as if the gate resolved — that ordering
+      // (rejected + ack while `blocked` persists) is the bug. Emit an explicit
+      // escalation instead: an OBSERVABLE recovery signal for alerting + a human,
+      // while the gate stays `blocked` so the reconcile sweep remains eligible to
+      // re-drive it.
+      console.error(`[orchestrator] advisory auto-approve for ${gateTicket.ticketId} did NOT land after ${ADVISORY_APPROVE_MAX_ATTEMPTS} attempts — escalating (gate left blocked): ${lastApproveErr?.message || "transition returned false"}`);
+      await publishEvent(gateTicket.ticketId, "review.escalated", {
+        ticketId: gateTicket.ticketId,
+        workflowId: workflow.id,
+        reason: "advisory_auto_approve_failed",
+        attempts: ADVISORY_APPROVE_MAX_ATTEMPTS,
+        error: lastApproveErr?.message || "transition returned false",
+        advisoryFindings: Array.isArray(reviewFindings) ? reviewFindings : [],
+      });
+      return;
+    }
+
+    // Approval landed — record it, then the legacy observability event.
+    await publishEvent(gateTicket.ticketId, "review.approved_with_advisory", {
+      ticketId: gateTicket.ticketId,
+      workflowId: workflow.id,
+      advisoryFindings: Array.isArray(reviewFindings) ? reviewFindings : [],
+    });
     await publishEvent(gateTicket.ticketId, "review.rejected", {
       ticketId: gateTicket.ticketId,
       onReject,
@@ -1722,6 +2176,59 @@ export async function completeWorkflow(workflow) {
     console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
   }
 
+  // ── TEAM-3760: TWO ship gates run here, in this order, both at full strength.
+  //   1. TEAM-3747 D2 ship-verdict gate (below): INTERNAL evidence, fail-CLOSED.
+  //      A done ship ticket with no merge/deploy verdict closes the run on an
+  //      honest TERMINAL outcome (deploy-blocked / static-ci-only).
+  //   2. TEAM-3721 SHIP_MERGE_VERIFY gate (after it): EXTERNAL GitHub ground
+  //      truth, fail-OPEN. A branch PROVABLY unmerged leaves the run OPEN
+  //      (workflow.cd_unmerged) for the RM/WM to repair.
+  // D2 must run first: it terminally closes the "nothing recorded shipped" runs,
+  // so merge-verify only ever sees runs whose recorded evidence CLAIMS a ship —
+  // and then cross-checks that claim against GitHub. Reversed, an unmerged run
+  // with no ship verdict would be left open by gate 2 and never reach gate 1 —
+  // exactly the silent CD dead-zone stall D2 exists to kill. (D2 first is also
+  // free: local reads, no GitHub call, for runs that will terminally close.)
+
+  // TEAM-3747 D2 — ship/CD merge-verdict gate: NO green close over unshipped work.
+  // If the def has a ship phase, a done ship ticket must carry a merge/deploy
+  // verdict (merge commit) OR an explicit deploy-blocked outcome. When neither is
+  // present the run did NOT actually ship, so we close it on the HONEST terminal
+  // outcome (deploy-blocked when a block was recorded, else static-ci-only) and
+  // emit a TERMINAL verdict event — never a silent stall, never a fake "complete".
+  // Reuses COMPLETION_EVIDENCE_REQUIRED (fail-closed: enforce by default; a
+  // fail-open here would defeat the whole deliverable). The explicit opt-out
+  // COMPLETION_EVIDENCE_REQUIRED=off|false|0 only shadow-logs and proceeds.
+  try {
+    const wfDef = getWorkflowDef(workflow?.workflowDefId);
+    const requiredPhases = wfDef.completionRequiresAgentPhases || [];
+    const shipPhases = requiredPhases.filter((p) => SHIP_PHASES.has(p));
+    if (shipPhases.length > 0) {
+      const children = await getChildTickets(workflow.epicId);
+      const freshWf = await store.getWorkflow(workflow.id);
+      const verdict = evaluateShipVerdict(
+        children,
+        freshWf?.agentTasks || workflow.agentTasks || {},
+        shipPhases,
+        { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase }
+      );
+      if (verdict.required && !verdict.shipped) {
+        const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
+        if (COMPLETION_EVIDENCE_REQUIRED) {
+          await closeWorkflowBlocked(workflow, verdict);
+          return;
+        }
+        console.warn(
+          `[orchestrator] ${workflow.id} would close as ${verdict.outcome} (shadow opt-out) — ship verdict missing: ${offenders}`
+        );
+      }
+    }
+  } catch (err) {
+    // Never let the ship-verdict resolution itself turn a legitimate completion
+    // into a stall — it only diverts when it can prove work never shipped.
+    console.warn(`[orchestrator] ship-verdict check skipped for ${workflow.id}: ${err?.message || err}`);
+  }
+
   // Ship-phase merge gate (TEAM-3721 CD dead-zone): a def with a "ship" phase
   // has the release manager own the merge, and the CD ticket can be marked done
   // even though the PR was never actually merged (RM BLOCKs in preflight, or the
@@ -1826,6 +2333,83 @@ export async function completeWorkflow(workflow) {
   // Durable marker that the side effects above all ran — the takeover path's
   // claim checks this so a completer killed mid-finalization gets resumed.
   await store.markFinalized(workflow.id);
+}
+
+/**
+ * TEAM-3747 D2 — close a run on an HONEST terminal ship outcome instead of a fake
+ * "complete". Mirrors completeWorkflow's side-effect discipline: an ATOMIC,
+ * idempotent phase claim (store.claimTerminalOutcome CASes off any terminal phase,
+ * so concurrent cascades and stream re-deliveries yield exactly one winner), then
+ * — winner only — a best-effort PR label, a TERMINAL verdict event, and the
+ * finalized marker. The event type is workflow.deploy_blocked / workflow.static_ci_only
+ * but ALSO carries an `outcome` field, so a consumer that only knows
+ * "workflow.complete" can still branch on `outcome` — the close is never silent.
+ */
+async function closeWorkflowBlocked(workflow, verdict) {
+  const outcome = verdict.outcome; // one of SHIP_BLOCKED_OUTCOMES
+  const completedAt = new Date().toISOString();
+  const won = await store.claimTerminalOutcome(workflow.id, outcome, completedAt, verdict.blockReason);
+  if (!won) {
+    console.log(`[orchestrator] Workflow ${workflow.id} already terminal — skipping duplicate ${outcome} close.`);
+    return;
+  }
+  const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
+  console.error(`[orchestrator] Workflow ${workflow.id} closed ${outcome} (not shipped): ${offenders}`);
+
+  workflow.phase = outcome;
+  workflow.completedAt = completedAt;
+  if (verdict.blockReason) workflow.blockReason = verdict.blockReason;
+
+  // Find a PR to label — prefer a prUrl harvested onto an offending ship ticket
+  // (harvestCompletionEvidence stashes record.pr_url there). Re-read for freshness.
+  let prUrl = "";
+  try {
+    const freshWf = await store.getWorkflow(workflow.id);
+    const tasks = freshWf?.agentTasks || workflow.agentTasks || {};
+    for (const o of verdict.offenders) {
+      const entry = tasks[o.ticketId];
+      if (entry && typeof entry.prUrl === "string" && entry.prUrl) { prUrl = entry.prUrl; break; }
+    }
+  } catch { /* best-effort */ }
+
+  // Surface the block on the review surface via a PR label. Best-effort by
+  // contract: a missing PAT / label / PR must never turn the terminal close
+  // into a throw (that would leave the run wedged, the exact failure we fix).
+  if (prUrl) {
+    try {
+      await labelPullRequest(prUrl, outcome);
+    } catch (err) {
+      console.warn(`[orchestrator] PR label ${outcome} skipped for ${prUrl}: ${err?.message || err}`);
+    }
+  }
+
+  await publishEvent(
+    workflow.epicId,
+    outcome === "deploy-blocked" ? "workflow.deploy_blocked" : "workflow.static_ci_only",
+    {
+      workflowId: workflow.id,
+      outcome,
+      reason: verdict.blockReason || null,
+      offenders: verdict.offenders,
+      prUrl,
+      featureBranch: workflow.featureBranch,
+    }
+  );
+
+  await store.markFinalized(workflow.id);
+}
+
+/**
+ * TEAM-3747 D2 — add a label to the PR behind a github.com/{owner}/{repo}/pull/{N}
+ * URL (issues + PRs share the labels endpoint). Validates the URL so a malformed
+ * prUrl throws to the caller's warn rather than hitting the wrong endpoint; the
+ * label is created on demand by GitHub if it doesn't exist yet.
+ */
+async function labelPullRequest(prUrl, label) {
+  const m = String(prUrl || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  if (!m) throw new Error(`unrecognized PR url: ${prUrl}`);
+  const [, owner, repo, number] = m;
+  await githubApi(`/repos/${owner}/${repo}/issues/${number}/labels`, "POST", { labels: [label] });
 }
 
 // ─── Agent Invocation ──────────────────────────────────────────────────────────
@@ -2401,6 +2985,24 @@ async function getTicket(ticketId) {
   return result.Item;
 }
 
+/**
+ * TEAM-3755 F9 — one ticket read by KEY with ConsistentRead, for callers that
+ * must not act on the eventually-consistent parentId-index snapshot (the cascade's
+ * blocker confirm). Jira has no read-consistency knob: its REST GET is already a
+ * fresh authoritative read, so the provider branch is the same shape as getTicket.
+ */
+async function getTicketConsistent(ticketId) {
+  if (TICKET_PROVIDER === "jira") {
+    return await getTicketFromJira(ticketId);
+  }
+  const result = await ddb.send(new GetCommand({
+    TableName: TICKETS_TABLE,
+    Key: { ticketId },
+    ConsistentRead: true,
+  }));
+  return result.Item || null;
+}
+
 async function getChildTickets(parentId) {
   if (TICKET_PROVIDER === "jira") {
     return await getChildTicketsFromJira(parentId);
@@ -2798,6 +3400,23 @@ async function callGitHub(toolName, args) {
         }
         throw err;
       }
+    }
+    if (toolName === "list_pr_files") {
+      // The PR's changed-file list (TEAM-3748 D3): what the diff-scoped ship
+      // review scopes against. Paginate — files come 100/page — but cap the walk
+      // so a pathological PR can't spin the Lambda; the change set is a scoping
+      // hint, not an audit, and any short read just fails open at the caller.
+      const { owner, repo, pull_number } = args;
+      const files = [];
+      for (let page = 1; page <= 30; page++) {
+        const batch = await githubApi(
+          `/repos/${owner}/${repo}/pulls/${pull_number}/files?per_page=100&page=${page}`
+        );
+        if (!Array.isArray(batch) || batch.length === 0) break;
+        files.push(...batch);
+        if (batch.length < 100) break;
+      }
+      return files;
     }
   }
   // Legacy fallback: proxy through the github-mcp Lambda if an install has one.
