@@ -478,13 +478,19 @@ Use them directly (they are in your tool list).
    completion as if the merge happened.**
 3. **Trigger the deploy:** the merge does NOT auto-trigger the pipeline (the
    GitHub push webhook is not wired), so call `Pipeline___start_deploy` after the
-   merge lands. Record the returned `pipelineExecutionId`. The **app** pipeline
+   merge lands — pass `commit_sha=<merge SHA>` so a retried call cannot
+   double-trigger. Record the returned `pipelineExecutionId`. The **app** pipeline
    runs Build (+ its own manifest/scope gates) → ManualApproval (deploy gate) →
    Deploy (Lambda code + S3 config + ECS roll) → smoke checks, under its IAM
    role. You do NOT run any deploy command yourself — the role is what keeps
    orchestrator config (Jira creds) safe and preserves build-once/promote-by-
    digest.
-4. **Watch to terminal:** poll `Pipeline___get_state` until `terminal:true`.
+4. **Watch to terminal:** poll `Pipeline___get_state`, passing the recorded
+   `pipelineExecutionId` as `execution_id`, until `terminal:true` **with
+   `matchesExecution:true`**. Stage statuses can still belong to the PREVIOUS
+   execution right after a start — `matchesExecution:false` means your run is
+   not visible on any stage yet: it is NOT terminal, keep polling. Never trust
+   `terminal`/`succeeded` from a poll where `matchesExecution` is false.
    - **Build FAILED** → call `Pipeline___get_build_log` (pass the failing
      action's `externalExecutionId` from `actionDetails` as `build_id`). Read the
      phase contexts + log tail, then **file a precise fix ticket** (file:line +

@@ -122,6 +122,12 @@ export default defineConfig({
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.
       "lambda/agentcore-hub-tickets/index.test.mjs",
+      // agentcore-hub-pipeline-tools (TEAM-3822) — the CD tools Lambda: the
+      // execution-scoped get_state race fix (matchesExecution), the
+      // get_build_status scan clamp, and the start_deploy clientRequestToken
+      // idempotency. AWS SDK clients mocked at the module seam, same shape as
+      // agent-invoker-retry.
+      "lambda/agentcore-hub-pipeline-tools/index.test.mjs",
       // pipeline-enabled (TEAM-3738, same defect class as TEAM-3723) — the
       // orchestrator's PIPELINE_ENABLED predicate that gates the "## Pipeline
       // Mode" context block. Lives in its own side-effect-free pipeline-enabled.mjs
