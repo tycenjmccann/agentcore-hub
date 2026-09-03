@@ -2330,22 +2330,27 @@ def _publish_agent_started(workflow_id: str, agent_id: str):
 
 def _publish_operator_delivery(workflow_id: str, agent_id: str, message: str):
     """Surface a consumed operator message in the agent's output stream so the
-    UI shows the hand-off (rides the same agent.streaming path as model text)."""
+    UI shows the hand-off (rides the same agent.streaming path as model text).
+    Stamped with the current ticket so it lands inside the run that consumed it
+    (an unstamped chunk used to render as its own phantom run in the UI)."""
     import time, random, string
     try:
         event_id = f"{int(time.time() * 1000)}-opmsg-{''.join(random.choices(string.ascii_lowercase, k=4))}"
+        detail = {
+            "agentId": {"S": agent_id},
+            "type": {"S": "text"},
+            "content": {"S": f"\n\n> 📨 **Operator:** {message}\n\n"},
+            "workflowId": {"S": workflow_id},
+        }
+        if _CURRENT_TICKET_ID:
+            detail["ticketId"] = {"S": _CURRENT_TICKET_ID}
         _ddb_events_client.put_item(
             TableName=_EVENTS_TABLE,
             Item={
                 "workflowId": {"S": workflow_id},
                 "eventId": {"S": event_id},
                 "type": {"S": "agent.streaming"},
-                "detail": {"M": {
-                    "agentId": {"S": agent_id},
-                    "type": {"S": "text"},
-                    "content": {"S": f"\n\n> 📨 **Operator:** {message}\n\n"},
-                    "workflowId": {"S": workflow_id},
-                }},
+                "detail": {"M": detail},
                 "timestamp": {"S": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
             },
         )

@@ -1727,8 +1727,12 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             const agentTask = Object.values(state.agentTasks).find((t) => t.agentId === expandedAgent);
             const currentTicketId = agentTask?.ticketId || "";
             const serverRuns = agentRuns[expandedAgent] || [];
-            // Merge live SSE text onto the matching run (server poll lags a few seconds).
-            const merged: AgentRun[] = serverRuns.map((r) => {
+            // Merge live SSE text onto the LAST segment of the matching ticket only
+            // (server poll lags a few seconds; re-dispatched tickets have several
+            // segments and the earlier ones are settled history).
+            const merged: AgentRun[] = serverRuns.map((r, i) => {
+              const isLastForTicket = !serverRuns.slice(i + 1).some((o) => o.ticketId === r.ticketId);
+              if (!isLastForTicket) return r;
               const live = streamingText[runKey(expandedAgent, r.ticketId)] || "";
               return live.length > r.stream.length ? { ...r, stream: live } : r;
             });

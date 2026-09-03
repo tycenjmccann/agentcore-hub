@@ -330,10 +330,15 @@ export interface HumanNotification {
   links?: ReviewPackageLink[];
 }
 
-// One dispatch of an agent within a workflow — its own ticket, streamed text,
-// and completion summary. Returned by GET /api/workflow/[id]/agent-output.
+// One dispatch (InvokeAgentRuntime call) of an agent within a workflow — its
+// streamed text and, if it reported completion, its summary. Segmented by
+// dispatch-boundary events, NOT by ticket: a convergence loop re-dispatching
+// one ticket yields one AgentRun per invocation.
+// Returned by GET /api/workflow/[id]/agent-output, chronological.
 export interface AgentRun {
   ticketId: string;
+  /** Timestamp of the dispatch boundary (agent.invoked/agent.started), if seen. */
+  invokedAt?: string;
   stream: string;
   summary: string;
   startedAt: string;

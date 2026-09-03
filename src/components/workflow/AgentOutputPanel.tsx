@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { X, AlertCircle, FileText, TerminalSquare, Send, ChevronRight } from "lucide-react";
+import { X, AlertCircle, FileText, TerminalSquare, Send } from "lucide-react";
 import type { AgentTask, AgentRun } from "@/lib/workflow/types";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import "./pipeline.css";
@@ -40,6 +40,16 @@ function fmtClock(iso: string): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+/** Divider timestamp: "9/3 8:45 PM" (local). */
+function fmtInvoked(iso: string): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const date = d.toLocaleDateString([], { month: "numeric", day: "numeric" });
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return `${date} ${time}`;
+}
+
 /** Remote coding sessions leave a footer in the agent's output:
  *  [coding-session: cc-<hex> cli=claude conversation=<id>]
  *  Each session id is a live, resumable Cloud Code session. */
@@ -68,68 +78,40 @@ function formatAgentName(agentId: string): string {
     .join(" ");
 }
 
-/** One collapsible card = one dispatch of the agent. Its own streamed text +
- *  its own summary, so re-runs never bleed into each other. */
-function RunCard({
-  run,
-  index,
-  total,
-  isCurrent,
-  defaultOpen,
-}: {
-  run: AgentRun;
-  index: number; // 1-based, in chronological order
-  total: number;
-  isCurrent: boolean;
-  defaultOpen: boolean;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-  // Keep the live run expanded as it streams even if props re-mount.
-  useEffect(() => {
-    if (isCurrent) setOpen(true);
-  }, [isCurrent]);
-
+/** One segment of the continuous log = one dispatch (invocation) of the agent.
+ *  A thin "Agent Invoked <time>" divider, the segment's streamed text flowing
+ *  under it, and a Run Summary block when the invocation reported completion. */
+function RunSegment({ run, isCurrent }: { run: AgentRun; isCurrent: boolean }) {
   const stream = run.stream ? unjam(run.stream) : "";
-  const started = fmtClock(run.startedAt);
+  const when = fmtInvoked(run.invokedAt || run.startedAt);
 
   return (
-    <div className={`run-card ${isCurrent ? "run-card-live" : ""}`}>
-      <button
-        type="button"
-        className="run-card-header"
-        onClick={() => setOpen((o) => !o)}
-        aria-expanded={open}
-      >
-        <ChevronRight size={14} className={`run-card-chevron ${open ? "open" : ""}`} aria-hidden="true" />
-        <span className="run-card-index">Run {index}<span className="run-card-of">/{total}</span></span>
-        {run.ticketId && <span className="run-card-ticket">{run.ticketId}</span>}
-        <span className={`run-card-badge ${isCurrent ? "live" : "done"}`}>
-          {isCurrent ? "Working" : "Done"}
+    <section className={`run-segment ${isCurrent ? "run-segment-live" : ""}`}>
+      <div className="run-divider" role="separator">
+        <span className="run-divider-line" aria-hidden="true" />
+        <span className="run-divider-label">
+          Agent Invoked{when ? ` ${when}` : ""}
+          {run.ticketId && <span className="run-divider-ticket">{run.ticketId}</span>}
+          {isCurrent && <span className="run-divider-live">LIVE</span>}
         </span>
-        <span className="run-card-spacer" />
-        {started && <span className="run-card-time">{started}</span>}
-      </button>
-      {open && (
-        <div className="run-card-body">
-          {stream && (
-            <div className="run-card-stream">
-              <MarkdownRenderer content={stream} />
-            </div>
-          )}
-          {run.summary && (
-            <div className="run-card-summary">
-              <div className="run-card-summary-label">Summary</div>
-              <MarkdownRenderer content={run.summary} />
-            </div>
-          )}
-          {!stream && !run.summary && (
-            <div className="run-card-empty">
-              {isCurrent ? "Waiting for output…" : "No output recorded for this run."}
-            </div>
-          )}
+        <span className="run-divider-line" aria-hidden="true" />
+      </div>
+      {stream ? (
+        <div className="run-segment-stream">
+          <MarkdownRenderer content={stream} />
+        </div>
+      ) : (
+        <div className="run-segment-empty">
+          {isCurrent ? "Waiting for output…" : "No output recorded for this invocation."}
         </div>
       )}
-    </div>
+      {run.summary && (
+        <div className="run-segment-summary">
+          <div className="run-segment-summary-label">Run Summary</div>
+          <MarkdownRenderer content={run.summary} />
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -255,12 +237,14 @@ export default function AgentOutputPanel({
     };
   }, [isOpen, workflowId, task?.agentId, task?.output]);
 
-  // Auto-scroll to bottom when output changes (streaming)
+  // Auto-scroll to bottom when output changes (streaming). The log is
+  // chronological with the live segment at the bottom, so bottom = newest.
+  const lastRun = runs[runs.length - 1];
   useEffect(() => {
-    if (contentRef.current && task?.output && isAutoScrollEnabled) {
+    if (contentRef.current && (task?.output || lastRun?.stream) && isAutoScrollEnabled) {
       contentRef.current.scrollTop = contentRef.current.scrollHeight;
     }
-  }, [task?.output, isAutoScrollEnabled]);
+  }, [task?.output, lastRun?.stream, isAutoScrollEnabled]);
 
   // Scroll to summary section when panel opens OR when output loads (async fetch)
   const hasScrolledRef = useRef(false);
@@ -462,25 +446,20 @@ export default function AgentOutputPanel({
             </div>
           )}
           {runs.length > 0 ? (
-            <div className="run-list">
-              {runs.length > 1 && (
-                <div className="run-list-caption">
-                  {runs.length} runs · newest first
-                </div>
-              )}
-              {/* Newest on top. The run matching the live ticket (while the agent
-                  is running) is the current one — auto-expanded and badged Working. */}
-              {[...runs].reverse().map((run, revIdx) => {
-                const chronoIndex = runs.length - revIdx; // 1-based chronological
-                const isCurrent = isRunning && !!currentTicketId && run.ticketId === currentTicketId;
+            <div className="run-log">
+              {/* One continuous chronological log: a divider per invocation,
+                  stream flowing under it, Run Summary at the segment's end.
+                  Newest at the bottom — live text appends there. */}
+              {runs.map((run, idx) => {
+                const isLast = idx === runs.length - 1;
+                const isCurrent =
+                  isRunning && isLast &&
+                  (!currentTicketId || !run.ticketId || run.ticketId === currentTicketId);
                 return (
-                  <RunCard
-                    key={run.ticketId || `run-${chronoIndex}`}
+                  <RunSegment
+                    key={`${run.ticketId || "run"}-${run.invokedAt || run.startedAt || idx}`}
                     run={run}
-                    index={chronoIndex}
-                    total={runs.length}
                     isCurrent={isCurrent}
-                    defaultOpen={isCurrent || revIdx === 0}
                   />
                 );
               })}
