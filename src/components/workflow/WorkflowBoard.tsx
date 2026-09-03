@@ -14,6 +14,7 @@ import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePha
 import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
 import { applyAgentStatus, applyAgentComplete, shouldForceTicketDone } from "@/lib/workflow/board-state";
+import { isLivenessEvent, computeIsStale, staleThresholdFor } from "@/lib/workflow/stale";
 import { Square, ClipboardCheck } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
@@ -672,6 +673,19 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
       return next;
     });
 
+    // Tool activity is liveness, not just text growth: a long tool call emits
+    // no agent_output, so without this a mid-tool agent trips STUCK while the
+    // footer simultaneously shows the tool in flight (TEAM-3858). handleEvent
+    // only fires for live SSE (never replay/catch-up), so Date.now() is real.
+    // agent_status/token_usage deliberately excluded — a dead session must
+    // still cross the threshold.
+    if (isLivenessEvent(event.type)) {
+      lastActivityRef.current = Date.now();
+      nudgeFiredRef.current = "";
+      setIsStale(false);
+      setManualStaleAgents((prev) => (prev.size > 0 ? new Set<string>() : prev));
+    }
+
     switch (event.type) {
       case "phase_change": {
         const newPhaseIndex = phaseOrderRef.current[event.phase] ?? -1;
@@ -980,18 +994,24 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
       );
       const nudgeKey = `${workflowId}:${state.phase}`;
 
-      // Tiered stale threshold based on last tool called:
-      // - claude_code: 12 min (600s timeout + 120s buffer) — it goes dark for the full run
-      // - anything else: 3 min — normal tools return in seconds
+      // Tiered stale threshold based on last tool called — see @/lib/workflow/stale
       const runningAgents = Object.entries(state.agentTasks || {})
         .filter(([, t]) => t.status === "running" || t.status === "waiting_response")
         .map(([key]) => key);
       const anyInClaudeCode = runningAgents.some(
         (id) => lastToolPerAgentRef.current[id] === "claude_code"
       );
-      const staleThreshold = anyInClaudeCode ? 1_020_000 : 180_000; // 17 min (15 min timeout + 2 min buffer) vs 3 min
+      const staleThreshold = staleThresholdFor(anyInClaudeCode);
 
-      if (hasRunning && idle > staleThreshold && !isStale) {
+      if (
+        computeIsStale({
+          now: Date.now(),
+          lastActivityAt: lastActivityRef.current,
+          hasRunningAgent: hasRunning,
+          thresholdMs: staleThreshold,
+        }) &&
+        !isStale
+      ) {
         setIsStale(true);
       }
 
@@ -1711,7 +1731,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           lastToolName={expandedAgent ? lastToolPerAgentRef.current[expandedAgent] : undefined}
           lastEvent={expandedAgent ? lastEventPerAgent[expandedAgent] : undefined}
           lastActivityTime={lastActivityRef.current}
-          staleThreshold={expandedAgent && lastToolPerAgentRef.current[expandedAgent] === "claude_code" ? 1_020_000 : 180_000}
+          staleThreshold={staleThresholdFor(!!expandedAgent && lastToolPerAgentRef.current[expandedAgent] === "claude_code")}
           onRestart={() => {
             setIsStale(false);
             if (expandedAgent) {

@@ -392,8 +392,10 @@ export default function AgentOutputPanel({
   const agentName = task ? formatAgentName(task.agentId) : "Agent Output";
   const isRunning = task?.status === "running";
 
+  // A stale running agent must not be headlined "Working" while the footer
+  // says STUCK — the header and footer derive from the same staleness flag.
   const statusClass = task?.status === "running"
-    ? "running"
+    ? (isStale ? "error" : "running")
     : task?.status === "complete"
     ? "complete"
     : task?.status === "error"
@@ -401,7 +403,7 @@ export default function AgentOutputPanel({
     : "";
 
   const statusLabel = task?.status === "running"
-    ? "Working"
+    ? (isStale ? "Stalled" : "Working")
     : task?.status === "complete"
     ? "Complete"
     : task?.status === "error"
