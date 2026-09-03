@@ -709,7 +709,7 @@ def main():
     parser.add_argument("--parallel", type=int, default=3, help="Max parallel invocations")
     parser.add_argument("--agent", type=str, default=None, help="Test single agent (name from fleet file)")
     parser.add_argument("--verbose", action="store_true", help="Print raw agent responses")
-    parser.add_argument("--model", type=str, default=None, help="Model override (e.g., us.anthropic.claude-sonnet-4-6, sonnet, haiku)")
+    parser.add_argument("--model", type=str, default=None, help="Model override (e.g., us.anthropic.claude-sonnet-5, sonnet, haiku)")
     args = parser.parse_args()
 
     with open(args.fleet_file, "r") as f:

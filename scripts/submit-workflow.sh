@@ -55,8 +55,8 @@ SKIP_VALIDATION=false
 
 resolve_model() {
   case "$1" in
-    opus|opus4.6|opus-4.6)   echo "us.anthropic.claude-opus-4-6-v1" ;;
-    sonnet|sonnet4.6|sonnet-4.6) echo "us.anthropic.claude-sonnet-4-6" ;;
+    opus|opus4.6|opus-4.6)   echo "us.anthropic.claude-opus-5" ;;
+    sonnet|sonnet4.6|sonnet-4.6) echo "us.anthropic.claude-sonnet-5" ;;
     haiku|haiku3.5)          echo "us.anthropic.claude-3-5-haiku-20241022-v1:0" ;;
     us.anthropic.*)          echo "$1" ;;  # Already a full model ID
     *)

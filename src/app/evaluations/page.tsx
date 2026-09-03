@@ -83,8 +83,9 @@ function formatCost(v?: number): string {
 }
 
 function shortModelName(modelId: string): string {
-  if (modelId.includes("opus-4-6") || modelId.includes("opus-4-7")) return "Opus";
-  if (modelId.includes("sonnet-4-6") || modelId.includes("sonnet-4-5")) return "Sonnet";
+  if (modelId.includes("fable")) return "Fable";
+  if (modelId.includes("opus")) return "Opus";
+  if (modelId.includes("sonnet")) return "Sonnet";
   if (modelId.includes("haiku")) return "Haiku";
   return modelId.split(".").pop()?.split("-")[0] || modelId;
 }

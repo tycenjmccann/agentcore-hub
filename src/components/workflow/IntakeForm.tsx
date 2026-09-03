@@ -364,7 +364,7 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
             Model Selection (Optional)
           </label>
           <p className="text-xs text-muted mb-2">
-            Select AI model for development agents. Defaults to Claude Sonnet 4.5.
+            Select AI model for development agents. Defaults to Claude Sonnet 5.
           </p>
 
           {modelsLoading ? (

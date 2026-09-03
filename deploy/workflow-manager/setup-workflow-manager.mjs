@@ -12,7 +12,7 @@
  *
  * Usage:
  *   node deploy/workflow-manager/setup-workflow-manager.mjs \
- *     [--model-id us.anthropic.claude-opus-4-8] [--workflow-api-url https://...]
+ *     [--model-id us.anthropic.claude-fable-5-1] [--workflow-api-url https://...]
  *
  * Requires: npm install at repo root (uses the repo's AWS SDK packages).
  */
@@ -38,11 +38,12 @@ const getArg = (name) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
-// NOTE: claude-fable-5 buffers all post-tool-call text and flushes it in a
-// single burst at message end (verified: 0.1s span vs 8–9s for opus/sonnet on
-// identical converse_stream). In the CHAT drawer that reads as a frozen,
-// unstreamed blob after a long tool loop. Opus streams post-tool text live.
-const MODEL_ID = getArg("model-id") || "us.anthropic.claude-opus-4-8";
+// NOTE: fable-5-1 must be smoke-verified for live post-tool-call streaming at
+// deploy time (its predecessor, claude-fable-5, buffered all post-tool-call
+// text and flushed it in a single burst at message end, which read as a
+// frozen, unstreamed blob in the CHAT drawer after a long tool loop). If
+// fable-5-1 still buffers, fall back to pinning us.anthropic.claude-opus-5.
+const MODEL_ID = getArg("model-id") || "us.anthropic.claude-fable-5-1";
 const HARNESS_NAME = "agentcore_hub_workflow_manager";
 const MEMORY_NAME = "agentcore_hub_workflow_manager_memory";
 const ROLE_NAME = "agentcore-hub-harness-role";

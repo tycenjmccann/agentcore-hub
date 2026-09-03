@@ -44,7 +44,7 @@ export async function POST(req: NextRequest) {
       harnessName: config.agent_name,
       executionRoleArn,
       foundation: {
-        modelId: config.model_id || "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        modelId: config.model_id || "us.anthropic.claude-sonnet-5",
         ...(config.system_prompt ? { instruction: config.system_prompt } : {}),
       },
     };

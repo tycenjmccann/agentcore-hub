@@ -26,7 +26,7 @@ import boto3
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 ARTIFACT_BUCKET = os.environ["ARTIFACT_BUCKET"]
 ANALYSES_TABLE = os.environ.get("ANALYSES_TABLE", "agentcore-hub-workflow-analyses")
-MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-opus-4-8")
+MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-opus-5")
 
 SCHEMA_VERSION = 1
 FINDING_KINDS = {"bottleneck", "failure", "success", "risk"}

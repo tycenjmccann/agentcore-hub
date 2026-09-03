@@ -16,7 +16,7 @@
  *
  * Usage:
  *   node deploy/routine-builder/setup-routine-builder.mjs \
- *     [--model-id us.anthropic.claude-opus-4-8]
+ *     [--model-id us.anthropic.claude-opus-5]
  *
  * Requires: npm install at repo root.
  */
@@ -42,8 +42,11 @@ const getArg = (name) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
-// Opus streams post-tool-call text live (fable buffers it) — matches the WM choice.
-const MODEL_ID = getArg("model-id") || "us.anthropic.claude-opus-4-8";
+// Opus streams post-tool-call text live (fable buffers it) — matches the WM's
+// pre-bump choice. NOTE: WM has since moved to fable-5-1 pending a live
+// streaming smoke test (see setup-workflow-manager.mjs); revisit this default
+// once that's confirmed one way or the other.
+const MODEL_ID = getArg("model-id") || "us.anthropic.claude-opus-5";
 const HARNESS_NAME = "agentcore_hub_routine_builder";
 const MEMORY_NAME = "agentcore_hub_routine_builder_memory";
 const ROLE_NAME = "agentcore-hub-harness-role";

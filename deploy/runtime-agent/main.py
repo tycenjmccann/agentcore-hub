@@ -141,7 +141,7 @@ def _load_builtin_tools():
 
 # --- Configuration ---
 REGION = os.getenv("AWS_REGION", "us-east-1")
-MODEL_ID = os.getenv("MODEL_ID", "us.anthropic.claude-fable-5")
+MODEL_ID = os.getenv("MODEL_ID", "us.anthropic.claude-fable-5-1")
 READ_TIMEOUT = int(os.getenv("READ_TIMEOUT", "1200"))  # 20 minutes — agents need room for complex claude_code calls
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "32000"))
 GATEWAY_ARN = os.getenv("GATEWAY_ARN", "")
@@ -453,7 +453,7 @@ CLOUD_CODE_TENANT_ID = os.getenv("CLOUD_CODE_TENANT_ID", "default")
 # (`model` arg). Bedrock inference-profile ids — bare model names 500 on Bedrock.
 # Empty/unknown tier → the coding runtime's own CLAUDE_MODEL default (Fable 5).
 CODING_MODEL_TIERS = {
-    "fable": "us.anthropic.claude-fable-5",
+    "fable": "us.anthropic.claude-fable-5-1",
     "opus": "us.anthropic.claude-opus-5",
     "sonnet": "us.anthropic.claude-sonnet-5",
     "haiku": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -1866,7 +1866,7 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
         CODING_MODEL_TIERS.get((model or "").strip().lower())
         or os.environ.get("ANTHROPIC_MODEL")
         or os.environ.get("CLAUDE_MODEL")
-        or "us.anthropic.claude-fable-5"
+        or "us.anthropic.claude-fable-5-1"
     )
 
     try:
@@ -2693,11 +2693,11 @@ async def _run_agent_invocation(payload, context):
 
         # Use model override if provided (orchestrator can specify per-agent)
         MODEL_ALIASES = {
-            "opus": "us.anthropic.claude-opus-4-6-v1",
-            "sonnet": "us.anthropic.claude-sonnet-4-6",
+            "opus": "us.anthropic.claude-opus-5",
+            "sonnet": "us.anthropic.claude-sonnet-5",
             "haiku": "us.anthropic.claude-haiku-4-5-20251001",
-            "claude-opus-46": "us.anthropic.claude-opus-4-6-v1",
-            "claude-sonnet-46": "us.anthropic.claude-sonnet-4-6",
+            "claude-opus-46": "us.anthropic.claude-opus-5",
+            "claude-sonnet-46": "us.anthropic.claude-sonnet-5",
         }
         active_model = model
         if model_override and model_override != MODEL_ID:

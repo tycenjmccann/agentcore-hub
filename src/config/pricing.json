@@ -1,11 +1,19 @@
 {
-  "_comment": "Single source of truth for model pricing. USD per 1M tokens (Bedrock on-demand, us-east-1). Keys match gen_ai.request.model values seen in spans \u2014 both bare model names (Claude Code CLI) and Bedrock inference-profile ids (Strands personas). kiro.usdPerCredit converts Kiro credits (its only usage unit) to USD for cross-engine comparison.",
+  "_comment": "Single source of truth for model pricing. USD per 1M tokens (Bedrock on-demand, us-east-1). Keys match gen_ai.request.model values seen in spans \u2014 both bare model names (Claude Code CLI) and Bedrock inference-profile ids (Strands personas). kiro.usdPerCredit converts Kiro credits (its only usage unit) to USD for cross-engine comparison. Pre-bump ids (e.g. opus-4-6/4-7, sonnet-4-5/4-6) are retained \u2014 do not remove \u2014 because historical aws/spans records still reference them for cost lookups.",
   "models": {
     "claude-fable-5": {
       "input": 20,
       "output": 100
     },
     "us.anthropic.claude-fable-5": {
+      "input": 20,
+      "output": 100
+    },
+    "claude-fable-5-1": {
+      "input": 20,
+      "output": 100
+    },
+    "us.anthropic.claude-fable-5-1": {
       "input": 20,
       "output": 100
     },

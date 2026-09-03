@@ -49,6 +49,21 @@ describe("harness model catalog", () => {
     });
   });
 
+  it("resolves the fable-5-1, opus-5, and sonnet-5 catalog entries", () => {
+    expect(buildHarnessModelConfig("claude-fable-5-1").bedrockModelConfig).toEqual({
+      modelId: "us.anthropic.claude-fable-5-1",
+      apiFormat: "converse_stream",
+    });
+    expect(buildHarnessModelConfig("claude-opus-5").bedrockModelConfig).toEqual({
+      modelId: "us.anthropic.claude-opus-5",
+      apiFormat: "converse_stream",
+    });
+    expect(buildHarnessModelConfig("claude-sonnet-5").bedrockModelConfig).toEqual({
+      modelId: "us.anthropic.claude-sonnet-5",
+      apiFormat: "converse_stream",
+    });
+  });
+
   it("falls back to native Converse for unknown ids", () => {
     const cfg = buildHarnessModelConfig("some-unknown-model");
     expect(cfg.bedrockModelConfig).toEqual({

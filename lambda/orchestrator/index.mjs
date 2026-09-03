@@ -2447,12 +2447,12 @@ async function invokeAgent(agentDef, context, workflow, ticketId) {
     let override = workflow.input.modelOverride;
     if (typeof override === "string") {
       const modelMap = {
-        "opus": "us.anthropic.claude-opus-4-6-v1",
-        "sonnet": "us.anthropic.claude-sonnet-4-6",
-        "claude-opus-47": "us.anthropic.claude-opus-4-7",
-        "claude-opus-46": "us.anthropic.claude-opus-4-6-v1",
-        "claude-sonnet-46": "us.anthropic.claude-sonnet-4-6",
-        "claude-sonnet-45": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "opus": "us.anthropic.claude-opus-5",
+        "sonnet": "us.anthropic.claude-sonnet-5",
+        "claude-opus-47": "us.anthropic.claude-opus-5",
+        "claude-opus-46": "us.anthropic.claude-opus-5",
+        "claude-sonnet-46": "us.anthropic.claude-sonnet-5",
+        "claude-sonnet-45": "us.anthropic.claude-sonnet-5",
       };
       override = { bedrockModelConfig: { modelId: modelMap[override] || override } };
     }

@@ -286,3 +286,97 @@ deploy gate (bridged to Telegram Approve/Reject buttons) authorizes the
 *deploy* of the artifacts the Build stage already produced. In legacy mode
 (no pipeline) the merge gate remains the single act that authorizes the
 deploy above.
+
+## Model bump
+
+One-off runbook for rotating the pinned Claude model ids fleet-wide (e.g.
+TEAM-3849/3851). NOT part of the routine staging deploy above and not run on
+every merge — run this section top to bottom, in order, whenever
+`src/lib/models/harness-models.json` / `CODING_MODEL_TIERS` / persona env
+defaults change. Six independent deploy targets carry a model id; the order
+below avoids a window where the orchestrator, harnesses, and runtimes disagree
+about which id is current.
+
+1. Orchestrator Lambda, code only — identical command to staging step 1 above
+   (explicit `zip -rq` file list ported from `deploy.sh`; **never** `zip -qr .`
+   — it drops `src/config/lease-constants.json` and the function INIT-crashes
+   on every invoke thereafter). Verify with a real test invoke, not just
+   `get-function` (which reports `Active` even mid-INIT-crash):
+   ```bash
+   aws lambda invoke --function-name agentcore-hub-orchestrator \
+     --payload "$(echo '{}' | base64)" /tmp/orchestrator-smoke.json \
+     --query 'FunctionError' --output text   # expect: None
+   ```
+
+2. Blueprints/prompts → S3; `agents.json` MERGED onto the S3 copy (identical
+   command to staging step 2 — the S3 copy carries deploy-injected
+   `runtimeArn`s that the repo's own copy nulls out). Verify the merge didn't
+   clobber ARNs:
+   ```bash
+   aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" - | \
+     python3 -c "import json,sys; a=json.load(sys.stdin); assert all(x.get('runtimeArn') for x in a['agents'] if x.get('type')=='runtime'), 'null runtimeArn — config merge clobbered ARNs'; print('config ok')"
+   ```
+
+3. Next.js app → ECS Express Mode (identical command to staging step 3):
+   ```bash
+   ./deploy/ecs-express/deploy.sh
+   ```
+
+4. Harness personas — Workflow Manager first, builder second:
+   ```bash
+   # WM: BLOCKING smoke — a chat turn's post-tool-call text must stream live,
+   # not arrive as one frozen blob at the end. If the new model buffers,
+   # re-run with --model-id us.anthropic.claude-opus-5 rather than shipping a
+   # regressed CHAT drawer.
+   node deploy/workflow-manager/setup-workflow-manager.mjs
+
+   # Builder — pin explicitly rather than trusting the script's baked-in default:
+   node deploy/setup-builder-agent.mjs --model-id us.anthropic.claude-sonnet-5
+   ```
+   `UpdateHarness`'s memory attachment needs the `optionalValue` wrapper; the
+   `model` field does not — don't copy that wrapper onto the model update by
+   reflex.
+
+5. Coding-agent runtime — rebuild and deploy with both env vars pinned
+   explicitly on the command line (don't rely on the script's baked-in
+   default matching what you intend):
+   ```bash
+   ANTHROPIC_MODEL=us.anthropic.claude-fable-5-1 CLAUDE_MODEL=us.anthropic.claude-fable-5-1 \
+     python3 deploy/coding-agent-runtime/deploy.py
+   ```
+
+6. Shared fleet runtime — LAST, only once every other target above is
+   confirmed on the new id (same pinning):
+   ```bash
+   ANTHROPIC_MODEL=us.anthropic.claude-fable-5-1 CLAUDE_MODEL=us.anthropic.claude-fable-5-1 \
+     ./deploy/runtime-agent/deploy-fleet.sh
+   ```
+   `UpdateAgentRuntime` REPLACES `env` / `filesystemConfigurations` / `lifecycle`
+   wholesale on every call — read back the current `MEMORY_ID`, EFS mount, and
+   lifecycle config first and pass them through unchanged, or a "just bump the
+   model" deploy silently drops the EFS mount.
+
+### Post-deploy smoke (model bump)
+
+```bash
+# New model id shows up in spans on BOTH the shared fleet and coding runtimes
+QUERY_ID=$(aws logs start-query --log-group-name aws/spans \
+  --start-time "$(date -u -d '30 minutes ago' +%s 2>/dev/null || date -u -v-30M +%s)" \
+  --end-time "$(date -u +%s)" \
+  --query-string 'fields `attributes.gen_ai.request.model` as model, `resource.attributes.service.name` as svc | filter model like /fable-5-1|opus-5|sonnet-5/ | stats count() by model, svc' \
+  --query 'queryId' --output text)
+sleep 5 && aws logs get-query-results --query-id "$QUERY_ID"   # expect: rows for the new ids, none for pre-bump ids
+
+# WM: a chat turn succeeds AND streams post-tool text live (manual check in
+# the CHAT drawer — no automated proxy for "did it stream" exists yet)
+
+# Builder answers a one-turn prompt
+curl -sf -X POST "$DEPLOYMENT_URL/api/agentcore/builder" \
+  -H 'Content-Type: application/json' -d '{"prompt":"say hello"}'   # expect: HTTP 200, non-empty reply
+
+# Dashboard cost still resolves for a PRE-bump run (retained src/config/pricing.json rows)
+curl -sf "$DEPLOYMENT_URL/api/evaluations" | python3 -c \
+  "import json,sys; d=json.load(sys.stdin); print('cost ok' if d.get('agents') else 'no data')"
+
+# Codex still invokes (Bedrock Mantle path — openai.gpt-5.5 is untouched by this bump)
+```

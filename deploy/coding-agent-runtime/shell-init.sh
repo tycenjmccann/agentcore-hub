@@ -36,7 +36,7 @@ export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-0}"
 # ── Claude Code → Bedrock (no key) ──
 export CLAUDE_CODE_USE_BEDROCK=1
 export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$WORKSPACE_ROOT/.claude-data}"
-export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-${CLAUDE_MODEL:-us.anthropic.claude-opus-4-6-v1}}"
+export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-${CLAUDE_MODEL:-us.anthropic.claude-opus-5}}"
 mkdir -p "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
 
 # ── Codex → Bedrock Mantle (no OpenAI key) ──
