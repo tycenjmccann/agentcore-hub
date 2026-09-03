@@ -210,8 +210,8 @@ async function getSpanLogGroups(region: string): Promise<string[]> {
 
 /**
  * Model ids arrive in several spellings depending on the emitter: Strands
- * spans carry Bedrock inference-profile ids (us.anthropic.claude-fable-5),
- * the coding CLI reports bare API names (claude-fable-5,
+ * spans carry Bedrock inference-profile ids (us.anthropic.claude-fable-5-1),
+ * the coding CLI reports bare API names (claude-fable-5-1,
  * claude-haiku-4-5-20251001). Collapse them to one display name so the same
  * model doesn't show up as three rows.
  */

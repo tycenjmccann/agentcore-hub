@@ -72,7 +72,7 @@ let MEMORY_ID = getArg("memory-id");
 const NO_MEMORY = args.includes("--no-memory");
 const MEMORY_NAME = "agentcore_hub_builder_memory";
 const MCP_URLS = getAllArgs("mcp-url");
-const MODEL_ID = getArg("model-id") || "us.anthropic.claude-sonnet-4-6";
+const MODEL_ID = getArg("model-id") || "us.anthropic.claude-sonnet-5";
 const ROLE_NAME = "agentcore-hub-harness-role";
 
 // --- Resolve account ID ---
@@ -469,7 +469,7 @@ client = boto3.client("bedrock-agentcore-control", region_name="${REGION}")
 response = client.create_harness(
     harnessName="my_new_agent",
     executionRoleArn="${HARNESS_ROLE_ARN}",
-    model={"bedrockModelConfig": {"modelId": "global.anthropic.claude-sonnet-4-5-20250929-v1:0"}},
+    model={"bedrockModelConfig": {"modelId": "us.anthropic.claude-sonnet-5"}},
     systemPrompt=[{"text": "Your system prompt here..."}],
     tools=[
         # Add remote_mcp for each MCP server the agent needs:
@@ -488,8 +488,8 @@ print(f"Created: {response['harness']['harnessId']}")
 
 - **Naming**: snake_case, descriptive: \`customer_support_agent\`, \`code_review_agent\`
 - **Models**:
-  - \`global.anthropic.claude-sonnet-4-5-20250929-v1:0\` — Fast, good for most tasks (default)
-  - \`global.anthropic.claude-opus-4-6-v1\` — Most capable, complex reasoning
+  - \`us.anthropic.claude-sonnet-5\` — Fast, good for most tasks (default)
+  - \`us.anthropic.claude-opus-5\` — Most capable, complex reasoning
   - \`global.anthropic.claude-haiku-4-5-20251001-v1:0\` — Fastest, cheapest
 - **System Prompts**: Clear role, specific capabilities, when/how to use tools
 - **Tool Wiring**: Use \`remote_mcp\` to connect agents to MCP servers. The URL is all that's needed — the agent discovers available tools at runtime.

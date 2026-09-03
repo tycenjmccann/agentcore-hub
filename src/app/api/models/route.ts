@@ -8,26 +8,19 @@ import type { ModelOption, ModelsApiResponse } from "@/lib/workflow/model-config
  */
 const BEDROCK_MODELS: ModelOption[] = [
   {
-    id: "claude-sonnet-45",
-    label: "Claude Sonnet 4.5 (Recommended)",
+    id: "claude-sonnet-5",
+    label: "Claude Sonnet 5 (Recommended)",
     provider: "bedrock",
-    modelId: "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    modelId: "us.anthropic.claude-sonnet-5",
     description: "Balanced performance and cost. Default for all workflows.",
     isDefault: true,
   },
   {
-    id: "claude-opus-47",
-    label: "Claude Opus 4.7",
+    id: "claude-opus-5",
+    label: "Claude Opus 5",
     provider: "bedrock",
-    modelId: "us.anthropic.claude-opus-4-7",
+    modelId: "us.anthropic.claude-opus-5",
     description: "Latest and most capable model. Best for complex reasoning and code generation.",
-  },
-  {
-    id: "claude-opus-46",
-    label: "Claude Opus 4.6",
-    provider: "bedrock",
-    modelId: "us.anthropic.claude-opus-4-6-v1",
-    description: "Highly capable model. Great for complex reasoning and code generation.",
   },
 ];
 

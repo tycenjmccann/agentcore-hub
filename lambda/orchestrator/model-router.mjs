@@ -26,9 +26,9 @@ export const TIERS = ["haiku", "sonnet", "opus", "fable"];
 
 export const TIER_MODELS = {
   haiku: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-  sonnet: "us.anthropic.claude-sonnet-4-6",
-  opus: "us.anthropic.claude-opus-4-6-v1",
-  fable: "us.anthropic.claude-fable-5",
+  sonnet: "us.anthropic.claude-sonnet-5",
+  opus: "us.anthropic.claude-opus-5",
+  fable: "us.anthropic.claude-fable-5-1",
 };
 
 const TIER_RANK = Object.fromEntries(TIERS.map((t, i) => [t, i]));

@@ -155,7 +155,7 @@ async function listMemories() {
 async function createHarness(event) {
   const name = event.harness_name || event.harnessName;
   const systemPrompt = event.system_prompt || event.systemPrompt;
-  const modelId = event.model_id || event.modelId || "global.anthropic.claude-sonnet-4-5-20250929-v1:0";
+  const modelId = event.model_id || event.modelId || "us.anthropic.claude-sonnet-5";
   const gatewayId = event.gateway_id || event.gatewayId;
   const memoryArn = event.memory_arn || event.memoryArn;
   const roleArn = event.execution_role_arn || event.executionRoleArn || process.env.HARNESS_ROLE_ARN;

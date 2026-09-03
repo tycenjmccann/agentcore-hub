@@ -57,7 +57,7 @@ Example — you MUST output the config like this:
 \`\`\`agent-config
 {
   "agent_name": "my_agent",
-  "model_id": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+  "model_id": "us.anthropic.claude-sonnet-5",
   "system_prompt": "You are...",
   "tools": ["tool1", "tool2"],
   "gateway_id": "gatewayId"
