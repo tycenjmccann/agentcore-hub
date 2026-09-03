@@ -29,6 +29,8 @@ Infra/deploy entry points (each is idempotent / re-runnable):
 node deploy/setup-tickets-lambda.mjs                 # deploys jira OR tickets Lambda per TICKET_PROVIDER
 node deploy/setup-builder-agent.mjs                  # builder harness
 cd deploy/runtime-agent && ./deploy-fleet.sh         # all 14 fleet runtime agents (needs AgentCore CLI)
+node deploy/setup-pipeline-tools-lambda.mjs          # Pipeline___* tools Lambda (pipeline module)
+./deploy/pipeline/deploy.sh                          # CI/CD pipeline CDK stack (pipeline module)
 ```
 
 The guided alternative to manual setup is the Claude Code plugin: `claude --plugin-dir .` then `/agentcore-hub:setup`.
@@ -36,7 +38,7 @@ The guided alternative to manual setup is the Claude Code plugin: `claude --plug
 ## Architecture
 
 ### Modular core + bolt-ons
-The app is a small always-on **core** (Dashboard, Agents, Invoke, region switch, runtime discovery/traces) plus **optional modules** (Workflow, Evaluations, Builder). Rules that matter when editing:
+The app is a small always-on **core** (Dashboard, Agents, Invoke, region switch, runtime discovery/traces) plus **optional modules** (Workflow, Evaluations, Builder, Registry, Cloud Code, Routines, Connectors, Pipeline — see `src/config/modules.ts`). Rules that matter when editing:
 - **Core never imports from an optional module.** Optional modules may use core libs (`src/lib/agentcore-sdk.ts`, `client-cache.ts`) and shared `src/config/agents.json`, but **not each other**.
 - Nav entries live in one registry: `src/config/modules.ts`. Removing a module should be a one-place edit, and the app must still pass `npx tsc --noEmit` + `npm run build`.
 - Every module's UI routes, API routes, Lambdas, and DynamoDB tables are namespaced. See `docs/MODULES.md` for the exact per-module file/table/env-var breakdown — consult it before adding or removing a surface.
@@ -56,13 +58,16 @@ Agents expect different payload shapes. `src/lib/agentcore-sdk.ts` has a `PAYLOA
 
 ### Workflow pipeline orchestration
 Submit a feature request → 14 Strands agents on AgentCore **Runtime** (requirements → 8 parallel design → 3 dev → 2 QA) produce a PR. Cascade is driven by ticket status changes:
-- **`TICKET_PROVIDER=dynamodb`** (default): DynamoDB Streams on the tickets table trigger the orchestrator Lambda.
-- **`TICKET_PROVIDER=jira`**: real Jira Cloud; Jira webhooks hit `/api/jira/webhook`. Requires a specific 6-status team-managed workflow (see README "Jira Integration").
+- **`TICKET_PROVIDER=dynamodb`** (code default when unset): DynamoDB Streams on the tickets table trigger the orchestrator Lambda.
+- **`TICKET_PROVIDER=jira`** (what `.env.example`/`Dockerfile` ship): real Jira Cloud; Jira webhooks hit `/api/jira/webhook`. Requires a specific 6-status team-managed workflow (see README "Jira Integration").
 
 Both ticket Lambdas expose the identical `Tickets___*` tool interface — agents don't know which backend is active. The fleet uses **Runtime** (not Harness) agents because runtimes emit OTEL spans during execution, which powers live UI streaming; the Builder is a Harness because single-turn chat needs no streaming.
 
 ### Coding CLIs on a dedicated runtime
 The coding CLIs (Claude Code, Codex) run on a separate, observable **coding-agent runtime** (`deploy/coding-agent-runtime/`) with a persistent `/mnt/workspace` and full OTel tracing, invoked by the fleet's `claude_code` / `codex` tools via the AgentCore commands API (`POST /runtimes/{arn}/commands`). Each CLI's internal tool calls become CloudWatch spans, and live `agent.streaming` events still flash in the UI. Set `CODING_AGENT_RUNTIME_ARN` on the fleet to enable it; when unset, `claude_code` falls back to an in-container subprocess (codex needs the runtime). Codex uses its built-in `amazon-bedrock` provider (the AWS blog pattern) — SigV4 from the IAM role, routing to Bedrock Mantle (`BEDROCK_MANTLE_REGION`, default us-east-2), default model `openai.gpt-5.5` (`CODEX_MODEL` to override). GPT-5.5 must be enabled on Mantle for the account. See `deploy/coding-agent-runtime/README.md`.
+
+### CI/CD pipeline module (optional)
+Agents own CD via the `Pipeline___*` tools (`get_state`/`start_deploy`/`get_build_status`/`get_build_log`) on a narrow Lambda (`lambda/agentcore-hub-pipeline-tools/`) — deliberately **no `PutApprovalResult`**: the in-pipeline ManualApproval deploy gate is human-only, bridged to Telegram. Merge does not auto-trigger the pipeline; the release manager calls `Pipeline___start_deploy`. The orchestrator's ship merge-verify gate blocks a ship-phase run from completing while its feature branch is provably unmerged (`SHIP_MERGE_VERIFY=off` to opt out). The CI agent auto-remediates whitelisted mechanical failures (prettier/eslint --fix/lockfile — `blueprints/ci-agent.md` P2a) and tickets logic failures to dev. See `docs/cicd-pipeline-module-design.md` + `docs/agents-own-cd.md`.
 
 ### Evaluations / self-improvement (optional)
 AgentCore online evaluations score invocations; low scores trigger `eval-packager` (via CloudWatch Logs subscription filters) → fleet improver agent writes a PRD → `prd-submitter` re-enters the same 14-agent pipeline. Toggle = set `eval-packager` Lambda concurrency to 0 (paused) vs unlimited.

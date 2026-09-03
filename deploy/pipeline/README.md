@@ -35,8 +35,11 @@ stack**:
 
 If a merge touches fleet/eval files (`deploy/runtime-agent/`, `blueprints/`,
 `deploy/evaluations/`, `lambda/eval-packager/`), the app pipeline's Deploy stage
-**BLOCKS in pre_build before any prod mutation** — a human runs DEPLOY.md steps
-4-9 (the documented handoff), never a silent skip.
+**deploys the app targets, advances the baseline SHA, then fails the action as a
+terminal non-rollback handoff** — a human runs DEPLOY.md steps 4-9 (the
+documented handoff), never a silent skip. (Blocking before the deploy would
+wedge the pipeline: the baseline only advances on a successful app deploy, so
+the same commit range would re-block forever.)
 
 ## Files
 

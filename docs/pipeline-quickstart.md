@@ -11,7 +11,11 @@ protection on `main` blocks the merge if any of these three checks comes
 back red, so a broken build or a failing test suite never lands on `main`.
 
 2. Once the pull request merges to `main`, the CodePipeline named
-`agentcore-hub-deploy` starts automatically and runs four stages in order:
+`agentcore-hub-deploy` is started by the release manager calling
+`Pipeline___start_deploy` — the merge does **not** auto-trigger it (the CDK
+stack sets `triggerOnPush: true`, but the CodeConnections GitHub App webhook
+permission is not installed, so the push trigger never fires until it is).
+The pipeline then runs four stages in order:
 Source, Build, ManualApproval, and Deploy. The Build stage re-runs the same
 gates as the PR check and produces the artifacts the later stages consume.
 See the design doc's [pipeline topology](cicd-pipeline-module-design.md#5-pipeline-topology-pilot--hub-repo)

@@ -210,6 +210,35 @@
 
 ---
 
+## Recovery & resilience events
+
+Beyond the happy-path events (agent.started / agent.streaming / tool_use /
+agent.completed), the orchestrator writes these to `agentcore-hub-events` when
+it detects or recovers from a failure. Grep for them when a run looks stuck:
+
+| Event | Emitter | Meaning |
+|-------|---------|---------|
+| `agent.error` | orchestrator / agent-invoker | An agent invocation failed, or (enforce mode only) the dead-session sweep declared a session dead |
+| `dead_session.shadow` | dead-session-detector | Shadow mode's "would fire" record — its own type, deliberately NOT `agent.error` (zero writes in shadow) |
+| `agent.escalated` | dead-session-detector | Enforce-mode retry exhausted — the dead session was retried once and escalated |
+| `orchestrator.unblocked` | cascade | Journal record: a ticket's last blocker resolved and it transitioned to Ready (one per Ready transition) |
+| `review.reawakened` | cascade | A parked review gate was re-run after a blocker change (CAS-guarded — at most once per gate wake) |
+| `review.cap_reached` | review-cap | A review/fix loop hit its round cap and stopped re-dispatching (`review.cap_authorized` marks an authorized extra round) |
+| `workflow.cd_unmerged` | orchestrator completion gate | Ship merge-verify refused to finalize the run — the feature branch is provably unmerged (`SHIP_MERGE_VERIFY=off` opts out) |
+
+The dead-session sweep runs on a `rate(5 minutes)` EventBridge schedule
+(`DEAD_SESSION_DETECTOR_MODE`: `off` | `shadow` (default, observe-only) |
+`enforce`). A second scheduled backstop, the missed-unblock **reconciliation
+sweep** (`reconcile-sweep.mjs`, `RECONCILE_SWEEP_MODE`: `off` (default, dark) |
+`shadow` | `enforce`), re-drives dependents whose blockers all resolved but who
+never re-Readied; it logs `reconcile.recover` / `reconcile.would_recover` lines
+rather than events, and its recoveries surface as the cascade events above. The
+detector, cascade, and review-cap all emit EMF metrics into the
+`AgentCoreHub/Orchestrator` CloudWatch namespace — chart those alongside the
+events when auditing sweep behavior.
+
+---
+
 ## Eval judge throttling (quota)
 
 > **OPERATOR ACTION (TEAM-3366 §2.5)** — this is a one-time, account-level AWS

@@ -10,8 +10,12 @@
  * - Calls report_completion tool when done → workflow-output Lambda → marks ticket "done"
  * - DynamoDB Stream on ticket status change → Orchestrator cascade
  *
- * If the agent crashes without calling report_completion, the existing nudge system
- * detects 90s idle and triggers recovery.
+ * If the agent crashes without calling report_completion, recovery is the
+ * dead-session detector sweep (dead-session-detector.mjs): an EventBridge
+ * schedule (rate(5 minutes)) invokes the orchestrator, which lease-guards the
+ * stale claim, steals it, and re-dispatches once or escalates. Rollout mode is
+ * DEAD_SESSION_DETECTOR_MODE (off | shadow | enforce). The manual nudge button
+ * remains for human-initiated recovery.
  *
  * Input: { harnessArn, sessionId, prompt, workflowId, agentId, ticketId, modelOverride }
  * Output: none (fire-and-forget)
@@ -98,7 +102,7 @@ export const handler = async (event) => {
     console.error(`[agent-invoker] ${agentId} invocation failed:`, error);
 
     // Only mark blocked if the Runtime REJECTED the request (connection refused, 4xx, etc.)
-    // If the agent was accepted but crashes later, nudge handles it.
+    // If the agent was accepted but crashes later, the dead-session detector sweep handles it.
     const failedTicketId = ticketId || await findTicketForAgent(workflowId, agentId);
     if (failedTicketId) {
       await ddb.send(new UpdateCommand({

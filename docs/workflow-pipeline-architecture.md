@@ -1147,7 +1147,7 @@ Any workflow created without the start route will be missing `startedAt`, `epicI
 
 **Context**: The `agentcore-hub-workflows` table stores:
 - `workflowId`, `epicId`, `repoConfig`, `startedAt`, `status`, `phase`
-- `agentTasks` map (output, branch, status per agent — powers UI output panel)
+- `agentTasks` map (output, branch, status per agent). Since PR #260/#262 the UI output panel is powered by per-run events (`/api/workflow/[id]/agent-output` returns `runs[]` bucketed by ticketId) plus per-run `completions/{ticketId}.json` S3 summaries; `agentTasks.output` is only a fallback, and its content is harvested from those S3 completions on the done cascade (`mergeTaskMetadata`), not solely webhook-written.
 
 All of this data either already exists on the epic ticket + children, or can trivially be added as fields on the epic.
 
@@ -1418,17 +1418,21 @@ If the condition fails (`ConditionalCheckFailedException`), the invocation retur
 
 A simple `if (ticket.status === "in_progress") return` has a TOCTOU race: two Lambda invocations read `todo` simultaneously, both pass the check, both invoke. The conditional write is atomic at the DynamoDB level — exactly one succeeds.
 
-**Crash recovery without Case 3**:
+**Crash recovery without Case 3** (table refreshed 2026-09 to reflect the resilience work — TEAM-3618/3619/3686/3721):
 
 | Scenario | Recovery |
 |----------|----------|
 | Agent finishes normally | Calls `report_completion` → ticket → done → cascade |
-| Agent crashes mid-work | Runtime session timeout (540s) → session ends → ticket stays `in_progress` |
-| Ticket stuck `in_progress` forever | Manual nudge button (user action) + future: alert on tickets `in_progress` > 15min |
+| Agent crashes mid-work | Runtime session ends → ticket stays `in_progress` → picked up by the dead-session detector sweep (next row) |
+| Ticket stuck `in_progress` forever | **Dead-session detector sweep** (`lambda/orchestrator/dead-session-detector.mjs`): an EventBridge schedule (rate(5 minutes)) invokes the orchestrator, which finds claims whose lease is dead and whose silence exceeds a per-agent threshold, lease-guards + steals the stale claim, then re-dispatches once or escalates. Rollout via `DEAD_SESSION_DETECTOR_MODE` (`off` \| `shadow` = observe-only, default \| `enforce` = writes). The manual nudge button remains for human-initiated recovery |
+| Review gate rework loops forever (human keeps requesting changes) | **Review round cap** (`lambda/orchestrator/review-cap.mjs`, TEAM-3619 D2c): diff-scoped round counting per gate (default `maxRounds: 3`, regressions count double); at the cap the automatic re-open is suppressed and the gate escalates to a human. `DECISION: continue` resets the count; ledger failures fail open (bounded, metered) then fail closed |
+| CD ticket marked done but the PR was never merged | **Ship merge-verify completion gate** (`lambda/orchestrator/index.mjs`, TEAM-3721): before finalizing a run whose def has a ship phase, the orchestrator verifies against GitHub that the feature branch is actually merged; a provably-unmerged branch aborts completion and emits `workflow.cd_unmerged` (fail-open on API errors; opt-out `SHIP_MERGE_VERIFY=off`) |
+| "Done" ticket with no actual deliverable (phantom completion) | **Completion-evidence gate** (`lambda/orchestrator/completion.mjs` `missingEvidenceTickets`, TEAM-3686/3690): every done ticket in a def-required phase must carry proof of work (non-empty `output` or an `artifactKey`) in `agentTasks`; missing evidence aborts completion. Enforced by default; emergency opt-out `COMPLETION_EVIDENCE_REQUIRED=off` |
+| Unblock event lost (blocker went done but the dependent never re-Readied) | **Reconciliation sweep** (`lambda/orchestrator/reconcile-sweep.mjs`, TEAM-3747 D1): the same 5-minute EventBridge schedule re-drives dependents whose blockers are all resolved but who never left `blocked`. Ships dark — `RECONCILE_SWEEP_MODE` defaults `off` (zero extra DDB reads); `shadow` = observe-only, `enforce` = re-drive. Rotating scan window prevents starvation at >50 open workflows |
 
-The manual nudge button still exists for human-initiated recovery. The key difference: humans can judge "this has been stuck for 20 minutes" — the auto-nudge (15s interval) cannot.
+The manual nudge button still exists for human-initiated recovery, but it is no longer the only automatic path: the dead-session detector sweep is the timed auto-recovery for truly crashed agents.
 
-**Future enhancement (not implemented)**: Add a timestamp-guarded auto-recovery for truly crashed agents (e.g., `in_progress` for > 10 minutes with no events in agentcore-hub-events table for that ticket). This is a better signal than "15 seconds with no UI activity."
+**Future enhancement — now implemented**: the timestamp-guarded auto-recovery proposed here shipped as the dead-session detector sweep above (TEAM-3618 D1.2), using lease liveness (`lease.mjs`) plus per-agent silence thresholds rather than "15 seconds with no UI activity."
 
 **Relationship to other DLs**:
 - DL-014 added Case 3 — **superseded by this DL**

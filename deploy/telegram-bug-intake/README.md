@@ -28,15 +28,28 @@ after that is a reviewable diff against the running function; keep it that way.
 Changes on top of the imported baseline:
 
 - **TEAM-3464** — `transcribeVoice` now paces audio into Transcribe streaming in
-  ~200 ms chunks and terminates the stream with an empty `AudioEvent`. The
-  deployed function still has the old full-file blast until this ships, so
-  **the running Lambda is behind this file by that fix.**
+  ~200 ms chunks and terminates the stream with an empty `AudioEvent` (PR #221).
+  This fix has since been deployed; if you need to know exactly what the running
+  Lambda contains, re-verify against the live function
+  (`lambda:GetFunction` → `Code.Location`, compare `sha256(index.mjs)`) rather
+  than trusting this note.
 - **TEAM-3493** — ship-review P1 fixes: voice transcription is budgeted against
   the remaining Lambda clock (deferred to the next invocation, or rejected if it
   could never fit, instead of dying mid-transcription and replaying forever);
   `ALLOWED_CHAT_IDS` fails closed when empty; review-gate callbacks require an
   allowlisted chat; a gate's 30-day notification claim is released when zero
   pings were delivered.
+- **PR #265** — review-gate pings carry an "Open approval in hub" deep link
+  straight to the gate ticket's review view
+  (`/workflow?id=<workflowId>&ticket=<ticketId>`), the one screen with the full
+  formatted breakout and approve controls.
+- **PR #293 (TEAM-3740-era deploy gate)** — `scanDeployApprovals` enrichment:
+  the commit SHA being deployed is extracted from the Source stage's
+  `currentRevision`, and `buildDeployBrief` turns it into a "what's shipping"
+  brief (commit subject, associated PR title/body, workflow/epic key, one-line
+  summary, file scope) via the GitHub API; the approval ping gains "View PR" /
+  "View commit" link buttons. All best-effort — failures fall back to the terse
+  message.
 
 ## Architecture
 

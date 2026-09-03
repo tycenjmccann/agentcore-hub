@@ -10,6 +10,12 @@ This is what makes CD safe across very different stacks (Next.js on ECS,
 Lambda fleets, iOS apps, static sites): the nuance lives in the repo that owns
 it, versioned and reviewed like code, instead of in an agent's judgment.
 
+When the repo has a deployed CI/CD pipeline (see
+[`cicd-pipeline-module-design.md`](cicd-pipeline-module-design.md)), the
+pipeline executes the buildspec form of the contract and the release manager
+only triggers/watches it — `DEPLOY.md` remains the contract source the
+buildspecs are ported from.
+
 ## Why a file, not config
 
 - **Reviewed with the code.** A change to how a repo deploys is a diff in the

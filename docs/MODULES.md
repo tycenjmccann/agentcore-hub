@@ -22,12 +22,18 @@ with the Evaluations surface removed), the remaining app still passes
 | **Evaluations** | Optional | Self-improvement loop: ingests AgentCore evaluation results from CloudWatch Logs, buffers them, and feeds an improver agent. |
 | **Registry** | Optional | Browse/manage the Amazon Bedrock AgentCore Registry — catalogs of registries and their records (MCP servers, A2A agents, custom resources, agent skills) with an approval lifecycle. |
 | **Cloud Code** | Optional | "Safe to close your laptop" coding agent — Claude Code / Codex run server-side on a dedicated AgentCore Runtime with an EFS workspace; chat (streaming) + a live terminal, resumable from any device. |
+| **Routines** | Optional | The `/routines` page — scheduled/recurring workflow runs built from a chat-based routine builder (`lambda/routines-runner`, `deploy/routine-builder/`). |
+| **Connectors** | Optional | The `/connectors` page — reusable connector primitive for external services (secrets in Secrets Manager, LLM-blind; `deploy/connectors/`). |
+| **Pipeline** | Optional | AWS-native CI/CD (CodeBuild + CodePipeline) for a repo the hub builds into, with agent-driven CD via `Pipeline___*` tools and a human deploy gate. See [Module: Pipeline](#module-pipeline-optional). |
 
 The core never imports from an optional module. Optional modules may share core
 libraries (`src/lib/agentcore-sdk.ts`, `src/lib/client-cache.ts`, etc.) and the
 shared `src/config/agents.json` roster, but not each other. Nav entries are
 declared in a single registry (`src/config/modules.ts`) so removing a module is
-a one-place edit.
+a one-place edit. One tolerated soft seam exists between two optional modules:
+Workflow's `WorkflowBoard.tsx` polls the Pipeline module's `/api/pipeline/status`
+for the deploy-gate banner, with a silent catch so the board works unchanged when
+the Pipeline module is absent.
 
 ---
 
@@ -40,13 +46,13 @@ The orchestration pipeline. Self-contained surface.
 - `src/app/tickets/` — ticket history
 
 **API routes**
-- `src/app/api/workflow/` — start/state/list/events/stream/cancel/retry/artifacts/webhook
+- `src/app/api/workflow/` — start/state/list/events/stream/cancel/retry/artifacts/webhook/agent-output/complete/nudge (plus definitions, tickets, watch, escalations, analysis under `[id]/`)
 - `src/app/api/jira/` — Jira webhook + metrics
 - `src/app/api/models/` — model picker (used only by the workflow intake form)
 
 **Frontend code**
 - `src/components/workflow/`
-- `src/lib/workflow/` (types, jira-client, model-config)
+- `src/lib/workflow/` (~30 modules: types, ticket providers (`ticket-provider*.ts`), board state, leases, ship-review, event transforms, jira-client, model-config, watchdog, …)
 - `src/lib/pipeline-config.ts`
 
 **Lambdas** (`lambda/`)
@@ -250,6 +256,7 @@ AWS-native CI/CD for a repo the hub builds into (pilot: the hub's own repo). A
 bolt-on that moves the deterministic build/test/deploy work OUT of the SDLC
 agents and INTO CodeBuild + CodePipeline, so the agents only author/judge/react.
 Full design + rationale: [`cicd-pipeline-module-design.md`](./cicd-pipeline-module-design.md).
+Operator-facing operating model (agents own CD): [`agents-own-cd.md`](./agents-own-cd.md).
 
 **Gated + inert by default.** Nothing runs unless you both deploy the CDK stack
 AND set the enable flags. With them unset the `/pipeline` nav entry is hidden and
@@ -263,6 +270,16 @@ the CI/QA/release-manager blueprints run their legacy self-build path unchanged.
 
 **Lib**
 - `src/lib/pipeline/status.ts` — CodeBuild + CodePipeline SDK reads (server-side).
+
+**Lambdas** (`lambda/`)
+- `agentcore-hub-pipeline-tools` (`lambda/agentcore-hub-pipeline-tools/index.mjs`)
+  — exposes `Pipeline___get_state` / `Pipeline___start_deploy` /
+  `Pipeline___get_build_status` / `Pipeline___get_build_log` to the fleet
+  (read + trigger only; **deliberately NO `codepipeline:PutApprovalResult`** —
+  the deploy gate is human-only). Deployed via
+  `deploy/setup-pipeline-tools-lambda.mjs`; reached from
+  `deploy/runtime-agent/main.py` via the `PIPELINE_TOOLS_LAMBDA` env var
+  (default `agentcore-hub-pipeline-tools`).
 
 **Infra (CDK, self-contained)** — `deploy/pipeline/`:
 - `bin/pipeline.ts` + `lib/pipeline-stack.ts` — CodeConnections link, CI CodeBuild
@@ -283,15 +300,32 @@ CloudWatch Logs. Deploy role is deliberately narrow (Lambda code-only, no
 - `NEXT_PUBLIC_PIPELINE_ENABLED=1` — shows the `/pipeline` nav entry + tab (app).
 - `PIPELINE_ENABLED=1` — on the fleet/orchestrator context: CI/QA/release-manager
   blueprints read pipeline results instead of shelling builds.
+- `PIPELINE_TOOLS_LAMBDA` — fleet runtime: name of the tools Lambda (default
+  `agentcore-hub-pipeline-tools`).
+- `PIPELINE_NAME` / `BUILD_PROJECT` / `CI_PROJECT` — on the tools Lambda
+  (defaults `agentcore-hub-deploy` / `agentcore-hub-build` / `agentcore-hub-ci`).
+- `PIPELINE_CI_WEBHOOK` — CDK-time flag turning on the CodeBuild PR-check
+  webhook (default OFF; required PR checks today come from GitHub Actions).
+- `DEPLOY_PIPELINE_NAME` — on the **telegram-bug-intake** Lambda: enables the
+  deploy-gate Telegram approval bridge (unset = the whole path is a no-op).
 
 **Removing the module**
 - Delete the `/pipeline` nav entry tagged `module: "pipeline"` (and the
   `enabledBy`/`moduleEnabled` gating) in `src/config/modules.ts`
 - `rm -rf src/app/pipeline src/app/api/pipeline src/lib/pipeline deploy/pipeline`
+- `rm -rf lambda/agentcore-hub-pipeline-tools deploy/setup-pipeline-tools-lambda.mjs`
+  (if deployed, also delete the AWS function)
+- Remove the `Pipeline___*` tool grants from `src/config/agents.json`
+  (`ci_agent` + `release_manager`) and the `Pipeline___*` `@tool` wrappers in
+  `deploy/runtime-agent/main.py`
+- Unset `DEPLOY_PIPELINE_NAME` on the telegram-bug-intake Lambda (the approval
+  bridge is a no-op without it)
 - Drop `@aws-sdk/client-codebuild` + `@aws-sdk/client-codepipeline` from
   `package.json` if nothing else uses them
 - Revert the `PIPELINE_ENABLED` blocks in `blueprints/{ci-agent,qa-verifier,release-manager}.md`
 - If deployed: `cdk destroy` the `AgentcoreHubPipeline` stack
+- The Workflow board's deploy-gate banner fails silent when `/api/pipeline/status`
+  is absent — no Workflow-side change needed
 - `npx tsc --noEmit && npm run build`
 
 ---
@@ -305,8 +339,12 @@ the optional modules expect certain shape.
 1. **`src/config/agents.json`** is the one roster shared by core + all modules.
    Core fields: `id`, `name`, `role`, `phase`, `type`, `model`, `tools`,
    `keywords`, `canQueryAgents`. Workflow adds `harnessName` + `runtimeArn`;
-   Evaluations adds `evaluationsEnabled` + `evalConfigName`. Extra fields are
-   ignored by modules that don't use them, so leaving them in is harmless.
+   Evaluations adds `evaluationsEnabled` + `evalConfigName`. There is also a
+   `watchdog` config block (per-agent, with a fleet-wide fallback under
+   `defaults.watchdog`: `enabled`, `heartbeatIntervalMs`, `toolDeadlineSecs`,
+   `turnTimeoutSecs`) read by the orchestrator's watchdog/dead-session sweep and
+   the runtime agents. Extra fields are ignored by modules that don't use them,
+   so leaving them in is harmless.
 
 2. **Runtime naming convention.** The orchestrator derives a runtime env key per
    agent as `RUNTIME_ARN_<HARNESS_NAME_UPPER>` and the eval-packager matches log

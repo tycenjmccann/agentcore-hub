@@ -149,6 +149,20 @@ This closes the last dual-actor hole (WM retry vs. live agent → duplicate PRs)
 three inconsistent staleness heuristics (60-min escape hatch, 10-min WM stale, 15-min cooldown)
 with one explicit contract.
 
+### R4–R7 — added by the resilience epic (TEAM-3742, merged 2026-09-03)
+The epic's code cites four further invariants by number:
+- **R4 — fail-open diff-scope**: the diff-scoped ship-review gate must degrade to legacy
+  behavior (byte-identical, gate inert) on any missing/unparseable PR context or GitHub error —
+  review scoping may never block a run on plumbing failure (`index.mjs` `computeReviewChangeSet`).
+- **R5 — cap reset**: an authorized `DECISION: continue` resets the review round count; the cap
+  can never permanently wedge a gate a human explicitly re-opened (`review-cap.mjs`).
+- **R6 — detection CAS**: the dead-session detector may only steal a claim via the same
+  lease-guarded conditional write R3 defines — detection and steal are one atomic CAS, never a
+  read-then-write (`dead-session-detector.mjs`).
+- **R7 — no duplicate session**: the invoke-retry path never retries after a possibly-successful
+  write with unknowable liveness — an ambiguous failure re-throws rather than risking two live
+  sessions for one ticket (`agent-invoker.mjs`).
+
 ### Simplifications that fall out
 - **Delete DynamoDB ticket-provider mode** (prod is Jira-only). Removes ~40% of the orchestrator's
   branchy surface, the entire legacy stream path, and the P1 webhook-route clobber with it.
@@ -185,3 +199,19 @@ Sequencing note: Phase 1 first is deliberate — once writes are serialized per 
 **Success metrics** (all already observable): duplicate-invocation skips in orchestrator logs
 (should → 0 legitimate hits), WM interventions per run (should collapse), duplicate PR/ticket
 incidents (0), and — the real one — coding-loop churn on race tickets.
+
+## Addendum (2026-09-01/02): intake dedup fence
+
+The start path itself grew the same treatment (TEAM-3699/3703/3705/3708, all in
+`src/app/api/workflow/start/route.ts`). A redelivered start for the same (sourceTicket,
+workflowDefId) is deduped by a `wfdedup_<sha256(sourceTicket:defId)>` marker row in the
+workflows table, claimed with `attribute_not_exists` before any epic/workflow is created, with
+a terminal-run re-point CAS guarded on the exact canonical id just read. Because the marker is
+claimed before the row exists, a marker-without-row is disambiguated by age: within a 120s
+in-flight grace window the loser coalesces onto the presumed-live winner instead of forking a
+second run. Correctness no longer rests on that heuristic — `putWorkflowRowFenced` writes the
+canonical row inside a `TransactWriteCommand` whose ConditionCheck proves the marker STILL
+points at this workflowId, so a slow owner re-pointed away mid-flight loses the fence and
+coalesces rather than double-creating. Fence losers run compensating cleanup on the orphan epic
+they already created (Jira: delete; DynamoDB: cancel via terminal transition with an audit
+comment).

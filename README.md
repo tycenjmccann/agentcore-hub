@@ -11,11 +11,13 @@ A platform for getting the most out of Amazon Bedrock AgentCore — run all your
 - **Builder** — Chat-based agent creation (harness with code_interpreter + MCP)
 - **Workflow** — Config-driven multi-agent pipelines: submit a request and a roster of agents produce the deliverable. Ships four workflows (Software Delivery → a PR; Marketing; Sales; Legal), each defined in `src/config/workflows.json`. Real-time pipeline visualization with animated phases, timeline replay/scrubber, S3 artifact browsing, optional **human review gates**, and dynamic header titles
 - **Cloud Code** — A coding agent that lives in the cloud ("safe to close your laptop"): Claude Code / Codex run server-side on a dedicated AgentCore Runtime with an EFS workspace. Streaming chat + a live terminal, per-session isolated checkouts, resumable from any device, MCP-gateway tools, and per-user CLI config bundles. **Port a live local session to the cloud and pull it back** — a [local MCP](mcp/hub/README.md) ships your raw transcript so `claude --resume` continues losslessly, laptop↔cloud. Opens PRs from a clone — Git-native, separate from the workflow fleet
+- **Pipeline** — AWS-native CI/CD (CodeBuild + CodePipeline) with a read-only `/pipeline` status board. Agents own CD through narrow `Pipeline___*` tools (trigger + watch + read build logs — never approve); the deploy gate is a human decision delivered to Telegram. See [`docs/cicd-pipeline-module-design.md`](docs/cicd-pipeline-module-design.md), [`docs/pipeline-quickstart.md`](docs/pipeline-quickstart.md), and [`docs/agents-own-cd.md`](docs/agents-own-cd.md)
 
 ### Modular by design
 
 The console is a small always-on **core** (Dashboard, Agents, Invoke) plus
-optional **bolt-on modules** (Workflow, Registry, Evaluations, Builder, Cloud Code). Each
+optional **bolt-on modules** (Workflow, Registry, Evaluations, Builder, Cloud Code,
+Routines, Connectors, Pipeline). Each
 module's UI, API routes, Lambdas, and DynamoDB tables are namespaced, so you can
 deploy only what you need and cherry-pick the rest out. See
 [`docs/MODULES.md`](docs/MODULES.md) for the core-vs-optional breakdown, per-module
@@ -174,6 +176,8 @@ After all stages are complete, run the full verification suite:
 | `AWS_REGION` | Defaults to `us-east-1` |
 | `HARNESS_EXECUTION_ROLE_ARN` | IAM role for creating new harness agents (enables Deploy button on Build page) |
 | `MCP_SERVERS` | JSON array of MCP server configs for custom tooling beyond GitHub |
+| `PIPELINE_ENABLED` | Fleet/orchestrator context — CI/QA/release-manager blueprints read pipeline results instead of shelling builds |
+| `NEXT_PUBLIC_PIPELINE_ENABLED` | Build-time — shows the `/pipeline` tab (Pipeline module) |
 
 ## How It Works
 
@@ -357,12 +361,14 @@ Without `BUILDER_AGENT_ID`, the Build page falls back to a direct Converse API c
 The Workflow tab runs config-driven multi-agent pipelines. A pipeline's **shape**
 (ordered phases, intake agent, completion criteria, review gates) is defined in
 `src/config/workflows.json`; the **agent roster** is derived from
-`src/config/agents.json` (each agent tagged with `workflowDefId` + `phase`). Four
+`src/config/agents.json` (each agent tagged with `workflowDefId` + `phase`). Six
 workflows ship by default:
 
 | Workflow | Intake → phases | Output |
 |----------|-----------------|--------|
 | **Software Delivery** | requirements → design → development → QA | a pull request |
+| **Bug Fix** | intake → triage → fix → QA | a fix PR |
+| **Dead Code Sweep** | intake → sweep → QA | a cleanup PR |
 | **Marketing Campaign** | strategy → creative (social/blog/ads) → assets → brand QA → scheduling | a launched campaign |
 | **Sales Proposal** | qualification → drafting → deal review → approval | a routed proposal |
 | **Legal Contract Review** | triage → review → redline → sign-off | redlined contract |
@@ -376,7 +382,7 @@ its `## Available Agents` roster at runtime and fans out the ticket graph.
 - **Agents:** Strands agents on AgentCore Runtime (configurable 600s timeout); the software-delivery fleet is 14 agents
 - **Orchestration:** ticket-status cascade — DynamoDB Streams (dynamodb mode) or Jira webhooks (jira mode) trigger the next phase
 - **Tools:** Agents connect to external tools via MCP (GitHub, GitLab, Jira, etc.) — configurable per deployment
-- **Model:** Claude Opus 4.6 (default, configurable via `MODEL_ID` env var)
+- **Model:** per-agent in `src/config/agents.json` (default Claude Fable 5; fleet-wide fallback via `MODEL_ID` env var)
 
 ### Human Review Gates (optional)
 
@@ -409,8 +415,8 @@ The platform supports two ticket backends, switchable via a single env var:
 
 | Mode | `TICKET_PROVIDER` | Backend | Trigger |
 |------|-------------------|---------|---------|
-| Mock | `dynamodb` (default) | DynamoDB tables | DynamoDB Streams → orchestrator Lambda |
-| Real | `jira` | Jira Cloud REST API | Jira webhook → `/api/jira/webhook` |
+| Mock | `dynamodb` (code default when unset) | DynamoDB tables | DynamoDB Streams → orchestrator Lambda |
+| Real | `jira` (what `.env.example`/`Dockerfile` ship) | Jira Cloud REST API | Jira webhook → `/api/jira/webhook` |
 
 **To switch to real Jira:**
 

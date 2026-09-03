@@ -37,6 +37,19 @@ The **Bug issue itself is the workflow root** — there is no separate Epic wrap
 `bootstrapBugWorkflow` is idempotent (keyed on the Bug's issue key via
 `epicId-index`), so redelivered webhooks won't double-provision.
 
+### Intake dedup fencing
+
+Intake paths that go through `POST /api/workflow/start`
+(`src/app/api/workflow/start/route.ts`) carry their own idempotency layer on
+(sourceTicket, workflowDefId): a marker row
+`wfdedup_<sha256(sourceTicket:defId)>` is claimed in the workflows table
+*before* any epic/workflow is created, so a redelivered start coalesces onto
+the canonical run instead of forking a second one. Correctness comes from an
+ownership **fence** — the workflow row is written inside a
+`TransactWriteCommand` whose ConditionCheck proves the marker still points at
+this workflowId — and a `DEDUP_INFLIGHT_GRACE_MS` (120s) window coalesces a
+racer onto a marker whose canonical row hasn't been written yet.
+
 ### Trigger conditions (all must hold)
 
 | Condition | Why |

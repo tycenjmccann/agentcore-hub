@@ -10,6 +10,12 @@ and a one-time scorecard reset. Some files referenced by the evaluation steps
 `lambda/eval-packager/lib/`, …) land with the evaluation-infrastructure PR's
 merge commit — the contract runs from a fresh clone of that merge commit.
 
+> **Pipeline mode.** When the CI/CD pipeline module is deployed
+> (`deploy/pipeline/`), steps 0-3 below are executed by the
+> `agentcore-hub-deploy` CodePipeline (see `docs/pipeline-quickstart.md`) —
+> the commands here are the legacy/manual path and remain the contract source
+> the pipeline's buildspecs are ported from.
+
 ## Environment prerequisites
 
 - AWS CLI v2 (>= 2.34, ships the `*-express-gateway-service` commands)
@@ -53,7 +59,18 @@ targets and verifying before the app rollout completes traffic shift.
 ./scripts/create-command-queue.sh
 
 # 1. Orchestrator Lambda — CODE ONLY (never its deploy.sh; see Required secrets)
-cd lambda/orchestrator && npm ci --omit=dev && zip -qr /tmp/orchestrator.zip . && cd ../..
+#    NEVER `zip -qr .` here: it omits src/config/lease-constants.json (which
+#    lease.mjs requires), so the deployed function INIT-crashes on every invoke
+#    (Runtime.Unknown) and ALL workflow dispatch stops. Copy the JSON in beside
+#    the code and reuse deploy.sh's OWN explicit `zip -rq function.zip ...` file
+#    list (same pattern as deploy/pipeline/buildspec-ci.yml — one list, no drift),
+#    then validate the built archive with the manifest guard.
+cp src/config/lease-constants.json lambda/orchestrator/lease-constants.json
+( cd lambda/orchestrator && npm ci --omit=dev )
+ZIP_ARGS="$(grep -oE 'zip -rq function\.zip .*' lambda/orchestrator/deploy.sh | sed 's/^zip -rq function\.zip //')"
+( cd lambda/orchestrator && zip -rq /tmp/orchestrator.zip $ZIP_ARGS )
+rm -f lambda/orchestrator/lease-constants.json
+bash scripts/check-lambda-zip-manifest.sh --zip /tmp/orchestrator.zip
 aws lambda update-function-code --function-name agentcore-hub-orchestrator \
   --zip-file fileb:///tmp/orchestrator.zip --region "$AWS_REGION"
 
@@ -192,6 +209,12 @@ curl -sf "$DEPLOYMENT_URL/api/agentcore/traces/health"        # expect HTTP 200
 aws lambda get-function --function-name agentcore-hub-orchestrator \
   --query 'Configuration.[State,LastUpdateStatus]' --output text  # expect: Active Successful
 
+# Orchestrator actually RUNS on the new code (get-function State reads Active
+# even when the function INIT-crashes — a test invoke is the only real check)
+aws lambda invoke --function-name agentcore-hub-orchestrator \
+  --payload "$(echo '{}' | base64)" /tmp/orchestrator-smoke.json \
+  --query 'FunctionError' --output text                            # expect: None (any FunctionError = INIT-crash class)
+
 # Command queue wired (R1): mapping enabled, DLQ empty
 aws lambda list-event-source-mappings --function-name agentcore-hub-orchestrator \
   --query 'EventSourceMappings[?contains(EventSourceArn, `workflow-commands`)].State' \
@@ -231,9 +254,14 @@ aws dynamodb get-item --table-name agentcore-hub-eval-config \
 
 ## Rollback
 
-Not yet automated as a single command — an agent hitting a failed deploy must
-report BLOCKED (with the failing output) rather than improvise. Manual
-rollback: re-point the Lambda at the prior zip via `update-function-code`,
+In pipeline mode, `deploy/pipeline/rollback.sh` now exists and runs
+automatically on a Deploy-stage failure (pre_build snapshots the current
+orchestrator zip + ECS image; the failure path restores both). The manual path
+below remains for legacy mode.
+
+Legacy mode is not yet automated as a single command — an agent hitting a failed
+deploy must report BLOCKED (with the failing output) rather than improvise.
+Manual rollback: re-point the Lambda at the prior zip via `update-function-code`,
 redeploy the previous image tag via `deploy/ecs-express/deploy.sh`, restore
 `config/*.json` from S3 object versions (bucket is versioned). For the
 evaluation targets: re-point the eval-packager at the prior zip via
@@ -245,11 +273,16 @@ indefinitely, so rubric rollback needs no packager rollback; alarms:
 `aws cloudwatch delete-alarms --alarm-names ...` (safe, unconditional); the
 scorecard REMOVE is not reversible and doesn't need to be — the packager
 re-creates the key at `{sum:0,count:0}` on the next delivery; runtime agents:
-redeploy the previous commit via `deploy-fleet.sh`. Wrapping this
-into `deploy/local/rollback.sh` is the outstanding contract gap.
+redeploy the previous commit via `deploy-fleet.sh`. The app-target rollback gap
+is closed by `deploy/pipeline/rollback.sh` in pipeline mode; a single-command
+legacy-mode wrapper (`deploy/local/rollback.sh`) is the remaining contract gap.
 
 ## Production deploy
 
 The staging section above IS the production deploy (single-account hub).
-No separate section; no `auto_promote` — a human approves the merge gate and
-the deploy above is the one act it authorizes.
+No separate section; no `auto_promote`. Production is a **two-gate** model:
+the human merge gate authorizes the *merge*; the in-pipeline ManualApproval
+deploy gate (bridged to Telegram Approve/Reject buttons) authorizes the
+*deploy* of the artifacts the Build stage already produced. In legacy mode
+(no pipeline) the merge gate remains the single act that authorizes the
+deploy above.

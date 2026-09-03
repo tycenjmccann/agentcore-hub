@@ -57,7 +57,8 @@ definition of CI, and exactly what an agent is worst at.
 Net effect on the fleet:
 
 - **CI agent** stops being a runner → becomes a thin **CI-fixer** (reads red
-  CodeBuild logs, files grouped fix tickets). The CI phase stays in
+  CodeBuild logs; auto-remediates whitelisted mechanical failures itself — see
+  §11 — and files grouped fix tickets for logic failures). The CI phase stays in
   `workflows.json`. *(Decision: keep as thin CI-fixer.)*
 - **QA verifier + code-reviewer** stay — they are the judgment layer.
 - **Release manager** stops shelling `DEPLOY.md`; the CD ticket **triggers and
@@ -78,7 +79,7 @@ account's own observability. AWS-native primitives:
 | SCM link (GitHub → AWS, no PAT) | **CodeConnections** (formerly CodeStar Connections), one org-level GitHub App link |
 | Deterministic build/test/scan | **CodeBuild** (Linux standard image for TS/Lambda; the existing macOS fleet for iOS) |
 | Orchestrated deploy w/ approval | **CodePipeline** — Source → Build → ManualApproval → Deploy |
-| Approval notification | **SNS → existing Telegram bot** (reuse the merge-gate ping path) |
+| Approval notification | **Telegram bridge** (poll-based, in `telegram-bug-intake` — see §5; SNS kept as email fallback) |
 | Provenance / integrity | build-once, promote-by-digest (ECR image digest + Lambda zip S3 version) |
 
 Cost: CodeBuild ~$0.005/min (general1.small Linux), CodePipeline $1/active
@@ -122,9 +123,10 @@ review. So they get **separate pipelines from the same parameterized CDK stack**
   Narrow role: `lambda:UpdateFunctionCode` (+ waiter read), S3 on the artifact
   bucket, `ecs:UpdateExpressGatewayService`. Triggered by `src/`,
   `lambda/orchestrator/`, `deploy/ecs-express/`, `src/config/*.json`. A changeset
-  that also touches fleet/eval files **BLOCKS in pre_build before any prod
-  mutation** — a human runs DEPLOY.md steps 4-9 (the documented deploy-contract
-  handoff), never a silent skip.
+  that also touches fleet/eval files **deploys the app targets, advances the
+  baseline SHA, then fails the action as a terminal non-rollback handoff** — a
+  human runs DEPLOY.md steps 4-9 (the documented deploy-contract handoff), never
+  a silent skip. (See §6 for why the deploy-then-signal ordering is deliberate.)
 - **Fleet + eval pipeline (follow-up).** A second `cdk deploy` of the same stack
   with `{component: "fleet-eval"}`: its own buildspec, its own broader-but-
   isolated role (AgentCore control-plane, fleet-role PassRole, GitHub/MCP secrets
@@ -155,17 +157,35 @@ GitHub: tycenjmccann/agentcore-hub
    │                               → posts a required commit status
    │                               → branch protection on `main` blocks merge if red
    │
-   └── on merge to main ───────► CodePipeline: agentcore-hub-deploy (APP pipeline)
+   └── after merge to main ────► CodePipeline: agentcore-hub-deploy (APP pipeline)
+        (RM: Pipeline___start_deploy — push trigger not wired; see below)
                                    ├─ Source   (CodeConnections, main)
                                    ├─ Build    buildspec-ci.yml again (build-once)
                                    │           → artifacts: orchestrator.zip (+ digest),
                                    │             ECR image (by digest)
-                                   ├─ Approval  ManualApproval → SNS → Telegram
+                                   ├─ Approval  ManualApproval → Telegram (poll bridge)
                                    └─ Deploy   buildspec-deploy.yml
                                                (Lambda code + S3 config + ECS roll,
                                                 promote-by-digest; fleet/eval change
-                                                → BLOCK for the fleet+eval pipeline)
+                                                → deploy app targets, advance baseline,
+                                                  then FAIL as a terminal handoff to
+                                                  the fleet+eval pipeline)
 ```
+
+- **Approval notification (as implemented):** a **poll-based Telegram bridge**,
+  not SNS. The `telegram-bug-intake` poller calls `GetPipelineState`, detects a
+  ManualApproval action awaiting a decision, atomically claims the approval
+  token in DynamoDB (so exactly one ping fires), and sends Approve / Reject
+  inline buttons whose taps map to `PutApprovalResult`. Gated by
+  `DEPLOY_PIPELINE_NAME` on that Lambda — unset makes the whole path a no-op.
+  (The CDK stack still provisions an SNS topic as an email fallback.)
+- **Merge does NOT auto-trigger the pipeline in prod.** The CDK stack sets
+  `triggerOnPush: true`, but the CodeConnections GitHub App webhook permission
+  is not installed, so the trigger never fires. The release manager starts the
+  pipeline explicitly via `Pipeline___start_deploy` after merging.
+- **PR-check webhook is gated OFF by default.** The CodeBuild PR webhook only
+  turns on with `PIPELINE_CI_WEBHOOK=1` at CDK deploy time. The required PR
+  checks today are the GitHub Actions in `.github/workflows/ci.yml`.
 
 - **Build-once / promote-by-digest:** the Deploy stage never rebuilds. It
   consumes the Build stage's ECR image *digest* and the orchestrator zip's S3
@@ -314,9 +334,11 @@ so the module stays truly optional.
   CodeBuild PR-check status for the branch head SHA (via a `Pipeline___*` tool
   or `aws codebuild batch-get-builds`). Green → PASS, record the tested SHA
   (RM still cross-checks it). Red → pull the CloudWatch build log, triage the
-  failure, and file **grouped fix tickets** (one per component, `blocked_by`
-  chained on same file) back to the owning dev — exactly its current FAIL path,
-  minus running the build itself.
+  failure, and split it into two lanes: **mechanical** failures (formatter/
+  linter/lockfile — the §11 whitelist) are auto-remediated by the CI agent
+  itself in a single pass; **logic** failures get **grouped fix tickets** (one
+  per component, `blocked_by` chained on same file) back to the owning dev —
+  exactly its current FAIL path, minus running the build itself.
 - **When unset:** current blueprint verbatim.
 
 ### `qa-verifier.md` → semantic verifier
@@ -332,9 +354,12 @@ so the module stays truly optional.
 ### `release-manager.md` (CD ticket) → trigger + report, don't execute
 - **When `PIPELINE_ENABLED`:** Ship ticket unchanged (final PR review + Merge
   Brief). CD ticket: after the human merge gate, **merge the PR, then start the
-  CodePipeline execution** (`aws codepipeline start-pipeline-execution`) and
-  poll it to terminal, or (cleaner) let the merge-to-main trigger fire the
-  pipeline and have the CD ticket **watch** the execution. Report the pipeline
+  CodePipeline execution via `Pipeline___start_deploy`** and poll it to terminal
+  with `Pipeline___get_state`. RM drives the pipeline **exclusively through the
+  `Pipeline___*` tools** — the coding-runtime IAM role is AccessDenied on
+  CodePipeline by design, so `aws codepipeline ...` in `claude_code` fails.
+  Merge does **not** auto-trigger the pipeline (the GitHub push webhook is not
+  wired); RM must call `Pipeline___start_deploy` explicitly. Report the pipeline
   execution result (stage statuses, approval, deploy + smoke outcomes,
   rollback if any) as the CD evidence — instead of shelling `DEPLOY.md` via
   `claude_code`. `DEPLOY.md` preflight still applies: no `DEPLOY.md` /
@@ -400,15 +425,43 @@ so the module stays truly optional.
 
 ---
 
-## 10. Open decisions (defaults chosen; flag if you disagree)
+## 10. Open decisions (all resolved)
 
-1. **One approval or two** (merge gate + pipeline approval). Default: **keep
-   both** — merge gate authorizes the merge, pipeline approval authorizes the
-   irreversible deploy against built artifacts.
-2. **CI-agent disposition.** Decided: **keep as thin CI-fixer** (not retired).
-3. **Rollback automation** lands with the pipeline (closes the `DEPLOY.md`
-   `rollback.sh` gap) rather than as a separate task. Default: **yes, in the
-   Deploy stage.**
-4. **`npm audit` failing the build.** Default: **report-only at first**, flip to
-   blocking once the current advisories are baselined.
-```
+1. **One approval or two** — RESOLVED: **both**. The merge gate authorizes the
+   merge; the in-pipeline ManualApproval (Telegram-bridged, §5) authorizes the
+   deploy.
+2. **CI-agent disposition** — RESOLVED: **kept as thin CI-fixer**, now with the
+   §11 mechanical-lane auto-remediation.
+3. **Rollback automation** — RESOLVED: **shipped in the Deploy stage**
+   (`deploy/pipeline/rollback.sh` runs automatically on a Deploy-stage failure).
+4. **`npm audit` failing the build** — RESOLVED: **report-only**
+   (`|| true` in `buildspec-ci.yml`); flip to blocking once the current
+   advisories are baselined.
+
+---
+
+## 11. Post-pilot additions (implemented)
+
+- **`agentcore-hub-pipeline-tools` Lambda.** The fleet drives the pipeline
+  through a narrow Lambda (`lambda/agentcore-hub-pipeline-tools/`, deployed via
+  `deploy/setup-pipeline-tools-lambda.mjs`) exposing `Pipeline___get_state` /
+  `start_deploy` / `get_build_status` / `get_build_log` — read + trigger only.
+  **Invariant: no `codepipeline:PutApprovalResult`** — an agent must never
+  approve its own deploy; the ManualApproval gate stays human (Telegram bridge).
+  This exists because the coding-runtime role is AccessDenied on CodePipeline by
+  design — the RM's dead-zone RCA.
+- **Ship merge-verify completion gate.** The orchestrator refuses to finalize a
+  ship-phase workflow if it can prove the feature branch is unmerged (emits
+  `workflow.cd_unmerged`, leaves the run open). Best-effort: a GitHub/API
+  failure never blocks a legitimate completion. Opt-out: `SHIP_MERGE_VERIFY=off`.
+- **CI two-lane auto-remediation** (`blueprints/ci-agent.md` P2a). Mechanical
+  failures — an exhaustive whitelist: `prettier`, `eslint --fix`, import
+  ordering, lockfile regen — are self-fixed by the CI agent: run the tool (never
+  hand-edit), single pass only, scope-capped to files already in the diff, then
+  re-verify green on the **new** head SHA via `Pipeline___get_build_status`.
+  Default-deny: anything off-whitelist (or touching logic) still files a dev
+  ticket.
+- **Deploy-gate surfaces.** The Telegram approval bridge (§5) plus a deploy-gate
+  banner on the Workflow board: `WorkflowBoard.tsx` polls `/api/pipeline/status`
+  during a ship-phase run and shows when a ManualApproval is waiting
+  (silent-catch when the Pipeline module is absent).

@@ -1,5 +1,9 @@
 # Changelog — AgentCore Hub Pipeline System
 
+> **Historical — frozen as of 2026-05-25.** This file is no longer maintained;
+> entries below are kept for reference only. For current changes, use
+> `git log` and the merged pull requests as the source of truth.
+
 All notable changes to the agent fleet, orchestrator, and deployment system.
 
 ## [Unreleased]
