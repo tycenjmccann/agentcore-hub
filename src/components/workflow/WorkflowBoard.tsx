@@ -14,7 +14,7 @@ import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePha
 import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
 import { applyAgentStatus, applyAgentComplete, shouldForceTicketDone } from "@/lib/workflow/board-state";
-import { isLivenessEvent, isDispatchEvent, computeStaleAgentIds, isStaleEligibleStatus, seedLastActivityByAgent, staleThresholdFor } from "@/lib/workflow/stale";
+import { isLivenessEvent, isDispatchEvent, computeStaleAgentIds, isStaleEligibleStatus, seedLastActivityByAgent, seedLastToolByAgent, staleThresholdFor } from "@/lib/workflow/stale";
 import { Square, ClipboardCheck } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
@@ -357,19 +357,22 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                       // agents. Clock seeding classifies liveness via the SAME shared helper
                       // the live path uses (isLivenessEvent: tool_end counts, agent_status/
                       // agent_complete don't — TEAM-3881 F4); labels keep any-event behavior.
-                      const lastPerAgent: Record<string, { event: string; tool?: string }> = {};
+                      const lastPerAgent: Record<string, { event: string }> = {};
                       for (const ev of evData.events) {
                         if (!ev.agentId) continue;
                         if (ev.type === "tool_use") {
                           const displayName = (ev.toolName || "").replace(/___/g, " → ").replace(/_/g, " ");
-                          lastPerAgent[ev.agentId] = { event: `Tool: ${displayName}`, tool: ev.toolName };
+                          lastPerAgent[ev.agentId] = { event: `Tool: ${displayName}` };
                         } else if (ev.type === "agent_output") {
-                          lastPerAgent[ev.agentId] = { event: "Streaming text...", tool: lastPerAgent[ev.agentId]?.tool };
+                          lastPerAgent[ev.agentId] = { event: "Streaming text..." };
                         } else if (ev.type === "agent_status" || ev.type === "agent_complete") {
-                          lastPerAgent[ev.agentId] = { event: `Agent ${ev.status || "complete"}`, tool: lastPerAgent[ev.agentId]?.tool };
+                          lastPerAgent[ev.agentId] = { event: `Agent ${ev.status || "complete"}` };
                         }
                       }
                       const seededActivity = seedLastActivityByAgent(evData.events);
+                      // Tool tiers via the shared helper: a dispatch clears the
+                      // previous run's tool, matching the live anchor (TEAM-3890).
+                      const seededTools = seedLastToolByAgent(evData.events);
                       // All stale-able agents (running OR waiting_response — the same
                       // predicate as the card/modal, TEAM-3881 F3).
                       const runningAgents = Object.entries(data.agentTasks || {})
@@ -380,9 +383,9 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                       for (const agentId of runningAgents) {
                         if (lastPerAgent[agentId]) {
                           eventMap[agentId] = lastPerAgent[agentId].event;
-                          if (lastPerAgent[agentId].tool) {
-                            lastToolPerAgentRef.current[agentId] = lastPerAgent[agentId].tool!;
-                          }
+                        }
+                        if (seededTools[agentId]) {
+                          lastToolPerAgentRef.current[agentId] = seededTools[agentId];
                         }
                         if (seededActivity[agentId] !== undefined) {
                           lastActivityPerAgentRef.current[agentId] = seededActivity[agentId];
@@ -735,6 +738,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         // same way (TEAM-3888).
         if (event.agentId && isDispatchEvent(event.type, event.status)) {
           lastActivityPerAgentRef.current[event.agentId] = Date.now();
+          // The long claude_code stale window is run-scoped: drop the previous
+          // run's tool tier so a re-dispatched run that dies before its first
+          // tool call gets the default 3-min threshold, not an inherited
+          // 17-min one (TEAM-3890).
+          delete lastToolPerAgentRef.current[event.agentId];
           setStaleAgents((prev) => {
             if (!prev.has(event.agentId)) return prev;
             const next = new Set(prev);

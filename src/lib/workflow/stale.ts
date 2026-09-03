@@ -113,3 +113,24 @@ export function seedLastActivityByAgent(
   }
   return seeded;
 }
+
+/** Seed per-agent LAST TOOL from historical events (page-load catch-up) — the
+ *  tier selector for staleThresholdFor. The long claude_code window is
+ *  run-scoped, so a dispatch drops the previous run's tool (TEAM-3890): run 1
+ *  ending in claude_code must not lend its 17-min window to a re-dispatched
+ *  run 2 that dies before its first tool call. Mirrors the live path, where
+ *  tool_use sets the tier and the dispatch anchor clears it. */
+export function seedLastToolByAgent(
+  events: { type: string; agentId?: string; status?: string; toolName?: string }[]
+): Record<string, string> {
+  const tools: Record<string, string> = {};
+  for (const ev of events) {
+    if (!ev.agentId) continue;
+    if (ev.type === "tool_use" && ev.toolName) {
+      tools[ev.agentId] = ev.toolName;
+    } else if (isDispatchEvent(ev.type, ev.status)) {
+      delete tools[ev.agentId];
+    }
+  }
+  return tools;
+}

@@ -78,6 +78,21 @@ describe("stuck detection counts tool activity as liveness (TEAM-3858)", () => {
     );
   });
 
+  it("a dispatch resets the agent's tool tier in both live and seeding paths (TEAM-3890)", () => {
+    // Live path: the dispatch anchor that restarts the idle clock must also
+    // drop the previous run's tool, or a re-dispatched run that dies before
+    // its first tool call inherits run 1's 17-min claude_code window.
+    const anchor = boardContent.match(
+      /if \(event\.agentId && isDispatchEvent\(event\.type, event\.status\)\) \{[\s\S]*?\n {8}\}/
+    );
+    expect(anchor).not.toBeNull();
+    expect(anchor![0]).toContain("delete lastToolPerAgentRef.current[event.agentId]");
+    // Seeding path: tool tiers come from the shared helper (tool_use sets,
+    // dispatch clears) instead of carrying run 1's tool across the dispatch.
+    expect(boardContent).toContain("seedLastToolByAgent(evData.events)");
+    expect(boardContent).not.toMatch(/tool: lastPerAgent\[ev\.agentId\]\?\.tool/);
+  });
+
   it("modal header cannot say Working (or raw status) while the footer says STUCK", () => {
     // Header label and style branch on the same isStale flag as the footer,
     // under the same running-or-waiting predicate (TEAM-3881 F3).
