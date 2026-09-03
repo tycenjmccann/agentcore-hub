@@ -193,6 +193,15 @@ def arn_for(agent):
 
 updated = 0
 for agent in config["agents"]:
+    # Only pipeline personas ride the anchor runtimes. Harnesses (WM, builder,
+    # routine builder, PA) and dedicated runtimes (coding runtime, fleet
+    # improver) keep their own ARNs — remapping them broke eval attribution
+    # and collapsed the evaluations UI to a single column (2026-08-30).
+    if agent.get("type") == "harness":
+        continue
+    existing_arn = agent.get("runtimeArn") or ""
+    if agent["agentId"] != "agentcore_hub_agent" and agent["agentId"] in existing_arn:
+        continue
     arn = arn_for(agent)
     agent_id = agent["agentId"]
     id_marker = f'"agentId": "{agent_id}"'
