@@ -14,7 +14,7 @@ import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePha
 import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
 import { applyAgentStatus, applyAgentComplete, shouldForceTicketDone } from "@/lib/workflow/board-state";
-import { isLivenessEvent, computeIsStale, staleThresholdFor } from "@/lib/workflow/stale";
+import { isLivenessEvent, computeStaleAgentIds, isStaleEligibleStatus, seedLastActivityByAgent, staleThresholdFor } from "@/lib/workflow/stale";
 import { Square, ClipboardCheck } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
@@ -352,24 +352,28 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                       setPlaybackSpeed(1);
                       setIsPlaying(true);
 
-                      // Seed last activity timestamp and last event per agent from historical events.
-                      // This ensures stuck detection works immediately on page load for stale agents.
-                      const lastPerAgent: Record<string, { event: string; timestamp: number; tool?: string }> = {};
+                      // Seed last-event labels and per-agent activity clocks from historical
+                      // events, so stuck detection works immediately on page load for stale
+                      // agents. Clock seeding classifies liveness via the SAME shared helper
+                      // the live path uses (isLivenessEvent: tool_end counts, agent_status/
+                      // agent_complete don't — TEAM-3881 F4); labels keep any-event behavior.
+                      const lastPerAgent: Record<string, { event: string; tool?: string }> = {};
                       for (const ev of evData.events) {
                         if (!ev.agentId) continue;
-                        const ts = ev.timestamp ? new Date(ev.timestamp).getTime() : 0;
                         if (ev.type === "tool_use") {
                           const displayName = (ev.toolName || "").replace(/___/g, " → ").replace(/_/g, " ");
-                          lastPerAgent[ev.agentId] = { event: `Tool: ${displayName}`, timestamp: ts, tool: ev.toolName };
+                          lastPerAgent[ev.agentId] = { event: `Tool: ${displayName}`, tool: ev.toolName };
                         } else if (ev.type === "agent_output") {
-                          lastPerAgent[ev.agentId] = { event: "Streaming text...", timestamp: ts, tool: lastPerAgent[ev.agentId]?.tool };
+                          lastPerAgent[ev.agentId] = { event: "Streaming text...", tool: lastPerAgent[ev.agentId]?.tool };
                         } else if (ev.type === "agent_status" || ev.type === "agent_complete") {
-                          lastPerAgent[ev.agentId] = { event: `Agent ${ev.status || "complete"}`, timestamp: ts, tool: lastPerAgent[ev.agentId]?.tool };
+                          lastPerAgent[ev.agentId] = { event: `Agent ${ev.status || "complete"}`, tool: lastPerAgent[ev.agentId]?.tool };
                         }
                       }
-                      // Find the most recent event across all running agents
+                      const seededActivity = seedLastActivityByAgent(evData.events);
+                      // All stale-able agents (running OR waiting_response — the same
+                      // predicate as the card/modal, TEAM-3881 F3).
                       const runningAgents = Object.entries(data.agentTasks || {})
-                        .filter(([, t]) => (t as { status?: string }).status === "running")
+                        .filter(([, t]) => isStaleEligibleStatus((t as { status?: string }).status))
                         .map(([, t]) => (t as { agentId?: string }).agentId || "");
                       let latestTs = 0;
                       const eventMap: Record<string, string> = {};
@@ -379,15 +383,19 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                           if (lastPerAgent[agentId].tool) {
                             lastToolPerAgentRef.current[agentId] = lastPerAgent[agentId].tool!;
                           }
-                          if (lastPerAgent[agentId].timestamp > latestTs) {
-                            latestTs = lastPerAgent[agentId].timestamp;
+                        }
+                        if (seededActivity[agentId] !== undefined) {
+                          lastActivityPerAgentRef.current[agentId] = seededActivity[agentId];
+                          if (seededActivity[agentId] > latestTs) {
+                            latestTs = seededActivity[agentId];
                           }
                         }
                       }
                       if (Object.keys(eventMap).length > 0) {
                         setLastEventPerAgent((prev) => ({ ...prev, ...eventMap }));
                       }
-                      // Seed lastActivityRef from actual event timestamps (not page load time)
+                      // Seed the workflow-global clock (auto-nudge) from actual event
+                      // timestamps (not page load time)
                       if (latestTs > 0) {
                         lastActivityRef.current = latestTs;
                       }
@@ -679,11 +687,30 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     // only fires for live SSE (never replay/catch-up), so Date.now() is real.
     // agent_status/token_usage deliberately excluded — a dead session must
     // still cross the threshold.
+    // Liveness is attributed to the EMITTING agent only (TEAM-3881 F1): agent
+    // A's tool calls must not un-stick or keep-alive a dead agent B. Every
+    // liveness event shape carries agentId; if one arrives without it we still
+    // bump the workflow-global clock (nudge suppression) but touch no agent.
     if (isLivenessEvent(event.type)) {
-      lastActivityRef.current = Date.now();
+      const now = Date.now();
+      lastActivityRef.current = now;
       nudgeFiredRef.current = "";
-      setIsStale(false);
-      setManualStaleAgents((prev) => (prev.size > 0 ? new Set<string>() : prev));
+      const agentId = "agentId" in event ? event.agentId : undefined;
+      if (agentId) {
+        lastActivityPerAgentRef.current[agentId] = now;
+        setStaleAgents((prev) => {
+          if (!prev.has(agentId)) return prev;
+          const next = new Set(prev);
+          next.delete(agentId);
+          return next;
+        });
+        setManualStaleAgents((prev) => {
+          if (!prev.has(agentId)) return prev;
+          const next = new Set(prev);
+          next.delete(agentId);
+          return next;
+        });
+      }
     }
 
     switch (event.type) {
@@ -699,6 +726,20 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         break;
       }
       case "agent_status":
+        // A dispatch (status → running) restarts this agent's idle clock and
+        // clears a lingering stale flag from its previous run. Status events
+        // are NOT liveness (a dead session emits no more of them — this is
+        // the orchestrator anchoring when the wait began), so they can't keep
+        // an agent alive past a threshold of real silence (TEAM-3881 F1).
+        if (event.agentId && event.status === "running") {
+          lastActivityPerAgentRef.current[event.agentId] = Date.now();
+          setStaleAgents((prev) => {
+            if (!prev.has(event.agentId)) return prev;
+            const next = new Set(prev);
+            next.delete(event.agentId);
+            return next;
+          });
+        }
         // If an agent starts running in a phase beyond current, animate the connector
         if (event.status === "running") {
           const agentPhase = pipelinePhasesRef.current.findIndex((p) =>
@@ -930,7 +971,17 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // ─── Auto-Nudge: if workflow active, no agent running, idle >60s → auto-fix stuck tickets ───
   const lastActivityRef = useRef<number>(Date.now());
   const nudgeFiredRef = useRef<string>(""); // tracks workflowId+phase to avoid repeat nudges
-  const [isStale, setIsStale] = useState(false);
+  // Per-agent activity clocks (TEAM-3881 F1): STUCK verdicts are per agent so
+  // one busy agent's events can't keep a dead sibling looking alive. The
+  // workflow-global clock above only drives auto-nudge idle detection.
+  const lastActivityPerAgentRef = useRef<Record<string, number>>({});
+  // Agents currently judged stale by the interval (cleared per agent on liveness)
+  const [staleAgents, setStaleAgents] = useState<Set<string>>(new Set());
+  // The 15s interval outlives mid-phase task-set changes (agent completes,
+  // another starts) — read the CURRENT task set via a render-updated ref so
+  // hasRunning and the per-agent claude_code tiering never go stale (F2).
+  const agentTasksRef = useRef(state?.agentTasks || {});
+  agentTasksRef.current = state?.agentTasks || {};
   // Track last tool called per agent — used for tiered stale thresholds
   const lastToolPerAgentRef = useRef<Record<string, string>>({});
   // Track last event description per agent — displayed in panel footer
@@ -955,10 +1006,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
       lastActivityRef.current = Date.now();
       // Reset nudge flag when activity resumes (new phase or agent started)
       nudgeFiredRef.current = "";
-      if (isStale) setIsStale(false);
-      if (manualStaleAgents.size > 0) setManualStaleAgents(new Set());
+      // Stale flags clear per agent in handleEvent's liveness guard — the same
+      // SSE chunk that grows this total also flows through it. Clearing ALL
+      // agents here would let one agent's text un-stick a dead sibling (F1).
     }
-  }, [state, streamingText, isStale, manualStaleAgents]);
+  }, [state, streamingText]);
 
   // Load the Workflow Manager watch flag for this run.
   useEffect(() => {
@@ -989,30 +1041,30 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     if (!state || state.phase === "complete" || state.phase === "error" || replayMode) return;
     const check = setInterval(() => {
       const idle = Date.now() - lastActivityRef.current;
-      const hasRunning = Object.values(state.agentTasks || {}).some(
-        (t) => t.status === "running" || t.status === "waiting_response"
-      );
+      // Read the CURRENT task set via the ref (F2): this interval outlives
+      // mid-phase task-set changes, and the closure's `state` was captured at
+      // effect setup.
+      const tasks = agentTasksRef.current;
+      const hasRunning = Object.values(tasks).some((t) => isStaleEligibleStatus(t.status));
       const nudgeKey = `${workflowId}:${state.phase}`;
 
-      // Tiered stale threshold based on last tool called — see @/lib/workflow/stale
-      const runningAgents = Object.entries(state.agentTasks || {})
-        .filter(([, t]) => t.status === "running" || t.status === "waiting_response")
-        .map(([key]) => key);
-      const anyInClaudeCode = runningAgents.some(
-        (id) => lastToolPerAgentRef.current[id] === "claude_code"
-      );
-      const staleThreshold = staleThresholdFor(anyInClaudeCode);
-
-      if (
-        computeIsStale({
-          now: Date.now(),
-          lastActivityAt: lastActivityRef.current,
-          hasRunningAgent: hasRunning,
-          thresholdMs: staleThreshold,
-        }) &&
-        !isStale
-      ) {
-        setIsStale(true);
+      // Per-agent STUCK verdicts, each against its own activity clock and its
+      // own tiered threshold — see @/lib/workflow/stale (F1). Recovery is
+      // handled by handleEvent's liveness guard, so this only ever adds.
+      const newlyStale = computeStaleAgentIds({
+        now: Date.now(),
+        tasks,
+        lastActivityByAgent: lastActivityPerAgentRef.current,
+        lastToolByAgent: lastToolPerAgentRef.current,
+      });
+      if (newlyStale.length > 0) {
+        setStaleAgents((prev) => {
+          const missing = newlyStale.filter((id) => !prev.has(id));
+          if (missing.length === 0) return prev;
+          const next = new Set(prev);
+          for (const id of missing) next.add(id);
+          return next;
+        });
       }
 
       // Fire nudge if:
@@ -1035,7 +1087,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
       }
     }, 15_000); // check every 15s
     return () => clearInterval(check);
-  }, [workflowId, state?.phase, replayMode, isStale]);
+  }, [workflowId, state?.phase, replayMode]);
 
   // Measure element positions and compute connector paths:
   // FROM: last output/trigger item (right edge) of phase[i]
@@ -1533,7 +1585,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                         <div className="sec-label">Agents ({phase.agents.length})</div>
                         {phase.agents.map((agent) => {
                           const agentTask = state?.agentTasks[agent.agentId];
-                          const isAgentStale = (isStale || manualStaleAgents.has(agent.agentId)) && agentTask && (agentTask.status === "running" || agentTask.status === "waiting_response");
+                          const isAgentStale = (staleAgents.has(agent.agentId) || manualStaleAgents.has(agent.agentId)) && agentTask && isStaleEligibleStatus(agentTask.status);
                           // Open fix-it ticket overrides a "complete" agentTask —
                           // the agent still has work queued/running for this run.
                           const openTicket = openTicketByAgent.get(agent.agentId);
@@ -1721,25 +1773,33 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                 next.delete(expandedAgent);
                 return next;
               });
-              // Also reset global isStale if no other manual overrides remain
-              if (manualStaleAgents.size <= 1) setIsStale(false);
             }
             setExpandedAgent(null);
           }}
-          isStale={(isStale || (!!expandedAgent && manualStaleAgents.has(expandedAgent))) && !!expandedAgent && (Object.values(state.agentTasks).find((t) => t.agentId === expandedAgent)?.status === "running")}
+          isStale={!!expandedAgent
+            && (staleAgents.has(expandedAgent) || manualStaleAgents.has(expandedAgent))
+            // Same status predicate as the board card (F3) — a stale
+            // waiting_response task must not show ACTIVE in the modal.
+            && isStaleEligibleStatus(Object.values(state.agentTasks).find((t) => t.agentId === expandedAgent)?.status)}
           workflowId={workflowId}
           lastToolName={expandedAgent ? lastToolPerAgentRef.current[expandedAgent] : undefined}
           lastEvent={expandedAgent ? lastEventPerAgent[expandedAgent] : undefined}
-          lastActivityTime={lastActivityRef.current}
+          lastActivityTime={(expandedAgent && lastActivityPerAgentRef.current[expandedAgent]) || lastActivityRef.current}
           staleThreshold={staleThresholdFor(!!expandedAgent && lastToolPerAgentRef.current[expandedAgent] === "claude_code")}
           onRestart={() => {
-            setIsStale(false);
             if (expandedAgent) {
+              setStaleAgents((prev) => {
+                if (!prev.has(expandedAgent)) return prev;
+                const next = new Set(prev);
+                next.delete(expandedAgent);
+                return next;
+              });
               setManualStaleAgents((prev) => {
                 const next = new Set(prev);
                 next.delete(expandedAgent);
                 return next;
               });
+              lastActivityPerAgentRef.current[expandedAgent] = Date.now();
             }
             lastActivityRef.current = Date.now();
           }}
