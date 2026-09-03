@@ -129,6 +129,14 @@ export function resolveReviewGateCap(gate: ReviewGate): {
 
 export interface WorkflowDef {
   id: string;
+  /**
+   * TEAM-3832: run-classification label this def derives — "bug" for the
+   * bug-fix pipeline, "feature" otherwise (default when absent). The stored
+   * workflow row's `workflowType` is DERIVED from the resolved def via
+   * `workflowTypeForDef` so the label can never contradict `workflowDefId`,
+   * which is the SOLE pipeline selector.
+   */
+  type?: "feature" | "bug";
   name: string;
   /** Short label for the workflow-list badge, e.g. "Dead-Code", "Bug-Fix", "SDLC". Falls back to `name` when absent. */
   displayName?: string;
@@ -168,6 +176,17 @@ export const WORKFLOW_DEFS: WorkflowDef[] = CONFIG.workflows;
 export function getWorkflowDef(id?: string | null): WorkflowDef {
   const found = id ? WORKFLOW_DEFS.find((w) => w.id === id) : undefined;
   return found || WORKFLOW_DEFS.find((w) => w.id === DEFAULT_WORKFLOW_DEF_ID) || WORKFLOW_DEFS[0];
+}
+
+/**
+ * TEAM-3832: derive the workflow-row `workflowType` label from a resolved def.
+ * `workflowDefId` is the SOLE pipeline selector; this label is display/query
+ * metadata (board BugIcon badge, crash-rca workflowType=bug query) and must be
+ * derived from the def — never copied from caller input — so it can never
+ * contradict the pipeline actually running.
+ */
+export function workflowTypeForDef(def: WorkflowDef): "feature" | "bug" {
+  return def.type === "bug" ? "bug" : "feature";
 }
 
 

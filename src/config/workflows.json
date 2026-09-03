@@ -3,6 +3,7 @@
   "workflows": [
     {
       "id": "software-delivery",
+      "type": "feature",
       "name": "Software Delivery",
       "displayName": "SDLC",
       "description": "Autonomous feature/bug pipeline: requirements analysis, parallel design, development, QA verification, CI, and a release manager that reviews the final PR — a human approves the merge, then it merges and deploys per the repo's DEPLOY.md.",
@@ -88,6 +89,7 @@
     },
     {
       "id": "bug-fix",
+      "type": "bug",
       "name": "Bug Fix",
       "displayName": "Bug-Fix",
       "description": "Fast defect flow: triage and root-cause, one general fixer (codex/claude_code, any subsystem) with a mandatory regression test, then independent code review, live QA verification, CI, and a release manager that reviews the final PR — a human approves the merge, then it merges and deploys per the repo's DEPLOY.md.",
@@ -149,6 +151,7 @@
     },
     {
       "id": "dead-code-sweep",
+      "type": "feature",
       "name": "Dead Code Sweep",
       "displayName": "Dead-Code",
       "description": "Scheduled hygiene flow: statically detect unused code (language-aware — Periphery for Swift, knip/ts-prune for TS, vulture for Python), remove it surgically with evidence it is unreferenced, then independent code review, live QA that build + tests still pass, CI, and a release manager that reviews the final PR — a human approves the merge, then it merges and deploys per the repo's DEPLOY.md.",
@@ -204,6 +207,7 @@
     },
     {
       "id": "marketing",
+      "type": "feature",
       "name": "Marketing Campaign",
       "displayName": "Marketing",
       "description": "Turn an idea into a launched campaign: strategy brief, multi-channel copy (social, blog, ads), asset generation, brand/compliance QA, and scheduling.",
@@ -257,6 +261,7 @@
     },
     {
       "id": "sales",
+      "type": "feature",
       "name": "Sales Proposal",
       "displayName": "Sales",
       "description": "Respond to an RFP or opportunity: qualify the deal, draft the proposal and solution, price it, run a deal-desk review, and route for approval.",
@@ -305,6 +310,7 @@
     },
     {
       "id": "legal",
+      "type": "feature",
       "name": "Legal Contract Review",
       "displayName": "Legal",
       "description": "Review an inbound contract: triage and classify, run parallel legal/risk/privacy review, draft redlines, and route for sign-off.",

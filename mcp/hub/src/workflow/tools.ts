@@ -52,7 +52,11 @@ export const WORKFLOW_TOOLS = [
   {
     name: "submit_workflow",
     description:
-      "Submit a new workflow for processing. Requires a title, description, and repository configuration. Sources and model override are optional.",
+      "Submit a new workflow for processing. Requires a title, description, and repository configuration. " +
+      "workflowDefId is the pipeline selector — pick an id from list_workflow_definitions (e.g. 'bug-fix' for bug runs; " +
+      "omitted → the default 'software-delivery' pipeline). workflowType is a DEPRECATED back-compat alias: without " +
+      "workflowDefId it maps to a def ('bug' → 'bug-fix', 'feature' → 'software-delivery'); when both are supplied the " +
+      "def wins and the run's stored type is derived from it. Sources and model override are optional.",
     inputSchema: {
       type: "object",
       required: ["title", "description", "repoConfig"],
@@ -111,8 +115,21 @@ export const WORKFLOW_TOOLS = [
             },
           },
         },
-        workflowType: { type: "string", enum: ["feature", "bug"] },
-        workflowDefId: { type: "string" },
+        workflowType: {
+          type: "string",
+          enum: ["feature", "bug"],
+          description:
+            "DEPRECATED — use workflowDefId to select the pipeline. Back-compat alias only: without workflowDefId it " +
+            "maps 'bug' → the 'bug-fix' def and 'feature' → the default 'software-delivery' def; when workflowDefId is " +
+            "also supplied the def wins and the stored workflowType is derived from it (the response then carries " +
+            "workflowTypeOverridden: true).",
+        },
+        workflowDefId: {
+          type: "string",
+          description:
+            "The pipeline selector: id of a workflow definition from list_workflow_definitions (e.g. " +
+            "'software-delivery', 'bug-fix'). Unknown ids are rejected with a 400 — never a silent fallback.",
+        },
         reviewGates: { type: "array", items: { type: "string" } },
       },
     },
@@ -325,7 +342,14 @@ async function handleSubmitWorkflow(args: unknown) {
   const parsed = SubmitWorkflowInputSchema.safeParse(args);
   if (!parsed.success) return zodError(parsed.error);
 
-  const result = await request<{ id?: string; workflowId?: string; epicId?: string; status?: string }>(
+  const result = await request<{
+    id?: string;
+    workflowId?: string;
+    epicId?: string;
+    status?: string;
+    workflowTypeOverridden?: boolean;
+    note?: string;
+  }>(
     "POST",
     "/api/workflow/start",
     parsed.data
@@ -338,6 +362,9 @@ async function handleSubmitWorkflow(args: unknown) {
   const lines = [`Workflow submitted successfully.`, `ID: ${id}`];
   if (d.epicId) lines.push(`Epic: ${d.epicId}`);
   if (d.status) lines.push(`Status: ${d.status}`);
+  // TEAM-3832: the def is the pipeline selector — tell the caller when their
+  // deprecated workflowType alias contradicted it and was overridden.
+  if (d.workflowTypeOverridden && d.note) lines.push(`Note: ${d.note}`);
   return success(lines.join("\n"));
 }
 
