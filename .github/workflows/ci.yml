@@ -81,6 +81,7 @@ jobs:
           deploy/runtime-agent/test_telemetry_init.py
           deploy/runtime-agent/test_build_env_vars.py
           deploy/workflow-manager/toolkit
+          deploy/pipeline/test_ecs_primary_container.py
 
   cloud-code-ui:
     name: Cloud Code UI (mocked, no AWS)

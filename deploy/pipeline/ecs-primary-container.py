@@ -7,7 +7,13 @@ service) is preserved untouched — mirrors deploy/ecs-express/deploy.sh's
 "never rewrite env" rule.
 
 Usage: ecs-primary-container.py '<describe-json>' '<ecr_uri@digest>'
-Prints the primary-container JSON to stdout.
+Prints the primary-container JSON to stdout on success.
+
+Fail-closed: if the describe JSON yields no live primaryContainer (or is
+malformed), print NOTHING to stdout and return non-zero. Synthesizing a
+default spec would emit an EMPTY environment and wipe the live runtime env
+(Jira/GitHub/Telegram creds) on the next roll — the opposite of the
+"never rewrite env" rule above — so we never do it.
 """
 import json
 import sys
@@ -19,24 +25,31 @@ def main() -> int:
         return 2
     describe_json, image = sys.argv[1], sys.argv[2]
 
-    d = json.loads(describe_json)
-    svc = d.get("service", {})
+    try:
+        d = json.loads(describe_json)
+    except (ValueError, TypeError) as exc:
+        print(f"could not parse describe JSON: {exc}", file=sys.stderr)
+        return 1
+    svc = d.get("service", {}) if isinstance(d, dict) else {}
 
     # Find the live primary container's port + environment across the shapes the
     # describe API returns (activeConfigurations[].primaryContainer, or a
     # top-level primaryContainer).
-    port = 8080
-    environment = []
     candidates = []
     for cfg in svc.get("activeConfigurations", []) or []:
         if cfg.get("primaryContainer"):
             candidates.append(cfg["primaryContainer"])
     if svc.get("primaryContainer"):
         candidates.append(svc["primaryContainer"])
-    if candidates:
-        pc = candidates[0]
-        port = pc.get("containerPort", port)
-        environment = pc.get("environment", []) or []
+    if not candidates:
+        # No live container to roll onto — fail closed rather than synthesize a
+        # default spec with an empty environment (which would wipe runtime env).
+        print("no live primaryContainer in describe JSON — refusing to synthesize an env-wiping fallback", file=sys.stderr)
+        return 1
+
+    pc = candidates[0]
+    port = pc.get("containerPort", 8080)
+    environment = pc.get("environment", []) or []
 
     primary = {"image": image, "containerPort": port, "environment": environment}
     sys.stdout.write(json.dumps(primary))

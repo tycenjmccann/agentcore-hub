@@ -34,6 +34,8 @@ if [ -n "${ECS_SERVICE_ARN:-}" ] && [ -n "$PREV_IMG" ]; then
     aws ecs update-express-gateway-service --service-arn "$ECS_SERVICE_ARN" \
       --region "$AWS_REGION_HUB" --primary-container "$PRIMARY" --output text >/dev/null \
       && echo "ECS rolled back" || echo "ECS rollback FAILED — inspect"
+  else
+    echo "could not describe live service — ECS rollback skipped, manual intervention required"
   fi
 else
   echo "no prior ECS image snapshot — ECS not rolled back"
