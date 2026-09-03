@@ -2641,7 +2641,7 @@ async def _run_agent_invocation(payload, context):
         "prompt": "The task context (ticket description, workflow metadata)",
         "workflow_id": "wf_xxx",
         "agent_id": "agentcore_hub_security_reviewer",
-        "model_override": "us.anthropic.claude-opus-4-6-v1" (optional)
+        "model_override": "us.anthropic.claude-opus-5" (optional)
     }
 
     The system prompt is NOT in the payload — it's baked into the agent at deploy time

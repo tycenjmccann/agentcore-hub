@@ -38,7 +38,7 @@ python3 verify-fleet-invoke.py \
 
 Optional: test with a different model:
 ```bash
-python3 verify-fleet-invoke.py --fleet-file fleet-runtime-ids.json --timeout 600 --parallel 5 --model us.anthropic.claude-sonnet-4-6
+python3 verify-fleet-invoke.py --fleet-file fleet-runtime-ids.json --timeout 600 --parallel 5 --model us.anthropic.claude-sonnet-5
 ```
 
 ## Post-deploy telemetry verification
@@ -159,15 +159,15 @@ These are passed via `--env` in deploy-one.sh and available inside the runtime a
 |----------|-------|---------|
 | `AGENTCORE_HUB_ARTIFACT_BUCKET` | `agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}` | S3 bucket for agent file ops |
 | `GATEWAY_ARN` | *(gateway ARN)* | AgentCore gateway reference |
-| `MODEL_ID` | `us.anthropic.claude-opus-4-6-v1` | Default model for agents |
+| `MODEL_ID` | `us.anthropic.claude-opus-5` | Default model for agents |
 | `READ_TIMEOUT` | `600` | Bedrock invoke timeout (seconds) |
 | `EVENTS_TABLE` | `agentcore-hub-events` | DynamoDB table for streaming events |
 | `TICKET_TOOLS_LAMBDA` | `agentcore-hub-tickets` or `agentcore-hub-jira` | Lambda for ticket operations (matches your TICKET_PROVIDER) |
 | `SYSTEM_PROMPT_S3_KEY` | `prompts/{agent_name}.txt` | S3 key for agent system prompt |
 | `BYPASS_TOOL_CONSENT` | `true` | Non-interactive tool execution |
 | `CLAUDE_CODE_USE_BEDROCK` | `1` | Claude Code uses Bedrock |
-| `CLAUDE_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Claude Code model |
-| `ANTHROPIC_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Claude Code model (alt) |
+| `CLAUDE_MODEL` | `us.anthropic.claude-opus-5` | Claude Code model |
+| `ANTHROPIC_MODEL` | `us.anthropic.claude-opus-5` | Claude Code model (alt) |
 | `GITHUB_PAT` | *(token)* | GitHub MCP access |
 | `UNIFIED_TRACES_DESTINATION_ENABLED` | `true` | Deliver spans to the unified telemetry destination (`spans` log streams) |
 | `OTEL_SERVICE_NAME` | *(agent name)* | Service name on every emitted span |
