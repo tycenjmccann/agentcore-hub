@@ -46,13 +46,13 @@
  */
 
 import { QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
-// The ONE terminal-phase list (TEAM-3755 F8 / TEAM-3756 F5). completion.mjs is
-// pure — no AWS clients, no store import — so importing it here cannot cycle.
-import { notTerminalPhaseFilter } from "./completion.mjs";
+// The ONE open-workflow scan, shared with reconcile-sweep.mjs (TEAM-3839): the
+// capped window ROTATES across sweeps (TEAM-3764 F5) so >SWEEP_CAP open
+// workflows can never permanently starve the older tail.
+import { SWEEP_CAP, createOpenWorkflowScan } from "./sweep-scan.mjs";
 
 // Sweep bounds and threshold knobs. The silence threshold is derived per-agent
 // from its own recent run durations; these frame that derivation.
-const SWEEP_CAP = 50;               // workflows inspected per sweep (most recent first)
 const MEDIAN_WINDOW = 20;           // most-recent completed runs sampled per agent
 const MEDIAN_MULTIPLIER = 3;        // silence must exceed 3× the agent's typical run
 const FALLBACK_MULTIPLIER = 2;      // cold-start silence = 2× TTL (the stale-claim hatch)
@@ -61,7 +61,6 @@ const MAX_THRESHOLD_MS = 6 * 60 * 60 * 1000; // never wait more than 6h to call 
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;     // median cache lifetime (matches the rule)
 const LIVE_STATUSES = ["running", "in_progress"];
 const MEDIAN_SCAN_PAGES = 10;       // bound the events scan on a cold median miss
-const WORKFLOW_SCAN_PAGES = 20;     // bound the workflows scan
 const COMPLETION_SCAN_PAGES = 20;   // bound the completion-check query (× 500 items/page,
                                     // same bound as lease.lastAgentActivity)
 const KNOWN_MODES = ["off", "shadow", "enforce"];
@@ -103,39 +102,16 @@ export function createDetector(deps) {
 
   /**
    * Scan workflows in a non-terminal phase, newest first, capped at SWEEP_CAP.
-   * Returns { workflows, matched } so the caller can flag truncation.
-   *
-   * TEAM-3756 F5: the filter is DERIVED from the shared TERMINAL_WORKFLOW_PHASES
-   * list (completion.mjs), the same fix TEAM-3755 F8 made to the reconcile
-   * sweep's identical scan. The hand-rolled list here named only
-   * complete/cancelled/error, so a run already closed deploy-blocked /
-   * static-ci-only still scanned as "open" — and in enforce mode (the default)
-   * a stale agentTask inside a terminally-blocked run could be retried or
-   * escalated after the run's honest close.
+   * Shared implementation (sweep-scan.mjs, TEAM-3839): the previous local copy
+   * truncated with a fixed newest-first slice(0, SWEEP_CAP), so with more than
+   * SWEEP_CAP open workflows the older tail was NEVER inspected — dead sessions
+   * there silently accumulated forever. The shared scan rotates the capped
+   * window across sweeps (TEAM-3764 F5, ported from reconcile-sweep), so every
+   * open workflow is inspected within ceil(N/SWEEP_CAP) rotation quanta.
+   * Returns { workflows, matched, rotation, pages } so the caller can flag
+   * truncation. Below the cap this is exactly the old behavior.
    */
-  async function scanNonTerminalWorkflows() {
-    const matched = [];
-    let lastKey;
-    const openOnly = notTerminalPhaseFilter("#p");
-    for (let page = 0; page < WORKFLOW_SCAN_PAGES; page++) {
-      const res = await ddb.send(new ScanCommand({
-        TableName: workflowsTable,
-        FilterExpression: openOnly.filter,
-        ExpressionAttributeNames: { "#p": "phase" },
-        ExpressionAttributeValues: { ...openOnly.values },
-        ExclusiveStartKey: lastKey,
-      }));
-      for (const w of res.Items || []) matched.push(w);
-      lastKey = res.LastEvaluatedKey;
-      if (!lastKey) break;
-    }
-    // Best-effort recency ordering — workflow rows carry no single updatedAt, so
-    // fall back through the timestamps they do carry. The cap is a safety bound,
-    // not a correctness gate: anything truncated is picked up next sweep.
-    const recency = (w) => String(w.updatedAt || w.completedAt || w.startedAt || "");
-    matched.sort((a, b) => recency(b).localeCompare(recency(a)));
-    return { workflows: matched.slice(0, SWEEP_CAP), matched: matched.length };
-  }
+  const scanNonTerminalWorkflows = createOpenWorkflowScan({ ddb, workflowsTable, now });
 
   /**
    * True if an agent.complete for this ticket was published at/after the claim
@@ -326,10 +302,10 @@ export function createDetector(deps) {
       return m;
     }
 
-    const { workflows, matched } = await scanNonTerminalWorkflows();
+    const { workflows, matched, rotation, pages } = await scanNonTerminalWorkflows();
     if (matched > SWEEP_CAP) {
       m.truncated = true;
-      log(`detector.sweep_truncated — ${matched} non-terminal workflows, capped at ${SWEEP_CAP} (sweep ${sweepId})`);
+      log(`dead_session.sweep_truncated — ${matched} non-terminal workflows, capped at ${SWEEP_CAP}; inspecting rotating window ${rotation + 1}/${pages} (every window is reached within ${pages} rotation quanta) (sweep ${sweepId})`);
     }
 
     for (const workflow of workflows) {

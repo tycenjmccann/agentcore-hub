@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createDetector } from "./dead-session-detector.mjs";
+import { SWEEP_ROTATION_QUANTUM_MS } from "./sweep-scan.mjs";
 
 /**
  * TEAM-3618 D1.2 — the orchestrator dead-session sweep. Every effect is
@@ -435,6 +436,88 @@ describe("sweep truncation", () => {
     const { runSweep } = createDetector(deps);
     const m = await runSweep("shadow");
     expect(m.truncated).toBe(true);
+  });
+});
+
+/**
+ * TEAM-3839 — the capped window must ROTATE so older workflows are inspected
+ * (port of the TEAM-3764 F5 reconcile-sweep fix). Before this fix the
+ * detector's scan re-inspected the same newest-50 slice on EVERY sweep, so with
+ * >SWEEP_CAP open workflows a dead session in any older workflow was NEVER
+ * detected — a permanent liveness gap. The window now rotates: chunk k of the
+ * recency-sorted list this rotation quantum, chunk k+1 the next, wrapping — so
+ * every open workflow is inspected within ceil(N/50) quanta. Mirrors the
+ * reconcile-sweep rotation tests.
+ */
+describe("TEAM-3839 — the capped window rotates so older workflows are inspected", () => {
+  // 120 open workflows, newest first (wf_0 newest … wf_119 oldest) → 3 chunks.
+  // ONLY the oldest — unreachable before this fix — carries the dead session.
+  const N = 120;
+  const PAGES = Math.ceil(N / 50);
+  const fleet = () =>
+    Array.from({ length: N }, (_, i) =>
+      makeWorkflow({
+        id: `wf_${i}`, workflowId: `wf_${i}`,
+        updatedAt: new Date(NOW - (i + 1) * 60_000).toISOString(),
+        agentTasks: i === N - 1 ? { "TEAM-2": { ...deadTask } } : {},
+      }));
+
+  it("a dead session in the OLDEST workflow is detected within ceil(N/cap) sweeps", async () => {
+    const clock = { v: NOW };
+    const { deps, store } = makeDeps({
+      ddb: makeDdb({ workflows: fleet() }),
+      now: () => clock.v,
+    });
+    const { runSweep } = createDetector(deps);
+
+    let sweepsUntilDetected = null;
+    for (let sweep = 1; sweep <= PAGES; sweep++) {
+      await runSweep("enforce");
+      if (sweepsUntilDetected === null && store.markDeadSessionDetected.mock.calls.length > 0) {
+        sweepsUntilDetected = sweep;
+      }
+      clock.v += SWEEP_ROTATION_QUANTUM_MS; // next sweep lands in the next quantum
+    }
+
+    // wf_119 (oldest — deepest chunk, starved forever before this fix) WAS
+    // reached, within ceil(120/50) = 3 rotation quanta.
+    expect(sweepsUntilDetected).not.toBeNull();
+    expect(sweepsUntilDetected).toBeLessThanOrEqual(PAGES);
+    expect(store.markDeadSessionDetected).toHaveBeenCalledWith(`wf_${N - 1}`, "TEAM-2", DEAD_STARTED);
+  });
+
+  it("emits the dead_session.sweep_truncated rotating-window log line when N > cap", async () => {
+    const lines = [];
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: fleet() }),
+      log: (msg) => lines.push(msg),
+    });
+    const { runSweep } = createDetector(deps);
+    const m = await runSweep("shadow");
+    expect(m.truncated).toBe(true);
+    expect(lines.some((l) =>
+      /^dead_session\.sweep_truncated — 120 non-terminal workflows, capped at 50; inspecting rotating window [1-3]\/3 \(every window is reached within 3 rotation quanta\)/.test(l),
+    )).toBe(true);
+  });
+
+  it("under the cap rotation is a no-op — a deep-quantum clock still inspects everything", async () => {
+    // 5 open workflows, dead session in the oldest; a clock deep into some
+    // arbitrary quantum must NOT slice a 5-row set (below-cap behavior is
+    // exactly the old slice(0, SWEEP_CAP)).
+    const few = Array.from({ length: 5 }, (_, i) =>
+      makeWorkflow({
+        id: `wf_${i}`, workflowId: `wf_${i}`,
+        updatedAt: new Date(NOW - (i + 1) * 60_000).toISOString(),
+        agentTasks: i === 4 ? { "TEAM-2": { ...deadTask } } : {},
+      }));
+    const { deps, store } = makeDeps({
+      ddb: makeDdb({ workflows: few }),
+      now: () => NOW + 7 * SWEEP_ROTATION_QUANTUM_MS,
+    });
+    const { runSweep } = createDetector(deps);
+    const m = await runSweep("enforce");
+    expect(m.truncated).toBe(false);
+    expect(store.markDeadSessionDetected).toHaveBeenCalledWith("wf_4", "TEAM-2", DEAD_STARTED);
   });
 });
 
