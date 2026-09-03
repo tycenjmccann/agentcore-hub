@@ -292,7 +292,14 @@ export class PipelineStack extends Stack {
               branch,
               connectionArn,
               output: sourceOutput,
-              triggerOnPush: true,
+              // Agent-owned trigger contract: merges do NOT auto-trigger the
+              // pipeline — the release manager explicitly calls
+              // Pipeline___start_deploy after the merge lands (see the tools
+              // Lambda header, the Pipeline___* docstrings, and
+              // blueprints/release-manager.md). Leaving this true would
+              // double-trigger every merge (auto + RM) once the GitHub App
+              // gains webhook permission.
+              triggerOnPush: false,
               // Emit a full git clone (not the default flat ZIP) so the Build
               // stage has a real .git — the image tag falls back to
               // `git rev-parse` when CODEBUILD_RESOLVED_SOURCE_VERSION is unset

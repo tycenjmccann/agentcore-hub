@@ -22,9 +22,15 @@
  * must never approve its own deploy. This Lambda is read + trigger only.
  *
  * Env:
- *   PIPELINE_NAME       default "agentcore-hub-deploy"
+ *   PIPELINE_NAME       default "agentcore-hub-deploy"  (the CodePipeline)
  *   BUILD_PROJECT       default "agentcore-hub-build"
  *   CI_PROJECT          default "agentcore-hub-ci"
+ *   DEPLOY_PROJECT      set on this Lambda by deploy/setup-pipeline-tools-lambda.mjs
+ *                       (which also uses it for IAM scoping) but NOT read by this
+ *                       code — to reach the Deploy stage's CodeBuild project
+ *                       (same name as the pipeline, different resource kind),
+ *                       callers pass project="agentcore-hub-deploy" explicitly
+ *                       to get_build_log
  *   REGION              default from AWS_REGION
  */
 
@@ -96,13 +102,23 @@ export const handler = async (event) => {
 // Returns whether a pipeline is configured, each stage's latest status, and the
 // most-recent execution's per-action detail (status + externalExecutionSummary +
 // log/console url). This is BOTH the preflight probe and the watch poll.
+//
+// Execution scoping: GetPipelineState stage statuses can belong to DIFFERENT
+// pipeline executions — right after start_deploy a poll can still see the
+// PREVIOUS run's all-green stages before Source flips InProgress. Pass the
+// execution_id returned by start_deploy to compute terminal/succeeded/failed
+// ONLY from stages whose latestExecution matches; matchesExecution:false means
+// the new run is not yet visible on any stage (keep polling — never read the
+// old run as this run's completion).
 async function getState(args = {}) {
   const name = args.pipeline_name || PIPELINE_NAME;
+  const executionId = String(args.execution_id || "").trim();
   const state = await cp.send(new GetPipelineStateCommand({ name }));
 
   const stages = (state.stageStates || []).map((s) => ({
     stage: s.stageName,
     status: s.latestExecution?.status || "Unknown",
+    executionId: s.latestExecution?.pipelineExecutionId,
     actions: (s.actionStates || []).map((a) => ({
       action: a.actionName,
       status: a.latestExecution?.status || "Unknown",
@@ -114,18 +130,54 @@ async function getState(args = {}) {
     })),
   }));
 
-  // The pipeline is "terminal" for a given execution when no stage is InProgress.
-  const anyInProgress = stages.some(
-    (s) =>
-      s.status === "InProgress" ||
-      s.actions.some((a) => a.status === "InProgress")
-  );
-  const anyFailed = stages.some(
-    (s) =>
-      s.status === "Failed" ||
-      s.actions.some((a) => a.status === "Failed")
-  );
+  // When an execution_id is given, only the stages whose latest execution IS
+  // that execution count toward terminal/succeeded/failed. Omitted → all stages
+  // (back-compat with the pre-execution-scoped behavior).
+  const scopedStages = executionId
+    ? stages.filter((s) => s.executionId === executionId)
+    : stages;
+  const matchesExecution = executionId ? scopedStages.length > 0 : undefined;
+
+  let anyInProgress, anyFailed, terminal;
+  if (executionId) {
+    // Scoped path: STAGE-LEVEL status only. actionStates carry no execution id,
+    // so a lingering Failed/InProgress action left over from the PREVIOUS run
+    // inside a stage whose latestExecution already matches the new id would
+    // corrupt the verdict — stage.latestExecution is authoritative for the
+    // matched execution. "Stopped" is a failure disposition too (the run will
+    // never advance past a stopped stage).
+    anyInProgress = scopedStages.some((s) => s.status === "InProgress");
+    anyFailed = scopedStages.some(
+      (s) => s.status === "Failed" || s.status === "Stopped"
+    );
+    // Terminal only when the requested execution has a terminal disposition
+    // across the WHOLE pipeline: either every stage has caught up to this
+    // execution, or a matching stage Failed/Stopped. A Succeeded prefix with
+    // later stages still on an older executionId is the mid-transition window
+    // (e.g. Source done, Build not yet started) — NOT terminal, keep polling.
+    // And ZERO matching stages means the new run isn't visible on any stage
+    // yet — never read the old run's state as this run's completion.
+    const allStagesMatch =
+      matchesExecution && scopedStages.length === stages.length;
+    terminal =
+      matchesExecution && !anyInProgress && (allStagesMatch || anyFailed);
+  } else {
+    // Unscoped path (execution_id omitted): the pre-execution-scoped behavior,
+    // action-level checks included. Terminal when no stage/action is InProgress.
+    anyInProgress = scopedStages.some(
+      (s) =>
+        s.status === "InProgress" ||
+        s.actions.some((a) => a.status === "InProgress")
+    );
+    anyFailed = scopedStages.some(
+      (s) =>
+        s.status === "Failed" ||
+        s.actions.some((a) => a.status === "Failed")
+    );
+    terminal = !anyInProgress;
+  }
   const pipelineExecutionId =
+    executionId ||
     state.stageStates?.[0]?.latestExecution?.pipelineExecutionId;
 
   // Enrich the latest execution with per-action summaries (get_state's stage
@@ -157,8 +209,12 @@ async function getState(args = {}) {
     configured: true,
     pipelineName: name,
     pipelineExecutionId,
-    terminal: !anyInProgress,
-    succeeded: !anyInProgress && !anyFailed,
+    // Present only when execution_id was passed: true iff ≥1 stage's latest
+    // execution is that execution. When false, terminal/succeeded describe
+    // NOTHING about the requested run — keep polling.
+    ...(executionId ? { matchesExecution } : {}),
+    terminal,
+    succeeded: terminal && !anyFailed,
     failed: anyFailed,
     stages,
     actionDetails,
@@ -168,16 +224,25 @@ async function getState(args = {}) {
 // ─── start_deploy ───────────────────────────────────────────────────────────
 // Trigger a pipeline run. Use after merge (push auto-trigger is not wired) or to
 // re-run after a build-failure fix has landed on the default branch.
+// Pass commit_sha (the merge SHA) so the request carries an idempotency token —
+// a retried tool call for the same SHA then cannot double-trigger the pipeline.
 async function startDeploy(args = {}) {
   const name = args.pipeline_name || PIPELINE_NAME;
-  const res = await cp.send(
-    new StartPipelineExecutionCommand({ name })
-  );
+  const input = { name };
+  // clientRequestToken constraints: ^[a-zA-Z0-9-]+$, 1–128 chars. Sanitize the
+  // SHA to that charset; if nothing valid remains (or no SHA was given), OMIT
+  // the token entirely — never send an empty/invalid one.
+  const rawSha = String(args.commit_sha || "").trim();
+  const sanitized = rawSha.replace(/[^a-zA-Z0-9-]/g, "");
+  if (sanitized) {
+    input.clientRequestToken = `deploy-${sanitized}`.slice(0, 128);
+  }
+  const res = await cp.send(new StartPipelineExecutionCommand(input));
   return jsonResult({
     started: true,
     pipelineName: name,
     pipelineExecutionId: res.pipelineExecutionId,
-    note: "Deploy stage has an in-pipeline ManualApproval (deploy gate) that a HUMAN approves (Telegram). Poll get_state until terminal.",
+    note: "Deploy stage has an in-pipeline ManualApproval (deploy gate) that a HUMAN approves (Telegram). Poll get_state with execution_id=<this pipelineExecutionId> until terminal:true AND matchesExecution:true.",
   });
 }
 
@@ -262,7 +327,13 @@ async function getBuildLog(args = {}) {
 async function getBuildStatus(args = {}) {
   const project = args.project || CI_PROJECT;
   const commit = (args.commit_sha || "").trim();
-  const scan = Math.min(Number(args.scan) || 15, 50);
+  // Clamp scan to an integer in [1, 50]. A negative value would turn
+  // ids.slice(0, n) into a from-end slice (silently dropping the NEWEST builds)
+  // and 0 would empty the scan; non-numeric input falls back to the default 15.
+  const requested = Number(args.scan);
+  const scan = Number.isFinite(requested)
+    ? Math.min(50, Math.max(1, Math.trunc(requested)))
+    : 15;
 
   const list = await cb.send(
     new ListBuildsForProjectCommand({ projectName: project, sortOrder: "DESCENDING" })

@@ -1358,7 +1358,7 @@ def Tickets___search_issues(query: str, max_results: int = 20) -> str:
 # an agent). See blueprints/release-manager.md "Pipeline mode".
 
 @tool
-def Pipeline___get_state(pipeline_name: str = "") -> str:
+def Pipeline___get_state(pipeline_name: str = "", execution_id: str = "") -> str:
     """Get the CI/CD deploy pipeline's current state: whether it is configured,
     each stage's status, whether the latest execution is terminal/succeeded/failed,
     and per-action failure summaries + log URLs.
@@ -1368,18 +1368,37 @@ def Pipeline___get_state(pipeline_name: str = "") -> str:
     after triggering a deploy. If a stage failed, read actionDetails for the
     failing action, then call Pipeline___get_build_log.
 
+    When watching a deploy you started, ALWAYS pass execution_id (the
+    pipelineExecutionId returned by Pipeline___start_deploy): stage statuses can
+    belong to a PREVIOUS execution right after a start, so an unscoped poll can
+    misread the old run's all-green stages as your run's completion. With
+    execution_id set, the response carries matchesExecution — only trust
+    terminal/succeeded when matchesExecution is true; matchesExecution:false
+    means your run is not visible on any stage yet (keep polling).
+
     Args:
         pipeline_name: Override the pipeline name (defaults to the deploy pipeline).
+        execution_id: Scope terminal/succeeded/failed to this pipelineExecutionId
+            (from Pipeline___start_deploy). Omit for the unscoped legacy view.
     """
-    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___get_state",
-                          {"pipeline_name": pipeline_name} if pipeline_name else {})
+    args = {}
+    if pipeline_name:
+        args["pipeline_name"] = pipeline_name
+    if execution_id:
+        args["execution_id"] = execution_id
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___get_state", args)
 
 
 @tool
-def Pipeline___start_deploy(pipeline_name: str = "") -> str:
+def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "") -> str:
     """Trigger a deploy pipeline execution. Call this AFTER merging the PR (the
     GitHub push auto-trigger is not wired) and again after a build-failure fix has
     landed on the default branch, to re-run. Returns the pipelineExecutionId.
+
+    Pass commit_sha (the merge commit SHA) so the start carries an idempotency
+    token — a retried call for the same SHA then cannot double-trigger the
+    pipeline. Record the returned pipelineExecutionId and pass it as
+    execution_id on every Pipeline___get_state watch poll.
 
     The Deploy stage has an in-pipeline ManualApproval (the deploy gate) that a
     HUMAN approves via Telegram — you do NOT approve it. After starting, poll
@@ -1387,9 +1406,15 @@ def Pipeline___start_deploy(pipeline_name: str = "") -> str:
 
     Args:
         pipeline_name: Override the pipeline name (defaults to the deploy pipeline).
+        commit_sha: The merge commit SHA; derives the idempotency token
+            (omitted from the AWS call when not provided).
     """
-    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___start_deploy",
-                          {"pipeline_name": pipeline_name} if pipeline_name else {})
+    args = {}
+    if pipeline_name:
+        args["pipeline_name"] = pipeline_name
+    if commit_sha:
+        args["commit_sha"] = commit_sha
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___start_deploy", args)
 
 
 @tool
@@ -1422,6 +1447,10 @@ def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: 
     action's externalExecutionId (from Pipeline___get_state actionDetails) as
     build_id; omit it to read the project's most recent build. File a precise fix
     ticket from this — do NOT hand-fix the deploy yourself.
+
+    The Deploy stage's build/log is also readable: pass its externalExecutionId
+    as build_id, or project="agentcore-hub-deploy" (e.g. to read the intentional
+    exit-2 "HANDOFF" signal vs a genuine deploy failure).
 
     Args:
         build_id: CodeBuild build id (from get_state actionDetails.externalExecutionId).

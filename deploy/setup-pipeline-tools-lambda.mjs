@@ -14,9 +14,11 @@
  *   AWS_PROFILE=tycenj-prod node deploy/setup-pipeline-tools-lambda.mjs
  *
  * Env (all optional — sane prod defaults):
- *   PIPELINE_NAME   default agentcore-hub-deploy
+ *   PIPELINE_NAME   default agentcore-hub-deploy   (the CodePipeline)
  *   BUILD_PROJECT   default agentcore-hub-build
  *   CI_PROJECT      default agentcore-hub-ci
+ *   DEPLOY_PROJECT  default agentcore-hub-deploy   (the Deploy stage's CodeBuild
+ *                   project — same NAME as the pipeline, different resource kind)
  *   AWS_REGION      default us-east-1
  */
 
@@ -47,6 +49,10 @@ const ROLE_NAME = "agentcore-hub-pipeline-tools-role";
 const PIPELINE_NAME = process.env.PIPELINE_NAME || "agentcore-hub-deploy";
 const BUILD_PROJECT = process.env.BUILD_PROJECT || "agentcore-hub-build";
 const CI_PROJECT = process.env.CI_PROJECT || "agentcore-hub-ci";
+// The Deploy stage's CodeBuild project. Shares its NAME with PIPELINE_NAME (the
+// CodePipeline) but is a DIFFERENT AWS resource kind — keep the two constants
+// distinct; do not collapse them.
+const DEPLOY_PROJECT = process.env.DEPLOY_PROJECT || "agentcore-hub-deploy";
 
 const iam = new IAMClient({ region: REGION });
 const lambda = new LambdaClient({ region: REGION });
@@ -62,10 +68,11 @@ console.log(`Account:  ${ACCOUNT}`);
 console.log(`Region:   ${REGION}`);
 console.log(`Pipeline: ${PIPELINE_NAME}`);
 
-// ─── 1. IAM role (scoped to exactly this pipeline + its two CodeBuild projects) ─
+// ─── 1. IAM role (scoped to exactly this pipeline + its three CodeBuild projects) ─
 const pipelineArn = `arn:aws:codepipeline:${REGION}:${ACCOUNT}:${PIPELINE_NAME}`;
 const buildArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${BUILD_PROJECT}`;
 const ciArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${CI_PROJECT}`;
+const deployArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${DEPLOY_PROJECT}`;
 
 const inlinePolicy = {
   Version: "2012-10-17",
@@ -89,10 +96,13 @@ const inlinePolicy = {
       Resource: pipelineArn,
     },
     {
+      // Read-only build visibility, incl. the Deploy stage's own CodeBuild
+      // project (agentcore-hub-deploy) so get_build_log can read the intentional
+      // exit-2 "HANDOFF" signal. Still NO approval/write action of any kind.
       Sid: "BuildRead",
       Effect: "Allow",
       Action: ["codebuild:BatchGetBuilds", "codebuild:ListBuildsForProject"],
-      Resource: [buildArn, ciArn],
+      Resource: [buildArn, ciArn, deployArn],
     },
     {
       Sid: "BuildLogRead",
@@ -101,6 +111,7 @@ const inlinePolicy = {
       Resource: [
         `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${BUILD_PROJECT}:*`,
         `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${CI_PROJECT}:*`,
+        `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${DEPLOY_PROJECT}:*`,
       ],
     },
   ],
@@ -151,6 +162,7 @@ const envVars = {
   PIPELINE_NAME,
   BUILD_PROJECT,
   CI_PROJECT,
+  DEPLOY_PROJECT,
 };
 
 // ─── 3. Create/update the function ──────────────────────────────────────────────
