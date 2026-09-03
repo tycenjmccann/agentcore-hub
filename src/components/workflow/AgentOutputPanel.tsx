@@ -392,7 +392,16 @@ export default function AgentOutputPanel({
   const agentName = task ? formatAgentName(task.agentId) : "Agent Output";
   const isRunning = task?.status === "running";
 
-  const statusClass = task?.status === "running"
+  // A stale live agent must not be headlined "Working" (or its raw status)
+  // while the footer says STUCK — header and footer derive from the same
+  // staleness flag, under the same status predicate the board card uses
+  // (running OR waiting_response, TEAM-3881 F3).
+  const isStalledLive =
+    !!isStale && (task?.status === "running" || task?.status === "waiting_response");
+
+  const statusClass = isStalledLive
+    ? "error"
+    : task?.status === "running"
     ? "running"
     : task?.status === "complete"
     ? "complete"
@@ -400,7 +409,9 @@ export default function AgentOutputPanel({
     ? "error"
     : "";
 
-  const statusLabel = task?.status === "running"
+  const statusLabel = isStalledLive
+    ? "Stalled"
+    : task?.status === "running"
     ? "Working"
     : task?.status === "complete"
     ? "Complete"
