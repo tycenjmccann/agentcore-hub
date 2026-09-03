@@ -417,7 +417,7 @@ export async function POST(req: NextRequest) {
     if (body.sourceTicket) {
       const dedup = await resolveDedup(body.sourceTicket, def.id);
       if (dedup.coalesce) {
-        return NextResponse.json({ workflowId: dedup.coalesce, deduplicated: true });
+        return NextResponse.json({ workflowId: dedup.coalesce, deduplicated: true, ...responseMeta });
       }
       workflowId = dedup.proceed;
       // TEAM-3703: markerId is set iff this run was minted through dedup — the
@@ -500,7 +500,7 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
           `(${(cleanupErr as Error).message}) — manual cleanup required.`
       );
     }
-    return NextResponse.json({ workflowId: fence.winner, deduplicated: true });
+    return NextResponse.json({ workflowId: fence.winner, deduplicated: true, ...responseMeta });
   }
 
   // 3. Create the intake ticket in Jira (assigned to the workflow's intake agent).
@@ -632,7 +632,7 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
           `(${(cleanupErr as Error).message}) — manual cleanup required.`
       );
     }
-    return NextResponse.json({ workflowId: fence.winner, deduplicated: true });
+    return NextResponse.json({ workflowId: fence.winner, deduplicated: true, ...responseMeta });
   }
 
   // 4. Create the intake ticket via ticket tools Lambda

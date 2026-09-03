@@ -732,3 +732,97 @@ describe("POST /api/workflow/start — orphan-epic cleanup on fence loss (TEAM-3
     });
   });
 });
+
+/**
+ * TEAM-3872 — FR3b override metadata on DEDUPLICATED responses (review finding
+ * on TEAM-3832 / PR #306).
+ *
+ * FR3b: a caller supplying BOTH workflowDefId and a contradicting workflowType
+ * must get `workflowTypeOverridden: true` plus a human-readable `note` in the
+ * JSON response — and the contract does not exempt deduplicated responses. The
+ * defect: `responseMeta` was spread into the two normal success returns but
+ * omitted from all three deduplicated returns (the POST coalesce early-return
+ * and both fence-loss returns), so a redelivery/race with contradicting inputs
+ * got a bare `{ workflowId, deduplicated: true }`.
+ *
+ * The harness DEF ("software-delivery") carries no `type` → derives "feature",
+ * so `workflowType: "bug"` alongside it is the contradicting pair.
+ */
+describe("POST /api/workflow/start — FR3b override note on deduplicated responses (TEAM-3872)", () => {
+  const CONTRA = { sourceTicket: "TEAM-9", workflowDefId: "software-delivery", workflowType: "bug" };
+
+  it("coalesce redelivery with contradicting inputs → deduplicated:true AND workflowTypeOverridden:true + note", async () => {
+    const first = await (await post({ title: "t", ...CONTRA })).json();
+    expect(first.workflowTypeOverridden).toBe(true); // sanity: the normal path already carried it
+    // Mark the canonical run non-terminal so the redelivery coalesces.
+    h.store.set(first.workflowId, { workflowId: first.workflowId, phase: "development" });
+
+    const res = await post({ title: "t again", ...CONTRA });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toMatchObject({ workflowId: first.workflowId, deduplicated: true, workflowTypeOverridden: true });
+    expect(typeof body.note).toBe("string");
+    expect(body.note.length).toBeGreaterThan(0);
+  });
+
+  it("coalesce redelivery with AGREEING inputs stays clean — no override flag, no note", async () => {
+    const agree = { sourceTicket: "TEAM-9", workflowDefId: "software-delivery", workflowType: "feature" };
+    const first = await (await post({ title: "t", ...agree })).json();
+    h.store.set(first.workflowId, { workflowId: first.workflowId, phase: "development" });
+
+    const res = await post({ title: "t again", ...agree });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.deduplicated).toBe(true);
+    expect(body.workflowTypeOverridden).toBeUndefined();
+    expect(body.note).toBeUndefined();
+  });
+
+  /** >grace overlap (same shape as TEAM-3705's raceOverlap) where the STALLED
+   *  loser A carries the contradicting pair; racer B wins the marker. */
+  async function raceOverlapContra(send: (body: Record<string, unknown>) => Promise<Response>) {
+    let bBody: { workflowId: string; deduplicated?: boolean } | undefined;
+    h.onInvoke = async () => {
+      const m = h.store.get(markerId9())!;
+      m.createdAt = new Date(Date.now() - 10 * 60_000).toISOString();
+      h.store.set(markerId9(), m);
+      bBody = await (await send({ title: "B", sourceTicket: "TEAM-9", workflowDefId: "software-delivery" })).json();
+    };
+    const aRes = await send({ title: "A", ...CONTRA });
+    return { aRes, aBody: await aRes.json(), bBody: bBody! };
+  }
+
+  it("dynamodb fence-loss deduplicated response carries the override flag + note", async () => {
+    const { aRes, aBody, bBody } = await raceOverlapContra(post);
+    expect(aRes.status).toBe(200);
+    expect(aBody).toMatchObject({ workflowId: bBody.workflowId, deduplicated: true, workflowTypeOverridden: true });
+    expect(typeof aBody.note).toBe("string");
+    expect(aBody.note.length).toBeGreaterThan(0);
+  });
+
+  describe("jira backend", () => {
+    let jiraPost: (body: Record<string, unknown>) => ReturnType<typeof POST>;
+
+    beforeEach(async () => {
+      process.env.TICKET_PROVIDER = "jira";
+      vi.resetModules();
+      const mod = await import("./route");
+      jiraPost = (body) =>
+        mod.POST(
+          new NextRequest("http://localhost/api/workflow/start", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          })
+        );
+    });
+
+    it("jira fence-loss deduplicated response carries the override flag + note", async () => {
+      const { aRes, aBody, bBody } = await raceOverlapContra(jiraPost);
+      expect(aRes.status).toBe(200);
+      expect(aBody).toMatchObject({ workflowId: bBody.workflowId, deduplicated: true, workflowTypeOverridden: true });
+      expect(typeof aBody.note).toBe("string");
+      expect(aBody.note.length).toBeGreaterThan(0);
+    });
+  });
+});
