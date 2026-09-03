@@ -3,6 +3,7 @@ import {
   computeStaleAgentIds,
   isStaleEligibleStatus,
   seedLastActivityByAgent,
+  seedLastToolByAgent,
   STALE_THRESHOLD_DEFAULT_MS,
   STALE_THRESHOLD_CLAUDE_CODE_MS,
 } from "@/lib/workflow/stale";
@@ -166,6 +167,72 @@ describe("per-agent stuck detection (TEAM-3881)", () => {
       { type: "tool_use", agentId: "agentX", timestamp: iso(T0 + 60_000) },
     ]);
     expect(seeded.agentX).toBe(T0 + 60_000);
+  });
+
+  it("TEAM-3890: a re-dispatch drops the previous run's claude_code tier", () => {
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const T1 = T0; // run 1's last tool call was claude_code
+    const T2 = T1 + 300_000; // run 2 dispatched
+    const history = [
+      { type: "tool_use", agentId: "agentX", toolName: "claude_code", timestamp: iso(T1) },
+      { type: "agent_status", agentId: "agentX", status: "running", timestamp: iso(T2) },
+    ];
+    const lastToolByAgent = seedLastToolByAgent(history);
+    // Pre-fix: run 1's claude_code survived the dispatch, so a run 2 that
+    // died before its first tool call inherited the 17-min window instead of
+    // the default 3-min tier.
+    expect(lastToolByAgent.agentX).toBeUndefined();
+    const lastActivityByAgent = { ...seedLastActivityByAgent(history) }; // clock = T2 (TEAM-3888)
+    expect(lastActivityByAgent.agentX).toBe(T2);
+    // Dead run 2 (no events after dispatch) trips STUCK at T2 + 4min…
+    expect(
+      computeStaleAgentIds({
+        now: T2 + 240_000,
+        tasks: { agentX: { status: "running" } },
+        lastActivityByAgent,
+        lastToolByAgent,
+      })
+    ).toEqual(["agentX"]);
+    // …control 1: but not at T2 + 1min (dispatch anchor intact).
+    expect(
+      computeStaleAgentIds({
+        now: T2 + 60_000,
+        tasks: { agentX: { status: "running" } },
+        lastActivityByAgent,
+        lastToolByAgent,
+      })
+    ).toEqual([]);
+  });
+
+  it("TEAM-3890: a tool_use AFTER the dispatch restores that run's own tier", () => {
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const T2 = T0 + 300_000;
+    const T3 = T2 + 30_000; // run 2 goes dark inside its own claude_code call
+    const history = [
+      { type: "tool_use", agentId: "agentX", toolName: "claude_code", timestamp: iso(T0) },
+      { type: "agent_status", agentId: "agentX", status: "running", timestamp: iso(T2) },
+      { type: "tool_use", agentId: "agentX", toolName: "claude_code", timestamp: iso(T3) },
+    ];
+    const lastToolByAgent = seedLastToolByAgent(history);
+    expect(lastToolByAgent.agentX).toBe("claude_code");
+    // Run 2 earned the 17-min window itself: not stale 4min into its call…
+    expect(
+      computeStaleAgentIds({
+        now: T3 + 240_000,
+        tasks: { agentX: { status: "running" } },
+        lastActivityByAgent: { ...seedLastActivityByAgent(history) },
+        lastToolByAgent,
+      })
+    ).toEqual([]);
+    // …and still trips past the long window.
+    expect(
+      computeStaleAgentIds({
+        now: T3 + STALE_THRESHOLD_CLAUDE_CODE_MS + 1,
+        tasks: { agentX: { status: "running" } },
+        lastActivityByAgent: { ...seedLastActivityByAgent(history) },
+        lastToolByAgent,
+      })
+    ).toEqual(["agentX"]);
   });
 
   it("F4: agent_status/agent_complete are not liveness for seeding, but anchor a never-emitting agent", () => {
