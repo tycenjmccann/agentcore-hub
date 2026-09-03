@@ -121,8 +121,8 @@ export const WORKFLOW_TOOLS = [
           description:
             "DEPRECATED — use workflowDefId to select the pipeline. Back-compat alias only: without workflowDefId it " +
             "maps 'bug' → the 'bug-fix' def and 'feature' → the default 'software-delivery' def; when workflowDefId is " +
-            "also supplied the def wins and the stored workflowType is derived from it (the response then carries " +
-            "workflowTypeOverridden: true).",
+            "also supplied the def wins and the stored workflowType is derived from it (when they contradict, the " +
+            "response carries workflowTypeOverridden: true plus a note).",
         },
         workflowDefId: {
           type: "string",
