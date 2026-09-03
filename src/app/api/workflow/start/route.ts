@@ -17,6 +17,7 @@ import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { validateIntakeSources } from "@/lib/workflow/intake";
 import type { WorkflowInput } from "@/lib/workflow/types";
 import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
+import { workflowTypeForDef } from "@/lib/workflow/workflow-defs";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -347,7 +348,10 @@ export async function POST(req: NextRequest) {
     // so routine defs created by the Routine Builder resolve here. An unknown id
     // is a HARD 400 — never silently fall back to software-delivery, which would
     // run the full dev pipeline with the wrong intake agent on a schedule.
-    // An absent id means the caller wants the default (checked-in) pipeline.
+    // TEAM-3832: workflowDefId is the SOLE pipeline selector. An absent id with
+    // a legacy workflowType maps to the def the caller intended ("bug" →
+    // bug-fix, "feature" → the default) instead of stamping a contradictory
+    // label on the default pipeline; absent both means the default pipeline.
     let def: WorkflowDef | null;
     if (body.workflowDefId) {
       def = await resolveWorkflowDef(body.workflowDefId);
@@ -358,11 +362,28 @@ export async function POST(req: NextRequest) {
         );
       }
     } else {
-      def = await resolveWorkflowDef("software-delivery");
+      const mappedDefId = body.workflowType === "bug" ? "bug-fix" : "software-delivery";
+      def = await resolveWorkflowDef(mappedDefId);
       if (!def) {
-        return NextResponse.json({ error: "Default workflow def unavailable" }, { status: 500 });
+        return NextResponse.json({ error: `Default workflow def "${mappedDefId}" unavailable` }, { status: 500 });
       }
     }
+
+    // TEAM-3832 FR2/FR3b: the persisted workflowType is DERIVED from the
+    // resolved def (workflowTypeForDef) — never copied from input — so it can
+    // never contradict workflowDefId. When the caller supplied a contradicting
+    // workflowType alongside workflowDefId, the def wins and the response says
+    // so instead of silently mislabeling the run.
+    const derivedWorkflowType = workflowTypeForDef(def);
+    const responseMeta: StartResponseMeta =
+      body.workflowType !== undefined && body.workflowType !== derivedWorkflowType
+        ? {
+            workflowTypeOverridden: true,
+            note:
+              `workflowType "${body.workflowType}" was ignored: the "${def.id}" workflow def is the ` +
+              `pipeline selector and derives workflowType "${derivedWorkflowType}".`,
+          }
+        : {};
 
     // repoConfig is only required for defs that actually check out a repo
     // (requiresRepo). Marketing/legal/sales and most routines don't touch code.
@@ -406,9 +427,9 @@ export async function POST(req: NextRequest) {
     }
 
     if (TICKET_PROVIDER === "jira") {
-      return await startWithJira(body, def, workflowId, markerId);
+      return await startWithJira(body, def, workflowId, markerId, responseMeta);
     } else {
-      return await startWithDynamoDB(body, def, workflowId, markerId);
+      return await startWithDynamoDB(body, def, workflowId, markerId, responseMeta);
     }
   } catch (err) {
     console.error("Workflow start error:", err);
@@ -418,7 +439,11 @@ export async function POST(req: NextRequest) {
 
 // ─── Jira Cloud Backend ────────────────────────────────────────────────────────
 
-async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string) {
+/** TEAM-3832 FR3b: success-response extras when a caller-supplied workflowType
+ *  contradicted the resolved def and was overridden (the def always wins). */
+type StartResponseMeta = { workflowTypeOverridden?: true; note?: string };
+
+async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}) {
   const { JiraCloudProvider } = await import("@/lib/workflow/ticket-provider-jira");
   const jira = new JiraCloudProvider();
 
@@ -449,7 +474,8 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
     humanNotifications: [],
     startedAt: new Date().toISOString(),
     ticketProvider: "jira",
-    workflowType: body.workflowType || "feature",
+    // TEAM-3832 FR2: derived from the resolved def — never from caller input.
+    workflowType: workflowTypeForDef(def),
     workflowDefId: def.id,
     ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
   }, markerId);
@@ -504,12 +530,12 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
     throw err;
   }
 
-  return NextResponse.json({ workflowId, epicId });
+  return NextResponse.json({ workflowId, epicId, ...responseMeta });
 }
 
 // ─── DynamoDB Backend (via ticket tools Lambda) ──────────────────────────────
 
-async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string) {
+async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}) {
   const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
   const intakePhaseName = def.phases.find((p) => p.type === "agent")?.name || "Intake";
   const workflowId = presetWorkflowId || mintWorkflowId();
@@ -552,7 +578,8 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
     messages: [],
     humanNotifications: [],
     startedAt: new Date().toISOString(),
-    workflowType: body.workflowType || "feature",
+    // TEAM-3832 FR2: derived from the resolved def — never from caller input.
+    workflowType: workflowTypeForDef(def),
     workflowDefId: def.id,
     ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
   }, markerId);
@@ -638,7 +665,7 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
 
   console.log(`[start] Workflow ${workflowId} created. Epic: ${epicId}. Requirements ticket ${reqTicketId} will trigger first.`);
 
-  return NextResponse.json({ workflowId, epicId });
+  return NextResponse.json({ workflowId, epicId, ...responseMeta });
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────

@@ -49,6 +49,10 @@ export const WorkflowInputSchema = z.object({
   repoConfig: RepoConfigSchema,
   sources: z.array(IntakeSourceSchema).optional().default([]),
   modelOverride: ModelOverrideSchema,
+  // TEAM-3832: workflowType is a DEPRECATED back-compat alias — workflowDefId
+  // is the pipeline selector. Without workflowDefId the API maps "bug" → the
+  // "bug-fix" def and "feature" → the default; on conflict the def wins and
+  // the stored type is derived from it. Still accepted here — do not remove.
   workflowType: z.enum(["feature", "bug"]).optional(),
   workflowDefId: z.string().optional(),
   reviewGates: z.array(z.string()).optional(),
