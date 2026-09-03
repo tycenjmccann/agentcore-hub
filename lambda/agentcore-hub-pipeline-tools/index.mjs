@@ -25,10 +25,12 @@
  *   PIPELINE_NAME       default "agentcore-hub-deploy"  (the CodePipeline)
  *   BUILD_PROJECT       default "agentcore-hub-build"
  *   CI_PROJECT          default "agentcore-hub-ci"
- *   DEPLOY_PROJECT      default "agentcore-hub-deploy"  (the Deploy stage's
- *                       CodeBuild project — same name as the pipeline, different
- *                       resource kind; its build/logs are readable via
- *                       get_build_log project="agentcore-hub-deploy")
+ *   DEPLOY_PROJECT      set on this Lambda by deploy/setup-pipeline-tools-lambda.mjs
+ *                       (which also uses it for IAM scoping) but NOT read by this
+ *                       code — to reach the Deploy stage's CodeBuild project
+ *                       (same name as the pipeline, different resource kind),
+ *                       callers pass project="agentcore-hub-deploy" explicitly
+ *                       to get_build_log
  *   REGION              default from AWS_REGION
  */
 
@@ -110,7 +112,7 @@ export const handler = async (event) => {
 // old run as this run's completion).
 async function getState(args = {}) {
   const name = args.pipeline_name || PIPELINE_NAME;
-  const executionId = (args.execution_id || "").trim();
+  const executionId = String(args.execution_id || "").trim();
   const state = await cp.send(new GetPipelineStateCommand({ name }));
 
   const stages = (state.stageStates || []).map((s) => ({
@@ -136,23 +138,44 @@ async function getState(args = {}) {
     : stages;
   const matchesExecution = executionId ? scopedStages.length > 0 : undefined;
 
-  // The pipeline is "terminal" for a given execution when no stage is InProgress.
-  const anyInProgress = scopedStages.some(
-    (s) =>
-      s.status === "InProgress" ||
-      s.actions.some((a) => a.status === "InProgress")
-  );
-  const anyFailed = scopedStages.some(
-    (s) =>
-      s.status === "Failed" ||
-      s.actions.some((a) => a.status === "Failed")
-  );
-  // With execution scoping, ZERO matching stages means the new run isn't visible
-  // yet — that must NOT read as "terminal" (it's the old run's state we'd be
-  // reporting). Force terminal:false until at least one stage matches.
-  const terminal = executionId
-    ? matchesExecution && !anyInProgress
-    : !anyInProgress;
+  let anyInProgress, anyFailed, terminal;
+  if (executionId) {
+    // Scoped path: STAGE-LEVEL status only. actionStates carry no execution id,
+    // so a lingering Failed/InProgress action left over from the PREVIOUS run
+    // inside a stage whose latestExecution already matches the new id would
+    // corrupt the verdict — stage.latestExecution is authoritative for the
+    // matched execution. "Stopped" is a failure disposition too (the run will
+    // never advance past a stopped stage).
+    anyInProgress = scopedStages.some((s) => s.status === "InProgress");
+    anyFailed = scopedStages.some(
+      (s) => s.status === "Failed" || s.status === "Stopped"
+    );
+    // Terminal only when the requested execution has a terminal disposition
+    // across the WHOLE pipeline: either every stage has caught up to this
+    // execution, or a matching stage Failed/Stopped. A Succeeded prefix with
+    // later stages still on an older executionId is the mid-transition window
+    // (e.g. Source done, Build not yet started) — NOT terminal, keep polling.
+    // And ZERO matching stages means the new run isn't visible on any stage
+    // yet — never read the old run's state as this run's completion.
+    const allStagesMatch =
+      matchesExecution && scopedStages.length === stages.length;
+    terminal =
+      matchesExecution && !anyInProgress && (allStagesMatch || anyFailed);
+  } else {
+    // Unscoped path (execution_id omitted): the pre-execution-scoped behavior,
+    // action-level checks included. Terminal when no stage/action is InProgress.
+    anyInProgress = scopedStages.some(
+      (s) =>
+        s.status === "InProgress" ||
+        s.actions.some((a) => a.status === "InProgress")
+    );
+    anyFailed = scopedStages.some(
+      (s) =>
+        s.status === "Failed" ||
+        s.actions.some((a) => a.status === "Failed")
+    );
+    terminal = !anyInProgress;
+  }
   const pipelineExecutionId =
     executionId ||
     state.stageStates?.[0]?.latestExecution?.pipelineExecutionId;

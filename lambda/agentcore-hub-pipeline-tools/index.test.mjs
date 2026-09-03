@@ -20,6 +20,12 @@
  *  3. start_deploy sent no clientRequestToken, so a retried tool call
  *     double-triggered the pipeline. Now: commit_sha derives a charset/length-
  *     valid token; no sha → token OMITTED (never empty/invalid).
+ *  4. (TEAM-3871) Scoped get_state declared terminal:true when only a PREFIX
+ *     of stages had reached the new execution (Source done, Build not started),
+ *     and stale action statuses from the previous run bled into the scoped
+ *     verdict. Now: terminal requires a whole-pipeline disposition (all stages
+ *     match, or a matching stage Failed/Stopped), scoped status is stage-level
+ *     only, and execution_id is String()-coerced.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -184,11 +190,134 @@ describe("get_state execution scoping (the post-start_deploy race)", () => {
 
     const out = await invoke("get_state", { execution_id: "NEW" });
 
-    // The OLD run's failure must not bleed into the NEW run's verdict.
+    // The OLD run's failure must not bleed into the NEW run's verdict — but a
+    // partial match with no matching failure is NOT terminal either (TEAM-3871:
+    // terminal requires the WHOLE pipeline to have a disposition for this run).
     expect(out.matchesExecution).toBe(true);
     expect(out.failed).toBe(false);
+    expect(out.terminal).toBe(false);
+    expect(out.succeeded).toBe(false);
+  });
+
+  // ── TEAM-3871 regressions ──────────────────────────────────────────────────
+
+  it("a prefix of stages Succeeded on NEW + later stages still on OLD → terminal:false (transition window)", async () => {
+    // The Source→Build handoff window: Source already flipped to NEW and
+    // Succeeded, but Build/Deploy still show the OLD run. Nothing is
+    // InProgress, yet the NEW run is provably NOT done — Build hasn't started.
+    h.state.getPipelineStateImpl = async () => ({
+      stageStates: [
+        {
+          stageName: "Source",
+          latestExecution: { status: "Succeeded", pipelineExecutionId: "NEW" },
+          actionStates: [
+            { actionName: "GitHub_main", latestExecution: { status: "Succeeded" } },
+          ],
+        },
+        {
+          stageName: "Build",
+          latestExecution: { status: "Succeeded", pipelineExecutionId: "OLD" },
+          actionStates: [
+            { actionName: "Build_and_gate", latestExecution: { status: "Succeeded" } },
+          ],
+        },
+        {
+          stageName: "Deploy",
+          latestExecution: { status: "Succeeded", pipelineExecutionId: "OLD" },
+          actionStates: [
+            { actionName: "Deploy_action", latestExecution: { status: "Succeeded" } },
+          ],
+        },
+      ],
+    });
+
+    const out = await invoke("get_state", { execution_id: "NEW" });
+
+    expect(out.matchesExecution).toBe(true);
+    expect(out.terminal).toBe(false);
+    expect(out.succeeded).toBe(false);
+    expect(out.failed).toBe(false);
+  });
+
+  it("a matching stage Failed → terminal:true + failed:true even with later stages still on OLD", async () => {
+    // A failure disposition on the requested execution IS terminal — the run
+    // will never advance past the failed stage, so waiting for the remaining
+    // stages to "catch up" would poll forever.
+    h.state.getPipelineStateImpl = async () => ({
+      stageStates: [
+        {
+          stageName: "Source",
+          latestExecution: { status: "Failed", pipelineExecutionId: "NEW" },
+          actionStates: [],
+        },
+        {
+          stageName: "Build",
+          latestExecution: { status: "Succeeded", pipelineExecutionId: "OLD" },
+          actionStates: [],
+        },
+      ],
+    });
+
+    const out = await invoke("get_state", { execution_id: "NEW" });
+
+    expect(out.matchesExecution).toBe(true);
+    expect(out.terminal).toBe(true);
+    expect(out.failed).toBe(true);
+    expect(out.succeeded).toBe(false);
+  });
+
+  it("stale Failed action inside a matching InProgress stage does NOT mark the run failed", async () => {
+    // actionStates carry no execution id: a lingering Failed action from the
+    // PREVIOUS run can sit inside a stage whose latestExecution already matches
+    // the NEW id. Scoped status must come from the STAGE level only.
+    h.state.getPipelineStateImpl = async () => ({
+      stageStates: [
+        {
+          stageName: "Build",
+          latestExecution: { status: "InProgress", pipelineExecutionId: "NEW" },
+          actionStates: [
+            { actionName: "Build_and_gate", latestExecution: { status: "Failed" } },
+          ],
+        },
+      ],
+    });
+
+    const out = await invoke("get_state", { execution_id: "NEW" });
+
+    expect(out.matchesExecution).toBe(true);
+    expect(out.failed).toBe(false);
+    expect(out.terminal).toBe(false);
+    expect(out.succeeded).toBe(false);
+  });
+
+  it("stale InProgress action inside all-green matching stages does NOT block terminal on the scoped path", async () => {
+    h.state.getPipelineStateImpl = async () => {
+      const state = allGreenStages("NEW");
+      state.stageStates[1].actionStates.push({
+        actionName: "stale_leftover",
+        latestExecution: { status: "InProgress" },
+      });
+      return state;
+    };
+
+    const out = await invoke("get_state", { execution_id: "NEW" });
+
+    expect(out.matchesExecution).toBe(true);
     expect(out.terminal).toBe(true);
     expect(out.succeeded).toBe(true);
+    expect(out.failed).toBe(false);
+  });
+
+  it("a numeric execution_id does not throw and behaves like its string form", async () => {
+    h.state.getPipelineStateImpl = async () => allGreenStages("123");
+
+    const asNumber = await invoke("get_state", { execution_id: 123 });
+    const asString = await invoke("get_state", { execution_id: "123" });
+
+    expect(asNumber.matchesExecution).toBe(true);
+    expect(asNumber.terminal).toBe(true);
+    expect(asNumber.succeeded).toBe(true);
+    expect(asNumber).toEqual(asString);
   });
 
   it("back-compat: omitted execution_id keeps today's unscoped behavior", async () => {
@@ -201,6 +330,24 @@ describe("get_state execution scoping (the post-start_deploy race)", () => {
     expect(out.failed).toBe(false);
     // matchesExecution is an execution-scoped concept — absent without the arg.
     expect(out).not.toHaveProperty("matchesExecution");
+  });
+
+  it("back-compat: omitted execution_id still honors ACTION-level statuses", async () => {
+    // The unscoped path keeps its pre-TEAM-3871 behavior byte-for-byte: an
+    // InProgress or Failed action counts even when the stage status disagrees.
+    h.state.getPipelineStateImpl = async () => {
+      const state = allGreenStages("OLD");
+      state.stageStates[1].actionStates.push({
+        actionName: "lagging_action",
+        latestExecution: { status: "InProgress" },
+      });
+      return state;
+    };
+
+    const out = await invoke("get_state", {});
+
+    expect(out.terminal).toBe(false);
+    expect(out.succeeded).toBe(false);
   });
 });
 
