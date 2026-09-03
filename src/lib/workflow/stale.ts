@@ -23,6 +23,16 @@ export function isLivenessEvent(type: string): boolean {
   return LIVENESS_EVENT_TYPES.has(type);
 }
 
+/** True if this event is a dispatch — the orchestrator (re)starting the agent
+ *  (agent_status → running). A dispatch is NOT liveness (a dead session emits
+ *  no more of them), but it anchors/restarts the agent's idle clock: the live
+ *  handler and page-load seeding must classify it identically, or a reload
+ *  right after a re-dispatch falsely trips STUCK off the previous run's last
+ *  liveness timestamp (TEAM-3888). */
+export function isDispatchEvent(type: string, status?: string): boolean {
+  return type === "agent_status" && status === "running";
+}
+
 /** The STUCK verdict: a running agent whose idle time exceeds the threshold. */
 export function computeIsStale(opts: {
   now: number;
@@ -74,26 +84,32 @@ export function computeStaleAgentIds(opts: {
 }
 
 /** Seed per-agent activity clocks from historical events (page-load catch-up),
- *  classified by the same isLivenessEvent the live path uses — so tool_end
- *  counts and agent_status/agent_complete do not (TEAM-3881 F4). An agent with
- *  NO liveness events anchors at its last event of any kind (its dispatch),
- *  so a session that died before emitting anything still trips immediately on
- *  load instead of a full threshold later. */
+ *  classified by the same predicates the live path uses: isLivenessEvent
+ *  (tool_end counts, agent_status/agent_complete don't — TEAM-3881 F4) and
+ *  isDispatchEvent (a re-dispatch restarts the clock, exactly like the live
+ *  handler's agent_status → running anchor — TEAM-3888; without it, run 1's
+ *  old liveness timestamp shadows a newer run-2 dispatch and a reload before
+ *  run 2's first output falsely trips STUCK). An agent with NO liveness or
+ *  dispatch events anchors at its last event of any kind, so a session that
+ *  died before emitting anything still trips immediately on load instead of
+ *  a full threshold later. */
 export function seedLastActivityByAgent(
-  events: { type: string; agentId?: string; timestamp?: string }[]
+  events: { type: string; agentId?: string; status?: string; timestamp?: string }[]
 ): Record<string, number> {
-  const liveness: Record<string, number> = {};
+  const clock: Record<string, number> = {};
   const anchor: Record<string, number> = {};
   for (const ev of events) {
     if (!ev.agentId) continue;
     const ts = ev.timestamp ? new Date(ev.timestamp).getTime() : NaN;
     if (isNaN(ts) || ts <= 0) continue;
-    if (isLivenessEvent(ev.type)) liveness[ev.agentId] = ts;
+    if (isLivenessEvent(ev.type) || isDispatchEvent(ev.type, ev.status)) {
+      clock[ev.agentId] = Math.max(clock[ev.agentId] ?? 0, ts);
+    }
     anchor[ev.agentId] = ts;
   }
   const seeded: Record<string, number> = {};
   for (const agentId of Object.keys(anchor)) {
-    seeded[agentId] = liveness[agentId] ?? anchor[agentId];
+    seeded[agentId] = clock[agentId] ?? anchor[agentId];
   }
   return seeded;
 }

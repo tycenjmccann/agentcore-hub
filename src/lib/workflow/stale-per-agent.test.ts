@@ -124,6 +124,50 @@ describe("per-agent stuck detection (TEAM-3881)", () => {
     expect(seeded.agentA).toBe(T0 + 120_000);
   });
 
+  it("TEAM-3888: a re-dispatch AFTER the last liveness event advances the seeded clock", () => {
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const T1 = T0; // run 1's last tool event
+    const T2 = T1 + STALE_THRESHOLD_DEFAULT_MS + 60_000; // run 2 dispatched later
+    const history = [
+      { type: "tool_use", agentId: "agentX", timestamp: iso(T1) },
+      { type: "agent_status", agentId: "agentX", status: "running", timestamp: iso(T2) },
+    ];
+    const seeded = seedLastActivityByAgent(history);
+    // Pre-fix: run-1 liveness (T1) shadowed the newer run-2 dispatch, so a
+    // page reload right after re-dispatch tripped a false STUCK on the first
+    // interval tick before run 2 emitted anything.
+    expect(seeded.agentX).toBe(T2);
+    expect(
+      computeStaleAgentIds({
+        now: T2 + 60_000,
+        tasks: { agentX: { status: "running" } },
+        lastActivityByAgent: { ...seeded },
+        lastToolByAgent: {},
+      })
+    ).toEqual([]);
+    // Control: the same history WITHOUT the post-T1 dispatch IS stale — the
+    // dispatch anchor must not weaken genuine dead-agent detection.
+    const control = seedLastActivityByAgent([history[0]]);
+    expect(control.agentX).toBe(T1);
+    expect(
+      computeStaleAgentIds({
+        now: T2 + 60_000,
+        tasks: { agentX: { status: "running" } },
+        lastActivityByAgent: { ...control },
+        lastToolByAgent: {},
+      })
+    ).toEqual(["agentX"]);
+  });
+
+  it("TEAM-3888: a dispatch OLDER than the last liveness event does not rewind the clock", () => {
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const seeded = seedLastActivityByAgent([
+      { type: "agent_status", agentId: "agentX", status: "running", timestamp: iso(T0) },
+      { type: "tool_use", agentId: "agentX", timestamp: iso(T0 + 60_000) },
+    ]);
+    expect(seeded.agentX).toBe(T0 + 60_000);
+  });
+
   it("F4: agent_status/agent_complete are not liveness for seeding, but anchor a never-emitting agent", () => {
     const iso = (ms: number) => new Date(ms).toISOString();
     const seeded = seedLastActivityByAgent([

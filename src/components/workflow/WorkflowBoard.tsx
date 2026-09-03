@@ -14,7 +14,7 @@ import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePha
 import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
 import { applyAgentStatus, applyAgentComplete, shouldForceTicketDone } from "@/lib/workflow/board-state";
-import { isLivenessEvent, computeStaleAgentIds, isStaleEligibleStatus, seedLastActivityByAgent, staleThresholdFor } from "@/lib/workflow/stale";
+import { isLivenessEvent, isDispatchEvent, computeStaleAgentIds, isStaleEligibleStatus, seedLastActivityByAgent, staleThresholdFor } from "@/lib/workflow/stale";
 import { Square, ClipboardCheck } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
@@ -731,7 +731,9 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         // are NOT liveness (a dead session emits no more of them — this is
         // the orchestrator anchoring when the wait began), so they can't keep
         // an agent alive past a threshold of real silence (TEAM-3881 F1).
-        if (event.agentId && event.status === "running") {
+        // Shared predicate so page-load seeding classifies dispatches the
+        // same way (TEAM-3888).
+        if (event.agentId && isDispatchEvent(event.type, event.status)) {
           lastActivityPerAgentRef.current[event.agentId] = Date.now();
           setStaleAgents((prev) => {
             if (!prev.has(event.agentId)) return prev;
