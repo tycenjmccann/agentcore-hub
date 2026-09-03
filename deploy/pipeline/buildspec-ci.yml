@@ -74,7 +74,8 @@ phases:
         pip install -q -r deploy/runtime-agent/tests/requirements-test.txt
         pytest -q deploy/runtime-agent/tests \
           deploy/runtime-agent/test_telemetry_init.py \
-          deploy/runtime-agent/test_build_env_vars.py
+          deploy/runtime-agent/test_build_env_vars.py \
+          deploy/pipeline/test_ecs_primary_container.py
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
       - "bash scripts/check-lambda-zip-manifest.sh"

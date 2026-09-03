@@ -126,6 +126,8 @@ phases:
         echo "Target 3/3 ECS Express roll-by-digest"
         if [ -n "${ECS_SERVICE_ARN:-}" ]; then
           DESC="$(aws ecs describe-express-gateway-service --service-arn "$ECS_SERVICE_ARN" --region "$AWS_REGION_HUB" --output json)"
+          # Fail-closed: the helper exits non-zero on no live container, and VAR="$(cmd)"
+          # propagates that status, so set -euo pipefail aborts here and fires the rollback trap.
           PRIMARY="$(python3 deploy/pipeline/ecs-primary-container.py "$DESC" "${ECR_URI}@${IMAGE_DIGEST}")"
           aws ecs update-express-gateway-service --service-arn "$ECS_SERVICE_ARN" \
             --region "$AWS_REGION_HUB" --primary-container "$PRIMARY" --output text >/dev/null
