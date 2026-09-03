@@ -468,7 +468,10 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
     // Routine-scoped connectors (if any) — forwarded to each agent invoke so
     // the runtime loads their creds/tools for this workflow's run only.
     connectors: body.connectors,
-    input: body,
+    // TEAM-3886: persist the NORMALIZED input — dashboards (WorkflowBoard) pick
+    // rendered phases from input.workflowDefId, so a type-only submission must
+    // carry the resolved def id, matching the top-level row field.
+    input: { ...body, workflowDefId: def.id },
     agentTasks: {},
     messages: [],
     humanNotifications: [],
@@ -573,7 +576,10 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
     // Routine-scoped connectors (if any) — forwarded to each agent invoke so
     // the runtime loads their creds/tools for this workflow's run only.
     connectors: body.connectors,
-    input: body,
+    // TEAM-3886: persist the NORMALIZED input — dashboards (WorkflowBoard) pick
+    // rendered phases from input.workflowDefId, so a type-only submission must
+    // carry the resolved def id, matching the top-level row field.
+    input: { ...body, workflowDefId: def.id },
     agentTasks: {},
     messages: [],
     humanNotifications: [],
