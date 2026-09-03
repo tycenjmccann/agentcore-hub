@@ -32,3 +32,68 @@ export function computeIsStale(opts: {
 }): boolean {
   return opts.hasRunningAgent && opts.now - opts.lastActivityAt > opts.thresholdMs;
 }
+
+/** Statuses an agent can be marked stale in — the ONE predicate shared by the
+ *  board card, the modal prop, and the interval verdict (TEAM-3881 F3). */
+export function isStaleEligibleStatus(status?: string): boolean {
+  return status === "running" || status === "waiting_response";
+}
+
+/** Per-agent STUCK verdicts (TEAM-3881 F1): each agent is judged against its
+ *  OWN activity clock and its OWN tiered threshold, so one busy agent cannot
+ *  keep a dead sibling looking alive (nor lend it the long claude_code
+ *  window). Mutates lastActivityByAgent to anchor a first-observed agent at
+ *  `now` — a never-emitting agent starts its idle clock when first seen
+ *  running and still trips after a full threshold of silence. */
+export function computeStaleAgentIds(opts: {
+  now: number;
+  tasks: Record<string, { status?: string }>;
+  lastActivityByAgent: Record<string, number>;
+  lastToolByAgent: Record<string, string>;
+}): string[] {
+  const stale: string[] = [];
+  for (const [agentId, task] of Object.entries(opts.tasks)) {
+    if (!isStaleEligibleStatus(task.status)) continue;
+    let lastActivityAt = opts.lastActivityByAgent[agentId];
+    if (lastActivityAt === undefined) {
+      opts.lastActivityByAgent[agentId] = opts.now;
+      lastActivityAt = opts.now;
+    }
+    if (
+      computeIsStale({
+        now: opts.now,
+        lastActivityAt,
+        hasRunningAgent: true,
+        thresholdMs: staleThresholdFor(opts.lastToolByAgent[agentId] === "claude_code"),
+      })
+    ) {
+      stale.push(agentId);
+    }
+  }
+  return stale;
+}
+
+/** Seed per-agent activity clocks from historical events (page-load catch-up),
+ *  classified by the same isLivenessEvent the live path uses — so tool_end
+ *  counts and agent_status/agent_complete do not (TEAM-3881 F4). An agent with
+ *  NO liveness events anchors at its last event of any kind (its dispatch),
+ *  so a session that died before emitting anything still trips immediately on
+ *  load instead of a full threshold later. */
+export function seedLastActivityByAgent(
+  events: { type: string; agentId?: string; timestamp?: string }[]
+): Record<string, number> {
+  const liveness: Record<string, number> = {};
+  const anchor: Record<string, number> = {};
+  for (const ev of events) {
+    if (!ev.agentId) continue;
+    const ts = ev.timestamp ? new Date(ev.timestamp).getTime() : NaN;
+    if (isNaN(ts) || ts <= 0) continue;
+    if (isLivenessEvent(ev.type)) liveness[ev.agentId] = ts;
+    anchor[ev.agentId] = ts;
+  }
+  const seeded: Record<string, number> = {};
+  for (const agentId of Object.keys(anchor)) {
+    seeded[agentId] = liveness[agentId] ?? anchor[agentId];
+  }
+  return seeded;
+}
