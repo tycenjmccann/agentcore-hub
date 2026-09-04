@@ -42,6 +42,18 @@ async function autoFilingSwitch(): Promise<"on" | "off" | "unknown"> {
 }
 
 /**
+ * Escape a value interpolated inside a JQL double-quoted string literal.
+ * Backslash first (so we don't double-escape the quotes we add), then the
+ * double quote. Labels are already space-filtered before they reach a query,
+ * but this stays as defense-in-depth for any interpolated value (labels,
+ * project key) so a stray `"` can't break out of the string and malform the
+ * search. See https://support.atlassian.com/jira-software-cloud/docs/jql-fields/
+ */
+function jqlEscape(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/**
  * Short-lived mutex serializing the family-cap check-then-create so concurrent
  * automated filings can't all read count < cap and each open a ticket.
  * Conditional put on the events table; a stale lock (holder crashed) expires
@@ -157,7 +169,13 @@ export async function POST(req: NextRequest) {
     // carries no dedupeLabels but sets origin="workflow-manager". BOTH are
     // automated filings subject to the kill switch; human-relayed bugs (Telegram
     // intake, UI) send neither and are never suppressed.
-    const dedupeLabels = (body.dedupeLabels || []).map((l) => String(l).trim()).filter(Boolean);
+    // Jira labels cannot contain spaces (same filter as extraLabels above) — a
+    // dedupe label with whitespace would be rejected on createIssue and would
+    // also produce malformed JQL below. Drop it rather than search for a label
+    // that can never exist.
+    const dedupeLabels = (body.dedupeLabels || [])
+      .map((l) => String(l).trim())
+      .filter((l) => l && !/\s/.test(l));
     const isWmFiling = dedupeLabels.length > 0 || body.origin === "workflow-manager";
 
     // 0. Kill switch — the operator said stop; enforce it in code, not prompt.
@@ -195,8 +213,8 @@ export async function POST(req: NextRequest) {
       // 1. Exact-signature dedupe: one open bug per signature, occurrences
       //    accumulate as comments.
       const sigJql =
-        `project = "${projectKey}" AND issuetype = Bug AND statusCategory != Done AND ` +
-        dedupeLabels.map((l) => `labels = "${l}"`).join(" AND ") +
+        `project = "${jqlEscape(projectKey)}" AND issuetype = Bug AND statusCategory != Done AND ` +
+        dedupeLabels.map((l) => `labels = "${jqlEscape(l)}"`).join(" AND ") +
         " ORDER BY created DESC";
       const existing = await jira.searchIssues(sigJql, ["summary", "status", "labels"], 1);
       if (existing.issues.length > 0) {
@@ -209,9 +227,9 @@ export async function POST(req: NextRequest) {
       //    (or whose fix run they cancelled) is a "stop reporting this" signal.
       //    Refiling it within the mute window is suppressed outright.
       const mutedJql =
-        `project = "${projectKey}" AND issuetype = Bug AND statusCategory = Done AND ` +
+        `project = "${jqlEscape(projectKey)}" AND issuetype = Bug AND statusCategory = Done AND ` +
         `resolution in ("Won't Do", "Won't Fix", "Duplicate") AND resolved >= -${WONT_DO_MUTE_DAYS}d AND ` +
-        dedupeLabels.map((l) => `labels = "${l}"`).join(" AND ") +
+        dedupeLabels.map((l) => `labels = "${jqlEscape(l)}"`).join(" AND ") +
         " ORDER BY resolved DESC";
       try {
         const muted = await jira.searchIssues(mutedJql, ["summary", "resolution"], 1);
@@ -229,8 +247,8 @@ export async function POST(req: NextRequest) {
       //    newest open bug instead of opening ticket N+1 and burning another
       //    pipeline run.
       const familyJql =
-        `project = "${projectKey}" AND issuetype = Bug AND statusCategory != Done AND ` +
-        `labels = "${dedupeLabels[0]}" ORDER BY created DESC`;
+        `project = "${jqlEscape(projectKey)}" AND issuetype = Bug AND statusCategory != Done AND ` +
+        `labels = "${jqlEscape(dedupeLabels[0])}" ORDER BY created DESC`;
       const openFamily = await jira.searchIssues(familyJql, ["summary"], MAX_OPEN_AUTO_BUGS);
       if (openFamily.issues.length >= MAX_OPEN_AUTO_BUGS) {
         const key = openFamily.issues[0].key;

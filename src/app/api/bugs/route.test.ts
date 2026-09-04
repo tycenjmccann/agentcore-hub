@@ -28,6 +28,11 @@ const h = vi.hoisted(() => ({
   killSwitch: "on" as "on" | "off" | "throw",
   sends: [] as Array<{ name: string; input: unknown }>,
   createCalls: [] as Array<Record<string, unknown>>,
+  // Every searchIssues(jql, ...) the handler runs, in order (sig, mute, family).
+  searchCalls: [] as Array<{ jql: string; fields: unknown; max: unknown }>,
+  // Queued searchIssues results (shifted per call); default is no hits.
+  searchQueue: [] as Array<{ issues: Array<{ key: string }> }>,
+  commentCalls: [] as Array<{ key: string; author: string; content: string }>,
 }));
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
@@ -68,15 +73,16 @@ vi.mock("@/lib/workflow/jira-client", () => {
     static fromEnv() {
       return new JiraClient();
     }
-    async searchIssues() {
-      return { issues: [] as Array<{ key: string }> };
+    async searchIssues(jql: string, fields: unknown, max: unknown) {
+      h.searchCalls.push({ jql, fields, max });
+      return h.searchQueue.shift() ?? { issues: [] as Array<{ key: string }> };
     }
     async createIssue(fields: Record<string, unknown>) {
       h.createCalls.push(fields);
       return { key: "TEAM-9" };
     }
-    async addComment() {
-      /* no-op */
+    async addComment(key: string, author: string, content: string) {
+      h.commentCalls.push({ key, author, content });
     }
   }
   return { JiraClient };
@@ -90,6 +96,9 @@ beforeEach(async () => {
   h.killSwitch = "on";
   h.sends.length = 0;
   h.createCalls.length = 0;
+  h.searchCalls.length = 0;
+  h.searchQueue.length = 0;
+  h.commentCalls.length = 0;
   for (const k of ["TICKET_PROVIDER", "GITHUB_OWNER", "GITHUB_REPO", "JIRA_PROJECT_KEY"]) {
     saved[k] = process.env[k];
   }
@@ -191,5 +200,71 @@ describe("POST /api/bugs — kill switch gates WM free-form + crash filings (TEA
     expect(h.createCalls.length).toBe(1);
     // The wm-config GetCommand is never sent for a non-WM filing.
     expect(getSends().length).toBe(0);
+  });
+});
+
+describe("POST /api/bugs — dedupeLabels are space-filtered + JQL-escaped (TEAM-3920)", () => {
+  // The exact signature query the handler builds for the given (already
+  // space-filtered) label list under the pinned project key "TEAM".
+  const sigJql = (labelClauses: string[]) =>
+    `project = "TEAM" AND issuetype = Bug AND statusCategory != Done AND ` +
+    labelClauses.map((l) => `labels = "${l}"`).join(" AND ") +
+    " ORDER BY created DESC";
+
+  it("a dedupe label containing a space is dropped and never reaches the JQL", async () => {
+    const res = await post({
+      title: "T",
+      description: "D",
+      repo: "owner/name",
+      labels: ["crash-rca", "agent:foo bar"],
+      dedupeLabels: ["crash-rca", "agent:foo bar"],
+    });
+    // No open bug exists (default empty results) → the filing proceeds normally.
+    expect(res.status).toBe(200);
+    expect(h.createCalls.length).toBe(1);
+    // The spaced label is filtered out; only the well-formed one is queried.
+    expect(h.searchCalls.length).toBeGreaterThan(0);
+    const jql = h.searchCalls[0].jql;
+    expect(jql).toBe(sigJql(["crash-rca"]));
+    expect(jql).not.toContain("foo bar");
+  });
+
+  it("a dedupe label containing a double quote is escaped into well-formed JQL", async () => {
+    await post({
+      title: "T",
+      description: "D",
+      repo: "owner/name",
+      labels: ["crash-rca"],
+      dedupeLabels: ['crash-rca', 'agent:"pwn'],
+    });
+    const jql = h.searchCalls[0].jql;
+    // The `"` is escaped as `\"` so the label stays inside its string literal.
+    expect(jql).toContain('labels = "agent:\\"pwn"');
+    expect(jql).toBe(sigJql(["crash-rca", 'agent:\\"pwn']));
+    // Well-formed: every double quote is either the opening/closing of a literal
+    // or backslash-escaped — no odd unescaped quote breaks out of the string.
+    const unescapedQuotes = (jql.match(/(?<!\\)"/g) || []).length;
+    expect(unescapedQuotes % 2).toBe(0);
+  });
+
+  it("well-formed labels produce the exact sigJql and dedupe behavior is unchanged", async () => {
+    const labels = ["crash-rca", "agent:agentcore_hub_qa_verifier"];
+    // An open bug already carries this signature → the report dedupes onto it.
+    h.searchQueue.push({ issues: [{ key: "TEAM-5" }] });
+    const res = await post({
+      title: "Verifier crashed again",
+      description: "RCA body",
+      repo: "owner/name",
+      labels,
+      dedupeLabels: labels,
+    });
+    const json = await res.json();
+    // Exact JQL for the well-formed crash signature (regression guard).
+    expect(h.searchCalls[0].jql).toBe(sigJql(labels));
+    // Unchanged dedupe: absorbed as a comment on the existing open bug, no new ticket.
+    expect(json).toEqual({ ticketId: "TEAM-5", deduped: true });
+    expect(h.commentCalls.length).toBe(1);
+    expect(h.commentCalls[0].key).toBe("TEAM-5");
+    expect(h.createCalls.length).toBe(0);
   });
 });
