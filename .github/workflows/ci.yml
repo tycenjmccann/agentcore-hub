@@ -31,6 +31,15 @@ jobs:
       - name: Unit tests (hermetic — no AWS)
         run: npm run test:unit
 
+      # The cost-report Lambda's pricing reducer (addUsage) is exercised by a
+      # node:test suite next to the code (TEAM-3954). It's a standalone
+      # `node --test` run, not part of the vitest include list, so it needs its
+      # own step to gate PRs. index.mjs's @aws-sdk imports resolve from the root
+      # node_modules that `npm ci` just installed (client-cost-explorer is a
+      # devDependency for exactly this reason).
+      - name: Cost-report lambda unit tests (node --test)
+        run: node --test lambda/cost-report
+
       # R2 (docs/race-condition-study.md): the workflows table may only be
       # written through lambda/orchestrator/workflow-store.mjs — ad-hoc writes
       # are the read-modify-write clobber class behind most workflow races.
