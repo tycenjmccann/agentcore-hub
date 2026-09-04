@@ -291,14 +291,20 @@ def cmd_start(args):
       --def <workflowDefId>  run against a specific workflow definition
       --type feature|bug     pick the built-in feature or bug pipeline
     With neither flag the body is unchanged from the historical default
-    (`workflowType: "feature"`)."""
+    (`workflowType: "feature"`). An explicitly empty/whitespace --def is
+    refused rather than silently falling through to that default."""
     if not (args.title or "").strip():
         raise SystemExit("REFUSED: start requires --title")
+    if args.workflow_def is not None and not args.workflow_def.strip():
+        raise SystemExit(
+            "REFUSED: --def was given but empty — omit --def entirely to use "
+            "--type/the feature default, or pass a real workflowDefId"
+        )
     body = {
         "title": args.title,
         "description": args.description or "",
     }
-    if args.workflow_def:
+    if args.workflow_def is not None:
         body["workflowDefId"] = args.workflow_def
     else:
         body["workflowType"] = args.type or "feature"
@@ -510,8 +516,10 @@ def main():
     p.add_argument("--title", default="")
     p.add_argument("--description", default="")
     pipeline = p.add_mutually_exclusive_group()
-    pipeline.add_argument("--def", dest="workflow_def", default="",
-                          help="run against a specific workflowDefId (omits workflowType)")
+    pipeline.add_argument("--def", dest="workflow_def", default=None,
+                          help="run against a specific workflowDefId (omits workflowType). "
+                               "An explicitly empty/whitespace value is refused rather than "
+                               "silently falling back to the feature/type default")
     pipeline.add_argument("--type", choices=["feature", "bug"], default="",
                           help="built-in pipeline to run (default: feature)")
     p.add_argument("--repo", default="")
