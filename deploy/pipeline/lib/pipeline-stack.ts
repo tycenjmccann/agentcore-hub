@@ -30,6 +30,8 @@ export interface PipelineStackProps extends StackProps {
   readonly artifactBucketName: string;
   /** The ECS Express service ARN the deploy stage rolls (optional until known). */
   readonly ecsServiceArn?: string;
+  /** Events table for the runtime.deploy performance marker (default agentcore-hub-events). */
+  readonly eventsTableName?: string;
   /** Reuse an existing SNS approval topic (e.g. the Telegram-bridged one). */
   readonly approvalSnsTopicArn?: string;
   /** Email fallbacks subscribed to the approval topic. */
@@ -60,6 +62,7 @@ export class PipelineStack extends Stack {
       approvalSnsTopicArn,
       approvalEmails,
     } = props;
+    const eventsTableName = props.eventsTableName || "agentcore-hub-events";
 
     const region = this.region;
     const account = this.account;
@@ -273,6 +276,50 @@ export class PipelineStack extends Stack {
       ecsServiceArn,
     });
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Runtime-image Deploy project — the PR-2 "merge = live" close on agent
+    // prompts+TOOLS. Persona prompts already ship via Deploy Target 2's S3 sync,
+    // but the fleet/coding TOOL code is baked into main.py inside the runtime
+    // image, so a self-improvement run that rewrites a tool used to stop at a
+    // human handoff. This action rebuilds only the runtimes whose baked source
+    // changed (plan-surfaces.py RUNTIME rows) and image-swaps them in place
+    // (update-runtime-image.py preserves env/lifecycle/role/EFS). It runs on a
+    // native ARM64 (Graviton) host because both runtime images are linux/arm64;
+    // its role is SEPARATE from and narrower than the app deploy role — it can
+    // ONLY push to the two runtime ECR repos + UpdateAgentRuntime, never touch
+    // Lambda/ECS/IAM. It runs in PARALLEL with the app deploy action so the
+    // app's exit-2 HANDOFF (still-manual infra scripts) can't block the image roll.
+    // ─────────────────────────────────────────────────────────────────────────
+    const runtimeImageProject = new codebuild.PipelineProject(
+      this,
+      "RuntimeImageProject",
+      {
+        projectName: "agentcore-hub-runtime-image-deploy",
+        description:
+          "Deploy stage (parallel): rebuild changed fleet/coding runtime images on arm64 + image-only UpdateAgentRuntime (env/lifecycle preserved).",
+        buildSpec: codebuild.BuildSpec.fromSourceFilename(
+          "deploy/pipeline/buildspec-runtime-images.yml"
+        ),
+        environment: {
+          // Native Graviton so `docker build --platform linux/arm64` is not QEMU
+          // emulation (the images bake claude-code + codex + chromium + skills).
+          buildImage: codebuild.LinuxArmBuildImage.AMAZON_LINUX_2023_STANDARD_3_0,
+          computeType: codebuild.ComputeType.LARGE,
+          privileged: true,
+        },
+        environmentVariables: {
+          ...commonEnvVars,
+          EVENTS_TABLE: { value: eventsTableName },
+        },
+        timeout: Duration.minutes(60), // full image rebuild + push + runtime READY wait
+      }
+    );
+    grantRuntimeImagePerms(this, runtimeImageProject.role!, {
+      account,
+      region,
+      eventsTableName,
+    });
+
     // ── The deploy pipeline: Source → Build → Approval → Deploy ──────────────
     const sourceOutput = new codepipeline.Artifact("Source");
     const buildOutput = new codepipeline.Artifact("BuildArtifacts");
@@ -339,6 +386,17 @@ export class PipelineStack extends Stack {
               actionName: "Deploy_three_targets",
               project: deployProject,
               input: buildOutput, // promote-by-digest: deploy consumes Build's artifacts
+              runOrder: 1,
+            }),
+            // Parallel (same runOrder) so the app action's exit-2 HANDOFF for
+            // still-manual infra scripts never blocks the runtime image roll, and
+            // vice-versa. Both read the same buildOutput (which carries deploy/**,
+            // pipeline-out/changed-files.txt, git-sha.txt).
+            new cpactions.CodeBuildAction({
+              actionName: "Deploy_runtime_images",
+              project: runtimeImageProject,
+              input: buildOutput,
+              runOrder: 1,
             }),
           ],
         },
@@ -346,7 +404,13 @@ export class PipelineStack extends Stack {
     });
 
     // ── cdk-nag suppressions: justified, scoped, documented ──────────────────
-    applyNagSuppressions(this, { ciProject, buildProject, deployProject, pipeline });
+    applyNagSuppressions(this, {
+      ciProject,
+      buildProject,
+      deployProject,
+      runtimeImageProject,
+      pipeline,
+    });
 
     // ── Outputs (wired into .env.local / the hub app by deploy/pipeline/deploy.sh) ──
     new CfnOutput(this, "ConnectionArn", {
@@ -355,6 +419,11 @@ export class PipelineStack extends Stack {
         "CodeConnections ARN. If freshly created it is PENDING — complete the GitHub App handshake in the console once.",
     });
     new CfnOutput(this, "CiProjectName", { value: ciProject.projectName });
+    new CfnOutput(this, "RuntimeImageProjectName", {
+      value: runtimeImageProject.projectName,
+      description:
+        "arm64 runtime-image Deploy project; wire into the pipeline-tools Lambda so the RM can read its build log.",
+    });
     new CfnOutput(this, "DeployPipelineName", { value: pipeline.pipelineName });
     new CfnOutput(this, "ApprovalTopicArn", { value: approvalTopic.topicArn });
   }
@@ -581,17 +650,99 @@ function grantDeployPerms(
     })
   );
 
-  // NOTE: runtime IMAGES (deploy/runtime-agent, deploy/coding-agent-runtime) and
-  // infra scripts (IAM, env vars, tables, subscriptions) are deliberately OUT of
-  // this role's scope: image builds need a privileged arm64 builder + ECR push +
-  // UpdateAgentRuntime with a live-env merge, and infra needs iam:* — both would
-  // defeat the narrow-role principle. When a merge touches those files the
-  // Deploy stage ships everything else, advances the baseline, then exits 2 so
-  // the release manager reports the human step (surfaces.json "handoff").
-  // Image CD is the next increment (own CodeBuild project + UpdateAgentRuntime).
+  // NOTE: runtime IMAGES ship via a SEPARATE parallel action (RuntimeImageProject
+  // + grantRuntimeImagePerms) — this app role has no ECR push and no
+  // UpdateAgentRuntime on purpose. Genuine INFRA (IAM, env vars, tables,
+  // subscriptions) still needs iam:* and stays a handoff: when a merge touches
+  // those files the Deploy stage ships everything else, advances the baseline,
+  // then exits 2 so the release manager reports the human step (surfaces.json
+  // "handoff").
 
   role.attachInlinePolicy(
     new iam.Policy(scope, "DeployPerms", { statements })
+  );
+}
+
+/**
+ * The runtime-image Deploy role — separate from and narrower than the app Deploy
+ * role. It can push to ONLY the two runtime ECR repos and do an image-only
+ * UpdateAgentRuntime on the fleet + coding runtimes (which requires PassRole on
+ * exactly their two execution roles, scoped by service). It has NO Lambda, NO
+ * ECS, NO harness, NO iam:* beyond that one scoped PassRole, and cannot
+ * create/delete a runtime — only swap the container image of an existing one.
+ */
+function grantRuntimeImagePerms(
+  scope: Construct,
+  role: iam.IRole,
+  ctx: { account: string; region: string; eventsTableName: string }
+) {
+  role.attachInlinePolicy(
+    new iam.Policy(scope, "RuntimeImagePerms", {
+      statements: [
+        new iam.PolicyStatement({
+          sid: "EcrAuth",
+          actions: ["ecr:GetAuthorizationToken"],
+          resources: ["*"], // GetAuthorizationToken has no resource scope
+        }),
+        // Push + read ONLY the two runtime image repos (never the app frontend repo).
+        new iam.PolicyStatement({
+          sid: "EcrPushRuntimeRepos",
+          actions: [
+            "ecr:BatchCheckLayerAvailability",
+            "ecr:InitiateLayerUpload",
+            "ecr:UploadLayerPart",
+            "ecr:CompleteLayerUpload",
+            "ecr:PutImage",
+            "ecr:BatchGetImage",
+            "ecr:DescribeImages",
+          ],
+          resources: [
+            `arn:aws:ecr:${ctx.region}:${ctx.account}:repository/runtime-agent`,
+            `arn:aws:ecr:${ctx.region}:${ctx.account}:repository/coding-agent-runtime`,
+          ],
+        }),
+        // Image-only swap of an EXISTING runtime. No Create/Delete; Get is needed
+        // to read live config (env/lifecycle/role/EFS) so Update preserves it.
+        new iam.PolicyStatement({
+          sid: "RuntimeImageSwap",
+          actions: [
+            "bedrock-agentcore:GetAgentRuntime",
+            "bedrock-agentcore:UpdateAgentRuntime",
+          ],
+          resources: [
+            `arn:aws:bedrock-agentcore:${ctx.region}:${ctx.account}:runtime/*`,
+          ],
+        }),
+        new iam.PolicyStatement({
+          sid: "RuntimeList",
+          actions: ["bedrock-agentcore:ListAgentRuntimes"],
+          resources: ["*"], // ListAgentRuntimes has no resource scope
+        }),
+        // UpdateAgentRuntime re-passes the runtime's OWN execution role; scope to
+        // exactly the two runtime roles + the bedrock-agentcore service.
+        new iam.PolicyStatement({
+          sid: "PassRuntimeRoles",
+          actions: ["iam:PassRole"],
+          resources: [
+            `arn:aws:iam::${ctx.account}:role/agentcore-hub-agentcore-role`,
+            `arn:aws:iam::${ctx.account}:role/agentcore-hub-coding-runtime-role`,
+          ],
+          conditions: {
+            StringEquals: {
+              "iam:PassedToService": "bedrock-agentcore.amazonaws.com",
+            },
+          },
+        }),
+        // The runtime.deploy performance marker (best-effort, single table).
+        new iam.PolicyStatement({
+          sid: "EmitDeployMarker",
+          actions: ["dynamodb:PutItem"],
+          resources: [
+            `arn:aws:dynamodb:${ctx.region}:${ctx.account}:table/${ctx.eventsTableName}`,
+          ],
+        }),
+      ],
+    })
   );
 }
 
@@ -601,6 +752,7 @@ function applyNagSuppressions(
     ciProject: codebuild.IProject;
     buildProject: codebuild.IProject;
     deployProject: codebuild.IProject;
+    runtimeImageProject: codebuild.IProject;
     pipeline: codepipeline.Pipeline;
   }
 ) {
@@ -610,7 +762,7 @@ function applyNagSuppressions(
       {
         id: "AwsSolutions-IAM5",
         reason:
-          "Scoped wildcards are intentional and minimal: agentcore-hub-* Lambda code updates, harness/* prompt+model updates, /config/* and /pipeline-artifacts/* S3 prefixes, and ecr:GetAuthorizationToken / bedrock-agentcore:ListHarnesses (which have no resource scope). No admin or cross-service wildcard.",
+          "Scoped wildcards are intentional and minimal: agentcore-hub-* Lambda code updates, harness/* prompt+model updates, runtime/* image-only UpdateAgentRuntime scoped to the runtime-agent + coding-agent-runtime ECR repos, /config/* and /pipeline-artifacts/* S3 prefixes, and ecr:GetAuthorizationToken / bedrock-agentcore:ListHarnesses / ListAgentRuntimes (which have no resource scope). PassRole is pinned to the specific ECS + runtime execution roles with an iam:PassedToService condition. No admin or cross-service wildcard.",
       },
       {
         id: "AwsSolutions-CB4",

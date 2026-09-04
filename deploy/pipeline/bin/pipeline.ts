@@ -56,6 +56,7 @@ new PipelineStack(app, "AgentcoreHubPipeline", {
   artifactBucketName:
     process.env.ARTIFACT_BUCKET || `agentcore-hub-artifacts-${account}-${region}`,
   ecsServiceArn: process.env.ECS_SERVICE_ARN,
+  eventsTableName: process.env.PIPELINE_EVENTS_TABLE, // default agentcore-hub-events
   approvalSnsTopicArn: process.env.PIPELINE_APPROVAL_SNS_ARN,
   approvalEmails: (process.env.PIPELINE_APPROVAL_EMAILS || "")
     .split(",")

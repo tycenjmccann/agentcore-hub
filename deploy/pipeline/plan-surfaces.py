@@ -9,7 +9,12 @@ for buildspec-deploy.yml to execute, grouped in execution order:
   S3SYNC   <src dir>  <dst key prefix> <extra aws s3 sync args, space-separated>
   S3CP     <src file> <dst key>
   HARNESS  <harness name> <setup script>
+  RUNTIME  <runtime name> <ecr repo> <docker build context>
   HANDOFF  <changed file that only a human/infra script can deploy>
+
+RUNTIME rows are consumed by buildspec-runtime-images.yml (the parallel Deploy
+action on an arm64 host), NOT by buildspec-deploy.yml — the app buildspec only
+greps for ^HANDOFF, so RUNTIME rows are inert there.
 
 Rules:
   - A surface deploys when any changed file starts with one of its `paths`
@@ -100,6 +105,12 @@ def plan(changed_files: list[str], manifest: dict, force_all: bool = False) -> l
         if everything or _hits(changed, h["paths"]):
             actions.append(["HARNESS", h["name"], h["script"]])
 
+    # RUNTIME rows fire only on a change to a runtime's BAKED source (paths).
+    # A prompt-only change (handoff_exempt) ships via the S3SYNC above, not here.
+    for rt in manifest.get("runtimes", []):
+        if everything or _hits(changed, rt["paths"]):
+            actions.append(["RUNTIME", rt["name"], rt["ecrRepo"], rt["context"]])
+
     for f in raw:
         if f == SENTINEL:
             actions.append(["HANDOFF", f])
@@ -140,7 +151,11 @@ def coverage_prefixes(manifest: dict) -> list[str]:
         prefixes.append(s3["src"])
     for h in manifest.get("harnesses", []):
         prefixes.extend(h["paths"])
+    for rt in manifest.get("runtimes", []):
+        prefixes.extend(rt["paths"])
     prefixes.extend(manifest.get("handoff", []))
+    # Prompts (handoff_exempt) ship via Target 2's S3 sync — a real surface.
+    prefixes.extend(manifest.get("handoff_exempt", []))
     for k in manifest.get("excluded", {}):
         prefixes.append(k if (k.endswith("/") or "." in Path(k).name) else k + "/")
     return prefixes
