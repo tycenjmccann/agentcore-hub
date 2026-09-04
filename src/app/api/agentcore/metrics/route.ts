@@ -244,15 +244,18 @@ async function getTokenUsageFromSpans(region: string): Promise<Record<string, Sv
     // Aggregate token usage server-side. Pulling raw @message blobs (limit
     // 10000) and JSON.parsing each one client-side took 80s+; a stats query
     // returns one small row per service in ~1s.
-    // Two shapes carry gen_ai.usage tokens: Strands/ADOT model spans (named
-    // "chat <model>") and Claude Code CLI api_request log events (coding
-    // runtime — its collector normalizes input_tokens -> gen_ai.usage.* and
-    // event.name arrives as "api_request", body carries the claude_code prefix).
+    // Two shapes carry gen_ai.usage tokens: Strands/ADOT model spans and Claude
+    // Code CLI api_request log events (coding runtime — its collector
+    // normalizes input_tokens -> gen_ai.usage.* and event.name arrives as
+    // "api_request", body carries the claude_code prefix). Model spans on
+    // strands>=1.53 are named exactly "chat" (the model id lives only in the
+    // gen_ai.request.model attribute); older strands versions named them
+    // "chat <model>". The filter below matches both shapes.
     // Both shapes stamp gen_ai.request.model, so grouping by it gives the
     // per-model split (e.g. which tier each claude_code delegation picked).
     const query = `
       fields \`attributes.gen_ai.usage.input_tokens\` as inp, \`attributes.gen_ai.usage.output_tokens\` as outp, \`resource.attributes.service.name\` as svc, coalesce(\`attributes.gen_ai.request.model\`, "unknown") as model
-      | filter name like /^chat / or \`attributes.event.name\` = "api_request"
+      | filter (name = "chat" or name like /^chat /) or \`attributes.event.name\` = "api_request"
       | stats sum(inp) as inputTokens, sum(outp) as outputTokens, count(*) as calls by svc, model
     `;
 

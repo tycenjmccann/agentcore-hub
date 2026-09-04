@@ -79,6 +79,10 @@ The orchestration pipeline. Self-contained surface.
 `RUNTIME_ARN_<HARNESS>` (one per agent harness), `LAMBDA_ROLE_ARN`; performance card:
 `PERFORMANCE_INDEX_KEY` (default `performance/index.json`), `PUBLISH_CW_METRICS`, `INFRA_REGION`.
 
+Fleet runtime agents (`deploy/runtime-agent`, see `DEPLOY.md`) additionally read:
+- `PERSONA_PROMPT_CACHE` — `1` (default on); Bedrock prompt caching for the persona system prompt + tools, set `0` to disable
+- `PERSONA_CACHE_TTL` — `1h` (`5m`|`1h`, default `1h`); prompt-cache TTL, invalid values fall back to `1h`
+
 ---
 
 ## Module: Evaluations

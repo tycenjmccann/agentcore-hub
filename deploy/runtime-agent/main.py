@@ -68,6 +68,7 @@ if not os.path.exists(_node_marker):
 else:
     os.environ["PATH"] = f"/tmp/node-v20.18.0-linux-arm64/bin:/tmp/.npm-global/bin:{os.environ.get('PATH', '')}"
 
+import importlib.metadata
 import json
 import logging
 import time
@@ -78,6 +79,10 @@ import boto3
 
 from strands import Agent, tool
 from strands.models import BedrockModel
+try:
+    from strands.models.model import CacheConfig
+except ImportError:
+    CacheConfig = None
 from botocore.config import Config as BotocoreConfig
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 
@@ -144,6 +149,20 @@ REGION = os.getenv("AWS_REGION", "us-east-1")
 MODEL_ID = os.getenv("MODEL_ID", "us.anthropic.claude-fable-5-1")
 READ_TIMEOUT = int(os.getenv("READ_TIMEOUT", "1200"))  # 20 minutes — agents need room for complex claude_code calls
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "32000"))
+# Bedrock prompt caching for the persona system prompt + tools (TEAM-3953).
+# Default ON. Disabled by any explicit falsy value — case-insensitive and
+# whitespace-stripped {"0","false","no","off"} (TEAM-3961 F2: the kill switch
+# must kill for the obvious spellings, not just "0"). Empty/unset → default
+# "1" → enabled; "" is deliberately treated as enabled (default-on).
+PERSONA_PROMPT_CACHE = os.getenv("PERSONA_PROMPT_CACHE", "1").strip().lower() not in {"0", "false", "no", "off"}
+# Cache TTL: Bedrock supports "5m" and "1h" only. Anything else falls back to "1h".
+PERSONA_CACHE_TTL = os.getenv("PERSONA_CACHE_TTL", "1h")
+if PERSONA_CACHE_TTL not in ("5m", "1h"):
+    logging.getLogger("agentcore-hub-pipeline-agent").warning(
+        "PERSONA_CACHE_TTL=%r invalid (expected '5m' or '1h') — falling back to '1h'",
+        PERSONA_CACHE_TTL,
+    )
+    PERSONA_CACHE_TTL = "1h"
 GATEWAY_ARN = os.getenv("GATEWAY_ARN", "")
 # NOTE: AgentCore reserves "ARTIFACT_BUCKET" as a system env var (points to CodeBuild source bucket).
 # We use AGENTCORE_HUB_ARTIFACT_BUCKET to avoid the collision.
@@ -284,21 +303,55 @@ def _load_prompt_for_agent(agent_id: str) -> str:
 # (deploy/runtime-agent/install-skills.sh) — no runtime sync needed.
 _agent_name_from_prompt_key = os.path.basename(_prompt_s3_key).replace(".txt", "") if _prompt_s3_key else ""
 
-# --- Model with custom timeout (THE FIX) ---
-boto_config = BotocoreConfig(
-    read_timeout=READ_TIMEOUT,
-    connect_timeout=30,
-    retries={"max_attempts": 2},
-)
+# --- Model with custom timeout (THE FIX) + Bedrock prompt caching (TEAM-3953) ---
+def _persona_cache_kwargs() -> dict:
+    """Cache kwargs for BedrockModel — empty when caching is off or unsupported.
 
-model = BedrockModel(
-    model_id=MODEL_ID,
-    region_name=REGION,
-    boto_client_config=boto_config,
-    streaming=True,
-    # Without an explicit cap, Bedrock's default (~4k) truncates multi-ticket
-    # fan-out turns mid-JSON → MaxTokensReachedException kills the invocation.
-    max_tokens=MAX_OUTPUT_TOKENS,
+    Returning {} keeps model construction behaviorally identical to the
+    pre-caching build (no cache_config/cache_tools kwargs at all).
+    """
+    if not PERSONA_PROMPT_CACHE or CacheConfig is None:
+        return {}
+    return {
+        "cache_config": CacheConfig(strategy="auto", ttl=PERSONA_CACHE_TTL),
+        "cache_tools": "default",
+    }
+
+
+def _build_bedrock_model(model_id: str) -> BedrockModel:
+    """Single construction site for every BedrockModel — default + overrides.
+
+    Folding both prior sites here means a model override can never silently
+    lose prompt caching.
+    """
+    boto_config = BotocoreConfig(
+        read_timeout=READ_TIMEOUT,
+        connect_timeout=30,
+        retries={"max_attempts": 2},
+    )
+    return BedrockModel(
+        model_id=model_id,
+        region_name=REGION,
+        boto_client_config=boto_config,
+        streaming=True,
+        # Without an explicit cap, Bedrock's default (~4k) truncates multi-ticket
+        # fan-out turns mid-JSON → MaxTokensReachedException kills the invocation.
+        max_tokens=MAX_OUTPUT_TOKENS,
+        **_persona_cache_kwargs(),
+    )
+
+
+model = _build_bedrock_model(MODEL_ID)
+
+try:
+    _strands_version = importlib.metadata.version("strands-agents")
+except Exception:
+    _strands_version = "unknown"
+logger.info(
+    "prompt-cache: state=%s ttl=%s strands=%s",
+    "on" if (PERSONA_PROMPT_CACHE and CacheConfig is not None) else "off",
+    PERSONA_CACHE_TTL,
+    _strands_version,
 )
 
 # --- Lambda client for invoking tool backends ---
@@ -2731,18 +2784,7 @@ async def _run_agent_invocation(payload, context):
         active_model = model
         if model_override and model_override != MODEL_ID:
             resolved_model_id = MODEL_ALIASES.get(model_override, model_override)
-            override_config = BotocoreConfig(
-                read_timeout=READ_TIMEOUT,
-                connect_timeout=30,
-                retries={"max_attempts": 2},
-            )
-            active_model = BedrockModel(
-                model_id=resolved_model_id,
-                region_name=REGION,
-                boto_client_config=override_config,
-                streaming=True,
-                max_tokens=MAX_OUTPUT_TOKENS,
-            )
+            active_model = _build_bedrock_model(resolved_model_id)
             # NOTE: the persona's board model governs its own reasoning only. The
             # coding CLI's model is chosen per-delegation via claude_code(model=...)
             # or falls back to the coding runtime's CLAUDE_MODEL default.
@@ -2859,12 +2901,15 @@ async def _run_agent_invocation(payload, context):
         # injection is absent (direct_code_deploy fallback path) — an unkeyed
         # span is invisible to it.
         _session_id = getattr(context, "session_id", None)
+        _cache_on = PERSONA_PROMPT_CACHE and CacheConfig is not None
         _trace_attrs = {k: v for k, v in {
             "session.id": _session_id or f"wf-{workflow_id}",
             "workflow.id": workflow_id,
             "agent.id": agent_id,
             "gen_ai.agent.id": agent_id,
             "ticket.id": _CURRENT_TICKET_ID,
+            "hub.prompt_cache": "on" if _cache_on else "off",
+            "hub.cache_ttl": PERSONA_CACHE_TTL if _cache_on else "",
         }.items() if v}
         completion_gate = _CompletionGate()
         agent = Agent(

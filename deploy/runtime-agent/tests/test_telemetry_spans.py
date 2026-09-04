@@ -523,6 +523,14 @@ def _load_production_entrypoints() -> dict[str, Any]:
         # Only reachable via the model_override branch, which no test takes.
         "BotocoreConfig": None,
         "BedrockModel": None,
+        # TEAM-3953 prompt-cache plumbing: the model_override branch now calls the
+        # _build_bedrock_model factory, and _trace_attrs reads PERSONA_PROMPT_CACHE
+        # / PERSONA_CACHE_TTL. Caching OFF here — `PERSONA_PROMPT_CACHE and ...`
+        # short-circuits, so CacheConfig is never dereferenced and needs no stub.
+        "_build_bedrock_model": lambda model_id: MockModel(),
+        "_persona_cache_kwargs": lambda: {},
+        "PERSONA_PROMPT_CACHE": False,
+        "PERSONA_CACHE_TTL": "1h",
         "_CODING_SESSION": {},
         # Network-touching collaborators, stubbed.
         # TEAM-3366 P0-A session-anchor span: stubbed so these tests keep

@@ -4,7 +4,15 @@
 # CI with no AWS credentials, no network at test time, and no Playwright/Node
 # install. Only what's needed to build a real Strands Agent against a mocked
 # model and read the spans back out of an in-memory exporter.
-strands-agents>=0.3.0
+#
+# Floor is 1.53.0, not 1.52.0: main.py passes cache_tools="default" (a string) and
+# relies on the tools cachePoint inheriting ttl from cache_config.ttl. That
+# inheritance (_build_tools_cache_point in strands/models/bedrock.py) only exists
+# from 1.53.0; on 1.52.0 the tools cachePoint ships without ttl (defaults 5m),
+# which breaks test_prompt_cache's ttl=="1h" assertion and yields a mixed-TTL
+# request Bedrock extended-TTL validation can reject (TEAM-3961, F1).
+strands-agents>=1.53.0
+boto3>=1.43.0
 opentelemetry-sdk>=1.29.0
 # StrandsTelemetry.setup_otlp_exporter() imports the OTLP/HTTP span exporter at
 # call time, so the fallback branch of main.py's _init_telemetry() can't be

@@ -65,7 +65,7 @@ const INDEX_KEY = process.env.PERFORMANCE_INDEX_KEY || "performance/index.json";
 const METRIC_NAMESPACE = process.env.METRIC_NAMESPACE || "AgentCoreHub/Performance";
 const PUBLISH_METRICS = (process.env.PUBLISH_CW_METRICS ?? "1") !== "0";
 
-export const REPORT_VERSION = 2;
+export const REPORT_VERSION = 3;
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -77,6 +77,9 @@ const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-block
 
 const DEFAULT_PRICING = {
   models: {}, default: { input: 5.5, output: 27.5 }, cachedInputDiscount: 0.1,
+  // Cache-write (5-minute vs 1-hour) surcharge as a multiple of the input rate,
+  // keyed by the span's hub.cache_ttl; `default` covers a missing/unknown ttl.
+  cacheWriteMultiplier: { "5m": 1.25, "1h": 2, default: 1.25 },
   kiro: { usdPerCredit: 0 }, agentcore: { runtimeGbHourUsd: 0.00945, runtimeVcpuHourUsd: 0.0895 },
 };
 
@@ -100,6 +103,7 @@ export const BAND_KPIS = [
   { path: "quality.nudges", label: "Nudges", unit: "count", floor: 1 },
   { path: "quality.errors", label: "Errors", unit: "count", floor: 1 },
   { path: "quality.firstPassYield", label: "First-pass yield", unit: "ratio", floor: 0.1, direction: "lower" },
+  { path: "cost.personaCacheHitRate", label: "Persona cache hit rate", unit: "ratio", floor: 0.1, direction: "lower" },
 ];
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
@@ -233,29 +237,46 @@ async function buildCard(workflowId, workflow, pricing) {
 
   // ── Roll up cost ──
   const byEngine = {};
-  const tokens = { input: 0, output: 0, cached: 0, total: 0 };
+  const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cached: 0, total: 0 };
   let kiroCredits = 0, totalUsd = 0, personaUsd = 0;
   for (const rec of Object.values(byAgent)) {
     for (const [engine, u] of Object.entries(rec.engines)) {
-      const e = (byEngine[engine] ||= { usd: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, kiroCredits: 0, byModel: {} });
+      const e = (byEngine[engine] ||= {
+        usd: 0, inputTokens: 0, outputTokens: 0,
+        cacheReadInputTokens: 0, cacheWriteInputTokens: 0, cachedInputTokens: 0,
+        kiroCredits: 0, byModel: {},
+      });
       e.usd += u.usd; e.inputTokens += u.inputTokens; e.outputTokens += u.outputTokens;
+      e.cacheReadInputTokens += u.cacheReadInputTokens; e.cacheWriteInputTokens += u.cacheWriteInputTokens;
       e.cachedInputTokens += u.cachedInputTokens; e.kiroCredits += u.kiroCredits;
       for (const [m, mv] of Object.entries(u.byModel)) {
-        const em = (e.byModel[m] ||= { inputTokens: 0, outputTokens: 0, usd: 0 });
-        em.inputTokens += mv.inputTokens; em.outputTokens += mv.outputTokens; em.usd += mv.usd;
+        const em = (e.byModel[m] ||= { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
+        em.inputTokens += mv.inputTokens; em.outputTokens += mv.outputTokens;
+        em.cacheReadInputTokens += mv.cacheReadInputTokens; em.cacheWriteInputTokens += mv.cacheWriteInputTokens;
+        em.usd += mv.usd;
       }
-      tokens.input += u.inputTokens; tokens.output += u.outputTokens; tokens.cached += u.cachedInputTokens;
+      tokens.input += u.inputTokens; tokens.output += u.outputTokens;
+      tokens.cacheRead += u.cacheReadInputTokens; tokens.cacheWrite += u.cacheWriteInputTokens;
+      tokens.cached += u.cachedInputTokens;
       kiroCredits += u.kiroCredits;
       totalUsd += u.usd;
       if (engine === "persona") personaUsd += u.usd;
     }
     rec.totalUsd = round4(Object.values(rec.engines).reduce((s, u) => s + u.usd, 0));
   }
-  tokens.total = tokens.input + tokens.output + tokens.cached;
+  tokens.total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
   for (const e of Object.values(byEngine)) {
     e.usd = round4(e.usd);
+    e.cacheHitRate = cacheHitRate(e.cacheReadInputTokens, e.inputTokens, e.cacheWriteInputTokens);
     for (const m of Object.values(e.byModel)) m.usd = round4(m.usd);
   }
+  // Hit rate = cache reads ÷ (fresh input + cache reads + cache writes), i.e. the
+  // share of prompt tokens served from cache. null when there was no input at all.
+  const cacheHitRateOverall = cacheHitRate(tokens.cacheRead, tokens.input, tokens.cacheWrite);
+  const pe = byEngine.persona;
+  const personaCacheHitRate = pe
+    ? cacheHitRate(pe.cacheReadInputTokens, pe.inputTokens, pe.cacheWriteInputTokens)
+    : null;
   if (kiroCredits > 0 && !(pricing.kiro?.usdPerCredit > 0)) {
     gaps.push("kiro credits present but pricing.kiro.usdPerCredit is 0 — kiro USD reported as 0");
   }
@@ -317,12 +338,15 @@ async function buildCard(workflowId, workflow, pricing) {
       codingUsd: round4(totalUsd - personaUsd),
       perTaskUsd: aiTasks.length ? round4(totalUsd / aiTasks.length) : null,
       tokens,
+      cacheHitRate: cacheHitRateOverall,
+      personaCacheHitRate,
       kiroCredits: round4(kiroCredits),
       byEngine,
       byAgent: Object.fromEntries(Object.entries(byAgent).map(([k, v]) => [k, {
         totalUsd: v.totalUsd,
         engines: Object.fromEntries(Object.entries(v.engines).map(([ek, ev]) => [ek, {
           usd: round4(ev.usd), inputTokens: ev.inputTokens, outputTokens: ev.outputTokens,
+          cacheReadInputTokens: ev.cacheReadInputTokens, cacheWriteInputTokens: ev.cacheWriteInputTokens,
           cachedInputTokens: ev.cachedInputTokens,
           ...(ev.kiroCredits ? { kiroCredits: round4(ev.kiroCredits) } : {}),
           byModel: Object.fromEntries(Object.entries(ev.byModel).map(([mk, mv]) => [mk, { ...mv, usd: round4(mv.usd) }])),
@@ -370,15 +394,22 @@ async function buildCard(workflowId, workflow, pricing) {
   };
 }
 
-function addUsage(byAgent, agentId, engine, row, pricing) {
+export function addUsage(byAgent, agentId, engine, row, pricing) {
   const rec = (byAgent[agentId] ||= { engines: {} });
   const u = (rec.engines[engine] ||= {
-    usd: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, kiroCredits: 0, byModel: {},
+    usd: 0, inputTokens: 0, outputTokens: 0,
+    cacheReadInputTokens: 0, cacheWriteInputTokens: 0, cachedInputTokens: 0,
+    kiroCredits: 0, byModel: {},
   });
   const inp = Number(row.inp || 0), outp = Number(row.outp || 0);
-  const cached = Number(row.cached || 0), credits = Number(row.credits || 0);
+  // Query aliases (post-TEAM-3954): cacheRead / cacheWrite; ttl selects the
+  // cache-write surcharge tier (5m vs 1h).
+  const read = Number(row.cacheRead || 0), write = Number(row.cacheWrite || 0);
+  const credits = Number(row.credits || 0);
   const model = row.model || "unknown";
-  u.inputTokens += inp; u.outputTokens += outp; u.cachedInputTokens += cached;
+  u.inputTokens += inp; u.outputTokens += outp;
+  u.cacheReadInputTokens += read; u.cacheWriteInputTokens += write;
+  u.cachedInputTokens += read; // keep: cached == cache-read, for pre-3954 readers
   u.kiroCredits += credits;
   let usd;
   if (credits > 0) {
@@ -386,11 +417,17 @@ function addUsage(byAgent, agentId, engine, row, pricing) {
   } else {
     const p = pricing.models[model] || pricing.default;
     const discount = pricing.cachedInputDiscount ?? 0.1;
-    usd = (inp / 1e6) * p.input + (outp / 1e6) * p.output + (cached / 1e6) * p.input * discount;
+    const writeMult = pricing.cacheWriteMultiplier?.[row.ttl] ?? pricing.cacheWriteMultiplier?.default ?? 1.25;
+    usd = (inp / 1e6) * p.input
+      + (outp / 1e6) * p.output
+      + (read / 1e6) * p.input * discount
+      + (write / 1e6) * p.input * writeMult;
   }
   u.usd += usd;
-  const m = (u.byModel[model] ||= { inputTokens: 0, outputTokens: 0, usd: 0 });
-  m.inputTokens += inp; m.outputTokens += outp; m.usd += usd;
+  const m = (u.byModel[model] ||= { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
+  m.inputTokens += inp; m.outputTokens += outp;
+  m.cacheReadInputTokens += read; m.cacheWriteInputTokens += write;
+  m.usd += usd;
 }
 
 // ─── Bands (pure — mirrored in src/lib/workflow/performance.ts) ───────────────
@@ -494,6 +531,8 @@ export function summarize(card) {
       total: card.cost.totalUsd, persona: card.cost.personaUsd, coding: card.cost.codingUsd,
       tokens: card.cost.tokens.total, tokensIn: card.cost.tokens.input, tokensOut: card.cost.tokens.output,
       cached: card.cost.tokens.cached,
+      cacheRead: card.cost.tokens.cacheRead, cacheWrite: card.cost.tokens.cacheWrite,
+      cacheHitRate: card.cost.cacheHitRate, personaCacheHitRate: card.cost.personaCacheHitRate,
       byEngine: Object.fromEntries(Object.entries(card.cost.byEngine || {}).map(([k, v]) => [k, v.usd])),
     },
     time: {
@@ -719,6 +758,9 @@ async function publishMetrics(card) {
     ["PersonaCostUsd", card.cost.personaUsd, "None"],
     ["CodingCostUsd", card.cost.codingUsd, "None"],
     ["TokensTotal", card.cost.tokens.total, "Count"],
+    ["PersonaCacheHitRate", card.cost.personaCacheHitRate, "None"],
+    ["CacheReadTokens", card.cost.tokens.cacheRead, "Count"],
+    ["CacheWriteTokens", card.cost.tokens.cacheWrite, "Count"],
     ["WallHours", h(card.time.wallMs), "None"],
     ["ActiveHours", h(card.time.activeMs), "None"],
     ["AgentWorkHours", h(card.time.agentWorkMs), "None"],
@@ -886,13 +928,21 @@ async function runInsights(groups, query, startSec, endSec) {
   throw new Error("Insights query did not complete in 120s");
 }
 
+// R1-F1 (TEAM-3964): on strands-agents >=1.53 model spans are named exactly
+// "chat" (the model id lives in gen_ai.request.model, not the span name); the
+// legacy "chat <model>" shape is retained here for older historical data. The
+// explicit `name = "chat"` branch is required — `name like /^chat /` alone
+// (space-terminated) never matches the exact "chat" name and silently zeroes
+// persona token/cache accounting on current strands.
+export const PERSONA_CHAT_SPAN_FILTER = '((name = "chat" or name like /^chat /) or `attributes.event.name` = "api_request")';
+
 async function queryPersonaSpans(groups, workflowId, startSec, endSec) {
-  // Strands model spans: name "chat <model>", session.id carries the wf id.
-  // Cache fields are read defensively — Strands does not emit them today, which
-  // is itself the finding: personas run with no prompt caching.
-  const q = `fields \`attributes.session.id\` as sid, \`attributes.gen_ai.usage.input_tokens\` as i, \`attributes.gen_ai.usage.output_tokens\` as o, \`attributes.gen_ai.usage.cache_read_input_tokens\` as cr, coalesce(\`attributes.gen_ai.request.model\`, "unknown") as model
-| filter sid like "${workflowId}" and (name like /^chat / or \`attributes.event.name\` = "api_request")
-| stats sum(i) as inp, sum(o) as outp, sum(cr) as cached by sid, model`;
+  // Cache read/write tokens land under either the nested (cache_read.input_tokens)
+  // or flat (cache_read_input_tokens) OTEL attribute depending on emitter version;
+  // hub.cache_ttl (set by the runtime, TEAM-3953) selects the write price tier.
+  const q = `fields \`attributes.session.id\` as sid, \`attributes.gen_ai.usage.input_tokens\` as i, \`attributes.gen_ai.usage.output_tokens\` as o, coalesce(\`attributes.gen_ai.usage.cache_read.input_tokens\`, \`attributes.gen_ai.usage.cache_read_input_tokens\`, 0) as cr, coalesce(\`attributes.gen_ai.usage.cache_creation.input_tokens\`, \`attributes.gen_ai.usage.cache_write_input_tokens\`, 0) as cw, \`attributes.hub.cache_ttl\` as ttl, coalesce(\`attributes.gen_ai.request.model\`, "unknown") as model
+| filter sid like "${workflowId}" and ${PERSONA_CHAT_SPAN_FILTER}
+| stats sum(i) as inp, sum(o) as outp, sum(cr) as cacheRead, sum(cw) as cacheWrite by sid, model, ttl`;
   return runInsights(groups, q, startSec, endSec).catch((e) => {
     console.warn(`${LOG} persona span query failed:`, e.message);
     return [];
@@ -903,9 +953,9 @@ async function queryClaudeCodeSpans(groups, codingSessions, startSec, endSec) {
   const ids = codingSessions.map((s) => s.sessionId).filter(Boolean);
   if (!ids.length) return [];
   const idList = ids.map((x) => `"${x}"`).join(",");
-  const q = `fields \`attributes.session.id\` as sid, \`attributes.gen_ai.usage.input_tokens\` as i, \`attributes.gen_ai.usage.output_tokens\` as o, \`attributes.gen_ai.usage.cache_read_input_tokens\` as cr, coalesce(\`attributes.gen_ai.request.model\`, "unknown") as model
+  const q = `fields \`attributes.session.id\` as sid, \`attributes.gen_ai.usage.input_tokens\` as i, \`attributes.gen_ai.usage.output_tokens\` as o, coalesce(\`attributes.gen_ai.usage.cache_read.input_tokens\`, \`attributes.gen_ai.usage.cache_read_input_tokens\`, 0) as cr, coalesce(\`attributes.gen_ai.usage.cache_creation.input_tokens\`, \`attributes.gen_ai.usage.cache_write_input_tokens\`, 0) as cw, \`attributes.hub.cache_ttl\` as ttl, coalesce(\`attributes.gen_ai.request.model\`, "unknown") as model
 | filter sid in [${idList}] and \`attributes.event.name\` = "api_request"
-| stats sum(i) as inp, sum(o) as outp, sum(cr) as cached by sid, model`;
+| stats sum(i) as inp, sum(o) as outp, sum(cr) as cacheRead, sum(cw) as cacheWrite by sid, model, ttl`;
   return runInsights(groups, q, startSec, endSec).catch((e) => {
     console.warn(`${LOG} claude-code span query failed:`, e.message);
     return [];
@@ -920,7 +970,7 @@ async function queryCodingUsageRecords(codingSessions, startSec, endSec) {
   const idList = ids.map((x) => `"${x}"`).join(",");
   const q = `fields coding_session_id as sid, cli, model, input_tokens, output_tokens, cached_input_tokens, credits
 | filter message = "coding_usage" and sid in [${idList}]
-| stats sum(input_tokens) as inp, sum(output_tokens) as outp, sum(cached_input_tokens) as cached, sum(credits) as credits by sid, cli, model`;
+| stats sum(input_tokens) as inp, sum(output_tokens) as outp, sum(cached_input_tokens) as cacheRead, sum(credits) as credits by sid, cli, model`;
   return runInsights([CODING_LOG_GROUP], q, startSec, endSec).catch((e) => {
     console.warn(`${LOG} coding_usage query failed:`, e.message);
     return [];
@@ -1068,6 +1118,11 @@ function computeHumanWait(events, endedMs) {
 // ─── Markdown render ──────────────────────────────────────────────────────────
 
 function round4(n) { return n == null ? n : Math.round(n * 10000) / 10000; }
+/** cacheRead ÷ (input + cacheRead + cacheWrite); null when the denominator is 0. */
+function cacheHitRate(read, input, write) {
+  const denom = (input || 0) + (read || 0) + (write || 0);
+  return denom > 0 ? round4(read / denom) : null;
+}
 function usd(n) { return n == null ? "—" : `$${n.toFixed(n >= 1 ? 2 : 4)}`; }
 function dur(ms) {
   if (ms == null) return "—";
@@ -1110,13 +1165,13 @@ function renderMarkdown(c) {
     `| Persona LLM (Strands agents) | ${usd(c.cost.personaUsd)} |`,
     `| Coding CLIs (bolt-ons) | ${usd(c.cost.codingUsd)} |`,
     `| Per agent task | ${usd(c.cost.perTaskUsd)} |`,
-    `| Tokens in / out / cached | ${c.cost.tokens.input.toLocaleString()} / ${c.cost.tokens.output.toLocaleString()} / ${c.cost.tokens.cached.toLocaleString()} |`,
+    `| Tokens in / out / cache read / cache write · hit rate | ${c.cost.tokens.input.toLocaleString()} / ${c.cost.tokens.output.toLocaleString()} / ${c.cost.tokens.cacheRead.toLocaleString()} / ${c.cost.tokens.cacheWrite.toLocaleString()} · ${pct(c.cost.cacheHitRate)} |`,
     ...(c.cost.kiroCredits ? [`| Kiro credits | ${c.cost.kiroCredits} |`] : []),
     ``,
-    `| Engine | Cost | Tokens in | Tokens out | Cached |`,
-    `|---|---|---|---|---|`,
+    `| Engine | Cost | Tokens in | Tokens out | Cache read | Cache write | Hit |`,
+    `|---|---|---|---|---|---|---|`,
     ...Object.entries(c.cost.byEngine).sort((a, b2) => b2[1].usd - a[1].usd).map(([k, v]) =>
-      `| ${k} | ${usd(v.usd)} | ${v.inputTokens.toLocaleString()} | ${v.outputTokens.toLocaleString()} | ${v.cachedInputTokens.toLocaleString()} |`),
+      `| ${k} | ${usd(v.usd)} | ${v.inputTokens.toLocaleString()} | ${v.outputTokens.toLocaleString()} | ${v.cacheReadInputTokens.toLocaleString()} | ${v.cacheWriteInputTokens.toLocaleString()} | ${pct(v.cacheHitRate)} |`),
     ``,
     `## ⏱ Time: ${dur(c.time.wallMs)} wall`,
     ``,
