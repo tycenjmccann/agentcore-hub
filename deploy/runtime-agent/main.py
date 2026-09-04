@@ -93,9 +93,11 @@ def _load_builtin_tools():
     All built-in tools are loaded for every agent. AgentCore Runtime provides /tmp
     as writable space, and Code Interpreter / Browser run in separate sandboxes.
     """
+    # image_reader is deliberately NOT imported from strands_tools: the raw tool
+    # streams file bytes straight into Converse and Bedrock rejects any image
+    # >8000px on a side, killing the whole agent loop. The module-level
+    # `image_reader` below downsizes/tiles first (TEAM-3938 crash class).
     from strands_tools import (
-        # Multi-modal
-        image_reader,
         # Web & Network
         http_request,
         # Utilities
@@ -121,7 +123,7 @@ def _load_builtin_tools():
     browser_tool = AgentCoreBrowser(region=REGION)
 
     return [
-        # Multi-modal
+        # Multi-modal (Bedrock-safe wrapper defined at module level)
         image_reader,
         # Web & Network
         http_request,
@@ -1135,6 +1137,120 @@ def download_s3_file(key: str, bucket: str = "") -> str:
     s3_client.download_file(actual_bucket, key, local_path)
     size = os.path.getsize(local_path)
     return f"Downloaded to {local_path} ({size} bytes). Use image_reader tool with this path to view the image."
+
+
+# ─── Bedrock-safe image_reader ────────────────────────────────────────────────
+# Bedrock's Converse API rejects any image >8000px on a side (and >3.75MB) with a
+# ValidationException that aborts the whole agent turn. A persona that reads a
+# full-page Playwright screenshot therefore dies deterministically on every retry
+# (TEAM-3938, wf_1787865008265_jp6x10). Claude also downsamples to ~1568px on
+# the long edge server-side, so pixels beyond that only cost latency/tokens.
+IMAGE_MAX_EDGE = int(os.getenv("IMAGE_MAX_EDGE", "1568"))
+IMAGE_MAX_BYTES = int(os.getenv("IMAGE_MAX_BYTES", "3500000"))
+IMAGE_MAX_TILES = int(os.getenv("IMAGE_MAX_TILES", "6"))
+# Taller than this many widths = a scrolled page, not a picture: tile it so the
+# model can read it instead of receiving a 200px-wide sliver.
+IMAGE_TILE_ASPECT = 2.5
+_IMAGE_FORMATS = {"png", "jpeg", "gif", "webp"}
+
+
+def _fit_edge(img, max_edge: int):
+    from PIL import Image
+    w, h = img.size
+    scale = min(1.0, max_edge / max(w, h))
+    if scale >= 1.0:
+        return img
+    return img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+
+
+def _encode_image(img, fmt: str) -> tuple[bytes, str]:
+    """PNG first (lossless UI text); fall back to JPEG when PNG busts the byte cap."""
+    import io
+    buf = io.BytesIO()
+    if fmt == "jpeg":
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+    else:
+        if img.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+            img = img.convert("RGB")
+        img.save(buf, format="PNG", optimize=True)
+    data = buf.getvalue()
+    if len(data) > IMAGE_MAX_BYTES and fmt != "jpeg":
+        return _encode_image(img, "jpeg")
+    return data, fmt
+
+
+def prepare_image_blocks(path: str, max_edge: int = 0, max_tiles: int = 0) -> list[dict]:
+    """Converse content blocks for an image file, guaranteed inside Bedrock limits.
+
+    - In-limit images pass through byte-for-byte.
+    - Oversized images with normal proportions are downscaled to `max_edge`.
+    - Tall page screenshots are cut into viewport-shaped tiles (top→bottom,
+      capped at `max_tiles`; tiles grow taller rather than dropping content).
+    """
+    import math
+    from PIL import Image
+
+    max_edge = max_edge or IMAGE_MAX_EDGE
+    max_tiles = max_tiles or IMAGE_MAX_TILES
+    with Image.open(path) as im:
+        im.load()
+        fmt = (im.format or "png").lower()
+        fmt = "jpeg" if fmt == "jpg" else fmt
+        if fmt not in _IMAGE_FORMATS:
+            fmt = "png"
+        w, h = im.size
+        if w <= max_edge and h <= max_edge and os.path.getsize(path) <= IMAGE_MAX_BYTES:
+            with open(path, "rb") as f:
+                return [{"image": {"format": fmt, "source": {"bytes": f.read()}}}]
+
+        img = im.convert("RGBA") if im.mode == "P" else im.copy()
+
+    if h > w * IMAGE_TILE_ASPECT:
+        tile_h = max(1, round(w * 0.75))
+        if math.ceil(h / tile_h) > max_tiles:
+            tile_h = math.ceil(h / max_tiles)
+        n = math.ceil(h / tile_h)
+        blocks = [{"text": (
+            f"Image is {w}x{h}px — too tall for Bedrock (8000px cap), so it is "
+            f"delivered as {n} tiles top→bottom, each downscaled to fit {max_edge}px."
+        )}]
+        for i in range(n):
+            y0, y1 = i * tile_h, min(h, (i + 1) * tile_h)
+            data, out_fmt = _encode_image(_fit_edge(img.crop((0, y0, w, y1)), max_edge), "png")
+            blocks.append({"text": f"Tile {i + 1}/{n}: y={y0}-{y1}px"})
+            blocks.append({"image": {"format": out_fmt, "source": {"bytes": data}}})
+        return blocks
+
+    small = _fit_edge(img, max_edge)
+    data, out_fmt = _encode_image(small, "png")
+    return [
+        {"text": f"Image is {w}x{h}px; downscaled to {small.size[0]}x{small.size[1]}px for Bedrock."},
+        {"image": {"format": out_fmt, "source": {"bytes": data}}},
+    ]
+
+
+@tool
+def image_reader(image_path: str) -> dict:
+    """Read an image file (PNG, JPEG, GIF, WebP) so you can look at it.
+
+    Large images are downscaled and very tall page screenshots are split into
+    tiles automatically, so any file size/dimensions are safe to read.
+
+    Args:
+        image_path: Local path to the image (e.g. the path returned by download_s3_file)
+
+    Returns:
+        The image content for visual analysis.
+    """
+    if not os.path.isfile(image_path):
+        return {"status": "error", "content": [{"text": f"Image file not found: {image_path}"}]}
+    try:
+        blocks = prepare_image_blocks(image_path)
+    except Exception as exc:  # noqa: BLE001 — a bad image must never abort the turn
+        return {"status": "error", "content": [{"text": f"Could not read image {image_path}: {exc}"}]}
+    return {"status": "success", "content": blocks}
 
 
 # ─── S3 Storage Tools ─────────────────────────────────────────────────────────
