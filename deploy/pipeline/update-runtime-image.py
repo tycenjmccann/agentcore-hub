@@ -82,6 +82,32 @@ def _wait_ready(control, runtime_id: str, name: str, timeout_s: int = 900) -> No
     _fail(name, f"timed out waiting for READY (last status={status})")
 
 
+def _update_kwargs_from_live(live: dict, new_image: str) -> dict:
+    """Build the UpdateAgentRuntime kwargs: the live config verbatim with only the
+    container image changed — minus fields the API returns but refuses on Update.
+
+    requireServiceS3Endpoint: GetAgentRuntime echoes it inside
+    networkModeConfig, but runtimes created after 2026-06-11 reject ANY Update
+    that carries the key — even the unchanged live value (ValidationException,
+    run fcde61ac 2026-09-04: coding-runtime swap failed, fleet swap rolled back).
+    """
+    kwargs: dict = {
+        "agentRuntimeId": live["agentRuntimeId"],
+        "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": new_image}},
+    }
+    for field in _PRESERVED:
+        if field in live and live[field] is not None:
+            kwargs[field] = live[field]
+    if live.get("description"):
+        kwargs["description"] = live["description"]
+    net = kwargs.get("networkConfiguration")
+    if isinstance(net, dict) and isinstance(net.get("networkModeConfig"), dict):
+        net["networkModeConfig"] = {
+            k: v for k, v in net["networkModeConfig"].items() if k != "requireServiceS3Endpoint"
+        }
+    return kwargs
+
+
 def _swap(control, name: str, new_image: str) -> tuple[str, str]:
     """UpdateAgentRuntime with only the container image changed. Returns
     (runtime_id, prior_image_ref)."""
@@ -96,15 +122,8 @@ def _swap(control, name: str, new_image: str) -> tuple[str, str]:
         .get("containerUri", "")
     )
 
-    kwargs: dict = {
-        "agentRuntimeId": runtime_id,
-        "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": new_image}},
-    }
-    for field in _PRESERVED:
-        if field in live and live[field] is not None:
-            kwargs[field] = live[field]
-    if live.get("description"):
-        kwargs["description"] = live["description"]
+    live["agentRuntimeId"] = runtime_id
+    kwargs = _update_kwargs_from_live(live, new_image)
 
     try:
         control.update_agent_runtime(**kwargs)
