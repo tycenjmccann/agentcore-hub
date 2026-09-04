@@ -638,11 +638,16 @@ describe("handleReviewRejection — findings derivation (TEAM-3756 F1)", () => {
  *   (a) HUMAN-ORIGIN rejection (the gate carries the uniform human-review
  *       markers from PR #216 — assignee "human:*" and/or "human-review"/
  *       "reviewer:*" labels) → NEVER auto-approve: the gate is parked where the
- *       rejection left it and a comment asks the human to confirm or reply
- *       DECISION: continue. The human keeps authority.
- *   (b) RM-origin rejection carrying the machine-written STRUCTURED
- *       reviewFindings payload → auto-approve still works, and the done-flip is
- *       now CONDITIONED on the gate still being in blocked/in_review.
+ *       rejection left it (blocked) and a comment tells the human: approve the
+ *       gate to confirm, or leave it rejected to hold; to force rework,
+ *       re-reject (In Review → Request Changes) with a note containing a line
+ *       that reads exactly `DECISION: continue` (TEAM-3966 F1), or re-reject
+ *       citing a file in the PR change set, or reopen the upstream ticket(s)
+ *       directly. A comment alone never wakes the orchestrator — the status
+ *       change does. The human keeps authority.
+ *   (b) RM-origin rejection carrying the machine-written STRUCTURED findings
+ *       (the RM's S3 ledger round) → auto-approve still works, and the done-flip
+ *       is CONDITIONED on the gate still being `blocked` (TEAM-3966 F3).
  *       Prose-derived findings (fenced JSON parsed out of comment text) are
  *       not usable for auto-approval → park.
  *   (c) The conditional write LOSES to a concurrent transition

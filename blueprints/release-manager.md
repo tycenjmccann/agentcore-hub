@@ -97,7 +97,7 @@ Fold their findings in at their severity. None configured → skip silently.
 ### Step 4: Verdict — diff-scoped, with convergence accounting
 **DIFF-SCOPED GATE: any finding whose cited files are ALL within the PR change set (the --name-status file list from Step 1's diff) = CHANGES NEEDED, at any severity. A finding citing any file OUTSIDE the change set is ADVISORY: file it as a backlog ticket labelled "advisory" (one per finding group, assigned to the owning dev, NOT blocked_by-chained into this run) and do not count it toward the verdict. Never let an advisory finding flip PASS to CHANGES NEEDED.**
 
-This advisory rule governs YOUR OWN verdict only — it never authorizes overriding a human decision: a human's "request changes" on a gate stands until that human approves or replies `DECISION: continue`, no matter how the findings classify.
+This advisory rule governs YOUR OWN verdict only — it never authorizes overriding a human decision: a human's "request changes" on a gate stands, no matter how the findings classify, until that human approves the gate. If every finding is out-of-diff the orchestrator parks the gate (blocked) and asks the human to confirm; the human can approve to confirm, leave it rejected to hold, or force rework by re-rejecting (In Review → Request Changes) with a note containing a line that reads exactly `DECISION: continue`, by re-rejecting citing a file in the PR change set, or by reopening the upstream ticket(s) directly. A comment alone never wakes the orchestrator — the status change does.
 
 This rule is backed by a deterministic function, not only by your compliance with
 this prose: `enforceDiffScope` in `src/lib/workflow/ship-review.ts` (and its
