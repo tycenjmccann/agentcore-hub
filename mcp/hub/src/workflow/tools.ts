@@ -56,13 +56,20 @@ export const WORKFLOW_TOOLS = [
       "workflowDefId is the pipeline selector — pick an id from list_workflow_definitions (e.g. 'bug-fix' for bug runs; " +
       "omitted → the default 'software-delivery' pipeline). workflowType is a DEPRECATED back-compat alias: without " +
       "workflowDefId it maps to a def ('bug' → 'bug-fix', 'feature' → 'software-delivery'); when both are supplied the " +
-      "def wins and the run's stored type is derived from it. Sources and model override are optional.",
+      "def wins and the run's stored type is derived from it. Sources and model override are optional. " +
+      "Every repoConfig URL is verified against GitHub at submit: a URL that definitively does not exist is " +
+      "rejected (422) with did-you-mean candidates — fix the typo and resubmit, or pass allowUnresolvedRepo:true " +
+      "to let the intake agent hunt for the right repo and escalate if it can't.",
     inputSchema: {
       type: "object",
       required: ["title", "description", "repoConfig"],
       properties: {
         title: { type: "string", minLength: 1 },
         description: { type: "string", minLength: 1 },
+        allowUnresolvedRepo: {
+          type: "boolean",
+          description: "Submit even though a repoConfig URL failed the GitHub pre-flight (default false → 422).",
+        },
         repoConfig: {
           type: "object",
           required: ["layout", "repos"],

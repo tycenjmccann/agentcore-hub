@@ -157,6 +157,10 @@ export interface WorkflowState {
   phase: WorkflowPhase;
   epicId: string;                // root Jira epic ticket ID
   repoConfig: RepoConfig;
+  /** Submit-time repo URL pre-flight. Present only when a URL did NOT verify
+   *  (see src/lib/workflow/repo-check.ts); the orchestrator re-checks and
+   *  warns every persona until it resolves. */
+  repoCheck?: import("./repo-check").RepoCheck;
   input: WorkflowInput;
   agentTasks: Record<string, AgentTask>;  // keyed by agent ID
   messages: AgentMessage[];
@@ -273,6 +277,12 @@ export interface WorkflowInput {
    * Absent → attribute omitted entirely; human/API callers are unaffected.
    */
   intakeChannel?: string;
+  /**
+   * Submit even though a repoConfig URL definitively failed the GitHub
+   * pre-flight (authenticated 404). The intake agent is told the URL did not
+   * resolve and must find the right repo or escalate. Default false → 422.
+   */
+  allowUnresolvedRepo?: boolean;
   /**
    * The upstream ticket that triggered this run (e.g. a Bug being auto-filed, or
    * an anomaly ticket). When present, POST /api/workflow/start is idempotent on

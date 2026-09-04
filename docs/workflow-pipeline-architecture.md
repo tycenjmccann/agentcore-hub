@@ -1095,6 +1095,35 @@ curl -s -X POST http://localhost:3000/api/workflow/start \
   | jq .
 ```
 
+### Repo URL pre-flight (submit-time + dispatch-time)
+
+Every `repoConfig.repos[].url` is verified against GitHub before a run is
+created (`src/lib/workflow/repo-check.ts`). A URL that **definitively** does not
+exist (authenticated 404) is rejected with `422` and a did-you-mean list built
+from `GITHUB_OWNER` and the token's own repos:
+
+```json
+{ "error": "Repository URL did not resolve",
+  "details": ["https://github.com/tycenj/agentcore-hub — GitHub 404: tycenj/agentcore-hub not found (owner \"tycenj\" does not exist)"],
+  "suggestions": ["tycenjmccann/agentcore-hub"],
+  "hint": "Did you mean: https://github.com/tycenjmccann/agentcore-hub? Fix the repoConfig URL (typo?) and resubmit, or pass allowUnresolvedRepo:true ..." }
+```
+
+- Pass `allowUnresolvedRepo: true` to submit anyway. The result is stored as
+  `repoCheck` on the workflow row and the orchestrator prepends a **READ THIS
+  FIRST** block to every persona's context: do not retry the bad URL, find the
+  right repo (candidates given) or block the ticket and escalate.
+- Soft failures (no `GITHUB_PAT`, rate limit, network) never block; they are
+  persisted and echoed in the response so the agents still see the warning.
+- Runs that bypass the API (Jira bug bootstrap) get the same check at first
+  dispatch (`lambda/orchestrator/repo-check.mjs`). A negative result is
+  re-checked on every dispatch, so correcting the URL in the row clears it.
+- Kill switch: `REPO_CHECK_MODE=off` on the app and on the orchestrator Lambda.
+
+Why: on 2026-09-03 a mistyped owner produced 633 failed clones, was reported by
+the coding-runtime wrapper as "coding turn vanished", and the personas escalated
+a fake fleet-wide coding outage. Nothing along the chain had asked GitHub.
+
 ### Via the UI
 
 Navigate to `http://localhost:3000/workflow` → click "New Workflow" → fill the intake form.
