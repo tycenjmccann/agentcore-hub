@@ -24,6 +24,7 @@ export interface CardSummary {
   cost: {
     total: number; persona: number; coding: number;
     tokens: number; tokensIn: number; tokensOut: number; cached: number;
+    cacheRead?: number; cacheWrite?: number; cacheHitRate?: number; personaCacheHitRate?: number;
     byEngine: Record<string, number>;
   };
   time: {
@@ -94,6 +95,7 @@ export const FLEET_KPIS: KpiDef[] = [
   { key: "quality.nudges", label: "Nudges", unit: "count", group: "quality", floor: 1, help: "Workflow Manager had to push a stalled run" },
   { key: "quality.errors", label: "Errors", unit: "count", group: "quality", floor: 1, help: "agent.error events" },
   { key: "quality.firstPassYield", label: "First-pass yield", unit: "ratio", group: "quality", floor: 0.1, direction: "lower", help: "Share of agent tasks that needed no rework (higher is better)" },
+  { key: "cost.personaCacheHitRate", label: "Persona cache hit rate", unit: "ratio", group: "cost", floor: 0.1, direction: "lower", help: "Share of persona input tokens served from the Bedrock prompt cache (higher is better)" },
 ];
 
 export const BASELINE_DAYS = 28;
@@ -188,7 +190,7 @@ export interface FleetView {
   kpis: FleetKpi[];
   agents: AgentAgg[];
   engines: Record<string, number>;
-  totals: { runs: number; cost: number; persona: number; coding: number; tokens: number; agentWorkMs: number; wallMs: number; loops: number; reworkRounds: number };
+  totals: { runs: number; cost: number; persona: number; coding: number; tokens: number; cacheRead: number; cacheWrite: number; agentWorkMs: number; wallMs: number; loops: number; reworkRounds: number };
   infra: InfraSnapshot | null;
   /** Per-run infra allocation from the trailing-30d snapshot, if available. */
   infraPerRun: { core: number | null; runtime: number | null } | null;
@@ -252,10 +254,11 @@ export function buildFleetView(
 
   const agentMap = new Map<string, AgentAgg>();
   const engines: Record<string, number> = {};
-  const totals = { runs: runs.length, cost: 0, persona: 0, coding: 0, tokens: 0, agentWorkMs: 0, wallMs: 0, loops: 0, reworkRounds: 0 };
+  const totals = { runs: runs.length, cost: 0, persona: 0, coding: 0, tokens: 0, cacheRead: 0, cacheWrite: 0, agentWorkMs: 0, wallMs: 0, loops: 0, reworkRounds: 0 };
   for (const c of runs) {
     totals.cost += c.cost.total; totals.persona += c.cost.persona; totals.coding += c.cost.coding;
-    totals.tokens += c.cost.tokens; totals.agentWorkMs += c.time.agentWork; totals.wallMs += c.time.wall ?? 0;
+    totals.tokens += c.cost.tokens; totals.cacheRead += c.cost.cacheRead ?? 0; totals.cacheWrite += c.cost.cacheWrite ?? 0;
+    totals.agentWorkMs += c.time.agentWork; totals.wallMs += c.time.wall ?? 0;
     totals.loops += c.quality.loops; totals.reworkRounds += c.quality.reworkRounds;
     for (const [e, usd] of Object.entries(c.cost.byEngine || {})) engines[e] = (engines[e] || 0) + usd;
     for (const [agentId, a] of Object.entries(c.agents || {})) {

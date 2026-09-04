@@ -20,7 +20,8 @@ interface RunCard {
   run: { outcome: string; startedAt: string | null; completedAt: string | null; prUrl: string | null };
   cost: {
     totalUsd: number; personaUsd: number; codingUsd: number; perTaskUsd: number | null;
-    tokens: { input: number; output: number; cached: number; total: number };
+    tokens: { input: number; output: number; cached: number; total: number; cacheRead?: number; cacheWrite?: number };
+    cacheHitRate?: number | null; personaCacheHitRate?: number | null;
     byEngine: Record<string, { usd: number }>;
   };
   time: {
@@ -129,7 +130,8 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
               <Row label="Persona LLM" value={formatKpi("usd", card.cost.personaUsd)} band={k("cost.personaUsd")} />
               <Row label="Coding CLIs" value={formatKpi("usd", card.cost.codingUsd)} band={k("cost.codingUsd")} hint={Object.entries(card.cost.byEngine).filter(([e]) => e !== "persona").map(([e, v]) => `${e}: ${formatKpi("usd", v.usd)}`).join(", ")} />
               <Row label="Per agent task" value={formatKpi("usd", card.cost.perTaskUsd)} />
-              <Row label="Tokens (in / out / cached)" value={`${formatKpi("tokens", card.cost.tokens.input)} / ${formatKpi("tokens", card.cost.tokens.output)} / ${formatKpi("tokens", card.cost.tokens.cached)}`} band={k("cost.tokens.total")} />
+              <Row label="Tokens (in / out / cache r / cache w)" value={`${formatKpi("tokens", card.cost.tokens.input)} / ${formatKpi("tokens", card.cost.tokens.output)} / ${formatKpi("tokens", card.cost.tokens.cacheRead ?? card.cost.tokens.cached)} / ${formatKpi("tokens", card.cost.tokens.cacheWrite ?? 0)}`} band={k("cost.tokens.total")} />
+              <Row label="Cache hit rate (persona)" value={formatKpi("ratio", card.cost.personaCacheHitRate ?? null)} band={k("cost.personaCacheHitRate")} hint="persona input tokens served from the Bedrock prompt cache" />
             </div>
             <div className="rounded-lg border border-[var(--color-border)] p-3 space-y-1.5">
               <div className="flex items-center gap-2 mb-1"><Clock className="w-4 h-4 text-sky-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Time</span><span className="ml-auto text-base font-semibold tabular-nums">{formatKpi("ms", card.time.wallMs)}</span></div>

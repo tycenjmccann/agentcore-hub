@@ -98,6 +98,87 @@ describe("buildFleetView", () => {
   });
 });
 
+describe("cache-aware cost metrics", () => {
+  const now = new Date("2026-09-04T00:00:00Z");
+  const day = (n: number) => new Date(now.getTime() - n * 86_400_000).toISOString();
+
+  // A card carrying the optional cache fields on cost. Merges into the base
+  // card factory so the rest of the shape stays valid.
+  function cacheCard(over: Partial<CardSummary> & { completedAt: string; total?: number }, cache: { cacheRead?: number; cacheWrite?: number; personaCacheHitRate?: number; cacheHitRate?: number }): CardSummary {
+    const c = card(over);
+    return { ...c, cost: { ...c.cost, ...cache } };
+  }
+
+  it("bands cost.personaCacheHitRate as lower-is-worse through buildFleetView", () => {
+    const baseHitRate = 0.6;
+    const index: PerformanceIndex = {
+      version: 1, updatedAt: now.toISOString(), infra: null,
+      cards: [
+        // baseline / prior week: healthy persona cache hit rate
+        ...[8, 9, 10, 11, 12, 13].map((d) => cacheCard({ completedAt: day(d), total: 100 }, { personaCacheHitRate: baseHitRate })),
+        // current week: hit rate collapsed → lower is worse
+        cacheCard({ completedAt: day(1), total: 100, workflowId: "a" }, { personaCacheHitRate: 0.2 }),
+        cacheCard({ completedAt: day(2), total: 100, workflowId: "b" }, { personaCacheHitRate: 0.2 }),
+        cacheCard({ completedAt: day(3), total: 100, workflowId: "c" }, { personaCacheHitRate: 0.2 }),
+      ],
+    };
+    const v = buildFleetView(index, { days: 7, workflowDefId: "software-delivery", now });
+    const hr = v.kpis.find((k) => k.key === "cost.personaCacheHitRate")!;
+    expect(hr.direction).toBe("lower");
+    // baseline flat at 0.6, sigma floored at 0.1 → current median 0.2 is z=4 → alert
+    expect(hr.current?.median).toBe(0.2);
+    expect(hr.status).toBe("alert");
+    expect(v.anomalies.map((a) => a.kpi)).toContain("cost.personaCacheHitRate");
+  });
+
+  it("does not flag a HIGHER persona cache hit rate", () => {
+    const index: PerformanceIndex = {
+      version: 1, updatedAt: now.toISOString(), infra: null,
+      cards: [
+        ...[8, 9, 10, 11, 12, 13].map((d) => cacheCard({ completedAt: day(d), total: 100 }, { personaCacheHitRate: 0.6 })),
+        cacheCard({ completedAt: day(1), total: 100, workflowId: "a" }, { personaCacheHitRate: 0.9 }),
+        cacheCard({ completedAt: day(2), total: 100, workflowId: "b" }, { personaCacheHitRate: 0.95 }),
+        cacheCard({ completedAt: day(3), total: 100, workflowId: "c" }, { personaCacheHitRate: 0.9 }),
+      ],
+    };
+    const v = buildFleetView(index, { days: 7, workflowDefId: "software-delivery", now });
+    const hr = v.kpis.find((k) => k.key === "cost.personaCacheHitRate")!;
+    expect(hr.status).toBe("ok");
+    expect(v.anomalies.map((a) => a.kpi)).not.toContain("cost.personaCacheHitRate");
+  });
+
+  it("accumulates cacheRead / cacheWrite across runs in the window", () => {
+    const index: PerformanceIndex = {
+      version: 1, updatedAt: now.toISOString(), infra: null,
+      cards: [
+        cacheCard({ completedAt: day(1), total: 100, workflowId: "a" }, { cacheRead: 1000, cacheWrite: 200 }),
+        cacheCard({ completedAt: day(2), total: 100, workflowId: "b" }, { cacheRead: 500, cacheWrite: 50 }),
+      ],
+    };
+    const v = buildFleetView(index, { days: 7, workflowDefId: "software-delivery", now });
+    expect(v.totals.cacheRead).toBe(1500);
+    expect(v.totals.cacheWrite).toBe(250);
+  });
+
+  it("back-compat: cards without cache fields pass through with no NaN", () => {
+    // Plain cards from the base factory — none carry cacheRead/cacheWrite/personaCacheHitRate.
+    const index: PerformanceIndex = {
+      version: 1, updatedAt: now.toISOString(), infra: null,
+      cards: [8, 9, 10, 11, 12, 13, 1, 2, 3].map((d) => card({ completedAt: day(d), total: 100 })),
+    };
+    const v = buildFleetView(index, { days: 7, workflowDefId: "software-delivery", now });
+    // Missing fields treated as 0, never NaN.
+    expect(v.totals.cacheRead).toBe(0);
+    expect(v.totals.cacheWrite).toBe(0);
+    expect(Number.isNaN(v.totals.cacheRead)).toBe(false);
+    // KPI series just omits the absent metric — no stats, status insufficient/unknown, no throw.
+    const hr = v.kpis.find((k) => k.key === "cost.personaCacheHitRate")!;
+    expect(hr.current).toBeNull();
+    expect(hr.series).toHaveLength(0);
+    expect(["insufficient", "unknown"]).toContain(hr.status);
+  });
+});
+
 describe("formatKpi", () => {
   it("formats units", () => {
     expect(formatKpi("usd", 1234)).toBe("$1.2k");
