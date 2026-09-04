@@ -354,6 +354,19 @@ export async function setResumeContext(workflowId, ticketId, note) {
   }));
 }
 
+/**
+ * Persist the repo URL pre-flight result (see repo-check.mjs). Scoped SET of
+ * one attribute — never touches the rest of the row.
+ */
+export async function setRepoCheck(workflowId, repoCheck) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET repoCheck = :rc",
+    ExpressionAttributeValues: { ":rc": repoCheck },
+  }));
+}
+
 /** Remove one resume context (one-time use). No-op if absent. */
 export async function removeResumeContext(workflowId, ticketId) {
   try {

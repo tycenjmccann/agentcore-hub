@@ -12,6 +12,7 @@ import {
   incrementDeadSessionRetry,
   advancePhase,
   setResumeContext,
+  setRepoCheck,
   appendNotification,
   appendReviewNotificationOnce,
   ackNotifications,
@@ -603,5 +604,18 @@ describe("review gate ledger (TEAM-3619 D2c)", () => {
     expect(writes()[2].input.UpdateExpression).toBe(
       "SET reviewGateHistory.#g.authorizations = list_append(if_not_exists(reviewGateHistory.#g.authorizations, :empty), :a)"
     );
+  });
+});
+
+describe("setRepoCheck (repo URL pre-flight)", () => {
+  it("is a scoped SET of the single repoCheck attribute — no full-row put", async () => {
+    initWorkflowStore(stubDdb, "wf");
+    sent.length = 0;
+    const rc = { checkedAt: "2026-09-04T00:00:00Z", results: [{ url: "https://github.com/tycenj/agentcore-hub", ok: false, definitive: true, status: 404, reason: "GitHub 404" }] };
+    await setRepoCheck("wf_1", rc);
+    expect(sent.length).toBe(1);
+    expect(sent[0].input.UpdateExpression).toBe("SET repoCheck = :rc");
+    expect(sent[0].input.ExpressionAttributeValues[":rc"]).toEqual(rc);
+    expect(sent[0].input.Key).toEqual({ workflowId: "wf_1" });
   });
 });

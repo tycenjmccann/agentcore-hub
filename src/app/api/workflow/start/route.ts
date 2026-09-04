@@ -15,6 +15,8 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { validateIntakeSources } from "@/lib/workflow/intake";
+import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure } from "@/lib/workflow/repo-check";
+import type { RepoCheck } from "@/lib/workflow/repo-check";
 import type { WorkflowInput } from "@/lib/workflow/types";
 import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
 import { workflowTypeForDef } from "@/lib/workflow/workflow-defs";
@@ -397,6 +399,31 @@ export async function POST(req: NextRequest) {
       body.repoConfig = { layout: "multi-repo", repos: [] };
     }
 
+    // Repo URL pre-flight. A mistyped owner used to sail through here and
+    // surface a day later as a fake "all coding engines down" outage (the
+    // clone 404 was laundered into "coding turn vanished"). Ask GitHub now.
+    // Only an AUTHENTICATED not-found is definitive; anything else (no token,
+    // rate limit, network) just rides along as a warning for the agents.
+    // REPO_CHECK_MODE=off is the kill switch. allowUnresolvedRepo:true lets a
+    // caller knowingly submit a URL that failed and have the intake agent
+    // hunt for the right one (and escalate if it can't).
+    let repoCheck: RepoCheck | undefined;
+    if (process.env.REPO_CHECK_MODE !== "off" && (body.repoConfig.repos ?? []).some((r) => r?.url)) {
+      repoCheck = await checkRepoConfig(body.repoConfig, {
+        token: process.env.GITHUB_PAT,
+        fallbackOwner: process.env.GITHUB_OWNER,
+      });
+      const failures = definitiveFailures(repoCheck);
+      if (failures.length > 0 && body.allowUnresolvedRepo !== true) {
+        return NextResponse.json({ ...describeRepoCheckFailure(failures), repoCheck }, { status: 422 });
+      }
+      if (repoCheck.results.every((r) => r.ok)) {
+        repoCheck = undefined; // clean — nothing to persist or warn about
+      } else {
+        responseMeta.repoCheck = repoCheck;
+      }
+    }
+
     if (!body.sources) body.sources = [];
     if (!body.description) body.description = "";
 
@@ -427,9 +454,9 @@ export async function POST(req: NextRequest) {
     }
 
     if (TICKET_PROVIDER === "jira") {
-      return await startWithJira(body, def, workflowId, markerId, responseMeta);
+      return await startWithJira(body, def, workflowId, markerId, responseMeta, repoCheck);
     } else {
-      return await startWithDynamoDB(body, def, workflowId, markerId, responseMeta);
+      return await startWithDynamoDB(body, def, workflowId, markerId, responseMeta, repoCheck);
     }
   } catch (err) {
     console.error("Workflow start error:", err);
@@ -441,9 +468,9 @@ export async function POST(req: NextRequest) {
 
 /** TEAM-3832 FR3b: success-response extras when a caller-supplied workflowType
  *  contradicted the resolved def and was overridden (the def always wins). */
-type StartResponseMeta = { workflowTypeOverridden?: true; note?: string };
+type StartResponseMeta = { workflowTypeOverridden?: true; note?: string; repoCheck?: RepoCheck };
 
-async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}) {
+async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}, repoCheck?: RepoCheck) {
   const { JiraCloudProvider } = await import("@/lib/workflow/ticket-provider-jira");
   const jira = new JiraCloudProvider();
 
@@ -465,6 +492,9 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
     phase: intakePhase,
     epicId,
     repoConfig: body.repoConfig,
+    // Only present when a repo URL did NOT verify — the orchestrator prepends
+    // the warning to every persona's context until the URL is fixed.
+    ...(repoCheck ? { repoCheck } : {}),
     // Routine-scoped connectors (if any) — forwarded to each agent invoke so
     // the runtime loads their creds/tools for this workflow's run only.
     connectors: body.connectors,
@@ -538,7 +568,7 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
 
 // ─── DynamoDB Backend (via ticket tools Lambda) ──────────────────────────────
 
-async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}) {
+async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}, repoCheck?: RepoCheck) {
   const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
   const intakePhaseName = def.phases.find((p) => p.type === "agent")?.name || "Intake";
   const workflowId = presetWorkflowId || mintWorkflowId();
@@ -573,6 +603,9 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
     phase: intakePhase,
     epicId,
     repoConfig: body.repoConfig,
+    // Only present when a repo URL did NOT verify — the orchestrator prepends
+    // the warning to every persona's context until the URL is fixed.
+    ...(repoCheck ? { repoCheck } : {}),
     // Routine-scoped connectors (if any) — forwarded to each agent invoke so
     // the runtime loads their creds/tools for this workflow's run only.
     connectors: body.connectors,

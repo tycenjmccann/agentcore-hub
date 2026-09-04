@@ -29,6 +29,9 @@ export default defineConfig({
       // workflow-store is pure DDB-command construction — unit-testable with a
       // stub client, same rationale as the eval-packager classifiers.
       "lambda/orchestrator/workflow-store.test.mjs",
+      // repo-check.mjs — the dispatch-time repo URL pre-flight (mirror of
+      // src/lib/workflow/repo-check.ts); fetch is injected, so no network.
+      "lambda/orchestrator/repo-check.test.mjs",
       // lease.mjs is the orchestrator port of the lease primitives (TEAM-3618)
       // — pure liveness math + DDB-command construction, stub-client testable.
       // Its parity with src/lib/workflow/lease.ts is asserted by the auto-

@@ -57,6 +57,10 @@ export const WorkflowInputSchema = z.object({
   workflowDefId: z.string().optional(),
   reviewGates: z.array(z.string()).optional(),
   portedSession: PortedSessionSchema.optional(),
+  // Waive the submit-time GitHub pre-flight on a repoConfig URL that
+  // definitively does not exist; the intake agent then hunts for the right
+  // repo and escalates if it can't. Default: the API rejects with 422.
+  allowUnresolvedRepo: z.boolean().optional(),
 });
 
 export const SubmitWorkflowInputSchema = WorkflowInputSchema;

@@ -44,6 +44,7 @@ import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
+import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -2819,6 +2820,12 @@ async function buildAgentContext(ticket, workflow) {
 
   // Repo identity — scope only
   if (workflow.repoConfig?.repos?.length > 0) {
+    // Repo URL pre-flight: a URL that does not resolve is announced to EVERY
+    // persona on the run, ahead of the repo identity, so nobody burns coding
+    // turns on a 404 clone and reports it as a runtime outage (2026-09-03).
+    const repoCheck = await ensureRepoCheck(workflow, { store });
+    const warning = formatRepoCheckWarning(repoCheck);
+    if (warning) context += warning;
     const { owner, repo } = parseRepoUrl(workflow.repoConfig);
     const defaultBranch = workflow.repoConfig.repos[0]?.defaultBranch || "main";
     context += `## Repository\nowner: ${owner}\nrepo: ${repo}\ndefault_branch: ${defaultBranch}\n\n`;
