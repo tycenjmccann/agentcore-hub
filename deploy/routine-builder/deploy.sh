@@ -33,7 +33,7 @@ echo "════════════════════════�
 
 aws s3 sync "${REPO_ROOT}/deploy/routine-builder/toolkit/" \
   "s3://${BUCKET}/routine-builder/toolkit/" \
-  --exclude "test_*.py" --delete --quiet
+  --exclude "test_*.py" --exclude "*.pyc" --delete --quiet
 echo "✓ Toolkit: s3://${BUCKET}/routine-builder/toolkit/"
 
 echo ""
