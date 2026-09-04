@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { createHash } from "node:crypto";
 
 /**
  * TEAM-3619 D2c + D4c — the orchestrator side of handleReviewRejection.
@@ -911,6 +912,260 @@ describe("handleReviewRejection — advisory park is idempotent across redeliver
     expect(h.state.ebEvents).toHaveLength(0);
     // And still nothing else moved: no reopen, no flip.
     expect(h.state.updates).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-3970 (ship-review F-2) — the F4 redelivery guard must discriminate a TRUE
+ * redelivery (same parked state re-processed) from a NEW rejection cycle (the
+ * human moved the gate In Review → Request Changes again with a fresh note).
+ * Before: ANY historical marker comment short-circuited the park, so the second
+ * cycle posted nothing and emitted no review.parked_advisory — the
+ * change-request metric undercounted by one.
+ *
+ * Discriminator (both providers):
+ *   E1 — a non-marker comment NEWER than the latest marker (by timestamp when
+ *        both parse, else by array position). Jira: the human's note is always
+ *        a comment posted BEFORE the transition (agentcore-hub-jira
+ *        transitionTicket) and mapJiraIssueToTicket keeps API order + `created`.
+ *   E2 — DDB only: the marker embeds `[fp:<sha256[0..12] of reviewComment>]`
+ *        at park time; a later invocation whose reviewComment fingerprints
+ *        differently is a new cycle. Needed because the DDB tickets Lambda
+ *        writes the rejection note to `reviewComment` ONLY (no comments[]
+ *        entry). Jira is excluded because there `reviewComment` is the LAST
+ *        comment, which on a redelivery is the marker itself.
+ * Fallback: legacy marker without fp / no timestamps → array order only, which
+ * is exactly the pre-existing F4 behavior.
+ */
+describe("handleReviewRejection — redelivery vs a NEW rejection cycle (TEAM-3970)", () => {
+  const advisoryEnforce = () => vi.fn(async () => ({ escalated: false, gated: false }));
+  const ADVISORY = [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }];
+  const fp = (s) => createHash("sha256").update(String(s), "utf8").digest("hex").slice(0, 12);
+  const MARKER = "[orchestrator:parked-advisory]";
+  const markerText = (note) =>
+    `${MARKER} [fp:${fp(note)}] All findings appear out-of-diff for this fix — approve the gate to confirm ...`;
+  const gateComments = () =>
+    h.state.updates.filter(
+      (u) => u.Key.ticketId === "TEAM-900" && String(u.UpdateExpression).includes("list_append")
+    );
+  const parkedEvents = () => h.state.events.filter((e) => e.type === "review.parked_advisory");
+
+  it("DDB shape: old marker comment, then a NEW rejection note in reviewComment → ONE new park comment, ONE event", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...GATE,
+      assignee: "human:engineer",
+      reviewFindings: ADVISORY,
+      // The DDB tickets Lambda writes the human's note to reviewComment only;
+      // comments[] holds the orchestrator's earlier park (with the OLD note's fp).
+      comments: [
+        { id: "comment-1", author: "orchestrator", content: markerText("please fix the null check"), timestamp: "2026-09-04T10:00:05.000Z" },
+      ],
+      reviewComment: "Second look: I still want this reworked, the vendor helper is a smell.",
+      updatedAt: "2026-09-04T11:30:00.000Z",
+    });
+
+    const comments = gateComments();
+    expect(comments).toHaveLength(1);
+    const posted = comments[0].ExpressionAttributeValues[":n"][0].content;
+    expect(posted).toContain(MARKER);
+    // The new marker fingerprints the NEW note, so a redelivery of THIS cycle is caught next time.
+    expect(posted).toContain(`[fp:${fp("Second look: I still want this reworked, the vendor helper is a smell.")}]`);
+    expect(parkedEvents()).toHaveLength(1);
+    expect(parkedEvents()[0].detail.reason).toBe("human_origin_rejection");
+  });
+
+  it("Jira shape (mapJiraIssueToTicket): human note comment NEWER than the marker → ONE new park comment, ONE event", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...GATE,
+      assignee: "human:engineer",
+      labels: ["human-review", "reviewer:engineer"],
+      reviewFindings: ADVISORY,
+      // Exactly the shape mapJiraIssueToTicket produces: API (chronological)
+      // order, {author, content, timestamp: created}; reviewComment = last.
+      comments: [
+        { author: "Engineer", content: "please fix the null check", timestamp: "2026-09-04T10:00:00.000+0000" },
+        { author: "AgentCore Bot", content: markerText("please fix the null check"), timestamp: "2026-09-04T10:00:05.000+0000" },
+        { author: "Engineer", content: "Re-rejecting: the vendor helper still bothers me.", timestamp: "2026-09-04T11:00:00.000+0000" },
+      ],
+      reviewComment: "Re-rejecting: the vendor helper still bothers me.",
+    });
+
+    expect(gateComments()).toHaveLength(1);
+    expect(parkedEvents()).toHaveLength(1);
+  });
+
+  it("Jira shape WITHOUT parseable timestamps → array position decides: a comment after the marker is a new cycle", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...GATE,
+      assignee: "human:engineer",
+      reviewFindings: ADVISORY,
+      comments: [
+        { author: "AgentCore Bot", content: markerText("please fix the null check") },
+        { author: "Engineer", content: "Re-rejecting, new note." },
+      ],
+      reviewComment: "Re-rejecting, new note.",
+    });
+
+    expect(gateComments()).toHaveLength(1);
+    expect(parkedEvents()).toHaveLength(1);
+  });
+
+  it("TRUE redelivery, DDB shape: marker fp matches the unchanged reviewComment → zero comments, zero events (F4 preserved)", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...GATE,
+      assignee: "human:engineer",
+      reviewFindings: ADVISORY,
+      comments: [
+        { id: "comment-1", author: "orchestrator", content: markerText("please fix the null check"), timestamp: "2026-09-04T10:00:05.000Z" },
+      ],
+      reviewComment: "please fix the null check",
+      updatedAt: "2026-09-04T10:00:05.003Z",
+    });
+
+    expect(gateComments()).toHaveLength(0);
+    expect(h.state.events).toHaveLength(0);
+    expect(h.state.ebEvents).toHaveLength(0);
+  });
+
+  it("TRUE redelivery: marker is the newest comment and reviewComment IS the marker (never a human note) → zero comments, zero events", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...GATE,
+      assignee: "human:engineer",
+      reviewFindings: ADVISORY,
+      comments: [
+        { author: "Engineer", content: "please fix the null check", timestamp: "2026-09-04T10:00:00.000+0000" },
+        { author: "AgentCore Bot", content: markerText("please fix the null check"), timestamp: "2026-09-04T10:00:05.000+0000" },
+      ],
+      // The provider surfaced the orchestrator's own park comment as
+      // reviewComment (Jira does exactly this: reviewComment = last comment).
+      // That is never a human note, so the fp check must not fire — regardless
+      // of provider mode. (The Jira-mode twin of this case lives in the
+      // "new rejection cycle in Jira mode" describe below.)
+      reviewComment: markerText("please fix the null check"),
+    });
+
+    expect(gateComments()).toHaveLength(0);
+    expect(h.state.events).toHaveLength(0);
+  });
+
+  it("legacy marker (no fp, no timestamps) with a reviewComment present → falls back to array order: still a redelivery", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...GATE,
+      assignee: "human:engineer",
+      reviewFindings: ADVISORY,
+      comments: [
+        { author: "engineer", content: "please fix the null check" },
+        { author: "orchestrator", content: `${MARKER} All findings appear out-of-diff for this fix — approve the gate to confirm ...` },
+      ],
+      reviewComment: "please fix the null check",
+    });
+
+    expect(gateComments()).toHaveLength(0);
+    expect(h.state.events).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-3970 in Jira mode: the same new-cycle detection with the provider's real
+ * comment write (POST /rest/api/3/issue/{key}/comment) — exactly one POST and
+ * one review.parked_advisory.
+ */
+describe("handleReviewRejection — new rejection cycle in Jira mode posts exactly one park comment (TEAM-3970)", () => {
+  const advisoryEnforce = () => vi.fn(async () => ({ escalated: false, gated: false }));
+  const ADVISORY = [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }];
+  const MARKER = "[orchestrator:parked-advisory]";
+  const jsonResp = (obj, status = 200) => ({ ok: true, status, text: async () => JSON.stringify(obj) });
+  const upstreamIssue = {
+    key: "TEAM-10",
+    fields: { summary: "TEAM-10", status: { name: "Done" }, labels: ["agent:agentcore_hub_api_dev"], issuetype: { name: "Task" }, parent: { key: "TEAM-1" }, issuelinks: [], comment: { comments: [] } },
+  };
+
+  beforeEach(async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    process.env.JIRA_SITE_URL = "jira.test";
+    process.env.JIRA_EMAIL = "bot@test";
+    process.env.JIRA_API_TOKEN = "t";
+    vi.resetModules();
+    ({ handleReviewRejection } = await import("./index.mjs"));
+    h.state.enforce = advisoryEnforce();
+  });
+  afterEach(() => {
+    delete process.env.TICKET_PROVIDER;
+    delete process.env.JIRA_SITE_URL;
+    delete process.env.JIRA_EMAIL;
+    delete process.env.JIRA_API_TOKEN;
+  });
+
+  it("human note newer than the marker → ONE POST /comment on the gate and ONE event", async () => {
+    const fetchSpy = vi.fn(async (url, init = {}) => {
+      const u = String(url);
+      if (u.includes("/issue/TEAM-10?fields")) return jsonResp(upstreamIssue);
+      if (u.includes("/issue/TEAM-900/comment")) return jsonResp({}, 201);
+      return jsonResp({});
+    });
+    global.fetch = fetchSpy;
+
+    await handleReviewRejection({
+      ...GATE,
+      assignee: "human:engineer",
+      labels: ["human-review", "reviewer:engineer"],
+      reviewFindings: ADVISORY,
+      comments: [
+        { author: "Engineer", content: "please fix the null check", timestamp: "2026-09-04T10:00:00.000+0000" },
+        { author: "AgentCore Bot", content: `${MARKER} [fp:0123456789ab] All findings appear out-of-diff ...`, timestamp: "2026-09-04T10:00:05.000+0000" },
+        { author: "Engineer", content: "Re-rejecting: still not convinced.", timestamp: "2026-09-04T11:00:00.000+0000" },
+      ],
+      reviewComment: "Re-rejecting: still not convinced.",
+    });
+
+    const commentPosts = fetchSpy.mock.calls.filter(
+      ([u, init]) => String(u).includes("/issue/TEAM-900/comment") && (init?.method || "GET") === "POST"
+    );
+    expect(commentPosts).toHaveLength(1);
+    expect(JSON.stringify(JSON.parse(commentPosts[0][1].body))).toContain(MARKER);
+    expect(h.state.events.filter((e) => e.type === "review.parked_advisory")).toHaveLength(1);
+  });
+
+  it("TRUE redelivery in Jira mode: marker is the newest comment, reviewComment = that marker → zero POSTs, zero events", async () => {
+    const fetchSpy = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes("/issue/TEAM-10?fields")) return jsonResp(upstreamIssue);
+      if (u.includes("/issue/TEAM-900/comment")) return jsonResp({}, 201);
+      return jsonResp({});
+    });
+    global.fetch = fetchSpy;
+    const marker = `${MARKER} [fp:0123456789ab] All findings appear out-of-diff ...`;
+
+    await handleReviewRejection({
+      ...GATE,
+      assignee: "human:engineer",
+      labels: ["human-review", "reviewer:engineer"],
+      reviewFindings: ADVISORY,
+      comments: [
+        { author: "Engineer", content: "please fix the null check", timestamp: "2026-09-04T10:00:00.000+0000" },
+        { author: "AgentCore Bot", content: marker, timestamp: "2026-09-04T10:00:05.000+0000" },
+      ],
+      // mapJiraIssueToTicket: reviewComment = last comment = the marker itself.
+      reviewComment: marker,
+    });
+
+    const commentPosts = fetchSpy.mock.calls.filter(
+      ([u, init]) => String(u).includes("/issue/TEAM-900/comment") && (init?.method || "GET") === "POST"
+    );
+    expect(commentPosts).toHaveLength(0);
+    expect(h.state.events).toHaveLength(0);
   });
 });
 

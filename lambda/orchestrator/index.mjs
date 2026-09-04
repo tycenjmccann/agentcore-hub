@@ -12,6 +12,7 @@
  * This Lambda is the SOLE orchestrator.
  */
 
+import { createHash } from "node:crypto";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
@@ -67,6 +68,15 @@ const ADVISORY_APPROVE_BACKOFF_MS = Number(process.env.ADVISORY_APPROVE_BACKOFF_
 // redelivered rejection (SQS retry, stream re-poll, webhook replay) can detect
 // the gate is ALREADY parked and skip the duplicate comment + event.
 const PARK_ADVISORY_MARKER = "[orchestrator:parked-advisory]";
+// TEAM-3970: the park comment also embeds `[fp:<12 hex>]` — a fingerprint of the
+// human's rejection note (gateTicket.reviewComment) at park time — so a later
+// invocation can tell a TRUE redelivery (same note) from a NEW rejection cycle
+// (different note) even when the provider never surfaces the note as a comment
+// (the DDB tickets Lambda writes it to reviewComment only). See the park branch.
+const PARK_FP_RE = /\[fp:([0-9a-f]{12})\]/;
+function parkNoteFingerprint(note) {
+  return createHash("sha256").update(String(note), "utf8").digest("hex").slice(0, 12);
+}
 // Dead-session detector rollout flag (TEAM-3618 D1.2): off = skip the sweep,
 // shadow = observe + metrics + shadow-flagged events but ZERO writes, enforce =
 // steal/retry/escalate. Unset/empty DEFAULTS TO SHADOW (TEAM-3763 F1): per the
@@ -1492,25 +1502,78 @@ export async function handleReviewRejection(gateTicket) {
           `— parking the gate for the human instead of auto-approving.`
       );
       // TEAM-3966 F4 — idempotent across redelivery. The orchestrator's own
-      // park comment carries PARK_ADVISORY_MARKER; if the gate already has one,
-      // this is a re-processing of the same parked state (SQS retry / stream
-      // re-poll / webhook replay): log, but post no second comment and publish
-      // no second review.parked_advisory. Both providers surface comments as
-      // [{author, content, timestamp}] (mapJiraIssueToTicket / DDB item).
-      const alreadyParked = (Array.isArray(gateTicket.comments) ? gateTicket.comments : []).some(
-        (c) => String(c?.content ?? c?.body ?? c ?? "").includes(PARK_ADVISORY_MARKER)
-      );
-      if (alreadyParked) {
+      // park comment carries PARK_ADVISORY_MARKER; if the gate already has one
+      // AND nothing newer than it is observable, this is a re-processing of the
+      // same parked state (SQS retry / stream re-poll / webhook replay): log,
+      // but post no second comment and publish no second review.parked_advisory.
+      // Both providers surface comments as [{author, content, timestamp}]
+      // (mapJiraIssueToTicket / DDB item).
+      //
+      // TEAM-3970 — a marker alone is NOT proof of redelivery: the human may
+      // have moved the gate In Review → Request Changes AGAIN with a fresh note
+      // (a real new transition that must park + count again). Redelivery only
+      // when BOTH hold:
+      //   E1  no non-marker comment is NEWER than the latest marker — by
+      //       timestamp when both parse, else by array position. Jira: the
+      //       human's note is always a comment posted BEFORE the transition
+      //       (agentcore-hub-jira transitionTicket) and mapJiraIssueToTicket
+      //       keeps API order with `created` as `timestamp`. DDB: a console
+      //       comment (/tickets/comment) lands the same way.
+      //   E2  (DDB only) the latest marker's `[fp:…]` — the fingerprint of the
+      //       reviewComment at park time — still matches the current
+      //       reviewComment. Needed because the DDB tickets Lambda writes the
+      //       rejection note to `reviewComment` ONLY (no comments[] entry), so
+      //       E1 can never see it there. Jira is excluded because there
+      //       `reviewComment` is the LAST comment, which on a redelivery is the
+      //       marker itself and would false-positive.
+      // Fallback (legacy marker without fp / no timestamps / no reviewComment):
+      // array order alone — byte-identical to the original F4 guard, i.e. a
+      // marker that is the newest comment is a redelivery.
+      const comments = Array.isArray(gateTicket.comments) ? gateTicket.comments : [];
+      const textOf = (c) => String(c?.content ?? c?.body ?? c ?? "");
+      const tsOf = (c) => {
+        const t = Date.parse(String(c?.timestamp ?? c?.created ?? ""));
+        return Number.isFinite(t) ? t : null;
+      };
+      const isMarker = (c) => textOf(c).includes(PARK_ADVISORY_MARKER);
+      let markerIdx = -1;
+      comments.forEach((c, i) => { if (isMarker(c)) markerIdx = i; }); // latest marker by position
+      const marker = markerIdx >= 0 ? comments[markerIdx] : null;
+      // A reviewComment that IS an orchestrator park comment (Jira sets
+      // reviewComment to the last comment, which on a redelivery is the marker)
+      // is never a human note — fingerprint nothing rather than the marker.
+      const noteFp =
+        typeof gateTicket.reviewComment === "string" &&
+        gateTicket.reviewComment &&
+        !gateTicket.reviewComment.includes(PARK_ADVISORY_MARKER)
+          ? parkNoteFingerprint(gateTicket.reviewComment)
+          : null;
+      if (marker) {
+        const markerTs = tsOf(marker);
+        const newerComment = comments.some((c, i) => {
+          if (isMarker(c)) return false;
+          const t = tsOf(c);
+          return markerTs !== null && t !== null ? t > markerTs : i > markerIdx;
+        });
+        const markerFp = PARK_FP_RE.exec(textOf(marker))?.[1] ?? null;
+        const newerNote =
+          TICKET_PROVIDER !== "jira" && markerFp !== null && noteFp !== null && markerFp !== noteFp;
+        if (!newerComment && !newerNote) {
+          console.log(
+            `[orchestrator] Review gate ${gateTicket.ticketId} is already parked (advisory) — redelivery; ` +
+              `skipping duplicate park comment and event.`
+          );
+          return;
+        }
         console.log(
-          `[orchestrator] Review gate ${gateTicket.ticketId} is already parked (advisory) — redelivery; ` +
-            `skipping duplicate park comment and event.`
+          `[orchestrator] Review gate ${gateTicket.ticketId} was parked before, but a NEW rejection cycle is ` +
+            `observable (${newerComment ? "newer human comment" : "reviewComment changed"}) — parking again.`
         );
-        return;
       }
       try {
         await commentOnTicket(
           gateTicket.ticketId,
-          `${PARK_ADVISORY_MARKER} All findings appear out-of-diff for this fix — approve the gate to confirm, ` +
+          `${PARK_ADVISORY_MARKER}${noteFp ? ` [fp:${noteFp}]` : ""} All findings appear out-of-diff for this fix — approve the gate to confirm, ` +
             `or leave it rejected to hold. To force rework: move the gate back to In Review, then Request Changes ` +
             `again with a note containing a line that reads exactly "DECISION: continue" — a comment alone does ` +
             `not wake the orchestrator, the status change does. Alternatively, re-reject citing a file in the PR ` +
