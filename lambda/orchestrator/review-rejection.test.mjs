@@ -33,6 +33,10 @@ const h = vi.hoisted(() => ({
     // letting one land; gateDoneAttempts = every attempt (thrown or not).
     failGateDone: 0,
     gateDoneAttempts: 0,
+    // TEAM-3790: when true, the gate done-write throws
+    // ConditionalCheckFailedException — a concurrent transition moved the gate
+    // out of blocked/in_review, so the conditional write loses.
+    conditionFailGateDone: false,
   },
 }));
 
@@ -64,6 +68,13 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               cmd.input.ExpressionAttributeValues?.[":s"] === "done";
             if (isGateDone) {
               h.state.gateDoneAttempts++;
+              // TEAM-3790: simulate a concurrent transition winning — DynamoDB
+              // rejects the conditioned write.
+              if (h.state.conditionFailGateDone) {
+                const e = new Error("The conditional request failed");
+                e.name = "ConditionalCheckFailedException";
+                throw e;
+              }
               if (h.state.failGateDone > 0) {
                 h.state.failGateDone--;
                 throw new Error("transient DDB failure");
@@ -143,6 +154,7 @@ beforeEach(async () => {
   h.state.s3Objects = {};
   h.state.failGateDone = 0;
   h.state.gateDoneAttempts = 0;
+  h.state.conditionFailGateDone = false;
   // TEAM-3765 F4: zero backoff so the bounded auto-approve retry is instant.
   process.env.ADVISORY_APPROVE_BACKOFF_MS = "0";
   // agentcore_hub_api_dev is a "development"-phase agent in the fallback roster.
@@ -598,5 +610,144 @@ describe("handleReviewRejection — findings derivation (TEAM-3756 F1)", () => {
     await handleReviewRejection(GATE); // no changeSet anywhere, no PR url
 
     expect(enforceArg().findings).toBeNull();
+  });
+});
+
+/**
+ * TEAM-3790 — gate integrity: the advisory auto-approve must never override a
+ * human's rejection, must never run off prose-derived findings, and must never
+ * blind-write over a concurrent transition.
+ *
+ *   (a) HUMAN-ORIGIN rejection (the gate carries the uniform human-review
+ *       markers from PR #216 — assignee "human:*" and/or "human-review"/
+ *       "reviewer:*" labels) → NEVER auto-approve: the gate is parked where the
+ *       rejection left it and a comment asks the human to confirm or reply
+ *       DECISION: continue. The human keeps authority.
+ *   (b) RM-origin rejection carrying the machine-written STRUCTURED
+ *       reviewFindings payload → auto-approve still works, and the done-flip is
+ *       now CONDITIONED on the gate still being in blocked/in_review.
+ *       Prose-derived findings (fenced JSON parsed out of comment text) are
+ *       not usable for auto-approval → park.
+ *   (c) The conditional write LOSES to a concurrent transition
+ *       (ConditionalCheckFailedException) → no overwrite, exactly one attempt,
+ *       handled (logged) — never retried, never rethrown, never escalated.
+ */
+describe("handleReviewRejection — human authority over advisory auto-approve (TEAM-3790)", () => {
+  const advisoryEnforce = () => vi.fn(async () => ({ escalated: false, gated: false }));
+  const STRUCTURED_FINDINGS = [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }];
+  const gateDoneWrites = () =>
+    h.state.updates.filter(
+      (u) => u.Key.ticketId === "TEAM-900" && u.ExpressionAttributeValues?.[":s"] === "done"
+    );
+  const gateComments = () =>
+    h.state.updates.filter(
+      (u) => u.Key.ticketId === "TEAM-900" && String(u.UpdateExpression).includes("list_append")
+    );
+
+  it("(a) human-origin rejection (human:* assignee) with all-advisory findings → parked + confirm comment, NOT done", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...GATE,
+      assignee: "human:engineer",
+      reviewFindings: STRUCTURED_FINDINGS,
+    });
+
+    // The gate is NEVER transitioned — it stays blocked, the human keeps authority.
+    expect(gateDoneWrites()).toHaveLength(0);
+    expect(h.state.gateDoneAttempts).toBe(0);
+    // Upstream work is not reopened either (the findings are all out-of-diff).
+    expect(h.state.updates.filter((u) => u.Key.ticketId === "TEAM-10")).toHaveLength(0);
+    // The human is asked to confirm — with the exact way forward.
+    const comments = gateComments();
+    expect(comments).toHaveLength(1);
+    expect(comments[0].ExpressionAttributeValues[":n"][0].content).toContain(
+      "approve to confirm, or reply DECISION: continue"
+    );
+    // Observable park, not a silent stall — and NOT any of the resolution events.
+    const parked = h.state.events.find((e) => e.type === "review.parked_advisory");
+    expect(parked).toBeTruthy();
+    expect(parked.detail.reason).toBe("human_origin_rejection");
+    expect(parked.detail.advisoryFindings).toEqual(STRUCTURED_FINDINGS);
+    expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeUndefined();
+    expect(h.state.events.find((e) => e.type === "review.rejected")).toBeUndefined();
+  });
+
+  it("(a) human-origin via the PR #216 labels alone (human-review / reviewer:*) is parked the same way", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...GATE,
+      labels: ["human-review", "reviewer:qa-lead"],
+      reviewFindings: STRUCTURED_FINDINGS,
+    });
+
+    expect(gateDoneWrites()).toHaveLength(0);
+    expect(h.state.events.find((e) => e.type === "review.parked_advisory")?.detail.reason).toBe(
+      "human_origin_rejection"
+    );
+    expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeUndefined();
+  });
+
+  it("(b) RM-origin with the machine-written structured payload still auto-approves — via a CONDITIONED write", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    // No human-review markers: this rejection is the release manager's own
+    // verdict delivery, carrying the plumbing-forwarded structured findings.
+    await handleReviewRejection({ ...GATE, reviewFindings: STRUCTURED_FINDINGS });
+
+    const done = gateDoneWrites();
+    expect(done).toHaveLength(1);
+    // TEAM-3790: the flip to done only lands from the expected pre-states.
+    expect(done[0].ConditionExpression).toBe("#s IN (:expectBlocked, :expectInReview)");
+    expect(done[0].ExpressionAttributeValues[":expectBlocked"]).toBe("blocked");
+    expect(done[0].ExpressionAttributeValues[":expectInReview"]).toBe("in_review");
+    expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeTruthy();
+    expect(h.state.events.find((e) => e.type === "review.parked_advisory")).toBeUndefined();
+  });
+
+  it("(b) prose-derived findings (fenced JSON in the comment) are NOT usable for auto-approval → parked", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    // No findings on the gate ticket — they get DERIVED from the rejection
+    // comment's fenced JSON, i.e. prose provenance. A misparse here must never
+    // close the gate.
+    await handleReviewRejection({
+      ...GATE,
+      changeSet: ["src/parser.ts"],
+      reviewComment:
+        "Concerns about legacy helpers.\n" +
+        '```json\n{"findings":[{"severity":"P2","citedFiles":["vendor/untouched.ts"]}]}\n```',
+    });
+
+    expect(gateDoneWrites()).toHaveLength(0);
+    const parked = h.state.events.find((e) => e.type === "review.parked_advisory");
+    expect(parked).toBeTruthy();
+    expect(parked.detail.reason).toBe("prose_derived_findings");
+    expect(gateComments().some((c) =>
+      String(c.ExpressionAttributeValues[":n"][0].content).includes("DECISION: continue")
+    )).toBe(true);
+    expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeUndefined();
+  });
+
+  it("(c) conditional write loses to a concurrent transition → no overwrite, ONE attempt, no retry, no rethrow, no escalation", async () => {
+    h.state.enforce = advisoryEnforce();
+    h.state.conditionFailGateDone = true; // a concurrent human transition won the race
+
+    // Must resolve, not throw — a rethrow would trigger event-source retries
+    // that re-race the human.
+    await expect(
+      handleReviewRejection({ ...GATE, reviewFindings: STRUCTURED_FINDINGS })
+    ).resolves.toBeUndefined();
+
+    // Exactly ONE attempt: a failed condition is authority, not a transient error.
+    expect(h.state.gateDoneAttempts).toBe(1);
+    // Nothing landed: the concurrent transition's state stands.
+    expect(gateDoneWrites()).toHaveLength(0);
+    // And none of the resolution/escalation events fired — the gate is wherever
+    // the concurrent actor put it; there is nothing to approve or escalate.
+    expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeUndefined();
+    expect(h.state.events.find((e) => e.type === "review.escalated")).toBeUndefined();
+    expect(h.state.events.find((e) => e.type === "review.rejected")).toBeUndefined();
   });
 });

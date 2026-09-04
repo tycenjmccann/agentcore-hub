@@ -345,6 +345,33 @@ describe("enforce — diff-scoped gate (TEAM-3689, release-manager.md Step 4)", 
     expect(parkGateForHuman).toHaveBeenCalledTimes(1);
   });
 
+  it("TEAM-3790: gated:false is a pure diff-scope verdict — it carries NO authority: origin/park decisions stay with the caller (no round, no park, no transition), even for a human-marked gate", async () => {
+    // The gate ticket carries the PR #216 human-review markers. The cap module
+    // must still answer only the diff-scope question (gated:false) and touch
+    // NOTHING — whether that verdict may auto-approve, park, or must defer to
+    // the human is handleReviewRejection's authority check (pinned in
+    // review-rejection.test.mjs). If origin handling ever migrates into this
+    // module, this pin fails and the two layers' contracts must be re-drawn
+    // deliberately.
+    const { deps, store, parkGateForHuman, publishEvent } = makeDeps();
+    const res = await createReviewCap(deps).enforce({
+      workflow: workflowWith(null),
+      gateTicket: { ticketId: GATE, assignee: "human:engineer", labels: ["human-review", "reviewer:qa-lead"] },
+      gateCfg: SHIP_GATE,
+      upstreamIds: ["TEAM-1"],
+      feedback: "Human request-changes citing only untouched files.",
+      changeSet: CHANGE_SET,
+      findings: [{ citedFiles: ["untouched/legacy.ts"] }],
+    });
+
+    expect(res.gated).toBe(false);
+    expect(res.escalated).toBe(false);
+    // No side effect of any kind: the caller owns what happens next.
+    expect(store.appendReviewRound).not.toHaveBeenCalled();
+    expect(parkGateForHuman).not.toHaveBeenCalled();
+    expect(publishEvent).not.toHaveBeenCalled();
+  });
+
   it("AC3c: no change set → gated (backward-compat pin), round recorded exactly as before", async () => {
     const { deps, store } = makeDeps();
     const res = await createReviewCap(deps).enforce({

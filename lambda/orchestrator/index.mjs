@@ -1201,20 +1201,29 @@ function usableReviewFindings(arr) {
  * Returns null when neither source yields usable findings: the caller passes
  * null through and the diff-scoped gate stays inert (fail-open, R4) — exactly
  * the pre-derivation behavior.
+ *
+ * TEAM-3790: the result now carries PROVENANCE — `{ findings, source }` where
+ * source is "prose" (fenced JSON parsed out of free-text comment feedback) or
+ * "structured" (the release manager's machine-written S3 ledger). The caller
+ * uses this to decide AUTHORITY: only machine-written structured findings may
+ * ever feed an auto-approval; a prose misparse must never close a gate a human
+ * tried to hold open.
  */
 async function deriveReviewFindings(workflow, gateTicket, feedback) {
-  // 1. Fenced JSON in the feedback.
+  // 1. Fenced JSON in the feedback — parsed out of a free-text comment, so its
+  //    provenance is PROSE: usable for diff-scoping, never for auto-approval.
   const fence = /```(?:json)?\s*([\s\S]*?)```/g;
   let m;
   while ((m = fence.exec(String(feedback || ""))) !== null) {
     try {
       const parsed = JSON.parse(m[1]);
       const arr = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? parsed.findings : null;
-      if (usableReviewFindings(arr)) return arr;
+      if (usableReviewFindings(arr)) return { findings: arr, source: "prose" };
     } catch { /* not JSON — keep scanning */ }
   }
 
-  // 2. The release manager's recorded round.
+  // 2. The release manager's recorded round — the agent's own machine-written
+  //    structured ledger (blueprint Step 4.1): provenance STRUCTURED.
   const raw = await readS3Artifact(workflow.id, "shared/ship-review-state.json");
   if (!raw) return null;
   let state;
@@ -1227,7 +1236,24 @@ async function deriveReviewFindings(workflow, gateTicket, feedback) {
   if (latest.verdict !== "CHANGES-NEEDED") return null;
   const gateSha = gateTicket.reviewedHeadSha || gateTicket.metadata?.headSha || null;
   if (gateSha && latest.reviewedHeadSha && latest.reviewedHeadSha !== gateSha) return null;
-  return usableReviewFindings(latest.findings) ? latest.findings : null;
+  return usableReviewFindings(latest.findings)
+    ? { findings: latest.findings, source: "structured" }
+    : null;
+}
+
+/**
+ * TEAM-3790: whether this gate ticket is a HUMAN review gate — the uniform
+ * markers PR #216 stamps on every human-gate creation path: assignee
+ * "human:<who>" and/or the "human-review" / "reviewer:<who>" labels. A
+ * "blocked" transition on such a gate is the human's own "request changes";
+ * machine machinery must never auto-approve over it.
+ */
+function isHumanReviewGate(ticket) {
+  if (isHumanAssignee(ticket?.assignee)) return true;
+  const labels = Array.isArray(ticket?.labels) ? ticket.labels : [];
+  return labels.some(
+    (l) => typeof l === "string" && (l === "human-review" || l.startsWith("reviewer:"))
+  );
 }
 
 /**
@@ -1311,6 +1337,13 @@ export async function handleReviewRejection(gateTicket) {
   // and behavior is byte-identical to before (R4).
   let changeSet = gateTicket.changeSet || gateTicket.metadata?.changeSet || null;
   let reviewFindings = gateTicket.reviewFindings || gateTicket.metadata?.reviewFindings || null;
+  // TEAM-3790: track the findings' PROVENANCE. Findings the gate plumbing
+  // forwarded onto the ticket are the release manager's machine-written
+  // classification — "structured". Derived findings carry the source
+  // deriveReviewFindings reports: "structured" (RM's S3 ledger) or "prose"
+  // (fenced JSON parsed out of comment text). Only "structured" findings may
+  // ever feed an auto-approval below.
+  let findingsSource = Array.isArray(reviewFindings) ? "structured" : null;
   // D3 (TEAM-3748, FR-D3.1): when the event carries no change set, compute it
   // from the PR diff so review is scoped to what the PR changed rather than the
   // whole assembled repo. Fail-open — no PR / GitHub error leaves changeSet null,
@@ -1323,7 +1356,11 @@ export async function handleReviewRejection(gateTicket) {
   // change set exists to scope against (without one the findings are never read,
   // so the S3 lookup would be a wasted call on every legacy rejection).
   if (!Array.isArray(reviewFindings) && Array.isArray(changeSet)) {
-    reviewFindings = await deriveReviewFindings(workflow, gateTicket, feedback);
+    const derived = await deriveReviewFindings(workflow, gateTicket, feedback);
+    if (derived) {
+      reviewFindings = derived.findings;
+      findingsSource = derived.source;
+    }
   }
   const capResult = await getReviewCap().enforce({
     workflow,
@@ -1369,6 +1406,46 @@ export async function handleReviewRejection(gateTicket) {
   // one existing machinery. A reviewer who wants to force rework can: any
   // finding without out-of-diff citations gates.
   if (capResult.gated === false) {
+    // TEAM-3790 — AUTHORITY CHECK before any auto-approval. The advisory
+    // auto-approve is the release manager's OWN Step-4 verdict being enacted;
+    // it must never override a human's explicit rejection, and it must never
+    // run off prose-derived findings a misparse could have misclassified.
+    //   1. Human-origin: the gate carries the uniform human-review markers
+    //      (PR #216 — assignee "human:*" and/or "human-review"/"reviewer:*"
+    //      labels). Its "blocked" transition IS the human's request-changes;
+    //      the human keeps authority. Park + ask, never flip to done.
+    //   2. Findings provenance: only the machine-written structured
+    //      reviewFindings payload (forwarded onto the gate ticket by the gate
+    //      plumbing, or the RM's own S3 ledger round) may feed an
+    //      auto-approval. Prose-derived findings → not usable → park.
+    const humanOrigin = isHumanReviewGate(gateTicket);
+    const structuredFindings = findingsSource === "structured";
+    if (humanOrigin || !structuredFindings) {
+      const reason = humanOrigin ? "human_origin_rejection" : "prose_derived_findings";
+      console.log(
+        `[orchestrator] Review gate ${gateTicket.ticketId} rejected with all-out-of-diff findings but ` +
+          `${humanOrigin ? "the rejection is a HUMAN's own request-changes" : "the findings are prose-derived (not machine-written)"} ` +
+          `— parking the gate for the human instead of auto-approving.`
+      );
+      try {
+        await commentOnTicket(
+          gateTicket.ticketId,
+          `All findings appear out-of-diff for this fix — approve to confirm, or reply DECISION: continue.`
+        );
+      } catch (err) {
+        console.warn(`[orchestrator] advisory park comment failed for ${gateTicket.ticketId}: ${err?.message || err}`);
+      }
+      // The gate stays exactly where the rejection put it (blocked) — the
+      // human's approval or an explicit "DECISION: continue" is the only way
+      // forward. Observable, so the parked state is never a silent stall.
+      await publishEvent(gateTicket.ticketId, "review.parked_advisory", {
+        ticketId: gateTicket.ticketId,
+        workflowId: workflow.id,
+        reason,
+        advisoryFindings: Array.isArray(reviewFindings) ? reviewFindings : [],
+      });
+      return;
+    }
     console.log(
       `[orchestrator] Review gate ${gateTicket.ticketId} rejected but all findings are out-of-diff (advisory) — ` +
         `approving with known findings instead of reopening.`
@@ -1426,16 +1503,41 @@ export async function handleReviewRejection(gateTicket) {
           // throw, so both count as "not approved" and drive a retry.
           approved = await jiraTransition(gateTicket.ticketId, "Done");
         } else {
+          // TEAM-3790: the flip to done is CONDITIONED on the gate still being
+          // where the rejection left it (blocked; in_review tolerated for
+          // redelivery timing). A concurrent human transition (cancel/rework/
+          // anything else) between findings-derivation and this write changes
+          // the status, fails the condition, and WINS — last-writer-wins is
+          // exactly the bug this removes.
           await ddb.send(new UpdateCommand({
             TableName: TICKETS_TABLE,
             Key: { ticketId: gateTicket.ticketId },
             UpdateExpression: "SET #s = :s, #u = :u",
+            ConditionExpression: "#s IN (:expectBlocked, :expectInReview)",
             ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-            ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
+            ExpressionAttributeValues: {
+              ":s": "done",
+              ":u": new Date().toISOString(),
+              ":expectBlocked": "blocked",
+              ":expectInReview": "in_review",
+            },
           }));
           approved = true;
         }
       } catch (err) {
+        // TEAM-3790: a failed condition is NOT a transient failure — a
+        // concurrent transition moved the gate out of blocked/in_review, and
+        // whoever did that holds authority. Log and STOP: no retry (retrying
+        // would be the same last-writer-wins overwrite one attempt later), no
+        // escalation (nothing is stuck — the gate is wherever the concurrent
+        // actor put it), no rethrow (an event-source retry would re-race).
+        if (err?.name === "ConditionalCheckFailedException") {
+          console.log(
+            `[orchestrator] advisory auto-approve for ${gateTicket.ticketId} lost to a concurrent ` +
+              `transition (condition failed) — stopping without retry; the concurrent action wins.`
+          );
+          return;
+        }
         lastApproveErr = err;
         console.warn(`[orchestrator] advisory auto-approve attempt ${attempt}/${ADVISORY_APPROVE_MAX_ATTEMPTS} for ${gateTicket.ticketId} failed: ${err?.message || err}`);
       }
