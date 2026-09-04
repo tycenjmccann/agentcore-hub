@@ -901,10 +901,34 @@ def _runtime_rejection(exc: Exception) -> dict | None:
     if code == 503:
         return {"error": "coding runtime refused the turn (HTTP 503: turn "
                          "journal unwritable, turn not started) — transient"}
-    return {"error": f"coding runtime refused the turn before it started (HTTP "
-                     f"{code}); the runtime dropped the reason — check its "
-                     f"CloudWatch logs for turn_setup_failed",
-            "setup_failed": True}
+    if code < 500:
+        # 4xx is only ever pre-CLI on the coding runtime: an invalid body, a
+        # missing prompt/session id, or the workspace-setup ValueError for a
+        # non-clonable repo field. Definitively "nothing started", so keep the
+        # actionable treatment — otherwise the session stays pinned to the bad
+        # repo and a corrected repo= is ignored (Codex #348 P2).
+        return {"error": f"coding runtime rejected the turn before it started "
+                         f"(HTTP {code}); the platform dropped the reason — it is "
+                         f"a bad request or a non-clonable repository field. Check "
+                         f"the coding runtime's CloudWatch logs (turn_setup_failed) "
+                         f"and verify the repository owner/name",
+                "setup_failed": True}
+    # 5xx other than 503: the runtime ANSWERED, so never poll/resubmit — but the
+    # body is gone, so we cannot tell a pre-CLI setup refusal from a legacy
+    # SYNCHRONOUS path that 500'd/504'd after the CLI already ran and touched
+    # the workspace. Do NOT claim setup_failed (that would assert "no work
+    # started" and drop the verify-first guidance). no_retry_hint keeps this
+    # terminal with verify-first instructions instead (Codex #346 P2).
+    return {"error": f"coding runtime answered HTTP {code} and the platform "
+                     f"dropped the response body, so the reason is unknown. The "
+                     f"turn was either refused during workspace setup (check the "
+                     f"coding runtime's CloudWatch logs for turn_setup_failed — "
+                     f"usually a wrong repository owner/name, branch or auth) or "
+                     f"failed after the CLI had already started. Do NOT re-run "
+                     f"blindly: check the branch on GitHub for work that may "
+                     f"already have landed, verify the repository owner/name, and "
+                     f"escalate if neither explains it",
+            "no_retry_hint": True}
 
 
 def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None,
@@ -1062,9 +1086,15 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
                              ticket_id=_CURRENT_TICKET_ID)
         if result.get("setup_failed"):
             # The workspace never came up, so nothing pins this session to the
-            # bad repo: release the pin so a corrected repo= on the next call
-            # actually takes effect instead of re-cloning the doomed URL.
-            _CODING_SESSION["repo"] = None
+            # bad target: release every field that decides WHAT gets cloned so a
+            # corrected repo= on the next call actually takes effect. Clearing
+            # only "repo" is not enough — a ported session keeps forwarding
+            # clone_url (which the coding runtime PREFERS over repo) and branch,
+            # so a bad saved origin or a missing branch would fail identically
+            # forever (Codex #346 P2). The transcript/conversation ids are kept:
+            # the conversation is still resumable once the clone target is right.
+            for stale in ("repo", "clone_url", "branch"):
+                _CODING_SESSION[stale] = None
             return (f"ERROR: remote {cli} turn could not START: {result['error']}. "
                     f"This is a workspace SETUP failure on the coding runtime "
                     f"(repository URL/owner, branch, clone or auth) — NOT a runtime "

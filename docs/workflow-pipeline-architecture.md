@@ -1140,12 +1140,20 @@ down" — TEAM-3790/3799). Now:
   as a terminal `done` record under the caller's `turn_id`, so a lost response
   still resolves on the next poll. Synchronous callers (Cloud Code UI) keep the
   HTTP status.
+  If the journal write itself fails (degraded EFS) there is no durable record, so
+  the response falls back to the `503` "turn not started" contract instead of
+  claiming one.
 - **Fleet wrapper** (`_runtime_rejection`, `_remote_coding_turn`): a
   `setup_failed` record is terminal — no recovery, no VM-death resubmit, and the
-  persona is told it is a repo/branch/auth problem, not an outage, with the
-  session's repo pin released so a corrected `repo=` takes effect. An HTTP
-  4xx/5xx `RuntimeClientError` from a legacy runtime is treated the same way
-  (503 = journal unwritable, stays retryable).
+  persona is told it is a repo/branch/auth problem, not an outage. Every field
+  that decides what gets cloned (`repo`, `clone_url`, `branch`) is released so a
+  corrected `repo=` takes effect; the coding runtime prefers `clone_url`, so
+  clearing the repo pin alone would loop a ported session forever. An HTTP
+  `RuntimeClientError` (body dropped by the platform) is also terminal and never
+  resubmitted; `4xx` is definitively pre-CLI so it keeps the actionable
+  treatment, while `500`/`504` are reported as **ambiguous** with verify-first
+  instructions, because a legacy synchronous runtime can fail *after* the CLI
+  ran. `503` stays retryable.
 
 Both runtimes are pipeline **handoff** surfaces: ship them by hand
 (`deploy/coding-agent-runtime` first, then `deploy/runtime-agent`).

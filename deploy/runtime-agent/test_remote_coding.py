@@ -552,7 +552,10 @@ class TestSetupFailureIsTerminal(RemoteCodingTestCase):
 
     def test_http_500_from_runtime_is_a_rejection_not_a_lost_submit(self):
         # Legacy coding runtime: body dropped by AgentCore, only the status
-        # survives. Still an ANSWER — must not probe/recover/resubmit.
+        # survives. Still an ANSWER — must not probe/recover/resubmit. But a
+        # legacy SYNCHRONOUS path 500s/504s AFTER the CLI ran, so this must not
+        # assert "nothing started": verify-first, no repo pin clearing
+        # (Codex #346 P2).
         from botocore.exceptions import ClientError
         err = ClientError(
             {"Error": {"Code": "RuntimeClientError",
@@ -561,18 +564,66 @@ class TestSetupFailureIsTerminal(RemoteCodingTestCase):
             "InvokeAgentRuntime")
         client = self._submit_client(err)
         events_client = mock.MagicMock()
+        main._CODING_SESSION["repo"] = "owner/repo"
         with mock.patch.object(main.boto3, "client", return_value=client), \
              mock.patch.object(main, "_ddb_events_client", events_client), \
              mock.patch.object(main.time, "sleep"):
             out = main._remote_coding_turn("fix the bug", "claude")
 
-        self.assertTrue(out.startswith("ERROR: remote claude turn could not START:"), out)
         self.assertIn("HTTP 500", out)
+        self.assertIn("Do NOT re-run", out)
+        self.assertNotIn("could not START", out, "cannot claim setup-only failure")
         self.assertNotIn("Retry this same", out)
         self.assertNotIn("vanished", out)
+        self.assertEqual(main._CODING_SESSION["repo"], "owner/repo",
+                         "an ambiguous legacy failure must not silently drop the pin")
         self.assertEqual(client.invoke_agent_runtime.call_count, 1,
                          "recovery probes / resubmits must not run on a rejection")
         self._assert_agent_error_published(events_client, "HTTP 500")
+
+    def test_setup_failed_clears_ported_clone_overrides(self):
+        # Codex #346 P2 — the coding runtime prefers clone_url over repo, so a
+        # ported session with a bad saved origin/branch would fail identically
+        # on every corrected call unless those are released too.
+        client = self._submit_client(lambda **kw: _invoke_response({
+            "error": "git clone failed: Repository not found.", "setup_failed": True}))
+        main._CODING_SESSION.update({
+            "repo": "tycenj/agentcore-hub",
+            "clone_url": "https://github.com/tycenj/agentcore-hub.git",
+            "branch": "feat/gone",
+            "resume_transcript": "s3://key", "resume_session_id": "sess-1",
+        })
+        with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_ddb_events_client", mock.MagicMock()), \
+             mock.patch.object(main.time, "sleep"):
+            main._remote_coding_turn("fix the bug", "claude")
+
+        for field in ("repo", "clone_url", "branch"):
+            self.assertIsNone(main._CODING_SESSION[field], f"{field} must be released")
+        # The conversation itself is still resumable once the target is right.
+        self.assertEqual(main._CODING_SESSION["resume_transcript"], "s3://key")
+        self.assertEqual(main._CODING_SESSION["resume_session_id"], "sess-1")
+
+    def test_http_400_stays_actionable_setup_failure(self):
+        # Codex #348 P2 — 4xx on the coding runtime is only ever pre-CLI (bad
+        # body / non-clonable repo field), so it must keep the actionable
+        # treatment or the session stays pinned to the bad repo.
+        from botocore.exceptions import ClientError
+        err = ClientError(
+            {"Error": {"Code": "RuntimeClientError",
+                       "Message": "Received error (400) from runtime."}},
+            "InvokeAgentRuntime")
+        client = self._submit_client(err)
+        main._CODING_SESSION["repo"] = "tycenjmccann"
+        with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_ddb_events_client", mock.MagicMock()), \
+             mock.patch.object(main.time, "sleep"):
+            out = main._remote_coding_turn("fix the bug", "claude")
+
+        self.assertTrue(out.startswith("ERROR: remote claude turn could not START:"), out)
+        self.assertIn("HTTP 400", out)
+        self.assertIsNone(main._CODING_SESSION["repo"],
+                          "a definitively pre-CLI rejection must release the pin")
 
     def test_http_503_keeps_retry_advice(self):
         from botocore.exceptions import ClientError
