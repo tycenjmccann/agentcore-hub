@@ -117,6 +117,20 @@ export function useWorkflowStream({
             }));
           }
 
+          // A new dispatch of the same ticket (convergence rounds, retries)
+          // starts a fresh invocation — reset that run key's accumulator so the
+          // new invocation's live text doesn't concatenate onto the old one.
+          // The settled history is served by the agent-output segments.
+          if (data.type === "agent_status" && data.status === "running" && data.agentId) {
+            const key = runKey(data.agentId, data.ticketId);
+            setStreamingText((prev) => {
+              if (!(key in prev)) return prev;
+              const next = { ...prev };
+              delete next[key];
+              return next;
+            });
+          }
+
           // Forward all events to component
           onEventRef.current(data);
         } catch {
