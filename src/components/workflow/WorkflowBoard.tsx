@@ -22,6 +22,7 @@ import CancelConfirmationModal from "./CancelConfirmationModal";
 import TicketStatusBadge from "./TicketStatusBadge";
 import TicketDetailModal from "./TicketDetailModal";
 import WorkflowManagerPanel from "./WorkflowManagerPanel";
+import RunPerformanceCard from "./RunPerformanceCard";
 import { useWorkflowStream, runKey } from "./useWorkflowStream";
 
 interface WorkflowBoardProps {
@@ -1768,6 +1769,10 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
 
         {/* Workflow Manager — per-run analysis (terminal runs only; a run with
             open fix-it tickets isn't terminal yet) */}
+        {/* Performance card — cost / time / quality + anomaly bands, written by
+            the cost-report Lambda when the run reaches a terminal phase */}
+        {isTerminalPhase(state.phase) && <RunPerformanceCard workflowId={workflowId} />}
+
         {(isComplete || state.phase === "cancelled" || state.phase === "error") && (
           <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} />
         )}

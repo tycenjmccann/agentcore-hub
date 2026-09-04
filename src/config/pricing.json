@@ -1,73 +1,65 @@
 {
-  "_comment": "Single source of truth for model pricing. USD per 1M tokens (Bedrock on-demand, us-east-1). Keys match gen_ai.request.model values seen in spans \u2014 both bare model names (Claude Code CLI) and Bedrock inference-profile ids (Strands personas). kiro.usdPerCredit converts Kiro credits (its only usage unit) to USD for cross-engine comparison. Pre-bump ids (e.g. opus-4-6/4-7, sonnet-4-5/4-6) are retained \u2014 do not remove \u2014 because historical aws/spans records still reference them for cost lookups.",
+  "_comment": "Single source of truth for model pricing. USD per 1M tokens, Amazon Bedrock on-demand, us-east-1 / US cross-region inference profiles (verified against Cost Explorer usage-type unit rates, 2026-09-03; Bedrock = Anthropic first-party +10%). Keys match gen_ai.request.model values seen in spans - both bare model names (Claude Code CLI) and Bedrock inference-profile ids (Strands personas). cachedInputDiscount = cache-read rate as a fraction of input. kiro.usdPerCredit converts Kiro credits (its only usage unit) to USD for cross-engine comparison.",
   "models": {
     "claude-fable-5": {
-      "input": 20,
-      "output": 100
+      "input": 11,
+      "output": 55
     },
     "us.anthropic.claude-fable-5": {
-      "input": 20,
-      "output": 100
-    },
-    "claude-fable-5-1": {
-      "input": 20,
-      "output": 100
-    },
-    "us.anthropic.claude-fable-5-1": {
-      "input": 20,
-      "output": 100
+      "input": 11,
+      "output": 55
     },
     "claude-opus-5": {
-      "input": 15,
-      "output": 75
+      "input": 5.5,
+      "output": 27.5
     },
     "us.anthropic.claude-opus-5": {
-      "input": 15,
-      "output": 75
+      "input": 5.5,
+      "output": 27.5
     },
     "claude-opus-4-8": {
-      "input": 15,
-      "output": 75
+      "input": 5.5,
+      "output": 27.5
     },
     "us.anthropic.claude-opus-4-8": {
-      "input": 15,
-      "output": 75
+      "input": 5.5,
+      "output": 27.5
     },
     "us.anthropic.claude-opus-4-7": {
-      "input": 15,
-      "output": 75
+      "input": 5.5,
+      "output": 27.5
     },
     "us.anthropic.claude-opus-4-6-v1": {
-      "input": 15,
-      "output": 75
+      "input": 5.5,
+      "output": 27.5
     },
     "claude-sonnet-5": {
-      "input": 3,
-      "output": 15
+      "input": 2.2,
+      "output": 11
     },
     "us.anthropic.claude-sonnet-5": {
-      "input": 3,
-      "output": 15
+      "input": 2.2,
+      "output": 11
     },
     "us.anthropic.claude-sonnet-4-6": {
-      "input": 3,
-      "output": 15
+      "input": 3.3,
+      "output": 16.5
     },
     "us.anthropic.claude-sonnet-4-5-20250929-v1:0": {
-      "input": 3,
-      "output": 15
+      "input": 3.3,
+      "output": 16.5
     },
     "claude-haiku-4-5": {
-      "input": 0.8,
-      "output": 4
+      "input": 1.1,
+      "output": 5.5
     },
     "anthropic.claude-haiku-4-5-20251001-v1:0": {
-      "input": 0.8,
-      "output": 4
+      "input": 1.1,
+      "output": 5.5
     },
     "us.anthropic.claude-haiku-4-5-20251001-v1:0": {
-      "input": 0.8,
-      "output": 4
+      "input": 1.1,
+      "output": 5.5
     },
     "openai.gpt-5.5": {
       "input": 1.25,
@@ -79,12 +71,17 @@
     }
   },
   "default": {
-    "input": 15,
-    "output": 75
+    "input": 5.5,
+    "output": 27.5
   },
   "cachedInputDiscount": 0.1,
   "kiro": {
     "usdPerCredit": 0.02,
     "_basis": "Kiro Pro $20/mo / 1000 credits (lowest public tier, per aws.amazon.com/q/developer/faqs); overage rate is $0.04/credit"
+  },
+  "agentcore": {
+    "runtimeGbHourUsd": 0.00945,
+    "runtimeVcpuHourUsd": 0.0895,
+    "_basis": "AgentCore Runtime consumption pricing us-east-1, verified against Cost Explorer unit rates 2026-09"
   }
 }
