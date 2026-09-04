@@ -337,7 +337,10 @@ describe("AC-D2.3 replay — r30dhl (CD fails closed on an IAM AccessDenied)", (
     // would divert; the run completing is what proves it did.
     const wf = fixture("r30dhl", { output: "release summary" });
     const store = await import("./workflow-store.mjs");
+    // Three reads now reach the store: the terminal-phase hygiene check (fails
+    // open), the evidence gate, the ship-verdict gate — each must swallow AccessDenied.
     store.getWorkflow.mockImplementationOnce(async () => { throw new Error("AccessDeniedException: dynamodb:GetItem"); })
+      .mockImplementationOnce(async () => { throw new Error("AccessDeniedException: dynamodb:GetItem"); })
       .mockImplementationOnce(async () => { throw new Error("AccessDeniedException: dynamodb:GetItem"); });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
