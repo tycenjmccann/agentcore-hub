@@ -1,5 +1,5 @@
 {
-  "_comment": "Single source of truth for model pricing. USD per 1M tokens, Amazon Bedrock on-demand, us-east-1 / US cross-region inference profiles (verified against Cost Explorer usage-type unit rates, 2026-09-03; Bedrock = Anthropic first-party +10%). Keys match gen_ai.request.model values seen in spans - both bare model names (Claude Code CLI) and Bedrock inference-profile ids (Strands personas). cachedInputDiscount = cache-read rate as a fraction of input. cacheWriteMultiplier = cache-write rate as a multiple of input, keyed by hub.cache_ttl (5m|1h) with a default fallback (added TEAM-3954). kiro.usdPerCredit converts Kiro credits (its only usage unit) to USD for cross-engine comparison. MERGE-APPROVAL NOTES (TEAM-3954, values on this branch differ from the epic spec's anchors - flagged, NOT overwritten): (1) main carries claude-fable-5-1 keys at 20/100 (TEAM-3849); this branch adds them at 11/55 per the epic spec and #328's Cost-Explorer-verified basis. Human Merge Approval gate must confirm which value wins - changing fable pricing alters reported persona cost. (The keys are required because the runtime default MODEL_ID is us.anthropic.claude-fable-5-1, which would otherwise fall through to `default` 5.5/27.5 - silently wrong persona cost, AC-J2.) (2) the epic spec claimed suffixed haiku keys were 0.8/4 and warned the new bare key at 1.1/5.5 would conflict; on this branch the suffixed haiku keys are ALREADY 1.1/5.5, so the new bare 'us.anthropic.claude-haiku-4-5-20251001' key at 1.1/5.5 is consistent - no conflict.",
+  "_comment": "Single source of truth for model pricing. USD per 1M tokens, Amazon Bedrock on-demand, us-east-1 / US cross-region inference profiles (verified against Cost Explorer usage-type unit rates, 2026-09-03; Bedrock = Anthropic first-party +10%). Keys match gen_ai.request.model values seen in spans - both bare model names (Claude Code CLI) and Bedrock inference-profile ids (Strands personas). cachedInputDiscount = cache-read rate as a fraction of input. cacheWriteMultiplier = cache-write rate as a multiple of input, keyed by hub.cache_ttl (5m|1h) with a default fallback (added TEAM-3954). kiro.usdPerCredit converts Kiro credits (its only usage unit) to USD for cross-engine comparison. MERGE-APPROVAL NOTES (TEAM-3954, values on this branch differ from the epic spec's anchors - flagged, NOT overwritten): (1) main carries claude-fable-5-1 keys at 20/100 (TEAM-3849, commit d628738); this branch KEEPS main's 20/100 per AC-J2's default action for the conflict - absent explicit human confirmation (none on any ticket), the existing main value stands and the conflict is recorded here for the human Merge Approval gate (TEAM-3962). The epic spec and #328's Cost-Explorer-verified basis suggest 11/55; the Merge Approval gate must decide whether to switch to 11/55 - changing fable pricing alters reported persona cost. (The keys are required because the runtime default MODEL_ID is us.anthropic.claude-fable-5-1, which would otherwise fall through to `default` 5.5/27.5 - silently wrong persona cost, AC-J2.) (2) the epic spec claimed suffixed haiku keys were 0.8/4 and warned the new bare key at 1.1/5.5 would conflict; on this branch the suffixed haiku keys are ALREADY 1.1/5.5, so the new bare 'us.anthropic.claude-haiku-4-5-20251001' key at 1.1/5.5 is consistent - no conflict.",
   "models": {
     "claude-fable-5": {
       "input": 11,
@@ -10,12 +10,12 @@
       "output": 55
     },
     "claude-fable-5-1": {
-      "input": 11,
-      "output": 55
+      "input": 20,
+      "output": 100
     },
     "us.anthropic.claude-fable-5-1": {
-      "input": 11,
-      "output": 55
+      "input": 20,
+      "output": 100
     },
     "claude-opus-5": {
       "input": 5.5,
