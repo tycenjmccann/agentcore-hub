@@ -342,6 +342,10 @@ function getCascade() {
     // TEAM-3755 F9 — the strongly-consistent blocker confirm the extended-state
     // event path runs before it steals a lease and re-dispatches.
     getTicketConsistent,
+    // TEAM-3969 — shared dead-session retry budget for the reconcile sweep's
+    // stale-lease recovery (one auto re-dispatch, then manager_escalation).
+    store,
+    blockTicket: blockTicketForFailedInvoke,
   });
   return _cascade;
 }

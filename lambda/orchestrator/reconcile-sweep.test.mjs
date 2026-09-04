@@ -80,6 +80,8 @@ function makeCascade(overrides = {}) {
     workflowsTable: "workflows",
     redispatch,
     reawakenGate,
+    ...(overrides.store ? { store: overrides.store } : {}),
+    ...(overrides.blockTicket ? { blockTicket: overrides.blockTicket } : {}),
   });
   return { cascade, publishEvent, lease, redispatch, reawakenGate };
 }
@@ -97,7 +99,8 @@ function makeSweep(overrides = {}) {
     now: overrides.now || (() => NOW),
     log: () => {},
   });
-  return { ...sweep, ddb, getChildTickets, cascade, publishEvent, lease, redispatch, reawakenGate };
+  return { ...sweep, ddb, getChildTickets, cascade, publishEvent, lease, redispatch, reawakenGate,
+    store: overrides.store, blockTicket: overrides.blockTicket };
 }
 
 // A non-terminal workflow whose in_progress dependent carries a stale running claim.
@@ -192,7 +195,8 @@ describe("R3 — a live lease is gated FIRST: nudge at most, ZERO steal", () => 
     expect(s.lease.stealClaim).not.toHaveBeenCalled();
     expect(s.redispatch).not.toHaveBeenCalled();
     expect(m.skippedLiveLease).toBe(1);
-    expect(eventsOfType(s.publishEvent, "orchestrator.nudge")).toHaveLength(1);
+    // TEAM-3969: observed, not published — see cascade.test "sweep path".
+    expect(eventsOfType(s.publishEvent, "orchestrator.nudge")).toHaveLength(0);
     expect(records[0].ReconcileSkippedLiveLease).toBe(1);
     expect(records[0].ReconcileRedispatch).toBe(0);
   });
@@ -548,5 +552,104 @@ describe("TEAM-3755 F8 — the workflow scan excludes EVERY terminal phase", () 
     const m = await s.runSweep("enforce");
 
     expect(m.candidates).toBe(1);
+  });
+});
+
+describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry budget", () => {
+  const makeStore = () => ({
+    incrementDeadSessionRetry: vi.fn(async () => 1),
+    setTaskStatus: vi.fn(async () => {}),
+    appendNotification: vi.fn(async () => {}),
+  });
+
+  it("first death: steal + re-dispatch, and the retry counter is bumped AFTER the steal wins", async () => {
+    const store = makeStore();
+    const blockTicket = vi.fn(async () => {});
+    const s = makeSweep({ workflows: [workflow()], siblings: inProgressStale, store, blockTicket });
+
+    const m = await s.runSweep("enforce");
+
+    expect(s.lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(s.redispatch).toHaveBeenCalledTimes(1);
+    expect(m.redispatched).toBe(1);
+    expect(m.escalated).toBe(0);
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(blockTicket).not.toHaveBeenCalled();
+  });
+
+  it("aborted steal (lease live again on re-check) does NOT burn the budget", async () => {
+    const store = makeStore();
+    const isLeaseLive = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const s = makeSweep({ workflows: [workflow()], siblings: inProgressStale, store, lease: { isLeaseLive } });
+
+    const m = await s.runSweep("enforce");
+
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(m.skippedLiveLease).toBe(1);
+    expect(eventsOfType(s.publishEvent, "orchestrator.nudge")).toHaveLength(0);
+  });
+
+  it("second death (deadSessionRetries=1): ZERO steal/re-dispatch → manager_escalation, task error, ticket parked", async () => {
+    const store = makeStore();
+    const blockTicket = vi.fn(async () => {});
+    const s = makeSweep({
+      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
+      siblings: inProgressStale, store, blockTicket,
+    });
+    const cap = captureMetrics();
+
+    const m = await s.runSweep("enforce");
+    const records = cap.records();
+    cap.restore();
+
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(m.redispatched).toBe(0);
+    expect(m.escalated).toBe(1);
+    expect(records[0].ReconcileEscalations).toBe(1);
+    expect(eventsOfType(s.publishEvent, "agent.escalated")).toHaveLength(1);
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+    expect(blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    expect(store.appendNotification).toHaveBeenCalledTimes(1);
+    const notif = store.appendNotification.mock.calls[0][1];
+    expect(notif.type).toBe("manager_escalation");
+    expect(notif.ticketId).toBe("TEAM-2");
+    expect(notif.acknowledged).toBe(false);
+  });
+
+  it("second death in shadow mode: observe only, zero writes", async () => {
+    const store = makeStore();
+    const blockTicket = vi.fn(async () => {});
+    const s = makeSweep({
+      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
+      siblings: inProgressStale, store, blockTicket,
+    });
+
+    const m = await s.runSweep("shadow");
+
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(store.appendNotification).not.toHaveBeenCalled();
+    expect(blockTicket).not.toHaveBeenCalled();
+    expect(s.publishEvent).not.toHaveBeenCalled();
+    expect(m.escalated).toBe(0);
+    expect(m.wouldRedispatch).toBe(1);
+  });
+
+  it("store unwired: legacy uncapped steal (pre-3968 callers are byte-identical)", async () => {
+    const s = makeSweep({
+      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 5 } })],
+      siblings: inProgressStale,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(s.lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(m.redispatched).toBe(1);
+    expect(m.escalated).toBe(0);
   });
 });

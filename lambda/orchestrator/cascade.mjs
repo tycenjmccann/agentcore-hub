@@ -109,6 +109,12 @@ export function createCascade(deps) {
     // consistent GSI page). Optional: when unwired the confirm is skipped and
     // behavior is exactly what it was before F9.
     getTicketConsistent,
+    // TEAM-3969 — retry budget for the reconcile sweep's stale-lease recovery
+    // (workflow-store incrementDeadSessionRetry/setTaskStatus/appendNotification
+    // + the failed-invoke ticket parker). Both optional: unwired = the pre-3968
+    // uncapped steal, so existing callers and tests are byte-identical.
+    store,
+    blockTicket,
   } = deps;
 
   // One normalization per cascade instance. The commit-4a union (blocked/todo →
@@ -264,6 +270,16 @@ export function createCascade(deps) {
   async function emitNudge(sibling, unblockedBy, workflow, m, mode) {
     const agentId = sibling.assignee;
     m.skippedLiveLease++;
+    // The reconcile sweep re-visits every live candidate each cycle. Re-publishing
+    // orchestrator.nudge on every visit has no consumer, and it resets every
+    // "last activity" clock that filters only agent.streaming (WM watch scan, UI)
+    // — a heartbeat the agent never sent, so a run can never look stale
+    // (TEAM-3969). Periodic visits are observed, not published; the event-path
+    // nudge (a blocker just closed) is unchanged.
+    if (unblockedBy === "reconcile-sweep") {
+      log(`[orchestrator] cascade live lease (sweep, no nudge) — ${sibling.ticketId} agent=${agentId}`);
+      return "live";
+    }
     if (mode === "enforce") {
       await publishEvent(sibling.ticketId, "orchestrator.nudge", {
         agentId, unblockedBy, workflowId: workflow?.id,
@@ -443,7 +459,7 @@ export function createCascade(deps) {
       return handleInReviewDependent(sibling, unblockedBy, workflow, m, mode);
     }
     if (sibling.status === "in_progress") {
-      return stealAndRedispatch(sibling, unblockedBy, workflow, m, mode);
+      return stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode);
     }
     // ready / todo / blocked — unblocked (or unblockable) but never dispatched.
     // No live claim to steal (the lease gate above already returned for a live
@@ -461,6 +477,57 @@ export function createCascade(deps) {
     }
     log(`[orchestrator] reconcile re-dispatch refused — ${sibling.ticketId} (claim CAS lost — already recovered)`);
     return "redispatch-refused";
+  }
+
+  /**
+   * TEAM-3969 — the sweep's stale-lease recovery shares the dead-session
+   * detector's retry budget (workflow.deadSessionRetries[ticketId]): ONE
+   * automatic re-dispatch per ticket, then escalate to a human. Without the cap
+   * the sweep re-steals a permanently-dying session every lease TTL forever (an
+   * agent parked fail-closed on a human gate is indistinguishable from a dead
+   * one), and the detector's once-then-escalate policy never engages because the
+   * sweep always steals first. Mirrors dead-session-detector.mjs retryOrEscalate.
+   * The counter is bumped only after the steal CAS wins, so a steal aborted by a
+   * live re-check never burns the budget. Unwired store = uncapped (pre-3968).
+   */
+  async function stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode) {
+    const ticketId = sibling.ticketId;
+    const agentId = sibling.assignee;
+    const priorRetries = workflow?.deadSessionRetries?.[ticketId] || 0;
+    if (!store || priorRetries === 0) {
+      const outcome = await stealAndRedispatch(sibling, unblockedBy, workflow, m, mode);
+      // Steal CAS won (whether or not the re-dispatch claim did) → budget spent.
+      if (store && (outcome === "redispatched" || outcome === "redispatch-refused")) {
+        await store.incrementDeadSessionRetry(workflow.id, ticketId);
+      }
+      return outcome;
+    }
+    if (mode !== "enforce") {
+      m.wouldRedispatch++;
+      log(`[orchestrator] reconcile would-escalate (shadow) — ${ticketId} agent=${agentId} retry exhausted`);
+      return "would-escalate";
+    }
+    const at = new Date(now()).toISOString();
+    await publishEvent(ticketId, "agent.escalated", {
+      workflowId: workflow.id, ticketId, agentId,
+      reason: "dead_session_retry_exhausted", source: unblockedBy,
+      claimStartedAt: workflow?.agentTasks?.[ticketId]?.startedAt || null,
+    });
+    await store.setTaskStatus(workflow.id, ticketId, "error");
+    if (blockTicket) await blockTicket(ticketId, "dead_session_retry_exhausted");
+    await store.appendNotification(workflow.id, {
+      id: `notif_dead_session_${ticketId}_${at}`,
+      type: "manager_escalation",
+      title: `Dead session (retry exhausted): ${ticketId}`,
+      details: `Agent ${agentId} went silent past the lease TTL twice on ${ticketId} (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human.`,
+      reviewer: "reconcile-sweep",
+      ticketId,
+      timestamp: at,
+      acknowledged: false,
+    });
+    m.escalated = (m.escalated || 0) + 1;
+    log(`[orchestrator] reconcile escalate — ${ticketId} agent=${agentId} retry exhausted`);
+    return "escalated";
   }
 
   /**

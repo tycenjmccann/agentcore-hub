@@ -917,10 +917,13 @@ describe("TEAM-3755 F7 — liveness is re-checked immediately before the steal",
       "reconcile-sweep", extWorkflow, m, "enforce"
     );
 
-    expect(outcome).toBe("nudged");
+    // TEAM-3969: the periodic sweep observes a live lease but publishes nothing —
+    // a per-cycle orchestrator.nudge would reset every activity clock that only
+    // filters agent.streaming (WM watch scan) and keep the run "fresh" forever.
+    expect(outcome).toBe("live");
     expect(lease.stealClaim).not.toHaveBeenCalled();
     expect(redispatch).not.toHaveBeenCalled();
-    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(1);
+    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(0);
     expect(m.skippedLiveLease).toBe(1);
     expect(m.redispatched).toBe(0);
   });

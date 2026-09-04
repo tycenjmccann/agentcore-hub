@@ -206,8 +206,9 @@ describe("AC-D1.2 replay — xm2bmz (5 mixed tickets, correct per-class handling
     // 2 stale in_progress + 1 ready are re-dispatched; the live ones are not.
     expect(redispatch).toHaveBeenCalledTimes(3);
     expect(new Set(redispatch.mock.calls.map((c) => c[1].ticketId))).toEqual(new Set([...STALE_IP, ...READY]));
-    // The 2 live ones get a context nudge only.
-    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(2);
+    // The 2 live ones are left alone — observed, not nudged (TEAM-3969: a
+    // per-cycle nudge would keep every run looking fresh to the WM watch scan).
+    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(0);
     expect(m.skippedLiveLease).toBe(2);
     expect(m.redispatched).toBe(3);
     expect(m.noop).toBe(0);
