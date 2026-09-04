@@ -83,7 +83,7 @@ echo "✓ IAM: WorkflowManagerAccess policy on agentcore-hub-lambda-role"
 # ─── Toolkit sync (updates take effect on the next harness session) ──────────
 aws s3 sync "${REPO_ROOT}/deploy/workflow-manager/toolkit/" \
   "s3://${BUCKET}/workflow-manager/toolkit/" \
-  --exclude "test_*.py" --delete --quiet
+  --exclude "test_*.py" --exclude "*.pyc" --delete --quiet
 echo "✓ Toolkit: s3://${BUCKET}/workflow-manager/toolkit/"
 
 # ─── Skills sync (harness skills[] resolves these S3 URIs on demand) ─────────
@@ -92,7 +92,7 @@ echo "✓ Toolkit: s3://${BUCKET}/workflow-manager/toolkit/"
 # sync alone.
 aws s3 sync "${REPO_ROOT}/deploy/workflow-manager/skills/" \
   "s3://${BUCKET}/workflow-manager/skills/" \
-  --delete --quiet
+  --exclude "*.pyc" --delete --quiet
 echo "✓ Skills: s3://${BUCKET}/workflow-manager/skills/"
 
 # ─── Trigger Lambda ───────────────────────────────────────────────────────────

@@ -499,6 +499,19 @@ function grantDeployPerms(
         `${ctx.artifactBucket.bucketArn}/*`,
       ],
     }),
+    // The WM/routine-builder toolkit+skills syncs run with `aws s3 sync --delete`
+    // (mirroring each surface's own deploy.sh) so a renamed/removed toolkit
+    // module doesn't linger in S3. --delete needs DeleteObject; scope it to just
+    // those prefixes (NOT config/, blueprints/, pipeline-artifacts/) so a deploy
+    // can never delete the roster, baselines, or rollback snapshots.
+    new iam.PolicyStatement({
+      sid: "S3ToolkitSyncDelete",
+      actions: ["s3:DeleteObject"],
+      resources: [
+        `${ctx.artifactBucket.bucketArn}/workflow-manager/*`,
+        `${ctx.artifactBucket.bucketArn}/routine-builder/*`,
+      ],
+    }),
     new iam.PolicyStatement({
       sid: "EcrPullForRoll",
       actions: [

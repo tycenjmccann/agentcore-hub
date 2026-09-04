@@ -1,6 +1,5 @@
 {
-  "$comment": "Deploy-surface manifest for the pipeline's Deploy stage (deploy/pipeline/plan-surfaces.py reads it; scripts/check-deploy-surfaces.sh enforces that every lambda/* and deploy/* surface is listed here). A surface deploys when any file in pipeline-out/changed-files.txt starts with one of its `paths`. CODE ONLY: the pipeline updates Lambda code, harness prompt/model/skills and S3 toolkits — never IAM, env vars or infra. Infra scripts are `handoff` (the Deploy stage exits 2 after a good app deploy so the release manager reports them as a human step).",
-
+  "$comment": "Deploy-surface manifest for the pipeline's Deploy stage (deploy/pipeline/plan-surfaces.py reads it; scripts/check-deploy-surfaces.sh enforces that every lambda/* and deploy/* surface is listed here). A surface deploys when any file in pipeline-out/changed-files.txt starts with one of its `paths`. CODE ONLY: the pipeline updates Lambda code, harness prompt/model/skills and S3 toolkits \u2014 never IAM, env vars or infra. Infra scripts are `handoff` (the Deploy stage exits 2 after a good app deploy so the release manager reports them as a human step).",
   "ignore": [
     "__tests__/",
     "\\.test\\.mjs$",
@@ -11,120 +10,184 @@
     "\\.gitignore$",
     "package-lock\\.json$"
   ],
-
   "lambdas": [
     {
       "function": "agentcore-hub-cost-report",
       "dir": "lambda/cost-report",
-      "files": ["index.mjs"],
+      "files": [
+        "index.mjs"
+      ],
       "npm": false,
       "note": "If REPORT_VERSION changed in index.mjs, run lambda/cost-report/deploy.sh --backfill by hand (regenerates every card; --rebuild-index alone empties the fleet index)."
     },
     {
       "function": "agentcore-hub-anomaly-watcher",
       "dir": "lambda/anomaly-watcher",
-      "files": ["index.mjs", "detect.mjs", "bands-schema.mjs", "bands.yaml", "package.json", "node_modules/"],
+      "files": [
+        "index.mjs",
+        "detect.mjs",
+        "bands-schema.mjs",
+        "bands.yaml",
+        "package.json",
+        "node_modules/"
+      ],
       "npm": true
     },
     {
       "function": "agentcore-hub-workflow-analyzer",
       "dir": "lambda/workflow-analyzer",
-      "files": ["index.mjs", "package.json", "node_modules/"],
+      "files": [
+        "index.mjs",
+        "package.json",
+        "node_modules/"
+      ],
       "npm": true
     },
     {
       "function": "agentcore-hub-pipeline-tools",
       "dir": "lambda/agentcore-hub-pipeline-tools",
-      "files": ["index.mjs"],
+      "files": [
+        "index.mjs"
+      ],
       "npm": false
     },
     {
       "function": "agentcore-hub-jira",
       "dir": "lambda/agentcore-hub-jira",
-      "files": ["index.mjs"],
+      "files": [
+        "index.mjs"
+      ],
       "npm": false,
-      "note": "Only @aws-sdk/client-s3 is declared, which the nodejs20.x runtime provides — deploy/setup-tickets-lambda.mjs ships index.mjs alone too."
+      "note": "Only @aws-sdk/client-s3 is declared, which the nodejs20.x runtime provides \u2014 deploy/setup-tickets-lambda.mjs ships index.mjs alone too."
     },
     {
       "function": "agentcore-hub-tickets",
       "dir": "lambda/agentcore-hub-tickets",
-      "files": ["index.mjs"],
+      "files": [
+        "index.mjs"
+      ],
       "npm": false,
       "optional": true,
-      "note": "Absent in TICKET_PROVIDER=jira installs — skipped when the function does not exist."
+      "note": "Absent in TICKET_PROVIDER=jira installs \u2014 skipped when the function does not exist."
     },
     {
       "function": "agentcore-hub-eval-packager",
       "dir": "lambda/eval-packager",
-      "files": ["index.mjs", "lib/", "package.json", "node_modules/"],
+      "files": [
+        "index.mjs",
+        "lib/",
+        "package.json",
+        "node_modules/"
+      ],
       "npm": true
     },
     {
       "function": "agentcore-hub-prd-submitter",
       "dir": "lambda/prd-submitter",
-      "files": ["index.mjs"],
+      "files": [
+        "index.mjs"
+      ],
       "npm": false
     },
     {
       "function": "agentcore-hub-token-aggregator",
       "dir": "lambda/token-aggregator",
-      "files": ["index.mjs"],
+      "files": [
+        "index.mjs"
+      ],
       "npm": false
     },
     {
       "function": "agentcore-hub-workflow-output",
       "dir": "lambda/workflow-output",
-      "files": ["index.mjs", "node_modules/"],
+      "files": [
+        "index.mjs",
+        "node_modules/"
+      ],
       "npm": true
     },
     {
       "function": "agentcore-hub-routines-runner",
       "dir": "lambda/routines-runner",
-      "files": ["index.mjs", "package.json", "node_modules/"],
+      "files": [
+        "index.mjs",
+        "package.json",
+        "node_modules/"
+      ],
       "npm": true
     },
     {
       "function": "agentcore-hub-session-reaper",
       "dir": "deploy/session-reaper",
-      "paths": ["deploy/session-reaper/handler.py"],
-      "files": ["handler.py"],
+      "paths": [
+        "deploy/session-reaper/handler.py"
+      ],
+      "files": [
+        "handler.py"
+      ],
       "npm": false
     },
     {
       "function": "telegram-bug-intake",
       "dir": "deploy/telegram-bug-intake",
-      "paths": ["deploy/telegram-bug-intake/index.mjs"],
-      "files": ["index.mjs"],
+      "paths": [
+        "deploy/telegram-bug-intake/index.mjs"
+      ],
+      "files": [
+        "index.mjs"
+      ],
       "npm": false
     }
   ],
-
   "s3": [
     {
       "src": "deploy/workflow-manager/toolkit/",
       "dst": "workflow-manager/toolkit/",
-      "paths": ["deploy/workflow-manager/toolkit/"],
-      "args": ["--delete", "--exclude", "test_*.py"]
+      "paths": [
+        "deploy/workflow-manager/toolkit/"
+      ],
+      "args": [
+        "--delete",
+        "--exclude",
+        "test_*.py",
+        "--exclude",
+        "*.pyc"
+      ]
     },
     {
       "src": "deploy/workflow-manager/skills/",
       "dst": "workflow-manager/skills/",
-      "paths": ["deploy/workflow-manager/skills/"],
-      "args": ["--delete"]
+      "paths": [
+        "deploy/workflow-manager/skills/"
+      ],
+      "args": [
+        "--delete",
+        "--exclude",
+        "*.pyc"
+      ]
     },
     {
       "src": "deploy/routine-builder/toolkit/",
       "dst": "routine-builder/toolkit/",
-      "paths": ["deploy/routine-builder/toolkit/"],
-      "args": ["--delete", "--exclude", "test_*.py"]
+      "paths": [
+        "deploy/routine-builder/toolkit/"
+      ],
+      "args": [
+        "--delete",
+        "--exclude",
+        "test_*.py",
+        "--exclude",
+        "*.pyc"
+      ]
     },
     {
       "src": "src/config/pricing.json",
       "dst": "config/pricing.json",
-      "paths": ["src/config/pricing.json"]
+      "paths": [
+        "src/config/pricing.json"
+      ]
     }
   ],
-
   "harnesses": [
     {
       "name": "agentcore_hub_workflow_manager",
@@ -153,7 +216,6 @@
       ]
     }
   ],
-
   "handoff": [
     "deploy/runtime-agent/",
     "deploy/coding-agent-runtime/",
@@ -175,14 +237,12 @@
     "lambda/orchestrator/deploy.sh",
     "lambda/orchestrator/template.yaml"
   ],
-
   "handoff_exempt": [
     "deploy/runtime-agent/prompts/"
   ],
-
   "excluded": {
     "lambda/orchestrator": "Target 1 of buildspec-deploy.yml (one zip to orchestrator + agent-invoker + events-writer).",
-    "lambda/builder-tools": "No deployed function — the builder harness uses code_interpreter; source kept for reference.",
+    "lambda/builder-tools": "No deployed function \u2014 the builder harness uses code_interpreter; source kept for reference.",
     "deploy/pipeline": "The pipeline itself; buildspec/stack edits take effect on the next run or via deploy/pipeline/deploy.sh.",
     "deploy/ecs-express": "The app image is Target 3 (roll-by-digest); deploy.sh is the pre-pipeline manual path.",
     "deploy/local": "Gitignored scratch.",
