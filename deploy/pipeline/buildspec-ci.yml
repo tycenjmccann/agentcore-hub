@@ -167,6 +167,18 @@ phases:
           else
             echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files.txt
           fi
+          # The runtime-image Deploy action runs in PARALLEL and advances its OWN
+          # baseline (last-deployed-runtime-sha.txt) only on its own success — so a
+          # failed image build is retried on the next run instead of being lost
+          # when the app action advances last-deployed-sha.txt. Diff from that
+          # separate baseline here (the Build stage is the only place with a git
+          # clone). First run / unknown → sentinel = rebuild every runtime.
+          LAST_RT="$(aws s3 cp "s3://${ARTIFACT_BUCKET}/pipeline-artifacts/last-deployed-runtime-sha.txt" - --region "$AWS_REGION_HUB" 2>/dev/null || true)"
+          if [ -n "$LAST_RT" ] && git cat-file -e "${LAST_RT}^{commit}" 2>/dev/null; then
+            git diff --name-only "${LAST_RT}..HEAD" > pipeline-out/changed-files-runtime.txt
+          else
+            echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files-runtime.txt
+          fi
         fi
 
 # For the deploy pipeline Build stage, these are the promote-by-digest artifacts.
@@ -180,6 +192,7 @@ artifacts:
     - "pipeline-out/image-digest.txt"
     - "pipeline-out/git-sha.txt"
     - "pipeline-out/changed-files.txt"
+    - "pipeline-out/changed-files-runtime.txt"
     - "blueprints/**/*"
     - "deploy/**/*"
     - "scripts/**/*"

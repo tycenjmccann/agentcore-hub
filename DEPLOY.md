@@ -306,6 +306,7 @@ reason).
 | `blueprints/`, `deploy/runtime-agent/prompts/`, `src/config/workflows.json`, `src/config/pricing.json`, `src/config/agents.json` (merged) | S3 sync/cp |
 | Workflow Manager toolkit + skills, Routine Builder toolkit | S3 sync (`--delete`, `test_*.py` excluded) |
 | Harness prompt / model / skills (WM, builder, routine builder) | each harness's own setup script in `PIPELINE_MODE=1` → `UpdateHarness` on the existing harness, prior values snapshotted |
+| **Runtime images** — fleet baked source (`deploy/runtime-agent/main.py`, `requirements.txt`, `install-skills.sh`, `Dockerfile`) and coding baked source (`deploy/coding-agent-runtime/main.py`, `requirements.txt`, `otel-collector-config.yaml`, `log.py`, `run-codex.sh`, `merge-codex-config.py`, `shell-init.sh`, `Dockerfile`) | **`Deploy_runtime_images`** — a parallel arm64 CodeBuild action (`buildspec-runtime-images.yml`) that rebuilds only the changed runtime, pushes by digest, and does an image-only `UpdateAgentRuntime` (`update-runtime-image.py`) preserving env/lifecycle/role/EFS. Emits a `runtime.deploy` marker to the events table so the performance card can attribute a step-change to a prompt/tool deploy. This is the PR-2 "merge = live" close on **agent tools** (prompts already ship via the S3 row above). |
 | The Next.js app | ECS roll-by-digest, Target 3 |
 
 **Handed off (Deploy stage exits 2 AFTER everything above shipped and the
@@ -314,13 +315,15 @@ script):**
 
 | Path in repo | Command |
 |---|---|
-| `deploy/runtime-agent/` (main.py, requirements, deploy-one*.py) | `build-and-push.sh v<N>` + `deploy-one-robust.py agentcore_hub_agent` — diff the live env keys first (see Model bump §2) |
-| `deploy/coding-agent-runtime/` | `build-and-push.sh <tag>` then `update-agent-runtime` with the LIVE env/EFS/network copied from `get-agent-runtime` (drop `requireServiceS3Endpoint`); never `deploy.py` against a live runtime — it rebuilds env from defaults and drops `KIRO_API_KEY` |
+| Runtime **create / build / setup** scripts (`deploy/runtime-agent/deploy*.{sh,py}`, `build-and-push.sh`, `refresh-agents-json.sh`, `setup-*.sh`; `deploy/coding-agent-runtime/deploy.py`, `build-and-push.sh`, `cfn-vpc-efs.yaml`, `setup-coding-*.sh`) | the script itself — these create runtimes / change IAM / env / EFS / VPC, which the image-swap action deliberately cannot. A pure baked-source change does NOT hit these (it auto-deploys above) |
 | `deploy/evaluations/`, `deploy/continuous-improvement/` | `setup-evaluations.sh` / `continuous-improvement/deploy.sh` (subscriptions, alarms, env) |
 | `lambda/*/deploy.sh`, `deploy/*/deploy.sh`, `deploy/setup-*.{sh,mjs}` | the script itself — these change IAM / env vars / tables, which the pipeline role deliberately cannot |
 | `lambda/cost-report/index.mjs` with a `REPORT_VERSION` bump | code ships via the pipeline, but run `lambda/cost-report/deploy.sh --backfill` afterwards (`--rebuild-index` alone drops every older-version card from the fleet index) |
 
-Runtime-image CD (the first two rows) is the next pipeline increment.
+Runtime-image CD landed in PR 2 — a baked source change (persona tool code) now
+deploys automatically. Only runtime env / lifecycle / IAM / EFS changes (which
+need `UpdateFunctionConfiguration`-class perms the narrow roles lack) remain a
+handoff, via the create/setup scripts above.
 
 ## Model bump
 

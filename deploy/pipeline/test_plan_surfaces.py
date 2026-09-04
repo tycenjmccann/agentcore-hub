@@ -91,16 +91,39 @@ def test_model_catalog_change_updates_builder_harness():
     assert kinds(actions, "HARNESS")[0][2] == "deploy/setup-builder-agent.mjs"
 
 
-def test_runtime_image_change_is_a_handoff_but_prompts_are_not():
-    actions = ps.plan([
-        "deploy/runtime-agent/main.py",
-        "deploy/runtime-agent/prompts/agentcore_hub_agent.txt",
-        "deploy/coding-agent-runtime/main.py",
-    ], MANIFEST)
-    assert [a[1] for a in kinds(actions, "HANDOFF")] == [
-        "deploy/runtime-agent/main.py",
-        "deploy/coding-agent-runtime/main.py",
-    ]
+def test_baked_runtime_source_emits_runtime_row_not_handoff():
+    # PR 2: a change to baked tool code (main.py) rebuilds + image-swaps the
+    # runtime via the parallel arm64 action — it is NOT a human handoff anymore.
+    for f, name, repo, ctx in [
+        ("deploy/runtime-agent/main.py", "agentcore_hub_agent", "runtime-agent", "deploy/runtime-agent"),
+        ("deploy/coding-agent-runtime/main.py", "agentcore_hub_coding_runtime", "coding-agent-runtime", "deploy/coding-agent-runtime"),
+        ("deploy/runtime-agent/Dockerfile", "agentcore_hub_agent", "runtime-agent", "deploy/runtime-agent"),
+        ("deploy/coding-agent-runtime/run-codex.sh", "agentcore_hub_coding_runtime", "coding-agent-runtime", "deploy/coding-agent-runtime"),
+    ]:
+        actions = ps.plan([f], MANIFEST)
+        assert kinds(actions, "RUNTIME") == [["RUNTIME", name, repo, ctx]], f
+        assert not kinds(actions, "HANDOFF"), f
+
+
+def test_prompt_only_change_is_neither_runtime_nor_handoff():
+    # Prompts ship via Target 2's unconditional S3 sync + load at cold start,
+    # so a prompt-only change must NOT trigger a costly image rebuild.
+    actions = ps.plan(["deploy/runtime-agent/prompts/agentcore_hub_agent.txt"], MANIFEST)
+    assert not kinds(actions, "RUNTIME") and not kinds(actions, "HANDOFF")
+
+
+def test_runtime_deploy_and_build_scripts_stay_handoffs():
+    # The create/build/setup scripts still need a human (iam:*, privileged build).
+    for f in [
+        "deploy/runtime-agent/deploy-one-robust.py",
+        "deploy/runtime-agent/build-and-push.sh",
+        "deploy/coding-agent-runtime/deploy.py",
+        "deploy/coding-agent-runtime/setup-coding-runtime-role.sh",
+        "deploy/coding-agent-runtime/cfn-vpc-efs.yaml",
+    ]:
+        actions = ps.plan([f], MANIFEST)
+        assert [a[1] for a in kinds(actions, "HANDOFF")] == [f], f
+        assert not kinds(actions, "RUNTIME"), f
 
 
 def test_infra_scripts_are_handoffs_not_code_deploys():
@@ -117,6 +140,7 @@ def test_unknown_range_sentinel_deploys_everything_and_hands_off():
     assert len(kinds(actions, "LAMBDA")) == len(MANIFEST["lambdas"])
     assert len(kinds(actions, "HARNESS")) == len(MANIFEST["harnesses"])
     assert len(kinds(actions, "S3SYNC")) + len(kinds(actions, "S3CP")) == len(MANIFEST["s3"])
+    assert len(kinds(actions, "RUNTIME")) == len(MANIFEST["runtimes"])
     assert kinds(actions, "HANDOFF") == [["HANDOFF", ps.SENTINEL]]
 
 

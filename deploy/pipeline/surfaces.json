@@ -217,8 +217,20 @@
     }
   ],
   "handoff": [
-    "deploy/runtime-agent/",
-    "deploy/coding-agent-runtime/",
+    "deploy/runtime-agent/build-and-push.sh",
+    "deploy/runtime-agent/deploy.sh",
+    "deploy/runtime-agent/deploy-fleet.sh",
+    "deploy/runtime-agent/deploy-one.sh",
+    "deploy/runtime-agent/deploy-one-robust.py",
+    "deploy/runtime-agent/deploy-topology.sh",
+    "deploy/runtime-agent/refresh-agents-json.sh",
+    "deploy/runtime-agent/setup-fleet-memory.sh",
+    "deploy/runtime-agent/setup-healthcheck.sh",
+    "deploy/coding-agent-runtime/build-and-push.sh",
+    "deploy/coding-agent-runtime/deploy.py",
+    "deploy/coding-agent-runtime/cfn-vpc-efs.yaml",
+    "deploy/coding-agent-runtime/setup-coding-efs.sh",
+    "deploy/coding-agent-runtime/setup-coding-runtime-role.sh",
     "deploy/evaluations/",
     "deploy/continuous-improvement/",
     "deploy/connectors/",
@@ -237,6 +249,35 @@
     "lambda/orchestrator/deploy.sh",
     "lambda/orchestrator/template.yaml"
   ],
+  "runtimes": [
+    {
+      "$comment": "Runtime-image CD (buildspec-runtime-images.yml): a change to a BAKED file rebuilds this runtime's arm64 image and image-swaps it via update-runtime-image.py (env/lifecycle/role/EFS preserved). Prompts (deploy/runtime-agent/prompts/) are NOT baked — they ship via Target 2's S3 sync and load at cold start, so they are not listed here.",
+      "name": "agentcore_hub_agent",
+      "ecrRepo": "runtime-agent",
+      "context": "deploy/runtime-agent",
+      "paths": [
+        "deploy/runtime-agent/main.py",
+        "deploy/runtime-agent/requirements.txt",
+        "deploy/runtime-agent/install-skills.sh",
+        "deploy/runtime-agent/Dockerfile"
+      ]
+    },
+    {
+      "name": "agentcore_hub_coding_runtime",
+      "ecrRepo": "coding-agent-runtime",
+      "context": "deploy/coding-agent-runtime",
+      "paths": [
+        "deploy/coding-agent-runtime/main.py",
+        "deploy/coding-agent-runtime/requirements.txt",
+        "deploy/coding-agent-runtime/otel-collector-config.yaml",
+        "deploy/coding-agent-runtime/log.py",
+        "deploy/coding-agent-runtime/run-codex.sh",
+        "deploy/coding-agent-runtime/merge-codex-config.py",
+        "deploy/coding-agent-runtime/shell-init.sh",
+        "deploy/coding-agent-runtime/Dockerfile"
+      ]
+    }
+  ],
   "handoff_exempt": [
     "deploy/runtime-agent/prompts/"
   ],
@@ -247,6 +288,12 @@
     "deploy/ecs-express": "The app image is Target 3 (roll-by-digest); deploy.sh is the pre-pipeline manual path.",
     "deploy/local": "Gitignored scratch.",
     "deploy/config.sh": "Sourced by scripts; not a deploy surface.",
-    "deploy/telegram-bug-intake/README.md": "Docs."
+    "deploy/telegram-bug-intake/README.md": "Docs.",
+    "deploy/runtime-agent/healthcheck-fixtures": "Fixtures for the fleet healthcheck (setup-healthcheck.sh); not baked, not deployed.",
+    "deploy/runtime-agent/test-streaming": "Standalone OTEL span-test runtime; deployed out of band by its own deploy.sh.",
+    "deploy/runtime-agent/verify-fleet-invoke.py": "Fleet smoke tool; run by hand.",
+    "deploy/runtime-agent/verify-fleet.sh": "Fleet smoke tool; run by hand.",
+    "deploy/runtime-agent/local-ab-test.py": "Local prompt A/B harness; dev-only.",
+    "deploy/coding-agent-runtime/invoke.py": "Manual invoke/smoke tool; not deployed."
   }
 }

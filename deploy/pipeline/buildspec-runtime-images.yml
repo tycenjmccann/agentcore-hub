@@ -1,0 +1,112 @@
+# buildspec-runtime-images.yml — the Deploy stage's runtime-image action.
+#
+# Runs in PARALLEL with buildspec-deploy.yml (the app targets) as a second
+# CodeBuild action in the Deploy stage, on an ARM64 (Graviton) CodeBuild host so
+# `docker build --platform linux/arm64` is NATIVE — the fleet/coding images bake
+# claude-code + codex + chromium + skills and cross-emulating them on amd64 is
+# minutes-slower and flakier. It rebuilds ONLY the runtimes whose baked source
+# changed (deploy/pipeline/plan-surfaces.py RUNTIME rows), pushes by digest, and
+# does an image-only swap via update-runtime-image.py (env/lifecycle/role/EFS all
+# preserved from the live runtime). Parallel + independent runOrder so an app-side
+# HANDOFF exit-2 never blocks the image roll, and this action never touches
+# Lambda/ECS (its role can't).
+#
+# Prompts (deploy/runtime-agent/prompts/) are NOT baked — the runtime reads them
+# from S3 at cold start — so a prompt-only self-improvement change ships via the
+# app action's S3 sync and never triggers a costly rebuild here.
+#
+# NOTE: quoted YAML scalars + `env: shell: bash` for parity with the other
+# buildspecs (dash rejects `set -o pipefail` and here-strings).
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  pre_build:
+    commands:
+      - "ACCOUNT_ID=\"$(aws sts get-caller-identity --query Account --output text)\""
+      - |
+        if [ -n "${EXPECTED_ACCOUNT_ID:-}" ] && [ "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT_ID" ]; then
+          echo "ERROR: account $ACCOUNT_ID != EXPECTED_ACCOUNT_ID $EXPECTED_ACCOUNT_ID" >&2; exit 1
+        fi
+      - |
+        # This action has its OWN baseline (last-deployed-runtime-sha.txt): the
+        # Build stage diffs from it into changed-files-runtime.txt so a failed
+        # image build here is retried next run instead of being lost when the
+        # parallel app action advances the shared last-deployed-sha.txt. Fall back
+        # to the app changeset only if the runtime list is absent (older artifact).
+        RT_CHANGED=pipeline-out/changed-files-runtime.txt
+        [ -f "$RT_CHANGED" ] || RT_CHANGED=pipeline-out/changed-files.txt
+        python3 deploy/pipeline/plan-surfaces.py "$RT_CHANGED" > /tmp/deploy-plan.tsv
+        grep '^RUNTIME' /tmp/deploy-plan.tsv > /tmp/runtimes.tsv || true
+        echo "── runtime images to roll ──"; cut -f1-4 /tmp/runtimes.tsv || true
+
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        export AWS_REGION="$AWS_REGION_HUB"
+        GIT_SHA="$(cat pipeline-out/git-sha.txt 2>/dev/null || echo nogit)"
+        # Advance THIS action's baseline to the current SHA. Reached only on
+        # success (no-op OR all swaps done); a failed build never gets here, so
+        # the baseline stays put and the Build stage re-diffs the same range next
+        # run → the change is retried, not lost. Non-fatal: a missed advance only
+        # costs a redundant (idempotent) rebuild next run, never a dropped deploy.
+        advance_rt_baseline() {
+          if [ "$GIT_SHA" != "nogit" ] && [ -n "${ARTIFACT_BUCKET:-}" ]; then
+            if printf '%s' "$GIT_SHA" | aws s3 cp - \
+                "s3://${ARTIFACT_BUCKET}/pipeline-artifacts/last-deployed-runtime-sha.txt" \
+                --region "$AWS_REGION_HUB"; then
+              echo "runtime baseline advanced → $GIT_SHA"
+            else
+              echo "WARN: could not advance runtime baseline (non-fatal)"
+            fi
+          fi
+        }
+        if [ ! -s /tmp/runtimes.tsv ]; then
+          echo "No runtime-image surfaces changed — nothing to build."
+          advance_rt_baseline
+          exit 0
+        fi
+        ECR_REG="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com"
+        aws ecr get-login-password --region "$AWS_REGION_HUB" \
+          | docker login --username AWS --password-stdin "$ECR_REG"
+
+        # Roll back every runtime we already swapped if a LATER one fails. The
+        # image swap is atomic per runtime (UpdateAgentRuntime either takes or
+        # throws before changing anything), so restoring the recorded prior image
+        # ref is a clean revert. Marker events are not emitted on rollback.
+        mkdir -p /tmp/rt-rollback
+        trap 'rc=$?; if [ $rc -ne 0 ]; then echo "── runtime image deploy failed (rc=$rc) → rolling back ──"; for f in /tmp/rt-rollback/*.prev; do [ -e "$f" ] || continue; n="$(basename "$f" .prev)"; prev="$(cat "$f")"; echo "rollback $n → $prev"; AWS_REGION="$AWS_REGION_HUB" python3 deploy/pipeline/update-runtime-image.py rollback "$n" "$prev" || echo "rollback of $n errored — inspect"; done; fi; exit $rc' EXIT
+
+        while IFS=$'\t' read -r KIND NAME REPO CTX; do
+          [ "$KIND" = "RUNTIME" ] || continue
+          TAG="${GIT_SHA}-$(date -u +%H%M%S)"
+          IMG="${ECR_REG}/${REPO}:${TAG}"
+          echo "── building $NAME image ($REPO) from $CTX ──"
+          docker build --platform linux/arm64 -t "$IMG" "$CTX"
+          docker push "$IMG"
+          # Resolve the immutable digest (ECR describe is eventually-consistent
+          # right after a push — retry, and never promote an empty ref).
+          DIGEST=""
+          for attempt in 1 2 3 4 5 6; do
+            DIGEST="$(aws ecr describe-images --repository-name "$REPO" \
+              --image-ids imageTag="$TAG" --region "$AWS_REGION_HUB" \
+              --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)"
+            case "$DIGEST" in
+              sha256:*) break ;;
+              *) echo "digest not ready (attempt $attempt): '$DIGEST' — retrying"; DIGEST=""; sleep 5 ;;
+            esac
+          done
+          if [ -z "$DIGEST" ]; then echo "FATAL: no sha256 digest for $REPO:$TAG" >&2; exit 1; fi
+          REF="${ECR_REG}/${REPO}@${DIGEST}"
+          echo "  promoting $NAME → $REF"
+          GIT_SHA="$GIT_SHA" EVENTS_TABLE="${EVENTS_TABLE:-agentcore-hub-events}" \
+            RT_SNAPSHOT_DIR=/tmp/rt-rollback AWS_REGION="$AWS_REGION_HUB" \
+            python3 deploy/pipeline/update-runtime-image.py deploy "$NAME" "$REF"
+        done < /tmp/runtimes.tsv
+
+        trap - EXIT
+        advance_rt_baseline
+        echo "── runtime images deployed + performance markers emitted ──"
