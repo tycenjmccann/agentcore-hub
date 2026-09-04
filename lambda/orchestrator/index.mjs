@@ -667,7 +667,7 @@ export async function handleTicketDoneUnified(ticketId) {
   // Protects against double-transition (agent calls transition_ticket AND report_completion).
   if (workflow.agentTasks?.[ticketId]?.status === "complete") {
     console.log(`[orchestrator] ${ticketId} already marked complete — skipping duplicate cascade.`);
-    // TEAM-3973 — the cascade is a one-shot, but a human RE-deciding a gate is
+    // TEAM-3974 — the cascade is a one-shot, but a human RE-deciding a gate is
     // not: re-Done'ing an escalation gate (a corrected DECISION comment, a
     // second approval) has to reach the parked release manager, or the human's
     // only lever silently does nothing. Both calls below are idempotent.

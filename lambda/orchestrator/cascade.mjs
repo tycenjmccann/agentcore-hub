@@ -452,7 +452,7 @@ export function createCascade(deps) {
    * observes, enforce writes. Returns an outcome string the sweep tallies.
    */
   async function reconcileDependent(sibling, unblockedBy, workflow, m, mode) {
-    // TEAM-3972 — an ESCALATED ticket is held for the human, in every status.
+    // TEAM-3973 — an ESCALATED ticket is held for the human, in every status.
     // Escalation used to bind only the in_progress steal path, so the very next
     // sweep re-drove the ticket through the ready/todo/blocked branch and the
     // escalation meant nothing (prod TEAM-3897: escalated 20:54Z, re-dispatched
@@ -491,7 +491,7 @@ export function createCascade(deps) {
   }
 
   /**
-   * TEAM-3972 — is this ticket parked on a human after an exhausted retry?
+   * TEAM-3973 — is this ticket parked on a human after an exhausted retry?
    * TRUE only while BOTH hold: the retry budget is spent AND the task still
    * carries the escalation's `error` status. A human (or the TEAM-3971 wake)
    * re-driving the ticket re-claims it — status leaves `error` — so the hold

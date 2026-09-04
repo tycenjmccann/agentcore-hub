@@ -654,7 +654,7 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
   });
 });
 
-describe("TEAM-3972 — an escalated ticket is HELD for the human in every status", () => {
+describe("TEAM-3973 — an escalated ticket is HELD for the human in every status", () => {
   // deadSessionRetries spent + task status "error" = the escalation's own marks.
   const escalated = (extra = {}) => workflow({
     deadSessionRetries: { "TEAM-2": 1 },
