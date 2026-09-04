@@ -108,5 +108,35 @@ class TestAsyncSubmitsGetA200Body(unittest.TestCase):
         self.assertNotIn("turn_id", _body(resp))
 
 
+class TestUnwritableJournalIsNotClaimedDurable(unittest.TestCase):
+    """Codex #346 P1 — a 200 setup_failed body asserts a durable terminal
+    record. If the journal write failed there is none: a lost response would
+    poll as 'unknown' and the caller would resubmit, restoring the very loop
+    this path removes. Degraded EFS can also be what broke setup."""
+
+    def test_journal_failure_returns_503_not_200(self):
+        payload = {"prompt": "x", "mode": "async", "turn_id": "turn-nj"}
+        with mock.patch.object(main, "_journal_write", return_value=False):
+            resp = main._setup_failure_response(payload, "claude", "sess-nj", CLONE_404, 500)
+        self.assertEqual(resp.status_code, 503)
+        b = _body(resp)
+        self.assertNotIn("setup_failed", b, "must not claim a durable terminal verdict")
+        self.assertIn("turn not started", b["error"])
+        self.assertIn("Repository not found", b["error"], "the setup reason must survive")
+
+    def test_journal_success_still_returns_200(self):
+        payload = {"prompt": "x", "mode": "async", "turn_id": "turn-nj2"}
+        with mock.patch.object(main, "_journal_write", return_value=True):
+            resp = main._setup_failure_response(payload, "claude", "sess-nj2", CLONE_404, 500)
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(_body(resp)["setup_failed"])
+
+    def test_sync_callers_unaffected_by_journal_state(self):
+        with mock.patch.object(main, "_journal_write", return_value=False):
+            resp = main._setup_failure_response({"prompt": "x"}, "claude", "s", CLONE_404, 500)
+        self.assertEqual(resp.status_code, 500)
+        self.assertTrue(_body(resp)["setup_failed"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2665,11 +2665,25 @@ def _setup_failure_response(payload: dict, cli: str, session_id: str | None,
         return JSONResponse(body, status_code=status_code)
     turn_id = payload.get("turn_id")
     if turn_id:
+        journaled = _journal_write(
+            _turn_journal_path(session_id, turn_id),
+            {"status": "done", "turn_id": turn_id, "cli": cli,
+             "finished_at": int(time.time()), "response": "",
+             "error": error, "setup_failed": True})
+        if not journaled:
+            # EFS is unwritable, so the terminal record does NOT exist. Returning
+            # 200 here would claim a durable verdict that a lost response could
+            # not recover: the poll would read 'unknown' and the caller would
+            # resubmit — the exact loop this path exists to stop. Degraded EFS is
+            # also a plausible CAUSE of the setup failure itself. Use the same
+            # 503 contract as an unseedable normal turn: transient, turn not
+            # started, caller may retry the same call.
+            return JSONResponse(
+                {"error": f"turn journal unwritable (EFS degraded) — turn not "
+                          f"started; setup had already failed with: {error}",
+                 "cli": cli},
+                status_code=503)
         body["turn_id"] = turn_id
-        _journal_write(_turn_journal_path(session_id, turn_id),
-                       {"status": "done", "turn_id": turn_id, "cli": cli,
-                        "finished_at": int(time.time()), "response": "",
-                        "error": error, "setup_failed": True})
     return JSONResponse(body, status_code=200)
 
 
