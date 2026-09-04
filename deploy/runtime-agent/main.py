@@ -150,8 +150,11 @@ MODEL_ID = os.getenv("MODEL_ID", "us.anthropic.claude-fable-5-1")
 READ_TIMEOUT = int(os.getenv("READ_TIMEOUT", "1200"))  # 20 minutes — agents need room for complex claude_code calls
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "32000"))
 # Bedrock prompt caching for the persona system prompt + tools (TEAM-3953).
-# Default ON — disabled only when explicitly set to "0".
-PERSONA_PROMPT_CACHE = os.getenv("PERSONA_PROMPT_CACHE", "1") != "0"
+# Default ON. Disabled by any explicit falsy value — case-insensitive and
+# whitespace-stripped {"0","false","no","off"} (TEAM-3961 F2: the kill switch
+# must kill for the obvious spellings, not just "0"). Empty/unset → default
+# "1" → enabled; "" is deliberately treated as enabled (default-on).
+PERSONA_PROMPT_CACHE = os.getenv("PERSONA_PROMPT_CACHE", "1").strip().lower() not in {"0", "false", "no", "off"}
 # Cache TTL: Bedrock supports "5m" and "1h" only. Anything else falls back to "1h".
 PERSONA_CACHE_TTL = os.getenv("PERSONA_CACHE_TTL", "1h")
 if PERSONA_CACHE_TTL not in ("5m", "1h"):

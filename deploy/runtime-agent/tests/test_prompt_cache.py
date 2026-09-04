@@ -19,6 +19,7 @@ import json
 import logging
 from pathlib import Path
 
+import pytest
 from strands.models import BedrockModel
 from strands.models.model import CacheConfig
 
@@ -58,9 +59,9 @@ def _resolve_knobs():
     `if` under the current os.environ, returning the resolved values.
 
     Extracting the real statements (not replicating them) means the default,
-    the "0"-disables rule, and the invalid-ttl warning+fallback are all the
-    shipped logic. Nodes are collected in source order so the validation `if`
-    runs after the assignments.
+    the falsy-set disable rule (TEAM-3961 F2), and the invalid-ttl
+    warning+fallback are all the shipped logic. Nodes are collected in source
+    order so the validation `if` runs after the assignments.
     """
     nodes = []
     for n in _TREE.body:
@@ -108,6 +109,67 @@ def test_cache_disabled_by_env(monkeypatch):
         prompt_cache=prompt_cache, cache_ttl=ttl, cache_config=CacheConfig
     )()
     assert kwargs == {}
+
+
+# ── Part A': PERSONA_PROMPT_CACHE disable semantics (TEAM-3961 F2) ────────────
+# The kill switch must kill for the obvious spellings, not just "0" — matching
+# case-insensitively on the whitespace-stripped value.
+_DISABLE_VALUES = ["0", "false", "False", "no", "off", "OFF", " 0 "]
+# Anything else stays enabled (default-on). "" is deliberately enabled: an
+# empty PERSONA_PROMPT_CACHE is NOT a falsy spelling, so it keeps the default.
+_ENABLE_VALUES = ["1", "true", "yes", ""]
+
+
+def _model_config(cache_kwargs):
+    """The BedrockModel config dict resulting from these construction kwargs.
+
+    AC-R9 hook: two builds are behaviorally identical iff their config dicts are
+    equal, so comparing an off/disabled build against a plain `{}` build proves
+    "byte-identical to caching-off" without inspecting private cache internals.
+    """
+    model = BedrockModel(
+        model_id="us.anthropic.claude-fable-5-1",
+        region_name="us-east-1",
+        **cache_kwargs,
+    )
+    return dict(model.config)
+
+
+@pytest.mark.parametrize("value", _DISABLE_VALUES)
+def test_falsy_values_disable_caching(monkeypatch, value):
+    monkeypatch.setenv("PERSONA_PROMPT_CACHE", value)
+    monkeypatch.delenv("PERSONA_CACHE_TTL", raising=False)
+    prompt_cache, ttl = _resolve_knobs()
+    assert prompt_cache is False, f"{value!r} should disable caching"
+
+    kwargs = _load_cache_kwargs_helper(
+        prompt_cache=prompt_cache, cache_ttl=ttl, cache_config=CacheConfig
+    )()
+    assert kwargs == {}, f"{value!r} must yield zero cache kwargs"
+    # AC-R9: model construction is byte-identical to an explicit caching-off build.
+    assert _model_config(kwargs) == _model_config({})
+
+
+@pytest.mark.parametrize("value", _ENABLE_VALUES)
+def test_non_falsy_values_keep_caching_on(monkeypatch, value):
+    monkeypatch.setenv("PERSONA_PROMPT_CACHE", value)
+    monkeypatch.delenv("PERSONA_CACHE_TTL", raising=False)
+    prompt_cache, ttl = _resolve_knobs()
+    assert prompt_cache is True, f"{value!r} should leave caching on (default)"
+
+    kwargs = _load_cache_kwargs_helper(
+        prompt_cache=prompt_cache, cache_ttl=ttl, cache_config=CacheConfig
+    )()
+    assert kwargs["cache_tools"] == "default"
+    assert kwargs["cache_config"].ttl == "1h"
+
+
+def test_empty_string_leaves_caching_on(monkeypatch):
+    # Explicit per reviewer note: "" is NOT a disable value — it stays default-on.
+    monkeypatch.setenv("PERSONA_PROMPT_CACHE", "")
+    monkeypatch.delenv("PERSONA_CACHE_TTL", raising=False)
+    prompt_cache, _ = _resolve_knobs()
+    assert prompt_cache is True
 
 
 def test_bad_ttl_falls_back_to_1h_and_warns(monkeypatch, caplog):
