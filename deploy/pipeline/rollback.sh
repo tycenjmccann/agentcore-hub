@@ -10,18 +10,21 @@ set -uo pipefail
 
 echo "── ROLLBACK ──"
 
-# 1. Orchestrator Lambda → prior zip
+# 1. Orchestrator Lambdas → prior zip (same zip feeds orchestrator, agent-invoker
+#    and events-writer — mirror Target 1 in buildspec-deploy.yml).
 # --output text --query suppresses the full-config dump: update-function-code
 # otherwise echoes plaintext env vars (JIRA_API_TOKEN, GITHUB_PAT) into the log.
 if [ -f /tmp/rollback/orchestrator-prev.zip ]; then
-  echo "restoring orchestrator to prior zip"
-  aws lambda update-function-code --function-name agentcore-hub-orchestrator \
-    --zip-file fileb:///tmp/rollback/orchestrator-prev.zip --region "$AWS_REGION_HUB" \
-    --output text --query 'LastUpdateStatus' >/dev/null \
-    && aws lambda wait function-updated --function-name agentcore-hub-orchestrator --region "$AWS_REGION_HUB" \
-    && echo "orchestrator rolled back" || echo "orchestrator rollback FAILED — inspect"
+  for FN in agentcore-hub-orchestrator agentcore-hub-agent-invoker agentcore-hub-events-writer; do
+    echo "restoring $FN to prior zip"
+    aws lambda update-function-code --function-name "$FN" \
+      --zip-file fileb:///tmp/rollback/orchestrator-prev.zip --region "$AWS_REGION_HUB" \
+      --output text --query 'LastUpdateStatus' >/dev/null \
+      && aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION_HUB" \
+      && echo "$FN rolled back" || echo "$FN rollback FAILED — inspect"
+  done
 else
-  echo "no prior orchestrator zip — orchestrator not rolled back (was it deployed this run?)"
+  echo "no prior orchestrator zip — orchestrator Lambdas not rolled back (were they deployed this run?)"
 fi
 
 # 2. ECS Express → prior image digest
