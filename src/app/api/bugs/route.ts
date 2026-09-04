@@ -109,7 +109,10 @@ async function releaseFilingLock(family: string): Promise<void> {
  *   repo         owner/name — defaults to GITHUB_OWNER/GITHUB_REPO
  *   labels       extra labels (e.g. ["crash-rca", "agent:agentcore_hub_backend_designer"])
  *   dedupeLabels if set, an OPEN Bug carrying ALL of these labels absorbs this
- *                report as a comment instead of a duplicate ticket
+ *                report as a comment instead of a duplicate ticket. These form
+ *                the dedupe signature, so a malformed entry (empty or
+ *                whitespace-bearing) is rejected with 400, never dropped —
+ *                dropping would silently broaden the match.
  *   origin       "workflow-manager" marks a Workflow Manager filing (crash or
  *                free-form). It only extends the kill-switch check to free-form
  *                WM bugs (which carry no dedupeLabels); it is NOT added to Jira
@@ -156,10 +159,33 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Jira labels cannot contain spaces.
+  // extraLabels are cosmetic (not dedupe identity), so a malformed one is just
+  // dropped — Jira labels cannot contain spaces.
   const extraLabels = (body.labels || []).map((l) => String(l).trim()).filter((l) => l && !/\s/.test(l));
   const labels = [`repo:${repo}`, ...extraLabels];
   const projectKey = process.env.JIRA_PROJECT_KEY || "TEAM";
+
+  // dedupeLabels are the dedupe SIGNATURE, so — unlike extraLabels — a malformed
+  // entry must NOT be silently dropped: doing so would BROADEN the exact-match
+  // sig/mute/family queries (e.g. running against just ["crash-rca"]) and
+  // misattribute the report to an unrelated open crash bug or an unrelated
+  // Won't-Do mute. Reject instead, before any Jira search/create runs. Jira
+  // labels cannot contain whitespace and an empty label is meaningless; a
+  // quote-bearing label is valid and gets jqlEscape()'d downstream. The error
+  // names the offending index/kind but never echoes the raw value back.
+  const dedupeLabels = (body.dedupeLabels || []).map((l) => String(l).trim());
+  const badDedupeIndex = dedupeLabels.findIndex((l) => !l || /\s/.test(l));
+  if (badDedupeIndex !== -1) {
+    const kind = dedupeLabels[badDedupeIndex] ? "contains whitespace" : "is empty";
+    return NextResponse.json(
+      {
+        error: `dedupeLabels[${badDedupeIndex}] is invalid: a dedupe label ${kind}. ` +
+          "Dedupe labels form the dedupe signature and cannot be normalized away — " +
+          "send a non-empty, whitespace-free label (e.g. agent:qa_verifier) and retry.",
+      },
+      { status: 400 }
+    );
+  }
 
   let filingLockFamily: string | null = null;
   try {
@@ -169,13 +195,6 @@ export async function POST(req: NextRequest) {
     // carries no dedupeLabels but sets origin="workflow-manager". BOTH are
     // automated filings subject to the kill switch; human-relayed bugs (Telegram
     // intake, UI) send neither and are never suppressed.
-    // Jira labels cannot contain spaces (same filter as extraLabels above) — a
-    // dedupe label with whitespace would be rejected on createIssue and would
-    // also produce malformed JQL below. Drop it rather than search for a label
-    // that can never exist.
-    const dedupeLabels = (body.dedupeLabels || [])
-      .map((l) => String(l).trim())
-      .filter((l) => l && !/\s/.test(l));
     const isWmFiling = dedupeLabels.length > 0 || body.origin === "workflow-manager";
 
     // 0. Kill switch — the operator said stop; enforce it in code, not prompt.

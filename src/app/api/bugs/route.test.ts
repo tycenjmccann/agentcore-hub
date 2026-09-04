@@ -203,33 +203,54 @@ describe("POST /api/bugs — kill switch gates WM free-form + crash filings (TEA
   });
 });
 
-describe("POST /api/bugs — dedupeLabels are space-filtered + JQL-escaped (TEAM-3920)", () => {
-  // The exact signature query the handler builds for the given (already
-  // space-filtered) label list under the pinned project key "TEAM".
+describe("POST /api/bugs — malformed dedupeLabels are REJECTED, not narrowed (TEAM-3923)", () => {
+  // The exact signature query the handler builds for the given label list under
+  // the pinned project key "TEAM".
   const sigJql = (labelClauses: string[]) =>
     `project = "TEAM" AND issuetype = Bug AND statusCategory != Done AND ` +
     labelClauses.map((l) => `labels = "${l}"`).join(" AND ") +
     " ORDER BY created DESC";
 
-  it("a dedupe label containing a space is dropped and never reaches the JQL", async () => {
+  it("a dedupe label containing internal whitespace → 400, no Jira/DDB call", async () => {
+    // R1-F2: dropping the spaced label would broaden the sig query to just
+    // ["crash-rca"] and misattribute the report. Reject instead.
     const res = await post({
       title: "T",
       description: "D",
       repo: "owner/name",
-      labels: ["crash-rca", "agent:foo bar"],
-      dedupeLabels: ["crash-rca", "agent:foo bar"],
+      labels: ["crash-rca", "agent:qa verifier"],
+      dedupeLabels: ["crash-rca", "agent:qa verifier"],
     });
-    // No open bug exists (default empty results) → the filing proceeds normally.
-    expect(res.status).toBe(200);
-    expect(h.createCalls.length).toBe(1);
-    // The spaced label is filtered out; only the well-formed one is queried.
-    expect(h.searchCalls.length).toBeGreaterThan(0);
-    const jql = h.searchCalls[0].jql;
-    expect(jql).toBe(sigJql(["crash-rca"]));
-    expect(jql).not.toContain("foo bar");
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    // Names the offending index/kind…
+    expect(json.error).toContain("dedupeLabels[1]");
+    expect(json.error).toContain("whitespace");
+    // …but never echoes the raw label value back.
+    expect(json.error).not.toContain("agent:qa verifier");
+    // Rejected BEFORE any Jira search/create and before the kill-switch read.
+    expect(h.searchCalls.length).toBe(0);
+    expect(h.createCalls.length).toBe(0);
+    expect(h.commentCalls.length).toBe(0);
+    expect(getSends().length).toBe(0);
   });
 
-  it("a dedupe label containing a double quote is escaped into well-formed JQL", async () => {
+  it("a dedupe label that is empty after trim → 400 naming 'is empty'", async () => {
+    const res = await post({
+      title: "T",
+      description: "D",
+      repo: "owner/name",
+      dedupeLabels: ["crash-rca", "   "],
+    });
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error).toContain("dedupeLabels[1]");
+    expect(json.error).toContain("is empty");
+    expect(h.searchCalls.length).toBe(0);
+    expect(h.createCalls.length).toBe(0);
+  });
+
+  it("a dedupe label containing a double quote is accepted and escaped into well-formed JQL", async () => {
     await post({
       title: "T",
       description: "D",
