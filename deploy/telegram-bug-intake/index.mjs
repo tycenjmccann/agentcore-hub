@@ -464,6 +464,13 @@ async function handleCallback(cb) {
     return;
   }
 
+  // Escalation-gate decision buttons: gdc|<m|c|x>|<ticketId>|<workflowId> (TEAM-3971)
+  if (action === "gdc") {
+    const [, opt, gateTicketId, gateWorkflowId] = (cb.data || "").split("|");
+    await handleDecisionCallback(cb, chatId, opt, gateTicketId, gateWorkflowId);
+    return;
+  }
+
   // Manager-escalation button: eok|<workflowId> (resolves every open escalation
   // on the run — the notification id alone overflows Telegram's 64-byte
   // callback_data cap, and one open escalation is enough to park the run).
@@ -506,6 +513,10 @@ async function handleCallback(cb) {
 // same write path a human clicking the board uses.
 
 const GATE_KEY_PREFIX = "gate#";
+// Release-manager convergence escalation gate — summary shape fixed by
+// blueprints/release-manager.md ("Escalation gate ticket"); the orchestrator
+// and the transition API match the same shape (TEAM-3971).
+const ESCALATION_GATE_TITLE = /^Escalation #\d+: ship-review not converging/i;
 const CHAT_KEY_PREFIX = "chat#";
 const REJECT_KEY_PREFIX = "rej#";
 
@@ -560,17 +571,33 @@ async function scanReviewGates() {
       } catch { /* ping still goes out with the id */ }
 
       const reviewer = notif.reviewer || "reviewer";
-      const text =
-        `🚦 *Review gate — ${esc(title)}*\n` +
+      // TEAM-3971: a release-manager escalation gate needs a DECISION, not a
+      // bare approve — a bare approve used to park the release manager forever.
+      // Offer the three decisions as buttons; each records the DECISION line.
+      const isEscalation = ESCALATION_GATE_TITLE.test(title);
+      const head =
         `📋 Run: ${esc(wf.input?.title || wf.workflowId)}\n` +
         `👤 Awaiting: \`${reviewer}\`\n` +
-        `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})\n\n` +
-        `Open the document below to review, then *Approve* or *Request changes*. ` +
-        `The pipeline is paused on you.`;
-      const keyboard = { inline_keyboard: [[
-        { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
-        { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
-      ]] };
+        `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})\n\n`;
+      const text = isEscalation
+        ? `🚨 *Ship-review escalation — ${esc(title)}*\n` + head +
+          `The review loop hit its round cap. Read the escalation digest below, then pick ONE decision. ` +
+          `It is recorded on the gate as a \`DECISION:\` line and the release manager resumes on its own.`
+        : `🚦 *Review gate — ${esc(title)}*\n` + head +
+          `Open the document below to review, then *Approve* or *Request changes*. ` +
+          `The pipeline is paused on you.`;
+      const keyboard = { inline_keyboard: isEscalation
+        ? [
+            [{ text: "✅ Merge with known findings", callback_data: `gdc|m|${notif.ticketId}|${wf.workflowId}` }],
+            [
+              { text: "🔁 Continue rework", callback_data: `gdc|c|${notif.ticketId}|${wf.workflowId}` },
+              { text: "🛑 Cancel run", callback_data: `gdc|x|${notif.ticketId}|${wf.workflowId}` },
+            ],
+          ]
+        : [[
+            { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
+            { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
+          ]] };
 
       // Direct jump to the gate ticket's review view in the hub — the one
       // screen with the full formatted breakout (review package + Merge
@@ -655,10 +682,14 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     return;
   }
   if (action === "gok") {
-    await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+    const res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
     await tgAnswer(cb.id, `Approved ${ticketId}`);
-    await tgEdit(chatId, cb.message.message_id,
-      `${cb.message.text}\n\n✅ Approved — pipeline resuming.`);
+    // TEAM-3971: the API records a bare approve on an escalation gate as
+    // DECISION: merge-with-known-findings — say so, the human should know.
+    const note = res?.decisionDefaulted
+      ? `✅ Approved — recorded as DECISION: ${res.decisionDefaulted}; release manager resuming.`
+      : `✅ Approved — pipeline resuming.`;
+    await tgEdit(chatId, cb.message.message_id, `${cb.message.text}\n\n${note}`);
     return;
   }
   // Request changes: the ticket needs a rework note. Park the intent; the
@@ -674,7 +705,47 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   }));
   await tgAnswer(cb.id, "Reply with what needs to change.");
   await tgEdit(chatId, cb.message.message_id,
-    `${cb.message.text}\n\n❌ Changes requested — reply with a note describing what to change. It goes to the agents as rework context.`);
+    `${cb.message.text}\n\n❌ Changes requested — reply with a note describing what to change. It goes to the agents as rework context. ` +
+    `(On an escalated gate, a line reading exactly "DECISION: continue" authorizes more rework rounds.)`);
+}
+
+// Escalation-gate decisions (TEAM-3971). Same vocabulary as the release-manager
+// blueprint and lambda/orchestrator/review-cap.mjs DECISIONS.
+const GATE_DECISIONS = { m: "merge-with-known-findings", c: "continue", x: "cancel" };
+
+async function handleDecisionCallback(cb, chatId, opt, ticketId, workflowId) {
+  if (!ALLOWED_CHAT_IDS.includes(String(chatId))) {
+    console.warn(`[telegram-bug-intake] unauthorized decision callback from chat ${chatId} for ${ticketId}`);
+    await tgAnswer(cb.id, "Not authorized to decide gates.");
+    return;
+  }
+  const decision = GATE_DECISIONS[opt];
+  if (!decision || !ticketId || !workflowId) {
+    await tgAnswer(cb.id, "Unknown decision — use the buttons on a current escalation ping.");
+    return;
+  }
+  // The DECISION line is what the release manager parses (last well-formed
+  // line wins); Done is what wakes the orchestrator, which re-drives the RM.
+  await transitionGate(workflowId, ticketId, "done",
+    `Decided via Telegram by chat ${chatId}\nDECISION: ${decision}`);
+  let tail = "";
+  if (decision === "cancel") {
+    try {
+      const res = await fetch(`${HUB_API_URL}/api/workflow/${encodeURIComponent(workflowId)}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: `DECISION: cancel via Telegram by chat ${chatId}` }),
+      });
+      tail = res.ok ? " Workflow cancelled." : ` Workflow cancel returned ${res.status} — cancel it from the console.`;
+    } catch (err) {
+      tail = ` Workflow cancel failed (${err.message}) — cancel it from the console.`;
+    }
+  } else {
+    tail = " Release manager resuming.";
+  }
+  await tgAnswer(cb.id, `Recorded DECISION: ${decision}`);
+  await tgEdit(chatId, cb.message.message_id,
+    `${cb.message.text}\n\n✅ DECISION: ${decision} recorded on ${ticketId}.${tail}`);
 }
 
 /** If this chat has a pending rejection, the message is its rework note. */
@@ -697,6 +768,8 @@ async function transitionGate(workflowId, ticketId, targetStatus, comment) {
     body: JSON.stringify({ ticketId, targetStatus, comment }),
   });
   if (!res.ok) throw new Error(`transition ${res.status}: ${await res.text().catch(() => "")}`);
+  // Body is informational (e.g. decisionDefaulted, TEAM-3971) — never required.
+  try { return await res.json(); } catch { return {}; }
 }
 
 // ─── Workflow Manager escalations ────────────────────────────────────────────

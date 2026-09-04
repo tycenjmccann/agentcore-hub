@@ -289,6 +289,28 @@ export async function clearDeadSessionDetected(workflowId, ticketId, expectedSta
  * the same SET that indexes into it), then the leaf is bumped with
  * if_not_exists so the first detection reads 0 → 1. Returns the new count.
  */
+/**
+ * TEAM-3971 — clear one ticket's dead-session retry budget. A human just made
+ * the decision the agent was parked on, so its next silence is a NEW episode
+ * and deserves the one automatic re-dispatch again. Scoped REMOVE of the leaf
+ * only; a missing map (never retried) is a no-op, not an error.
+ */
+export async function resetDeadSessionRetry(workflowId, ticketId) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE deadSessionRetries.#tid",
+      ConditionExpression: "attribute_exists(deadSessionRetries)",
+      ExpressionAttributeNames: { "#tid": ticketId },
+    }));
+    return true;
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
 export async function incrementDeadSessionRetry(workflowId, ticketId) {
   await _ddb.send(new UpdateCommand({
     TableName: _table,

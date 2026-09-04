@@ -131,6 +131,7 @@ export function createReconcileSweep(deps) {
       candidates: 0,
       skippedLiveLease: 0,
       escalated: 0,
+      escalationHeld: 0,
       redispatched: 0,
       reviewReawakened: 0,
       wouldRedispatch: 0,
@@ -200,7 +201,7 @@ export function createReconcileSweep(deps) {
 
     m.durationMs = now() - startedAtMs;
     emitReconcileMetrics(m);
-    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} escalated=${m.escalated || 0} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
+    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} escalated=${m.escalated || 0} escalationHeld=${m.escalationHeld || 0} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
     return m;
   }
 
@@ -222,6 +223,9 @@ function tally(m, outcome) {
       break;
     case "escalated":
       m.escalated++;
+      break;
+    case "escalation-held":
+      m.escalationHeld++;
       break;
     case "redispatched":
       m.redispatched++;
@@ -261,6 +265,7 @@ export function emitReconcileMetrics(m) {
           { Name: "ReconcileSkippedLiveLease", Unit: "Count" },
           { Name: "ReconcileRedispatch", Unit: "Count" },
           { Name: "ReconcileEscalations", Unit: "Count" },
+          { Name: "ReconcileEscalationHeld", Unit: "Count" },
           { Name: "ReconcileReviewReawaken", Unit: "Count" },
           { Name: "ReconcileWouldRedispatch", Unit: "Count" },
           { Name: "ReconcileNoop", Unit: "Count" },
@@ -275,6 +280,7 @@ export function emitReconcileMetrics(m) {
     ReconcileSkippedLiveLease: m.skippedLiveLease,
     ReconcileRedispatch: m.redispatched,
     ReconcileEscalations: m.escalated || 0,
+    ReconcileEscalationHeld: m.escalationHeld || 0,
     ReconcileReviewReawaken: m.reviewReawakened,
     ReconcileWouldRedispatch: m.wouldRedispatch,
     ReconcileNoop: m.noop,

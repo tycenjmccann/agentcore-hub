@@ -452,6 +452,17 @@ export function createCascade(deps) {
    * observes, enforce writes. Returns an outcome string the sweep tallies.
    */
   async function reconcileDependent(sibling, unblockedBy, workflow, m, mode) {
+    // TEAM-3973 — an ESCALATED ticket is held for the human, in every status.
+    // Escalation used to bind only the in_progress steal path, so the very next
+    // sweep re-drove the ticket through the ready/todo/blocked branch and the
+    // escalation meant nothing (prod TEAM-3897: escalated 20:54Z, re-dispatched
+    // 20:59Z). The park transition cannot carry this on its own — a board with
+    // no Blocked transition falls back to To Do, which IS dispatch-eligible.
+    if (escalationHeld(sibling, workflow)) {
+      m.escalationHeld = (m.escalationHeld || 0) + 1;
+      log(`[orchestrator] reconcile hold (escalated, awaiting human) — ${sibling.ticketId} status=${sibling.status}`);
+      return "escalation-held";
+    }
     if (await leaseIsLive(sibling, workflow)) {
       return emitNudge(sibling, unblockedBy, workflow, m, mode);
     }
@@ -477,6 +488,19 @@ export function createCascade(deps) {
     }
     log(`[orchestrator] reconcile re-dispatch refused — ${sibling.ticketId} (claim CAS lost — already recovered)`);
     return "redispatch-refused";
+  }
+
+  /**
+   * TEAM-3973 — is this ticket parked on a human after an exhausted retry?
+   * TRUE only while BOTH hold: the retry budget is spent AND the task still
+   * carries the escalation's `error` status. A human (or the TEAM-3971 wake)
+   * re-driving the ticket re-claims it — status leaves `error` — so the hold
+   * releases itself with no extra bookkeeping and no permanent dead end.
+   */
+  function escalationHeld(sibling, workflow) {
+    const task = workflow?.agentTasks?.[sibling.ticketId];
+    if (task?.status !== "error") return false;
+    return (workflow?.deadSessionRetries?.[sibling.ticketId] || 0) >= 1;
   }
 
   /**
