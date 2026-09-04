@@ -1149,10 +1149,11 @@ down" — TEAM-3790/3799). Now:
   that decides what gets cloned (`repo`, `clone_url`, `branch`) is released so a
   corrected `repo=` takes effect; the coding runtime prefers `clone_url`, so
   clearing the repo pin alone would loop a ported session forever. An HTTP
-  4xx/5xx `RuntimeClientError` (body dropped by the platform) is also terminal
-  and never resubmitted, but is reported as **ambiguous** with verify-first
-  instructions: a legacy synchronous runtime can 500/504 *after* the CLI ran, so
-  it must not be labelled "nothing started". `503` stays retryable.
+  `RuntimeClientError` (body dropped by the platform) is also terminal and never
+  resubmitted; `4xx` is definitively pre-CLI so it keeps the actionable
+  treatment, while `500`/`504` are reported as **ambiguous** with verify-first
+  instructions, because a legacy synchronous runtime can fail *after* the CLI
+  ran. `503` stays retryable.
 
 Both runtimes are pipeline **handoff** surfaces: ship them by hand
 (`deploy/coding-agent-runtime` first, then `deploy/runtime-agent`).

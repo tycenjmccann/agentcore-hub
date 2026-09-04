@@ -604,6 +604,27 @@ class TestSetupFailureIsTerminal(RemoteCodingTestCase):
         self.assertEqual(main._CODING_SESSION["resume_transcript"], "s3://key")
         self.assertEqual(main._CODING_SESSION["resume_session_id"], "sess-1")
 
+    def test_http_400_stays_actionable_setup_failure(self):
+        # Codex #348 P2 — 4xx on the coding runtime is only ever pre-CLI (bad
+        # body / non-clonable repo field), so it must keep the actionable
+        # treatment or the session stays pinned to the bad repo.
+        from botocore.exceptions import ClientError
+        err = ClientError(
+            {"Error": {"Code": "RuntimeClientError",
+                       "Message": "Received error (400) from runtime."}},
+            "InvokeAgentRuntime")
+        client = self._submit_client(err)
+        main._CODING_SESSION["repo"] = "tycenjmccann"
+        with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_ddb_events_client", mock.MagicMock()), \
+             mock.patch.object(main.time, "sleep"):
+            out = main._remote_coding_turn("fix the bug", "claude")
+
+        self.assertTrue(out.startswith("ERROR: remote claude turn could not START:"), out)
+        self.assertIn("HTTP 400", out)
+        self.assertIsNone(main._CODING_SESSION["repo"],
+                          "a definitively pre-CLI rejection must release the pin")
+
     def test_http_503_keeps_retry_advice(self):
         from botocore.exceptions import ClientError
         err = ClientError(

@@ -901,7 +901,19 @@ def _runtime_rejection(exc: Exception) -> dict | None:
     if code == 503:
         return {"error": "coding runtime refused the turn (HTTP 503: turn "
                          "journal unwritable, turn not started) — transient"}
-    # Any other status: the runtime ANSWERED, so never poll/resubmit — but the
+    if code < 500:
+        # 4xx is only ever pre-CLI on the coding runtime: an invalid body, a
+        # missing prompt/session id, or the workspace-setup ValueError for a
+        # non-clonable repo field. Definitively "nothing started", so keep the
+        # actionable treatment — otherwise the session stays pinned to the bad
+        # repo and a corrected repo= is ignored (Codex #348 P2).
+        return {"error": f"coding runtime rejected the turn before it started "
+                         f"(HTTP {code}); the platform dropped the reason — it is "
+                         f"a bad request or a non-clonable repository field. Check "
+                         f"the coding runtime's CloudWatch logs (turn_setup_failed) "
+                         f"and verify the repository owner/name",
+                "setup_failed": True}
+    # 5xx other than 503: the runtime ANSWERED, so never poll/resubmit — but the
     # body is gone, so we cannot tell a pre-CLI setup refusal from a legacy
     # SYNCHRONOUS path that 500'd/504'd after the CLI already ran and touched
     # the workspace. Do NOT claim setup_failed (that would assert "no work
