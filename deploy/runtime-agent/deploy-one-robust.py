@@ -155,7 +155,12 @@ def deploy(agent_name: str) -> None:
 
     artifact = {"containerConfiguration": {"containerUri": image_uri}}
     network = {"networkMode": "PUBLIC"}
-    lifecycle = {"idleRuntimeSessionTimeout": 3600, "maxLifetime": 3600}
+    # maxLifetime is the HARD session cap: AgentCore kills a persona mid-tool-call
+    # at this many seconds with no completion reported, which strands the whole
+    # workflow (TEAM-3966 RCA 2026-09-04 — the 1h value silently reverted three
+    # hand-applied 8h fixes because every deploy re-sends this block). 28800 is
+    # the platform max and matches the coding runtime.
+    lifecycle = {"idleRuntimeSessionTimeout": 3600, "maxLifetime": 28800}
 
     runtime_id = find_runtime(control, agent_name)
     try:

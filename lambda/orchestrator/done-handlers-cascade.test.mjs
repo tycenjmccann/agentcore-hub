@@ -41,6 +41,7 @@ const h = vi.hoisted(() => ({
       completeTaskEntry: /** @type {any[]} */ ([]),
       claimInvocation: /** @type {any[]} */ ([]),
       appendReviewNotificationOnce: /** @type {any[]} */ ([]),
+      ackNotifications: /** @type {any[]} */ ([]),
     },
   },
 }));
@@ -111,6 +112,8 @@ vi.mock("./workflow-store.mjs", () => ({
   // (re)notified, which is what makes the cascade emit review.reawakened.
   appendReviewNotificationOnce: vi.fn(async (wfId, tid) => { h.state.store.appendReviewNotificationOnce.push({ wfId, tid }); return true; }),
   setTaskStatus: vi.fn(async () => {}), // only touched on an invoke failure
+  // TEAM-3966: a human gate going done (approve) must ack its review_needed.
+  ackNotifications: vi.fn(async (wfId, predicate) => { h.state.store.ackNotifications.push({ wfId, predicate }); }),
 }));
 
 // cascade.mjs and lease.mjs are deliberately NOT mocked — the point of these
@@ -180,6 +183,7 @@ beforeEach(async () => {
   h.state.store.completeTaskEntry.length = 0;
   h.state.store.claimInvocation.length = 0;
   h.state.store.appendReviewNotificationOnce.length = 0;
+  h.state.store.ackNotifications.length = 0;
   await load();
 });
 
@@ -282,5 +286,57 @@ describe("reconcile-sweep sentinel route (TEAM-3747 D1)", () => {
     expect(h.state.lambdaInvokes).toHaveLength(0);
     expect(h.state.updates).toHaveLength(0);
     expect(eventsOfType("agent.complete")).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-3966 — approving a human review gate (gate ticket → done) must
+ * acknowledge the gate's open review_needed notification on BOTH done paths.
+ * Before this, handleReviewRejection (CHANGES-NEEDED) was the only caller of
+ * store.ackNotifications, so an APPROVED gate left review_needed open forever
+ * and the watch scheduler's parkedOnHuman() muted the run from the Workflow
+ * Manager for the rest of its life.
+ */
+describe("human gate approved (gate → done) acks its review_needed (TEAM-3966)", () => {
+  const HUMAN = "human:reviewer";
+
+  function approvedGateFixture() {
+    h.state.tickets[DONE] = { ticketId: DONE, parentId: PARENT, workflowId: "wf_1", assignee: HUMAN, status: "done" };
+    h.state.workflow.humanNotifications = [
+      { id: "n1", type: "review_needed", ticketId: DONE, acknowledged: false },
+    ];
+    h.state.children = [
+      { ticketId: DONE, parentId: PARENT, status: "done", assignee: HUMAN, type: "task" },
+    ];
+  }
+
+  function expectAckedExactlyThisGate() {
+    expect(h.state.store.ackNotifications).toHaveLength(1);
+    const { wfId, predicate } = h.state.store.ackNotifications[0];
+    expect(wfId).toBe("wf_1");
+    // Scoped to THIS gate's review_needed — never another gate, never an escalation.
+    expect(predicate({ ticketId: DONE, type: "review_needed" })).toBe(true);
+    expect(predicate({ ticketId: "GATE-OTHER", type: "review_needed" })).toBe(false);
+    expect(predicate({ ticketId: DONE, type: "manager_escalation" })).toBe(false);
+    // The done cascade still ran to completion.
+    expect(eventsOfType("agent.complete").some((e) => e.detail.ticketId === DONE)).toBe(true);
+  }
+
+  it("Jira-webhook path (handleTicketDoneUnified) acks the approved gate", async () => {
+    approvedGateFixture();
+    await handleTicketDoneUnified(DONE);
+    expectAckedExactlyThisGate();
+  });
+
+  it("DDB-stream path (handleTicketDone) acks the approved gate", async () => {
+    approvedGateFixture();
+    await handleTicketDone(DONE, { parentId: PARENT, workflowId: "wf_1", assignee: HUMAN });
+    expectAckedExactlyThisGate();
+  });
+
+  it("an AGENT ticket going done does not touch notifications", async () => {
+    inReviewChildren();
+    await handleTicketDoneUnified(DONE); // DONE is assigned to DEV
+    expect(h.state.store.ackNotifications).toHaveLength(0);
   });
 });
