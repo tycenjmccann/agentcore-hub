@@ -107,6 +107,11 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         env["REMOTE_CODING_PERSONAS"] = personas
     if cc_tenant := os.environ.get("CLOUD_CODE_TENANT_ID"):
         env["CLOUD_CODE_TENANT_ID"] = cc_tenant
+    # Bedrock prompt caching (TEAM-3953) — only override main.py's defaults when set.
+    if cache := os.environ.get("PERSONA_PROMPT_CACHE"):
+        env["PERSONA_PROMPT_CACHE"] = cache
+    if cache_ttl := os.environ.get("PERSONA_CACHE_TTL"):
+        env["PERSONA_CACHE_TTL"] = cache_ttl
     return env
 
 
