@@ -83,6 +83,12 @@ OTEL spans, and last tool activity before death. What to read off it:
   Omit `--repo` and it defaults to the hub repo — crashes are almost always
   infrastructure, not the workload's repo.
 
+  The `--agent` flag is what makes this a CRASH filing (crash-rca + agent
+  labels + signature dedupe). A plain bug the manager noticed that ISN'T a
+  crashed persona is a free-form filing: run `file-bug` WITHOUT `--agent` (and
+  `<workflowId>` is then optional). Free-form bugs carry no crash labels and no
+  dedupe, but still honor the auto-filing kill switch.
+
 - **One-off transient** (single death, retry succeeded, no matching signature
   anywhere) → do NOT file. Comment the RCA on the ticket
   (`intervene.py comment ...`) and store the signature in memory so a repeat

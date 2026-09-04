@@ -98,6 +98,10 @@ async function releaseFilingLock(family: string): Promise<void> {
  *   labels       extra labels (e.g. ["crash-rca", "agent:agentcore_hub_backend_designer"])
  *   dedupeLabels if set, an OPEN Bug carrying ALL of these labels absorbs this
  *                report as a comment instead of a duplicate ticket
+ *   origin       "workflow-manager" marks a Workflow Manager filing (crash or
+ *                free-form). It only extends the kill-switch check to free-form
+ *                WM bugs (which carry no dedupeLabels); it is NOT added to Jira
+ *                labels and is never used for dedupe.
  *
  * Returns { ticketId, deduped } — deduped=true means the description landed as
  * a comment on the existing open bug named by ticketId.
@@ -116,6 +120,7 @@ export async function POST(req: NextRequest) {
     repo?: string;
     labels?: string[];
     dedupeLabels?: string[];
+    origin?: string;
   };
   try {
     body = await req.json();
@@ -148,24 +153,33 @@ export async function POST(req: NextRequest) {
   try {
     const jira = JiraClient.fromEnv();
 
-    // dedupeLabels present = automated filing path (WM crash-rca etc.). Everything
-    // below the kill switch applies ONLY to automated filings; human-relayed bugs
-    // (Telegram intake, UI) don't send dedupeLabels and are never suppressed.
+    // dedupeLabels present = automated crash-rca filing path. A WM free-form bug
+    // carries no dedupeLabels but sets origin="workflow-manager". BOTH are
+    // automated filings subject to the kill switch; human-relayed bugs (Telegram
+    // intake, UI) send neither and are never suppressed.
     const dedupeLabels = (body.dedupeLabels || []).map((l) => String(l).trim()).filter(Boolean);
-    if (dedupeLabels.length > 0) {
-      // 0. Kill switch — the operator said stop; enforce it in code, not prompt.
-      //    Fail CLOSED on a read failure: a DDB blip while the switch is off
-      //    must not re-enable filing. Human bugs never reach this check.
+    const isWmFiling = dedupeLabels.length > 0 || body.origin === "workflow-manager";
+
+    // 0. Kill switch — the operator said stop; enforce it in code, not prompt.
+    //    Fail CLOSED on a read failure: a DDB blip while the switch is off
+    //    must not re-enable filing. Applies to every automated WM filing
+    //    (dedupeLabels OR the free-form origin marker); human bugs never reach it.
+    if (isWmFiling) {
       const filingSwitch = await autoFilingSwitch();
       if (filingSwitch !== "on") {
         return NextResponse.json({
           suppressed: true,
           reason: filingSwitch === "off"
-            ? "Automated bug filing is disabled (wm-config/auto-file-bugs=off). Report the RCA as a ticket comment instead. Do NOT retry."
-            : "Kill-switch state could not be read — automated filing fails closed. Report the RCA as a ticket comment instead. Do NOT retry.",
+            ? "Automated bug filing is disabled (wm-config/auto-file-bugs=off). Report the bug as a ticket comment instead. Do NOT retry."
+            : "Kill-switch state could not be read — automated filing fails closed. Report the bug as a ticket comment instead. Do NOT retry.",
         });
       }
+    }
 
+    // The filing lock, exact-signature dedupe, Won't-Do mute, and family cap are
+    // signature-based and apply ONLY to crash-rca-style filings (dedupeLabels).
+    // A free-form WM bug has no signature, so it skips all of them.
+    if (dedupeLabels.length > 0) {
       // Serialize the whole automated check-then-create sequence per family so
       // concurrent WATCH sessions can't race the dedupe or the cap and file
       // duplicate tickets. Lock released in finally; stale locks self-expire.

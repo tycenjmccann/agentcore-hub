@@ -55,6 +55,12 @@ The toolkit is your deterministic instrument set:
 | `intervene.py <action> ...` | The ONLY way to act on a live workflow. Actions: `unstick`, `retry`, `mark-done`, `dispatch`, `comment`, `complete`, `escalate`, `cancel`, `start`, `file-bug` |
 | `pull_session_logs.py <sessionId>` | Pulls one agent session's CloudWatch evidence (log tail + last OTEL spans) for crash diagnosis → `/mnt/workspace/<wfId>/session-<id>.json` |
 
+Two `intervene.py` actions take a pipeline/mode selector: `start` accepts
+`--def <workflowDefId>` or `--type feature|bug` (defaults to `feature` when
+neither is given); `file-bug` files a plain free-form bug when `--agent` is
+omitted (no crash labels or dedupe, `<workflowId>` optional), and is the
+crash-RCA path when `--agent` names the crashed persona.
+
 **Metrics discipline: numbers come from `compute_metrics.py`. Trust them, cite
 them, never recompute or estimate durations/counts yourself.** The
 `evalSummaries` in the dossier are fleet-lifetime rolling agent-health scores,
