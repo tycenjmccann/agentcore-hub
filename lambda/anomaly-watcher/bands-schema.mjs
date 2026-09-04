@@ -32,6 +32,10 @@ export const VERIFIED_EVENT_TYPES = Object.freeze([
   "agent.error",
   "agent.retry",
   "review.rejected",
+  // TEAM-3966 F6: a human-origin advisory-only rejection the orchestrator
+  // parks instead of auto-approving (TEAM-3790). A change request that
+  // reopened nothing — counted alongside review.rejected, never as a resolution.
+  "review.parked_advisory",
   "ticket.created",
 ]);
 

@@ -165,7 +165,11 @@ def compute_human_reviews(tickets, events, workflow, ended, missing):
 
 def compute_change_requests(events):
     cycles = []
-    rejections = events_of(events, "review.rejected")
+    # TEAM-3966 F6: review.parked_advisory is a human's request-changes the
+    # orchestrator parked (all findings out-of-diff) instead of reopening — a
+    # change request with no reopened tickets. NOT a review resolution: the
+    # humanReviews outcome logic above deliberately reads review.rejected only.
+    rejections = events_of(events, "review.rejected", "review.parked_advisory")
     completions = events_of(events, "agent.complete", "workflow.report_completion")
     for e in rejections:
         rejected_at = parse_ts(e.get("timestamp"))

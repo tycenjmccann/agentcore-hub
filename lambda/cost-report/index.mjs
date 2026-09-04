@@ -296,7 +296,11 @@ async function buildCard(workflowId, workflow, pricing) {
 
   // ── Quality ──
   const count = (type) => events.filter((e) => e.type === type).length;
-  const changeRequests = count("review.rejected");
+  // TEAM-3966 F6: review.parked_advisory is a human's request-changes the
+  // orchestrator parked (all findings out-of-diff) rather than reopening — still
+  // a change request. Deliberately NOT in computeHumanWait's resolution set: a
+  // parked gate is not resolved.
+  const changeRequests = count("review.rejected") + count("review.parked_advisory");
   const fixTickets = countFixTickets(events, agentTasks);
   const gates = computeGateRounds(workflow);
   const reworkRounds = aiTasks.reduce((s, t) => s + t.reworkRounds, 0);

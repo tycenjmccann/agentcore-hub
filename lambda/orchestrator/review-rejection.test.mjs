@@ -130,14 +130,21 @@ vi.mock("./workflow-store.mjs", () => ({
   removeResumeContext: vi.fn(async () => {}),
 }));
 
-vi.mock("./review-cap.mjs", () => ({
-  // getReviewCap() calls createReviewCap({...}); we return a cap whose enforce is
-  // per-test controllable. The real cap publishes review.cap_reached itself
-  // (covered by review-cap.test.mjs) — here we only need the escalated verdict.
-  createReviewCap: () => ({ enforce: (...args) => h.state.enforce(...args) }),
-}));
+vi.mock("./review-cap.mjs", async () => {
+  // TEAM-3966 F1: index.mjs imports the REAL parseDecision for the human's
+  // DECISION: continue override — keep the genuine fail-closed parser.
+  const actual = await vi.importActual("./review-cap.mjs");
+  return {
+    parseDecision: actual.parseDecision,
+    // getReviewCap() calls createReviewCap({...}); we return a cap whose enforce is
+    // per-test controllable. The real cap publishes review.cap_reached itself
+    // (covered by review-cap.test.mjs) — here we only need the escalated verdict.
+    createReviewCap: () => ({ enforce: (...args) => h.state.enforce(...args) }),
+  };
+});
 
 let handleReviewRejection;
+let handler;
 
 const GATE = {
   ticketId: "TEAM-900",
@@ -166,7 +173,7 @@ beforeEach(async () => {
   // readS3Artifact (the F1 ledger derivation) actually hits the S3 mock.
   process.env.ARTIFACT_BUCKET = "test-bucket";
   vi.resetModules();
-  ({ handleReviewRejection } = await import("./index.mjs"));
+  ({ handleReviewRejection, handler } = await import("./index.mjs"));
 });
 
 // The change-set threading tests below toggle GITHUB_PAT + global.fetch; restore
@@ -203,11 +210,14 @@ describe("handleReviewRejection — diff-scoped non-gating rejection (TEAM-3689 
     // and returned, leaving the gate parked in `blocked` with nothing scheduled
     // to touch it again — a silent stall.
     h.state.enforce = vi.fn(async () => ({ escalated: false, gated: false, effectiveRounds: 0, maxRounds: 3 }));
-
-    await handleReviewRejection({
-      ...GATE,
-      reviewFindings: [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }],
+    // TEAM-3966 F5: the auto-approve path requires STRUCTURED findings, and the
+    // only structured source is the release manager's S3 ledger round (read via
+    // deriveReviewFindings, which runs when the gate has a change set).
+    h.state.s3Objects["workflows/wf_1/shared/ship-review-state.json"] = JSON.stringify({
+      rounds: [{ round: 1, verdict: "CHANGES-NEEDED", findings: [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }] }],
     });
+
+    await handleReviewRejection({ ...GATE, changeSet: ["src/parser.ts"] });
 
     expect(h.state.enforce).toHaveBeenCalledTimes(1);
     // No write touches the upstream ticket — the reopen stays suppressed.
@@ -265,7 +275,14 @@ describe("handleReviewRejection — diff-scoped non-gating rejection (TEAM-3689 
 describe("handleReviewRejection — advisory auto-approval failure is not swallowed (TEAM-3765 F4)", () => {
   // The all-advisory verdict: escalated:false + gated:false → the auto-approve branch.
   const advisoryEnforce = () => vi.fn(async () => ({ escalated: false, gated: false }));
-  const ADVISORY_GATE = { ...GATE, reviewFindings: [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }] };
+  // TEAM-3966 F5: structured findings come ONLY from the RM's S3 ledger round;
+  // the change set on the gate makes deriveReviewFindings read it.
+  const ADVISORY_GATE = { ...GATE, changeSet: ["src/parser.ts"] };
+  beforeEach(() => {
+    h.state.s3Objects["workflows/wf_1/shared/ship-review-state.json"] = JSON.stringify({
+      rounds: [{ round: 1, verdict: "CHANGES-NEEDED", findings: [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }] }],
+    });
+  });
   const gateDoneWrites = () =>
     h.state.updates.filter(
       (u) => u.Key.ticketId === "TEAM-900" && u.ExpressionAttributeValues?.[":s"] === "done"
@@ -689,19 +706,32 @@ describe("handleReviewRejection — human authority over advisory auto-approve (
     expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeUndefined();
   });
 
+  // TEAM-3966 F5: the ONLY structured source is the release manager's S3 ledger
+  // round, read through deriveReviewFindings. These helpers feed it that way.
+  const LEDGER_KEY = "workflows/wf_1/shared/ship-review-state.json";
+  const structuredLedger = () => {
+    h.state.s3Objects[LEDGER_KEY] = JSON.stringify({
+      rounds: [{ round: 1, verdict: "CHANGES-NEEDED", findings: STRUCTURED_FINDINGS }],
+    });
+  };
+  // A change set on the gate makes derivation run without a PR fetch.
+  const RM_GATE = { ...GATE, changeSet: ["src/parser.ts"] };
+
   it("(b) RM-origin with the machine-written structured payload still auto-approves — via a CONDITIONED write", async () => {
     h.state.enforce = advisoryEnforce();
+    structuredLedger();
 
     // No human-review markers: this rejection is the release manager's own
-    // verdict delivery, carrying the plumbing-forwarded structured findings.
-    await handleReviewRejection({ ...GATE, reviewFindings: STRUCTURED_FINDINGS });
+    // verdict delivery; the structured findings come from its S3 ledger round.
+    await handleReviewRejection(RM_GATE);
 
     const done = gateDoneWrites();
     expect(done).toHaveLength(1);
-    // TEAM-3790: the flip to done only lands from the expected pre-states.
-    expect(done[0].ConditionExpression).toBe("#s IN (:expectBlocked, :expectInReview)");
+    // TEAM-3790 + TEAM-3966 F3: the flip to done only lands when the gate is
+    // still exactly where the rejection left it — `blocked`, nothing else.
+    expect(done[0].ConditionExpression).toBe("#s = :expectBlocked");
     expect(done[0].ExpressionAttributeValues[":expectBlocked"]).toBe("blocked");
-    expect(done[0].ExpressionAttributeValues[":expectInReview"]).toBe("in_review");
+    expect(done[0].ExpressionAttributeValues[":expectInReview"]).toBeUndefined();
     expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeTruthy();
     expect(h.state.events.find((e) => e.type === "review.parked_advisory")).toBeUndefined();
   });
@@ -733,12 +763,11 @@ describe("handleReviewRejection — human authority over advisory auto-approve (
   it("(c) conditional write loses to a concurrent transition → no overwrite, ONE attempt, no retry, no rethrow, no escalation", async () => {
     h.state.enforce = advisoryEnforce();
     h.state.conditionFailGateDone = true; // a concurrent human transition won the race
+    structuredLedger();
 
     // Must resolve, not throw — a rethrow would trigger event-source retries
     // that re-race the human.
-    await expect(
-      handleReviewRejection({ ...GATE, reviewFindings: STRUCTURED_FINDINGS })
-    ).resolves.toBeUndefined();
+    await expect(handleReviewRejection(RM_GATE)).resolves.toBeUndefined();
 
     // Exactly ONE attempt: a failed condition is authority, not a transient error.
     expect(h.state.gateDoneAttempts).toBe(1);
@@ -749,5 +778,320 @@ describe("handleReviewRejection — human authority over advisory auto-approve (
     expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeUndefined();
     expect(h.state.events.find((e) => e.type === "review.escalated")).toBeUndefined();
     expect(h.state.events.find((e) => e.type === "review.rejected")).toBeUndefined();
+  });
+});
+
+/**
+ * TEAM-3966 — adversarial-review follow-ups on the TEAM-3790 gate-integrity fix.
+ *
+ *   F1  A human-origin rejection whose feedback carries a well-formed
+ *       `DECISION: continue` line is GATING even when every finding is
+ *       out-of-diff: the normal reopen-upstream path runs, no park. Any other
+ *       (or malformed) DECISION is not an override — fail closed.
+ *   F4  The park is idempotent across redelivery: a gate that already carries
+ *       the orchestrator's marked park comment gets no second comment and no
+ *       second review.parked_advisory.
+ *   F5  Findings already on the gate ticket (a field nothing in the repo
+ *       writes) are NOT structured provenance — an RM-origin rejection that
+ *       relies on them parks instead of flipping the gate.
+ */
+describe("handleReviewRejection — human DECISION: continue overrides the advisory park (TEAM-3966 F1)", () => {
+  const advisoryEnforce = () => vi.fn(async () => ({ escalated: false, gated: false }));
+  const ADVISORY = [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }];
+  const HUMAN_GATE = { ...GATE, assignee: "human:engineer", reviewFindings: ADVISORY };
+  const reopens = () =>
+    h.state.updates.filter((u) => u.Key.ticketId === "TEAM-10" && u.ExpressionAttributeValues?.[":s"] === "todo");
+  const gateWrites = () => h.state.updates.filter((u) => u.Key.ticketId === "TEAM-900");
+
+  it("human-origin + all-advisory + feedback with DECISION: continue → upstream reopened, NO park comment, NO parked event", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...HUMAN_GATE,
+      reviewComment: "I still want this reworked despite the diff scope.\nDECISION: continue",
+    });
+
+    // The normal rework path ran: the upstream dev ticket is reopened with the
+    // human's feedback as resume context.
+    expect(reopens()).toHaveLength(1);
+    expect(reopens()[0].ExpressionAttributeValues[":sb"]).toMatchObject({ gateTicketId: "TEAM-900", kind: "review_fix" });
+    // Nothing touched the gate itself: no park comment, no done flip.
+    expect(gateWrites()).toHaveLength(0);
+    expect(h.state.events.find((e) => e.type === "review.parked_advisory")).toBeUndefined();
+    expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeUndefined();
+    const rejected = h.state.events.find((e) => e.type === "review.rejected");
+    expect(rejected).toBeTruthy();
+    expect(rejected.detail.reopened).toEqual(["TEAM-10"]);
+  });
+
+  it("the DECISION line is read from the latest comment when no reviewComment is persisted", async () => {
+    h.state.enforce = advisoryEnforce();
+    const { reviewComment: _drop, ...noReviewComment } = HUMAN_GATE;
+
+    await handleReviewRejection({
+      ...noReviewComment,
+      comments: [
+        { author: "orchestrator", content: "[orchestrator:parked-advisory] earlier park" },
+        { author: "engineer", content: "Re-rejecting.\n\nDECISION: continue" },
+      ],
+    });
+
+    expect(reopens()).toHaveLength(1);
+    expect(h.state.events.find((e) => e.type === "review.parked_advisory")).toBeUndefined();
+  });
+
+  it("a DECISION other than continue (merge-with-known-findings) is NOT an override → still parked", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...HUMAN_GATE,
+      reviewComment: "Fine, ship it.\nDECISION: merge-with-known-findings",
+    });
+
+    expect(reopens()).toHaveLength(0);
+    const parked = h.state.events.find((e) => e.type === "review.parked_advisory");
+    expect(parked).toBeTruthy();
+    expect(parked.detail.reason).toBe("human_origin_rejection");
+  });
+
+  it("a DECISION buried mid-sentence is not well-formed → fail closed, still parked", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...HUMAN_GATE,
+      reviewComment: "I guess DECISION: continue would be the thing to say here, but I'm unsure.",
+    });
+
+    expect(reopens()).toHaveLength(0);
+    expect(h.state.events.find((e) => e.type === "review.parked_advisory")).toBeTruthy();
+  });
+});
+
+describe("handleReviewRejection — advisory park is idempotent across redelivery (TEAM-3966 F4)", () => {
+  const advisoryEnforce = () => vi.fn(async () => ({ escalated: false, gated: false }));
+  const ADVISORY = [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }];
+  const HUMAN_GATE = { ...GATE, assignee: "human:engineer", reviewFindings: ADVISORY };
+  const gateComments = () =>
+    h.state.updates.filter(
+      (u) => u.Key.ticketId === "TEAM-900" && String(u.UpdateExpression).includes("list_append")
+    );
+
+  it("first delivery: the park comment carries the stable marker", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection(HUMAN_GATE);
+
+    const comments = gateComments();
+    expect(comments).toHaveLength(1);
+    expect(comments[0].ExpressionAttributeValues[":n"][0].content).toContain("[orchestrator:parked-advisory]");
+    expect(h.state.events.filter((e) => e.type === "review.parked_advisory")).toHaveLength(1);
+  });
+
+  it("redelivery: the gate already carries the orchestrator's park comment → zero new comments, zero events", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    await handleReviewRejection({
+      ...HUMAN_GATE,
+      comments: [
+        { author: "engineer", content: "please fix the null check" },
+        {
+          author: "orchestrator",
+          content: "[orchestrator:parked-advisory] All findings appear out-of-diff for this fix — approve the gate to confirm ...",
+        },
+      ],
+    });
+
+    expect(gateComments()).toHaveLength(0);
+    expect(h.state.events).toHaveLength(0);
+    expect(h.state.ebEvents).toHaveLength(0);
+    // And still nothing else moved: no reopen, no flip.
+    expect(h.state.updates).toHaveLength(0);
+  });
+});
+
+describe("handleReviewRejection — ticket-carried reviewFindings are NOT structured provenance (TEAM-3966 F5)", () => {
+  const advisoryEnforce = () => vi.fn(async () => ({ escalated: false, gated: false }));
+  const FINDINGS = [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }];
+  const gateDoneWrites = () =>
+    h.state.updates.filter(
+      (u) => u.Key.ticketId === "TEAM-900" && u.ExpressionAttributeValues?.[":s"] === "done"
+    );
+
+  it("RM-origin gate with gateTicket.reviewFindings set (no writer exists) → parked as non_structured_findings, no flip", async () => {
+    h.state.enforce = advisoryEnforce();
+
+    // No human markers, no S3 ledger — the ONLY findings are on the ticket.
+    await handleReviewRejection({ ...GATE, reviewFindings: FINDINGS });
+
+    // Still fed to the cap for diff-scoping (that is what decided gated:false)...
+    expect(h.state.enforce.mock.calls[0][0].findings).toEqual(FINDINGS);
+    // ...but never authority for a flip.
+    expect(gateDoneWrites()).toHaveLength(0);
+    expect(h.state.gateDoneAttempts).toBe(0);
+    const parked = h.state.events.find((e) => e.type === "review.parked_advisory");
+    expect(parked).toBeTruthy();
+    expect(parked.detail.reason).toBe("non_structured_findings");
+    expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeUndefined();
+  });
+});
+
+/**
+ * TEAM-3966 F2 — the Jira-provider done-flip has the same pre-state guard as the
+ * DDB ConditionExpression: re-read the gate right before transitioning and stop
+ * (no retry / rethrow / escalation) unless it is still `blocked`.
+ *
+ * index.mjs snapshots TICKET_PROVIDER at module load, so this suite re-imports
+ * in Jira mode and routes jiraFetch's global.fetch by URL.
+ */
+describe("handleReviewRejection — Jira-provider pre-state guard on the done-flip (TEAM-3966 F2)", () => {
+  const advisoryEnforce = () => vi.fn(async () => ({ escalated: false, gated: false }));
+  const STRUCTURED_FINDINGS = [{ severity: "P2", citedFiles: ["vendor/untouched.ts"] }];
+  const LEDGER_KEY = "workflows/wf_1/shared/ship-review-state.json";
+  const RM_GATE = { ...GATE, changeSet: ["src/parser.ts"] };
+
+  const jiraIssue = (key, { status = "Blocked", labels = [], blockedBy = [], comments = [] } = {}) => ({
+    key,
+    fields: {
+      summary: key,
+      status: { name: status },
+      labels,
+      issuetype: { name: "Task" },
+      parent: { key: "TEAM-1" },
+      issuelinks: blockedBy.map((k) => ({ type: { inward: "is blocked by" }, inwardIssue: { key: k } })),
+      comment: {
+        comments: comments.map((c) => ({
+          author: { displayName: "human" },
+          body: { content: [{ content: [{ text: c }] }] },
+          created: "2026-09-04T00:00:00Z",
+        })),
+      },
+    },
+  });
+  const jsonResp = (obj, status = 200) => ({ ok: true, status, text: async () => JSON.stringify(obj) });
+  /** Routes every Jira REST call the handler can make; records them for assertions. */
+  const jiraRouter = (issues) =>
+    vi.fn(async (url, init = {}) => {
+      const u = String(url);
+      const m = u.match(/\/rest\/api\/3\/issue\/([A-Z]+-\d+)(\/transitions|\/comment)?/);
+      if (!m) return jsonResp({});
+      const [, key, sub] = m;
+      if (sub === "/transitions") {
+        if ((init.method || "GET") === "GET") {
+          return jsonResp({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }] });
+        }
+        return { ok: true, status: 204, text: async () => "" };
+      }
+      if (sub === "/comment") return jsonResp({}, 201);
+      return issues[key] ? jsonResp(issues[key]) : { ok: false, status: 404, text: async () => "not found" };
+    });
+  const calls = (fetchSpy, pred) =>
+    fetchSpy.mock.calls.filter(([u, init]) => pred(String(u), (init && init.method) || "GET"));
+
+  beforeEach(async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    process.env.JIRA_SITE_URL = "jira.test";
+    process.env.JIRA_EMAIL = "bot@test";
+    process.env.JIRA_API_TOKEN = "t";
+    vi.resetModules();
+    ({ handleReviewRejection, handler } = await import("./index.mjs"));
+    h.state.s3Objects[LEDGER_KEY] = JSON.stringify({
+      rounds: [{ round: 1, verdict: "CHANGES-NEEDED", findings: STRUCTURED_FINDINGS }],
+    });
+    h.state.enforce = advisoryEnforce();
+  });
+  afterEach(() => {
+    delete process.env.TICKET_PROVIDER;
+    delete process.env.JIRA_SITE_URL;
+    delete process.env.JIRA_EMAIL;
+    delete process.env.JIRA_API_TOKEN;
+  });
+
+  const upstream = () => jiraIssue("TEAM-10", { status: "Done", labels: ["agent:agentcore_hub_api_dev"] });
+
+  it("re-read shows the gate moved (In Review) → NO transition, ONE read, no retry, no rethrow, no escalation", async () => {
+    const fetchSpy = jiraRouter({ "TEAM-10": upstream(), "TEAM-900": jiraIssue("TEAM-900", { status: "In Review" }) });
+    global.fetch = fetchSpy;
+
+    await expect(handleReviewRejection(RM_GATE)).resolves.toBeUndefined();
+
+    expect(calls(fetchSpy, (u) => u.includes("/TEAM-900/transitions"))).toHaveLength(0);
+    expect(calls(fetchSpy, (u) => u.includes("/issue/TEAM-900?fields"))).toHaveLength(1);
+    expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeUndefined();
+    expect(h.state.events.find((e) => e.type === "review.escalated")).toBeUndefined();
+    expect(h.state.events.find((e) => e.type === "review.rejected")).toBeUndefined();
+  });
+
+  it("re-read shows the gate moved (Done) → same stop", async () => {
+    const fetchSpy = jiraRouter({ "TEAM-10": upstream(), "TEAM-900": jiraIssue("TEAM-900", { status: "Done" }) });
+    global.fetch = fetchSpy;
+
+    await handleReviewRejection(RM_GATE);
+
+    expect(calls(fetchSpy, (u) => u.includes("/TEAM-900/transitions"))).toHaveLength(0);
+    expect(calls(fetchSpy, (u) => u.includes("/issue/TEAM-900?fields"))).toHaveLength(1);
+    expect(h.state.events.find((e) => e.type === "review.escalated")).toBeUndefined();
+  });
+
+  it("re-read shows the gate still Blocked → the Done transition proceeds and approved_with_advisory fires", async () => {
+    const fetchSpy = jiraRouter({ "TEAM-10": upstream(), "TEAM-900": jiraIssue("TEAM-900", { status: "Blocked" }) });
+    global.fetch = fetchSpy;
+
+    await handleReviewRejection(RM_GATE);
+
+    expect(calls(fetchSpy, (u, m) => u.includes("/TEAM-900/transitions") && m === "GET")).toHaveLength(1);
+    expect(calls(fetchSpy, (u, m) => u.includes("/TEAM-900/transitions") && m === "POST")).toHaveLength(1);
+    expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeTruthy();
+  });
+
+  /**
+   * F2 pin — the production trigger only invokes handleReviewRejection for a
+   * "human:*" gate, so the RM-origin auto-approve above is intentionally
+   * unreachable from the Jira webhook entry point.
+   */
+  it("PIN: the Jira webhook trigger invokes handleReviewRejection ONLY for a human-assigned gate", async () => {
+    const rmGate = jiraIssue("TEAM-900", { status: "Blocked", labels: ["agent:agentcore_hub_release_manager", "wf:wf_1"], blockedBy: ["TEAM-10"] });
+    const humanGate = jiraIssue("TEAM-900", { status: "Blocked", labels: ["human-review", "reviewer:engineer", "wf:wf_1"], blockedBy: ["TEAM-10"] });
+    // Short-circuit before the (Jira-hopping) reopen loop — we only need to know
+    // whether the handler was reached.
+    h.state.enforce = vi.fn(async () => ({ escalated: true, effectiveRounds: 3, maxRounds: 3 }));
+    const webhook = { source: "jira-webhook", ticketId: "TEAM-900", newStatus: "blocked", oldStatus: "in_review" };
+
+    global.fetch = jiraRouter({ "TEAM-10": upstream(), "TEAM-900": rmGate });
+    await handler(webhook);
+    expect(h.state.enforce).not.toHaveBeenCalled();
+
+    global.fetch = jiraRouter({ "TEAM-10": upstream(), "TEAM-900": humanGate });
+    await handler(webhook);
+    expect(h.state.enforce).toHaveBeenCalledTimes(1);
+    expect(h.state.enforce.mock.calls[0][0].gateTicket.assignee).toBe("human:engineer");
+  });
+});
+
+/**
+ * TEAM-3966 F2 pin (DDB-stream twin): processRecord gates on the stream image's
+ * assignee the same way.
+ */
+describe("processRecord — DDB-stream trigger invokes handleReviewRejection ONLY for a human-assigned gate (TEAM-3966 F2 pin)", () => {
+  const streamEvent = (assignee) => ({
+    Records: [{
+      eventName: "MODIFY",
+      eventSource: "aws:dynamodb",
+      dynamodb: {
+        NewImage: { ticketId: { S: "TEAM-900" }, status: { S: "blocked" }, assignee: { S: assignee } },
+        OldImage: { ticketId: { S: "TEAM-900" }, status: { S: "in_review" }, assignee: { S: assignee } },
+      },
+    }],
+  });
+
+  it("agent-assigned gate → handler never reached; human-assigned gate → reached once", async () => {
+    h.state.enforce = vi.fn(async () => ({ escalated: true, effectiveRounds: 3, maxRounds: 3 }));
+    h.state.tickets["TEAM-900"] = { ...GATE, assignee: "human:engineer", status: "blocked" };
+
+    await handler(streamEvent("agentcore_hub_release_manager"));
+    expect(h.state.enforce).not.toHaveBeenCalled();
+
+    await handler(streamEvent("human:engineer"));
+    expect(h.state.enforce).toHaveBeenCalledTimes(1);
+    expect(h.state.enforce.mock.calls[0][0].gateTicket.ticketId).toBe("TEAM-900");
   });
 });

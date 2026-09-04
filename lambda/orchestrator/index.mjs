@@ -41,7 +41,7 @@ import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
-import { createReviewCap } from "./review-cap.mjs";
+import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 
@@ -62,6 +62,10 @@ const MAX_QA_RETRIES = 3;
 // to 0 in tests) — a false/throw from the transition is a transient candidate.
 const ADVISORY_APPROVE_MAX_ATTEMPTS = Number(process.env.ADVISORY_APPROVE_MAX_ATTEMPTS) || 3;
 const ADVISORY_APPROVE_BACKOFF_MS = Number(process.env.ADVISORY_APPROVE_BACKOFF_MS ?? 250);
+// TEAM-3966 F4: stable marker stamped into the advisory park comment so a
+// redelivered rejection (SQS retry, stream re-poll, webhook replay) can detect
+// the gate is ALREADY parked and skip the duplicate comment + event.
+const PARK_ADVISORY_MARKER = "[orchestrator:parked-advisory]";
 // Dead-session detector rollout flag (TEAM-3618 D1.2): off = skip the sweep,
 // shadow = observe + metrics + shadow-flagged events but ZERO writes, enforce =
 // steal/retry/escalate. Unset/empty DEFAULTS TO SHADOW (TEAM-3763 F1): per the
@@ -535,6 +539,14 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
     case "blocked": {
       // A human-review gate moved to "blocked" = "Request changes". If the gate
       // is configured onReject:"rework", re-open the upstream work it reviewed.
+      //
+      // TEAM-3966 F2 (pin): handleReviewRejection is reached ONLY for a gate
+      // whose assignee is "human:*" — here and in processRecord (the DDB-stream
+      // twin). isHumanReviewGate() is a superset of this check, so inside the
+      // handler `humanOrigin` is always true from a production trigger and the
+      // release-manager-origin auto-approve branch is INTENTIONALLY unreachable
+      // from any entry point (the blueprint never has the RM transition the
+      // Merge Approval gate). Pinned by review-rejection.test.mjs.
       const rejected = await getTicket(ticketId);
       if (rejected && isHumanAssignee(rejected.assignee)) {
         await handleReviewRejection(rejected);
@@ -1337,13 +1349,18 @@ export async function handleReviewRejection(gateTicket) {
   // and behavior is byte-identical to before (R4).
   let changeSet = gateTicket.changeSet || gateTicket.metadata?.changeSet || null;
   let reviewFindings = gateTicket.reviewFindings || gateTicket.metadata?.reviewFindings || null;
-  // TEAM-3790: track the findings' PROVENANCE. Findings the gate plumbing
-  // forwarded onto the ticket are the release manager's machine-written
-  // classification — "structured". Derived findings carry the source
-  // deriveReviewFindings reports: "structured" (RM's S3 ledger) or "prose"
-  // (fenced JSON parsed out of comment text). Only "structured" findings may
-  // ever feed an auto-approval below.
-  let findingsSource = Array.isArray(reviewFindings) ? "structured" : null;
+  // TEAM-3790: track the findings' PROVENANCE. Derived findings carry the
+  // source deriveReviewFindings reports: "structured" (the RM's machine-written
+  // S3 ledger round) or "prose" (fenced JSON parsed out of comment text). Only
+  // "structured" findings may ever feed an auto-approval below.
+  //
+  // TEAM-3966 F5: findings already ON the gate ticket are NOT granted
+  // "structured" provenance. No writer of gateTicket.reviewFindings exists
+  // anywhere in the repo (orchestrator, ticket Lambdas, app, deploy), so the
+  // field's provenance is unattested — it is still used for diff-scoping (the
+  // cap treats it as the reviewer's classification) but its source stays null,
+  // which can never authorize a flip to done.
+  let findingsSource = null;
   // D3 (TEAM-3748, FR-D3.1): when the event carries no change set, compute it
   // from the PR diff so review is scoped to what the PR changed rather than the
   // whole assembled repo. Fail-open — no PR / GitHub error leaves changeSet null,
@@ -1405,7 +1422,27 @@ export async function handleReviewRejection(gateTicket) {
   // stream / Jira webhook → done cascade), so dependents unblock through the
   // one existing machinery. A reviewer who wants to force rework can: any
   // finding without out-of-diff citations gates.
-  if (capResult.gated === false) {
+  //
+  // TEAM-3966 F1 — the human's explicit override. A human-origin rejection
+  // whose feedback carries a well-formed `DECISION: continue` line (same
+  // fail-closed parser the cap escalation uses) is treated as GATING even when
+  // the diff-scope verdict says all findings are advisory: skip the park and
+  // take the normal reopen-upstream path. Without this, a human who rejects,
+  // gets parked, and wants REWORK has no working path — nothing else consumes
+  // a DECISION line on a parked gate (the cap's authorizeIfDecided only acts on
+  // an open escalation, and gated:false records neither a round nor an
+  // escalation). `feedback` is the persisted reviewComment (set at transition
+  // time) or the latest comment, so the human must put the line in the note
+  // attached to the re-rejection; comments alone never wake the orchestrator.
+  const humanOrigin = isHumanReviewGate(gateTicket);
+  const humanContinue = humanOrigin && parseDecision(feedback) === "continue";
+  if (capResult.gated === false && humanContinue) {
+    console.log(
+      `[orchestrator] Review gate ${gateTicket.ticketId}: all findings out-of-diff, but the human's ` +
+        `rejection carries DECISION: continue — treating as gating and reopening upstream work.`
+    );
+  }
+  if (capResult.gated === false && !humanContinue) {
     // TEAM-3790 — AUTHORITY CHECK before any auto-approval. The advisory
     // auto-approve is the release manager's OWN Step-4 verdict being enacted;
     // it must never override a human's explicit rejection, and it must never
@@ -1414,30 +1451,53 @@ export async function handleReviewRejection(gateTicket) {
     //      (PR #216 — assignee "human:*" and/or "human-review"/"reviewer:*"
     //      labels). Its "blocked" transition IS the human's request-changes;
     //      the human keeps authority. Park + ask, never flip to done.
-    //   2. Findings provenance: only the machine-written structured
-    //      reviewFindings payload (forwarded onto the gate ticket by the gate
-    //      plumbing, or the RM's own S3 ledger round) may feed an
-    //      auto-approval. Prose-derived findings → not usable → park.
-    const humanOrigin = isHumanReviewGate(gateTicket);
+    //   2. Findings provenance: only the machine-written structured findings
+    //      (the RM's own S3 ledger round, via deriveReviewFindings) may feed an
+    //      auto-approval. Prose-derived or ticket-carried findings → park.
     const structuredFindings = findingsSource === "structured";
     if (humanOrigin || !structuredFindings) {
-      const reason = humanOrigin ? "human_origin_rejection" : "prose_derived_findings";
+      const reason = humanOrigin
+        ? "human_origin_rejection"
+        : findingsSource === "prose"
+        ? "prose_derived_findings"
+        : "non_structured_findings";
       console.log(
         `[orchestrator] Review gate ${gateTicket.ticketId} rejected with all-out-of-diff findings but ` +
-          `${humanOrigin ? "the rejection is a HUMAN's own request-changes" : "the findings are prose-derived (not machine-written)"} ` +
+          `${humanOrigin ? "the rejection is a HUMAN's own request-changes" : `the findings are not machine-written (${reason})`} ` +
           `— parking the gate for the human instead of auto-approving.`
       );
+      // TEAM-3966 F4 — idempotent across redelivery. The orchestrator's own
+      // park comment carries PARK_ADVISORY_MARKER; if the gate already has one,
+      // this is a re-processing of the same parked state (SQS retry / stream
+      // re-poll / webhook replay): log, but post no second comment and publish
+      // no second review.parked_advisory. Both providers surface comments as
+      // [{author, content, timestamp}] (mapJiraIssueToTicket / DDB item).
+      const alreadyParked = (Array.isArray(gateTicket.comments) ? gateTicket.comments : []).some(
+        (c) => String(c?.content ?? c?.body ?? c ?? "").includes(PARK_ADVISORY_MARKER)
+      );
+      if (alreadyParked) {
+        console.log(
+          `[orchestrator] Review gate ${gateTicket.ticketId} is already parked (advisory) — redelivery; ` +
+            `skipping duplicate park comment and event.`
+        );
+        return;
+      }
       try {
         await commentOnTicket(
           gateTicket.ticketId,
-          `All findings appear out-of-diff for this fix — approve the gate to confirm, or leave it rejected to hold. To force rework, re-reject citing a file in the PR change set, or reopen the upstream ticket(s) directly.`
+          `${PARK_ADVISORY_MARKER} All findings appear out-of-diff for this fix — approve the gate to confirm, ` +
+            `or leave it rejected to hold. To force rework: move the gate back to In Review, then Request Changes ` +
+            `again with a note containing a line that reads exactly "DECISION: continue" — a comment alone does ` +
+            `not wake the orchestrator, the status change does. Alternatively, re-reject citing a file in the PR ` +
+            `change set, or reopen the upstream ticket(s) directly.`
         );
       } catch (err) {
         console.warn(`[orchestrator] advisory park comment failed for ${gateTicket.ticketId}: ${err?.message || err}`);
       }
       // The gate stays exactly where the rejection put it (blocked) — the
-      // human's approval is the only way forward. Observable, so the parked
-      // state is never a silent stall.
+      // human's approval, or a re-rejection carrying DECISION: continue, is the
+      // only way forward. Observable, so the parked state is never a silent
+      // stall.
       await publishEvent(gateTicket.ticketId, "review.parked_advisory", {
         ticketId: gateTicket.ticketId,
         workflowId: workflow.id,
@@ -1498,36 +1558,57 @@ export async function handleReviewRejection(gateTicket) {
     for (let attempt = 1; attempt <= ADVISORY_APPROVE_MAX_ATTEMPTS && !approved; attempt++) {
       try {
         if (TICKET_PROVIDER === "jira") {
+          // TEAM-3966 F2: Jira has no conditional transition, so emulate the
+          // DDB branch's pre-state guard — re-read the gate immediately before
+          // transitioning and require it to STILL be `blocked` (where the
+          // rejection left it). Any other status means a concurrent transition
+          // moved it and whoever did that holds authority: log and STOP, exactly
+          // like ConditionalCheckFailedException below (no retry, no rethrow,
+          // no escalation). A read failure throws into the catch and is
+          // treated as transient (retried), re-reading on the next attempt.
+          const fresh = await getTicketFromJira(gateTicket.ticketId);
+          if (fresh?.status !== "blocked") {
+            console.log(
+              `[orchestrator] advisory auto-approve for ${gateTicket.ticketId} lost to a concurrent ` +
+                `transition (Jira status is "${fresh?.status ?? "unknown"}", expected "blocked") — ` +
+                `stopping without retry; the concurrent action wins.`
+            );
+            return;
+          }
           // jiraTransition returns false (does NOT throw) when the transition is
           // missing or the POST fails — a false is as much a non-landing as a
           // throw, so both count as "not approved" and drive a retry.
           approved = await jiraTransition(gateTicket.ticketId, "Done");
         } else {
           // TEAM-3790: the flip to done is CONDITIONED on the gate still being
-          // where the rejection left it (blocked; in_review tolerated for
-          // redelivery timing). A concurrent human transition (cancel/rework/
-          // anything else) between findings-derivation and this write changes
-          // the status, fails the condition, and WINS — last-writer-wins is
-          // exactly the bug this removes.
+          // where the rejection left it. A concurrent human transition (cancel/
+          // rework/anything else) between findings-derivation and this write
+          // changes the status, fails the condition, and WINS — last-writer-wins
+          // is exactly the bug this removes.
+          //
+          // TEAM-3966 F3: `blocked` ONLY. The stream record that reaches this
+          // handler fires after the item is already `blocked`, so `in_review`
+          // here can only mean a concurrent move (a human sending it back to
+          // review, parkGateForHuman on an escalation, the cascade's re-park) —
+          // every one of which must win, not be overwritten.
           await ddb.send(new UpdateCommand({
             TableName: TICKETS_TABLE,
             Key: { ticketId: gateTicket.ticketId },
             UpdateExpression: "SET #s = :s, #u = :u",
-            ConditionExpression: "#s IN (:expectBlocked, :expectInReview)",
+            ConditionExpression: "#s = :expectBlocked",
             ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
             ExpressionAttributeValues: {
               ":s": "done",
               ":u": new Date().toISOString(),
               ":expectBlocked": "blocked",
-              ":expectInReview": "in_review",
             },
           }));
           approved = true;
         }
       } catch (err) {
         // TEAM-3790: a failed condition is NOT a transient failure — a
-        // concurrent transition moved the gate out of blocked/in_review, and
-        // whoever did that holds authority. Log and STOP: no retry (retrying
+        // concurrent transition moved the gate out of blocked, and whoever did
+        // that holds authority. Log and STOP: no retry (retrying
         // would be the same last-writer-wins overwrite one attempt later), no
         // escalation (nothing is stuck — the gate is wherever the concurrent
         // actor put it), no rethrow (an event-source retry would re-race).
@@ -1938,6 +2019,9 @@ async function processRecord(record) {
       break;
     case "blocked": {
       // Human-review gate "Request changes" → re-open upstream work if configured.
+      // TEAM-3966 F2 (pin): same "human:*"-only gating as processStatusChange —
+      // the RM-origin auto-approve inside handleReviewRejection is unreachable
+      // from this trigger too. Pinned by review-rejection.test.mjs.
       const blockedAssignee = unwrapDdbValue(newImage.assignee);
       if (isHumanAssignee(blockedAssignee)) {
         const rejected = await getTicket(ticketId);

@@ -49,7 +49,7 @@ import {
   canonicalWindowStart,
   renderEvidence,
 } from "./detect.mjs";
-import { validateBands } from "./bands-schema.mjs";
+import { validateBands, VERIFIED_EVENT_TYPES } from "./bands-schema.mjs";
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 
@@ -1407,4 +1407,25 @@ test("postStart OMITS the x-intake-internal-secret header entirely when the secr
   const posts = startPosts(harness);
   assert.equal(posts.length, 1);
   assert.ok(!("x-intake-internal-secret" in posts[0].headers), "no empty header sent");
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TEAM-3966 F6 — review.parked_advisory (TEAM-3790: a human-origin advisory-only
+// rejection the orchestrator parks instead of auto-approving) is part of the
+// verified vocabulary, so a bands metric may count it without a validation error.
+// ═════════════════════════════════════════════════════════════════════════════
+
+test("TEAM-3966 F6: review.parked_advisory is a verified event type and validates as a numerator", () => {
+  assert.ok(VERIFIED_EVENT_TYPES.includes("review.parked_advisory"));
+  assert.ok(VERIFIED_EVENT_TYPES.includes("review.rejected"), "sibling change-request type still present");
+
+  const text =
+    `version: 1\nmetrics:\n` +
+    rateMetricYaml("change_request_rate").replace(
+      "numeratorTypes: [agent.error, agent.retry]",
+      "numeratorTypes: [review.rejected, review.parked_advisory]"
+    );
+  const res = validateBands(yaml.load(text));
+  assert.ok(res.ok, `expected valid, got: ${(res.errors || []).join(" | ")}`);
+  assert.deepEqual(res.config.metrics[0].source.numeratorTypes, ["review.rejected", "review.parked_advisory"]);
 });
