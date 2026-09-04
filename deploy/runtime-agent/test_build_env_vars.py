@@ -42,12 +42,13 @@ PLATFORM_MANAGED = [
 
 
 class TestBuildEnvVars(unittest.TestCase):
-    def build(self):
+    def build(self, extra_env=None):
         # clear=True: only ARTIFACT_BUCKET present, so optional passthroughs
         # (GATEWAY_ARN, MCP_SERVERS, ...) from the host env can't leak in.
-        with mock.patch.dict(
-            os.environ, {"ARTIFACT_BUCKET": "test-bucket"}, clear=True
-        ):
+        env = {"ARTIFACT_BUCKET": "test-bucket"}
+        if extra_env:
+            env.update(extra_env)
+        with mock.patch.dict(os.environ, env, clear=True):
             return deploy_one_robust.build_env_vars(AGENT, f"prompts/{AGENT}.txt")
 
     def test_otel_service_name(self):
@@ -67,6 +68,20 @@ class TestBuildEnvVars(unittest.TestCase):
         env = self.build()
         for key in PLATFORM_MANAGED:
             self.assertNotIn(key, env, f"{key} is platform-managed and must not be set")
+
+    def test_prompt_cache_vars_absent_when_unset(self):
+        # TEAM-3953: main.py owns the defaults (cache on, ttl 1h); the deploy
+        # path passes these through ONLY when set in the shell env.
+        env = self.build()
+        self.assertNotIn("PERSONA_PROMPT_CACHE", env)
+        self.assertNotIn("PERSONA_CACHE_TTL", env)
+
+    def test_prompt_cache_vars_passed_through_when_set(self):
+        env = self.build(
+            {"PERSONA_PROMPT_CACHE": "0", "PERSONA_CACHE_TTL": "5m"}
+        )
+        self.assertEqual(env["PERSONA_PROMPT_CACHE"], "0")
+        self.assertEqual(env["PERSONA_CACHE_TTL"], "5m")
 
 
 if __name__ == "__main__":
