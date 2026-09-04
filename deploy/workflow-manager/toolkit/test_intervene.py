@@ -182,6 +182,20 @@ def test_file_bug_crash_mode_without_workflow_id_refuses(rec):
     assert rec.posts == []
 
 
+@pytest.mark.parametrize("agent_value", ["", "   "])
+def test_file_bug_explicit_empty_agent_refuses_no_post(rec, agent_value):
+    # TEAM-3919 finding 1 (P2): an explicit but empty/whitespace --agent must
+    # NOT silently fall through to free-form mode (that would skip the
+    # crash-rca dedupe + family cap the caller almost certainly wanted). It is
+    # a hard refusal instead, distinct from --agent being absent entirely.
+    with pytest.raises(SystemExit) as exc:
+        run(["file-bug", "WF-1", "--title", "T", "--description", "D", "--agent", agent_value])
+    assert "REFUSED" in str(exc.value)
+    assert "--agent" in str(exc.value)
+    assert rec.posts == []
+    assert rec.events == []
+
+
 # --------------------------------------------------------------------------
 # file-bug — free-form mode (no --agent)
 # --------------------------------------------------------------------------
