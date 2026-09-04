@@ -50,6 +50,14 @@
  * in the next message, then transitions to blocked with that note as the
  * rework context. Dedupe per gate ticket lives in PENDING_TABLE (gate#<id>),
  * chat registry in chat#<chatId> (any chat that ever messaged the bot).
+ *
+ * MANAGER ESCALATIONS: the same scan also pages every allowlisted chat when the
+ * Workflow Manager records an unacknowledged manager_escalation. An open
+ * escalation PARKS the run (the watch scheduler skips it), so without a ping
+ * the run stays parked until someone happens to open the UI — the 9h
+ * TEAM-3938 stall. The ✅ Resolved button PATCHes /api/workflow/[id]/escalations
+ * (acknowledge all open), which is the only thing that puts the run back
+ * under watch. Dedupe per escalation lives in PENDING_TABLE (esc#<notif.id>).
  */
 
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
@@ -135,6 +143,7 @@ export const handler = async (event, context) => {
   // Re-scan every 60s INSIDE the loop too: one invocation long-polls ~14.5 min,
   // so a start-only scan made gate pings lag up to 15 min behind the gate.
   try { await scanReviewGates(); } catch (err) { console.error("[telegram-bug-intake] gate scan", err); }
+  try { await scanManagerEscalations(); } catch (err) { console.error("[telegram-bug-intake] escalation scan", err); }
   try { await scanDeployApprovals(); } catch (err) { console.error("[telegram-bug-intake] deploy approval scan", err); }
   let lastGateScan = Date.now();
 
@@ -142,6 +151,7 @@ export const handler = async (event, context) => {
     if (Date.now() - lastGateScan > 60_000) {
       lastGateScan = Date.now();
       try { await scanReviewGates(); } catch (err) { console.error("[telegram-bug-intake] gate scan", err); }
+      try { await scanManagerEscalations(); } catch (err) { console.error("[telegram-bug-intake] escalation scan", err); }
       try { await scanDeployApprovals(); } catch (err) { console.error("[telegram-bug-intake] deploy approval scan", err); }
     }
     await flushSettledBuffers(buffers, context);
@@ -454,6 +464,14 @@ async function handleCallback(cb) {
     return;
   }
 
+  // Manager-escalation button: eok|<workflowId> (resolves every open escalation
+  // on the run — the notification id alone overflows Telegram's 64-byte
+  // callback_data cap, and one open escalation is enough to park the run).
+  if (action === "eok") {
+    await handleEscalationCallback(cb, chatId, id);
+    return;
+  }
+
   const item = await ddb.send(new GetItemCommand({ TableName: PENDING_TABLE, Key: { id: { S: id } } }));
   if (!item.Item) {
     await tgAnswer(cb.id, "Expired — send the bug again.");
@@ -679,6 +697,112 @@ async function transitionGate(workflowId, ticketId, targetStatus, comment) {
     body: JSON.stringify({ ticketId, targetStatus, comment }),
   });
   if (!res.ok) throw new Error(`transition ${res.status}: ${await res.text().catch(() => "")}`);
+}
+
+// ─── Workflow Manager escalations ────────────────────────────────────────────
+// intervene.py `escalate` appends an unacknowledged manager_escalation to the
+// workflow's humanNotifications and the watch scheduler (workflow-analyzer)
+// skips the run while one is open. Nothing else surfaces it, so a run parked
+// this way is invisible until a human opens the UI. Page every allowlisted
+// chat once per escalation with a Resolved button that acknowledges it.
+
+const ESC_KEY_PREFIX = "esc#";
+const ESC_DETAIL_MAX = 700;
+
+async function scanManagerEscalations() {
+  const res = await fetch(`${HUB_API_URL}/api/workflow/list`);
+  if (!res.ok) throw new Error(`workflow/list ${res.status}`);
+  const { workflows = [] } = await res.json();
+
+  const pending = [];
+  for (const wf of workflows) {
+    for (const n of wf.humanNotifications || []) {
+      if (n.type === "manager_escalation" && !n.acknowledged && n.id) {
+        pending.push({ wf, notif: n });
+      }
+    }
+  }
+  if (!pending.length) return;
+
+  let chats = null;
+  for (const { wf, notif } of pending) {
+    const claimed = await claimKey(`${ESC_KEY_PREFIX}${notif.id}`);
+    if (!claimed) continue;
+
+    // Same claim-before-delivery contract as review gates: any throw before a
+    // delivered ping must release the claim or this escalation stays silent.
+    try {
+      chats = chats || (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
+      if (!chats.length) {
+        console.warn("[telegram-bug-intake] manager escalation but no allowlisted chats to notify");
+        await releaseKey(`${ESC_KEY_PREFIX}${notif.id}`);
+        continue;
+      }
+
+      const details = String(notif.details || notif.message || "").trim();
+      const clipped = details.length > ESC_DETAIL_MAX ? `${details.slice(0, ESC_DETAIL_MAX)}…` : details;
+      const text =
+        `🚨 *Workflow Manager escalation*\n` +
+        `📋 Run: ${esc(wf.input?.title || wf.workflowId)}\n` +
+        `⏸ The run is *parked* until you tap Resolved — the watch scheduler skips it while this is open.\n\n` +
+        `${esc(clipped)}`;
+      const keyboard = { inline_keyboard: [
+        [{ text: "✅ Resolved — resume watching", callback_data: `eok|${wf.workflowId}` }],
+        [{ text: "📱 Open run in hub", url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}` }],
+      ] };
+
+      let delivered = 0;
+      for (const chatId of chats) {
+        try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
+        catch (err) { console.error(`[telegram-bug-intake] escalation ping to ${chatId}`, err.message); }
+      }
+      if (!delivered) await releaseKey(`${ESC_KEY_PREFIX}${notif.id}`);
+    } catch (err) {
+      await releaseKey(`${ESC_KEY_PREFIX}${notif.id}`).catch((relErr) =>
+        console.error("[telegram-bug-intake] releaseKey after escalation failure", relErr.message));
+      throw err;
+    }
+  }
+}
+
+async function handleEscalationCallback(cb, chatId, workflowId) {
+  if (!ALLOWED_CHAT_IDS.includes(String(chatId))) {
+    console.warn(`[telegram-bug-intake] unauthorized escalation callback from chat ${chatId} for ${workflowId}`);
+    await tgAnswer(cb.id, "Not authorized to resolve escalations.");
+    return;
+  }
+  const res = await fetch(`${HUB_API_URL}/api/workflow/${encodeURIComponent(workflowId)}/escalations`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  if (!res.ok) {
+    await tgAnswer(cb.id, `Resolve failed (${res.status}) — try again or use the hub.`);
+    return;
+  }
+  const { resolved = [] } = await res.json().catch(() => ({}));
+  await tgAnswer(cb.id, resolved.length ? "Resolved — run is back under watch." : "Already resolved.");
+  await tgEdit(chatId, cb.message.message_id,
+    `${cb.message.text}\n\n✅ Resolved via Telegram (${resolved.length} escalation${resolved.length === 1 ? "" : "s"}) — watching resumes.`);
+}
+
+/** Atomically claim an arbitrary dedupe key (30-day TTL). False = already claimed. */
+async function claimKey(id) {
+  try {
+    await ddb.send(new PutItemCommand({
+      TableName: PENDING_TABLE,
+      Item: { id: { S: id }, ttl: { N: String(Math.floor(Date.now() / 1000) + 30 * 86400) } },
+      ConditionExpression: "attribute_not_exists(id)",
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+async function releaseKey(id) {
+  await ddb.send(new DeleteItemCommand({ TableName: PENDING_TABLE, Key: { id: { S: id } } }));
 }
 
 // Chat registry — every chat that ever messaged the bot gets gate pings.
