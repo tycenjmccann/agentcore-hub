@@ -102,16 +102,23 @@ phases:
         # Roll back on ANY failure from here on (deploy target OR smoke check).
         trap 'rc=$?; if [ $rc -ne 0 ]; then echo "── deploy failed (rc=$rc) → rolling back ──"; bash deploy/pipeline/rollback.sh || echo "rollback errored — inspect"; fi; exit $rc' EXIT
 
-        # ── Target 1: orchestrator Lambda — CODE ONLY (prebuilt zip) ──
+        # ── Target 1: orchestrator Lambdas — CODE ONLY (prebuilt zip) ──
+        # lambda/orchestrator/deploy.sh ships ONE zip to THREE functions
+        # (orchestrator + agent-invoker + events-writer share the source dir and
+        # the manifest). The pipeline must do the same: updating only the
+        # orchestrator left agent-invoker on 2026-08-27 code for a week while
+        # main carried the retry/liveness/lease fixes (drift audit 2026-09-04).
         # update-function-code echoes the FULL function config, incl. plaintext
         # env vars (JIRA_API_TOKEN, GITHUB_PAT) → CloudWatch. Suppress stdout so
         # those secrets never land in the build log (pilot run b6cdd247 leaked
         # them). --output text --query keeps only the state we assert on.
-        echo "Target 1/3 orchestrator Lambda code-only"
-        aws lambda update-function-code --function-name agentcore-hub-orchestrator \
-          --zip-file fileb://pipeline-out/orchestrator.zip --region "$AWS_REGION_HUB" \
-          --output text --query 'LastUpdateStatus' >/dev/null
-        aws lambda wait function-updated --function-name agentcore-hub-orchestrator --region "$AWS_REGION_HUB"
+        echo "Target 1/3 orchestrator Lambdas code-only (orchestrator, agent-invoker, events-writer)"
+        for FN in agentcore-hub-orchestrator agentcore-hub-agent-invoker agentcore-hub-events-writer; do
+          aws lambda update-function-code --function-name "$FN" \
+            --zip-file fileb://pipeline-out/orchestrator.zip --region "$AWS_REGION_HUB" \
+            --output text --query 'LastUpdateStatus' >/dev/null
+          aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION_HUB"
+        done
 
         # ── Target 2: config/blueprints → S3 (agents.json MERGED, never cp'd) ──
         echo "Target 2/3 config + blueprints to S3"

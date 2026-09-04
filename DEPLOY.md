@@ -287,6 +287,31 @@ deploy gate (bridged to Telegram Approve/Reject buttons) authorizes the
 (no pipeline) the merge gate remains the single act that authorizes the
 deploy above.
 
+### Not covered by the app pipeline (deploy by hand, or drift accrues)
+
+The pipeline's Deploy stage ships exactly three targets: the orchestrator
+Lambdas (one zip → `agentcore-hub-orchestrator`, `agentcore-hub-agent-invoker`,
+`agentcore-hub-events-writer`), S3 config/blueprints/prompts, and the ECS app.
+Everything else only reaches prod when someone runs its own script. A 2026-09-04
+drift audit found every surface below behind `main` by 1-7 days. When a PR
+touches one of these paths, the CD ticket (or a human) must run the matching
+command after merge:
+
+| Path in repo | Command |
+|---|---|
+| `lambda/agentcore-hub-pipeline-tools/`, `deploy/setup-pipeline-tools-lambda.mjs` | `node deploy/setup-pipeline-tools-lambda.mjs` (IAM + env + code) |
+| `lambda/cost-report/` | `./lambda/cost-report/deploy.sh` (`--backfill` when `REPORT_VERSION` changes — `--rebuild-index` alone drops every older-version card from the fleet index) |
+| `lambda/anomaly-watcher/` | `./lambda/anomaly-watcher/deploy.sh` |
+| `lambda/workflow-analyzer/`, `deploy/workflow-manager/{toolkit,skills}/` | `./deploy/workflow-manager/deploy.sh` |
+| `deploy/workflow-manager/system-prompt.md`, `setup-workflow-manager.mjs` | `node deploy/workflow-manager/setup-workflow-manager.mjs` |
+| `deploy/setup-builder-agent.mjs`, `deploy/routine-builder/` | re-run the setup script (updates the harness model in place) |
+| `deploy/telegram-bug-intake/index.mjs` | `zip -j t.zip deploy/telegram-bug-intake/index.mjs && aws lambda update-function-code --function-name telegram-bug-intake --zip-file fileb://t.zip` |
+| `deploy/runtime-agent/` (main.py, requirements) | `build-and-push.sh v<N>` + `deploy-one-robust.py agentcore_hub_agent` — diff the live env keys first (see Model bump §2) |
+| `deploy/coding-agent-runtime/` | `build-and-push.sh <tag>` then `update-agent-runtime` with the LIVE env/EFS/network copied from `get-agent-runtime` (drop `requireServiceS3Endpoint`); never `deploy.py` against a live runtime — it rebuilds env from defaults and drops `KIRO_API_KEY` |
+
+The Deploy stage already flags `deploy/runtime-agent/` changes with its exit-2
+HANDOFF; the other rows are silent, so check this table on every CD ticket.
+
 ## Model bump
 
 One-off runbook for rotating the pinned Claude model ids fleet-wide (e.g.
