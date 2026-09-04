@@ -311,13 +311,18 @@ export class PipelineStack extends Stack {
           ...commonEnvVars,
           EVENTS_TABLE: { value: eventsTableName },
         },
-        timeout: Duration.minutes(60), // full image rebuild + push + runtime READY wait
+        // Rebuild + push + up to two 900s READY waits, and on failure a rollback
+        // that waits on READY again per already-swapped runtime — 90m leaves room
+        // so a slow build can't truncate the rollback. (Even a truncated rollback
+        // self-heals: the baseline isn't advanced, so the next run re-rolls.)
+        timeout: Duration.minutes(90),
       }
     );
     grantRuntimeImagePerms(this, runtimeImageProject.role!, {
       account,
       region,
       eventsTableName,
+      artifactBucket,
     });
 
     // ── The deploy pipeline: Source → Build → Approval → Deploy ──────────────
@@ -674,7 +679,12 @@ function grantDeployPerms(
 function grantRuntimeImagePerms(
   scope: Construct,
   role: iam.IRole,
-  ctx: { account: string; region: string; eventsTableName: string }
+  ctx: {
+    account: string;
+    region: string;
+    eventsTableName: string;
+    artifactBucket: s3.IBucket;
+  }
 ) {
   role.attachInlinePolicy(
     new iam.Policy(scope, "RuntimeImagePerms", {
@@ -739,6 +749,15 @@ function grantRuntimeImagePerms(
           actions: ["dynamodb:PutItem"],
           resources: [
             `arn:aws:dynamodb:${ctx.region}:${ctx.account}:table/${ctx.eventsTableName}`,
+          ],
+        }),
+        // Advance THIS action's own deploy baseline after a successful (or no-op)
+        // roll — a single fixed key, never the app baseline or any other prefix.
+        new iam.PolicyStatement({
+          sid: "AdvanceRuntimeBaseline",
+          actions: ["s3:PutObject"],
+          resources: [
+            `${ctx.artifactBucket.bucketArn}/pipeline-artifacts/last-deployed-runtime-sha.txt`,
           ],
         }),
       ],

@@ -31,7 +31,14 @@ phases:
           echo "ERROR: account $ACCOUNT_ID != EXPECTED_ACCOUNT_ID $EXPECTED_ACCOUNT_ID" >&2; exit 1
         fi
       - |
-        python3 deploy/pipeline/plan-surfaces.py pipeline-out/changed-files.txt > /tmp/deploy-plan.tsv
+        # This action has its OWN baseline (last-deployed-runtime-sha.txt): the
+        # Build stage diffs from it into changed-files-runtime.txt so a failed
+        # image build here is retried next run instead of being lost when the
+        # parallel app action advances the shared last-deployed-sha.txt. Fall back
+        # to the app changeset only if the runtime list is absent (older artifact).
+        RT_CHANGED=pipeline-out/changed-files-runtime.txt
+        [ -f "$RT_CHANGED" ] || RT_CHANGED=pipeline-out/changed-files.txt
+        python3 deploy/pipeline/plan-surfaces.py "$RT_CHANGED" > /tmp/deploy-plan.tsv
         grep '^RUNTIME' /tmp/deploy-plan.tsv > /tmp/runtimes.tsv || true
         echo "── runtime images to roll ──"; cut -f1-4 /tmp/runtimes.tsv || true
 
@@ -39,13 +46,30 @@ phases:
     commands:
       - |
         set -euo pipefail
+        export AWS_REGION="$AWS_REGION_HUB"
+        GIT_SHA="$(cat pipeline-out/git-sha.txt 2>/dev/null || echo nogit)"
+        # Advance THIS action's baseline to the current SHA. Reached only on
+        # success (no-op OR all swaps done); a failed build never gets here, so
+        # the baseline stays put and the Build stage re-diffs the same range next
+        # run → the change is retried, not lost. Non-fatal: a missed advance only
+        # costs a redundant (idempotent) rebuild next run, never a dropped deploy.
+        advance_rt_baseline() {
+          if [ "$GIT_SHA" != "nogit" ] && [ -n "${ARTIFACT_BUCKET:-}" ]; then
+            if printf '%s' "$GIT_SHA" | aws s3 cp - \
+                "s3://${ARTIFACT_BUCKET}/pipeline-artifacts/last-deployed-runtime-sha.txt" \
+                --region "$AWS_REGION_HUB"; then
+              echo "runtime baseline advanced → $GIT_SHA"
+            else
+              echo "WARN: could not advance runtime baseline (non-fatal)"
+            fi
+          fi
+        }
         if [ ! -s /tmp/runtimes.tsv ]; then
           echo "No runtime-image surfaces changed — nothing to build."
+          advance_rt_baseline
           exit 0
         fi
-        export AWS_REGION="$AWS_REGION_HUB"
         ECR_REG="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com"
-        GIT_SHA="$(cat pipeline-out/git-sha.txt 2>/dev/null || echo nogit)"
         aws ecr get-login-password --region "$AWS_REGION_HUB" \
           | docker login --username AWS --password-stdin "$ECR_REG"
 
@@ -84,4 +108,5 @@ phases:
         done < /tmp/runtimes.tsv
 
         trap - EXIT
+        advance_rt_baseline
         echo "── runtime images deployed + performance markers emitted ──"
