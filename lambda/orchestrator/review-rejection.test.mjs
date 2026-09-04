@@ -662,7 +662,7 @@ describe("handleReviewRejection — human authority over advisory auto-approve (
     const comments = gateComments();
     expect(comments).toHaveLength(1);
     expect(comments[0].ExpressionAttributeValues[":n"][0].content).toContain(
-      "approve to confirm, or reply DECISION: continue"
+      "approve the gate to confirm"
     );
     // Observable park, not a silent stall — and NOT any of the resolution events.
     const parked = h.state.events.find((e) => e.type === "review.parked_advisory");
@@ -725,7 +725,7 @@ describe("handleReviewRejection — human authority over advisory auto-approve (
     expect(parked).toBeTruthy();
     expect(parked.detail.reason).toBe("prose_derived_findings");
     expect(gateComments().some((c) =>
-      String(c.ExpressionAttributeValues[":n"][0].content).includes("DECISION: continue")
+      String(c.ExpressionAttributeValues[":n"][0].content).includes("approve the gate to confirm")
     )).toBe(true);
     expect(h.state.events.find((e) => e.type === "review.approved_with_advisory")).toBeUndefined();
   });

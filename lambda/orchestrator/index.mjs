@@ -1430,14 +1430,14 @@ export async function handleReviewRejection(gateTicket) {
       try {
         await commentOnTicket(
           gateTicket.ticketId,
-          `All findings appear out-of-diff for this fix — approve to confirm, or reply DECISION: continue.`
+          `All findings appear out-of-diff for this fix — approve the gate to confirm, or leave it rejected to hold. To force rework, re-reject citing a file in the PR change set, or reopen the upstream ticket(s) directly.`
         );
       } catch (err) {
         console.warn(`[orchestrator] advisory park comment failed for ${gateTicket.ticketId}: ${err?.message || err}`);
       }
       // The gate stays exactly where the rejection put it (blocked) — the
-      // human's approval or an explicit "DECISION: continue" is the only way
-      // forward. Observable, so the parked state is never a silent stall.
+      // human's approval is the only way forward. Observable, so the parked
+      // state is never a silent stall.
       await publishEvent(gateTicket.ticketId, "review.parked_advisory", {
         ticketId: gateTicket.ticketId,
         workflowId: workflow.id,
