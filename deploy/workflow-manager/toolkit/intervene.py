@@ -320,9 +320,12 @@ def cmd_start(args):
 
 def cmd_bugs_toggle(args):
     """Flip the auto-bug-filing kill switch (enforced server-side in /api/bugs).
-    `bugs-off` = automated filings (any request with dedupeLabels) are suppressed;
-    human-relayed bugs are unaffected. Config lives in the events table so no new
-    IAM is needed. Use when the operator says "stop filing bugs"."""
+    `bugs-off` = ALL automated workflow-manager filings are suppressed: both the
+    crash path (any request with dedupeLabels) and the free-form path (a
+    dedupeLabels-less request carrying origin:"workflow-manager"). Human-relayed
+    bugs (Telegram/UI intake — neither field set) are unaffected. Config lives
+    in the events table so no new IAM is needed. Use when the operator says
+    "stop filing bugs"."""
     value = "off" if args.action == "bugs-off" else "on"
     dynamodb.Table(EVENTS_TABLE).put_item(Item={
         "workflowId": "wm-config",
@@ -336,7 +339,10 @@ def cmd_bugs_toggle(args):
 
 def cmd_file_bug(args):
     """File a top-level Bug that auto-fires the bug-fix pipeline (Jira webhook →
-    bootstrapBugWorkflow). Two modes, selected by the presence of --agent:
+    bootstrapBugWorkflow). Two modes, selected by whether --agent is passed at
+    all (not by whether its value is truthy — an explicitly empty/whitespace
+    --agent is refused outright rather than silently falling back to free-form,
+    so a caller who meant crash mode never files a bug that skips dedupe):
 
     CRASH MODE (--agent given) — the crash-rca skill's output path. The RCA
     becomes the bug description and the fix ships without a human relay.
@@ -360,7 +366,12 @@ def cmd_file_bug(args):
     for field, val in (("--title", args.title), ("--description", args.description)):
         if not (val or "").strip():
             raise SystemExit(f"REFUSED: file-bug requires {field}")
-    crash_mode = bool((args.agent or "").strip())
+    if args.agent is not None and not args.agent.strip():
+        raise SystemExit(
+            "REFUSED: --agent was given but empty — omit --agent entirely for a "
+            "free-form bug, or pass the crashed persona's id for crash mode"
+        )
+    crash_mode = args.agent is not None
     if crash_mode and not args.workflow_id:
         raise SystemExit("REFUSED: crash-mode file-bug (--agent) requires <workflowId>")
 
@@ -518,8 +529,10 @@ def main():
     p.add_argument("--title", default="")
     p.add_argument("--description", default="",
                    help="REQUIRED: the bug description (in crash mode, the full RCA: symptom, occurrences, last activity, suspected cause)")
-    p.add_argument("--agent", default="",
-                   help="optional; presence selects crash mode — the persona that crashed, used as the dedupe key")
+    p.add_argument("--agent", default=None,
+                   help="optional; presence (non-empty) selects crash mode — the persona that "
+                        "crashed, used as the dedupe key. An explicitly empty/whitespace value "
+                        "is refused rather than silently falling back to free-form mode")
     p.add_argument("--repo", default="")
     p.set_defaults(func=cmd_file_bug)
 
