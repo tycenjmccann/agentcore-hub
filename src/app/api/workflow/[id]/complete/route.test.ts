@@ -30,7 +30,15 @@ const h = vi.hoisted(() => {
     // the route's re-read sees what actually won.
     updateError: string | null;
     workflowAfterFail: Record<string, unknown> | null;
-  } = { workflow: {}, tickets: [], def: {}, updates: [], updateError: null, workflowAfterFail: null };
+    // TEAM-3976: completions/{ticketId}.json served by key; every GetObject key
+    // recorded; s3Error (when set) makes every read throw it (non-NoSuchKey path).
+    s3Objects: Record<string, string>;
+    s3Gets: string[];
+    s3Error: Error | null;
+  } = {
+    workflow: {}, tickets: [], def: {}, updates: [], updateError: null, workflowAfterFail: null,
+    s3Objects: {}, s3Gets: [], s3Error: null,
+  };
   return { state };
 });
 
@@ -83,6 +91,25 @@ vi.mock("@aws-sdk/client-eventbridge", () => ({
   },
 }));
 
+vi.mock("@aws-sdk/client-s3", () => ({
+  S3Client: class {
+    async send(cmd: { input: { Key: string } }) {
+      h.state.s3Gets.push(cmd.input.Key);
+      if (h.state.s3Error) throw h.state.s3Error;
+      const body = h.state.s3Objects[cmd.input.Key];
+      if (body === undefined) {
+        const e = new Error("The specified key does not exist.");
+        e.name = "NoSuchKey";
+        throw e;
+      }
+      return { Body: { transformToString: async () => body } };
+    }
+  },
+  GetObjectCommand: class {
+    constructor(public input: Record<string, unknown>) {}
+  },
+}));
+
 vi.mock("@/lib/workflow/dynamo-read", () => ({
   getTicketsForWorkflowFromDynamo: vi.fn(async () => h.state.tickets),
 }));
@@ -96,7 +123,7 @@ vi.mock("@/lib/workflow/defs-loader", () => ({
 
 let POST: typeof import("./route").POST;
 
-const SAVED = ["COMPLETION_EVIDENCE_REQUIRED", "TICKET_PROVIDER"] as const;
+const SAVED = ["COMPLETION_EVIDENCE_REQUIRED", "TICKET_PROVIDER", "ARTIFACT_BUCKET"] as const;
 const saved: Partial<Record<(typeof SAVED)[number], string | undefined>> = {};
 
 async function load() {
@@ -109,8 +136,14 @@ beforeEach(() => {
   h.state.updateError = null;
   h.state.workflowAfterFail = null;
   h.state.def = { completionRequiresAgentPhases: ["ship"] };
+  h.state.s3Objects = {};
+  h.state.s3Gets.length = 0;
+  h.state.s3Error = null;
   for (const k of SAVED) saved[k] = process.env[k];
   process.env.TICKET_PROVIDER = "dynamodb";
+  // TEAM-3976: the completions-record fallback is gated on ARTIFACT_BUCKET (read
+  // at module load, so it must be set before every load()).
+  process.env.ARTIFACT_BUCKET = "test-bucket";
   delete process.env.COMPLETION_EVIDENCE_REQUIRED;
 });
 
@@ -644,5 +677,119 @@ describe("POST complete — terminal-claim CAS parity (TEAM-3755 F2)", () => {
     const res = await post();
     expect(res.status).toBe(200);
     expect(refusedPhases(h.state.updates[0])).toEqual(ALL_TERMINAL_PHASES);
+  });
+});
+
+/**
+ * TEAM-3976 — the completions-record fallback on the evidence gate.
+ *
+ * The production failure: a dev ticket was mark_done'd (Workflow Manager) BEFORE
+ * the agent's report_completion fired. The orchestrator's one-shot harvest found
+ * no completions/T.json and left agentTasks[T] = {status:"complete"} with no
+ * output; the later report_completion wrote the record but its done→done
+ * transition was a no-op, so nothing re-harvested and this route 409'd forever.
+ * Now the gate consults completions/{ticketId}.json for the would-be offenders
+ * only, backfills the entry (field-scoped, existing-entry-only — the hand-port of
+ * workflow-store.mjs mergeTaskMetadata), and completes. A missing/blank record or
+ * a failed read keeps the 409 — never a 500, never a silent skip.
+ */
+describe("POST complete — completions-record fallback (TEAM-3976)", () => {
+  const doneDevTicket = {
+    ticketId: "T-1", type: "task", status: "done", phase: "development", assignee: "agentcore_hub_backend_dev",
+  };
+  const RECORD = JSON.stringify({
+    ticket_id: "T-1",
+    summary: "Fixed it",
+    pr_url: "https://github.com/x/y/pull/1",
+    commit_sha: "abc",
+    branch: "feature/x",
+    artifacts: "shared/dev-evidence/T-1.md",
+  });
+  const backfillUpdate = () =>
+    h.state.updates.find((u) => u.ConditionExpression === "attribute_exists(agentTasks.#tid)");
+
+  beforeEach(() => {
+    h.state.def = { completionRequiresAgentPhases: ["development"] };
+    h.state.workflow = {
+      workflowId: "wf_1",
+      phase: "development",
+      workflowDefId: "software-delivery",
+      // mark_done landed first: complete, but no output/artifactKey.
+      agentTasks: { "T-1": { ticketId: "T-1", status: "complete", completedAt: "2026-09-01T00:00:00Z" } },
+    };
+    h.state.tickets = [doneDevTicket];
+  });
+
+  it("record with summary+pr_url → 200, and agentTasks.T-1 is backfilled via a field-scoped UpdateCommand", async () => {
+    h.state.s3Objects["completions/T-1.json"] = RECORD;
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect(h.state.s3Gets).toEqual(["completions/T-1.json"]);
+    const backfill = backfillUpdate();
+    expect(backfill).toBeTruthy();
+    expect(backfill!.TableName).toBe("agentcore-hub-workflows");
+    expect(backfill!.Key).toEqual({ workflowId: "wf_1" });
+    const names = backfill!.ExpressionAttributeNames as Record<string, string>;
+    const values = backfill!.ExpressionAttributeValues as Record<string, unknown>;
+    expect(names["#tid"]).toBe("T-1");
+    const fieldNames = Object.entries(names).filter(([k]) => k !== "#tid").map(([, v]) => v).sort();
+    expect(fieldNames).toEqual(["branch", "commitSha", "output", "prUrl"]);
+    expect(Object.values(values)).toEqual(
+      expect.arrayContaining(["Fixed it", "https://github.com/x/y/pull/1", "abc", "feature/x"])
+    );
+    expect(fieldNames).not.toContain("mergeCommit");
+    expect(fieldNames).not.toContain("outcome");
+    expect(String(backfill!.UpdateExpression)).toMatch(/^SET agentTasks\.#tid\.#f0 = :v0/);
+    // The green completion write still happened after the backfill.
+    expect(h.state.updates.length).toBe(2);
+    expect(h.state.updates[1].ConditionExpression).toContain("#phase <>");
+  });
+
+  it("no record → 409 missing_evidence [{T-1, development}], nothing written", async () => {
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("missing_evidence");
+    expect(body.tickets).toEqual([{ ticketId: "T-1", phase: "development" }]);
+    expect(h.state.s3Gets).toEqual(["completions/T-1.json"]);
+    expect(h.state.updates.length).toBe(0);
+  });
+
+  it("blank record (whitespace summary) → 409 — an empty record is not evidence (AC-D4.1)", async () => {
+    h.state.s3Objects["completions/T-1.json"] = JSON.stringify({ ticket_id: "T-1", summary: "   " });
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("missing_evidence");
+    expect(h.state.updates.length).toBe(0);
+  });
+
+  it("S3 read throws a non-NoSuchKey error → still 409 (not 500, not a skipped check)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.s3Objects["completions/T-1.json"] = RECORD; // present, but unreadable
+    h.state.s3Error = Object.assign(new Error("AccessDenied"), { name: "AccessDenied" });
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("missing_evidence");
+    expect(h.state.updates.length).toBe(0);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("evidence check skipped"))).toBe(false);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("read failed"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("happy path (entry already has output) → ZERO completions/ reads", async () => {
+    h.state.workflow = {
+      ...h.state.workflow,
+      agentTasks: { "T-1": { ticketId: "T-1", status: "complete", output: "already harvested" } },
+    };
+    h.state.s3Objects["completions/T-1.json"] = RECORD;
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect(h.state.s3Gets).toEqual([]);
+    expect(h.state.updates.length).toBe(1); // only the green completion write
   });
 });

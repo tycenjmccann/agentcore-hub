@@ -43,7 +43,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 
@@ -677,6 +677,14 @@ export async function handleTicketDoneUnified(ticketId) {
   // Protects against double-transition (agent calls transition_ticket AND report_completion).
   if (workflow.agentTasks?.[ticketId]?.status === "complete") {
     console.log(`[orchestrator] ${ticketId} already marked complete — skipping duplicate cascade.`);
+    // TEAM-3976 — heal an evidence-less complete entry (mark_done landed before
+    // report_completion) even when the run is not yet complete; fill-only-if-
+    // missing, and completeWorkflow's own re-harvest then short-circuits.
+    const prior = workflow.agentTasks[ticketId];
+    const priorHasEvidence =
+      (typeof prior?.output === "string" && prior.output.trim().length > 0) ||
+      (typeof prior?.artifactKey === "string" && prior.artifactKey.length > 0);
+    if (!priorHasEvidence) await harvestCompletionEvidence(workflow, ticketId);
     // TEAM-3974 — the cascade is a one-shot, but a human RE-deciding a gate is
     // not: re-Done'ing an escalation gate (a corrected DECISION comment, a
     // second approval) has to reach the parked release manager, or the human's
@@ -2574,6 +2582,41 @@ export async function completeWorkflow(workflow) {
         missing = missingEvidenceTickets(
           children, freshWf?.agentTasks || workflow.agentTasks || {}, requiredPhases, evidenceOpts
         );
+      }
+      // TEAM-3976 — second pass, still needed after the TEAM-3985 re-harvest above:
+      // the harvest only makes the agentTasks-only gate pass when the record has a
+      // non-empty `summary` (it maps summary→output). A record whose deliverable
+      // proof is pr_url / commit_sha / artifacts with a blank summary still fails
+      // that check. This pass is the twin of the HTTP route's rule (summary OR
+      // pr_url OR commit_sha OR non-empty artifacts counts as evidence; a blank
+      // record does not), consulted for the remaining offenders ONLY — no S3 reads
+      // on the happy path. Read/backfill failures keep the offender, so the
+      // escalation below fires only for what survives BOTH passes.
+      if (missing.length > 0 && ARTIFACT_BUCKET) {
+        const before = missing;
+        missing = await resolveMissingEvidenceFromRecords(missing, freshWf?.agentTasks || workflow.agentTasks || {}, {
+          readCompletionRecord: async (tid) => {
+            try {
+              const res = await s3.send(new GetObjectCommand({
+                Bucket: ARTIFACT_BUCKET,
+                Key: `completions/${tid}.json`,
+              }));
+              return JSON.parse(await res.Body.transformToString());
+            } catch (err) {
+              const code = err?.name || err?.Code || "";
+              if (code === "NoSuchKey" || code === "NotFound" || err?.$metadata?.httpStatusCode === 404) return null;
+              throw err; // logged by the resolver; offender stays
+            }
+          },
+          backfill: (tid, fields) => store.mergeTaskMetadata(workflow.id, tid, fields),
+          log: console.warn,
+        });
+        const stillMissing = new Set(missing.map((m) => m.ticketId));
+        for (const m of before) {
+          if (!stillMissing.has(m.ticketId)) {
+            console.log(`[orchestrator] completion evidence resolved from completions record for ${m.ticketId}`);
+          }
+        }
       }
       if (missing.length > 0) {
         const offenders = missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ");

@@ -333,3 +333,77 @@ describe("ship-verdict harvest — merge_commit / outcome / block_reason (TEAM-3
     });
   });
 });
+
+/**
+ * TEAM-3976 — late re-harvest on an evidence-less "complete" entry.
+ *
+ * mark_done landed BEFORE report_completion: the done cascade ran, found no
+ * completions record, and left agentTasks[tid] = {status:"complete"} with no
+ * output. The dedup guard in handleTicketDoneUnified used to return before any
+ * harvest, so a later done signal for that ticket could never pick the record
+ * up. Now the guard re-harvests (fill-only-if-missing) when the complete entry
+ * is evidence-less — and STILL skips the cascade (no second markTaskComplete).
+ */
+describe("late re-harvest on an evidence-less complete entry (TEAM-3976)", () => {
+  const completionReads = () => h.state.s3Gets.filter((k) => k.startsWith("completions/"));
+
+  it("entry already complete but evidence-less + record present → harvests; no second markTaskComplete, cascade skipped", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    // The store mock's vi.fn instances persist across load() calls, so pin the
+    // call count around this invocation rather than asserting "never called".
+    const store = await import("./workflow-store.mjs");
+    const completeCallsBefore = store.completeTaskEntry.mock.calls.length;
+    h.state.workflow = makeWorkflow({ status: "complete", completedAt: "2020-01-01T00:05:00Z" });
+    h.state.s3Objects[COMPLETION_KEY] = RECORD;
+    await handleTicketDoneUnified(DONE);
+    expect(store.completeTaskEntry.mock.calls.length).toBe(completeCallsBefore); // no second markTaskComplete
+    expect(log.mock.calls.some((c) => String(c[0]).includes("already marked complete — skipping duplicate cascade"))).toBe(true);
+    expect(completionReads()).toEqual([COMPLETION_KEY]);
+    expect(h.state.merges).toEqual([{
+      wfId: "wf_1",
+      tid: DONE,
+      fields: {
+        output: "Implemented the feature and pushed the branch.",
+        branch: "feature/x",
+        commitSha: "abc123",
+        prUrl: "https://github.com/o/r/pull/7",
+      },
+    }]);
+    expect(h.state.workflow.agentTasks[DONE].output).toBe("Implemented the feature and pushed the branch.");
+    expect(h.state.workflow.agentTasks[DONE].status).toBe("complete");
+    log.mockRestore();
+  });
+
+  it("entry already complete but evidence-less + NO record → no merge, no throw, cascade still skipped", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = await import("./workflow-store.mjs");
+    const completeCallsBefore = store.completeTaskEntry.mock.calls.length;
+    h.state.workflow = makeWorkflow({ status: "complete" });
+    await handleTicketDoneUnified(DONE);
+    expect(store.completeTaskEntry.mock.calls.length).toBe(completeCallsBefore);
+    expect(h.state.merges).toHaveLength(0);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("evidence harvest skipped"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("entry already complete WITH output and a merge commit → no S3 read, no merge (existing fields never overwritten)", async () => {
+    h.state.workflow = makeWorkflow({ status: "complete", output: "already there", mergeCommit: "9f1c2ab" });
+    h.state.s3Objects[COMPLETION_KEY] = RECORD;
+    await handleTicketDoneUnified(DONE);
+    expect(completionReads()).toEqual([]);
+    expect(h.state.merges).toHaveLength(0);
+    expect(h.state.workflow.agentTasks[DONE].output).toBe("already there");
+    expect(h.state.workflow.agentTasks[DONE].mergeCommit).toBe("9f1c2ab");
+  });
+
+  it("entry already complete WITH output (evidence present) → the guard does not re-harvest", async () => {
+    // The guard's predicate is the harvest's own hasEvidence: output alone is
+    // enough to skip. (Ship-signal top-up on a complete entry is the D2 harvest's
+    // job on the ORIGINAL done cascade, not this late path.)
+    h.state.workflow = makeWorkflow({ status: "complete", output: "already there" });
+    h.state.s3Objects[COMPLETION_KEY] = RECORD;
+    await handleTicketDoneUnified(DONE);
+    expect(completionReads()).toEqual([]);
+    expect(h.state.merges).toHaveLength(0);
+  });
+});

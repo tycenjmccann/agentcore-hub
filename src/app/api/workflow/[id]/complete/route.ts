@@ -31,14 +31,19 @@ import {
   PutCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
+import { resolveMissingEvidenceFromRecords } from "@/lib/workflow/completion-evidence";
 import agentsConfig from "@/config/agents.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
+// TEAM-3976: the completions-record fallback reads completions/{ticketId}.json
+// (same client/bucket pattern as src/app/api/workflow/[id]/agent-output/route.ts).
+const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
@@ -105,6 +110,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
   marshallOptions: { removeUndefinedValues: true },
 });
 const eventBridge = new EventBridgeClient({ region: REGION });
+const s3 = new S3Client({ region: REGION });
 
 export const dynamic = "force-dynamic";
 
@@ -528,11 +534,67 @@ export async function POST(
     try {
       const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
       const requiredPhases = def?.completionRequiresAgentPhases || [];
-      const missing = missingEvidenceTickets(
-        tickets,
-        (workflow.agentTasks as Record<string, AgentTaskLike>) || {},
-        requiredPhases
-      );
+      const agentTasks = (workflow.agentTasks as Record<string, AgentTaskLike>) || {};
+      let missing = missingEvidenceTickets(tickets, agentTasks, requiredPhases);
+      // TEAM-3976: a ticket closed out-of-band (mark_done) BEFORE its
+      // report_completion landed has an evidence-less agentTasks entry — the
+      // orchestrator's one-shot harvest found no record, and the later done→done
+      // transition was a no-op so it never re-ran. Consult the authoritative
+      // completions/{ticketId}.json for the would-be offenders ONLY (no S3 reads
+      // on the happy path) and backfill the entry so the run self-heals. The
+      // resolver swallows read/backfill failures itself — a failed read keeps the
+      // offender (409), it must never fall through to the outer "skipped" catch.
+      if (missing.length > 0 && ARTIFACT_BUCKET) {
+        missing = await resolveMissingEvidenceFromRecords(missing, agentTasks, {
+          readCompletionRecord: async (ticketId) => {
+            try {
+              const obj = await s3.send(
+                new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: `completions/${ticketId}.json` })
+              );
+              const body = await obj.Body?.transformToString();
+              return body ? (JSON.parse(body) as Record<string, unknown>) : null;
+            } catch (err) {
+              const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
+              if (e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404) {
+                return null;
+              }
+              throw err; // logged by the resolver; offender stays
+            }
+          },
+          // Hand-port of lambda/orchestrator/workflow-store.mjs mergeTaskMetadata:
+          // field-scoped SET on the existing entry only (attribute_exists guard),
+          // a missing entry is dropped rather than materialized.
+          backfill: async (ticketId, fields) => {
+            const names: Record<string, string> = { "#tid": ticketId };
+            const values: Record<string, unknown> = {};
+            const sets: string[] = [];
+            let i = 0;
+            for (const [k, v] of Object.entries(fields)) {
+              if (v === undefined || v === null) continue;
+              names[`#f${i}`] = k;
+              values[`:v${i}`] = v;
+              sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
+              i++;
+            }
+            if (!sets.length) return;
+            try {
+              await ddb.send(
+                new UpdateCommand({
+                  TableName: WORKFLOWS_TABLE,
+                  Key: { workflowId },
+                  UpdateExpression: `SET ${sets.join(", ")}`,
+                  ConditionExpression: "attribute_exists(agentTasks.#tid)",
+                  ExpressionAttributeNames: names,
+                  ExpressionAttributeValues: values,
+                })
+              );
+            } catch (err) {
+              if ((err as Error).name !== "ConditionalCheckFailedException") throw err;
+            }
+          },
+          log: console.warn,
+        });
+      }
       if (missing.length > 0) {
         if (COMPLETION_EVIDENCE_REQUIRED) {
           return NextResponse.json({ error: "missing_evidence", tickets: missing }, { status: 409 });
