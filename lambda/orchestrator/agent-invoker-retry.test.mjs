@@ -42,7 +42,11 @@ vi.mock("@aws-sdk/lib-dynamodb", () => ({
     from: () => ({
       send: async (cmd) => {
         const n = cmd?.constructor?.name;
-        if (n === "UpdateCommand") { h.state.updates.push(cmd.input); return {}; }
+        if (n === "UpdateCommand") {
+          h.state.updates.push(cmd.input);
+          if (h.state.updateImpl) return h.state.updateImpl(cmd.input);
+          return {};
+        }
         if (n === "PutCommand") { h.state.puts.push(cmd.input); return {}; }
         if (n === "GetCommand") return { Item: null };
         if (n === "QueryCommand") { h.state.queries.push(cmd.input); return h.state.queryImpl(cmd.input); }
@@ -127,6 +131,8 @@ beforeEach(() => {
   h.state.invokeImpl = async () => ({});
   h.state.queries = [];
   h.state.queryImpl = async () => ({ Items: [] });
+  h.state.updateImpl = null;
+  delete process.env.TICKET_PROVIDER;
   h.state.httpCalls = 0;
   h.state.httpImpl = null;
   // Bounded to 3 attempts, zero backoff so retries are instant.
@@ -476,5 +482,42 @@ describe("TEAM-3756 F4 — runtime retry re-checks liveness before re-sending", 
       expect(h.state.queries).toHaveLength(1); // horizon crossed on page one
       expect(errorEntries()).toHaveLength(0);
     });
+  });
+});
+
+/**
+ * The failure path's ONE non-negotiable duty is to publish agent.error. In Jira
+ * mode the DDB tickets table does not exist, and the ResourceNotFoundException
+ * from the board write used to abort the handler before the publish — a failed
+ * invoke left a running claim, no error event, an unparked ticket (prod 23:12Z,
+ * TEAM-3989).
+ */
+describe("failure path — agent.error is published no matter what the board write does", () => {
+  it("Jira mode: no board write at all, agent.error published once", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    h.state.invokeImpl = async () => { throw makeErr({ message: "Runtime returned 400: bad request", statusCode: 400 }); };
+
+    const handler = await loadHandler();
+    await handler({ ...HARNESS_EVENT });
+
+    expect(blockedUpdates()).toHaveLength(0);
+    expect(errorEntries()).toHaveLength(1);
+    expect(errorEntries()[0].Detail).toContain("TEAM-42");
+  });
+
+  it("DDB mode: the board write throwing (table missing) is logged, agent.error still published", async () => {
+    h.state.invokeImpl = async () => { throw makeErr({ message: "Runtime returned 400: bad request", statusCode: 400 }); };
+    h.state.updateImpl = async () => {
+      const e = new Error("Requested resource not found"); e.name = "ResourceNotFoundException"; throw e;
+    };
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const handler = await loadHandler();
+    await handler({ ...HARNESS_EVENT });
+
+    expect(blockedUpdates()).toHaveLength(1); // attempted…
+    expect(errorEntries()).toHaveLength(1);    // …and the publish still happened
+    expect(error.mock.calls.some((c) => String(c[0]).includes("could not park"))).toBe(true);
+    error.mockRestore();
   });
 });
