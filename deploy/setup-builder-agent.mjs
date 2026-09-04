@@ -46,6 +46,7 @@ import {
   PutRolePolicyCommand,
 } from "@aws-sdk/client-iam";
 import { buildHarnessModelConfig } from "../src/lib/models/harness-models.mjs";
+import { snapshotHarness } from "./pipeline/harness-snapshot.mjs";
 
 const args = process.argv.slice(2);
 function getArg(name) {
@@ -74,6 +75,11 @@ const MEMORY_NAME = "agentcore_hub_builder_memory";
 const MCP_URLS = getAllArgs("mcp-url");
 const MODEL_ID = getArg("model-id") || "us.anthropic.claude-sonnet-5";
 const ROLE_NAME = "agentcore-hub-harness-role";
+// PIPELINE_MODE=1: the CI/CD Deploy stage runs this under its narrow role — no
+// IAM writes, no memory provisioning, no verify invoke. Only the code-like
+// surfaces of the EXISTING builder (model, system prompt) are updated, after
+// snapshotting the live values for deploy/pipeline/rollback.sh.
+const PIPELINE_MODE = process.env.PIPELINE_MODE === "1";
 
 // --- Resolve account ID ---
 const sts = new STSClient({ region: REGION });
@@ -81,7 +87,10 @@ const identity = await sts.send(new GetCallerIdentityCommand({}));
 const accountId = identity.Account;
 
 // --- Create or verify IAM role ---
-if (!HARNESS_ROLE_ARN) {
+if (PIPELINE_MODE && !HARNESS_ROLE_ARN) {
+  HARNESS_ROLE_ARN = `arn:aws:iam::${accountId}:role/${ROLE_NAME}`;
+  console.log("\n1/4 IAM harness execution role — skipped (PIPELINE_MODE: IAM is owned by the hand-run setup)");
+} else if (!HARNESS_ROLE_ARN) {
   console.log("\n1/4 Setting up IAM harness execution role...\n");
 
   const iam = new IAMClient({ region: REGION });
@@ -313,14 +322,18 @@ const existingReady = (list.harnesses || []).find(
 
 if (existingReady) {
   const existingId = existingReady.harnessId;
-  console.log(`  Already exists: ${existingId} (READY) — updating model in place`);
+  console.log(`  Already exists: ${existingId} (READY) — updating model + system prompt in place`);
+  await snapshotHarness(agentcore, GetHarnessCommand, existingId, "agentcore_hub_builder");
   // Model bump: re-pin the live builder to MODEL_ID. Without this, a model-bump
   // deploy over an existing harness was a silent no-op (verify + exit, model
   // never touched). model is passed plainly — no optionalValue wrapper (that's
-  // only for the memory attachment on Update).
+  // only for the memory attachment on Update). The system prompt rides along so
+  // a prompt edit in this file reaches the live builder too (it used to need a
+  // delete + recreate).
   await agentcore.send(new UpdateHarnessCommand({
     harnessId: existingId,
     model: buildHarnessModelConfig(MODEL_ID),
+    systemPrompt: [{ text: buildSystemPrompt() }],
   }));
   for (let i = 0; i < 24; i++) {
     await sleep(5000);
@@ -336,10 +349,19 @@ if (existingReady) {
       process.exit(1);
     }
   }
-  console.log(`  ✓ Model updated to ${MODEL_ID} — READY`);
+  console.log(`  ✓ Model + system prompt updated (model=${MODEL_ID}) — READY`);
+  if (PIPELINE_MODE) {
+    console.log("  Verify invoke skipped (PIPELINE_MODE: READY is the gate; the deploy role cannot InvokeHarness)");
+    process.exit(0);
+  }
   await verifyHarness(existingId);
   printDone(existingId);
   process.exit(0);
+}
+
+if (PIPELINE_MODE) {
+  console.error("agentcore_hub_builder is not READY/present — the pipeline only UPDATES harnesses. Create it once by hand: node deploy/setup-builder-agent.mjs");
+  process.exit(1);
 }
 
 // Check if one exists but is still being created or deleted
@@ -464,7 +486,10 @@ for (let i = 0; i < MCP_URLS.length; i++) {
 }
 
 // --- System prompt ---
-const SYSTEM_PROMPT = `You are the Builder Agent — you create and configure AI agents on Amazon Bedrock AgentCore.
+// A hoisted function (not a const) so the update-in-place path above can build
+// it before this point in the file executes.
+function buildSystemPrompt() {
+  return `You are the Builder Agent — you create and configure AI agents on Amazon Bedrock AgentCore.
 
 ## Your Tools
 
@@ -525,6 +550,7 @@ print(f"Created: {response['harness']['harnessId']}")
 - When creating agents, use this same role ARN for \`executionRoleArn\`.
 - MCP servers are the universal adapter — any tool (AWS, GCP, on-prem, SaaS) can be exposed via MCP.
 - Always verify an agent was created successfully (status=READY) before reporting back.`;
+}
 
 // --- Create harness ---
 console.log("  Creating builder agent harness...");
@@ -533,7 +559,7 @@ const harnessConfig = {
   harnessName: "agentcore_hub_builder",
   executionRoleArn: HARNESS_ROLE_ARN,
   model: buildHarnessModelConfig(MODEL_ID),
-  systemPrompt: [{ text: SYSTEM_PROMPT }],
+  systemPrompt: [{ text: buildSystemPrompt() }],
   tools,
   allowedTools: ["*"],
   truncation: { strategy: "sliding_window", config: { slidingWindow: { messagesCount: 150 } } },

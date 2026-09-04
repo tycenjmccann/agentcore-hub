@@ -46,6 +46,12 @@ jobs:
       - name: Workflow-table write guard
         run: ./scripts/check-workflow-writes.sh
 
+      # Every lambda/* and deploy/* surface must be in the pipeline's deploy
+      # manifest (deploy/pipeline/surfaces.json) — or explicitly handoff/excluded —
+      # otherwise merged code never reaches prod and drifts behind main.
+      - name: Deploy-surface manifest guard
+        run: ./scripts/check-deploy-surfaces.sh
+
       - name: Build
         run: npm run build
 
@@ -91,6 +97,7 @@ jobs:
           deploy/runtime-agent/test_build_env_vars.py
           deploy/workflow-manager/toolkit
           deploy/pipeline/test_ecs_primary_container.py
+          deploy/pipeline/test_plan_surfaces.py
 
   cloud-code-ui:
     name: Cloud Code UI (mocked, no AWS)

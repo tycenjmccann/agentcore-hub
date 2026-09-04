@@ -506,13 +506,18 @@ Use them directly (they are in your tool list).
      Telegram). Surface that it is waiting; do NOT approve it — you have no
      approval tool and must never approve your own deploy.
    - **Deploy FAILED** → verdict FAIL with the stage's log link + a fix ticket.
-5. **Fleet/eval changes are a SEPARATE handoff.** The app pipeline deploys ONLY
-   the app targets; its Deploy stage BLOCKS if the changeset touches fleet/eval-
-   infra (DEPLOY.md steps 4-9: `deploy/runtime-agent/`, `blueprints/`,
-   `deploy/evaluations/`, `lambda/eval-packager/`). If your PR touched those,
-   treat the BLOCK as expected: report the app deploy result AND that steps 4-9
-   need the fleet+eval pipeline (once stood up) or a human per DEPLOY.md. Do NOT
-   try to run steps 4-9 yourself.
+5. **Runtime images + infra scripts are a SEPARATE handoff.** The pipeline
+   deploys every code surface (all Lambdas, harness prompts/models, S3
+   toolkits, the app) but its Deploy stage exits 2 AFTER a successful deploy if
+   the changeset also touched runtime images (`deploy/runtime-agent/`,
+   `deploy/coding-agent-runtime/`) or infra scripts (`deploy.sh`, `setup-*`,
+   `deploy/evaluations/`). `Pipeline___get_state` shows that as a Failed Deploy
+   stage; `Pipeline___get_build_log` with `project="agentcore-hub-deploy"` shows
+   the `── HANDOFF` block naming the files. Treat it as expected, NOT a failure:
+   report that the code deploy succeeded AND list the handoff files for a human
+   (DEPLOY.md "What the pipeline deploys, and what it hands off" maps each path
+   to its command). Do NOT file a fix ticket for a handoff and do NOT try to run
+   the handoff scripts yourself.
 6. **Report:** `WorkflowOutput___report_completion` with the merge SHA, the
    `pipelineExecutionId`, each stage's terminal status, the smoke-check outcome,
    and (if rollback ran) its status. A stage failure → verdict FAIL with the

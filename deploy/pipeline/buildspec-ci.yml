@@ -47,6 +47,9 @@ phases:
       - "npx tsc --noEmit"
       - "npm run test:unit"
       - "./scripts/check-workflow-writes.sh"
+      # Every lambda/* and deploy/* surface must be in the Deploy stage's manifest
+      # (or explicitly handoff/excluded) — otherwise it silently drifts behind main.
+      - "./scripts/check-deploy-surfaces.sh"
 
   build:
     commands:
@@ -76,7 +79,8 @@ phases:
           deploy/runtime-agent/test_telemetry_init.py \
           deploy/runtime-agent/test_build_env_vars.py \
           deploy/workflow-manager/toolkit \
-          deploy/pipeline/test_ecs_primary_container.py
+          deploy/pipeline/test_ecs_primary_container.py \
+          deploy/pipeline/test_plan_surfaces.py
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
       - "bash scripts/check-lambda-zip-manifest.sh"
@@ -165,8 +169,8 @@ phases:
 
 # For the deploy pipeline Build stage, these are the promote-by-digest artifacts.
 # (The PR-check invocation ignores artifacts — it only cares about pass/fail.)
-# lambda/** IS included: the Deploy stage's eval targets cd into lambda/eval-packager
-# (Codex #263 round-3 P1).
+# lambda/** IS included: the Deploy stage zips every manifest Lambda from its
+# source dir (surfaces.json), so the whole tree must ride along.
 artifacts:
   base-directory: .
   files:
@@ -179,3 +183,7 @@ artifacts:
     - "scripts/**/*"
     - "src/config/**/*"
     - "lambda/**/*"
+    # Harness updates (Deploy Target 2b) run the setup scripts, which import the
+    # model catalog and read root package.json for the SDK client versions.
+    - "src/lib/models/**/*"
+    - "package.json"

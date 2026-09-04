@@ -112,6 +112,15 @@ behave exactly as today. This is the whole opt-out.
 
 ### Pipelines are split by independently-deployable component
 
+> **Status (2026-09-04):** the app pipeline's Deploy stage now covers every
+> *code* surface, not just the three app targets — see
+> `deploy/pipeline/surfaces.json` (manifest), `plan-surfaces.py` (planner) and
+> `scripts/check-deploy-surfaces.sh` (CI gate: every `lambda/*` and `deploy/*`
+> file must be a surface, a handoff, or explicitly excluded). What remains a
+> handoff is exactly what the narrow role cannot do: runtime images and infra
+> scripts (IAM/env/tables). The "fleet + eval pipeline" below therefore shrinks
+> to an image-build-and-`UpdateAgentRuntime` increment.
+
 The hub is not one deployable — it is an **app** (Next.js + orchestrator Lambda +
 `config/*`) and a **fleet + eval-infra** (14 runtime agents + evaluator config +
 alarms + eval-packager, i.e. DEPLOY.md steps 4-9). These have different blast

@@ -27,6 +27,27 @@ else
   echo "no prior orchestrator zip — orchestrator Lambdas not rolled back (were they deployed this run?)"
 fi
 
+# 1b. Manifest surface Lambdas → the live code captured before each update
+#     (buildspec Target 1b writes /tmp/rollback/lambda/<function>.zip).
+shopt -s nullglob
+for Z in /tmp/rollback/lambda/*.zip; do
+  FN="$(basename "$Z" .zip)"
+  echo "restoring $FN to prior zip"
+  aws lambda update-function-code --function-name "$FN" \
+    --zip-file "fileb://$Z" --region "$AWS_REGION_HUB" \
+    --output text --query 'LastUpdateStatus' >/dev/null \
+    && aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION_HUB" \
+    && echo "$FN rolled back" || echo "$FN rollback FAILED — inspect"
+done
+
+# 1c. Harnesses → the prompt/model/skills snapshot taken before UpdateHarness
+#     (deploy/pipeline/harness-snapshot.mjs, PIPELINE_MODE). node_modules for
+#     the SDK client was symlinked by Target 2b before any snapshot could exist.
+for S in /tmp/rollback/harness/*.json; do
+  node deploy/pipeline/restore-harness.mjs "$S" || echo "harness restore from $S FAILED — inspect"
+done
+shopt -u nullglob
+
 # 2. ECS Express → prior image digest
 PREV_IMG="$(cat /tmp/rollback/ecs-prev-image.txt 2>/dev/null || true)"
 if [ -n "${ECS_SERVICE_ARN:-}" ] && [ -n "$PREV_IMG" ]; then

@@ -1,8 +1,17 @@
 # buildspec-deploy.yml — the Deploy stage. The machine form of DEPLOY.md's
-# three targets (+ conditional eval targets), run under the pipeline's NARROW
-# IAM role (no laptop, no tycenj-prod profile, Jira creds never touched — the
-# role literally cannot UpdateFunctionConfiguration). Consumes the Build stage's
-# artifacts by digest; it never rebuilds. See docs/cicd-pipeline-module-design.md.
+# three app targets PLUS every code-only surface in deploy/pipeline/surfaces.json
+# (the other Lambdas, harness prompt/model/skills, S3 toolkits), run under the
+# pipeline's NARROW IAM role (no laptop, no tycenj-prod profile, Jira creds never
+# touched — the role literally cannot UpdateFunctionConfiguration). Consumes the
+# Build stage's artifacts by digest; it never rebuilds. See
+# docs/cicd-pipeline-module-design.md.
+#
+# Which surfaces deploy is decided by deploy/pipeline/plan-surfaces.py from the
+# Build stage's changed-files.txt — code pushes only. Infra scripts (IAM, env,
+# tables, runtime images) are HANDOFF: the app + surfaces ship, the baseline
+# advances, then the action exits 2 so the release manager reports the human
+# step. Before the manifest existed the pipeline shipped 3 of ~14 surfaces and
+# everything else drifted behind main for days (audit 2026-09-04).
 #
 # The entire deploy runs inside ONE build-phase block with a bash `trap` so that
 # ANY failure — orchestrator update, S3 merge, ECS roll, eval targets, OR a
@@ -32,25 +41,21 @@ phases:
         if [ -n "${EXPECTED_ACCOUNT_ID:-}" ] && [ "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT_ID" ]; then
           echo "ERROR: account $ACCOUNT_ID != EXPECTED_ACCOUNT_ID $EXPECTED_ACCOUNT_ID" >&2; exit 1
         fi
-      # ── Scope guard (DETECT only, don't exit): this is the APP pipeline (Lambda
-      # + S3 config + ECS). Fleet + eval-infra (DEPLOY.md steps 4-9) belong to a
-      # separate pipeline. We do NOT exit here — that would wedge the pipeline,
-      # because the baseline SHA only advances after a successful app deploy, so
-      # the same range would re-block forever (Codex PR #263 round-5). Instead we
-      # DEPLOY THE APP (never skip it), advance the baseline, and THEN signal the
-      # eval handoff as a terminal non-rollback failure at the end of the build.
+      # ── Deploy plan (DETECT only, don't exit): plan-surfaces.py maps the
+      # changed files onto the surface manifest — which Lambdas / S3 toolkits /
+      # harnesses to update, and which files are infra-only HANDOFF (runtime
+      # images, IAM/env scripts). We do NOT exit on a handoff here — that would
+      # wedge the pipeline, because the baseline SHA only advances after a
+      # successful app deploy, so the same range would re-block forever (Codex PR
+      # #263 round-5). Instead we DEPLOY EVERYTHING WE CAN, advance the baseline,
+      # and THEN signal the handoff as a terminal non-rollback failure.
       - |
-        CHANGED="$(cat pipeline-out/changed-files.txt 2>/dev/null || true)"
-        EVAL_HANDOFF=0
-        EVAL_FILES=""
-        if printf '%s' "$CHANGED" | grep -qE '^(lambda/eval-packager/|deploy/evaluations/|deploy/continuous-improvement/|deploy/runtime-agent/)'; then
-          EVAL_HANDOFF=1
-          EVAL_FILES="$(printf '%s\n' "$CHANGED" | grep -E '^(lambda/eval-packager/|deploy/evaluations/|deploy/continuous-improvement/|deploy/runtime-agent/)')"
-        fi
-        # Hand the flag to the build phase (env doesn't persist across CodeBuild
-        # phase boundaries; write it to a file the build block reads).
-        printf '%s' "$EVAL_HANDOFF" > /tmp/eval-handoff
-        printf '%s' "$EVAL_FILES" > /tmp/eval-files
+        python3 deploy/pipeline/plan-surfaces.py pipeline-out/changed-files.txt > /tmp/deploy-plan.tsv
+        echo "── deploy plan ──"; cut -f1-3 /tmp/deploy-plan.tsv || true
+        # Hand the handoff signal to the build phase (env doesn't persist across
+        # CodeBuild phase boundaries; write it to a file the build block reads).
+        if grep -q '^HANDOFF' /tmp/deploy-plan.tsv; then printf 1 > /tmp/eval-handoff; else printf 0 > /tmp/eval-handoff; fi
+        grep '^HANDOFF' /tmp/deploy-plan.tsv | cut -f2 > /tmp/eval-files || true
 
   build:
     commands:
@@ -120,6 +125,43 @@ phases:
           aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION_HUB"
         done
 
+        # ── Target 1b: every other Lambda in the surface manifest — CODE ONLY ──
+        # plan-surfaces.py emitted one LAMBDA row per function whose source dir
+        # changed. Each row: function, dir, npm(0|1), optional(0|1), zip file
+        # list (mirrors that Lambda's own deploy.sh zip line), note. Live code is
+        # snapshotted first so rollback.sh can restore it. Env/IAM are never
+        # touched (that stays with each surface's deploy.sh — a HANDOFF row).
+        # Loops read the plan on fd 3: npm/aws inside the loop must not eat the
+        # plan from stdin.
+        echo "Target 1b surface Lambdas (manifest-driven, code-only)"
+        mkdir -p /tmp/rollback/lambda
+        while IFS=$'\t' read -r KIND FN DIR NPM OPTIONAL FILES NOTE <&3; do
+          [ "$KIND" = "LAMBDA" ] || continue
+          if ! aws lambda get-function-configuration --function-name "$FN" --region "$AWS_REGION_HUB" >/dev/null 2>&1; then
+            if [ "$OPTIONAL" = "1" ]; then echo "  $FN not present in this account — skipped (optional surface)"; continue; fi
+            echo "FATAL: $FN does not exist — create it once with its own deploy script, then the pipeline keeps its code current" >&2
+            exit 1
+          fi
+          LIVE_URL="$(aws lambda get-function --function-name "$FN" --region "$AWS_REGION_HUB" --query 'Code.Location' --output text 2>/dev/null || true)"
+          if [ -n "$LIVE_URL" ] && [ "$LIVE_URL" != "None" ] && curl -sf "$LIVE_URL" -o "/tmp/rollback/lambda/$FN.zip"; then
+            echo "  $FN: rollback snapshot captured"
+          else
+            rm -f "/tmp/rollback/lambda/$FN.zip"; echo "  WARN: $FN: no rollback snapshot (live code not downloadable)"
+          fi
+          rm -f /tmp/surface.zip
+          ( cd "$DIR" \
+            && if [ "$NPM" = "1" ]; then rm -rf node_modules; npm ci --omit=dev --no-audit --no-fund --silent || npm install --omit=dev --no-audit --no-fund --silent; fi \
+            && zip -rq /tmp/surface.zip $FILES )
+          # --output text --query: update-function-code echoes the full config incl.
+          # plaintext env vars (tokens) — keep them out of the build log.
+          aws lambda update-function-code --function-name "$FN" \
+            --zip-file fileb:///tmp/surface.zip --region "$AWS_REGION_HUB" \
+            --output text --query 'LastUpdateStatus' >/dev/null
+          aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION_HUB"
+          echo "  $FN updated ($(du -k /tmp/surface.zip | cut -f1) KB)"
+          [ -n "$NOTE" ] && echo "  NOTE for $FN: $NOTE" || true
+        done 3< /tmp/deploy-plan.tsv
+
         # ── Target 2: config/blueprints → S3 (agents.json MERGED, never cp'd) ──
         echo "Target 2/3 config + blueprints to S3"
         aws s3 sync blueprints/ "s3://$ARTIFACT_BUCKET/blueprints/"
@@ -128,6 +170,39 @@ phases:
         aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" /tmp/agents-s3.json
         python3 deploy/pipeline/merge-agents-json.py /tmp/agents-s3.json src/config/agents.json /tmp/agents-merged.json
         aws s3 cp /tmp/agents-merged.json "s3://$ARTIFACT_BUCKET/config/agents.json"
+        # Manifest S3 surfaces (WM toolkit/skills, routine-builder toolkit,
+        # pricing.json). Extra args are the same --delete/--exclude each surface's
+        # deploy.sh uses; set -f keeps the exclude glob literal.
+        while IFS=$'\t' read -r KIND SRC DST EXTRA <&3; do
+          case "$KIND" in
+            S3SYNC) set -f; aws s3 sync "$SRC" "s3://$ARTIFACT_BUCKET/$DST" $EXTRA --only-show-errors; set +f; echo "  synced $SRC → $DST" ;;
+            S3CP)   aws s3 cp "$SRC" "s3://$ARTIFACT_BUCKET/$DST" --only-show-errors; echo "  copied $SRC → $DST" ;;
+          esac
+        done 3< /tmp/deploy-plan.tsv
+
+        # ── Target 2b: harness prompt / model / skills (WM, builder, routine builder) ──
+        # Runs each harness's OWN setup script in PIPELINE_MODE (no IAM, no memory
+        # provisioning, no verify invoke — UpdateHarness on the existing harness
+        # only, after snapshotting the live prompt/model for rollback.sh). S3
+        # skills above land first because the WM harness references them by URI.
+        if grep -q '^HARNESS' /tmp/deploy-plan.tsv; then
+          echo "Target 2b harness updates"
+          # The setup scripts import the repo's AWS SDK clients. Install just
+          # those three, at the versions root package.json pins, into a scratch
+          # dir and symlink it as ./node_modules — ESM resolution from
+          # deploy/**/*.mjs walks up to the repo root, and a full `npm ci` of the
+          # Next app here would add minutes for nothing.
+          PKGS="$(node -e 'const d=require("./package.json").dependencies;for(const n of ["@aws-sdk/client-bedrock-agentcore-control","@aws-sdk/client-sts","@aws-sdk/client-iam"]){if(!d[n])throw new Error(n+" missing from package.json");console.log(n+"@"+d[n])}' | tr '\n' ' ')"
+          mkdir -p /tmp/hdeps && ( cd /tmp/hdeps && [ -f package.json ] || npm init -y >/dev/null; npm install --no-audit --no-fund --silent $PKGS )
+          [ -e node_modules ] || ln -s /tmp/hdeps/node_modules node_modules
+          mkdir -p /tmp/rollback/harness
+          while IFS=$'\t' read -r KIND HNAME HSCRIPT <&3; do
+            [ "$KIND" = "HARNESS" ] || continue
+            echo "  $HNAME ← $HSCRIPT"
+            PIPELINE_MODE=1 HARNESS_SNAPSHOT_DIR=/tmp/rollback/harness AWS_REGION="$AWS_REGION_HUB" ARTIFACT_BUCKET="$ARTIFACT_BUCKET" \
+              node "$HSCRIPT" < /dev/null
+          done 3< /tmp/deploy-plan.tsv
+        fi
 
         # ── Target 3: ECS Express app — roll to the promoted image BY DIGEST ──
         echo "Target 3/3 ECS Express roll-by-digest"
@@ -143,9 +218,9 @@ phases:
           echo "ECS_SERVICE_ARN unset — skipping app roll (Lambda/blueprint-only deploy)"
         fi
 
-        # (Fleet/eval-infra detected in pre_build is handled AFTER a successful
-        # app deploy + baseline advance — see the handoff signal below — so the
-        # app always ships and the same commits never re-block.)
+        # (HANDOFF rows from the plan are reported AFTER a successful deploy +
+        # baseline advance — see the handoff signal below — so everything that
+        # can ship does, and the same commits never re-block.)
 
         # ── Smoke checks (DEPLOY.md) — failures here also hit the rollback trap ──
         echo "Smoke checks"
@@ -180,17 +255,21 @@ phases:
         trap - EXIT
         echo "── App deploy complete ──"
 
-        # ── Eval/fleet handoff: app shipped + baseline advanced; NOW fail the
-        # action (no rollback — the app deploy is good and permanent) so the
-        # release manager reports the eval part as a human handoff. Because the
-        # baseline already moved to this SHA, the NEXT run starts from here and
-        # will NOT re-block these commits (Codex #263 round-5).
+        # ── Infra/runtime handoff: everything deployable shipped + baseline
+        # advanced; NOW fail the action (no rollback — the deploy is good and
+        # permanent) so the release manager reports the remaining files as a
+        # human step. Because the baseline already moved to this SHA, the NEXT
+        # run starts from here and will NOT re-block these commits (Codex #263
+        # round-5). What lands here: runtime images (deploy/runtime-agent,
+        # deploy/coding-agent-runtime) and infra scripts (IAM/env/tables) — see
+        # surfaces.json "handoff". Code-only surfaces are NOT here anymore.
         if [ "$(cat /tmp/eval-handoff 2>/dev/null)" = "1" ]; then
-          echo "── HANDOFF: app deployed OK, but the changeset also touched fleet/eval-infra ──" >&2
-          echo "This APP pipeline does not deploy DEPLOY.md steps 4-9. A human (or the" >&2
-          echo "fleet+eval pipeline, once stood up) must deploy these files:" >&2
+          echo "── HANDOFF: app + code surfaces deployed OK, but the changeset also touched infra-only files ──" >&2
+          echo "The pipeline deploys code (Lambda zips, harness prompts/models, S3 toolkits) — not" >&2
+          echo "runtime images, IAM, env vars or tables. A human must run the owning script for:" >&2
           sed 's/^/  - /' /tmp/eval-files >&2
-          echo "The app targets (Lambda/S3/ECS) are deployed + verified and the baseline" >&2
-          echo "has advanced, so re-running will not re-block these commits." >&2
+          echo "(DEPLOY.md 'Not covered by the app pipeline' maps each path to its command.)" >&2
+          echo "Everything else is deployed + verified and the baseline has advanced, so" >&2
+          echo "re-running will not re-block these commits." >&2
           exit 2
         fi

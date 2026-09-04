@@ -28,6 +28,7 @@ import {
   AttachRolePolicyCommand,
   PutRolePolicyCommand,
 } from "@aws-sdk/client-iam";
+import { snapshotHarness } from "../pipeline/harness-snapshot.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -67,6 +68,11 @@ if (existsSync(ENV_LOCAL)) {
 
 const WORKFLOW_API_URL = getArg("workflow-api-url") || process.env.DEPLOYMENT_URL || "";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
+// PIPELINE_MODE=1: the CI/CD Deploy stage runs this under its narrow role — no
+// IAM writes, no memory provisioning, no verify invoke. Only the code-like
+// surfaces of an EXISTING harness (model, system prompt, skills) are updated,
+// after snapshotting the live values for deploy/pipeline/rollback.sh.
+const PIPELINE_MODE = process.env.PIPELINE_MODE === "1";
 
 const TABLES = {
   WORKFLOWS_TABLE: process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows",
@@ -85,6 +91,9 @@ const ROLE_ARN = `arn:aws:iam::${accountId}:role/${ROLE_NAME}`;
 // ─── 1/4 Execution role (shared harness role + WM data-plane policy) ───────────
 console.log("\n1/4 Execution role");
 const iam = new IAMClient({ region: REGION });
+if (PIPELINE_MODE) {
+  console.log("   – skipped (PIPELINE_MODE: IAM is owned by the hand-run setup)");
+} else {
 try {
   await iam.send(new GetRoleCommand({ RoleName: ROLE_NAME }));
   console.log(`   ✓ ${ROLE_NAME} exists`);
@@ -170,6 +179,7 @@ await iam.send(new PutRolePolicyCommand({
 }));
 console.log("   ✓ WorkflowManagerData inline policy applied");
 await sleep(8000); // IAM propagation
+}
 
 // ─── 2/4 Memory ────────────────────────────────────────────────────────────────
 const {
@@ -186,6 +196,10 @@ const agentcore = new BedrockAgentCoreControlClient({ region: REGION });
 
 console.log("\n2/4 AgentCore Memory");
 let memoryId = null;
+let memoryArn = null;
+if (PIPELINE_MODE) {
+  console.log("   – skipped (PIPELINE_MODE: memory is only needed to CREATE the harness)");
+} else {
 let memories = [];
 let nextToken;
 do {
@@ -219,7 +233,8 @@ if (existingMemory) {
   }
   console.log("   ✓ Memory ACTIVE");
 }
-const memoryArn = `arn:aws:bedrock-agentcore:${REGION}:${accountId}:memory/${memoryId}`;
+memoryArn = `arn:aws:bedrock-agentcore:${REGION}:${accountId}:memory/${memoryId}`;
+}
 
 // ─── 3/4 Harness ───────────────────────────────────────────────────────────────
 console.log("\n3/4 Harness");
@@ -275,6 +290,7 @@ if (existing && existing.status === "READY") {
   harnessId = existing.harnessId;
   harnessArn = existing.arn;
   console.log(`   ✓ Harness exists: ${harnessId} (READY) — updating in place`);
+  await snapshotHarness(agentcore, GetHarnessCommand, harnessId, HARNESS_NAME);
   // Update prompt + skills + model in place. The model MUST be included: a
   // model-bump deploy that omitted it would be a silent no-op on an existing
   // harness (the live harness would keep its old pin). model is passed plainly
@@ -302,6 +318,8 @@ if (existing && existing.status === "READY") {
   console.log(`   ✓ Harness updated (model=${MODEL_ID} + system prompt + skills) — READY`);
 } else if (existing) {
   throw new Error(`Harness ${HARNESS_NAME} exists in status ${existing.status} — resolve manually (delete or wait), then re-run.`);
+} else if (PIPELINE_MODE) {
+  throw new Error(`Harness ${HARNESS_NAME} does not exist — the pipeline only UPDATES harnesses. Create it once by hand: node deploy/workflow-manager/setup-workflow-manager.mjs`);
 } else {
   const res = await agentcore.send(new CreateHarnessCommand(harnessConfig));
   harnessId = res.harness?.harnessId;
@@ -322,6 +340,11 @@ if (existing && existing.status === "READY") {
 
 // ─── 4/4 Verify invoke ─────────────────────────────────────────────────────────
 console.log("\n4/4 Verify");
+if (PIPELINE_MODE) {
+  console.log("   – skipped (PIPELINE_MODE: READY status above is the gate; the deploy role cannot InvokeHarness)");
+  console.log(`\nDone (pipeline update). Harness: ${harnessArn}\n`);
+  process.exit(0);
+}
 const { BedrockAgentCoreClient, InvokeHarnessCommand } = await import("@aws-sdk/client-bedrock-agentcore");
 const dataplane = new BedrockAgentCoreClient({ region: REGION });
 const sessionId = `wmverify-${Date.now()}-${"x".repeat(16)}`;
