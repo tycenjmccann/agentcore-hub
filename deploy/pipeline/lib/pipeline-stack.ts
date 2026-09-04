@@ -427,11 +427,12 @@ function grantBuildArtifactPerms(
 }
 
 /**
- * The Deploy role — deliberately narrow. It can update Lambda CODE, sync S3
- * config, and roll the one ECS service. It CANNOT
+ * The Deploy role — deliberately narrow. It can update Lambda CODE (every
+ * function in deploy/pipeline/surfaces.json), sync S3 config/toolkits, update
+ * harness prompt/model/skills, and roll the one ECS service. It CANNOT
  * `lambda:UpdateFunctionConfiguration` (that is what blanks prod Jira creds —
- * DEPLOY.md's "never run the full deploy.sh" rule, enforced by permission) and
- * has no iam:* / no ecs create.
+ * DEPLOY.md's "never run the full deploy.sh" rule, enforced by permission),
+ * cannot create/delete harnesses or runtimes, and has no iam:* / no ecs create.
  */
 function grantDeployPerms(
   scope: Construct,
@@ -457,7 +458,28 @@ function grantDeployPerms(
       ],
       resources: [
         `arn:aws:lambda:${ctx.region}:${ctx.account}:function:agentcore-hub-*`,
+        // The Telegram intake bot predates the naming convention (surfaces.json).
+        `arn:aws:lambda:${ctx.region}:${ctx.account}:function:telegram-bug-intake`,
       ],
+    }),
+    // Harness prompt / model / skills (surfaces.json "harnesses"): the setup
+    // scripts run in PIPELINE_MODE call only Get/List/UpdateHarness on the
+    // EXISTING harness — no create, no IAM, no memory, no invoke. Update never
+    // passes executionRoleArn, so no iam:PassRole is needed here.
+    new iam.PolicyStatement({
+      sid: "HarnessCodeSurfaces",
+      actions: [
+        "bedrock-agentcore:GetHarness",
+        "bedrock-agentcore:UpdateHarness",
+      ],
+      resources: [
+        `arn:aws:bedrock-agentcore:${ctx.region}:${ctx.account}:harness/*`,
+      ],
+    }),
+    new iam.PolicyStatement({
+      sid: "HarnessList",
+      actions: ["bedrock-agentcore:ListHarnesses"],
+      resources: ["*"], // ListHarnesses has no resource scope
     }),
     // Smoke test: invoke the orchestrator with {} → assert FunctionError:None
     // (guards the INIT-crash class the lease-constants zip bug caused).
@@ -546,15 +568,14 @@ function grantDeployPerms(
     })
   );
 
-  // NOTE: the eval-infra targets (DEPLOY.md steps 4-9) are deliberately OUT of
-  // this pilot's CD scope. Running them needs the agentcore CLI in the image,
-  // the fleet role, MCP/GitHub secrets, and broad AgentCore + IAM-create perms —
-  // which would defeat the narrow-role principle and balloon the pilot. When a
-  // merge touches eval files the Deploy stage BLOCKS loudly (not silently skips)
-  // so a human runs steps 4-9 per DEPLOY.md — exactly the documented
-  // no-DEPLOY.md handoff (Codex PR #263 round-4). Templating eval CD in is a
-  // follow-up once the app-deploy loop is proven. So the deploy role stays
-  // app-only: Lambda code, S3 config, ECS roll.
+  // NOTE: runtime IMAGES (deploy/runtime-agent, deploy/coding-agent-runtime) and
+  // infra scripts (IAM, env vars, tables, subscriptions) are deliberately OUT of
+  // this role's scope: image builds need a privileged arm64 builder + ECR push +
+  // UpdateAgentRuntime with a live-env merge, and infra needs iam:* — both would
+  // defeat the narrow-role principle. When a merge touches those files the
+  // Deploy stage ships everything else, advances the baseline, then exits 2 so
+  // the release manager reports the human step (surfaces.json "handoff").
+  // Image CD is the next increment (own CodeBuild project + UpdateAgentRuntime).
 
   role.attachInlinePolicy(
     new iam.Policy(scope, "DeployPerms", { statements })
@@ -576,7 +597,7 @@ function applyNagSuppressions(
       {
         id: "AwsSolutions-IAM5",
         reason:
-          "Scoped wildcards are intentional and minimal: agentcore-hub-* Lambda code updates, /config/* and /pipeline-artifacts/* S3 prefixes, and ecr:GetAuthorizationToken (which has no resource scope). No admin or cross-service wildcard.",
+          "Scoped wildcards are intentional and minimal: agentcore-hub-* Lambda code updates, harness/* prompt+model updates, /config/* and /pipeline-artifacts/* S3 prefixes, and ecr:GetAuthorizationToken / bedrock-agentcore:ListHarnesses (which have no resource scope). No admin or cross-service wildcard.",
       },
       {
         id: "AwsSolutions-CB4",

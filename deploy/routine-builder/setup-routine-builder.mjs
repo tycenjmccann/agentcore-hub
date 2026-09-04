@@ -32,6 +32,7 @@ import {
   AttachRolePolicyCommand,
   PutRolePolicyCommand,
 } from "@aws-sdk/client-iam";
+import { snapshotHarness } from "../pipeline/harness-snapshot.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -50,6 +51,11 @@ const MODEL_ID = getArg("model-id") || "us.anthropic.claude-opus-5";
 const HARNESS_NAME = "agentcore_hub_routine_builder";
 const MEMORY_NAME = "agentcore_hub_routine_builder_memory";
 const ROLE_NAME = "agentcore-hub-harness-role";
+// PIPELINE_MODE=1: the CI/CD Deploy stage runs this under its narrow role — no
+// IAM writes, no memory provisioning, no verify invoke. Only the code-like
+// surfaces of the EXISTING harness (model, system prompt) are updated, after
+// snapshotting the live values for deploy/pipeline/rollback.sh.
+const PIPELINE_MODE = process.env.PIPELINE_MODE === "1";
 
 // Load .env.local (gitignored) so a standalone run picks up DEPLOYMENT_URL and the
 // runner/scheduler ARNs the routines-runner deploy printed. Existing env wins.
@@ -89,6 +95,9 @@ const DLQ_ARN =
 // ─── 1/4 Execution role (shared harness role + routines data-plane policy) ─────
 console.log("\n1/4 Execution role");
 const iam = new IAMClient({ region: REGION });
+if (PIPELINE_MODE) {
+  console.log("   – skipped (PIPELINE_MODE: IAM is owned by the hand-run setup)");
+} else {
 try {
   await iam.send(new GetRoleCommand({ RoleName: ROLE_NAME }));
   console.log(`   ✓ ${ROLE_NAME} exists`);
@@ -163,6 +172,7 @@ await iam.send(new PutRolePolicyCommand({
 }));
 console.log("   ✓ RoutineBuilderData inline policy applied");
 await sleep(8000); // IAM propagation
+}
 
 // ─── 2/4 Memory ────────────────────────────────────────────────────────────────
 const {
@@ -179,6 +189,10 @@ const agentcore = new BedrockAgentCoreControlClient({ region: REGION });
 
 console.log("\n2/4 AgentCore Memory");
 let memoryId = null;
+let memoryArn = null;
+if (PIPELINE_MODE) {
+  console.log("   – skipped (PIPELINE_MODE: memory is only needed to CREATE the harness)");
+} else {
 let memories = [];
 let nextToken;
 do {
@@ -212,7 +226,8 @@ if (existingMemory) {
   }
   console.log("   ✓ Memory ACTIVE");
 }
-const memoryArn = `arn:aws:bedrock-agentcore:${REGION}:${accountId}:memory/${memoryId}`;
+memoryArn = `arn:aws:bedrock-agentcore:${REGION}:${accountId}:memory/${memoryId}`;
+}
 
 // ─── 3/4 Harness ───────────────────────────────────────────────────────────────
 console.log("\n3/4 Harness");
@@ -252,15 +267,19 @@ let harnessArn;
 if (existing && existing.status === "READY") {
   harnessId = existing.harnessId;
   harnessArn = existing.arn;
-  console.log(`   ✓ Harness exists: ${harnessId} (READY) — updating model in place`);
+  console.log(`   ✓ Harness exists: ${harnessId} (READY) — updating model + system prompt in place`);
+  await snapshotHarness(agentcore, GetHarnessCommand, harnessId, HARNESS_NAME);
   // Model bump: re-pin the live harness to MODEL_ID so a model-bump deploy
   // isn't a silent no-op on an existing routine builder. model is passed
   // plainly — no optionalValue wrapper (that's only for the memory attachment
-  // on Update). System prompt/env are left as-is; delete and re-run to change
-  // those.
+  // on Update). The system prompt rides along so an edit to system-prompt.md
+  // reaches the live harness (it used to need a delete + recreate). Env is
+  // left as-is (replace-all on Update; the live harness may carry values this
+  // script doesn't know).
   await agentcore.send(new UpdateHarnessCommand({
     harnessId,
     model: { bedrockModelConfig: { modelId: MODEL_ID } },
+    systemPrompt: [{ text: SYSTEM_PROMPT }],
   }));
   for (let i = 0; i < 24; i++) {
     await sleep(5000);
@@ -270,10 +289,12 @@ if (existing && existing.status === "READY") {
     if (s === "UPDATE_FAILED") throw new Error(`Model update failed: ${status.harness?.failureReason || "unknown"}`);
     if (i === 23) throw new Error("Timed out waiting for harness READY after model update");
   }
-  console.log(`   ✓ Model updated to ${MODEL_ID} — READY`);
-  console.log("   ℹ To pick up a changed system prompt/env, delete and re-run, or use UpdateHarness.");
+  console.log(`   ✓ Model + system prompt updated (model=${MODEL_ID}) — READY`);
+  console.log("   ℹ Env changes still need a delete + re-run (UpdateHarness env is replace-all).");
 } else if (existing) {
   throw new Error(`Harness ${HARNESS_NAME} exists in status ${existing.status} — resolve manually, then re-run.`);
+} else if (PIPELINE_MODE) {
+  throw new Error(`Harness ${HARNESS_NAME} does not exist — the pipeline only UPDATES harnesses. Create it once by hand: node deploy/routine-builder/setup-routine-builder.mjs`);
 } else {
   const res = await agentcore.send(new CreateHarnessCommand(harnessConfig));
   harnessId = res.harness?.harnessId;
@@ -292,6 +313,11 @@ if (existing && existing.status === "READY") {
 
 // ─── 4/4 Verify invoke ─────────────────────────────────────────────────────────
 console.log("\n4/4 Verify");
+if (PIPELINE_MODE) {
+  console.log("   – skipped (PIPELINE_MODE: READY status above is the gate; the deploy role cannot InvokeHarness)");
+  console.log(`\nDone (pipeline update). Harness: ${harnessArn}\n`);
+  process.exit(0);
+}
 const { BedrockAgentCoreClient, InvokeHarnessCommand } = await import("@aws-sdk/client-bedrock-agentcore");
 const dataplane = new BedrockAgentCoreClient({ region: REGION });
 const sessionId = `rbverify-${Date.now()}-${"x".repeat(16)}`;

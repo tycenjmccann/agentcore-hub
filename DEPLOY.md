@@ -287,30 +287,40 @@ deploy gate (bridged to Telegram Approve/Reject buttons) authorizes the
 (no pipeline) the merge gate remains the single act that authorizes the
 deploy above.
 
-### Not covered by the app pipeline (deploy by hand, or drift accrues)
+### What the pipeline deploys, and what it hands off
 
-The pipeline's Deploy stage ships exactly three targets: the orchestrator
-Lambdas (one zip → `agentcore-hub-orchestrator`, `agentcore-hub-agent-invoker`,
-`agentcore-hub-events-writer`), S3 config/blueprints/prompts, and the ECS app.
-Everything else only reaches prod when someone runs its own script. A 2026-09-04
-drift audit found every surface below behind `main` by 1-7 days. When a PR
-touches one of these paths, the CD ticket (or a human) must run the matching
-command after merge:
+The Deploy stage is manifest-driven: `deploy/pipeline/surfaces.json` lists every
+deployable surface and `deploy/pipeline/plan-surfaces.py` turns the merge's
+changed files into a plan. CI (`scripts/check-deploy-surfaces.sh`) fails if a
+file under `lambda/` or `deploy/` is covered by no manifest entry, so a new
+Lambda or deploy script cannot silently fall outside the pipeline again (a
+2026-09-04 audit found eight surfaces 1-7 days behind `main` for exactly that
+reason).
+
+**Deployed by the pipeline (code only, on every merge that touches them):**
+
+| Surface | How |
+|---|---|
+| Orchestrator Lambdas (`lambda/orchestrator/` → orchestrator, agent-invoker, events-writer) | one zip, Target 1 |
+| Every other Lambda in the manifest (`lambda/*`, `deploy/telegram-bug-intake/index.mjs`, `deploy/session-reaper/handler.py`) | zip from source (npm deps vendored where declared), `update-function-code`, live code snapshotted for rollback |
+| `blueprints/`, `deploy/runtime-agent/prompts/`, `src/config/workflows.json`, `src/config/pricing.json`, `src/config/agents.json` (merged) | S3 sync/cp |
+| Workflow Manager toolkit + skills, Routine Builder toolkit | S3 sync (`--delete`, `test_*.py` excluded) |
+| Harness prompt / model / skills (WM, builder, routine builder) | each harness's own setup script in `PIPELINE_MODE=1` → `UpdateHarness` on the existing harness, prior values snapshotted |
+| The Next.js app | ECS roll-by-digest, Target 3 |
+
+**Handed off (Deploy stage exits 2 AFTER everything above shipped and the
+baseline advanced — the release manager reports it, a human runs the owning
+script):**
 
 | Path in repo | Command |
 |---|---|
-| `lambda/agentcore-hub-pipeline-tools/`, `deploy/setup-pipeline-tools-lambda.mjs` | `node deploy/setup-pipeline-tools-lambda.mjs` (IAM + env + code) |
-| `lambda/cost-report/` | `./lambda/cost-report/deploy.sh` (`--backfill` when `REPORT_VERSION` changes — `--rebuild-index` alone drops every older-version card from the fleet index) |
-| `lambda/anomaly-watcher/` | `./lambda/anomaly-watcher/deploy.sh` |
-| `lambda/workflow-analyzer/`, `deploy/workflow-manager/{toolkit,skills}/` | `./deploy/workflow-manager/deploy.sh` |
-| `deploy/workflow-manager/system-prompt.md`, `setup-workflow-manager.mjs` | `node deploy/workflow-manager/setup-workflow-manager.mjs` |
-| `deploy/setup-builder-agent.mjs`, `deploy/routine-builder/` | re-run the setup script (updates the harness model in place) |
-| `deploy/telegram-bug-intake/index.mjs` | `zip -j t.zip deploy/telegram-bug-intake/index.mjs && aws lambda update-function-code --function-name telegram-bug-intake --zip-file fileb://t.zip` |
-| `deploy/runtime-agent/` (main.py, requirements) | `build-and-push.sh v<N>` + `deploy-one-robust.py agentcore_hub_agent` — diff the live env keys first (see Model bump §2) |
+| `deploy/runtime-agent/` (main.py, requirements, deploy-one*.py) | `build-and-push.sh v<N>` + `deploy-one-robust.py agentcore_hub_agent` — diff the live env keys first (see Model bump §2) |
 | `deploy/coding-agent-runtime/` | `build-and-push.sh <tag>` then `update-agent-runtime` with the LIVE env/EFS/network copied from `get-agent-runtime` (drop `requireServiceS3Endpoint`); never `deploy.py` against a live runtime — it rebuilds env from defaults and drops `KIRO_API_KEY` |
+| `deploy/evaluations/`, `deploy/continuous-improvement/` | `setup-evaluations.sh` / `continuous-improvement/deploy.sh` (subscriptions, alarms, env) |
+| `lambda/*/deploy.sh`, `deploy/*/deploy.sh`, `deploy/setup-*.{sh,mjs}` | the script itself — these change IAM / env vars / tables, which the pipeline role deliberately cannot |
+| `lambda/cost-report/index.mjs` with a `REPORT_VERSION` bump | code ships via the pipeline, but run `lambda/cost-report/deploy.sh --backfill` afterwards (`--rebuild-index` alone drops every older-version card from the fleet index) |
 
-The Deploy stage already flags `deploy/runtime-agent/` changes with its exit-2
-HANDOFF; the other rows are silent, so check this table on every CD ticket.
+Runtime-image CD (the first two rows) is the next pipeline increment.
 
 ## Model bump
 

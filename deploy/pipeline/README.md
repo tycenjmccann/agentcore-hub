@@ -23,23 +23,27 @@ merge to main ─► CodePipeline "agentcore-hub-deploy":
   (Lambda code + S3 config + ECS roll), run under a narrow IAM role that
   **cannot** rewrite orchestrator config (so it cannot blank prod Jira creds).
 
-### Scope: app pipeline only (this pilot)
+### Scope: everything code-only; runtime images + infra are a handoff
 
-The hub splits into two independently-deployable components with different blast
-radius + IAM, so they get **separate pipelines from this same parameterized
-stack**:
-- **App pipeline (here):** Lambda + S3 config + ECS. Narrow role.
-- **Fleet + eval pipeline (follow-up):** the 14 runtime agents + evaluator config
-  + alarms + eval-packager (DEPLOY.md steps 4-9). Its own broader-but-isolated
-  role, secrets, and `agentcore` CLI.
+The Deploy stage is driven by `surfaces.json` (the deploy-surface manifest) via
+`plan-surfaces.py`: from the merge's changed files it plans which Lambdas to
+re-zip and `update-function-code`, which S3 toolkits/skills/config to sync, and
+which harness prompts/models to `UpdateHarness` (each harness's own setup script
+run with `PIPELINE_MODE=1`). Live code and harness config are snapshotted first;
+`rollback.sh` restores them on any failure. `scripts/check-deploy-surfaces.sh`
+(CI gate) fails when a file under `lambda/` or `deploy/` is covered by no
+manifest entry, so a new surface cannot silently fall outside the pipeline.
 
-If a merge touches fleet/eval files (`deploy/runtime-agent/`, `blueprints/`,
-`deploy/evaluations/`, `lambda/eval-packager/`), the app pipeline's Deploy stage
-**deploys the app targets, advances the baseline SHA, then fails the action as a
-terminal non-rollback handoff** — a human runs DEPLOY.md steps 4-9 (the
-documented handoff), never a silent skip. (Blocking before the deploy would
-wedge the pipeline: the baseline only advances on a successful app deploy, so
-the same commit range would re-block forever.)
+What the narrow Deploy role deliberately cannot do stays a **handoff**: runtime
+images (`deploy/runtime-agent/`, `deploy/coding-agent-runtime/`) and infra
+scripts (IAM, env vars, tables, subscriptions — every `deploy.sh` / `setup-*`).
+When a merge touches those, the Deploy stage **deploys everything it can,
+advances the baseline SHA, then fails the action as a terminal non-rollback
+handoff** listing the files — the release manager reports it, a human runs the
+owning script (DEPLOY.md maps path → command). Blocking before the deploy would
+wedge the pipeline: the baseline only advances on a successful deploy, so the
+same commit range would re-block forever. Runtime-image CD is the next
+increment.
 
 ## Files
 
