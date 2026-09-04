@@ -78,6 +78,13 @@ const h = vi.hoisted(() => ({
     workflowsConfig: /** @type {any} */ (null),
     s3Completions: /** @type {Record<string, any>} */ ({}), // completions/<ticket>.json records
     notifications: /** @type {any[]} */ ([]),
+    // TEAM-3976: completions/{tid}.json records served by key (raw string —
+    // s3Completions above holds objects), every GetObject key recorded (so the
+    // happy path can assert ZERO record reads), and every store.mergeTaskMetadata
+    // backfill captured. Mirrors evidence-harvest.test.mjs.
+    s3Objects: /** @type {Record<string, string>} */ ({}),
+    s3Gets: /** @type {string[]} */ ([]),
+    merges: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -119,9 +126,23 @@ vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
       const key = cmd?.input?.Key;
+      h.state.s3Gets.push(key);
+      if (typeof key === "string" && key.startsWith("completions/")) {
+        // TEAM-3976: raw-string records (s3Objects) or object records
+        // (s3Completions, TEAM-3985). Absent → the SDK's named NoSuchKey.
+        const raw = h.state.s3Objects[key] !== undefined
+          ? h.state.s3Objects[key]
+          : h.state.s3Completions[key] !== undefined ? JSON.stringify(h.state.s3Completions[key]) : undefined;
+        if (raw === undefined) {
+          const e = new Error("The specified key does not exist.");
+          e.name = "NoSuchKey";
+          throw e;
+        }
+        return { Body: { transformToString: async () => raw } };
+      }
       const body = key === "config/agents.json" ? h.state.s3AgentsConfig
         : key === "config/workflows.json" ? (h.state.workflowsConfig || h.state.s3WorkflowsConfig)
-        : (key && h.state.s3Completions[key]) || null;
+        : null;
       if (!body) throw new Error("NoSuchKey");
       return { Body: { transformToString: async () => JSON.stringify(body) } };
     }
@@ -162,7 +183,9 @@ vi.mock("./workflow-store.mjs", () => ({
   }),
   // Apply the merge onto the fresh snapshot so a re-read after a harvest/stamp
   // sees it — exactly what the real store does (TEAM-3985/3976 tests rely on it).
+  // Every call is also recorded (TEAM-3976 asserts WHICH fields were backfilled).
   mergeTaskMetadata: vi.fn(async (id, tid, fields) => {
+    h.state.merges.push({ wfId: id, tid, fields });
     const tasks = h.state.freshWorkflow?.agentTasks;
     if (tasks) tasks[tid] = { ...(tasks[tid] || { ticketId: tid }), ...fields };
   }),
@@ -230,6 +253,11 @@ beforeEach(() => {
   h.state.terminalClaimWins = true;
   h.state.ebEvents.length = 0;
   h.state.workflowsConfig = null;
+  h.state.s3Objects = {};
+  h.state.s3Gets.length = 0;
+  h.state.merges.length = 0;
+  h.state.s3Completions = {};
+  h.state.notifications.length = 0;
   delete process.env.COMPLETION_EVIDENCE_REQUIRED;
 });
 
@@ -386,6 +414,151 @@ describe("completeWorkflow — evidence gate wiring (TEAM-3686 F3)", () => {
     expect(h.state.storeCompletions.length).toBe(1);
     expect(warn.mock.calls.some((c) => String(c[0]).includes("evidence check skipped"))).toBe(true);
     warn.mockRestore();
+  });
+});
+
+/**
+ * TEAM-3976 — completeWorkflow's completions-record fallback.
+ *
+ * The production failure: a dev ticket was mark_done'd (Workflow Manager) BEFORE
+ * the agent's report_completion fired. The done cascade's one-shot harvest found
+ * no completions/T.json and left agentTasks[T] = {status:"complete"} with no
+ * output; the later report_completion wrote the record but its done→done
+ * transition was a no-op, so no harvest re-ran and the gate refused forever.
+ * Now the gate consults the record for the would-be offenders ONLY — the happy
+ * path (every entry already carries evidence) must make ZERO completions/ reads.
+ */
+describe("completeWorkflow — completions-record fallback (TEAM-3976)", () => {
+  const RECORD = {
+    ticket_id: "T-1",
+    summary: "Fixed it",
+    pr_url: "https://github.com/x/y/pull/1",
+    commit_sha: "abc",
+    branch: "feature/x",
+    artifacts: "shared/dev-evidence/T-1.md",
+  };
+  /** T-1 closed out-of-band: complete, but evidence-less. Siblings have output. */
+  const tasksMissingT1 = () => ({
+    id: "wf_1",
+    agentTasks: {
+      "T-1": { ticketId: "T-1", status: "complete", completedAt: "2026-09-01T00:00:00Z" },
+      "T-2": { ticketId: "T-2", output: "verified" },
+      "T-3": { ticketId: "T-3", output: "ci green" },
+    },
+  });
+  const completionReads = () => h.state.s3Gets.filter((k) => String(k).startsWith("completions/"));
+
+  it("record proves evidence → completes, backfills T-1 (deliverable fields only), no rejection", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = tasksMissingT1();
+    h.state.s3Objects["completions/T-1.json"] = JSON.stringify(RECORD);
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(false);
+    // Exactly ONE record read: the TEAM-3985 re-harvest maps summary→output and
+    // the re-evaluation clears `missing`, so the TEAM-3976 second pass never runs
+    // (it would have been a second read of the same key).
+    expect(completionReads()).toEqual(["completions/T-1.json"]);
+    expect(h.state.notifications).toHaveLength(0);
+    expect(h.state.merges).toHaveLength(1);
+    expect(h.state.merges[0].wfId).toBe("wf_1");
+    expect(h.state.merges[0].tid).toBe("T-1");
+    expect(h.state.merges[0].fields).toEqual({
+      output: "Fixed it",
+      branch: "feature/x",
+      commitSha: "abc",
+      prUrl: "https://github.com/x/y/pull/1",
+    });
+    expect(h.state.merges[0].fields).not.toHaveProperty("mergeCommit");
+    expect(h.state.merges[0].fields).not.toHaveProperty("outcome");
+    error.mockRestore();
+  });
+
+  it("blank summary but PR proof (pr_url + commit_sha) → completes via the second pass; no escalation", async () => {
+    // The case the TEAM-3985 re-harvest alone cannot close: it maps summary→output,
+    // so a record whose deliverable proof is the PR leaves `output` empty and the
+    // agentTasks-only check still fails. The TEAM-3976 rule (summary OR pr_url OR
+    // commit_sha OR artifacts) resolves it — and the escalation must NOT fire.
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = tasksMissingT1();
+    h.state.s3Objects["completions/T-1.json"] = JSON.stringify({
+      ticket_id: "T-1", summary: "", pr_url: "https://github.com/x/y/pull/1", commit_sha: "abc", branch: "feature/x",
+    });
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(false);
+    expect(h.state.notifications).toHaveLength(0);
+    // Two reads of the same key: the re-harvest (first pass) and our resolver.
+    expect(completionReads()).toEqual(["completions/T-1.json", "completions/T-1.json"]);
+    expect(h.state.merges.length).toBeGreaterThanOrEqual(1);
+    const merged = Object.assign({}, ...h.state.merges.map((m) => m.fields));
+    expect(merged).toMatchObject({ prUrl: "https://github.com/x/y/pull/1", commitSha: "abc", branch: "feature/x" });
+    for (const m of h.state.merges) {
+      expect(m.tid).toBe("T-1");
+      expect(m.fields).not.toHaveProperty("output"); // a blank summary is never written as output
+      expect(m.fields).not.toHaveProperty("mergeCommit");
+      expect(m.fields).not.toHaveProperty("outcome");
+    }
+    error.mockRestore();
+  });
+
+  it("no record → still rejected (T-1@development), nothing backfilled", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = tasksMissingT1();
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(h.state.merges).toHaveLength(0);
+    const rejected = error.mock.calls.find((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"));
+    expect(rejected).toBeTruthy();
+    expect(String(rejected[0])).toContain("T-1@development");
+    // A missing record is a fallback miss, NOT a check failure — the gate stays.
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("evidence check skipped"))).toBe(false);
+    // TEAM-3985's escalation is preserved and fires exactly once, only after BOTH passes.
+    expect(h.state.notifications).toHaveLength(1);
+    expect(h.state.notifications[0].n.type).toBe("manager_escalation");
+    expect(h.state.notifications[0].n.details).toContain("T-1@development");
+    error.mockRestore();
+    warn.mockRestore();
+  });
+
+  it("blank record (whitespace summary) → still rejected — an empty record is not evidence (AC-D4.1)", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = tasksMissingT1();
+    h.state.s3Objects["completions/T-1.json"] = JSON.stringify({ ticket_id: "T-1", summary: "   " });
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(h.state.merges).toHaveLength(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes("T-1@development"))).toBe(true);
+    expect(h.state.notifications).toHaveLength(1);
+    expect(h.state.notifications[0].n.type).toBe("manager_escalation");
+    error.mockRestore();
+  });
+
+  it("happy path (every entry has evidence) → ZERO completions/ reads", async () => {
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = {
+      id: "wf_1",
+      agentTasks: {
+        "T-1": { ticketId: "T-1", output: "shipped the code" },
+        "T-2": { ticketId: "T-2", output: "verified" },
+        "T-3": { ticketId: "T-3", output: "ci green" },
+      },
+    };
+    h.state.s3Objects["completions/T-1.json"] = JSON.stringify(RECORD);
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(completionReads()).toEqual([]);
+    expect(h.state.merges).toHaveLength(0);
   });
 });
 

@@ -8,6 +8,9 @@ import {
   SHIP_PHASES,
   TERMINAL_WORKFLOW_PHASES,
   notTerminalPhaseGuard,
+  completionRecordHasEvidence,
+  evidenceBackfillFields,
+  resolveMissingEvidenceFromRecords,
 } from "./completion.mjs";
 
 /**
@@ -538,5 +541,186 @@ describe("terminal-phase guard (TEAM-3755 F2)", () => {
 
   it("the list is frozen — a caller cannot mutate the shared guard", () => {
     expect(Object.isFrozen(TERMINAL_WORKFLOW_PHASES)).toBe(true);
+  });
+});
+
+/**
+ * TEAM-3976 — the completions-record fallback behind both evidence gates.
+ *
+ * A ticket closed out-of-band (mark_done) BEFORE its report_completion landed has
+ * an evidence-less agentTasks entry; the later report_completion wrote
+ * completions/{tid}.json but its done→done transition was a no-op, so nothing
+ * re-harvested. These pin: what counts as evidence in a record (a blank record is
+ * NOT — AC-D4.1), what gets backfilled (deliverable fields only, fill-if-missing,
+ * never the ship-verdict signals), and the resolver's fail-closed contract.
+ */
+describe("completion-record fallback (TEAM-3976)", () => {
+  describe("completionRecordHasEvidence", () => {
+    const table = [
+      [{ summary: "did it", pr_url: "https://github.com/x/y/pull/1" }, true, "summary + pr_url"],
+      [{ pr_url: "https://github.com/x/y/pull/1" }, true, "pr_url only"],
+      [{ commit_sha: "abc123" }, true, "commit_sha only"],
+      [{ artifacts: "a.md" }, true, "artifacts string"],
+      [{ artifacts: ["a.md"] }, true, "artifacts array"],
+      [null, false, "null"],
+      [{}, false, "empty object"],
+      [{ summary: "   " }, false, "whitespace summary"],
+      [{ summary: "", artifacts: "", pr_url: null, commit_sha: null }, false, "all blank"],
+      [{ artifacts: [] }, false, "empty artifacts array"],
+    ];
+    for (const [record, expected, label] of table) {
+      it(`${label} → ${expected}`, () => {
+        expect(completionRecordHasEvidence(record)).toBe(expected);
+      });
+    }
+    it("non-object inputs are never evidence", () => {
+      expect(completionRecordHasEvidence("summary")).toBe(false);
+      expect(completionRecordHasEvidence(["a.md"])).toBe(false);
+      expect(completionRecordHasEvidence(undefined)).toBe(false);
+    });
+  });
+
+  describe("evidenceBackfillFields", () => {
+    const RECORD = {
+      summary: "Fixed it",
+      branch: "feature/x",
+      commit_sha: "abc",
+      pr_url: "https://github.com/x/y/pull/1",
+      merge_commit: "9f1c2ab",
+      outcome: "shipped",
+      block_reason: "none",
+    };
+
+    it("fills output/branch/commitSha/prUrl on an empty entry", () => {
+      expect(evidenceBackfillFields(RECORD, { ticketId: "T-1", status: "complete" })).toEqual({
+        output: "Fixed it",
+        branch: "feature/x",
+        commitSha: "abc",
+        prUrl: "https://github.com/x/y/pull/1",
+      });
+    });
+
+    it("an undefined entry is treated as empty", () => {
+      expect(evidenceBackfillFields(RECORD, undefined).output).toBe("Fixed it");
+    });
+
+    it("does NOT emit output when the entry already has non-empty output", () => {
+      const fields = evidenceBackfillFields(RECORD, { output: "webhook merge landed first" });
+      expect(fields).not.toHaveProperty("output");
+      expect(fields.branch).toBe("feature/x");
+    });
+
+    it("does NOT emit commitSha/prUrl/branch when the entry already has them", () => {
+      const fields = evidenceBackfillFields(RECORD, {
+        commitSha: "already", prUrl: "https://already", branch: "already",
+      });
+      expect(fields).toEqual({ output: "Fixed it" });
+    });
+
+    it("NEVER emits mergeCommit/outcome/blockReason — ship-verdict signals stay the harvest's job", () => {
+      const fields = evidenceBackfillFields(RECORD, {});
+      expect(fields).not.toHaveProperty("mergeCommit");
+      expect(fields).not.toHaveProperty("outcome");
+      expect(fields).not.toHaveProperty("blockReason");
+      expect(Object.keys(fields).sort()).toEqual(["branch", "commitSha", "output", "prUrl"]);
+    });
+
+    it("output is capped at 10000 chars (same cap as harvestCompletionEvidence)", () => {
+      expect(evidenceBackfillFields({ summary: "x".repeat(20000) }, {}).output).toHaveLength(10000);
+    });
+
+    it("blank record fields are not emitted", () => {
+      expect(evidenceBackfillFields({ summary: "   ", branch: "", commit_sha: null, pr_url: null }, {})).toEqual({});
+      expect(evidenceBackfillFields(null, {})).toEqual({});
+    });
+  });
+
+  describe("resolveMissingEvidenceFromRecords", () => {
+    const MISSING = [{ ticketId: "T-1", phase: "development" }];
+    const TASKS = { "T-1": { ticketId: "T-1", status: "complete" } };
+    const RECORD = { summary: "Fixed it", pr_url: "https://github.com/x/y/pull/1" };
+
+    function deps(overrides = {}) {
+      const calls = { reads: [], backfills: [], logs: [] };
+      const d = {
+        readCompletionRecord: async (tid) => { calls.reads.push(tid); return RECORD; },
+        backfill: async (tid, fields) => { calls.backfills.push({ tid, fields }); },
+        log: (m) => calls.logs.push(m),
+        ...overrides,
+      };
+      return { d, calls };
+    }
+
+    it("(a) a record proving evidence removes the offender AND backfills its entry", async () => {
+      const { d, calls } = deps();
+      const remaining = await resolveMissingEvidenceFromRecords(MISSING, TASKS, d);
+      expect(remaining).toEqual([]);
+      expect(calls.reads).toEqual(["T-1"]);
+      expect(calls.backfills).toEqual([{ tid: "T-1", fields: { output: "Fixed it", prUrl: "https://github.com/x/y/pull/1" } }]);
+    });
+
+    it("(b) no record (read returns null) → still an offender, backfill not called", async () => {
+      const { d, calls } = deps({ readCompletionRecord: async () => null });
+      const remaining = await resolveMissingEvidenceFromRecords(MISSING, TASKS, d);
+      expect(remaining).toEqual(MISSING);
+      expect(calls.backfills).toEqual([]);
+      expect(calls.logs.some((m) => m.includes("not found"))).toBe(true);
+    });
+
+    it("(c) a blank record (whitespace summary, nothing else) → still an offender", async () => {
+      const { d, calls } = deps({ readCompletionRecord: async () => ({ summary: "   " }) });
+      const remaining = await resolveMissingEvidenceFromRecords(MISSING, TASKS, d);
+      expect(remaining).toEqual(MISSING);
+      expect(calls.backfills).toEqual([]);
+      expect(calls.logs.some((m) => m.includes("carries no evidence"))).toBe(true);
+    });
+
+    it("(d) a read that throws keeps the offender and does not throw out", async () => {
+      const { d, calls } = deps({ readCompletionRecord: async () => { throw new Error("S3 down"); } });
+      const remaining = await resolveMissingEvidenceFromRecords(MISSING, TASKS, d);
+      expect(remaining).toEqual(MISSING);
+      expect(calls.backfills).toEqual([]);
+      expect(calls.logs.some((m) => m.includes("read failed") && m.includes("S3 down"))).toBe(true);
+    });
+
+    it("(e) a backfill that throws still resolves the offender (evidence was proven), no throw", async () => {
+      const { d, calls } = deps({ backfill: async () => { throw new Error("ddb down"); } });
+      const remaining = await resolveMissingEvidenceFromRecords(MISSING, TASKS, d);
+      expect(remaining).toEqual([]);
+      expect(calls.logs.some((m) => m.includes("backfill failed") && m.includes("ddb down"))).toBe(true);
+    });
+
+    it("(f) zero reads when there is nothing missing — the happy path never touches S3", async () => {
+      const { d, calls } = deps();
+      expect(await resolveMissingEvidenceFromRecords([], TASKS, d)).toEqual([]);
+      expect(await resolveMissingEvidenceFromRecords(undefined, TASKS, d)).toBeUndefined();
+      expect(calls.reads).toEqual([]);
+    });
+
+    it("only the offenders are read — a clean sibling never costs an S3 call", async () => {
+      const { d, calls } = deps();
+      await resolveMissingEvidenceFromRecords(MISSING, { ...TASKS, "T-2": { ticketId: "T-2", output: "fine" } }, d);
+      expect(calls.reads).toEqual(["T-1"]);
+    });
+
+    it("resolves the entry through the ticketId secondary index (task-id-keyed agentTasks)", async () => {
+      const { d, calls } = deps();
+      const tasks = { task_9: { ticketId: "T-1", output: "already has output" } };
+      await resolveMissingEvidenceFromRecords(MISSING, tasks, d);
+      // output already present → only prUrl is backfilled.
+      expect(calls.backfills).toEqual([{ tid: "T-1", fields: { prUrl: "https://github.com/x/y/pull/1" } }]);
+    });
+
+    it("mixed: resolved offenders are dropped, unproven ones stay, in order", async () => {
+      const { d } = deps({
+        readCompletionRecord: async (tid) => (tid === "T-1" ? RECORD : null),
+      });
+      const remaining = await resolveMissingEvidenceFromRecords(
+        [{ ticketId: "T-1", phase: "development" }, { ticketId: "T-2", phase: "verification" }],
+        { "T-1": { ticketId: "T-1" }, "T-2": { ticketId: "T-2" } },
+        d
+      );
+      expect(remaining).toEqual([{ ticketId: "T-2", phase: "verification" }]);
+    });
   });
 });
