@@ -23,3 +23,6 @@ pytest>=8.0.0
 pytest-asyncio>=0.23.0
 # image_reader guard tests build real PNGs and re-open the tiles it emits.
 pillow>=11.2.1
+# deploy/coding-agent-runtime/test_setup_failure_response.py exec's the coding
+# runtime's main.py (FastAPI app). Only the import is needed — no server runs.
+fastapi>=0.115.0

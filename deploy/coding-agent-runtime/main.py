@@ -2641,6 +2641,38 @@ async def health():
     return JSONResponse({"status": status, "time_of_last_update": int(time.time())})
 
 
+def _setup_failure_response(payload: dict, cli: str, session_id: str | None,
+                            error: str, status_code: int) -> JSONResponse:
+    """Answer a pre-CLI workspace setup failure (bad repo field, clone / auth /
+    checkout failure) so the REASON actually reaches the caller.
+
+    Synchronous callers (Cloud Code UI, invoke.py) keep the HTTP status — they
+    read the body straight off the response.
+
+    Async submits (workflow personas) cannot: AgentCore drops the body of every
+    non-2xx runtime response and raises a bare "Received error (500)" client-
+    side, indistinguishable from a VM that died mid-response. The fleet then ran
+    lost-submit recovery, polled a turn that was never journaled, declared a VM
+    death after three 'unknown's and resubmitted — 158 identical clone-404
+    loops per run on 2026-09-03/04 (TEAM-3790/3799), surfaced to the persona as
+    "all coding engines down". So for async: (1) journal a terminal record under
+    the caller's turn_id, so a poll returns done+error even if this response is
+    lost and a same-id resubmit dedupes onto it; (2) return the error as a 200
+    body flagged setup_failed — the fleet's synchronous {error} branch handles
+    it, and the flag tells it "not a runtime death, do not retry"."""
+    body = {"error": error, "setup_failed": True, "cli": cli}
+    if payload.get("mode") != "async":
+        return JSONResponse(body, status_code=status_code)
+    turn_id = payload.get("turn_id")
+    if turn_id:
+        body["turn_id"] = turn_id
+        _journal_write(_turn_journal_path(session_id, turn_id),
+                       {"status": "done", "turn_id": turn_id, "cli": cli,
+                        "finished_at": int(time.time()), "response": "",
+                        "error": error, "setup_failed": True})
+    return JSONResponse(body, status_code=200)
+
+
 @app.post("/invocations")
 async def invocations(request: Request):
     """Run one coding turn.
@@ -2884,10 +2916,13 @@ async def invocations(request: Request):
                 workdir, claude_session_id, session_id, cli=cli,
                 kiro_home=KIRO_HOME if cli == "kiro" else None)
     except ValueError as ve:  # bad repo field — caller error, not a 500
-        return JSONResponse({"error": str(ve)}, status_code=400)
+        return _setup_failure_response(payload, cli, session_id, str(ve)[:600], 400)
     except Exception as exc:  # noqa: BLE001
-        logger.error("turn_setup_failed", extra={"cli": cli, "error": str(exc)[:600]})
-        return JSONResponse({"error": str(exc)[:600]}, status_code=500)
+        # Scrub before it leaves the box: this message now reaches the persona
+        # transcript, and git echoes the remote (possibly token-bearing) URL.
+        err = _scrub_git_url(str(exc))[:600]
+        logger.error("turn_setup_failed", extra={"cli": cli, "error": err})
+        return _setup_failure_response(payload, cli, session_id, err, 500)
 
     # Checkpoint: upload the grown transcript back to S3 for the laptop to pull.
     # The session id to checkpoint is the resume id (the conversation's real id).

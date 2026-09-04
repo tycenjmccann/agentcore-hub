@@ -1124,6 +1124,32 @@ Why: on 2026-09-03 a mistyped owner produced 633 failed clones, was reported by
 the coding-runtime wrapper as "coding turn vanished", and the personas escalated
 a fake fleet-wide coding outage. Nothing along the chain had asked GitHub.
 
+#### Third layer: setup failures reach the persona (coding runtime + fleet)
+
+If a bad URL still reaches a coding turn (waiver, non-GitHub host, branch or
+auth problem), the coding runtime fails the `git clone` **before any CLI
+starts**. It used to answer with a bare HTTP 500; AgentCore drops the body of
+non-2xx runtime responses, so the fleet only saw `Received error (500)`, could
+not tell a refusal from a dead microVM, ran lost-submit recovery, polled a turn
+that was never journaled, and after three `unknown`s declared a VM death and
+resubmitted (158 identical loops per run, surfaced as "all coding engines
+down" — TEAM-3790/3799). Now:
+
+- **Coding runtime** (`_setup_failure_response`): for `mode:"async"` submits the
+  reason is returned as a **200 body** flagged `setup_failed:true` and journaled
+  as a terminal `done` record under the caller's `turn_id`, so a lost response
+  still resolves on the next poll. Synchronous callers (Cloud Code UI) keep the
+  HTTP status.
+- **Fleet wrapper** (`_runtime_rejection`, `_remote_coding_turn`): a
+  `setup_failed` record is terminal — no recovery, no VM-death resubmit, and the
+  persona is told it is a repo/branch/auth problem, not an outage, with the
+  session's repo pin released so a corrected `repo=` takes effect. An HTTP
+  4xx/5xx `RuntimeClientError` from a legacy runtime is treated the same way
+  (503 = journal unwritable, stays retryable).
+
+Both runtimes are pipeline **handoff** surfaces: ship them by hand
+(`deploy/coding-agent-runtime` first, then `deploy/runtime-agent`).
+
 ### Via the UI
 
 Navigate to `http://localhost:3000/workflow` → click "New Workflow" → fill the intake form.
