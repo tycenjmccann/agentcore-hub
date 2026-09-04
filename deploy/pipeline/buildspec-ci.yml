@@ -78,6 +78,8 @@ phases:
         pytest -q deploy/runtime-agent/tests \
           deploy/runtime-agent/test_telemetry_init.py \
           deploy/runtime-agent/test_build_env_vars.py \
+          deploy/runtime-agent/test_remote_coding.py \
+          deploy/coding-agent-runtime/test_setup_failure_response.py \
           deploy/workflow-manager/toolkit \
           deploy/pipeline/test_ecs_primary_container.py \
           deploy/pipeline/test_plan_surfaces.py

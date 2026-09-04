@@ -71,6 +71,7 @@ else:
 import importlib.metadata
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -877,6 +878,35 @@ def _recover_lost_submit(client, payload: dict, outer_deadline: float | None = N
     return None
 
 
+_RUNTIME_HTTP_ERR = re.compile(r"Received error \((\d{3})\) from runtime")
+
+
+def _runtime_rejection(exc: Exception) -> dict | None:
+    """Tell 'the coding runtime ANSWERED with an HTTP error' apart from 'the
+    response was lost'. AgentCore surfaces a non-2xx runtime response as a
+    RuntimeClientError whose message carries only the status — the body (the
+    actual reason) is dropped. It is still an answer: the turn was refused
+    before it started and nothing is running, so lost-submit recovery must NOT
+    run — it would poll an unjournaled turn into a bogus VM-death verdict and
+    resubmit the same doomed setup (TEAM-3790/3799: 158 loops per run). A
+    current coding runtime returns setup failures as a 200 body instead, so
+    this only fires against a legacy runtime — still terminal. 503 is the
+    runtime's own "journal unwritable, turn not started": transient, the
+    persona may retry the same call. Returns None when the exception says
+    nothing about the runtime (timeout, connection drop, throttle)."""
+    m = _RUNTIME_HTTP_ERR.search(str(exc))
+    if not m:
+        return None
+    code = int(m.group(1))
+    if code == 503:
+        return {"error": "coding runtime refused the turn (HTTP 503: turn "
+                         "journal unwritable, turn not started) — transient"}
+    return {"error": f"coding runtime refused the turn before it started (HTTP "
+                     f"{code}); the runtime dropped the reason — check its "
+                     f"CloudWatch logs for turn_setup_failed",
+            "setup_failed": True}
+
+
 def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None,
                      budget_s: int | None = None) -> dict:
     """Submit one async coding turn and poll it to a terminal record.
@@ -899,13 +929,19 @@ def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None,
     try:
         submitted = _coding_invoke(client, payload)
     except Exception as e:  # noqa: BLE001
+        rejected = _runtime_rejection(e)
+        if rejected is not None:
+            logger.warning(f"[remote-coding] submit refused by runtime: {str(e)[:200]}")
+            return rejected
         logger.warning(f"[remote-coding] submit response lost: {str(e)[:200]}")
         submitted = _recover_lost_submit(client, payload, outer_deadline)
         if submitted is None:
             return {"error": "submit response lost and could not be safely "
                              "recovered (see logs)"}
     if submitted.get("error"):
-        return submitted  # setup failure (bad repo, clone) — synchronous
+        # Setup failure (bad repo, clone, auth) — answered synchronously, the
+        # turn never started. setup_failed (current runtimes) marks it terminal.
+        return submitted
     if not submitted.get("turn_id"):
         # Runtime predates async mode (or ran a legacy path) and executed the
         # turn synchronously — its result is already complete.
@@ -1024,6 +1060,22 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         _publish_agent_error(_CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID,
                              f"remote {cli} turn failed: {str(result['error'])[:600]}",
                              ticket_id=_CURRENT_TICKET_ID)
+        if result.get("setup_failed"):
+            # The workspace never came up, so nothing pins this session to the
+            # bad repo: release the pin so a corrected repo= on the next call
+            # actually takes effect instead of re-cloning the doomed URL.
+            _CODING_SESSION["repo"] = None
+            return (f"ERROR: remote {cli} turn could not START: {result['error']}. "
+                    f"This is a workspace SETUP failure on the coding runtime "
+                    f"(repository URL/owner, branch, clone or auth) — NOT a runtime "
+                    f"outage and NOT a crashed VM. Retrying the same call, or "
+                    f"switching coding engines, fails identically: every engine "
+                    f"clones the same URL. Fix the cause first: verify the repository "
+                    f"owner/name and branch with your GitHub tools (e.g. list the "
+                    f"owner's repositories), then call this tool again with the "
+                    f"corrected repo= and state the correction in your ticket. If "
+                    f"you cannot find the correct repository, STOP and escalate. Do "
+                    f"not report this as an infrastructure outage.")
         if result.get("no_retry_hint"):
             # The turn's work may already exist in the workspace — the error
             # text itself carries the verify-first instructions.

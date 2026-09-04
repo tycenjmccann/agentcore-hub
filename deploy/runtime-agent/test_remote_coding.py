@@ -515,3 +515,110 @@ class TestPollBudgetScaling(RemoteCodingTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSetupFailureIsTerminal(RemoteCodingTestCase):
+    """TEAM-3790/3799 — a workspace setup failure (clone 404 on a wrong repo
+    owner) must surface as a terminal, actionable error: no lost-submit
+    recovery, no VM-death resubmit, no 'retry this same call' advice."""
+
+    def _submit_client(self, side_effect):
+        client = mock.MagicMock()
+        client.invoke_agent_runtime.side_effect = side_effect
+        return client
+
+    def test_setup_failed_body_is_terminal_and_actionable(self):
+        client = self._submit_client(lambda **kw: _invoke_response({
+            "error": "git clone failed: remote: Repository not found.",
+            "setup_failed": True, "turn_id": kw and "turn-x", "cli": "codex",
+        }))
+        events_client = mock.MagicMock()
+        main._CODING_SESSION["repo"] = "tycenj/agentcore-hub"
+        with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main.time, "sleep"):
+            out = main._remote_coding_turn("fix the bug", "codex", repo="tycenj/agentcore-hub")
+
+        self.assertTrue(out.startswith("ERROR: remote codex turn could not START:"), out)
+        self.assertIn("Repository not found", out)
+        self.assertIn("NOT a runtime outage", out)
+        self.assertIn("STOP and escalate", out)
+        self.assertNotIn("Retry this same", out)
+        # One submit, zero polls, zero resubmits.
+        self.assertEqual(client.invoke_agent_runtime.call_count, 1)
+        # The bad repo pin is released so a corrected repo= takes effect.
+        self.assertIsNone(main._CODING_SESSION["repo"])
+        self._assert_agent_error_published(events_client, "Repository not found")
+
+    def test_http_500_from_runtime_is_a_rejection_not_a_lost_submit(self):
+        # Legacy coding runtime: body dropped by AgentCore, only the status
+        # survives. Still an ANSWER — must not probe/recover/resubmit.
+        from botocore.exceptions import ClientError
+        err = ClientError(
+            {"Error": {"Code": "RuntimeClientError",
+                       "Message": "Received error (500) from runtime. Please check "
+                                  "your CloudWatch logs for more information."}},
+            "InvokeAgentRuntime")
+        client = self._submit_client(err)
+        events_client = mock.MagicMock()
+        with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main.time, "sleep"):
+            out = main._remote_coding_turn("fix the bug", "claude")
+
+        self.assertTrue(out.startswith("ERROR: remote claude turn could not START:"), out)
+        self.assertIn("HTTP 500", out)
+        self.assertNotIn("Retry this same", out)
+        self.assertNotIn("vanished", out)
+        self.assertEqual(client.invoke_agent_runtime.call_count, 1,
+                         "recovery probes / resubmits must not run on a rejection")
+        self._assert_agent_error_published(events_client, "HTTP 500")
+
+    def test_http_503_keeps_retry_advice(self):
+        from botocore.exceptions import ClientError
+        err = ClientError(
+            {"Error": {"Code": "RuntimeClientError",
+                       "Message": "Received error (503) from runtime."}},
+            "InvokeAgentRuntime")
+        client = self._submit_client(err)
+        with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_ddb_events_client", mock.MagicMock()), \
+             mock.patch.object(main.time, "sleep"):
+            out = main._remote_coding_turn("fix the bug", "claude")
+
+        self.assertTrue(out.startswith("ERROR: remote claude turn failed:"), out)
+        self.assertIn("Retry this same claude call", out)
+        self.assertEqual(client.invoke_agent_runtime.call_count, 1)
+
+    def test_connection_drop_still_takes_recovery_path(self):
+        # Regression guard: only HTTP rejections short-circuit. A dropped
+        # connection says nothing about the runner and must still recover.
+        client = self._submit_client(RuntimeError("Connection was closed before we received a valid response"))
+        with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_ddb_events_client", mock.MagicMock()), \
+             mock.patch.object(main, "_recover_lost_submit", return_value=None) as rec, \
+             mock.patch.object(main.time, "sleep"):
+            out = main._remote_coding_turn("fix the bug", "claude")
+        rec.assert_called_once()
+        self.assertIn("could not be safely recovered", out)
+
+    def test_done_record_with_setup_failed_from_poll_is_terminal(self):
+        # Response lost, then the poll returns the journaled setup failure.
+        calls = {"n": 0}
+
+        def side_effect(**kw):
+            body = json.loads(kw["payload"].decode("utf-8"))
+            if body.get("action") == "poll":
+                return _invoke_response({"status": "done", "turn_id": body["turn_id"],
+                                         "error": "git clone failed: Repository not found.",
+                                         "setup_failed": True, "response": ""})
+            calls["n"] += 1
+            raise RuntimeError("Connection was closed before we received a valid response")
+
+        client = self._submit_client(side_effect)
+        with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_ddb_events_client", mock.MagicMock()), \
+             mock.patch.object(main.time, "sleep"):
+            out = main._remote_coding_turn("fix the bug", "codex")
+        self.assertTrue(out.startswith("ERROR: remote codex turn could not START:"), out)
+        self.assertEqual(calls["n"], 1, "no resubmit after a journaled setup failure")
