@@ -225,5 +225,46 @@ class TokensAndInterventions(unittest.TestCase):
         self.assertEqual(metrics["nudgeCount"], 1)
 
 
+class ParkedAdvisory(unittest.TestCase):
+    """TEAM-3966 F6: review.parked_advisory (TEAM-3790 — a human's request-changes
+    the orchestrator parked because every finding was out-of-diff) is a change
+    request with no reopened tickets, and is NOT a review resolution."""
+
+    def setUp(self):
+        self.metrics = compute_metrics(dossier(
+            tickets=[
+                ticket("TEAM-2", "design_agent", "done", updatedAt=ts(20)),
+                # The gate stays where the rejection left it: blocked, not done.
+                ticket("TEAM-9", "human:alice@example.com", "blocked", title="Design review",
+                       updatedAt=ts(45), blockedBy=["TEAM-2"]),
+            ],
+            events=[
+                ev(0, "workflow.phase_change", {"phase": "design", "workflowId": "wf-1"}),
+                ev(1, "agent.invoked", {"ticketId": "TEAM-2", "agentId": "design_agent",
+                                        "phase": "design", "workflowId": "wf-1"}),
+                ev(20, "agent.complete", {"ticketId": "TEAM-2", "agentId": "design_agent",
+                                          "workflowId": "wf-1"}),
+                ev(21, "review.needed", {"ticketId": "TEAM-9", "reviewer": "human:alice@example.com",
+                                         "workflowId": "wf-1"}),
+                ev(45, "review.parked_advisory", {"ticketId": "TEAM-9", "reason": "human_origin_rejection",
+                                                  "advisoryFindings": [], "workflowId": "wf-1"}),
+            ],
+        ))
+
+    def test_counted_as_change_request_without_rework(self):
+        cr = self.metrics["changeRequests"]
+        self.assertEqual(cr["count"], 1)
+        cycle = cr["cycles"][0]
+        self.assertEqual(cycle["gateTicketId"], "TEAM-9")
+        self.assertEqual(cycle["reopenedTickets"], [])
+        self.assertIsNone(cycle["reworkDurationMs"])
+
+    def test_not_a_review_resolution(self):
+        reviews = self.metrics["humanReviews"]
+        self.assertEqual(len(reviews), 1)
+        # Parked is not rejected and not approved — the gate is still waiting.
+        self.assertEqual(reviews[0]["outcome"], "unresolved")
+
+
 if __name__ == "__main__":
     unittest.main()
