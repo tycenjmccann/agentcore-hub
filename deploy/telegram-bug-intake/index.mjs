@@ -708,6 +708,11 @@ async function transitionGate(workflowId, ticketId, targetStatus, comment) {
 
 const ESC_KEY_PREFIX = "esc#";
 const ESC_DETAIL_MAX = 700;
+// A finished run cannot be "parked" — its leftover escalations are history, not
+// work. Paging them would only flood the chat (first rollout pinged ~40 stale
+// ones from completed runs). Terminal phases per the orchestrator's
+// claimTerminalOutcome: complete / cancelled / deploy-blocked / static-ci-only.
+const TERMINAL_PHASES = new Set(["complete", "completed", "cancelled", "canceled", "failed", "deploy-blocked", "static-ci-only"]);
 
 async function scanManagerEscalations() {
   const res = await fetch(`${HUB_API_URL}/api/workflow/list`);
@@ -716,6 +721,7 @@ async function scanManagerEscalations() {
 
   const pending = [];
   for (const wf of workflows) {
+    if (TERMINAL_PHASES.has(String(wf.phase || wf.status || "").toLowerCase())) continue;
     for (const n of wf.humanNotifications || []) {
       if (n.type === "manager_escalation" && !n.acknowledged && n.id) {
         pending.push({ wf, notif: n });

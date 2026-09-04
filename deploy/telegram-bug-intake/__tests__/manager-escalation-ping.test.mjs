@@ -189,6 +189,24 @@ describe("manager_escalation pages allowlisted chats", () => {
     expect(db.items.has("esc#notif_wm_1")).toBe(false);
   });
 
+  it("never pages escalations left on finished runs", async () => {
+    const handler = await loadHandler("12345");
+    registerChat(12345);
+    const ctx = makeCtx(100_000);
+    const net = makeNet(ctx, { workflows: [
+      { ...escalatedRun()[0], phase: "complete" },
+      { ...escalatedRun({ ...ESCALATION, id: "notif_wm_2" })[0], workflowId: "wf-3", phase: "static-ci-only" },
+      { ...escalatedRun({ ...ESCALATION, id: "notif_wm_3" })[0], workflowId: "wf-4", phase: "development" },
+    ] });
+    global.fetch = net.fetch;
+    await handler({}, ctx);
+    const pings = escalations(net);
+    expect(pings).toHaveLength(1);
+    expect(pings[0].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === "eok|wf-4")).toBe(true);
+    expect(db.items.has("esc#notif_wm_1")).toBe(false);
+    expect(db.items.has("esc#notif_wm_2")).toBe(false);
+  });
+
   it("releases the claim when no allowlisted chat can be paged", async () => {
     const handler = await loadHandler("12345");
     registerChat(999); // nobody allowlisted is registered
