@@ -5,6 +5,7 @@ import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical
 import WorkflowBoard from "@/components/workflow/WorkflowBoard";
 import WorkflowManagerChat from "@/components/workflow/WorkflowManagerChat";
 import IntakeForm from "@/components/workflow/IntakeForm";
+import PerformanceCard from "@/components/workflow/PerformanceCard";
 import { type WorkflowState, type WorkflowInput, isTerminalPhase } from "@/lib/workflow/types";
 import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
@@ -394,7 +395,9 @@ export default function WorkflowPage() {
             onAskManager={(wfId) => { setChatSeedWorkflowId(wfId); setChatOpen(true); }}
           />
         ) : (
-          <div className="flex flex-col items-center justify-center h-full text-center p-8">
+          <div className="p-6 space-y-6">
+            <PerformanceCard onSelectRun={(id) => handleSelectWorkflow(id)} />
+            <div className="flex flex-col items-center justify-center text-center p-6">
             <div className="w-16 h-16 rounded-full bg-blue-600/10 flex items-center justify-center mb-4">
               <Play className="w-7 h-7 text-blue-400" />
             </div>
@@ -432,6 +435,7 @@ export default function WorkflowPage() {
                   Test Workflow
                 </button>
               </div>
+            </div>
             </div>
           </div>
         )}
