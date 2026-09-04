@@ -34,8 +34,9 @@ Usage:
   python3 intervene.py escalate  <workflowId> <message>
   python3 intervene.py complete  <workflowId> [--reason "..."]
   python3 intervene.py cancel    <workflowId> --reason "..."   (explicit user request ONLY)
-  python3 intervene.py start     --title "..." [--description "..."] [--repo owner/name] [--branch main]
-  python3 intervene.py file-bug  <workflowId> --title "..." --description "<RCA>" --agent <agentId> [--repo owner/name]
+  python3 intervene.py start     --title "..." [--description "..."] [--def <workflowDefId> | --type feature|bug] [--repo owner/name] [--branch main]
+  python3 intervene.py file-bug  [<workflowId>] --title "..." --description "..." [--agent <agentId>] [--repo owner/name]
+                                 (--agent selects crash mode; plain bugs omit it and may omit <workflowId>)
   python3 intervene.py bugs-off  [--note "..."]   (operator said stop → suppress ALL automated bug filing)
   python3 intervene.py bugs-on   [--note "..."]
 
@@ -284,15 +285,30 @@ def cmd_cancel(args):
 def cmd_start(args):
     """Start a new workflow run — the same entry point the UI and Telegram
     feature intake use. Only on explicit user request (e.g. 'restart that with
-    these instructions'). Returns workflowId + epicId."""
+    these instructions'). Returns workflowId + epicId.
+
+    Pipeline selection (mutually exclusive, both optional):
+      --def <workflowDefId>  run against a specific workflow definition
+      --type feature|bug     pick the built-in feature or bug pipeline
+    With neither flag the body is unchanged from the historical default
+    (`workflowType: "feature"`). An explicitly empty/whitespace --def is
+    refused rather than silently falling through to that default."""
     if not (args.title or "").strip():
         raise SystemExit("REFUSED: start requires --title")
+    if args.workflow_def is not None and not args.workflow_def.strip():
+        raise SystemExit(
+            "REFUSED: --def was given but empty — omit --def entirely to use "
+            "--type/the feature default, or pass a real workflowDefId"
+        )
     body = {
         "title": args.title,
         "description": args.description or "",
-        "workflowType": "feature",
-        "sources": [],
     }
+    if args.workflow_def is not None:
+        body["workflowDefId"] = args.workflow_def
+    else:
+        body["workflowType"] = args.type or "feature"
+    body["sources"] = []
     if args.repo:
         body["repoConfig"] = {
             "layout": "multi-repo",
@@ -310,9 +326,12 @@ def cmd_start(args):
 
 def cmd_bugs_toggle(args):
     """Flip the auto-bug-filing kill switch (enforced server-side in /api/bugs).
-    `bugs-off` = automated filings (any request with dedupeLabels) are suppressed;
-    human-relayed bugs are unaffected. Config lives in the events table so no new
-    IAM is needed. Use when the operator says "stop filing bugs"."""
+    `bugs-off` = ALL automated workflow-manager filings are suppressed: both the
+    crash path (any request with dedupeLabels) and the free-form path (a
+    dedupeLabels-less request carrying origin:"workflow-manager"). Human-relayed
+    bugs (Telegram/UI intake — neither field set) are unaffected. Config lives
+    in the events table so no new IAM is needed. Use when the operator says
+    "stop filing bugs"."""
     value = "off" if args.action == "bugs-off" else "on"
     dynamodb.Table(EVENTS_TABLE).put_item(Item={
         "workflowId": "wm-config",
@@ -326,32 +345,62 @@ def cmd_bugs_toggle(args):
 
 def cmd_file_bug(args):
     """File a top-level Bug that auto-fires the bug-fix pipeline (Jira webhook →
-    bootstrapBugWorkflow). This is the crash-rca skill's output path: the RCA
-    becomes the bug description, and the fix ships without a human relay.
+    bootstrapBugWorkflow). Two modes, selected by whether --agent is passed at
+    all (not by whether its value is truthy — an explicitly empty/whitespace
+    --agent is refused outright rather than silently falling back to free-form,
+    so a caller who meant crash mode never files a bug that skips dedupe):
 
-    Guardrails enforced here and server-side:
-      - --title, --description (the RCA), and --agent are all REQUIRED. An RCA
-        must cite evidence; a bare "agent X died" is refused by the skill, and
-        an empty description is refused here.
+    CRASH MODE (--agent given) — the crash-rca skill's output path. The RCA
+    becomes the bug description and the fix ships without a human relay.
+      - <workflowId>, --title, --description (the RCA), and --agent are all
+        REQUIRED. An RCA must cite evidence; a bare "agent X died" is refused
+        by the skill, and an empty description is refused here.
       - Dedupe is signature-based: one OPEN bug per (crash-rca, agent:<id>)
         label pair. A second filing for the same agent lands as a comment on
         the existing bug — the pipeline never burns a run per crash.
+
+    FREE-FORM MODE (--agent omitted) — file an ordinary bug the manager noticed
+    (not tied to a crashed persona). No crash-rca/agent labels and no dedupe:
+    the request carries an `origin: "workflow-manager"` marker so the server
+    still honors the auto-filing kill switch. <workflowId> is OPTIONAL — pass it
+    to link the intervention event to a run, omit it for a standalone bug.
+
+    Common to both:
+      - --title and --description are always REQUIRED.
       - --repo defaults server-side to the hub repo (GITHUB_OWNER/GITHUB_REPO):
         agent crashes are hub infrastructure, not the workload's repo."""
-    for field, val in (("--title", args.title), ("--description", args.description),
-                       ("--agent", args.agent)):
+    for field, val in (("--title", args.title), ("--description", args.description)):
         if not (val or "").strip():
             raise SystemExit(f"REFUSED: file-bug requires {field}")
-    body = {
-        "title": args.title,
-        "description": args.description,
-        "labels": ["crash-rca", f"agent:{args.agent}", f"crashed-in:{args.workflow_id}"],
-        "dedupeLabels": ["crash-rca", f"agent:{args.agent}"],
-    }
+    if args.agent is not None and not args.agent.strip():
+        raise SystemExit(
+            "REFUSED: --agent was given but empty — omit --agent entirely for a "
+            "free-form bug, or pass the crashed persona's id for crash mode"
+        )
+    crash_mode = args.agent is not None
+    if crash_mode and not args.workflow_id:
+        raise SystemExit("REFUSED: crash-mode file-bug (--agent) requires <workflowId>")
+
+    if crash_mode:
+        body = {
+            "title": args.title,
+            "description": args.description,
+            "labels": ["crash-rca", f"agent:{args.agent}", f"crashed-in:{args.workflow_id}"],
+            "dedupeLabels": ["crash-rca", f"agent:{args.agent}"],
+        }
+    else:
+        body = {
+            "title": args.title,
+            "description": args.description,
+            "origin": "workflow-manager",
+        }
     if args.repo:
         body["repo"] = args.repo
     result = api_post("/api/bugs", body)
-    publish_intervention(args.workflow_id, "file_bug", {
+    # Link the intervention event to the run when we have one; otherwise publish
+    # under the "wm-adhoc" sentinel partition (mirrors "wm-config" for toggles).
+    event_workflow_id = args.workflow_id or "wm-adhoc"
+    publish_intervention(event_workflow_id, "file_bug", {
         "ticketId": result.get("ticketId"), "deduped": result.get("deduped"),
         "agentId": args.agent, "note": args.title[:500],
     })
@@ -466,6 +515,13 @@ def main():
     p = sub.add_parser("start")
     p.add_argument("--title", default="")
     p.add_argument("--description", default="")
+    pipeline = p.add_mutually_exclusive_group()
+    pipeline.add_argument("--def", dest="workflow_def", default=None,
+                          help="run against a specific workflowDefId (omits workflowType). "
+                               "An explicitly empty/whitespace value is refused rather than "
+                               "silently falling back to the feature/type default")
+    pipeline.add_argument("--type", choices=["feature", "bug"], default="",
+                          help="built-in pipeline to run (default: feature)")
     p.add_argument("--repo", default="")
     p.add_argument("--branch", default="")
     p.set_defaults(func=cmd_start)
@@ -476,12 +532,15 @@ def main():
         p.set_defaults(func=cmd_bugs_toggle, action=name)
 
     p = sub.add_parser("file-bug")
-    p.add_argument("workflow_id")
+    p.add_argument("workflow_id", nargs="?", default=None,
+                   help="run to link the intervention event to; REQUIRED in crash mode, optional for a free-form bug")
     p.add_argument("--title", default="")
     p.add_argument("--description", default="",
-                   help="REQUIRED: the full crash RCA (symptom, occurrences, last activity, suspected cause)")
-    p.add_argument("--agent", default="",
-                   help="REQUIRED: the persona that crashed (dedupe key)")
+                   help="REQUIRED: the bug description (in crash mode, the full RCA: symptom, occurrences, last activity, suspected cause)")
+    p.add_argument("--agent", default=None,
+                   help="optional; presence (non-empty) selects crash mode — the persona that "
+                        "crashed, used as the dedupe key. An explicitly empty/whitespace value "
+                        "is refused rather than silently falling back to free-form mode")
     p.add_argument("--repo", default="")
     p.set_defaults(func=cmd_file_bug)
 
