@@ -653,3 +653,69 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
     expect(m.escalated).toBe(0);
   });
 });
+
+describe("TEAM-3972 — an escalated ticket is HELD for the human in every status", () => {
+  // deadSessionRetries spent + task status "error" = the escalation's own marks.
+  const escalated = (extra = {}) => workflow({
+    deadSessionRetries: { "TEAM-2": 1 },
+    agentTasks: { "TEAM-2": { id: "t2", agentId: "dev", ticketId: "TEAM-2", status: "error", startedAt: STALE_STARTED } },
+    ...extra,
+  });
+
+  for (const status of ["in_progress", "todo", "ready", "blocked", "in_review"]) {
+    it(`${status} candidate is held: zero steal, zero redispatch, zero re-escalation`, async () => {
+      const s = makeSweep({
+        workflows: [escalated()],
+        siblings: [
+          { ticketId: DONE, status: "done", type: "task" },
+          { ticketId: "TEAM-2", status, assignee: "dev", type: "task", blockedBy: [DONE], updatedAt: STALE_STARTED },
+        ],
+        store: { incrementDeadSessionRetry: vi.fn(), setTaskStatus: vi.fn(), appendNotification: vi.fn() },
+      });
+      const cap = captureMetrics();
+
+      const m = await s.runSweep("enforce");
+      const records = cap.records();
+      cap.restore();
+
+      expect(m.candidates).toBe(1);
+      expect(m.escalationHeld).toBe(1);
+      expect(records[0].ReconcileEscalationHeld).toBe(1);
+      expect(s.lease.stealClaim).not.toHaveBeenCalled();
+      expect(s.redispatch).not.toHaveBeenCalled();
+      expect(s.reawakenGate).not.toHaveBeenCalled();
+      expect(s.publishEvent).not.toHaveBeenCalled();
+      expect(m.redispatched).toBe(0);
+      expect(m.escalated).toBe(0);
+      // The hold is not a liveness claim — it must not be counted as "agent alive".
+      expect(m.skippedLiveLease).toBe(0);
+    });
+  }
+
+  it("releases as soon as a human re-drive re-claims the ticket (status leaves error)", async () => {
+    const s = makeSweep({
+      workflows: [escalated({
+        agentTasks: { "TEAM-2": { id: "t2", agentId: "dev", ticketId: "TEAM-2", status: "running", startedAt: STALE_STARTED } },
+      })],
+      siblings: inProgressStale,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.escalationHeld).toBe(0);
+    expect(m.redispatched).toBe(1);
+  });
+
+  it("a spent budget alone (task still running) does NOT hold — only the error status does", async () => {
+    const s = makeSweep({
+      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
+      siblings: inProgressStale,
+      store: { incrementDeadSessionRetry: vi.fn(), setTaskStatus: vi.fn(async () => {}), appendNotification: vi.fn(async () => {}) },
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.escalationHeld).toBe(0);
+    expect(m.escalated).toBe(1); // second death → escalate, unchanged (TEAM-3969)
+  });
+});

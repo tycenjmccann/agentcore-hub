@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { getWorkflowFromDynamo, getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
+import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
+import { withDefaultDecision } from "@/lib/workflow/gate-decision";
 
 export const dynamic = "force-dynamic";
 
@@ -58,8 +60,9 @@ export async function POST(
   // In jira mode tickets live in Jira (no DynamoDB tickets table). The ticket
   // Lambda validates transition legality against Jira's live transitions, so we
   // skip the DDB pre-check here. In dynamodb mode we still validate locally.
+  let tickets: Record<string, unknown>[] = [];
   if (TICKET_PROVIDER !== "jira") {
-    const tickets = await getTicketsForWorkflowFromDynamo(params.id);
+    tickets = (await getTicketsForWorkflowFromDynamo(params.id)) as Record<string, unknown>[];
     const ticket = tickets.find((t) => (t as Record<string, unknown>).ticketId === ticketId);
     if (!ticket) {
       return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
@@ -82,6 +85,28 @@ export async function POST(
     }
   }
 
+  // TEAM-3971: only an approve (→ done) needs the gate's title, and only to
+  // recognise an escalation gate. Best-effort — a lookup failure must never
+  // block a human's approval.
+  let decisionDefaulted: string | null = null;
+  let finalComment: string | undefined = comment;
+  if (targetStatus === "done") {
+    try {
+      if (TICKET_PROVIDER === "jira") {
+        tickets = (await getTicketsForWorkflowFromJira(params.id)) as unknown as Record<string, unknown>[];
+      }
+      const gate = tickets.find((t) => t.ticketId === ticketId);
+      ({ comment: finalComment, decisionDefaulted } = withDefaultDecision(
+        comment, targetStatus, gate ? String(gate.title || "") : undefined
+      ));
+      if (decisionDefaulted) {
+        console.log(`[transition] ${ticketId}: escalation gate approved without a DECISION line — recorded as DECISION: ${decisionDefaulted}`);
+      }
+    } catch (err) {
+      console.warn(`[transition] ${ticketId}: escalation-gate lookup failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
   // Invoke the agentcore-hub-tickets Lambda
   const lambda = new LambdaClient({ region: process.env.AWS_REGION || "us-east-1" });
 
@@ -90,7 +115,7 @@ export async function POST(
     parameters: {
       ticket_id: ticketId,
       transition_id: targetStatus,
-      reason: comment || "Manual override from console",
+      reason: finalComment || "Manual override from console",
     },
   };
 
@@ -113,7 +138,10 @@ export async function POST(
       );
     }
 
-    return NextResponse.json({ success: true, ticketId, newStatus: targetStatus });
+    return NextResponse.json({
+      success: true, ticketId, newStatus: targetStatus,
+      ...(decisionDefaulted ? { decisionDefaulted } : {}),
+    });
   } catch (err: unknown) {
     const errorMessage = err instanceof Error ? err.message : "Unknown error";
     return NextResponse.json(

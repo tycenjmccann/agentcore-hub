@@ -675,6 +675,7 @@ export async function handleTicketDoneUnified(ticketId) {
   // a pre-claim snapshot (double invocation).
   await markTaskComplete(workflow, ticketId, assignee);
   await ackApprovedGateNotification(workflow, ticketId, assignee);
+  await wakeReleaseManagerAfterEscalationGate(workflow, ticketId, ticket.title, assignee, parentId);
 
   // Unblock dependents via the shared cascade (TEAM-3618 D3). The helper owns
   // the blocker predicate, provider branching, and orchestrator.unblocked
@@ -704,6 +705,64 @@ export async function handleTicketDoneUnified(ticketId) {
 /** Whether an assignee refers to a human reviewer (review gate) vs an agent. */
 function isHumanAssignee(assignee) {
   return typeof assignee === "string" && assignee.startsWith("human:");
+}
+
+// Release-manager convergence escalation gate. The summary shape is fixed by
+// blueprints/release-manager.md ("Escalation gate ticket", step c); the
+// transition API and the Telegram bot match the same shape.
+const ESCALATION_GATE_TITLE = /^Escalation #\d+: ship-review not converging/i;
+const RELEASE_MANAGER_AGENT = "agentcore_hub_release_manager";
+
+/**
+ * TEAM-3971 — a human just Done'd a release-manager escalation gate. Nothing
+ * depends on that gate (its blocked_by is deliberately empty), so until now the
+ * parked release manager sat until a human hand-nudged it with force — the
+ * "I approved and it still just sits there" class. Wake it deterministically:
+ * the human decided, so the RM's dead-session retry budget resets (its next
+ * silence is a new episode); its parked claim is taken over unless the lease is
+ * live (a live RM reads the DECISION itself); then it is re-driven through the
+ * normal path — Jira: hop the ticket to Ready so the ready webhook dispatches
+ * via the claim CAS (the steal flipped the task to ready, so the claim wins);
+ * DDB: re-dispatch directly. Best-effort: any failure logs and leaves the
+ * reconcile sweep as the backstop.
+ */
+async function wakeReleaseManagerAfterEscalationGate(workflow, gateTicketId, gateTitle, assignee, parentId) {
+  if (!isHumanAssignee(assignee)) return false;
+  if (!ESCALATION_GATE_TITLE.test(gateTitle || "")) return false;
+  try {
+    const siblings = await getChildTickets(parentId);
+    const rm = (siblings || []).find(
+      (s) => s.assignee === RELEASE_MANAGER_AGENT && !["done", "cancelled"].includes(s.status)
+    );
+    if (!rm) {
+      console.log(`[orchestrator] ${gateTicketId}: escalation gate done but no open release-manager ticket under ${parentId} — nothing to wake`);
+      return false;
+    }
+    await store.resetDeadSessionRetry(workflow.id, rm.ticketId);
+    const task = workflow.agentTasks?.[rm.ticketId];
+    const lastActivity = await lastAgentActivity(ddb, EVENTS_TABLE, workflow.id, rm.assignee, rm.ticketId);
+    if (task && isLeaseLive(task, lastActivity, Date.now())) {
+      console.log(`[orchestrator] ${gateTicketId}: escalation gate done — release manager ${rm.ticketId} lease is live; it reads the DECISION itself`);
+      return false;
+    }
+    if (task?.startedAt) {
+      await stealClaim(ddb, WORKFLOWS_TABLE, workflow.id, rm.ticketId, task.startedAt);
+    }
+    await publishEvent(rm.ticketId, "orchestrator.escalation_decided", {
+      workflowId: workflow.id, gateTicketId, ticketId: rm.ticketId, agentId: rm.assignee,
+    });
+    let woke = false;
+    if (TICKET_PROVIDER === "jira") {
+      woke = (await jiraTransition(rm.ticketId, "Ready"))
+        || ((await jiraTransition(rm.ticketId, "To Do")) && (await jiraTransition(rm.ticketId, "Ready")));
+    }
+    if (!woke) woke = await redispatchTicket(workflow, rm);
+    console.log(`[orchestrator] ${gateTicketId}: escalation gate done — release manager ${rm.ticketId} ${woke ? "re-driven" : "NOT re-driven (reconcile sweep is the backstop)"}`);
+    return woke;
+  } catch (err) {
+    console.warn(`[orchestrator] ${gateTicketId}: release-manager wake failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
 }
 
 /**
@@ -2145,6 +2204,7 @@ export async function handleTicketDone(ticketId, image) {
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);
   await ackApprovedGateNotification(workflow, ticketId, assignee);
+  await wakeReleaseManagerAfterEscalationGate(workflow, ticketId, unwrapDdbValue(image.title), assignee, parentId);
 
   // Unblock dependents via the shared cascade (TEAM-3618 D3). Same helper as the
   // Jira-webhook twin (handleTicketDoneUnified) — this path previously matched
