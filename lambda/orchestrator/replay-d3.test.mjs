@@ -247,17 +247,19 @@ describe("AC-D3.2 replay — an out-of-diff rejection with DERIVED findings gate
 
     expect(reopenUpdates()).toHaveLength(1);          // no new reopen
     expect(h.state.ledger.rounds).toHaveLength(1);    // no round recorded — the cap did not advance
-    const advisory = eventsOfType("review.rejected").find((e) => e.detail?.noInDiffFindings);
-    expect(advisory).toBeTruthy();
-    expect(advisory.detail.reopened).toEqual([]);
-    // TEAM-3756 F3b: the non-gating rejection resolves the gate instead of
-    // stranding it in blocked — approved-with-known-findings, via the same done
-    // transition a human approval makes.
+    // TEAM-3790: the findings were DERIVED from the comment's JSON block —
+    // prose provenance. Prose-derived findings may suppress the reopen (diff
+    // scope), but they may NOT auto-approve the gate: the gate is PARKED for
+    // the human instead (a misparse must never close a gate someone tried to
+    // hold open). No done transition, no approved-with-advisory.
     const gateDone = h.state.updates.filter(
       (u) => u.Key.ticketId === GATE_ID && u.ExpressionAttributeValues?.[":s"] === "done"
     );
-    expect(gateDone).toHaveLength(1);
-    expect(eventsOfType("review.approved_with_advisory")).toHaveLength(1);
+    expect(gateDone).toHaveLength(0);
+    expect(eventsOfType("review.approved_with_advisory")).toHaveLength(0);
+    const parked = eventsOfType("review.parked_advisory");
+    expect(parked).toHaveLength(1);
+    expect(parked[0].detail.reason).toBe("prose_derived_findings");
 
     // Round 3: back in-diff — the loop resumes exactly where it left off (round 2,
     // not 3: the advisory cycle left no trace in the count).
