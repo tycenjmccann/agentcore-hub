@@ -76,6 +76,8 @@ const h = vi.hoisted(() => ({
     // TEAM-3721 merge-gate suite: a per-test workflows.json override served in
     // PREFERENCE to s3WorkflowsConfig (loadShip seeds it; beforeEach resets null).
     workflowsConfig: /** @type {any} */ (null),
+    s3Completions: /** @type {Record<string, any>} */ ({}), // completions/<ticket>.json records
+    notifications: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -119,7 +121,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
       const key = cmd?.input?.Key;
       const body = key === "config/agents.json" ? h.state.s3AgentsConfig
         : key === "config/workflows.json" ? (h.state.workflowsConfig || h.state.s3WorkflowsConfig)
-        : null;
+        : (key && h.state.s3Completions[key]) || null;
       if (!body) throw new Error("NoSuchKey");
       return { Body: { transformToString: async () => JSON.stringify(body) } };
     }
@@ -158,7 +160,13 @@ vi.mock("./workflow-store.mjs", () => ({
     h.state.terminalClaims.push({ id, outcome, ts, reason: reason ?? null });
     return h.state.terminalClaimWins;
   }),
-  mergeTaskMetadata: vi.fn(async () => {}),
+  // Apply the merge onto the fresh snapshot so a re-read after a harvest/stamp
+  // sees it — exactly what the real store does (TEAM-3985/3976 tests rely on it).
+  mergeTaskMetadata: vi.fn(async (id, tid, fields) => {
+    const tasks = h.state.freshWorkflow?.agentTasks;
+    if (tasks) tasks[tid] = { ...(tasks[tid] || { ticketId: tid }), ...fields };
+  }),
+  appendNotification: vi.fn(async (id, n) => { h.state.notifications.push({ id, n }); }),
 }));
 
 // Set before importing index.mjs: the roster/def loaders early-return to the
@@ -715,5 +723,189 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     await completeWorkflow({ ...SHIP_WF });
     expect(h.state.storeCompletions.length).toBe(1);
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * TEAM-3985 — evidence harvested late. Agents routinely Done their ticket before
+ * report_completion writes completions/<ticket>.json, so the done-cascade
+ * harvest finds nothing and the run stranded forever with a silent
+ * CompletionRejectedMissingEvidence (prod: sffzti/TEAM-3790, Done 19:37Z,
+ * record 19:50Z). completeWorkflow must re-harvest before rejecting, and when
+ * still missing, escalate ONCE instead of staying silent.
+ */
+describe("completeWorkflow — late evidence is re-harvested; a real gap escalates once (TEAM-3985)", () => {
+  const CHILDREN = [
+    { ticketId: "D-1", assignee: "agentcore_hub_backend_dev", type: "task", status: "done", phase: "development" },
+    { ticketId: "D-2", assignee: "agentcore_hub_qa_verifier", type: "task", status: "done", phase: "verification" },
+    { ticketId: "D-3", assignee: "agentcore_hub_ci_agent", type: "task", status: "done", phase: "review" },
+    { ticketId: "D-4", assignee: "agentcore_hub_release_manager", type: "task", status: "done", phase: "ship" },
+  ];
+  const TASKS_MISSING_D1 = () => ({
+    "D-1": { ticketId: "D-1", agentId: "agentcore_hub_backend_dev", status: "complete" }, // no output/artifact
+    "D-2": { ticketId: "D-2", output: "verified" },
+    "D-3": { ticketId: "D-3", output: "ci green" },
+    "D-4": { ticketId: "D-4", output: "shipped", mergeCommit: "9f1c2ab" },
+  });
+
+  beforeEach(async () => {
+    h.state.s3Completions = {};
+    h.state.notifications.length = 0;
+    h.state.storeCompletions.length = 0;
+    h.state.terminalClaims.length = 0;
+    delete process.env.GITHUB_PAT;
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    await loadWithShipDef();
+  });
+  afterEach(() => { delete process.env.ARTIFACT_BUCKET; });
+
+  it("record landed after the ticket went Done → re-harvested at completion time, run completes", async () => {
+    h.state.snapshots = [CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: TASKS_MISSING_D1() };
+    h.state.s3Completions["completions/D-1.json"] = {
+      ticket_id: "D-1", summary: "implemented the endpoint", branch: "feature/EPIC-1-x",
+      commit_sha: "c0ffee", pr_url: "https://github.com/o/r/pull/7",
+    };
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await completeWorkflow({ ...WF });
+
+    expect(h.state.storeCompletions).toHaveLength(1);
+    expect(h.state.freshWorkflow.agentTasks["D-1"].output).toBe("implemented the endpoint");
+    expect(h.state.freshWorkflow.agentTasks["D-1"].prUrl).toBe("https://github.com/o/r/pull/7");
+    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(false);
+    expect(h.state.notifications).toHaveLength(0);
+    error.mockRestore();
+  });
+
+  it("no record anywhere → still rejected, but a manager_escalation is appended exactly once", async () => {
+    h.state.snapshots = [CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: TASKS_MISSING_D1(), humanNotifications: [] };
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await completeWorkflow({ ...WF });
+    // A second pass (another re-Done kick) with the escalation still open: no duplicate.
+    h.state.freshWorkflow.humanNotifications = h.state.notifications.map((x) => x.n);
+    await completeWorkflow({ ...WF });
+
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(error.mock.calls.filter((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toHaveLength(2);
+    expect(h.state.notifications).toHaveLength(1);
+    const n = h.state.notifications[0].n;
+    expect(n.type).toBe("manager_escalation");
+    expect(n.id).toBe("notif_completion_evidence_wf_1");
+    expect(n.details).toContain("D-1@development");
+    expect(n.acknowledged).toBe(false);
+    error.mockRestore();
+  });
+});
+
+/**
+ * TEAM-3986 — GitHub's merge is the ship proof. The release manager's
+ * report_completion tool has no outcome/merge_commit field, so self-report can
+ * never read "shipped" and every merged run closed static-ci-only. When the
+ * merge-verify probe PROVES the merge, the ship tasks are stamped with the merge
+ * commit and the run completes; unknown → self-report still decides; a recorded
+ * BLOCK is never overwritten.
+ */
+describe("completeWorkflow — GitHub merge proof drives the ship verdict (TEAM-3986)", () => {
+  const SHIP_WF = {
+    id: "wf_1", phase: "verification", workflowDefId: "software-delivery", epicId: "EPIC-1", input: { title: "t" },
+    featureBranch: "feature/EPIC-1-fix",
+    repoConfig: { layout: "multi-repo", repos: [{ platform: "backend", url: "https://github.com/o/r", defaultBranch: "main" }] },
+  };
+  const CHILDREN = [
+    { ticketId: "S-1", assignee: "agentcore_hub_backend_dev", type: "task", status: "done", phase: "development" },
+    { ticketId: "S-2", assignee: "agentcore_hub_qa_verifier", type: "task", status: "done", phase: "verification" },
+    { ticketId: "S-3", assignee: "agentcore_hub_ci_agent", type: "task", status: "done", phase: "review" },
+    { ticketId: "S-4", assignee: "agentcore_hub_release_manager", type: "task", status: "done", phase: "ship" },
+  ];
+  // What the release manager's report_completion actually yields today: output +
+  // commitSha (branch HEAD) + prUrl — and NO mergeCommit / outcome.
+  const SELF_REPORT_ONLY = () => ({
+    "S-1": { ticketId: "S-1", output: "built" },
+    "S-2": { ticketId: "S-2", output: "verified" },
+    "S-3": { ticketId: "S-3", output: "ci green" },
+    "S-4": { ticketId: "S-4", output: "DEPLOY SUCCEEDED", commitSha: "80a64ae", prUrl: "https://github.com/o/r/pull/327" },
+  });
+  const mockGitHub = ({ prs = [], compareStatus = "ahead", aheadBy = 3, fail = false } = {}) => {
+    global.fetch = vi.fn(async (url) => {
+      if (fail) throw new Error("github down");
+      const u = String(url);
+      const body = u.includes("/pulls?") ? prs : u.includes("/compare/") ? { status: compareStatus, ahead_by: aheadBy } : {};
+      return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+    });
+  };
+  let realFetch;
+  beforeEach(async () => {
+    realFetch = global.fetch;
+    h.state.storeCompletions.length = 0;
+    h.state.terminalClaims.length = 0;
+    h.state.notifications.length = 0;
+    process.env.GITHUB_PAT = "ghp_test";
+    delete process.env.SHIP_MERGE_VERIFY;
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    await loadWithShipDef();
+  });
+  afterEach(() => {
+    global.fetch = realFetch;
+    delete process.env.GITHUB_PAT;
+    delete process.env.ARTIFACT_BUCKET;
+  });
+
+  it("merged PR on GitHub → ship task stamped with the merge commit, run completes (not static-ci-only)", async () => {
+    h.state.snapshots = [CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SELF_REPORT_ONLY() };
+    mockGitHub({ prs: [{ merged_at: "2026-09-04T22:00:00Z", merge_commit_sha: "c092e98", html_url: "https://github.com/o/r/pull/327" }] });
+
+    await completeWorkflow({ ...SHIP_WF });
+
+    expect(h.state.terminalClaims).toHaveLength(0);
+    expect(h.state.storeCompletions).toHaveLength(1);
+    expect(h.state.freshWorkflow.agentTasks["S-4"].mergeCommit).toBe("c092e98");
+    expect(h.state.freshWorkflow.agentTasks["S-4"].mergeVerifiedBy).toBe("github");
+  });
+
+  it("GitHub unknown (API error) → no proof; self-report alone still closes static-ci-only", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SELF_REPORT_ONLY() };
+    mockGitHub({ fail: true });
+
+    await completeWorkflow({ ...SHIP_WF });
+
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.terminalClaims.map((c) => c.outcome)).toEqual(["static-ci-only"]);
+    error.mockRestore();
+  });
+
+  it("provably unmerged → still rejected before any verdict (TEAM-3721 unchanged)", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SELF_REPORT_ONLY() };
+    mockGitHub({ prs: [{ merged_at: null }], compareStatus: "ahead", aheadBy: 2 });
+
+    await completeWorkflow({ ...SHIP_WF });
+
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.terminalClaims).toHaveLength(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedUnmergedBranch"))).toBe(true);
+    error.mockRestore();
+  });
+
+  it("a recorded BLOCK outcome is never overwritten by a merge proof", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [CHILDREN];
+    const tasks = SELF_REPORT_ONLY();
+    tasks["S-4"] = { ticketId: "S-4", output: "BLOCKED", outcome: "deploy-blocked", blockReason: "smoke failed" };
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: tasks };
+    mockGitHub({ prs: [{ merged_at: "2026-09-04T22:00:00Z", merge_commit_sha: "c092e98" }] });
+
+    await completeWorkflow({ ...SHIP_WF });
+
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.terminalClaims.map((c) => c.outcome)).toEqual(["deploy-blocked"]);
+    expect(h.state.freshWorkflow.agentTasks["S-4"].mergeCommit).toBeUndefined();
+    error.mockRestore();
   });
 });

@@ -683,6 +683,12 @@ export async function handleTicketDoneUnified(ticketId) {
     // only lever silently does nothing. Both calls below are idempotent.
     await ackApprovedGateNotification(workflow, ticketId, assignee);
     await wakeReleaseManagerAfterEscalationGate(workflow, ticketId, ticket.title, assignee, parentId);
+    // TEAM-3985 — re-Done'ing any ticket is the human's deterministic "re-check
+    // completion" lever (evidence that landed late, gate opt-out flipped).
+    // Idempotent: completeWorkflow returns at once on a terminal phase.
+    if (await isWorkflowComplete(parentId, workflow, assignee)) {
+      await completeWorkflow(workflow);
+    }
     return;
   }
 
@@ -2479,6 +2485,37 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
 }
 
 // Exported solely so completion-gates.test.mjs can drive the evidence gate.
+/**
+ * TEAM-3985 — one manager_escalation per stranded run: "all tickets Done, but
+ * completion is refused for missing evidence". Idempotent on notification id;
+ * a human re-driving any ticket (re-Done) re-runs the check and, once the
+ * evidence is in, the run completes and the escalation is history.
+ */
+async function notifyCompletionBlockedOnce(workflow, offenders) {
+  const id = `notif_completion_evidence_${workflow.id}`;
+  const list = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
+  if (list.some((n) => n.id === id && !n.acknowledged)) return false;
+  try {
+    await publishEvent(workflow.epicId, "workflow.completion_blocked", {
+      workflowId: workflow.id, reason: "missing_evidence", offenders,
+    });
+    await store.appendNotification(workflow.id, {
+      id,
+      type: "manager_escalation",
+      title: "Run cannot complete: missing completion evidence",
+      details: `Every ticket is Done but the completion evidence gate refused to close the run — no output/artifact recorded for ${offenders}. The agent probably moved its ticket to Done before report_completion wrote completions/<ticket>.json. If the record exists now, re-Done any ticket to re-check; otherwise add the evidence (or set COMPLETION_EVIDENCE_REQUIRED=off) and re-check.`,
+      reviewer: "completion-gate",
+      timestamp: new Date().toISOString(),
+      acknowledged: false,
+    });
+    console.log(`[orchestrator] ${workflow.id}: completion blocked on evidence — manager_escalation appended (${offenders})`);
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
+}
+
 export async function completeWorkflow(workflow) {
   if (workflow.phase === "complete") return;
 
@@ -2497,19 +2534,36 @@ export async function completeWorkflow(workflow) {
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     if (requiredPhases.length > 0) {
       const children = await getChildTickets(workflow.epicId);
-      const freshWf = await store.getWorkflow(workflow.id);
-      const missing = missingEvidenceTickets(
-        children,
-        freshWf?.agentTasks || workflow.agentTasks || {},
-        requiredPhases,
-        { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase }
+      const evidenceOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
+      let freshWf = await store.getWorkflow(workflow.id);
+      let missing = missingEvidenceTickets(
+        children, freshWf?.agentTasks || workflow.agentTasks || {}, requiredPhases, evidenceOpts
       );
+      if (missing.length > 0) {
+        // TEAM-3985 — the done-cascade harvest is a single point-in-time read,
+        // and agents routinely transition their ticket BEFORE report_completion
+        // lands completions/{ticketId}.json (sffzti/TEAM-3790: Done 19:37Z, record
+        // 19:50Z). The record exists by the time the LAST ticket closes, so
+        // re-harvest the offenders here and re-evaluate before rejecting.
+        for (const m of missing) {
+          try { await harvestCompletionEvidence(freshWf || workflow, m.ticketId); }
+          catch (err) { console.warn(`[orchestrator] evidence re-harvest failed for ${m.ticketId}: ${err?.message || err}`); }
+        }
+        freshWf = await store.getWorkflow(workflow.id);
+        missing = missingEvidenceTickets(
+          children, freshWf?.agentTasks || workflow.agentTasks || {}, requiredPhases, evidenceOpts
+        );
+      }
       if (missing.length > 0) {
         const offenders = missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ");
         if (COMPLETION_EVIDENCE_REQUIRED) {
           console.error(
             `[orchestrator] CompletionRejectedMissingEvidence ${workflow.id}: ${offenders}`
           );
+          // A silent rejection strands the run with no live task, no gate and no
+          // notification — nothing ever revisits it. Escalate ONCE so a human (or
+          // the WM) sees why "every ticket is Done but the run never finished".
+          await notifyCompletionBlockedOnce(freshWf || workflow, offenders);
           return;
         }
         console.warn(
@@ -2544,19 +2598,69 @@ export async function completeWorkflow(workflow) {
   // Reuses COMPLETION_EVIDENCE_REQUIRED (fail-closed: enforce by default; a
   // fail-open here would defeat the whole deliverable). The explicit opt-out
   // COMPLETION_EVIDENCE_REQUIRED=off|false|0 only shadow-logs and proceeds.
+  // TEAM-3986 — the release manager's report_completion tool has no
+  // outcome/merge_commit field, so the self-reported ship verdict can NEVER read
+  // "shipped" (commitSha is deliberately not proof: it is the branch HEAD). Every
+  // merged-and-deployed run therefore closed as static-ci-only. GitHub is the
+  // ground truth the TEAM-3721 gate already consults — consult it FIRST, and when
+  // it proves the merge, stamp the ship tasks with the merge commit so the
+  // verdict below (and the dashboard) tell the truth. Unknown → self-report decides.
+  const shipMergeVerify = !["off", "false", "0"].includes(
+    String(process.env.SHIP_MERGE_VERIFY || "").trim().toLowerCase()
+  );
+  const mergeVerifyConfigured = Boolean(
+    shipMergeVerify && defHasShipPhase(workflow) && workflow.featureBranch &&
+    workflow.repoConfig && process.env.GITHUB_PAT
+  );
+  let mergeProof = null;
+  if (mergeVerifyConfigured) {
+    const probe = await featureBranchMergeProbe(workflow);
+    if (probe.merged === false) {
+      console.error(
+        `[orchestrator] CompletionRejectedUnmergedBranch ${workflow.id}: ` +
+          `feature branch ${workflow.featureBranch} is not merged into the base ` +
+          `(${probe.reason}). CD did not land the merge — leaving run open.`
+      );
+      await publishEvent(workflow.epicId, "workflow.cd_unmerged", {
+        workflowId: workflow.id,
+        featureBranch: workflow.featureBranch,
+        reason: probe.reason,
+      });
+      return;
+    }
+    if (probe.merged === true) mergeProof = probe;
+  }
+
   try {
     const wfDef = getWorkflowDef(workflow?.workflowDefId);
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     const shipPhases = requiredPhases.filter((p) => SHIP_PHASES.has(p));
     if (shipPhases.length > 0) {
       const children = await getChildTickets(workflow.epicId);
-      const freshWf = await store.getWorkflow(workflow.id);
-      const verdict = evaluateShipVerdict(
-        children,
-        freshWf?.agentTasks || workflow.agentTasks || {},
-        shipPhases,
-        { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase }
+      let freshWf = await store.getWorkflow(workflow.id);
+      const shipOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
+      let verdict = evaluateShipVerdict(
+        children, freshWf?.agentTasks || workflow.agentTasks || {}, shipPhases, shipOpts
       );
+      if (verdict.required && !verdict.shipped && mergeProof) {
+        // Stamp GitHub's proof onto ship tasks that self-reported nothing. A
+        // recorded BLOCK outcome is never overwritten — a block is a block.
+        for (const o of verdict.offenders) {
+          if (o.verdict && o.verdict !== "none") continue;
+          const fields = {
+            mergeCommit: mergeProof.mergeCommit || `merged:${workflow.featureBranch}`,
+            mergeVerifiedBy: "github",
+          };
+          if (mergeProof.prUrl && !freshWf?.agentTasks?.[o.ticketId]?.prUrl) fields.prUrl = mergeProof.prUrl;
+          try { await store.mergeTaskMetadata(workflow.id, o.ticketId, fields); }
+          catch (err) { console.warn(`[orchestrator] merge-proof stamp failed for ${o.ticketId}: ${err?.message || err}`); }
+        }
+        console.log(`[orchestrator] ${workflow.id}: GitHub proves ${workflow.featureBranch} merged (${mergeProof.mergeCommit || "compare"}) — ship verdict taken from ground truth`);
+        freshWf = await store.getWorkflow(workflow.id);
+        verdict = evaluateShipVerdict(
+          children, freshWf?.agentTasks || workflow.agentTasks || {}, shipPhases, shipOpts
+        );
+      }
       if (verdict.required && !verdict.shipped) {
         const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
         if (COMPLETION_EVIDENCE_REQUIRED) {
@@ -2584,37 +2688,6 @@ export async function completeWorkflow(workflow) {
   // ticket / WM surfaces it) instead of lying. Best-effort: a GitHub/API failure
   // (or no PAT) never blocks a legitimate completion — it only tightens when it
   // can PROVE the branch is unmerged. Opt-out: SHIP_MERGE_VERIFY=off.
-  const shipMergeVerify = !["off", "false", "0"].includes(
-    String(process.env.SHIP_MERGE_VERIFY || "").trim().toLowerCase()
-  );
-  if (
-    shipMergeVerify &&
-    defHasShipPhase(workflow) &&
-    workflow.featureBranch &&
-    workflow.repoConfig &&
-    process.env.GITHUB_PAT
-  ) {
-    const unmerged = await featureBranchUnmerged(workflow);
-    if (unmerged) {
-      console.error(
-        `[orchestrator] CompletionRejectedUnmergedBranch ${workflow.id}: ` +
-          `feature branch ${workflow.featureBranch} is not merged into the base ` +
-          `(${unmerged}). CD did not land the merge — leaving run open.`
-      );
-      await publishEvent(workflow.epicId, "workflow.cd_unmerged", {
-        workflowId: workflow.id,
-        featureBranch: workflow.featureBranch,
-        reason: unmerged,
-      });
-      return;
-    }
-  }
-
-  // Atomic completion claim FIRST — only the winner runs the side effects
-  // (PR creation, epic roll-up, the workflow.complete event). Previously the
-  // guard was the stale in-memory phase + a full-row put: two concurrent
-  // "last ticket done" cascades both passed it, double-firing the side
-  // effects and clobbering concurrent scoped writes (study P1).
   const completedAt = new Date().toISOString();
   const won = await store.completeWorkflow(workflow.id, completedAt);
   if (!won) {
@@ -3661,36 +3734,50 @@ function defHasShipPhase(workflow) {
 // commits); only if no PR is found do we fall back to the compare API. Any API
 // error returns "" (fail-open — never block a legitimate completion on a transient).
 async function featureBranchUnmerged(workflow) {
+  const probe = await featureBranchMergeProbe(workflow);
+  return probe.merged === false ? probe.reason : "";
+}
+
+/**
+ * TEAM-3986 — ONE GitHub probe, three honest answers:
+ *   { merged: true,  mergeCommit, prUrl }  a PR for the head has merged_at (its
+ *                                          merge_commit_sha is the ship proof), or
+ *                                          the branch is identical/behind the base;
+ *   { merged: false, reason }              compare says ahead/diverged — provably unmerged;
+ *   { merged: null }                       unknown status or API error — fail OPEN for
+ *                                          the unmerged gate, and NO proof for the
+ *                                          shipped verdict (self-report decides).
+ * The fail-open `featureBranchUnmerged` wrapper keeps the TEAM-3721 semantics.
+ */
+async function featureBranchMergeProbe(workflow) {
   try {
     const { owner, repo } = parseRepoUrl(workflow.repoConfig);
     const base = workflow.repoConfig.repos?.[0]?.defaultBranch || "main";
     const head = workflow.featureBranch;
 
-    // 1) Authoritative: any PR from this head that is merged?
     const prs = await githubApi(
       `/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(head)}&state=all&per_page=20`
     );
     if (Array.isArray(prs) && prs.length > 0) {
-      if (prs.some((p) => p.merged_at)) return ""; // merged — clean
-      // PRs exist but none merged. Still cross-check compare in case the branch
-      // was merged via a differently-headed PR / direct push.
+      const mergedPr = prs.find((p) => p.merged_at);
+      if (mergedPr) {
+        return { merged: true, mergeCommit: mergedPr.merge_commit_sha || "", prUrl: mergedPr.html_url || "" };
+      }
     }
 
-    // 2) Fallback: does base already contain the head? compare status
-    //    "identical" or "behind" means head is an ancestor of base (merged).
     const cmp = await githubApi(
       `/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`
     );
-    // status is head-relative to base: "behind"/"identical" → head ⊆ base (merged);
-    // "ahead"/"diverged" → head has commits not in base (not merged).
-    if (cmp?.status === "identical" || cmp?.status === "behind") return "";
-    if (cmp?.status === "ahead" || cmp?.status === "diverged") {
-      return `branch ${cmp.ahead_by} commit(s) ahead of ${base} (status=${cmp.status})`;
+    if (cmp?.status === "identical" || cmp?.status === "behind") {
+      return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: "" };
     }
-    return ""; // unknown status — fail open
+    if (cmp?.status === "ahead" || cmp?.status === "diverged") {
+      return { merged: false, reason: `branch ${cmp.ahead_by} commit(s) ahead of ${base} (status=${cmp.status})` };
+    }
+    return { merged: null }; // unknown status — fail open, no proof
   } catch (err) {
     console.warn(`[orchestrator] merge-verify skipped for ${workflow.id}: ${err.message}`);
-    return ""; // fail open
+    return { merged: null }; // fail open, no proof
   }
 }
 
