@@ -360,6 +360,12 @@ async function watchScan() {
 }
 
 /** Age in ms of the newest non-streaming event, or null if none. */
+// Not agent activity: streaming chunks are too chatty to mean anything alone,
+// and orchestrator.nudge is a housekeeping event the orchestrator publishes
+// itself (a live lease it chose not to steal) — counting either keeps a run
+// looking fresh no matter what the agent is doing (TEAM-3969).
+const NON_SIGNIFICANT_EVENT_TYPES = new Set(["agent.streaming", "orchestrator.nudge"]);
+
 async function lastSignificantEventAge(workflowId, now) {
   const page = await ddb.send(new QueryCommand({
     TableName: EVENTS_TABLE,
@@ -368,7 +374,7 @@ async function lastSignificantEventAge(workflowId, now) {
     ScanIndexForward: false,
     Limit: 25,
   }));
-  const item = (page.Items || []).find((e) => e.type !== "agent.streaming") || (page.Items || [])[0];
+  const item = (page.Items || []).find((e) => !NON_SIGNIFICANT_EVENT_TYPES.has(e.type)) || (page.Items || [])[0];
   if (!item?.timestamp) return null;
   return now - Date.parse(item.timestamp);
 }

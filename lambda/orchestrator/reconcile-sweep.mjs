@@ -130,6 +130,7 @@ export function createReconcileSweep(deps) {
       mode,
       candidates: 0,
       skippedLiveLease: 0,
+      escalated: 0,
       redispatched: 0,
       reviewReawakened: 0,
       wouldRedispatch: 0,
@@ -199,7 +200,7 @@ export function createReconcileSweep(deps) {
 
     m.durationMs = now() - startedAtMs;
     emitReconcileMetrics(m);
-    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
+    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} escalated=${m.escalated || 0} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
     return m;
   }
 
@@ -216,7 +217,11 @@ function tally(m, outcome) {
   switch (outcome) {
     case "nudged":
     case "would-nudge":
+    case "live":
       m.skippedLiveLease++;
+      break;
+    case "escalated":
+      m.escalated++;
       break;
     case "redispatched":
       m.redispatched++;
@@ -227,6 +232,7 @@ function tally(m, outcome) {
     case "would-redispatch":
     case "would-steal":
     case "would-review":
+    case "would-escalate":
       m.wouldRedispatch++;
       break;
     // steal-lost / redispatch-refused / review-noop → already recovered or a
@@ -254,6 +260,7 @@ export function emitReconcileMetrics(m) {
           { Name: "ReconcileSweepCandidates", Unit: "Count" },
           { Name: "ReconcileSkippedLiveLease", Unit: "Count" },
           { Name: "ReconcileRedispatch", Unit: "Count" },
+          { Name: "ReconcileEscalations", Unit: "Count" },
           { Name: "ReconcileReviewReawaken", Unit: "Count" },
           { Name: "ReconcileWouldRedispatch", Unit: "Count" },
           { Name: "ReconcileNoop", Unit: "Count" },
@@ -267,6 +274,7 @@ export function emitReconcileMetrics(m) {
     ReconcileSweepCandidates: m.candidates,
     ReconcileSkippedLiveLease: m.skippedLiveLease,
     ReconcileRedispatch: m.redispatched,
+    ReconcileEscalations: m.escalated || 0,
     ReconcileReviewReawaken: m.reviewReawakened,
     ReconcileWouldRedispatch: m.wouldRedispatch,
     ReconcileNoop: m.noop,
