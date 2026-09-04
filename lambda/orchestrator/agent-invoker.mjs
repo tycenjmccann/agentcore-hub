@@ -27,6 +27,7 @@ import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
+const TICKET_PROVIDER = (process.env.TICKET_PROVIDER || "dynamodb").trim().toLowerCase();
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 // Events table (FR-D4.3 liveness): the detector's lease.lastAgentActivity reads
 // THIS table for agent.streaming/agent.started heartbeats to decide slow-vs-dead.
@@ -101,17 +102,27 @@ export const handler = async (event) => {
     const error = err.message || String(err);
     console.error(`[agent-invoker] ${agentId} invocation failed:`, error);
 
-    // Only mark blocked if the Runtime REJECTED the request (connection refused, 4xx, etc.)
-    // If the agent was accepted but crashes later, the dead-session detector sweep handles it.
-    const failedTicketId = ticketId || await findTicketForAgent(workflowId, agentId);
-    if (failedTicketId) {
-      await ddb.send(new UpdateCommand({
-        TableName: TICKETS_TABLE,
-        Key: { ticketId: failedTicketId },
-        UpdateExpression: "SET #s = :s, #u = :u, #e = :e",
-        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt", "#e": "error" },
-        ExpressionAttributeValues: { ":s": "blocked", ":u": new Date().toISOString(), ":e": error },
-      }));
+    // The board write below is DDB-mode only: in Jira mode the tickets table
+    // does not exist, and the ResourceNotFoundException it threw here aborted the
+    // handler BEFORE agent.error was published — a failed invoke left a running
+    // claim, no error event and an unparked ticket (prod 23:12Z, TEAM-3989). The
+    // orchestrator parks Jira tickets itself off agent.error; this Lambda's one
+    // non-negotiable duty on failure is to PUBLISH it. If the agent was accepted
+    // but crashes later, the dead-session detector sweep handles it.
+    let failedTicketId = ticketId;
+    try {
+      failedTicketId = ticketId || await findTicketForAgent(workflowId, agentId);
+      if (failedTicketId && TICKET_PROVIDER !== "jira") {
+        await ddb.send(new UpdateCommand({
+          TableName: TICKETS_TABLE,
+          Key: { ticketId: failedTicketId },
+          UpdateExpression: "SET #s = :s, #u = :u, #e = :e",
+          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt", "#e": "error" },
+          ExpressionAttributeValues: { ":s": "blocked", ":u": new Date().toISOString(), ":e": error },
+        }));
+      }
+    } catch (boardErr) {
+      console.error(`[agent-invoker] ${agentId} could not park ${failedTicketId || "(unknown ticket)"} on the board (non-fatal): ${boardErr?.message || boardErr}`);
     }
 
     // Publish error event so UI knows immediately
