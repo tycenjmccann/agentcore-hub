@@ -44,7 +44,7 @@ to `feature` when neither is given). If no repo is given, ask or use the hub
 default — do not guess a repo for code-changing work.
 
 ```bash
-python3 /mnt/workspace/toolkit/intervene.py start --title "..." --description "..." [--def <workflowDefId> | --type feature|bug] --repo owner/name
+python3 /mnt/workspace/toolkit/intervene.py start --title "..." --description "..." [--def <workflowDefId> | --type feature|bug] [--repo owner/name]
 ```
 
 ## Report

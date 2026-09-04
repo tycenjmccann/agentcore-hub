@@ -126,6 +126,41 @@ def test_start_def_and_type_together_exits_before_any_post(rec):
     assert rec.posts == []
 
 
+@pytest.mark.parametrize("def_value", ["", "   "])
+def test_start_explicit_empty_def_refuses_no_post(rec, def_value):
+    # TEAM-3924 finding R1-F3 (P2): an explicit but empty/whitespace --def
+    # must NOT silently fall through to the --type/feature default (that
+    # would start the WRONG pipeline with no indication anything went wrong).
+    # It is a hard refusal instead, distinct from --def being absent entirely.
+    with pytest.raises(SystemExit) as exc:
+        run(["start", "--title", "T", "--def", def_value])
+    assert "REFUSED" in str(exc.value)
+    assert "--def" in str(exc.value)
+    assert rec.posts == []
+    assert rec.events == []
+
+
+def test_start_omitted_def_body_is_unchanged(rec):
+    # TEAM-3924 — omitted --def must keep today's behavior byte-identical
+    # (same golden body as test_start_no_flags_body_is_byte_identical_to_today).
+    run(["start", "--title", "My title"])
+    _, body = only_post(rec)
+    assert body == {
+        "title": "My title",
+        "description": "",
+        "workflowType": "feature",
+        "sources": [],
+    }
+
+
+def test_start_real_def_still_sends_workflow_def_id_no_type(rec):
+    # TEAM-3924 — a real --def value is unaffected by the empty-value guard.
+    run(["start", "--title", "T", "--def", "real-id"])
+    _, body = only_post(rec)
+    assert body["workflowDefId"] == "real-id"
+    assert "workflowType" not in body
+
+
 def test_start_empty_title_refuses_without_post(rec):
     # AC-1.5
     with pytest.raises(SystemExit) as exc:
