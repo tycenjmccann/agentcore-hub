@@ -46,13 +46,13 @@ The orchestration pipeline. Self-contained surface.
 - `src/app/tickets/` — ticket history
 
 **API routes**
-- `src/app/api/workflow/` — start/state/list/events/stream/cancel/retry/artifacts/webhook/agent-output/complete/nudge (plus definitions, tickets, watch, escalations, analysis under `[id]/`)
+- `src/app/api/workflow/` — start/state/list/events/stream/cancel/retry/artifacts/webhook/agent-output/complete/nudge/performance (plus definitions, tickets, watch, escalations, analysis under `[id]/`)
 - `src/app/api/jira/` — Jira webhook + metrics
 - `src/app/api/models/` — model picker (used only by the workflow intake form)
 
 **Frontend code**
 - `src/components/workflow/`
-- `src/lib/workflow/` (~30 modules: types, ticket providers (`ticket-provider*.ts`), board state, leases, ship-review, event transforms, jira-client, model-config, watchdog, …)
+- `src/lib/workflow/` (~30 modules: types, ticket providers (`ticket-provider*.ts`), board state, leases, ship-review, event transforms, jira-client, model-config, watchdog, performance (fleet performance card — see `docs/performance-card.md`), …)
 - `src/lib/pipeline-config.ts`
 
 **Lambdas** (`lambda/`)
@@ -60,6 +60,7 @@ The orchestration pipeline. Self-contained surface.
 - `agentcore-hub-jira` — Jira Cloud ticket tools (deployed when `TICKET_PROVIDER=jira`)
 - `agentcore-hub-tickets` — DynamoDB-backed ticket tools (deployed when `TICKET_PROVIDER=dynamodb`)
 - `workflow-output` — collects agent artifacts
+- `cost-report` — per-run performance card (cost / time / quality + anomaly bands) on `workflow.complete`; writes `workflows/{id}/shared/performance-card.{json,md}`, `performance/index.json`, `workflow.performance` events and `AgentCoreHub/Performance` CloudWatch metrics (`docs/performance-card.md`)
 
 **DynamoDB tables** (defaults in `deploy/config.sh`)
 - `agentcore-hub-workflows` (`WORKFLOWS_TABLE`)
@@ -68,13 +69,15 @@ The orchestration pipeline. Self-contained surface.
 
 **Deploy scripts**
 - `deploy/setup-tickets-lambda.mjs` and the orchestrator/Jira/output Lambdas
+- `lambda/cost-report/deploy.sh` (`--backfill` / `--rebuild-index`)
 
 **`agents.json` fields it reads**
 - `harnessName` — maps an agent to its AgentCore runtime via the `RUNTIME_ARN_<HARNESS_NAME_UPPER>` convention
 - `runtimeArn` — optional explicit ARN; when `null`, the orchestrator resolves the runtime from the env var above
 
 **Env vars** — `WORKFLOWS_TABLE`, `EVENTS_TABLE`, `TICKETS_TABLE`, `ARTIFACT_BUCKET`,
-`RUNTIME_ARN_<HARNESS>` (one per agent harness), `LAMBDA_ROLE_ARN`.
+`RUNTIME_ARN_<HARNESS>` (one per agent harness), `LAMBDA_ROLE_ARN`; performance card:
+`PERFORMANCE_INDEX_KEY` (default `performance/index.json`), `PUBLISH_CW_METRICS`, `INFRA_REGION`.
 
 ---
 
