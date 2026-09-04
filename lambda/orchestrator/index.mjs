@@ -657,6 +657,7 @@ export async function handleTicketDoneUnified(ticketId) {
   // concurrent invocation claims of just-unblocked siblings and can resurrect
   // a pre-claim snapshot (double invocation).
   await markTaskComplete(workflow, ticketId, assignee);
+  await ackApprovedGateNotification(workflow, ticketId, assignee);
 
   // Unblock dependents via the shared cascade (TEAM-3618 D3). The helper owns
   // the blocker predicate, provider branching, and orchestrator.unblocked
@@ -686,6 +687,29 @@ export async function handleTicketDoneUnified(ticketId) {
 /** Whether an assignee refers to a human reviewer (review gate) vs an agent. */
 function isHumanAssignee(assignee) {
   return typeof assignee === "string" && assignee.startsWith("human:");
+}
+
+/**
+ * A human review gate went "done" = the reviewer APPROVED. Close the gate's open
+ * review_needed notification. The watch scheduler (lambda/workflow-analyzer
+ * parkedOnHuman) skips any run with an open review_needed, and until TEAM-3966
+ * the approve path never acked — handleReviewRejection (the CHANGES-NEEDED twin)
+ * was the ONLY caller of store.ackNotifications — so every approved gate muted
+ * its run from the Workflow Manager for the rest of its life (RCA 2026-09-04:
+ * 4 of 5 live runs unwatched, all three review_needed gates already done).
+ * Best-effort: an ack failure must never block the done cascade.
+ */
+async function ackApprovedGateNotification(workflow, ticketId, assignee) {
+  if (!isHumanAssignee(assignee)) return;
+  try {
+    await store.ackNotifications(
+      workflow.id,
+      (n) => n.ticketId === ticketId && n.type === "review_needed"
+    );
+    console.log(`[orchestrator] ${ticketId}: human gate approved — review_needed acknowledged`);
+  } catch (err) {
+    console.warn(`[orchestrator] ${ticketId}: review_needed ack failed (non-fatal): ${err?.message || err}`);
+  }
 }
 
 /**
@@ -2031,6 +2055,7 @@ export async function handleTicketDone(ticketId, image) {
 
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);
+  await ackApprovedGateNotification(workflow, ticketId, assignee);
 
   // Unblock dependents via the shared cascade (TEAM-3618 D3). Same helper as the
   // Jira-webhook twin (handleTicketDoneUnified) — this path previously matched
