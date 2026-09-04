@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { addUsage } from "./index.mjs";
+import { addUsage, PERSONA_CHAT_SPAN_FILTER } from "./index.mjs";
 
 // Fixture: 10/50 USD per 1M in/out; cache-read at 0.1x input; cache-write
 // surcharge 1.25x (5m) / 2x (1h) / 1.25x (default) of the input rate.
@@ -105,4 +105,21 @@ test("plain rows (no cache fields) are unchanged by cache logic", () => {
   assert.equal(u.cacheReadInputTokens, 0);
   assert.equal(u.cacheWriteInputTokens, 0);
   assert.equal(u.cachedInputTokens, 0);
+});
+
+// TEAM-3964 / R1-F1: strands-agents >=1.53 names model spans exactly "chat"
+// (no " <model>" suffix — model id moved to the gen_ai.request.model
+// attribute). The persona query's filter must match that exact name, not just
+// the legacy "chat <model>" shape, or persona token/cache accounting on
+// current strands silently zeroes out.
+test("persona chat-span filter matches the exact strands >=1.53 span name", () => {
+  assert.match(PERSONA_CHAT_SPAN_FILTER, /name\s*=\s*"chat"/);
+});
+
+test("persona chat-span filter still matches the legacy 'chat <model>' shape", () => {
+  assert.match(PERSONA_CHAT_SPAN_FILTER, /name like \/\^chat \//);
+});
+
+test("persona chat-span filter still ORs in the api_request event-name branch", () => {
+  assert.match(PERSONA_CHAT_SPAN_FILTER, /`attributes\.event\.name` = "api_request"/);
 });
