@@ -909,3 +909,41 @@ describe("completeWorkflow — GitHub merge proof drives the ship verdict (TEAM-
     error.mockRestore();
   });
 });
+
+/**
+ * A run that is already terminal owes nothing. Cancel marks every open ticket
+ * Done and each Done re-enters completeWorkflow with a snapshot that still says
+ * "verification" — the fresh phase must win, or a cancelled run gets a
+ * completion attempt / ship close / evidence escalation (prod wf_bug_TEAM-3976).
+ */
+describe("completeWorkflow — an already-terminal run (fresh phase) is left alone", () => {
+  const CHILDREN = [
+    { ticketId: "C-1", assignee: "agentcore_hub_backend_dev", type: "task", status: "done", phase: "development" },
+    { ticketId: "C-4", assignee: "agentcore_hub_release_manager", type: "task", status: "done", phase: "ship" },
+  ];
+  beforeEach(async () => {
+    h.state.storeCompletions.length = 0;
+    h.state.terminalClaims.length = 0;
+    h.state.notifications.length = 0;
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    await loadWithShipDef();
+  });
+  afterEach(() => { delete process.env.ARTIFACT_BUCKET; });
+
+  for (const phase of ["cancelled", "deploy-blocked", "static-ci-only", "error"]) {
+    it(`fresh phase ${phase} with a stale in-flight snapshot → no completion, no close, no escalation`, async () => {
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      h.state.snapshots = [CHILDREN];
+      // Tasks carry NO evidence — every gate would fire if the check ran.
+      h.state.freshWorkflow = { id: "wf_1", phase, agentTasks: { "C-1": { ticketId: "C-1" }, "C-4": { ticketId: "C-4" } } };
+
+      await completeWorkflow({ ...WF, phase: "verification" });
+
+      expect(h.state.storeCompletions).toHaveLength(0);
+      expect(h.state.terminalClaims).toHaveLength(0);
+      expect(h.state.notifications).toHaveLength(0);
+      expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejected"))).toBe(false);
+      error.mockRestore();
+    });
+  }
+});

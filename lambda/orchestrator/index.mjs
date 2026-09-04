@@ -43,7 +43,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 
@@ -2518,6 +2518,27 @@ async function notifyCompletionBlockedOnce(workflow, offenders) {
 
 export async function completeWorkflow(workflow) {
   if (workflow.phase === "complete") return;
+  // TEAM-3987-adjacent hygiene: a run that is ALREADY terminal (cancelled,
+  // deploy-blocked, static-ci-only, error) owes nothing — but the caller's
+  // snapshot can predate the terminal write (cancel marks every open ticket Done,
+  // and each of those Done events re-enters here with a stale in-flight phase).
+  // Re-read the phase so a cancelled run never gets a completion attempt, a
+  // ship-verdict close, or a "completion blocked on evidence" escalation
+  // (prod 22:50Z: wf_bug_TEAM-3976 was cancelled and immediately escalated).
+  let livePhase = workflow.phase;
+  try {
+    livePhase = (await store.getWorkflow(workflow.id))?.phase ?? workflow.phase;
+  } catch (err) {
+    // Fail open on the read: the gates below have their own parity guards and
+    // must never be blocked by this hygiene check (route parity).
+    console.warn(`[orchestrator] ${workflow.id}: live-phase read failed, using snapshot phase: ${err?.message || err}`);
+  }
+  if (TERMINAL_WORKFLOW_PHASES.includes(livePhase)) {
+    if (livePhase !== workflow.phase) {
+      console.log(`[orchestrator] ${workflow.id}: completion skipped — run is already ${livePhase}`);
+    }
+    return;
+  }
 
   // TEAM-3686 Finding 3: deliverable-evidence gate — same semantics as the HTTP
   // complete route (TEAM-3619 D4a). Every done ticket in a completion-required
