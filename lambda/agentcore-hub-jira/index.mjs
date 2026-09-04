@@ -243,7 +243,17 @@ async function createTicket(params) {
       const normSummary = (s) =>
         (s || "").trim().replace(/\s+/g, " ").toLowerCase().replace(/\.$/, "");
       const wantSummary = normSummary(summary);
+      // A same-summary ticket that is already Done/Closed must NOT be treated as
+      // a duplicate. Escalation gates (e.g. "ship-review not converging") are
+      // recreated on purpose; if we returned the prior, resolved gate its stale
+      // "DECISION: continue" comment gets re-parsed and the round cap resets
+      // forever without a fresh human decision. A terminal status → create anew.
+      const isDoneStatus = (iss) => {
+        const internal = mapStatusToInternal(iss.fields?.status?.name || "");
+        return internal === "done" || internal === "closed";
+      };
       const dup = (existingSearch.issues || []).find((iss) => {
+        if (isDoneStatus(iss)) return false; // completed gate is not a live duplicate
         if (normSummary(iss.fields?.summary) !== wantSummary) return false; // summary ~ is fuzzy; require normalized-exact
         const labs = iss.fields?.labels || [];
         if (wantAgentLabel) return labs.includes(wantAgentLabel);
@@ -560,7 +570,13 @@ async function searchIssues(params) {
 }
 
 export async function getIssue(params) {
-  const { issue_key } = params;
+  // Accept both `issue_key` (agent-facing tool schema) and `ticket_id` (the
+  // gateway tool schema for Tickets___get_issue exposes ONLY ticket_id). Without
+  // this, a schema-conforming gateway-direct call hits Jira with `undefined`.
+  const issue_key = params.issue_key || params.ticket_id;
+  if (!issue_key) {
+    throw new Error("get_issue requires an issue_key (or ticket_id)");
+  }
   // Read only the fields mapIssue needs. Comments are NOT requested here: the
   // embedded `comment` container paginates ASCENDING, so on long threads the
   // NEWEST comments (where the release manager's DECISION lives) get cut off.
