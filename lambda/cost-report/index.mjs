@@ -928,13 +928,20 @@ async function runInsights(groups, query, startSec, endSec) {
   throw new Error("Insights query did not complete in 120s");
 }
 
+// R1-F1 (TEAM-3964): on strands-agents >=1.53 model spans are named exactly
+// "chat" (the model id lives in gen_ai.request.model, not the span name); the
+// legacy "chat <model>" shape is retained here for older historical data. The
+// explicit `name = "chat"` branch is required — `name like /^chat /` alone
+// (space-terminated) never matches the exact "chat" name and silently zeroes
+// persona token/cache accounting on current strands.
+export const PERSONA_CHAT_SPAN_FILTER = '((name = "chat" or name like /^chat /) or `attributes.event.name` = "api_request")';
+
 async function queryPersonaSpans(groups, workflowId, startSec, endSec) {
-  // Strands model spans: name "chat <model>", session.id carries the wf id.
   // Cache read/write tokens land under either the nested (cache_read.input_tokens)
   // or flat (cache_read_input_tokens) OTEL attribute depending on emitter version;
   // hub.cache_ttl (set by the runtime, TEAM-3953) selects the write price tier.
   const q = `fields \`attributes.session.id\` as sid, \`attributes.gen_ai.usage.input_tokens\` as i, \`attributes.gen_ai.usage.output_tokens\` as o, coalesce(\`attributes.gen_ai.usage.cache_read.input_tokens\`, \`attributes.gen_ai.usage.cache_read_input_tokens\`, 0) as cr, coalesce(\`attributes.gen_ai.usage.cache_creation.input_tokens\`, \`attributes.gen_ai.usage.cache_write_input_tokens\`, 0) as cw, \`attributes.hub.cache_ttl\` as ttl, coalesce(\`attributes.gen_ai.request.model\`, "unknown") as model
-| filter sid like "${workflowId}" and (name like /^chat / or \`attributes.event.name\` = "api_request")
+| filter sid like "${workflowId}" and ${PERSONA_CHAT_SPAN_FILTER}
 | stats sum(i) as inp, sum(o) as outp, sum(cr) as cacheRead, sum(cw) as cacheWrite by sid, model, ttl`;
   return runInsights(groups, q, startSec, endSec).catch((e) => {
     console.warn(`${LOG} persona span query failed:`, e.message);
