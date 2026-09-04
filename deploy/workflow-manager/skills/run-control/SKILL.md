@@ -32,11 +32,20 @@ get cancelled on your judgment.
 4. ```bash
    python3 /mnt/workspace/toolkit/intervene.py start --title "..." --description "..." --repo owner/name
    ```
+   Carry over the old run's pipeline too: pass `--def <workflowDefId>` if it ran
+   against a specific workflow definition, or `--type bug` if it was a bug run.
 
 ## Fresh start ("kick off a workflow to ...")
 
-`intervene.py start` with the user's title/description. If no repo is given,
-ask or use the hub default — do not guess a repo for code-changing work.
+`intervene.py start` with the user's title/description. Pipeline selection is
+optional and mutually exclusive: `--def <workflowDefId>` for a specific
+workflow definition, or `--type feature|bug` for a built-in pipeline (defaults
+to `feature` when neither is given). If no repo is given, ask or use the hub
+default — do not guess a repo for code-changing work.
+
+```bash
+python3 /mnt/workspace/toolkit/intervene.py start --title "..." --description "..." [--def <workflowDefId> | --type feature|bug] --repo owner/name
+```
 
 ## Report
 
