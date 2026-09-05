@@ -211,6 +211,18 @@ export default defineConfig({
       // never dispatched/paged; intake context stops the chain at CI; completion
       // opens the handoff PR), a registered one keeps the full ship phase.
       "lambda/orchestrator/cd-handoff.test.mjs",
+      // gate-state.mjs (TEAM-4120 FR-1) — the pure truth table behind the
+      // review-gate guard (which `→ blocked` is a real human rejection vs a
+      // creation block / redelivery / never-presented gate) plus the strict mode
+      // allow-list. Zero imports, no I/O.
+      "lambda/orchestrator/gate-state.test.mjs",
+      // gate-state-guard (TEAM-4120 FR-1) — index.mjs REAL, AWS/store seams
+      // mocked: proves off does ZERO extra I/O (no store.markGate*, no extra
+      // workflow read, no gate.reject_ignored), that enforce admits a presented
+      // gate exactly once and drops the duplicate/unrequested ones, and that
+      // shadow records + reports but never drops. Both twins (Jira webhook +
+      // DDB stream).
+      "lambda/orchestrator/gate-state-guard.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

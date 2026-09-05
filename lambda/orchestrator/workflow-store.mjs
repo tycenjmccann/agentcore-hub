@@ -596,6 +596,145 @@ export async function appendReworkAuthorization(workflowId, lineageKey, authoriz
 }
 
 /**
+ * Human review-gate state machine (TEAM-4120 FR-1).
+ *
+ * Row shape: `gateStates[gateTicketId] = { state, requestedAt, resolvedAt?,
+ * cycles: [{ requestedAt, resolvedAt, outcome }] }` where `cycles` holds only
+ * CLOSED cycles — the OPEN one is the top-level `requestedAt` plus
+ * `state: "requested"`, so "is a review pending right now" is one attribute
+ * read, not a list scan.
+ *
+ * Same two-write if_not_exists seed as ensureReviewGateLedger (DynamoDB rejects
+ * `SET a.b.c` when `a.b` is missing) with a `state: "none"` seed. "none" is
+ * deliberately NOT one of the real GATE_STATES: a seeded-but-never-requested
+ * gate must classify as "no usable state", not as a pending review.
+ */
+async function ensureGateState(workflowId, gateTicketId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET gateStates = if_not_exists(gateStates, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET gateStates.#g = if_not_exists(gateStates.#g, :seed)",
+    ExpressionAttributeNames: { "#g": gateTicketId },
+    ExpressionAttributeValues: { ":seed": { state: "none", cycles: [] } },
+  }));
+}
+
+/**
+ * Record that a gate has been PRESENTED to a human (parked for review).
+ *
+ * Returns false when the gate is ALREADY `requested` — the CAS
+ * (`state <> "requested"`) makes the re-park idempotent, so a cascade re-wake or
+ * a webhook redelivery cannot overwrite the original requestedAt and restart the
+ * human's clock. Returns true when this call opened the cycle. Any error other
+ * than the lost condition is rethrown: a caller must not read a failed write as
+ * "already requested".
+ */
+export async function markGateRequested(workflowId, gateTicketId, at) {
+  await ensureGateState(workflowId, gateTicketId);
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET gateStates.#g.#st = :req, gateStates.#g.requestedAt = :at",
+      ConditionExpression: "gateStates.#g.#st <> :req",
+      ExpressionAttributeNames: { "#g": gateTicketId, "#st": "state" },
+      ExpressionAttributeValues: { ":req": "requested", ":at": at },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * Close a gate's open cycle as REJECTED ("Request changes") and return the gate's
+ * post-write state row, or null when the CAS was lost.
+ *
+ * The condition is `state = "requested"`: exactly one caller can convert a
+ * pending review into a rejection, which is what makes the guard idempotent
+ * across the Jira-webhook and DDB-stream twins firing for the SAME transition
+ * (both see `in_review → blocked`; the loser gets null and stands down).
+ *
+ * A null return therefore means "somebody else already recorded this" OR "there
+ * was no pending review" — the caller distinguishes those by what it read before
+ * the write, and must never treat null as a reason to drop a rejection on a run
+ * that has no ledger yet (a pre-guard run seeds "none" and always loses).
+ */
+export async function markGateRejected(workflowId, gateTicketId, at, { requestedAt } = {}) {
+  await ensureGateState(workflowId, gateTicketId);
+  try {
+    const res = await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression:
+        "SET gateStates.#g.#st = :rej, gateStates.#g.resolvedAt = :at, " +
+        "gateStates.#g.cycles = list_append(if_not_exists(gateStates.#g.cycles, :empty), :cycle)",
+      ConditionExpression: "gateStates.#g.#st = :req",
+      ExpressionAttributeNames: { "#g": gateTicketId, "#st": "state" },
+      ExpressionAttributeValues: {
+        ":rej": "rejected",
+        ":req": "requested",
+        ":at": at,
+        ":empty": [],
+        // `?? null`, never undefined: the DocumentClient strips undefined values,
+        // which would drop the key and lose the cycle's duration.
+        ":cycle": [{ requestedAt: requestedAt ?? null, resolvedAt: at, outcome: "rejected" }],
+      },
+      ReturnValues: "ALL_NEW",
+    }));
+    return res.Attributes?.gateStates?.[gateTicketId] || null;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return null;
+    throw err;
+  }
+}
+
+/**
+ * Close a gate's cycle as APPROVED (the human Done'd it) and return the
+ * post-write state row, or null when the CAS was lost.
+ *
+ * Accepts `requested` OR `rejected` as the prior state: TEAM-3974 pins that a
+ * human RE-deciding a gate is legitimate (Done after a Request-changes, a second
+ * approval), so an approval must be able to close a cycle the reject path
+ * already closed. `approved → approved` loses the CAS and is a no-op, which is
+ * what keeps the done-cascade's repeated acks from appending endless cycles.
+ */
+export async function markGateApproved(workflowId, gateTicketId, at, { requestedAt } = {}) {
+  await ensureGateState(workflowId, gateTicketId);
+  try {
+    const res = await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression:
+        "SET gateStates.#g.#st = :app, gateStates.#g.resolvedAt = :at, " +
+        "gateStates.#g.cycles = list_append(if_not_exists(gateStates.#g.cycles, :empty), :cycle)",
+      ConditionExpression: "gateStates.#g.#st IN (:req, :rej)",
+      ExpressionAttributeNames: { "#g": gateTicketId, "#st": "state" },
+      ExpressionAttributeValues: {
+        ":app": "approved",
+        ":req": "requested",
+        ":rej": "rejected",
+        ":at": at,
+        ":empty": [],
+        ":cycle": [{ requestedAt: requestedAt ?? null, resolvedAt: at, outcome: "approved" }],
+      },
+      ReturnValues: "ALL_NEW",
+    }));
+    return res.Attributes?.gateStates?.[gateTicketId] || null;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return null;
+    throw err;
+  }
+}
+
+/**
  * Append a human notification atomically (no full-array rewrite). Bumps
  * notifVersion in the same write so a concurrent ackNotifications CAS that
  * read the pre-append list fails and re-reads instead of overwriting the

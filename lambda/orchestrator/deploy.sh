@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs repo-check.mjs event-id.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs repo-check.mjs event-id.mjs gate-state.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -186,7 +186,19 @@ if [ -n "${EVENT_DEDUPE_MODE:-}" ]; then
   echo "  EVENT_DEDUPE_MODE=${EVENT_DEDUPE_MODE} forwarded to orchestrator+agent-invoker+events-writer"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}}"
+# Review-gate state machine (TEAM-4120 FR-1): only forwarded when explicitly
+# set, so a plain install stays default off (byte-identical — the guard returns
+# before its first read; instant rollback = set off). Orchestrator ONLY: it is
+# the sole writer/reader of gateStates — the agent-invoker and events-writer have
+# no gate logic. Strict allow-list in code: garbage/legacy truthy → off, because
+# the dangerous failure is DROPPING a human's Request-changes.
+GATE_STATE_GUARD_VARS=""
+if [ -n "${GATE_STATE_GUARD:-}" ]; then
+  GATE_STATE_GUARD_VARS=",GATE_STATE_GUARD=${GATE_STATE_GUARD}"
+  echo "  GATE_STATE_GUARD=${GATE_STATE_GUARD} forwarded to orchestrator"
+fi
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${EVENT_DEDUPE_VARS}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}${EVENT_DEDUPE_VARS}}"
 

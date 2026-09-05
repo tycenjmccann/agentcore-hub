@@ -26,6 +26,11 @@ Globals:
         # events-writer) in one place, which is exactly the requirement: the
         # double-write only collapses when all three agree on the mode.
         EVENT_DEDUPE_MODE: !Ref EventDedupeMode
+        # Only the orchestrator reads this (it is the sole writer/reader of
+        # gateStates); it rides Globals for one-place-to-set parity with the
+        # other mode flags and is inert in the other two functions. deploy.sh
+        # forwards it to the orchestrator only.
+        GATE_STATE_GUARD: !Ref GateStateGuard
 
 Parameters:
   TicketsTableName:
@@ -107,6 +112,23 @@ Parameters:
       when explicitly set, so a fresh deploy is byte-identical. Instant rollback
       = set off. There is deliberately no "shadow": nothing is observable
       without changing the write.
+
+  GateStateGuard:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Human review-gate state machine (TEAM-4120 FR-1). A gate reaching `blocked`
+      is the ONLY signal the reject path has today, and it also fires for a
+      creation-time dependency block, for the same rejection redelivered (or
+      handled by both the Jira-webhook and DDB-stream twins), and for a gate no
+      human was ever asked about. off = byte-identical to pre-4120: the guard
+      returns "admitted" before its first read, so ZERO extra DynamoDB I/O.
+      shadow = record gateStates + publish gate.reject_ignored{wouldDrop:true}
+      but never drop a rejection (NOT byte-identical — it writes, so the ledger
+      is populated before enforce). enforce = drop the unrequested/duplicate
+      ones. Default "off" matches the code's unset default, and deploy.sh only
+      forwards GATE_STATE_GUARD when explicitly set. Instant rollback = set off.
 
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────

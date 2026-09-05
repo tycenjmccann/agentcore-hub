@@ -52,6 +52,7 @@ import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
+import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -150,6 +151,19 @@ const REWORK_LOOP_CAP = process.env.REWORK_LOOP_CAP
 // and "shadow" → off; see event-id.mjs). Instant rollback = set off. Must agree
 // across all three writers, which is why deploy.sh forwards it to all three.
 const EVENT_DEDUPE_MODE = normalizeEventDedupeMode(process.env.EVENT_DEDUPE_MODE);
+// Human review-gate state machine (TEAM-4120 FR-1): off | shadow | enforce,
+// default off. The reject path today reads a human's intent off ONE ambiguous
+// signal — a gate ticket reaching `blocked` — which also fires for a gate's
+// creation-time dependency block (TEAM-4044), for a redelivered/twinned
+// rejection, and for a gate no human was ever asked about. When on, the
+// orchestrator records `requested` when it parks a gate and admits a rejection
+// only for a gate actually sitting in `requested`. off = byte-identical (the
+// guard returns "admitted" before reading anything — ZERO extra DDB I/O);
+// shadow records state + publishes gate.reject_ignored{wouldDrop:true} but
+// drops nothing; enforce drops the unrequested/duplicate ones. STRICT allow-list
+// (garbage/legacy truthy → off; see gate-state.mjs) because the dangerous
+// failure here is DROPPING a human's Request-changes. Instant rollback = off.
+const GATE_STATE_GUARD = normalizeGateGuardMode(process.env.GATE_STATE_GUARD);
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -958,6 +972,9 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       }
       const rejected = await getTicket(ticketId);
       if (rejected && isHumanAssignee(rejected.assignee)) {
+        // TEAM-4120 FR-1: …and it must be a gate a human was actually ASKED
+        // about, exactly once (no-op when GATE_STATE_GUARD is off).
+        if (!(await gateRejectionAdmitted(rejected, oldStatus))) break;
         await handleReviewRejection(rejected);
       }
       break;
@@ -1209,6 +1226,16 @@ async function ackApprovedGateNotification(workflow, ticketId, assignee) {
       workflow.id,
       (n) => n.ticketId === ticketId && n.type === "review_needed"
     );
+    // TEAM-4120 FR-1: close the gate's cycle as APPROVED. Without this the gate
+    // would sit in `requested` forever, so a later creation-time-ish `→ blocked`
+    // on an already-decided gate would still read as a fresh rejection. Same
+    // best-effort contract as the ack above (an approve must never be blocked by
+    // a ledger write); no-op when the guard is off.
+    if (GATE_STATE_GUARD !== "off") {
+      await store.markGateApproved(workflow.id, ticketId, new Date().toISOString(), {
+        requestedAt: workflow.gateStates?.[ticketId]?.requestedAt,
+      });
+    }
     console.log(`[orchestrator] ${ticketId}: human gate approved — review_needed acknowledged`);
   } catch (err) {
     console.warn(`[orchestrator] ${ticketId}: review_needed ack failed (non-fatal): ${err?.message || err}`);
@@ -1533,6 +1560,21 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
     if (pkg) {
       try { await attachPackageToTicket(ticketId, pkg); }
       catch (err) { console.warn(`[orchestrator] could not attach review package to ${ticketId}: ${err.message}`); }
+    }
+  }
+
+  // TEAM-4120 FR-1: record that this gate is now PENDING A HUMAN — the state the
+  // reject path checks before believing a `→ blocked` is a "Request changes".
+  // Every way a gate reaches a human passes through here (the Ready path, the
+  // park, the cascade's re-wake), so this is the ONE place the cycle opens.
+  // Idempotent in the store (CAS on state <> "requested"), best-effort here: a
+  // failed write must never delay the reviewer's ping — the guard's fallback is
+  // the review_needed notification this function just appended.
+  if (GATE_STATE_GUARD !== "off" && workflow) {
+    try {
+      await store.markGateRequested(workflow.id, ticketId, new Date().toISOString());
+    } catch (err) {
+      console.warn(`[gate-state] markGateRequested(${ticketId}) failed (non-fatal): ${err?.message || err}`);
     }
   }
 
@@ -1863,6 +1905,90 @@ function isHumanReviewGate(ticket) {
   return labels.some(
     (l) => typeof l === "string" && (l === "human-review" || l.startsWith("reviewer:"))
   );
+}
+
+/**
+ * TEAM-4120 FR-1 — is this gate's `→ blocked` a rejection the orchestrator should
+ * ACT on? Returns true to proceed to handleReviewRejection, false to drop.
+ *
+ * Ordering contract (both twins): isCreationTimeBlock → THIS → handleReviewRejection.
+ * The creation-block check stays where it is, ahead of any I/O; this guard adds
+ * the two cases a previous-status check cannot see — the same rejection arriving
+ * twice, and a gate no human was ever asked about.
+ *
+ * Fail-open on EVERY uncertainty:
+ *   - GATE_STATE_GUARD=off → true immediately, before a single read.
+ *   - workflow unresolvable, or any thrown error → true (logged). A bug in this
+ *     guard must never be how a human's Request-changes gets swallowed.
+ *   - a run with no recorded state (pre-guard, or the "none" seed) → the
+ *     review_needed notification decides, and a lost CAS on such a run is NOT
+ *     read as a duplicate.
+ *   - shadow → always true, but the state IS recorded and the would-be drop is
+ *     published as gate.reject_ignored{wouldDrop:true} so the drop rate is
+ *     measurable on live traffic before anyone enforces.
+ */
+async function gateRejectionAdmitted(gateTicket, oldStatus) {
+  if (GATE_STATE_GUARD === "off") return true;
+  const ticketId = gateTicket?.ticketId;
+  try {
+    const workflow = await resolveWorkflow(gateTicket?.workflowId, gateTicket?.parentId);
+    if (!workflow) {
+      console.warn(`[gate-state] ${ticketId}: no workflow resolved — admitting the rejection (fail-open)`);
+      return true;
+    }
+    const gateState = workflow.gateStates?.[ticketId] || null;
+    // The "none" seed (and any unknown state) is NOT usable state: such a run
+    // must fall back to the notification, and must never have a lost CAS read as
+    // "already rejected".
+    const legacyFallback = !GATE_STATES.includes(gateState?.state);
+    // Deliberately regardless of `acknowledged`: BOTH conclusions ack the
+    // notification (approve → ackApprovedGateNotification, reject →
+    // handleReviewRejection), so an acked notification cannot distinguish
+    // "reviewed once already" from "never presented". Existence is the signal.
+    const hasReviewNeeded = (workflow.humanNotifications || []).some(
+      (n) => n?.type === "review_needed" && n?.ticketId === ticketId
+    );
+
+    let verdict = classifyRejection({ gateTicket, oldStatus, gateState, hasReviewNeeded });
+    if (verdict === "presented") {
+      // Claim the rejection. Shadow writes too — the ledger has to be populated
+      // (and its CAS exercised) before an operator flips enforce, so shadow is
+      // NOT byte-identical, same as REWORK_LOOP_CAP's shadow.
+      const claimed = await store.markGateRejected(workflow.id, ticketId, new Date().toISOString(), {
+        requestedAt: gateState?.requestedAt,
+      });
+      if (claimed || legacyFallback || GATE_STATE_GUARD !== "enforce") {
+        console.log(
+          `[gate-state] ${ticketId}: ${oldStatus || "NEW"} → blocked admitted as a rejection ` +
+            `(state=${gateState?.state ?? "none"}${legacyFallback ? ", legacy fallback" : ""}, mode=${GATE_STATE_GUARD})`
+        );
+        return true;
+      }
+      // Enforce + a real pending state we did NOT get to close = another
+      // deliverer (the other twin, or a redelivery) already recorded it.
+      verdict = "duplicate";
+    }
+
+    await publishEvent(ticketId, "gate.reject_ignored", {
+      workflowId: workflow.id,
+      ticketId,
+      reason: verdict,
+      oldStatus: oldStatus ?? null,
+      gateState: gateState?.state ?? null,
+      legacyFallback,
+      wouldDrop: true,
+      mode: GATE_STATE_GUARD,
+    });
+    const dropped = GATE_STATE_GUARD === "enforce";
+    console.log(
+      `[gate-state] ${ticketId}: ${oldStatus || "NEW"} → blocked is ${verdict} ` +
+        `(state=${gateState?.state ?? "none"}) — ${dropped ? "DROPPED" : "would drop; proceeding (shadow)"}`
+    );
+    return !dropped;
+  } catch (err) {
+    console.warn(`[gate-state] ${ticketId}: guard failed (${err?.message || err}) — admitting the rejection (fail-open)`);
+    return true;
+  }
 }
 
 /**
@@ -2696,7 +2822,13 @@ async function processRecord(record) {
       const blockedAssignee = unwrapDdbValue(newImage.assignee);
       if (isHumanAssignee(blockedAssignee)) {
         const rejected = await getTicket(ticketId);
-        if (rejected) await handleReviewRejection(rejected);
+        // TEAM-4120 FR-1: same guard, same position as the webhook twin — after
+        // the creation-block + human-assignee checks, before the handler. This is
+        // also the twin that most often arrives second for the SAME transition,
+        // so under enforce it is the one the CAS stands down (no-op when off).
+        if (rejected && (await gateRejectionAdmitted(rejected, oldStatus))) {
+          await handleReviewRejection(rejected);
+        }
       }
       break;
     }
