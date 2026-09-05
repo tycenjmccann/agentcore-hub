@@ -103,6 +103,11 @@ beforeEach(() => {
   h.state.tickets = {
     "TEAM-4001": { assignee: "agentcore_hub_backend_dev", status: "in_progress" },
     "TEAM-4002": { assignee: "human:tycen", status: "in_review" },
+    // TEAM-4100 F1 — Re-verify tickets, each assigned to the verifier role that
+    // owns the verification kind it reports.
+    "TEAM-4003": { assignee: "agentcore_hub_code_reviewer", status: "in_progress" },
+    "TEAM-4004": { assignee: "agentcore_hub_ci_agent", status: "in_progress" },
+    "TEAM-4005": { assignee: "agentcore_hub_qa_verifier", status: "in_progress" },
   };
 });
 
@@ -280,8 +285,9 @@ describe("TEAM-3992 Q4 — verification record", () => {
 
   it("persists verification + findings in the completion record and a durable record at the SHA-pinned key", async () => {
     const res = await report({
-      ticket_id: "TEAM-4001", summary: "re-reviewed", workflow_id: "wf1",
-      agent_id: "agentcore_hub_backend_dev",
+      // A code_reviewer re-verify ticket reports a review verification for a DIFFERENT fix.
+      ticket_id: "TEAM-4003", summary: "re-reviewed", workflow_id: "wf1",
+      agent_id: "agentcore_hub_code_reviewer",
       verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "review", verdict: "pass" },
       findings: [{ component: "auth", severity: "high", summary: "null deref", files: ["a.ts"] }],
     });
@@ -295,15 +301,15 @@ describe("TEAM-3992 Q4 — verification record", () => {
     const rec = savedVerification();
     expect(rec).toMatchObject({
       target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "review", verdict: "pass",
-      verifier_ticket_id: "TEAM-4001", source: "agent", reported_by: "agentcore_hub_backend_dev",
+      verifier_ticket_id: "TEAM-4003", source: "agent", reported_by: "agentcore_hub_code_reviewer",
     });
     expect(rec.at).toBeTruthy();
   });
 
   it("normalizes kind/verdict/sha case before keying the record", async () => {
     await report({
-      ticket_id: "TEAM-4001", summary: "x", workflow_id: "wf1",
-      agent_id: "agentcore_hub_backend_dev",
+      ticket_id: "TEAM-4004", summary: "x", workflow_id: "wf1",
+      agent_id: "agentcore_hub_ci_agent",
       verification: { target_ticket_id: "TEAM-3050", head_sha: "ABCDEF1", kind: "CI", verdict: "PASS" },
     });
     expect(verificationPuts()[0].Key).toBe("workflows/wf1/shared/verifications/TEAM-3050/abcdef1.ci.json");
@@ -312,8 +318,8 @@ describe("TEAM-3992 Q4 — verification record", () => {
 
   it("carries build_id and evidence_key through when supplied", async () => {
     await report({
-      ticket_id: "TEAM-4001", summary: "x", workflow_id: "wf1",
-      agent_id: "agentcore_hub_backend_dev",
+      ticket_id: "TEAM-4004", summary: "x", workflow_id: "wf1",
+      agent_id: "agentcore_hub_ci_agent",
       verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "ci", verdict: "pass", build_id: 42, evidence_key: "k/x.log" },
     });
     expect(savedVerification()).toMatchObject({ build_id: "42", evidence_key: "k/x.log" });
@@ -322,8 +328,8 @@ describe("TEAM-3992 Q4 — verification record", () => {
   it("writes verification into the completion record but NO durable record when workflow_id is absent", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const res = await report({
-      ticket_id: "TEAM-4001", summary: "x",
-      agent_id: "agentcore_hub_backend_dev",
+      ticket_id: "TEAM-4003", summary: "x",
+      agent_id: "agentcore_hub_code_reviewer",
       verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "review", verdict: "pass" },
     });
     expect(res.isError).toBeFalsy();
@@ -343,8 +349,8 @@ describe("TEAM-3992 Q4 — verification record", () => {
   ]) {
     it(`rejects malformed verification (${label}) with no S3 write`, async () => {
       const res = await report({
-        ticket_id: "TEAM-4001", summary: "x", workflow_id: "wf1",
-        agent_id: "agentcore_hub_backend_dev", verification: bad,
+        ticket_id: "TEAM-4003", summary: "x", workflow_id: "wf1",
+        agent_id: "agentcore_hub_code_reviewer", verification: bad,
       });
       expect(res.isError).toBe(true);
       expect(completionPuts()).toHaveLength(0);
@@ -363,5 +369,95 @@ describe("TEAM-3992 Q4 — verification record", () => {
     expect(res.content[0].text).toMatch(/REFUSED/);
     expect(completionPuts()).toHaveLength(0);
     expect(verificationPuts()).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4100 F1 — a SHA-pinned verification cannot be self-certified.
+ *
+ * The hole: validateVerification checked only the SHAPE of the block, never WHO
+ * was reporting it or WHAT it targeted. A fix agent could call report_completion
+ * on its OWN fix ticket with verification{ target_ticket_id: <self>, kind:
+ * "review", verdict: "pass" } and the durable record + completion record would
+ * both stamp a passing review the fix wrote about itself — the exact record the
+ * completion gate reads. Two floors, both derived from the reporter's assignee id
+ * (the id F17 already trusts) and the reporting ticket:
+ *   - target_ticket_id === the reporting ticket → VERIFICATION_SELF_CERT.
+ *   - the reporter's role does not own the claimed kind → VERIFICATION_ROLE_MISMATCH.
+ * A rejected verification fails the whole report_completion (coded, structured,
+ * visible on the board) rather than being silently dropped — the fix does not get
+ * a false "done" and the agent sees exactly why.
+ */
+describe("TEAM-4100 F1 — verification cannot be self-certified", () => {
+  const SHA = "abcdef1234567890";
+
+  const bodyOf = (res) => JSON.parse(res.content[0].text);
+
+  it("rejects a self-cert: target_ticket_id === the reporting ticket", async () => {
+    const res = await report({
+      ticket_id: "TEAM-4003", summary: "I reviewed my own work", workflow_id: "wf1",
+      agent_id: "agentcore_hub_code_reviewer",
+      verification: { target_ticket_id: "TEAM-4003", head_sha: SHA, kind: "review", verdict: "pass" },
+    });
+    expect(res.isError).toBe(true);
+    expect(bodyOf(res).error).toBe("VERIFICATION_SELF_CERT");
+    // No record of any kind is written on rejection.
+    expect(completionPuts()).toHaveLength(0);
+    expect(verificationPuts()).toHaveLength(0);
+    expect(transitions()).toHaveLength(0);
+  });
+
+  it("rejects a dev-role reporter stamping a review verification (role mismatch)", async () => {
+    const res = await report({
+      ticket_id: "TEAM-4001", summary: "closing my fix as reviewed", workflow_id: "wf1",
+      agent_id: "agentcore_hub_backend_dev",
+      verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "review", verdict: "pass" },
+    });
+    expect(res.isError).toBe(true);
+    expect(bodyOf(res).error).toBe("VERIFICATION_ROLE_MISMATCH");
+    expect(completionPuts()).toHaveLength(0);
+    expect(verificationPuts()).toHaveLength(0);
+  });
+
+  it("rejects a reviewer stamping a qa verification (kind outside its role)", async () => {
+    const res = await report({
+      ticket_id: "TEAM-4003", summary: "x", workflow_id: "wf1",
+      agent_id: "agentcore_hub_code_reviewer",
+      verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "qa", verdict: "pass" },
+    });
+    expect(res.isError).toBe(true);
+    expect(bodyOf(res).error).toBe("VERIFICATION_ROLE_MISMATCH");
+    expect(completionPuts()).toHaveLength(0);
+  });
+
+  it("accepts a code_reviewer reporting a review verification for a DIFFERENT ticket", async () => {
+    const res = await report({
+      ticket_id: "TEAM-4003", summary: "re-reviewed the fix", workflow_id: "wf1",
+      agent_id: "agentcore_hub_code_reviewer",
+      verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "review", verdict: "pass" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(verificationPuts()).toHaveLength(1);
+    expect(savedVerification()).toMatchObject({ kind: "review", verifier_ticket_id: "TEAM-4003" });
+  });
+
+  it("accepts a qa_verifier reporting a qa verification", async () => {
+    const res = await report({
+      ticket_id: "TEAM-4005", summary: "re-qa'd the fix", workflow_id: "wf1",
+      agent_id: "agentcore_hub_qa_verifier",
+      verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "qa", verdict: "pass" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(verificationPuts()[0].Key).toBe(`workflows/wf1/shared/verifications/TEAM-3050/${SHA}.qa.json`);
+  });
+
+  it("accepts a ci_agent reporting a ci verification", async () => {
+    const res = await report({
+      ticket_id: "TEAM-4004", summary: "re-ran CI on the fix", workflow_id: "wf1",
+      agent_id: "agentcore_hub_ci_agent",
+      verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "ci", verdict: "pass" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(verificationPuts()[0].Key).toBe(`workflows/wf1/shared/verifications/TEAM-3050/${SHA}.ci.json`);
   });
 });

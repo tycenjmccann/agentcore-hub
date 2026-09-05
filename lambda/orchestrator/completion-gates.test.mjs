@@ -1535,10 +1535,22 @@ describe("completeWorkflow — SHA-pinned fix-verification gate (TEAM-3992 Q4, w
     spawnedBy: { kind: "review_fix", gateTicketId: "T-3" },
   };
   const CHILDREN_WITH_FIX = [...DONE, FIX_TICKET];
-  // A verifier task carrying a verification record (the shape harvestCompletionEvidence
-  // writes: agentTasks.<verifier>.verification).
+  // TEAM-4100 F1 — a verification only counts when it comes from a genuine
+  // Re-verify ticket: a distinct child spawned for THIS fix (spawnedBy.rearmOf),
+  // assigned to the verifier role whose harvested agentId owns the kind.
+  const RV_AGENT = { review: "agentcore_hub_code_reviewer", ci: "agentcore_hub_ci_agent", qa: "agentcore_hub_qa_verifier" };
+  // The Re-verify child ticket (carries the rearm marker + verifier assignee).
+  const rvChild = (kind) => ({
+    ticketId: `V-${kind}`, assignee: RV_AGENT[kind], type: "task", status: "done",
+    spawnedBy: { kind: "reverify", rearmOf: "FIX-1" },
+  });
+  // Children snapshot = the base run + fix + one Re-verify ticket per given kind.
+  const childrenWith = (...kinds) => [...CHILDREN_WITH_FIX, ...kinds.map(rvChild)];
+  // The verifier's harvested agentTasks row (agentId = the verifier role) carrying
+  // the verification record (the shape harvestCompletionEvidence writes).
   const vTask = (kind, verdict = "pass", headSha = SHA) => ({
-    ticketId: `V-${kind}`, verification: { targetTicketId: "FIX-1", headSha, kind, verdict },
+    ticketId: `V-${kind}`, agentId: RV_AGENT[kind],
+    verification: { targetTicketId: "FIX-1", headSha, kind, verdict },
   });
 
   /** Prime the roster + the ticketDag-bearing def, then hand back completeWorkflow. */
@@ -1566,7 +1578,7 @@ describe("completeWorkflow — SHA-pinned fix-verification gate (TEAM-3992 Q4, w
 
   it("enforce (default): blocks the run when the fix's final SHA is not re-CI'd, escalates once", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    h.state.snapshots = [CHILDREN_WITH_FIX];
+    h.state.snapshots = [childrenWith("review")]; // only a review Re-verify exists
     h.state.freshWorkflow = {
       id: "wf_1",
       agentTasks: {
@@ -1591,7 +1603,7 @@ describe("completeWorkflow — SHA-pinned fix-verification gate (TEAM-3992 Q4, w
   });
 
   it("enforce: completes once review AND ci are re-verified at the fix's FINAL SHA (short↔long ok)", async () => {
-    h.state.snapshots = [CHILDREN_WITH_FIX];
+    h.state.snapshots = [childrenWith("review", "ci")];
     h.state.freshWorkflow = {
       id: "wf_1",
       agentTasks: {
@@ -1608,7 +1620,7 @@ describe("completeWorkflow — SHA-pinned fix-verification gate (TEAM-3992 Q4, w
 
   it("enforce: a re-verification at the WRONG sha does not satisfy the gate", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    h.state.snapshots = [CHILDREN_WITH_FIX];
+    h.state.snapshots = [childrenWith("review", "ci")];
     h.state.freshWorkflow = {
       id: "wf_1",
       agentTasks: {
@@ -1628,7 +1640,7 @@ describe("completeWorkflow — SHA-pinned fix-verification gate (TEAM-3992 Q4, w
   it("shadow: publishes the completion_blocked event but completes anyway (no escalation)", async () => {
     process.env.FIX_VERIFICATION_REQUIRED = "shadow";
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    h.state.snapshots = [CHILDREN_WITH_FIX];
+    h.state.snapshots = [childrenWith("review")];
     h.state.freshWorkflow = {
       id: "wf_1",
       agentTasks: { "FIX-1": { ticketId: "FIX-1", commitSha: SHA }, "V-review": vTask("review") },
@@ -1639,6 +1651,30 @@ describe("completeWorkflow — SHA-pinned fix-verification gate (TEAM-3992 Q4, w
     expect(blockedEvents().some((d) => d.reason === "fix_unverified" && d.shadow === true)).toBe(true);
     expect(h.state.notifications.some((n) => n.n?.id === "notif_fix_unverified_wf_1")).toBe(false);
     warn.mockRestore();
+  });
+
+  it("enforce (TEAM-4100 F1): review+ci stamped on the FIX's OWN entry self-cert → still blocked (both gaps)", async () => {
+    // The self-cert hole replayed: the fix agent stamped review AND ci verification
+    // records on FIX-1's own agentTasks entry (no Re-verify tickets exist). Before
+    // F1 this closed the run green; now neither counts (entryTicketId === the fix).
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [CHILDREN_WITH_FIX]; // no Re-verify children at all
+    h.state.freshWorkflow = {
+      id: "wf_1",
+      agentTasks: {
+        "FIX-1": {
+          ticketId: "FIX-1", commitSha: SHA,
+          verification: { targetTicketId: "FIX-1", headSha: SHA, kind: "review", verdict: "pass" },
+        },
+      },
+    };
+    await loadWithFixDef();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(0); // never claimed
+    const rejected = error.mock.calls.find((c) => String(c[0]).includes("CompletionRejectedFixUnverified"));
+    expect(rejected).toBeTruthy();
+    expect(String(rejected[0])).toContain("FIX-1(review/ci)");
+    error.mockRestore();
   });
 
   it("off: the gate is skipped entirely — an unverified fix still completes", async () => {
