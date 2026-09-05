@@ -193,11 +193,64 @@ export default defineConfig({
       // cd-registry.mjs — pure registry parsing / repo matching / ship-phase
       // stripping (which repos the hub merges + deploys); no I/O.
       "lambda/orchestrator/cd-registry.test.mjs",
+      // event-id.mjs (TEAM-4120 FR-2) — the deterministic event id that collapses
+      // the events table's EventBridge/direct double-write. Pure (node:crypto
+      // only): determinism, the 13-digit-ms id shape the anomaly-watcher's
+      // eventId range query depends on, byte-for-byte agreement with the
+      // cost-report consumer-side dedupe key, and the fail-safe directions
+      // (strict mode allow-list, agent.streaming + bad timestamp → random).
+      "lambda/orchestrator/event-id.test.mjs",
+      // events-writer (TEAM-4120 FR-2) — the EventBridge-fan-out half of the
+      // double-write. Drives the REAL handler with a stub DDB doc client,
+      // reloaded per EVENT_DEDUPE_MODE, to prove that under enforce its row key
+      // equals the publisher's (so the Put overwrites instead of doubling) and
+      // that off is byte-identical (base36 monotonic ids).
+      "lambda/orchestrator/events-writer.test.mjs",
       // cd-handoff — index.mjs REAL, AWS/store seams mocked: an unregistered
       // repo gets no ship phase (Ship/CD tickets + Merge Approval gate resolved,
       // never dispatched/paged; intake context stops the chain at CI; completion
       // opens the handoff PR), a registered one keeps the full ship phase.
       "lambda/orchestrator/cd-handoff.test.mjs",
+      // gate-state.mjs (TEAM-4120 FR-1) — the pure truth table behind the
+      // review-gate guard (which `→ blocked` is a real human rejection vs a
+      // creation block / redelivery / never-presented gate) plus the strict mode
+      // allow-list. Zero imports, no I/O.
+      "lambda/orchestrator/gate-state.test.mjs",
+      // gate-state-guard (TEAM-4120 FR-1) — index.mjs REAL, AWS/store seams
+      // mocked: proves off does ZERO extra I/O (no store.markGate*, no extra
+      // workflow read, no gate.reject_ignored), that enforce admits a presented
+      // gate exactly once and drops the duplicate/unrequested ones, and that
+      // shadow records + reports but never drops. Both twins (Jira webhook +
+      // DDB stream).
+      "lambda/orchestrator/gate-state-guard.test.mjs",
+      // replay-gate-state (TEAM-4120 FR-1 acceptance) — the gate history of REAL
+      // runs (yteqfl + sffzti reduced dossiers, deduped by the real contentKey)
+      // plus a reconstructed TEAM-4045-pattern run, replayed through the REAL
+      // blocked twins: asserts the guard admits exactly as many rejections as a
+      // human actually filed (zero, in every dossier we have), that the
+      // creation-time block still costs no I/O, and that off is unchanged.
+      "lambda/orchestrator/replay-gate-state.test.mjs",
+      // dead-session-escalation (TEAM-4120 FR-3) — the page→synthesize→park tree,
+      // fully DI: the mode normalizer's shadow-coalescing fail-safe, the redaction
+      // table one vector per pattern (including a secret straddling the 600-char
+      // clip boundary), child selection replayed against the REAL yteqfl ticket
+      // set, the decision order (agent error > fresh record > children > park,
+      // never Done on a stale/blank record), shadow's single write, and that no
+      // dep failure can make it reject mid-sweep.
+      "lambda/orchestrator/dead-session-escalation.test.mjs",
+      // dead-session gate wake (TEAM-4120 FR-3) — index.mjs REAL, AWS/store seams
+      // mocked: a human Done'ing an `Escalation: dead session on TEAM-x (agent)`
+      // gate hands that ticket's retry budget back and announces the decision
+      // WITHOUT re-dispatching anything (the gate's own cascade unblocks it), and
+      // the release-manager escalation title still takes the TEAM-3971 branch.
+      "lambda/orchestrator/dead-session-gate-wake.test.mjs",
+      // replay-yteqfl-dead-session (TEAM-4120 FR-3 acceptance) — the real yteqfl
+      // slice 06:51→07:36Z replayed through the REAL sweep → cascade → escalation
+      // tree: the dead release manager's TEAM-4066 gets blocked on the six tickets
+      // it spawned (both the AC's literal 4101/4102 pair and the full closure) and
+      // ONE reconcile tick re-drives it when the last child lands — versus mode
+      // off, where escalationHeld reproduces the 3h26m stall prod actually took.
+      "lambda/orchestrator/replay-yteqfl-dead-session.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

@@ -116,6 +116,96 @@ export async function lastAgentActivity(ddb, eventsTable, workflowId, agentId, t
 }
 
 /**
+ * TEAM-4120 FR-3 — the dead agent's LAST WORDS, newest-first-collected and
+ * returned oldest-first. READ-ONLY (check-workflow-writes.sh allows exactly one
+ * write in this module, stealClaim); it lives here rather than in the escalation
+ * module so every events-table query keeps ONE shape and one paging bound.
+ *
+ * Same QueryCommand shape as lastAgentActivity: partition on workflowId, newest
+ * first, ≤20 pages × 500. Selects `agent.streaming` frames whose payload type is
+ * text or reasoning (the streamed model output; tool frames are noise for a
+ * human page). ticketId is honored the same way as in lastAgentActivity — an
+ * event stamped with a DIFFERENT ticketId is skipped, an unstamped one counts.
+ *
+ * Returns the RAW joined string: redaction + clipping belong to the caller,
+ * which must join FIRST so a secret split across two chunks still matches.
+ */
+export async function lastStreamedText(ddb, eventsTable, workflowId, agentId, ticketId, maxChars = 600) {
+  const chunks = [];
+  let collected = 0;
+  let lastKey;
+  for (let page = 0; page < 20 && collected < maxChars; page++) {
+    const res = await ddb.send(
+      new QueryCommand({
+        TableName: eventsTable,
+        KeyConditionExpression: "workflowId = :w",
+        FilterExpression: "#t = :streaming AND detail.agentId = :aid AND detail.#dt IN (:text, :reasoning)",
+        ExpressionAttributeNames: { "#t": "type", "#dt": "type" },
+        ExpressionAttributeValues: {
+          ":w": workflowId,
+          ":streaming": "agent.streaming",
+          ":aid": agentId,
+          ":text": "text",
+          ":reasoning": "reasoning",
+        },
+        ScanIndexForward: false,
+        Limit: 500,
+        ExclusiveStartKey: lastKey,
+      })
+    );
+    for (const e of res.Items || []) {
+      const detail = e.detail || {};
+      if (ticketId && detail.ticketId && detail.ticketId !== ticketId) continue;
+      const content = detail.content;
+      if (typeof content !== "string" || !content) continue;
+      chunks.push(content);
+      collected += content.length;
+      if (collected >= maxChars) break;
+    }
+    lastKey = res.LastEvaluatedKey;
+    if (!lastKey) break;
+  }
+  return chunks.reverse().join("");
+}
+
+/**
+ * TEAM-4120 FR-3 — did the AGENT report a real failure on this ticket since the
+ * claim started? READ-ONLY. `dead_session` is excluded because that reason is
+ * the detector's own death announcement: counting it would make every dead
+ * session look like a self-reported agent error and suppress synthesis for all
+ * of them.
+ */
+export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, sinceIso) {
+  if (!sinceIso) return false;
+  let lastKey;
+  for (let page = 0; page < 20; page++) {
+    const res = await ddb.send(
+      new QueryCommand({
+        TableName: eventsTable,
+        KeyConditionExpression: "workflowId = :w",
+        FilterExpression:
+          "#t = :err AND detail.ticketId = :tid AND #ts >= :since AND (attribute_not_exists(detail.reason) OR detail.reason <> :dead)",
+        ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
+        ExpressionAttributeValues: {
+          ":w": workflowId,
+          ":err": "agent.error",
+          ":tid": ticketId,
+          ":since": sinceIso,
+          ":dead": "dead_session",
+        },
+        ScanIndexForward: false,
+        Limit: 500,
+        ExclusiveStartKey: lastKey,
+      })
+    );
+    if ((res.Items || []).length > 0) return true;
+    lastKey = res.LastEvaluatedKey;
+    if (!lastKey) break;
+  }
+  return false;
+}
+
+/**
  * Atomically steal a running claim: flip status→ready ONLY IF the entry still
  * holds the generation we inspected (same startedAt, still running). One
  * winner under concurrent stealers; never clobbers a re-issued claim.

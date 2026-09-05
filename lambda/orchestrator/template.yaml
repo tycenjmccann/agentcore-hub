@@ -22,6 +22,18 @@ Globals:
         DEAD_SESSION_DETECTOR_MODE: !Ref DeadSessionDetectorMode
         CASCADE_EXTENDED_STATES: !Ref CascadeExtendedStates
         RECONCILE_SWEEP_MODE: !Ref ReconcileSweepMode
+        # Globals reaches all three writers (orchestrator, agent-invoker,
+        # events-writer) in one place, which is exactly the requirement: the
+        # double-write only collapses when all three agree on the mode.
+        EVENT_DEDUPE_MODE: !Ref EventDedupeMode
+        # Only the orchestrator reads this (it is the sole writer/reader of
+        # gateStates); it rides Globals for one-place-to-set parity with the
+        # other mode flags and is inert in the other two functions. deploy.sh
+        # forwards it to the orchestrator only.
+        GATE_STATE_GUARD: !Ref GateStateGuard
+        # Orchestrator-only as well (both exhausted-retry emitters live there);
+        # rides Globals for the same one-place-to-set parity.
+        DEAD_SESSION_ESCALATION_MODE: !Ref DeadSessionEscalationMode
 
 Parameters:
   TicketsTableName:
@@ -86,6 +98,59 @@ Parameters:
       dependents. Default "off" matches the code's unset default, so the backstop
       ships dark — same rollout posture as deploy.sh (TEAM-3763 F2), which only
       forwards RECONCILE_SWEEP_MODE when explicitly set.
+
+  EventDedupeMode:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "enforce"]
+    Description: >
+      Events-table double-write collapse (TEAM-4120 FR-2). Every event is stored
+      TWICE today — once by the publisher's direct Put, once by the events-writer
+      fan-out of the same EventBridge event, under two different eventIds. off =
+      byte-identical to pre-4120 (random / base36 eventIds; consumers keep
+      deduping by content); enforce = every writer derives the eventId from the
+      event's CONTENT, so the fan-out Put lands on the same (workflowId, eventId)
+      and overwrites the direct copy — one row per event. Default "off" matches
+      the code's unset default, and deploy.sh only forwards EVENT_DEDUPE_MODE
+      when explicitly set, so a fresh deploy is byte-identical. Instant rollback
+      = set off. There is deliberately no "shadow": nothing is observable
+      without changing the write.
+
+  GateStateGuard:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Human review-gate state machine (TEAM-4120 FR-1). A gate reaching `blocked`
+      is the ONLY signal the reject path has today, and it also fires for a
+      creation-time dependency block, for the same rejection redelivered (or
+      handled by both the Jira-webhook and DDB-stream twins), and for a gate no
+      human was ever asked about. off = byte-identical to pre-4120: the guard
+      returns "admitted" before its first read, so ZERO extra DynamoDB I/O.
+      shadow = record gateStates + publish gate.reject_ignored{wouldDrop:true}
+      but never drop a rejection (NOT byte-identical — it writes, so the ledger
+      is populated before enforce). enforce = drop the unrequested/duplicate
+      ones. Default "off" matches the code's unset default, and deploy.sh only
+      forwards GATE_STATE_GUARD when explicitly set. Instant rollback = set off.
+
+  DeadSessionEscalationMode:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Dead-session escalation tree (TEAM-4120 FR-3) — page, then synthesize or
+      park, when the dead-session retry budget is spent. off = byte-identical to
+      pre-4120: both emitters append the same evidence-free manager_escalation
+      and the ticket stays held in `error`. shadow = page WITH evidence (last
+      streamed words redacted, tickets spawned in the claim window, completion
+      record, PR) and publish the decision it WOULD take; no board writes.
+      enforce = also act — Done from a completion record that bears evidence AND
+      was written during this claim, else block the ticket on the children the
+      dead agent spawned (auto-reset capped to once per ticket), else park it on
+      one human gate. It never steals a claim, never invokes an agent, and never
+      marks a ticket Done on a stale or evidence-less record. Default "off"
+      matches the code's unset default and deploy.sh only forwards the var when
+      explicitly set. Instant rollback = set off.
 
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────

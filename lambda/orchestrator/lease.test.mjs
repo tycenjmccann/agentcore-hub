@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isLeaseLive, lastAgentActivity, stealClaim } from "./lease.mjs";
+import { isLeaseLive, lastAgentActivity, lastStreamedText, hasAgentErrorSince, stealClaim } from "./lease.mjs";
 
 /**
  * TEAM-3618: the orchestrator port of the lease primitives. Same contract as
@@ -111,5 +111,128 @@ describe("stealClaim (mjs)", () => {
   it("loses when the claim moved (completed or re-claimed)", async () => {
     const { ddb } = stub(true);
     expect(await stealClaim(ddb, "wf-table", "wf_1", "TEAM-2", "2026-08-30T10:00:00Z")).toBe(false);
+  });
+});
+
+/**
+ * TEAM-4120 FR-3 — the two read-only queries the escalation tree needs. They
+ * live in lease.mjs so every events-table query keeps ONE shape and one paging
+ * bound; check-workflow-writes.sh still allows exactly one write here
+ * (stealClaim), so these must never grow an Update/Put.
+ */
+function eventsPages(pages) {
+  const inputs = [];
+  let i = 0;
+  const ddb = {
+    async send(cmd) {
+      inputs.push(cmd.input);
+      return pages[Math.min(i++, pages.length - 1)];
+    },
+  };
+  return { ddb, inputs };
+}
+
+const streamFrame = (content, over = {}) => ({
+  type: "agent.streaming",
+  detail: { agentId: "dev_agent", type: "text", content, ...over },
+});
+
+describe("lastStreamedText (TEAM-4120 FR-3)", () => {
+  it("queries newest-first for this agent's text/reasoning frames only", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [] }]);
+    await lastStreamedText(ddb, "events", "wf_1", "dev_agent", "TEAM-2", 600);
+    const q = inputs[0];
+    expect(q.TableName).toBe("events");
+    expect(q.KeyConditionExpression).toBe("workflowId = :w");
+    expect(q.FilterExpression).toContain("#t = :streaming");
+    expect(q.FilterExpression).toContain("detail.agentId = :aid");
+    expect(q.FilterExpression).toContain("detail.#dt IN (:text, :reasoning)");
+    expect(q.ExpressionAttributeNames).toMatchObject({ "#t": "type", "#dt": "type" });
+    expect(q.ExpressionAttributeValues[":streaming"]).toBe("agent.streaming");
+    expect(q.ExpressionAttributeValues[":aid"]).toBe("dev_agent");
+    expect(q.ExpressionAttributeValues[":text"]).toBe("text");
+    expect(q.ExpressionAttributeValues[":reasoning"]).toBe("reasoning");
+    // Newest-first is what makes "the LAST words" cheap.
+    expect(q.ScanIndexForward).toBe(false);
+    expect(q.Limit).toBe(500);
+  });
+
+  it("re-joins newest-first pages back into chronological order", async () => {
+    // The table hands back "third", "second" then "first"; the caller wants the
+    // text in the order the human would have watched it stream.
+    const { ddb } = eventsPages([
+      { Items: [streamFrame("third "), streamFrame("second ")], LastEvaluatedKey: { k: 1 } },
+      { Items: [streamFrame("first ")] },
+    ]);
+    expect(await lastStreamedText(ddb, "events", "wf_1", "dev_agent", "TEAM-2", 600))
+      .toBe("first second third ");
+  });
+
+  it("stops as soon as maxChars is collected (no needless pages)", async () => {
+    const { ddb, inputs } = eventsPages([
+      { Items: [streamFrame("z".repeat(40)), streamFrame("y".repeat(40))], LastEvaluatedKey: { k: 1 } },
+      { Items: [streamFrame("x".repeat(40))] },
+    ]);
+    const out = await lastStreamedText(ddb, "events", "wf_1", "dev_agent", "TEAM-2", 50);
+    expect(inputs).toHaveLength(1);
+    // Both frames from the first page are kept — the budget is a floor to stop
+    // paging at, and the CALLER clips to its exact character budget.
+    expect(out).toBe("y".repeat(40) + "z".repeat(40));
+  });
+
+  it("skips frames stamped with a DIFFERENT ticket, keeps unstamped ones", async () => {
+    const { ddb } = eventsPages([{
+      Items: [
+        streamFrame("mine ", { ticketId: "TEAM-2" }),
+        streamFrame("theirs ", { ticketId: "TEAM-9" }),
+        streamFrame("unstamped "),
+      ],
+    }]);
+    expect(await lastStreamedText(ddb, "events", "wf_1", "dev_agent", "TEAM-2", 600))
+      .toBe("unstamped mine ");
+  });
+
+  it("ignores non-string / empty content and returns '' when nothing streamed", async () => {
+    const { ddb } = eventsPages([{ Items: [streamFrame(""), streamFrame(undefined), { detail: {} }] }]);
+    expect(await lastStreamedText(ddb, "events", "wf_1", "dev_agent", "TEAM-2", 600)).toBe("");
+  });
+
+  it("bounds paging at 20 pages even when the table keeps handing back a cursor", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [], LastEvaluatedKey: { k: 1 } }]);
+    await lastStreamedText(ddb, "events", "wf_1", "dev_agent", "TEAM-2", 600);
+    expect(inputs).toHaveLength(20);
+  });
+});
+
+describe("hasAgentErrorSince (TEAM-4120 FR-3)", () => {
+  const errRow = (over = {}) => ({ type: "agent.error", detail: { ticketId: "TEAM-2", ...over } });
+
+  it("filters to agent.error on this ticket since the claim, excluding dead_session", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(10 * 60_000));
+    const q = inputs[0];
+    expect(q.FilterExpression).toContain("#t = :err");
+    expect(q.FilterExpression).toContain("detail.ticketId = :tid");
+    expect(q.FilterExpression).toContain("#ts >= :since");
+    // The detector's own death announcement is not the AGENT reporting failure —
+    // counting it would suppress synthesis for every dead session.
+    expect(q.FilterExpression).toContain("detail.reason <> :dead");
+    expect(q.ExpressionAttributeValues[":err"]).toBe("agent.error");
+    expect(q.ExpressionAttributeValues[":dead"]).toBe("dead_session");
+    expect(q.ExpressionAttributeNames).toMatchObject({ "#t": "type", "#ts": "timestamp" });
+  });
+
+  it("true on the first non-empty page, false when nothing matched", async () => {
+    const { ddb } = eventsPages([{ Items: [errRow({ reason: "tool_failure" })] }]);
+    expect(await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(0))).toBe(true);
+
+    const empty = eventsPages([{ Items: [] }]);
+    expect(await hasAgentErrorSince(empty.ddb, "events", "wf_1", "TEAM-2", iso(0))).toBe(false);
+  });
+
+  it("no claim start = nothing to compare against: false without a single read", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [errRow()] }]);
+    expect(await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", undefined)).toBe(false);
+    expect(inputs).toHaveLength(0);
   });
 });

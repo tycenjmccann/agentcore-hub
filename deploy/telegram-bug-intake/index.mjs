@@ -864,6 +864,126 @@ const ESC_DETAIL_MAX = 700;
 // claimTerminalOutcome: complete / cancelled / deploy-blocked / static-ci-only.
 const TERMINAL_PHASES = new Set(["complete", "completed", "cancelled", "canceled", "failed", "deploy-blocked", "static-ci-only"]);
 
+// TEAM-4120 FR-3 — a dead-session escalation is a different DECISION from a
+// Workflow Manager escalation: the run is not asking "what should I do", it is
+// telling you an agent died, what evidence survived, and what it did about it.
+// These three reviewers are the emitters of that page (the two exhausted-retry
+// emitters kept their legacy reviewer strings, so old rows still land here).
+const DEAD_SESSION_REVIEWERS = new Set(["dead-session-detector", "reconcile-sweep", "dead-session-escalation"]);
+
+// ─── byte-identical copy — parity test in deploy/telegram-bug-intake/redact-parity.test.mjs ───
+// Copied VERBATIM from lambda/orchestrator/dead-session-escalation.mjs. The page
+// already carries a redacted `lastText`, but this Lambda re-redacts before it
+// leaves the account: a legacy row (written before FR-3) is raw, and Telegram is
+// off-account, so the last line of defense belongs here. Do NOT "improve" one
+// copy — the parity test asserts the two function bodies are byte-equal.
+function clipText(s, n) {
+  const str = typeof s === "string" ? s : "";
+  if (n <= 0) return "";
+  return str.length > n ? `${str.slice(0, Math.max(0, n - 1))}…` : str;
+}
+
+function redactText(s) {
+  let t = typeof s === "string" ? s : "";
+  if (!t) return "";
+  const R = "[REDACTED]";
+
+  // Private keys first — the multi-line blob would otherwise be shredded by the
+  // whitespace collapse below and never match.
+  t = t.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, R);
+
+  // Presigned-URL query strings: keep the path (it identifies the artifact),
+  // redact every value (SigV4 signature/credential live here).
+  t = t.replace(/([a-zA-Z][\w+.-]*:\/\/[^\s?]+\?)([^\s]*)/g, (_m, head, qs) =>
+    head + qs.replace(/([^&=]+)=([^&]*)/g, (__, k) => `${k}=${R}`)
+  );
+  // …and bare SigV4 params that arrive without a host (log lines, curl echoes).
+  // The value stops at `&` so a param list keeps every KEY NAME visible instead
+  // of a single greedy match swallowing the rest of the query.
+  t = t.replace(/X-Amz-(Signature|Credential|Security-Token|Algorithm|Date|Expires|SignedHeaders)=[^\s&]+/gi,
+    (_m, p) => `X-Amz-${p}=${R}`);
+
+  // Provider tokens — longest/most specific patterns first.
+  t = t.replace(/github_pat_[A-Za-z0-9_]{20,}/g, R);
+  t = t.replace(/ghp_[A-Za-z0-9]{36}/g, R);
+  t = t.replace(/gh[osur]_[A-Za-z0-9]{36}/g, R);
+  t = t.replace(/(?:AKIA|ASIA)[0-9A-Z]{16}/g, R);
+  t = t.replace(/aws_secret_access_key\s*[=:]\s*\S+/gi, `aws_secret_access_key=${R}`);
+  t = t.replace(/xox[abprs]-[A-Za-z0-9-]+/g, R);
+  t = t.replace(/hooks\.slack\.com\/services\/\S+/g, `hooks.slack.com/services/${R}`);
+  t = t.replace(/eyJ[\w-]+\.[\w-]+\.[\w-]+/g, R);              // JWT
+  t = t.replace(/\b\d{8,10}:[A-Za-z0-9_-]{35}\b/g, R);          // Telegram bot token
+  t = t.replace(/sk-ant-[A-Za-z0-9_-]{20,}/g, R);
+  t = t.replace(/sk-[A-Za-z0-9]{20,}/g, R);
+  t = t.replace(/ATATT[A-Za-z0-9_-]{20,}/g, R);                 // Jira API token
+  t = t.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, `Bearer ${R}`);
+  // `Authorization: <scheme> <credential>` — the scheme name is not the secret,
+  // so step OVER a known one and redact what follows. A bare `Authorization: xyz`
+  // (no scheme) still matches via the optional group.
+  t = t.replace(/Authorization:\s*(?:(Bearer|Basic|Token|Digest|AWS4-HMAC-SHA256)\s+)?\S+/gi,
+    (_m, scheme) => `Authorization: ${scheme ? `${scheme} ` : ""}${R}`);
+
+  // Generic key=value — keep the KEY NAME (it tells the human what leaked) and
+  // redact the value. Runs last so the specific patterns above win.
+  t = t.replace(/(api[_-]?key|password|passwd|secret|token)(\s*[=:]\s*)(\S+)/gi,
+    (_m, k, sep) => `${k}${sep}${R}`);
+
+  // Emails: a page goes to a chat channel, so PII gets a placeholder, not [REDACTED].
+  t = t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "<email>");
+
+  // Finally make it one readable line: drop ANSI + code fences/backticks, collapse
+  // whitespace. (After redaction, so a fence can't hide a pattern boundary.)
+  // eslint-disable-next-line no-control-regex
+  t = t.replace(/\[[0-9;]*[A-Za-z]/g, "");
+  t = t.replace(/```+/g, " ").replace(/`/g, "");
+  return t.replace(/\s+/g, " ").trim();
+}
+
+/** One line per disposition: what the tree DID, in the imperative the human needs. */
+const DEAD_SESSION_SUMMARY = {
+  parked: (n) => `Parked on gate ${n.gateTicketId || "(unknown)"} — approve it to re-run`,
+  synthesized_children: () => "Waiting on children; auto-resumes when they finish",
+  synthesized_completion: () => "Completion record found; marked done",
+  shadow: (n) => `Observe-only (shadow) — would have ${n.wouldSynthesize ? "synthesized" : "parked"}`,
+};
+
+/**
+ * Render a dead-session page through the ONE exec shape. Legacy rows (the
+ * pre-FR-3 evidence-free notification, and anything written while the flag is
+ * off) carry no disposition/evidence — they fall back to their own details text
+ * and still get the DEAD SESSION kicker, because the DECISION is the same.
+ */
+function deadSessionPing(wf, notif, legacyDetails) {
+  const disposition = String(notif.disposition || "");
+  const summary = DEAD_SESSION_SUMMARY[disposition]?.(notif) || legacyDetails;
+  const lastText = redactText(notif.lastText || "");
+  const children = Array.isArray(notif.children) ? notif.children : [];
+  const artifacts = notif.artifacts || {};
+  const tid = notif.ticketId || "";
+  return execPing({
+    kicker: "🚨 DEAD SESSION",
+    subject: `${tid || wf.workflowId} · ${clipText(notif.ticketTitle || notif.title || wf.input?.title || "", 80)}`,
+    summary,
+    bullets: [
+      `🤖 ${notif.agentId || "unknown agent"} (${notif.source || notif.reviewer || "unknown"})`,
+      lastText ? `💬 Last said: "${clipText(lastText, 240)}"` : "💬 Last said: (nothing streamed)",
+      `👶 Children: ${children.length ? children.join(", ") : "none"}`,
+      `📦 Artifacts: ${artifacts.completionRecord ? "completion record ✓" : "no completion record"}${artifacts.prUrl ? ` · PR ${artifacts.prUrl}` : ""}`,
+    ],
+    meta: [
+      tid
+        ? (JIRA_SITE_URL
+            ? `🎫 [${tid}](https://${JIRA_SITE_URL}/browse/${tid})`
+            : `🎫 [${tid}](${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)})`)
+        : "",
+      disposition === "parked" ? "⏸ run parked until you resolve" : "",
+    ],
+    ask: disposition === "parked"
+      ? "Approve the escalation gate to re-run the agent, then tap Resolved."
+      : "Tap Resolved once handled — the watch scheduler skips this run while the escalation is open.",
+  });
+}
+
 async function scanManagerEscalations() {
   const res = await fetch(`${HUB_API_URL}/api/workflow/list`);
   if (!res.ok) throw new Error(`workflow/list ${res.status}`);
@@ -897,13 +1017,17 @@ async function scanManagerEscalations() {
 
       const details = String(notif.details || notif.message || "").trim();
       const clipped = details.length > ESC_DETAIL_MAX ? `${details.slice(0, ESC_DETAIL_MAX)}…` : details;
-      const text = execPing({
-        kicker: "🚨 WORKFLOW MANAGER ESCALATION",
-        subject: wf.input?.title || wf.workflowId,
-        summary: clipped,
-        meta: ["⏸ run parked until you resolve"],
-        ask: "Tap Resolved once handled — the watch scheduler skips this run while the escalation is open.",
-      });
+      const text = DEAD_SESSION_REVIEWERS.has(String(notif.reviewer || ""))
+        ? deadSessionPing(wf, notif, clipped)
+        : execPing({
+            kicker: "🚨 WORKFLOW MANAGER ESCALATION",
+            subject: wf.input?.title || wf.workflowId,
+            summary: clipped,
+            meta: ["⏸ run parked until you resolve"],
+            ask: "Tap Resolved once handled — the watch scheduler skips this run while the escalation is open.",
+          });
+      // The keyboard + claim keys are deliberately IDENTICAL for both shapes:
+      // resolving is the same action whichever page you are looking at.
       const keyboard = { inline_keyboard: [
         [{ text: "✅ Resolved — resume watching", callback_data: `eok|${wf.workflowId}` }],
         [{ text: "📱 Open run in hub", url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}` }],

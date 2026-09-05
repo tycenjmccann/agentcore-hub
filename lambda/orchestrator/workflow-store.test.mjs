@@ -10,6 +10,7 @@ import {
   markDeadSessionDetected,
   clearDeadSessionDetected,
   incrementDeadSessionRetry,
+  claimDeadSessionSynthesis,
   advancePhase,
   setResumeContext,
   setRepoCheck,
@@ -26,6 +27,9 @@ import {
   appendReworkRound,
   appendReworkEscalation,
   appendReworkAuthorization,
+  markGateRequested,
+  markGateRejected,
+  markGateApproved,
 } from "./workflow-store.mjs";
 
 /**
@@ -260,6 +264,26 @@ describe("incrementDeadSessionRetry", () => {
     );
     expect(bump.input.ExpressionAttributeNames["#tid"]).toBe("TEAM-2");
     expect(bump.input.ReturnValues).toBe("UPDATED_NEW");
+  });
+});
+
+describe("claimDeadSessionSynthesis (TEAM-4120 FR-3)", () => {
+  it("seeds the map, then claims the per-ticket leaf with attribute_not_exists", async () => {
+    const ok = await claimDeadSessionSynthesis("wf_1", "TEAM-2");
+    expect(ok).toBe(true);
+    // Step 1 has NO condition (idempotent seed — DynamoDB rejects SET a.b when a
+    // is missing), step 2 carries the CAS.
+    expect(writes()[0].input.UpdateExpression).toContain("if_not_exists(deadSessionSynthesized, :empty)");
+    expect(writes()[0].input.ConditionExpression).toBeUndefined();
+    const claim = writes()[1];
+    expect(claim.input.UpdateExpression).toBe("SET deadSessionSynthesized.#tid = :one");
+    expect(claim.input.ConditionExpression).toBe("attribute_not_exists(deadSessionSynthesized.#tid)");
+    expect(claim.input.ExpressionAttributeNames["#tid"]).toBe("TEAM-2");
+  });
+
+  it("returns false when the synthesis was already spent (CCFE), never throws", async () => {
+    failNextCondition = true;
+    await expect(claimDeadSessionSynthesis("wf_1", "TEAM-2")).resolves.toBe(false);
   });
 });
 
@@ -704,5 +728,162 @@ describe("rework lineage ledger (TEAM-4113)", () => {
     expect(writes()[2].input.UpdateExpression).toBe(
       "SET reworkLineage.#k.authorizations = list_append(if_not_exists(reworkLineage.#k.authorizations, :empty), :a)"
     );
+  });
+});
+
+
+/**
+ * Review-gate state machine (TEAM-4120 FR-1). Same two-seed-then-CAS shape as the
+ * ledgers above, but the CAS is the POINT here, not an optimization: it is what
+ * makes "one human decision = one recorded transition" true when the Jira-webhook
+ * and DDB-stream twins both fire for the same `→ blocked`.
+ */
+describe("gate state machine (TEAM-4120 FR-1)", () => {
+  const AT = "2026-09-05T12:00:00.000Z";
+  const REQ_AT = "2026-09-05T10:00:00.000Z";
+
+  /** A client that returns `Attributes` for the ALL_NEW CAS write. */
+  const returning = (gateStates) =>
+    initWorkflowStore(
+      {
+        async send(cmd) {
+          sent.push({ type: cmd.constructor.name, input: cmd.input });
+          return cmd.input.ReturnValues === "ALL_NEW" ? { Attributes: { workflowId: "wf_1", gateStates } } : {};
+        },
+      },
+      "workflows-test"
+    );
+
+  /** A client whose CAS write fails with something OTHER than a lost condition. */
+  const throwing = () =>
+    initWorkflowStore(
+      {
+        async send(cmd) {
+          sent.push({ type: cmd.constructor.name, input: cmd.input });
+          if (cmd.input.ConditionExpression) throw new Error("ProvisionedThroughputExceededException");
+          return {};
+        },
+      },
+      "workflows-test"
+    );
+
+  describe("markGateRequested", () => {
+    it("seeds gateStates + the per-gate entry, then CASes state <> requested", async () => {
+      expect(await markGateRequested("wf_1", "TEAM-900", AT)).toBe(true);
+      const w = writes();
+      expect(w).toHaveLength(3);
+      expect(w[0].input.UpdateExpression).toBe("SET gateStates = if_not_exists(gateStates, :empty)");
+      expect(w[1].input.UpdateExpression).toBe("SET gateStates.#g = if_not_exists(gateStates.#g, :seed)");
+      // "none", NOT "requested": a seeded-but-never-presented gate must classify
+      // as "no usable state", never as a pending review.
+      expect(w[1].input.ExpressionAttributeValues[":seed"]).toEqual({ state: "none", cycles: [] });
+      expect(w[1].input.ExpressionAttributeNames["#g"]).toBe("TEAM-900");
+      expect(w[2].input.UpdateExpression).toBe(
+        "SET gateStates.#g.#st = :req, gateStates.#g.requestedAt = :at"
+      );
+      expect(w[2].input.ConditionExpression).toBe("gateStates.#g.#st <> :req");
+      expect(w[2].input.ExpressionAttributeNames).toEqual({ "#g": "TEAM-900", "#st": "state" });
+      expect(w[2].input.ExpressionAttributeValues).toEqual({ ":req": "requested", ":at": AT });
+      expect(w[2].input.Key).toEqual({ workflowId: "wf_1" });
+    });
+
+    it("returns false when the gate is already requested (re-park is a no-op)", async () => {
+      // The seeds carry no ConditionExpression, so the injected failure lands on
+      // the CAS — an already-pending gate must NOT get a fresh requestedAt, which
+      // would restart the human's clock on every cascade re-wake.
+      failNextCondition = true;
+      expect(await markGateRequested("wf_1", "TEAM-900", AT)).toBe(false);
+    });
+
+    it("rethrows anything that is not a lost condition", async () => {
+      throwing();
+      await expect(markGateRequested("wf_1", "TEAM-900", AT)).rejects.toThrow(
+        "ProvisionedThroughputExceededException"
+      );
+    });
+  });
+
+  describe("markGateRejected", () => {
+    it("CASes requested → rejected and list_appends the closed cycle", async () => {
+      await markGateRejected("wf_1", "TEAM-900", AT, { requestedAt: REQ_AT });
+      const w = writes();
+      expect(w).toHaveLength(3);
+      expect(w[2].input.UpdateExpression).toBe(
+        "SET gateStates.#g.#st = :rej, gateStates.#g.resolvedAt = :at, " +
+          "gateStates.#g.cycles = list_append(if_not_exists(gateStates.#g.cycles, :empty), :cycle)"
+      );
+      // Only a PENDING review can become a rejection — that is the whole guard.
+      expect(w[2].input.ConditionExpression).toBe("gateStates.#g.#st = :req");
+      expect(w[2].input.ExpressionAttributeValues[":cycle"]).toEqual([
+        { requestedAt: REQ_AT, resolvedAt: AT, outcome: "rejected" },
+      ]);
+      expect(w[2].input.ReturnValues).toBe("ALL_NEW");
+    });
+
+    it("returns the POST-write gate row so the caller sees the state it just wrote", async () => {
+      const row = { state: "rejected", requestedAt: REQ_AT, resolvedAt: AT, cycles: [{ outcome: "rejected" }] };
+      returning({ "TEAM-900": row });
+      expect(await markGateRejected("wf_1", "TEAM-900", AT, { requestedAt: REQ_AT })).toEqual(row);
+    });
+
+    it("returns null when the CAS is lost — the other twin already recorded it", async () => {
+      failNextCondition = true;
+      expect(await markGateRejected("wf_1", "TEAM-900", AT, { requestedAt: REQ_AT })).toBeNull();
+    });
+
+    it("returns null when the row is gone rather than inventing a state", async () => {
+      expect(await markGateRejected("wf_1", "TEAM-900", AT, {})).toBeNull();
+    });
+
+    it("records requestedAt as null (never undefined) so the cycle keeps the key", async () => {
+      // The DocumentClient strips undefined values; a dropped requestedAt would
+      // silently lose the cycle's duration.
+      await markGateRejected("wf_1", "TEAM-900", AT);
+      expect(writes()[2].input.ExpressionAttributeValues[":cycle"]).toEqual([
+        { requestedAt: null, resolvedAt: AT, outcome: "rejected" },
+      ]);
+    });
+
+    it("rethrows anything that is not a lost condition", async () => {
+      throwing();
+      await expect(markGateRejected("wf_1", "TEAM-900", AT, {})).rejects.toThrow(
+        "ProvisionedThroughputExceededException"
+      );
+    });
+  });
+
+  describe("markGateApproved", () => {
+    it("accepts requested OR rejected as the prior state (TEAM-3974 re-decides)", async () => {
+      await markGateApproved("wf_1", "TEAM-900", AT, { requestedAt: REQ_AT });
+      const w = writes();
+      expect(w[2].input.UpdateExpression).toBe(
+        "SET gateStates.#g.#st = :app, gateStates.#g.resolvedAt = :at, " +
+          "gateStates.#g.cycles = list_append(if_not_exists(gateStates.#g.cycles, :empty), :cycle)"
+      );
+      expect(w[2].input.ConditionExpression).toBe("gateStates.#g.#st IN (:req, :rej)");
+      expect(w[2].input.ExpressionAttributeValues[":app"]).toBe("approved");
+      expect(w[2].input.ExpressionAttributeValues[":cycle"]).toEqual([
+        { requestedAt: REQ_AT, resolvedAt: AT, outcome: "approved" },
+      ]);
+      expect(w[2].input.ReturnValues).toBe("ALL_NEW");
+    });
+
+    it("returns null on a lost CAS (already approved → the repeated ack is a no-op)", async () => {
+      failNextCondition = true;
+      expect(await markGateApproved("wf_1", "TEAM-900", AT, {})).toBeNull();
+    });
+
+    it("returns the POST-write gate row", async () => {
+      const row = { state: "approved", requestedAt: REQ_AT, resolvedAt: AT, cycles: [{ outcome: "approved" }] };
+      returning({ "TEAM-900": row });
+      expect(await markGateApproved("wf_1", "TEAM-900", AT, { requestedAt: REQ_AT })).toEqual(row);
+    });
+
+    it("rethrows anything that is not a lost condition", async () => {
+      throwing();
+      await expect(markGateApproved("wf_1", "TEAM-900", AT, {})).rejects.toThrow(
+        "ProvisionedThroughputExceededException"
+      );
+    });
   });
 });

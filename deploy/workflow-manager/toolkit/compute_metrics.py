@@ -12,7 +12,14 @@ All functions are pure (no AWS calls) so they can be unit-tested locally:
 import argparse
 import json
 import os
+import sys
 from datetime import datetime, timezone
+
+# Sibling module in this same toolkit dir. Running as a script already puts that
+# dir on sys.path, but adding it explicitly keeps the import working when this
+# module is imported by name (the unit tests do exactly that).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from events import dedupe_events  # noqa: E402
 
 HUMAN_PREFIX = "human:"
 FIX_PREFIX = "Fix:"
@@ -218,8 +225,13 @@ def compute_tokens(events, missing):
 def compute_metrics(dossier):
     workflow = dossier.get("workflow") or {}
     tickets = dossier.get("tickets") or []
+    # Dedupe FIRST, before the sort and before anything counts a row. pull_dossier
+    # now collapses the double-write at collection time, but every dossier saved
+    # before that change still carries both copies of every event — and with them
+    # doubled human-review cycles, doubled rework counts and doubled event totals.
+    # Deduping again here is idempotent and makes old dossiers compute clean.
     events = sorted(
-        dossier.get("events") or [],
+        dedupe_events(dossier.get("events") or []),
         key=lambda e: (e.get("timestamp", ""), e.get("eventId", "")),
     )
     missing = list(dossier.get("missingSignals") or [])
