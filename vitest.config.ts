@@ -107,6 +107,11 @@ export default defineConfig({
       // cap: asserts the lineage cap trips at maxRounds and signals ONCE, while
       // a per-gate-id ledger (the review-cap's keying) never reaches the cap.
       "lambda/orchestrator/rework-loop-replay.test.mjs",
+      // jira-fix-label (TEAM-4113) — mapJiraIssueToTicket reconstructs an agent-
+      // filed fix ticket's spawnedBy.kind from the `fix:<kind>` label the jira
+      // tools Lambda stamps, so Jira-mode fixes gate completion + the rework cap
+      // the same as DynamoDB mode. Pure map, no I/O.
+      "lambda/orchestrator/jira-fix-label.test.mjs",
       // done-handlers-cascade (TEAM-3688 F3) — HANDLER-level cascade coverage.
       // Invokes the REAL handleTicketDoneUnified + handleTicketDone from index.mjs
       // through the REAL cascade (cascade.mjs/lease.mjs unmocked; only AWS/store

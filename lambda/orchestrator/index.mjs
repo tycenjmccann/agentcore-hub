@@ -4134,12 +4134,16 @@ function mapJiraStatus(name) {
   return map[name.toLowerCase()] || name.toLowerCase().replace(/\s+/g, "_");
 }
 
-function mapJiraIssueToTicket(issue) {
+export function mapJiraIssueToTicket(issue) {
   const f = issue.fields || {};
   const labels = f.labels || [];
   const agentLabel = labels.find(l => l.startsWith("agent:"));
   const reviewerLabel = labels.find(l => l.startsWith("reviewer:"));
   const wfLabel = labels.find(l => l.startsWith("wf:"));
+  // TEAM-4113: reconstruct an agent-filed fix ticket's origin kind from the
+  // `fix:<kind>` label the tickets Lambdas stamp. Keeps Jira-mode tickets
+  // carrying spawnedBy.kind so the completion gate + rework-loop cap see them.
+  const fixLabel = labels.find(l => l.startsWith("fix:"));
 
   // Extract blockedBy from issue links
   // From this ticket's perspective: if it has an inwardIssue with type "is blocked by",
@@ -4180,6 +4184,8 @@ function mapJiraIssueToTicket(issue) {
     blockedBy,
     comments: jiraComments,
     ...(reviewComment ? { reviewComment } : {}),
+    // TEAM-4113: agent-filed fix ticket → spawnedBy.kind (mirrors DynamoDB mode).
+    ...(fixLabel ? { spawnedBy: { kind: fixLabel.slice("fix:".length) } } : {}),
     artifacts: [],
   };
 }
