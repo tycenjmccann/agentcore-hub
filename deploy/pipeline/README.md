@@ -92,6 +92,10 @@ Env (all optional except the owner; defaults derive from `deploy/config.sh`):
    - Blueprints: set `PIPELINE_ENABLED=1` on the fleet/orchestrator context —
      the CI, QA, and release-manager blueprints then read pipeline results
      instead of shelling builds. Unset → they behave exactly as before.
+     If the fleet ships more than one repo, also set `PIPELINE_REPOS=owner/repo`
+     to the repo this pipeline deploys — runs on other repos then keep the
+     legacy DEPLOY.md / self-run path instead of being pointed at a pipeline
+     that does not deploy them.
 
 ## Removing / not using it
 
