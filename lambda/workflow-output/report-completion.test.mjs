@@ -136,6 +136,47 @@ describe("F18 — source is server-stamped, never taken from the caller", () => 
   });
 });
 
+/**
+ * TEAM-4099 F4 — the ONE write direction that is allowed to overwrite.
+ *
+ * The orchestrator's salvage path (evidence.mjs synthesizeCompletion) creates
+ * completions/<tid>.json with `IfNoneMatch: "*"`, so a synthesis can never
+ * clobber an agent's record. Here the reverse is intentional and unconditional:
+ * an agent reporting after the salvage guessed must replace
+ * `source: "synthesized"` with its own report (the done cascade's harvest then
+ * promotes the task row's evidenceSource off "synthesized"). An existing
+ * `source: "agent"` record means the same agent is re-reporting — last write
+ * wins, as it always has.
+ */
+describe("TEAM-4099 F4 — real report_completion overwrites the record unconditionally", () => {
+  it("writes the record with no IfNoneMatch / IfMatch precondition", async () => {
+    const res = await report({
+      ticket_id: "TEAM-4001", summary: "done", workflow_id: "wf1",
+      agent_id: "agentcore_hub_backend_dev",
+    });
+    expect(res.isError).toBeFalsy();
+    expect(completionPuts()).toHaveLength(1);
+    expect(completionPuts()[0].IfNoneMatch).toBeUndefined();
+    expect(completionPuts()[0].IfMatch).toBeUndefined();
+    expect(completionPuts()[0].Key).toBe("completions/TEAM-4001.json");
+  });
+
+  it("real beats synthesized: a second, re-report still lands at the same key", async () => {
+    await report({
+      ticket_id: "TEAM-4001", summary: "first", workflow_id: "wf1",
+      agent_id: "agentcore_hub_backend_dev",
+    });
+    await report({
+      ticket_id: "TEAM-4001", summary: "corrected", workflow_id: "wf1",
+      agent_id: "agentcore_hub_backend_dev",
+    });
+    const puts = completionPuts();
+    expect(puts).toHaveLength(2);
+    expect(puts.every((p) => p.Key === "completions/TEAM-4001.json")).toBe(true);
+    expect(JSON.parse(puts[1].Body)).toMatchObject({ summary: "corrected", source: "agent" });
+  });
+});
+
 describe("F17 — a report must come from the ticket's own assignee", () => {
   it("refuses a human-gate ticket with no write and no transition", async () => {
     const res = await report({

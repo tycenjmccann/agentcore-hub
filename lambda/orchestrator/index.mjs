@@ -1426,6 +1426,21 @@ async function transitionTicketToDone(ticketId) {
  * TEAM-3991 D1.2 — harvest completion evidence from GitHub for an agent that
  * pushed a branch/PR but died before report_completion. evidence.mjs never
  * fabricates: no commits ahead and no PR ⇒ no writes, no transition.
+ *
+ * TEAM-4099 F4 — every caller funnels through here, so the synthesis claim +
+ * conditional writes inside evidence.mjs cover all four trigger paths. `s3Get`
+ * throwing is the absent-key shape; `s3PutIfAbsent` is a CONDITIONAL create
+ * (`IfNoneMatch: "*"`) reporting `{ written: false }` on the 412, which is how
+ * evidence.mjs learns a real report_completion already owns the record. Any
+ * other S3 error still throws (a synthesis that cannot prove the key was free
+ * must abort, not overwrite).
+ *
+ * `@aws-sdk/client-s3` is now PINNED in this Lambda's package.json for exactly
+ * this reason: PutObject's IfNoneMatch needs SDK >= 3.6xx (Aug 2024), and an SDK
+ * that predates it drops the unknown param silently — the conditional create
+ * would degrade into the unconditional overwrite this guard replaces. Depending
+ * on the nodejs20.x runtime-provided SDK version is not a safe basis for a
+ * correctness guarantee. No extra IAM: IfNoneMatch rides on s3:PutObject.
  */
 async function synthesizeCompletionFor(workflow, ticket) {
   if (!ARTIFACT_BUCKET) return { synthesized: false, reason: "no_bucket" };
@@ -1440,10 +1455,20 @@ async function synthesizeCompletionFor(workflow, ticket) {
         const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
         return await res.Body.transformToString();
       },
-      s3Put: async (key, body) => {
-        await s3.send(new PutObjectCommand({
-          Bucket: ARTIFACT_BUCKET, Key: key, Body: body, ContentType: "application/json",
-        }));
+      s3PutIfAbsent: async (key, body) => {
+        try {
+          await s3.send(new PutObjectCommand({
+            Bucket: ARTIFACT_BUCKET, Key: key, Body: body, ContentType: "application/json",
+            IfNoneMatch: "*",
+          }));
+          return { written: true };
+        } catch (err) {
+          const status = err?.$metadata?.httpStatusCode;
+          if (err?.name === "PreconditionFailed" || err?.Code === "PreconditionFailed" || status === 412) {
+            return { written: false, reason: "precondition_failed" };
+          }
+          throw err;
+        }
       },
       store,
       transitionTicket: transitionTicketToDone,
@@ -1638,13 +1663,24 @@ async function markTaskComplete(workflow, ticketId, assignee) {
  * Fills only when the entry has no evidence yet (a webhook merge that DID land
  * wins), and never throws — a missing record (human gates, legacy tickets)
  * just means the gate won't see harvested evidence for this ticket.
+ *
+ * TEAM-4099 F4 — SYNTHESIZED evidence is the one exception to "a merge that DID
+ * land wins": a synthesized row carries both `output` and `commitSha`, so it
+ * satisfied hasEvidence && hasShipSignal and permanently blocked the agent's own
+ * (later) report_completion from ever being harvested — the row kept
+ * `evidenceSource: "synthesized"` and the real summary was never promoted. Real
+ * beats synthesized, so a synthesized row counts as NOT having evidence here and
+ * a real record overwrites it (stamping `evidenceSource: "agent"`). A synthesized
+ * record over a synthesized row has nothing to promote and is skipped.
  */
 async function harvestCompletionEvidence(workflow, ticketId) {
   if (!ARTIFACT_BUCKET) return;
   const entry = workflow.agentTasks?.[ticketId];
+  const synthesizedRow = entry?.evidenceSource === "synthesized";
   const hasEvidence =
-    (typeof entry?.output === "string" && entry.output.trim().length > 0) ||
-    (typeof entry?.artifactKey === "string" && entry.artifactKey.length > 0);
+    !synthesizedRow &&
+    ((typeof entry?.output === "string" && entry.output.trim().length > 0) ||
+      (typeof entry?.artifactKey === "string" && entry.artifactKey.length > 0));
   // TEAM-3747 D2: the ship/CD merge-verdict gate needs the merge commit / outcome
   // signals, and a ship ticket almost ALWAYS has a summary (so hasEvidence is
   // true). Harvesting must therefore run when EITHER the deliverable evidence OR
@@ -1664,17 +1700,27 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     const fields = {};
     // Deliverable evidence — only fill when absent (a webhook metadata merge that
     // DID land wins), exactly as before.
-    if (!hasEvidence) {
+    const recordIsReal = String(record.source || "").toLowerCase() !== "synthesized";
+    if (!hasEvidence && (recordIsReal || !synthesizedRow)) {
       const summary = typeof record.summary === "string" ? record.summary.trim() : "";
       if (summary) fields.output = summary.slice(0, 10000);
       if (record.branch) fields.branch = record.branch;
+      // Promote the row: someone real spoke after all, so this is no longer
+      // synthesized. Carry the record's own provenance ("agent", or "manager"
+      // from the mark-done override) rather than flattening it.
+      if (recordIsReal && synthesizedRow) {
+        fields.evidenceSource = String(record.source || "agent").toLowerCase();
+      }
     }
     // Ship/CD verdict signals — harvested regardless of deliverable evidence,
     // each filled only when the entry doesn't already carry it (additive; legacy
     // records simply lack these keys). commit_sha/pr_url kept here too so the
     // ship gate + the final PR label can find them.
-    if (record.commit_sha && !entry?.commitSha) fields.commitSha = record.commit_sha;
-    if (record.pr_url && !entry?.prUrl) fields.prUrl = record.pr_url;
+    // F4: a real record also refreshes the commit/PR a synthesis guessed from the
+    // branch head — the agent's own SHA is the authoritative one.
+    const promoting = recordIsReal && synthesizedRow;
+    if (record.commit_sha && (!entry?.commitSha || promoting)) fields.commitSha = record.commit_sha;
+    if (record.pr_url && (!entry?.prUrl || promoting)) fields.prUrl = record.pr_url;
     if (record.merge_commit && !entry?.mergeCommit) fields.mergeCommit = record.merge_commit;
     if (typeof record.outcome === "string" && !entry?.outcome) {
       const oc = record.outcome.trim().toLowerCase();

@@ -34,6 +34,10 @@ import {
   setDagAudit,
   // TEAM-4099 F2
   claimGateBypassFlag,
+  // TEAM-4099 F4
+  claimCompletionSynthesis,
+  setSynthesizedEvidence,
+  releaseCompletionSynthesisClaim,
 } from "./workflow-store.mjs";
 import { isLeaseLive } from "./lease.mjs";
 
@@ -314,6 +318,138 @@ describe("claimGateBypassFlag", () => {
   it("a non-conditional DDB failure propagates (never a silent 'won')", async () => {
     initWorkflowStore({ async send() { throw new Error("throughput exceeded"); } }, "workflows-test");
     await expect(claimGateBypassFlag("wf_1", "TEAM-2", {})).rejects.toThrow("throughput exceeded");
+  });
+});
+
+/**
+ * TEAM-4099 F4 — synthesized completion evidence is a CLAIMED, conditional write.
+ * Four trigger paths can call the synthesizer; the claim makes exactly one of them
+ * the owner, and both follow-up writes refuse to overwrite real evidence.
+ */
+describe("claimCompletionSynthesis (TEAM-4099 F4)", () => {
+  it("claims only an existing, output-free, unclaimed entry", async () => {
+    const res = await claimCompletionSynthesis("wf_1", "TEAM-2", { now: "2026-09-05T12:00:00Z" });
+    expect(res).toEqual({ won: true, claimedAt: "2026-09-05T12:00:00Z" });
+    expect(writes()).toHaveLength(1);
+    const { input } = writes()[0];
+    expect(input.UpdateExpression).toBe("SET agentTasks.#tid.#sc = :ts");
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#out) " +
+      "AND attribute_not_exists(agentTasks.#tid.#sc)"
+    );
+    expect(input.ExpressionAttributeNames).toEqual({
+      "#tid": "TEAM-2", "#sc": "synthesisClaimedAt", "#out": "output",
+    });
+    expect(input.ExpressionAttributeValues).toEqual({ ":ts": "2026-09-05T12:00:00Z" });
+  });
+
+  it("defaults the claim stamp to now when the caller passes none", async () => {
+    const res = await claimCompletionSynthesis("wf_1", "TEAM-2");
+    expect(res.won).toBe(true);
+    expect(Date.parse(res.claimedAt)).toBeGreaterThan(0);
+  });
+
+  it("a second claimant loses: one attempt, no retry, no claimedAt handed back", async () => {
+    failConditionCount = 2; // stamp refused AND the seeding track refused → entry exists
+    expect(await claimCompletionSynthesis("wf_1", "TEAM-2", { now: "t0" })).toEqual({ won: false });
+    const stamps = writes().filter((c) => String(c.input.UpdateExpression).includes("#sc"));
+    expect(stamps).toHaveLength(1);
+  });
+
+  it("an UNTRACKED ticket is seeded first-writer-wins (with the assignee), then claimed", async () => {
+    failConditionCount = 1; // only the first stamp fails — no entry yet
+    const res = await claimCompletionSynthesis("wf_1", "TEAM-99", {
+      now: "t0", seed: { agentId: "agentcore_hub_backend_dev" },
+    });
+    expect(res).toEqual({ won: true, claimedAt: "t0" });
+    const seed = writes().find((c) => c.input.ConditionExpression === "attribute_not_exists(agentTasks.#tid)");
+    expect(seed.input.ExpressionAttributeValues[":task"]).toMatchObject({
+      ticketId: "TEAM-99", status: "pending", agentId: "agentcore_hub_backend_dev",
+    });
+    expect(writes().filter((c) => String(c.input.UpdateExpression).includes("#sc"))).toHaveLength(2);
+  });
+
+  it("a non-conditional DDB failure propagates (never a silent 'won')", async () => {
+    initWorkflowStore({ async send() { throw new Error("throughput exceeded"); } }, "workflows-test");
+    await expect(claimCompletionSynthesis("wf_1", "TEAM-2", {})).rejects.toThrow("throughput exceeded");
+  });
+});
+
+describe("setSynthesizedEvidence (TEAM-4099 F4)", () => {
+  const FIELDS = {
+    output: "[synthesized] 3 commit(s) on feature/x; PR none",
+    branch: "feature/x",
+    commitSha: "ccc333",
+    evidenceSource: "synthesized",
+    synthesizedAt: "2026-09-05T12:00:00Z",
+  };
+
+  it("writes per-field SETs, conditional on no output AND our claim generation", async () => {
+    const res = await setSynthesizedEvidence("wf_1", "TEAM-2", FIELDS, { claimedAt: "2026-09-05T12:00:00Z" });
+    expect(res).toEqual({ applied: true });
+    expect(writes()).toHaveLength(1);
+    const { input } = writes()[0];
+    // Scoped per-field SETs — never a whole-entry replacement (R2).
+    expect(input.UpdateExpression).toMatch(/^SET agentTasks\.#tid\.#f1 = :v1(, agentTasks\.#tid\.#f\d+ = :v\d+)+$/);
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#out) " +
+      "AND agentTasks.#tid.#sc = :claimed"
+    );
+    expect(input.ExpressionAttributeNames["#out"]).toBe("output");
+    expect(input.ExpressionAttributeNames["#sc"]).toBe("synthesisClaimedAt");
+    expect(input.ExpressionAttributeValues[":claimed"]).toBe("2026-09-05T12:00:00Z");
+    expect(Object.values(input.ExpressionAttributeValues)).toContain(FIELDS.output);
+  });
+
+  it("without a claim generation the no-output condition still holds", async () => {
+    expect(await setSynthesizedEvidence("wf_1", "TEAM-2", FIELDS)).toEqual({ applied: true });
+    const { input } = writes()[0];
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#out)"
+    );
+    expect(JSON.stringify(input)).not.toContain("synthesisClaimedAt");
+  });
+
+  it("real evidence landing first wins the CAS — { applied: false }, and NO trackTicket resurrection", async () => {
+    failNextCondition = true;
+    expect(await setSynthesizedEvidence("wf_1", "TEAM-2", FIELDS, { claimedAt: "t0" }))
+      .toEqual({ applied: false, reason: "condition_failed" });
+    expect(writes()).toHaveLength(1); // unlike mergeTaskMetadataOrTrack: no seed + retry
+  });
+
+  it("nothing settable is a no-op, not a write", async () => {
+    expect(await setSynthesizedEvidence("wf_1", "TEAM-2", { output: undefined }, { claimedAt: "t0" }))
+      .toEqual({ applied: false, reason: "nothing_to_set" });
+    expect(writes()).toHaveLength(0);
+  });
+
+  it("a non-conditional DDB failure propagates", async () => {
+    initWorkflowStore({ async send() { throw new Error("throughput exceeded"); } }, "workflows-test");
+    await expect(setSynthesizedEvidence("wf_1", "TEAM-2", FIELDS, {})).rejects.toThrow("throughput exceeded");
+  });
+});
+
+describe("releaseCompletionSynthesisClaim (TEAM-4099 F4)", () => {
+  it("removes ONLY our claim generation, and only while there is still no output", async () => {
+    expect(await releaseCompletionSynthesisClaim("wf_1", "TEAM-2", "t0")).toBe(true);
+    const { input } = writes()[0];
+    expect(input.UpdateExpression).toBe("REMOVE agentTasks.#tid.#sc");
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(agentTasks.#tid) AND agentTasks.#tid.#sc = :claimed " +
+      "AND attribute_not_exists(agentTasks.#tid.#out)"
+    );
+    expect(input.ExpressionAttributeValues).toEqual({ ":claimed": "t0" });
+  });
+
+  it("a stale generation (or landed output) loses the CAS — false, no other write", async () => {
+    failNextCondition = true;
+    expect(await releaseCompletionSynthesisClaim("wf_1", "TEAM-2", "t0")).toBe(false);
+    expect(writes()).toHaveLength(1);
+  });
+
+  it("no generation to release is a no-op", async () => {
+    expect(await releaseCompletionSynthesisClaim("wf_1", "TEAM-2", null)).toBe(false);
+    expect(writes()).toHaveLength(0);
   });
 });
 

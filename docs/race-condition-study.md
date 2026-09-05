@@ -315,3 +315,66 @@ for a later deploy). For any current run a `done` gate with no APPROVE row is si
 verdict `bypass`, `approvalSource: "none"`, reason `gate_done_without_ledger`. A defence that lives
 in only one Lambda is not an authz floor: the fence also covers a status set before the guard
 shipped, or set by a future writer that forgets it.
+
+## Addendum (2026-09-05): synthesized evidence must never outrank real evidence — the synthesis claim
+
+TEAM-4099 F4. The D1.2 salvage path (`evidence.mjs synthesizeCompletion`) harvests GitHub for an
+agent that pushed a branch and died before `report_completion`. It read "no evidence" — no
+`completions/<tid>.json`, no `agentTasks[tid].output` — and then wrote both records
+UNCONDITIONALLY. Four independent triggers reach it: the dead-session detector's stall branch and
+its dead-session branch, the invoke-failure catch, and the prGuard's merged-PR salvage. None of
+them coordinated, and the GitHub probe between the read and the writes takes seconds.
+
+Two failure modes fell out of that. Two triggers firing in the same window both passed the read and
+both synthesized — two S3 records, two row writes, two `done` transitions, two done-cascades. And a
+trigger that read "no evidence" before the agent's own `report_completion` landed then overwrote the
+real record with `source: "synthesized"` and the real row with the `[synthesized] N commit(s)`
+summary. D1.2's rule is never fabricate evidence; clobbering real evidence with a guess is strictly
+worse, because a fabricated summary is at least honest about being one.
+
+The synthesis is now a claimed, conditionally-written operation, and the whole ordering is chosen so
+that every race resolves toward real evidence:
+
+1. precondition read (cheap; keeps the common "already reported" case at zero writes)
+2. `store.claimCompletionSynthesis` — `SET agentTasks.#tid.synthesisClaimedAt` under
+   `attribute_exists(entry) AND attribute_not_exists(output) AND attribute_not_exists(claim)`. First
+   write on the path, before any GitHub call, so a loser spends nothing. Untracked legacy rows are
+   handled the `claimGateBypassFlag` way: seed via `trackTicket`, retry the stamp only if this call
+   created the entry.
+3. GitHub harvest — winner only.
+4. `IfNoneMatch: "*"` create of `completions/<tid>.json`. The durable record goes FIRST because it is
+   what every reader trusts; a real `report_completion` that landed after the claim owns the key and
+   the 412 aborts the synthesis (`record_exists`).
+5. `store.setSynthesizedEvidence` — per-field SETs under `attribute_not_exists(output) AND
+   synthesisClaimedAt = :claimed`. Losing it means real evidence arrived in the gap
+   (`real_evidence_won`); the row is left alone.
+6. only then the provider `done` transition and `agent.completion_synthesized`.
+
+The claim's disposition on abort is the part worth spelling out, because "hold the claim forever" is
+its own bug. It is RELEASED (generation-scoped REMOVE, refused once `output` exists) when the abort
+left nothing durable behind — `no_evidence`, or a throw before the record write — because a sticky
+claim would make the ticket permanently un-synthesizable and a branch that appears ten minutes later
+could never be salvaged, which is the stranded-run bug D1.2 exists to fix. It is KEPT on success and
+on the two terminal aborts (`record_exists`, `real_evidence_won`), where evidence now exists and
+re-synthesis must never happen: there the stamp doubles as a "synthesis is settled here" marker.
+
+The reverse direction is deliberately left unconditional. `lambda/workflow-output`'s real
+`report_completion` still overwrites `completions/<tid>.json` outright — real beats synthesized, and
+an existing `source: "agent"` record means the same agent is re-reporting. The orchestrator's
+`harvestCompletionEvidence` needed the matching fix: a synthesized row carries both `output` and
+`commitSha`, so it satisfied the `hasEvidence && hasShipSignal` short-circuit and permanently blocked
+a later real record from ever reaching the row — the run kept `evidenceSource: "synthesized"` and the
+agent's own summary was never promoted. A synthesized row now counts as NOT having evidence there,
+and a real record overwrites it, carrying its own provenance (`agent`, or `manager` from the
+mark-done override).
+
+`@aws-sdk/client-s3` is now pinned in `lambda/orchestrator/package.json`. `IfNoneMatch` on PutObject
+needs SDK >= 3.6xx (Aug 2024) and an older client drops the unknown parameter SILENTLY — the
+conditional create would degrade into exactly the unconditional overwrite it replaces. A correctness
+guarantee cannot rest on whichever SDK version the managed runtime happens to bundle.
+
+Generalized, alongside R2's "scoped conditional write": a write that INFERS state must be
+conditional on the state it inferred still holding, and the conditional writes must be ordered so
+that the authoritative record is the first thing contended for. Every actor that can perform the
+same inference needs one claim between them, and that claim needs an explicit release policy —
+released while the obligation is still outstanding, kept once it is discharged.

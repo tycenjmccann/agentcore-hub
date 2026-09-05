@@ -314,6 +314,136 @@ export async function claimGateBypassFlag(workflowId, ticketId, { mergeCommit = 
 }
 
 /**
+ * TEAM-4099 F4 — claim the right to SYNTHESIZE completion evidence for ONE ticket.
+ *
+ * Four independent paths call synthesizeCompletion (dead-session detector's stall
+ * and dead-session branches, the invoke-failure catch, and the prGuard's
+ * merged-PR salvage). Each used to read "no evidence yet" and then write
+ * unconditionally, so two triggers could both synthesize (two done-cascades) and
+ * either could land AFTER the agent's real report_completion and overwrite real
+ * evidence with `evidenceSource: "synthesized"`. D1.2 says never fabricate
+ * evidence; clobbering real evidence is worse.
+ *
+ * This is the FIRST write on the synthesis path: stamp `synthesisClaimedAt` ONLY
+ * IF the entry exists, carries no `output` yet (a real report_completion having
+ * landed is disqualifying), and is not already claimed. Losing the CAS means
+ * another actor owns the synthesis — or real output arrived — so the caller
+ * returns with zero writes.
+ *
+ * A ticket whose agent died before any claim landed has no agentTasks entry at
+ * all, and DynamoDB cannot distinguish "no entry" from "already claimed". So,
+ * mirroring claimGateBypassFlag / mergeTaskMetadataOrTrack: on a lost CAS seed
+ * the entry via trackTicket (first-writer-wins) and retry ONLY when this call
+ * created it. Returns { won, claimedAt } — `claimedAt` is the claim GENERATION,
+ * passed back to setSynthesizedEvidence / releaseCompletionSynthesisClaim so
+ * those writes can prove they own the claim they are acting on.
+ */
+export async function claimCompletionSynthesis(workflowId, ticketId, { now: claimedAt, seed = {} } = {}) {
+  const ts = claimedAt || new Date().toISOString();
+  const stamp = async () => {
+    try {
+      await _ddb.send(new UpdateCommand({
+        TableName: _table,
+        Key: { workflowId },
+        UpdateExpression: "SET agentTasks.#tid.#sc = :ts",
+        ConditionExpression:
+          "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#out) " +
+          "AND attribute_not_exists(agentTasks.#tid.#sc)",
+        ExpressionAttributeNames: { "#tid": ticketId, "#sc": "synthesisClaimedAt", "#out": "output" },
+        ExpressionAttributeValues: { ":ts": ts },
+      }));
+      return true;
+    } catch (err) {
+      if (err.name === "ConditionalCheckFailedException") return false;
+      throw err;
+    }
+  };
+
+  if (await stamp()) return { won: true, claimedAt: ts };
+  const created = await trackTicket(workflowId, ticketId, {
+    ticketId,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+    ...seed,
+  });
+  if (!created) return { won: false };
+  return (await stamp()) ? { won: true, claimedAt: ts } : { won: false };
+}
+
+/**
+ * TEAM-4099 F4 — write synthesized evidence onto a task row, but ONLY while it
+ * is still evidence-free.
+ *
+ * The synthesizer's GitHub probe takes seconds; the agent's real
+ * report_completion can land in that window (the S3 record write is conditional
+ * for the same reason). `attribute_not_exists(output)` makes the row write lose
+ * that race by design — real evidence is never overwritten by synthesized. When
+ * a claim generation is supplied, the write also proves ownership of the claim
+ * it was authorized by, so a released-and-reclaimed synthesis can't be finished
+ * by the stale loser. Deliberately does NOT trackTicket on a missing entry: the
+ * claim already established the entry, and resurrecting a vanished row here
+ * would recreate the unconditional write this replaces. Returns { applied }.
+ */
+export async function setSynthesizedEvidence(workflowId, ticketId, fields, { claimedAt } = {}) {
+  const update = taskMetadataUpdate(ticketId, fields);
+  if (!update) return { applied: false, reason: "nothing_to_set" };
+  const names = { ...update.ExpressionAttributeNames, "#out": "output" };
+  const values = { ...update.ExpressionAttributeValues };
+  let condition = `${update.ConditionExpression} AND attribute_not_exists(agentTasks.#tid.#out)`;
+  if (claimedAt) {
+    names["#sc"] = "synthesisClaimedAt";
+    values[":claimed"] = claimedAt;
+    condition += " AND agentTasks.#tid.#sc = :claimed";
+  }
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: update.UpdateExpression,
+      ConditionExpression: condition,
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+    }));
+    return { applied: true };
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return { applied: false, reason: "condition_failed" };
+    throw err;
+  }
+}
+
+/**
+ * TEAM-4099 F4 — drop OUR synthesis claim after an abort that left no durable
+ * evidence behind (no repo, no branch/PR yet, or a thrown probe).
+ *
+ * A sticky claim is not harmless: claimCompletionSynthesis refuses an already
+ * claimed ticket forever, so a run whose branch appears minutes after the first
+ * failed probe could never be salvaged — exactly the stranded-run bug D1.2
+ * exists to fix. Generation-scoped (`synthesisClaimedAt = :claimed`) so we only
+ * ever release the claim we took, and refused once real `output` exists (the
+ * claim has become a permanent "synthesis is settled" marker at that point).
+ * Returns true when the claim was released.
+ */
+export async function releaseCompletionSynthesisClaim(workflowId, ticketId, claimedAt) {
+  if (!claimedAt) return false;
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE agentTasks.#tid.#sc",
+      ConditionExpression:
+        "attribute_exists(agentTasks.#tid) AND agentTasks.#tid.#sc = :claimed " +
+        "AND attribute_not_exists(agentTasks.#tid.#out)",
+      ExpressionAttributeNames: { "#tid": ticketId, "#sc": "synthesisClaimedAt", "#out": "output" },
+      ExpressionAttributeValues: { ":claimed": claimedAt },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
  * TEAM-3991 D2.2 — park an agent's live claim because its ticket was blocked
  * (a fix ticket was filed against it, or a reviewer requested changes). "parked"
  * is deliberately NOT in lease-constants `liveClaimStatuses`, so a parked claim

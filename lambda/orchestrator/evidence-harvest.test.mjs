@@ -240,6 +240,80 @@ describe("completion-evidence harvest on the done cascade", () => {
 });
 
 /**
+ * TEAM-4099 F4 — real evidence supersedes SYNTHESIZED evidence on the row.
+ *
+ * A synthesized row carries both `output` and `commitSha`, so it used to satisfy
+ * `hasEvidence && hasShipSignal` and short-circuit the harvest: the agent's own
+ * report_completion, landing after the salvage guessed, was never promoted onto
+ * the row and `evidenceSource` stayed "synthesized" forever. The synthesizer can
+ * never clobber a real record (conditional S3 create + conditional row write), so
+ * this is the other half of the same rule — real always wins.
+ */
+describe("real report_completion supersedes a synthesized row (TEAM-4099 F4)", () => {
+  const SYNTH_ROW = {
+    output: "[synthesized] 3 commit(s) on feature/x; PR none",
+    branch: "feature/x",
+    commitSha: "guessed0",
+    evidenceSource: "synthesized",
+    synthesizedAt: "2026-09-05T11:00:00Z",
+  };
+
+  it("a real record overwrites the synthesized output and re-stamps evidenceSource=agent", async () => {
+    h.state.workflow = makeWorkflow(SYNTH_ROW);
+    h.state.s3Objects[COMPLETION_KEY] = JSON.stringify({
+      ticket_id: DONE, source: "agent", summary: "The agent's own summary.",
+      branch: "feature/x", commit_sha: "abc123", pr_url: "https://github.com/o/r/pull/7",
+    });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.s3Gets).toContain(COMPLETION_KEY); // NOT short-circuited any more
+    expect(h.state.merges).toHaveLength(1);
+    expect(h.state.merges[0].fields).toEqual({
+      output: "The agent's own summary.",
+      branch: "feature/x",
+      commitSha: "abc123", // the agent's SHA beats the branch-head guess
+      prUrl: "https://github.com/o/r/pull/7",
+      evidenceSource: "agent",
+    });
+    expect(h.state.workflow.agentTasks[DONE].evidenceSource).toBe("agent");
+  });
+
+  it("a manager mark-done record promotes with its own provenance, not 'agent'", async () => {
+    h.state.workflow = makeWorkflow(SYNTH_ROW);
+    h.state.s3Objects[COMPLETION_KEY] = JSON.stringify({
+      ticket_id: DONE, source: "manager", summary: "Closed by the manager.",
+    });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields).toMatchObject({
+      output: "Closed by the manager.",
+      evidenceSource: "manager",
+    });
+  });
+
+  it("a synthesized record over a synthesized row has nothing to promote — no output rewrite", async () => {
+    h.state.workflow = makeWorkflow(SYNTH_ROW);
+    h.state.s3Objects[COMPLETION_KEY] = JSON.stringify({
+      ticket_id: DONE, source: "synthesized", summary: SYNTH_ROW.output, branch: "feature/x", commit_sha: "guessed0",
+    });
+    await handleTicketDoneUnified(DONE);
+    // Only additive verdict signals may land; output/branch/evidenceSource untouched.
+    for (const m of h.state.merges) {
+      expect(m.fields.output).toBeUndefined();
+      expect(m.fields.branch).toBeUndefined();
+      expect(m.fields.evidenceSource).toBeUndefined();
+    }
+    expect(h.state.workflow.agentTasks[DONE].output).toBe(SYNTH_ROW.output);
+  });
+
+  it("a non-synthesized row is unaffected: existing output still wins over the record", async () => {
+    h.state.workflow = makeWorkflow({ output: "webhook merge landed first", mergeCommit: "9f1c2ab" });
+    h.state.s3Objects[COMPLETION_KEY] = RECORD;
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.s3Gets).not.toContain(COMPLETION_KEY); // short-circuit preserved
+    expect(h.state.merges).toHaveLength(0);
+  });
+});
+
+/**
  * TEAM-3747 D2 — the ship/CD verdict signals. The merge-verdict gate reads
  * agentTasks[tid].mergeCommit / .outcome / .blockReason, and the ONLY writer that
  * runs on the live cascade is this harvest. If merge_commit stopped being picked
@@ -549,22 +623,49 @@ describe("synthesizeCompletion", () => {
     "?head=": [{ number: 42, state: "open", merged_at: null, html_url: "https://github.com/o/r/pull/42", head: { sha: "aaa111", ref: BRANCH } }],
   });
 
+  // TEAM-4099 F4 — the store seam is now three CAS-shaped calls, and the S3 put is
+  // a conditional create reporting { written }. `state` lets a test flip any of
+  // them to the losing side without touching the rest of the harness.
   function harness(overrides = {}) {
-    const writes = { merges: [], puts: [], transitions: [], events: [] };
+    const writes = { claims: [], rows: [], puts: [], releases: [], transitions: [], events: [], order: [] };
+    const state = {
+      claimWins: overrides.claimWins !== false,
+      putWritten: overrides.putWritten !== false,
+      rowApplied: overrides.rowApplied !== false,
+    };
     const deps = {
       githubFetch: overrides.gh || fakeGithub(liveRoutes()),
       s3Get: overrides.s3Get || (async () => { throw new Error("NoSuchKey"); }),
-      s3Put: async (key, body) => { writes.puts.push({ key, body }); },
+      s3PutIfAbsent: overrides.s3PutIfAbsent || (async (key, body) => {
+        writes.puts.push({ key, body });
+        writes.order.push("put");
+        return { written: state.putWritten };
+      }),
       store: {
-        mergeTaskMetadataOrTrack: async (id, tid, fields, seed) => { writes.merges.push({ id, tid, fields, seed }); return true; },
+        claimCompletionSynthesis: async (id, tid, opts) => {
+          writes.claims.push({ id, tid, opts });
+          writes.order.push("claim");
+          return state.claimWins ? { won: true, claimedAt: opts?.now } : { won: false };
+        },
+        setSynthesizedEvidence: async (id, tid, fields, opts) => {
+          writes.rows.push({ id, tid, fields, opts });
+          writes.order.push("row");
+          return { applied: state.rowApplied };
+        },
+        releaseCompletionSynthesisClaim: async (id, tid, claimedAt) => {
+          writes.releases.push({ id, tid, claimedAt });
+          writes.order.push("release");
+          return true;
+        },
       },
-      transitionTicket: async (tid, status) => { writes.transitions.push({ tid, status }); },
-      publishEvent: async (tid, type, detail) => { writes.events.push({ tid, type, detail }); },
+      transitionTicket: async (tid, status) => { writes.transitions.push({ tid, status }); writes.order.push("transition"); },
+      publishEvent: async (tid, type, detail) => { writes.events.push({ tid, type, detail }); writes.order.push("event"); },
       now: () => NOW,
       log: { warn: () => {} },
     };
-    return { writes, deps };
+    return { writes, deps, state };
   }
+  const NO_WRITES = { claims: [], rows: [], puts: [], releases: [], transitions: [], events: [], order: [] };
 
   it("TEAM-3790 shape: merges metadata, writes the record, transitions done, emits the event", async () => {
     const { writes, deps } = harness();
@@ -575,9 +676,16 @@ describe("synthesizeCompletion", () => {
     expect(res).toMatchObject({ synthesized: true, branch: BRANCH, commitSha: "ccc333", prUrl: "https://github.com/o/r/pull/42", aheadBy: 3 });
     expect(res.summary).toBe(`[synthesized] 3 commit(s) on ${BRANCH}; PR https://github.com/o/r/pull/42`);
 
-    expect(writes.merges).toHaveLength(1);
-    expect(writes.merges[0]).toMatchObject({ id: "wf_3790", tid: TID, seed: { agentId: AGENT } });
-    expect(writes.merges[0].fields).toEqual({
+    // Claimed first, seeded with the assignee for the never-tracked case.
+    expect(writes.claims).toHaveLength(1);
+    expect(writes.claims[0]).toMatchObject({
+      id: "wf_3790", tid: TID, opts: { now: new Date(NOW).toISOString(), seed: { agentId: AGENT } },
+    });
+    expect(writes.releases).toEqual([]); // evidence now exists — the claim stays
+
+    expect(writes.rows).toHaveLength(1);
+    expect(writes.rows[0]).toMatchObject({ id: "wf_3790", tid: TID, opts: { claimedAt: new Date(NOW).toISOString() } });
+    expect(writes.rows[0].fields).toEqual({
       output: res.summary,
       branch: BRANCH,
       commitSha: "ccc333",
@@ -604,6 +712,9 @@ describe("synthesizeCompletion", () => {
     expect(writes.events).toHaveLength(1);
     expect(writes.events[0].type).toBe("agent.completion_synthesized");
     expect(writes.events[0].detail).toMatchObject({ workflowId: "wf_3790", ticketId: TID, agentId: AGENT, branch: BRANCH, aheadBy: 3 });
+
+    // The ordering F4 mandates: claim → durable record → row → provider done.
+    expect(writes.order).toEqual(["claim", "put", "row", "transition", "event"]);
   });
 
   it("an already-done ticket is not re-transitioned (the rest still lands)", async () => {
@@ -614,27 +725,31 @@ describe("synthesizeCompletion", () => {
     expect(writes.puts).toHaveLength(1);
   });
 
-  it("an existing completion record wins — zero writes", async () => {
+  it("an existing completion record wins — zero writes, not even the claim", async () => {
     const { writes, deps } = harness({ s3Get: async () => JSON.stringify({ ticket_id: TID, summary: "the agent spoke" }) });
     const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "backend-dev", deps });
     expect(res).toEqual({ synthesized: false, reason: "evidence_exists" });
-    expect(writes).toEqual({ merges: [], puts: [], transitions: [], events: [] });
+    expect(writes).toEqual(NO_WRITES);
   });
 
-  it("existing agentTasks output wins too — zero writes", async () => {
+  it("existing agentTasks output wins too — has_output, zero writes", async () => {
     const { writes, deps } = harness();
     const workflow = wf({ agentTasks: { [TID]: { output: "already reported" } } });
     const res = await synthesizeCompletion({ workflow, ticket: tkt(), agentSlug: "backend-dev", deps });
-    expect(res).toEqual({ synthesized: false, reason: "evidence_exists" });
-    expect(writes.merges).toEqual([]);
-    expect(writes.puts).toEqual([]);
+    expect(res).toEqual({ synthesized: false, reason: "has_output" });
+    expect(writes).toEqual(NO_WRITES);
   });
 
-  it("NO branch and NO PR → no_evidence and ZERO writes (never fabricate)", async () => {
+  it("NO branch and NO PR → no_evidence, no record/row writes, and the claim is RELEASED", async () => {
     const { writes, deps } = harness({ gh: fakeGithub({ "state=all&base=main": [] }) });
     const res = await synthesizeCompletion({ workflow: wf({ featureBranch: "" }), ticket: tkt(), agentSlug: "backend-dev", deps });
     expect(res).toEqual({ synthesized: false, reason: "no_evidence" });
-    expect(writes).toEqual({ merges: [], puts: [], transitions: [], events: [] });
+    expect(writes.puts).toEqual([]);
+    expect(writes.rows).toEqual([]);
+    expect(writes.transitions).toEqual([]);
+    expect(writes.events).toEqual([]);
+    // A sticky claim would block the salvage forever once the branch appears.
+    expect(writes.releases).toEqual([{ id: "wf_3790", tid: TID, claimedAt: new Date(NOW).toISOString() }]);
   });
 
   it("a branch identical to base (no commits, no PR) is not evidence either", async () => {
@@ -650,13 +765,13 @@ describe("synthesizeCompletion", () => {
     expect(writes.puts).toEqual([]);
   });
 
-  it("no repo config → no_repo, no GitHub calls, zero writes", async () => {
+  it("no repo config → no_repo, no GitHub calls, no claim at all", async () => {
     const calls = [];
     const { writes, deps } = harness({ gh: fakeGithub(liveRoutes(), calls) });
     const res = await synthesizeCompletion({ workflow: wf({ repoConfig: null }), ticket: tkt(), deps });
     expect(res).toEqual({ synthesized: false, reason: "no_repo" });
     expect(calls).toEqual([]);
-    expect(writes.merges).toEqual([]);
+    expect(writes).toEqual(NO_WRITES);
   });
 
   it("discovers the per-ticket branch from an open PR when no agentSlug is known", async () => {
@@ -665,13 +780,113 @@ describe("synthesizeCompletion", () => {
     const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "", deps });
     expect(res.synthesized).toBe(true);
     expect(res.branch).toBe(BRANCH);
-    expect(writes.merges[0].fields.branch).toBe(BRANCH);
+    expect(writes.rows[0].fields.branch).toBe(BRANCH);
   });
 
   it("a store failure is swallowed as reason=error, never thrown at the cascade", async () => {
-    const { deps } = harness();
-    deps.store.mergeTaskMetadataOrTrack = async () => { throw new Error("DDB down"); };
+    const { writes, deps } = harness();
+    deps.store.setSynthesizedEvidence = async () => { throw new Error("DDB down"); };
     const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "backend-dev", deps });
     expect(res).toEqual({ synthesized: false, reason: "error" });
+    // The record was already written, so the claim is NOT handed back — the next
+    // trigger must not re-synthesize over a durable record.
+    expect(writes.puts).toHaveLength(1);
+    expect(writes.releases).toEqual([]);
+  });
+
+  it("a throw BEFORE the record write releases the claim (reason=error, retryable)", async () => {
+    const { writes, deps } = harness({ s3PutIfAbsent: async () => { throw new Error("S3 500"); } });
+    const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "backend-dev", deps });
+    expect(res).toEqual({ synthesized: false, reason: "error" });
+    expect(writes.rows).toEqual([]);
+    expect(writes.releases).toHaveLength(1);
+  });
+
+  // ─── TEAM-4099 F4: synth must never clobber a real report_completion ─────────
+
+  it("(a) the real record landing after the claim wins the S3 CAS → abort, ZERO row writes", async () => {
+    // The agent's report_completion put the record while we were probing GitHub;
+    // the conditional create comes back 412.
+    const { writes, deps } = harness({ putWritten: false });
+    const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "backend-dev", deps });
+    expect(res).toEqual({ synthesized: false, reason: "record_exists" });
+    expect(writes.puts).toHaveLength(1);          // attempted, refused by S3
+    expect(writes.rows).toEqual([]);              // the real record is untouched
+    expect(writes.transitions).toEqual([]);       // and no second done-cascade
+    expect(writes.events).toEqual([]);
+    expect(writes.releases).toEqual([]);          // real evidence exists — claim stays
+  });
+
+  it("(b) real evidence landing between the claim and the row write → no overwrite", async () => {
+    const { writes, deps } = harness({ rowApplied: false });
+    const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "backend-dev", deps });
+    expect(res).toEqual({ synthesized: false, reason: "real_evidence_won" });
+    expect(writes.rows).toHaveLength(1);          // attempted with the CAS condition
+    expect(writes.rows[0].opts).toEqual({ claimedAt: new Date(NOW).toISOString() });
+    expect(writes.transitions).toEqual([]);
+    expect(writes.events).toEqual([]);
+    expect(writes.releases).toEqual([]);
+  });
+
+  it("(c) two concurrent triggers: exactly ONE claim wins ⇒ one harvest, one put, one row, one cascade", async () => {
+    // Shared fake store: the claim is a real first-writer-wins latch, so both
+    // Promise.all branches race it exactly as two Lambda invocations would.
+    const shared = { claimed: false, ghCalls: 0, puts: [], rows: [], transitions: [], events: [], releases: [] };
+    const mkDeps = () => ({
+      githubFetch: async (path) => { shared.ghCalls++; return await fakeGithub(liveRoutes())(path); },
+      s3Get: async () => { throw new Error("NoSuchKey"); },
+      s3PutIfAbsent: async (key, body) => {
+        if (shared.puts.some((p) => p.key === key)) return { written: false };
+        shared.puts.push({ key, body });
+        return { written: true };
+      },
+      store: {
+        claimCompletionSynthesis: async (id, tid, opts) => {
+          if (shared.claimed) return { won: false };
+          shared.claimed = true;
+          return { won: true, claimedAt: opts?.now };
+        },
+        setSynthesizedEvidence: async (id, tid, fields, opts) => {
+          shared.rows.push({ id, tid, fields, opts });
+          return { applied: true };
+        },
+        releaseCompletionSynthesisClaim: async (id, tid, claimedAt) => {
+          shared.releases.push({ id, tid, claimedAt });
+          return true;
+        },
+      },
+      transitionTicket: async (tid, status) => { shared.transitions.push({ tid, status }); },
+      publishEvent: async (tid, type, detail) => { shared.events.push({ tid, type, detail }); },
+      now: () => NOW,
+      log: { warn: () => {} },
+    });
+
+    const call = () => synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "backend-dev", deps: mkDeps() });
+    const [a, b] = await Promise.all([call(), call()]);
+
+    const winners = [a, b].filter((r) => r.synthesized);
+    const losers = [a, b].filter((r) => !r.synthesized);
+    expect(winners).toHaveLength(1);
+    expect(losers).toEqual([{ synthesized: false, reason: "claimed" }]);
+    expect(shared.puts).toHaveLength(1);
+    expect(shared.rows).toHaveLength(1);
+    expect(shared.transitions).toEqual([{ tid: TID, status: "done" }]); // ONE cascade
+    expect(shared.events).toHaveLength(1);
+    expect(shared.releases).toEqual([]);
+    // The loser did no GitHub work either — the claim precedes the harvest.
+    expect(shared.ghCalls).toBeGreaterThan(0);
+  });
+
+  it("(d) the claim loser writes nothing and makes no GitHub calls", async () => {
+    const calls = [];
+    const { writes, deps } = harness({ claimWins: false, gh: fakeGithub(liveRoutes(), calls) });
+    const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "backend-dev", deps });
+    expect(res).toEqual({ synthesized: false, reason: "claimed" });
+    expect(calls).toEqual([]);
+    expect(writes.puts).toEqual([]);
+    expect(writes.rows).toEqual([]);
+    expect(writes.transitions).toEqual([]);
+    expect(writes.events).toEqual([]);
+    expect(writes.releases).toEqual([]);          // not ours to release
   });
 });
