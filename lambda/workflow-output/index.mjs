@@ -10,6 +10,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { validateTicketPlan } from "./dag.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -22,6 +23,55 @@ const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "jira";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA ||
   (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
+// TEAM-3992 D3.4: structural validation of a submitted ticket plan against the
+// def's ticketDag. enforce → reject an invalid plan (nothing created); shadow →
+// accept but report `dagViolations`; off → skip. Default enforce.
+const DAG_VALIDATION_MODE = (process.env.DAG_VALIDATION_MODE || "enforce").toLowerCase();
+const DEFAULT_WORKFLOW_DEF_ID = "software-delivery";
+
+// config/workflows.json + config/agents.json are the same S3 objects the tickets
+// Lambda's loadValidPhases and the orchestrator's loadWorkflowDefs read; cache
+// per cold start. A load failure degrades to "no dag" (validation skipped) rather
+// than blocking a legitimate plan on an S3 blip.
+let _workflowsConfig = null;
+async function loadWorkflowsConfig() {
+  if (_workflowsConfig) return _workflowsConfig;
+  if (!BUCKET) return (_workflowsConfig = { workflows: [] });
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: "config/workflows.json" }));
+    _workflowsConfig = JSON.parse(await r.Body.transformToString());
+  } catch (err) {
+    console.warn(`[submit_ticket_plan] could not load config/workflows.json: ${err.message}`);
+    _workflowsConfig = { workflows: [] };
+  }
+  return _workflowsConfig;
+}
+
+let _roster = null;
+async function loadRoster() {
+  if (_roster) return _roster;
+  if (!BUCKET) return (_roster = { agents: [] });
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: "config/agents.json" }));
+    _roster = JSON.parse(await r.Body.transformToString());
+  } catch (err) {
+    console.warn(`[submit_ticket_plan] could not load config/agents.json: ${err.message}`);
+    _roster = { agents: [] };
+  }
+  return _roster;
+}
+
+/**
+ * The plan payload is the only reliable def signal submit_ticket_plan receives:
+ * the workflows table isn't wired into this Lambda and the S3 manifest doesn't
+ * record a def id. A run that names its def (workflow_def_id / def_id) wins;
+ * otherwise default to the code pipeline (software-delivery). `workflow_type`
+ * ("feature"/"bug") is intentionally NOT treated as a def id — it is a label,
+ * not a selector.
+ */
+function resolveDefId(args) {
+  return args.workflow_def_id || args.def_id || DEFAULT_WORKFLOW_DEF_ID;
+}
 
 async function publishJourneyEvent(workflowId, type, detail) {
   if (!EVENTS_TABLE || !workflowId) return;
@@ -39,7 +89,34 @@ async function publishJourneyEvent(workflowId, type, detail) {
   } catch { /* non-fatal */ }
 }
 
-async function submitTicketPlan({ workflow_id, requirements, tickets }) {
+async function submitTicketPlan(args) {
+  const { workflow_id, requirements, tickets } = args;
+
+  // TEAM-3992 D3.4 — validate the plan's structure against the def's ticketDag
+  // BEFORE persisting anything, so an enforced rejection leaves no partial state.
+  let dagViolations = null;
+  if (DAG_VALIDATION_MODE !== "off") {
+    const [cfg, roster] = await Promise.all([loadWorkflowsConfig(), loadRoster()]);
+    const defId = resolveDefId(args);
+    const dag = (cfg.workflows || []).find((w) => w.id === defId)?.ticketDag;
+    if (dag) {
+      const result = validateTicketPlan({ tickets }, dag, roster);
+      if (!result.ok) {
+        if (DAG_VALIDATION_MODE === "enforce") {
+          const err = new Error("ticket_plan_invalid");
+          err.mcpBody = {
+            status: "rejected",
+            error: "ticket_plan_invalid",
+            violations: result.violations,
+            hint: "Fix the plan and resubmit; nothing was created.",
+          };
+          throw err;
+        }
+        dagViolations = result.violations; // shadow: report but proceed
+      }
+    }
+  }
+
   const key = `workflows/${workflow_id}/shared/ticket-plan.json`;
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
@@ -51,6 +128,7 @@ async function submitTicketPlan({ workflow_id, requirements, tickets }) {
     status: "saved",
     location: `s3://${BUCKET}/${key}`,
     ticket_count: tickets.length,
+    ...(dagViolations ? { dagViolations } : {}),
     message: `Ticket plan saved with ${tickets.length} tickets as a record. NEXT: you must call Tickets___create_ticket once per ticket to actually create them under the epic in the ticket system. submit_ticket_plan only persists the plan — it does not create tickets.`,
   };
 }
@@ -418,6 +496,14 @@ export const handler = async (event) => {
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
     console.error(`[workflow-output] Error in ${toolName}:`, err);
+    // A structured rejection (e.g. D3.4 ticket_plan_invalid) carries its own MCP
+    // body so the agent gets the machine-readable violations, not just a string.
+    if (err.mcpBody) {
+      return {
+        content: [{ type: "text", text: JSON.stringify(err.mcpBody, null, 2) }],
+        isError: true,
+      };
+    }
     return {
       content: [{ type: "text", text: `Error: ${err.message}` }],
       isError: true,

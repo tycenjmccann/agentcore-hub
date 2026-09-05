@@ -159,6 +159,11 @@ export default defineConfig({
       // S3/Lambda/DDB clients mocked at the module seam, same shape as
       // agentcore-hub-pipeline-tools/index.test.mjs.
       "lambda/workflow-output/report-completion.test.mjs",
+      // submit_ticket_plan structural validation (TEAM-3992 D3.4) — the ticketDag
+      // gate on the real handler, with config/workflows.json + config/agents.json
+      // served from the mocked S3 seam. Imports the validator through the
+      // committed dag.mjs re-export shim → lambda/orchestrator/dag.mjs.
+      "lambda/workflow-output/submit-plan.test.mjs",
       // pipeline-enabled (TEAM-3738, same defect class as TEAM-3723) — the
       // orchestrator's PIPELINE_ENABLED predicate that gates the "## Pipeline
       // Mode" context block. Lives in its own side-effect-free pipeline-enabled.mjs
