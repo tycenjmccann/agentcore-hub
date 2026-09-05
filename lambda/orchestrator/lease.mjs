@@ -42,6 +42,13 @@ const [HEARTBEAT_TYPE_1, HEARTBEAT_TYPE_2] = heartbeatEventTypes;
 export const DEFAULT_TTL_MINUTES = defaultTtlMinutes;
 export const STALE_CLAIM_MULTIPLIER = staleClaimMultiplier;
 
+// The claim statuses that hold a lease, straight from lease-constants.json
+// (TEAM-3991 D2.2). Exported so a caller that needs to know "is this task's claim
+// still live enough to be worth parking?" reads the same list isLeaseLive does,
+// instead of re-hardcoding ["running","in_progress"]. NOT a liveness check — the
+// authoritative CAS still lives in workflow-store.parkClaim / lease.stealClaim.
+export const LIVE_CLAIM_STATUSES = Object.freeze([...liveClaimStatuses]);
+
 /** A nonnumeric/zero/negative env value must not silently disable leases. */
 function resolveTtlMs() {
   const minutes = Number(process.env.WORKFLOW_LEASE_TTL_MINUTES);

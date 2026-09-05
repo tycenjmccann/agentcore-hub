@@ -81,6 +81,45 @@ export async function probeTicketBranches(githubFetch, { owner, repo, base = "ma
 }
 
 /**
+ * TEAM-3991 D1.5 — the PR that already exists for a ticket, if any.
+ *
+ * ONE list call against the base branch, then a client-side match on the head
+ * ref: a PR's head is `feature/<ticketId>-<something>` (the fleet's branch
+ * convention) or the run's shared feature branch. Cheaper and more forgiving than
+ * guessing the exact branch name, which is what made the dispatch guard worth
+ * having — a re-dispatched agent that can't see its own merged PR redoes the work
+ * (prod: TEAM-3790 investigated a finding it had already merged).
+ *
+ * Newest first, and a merged PR outranks an open one: the guard's decision differs
+ * (synthesize vs resume), so the strongest state must win when both exist.
+ * Returns null on any GitHub error — the caller FAILS OPEN and dispatches.
+ */
+export async function findTicketPullRequest(githubFetch, { owner, repo, base = "main", ticketId = "", featureBranch = "" } = {}) {
+  if (!githubFetch || !owner || !repo || !ticketId) return null;
+  const o = encodeURIComponent(owner);
+  const r = encodeURIComponent(repo);
+  const prs = await attempt(() =>
+    githubFetch(`/repos/${o}/${r}/pulls?state=all&base=${encodeURIComponent(base)}&per_page=100&sort=updated&direction=desc`)
+  );
+  if (!Array.isArray(prs)) return null;
+
+  const prefix = `feature/${ticketId}-`;
+  const mine = prs.filter((p) => {
+    const ref = p?.head?.ref || "";
+    return ref === `feature/${ticketId}` || ref.startsWith(prefix) || (featureBranch && ref === featureBranch);
+  });
+  if (mine.length === 0) return null;
+  const pick = mine.find((p) => p?.merged_at) || mine.find((p) => p?.state === "open") || mine[0];
+  return {
+    number: pick.number ?? null,
+    url: pick.html_url || "",
+    state: pick.merged_at ? "merged" : pick.state || "",
+    merged: Boolean(pick.merged_at),
+    headRef: pick.head?.ref || "",
+  };
+}
+
+/**
  * Write the missing completion evidence for a ticket, from GitHub.
  *
  * Precondition: no `completions/<ticketId>.json` AND no `agentTasks[tid].output`

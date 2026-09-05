@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createCascade, normalizeExtendedMode, newMetrics } from "./cascade.mjs";
+import { createCascade, normalizeExtendedMode, newMetrics, reconcileReason } from "./cascade.mjs";
 
 /**
  * TEAM-3618 D3 — the shared unblock cascade. Both "ticket done" paths
@@ -912,7 +912,9 @@ describe("TEAM-3755 F7 — liveness is re-checked immediately before the steal",
     const { reconcileDependent } = createCascade(deps);
     const m = newMetrics();
 
-    const outcome = await reconcileDependent(
+    // TEAM-3991 D2.1: reconcileDependent now returns { outcome, reason } — the
+    // outcome vocabulary is unchanged, so every assertion reads `.outcome`.
+    const { outcome, reason } = await reconcileDependent(
       { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
       "reconcile-sweep", extWorkflow, m, "enforce"
     );
@@ -921,6 +923,7 @@ describe("TEAM-3755 F7 — liveness is re-checked immediately before the steal",
     // a per-cycle orchestrator.nudge would reset every activity clock that only
     // filters agent.streaming (WM watch scan) and keep the run "fresh" forever.
     expect(outcome).toBe("live");
+    expect(reason).toBe("lease_live");
     expect(lease.stealClaim).not.toHaveBeenCalled();
     expect(redispatch).not.toHaveBeenCalled();
     expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(0);
@@ -1091,14 +1094,52 @@ describe("TEAM-3755 F9 — blockers are confirmed by consistent point-read befor
     const { deps, lease, redispatch } = makeExtDeps({ getTicketConsistent });
     const { reconcileDependent } = createCascade(deps);
 
-    const outcome = await reconcileDependent(
+    const { outcome, reason } = await reconcileDependent(
       { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
       "reconcile-sweep", extWorkflow, newMetrics(), "enforce"
     );
 
     expect(outcome).toBe("redispatched");
+    expect(reason).toBe("claimed");
     expect(getTicketConsistent).not.toHaveBeenCalled();
     expect(lease.stealClaim).toHaveBeenCalledTimes(1);
     expect(redispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * TEAM-3991 D2.1 — the reconcile return shape. index.mjs's recomputeRun publishes
+ * `orchestrator.recompute` with a per-candidate { outcome, reason }, so the reason
+ * has to come from the cascade (one vocabulary) rather than being re-derived by
+ * each caller from the outcome string.
+ */
+describe("reconcileDependent return shape (D2.1)", () => {
+  it("returns { outcome, reason } with the outcome vocabulary unchanged", async () => {
+    const { deps } = makeExtDeps({ lease: { isLeaseLive: vi.fn(() => true) } });
+    const cascade = createCascade(deps);
+
+    const res = await cascade.reconcileDependent(
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+      "recompute", extWorkflow, newMetrics(), "enforce"
+    );
+
+    // A live lease under enforce nudges (never steals) — both map to lease_live.
+    expect(res).toEqual({ outcome: "nudged", reason: "lease_live" });
+  });
+
+  it("reconcileReason maps every outcome the router can return, and is honest about the rest", () => {
+    for (const outcome of [
+      "escalation-held", "live", "nudged", "would-nudge", "review-reawakened", "review-noop",
+      "would-review", "blockers-unconfirmed", "redispatched", "redispatch-refused",
+      "would-redispatch", "steal-lost", "would-steal", "escalated", "would-escalate",
+    ]) {
+      expect(reconcileReason(outcome)).not.toBe("unknown");
+    }
+    expect(reconcileReason("something-new")).toBe("unknown");
+  });
+
+  it("exposes transitionToReady for callers that must re-Ready through the provider branch", () => {
+    const { deps } = makeExtDeps();
+    expect(typeof createCascade(deps).transitionToReady).toBe("function");
   });
 });

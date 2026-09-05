@@ -103,6 +103,16 @@ export default defineConfig({
       // sffzti's defect was that nothing called it. Real index.mjs, mocked I/O
       // seams, real githubApi over a stubbed fetch.
       "lambda/orchestrator/gate-bypass-wiring.test.mjs",
+      // recompute-park (TEAM-3991 D2.1/D2.2) — the run-wide recompute hooks and
+      // the blocked→parked claim transition, both driven through the REAL
+      // index.mjs + REAL cascade (only AWS/store seams mocked), because the
+      // defect in both cases was a missing CALL, not a wrong pure function.
+      "lambda/orchestrator/recompute-park.test.mjs",
+      // dispatch-guard (TEAM-3991 D1.5) — the PR-aware pre-dispatch guard at both
+      // ready entry points: a merged PR synthesizes the completion instead of
+      // re-running the agent, an open PR hands over resume context. Real
+      // index.mjs + real evidence.mjs, GitHub/Jira over one stubbed fetch.
+      "lambda/orchestrator/dispatch-guard.test.mjs",
       // ticket-done-blocked-terminal (TEAM-3755 F3) — the contract behind
       // markTaskComplete's unconditional "done": a ticket done whose completion
       // record carries a SHIP_BLOCKED outcome must ALWAYS close the run on a
@@ -134,6 +144,10 @@ export default defineConfig({
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.
       "lambda/agentcore-hub-tickets/index.test.mjs",
+      // tickets-edge (TEAM-3991 D2.2) — the reverse half of that marker: the
+      // ORIGIN ticket becomes blockedBy its fix, which is what turns the fix's
+      // completion into an unblock event for the parked origin (wf 1pl3h1).
+      "lambda/agentcore-hub-tickets/tickets-edge.test.mjs",
       // agentcore-hub-pipeline-tools (TEAM-3822) — the CD tools Lambda: the
       // execution-scoped get_state race fix (matchesExecution), the
       // get_build_status scan clamp, and the start_deploy clientRequestToken

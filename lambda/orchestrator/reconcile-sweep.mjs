@@ -182,16 +182,16 @@ export function createReconcileSweep(deps) {
           if (mode === "shadow") {
             // Observe only — run the same routing to learn the outcome shape,
             // but reconcileDependent honors shadow mode and performs no writes.
-            const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "shadow");
+            const { outcome, reason } = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "shadow");
             tally(m, outcome);
-            log(`reconcile.would_recover (shadow) — ${sibling.ticketId} status=${sibling.status} → ${outcome} (sweep ${sweepId})`);
+            log(`reconcile.would_recover (shadow) — ${sibling.ticketId} status=${sibling.status} → ${outcome} (${reason}) (sweep ${sweepId})`);
             continue;
           }
 
           // enforce — re-drive through the ONE implementation of the invariant.
-          const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "enforce");
+          const { outcome, reason } = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "enforce");
           tally(m, outcome);
-          log(`reconcile.recover — ${sibling.ticketId} status=${sibling.status} → ${outcome} (sweep ${sweepId})`);
+          log(`reconcile.recover — ${sibling.ticketId} status=${sibling.status} → ${outcome} (${reason}) (sweep ${sweepId})`);
         } catch (err) {
           m.candidateErrors++;
           log(`reconcile.candidate_error — ${sibling?.ticketId} ${err?.name || "Error"}: ${err?.message || err} (sweep ${sweepId})`);

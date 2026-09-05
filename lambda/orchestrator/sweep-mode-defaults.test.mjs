@@ -58,7 +58,7 @@ vi.mock("@aws-sdk/client-bedrock-agent-runtime", () => ({
 vi.mock("./cascade.mjs", () => ({
   createCascade: (opts) => {
     h.extendedStates.push(opts?.extendedStates);
-    return { cascadeUnblock: async () => [], reconcileDependent: async () => "noop" };
+    return { cascadeUnblock: async () => [], reconcileDependent: async () => ({ outcome: "noop", reason: "unknown" }) };
   },
   newMetrics: () => ({}),
 }));

@@ -452,6 +452,12 @@ export function createCascade(deps) {
    * observes, enforce writes. Returns an outcome string the sweep tallies.
    */
   async function reconcileDependent(sibling, unblockedBy, workflow, m, mode) {
+    const outcome = await routeDependent(sibling, unblockedBy, workflow, m, mode);
+    return { outcome, reason: reconcileReason(outcome) };
+  }
+
+  /** The routing itself — returns the outcome string (unchanged vocabulary). */
+  async function routeDependent(sibling, unblockedBy, workflow, m, mode) {
     // TEAM-3973 — an ESCALATED ticket is held for the human, in every status.
     // Escalation used to bind only the in_progress steal path, so the very next
     // sweep re-drove the ticket through the ready/todo/blocked branch and the
@@ -579,8 +585,42 @@ export function createCascade(deps) {
     reconcileDependent,
     handleInProgressDependent,
     handleInReviewDependent,
+    // TEAM-3991 D2.1: exposed so a recompute caller can re-Ready a board ticket
+    // through the ONE provider-branching implementation. Still used internally as
+    // a closure — this is an additional door, not a move.
+    transitionToReady,
     extendedMode,
   };
+}
+
+/**
+ * TEAM-3991 D2.1 — the WHY behind a reconcile outcome. The outcome vocabulary is
+ * what happened ("nudged", "redispatched"); the reason is why that was the right
+ * move ("lease_live", "dispatchable"), which is what a human reading
+ * orchestrator.recompute or a sweep log actually needs. Pure map, so both the
+ * sweep and the recompute publisher report identical strings.
+ */
+const RECONCILE_REASONS = {
+  "escalation-held": "escalation_held",
+  live: "lease_live",
+  nudged: "lease_live",
+  "would-nudge": "lease_live",
+  "review-reawakened": "gate_rewoken",
+  "review-noop": "in_review",
+  "would-review": "in_review",
+  "blockers-unconfirmed": "blockers_pending",
+  redispatched: "claimed",
+  "redispatch-refused": "claim_lost",
+  "would-redispatch": "dispatchable",
+  "steal-lost": "claim_moved",
+  "would-steal": "stale_lease",
+  escalated: "retry_exhausted",
+  "would-escalate": "retry_exhausted",
+};
+
+/** Reason string for a reconcile outcome ("unknown" for anything unmapped). */
+export function reconcileReason(outcome) {
+  return RECONCILE_REASONS[outcome] || "unknown";
 }
 
 /** Fresh cascade metrics accumulator (real actions + shadow would-* counters). */

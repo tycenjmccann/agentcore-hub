@@ -210,7 +210,7 @@ async function listReviewers(params = {}) {
 // ─── Tool Implementations ────────────────────────────────────────────────────
 
 async function createTicket(params) {
-  const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id } = params;
+  const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, phase } = params;
 
   // Validate assignee against known roster — reject hallucinated agent names.
   // "human:<who>" assignees are human-review gates, not agents, and are always
@@ -396,8 +396,43 @@ async function createTicket(params) {
   const blockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
   const status = await reconcileBlockersAndStatus(ticketId, blockers, assignee);
 
+  // TEAM-3991 D2.2 — the parked→fix edge, the Jira twin of the DynamoDB tickets
+  // Lambda's blockedBy append: a fix ticket BLOCKS the origin it answers, so the
+  // origin can't be re-dispatched (or closed) while the fix is open.
+  await linkFixToOrigin(ticketId, spawned_by, phase);
+
   console.log(`[jira-tools] Created ${ticketId} in Jira. Status: ${status}`);
   return { ticketId, status, message: `Created ${ticketId}: ${summary}` };
+}
+
+/**
+ * TEAM-3991 D2.2 — link a fix ticket so it BLOCKS the origin ticket that filed it
+ * (same link type/direction as reconcileBlockersAndStatus: inward blocks
+ * outward, so inward = the fix, outward = the origin). Jira dedupes issue links
+ * by (type, pair), so a retried create converges. Best-effort: a link failure
+ * must never fail the create.
+ */
+const FIX_ORIGIN_KEYS = ["gateTicketId", "qaTicketId", "codexTicketId"];
+
+async function linkFixToOrigin(fixTicketId, spawnedBy, phase) {
+  if (!spawnedBy || typeof spawnedBy !== "object") return false;
+  const originId = FIX_ORIGIN_KEYS.map((k) => spawnedBy[k]).find((v) => typeof v === "string" && v);
+  if (!originId || originId === fixTicketId) return false;
+  try {
+    await jiraFetch("/rest/api/3/issueLink", {
+      method: "POST",
+      body: JSON.stringify({
+        type: { name: "Blocks" },
+        inwardIssue: { key: fixTicketId },
+        outwardIssue: { key: originId },
+      }),
+    });
+    console.log(`[jira-tools] ${fixTicketId} (${spawnedBy.kind || "fix"}${phase ? `, phase ${phase}` : ""}) now blocks origin ${originId}`);
+    return true;
+  } catch (err) {
+    console.log(`Warning: could not link fix ${fixTicketId} -> origin ${originId}: ${err.message}`);
+    return false;
+  }
 }
 
 // Bring a ticket to its intended blocker-links + initial status. Idempotent:

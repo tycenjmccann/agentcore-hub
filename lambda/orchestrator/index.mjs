@@ -34,20 +34,21 @@ import {
   DEFAULT_TTL_MINUTES,
   STALE_CLAIM_MULTIPLIER,
   LEASE_TTL_MS,
+  LIVE_CLAIM_STATUSES,
   isLeaseLive,
   lastAgentActivity,
   stealClaim,
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
-import { createCascade } from "./cascade.mjs";
+import { createCascade, newMetrics as newCascadeMetrics } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning, checkBranchProtection } from "./repo-check.mjs";
 import { runGateBypassCheck, hasUnackedGateBypass } from "./gate-bypass.mjs";
-import { synthesizeCompletion } from "./evidence.mjs";
+import { synthesizeCompletion, findTicketPullRequest } from "./evidence.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -302,6 +303,8 @@ function getWorkflowDef(id) {
 async function redispatchTicket(workflow, ticket) {
   const agentDef = getAgentDef(ticket.assignee);
   if (!agentDef) return false;
+  // TEAM-3991 D1.5 — a merged PR means the work is done, not stalled.
+  if (!(await dispatchAllowed(workflow, ticket, "redispatch"))) return false;
   const claimed = await claimTicketInvocation(workflow, ticket.ticketId, ticket.assignee);
   if (!claimed) return false;
   const context = await buildAgentContext(ticket, workflow);
@@ -569,6 +572,10 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       const rejected = await getTicket(ticketId);
       if (rejected && isHumanAssignee(rejected.assignee)) {
         await handleReviewRejection(rejected);
+      } else if (rejected) {
+        // TEAM-3991 D2.2: an AGENT ticket blocked mid-run — park its claim so it
+        // stops looking live and becomes re-drivable once the blocker clears.
+        await parkAgentClaimOnBlock(ticketId, rejected.assignee, rejected.workflowId, rejected.parentId);
       }
       break;
     }
@@ -728,6 +735,10 @@ export async function handleTicketDoneUnified(ticketId) {
     console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
   }
 
+  // TEAM-3991 D2.1 — the cascade only re-drives THIS ticket's dependents; a
+  // recompute asks the same invariant about every sibling (sffzti/TEAM-3799).
+  await recomputeRun(workflow, parentId, "agent.complete");
+
   // TEAM-3991 D1.1 — did anything merge before the Merge Approval gate approved
   // it? The work DID happen either way, so agent.complete still publishes; the
   // detail carries gateBypass so the UI/journal shows why the run won't close.
@@ -819,6 +830,114 @@ async function gateBypassCheck(workflow, ticket, children) {
  * Returns true when completion must NOT proceed. A bypass is a human-ack
  * condition, not a terminal outcome — the run stays open, no fabricated close.
  */
+/**
+ * The def's review-gate entry a human gate ticket guards, resolved by GUARDED
+ * PHASE (the same resolution findMergeApprovalGate/isWorkflowComplete use) with a
+ * name fallback. Returns null for a def with no gates. Used only to label the
+ * `review.approved` event.
+ */
+function findGateDefForTicket(workflow, ticketId) {
+  const gates = getWorkflowDef(workflow?.workflowDefId)?.reviewGates || [];
+  if (gates.length === 0) return null;
+  const task = workflow?.agentTasks?.[ticketId];
+  const phase = task?.phase || null;
+  return (
+    (phase && gates.find((g) => g.afterPhase === phase)) ||
+    gates.find((g) => new RegExp(String(g?.name || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(task?.title || "")) ||
+    null
+  );
+}
+
+/**
+ * TEAM-3991 D2.2 — an AGENT ticket moved to "blocked" while its claim was still
+ * live (a fix spawned a blocker, a QA finding parked the dev work). The claim must
+ * be parked, not left `running`: a live-looking claim makes every liveness check
+ * downstream (cascade, dead-session detector, reconcile sweep) treat the ticket as
+ * a session in flight, so when the blocker clears nothing re-drives it — that is
+ * how TEAM-3727 sat parked-but-"running" until a human dispatched it.
+ *
+ * `parked` is deliberately NOT in liveClaimStatuses (src/config/lease-constants.json),
+ * so the park itself is what makes the ticket re-dispatchable. The CAS in
+ * `store.parkClaim` (status IN {running,in_progress} AND startedAt matches) is the
+ * only writer — a claim that has since moved on is left alone (R3).
+ *
+ * Human gates are NOT parked: a `human:*` ticket going blocked is "Request
+ * changes", handled by handleReviewRejection, and has no agent claim to park.
+ * Never throws.
+ */
+async function parkAgentClaimOnBlock(ticketId, assignee, workflowId, parentId) {
+  if (!ticketId || !assignee || isHumanAssignee(assignee)) return false;
+  try {
+    const workflow = await resolveWorkflow(workflowId, parentId);
+    const task = workflow?.agentTasks?.[ticketId];
+    if (!task || !LIVE_CLAIM_STATUSES.includes(String(task.status || ""))) return false;
+    const parked = await store.parkClaim(workflow.id, ticketId, task.startedAt);
+    if (!parked) return false;
+    await publishEvent(ticketId, "agent.parked", {
+      workflowId: workflow.id,
+      ticketId,
+      agentId: assignee,
+    });
+    console.log(`[orchestrator] parked claim for ${ticketId} (${assignee}) on blocked — was ${task.status}`);
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] parkClaim for ${ticketId} failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
+}
+
+/**
+ * TEAM-3991 D2.1 — re-evaluate EVERY sibling of a run after something changed,
+ * not just the dependents of the ticket that changed.
+ *
+ * The cascade answers "who did THIS ticket unblock?". That misses the run whose
+ * sibling was never blocked by the trigger at all: wf sffzti's TEAM-3799 had all
+ * its blockers done and no live lease, but nothing had unblocked it *that moment*,
+ * so it sat until a human dispatched it by hand. A recompute asks the invariant
+ * about every candidate instead, and routes each one through the ONE
+ * implementation of it (`cascade.reconcileDependent` — R3: never re-derive
+ * liveness here).
+ *
+ * Never throws: a recompute is a backstop, and a backstop that can break the
+ * cascade is worse than no backstop.
+ */
+async function recomputeRun(workflow, epicId, trigger) {
+  if (!workflow?.id || !epicId) return null;
+  const mode = resolveCascadeMode(process.env.CASCADE_EXTENDED_STATES);
+  try {
+    const siblings = await getChildTickets(epicId);
+    const cascade = getCascade();
+    const m = newCascadeMetrics();
+    const candidates = [];
+    const outcomes = {};
+    for (const sibling of siblings || []) {
+      const id = sibling?.ticketId;
+      if (!id || id === epicId) continue;
+      if (sibling.type === "epic") continue;
+      if (!sibling.assignee || isHumanAssignee(sibling.assignee)) continue;
+      if (["done", "cancelled"].includes(String(sibling.status || "").toLowerCase())) continue;
+      const blockers = sibling.blockedBy || [];
+      if (blockers.length > 0 && !(await checkAllBlockersResolved(blockers))) continue;
+      candidates.push(id);
+      try {
+        const { outcome, reason } = await cascade.reconcileDependent(sibling, trigger, workflow, m, mode);
+        outcomes[id] = { outcome, reason };
+      } catch (err) {
+        outcomes[id] = { outcome: "error", reason: err?.message || String(err) };
+      }
+    }
+    if (candidates.length === 0) return { candidates, outcomes };
+    await publishEvent(epicId, "orchestrator.recompute", {
+      workflowId: workflow.id, trigger, candidates, outcomes,
+    });
+    console.log(`[orchestrator] recompute(${trigger}) ${workflow.id}: ${candidates.length} candidate(s) — ${candidates.map((id) => `${id}:${outcomes[id]?.outcome}`).join(", ")}`);
+    return { candidates, outcomes };
+  } catch (err) {
+    console.warn(`[orchestrator] recompute(${trigger}) failed for ${workflow?.id} (non-fatal): ${err?.message || err}`);
+    return null;
+  }
+}
+
 async function gateBypassBlocksCompletion(workflow) {
   try {
     let fresh = (await store.getWorkflow(workflow.id)) || workflow;
@@ -909,6 +1028,101 @@ async function ensureBranchProtectionCheck(workflow) {
   }
 }
 
+/**
+ * TEAM-3991 D1.5 — the one question to ask before dispatching an agent: is there
+ * already a PR for this ticket?
+ *
+ * Two failures this closes, both observed in prod:
+ *   - MERGED PR, task not complete: the agent finished, the merge happened, and
+ *     the completion report never landed. Re-dispatching sends the agent to
+ *     re-investigate work that is already on main (TEAM-3790). Synthesize the
+ *     completion from GitHub instead and REFUSE the dispatch.
+ *   - OPEN PR: the work is in flight on a branch. Dispatching without saying so
+ *     makes the agent start over on a fresh branch. Dispatch, but hand it the
+ *     resume context first.
+ *
+ * FAIL OPEN by construction: no repo config, no PAT, a GitHub error, or no PR all
+ * return `{ ok: true }`. A guard that can strand a dispatch is worse than the
+ * duplicate work it prevents. One list call per dispatch.
+ */
+async function preDispatchGuards(workflow, ticket, { source = "dispatch" } = {}) {
+  const ticketId = ticket?.ticketId || ticket?.id;
+  if (!workflow?.id || !ticketId) return { ok: true };
+  if (isHumanAssignee(ticket?.assignee)) return { ok: true };
+  if (!workflow.repoConfig?.repos?.length || !process.env.GITHUB_PAT) return { ok: true };
+
+  try {
+    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+    if (!owner || !repo) return { ok: true };
+    const pr = await findTicketPullRequest((path) => githubApi(path), {
+      owner,
+      repo,
+      base: workflow.repoConfig.repos[0]?.defaultBranch || "main",
+      ticketId,
+      featureBranch: workflow.featureBranch || "",
+    });
+    if (!pr) return { ok: true };
+
+    if (pr.merged) {
+      // Already complete? Then there is nothing to guard — the normal dedup path
+      // handles it. Otherwise harvest the evidence the dead agent never reported.
+      if (workflow.agentTasks?.[ticketId]?.status === "complete") return { ok: true };
+      const result = await synthesizeCompletionFor(workflow, ticket);
+      if (result?.synthesized) {
+        return {
+          ok: false,
+          refused: "pr_merged",
+          detail: `PR #${pr.number} is merged (${pr.url}) — completion synthesized from GitHub instead of re-dispatching`,
+        };
+      }
+      // NEVER fabricate: no harvestable evidence ⇒ do not refuse on a hunch.
+      console.warn(`[orchestrator] ${ticketId}: PR #${pr.number} merged but no harvestable evidence — dispatching (${source})`);
+      return { ok: true };
+    }
+
+    if (pr.state === "open") {
+      await store.setResumeContext(
+        workflow.id,
+        ticketId,
+        `PR #${pr.number} exists on ${pr.headRef} (${pr.url}) — resume, don't re-investigate. ` +
+          `Continue from the existing branch/PR.`
+      );
+      await publishEvent(ticketId, "orchestrator.resume_context_set", {
+        workflowId: workflow.id,
+        ticketId,
+        prNumber: pr.number,
+        prUrl: pr.url,
+        state: pr.state,
+        source,
+      });
+    }
+    return { ok: true };
+  } catch (err) {
+    console.warn(`[orchestrator] ${ticketId}: pre-dispatch PR guard skipped (non-fatal): ${err?.message || err}`);
+    return { ok: true };
+  }
+}
+
+/**
+ * Run the guards and journal a refusal. Returns true when the dispatch may
+ * proceed — every caller's shape is `if (!(await dispatchAllowed(...))) return;`
+ * immediately before the claim CAS.
+ */
+async function dispatchAllowed(workflow, ticket, source) {
+  const verdict = await preDispatchGuards(workflow, ticket, { source });
+  if (verdict.ok) return true;
+  const ticketId = ticket?.ticketId || ticket?.id;
+  await publishEvent(ticketId, "orchestrator.dispatch_refused", {
+    workflowId: workflow.id,
+    ticketId,
+    refused: verdict.refused,
+    detail: verdict.detail || null,
+    source,
+  });
+  console.log(`[orchestrator] ${ticketId}: dispatch refused (${verdict.refused}) — ${verdict.detail || ""}`);
+  return false;
+}
+
 /** Move a ticket to Done through whichever backend is configured. */
 async function transitionTicketToDone(ticketId) {
   if (TICKET_PROVIDER === "jira") return await jiraTransition(ticketId, "Done");
@@ -997,6 +1211,10 @@ async function wakeReleaseManagerAfterEscalationGate(workflow, gateTicketId, gat
     await publishEvent(rm.ticketId, "orchestrator.escalation_decided", {
       workflowId: workflow.id, gateTicketId, ticketId: rm.ticketId, agentId: rm.assignee,
     });
+    // TEAM-3991 D2.1 — the decision may have unstuck siblings that were never
+    // blockedBy the gate at all (sffzti: TEAM-3799 waited on nothing observable).
+    // Recompute the whole run, THEN do the targeted release-manager wake.
+    await recomputeRun(workflow, parentId, "escalation_decided");
     let woke = false;
     if (TICKET_PROVIDER === "jira") {
       woke = (await jiraTransition(rm.ticketId, "Ready"))
@@ -1023,6 +1241,23 @@ async function wakeReleaseManagerAfterEscalationGate(workflow, gateTicketId, gat
  */
 async function ackApprovedGateNotification(workflow, ticketId, assignee) {
   if (!isHumanAssignee(assignee)) return;
+  // TEAM-3991 D2.1 — announce the approval itself (the ledger row is written ONLY
+  // by the human-authenticated console/Telegram paths — F6: the orchestrator
+  // consumes the ledger, it never writes to it) and recompute the run: an
+  // approval routinely frees siblings that were never blockedBy the gate.
+  try {
+    const gate = findGateDefForTicket(workflow, ticketId);
+    await publishEvent(ticketId, "review.approved", {
+      workflowId: workflow.id,
+      gateTicketId: ticketId,
+      gateName: gate?.name || null,
+      afterPhase: gate?.afterPhase || null,
+      decidedAt: new Date().toISOString(),
+    });
+    await recomputeRun(workflow, workflow.epicId, "review.approved");
+  } catch (err) {
+    console.warn(`[orchestrator] ${ticketId}: review.approved publish/recompute failed (non-fatal): ${err?.message || err}`);
+  }
   try {
     await store.ackNotifications(
       workflow.id,
@@ -2199,6 +2434,11 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   // is the real lock. Jira transitions are NOT a guard: concurrent webhook
   // deliveries each see "Ready" and each proceed — that is exactly how duplicate
   // agent sessions (and duplicate PRs) were spawned. Claim BEFORE any transition.
+  //
+  // TEAM-3991 D1.5: ask GitHub first. A merged PR for this ticket means the work
+  // landed and only the completion report is missing (synthesize + refuse); an
+  // open PR means resume, not restart.
+  if (!(await dispatchAllowed(workflow, ticket, "ready_unified"))) return;
   const claimed = await claimTicketInvocation(workflow, ticketId, assignee);
   if (!claimed) {
     console.log(`[orchestrator] ${ticketId} already claimed (running) — skipping duplicate invocation`);
@@ -2416,6 +2656,14 @@ async function processRecord(record) {
       if (isHumanAssignee(blockedAssignee)) {
         const rejected = await getTicket(ticketId);
         if (rejected) await handleReviewRejection(rejected);
+      } else if (blockedAssignee) {
+        // TEAM-3991 D2.2: same park as the webhook twin above.
+        await parkAgentClaimOnBlock(
+          ticketId,
+          blockedAssignee,
+          unwrapDdbValue(newImage.workflowId),
+          unwrapDdbValue(newImage.parentId),
+        );
       }
       break;
     }
@@ -2524,6 +2772,9 @@ export async function handleTicketDone(ticketId, image) {
     console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
   }
 
+  // TEAM-3991 D2.1 — recompute, symmetric with the webhook twin.
+  await recomputeRun(workflow, parentId, "agent.complete");
+
   // TEAM-3991 D1.1 — gate-bypass detection, symmetric with the webhook twin.
   const bypass = await gateBypassCheck(workflow, { ticketId, assignee, status: "done" });
 
@@ -2575,6 +2826,8 @@ async function handleTicketReady(ticketId, image) {
   }
 
   // Idempotency claim — same atomic workflow-row lock as the Jira path.
+  // TEAM-3991 D1.5: same PR guard as the webhook twin above.
+  if (!(await dispatchAllowed(workflow, { ticketId, assignee }, "ready_stream"))) return;
   const claimed = await claimTicketInvocation(workflow, ticketId, assignee);
   if (!claimed) {
     console.log(`[orchestrator] ${ticketId} already claimed (running) — skipping duplicate invocation`);
