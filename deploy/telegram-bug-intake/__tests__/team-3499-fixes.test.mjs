@@ -235,7 +235,7 @@ describe("DynamoDB scans read every page (TEAM-3499 finding 1)", () => {
 
     expect(net.sent.length, "the page-2 reviewer must receive the gate ping").toBe(1);
     expect(net.sent[0].chat_id).toBe(12345);
-    expect(net.sent[0].text).toMatch(/Review gate/);
+    expect(net.sent[0].text).toMatch(/review gate/i);
     expect(db.deletes, "a delivered ping must keep the dedupe claim").not.toContain("gate#GATE-1");
     expect(db.items.has("gate#GATE-1")).toBe(true);
   });

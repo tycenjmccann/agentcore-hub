@@ -314,7 +314,7 @@ describe("gate claim released on listChats failure (TEAM-3505 finding 2)", () =>
 
     expect(net2.sent.length, "the retried scan must deliver the gate ping").toBe(1);
     expect(net2.sent[0].chat_id).toBe(12345);
-    expect(net2.sent[0].text).toMatch(/Review gate/);
+    expect(net2.sent[0].text).toMatch(/review gate/i);
     expect(db.items.has("gate#GATE-1"), "a delivered ping keeps the dedupe claim").toBe(true);
   });
 });

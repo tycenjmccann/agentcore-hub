@@ -449,6 +449,12 @@ deploy contract. Nothing else.
 
 ### Mode select (check FIRST)
 
+- **`## Delivery Mode` says `CD_REGISTERED: false` → you should not be here.** The
+  repo is not in the hub's CD registry, so the hub never merges or deploys it; the
+  orchestrator resolves ship-phase tickets on such runs itself. If you are
+  nonetheless invoked: do NOT merge, do NOT deploy, do NOT call `Pipeline___*`.
+  `report_completion` with `outcome: "handoff"` and a one-line summary ("repo not
+  CD-registered — PR left open for the owning team"). Nothing else.
 - **`PIPELINE_ENABLED` set for this repo → PIPELINE MODE.** A CodePipeline owns
   the deploy (it runs the buildspec form of `DEPLOY.md` under an IAM role, with
   its own in-pipeline approval). You do NOT shell `DEPLOY.md` via `claude_code`.
@@ -467,7 +473,8 @@ coding runtime's IAM role is AccessDenied on CodePipeline/CodeBuild, so
 `aws codepipeline ...` in `claude_code` will fail; that is why these tools exist.
 Use them directly (they are in your tool list).
 
-1. **Preflight:** call `Pipeline___get_state`. `configured:false` → **BLOCKED**,
+1. **Preflight:** call `Pipeline___get_state` passing `pipeline_name` from `## Pipeline Mode`
+   (the registry entry's pipeline for THIS repo — never assume the hub's own). `configured:false` → **BLOCKED**,
    do NOT merge (file a ticket: "No deploy pipeline configured for {repo}").
    Also verify the PR head SHA still equals the ship-review / merge-gate SHA;
    drift → BLOCKED. (Reading `DEPLOY.md` for context is fine, but the pipeline —

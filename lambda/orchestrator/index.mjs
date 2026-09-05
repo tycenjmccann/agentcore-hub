@@ -44,7 +44,8 @@ import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
-import { isPipelineEnabled, pipelineOwnsRepo } from "./pipeline-enabled.mjs";
+import { isPipelineEnabled } from "./pipeline-enabled.mjs";
+import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
@@ -187,6 +188,51 @@ const FALLBACK_ROSTER = [
 ];
 
 let _agentRoster = null;
+
+// ─── CD registry (which repos the hub merges + deploys) ──────────────────────
+// config/cd-registry.json in the artifact bucket; see cd-registry.mjs for the
+// semantics. Re-read every CD_REGISTRY_TTL_MS (default 60s) so registering a
+// repo in the UI takes effect on warm containers too — a run that is mid-flight
+// when its repo is registered picks the ship phase up at its next dispatch.
+// A failed read keeps the last good copy; a never-loaded registry is EMPTY
+// (nothing registered → HANDOFF), the fail-safe direction: no merge, no deploy.
+const CD_REGISTRY_TTL_MS = Number(process.env.CD_REGISTRY_TTL_MS) || 60_000;
+let _cdRegistry = { ...EMPTY_CD_REGISTRY };
+let _cdRegistryLoadedAt = 0;
+
+export async function loadCdRegistry({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && _cdRegistryLoadedAt && now - _cdRegistryLoadedAt < CD_REGISTRY_TTL_MS) return _cdRegistry;
+  if (!ARTIFACT_BUCKET) { _cdRegistryLoadedAt = now; return _cdRegistry; }
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: CD_REGISTRY_KEY }));
+    _cdRegistry = parseCdRegistry(await res.Body.transformToString());
+    if (!_cdRegistryLoadedAt) {
+      console.log(`[orchestrator] CD registry: ${_cdRegistry.repos.length} repo(s) registered for merge+deploy`);
+    }
+  } catch (err) {
+    const missing = /NoSuchKey|NotFound|404/i.test(String(err?.name || err?.message));
+    if (missing) {
+      if (!_cdRegistryLoadedAt) console.log("[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)");
+      _cdRegistry = { ...EMPTY_CD_REGISTRY };
+    } else {
+      console.warn(`[orchestrator] CD registry read failed: ${err.message} — keeping ${_cdRegistryLoadedAt ? "last good copy" : "empty registry"}`);
+    }
+  }
+  _cdRegistryLoadedAt = now;
+  return _cdRegistry;
+}
+
+/** The def a run FOLLOWS: registered repo → as written; else ship phase stripped. */
+function getEffectiveWorkflowDef(workflow) {
+  return effectiveWorkflowDef(getWorkflowDef(workflow?.workflowDefId), _cdRegistry, workflow?.repoConfig, SHIP_PHASES);
+}
+
+function getDelivery(workflow) {
+  return resolveDelivery(_cdRegistry, workflow?.repoConfig, {
+    pipelineEnabled: isPipelineEnabled(process.env.PIPELINE_ENABLED),
+  });
+}
 
 async function loadAgentRoster() {
   if (_agentRoster) return _agentRoster;
@@ -483,6 +529,7 @@ export const handler = async (event) => {
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
+  await loadCdRegistry();
 
   // Scheduled dead-session sweep (TEAM-3618 D1.2). A rate(5 minutes) EventBridge
   // rule fires this sentinel. Branch BEFORE any stream/webhook parsing — it is a
@@ -1143,8 +1190,90 @@ async function claimTicketInvocation(workflow, ticketId, assignee) {
  * stay blocked until a person transitions it to "done" (approve) — the existing
  * cascade then continues. Returns true if the ticket was handled as a gate.
  */
+// ─── CD HANDOFF (cd-registry.mjs) ─────────────────────────────────────────────
+// A repo outside the CD registry never gets a ship phase: the intake agent is
+// told not to plan Ship/Merge Approval/CD tickets, and these guards make that
+// deterministic — a ship-phase agent ticket or a ship-phase human gate that
+// exists anyway (older run, model drift, hand-made ticket) is resolved Done with
+// an explanatory comment instead of being dispatched or paged. Done feeds the
+// normal cascade, so the run still completes and gets its handoff PR.
+
+function handoffNote(workflow, what) {
+  const url = workflow.repoConfig?.repos?.[0]?.url || "this repo";
+  return (
+    `Resolved by the orchestrator — CD handoff.\n` +
+    `${url} is not in the hub's CD registry, so the hub does not merge or deploy it; ` +
+    `this ${what} does not apply. The run completes once review/QA/CI are done and the ` +
+    `unified PR is left OPEN for the owning team to merge and deploy.`
+  );
+}
+
+async function resolveTicketAsHandoff(ticketId, workflow, note, detail) {
+  console.log(`[orchestrator] ${ticketId}: CD handoff — ${detail.kind} on unregistered repo resolved Done (workflow ${workflow.id})`);
+  try { await commentOnTicket(ticketId, note); }
+  catch (err) { console.warn(`[orchestrator] handoff comment on ${ticketId} failed: ${err.message}`); }
+  if (TICKET_PROVIDER === "jira") {
+    await jiraTransition(ticketId, "Done");
+  } else {
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId },
+      UpdateExpression: "SET #s = :s, #u = :u",
+      ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+      ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
+    }));
+  }
+  await publishEvent(ticketId, "cd.handoff_skip", { ticketId, workflowId: workflow.id, ...detail });
+}
+
+/** Ship-phase AGENT ticket on a HANDOFF run → resolved, not dispatched. */
+async function skipShipTicketForHandoff(ticketId, agentDef, workflow) {
+  if (!SHIP_PHASES.has(agentDef?.phase)) return false;
+  await loadCdRegistry();
+  if (isCdRegistered(_cdRegistry, workflow.repoConfig)) return false;
+  await resolveTicketAsHandoff(
+    ticketId, workflow,
+    handoffNote(workflow, `ship-phase ticket (${agentDef.agentId})`),
+    { kind: "ship_ticket", assignee: agentDef.agentId, phase: agentDef.phase }
+  );
+  return true;
+}
+
+/** Ship-phase HUMAN gate (Merge Approval) on a HANDOFF run → resolved, not paged. */
+async function skipShipGateForHandoff(ticketId, workflow) {
+  await loadCdRegistry();
+  if (isCdRegistered(_cdRegistry, workflow.repoConfig)) return false;
+  const phase = await gatePhaseOf(ticketId);
+  if (!SHIP_PHASES.has(phase)) return false;
+  await resolveTicketAsHandoff(
+    ticketId, workflow,
+    handoffNote(workflow, "merge-approval gate"),
+    { kind: "ship_gate", phase }
+  );
+  return true;
+}
+
+/** The agent phase a human gate guards = the phase of the tickets it is blockedBy. */
+async function gatePhaseOf(gateTicketId) {
+  try {
+    const gate = await getTicket(gateTicketId);
+    for (const upId of gate?.blockedBy || []) {
+      const up = await getTicket(upId);
+      const def = up && getAgentDef(up.assignee);
+      if (def?.phase) return def.phase;
+    }
+  } catch (err) {
+    console.warn(`[orchestrator] gatePhaseOf(${gateTicketId}) failed: ${err.message}`);
+  }
+  return undefined;
+}
+
 async function handleHumanReviewGate(ticketId, assignee, workflow) {
   const reviewer = assignee.slice("human:".length);
+
+  // CD HANDOFF: a Merge Approval gate on a repo the hub does not deploy has
+  // nothing to approve — nobody here merges. Resolve it instead of paging a human.
+  if (workflow && (await skipShipGateForHandoff(ticketId, workflow))) return false;
 
   // Park the ticket in "in_review" (idempotent — setting it again is a no-op).
   if (TICKET_PROVIDER === "jira") {
@@ -1571,7 +1700,7 @@ export async function handleReviewRejection(gateTicket) {
   }
   const gatePhase = upstream.length ? getAgentDef(upstream[0].assignee)?.phase : undefined;
 
-  const wfDef = getWorkflowDef(workflow.workflowDefId);
+  const wfDef = getEffectiveWorkflowDef(workflow);
   const gateCfg =
     (wfDef.reviewGates || []).find((g) => g.afterPhase === gatePhase) || null;
   const onReject = gateCfg?.onReject || "rework"; // default keeps work moving
@@ -2169,6 +2298,9 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   }
   // ─── END CANCEL GUARD ───
 
+  // ─── CD HANDOFF GUARD: no ship-phase work on a repo the hub does not deploy ───
+  if (await skipShipTicketForHandoff(ticketId, agentDef, workflow)) return;
+
   // Idempotency claim — ATOMIC, backend-agnostic. The workflow row lives in
   // DynamoDB in BOTH modes, so a conditional write on agentTasks[ticketId].status
   // is the real lock. Jira transitions are NOT a guard: concurrent webhook
@@ -2601,6 +2733,9 @@ async function handleTicketReady(ticketId, image) {
     return;
   }
 
+  // ─── CD HANDOFF GUARD: no ship-phase work on a repo the hub does not deploy ───
+  if (await skipShipTicketForHandoff(ticketId, agentDef, workflow)) return;
+
   // Idempotency claim — same atomic workflow-row lock as the Jira path.
   const claimed = await claimTicketInvocation(workflow, ticketId, assignee);
   if (!claimed) {
@@ -2700,6 +2835,7 @@ function mayHaveJustSpawnedFixes(assignee) {
 
 // Exported solely so completion-gates.test.mjs can drive the re-check seam.
 export async function isWorkflowComplete(epicId, workflow, triggerAssignee) {
+  await loadCdRegistry(); // effective def (ship phase or not) depends on it
   if (!(await evaluateCompletionSnapshot(epicId, workflow))) return false;
   if (mayHaveJustSpawnedFixes(triggerAssignee)) {
     await new Promise((r) => setTimeout(r, COMPLETION_RECHECK_DELAY_MS));
@@ -2719,7 +2855,7 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
   const children = await getChildTickets(epicId);
   if (children.length === 0) return false;
 
-  const wfDef = getWorkflowDef(workflow?.workflowDefId);
+  const wfDef = getEffectiveWorkflowDef(workflow);
 
   // Resolve a gate ticket's guarded phase the same way handleReviewRejection
   // does — from the agent phase of the upstream tickets it blocks. Prefer any
@@ -2776,8 +2912,31 @@ async function notifyCompletionBlockedOnce(workflow, offenders) {
   }
 }
 
+/**
+ * PR description for a CD HANDOFF run: the hub opened the PR but will not
+ * merge or deploy — say so where the owning team will read it.
+ */
+function handoffPrBody(workflow, baseBranch) {
+  const title = workflow.input?.title || workflow.id;
+  return [
+    `Automated implementation by the AgentCore Hub agent team (${workflow.epicId}).`,
+    ``,
+    `**Handoff — this repository is not in the hub's CD registry.** The hub does not merge or deploy it: `,
+    `code review, QA verification and CI have run on \`${workflow.featureBranch}\`, and this PR against `,
+    `\`${baseBranch}\` is left open for the owning team to review, merge and deploy.`,
+    ``,
+    `- Feature: ${title}`,
+    `- Workflow run: ${workflow.id}`,
+    `- Ticket: ${workflow.epicId}`,
+    `- Evidence: the run's review, QA and CI reports are attached to the tickets above and in the hub's workflow artifacts (\`workflows/${workflow.id}/shared/\`).`,
+  ].join("\n");
+}
+
 export async function completeWorkflow(workflow) {
   if (workflow.phase === "complete") return;
+  // The delivery decision (CD vs HANDOFF) below is taken from the registry as it
+  // is NOW — refresh past the TTL so a repo registered mid-run is honored.
+  await loadCdRegistry();
   // TEAM-3987-adjacent hygiene: a run that is ALREADY terminal (cancelled,
   // deploy-blocked, static-ci-only, error) owes nothing — but the caller's
   // snapshot can predate the terminal write (cancel marks every open ticket Done,
@@ -2811,7 +2970,7 @@ export async function completeWorkflow(workflow) {
   // itself never blocks a legitimate completion — it only tightens when it can
   // prove a phantom deliverable.
   try {
-    const wfDef = getWorkflowDef(workflow?.workflowDefId);
+    const wfDef = getEffectiveWorkflowDef(workflow);
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     if (requiredPhases.length > 0) {
       const children = await getChildTickets(workflow.epicId);
@@ -2948,7 +3107,7 @@ export async function completeWorkflow(workflow) {
   }
 
   try {
-    const wfDef = getWorkflowDef(workflow?.workflowDefId);
+    const wfDef = getEffectiveWorkflowDef(workflow);
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     const shipPhases = requiredPhases.filter((p) => SHIP_PHASES.has(p));
     if (shipPhases.length > 0) {
@@ -3026,7 +3185,8 @@ export async function completeWorkflow(workflow) {
   // Create unified PR if feature branch exists — unless the def has a "ship"
   // phase: there the release manager owns the PR, and by completion time the
   // branch is already merged (create_pr here would 422 "no commits between").
-  const defHasShip = (getWorkflowDef(workflow?.workflowDefId).completionRequiresAgentPhases || []).includes("ship");
+  const defHasShip = defHasShipPhase(workflow);
+  const delivery = getDelivery(workflow);
   let prUrl = "";
   if (!defHasShip && workflow.featureBranch && workflow.repoConfig) {
     try {
@@ -3036,15 +3196,31 @@ export async function completeWorkflow(workflow) {
         owner,
         repo,
         title: `feat: ${workflow.input.title} (${workflow.epicId})`,
-        body: `Automated implementation by agentic team workflow (${workflow.epicId}).`,
+        body: delivery.mode === "handoff"
+          ? handoffPrBody(workflow, baseBranch)
+          : `Automated implementation by agentic team workflow (${workflow.epicId}).`,
         head: workflow.featureBranch,
         base: baseBranch,
       });
       prUrl = prResult?.html_url || "";
-      console.log(`[orchestrator] Created PR: ${prUrl}`);
+      console.log(`[orchestrator] Created PR: ${prUrl}${delivery.mode === "handoff" ? " (CD handoff — left open for the owning team)" : ""}`);
     } catch (err) {
       console.warn(`[orchestrator] PR creation failed: ${err.message}`);
     }
+  }
+
+  // Record how the run was delivered so the UI can say "handed off (PR open)"
+  // vs "merged + deployed" without re-deriving it from the registry later
+  // (the registry can change after the fact). Best-effort.
+  try {
+    await store.setDelivery(workflow.id, {
+      mode: delivery.mode,
+      ...(delivery.pipeline ? { pipeline: delivery.pipeline } : {}),
+      ...(prUrl ? { prUrl } : {}),
+      at: completedAt,
+    });
+  } catch (err) {
+    console.warn(`[orchestrator] ${workflow.id}: could not record delivery mode: ${err.message}`);
   }
 
   // Roll the epic ticket up so the board reflects the closure. Without this the
@@ -3062,6 +3238,7 @@ export async function completeWorkflow(workflow) {
     workflowId: workflow.id,
     featureBranch: workflow.featureBranch,
     prUrl,
+    delivery: delivery.mode,
   });
 
   // Durable marker that the side effects above all ran — the takeover path's
@@ -3311,7 +3488,9 @@ async function blockTicketForFailedInvoke(ticketId, reason) {
 
 // ─── Context Builder ───────────────────────────────────────────────────────────
 
-async function buildAgentContext(ticket, workflow) {
+// Exported solely for cd-handoff.test.mjs (Delivery Mode / roster / gates block).
+export async function buildAgentContext(ticket, workflow) {
+  await loadCdRegistry(); // the Delivery Mode block below reads it
   let context = `# Your Assignment: ${ticket.title}\n\n`;
   context += `## Ticket\nID: ${ticket.ticketId}\nDescription: ${ticket.description}\n\n`;
 
@@ -3360,11 +3539,16 @@ async function buildAgentContext(ticket, workflow) {
 
   // For the intake agent only: provide the valid agent roster (registry data),
   // scoped to agents belonging to this workflow definition.
-  const wfDef = getWorkflowDef(workflow.workflowDefId);
+  const wfDef = getEffectiveWorkflowDef(workflow);
+  const deliveryForContext = getDelivery(workflow);
   if (ticket.assignee === wfDef.intakeAgentId) {
+    // HANDOFF run: the ship-phase personas (release manager) are not offered at
+    // all — the hub does not merge or deploy this repo, so there is no Ship/CD
+    // ticket to plan. The dispatch guard in handleTicketReady* backstops this.
     const roster = (_agentRoster || FALLBACK_ROSTER)
       .filter(a => a.agentId !== wfDef.intakeAgentId)
       .filter(a => (a.workflowDefIds || [a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID]).includes(wfDef.id))
+      .filter(a => deliveryForContext.mode === "cd" || !SHIP_PHASES.has(a.phase))
       .map(a => `  - "${a.agentId}" (${a.phase})`)
       .join("\n");
     context += `## Available Agents\n${roster}\n\n`;
@@ -3437,25 +3621,35 @@ async function buildAgentContext(ticket, workflow) {
     context += `## Repository\nowner: ${owner}\nrepo: ${repo}\ndefault_branch: ${defaultBranch}\n\n`;
   }
 
+  // Delivery mode (CD registry): who merges + deploys this repo. Every persona
+  // sees it — intake stops the ticket chain at CI for a HANDOFF repo, and no
+  // agent merges/deploys a repo the hub does not own. See cd-registry.mjs.
+  {
+    const repoRef = workflow.repoConfig?.repos?.length > 0
+      ? (() => { const { owner, repo } = parseRepoUrl(workflow.repoConfig); return `${owner}/${repo}`; })()
+      : null;
+    context += deliveryModeContext(deliveryForContext, {
+      repo: repoRef,
+      defaultBranch: workflow.repoConfig?.repos?.[0]?.defaultBranch || "main",
+    });
+  }
+
   // CI/CD pipeline mode signal (PR #263). The CI/QA/release-manager blueprints
   // branch on this: set → read CodeBuild/CodePipeline results instead of shelling
   // builds/deploys; absent → legacy self-run. An env var alone is invisible to
   // the model, so surface it EXPLICITLY in the task context (Codex #263 round-5).
   //
-  // TEAM-4044: scoped by PIPELINE_REPOS — the pipeline has ONE Source repo, so a
-  // run on any other repo (juno) gets NO block and its blueprints take the
-  // legacy path (DEPLOY.md / self-run). Before, every repo was told a pipeline
-  // owned its deploy and the release manager's Pipeline___* preflight resolved
-  // to the hub's own pipeline.
-  if (
-    isPipelineEnabled(process.env.PIPELINE_ENABLED) &&
-    pipelineOwnsRepo(workflow.repoConfig, process.env.PIPELINE_REPOS)
-  ) {
+  // Emitted only for a CD-registered repo whose registry entry names a pipeline
+  // (TEAM-4044: before, one global flag told every repo a pipeline owned its
+  // deploy, and the release manager's Pipeline___* preflight resolved to the
+  // hub's own pipeline on repos it never deploys).
+  if (deliveryForContext.pipelineMode) {
     context += `## Pipeline Mode\nPIPELINE_ENABLED: true\n`;
+    context += `pipeline_name: ${deliveryForContext.pipeline}\n`;
     context += `A CodeBuild PR-check + CodePipeline deploy own this repo's `;
     context += `deterministic build/test/deploy. Follow the PIPELINE_ENABLED path `;
-    context += `in your blueprint (read CI/pipeline results; do NOT shell builds or `;
-    context += `run DEPLOY.md yourself).\n\n`;
+    context += `in your blueprint (read CI/pipeline results via the Pipeline___* tools, `;
+    context += `passing pipeline_name; do NOT shell builds or run DEPLOY.md yourself).\n\n`;
   }
 
   // S3 workspace paths (scope)
@@ -4047,9 +4241,11 @@ async function listReviewers(role) {
 // True when this workflow's def declares a "ship" completion phase (the release
 // manager owns the merge). Used by the ship-phase merge gate in completeWorkflow.
 function defHasShipPhase(workflow) {
+  // Effective def: a repo outside the CD registry has its ship phase stripped
+  // (HANDOFF), so the merge gate and the ship verdict never engage for it.
   return (
-    getWorkflowDef(workflow?.workflowDefId).completionRequiresAgentPhases || []
-  ).includes("ship");
+    getEffectiveWorkflowDef(workflow).completionRequiresAgentPhases || []
+  ).some((p) => SHIP_PHASES.has(p));
 }
 
 // Ship-phase merge gate helper (TEAM-3721). Returns a short reason string when

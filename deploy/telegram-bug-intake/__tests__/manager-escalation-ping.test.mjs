@@ -144,7 +144,7 @@ const escalatedRun = (notif = ESCALATION) => [{
   input: { title: "Music video journey" },
   humanNotifications: [notif],
 }];
-const escalations = (net) => net.sent.filter((m) => String(m.text).includes("Workflow Manager escalation"));
+const escalations = (net) => net.sent.filter((m) => String(m.text).toLowerCase().includes("workflow manager escalation"));
 
 describe("manager_escalation pages allowlisted chats", () => {
   it("sends one ping with a Resolved button and dedupes across scans", async () => {

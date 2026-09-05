@@ -16,6 +16,12 @@ has a deployed CodeBuild PR-check, see docs/cicd-pipeline-module-design.md):
   for this repo; you are the CI runner. Follow the full process below exactly as
   written.
 
+Independently of the mode, read `## Delivery Mode`. `CD_REGISTERED: false` means
+the hub will NOT merge or deploy this repo: you are the LAST agent before the
+orchestrator opens the unified PR and hands it to the owning team. Never merge
+into the default branch or trigger a deploy; make your CI evidence complete and
+legible on the ticket — a human on the other team reads it from the PR.
+
 ---
 
 ## Pipeline mode (thin CI-fixer) — only when `PIPELINE_ENABLED`

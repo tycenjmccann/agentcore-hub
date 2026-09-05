@@ -217,7 +217,7 @@ describe("gate pings respect ALLOWED_CHAT_IDS (TEAM-3495 finding 1)", () => {
 
     expect(net.sent.length, "exactly one ping — the allowlisted chat's").toBe(1);
     expect(net.sent[0].chat_id).toBe(12345);
-    expect(net.sent[0].text).toMatch(/Review gate/);
+    expect(net.sent[0].text).toMatch(/review gate/i);
     expect(db.deletes).not.toContain("gate#GATE-1");
     expect(db.items.has("gate#GATE-1"), "a delivered ping holds the dedupe claim").toBe(true);
   });
@@ -285,5 +285,89 @@ describe("no-duration voice notes are budgeted by file size (TEAM-3495 finding 2
     expect(net.sent[0].chat_id).toBe(12345);
     expect(result.offset, "unbudgetable note must not be replayed").toBe(96);
     expect(savedOffsets()).toContain("96");
+  });
+});
+
+// ─── Executive review-gate ping: review package + consistent curated docs ────
+// The ping renders the notification's summary/bullets (the closing agent's
+// review package) and links to its CURATED deliverables — never the old
+// nondeterministic "freshest 3 markdown files" artifacts scan.
+describe("review-gate ping is executive: package summary + curated artifacts", () => {
+  const RICH = [{
+    workflowId: "wf-1",
+    input: { title: "Add passkey login" },
+    humanNotifications: [{
+      type: "review_needed", acknowledged: false, ticketId: "GATE-1", reviewer: "release_manager",
+      gate: "spec",
+      summary: "Passkey (WebAuthn) login for the web console.",
+      bullets: ["Adds /api/auth/passkey", "Falls back to password on unsupported browsers"],
+      links: [
+        { label: "spec.md", artifactKey: "workflows/wf-1/shared/spec.md" },
+        { label: "RFC", url: "https://example.com/rfc" },
+      ],
+    }],
+  }];
+
+  it("renders summary + bullets and curated doc buttons, and never scans /artifacts", async () => {
+    const handler = await loadHandler("12345");
+    registerChat(12345);
+    const ctx = makeCtx(100_000);
+    const net = makeNet(ctx, { workflows: RICH });
+    let artifactCalls = 0;
+    const inner = net.fetch;
+    net.fetch = async (url, opts) => {
+      if (String(url).includes("/api/workflow/artifacts")) artifactCalls++;
+      return inner(url, opts);
+    };
+    global.fetch = net.fetch;
+
+    await handler({}, ctx);
+
+    expect(net.sent.length).toBe(1);
+    const { text, reply_markup: kb } = net.sent[0];
+    expect(text).toMatch(/SPEC REVIEW GATE/);
+    expect(text).toContain("Passkey (WebAuthn) login");
+    expect(text).toContain("*What changed*");
+    expect(text).toContain("• Adds /api/auth/passkey");
+    expect(artifactCalls, "the ping must not fetch the artifacts listing").toBe(0);
+    const btns = kb.inline_keyboard.flat();
+    expect(btns.some((b) => b.text === "📱 Open approval in hub")).toBe(true);
+    expect(btns.some((b) => b.text === "📄 spec.md"
+      && b.url === `${HUB}/workflow?id=wf-1&artifact=workflows%2Fwf-1%2Fshared%2Fspec.md`)).toBe(true);
+    expect(btns.some((b) => b.text === "📄 RFC" && b.url === "https://example.com/rfc")).toBe(true);
+  });
+
+  it("falls back to the gate ticket description + upstream work when no review package", async () => {
+    const WF = [{
+      workflowId: "wf-1",
+      input: { title: "Checkout revamp" },
+      humanNotifications: [{ type: "review_needed", acknowledged: false, ticketId: "GATE-1", reviewer: "release_manager", gate: "plan" }],
+    }];
+    const handler = await loadHandler("12345");
+    registerChat(12345);
+    const ctx = makeCtx(100_000);
+    const net = makeNet(ctx, { workflows: WF });
+    const inner = net.fetch;
+    net.fetch = async (url, opts) => {
+      if (/\/api\/workflow\/[^/]+\/tickets$/.test(String(url))) {
+        return { ok: true, status: 200, text: async () => "", json: async () => ({ tickets: [
+          { ticketId: "GATE-1", title: "Plan Approval", description: "Approve the implementation plan for [checkout](workflows/wf-1/shared/plan.md).", blockedBy: ["T-1", "T-2"] },
+          { ticketId: "T-1", title: "Design cart service" },
+          { ticketId: "T-2", title: "Migrate payment adapter" },
+        ] }) };
+      }
+      return inner(url, opts);
+    };
+    global.fetch = net.fetch;
+
+    await handler({}, ctx);
+
+    const text = net.sent[0].text;
+    expect(text).toMatch(/PLAN REVIEW GATE/);
+    expect(text).toContain("Approve the implementation plan for checkout");
+    expect(text).not.toContain("workflows/wf-1");
+    expect(text).toContain("*What changed*");
+    expect(text).toContain("\u2022 Design cart service");
+    expect(text).toContain("\u2022 Migrate payment adapter");
   });
 });
