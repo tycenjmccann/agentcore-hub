@@ -59,7 +59,10 @@ export const WORKFLOW_TOOLS = [
       "def wins and the run's stored type is derived from it. Sources and model override are optional. " +
       "Every repoConfig URL is verified against GitHub at submit: a URL that definitively does not exist is " +
       "rejected (422) with did-you-mean candidates — fix the typo and resubmit, or pass allowUnresolvedRepo:true " +
-      "to let the intake agent hunt for the right repo and escalate if it can't.",
+      "to let the intake agent hunt for the right repo and escalate if it can't. " +
+      "Intake sources are validated leniently: only a definitive negative (malformed s3://, S3 404, URL 404/410) " +
+      "rejects the submission, while a source that merely could not be reached is accepted and stamped " +
+      "verification.status=\"unverified\" on the run — see the `sources` description.",
     inputSchema: {
       type: "object",
       required: ["title", "description", "repoConfig"],
@@ -92,6 +95,8 @@ export const WORKFLOW_TOOLS = [
         },
         sources: {
           type: "array",
+          description:
+            "Reference material for the requirements agent. Each item: {type, value, label?, contentType?}. type \"s3\" -> value is s3://bucket/key (the hub's own artifacts bucket is HEAD-checked with the hub's task role; EXTERNAL buckets are also HeadObject-checked and the hub account must be granted read via bucket policy — otherwise the source is accepted but marked unverified and pipeline agents will not be able to read it). type \"url\" -> https URL, INCLUDING presigned S3/CloudFront URLs: must be GET-signed (the validator issues a GET with Range: bytes=0-0, never HEAD), lifetime <= 7 days (S3 max), and MUST still be valid when pipeline agents read it later in the run (hours after submit) — not just at submit time. type \"upload\" -> content is in-memory / inline and is not network-validated. Validation is lenient by default (SOURCE_VALIDATION_MODE=lenient): unreachable-but-plausible sources (403, timeouts, 5xx) are accepted and marked verification.status=\"unverified\"; only definitive failures (malformed s3://, S3 404/NoSuchKey, URL 404/410) reject the submission with 422. `verification` is output-only and is overwritten by the server.",
           items: {
             type: "object",
             required: ["type", "value"],
@@ -100,6 +105,16 @@ export const WORKFLOW_TOOLS = [
               value: { type: "string", minLength: 1 },
               contentType: { type: "string" },
               label: { type: "string" },
+              verification: {
+                type: "object",
+                description: "Output-only — the server overwrites whatever a caller sends.",
+                properties: {
+                  status: { type: "string", enum: ["verified", "unverified", "skipped"] },
+                  method: { type: "string" },
+                  detail: { type: "string" },
+                  checkedAt: { type: "string" },
+                },
+              },
             },
           },
           default: [],
@@ -262,6 +277,8 @@ export const WORKFLOW_TOOLS = [
             },
             sources: {
               type: "array",
+              description:
+                "Reference material for the requirements agent. Each item: {type, value, label?, contentType?}. type \"s3\" -> value is s3://bucket/key (the hub's own artifacts bucket is HEAD-checked with the hub's task role; EXTERNAL buckets are also HeadObject-checked and the hub account must be granted read via bucket policy — otherwise the source is accepted but marked unverified and pipeline agents will not be able to read it). type \"url\" -> https URL, INCLUDING presigned S3/CloudFront URLs: must be GET-signed (the validator issues a GET with Range: bytes=0-0, never HEAD), lifetime <= 7 days (S3 max), and MUST still be valid when pipeline agents read it later in the run (hours after submit) — not just at submit time. type \"upload\" -> content is in-memory / inline and is not network-validated. Validation is lenient by default (SOURCE_VALIDATION_MODE=lenient): unreachable-but-plausible sources (403, timeouts, 5xx) are accepted and marked verification.status=\"unverified\"; only definitive failures (malformed s3://, S3 404/NoSuchKey, URL 404/410) reject the submission with 422. `verification` is output-only and is overwritten by the server.",
               items: {
                 type: "object",
                 required: ["type", "value"],
@@ -270,6 +287,16 @@ export const WORKFLOW_TOOLS = [
                   value: { type: "string", minLength: 1 },
                   contentType: { type: "string" },
                   label: { type: "string" },
+                  verification: {
+                    type: "object",
+                    description: "Output-only — the server overwrites whatever a caller sends.",
+                    properties: {
+                      status: { type: "string", enum: ["verified", "unverified", "skipped"] },
+                      method: { type: "string" },
+                      detail: { type: "string" },
+                      checkedAt: { type: "string" },
+                    },
+                  },
                 },
               },
             },
