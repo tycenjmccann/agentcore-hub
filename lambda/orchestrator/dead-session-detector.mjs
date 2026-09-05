@@ -92,6 +92,9 @@ export function createDetector(deps) {
     publishEvent,
     redispatch,
     blockTicket,
+    // TEAM-3991 D1.2 — optional: harvest GitHub evidence for a dead session that
+    // did the work but never reported it. Absent ⇒ the old retry/escalate path.
+    synthesizeCompletion,
     now = () => Date.now(),
     log = (msg) => console.log(`[orchestrator] ${msg}`),
   } = deps;
@@ -508,6 +511,24 @@ export function createDetector(deps) {
           });
           m.fired++;
           if (deathClass === "streamed_then_silent") m.hungToolCalls++;
+
+          // 3b. TEAM-3991 D1.2 — before spending the retry budget, ask GitHub
+          // whether the dead agent already delivered (branch pushed / PR open)
+          // and only its report_completion is missing. If so the ticket goes
+          // Done with synthesized evidence and the normal done cascade takes
+          // over — retrying would redo landed work, escalating would bury it.
+          if (synthesizeCompletion) {
+            let salvaged = null;
+            try {
+              salvaged = await synthesizeCompletion(workflow, ticket);
+            } catch (err) {
+              log(`detector.synthesize_error — ${ticketId} ${err?.message || err} (sweep ${sweepId})`);
+            }
+            if (salvaged?.synthesized) {
+              log(`detector.synthesized — ${ticketId} agent=${agentId} evidence harvested from ${salvaged.branch}; skipping retry/escalate (sweep ${sweepId})`);
+              continue;
+            }
+          }
 
           // 4/5. Retry ONCE, else escalate. The pre-read snapshot count decides;
           // markDeadSessionDetected guarantees one decision per generation.

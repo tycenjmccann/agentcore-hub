@@ -98,6 +98,11 @@ export default defineConfig({
       // Pure module: injected githubFetch + store recorders, no AWS. Includes the
       // wf sffzti replay (4 PRs merged before any gate approval).
       "lambda/orchestrator/gate-bypass.test.mjs",
+      // gate-bypass-wiring (TEAM-3991 D1.1) — the same detector WIRED into both
+      // done handlers. The pure module passing its own tests is not the fix; wf
+      // sffzti's defect was that nothing called it. Real index.mjs, mocked I/O
+      // seams, real githubApi over a stubbed fetch.
+      "lambda/orchestrator/gate-bypass-wiring.test.mjs",
       // ticket-done-blocked-terminal (TEAM-3755 F3) — the contract behind
       // markTaskComplete's unconditional "done": a ticket done whose completion
       // record carries a SHIP_BLOCKED outcome must ALWAYS close the run on a

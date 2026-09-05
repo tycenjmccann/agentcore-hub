@@ -45,7 +45,9 @@ import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
-import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
+import { ensureRepoCheck, formatRepoCheckWarning, checkBranchProtection } from "./repo-check.mjs";
+import { runGateBypassCheck, hasUnackedGateBypass } from "./gate-bypass.mjs";
+import { synthesizeCompletion } from "./evidence.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -323,6 +325,8 @@ function getDetector() {
     publishEvent,
     redispatch: redispatchTicket,
     blockTicket: blockTicketForFailedInvoke,
+    // TEAM-3991 D1.2 — salvage a dead session that already delivered.
+    synthesizeCompletion: synthesizeCompletionFor,
   });
   return _detector;
 }
@@ -724,7 +728,15 @@ export async function handleTicketDoneUnified(ticketId) {
     console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
   }
 
-  await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
+  // TEAM-3991 D1.1 — did anything merge before the Merge Approval gate approved
+  // it? The work DID happen either way, so agent.complete still publishes; the
+  // detail carries gateBypass so the UI/journal shows why the run won't close.
+  const bypass = await gateBypassCheck(workflow, ticket);
+
+  await publishEvent(ticketId, "agent.complete", {
+    ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id,
+    ...(bypass?.bypasses > 0 ? { gateBypass: true } : {}),
+  });
 
   // Always check workflow completion — the last ticket to close triggers this
   if (await isWorkflowComplete(parentId, workflow, assignee)) {
@@ -735,6 +747,210 @@ export async function handleTicketDoneUnified(ticketId) {
 /** Whether an assignee refers to a human reviewer (review gate) vs an agent. */
 function isHumanAssignee(assignee) {
   return typeof assignee === "string" && assignee.startsWith("human:");
+}
+
+/** The per-ticket branch slug an agent is told to push to (buildAgentContext). */
+function agentBranchSlug(assignee) {
+  return typeof assignee === "string"
+    ? assignee.replace(/^agentcore_hub_/, "").replace(/_/g, "-")
+    : "";
+}
+
+/**
+ * Resolve a review-gate ticket's GUARDED phase — the one resolution used by
+ * evaluateCompletionSnapshot (and mirrored in handleReviewRejection): the
+ * ticket's own phase, else the agent phase of the first upstream it blocks.
+ * There is no canonical gate title, so this is how a gate is matched to its def
+ * entry. Extracted (TEAM-3991 D1.1) so the bypass detector shares it verbatim.
+ */
+function makeGatePhaseResolver(children) {
+  const childById = new Map((children || []).map((t) => [t.ticketId, t]));
+  return (gateTicket) => {
+    if (typeof gateTicket?.phase === "string" && gateTicket.phase) return gateTicket.phase;
+    for (const upId of gateTicket?.blockedBy || []) {
+      const up = childById.get(upId);
+      const phase = up && getAgentDef(up.assignee)?.phase;
+      if (phase) return phase;
+    }
+    return undefined;
+  };
+}
+
+/**
+ * TEAM-3991 D1.1 — merge-without-approval detection on the done cascade.
+ *
+ * Runs for every NON-human ticket that closes in a run whose def declares a
+ * Merge Approval gate (F7: the def's gate, not `phase === "development"`).
+ * gate-bypass.mjs owns the logic and never throws; this wrapper owns the deps
+ * and is belt-and-braces guarded — a detector that can break the cascade is
+ * worse than no detector.
+ */
+async function gateBypassCheck(workflow, ticket, children) {
+  try {
+    if (!workflow || !ticket || isHumanAssignee(ticket.assignee)) return null;
+    const kids = children || (await getChildTickets(workflow.epicId));
+    return await runGateBypassCheck({
+      workflow,
+      ticket,
+      children: kids,
+      workflowDef: getWorkflowDef(workflow.workflowDefId),
+      deps: {
+        githubFetch: (path) => githubApi(path),
+        store,
+        publishEvent,
+        addTicketComment,
+        gatePhaseOf: makeGatePhaseResolver(kids),
+        now: () => Date.now(),
+        log: console,
+      },
+    });
+  } catch (err) {
+    console.warn(`[orchestrator] gate-bypass check skipped for ${ticket?.ticketId}: ${err?.message || err}`);
+    return null;
+  }
+}
+
+/**
+ * F10 + the ack gate. Called from completeWorkflow BEFORE the terminal claim:
+ *   (a) re-evaluate every merge that was DEFERRED inside its grace window (by
+ *       completion time the window has long elapsed, so a real bypass can't slip
+ *       out on a deferral);
+ *   (b) refuse to close GREEN while any gate-bypass escalation is unacked.
+ * Returns true when completion must NOT proceed. A bypass is a human-ack
+ * condition, not a terminal outcome — the run stays open, no fabricated close.
+ */
+async function gateBypassBlocksCompletion(workflow) {
+  try {
+    let fresh = (await store.getWorkflow(workflow.id)) || workflow;
+    const deferred = Object.entries(fresh.agentTasks || {}).filter(([, e]) => e?.gateBypassCheckAt);
+    if (deferred.length > 0) {
+      const children = await getChildTickets(workflow.epicId);
+      const byId = new Map(children.map((t) => [t.ticketId, t]));
+      for (const [tid] of deferred) {
+        const t = byId.get(tid) || (await getTicket(tid));
+        if (t) await gateBypassCheck(fresh, t, children);
+      }
+      fresh = (await store.getWorkflow(workflow.id)) || fresh;
+    }
+    if (!hasUnackedGateBypass(fresh)) return false;
+
+    const open = (fresh.humanNotifications || []).filter(
+      (n) => typeof n?.id === "string" && n.id.startsWith("notif_gate_bypass_") && !n.acknowledged
+    );
+    const ticketIds = [...new Set(open.map((n) => n.ticketId).filter(Boolean))];
+    const appended = await store.appendNotificationOnce(fresh.id, {
+      id: `notif_completion_gate_bypass_${fresh.id}`,
+      type: "manager_escalation",
+      title: "Run cannot close: merge without approval is unacknowledged",
+      details:
+        `Code merged before the Merge Approval gate recorded an APPROVE (${open.length} merge commit(s): ` +
+        `${open.map((n) => n.mergeCommit).filter(Boolean).join(", ") || "see the ticket escalations"}). The run stays ` +
+        `open until a human acknowledges the escalation — approve the gate retroactively (or revert), then re-Done ` +
+        `any ticket to re-check completion.`,
+      reviewer: "gate-bypass",
+      timestamp: new Date().toISOString(),
+      acknowledged: false,
+    });
+    if (appended) {
+      await publishEvent(workflow.epicId, "workflow.completion_blocked", {
+        workflowId: fresh.id,
+        reason: "gate_bypass_unacked",
+        ticketIds,
+      });
+    }
+    console.warn(
+      `[orchestrator] ${fresh.id}: completion refused — ${open.length} unacked gate-bypass escalation(s) (${ticketIds.join(", ")})`
+    );
+    return true;
+  } catch (err) {
+    // Fail OPEN: never turn a legitimate completion into a stall on a transient.
+    console.warn(`[orchestrator] gate-bypass completion guard skipped for ${workflow?.id}: ${err?.message || err}`);
+    return false;
+  }
+}
+
+/**
+ * TEAM-3991 D1.1 — branch-protection preflight, once per run.
+ *
+ * A Merge Approval gate is only worth anything if the base branch actually
+ * requires a PR + an approving review; an unprotected default branch means the
+ * gate is advisory and a direct push can bypass it entirely. Recorded on the
+ * workflow (branchProtectionCheck) and, when the branch is NOT protected,
+ * surfaced as workflow.protection_warning. Non-fatal in every direction: an
+ * unreadable answer (no admin scope on the PAT) is never reported as protected.
+ */
+async function ensureBranchProtectionCheck(workflow) {
+  try {
+    if (!workflow || workflow.branchProtectionCheck) return null;
+    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+    if (!owner || !repo) return null;
+    const branch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    const result = await checkBranchProtection({ owner, repo, branch });
+    const checkedAt = new Date().toISOString();
+    workflow.branchProtectionCheck = { ...result, branch, checkedAt };
+    await store.setProtectionCheck(workflow.id, workflow.branchProtectionCheck);
+    if (!result.protected) {
+      await publishEvent(workflow.epicId, "workflow.protection_warning", {
+        workflowId: workflow.id,
+        repo: `${owner}/${repo}`,
+        branch,
+        source: result.source,
+        missing: result.missing,
+      });
+      console.warn(
+        `[orchestrator] ${workflow.id}: ${owner}/${repo}@${branch} is not merge-gate protected ` +
+          `(source=${result.source}, missing=${result.missing.join(",") || "n/a"})`
+      );
+    }
+    return result;
+  } catch (err) {
+    console.warn(`[orchestrator] branch-protection preflight skipped for ${workflow?.id}: ${err?.message || err}`);
+    return null;
+  }
+}
+
+/** Move a ticket to Done through whichever backend is configured. */
+async function transitionTicketToDone(ticketId) {
+  if (TICKET_PROVIDER === "jira") return await jiraTransition(ticketId, "Done");
+  await ddb.send(new UpdateCommand({
+    TableName: TICKETS_TABLE,
+    Key: { ticketId },
+    UpdateExpression: "SET #s = :s, #u = :u",
+    ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+    ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
+  }));
+  return true;
+}
+
+/**
+ * TEAM-3991 D1.2 — harvest completion evidence from GitHub for an agent that
+ * pushed a branch/PR but died before report_completion. evidence.mjs never
+ * fabricates: no commits ahead and no PR ⇒ no writes, no transition.
+ */
+async function synthesizeCompletionFor(workflow, ticket) {
+  if (!ARTIFACT_BUCKET) return { synthesized: false, reason: "no_bucket" };
+  return await synthesizeCompletion({
+    workflow,
+    ticket,
+    agentSlug: agentBranchSlug(ticket?.assignee),
+    deps: {
+      githubFetch: (path) => githubApi(path),
+      s3Get: async (key) => {
+        const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+        return await res.Body.transformToString();
+      },
+      s3Put: async (key, body) => {
+        await s3.send(new PutObjectCommand({
+          Bucket: ARTIFACT_BUCKET, Key: key, Body: body, ContentType: "application/json",
+        }));
+      },
+      store,
+      transitionTicket: transitionTicketToDone,
+      publishEvent,
+      now: () => Date.now(),
+      log: console,
+    },
+  });
 }
 
 // Release-manager convergence escalation gate. The summary shape is fixed by
@@ -2027,6 +2243,9 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     // Feature branch on the def's branch phase entry (repo-backed workflows only)
     if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
       workflow.featureBranch = await ensureFeatureBranch(workflow);
+      // TEAM-3991 D1.1 — one-shot branch-protection preflight on the base
+      // branch (non-fatal, records what it found either way).
+      await ensureBranchProtectionCheck(workflow);
     }
 
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
@@ -2305,8 +2524,14 @@ export async function handleTicketDone(ticketId, image) {
     console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
   }
 
+  // TEAM-3991 D1.1 — gate-bypass detection, symmetric with the webhook twin.
+  const bypass = await gateBypassCheck(workflow, { ticketId, assignee, status: "done" });
+
   // Publish event for UI
-  await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
+  await publishEvent(ticketId, "agent.complete", {
+    ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id,
+    ...(bypass?.bypasses > 0 ? { gateBypass: true } : {}),
+  });
 
   // Check if workflow is complete (all tickets done)
   if (unblocked.length === 0) {
@@ -2391,6 +2616,9 @@ async function handleTicketReady(ticketId, image) {
     // Create shared feature branch on the def's branch phase (repo-backed workflows only)
     if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
       workflow.featureBranch = await ensureFeatureBranch(workflow);
+      // TEAM-3991 D1.1 — one-shot branch-protection preflight on the base
+      // branch (non-fatal, records what it found either way).
+      await ensureBranchProtectionCheck(workflow);
     }
 
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
@@ -2472,16 +2700,8 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
   // Resolve a gate ticket's guarded phase the same way handleReviewRejection
   // does — from the agent phase of the upstream tickets it blocks. Prefer any
   // in-memory child (no fetch); fall back to a lookup for out-of-batch upstreams.
-  const childById = new Map(children.map((t) => [t.ticketId, t]));
-  const gatePhaseOf = (gateTicket) => {
-    if (typeof gateTicket.phase === "string" && gateTicket.phase) return gateTicket.phase;
-    for (const upId of gateTicket.blockedBy || []) {
-      const up = childById.get(upId);
-      const phase = up && getAgentDef(up.assignee)?.phase;
-      if (phase) return phase;
-    }
-    return undefined;
-  };
+  // Shared with the D1.1 bypass detector via makeGatePhaseResolver.
+  const gatePhaseOf = makeGatePhaseResolver(children);
 
   // TEAM-3619 D4c: per-phase re-verify (done work + approved gates + no open
   // fixes), or the legacy heuristic when the def declares no required phases.
@@ -2752,6 +2972,10 @@ export async function completeWorkflow(workflow) {
   // ticket / WM surfaces it) instead of lying. Best-effort: a GitHub/API failure
   // (or no PAT) never blocks a legitimate completion — it only tightens when it
   // can PROVE the branch is unmerged. Opt-out: SHIP_MERGE_VERIFY=off.
+  // TEAM-3991 D1.1 (F10) — re-evaluate deferred merges and refuse a GREEN close
+  // while a merge-without-approval escalation is unacked. The run stays open.
+  if (await gateBypassBlocksCompletion(workflow)) return;
+
   const completedAt = new Date().toISOString();
   const won = await store.completeWorkflow(workflow.id, completedAt);
   if (!won) {
@@ -3007,6 +3231,17 @@ async function invokeAgent(agentDef, context, workflow, ticketId) {
       error: `Invoke failed: ${err.message}`,
     });
     await releaseClaimOnFailure(workflow.id, ticketId);
+    // TEAM-3991 D1.2 — the agent may have already done the work in a prior
+    // session (branch pushed, PR opened) and only the RE-invoke failed. Blocking
+    // the ticket then buries provable work; harvest it from GitHub instead. Only
+    // when there is real evidence — evidence.mjs never fabricates.
+    const salvaged = ticketId
+      ? await synthesizeCompletionFor(workflow, await getTicket(ticketId)).catch(() => null)
+      : null;
+    if (salvaged?.synthesized) {
+      console.log(`[orchestrator] ${ticketId}: invoke failed but GitHub evidence exists — synthesized completion instead of blocking`);
+      return;
+    }
     await blockTicketForFailedInvoke(ticketId, `invoke failed: ${err.message}`);
   }
 }
@@ -3215,7 +3450,7 @@ async function buildAgentContext(ticket, workflow) {
   if (agentDef?.phase === "development") {
     const baseBranch = workflow.featureBranch || workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
     context += `## Branch\n`;
-    context += `feature_branch: feature/${ticket.ticketId}-${agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-")}\n`;
+    context += `feature_branch: feature/${ticket.ticketId}-${agentBranchSlug(agentDef.agentId)}\n`;
     context += `base_branch: ${baseBranch}\n`;
     if (workflow.featureBranch) {
       context += `NOTE: base_branch is this run's SHARED integration branch. Branch from it, target your PR at it (never the repo default branch), and merge your PR into it when your evidence is complete — one unified PR to the default branch is opened by the orchestrator at run completion.\n`;
