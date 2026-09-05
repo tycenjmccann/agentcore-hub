@@ -244,6 +244,13 @@ export default defineConfig({
       // WITHOUT re-dispatching anything (the gate's own cascade unblocks it), and
       // the release-manager escalation title still takes the TEAM-3971 branch.
       "lambda/orchestrator/dead-session-gate-wake.test.mjs",
+      // replay-yteqfl-dead-session (TEAM-4120 FR-3 acceptance) — the real yteqfl
+      // slice 06:51→07:36Z replayed through the REAL sweep → cascade → escalation
+      // tree: the dead release manager's TEAM-4066 gets blocked on the six tickets
+      // it spawned (both the AC's literal 4101/4102 pair and the full closure) and
+      // ONE reconcile tick re-drives it when the last child lands — versus mode
+      // off, where escalationHeld reproduces the 3h26m stall prod actually took.
+      "lambda/orchestrator/replay-yteqfl-dead-session.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
