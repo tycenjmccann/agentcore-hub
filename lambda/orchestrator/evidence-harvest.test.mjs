@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
+// TEAM-3991 D1.2 — the GitHub-side synthesizer (pure module, safe to import
+// statically here: evidence.mjs pulls in no AWS SDK and no mocked seam).
+import { evidenceFromBranchProbe, probeTicketBranches, synthesizeCompletion } from "./evidence.mjs";
+
 /**
  * Completion-evidence harvest on the done cascade.
  *
@@ -405,5 +409,269 @@ describe("late re-harvest on an evidence-less complete entry (TEAM-3976)", () =>
     await handleTicketDoneUnified(DONE);
     expect(completionReads()).toEqual([]);
     expect(h.state.merges).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-3991 D1.2 — synthesized completion evidence (evidence.mjs).
+ *
+ * The harvest above can only read a record the agent wrote. When the agent died
+ * before report_completion there is no record at all, yet the work may be
+ * provably on GitHub (TEAM-3790: branch 3 commits ahead of main with an open PR)
+ * — the run then stranded on the evidence gate forever. evidence.mjs harvests
+ * that proof from the GitHub API instead.
+ *
+ * Harness (b): pure module, injected fetch + store recorders. The mocks above
+ * are irrelevant to these tests (nothing here loads index.mjs).
+ */
+function fakeGithub(routes, calls = []) {
+  return async (path) => {
+    calls.push(path);
+    const hit = Object.entries(routes).find(([k]) => String(path).includes(k));
+    if (!hit) { const e = new Error(`404 Not Found: ${path}`); e.status = 404; throw e; }
+    const val = typeof hit[1] === "function" ? hit[1](path) : hit[1];
+    if (val instanceof Error) throw val;
+    return val;
+  };
+}
+
+describe("evidenceFromBranchProbe", () => {
+  const openPr = { number: 12, state: "open", merged_at: null, html_url: "https://github.com/o/r/pull/12", head: { sha: "aaa111", ref: "feature/TEAM-3790-backend-dev" } };
+  const mergedPr = { number: 9, state: "closed", merged_at: "2026-09-01T09:00:00Z", html_url: "https://github.com/o/r/pull/9", head: { sha: "bbb222", ref: "feature/TEAM-3790-backend-dev" } };
+
+  it("commits ahead + an open PR is evidence", () => {
+    const ev = evidenceFromBranchProbe({
+      branch: "feature/TEAM-3790-backend-dev",
+      branchHead: { name: "feature/TEAM-3790-backend-dev", commit: { sha: "ccc333" } },
+      compare: { ahead_by: 3, status: "ahead" },
+      prs: [openPr],
+    });
+    expect(ev).toEqual({
+      hasEvidence: true,
+      branch: "feature/TEAM-3790-backend-dev",
+      commitSha: "ccc333",
+      prUrl: "https://github.com/o/r/pull/12",
+      prNumber: 12,
+      prState: "open",
+      aheadBy: 3,
+    });
+  });
+
+  it("commits ahead with no PR is still evidence", () => {
+    const ev = evidenceFromBranchProbe({ branch: "b", branchHead: { commit: { sha: "ccc333" } }, compare: { ahead_by: 1 }, prs: [] });
+    expect(ev.hasEvidence).toBe(true);
+    expect(ev.prUrl).toBe("");
+    expect(ev.prNumber).toBeNull();
+  });
+
+  it("a PR with no commits ahead (already merged) is evidence too", () => {
+    const ev = evidenceFromBranchProbe({ branch: "b", branchHead: null, compare: { ahead_by: 0, status: "behind" }, prs: [mergedPr] });
+    expect(ev.hasEvidence).toBe(true);
+    expect(ev.prState).toBe("merged");
+    expect(ev.commitSha).toBe("bbb222"); // falls back to the PR head sha
+  });
+
+  it("prefers a merged PR over an open one", () => {
+    const ev = evidenceFromBranchProbe({ branch: "b", compare: { ahead_by: 2 }, prs: [openPr, mergedPr] });
+    expect(ev.prNumber).toBe(9);
+    expect(ev.prState).toBe("merged");
+  });
+
+  it("no commits and no PR is NOT evidence — nothing to fabricate from", () => {
+    const ev = evidenceFromBranchProbe({ branch: "b", branchHead: { commit: { sha: "ccc333" } }, compare: { ahead_by: 0, status: "identical" }, prs: [] });
+    expect(ev.hasEvidence).toBe(false);
+    expect(ev.aheadBy).toBe(0);
+  });
+
+  it("an empty probe is not evidence", () => {
+    expect(evidenceFromBranchProbe({}).hasEvidence).toBe(false);
+    expect(evidenceFromBranchProbe().hasEvidence).toBe(false);
+  });
+});
+
+describe("probeTicketBranches", () => {
+  it("skips branches GitHub 404s and returns the first one with evidence", async () => {
+    const calls = [];
+    const gh = fakeGithub({
+      "/branches/feature%2FTEAM-3790-backend-dev": { name: "feature/TEAM-3790-backend-dev", commit: { sha: "ccc333" } },
+      "/compare/": { ahead_by: 3, status: "ahead" },
+      "?head=": [{ number: 12, state: "open", merged_at: null, html_url: "u", head: { sha: "aaa111", ref: "x" } }],
+    }, calls);
+    const ev = await probeTicketBranches(gh, {
+      owner: "o", repo: "r", base: "main",
+      branches: ["feature/TEAM-3790-nope", "feature/TEAM-3790-backend-dev"],
+    });
+    expect(ev.hasEvidence).toBe(true);
+    expect(ev.branch).toBe("feature/TEAM-3790-backend-dev");
+    // The missing branch cost exactly one call — no compare/PR lookups for it.
+    expect(calls.filter((p) => p.includes("nope"))).toHaveLength(1);
+  });
+
+  it("dedupes candidates and reports no evidence when every probe is empty", async () => {
+    const calls = [];
+    const gh = fakeGithub({ "/branches/": { commit: { sha: "c" } }, "/compare/": { ahead_by: 0, status: "identical" }, "&head=": [] }, calls);
+    const ev = await probeTicketBranches(gh, { owner: "o", repo: "r", base: "main", branches: ["b", "b", "", null] });
+    expect(ev).toEqual({ hasEvidence: false });
+    expect(calls.filter((p) => p.includes("/branches/"))).toHaveLength(1);
+  });
+
+  it("a thrown compare/PR call is treated as absent, never as a throw", async () => {
+    const gh = fakeGithub({
+      "/branches/": { commit: { sha: "c" } },
+      "/compare/": new Error("GitHub GET /compare 502"),
+      "?head=": new Error("GitHub GET /pulls 502"),
+    });
+    await expect(probeTicketBranches(gh, { owner: "o", repo: "r", branches: ["b"] })).resolves.toEqual({ hasEvidence: false });
+  });
+});
+
+describe("synthesizeCompletion", () => {
+  const TID = "TEAM-3790";
+  const AGENT = "agentcore_hub_backend_dev";
+  const BRANCH = `feature/${TID}-backend-dev`;
+  const NOW = Date.parse("2026-09-05T12:00:00Z");
+  const KEY = `completions/${TID}.json`;
+
+  const wf = (extra = {}) => ({
+    id: "wf_3790",
+    featureBranch: "feature/EPIC-3780-thing",
+    repoConfig: { repos: [{ url: "https://github.com/o/r", defaultBranch: "main" }] },
+    agentTasks: {},
+    ...extra,
+  });
+  const tkt = (extra = {}) => ({ ticketId: TID, assignee: AGENT, status: "in_progress", ...extra });
+
+  // The TEAM-3790 shape: branch 3 commits ahead of main + an open PR, no record.
+  const liveRoutes = () => ({
+    "state=all&base=main": [{ number: 42, state: "open", merged_at: null, html_url: "https://github.com/o/r/pull/42", head: { sha: "aaa111", ref: BRANCH } }],
+    [`/branches/${encodeURIComponent(BRANCH)}`]: { name: BRANCH, commit: { sha: "ccc333" } },
+    "/compare/": { ahead_by: 3, status: "ahead" },
+    "?head=": [{ number: 42, state: "open", merged_at: null, html_url: "https://github.com/o/r/pull/42", head: { sha: "aaa111", ref: BRANCH } }],
+  });
+
+  function harness(overrides = {}) {
+    const writes = { merges: [], puts: [], transitions: [], events: [] };
+    const deps = {
+      githubFetch: overrides.gh || fakeGithub(liveRoutes()),
+      s3Get: overrides.s3Get || (async () => { throw new Error("NoSuchKey"); }),
+      s3Put: async (key, body) => { writes.puts.push({ key, body }); },
+      store: {
+        mergeTaskMetadataOrTrack: async (id, tid, fields, seed) => { writes.merges.push({ id, tid, fields, seed }); return true; },
+      },
+      transitionTicket: async (tid, status) => { writes.transitions.push({ tid, status }); },
+      publishEvent: async (tid, type, detail) => { writes.events.push({ tid, type, detail }); },
+      now: () => NOW,
+      log: { warn: () => {} },
+    };
+    return { writes, deps };
+  }
+
+  it("TEAM-3790 shape: merges metadata, writes the record, transitions done, emits the event", async () => {
+    const { writes, deps } = harness();
+    const res = await synthesizeCompletion({
+      workflow: wf(), ticket: tkt(), agentSlug: "backend-dev", deps,
+    });
+
+    expect(res).toMatchObject({ synthesized: true, branch: BRANCH, commitSha: "ccc333", prUrl: "https://github.com/o/r/pull/42", aheadBy: 3 });
+    expect(res.summary).toBe(`[synthesized] 3 commit(s) on ${BRANCH}; PR https://github.com/o/r/pull/42`);
+
+    expect(writes.merges).toHaveLength(1);
+    expect(writes.merges[0]).toMatchObject({ id: "wf_3790", tid: TID, seed: { agentId: AGENT } });
+    expect(writes.merges[0].fields).toEqual({
+      output: res.summary,
+      branch: BRANCH,
+      commitSha: "ccc333",
+      prUrl: "https://github.com/o/r/pull/42",
+      evidenceSource: "synthesized",
+      synthesizedAt: new Date(NOW).toISOString(),
+    });
+
+    expect(writes.puts).toHaveLength(1);
+    expect(writes.puts[0].key).toBe(KEY);
+    expect(JSON.parse(writes.puts[0].body)).toEqual({
+      ticket_id: TID,
+      agent_id: AGENT,
+      workflow_id: "wf_3790",
+      source: "synthesized", // never mistakable for an agent's own report
+      branch: BRANCH,
+      commit_sha: "ccc333",
+      pr_url: "https://github.com/o/r/pull/42",
+      summary: res.summary,
+      synthesized_at: new Date(NOW).toISOString(),
+    });
+
+    expect(writes.transitions).toEqual([{ tid: TID, status: "done" }]);
+    expect(writes.events).toHaveLength(1);
+    expect(writes.events[0].type).toBe("agent.completion_synthesized");
+    expect(writes.events[0].detail).toMatchObject({ workflowId: "wf_3790", ticketId: TID, agentId: AGENT, branch: BRANCH, aheadBy: 3 });
+  });
+
+  it("an already-done ticket is not re-transitioned (the rest still lands)", async () => {
+    const { writes, deps } = harness();
+    const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt({ status: "done" }), agentSlug: "backend-dev", deps });
+    expect(res.synthesized).toBe(true);
+    expect(writes.transitions).toEqual([]);
+    expect(writes.puts).toHaveLength(1);
+  });
+
+  it("an existing completion record wins — zero writes", async () => {
+    const { writes, deps } = harness({ s3Get: async () => JSON.stringify({ ticket_id: TID, summary: "the agent spoke" }) });
+    const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "backend-dev", deps });
+    expect(res).toEqual({ synthesized: false, reason: "evidence_exists" });
+    expect(writes).toEqual({ merges: [], puts: [], transitions: [], events: [] });
+  });
+
+  it("existing agentTasks output wins too — zero writes", async () => {
+    const { writes, deps } = harness();
+    const workflow = wf({ agentTasks: { [TID]: { output: "already reported" } } });
+    const res = await synthesizeCompletion({ workflow, ticket: tkt(), agentSlug: "backend-dev", deps });
+    expect(res).toEqual({ synthesized: false, reason: "evidence_exists" });
+    expect(writes.merges).toEqual([]);
+    expect(writes.puts).toEqual([]);
+  });
+
+  it("NO branch and NO PR → no_evidence and ZERO writes (never fabricate)", async () => {
+    const { writes, deps } = harness({ gh: fakeGithub({ "state=all&base=main": [] }) });
+    const res = await synthesizeCompletion({ workflow: wf({ featureBranch: "" }), ticket: tkt(), agentSlug: "backend-dev", deps });
+    expect(res).toEqual({ synthesized: false, reason: "no_evidence" });
+    expect(writes).toEqual({ merges: [], puts: [], transitions: [], events: [] });
+  });
+
+  it("a branch identical to base (no commits, no PR) is not evidence either", async () => {
+    const gh = fakeGithub({
+      "state=all&base=main": [],
+      "/branches/": { commit: { sha: "ccc333" } },
+      "/compare/": { ahead_by: 0, status: "identical" },
+      "?head=": [],
+    });
+    const { writes, deps } = harness({ gh });
+    const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "backend-dev", deps });
+    expect(res).toEqual({ synthesized: false, reason: "no_evidence" });
+    expect(writes.puts).toEqual([]);
+  });
+
+  it("no repo config → no_repo, no GitHub calls, zero writes", async () => {
+    const calls = [];
+    const { writes, deps } = harness({ gh: fakeGithub(liveRoutes(), calls) });
+    const res = await synthesizeCompletion({ workflow: wf({ repoConfig: null }), ticket: tkt(), deps });
+    expect(res).toEqual({ synthesized: false, reason: "no_repo" });
+    expect(calls).toEqual([]);
+    expect(writes.merges).toEqual([]);
+  });
+
+  it("discovers the per-ticket branch from an open PR when no agentSlug is known", async () => {
+    const calls = [];
+    const { writes, deps } = harness({ gh: fakeGithub(liveRoutes(), calls) });
+    const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "", deps });
+    expect(res.synthesized).toBe(true);
+    expect(res.branch).toBe(BRANCH);
+    expect(writes.merges[0].fields.branch).toBe(BRANCH);
+  });
+
+  it("a store failure is swallowed as reason=error, never thrown at the cascade", async () => {
+    const { deps } = harness();
+    deps.store.mergeTaskMetadataOrTrack = async () => { throw new Error("DDB down"); };
+    const res = await synthesizeCompletion({ workflow: wf(), ticket: tkt(), agentSlug: "backend-dev", deps });
+    expect(res).toEqual({ synthesized: false, reason: "error" });
   });
 });

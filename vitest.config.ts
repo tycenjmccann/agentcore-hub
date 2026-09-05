@@ -94,6 +94,10 @@ export default defineConfig({
       // has something to read on the done cascade. Same harness as
       // done-handlers-cascade: real handlers, mocked I/O seams.
       "lambda/orchestrator/evidence-harvest.test.mjs",
+      // gate-bypass.mjs (TEAM-3991 D1.1) — merge-without-approval detection.
+      // Pure module: injected githubFetch + store recorders, no AWS. Includes the
+      // wf sffzti replay (4 PRs merged before any gate approval).
+      "lambda/orchestrator/gate-bypass.test.mjs",
       // ticket-done-blocked-terminal (TEAM-3755 F3) — the contract behind
       // markTaskComplete's unconditional "done": a ticket done whose completion
       // record carries a SHIP_BLOCKED outcome must ALWAYS close the run on a
