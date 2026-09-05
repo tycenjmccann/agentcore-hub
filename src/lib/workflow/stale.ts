@@ -19,20 +19,40 @@ import leaseConstants from "../../config/lease-constants.json";
 export const STALL_SOFT_TIMEOUT_MS = leaseConstants.stallSoftTimeoutMs;
 
 export const STALE_THRESHOLD_DEFAULT_MS = 180_000;
+
+/** TEAM-4100 F6 — the coding runtime throttles its liveness heartbeat to at most
+ *  one per HEARTBEAT_MIN_INTERVAL_S (deploy/runtime-agent/main.py, default 60s).
+ *  Both the backend lease and (post-F6) the UI advance their idle clock on each
+ *  heartbeat, but the UI can lag the backend by up to one interval — a heartbeat
+ *  already renewed the backend lease but hasn't reached the browser yet. So the
+ *  UI window carries one heartbeat interval of slack so the board never paints
+ *  STUCK BEFORE the orchestrator reclaims the lease. That direction is the one
+ *  that bites: a premature STUCK exposes the manual Restart button and invites a
+ *  duplicate session (D1.5). */
+export const HEARTBEAT_SLACK_MS = 60_000;
+
 /** claude_code goes dark for the whole run: historically 15 min timeout + 2 min
- *  buffer (1_020_000). TEAM-3989 D4.3 caps this at the orchestrator's stall
+ *  buffer (1_020_000). TEAM-3989 D4.3 tied this to the orchestrator's stall
  *  soft-timeout (STALL_SOFT_TIMEOUT_MS) so the board and the stall detector agree
- *  on when a silent claude_code agent is stuck: the UI can never treat an agent
- *  as live past the point the orchestrator will reclaim its lease. With the
- *  current 10-min soft-timeout (< 17 min) this LOWERS the window to 10 min; the
- *  value now tracks lease-constants.stallSoftTimeoutMs. */
-export const STALE_THRESHOLD_CLAUDE_CODE_MS = Math.min(1_020_000, STALL_SOFT_TIMEOUT_MS);
+ *  on when a silent claude_code agent is stuck. TEAM-4100 F6 then made the UI
+ *  count coding heartbeats (agent_heartbeat) toward liveness — the SAME signal the
+ *  backend lease counts — so the two now measure silence from the same anchor. To
+ *  guarantee the UI is never the FIRST to give up (see HEARTBEAT_SLACK_MS), the
+ *  window is soft-timeout + one heartbeat interval, still well under the old 17-min
+ *  ceiling: min(1_020_000, 600_000 + 60_000) = 660_000 (11 min). A live heartbeat
+ *  stream keeps the agent green indefinitely; the ceiling only decides how long
+ *  after heartbeats STOP the board waits, which now trails the backend by the slack. */
+export const STALE_THRESHOLD_CLAUDE_CODE_MS = Math.min(1_020_000, STALL_SOFT_TIMEOUT_MS + HEARTBEAT_SLACK_MS);
 
 export function staleThresholdFor(anyAgentInClaudeCode: boolean): number {
   return anyAgentInClaudeCode ? STALE_THRESHOLD_CLAUDE_CODE_MS : STALE_THRESHOLD_DEFAULT_MS;
 }
 
-const LIVENESS_EVENT_TYPES = new Set(["agent_output", "tool_use", "tool_end"]);
+// agent_heartbeat (TEAM-4100 F6) is liveness: the coding runtime emits it during
+// a silent claude_code/codex turn precisely to prove the microVM is alive, and the
+// backend lease counts it — the UI must too, or a heartbeating-but-text-silent
+// coding agent falsely trips STUCK.
+const LIVENESS_EVENT_TYPES = new Set(["agent_output", "tool_use", "tool_end", "agent_heartbeat"]);
 
 /** True if this SSE event proves the agent is alive (resets the idle clock). */
 export function isLivenessEvent(type: string): boolean {

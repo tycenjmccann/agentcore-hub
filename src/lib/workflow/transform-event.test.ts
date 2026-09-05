@@ -30,6 +30,42 @@ describe("transformEvent — agent.error (real failure)", () => {
   });
 });
 
+describe("transformEvent — agent.streaming subtypes (TEAM-4100 F6)", () => {
+  const streaming = (detail: Record<string, unknown>) =>
+    transformEvent({ type: "agent.streaming", timestamp: TS, detail });
+
+  it("text → agent_output (unchanged)", () => {
+    expect(streaming({ agentId: "dev", type: "text", content: "hi", ticketId: "TEAM-2" })).toEqual({
+      type: "agent_output",
+      agentId: "dev",
+      chunk: "hi",
+      ticketId: "TEAM-2",
+      timestamp: TS,
+    });
+  });
+
+  it("trace → tool_use (unchanged)", () => {
+    expect(streaming({ agentId: "dev", type: "trace", toolName: "claude_code" })).toEqual({
+      type: "tool_use",
+      agentId: "dev",
+      toolName: "claude_code",
+      timestamp: TS,
+    });
+  });
+
+  it("heartbeat → agent_heartbeat liveness event (agentId + ticketId, no chunk)", () => {
+    const out = streaming({ agentId: "dev", type: "heartbeat", ticketId: "TEAM-2", turn_id: "t1", poll_status: "running" });
+    expect(out).toEqual({ type: "agent_heartbeat", agentId: "dev", ticketId: "TEAM-2", timestamp: TS });
+    // Not transcript text — nothing to render/accumulate.
+    expect(out).not.toHaveProperty("chunk");
+    expect(out).not.toHaveProperty("content");
+  });
+
+  it("an unknown agent.streaming subtype is still dropped (null)", () => {
+    expect(streaming({ agentId: "dev", type: "keepalive-legacy" })).toBeNull();
+  });
+});
+
 describe("transformEvent — dead_session.shadow (TEAM-3698 F2)", () => {
   it("is dropped (null): a shadow observation is not a UI event", () => {
     const out = transformEvent({

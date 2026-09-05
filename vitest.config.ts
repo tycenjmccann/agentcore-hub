@@ -158,6 +158,22 @@ export default defineConfig({
       // ORIGIN ticket becomes blockedBy its fix, which is what turns the fix's
       // completion into an unblock event for the parked origin (wf 1pl3h1).
       "lambda/agentcore-hub-tickets/tickets-edge.test.mjs",
+      // plan-gate (TEAM-4100 F2 layer 2) — the create-time plan-conformance check:
+      // when a validated ticket-plan is persisted, an agent create for an assignee
+      // outside the plan is rejected TICKET_NOT_IN_PLAN; the orchestrator envelope,
+      // human gates, and no-plan runs are exempt (layer 1 is the hard gate).
+      "lambda/agentcore-hub-tickets/plan-gate.test.mjs",
+      // fix-dedupe (TEAM-4100 F5) — create-time (workflow, findingId) uniqueness
+      // for orchestrator fix tickets, in BOTH ticket providers. The DynamoDB twin
+      // is atomic (a dedupe#<wf>#finding#<fid> item written under
+      // attribute_not_exists BEFORE the real ticket, with a 60s stale-claim
+      // take-over for a crashed creator); the Jira twin is best-effort
+      // (deterministic finding:<fid> label + search-before-create, Jira has no
+      // CAS). Real handlers, stub DDB honouring the conditional put / stubbed
+      // Jira REST; the second concurrent create returns { deduped:true } with the
+      // winner's key so the orchestrator publishes exactly one fix_spawned event.
+      "lambda/agentcore-hub-tickets/fix-dedupe.test.mjs",
+      "lambda/agentcore-hub-jira/fix-dedupe.test.mjs",
       // agentcore-hub-pipeline-tools (TEAM-3822) — the CD tools Lambda: the
       // execution-scoped get_state race fix (matchesExecution), the
       // get_build_status scan clamp, and the start_deploy clientRequestToken
@@ -203,6 +219,11 @@ export default defineConfig({
       // workflow.dag_violation → store.setDagAudit). §3(a) shape: real index.mjs
       // + real dag.mjs, I/O seams mocked, def served from S3 workflows.json.
       "lambda/orchestrator/dag-audit.test.mjs",
+      // dag-enforce-gate (TEAM-4100 F2) — the HARD realized-graph topology gate at
+      // first development-phase entry when DAG_VALIDATION_MODE=enforce: violating
+      // tickets (or a missing plan) park the claim + raise ONE idempotent
+      // manager_escalation + abort dispatch; conforming/shadow proceed. §3(a) shape.
+      "lambda/orchestrator/dag-enforce-gate.test.mjs",
       // mode-defaults (TEAM-4099 F8) — the three-way agreement between the code
       // default in index.mjs, template.yaml's parameter Default, and what
       // deploy.sh forwards (the layer that decides production, since

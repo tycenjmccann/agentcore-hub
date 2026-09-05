@@ -81,6 +81,11 @@ const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
+// TEAM-4100 F2 — realized-graph topology enforcement mode (must match the value
+// workflow-output submitTicketPlan reads). "enforce" makes the realized-graph
+// check a HARD dispatch gate at first development-phase entry; "shadow"/"off"
+// keep the advisory, never-blocking auditRealizedGraphOnce behavior.
+const DAG_VALIDATION_MODE = (process.env.DAG_VALIDATION_MODE || "enforce").toLowerCase();
 const GITHUB_LAMBDA = process.env.GITHUB_LAMBDA || "agentcore-hub-github-mcp";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const MAX_QA_RETRIES = 3;
@@ -478,6 +483,105 @@ async function auditRealizedGraphOnce(workflow, wfDef) {
   }
 }
 
+/**
+ * TEAM-4100 F2 — HARD realized-graph topology gate (design D3.4 / TEAM-3993
+ * "cannot be bypassed by the analyst"). This is THE HARD GATE; the create-time
+ * check in the tickets Lambdas is a best-effort second layer.
+ *
+ * The plan-time validator (workflow-output submitTicketPlan) only guards the
+ * PLAN — the analyst then creates the real tickets by hand via
+ * Tickets___create_ticket, so the plan and the realized graph can diverge and
+ * auditRealizedGraphOnce (advisory) never blocked dispatch. This gate runs at
+ * the run's FIRST development-phase entry, BEFORE the phase is advanced, so a
+ * violating run stays in its prior phase and RE-EVALUATES on every re-trigger
+ * until the tickets conform (no permanent slip on a transient read error).
+ *
+ * Scope predicate (enforced by the caller): agentDef.phase === "development"
+ * AND the run is advancing INTO development (agentPhaseIdx > currentPhaseIdx)
+ * AND DAG_VALIDATION_MODE === "enforce". This fires exactly once per real
+ * advance into development — fix/re-verify chains and the ship phase re-drive
+ * dev tickets WITHOUT re-entering the phase-advance block, so runs already past
+ * development are never gated here.
+ *
+ * Two coded outcomes, both fail-closed (park + one idempotent escalation):
+ *   - PLAN_NOT_SUBMITTED — the def declares a ticketDag (so it requires a
+ *     validated plan) but none was ever persisted (shared/ticket-plan.json
+ *     absent).
+ *   - the validateRealizedGraph violation set over the run's REAL child tickets,
+ *     EXCLUDING orchestrator-spawned fix/re-verify tickets (any `spawnedBy`) —
+ *     those are created later and are exempt from the topology contract, so
+ *     they are filtered out before the check rather than flagged.
+ *
+ * Returns true when it BLOCKED dispatch — the caller must return WITHOUT
+ * advancing the phase or invoking. No-op (false) when the def declares no
+ * ticketDag or the realized graph conforms. Idempotent on re-trigger: parkClaim
+ * is generation-scoped (only parks THIS fresh claim) and appendNotificationOnce
+ * dedupes by id, so a re-trigger raises no second escalation/event.
+ */
+async function enforceRealizedGraphGate(workflow, wfDef, ticketId) {
+  if (!wfDef?.ticketDag) return false; // def declares no topology to enforce
+  const expectedStartedAt = workflow.agentTasks?.[ticketId]?.startedAt;
+  let violations;
+  try {
+    // The def requires a validated plan; if none was persisted, the analyst
+    // skipped submit_ticket_plan entirely — coded PLAN_NOT_SUBMITTED.
+    const planRaw = await readS3Artifact(workflow.id, "shared/ticket-plan.json");
+    if (!planRaw) {
+      violations = [{ code: "PLAN_NOT_SUBMITTED" }];
+    } else {
+      const children = (await getChildTickets(workflow.epicId)).filter(
+        (c) => !(c && (c.spawnedBy || c.spawned_by))
+      );
+      const roster = await loadAgentRoster();
+      violations = validateRealizedGraph(children, wfDef.ticketDag, roster) || [];
+    }
+  } catch (err) {
+    // FAIL CLOSED on an infra fault: park (no escalation) so the reconcile sweep
+    // re-drives and this gate re-evaluates once the read recovers, rather than
+    // dispatching blind and advancing the phase past the gate.
+    console.warn(`[orchestrator] ${workflow.id}: realized-graph gate read failed — parking (fail-closed): ${err?.message || err}`);
+    await store.parkClaim(workflow.id, ticketId, expectedStartedAt);
+    return true;
+  }
+  if (violations.length === 0) return false; // realized graph conforms → dispatch
+
+  // Block: park this claim, raise ONE manager_escalation naming the coded
+  // violations, and abort. The phase is NOT advanced (caller returns), so the
+  // next re-trigger re-runs this gate — once the tickets conform it proceeds.
+  await store.parkClaim(workflow.id, ticketId, expectedStartedAt);
+  const codes = [...new Set(violations.map((v) => v.code).filter(Boolean))];
+  const planMissing = codes.includes("PLAN_NOT_SUBMITTED");
+  const detail = violations
+    .slice(0, 20)
+    .map((v) =>
+      v.code === "PLAN_NOT_SUBMITTED"
+        ? "PLAN_NOT_SUBMITTED"
+        : `${v.code}${v.ticket ? ` @${v.ticket}` : ""}${v.node ? ` (${v.node})` : ""}${v.from ? ` ${v.from}→${v.to}` : ""}`
+    )
+    .join("; ");
+  const appended = await store.appendNotificationOnce(workflow.id, {
+    id: `notif_dag_violation_${workflow.id}`,
+    type: "manager_escalation",
+    title: "Run blocked: created tickets violate the workflow topology",
+    details: planMissing
+      ? `No validated ticket plan was submitted for this run, but the workflow def requires one (DAG_VALIDATION_MODE=enforce). Call submit_ticket_plan (it validates against the def's ticketDag) and create the tickets from it before development can start.`
+      : `The run's created child tickets do not conform to the def's declared ticketDag (DAG_VALIDATION_MODE=enforce): ${detail}. Fix the tickets (assignees / blocked_by edges) to match the validated plan; development will not dispatch until they conform. Re-drive any dev ticket to re-check.`,
+    reviewer: "dag-gate",
+    timestamp: new Date().toISOString(),
+    acknowledged: false,
+  });
+  if (appended) {
+    await publishEvent(workflow.epicId, "workflow.dag_violation", {
+      workflowId: workflow.id,
+      defId: workflow.workflowDefId,
+      enforced: true,
+      violations: violations.slice(0, 20),
+    });
+  }
+  console.log(`[orchestrator] ${workflow.id}: realized-graph topology gate BLOCKED dispatch (${codes.join(", ") || "violations"})`);
+  return true;
+}
+
 // ─── Dead-session detector (TEAM-3618 D1.2) ──────────────────────────────────
 
 /**
@@ -645,6 +749,41 @@ async function blockTicketRuntime(ticketId) {
   }
 }
 
+/**
+ * TEAM-4100 F3 backstop — find coding tickets parked `blocked:runtime` that have
+ * NO outage object driving their recovery (a prior recovery deleted the object
+ * before resuming the remainder, or a park outlived its outage). There is no
+ * status/blockReason GSI on the tickets table, so this is a bounded FilterExpression
+ * SCAN: at most RUNTIME_BACKSTOP_SCAN_PAGES DynamoDB pages, capped at
+ * RUNTIME_BACKSTOP_CAP matches. It runs from the 5-minute sweep ONLY when no outage
+ * object exists, so the scan is not on any hot path. DynamoDB provider only — Jira
+ * parks via a status transition + comment with no queryable blockReason, and the
+ * outage-object recovery path (shared by both providers) is the primary mechanism.
+ */
+const RUNTIME_BACKSTOP_SCAN_PAGES = Number(process.env.RUNTIME_BACKSTOP_SCAN_PAGES) || 10;
+const RUNTIME_BACKSTOP_CAP = Number(process.env.RUNTIME_BACKSTOP_CAP) || 200;
+async function findRuntimeBlockedTickets() {
+  if (TICKET_PROVIDER === "jira") return [];
+  const found = [];
+  let lastKey;
+  for (let page = 0; page < RUNTIME_BACKSTOP_SCAN_PAGES; page++) {
+    const res = await ddb.send(new ScanCommand({
+      TableName: TICKETS_TABLE,
+      FilterExpression: "#s = :blocked AND #br = :runtime",
+      ExpressionAttributeNames: { "#s": "status", "#br": "blockReason" },
+      ExpressionAttributeValues: { ":blocked": "blocked", ":runtime": "runtime" },
+      ExclusiveStartKey: lastKey,
+    }));
+    for (const t of res.Items || []) {
+      if (t.ticketId && t.workflowId) found.push({ workflowId: t.workflowId, ticketId: t.ticketId });
+      if (found.length >= RUNTIME_BACKSTOP_CAP) return found;
+    }
+    lastKey = res.LastEvaluatedKey;
+    if (!lastKey) break;
+  }
+  return found;
+}
+
 // One shared runtime-health gate per warm container (same shape as the cascade /
 // detector singletons). The S3 seam is adapted to the ETag/IfNoneMatch/IfMatch
 // contract runtime-health.mjs expects; the InvokeAgentRuntime call is lazily
@@ -659,6 +798,9 @@ function getRuntimeHealth() {
       RUNTIME_PROBE_CACHE_MS: process.env.RUNTIME_PROBE_CACHE_MS,
       RUNTIME_PROBE_CONFIRM: process.env.RUNTIME_PROBE_CONFIRM,
       RUNTIME_OUTAGE_BACKOFF_MIN: process.env.RUNTIME_OUTAGE_BACKOFF_MIN,
+      RUNTIME_PROBE_TIMEOUT_MS: process.env.RUNTIME_PROBE_TIMEOUT_MS,
+      RUNTIME_RECOVERING_STALE_MS: process.env.RUNTIME_RECOVERING_STALE_MS,
+      RUNTIME_RESUME_PERSIST_EVERY: process.env.RUNTIME_RESUME_PERSIST_EVERY,
     },
     now: () => Date.now(),
     publishEvent,
@@ -696,6 +838,7 @@ function getRuntimeHealth() {
       const children = await getChildTickets(workflow.epicId).catch(() => []);
       return children.find((t) => t.ticketId === ticketId) || (await getTicket(ticketId));
     },
+    findRuntimeBlockedTickets,
     log: (msg) => console.log(msg),
   });
   return _runtimeHealth;
@@ -709,19 +852,24 @@ function getRuntimeHealth() {
  * { statusCode, json }. Connect/read timeouts keep a wedged runtime from hanging
  * the 45s probe budget. Lazily imported so this is free on warm paths that never probe.
  */
-async function invokeCodingRuntimeProbe({ arn, sessionId, payload }) {
+async function invokeCodingRuntimeProbe({ arn, sessionId, payload, abortSignal }) {
   const { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } = await import("@aws-sdk/client-bedrock-agentcore");
   const { NodeHttpHandler } = await import("@smithy/node-http-handler");
   const client = new BedrockAgentCoreClient({
     region: REGION,
     requestHandler: new NodeHttpHandler({ connectionTimeout: 5000, requestTimeout: 20000 }),
   });
-  const resp = await client.send(new InvokeAgentRuntimeCommand({
-    agentRuntimeArn: arn,
-    runtimeSessionId: sessionId,
-    payload: new TextEncoder().encode(JSON.stringify(payload)),
-    accept: "application/json",
-  }));
+  const resp = await client.send(
+    new InvokeAgentRuntimeCommand({
+      agentRuntimeArn: arn,
+      runtimeSessionId: sessionId,
+      payload: new TextEncoder().encode(JSON.stringify(payload)),
+      accept: "application/json",
+    }),
+    // F4 — the runtime-health guard's timer aborts this signal on budget-exceed so
+    // a wedged runtime tears its socket down instead of hanging the probe.
+    abortSignal ? { abortSignal } : {},
+  );
   const statusCode = resp?.statusCode ?? resp?.$metadata?.httpStatusCode ?? 0;
   let json = null;
   try {
@@ -3017,6 +3165,13 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
   if (agentPhaseIdx > currentPhaseIdx) {
+    // TEAM-4100 F2 — HARD topology gate at the run's FIRST development-phase
+    // entry. Runs BEFORE the phase is advanced so a violating run stays in its
+    // prior phase and re-evaluates on every re-trigger (no bypass); on a block
+    // it parks this claim + raises one escalation and we abort without invoking.
+    if (agentDef.phase === "development" && DAG_VALIDATION_MODE === "enforce") {
+      if (await enforceRealizedGraphGate(workflow, wfDef, ticketId)) return;
+    }
     workflow.phase = agentDef.phase;
     await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
 
@@ -3030,8 +3185,12 @@ async function handleTicketReadyUnified(ticketId, ticket) {
 
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
 
-    // TEAM-3992 D3.4 — one-shot realized-graph audit on development-phase entry.
-    if (agentDef.phase === "development") await auditRealizedGraphOnce(workflow, wfDef);
+    // TEAM-3992 D3.4 — advisory realized-graph audit on development-phase entry.
+    // Shadow/off ONLY: in enforce mode the HARD gate above already ran (and, on a
+    // violation, aborted before we reached here), so this never double-checks.
+    if (agentDef.phase === "development" && DAG_VALIDATION_MODE !== "enforce") {
+      await auditRealizedGraphOnce(workflow, wfDef);
+    }
   }
 
   // Build context and invoke — SAME buildAgentContext for both paths
@@ -3426,6 +3585,13 @@ async function handleTicketReady(ticketId, image) {
   const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
   if (agentPhaseIdx > currentPhaseIdx) {
+    // TEAM-4100 F2 — HARD topology gate at the run's FIRST development-phase
+    // entry. Runs BEFORE the phase is advanced so a violating run stays in its
+    // prior phase and re-evaluates on every re-trigger (no bypass); on a block
+    // it parks this claim + raises one escalation and we abort without invoking.
+    if (agentDef.phase === "development" && DAG_VALIDATION_MODE === "enforce") {
+      if (await enforceRealizedGraphGate(workflow, wfDef, ticketId)) return;
+    }
     workflow.phase = agentDef.phase;
     await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
 
@@ -3439,8 +3605,12 @@ async function handleTicketReady(ticketId, image) {
 
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
 
-    // TEAM-3992 D3.4 — one-shot realized-graph audit on development-phase entry.
-    if (agentDef.phase === "development") await auditRealizedGraphOnce(workflow, wfDef);
+    // TEAM-3992 D3.4 — advisory realized-graph audit on development-phase entry.
+    // Shadow/off ONLY: in enforce mode the HARD gate above already ran (and, on a
+    // violation, aborted before we reached here), so this never double-checks.
+    if (agentDef.phase === "development" && DAG_VALIDATION_MODE !== "enforce") {
+      await auditRealizedGraphOnce(workflow, wfDef);
+    }
   }
 
   // Build context and invoke agent
@@ -4983,6 +5153,11 @@ async function runFixTicketMachinery(workflow, ticket) {
     getWorkflowDef,
     getAgentDef,
     resolveDevAssignee,
+    // TEAM-4100 F5b — provider-independent (workflow, findingId) CAS on the
+    // workflows table, so the fix-spawn race is closed even under TICKET_PROVIDER=jira
+    // (whose Lambda has no conditional create / no DynamoDB access).
+    claimFindingSpawn: store.claimFindingSpawn,
+    finalizeFindingSpawn: store.finalizeFindingSpawn,
     commitShaOf: (tid) =>
       (record && record.commit_sha) || workflow.agentTasks?.[tid]?.commitSha || "",
   };

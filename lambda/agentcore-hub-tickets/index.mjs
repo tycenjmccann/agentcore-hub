@@ -45,6 +45,21 @@ const s3 = new S3Client({ region: REGION });
 
 const COUNTER_KEY = { ticketId: "__COUNTER__" };
 
+// TEAM-4100 F5 — create-time uniqueness for orchestrator fix tickets. Two verifier
+// completions with the SAME (workflowId, findingId) can race the orchestrator's
+// read-first sibling check (spawnFixTicketsFromFindings) and both reach create,
+// producing duplicate fix tickets. Uniqueness is enforced HERE with a dedupe item
+// keyed `dedupe#<wf>#finding#<fid>` written under attribute_not_exists BEFORE the
+// real ticket. A `pending` claim whose creator crashed before writing the real
+// ticket is taken over after DEDUPE_STALE_MS so a crash can never permanently
+// wedge a finding. The item carries a TTL so the table self-cleans.
+const DEDUPE_STALE_MS = Number(process.env.FIX_DEDUPE_STALE_MS) || 60000;
+const DEDUPE_TTL_SECONDS = Number(process.env.FIX_DEDUPE_TTL_SECONDS) || 7 * 24 * 3600;
+
+/** Reserved (non-ticket) rows that must never surface in ticket listings/scans. */
+const isReservedRow = (i) =>
+  i?.ticketId === "__COUNTER__" || String(i?.ticketId || "").startsWith("dedupe#");
+
 // ─── Agent Roster (config-driven from S3, falls back to hardcoded) ────────────
 
 const FALLBACK_AGENTS = new Set([
@@ -88,6 +103,36 @@ async function loadValidAgents() {
     VALID_AGENTS = FALLBACK_AGENTS;
   }
   return VALID_AGENTS;
+}
+
+/**
+ * TEAM-4100 F2 (layer 2, best-effort create-time check) — the set of assignees a
+ * validated ticket plan authorized for a workflow. The plan is persisted by
+ * workflow-output submitTicketPlan (only AFTER it validates against the def's
+ * ticketDag in enforce/shadow mode) at shared/ticket-plan.json in the SAME
+ * bucket this Lambda already reads the roster from — one cheap GetObject, no new
+ * IAM. Returns null when no plan exists or on any read/parse failure: the check
+ * fails OPEN because the orchestrator's realized-graph gate (layer 1) is the
+ * hard gate. Layer 2 only tightens the analyst's create path when it provably can.
+ */
+async function planAssigneeSet(workflowId) {
+  if (!workflowId || !ARTIFACT_BUCKET) return null;
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: `workflows/${workflowId}/shared/ticket-plan.json`,
+    }));
+    const plan = JSON.parse(await res.Body.transformToString());
+    const tickets = Array.isArray(plan?.tickets) ? plan.tickets : [];
+    const set = new Set();
+    for (const t of tickets) {
+      const a = typeof t?.assignee === "string" ? t.assignee.trim() : "";
+      if (a) set.add(a);
+    }
+    return set.size > 0 ? set : null;
+  } catch {
+    return null; // no plan persisted / unreadable → no create-time check
+  }
 }
 
 // TEAM-3686: known workflow phases, for validating the `phase` stamp on
@@ -236,7 +281,7 @@ export const handler = async (event) => {
   try {
     switch (toolName) {
       case "create_ticket":
-        return await createTicket(args);
+        return await createTicket(args, { caller: trustedCallerOf(event) });
       case "get_issue":
         return await getIssue(args);
       case "edit_issue":
@@ -366,6 +411,76 @@ async function linkFixToOrigin(fixTicketId, spawnedBy, nowIso) {
   }
 }
 
+// ─── F5: create-time fix-ticket dedupe (atomic, DynamoDB CAS) ────────────────
+
+/** The reserved dedupe pk for a (workflow, finding) pair, or null when either is absent. */
+function findingDedupeKey(workflowId, findingId) {
+  return workflowId && findingId ? `dedupe#${workflowId}#finding#${findingId}` : null;
+}
+
+/**
+ * Claim the create-time dedupe lease for a (workflow, findingId), embedding the
+ * ticketId we intend to mint so a LOSING racer can return it immediately — even
+ * before our real Put lands. The conditional Put IS the uniqueness guarantee:
+ * exactly one concurrent create wins `attribute_not_exists`, the rest fail closed.
+ * A `pending` lease older than DEDUPE_STALE_MS is a crashed creator (claimed but
+ * never wrote the real ticket) and is taken over.
+ *   { won: true }             — we hold the lease; create the ticket, then finalize
+ *   { won: false, ticketId }  — someone else owns it; return their id as deduped
+ */
+async function claimFindingDedupe(key, intendedTicketId) {
+  const nowMs = Date.now();
+  const item = {
+    ticketId: key,
+    dedupeStatus: "pending",
+    dedupeFor: intendedTicketId,
+    claimedAtMs: nowMs,
+    createdAt: new Date(nowMs).toISOString(),
+    ttl: Math.floor(nowMs / 1000) + DEDUPE_TTL_SECONDS,
+  };
+  try {
+    await ddb.send(new PutCommand({
+      TableName: TABLE_NAME,
+      Item: item,
+      ConditionExpression:
+        "attribute_not_exists(ticketId) OR (dedupeStatus = :pending AND claimedAtMs < :staleBefore)",
+      ExpressionAttributeValues: { ":pending": "pending", ":staleBefore": nowMs - DEDUPE_STALE_MS },
+    }));
+    return { won: true };
+  } catch (err) {
+    if (err?.name !== "ConditionalCheckFailedException") throw err;
+    // Lost: a live (pending-fresh) or completed (created) lease already owns it.
+    const cur = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: key } }));
+    return { won: false, ticketId: cur.Item?.dedupeFor || null };
+  }
+}
+
+/** Mark a claimed dedupe lease `created` once the real ticket exists. Best-effort. */
+async function finalizeFindingDedupe(key, ticketId) {
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { ticketId: key },
+      UpdateExpression: "SET dedupeStatus = :created, dedupeFor = :tid",
+      ExpressionAttributeValues: { ":created": "created", ":tid": ticketId },
+    }));
+  } catch (err) {
+    console.warn(`[tickets] dedupe finalize failed for ${key} (non-fatal): ${err?.message || err}`);
+  }
+}
+
+/** Successful-tool-result shape a deduped create returns (callers treat as success). */
+function dedupedResult(existingId) {
+  return {
+    key: existingId,
+    ticket_id: existingId,
+    ticketId: existingId,
+    self: `https://your-domain.atlassian.net/browse/${existingId}`,
+    status: "deduped",
+    deduped: true,
+  };
+}
+
 /**
  * TEAM-3992 D3.2 — add blockers to an existing ticket (the orchestrator uses this
  * to block the Ship ticket on freshly-created re-arm tickets). Idempotent per id
@@ -419,7 +534,7 @@ async function addBlockers(args) {
   return { status: "ok", ticket_id: ticketId, added };
 }
 
-async function createTicket(args) {
+async function createTicket(args, { caller } = {}) {
   const { summary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase } = args;
   if (!summary) return textResult("Error: 'summary' is required");
 
@@ -457,7 +572,38 @@ async function createTicket(args) {
     );
   }
 
+  // TEAM-4100 F2 (layer 2) — when a validated plan exists for this workflow, the
+  // analyst may only create AGENT tickets for assignees the plan authorized.
+  // Trusted server-side callers (orchestrator fix/re-verify spawns, console,
+  // telegram) bypass — the orchestrator's tickets are created AFTER the plan and
+  // are exempt from the topology contract (see enforceRealizedGraphGate). Human
+  // gates (human:*) and no-plan runs are not checked. Layer 1 remains the hard
+  // gate; this only tightens the create path when a plan is provably present.
+  if (!caller && assignee && !isHumanReviewer) {
+    const planSet = await planAssigneeSet(workflow_id);
+    if (planSet && !planSet.has(assignee)) {
+      return textResult(
+        `Error: TICKET_NOT_IN_PLAN — assignee "${assignee}" is not in the validated ticket plan ` +
+        `for ${workflow_id}. The plan authorizes: ${[...planSet].sort().join(", ")}. ` +
+        `Update and resubmit the plan (submit_ticket_plan) before creating tickets for a new assignee.`
+      );
+    }
+  }
+
   const ticketId = await nextTicketId(project_key);
+
+  // TEAM-4100 F5 — enforce (workflow, findingId) uniqueness at create time so two
+  // racing verifier completions can't both mint a fix ticket for the same finding.
+  // Only fix tickets carry spawned_by.findingId; plain creates write no dedupe item.
+  const dedupeKey = findingDedupeKey(workflow_id, spawn.value?.findingId);
+  if (dedupeKey) {
+    const claim = await claimFindingDedupe(dedupeKey, ticketId);
+    if (!claim.won) {
+      console.log(`[tickets] DEDUPED fix finding ${spawn.value.findingId} in ${workflow_id} → existing ${claim.ticketId}`);
+      return dedupedResult(claim.ticketId);
+    }
+  }
+
   const now = new Date().toISOString();
   const type = (issue_type || "Task").toLowerCase();
   const blockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
@@ -496,6 +642,10 @@ async function createTicket(args) {
   // the origin and the agent re-investigates a finding it already answered
   // (prod 1pl3h1: TEAM-3727 re-dispatched twice with TEAM-3737 open).
   await linkFixToOrigin(ticketId, spawn.value, now);
+
+  // F5 — the real ticket now exists; flip the dedupe lease to `created` so any
+  // later create for this finding dedupes on a settled id (not a pending claim).
+  if (dedupeKey) await finalizeFindingDedupe(dedupeKey, ticketId);
 
   return {
     key: ticketId,
@@ -655,7 +805,7 @@ async function searchIssues(args) {
             Limit: limit,
           })
         );
-        const items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+        const items = (result.Items || []).filter((i) => !isReservedRow(i));
         return formatSearchResults(items);
       }
     }
@@ -672,7 +822,7 @@ async function searchIssues(args) {
             Limit: limit,
           })
         );
-        const items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+        const items = (result.Items || []).filter((i) => !isReservedRow(i));
         return formatSearchResults(items);
       }
     }
@@ -696,7 +846,7 @@ async function searchIssues(args) {
   }
 
   const result = await ddb.send(new ScanCommand(scanParams));
-  const items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+  const items = (result.Items || []).filter((i) => !isReservedRow(i));
   return formatSearchResults(items);
 }
 
@@ -714,7 +864,7 @@ async function listTickets(args) {
         ExpressionAttributeValues: { ":pid": parent_id },
       })
     );
-    items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+    items = (result.Items || []).filter((i) => !isReservedRow(i));
   } else if (assignee) {
     const result = await ddb.send(
       new QueryCommand({
@@ -724,10 +874,10 @@ async function listTickets(args) {
         ExpressionAttributeValues: { ":a": assignee },
       })
     );
-    items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+    items = (result.Items || []).filter((i) => !isReservedRow(i));
   } else {
     const result = await ddb.send(new ScanCommand({ TableName: TABLE_NAME, Limit: 50 }));
-    items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+    items = (result.Items || []).filter((i) => !isReservedRow(i));
   }
 
   // Apply optional filters

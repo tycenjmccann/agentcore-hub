@@ -71,6 +71,35 @@ async function loadValidAssignees() {
   return VALID_ASSIGNEES;
 }
 
+/**
+ * TEAM-4100 F2 (layer 2, best-effort create-time check) — the set of assignees a
+ * validated ticket plan authorized for a workflow. Twin of the DynamoDB tickets
+ * Lambda's planAssigneeSet: the plan is persisted by workflow-output
+ * submitTicketPlan at shared/ticket-plan.json in the SAME bucket this Lambda
+ * already reads the roster from (one cheap GetObject, no new IAM). Returns null
+ * when no plan exists or on any read/parse failure — fails OPEN because the
+ * orchestrator's realized-graph gate (layer 1) is the hard gate.
+ */
+async function planAssigneeSet(workflowId) {
+  if (!workflowId || !ARTIFACT_BUCKET) return null;
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: `workflows/${workflowId}/shared/ticket-plan.json`,
+    }));
+    const plan = JSON.parse(await res.Body.transformToString());
+    const tickets = Array.isArray(plan?.tickets) ? plan.tickets : [];
+    const set = new Set();
+    for (const t of tickets) {
+      const a = typeof t?.assignee === "string" ? t.assignee.trim() : "";
+      if (a) set.add(a);
+    }
+    return set.size > 0 ? set : null;
+  } catch {
+    return null; // no plan persisted / unreadable → no create-time check
+  }
+}
+
 // ─── Status Mapping ──────────────────────────────────────────────────────────
 
 const INTERNAL_TO_JIRA = {
@@ -209,8 +238,15 @@ async function listReviewers(params = {}) {
 
 // ─── Tool Implementations ────────────────────────────────────────────────────
 
-async function createTicket(params) {
+async function createTicket(params, { caller } = {}) {
   const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, phase } = params;
+
+  // TEAM-4100 F5 — a fix ticket's stable finding id (sha1(originTicketId+component)).
+  // Present only on orchestrator-spawned fix tickets; drives the finding-label dedupe.
+  const findingId =
+    spawned_by && typeof spawned_by === "object" && typeof spawned_by.findingId === "string" && spawned_by.findingId
+      ? spawned_by.findingId
+      : null;
 
   // Validate assignee against known roster — reject hallucinated agent names.
   // "human:<who>" assignees are human-review gates, not agents, and are always
@@ -222,6 +258,51 @@ async function createTicket(params) {
       `Invalid assignee "${assignee}". Valid agents: ${valid}. ` +
       `Note: There is NO "agentcore_hub_ios_dev" agent. ALL iOS/SwiftUI/Android/Web development goes to "agentcore_hub_frontend_dev".`
     );
+  }
+
+  // TEAM-4100 F2 (layer 2) — when a validated plan exists for this workflow, the
+  // analyst may only create AGENT tickets for assignees the plan authorized.
+  // Trusted server-side callers (orchestrator fix/re-verify spawns, console,
+  // telegram) bypass; human gates (human:*) and no-plan runs are not checked.
+  // Layer 1 (the orchestrator realized-graph gate) remains the hard gate.
+  if (!caller && assignee && !isHumanReviewer) {
+    const planSet = await planAssigneeSet(workflow_id);
+    if (planSet && !planSet.has(assignee)) {
+      throw new Error(
+        `TICKET_NOT_IN_PLAN — assignee "${assignee}" is not in the validated ticket plan ` +
+        `for ${workflow_id}. The plan authorizes: ${[...planSet].sort().join(", ")}. ` +
+        `Update and resubmit the plan (submit_ticket_plan) before creating tickets for a new assignee.`
+      );
+    }
+  }
+
+  // ─── F5: fix-ticket uniqueness on (workflow, findingId) ────────────────────
+  // Two verifier completions with the same finding can race spawnFixTicketsFromFindings
+  // and both reach create. Jira has NO conditional create (unlike the DynamoDB
+  // twin's atomic dedupe item), so the strongest available guarantee is a
+  // deterministic `finding:<fid>` label matched by search-before-create: it kills
+  // the fuzzy-summary false-negatives and makes any retry converge on the same
+  // ticket. A sub-second true race can still double-create under Jira's
+  // eventually-consistent search index — a documented Jira limitation, not the
+  // DynamoDB twin's behaviour. Checked first (more precise than summary matching).
+  if (findingId && workflow_id) {
+    try {
+      const jql =
+        `project = ${PROJECT_KEY} AND labels = "wf:${workflow_id}" AND labels = "finding:${findingId}" ORDER BY created ASC`;
+      const found = await jiraSearch(jql, ["summary", "status", "labels", "assignee", "issuetype", "parent"], 2);
+      const live = (found.issues || []).find((iss) => {
+        const internal = mapStatusToInternal(iss.fields?.status?.name || "");
+        return internal !== "done" && internal !== "closed";
+      });
+      if (live) {
+        const dupBlockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
+        await reconcileBlockersAndStatus(live.key, dupBlockers, assignee);
+        console.log(`[jira-tools] DEDUPED fix finding ${findingId} in ${workflow_id} → existing ${live.key} (reconciled)`);
+        return { ...mapIssue(live), deduped: true, deduplicated: true };
+      }
+    } catch (err) {
+      console.warn(`[jira-tools] finding dedupe check failed (proceeding to create): ${err.message}`);
+    }
   }
 
   // ─── Idempotency guard ───────────────────────────────────────────────────
@@ -289,6 +370,8 @@ async function createTicket(params) {
     labels.push(`agent:${assignee}`);
   }
   if (workflow_id) labels.push(`wf:${workflow_id}`);
+  // F5 — the deterministic dedupe key for fix tickets (see the finding guard above).
+  if (findingId) labels.push(`finding:${findingId}`);
 
   // Normalize common LLM variations of issue type names to Jira's canonical form
   const ISSUE_TYPE_ALIASES = {

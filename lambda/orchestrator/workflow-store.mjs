@@ -444,6 +444,98 @@ export async function releaseCompletionSynthesisClaim(workflowId, ticketId, clai
 }
 
 /**
+ * TEAM-4100 F5b — how long a still-"pending" finding-spawn claim owns its finding
+ * before a retry may take it over. A crash between claim and create leaves a
+ * pending claim; the stale window lets the next verifier re-report re-drive it.
+ * Matches the DDB-tickets-Lambda dedupe twin's DEDUPE_STALE_MS.
+ */
+export const FINDING_SPAWN_STALE_MS = 60_000;
+
+/** spawnClaims map must exist before we index into it (same two-write constraint
+ *  as ensureAgentTasksMap: a single expression can't create the map AND set a key). */
+async function ensureSpawnClaimsMap(workflowId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET spawnClaims = if_not_exists(spawnClaims, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+}
+
+/**
+ * TEAM-4100 F5b — claim the right to spawn ONE fix ticket for a (workflowId,
+ * findingId), provider-independently.
+ *
+ * F5 gave the DDB tickets Lambda an atomic create-time CAS, but the Jira twin
+ * has no conditional create — its `finding:<fid>` label + search-before-create is
+ * read-then-create (Jira search is eventually consistent; two racing creates both
+ * see zero results), and prod runs TICKET_PROVIDER=jira. The Jira Lambda has no
+ * DynamoDB access and jira mode provisions no table, so the atomic guard cannot
+ * live there. The orchestrator is the ONE caller that passes findingId, so a CAS
+ * on the workflows table (which it already owns, R2) closes the race for BOTH
+ * providers with a single implementation; the Jira label stays a secondary marker.
+ *
+ * Mint-pending-first so the loser can report the winner's key once it finalizes:
+ * the winner writes {status:"pending", claimedAt}, creates the ticket, then
+ * finalizeFindingSpawn stamps {status:"created", ticketId}. The CAS admits a fresh
+ * claim, OR takes over a pending claim older than the stale window (a crashed
+ * winner). Losing the CAS returns { won:false, ticketId, status } — a finalized
+ * winner yields its ticketId; a still-pending winner yields null (caller skips the
+ * create and publishes nothing, the pending winner will). Scoped to spawnClaims's
+ * own key (R2). Returns { won:true } for the winner.
+ */
+export async function claimFindingSpawn(workflowId, findingId, { now = new Date().toISOString(), staleMs = FINDING_SPAWN_STALE_MS } = {}) {
+  await ensureSpawnClaimsMap(workflowId);
+  const nowMs = Date.parse(now);
+  const staleBefore = new Date((Number.isFinite(nowMs) ? nowMs : Date.now()) - staleMs).toISOString();
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET spawnClaims.#fid = :claim",
+      ConditionExpression:
+        "attribute_not_exists(spawnClaims.#fid) OR " +
+        "(spawnClaims.#fid.#st = :pending AND spawnClaims.#fid.claimedAt < :staleBefore)",
+      ExpressionAttributeNames: { "#fid": findingId, "#st": "status" },
+      ExpressionAttributeValues: {
+        ":claim": { status: "pending", claimedAt: now },
+        ":pending": "pending",
+        ":staleBefore": staleBefore,
+      },
+    }));
+    return { won: true };
+  } catch (err) {
+    if (err.name !== "ConditionalCheckFailedException") throw err;
+    const wf = await getWorkflow(workflowId);
+    const claim = wf?.spawnClaims?.[findingId] || null;
+    return { won: false, ticketId: claim?.ticketId || null, status: claim?.status || null };
+  }
+}
+
+/**
+ * TEAM-4100 F5b — finalize a won finding-spawn claim with the created ticketId, so
+ * a later concurrent loser reports the SAME key. Scoped SET on the claim's own map
+ * key; a claim that vanished (never happens once ensureSpawnClaimsMap ran) is a
+ * graceful no-op. Returns true when the finalize landed.
+ */
+export async function finalizeFindingSpawn(workflowId, findingId, ticketId) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET spawnClaims.#fid.#st = :created, spawnClaims.#fid.ticketId = :tid",
+      ConditionExpression: "attribute_exists(spawnClaims.#fid)",
+      ExpressionAttributeNames: { "#fid": findingId, "#st": "status" },
+      ExpressionAttributeValues: { ":created": "created", ":tid": ticketId },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
  * TEAM-3991 D2.2 — park an agent's live claim because its ticket was blocked
  * (a fix ticket was filed against it, or a reviewer requested changes). "parked"
  * is deliberately NOT in lease-constants `liveClaimStatuses`, so a parked claim

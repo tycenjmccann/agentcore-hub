@@ -257,13 +257,47 @@ const VERIFICATION_VERDICTS = new Set(["pass", "fail", "blocked"]);
 const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
 
 /**
+ * TEAM-4100 F1 — the verifier ROLE that owns a verification `kind`, derived from
+ * the reporter's agent id (the same id F17 uses to check ownership), NOT from a
+ * caller-supplied field: code_reviewer owns "review", qa_verifier owns "qa",
+ * ci_agent owns "ci". Any other id (a fix agent: …_dev, codex, …) owns nothing.
+ * PARITY MIRROR: lambda/orchestrator/completion.mjs +
+ * src/lib/workflow/completion-evidence.ts verifierKindOf.
+ */
+function verifierKindOf(agentId) {
+  const id = String(agentId || "");
+  if (id.includes("code_reviewer")) return "review";
+  if (id.includes("qa_verifier")) return "qa";
+  if (id.includes("ci_agent")) return "ci";
+  return null;
+}
+
+/** Build a coded, MCP-structured rejection the agent sees verbatim (see handler). */
+function verificationRejection(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  err.mcpBody = { status: "rejected", error: code, message };
+  return err;
+}
+
+/**
  * TEAM-3992 Q4 — validate a caller-supplied `verification` block before it is
  * persisted or turned into a durable record. Returns a NORMALIZED copy (kind /
  * verdict lower-cased, sha lower-cased) or throws a specific error naming the bad
  * field. A malformed block must never be silently dropped — a fix that reports a
  * garbage verification would otherwise look re-verified to the SHA-pinned gate.
+ *
+ * TEAM-4100 F1 — the authz floor: a SHA-pinned verification cannot be
+ * self-certified. `ctx.ticketId` (the reporting ticket) and `ctx.reporterAgentId`
+ * (its assignee, already ownership-checked) gate two ways a fix agent could close
+ * its own gate:
+ *   - target_ticket_id === the reporting ticket → a ticket certifying itself.
+ *   - the reporter's role does not own the claimed kind → e.g. a dev/ship agent
+ *     stamping a "review", or a reviewer stamping a "qa"/"ci".
+ * Both are hard rejections (coded, structured) — the agent sees why, and no
+ * record is written that a later gate would read as a real re-verification.
  */
-function validateVerification(v) {
+function validateVerification(v, ctx = {}) {
   if (!v || typeof v !== "object" || Array.isArray(v)) {
     throw new Error("verification must be an object");
   }
@@ -281,6 +315,28 @@ function validateVerification(v) {
   if (!SHA_RE.test(headSha)) {
     throw new Error(`verification.head_sha must be a hex sha of length >= 7 (got ${JSON.stringify(v.head_sha)})`);
   }
+
+  // TEAM-4100 F1 — self-certification floor.
+  const reportingTicket = typeof ctx.ticketId === "string" ? ctx.ticketId.trim() : "";
+  if (reportingTicket && target === reportingTicket) {
+    throw verificationRejection(
+      "VERIFICATION_SELF_CERT",
+      `REFUSED: verification.target_ticket_id (${target}) is the reporting ticket itself. ` +
+        `A ticket cannot certify its own re-verification — a verification must target a DIFFERENT ` +
+        `ticket (the fix you re-verified) and be reported from the Re-verify ticket assigned to you.`
+    );
+  }
+  const reporterKind = verifierKindOf(ctx.reporterAgentId);
+  if (reporterKind !== kind) {
+    throw verificationRejection(
+      "VERIFICATION_ROLE_MISMATCH",
+      `REFUSED: a "${kind}" verification cannot be reported by ` +
+        `${ctx.reporterAgentId ? `${ctx.reporterAgentId}` : "an unattributed caller"}. ` +
+        `A "${kind}" verification may only come from its verifier role ` +
+        `(review←code_reviewer, qa←qa_verifier, ci←ci_agent).`
+    );
+  }
+
   const out = { target_ticket_id: target, head_sha: headSha, kind, verdict };
   if (v.build_id != null) out.build_id = String(v.build_id);
   if (v.evidence_key != null) out.evidence_key = String(v.evidence_key);
@@ -310,7 +366,23 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // TEAM-3992 Q4 — validate the optional verification block BEFORE any write, so
   // a malformed block is a hard rejection (never a half-written record). findings
   // are advisory metadata, persisted as-is when they are an array.
-  const verified = verification != null ? validateVerification(verification) : null;
+  // TEAM-4100 F1 — pass the reporting ticket + its assignee so validateVerification
+  // can reject a self-certified or wrong-role verification. A coded rejection is
+  // published to the journey log before it re-throws, so the false-close attempt
+  // is visible on the board rather than silently failing the tool call.
+  let verified = null;
+  if (verification != null) {
+    try {
+      verified = validateVerification(verification, { ticketId: ticket_id, reporterAgentId: agent_id });
+    } catch (err) {
+      if (err.code) {
+        await publishJourneyEvent(workflow_id || ticket_id, "workflow.verification_rejected", {
+          ticketId: ticket_id, agentId: agent_id || null, error: err.code, message: err.message,
+        });
+      }
+      throw err;
+    }
+  }
   const findingsList = Array.isArray(findings) ? findings : null;
 
   const completedAt = new Date().toISOString();

@@ -340,10 +340,21 @@ describe("TEAM-3992 Q4/D3.2 parity — fixVerificationGaps", () => {
   const SHA_SHORT = "abcdef1";
   const SHA_OTHER = "9999999";
 
-  // A verifier task carrying a verification record for a target fix.
-  const v = (targetTicketId: string, headSha: string, kind: string, verdict: string) => ({
-    ticketId: `V-${kind}`,
-    verification: { targetTicketId, headSha, kind, verdict },
+  // TEAM-4100 F1 — a verification only counts when it comes from a genuine
+  // Re-verify ticket: a distinct child spawned for THIS fix (spawnedBy.rearmOf),
+  // assigned to (harvested agentId of) the verifier role that owns the kind.
+  const AGENT: Record<string, string> = {
+    review: "agentcore_hub_code_reviewer",
+    ci: "agentcore_hub_ci_agent",
+    qa: "agentcore_hub_qa_verifier",
+  };
+  // The Re-verify child ticket (carries the rearm marker + a verifier assignee).
+  const rvChild = (vid: string, fixId: string, kind: string) => ({
+    ticketId: vid, status: "done", assignee: AGENT[kind], spawnedBy: { kind: "reverify", rearmOf: fixId },
+  });
+  // Its harvested agentTasks row (agentId = the verifier role) carrying the record.
+  const rvTask = (vid: string, fixId: string, headSha: string, kind: string, verdict: string) => ({
+    ticketId: vid, agentId: AGENT[kind], verification: { targetTicketId: fixId, headSha, kind, verdict },
   });
 
   const CASES: Array<[string, unknown, Record<string, unknown>, Record<string, string[]> | null | undefined]> = [
@@ -352,37 +363,52 @@ describe("TEAM-3992 Q4/D3.2 parity — fixVerificationGaps", () => {
     ["children not array", null, {}, REARM],
     [
       "review_fix fully re-verified (short↔long sha)",
-      [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }],
+      [
+        { ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } },
+        rvChild("V1", "F1", "review"),
+        rvChild("V2", "F1", "ci"),
+      ],
       {
         F1: { ticketId: "F1", commitSha: SHA_LONG },
-        va: v("F1", SHA_SHORT, "review", "pass"),
-        vb: v("F1", SHA_LONG, "ci", "pass"),
+        V1: rvTask("V1", "F1", SHA_SHORT, "review", "pass"),
+        V2: rvTask("V2", "F1", SHA_LONG, "ci", "pass"),
       },
       REARM,
     ],
     [
       "review_fix missing ci",
-      [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }],
-      { F1: { ticketId: "F1", commitSha: SHA_LONG }, va: v("F1", SHA_LONG, "review", "pass") },
+      [
+        { ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } },
+        rvChild("V1", "F1", "review"),
+      ],
+      { F1: { ticketId: "F1", commitSha: SHA_LONG }, V1: rvTask("V1", "F1", SHA_LONG, "review", "pass") },
       REARM,
     ],
     [
       "review_fix verified at WRONG sha",
-      [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }],
+      [
+        { ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } },
+        rvChild("V1", "F1", "review"),
+        rvChild("V2", "F1", "ci"),
+      ],
       {
         F1: { ticketId: "F1", commitSha: SHA_LONG },
-        va: v("F1", SHA_OTHER, "review", "pass"),
-        vb: v("F1", SHA_OTHER, "ci", "pass"),
+        V1: rvTask("V1", "F1", SHA_OTHER, "review", "pass"),
+        V2: rvTask("V2", "F1", SHA_OTHER, "ci", "pass"),
       },
       REARM,
     ],
     [
       "review verdict fail (not pass)",
-      [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }],
+      [
+        { ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } },
+        rvChild("V1", "F1", "review"),
+        rvChild("V2", "F1", "ci"),
+      ],
       {
         F1: { ticketId: "F1", commitSha: SHA_LONG },
-        va: v("F1", SHA_LONG, "review", "fail"),
-        vb: v("F1", SHA_LONG, "ci", "pass"),
+        V1: rvTask("V1", "F1", SHA_LONG, "review", "fail"),
+        V2: rvTask("V2", "F1", SHA_LONG, "ci", "pass"),
       },
       REARM,
     ],
@@ -412,22 +438,31 @@ describe("TEAM-3992 Q4/D3.2 parity — fixVerificationGaps", () => {
     ],
     [
       "qa_fix needs review+ci+verification, has all (verification kind = qa)",
-      [{ ticketId: "F2", status: "done", spawnedBy: { kind: "qa_fix" } }],
+      [
+        { ticketId: "F2", status: "done", spawnedBy: { kind: "qa_fix" } },
+        rvChild("V1", "F2", "review"),
+        rvChild("V2", "F2", "ci"),
+        rvChild("V3", "F2", "qa"),
+      ],
       {
         F2: { ticketId: "F2", commitSha: SHA_LONG },
-        va: v("F2", SHA_LONG, "review", "pass"),
-        vb: v("F2", SHA_LONG, "ci", "pass"),
-        vc: v("F2", SHA_LONG, "qa", "pass"),
+        V1: rvTask("V1", "F2", SHA_LONG, "review", "pass"),
+        V2: rvTask("V2", "F2", SHA_LONG, "ci", "pass"),
+        V3: rvTask("V3", "F2", SHA_LONG, "qa", "pass"),
       },
       REARM,
     ],
     [
       "qa_fix missing qa record",
-      [{ ticketId: "F2", status: "done", spawnedBy: { kind: "qa_fix" } }],
+      [
+        { ticketId: "F2", status: "done", spawnedBy: { kind: "qa_fix" } },
+        rvChild("V1", "F2", "review"),
+        rvChild("V2", "F2", "ci"),
+      ],
       {
         F2: { ticketId: "F2", commitSha: SHA_LONG },
-        va: v("F2", SHA_LONG, "review", "pass"),
-        vb: v("F2", SHA_LONG, "ci", "pass"),
+        V1: rvTask("V1", "F2", SHA_LONG, "review", "pass"),
+        V2: rvTask("V2", "F2", SHA_LONG, "ci", "pass"),
       },
       REARM,
     ],
@@ -442,16 +477,80 @@ describe("TEAM-3992 Q4/D3.2 parity — fixVerificationGaps", () => {
       [
         { ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } },
         { ticketId: "F3", status: "done", spawnedBy: { kind: "codex_fix" } },
+        rvChild("V1", "F1", "review"),
+        rvChild("V2", "F1", "ci"),
       ],
       {
         F1: { ticketId: "F1", commitSha: SHA_LONG },
-        va: v("F1", SHA_LONG, "review", "pass"),
-        vb: v("F1", SHA_LONG, "ci", "pass"),
+        V1: rvTask("V1", "F1", SHA_LONG, "review", "pass"),
+        V2: rvTask("V2", "F1", SHA_LONG, "ci", "pass"),
         F3: { ticketId: "F3", commitSha: SHA_OTHER },
       },
       REARM,
     ],
     ["null entries in agentTasks tolerated", [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }], { x: null as unknown as Record<string, unknown>, F1: { ticketId: "F1", commitSha: SHA_LONG } }, REARM],
+
+    // ── TEAM-4100 F1 — the self-certification branches ──────────────────────
+    [
+      // The QA-confirmed scenario: review+ci verification records stamped on the
+      // fix's OWN agentTasks entry. entryTicketId === the fix → neither counts.
+      "self-cert on the fix's own entry does NOT count (both gaps)",
+      [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }],
+      {
+        F1: {
+          ticketId: "F1", commitSha: SHA_LONG,
+          verification: { targetTicketId: "F1", headSha: SHA_LONG, kind: "review", verdict: "pass" },
+        },
+      },
+      REARM,
+    ],
+    [
+      // A matching review verification whose source ticket is NOT a Re-verify of
+      // this fix (no spawnedBy.rearmOf) is untrusted → review still a gap.
+      "verification from a non-reverify ticket does NOT count",
+      [
+        { ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } },
+        { ticketId: "V1", status: "done", assignee: AGENT.review }, // no spawnedBy
+        rvChild("V2", "F1", "ci"),
+      ],
+      {
+        F1: { ticketId: "F1", commitSha: SHA_LONG },
+        V1: rvTask("V1", "F1", SHA_LONG, "review", "pass"),
+        V2: rvTask("V2", "F1", SHA_LONG, "ci", "pass"),
+      },
+      REARM,
+    ],
+    [
+      // A Re-verify child of this fix, but assigned to a DEV role carrying a
+      // review verification → verifierKindOf(dev)=null ≠ review → still a gap.
+      "dev-assigned re-verify entry does NOT count as review",
+      [
+        { ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } },
+        { ticketId: "V1", status: "done", assignee: "agentcore_hub_backend_dev", spawnedBy: { kind: "reverify", rearmOf: "F1" } },
+        rvChild("V2", "F1", "ci"),
+      ],
+      {
+        F1: { ticketId: "F1", commitSha: SHA_LONG },
+        V1: { ticketId: "V1", agentId: "agentcore_hub_backend_dev", verification: { targetTicketId: "F1", headSha: SHA_LONG, kind: "review", verdict: "pass" } },
+        V2: rvTask("V2", "F1", SHA_LONG, "ci", "pass"),
+      },
+      REARM,
+    ],
+    [
+      // A Re-verify child of a DIFFERENT fix (rearmOf F0) cannot re-verify F1.
+      "re-verify targeting a different fix does NOT count",
+      [
+        { ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } },
+        { ticketId: "V1", status: "done", assignee: AGENT.review, spawnedBy: { kind: "reverify", rearmOf: "F0" } },
+        rvChild("V2", "F1", "ci"),
+      ],
+      {
+        F1: { ticketId: "F1", commitSha: SHA_LONG },
+        V1: rvTask("V1", "F1", SHA_LONG, "review", "pass"),
+        V2: rvTask("V2", "F1", SHA_LONG, "ci", "pass"),
+      },
+      REARM,
+    ],
   ];
 
   for (const [label, children, agentTasks, fixRearm] of CASES) {
@@ -463,10 +562,35 @@ describe("TEAM-3992 Q4/D3.2 parity — fixVerificationGaps", () => {
     });
   }
 
-  it("pins the gap truth for the mixed two-fix case", () => {
-    const [, children, agentTasks, fixRearm] = CASES.find((c) => c[0] === "two fixes, one green one gapped")!;
+  const gapsForCase = (label: string) => {
+    const [, children, agentTasks, fixRearm] = CASES.find((c) => c[0] === label)!;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const gaps = fixGapsTs(children as any, agentTasks as any, fixRearm as any);
-    expect(gaps).toEqual([{ ticketId: "F3", commitSha: SHA_OTHER, missingKinds: ["review", "ci"] }]);
+    return fixGapsTs(children as any, agentTasks as any, fixRearm as any);
+  };
+
+  it("pins the gap truth for the mixed two-fix case", () => {
+    expect(gapsForCase("two fixes, one green one gapped")).toEqual([
+      { ticketId: "F3", commitSha: SHA_OTHER, missingKinds: ["review", "ci"] },
+    ]);
+  });
+
+  it("pins the gap truth for a fully-verified fix (real re-verify children → clean)", () => {
+    expect(gapsForCase("review_fix fully re-verified (short↔long sha)")).toEqual([]);
+  });
+
+  it("pins that a self-certified verification leaves BOTH gaps (TEAM-4100 F1)", () => {
+    expect(gapsForCase("self-cert on the fix's own entry does NOT count (both gaps)")).toEqual([
+      { ticketId: "F1", commitSha: SHA_LONG, missingKinds: ["review", "ci"] },
+    ]);
+  });
+
+  it("pins that a non-reverify / wrong-role / wrong-target source leaves the review gap (TEAM-4100 F1)", () => {
+    for (const label of [
+      "verification from a non-reverify ticket does NOT count",
+      "dev-assigned re-verify entry does NOT count as review",
+      "re-verify targeting a different fix does NOT count",
+    ]) {
+      expect(gapsForCase(label)).toEqual([{ ticketId: "F1", commitSha: SHA_LONG, missingKinds: ["review"] }]);
+    }
   });
 });

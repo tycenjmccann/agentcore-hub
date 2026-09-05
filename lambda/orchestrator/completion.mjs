@@ -497,6 +497,24 @@ export const FIX_REARM_ROLE_TO_KIND = Object.freeze({
 });
 
 /**
+ * TEAM-4100 F1 — the verifier ROLE that owns a verification `kind`, derived from
+ * the assignee agent id (agentTasks.<t>.agentId, the id the harvest stores), NOT
+ * from any caller-supplied field: code_reviewer owns "review", qa_verifier owns
+ * "qa", ci_agent owns "ci". A fix-agent id (…_dev, codex, requirements, …) maps to
+ * null — it can certify nothing. This is the read-side floor that stops a fix
+ * agent from stamping a verification on its OWN agentTasks entry and self-closing
+ * the SHA-pinned gate. PARITY MIRROR: src/lib/workflow/completion-evidence.ts
+ * verifierKindOf + lambda/workflow-output/index.mjs.
+ */
+export function verifierKindOf(agentId) {
+  const id = String(agentId || "");
+  if (id.includes("code_reviewer")) return "review";
+  if (id.includes("qa_verifier")) return "qa";
+  if (id.includes("ci_agent")) return "ci";
+  return null;
+}
+
+/**
  * SHA-pinning tolerates abbreviation: a 7-char short sha matches its full 40-char
  * form (CI reports resolvedSourceVersion; a dev may report the short HEAD). Equal
  * after lower-casing, or — both ≥7 hex chars — one a prefix of the other. Empty
@@ -524,16 +542,26 @@ function shaMatches(a, b) {
  *   - no final SHA harvested onto its agentTasks entry (`commitSha`) → the fix
  *     never reported where it landed; reported as missingKinds ["commitSha"].
  *   - else, for each role in fixRearm[kind] (mapped to a verification kind), there
- *     must be SOME agentTasks entry carrying `verification` with
- *     targetTicketId === <fix>, headSha matching the fix's commitSha, and
- *     verdict "pass". A missing/failing/stale-SHA verification lists that kind.
+ *     must be a TRUSTED verification (see below) with headSha matching the fix's
+ *     commitSha, kind matching the role, and verdict "pass". A missing / failing /
+ *     stale-SHA / untrusted verification lists that kind.
+ *
+ * TEAM-4100 F1 — a verification counts ONLY when its source is a genuine
+ * re-verification, not the fix self-certifying. The record must live on an
+ * agentTasks entry that is (1) NOT the fix's own entry, (2) a Re-verify ticket
+ * spawned for THIS fix (`children[entry].spawnedBy.rearmOf === <fix>`), and (3)
+ * assigned to a verifier role whose kind (verifierKindOf(entry.agentId)) matches
+ * the verification's kind. Before this, any agentTasks entry carrying a matching
+ * verification satisfied the gate — including the fix ticket's own harvested entry
+ * — so a fix agent could call report_completion with a verification block naming
+ * itself and close the SHA-pinned gate with no real review/qa/ci.
  *
  * Returns [{ ticketId, commitSha, missingKinds[] }] — empty when every fix is
  * fully re-verified. A def with no `fixRearm` (non-code defs, or a def that opts
  * out) makes this inert: it returns []. Pure — plain data in, plain data out.
  *
- * @param children   epic child tickets (status + spawnedBy)
- * @param agentTasks harvested per-ticket metadata (commitSha + verification)
+ * @param children   epic child tickets (status + spawnedBy + assignee)
+ * @param agentTasks harvested per-ticket metadata (agentId + commitSha + verification)
  * @param fixRearm   the def's ticketDag.fixRearm map (kind → role[])
  * @param opts       reserved (parity with the evidence/ship gates' signature)
  */
@@ -542,7 +570,16 @@ export function fixVerificationGaps(children, agentTasks, fixRearm, opts = {}) {
   if (!Array.isArray(children) || !fixRearm || typeof fixRearm !== "object") return [];
   const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
 
-  // Index every harvested verification record by the fix ticket it targets.
+  // Index children by ticketId so a verification's source entry can be traced to
+  // the ticket that produced it (TEAM-4100 F1: it must be a Re-verify of the fix).
+  const childById = new Map();
+  for (const c of children) {
+    if (c && typeof c.ticketId === "string") childById.set(c.ticketId, c);
+  }
+
+  // Index every harvested verification by the fix ticket it targets, KEEPING the
+  // agentTasks entry it came from (its ticketId + assignee) so the source can be
+  // authenticated below — a verification alone no longer proves anything.
   const verifsByTarget = new Map();
   const byTicketId = new Map();
   for (const entry of Object.values(tasks)) {
@@ -553,7 +590,11 @@ export function fixVerificationGaps(children, agentTasks, fixRearm, opts = {}) {
     const target = typeof v.targetTicketId === "string" ? v.targetTicketId : "";
     if (!target) continue;
     if (!verifsByTarget.has(target)) verifsByTarget.set(target, []);
-    verifsByTarget.get(target).push(v);
+    verifsByTarget.get(target).push({
+      v,
+      entryTicketId: typeof entry.ticketId === "string" ? entry.ticketId : "",
+      assignee: typeof entry.agentId === "string" ? entry.agentId : "",
+    });
   }
 
   const gaps = [];
@@ -577,17 +618,38 @@ export function fixVerificationGaps(children, agentTasks, fixRearm, opts = {}) {
     const missingKinds = [];
     for (const role of roles) {
       const kind = FIX_REARM_ROLE_TO_KIND[role] || role;
-      const passed = records.some(
-        (v) =>
-          shaMatches(v.headSha, commitSha) &&
-          v.kind === kind &&
-          String(v.verdict || "").toLowerCase() === "pass"
+      const passed = records.some((r) =>
+        trustedVerification(r, ticketId, kind, commitSha, childById)
       );
       if (!passed && !missingKinds.includes(kind)) missingKinds.push(kind);
     }
     if (missingKinds.length > 0) gaps.push({ ticketId, commitSha, missingKinds });
   }
   return gaps;
+}
+
+/**
+ * TEAM-4100 F1 — does one harvested verification honestly re-verify `fixTicketId`
+ * at `commitSha` for `kind`? A record counts only if its source agentTasks entry
+ * is a distinct Re-verify ticket for this fix, assigned to the matching verifier
+ * role — AND the record is SHA-pinned + passing. PARITY MIRROR: the TS twin.
+ */
+function trustedVerification(r, fixTicketId, kind, commitSha, childById) {
+  if (!r || typeof r !== "object") return false;
+  const { v, entryTicketId, assignee } = r;
+  // (1) not the fix's own agentTasks entry (self-certification).
+  if (!entryTicketId || entryTicketId === fixTicketId) return false;
+  // (2) the source entry is a Re-verify ticket spawned for THIS fix.
+  const child = childById.get(entryTicketId);
+  if (!child || !child.spawnedBy || child.spawnedBy.rearmOf !== fixTicketId) return false;
+  // (3) its assignee owns this verification kind.
+  if (verifierKindOf(assignee) !== kind) return false;
+  // The original SHA-pin + passing verdict.
+  return (
+    shaMatches(v.headSha, commitSha) &&
+    v.kind === kind &&
+    String(v.verdict || "").toLowerCase() === "pass"
+  );
 }
 
 /**

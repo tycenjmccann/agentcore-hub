@@ -307,6 +307,20 @@ export const FIX_REARM_ROLE_TO_KIND: Readonly<Record<string, string>> = Object.f
   verification: "qa",
 });
 
+/**
+ * TEAM-4100 F1 — verifier ROLE that owns a verification `kind`, derived from the
+ * assignee agent id (NOT a caller-supplied field): code_reviewer→"review",
+ * qa_verifier→"qa", ci_agent→"ci". A fix-agent id maps to null. PARITY MIRROR:
+ * completion.mjs verifierKindOf.
+ */
+export function verifierKindOf(agentId: unknown): string | null {
+  const id = String(agentId || "");
+  if (id.includes("code_reviewer")) return "review";
+  if (id.includes("qa_verifier")) return "qa";
+  if (id.includes("ci_agent")) return "ci";
+  return null;
+}
+
 /** SHA-pinning tolerates abbreviation (7-char short sha ↔ 40-char full). */
 function shaMatches(a: unknown, b: unknown): boolean {
   const x = String(a || "").toLowerCase();
@@ -325,6 +339,7 @@ export interface VerificationRecordLike {
 
 export interface FixTaskLike {
   ticketId?: unknown;
+  agentId?: unknown;
   commitSha?: unknown;
   verification?: VerificationRecordLike | null;
 }
@@ -333,7 +348,15 @@ export interface FixChildLike {
   ticketId?: unknown;
   status?: unknown;
   type?: unknown;
+  assignee?: unknown;
   spawnedBy?: { kind?: unknown; rearmOf?: unknown } | null;
+}
+
+/** A harvested verification kept with the agentTasks entry that produced it. */
+interface SourcedVerification {
+  v: VerificationRecordLike;
+  entryTicketId: string;
+  assignee: string;
 }
 
 export interface FixVerificationGap {
@@ -360,7 +383,16 @@ export function fixVerificationGaps(
   const tasks: Record<string, FixTaskLike> =
     agentTasks && typeof agentTasks === "object" ? agentTasks : {};
 
-  const verifsByTarget = new Map<string, VerificationRecordLike[]>();
+  // Index children by ticketId so a verification's source entry can be traced to
+  // the ticket that produced it (TEAM-4100 F1: it must be a Re-verify of the fix).
+  const childById = new Map<string, FixChildLike>();
+  for (const c of children as FixChildLike[]) {
+    if (c && typeof c.ticketId === "string") childById.set(c.ticketId, c);
+  }
+
+  // Index every harvested verification by the fix it targets, KEEPING the entry it
+  // came from (its ticketId + assignee) so the source can be authenticated below.
+  const verifsByTarget = new Map<string, SourcedVerification[]>();
   const byTicketId = new Map<string, FixTaskLike>();
   for (const entry of Object.values(tasks)) {
     if (!entry || typeof entry !== "object") continue;
@@ -370,7 +402,11 @@ export function fixVerificationGaps(
     const target = typeof v.targetTicketId === "string" ? v.targetTicketId : "";
     if (!target) continue;
     if (!verifsByTarget.has(target)) verifsByTarget.set(target, []);
-    verifsByTarget.get(target)!.push(v);
+    verifsByTarget.get(target)!.push({
+      v,
+      entryTicketId: typeof entry.ticketId === "string" ? entry.ticketId : "",
+      assignee: typeof entry.agentId === "string" ? entry.agentId : "",
+    });
   }
 
   const gaps: FixVerificationGap[] = [];
@@ -395,15 +431,41 @@ export function fixVerificationGaps(
     const missingKinds: string[] = [];
     for (const role of roles) {
       const vkind = FIX_REARM_ROLE_TO_KIND[role] || role;
-      const passed = records.some(
-        (v) =>
-          shaMatches(v.headSha, commitSha) &&
-          v.kind === vkind &&
-          String(v.verdict || "").toLowerCase() === "pass"
-      );
+      const passed = records.some((r) => trustedVerification(r, ticketId, vkind, commitSha, childById));
       if (!passed && !missingKinds.includes(vkind)) missingKinds.push(vkind);
     }
     if (missingKinds.length > 0) gaps.push({ ticketId, commitSha, missingKinds });
   }
   return gaps;
+}
+
+/**
+ * TEAM-4100 F1 — does one harvested verification honestly re-verify `fixTicketId`
+ * at `commitSha` for `kind`? Counts only when its source entry is a distinct
+ * Re-verify ticket for this fix, assigned to the matching verifier role, and the
+ * record is SHA-pinned + passing. PARITY MIRROR: completion.mjs trustedVerification.
+ */
+function trustedVerification(
+  r: SourcedVerification,
+  fixTicketId: string,
+  kind: string,
+  commitSha: string,
+  childById: Map<string, FixChildLike>
+): boolean {
+  if (!r || typeof r !== "object") return false;
+  const { v, entryTicketId, assignee } = r;
+  // (1) not the fix's own agentTasks entry (self-certification).
+  if (!entryTicketId || entryTicketId === fixTicketId) return false;
+  // (2) the source entry is a Re-verify ticket spawned for THIS fix.
+  const child = childById.get(entryTicketId);
+  const rearmOf = child?.spawnedBy?.rearmOf;
+  if (!child || rearmOf !== fixTicketId) return false;
+  // (3) its assignee owns this verification kind.
+  if (verifierKindOf(assignee) !== kind) return false;
+  // The original SHA-pin + passing verdict.
+  return (
+    shaMatches(v.headSha, commitSha) &&
+    v.kind === kind &&
+    String(v.verdict || "").toLowerCase() === "pass"
+  );
 }

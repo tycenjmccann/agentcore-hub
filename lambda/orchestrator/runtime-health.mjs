@@ -45,6 +45,16 @@ const DEFAULT_BACKOFF_MIN = Object.freeze([5, 15, 30]);
 // Hard ceiling on a single probe. Cold start of the coding microVM is 5-20s; a
 // probe that hangs past this is itself evidence the runtime is unreachable.
 const PROBE_OVERALL_BUDGET_MS = 45000;
+// F3 — recovery is a lease held on the outage object itself (state:"recovering"
+// + recoveringAt). A sweep that finds a FRESH recovering marker stands down (a
+// peer owns the active drain); one older than this window is treated as a
+// crashed/timed-out owner and re-claimed. Kept well under the 5-minute sweep
+// cadence so the next scheduled sweep always continues a stranded recovery.
+const DEFAULT_RECOVERING_STALE_MS = 120000;
+// F3 — persist resume progress (shrink blockedTickets) to the outage object
+// every N resumed tickets. 1 = per-ticket (crash-exact; M is small — bounded by
+// the fleet's concurrent coding-ticket parallelism, ~24). Raise to batch writes.
+const DEFAULT_RESUME_PERSIST_EVERY = 1;
 
 /** sha1 hex of a string (Node built-in; no extra dependency). */
 function sha1hex(s) {
@@ -92,20 +102,39 @@ function isPreconditionFailed(err) {
   return n === "PreconditionFailed" || err?.$metadata?.httpStatusCode === 412;
 }
 
-/** Promise.race a work promise against a rejecting timer; always clears the timer. */
-function withBudget(promise, ms) {
-  let timer;
-  const guard = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`probe exceeded ${ms}ms budget`)), ms);
-  });
-  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+/**
+ * F4 — classify a probe failure. The distinction matters because a MISCONFIGURED
+ * probe (bad IAM grant / bad ARN) looks identical to an outage under the old
+ * "any failure counts" rule, so a single IAM regression would park EVERY coding
+ * ticket while the runtime is perfectly healthy and never auto-resume.
+ *   - transient        : throttling / 429 — outage-ish but not proof; never park.
+ *   - probe_misconfigured : AccessDenied/Validation/NotFound/UnrecognizedClient or
+ *                        any non-throttling 4xx — the PROBE is broken, not the
+ *                        runtime; escalate once, do NOT park, do NOT count.
+ *   - outage           : 5xx / network / timeout / abort — a genuine outage candidate.
+ */
+export function classifyProbeError(errName, httpStatus) {
+  const name = errName || "";
+  const http = typeof httpStatus === "number" ? httpStatus : undefined;
+  if (name === "ThrottlingException" || name === "TooManyRequestsException" || http === 429) return "transient";
+  const MISCONFIG = new Set([
+    "AccessDeniedException",
+    "ValidationException",
+    "ResourceNotFoundException",
+    "UnrecognizedClientException",
+    "IncompleteSignatureException",
+    "InvalidSignatureException",
+  ]);
+  if (MISCONFIG.has(name)) return "probe_misconfigured";
+  if (http !== undefined && http >= 400 && http < 500) return "probe_misconfigured";
+  return "outage";
 }
 
 /**
  * Build a runtime-health gate bound to its dependencies.
  *
  * deps:
- *   invokeRuntime({ arn, sessionId, payload }) -> { statusCode, json } | throws
+ *   invokeRuntime({ arn, sessionId, payload, abortSignal }) -> { statusCode, json } | throws
  *   s3: { getObject(key)->{body,etag}|null, putObject(key,body,{ifNoneMatch?,ifMatch?})->{etag}|throws412, deleteObject(key) }
  *   publishEvent(subject, type, detail)
  *   now() -> epoch ms
@@ -115,6 +144,7 @@ function withBudget(promise, ms) {
  *   cascade: { reconcileDependent, transitionToReady }
  *   loadWorkflow(workflowId) -> workflow | null      (sweep resume only)
  *   loadTicket(workflow, ticketId) -> ticket | null  (sweep resume only)
+ *   findRuntimeBlockedTickets() -> [{workflowId, ticketId}]  (F3 backstop; bounded scan)
  *   log (optional)
  */
 export function createRuntimeHealth(deps) {
@@ -129,6 +159,7 @@ export function createRuntimeHealth(deps) {
     cascade,
     loadWorkflow,
     loadTicket,
+    findRuntimeBlockedTickets = async () => [],
     log = () => {},
   } = deps;
 
@@ -136,6 +167,8 @@ export function createRuntimeHealth(deps) {
   const confirm = Math.max(1, Number(env.RUNTIME_PROBE_CONFIRM) || DEFAULT_PROBE_CONFIRM);
   const backoff = parseBackoffMinutes(env.RUNTIME_OUTAGE_BACKOFF_MIN);
   const provider = env.TICKET_PROVIDER || "dynamodb";
+  const recoveringStaleMs = Number(env.RUNTIME_RECOVERING_STALE_MS) || DEFAULT_RECOVERING_STALE_MS;
+  const resumePersistEvery = Math.max(1, Number(env.RUNTIME_RESUME_PERSIST_EVERY) || DEFAULT_RESUME_PERSIST_EVERY);
 
   // Per-container warm state (this factory is a singleton in index.mjs). Keyed by
   // arn so a multi-runtime future needs no rework; today there is one arn.
@@ -146,23 +179,68 @@ export function createRuntimeHealth(deps) {
 
   // ── Probe ──────────────────────────────────────────────────────────────────
 
-  /** Single read-only poll probe. Never throws — a throw IS an unhealthy verdict. */
+  /**
+   * Single read-only poll probe. Never throws — a throw IS an unhealthy verdict.
+   * Returns { healthy, classification, latencyMs, status, errorName, error }.
+   *
+   * F4 — the SDK call is bounded by an AbortController + a rejecting timer (the
+   * NodeHttpHandler connect/read timeouts live at the index.mjs seam). On timeout
+   * the controller is ABORTED so a well-behaved request tears its socket down, and
+   * the guard promise rejects so we are never left hanging even if the SDK ignores
+   * the signal. The timer is always cleared. The budget is
+   * min(RUNTIME_PROBE_TIMEOUT_MS, 45s ceiling) — the Lambda invocation context is
+   * NOT plumbed to this deep call site (the guard runs inside handleTicketReady),
+   * so clamping to getRemainingTimeInMillis would require threading context through
+   * every dispatch path; the env-configurable budget under the 45s ceiling is the
+   * bound instead.
+   */
   async function probeRuntime({ arn }) {
     const t0 = now();
     const sessionId = probeSessionId(arn);
     const payload = { action: "poll", turn_id: `probe-${isoMinute(now())}`, session_id: sessionId };
+    const budget = Math.min(PROBE_OVERALL_BUDGET_MS, Number(env.RUNTIME_PROBE_TIMEOUT_MS) || PROBE_OVERALL_BUDGET_MS);
+    const controller = new AbortController();
+    let timer;
     try {
-      const res = await withBudget(invokeRuntime({ arn, sessionId, payload }), PROBE_OVERALL_BUDGET_MS);
+      const guard = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const e = new Error(`probe exceeded ${budget}ms budget`);
+          e.name = "AbortError";
+          controller.abort(e); // tear down a well-behaved SDK request...
+          reject(e); // ...and unblock us even if it ignores the signal
+        }, budget);
+      });
+      const res = await Promise.race([
+        invokeRuntime({ arn, sessionId, payload, abortSignal: controller.signal }),
+        guard,
+      ]);
       const status = res?.json?.status;
-      const healthy = res?.statusCode === 200 && VALID_POLL_STATUSES.includes(status);
+      const http = res?.statusCode;
+      const healthy = http === 200 && VALID_POLL_STATUSES.includes(status);
+      if (healthy) {
+        return { healthy: true, classification: "healthy", latencyMs: now() - t0, status, errorName: null, error: null };
+      }
+      // A response arrived but is not healthy — classify by HTTP status.
       return {
-        healthy,
+        healthy: false,
+        classification: classifyProbeError(null, http),
         latencyMs: now() - t0,
         status: status ?? null,
-        error: healthy ? null : `unexpected probe response (http=${res?.statusCode ?? "?"}, status=${status ?? "?"})`,
+        errorName: null,
+        error: `unexpected probe response (http=${http ?? "?"}, status=${status ?? "?"})`,
       };
     } catch (err) {
-      return { healthy: false, latencyMs: now() - t0, status: null, error: err?.message || String(err) };
+      const errName = err?.name || err?.code || null;
+      return {
+        healthy: false,
+        classification: classifyProbeError(errName, err?.$metadata?.httpStatusCode),
+        latencyMs: now() - t0,
+        status: null,
+        errorName: errName,
+        error: err?.message || String(err),
+      };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -219,6 +297,50 @@ export function createRuntimeHealth(deps) {
     });
   }
 
+  // ── Probe misconfiguration (F4) ──────────────────────────────────────────────
+
+  /**
+   * F4 — a probe that fails with a misconfiguration signal (bad IAM grant, bad/
+   * stale ARN, malformed request) is NOT an outage: the runtime may be perfectly
+   * healthy and every coding ticket would otherwise be parked with no path back.
+   * So we emit a DISTINCT `runtime.probe_misconfigured` event and raise ONE
+   * idempotent manager_escalation naming the concrete fix — gated on the store's
+   * appendNotificationOnce CAS so a broken probe across dozens of dispatches
+   * yields exactly one escalation, not one per ticket. We never park and never
+   * touch the outage confirm counter (the caller fails OPEN).
+   */
+  async function handleProbeMisconfigured(arn, workflowId, probe) {
+    const errName = probe?.errorName || "probe misconfigured";
+    let appended = false;
+    if (appendNotificationOnce && workflowId) {
+      appended = await appendNotificationOnce(workflowId, {
+        id: `notif_runtime_probe_misconfigured_${arnTag(arn)}`,
+        type: "manager_escalation",
+        title: "Coding-runtime probe is misconfigured — health gate is blind",
+        details:
+          `The coding-runtime health probe is failing with ${errName}. This is a PROBE ` +
+          `misconfiguration, not a runtime outage — coding tickets are NOT being parked and ` +
+          `will dispatch normally, but the health gate cannot protect them until this is fixed. ` +
+          `Check that the orchestrator role grants bedrock-agentcore:InvokeAgentRuntime on ` +
+          `CODING_AGENT_RUNTIME_ARN (${arn || "unset"}) and that the ARN is current.`,
+        reviewer: "runtime-health",
+        timestamp: new Date(now()).toISOString(),
+        acknowledged: false,
+      });
+    }
+    // Emit the distinct event only alongside a freshly-raised escalation so the
+    // event stream mirrors the once-only escalation (no per-ticket event spam).
+    if (appended || !workflowId) {
+      await publishEvent(`runtime:${arnTag(arn)}`, "runtime.probe_misconfigured", {
+        runtimeArn: arn,
+        workflowId: workflowId || null,
+        errorName: errName,
+        hint: "grant bedrock-agentcore:InvokeAgentRuntime on CODING_AGENT_RUNTIME_ARN and verify the ARN",
+      });
+    }
+    log(`[runtime-health] probe MISCONFIGURED (${errName}) — failing open, escalated=${appended}`);
+  }
+
   // ── Dispatch guard ───────────────────────────────────────────────────────────
 
   /**
@@ -237,8 +359,20 @@ export function createRuntimeHealth(deps) {
     const workflowId = workflow?.id;
 
     // 1. Known outage → fan it out: record + park this ticket, refuse. One S3 read.
+    //    EXCEPTION: an object in `recovering` state means a sweep already re-probed
+    //    the runtime HEALTHY and is draining the parked list back through the
+    //    cascade (F3). The recovery no longer deletes the object up-front, so a
+    //    resumed ticket's re-dispatch can re-enter this guard while the object is
+    //    still present — treat recovering as "runtime is up" and let it proceed,
+    //    never re-park a ticket we are actively freeing.
     const existing = await s3.getObject(key);
     if (existing) {
+      let state = "outage";
+      try { state = JSON.parse(existing.body)?.state || "outage"; } catch { /* treat unparseable as outage */ }
+      if (state === "recovering") {
+        _healthyUntil.set(arn, now() + cacheMs);
+        return { ok: true };
+      }
       await recordBlockedTicket(key, workflowId, ticketId);
       await blockTicketRuntime(ticketId, workflow);
       return { ok: false, reason: "runtime_outage", detail: "coding runtime outage — ticket parked" };
@@ -251,8 +385,22 @@ export function createRuntimeHealth(deps) {
       return { ok: true };
     }
 
-    // 3. Unhealthy — CONFIRM consecutive failures before declaring an outage
-    //    (a single miss during the microVM's 5-20s cold start must not park work).
+    // F4 — a MISCONFIGURED probe (bad IAM grant / bad ARN) is NOT an outage: the
+    // runtime may be perfectly healthy. Do NOT park, do NOT touch the confirm
+    // counter, and raise ONE idempotent escalation naming the fix. Fail OPEN —
+    // blocking real work on a broken probe is the very failure this guards against.
+    if (probe.classification === "probe_misconfigured") {
+      await handleProbeMisconfigured(arn, workflowId, probe);
+      return { ok: true };
+    }
+    // F4 — throttling is transient (outage-ish but not proof); never park on it.
+    if (probe.classification === "transient") {
+      log(`[runtime-health] ${ticketId}: probe transient (${probe.errorName || "throttled"}) — dispatching, not an outage`);
+      return { ok: true };
+    }
+
+    // 3. Unhealthy (outage-candidate) — CONFIRM consecutive failures before declaring
+    //    an outage (a single miss during the microVM's 5-20s cold start must not park).
     const fails = (_failures.get(arn) || 0) + 1;
     _failures.set(arn, fails);
     if (fails < confirm) {
@@ -316,30 +464,238 @@ export function createRuntimeHealth(deps) {
   // ── Recovery sweep ───────────────────────────────────────────────────────────
 
   /**
-   * Called from the 5-minute orchestrator.sweep. When an outage object exists and
-   * its backoff timer has elapsed, re-probe. Still unhealthy → advance backoff.
-   * Healthy → emit runtime.recovered, delete the object, and route every parked
-   * ticket back through the ONE cascade R3 implementation.
+   * Route ONE parked ticket back onto the board and through the ONE cascade R3
+   * implementation. Never throws — every per-ticket error is caught and reported
+   * so the caller can record it and move on (a resume is idempotent: a ticket
+   * already re-dispatched is `running`, which reconcileDependent leaves alone).
    *
-   * Returns { probed, healthy, resumed, skipped:[...] }.
+   *   { ok:true }                          resumed
+   *   { ok:false, terminal:true, reason }  the run/ticket is gone — drop it
+   *   { ok:false, terminal:false, reason } transient — keep it for a later retry
+   */
+  async function resumeTicket(workflowId, ticketId) {
+    let wf, ticket;
+    try {
+      wf = loadWorkflow ? await loadWorkflow(workflowId) : null;
+      ticket = wf && loadTicket ? await loadTicket(wf, ticketId) : null;
+    } catch (err) {
+      return { ok: false, terminal: false, reason: err?.message || String(err) };
+    }
+    if (!wf || !ticket) return { ok: false, terminal: true, reason: "not_found" };
+    try {
+      // Un-block the board first (blocked → todo/Ready), then route through the
+      // ONE R3 implementation (claim CAS, liveness — never re-implemented here).
+      await cascade.transitionToReady(ticket);
+      ticket.status = provider === "jira" ? "ready" : "todo";
+      await cascade.reconcileDependent(ticket, "runtime-recovered", wf, newCascadeMetrics(), "enforce");
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, terminal: false, reason: err?.message || String(err) };
+    }
+  }
+
+  /**
+   * Claim the recovery lease on the outage object: CAS `state:"recovering"` +
+   * a fresh `recoveringAt` under IfMatch on the etag the caller just read. The
+   * conditional write IS the lease — two sweeps that both read the same etag
+   * both attempt this; exactly one wins, the loser 412s and stands down. Returns
+   * { obj, etag } on success, null on a lost race / object gone.
+   */
+  async function claimRecovering(key, obj, etag) {
+    const iso = new Date(now()).toISOString();
+    const next = { ...obj, state: "recovering", recoveringAt: iso, recoverStartedAt: obj.recoverStartedAt || iso };
+    try {
+      const { etag: newEtag } = await s3.putObject(key, JSON.stringify(next), { ifMatch: etag });
+      return { obj: next, etag: newEtag };
+    } catch (err) {
+      if (isPreconditionFailed(err)) return null;
+      throw err;
+    }
+  }
+
+  /**
+   * Drain the outage object's blockedTickets, one at a time, holding the recovery
+   * lease. After each resumed/dropped ticket the object is re-persisted (IfMatch)
+   * so its blockedTickets always reflects the true remainder — if this Lambda
+   * crashes or times out mid-drain, whatever was persisted last is exactly the
+   * work left, and the recovering marker (+ its refreshed recoveringAt) lets a
+   * later sweep continue once the marker goes stale. The object is DELETED and
+   * `runtime.recovered` emitted EXACTLY once, only when blockedTickets empties.
+   * Transient per-ticket failures are KEPT in blockedTickets (retried by a later
+   * recovery); terminal `not_found` tickets are dropped. A non-empty remainder at
+   * loop end flips the object back to `state:"outage"` with a short backoff so the
+   * runtime is re-probed and the remainder re-driven.
+   */
+  async function drainResumes(key, claim, out) {
+    let etag = claim.etag;
+    let remaining = Array.isArray(claim.obj.blockedTickets) ? [...claim.obj.blockedTickets] : [];
+    const since = claim.obj.since;
+    const resumedIds = [];
+    let sincePersist = 0;
+
+    // Persist the current remainder (+ heartbeat recoveringAt) under IfMatch.
+    // Returns true on success; false if we lost the lease (a peer re-claimed) —
+    // the caller aborts. Throws on infra error → the sweep aborts, object intact.
+    const persist = async (extra = {}) => {
+      const iso = new Date(now()).toISOString();
+      const next = {
+        ...claim.obj,
+        state: "recovering",
+        recoveringAt: iso,
+        blockedTickets: remaining,
+        ...extra,
+      };
+      try {
+        const { etag: e2 } = await s3.putObject(key, JSON.stringify(next), { ifMatch: etag });
+        etag = e2;
+        claim.obj = next;
+        return true;
+      } catch (err) {
+        if (isPreconditionFailed(err)) return false; // lost the lease
+        throw err;
+      }
+    };
+
+    let i = 0;
+    while (i < remaining.length) {
+      const { workflowId, ticketId } = remaining[i];
+      const r = await resumeTicket(workflowId, ticketId);
+      if (r.ok) {
+        resumedIds.push(ticketId);
+        out.resumed++;
+        remaining.splice(i, 1); // resumed → drop from the remainder
+      } else if (r.terminal) {
+        out.skipped.push({ ticketId, reason: r.reason });
+        remaining.splice(i, 1); // gone → drop (never retry a missing run)
+      } else {
+        out.skipped.push({ ticketId, reason: r.reason });
+        i++; // transient → keep in place, advance past it this pass
+        log(`[runtime-health] resume of ${ticketId} deferred (transient): ${r.reason}`);
+      }
+      if (++sincePersist >= resumePersistEvery) {
+        if (!(await persist())) { out.recovering = true; return out; }
+        sincePersist = 0;
+      }
+    }
+
+    if (remaining.length === 0) {
+      // Fully drained → the recovery is complete. Delete + announce exactly once.
+      await s3.deleteObject(key);
+      _healthyUntil.set(codingArn(), now() + cacheMs);
+      _failures.set(codingArn(), 0);
+      await publishEvent(`runtime:${arnTag(codingArn())}`, "runtime.recovered", {
+        runtimeArn: codingArn(),
+        since,
+        durationMs: now() - Date.parse(since || now()),
+        resumed: resumedIds,
+      });
+      out.recovered = true;
+    } else {
+      // Transient failures remain → hand back to the outage path with a short
+      // backoff so the runtime is re-probed and the remainder re-driven later.
+      await persist({ state: "outage", backoffIdx: 0, nextProbeAt: new Date(now() + backoff[0] * 60000).toISOString() });
+      out.recovering = false;
+      log(`[runtime-health] recovery partial: ${remaining.length} ticket(s) deferred for retry`);
+    }
+    return out;
+  }
+
+  /**
+   * F3 backstop: find `blocked:runtime` tickets that have NO outage object driving
+   * them (e.g. a prior recovery deleted the object before resuming, or a park
+   * outlived its outage), and — only when the runtime probes HEALTHY — resume
+   * them. `findRuntimeBlockedTickets` is a BOUNDED scan of the tickets table
+   * (index.mjs; there is no status/blockReason GSI). Resumes are idempotent, so a
+   * rare concurrent backstop double-run is harmless. Never resumes while the probe
+   * is unhealthy (that would just re-park); leaves those for a later healthy sweep.
+   */
+  async function backstopResume(out) {
+    const a = codingArn();
+    let stranded = [];
+    try {
+      stranded = (await findRuntimeBlockedTickets()) || [];
+    } catch (err) {
+      log(`[runtime-health] backstop scan failed (non-fatal): ${err?.message || err}`);
+      return out;
+    }
+    if (!stranded.length) return out; // nothing stranded → true no-op
+
+    out.probed = 1;
+    const probe = await probeRuntime({ arn: a });
+    await publishEvent(`runtime:${arnTag(a)}`, "runtime.probe", {
+      runtimeArn: a,
+      healthy: probe.healthy,
+      latencyMs: probe.latencyMs,
+      cached: false,
+    });
+    out.healthy = probe.healthy;
+    if (!probe.healthy) {
+      out.backstop = { found: stranded.length, resumed: 0, reason: "runtime_unhealthy" };
+      return out; // still down — resuming now would only re-park; wait for health
+    }
+
+    const resumedIds = [];
+    for (const { workflowId, ticketId } of stranded) {
+      const r = await resumeTicket(workflowId, ticketId);
+      if (r.ok) { out.resumed++; resumedIds.push(ticketId); }
+      else out.skipped.push({ ticketId, reason: r.reason });
+    }
+    out.backstop = { found: stranded.length, resumed: out.resumed };
+    if (resumedIds.length) {
+      _healthyUntil.set(a, now() + cacheMs);
+      _failures.set(a, 0);
+      await publishEvent(`runtime:${arnTag(a)}`, "runtime.backstop_resumed", {
+        runtimeArn: a,
+        resumed: resumedIds,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Called from the 5-minute orchestrator.sweep. Three paths:
+   *  - No outage object → the F3 BACKSTOP: sweep the tickets table for stranded
+   *    `blocked:runtime` tickets and, when the runtime is healthy, resume them.
+   *  - Object in `outage` state → honour the backoff, re-probe; still unhealthy
+   *    advances the backoff, healthy CLAIMS the recovery lease and drains.
+   *  - Object in `recovering` state → a peer sweep owns an active drain; stand
+   *    down unless the marker is STALE (crashed/timed-out owner), then re-claim
+   *    and continue the remainder.
+   *
+   * Returns { probed, healthy, resumed, skipped:[...] } (+ recovered/recovering/backstop).
    */
   async function runtimeHealthSweep() {
-    const arn = codingArn();
+    const a = codingArn();
     const out = { probed: 0, healthy: null, resumed: 0, skipped: [] };
-    if (!arn) return out;
-    const key = outageKey(arn);
+    if (!a) return out;
+    const key = outageKey(a);
     const cur = await s3.getObject(key);
-    if (!cur) return out; // no outage in progress
+    if (!cur) return await backstopResume(out); // no outage object → backstop
     const obj = JSON.parse(cur.body);
+
+    // Recovery already in progress (F3 lease). Fresh marker → a peer owns it,
+    // stand down (idempotency). Stale marker → prior owner crashed; re-claim and
+    // continue draining the remainder from where it left off.
+    if (obj.state === "recovering") {
+      const age = now() - Date.parse(obj.recoveringAt || 0);
+      if (age < recoveringStaleMs) {
+        out.recovering = true;
+        return out;
+      }
+      const claim = await claimRecovering(key, obj, cur.etag);
+      if (!claim) { out.recovering = true; return out; } // lost the re-claim race
+      log(`[runtime-health] re-claiming stale recovery for ${a} (age ${age}ms)`);
+      return await drainResumes(key, claim, out);
+    }
 
     if (now() < Date.parse(obj.nextProbeAt || 0)) {
       return out; // still backing off — do not probe
     }
 
     out.probed = 1;
-    const probe = await probeRuntime({ arn }); // sweep probe is never cached
-    await publishEvent(`runtime:${arnTag(arn)}`, "runtime.probe", {
-      runtimeArn: arn,
+    const probe = await probeRuntime({ arn: a }); // sweep probe is never cached
+    await publishEvent(`runtime:${arnTag(a)}`, "runtime.probe", {
+      runtimeArn: a,
       healthy: probe.healthy,
       latencyMs: probe.latencyMs,
       cached: false,
@@ -359,41 +715,19 @@ export function createRuntimeHealth(deps) {
       return out;
     }
 
-    // Recovered. Capture the parked list, announce, then DELETE the object BEFORE
-    // resuming — otherwise each resume re-enters runtimeHealthGuard, sees the
-    // still-present object, and re-parks the very ticket we are freeing.
-    const blocked = Array.isArray(obj.blockedTickets) ? obj.blockedTickets : [];
-    const durationMs = now() - Date.parse(obj.since || now());
-    _healthyUntil.set(arn, now() + cacheMs);
-    _failures.set(arn, 0);
-    await publishEvent(`runtime:${arnTag(arn)}`, "runtime.recovered", {
-      runtimeArn: arn,
+    // Recovered. CLAIM the recovery lease (outage→recovering) under IfMatch — the
+    // object is NOT deleted up-front any more; it drives the drain and survives a
+    // crash. Losing the CAS means a peer sweep already owns the recovery.
+    const claim = await claimRecovering(key, obj, cur.etag);
+    if (!claim) { out.recovering = true; return out; }
+    _healthyUntil.set(a, now() + cacheMs);
+    _failures.set(a, 0);
+    await publishEvent(`runtime:${arnTag(a)}`, "runtime.recovering", {
+      runtimeArn: a,
       since: obj.since,
-      durationMs,
-      resumed: blocked.map((b) => b.ticketId),
+      blocked: (claim.obj.blockedTickets || []).length,
     });
-    await s3.deleteObject(key);
-
-    for (const { workflowId, ticketId } of blocked) {
-      try {
-        const wf = loadWorkflow ? await loadWorkflow(workflowId) : null;
-        const ticket = wf && loadTicket ? await loadTicket(wf, ticketId) : null;
-        if (!wf || !ticket) {
-          out.skipped.push({ ticketId, reason: "not_found" });
-          continue;
-        }
-        // Un-block the board first (blocked → todo/Ready), then route through the
-        // ONE R3 implementation (claim CAS, liveness — never re-implemented here).
-        await cascade.transitionToReady(ticket);
-        ticket.status = provider === "jira" ? "ready" : "todo";
-        await cascade.reconcileDependent(ticket, "runtime-recovered", wf, newCascadeMetrics(), "enforce");
-        out.resumed++;
-      } catch (err) {
-        out.skipped.push({ ticketId, reason: err?.message || String(err) });
-        log(`[runtime-health] resume of ${ticketId} failed (non-fatal): ${err?.message || err}`);
-      }
-    }
-    return out;
+    return await drainResumes(key, claim, out);
   }
 
   return { probeRuntime, probeCached, runtimeHealthGuard, runtimeHealthSweep, outageKey, probeSessionId };

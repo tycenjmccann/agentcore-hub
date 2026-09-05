@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createRuntimeHealth, outageKey, probeSessionId, parseBackoffMinutes } from "./runtime-health.mjs";
+import { createRuntimeHealth, outageKey, probeSessionId, parseBackoffMinutes, classifyProbeError } from "./runtime-health.mjs";
 
 /**
  * TEAM-3992 D4.2 — the coding-runtime health gate + auto-resume.
@@ -49,7 +49,7 @@ function harness(overrides = {}) {
   const events = [];
   const publishEvent = vi.fn(async (subject, type, detail) => { events.push({ subject, type, detail }); });
   const blockTicketRuntime = vi.fn(async () => {});
-  const appendNotificationOnce = vi.fn(async () => true);
+  const appendNotificationOnce = overrides.appendNotificationOnce || vi.fn(async () => true);
   const invokeRuntime = overrides.invokeRuntime || vi.fn(async () => ({ statusCode: 200, json: { status: "unknown" } }));
   const cascade = overrides.cascade || {
     reconcileDependent: vi.fn(async () => ({ outcome: "redispatched", reason: "dispatchable" })),
@@ -57,6 +57,7 @@ function harness(overrides = {}) {
   };
   const loadWorkflow = overrides.loadWorkflow || vi.fn(async (id) => ({ id, epicId: "EPIC-1" }));
   const loadTicket = overrides.loadTicket || vi.fn(async (wf, ticketId) => ({ ticketId, status: "blocked", assignee: "agentcore_hub_backend_dev" }));
+  const findRuntimeBlockedTickets = overrides.findRuntimeBlockedTickets || vi.fn(async () => []);
   const env = {
     CODING_AGENT_RUNTIME_ARN: ARN,
     TICKET_PROVIDER: "dynamodb",
@@ -67,11 +68,11 @@ function harness(overrides = {}) {
   };
   const rh = createRuntimeHealth({
     invokeRuntime, s3, publishEvent, now, env,
-    blockTicketRuntime, appendNotificationOnce, cascade, loadWorkflow, loadTicket,
+    blockTicketRuntime, appendNotificationOnce, cascade, loadWorkflow, loadTicket, findRuntimeBlockedTickets,
   });
   const outage = () => (s3.store.has(KEY) ? JSON.parse(s3.store.get(KEY).body) : null);
   const eventsOfType = (t) => events.filter((e) => e.type === t);
-  return { rh, s3, clock, now, events, eventsOfType, publishEvent, blockTicketRuntime, appendNotificationOnce, invokeRuntime, cascade, outage, env };
+  return { rh, s3, clock, now, events, eventsOfType, publishEvent, blockTicketRuntime, appendNotificationOnce, invokeRuntime, cascade, loadWorkflow, loadTicket, findRuntimeBlockedTickets, outage, env };
 }
 
 const wf = { id: "wf_1", epicId: "EPIC-1" };
@@ -274,7 +275,10 @@ describe("runtimeHealthSweep — backoff + recovery", () => {
     // Each parked ticket routed through the ONE cascade implementation, once.
     expect(h.cascade.reconcileDependent).toHaveBeenCalledTimes(2);
     expect(h.cascade.transitionToReady).toHaveBeenCalledTimes(2);
-    // Object deleted BEFORE resume so the guard can't re-park a freed ticket.
+    // Recovering-lease ordering (F3): the object is the recovery lease — it is
+    // flipped outage→recovering, drained one resumed ticket at a time, and only
+    // DELETEd once blockedTickets empties (here both resumed). So a healthy sweep
+    // that finishes ends with no object.
     expect(h.outage()).toBeNull();
   });
 
@@ -284,5 +288,338 @@ describe("runtimeHealthSweep — backoff + recovery", () => {
     expect(res).toEqual({ probed: 0, healthy: null, resumed: 0, skipped: [] });
     expect(h.s3.getObject).toHaveBeenCalledTimes(1);
     expect(h.invokeRuntime).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * TEAM-4100 F3 (P1) — recovery must not strand parked tickets.
+ *
+ * The old recovery published `runtime.recovered`, DELETED the outage object, and
+ * only THEN looped the parked list — so a throw / Lambda timeout after N of M
+ * resumes left the remainder `blocked:runtime` with no marker to drive a retry.
+ * The fix makes the outage object itself the recovery lease: a healthy sweep CAS-
+ * flips it `outage`→`recovering` (IfMatch — the winner drains, losers stand down),
+ * shrinks blockedTickets per resumed ticket, and DELETEs + announces recovered
+ * EXACTLY once, only when the list empties. A crash leaves the true remainder + a
+ * `recovering` marker; a later sweep re-claims the stale marker and finishes it.
+ * An independent backstop scans the tickets table for stranded `blocked:runtime`
+ * tickets that have NO outage object and resumes them when the runtime is healthy.
+ */
+describe("runtimeHealthSweep — F3 crash-safe recovery + backstop", () => {
+  const other = (id) => ({ id, epicId: "EPIC-1" });
+
+  async function armOutageWith(h, ids) {
+    for (const id of ids) await h.rh.runtimeHealthGuard(other(`wf_${id}`), ticket(id));
+  }
+
+  /** makeS3 that throws (non-412) the first time `shouldThrow(parsedBody)` is true. */
+  function makeCrashS3(shouldThrow) {
+    const base = makeS3();
+    const orig = base.putObject;
+    let armed = true;
+    base.putObject = vi.fn(async (key, body, opts = {}) => {
+      if (armed) {
+        let parsed = null;
+        try { parsed = JSON.parse(body); } catch { /* ignore */ }
+        if (parsed && shouldThrow(parsed)) {
+          armed = false;
+          const e = new Error("simulated Lambda crash — S3 write interrupted");
+          e.name = "InternalError";
+          throw e;
+        }
+      }
+      return orig(key, body, opts);
+    });
+    return base;
+  }
+
+  it("crash mid-drain leaves the object recovering with the TRUE remainder; a later sweep completes it", async () => {
+    // Throw on the persist that would shrink the remainder to [T-3] (after T-1+T-2
+    // resumed) — the object stays at its prior persist (blocked=[T-2,T-3]).
+    const s3 = makeCrashS3((b) => b.state === "recovering" && (b.blockedTickets || []).length === 1);
+    const h = harness({ s3, invokeRuntime: vi.fn(async () => { throw new Error("down"); }), env: { RUNTIME_PROBE_CONFIRM: "1", RUNTIME_RECOVERING_STALE_MS: "120000" } });
+    await armOutageWith(h, ["T-1", "T-2", "T-3"]);
+    expect(h.outage().blockedTickets.map((b) => b.ticketId)).toEqual(["T-1", "T-2", "T-3"]);
+
+    // Runtime recovers; jump to the scheduled probe.
+    h.invokeRuntime.mockImplementation(async () => ({ statusCode: 200, json: { status: "unknown" } }));
+    h.clock.ms = Date.parse(h.outage().nextProbeAt);
+
+    // The 3rd IfMatch write (persist after resuming T-2) throws → the sweep aborts.
+    await expect(h.rh.runtimeHealthSweep()).rejects.toThrow(/interrupted/i);
+
+    // Object still present, marked recovering, with the persisted remainder [T-2,T-3]
+    // (T-1's removal was persisted by write #2; T-2's by the write that threw).
+    const obj = h.outage();
+    expect(obj).not.toBeNull();
+    expect(obj.state).toBe("recovering");
+    expect(obj.blockedTickets.map((b) => b.ticketId)).toEqual(["T-2", "T-3"]);
+    // T-1 and T-2 were both routed through the cascade before the crash.
+    expect(h.cascade.reconcileDependent).toHaveBeenCalledTimes(2);
+    expect(h.eventsOfType("runtime.recovered")).toHaveLength(0); // NOT announced yet
+
+    // A later sweep: the recovering marker is now stale → re-claim + finish.
+    h.clock.ms += 120001;
+    const res = await h.rh.runtimeHealthSweep();
+    expect(res.resumed).toBe(2); // remainder [T-2,T-3] (T-2 re-resumed idempotently)
+    expect(h.outage()).toBeNull(); // deleted ONLY once the list emptied
+    expect(h.eventsOfType("runtime.recovered")).toHaveLength(1); // exactly one
+  });
+
+  it("a fresh recovering marker makes a concurrent sweep stand down (idempotency)", async () => {
+    const h = harness();
+    h.s3.store.set(KEY, {
+      body: JSON.stringify({ runtimeArn: ARN, state: "recovering", recoveringAt: new Date(START).toISOString(), blockedTickets: [{ workflowId: "wf_1", ticketId: "T-1" }] }),
+      etag: "etag-fresh",
+    });
+    h.clock.ms = START + 1000; // age 1s < RUNTIME_RECOVERING_STALE_MS (120s)
+    const res = await h.rh.runtimeHealthSweep();
+    expect(res.recovering).toBe(true);
+    expect(res.resumed).toBe(0);
+    expect(h.cascade.reconcileDependent).not.toHaveBeenCalled();
+    expect(h.invokeRuntime).not.toHaveBeenCalled(); // recovering path never probes
+  });
+
+  it("two concurrent recoveries: one wins the lease, exactly one set of resumes + one recovered", async () => {
+    const s3 = makeS3();
+    const cascade = {
+      reconcileDependent: vi.fn(async () => ({ outcome: "redispatched", reason: "dispatchable" })),
+      transitionToReady: vi.fn(async () => {}),
+    };
+    const events = [];
+    const mk = () => {
+      const hh = harness({ s3, cascade, invokeRuntime: vi.fn(async () => { throw new Error("down"); }), env: { RUNTIME_PROBE_CONFIRM: "1" } });
+      hh.publishEvent.mockImplementation(async (subject, type, detail) => events.push({ type, detail }));
+      return hh;
+    };
+    const a = mk();
+    await a.rh.runtimeHealthGuard(wf, ticket("T-1"));
+    await a.rh.runtimeHealthGuard(other("wf_2"), ticket("T-2"));
+
+    // Both probers see the runtime healthy at the scheduled probe time.
+    const healthy = async () => ({ statusCode: 200, json: { status: "unknown" } });
+    a.invokeRuntime.mockImplementation(healthy);
+    const b = mk();
+    b.invokeRuntime.mockImplementation(healthy);
+    const probeAt = Date.parse(JSON.parse(s3.store.get(KEY).body).nextProbeAt);
+    a.clock.ms = probeAt;
+    b.clock.ms = probeAt;
+
+    const [ra, rb] = await Promise.all([a.rh.runtimeHealthSweep(), b.rh.runtimeHealthSweep()]);
+
+    // Exactly one winner drained (2 tickets, once each); the loser stood down.
+    expect(events.filter((e) => e.type === "runtime.recovered")).toHaveLength(1);
+    expect(cascade.reconcileDependent).toHaveBeenCalledTimes(2);
+    expect(cascade.transitionToReady).toHaveBeenCalledTimes(2);
+    expect([ra, rb].filter((r) => r.recovered).length).toBe(1);
+    expect([ra, rb].filter((r) => r.recovering).length).toBe(1);
+    expect(s3.store.has(KEY)).toBe(false); // the winner deleted it
+  });
+
+  it("a transient per-ticket failure keeps that ticket parked and flips the object back to outage", async () => {
+    const h = harness({ invokeRuntime: vi.fn(async () => { throw new Error("down"); }), env: { RUNTIME_PROBE_CONFIRM: "1" } });
+    await armOutageWith(h, ["T-1", "T-2"]);
+    h.invokeRuntime.mockImplementation(async () => ({ statusCode: 200, json: { status: "unknown" } }));
+    // T-2's reconcile fails transiently; T-1 succeeds.
+    h.cascade.reconcileDependent.mockImplementation(async (t) => { if (t.ticketId === "T-2") throw new Error("ddb throttled"); return {}; });
+    h.clock.ms = Date.parse(h.outage().nextProbeAt);
+
+    const res = await h.rh.runtimeHealthSweep();
+    expect(res.resumed).toBe(1);
+    const obj = h.outage();
+    expect(obj).not.toBeNull();
+    expect(obj.state).toBe("outage"); // handed back for a later re-probe + retry
+    expect(obj.blockedTickets.map((b) => b.ticketId)).toEqual(["T-2"]);
+    expect(h.eventsOfType("runtime.recovered")).toHaveLength(0); // recovery incomplete
+  });
+
+  it("a not_found ticket (run gone) is dropped, not retried forever", async () => {
+    const h = harness({ invokeRuntime: vi.fn(async () => { throw new Error("down"); }), env: { RUNTIME_PROBE_CONFIRM: "1" } });
+    await armOutageWith(h, ["T-1", "T-2"]);
+    h.invokeRuntime.mockImplementation(async () => ({ statusCode: 200, json: { status: "unknown" } }));
+    h.loadWorkflow.mockImplementation(async (id) => (id === "wf_T-2" ? null : { id, epicId: "EPIC-1" }));
+    h.clock.ms = Date.parse(h.outage().nextProbeAt);
+
+    const res = await h.rh.runtimeHealthSweep();
+    expect(res.resumed).toBe(1); // T-1 resumed
+    expect(res.skipped).toEqual([{ ticketId: "T-2", reason: "not_found" }]);
+    expect(h.outage()).toBeNull(); // list emptied (T-2 dropped) → deleted + recovered
+    expect(h.eventsOfType("runtime.recovered")).toHaveLength(1);
+  });
+
+  it("backstop: no outage object + healthy probe + stranded blocked:runtime tickets → resumes them", async () => {
+    const stranded = [{ workflowId: "wf_1", ticketId: "T-1" }, { workflowId: "wf_2", ticketId: "T-2" }];
+    const h = harness({
+      findRuntimeBlockedTickets: vi.fn(async () => stranded),
+      invokeRuntime: vi.fn(async () => ({ statusCode: 200, json: { status: "unknown" } })),
+    });
+    expect(h.outage()).toBeNull();
+
+    const res = await h.rh.runtimeHealthSweep();
+    expect(res.resumed).toBe(2);
+    expect(res.backstop).toMatchObject({ found: 2, resumed: 2 });
+    expect(h.cascade.transitionToReady).toHaveBeenCalledTimes(2);
+    expect(h.cascade.reconcileDependent).toHaveBeenCalledTimes(2);
+    expect(h.eventsOfType("runtime.backstop_resumed")).toHaveLength(1);
+  });
+
+  it("backstop stands down while the runtime is still unhealthy (never re-parks)", async () => {
+    const h = harness({
+      findRuntimeBlockedTickets: vi.fn(async () => [{ workflowId: "wf_1", ticketId: "T-1" }]),
+      invokeRuntime: vi.fn(async () => { throw new Error("down"); }),
+    });
+    const res = await h.rh.runtimeHealthSweep();
+    expect(res.resumed).toBe(0);
+    expect(res.backstop).toMatchObject({ found: 1, resumed: 0, reason: "runtime_unhealthy" });
+    expect(h.cascade.reconcileDependent).not.toHaveBeenCalled();
+  });
+
+  it("dispatch is NOT parked while the outage object is in recovering state", async () => {
+    const h = harness();
+    h.s3.store.set(KEY, {
+      body: JSON.stringify({ runtimeArn: ARN, state: "recovering", recoveringAt: new Date(START).toISOString(), blockedTickets: [{ workflowId: "wf_1", ticketId: "T-9" }] }),
+      etag: "etag-r",
+    });
+    const v = await h.rh.runtimeHealthGuard(wf, ticket("T-1"));
+    expect(v).toEqual({ ok: true });
+    expect(h.blockTicketRuntime).not.toHaveBeenCalled();
+    expect(h.invokeRuntime).not.toHaveBeenCalled(); // recovering ⇒ runtime is up
+  });
+});
+
+/**
+ * TEAM-4100 F4 (P2) — a misconfigured probe must not masquerade as an outage,
+ * and a hung probe must not hang the invocation.
+ *
+ * Under the old "any probe failure counts" rule a single IAM regression (missing
+ * bedrock-agentcore:InvokeAgentRuntime) or a stale ARN would confirm an "outage"
+ * and park EVERY coding ticket, with no auto-resume path (the runtime is healthy,
+ * so a re-probe stays broken forever). F4 classifies the failure: a misconfig
+ * signal fails OPEN (dispatch proceeds, ONE idempotent escalation, distinct
+ * event, NO park, NO confirm-count bump); throttling is transient (proceed, no
+ * park); only 5xx/network/timeout is an outage candidate. And every probe is
+ * bounded by an AbortController + rejecting timer so a wedged runtime can never
+ * hang the guard.
+ */
+describe("classifyProbeError — the classification table (F4)", () => {
+  it("throttling / 429 → transient", () => {
+    expect(classifyProbeError("ThrottlingException")).toBe("transient");
+    expect(classifyProbeError("TooManyRequestsException")).toBe("transient");
+    expect(classifyProbeError(null, 429)).toBe("transient");
+  });
+  it("auth / validation / not-found / bad-client / any non-throttling 4xx → probe_misconfigured", () => {
+    for (const n of ["AccessDeniedException", "ValidationException", "ResourceNotFoundException", "UnrecognizedClientException", "IncompleteSignatureException", "InvalidSignatureException"]) {
+      expect(classifyProbeError(n)).toBe("probe_misconfigured");
+    }
+    expect(classifyProbeError(null, 400)).toBe("probe_misconfigured");
+    expect(classifyProbeError(null, 403)).toBe("probe_misconfigured");
+  });
+  it("5xx / network / timeout / abort → outage", () => {
+    expect(classifyProbeError(null, 503)).toBe("outage");
+    expect(classifyProbeError(null, 500)).toBe("outage");
+    expect(classifyProbeError("AbortError")).toBe("outage");
+    expect(classifyProbeError("TimeoutError")).toBe("outage");
+    expect(classifyProbeError("ECONNREFUSED")).toBe("outage");
+    expect(classifyProbeError(null)).toBe("outage"); // nothing known → treat as outage
+  });
+});
+
+describe("runtimeHealthGuard — F4 probe-misconfiguration + transient classification", () => {
+  /** A stateful appendNotificationOnce: true the first time per id, false after. */
+  function onceStore() {
+    const seen = new Set();
+    return vi.fn(async (_wfId, n) => { if (seen.has(n.id)) return false; seen.add(n.id); return true; });
+  }
+  const namedErr = (name) => { const e = new Error(name); e.name = name; return e; };
+
+  it("AccessDenied → probe_misconfigured: fails OPEN, ONE escalation, distinct event, NO park, NO outage", async () => {
+    const appendNotificationOnce = onceStore();
+    const h = harness({ invokeRuntime: vi.fn(async () => { throw namedErr("AccessDeniedException"); }), appendNotificationOnce });
+
+    const v = await h.rh.runtimeHealthGuard(wf, ticket("T-1"));
+    expect(v).toEqual({ ok: true }); // fail-open — a broken probe must NOT park healthy work
+    expect(h.blockTicketRuntime).not.toHaveBeenCalled();
+    expect(h.outage()).toBeNull(); // no outage object created
+    expect(h.eventsOfType("runtime.outage")).toHaveLength(0);
+    expect(h.eventsOfType("runtime.probe_misconfigured")).toHaveLength(1);
+    expect(h.eventsOfType("runtime.probe_misconfigured")[0].detail).toMatchObject({ runtimeArn: ARN, errorName: "AccessDeniedException" });
+    expect(appendNotificationOnce).toHaveBeenCalledTimes(1);
+    expect(appendNotificationOnce.mock.calls[0][1]).toMatchObject({ id: expect.stringContaining("notif_runtime_probe_misconfigured_"), type: "manager_escalation" });
+    expect(appendNotificationOnce.mock.calls[0][1].details).toContain("bedrock-agentcore:InvokeAgentRuntime");
+  });
+
+  it("a second misconfigured probe does NOT raise a second escalation or event (idempotent)", async () => {
+    const appendNotificationOnce = onceStore();
+    const h = harness({ invokeRuntime: vi.fn(async () => { throw namedErr("AccessDeniedException"); }), appendNotificationOnce });
+    await h.rh.runtimeHealthGuard(wf, ticket("T-1"));
+    await h.rh.runtimeHealthGuard(wf, ticket("T-2")); // unhealthy cache expired → re-probes
+    expect(h.invokeRuntime).toHaveBeenCalledTimes(2); // it DID re-probe
+    expect(appendNotificationOnce).toHaveBeenCalledTimes(2); // both attempt the CAS
+    expect(h.eventsOfType("runtime.probe_misconfigured")).toHaveLength(1); // only the first won
+  });
+
+  it("ThrottlingException → transient: dispatch proceeds, NO park, NO outage, NO escalation", async () => {
+    const appendNotificationOnce = onceStore();
+    const h = harness({ invokeRuntime: vi.fn(async () => { throw namedErr("ThrottlingException"); }), appendNotificationOnce });
+    const v = await h.rh.runtimeHealthGuard(wf, ticket("T-1"));
+    expect(v).toEqual({ ok: true });
+    expect(h.blockTicketRuntime).not.toHaveBeenCalled();
+    expect(h.outage()).toBeNull();
+    expect(h.eventsOfType("runtime.outage")).toHaveLength(0);
+    expect(h.eventsOfType("runtime.probe_misconfigured")).toHaveLength(0);
+    expect(appendNotificationOnce).not.toHaveBeenCalled();
+  });
+
+  it("a 503 response is still an outage (classification does not soften genuine failures)", async () => {
+    const h = harness({ invokeRuntime: vi.fn(async () => ({ statusCode: 503, json: null })), env: { RUNTIME_PROBE_CONFIRM: "1" } });
+    const v = await h.rh.runtimeHealthGuard(wf, ticket("T-1"));
+    expect(v).toMatchObject({ ok: false, reason: "runtime_outage" });
+    expect(h.outage()).toMatchObject({ state: "outage" });
+    expect(h.eventsOfType("runtime.outage")).toHaveLength(1);
+  });
+});
+
+describe("probeRuntime — F4 abort + timer hygiene", () => {
+  it("passes an AbortSignal to the SDK invoke", async () => {
+    const h = harness();
+    await h.rh.probeRuntime({ arn: ARN });
+    expect(h.invokeRuntime.mock.calls[0][0].abortSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("a hanging probe is ABORTED at the budget and the guard rejects (never hangs)", async () => {
+    vi.useFakeTimers();
+    try {
+      let captured;
+      const invokeRuntime = vi.fn(({ abortSignal }) => new Promise((_, reject) => {
+        captured = abortSignal;
+        abortSignal.addEventListener("abort", () => reject(abortSignal.reason));
+      }));
+      const h = harness({ invokeRuntime, env: { RUNTIME_PROBE_TIMEOUT_MS: "1000" } });
+      const p = h.rh.probeRuntime({ arn: ARN });
+      await vi.advanceTimersByTimeAsync(1000); // fire the guard timer
+      const res = await p;
+      expect(captured.aborted).toBe(true); // the SDK request was told to tear down
+      expect(res.healthy).toBe(false);
+      expect(res.errorName).toBe("AbortError");
+      expect(res.classification).toBe("outage"); // a hang is an outage candidate
+      expect(vi.getTimerCount()).toBe(0); // timer cleared, none dangling
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the abort timer on a successful probe", async () => {
+    vi.useFakeTimers();
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout");
+    try {
+      const h = harness(); // default invokeRuntime resolves healthy
+      const res = await h.rh.probeRuntime({ arn: ARN });
+      expect(res.healthy).toBe(true);
+      expect(clearSpy).toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      clearSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });
