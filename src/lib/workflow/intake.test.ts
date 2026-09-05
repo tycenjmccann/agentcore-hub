@@ -1741,10 +1741,43 @@ describe("connect-time address pin — TEAM-4115", () => {
     const c = only(
       await validateIntakeSources([src("url", "https://example.com/spec.md")], { fetchImpl: impl, env: envOf({}) })
     );
-    expect(c.outcome).toBe("transient");
+    // A pin refusal is the SAME definitive verdict as a literal/resolved blocked
+    // host, not a network hiccup — see the dedicated test below for the full
+    // acceptance criterion; this one only pins that the dispatcher still closes.
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
     // The opaque TypeError alone would say only "fetch failed"; the cause is the reason.
     expect(c.detail).toContain("connect to unvetted host refused");
     expect(captured!.closed).toBe(true);
+  });
+
+  it("a pin refusal classifies as definitive/parse, never as a transient TypeError (the acceptance criterion)", async () => {
+    // The dispatcherFactory stub hands back a REAL pinned dispatcher (so its
+    // lookup genuinely refuses), but fetchImpl is what actually throws — same
+    // shape as fetch's real behaviour when init.dispatcher's connector errors:
+    // an opaque TypeError with the real reason one level down on `cause`.
+    const dispatcherFactory = vi.fn((host: string, addresses: readonly string[]) =>
+      createPinnedDispatcher(host, addresses)
+    );
+    const impl = (async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: new Error("Blocked URL host — connect to unvetted host refused"),
+      });
+    }) as unknown as typeof fetch;
+
+    const c = only(
+      await validateIntakeSources([src("url", PRESIGNED)], { fetchImpl: impl, dispatcherFactory, env: envOf({}) })
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    expect(c.detail!.startsWith("Blocked URL host —")).toBe(true);
+    expect(c.detail).toContain(redactUrl(PRESIGNED));
+    // The redacted url, not the raw one — the presigned signature must not leak.
+    expect(c.detail).not.toContain("X-Amz-Signature=SECRETSIG");
+    // Definitive → 422 in both modes, exactly like every other blocked-host case.
+    const r = await validateIntakeSources([src("url", PRESIGNED)], { fetchImpl: impl, dispatcherFactory, env: envOf({}) });
+    expect(shouldRejectSubmission(r, "lenient").reject).toBe(true);
+    expect(shouldRejectSubmission(r, "strict").reject).toBe(true);
   });
 
   it("a blocked resolver answer never builds a dispatcher at all", async () => {

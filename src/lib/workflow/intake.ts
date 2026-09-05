@@ -684,7 +684,11 @@ export function createPinnedDispatcher(
 ): Agent {
   const lookup = buildPinnedLookup(host, addresses, opts);
   const dispatcher = new Agent({
-    connect: { lookup, timeout: DNS_LOOKUP_TIMEOUT_MS },
+    // This is undici's TCP/TLS connect timeout, not a DNS budget — the pin does
+    // no lookup, so it must not be tightened to DNS_LOOKUP_TIMEOUT_MS. Match the
+    // fetch's own AbortSignal budget so a slow-but-public origin behaves exactly
+    // as it did before the pin.
+    connect: { lookup, timeout: URL_TIMEOUT_MS },
     // One source check is one request; no reason to hold a pool open.
     pipelining: 0,
   });
@@ -869,8 +873,17 @@ async function checkUrlSource(
     const message = (err as Error)?.message || "";
     // A pin refusal surfaces as fetch's opaque TypeError with the real reason on
     // `cause` — carry that through so "connect to unvetted host refused" is not
-    // laundered into a bare "fetch failed".
+    // laundered into a bare "fetch failed". One level deep only: undici never
+    // nests further than this for a connector-level rejection.
     const cause = (err as { cause?: { message?: string } })?.cause?.message || "";
+    // The pin refused the connect — this is the SAME definitive verdict a
+    // literal/resolved blocked host gets above, not a network hiccup worth
+    // retrying. Check cause first: `message` is fetch's generic "fetch failed"
+    // when the real reason is on cause.
+    const pinRefusal = cause.startsWith("Blocked URL host") ? cause : message.startsWith("Blocked URL host") ? message : "";
+    if (pinRefusal) {
+      return { outcome: "definitive", method: "parse", detail: `${pinRefusal}: ${redactUrl(value)}` };
+    }
     return {
       outcome: "transient",
       method,
