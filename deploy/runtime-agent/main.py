@@ -1719,7 +1719,7 @@ def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: 
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", verification: dict = None, findings: list = None) -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -1729,14 +1729,21 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         branch: Git branch name (for dev agents)
         commit_sha: Git commit SHA (for dev agents)
         pr_url: Pull request URL (for dev agents)
+        verification: Optional structured verification object for a fix/re-arm ticket (e.g. {target_ticket_id, head_sha, kind, verdict})
+        findings: Optional list of structured findings (e.g. [{component, severity, summary, files}])
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
-    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", {
+    payload = {
         "ticket_id": ticket_id, "summary": summary,
         "artifacts": artifacts, "branch": branch, "commit_sha": commit_sha, "pr_url": pr_url,
         "workflow_id": _CURRENT_WORKFLOW_ID,
         "agent_id": _CURRENT_AGENT_ID,
-    })
+    }
+    if verification is not None:
+        payload["verification"] = verification
+    if findings is not None:
+        payload["findings"] = findings
+    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", payload)
 
 
 @tool

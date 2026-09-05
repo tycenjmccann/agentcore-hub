@@ -164,6 +164,15 @@ discipline above.
   Then `WorkflowOutput___report_completion` summarizing the findings + the fix
   ticket keys you filed.
 
+## Re-verifying a fix
+When your ticket is a fix ticket or a re-verify ("re-arm") ticket, include a
+`verification` object in your `report_completion` call so the completion gate can
+prove the fix was re-verified at its final commit SHA:
+`{ target_ticket_id: <the fix ticket you are verifying>, head_sha: <the HEAD commit
+SHA you reviewed>, kind: "review", verdict: "pass" | "fail" | "blocked" }`.
+Optionally include `findings: [{ component, severity, summary, files: [] }]`
+describing any issues you found.
+
 ## Rules
 - ZERO findings = the only PASS. Any finding, any severity → CHANGES NEEDED + fix ticket
 - Dismissing a candidate finding requires verified evidence in writing; unverified "acceptable trade-off" = file it

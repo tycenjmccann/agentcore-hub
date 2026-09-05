@@ -224,6 +224,8 @@ export const handler = async (event) => {
         return await getTransitions(args);
       case "add_comment":
         return await addComment(args);
+      case "add_blockers":
+        return await addBlockers(args);
       case "list_projects":
         return await listProjects();
       case "get_project_issue_types":
@@ -234,7 +236,7 @@ export const handler = async (event) => {
         // Return an `error` field so callers (e.g. workflow-output) can tell a
         // no-op from a real result. Without this, an unrecognized tool name
         // looked like success and silently stalled the pipeline.
-        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, list_projects, get_project_issue_types, lookup_user`;
+        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, add_blockers, list_projects, get_project_issue_types, lookup_user`;
         return { error: message, content: [{ text: message }] };
       }
     }
@@ -255,6 +257,11 @@ const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
 const SPAWN_ORIGIN_KEYS = ["gateTicketId", "qaTicketId", "codexTicketId"];
 // TEAM-3991 D2.2 — non-origin provenance fields (never used to resolve an edge).
 const SPAWN_META_KEYS = ["by", "findingId"];
+// TEAM-3992 D3.2 — re-arm provenance: rearmOf (the fix this re-verify pins to),
+// headSha (the exact commit), role (which gate is re-verifying). Kept so the
+// orchestrator can dedup re-arm tickets and the SHA-pinned completion gate can
+// attribute a verification record to its fix.
+const REARM_KEYS = ["rearmOf", "headSha", "role"];
 
 /**
  * Normalize an agent-supplied `spawned_by` marker. Returns { value } for a clean
@@ -279,6 +286,10 @@ function sanitizeSpawnedBy(raw) {
   // and `findingId` (which finding it answers) so the parked→fix edge and the
   // metrics bucketing can attribute a fix without parsing its title.
   for (const k of SPAWN_META_KEYS) {
+    if (typeof raw[k] === "string" && raw[k]) value[k] = raw[k];
+  }
+  // TEAM-3992 D3.2 — re-arm provenance (allowlist extension only).
+  for (const k of REARM_KEYS) {
     if (typeof raw[k] === "string" && raw[k]) value[k] = raw[k];
   }
   return { value };
@@ -325,6 +336,59 @@ async function linkFixToOrigin(fixTicketId, spawnedBy, nowIso) {
     console.warn(`[tickets] blockedBy edge ${originId} → ${fixTicketId} failed (non-fatal): ${err?.message || err}`);
     return false;
   }
+}
+
+/**
+ * TEAM-3992 D3.2 — add blockers to an existing ticket (the orchestrator uses this
+ * to block the Ship ticket on freshly-created re-arm tickets). Idempotent per id
+ * (list_append only when NOT already contains) and refuses on a done/cancelled
+ * target — a closed ticket cannot be re-blocked.
+ */
+async function addBlockers(args) {
+  const ticketId = args.ticket_id || args.ticketId;
+  const raw = Array.isArray(args.blocked_by) ? args.blocked_by : args.blocked_by ? [args.blocked_by] : [];
+  const blockers = [...new Set(raw.filter((b) => typeof b === "string" && b && b !== ticketId))];
+  if (!ticketId) return textResult("Error: 'ticket_id' is required");
+  if (blockers.length === 0) return textResult("Error: 'blocked_by' must be a non-empty list of ticket ids");
+
+  const now = new Date().toISOString();
+  const added = [];
+  for (const b of blockers) {
+    try {
+      await ddb.send(new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { ticketId },
+        UpdateExpression:
+          "SET blockedBy = list_append(if_not_exists(blockedBy, :empty), :one), updatedAt = :now",
+        ConditionExpression:
+          "(attribute_not_exists(blockedBy) OR NOT contains(blockedBy, :b)) AND #s <> :done AND #s <> :cancelled",
+        ExpressionAttributeNames: { "#s": "status" },
+        ExpressionAttributeValues: {
+          ":empty": [],
+          ":one": [b],
+          ":b": b,
+          ":now": now,
+          ":done": "done",
+          ":cancelled": "cancelled",
+        },
+      }));
+      added.push(b);
+    } catch (err) {
+      if (err?.name === "ConditionalCheckFailedException") {
+        // Either already linked (no-op) or the target is closed. Distinguish so a
+        // refuse-on-closed is a real error, not a silent no-op.
+        const cur = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId } }));
+        const status = cur.Item?.status;
+        if (status === "done" || status === "cancelled") {
+          return textResult(`Error: ${ticketId} is ${status} — cannot add blockers to a closed ticket`);
+        }
+        // else already contains this blocker — idempotent skip
+        continue;
+      }
+      throw err;
+    }
+  }
+  return { status: "ok", ticket_id: ticketId, added };
 }
 
 async function createTicket(args) {

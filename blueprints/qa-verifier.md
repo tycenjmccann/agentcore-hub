@@ -221,6 +221,15 @@ PASS on that dimension. Do not describe a code-read as if it were a test run.
 to merge" for an iOS change you could not build and run. That reads as an
 all-clear on something that was never tested. Use BLOCKED and say so plainly.**
 
+## Re-verifying a fix
+When your ticket is a fix ticket or a re-verify ("re-arm") ticket, include a
+`verification` object in your `report_completion` call so the completion gate can
+prove the fix was re-verified at its final commit SHA:
+`{ target_ticket_id: <the fix ticket you are verifying>, head_sha: <the HEAD commit
+SHA you verified>, kind: "qa", verdict: "pass" | "fail" | "blocked" }`.
+Optionally include `findings: [{ component, severity, summary, files: [] }]`
+describing any issues you found.
+
 ## Rules
 - Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - NEVER pass a UI change without a screenshot proving it renders correctly

@@ -23,6 +23,7 @@ Globals:
         CASCADE_EXTENDED_STATES: !Ref CascadeExtendedStates
         RECONCILE_SWEEP_MODE: !Ref ReconcileSweepMode
         GATE_BYPASS_MODE: !Ref GateBypassMode
+        FIX_VERIFICATION_REQUIRED: !Ref FixVerificationRequired
 
 Parameters:
   TicketsTableName:
@@ -102,6 +103,19 @@ Parameters:
       matches the code default in gate-bypass.mjs gateBypassMode() — unlike the
       sweeps this ships ON, because the failure it catches (a run closing green
       over an unapproved merge) is exactly what it must not miss.
+
+  FixVerificationRequired:
+    Type: String
+    Default: enforce
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      SHA-pinned fix-verification gate (TEAM-3992 Q4/D3.2). off = skip the check;
+      shadow = detect + publish workflow.completion_blocked (reason fix_unverified),
+      no block; enforce = hold the run open at completion when a done fix ticket was
+      not re-verified at its FINAL commit SHA by every role its kind re-arms, and
+      raise one manager_escalation. Inert unless the run's def declares
+      ticketDag.fixRearm. Default "enforce" matches the code default in index.mjs —
+      a fix closing green without re-verification is exactly what it must not miss.
 
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────

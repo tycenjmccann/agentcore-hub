@@ -250,7 +250,44 @@ async function lookupTicketOwner(ticket_id) {
  *      An ABSENT `agent_id` is allowed (older fleet callers omit it) but logged:
  *      it cannot be checked, so it must at least be visible.
  */
-async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id }) {
+/** verification.kind values a verifier may stamp (review/qa/ci gates). */
+const VERIFICATION_KINDS = new Set(["review", "qa", "ci"]);
+/** verification.verdict values. */
+const VERIFICATION_VERDICTS = new Set(["pass", "fail", "blocked"]);
+const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
+
+/**
+ * TEAM-3992 Q4 — validate a caller-supplied `verification` block before it is
+ * persisted or turned into a durable record. Returns a NORMALIZED copy (kind /
+ * verdict lower-cased, sha lower-cased) or throws a specific error naming the bad
+ * field. A malformed block must never be silently dropped — a fix that reports a
+ * garbage verification would otherwise look re-verified to the SHA-pinned gate.
+ */
+function validateVerification(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) {
+    throw new Error("verification must be an object");
+  }
+  const target = typeof v.target_ticket_id === "string" ? v.target_ticket_id.trim() : "";
+  if (!target) throw new Error("verification.target_ticket_id is required");
+  const kind = typeof v.kind === "string" ? v.kind.trim().toLowerCase() : "";
+  if (!VERIFICATION_KINDS.has(kind)) {
+    throw new Error(`verification.kind must be one of review|qa|ci (got ${JSON.stringify(v.kind)})`);
+  }
+  const verdict = typeof v.verdict === "string" ? v.verdict.trim().toLowerCase() : "";
+  if (!VERIFICATION_VERDICTS.has(verdict)) {
+    throw new Error(`verification.verdict must be one of pass|fail|blocked (got ${JSON.stringify(v.verdict)})`);
+  }
+  const headSha = typeof v.head_sha === "string" ? v.head_sha.trim().toLowerCase() : "";
+  if (!SHA_RE.test(headSha)) {
+    throw new Error(`verification.head_sha must be a hex sha of length >= 7 (got ${JSON.stringify(v.head_sha)})`);
+  }
+  const out = { target_ticket_id: target, head_sha: headSha, kind, verdict };
+  if (v.build_id != null) out.build_id = String(v.build_id);
+  if (v.evidence_key != null) out.evidence_key = String(v.evidence_key);
+  return out;
+}
+
+async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, verification, findings }) {
   const owner = await lookupTicketOwner(ticket_id);
   if (!owner) {
     console.warn(`[report_completion] ownership_unverified — could not read ${ticket_id}; proceeding without the assignee check`);
@@ -270,6 +307,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     console.warn(`[report_completion] ownership_unverified — no agent_id supplied for ${ticket_id} (assignee ${owner.assignee || "none"}); cannot verify the caller`);
   }
 
+  // TEAM-3992 Q4 — validate the optional verification block BEFORE any write, so
+  // a malformed block is a hard rejection (never a half-written record). findings
+  // are advisory metadata, persisted as-is when they are an array.
+  const verified = verification != null ? validateVerification(verification) : null;
+  const findingsList = Array.isArray(findings) ? findings : null;
+
+  const completedAt = new Date().toISOString();
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -278,11 +322,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     branch: branch || null,
     commit_sha: commit_sha || null,
     pr_url: pr_url || null,
-    completed_at: new Date().toISOString(),
+    completed_at: completedAt,
     // Server-stamped, LAST, so a caller-supplied `source` cannot survive (F18).
     source: "agent",
     reported_by: agent_id || null,
   };
+  if (verified) report.verification = verified;
+  if (findingsList) report.findings = findingsList;
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
@@ -290,6 +336,34 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     ContentType: "application/json",
   }));
   console.log(`[report_completion] Saved s3://${BUCKET}/${key}`);
+
+  // TEAM-3992 Q4 — durable, SHA-pinned verification record the completion gate
+  // reads without racing the agentTasks harvest. Keyed by target ticket + HEAD sha
+  // + kind, so re-verifying the same fix at the same SHA is idempotent and a later
+  // fix (new SHA) never satisfies an older gate. Requires workflow_id to place it.
+  if (verified && workflow_id) {
+    const recordKey = `workflows/${workflow_id}/shared/verifications/${verified.target_ticket_id}/${verified.head_sha}.${verified.kind}.json`;
+    await s3.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: recordKey,
+      Body: JSON.stringify(
+        {
+          ...verified,
+          findings: findingsList || undefined,
+          verifier_ticket_id: ticket_id,
+          reported_by: agent_id || null,
+          source: "agent",
+          at: completedAt,
+        },
+        null,
+        2
+      ),
+      ContentType: "application/json",
+    }));
+    console.log(`[report_completion] Saved verification record s3://${BUCKET}/${recordKey}`);
+  } else if (verified && !workflow_id) {
+    console.warn(`[report_completion] verification supplied for ${ticket_id} but no workflow_id — durable record NOT written`);
+  }
 
   // Journey log: report_completion received — includes agentId so UI can immediately mark agent done
   await publishJourneyEvent(workflow_id || ticket_id, "workflow.report_completion", {

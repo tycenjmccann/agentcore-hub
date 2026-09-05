@@ -484,6 +484,113 @@ export function shipVerdictOf(entry) {
 }
 
 /**
+ * TEAM-3992 D3.2 — role name (as it appears in a def's ticketDag.fixRearm) → the
+ * verification `kind` a verifier stamps on its report_completion record. review
+ * and ci keep their names; the verification phase's re-verify is a `qa` record
+ * (the QA verifier), so the role "verification" maps to kind "qa". PARITY MIRROR:
+ * src/lib/workflow/completion-evidence.ts FIX_REARM_ROLE_TO_KIND.
+ */
+export const FIX_REARM_ROLE_TO_KIND = Object.freeze({
+  review: "review",
+  ci: "ci",
+  verification: "qa",
+});
+
+/**
+ * SHA-pinning tolerates abbreviation: a 7-char short sha matches its full 40-char
+ * form (CI reports resolvedSourceVersion; a dev may report the short HEAD). Equal
+ * after lower-casing, or — both ≥7 hex chars — one a prefix of the other. Empty
+ * on either side never matches. PARITY MIRROR of the TS twin.
+ */
+function shaMatches(a, b) {
+  const x = String(a || "").toLowerCase();
+  const y = String(b || "").toLowerCase();
+  if (!x || !y) return false;
+  if (x === y) return true;
+  return x.length >= 7 && y.length >= 7 && (x.startsWith(y) || y.startsWith(x));
+}
+
+/**
+ * TEAM-3992 D3.2 — the SHA-pinned fix-verification gate. A fix ticket is only
+ * honestly "done" once the roles its def re-arms (ticketDag.fixRearm[kind]) have
+ * each re-verified the fix AT THE FIX'S FINAL SHA and passed. This is what stops
+ * the TEAM-2811 / sffzti class of false-green: a reviewer approves fix commit Y,
+ * the dev pushes Z to answer a later finding, and the run closes on the stale
+ * approval — the review of record was never against the code that shipped.
+ *
+ * For every DONE fix ticket (`spawnedBy.kind ∈ FIX_KINDS`, and NOT itself a
+ * re-arm ticket — a re-arm carries `spawnedBy.rearmOf` and is the verifier, not a
+ * fix to be re-verified) whose kind re-arms at least one role:
+ *   - no final SHA harvested onto its agentTasks entry (`commitSha`) → the fix
+ *     never reported where it landed; reported as missingKinds ["commitSha"].
+ *   - else, for each role in fixRearm[kind] (mapped to a verification kind), there
+ *     must be SOME agentTasks entry carrying `verification` with
+ *     targetTicketId === <fix>, headSha matching the fix's commitSha, and
+ *     verdict "pass". A missing/failing/stale-SHA verification lists that kind.
+ *
+ * Returns [{ ticketId, commitSha, missingKinds[] }] — empty when every fix is
+ * fully re-verified. A def with no `fixRearm` (non-code defs, or a def that opts
+ * out) makes this inert: it returns []. Pure — plain data in, plain data out.
+ *
+ * @param children   epic child tickets (status + spawnedBy)
+ * @param agentTasks harvested per-ticket metadata (commitSha + verification)
+ * @param fixRearm   the def's ticketDag.fixRearm map (kind → role[])
+ * @param opts       reserved (parity with the evidence/ship gates' signature)
+ */
+export function fixVerificationGaps(children, agentTasks, fixRearm, opts = {}) {
+  void opts;
+  if (!Array.isArray(children) || !fixRearm || typeof fixRearm !== "object") return [];
+  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
+
+  // Index every harvested verification record by the fix ticket it targets.
+  const verifsByTarget = new Map();
+  const byTicketId = new Map();
+  for (const entry of Object.values(tasks)) {
+    if (!entry || typeof entry !== "object") continue;
+    if (typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
+    const v = entry.verification;
+    if (!v || typeof v !== "object") continue;
+    const target = typeof v.targetTicketId === "string" ? v.targetTicketId : "";
+    if (!target) continue;
+    if (!verifsByTarget.has(target)) verifsByTarget.set(target, []);
+    verifsByTarget.get(target).push(v);
+  }
+
+  const gaps = [];
+  for (const t of children) {
+    if (!t || t.type === "epic") continue;
+    if (String(t.status || "").toLowerCase() !== "done") continue;
+    const sb = t.spawnedBy;
+    if (!sb || !FIX_KINDS.has(sb.kind)) continue;
+    if (sb.rearmOf) continue; // a re-arm ticket is a verifier, not a fix
+    const roles = Array.isArray(fixRearm[sb.kind]) ? fixRearm[sb.kind] : [];
+    if (roles.length === 0) continue; // this kind re-arms nothing
+    const ticketId = String(t.ticketId || "");
+    const entry = tasks[ticketId] || byTicketId.get(ticketId);
+    const commitSha =
+      typeof entry?.commitSha === "string" && entry.commitSha.trim() ? entry.commitSha.trim() : "";
+    if (!commitSha) {
+      gaps.push({ ticketId, commitSha: null, missingKinds: ["commitSha"] });
+      continue;
+    }
+    const records = verifsByTarget.get(ticketId) || [];
+    const missingKinds = [];
+    for (const role of roles) {
+      const kind = FIX_REARM_ROLE_TO_KIND[role] || role;
+      const passed = records.some(
+        (v) =>
+          shaMatches(v.headSha, commitSha) &&
+          v.kind === kind &&
+          String(v.verdict || "").toLowerCase() === "pass"
+      );
+      if (!passed && !missingKinds.includes(kind)) missingKinds.push(kind);
+    }
+    if (missingKinds.length > 0) gaps.push({ ticketId, commitSha, missingKinds });
+  }
+  return gaps;
+}
+
+/**
  * TEAM-3747 D2 — decide the ship/CD verdict for a whole run. Given the epic's
  * children, the harvested agentTasks, and the def's ship phases, returns:
  *   {

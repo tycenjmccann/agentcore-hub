@@ -170,6 +170,11 @@ export default defineConfig({
       // (TEAM-3744) so this test never imports index.mjs's module-load AWS
       // client construction; isPipelineEnabled is pure, no I/O.
       "lambda/orchestrator/pipeline-enabled.test.mjs",
+      // fix-rearm (TEAM-3992 D3.1/D3.2) — spawnFixTicketsFromFindings +
+      // rearmVerification from fix-tickets.mjs. Both are dependency-injected
+      // (tickets-Lambda invoke / event / child read / def lookups mocked at the
+      // seam), so the spawn dedupe + SHA-pinned re-arm logic runs with no AWS.
+      "lambda/orchestrator/fix-rearm.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

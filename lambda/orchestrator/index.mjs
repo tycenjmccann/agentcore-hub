@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade, newMetrics as newCascadeMetrics } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, openGateOf, parseCdEvidence, blockReasonWithGate, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, ACCEPTED_SHIP_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, fixVerificationGaps, openGateOf, parseCdEvidence, blockReasonWithGate, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, ACCEPTED_SHIP_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning, checkBranchProtection } from "./repo-check.mjs";
 import { runGateBypassCheck, hasUnackedGateBypass } from "./gate-bypass.mjs";
@@ -54,6 +54,12 @@ import {
   mergeProbeFromPulls,
   mergeProbeFromCompare,
 } from "./evidence.mjs";
+import {
+  spawnFixTicketsFromFindings,
+  rearmVerification,
+  finderKind,
+  FIX_KINDS as FIX_TICKET_KINDS,
+} from "./fix-tickets.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -149,6 +155,16 @@ function resolveCascadeMode(raw) {
 const COMPLETION_EVIDENCE_REQUIRED = !/^(off|false|0)$/i.test(
   (process.env.COMPLETION_EVIDENCE_REQUIRED || "").trim()
 );
+// TEAM-3992 Q4 — SHA-pinned fix-verification gate mode. enforce (default): a done
+// fix ticket that was not re-verified at its FINAL commit SHA blocks completion.
+// shadow: emit the completion_blocked event but do NOT block. off: skip entirely.
+// Fail-closed like COMPLETION_EVIDENCE_REQUIRED — any unrecognized value enforces.
+const FIX_VERIFICATION_REQUIRED = (() => {
+  const v = (process.env.FIX_VERIFICATION_REQUIRED || "").trim().toLowerCase();
+  if (v === "off") return "off";
+  if (v === "shadow") return "shadow";
+  return "enforce";
+})();
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
@@ -282,6 +298,11 @@ export async function loadWorkflowDefs() {
         completionRequiresAgentPhases: w.completionRequiresAgentPhases || [],
         reviewGates: w.reviewGates || [],
         phaseOrder: order,
+        // TEAM-3992 — carry the DAG template through so the fix-verification gate
+        // (ticketDag.fixRearm) and fix-ticket spawn can read it. Dropping it here
+        // silently made the SHA-pinned gate inert.
+        ticketDag: w.ticketDag || null,
+        phases: w.phases || [],
       };
     }
     console.log(`[orchestrator] Loaded ${Object.keys(_workflowDefs).length} workflow definitions from S3`);
@@ -763,6 +784,10 @@ export async function handleTicketDoneUnified(ticketId) {
     ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id,
     ...(bypass?.bypasses > 0 ? { gateBypass: true } : {}),
   });
+
+  // TEAM-3992 D3.1/D3.2 — spawn fix tickets from any findings this verifier
+  // reported, and re-arm SHA-pinned verification if this ticket itself is a fix.
+  await runFixTicketMachinery(workflow, ticket);
 
   // Always check workflow completion — the last ticket to close triggers this
   if (await isWorkflowComplete(parentId, workflow, assignee)) {
@@ -1413,6 +1438,24 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     }
     if (record.block_reason && !entry?.blockReason) {
       fields.blockReason = String(record.block_reason).slice(0, 500);
+    }
+    // TEAM-3992 Q4 — SHA-pinned verification record onto the VERIFIER's task, so
+    // fixVerificationGaps can prove a fix was re-verified at its final SHA without
+    // an S3 read. workflow-output already validated the shape + wrote the durable
+    // record; we mirror it flat (one scoped SET) as agentTasks.<verifier>.verification.
+    const v = record.verification;
+    if (v && typeof v === "object" && typeof v.target_ticket_id === "string" && typeof v.head_sha === "string") {
+      const headSha = v.head_sha.trim().toLowerCase();
+      const kind = String(v.kind || "").trim().toLowerCase();
+      fields.verification = {
+        targetTicketId: v.target_ticket_id,
+        headSha,
+        kind,
+        verdict: String(v.verdict || "").trim().toLowerCase(),
+        recordKey: `workflows/${workflow.id}/shared/verifications/${v.target_ticket_id}/${headSha}.${kind}.json`,
+        at: record.completed_at || new Date().toISOString(),
+      };
+      if (v.build_id != null) fields.verification.buildId = String(v.build_id);
     }
     if (Object.keys(fields).length === 0) return;
     await store.mergeTaskMetadata(workflow.id, ticketId, fields);
@@ -2739,6 +2782,17 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
         updatedAt: t?.updatedAt || new Date().toISOString(),
       },
     });
+    // TEAM-3992 D3.1 — a persona-created fix ticket (a verifier that filed its own
+    // fix, not the orchestrator) still carries spawnedBy; surface it on the same
+    // event stream as orchestrator-spawned fixes so the journal attributes both.
+    const sb = t?.spawnedBy;
+    if (sb && FIX_TICKET_KINDS.has(sb.kind) && !sb.rearmOf && sb.by !== "orchestrator") {
+      const originKey = ["gateTicketId", "qaTicketId", "codexTicketId"].find((k) => sb[k]);
+      await publishEvent(parentId, "orchestrator.fix_spawned", {
+        workflowId: workflow.id, ticketId, originTicketId: originKey ? sb[originKey] : null,
+        kind: sb.kind, assignee, findingId: sb.findingId || null, by: "agent",
+      });
+    }
   } catch (err) {
     console.warn(`[orchestrator] ticket.created publish failed for ${ticketId}:`, err.message);
   }
@@ -2801,6 +2855,15 @@ export async function handleTicketDone(ticketId, image) {
     ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id,
     ...(bypass?.bypasses > 0 ? { gateBypass: true } : {}),
   });
+
+  // TEAM-3992 D3.1/D3.2 — fix-ticket spawn + verification re-arm, symmetric with
+  // the webhook twin. Load the normalized ticket so spawnedBy/title are available.
+  try {
+    const ticket = await getTicket(ticketId);
+    if (ticket) await runFixTicketMachinery(workflow, ticket);
+  } catch (err) {
+    console.warn(`[orchestrator] fix-ticket machinery skipped for ${ticketId}: ${err?.message || err}`);
+  }
 
   // Check if workflow is complete (all tickets done)
   if (unblocked.length === 0) {
@@ -3011,6 +3074,41 @@ async function notifyCompletionBlockedOnce(workflow, offenders) {
     return true;
   } catch (err) {
     console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
+}
+
+/**
+ * TEAM-3992 Q4 — one manager_escalation per run stranded on the SHA-pinned fix
+ * gate: "a fix ticket is Done but was never re-verified at its final commit".
+ * Idempotent on notification id (twin of notifyCompletionBlockedOnce); re-driving
+ * any ticket re-runs the gate, and once the re-verification records land the run
+ * completes and the escalation is history.
+ */
+async function notifyFixUnverifiedOnce(workflow, offenders) {
+  const id = `notif_fix_unverified_${workflow.id}`;
+  const list = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
+  if (list.some((n) => n.id === id && !n.acknowledged)) return false;
+  const detail = offenders
+    .map((o) => `${o.ticketId}@${o.commitSha || "no-sha"} needs ${o.missingKinds.join("/")}`)
+    .join("; ");
+  try {
+    await publishEvent(workflow.epicId, "workflow.completion_blocked", {
+      workflowId: workflow.id, reason: "fix_unverified", offenders,
+    });
+    await store.appendNotification(workflow.id, {
+      id,
+      type: "manager_escalation",
+      title: "Run cannot complete: fix not re-verified at its final commit",
+      details: `A fix ticket closed Done but its final commit was not re-verified by every required gate: ${detail}. The re-verify (re-arm) tickets must report a passing verification pinned to that SHA. Re-Done any ticket to re-check once the re-verification lands; or set FIX_VERIFICATION_REQUIRED=off to opt out.`,
+      reviewer: "completion-gate",
+      timestamp: new Date().toISOString(),
+      acknowledged: false,
+    });
+    console.log(`[orchestrator] ${workflow.id}: completion blocked on fix verification — manager_escalation appended (${detail})`);
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] ${workflow.id}: fix-unverified notification failed (non-fatal): ${err?.message || err}`);
     return false;
   }
 }
@@ -3301,6 +3399,46 @@ export async function completeWorkflow(workflow) {
     }
   } catch (err) {
     console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
+  }
+
+  // TEAM-3992 Q4/D3.2 — SHA-pinned fix-verification gate. Runs AFTER the evidence
+  // gate (so the run has real deliverables) and BEFORE the ship verdict. Every done
+  // fix ticket must carry a passing verification record pinned to its FINAL commit
+  // SHA for each role its kind re-arms — proof the fix was re-reviewed/re-CI'd/re-QA'd
+  // at the code that actually landed, not an earlier iteration. Inert when the def
+  // declares no ticketDag.fixRearm. Fail-closed (enforce default); shadow only
+  // events; off skips. The check itself never throws a completion — a failure to
+  // read only tightens when it can prove a gap.
+  if (FIX_VERIFICATION_REQUIRED !== "off") {
+    try {
+      const fixRearm = getWorkflowDef(workflow?.workflowDefId)?.ticketDag?.fixRearm;
+      if (fixRearm && typeof fixRearm === "object") {
+        const children = await getChildTickets(workflow.epicId);
+        const freshWf = await store.getWorkflow(workflow.id);
+        const gaps = fixVerificationGaps(
+          children, freshWf?.agentTasks || workflow.agentTasks || {}, fixRearm
+        );
+        if (gaps.length > 0) {
+          if (FIX_VERIFICATION_REQUIRED === "enforce") {
+            console.error(
+              `[orchestrator] CompletionRejectedFixUnverified ${workflow.id}: ` +
+              gaps.map((g) => `${g.ticketId}(${g.missingKinds.join("/")})`).join(", ")
+            );
+            await notifyFixUnverifiedOnce(freshWf || workflow, gaps);
+            return;
+          }
+          console.warn(
+            `[orchestrator] ${workflow.id} would be blocked for fix_unverified (shadow): ` +
+            gaps.map((g) => `${g.ticketId}(${g.missingKinds.join("/")})`).join(", ")
+          );
+          await publishEvent(workflow.epicId, "workflow.completion_blocked", {
+            workflowId: workflow.id, reason: "fix_unverified", offenders: gaps, shadow: true,
+          });
+        }
+      }
+    } catch (err) {
+      console.warn(`[orchestrator] fix-verification check skipped for ${workflow.id}: ${err?.message || err}`);
+    }
   }
 
   // ── TEAM-3760: TWO ship gates run here, in this order, both at full strength.
@@ -3818,6 +3956,18 @@ async function buildAgentContext(ticket, workflow) {
   context += `epic_id: ${workflow.epicId}\n`;
   context += `ticket_id: ${ticket.ticketId}\n\n`;
 
+  // TEAM-3992 D3.2 — a re-arm ticket re-verifies a fix at a PINNED commit SHA.
+  // The completion gate matches the verification record to that SHA, so the agent
+  // must report it. rearmOf/headSha are stamped on the ticket's spawnedBy.
+  const rearm = ticket.spawnedBy?.rearmOf ? ticket.spawnedBy : null;
+  if (rearm) {
+    context += `## Re-verification (REQUIRED report)\n`;
+    context += `You are re-verifying fix ${rearm.rearmOf} at HEAD ${rearm.headSha}.\n`;
+    context += `In report_completion you MUST include a verification object pinned to that commit:\n`;
+    context += `  verification: { target_ticket_id: "${rearm.rearmOf}", head_sha: "${rearm.headSha}", kind: "<review|qa|ci>", verdict: "<pass|fail|blocked>" }\n`;
+    context += `Use the kind for your role (code review = review, QA = qa, CI = ci). For CI, head_sha is the resolvedSourceVersion from Pipeline___get_build_status. Optionally add findings[].\n\n`;
+  }
+
   // Shipped laptop session: the requester planned this work in a live coding
   // session and shipped it here. Visible to EVERY agent — the transcript is the
   // authoritative context, and the branch already carries in-flight work.
@@ -4251,6 +4401,93 @@ async function getChildTickets(parentId) {
     ExpressionAttributeValues: { ":pid": parentId },
   }));
   return result.Items || [];
+}
+
+// ─── Fix-ticket machinery (TEAM-3992 D3.1/D3.2) ──────────────────────────────
+
+/**
+ * Invoke a tickets-Lambda tool op and return a flat result object. Injects a
+ * default project_key for create_ticket (nextTicketId needs it). Throws on a
+ * structured { error } so callers log-and-skip rather than silently no-op.
+ */
+async function invokeTicketsOp(op, params) {
+  const parameters = { ...params };
+  if (op === "create_ticket" && !parameters.project_key) {
+    parameters.project_key =
+      (parameters.parent_key && String(parameters.parent_key).split("-")[0]) ||
+      process.env.PROJECT_KEY ||
+      "TEAM";
+  }
+  const res = await lambda.send(new InvokeCommand({
+    FunctionName: TICKET_TOOLS_LAMBDA,
+    Payload: JSON.stringify({ tool_name: `Tickets___${op}`, parameters }),
+  }));
+  let payload = JSON.parse(new TextDecoder().decode(res.Payload));
+  // Some ops return the MCP { content:[{text}] } envelope — unwrap a JSON body.
+  if (payload && payload.content && Array.isArray(payload.content) && payload.content[0]?.text && !payload.key) {
+    try { payload = JSON.parse(payload.content[0].text); } catch { /* keep envelope */ }
+  }
+  if (payload?.error) throw new Error(payload.error);
+  return payload;
+}
+
+/** The dev agent a fix ticket should be assigned to (development-phase agent). */
+function resolveDevAssignee(workflow, children) {
+  const devChild = (children || []).find((t) => getAgentDef(t?.assignee)?.phase === "development");
+  if (devChild) return devChild.assignee;
+  const def = getWorkflowDef(workflow.workflowDefId);
+  const roster = (_agentRoster || FALLBACK_ROSTER).filter(
+    (a) =>
+      a.phase === "development" &&
+      (a.workflowDefIds || [a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID]).includes(def.id)
+  );
+  return roster[0]?.agentId || "agentcore_hub_backend_dev";
+}
+
+/**
+ * On a ticket's done: (1) if it carries a verifier's `findings`, spawn one fix
+ * ticket per component; (2) if it IS a fix ticket, re-arm SHA-pinned verification.
+ * Best-effort — reads the completion record for findings + the final commit sha,
+ * so it never depends on harvest ordering. Wired into BOTH done handlers.
+ */
+async function runFixTicketMachinery(workflow, ticket) {
+  if (!workflow || !ticket?.ticketId || !ARTIFACT_BUCKET) return;
+  // Only a VERIFIER's done ticket can carry findings (→ spawn), and only a FIX
+  // ticket re-arms verification. An ordinary dev/ship done ticket does neither, so
+  // skip the completion-record read entirely for it — this preserves the harvest's
+  // "no S3 read when evidence is already present" fast path (evidence-harvest test).
+  const sb = ticket.spawnedBy;
+  const isFinder = finderKind(ticket.assignee) != null;
+  const isFix = !!(sb && FIX_TICKET_KINDS.has(sb.kind) && !sb.rearmOf);
+  if (!isFinder && !isFix) return;
+
+  let record = null;
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET, Key: `completions/${ticket.ticketId}.json`,
+    }));
+    record = JSON.parse(await res.Body.transformToString());
+  } catch { /* no completion record — nothing to spawn from */ }
+
+  const deps = {
+    invokeTickets: invokeTicketsOp,
+    publishEvent,
+    getChildTickets,
+    getWorkflowDef,
+    getAgentDef,
+    resolveDevAssignee,
+    commitShaOf: (tid) =>
+      (record && record.commit_sha) || workflow.agentTasks?.[tid]?.commitSha || "",
+  };
+
+  if (record && Array.isArray(record.findings) && record.findings.length > 0) {
+    try { await spawnFixTicketsFromFindings(workflow, ticket, record, deps); }
+    catch (err) { console.warn(`[orchestrator] fix spawn failed for ${ticket.ticketId}: ${err?.message || err}`); }
+  }
+  if (isFix) {
+    try { await rearmVerification(workflow, ticket, deps); }
+    catch (err) { console.warn(`[orchestrator] re-arm failed for ${ticket.ticketId}: ${err?.message || err}`); }
+  }
 }
 
 // ─── Jira Ticket Provider ─────────────────────────────────────────────────────
