@@ -377,6 +377,57 @@ describe("validateIntakeSources — S3 error detail carries no SDK placeholder (
         "bucket policy grant, or upload the object to the hub artifacts bucket instead"
     );
   });
+
+  // TEAM-4105 (TEAM-4089 follow-up): QA proved the REAL live shape is name
+  // "Unknown" (not "403") — a bare placeholder the SDK also uses on the NAME
+  // slot. UNINFORMATIVE_ERROR_NAMES held "UnknownError" but not "Unknown", and
+  // the name slot did a raw Set.has() instead of going through the same
+  // normalizing check as the message slot, so "Unknown" rode along as an extra.
+  it('the real live shape (name "Unknown", message "UnknownError") reports no "unknown" at all', async () => {
+    const c = only(
+      await denied(Object.assign(new Error("UnknownError"), { name: "Unknown", $metadata: { httpStatusCode: 403 } }))
+    );
+    expect(c.outcome).toBe("transient");
+    expect(c.verification.status).toBe("unverified");
+    expect(c.detail).toContain("HeadObject");
+    expect(c.detail).toContain("AccessDenied");
+    expect(c.detail).toContain("403");
+    expect(c.detail).toContain("validator role has no read access");
+    expect(c.detail!.toLowerCase()).not.toContain("unknown");
+  });
+
+  it('name "Unknown" AND message "Unknown" together report no "unknown" at all', async () => {
+    const c = only(
+      await denied(Object.assign(new Error("Unknown"), { name: "Unknown", $metadata: { httpStatusCode: 403 } }))
+    );
+    expect(c.outcome).toBe("transient");
+    expect(c.detail).toContain("HeadObject");
+    expect(c.detail).toContain("AccessDenied");
+    expect(c.detail).toContain("403");
+    expect(c.detail).toContain("validator role has no read access");
+    expect(c.detail!.toLowerCase()).not.toContain("unknown");
+  });
+
+  it("a case variant on the name slot (\"UNKNOWN\" / \"unknown error\") is still dropped", async () => {
+    const c = only(
+      await denied(Object.assign(new Error("unknown error"), { name: "UNKNOWN", $metadata: { httpStatusCode: 403 } }))
+    );
+    expect(c.outcome).toBe("transient");
+    expect(c.detail).toContain("HeadObject");
+    expect(c.detail).toContain("AccessDenied");
+    expect(c.detail).toContain("403");
+    expect(c.detail).toContain("validator role has no read access");
+    expect(c.detail!.toLowerCase()).not.toContain("unknown");
+  });
+
+  it('a name-slot "Unknown" on a 404 is still definitive, with no "unknown" in the detail', async () => {
+    const c = only(
+      await denied(Object.assign(new Error("UnknownError"), { name: "Unknown", $metadata: { httpStatusCode: 404 } }))
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(c.detail).toContain("NotFound (404)");
+    expect(c.detail!.toLowerCase()).not.toContain("unknown");
+  });
 });
 
 // ─── (e) transient vs definitive elsewhere ──────────────────────────────────

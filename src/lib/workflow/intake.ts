@@ -350,11 +350,16 @@ async function checkS3Source(
     }
 
     // "UnknownError" and "Unknown" are the bodiless-HEAD artefacts — neither may
-    // ever reach the operator (see isUninformativeMessage). Anything genuinely
-    // informative ("must be addressed using the specified endpoint…", a
-    // credentials or ECONNREFUSED text) still rides along.
+    // ever reach the operator. Both the name and message slots go through the
+    // same normalizing check (see isUninformativeMessage) rather than a raw Set
+    // lookup — TEAM-4105: UNINFORMATIVE_ERROR_NAMES holds "UnknownError" but not
+    // the bare "Unknown" the SDK also produces, so the raw .has() let it through.
+    // Anything genuinely informative ("must be addressed using the specified
+    // endpoint…", a credentials or ECONNREFUSED text) still rides along.
     const extras: string[] = [];
-    if (rawName && rawName !== errName && !UNINFORMATIVE_ERROR_NAMES.has(rawName)) extras.push(rawName);
+    if (rawName && rawName !== errName && !isUninformativeMessage(rawName, { errName, rawName: "", status })) {
+      extras.push(rawName);
+    }
     if (!isUninformativeMessage(rawMessage, { errName, rawName, status })) extras.push(rawMessage);
 
     const detail =
