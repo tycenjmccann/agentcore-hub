@@ -19,6 +19,7 @@ import {
   UpdateRoutineInputSchema,
   DeleteRoutineInputSchema,
   RunRoutineInputSchema,
+  MAX_INTAKE_SOURCES,
 } from "./schemas.js";
 
 // --- Response helpers ---
@@ -96,7 +97,8 @@ export const WORKFLOW_TOOLS = [
         sources: {
           type: "array",
           description:
-            "Reference material for the requirements agent. Each item: {type, value, label?, contentType?}. type \"s3\" -> value is s3://bucket/key (the hub's own artifacts bucket is HEAD-checked with the hub's task role; EXTERNAL buckets are also HeadObject-checked and the hub account must be granted read via bucket policy — otherwise the source is accepted but marked unverified and pipeline agents will not be able to read it). type \"url\" -> https URL, INCLUDING presigned S3/CloudFront URLs: must be GET-signed (the validator issues a GET with Range: bytes=0-0, never HEAD), lifetime <= 7 days (S3 max), and MUST still be valid when pipeline agents read it later in the run (hours after submit) — not just at submit time. type \"upload\" -> content is in-memory / inline and is not network-validated. Validation is lenient by default (SOURCE_VALIDATION_MODE=lenient): unreachable-but-plausible sources (403, timeouts, 5xx) are accepted and marked verification.status=\"unverified\"; only definitive failures (malformed s3://, S3 404/NoSuchKey, URL 404/410) reject the submission with 422. `verification` is output-only and is overwritten by the server.",
+            "Reference material for the requirements agent. Each item: {type, value, label?, contentType?}. type \"s3\" -> value is s3://bucket/key (the hub's own artifacts bucket is HEAD-checked with the hub's task role; EXTERNAL buckets are also HeadObject-checked and the hub account must be granted read via bucket policy — otherwise the source is accepted but marked unverified and pipeline agents will not be able to read it). type \"url\" -> https URL, INCLUDING presigned S3/CloudFront URLs: must be GET-signed (the validator issues a GET with Range: bytes=0-0, never HEAD), lifetime <= 7 days (S3 max), and MUST still be valid when pipeline agents read it later in the run (hours after submit) — not just at submit time. type \"upload\" -> content is in-memory / inline and is not network-validated. Validation is lenient by default (SOURCE_VALIDATION_MODE=lenient): unreachable-but-plausible sources (403, timeouts, 5xx) are accepted and marked verification.status=\"unverified\"; only definitive failures (malformed s3://, S3 404/NoSuchKey, URL 404/410) reject the submission with 422. `verification` is output-only and is overwritten by the server. " +
+            `At most ${MAX_INTAKE_SOURCES} sources per submission.`,
           items: {
             type: "object",
             required: ["type", "value"],
@@ -117,6 +119,7 @@ export const WORKFLOW_TOOLS = [
               },
             },
           },
+          maxItems: MAX_INTAKE_SOURCES,
           default: [],
         },
         modelOverride: {
@@ -278,7 +281,8 @@ export const WORKFLOW_TOOLS = [
             sources: {
               type: "array",
               description:
-                "Reference material for the requirements agent. Each item: {type, value, label?, contentType?}. type \"s3\" -> value is s3://bucket/key (the hub's own artifacts bucket is HEAD-checked with the hub's task role; EXTERNAL buckets are also HeadObject-checked and the hub account must be granted read via bucket policy — otherwise the source is accepted but marked unverified and pipeline agents will not be able to read it). type \"url\" -> https URL, INCLUDING presigned S3/CloudFront URLs: must be GET-signed (the validator issues a GET with Range: bytes=0-0, never HEAD), lifetime <= 7 days (S3 max), and MUST still be valid when pipeline agents read it later in the run (hours after submit) — not just at submit time. type \"upload\" -> content is in-memory / inline and is not network-validated. Validation is lenient by default (SOURCE_VALIDATION_MODE=lenient): unreachable-but-plausible sources (403, timeouts, 5xx) are accepted and marked verification.status=\"unverified\"; only definitive failures (malformed s3://, S3 404/NoSuchKey, URL 404/410) reject the submission with 422. `verification` is output-only and is overwritten by the server.",
+                "Reference material for the requirements agent. Each item: {type, value, label?, contentType?}. type \"s3\" -> value is s3://bucket/key (the hub's own artifacts bucket is HEAD-checked with the hub's task role; EXTERNAL buckets are also HeadObject-checked and the hub account must be granted read via bucket policy — otherwise the source is accepted but marked unverified and pipeline agents will not be able to read it). type \"url\" -> https URL, INCLUDING presigned S3/CloudFront URLs: must be GET-signed (the validator issues a GET with Range: bytes=0-0, never HEAD), lifetime <= 7 days (S3 max), and MUST still be valid when pipeline agents read it later in the run (hours after submit) — not just at submit time. type \"upload\" -> content is in-memory / inline and is not network-validated. Validation is lenient by default (SOURCE_VALIDATION_MODE=lenient): unreachable-but-plausible sources (403, timeouts, 5xx) are accepted and marked verification.status=\"unverified\"; only definitive failures (malformed s3://, S3 404/NoSuchKey, URL 404/410) reject the submission with 422. `verification` is output-only and is overwritten by the server. " +
+                `At most ${MAX_INTAKE_SOURCES} sources per submission.`,
               items: {
                 type: "object",
                 required: ["type", "value"],
@@ -299,6 +303,7 @@ export const WORKFLOW_TOOLS = [
                   },
                 },
               },
+              maxItems: MAX_INTAKE_SOURCES,
             },
             connectors: {
               type: "array",
