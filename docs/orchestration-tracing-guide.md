@@ -227,15 +227,55 @@ it detects or recovers from a failure. Grep for them when a run looks stuck:
 | `workflow.cd_unmerged` | orchestrator completion gate | Ship merge-verify refused to finalize the run — the feature branch is provably unmerged (`SHIP_MERGE_VERIFY=off` opts out) |
 
 The dead-session sweep runs on a `rate(5 minutes)` EventBridge schedule
-(`DEAD_SESSION_DETECTOR_MODE`: `off` | `shadow` (default, observe-only) |
-`enforce`). A second scheduled backstop, the missed-unblock **reconciliation
-sweep** (`reconcile-sweep.mjs`, `RECONCILE_SWEEP_MODE`: `off` (default, dark) |
-`shadow` | `enforce`), re-drives dependents whose blockers all resolved but who
+(`DEAD_SESSION_DETECTOR_MODE`: `off` | `shadow` (observe-only) | `enforce`
+(default)). A second scheduled backstop, the missed-unblock **reconciliation
+sweep** (`reconcile-sweep.mjs`, `RECONCILE_SWEEP_MODE`: `off` (dark) | `shadow` |
+`enforce` (default)), re-drives dependents whose blockers all resolved but who
 never re-Readied; it logs `reconcile.recover` / `reconcile.would_recover` lines
 rather than events, and its recoveries surface as the cascade events above. The
 detector, cascade, and review-cap all emit EMF metrics into the
 `AgentCoreHub/Orchestrator` CloudWatch namespace — chart those alongside the
 events when auditing sweep behavior.
+
+### Operator parameters — effective modes
+
+Every recovery/guard behavior above is behind a mode flag. All of them ship
+**armed** except the two that are dark for a stated reason, and the deployed
+value is visible without reading code: on each cold start the orchestrator logs
+one `orchestrator.effective_modes` line naming every flag, plus one EMF datum per
+flag (`ModeEnforce_<FLAG>` = 1 when acting, 0 when `off`/`shadow`) in
+`AgentCoreHub/Orchestrator`. Alarm on the 0s you did not choose.
+
+Three layers decide a flag, and they must agree — the code default in
+`lambda/orchestrator/index.mjs`, the `template.yaml` parameter `Default`, and what
+`deploy.sh` forwards. `deploy.sh` is the layer that decides production here (it
+uses `aws lambda update-function-configuration --environment`, which **replaces**
+the whole variable map — an omitted var is deleted from the function and the code
+default silently wins), so it now forwards every flag unconditionally with its
+default. `lambda/orchestrator/mode-defaults.test.mjs` fails if the three drift.
+
+| Flag | Default | What it gates | How to verify |
+|------|---------|---------------|---------------|
+| `DEAD_SESSION_DETECTOR_MODE` | `enforce` | Dead/stalled claim salvage: steal a stale claim, re-dispatch once, then escalate (D1.2 / D4.3). `shadow` returns before every write | `ModeEnforce_DEAD_SESSION_DETECTOR_MODE`=1; `agent.escalated` / `dead_session.shadow` events; sweep summary carries `mode` |
+| `RECONCILE_SWEEP_MODE` | `enforce` | Missed-unblock backstop: re-drive stalled dependents, retry outstanding epic roll-ups (D2.3), re-evaluate gate-bypass flags, and absorb F7's truncated recompute remainder | `ModeEnforce_RECONCILE_SWEEP_MODE`=1; `ReconcileMode` EMF dimension + `reconcile.recover` log lines |
+| `GATE_BYPASS_MODE` | `enforce` | Merge-without-approval detection: flag the task, push the ticket back to `in_review`, escalate per offending merge, hold the run open until acked (D1.1) | `ModeEnforce_GATE_BYPASS_MODE`=1; `workflow.gate_bypass` events |
+| `FIX_VERIFICATION_REQUIRED` | `enforce` | SHA-pinned fix re-verification at completion (Q4/D3.2). Inert unless the run's def declares `ticketDag.fixRearm` | `ModeEnforce_FIX_VERIFICATION_REQUIRED`=1; `workflow.completion_blocked` reason `fix_unverified` |
+| `COMPLETION_EVIDENCE_REQUIRED` | `enforce` (no CFN parameter) | Completion evidence gate: a run cannot close green over work with no completion record | `ModeEnforce_COMPLETION_EVIDENCE_REQUIRED`=1; `workflow.completion_blocked` |
+| `SHIP_MERGE_VERIFY` | on (`off`/`false`/`0` opts out) | Ship merge-verify: a ship-phase run cannot finalize while its branch is provably unmerged | `ModeEnforce_SHIP_MERGE_VERIFY`=1; `workflow.cd_unmerged` events |
+| `CASCADE_EXTENDED_STATES` | `off` — **dark on purpose** | Extended cascade states (re-wake `in_progress`/`in_review` dependents). Left dark: its `shadow` path is not read-free (blocker-confirm + lease reads precede the no-write check), and the enforcing reconcile sweep covers the same stalls under the same lease floor | `ModeEnforce_CASCADE_EXTENDED_STATES`=0 is the expected value |
+| `OTEL_ACTIVITY_CONFIRM` | `off` — **dark on purpose** | Confirms a soft-stale claim against `aws/spans` before stealing (D4.3). Left dark: the hard ceiling (2× the soft timeout) is already the safe backstop, and confirming costs Logs Insights queries per sweep. IAM (`logs:StartQuery`/`GetQueryResults`) is granted unconditionally, so flipping it needs no redeploy | `ModeEnforce_OTEL_ACTIVITY_CONFIRM`=0 is the expected value |
+| `CODING_AGENT_RUNTIME_ARN` | unset — gate **off** | Coding-runtime health gate + auto-resume (D4.2). Cannot be defaulted on: `bedrock-agentcore:InvokeAgentRuntime` is granted only under the `HasCodingRuntime` condition, i.e. only once an ARN is supplied | `ModeEnforce_CODING_RUNTIME_GATE`=1 once the ARN is set |
+| `RECOMPUTE_MAX_CANDIDATES` / `RECOMPUTE_BUDGET_MS` | `50` / `20000` | Bounds on the run-wide sibling recompute (F7) — candidates per trigger and wall-clock per invocation. Overflow emits `orchestrator.recompute` with `truncated` / `budgetExceeded`; the reconcile sweep takes the remainder | Grep `orchestrator.recompute` for `truncated:true` / `budgetExceeded:true` — steady non-zero means raise the cap or shrink the graph |
+
+To read the modes a deployed function is actually running:
+
+```bash
+aws lambda get-function-configuration --function-name agentcore-hub-orchestrator \
+  --query 'Environment.Variables.{detector:DEAD_SESSION_DETECTOR_MODE,reconcile:RECONCILE_SWEEP_MODE,gateBypass:GATE_BYPASS_MODE,fixVerify:FIX_VERIFICATION_REQUIRED}'
+```
+
+A flag missing from that map is the failure this table exists to prevent: the
+function falls back to its code default, and nothing in the stack says so.
 
 ---
 

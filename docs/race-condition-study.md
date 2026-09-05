@@ -386,3 +386,51 @@ conditional on the state it inferred still holding, and the conditional writes m
 that the authoritative record is the first thing contended for. Every actor that can perform the
 same inference needs one claim between them, and that claim needs an explicit release policy —
 released while the obligation is still outstanding, kept once it is discharged.
+
+## Addendum (2026-09-05): a backstop needs a budget — bounding the sibling recompute
+
+TEAM-4099 F7. D2.1's `recomputeRun` re-asks the dispatch invariant of EVERY sibling of a run
+whenever something terminal happens (`agent.complete`, `review.approved`, an escalation decision).
+That is the right question to ask; the cost of asking it was unbounded in three separate dimensions,
+inside an invocation that is not free to spend.
+
+The budget it spends against: `template.yaml`'s `OrchestratorFunction` has `Timeout: 60` (the
+`Globals` 900 is overridden) and `MemorySize: 256`, and the DDB-stream trigger has `BatchSize: 10`.
+So one invocation can carry ten terminal records, and each of them already owns a done-cascade, a
+completion check, fix verification and the gate-bypass check *before* the recompute runs. The
+recompute is the last thing in that chain and the only part with no natural ceiling.
+
+What was unbounded, and what bounds it now:
+
+1. **Reads.** Every still-open sibling with blockers cost one serial `getTicket` PER BLOCKER
+   (`checkAllBlockersResolved`), for information the sibling rows already carried. Measured on a
+   100-sibling epic with 5 blockers each: **500 single-ticket reads** before, **0** after. Blockers
+   now resolve against a `Map` built once from the single `getChildTickets` query; only a blocker
+   MISSING from that snapshot (cross-epic, or deleted) falls back to a `getTicket`, memoized per id,
+   so the read count is at most the number of DISTINCT foreign blockers.
+   Note what was *not* done: putting a `Limit` on the child query. That query is shared with the
+   cascade and the sweep, and a `Limit` would silently shorten *their* view of the run — a
+   correctness change dressed as a bound. (Its real latent gap is the missing `LastEvaluatedKey`
+   pagination past 1 MB, which is a separate issue.) The bound belongs at the candidate level.
+2. **Candidates.** `RECOMPUTE_MAX_CANDIDATES` (default 50) reconciles at most that many siblings.
+3. **Wall clock.** `RECOMPUTE_BUDGET_MS` (default 20000 — a third of the timeout) is checked before
+   each `reconcileDependent`.
+
+Both bounds are per INVOCATION, not per call: they live in module scope (the Node Lambda runtime
+runs one invocation at a time per container, so module scope *is* invocation scope) and are reset at
+the top of `handler`. A per-call budget would have been useless here — ten records would stack ten
+budgets and run 200 seconds inside a 60-second function. For the same reason a `(workflow, trigger)`
+pair recomputes once per invocation: a batch carrying two terminal records for the same run used to
+run the identical whole-run backstop twice, and the second record's own cascade still fans out
+normally.
+
+Hitting either bound is not silent — `orchestrator.recompute` carries `truncated: true` / `cap`, or
+`budgetExceeded: true` / `budgetMs`, and the event is published even when nothing was reconciled,
+because "part of this run was left to the sweep" is exactly what an operator needs to see. Leaving
+the remainder to the reconcile sweep is safe by construction: the sweep asks the same question
+through the same `cascade.reconcileDependent` (R3), on a 5-minute schedule, which is what it is for.
+
+Generalized: a backstop that runs on every signal is a load amplifier. It needs a per-invocation
+budget stated against the function's actual timeout, a bound on work rather than on the shared query
+it borrows, and an event that admits when it stopped early — a backstop that silently does less than
+it claims is worse than one that is honest about its ceiling.

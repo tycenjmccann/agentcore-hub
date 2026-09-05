@@ -17,10 +17,14 @@
  *   Steal is never forced — stealClaim only wins against the exact generation
  *        the sweep inspected (its startedAt), so a re-issued claim is safe.
  *
- * Modes (DEAD_SESSION_DETECTOR_MODE): off = skip; shadow (default) = full sweep
+ * The DEPLOYED default is enforce (TEAM-4099 F8: index.mjs + template.yaml +
+ * deploy.sh all agree); `runSweep(mode = "shadow")`'s parameter default stays
+ * shadow so a direct call with no argument can only ever observe.
+ *
+ * Modes (DEAD_SESSION_DETECTOR_MODE): off = skip; shadow = full sweep
  * + logs/metrics + a would-fire dead_session.shadow event (its own type, NOT
- * agent.error — shadow is the default, and every agent.error consumer reads that
- * type as a real failure: UI error cards, anomaly agent_error_retry_rate), but
+ * agent.error — every agent.error consumer reads that type as a real failure:
+ * UI error cards, anomaly agent_error_retry_rate), but
  * ZERO writes (no steal, no retry, no status change); enforce = full behavior,
  * and only enforce ever publishes a real agent.error. The gate
  * fails SAFE: the value is trimmed + lowercased, and anything that is not

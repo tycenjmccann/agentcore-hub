@@ -57,6 +57,9 @@ import {
   hasUnackedGateBypass,
   ackedGateBypasses,
   gateBypassBlockReason,
+  // TEAM-4099 F8 — reported in the cold-start effective-modes line; the flag
+  // itself is still resolved (and defaulted) inside gate-bypass.mjs.
+  gateBypassMode,
 } from "./gate-bypass.mjs";
 import {
   synthesizeCompletion,
@@ -103,15 +106,20 @@ function parkNoteFingerprint(note) {
 }
 // Dead-session detector rollout flag (TEAM-3618 D1.2): off = skip the sweep,
 // shadow = observe + metrics + shadow-flagged events but ZERO writes, enforce =
-// steal/retry/escalate. Unset/empty DEFAULTS TO SHADOW (TEAM-3763 F1): per the
-// FR-D4.1 rollout, shadow → enforce is an explicit operator action, not a
-// deploy-time flip. A fresh deploy that omits the var must stay observe-only —
-// deploy.sh:94-99 forwards the var only when explicitly set, so an unset install
-// (production today) must NOT silently begin stealing/retrying sessions. The
-// fail-safe coercion still holds: runSweep normalizes (trim+lowercase) and
+// steal/retry/escalate.
+// Unset/empty DEFAULTS TO ENFORCE (TEAM-4099 F8, superseding TEAM-3763 F1's
+// shadow default). The rollout the shadow default belonged to is over: shadow
+// returns BEFORE the stamp/steal/synthesize (dead-session-detector.mjs:652) and
+// before the stall stamp (:355), so a default install produced no writes at all
+// — which means D1.2's dead-session salvage (AC: TEAM-3790 synthesized inside 5
+// minutes) and D4.3's stall re-dispatch (AC: TEAM-2609) were unmet AS DEPLOYED,
+// not merely un-flipped. A feature whose acceptance criteria require writes
+// cannot ship observe-only by default. Operators who still want observation set
+// the var explicitly (shadow), the same way they used to flip it up.
+// The fail-safe coercion still holds: runSweep normalizes (trim+lowercase) and
 // coerces anything not exactly off|shadow|enforce back to shadow, so a typo in
 // the env var can only ever DOWNGRADE to observe-only, never grant a rogue mode.
-const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
+const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "enforce";
 // TEAM-3992 D4.3 — per-sweep OTEL span-confirmation query budget for the stall
 // soft-timeout path. Bounds Logs Insights fan-out per sweep (default 5); the
 // OTEL_ACTIVITY_CONFIRM flag itself (default off) is read inside otel-activity.mjs.
@@ -133,13 +141,37 @@ const OTEL_QUERY_BUDGET_PER_SWEEP = Number(process.env.OTEL_QUERY_BUDGET_PER_SWE
 const CASCADE_EXTENDED_STATES_MODE = resolveCascadeMode(process.env.CASCADE_EXTENDED_STATES);
 // Missed-unblock reconciliation sweep (TEAM-3747 D1). Tri-state, governed
 // independently of the cascade's own mode (a separate safety-net rollout).
-// Unset/empty DEFAULTS TO OFF (TEAM-3763 F2): the sweep is now scheduled
-// (deploy.sh wires a reconcile_sweep EventBridge target), so a dark default is
-// what keeps a fresh deploy byte-identical to pre-epic. runSweep("off")
-// short-circuits before its first ScanCommand (reconcile-sweep.mjs:165) — ZERO
-// DDB reads/writes. shadow/enforce only when the operator explicitly sets the
-// var (deploy.sh forwards it only when set).
-const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
+// Unset/empty DEFAULTS TO ENFORCE (TEAM-4099 F8, superseding TEAM-3763 F2's dark
+// default). "Byte-identical to pre-epic" was the right posture while the sweep
+// was new; it is the wrong posture for the sweep everything else now DELEGATES
+// to. runSweep("off") short-circuits before its first ScanCommand
+// (reconcile-sweep.mjs:242), and with it go the 2-minute ready SLA (AC: wf
+// sffzti's 21:04 dispatch), the D2.3 epic-rollup retry, the gate-bypass re-eval,
+// and F7's "the rest is left to the sweep" bound. A backstop that is off by
+// default is not a backstop — it is a comment. Set the var to "shadow" (or
+// "off") explicitly to opt back out; anything unrecognized coerces to shadow.
+const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "enforce";
+
+// TEAM-4099 F7 — recompute bounds. recomputeRun fans out over EVERY sibling of a
+// run on every terminal signal, inside a 60-second Lambda (template.yaml
+// OrchestratorFunction Timeout) that also owns the completion, fix-verification
+// and gate work for the same record. Both bounds are per INVOCATION, not per
+// call: the stream batch is up to 10 records (template.yaml BatchSize), so a
+// per-call budget would multiply straight past the timeout. See recomputeRun.
+const RECOMPUTE_MAX_CANDIDATES = envIntOr("RECOMPUTE_MAX_CANDIDATES", 50);
+const RECOMPUTE_BUDGET_MS = envIntOr("RECOMPUTE_BUDGET_MS", 20_000);
+
+/** A non-negative integer env override, else the default. 0 is honored. */
+function envIntOr(name, dflt) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : dflt;
+}
+
+// Per-invocation recompute state, cleared at the top of every handler call (the
+// Node Lambda runtime runs one invocation at a time per container, so module
+// scope IS invocation scope). `seen` dedupes the backstop when one batch carries
+// several terminal records for the same run; `spentMs` is the shared budget.
+const recomputeInvocation = { seen: new Set(), spentMs: 0 };
 
 // TEAM-3992 D4.2 — coding-runtime health gate. The fleet's coding agents delegate
 // claude_code/codex/kiro to the single coding-agent runtime; when it is wedged,
@@ -190,6 +222,71 @@ const FIX_VERIFICATION_REQUIRED = (() => {
   if (v === "shadow") return "shadow";
   return "enforce";
 })();
+/** Ship merge-verify (TEAM-3986): on unless explicitly off|false|0. */
+function shipMergeVerifyOn() {
+  return !["off", "false", "0"].includes(
+    String(process.env.SHIP_MERGE_VERIFY || "").trim().toLowerCase()
+  );
+}
+
+/**
+ * TEAM-4099 F8 — every operator-facing mode flag, resolved, in one place.
+ *
+ * F8 was "the defaults leave D1.2 / D2.3 / D4.3 / the roll-up retry inert in a
+ * default deploy", and the reason it took a code review to notice is that
+ * NOTHING said which modes were live. A flag's effective value is decided by
+ * three independent things — the code default here, template.yaml's parameter
+ * default, and what deploy.sh forwards — and `aws lambda
+ * update-function-configuration --environment` REPLACES the whole variable map,
+ * so a var deploy.sh omits is deleted from the function and the code default
+ * below is what actually runs. That is one place too many to reason about from a
+ * CloudWatch log that never mentions any of them.
+ *
+ * So: one structured line per cold start, plus one EMF datum per flag
+ * (ModeEnforce_<FLAG> = 1 when it is actually acting), which is what makes
+ * "is the sweep enforcing in prod?" a dashboard question instead of an
+ * archaeology question. Derived, never authoritative — reading this cannot
+ * change behaviour.
+ */
+function effectiveModes() {
+  return {
+    DEAD_SESSION_DETECTOR_MODE,
+    RECONCILE_SWEEP_MODE,
+    CASCADE_EXTENDED_STATES: CASCADE_EXTENDED_STATES_MODE,
+    GATE_BYPASS_MODE: gateBypassMode(),
+    FIX_VERIFICATION_REQUIRED,
+    COMPLETION_EVIDENCE_REQUIRED: COMPLETION_EVIDENCE_REQUIRED ? "enforce" : "shadow",
+    SHIP_MERGE_VERIFY: shipMergeVerifyOn() ? "enforce" : "off",
+    OTEL_ACTIVITY_CONFIRM:
+      String(process.env.OTEL_ACTIVITY_CONFIRM || "").trim().toLowerCase() === "on" ? "on" : "off",
+    // Not a mode: the coding-runtime gate is armed by the ARN's presence alone
+    // (D4.2 fails open by design), so report whether it is armed, not a level.
+    CODING_RUNTIME_GATE: CODING_AGENT_RUNTIME_ARN ? "armed" : "off",
+  };
+}
+
+/** A flag counts as ACTING (metric 1) when its value is not off/shadow. */
+const MODE_ACTING = new Set(["enforce", "on", "armed"]);
+
+export function emitEffectiveModes(modes = effectiveModes(), log = console.log) {
+  log(JSON.stringify({ type: "orchestrator.effective_modes", ...modes }));
+  const names = Object.keys(modes);
+  log(JSON.stringify({
+    _aws: {
+      Timestamp: Date.now(),
+      CloudWatchMetrics: [{
+        Namespace: "AgentCoreHub/Orchestrator",
+        Dimensions: [[]],
+        Metrics: names.map((n) => ({ Name: `ModeEnforce_${n}`, Unit: "Count" })),
+      }],
+    },
+    ...Object.fromEntries(names.map((n) => [`ModeEnforce_${n}`, MODE_ACTING.has(modes[n]) ? 1 : 0])),
+  }));
+  return modes;
+}
+// Cold start: exactly once per container, before any invocation runs.
+emitEffectiveModes();
+
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
@@ -709,6 +806,12 @@ async function addTicketComment(ticketId, comment) {
 // ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
 
 export const handler = async (event) => {
+  // TEAM-4099 F7 — reset the per-invocation recompute bounds. Module scope is
+  // invocation scope (one invocation at a time per container), so this is where
+  // the dedupe set and the shared wall-clock budget start over.
+  recomputeInvocation.seen.clear();
+  recomputeInvocation.spentMs = 0;
+
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
@@ -1166,24 +1269,69 @@ async function parkAgentClaimOnBlock(ticketId, assignee, workflowId, parentId) {
  *
  * Never throws: a recompute is a backstop, and a backstop that can break the
  * cascade is worse than no backstop.
+ *
+ * ── TEAM-4099 F7: what it costs, and why it is bounded ──────────────────────
+ * This runs inside a 60-second Lambda (template.yaml OrchestratorFunction
+ * Timeout) whose invocation ALSO owns the cascade, the completion check, the
+ * fix-verification gate and the gate-bypass check for the same record — and a
+ * DDB-stream batch carries up to 10 records (BatchSize). The original loop had
+ * no bound at all in three separate dimensions:
+ *   1. READS. Every still-open sibling with blockers cost one serial getTicket
+ *      PER BLOCKER (checkAllBlockersResolved). A 100-ticket epic with 5 blockers
+ *      each = ~500 serial round-trips for information the sibling snapshot
+ *      already contains. Now blockers resolve against `byId`, built once from
+ *      the ONE getChildTickets query, and only a blocker MISSING from that map
+ *      (cross-epic, or deleted) falls back to a getTicket — memoized per id, so
+ *      the read count is at most the number of distinct foreign blockers, and 0
+ *      in the common case.
+ *   2. CANDIDATES. RECOMPUTE_MAX_CANDIDATES (default 50) reconciles at most that
+ *      many siblings per call; over-cap emits truncated:true and leaves the rest
+ *      to the reconcile sweep (which exists for exactly this).
+ *   3. WALL CLOCK. RECOMPUTE_BUDGET_MS (default 20000, a third of the timeout)
+ *      is shared across EVERY recompute in the invocation and checked before
+ *      each reconcileDependent, so 10 records cannot stack 10 budgets. Over
+ *      budget emits budgetExceeded:true and stops.
+ * Plus a per-invocation dedupe: two terminal records for the same run in one
+ * batch used to run the same backstop twice. Each (workflow, trigger) pair runs
+ * once per invocation; the second record's OWN cascade still fans out normally,
+ * and the sweep is the longer-horizon backstop, so nothing is lost.
+ *
+ * `now` is injectable for the budget tests only.
  */
-async function recomputeRun(workflow, epicId, trigger) {
+export async function recomputeRun(workflow, epicId, trigger, { now = Date.now } = {}) {
   if (!workflow?.id || !epicId) return null;
+  const dedupeKey = `${workflow.id}:${trigger}`;
+  if (recomputeInvocation.seen.has(dedupeKey)) {
+    console.log(`[orchestrator] recompute(${trigger}) ${workflow.id}: already ran in this invocation — skipping (the cascade and the sweep still cover it)`);
+    return { candidates: [], outcomes: {}, deduped: true };
+  }
+  recomputeInvocation.seen.add(dedupeKey);
   const mode = resolveCascadeMode(process.env.CASCADE_EXTENDED_STATES);
+  const startedAtMs = now();
   try {
-    const siblings = await getChildTickets(epicId);
+    const siblings = (await getChildTickets(epicId)) || [];
+    const byId = new Map(siblings.filter((t) => t?.ticketId).map((t) => [t.ticketId, t]));
+    // One read per DISTINCT blocker that is not a sibling, at most once per call.
+    const foreign = new Map();
+    const readForeign = async (bid) => {
+      if (!foreign.has(bid)) foreign.set(bid, (await getTicket(bid)) || null);
+      return foreign.get(bid);
+    };
     const cascade = getCascade();
     const m = newCascadeMetrics();
     const candidates = [];
     const outcomes = {};
-    for (const sibling of siblings || []) {
+    let truncated = false;
+    let budgetExceeded = false;
+    for (const sibling of siblings) {
       const id = sibling?.ticketId;
       if (!id || id === epicId) continue;
       if (sibling.type === "epic") continue;
       if (!sibling.assignee || isHumanAssignee(sibling.assignee)) continue;
       if (["done", "cancelled"].includes(String(sibling.status || "").toLowerCase())) continue;
-      const blockers = sibling.blockedBy || [];
-      if (blockers.length > 0 && !(await checkAllBlockersResolved(blockers))) continue;
+      if (!(await blockersResolvedFrom(sibling, byId, readForeign))) continue;
+      if (candidates.length >= RECOMPUTE_MAX_CANDIDATES) { truncated = true; break; }
+      if (recomputeInvocation.spentMs + (now() - startedAtMs) >= RECOMPUTE_BUDGET_MS) { budgetExceeded = true; break; }
       candidates.push(id);
       try {
         const { outcome, reason } = await cascade.reconcileDependent(sibling, trigger, workflow, m, mode);
@@ -1192,16 +1340,54 @@ async function recomputeRun(workflow, epicId, trigger) {
         outcomes[id] = { outcome: "error", reason: err?.message || String(err) };
       }
     }
-    if (candidates.length === 0) return { candidates, outcomes };
+    const result = {
+      candidates, outcomes, truncated, budgetExceeded,
+      scanned: siblings.length, foreignReads: foreign.size,
+    };
+    // A bound that was HIT is news even with nothing reconciled — it means part
+    // of the run was left to the sweep.
+    if (candidates.length === 0 && !truncated && !budgetExceeded) return result;
     await publishEvent(epicId, "orchestrator.recompute", {
       workflowId: workflow.id, trigger, candidates, outcomes,
+      ...(truncated ? { truncated: true, cap: RECOMPUTE_MAX_CANDIDATES } : {}),
+      ...(budgetExceeded ? { budgetExceeded: true, budgetMs: RECOMPUTE_BUDGET_MS } : {}),
     });
-    console.log(`[orchestrator] recompute(${trigger}) ${workflow.id}: ${candidates.length} candidate(s) — ${candidates.map((id) => `${id}:${outcomes[id]?.outcome}`).join(", ")}`);
-    return { candidates, outcomes };
+    console.log(`[orchestrator] recompute(${trigger}) ${workflow.id}: ${candidates.length} candidate(s) of ${siblings.length} sibling(s), ${foreign.size} foreign blocker read(s)` +
+      `${truncated ? ` — TRUNCATED at ${RECOMPUTE_MAX_CANDIDATES}, rest left to the reconcile sweep` : ""}` +
+      `${budgetExceeded ? ` — BUDGET ${RECOMPUTE_BUDGET_MS}ms exhausted, rest left to the reconcile sweep` : ""}` +
+      ` — ${candidates.map((id) => `${id}:${outcomes[id]?.outcome}`).join(", ")}`);
+    return result;
   } catch (err) {
     console.warn(`[orchestrator] recompute(${trigger}) failed for ${workflow?.id} (non-fatal): ${err?.message || err}`);
     return null;
+  } finally {
+    recomputeInvocation.spentMs += Math.max(0, now() - startedAtMs);
   }
+}
+
+/**
+ * TEAM-4099 F7 — every blockedBy entry of `sibling` reads done/cancelled in a
+ * snapshot map, falling back to ONE memoized read per blocker the snapshot does
+ * not contain. Vacuously true with no blockers (a stalled no-blocker ticket is a
+ * missed dispatch, still worth reconciling — same as the sweep's predicate).
+ *
+ * Why this isn't a call into an existing copy: cascade.mjs:154 defines its
+ * predicate as a closure over the just-closed ticketId (it answers "…given THIS
+ * one is done"), and reconcile-sweep.mjs:184 defines its own inside
+ * createReconcileSweep's factory scope. Neither is importable as a pure
+ * function, and both are snapshot-only (a blocker missing from the snapshot is
+ * unresolved, full stop) — which is right for them and wrong here, because a
+ * recompute must not permanently ignore a sibling blocked by a cross-epic
+ * ticket. Same terminal-status rule as both, one map lookup instead of a linear
+ * find.
+ */
+async function blockersResolvedFrom(sibling, byId, readForeign) {
+  for (const bid of sibling?.blockedBy || []) {
+    const blocker = byId.get(bid) || (await readForeign(bid));
+    const status = String(blocker?.status || "").toLowerCase();
+    if (status !== "done" && status !== "cancelled") return false;
+  }
+  return true;
 }
 
 async function gateBypassCompletionVerdict(workflow) {
@@ -3778,9 +3964,7 @@ export async function completeWorkflow(workflow) {
   // ground truth the TEAM-3721 gate already consults — consult it FIRST, and when
   // it proves the merge, stamp the ship tasks with the merge commit so the
   // verdict below (and the dashboard) tell the truth. Unknown → self-report decides.
-  const shipMergeVerify = !["off", "false", "0"].includes(
-    String(process.env.SHIP_MERGE_VERIFY || "").trim().toLowerCase()
-  );
+  const shipMergeVerify = shipMergeVerifyOn();
   const mergeVerifyConfigured = Boolean(
     shipMergeVerify && defHasShipPhase(workflow) && workflow.featureBranch &&
     workflow.repoConfig && process.env.GITHUB_PAT

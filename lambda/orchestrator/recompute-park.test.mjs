@@ -30,6 +30,9 @@ const h = vi.hoisted(() => ({
     workflow: /** @type {any} */ (null),
     lambdaInvokes: /** @type {any[]} */ ([]),
     events: /** @type {any[]} */ ([]),
+    // TEAM-4099 F7 — every single-ticket provider read (GetCommand on the tickets
+    // table), so a test can assert the read COUNT, not the implementation.
+    getReads: /** @type {string[]} */ ([]),
     store: {
       claimInvocation: /** @type {any[]} */ ([]),
       parkClaim: /** @type {any[]} */ ([]),
@@ -52,7 +55,10 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
       from: () => ({
         send: async (cmd) => {
           const name = cmd.constructor.name;
-          if (name === "GetCommand") return { Item: h.state.tickets[cmd.input.Key.ticketId] || null };
+          if (name === "GetCommand") {
+            h.state.getReads.push(cmd.input.Key.ticketId);
+            return { Item: h.state.tickets[cmd.input.Key.ticketId] || null };
+          }
           if (name === "QueryCommand") {
             // No heartbeats in the events table → every lease reads stale.
             if (cmd.input.TableName === "agentcore-hub-events") return { Items: [] };
@@ -130,11 +136,12 @@ const UPSTREAM = "TEAM-3798";
 
 let handleTicketDoneUnified;
 let handler;
+let recomputeRun;
 
 async function load(provider = "dynamodb") {
   process.env.TICKET_PROVIDER = provider;
   vi.resetModules();
-  ({ handleTicketDoneUnified, handler } = await import("./index.mjs"));
+  ({ handleTicketDoneUnified, handler, recomputeRun } = await import("./index.mjs"));
 }
 
 const eventsOfType = (type) => h.state.events.filter((e) => e.type === type);
@@ -147,6 +154,7 @@ beforeEach(() => {
   h.state.workflow = null;
   h.state.lambdaInvokes.length = 0;
   h.state.events.length = 0;
+  h.state.getReads.length = 0;
   h.state.store.claimInvocation.length = 0;
   h.state.store.parkClaim.length = 0;
   h.state.store.parkClaimResult = true;
@@ -255,6 +263,151 @@ describe("recomputeRun re-asks every sibling (D2.1)", () => {
 
     expect(eventsOfType("orchestrator.recompute")).toHaveLength(0);
     expect(invokedTickets()).not.toContain(STALLED);
+  });
+});
+
+// ─── TEAM-4099 F7 — the recompute is bounded ─────────────────────────────────
+
+/**
+ * The backstop above runs on EVERY terminal signal, inside the same 60-second
+ * invocation that owns the completion, fix-verification and gate work for the
+ * record that triggered it. These tests pin the three bounds as invariants —
+ * provider read count, reconcile count — never as "which helper was called".
+ */
+
+/** Warm the roster/defs cache the way a real invocation does, then clear counters. */
+async function warm() {
+  await handler({ source: "orchestrator.sweep", action: "runtime_health_sweep" });
+  h.state.getReads.length = 0;
+  h.state.events.length = 0;
+}
+
+/** A FRESH run object per test — reconcileDependent mutates agentTasks in place. */
+const newWf = () => ({ id: "wf_1", workflowId: "wf_1", epicId: PARENT, workflowDefId: "software-delivery", input: { title: "t" }, humanNotifications: [], agentTasks: {} });
+
+/** `n` agent siblings, each blocked behind `blockedBy`. No claims → nothing live. */
+const blockedSiblings = (n, blockedBy, prefix = "TASK") =>
+  Array.from({ length: n }, (_, i) => ({
+    ticketId: `${prefix}-${i}`, parentId: PARENT, status: "blocked", assignee: DEV, type: "task", blockedBy,
+  }));
+
+describe("recompute bounds (TEAM-4099 F7)", () => {
+  it("100 siblings x 5 blockers each: ZERO single-ticket provider reads (the snapshot already has them)", async () => {
+    await load();
+    await warm();
+    // 4 done blockers + 1 still-open one, all siblings of the same epic. The
+    // predicate therefore walks all 5 edges of all 100 siblings — 500 blocker
+    // resolutions, which used to be 500 serial getTicket round-trips.
+    const done = Array.from({ length: 4 }, (_, i) => ({ ticketId: `BLK-${i}`, parentId: PARENT, status: "done", assignee: DEV, type: "task" }));
+    // The open one is a human gate, so it is not a candidate in its own right —
+    // this test measures the PREDICATE's reads and nothing else.
+    const open = { ticketId: "BLK-OPEN", parentId: PARENT, status: "in_review", assignee: REVIEWER, type: "task" };
+    h.state.children = [
+      ...done, open,
+      ...blockedSiblings(100, [...done.map((d) => d.ticketId), open.ticketId]),
+    ];
+    // Every sibling is ALSO readable one-by-one from the tickets table — the
+    // measurement is that the recompute does not need to, not that it cannot.
+    for (const c of h.state.children) h.state.tickets[c.ticketId] = { ...c, workflowId: "wf_1" };
+    const wf = newWf();
+    h.state.workflow = wf;
+
+    const result = await recomputeRun(wf, PARENT, "agent.complete");
+
+    expect(result.scanned).toBe(105);
+    expect(result.candidates).toEqual([]); // every one is genuinely still blocked
+    expect(h.state.getReads).toEqual([]); // <- the F7 invariant
+    expect(result.foreignReads).toBe(0);
+  });
+
+  it("cross-epic blockers cost ONE read each, memoized — not one per sibling edge", async () => {
+    await load();
+    await warm();
+    // Neither blocker is a child of this epic, so neither is in the snapshot.
+    h.state.tickets = {
+      "OTHER-1": { ticketId: "OTHER-1", status: "done" },
+      "OTHER-2": { ticketId: "OTHER-2", status: "in_progress" },
+    };
+    h.state.children = blockedSiblings(20, ["OTHER-1", "OTHER-2"]);
+    const wf = newWf();
+    h.state.workflow = wf;
+
+    const result = await recomputeRun(wf, PARENT, "agent.complete");
+
+    // 40 blocker edges over 20 siblings, 2 distinct foreign ids => 2 reads.
+    expect(h.state.getReads.sort()).toEqual(["OTHER-1", "OTHER-2"]);
+    expect(result.foreignReads).toBe(2);
+    expect(result.candidates).toEqual([]);
+  });
+
+  it("over the candidate cap: stops at the cap, says truncated, and leaves the rest to the sweep", async () => {
+    process.env.RECOMPUTE_MAX_CANDIDATES = "5";
+    await load();
+    await warm();
+    h.state.children = [
+      { ticketId: UPSTREAM, parentId: PARENT, status: "done", assignee: DEV, type: "task" },
+      ...blockedSiblings(12, [UPSTREAM]),
+    ];
+    const wf = newWf();
+    h.state.workflow = wf;
+
+    const result = await recomputeRun(wf, PARENT, "agent.complete");
+    delete process.env.RECOMPUTE_MAX_CANDIDATES;
+
+    expect(result.candidates).toHaveLength(5);
+    expect(result.truncated).toBe(true);
+    // The bound is on WORK done, not just on the reported list.
+    expect(h.state.store.claimInvocation).toHaveLength(5);
+    expect(invokedTickets()).toHaveLength(5);
+    // …and a hit bound is always announced, so an operator can see the gap.
+    expect(recomputes()[0]).toMatchObject({ truncated: true, cap: 5 });
+  });
+
+  it("over the wall-clock budget: stops mid-scan and says budgetExceeded", async () => {
+    await load();
+    await warm();
+    h.state.children = [
+      { ticketId: UPSTREAM, parentId: PARENT, status: "done", assignee: DEV, type: "task" },
+      ...blockedSiblings(3, [UPSTREAM]),
+    ];
+    const wf = newWf();
+    h.state.workflow = wf;
+
+    // 15s per tick: the first candidate is inside the 20s budget, the second is not.
+    let t = -15_000;
+    const now = () => (t += 15_000);
+
+    const result = await recomputeRun(wf, PARENT, "agent.complete", { now });
+
+    expect(result.candidates).toHaveLength(1);
+    expect(result.budgetExceeded).toBe(true);
+    expect(h.state.store.claimInvocation).toHaveLength(1);
+    expect(recomputes()[0]).toMatchObject({ budgetExceeded: true, budgetMs: 20_000 });
+  });
+
+  it("two terminal records for the same run in one invocation recompute it once, and a reset re-arms it", async () => {
+    await load();
+    await warm();
+    h.state.children = [
+      { ticketId: UPSTREAM, parentId: PARENT, status: "done", assignee: DEV, type: "task" },
+      ...blockedSiblings(1, [UPSTREAM]),
+    ];
+    const wf = newWf();
+    h.state.workflow = wf;
+
+    const first = await recomputeRun(wf, PARENT, "agent.complete");
+    const second = await recomputeRun(wf, PARENT, "agent.complete");
+    // A different trigger is a different question — never deduped away.
+    const other = await recomputeRun(wf, PARENT, "review.approved");
+
+    expect(first.candidates).toEqual(["TASK-0"]);
+    expect(second).toMatchObject({ deduped: true, candidates: [] });
+    expect(other.candidates).toEqual(["TASK-0"]);
+    expect(recomputes().map((r) => r.trigger)).toEqual(["agent.complete", "review.approved"]);
+
+    // The next invocation starts clean (the handler clears the per-invocation set).
+    await warm();
+    expect((await recomputeRun(wf, PARENT, "agent.complete")).candidates).toEqual(["TASK-0"]);
   });
 });
 

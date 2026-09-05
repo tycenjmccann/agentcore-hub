@@ -44,17 +44,20 @@ export default defineConfig({
       // dependency-injected (stub ddb/store/lease + fake clock), so its
       // guard/trigger/retry/escalate logic is unit-testable with no AWS.
       "lambda/orchestrator/dead-session-detector.test.mjs",
-      // detector-mode-default (TEAM-3763 F1) — the index.mjs sweep-dispatch
-      // default: DEAD_SESSION_DETECTOR_MODE coalesces to "shadow" (observe-only)
-      // when unset, so a fresh deploy stays dark. Drives the real handler with
+      // detector-mode-default (TEAM-3763 F1, amended by TEAM-4099 F8) — the
+      // index.mjs sweep-dispatch default: DEAD_SESSION_DETECTOR_MODE coalesces to
+      // "enforce" when unset (F1 shipped "shadow", which returns before every
+      // write, so a default deploy salvaged nothing). Drives the real handler with
       // the sweep sentinel and a mocked detector to observe the exact mode
       // forwarded to runSweep.
       "lambda/orchestrator/detector-mode-default.test.mjs",
-      // sweep-mode-defaults (TEAM-3763 F2/F6) — the index.mjs defaults for the two
-      // dark-by-default sweeps: RECONCILE_SWEEP_MODE unset → "off" (the sweep is
-      // now scheduled) and CASCADE_EXTENDED_STATES unset → "off". Drives the real
-      // handler with the reconcile_sweep sentinel (mocked cascade + reconcile
-      // factories) to observe the modes index resolves before dispatch.
+      // sweep-mode-defaults (TEAM-3763 F2/F6, amended by TEAM-4099 F8) — the
+      // index.mjs defaults for the scheduled reconcile sweep and the cascade's
+      // extended states, which now differ deliberately: RECONCILE_SWEEP_MODE unset
+      // → "enforce" (a backstop that is off by default is not a backstop) while
+      // CASCADE_EXTENDED_STATES unset → "off" (its shadow path is not read-free).
+      // Drives the real handler with the reconcile_sweep sentinel (mocked cascade +
+      // reconcile factories) to observe the modes index resolves before dispatch.
       "lambda/orchestrator/sweep-mode-defaults.test.mjs",
       // agent-invoker-retry (TEAM-3748 D4.2) — bounded transient-5xx retry at the
       // invoke boundary + the D4.3 publishAgentEvent dual-write. Drives the real
@@ -200,6 +203,12 @@ export default defineConfig({
       // workflow.dag_violation → store.setDagAudit). §3(a) shape: real index.mjs
       // + real dag.mjs, I/O seams mocked, def served from S3 workflows.json.
       "lambda/orchestrator/dag-audit.test.mjs",
+      // mode-defaults (TEAM-4099 F8) — the three-way agreement between the code
+      // default in index.mjs, template.yaml's parameter Default, and what
+      // deploy.sh forwards (the layer that decides production, since
+      // update-function-configuration replaces the whole env map), plus the
+      // cold-start orchestrator.effective_modes log + per-flag EMF metric.
+      "lambda/orchestrator/mode-defaults.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

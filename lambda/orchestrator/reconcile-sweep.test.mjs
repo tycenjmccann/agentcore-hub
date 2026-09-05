@@ -279,6 +279,23 @@ describe("off mode skips the sweep entirely", () => {
     expect(s.ddb.send).not.toHaveBeenCalled();
     expect(s.redispatch).not.toHaveBeenCalled();
   });
+
+  it("…but still reports its mode (TEAM-4099 F8): one EMF record, zero reads", async () => {
+    // A dark sweep is exactly the state that has to be visible: without this
+    // record, "off" and "the sweep is broken" look identical on a dashboard.
+    const s = makeSweep({ workflows: [workflow()], siblings: inProgressStale });
+    const cap = captureMetrics();
+
+    const m = await s.runSweep("off");
+    const records = cap.records();
+    cap.restore();
+
+    expect(records).toHaveLength(1);
+    expect(records[0].ReconcileMode).toBe("off");
+    expect(records[0].ReconcileSweepCandidates).toBe(0);
+    expect(m.durationMs).toBeGreaterThanOrEqual(0);
+    expect(s.ddb.send).not.toHaveBeenCalled();
+  });
 });
 
 describe("mode normalization (fail-safe, mirrors the detector)", () => {

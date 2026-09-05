@@ -63,17 +63,28 @@ Parameters:
 
   DeadSessionDetectorMode:
     Type: String
-    Default: shadow
+    Default: enforce
     AllowedValues: ["off", "shadow", "enforce"]
     Description: >
       Dead-session detector rollout (TEAM-3618 D1.2). off = skip the sweep;
       shadow = observe + metrics + shadow-flagged events, no writes;
-      enforce = steal stale claims, retry once, then escalate.
+      enforce = steal stale claims, retry once, then escalate. Default flipped
+      shadow -> enforce by TEAM-4099 F8: shadow returns before the
+      stamp/steal/synthesize, so D1.2's dead-session salvage (TEAM-3790) and
+      D4.3's stall re-dispatch (TEAM-2609) produced NO writes in a default
+      deploy - their ACs were unmet as deployed, not merely un-flipped. Matches
+      the code default in index.mjs. Set shadow explicitly to observe first.
 
   CascadeExtendedStates:
     Type: String
     Default: "off"
-    AllowedValues: ["off", "on"]
+    # "shadow" is accepted by the code (resolveCascadeMode is tri-state as of
+    # TEAM-3747 D1) but was missing here, so the template could not express the
+    # observe-only step of its own rollout. "on" is kept as the legacy alias for
+    # enforce. Stays OFF by default: shadow is NOT read-free (the extended path
+    # issues its blocker-confirm + lease reads before the no-write check), and no
+    # AC needs it now that the reconcile sweep enforces under the same lease floor.
+    AllowedValues: ["off", "shadow", "enforce", "on"]
     Description: >
       Cascade extended-states rollout (TEAM-3618 D3 commit 4b). off = the unblock
       cascade only re-Readies {blocked, todo} dependents. on = a dependent
@@ -83,16 +94,19 @@ Parameters:
 
   ReconcileSweepMode:
     Type: String
-    Default: "off"
+    Default: enforce
     AllowedValues: ["off", "shadow", "enforce"]
     Description: >
       Missed-unblock reconciliation sweep rollout (TEAM-3747 D1 / FR-D1.3
       backstop). off = dark: runSweep short-circuits before its first DynamoDB
       scan, so ZERO extra reads/writes; shadow = observe-only scan (metrics/logs
       of what WOULD be re-driven, no writes); enforce = re-drive stalled
-      dependents. Default "off" matches the code's unset default, so the backstop
-      ships dark — same rollout posture as deploy.sh (TEAM-3763 F2), which only
-      forwards RECONCILE_SWEEP_MODE when explicitly set.
+      dependents, retry outstanding epic roll-ups (D2.3) and re-evaluate
+      gate-bypass flags. Default flipped off -> enforce by TEAM-4099 F8: dark by
+      default also disabled the 2-minute ready SLA (wf sffzti's 21:04 dispatch),
+      the roll-up retry, and F7's "the rest is left to the sweep" bound - a
+      backstop that is off by default is not a backstop. Matches the code
+      default in index.mjs. Set shadow (or off) explicitly to opt back out.
 
   GateBypassMode:
     Type: String

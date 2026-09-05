@@ -269,10 +269,12 @@ describe("handleTicketDone (DDB-stream path) drives the real cascade", () => {
  * "reconcile_sweep" }; the handler must branch to the reconcile sweep BEFORE any
  * stream/webhook parsing (the event has no Records) and return the sweep's
  * metrics summary — proof the route dispatched the sweep rather than falling
- * through. Default mode is OFF (RECONCILE_SWEEP_MODE unset — TEAM-3763 F2): now
- * that the sweep is SCHEDULED, dark-by-default keeps a fresh deploy byte-
- * identical to pre-epic, so runSweep short-circuits before its first Scan and
- * touches nothing.
+ * through. With RECONCILE_SWEEP_MODE unset the mode is ENFORCE (TEAM-4099 F8,
+ * superseding F2's dark default: a scheduled backstop that is off by default is
+ * not a backstop). Nothing here depends on that value beyond reporting it — this
+ * harness's Scan returns no workflows, so the sweep finds nothing to act on and
+ * the no-writes assertions below hold in any mode. The mode DEFAULTS themselves
+ * are pinned in sweep-mode-defaults.test.mjs + mode-defaults.test.mjs.
  */
 describe("reconcile-sweep sentinel route (TEAM-3747 D1)", () => {
   it("routes { orchestrator.sweep, reconcile_sweep } to the sweep and returns its summary", async () => {
@@ -280,8 +282,8 @@ describe("reconcile-sweep sentinel route (TEAM-3747 D1)", () => {
 
     // The sweep ran (returned its metrics), not a stream/webhook path.
     expect(typeof result.sweepId).toBe("string");
-    expect(result.mode).toBe("off");    // RECONCILE_SWEEP_MODE unset → dark default (F2)
-    expect(result.candidates).toBe(0);  // off short-circuits before the Scan
+    expect(result.mode).toBe("enforce"); // RECONCILE_SWEEP_MODE unset → armed (F8)
+    expect(result.candidates).toBe(0);   // nothing in the scan window to re-drive
     // A sweep is not a ticket-done fan-out: no agent dispatch, no board writes.
     expect(h.state.lambdaInvokes).toHaveLength(0);
     expect(h.state.updates).toHaveLength(0);
