@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateSourcesShape, formatSourceDisplay } from "./source-shape";
+import { validateSourcesShape, formatSourceDisplay, sourcesForDisplay } from "./source-shape";
 
 /**
  * TEAM-4078 regression suite.
@@ -209,5 +209,65 @@ describe("formatSourceDisplay — the board read path (F1b + F2)", () => {
     const d = formatSourceDisplay({ type: "url", value: "https://x/y", verification: { status: "unverified", detail: {} } });
     expect(d.unverified).toBe(true);
     expect(d.detail).toBeUndefined();
+  });
+});
+
+/**
+ * TEAM-4090 regression suite.
+ *
+ * The board's container check was `(state.input?.sources?.length ?? 0) > 0`,
+ * followed by `state.input.sources.map(...)`. A persisted `input.sources` of a
+ * non-empty STRING or an array-like OBJECT ({ length: 1, 0: {...} }) has a
+ * truthy `.length`, so it passed that guard and then threw
+ * "sources.map is not a function" — blanking the whole board, not just one row.
+ * Only Array.isArray tells `.map` is safe.
+ */
+describe("sourcesForDisplay — the board's array guard on input.sources (TEAM-4090)", () => {
+  it("returns [] for undefined, null, and non-object input", () => {
+    for (const input of [undefined, null, "abc", 5, true]) {
+      expect(sourcesForDisplay(input)).toEqual([]);
+    }
+  });
+
+  it("returns [] when input has no sources field", () => {
+    expect(sourcesForDisplay({})).toEqual([]);
+    expect(sourcesForDisplay({ title: "x" })).toEqual([]);
+  });
+
+  it("returns [] for a non-empty STRING sources — the .map is not a function payload", () => {
+    expect(sourcesForDisplay({ sources: "abc" })).toEqual([]);
+  });
+
+  it("returns [] for an array-like OBJECT sources", () => {
+    expect(sourcesForDisplay({ sources: { length: 1, 0: { type: "url", value: "x" } } })).toEqual([]);
+  });
+
+  it("returns [] for sources = {}", () => {
+    expect(sourcesForDisplay({ sources: {} })).toEqual([]);
+  });
+
+  it("returns the SAME array reference for a real array, including an empty one", () => {
+    const empty: unknown[] = [];
+    expect(sourcesForDisplay({ sources: empty })).toBe(empty);
+
+    const populated = [{ type: "url", value: "https://x/y" }];
+    expect(sourcesForDisplay({ sources: populated })).toBe(populated);
+  });
+
+  it("fail-on-base evidence: the OLD `.length > 0` guard is true for exactly the inputs Array.isArray rejects", () => {
+    const oldGuard = (input: unknown): boolean => {
+      const rec = input as { sources?: { length?: number } } | null | undefined;
+      return ((rec?.sources?.length as number | undefined) ?? 0) > 0;
+    };
+
+    const stringSources = { sources: "abc" };
+    const arrayLikeSources = { sources: { length: 1, 0: { type: "url", value: "x" } } };
+
+    for (const input of [stringSources, arrayLikeSources]) {
+      expect(oldGuard(input)).toBe(true);
+      expect(Array.isArray((input as { sources: unknown }).sources)).toBe(false);
+      // This is the exact condition under which the old code proceeded to call
+      // .sources.map(...) on a non-array and threw.
+    }
   });
 });
