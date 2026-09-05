@@ -11,6 +11,7 @@
 
 import { isIPv4, isIPv6 } from "node:net";
 import { lookup as dnsLookup } from "node:dns/promises";
+import { Agent } from "undici";
 import { S3Client, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import type { IntakeSource, SourceVerification } from "./types";
@@ -105,6 +106,12 @@ export type LookupImpl = (
   hostname: string
 ) => Promise<ReadonlyArray<{ address: string; family?: number }>>;
 
+/**
+ * The connect-time pin factory (TEAM-4115). Injectable only so a test can observe
+ * / substitute the dispatcher; production always uses createPinnedDispatcher.
+ */
+export type DispatcherFactory = (host: string, addresses: readonly string[]) => Agent;
+
 export interface ValidateIntakeSourcesOptions {
   /** Injected for tests; defaults to a real S3Client in the resolved region. */
   s3Client?: AwsClientLike;
@@ -112,6 +119,8 @@ export interface ValidateIntakeSourcesOptions {
   fetchImpl?: typeof fetch;
   /** Injected for tests; defaults to dns.lookup(host, { all: true }). */
   lookupImpl?: LookupImpl;
+  /** Injected for tests; defaults to createPinnedDispatcher. */
+  dispatcherFactory?: DispatcherFactory;
   env?: NodeJS.ProcessEnv;
   /** Skips hub-bucket resolution entirely (and therefore STS). */
   hubBucket?: string;
@@ -390,7 +399,7 @@ async function checkS3Source(
   }
 }
 
-// ─── SSRF gate for the URL check (TEAM-4091 F1 + TEAM-4101 r2-F2) ────────────
+// ─── SSRF gate for the URL check (TEAM-4091 F1 + TEAM-4101 r2-F2 + TEAM-4115) ─
 //
 // checkUrlSource issues a SERVER-SIDE GET to a caller-supplied URL and persists
 // the status code into verification.detail, which the submitter reads back. That
@@ -407,12 +416,22 @@ async function checkS3Source(
 //    rejected if ANY answer is private/link-local/loopback — a public name with an
 //    RFC1918/link-local A/AAAA record (or attacker-controlled DNS on this
 //    unauthenticated route) was otherwise a legal source and a blind oracle.
-//  - The ACCEPTED residual is DNS-rebinding TOCTOU: the record can change between
-//    our lookup and undici's own connect(), so a pinned attacker could still hit an
-//    internal address on the real GET. We accept it because the oracle is
-//    status-only — no body is read, no credential is sent — and truly closing it
-//    would require pinning the socket to the vetted address via a custom undici
-//    dispatcher, which is out of scope here.
+//  - DNS-rebinding TOCTOU is now CLOSED (TEAM-4115, ship-review r3-F1). It used
+//    to be the accepted residual: undici did its OWN resolution at connect(), so a
+//    TTL-0 zone could answer public to our lookup and 169.254.169.254 (or a
+//    VPC-internal address) to undici microseconds later — one server-side GET with
+//    its status class persisted, i.e. a blind status oracle past the gate. Both
+//    fetches now run on a per-check undici Agent whose connector `lookup` returns
+//    ONLY the address set this gate just vetted (createPinnedDispatcher), and
+//    refuses any other hostname outright. There is no second resolution to race:
+//    the socket can only go to an address we already classified as routable. The
+//    vetted set is re-classified inside the pin as well, so even a caller that
+//    hands over a bad set gets refused before a socket exists.
+//
+// The blocked-range classifier covers the non-unicast/special-purpose space too
+// (multicast, reserved/broadcast, benchmarking, IETF protocol assignments, NAT64
+// and 6to4 by their embedded IPv4) — a v6 costume over 127.0.0.1 is still
+// 127.0.0.1, and 2002:7f00:1:: / 64:ff9b::7f00:1 are exactly that.
 
 /** Blocked IPv4 range, or undefined for a routable literal. */
 function blockedIpv4Reason(host: string): string | undefined {
@@ -426,6 +445,13 @@ function blockedIpv4Reason(host: string): string | undefined {
   if (a === 169 && b === 254) return "link-local address 169.254.0.0/16 (instance metadata)";
   if (a === 0) return "unspecified address 0.0.0.0/8";
   if (a === 100 && b >= 64 && b <= 127) return "shared address space 100.64.0.0/10";
+  // TEAM-4115: the non-unicast / special-purpose space the pin must also refuse.
+  // None of it is a legitimate source host, and a connect to it is either a
+  // local-segment broadcast/multicast probe or an on-link special case.
+  if (a >= 224 && a <= 239) return "multicast address 224.0.0.0/4";
+  if (a >= 240) return "reserved address 240.0.0.0/4";
+  if (a === 192 && b === 0 && parts[2] === 0) return "IETF protocol assignments 192.0.0.0/24";
+  if (a === 198 && (b === 18 || b === 19)) return "benchmarking address 198.18.0.0/15";
   return undefined;
 }
 
@@ -461,9 +487,29 @@ function blockedIpv6Reason(host: string): string | undefined {
     const mapped = blockedIpv4Reason(`${g[6] >> 8}.${g[6] & 0xff}.${g[7] >> 8}.${g[7] & 0xff}`);
     if (mapped) return `IPv4-mapped ${mapped}`;
   }
+  // TEAM-4115: 64:ff9b::/96 is the well-known NAT64 prefix — a v6 address that a
+  // translator turns straight back into the embedded IPv4, so it must be decided
+  // by that IPv4 exactly like the ::ffff: mapped case. 64:ff9b::7f00:1 reaches
+  // 127.0.0.1; 64:ff9b::a9fe:a9fe reaches the metadata endpoint.
+  if (g[0] === 0x64 && g[1] === 0xff9b) {
+    // 64:ff9b:1::/48 — the local-use translation prefix (RFC 8215). Its lower
+    // bits are not a fixed embedded-v4 layout, so refuse the whole /48 outright.
+    if (g[2] === 1) return "local-use NAT64 prefix 64:ff9b:1::/48";
+    if (g.slice(2, 6).every((x) => x === 0)) {
+      const mapped = blockedIpv4Reason(`${g[6] >> 8}.${g[6] & 0xff}.${g[7] >> 8}.${g[7] & 0xff}`);
+      if (mapped) return `NAT64 ${mapped}`;
+    }
+  }
+  // 2002::/16 — 6to4 embeds the IPv4 of the relay in groups 1-2, so 2002:7f00:1::
+  // is 127.0.0.1 wearing a v6 costume. Same treatment.
+  if (g[0] === 0x2002) {
+    const mapped = blockedIpv4Reason(`${g[1] >> 8}.${g[1] & 0xff}.${g[2] >> 8}.${g[2] & 0xff}`);
+    if (mapped) return `6to4 ${mapped}`;
+  }
   const topByte = g[0] >> 8;
   if (topByte === 0xfc || topByte === 0xfd) return "unique-local address fc00::/7";
   if (g[0] >= 0xfe80 && g[0] <= 0xfebf) return "link-local address fe80::/10";
+  if (topByte === 0xff) return "multicast address ff00::/8";
   return undefined;
 }
 
@@ -525,19 +571,155 @@ function urlGate(value: string): UrlGateResult {
 }
 
 /**
+ * The one address classifier both the pre-flight resolver and the connect-time
+ * pin call, so the two can never disagree about what "blocked" means. A scope id
+ * (fe80::1%eth0) is not part of the address; anything that is not an IP at all is
+ * refused outright — the pin only ever hands literal addresses to the socket.
+ */
+function blockedAddressReason(address: string): string | undefined {
+  const addr = address.replace(/%.*$/, "");
+  return isIPv4(addr) ? blockedIpv4Reason(addr) : isIPv6(addr) ? blockedIpv6Reason(addr) : "non-IP DNS answer";
+}
+
+/** Node's dns.lookup callback shape, as undici's `connect.lookup` hook uses it. */
+type PinnedLookup = (
+  hostname: string,
+  // `family` is Node's LookupOptions shape (number | "IPv4" | "IPv6"); we only
+  // ever read `all`, but the type has to stay assignable to net.LookupFunction.
+  options: { all?: boolean; family?: number | "IPv4" | "IPv6" } | undefined,
+  // On the error path undici/net never reads the address argument, but
+  // net.LookupFunction types it as non-optional — hence the union rather than `?`.
+  callback: (
+    err: NodeJS.ErrnoException | null,
+    addressOrAll: string | Array<{ address: string; family: number }>,
+    family?: number
+  ) => void
+) => void;
+
+/** Metadata the pin hangs on its dispatcher so tests can assert what it pinned. */
+export const PINNED_META = Symbol("intake.pinnedDispatcher");
+
+export interface PinnedMeta {
+  host: string;
+  addresses: readonly string[];
+  lookup: PinnedLookup;
+}
+
+/**
+ * TEAM-4115 — the connect-time pin that closes the DNS-rebinding TOCTOU.
+ *
+ * A `lookup` hook for undici's connector that resolves EXACTLY ONE hostname to
+ * EXACTLY the address set the pre-flight resolver already vetted, and never
+ * consults system DNS. Two independent refusals, both before any socket exists:
+ *
+ *  - a request for any other hostname (a redirect we did not follow, a
+ *    connection-reuse mix-up) errors out rather than resolving;
+ *  - every vetted address is re-run through blockedAddressReason. The vetted set
+ *    comes from our own resolver, so this is belt-and-braces — but it is what
+ *    makes the pin safe even if a future caller hands it a bad set, and it is the
+ *    invariant the adversarial test pins.
+ *
+ * `skipRangeRecheck` exists ONLY for the real-socket integration test, which has
+ * to pin to 127.0.0.1 to have a server to talk to. Nothing in the app sets it.
+ */
+export function buildPinnedLookup(
+  host: string,
+  addresses: readonly string[],
+  opts: { skipRangeRecheck?: boolean } = {}
+): PinnedLookup {
+  const pinnedHost = host.replace(/\.+$/, "").toLowerCase();
+  return (hostname, options, callback) => {
+    const asked = String(hostname ?? "")
+      .replace(/\.+$/, "")
+      .toLowerCase();
+    if (asked !== pinnedHost) {
+      callback(new Error("Blocked URL host — connect to unvetted host refused"), "");
+      return;
+    }
+    const vetted: Array<{ address: string; family: number }> = [];
+    for (const address of addresses) {
+      if (!opts.skipRangeRecheck) {
+        const reason = blockedAddressReason(address);
+        if (reason) {
+          callback(new Error(`Blocked URL host — ${reason}`), "");
+          return;
+        }
+      }
+      const family = isIPv4(address) ? 4 : isIPv6(address) ? 6 : 0;
+      if (family === 0) {
+        callback(new Error("Blocked URL host — non-IP address refused"), "");
+        return;
+      }
+      vetted.push({ address, family });
+    }
+    if (vetted.length === 0) {
+      callback(new Error("Blocked URL host — no vetted address"), "");
+      return;
+    }
+    if (options?.all) callback(null, vetted);
+    else callback(null, vetted[0].address, vetted[0].family);
+  };
+}
+
+/**
+ * An undici Agent whose connector resolves `host` only to `addresses`.
+ *
+ * WHY an npm `undici` Agent handed to Node's GLOBAL fetch via the non-standard
+ * `init.dispatcher`, rather than undici's own fetch: verified working on the
+ * runtime Node (Dockerfile: node:22-alpine) and CI Node 20 — a global-fetch GET
+ * to a hostname with NO DNS record SUCCEEDS through this dispatcher, which is
+ * itself the proof the pin is honoured (an ignored dispatcher would ENOTFOUND).
+ * undici's `buildConnector` spreads unknown `connect` options into BOTH
+ * `net.connect` and `tls.connect`, so `lookup` applies to http and https alike,
+ * and it sets `servername` AFTER that spread — TLS is still verified against the
+ * ORIGINAL hostname, so pinning the address does not weaken certificate checks.
+ * The real-socket test in intake.test.ts is the regression guard: if a future
+ * Node stops honouring `init.dispatcher`, that test fails loudly instead of the
+ * pin silently becoming a no-op.
+ */
+export function createPinnedDispatcher(
+  host: string,
+  addresses: readonly string[],
+  opts: { skipRangeRecheck?: boolean } = {}
+): Agent {
+  const lookup = buildPinnedLookup(host, addresses, opts);
+  const dispatcher = new Agent({
+    // This is undici's TCP/TLS connect timeout, not a DNS budget — the pin does
+    // no lookup, so it must not be tightened to DNS_LOOKUP_TIMEOUT_MS. Match the
+    // fetch's own AbortSignal budget so a slow-but-public origin behaves exactly
+    // as it did before the pin.
+    connect: { lookup, timeout: URL_TIMEOUT_MS },
+    // One source check is one request; no reason to hold a pool open.
+    pipelining: 0,
+  });
+  Object.defineProperty(dispatcher, PINNED_META, {
+    value: { host, addresses: [...addresses], lookup } satisfies PinnedMeta,
+    enumerable: false,
+  });
+  return dispatcher;
+}
+
+/**
  * Resolve a NON-literal host and refuse it if ANY answer is a blocked address
  * (r2-F2). Bounded by DNS_LOOKUP_TIMEOUT_MS with the same race-and-always-clear
- * pattern as probeAccountId. Returns a Check to report, or undefined when every
- * resolved address is routable — only then does the caller proceed to the GET.
+ * pattern as probeAccountId. Returns a Check to report, or the vetted address set
+ * for the caller to PIN the connection to (TEAM-4115) — only a fully routable
+ * answer set gets that far.
  *
  * The resolved IP is NEVER put in the detail: the string is fixed and, like every
  * other detail, goes through redactUrl.
  */
-async function resolveHostGuard(host: string, value: string, lookupImpl: LookupImpl): Promise<Check | undefined> {
-  const transient = (reason: string): Check => ({
-    outcome: "transient",
-    method: "DNS",
-    detail: `URL unreachable — DNS -> ${reason}: ${redactUrl(value)}`,
+async function resolveHostGuard(
+  host: string,
+  value: string,
+  lookupImpl: LookupImpl
+): Promise<{ check: Check } | { addresses: string[] }> {
+  const transient = (reason: string): { check: Check } => ({
+    check: {
+      outcome: "transient",
+      method: "DNS",
+      detail: `URL unreachable — DNS -> ${reason}: ${redactUrl(value)}`,
+    },
   });
 
   const TIMED_OUT = Symbol("dns-timeout");
@@ -562,23 +744,24 @@ async function resolveHostGuard(host: string, value: string, lookupImpl: LookupI
 
   if (!addresses || addresses.length === 0) return transient("no addresses");
 
+  const vetted: string[] = [];
   for (const { address } of addresses) {
     // fe80::1%eth0 → fe80::1 — a scope/zone id is not part of the address.
     const addr = address.replace(/%.*$/, "");
-    const reason = isIPv4(addr)
-      ? blockedIpv4Reason(addr)
-      : isIPv6(addr)
-        ? blockedIpv6Reason(addr)
-        : "non-IP DNS answer";
-    if (reason) {
+    if (blockedAddressReason(addr)) {
       return {
-        outcome: "definitive",
-        method: "parse",
-        detail: `Blocked URL host — resolves to a private/link-local address: ${redactUrl(value)}`,
+        check: {
+          outcome: "definitive",
+          method: "parse",
+          detail: `Blocked URL host — resolves to a private/link-local address: ${redactUrl(value)}`,
+        },
       };
     }
+    vetted.push(addr);
   }
-  return undefined;
+  // The addresses the GET is now PINNED to (TEAM-4115) — the record cannot be
+  // swapped underneath us between this lookup and undici's connect().
+  return { addresses: vetted };
 }
 
 /** Cancel the body without reading a byte of it. */
@@ -592,7 +775,12 @@ async function discardBody(res: Response): Promise<void> {
 
 async function checkUrlSource(
   value: string,
-  ctx: { fetchImpl: typeof fetch; lookupImpl: LookupImpl; env: NodeJS.ProcessEnv }
+  ctx: {
+    fetchImpl: typeof fetch;
+    lookupImpl: LookupImpl;
+    env: NodeJS.ProcessEnv;
+    dispatcherFactory?: DispatcherFactory;
+  }
 ): Promise<Check> {
   // FIRST, before even the trusted-owner shortcut: a blocked literal host must
   // never be labelled "trusted" on the strength of a path that spells out
@@ -603,10 +791,13 @@ async function checkUrlSource(
   // THEN resolve a non-literal host and vet every answer — still BEFORE the
   // trusted-owner shortcut and the GET, so a name that resolves into a private
   // range can neither be labelled "trusted" nor reached. Literal hosts were
-  // already vetted above and skip the resolver entirely.
+  // already vetted above and skip the resolver entirely: their vetted set is the
+  // literal itself.
+  let vettedAddresses: readonly string[] = [gate.host];
   if (!gate.literal) {
     const resolved = await resolveHostGuard(gate.host, value, ctx.lookupImpl);
-    if (resolved) return resolved;
+    if ("check" in resolved) return resolved.check;
+    vettedAddresses = resolved.addresses;
   }
 
   const trustedOwner = ctx.env.GITHUB_OWNER;
@@ -625,14 +816,22 @@ async function checkUrlSource(
   // redirect:"manual" on BOTH calls (TEAM-4091 F1) — following a redirect hands
   // the destination back to the caller and walks straight past urlGate, which only
   // ever saw the URL that was submitted.
+  //
+  // TEAM-4115: BOTH fetches ride the same connect-time pin, built from the set
+  // the gate/resolver just vetted, so undici can no longer re-resolve the name
+  // and land on 169.254.169.254 (the DNS-rebinding TOCTOU). `dispatcher` is
+  // non-standard on RequestInit, hence the cast; stub fetchImpls in tests simply
+  // ignore it.
   let method = "GET (Range 0-0)";
+  const dispatcher = (ctx.dispatcherFactory ?? createPinnedDispatcher)(gate.host, vettedAddresses);
   try {
     let res = await ctx.fetchImpl(value, {
       method: "GET",
       headers: { Range: "bytes=0-0" },
       redirect: "manual",
       signal: AbortSignal.timeout(URL_TIMEOUT_MS),
-    });
+      dispatcher,
+    } as RequestInit);
     await discardBody(res);
 
     // 403 can mean "Range is not in the signed headers"; 416 means the object is
@@ -643,7 +842,8 @@ async function checkUrlSource(
         method: "GET",
         redirect: "manual",
         signal: AbortSignal.timeout(URL_TIMEOUT_MS),
-      });
+        dispatcher,
+      } as RequestInit);
       await discardBody(res);
     }
 
@@ -671,14 +871,40 @@ async function checkUrlSource(
   } catch (err) {
     const name = (err as Error)?.name || "Error";
     const message = (err as Error)?.message || "";
+    // A pin refusal surfaces as fetch's opaque TypeError with the real reason on
+    // `cause` — carry that through so "connect to unvetted host refused" is not
+    // laundered into a bare "fetch failed". One level deep only: undici never
+    // nests further than this for a connector-level rejection.
+    const cause = (err as { cause?: { message?: string } })?.cause?.message || "";
+    // The pin refused the connect — this is the SAME definitive verdict a
+    // literal/resolved blocked host gets above, not a network hiccup worth
+    // retrying. Check cause first: `message` is fetch's generic "fetch failed"
+    // when the real reason is on cause.
+    const pinRefusal = cause.startsWith("Blocked URL host") ? cause : message.startsWith("Blocked URL host") ? message : "";
+    if (pinRefusal) {
+      return { outcome: "definitive", method: "parse", detail: `${pinRefusal}: ${redactUrl(value)}` };
+    }
     return {
       outcome: "transient",
       method,
       // undici echoes the request URL into some messages — redact it too.
       detail:
         `URL unreachable — ${method} -> ${name}: ${redactUrl(value)}` +
-        (message ? ` — ${redactUrl(message)}` : ""),
+        (message ? ` — ${redactUrl(message)}` : "") +
+        (cause && cause !== message ? ` — ${redactUrl(cause)}` : ""),
     };
+  } finally {
+    // Never leak a socket or the connector's keep-alive timer: an unclosed Agent
+    // keeps vitest's event loop alive and the ECS task's fd count climbing.
+    try {
+      await dispatcher.close();
+    } catch {
+      try {
+        await dispatcher.destroy();
+      } catch {
+        /* already gone */
+      }
+    }
   }
 }
 
@@ -739,7 +965,12 @@ export async function validateIntakeSources(
     if (value.startsWith("s3://")) {
       check = await checkS3Source(value, { s3, hubBucket: hubBucketPromise });
     } else if (value.startsWith("http://") || value.startsWith("https://")) {
-      check = await checkUrlSource(value, { fetchImpl, lookupImpl, env });
+      check = await checkUrlSource(value, {
+        fetchImpl,
+        lookupImpl,
+        env,
+        dispatcherFactory: opts.dispatcherFactory,
+      });
     } else if (source?.type === "s3") {
       // Not an s3:// URI — checkS3Source's parse branch rejects it definitively
       // without touching the client.
