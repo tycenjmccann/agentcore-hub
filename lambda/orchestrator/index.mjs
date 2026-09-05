@@ -45,6 +45,7 @@ import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { createMergeOnGreen } from "./merge-on-green.mjs";
 import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stability.mjs";
+import { shouldGateShipDispatch, normalizeShipDispatchMode, emitShipDispatchMetrics } from "./ship-dispatch-gate.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
@@ -128,6 +129,10 @@ const MERGE_ON_GREEN = process.env.MERGE_ON_GREEN || "off";
 // ship-head-stability.mjs (STRICT allow-list: garbage / legacy "on" → off, never
 // wedge ship). off = byte-identical (no GitHub probe, no metrics, always dispatch).
 const SHIP_HEAD_STABILITY = process.env.SHIP_HEAD_STABILITY || "off";
+// TEAM-4112 ship-dispatch prerequisite gate. Strict allow-list (garbage/legacy
+// truthy → off); default off = byte-identical (helper returns dispatch without
+// reading anything). Same fail-safe direction as SHIP_HEAD_STABILITY.
+const SHIP_DISPATCH_GATE = normalizeShipDispatchMode(process.env.SHIP_DISPATCH_GATE);
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -557,6 +562,126 @@ async function redriveDeferredShipHeads() {
   }
   if (rechecked) console.log(`[orchestrator] ship-head re-drive — rechecked=${rechecked} redriven=${redriven}`);
   return { rechecked, redriven };
+}
+
+/**
+ * Both ship-ticket dispatch gates, in one place, wired into BOTH Ready handlers
+ * (the Jira/webhook `handleTicketReadyUnified` and the DDB-stream legacy
+ * `handleTicketReady`). Runs only for ship-phase tickets (caller guards). Order
+ * matters: check prerequisites FIRST (cheap-ish sibling read, and no point
+ * probing GitHub for a run whose dev/QA isn't even done), THEN head-stability.
+ *
+ *   - TEAM-4112 SHIP_DISPATCH_GATE: gate the RM until its prerequisite dev/QA/CI
+ *     siblings are terminal. enforce writes a blockedBy edge to the incomplete
+ *     prerequisite (Jira issueLink + Blocked / DDB blockedBy+status), so the
+ *     EXISTING unblock cascade re-wakes ship when that prerequisite completes.
+ *   - TEAM-4111 SHIP_HEAD_STABILITY: defer the RM off a moving/not-green head;
+ *     re-driven on the reconcile-sweep tick (redriveDeferredShipHeads).
+ *
+ * Returns "dispatch" (proceed to claim + invoke) or "skip" (the caller returns
+ * immediately without claiming). Both gates default off ⇒ this returns
+ * "dispatch" with zero I/O and zero metrics — byte-identical to pre-gate.
+ * Never throws: a read/probe failure fails OPEN (dispatch) — a wedged ship is
+ * worse than a redundant RM invocation.
+ */
+async function evaluateShipTicketDispatch({ ticketId, parentId, agentDef, workflow }) {
+  // ── TEAM-4112: prerequisite gate ──────────────────────────────────────────
+  if (SHIP_DISPATCH_GATE !== "off") {
+    let siblings = null;
+    try {
+      siblings = await getChildTickets(parentId || workflow.epicId);
+    } catch (err) {
+      console.warn(`[orchestrator] ship-dispatch sibling read failed (dispatching, fail-open): ${err?.message || err}`);
+    }
+    if (siblings) {
+      const verdict = shouldGateShipDispatch({
+        agentDef,
+        wfDef: getEffectiveWorkflowDef(workflow),
+        siblings,
+        getAgentPhase: (a) => getAgentDef(a)?.phase,
+        shipPhases: SHIP_PHASES,
+      });
+      if (verdict.gated) {
+        if (SHIP_DISPATCH_GATE === "shadow") {
+          console.log(`[orchestrator] ship-dispatch WOULD gate ${ticketId} → prereq ${verdict.repairBlocker} incomplete (blockers=${verdict.blockers.join(",")}) — shadow`);
+          emitShipDispatchMetrics("wouldGate");
+        } else {
+          const self = siblings.find((s) => (s.ticketId || s.id || s.key) === ticketId);
+          try {
+            await blockShipOnPrereq(ticketId, self, verdict.repairBlocker);
+          } catch (err) {
+            // Block-write failure fails OPEN: better a redundant RM run than a
+            // ship ticket stuck Ready with no blockedBy edge to ever re-wake it.
+            console.warn(`[orchestrator] ship-dispatch block-write failed (dispatching, fail-open): ${err?.message || err}`);
+            emitShipDispatchMetrics("clear");
+            return "dispatch";
+          }
+          console.log(`[orchestrator] ship-dispatch GATE ${ticketId} → blocked on ${verdict.repairBlocker} (prereqs incomplete) — not dispatching`);
+          emitShipDispatchMetrics("gated");
+          return "skip";
+        }
+      } else {
+        emitShipDispatchMetrics("clear");
+      }
+    }
+  }
+
+  // ── TEAM-4111: head-stability gate ─────────────────────────────────────────
+  // On defer we persist the consecutive-deferral count + this ticket id and skip;
+  // the reconcile-tick re-drive re-enters the Ready handler once the head may
+  // have settled. On dispatch we clear any prior marker so the deadlock cap resets.
+  if (SHIP_HEAD_STABILITY !== "off") {
+    const verdict = await getShipHeadGate().evaluate(workflow, { ticketId });
+    if (verdict.action === "defer") {
+      const n = (Number(workflow.shipHeadDeferrals) || 0) + 1;
+      try { await store.setShipHeadDeferrals(workflow.id, n, ticketId); }
+      catch (err) { console.warn(`[orchestrator] ship-head deferral persist failed (non-fatal): ${err?.message || err}`); }
+      console.log(`[orchestrator] ship-head defer ${ticketId} (${verdict.reason}) — deferral ${n} — not dispatching`);
+      return "skip";
+    }
+    if ((Number(workflow.shipHeadDeferrals) || 0) > 0) {
+      try { await store.setShipHeadDeferrals(workflow.id, 0); }
+      catch (err) { console.warn(`[orchestrator] ship-head deferral clear failed (non-fatal): ${err?.message || err}`); }
+      workflow.shipHeadDeferrals = 0;
+    }
+  }
+
+  return "dispatch";
+}
+
+/**
+ * Block a ship ticket on an incomplete prerequisite (TEAM-4112 enforce). Writes
+ * the blockedBy edge the requirements agent should have — Jira: a "Blocks" issue
+ * link (blocker blocks ship) + a transition to Blocked; DynamoDB: append to the
+ * blockedBy array + set status "blocked". Idempotent: if the ship ticket already
+ * lists this blocker, only re-assert the Blocked status (Jira links dedupe by
+ * (type, pair) anyway). The existing unblock cascade re-wakes ship to Ready when
+ * the blocker reaches done/cancelled, so no bespoke re-drive is needed.
+ */
+async function blockShipOnPrereq(ticketId, shipTicket, blockerId) {
+  if (!blockerId) return;
+  const already = Array.isArray(shipTicket?.blockedBy) && shipTicket.blockedBy.includes(blockerId);
+  if (TICKET_PROVIDER === "jira") {
+    if (!already) {
+      await jiraFetch("/rest/api/3/issueLink", "POST", {
+        type: { name: "Blocks" },
+        inwardIssue: { key: blockerId },
+        outwardIssue: { key: ticketId },
+      });
+    }
+    await jiraTransition(ticketId, "Blocked");
+  } else {
+    const merged = already
+      ? shipTicket.blockedBy
+      : [...((shipTicket && shipTicket.blockedBy) || []), blockerId];
+    await ddb.send(new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId },
+      UpdateExpression: "SET blockedBy = :b, #s = :s, #u = :u",
+      ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+      ExpressionAttributeValues: { ":b": merged, ":s": "blocked", ":u": new Date().toISOString() },
+    }));
+  }
 }
 
 /**
@@ -2246,26 +2371,12 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   // ─── CD HANDOFF GUARD: no ship-phase work on a repo the hub does not deploy ───
   if (await skipShipTicketForHandoff(ticketId, agentDef, workflow)) return;
 
-  // ─── SHIP-HEAD STABILITY GATE (TEAM-4111) — keep the RM off a moving head ───
-  // Ship-phase tickets only. Default off = byte-identical (no probe, no metrics,
-  // always falls through). On defer we persist the consecutive-deferral count +
-  // this ticket id and RETURN without claiming; the reconcile-tick re-drive
-  // (redriveDeferredShipHeads) re-enters this handler when the head may have
-  // settled. On dispatch we clear any prior marker so the deadlock cap resets.
-  if (SHIP_HEAD_STABILITY !== "off" && SHIP_PHASES.has(agentDef.phase)) {
-    const verdict = await getShipHeadGate().evaluate(workflow, ticket);
-    if (verdict.action === "defer") {
-      const n = (Number(workflow.shipHeadDeferrals) || 0) + 1;
-      try { await store.setShipHeadDeferrals(workflow.id, n, ticketId); }
-      catch (err) { console.warn(`[orchestrator] ship-head deferral persist failed (non-fatal): ${err?.message || err}`); }
-      console.log(`[orchestrator] ship-head defer ${ticketId} (${verdict.reason}) — deferral ${n} — not dispatching`);
-      return;
-    }
-    if ((Number(workflow.shipHeadDeferrals) || 0) > 0) {
-      try { await store.setShipHeadDeferrals(workflow.id, 0); }
-      catch (err) { console.warn(`[orchestrator] ship-head deferral clear failed (non-fatal): ${err?.message || err}`); }
-      workflow.shipHeadDeferrals = 0;
-    }
+  // ─── SHIP-TICKET DISPATCH GATES (TEAM-4112 prereq + TEAM-4111 head stability) ───
+  // Ship-phase tickets only. Both gates default off = byte-identical (no reads,
+  // no probe, no metrics). "skip" means the ticket was held (blocked/deferred and
+  // persisted as needed) — return without claiming; "dispatch" means proceed.
+  if (SHIP_PHASES.has(agentDef.phase)) {
+    if ((await evaluateShipTicketDispatch({ ticketId, parentId, agentDef, workflow })) === "skip") return;
   }
 
   // Idempotency claim — ATOMIC, backend-agnostic. The workflow row lives in
@@ -2662,6 +2773,13 @@ async function handleTicketReady(ticketId, image) {
 
   // ─── CD HANDOFF GUARD: no ship-phase work on a repo the hub does not deploy ───
   if (await skipShipTicketForHandoff(ticketId, agentDef, workflow)) return;
+
+  // ─── SHIP-TICKET DISPATCH GATES (TEAM-4112 prereq + TEAM-4111 head stability) ───
+  // Same gates as the Jira path — wired here so DynamoDB-stream mode has parity.
+  // Both default off = byte-identical.
+  if (SHIP_PHASES.has(agentDef.phase)) {
+    if ((await evaluateShipTicketDispatch({ ticketId, parentId, agentDef, workflow })) === "skip") return;
+  }
 
   // Idempotency claim — same atomic workflow-row lock as the Jira path.
   const claimed = await claimTicketInvocation(workflow, ticketId, assignee);

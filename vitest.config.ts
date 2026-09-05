@@ -88,6 +88,13 @@ export default defineConfig({
       // CI green on that exact head). CI-red passes through, probe-throw and
       // maxDeferrals both fail open, unknown mode fails safe to off.
       "lambda/orchestrator/ship-head-stability.test.mjs",
+      // ship-dispatch-gate.mjs (TEAM-4112) — DI coverage for the ship-dispatch
+      // prerequisite gate: ship is gated iff a non-epic, completion-required,
+      // present pre-ship-phase sibling is not terminal. Epics/other-ship-phase/
+      // unclassifiable (human-gate) tickets never gate (fail-safe), absent phases
+      // never wedge, repairBlocker prefers verification/CI, and mode normalization
+      // is the same strict allow-list as ship-head (legacy on/true/1 → off).
+      "lambda/orchestrator/ship-dispatch-gate.test.mjs",
       // done-handlers-cascade (TEAM-3688 F3) — HANDLER-level cascade coverage.
       // Invokes the REAL handleTicketDoneUnified + handleTicketDone from index.mjs
       // through the REAL cascade (cascade.mjs/lease.mjs unmocked; only AWS/store
