@@ -9,6 +9,22 @@
  */
 
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+// TEAM-4121 FR-8: the shared fix-ticket contract. Byte-identical copy of the one
+// in lambda/agentcore-hub-tickets/ and lambda/orchestrator/ (each Lambda ships as
+// a self-contained zip, so they cannot share a file); CI byte-compares them.
+// Edit one copy, then `cp` it over the other two.
+import {
+  FIX_KINDS,
+  KIND_TO_ORIGIN_KEY,
+  TICKET_KEY_RE,
+  sanitizeSpawnedBy,
+  validateFixContract,
+  normalizeContractMode,
+  sanitizeUserLabels,
+  contractLabels,
+  renderFixContractBlock,
+  escapeJql,
+} from "./fix-contract.mjs";
 
 // ─── Jira Config ─────────────────────────────────────────────────────────────
 
@@ -16,9 +32,12 @@ const SITE = process.env.JIRA_SITE_URL;
 const EMAIL = process.env.JIRA_EMAIL;
 const TOKEN = process.env.JIRA_API_TOKEN;
 const PROJECT_KEY = process.env.JIRA_PROJECT_KEY || "TEAM";
-// TEAM-4113: fix-ticket origin kinds an agent may stamp via `spawned_by`. Kept
-// in lockstep with the DynamoDB tickets Lambda + orchestrator completion.mjs.
-const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
+// TEAM-4113: fix-ticket origin kinds an agent may stamp via `spawned_by` — now
+// the shared FIX_KINDS from fix-contract.mjs (TEAM-4121), in lockstep with the
+// DynamoDB tickets Lambda + orchestrator completion.mjs by construction.
+// TEAM-4121 FR-8: off = ignore the contract fields (byte-identical to before);
+// shadow = validate + accept + label `contract:incomplete`; enforce = reject.
+const FIX_TICKET_CONTRACT = normalizeContractMode(process.env.FIX_TICKET_CONTRACT);
 
 const BASE_URL = `https://${SITE}`;
 const AUTH = `Basic ${Buffer.from(`${EMAIL}:${TOKEN}`).toString("base64")}`;
@@ -72,6 +91,79 @@ async function loadValidAssignees() {
     VALID_ASSIGNEES = FALLBACK_ASSIGNEES;
   }
   return VALID_ASSIGNEES;
+}
+
+// ─── Workflow Phases (TEAM-4121 F7 — ported from the DynamoDB tickets Lambda) ─
+//
+// TEAM-3686 established this check in the DynamoDB provider: completion.mjs's
+// open-fix gate matches fix tickets per-phase (`phaseOf(t) === p` for each
+// required phase p), so a fix ticket stamped with a phase outside the known set
+// is invisible to EVERY required phase's check — the run can be declared
+// complete with the fix still open. Jira mode had the same exposure and worse:
+// createTicket DROPPED `phase` on the floor entirely, so an agent's correct
+// stamp was silently lost and the orchestrator had nothing to read.
+//
+// The valid set is derived from the same S3 configs the orchestrator and the
+// DynamoDB Lambda read — roster phases from config/agents.json plus each
+// workflow def's agentPhases + completionRequiresAgentPhases from
+// config/workflows.json — and the rejection text is byte-identical to the
+// tickets Lambda's, so an agent gets the same instruction in either mode.
+const FALLBACK_PHASES = new Set([
+  "requirements",
+  "design",
+  "development",
+  "verification",
+  "review",
+  "ship",
+]);
+
+let VALID_PHASES = null;
+
+async function loadValidPhases() {
+  if (VALID_PHASES) return VALID_PHASES;
+  if (!ARTIFACT_BUCKET) {
+    console.warn("[agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback phase set");
+    VALID_PHASES = FALLBACK_PHASES;
+    return VALID_PHASES;
+  }
+  const phases = new Set();
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: "config/agents.json",
+    }));
+    const config = JSON.parse(await res.Body.transformToString());
+    for (const a of config.agents || []) {
+      if (typeof a.phase === "string" && a.phase) phases.add(a.phase);
+    }
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] Failed to load agent phases from S3: ${err.message}`);
+  }
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: "config/workflows.json",
+    }));
+    const config = JSON.parse(await res.Body.transformToString());
+    for (const w of config.workflows || []) {
+      for (const p of w.phases || []) {
+        if (typeof p.agentPhase === "string" && p.agentPhase) phases.add(p.agentPhase);
+      }
+      for (const p of w.completionRequiresAgentPhases || []) {
+        if (typeof p === "string" && p) phases.add(p);
+      }
+    }
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] Failed to load workflow phases from S3: ${err.message}`);
+  }
+  if (phases.size === 0) {
+    console.warn("[agentcore-hub-jira] No phases loaded from S3 — using fallback phase set");
+    VALID_PHASES = FALLBACK_PHASES;
+  } else {
+    VALID_PHASES = phases;
+    console.log(`[agentcore-hub-jira] Loaded ${phases.size} valid phases from S3 config`);
+  }
+  return VALID_PHASES;
 }
 
 // ─── Status Mapping ──────────────────────────────────────────────────────────
@@ -213,7 +305,50 @@ async function listReviewers(params = {}) {
 // ─── Tool Implementations ────────────────────────────────────────────────────
 
 async function createTicket(params) {
-  const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by } = params;
+  const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels } = params;
+
+  // TEAM-4121 FR-8: provenance + contract, validated BEFORE anything is created
+  // in Jira so a rejected fix ticket leaves no partially-wired issue behind.
+  const spawn = sanitizeSpawnedBy(spawned_by);
+  if (spawn.error && FIX_TICKET_CONTRACT === "enforce") throw new Error(spawn.error);
+  if (spawn.error) console.warn(`[jira-tools] ignoring spawned_by with unknown/invalid kind: ${JSON.stringify(spawned_by)} (${spawn.error})`);
+  const fixKind = spawn.value ? spawn.value.kind : null;
+  const originId = fixKind ? spawn.value[KIND_TO_ORIGIN_KEY[fixKind]] || null : null;
+
+  // F7: `phase` used to be accepted and then silently DROPPED here, so a fix
+  // ticket's phase stamp never reached the orchestrator in Jira mode and the
+  // completion open-fix gate could not see it. Validate it against the same
+  // config-derived set the DynamoDB Lambda uses, with the same message.
+  const phaseStamp = typeof phase === "string" && phase.trim() ? phase.trim() : null;
+  if (spawn.value && phaseStamp) {
+    const validPhases = await loadValidPhases();
+    if (!validPhases.has(phaseStamp)) {
+      throw new Error(
+        `'phase' "${phaseStamp}" is not a known workflow phase — a fix ticket ` +
+        `with an unknown phase would be invisible to the completion open-fix gate. ` +
+        `Valid phases: ${[...validPhases].sort().join(", ")}`
+      );
+    }
+  }
+
+  let contract = null;
+  let contractIncomplete = false;
+  if (spawn.value && FIX_TICKET_CONTRACT !== "off") {
+    const fc = validateFixContract({ spawnedBy: spawn.value, ...(fix_contract || {}) });
+    const detail = [
+      fc.missing.length ? `missing: ${fc.missing.join(", ")}` : null,
+      fc.invalid.length ? `invalid: ${fc.invalid.join(", ")}` : null,
+    ].filter(Boolean).join("; ");
+    if (!fc.ok && FIX_TICKET_CONTRACT === "enforce") {
+      const firstProblem = fc.missing[0] || fc.invalid[0];
+      throw new Error(`'${firstProblem}' is required on a fix ticket (${detail})`);
+    }
+    if (!fc.ok) {
+      contractIncomplete = true;
+      console.warn(`[jira-tools] fix contract incomplete (shadow, accepting): ${detail}`);
+    }
+    contract = fc.contract;
+  }
 
   // Validate assignee against known roster — reject hallucinated agent names.
   // "human:<who>" assignees are human-review gates, not agents, and are always
@@ -233,13 +368,21 @@ async function createTicket(params) {
   // duplicate ticket plan. Before creating, look for an existing ticket in the
   // same workflow with the same summary + assignee; if found, return it instead
   // of making a copy. Keyed on the wf:<id> label so it only dedupes within a run.
+  // F6: `workflow_id` is interpolated into a JQL string literal, so it is
+  // shape-checked (it is a hub-minted `wf_<ms>_<slug>` id, never free text) and
+  // the summary is escaped backslash-first via the shared escapeJql. Escaping the
+  // quote first would double-escape the backslashes the escape itself adds,
+  // letting a summary containing `\"` terminate the literal and append JQL.
+  if (workflow_id && !/^[A-Za-z0-9_-]+$/.test(String(workflow_id))) {
+    throw new Error(`Invalid 'workflow_id' ${JSON.stringify(workflow_id)} — expected a hub workflow id (letters, digits, _ and - only)`);
+  }
   if (workflow_id && summary) {
     try {
       // statusCategory != Done: resolved tickets are excluded SERVER-SIDE so a
       // live duplicate is never pushed out of the 5-result window by older
       // completed same-summary tickets (Codex P2 on #356). The isDoneStatus
       // check below stays as defense-in-depth for the returned page.
-      const jql = `project = ${PROJECT_KEY} AND labels = "wf:${workflow_id}" AND statusCategory != Done AND summary ~ "\\"${summary.replace(/"/g, '\\"')}\\"" ORDER BY created ASC`;
+      const jql = `project = ${PROJECT_KEY} AND labels = "wf:${escapeJql(workflow_id)}" AND statusCategory != Done AND summary ~ "\\"${escapeJql(summary)}\\"" ORDER BY created ASC`;
       const existingSearch = await jiraSearch(jql, ["summary", "status", "labels", "assignee", "issuetype", "parent"], 5);
       const wantAgentLabel = assignee && !isHumanReviewer ? `agent:${assignee}` : null;
       const wantReviewerLabel = isHumanReviewer ? `reviewer:${assignee.slice("human:".length)}` : null;
@@ -288,23 +431,52 @@ async function createTicket(params) {
   // Assignee is carried as a label (Jira's assignee field needs an accountId).
   // Human-review gates use a "reviewer:<who>" label + a "human-review" marker so
   // the orchestrator recognizes them and parks instead of invoking an agent.
-  const labels = [];
+  // (`issueLabels`, not `labels` — the latter is now a caller-supplied argument,
+  // sanitized and appended at the end of this block.)
+  const issueLabels = [];
   if (isHumanReviewer) {
-    labels.push("human-review");
-    labels.push(`reviewer:${assignee.slice("human:".length)}`);
+    issueLabels.push("human-review");
+    issueLabels.push(`reviewer:${assignee.slice("human:".length)}`);
   } else if (assignee) {
-    labels.push(`agent:${assignee}`);
+    issueLabels.push(`agent:${assignee}`);
   }
-  if (workflow_id) labels.push(`wf:${workflow_id}`);
+  if (workflow_id) issueLabels.push(`wf:${workflow_id}`);
   // TEAM-4113: agents stamp a fix ticket's origin as `spawned_by:{kind}`; the
   // DynamoDB tickets Lambda persists it, so mirror it here as a `fix:<kind>`
   // label. The orchestrator reconstructs `spawnedBy.kind` from this label
   // (mapJiraIssueToTicket) so the completion evidence gate + rework-loop cap
   // count agent-filed fixes in Jira mode the same as in DynamoDB mode.
-  {
-    const kind = spawned_by && typeof spawned_by === "object" ? spawned_by.kind : null;
-    if (kind && FIX_KINDS.has(kind)) labels.push(`fix:${kind}`);
-    else if (spawned_by) console.warn(`[jira-tools] ignoring spawned_by with unknown/invalid kind: ${JSON.stringify(spawned_by)}`);
+  // TEAM-4121 FR-8: the rest of the contract rides along as labels — `origin:`
+  // (lineage), `evidence:` (how the author knows), `phase:` (F7, what the
+  // completion gate reads), and `contract:incomplete` when shadow mode let a
+  // partial contract through. Jira mode has no place to persist a structured
+  // record, so the labels ARE the index; the block in the description is the
+  // human/agent-readable copy.
+  //
+  // `fix:<kind>` and `phase:<p>` are emitted regardless of FIX_TICKET_CONTRACT:
+  // the first is pre-existing behavior and the second is the F7 defect fix (a
+  // dropped phase stamp is a completion-gate hole with or without contracts).
+  // The contract INDEX labels — origin:/evidence:/contract:incomplete — appear
+  // only when the flag is on, so mode=off adds no new FR-8 surface to Jira.
+  if (fixKind) {
+    const contractOn = FIX_TICKET_CONTRACT !== "off";
+    issueLabels.push(...contractLabels(contractOn ? contract : null, {
+      kind: fixKind,
+      originId: contractOn ? originId : null,
+      phase: phaseStamp,
+      incomplete: contractIncomplete,
+    }));
+  } else if (phaseStamp) {
+    // A non-fix ticket may still carry a phase stamp; it just isn't validated
+    // above (only fix tickets are gated on the known-phase set).
+    issueLabels.push(`phase:${phaseStamp}`);
+  }
+  // Caller-supplied labels last, and only after the system namespaces are
+  // stripped out of them — an agent must not be able to forge `fix:`/`wf:`.
+  const userLabels = sanitizeUserLabels(labels);
+  issueLabels.push(...userLabels.labels);
+  if (userLabels.dropped.length > 0) {
+    console.warn(`[jira-tools] dropped ${userLabels.dropped.length} label(s) squatting a system namespace: ${userLabels.dropped.join(", ")}`);
   }
 
   // Normalize common LLM variations of issue type names to Jira's canonical form
@@ -346,7 +518,7 @@ async function createTicket(params) {
     project: { key: PROJECT_KEY },
     summary,
     issuetype: { name: canonicalType },
-    labels,
+    labels: issueLabels,
   };
 
   // Human-review gate: assign the ticket to a REAL Jira user so they're notified
@@ -364,7 +536,27 @@ async function createTicket(params) {
     }
   }
 
-  if (description) {
+  // TEAM-4121 FR-8: when a contract exists, it leads the description as a yaml
+  // codeBlock. A codeBlock (not a paragraph) because the block is line-oriented
+  // and Jira must not reflow it — and because adfToText treats codeBlock as a
+  // block node, so the flattened text is the block verbatim followed by "\n" and
+  // then the prose, which is exactly what parseFixContractBlock expects
+  // (contract first, `rest` = the prose). The dedupe path above returns the
+  // existing issue untouched, so a retried create never re-prepends a second
+  // block onto a description that already has one.
+  const contractBlock = contract
+    ? renderFixContractBlock(contract, { kind: fixKind, originId, phase: phaseStamp })
+    : null;
+  if (contractBlock) {
+    fields.description = {
+      type: "doc",
+      version: 1,
+      content: [
+        { type: "codeBlock", attrs: { language: "yaml" }, content: [{ type: "text", text: contractBlock }] },
+        { type: "paragraph", content: [{ type: "text", text: description || "" }] },
+      ],
+    };
+  } else if (description) {
     fields.description = {
       type: "doc",
       version: 1,
@@ -551,6 +743,13 @@ async function updateTicket(params) {
 
 async function listTickets(params) {
   const { parent_id } = params;
+  // F6: `parent_id` lands UNQUOTED in the JQL (it is an issue key, not a string
+  // literal), so escaping cannot protect it — anything that is not a project key
+  // is refused outright. Without this, a parent_id of `X ORDER BY created` or
+  // `X OR project = OTHER` silently changes which tickets the caller gets back.
+  if (!TICKET_KEY_RE.test(String(parent_id || ""))) {
+    throw new Error(`Invalid 'parent_id' ${JSON.stringify(parent_id)} — expected an issue key like ${PROJECT_KEY}-123`);
+  }
   const jql = `parent = ${parent_id} ORDER BY created ASC`;
 
   const data = await jiraSearch(jql, ["summary", "status", "labels", "assignee", "issuetype"], 100);
@@ -660,7 +859,10 @@ async function getProjectIssueTypes() {
 
 async function lookupUser(params) {
   const { query } = params;
-  const jql = `project = ${PROJECT_KEY} AND labels in ("agent:${query}") ORDER BY created DESC`;
+  // F6: `query` is agent-supplied free text inside a quoted JQL literal — escape
+  // it (backslash first, then quote) so a name containing `"` cannot close the
+  // literal and append clauses.
+  const jql = `project = ${PROJECT_KEY} AND labels in ("agent:${escapeJql(query)}") ORDER BY created DESC`;
 
   try {
     const data = await jiraSearch(jql, ["labels"], 1);
