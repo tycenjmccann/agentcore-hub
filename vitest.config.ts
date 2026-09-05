@@ -230,6 +230,20 @@ export default defineConfig({
       // human actually filed (zero, in every dossier we have), that the
       // creation-time block still costs no I/O, and that off is unchanged.
       "lambda/orchestrator/replay-gate-state.test.mjs",
+      // dead-session-escalation (TEAM-4120 FR-3) — the page→synthesize→park tree,
+      // fully DI: the mode normalizer's shadow-coalescing fail-safe, the redaction
+      // table one vector per pattern (including a secret straddling the 600-char
+      // clip boundary), child selection replayed against the REAL yteqfl ticket
+      // set, the decision order (agent error > fresh record > children > park,
+      // never Done on a stale/blank record), shadow's single write, and that no
+      // dep failure can make it reject mid-sweep.
+      "lambda/orchestrator/dead-session-escalation.test.mjs",
+      // dead-session gate wake (TEAM-4120 FR-3) — index.mjs REAL, AWS/store seams
+      // mocked: a human Done'ing an `Escalation: dead session on TEAM-x (agent)`
+      // gate hands that ticket's retry budget back and announces the decision
+      // WITHOUT re-dispatching anything (the gate's own cascade unblocks it), and
+      // the release-manager escalation title still takes the TEAM-3971 branch.
+      "lambda/orchestrator/dead-session-gate-wake.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

@@ -192,6 +192,35 @@ describe("second dead session, same ticket (retry exhausted)", () => {
     expect(m.escalations).toBe(1);
     expect(m.retries).toBe(0);
   });
+
+  // TEAM-4120 FR-3: with the escalation tree wired, steps 1-3 are unchanged and
+  // the bare evidence-free page is HANDED OVER to it (which appends the enriched
+  // one itself, so appending here too would double-page the human).
+  it("hands the page to the escalation tree when wired, keeping steps 1-3", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const escalate = vi.fn(async () => ({ disposition: "parked" }));
+    const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), escalate });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(1);
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    expect(escalate).toHaveBeenCalledTimes(1);
+    expect(escalate.mock.calls[0][0]).toMatchObject({
+      ticketId: "TEAM-2",
+      agentId: "dev",
+      claim: { source: "dead-session-detector", startedAt: DEAD_STARTED },
+    });
+    expect(escalate.mock.calls[0][0].workflow.id).toBe("wf_1");
+    expect(escalate.mock.calls[0][0].claim.lastHeartbeatAt !== undefined).toBe(true);
+    expect(escalate.mock.calls[0][0].claim.detectorMeta).toBeDefined();
+    // The tree owns the page now.
+    expect(store.appendNotification).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(m.escalations).toBe(1);
+  });
 });
 
 describe("shadow mode", () => {

@@ -114,7 +114,11 @@ export function redactText(s) {
   t = t.replace(/sk-[A-Za-z0-9]{20,}/g, R);
   t = t.replace(/ATATT[A-Za-z0-9_-]{20,}/g, R);                 // Jira API token
   t = t.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, `Bearer ${R}`);
-  t = t.replace(/Authorization:\s*\S+/gi, `Authorization: ${R}`);
+  // `Authorization: <scheme> <credential>` — the scheme name is not the secret,
+  // so step OVER a known one and redact what follows. A bare `Authorization: xyz`
+  // (no scheme) still matches via the optional group.
+  t = t.replace(/Authorization:\s*(?:(Bearer|Basic|Token|Digest|AWS4-HMAC-SHA256)\s+)?\S+/gi,
+    (_m, scheme) => `Authorization: ${scheme ? `${scheme} ` : ""}${R}`);
 
   // Generic key=value — keep the KEY NAME (it tells the human what leaked) and
   // redact the value. Runs last so the specific patterns above win.
