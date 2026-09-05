@@ -28,7 +28,9 @@ The two stuck-agent decisions (the common case) are `retry` and `mark-done`:
 Usage:
   python3 intervene.py unstick   <workflowId> [--note "..."]
   python3 intervene.py retry     <workflowId> <agentId> [--note "..."] [--resume]
-  python3 intervene.py mark-done <workflowId> <ticketId> --evidence "PR #87 / s3 key / streamed PASS"
+  python3 intervene.py mark-done <workflowId> <ticketId> --evidence "PR #87 / s3 key / streamed PASS" [--force]
+                                 (--force overwrites evidence the ticket already carries; without it the
+                                  server refuses with 409 EVIDENCE_EXISTS and keeps the agent's own report)
   python3 intervene.py dispatch  <workflowId> <ticketId> [--note "..."] [--resume]
   python3 intervene.py comment   <workflowId> <ticketId> <text>
   python3 intervene.py escalate  <workflowId> <message>
@@ -135,6 +137,16 @@ def api_post(path, body=None):
                 file=sys.stderr,
             )
             raise SystemExit(2)
+        if e.code == 409 and code == "EVIDENCE_EXISTS":
+            # TEAM-4099 F6 — the ticket already carries evidence and a mark-done
+            # never replaces it. The endpoint speaks JSON (`force: true`); the
+            # operator's escape hatch is the flag.
+            raise SystemExit(
+                f"REFUSED (evidence exists): {message}\n"
+                f"  Kept: evidenceSource={payload.get('evidenceSource') or 'unknown'}\n"
+                "  Stale board only? Transition the ticket — the evidence is already there.\n"
+                "  Recorded evidence actually wrong? Re-run with --force (the override is logged as yours)."
+            )
         if e.code == 409 and code:
             raise SystemExit(f"REFUSED ({code}): {message}")
         raise SystemExit(f"API {e.code}: {detail}")
@@ -288,7 +300,16 @@ def cmd_mark_done(args):
 
     The client-side human-gate guard below is kept deliberately: the server
     refuses too (409 PROTECTED_TICKET), but refusing before the network call
-    means an operator pointed at a human review gate is told so immediately."""
+    means an operator pointed at a human review gate is told so immediately.
+
+    TEAM-4099 F6 — a mark-done FILLS gaps, it never clobbers. If the task entry
+    already carries an `output` (the agent's real deliverable), the server
+    refuses with 409 EVIDENCE_EXISTS and names the evidenceSource it kept.
+    `--force` is the deliberate override for the rare case where the recorded
+    evidence is known wrong; it overwrites the row and the completions record,
+    and the `manager.intervention` event carries `forced: true`. Prefer no
+    --force: if the evidence is right but the board is stale, transition the
+    ticket instead of overwriting the proof."""
     if not (args.evidence or "").strip():
         raise SystemExit(
             "REFUSED: mark-done requires --evidence citing the shipped deliverable "
@@ -297,13 +318,16 @@ def cmd_mark_done(args):
         )
     if TICKET_PROVIDER != "jira":
         refuse_if_protected(get_ticket(args.ticket_id))
+    force = bool(getattr(args, "force", False))
     result = api_post(f"/api/workflow/{args.workflow_id}/tickets/mark-done", {
         "ticketId": args.ticket_id,
         "evidence": args.evidence,
+        **({"force": True} if force else {}),
     })
     publish_intervention(args.workflow_id, "mark_done", {
         "ticketId": args.ticket_id, "evidence": args.evidence[:500],
         "evidenceSource": result.get("evidenceSource"),
+        **({"forced": True} if force else {}),
     })
     # Which evidence the server actually recorded matters to the operator: a
     # `manager` source means it fell back to the text they typed, while a branch /
@@ -561,6 +585,10 @@ def main():
     p.add_argument("ticket_id")
     p.add_argument("--evidence", default="",
                    help="REQUIRED: the shipped deliverable (S3 key, PR URL, or streamed PASS verdict)")
+    p.add_argument("--force", action="store_true",
+                   help="Overwrite evidence the ticket ALREADY carries (the server otherwise "
+                        "refuses with 409 EVIDENCE_EXISTS). Only when the recorded evidence is "
+                        "known wrong - the override is stamped with your identity.")
     p.set_defaults(func=cmd_mark_done)
 
     p = sub.add_parser("cancel")

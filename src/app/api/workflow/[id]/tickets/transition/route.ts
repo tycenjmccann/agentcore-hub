@@ -1,20 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { getWorkflowFromDynamo, getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { withDefaultDecision } from "@/lib/workflow/gate-decision";
+import { appendGateDecision } from "@/lib/workflow/workflow-store";
 import { getIdentity } from "@/lib/auth/identity";
 
 export const dynamic = "force-dynamic";
 
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
-const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
-const ddb = DynamoDBDocumentClient.from(
-  new DynamoDBClient({ region: process.env.AWS_REGION || "us-east-1" }),
-  { marshallOptions: { removeUndefinedValues: true } }
-);
 
 /**
  * TEAM-3991 F6 — the gate DECISION ledger writer.
@@ -34,10 +28,12 @@ const ddb = DynamoDBDocumentClient.from(
  * request body: a body-supplied actor is caller-controlled, and this row is the
  * evidence a human authorized the merge.
  *
- * Mirrors workflow-store.mjs appendGateDecision — seed the map, then list_append
- * (never a whole-array rewrite, so a console click and a Telegram reply landing
- * together are both recorded). Best-effort by construction: the human's
- * transition already succeeded, so a ledger failure is logged, never surfaced.
+ * The write itself lives in src/lib/workflow/workflow-store.ts
+ * (appendGateDecision, twin of workflow-store.mjs) — seed the map, then
+ * list_append, never a whole-array rewrite, so a console click and a Telegram
+ * reply landing together are both recorded. Best-effort by construction: the
+ * human's transition already succeeded, so a ledger failure is logged, never
+ * surfaced.
  */
 async function recordGateDecision(
   workflowId: string,
@@ -57,33 +53,7 @@ async function recordGateDecision(
     // record is worse than one honest value naming the endpoint that wrote it.
     source: "console",
   };
-  await ddb.send(
-    new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: "SET reviewGateHistory = if_not_exists(reviewGateHistory, :emptyMap)",
-      ExpressionAttributeValues: { ":emptyMap": {} },
-    })
-  );
-  await ddb.send(
-    new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: "SET reviewGateHistory.#g = if_not_exists(reviewGateHistory.#g, :seed)",
-      ExpressionAttributeNames: { "#g": gateTicketId },
-      ExpressionAttributeValues: { ":seed": { rounds: [], authorizations: [], escalations: [] } },
-    })
-  );
-  await ddb.send(
-    new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression:
-        "SET reviewGateHistory.#g.decisions = list_append(if_not_exists(reviewGateHistory.#g.decisions, :empty), :d)",
-      ExpressionAttributeNames: { "#g": gateTicketId },
-      ExpressionAttributeValues: { ":empty": [], ":d": [row] },
-    })
-  );
+  await appendGateDecision(workflowId, gateTicketId, row);
   console.log(`[transition] ${gateTicketId}: recorded ${decision} by ${decidedBy} in the gate ledger`);
 }
 

@@ -208,7 +208,7 @@ export async function POST(
             { status: 409 }
           );
         }
-        await writeResumeContext(ddb, WORKFLOWS_TABLE, workflowId, targetTicket, resumeNote(targetTicket, pr));
+        await writeResumeContext(workflowId, targetTicket, resumeNote(targetTicket, pr));
         console.log(`[retry] ${targetTicket}: resuming onto PR #${pr.number} (${pr.state})`);
       }
     }

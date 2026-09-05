@@ -8,6 +8,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, UpdateCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { mergeTaskMetadata } from "@/lib/workflow/workflow-store";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -188,38 +189,23 @@ async function getWorkflowFromDynamo(workflowId: string) {
  * Scoped per-field merge into agentTasks[ticketId]. The previous version
  * rewrote the ENTIRE agentTasks map from a read snapshot (keyed by agentId,
  * doubly wrong) — resurrecting pre-claim state over concurrent sibling
- * invocation claims (study P1).
+ * invocation claims (study P1). TEAM-4099 F6 moved the write itself into
+ * workflow-store.mergeTaskMetadata (twin of the orchestrator's), which keeps the
+ * per-field SETs, the `attribute_exists(agentTasks.#tid)` condition and the
+ * same-write `updatedAt` stamp.
+ *
+ * A missing entry returns false: drop the metadata rather than materializing a
+ * partial entry the orchestrator's claim path doesn't own. Anything else
+ * (throttle, auth, service error) still propagates so the delivery retries.
  */
 async function updateWorkflowTaskMetadata(workflowId: string, ticketId: string, metadata: Record<string, unknown>) {
-  const names: Record<string, string> = { "#tid": ticketId, "#u": "updatedAt" };
-  const values: Record<string, unknown> = { ":u": new Date().toISOString() };
-  const sets = ["#u = :u"];
-  let i = 0;
-  for (const [k, v] of Object.entries({
-    ...metadata,
-    status: "complete",
-    completedAt: new Date().toISOString(),
-  })) {
-    if (v === undefined || v === null) continue;
-    i++;
-    names[`#f${i}`] = k;
-    values[`:v${i}`] = v;
-    sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
-  }
-  try {
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: `SET ${sets.join(", ")}`,
-      ConditionExpression: "attribute_exists(agentTasks.#tid)",
-      ExpressionAttributeNames: names,
-      ExpressionAttributeValues: values,
-    }));
-  } catch (err) {
-    // Entry not tracked yet — drop the metadata rather than materializing a
-    // partial entry the orchestrator's claim path doesn't own. Anything else
-    // (throttle, auth, service error) must propagate so the delivery retries.
-    if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
+  const applied = await mergeTaskMetadata(
+    workflowId,
+    ticketId,
+    { ...metadata, status: "complete", completedAt: new Date().toISOString() },
+    { touchUpdatedAt: true }
+  );
+  if (!applied) {
     console.warn(`[webhook:lambda] task metadata skipped for ${ticketId}: no tracked entry`);
   }
 }

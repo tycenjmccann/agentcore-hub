@@ -27,13 +27,22 @@
  *     ticket in `in_review` is a DECISION someone else owes. Marking it done from
  *     here would forge that decision — 409 PROTECTED_TICKET. Gate decisions go
  *     through the transition route, which records them in the gate ledger.
+ *
+ * TEAM-4099 F6 — FILL-ONLY, never a clobber. The three sources above chose what
+ * this route WRITES; nothing protected what was already on the row, so a typed
+ * `--evidence` replaced an agent's real `output` (and the S3 record overwrote the
+ * agent's own completions record). Now the row write is `if_not_exists` per field
+ * under `attribute_not_exists(...output)` (workflow-store.markDoneEvidence) and
+ * the record is a conditional create (`IfNoneMatch: "*"`). Real evidence wins;
+ * a caller who means to replace it must say `force: true` and is logged doing so.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { markDoneEvidence } from "@/lib/workflow/workflow-store";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { githubApi, parseRepo, probeTicketBranches, type BranchEvidence } from "@/lib/workflow/evidence";
@@ -106,69 +115,40 @@ async function transitionToDone(ticketId: string, by: string): Promise<void> {
 }
 
 /**
- * Merge evidence into `agentTasks.<ticketId>`, creating the entry when the agent
- * died before any claim landed (hand-port of workflow-store.mjs
- * mergeTaskMetadataOrTrack: scoped conditional merge, seed, re-merge). Every
- * write is field-scoped — never a whole-map rewrite, so a concurrent
- * orchestrator write to another ticket cannot be clobbered (R2).
+ * Write the completions record, creating it only if absent unless the caller
+ * forced the mark-done. TEAM-4099 F6: this used to be an unconditional
+ * PutObject, so a manager mark-done overwrote the agent's OWN record — the same
+ * clobber F4 fixed on the synthesis path, in the other direction. `IfNoneMatch:
+ * "*"` makes it a conditional create; a 412 means the agent (or the salvage
+ * path) already wrote one and theirs stands.
+ *
+ * Returns "written" | "exists" | "failed" — "failed" is non-fatal by design:
+ * the agentTasks row write is what the completion gate reads.
  */
-async function mergeTaskEvidence(
-  workflowId: string,
+async function writeCompletionRecord(
   ticketId: string,
-  fields: Record<string, unknown>,
-  seed: Record<string, unknown>
-): Promise<boolean> {
-  const entries = Object.entries(fields).filter(([, v]) => v !== undefined && v !== "");
-  if (entries.length === 0) return false;
-  const names: Record<string, string> = { "#tid": ticketId };
-  const values: Record<string, unknown> = {};
-  const sets: string[] = [];
-  entries.forEach(([k, v], i) => {
-    names[`#f${i}`] = k;
-    values[`:v${i}`] = v;
-    sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
-  });
-  const merge = async () => {
-    try {
-      await ddb.send(
-        new UpdateCommand({
-          TableName: WORKFLOWS_TABLE,
-          Key: { workflowId },
-          UpdateExpression: `SET ${sets.join(", ")}`,
-          ConditionExpression: "attribute_exists(agentTasks.#tid)",
-          ExpressionAttributeNames: names,
-          ExpressionAttributeValues: values,
-        })
-      );
-      return true;
-    } catch (err) {
-      if ((err as Error).name !== "ConditionalCheckFailedException") throw err;
-      return false;
+  body: string,
+  force: boolean
+): Promise<"written" | "exists" | "failed"> {
+  try {
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: ARTIFACT_BUCKET,
+        Key: `completions/${ticketId}.json`,
+        Body: body,
+        ContentType: "application/json",
+        ...(force ? {} : { IfNoneMatch: "*" }),
+      })
+    );
+    return "written";
+  } catch (err) {
+    const e = err as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number } };
+    if (e?.name === "PreconditionFailed" || e?.Code === "PreconditionFailed" || e?.$metadata?.httpStatusCode === 412) {
+      return "exists";
     }
-  };
-  if (await merge()) return true;
-  // No tracked entry: seed one (first-writer-wins, so a concurrent tracker is
-  // harmless) and merge again.
-  await ddb.send(
-    new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: "SET agentTasks = if_not_exists(agentTasks, :emptyMap)",
-      ExpressionAttributeValues: { ":emptyMap": {} },
-    })
-  );
-  await ddb.send(
-    new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: "SET agentTasks.#tid = if_not_exists(agentTasks.#tid, :seed)",
-      ExpressionAttributeNames: { "#tid": ticketId },
-      ExpressionAttributeValues: {
-        ":seed": { ticketId, status: "pending", createdAt: new Date().toISOString(), ...seed },
-      },
-    })
-  );
-  return await merge();
+    console.warn(`[mark-done] ${ticketId}: completions record write failed: ${(err as Error).message}`);
+    return "failed";
+  }
 }
 
 export async function POST(req: NextRequest, { params }: { params: { id: string } }) {
@@ -186,6 +166,10 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
   }
   // SECURITY F16: the actor is the authenticated caller, never the body.
   const markedDoneBy = getIdentity(req).userId;
+  // F6: an explicit "yes, replace the evidence that is already there". Not a
+  // security boundary (the actor is still authenticated and stamped) — it is the
+  // difference between a manager filling a gap and a manager overruling an agent.
+  const force = body.force === true;
 
   try {
     const wf = await ddb.send(new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId } }));
@@ -283,45 +267,74 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
 
     const markedDoneAt = new Date().toISOString();
 
-    // 1. The evidence, on the run record. SECURITY F16: no mergeCommit, no
-    //    outcome, no blockReason — a manager override never forges a ship verdict.
-    await mergeTaskEvidence(
+    // 1. The evidence, on the run record — FILL-ONLY (F6). SECURITY F16: no
+    //    mergeCommit, no outcome, no blockReason — a manager override never
+    //    forges a ship verdict.
+    const row = await markDoneEvidence(
       workflowId,
       ticketId,
       { output, branch, commitSha, prUrl, evidenceSource: "manager", markedDoneBy, markedDoneAt },
-      { agentId: assignee }
+      { force, seed: { agentId: assignee } }
     );
+    if (!row.applied) {
+      // Real evidence is already on the row and we were not told to replace it.
+      // Refuse the WHOLE mark-done — no record write, no transition — and say
+      // which of the two things the caller probably wanted: a stale board moves
+      // through the transition endpoint (evidence untouched), an actual override
+      // needs force:true with this actor's name on it. `evidenceSource` comes
+      // from the pre-read snapshot: informational, not the CAS the refusal rests
+      // on (that one is `attribute_not_exists(agentTasks.<tid>.output)`).
+      const existing = ((workflow.agentTasks as Record<string, Row> | undefined)?.[ticketId] || {}) as Row;
+      return NextResponse.json(
+        {
+          code: "EVIDENCE_EXISTS",
+          error:
+            `${ticketId} already carries evidence (evidenceSource: ${str(existing.evidenceSource) || "unknown"}) — ` +
+            `a mark-done fills gaps, it never replaces an agent's own report. If the board is merely stale, move ` +
+            `the ticket with the transition endpoint and leave the evidence alone. If you really mean to overrule ` +
+            `it, repeat this call with { force: true } and your name goes on the override.`,
+          ticketId,
+          evidenceSource: str(existing.evidenceSource),
+          reason: row.reason,
+        },
+        { status: 409 }
+      );
+    }
 
     // 2. The durable record, so the orchestrator's own re-harvest (and the
     //    completion route's) find it too. `source: "manager"` — never "agent".
+    //    Conditional create unless forced (F6): an existing record is the
+    //    agent's, and D1.3's own precedence says the agent's record outranks us.
+    let recordState: "written" | "exists" | "failed" | "skipped" = "skipped";
     if (ARTIFACT_BUCKET) {
-      try {
-        await s3.send(
-          new PutObjectCommand({
-            Bucket: ARTIFACT_BUCKET,
-            Key: `completions/${ticketId}.json`,
-            Body: JSON.stringify(
-              {
-                source: "manager",
-                ticket_id: ticketId,
-                workflow_id: workflowId,
-                agent_id: assignee,
-                summary: output,
-                branch,
-                commit_sha: commitSha,
-                pr_url: prUrl,
-                marked_done_by: markedDoneBy,
-                marked_done_at: markedDoneAt,
-              },
-              null,
-              2
-            ),
-            ContentType: "application/json",
-          })
+      recordState = await writeCompletionRecord(
+        ticketId,
+        JSON.stringify(
+          {
+            source: "manager",
+            ticket_id: ticketId,
+            workflow_id: workflowId,
+            agent_id: assignee,
+            summary: output,
+            branch,
+            commit_sha: commitSha,
+            pr_url: prUrl,
+            marked_done_by: markedDoneBy,
+            marked_done_at: markedDoneAt,
+            ...(force ? { forced: true } : {}),
+          },
+          null,
+          2
+        ),
+        force
+      );
+      if (recordState === "exists") {
+        // Their record stands; ours is dropped. The row write DID apply (the gate
+        // reads that), and the board still moves — the ticket is done either way,
+        // and stopping here would leave a done-in-fact ticket open on the board.
+        console.log(
+          `[mark-done] ${workflowId}/${ticketId}: completions record already exists — keeping it, row evidence applied`
         );
-      } catch (err) {
-        // The agentTasks write already landed, which is what the gate reads.
-        console.warn(`[mark-done] ${ticketId}: completions record write failed: ${(err as Error).message}`);
       }
     }
 
@@ -349,6 +362,10 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
               branch,
               commitSha,
               prUrl,
+              // F6: an override is a different act from a fill, and a replay must
+              // be able to tell them apart.
+              ...(force ? { forced: true } : {}),
+              recordState,
             },
           },
         })
@@ -357,8 +374,19 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       /* event publish is non-fatal */
     }
 
-    console.log(`[mark-done] ${workflowId}/${ticketId}: done by ${markedDoneBy} (evidence: ${evidenceSource})`);
-    return NextResponse.json({ ok: true, ticketId, evidenceSource, branch, commitSha, prUrl });
+    console.log(
+      `[mark-done] ${workflowId}/${ticketId}: done by ${markedDoneBy} ` +
+        `(evidence: ${evidenceSource}${force ? ", FORCED" : ""}, record: ${recordState})`
+    );
+    return NextResponse.json({
+      ok: true,
+      ticketId,
+      evidenceSource,
+      branch,
+      commitSha,
+      prUrl,
+      ...(force ? { forced: true } : {}),
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     console.error(`[mark-done] ${workflowId}/${ticketId}:`, message);

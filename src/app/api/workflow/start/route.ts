@@ -11,8 +11,6 @@
 
 import { timingSafeEqual, createHash } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { validateIntakeSources } from "@/lib/workflow/intake";
 import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure } from "@/lib/workflow/repo-check";
@@ -21,10 +19,15 @@ import type { WorkflowInput } from "@/lib/workflow/types";
 import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
 import { workflowTypeForDef } from "@/lib/workflow/workflow-defs";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
+import {
+  claimDedupMarker,
+  getWorkflowRow,
+  markWorkflowStartError as storeMarkWorkflowStartError,
+  putWorkflowRowFenced,
+  repointDedupMarker,
+} from "@/lib/workflow/workflow-store";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
-const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
-const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const PROJECT_KEY = process.env.JIRA_PROJECT_KEY || process.env.PROJECT_KEY || "TEAM";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || "agentcore-hub-tickets";
@@ -39,9 +42,10 @@ const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || "agentcore-hub-ti
 const RESERVED_INTAKE_CHANNELS = new Set(["anomaly-detector"]);
 const INTAKE_INTERNAL_SECRET_HEADER = "x-intake-internal-secret";
 
-const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
-  marshallOptions: { removeUndefinedValues: true },
-});
+// Every workflows-table write this route makes goes through
+// src/lib/workflow/workflow-store.ts (TEAM-4099 F6), which owns the client; the
+// tickets are created through the ticket-tools Lambda. So there is no DynamoDB
+// client here at all.
 const lambda = new LambdaClient({ region: REGION });
 
 const TERMINAL_PHASES = new Set(["complete", "error", "cancelled"]);
@@ -134,35 +138,23 @@ async function resolveDedup(
   const markerId = `wfdedup_${idemKey}`;
   const candidateWorkflowId = mintWorkflowId();
 
-  try {
-    await ddb.send(
-      new PutCommand({
-        TableName: WORKFLOWS_TABLE,
-        Item: {
-          workflowId: markerId,
-          canonicalWorkflowId: candidateWorkflowId,
-          sourceTicket,
-          defId,
-          createdAt: new Date().toISOString(),
-        },
-        ConditionExpression: "attribute_not_exists(workflowId)",
-      })
-    );
+  if (
+    await claimDedupMarker({
+      workflowId: markerId,
+      canonicalWorkflowId: candidateWorkflowId,
+      sourceTicket,
+      defId,
+      createdAt: new Date().toISOString(),
+    })
+  ) {
     return { proceed: candidateWorkflowId, markerId };
-  } catch (err) {
-    if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
   }
 
   // The marker already exists — inspect the canonical run it points to.
-  const markerRes = await ddb.send(
-    new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: markerId }, ConsistentRead: true })
-  );
-  const priorCanonical = markerRes.Item?.canonicalWorkflowId as string | undefined;
+  const marker = await getWorkflowRow(markerId);
+  const priorCanonical = marker?.canonicalWorkflowId as string | undefined;
   if (priorCanonical) {
-    const canonRes = await ddb.send(
-      new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: priorCanonical }, ConsistentRead: true })
-    );
-    const canon = canonRes.Item;
+    const canon = await getWorkflowRow(priorCanonical);
     // A live (non-terminal) canonical run owns this key — coalesce onto it.
     if (canon && !TERMINAL_PHASES.has(String(canon.phase)) && canon.deleted !== true) {
       return { coalesce: priorCanonical };
@@ -172,7 +164,7 @@ async function resolveDedup(
     // create a second epic/workflow for the same key. Past the window (or with
     // an unusable createdAt) treat it as stillborn and let the re-point run.
     if (!canon) {
-      const ageMs = markerAgeMs(markerRes.Item?.createdAt);
+      const ageMs = markerAgeMs(marker?.createdAt);
       if (ageMs !== null && ageMs < DEDUP_INFLIGHT_GRACE_MS) {
         return { coalesce: priorCanonical };
       }
@@ -182,107 +174,27 @@ async function resolveDedup(
   // The prior run is terminal (or gone). Atomically re-point the marker at a
   // fresh run, guarded on the exact canonical id we just read so a concurrent
   // racer can't double-claim. If that guard loses, re-read and coalesce.
-  try {
-    await ddb.send(
-      new PutCommand({
-        TableName: WORKFLOWS_TABLE,
-        Item: {
-          workflowId: markerId,
-          canonicalWorkflowId: candidateWorkflowId,
-          sourceTicket,
-          defId,
-          createdAt: new Date().toISOString(),
-        },
-        ConditionExpression: priorCanonical
-          ? "canonicalWorkflowId = :old"
-          : "attribute_not_exists(canonicalWorkflowId)",
-        ...(priorCanonical ? { ExpressionAttributeValues: { ":old": priorCanonical } } : {}),
-      })
-    );
-    return { proceed: candidateWorkflowId, markerId };
-  } catch (err) {
-    if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
-    const reread = await ddb.send(
-      new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: markerId }, ConsistentRead: true })
-    );
-    const winner = reread.Item?.canonicalWorkflowId as string | undefined;
-    return winner ? { coalesce: winner } : { proceed: candidateWorkflowId, markerId };
-  }
+  const repointed = await repointDedupMarker(
+    {
+      workflowId: markerId,
+      canonicalWorkflowId: candidateWorkflowId,
+      sourceTicket,
+      defId,
+      createdAt: new Date().toISOString(),
+    },
+    priorCanonical
+  );
+  if (repointed) return { proceed: candidateWorkflowId, markerId };
+  const reread = await getWorkflowRow(markerId);
+  const winner = reread?.canonicalWorkflowId as string | undefined;
+  return winner ? { coalesce: winner } : { proceed: candidateWorkflowId, markerId };
 }
 
-/**
- * TEAM-3703: write the canonical workflow row behind an atomic ownership FENCE.
- *
- * The dedup marker is claimed/re-pointed BEFORE the epic + workflow row are
- * created (resolveDedup). Those external steps can take arbitrarily long, so by
- * the time this caller writes its row the marker may have been re-pointed at a
- * different racer (a legitimate recovery when the first owner looked dead). A
- * plain PutCommand here would land the loser's row anyway → two live workflows
- * for one (sourceTicket, defId). The old grace window only NARROWED that race.
- *
- * The fix makes ownership a precondition of the write, not a prior guess: for a
- * dedup start (markerId present) the row is put inside a TransactWriteCommand
- * whose ConditionCheck requires `marker.canonicalWorkflowId = this workflowId`.
- * If the marker no longer points at us the whole transaction is cancelled and
- * the row is NOT written — we lost the fence and must coalesce onto the winner.
- * Non-dedup starts (no marker) keep the plain unconditioned PutCommand.
- *
- * Returns:
- *   - { won: true }               → the row was written; caller proceeds.
- *   - { won: false, winner }      → fence lost; caller must NOT keep its row
- *                                   (none was written) and should coalesce onto
- *                                   `winner` (the marker's current canonical id).
- * Throws on any non-fence error (including a TransactionCanceledException whose
- * re-read still shows US as owner — that is a transient conflict, not a loss).
- */
-async function putWorkflowRowFenced(
-  item: Record<string, unknown>,
-  markerId: string | undefined
-): Promise<{ won: true } | { won: false; winner: string | undefined }> {
-  const workflowId = item.workflowId as string;
-
-  // Non-dedup start (human/API caller with no sourceTicket): nothing to fence.
-  if (!markerId) {
-    await ddb.send(new PutCommand({ TableName: WORKFLOWS_TABLE, Item: item }));
-    return { won: true };
-  }
-
-  try {
-    await ddb.send(
-      new TransactWriteCommand({
-        TransactItems: [
-          // Put is unconditioned (same as the legacy PutCommand) — the row's
-          // workflowId is freshly minted per start, so there is nothing to
-          // collide with; the marker ConditionCheck is the only guard.
-          { Put: { TableName: WORKFLOWS_TABLE, Item: item } },
-          {
-            ConditionCheck: {
-              TableName: WORKFLOWS_TABLE,
-              Key: { workflowId: markerId },
-              ConditionExpression: "canonicalWorkflowId = :me",
-              ExpressionAttributeValues: { ":me": workflowId },
-            },
-          },
-        ],
-      })
-    );
-    return { won: true };
-  } catch (err) {
-    if ((err as { name?: string }).name !== "TransactionCanceledException") throw err;
-    // The transaction was cancelled. The only conditioned item is the marker
-    // ConditionCheck, so a cancel means either the marker was re-pointed away
-    // (fence loss) or a transient transaction conflict. Disambiguate by re-reading
-    // the marker: if it still points at us this was a conflict, not a loss —
-    // rethrow so the caller surfaces it (the outer POST catch returns 500 and the
-    // trigger redelivers). Otherwise we genuinely lost ownership.
-    const reread = await ddb.send(
-      new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: markerId }, ConsistentRead: true })
-    );
-    const winner = reread.Item?.canonicalWorkflowId as string | undefined;
-    if (winner === workflowId) throw err;
-    return { won: false, winner };
-  }
-}
+// TEAM-3703's ownership FENCE for the canonical workflow row (a dedup start puts
+// the row inside a transaction whose ConditionCheck proves the marker still names
+// this workflowId) is workflow-store.putWorkflowRowFenced — TEAM-4099 F6 moved it
+// there with every other workflows-table write. Losing the fence means NO row was
+// written and the caller must coalesce onto the returned winner.
 
 /**
  * TEAM-3686: mark a just-created workflow row terminal when intake-ticket
@@ -296,18 +208,9 @@ async function putWorkflowRowFenced(
  */
 async function markWorkflowStartError(workflowId: string, cause: unknown): Promise<void> {
   try {
-    await ddb.send(
-      new UpdateCommand({
-        TableName: WORKFLOWS_TABLE,
-        Key: { workflowId },
-        UpdateExpression: "SET #phase = :error, erroredAt = :ts, startError = :msg",
-        ExpressionAttributeNames: { "#phase": "phase" },
-        ExpressionAttributeValues: {
-          ":error": "error",
-          ":ts": new Date().toISOString(),
-          ":msg": `intake ticket creation failed: ${String((cause as Error)?.message || cause).slice(0, 500)}`,
-        },
-      })
+    await storeMarkWorkflowStartError(
+      workflowId,
+      `intake ticket creation failed: ${String((cause as Error)?.message || cause).slice(0, 500)}`
     );
     console.error(`[start] workflow ${workflowId} marked error — intake ticket creation failed: ${(cause as Error)?.message}`);
   } catch (markErr) {

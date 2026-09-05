@@ -15,7 +15,14 @@ import { NextRequest } from "next/server";
  *   refuse_if_protected  a human-assigned ticket or an in_review ticket is a
  *        DECISION someone else owes — 409, use the transition endpoint.
  *
- * Only the seams are mocked: the DDB doc client, S3, the tickets Lambda, Jira.
+ * TEAM-4099 F6 adds the fourth rule: a mark-done FILLS GAPS, it never clobbers.
+ * The row write is fill-only and refuses outright when real `output` is already
+ * there (409 EVIDENCE_EXISTS), the completions record is a conditional create,
+ * and only an explicit `force: true` overrules either — logged as such.
+ *
+ * Only the seams are mocked: the DDB doc client (which models agentTasks well
+ * enough to honour both CAS conditions), S3 (which honours IfNoneMatch), the
+ * tickets Lambda, Jira.
  */
 
 const h = vi.hoisted(() => ({
@@ -24,15 +31,14 @@ const h = vi.hoisted(() => ({
     ticket: null as Record<string, unknown> | null,
     /** completions/<id>.json bodies by key. */
     s3Objects: {} as Record<string, string>,
-    s3Puts: [] as Array<{ Key: string; Body: string }>,
+    /** Every ATTEMPTED PutObject (a 412 is recorded too, then thrown). */
+    s3Puts: [] as Array<{ Key: string; Body: string; IfNoneMatch?: string }>,
     updates: [] as Array<Record<string, unknown>>,
     events: [] as Array<Record<string, unknown>>,
     lambdaCalls: [] as Array<Record<string, unknown>>,
     /** GitHub responses by path fragment; unmatched paths 404. */
     github: {} as Record<string, unknown>,
     githubCalls: [] as string[],
-    /** When true the first (scoped) merge loses its CAS, forcing the seed path. */
-    noTaskEntry: false,
   },
 }));
 
@@ -62,14 +68,33 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             return { Item: h.state.ticket };
           }
           if (name === "UpdateCommand") {
-            const scoped = cmd.input.ConditionExpression === "attribute_exists(agentTasks.#tid)";
-            if (scoped && h.state.noTaskEntry && !h.state.updates.some((u) => String(u.UpdateExpression).includes("if_not_exists(agentTasks.#tid"))) {
-              h.state.updates.push(cmd.input);
-              const e = new Error("no entry");
+            // F6: the two CAS conditions are honoured against the workflow row's
+            // own agentTasks map, so "no entry" and "entry already carries
+            // output" are distinct outcomes — which is the whole point of the
+            // track-then-retry-once disambiguation in the store.
+            h.state.updates.push(cmd.input);
+            const expr = String(cmd.input.ConditionExpression || "");
+            const names = (cmd.input.ExpressionAttributeNames || {}) as Record<string, string>;
+            const values = (cmd.input.ExpressionAttributeValues || {}) as Record<string, unknown>;
+            const fail = (why: string): never => {
+              const e = new Error(why);
               e.name = "ConditionalCheckFailedException";
               throw e;
+            };
+            const tasks = (h.state.workflow?.agentTasks || {}) as Record<string, Record<string, unknown>>;
+            const tid = names["#tid"];
+            if (expr.includes("attribute_not_exists(agentTasks.#tid)")) {
+              if (tasks[tid]) fail("entry already tracked");
+              tasks[tid] = { ...(values[":seed"] as Record<string, unknown>) };
+              if (h.state.workflow) h.state.workflow.agentTasks = tasks;
+              return {};
             }
-            h.state.updates.push(cmd.input);
+            if (expr.startsWith("attribute_exists(agentTasks.#tid)")) {
+              if (!tasks[tid]) fail("no tracked entry");
+              if (expr.includes("attribute_not_exists(agentTasks.#tid.#out)") && tasks[tid].output) {
+                fail("output already present");
+              }
+            }
             return {};
           }
           if (name === "PutCommand") {
@@ -85,9 +110,25 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
 
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
-    async send(cmd: { constructor: { name: string }; input: { Key: string; Body?: string } }) {
+    async send(cmd: {
+      constructor: { name: string };
+      input: { Key: string; Body?: string; IfNoneMatch?: string };
+    }) {
       if (cmd.constructor.name === "PutObjectCommand") {
-        h.state.s3Puts.push({ Key: cmd.input.Key, Body: String(cmd.input.Body) });
+        // Recorded BEFORE the precondition is evaluated: a refused create is
+        // still what this route tried to write, and the security assertions
+        // (source:manager, identity, no forged fields) are about that body.
+        h.state.s3Puts.push({
+          Key: cmd.input.Key,
+          Body: String(cmd.input.Body),
+          ...(cmd.input.IfNoneMatch ? { IfNoneMatch: cmd.input.IfNoneMatch } : {}),
+        });
+        if (cmd.input.IfNoneMatch === "*" && h.state.s3Objects[cmd.input.Key] !== undefined) {
+          const e = new Error("At least one of the pre-conditions you specified did not hold");
+          e.name = "PreconditionFailed";
+          throw e;
+        }
+        h.state.s3Objects[cmd.input.Key] = String(cmd.input.Body);
         return {};
       }
       const body = h.state.s3Objects[cmd.input.Key];
@@ -163,8 +204,11 @@ const TICKET = {
 };
 
 /** The field-scoped evidence merge (the write the completion gate later reads). */
-const evidenceMerge = () =>
-  h.state.updates.find((u) => u.ConditionExpression === "attribute_exists(agentTasks.#tid)");
+const evidenceMerges = () =>
+  h.state.updates.filter((u) => String(u.ConditionExpression || "").startsWith("attribute_exists(agentTasks.#tid)"));
+const evidenceMerge = () => evidenceMerges()[0];
+/** The agentTasks seed write (track-then-retry-once), by its :seed value. */
+const seedWrite = () => h.state.updates.find((u) => (u.ExpressionAttributeValues as Record<string, unknown>)?.[":seed"]);
 const mergedFields = (): Record<string, unknown> => {
   const u = evidenceMerge();
   if (!u) return {};
@@ -172,14 +216,16 @@ const mergedFields = (): Record<string, unknown> => {
   const values = u.ExpressionAttributeValues as Record<string, unknown>;
   const out: Record<string, unknown> = {};
   for (const [placeholder, field] of Object.entries(names)) {
-    if (placeholder === "#tid") continue;
+    // #tid scopes the entry and #out is the refusal condition's own name — only
+    // the #fN placeholders are fields this route writes.
+    if (!/^#f\d+$/.test(placeholder)) continue;
     out[field] = values[`:v${placeholder.slice(2)}`];
   }
   return out;
 };
 
 beforeEach(() => {
-  h.state.workflow = { ...WORKFLOW };
+  h.state.workflow = { ...WORKFLOW, agentTasks: { "T-1": { ...WORKFLOW.agentTasks["T-1"] } } };
   h.state.ticket = { ...TICKET };
   h.state.s3Objects = {};
   h.state.s3Puts.length = 0;
@@ -188,7 +234,6 @@ beforeEach(() => {
   h.state.lambdaCalls.length = 0;
   h.state.github = {};
   h.state.githubCalls.length = 0;
-  h.state.noTaskEntry = false;
   for (const k of SAVED) saved[k] = process.env[k];
   process.env.ARTIFACT_BUCKET = "test-bucket";
   process.env.TICKET_PROVIDER = "dynamodb";
@@ -415,13 +460,13 @@ describe("mark-done — security invariants (F16)", () => {
 
 describe("mark-done — plumbing", () => {
   it("seeds a missing agentTasks entry before merging (the agent died before any claim)", async () => {
-    h.state.noTaskEntry = true;
+    h.state.workflow = { ...WORKFLOW, agentTasks: {} };
     h.state.s3Objects["completions/T-1.json"] = JSON.stringify({ summary: "the work" });
     await load();
     const res = await post({ ticketId: "T-1" });
 
     expect(res.status).toBe(200);
-    const seed = h.state.updates.find((u) => String(u.UpdateExpression).includes("if_not_exists(agentTasks.#tid"));
+    const seed = seedWrite();
     expect(seed).toBeTruthy();
     expect((seed!.ExpressionAttributeValues as Record<string, Record<string, unknown>>)[":seed"]).toMatchObject({
       ticketId: "T-1",
@@ -429,7 +474,7 @@ describe("mark-done — plumbing", () => {
       agentId: "agentcore_hub_backend_dev",
     });
     // …and the scoped merge is retried after the seed, so the evidence lands.
-    expect(h.state.updates.filter((u) => u.ConditionExpression === "attribute_exists(agentTasks.#tid)").length).toBe(2);
+    expect(evidenceMerges()).toHaveLength(2);
   });
 
   it("400 without a ticketId, 404 for an unknown workflow or ticket", async () => {
@@ -437,7 +482,7 @@ describe("mark-done — plumbing", () => {
     expect((await post({})).status).toBe(400);
     h.state.workflow = null;
     expect((await post({ ticketId: "T-1" })).status).toBe(404);
-    h.state.workflow = { ...WORKFLOW };
+    h.state.workflow = { ...WORKFLOW, agentTasks: { "T-1": { ...WORKFLOW.agentTasks["T-1"] } } };
     h.state.ticket = null;
     expect((await post({ ticketId: "T-1" })).status).toBe(404);
   });
@@ -449,5 +494,129 @@ describe("mark-done — plumbing", () => {
     const res = await post({ ticketId: "T-1", evidence: "vouched" });
     expect(res.status).toBe(200);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("TEAM-4099 F6 — a mark-done fills gaps, it never clobbers", () => {
+  /** A row that already carries the agent's own report. */
+  const withRealEvidence = () => ({
+    ...WORKFLOW,
+    agentTasks: {
+      "T-1": {
+        ticketId: "T-1",
+        status: "complete",
+        agentId: "agentcore_hub_backend_dev",
+        output: "Implemented the endpoints; 12 tests green.",
+        branch: "feature/T-1-backend-dev",
+        commitSha: "aaa1111",
+        evidenceSource: "agent",
+      },
+    },
+  });
+
+  it("existing real output + typed --evidence → 409 EVIDENCE_EXISTS, no record write, no transition", async () => {
+    h.state.workflow = withRealEvidence();
+    await load();
+    const res = await post({ ticketId: "T-1", evidence: "looks done to me" });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.code).toBe("EVIDENCE_EXISTS");
+    expect(body.evidenceSource).toBe("agent");
+    expect(body.error).toContain("force: true");
+    // The evidence stands, the board is untouched, nothing is announced.
+    expect(h.state.s3Puts).toEqual([]);
+    expect(h.state.lambdaCalls).toEqual([]);
+    expect(h.state.events).toEqual([]);
+    // …and the refusal came from the CAS, not from the pre-read: the write WAS
+    // attempted, conditioned on the output being absent.
+    expect(String(evidenceMerge()!.ConditionExpression)).toBe(
+      "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#out)"
+    );
+    expect(String(evidenceMerge()!.UpdateExpression)).toContain("if_not_exists(agentTasks.#tid.#f0, :v0)");
+  });
+
+  it("the refusal is not a lost-seed race: an existing entry is never re-seeded into a win", async () => {
+    h.state.workflow = withRealEvidence();
+    await load();
+    await post({ ticketId: "T-1", evidence: "looks done to me" });
+    // track-then-retry-once: the seed is attempted, loses (the entry exists), and
+    // the evidence write is NOT retried — exactly two evidence attempts would mean
+    // the store had decided the entry was missing.
+    expect(seedWrite()).toBeTruthy();
+    expect(evidenceMerges()).toHaveLength(1);
+  });
+
+  it("force: true overrules it — plain SETs, and the intervention is marked forced", async () => {
+    h.state.workflow = withRealEvidence();
+    await load();
+    const res = await post({ ticketId: "T-1", evidence: "the agent's report was wrong; I re-ran it", force: true });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).forced).toBe(true);
+    // No output guard, no if_not_exists — a forced write replaces.
+    expect(String(evidenceMerge()!.ConditionExpression)).toBe("attribute_exists(agentTasks.#tid)");
+    expect(String(evidenceMerge()!.UpdateExpression)).not.toContain("if_not_exists");
+    expect(mergedFields()).toMatchObject({
+      output: "the agent's report was wrong; I re-ran it",
+      evidenceSource: "manager",
+      markedDoneBy: "alice@example.com",
+    });
+    // The record is overwritten unconditionally, and the replay can tell an
+    // override from a fill.
+    expect(h.state.s3Puts[0].IfNoneMatch).toBeUndefined();
+    expect(JSON.parse(h.state.s3Puts[0].Body).forced).toBe(true);
+    expect(h.state.events[0].detail).toMatchObject({ action: "mark_done", forced: true, recordState: "written" });
+    expect(h.state.lambdaCalls).toHaveLength(1);
+  });
+
+  it("no existing output → the fill applies, per field, and the record is a conditional create", async () => {
+    h.state.workflow = {
+      ...WORKFLOW,
+      // A claim landed, a branch was harvested earlier, but the agent never
+      // reported: branch stays, output is the gap this fills.
+      agentTasks: { "T-1": { ticketId: "T-1", status: "running", branch: "feature/T-1-backend-dev" } },
+    };
+    await load();
+    const res = await post({ ticketId: "T-1", evidence: "verified in staging" });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).not.toHaveProperty("forced");
+    const update = String(evidenceMerge()!.UpdateExpression);
+    for (const [i] of Object.keys(evidenceMerge()!.ExpressionAttributeNames as Record<string, string>)
+      .filter((n) => /^#f\d+$/.test(n))
+      .entries()) {
+      expect(update).toContain(`agentTasks.#tid.#f${i} = if_not_exists(agentTasks.#tid.#f${i}, :v${i})`);
+    }
+    expect(h.state.s3Puts[0].IfNoneMatch).toBe("*");
+    expect(h.state.events[0].detail).toMatchObject({ recordState: "written" });
+    expect(h.state.events[0].detail).not.toHaveProperty("forced");
+  });
+
+  it("an existing completions record is kept (412) — the row evidence still applied and the board still moves", async () => {
+    // The agent DID report (so harvest source is its record) but the cascade
+    // missed it: the row has no output, the record exists. Ours must not replace
+    // theirs, and the ticket must still end up done.
+    h.state.s3Objects["completions/T-1.json"] = JSON.stringify({
+      source: "agent",
+      summary: "Implemented the endpoints; 12 tests green.",
+      commit_sha: "aaa1111",
+    });
+    await load();
+    const res = await post({ ticketId: "T-1" });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).evidenceSource).toBe("record");
+    expect(h.state.s3Puts[0].IfNoneMatch).toBe("*");
+    // Their record survived ours verbatim.
+    expect(JSON.parse(h.state.s3Objects["completions/T-1.json"]).source).toBe("agent");
+    expect(evidenceMerges()).toHaveLength(1);
+    expect(h.state.events[0].detail).toMatchObject({ recordState: "exists" });
+    expect(h.state.lambdaCalls).toEqual([
+      {
+        tool_name: "Tickets___transition_ticket",
+        parameters: { ticket_id: "T-1", transition_id: "done", reason: "Marked done by alice@example.com" },
+      },
+    ]);
   });
 });

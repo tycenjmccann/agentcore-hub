@@ -140,6 +140,14 @@ agentId keying (ticketId everywhere; the invoke chain already carries ticketId e
 Move the manifest's `sessions` + phase-artifact index into the workflow row (per-key updates)
 or S3 conditional writes (If-Match); the manifest stays as a rendered artifact, not a store.
 
+**As shipped (TEAM-4099 F6):** R2 has TWO stores, one per runtime — the orchestrator's
+`lambda/orchestrator/workflow-store.mjs` and the app tier's `src/lib/workflow/workflow-store.ts`
+(Next.js route handlers + `src/lib`). Same rule in both: named intent-level ops, each a scoped
+conditional write; no raw `Put`/`Update`/`Delete`/`TransactWrite` against the workflows table
+anywhere else. `scripts/check-workflow-writes.sh` now scans both trees (tests excluded) and
+allowlists exactly two files — `lease.mjs` and `lease.ts`, each holding only `stealClaim`'s CAS,
+the R3 primitive that is deliberately never re-implemented in a store.
+
 ### R3 — Leases instead of silence-guessing
 Agent invocation writes a lease: `agentTasks[ticketId] = {status: running, leaseUntil}`;
 the runtime heartbeats (it already streams events — piggyback: any agent event extends the

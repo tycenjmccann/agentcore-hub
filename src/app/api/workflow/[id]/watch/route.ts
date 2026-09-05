@@ -9,7 +9,8 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { setManagerWatch } from "@/lib/workflow/workflow-store";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
@@ -37,18 +38,13 @@ export async function PATCH(req: NextRequest, { params }: { params: { id: string
     if (typeof watch !== "boolean") {
       return NextResponse.json({ error: "watch (boolean) is required" }, { status: 400 });
     }
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: "SET managerWatch = :w",
-      ConditionExpression: "attribute_exists(workflowId)",
-      ExpressionAttributeValues: { ":w": watch },
-    }));
-    return NextResponse.json({ workflowId, watch });
-  } catch (err) {
-    if ((err as { name?: string }).name === "ConditionalCheckFailedException") {
+    // The store swallows the ConditionalCheckFailedException and reports the loss
+    // as false — the row does not exist, which is a 404, not a 500.
+    if (!(await setManagerWatch(workflowId, watch))) {
       return NextResponse.json({ error: "Workflow not found" }, { status: 404 });
     }
+    return NextResponse.json({ workflowId, watch });
+  } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     console.error(`[watch] ${workflowId}:`, message);
     return NextResponse.json({ error: message }, { status: 500 });
