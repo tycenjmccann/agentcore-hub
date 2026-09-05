@@ -248,6 +248,44 @@ const UNINFORMATIVE_ERROR_NAMES = new Set([
   "AccessDenied",
 ]);
 
+/** Compare error strings by content only: "Access Denied" ≡ "AccessDenied" ≡ "access_denied". */
+function normalizeToken(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * TEAM-4089: the SDK's placeholder message strings are "UnknownError" AND the
+ * bare "Unknown" — which one you get depends on the protocol implementation and
+ * the SDK minor, and either can land in `name` or in `message`:
+ *   - @smithy/core/dist-es/submodules/client/smithy-client/exceptions.js:46
+ *     decorateServiceException -> `message || Message || "UnknownError"`
+ *   - .../smithy-client/default-error-handler.js:6 throwDefaultError -> the NAME
+ *     falls back to `errorCode || statusCode || "UnknownError"`, which is how a
+ *     bodiless HEAD 403 arrives as name "403"
+ *   - @aws-sdk/core/dist-es/submodules/protocols/xml/AwsRestXmlProtocol.js:53
+ *     `loadRestXmlErrorCode(...) ?? "Unknown"` (parseXmlBody.js:36 returns
+ *     undefined when there is no body to parse), and :70 / ProtocolLib.js:58
+ *     fall back to "UnknownError"
+ * A bodiless HeadObject 403 was observed live (QA TEAM-4064) as
+ * name "403" / message "Unknown" / $metadata.httpStatusCode 403.
+ * So don't match one exact literal: drop any message that is a placeholder, or
+ * that merely repeats what the detail already prints (the name or the status).
+ */
+function isUninformativeMessage(
+  rawMessage: string,
+  ctx: { errName: string; rawName: string; status: number | undefined }
+): boolean {
+  const normalized = normalizeToken(rawMessage);
+  if (!normalized) return true;
+  const uninformative = new Set(["unknown", "unknownerror"]);
+  for (const name of UNINFORMATIVE_ERROR_NAMES) uninformative.add(normalizeToken(name));
+  uninformative.add(normalizeToken(ctx.errName));
+  uninformative.add(normalizeToken(ctx.rawName));
+  if (ctx.status !== undefined) uninformative.add(normalizeToken(String(ctx.status)));
+  uninformative.delete("");
+  return uninformative.has(normalized);
+}
+
 const ACCESS_DENIED_HINT =
   " — validator role has no read access to this bucket; runtime agents in the hub account will need a " +
   "bucket policy grant, or upload the object to the hub artifacts bucket instead";
@@ -310,11 +348,13 @@ async function checkS3Source(
       errName = rawName || "Error";
     }
 
-    // "UnknownError" is the bodiless-HEAD artefact — it must never be the only
-    // thing we report. Anything genuinely informative still rides along.
+    // "UnknownError" and "Unknown" are the bodiless-HEAD artefacts — neither may
+    // ever reach the operator (see isUninformativeMessage). Anything genuinely
+    // informative ("must be addressed using the specified endpoint…", a
+    // credentials or ECONNREFUSED text) still rides along.
     const extras: string[] = [];
     if (rawName && rawName !== errName && !UNINFORMATIVE_ERROR_NAMES.has(rawName)) extras.push(rawName);
-    if (rawMessage && rawMessage !== "UnknownError") extras.push(rawMessage);
+    if (!isUninformativeMessage(rawMessage, { errName, rawName, status })) extras.push(rawMessage);
 
     const detail =
       `S3 object ${label} — HeadObject -> ${errName} (${status ?? "no status"}): ${redactUrl(value)}` +

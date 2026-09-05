@@ -275,6 +275,110 @@ describe("validateIntakeSources — S3 AccessDenied", () => {
   }
 });
 
+// ─── (d2) TEAM-4089: no SDK placeholder, no duplicate-of-name, in the detail ──
+
+/**
+ * QA TEAM-4064 saw the REAL bodiless 403 off the wire and it did not match the
+ * mock every test above uses: name "403", message "Unknown" (not "UnknownError"),
+ * $metadata.httpStatusCode 403. The old filter compared against the single
+ * literal "UnknownError", so the operator-facing detail read
+ *   "… -> AccessDenied (403): s3://… — Unknown — validator role has no read…"
+ * i.e. the exact meaningless-SDK-artefact text this feature exists to remove.
+ */
+describe("validateIntakeSources — S3 error detail carries no SDK placeholder (TEAM-4089)", () => {
+  const CROSS_ACCOUNT = "s3://agentcore-hub-artifacts-023392223961-us-east-1/prd/spec.md";
+  const denied = (err: unknown) =>
+    validateIntakeSources([src("s3", CROSS_ACCOUNT)], {
+      s3Client: throwingS3(err),
+      env: envOf({ ARTIFACT_BUCKET: "hub-bucket" }),
+    });
+
+  it('the real bodiless 403 (name "403", message "Unknown") reports no "Unknown" at all', async () => {
+    const c = only(
+      await denied(Object.assign(new Error("Unknown"), { name: "403", $metadata: { httpStatusCode: 403 } }))
+    );
+    expect(c.outcome).toBe("transient");
+    expect(c.verification.status).toBe("unverified");
+    expect(c.detail).toContain("HeadObject");
+    expect(c.detail).toContain("AccessDenied");
+    expect(c.detail).toContain("403");
+    expect(c.detail).toContain("validator role has no read access");
+    // Covers "Unknown" and "UnknownError" in one assertion.
+    expect(c.detail).not.toMatch(/Unknown/);
+  });
+
+  it("a body-ful 403 does not print AccessDenied twice, once per spelling", async () => {
+    const c = only(
+      await denied(
+        Object.assign(new Error("Access Denied"), { name: "AccessDenied", $metadata: { httpStatusCode: 403 } })
+      )
+    );
+    expect(c.outcome).toBe("transient");
+    expect(c.verification.status).toBe("unverified");
+    // "AccessDenied (403)" is the label; the message "Access Denied" is the same
+    // fact with a space in it, so it must not ride along as an extra.
+    expect(c.detail!.match(/AccessDenied/g)).toHaveLength(1);
+    expect(c.detail).not.toContain("Access Denied");
+    expect(c.detail).toContain("AccessDenied (403)");
+  });
+
+  for (const message of ["  unknown  ", "UNKNOWN", "unknown_error", "Unknown Error"]) {
+    it(`a case/whitespace variant of the placeholder (${JSON.stringify(message)}) is still dropped`, async () => {
+      const c = only(
+        await denied(Object.assign(new Error(message), { name: "403", $metadata: { httpStatusCode: 403 } }))
+      );
+      expect(c.outcome).toBe("transient");
+      expect(c.detail!.toLowerCase()).not.toContain("unknown");
+    });
+  }
+
+  it("a message that only repeats the status code or the name is dropped", async () => {
+    const byStatus = only(
+      await denied(Object.assign(new Error("403"), { name: "403", $metadata: { httpStatusCode: 403 } }))
+    );
+    // "403" appears once, in the "(403)" the label already prints.
+    expect(byStatus.detail!.match(/403/g)).toHaveLength(1);
+
+    const byName = only(
+      await denied(
+        Object.assign(new Error("PermanentRedirect"), {
+          name: "PermanentRedirect",
+          $metadata: { httpStatusCode: 301 },
+        })
+      )
+    );
+    expect(byName.detail!.match(/PermanentRedirect/g)).toHaveLength(1);
+  });
+
+  it("a genuinely informative message is STILL reported — the filter is not a blanket drop", async () => {
+    const endpointMsg = "The bucket you are attempting to access must be addressed using the specified endpoint.";
+    const c = only(
+      await denied(
+        Object.assign(new Error(endpointMsg), { name: "PermanentRedirect", $metadata: { httpStatusCode: 301 } })
+      )
+    );
+    expect(c.outcome).toBe("transient");
+    expect(c.detail).toContain(endpointMsg);
+
+    const credsMsg = "Missing credentials in config, if using AWS_CONFIG_FILE, set AWS_SDK_LOAD_CONFIG=1";
+    const creds = only(
+      await denied(Object.assign(new Error(credsMsg), { name: "CredentialsError" }))
+    );
+    expect(creds.outcome).toBe("transient");
+    expect(creds.detail).toContain(credsMsg);
+    expect(creds.detail).toContain("no status");
+  });
+
+  it("an error with no message at all still yields a usable detail", async () => {
+    const c = only(await denied(Object.assign(new Error(""), { name: "403", $metadata: { httpStatusCode: 403 } })));
+    expect(c.detail).toBe(
+      `S3 object unreadable — HeadObject -> AccessDenied (403): ${CROSS_ACCOUNT}` +
+        " — validator role has no read access to this bucket; runtime agents in the hub account will need a " +
+        "bucket policy grant, or upload the object to the hub artifacts bucket instead"
+    );
+  });
+});
+
 // ─── (e) transient vs definitive elsewhere ──────────────────────────────────
 
 describe("validateIntakeSources — transient failures", () => {
