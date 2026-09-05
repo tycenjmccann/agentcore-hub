@@ -77,6 +77,11 @@ export default defineConfig({
       // off|shadow|enforce, the already-Ready in-process dispatch, and non-fatal
       // isolation when dispatchReady (the claim-CAS webhook path) loses a race.
       "lambda/orchestrator/level-trigger-dispatch.test.mjs",
+      // merge-on-green.mjs (TEAM-4110) — DI coverage for the auto-merge of a
+      // human-approved, clean+green final PR: off | shadow | enforce (default
+      // off, byte-identical), gate-must-be-done, mergeable_state:"clean" only,
+      // exact-head-SHA merge, and non-fatal GitHub-refusal handling.
+      "lambda/orchestrator/merge-on-green.test.mjs",
       // done-handlers-cascade (TEAM-3688 F3) — HANDLER-level cascade coverage.
       // Invokes the REAL handleTicketDoneUnified + handleTicketDone from index.mjs
       // through the REAL cascade (cascade.mjs/lease.mjs unmocked; only AWS/store

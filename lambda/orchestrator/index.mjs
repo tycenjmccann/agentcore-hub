@@ -43,6 +43,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
+import { createMergeOnGreen } from "./merge-on-green.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
@@ -117,6 +118,12 @@ const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
 // When enforce, the done-cascade invokes a newly-unblocked dependent in-process
 // instead of waiting for its Ready webhook — closes the dispatch dead-zone.
 const LEVEL_TRIGGER_DISPATCH = process.env.LEVEL_TRIGGER_DISPATCH || "off";
+// Merge-on-green (TEAM-4110): off | shadow | enforce, default off. When enforce,
+// completeWorkflow merges a human-approved (Merge-Approval gate done), clean+green
+// final PR itself instead of leaving the run open on workflow.cd_unmerged (which
+// has no consumer today). off is byte-identical to pre-4110. Normalized in
+// merge-on-green.mjs (reuses normalizeExtendedMode: garbage → shadow, never merge).
+const MERGE_ON_GREEN = process.env.MERGE_ON_GREEN || "off";
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -468,6 +475,25 @@ function getReviewCap() {
     log: (msg) => console.log(`[orchestrator] ${msg}`),
   });
   return _reviewCap;
+}
+
+// ─── Merge-on-green (TEAM-4110) ──────────────────────────────────────────────
+// Merges a human-approved, clean+green final PR from the orchestrator so an
+// approved run isn't left open on workflow.cd_unmerged. Lazy singleton, same
+// shape as getCascade()/getReviewCap(). Fires only when MERGE_ON_GREEN != off.
+let _mergeOnGreen = null;
+function getMergeOnGreen() {
+  if (_mergeOnGreen) return _mergeOnGreen;
+  _mergeOnGreen = createMergeOnGreen({
+    githubApi,
+    getChildTickets,
+    parseRepoUrl,
+    publishEvent,
+    getAgentPhase: (agentId) => getAgentDef(agentId)?.phase,
+    log: (msg) => console.log(`[orchestrator] ${msg}`),
+    mode: MERGE_ON_GREEN,
+  });
+  return _mergeOnGreen;
 }
 
 /**
@@ -2902,17 +2928,33 @@ export async function completeWorkflow(workflow) {
   if (mergeVerifyConfigured) {
     const probe = await featureBranchMergeProbe(workflow);
     if (probe.merged === false) {
-      console.error(
-        `[orchestrator] CompletionRejectedUnmergedBranch ${workflow.id}: ` +
-          `feature branch ${workflow.featureBranch} is not merged into the base ` +
-          `(${probe.reason}). CD did not land the merge — leaving run open.`
-      );
-      await publishEvent(workflow.epicId, "workflow.cd_unmerged", {
-        workflowId: workflow.id,
-        featureBranch: workflow.featureBranch,
-        reason: probe.reason,
-      });
-      return;
+      // TEAM-4110 merge-on-green: a human-approved, clean+green PR should not be
+      // left open on cd_unmerged (which has no consumer). Attempt the merge here.
+      // Default off → mergeApprovedGreenPr returns skip with zero I/O, so this is
+      // byte-identical to pre-4110. On "merged", take the proof from the merge and
+      // fall through to the ship-verdict stamping below (verdict reads merged);
+      // any other outcome keeps the existing cd_unmerged + return.
+      const mog = await getMergeOnGreen().mergeApprovedGreenPr(workflow, probe);
+      if (mog.outcome === "merged") {
+        mergeProof = { merged: true, mergeCommit: mog.mergeCommit || "", prUrl: mog.prUrl || "" };
+        console.log(
+          `[orchestrator] ${workflow.id}: merge-on-green merged ${workflow.featureBranch} ` +
+            `(${mergeProof.mergeCommit || "squash"}) — proceeding to completion`
+        );
+      } else {
+        console.error(
+          `[orchestrator] CompletionRejectedUnmergedBranch ${workflow.id}: ` +
+            `feature branch ${workflow.featureBranch} is not merged into the base ` +
+            `(${probe.reason}). CD did not land the merge — leaving run open.`
+        );
+        await publishEvent(workflow.epicId, "workflow.cd_unmerged", {
+          workflowId: workflow.id,
+          featureBranch: workflow.featureBranch,
+          reason: probe.reason,
+          mergeOnGreen: mog.outcome,
+        });
+        return;
+      }
     }
     if (probe.merged === true) mergeProof = probe;
   }
