@@ -78,6 +78,14 @@ export default defineConfig({
       // through the REAL cascade (cascade.mjs/lease.mjs unmocked; only AWS/store
       // seams stubbed), proving BOTH done paths drive the unblock cascade.
       "lambda/orchestrator/done-handlers-cascade.test.mjs",
+      // source-context (TEAM-4093, ship-review F2) — formatSourceLine, the "##
+      // Input Sources" line the agent-context builder emits. Since TEAM-4054
+      // made lenient mode the default, a failed reachability check only stamps
+      // verification.status="unverified" + a redacted detail; this pins that the
+      // verdict (and its bucket-policy hint) reaches the intake agent's prompt,
+      // and that pre-TEAM-4054 rows with no `verification` field render as
+      // before. Pure string rendering; index.mjs's AWS seams mocked for load.
+      "lambda/orchestrator/source-context.test.mjs",
       // review-cap.mjs (TEAM-3619 D2c) — the review→rework round cap. Same DI
       // shape as the cascade (stub store/event publisher/roster + fake clock).
       // Its ship-review.mjs arithmetic port is pinned against the TS original by
