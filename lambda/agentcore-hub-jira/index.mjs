@@ -232,7 +232,11 @@ async function createTicket(params) {
   // of making a copy. Keyed on the wf:<id> label so it only dedupes within a run.
   if (workflow_id && summary) {
     try {
-      const jql = `project = ${PROJECT_KEY} AND labels = "wf:${workflow_id}" AND summary ~ "\\"${summary.replace(/"/g, '\\"')}\\"" ORDER BY created ASC`;
+      // statusCategory != Done: resolved tickets are excluded SERVER-SIDE so a
+      // live duplicate is never pushed out of the 5-result window by older
+      // completed same-summary tickets (Codex P2 on #356). The isDoneStatus
+      // check below stays as defense-in-depth for the returned page.
+      const jql = `project = ${PROJECT_KEY} AND labels = "wf:${workflow_id}" AND statusCategory != Done AND summary ~ "\\"${summary.replace(/"/g, '\\"')}\\"" ORDER BY created ASC`;
       const existingSearch = await jiraSearch(jql, ["summary", "status", "labels", "assignee", "issuetype", "parent"], 5);
       const wantAgentLabel = assignee && !isHumanReviewer ? `agent:${assignee}` : null;
       const wantReviewerLabel = isHumanReviewer ? `reviewer:${assignee.slice("human:".length)}` : null;

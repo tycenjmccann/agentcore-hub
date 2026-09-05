@@ -44,7 +44,7 @@ import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
-import { isPipelineEnabled } from "./pipeline-enabled.mjs";
+import { isPipelineEnabled, pipelineOwnsRepo } from "./pipeline-enabled.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
@@ -112,6 +112,10 @@ const CASCADE_EXTENDED_STATES_MODE = resolveCascadeMode(process.env.CASCADE_EXTE
 // DDB reads/writes. shadow/enforce only when the operator explicitly sets the
 // var (deploy.sh forwards it only when set).
 const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
+// Level-triggered dispatch (TEAM-4060): off | shadow | enforce, default off.
+// When enforce, the done-cascade invokes a newly-unblocked dependent in-process
+// instead of waiting for its Ready webhook — closes the dispatch dead-zone.
+const LEVEL_TRIGGER_DISPATCH = process.env.LEVEL_TRIGGER_DISPATCH || "off";
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -307,6 +311,22 @@ async function redispatchTicket(workflow, ticket) {
   return true;
 }
 
+/**
+ * Level-triggered dispatch (TEAM-4060). Invoke a now-dispatchable dependent
+ * IN-PROCESS instead of waiting for its provider Ready-status webhook. Routes
+ * through the SAME handler the webhook path uses (handleTicketReadyUnified), so
+ * every guard is reused for free — cancel-guard, human-gate parking, the claim
+ * CAS (sole dedup arbiter; a webhook that also fires no-ops), the In Progress
+ * transition, phase advancement, and feature-branch creation. Re-fetch the
+ * ticket so assignee/parent/status are authoritative (the cascade snapshot came
+ * off the eventually-consistent parentId GSI). Injected into the cascade as
+ * `dispatchReady`; the cascade wraps this in its own non-fatal try/catch.
+ */
+async function dispatchReadyDependent(_workflow, sibling) {
+  const fresh = (await getTicket(sibling.ticketId)) || sibling;
+  await handleTicketReadyUnified(sibling.ticketId, fresh);
+}
+
 // One detector per warm container so its per-agent median cache is reused
 // across the 5-minute sweeps (rebuilt from scratch on a cold start).
 let _detector = null;
@@ -344,6 +364,11 @@ function getCascade() {
     publishEvent,
     // Extended states (commit 4b) — off | shadow | enforce (TEAM-3747 D1).
     extendedStates: CASCADE_EXTENDED_STATES_MODE,
+    // Level-triggered dispatch (TEAM-4060) — off | shadow | enforce. When on,
+    // the cascade invokes newly-unblocked dependents in-process (dispatchReady)
+    // instead of waiting for the Ready webhook.
+    levelTriggerDispatch: LEVEL_TRIGGER_DISPATCH,
+    dispatchReady: dispatchReadyDependent,
     lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
     eventsTable: EVENTS_TABLE,
     workflowsTable: WORKFLOWS_TABLE,
@@ -562,6 +587,23 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       // release-manager-origin auto-approve branch is INTENTIONALLY unreachable
       // from any entry point (the blueprint never has the RM transition the
       // Merge Approval gate). Pinned by review-rejection.test.mjs.
+      //
+      // TEAM-4044: a gate's CREATION-TIME block is not a rejection. Every human
+      // gate is created with blocked_by (its upstream chain), so the ticket
+      // Lambda's initial status write is `todo → blocked` (Jira: create in To
+      // Do, then transition) or an INSERT straight into blocked (DDB). That
+      // transition used to be read as "Request changes": the Merge Approval
+      // gate's creation reopened the Ship ticket and dispatched the release
+      // manager at requirements time — on EVERY run (observed back to
+      // 2026-08-31; wf c5y8xg/bwastu/trf22q on 2026-09-05). A real rejection
+      // comes from a gate that was PRESENTED: ready/in_progress/in_review.
+      if (isCreationTimeBlock(oldStatus)) {
+        console.log(
+          `[orchestrator] ${ticketId}: ${oldStatus || "NEW"} → blocked is the gate's creation-time ` +
+            `dependency block, not a review rejection — ignoring.`
+        );
+        break;
+      }
       const rejected = await getTicket(ticketId);
       if (rejected && isHumanAssignee(rejected.assignee)) {
         // TEAM-4045: only a real "Request changes" (in_review → blocked) is a
@@ -2322,6 +2364,16 @@ async function processRecord(record) {
       // TEAM-3966 F2 (pin): same "human:*"-only gating as processStatusChange —
       // the RM-origin auto-approve inside handleReviewRejection is unreachable
       // from this trigger too. Pinned by review-rejection.test.mjs.
+      // TEAM-4044: same creation-time guard as processStatusChange — an INSERT
+      // straight into blocked (no old image) or a `todo → blocked` initial write
+      // is the dependency block, not a human "Request changes".
+      if (isCreationTimeBlock(oldStatus)) {
+        console.log(
+          `[orchestrator] ${ticketId}: ${oldStatus || "NEW"} → blocked is the gate's creation-time ` +
+            `dependency block, not a review rejection — ignoring.`
+        );
+        break;
+      }
       const blockedAssignee = unwrapDdbValue(newImage.assignee);
       if (isHumanAssignee(blockedAssignee)) {
         // TEAM-4045: an INSERT is creation (the tickets Lambda writes a gate
@@ -2347,6 +2399,17 @@ async function processRecord(record) {
       break;
     }
   }
+}
+
+/**
+ * TEAM-4044: `→ blocked` from no prior status / "new" / "todo" is a ticket's
+ * creation-time dependency block (blocked_by set at creation), never a human
+ * review rejection. A rejection always comes from a presented gate — any other
+ * prior status (ready / in_progress / in_review / …) is honored as before.
+ */
+export function isCreationTimeBlock(oldStatus) {
+  const prev = String(oldStatus ?? "").trim().toLowerCase();
+  return prev === "" || prev === "new" || prev === "todo";
 }
 
 // ─── Ticket Tracking at Creation ────────────────────────────────────────────────
@@ -3335,7 +3398,16 @@ async function buildAgentContext(ticket, workflow) {
   // branch on this: set → read CodeBuild/CodePipeline results instead of shelling
   // builds/deploys; absent → legacy self-run. An env var alone is invisible to
   // the model, so surface it EXPLICITLY in the task context (Codex #263 round-5).
-  if (isPipelineEnabled(process.env.PIPELINE_ENABLED)) {
+  //
+  // TEAM-4044: scoped by PIPELINE_REPOS — the pipeline has ONE Source repo, so a
+  // run on any other repo (juno) gets NO block and its blueprints take the
+  // legacy path (DEPLOY.md / self-run). Before, every repo was told a pipeline
+  // owned its deploy and the release manager's Pipeline___* preflight resolved
+  // to the hub's own pipeline.
+  if (
+    isPipelineEnabled(process.env.PIPELINE_ENABLED) &&
+    pipelineOwnsRepo(workflow.repoConfig, process.env.PIPELINE_REPOS)
+  ) {
     context += `## Pipeline Mode\nPIPELINE_ENABLED: true\n`;
     context += `A CodeBuild PR-check + CodePipeline deploy own this repo's `;
     context += `deterministic build/test/deploy. Follow the PIPELINE_ENABLED path `;

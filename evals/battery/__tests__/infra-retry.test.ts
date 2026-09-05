@@ -5,7 +5,6 @@
 import { describe, it, expect } from "vitest";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { runCase, isInfraReadError, isRetryableTransportError } from "../lib/agent-runner.mjs";
 
@@ -19,8 +18,11 @@ const canDenyRead = typeof process.getuid === "function" && process.getuid() !==
 const coded = (code: string) => Object.assign(new Error(`${code}: boom`), { code });
 
 // Minimal case with no required-tool guards, whose only pre-turn fs
-// dependency we control via input.transcript (resolved relative to
-// evals/battery, so escape to a temp dir with ../ segments).
+// dependency we control via input.transcript. Fixture refs are confined to
+// evals/battery/fixtures/ (traversal is refused — Codex P1 on #358), so the
+// probe files live in a throwaway dir INSIDE fixtures/ and are removed after.
+const FIXTURES_DIR = join(BATTERY_DIR, "fixtures");
+const probeDir = () => mkdtempSync(join(FIXTURES_DIR, ".tmp-infra-"));
 const caseWithTranscript = (transcriptAbs: string) => ({
   id: "infra-retry-probe",
   targetAgentId: "agentcore_hub_qa_verifier",
@@ -59,7 +61,7 @@ describe("isInfraReadError classification", () => {
 
 describe.runIf(canDenyRead)("runCase infra retry on unreadable case inputs", () => {
   it("retries once, marks infraRetried, and never reaches the model when the blip persists", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "battery-infra-"));
+    const dir = probeDir();
     const transcript = join(dir, "transcript.json");
     writeFileSync(transcript, JSON.stringify([{ role: "user", content: "context" }]));
     chmodSync(transcript, 0o000);
@@ -84,7 +86,7 @@ describe.runIf(canDenyRead)("runCase infra retry on unreadable case inputs", () 
   });
 
   it("recovers when the blip clears before the retry (the NFS-lease scenario)", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "battery-infra-"));
+    const dir = probeDir();
     const transcript = join(dir, "transcript.json");
     writeFileSync(transcript, JSON.stringify([{ role: "user", content: "context" }]));
     chmodSync(transcript, 0o000);
@@ -109,7 +111,7 @@ describe.runIf(canDenyRead)("runCase infra retry on unreadable case inputs", () 
 describe("what the infra retry must NOT touch", () => {
   it("ENOENT on a case input is not retried (deterministic config error)", async () => {
     const result = (await runCase({
-      caseDef: caseWithTranscript(join(tmpdir(), "battery-infra-missing", "nope.json")),
+      caseDef: caseWithTranscript(join(FIXTURES_DIR, ".tmp-infra-missing", "nope.json")),
       repoRoot: REPO_ROOT,
       runId: "test",
       converse: async () => endTurn(),
@@ -123,7 +125,7 @@ describe("what the infra retry must NOT touch", () => {
 
   it("an fs-coded error AFTER the first model turn is not infra-retried", async () => {
     let converseCalls = 0;
-    const dir = mkdtempSync(join(tmpdir(), "battery-infra-"));
+    const dir = probeDir();
     const transcript = join(dir, "transcript.json");
     writeFileSync(transcript, JSON.stringify([{ role: "user", content: "context" }]));
     try {

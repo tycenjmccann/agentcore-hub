@@ -73,6 +73,10 @@ export default defineConfig({
       // publisher + fake clock), so the union + extended-state logic is
       // unit-testable with no AWS.
       "lambda/orchestrator/cascade.test.mjs",
+      // level-trigger-dispatch (TEAM-4060) — DI coverage for the dead-zone fix:
+      // off|shadow|enforce, the already-Ready in-process dispatch, and non-fatal
+      // isolation when dispatchReady (the claim-CAS webhook path) loses a race.
+      "lambda/orchestrator/level-trigger-dispatch.test.mjs",
       // done-handlers-cascade (TEAM-3688 F3) — HANDLER-level cascade coverage.
       // Invokes the REAL handleTicketDoneUnified + handleTicketDone from index.mjs
       // through the REAL cascade (cascade.mjs/lease.mjs unmocked; only AWS/store

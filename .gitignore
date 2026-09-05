@@ -89,3 +89,8 @@ evals/battery/battery-results.json
 evals/battery/battery-progress.jsonl
 evals/battery/flake-ledger.jsonl
 evals/battery/check-summary.md
+# infra-retry vitest probes (created + removed inside fixtures/ during the run)
+evals/battery/fixtures/.tmp-*
+
+# Local-only scratch: analysis, HTML reports, span/event dumps (never committed)
+.local-workspace/

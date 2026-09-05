@@ -98,6 +98,18 @@ export function createCascade(deps) {
     // Extended-states (commit 4b) — all optional; guarded by extendedMode.
     // `extendedStates` is off | shadow | enforce (or the legacy boolean).
     extendedStates = false,
+    // Level-triggered dispatch (TEAM-4060) — off | shadow | enforce, default off.
+    // When enforced, a dependent that becomes dispatchable (blocked/todo → Ready,
+    // or already parked in Ready but never claimed) is invoked IN-PROCESS via
+    // `dispatchReady` instead of waiting for the provider's Ready-status webhook.
+    // This closes the "dispatch dead-zone": the webhook round-trip is edge-
+    // triggered, so a Ready→Ready no-op or a dropped webhook left the dependent
+    // idle until the 5-min reconcile sweep. `dispatchReady` routes through the
+    // same claim CAS the webhook path uses, so a webhook that ALSO fires is a
+    // harmless no-op — the CAS is the sole dedup arbiter. off = pure webhook path,
+    // byte-identical to pre-4060.
+    levelTriggerDispatch = "off",
+    dispatchReady,
     lease,
     eventsTable,
     workflowsTable,
@@ -121,6 +133,37 @@ export function createCascade(deps) {
   // Ready) is ALWAYS enforced regardless of this — extendedMode gates only the
   // commit-4b extended-state actions (in_progress / in_review).
   const extendedMode = normalizeExtendedMode(extendedStates);
+  // Same off|shadow|enforce vocabulary as extendedStates; anything else → off.
+  const levelTriggerMode = ["shadow", "enforce"].includes(levelTriggerDispatch)
+    ? levelTriggerDispatch
+    : "off";
+
+  /**
+   * Level-triggered dispatch (TEAM-4060). Invoke a now-dispatchable dependent
+   * directly instead of waiting for its Ready webhook. Non-fatal by contract:
+   * a throw here NEVER strands the cascade — the Ready transition already
+   * happened and the webhook + reconcile sweep remain the backstop. The claim
+   * CAS inside dispatchReady dedups against a concurrent webhook delivery.
+   *   off     → skip (pure webhook path).
+   *   shadow  → count wouldDispatch, no invoke.
+   *   enforce → dispatch in-process.
+   */
+  async function levelDispatch(sibling, workflow, m) {
+    if (levelTriggerMode === "off" || typeof dispatchReady !== "function") return;
+    if (levelTriggerMode === "shadow") {
+      m.wouldDispatch = (m.wouldDispatch || 0) + 1;
+      log(`[orchestrator] level-trigger would-dispatch (shadow) — ${sibling.ticketId}`);
+      return;
+    }
+    try {
+      await dispatchReady(workflow, sibling);
+      m.levelDispatched = (m.levelDispatched || 0) + 1;
+      log(`[orchestrator] level-trigger dispatch — ${sibling.ticketId}`);
+    } catch (err) {
+      m.levelDispatchErrors = (m.levelDispatchErrors || 0) + 1;
+      log(`[orchestrator] level-trigger dispatch failed (non-fatal, webhook+sweep backstop) — ${sibling.ticketId}: ${err?.message || err}`);
+    }
+  }
 
   /**
    * Fan a just-closed ticket's completion out to its dependents.
@@ -171,6 +214,18 @@ export function createCascade(deps) {
         if (sibling.status === "blocked" || sibling.status === "todo") {
           await transitionToReady(sibling);
           unblocked.push(sibling.ticketId);
+          // Level-trigger (TEAM-4060): dispatch now instead of waiting for the
+          // Ready webhook. No-op when levelTriggerMode is off.
+          await levelDispatch(sibling, workflow, m);
+          return;
+        }
+        // Level-trigger (TEAM-4060). A dependent already parked in "ready" whose
+        // last blocker just resolved but which was never claimed — the classic
+        // Ready→Ready dead-zone (the transition that would have fired the webhook
+        // was a no-op). Dispatch it in-process. off → no-op (pre-4060 fall-through
+        // to the extended-state checks below, which never matched "ready").
+        if (sibling.status === "ready") {
+          await levelDispatch(sibling, workflow, m);
           return;
         }
         // Commit 4b (CASCADE_EXTENDED_STATES). The last blocker of an ALREADY-
@@ -229,6 +284,10 @@ export function createCascade(deps) {
         ? ` mode=${extendedMode} nudged=${m.nudged} redispatched=${m.redispatched} reviewReawakened=${m.reviewReawakened}` +
           ` wouldNudge=${m.wouldNudge} wouldSteal=${m.wouldSteal} wouldRedispatch=${m.wouldRedispatch} wouldReviewReawaken=${m.wouldReviewReawaken}` +
           ` blockerConfirmAborted=${m.blockerConfirmAborted}`
+        : "") +
+      (levelTriggerMode !== "off"
+        ? ` levelTrigger=${levelTriggerMode} levelDispatched=${m.levelDispatched || 0}` +
+          ` wouldDispatch=${m.wouldDispatch || 0} levelDispatchErrors=${m.levelDispatchErrors || 0}`
         : ""));
 
     // Journey log: one orchestrator.unblocked per Ready transition. The helper
@@ -598,6 +657,10 @@ export function newMetrics() {
     // TEAM-3755 F9 — extended-state actions refused because a strongly-consistent
     // re-read showed a blocker was NOT actually resolved (stale GSI snapshot).
     blockerConfirmAborted: 0,
+    // TEAM-4060 — level-triggered dispatch (in-process invoke on unblock).
+    levelDispatched: 0,
+    wouldDispatch: 0,
+    levelDispatchErrors: 0,
   };
 }
 
@@ -606,7 +669,8 @@ export function hasCascadeActivity(m) {
   return !!(
     m.nudged || m.skippedLiveLease || m.redispatched || m.reviewReawakened ||
     m.dependentErrors || m.wouldNudge || m.wouldSteal || m.wouldRedispatch ||
-    m.wouldReviewReawaken || m.blockerConfirmAborted
+    m.wouldReviewReawaken || m.blockerConfirmAborted ||
+    m.levelDispatched || m.wouldDispatch || m.levelDispatchErrors
   );
 }
 
@@ -634,6 +698,9 @@ export function emitCascadeMetrics(m) {
           { Name: "CascadeWouldRedispatch", Unit: "Count" },
           { Name: "CascadeWouldReviewReawaken", Unit: "Count" },
           { Name: "CascadeBlockerConfirmAborted", Unit: "Count" },
+          { Name: "CascadeLevelDispatched", Unit: "Count" },
+          { Name: "CascadeWouldDispatch", Unit: "Count" },
+          { Name: "CascadeLevelDispatchErrors", Unit: "Count" },
         ],
       }],
     },
@@ -647,5 +714,8 @@ export function emitCascadeMetrics(m) {
     CascadeWouldRedispatch: m.wouldRedispatch || 0,
     CascadeWouldReviewReawaken: m.wouldReviewReawaken || 0,
     CascadeBlockerConfirmAborted: m.blockerConfirmAborted || 0,
+    CascadeLevelDispatched: m.levelDispatched || 0,
+    CascadeWouldDispatch: m.wouldDispatch || 0,
+    CascadeLevelDispatchErrors: m.levelDispatchErrors || 0,
   }));
 }

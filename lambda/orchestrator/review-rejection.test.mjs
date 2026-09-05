@@ -1325,6 +1325,34 @@ describe("handleReviewRejection — Jira-provider pre-state guard on the done-fl
     expect(h.state.enforce).toHaveBeenCalledTimes(1);
     expect(h.state.enforce.mock.calls[0][0].gateTicket.assignee).toBe("human:engineer");
   });
+
+  /**
+   * TEAM-4044: every human gate is created WITH blocked_by, so the ticket
+   * Lambda's initial status write arrives as `todo → blocked` (Jira: created in
+   * To Do, then transitioned). That is the dependency block, not a "Request
+   * changes" — reading it as one reopened the Ship ticket and dispatched the
+   * release manager at requirements time on every run (wf c5y8xg 2026-09-05).
+   * Only a PRESENTED gate (ready / in_progress / in_review → blocked) rejects.
+   */
+  it("TEAM-4044: a human gate's creation-time `todo`/`new`/no-status → blocked is NOT a rejection", async () => {
+    const humanGate = jiraIssue("TEAM-900", { status: "Blocked", labels: ["human-review", "reviewer:engineer", "wf:wf_1"], blockedBy: ["TEAM-10"] });
+    h.state.enforce = vi.fn(async () => ({ escalated: true, effectiveRounds: 3, maxRounds: 3 }));
+    const fetchSpy = jiraRouter({ "TEAM-10": upstream(), "TEAM-900": humanGate });
+    global.fetch = fetchSpy;
+
+    for (const oldStatus of ["todo", "new", undefined, "", " TODO "]) {
+      await handler({ source: "jira-webhook", ticketId: "TEAM-900", newStatus: "blocked", oldStatus });
+    }
+    expect(h.state.enforce).not.toHaveBeenCalled();
+    expect(h.state.events.filter((e) => e.type === "review.rejected")).toHaveLength(0);
+    // Not even a ticket read — the guard is on the transition, before any I/O.
+    expect(calls(fetchSpy, (u) => u.includes("/issue/TEAM-900"))).toHaveLength(0);
+    expect(calls(fetchSpy, (u) => u.includes("/TEAM-10/transitions"))).toHaveLength(0);
+
+    // Positive control: the same gate rejected AFTER being presented still rejects.
+    await handler({ source: "jira-webhook", ticketId: "TEAM-900", newStatus: "blocked", oldStatus: "in_progress" });
+    expect(h.state.enforce).toHaveBeenCalledTimes(1);
+  });
 });
 
 /**
@@ -1353,5 +1381,27 @@ describe("processRecord — DDB-stream trigger invokes handleReviewRejection ONL
     await handler(streamEvent("human:engineer"));
     expect(h.state.enforce).toHaveBeenCalledTimes(1);
     expect(h.state.enforce.mock.calls[0][0].gateTicket.ticketId).toBe("TEAM-900");
+  });
+
+  /** TEAM-4044 DDB twin: INSERT straight into blocked, or OldImage todo → not a rejection. */
+  it("TEAM-4044: creation-time block (INSERT with no OldImage, or OldImage todo) is NOT a rejection", async () => {
+    h.state.enforce = vi.fn(async () => ({ escalated: true, effectiveRounds: 3, maxRounds: 3 }));
+    h.state.tickets["TEAM-900"] = { ...GATE, assignee: "human:engineer", status: "blocked" };
+
+    const fromTodo = streamEvent("human:engineer");
+    fromTodo.Records[0].dynamodb.OldImage.status = { S: "todo" };
+    await handler(fromTodo);
+
+    const insert = streamEvent("human:engineer");
+    insert.Records[0].eventName = "INSERT";
+    delete insert.Records[0].dynamodb.OldImage;
+    await handler(insert);
+
+    expect(h.state.enforce).not.toHaveBeenCalled();
+    expect(h.state.events.filter((e) => e.type === "review.rejected")).toHaveLength(0);
+
+    // Positive control: in_review → blocked (the fixture default) still rejects.
+    await handler(streamEvent("human:engineer"));
+    expect(h.state.enforce).toHaveBeenCalledTimes(1);
   });
 });

@@ -129,8 +129,25 @@ PIPELINE_VARS=""
 if [ -n "${PIPELINE_ENABLED:-}" ]; then
   PIPELINE_VARS=",PIPELINE_ENABLED=${PIPELINE_ENABLED}"
 fi
+# TEAM-4044: PIPELINE_REPOS scopes that block to the repos the pipeline actually
+# deploys (comma-separated owner/repo). A run on any other repo gets the legacy
+# (DEPLOY.md / self-run) path. Unset → every repo (single-repo installs).
+if [ -n "${PIPELINE_REPOS:-}" ]; then
+  PIPELINE_VARS="${PIPELINE_VARS},PIPELINE_REPOS=${PIPELINE_REPOS}"
+fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}}"
+# Level-triggered dispatch (TEAM-4060): off | shadow | enforce. When enforce, the
+# done-cascade invokes a newly-unblocked dependent IN-PROCESS instead of waiting
+# for the Ready-status webhook round-trip — closes the dispatch dead-zone (the
+# Ready->Ready no-op / dropped-webhook stall that idled work until the sweep).
+# Code defaults OFF (pure webhook path, byte-identical to pre-4060); only forward
+# an explicit override so a stale config.sh value can never silently flip it.
+LEVEL_DISPATCH_VARS=""
+if [ -n "${LEVEL_TRIGGER_DISPATCH:-}" ]; then
+  LEVEL_DISPATCH_VARS=",LEVEL_TRIGGER_DISPATCH=${LEVEL_TRIGGER_DISPATCH}"
+fi
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}}"
 
@@ -258,8 +275,9 @@ else
 fi
 
 # ── EventBridge: scheduled sweeps → orchestrator ──────────────────────────────
-# Mirrors DeadSessionSweepRule + permission in template.yaml. A rate(5 minutes)
-# rule invokes the orchestrator with a sentinel payload; index.mjs branches on it
+# Mirrors DeadSessionSweepRule + permission in template.yaml. A scheduled rule
+# (SWEEP_RATE, default rate(1 minute) since TEAM-4060 — see below) invokes the
+# orchestrator with a sentinel payload; index.mjs branches on it
 # before any stream/webhook parsing. ONE rule fans out to TWO targets, each with
 # its own Input action — a separate synthetic invocation per sweep:
 #   - action "dead_session_sweep"  → getDetector().runSweep       (TEAM-3618 D1.2)
@@ -275,13 +293,19 @@ echo "=== Wiring scheduled sweep triggers (EventBridge schedule) ==="
 SWEEP_RULE="agentcore-hub-dead-session-sweep"
 ORCH_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-orchestrator"
 
+# rate(1 minute): with level-triggered dispatch (TEAM-4060) doing the happy-path
+# hand-off in-process, the sweep is now a fast backstop for genuinely dropped
+# cascades/webhooks — a 1-min cadence caps recovery latency at ~1 min instead of
+# ~5. It stays cheap: each fire scans only active workflows and almost always
+# finds everything skippedLiveLease. Override with SWEEP_RATE if needed.
+SWEEP_RATE="${SWEEP_RATE:-rate(1 minute)}"
 aws events put-rule \
   --name "$SWEEP_RULE" \
-  --schedule-expression "rate(5 minutes)" \
+  --schedule-expression "$SWEEP_RATE" \
   --state ENABLED \
   --region "$AWS_REGION" \
   --output text --query 'RuleArn' >/dev/null
-echo "  ✓ Rule $SWEEP_RULE upserted (rate(5 minutes))"
+echo "  ✓ Rule $SWEEP_RULE upserted ($SWEEP_RATE)"
 
 # JSON list form (not the key=value shorthand): the Input JSON contains commas,
 # which the shorthand parser would mis-split on. Input is a JSON *string*. Two

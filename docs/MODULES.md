@@ -307,6 +307,10 @@ CloudWatch Logs. Deploy role is deliberately narrow (Lambda code-only, no
 - `NEXT_PUBLIC_PIPELINE_ENABLED=1` — shows the `/pipeline` nav entry + tab (app).
 - `PIPELINE_ENABLED=1` — on the fleet/orchestrator context: CI/QA/release-manager
   blueprints read pipeline results instead of shelling builds.
+- `PIPELINE_REPOS=owner/repo[,owner/repo2]` — orchestrator: scopes that signal to the
+  repos the pipeline actually deploys (it has one Source repo). A run on any other
+  repo gets no Pipeline Mode block and its blueprints take the legacy path
+  (DEPLOY.md / self-run). Unset = every repo (single-repo installs).
 - `PIPELINE_TOOLS_LAMBDA` — fleet runtime: name of the tools Lambda (default
   `agentcore-hub-pipeline-tools`).
 - `PIPELINE_NAME` / `BUILD_PROJECT` / `CI_PROJECT` — on the tools Lambda

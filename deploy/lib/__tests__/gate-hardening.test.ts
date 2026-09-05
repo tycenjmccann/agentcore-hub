@@ -302,9 +302,15 @@ describe("F3: belt cap fails closed", () => {
 
 describe("F4b: break-glass refuses when no durable audit record can be written", () => {
   it("refuses (exit 1) when BOTH the local log append and the S3 audit write fail", () => {
-    // The local log lives at $repo_root/.eval-gate-overrides.log — a 555
-    // repo root makes the append fail; the aws shim fails every s3 cp.
-    chmodSync(repoGatedHead, 0o555);
+    // The local log lives at $repo_root/.eval-gate-overrides.log. Occupy that
+    // path with a DIRECTORY so the `>>` append fails with EISDIR — for root
+    // too. (A 555 repo root only fails for unprivileged users; CodeBuild runs
+    // the unit suite as root, where chmod is not a barrier and the append
+    // silently succeeded, so the "both sinks failed" refusal never fired.)
+    // The aws shim fails every s3 cp.
+    const logPath = join(repoGatedHead, ".eval-gate-overrides.log");
+    rmSync(logPath, { force: true, recursive: true });
+    mkdirSync(logPath);
     try {
       const r = runGate(repoGatedHead, {
         EVAL_GATE_OVERRIDE: "1",
@@ -319,7 +325,7 @@ describe("F4b: break-glass refuses when no durable audit record can be written",
       expect(r.out).toContain("FR-3.3");
       expect(r.out).not.toContain("proceeding under break-glass override");
     } finally {
-      chmodSync(repoGatedHead, 0o755);
+      rmSync(logPath, { force: true, recursive: true });
     }
   });
 

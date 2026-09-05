@@ -5,7 +5,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "nod
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { preflight } from "../lib/cases.mjs";
+import { preflight, resolveFixtureRef } from "../lib/cases.mjs";
+import { createRegistry } from "../lib/registry.mjs";
 
 const REAL_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const REAL_SCHEMA = readFileSync(join(REAL_ROOT, "evals/battery/schema/case.schema.json"), "utf8");
@@ -292,5 +293,47 @@ describe("preflight on the real working tree", () => {
     expect(errorText(pf)).toBe("");
     expect(pf.activeCases.length).toBeGreaterThanOrEqual(10);
     expect(pf.retiredCases.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("fixture references are confined to evals/battery/fixtures/ (Codex P1 on #358)", () => {
+  const TRAVERSAL = "../../../../etc/hosts";
+
+  it("preflight fails a case whose input.files escapes the fixtures directory", () => {
+    const pf = preflight(
+      makeRepo((root) => {
+        const c = { ...VALID_CASE, input: { files: [TRAVERSAL] } };
+        writeFileSync(join(root, "evals", "battery", "cases", "valid-case-001.json"), JSON.stringify(c));
+      })
+    );
+    expect(pf.errors.some((e) => e.check === "fixture" && /escapes evals\/battery\/fixtures/.test(e.message))).toBe(true);
+  });
+
+  it("preflight fails on an absolute path and on a ref outside fixtures/ even when it exists", () => {
+    const pf = preflight(
+      makeRepo((root) => {
+        const c = { ...VALID_CASE, input: { files: ["/etc/hosts", "manifest.json"] } };
+        writeFileSync(join(root, "evals", "battery", "cases", "valid-case-001.json"), JSON.stringify(c));
+      })
+    );
+    const msgs = pf.errors.filter((e) => e.check === "fixture").map((e) => e.message);
+    expect(msgs.some((m) => /must be a relative path/.test(m))).toBe(true);
+    expect(msgs.some((m) => /manifest\.json.*escapes/.test(m))).toBe(true);
+  });
+
+  it("resolveFixtureRef accepts a normal fixture path and rejects traversal", () => {
+    const root = makeRepo();
+    expect(resolveFixtureRef(root, "fixtures/x/a.md")).toBe(join(root, "evals", "battery", "fixtures", "x", "a.md"));
+    expect(() => resolveFixtureRef(root, TRAVERSAL)).toThrow(/escapes/);
+    expect(() => resolveFixtureRef(root, "fixtures/../cases/valid-case-001.json")).toThrow(/escapes/);
+  });
+
+  it("createRegistry refuses to seed a traversal ref instead of silently reading it", () => {
+    const root = makeRepo();
+    const ws = mkdtempSync(join(tmpdir(), "battery-ws-"));
+    tempDirs.push(ws);
+    expect(() =>
+      createRegistry({ caseDef: { ...VALID_CASE, input: { files: [TRAVERSAL] } }, repoRoot: root, workspaceDir: ws })
+    ).toThrow(/escapes/);
   });
 });
