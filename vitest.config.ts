@@ -223,6 +223,13 @@ export default defineConfig({
       // shadow records + reports but never drops. Both twins (Jira webhook +
       // DDB stream).
       "lambda/orchestrator/gate-state-guard.test.mjs",
+      // replay-gate-state (TEAM-4120 FR-1 acceptance) — the gate history of REAL
+      // runs (yteqfl + sffzti reduced dossiers, deduped by the real contentKey)
+      // plus a reconstructed TEAM-4045-pattern run, replayed through the REAL
+      // blocked twins: asserts the guard admits exactly as many rejections as a
+      // human actually filed (zero, in every dossier we have), that the
+      // creation-time block still costs no I/O, and that off is unchanged.
+      "lambda/orchestrator/replay-gate-state.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
