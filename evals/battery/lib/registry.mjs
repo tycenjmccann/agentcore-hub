@@ -7,6 +7,7 @@
 // run-battery.mjs before any case runs).
 
 import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { resolveFixtureRef } from "./cases.mjs";
 import { join, resolve, basename, dirname, sep } from "node:path";
 import { createHash } from "node:crypto";
 
@@ -59,7 +60,7 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
     ...(caseDef.input?.transcript ? [caseDef.input.transcript] : []),
   ];
   for (const ref of fixtureRefs) {
-    const abs = join(repoRoot, "evals", "battery", ref);
+    const abs = resolveFixtureRef(repoRoot, ref); // throws on traversal/symlink escape
     if (!existsSync(abs)) continue;
     const content = readFileSync(abs, "utf8");
     s3.set(`shared/inputs/${basename(ref)}`, content);
@@ -76,7 +77,7 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
   // see the degradation. Unpinned names still serve from the working tree.
   const blueprintOverrides = new Map();
   for (const ref of caseDef.input?.blueprints || []) {
-    const abs = join(repoRoot, "evals", "battery", ref);
+    const abs = resolveFixtureRef(repoRoot, ref); // throws on traversal/symlink escape
     if (!existsSync(abs)) continue;
     blueprintOverrides.set(basename(ref).replace(/\.md$/, ""), readFileSync(abs, "utf8"));
   }

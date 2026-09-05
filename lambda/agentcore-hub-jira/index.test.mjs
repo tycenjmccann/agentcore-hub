@@ -207,6 +207,7 @@ test("getIssue: comment fetch failure returns the mapped issue with comments: []
 test("createTicket: a Done same-summary ticket is NOT a duplicate — a new ticket is created", async () => {
   const originalFetch = globalThis.fetch;
   const posts = [];
+  const searchUrls = [];
 
   const SUMMARY = "Escalation: ship-review not converging (TEAM-1)";
 
@@ -214,6 +215,7 @@ test("createTicket: a Done same-summary ticket is NOT a duplicate — a new tick
     const method = options.method || "GET";
     // Dedupe search — returns a prior gate with the SAME summary/labels, Done.
     if (url.includes("/rest/api/3/search/jql")) {
+      searchUrls.push(url);
       return new Response(
         JSON.stringify({
           issues: [
@@ -241,6 +243,11 @@ test("createTicket: a Done same-summary ticket is NOT a duplicate — a new tick
     assert.equal(posts.length, 1, `expected one create POST, got ${posts.length}`);
     assert.equal(result.ticketId, "TEAM-11");
     assert.ok(!result.deduplicated, "a Done gate must not be returned as a dedupe hit");
+    // Terminal tickets are filtered server-side too, so a live duplicate can
+    // never be crowded out of the result window by old completed matches.
+    assert.equal(searchUrls.length, 1);
+    const jql = decodeURIComponent(searchUrls[0]).replace(/\+/g, " "); // URLSearchParams encodes spaces as "+"
+    assert.ok(jql.includes("statusCategory != Done"), `JQL must exclude Done: ${jql}`);
   } finally {
     globalThis.fetch = originalFetch;
   }

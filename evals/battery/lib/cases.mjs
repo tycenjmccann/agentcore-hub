@@ -3,8 +3,8 @@
 // a structured error and a gate FAIL — malformed config must fail loudly
 // BEFORE any Bedrock spend.
 
-import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, readdirSync, existsSync, realpathSync } from "node:fs";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
 
@@ -13,6 +13,35 @@ export const PERSONA_EVALUATOR_ID = "persona_contract_compliance";
 export const SCORING_BACKEND = "local-judge";
 
 export const batteryDir = (repoRoot) => join(repoRoot, "evals", "battery");
+
+/**
+ * Resolve a case's fixture reference (input.files / transcript / repoFixture /
+ * blueprints) to an absolute path, REFUSING anything that does not stay inside
+ * evals/battery/fixtures/. Case files are overlaid from the PR head as data in
+ * gate mode, so a traversal like `../../../../proc/self/environ` would let a
+ * PR feed the CI job's environment (OIDC credentials) to the model through the
+ * stub file/S3 tools. Symlinks are resolved and re-checked when the target
+ * exists. Throws on escape; callers decide whether a missing target is fatal.
+ */
+export function resolveFixtureRef(repoRoot, ref) {
+  const fixturesRoot = resolve(batteryDir(repoRoot), "fixtures");
+  const inside = (abs, root) => abs === root || abs.startsWith(root + sep);
+  if (typeof ref !== "string" || ref.length === 0 || isAbsolute(ref)) {
+    throw new Error(`fixture ref '${ref}' must be a relative path under evals/battery/fixtures/`);
+  }
+  const abs = resolve(batteryDir(repoRoot), ref);
+  if (!inside(abs, fixturesRoot)) {
+    throw new Error(`fixture ref '${ref}' escapes evals/battery/fixtures/ — denied`);
+  }
+  if (existsSync(abs) && existsSync(fixturesRoot)) {
+    const real = realpathSync(abs);
+    const realRoot = realpathSync(fixturesRoot);
+    if (!inside(real, realRoot)) {
+      throw new Error(`fixture ref '${ref}' resolves (via symlink) outside evals/battery/fixtures/ — denied`);
+    }
+  }
+  return abs;
+}
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
@@ -165,8 +194,16 @@ export function preflight(repoRoot) {
     if (def.input?.transcript) refs.push(def.input.transcript);
     if (def.input?.repoFixture) refs.push(def.input.repoFixture);
     refs.push(...(def.input?.files || []), ...(def.input?.blueprints || []));
-    for (const ref of refs)
-      if (!existsSync(join(dir, ref))) fail("fixture", file, `referenced fixture path does not exist: ${ref}`);
+    for (const ref of refs) {
+      let abs;
+      try {
+        abs = resolveFixtureRef(repoRoot, ref);
+      } catch (err) {
+        fail("fixture", file, err.message);
+        continue;
+      }
+      if (!existsSync(abs)) fail("fixture", file, `referenced fixture path does not exist: ${ref}`);
+    }
     if (
       (def.evaluators || []).includes(CUSTOM_EVALUATOR_ID) &&
       !def.referenceInputs?.expectedToolTrajectory?.length

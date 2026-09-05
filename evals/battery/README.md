@@ -14,7 +14,7 @@ The battery ships **opt-in**. Nothing runs and nothing blocks unless you ask:
 | Surface | Off (default) | On |
 | --- | --- | --- |
 | Local CLI | — | `npm run battery:run -- --case <id> --report-only` scores one case (exit 0 regardless of verdict). `npm run battery:run -- --base-ref origin/main` = full gate math. `npm run battery:mock` = zero-AWS demo. |
-| PR check | no check run | add the **`config-evals`** label to the PR, or set repo variable `CONFIG_EVALS_GATE=always` for every PR (the original required-check design). |
+| PR check | no check run | add the **`config-evals`** label to a same-repo PR (labeled fork PRs are ignored — push the branch to this repo instead), or set repo variable `CONFIG_EVALS_GATE=always` for every PR (the original required-check design). |
 | On-demand CI | — | dispatch **Config Evals Run** (`config-evals-run.yml`) against any ref; inputs: case filter, report-only, base ref. Summary lands in the job summary + artifact. |
 | Baseline refresh | manual only | `npm run battery:baseline` locally (commit the result) or dispatch **Config Evals Baseline**; set `CONFIG_EVALS_AUTO_BASELINE=true` to regenerate on every gated merge to main (~$25/run). |
 | Deploy guard | `require_eval_gate` is a no-op | export `EVAL_GATE=enforce` before running a deploy script. |
