@@ -40,6 +40,13 @@ jobs:
       - name: Cost-report lambda unit tests (node --test)
         run: node --test lambda/cost-report
 
+      # The Jira ticket-tools Lambda (agentcore-hub-jira) has a node:test suite
+      # (adfToText, getIssue comment fetch, createTicket dedupe, and the
+      # TEAM-4113 spawned_by → fix:<kind> label round-trip). Same rationale as
+      # cost-report: standalone `node --test`, not in the vitest include list.
+      - name: Jira ticket-tools lambda unit tests (node --test)
+        run: node --test lambda/agentcore-hub-jira
+
       # R2 (docs/race-condition-study.md): the workflows table may only be
       # written through lambda/orchestrator/workflow-store.mjs — ad-hoc writes
       # are the read-modify-write clobber class behind most workflow races.

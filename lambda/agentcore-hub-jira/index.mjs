@@ -16,6 +16,9 @@ const SITE = process.env.JIRA_SITE_URL;
 const EMAIL = process.env.JIRA_EMAIL;
 const TOKEN = process.env.JIRA_API_TOKEN;
 const PROJECT_KEY = process.env.JIRA_PROJECT_KEY || "TEAM";
+// TEAM-4113: fix-ticket origin kinds an agent may stamp via `spawned_by`. Kept
+// in lockstep with the DynamoDB tickets Lambda + orchestrator completion.mjs.
+const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
 
 const BASE_URL = `https://${SITE}`;
 const AUTH = `Basic ${Buffer.from(`${EMAIL}:${TOKEN}`).toString("base64")}`;
@@ -210,7 +213,7 @@ async function listReviewers(params = {}) {
 // ─── Tool Implementations ────────────────────────────────────────────────────
 
 async function createTicket(params) {
-  const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id } = params;
+  const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by } = params;
 
   // Validate assignee against known roster — reject hallucinated agent names.
   // "human:<who>" assignees are human-review gates, not agents, and are always
@@ -293,6 +296,16 @@ async function createTicket(params) {
     labels.push(`agent:${assignee}`);
   }
   if (workflow_id) labels.push(`wf:${workflow_id}`);
+  // TEAM-4113: agents stamp a fix ticket's origin as `spawned_by:{kind}`; the
+  // DynamoDB tickets Lambda persists it, so mirror it here as a `fix:<kind>`
+  // label. The orchestrator reconstructs `spawnedBy.kind` from this label
+  // (mapJiraIssueToTicket) so the completion evidence gate + rework-loop cap
+  // count agent-filed fixes in Jira mode the same as in DynamoDB mode.
+  {
+    const kind = spawned_by && typeof spawned_by === "object" ? spawned_by.kind : null;
+    if (kind && FIX_KINDS.has(kind)) labels.push(`fix:${kind}`);
+    else if (spawned_by) console.warn(`[jira-tools] ignoring spawned_by with unknown/invalid kind: ${JSON.stringify(spawned_by)}`);
+  }
 
   // Normalize common LLM variations of issue type names to Jira's canonical form
   const ISSUE_TYPE_ALIASES = {

@@ -77,6 +77,41 @@ export default defineConfig({
       // off|shadow|enforce, the already-Ready in-process dispatch, and non-fatal
       // isolation when dispatchReady (the claim-CAS webhook path) loses a race.
       "lambda/orchestrator/level-trigger-dispatch.test.mjs",
+      // merge-on-green.mjs (TEAM-4110) — DI coverage for the auto-merge of a
+      // human-approved, clean+green final PR: off | shadow | enforce (default
+      // off, byte-identical), gate-must-be-done, mergeable_state:"clean" only,
+      // exact-head-SHA merge, and non-fatal GitHub-refusal handling.
+      "lambda/orchestrator/merge-on-green.test.mjs",
+      // ship-head-stability.mjs (TEAM-4111) — DI coverage for the dispatch-time
+      // head-stability gate: off (no probe, byte-identical) | shadow (measures
+      // would-defer, always dispatches) | enforce (defer until head quiet +
+      // CI green on that exact head). CI-red passes through, probe-throw and
+      // maxDeferrals both fail open, unknown mode fails safe to off.
+      "lambda/orchestrator/ship-head-stability.test.mjs",
+      // ship-dispatch-gate.mjs (TEAM-4112) — DI coverage for the ship-dispatch
+      // prerequisite gate: ship is gated iff a non-epic, completion-required,
+      // present pre-ship-phase sibling is not terminal. Epics/other-ship-phase/
+      // unclassifiable (human-gate) tickets never gate (fail-safe), absent phases
+      // never wedge, repairBlocker prefers verification/CI, and mode normalization
+      // is the same strict allow-list as ship-head (legacy on/true/1 → off).
+      "lambda/orchestrator/ship-dispatch-gate.test.mjs",
+      // rework-loop-cap.mjs (TEAM-4113) — the per-(workflow,phase) lineage
+      // backstop the per-gate review-cap can't provide: counts fix tickets per
+      // PHASE so a loop hopping ticket ids still accumulates. DI coverage of
+      // off|shadow|enforce (fail-safe to SHADOW, opposite of the ship gates),
+      // distinct-id round counting, DECISION: continue reset, idempotent
+      // escalation, and ledger-failure fail-open.
+      "lambda/orchestrator/rework-loop-cap.test.mjs",
+      // rework-loop-replay (TEAM-4113) — a 9-round QA→dev runaway that files a
+      // fresh fix ticket (new gate id) each round, replayed through the REAL
+      // cap: asserts the lineage cap trips at maxRounds and signals ONCE, while
+      // a per-gate-id ledger (the review-cap's keying) never reaches the cap.
+      "lambda/orchestrator/rework-loop-replay.test.mjs",
+      // jira-fix-label (TEAM-4113) — mapJiraIssueToTicket reconstructs an agent-
+      // filed fix ticket's spawnedBy.kind from the `fix:<kind>` label the jira
+      // tools Lambda stamps, so Jira-mode fixes gate completion + the rework cap
+      // the same as DynamoDB mode. Pure map, no I/O.
+      "lambda/orchestrator/jira-fix-label.test.mjs",
       // done-handlers-cascade (TEAM-3688 F3) — HANDLER-level cascade coverage.
       // Invokes the REAL handleTicketDoneUnified + handleTicketDone from index.mjs
       // through the REAL cascade (cascade.mjs/lease.mjs unmocked; only AWS/store

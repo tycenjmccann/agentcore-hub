@@ -330,3 +330,74 @@ test("handler(Tickets___get_issue) accepts ticket_id and hits Jira with the real
     globalThis.fetch = originalFetch;
   }
 });
+
+// ─── TEAM-4113: spawned_by → fix:<kind> label on create ─────────────────────────
+
+test("createTicket: spawned_by {kind:'qa_fix'} adds a fix:qa_fix label to the POST", async () => {
+  const originalFetch = globalThis.fetch;
+  let postedFields = null;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    if (url.includes("/rest/api/3/search/jql")) {
+      return new Response(JSON.stringify({ issues: [] }), { status: 200 }); // no dedupe hit
+    }
+    if (url.endsWith("/rest/api/3/issue") && method === "POST") {
+      postedFields = JSON.parse(options.body).fields;
+      return new Response(JSON.stringify({ key: "TEAM-77" }), { status: 201 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+
+  try {
+    const result = await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: {
+        summary: "Fix flaky login test",
+        workflow_id: "run1",
+        assignee: "agentcore_hub_backend_dev",
+        spawned_by: { kind: "qa_fix" },
+      },
+    });
+    assert.equal(result.ticketId, "TEAM-77");
+    assert.ok(postedFields, "expected a create POST");
+    assert.ok(postedFields.labels.includes("fix:qa_fix"), `expected fix:qa_fix label, got ${JSON.stringify(postedFields.labels)}`);
+    // The wf + agent labels must survive alongside it.
+    assert.ok(postedFields.labels.includes("wf:run1"));
+    assert.ok(postedFields.labels.includes("agent:agentcore_hub_backend_dev"));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("createTicket: spawned_by with an unknown kind is dropped (no fix: label)", async () => {
+  const originalFetch = globalThis.fetch;
+  let postedFields = null;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    if (url.includes("/rest/api/3/search/jql")) {
+      return new Response(JSON.stringify({ issues: [] }), { status: 200 });
+    }
+    if (url.endsWith("/rest/api/3/issue") && method === "POST") {
+      postedFields = JSON.parse(options.body).fields;
+      return new Response(JSON.stringify({ key: "TEAM-78" }), { status: 201 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+
+  try {
+    await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: {
+        summary: "Something",
+        workflow_id: "run1",
+        spawned_by: { kind: "not_a_real_kind" },
+      },
+    });
+    assert.ok(postedFields, "expected a create POST");
+    assert.ok(!postedFields.labels.some((l) => l.startsWith("fix:")), `no fix: label expected, got ${JSON.stringify(postedFields.labels)}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

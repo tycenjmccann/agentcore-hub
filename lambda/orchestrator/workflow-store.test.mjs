@@ -22,6 +22,10 @@ import {
   appendReviewRound,
   appendReviewCapEscalation,
   appendReviewAuthorization,
+  setShipHeadDeferrals,
+  appendReworkRound,
+  appendReworkEscalation,
+  appendReworkAuthorization,
 } from "./workflow-store.mjs";
 
 /**
@@ -617,5 +621,88 @@ describe("setRepoCheck (repo URL pre-flight)", () => {
     expect(sent[0].input.UpdateExpression).toBe("SET repoCheck = :rc");
     expect(sent[0].input.ExpressionAttributeValues[":rc"]).toEqual(rc);
     expect(sent[0].input.Key).toEqual({ workflowId: "wf_1" });
+  });
+});
+
+
+describe("setShipHeadDeferrals (ship-head stability, TEAM-4111)", () => {
+  it("count > 0 → scoped SET of the two attrs, no full-row put", async () => {
+    initWorkflowStore(stubDdb, "wf");
+    sent.length = 0;
+    await setShipHeadDeferrals("wf_1", 2, "TEAM-SHIP");
+    expect(sent.length).toBe(1);
+    expect(sent[0].input.UpdateExpression).toBe("SET shipHeadDeferrals = :n, shipHeadTicketId = :t");
+    expect(sent[0].input.ExpressionAttributeValues).toEqual({ ":n": 2, ":t": "TEAM-SHIP" });
+    expect(sent[0].input.Key).toEqual({ workflowId: "wf_1" });
+  });
+
+  it("count <= 0 → REMOVEs both attrs (dispatched run carries no ship-head state)", async () => {
+    initWorkflowStore(stubDdb, "wf");
+    sent.length = 0;
+    await setShipHeadDeferrals("wf_1", 0);
+    expect(sent.length).toBe(1);
+    expect(sent[0].input.UpdateExpression).toBe("REMOVE shipHeadDeferrals, shipHeadTicketId");
+    expect(sent[0].input.ExpressionAttributeValues).toBeUndefined();
+  });
+});
+
+
+describe("rework lineage ledger (TEAM-4113)", () => {
+  const round = { ticketId: "TEAM-90", at: "2026-09-05T00:00:00Z" };
+
+  it("seeds reworkLineage + the per-lineage entry with if_not_exists, then list_appends the round", async () => {
+    initWorkflowStore(stubDdb, "wf");
+    sent.length = 0;
+    await appendReworkRound("wf_1", "wf_1:development", round);
+    const w = writes();
+    expect(w[0].input.UpdateExpression).toContain("if_not_exists(reworkLineage, :empty)");
+    expect(w[1].input.UpdateExpression).toBe(
+      "SET reworkLineage.#k = if_not_exists(reworkLineage.#k, :seed)"
+    );
+    expect(w[1].input.ExpressionAttributeValues[":seed"]).toEqual({
+      rounds: [], authorizations: [], escalations: [],
+    });
+    expect(w[1].input.ExpressionAttributeNames["#k"]).toBe("wf_1:development");
+    // A lost round is a cap that trips late — append, never rewrite the array.
+    expect(w[2].input.UpdateExpression).toBe(
+      "SET reworkLineage.#k.rounds = list_append(if_not_exists(reworkLineage.#k.rounds, :empty), :r)"
+    );
+    expect(w[2].input.ExpressionAttributeValues[":r"]).toEqual([round]);
+    expect(w[2].input.ReturnValues).toBe("ALL_NEW");
+  });
+
+  it("returns the POST-write lineage ledger so a concurrent round is counted", async () => {
+    const ledger = { rounds: [round], authorizations: [], escalations: [] };
+    initWorkflowStore(
+      {
+        async send(cmd) {
+          sent.push({ type: cmd.constructor.name, input: cmd.input });
+          return cmd.input.ReturnValues === "ALL_NEW"
+            ? { Attributes: { workflowId: "wf_1", reworkLineage: { "wf_1:development": ledger } } }
+            : {};
+        },
+      },
+      "wf"
+    );
+    expect(await appendReworkRound("wf_1", "wf_1:development", round)).toEqual(ledger);
+  });
+
+  it("returns null when the row is gone rather than inventing an empty ledger", async () => {
+    initWorkflowStore(stubDdb, "wf");
+    expect(await appendReworkRound("wf_1", "wf_1:development", round)).toBeNull();
+  });
+
+  it("append-onlys escalations and authorizations under the same lineage key", async () => {
+    initWorkflowStore(stubDdb, "wf");
+    sent.length = 0;
+    await appendReworkEscalation("wf_1", "wf_1:development", { escalatedAtRound: 4, decision: null });
+    expect(writes()[2].input.UpdateExpression).toBe(
+      "SET reworkLineage.#k.escalations = list_append(if_not_exists(reworkLineage.#k.escalations, :empty), :e)"
+    );
+    sent.length = 0;
+    await appendReworkAuthorization("wf_1", "wf_1:development", { decision: "continue", resetAtRound: 4 });
+    expect(writes()[2].input.UpdateExpression).toBe(
+      "SET reworkLineage.#k.authorizations = list_append(if_not_exists(reworkLineage.#k.authorizations, :empty), :a)"
+    );
   });
 });
