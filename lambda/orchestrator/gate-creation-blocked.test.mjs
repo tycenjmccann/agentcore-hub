@@ -55,6 +55,8 @@ const h = vi.hoisted(() => ({
     // TEAM-4071 F2: when true, the workflows-table steal CAS (lease.mjs
     // stealClaim) loses — a concurrent writer moved the claim generation.
     failSteal: false,
+    // Fresh per test (see the note above expectStealCas).
+    startedAt: "",
   },
 }));
 
@@ -336,7 +338,11 @@ const expectStealCas = (ticketId, startedAt) => {
     ":ready": "ready", ":running": "running", ":inprog": "in_progress", ":exp": startedAt,
   });
 };
-const STARTED_AT = "2026-09-05T04:00:00.000Z";
+// TEAM-4080: the running claim's startedAt must be FRESH per test. A fixed
+// timestamp ages past claimTicketInvocation's 2×TTL stale-claim hatch as wall
+// clock passes, after which a later Ready would be re-claimed WITHOUT any
+// release having happened — and the (e2)/(e-DDB) dispatch assertions would pass
+// on code that never releases. Set in the top-level beforeEach.
 
 let handler;
 let handleReviewRejection;
@@ -381,6 +387,7 @@ beforeEach(() => {
   h.state.storeCalls.length = 0;
   h.state.jira = null;
   h.state.failSteal = false;
+  h.state.startedAt = new Date().toISOString();
   // Default cap verdict: not escalated, gating -> the rework reopen path.
   h.state.enforce = vi.fn(async () => ({ escalated: false, gated: true }));
   h.state.workflow = {
@@ -485,7 +492,7 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
         "TEAM-24": agentIssue("TEAM-24", RM, "Blocked", shipBlockedBy, "Ship"),
       });
       h.state.workflow.agentTasks["TEAM-24"] = {
-        id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: STARTED_AT,
+        id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: h.state.startedAt,
       };
     };
     const blockedWebhook = { source: "jira-webhook", ticketId: "TEAM-24", newStatus: "blocked", oldStatus: "in_progress" };
@@ -500,10 +507,10 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       expect(h.state.workflow.agentTasks["TEAM-24"].status).not.toBe("complete");
       expect(eventsOf("review.rejected")).toHaveLength(0);
       // TEAM-4071 F2: the release IS the lease.mjs stealClaim CAS, on this generation.
-      expectStealCas("TEAM-24", STARTED_AT);
+      expectStealCas("TEAM-24", h.state.startedAt);
       const released = eventsOf("orchestrator.claim_released");
       expect(released).toHaveLength(1);
-      expect(released[0].detail).toMatchObject({ ticketId: "TEAM-24", agentId: RM, reason: "agent_self_park", claimStartedAt: STARTED_AT, blockedBy: ["TEAM-23"] });
+      expect(released[0].detail).toMatchObject({ ticketId: "TEAM-24", agentId: RM, reason: "agent_self_park", claimStartedAt: h.state.startedAt, blockedBy: ["TEAM-23"] });
     });
 
     it("(e2) a subsequent Ready for that ticket invokes the agent normally (not skipped as already claimed)", async () => {
@@ -552,7 +559,7 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       await handler(blockedWebhook);
 
       // The CAS was attempted exactly once, on this generation...
-      expectStealCas("TEAM-24", STARTED_AT);
+      expectStealCas("TEAM-24", h.state.startedAt);
       // ...and lost: the in-memory task is NOT flipped and no event is published.
       expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("running");
       expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
@@ -650,7 +657,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
 
   const seedRunningShipTask = () => {
     h.state.workflow.agentTasks["TEAM-24"] = {
-      id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: STARTED_AT,
+      id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: h.state.startedAt,
     };
   };
 
@@ -659,7 +666,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
 
     await handler(record("MODIFY", shipImage("blocked"), shipImage("in_progress")));
     expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
-    expectStealCas("TEAM-24", STARTED_AT);
+    expectStealCas("TEAM-24", h.state.startedAt);
     expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
     expect(eventsOf("orchestrator.claim_released")[0].detail.blockedBy).toEqual(["TEAM-23"]);
 
@@ -693,7 +700,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     await handler(record("MODIFY", imageNoBlockers, oldNoBlockers));
 
     // h.state.tickets["TEAM-24"].blockedBy = ["TEAM-23"] (blocked) -> released.
-    expectStealCas("TEAM-24", STARTED_AT);
+    expectStealCas("TEAM-24", h.state.startedAt);
     expect(eventsOf("orchestrator.claim_released")[0].detail.blockedBy).toEqual(["TEAM-23"]);
   });
 
@@ -707,7 +714,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     );
 
     expect(released).toBe(false);
-    expectStealCas("TEAM-24", STARTED_AT); // attempted once, on this generation
+    expectStealCas("TEAM-24", h.state.startedAt); // attempted once, on this generation
     expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("running");
     expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
     expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);

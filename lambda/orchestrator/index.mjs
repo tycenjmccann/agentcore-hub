@@ -606,9 +606,11 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       }
       const rejected = await getTicket(ticketId);
       if (rejected && isHumanAssignee(rejected.assignee)) {
-        // TEAM-4045: the from-state guard is isCreationTimeBlock above (TEAM-4044
-        // landed it first; a PRESENTED gate — ready/in_progress/in_review →
-        // blocked — is honored as a rejection).
+        // TEAM-4045 / TEAM-4080: the ONE from-state policy is isCreationTimeBlock
+        // above (see its docblock): a PRESENTED gate — ready / in_progress /
+        // in_review → blocked — is a rejection; todo / new / missing is not, with
+        // no evidence-based fallback. Fix 2's blocker guard inside
+        // handleReviewRejection is the second line of defence.
         await handleReviewRejection(rejected);
       } else if (rejected) {
         // TEAM-4045: an agent parked its own ticket — free its invocation claim.
@@ -2343,8 +2345,12 @@ async function processRecord(record) {
       }
       const blockedAssignee = unwrapDdbValue(newImage.assignee);
       if (isHumanAssignee(blockedAssignee)) {
-        // (An INSERT has no OldImage → oldStatus null → isCreationTimeBlock
-        // above already returned; only a MODIFY from a presented state gets here.)
+        // TEAM-4045 / TEAM-4080: same ONE from-state policy as the Jira twin —
+        // isCreationTimeBlock above (see its docblock). An INSERT has no
+        // OldImage → oldStatus null → already returned; only a MODIFY from a
+        // presented state (ready / in_progress / in_review) gets here, with no
+        // evidence-based fallback. Fix 2's blocker guard inside
+        // handleReviewRejection is the second line of defence.
         const rejected = await getTicket(ticketId);
         if (rejected) await handleReviewRejection(rejected);
       } else if (eventName === "MODIFY") {
@@ -2367,6 +2373,21 @@ async function processRecord(record) {
  * creation-time dependency block (blocked_by set at creation), never a human
  * review rejection. A rejection always comes from a presented gate — any other
  * prior status (ready / in_progress / in_review / …) is honored as before.
+ *
+ * TEAM-4045 / TEAM-4080 — this is the ONE from-state policy for a `human:*`
+ * gate entering blocked, applied identically at both entry points
+ * (processStatusChange for Jira webhooks, processRecord for DDB streams):
+ *   (a) ready / in_progress / in_review → blocked IS a rejection. The gate was
+ *       presented, and the human may park it from any presented state.
+ *       handleReviewRejection's reopen loop is the second line of defence for
+ *       this branch (fix 2): an upstream whose own blockedBy is still open is
+ *       never re-Readied (checkAllBlockersResolved), so a rejection from a
+ *       presented state can not dispatch an agent ahead of its dependencies.
+ *   (b) a missing / empty from-state, "new", "todo", or a DDB INSERT (no
+ *       OldImage → oldStatus null) is NEVER a rejection. There is deliberately
+ *       NO evidence-based fallback (e.g. an open review_needed notification):
+ *       the decision is made on the transition alone, before any I/O, and a
+ *       missing from-state fails closed.
  */
 export function isCreationTimeBlock(oldStatus) {
   const prev = String(oldStatus ?? "").trim().toLowerCase();
