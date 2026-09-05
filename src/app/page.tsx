@@ -35,8 +35,30 @@ interface MetricsData {
     avgDuration: number;
     totalDuration: number;
     invocations: number;
+    models?: ModelUsage[];
   }>;
+  modelMetrics?: ModelUsage[];
 }
+
+interface ModelUsage {
+  model: string;
+  tokensIn: number;
+  tokensOut: number;
+  calls: number;
+}
+
+// Tailwind can't see dynamically-built class names, so map models to full
+// literal classes. Order here is also the display order fallback.
+const MODEL_COLORS: Record<string, string> = {
+  "fable-5": "bg-brand-400",
+  "opus-5": "bg-violet-fg",
+  "opus-4-8": "bg-violet-fg",
+  "opus-4-7": "bg-violet-fg",
+  "opus-4-6": "bg-violet-fg",
+  "sonnet-5": "bg-info-fg",
+  "sonnet-4-6": "bg-info-fg",
+  "haiku-4-5": "bg-success-fg",
+};
 
 function formatNumber(n: number): string {
   const opts = { minimumFractionDigits: 1, maximumFractionDigits: 1 } as const;
@@ -112,6 +134,14 @@ export default function DashboardPage() {
           />
         </div>
       </div>
+
+      {/* Model usage: which Claude tier each call ran on (personas + coding CLI delegations) */}
+      {(metrics?.modelMetrics?.length ?? 0) > 0 && (
+        <div className="card">
+          <h3 className="text-xs font-semibold text-[var(--color-text-muted)] uppercase tracking-wide mb-4">Model Usage (30d)</h3>
+          <ModelUsagePanel models={metrics!.modelMetrics!} />
+        </div>
+      )}
 
       {/* Ticket flow section */}
       <TicketsFlowPanel />
@@ -205,6 +235,43 @@ export default function DashboardPage() {
             </table>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function ModelUsagePanel({ models }: { models: ModelUsage[] }) {
+  const totalCalls = models.reduce((sum, m) => sum + m.calls, 0);
+  if (totalCalls === 0) return null;
+
+  return (
+    <div className="space-y-3">
+      {/* Stacked share-of-calls bar */}
+      <div className="flex h-2 rounded-full overflow-hidden bg-surface-3">
+        {models.map((m) => (
+          <div
+            key={m.model}
+            className={MODEL_COLORS[m.model] || "bg-surface-4"}
+            style={{ width: `${(m.calls / totalCalls) * 100}%` }}
+            title={`${m.model}: ${m.calls.toLocaleString("en-US")} calls`}
+          />
+        ))}
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+        {models.map((m) => (
+          <div key={m.model}>
+            <div className="flex items-center gap-1.5">
+              <span className={`w-2 h-2 rounded-full shrink-0 ${MODEL_COLORS[m.model] || "bg-surface-4"}`} />
+              <span className="text-xs font-semibold text-[var(--color-text-primary)] truncate" title={m.model}>{m.model}</span>
+            </div>
+            <p className="text-lg font-bold text-[var(--color-text-primary)] mt-0.5">
+              {((m.calls / totalCalls) * 100).toFixed(1)}%
+            </p>
+            <p className="text-[11px] text-[var(--color-text-secondary)]">
+              {formatNumber(m.calls)} calls · {formatNumber(m.tokensIn)} / {formatNumber(m.tokensOut)} tok
+            </p>
+          </div>
+        ))}
       </div>
     </div>
   );
