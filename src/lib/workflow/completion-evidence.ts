@@ -282,3 +282,128 @@ export function shipVerdictOf(entry: ShipTaskLike | undefined | null): string | 
   if (merged || (SHIP_PROVEN_OUTCOMES as readonly string[]).includes(outcome)) return "shipped";
   return null;
 }
+
+/* ------------------------------------------------------------------------- *
+ * TEAM-3992 D3.2 — SHA-pinned fix-verification gate (pure twin).
+ *
+ * PARITY with lambda/orchestrator/completion.mjs fixVerificationGaps /
+ * FIX_REARM_ROLE_TO_KIND. completion-evidence-parity.test.ts feeds one fixture
+ * table through both copies. A drift means the HTTP complete route and the
+ * orchestrator disagree about whether a fix was re-verified at its final SHA —
+ * one surface closes green while the other 409s.
+ * ------------------------------------------------------------------------- */
+
+/** The fix-ticket kinds the re-verify recognizes — mirror of completion.mjs FIX_KINDS. */
+const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
+
+/**
+ * Role name (as it appears in a def's ticketDag.fixRearm) → the verification
+ * `kind` a verifier stamps. review/ci keep their names; the verification phase's
+ * re-verify is a `qa` record. PARITY MIRROR: completion.mjs FIX_REARM_ROLE_TO_KIND.
+ */
+export const FIX_REARM_ROLE_TO_KIND: Readonly<Record<string, string>> = Object.freeze({
+  review: "review",
+  ci: "ci",
+  verification: "qa",
+});
+
+/** SHA-pinning tolerates abbreviation (7-char short sha ↔ 40-char full). */
+function shaMatches(a: unknown, b: unknown): boolean {
+  const x = String(a || "").toLowerCase();
+  const y = String(b || "").toLowerCase();
+  if (!x || !y) return false;
+  if (x === y) return true;
+  return x.length >= 7 && y.length >= 7 && (x.startsWith(y) || y.startsWith(x));
+}
+
+export interface VerificationRecordLike {
+  targetTicketId?: unknown;
+  headSha?: unknown;
+  kind?: unknown;
+  verdict?: unknown;
+}
+
+export interface FixTaskLike {
+  ticketId?: unknown;
+  commitSha?: unknown;
+  verification?: VerificationRecordLike | null;
+}
+
+export interface FixChildLike {
+  ticketId?: unknown;
+  status?: unknown;
+  type?: unknown;
+  spawnedBy?: { kind?: unknown; rearmOf?: unknown } | null;
+}
+
+export interface FixVerificationGap {
+  ticketId: string;
+  commitSha: string | null;
+  missingKinds: string[];
+}
+
+/**
+ * The SHA-pinned fix-verification gate. See completion.mjs fixVerificationGaps
+ * for the full contract: for every DONE fix ticket whose kind re-arms roles, its
+ * final SHA (agentTasks.commitSha) must carry a passing verification record per
+ * role (mapped to a verification kind). Returns the unresolved gaps; inert ([])
+ * when the def declares no fixRearm.
+ */
+export function fixVerificationGaps(
+  children: unknown,
+  agentTasks: Record<string, FixTaskLike> | undefined | null,
+  fixRearm: Record<string, string[]> | undefined | null,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  opts: Record<string, unknown> = {}
+): FixVerificationGap[] {
+  if (!Array.isArray(children) || !fixRearm || typeof fixRearm !== "object") return [];
+  const tasks: Record<string, FixTaskLike> =
+    agentTasks && typeof agentTasks === "object" ? agentTasks : {};
+
+  const verifsByTarget = new Map<string, VerificationRecordLike[]>();
+  const byTicketId = new Map<string, FixTaskLike>();
+  for (const entry of Object.values(tasks)) {
+    if (!entry || typeof entry !== "object") continue;
+    if (typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
+    const v = entry.verification;
+    if (!v || typeof v !== "object") continue;
+    const target = typeof v.targetTicketId === "string" ? v.targetTicketId : "";
+    if (!target) continue;
+    if (!verifsByTarget.has(target)) verifsByTarget.set(target, []);
+    verifsByTarget.get(target)!.push(v);
+  }
+
+  const gaps: FixVerificationGap[] = [];
+  for (const t of children as FixChildLike[]) {
+    if (!t || t.type === "epic") continue;
+    if (String(t.status || "").toLowerCase() !== "done") continue;
+    const sb = t.spawnedBy;
+    const kind = sb && typeof sb.kind === "string" ? sb.kind : "";
+    if (!FIX_KINDS.has(kind)) continue;
+    if (sb && sb.rearmOf) continue; // a re-arm ticket is a verifier, not a fix
+    const roles = Array.isArray(fixRearm[kind]) ? fixRearm[kind] : [];
+    if (roles.length === 0) continue;
+    const ticketId = String(t.ticketId || "");
+    const entry = tasks[ticketId] || byTicketId.get(ticketId);
+    const commitSha =
+      typeof entry?.commitSha === "string" && entry.commitSha.trim() ? entry.commitSha.trim() : "";
+    if (!commitSha) {
+      gaps.push({ ticketId, commitSha: null, missingKinds: ["commitSha"] });
+      continue;
+    }
+    const records = verifsByTarget.get(ticketId) || [];
+    const missingKinds: string[] = [];
+    for (const role of roles) {
+      const vkind = FIX_REARM_ROLE_TO_KIND[role] || role;
+      const passed = records.some(
+        (v) =>
+          shaMatches(v.headSha, commitSha) &&
+          v.kind === vkind &&
+          String(v.verdict || "").toLowerCase() === "pass"
+      );
+      if (!passed && !missingKinds.includes(vkind)) missingKinds.push(vkind);
+    }
+    if (missingKinds.length > 0) gaps.push({ ticketId, commitSha, missingKinds });
+  }
+  return gaps;
+}

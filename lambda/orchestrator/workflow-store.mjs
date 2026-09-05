@@ -492,6 +492,38 @@ export async function setProtectionCheck(workflowId, protectionCheck) {
   }));
 }
 
+/**
+ * TEAM-3992 D3.4 — record the one-shot realized-graph audit result. The
+ * orchestrator validates the run's realized child graph against the def's
+ * ticketDag once, at the first development-phase dispatch; this stamps the
+ * outcome. The `attribute_not_exists(dagAudit)` condition makes the write itself
+ * the idempotency guard — the first caller wins and records, every later caller
+ * loses the CAS and gets false, so the audit (and its event) fires exactly once
+ * per run. Scoped SET of one top-level attribute; never a full-map replacement
+ * (R2). Returns true when this caller recorded the audit.
+ */
+export async function setDagAudit(workflowId, { at, violationCount, violations }) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET dagAudit = :a",
+      ConditionExpression: "attribute_not_exists(dagAudit)",
+      ExpressionAttributeValues: {
+        ":a": {
+          at,
+          violationCount,
+          violations: (violations || []).slice(0, 20),
+        },
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
 /** Remove one resume context (one-time use). No-op if absent. */
 export async function removeResumeContext(workflowId, ticketId) {
   try {

@@ -497,6 +497,44 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
   return status;
 }
 
+/**
+ * TEAM-3992 D3.2 — add Blocks links so `ticket_id` is blocked_by each id in
+ * `blocked_by` (the DynamoDB twin's add_blockers op). Same link type/direction as
+ * reconcileBlockersAndStatus: inward blocks outward, so inward = the blocker,
+ * outward = ticket_id. Jira dedupes issue links by (type, pair), so a retried
+ * call converges — no explicit already-linked probe needed. Minimal: link only,
+ * no status transition (the ship ticket already carries its own status).
+ */
+async function addBlockers(params) {
+  const { ticket_id } = params;
+  const blockers = Array.isArray(params.blocked_by)
+    ? params.blocked_by
+    : params.blocked_by
+      ? [params.blocked_by]
+      : [];
+  if (!ticket_id) throw new Error("add_blockers requires ticket_id");
+  if (blockers.length === 0) throw new Error("add_blockers requires a non-empty blocked_by");
+
+  const added = [];
+  for (const blockerKey of blockers) {
+    if (!blockerKey || blockerKey === ticket_id) continue;
+    try {
+      await jiraFetch("/rest/api/3/issueLink", {
+        method: "POST",
+        body: JSON.stringify({
+          type: { name: "Blocks" },
+          inwardIssue: { key: blockerKey },
+          outwardIssue: { key: ticket_id },
+        }),
+      });
+      added.push(blockerKey);
+    } catch (err) {
+      console.log(`Warning: could not link blocker ${blockerKey} -> ${ticket_id}: ${err.message}`);
+    }
+  }
+  return { status: "ok", ticket_id, added };
+}
+
 async function transitionTicket(params) {
   const { ticket_id, transition_id, reason } = params;
 
@@ -790,6 +828,7 @@ const TOOLS = {
   Tickets___get_project_issue_types: getProjectIssueTypes,
   Tickets___lookup_user: lookupUser,
   Tickets___list_reviewers: listReviewers,
+  Tickets___add_blockers: addBlockers,
   // Backward compat: accept old prefix during transition
   JiraIntegration___create_ticket: createTicket,
   JiraIntegration___transition_ticket: transitionTicket,

@@ -417,6 +417,17 @@ export async function POST(req: NextRequest) {
       if (failures.length > 0 && body.allowUnresolvedRepo !== true) {
         return NextResponse.json({ ...describeRepoCheckFailure(failures), repoCheck }, { status: 422 });
       }
+      // TEAM-3992 D4.1: fold GitHub's resolved default_branch / canonical full_name
+      // back onto each repo so the workflow row carries the resolved truth from
+      // creation, persisted through the existing repoConfig write path (no raw DDB
+      // write). An explicitly configured defaultBranch always wins — a submitter
+      // may target a non-default integration branch on purpose.
+      for (const repo of body.repoConfig.repos ?? []) {
+        const res = repoCheck.results.find((r) => r.url === repo?.url && r.ok);
+        if (!res) continue;
+        if (res.defaultBranch && !repo.defaultBranch) repo.defaultBranch = res.defaultBranch;
+        if (res.fullName) repo.fullName = res.fullName;
+      }
       if (repoCheck.results.every((r) => r.ok)) {
         repoCheck = undefined; // clean — nothing to persist or warn about
       } else {

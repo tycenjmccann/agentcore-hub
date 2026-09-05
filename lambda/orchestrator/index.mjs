@@ -23,7 +23,7 @@ import {
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
-import { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import {
   BedrockAgentRuntimeClient,
@@ -38,15 +38,20 @@ import {
   isLeaseLive,
   lastAgentActivity,
   stealClaim,
+  leaseVerdict,
 } from "./lease.mjs";
-import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
+import { resolveWatchdog, setWatchdogSource, resolveStallSoftTimeoutMs } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
+import { validateRealizedGraph } from "./dag.mjs";
+import { createOtelActivity } from "./otel-activity.mjs";
 import { createCascade, newMetrics as newCascadeMetrics } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
+import { createRuntimeHealth, outageKey as runtimeOutageKey } from "./runtime-health.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, openGateOf, parseCdEvidence, blockReasonWithGate, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, ACCEPTED_SHIP_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, fixVerificationGaps, openGateOf, parseCdEvidence, blockReasonWithGate, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, ACCEPTED_SHIP_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning, checkBranchProtection } from "./repo-check.mjs";
+import { parseRepoUrl, resolveDefaultBranch, resolveRepoIdentity } from "./default-branch.mjs";
 import { runGateBypassCheck, hasUnackedGateBypass } from "./gate-bypass.mjs";
 import {
   synthesizeCompletion,
@@ -54,6 +59,12 @@ import {
   mergeProbeFromPulls,
   mergeProbeFromCompare,
 } from "./evidence.mjs";
+import {
+  spawnFixTicketsFromFindings,
+  rearmVerification,
+  finderKind,
+  FIX_KINDS as FIX_TICKET_KINDS,
+} from "./fix-tickets.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -96,6 +107,10 @@ function parkNoteFingerprint(note) {
 // coerces anything not exactly off|shadow|enforce back to shadow, so a typo in
 // the env var can only ever DOWNGRADE to observe-only, never grant a rogue mode.
 const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
+// TEAM-3992 D4.3 — per-sweep OTEL span-confirmation query budget for the stall
+// soft-timeout path. Bounds Logs Insights fan-out per sweep (default 5); the
+// OTEL_ACTIVITY_CONFIRM flag itself (default off) is read inside otel-activity.mjs.
+const OTEL_QUERY_BUDGET_PER_SWEEP = Number(process.env.OTEL_QUERY_BUDGET_PER_SWEEP) || 5;
 // Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b; tri-state as of
 // TEAM-3747 D1). off = the cascade only re-Readies {blocked, todo} dependents
 // (commit-4a behavior — the PRE-EPIC production path); shadow = evaluate the
@@ -120,6 +135,17 @@ const CASCADE_EXTENDED_STATES_MODE = resolveCascadeMode(process.env.CASCADE_EXTE
 // DDB reads/writes. shadow/enforce only when the operator explicitly sets the
 // var (deploy.sh forwards it only when set).
 const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
+
+// TEAM-3992 D4.2 — coding-runtime health gate. The fleet's coding agents delegate
+// claude_code/codex/kiro to the single coding-agent runtime; when it is wedged,
+// dispatching a coding ticket burns a full invoke to die mid-turn. CODING_AGENT_RUNTIME_ARN
+// is the ONLY thing that arms the gate — unset (the pre-D4.2 posture) fails open,
+// so nothing changes until an operator wires the runtime. The probe/confirm/backoff
+// knobs have code defaults (60s healthy cache, 2 consecutive fails to declare, 5/15/30m
+// backoff) resolved inside runtime-health.mjs; only forward explicit overrides.
+const CODING_AGENT_RUNTIME_ARN = process.env.CODING_AGENT_RUNTIME_ARN || "";
+// Roster tools that make an agent depend on the coding runtime (poll-probe gate).
+const CODING_RUNTIME_TOOLS = new Set(["claude_code", "codex", "kiro"]);
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -149,6 +175,16 @@ function resolveCascadeMode(raw) {
 const COMPLETION_EVIDENCE_REQUIRED = !/^(off|false|0)$/i.test(
   (process.env.COMPLETION_EVIDENCE_REQUIRED || "").trim()
 );
+// TEAM-3992 Q4 — SHA-pinned fix-verification gate mode. enforce (default): a done
+// fix ticket that was not re-verified at its FINAL commit SHA blocks completion.
+// shadow: emit the completion_blocked event but do NOT block. off: skip entirely.
+// Fail-closed like COMPLETION_EVIDENCE_REQUIRED — any unrecognized value enforces.
+const FIX_VERIFICATION_REQUIRED = (() => {
+  const v = (process.env.FIX_VERIFICATION_REQUIRED || "").trim().toLowerCase();
+  if (v === "off") return "off";
+  if (v === "shadow") return "shadow";
+  return "enforce";
+})();
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
@@ -217,6 +253,10 @@ async function loadAgentRoster() {
       // software-delivery and bug-fix). workflowDefIds is the multi-def list;
       // fall back to the single workflowDefId shorthand.
       workflowDefIds: a.workflowDefIds?.length ? a.workflowDefIds : [a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID],
+      // TEAM-3992 D4.2 — carried so the runtime-health gate can tell which agents
+      // actually shell a coding CLI (claude_code/codex/kiro) and therefore depend
+      // on the coding-agent runtime. Everything else bypasses the probe entirely.
+      tools: Array.isArray(a.tools) ? a.tools : [],
     }));
     console.log(`[orchestrator] Loaded ${_agentRoster.length} agents from S3 config`);
   } catch (err) {
@@ -282,6 +322,11 @@ export async function loadWorkflowDefs() {
         completionRequiresAgentPhases: w.completionRequiresAgentPhases || [],
         reviewGates: w.reviewGates || [],
         phaseOrder: order,
+        // TEAM-3992 — carry the DAG template through so the fix-verification gate
+        // (ticketDag.fixRearm) and fix-ticket spawn can read it. Dropping it here
+        // silently made the SHA-pinned gate inert.
+        ticketDag: w.ticketDag || null,
+        phases: w.phases || [],
       };
     }
     console.log(`[orchestrator] Loaded ${Object.keys(_workflowDefs).length} workflow definitions from S3`);
@@ -295,6 +340,40 @@ export async function loadWorkflowDefs() {
 function getWorkflowDef(id) {
   const defs = _workflowDefs || { [DEFAULT_WORKFLOW_DEF_ID]: FALLBACK_WORKFLOW_DEF };
   return defs[id] || defs[DEFAULT_WORKFLOW_DEF_ID] || FALLBACK_WORKFLOW_DEF;
+}
+
+/**
+ * TEAM-3992 D3.4 — one-shot realized-graph audit (design Q2). At the first
+ * development-phase dispatch, validate the run's realized child-ticket graph
+ * (assignees + blocked_by edges) against the def's declared `ticketDag` using
+ * the pure validator in dag.mjs, and record the outcome exactly once via
+ * store.setDagAudit (whose `attribute_not_exists(dagAudit)` condition is the
+ * authoritative idempotency guard — R2). A non-empty violation set surfaces a
+ * NON-FATAL `workflow.dag_violation` event, emitted only on the write that
+ * actually recorded the audit so it fires at most once per run. This is
+ * advisory only: it NEVER blocks dispatch. No-op when the def declares no
+ * ticketDag, and short-circuits in-memory once this container has audited.
+ */
+async function auditRealizedGraphOnce(workflow, wfDef) {
+  try {
+    if (!wfDef?.ticketDag) return; // def declares no DAG → nothing to audit
+    if (workflow.dagAudit) return; // already audited (in-memory short-circuit)
+    const children = await getChildTickets(workflow.epicId);
+    const roster = await loadAgentRoster();
+    const violations = validateRealizedGraph(children, wfDef.ticketDag, roster) || [];
+    const audit = { at: new Date().toISOString(), violationCount: violations.length, violations };
+    const recorded = await store.setDagAudit(workflow.id, audit);
+    workflow.dagAudit = { at: audit.at, violationCount: audit.violationCount };
+    if (recorded && violations.length > 0) {
+      await publishEvent(workflow.epicId, "workflow.dag_violation", {
+        workflowId: workflow.id,
+        defId: workflow.workflowDefId,
+        violations: violations.slice(0, 20),
+      });
+    }
+  } catch (err) {
+    console.warn(`[orchestrator] realized-graph audit failed (non-fatal): ${err.message}`);
+  }
 }
 
 // ─── Dead-session detector (TEAM-3618 D1.2) ──────────────────────────────────
@@ -327,7 +406,7 @@ function getDetector() {
     workflowsTable: WORKFLOWS_TABLE,
     eventsTable: EVENTS_TABLE,
     store,
-    lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
+    lease: { isLeaseLive, lastAgentActivity, stealClaim, leaseVerdict, LEASE_TTL_MS },
     getTicket,
     getAgentDef,
     publishEvent,
@@ -335,6 +414,14 @@ function getDetector() {
     blockTicket: blockTicketForFailedInvoke,
     // TEAM-3991 D1.2 — salvage a dead session that already delivered.
     synthesizeCompletion: synthesizeCompletionFor,
+    // TEAM-3992 D4.3 — the absolute stall soft-timeout path (dark until
+    // OTEL_ACTIVITY_CONFIRM=on for the OTEL confirm; the hard ceiling in
+    // leaseVerdict fires regardless once silence passes 2× the soft-timeout).
+    cascade: getCascade(),
+    otel: createOtelActivity({}),
+    resolveStallSoftTimeout: resolveStallSoftTimeoutMs,
+    loadWorkflowDef: getWorkflowDef,
+    otelBudgetPerSweep: OTEL_QUERY_BUDGET_PER_SWEEP,
   });
   return _detector;
 }
@@ -398,8 +485,148 @@ function getReconcileSweep() {
       return gateBypassCheck(workflow, ticket, children);
     },
     retryEpicRollup: retryPendingEpicRollups,
+    // TEAM-3992 D4.2 — hold coding tickets while a coding-runtime outage object
+    // exists (one S3 head per sweep); the runtime-health recovery sweep owns
+    // their resume. Both no-ops when no runtime is configured.
+    runtimeOutageActive: async () => {
+      if (!CODING_AGENT_RUNTIME_ARN || !ARTIFACT_BUCKET) return false;
+      try {
+        await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: runtimeOutageKey(CODING_AGENT_RUNTIME_ARN) }));
+        return true;
+      } catch (err) {
+        if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) return false;
+        throw err;
+      }
+    },
+    isCodingTicket: (sibling) => agentUsesCodingRuntime(sibling?.assignee),
   });
   return _reconcileSweep;
+}
+
+// ─── Coding-runtime health gate (TEAM-3992 D4.2) ─────────────────────────────
+
+/** True when an agent shells a coding CLI and thus depends on the coding runtime. */
+function agentUsesCodingRuntime(assignee) {
+  const def = getAgentDef(assignee);
+  const tools = def?.tools || [];
+  return tools.some((t) => CODING_RUNTIME_TOOLS.has(t));
+}
+
+/**
+ * Park a coding ticket blocked:runtime — the coding runtime is unreachable, so
+ * the invoke would only die mid-turn. Provider-aware, best-effort (never throws).
+ * DynamoDB mode stamps blockReason="runtime" so the board can label it "Blocked:
+ * runtime outage"; Jira mode transitions to Blocked and leaves a [blocked:runtime]
+ * comment. This is a tickets-table write (the workflows-table write guard is not
+ * in play).
+ */
+async function blockTicketRuntime(ticketId) {
+  if (!ticketId) return;
+  try {
+    if (TICKET_PROVIDER === "jira") {
+      const moved = (await jiraTransition(ticketId, "Blocked")) || (await jiraTransition(ticketId, "To Do"));
+      if (!moved) console.warn(`[orchestrator] Could not park ${ticketId} on runtime outage`);
+      await jiraFetch(`/rest/api/3/issue/${ticketId}/comment`, "POST", {
+        body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "AgentCore Hub [blocked:runtime]: the coding-agent runtime is unreachable. This ticket will auto-resume when the runtime recovers." }] }] },
+      });
+    } else {
+      await ddb.send(new UpdateCommand({
+        TableName: TICKETS_TABLE,
+        Key: { ticketId },
+        UpdateExpression: "SET #s = :s, #br = :br, #u = :u",
+        ExpressionAttributeNames: { "#s": "status", "#br": "blockReason", "#u": "updatedAt" },
+        ExpressionAttributeValues: { ":s": "blocked", ":br": "runtime", ":u": new Date().toISOString() },
+      }));
+    }
+  } catch (err) {
+    console.warn(`[orchestrator] blockTicketRuntime(${ticketId}) failed: ${err.message}`);
+  }
+}
+
+// One shared runtime-health gate per warm container (same shape as the cascade /
+// detector singletons). The S3 seam is adapted to the ETag/IfNoneMatch/IfMatch
+// contract runtime-health.mjs expects; the InvokeAgentRuntime call is lazily
+// imported so warm containers that never probe don't construct the client.
+let _runtimeHealth = null;
+function getRuntimeHealth() {
+  if (_runtimeHealth) return _runtimeHealth;
+  _runtimeHealth = createRuntimeHealth({
+    env: {
+      CODING_AGENT_RUNTIME_ARN,
+      TICKET_PROVIDER,
+      RUNTIME_PROBE_CACHE_MS: process.env.RUNTIME_PROBE_CACHE_MS,
+      RUNTIME_PROBE_CONFIRM: process.env.RUNTIME_PROBE_CONFIRM,
+      RUNTIME_OUTAGE_BACKOFF_MIN: process.env.RUNTIME_OUTAGE_BACKOFF_MIN,
+    },
+    now: () => Date.now(),
+    publishEvent,
+    invokeRuntime: invokeCodingRuntimeProbe,
+    s3: {
+      getObject: async (key) => {
+        try {
+          const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+          return { body: await res.Body.transformToString(), etag: res.ETag };
+        } catch (err) {
+          if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) return null;
+          throw err;
+        }
+      },
+      putObject: async (key, body, opts = {}) => {
+        const res = await s3.send(new PutObjectCommand({
+          Bucket: ARTIFACT_BUCKET,
+          Key: key,
+          Body: body,
+          ContentType: "application/json",
+          ...(opts.ifNoneMatch ? { IfNoneMatch: opts.ifNoneMatch } : {}),
+          ...(opts.ifMatch ? { IfMatch: opts.ifMatch } : {}),
+        }));
+        return { etag: res.ETag };
+      },
+      deleteObject: async (key) => {
+        await s3.send(new DeleteObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+      },
+    },
+    blockTicketRuntime,
+    appendNotificationOnce: (workflowId, notification) => store.appendNotificationOnce(workflowId, notification),
+    cascade: getCascade(),
+    loadWorkflow: (workflowId) => store.getWorkflow(workflowId),
+    loadTicket: async (workflow, ticketId) => {
+      const children = await getChildTickets(workflow.epicId).catch(() => []);
+      return children.find((t) => t.ticketId === ticketId) || (await getTicket(ticketId));
+    },
+    log: (msg) => console.log(msg),
+  });
+  return _runtimeHealth;
+}
+
+/**
+ * Concrete InvokeAgentRuntime probe — the ONLY place a bedrock-agentcore client is
+ * constructed for the health gate. Mirrors the fleet's `_coding_invoke` shape
+ * (deploy/runtime-agent/main.py): agentRuntimeArn + runtimeSessionId + a JSON
+ * payload; the poll action is read-only on the runtime side. Returns
+ * { statusCode, json }. Connect/read timeouts keep a wedged runtime from hanging
+ * the 45s probe budget. Lazily imported so this is free on warm paths that never probe.
+ */
+async function invokeCodingRuntimeProbe({ arn, sessionId, payload }) {
+  const { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } = await import("@aws-sdk/client-bedrock-agentcore");
+  const { NodeHttpHandler } = await import("@smithy/node-http-handler");
+  const client = new BedrockAgentCoreClient({
+    region: REGION,
+    requestHandler: new NodeHttpHandler({ connectionTimeout: 5000, requestTimeout: 20000 }),
+  });
+  const resp = await client.send(new InvokeAgentRuntimeCommand({
+    agentRuntimeArn: arn,
+    runtimeSessionId: sessionId,
+    payload: new TextEncoder().encode(JSON.stringify(payload)),
+    accept: "application/json",
+  }));
+  const statusCode = resp?.statusCode ?? resp?.$metadata?.httpStatusCode ?? 0;
+  let json = null;
+  try {
+    const raw = resp?.response ? await resp.response.transformToString() : "";
+    json = raw ? JSON.parse(raw) : null;
+  } catch { json = null; }
+  return { statusCode, json };
 }
 
 // ─── Review-gate round cap (TEAM-3619 D2c) ───────────────────────────────────
@@ -496,6 +723,16 @@ export const handler = async (event) => {
   if (event?.source === "orchestrator.sweep" && event?.action === "reconcile_sweep") {
     console.log(`[orchestrator] reconcile sweep (mode=${RECONCILE_SWEEP_MODE})`);
     return getReconcileSweep().runSweep(RECONCILE_SWEEP_MODE);
+  }
+
+  // Scheduled coding-runtime recovery sweep (TEAM-3992 D4.2). Same sentinel-event
+  // pattern. Re-probes the coding runtime with backoff while an outage object
+  // exists and, on recovery, auto-resumes every parked ticket through the cascade.
+  // No-op (single S3 head) when no runtime is configured or no outage is open.
+  if (event?.source === "orchestrator.sweep" && event?.action === "runtime_health_sweep") {
+    if (!CODING_AGENT_RUNTIME_ARN) return { skipped: "no_runtime" };
+    console.log(`[orchestrator] runtime-health sweep`);
+    return getRuntimeHealth().runtimeHealthSweep();
   }
 
   // SQS FIFO command queue (R1 — docs/race-condition-study.md). One message
@@ -764,6 +1001,10 @@ export async function handleTicketDoneUnified(ticketId) {
     ...(bypass?.bypasses > 0 ? { gateBypass: true } : {}),
   });
 
+  // TEAM-3992 D3.1/D3.2 — spawn fix tickets from any findings this verifier
+  // reported, and re-arm SHA-pinned verification if this ticket itself is a fix.
+  await runFixTicketMachinery(workflow, ticket);
+
   // Always check workflow completion — the last ticket to close triggers this
   if (await isWorkflowComplete(parentId, workflow, assignee)) {
     await completeWorkflow(workflow);
@@ -826,6 +1067,7 @@ async function gateBypassCheck(workflow, ticket, children) {
         publishEvent,
         addTicketComment,
         gatePhaseOf: makeGatePhaseResolver(kids),
+        baseBranch: resolveDefaultBranch(workflow),
         now: () => Date.now(),
         log: console,
       },
@@ -1016,9 +1258,9 @@ async function gateBypassBlocksCompletion(workflow) {
 async function ensureBranchProtectionCheck(workflow) {
   try {
     if (!workflow || workflow.branchProtectionCheck) return null;
-    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+    const { owner, repo } = resolveRepoIdentity(workflow);
     if (!owner || !repo) return null;
-    const branch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    const branch = resolveDefaultBranch(workflow);
     const result = await checkBranchProtection({ owner, repo, branch });
     const checkedAt = new Date().toISOString();
     workflow.branchProtectionCheck = { ...result, branch, checkedAt };
@@ -1064,15 +1306,31 @@ async function preDispatchGuards(workflow, ticket, { source = "dispatch" } = {})
   const ticketId = ticket?.ticketId || ticket?.id;
   if (!workflow?.id || !ticketId) return { ok: true };
   if (isHumanAssignee(ticket?.assignee)) return { ok: true };
+
+  // TEAM-3992 D4.2 — coding-runtime health gate. ONLY agents that shell a coding
+  // CLI depend on the coding runtime; everything else skips the probe. Runs
+  // BEFORE the repo/PAT early-return below because a coding runtime can be down
+  // regardless of repo config, and gates on its own S3 outage object + cheap
+  // poll-probe. Never throws (its own effects are best-effort); a refusal here
+  // parks the ticket blocked:runtime instead of dispatching it into a dead microVM.
+  if (CODING_AGENT_RUNTIME_ARN && agentUsesCodingRuntime(ticket?.assignee)) {
+    try {
+      const health = await getRuntimeHealth().runtimeHealthGuard(workflow, ticket);
+      if (!health.ok) return { ok: false, refused: health.reason, detail: health.detail || "coding runtime outage" };
+    } catch (err) {
+      console.warn(`[orchestrator] ${ticketId}: runtime-health gate skipped (non-fatal): ${err?.message || err}`);
+    }
+  }
+
   if (!workflow.repoConfig?.repos?.length || !process.env.GITHUB_PAT) return { ok: true };
 
   try {
-    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+    const { owner, repo } = resolveRepoIdentity(workflow);
     if (!owner || !repo) return { ok: true };
     const pr = await findTicketPullRequest((path) => githubApi(path), {
       owner,
       repo,
-      base: workflow.repoConfig.repos[0]?.defaultBranch || "main",
+      base: resolveDefaultBranch(workflow),
       ticketId,
       featureBranch: workflow.featureBranch || "",
     });
@@ -1162,6 +1420,7 @@ async function synthesizeCompletionFor(workflow, ticket) {
     workflow,
     ticket,
     agentSlug: agentBranchSlug(ticket?.assignee),
+    baseBranch: resolveDefaultBranch(workflow),
     deps: {
       githubFetch: (path) => githubApi(path),
       s3Get: async (key) => {
@@ -1413,6 +1672,24 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     }
     if (record.block_reason && !entry?.blockReason) {
       fields.blockReason = String(record.block_reason).slice(0, 500);
+    }
+    // TEAM-3992 Q4 — SHA-pinned verification record onto the VERIFIER's task, so
+    // fixVerificationGaps can prove a fix was re-verified at its final SHA without
+    // an S3 read. workflow-output already validated the shape + wrote the durable
+    // record; we mirror it flat (one scoped SET) as agentTasks.<verifier>.verification.
+    const v = record.verification;
+    if (v && typeof v === "object" && typeof v.target_ticket_id === "string" && typeof v.head_sha === "string") {
+      const headSha = v.head_sha.trim().toLowerCase();
+      const kind = String(v.kind || "").trim().toLowerCase();
+      fields.verification = {
+        targetTicketId: v.target_ticket_id,
+        headSha,
+        kind,
+        verdict: String(v.verdict || "").trim().toLowerCase(),
+        recordKey: `workflows/${workflow.id}/shared/verifications/${v.target_ticket_id}/${headSha}.${kind}.json`,
+        at: record.completed_at || new Date().toISOString(),
+      };
+      if (v.build_id != null) fields.verification.buildId = String(v.build_id);
     }
     if (Object.keys(fields).length === 0) return;
     await store.mergeTaskMetadata(workflow.id, ticketId, fields);
@@ -2507,6 +2784,9 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     }
 
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
+
+    // TEAM-3992 D3.4 — one-shot realized-graph audit on development-phase entry.
+    if (agentDef.phase === "development") await auditRealizedGraphOnce(workflow, wfDef);
   }
 
   // Build context and invoke — SAME buildAgentContext for both paths
@@ -2739,6 +3019,17 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
         updatedAt: t?.updatedAt || new Date().toISOString(),
       },
     });
+    // TEAM-3992 D3.1 — a persona-created fix ticket (a verifier that filed its own
+    // fix, not the orchestrator) still carries spawnedBy; surface it on the same
+    // event stream as orchestrator-spawned fixes so the journal attributes both.
+    const sb = t?.spawnedBy;
+    if (sb && FIX_TICKET_KINDS.has(sb.kind) && !sb.rearmOf && sb.by !== "orchestrator") {
+      const originKey = ["gateTicketId", "qaTicketId", "codexTicketId"].find((k) => sb[k]);
+      await publishEvent(parentId, "orchestrator.fix_spawned", {
+        workflowId: workflow.id, ticketId, originTicketId: originKey ? sb[originKey] : null,
+        kind: sb.kind, assignee, findingId: sb.findingId || null, by: "agent",
+      });
+    }
   } catch (err) {
     console.warn(`[orchestrator] ticket.created publish failed for ${ticketId}:`, err.message);
   }
@@ -2801,6 +3092,15 @@ export async function handleTicketDone(ticketId, image) {
     ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id,
     ...(bypass?.bypasses > 0 ? { gateBypass: true } : {}),
   });
+
+  // TEAM-3992 D3.1/D3.2 — fix-ticket spawn + verification re-arm, symmetric with
+  // the webhook twin. Load the normalized ticket so spawnedBy/title are available.
+  try {
+    const ticket = await getTicket(ticketId);
+    if (ticket) await runFixTicketMachinery(workflow, ticket);
+  } catch (err) {
+    console.warn(`[orchestrator] fix-ticket machinery skipped for ${ticketId}: ${err?.message || err}`);
+  }
 
   // Check if workflow is complete (all tickets done)
   if (unblocked.length === 0) {
@@ -2893,6 +3193,9 @@ async function handleTicketReady(ticketId, image) {
     }
 
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
+
+    // TEAM-3992 D3.4 — one-shot realized-graph audit on development-phase entry.
+    if (agentDef.phase === "development") await auditRealizedGraphOnce(workflow, wfDef);
   }
 
   // Build context and invoke agent
@@ -3011,6 +3314,41 @@ async function notifyCompletionBlockedOnce(workflow, offenders) {
     return true;
   } catch (err) {
     console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
+}
+
+/**
+ * TEAM-3992 Q4 — one manager_escalation per run stranded on the SHA-pinned fix
+ * gate: "a fix ticket is Done but was never re-verified at its final commit".
+ * Idempotent on notification id (twin of notifyCompletionBlockedOnce); re-driving
+ * any ticket re-runs the gate, and once the re-verification records land the run
+ * completes and the escalation is history.
+ */
+async function notifyFixUnverifiedOnce(workflow, offenders) {
+  const id = `notif_fix_unverified_${workflow.id}`;
+  const list = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
+  if (list.some((n) => n.id === id && !n.acknowledged)) return false;
+  const detail = offenders
+    .map((o) => `${o.ticketId}@${o.commitSha || "no-sha"} needs ${o.missingKinds.join("/")}`)
+    .join("; ");
+  try {
+    await publishEvent(workflow.epicId, "workflow.completion_blocked", {
+      workflowId: workflow.id, reason: "fix_unverified", offenders,
+    });
+    await store.appendNotification(workflow.id, {
+      id,
+      type: "manager_escalation",
+      title: "Run cannot complete: fix not re-verified at its final commit",
+      details: `A fix ticket closed Done but its final commit was not re-verified by every required gate: ${detail}. The re-verify (re-arm) tickets must report a passing verification pinned to that SHA. Re-Done any ticket to re-check once the re-verification lands; or set FIX_VERIFICATION_REQUIRED=off to opt out.`,
+      reviewer: "completion-gate",
+      timestamp: new Date().toISOString(),
+      acknowledged: false,
+    });
+    console.log(`[orchestrator] ${workflow.id}: completion blocked on fix verification — manager_escalation appended (${detail})`);
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] ${workflow.id}: fix-unverified notification failed (non-fatal): ${err?.message || err}`);
     return false;
   }
 }
@@ -3303,6 +3641,46 @@ export async function completeWorkflow(workflow) {
     console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
   }
 
+  // TEAM-3992 Q4/D3.2 — SHA-pinned fix-verification gate. Runs AFTER the evidence
+  // gate (so the run has real deliverables) and BEFORE the ship verdict. Every done
+  // fix ticket must carry a passing verification record pinned to its FINAL commit
+  // SHA for each role its kind re-arms — proof the fix was re-reviewed/re-CI'd/re-QA'd
+  // at the code that actually landed, not an earlier iteration. Inert when the def
+  // declares no ticketDag.fixRearm. Fail-closed (enforce default); shadow only
+  // events; off skips. The check itself never throws a completion — a failure to
+  // read only tightens when it can prove a gap.
+  if (FIX_VERIFICATION_REQUIRED !== "off") {
+    try {
+      const fixRearm = getWorkflowDef(workflow?.workflowDefId)?.ticketDag?.fixRearm;
+      if (fixRearm && typeof fixRearm === "object") {
+        const children = await getChildTickets(workflow.epicId);
+        const freshWf = await store.getWorkflow(workflow.id);
+        const gaps = fixVerificationGaps(
+          children, freshWf?.agentTasks || workflow.agentTasks || {}, fixRearm
+        );
+        if (gaps.length > 0) {
+          if (FIX_VERIFICATION_REQUIRED === "enforce") {
+            console.error(
+              `[orchestrator] CompletionRejectedFixUnverified ${workflow.id}: ` +
+              gaps.map((g) => `${g.ticketId}(${g.missingKinds.join("/")})`).join(", ")
+            );
+            await notifyFixUnverifiedOnce(freshWf || workflow, gaps);
+            return;
+          }
+          console.warn(
+            `[orchestrator] ${workflow.id} would be blocked for fix_unverified (shadow): ` +
+            gaps.map((g) => `${g.ticketId}(${g.missingKinds.join("/")})`).join(", ")
+          );
+          await publishEvent(workflow.epicId, "workflow.completion_blocked", {
+            workflowId: workflow.id, reason: "fix_unverified", offenders: gaps, shadow: true,
+          });
+        }
+      }
+    } catch (err) {
+      console.warn(`[orchestrator] fix-verification check skipped for ${workflow.id}: ${err?.message || err}`);
+    }
+  }
+
   // ── TEAM-3760: TWO ship gates run here, in this order, both at full strength.
   //   1. TEAM-3747 D2 ship-verdict gate (below): INTERNAL evidence, fail-CLOSED.
   //      A done ship ticket with no merge/deploy verdict closes the run on an
@@ -3514,8 +3892,8 @@ export async function completeWorkflow(workflow) {
   let prUrl = "";
   if (!defHasShip && workflow.featureBranch && workflow.repoConfig) {
     try {
-      const { owner, repo } = parseRepoUrl(workflow.repoConfig);
-      const baseBranch = workflow.repoConfig.repos?.[0]?.defaultBranch || "main";
+      const { owner, repo } = resolveRepoIdentity(workflow);
+      const baseBranch = resolveDefaultBranch(workflow);
       const prResult = await callGitHub("create_pr", {
         owner,
         repo,
@@ -3818,6 +4196,18 @@ async function buildAgentContext(ticket, workflow) {
   context += `epic_id: ${workflow.epicId}\n`;
   context += `ticket_id: ${ticket.ticketId}\n\n`;
 
+  // TEAM-3992 D3.2 — a re-arm ticket re-verifies a fix at a PINNED commit SHA.
+  // The completion gate matches the verification record to that SHA, so the agent
+  // must report it. rearmOf/headSha are stamped on the ticket's spawnedBy.
+  const rearm = ticket.spawnedBy?.rearmOf ? ticket.spawnedBy : null;
+  if (rearm) {
+    context += `## Re-verification (REQUIRED report)\n`;
+    context += `You are re-verifying fix ${rearm.rearmOf} at HEAD ${rearm.headSha}.\n`;
+    context += `In report_completion you MUST include a verification object pinned to that commit:\n`;
+    context += `  verification: { target_ticket_id: "${rearm.rearmOf}", head_sha: "${rearm.headSha}", kind: "<review|qa|ci>", verdict: "<pass|fail|blocked>" }\n`;
+    context += `Use the kind for your role (code review = review, QA = qa, CI = ci). For CI, head_sha is the resolvedSourceVersion from Pipeline___get_build_status. Optionally add findings[].\n\n`;
+  }
+
   // Shipped laptop session: the requester planned this work in a live coding
   // session and shipped it here. Visible to EVERY agent — the transcript is the
   // authoritative context, and the branch already carries in-flight work.
@@ -3927,10 +4317,11 @@ async function buildAgentContext(ticket, workflow) {
     // persona on the run, ahead of the repo identity, so nobody burns coding
     // turns on a 404 clone and reports it as a runtime outage (2026-09-03).
     const repoCheck = await ensureRepoCheck(workflow, { store });
+    if (repoCheck) workflow.repoCheck = repoCheck; // so the resolvers below see it
     const warning = formatRepoCheckWarning(repoCheck);
     if (warning) context += warning;
-    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
-    const defaultBranch = workflow.repoConfig.repos[0]?.defaultBranch || "main";
+    const { owner, repo } = resolveRepoIdentity(workflow);
+    const defaultBranch = resolveDefaultBranch(workflow);
     context += `## Repository\nowner: ${owner}\nrepo: ${repo}\ndefault_branch: ${defaultBranch}\n\n`;
   }
 
@@ -3962,7 +4353,7 @@ async function buildAgentContext(ticket, workflow) {
 
   // Dev agents: branch identity (scope, not HOW)
   if (agentDef?.phase === "development") {
-    const baseBranch = workflow.featureBranch || workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    const baseBranch = workflow.featureBranch || resolveDefaultBranch(workflow);
     context += `## Branch\n`;
     context += `feature_branch: feature/${ticket.ticketId}-${agentBranchSlug(agentDef.agentId)}\n`;
     context += `base_branch: ${baseBranch}\n`;
@@ -4253,6 +4644,93 @@ async function getChildTickets(parentId) {
   return result.Items || [];
 }
 
+// ─── Fix-ticket machinery (TEAM-3992 D3.1/D3.2) ──────────────────────────────
+
+/**
+ * Invoke a tickets-Lambda tool op and return a flat result object. Injects a
+ * default project_key for create_ticket (nextTicketId needs it). Throws on a
+ * structured { error } so callers log-and-skip rather than silently no-op.
+ */
+async function invokeTicketsOp(op, params) {
+  const parameters = { ...params };
+  if (op === "create_ticket" && !parameters.project_key) {
+    parameters.project_key =
+      (parameters.parent_key && String(parameters.parent_key).split("-")[0]) ||
+      process.env.PROJECT_KEY ||
+      "TEAM";
+  }
+  const res = await lambda.send(new InvokeCommand({
+    FunctionName: TICKET_TOOLS_LAMBDA,
+    Payload: JSON.stringify({ tool_name: `Tickets___${op}`, parameters }),
+  }));
+  let payload = JSON.parse(new TextDecoder().decode(res.Payload));
+  // Some ops return the MCP { content:[{text}] } envelope — unwrap a JSON body.
+  if (payload && payload.content && Array.isArray(payload.content) && payload.content[0]?.text && !payload.key) {
+    try { payload = JSON.parse(payload.content[0].text); } catch { /* keep envelope */ }
+  }
+  if (payload?.error) throw new Error(payload.error);
+  return payload;
+}
+
+/** The dev agent a fix ticket should be assigned to (development-phase agent). */
+function resolveDevAssignee(workflow, children) {
+  const devChild = (children || []).find((t) => getAgentDef(t?.assignee)?.phase === "development");
+  if (devChild) return devChild.assignee;
+  const def = getWorkflowDef(workflow.workflowDefId);
+  const roster = (_agentRoster || FALLBACK_ROSTER).filter(
+    (a) =>
+      a.phase === "development" &&
+      (a.workflowDefIds || [a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID]).includes(def.id)
+  );
+  return roster[0]?.agentId || "agentcore_hub_backend_dev";
+}
+
+/**
+ * On a ticket's done: (1) if it carries a verifier's `findings`, spawn one fix
+ * ticket per component; (2) if it IS a fix ticket, re-arm SHA-pinned verification.
+ * Best-effort — reads the completion record for findings + the final commit sha,
+ * so it never depends on harvest ordering. Wired into BOTH done handlers.
+ */
+async function runFixTicketMachinery(workflow, ticket) {
+  if (!workflow || !ticket?.ticketId || !ARTIFACT_BUCKET) return;
+  // Only a VERIFIER's done ticket can carry findings (→ spawn), and only a FIX
+  // ticket re-arms verification. An ordinary dev/ship done ticket does neither, so
+  // skip the completion-record read entirely for it — this preserves the harvest's
+  // "no S3 read when evidence is already present" fast path (evidence-harvest test).
+  const sb = ticket.spawnedBy;
+  const isFinder = finderKind(ticket.assignee) != null;
+  const isFix = !!(sb && FIX_TICKET_KINDS.has(sb.kind) && !sb.rearmOf);
+  if (!isFinder && !isFix) return;
+
+  let record = null;
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET, Key: `completions/${ticket.ticketId}.json`,
+    }));
+    record = JSON.parse(await res.Body.transformToString());
+  } catch { /* no completion record — nothing to spawn from */ }
+
+  const deps = {
+    invokeTickets: invokeTicketsOp,
+    publishEvent,
+    getChildTickets,
+    getWorkflowDef,
+    getAgentDef,
+    resolveDevAssignee,
+    commitShaOf: (tid) =>
+      (record && record.commit_sha) || workflow.agentTasks?.[tid]?.commitSha || "",
+  };
+
+  if (record && Array.isArray(record.findings) && record.findings.length > 0) {
+    try { await spawnFixTicketsFromFindings(workflow, ticket, record, deps); }
+    catch (err) { console.warn(`[orchestrator] fix spawn failed for ${ticket.ticketId}: ${err?.message || err}`); }
+  }
+  if (isFix) {
+    try { await rearmVerification(workflow, ticket, deps); }
+    catch (err) { console.warn(`[orchestrator] re-arm failed for ${ticket.ticketId}: ${err?.message || err}`); }
+  }
+}
+
 // ─── Jira Ticket Provider ─────────────────────────────────────────────────────
 
 async function jiraFetch(path, method = "GET", body = null) {
@@ -4387,16 +4865,64 @@ async function readManifest(workflowId) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
+/**
+ * TEAM-3992 D4.1 — the once-per-run repo resolution. Runs the URL pre-flight
+ * (which also persists repoCheck via the store), stamps the resolved check back
+ * on the in-memory workflow so resolveDefaultBranch/resolveRepoIdentity see it,
+ * emits workflow.repo_resolved ONCE, and returns the manifest.repo{} block
+ * ({fullName, defaultBranch, url, owner, repo, resolvedAt}) or null. Never throws.
+ */
+async function resolveRepoAtIntake(workflow) {
+  if (!workflow.repoConfig?.repos?.length) return null;
+  try {
+    const check = await ensureRepoCheck(workflow, { store });
+    if (!check) return null;
+    workflow.repoCheck = check;
+    const primaryUrl = workflow.repoConfig.repos[0]?.url;
+    const results = check.results || [];
+    const match = results.find((r) => r?.url === primaryUrl && r?.ok) || results.find((r) => r?.ok);
+    const { owner, repo } = resolveRepoIdentity(workflow);
+    const fullName = match?.fullName || (owner && repo ? `${owner}/${repo}` : undefined);
+    const defaultBranch = resolveDefaultBranch(workflow);
+    const repoResolved = {
+      ...(fullName ? { fullName } : {}),
+      defaultBranch,
+      url: primaryUrl,
+      owner,
+      repo,
+      resolvedAt: new Date().toISOString(),
+    };
+    await publishEvent(workflow.epicId, "workflow.repo_resolved", {
+      workflowId: workflow.id,
+      fullName,
+      defaultBranch,
+      renamed: Boolean(match?.renamed),
+      requested: primaryUrl,
+    });
+    return repoResolved;
+  } catch (err) {
+    console.warn(`[orchestrator] repo resolve at intake skipped for ${workflow?.id}: ${err.message}`);
+    return null;
+  }
+}
+
 async function initManifestIfNeeded(workflow) {
   if (!ARTIFACT_BUCKET) return;
   const existing = await readManifest(workflow.id);
   if (existing) return; // Already initialized
+
+  // TEAM-3992 D4.1 — resolve the repo ONCE, here at intake: ask GitHub for the
+  // canonical full_name + default_branch, persist it on the run (repoCheck) and
+  // freeze it into manifest.repo{} so every downstream phase reads one resolved
+  // truth instead of re-deriving owner/repo/branch from the raw URL.
+  const repoResolved = await resolveRepoAtIntake(workflow);
 
   const manifest = {
     workflowId: workflow.id,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     repoConfig: workflow.repoConfig,
+    ...(repoResolved ? { repo: repoResolved } : {}),
     phases: { intake: [], requirements: [], design: [], development: [], verification: [], ship: [] },
   };
 
@@ -4457,8 +4983,15 @@ function buildManifestContext(manifest, agentPhase, workflow, ticket) {
 
   let ctx = `## Workflow Manifest — Upstream Artifacts\n\n`;
 
-  // Canonical repo info from manifest (single source of truth)
-  if (manifest.repoConfig?.repos?.length > 0) {
+  // Canonical repo info from manifest (single source of truth). Prefer the
+  // resolved manifest.repo{} block (TEAM-3992 D4.1) — it carries the canonical
+  // full_name and the branch GitHub actually reported; fall back to parsing the
+  // configured URL for manifests written before D4.1.
+  if (manifest.repo?.owner && manifest.repo?.repo) {
+    ctx += `### Repository\n`;
+    ctx += `- owner: "${manifest.repo.owner}"\n- repo: "${manifest.repo.repo}"\n`;
+    ctx += `- default_branch: "${manifest.repo.defaultBranch || "main"}"\n\n`;
+  } else if (manifest.repoConfig?.repos?.length > 0) {
     const url = manifest.repoConfig.repos[0].url || "";
     const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
     if (match) {
@@ -4564,8 +5097,8 @@ async function featureBranchUnmerged(workflow) {
  */
 async function featureBranchMergeProbe(workflow) {
   try {
-    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
-    const base = workflow.repoConfig.repos?.[0]?.defaultBranch || "main";
+    const { owner, repo } = resolveRepoIdentity(workflow);
+    const base = resolveDefaultBranch(workflow);
     const head = workflow.featureBranch;
 
     const prs = await githubApi(
@@ -4618,7 +5151,10 @@ async function callGitHub(toolName, args) {
   if (process.env.GITHUB_PAT) {
     if (toolName === "create_branch") {
       const { owner, repo, branch_name, from_branch } = args;
-      const base = await githubApi(`/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(from_branch)}`);
+      // No explicit source branch → resolve the repo's actual default branch from
+      // GitHub rather than assuming "main" (TEAM-3992 D4.1).
+      const fromBranch = from_branch || (await githubApi(`/repos/${owner}/${repo}`))?.default_branch || "main";
+      const base = await githubApi(`/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(fromBranch)}`);
       try {
         return await githubApi(`/repos/${owner}/${repo}/git/refs`, "POST", {
           ref: `refs/heads/${branch_name}`,
@@ -4701,8 +5237,8 @@ async function ensureFeatureBranch(workflow) {
   }
   if (!workflow.repoConfig?.repos?.length) return null;
   try {
-    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
-    const baseBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    const { owner, repo } = resolveRepoIdentity(workflow);
+    const baseBranch = resolveDefaultBranch(workflow);
     const slug = (workflow.input?.title || workflow.id).toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40).replace(/-$/, "");
     const branchName = `feature/${workflow.epicId}-${slug}`;
     await callGitHub("create_branch", { owner, repo, branch_name: branchName, from_branch: baseBranch });
@@ -4762,11 +5298,9 @@ async function publishEvent(ticketId, detailType, detail) {
 
 // ─── Utilities ─────────────────────────────────────────────────────────────────
 
-function parseRepoUrl(repoConfig) {
-  const url = repoConfig?.repos?.[0]?.url || "";
-  const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
-  return match ? { owner: match[1], repo: match[2] } : { owner: "", repo: "" };
-}
+// parseRepoUrl / resolveDefaultBranch / resolveRepoIdentity live in the
+// side-effect-free default-branch.mjs (TEAM-3992 D4.1) so they can be unit-tested
+// without index.mjs's module-load AWS clients. Imported at the top of the file.
 
 /**
  * Resolve the target repo from a Jira ticket's labels. The repo rides on the

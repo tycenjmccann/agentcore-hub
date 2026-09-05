@@ -60,7 +60,15 @@ if [ -f package.json ]; then
     exit 1
   fi
 fi
-zip -qr function.zip index.mjs node_modules
+# TEAM-3992 D3.4: the ticket-plan DAG validator is authored ONCE in
+# lambda/orchestrator/dag.mjs (its parity twin is src/lib/workflow/dag.ts). This
+# Lambda ships as a single flat directory, so a `../orchestrator/dag.mjs` import
+# cannot resolve at runtime — copy the concrete module in as ./dag.mjs (the
+# committed dag.mjs here is a re-export shim used only by the repo/tests), ship
+# it, then restore the shim so the working tree is left clean.
+cp "$REPO_ROOT/lambda/orchestrator/dag.mjs" ./dag.mjs
+zip -qr function.zip index.mjs dag.mjs node_modules
+git -C "$REPO_ROOT" checkout -- lambda/workflow-output/dag.mjs 2>/dev/null || true
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"

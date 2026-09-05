@@ -45,6 +45,8 @@ import {
   parseCdEvidence,
   blockReasonWithGate,
   shipVerdictOf as classifyShipEntry,
+  // TEAM-3992 Q4/D3.2 — SHA-pinned fix-verification gate, same parity test.
+  fixVerificationGaps,
   type OpenGate,
 } from "@/lib/workflow/completion-evidence";
 import {
@@ -78,6 +80,17 @@ const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const COMPLETION_EVIDENCE_REQUIRED = !/^(off|false|0)$/i.test(
   (process.env.COMPLETION_EVIDENCE_REQUIRED || "").trim()
 );
+
+// TEAM-3992 Q4/D3.2 — SHA-pinned fix-verification gate mode, PARITY with the
+// orchestrator's FIX_VERIFICATION_REQUIRED. enforce (default): a done fix ticket
+// not re-verified at its FINAL commit SHA 409s (code fix_unverified). shadow: log
+// only. off: skip. Fail-closed — any unrecognized value enforces.
+const FIX_VERIFICATION_REQUIRED = (() => {
+  const v = (process.env.FIX_VERIFICATION_REQUIRED || "").trim().toLowerCase();
+  if (v === "off") return "off";
+  if (v === "shadow") return "shadow";
+  return "enforce";
+})();
 
 // agentId → agent phase, from the bundled roster (same doc the pipeline reads).
 // Used to route a child ticket to its agent phase when the ticket carries no
@@ -854,6 +867,35 @@ export async function POST(
       // Never let evidence resolution (def load) turn a legitimate completion into
       // a 500 — the gate only tightens when it can prove a phantom deliverable.
       console.warn(`[complete] evidence check skipped: ${(err as Error).message}`);
+    }
+
+    // 2b″. TEAM-3992 Q4/D3.2 — SHA-pinned fix-verification gate, PARITY with the
+    //      orchestrator's completeWorkflow. Every done fix ticket must carry a
+    //      passing verification pinned to its FINAL commit SHA for each role its
+    //      kind re-arms. Inert unless def.ticketDag.fixRearm is declared. enforce
+    //      → 409 fix_unverified; shadow → log only; off → skip. Same fail-open
+    //      discipline: a failure to evaluate never turns into a 500.
+    if (FIX_VERIFICATION_REQUIRED !== "off") {
+      try {
+        const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
+        const fixRearm = (def as { ticketDag?: { fixRearm?: Record<string, string[]> } })?.ticketDag
+          ?.fixRearm;
+        if (fixRearm && typeof fixRearm === "object") {
+          const agentTasks = (workflow.agentTasks as Record<string, AgentTaskLike>) || {};
+          const offenders = fixVerificationGaps(tickets, agentTasks, fixRearm);
+          if (offenders.length > 0) {
+            if (FIX_VERIFICATION_REQUIRED === "enforce") {
+              return NextResponse.json({ code: "fix_unverified", offenders }, { status: 409 });
+            }
+            console.warn(
+              `[complete] ${workflowId} would be blocked for fix_unverified (shadow): ` +
+                offenders.map((o) => `${o.ticketId}(${o.missingKinds.join("/")})`).join(", ")
+            );
+          }
+        }
+      } catch (err) {
+        console.warn(`[complete] fix-verification check skipped: ${(err as Error).message}`);
+      }
     }
 
     // 2b′. TEAM-3755 F4 — structural parity with completion.mjs

@@ -113,16 +113,19 @@ describe("stuck detection vs in-flight tool calls (TEAM-3858 / TEAM-3862)", () =
   it("tiered threshold: claude_code gets the long window", () => {
     expect(staleThresholdFor(true)).toBe(STALE_THRESHOLD_CLAUDE_CODE_MS);
     expect(staleThresholdFor(false)).toBe(STALE_THRESHOLD_DEFAULT_MS);
-    // A claude_code run dark for 10 min is healthy under its window…
+    // TEAM-3989 D4.3: the claude_code window is now capped at the orchestrator's
+    // 10-min stall soft-timeout (was 17 min / 1_020_000). A run dark for 9 min is
+    // still healthy under its (now 10-min) window…
     expect(
       computeIsStale({
-        now: T0 + 600_000,
+        now: T0 + 540_000,
         lastActivityAt: T0,
         hasRunningAgent: true,
         thresholdMs: staleThresholdFor(true),
       })
     ).toBe(false);
-    // …but past 17 min it is stuck.
+    // …but past its 10-min ceiling (D4.3: the stall soft-timeout, previously
+    // 17 min) it is stuck.
     expect(
       computeIsStale({
         now: T0 + STALE_THRESHOLD_CLAUDE_CODE_MS + 1,

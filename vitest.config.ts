@@ -159,12 +159,40 @@ export default defineConfig({
       // S3/Lambda/DDB clients mocked at the module seam, same shape as
       // agentcore-hub-pipeline-tools/index.test.mjs.
       "lambda/workflow-output/report-completion.test.mjs",
+      // submit_ticket_plan structural validation (TEAM-3992 D3.4) — the ticketDag
+      // gate on the real handler, with config/workflows.json + config/agents.json
+      // served from the mocked S3 seam. Imports the validator through the
+      // committed dag.mjs re-export shim → lambda/orchestrator/dag.mjs.
+      "lambda/workflow-output/submit-plan.test.mjs",
       // pipeline-enabled (TEAM-3738, same defect class as TEAM-3723) — the
       // orchestrator's PIPELINE_ENABLED predicate that gates the "## Pipeline
       // Mode" context block. Lives in its own side-effect-free pipeline-enabled.mjs
       // (TEAM-3744) so this test never imports index.mjs's module-load AWS
       // client construction; isPipelineEnabled is pure, no I/O.
       "lambda/orchestrator/pipeline-enabled.test.mjs",
+      // fix-rearm (TEAM-3992 D3.1/D3.2) — spawnFixTicketsFromFindings +
+      // rearmVerification from fix-tickets.mjs. Both are dependency-injected
+      // (tickets-Lambda invoke / event / child read / def lookups mocked at the
+      // seam), so the spawn dedupe + SHA-pinned re-arm logic runs with no AWS.
+      "lambda/orchestrator/fix-rearm.test.mjs",
+      // default-branch (TEAM-3992 D4.1) — the base-branch + repo-identity
+      // resolvers that replace every hardcoded `|| "main"` in index.mjs. Pure
+      // functions in a side-effect-free module (pipeline-enabled.mjs pattern), so
+      // the repoCheck→repoConfig→"main" chain runs with no AWS.
+      "lambda/orchestrator/default-branch.test.mjs",
+      // runtime-health (TEAM-3992 D4.2) — the coding-runtime health gate +
+      // auto-resume. Fully dependency-injected (fake InvokeAgentRuntime, in-memory
+      // S3 honoring ETag/IfNoneMatch/IfMatch, fake publishEvent + clock), so the
+      // probe/confirm/CAS-outage/backoff/recovery logic runs with no AWS.
+      "lambda/orchestrator/runtime-health.test.mjs",
+      // TEAM-3992 D4.3 — the OTEL span confirmation probe (sentinel contract +
+      // flag/budget cost guards) behind injected startQuery/getQueryResults.
+      "lambda/orchestrator/otel-activity.test.mjs",
+      // dag-audit (TEAM-3992 D3.4) — the one-shot realized-graph audit wired at
+      // the first development-phase dispatch (validateRealizedGraph → non-fatal
+      // workflow.dag_violation → store.setDagAudit). §3(a) shape: real index.mjs
+      // + real dag.mjs, I/O seams mocked, def served from S3 workflows.json.
+      "lambda/orchestrator/dag-audit.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

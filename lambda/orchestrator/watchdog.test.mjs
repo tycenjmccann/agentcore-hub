@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { resolveWatchdog, setWatchdogSource, LEGACY_WATCHDOG } from "./watchdog.mjs";
+import { resolveWatchdog, setWatchdogSource, resolveStallSoftTimeoutMs, LEGACY_WATCHDOG } from "./watchdog.mjs";
+import { STALL_SOFT_TIMEOUT_MS } from "./lease.mjs";
 
 /**
  * D1.1 (TEAM-3618): the orchestrator mirror of the watchdog resolver. Same
@@ -91,5 +92,38 @@ describe("resolveWatchdog (mjs)", () => {
   it("unknown agentId falls back to the fleet default", () => {
     setWatchdogSource({ agents: [{ agentId: "a1", watchdog: { heartbeatIntervalMs: 5000 } }], defaults: { watchdog: { heartbeatIntervalMs: 9000 } } });
     expect(resolveWatchdog("nope").heartbeatIntervalMs).toBe(9000);
+  });
+});
+
+/**
+ * TEAM-3992 D4.3 — the stall soft-timeout resolver. A workflow def may raise the
+ * shared STALL_SOFT_TIMEOUT_MS default via `stallSoftTimeoutMs`, but the result is
+ * ALWAYS floored at 2× the resolved heartbeat interval so the soft-timeout can
+ * never fire between two expected heartbeats (a healthy agent that missed one beat
+ * is not stalled). Reads the default from lease.mjs (the single source shared with
+ * the TS twin), so there is no forked constant here.
+ */
+describe("resolveStallSoftTimeoutMs (mjs)", () => {
+  it("honors a per-def stallSoftTimeoutMs override that clears the floor", () => {
+    setWatchdogSource(null); // legacy heartbeat 15000 → floor = 2×15000 = 30000
+    expect(resolveStallSoftTimeoutMs({ stallSoftTimeoutMs: 300_000 }, "dev")).toBe(300_000);
+  });
+
+  it("floors a too-small override at 2× the resolved heartbeat interval", () => {
+    setWatchdogSource(null);
+    expect(resolveStallSoftTimeoutMs({ stallSoftTimeoutMs: 1000 }, "dev")).toBe(30_000);
+  });
+
+  it("uses the shared lease-constants default when the def sets no override", () => {
+    setWatchdogSource(null);
+    // Whatever the shared default is, it is still floored at 2× the heartbeat.
+    expect(resolveStallSoftTimeoutMs({}, "dev")).toBe(Math.max(STALL_SOFT_TIMEOUT_MS, 30_000));
+    expect(resolveStallSoftTimeoutMs(undefined, "dev")).toBe(Math.max(STALL_SOFT_TIMEOUT_MS, 30_000));
+  });
+
+  it("floors against a per-agent heartbeat override, not just the legacy 15s", () => {
+    setWatchdogSource({ agents: [{ agentId: "slow", watchdog: { heartbeatIntervalMs: 200_000 } }], defaults: {} });
+    // 2×200000 = 400000 floor beats the tiny configured value.
+    expect(resolveStallSoftTimeoutMs({ stallSoftTimeoutMs: 1000 }, "slow")).toBe(400_000);
   });
 });

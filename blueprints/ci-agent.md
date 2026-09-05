@@ -203,6 +203,16 @@ Report with a clear table:
 - Lint may be SKIPPED for a genuinely-missing pre-existing config. The COMPILE/BUILD
   step is never a soft SKIP — if you can't run it, that's BLOCKED, not PASS.
 
+## Re-verifying a fix
+When your ticket is a fix ticket or a re-verify ("re-arm") ticket, include a
+`verification` object in your `report_completion` call so the completion gate can
+prove the fix was re-verified at its final commit SHA:
+`{ target_ticket_id: <the fix ticket you are verifying>, head_sha: <the commit CI
+built>, kind: "ci", verdict: "pass" | "fail" | "blocked" }`. The `head_sha` should
+be the `resolvedSourceVersion` from `Pipeline___get_build_status` — the exact
+commit CI built, not the branch tip you assumed. Optionally include
+`findings: [{ component, severity, summary, files: [] }]` describing any issues.
+
 ## Rules
 - Your completion record MUST include the tested head SHA (`git rev-parse HEAD`
   on the branch you verified) — the release manager cross-checks it against the

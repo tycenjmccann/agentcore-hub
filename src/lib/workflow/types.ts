@@ -29,6 +29,14 @@ export interface JiraTicket {
   parent?: string;               // parent ticket ID
   children: string[];            // child ticket IDs
   blockedBy: string[];           // tickets that must be "done" before this can start
+  /**
+   * TEAM-3992 D4.2: machine-readable reason a ticket is `blocked`, when one
+   * applies. "runtime" = the coding-agent runtime was unreachable at dispatch, so
+   * the orchestrator parked this coding ticket instead of invoking into a dead
+   * microVM; the runtime-health recovery sweep auto-resumes it. Distinct from a
+   * dependency block (blockedBy) or a human "request changes" at a review gate.
+   */
+  blockReason?: string;
   comments: JiraComment[];
   artifacts: Artifact[];
   createdAt: string;
@@ -207,6 +215,7 @@ export interface RepoTarget {
   defaultBranch: string;         // "main"
   pathPrefix?: string;           // for monorepo: "ios/", "backend/", etc.
   platform: "ios" | "backend" | "android" | "shared";
+  fullName?: string;             // canonical owner/name from GitHub (TEAM-3992 D4.1)
 }
 
 // ─── Agent-to-Agent Messages ─────────────────────────────────────────────────

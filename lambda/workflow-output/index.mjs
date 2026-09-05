@@ -10,6 +10,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { validateTicketPlan } from "./dag.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -22,6 +23,55 @@ const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "jira";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA ||
   (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
+// TEAM-3992 D3.4: structural validation of a submitted ticket plan against the
+// def's ticketDag. enforce → reject an invalid plan (nothing created); shadow →
+// accept but report `dagViolations`; off → skip. Default enforce.
+const DAG_VALIDATION_MODE = (process.env.DAG_VALIDATION_MODE || "enforce").toLowerCase();
+const DEFAULT_WORKFLOW_DEF_ID = "software-delivery";
+
+// config/workflows.json + config/agents.json are the same S3 objects the tickets
+// Lambda's loadValidPhases and the orchestrator's loadWorkflowDefs read; cache
+// per cold start. A load failure degrades to "no dag" (validation skipped) rather
+// than blocking a legitimate plan on an S3 blip.
+let _workflowsConfig = null;
+async function loadWorkflowsConfig() {
+  if (_workflowsConfig) return _workflowsConfig;
+  if (!BUCKET) return (_workflowsConfig = { workflows: [] });
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: "config/workflows.json" }));
+    _workflowsConfig = JSON.parse(await r.Body.transformToString());
+  } catch (err) {
+    console.warn(`[submit_ticket_plan] could not load config/workflows.json: ${err.message}`);
+    _workflowsConfig = { workflows: [] };
+  }
+  return _workflowsConfig;
+}
+
+let _roster = null;
+async function loadRoster() {
+  if (_roster) return _roster;
+  if (!BUCKET) return (_roster = { agents: [] });
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: "config/agents.json" }));
+    _roster = JSON.parse(await r.Body.transformToString());
+  } catch (err) {
+    console.warn(`[submit_ticket_plan] could not load config/agents.json: ${err.message}`);
+    _roster = { agents: [] };
+  }
+  return _roster;
+}
+
+/**
+ * The plan payload is the only reliable def signal submit_ticket_plan receives:
+ * the workflows table isn't wired into this Lambda and the S3 manifest doesn't
+ * record a def id. A run that names its def (workflow_def_id / def_id) wins;
+ * otherwise default to the code pipeline (software-delivery). `workflow_type`
+ * ("feature"/"bug") is intentionally NOT treated as a def id — it is a label,
+ * not a selector.
+ */
+function resolveDefId(args) {
+  return args.workflow_def_id || args.def_id || DEFAULT_WORKFLOW_DEF_ID;
+}
 
 async function publishJourneyEvent(workflowId, type, detail) {
   if (!EVENTS_TABLE || !workflowId) return;
@@ -39,7 +89,34 @@ async function publishJourneyEvent(workflowId, type, detail) {
   } catch { /* non-fatal */ }
 }
 
-async function submitTicketPlan({ workflow_id, requirements, tickets }) {
+async function submitTicketPlan(args) {
+  const { workflow_id, requirements, tickets } = args;
+
+  // TEAM-3992 D3.4 — validate the plan's structure against the def's ticketDag
+  // BEFORE persisting anything, so an enforced rejection leaves no partial state.
+  let dagViolations = null;
+  if (DAG_VALIDATION_MODE !== "off") {
+    const [cfg, roster] = await Promise.all([loadWorkflowsConfig(), loadRoster()]);
+    const defId = resolveDefId(args);
+    const dag = (cfg.workflows || []).find((w) => w.id === defId)?.ticketDag;
+    if (dag) {
+      const result = validateTicketPlan({ tickets }, dag, roster);
+      if (!result.ok) {
+        if (DAG_VALIDATION_MODE === "enforce") {
+          const err = new Error("ticket_plan_invalid");
+          err.mcpBody = {
+            status: "rejected",
+            error: "ticket_plan_invalid",
+            violations: result.violations,
+            hint: "Fix the plan and resubmit; nothing was created.",
+          };
+          throw err;
+        }
+        dagViolations = result.violations; // shadow: report but proceed
+      }
+    }
+  }
+
   const key = `workflows/${workflow_id}/shared/ticket-plan.json`;
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
@@ -51,6 +128,7 @@ async function submitTicketPlan({ workflow_id, requirements, tickets }) {
     status: "saved",
     location: `s3://${BUCKET}/${key}`,
     ticket_count: tickets.length,
+    ...(dagViolations ? { dagViolations } : {}),
     message: `Ticket plan saved with ${tickets.length} tickets as a record. NEXT: you must call Tickets___create_ticket once per ticket to actually create them under the epic in the ticket system. submit_ticket_plan only persists the plan — it does not create tickets.`,
   };
 }
@@ -172,7 +250,44 @@ async function lookupTicketOwner(ticket_id) {
  *      An ABSENT `agent_id` is allowed (older fleet callers omit it) but logged:
  *      it cannot be checked, so it must at least be visible.
  */
-async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id }) {
+/** verification.kind values a verifier may stamp (review/qa/ci gates). */
+const VERIFICATION_KINDS = new Set(["review", "qa", "ci"]);
+/** verification.verdict values. */
+const VERIFICATION_VERDICTS = new Set(["pass", "fail", "blocked"]);
+const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
+
+/**
+ * TEAM-3992 Q4 — validate a caller-supplied `verification` block before it is
+ * persisted or turned into a durable record. Returns a NORMALIZED copy (kind /
+ * verdict lower-cased, sha lower-cased) or throws a specific error naming the bad
+ * field. A malformed block must never be silently dropped — a fix that reports a
+ * garbage verification would otherwise look re-verified to the SHA-pinned gate.
+ */
+function validateVerification(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) {
+    throw new Error("verification must be an object");
+  }
+  const target = typeof v.target_ticket_id === "string" ? v.target_ticket_id.trim() : "";
+  if (!target) throw new Error("verification.target_ticket_id is required");
+  const kind = typeof v.kind === "string" ? v.kind.trim().toLowerCase() : "";
+  if (!VERIFICATION_KINDS.has(kind)) {
+    throw new Error(`verification.kind must be one of review|qa|ci (got ${JSON.stringify(v.kind)})`);
+  }
+  const verdict = typeof v.verdict === "string" ? v.verdict.trim().toLowerCase() : "";
+  if (!VERIFICATION_VERDICTS.has(verdict)) {
+    throw new Error(`verification.verdict must be one of pass|fail|blocked (got ${JSON.stringify(v.verdict)})`);
+  }
+  const headSha = typeof v.head_sha === "string" ? v.head_sha.trim().toLowerCase() : "";
+  if (!SHA_RE.test(headSha)) {
+    throw new Error(`verification.head_sha must be a hex sha of length >= 7 (got ${JSON.stringify(v.head_sha)})`);
+  }
+  const out = { target_ticket_id: target, head_sha: headSha, kind, verdict };
+  if (v.build_id != null) out.build_id = String(v.build_id);
+  if (v.evidence_key != null) out.evidence_key = String(v.evidence_key);
+  return out;
+}
+
+async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, verification, findings }) {
   const owner = await lookupTicketOwner(ticket_id);
   if (!owner) {
     console.warn(`[report_completion] ownership_unverified — could not read ${ticket_id}; proceeding without the assignee check`);
@@ -192,6 +307,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     console.warn(`[report_completion] ownership_unverified — no agent_id supplied for ${ticket_id} (assignee ${owner.assignee || "none"}); cannot verify the caller`);
   }
 
+  // TEAM-3992 Q4 — validate the optional verification block BEFORE any write, so
+  // a malformed block is a hard rejection (never a half-written record). findings
+  // are advisory metadata, persisted as-is when they are an array.
+  const verified = verification != null ? validateVerification(verification) : null;
+  const findingsList = Array.isArray(findings) ? findings : null;
+
+  const completedAt = new Date().toISOString();
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -200,11 +322,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     branch: branch || null,
     commit_sha: commit_sha || null,
     pr_url: pr_url || null,
-    completed_at: new Date().toISOString(),
+    completed_at: completedAt,
     // Server-stamped, LAST, so a caller-supplied `source` cannot survive (F18).
     source: "agent",
     reported_by: agent_id || null,
   };
+  if (verified) report.verification = verified;
+  if (findingsList) report.findings = findingsList;
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
@@ -212,6 +336,34 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     ContentType: "application/json",
   }));
   console.log(`[report_completion] Saved s3://${BUCKET}/${key}`);
+
+  // TEAM-3992 Q4 — durable, SHA-pinned verification record the completion gate
+  // reads without racing the agentTasks harvest. Keyed by target ticket + HEAD sha
+  // + kind, so re-verifying the same fix at the same SHA is idempotent and a later
+  // fix (new SHA) never satisfies an older gate. Requires workflow_id to place it.
+  if (verified && workflow_id) {
+    const recordKey = `workflows/${workflow_id}/shared/verifications/${verified.target_ticket_id}/${verified.head_sha}.${verified.kind}.json`;
+    await s3.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: recordKey,
+      Body: JSON.stringify(
+        {
+          ...verified,
+          findings: findingsList || undefined,
+          verifier_ticket_id: ticket_id,
+          reported_by: agent_id || null,
+          source: "agent",
+          at: completedAt,
+        },
+        null,
+        2
+      ),
+      ContentType: "application/json",
+    }));
+    console.log(`[report_completion] Saved verification record s3://${BUCKET}/${recordKey}`);
+  } else if (verified && !workflow_id) {
+    console.warn(`[report_completion] verification supplied for ${ticket_id} but no workflow_id — durable record NOT written`);
+  }
 
   // Journey log: report_completion received — includes agentId so UI can immediately mark agent done
   await publishJourneyEvent(workflow_id || ticket_id, "workflow.report_completion", {
@@ -418,6 +570,14 @@ export const handler = async (event) => {
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
     console.error(`[workflow-output] Error in ${toolName}:`, err);
+    // A structured rejection (e.g. D3.4 ticket_plan_invalid) carries its own MCP
+    // body so the agent gets the machine-readable violations, not just a string.
+    if (err.mcpBody) {
+      return {
+        content: [{ type: "text", text: JSON.stringify(err.mcpBody, null, 2) }],
+        isError: true,
+      };
+    }
     return {
       content: [{ type: "text", text: `Error: ${err.message}` }],
       isError: true,

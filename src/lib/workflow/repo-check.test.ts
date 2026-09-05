@@ -18,7 +18,7 @@ import {
  * These pin the pre-flight that now asks.
  */
 
-type Route = { status: number; json?: unknown };
+type Route = { status: number; json?: unknown; url?: string; redirected?: boolean };
 function fakeFetch(routes: Record<string, Route>, calls: string[] = []): typeof fetch {
   return (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
@@ -28,6 +28,9 @@ function fakeFetch(routes: Record<string, Route>, calls: string[] = []): typeof 
     return {
       status: r.status,
       ok: r.status < 400,
+      // url/redirected model a followed 301 for the D4.1 rename-detection tests.
+      url: r.url ?? url,
+      redirected: r.redirected ?? false,
       json: async () => r.json ?? {},
     } as unknown as Response;
   }) as typeof fetch;
@@ -94,6 +97,53 @@ describe("checkRepoUrl — GitHub", () => {
     });
     expect(boom).toMatchObject({ ok: false, definitive: false, status: null });
     expect(boom.reason).toMatch(/ECONNRESET/);
+  });
+});
+
+describe("checkRepoUrl — body capture (TEAM-3992 D4.1)", () => {
+  const GOOD = "https://github.com/tycenjmccann/agentcore-hub";
+
+  it("200 captures default_branch + full_name; renamed false when the body matches", async () => {
+    const r = await checkRepoUrl(GOOD, {
+      token: "t",
+      fetchImpl: fakeFetch({ "/repos/tycenjmccann/agentcore-hub": { status: 200, json: { full_name: "tycenjmccann/agentcore-hub", default_branch: "main" } } }),
+    });
+    expect(r).toMatchObject({ ok: true, defaultBranch: "main", fullName: "tycenjmccann/agentcore-hub", renamed: false, owner: "tycenjmccann", repo: "agentcore-hub" });
+  });
+
+  it("a non-'main' default is captured verbatim", async () => {
+    const r = await checkRepoUrl(GOOD, {
+      token: "t",
+      fetchImpl: fakeFetch({ "/repos/tycenjmccann/agentcore-hub": { status: 200, json: { full_name: "tycenjmccann/agentcore-hub", default_branch: "master" } } }),
+    });
+    expect(r.defaultBranch).toBe("master");
+  });
+
+  it("a followed 301 → renamed:true, owner/repo from the canonical full_name", async () => {
+    const r = await checkRepoUrl(GOOD, {
+      token: "t",
+      fetchImpl: fakeFetch({
+        "/repos/tycenjmccann/agentcore-hub": {
+          status: 200,
+          redirected: true,
+          url: "https://api.github.com/repos/tycenjmccann/agentcore-console",
+          json: { full_name: "tycenjmccann/agentcore-console", default_branch: "main" },
+        },
+      }),
+    });
+    expect(r).toMatchObject({ ok: true, renamed: true, fullName: "tycenjmccann/agentcore-console", owner: "tycenjmccann", repo: "agentcore-console" });
+  });
+
+  it("a 200 with no body fields → defaultBranch undefined (NOT 'main'), renamed false", async () => {
+    const r = await checkRepoUrl(GOOD, {
+      token: "t",
+      fetchImpl: fakeFetch({ "/repos/tycenjmccann/agentcore-hub": { status: 200, json: {} } }),
+    });
+    expect(r.ok).toBe(true);
+    expect(r.defaultBranch).toBeUndefined();
+    expect(r.fullName).toBeUndefined();
+    expect(r.renamed).toBe(false);
+    expect(r).toMatchObject({ owner: "tycenjmccann", repo: "agentcore-hub" });
   });
 });
 

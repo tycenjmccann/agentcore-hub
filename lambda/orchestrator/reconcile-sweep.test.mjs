@@ -104,9 +104,14 @@ function makeSweep(overrides = {}) {
     readySlaMs: overrides.readySlaMs,
     gateBypassRecheck: overrides.gateBypassRecheck,
     retryEpicRollup: overrides.retryEpicRollup,
+    // TEAM-3992 D4.2 — the coding-runtime-outage skip. Unset by default so every
+    // pre-D4.2 test exercises the reserved-reason-stays-zero path.
+    runtimeOutageActive: overrides.runtimeOutageActive,
+    isCodingTicket: overrides.isCodingTicket,
   });
   return { ...sweep, ddb, getChildTickets, cascade, publishEvent, lease, redispatch, reawakenGate,
-    store: overrides.store, blockTicket: overrides.blockTicket };
+    store: overrides.store, blockTicket: overrides.blockTicket,
+    runtimeOutageActive: overrides.runtimeOutageActive, isCodingTicket: overrides.isCodingTicket };
 }
 
 // A non-terminal workflow whose in_progress dependent carries a stale running claim.
@@ -1046,5 +1051,70 @@ describe("D2.3 — the two extra sweep steps", () => {
     const shadowDep = vi.fn(async () => ({ ok: true }));
     await makeSweep({ ddb, siblings: [], retryEpicRollup: shadowDep }).runSweep("shadow");
     expect(shadowDep).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * TEAM-3992 D4.2 — during an open coding-runtime outage the sweep must NOT
+ * re-drive coding tickets: dispatching into a dead microVM is exactly what the
+ * outage park prevented, and the runtime-health recovery sweep owns resuming
+ * them. The gate is a ONCE-per-sweep S3 head (runtimeOutageActive) plus a
+ * per-sibling roster check (isCodingTicket); non-coding tickets are untouched.
+ */
+describe("D4.2 — a coding-runtime outage holds coding candidates (runtime_outage skip)", () => {
+  it("skips a coding candidate as runtime_outage, never re-dispatches, probes S3 once", async () => {
+    const runtimeOutageActive = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], siblings: readyCandidate,
+      runtimeOutageActive, isCodingTicket: () => true,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(runtimeOutageActive).toHaveBeenCalledTimes(1); // once per sweep, not per sibling
+    expect(m.skipped.runtime_outage).toBe(1);
+    expect(m.candidates).toBe(0); // held before the candidate stage
+    expect(m.acted).toBe(0);
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+  });
+
+  it("during an outage a NON-coding candidate is still recovered normally", async () => {
+    const s = makeSweep({
+      workflows: [workflow()], siblings: readyCandidate,
+      runtimeOutageActive: async () => true, isCodingTicket: () => false,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.skipped.runtime_outage).toBe(0);
+    expect(m.redispatched).toBe(1);
+    expect(s.redispatch.mock.calls[0][1].ticketId).toBe("TEAM-3");
+  });
+
+  it("no outage → the gate is inert (coding candidate recovered as usual)", async () => {
+    const runtimeOutageActive = vi.fn(async () => false);
+    const s = makeSweep({
+      workflows: [workflow()], siblings: readyCandidate,
+      runtimeOutageActive, isCodingTicket: () => true,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(runtimeOutageActive).toHaveBeenCalledTimes(1);
+    expect(m.skipped.runtime_outage).toBe(0);
+    expect(m.redispatched).toBe(1);
+  });
+
+  it("a throwing runtimeOutageActive fails safe (outage treated as inactive, sweep survives)", async () => {
+    const s = makeSweep({
+      workflows: [workflow()], siblings: readyCandidate,
+      runtimeOutageActive: async () => { throw new Error("s3 down"); }, isCodingTicket: () => true,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.skipped.runtime_outage).toBe(0);
+    expect(m.redispatched).toBe(1); // recovery proceeds rather than stalling on a probe error
   });
 });

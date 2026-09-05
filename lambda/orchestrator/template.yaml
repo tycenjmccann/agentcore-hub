@@ -23,6 +23,12 @@ Globals:
         CASCADE_EXTENDED_STATES: !Ref CascadeExtendedStates
         RECONCILE_SWEEP_MODE: !Ref ReconcileSweepMode
         GATE_BYPASS_MODE: !Ref GateBypassMode
+        FIX_VERIFICATION_REQUIRED: !Ref FixVerificationRequired
+        CODING_AGENT_RUNTIME_ARN: !Ref CodingAgentRuntimeArn
+        OTEL_ACTIVITY_CONFIRM: !Ref OtelActivityConfirm
+        OTEL_SPANS_LOG_GROUP: !Ref OtelSpansLogGroup
+        OTEL_QUERY_TIMEOUT_MS: !Ref OtelQueryTimeoutMs
+        OTEL_QUERY_BUDGET_PER_SWEEP: !Ref OtelQueryBudgetPerSweep
 
 Parameters:
   TicketsTableName:
@@ -103,6 +109,74 @@ Parameters:
       sweeps this ships ON, because the failure it catches (a run closing green
       over an unapproved merge) is exactly what it must not miss.
 
+  FixVerificationRequired:
+    Type: String
+    Default: enforce
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      SHA-pinned fix-verification gate (TEAM-3992 Q4/D3.2). off = skip the check;
+      shadow = detect + publish workflow.completion_blocked (reason fix_unverified),
+      no block; enforce = hold the run open at completion when a done fix ticket was
+      not re-verified at its FINAL commit SHA by every role its kind re-arms, and
+      raise one manager_escalation. Inert unless the run's def declares
+      ticketDag.fixRearm. Default "enforce" matches the code default in index.mjs —
+      a fix closing green without re-verification is exactly what it must not miss.
+
+  CodingAgentRuntimeArn:
+    Type: String
+    Default: ""
+    Description: >
+      Coding-runtime health gate (TEAM-3992 D4.2). The AgentRuntime ARN of the
+      shared coding-agent runtime (deploy/coding-agent-runtime/). When set, the
+      orchestrator poll-probes it before dispatching a coding ticket
+      (claude_code/codex/kiro), parks tickets blocked:runtime during an outage,
+      and auto-resumes them on recovery. Unset (default) fails OPEN — the gate is
+      dark and dispatch behaves exactly as pre-D4.2. No hardcoded ARN/account:
+      supply via CODING_AGENT_RUNTIME_ARN from deploy/config.sh.
+
+  OtelActivityConfirm:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: >
+      OTEL span-confirmation for the dead-session detector's stall soft-timeout
+      (TEAM-3992 D4.3). off (default) = the detector never queries CloudWatch Logs
+      Insights: a soft-stale claim is only ever stolen once its silence passes the
+      absolute hard ceiling (2× the soft-timeout) — the 4v1ykk TEAM-2609 class. on
+      = below the hard ceiling the detector confirms death against aws/spans before
+      stealing, so a genuinely-working agent whose stream heartbeats lapsed is not
+      recovered mid-turn. Ships off — the hard ceiling alone is the safe backstop.
+
+  OtelSpansLogGroup:
+    Type: String
+    Default: aws/spans
+    Description: >
+      CloudWatch Logs group holding the fleet's OTEL spans, queried by the stall
+      soft-timeout confirmation probe (TEAM-3992 D4.3). Default aws/spans matches
+      the group the runtime + traces already emit to.
+
+  OtelQueryTimeoutMs:
+    Type: String
+    Default: "15000"
+    Description: >
+      Per-query wall-clock budget (ms) for the OTEL span-confirmation Logs Insights
+      poll (TEAM-3992 D4.3). A query that has not reached Complete by then yields
+      the "unknown" sentinel, which NEVER escalates a soft-stale to a steal.
+
+  OtelQueryBudgetPerSweep:
+    Type: String
+    Default: "5"
+    Description: >
+      Maximum OTEL confirmation queries a single dead-session sweep may issue
+      (TEAM-3992 D4.3), bounding Logs Insights fan-out when many claims go
+      soft-stale at once. Over budget yields the "unknown" sentinel (no steal).
+
+Conditions:
+  # The coding-runtime health gate's InvokeAgentRuntime grant is only added when a
+  # runtime ARN is supplied — an empty Resource would be an invalid IAM policy,
+  # and a dark gate needs no permission.
+  HasCodingRuntime: !Not [!Equals [!Ref CodingAgentRuntimeArn, ""]]
+
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────
   # Create with: scripts/create-dynamodb-tables.sh
@@ -143,6 +217,43 @@ Resources:
             BucketName: !Ref ArtifactBucket
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBus
+        # TEAM-3992 D4.2 — the coding-runtime health gate persists its outage
+        # state object under runtime-health/*. Read is already covered by
+        # S3ReadPolicy above; grant scoped write/delete on that prefix only.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/runtime-health/*"
+        # InvokeAgentRuntime on the coding runtime ONLY — scoped to the configured
+        # ARN (+ its endpoints), added only when an ARN is supplied.
+        - !If
+          - HasCodingRuntime
+          - Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Ref CodingAgentRuntimeArn
+                  - !Sub "${CodingAgentRuntimeArn}/runtime-endpoint/*"
+          - !Ref AWS::NoValue
+        # TEAM-3992 D4.3 — the stall soft-timeout's OTEL span-confirmation probe
+        # runs a CloudWatch Logs Insights query over the aws/spans log group.
+        # StartQuery/StopQuery accept resource-level scoping (the aws/spans group);
+        # GetQueryResults does NOT support resource-level permissions and must be
+        # granted on "*" (see the CloudWatch Logs IAM reference — it is keyed by
+        # queryId, not log group). The probe is dark unless OTEL_ACTIVITY_CONFIRM=on,
+        # but the grant is always present so enabling the flag needs no redeploy.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:StartQuery
+                - logs:StopQuery
+              Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*"
+            - Effect: Allow
+              Action:
+                - logs:GetQueryResults
+              Resource: "*"  # GetQueryResults has no resource-level permission support
       Events:
         DynamoDBStream:
           Type: DynamoDB
@@ -184,6 +295,18 @@ Resources:
             Name: agentcore-hub-reconcile-sweep
             Description: Invoke the orchestrator to run the missed-unblock reconciliation sweep (TEAM-3747 D1 / FR-D1.3 backstop).
             Input: '{"source":"orchestrator.sweep","action":"reconcile_sweep"}'
+        # Coding-runtime recovery sweep (TEAM-3992 D4.2). Same sentinel pattern —
+        # index.mjs branches on action=runtime_health_sweep. No-op (one S3 head)
+        # unless CODING_AGENT_RUNTIME_ARN is set and an outage object is open, so
+        # scheduling it is free until the gate is armed. deploy.sh folds the same
+        # action into its single dead-session rule as a third target.
+        RuntimeHealthSweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Name: agentcore-hub-runtime-health-sweep
+            Description: Invoke the orchestrator to re-probe the coding runtime and auto-resume parked coding tickets on recovery (TEAM-3992 D4.2).
+            Input: '{"source":"orchestrator.sweep","action":"runtime_health_sweep"}'
 
   # ─── Agent Invoker Lambda (async, long-running) ────────────────────────────────
   AgentInvokerFunction:

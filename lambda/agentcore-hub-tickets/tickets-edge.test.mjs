@@ -31,6 +31,13 @@ const h = vi.hoisted(() => ({
     counter: 0,
     /** Set to an error name to make the NEXT edge UpdateCommand throw. */
     edgeError: /** @type {string | null} */ (null),
+    /** Item returned by GetCommand (addBlockers reads it to distinguish
+     * already-linked from refuse-on-closed after a ConditionalCheckFailed). */
+    getItem: /** @type {any} */ (null),
+    /** Queue of error names — each pops for the next edge UpdateCommand (used to
+     * make one blocker's write fail while others succeed). Takes precedence over
+     * edgeError when non-empty. */
+    edgeErrors: /** @type {string[]} */ ([]),
   },
 }));
 
@@ -59,15 +66,17 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               h.state.counter += 1;
               return { Attributes: { nextNum: h.state.counter } };
             }
-            if (h.state.edgeError) {
+            const errName = h.state.edgeErrors.length ? h.state.edgeErrors.shift() : h.state.edgeError;
+            if (errName) {
               const err = new Error("condition failed");
-              err.name = h.state.edgeError;
-              h.state.edgeError = null;
+              err.name = errName;
+              if (!h.state.edgeErrors.length) h.state.edgeError = null;
               throw err;
             }
             h.state.edges.push(cmd.input);
             return {};
           }
+          if (name === "GetCommand") { return { Item: h.state.getItem }; }
           if (name === "PutCommand") { h.state.puts.push(cmd.input.Item); return {}; }
           return {};
         },
@@ -87,6 +96,8 @@ beforeEach(async () => {
   h.state.edges.length = 0;
   h.state.counter = 0;
   h.state.edgeError = null;
+  h.state.edgeErrors.length = 0;
+  h.state.getItem = null;
   delete process.env.ARTIFACT_BUCKET;
   vi.resetModules();
   ({ handler } = await import("./index.mjs"));
@@ -176,5 +187,124 @@ describe("create_ticket writes the origin→fix blockedBy edge (D2.2)", () => {
       findingId: "F3",
     });
     expect(h.state.edges[0].Key).toEqual({ ticketId: "TEAM-3727" });
+  });
+
+  it("TEAM-3992: re-arm provenance (rearmOf / headSha / role) survives sanitization; junk is dropped", async () => {
+    // The SHA-pinned completion gate attributes a verification to its fix via
+    // rearmOf+headSha, and the orchestrator dedups re-arm tickets by role — so all
+    // three must persist on the re-verify ticket.
+    await create({
+      summary: "Re-verify (review): fix @ abcdef1",
+      assignee: "agentcore_hub_code_reviewer",
+      spawned_by: {
+        kind: "review_fix", gateTicketId: "TEAM-19", rearmOf: "TEAM-50",
+        headSha: "abcdef1234567890", role: "review", junk: "drop-me",
+      },
+      phase: "review",
+    });
+    expect(h.state.puts[0].spawnedBy).toEqual({
+      kind: "review_fix", gateTicketId: "TEAM-19", rearmOf: "TEAM-50",
+      headSha: "abcdef1234567890", role: "review",
+    });
+  });
+});
+
+/**
+ * TEAM-3992 D3.2 — the add_blockers op. The orchestrator blocks the Ship ticket on
+ * freshly-created re-verify tickets so a run cannot ship before its fixes are
+ * re-verified at the code that landed. Contract: one scoped, idempotent
+ * list_append UpdateCommand per NEW blocker on the target; a closed target is
+ * refused; a redundant blocker is a silent no-op.
+ */
+describe("add_blockers (D3.2)", () => {
+  const addBlockers = (args) => handler({ name: "Tickets___add_blockers", arguments: args });
+
+  it("blocks the ship ticket on each re-arm id with a scoped, guarded list_append", async () => {
+    const res = await addBlockers({ ticket_id: "SHIP-1", blocked_by: ["RA-1", "RA-2"] });
+    expect(res).toMatchObject({ status: "ok", ticket_id: "SHIP-1", added: ["RA-1", "RA-2"] });
+    expect(h.state.edges).toHaveLength(2);
+    for (const edge of h.state.edges) {
+      expect(edge.Key).toEqual({ ticketId: "SHIP-1" });
+      expect(edge.UpdateExpression).toContain("list_append(if_not_exists(blockedBy, :empty), :one)");
+      expect(edge.ConditionExpression).toContain("NOT contains(blockedBy, :b)");
+      expect(edge.ConditionExpression).toContain("#s <> :done");
+      expect(edge.ConditionExpression).toContain("#s <> :cancelled");
+    }
+    expect(h.state.edges.map((e) => e.ExpressionAttributeValues[":one"][0])).toEqual(["RA-1", "RA-2"]);
+  });
+
+  it("dedupes the input list and drops a self-reference", async () => {
+    const res = await addBlockers({ ticket_id: "SHIP-1", blocked_by: ["RA-1", "RA-1", "SHIP-1", "RA-2"] });
+    expect(res.added).toEqual(["RA-1", "RA-2"]);
+    expect(h.state.edges).toHaveLength(2);
+  });
+
+  it("accepts a scalar blocked_by", async () => {
+    const res = await addBlockers({ ticket_id: "SHIP-1", blocked_by: "RA-1" });
+    expect(res.added).toEqual(["RA-1"]);
+  });
+
+  it("requires ticket_id and a non-empty blocked_by", async () => {
+    expect((await addBlockers({ blocked_by: ["RA-1"] })).content[0].text).toMatch(/ticket_id/);
+    expect((await addBlockers({ ticket_id: "SHIP-1", blocked_by: [] })).content[0].text).toMatch(/blocked_by/);
+    expect((await addBlockers({ ticket_id: "SHIP-1", blocked_by: ["SHIP-1"] })).content[0].text).toMatch(/blocked_by/);
+  });
+
+  it("an already-linked blocker is an idempotent skip — the create/add still succeeds", async () => {
+    // First blocker's write hits the NOT-contains guard; the target is open, so
+    // it's a redundant link, not a closed ticket → skipped, second still added.
+    h.state.edgeErrors = ["ConditionalCheckFailedException"];
+    h.state.getItem = { ticketId: "SHIP-1", status: "in_review" };
+    const res = await addBlockers({ ticket_id: "SHIP-1", blocked_by: ["RA-1", "RA-2"] });
+    expect(res).toMatchObject({ status: "ok", added: ["RA-2"] });
+  });
+
+  it("refuses to add blockers to a done/cancelled target", async () => {
+    h.state.edgeErrors = ["ConditionalCheckFailedException"];
+    h.state.getItem = { ticketId: "SHIP-1", status: "done" };
+    const res = await addBlockers({ ticket_id: "SHIP-1", blocked_by: ["RA-1"] });
+    expect(res.content[0].text).toMatch(/done — cannot add blockers to a closed ticket/);
+  });
+});
+
+/**
+ * TEAM-3992 D4.2 — a `block` transition may carry a machine-readable
+ * `block_reason`, persisted as the `blockReason` attribute. The orchestrator's
+ * runtime-health gate parks a coding ticket with block_reason:"runtime" so the
+ * board can label WHY it is blocked ("Blocked: runtime outage") and the recovery
+ * sweep can find its own parks. Only a `block` transition consults it.
+ */
+describe("transition_ticket block_reason → blockReason (D4.2)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const upd = () => h.state.edges[0]; // the transition's UpdateCommand (not the counter)
+
+  it("a block transition with block_reason 'runtime' persists blockReason", async () => {
+    h.state.getItem = { ticketId: "TEAM-7", status: "in_progress", assignee: "agentcore_hub_backend_dev" };
+    const res = await transition({ ticket_id: "TEAM-7", transition_id: "block", block_reason: "runtime" });
+    expect(res).toMatchObject({ status: "transitioned", to: "blocked" });
+    expect(upd().Key).toEqual({ ticketId: "TEAM-7" });
+    expect(upd().ExpressionAttributeNames["#brs"]).toBe("blockReason");
+    expect(upd().ExpressionAttributeValues[":brs"]).toBe("runtime");
+    expect(upd().UpdateExpression).toContain("#brs = :brs");
+  });
+
+  it("a block transition WITHOUT block_reason writes no blockReason (unchanged)", async () => {
+    h.state.getItem = { ticketId: "TEAM-7", status: "in_progress", assignee: "agentcore_hub_backend_dev" };
+    await transition({ ticket_id: "TEAM-7", transition_id: "block" });
+    expect(upd().ExpressionAttributeValues[":brs"]).toBeUndefined();
+    expect(upd().UpdateExpression).not.toContain("blockReason");
+  });
+
+  it("a NON-block transition ignores block_reason entirely", async () => {
+    h.state.getItem = { ticketId: "TEAM-7", status: "ready", assignee: "agentcore_hub_backend_dev" };
+    const res = await transition({ ticket_id: "TEAM-7", transition_id: "start", block_reason: "runtime" });
+    expect(res).toMatchObject({ status: "transitioned", to: "in_progress" });
+    expect(upd().ExpressionAttributeValues[":brs"]).toBeUndefined();
+  });
+
+  it("clamps an oversized block_reason to 200 chars (no unbounded attribute)", async () => {
+    h.state.getItem = { ticketId: "TEAM-7", status: "in_progress", assignee: "agentcore_hub_backend_dev" };
+    await transition({ ticket_id: "TEAM-7", transition_id: "block", block_reason: "x".repeat(500) });
+    expect(upd().ExpressionAttributeValues[":brs"].length).toBe(200);
   });
 });

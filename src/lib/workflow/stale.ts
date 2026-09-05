@@ -8,9 +8,25 @@
 // count — a genuinely dead session must still cross the threshold and trip.
 
 /** Normal tools return in seconds — 3 min of total silence means stuck. */
+import leaseConstants from "../../config/lease-constants.json";
+
+/** The orchestrator's absolute stall soft-timeout (TEAM-3989 D4.3). This is the
+ *  point past which the stall detector agent will steal a silent agent's lease,
+ *  so it is the CEILING for any UI liveness window: the board must never show an
+ *  agent as live past the moment the backend gives up on it. Sourced from
+ *  lease-constants.json so the UI ceiling and the orchestrator soft-timeout are
+ *  the same number from the same file. */
+export const STALL_SOFT_TIMEOUT_MS = leaseConstants.stallSoftTimeoutMs;
+
 export const STALE_THRESHOLD_DEFAULT_MS = 180_000;
-/** claude_code goes dark for the whole run: 15 min timeout + 2 min buffer. */
-export const STALE_THRESHOLD_CLAUDE_CODE_MS = 1_020_000;
+/** claude_code goes dark for the whole run: historically 15 min timeout + 2 min
+ *  buffer (1_020_000). TEAM-3989 D4.3 caps this at the orchestrator's stall
+ *  soft-timeout (STALL_SOFT_TIMEOUT_MS) so the board and the stall detector agree
+ *  on when a silent claude_code agent is stuck: the UI can never treat an agent
+ *  as live past the point the orchestrator will reclaim its lease. With the
+ *  current 10-min soft-timeout (< 17 min) this LOWERS the window to 10 min; the
+ *  value now tracks lease-constants.stallSoftTimeoutMs. */
+export const STALE_THRESHOLD_CLAUDE_CODE_MS = Math.min(1_020_000, STALL_SOFT_TIMEOUT_MS);
 
 export function staleThresholdFor(anyAgentInClaudeCode: boolean): number {
   return anyAgentInClaudeCode ? STALE_THRESHOLD_CLAUDE_CODE_MS : STALE_THRESHOLD_DEFAULT_MS;

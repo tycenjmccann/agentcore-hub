@@ -90,8 +90,10 @@ async function report(args) {
 }
 
 const completionPuts = () => h.state.s3Puts.filter((p) => String(p.Key).startsWith("completions/"));
+const verificationPuts = () => h.state.s3Puts.filter((p) => String(p.Key).includes("/shared/verifications/"));
 const transitions = () => h.state.lambdaCalls.filter((c) => c.tool_name === "Tickets___transition_ticket");
 const savedRecord = () => JSON.parse(completionPuts()[0].Body);
+const savedVerification = () => JSON.parse(verificationPuts()[0].Body);
 
 beforeEach(() => {
   h.state.s3Puts = [];
@@ -222,5 +224,103 @@ describe("F17 — a report must come from the ticket's own assignee", () => {
     });
     expect(h.state.lambdaCalls[0].tool_name).toBe("Tickets___get_issue");
     expect(h.state.lambdaCalls[0].parameters.ticket_id).toBe("TEAM-4001");
+  });
+});
+
+/**
+ * TEAM-3992 Q4 — the SHA-pinned verification record. A re-verify ticket reports a
+ * `verification` block; the Lambda persists it inside the completion record AND
+ * writes a durable, idempotently-keyed record the completion gate reads without
+ * racing the agentTasks harvest. A malformed block must be a HARD rejection — a
+ * fix that reported garbage would otherwise look re-verified to the gate.
+ */
+describe("TEAM-3992 Q4 — verification record", () => {
+  const SHA = "abcdef1234567890";
+
+  it("persists verification + findings in the completion record and a durable record at the SHA-pinned key", async () => {
+    const res = await report({
+      ticket_id: "TEAM-4001", summary: "re-reviewed", workflow_id: "wf1",
+      agent_id: "agentcore_hub_backend_dev",
+      verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "review", verdict: "pass" },
+      findings: [{ component: "auth", severity: "high", summary: "null deref", files: ["a.ts"] }],
+    });
+    expect(res.isError).toBeFalsy();
+    // Completion record carries both.
+    expect(savedRecord().verification).toEqual({ target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "review", verdict: "pass" });
+    expect(savedRecord().findings).toHaveLength(1);
+    // Durable record keyed by target + sha + kind.
+    expect(verificationPuts()).toHaveLength(1);
+    expect(verificationPuts()[0].Key).toBe(`workflows/wf1/shared/verifications/TEAM-3050/${SHA}.review.json`);
+    const rec = savedVerification();
+    expect(rec).toMatchObject({
+      target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "review", verdict: "pass",
+      verifier_ticket_id: "TEAM-4001", source: "agent", reported_by: "agentcore_hub_backend_dev",
+    });
+    expect(rec.at).toBeTruthy();
+  });
+
+  it("normalizes kind/verdict/sha case before keying the record", async () => {
+    await report({
+      ticket_id: "TEAM-4001", summary: "x", workflow_id: "wf1",
+      agent_id: "agentcore_hub_backend_dev",
+      verification: { target_ticket_id: "TEAM-3050", head_sha: "ABCDEF1", kind: "CI", verdict: "PASS" },
+    });
+    expect(verificationPuts()[0].Key).toBe("workflows/wf1/shared/verifications/TEAM-3050/abcdef1.ci.json");
+    expect(savedVerification()).toMatchObject({ kind: "ci", verdict: "pass", head_sha: "abcdef1" });
+  });
+
+  it("carries build_id and evidence_key through when supplied", async () => {
+    await report({
+      ticket_id: "TEAM-4001", summary: "x", workflow_id: "wf1",
+      agent_id: "agentcore_hub_backend_dev",
+      verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "ci", verdict: "pass", build_id: 42, evidence_key: "k/x.log" },
+    });
+    expect(savedVerification()).toMatchObject({ build_id: "42", evidence_key: "k/x.log" });
+  });
+
+  it("writes verification into the completion record but NO durable record when workflow_id is absent", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await report({
+      ticket_id: "TEAM-4001", summary: "x",
+      agent_id: "agentcore_hub_backend_dev",
+      verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "review", verdict: "pass" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(savedRecord().verification).toBeTruthy();
+    expect(verificationPuts()).toHaveLength(0);
+    expect(warn.mock.calls.flat().join(" ")).toMatch(/durable record NOT written/);
+    warn.mockRestore();
+  });
+
+  for (const [label, bad] of [
+    ["missing target_ticket_id", { head_sha: SHA, kind: "review", verdict: "pass" }],
+    ["bad kind", { target_ticket_id: "T", head_sha: SHA, kind: "smoke", verdict: "pass" }],
+    ["bad verdict", { target_ticket_id: "T", head_sha: SHA, kind: "review", verdict: "green" }],
+    ["short sha", { target_ticket_id: "T", head_sha: "abc", kind: "review", verdict: "pass" }],
+    ["non-hex sha", { target_ticket_id: "T", head_sha: "zzzzzzz", kind: "review", verdict: "pass" }],
+    ["not an object", "review"],
+  ]) {
+    it(`rejects malformed verification (${label}) with no S3 write`, async () => {
+      const res = await report({
+        ticket_id: "TEAM-4001", summary: "x", workflow_id: "wf1",
+        agent_id: "agentcore_hub_backend_dev", verification: bad,
+      });
+      expect(res.isError).toBe(true);
+      expect(completionPuts()).toHaveLength(0);
+      expect(verificationPuts()).toHaveLength(0);
+      expect(transitions()).toHaveLength(0);
+    });
+  }
+
+  it("does not weaken ownership — a human-gate ticket is refused even with a valid verification", async () => {
+    const res = await report({
+      ticket_id: "TEAM-4002", summary: "x", workflow_id: "wf1",
+      agent_id: "agentcore_hub_backend_dev",
+      verification: { target_ticket_id: "TEAM-3050", head_sha: SHA, kind: "review", verdict: "pass" },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/REFUSED/);
+    expect(completionPuts()).toHaveLength(0);
+    expect(verificationPuts()).toHaveLength(0);
   });
 });

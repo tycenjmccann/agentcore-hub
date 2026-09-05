@@ -499,6 +499,12 @@ REMOTE_CODING_TURN_DEADLINE_S = int(os.getenv(
     "REMOTE_CODING_TURN_DEADLINE_S",
     str(REMOTE_CODING_READ_TIMEOUT + 2 * REMOTE_CODING_TURN_BUDGET_S),
 ))
+# TEAM-3992 D4.3 — while a coding turn is being polled "running", the poll loop
+# emits an agent.streaming heartbeat at most this often. The orchestrator's
+# lease.lastAgentActivity counts ANY agent.streaming row, so a heartbeat renews
+# the lease and a long silent coding session isn't reaped as dead. Throttled so
+# a multi-minute turn produces a steady trickle, not one row per poll.
+HEARTBEAT_MIN_INTERVAL_S = int(os.environ.get("HEARTBEAT_MIN_INTERVAL_S", "60"))
 
 # Tenant the workflow session rows belong to. Multi-tenant deployments must set
 # this to the tenant that owns the fleet, or the Cloud Code tab (which scopes
@@ -679,6 +685,41 @@ def _deadline_expired_error() -> dict:
             "no_retry_hint": True}
 
 
+def _publish_coding_heartbeat(turn_id: str, poll_status: str):
+    """TEAM-3992 D4.3 — emit an agent.streaming heartbeat while a coding turn is
+    polling "running". A long-running coding session is otherwise silent between
+    the submit and its terminal verdict, and the orchestrator's
+    lease.lastAgentActivity (which counts ANY agent.streaming row, regardless of
+    the detail `type`) would go stale and the persona could be reaped as dead.
+    Writing this row renews that lease. Rides the same events-table path and the
+    same _ddb_events_client that model-text/trace streaming uses; best-effort, a
+    failure here must never break the poll loop."""
+    import time, random, string
+    try:
+        event_id = f"{int(time.time() * 1000)}-hb-{''.join(random.choices(string.ascii_lowercase, k=4))}"
+        detail = {
+            "agentId": {"S": _CURRENT_AGENT_ID},
+            "type": {"S": "heartbeat"},
+            "turn_id": {"S": str(turn_id)},
+            "poll_status": {"S": str(poll_status)},
+            "workflowId": {"S": _CURRENT_WORKFLOW_ID},
+        }
+        if _CURRENT_TICKET_ID:
+            detail["ticketId"] = {"S": _CURRENT_TICKET_ID}
+        _ddb_events_client.put_item(
+            TableName=_EVENTS_TABLE,
+            Item={
+                "workflowId": {"S": _CURRENT_WORKFLOW_ID},
+                "eventId": {"S": event_id},
+                "type": {"S": "agent.streaming"},
+                "detail": {"M": detail},
+                "timestamp": {"S": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+            },
+        )
+    except Exception as e:  # noqa: BLE001 — heartbeat is best-effort liveness
+        logger.warning(f"[{_CURRENT_AGENT_ID}] Failed to publish coding heartbeat: {e}")
+
+
 def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
                       budget_s: int | None = None) -> dict:
     """Poll an async coding turn to its terminal state. Returns the done record
@@ -707,6 +748,11 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
     # wedged-yet-heartbeating runner must not pin this persona forever.
     hard_stop = time.time() + 2 * budget
     unknowns = 0
+    # TEAM-3992 D4.3 — heartbeat throttle. Seeded to loop entry so the first
+    # heartbeat fires after one full HEARTBEAT_MIN_INTERVAL_S of "running"
+    # (never on the very first poll), which keeps at-most-once-per-interval
+    # trivially true even for a turn that finishes within the first interval.
+    last_heartbeat = time.monotonic()
     while time.time() < min(deadline, hard_stop) and (
             outer_deadline is None or time.monotonic() < outer_deadline):
         time.sleep(REMOTE_CODING_POLL_S)
@@ -753,6 +799,14 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
         if state == "running":
             deadline = max(deadline,
                            time.time() + max(3 * REMOTE_CODING_POLL_S, 120))
+            # TEAM-3992 D4.3 — renew the orchestrator lease. Emitted ONLY while
+            # "running" and AT MOST once per HEARTBEAT_MIN_INTERVAL_S so a long
+            # silent coding session keeps lease.lastAgentActivity fresh without
+            # flooding the events table with one row per poll.
+            now = time.monotonic()
+            if now - last_heartbeat >= HEARTBEAT_MIN_INTERVAL_S:
+                _publish_coding_heartbeat(turn_id, state)
+                last_heartbeat = now
     # Budget spent with no live heartbeat seen recently and no verdict. The
     # turn may STILL have completed its work — a blind re-run is not safe.
     # Probe once more, then tell the persona to VERIFY STATE WITHOUT running a
@@ -1074,9 +1128,14 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         # Do NOT fall back to a local CLI run: the session's workspace lives on
         # the coding runtime, and a local run would fork it (split-brain).
         logger.warning(f"[remote-coding] turn failed: {str(e)[:300]}")
+        # An exception escaping submit/poll here is an InvokeAgentRuntime-level
+        # failure — the coding runtime itself was unreachable (transport/SDK), NOT
+        # a CLI error the runtime reported back in-band. Tag it so the orchestrator
+        # health gate can fold a burst into one outage.
         _publish_agent_error(_CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID,
                              f"remote {cli} turn failed: {str(e)[:300]}",
-                             ticket_id=_CURRENT_TICKET_ID)
+                             ticket_id=_CURRENT_TICKET_ID,
+                             error_kind="runtime_unreachable")
         return (f"ERROR: remote {cli} turn failed: {str(e)[:300]}. "
                 f"Retry this same {cli} call — the session workspace is preserved.")
 
@@ -1719,7 +1778,7 @@ def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: 
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", verification: dict = None, findings: list = None) -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -1729,14 +1788,21 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         branch: Git branch name (for dev agents)
         commit_sha: Git commit SHA (for dev agents)
         pr_url: Pull request URL (for dev agents)
+        verification: Optional structured verification object for a fix/re-arm ticket (e.g. {target_ticket_id, head_sha, kind, verdict})
+        findings: Optional list of structured findings (e.g. [{component, severity, summary, files}])
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
-    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", {
+    payload = {
         "ticket_id": ticket_id, "summary": summary,
         "artifacts": artifacts, "branch": branch, "commit_sha": commit_sha, "pr_url": pr_url,
         "workflow_id": _CURRENT_WORKFLOW_ID,
         "agent_id": _CURRENT_AGENT_ID,
-    })
+    }
+    if verification is not None:
+        payload["verification"] = verification
+    if findings is not None:
+        payload["findings"] = findings
+    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", payload)
 
 
 @tool
@@ -2858,7 +2924,7 @@ _AGENT_ERROR_PUBLISH_BACKOFF_S = (0.5, 1.0)
 
 
 def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
-                         ticket_id: str = "") -> None:
+                         ticket_id: str = "", error_kind: str = "") -> None:
     """Surface a failure to the events table so the workflow board and nudge
     system can see it — a detached-run crash (a detached task has no caller to
     error to) or a failed nested coding-runtime handoff (TEAM-3119: those used
@@ -2890,6 +2956,13 @@ def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
                             "workflowId": {"S": workflow_id or "unknown"},
                             "ticketId": {"S": ticket_id or ""},
                             "error": {"S": (error or "")[:1000]},
+                            # TEAM-3992 D4.2: distinguish "the coding runtime was
+                            # unreachable" (an InvokeAgentRuntime SDK failure) from
+                            # an ordinary CLI failure, so the orchestrator's health
+                            # gate can correlate a burst of these to ONE outage
+                            # instead of N independent agent errors. Omitted when
+                            # empty so existing consumers are unaffected.
+                            **({"errorKind": {"S": error_kind}} if error_kind else {}),
                         }},
                         "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
                                       + f".{digits}Z"},

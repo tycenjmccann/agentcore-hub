@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createDetector } from "./dead-session-detector.mjs";
 import { SWEEP_ROTATION_QUANTUM_MS } from "./sweep-scan.mjs";
+// R3: the stall path's DECISION lives in lease.mjs — the tests wire the REAL
+// leaseVerdict (which composes the real isLeaseLive internally), never a stub.
+import { leaseVerdict as realLeaseVerdict } from "./lease.mjs";
+import { resolveStallSoftTimeoutMs } from "./watchdog.mjs";
 
 /**
  * TEAM-3618 D1.2 — the orchestrator dead-session sweep. Every effect is
@@ -1243,5 +1247,262 @@ describe("synthesized completion (D1.2 trigger a)", () => {
     await runSweep("shadow");
 
     expect(synthesizeCompletion).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * TEAM-3992 D4.3 — the absolute stall soft-timeout. A claim still WITHIN its
+ * lease TTL (guard 1 passes, isLeaseLive true) but silent past the activity-based
+ * soft-timeout is a candidate stall — the hung-tool-call / wedged-coding-turn
+ * class the TTL alone shelters for up to a full 30 min. The DECISION is
+ * lease.leaseVerdict + cascade.reconcileDependent (R3): these tests wire the REAL
+ * leaseVerdict and assert the detector only ever calls verdict / OTEL / steal /
+ * reconcile — never re-derives liveness locally.
+ *
+ * Replay of the 4v1ykk TEAM-2609 incident: a task started at T0 with its last
+ * agent.streaming at T0 and ZERO events afterwards, whose lease TTL still reads
+ * live 10 min later. Silence sits between the 10-min soft-timeout and the 20-min
+ * hard ceiling, so the detector must NOT steal on silence alone — it confirms
+ * against OTEL spans first, and steals only past the hard ceiling when OTEL is off.
+ *
+ * The stall path is DARK unless cascade + resolveStallSoftTimeout + leaseVerdict
+ * are all wired, so every pre-D4.3 test above runs it as a no-op (stallEnabled
+ * false) — those suites are unaffected.
+ */
+describe("D4.3 stall soft-timeout", () => {
+  const SOFT = 600_000;          // 10-min activity-based soft-timeout
+  const HARD = 2 * SOFT;         // 20-min absolute hard ceiling (leaseVerdict default)
+  // Silence in [soft, hard): started 10min01s ago, last heartbeat = start (T0).
+  const SOFT_STALE_STARTED = new Date(NOW - (SOFT + 1000)).toISOString();
+
+  /**
+   * Build a detector wired for the stall path over ONE live-TTL claim. The
+   * guard-1 isLeaseLive stub returns true (enter the live-lease branch); the REAL
+   * leaseVerdict then does the soft-timeout refinement off its own internal
+   * isLeaseLive. `otel` unwired ⇒ OTEL "off" (no query issued).
+   */
+  function makeStall(overrides = {}) {
+    const {
+      startedAt = SOFT_STALE_STARTED,
+      deadSessionRetries,
+      resolveStallSoftTimeout = () => SOFT,
+      loadWorkflowDef = () => undefined,
+      otel, // undefined ⇒ OTEL off (dep unwired, no query)
+      ...depOverrides
+    } = overrides;
+    const wf = makeWorkflow({
+      agentTasks: { "TEAM-2": { ...deadTask, startedAt } },
+      ...(deadSessionRetries ? { deadSessionRetries } : {}),
+    });
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), ...depOverrides });
+    lease.isLeaseLive.mockReturnValue(true); // guard 1: still inside the lease TTL
+    lease.leaseVerdict = realLeaseVerdict;   // R3: the real verdict from lease.mjs
+    const cascade = { reconcileDependent: vi.fn(async () => ({ outcome: "redispatched" })) };
+    deps.cascade = cascade;
+    deps.resolveStallSoftTimeout = resolveStallSoftTimeout;
+    deps.loadWorkflowDef = loadWorkflowDef;
+    if (otel) deps.otel = otel;
+    return { deps, store, lease, cascade, wf };
+  }
+
+  const otelReturning = (value) => ({ lastOtelActivity: vi.fn(async () => value) });
+  const stalledEvents = (fn) => eventsOfType(fn, "agent.stalled");
+
+  it("(a) OTEL off, silence below the hard ceiling → soft-stale, NEVER stolen", async () => {
+    const { deps, store, lease } = makeStall(); // no otel dep
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.softStale).toBe(1);
+    expect(m.stalled).toBe(0);
+    expect(m.otelQueries).toBe(0);           // OTEL never consulted
+    expect(m.skippedLiveLease).toBe(1);      // fell through to the plain no-op
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(stalledEvents(deps.publishEvent)).toHaveLength(0);
+  });
+
+  it("(b) OTEL on, query returns null → stolen ONCE, agent.stalled(confirmedBy:otel), one reconcileDependent, one stealClaim", async () => {
+    const otel = otelReturning(null); // queried, no span → confirmed dead
+    const { deps, store, lease, cascade } = makeStall({ otel });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.otelQueries).toBe(1);
+    expect(otel.lastOtelActivity).toHaveBeenCalledTimes(1);
+    // Keyed on the ticket id (fleet turns always stamp it), soft window as the OTEL window.
+    expect(otel.lastOtelActivity.mock.calls[0][0]).toMatchObject({ ticketId: "TEAM-2", windowMs: SOFT });
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(lease.stealClaim).toHaveBeenCalledWith(deps.ddb, "workflows", "wf_1", "TEAM-2", SOFT_STALE_STARTED);
+    const stalled = stalledEvents(deps.publishEvent);
+    expect(stalled).toHaveLength(1);
+    expect(stalled[0][2]).toMatchObject({
+      workflowId: "wf_1", ticketId: "TEAM-2", agentId: "dev",
+      confirmedBy: "otel", softTimeoutMs: SOFT, lastSpan: null,
+    });
+    expect(cascade.reconcileDependent).toHaveBeenCalledTimes(1);
+    expect(cascade.reconcileDependent.mock.calls[0][1]).toBe("stall-detector");
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(m.stalled).toBe(1);
+    expect(m.escalations).toBe(0);
+  });
+
+  it("(c) a re-dispatched claim with a fresh startedAt/activity is live again → not re-stolen", async () => {
+    // The re-dispatch minted a new generation 1s ago — verdict #1 is "live".
+    const { deps, lease, cascade } = makeStall({ startedAt: new Date(NOW - 1000).toISOString(), otel: otelReturning(null) });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.softStale).toBe(0);
+    expect(m.stalled).toBe(0);
+    expect(m.skippedLiveLease).toBe(1);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(cascade.reconcileDependent).not.toHaveBeenCalled();
+    expect(stalledEvents(deps.publishEvent)).toHaveLength(0);
+  });
+
+  it("(d) a SECOND stall on the same ticket escalates — no second re-dispatch", async () => {
+    const { deps, store, cascade, lease } = makeStall({ otel: otelReturning(null), deadSessionRetries: { "TEAM-2": 1 } });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    // The steal + agent.stalled still happen (the claim IS stalled)…
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(stalledEvents(deps.publishEvent)).toHaveLength(1);
+    // …but the retry budget is exhausted: escalate, never re-dispatch.
+    expect(cascade.reconcileDependent).not.toHaveBeenCalled();
+    const esc = eventsOfType(deps.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    expect(esc[0][2].reason).toBe("stall_retry_exhausted");
+    expect(esc[0][2].detectorMeta).toMatchObject({ stall: true, confirmedBy: "otel" });
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "stall_retry_exhausted");
+    expect(store.appendNotification).toHaveBeenCalledTimes(1);
+    expect(store.appendNotification.mock.calls[0][1].type).toBe("manager_escalation");
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(m.stalled).toBe(1);
+    expect(m.escalations).toBe(1);
+  });
+
+  it("(e) 4v1ykk silence (1,439,754 ms) with OTEL off → hard-timeout stale, stolen, confirmedBy:hard-timeout", async () => {
+    // The exact incident silence: past the 20-min hard ceiling, still inside the
+    // 30-min lease TTL — caught with NO OTEL query needed.
+    const started = new Date(NOW - 1_439_754).toISOString();
+    const { deps, lease, cascade } = makeStall({ startedAt: started }); // OTEL off
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.otelQueries).toBe(0);        // hard ceiling alone; never queried
+    expect(m.softStale).toBe(0);          // verdict #1 was "stale", not soft-stale
+    expect(lease.stealClaim).toHaveBeenCalledWith(deps.ddb, "workflows", "wf_1", "TEAM-2", started);
+    const stalled = stalledEvents(deps.publishEvent);
+    expect(stalled).toHaveLength(1);
+    expect(stalled[0][2].confirmedBy).toBe("hard-timeout");
+    expect(stalled[0][2].silenceMs).toBe(1_439_754);
+    expect(cascade.reconcileDependent).toHaveBeenCalledTimes(1);
+    expect(m.stalled).toBe(1);
+  });
+
+  it("(f) a per-def stallSoftTimeoutMs override flows through the REAL resolver into the verdict + event", async () => {
+    // def raises the soft-timeout to 5 min → hard ceiling 10 min. The 10min01s
+    // silence clears that hard ceiling, so it is stolen and the event carries the
+    // overridden soft-timeout (proving loadWorkflowDef → resolveStallSoftTimeoutMs).
+    const { deps, lease } = makeStall({
+      resolveStallSoftTimeout: resolveStallSoftTimeoutMs, // the REAL resolver
+      loadWorkflowDef: () => ({ stallSoftTimeoutMs: 300_000 }),
+    });
+    const { runSweep } = createDetector(deps);
+
+    await runSweep("enforce");
+
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+    const stalled = stalledEvents(deps.publishEvent);
+    expect(stalled).toHaveLength(1);
+    expect(stalled[0][2].softTimeoutMs).toBe(300_000);
+    expect(stalled[0][2].confirmedBy).toBe("hard-timeout");
+  });
+
+  it("(g) the soft-timeout is floored at 2× the heartbeat interval even when the def sets a tiny value", async () => {
+    // def asks for 1s; the floor (2×15000 legacy heartbeat = 30000) wins. 70s of
+    // silence clears the 60s hard ceiling → stolen, event carries the FLOOR.
+    const { deps, lease } = makeStall({
+      startedAt: new Date(NOW - 70_000).toISOString(),
+      resolveStallSoftTimeout: resolveStallSoftTimeoutMs,
+      loadWorkflowDef: () => ({ stallSoftTimeoutMs: 1000 }),
+    });
+    const { runSweep } = createDetector(deps);
+
+    await runSweep("enforce");
+
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+    const stalled = stalledEvents(deps.publishEvent);
+    expect(stalled).toHaveLength(1);
+    expect(stalled[0][2].softTimeoutMs).toBe(30_000); // the floor, not 1000
+  });
+
+  it("(h) OTEL query returns a RECENT span → live, not stolen", async () => {
+    const otel = otelReturning(new Date(NOW - 1000).toISOString()); // a span 1s ago
+    const { deps, lease, cascade } = makeStall({ otel });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.softStale).toBe(1);
+    expect(m.otelQueries).toBe(1);
+    expect(m.stalled).toBe(0);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(cascade.reconcileDependent).not.toHaveBeenCalled();
+    expect(stalledEvents(deps.publishEvent)).toHaveLength(0);
+  });
+
+  it("(i) OTEL query returns undefined (error / over-budget) → stays soft-stale, not stolen", async () => {
+    const otel = otelReturning(undefined); // unknown — never escalates on its own
+    const { deps, lease } = makeStall({ otel });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.softStale).toBe(1);
+    expect(m.otelQueries).toBe(1);
+    expect(m.stalled).toBe(0);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(stalledEvents(deps.publishEvent)).toHaveLength(0);
+  });
+
+  it("shadow mode observes a would-stall and writes NOTHING (no OTEL, no steal)", async () => {
+    // Below the hard ceiling shadow can't confirm (OTEL is enforce-only), so it
+    // stays soft-stale; at/above the hard ceiling it would-stall observe-only.
+    const started = new Date(NOW - 1_439_754).toISOString(); // past the hard ceiling
+    const { deps, store, lease, cascade } = makeStall({ startedAt: started });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("shadow");
+
+    expect(m.stalled).toBe(0);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(cascade.reconcileDependent).not.toHaveBeenCalled();
+    expect(stalledEvents(deps.publishEvent)).toHaveLength(0);
+  });
+
+  it("the pre-D4.3 detector (no stall deps wired) leaves the live-lease branch a pure no-op", async () => {
+    // Guard 1 live, but cascade/resolveStallSoftTimeout/leaseVerdict unwired →
+    // stallEnabled false → the exact pre-D4.3 skippedLiveLease behavior.
+    const { deps, store, lease } = makeDeps();
+    lease.isLeaseLive.mockReturnValue(true);
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.skippedLiveLease).toBe(1);
+    expect(m.softStale).toBe(0);
+    expect(m.stalled).toBe(0);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
   });
 });

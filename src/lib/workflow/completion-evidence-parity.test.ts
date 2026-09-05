@@ -9,6 +9,8 @@ import {
   shipVerdictOf as shipVerdictTs,
   SHIP_PROVEN_OUTCOMES as PROVEN_TS,
   ACCEPTED_SHIP_OUTCOMES as ACCEPTED_TS,
+  // TEAM-3992 Q4/D3.2 twin.
+  fixVerificationGaps as fixGapsTs,
 } from "./completion-evidence";
 import {
   // TEAM-3991 D1.3 twins (the merge-probe result mappings).
@@ -28,6 +30,7 @@ import {
   shipVerdictOf as shipVerdictMjs,
   SHIP_PROVEN_OUTCOMES as PROVEN_MJS,
   ACCEPTED_SHIP_OUTCOMES as ACCEPTED_MJS,
+  fixVerificationGaps as fixGapsMjs,
 } from "../../../lambda/orchestrator/completion.mjs";
 import {
   mergeProbeFromPulls as mergeFromPullsMjs,
@@ -319,5 +322,151 @@ describe("TEAM-3991 D1.3 parity — mergeProbeFromPulls / mergeProbeFromCompare"
     const abandoned = [{ state: "closed", merge_commit_sha: "deadbeef", html_url: "u" }];
     expect(mergeFromPullsTs(abandoned)).toBeNull();
     expect(mergeFromPullsMjs(abandoned)).toBeNull();
+  });
+});
+
+/**
+ * TEAM-3992 Q4/D3.2 parity — the SHA-pinned fix-verification gate.
+ *
+ * The HTTP complete route (fix_unverified 409) and the orchestrator's
+ * completeWorkflow must agree, on the SAME children × agentTasks × fixRearm
+ * matrix, on exactly which done fix tickets were NOT re-verified at their final
+ * commit SHA. A drift means one surface closes a run green while the other holds
+ * it open on a fix whose re-review never landed at the code that shipped.
+ */
+describe("TEAM-3992 Q4/D3.2 parity — fixVerificationGaps", () => {
+  const REARM = { review_fix: ["review", "ci"], qa_fix: ["review", "ci", "verification"], codex_fix: ["review", "ci"] };
+  const SHA_LONG = "abcdef1234567890abcdef1234567890abcdef12";
+  const SHA_SHORT = "abcdef1";
+  const SHA_OTHER = "9999999";
+
+  // A verifier task carrying a verification record for a target fix.
+  const v = (targetTicketId: string, headSha: string, kind: string, verdict: string) => ({
+    ticketId: `V-${kind}`,
+    verification: { targetTicketId, headSha, kind, verdict },
+  });
+
+  const CASES: Array<[string, unknown, Record<string, unknown>, Record<string, string[]> | null | undefined]> = [
+    ["no fixRearm → inert", [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }], {}, null],
+    ["fixRearm not object", [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }], {}, undefined],
+    ["children not array", null, {}, REARM],
+    [
+      "review_fix fully re-verified (short↔long sha)",
+      [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }],
+      {
+        F1: { ticketId: "F1", commitSha: SHA_LONG },
+        va: v("F1", SHA_SHORT, "review", "pass"),
+        vb: v("F1", SHA_LONG, "ci", "pass"),
+      },
+      REARM,
+    ],
+    [
+      "review_fix missing ci",
+      [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }],
+      { F1: { ticketId: "F1", commitSha: SHA_LONG }, va: v("F1", SHA_LONG, "review", "pass") },
+      REARM,
+    ],
+    [
+      "review_fix verified at WRONG sha",
+      [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }],
+      {
+        F1: { ticketId: "F1", commitSha: SHA_LONG },
+        va: v("F1", SHA_OTHER, "review", "pass"),
+        vb: v("F1", SHA_OTHER, "ci", "pass"),
+      },
+      REARM,
+    ],
+    [
+      "review verdict fail (not pass)",
+      [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }],
+      {
+        F1: { ticketId: "F1", commitSha: SHA_LONG },
+        va: v("F1", SHA_LONG, "review", "fail"),
+        vb: v("F1", SHA_LONG, "ci", "pass"),
+      },
+      REARM,
+    ],
+    [
+      "fix with no commitSha",
+      [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }],
+      { F1: { ticketId: "F1" } },
+      REARM,
+    ],
+    [
+      "fix not done yet",
+      [{ ticketId: "F1", status: "in_progress", spawnedBy: { kind: "review_fix" } }],
+      { F1: { ticketId: "F1", commitSha: SHA_LONG } },
+      REARM,
+    ],
+    [
+      "re-arm ticket itself is not a fix",
+      [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix", rearmOf: "F0" } }],
+      { F1: { ticketId: "F1", commitSha: SHA_LONG } },
+      REARM,
+    ],
+    [
+      "non-fix done ticket ignored",
+      [{ ticketId: "T1", status: "done", assignee: "agentcore_hub_backend_dev" }],
+      { T1: { ticketId: "T1", commitSha: SHA_LONG } },
+      REARM,
+    ],
+    [
+      "qa_fix needs review+ci+verification, has all (verification kind = qa)",
+      [{ ticketId: "F2", status: "done", spawnedBy: { kind: "qa_fix" } }],
+      {
+        F2: { ticketId: "F2", commitSha: SHA_LONG },
+        va: v("F2", SHA_LONG, "review", "pass"),
+        vb: v("F2", SHA_LONG, "ci", "pass"),
+        vc: v("F2", SHA_LONG, "qa", "pass"),
+      },
+      REARM,
+    ],
+    [
+      "qa_fix missing qa record",
+      [{ ticketId: "F2", status: "done", spawnedBy: { kind: "qa_fix" } }],
+      {
+        F2: { ticketId: "F2", commitSha: SHA_LONG },
+        va: v("F2", SHA_LONG, "review", "pass"),
+        vb: v("F2", SHA_LONG, "ci", "pass"),
+      },
+      REARM,
+    ],
+    [
+      "epic child skipped",
+      [{ ticketId: "E", type: "epic", status: "done", spawnedBy: { kind: "review_fix" } }],
+      { E: { ticketId: "E", commitSha: SHA_LONG } },
+      REARM,
+    ],
+    [
+      "two fixes, one green one gapped",
+      [
+        { ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } },
+        { ticketId: "F3", status: "done", spawnedBy: { kind: "codex_fix" } },
+      ],
+      {
+        F1: { ticketId: "F1", commitSha: SHA_LONG },
+        va: v("F1", SHA_LONG, "review", "pass"),
+        vb: v("F1", SHA_LONG, "ci", "pass"),
+        F3: { ticketId: "F3", commitSha: SHA_OTHER },
+      },
+      REARM,
+    ],
+    ["null entries in agentTasks tolerated", [{ ticketId: "F1", status: "done", spawnedBy: { kind: "review_fix" } }], { x: null as unknown as Record<string, unknown>, F1: { ticketId: "F1", commitSha: SHA_LONG } }, REARM],
+  ];
+
+  for (const [label, children, agentTasks, fixRearm] of CASES) {
+    it(`agrees on ${label}`, () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ts = fixGapsTs(children as any, agentTasks as any, fixRearm as any);
+      const mjs = fixGapsMjs(children, agentTasks, fixRearm);
+      expect(mjs).toEqual(ts);
+    });
+  }
+
+  it("pins the gap truth for the mixed two-fix case", () => {
+    const [, children, agentTasks, fixRearm] = CASES.find((c) => c[0] === "two fixes, one green one gapped")!;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const gaps = fixGapsTs(children as any, agentTasks as any, fixRearm as any);
+    expect(gaps).toEqual([{ ticketId: "F3", commitSha: SHA_OTHER, missingKinds: ["review", "ci"] }]);
   });
 });

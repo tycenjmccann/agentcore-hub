@@ -4,6 +4,9 @@ import {
   applyAgentComplete,
   canRegressCompletedTask,
   shouldForceTicketDone,
+  isRuntimeBlocked,
+  blockReasonLabel,
+  ticketBlockLabel,
 } from "./board-state";
 import type { AgentTask } from "./types";
 
@@ -125,5 +128,44 @@ describe("shouldForceTicketDone", () => {
 
   it("forces done when timestamps are missing (legacy behavior)", () => {
     expect(shouldForceTicketDone({ status: "complete" }, { status: "in_progress" })).toBe(true);
+  });
+
+  // TEAM-3992 D4.2 — a ticket the orchestrator parked blocked:runtime is waiting
+  // to be RESUMED by the recovery sweep, not finished. A stale completed agentTask
+  // (from before the outage) must NEVER force it back to "done", even with the
+  // legacy no-timestamp path that would otherwise force it.
+  it("never forces done a runtime-blocked ticket, even with no timestamps", () => {
+    expect(shouldForceTicketDone({ status: "complete" }, { status: "blocked", blockReason: "runtime" })).toBe(false);
+    expect(shouldForceTicketDone(doneTask, { status: "blocked", blockReason: "runtime", updatedAt: T_LATE })).toBe(false);
+  });
+
+  it("still forces done a plainly-blocked ticket (a non-runtime block is not special)", () => {
+    // Only the runtime park is protected; a bare `blocked` with no runtime reason
+    // keeps the pre-D4.2 Jira-lag override behavior.
+    expect(shouldForceTicketDone({ status: "complete" }, { status: "blocked" })).toBe(true);
+  });
+});
+
+describe("TEAM-3992 D4.2 — runtime-block predicates + labels", () => {
+  it("isRuntimeBlocked: only blocked + blockReason 'runtime'", () => {
+    expect(isRuntimeBlocked({ status: "blocked", blockReason: "runtime" })).toBe(true);
+    expect(isRuntimeBlocked({ status: "blocked", blockReason: "dependency" })).toBe(false);
+    expect(isRuntimeBlocked({ status: "blocked" })).toBe(false);
+    expect(isRuntimeBlocked({ status: "in_progress", blockReason: "runtime" })).toBe(false);
+    expect(isRuntimeBlocked(undefined)).toBe(false);
+  });
+
+  it("blockReasonLabel: 'runtime' → 'runtime outage'; unknown passes through; empty → null", () => {
+    expect(blockReasonLabel("runtime")).toBe("runtime outage");
+    expect(blockReasonLabel("dependency")).toBe("dependency");
+    expect(blockReasonLabel(null)).toBeNull();
+    expect(blockReasonLabel(undefined)).toBeNull();
+  });
+
+  it("ticketBlockLabel: full board label, only for blocked tickets", () => {
+    expect(ticketBlockLabel({ status: "blocked", blockReason: "runtime" })).toBe("Blocked: runtime outage");
+    expect(ticketBlockLabel({ status: "blocked" })).toBe("Blocked");
+    expect(ticketBlockLabel({ status: "ready" })).toBeNull();
+    expect(ticketBlockLabel(undefined)).toBeNull();
   });
 });

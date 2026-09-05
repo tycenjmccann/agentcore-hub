@@ -95,9 +95,27 @@ export function createDetector(deps) {
     // TEAM-3991 D1.2 — optional: harvest GitHub evidence for a dead session that
     // did the work but never reported it. Absent ⇒ the old retry/escalate path.
     synthesizeCompletion,
+    // TEAM-3992 D4.3 — the absolute stall soft-timeout path. ALL four are
+    // optional and the path stays DARK unless every one is wired, so the
+    // pre-D4.3 detector (and its whole test suite) is byte-for-byte unaffected:
+    //   cascade              — reconcileDependent, the R3-safe re-dispatch used
+    //                          for the ONE stall retry (never a bespoke steal loop).
+    //   otel                 — lastOtelActivity, the span-confirmation probe.
+    //   resolveStallSoftTimeout(wfDef, agentId) — the per-def soft-timeout knob.
+    //   loadWorkflowDef(id)  — resolve a workflow def for its stallSoftTimeoutMs.
+    cascade,
+    otel,
+    resolveStallSoftTimeout,
+    loadWorkflowDef,
+    otelBudgetPerSweep = 5,
     now = () => Date.now(),
     log = (msg) => console.log(`[orchestrator] ${msg}`),
   } = deps;
+
+  // The stall soft-timeout path is enabled only when every effect it needs is
+  // wired AND lease.mjs exposes the pure verdict (R3: the DECISION lives there,
+  // never here). Absent ⇒ the live-lease branch is the pre-D4.3 no-op.
+  const stallEnabled = !!(cascade && resolveStallSoftTimeout && lease?.leaseVerdict);
 
   // agentId → { medianMs, sampleCount, computedAt }. Refreshed once per sweep
   // interval; a busy fleet reuses one median across the whole sweep.
@@ -265,6 +283,170 @@ export function createDetector(deps) {
   }
 
   /**
+   * TEAM-3992 D4.3 — the absolute stall soft-timeout, evaluated ONLY inside the
+   * live-lease branch (a claim still within its lease TTL that has nonetheless
+   * gone silent past the activity-based soft-timeout — a hung tool call / wedged
+   * coding turn the TTL alone would shelter for up to 30 min).
+   *
+   * R3: the detector does NO liveness math. lease.leaseVerdict is the sole
+   * decision — it composes isLeaseLive and layers the soft-timeout + OTEL/hard-
+   * ceiling refinement. The flow:
+   *   verdict #1 (OTEL unknown):
+   *     "live"       → return false (fall back to the plain skippedLiveLease no-op).
+   *     "stale"      → the absolute HARD ceiling (2× soft) passed with no OTEL
+   *                    needed — the 4v1ykk TEAM-2609 class; confirmedBy=hard-timeout.
+   *     "soft-stale" → below the hard ceiling: query OTEL spans and re-verdict.
+   *   OTEL re-verdict (enforce only, observe-only shadow has zero side effects):
+   *     "stale" (span absent / older than the window) → confirmedBy=otel.
+   *     anything else (renewed / still-unknown / off / over-budget) → return false;
+   *                    silence alone below the hard ceiling NEVER steals.
+   * On a confirmed stall (enforce): stamp → TOCTOU re-verdict → steal → emit
+   * agent.stalled → try synthesize → ONE re-dispatch via reconcileDependent under
+   * the shared retry budget (second stall escalates). Returns true when the stall
+   * path took the candidate (steal, shadow-observe, or resurrection), false when
+   * the candidate should fall through to the normal live-lease handling.
+   */
+  async function maybeHandleStall(ctx) {
+    const { workflow, ticketId, task, agentId, ticket, lastActivity, mode, m, startedAtMs, sweepId, otelBudget } = ctx;
+    const wfDef = loadWorkflowDef ? loadWorkflowDef(workflow.workflowDefId) : undefined;
+    const softTimeoutMs = resolveStallSoftTimeout(wfDef, agentId);
+    const opts = { ttlMs: lease.LEASE_TTL_MS, softTimeoutMs };
+
+    // Verdict #1 — OTEL UNKNOWN (undefined). No local liveness math (R3).
+    let verdict = lease.leaseVerdict(task, lastActivity, undefined, startedAtMs, opts);
+    if (verdict === "live") return false; // a heartbeat inside the soft window
+
+    // Silence + lastSpan are for the event payload only — never the decision.
+    const startedMs = task.startedAt ? Date.parse(task.startedAt) : 0;
+    const activityMs = lastActivity ? Date.parse(lastActivity) : 0;
+    const silenceMs = startedAtMs - Math.max(startedMs, activityMs);
+    // The agentTask carries no sessionId (it is minted at invoke time and stamped
+    // onto the OTEL spans + events, not the claim). Pass whatever is present and
+    // let the probe key on ticket.id, which fleet turns always stamp.
+    const sessionId = task.sessionId || undefined;
+
+    let confirmedBy;
+    let otelIso;      // undefined = OTEL not queried (the sentinel leaseVerdict reads)
+    let lastSpan = null;
+
+    if (verdict === "soft-stale") {
+      m.softStale++;
+      // Confirm against OTEL spans before stealing a possibly-still-working agent.
+      // Only in enforce mode (shadow must have zero side effects) and only wired.
+      if (mode === "enforce" && otel) {
+        m.otelQueries++;
+        otelIso = await otel.lastOtelActivity({ sessionId, ticketId, windowMs: softTimeoutMs }, otelBudget);
+        verdict = lease.leaseVerdict(task, lastActivity, otelIso, startedAtMs, opts);
+      }
+      if (verdict !== "stale") {
+        log(`detector.soft_stale — ${ticketId} agent=${agentId} silence=${silenceMs}ms soft=${softTimeoutMs}ms verdict=${verdict} (sweep ${sweepId})`);
+        return false; // unconfirmed / renewed — leave it for a later sweep, never steal on silence alone
+      }
+      // Reaching stale in the soft branch means OTEL was queried and confirmed
+      // death (null = no span, or a span older than the soft window).
+      confirmedBy = "otel";
+      if (typeof otelIso === "string") lastSpan = { timestamp: otelIso, sessionId: sessionId || null };
+    } else {
+      // verdict === "stale" straight from verdict #1: the hard ceiling passed
+      // (isLeaseLive was true at guard 1, so this is hard-timeout, never lease-expired).
+      confirmedBy = "hard-timeout";
+    }
+
+    // ── SHADOW: observe only, zero writes. ──
+    if (mode !== "enforce") {
+      log(`detector.would_stall (shadow) — ${ticketId} agent=${agentId} confirmedBy=${confirmedBy} silence=${silenceMs}ms soft=${softTimeoutMs}ms (sweep ${sweepId})`);
+      return true;
+    }
+
+    // ── ENFORCE: recover the stalled session (mirrors the dead-session path). ──
+    // Sweep-idempotency stamp on the exact claim generation; a held stamp (residue
+    // of a prior partial sweep) is reused, not re-written (the CAS would lose).
+    const stamped = !!task.deadSessionDetectedAt
+      || await store.markDeadSessionDetected(workflow.id, ticketId, task.startedAt);
+    if (!stamped) {
+      log(`detector.stall_cas_lost — ${ticketId} (claim moved or already detected) (sweep ${sweepId})`);
+      return true;
+    }
+    // TOCTOU re-verdict (NOT isLeaseLive — the soft-timeout must survive a still-
+    // valid TTL). A heartbeat since verdict #1 makes silence small → non-stale →
+    // abort the steal and clear the stamp, CAS'd to this exact generation.
+    const recheckActivity = await lease.lastAgentActivity(ddb, eventsTable, workflow.id, agentId, ticketId);
+    const recheckVerdict = lease.leaseVerdict(task, recheckActivity, otelIso, now(), opts);
+    if (recheckVerdict !== "stale") {
+      const cleared = await store.clearDeadSessionDetected(workflow.id, ticketId, task.startedAt);
+      log(`detector.stall_resurrected — ${ticketId} verdict=${recheckVerdict} after stamp; skipping steal, stamp ${cleared ? "cleared" : "clear CAS lost"} (sweep ${sweepId})`);
+      return true;
+    }
+    // Steal the stale generation (never forced — exact startedAt only).
+    const stole = await lease.stealClaim(ddb, workflowsTable, workflow.id, ticketId, task.startedAt);
+    if (!stole) {
+      log(`detector.stall_steal_lost — ${ticketId} claim moved after stamp (sweep ${sweepId})`);
+      return true;
+    }
+    m.stalled++;
+    await publishEvent(ticketId, "agent.stalled", {
+      workflowId: workflow.id, ticketId, agentId,
+      silenceMs, lastSpan, softTimeoutMs, confirmedBy,
+    });
+
+    // Salvage a stall that already delivered — identical to the dead-session
+    // path: skip re-dispatch, let the synthesize path drive the done cascade.
+    if (synthesizeCompletion) {
+      let salvaged = null;
+      try { salvaged = await synthesizeCompletion(workflow, ticket); }
+      catch (err) { log(`detector.synthesize_error — ${ticketId} ${err?.message || err} (sweep ${sweepId})`); }
+      if (salvaged?.synthesized) {
+        log(`detector.stall_synthesized — ${ticketId} evidence harvested from ${salvaged.branch}; skipping re-dispatch (sweep ${sweepId})`);
+        return true;
+      }
+    }
+
+    await stallRetryOrEscalate({ workflow, ticket, ticketId, agentId, confirmedBy, silenceMs, softTimeoutMs, m, startedAtMs, sweepId });
+    return true;
+  }
+
+  /**
+   * ONE re-dispatch per stalled ticket, then escalate — sharing the dead-session
+   * retry budget (workflow.deadSessionRetries) so a claim that dies and stalls
+   * cannot double its automatic retries. The re-dispatch itself goes through
+   * cascade.reconcileDependent (R3: the single lease/steal implementation): after
+   * the steal the task is "ready", so reconcile routes it through its
+   * ready→claim-CAS re-dispatch branch. The detector owns the budget bump +
+   * escalation because reconcile's ready branch (correctly) neither, mirroring
+   * retryOrEscalate's once-then-escalate policy.
+   */
+  async function stallRetryOrEscalate({ workflow, ticket, ticketId, agentId, confirmedBy, silenceMs, softTimeoutMs, m, startedAtMs, sweepId }) {
+    const priorRetries = workflow.deadSessionRetries?.[ticketId] || 0;
+    if (priorRetries === 0) {
+      await store.incrementDeadSessionRetry(workflow.id, ticketId);
+      // Re-read so reconcile sees the post-steal "ready" status (a dead lease).
+      const freshWorkflow = (await store.getWorkflow(workflow.id)) || workflow;
+      const { outcome } = await cascade.reconcileDependent(ticket, "stall-detector", freshWorkflow, m, "enforce");
+      log(`detector.stall_redispatch — ${ticketId} agent=${agentId} confirmedBy=${confirmedBy} outcome=${outcome} (sweep ${sweepId})`);
+    } else {
+      await publishEvent(ticketId, "agent.escalated", {
+        workflowId: workflow.id, ticketId, agentId,
+        reason: "stall_retry_exhausted",
+        detectorMeta: { stall: true, confirmedBy, silenceMs, softTimeoutMs, sweepId },
+      });
+      await store.setTaskStatus(workflow.id, ticketId, "error");
+      await blockTicket(ticketId, "stall_retry_exhausted");
+      await store.appendNotification(workflow.id, {
+        id: `notif_stall_${ticketId}_${new Date(startedAtMs).toISOString()}`,
+        type: "manager_escalation",
+        title: `Stalled session (retry exhausted): ${ticketId}`,
+        details: `Agent ${agentId} stalled twice on ${ticketId} (silence ${silenceMs}ms, confirmed by ${confirmedBy}). Auto-retry is exhausted — needs a human.`,
+        reviewer: "dead-session-detector",
+        ticketId,
+        timestamp: new Date(startedAtMs).toISOString(),
+        acknowledged: false,
+      });
+      m.escalations++;
+      log(`detector.stall_escalate — ${ticketId} agent=${agentId} retry exhausted (sweep ${sweepId})`);
+    }
+  }
+
+  /**
    * Run one sweep. `mode` is off | shadow | enforce (anything else is coerced
    * to shadow — fail safe). Returns a metrics summary (also emitted as an EMF
    * record) for observability + tests.
@@ -294,6 +476,10 @@ export function createDetector(deps) {
       // change to detection: both classes were already recovered by the
       // silence-vs-threshold math; this only makes the class observable.
       hungToolCalls: 0,
+      // TEAM-3992 D4.3 stall soft-timeout tallies (0 when the path is dark).
+      softStale: 0,   // live-lease claims that verdicted soft-stale this sweep
+      stalled: 0,     // confirmed stalls recovered (steal + agent.stalled)
+      otelQueries: 0, // OTEL span-confirmation queries actually issued
       retries: 0,
       escalations: 0,
       candidateErrors: 0,
@@ -304,6 +490,11 @@ export function createDetector(deps) {
       log(`dead-session sweep skipped (mode=off)`);
       return m;
     }
+
+    // One per-sweep OTEL query budget shared across every soft-stale candidate,
+    // so a fleet-wide stall can never fan out an unbounded number of Logs Insights
+    // queries (otel-activity.mjs charges { remaining } per real query).
+    const otelBudget = { remaining: otelBudgetPerSweep };
 
     const { workflows, matched, rotation, pages } = await scanNonTerminalWorkflows();
     if (matched > SWEEP_CAP) {
@@ -385,6 +576,18 @@ export function createDetector(deps) {
             ddb, eventsTable, workflow.id, agentId, ticketId
           );
           if (lease.isLeaseLive(task, lastActivity, startedAtMs)) {
+            // ── D4.3 STALL SOFT-TIMEOUT (optional): a lease still within its TTL
+            //    but silent past the activity-based soft-timeout may be a hung
+            //    agent. The verdict + recovery live in lease.mjs / cascade (R3);
+            //    dark unless every soft-timeout dep is wired. If it takes the
+            //    candidate (steal / shadow-observe / resurrection) we are done.
+            if (stallEnabled) {
+              const handled = await maybeHandleStall({
+                workflow, ticketId, task, agentId, ticket, lastActivity,
+                mode, m, startedAtMs, sweepId, otelBudget,
+              });
+              if (handled) continue;
+            }
             m.skippedLiveLease++;
             // A stamp on a LIVE lease is residue of a clear that failed or
             // raced (TEAM-3702) — retry the generation-CAS'd clear so the
@@ -545,7 +748,7 @@ export function createDetector(deps) {
 
     m.durationMs = now() - startedAtMs;
     emitMetrics(m);
-    log(`dead-session sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} fired=${m.fired} hungToolCalls=${m.hungToolCalls} retries=${m.retries} escalations=${m.escalations} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
+    log(`dead-session sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} fired=${m.fired} hungToolCalls=${m.hungToolCalls} softStale=${m.softStale} stalled=${m.stalled} otelQueries=${m.otelQueries} retries=${m.retries} escalations=${m.escalations} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
     return m;
   }
 
@@ -571,6 +774,9 @@ export function emitMetrics(m) {
           { Name: "DetectorSkippedLiveLease", Unit: "Count" },
           { Name: "DetectorFired", Unit: "Count" },
           { Name: "DetectorHungToolCalls", Unit: "Count" },
+          { Name: "DetectorSoftStale", Unit: "Count" },
+          { Name: "DetectorStalled", Unit: "Count" },
+          { Name: "DetectorOtelQueries", Unit: "Count" },
           { Name: "DetectorRetries", Unit: "Count" },
           { Name: "DetectorEscalations", Unit: "Count" },
           { Name: "DetectorCandidateErrors", Unit: "Count" },
@@ -584,6 +790,9 @@ export function emitMetrics(m) {
     DetectorSkippedLiveLease: m.skippedLiveLease,
     DetectorFired: m.fired,
     DetectorHungToolCalls: m.hungToolCalls || 0,
+    DetectorSoftStale: m.softStale || 0,
+    DetectorStalled: m.stalled || 0,
+    DetectorOtelQueries: m.otelQueries || 0,
     DetectorRetries: m.retries,
     DetectorEscalations: m.escalations,
     DetectorCandidateErrors: m.candidateErrors || 0,

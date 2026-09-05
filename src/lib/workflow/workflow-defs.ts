@@ -16,6 +16,9 @@
  */
 
 import workflowsConfig from "@/config/workflows.json";
+import { assertDagWellFormed, type TicketDag } from "./dag";
+
+export type { TicketDag, DagNode, DagEdge, ExtraNodeRule, FixRearm } from "./dag";
 
 export type WorkflowPhaseType = "app" | "agent";
 
@@ -155,6 +158,19 @@ export interface WorkflowDef {
   completionRequiresAgentPhases: string[];
   /** Optional human-review gates keyed by the agent phase they guard. */
   reviewGates?: ReviewGate[];
+  /**
+   * TEAM-3992 D3.4: the structural ticket-DAG contract this def's ticket plan
+   * must satisfy (nodes / required + forbidden edges / cardinality). Absent for
+   * non-code defs (marketing/sales/legal), which have no such contract.
+   * Validated at load by {@link assertDagWellFormed}; consumed by
+   * submit_ticket_plan (lambda/workflow-output) via lambda/orchestrator/dag.mjs.
+   */
+  ticketDag?: TicketDag;
+  /**
+   * TEAM-3992 D4.3 (reserved): per-def soft stall timeout in ms before the
+   * stall detector nudges a run. Optional; unset → the detector's default.
+   */
+  stallSoftTimeoutMs?: number;
   phases: WorkflowDefPhase[];
 }
 
@@ -168,6 +184,13 @@ const CONFIG = workflowsConfig as WorkflowsConfig;
 export const DEFAULT_WORKFLOW_DEF_ID = CONFIG.defaultWorkflowDefId;
 
 export const WORKFLOW_DEFS: WorkflowDef[] = CONFIG.workflows;
+
+// Fail fast on a malformed ticketDag (edge to an undeclared node, or a cyclic
+// edge set) the moment the config is loaded, rather than deep inside a run's
+// plan validation. A def with no ticketDag is skipped.
+for (const def of WORKFLOW_DEFS) {
+  if (def.ticketDag) assertDagWellFormed(def.ticketDag, `workflows.json[${def.id}].ticketDag`);
+}
 
 /**
  * Resolve a workflow definition by id. Falls back to the default definition

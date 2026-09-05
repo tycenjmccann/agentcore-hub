@@ -267,7 +267,9 @@ export async function runGateBypassCheck({ workflow, ticket, children, workflowD
 
     const { owner, repo } = parseRepo(workflow?.repoConfig);
     if (!owner || !repo) return { checked: false, reason: "no_repo" };
-    const base = workflow?.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    // Resolved default branch, passed by the caller (TEAM-3992 D4.1); the local
+    // repoConfig read is the fallback for callers that do not resolve it.
+    const base = deps.baseBranch || workflow?.repoConfig?.repos?.[0]?.defaultBranch || "main";
 
     const { merged, error } = await collectMergedPrs(githubFetch, {
       owner,

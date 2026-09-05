@@ -138,6 +138,13 @@ export function createReconcileSweep(deps) {
     readySlaMs,       // D2.3 — the (much tighter) floor for missed DISPATCHES
     gateBypassRecheck, // (workflow, ticketId) → re-run the deferred bypass check
     retryEpicRollup,   // (workflow) → discharge an outstanding epic roll-up
+    // TEAM-3992 D4.2 — while a coding-runtime outage object exists, coding
+    // tickets are owned by the runtime-health recovery sweep, NOT this one:
+    // re-driving them would dispatch straight into the dead microVM. Checked ONCE
+    // per sweep (a single S3 head), then applied per coding candidate as the
+    // reserved `runtime_outage` skip. Both optional — unset restores pre-D4.2 behaviour.
+    runtimeOutageActive, // async () → bool: is a coding-runtime outage open right now
+    isCodingTicket,      // (sibling) → bool: does this ticket's agent shell a coding CLI
     now = () => Date.now(),
     // Structured records (the skip reasons) are passed as OBJECTS; the default
     // logger JSON-encodes them so CW Logs Insights can filter on `reason`
@@ -237,6 +244,15 @@ export function createReconcileSweep(deps) {
       return m;
     }
 
+    // TEAM-3992 D4.2 — one S3 head per sweep: is a coding-runtime outage open?
+    // If so, every coding candidate is held (skip "runtime_outage") and left for
+    // the runtime-health recovery sweep, which auto-resumes them on probe success.
+    let runtimeOutage = false;
+    if (runtimeOutageActive) {
+      try { runtimeOutage = await runtimeOutageActive(); }
+      catch (err) { log(`reconcile.runtime_outage_probe_error — ${err?.message || err} (sweep ${sweepId})`); }
+    }
+
     const { workflows, matched, rotation, pages } = await scanNonTerminalWorkflows();
     if (matched > SWEEP_CAP) {
       m.truncated = true;
@@ -296,6 +312,9 @@ export function createReconcileSweep(deps) {
           }
           if (!allBlockersResolved(sibling, siblings)) { skip("blockers_pending"); continue; }
           if (!parkedLongEnough(sibling, startedAtMs, floorFor(sibling))) { skip("parked_too_recently"); continue; }
+          // A coding ticket during a runtime outage belongs to the recovery
+          // sweep — re-driving it here dispatches into the dead microVM.
+          if (runtimeOutage && isCodingTicket && isCodingTicket(sibling)) { skip("runtime_outage"); continue; }
 
           m.candidates++;
 

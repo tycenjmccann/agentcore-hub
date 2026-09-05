@@ -23,6 +23,7 @@
  */
 
 import agentsConfig from "../../config/agents.json";
+import leaseConstants from "../../config/lease-constants.json";
 
 export interface WatchdogConfig {
   enabled: boolean;
@@ -110,4 +111,20 @@ export function resolveWatchdogFrom(per: PartialWatchdog, def: PartialWatchdog):
  */
 export function resolveWatchdog(agentId?: string): WatchdogConfig {
   return resolveWatchdogFrom(agentWatchdog(agentId), defaultsWatchdog());
+}
+
+/**
+ * TEAM-3992 D4.3 — the absolute no-heartbeat soft-timeout for a workflow def,
+ * co-located here so it resolves against the same watchdog heartbeat cadence it
+ * must never undercut. A workflow definition may override the shared
+ * lease-constants default via `stallSoftTimeoutMs`; the result is floored at 2×
+ * the resolved heartbeat interval so the soft-timeout can never fire between two
+ * expected heartbeats (a healthy agent that just missed one beat is not stalled).
+ */
+export function resolveStallSoftTimeoutMs(
+  wfDef: { stallSoftTimeoutMs?: number } | undefined,
+  agentId?: string
+): number {
+  const configured = firstNum([wfDef?.stallSoftTimeoutMs]) ?? leaseConstants.stallSoftTimeoutMs;
+  return Math.max(configured, 2 * resolveWatchdog(agentId).heartbeatIntervalMs);
 }

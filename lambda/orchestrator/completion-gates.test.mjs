@@ -1366,3 +1366,159 @@ describe("completeWorkflow — open gate, CD evidence, atomic epic roll-up (TEAM
     expect(h.state.finalized).toHaveLength(0);
   });
 });
+
+/**
+ * TEAM-3992 Q4/D3.2 — the SHA-pinned fix-verification gate WIRED into
+ * completeWorkflow (the pure fixVerificationGaps ↔ completion-evidence.ts twin is
+ * pinned separately by the parity test). Reproduces wf 6ym4ef (TEAM-2811): a
+ * review_fix closed Done and the run went green, but the fix's FINAL commit was
+ * never re-reviewed or re-CI'd — so a regression shipped. Now: a done fix ticket
+ * must carry a passing verification record pinned to agentTasks[fix].commitSha for
+ * every role its kind re-arms, or the run cannot complete.
+ *
+ * Evidence gate is opted OUT here (COMPLETION_EVIDENCE_REQUIRED=off) so these tests
+ * isolate the fix gate; the def carries no ship phase, so no ship gate follows.
+ */
+describe("completeWorkflow — SHA-pinned fix-verification gate (TEAM-3992 Q4, wf 6ym4ef)", () => {
+  const SHA = "abcdef1234567890abcdef1234567890abcdef12";
+  // A def like software-delivery but WITHOUT ship, carrying a ticketDag.fixRearm.
+  // loadWorkflowDefs must carry ticketDag through (the gate reads it) — a drift
+  // there silently disables the gate, which this suite would then catch.
+  const FIX_WF_CONFIG = {
+    workflows: [
+      {
+        id: "software-delivery",
+        intakeAgentId: "agentcore_hub_requirements_analyst",
+        featureBranchPhase: "development",
+        completionRequiresAgentPhases: ["development", "verification", "review"],
+        reviewGates: [],
+        phases: [{ agentPhase: "development" }, { agentPhase: "verification" }, { agentPhase: "review" }],
+        ticketDag: {
+          fixRearm: { review_fix: ["review", "ci"], qa_fix: ["review", "ci", "verification"], codex_fix: ["review", "ci"] },
+        },
+      },
+    ],
+  };
+  // The done review_fix ticket under development, plus the three ordinary done
+  // tickets. fixVerificationGaps iterates the CHILDREN (parentId-index snapshot).
+  const FIX_TICKET = {
+    ticketId: "FIX-1", assignee: "agentcore_hub_backend_dev", type: "task", status: "done",
+    spawnedBy: { kind: "review_fix", gateTicketId: "T-3" },
+  };
+  const CHILDREN_WITH_FIX = [...DONE, FIX_TICKET];
+  // A verifier task carrying a verification record (the shape harvestCompletionEvidence
+  // writes: agentTasks.<verifier>.verification).
+  const vTask = (kind, verdict = "pass", headSha = SHA) => ({
+    ticketId: `V-${kind}`, verification: { targetTicketId: "FIX-1", headSha, kind, verdict },
+  });
+
+  /** Prime the roster + the ticketDag-bearing def, then hand back completeWorkflow. */
+  async function loadWithFixDef() {
+    h.state.workflowsConfig = FIX_WF_CONFIG;
+    await load();
+    await handler({ Records: [] });
+  }
+
+  const ebTypes = () =>
+    h.state.ebEvents.map((e) => e.Entries?.[0]?.DetailType).filter(Boolean);
+  const blockedEvents = () =>
+    h.state.ebEvents
+      .map((e) => e.Entries?.[0])
+      .filter((e) => e?.DetailType === "workflow.completion_blocked")
+      .map((e) => JSON.parse(e.Detail));
+
+  beforeEach(() => {
+    process.env.COMPLETION_EVIDENCE_REQUIRED = "off"; // isolate the fix gate
+    delete process.env.FIX_VERIFICATION_REQUIRED; // default enforce
+  });
+  afterEach(() => {
+    delete process.env.FIX_VERIFICATION_REQUIRED;
+  });
+
+  it("enforce (default): blocks the run when the fix's final SHA is not re-CI'd, escalates once", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [CHILDREN_WITH_FIX];
+    h.state.freshWorkflow = {
+      id: "wf_1",
+      agentTasks: {
+        "FIX-1": { ticketId: "FIX-1", commitSha: SHA },
+        "V-review": vTask("review"), // review re-verified, but no ci → gap
+      },
+    };
+    await loadWithFixDef();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(0); // never claimed
+    expect(h.state.finalized.length).toBe(0);
+    const rejected = error.mock.calls.find((c) => String(c[0]).includes("CompletionRejectedFixUnverified"));
+    expect(rejected).toBeTruthy();
+    expect(String(rejected[0])).toContain("FIX-1(ci)");
+    // Idempotent manager_escalation on the pinned id.
+    const esc = h.state.notifications.find((n) => n.n?.id === "notif_fix_unverified_wf_1");
+    expect(esc).toBeTruthy();
+    expect(esc.n.type).toBe("manager_escalation");
+    // Terminal-blocked event carries the offenders.
+    expect(blockedEvents().some((d) => d.reason === "fix_unverified" && d.offenders?.[0]?.ticketId === "FIX-1")).toBe(true);
+    error.mockRestore();
+  });
+
+  it("enforce: completes once review AND ci are re-verified at the fix's FINAL SHA (short↔long ok)", async () => {
+    h.state.snapshots = [CHILDREN_WITH_FIX];
+    h.state.freshWorkflow = {
+      id: "wf_1",
+      agentTasks: {
+        "FIX-1": { ticketId: "FIX-1", commitSha: SHA },
+        "V-review": vTask("review", "pass", "abcdef1"), // 7-char prefix of the full SHA
+        "V-ci": vTask("ci"),
+      },
+    };
+    await loadWithFixDef();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(h.state.notifications.some((n) => n.n?.id === "notif_fix_unverified_wf_1")).toBe(false);
+  });
+
+  it("enforce: a re-verification at the WRONG sha does not satisfy the gate", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [CHILDREN_WITH_FIX];
+    h.state.freshWorkflow = {
+      id: "wf_1",
+      agentTasks: {
+        "FIX-1": { ticketId: "FIX-1", commitSha: SHA },
+        "V-review": vTask("review", "pass", "9999999"),
+        "V-ci": vTask("ci", "pass", "9999999"),
+      },
+    };
+    await loadWithFixDef();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(String(error.mock.calls.find((c) => String(c[0]).includes("CompletionRejectedFixUnverified"))[0]))
+      .toContain("FIX-1(review/ci)");
+    error.mockRestore();
+  });
+
+  it("shadow: publishes the completion_blocked event but completes anyway (no escalation)", async () => {
+    process.env.FIX_VERIFICATION_REQUIRED = "shadow";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.snapshots = [CHILDREN_WITH_FIX];
+    h.state.freshWorkflow = {
+      id: "wf_1",
+      agentTasks: { "FIX-1": { ticketId: "FIX-1", commitSha: SHA }, "V-review": vTask("review") },
+    };
+    await loadWithFixDef();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(1); // proceeds
+    expect(blockedEvents().some((d) => d.reason === "fix_unverified" && d.shadow === true)).toBe(true);
+    expect(h.state.notifications.some((n) => n.n?.id === "notif_fix_unverified_wf_1")).toBe(false);
+    warn.mockRestore();
+  });
+
+  it("off: the gate is skipped entirely — an unverified fix still completes", async () => {
+    process.env.FIX_VERIFICATION_REQUIRED = "off";
+    h.state.snapshots = [CHILDREN_WITH_FIX];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { "FIX-1": { ticketId: "FIX-1", commitSha: SHA } } };
+    await loadWithFixDef();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(ebTypes().includes("workflow.completion_blocked")).toBe(false);
+  });
+});
