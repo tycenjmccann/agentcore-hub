@@ -564,7 +564,15 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       // Merge Approval gate). Pinned by review-rejection.test.mjs.
       const rejected = await getTicket(ticketId);
       if (rejected && isHumanAssignee(rejected.assignee)) {
-        await handleReviewRejection(rejected);
+        // TEAM-4045: only a real "Request changes" (in_review → blocked) is a
+        // rejection. The jira Lambda routes a NEW gate To Do → Blocked at
+        // creation; that hop must not re-open the gate's upstream work.
+        if (await isHumanRejectionTransition(oldStatus, rejected)) {
+          await handleReviewRejection(rejected);
+        }
+      } else if (rejected) {
+        // TEAM-4045: an agent parked its own ticket — free its invocation claim.
+        await releaseClaimOnSelfPark(rejected, oldStatus);
       }
       break;
     }
@@ -735,6 +743,80 @@ export async function handleTicketDoneUnified(ticketId) {
 /** Whether an assignee refers to a human reviewer (review gate) vs an agent. */
 function isHumanAssignee(assignee) {
   return typeof assignee === "string" && assignee.startsWith("human:");
+}
+
+/**
+ * TEAM-4045 — is this human gate's move to "blocked" the reviewer's "Request
+ * changes"? Only in_review → blocked is: in_review is the one state the
+ * orchestrator parks a gate in for review (handleHumanReviewGate, also behind
+ * parkGateForHuman and the cascade re-wake), and both ticket providers only
+ * carry a rejection note out of in_review. Every other from-state is plumbing:
+ * the jira Lambda's creation-time To Do → Blocked hop ("todo"), a
+ * jira:issue_created delivery ("new"), a board drag off Ready. A MISSING
+ * from-state (older command producers; a changelog item without fromString)
+ * fails CLOSED unless the orchestrator's own record shows the gate was parked
+ * for review — an unacknowledged review_needed notification for it.
+ */
+async function isHumanRejectionTransition(oldStatus, gate) {
+  if (oldStatus === "in_review") return true;
+  if (oldStatus === undefined || oldStatus === null || oldStatus === "") {
+    const workflow = await resolveWorkflow(gate.workflowId, gate.parentId);
+    const underReview = (workflow?.humanNotifications || []).some(
+      (n) => n.ticketId === gate.ticketId && n.type === "review_needed" && !n.acknowledged
+    );
+    console.log(
+      `[orchestrator] ${gate.ticketId}: → blocked with no from-state — ` +
+      (underReview
+        ? "open review_needed notification found, treating as a review rejection"
+        : "no open review_needed notification, NOT a review rejection (fail closed)")
+    );
+    return underReview;
+  }
+  console.log(`[orchestrator] ${gate.ticketId}: ${oldStatus} → blocked on a human gate is not a review rejection (only in_review → blocked is) — skipping handleReviewRejection`);
+  return false;
+}
+
+/**
+ * TEAM-4045 — an AGENT ticket left in_progress for blocked while its invocation
+ * claim is still `running`: the agent parked itself (release-manager.md, park
+ * step e) and exited without report_completion. Left alone, the claim refuses
+ * the human's later Blocked → Ready re-dispatch as "already claimed" until it
+ * is 2× the lease TTL old. Release it through the ONE lease primitive
+ * (stealClaim: CAS on running + this generation's startedAt → "ready"); never
+ * a human gate, never a lease that is not running, never a completed task.
+ *
+ * Accepted trade-off: if a human moves a GENUINELY live agent's ticket to
+ * Blocked and then to Ready, the release lets a second session start — the
+ * human chose it, the same trade the stale-claim escape hatch in
+ * claimTicketInvocation already makes. The sweeps stay inert on the parked
+ * ticket: the dead-session detector only inspects tickets that are in_progress
+ * on the board, and the reconcile sweep only candidates a ticket whose
+ * blockers are ALL resolved (a self-park with open blockers is never touched).
+ */
+async function releaseClaimOnSelfPark(ticket, oldStatus) {
+  if (oldStatus !== "in_progress") return false;
+  const { ticketId, assignee, workflowId, parentId } = ticket || {};
+  if (!ticketId || !assignee || isHumanAssignee(assignee) || !getAgentDef(assignee)) return false;
+  try {
+    const workflow = await resolveWorkflow(workflowId, parentId);
+    const task = workflow?.agentTasks?.[ticketId];
+    if (!task || task.status !== "running" || task.completedAt) return false;
+    const released = await stealClaim(ddb, WORKFLOWS_TABLE, workflow.id, ticketId, task.startedAt || null);
+    if (!released) {
+      console.log(`[orchestrator] ${ticketId}: in_progress → blocked but the claim generation moved — nothing released`);
+      return false;
+    }
+    task.status = "ready";
+    console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim (agent self-park) — claim released so a later Ready can re-dispatch`);
+    await publishEvent(ticketId, "orchestrator.claim_released", {
+      ticketId, agentId: assignee, workflowId: workflow.id, reason: "agent_self_park",
+      claimStartedAt: task.startedAt || null,
+    });
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] ${ticketId}: claim release after self-park failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
 }
 
 // Release-manager convergence escalation gate. The summary shape is fixed by
@@ -1836,7 +1918,23 @@ export async function handleReviewRejection(gateTicket) {
   // Persist each ticket's feedback atomically (per-key, no full-row put) BEFORE
   // reopening, so a fast re-invocation always finds its resume context.
   const reopened = [];
+  // TEAM-4045: an upstream whose OWN blockers are still open was never done —
+  // the gate reached "blocked" through creation-time routing or a board move,
+  // not through a review of finished work. Re-Readying it would dispatch the
+  // agent ahead of its dependencies (prod: the release manager ran while
+  // review/QA/CI were still blocked). Leave it Blocked; the normal
+  // cascadeUnblock on its last blocker's done Readies it. No resume context is
+  // stashed for a skipped ticket — the feedback is not about work it did.
+  const skipped = [];
+  const reopenable = [];
   for (const up of upstream) {
+    const upBlockers = up.blockedBy || [];
+    if (upBlockers.length > 0 && !(await checkAllBlockersResolved(upBlockers))) {
+      console.log(`[orchestrator] Review gate ${gateTicket.ticketId}: upstream ${up.ticketId} still has unresolved blockers [${upBlockers.join(", ")}] — not reopening`);
+      skipped.push(up.ticketId);
+      continue;
+    }
+    reopenable.push(up);
     // Surface the agent's prior coding session so it can CHOOSE to continue
     // that conversation (claude_code/codex resume_session=...) instead of
     // rebuilding context. Scope, not a command — the resume decision is the
@@ -1849,7 +1947,6 @@ export async function handleReviewRejection(gateTicket) {
       : "";
     const resumeNote = `## Review feedback (changes requested)\n${feedback}\n\nAddress this feedback and redo your work.${sessionHint}`;
     await store.setResumeContext(workflow.id, up.ticketId, resumeNote);
-    reopened.push(up.ticketId);
   }
 
   // Re-open each upstream ticket so its agent re-runs. Done has no direct path to
@@ -1872,10 +1969,13 @@ export async function handleReviewRejection(gateTicket) {
   // (Jira tickets can't carry arbitrary columns; the reopen path re-derives
   // phase from the assignee and the workflow row records the round, so the DDB
   // stamp is where this metadata lands.)
+  //
+  // TEAM-4045: `reopened` records what actually happened — a Jira reopen that
+  // never reached Ready (jiraReopenToReady false) is not advertised as reopened.
   const spawnedBy = { gateTicketId: gateTicket.ticketId, kind: "review_fix" };
-  for (const up of upstream) {
+  for (const up of reopenable) {
     if (TICKET_PROVIDER === "jira") {
-      await jiraReopenToReady(up.ticketId);
+      if (await jiraReopenToReady(up.ticketId)) reopened.push(up.ticketId);
     } else {
       await ddb.send(new UpdateCommand({
         TableName: TICKETS_TABLE,
@@ -1893,11 +1993,12 @@ export async function handleReviewRejection(gateTicket) {
           ...(gatePhase ? { ":ph": gatePhase } : {}),
         },
       }));
+      reopened.push(up.ticketId);
     }
   }
-  console.log(`[orchestrator] Review gate ${gateTicket.ticketId} rejected (rework) — re-opened: [${reopened.join(", ")}]`);
+  console.log(`[orchestrator] Review gate ${gateTicket.ticketId} rejected (rework) — re-opened: [${reopened.join(", ")}]${skipped.length ? ` skipped (blockers open): [${skipped.join(", ")}]` : ""}`);
   await publishEvent(gateTicket.ticketId, "review.rejected", {
-    ticketId: gateTicket.ticketId, onReject, reopened, workflowId: workflow.id,
+    ticketId: gateTicket.ticketId, onReject, reopened, skipped, workflowId: workflow.id,
   });
 }
 
@@ -2195,8 +2296,24 @@ async function processRecord(record) {
       // from this trigger too. Pinned by review-rejection.test.mjs.
       const blockedAssignee = unwrapDdbValue(newImage.assignee);
       if (isHumanAssignee(blockedAssignee)) {
+        // TEAM-4045: an INSERT is creation (the tickets Lambda writes a gate
+        // with blockers as status "blocked" directly) — never a rejection.
+        if (eventName === "INSERT") {
+          console.log(`[orchestrator] ${ticketId}: human gate created as blocked — not a review rejection, skipping handleReviewRejection`);
+          break;
+        }
         const rejected = await getTicket(ticketId);
-        if (rejected) await handleReviewRejection(rejected);
+        if (rejected && await isHumanRejectionTransition(oldStatus, rejected)) {
+          await handleReviewRejection(rejected);
+        }
+      } else if (eventName === "MODIFY") {
+        // TEAM-4045: an agent parked its own ticket — free its invocation claim.
+        await releaseClaimOnSelfPark({
+          ticketId,
+          assignee: blockedAssignee,
+          workflowId: unwrapDdbValue(newImage.workflowId),
+          parentId: unwrapDdbValue(newImage.parentId),
+        }, oldStatus);
       }
       break;
     }
