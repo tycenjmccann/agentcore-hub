@@ -49,19 +49,41 @@ force a Playwright re-run:
 | A1b | `npx tsc --noEmit` (mcp/hub) | clean | 0 |
 | A1c | `npm run lint` | **0 errors, 19 warnings** (React-hooks deps + `<img>`; none in intake/source files) | 0 |
 | A2 | targeted vitest (5 source-validation files) | **5 files / 168 tests passed** | 0 |
-| A3 | full `npx vitest run` | **114 files / 1829 tests** (see flake note) | 0 (2 of 3 runs) |
+| A3 | full `npx vitest run` ×5 (flake hunt, JSON reporter) | **114 files / 1829 tests — 5 consecutive green runs** | 0 (5/5) |
 
 A2 files: `intake.test.ts` (110), `source-shape.test.ts` (33), `route.sources-shape.test.ts` (7),
 `intake.hub-bucket.test.ts` (4), `lambda/orchestrator/source-context.test.mjs` (14).
 
-**A3 flake note (reported honestly):** the full suite was run **3×**. Runs 2 and 3 were green
-(`114 passed / 1829 passed`, exit 0). Run 1 reported `1 failed / 1828 passed` (exit 1) and did
-**not** reproduce on either re-run. The failure was **not** in the source-validation surface
-(the A2 targeted set is deterministic and passed every time); the suite contains known
-wall-clock / concurrency-timing tests (e.g. the orchestrator advisory-auto-approve retry test and
-an intake real-time budget assertion) that can flake under sandbox load. No source-validation
-regression is implied. The single non-reproducing failure was not isolated to a named test before
-it cleared on the next run.
+**A3 flake hunt — 5 consecutive green runs, flake NOT reproduced.** A prior interim run had shown a
+single `1 failed / 1828` result that cleared on re-run. To pin it down, the full suite was re-run
+**5×** back-to-back under the JSON reporter and every run's `testResults[].assertionResults[]` was
+scanned for any `status !== "passed"`:
+
+```
+$ for i in 1 2 3 4 5; do npx vitest run --reporter=default --reporter=json \
+      --outputFile.json=/tmp/vitest-run-$i.json > /tmp/vitest-console-$i.log 2>&1; \
+      echo "run $i exit $?"; done
+$ node -e '<read each JSON; print numTotal/numPassed/numFailed + any assertionResults with status!=="passed">'
+run 1: numTotalTests=1829 numPassed=1829 numFailed=0 success=true  nonPassed=0
+run 2: numTotalTests=1829 numPassed=1829 numFailed=0 success=true  nonPassed=0
+run 3: numTotalTests=1829 numPassed=1829 numFailed=0 success=true  nonPassed=0
+run 4: numTotalTests=1829 numPassed=1829 numFailed=0 success=true  nonPassed=0
+run 5: numTotalTests=1829 numPassed=1829 numFailed=0 success=true  nonPassed=0
+```
+
+| Run | Test files | Tests | Passed | Failed | non-passed assertions | Wall clock | Exit |
+|---|---|---|---|---|---|---|---|
+| 1 | 114 | 1829 | 1829 | 0 | 0 | ~105.1 s | 0 |
+| 2 | 114 | 1829 | 1829 | 0 | 0 | ~103.8 s | 0 |
+| 3 | 114 | 1829 | 1829 | 0 | 0 | ~99.3 s | 0 |
+| 4 | 114 | 1829 | 1829 | 0 | 0 | ~94.9 s | 0 |
+| 5 | 114 | 1829 | 1829 | 0 | 0 | ~102.8 s | 0 |
+
+**Result: the earlier single failure did not reproduce in 5/5 runs (0 non-passed assertions in any
+run), so it could not be named or attributed to a file.** Because it never recurred, there is no
+test/file to run `git log`/`git diff` against and no isolated flake rate to measure. The deterministic
+A2 source-validation set passed every time. Consistent with a one-off sandbox wall-clock/concurrency
+hiccup; no source-validation regression is implied.
 
 ---
 
@@ -81,7 +103,7 @@ Pre-check assertion: `import { DNS_LOOKUP_TIMEOUT_MS }` → **`2000` (=== 2000 �
 | C3 | malformed `s3://bucket-only-no-key` | definitive/parse "Invalid S3 URI format"; **S3 `send`=0** | 0 | 0 | true / true | **PASS** |
 | C4 | public https (raw.githubusercontent + example.com) | 206 verified, header `Range`, `redirect:"manual"` | 1 | 1 | false / false | **PASS** |
 | C5 | presigned-style URL (fake canary sig) | transient GET 403; **every method GET (no HEAD)**; URL byte-identical; call-1 headers `["Range"]`, both `redirect:"manual"`; **canary = 0** in detail / persisted / strict-422 | 2 | 1 | false / true | **PASS** |
-| C6 | redirect not followed (`http://github.com/` 301; httpbingo 302) | transient "URL redirected"; destination never fetched (see note) | 1 | 1 | false / true | **PASS** |
+| C6 | redirect not followed (`http://github.com/` 301; httpbingo 302) | transient "URL redirected"; **destination never fetched** (origin-compared, see C6 block) | 1 | 1 | false / true | **PASS** |
 | C7 | blocked-host literal matrix (32 rows) | **all** definitive/parse/blocked/**fetch0/lookup0**/lenientReject | 0 | 0 | true / — | **PASS** |
 | C7-neg | non-private literals (172.32/100.128/11/8.8.8.8) | verified, **lookup0** (literal ⇒ no DNS) | 1 | 0 | — | **PASS** |
 | C8a | real-DNS private-resolving names (nip.io/sslip.io) | all `Blocked … resolves to a private/link-local address`, `exactDetail=true`, **no IP in detail** | 0 | 1 | — | **PASS** |
@@ -114,13 +136,41 @@ canary <sig> in result JSON => 0   canary <akia> in result JSON => 0   canary in
 r.sources[0].value === original full URL => true
 ```
 
-### C6 — redirect note (harness-check substring artifact, NOT a failure)
-For the 302 sub-case the harness prints `destination(example.com) requested? => true`. This is a
-**substring false-positive**: the only fetched URL is the httpbingo redirector
-`https://httpbingo.org/redirect-to?url=https%3A%2F%2Fexample.com%2F&status_code=302`, whose `url=`
-query param literally contains "example.com". **`fetchCalls=1`** (redirector only, `redirect:"manual"`,
-302 → transient "URL redirected"); the destination was **never** requested. The `http://github.com/`
-sub-case confirms the intended assertion cleanly: `destination (https) requested? => false`.
+### C6 — redirect not followed (corrected destination check: ORIGIN comparison)
+The earlier harness used a **substring** check (`fCalls.some(c => c.url.includes("example.com"))`),
+which was a false-positive: the httpbingo redirector URL literally embeds `example.com` in its
+`?url=` query param, so the substring matched even though the destination was never fetched. The
+check is now `new URL(call.url).origin === new URL(destination).origin` — **origin**, not bare
+hostname, precisely because the `http://github.com/` case redirects to `https://github.com/` (same
+host, different scheme); a bare-hostname compare would false-positive there, but origin distinguishes
+`http://github.com` from `https://github.com`. Re-running **only** the C6 cases (`npx tsx qa-c6-4103.mts`,
+real `validateIntakeSources` + real network, exit 0):
+
+```
+### C6a  http://github.com/  (301 -> https://github.com/)
+  input url: http://github.com/   destination: https://github.com/
+  fetch call list => [{"method":"GET","hostname":"github.com","redirect":"manual"}]
+  lookupCalls=1 ["github.com"]
+  outcome=transient  method=GET (Range 0-0)  verification.status=unverified
+  detail: URL redirected — GET (Range 0-0) -> 301: http://github.com/
+  reject(lenient)=false  reject(strict)=true
+  destination requested? (origin === https://github.com) => false   (must be false)
+
+### C6b  httpbingo.org redirector (302 -> https://example.com/)
+  input url: https://httpbingo.org/redirect-to?url=https%3A%2F%2Fexample.com%2F&status_code=302
+  destination: https://example.com/
+  fetch call list => [{"method":"GET","hostname":"httpbingo.org","redirect":"manual"}]
+  lookupCalls=1 ["httpbingo.org"]
+  outcome=transient  method=GET (Range 0-0)  verification.status=unverified
+  detail: URL redirected — GET (Range 0-0) -> 302: https://httpbingo.org/redirect-to?url=REDACTED&status_code=REDACTED
+  reject(lenient)=false  reject(strict)=true
+  destination requested? (origin === https://example.com) => false   (must be false)
+```
+
+Both cases: exactly **one** fetch, to the *input* host only (`github.com` / `httpbingo.org`), with
+`redirect:"manual"`; the validator sees the 301/302, marks it transient "URL redirected" (unverified),
+and **never requests the redirect destination** — `destination requested? => false` in both. Lenient
+does not reject an unverified/transient result; strict does.
 
 ### C7 — blocked-host literal matrix (32/32 → `C7 ALL PASS => true`)
 `localhost`/trailing-dot/`foo.localhost.`/`localhost..`, obfuscated IPv4 (`127.1`, `0x7f000001`,
@@ -211,7 +261,7 @@ its single amber badge — no overlap. Screenshots in `docs/qa/`:
 | Step | Scope | Result |
 |---|---|---|
 | 0 | sync + change surface | **PASS** — HEAD `45694dd`; 46 files/+3142/−140 since 16b2bd3f; source-shape/redact unchanged; WorkflowBoard +28 → Playwright re-run |
-| A | static + suite | **PASS** — tsc×2/lint clean; 168 targeted; full 1829 (2/3 green, 1 non-reproducing non-source-validation flake) |
+| A | static + suite | **PASS** — tsc×2/lint clean; 168 targeted; full 1829 — **5/5 consecutive green** runs (earlier one-off failure did not reproduce, could not be named) |
 | B | live validator (real SDK + network) | **PASS** — TEAM-4105 "Unknown" leak fixed; SSRF matrix fetch0/lookup-controlled; no secret leak; DNS timeout 2001 ms; `DNS_LOOKUP_TIMEOUT_MS===2000` |
 | D | caps | **PASS** — 32 enforced in REST/zod/JSON-schema (submit + routine); mcp/hub build clean |
 | E | deploy.sh | **PASS** — only `SOURCE_VALIDATION_MODE` env-forward (+2/−1); full delta 24 files +3415/−74 |
@@ -220,6 +270,6 @@ its single amber badge — no overlap. Screenshots in `docs/qa/`:
 **Overall: PASS.** The final head `45694dd` of PR #371 carries the complete
 TEAM-4054/4078/4089/4091/4093/4101/4102/4105 source-validation surface; the TEAM-4102 main-merge
 added only orthogonal CD-registry work plus a separate delivery badge that does not regress the
-sources UI. The single full-suite failure across three runs did not reproduce and was outside the
-source-validation surface. No non-docs file on the feature branch was modified during this
-verification.
+sources UI. The earlier one-off full-suite failure did not reproduce across 5 consecutive green runs
+(0 non-passed assertions in any run) and could not be named. No non-docs file on the feature branch
+was modified during this verification.
