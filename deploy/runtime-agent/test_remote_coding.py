@@ -712,3 +712,118 @@ class TestSetupFailureIsTerminal(RemoteCodingTestCase):
             out = main._remote_coding_turn("fix the bug", "codex")
         self.assertTrue(out.startswith("ERROR: remote codex turn could not START:"), out)
         self.assertEqual(calls["n"], 1, "no resubmit after a journaled setup failure")
+
+
+class TestCodingTurnHeartbeat(RemoteCodingTestCase):
+    """TEAM-3992 D4.3 — while a coding turn polls "running", _poll_coding_turn
+    emits an agent.streaming heartbeat (detail type "heartbeat") to renew the
+    orchestrator lease. Pinned invariants: (a) at most one heartbeat per
+    HEARTBEAT_MIN_INTERVAL_S over a run of "running" polls, and (b) no heartbeat
+    at all when the poll status is never "running"."""
+
+    def _heartbeat_rows(self, events_client):
+        return [
+            c for c in events_client.put_item.call_args_list
+            if c.kwargs.get("Item", {}).get("type", {}).get("S") == "agent.streaming"
+            and c.kwargs["Item"]["detail"]["M"].get("type", {}).get("S") == "heartbeat"
+        ]
+
+    def test_heartbeats_throttled_to_at_most_once_per_interval(self):
+        # A run of "running" polls spanning several intervals. A fake monotonic
+        # clock advances a fixed step per poll; heartbeats must land no closer
+        # than HEARTBEAT_MIN_INTERVAL_S apart and must be far fewer than the
+        # number of polls (not one-per-poll). budget/deadline ride real
+        # time.time() with sleep patched out, so the loop ends only when the
+        # runner reports "done".
+        interval = 10
+        poll_step = 4.0
+        running_polls = 7
+
+        clock = {"t": 0.0}
+        calls = {"n": 0}
+        emit_times = []
+
+        def fake_poll_once(client, turn_id):
+            calls["n"] += 1
+            if calls["n"] <= running_polls:
+                clock["t"] += poll_step
+                return {"status": "running"}
+            return {"status": "done", "response": "ok", "claude_session_id": "s-1"}
+
+        def record_hb(turn_id, poll_status):
+            self.assertEqual(poll_status, "running")
+            emit_times.append(clock["t"])
+
+        events_client = mock.MagicMock()
+        with mock.patch.object(main, "_poll_once", side_effect=fake_poll_once), \
+             mock.patch.object(main.time, "sleep"), \
+             mock.patch.object(main.time, "monotonic",
+                               side_effect=lambda: clock["t"]), \
+             mock.patch.object(main, "_publish_coding_heartbeat",
+                               side_effect=record_hb), \
+             mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main, "HEARTBEAT_MIN_INTERVAL_S", interval), \
+             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01):
+            result = main._poll_coding_turn(mock.MagicMock(), "turn-hb")
+
+        self.assertEqual(result.get("status"), "done")
+        self.assertTrue(
+            emit_times,
+            "a multi-interval running turn must emit at least one heartbeat",
+        )
+        self.assertLess(
+            len(emit_times), running_polls,
+            "heartbeats must be throttled, not one per poll",
+        )
+        for earlier, later in zip(emit_times, emit_times[1:]):
+            self.assertGreaterEqual(
+                later - earlier, interval,
+                "consecutive heartbeats must be >= HEARTBEAT_MIN_INTERVAL_S apart",
+            )
+
+    def test_no_heartbeat_when_turn_goes_straight_to_done(self):
+        # The runner reports "done" on the first poll — the "running" branch
+        # never executes, so NO heartbeat is written. Throttle disabled
+        # (interval 0) to prove the guard is the poll-status check, not timing.
+        events_client = mock.MagicMock()
+        with mock.patch.object(main, "_poll_once",
+                               return_value={"status": "done", "response": "ok",
+                                             "claude_session_id": "s-1"}), \
+             mock.patch.object(main.time, "sleep"), \
+             mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main, "HEARTBEAT_MIN_INTERVAL_S", 0), \
+             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01):
+            result = main._poll_coding_turn(mock.MagicMock(), "turn-done")
+
+        self.assertEqual(result.get("status"), "done")
+        self.assertEqual(
+            self._heartbeat_rows(events_client), [],
+            "a turn that never polls 'running' must emit no heartbeat",
+        )
+
+    def test_no_heartbeat_for_non_running_poll_status(self):
+        # Non-terminal, non-"running" statuses (e.g. "transient" — a degraded
+        # journal read) must not renew the lease: only a "running" verdict is
+        # positive proof the runner is alive. Throttle disabled (interval 0) so
+        # any leak would show as a heartbeat row.
+        calls = {"n": 0}
+
+        def fake_poll_once(client, turn_id):
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                return {"status": "transient"}
+            return {"status": "done", "response": "ok", "claude_session_id": "s-1"}
+
+        events_client = mock.MagicMock()
+        with mock.patch.object(main, "_poll_once", side_effect=fake_poll_once), \
+             mock.patch.object(main.time, "sleep"), \
+             mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main, "HEARTBEAT_MIN_INTERVAL_S", 0), \
+             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01):
+            result = main._poll_coding_turn(mock.MagicMock(), "turn-transient")
+
+        self.assertEqual(result.get("status"), "done")
+        self.assertEqual(
+            self._heartbeat_rows(events_client), [],
+            "non-'running' poll statuses must not emit a heartbeat",
+        )

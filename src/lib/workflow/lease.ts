@@ -28,8 +28,16 @@ import leaseConstants from "../../config/lease-constants.json";
 // Single source of truth shared with the orchestrator Lambda (lambda/
 // orchestrator/lease.mjs reads the SAME file). TEAM-3618: constants extraction
 // only — the values are identical to the literals they replaced.
-const { defaultTtlMinutes, heartbeatEventTypes, liveClaimStatuses } = leaseConstants;
+const { defaultTtlMinutes, stallSoftTimeoutMs, heartbeatEventTypes, liveClaimStatuses } = leaseConstants;
 const [HEARTBEAT_TYPE_1, HEARTBEAT_TYPE_2] = heartbeatEventTypes;
+
+// The absolute no-heartbeat soft-timeout (TEAM-3992 D4.3). A claim can sit
+// inside its lease TTL yet emit no stream/tool heartbeat for a long time (a hung
+// tool call, a wedged coding turn) — the lease TTL alone would protect it for up
+// to 30 min. This is the tighter, activity-based window after which the sweep
+// begins confirming death. Shared with the UI (src/lib/workflow/stale.ts caps
+// the claude_code stale threshold at this same value) so board and detector agree.
+export const STALL_SOFT_TIMEOUT_MS = stallSoftTimeoutMs;
 
 /** A nonnumeric/zero/negative env value must not silently disable leases. */
 function resolveTtlMs(): number {
@@ -63,6 +71,77 @@ export function isLeaseLive(
   const freshest = Math.max(started, lastActivity);
   if (!freshest) return false; // no start, no activity — nothing to protect
   return nowMs - freshest < ttlMs;
+}
+
+export type LeaseVerdict = "live" | "soft-stale" | "stale";
+
+export interface LeaseVerdictOpts {
+  ttlMs?: number;
+  softTimeoutMs?: number;
+  hardTimeoutMs?: number;
+}
+
+/**
+ * Absolute stall verdict (TEAM-3992 D4.3) — a pure REFINEMENT of isLeaseLive that
+ * adds the activity-based soft-timeout on top of the TTL. isLeaseLive is left
+ * byte-identical (R3): this composes it, never re-derives it.
+ *
+ *   "live"       — the lease is live per TTL AND the newest of (stream/tool
+ *                  activity, OTEL span activity) is within softTimeoutMs.
+ *   "soft-stale" — the lease is live per TTL but there has been NO stream/tool
+ *                  heartbeat for >= softTimeoutMs, and OTEL is UNKNOWN (not yet
+ *                  queried). This is the "needs confirmation" state: the caller
+ *                  runs an OTEL span query and re-verdicts with the result.
+ *   "stale"      — the lease is not live per TTL, OR silence >= softTimeoutMs and
+ *                  death is confirmed: OTEL was queried and found no (recent)
+ *                  span, OR the absolute hard ceiling (hardTimeoutMs, default
+ *                  2× soft) has passed even without OTEL confirmation.
+ *
+ * `otelActivityIso` sentinel — the caller MUST distinguish these three:
+ *   undefined = OTEL not queried / unknown (OTEL_ACTIVITY_CONFIRM off, over
+ *               budget, query error/timeout) → yields soft-stale (below the hard
+ *               ceiling) so the conservative default never steals on silence
+ *               alone.
+ *   null      = OTEL queried successfully, found NO span → confirmed dead.
+ *   string    = the newest span's ISO timestamp → renews liveness if recent.
+ */
+export function leaseVerdict(
+  task: AgentTaskEntry | undefined,
+  lastActivityIso: string | null,
+  otelActivityIso: string | null | undefined,
+  nowMs: number,
+  opts: LeaseVerdictOpts = {}
+): LeaseVerdict {
+  const ttlMs = opts.ttlMs ?? LEASE_TTL_MS;
+  const softTimeoutMs = opts.softTimeoutMs ?? STALL_SOFT_TIMEOUT_MS;
+  const hardTimeoutMs = opts.hardTimeoutMs ?? 2 * softTimeoutMs;
+
+  // TTL is the outer bound (R3): a claim past its lease TTL is unconditionally
+  // stale, regardless of any soft-timeout refinement.
+  if (!isLeaseLive(task, lastActivityIso, nowMs, ttlMs)) return "stale";
+
+  // Heartbeat silence: now minus the newest of (claim start, stream/tool activity).
+  const started = task!.startedAt ? Date.parse(task!.startedAt) : 0;
+  const lastActivity = lastActivityIso ? Date.parse(lastActivityIso) : 0;
+  const silence = nowMs - Math.max(started, lastActivity);
+
+  // A fresh stream/tool heartbeat inside the soft window keeps it live.
+  if (silence < softTimeoutMs) return "live";
+
+  // No heartbeat for >= soft. Consult the OTEL span signal.
+  if (typeof otelActivityIso === "string") {
+    const otelMs = Date.parse(otelActivityIso);
+    if (Number.isFinite(otelMs) && nowMs - otelMs < softTimeoutMs) return "live";
+    return "stale"; // a span exists but is itself older than the soft window
+  }
+  if (otelActivityIso === null) return "stale"; // queried, confirmed no span
+
+  // OTEL unknown (undefined): soft-stale (needs confirmation) UNLESS the
+  // absolute hard ceiling has passed, at which point silence alone is enough to
+  // declare death (catches an outage where OTEL confirm is off / over budget —
+  // the 4v1ykk TEAM-2609 incident: >2× soft of pure silence, never confirmed).
+  if (silence >= hardTimeoutMs) return "stale";
+  return "soft-stale";
 }
 
 /**

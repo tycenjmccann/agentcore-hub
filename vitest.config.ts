@@ -185,6 +185,9 @@ export default defineConfig({
       // S3 honoring ETag/IfNoneMatch/IfMatch, fake publishEvent + clock), so the
       // probe/confirm/CAS-outage/backoff/recovery logic runs with no AWS.
       "lambda/orchestrator/runtime-health.test.mjs",
+      // TEAM-3992 D4.3 — the OTEL span confirmation probe (sentinel contract +
+      // flag/budget cost guards) behind injected startQuery/getQueryResults.
+      "lambda/orchestrator/otel-activity.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

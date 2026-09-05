@@ -17,6 +17,8 @@
  * `enabled: false` disables ACTIVE enforcement only — never heartbeat emission.
  */
 
+import { STALL_SOFT_TIMEOUT_MS } from "./lease.mjs";
+
 // Legacy hardcoded constants — the byte-identical fallback when neither
 // agents.json nor an env override configures a field.
 export const LEGACY_WATCHDOG = {
@@ -91,4 +93,19 @@ export function resolveWatchdog(agentId) {
       firstNum([per.turnTimeoutSecs, def.turnTimeoutSecs, process.env.WATCHDOG_TURN_TIMEOUT_SECS]) ??
       LEGACY_WATCHDOG.turnTimeoutSecs,
   };
+}
+
+/**
+ * TEAM-3992 D4.3 — the absolute no-heartbeat soft-timeout for a workflow def,
+ * co-located here so it resolves against the same watchdog heartbeat cadence it
+ * must never undercut. A workflow definition may override the shared
+ * lease-constants default via `stallSoftTimeoutMs`; the result is floored at 2×
+ * the resolved heartbeat interval so the soft-timeout can never fire between two
+ * expected heartbeats (a healthy agent that just missed one beat is not stalled).
+ * Reads STALL_SOFT_TIMEOUT_MS from lease.mjs (the single source shared with the TS
+ * twin) so there is no forked default.
+ */
+export function resolveStallSoftTimeoutMs(wfDef, agentId) {
+  const configured = firstNum([wfDef?.stallSoftTimeoutMs]) ?? STALL_SOFT_TIMEOUT_MS;
+  return Math.max(configured, 2 * resolveWatchdog(agentId).heartbeatIntervalMs);
 }

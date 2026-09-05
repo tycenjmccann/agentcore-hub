@@ -1,6 +1,7 @@
 {
   "defaultTtlMinutes": 30,
   "staleClaimMultiplier": 2,
+  "stallSoftTimeoutMs": 600000,
   "heartbeatEventTypes": ["agent.streaming", "agent.started"],
   "liveClaimStatuses": ["running", "in_progress"]
 }
