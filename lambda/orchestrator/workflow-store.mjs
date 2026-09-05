@@ -330,6 +330,41 @@ export async function incrementDeadSessionRetry(workflowId, ticketId) {
 }
 
 /**
+ * TEAM-4120 FR-3 — claim the ONE automatic children-synthesis a ticket ever
+ * gets. The children-only branch of the escalation tree blocks the held ticket
+ * on the tickets its dead agent spawned and hands back the retry budget; without
+ * a cap, a ticket that keeps dying is re-blocked on a fresh child set every
+ * sweep and never reaches a human (the same runaway the retry budget itself
+ * exists to prevent). Returns false when the synthesis was already spent.
+ *
+ * Two-step seed for the same reason ensureGateState/incrementDeadSessionRetry
+ * need one: DynamoDB rejects `SET a.b = …` when `a` is missing. The seed is
+ * unconditional (idempotent), the leaf write carries the CAS.
+ */
+export async function claimDeadSessionSynthesis(workflowId, ticketId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET deadSessionSynthesized = if_not_exists(deadSessionSynthesized, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET deadSessionSynthesized.#tid = :one",
+      ConditionExpression: "attribute_not_exists(deadSessionSynthesized.#tid)",
+      ExpressionAttributeNames: { "#tid": ticketId },
+      ExpressionAttributeValues: { ":one": 1 },
+    }));
+    return true;
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
  * Advance the workflow phase, optionally pinning the shared feature branch.
  * if_not_exists on the branch keeps the first winner under concurrent
  * same-phase claims; the monotonic phase check happened caller-side against a

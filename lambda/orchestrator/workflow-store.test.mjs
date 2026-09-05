@@ -10,6 +10,7 @@ import {
   markDeadSessionDetected,
   clearDeadSessionDetected,
   incrementDeadSessionRetry,
+  claimDeadSessionSynthesis,
   advancePhase,
   setResumeContext,
   setRepoCheck,
@@ -263,6 +264,26 @@ describe("incrementDeadSessionRetry", () => {
     );
     expect(bump.input.ExpressionAttributeNames["#tid"]).toBe("TEAM-2");
     expect(bump.input.ReturnValues).toBe("UPDATED_NEW");
+  });
+});
+
+describe("claimDeadSessionSynthesis (TEAM-4120 FR-3)", () => {
+  it("seeds the map, then claims the per-ticket leaf with attribute_not_exists", async () => {
+    const ok = await claimDeadSessionSynthesis("wf_1", "TEAM-2");
+    expect(ok).toBe(true);
+    // Step 1 has NO condition (idempotent seed — DynamoDB rejects SET a.b when a
+    // is missing), step 2 carries the CAS.
+    expect(writes()[0].input.UpdateExpression).toContain("if_not_exists(deadSessionSynthesized, :empty)");
+    expect(writes()[0].input.ConditionExpression).toBeUndefined();
+    const claim = writes()[1];
+    expect(claim.input.UpdateExpression).toBe("SET deadSessionSynthesized.#tid = :one");
+    expect(claim.input.ConditionExpression).toBe("attribute_not_exists(deadSessionSynthesized.#tid)");
+    expect(claim.input.ExpressionAttributeNames["#tid"]).toBe("TEAM-2");
+  });
+
+  it("returns false when the synthesis was already spent (CCFE), never throws", async () => {
+    failNextCondition = true;
+    await expect(claimDeadSessionSynthesis("wf_1", "TEAM-2")).resolves.toBe(false);
   });
 });
 

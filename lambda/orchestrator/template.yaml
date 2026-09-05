@@ -31,6 +31,9 @@ Globals:
         # other mode flags and is inert in the other two functions. deploy.sh
         # forwards it to the orchestrator only.
         GATE_STATE_GUARD: !Ref GateStateGuard
+        # Orchestrator-only as well (both exhausted-retry emitters live there);
+        # rides Globals for the same one-place-to-set parity.
+        DEAD_SESSION_ESCALATION_MODE: !Ref DeadSessionEscalationMode
 
 Parameters:
   TicketsTableName:
@@ -129,6 +132,25 @@ Parameters:
       is populated before enforce). enforce = drop the unrequested/duplicate
       ones. Default "off" matches the code's unset default, and deploy.sh only
       forwards GATE_STATE_GUARD when explicitly set. Instant rollback = set off.
+
+  DeadSessionEscalationMode:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Dead-session escalation tree (TEAM-4120 FR-3) — page, then synthesize or
+      park, when the dead-session retry budget is spent. off = byte-identical to
+      pre-4120: both emitters append the same evidence-free manager_escalation
+      and the ticket stays held in `error`. shadow = page WITH evidence (last
+      streamed words redacted, tickets spawned in the claim window, completion
+      record, PR) and publish the decision it WOULD take; no board writes.
+      enforce = also act — Done from a completion record that bears evidence AND
+      was written during this claim, else block the ticket on the children the
+      dead agent spawned (auto-reset capped to once per ticket), else park it on
+      one human gate. It never steals a claim, never invokes an agent, and never
+      marks a ticket Done on a stale or evidence-less record. Default "off"
+      matches the code's unset default and deploy.sh only forwards the var when
+      explicitly set. Instant rollback = set off.
 
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────

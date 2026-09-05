@@ -92,6 +92,10 @@ export function createDetector(deps) {
     publishEvent,
     redispatch,
     blockTicket,
+    // TEAM-4120 FR-3 — optional dead-session escalation tree. When unwired
+    // (DEAD_SESSION_ESCALATION_MODE=off, the default) the exhausted-retry path
+    // appends the bare manager_escalation notification exactly as before.
+    escalate,
     now = () => Date.now(),
     log = (msg) => console.log(`[orchestrator] ${msg}`),
   } = deps;
@@ -246,16 +250,32 @@ export function createDetector(deps) {
       });
       await store.setTaskStatus(workflow.id, ticketId, "error");
       await blockTicket(ticketId, "dead_session_retry_exhausted");
-      await store.appendNotification(workflow.id, {
-        id: `notif_dead_session_${ticketId}_${new Date(startedAtMs).toISOString()}`,
-        type: "manager_escalation",
-        title: `Dead session (retry exhausted): ${ticketId}`,
-        details: `Agent ${agentId} died twice on ${ticketId} (last heartbeat ${detectorMeta.lastHeartbeatAt || "unknown"}). Auto-retry is exhausted — needs a human.`,
-        reviewer: "dead-session-detector",
-        ticketId,
-        timestamp: new Date(startedAtMs).toISOString(),
-        acknowledged: false,
-      });
+      // TEAM-4120 FR-3 — when DEAD_SESSION_ESCALATION_MODE is on, the escalation
+      // tree (page → synthesize → park) writes the notification instead, with
+      // evidence and a resume path. Unwired (`escalate` undefined, the default)
+      // this is byte-identical to pre-4120: the bare page below.
+      if (escalate) {
+        await escalate({
+          workflow, ticketId, agentId,
+          claim: {
+            startedAt: workflow.agentTasks?.[ticketId]?.startedAt,
+            lastHeartbeatAt: detectorMeta?.lastHeartbeatAt,
+            source: "dead-session-detector",
+            detectorMeta,
+          },
+        });
+      } else {
+        await store.appendNotification(workflow.id, {
+          id: `notif_dead_session_${ticketId}_${new Date(startedAtMs).toISOString()}`,
+          type: "manager_escalation",
+          title: `Dead session (retry exhausted): ${ticketId}`,
+          details: `Agent ${agentId} died twice on ${ticketId} (last heartbeat ${detectorMeta.lastHeartbeatAt || "unknown"}). Auto-retry is exhausted — needs a human.`,
+          reviewer: "dead-session-detector",
+          ticketId,
+          timestamp: new Date(startedAtMs).toISOString(),
+          acknowledged: false,
+        });
+      }
       m.escalations++;
       log(`detector.escalate — ${ticketId} agent=${agentId} retry exhausted (sweep ${sweepId})`);
     }

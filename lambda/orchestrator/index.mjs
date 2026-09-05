@@ -37,6 +37,8 @@ import {
   isLeaseLive,
   lastAgentActivity,
   stealClaim,
+  lastStreamedText,
+  hasAgentErrorSince,
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
@@ -53,6 +55,7 @@ import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, ef
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
+import { createDeadSessionEscalation, normalizeEscalationMode } from "./dead-session-escalation.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -164,6 +167,18 @@ const EVENT_DEDUPE_MODE = normalizeEventDedupeMode(process.env.EVENT_DEDUPE_MODE
 // (garbage/legacy truthy → off; see gate-state.mjs) because the dangerous
 // failure here is DROPPING a human's Request-changes. Instant rollback = off.
 const GATE_STATE_GUARD = normalizeGateGuardMode(process.env.GATE_STATE_GUARD);
+// Dead-session escalation tree (TEAM-4120 FR-3): off | shadow | enforce, default
+// off. Today both exhausted-retry emitters end with an evidence-free
+// manager_escalation ("needs a human") and leave the ticket held in `error`, so
+// the run stops until somebody reconstructs it by hand. When on, the tree pages
+// WITH evidence (last streamed words, spawned children, completion record, PR)
+// and picks a resume path: synthesize from a fresh completion record, block the
+// ticket on the children it spawned, or park it on one human gate. off = the
+// module is never constructed and `escalate` stays undefined, so both emitters
+// are byte-identical. UNSET → off, but a PRESENT-but-garbage value → shadow
+// (normalizeEscalationMode, same fail-safe direction as REWORK_LOOP_CAP):
+// somebody meant to enable it, and shadow only observes. Instant rollback = off.
+const DEAD_SESSION_ESCALATION_MODE = normalizeEscalationMode(process.env.DEAD_SESSION_ESCALATION_MODE);
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -420,6 +435,53 @@ async function dispatchReadyDependent(_workflow, sibling) {
   await handleTicketReadyUnified(sibling.ticketId, fresh);
 }
 
+/**
+ * Read one JSON object out of the artifact bucket, or null when it isn't there /
+ * isn't JSON (TEAM-4120 FR-3). Injected as the escalation tree's `s3Get` so the
+ * module never constructs an S3 client. "Missing" and "unreadable" are the same
+ * answer to the caller: there is no evidence.
+ */
+async function readArtifactJson(key) {
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+    return JSON.parse(await res.Body.transformToString());
+  } catch {
+    return null;
+  }
+}
+
+// ─── Dead-session escalation tree (TEAM-4120 FR-3) ───────────────────────────
+// Lazy singleton, same shape as getReworkLoopCap(): returns null when the mode is
+// off, so `escalate` threads into both sweeps as `undefined` and their
+// exhausted-retry paths stay byte-identical to pre-4120. Constructed once per
+// warm container; every dep is an existing orchestrator function, which is what
+// keeps the module itself free of AWS clients and unit-testable.
+let _deadSessionEscalation = null;
+function getDeadSessionEscalation() {
+  if (DEAD_SESSION_ESCALATION_MODE === "off") return null;
+  if (_deadSessionEscalation) return _deadSessionEscalation;
+  _deadSessionEscalation = createDeadSessionEscalation({
+    mode: DEAD_SESSION_ESCALATION_MODE,
+    store,
+    // Read-only events-table queries (lease.mjs owns every events read so the
+    // paging bound + filter shape have one definition).
+    lease: { lastStreamedText, hasAgentErrorSince },
+    ddb,
+    eventsTable: EVENTS_TABLE,
+    getChildTickets,
+    getTicket,
+    invokeTickets,
+    s3Get: readArtifactJson,
+    // Optional: no PAT → readPrUrl is skipped, never fatal.
+    githubApi: process.env.GITHUB_PAT ? githubApi : undefined,
+    addBlockers,
+    parkGateForHuman,
+    publishEvent,
+    transitionTicket: transitionTicketStatus,
+  });
+  return _deadSessionEscalation;
+}
+
 // One detector per warm container so its per-agent median cache is reused
 // across the 5-minute sweeps (rebuilt from scratch on a cold start).
 let _detector = null;
@@ -436,6 +498,9 @@ function getDetector() {
     publishEvent,
     redispatch: redispatchTicket,
     blockTicket: blockTicketForFailedInvoke,
+    // TEAM-4120 FR-3 — undefined when DEAD_SESSION_ESCALATION_MODE=off (default),
+    // which keeps the exhausted-retry page byte-identical.
+    escalate: getDeadSessionEscalation()?.escalateExhausted,
   });
   return _detector;
 }
@@ -474,6 +539,8 @@ function getCascade() {
     // stale-lease recovery (one auto re-dispatch, then manager_escalation).
     store,
     blockTicket: blockTicketForFailedInvoke,
+    // TEAM-4120 FR-3 — same hook as the detector; undefined when off.
+    escalate: getDeadSessionEscalation()?.escalateExhausted,
   });
   return _cascade;
 }
@@ -782,6 +849,90 @@ async function blockShipOnPrereq(ticketId, shipTicket, blockerId) {
       ExpressionAttributeValues: { ":b": merged, ":s": "blocked", ":u": new Date().toISOString() },
     }));
   }
+}
+
+/**
+ * Add blockers to ANY ticket and park it Blocked (TEAM-4120 FR-3). Generalized
+ * from blockShipOnPrereq (left untouched — it carries the TEAM-4112 ship
+ * semantics): many blockers instead of one, and idempotent per blocker so a
+ * re-run adds only what is missing. Returns the ids actually added.
+ *
+ * Jira: one "Blocks" issueLink per blocker (Jira dedupes by (type, pair), so a
+ * repeat is a no-op) then ONE transition to Blocked. DynamoDB: a conditional
+ * per-blocker list_append, so concurrent writers can't clobber each other's
+ * edges the way a whole-array rewrite does; CCFE means "already linked" → skip.
+ *
+ * NOTE: this is a deliberate, acknowledged duplicate of the tickets-Lambda
+ * `add_blockers` op added in PR #380, which main does not yet carry. When #380
+ * merges, replace the body with invokeTickets("add_blockers", …) so the board
+ * write lives in exactly one place again.
+ */
+async function addBlockers(ticketId, ids) {
+  const blockers = (Array.isArray(ids) ? ids : [ids]).filter(Boolean);
+  if (!ticketId || !blockers.length) return [];
+  const added = [];
+  if (TICKET_PROVIDER === "jira") {
+    for (const id of blockers) {
+      try {
+        await jiraFetch("/rest/api/3/issueLink", "POST", {
+          type: { name: "Blocks" },
+          inwardIssue: { key: id },
+          outwardIssue: { key: ticketId },
+        });
+        added.push(id);
+      } catch (err) {
+        console.warn(`[orchestrator] addBlockers: link ${id} → ${ticketId} failed (non-fatal): ${err?.message || err}`);
+      }
+    }
+    if (added.length) await jiraTransition(ticketId, "Blocked");
+    return added;
+  }
+  for (const id of blockers) {
+    try {
+      await ddb.send(new UpdateCommand({
+        TableName: TICKETS_TABLE,
+        Key: { ticketId },
+        UpdateExpression:
+          "SET blockedBy = list_append(if_not_exists(blockedBy, :empty), :one), #s = :blocked, #u = :now",
+        ConditionExpression: "attribute_not_exists(blockedBy) OR NOT contains(blockedBy, :id)",
+        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+        ExpressionAttributeValues: {
+          ":empty": [], ":one": [id], ":id": id,
+          ":blocked": "blocked", ":now": new Date().toISOString(),
+        },
+      }));
+      added.push(id);
+    } catch (err) {
+      if (err?.name !== "ConditionalCheckFailedException") {
+        console.warn(`[orchestrator] addBlockers: ${ticketId} += ${id} failed (non-fatal): ${err?.message || err}`);
+      }
+    }
+  }
+  return added;
+}
+
+/**
+ * Call the tickets/jira tools Lambda synchronously and return its parsed result
+ * (TEAM-4120 FR-3 needs the new key back from create_ticket, so unlike
+ * addTicketComment's fire-and-forget invoke this one reads the response). Both
+ * provider Lambdas expose the identical `Tickets___*` interface, so the caller
+ * never learns which backend is live.
+ */
+async function invokeTickets(toolName, parameters) {
+  const res = await lambda.send(new InvokeCommand({
+    FunctionName: TICKET_TOOLS_LAMBDA,
+    Payload: JSON.stringify({ tool_name: `Tickets___${toolName}`, parameters }),
+  }));
+  const raw = res.Payload ? new TextDecoder().decode(res.Payload) : "";
+  if (!raw) return null;
+  let parsed = JSON.parse(raw);
+  if (typeof parsed === "string") parsed = JSON.parse(parsed);
+  // Errors come back as a textResult envelope ({ content: [{ text }] }); the
+  // create/transition ops return their object directly.
+  if (parsed?.content?.[0]?.text && !parsed.key) {
+    throw new Error(`Tickets___${toolName}: ${String(parsed.content[0].text).slice(0, 300)}`);
+  }
+  return parsed;
 }
 
 /**
@@ -1101,7 +1252,7 @@ export async function handleTicketDoneUnified(ticketId) {
     // second approval) has to reach the parked release manager, or the human's
     // only lever silently does nothing. Both calls below are idempotent.
     await ackApprovedGateNotification(workflow, ticketId, assignee);
-    await wakeReleaseManagerAfterEscalationGate(workflow, ticketId, ticket.title, assignee, parentId);
+    await wakeHeldTicketAfterEscalationGate(workflow, ticketId, ticket.title, assignee, parentId);
     // TEAM-3985 — re-Done'ing any ticket is the human's deterministic "re-check
     // completion" lever (evidence that landed late, gate opt-out flipped).
     // Idempotent: completeWorkflow returns at once on a terminal phase.
@@ -1116,7 +1267,7 @@ export async function handleTicketDoneUnified(ticketId) {
   // a pre-claim snapshot (double invocation).
   await markTaskComplete(workflow, ticketId, assignee);
   await ackApprovedGateNotification(workflow, ticketId, assignee);
-  await wakeReleaseManagerAfterEscalationGate(workflow, ticketId, ticket.title, assignee, parentId);
+  await wakeHeldTicketAfterEscalationGate(workflow, ticketId, ticket.title, assignee, parentId);
 
   // Unblock dependents via the shared cascade (TEAM-3618 D3). The helper owns
   // the blocker predicate, provider branching, and orchestrator.unblocked
@@ -1156,6 +1307,10 @@ function isHumanAssignee(assignee) {
 // transition API and the Telegram bot match the same shape.
 const ESCALATION_GATE_TITLE = /^Escalation #\d+: ship-review not converging/i;
 const RELEASE_MANAGER_AGENT = "agentcore_hub_release_manager";
+// TEAM-4120 FR-3 — the escalation tree's park gate. The captures ARE the wake
+// payload: m[1] = the held ticket, m[2] = the agent that died on it. Shape fixed
+// by dead-session-escalation.mjs park() (keep the two in sync).
+const DEAD_SESSION_GATE_TITLE = /^Escalation: dead session on (\S+) \((.+)\)$/i;
 
 /**
  * TEAM-3971 — a human just Done'd a release-manager escalation gate. Nothing
@@ -1170,8 +1325,41 @@ const RELEASE_MANAGER_AGENT = "agentcore_hub_release_manager";
  * DDB: re-dispatch directly. Best-effort: any failure logs and leaves the
  * reconcile sweep as the backstop.
  */
-async function wakeReleaseManagerAfterEscalationGate(workflow, gateTicketId, gateTitle, assignee, parentId) {
+async function wakeHeldTicketAfterEscalationGate(workflow, gateTicketId, gateTitle, assignee, parentId) {
   if (!isHumanAssignee(assignee)) return false;
+  // TEAM-4120 FR-3 — a dead-session park gate names the ticket it holds in its
+  // own title, so the wake needs no sibling search: reset that ticket's retry
+  // budget, announce the decision, and let the gate's OWN done cascade unblock it
+  // (the gate is in the held ticket's blockedBy). Deliberately NO direct
+  // re-dispatch: this module never invokes an agent (R3), and a second dispatch
+  // path here would race the cascade's.
+  const dead = DEAD_SESSION_GATE_TITLE.exec(gateTitle || "");
+  if (dead) {
+    const heldId = dead[1];
+    const heldAgent = dead[2];
+    try {
+      await store.resetDeadSessionRetry(workflow.id, heldId);
+      await publishEvent(heldId, "orchestrator.escalation_decided", {
+        workflowId: workflow.id, gateTicketId, ticketId: heldId, agentId: heldAgent,
+      });
+      // Jira fallback: on a board whose Blocked→Ready hop needs a stop at To Do,
+      // the cascade's single transition can leave the ticket sitting in Blocked.
+      // Re-read AFTER the cascade has had its turn and hop it only if it is.
+      if (TICKET_PROVIDER === "jira") {
+        const held = await getTicket(heldId);
+        if (held?.status === "blocked") {
+          const woke = (await jiraTransition(heldId, "Ready"))
+            || ((await jiraTransition(heldId, "To Do")) && (await jiraTransition(heldId, "Ready")));
+          console.log(`[orchestrator] ${gateTicketId}: dead-session gate done — ${heldId} still blocked, hop ${woke ? "succeeded" : "failed (reconcile sweep is the backstop)"}`);
+        }
+      }
+      console.log(`[orchestrator] ${gateTicketId}: dead-session gate done — ${heldId} retry budget reset, unblocked by the gate's own cascade`);
+      return true;
+    } catch (err) {
+      console.warn(`[orchestrator] ${gateTicketId}: dead-session wake failed (non-fatal): ${err?.message || err}`);
+      return false;
+    }
+  }
   if (!ESCALATION_GATE_TITLE.test(gateTitle || "")) return false;
   try {
     const siblings = await getChildTickets(parentId);
@@ -1433,6 +1621,29 @@ function handoffNote(workflow, what) {
     `this ${what} does not apply. The run completes once review/QA/CI are done and the ` +
     `unified PR is left OPEN for the owning team to merge and deploy.`
   );
+}
+
+/**
+ * Provider-agnostic ticket status write (TEAM-4120 FR-3). Same two branches every
+ * other status write in this file uses — Jira transitions by display name, the
+ * DDB board writes the lowercase status; the ensuing webhook/stream is what
+ * drives the normal done handlers, which is exactly what the escalation tree's
+ * synthesize-from-completion-record path wants (it must NOT write agentTasks
+ * itself; markTaskComplete → harvestCompletionEvidence owns that).
+ */
+async function transitionTicketStatus(ticketId, status) {
+  if (TICKET_PROVIDER === "jira") {
+    const display = { done: "Done", ready: "Ready", blocked: "Blocked", todo: "To Do" }[status] || status;
+    return await jiraTransition(ticketId, display);
+  }
+  await ddb.send(new UpdateCommand({
+    TableName: TICKETS_TABLE,
+    Key: { ticketId },
+    UpdateExpression: "SET #s = :s, #u = :u",
+    ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+    ExpressionAttributeValues: { ":s": status, ":u": new Date().toISOString() },
+  }));
+  return true;
 }
 
 async function resolveTicketAsHandoff(ticketId, workflow, note, detail) {
@@ -2930,7 +3141,7 @@ export async function handleTicketDone(ticketId, image) {
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);
   await ackApprovedGateNotification(workflow, ticketId, assignee);
-  await wakeReleaseManagerAfterEscalationGate(workflow, ticketId, unwrapDdbValue(image.title), assignee, parentId);
+  await wakeHeldTicketAfterEscalationGate(workflow, ticketId, unwrapDdbValue(image.title), assignee, parentId);
 
   // Unblock dependents via the shared cascade (TEAM-3618 D3). Same helper as the
   // Jira-webhook twin (handleTicketDoneUnified) — this path previously matched
