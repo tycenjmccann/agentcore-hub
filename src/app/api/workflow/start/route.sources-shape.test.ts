@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { MAX_INTAKE_SOURCES } from "@/lib/workflow/source-shape";
 import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
 
 /**
@@ -152,5 +153,32 @@ describe("POST /api/workflow/start — intake source shape gate (TEAM-4078)", ()
   it("does NOT reject a submission with no sources at all", async () => {
     const res = await post({ title: "t", repoConfig });
     expect(res.status).toBe(200);
+  });
+
+  // TEAM-4091 F3: every source costs the server up to two 10s outbound GETs or a
+  // HeadObject, all concurrent, so an unbounded array is a request amplifier on
+  // an unauthenticated route.
+  it("rejects more than MAX_INTAKE_SOURCES sources with 400 before any fan-out", async () => {
+    const sources = Array.from({ length: MAX_INTAKE_SOURCES + 1 }, (_, i) => ({
+      type: "url",
+      value: `https://example.com/${i}`,
+    }));
+    const res = await post({ title: "t", repoConfig, sources });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe(`sources must have at most ${MAX_INTAKE_SOURCES} items`);
+    expect(h.puts.length).toBe(0);
+    expect(h.invokes.length).toBe(0);
+    // The whole point: not one outbound request was ever queued.
+    expect(h.validate.fn).not.toHaveBeenCalled();
+  });
+
+  it("accepts exactly MAX_INTAKE_SOURCES sources", async () => {
+    const sources = Array.from({ length: MAX_INTAKE_SOURCES }, (_, i) => ({
+      type: "url",
+      value: `https://example.com/${i}`,
+    }));
+    const res = await post({ title: "t", repoConfig, sources });
+    expect(res.status).toBe(200);
+    expect(h.validate.fn).toHaveBeenCalledWith(sources);
   });
 });

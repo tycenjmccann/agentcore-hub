@@ -47,12 +47,12 @@ const src = (type: IntakeSource["type"], value: string, extra: Partial<IntakeSou
 });
 
 /** Records every fetch call so we can assert HEAD is NEVER issued. */
-type FetchCall = { url: string; method: string; headers: Record<string, string> };
+type FetchCall = { url: string; method: string; headers: Record<string, string>; redirect?: RequestRedirect };
 function fakeFetch(responses: Array<{ status: number }>, calls: FetchCall[]) {
   const cancel = vi.fn(async () => undefined);
   const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const headers = (init?.headers ?? {}) as Record<string, string>;
-    calls.push({ url: String(input), method: init?.method ?? "GET", headers });
+    calls.push({ url: String(input), method: init?.method ?? "GET", headers, redirect: init?.redirect });
     const r = responses[Math.min(calls.length - 1, responses.length - 1)];
     return { status: r.status, ok: r.status < 400, body: { cancel } } as unknown as Response;
   }) as unknown as typeof fetch;
@@ -870,5 +870,201 @@ describe("validateIntakeSources — hub-bucket probe is bounded (F3)", () => {
     });
     expect(only(r).detail).toContain("(hub bucket)");
     expect(sts.send).not.toHaveBeenCalled();
+  });
+});
+
+// ─── (g) TEAM-4091 F1: SSRF gate on the URL check ────────────────────────────
+
+/**
+ * checkUrlSource issues a SERVER-SIDE GET to a caller-supplied URL and persists
+ * the status into verification.detail, which the submitter reads back — a blind
+ * status oracle for everything the ECS task can reach, on a route with no auth
+ * under AUTH_MODE=none. Two holes: redirects were followed (fetch's default), so
+ * the URL actually fetched was not the URL we inspected; and no host was ever
+ * refused, so http://169.254.169.254/ was a legal "source".
+ *
+ * Only LITERAL hosts are checked. A public name that RESOLVES into a private
+ * range (DNS rebinding) is out of scope — see the comment on urlGate.
+ */
+describe("validateIntakeSources — URL redirects are not followed (TEAM-4091 F1)", () => {
+  it("a 302 on the ranged GET → transient 'URL redirected', with redirect:manual", async () => {
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 302 }], calls);
+    const r = await validateIntakeSources([src("url", "https://example.com/spec.md")], {
+      fetchImpl: impl,
+      env: envOf({}),
+    });
+    const c = only(r);
+    expect(c.outcome).toBe("transient");
+    expect(c.verification.status).toBe("unverified");
+    expect(c.detail!.startsWith("URL redirected")).toBe(true);
+    expect(c.detail).toContain("GET (Range 0-0) -> 302");
+    // The redirect is never chased: one call, and it opted out of following.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].redirect).toBe("manual");
+    // A redirect is a network opinion, not a fact about the source.
+    expect(shouldRejectSubmission(r, "lenient").reject).toBe(false);
+    expect(shouldRejectSubmission(r, "strict").reject).toBe(true);
+  });
+
+  it("the plain-GET fallback after a 403 also passes redirect:manual", async () => {
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 403 }, { status: 301 }], calls);
+    const c = only(
+      await validateIntakeSources([src("url", PRESIGNED)], { fetchImpl: impl, env: envOf({}) })
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[0].redirect).toBe("manual");
+    expect(calls[1].redirect).toBe("manual");
+    expect(calls[1].headers.Range).toBeUndefined();
+    expect(c.outcome).toBe("transient");
+    expect(c.detail!.startsWith("URL redirected")).toBe(true);
+    expect(c.detail).toContain("GET -> 301");
+    // The signature never reaches the persisted detail.
+    expect(c.detail).not.toContain("SECRETSIG");
+  });
+
+  it("a 416 fallback that redirects is reported off the fallback's status", async () => {
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 416 }, { status: 307 }], calls);
+    const c = only(
+      await validateIntakeSources([src("url", "https://example.com/empty")], { fetchImpl: impl, env: envOf({}) })
+    );
+    expect(c.detail).toContain("GET -> 307");
+    expect(calls.map((x) => x.redirect)).toEqual(["manual", "manual"]);
+  });
+});
+
+describe("validateIntakeSources — blocked URL hosts (TEAM-4091 F1)", () => {
+  /** A fetch that must never be reached; vi.fn so .not.toHaveBeenCalled() is real. */
+  const neverFetch = () =>
+    vi.fn(async () => ({ status: 206, ok: true, body: { cancel: async () => undefined } }) as unknown as Response);
+
+  const BLOCKED: Array<[string, string]> = [
+    ["localhost", "loopback name localhost"],
+    ["foo.localhost", "loopback name localhost"],
+    ["127.0.0.1", "loopback address 127.0.0.0/8"],
+    ["127.42.7.9", "loopback address 127.0.0.0/8"],
+    ["10.0.0.1", "private address 10.0.0.0/8"],
+    ["172.16.0.1", "private address 172.16.0.0/12"],
+    ["172.31.255.255", "private address 172.16.0.0/12"],
+    ["192.168.1.1", "private address 192.168.0.0/16"],
+    ["169.254.169.254", "link-local address 169.254.0.0/16 (instance metadata)"],
+    ["0.0.0.0", "unspecified address 0.0.0.0/8"],
+    ["100.64.0.1", "shared address space 100.64.0.0/10"],
+    ["[::1]", "loopback address ::1"],
+    ["[::]", "unspecified address ::"],
+    ["[fc00::1]", "unique-local address fc00::/7"],
+    ["[fd12::1]", "unique-local address fc00::/7"],
+    ["[fe80::1]", "link-local address fe80::/10"],
+    ["[::ffff:127.0.0.1]", "IPv4-mapped loopback address 127.0.0.0/8"],
+    ["[::ffff:7f00:1]", "IPv4-mapped loopback address 127.0.0.0/8"],
+    ["[::ffff:169.254.169.254]", "IPv4-mapped link-local address 169.254.0.0/16 (instance metadata)"],
+  ];
+
+  it.each(BLOCKED)("%s → definitive parse failure, no socket opened", async (host, reason) => {
+    const fetchImpl = neverFetch();
+    const url = `https://${host}/spec.md`;
+    const r = await validateIntakeSources([src("url", url)], {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      env: envOf({}),
+    });
+    const c = only(r);
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    expect(c.detail!.startsWith("Blocked URL host")).toBe(true);
+    expect(c.detail).toContain(reason);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    // Definitive → 422 in every mode, so the oracle is not merely unverified.
+    expect(shouldRejectSubmission(r, "lenient")).toEqual({ reject: true, errors: [c.detail] });
+    expect(shouldRejectSubmission(r, "strict").reject).toBe(true);
+  });
+
+  it("the obfuscated numeric forms are covered by WHATWG normalization", async () => {
+    const fetchImpl = neverFetch();
+    for (const host of ["0x7f000001", "127.1", "2130706433"]) {
+      const c = only(
+        await validateIntakeSources([src("url", `http://${host}/latest/meta-data/`)], {
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          env: envOf({}),
+        })
+      );
+      expect(c.outcome).toBe("definitive");
+      expect(c.detail).toContain("loopback address 127.0.0.0/8");
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("blocks a loopback host even when the PATH would satisfy the GITHUB_OWNER shortcut", async () => {
+    const fetchImpl = neverFetch();
+    const c = only(
+      await validateIntakeSources([src("url", "https://127.0.0.1/github.com/tycenjmccann/x/README.md")], {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        env: envOf({ GITHUB_OWNER: "tycenjmccann" }),
+      })
+    );
+    // The gate runs BEFORE the trusted-owner shortcut, so this is not "trusted".
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    expect(c.detail).toContain("loopback address 127.0.0.0/8");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("a non-http(s) scheme never reaches a socket", async () => {
+    const fetchImpl = neverFetch();
+    // Through the public entry point a "url" source with no http(s):// prefix is
+    // already stopped by the TEAM-4079 type dispatch, which is why the detail here
+    // is the scheme message rather than "Blocked URL host" — either way it is
+    // definitive, and no fetch is issued. urlGate's own scheme branch is the
+    // second layer, for any future caller that reaches checkUrlSource directly.
+    const c = only(
+      await validateIntakeSources([src("url", "ftp://example.com/x")], {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    expect(c.detail).toContain("Unsupported URL scheme");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  const ALLOWED = ["172.32.0.1", "100.128.0.1", "11.0.0.1", "8.8.8.8", "example.com", "[2606:4700::1]"];
+
+  it.each(ALLOWED)("%s is NOT blocked — the ranges are boundaries, not prefixes", async (host) => {
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 206 }], calls);
+    const c = only(
+      await validateIntakeSources([src("url", `https://${host}/spec.md`)], { fetchImpl: impl, env: envOf({}) })
+    );
+    expect(c.outcome).toBe("verified");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("a presigned S3 URL still verifies, untouched and unredirected", async () => {
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 206 }], calls);
+    const c = only(await validateIntakeSources([src("url", PRESIGNED)], { fetchImpl: impl, env: envOf({}) }));
+    expect(c.outcome).toBe("verified");
+    expect(calls).toHaveLength(1);
+    // Still byte-identical: the gate parses a copy, it never rewrites the URL,
+    // and no header beyond Range is added (either would break the signature).
+    expect(calls[0].url).toBe(PRESIGNED);
+    expect(Object.keys(calls[0].headers)).toEqual(["Range"]);
+    expect(calls[0].redirect).toBe("manual");
+  });
+
+  it("an unparseable http URL is a definitive parse failure, not a fetch attempt", async () => {
+    const fetchImpl = neverFetch();
+    const c = only(
+      await validateIntakeSources([src("url", "https://")], {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    expect(c.detail).toContain("Invalid URL format");
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });

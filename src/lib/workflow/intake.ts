@@ -9,6 +9,7 @@
  * Processed content is packaged for the requirements agent.
  */
 
+import { isIPv4, isIPv6 } from "node:net";
 import { S3Client, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import type { IntakeSource, SourceVerification } from "./types";
@@ -365,6 +366,104 @@ async function checkS3Source(
   }
 }
 
+// ─── SSRF gate for the URL check (TEAM-4091 F1) ──────────────────────────────
+//
+// checkUrlSource issues a SERVER-SIDE GET to a caller-supplied URL and persists
+// the status code into verification.detail, which the submitter reads back. That
+// is a blind status oracle for anything the ECS task can reach — most sharply
+// http://169.254.169.254/ (the instance metadata endpoint) and the VPC's private
+// ranges. The submission route has no auth under AUTH_MODE=none.
+//
+// SCOPE, EXPLICITLY: only LITERAL hosts are blocked. A hostname that RESOLVES to
+// a private address — DNS rebinding, or a public name with an RFC1918 A record —
+// is OUT OF SCOPE for this check, because fetch gives us no hook between
+// resolution and connect. This closes the trivially-typed oracle, not every SSRF
+// avenue. Note that WHATWG URL already normalizes the obfuscated numeric forms
+// (http://0x7f000001/ and http://127.1/ both give hostname "127.0.0.1"), so
+// testing url.hostname after parsing covers them.
+
+/** Blocked IPv4 range, or undefined for a routable literal. */
+function blockedIpv4Reason(host: string): string | undefined {
+  const parts = host.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return undefined;
+  const [a, b] = parts;
+  if (a === 127) return "loopback address 127.0.0.0/8";
+  if (a === 10) return "private address 10.0.0.0/8";
+  if (a === 172 && b >= 16 && b <= 31) return "private address 172.16.0.0/12";
+  if (a === 192 && b === 168) return "private address 192.168.0.0/16";
+  if (a === 169 && b === 254) return "link-local address 169.254.0.0/16 (instance metadata)";
+  if (a === 0) return "unspecified address 0.0.0.0/8";
+  if (a === 100 && b >= 64 && b <= 127) return "shared address space 100.64.0.0/10";
+  return undefined;
+}
+
+/** Expand an IPv6 literal (already validated by isIPv6) to its 8 groups. */
+function expandIpv6(host: string): number[] | undefined {
+  let s = host.toLowerCase();
+  // A trailing dotted quad (::ffff:127.0.0.1) becomes the last two groups.
+  const v4 = /(\d{1,3}(?:\.\d{1,3}){3})$/.exec(s);
+  if (v4) {
+    const o = v4[1].split(".").map(Number);
+    if (o.some((n) => n > 255)) return undefined;
+    s = s.slice(0, v4.index) + `${((o[0] << 8) | o[1]).toString(16)}:${((o[2] << 8) | o[3]).toString(16)}`;
+  }
+  const halves = s.split("::");
+  if (halves.length > 2) return undefined;
+  const toGroups = (part: string) => (part ? part.split(":").map((g) => parseInt(g, 16)) : []);
+  const head = toGroups(halves[0]);
+  const tail = halves.length === 2 ? toGroups(halves[1]) : [];
+  const groups = halves.length === 2 ? [...head, ...new Array(8 - head.length - tail.length).fill(0), ...tail] : head;
+  if (groups.length !== 8 || groups.some((g) => !Number.isInteger(g) || g < 0 || g > 0xffff)) return undefined;
+  return groups;
+}
+
+/** Blocked IPv6 range, or undefined for a routable literal. */
+function blockedIpv6Reason(host: string): string | undefined {
+  const g = expandIpv6(host);
+  if (!g) return undefined;
+  if (g.every((x) => x === 0)) return "unspecified address ::";
+  if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return "loopback address ::1";
+  // ::ffff:a.b.c.d — an IPv4-mapped address is decided by the mapped v4 address,
+  // in either the dotted or the hex spelling (::ffff:7f00:1 === ::ffff:127.0.0.1).
+  if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) {
+    const mapped = blockedIpv4Reason(`${g[6] >> 8}.${g[6] & 0xff}.${g[7] >> 8}.${g[7] & 0xff}`);
+    if (mapped) return `IPv4-mapped ${mapped}`;
+  }
+  const topByte = g[0] >> 8;
+  if (topByte === 0xfc || topByte === 0xfd) return "unique-local address fc00::/7";
+  if (g[0] >= 0xfe80 && g[0] <= 0xfebf) return "link-local address fe80::/10";
+  return undefined;
+}
+
+/**
+ * Refuse the URL before any socket is opened. Returns the Check to report, or
+ * undefined when the URL is allowed. A URL we cannot even parse is definitive —
+ * nothing downstream will ever fetch it — mirroring "Invalid S3 URI format".
+ */
+function urlGate(value: string): Check | undefined {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return { outcome: "definitive", method: "parse", detail: `Invalid URL format: ${redactUrl(value)}` };
+  }
+
+  const blocked = (reason: string): Check => ({
+    outcome: "definitive",
+    method: "parse",
+    detail: `Blocked URL host — ${reason}: ${redactUrl(value)}`,
+  });
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return blocked(`unsupported scheme ${url.protocol.replace(/:$/, "")}`);
+  }
+  // URL.hostname brackets an IPv6 literal: "[::1]".
+  const host = url.hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  if (host === "localhost" || host.endsWith(".localhost")) return blocked("loopback name localhost");
+  const reason = isIPv4(host) ? blockedIpv4Reason(host) : isIPv6(host) ? blockedIpv6Reason(host) : undefined;
+  return reason ? blocked(reason) : undefined;
+}
+
 /** Cancel the body without reading a byte of it. */
 async function discardBody(res: Response): Promise<void> {
   try {
@@ -378,6 +477,12 @@ async function checkUrlSource(
   value: string,
   ctx: { fetchImpl: typeof fetch; env: NodeJS.ProcessEnv }
 ): Promise<Check> {
+  // FIRST, before even the trusted-owner shortcut: a blocked literal host must
+  // never be labelled "trusted" on the strength of a path that spells out
+  // github.com/<owner>/.
+  const gate = urlGate(value);
+  if (gate) return gate;
+
   const trustedOwner = ctx.env.GITHUB_OWNER;
   if (trustedOwner && value.includes(`github.com/${trustedOwner}/`)) {
     return {
@@ -391,11 +496,15 @@ async function checkUrlSource(
   // always GET. Range: bytes=0-0 keeps it to a single byte; the URL itself is
   // never modified (an extra query param would break the signature) and no
   // other header is added (If-Range etc. would too).
+  // redirect:"manual" on BOTH calls (TEAM-4091 F1) — following a redirect hands
+  // the destination back to the caller and walks straight past urlGate, which only
+  // ever saw the URL that was submitted.
   let method = "GET (Range 0-0)";
   try {
     let res = await ctx.fetchImpl(value, {
       method: "GET",
       headers: { Range: "bytes=0-0" },
+      redirect: "manual",
       signal: AbortSignal.timeout(URL_TIMEOUT_MS),
     });
     await discardBody(res);
@@ -404,13 +513,27 @@ async function checkUrlSource(
     // empty or the origin dislikes the range. Both are worth one plain retry.
     if (res.status === 403 || res.status === 416) {
       method = "GET";
-      res = await ctx.fetchImpl(value, { method: "GET", signal: AbortSignal.timeout(URL_TIMEOUT_MS) });
+      res = await ctx.fetchImpl(value, {
+        method: "GET",
+        redirect: "manual",
+        signal: AbortSignal.timeout(URL_TIMEOUT_MS),
+      });
       await discardBody(res);
     }
 
     // 200 (plain GET) and 206 (satisfied Range) are the expected successes.
     if (res.status >= 200 && res.status < 300) {
       return { outcome: "verified", method, detail: `URL readable — ${method} -> ${res.status}: ${redactUrl(value)}` };
+    }
+
+    // Unfollowed by design: the redirect target is unvalidated, so "could not
+    // verify" is the honest answer rather than a status read from somewhere else.
+    if (res.status >= 300 && res.status < 400) {
+      return {
+        outcome: "transient",
+        method,
+        detail: `URL redirected — ${method} -> ${res.status}: ${redactUrl(value)}`,
+      };
     }
 
     const gone = res.status === 404 || res.status === 410;
