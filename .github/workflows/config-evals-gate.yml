@@ -98,7 +98,8 @@
 # OPT-IN (2026-09-04): the gate is off by default. Jobs run only when the PR
 # carries the `config-evals` label, or when the repository variable
 # CONFIG_EVALS_GATE is `always` (restores the always-run/required-check design
-# above for every PR). Unlabeled PRs get no check run at all. For on-demand runs
+# above for every PR). Unlabeled PRs get no check run at all; the label path is
+# same-repo only (a labeled fork PR is ignored — see changed-paths). For on-demand runs
 # against any ref use config-evals-run.yml (workflow_dispatch).
 name: Config Evals Gate
 
@@ -124,7 +125,11 @@ jobs:
   # DUPLICATE of this list — it recomputes gatedness for fork PRs from the
   # trusted side — and a contract test pins the two lists equal.
   changed-paths:
-    if: contains(github.event.pull_request.labels.*.name, 'config-evals') || vars.CONFIG_EVALS_GATE == 'always'
+    # Label opt-in is SAME-REPO only: a labeled fork PR cannot get a check (this
+    # workflow's token is read-only on forks and the trusted publisher only runs
+    # in always-on mode), so it is ignored rather than left "pending" forever.
+    # Maintainers gate a fork contribution by pushing its branch to this repo.
+    if: (contains(github.event.pull_request.labels.*.name, 'config-evals') && github.event.pull_request.head.repo.full_name == github.repository) || vars.CONFIG_EVALS_GATE == 'always'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

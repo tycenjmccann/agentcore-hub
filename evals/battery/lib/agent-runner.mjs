@@ -7,6 +7,7 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createRegistry } from "./registry.mjs";
+import { resolveFixtureRef } from "./cases.mjs";
 import { backoffDelayMs, createRetryBudget, linkAbort, sleep } from "./retry.mjs";
 
 // Mirrors CODING_MODEL_TIERS in deploy/runtime-agent/main.py (keep in sync;
@@ -130,7 +131,7 @@ async function converseLoop({ caseDef, repoRoot, converse, modelId, signal, maxT
     const system = [{ text: readFileSync(systemPromptPath(repoRoot, caseDef.targetAgentId), "utf8") }];
     let transcript = null;
     if (caseDef.input?.transcript) {
-      transcript = JSON.parse(readFileSync(join(repoRoot, "evals", "battery", caseDef.input.transcript), "utf8"));
+      transcript = JSON.parse(readFileSync(resolveFixtureRef(repoRoot, caseDef.input.transcript), "utf8"));
     }
     const messages = buildMessages(transcript, caseDef.taskPrompt);
     const usage = { inputTokens: 0, outputTokens: 0 };
