@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { outageKey } from "./runtime-health.mjs";
 
 /**
  * TEAM-3991 D1.5 — the PR-aware dispatch guard.
@@ -41,6 +42,13 @@ const h = vi.hoisted(() => ({
     branchAhead: 3,
     ghStatus: 200,
     ghCalls: /** @type {string[]} */ ([]),
+    // TEAM-3992 D4.2 runtime-health wiring: when set, S3 serves config/agents.json
+    // (so an agent's `tools` decide whether the runtime probe runs) and the
+    // per-arn outage object (so the guard refuses without any bedrock call).
+    roster: /** @type {any[] | null} */ (null),
+    runtimeOutage: /** @type {any} */ (null),
+    runtimeOutageKey: "",
+    s3Deletes: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -82,14 +90,30 @@ vi.mock("@aws-sdk/client-lambda", () => ({
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
-      if (cmd.constructor.name === "PutObjectCommand") { h.state.s3Puts.push(cmd.input); return {}; }
-      const e = new Error("The specified key does not exist.");
-      e.name = "NoSuchKey";
-      throw e;
+      const name = cmd.constructor.name;
+      if (name === "PutObjectCommand") { h.state.s3Puts.push(cmd.input); return { ETag: '"etag-put"' }; }
+      if (name === "DeleteObjectCommand") { h.state.s3Deletes.push(cmd.input); return {}; }
+      if (name === "GetObjectCommand") {
+        const key = cmd.input.Key;
+        // config/agents.json — only served when a test opts in via h.state.roster;
+        // otherwise the loader falls back exactly as before (D1.5 tests unaffected).
+        if (key === "config/agents.json" && h.state.roster) {
+          return { Body: { transformToString: async () => JSON.stringify({ agents: h.state.roster }) } };
+        }
+        // The per-arn outage object (runtime-health/<sha1>.json).
+        if (h.state.runtimeOutage && key === h.state.runtimeOutageKey) {
+          return { Body: { transformToString: async () => JSON.stringify(h.state.runtimeOutage) }, ETag: '"etag-outage"' };
+        }
+        const e = new Error("The specified key does not exist.");
+        e.name = "NoSuchKey";
+        throw e;
+      }
+      return {};
     }
   },
   GetObjectCommand: class { constructor(i) { this.input = i; } },
   PutObjectCommand: class { constructor(i) { this.input = i; } },
+  DeleteObjectCommand: class { constructor(i) { this.input = i; } },
   ListObjectsV2Command: class { constructor(i) { this.input = i; } },
 }));
 
@@ -200,6 +224,11 @@ beforeEach(() => {
   h.state.branchAhead = 3;
   h.state.ghStatus = 200;
   h.state.ghCalls.length = 0;
+  h.state.roster = null;
+  h.state.runtimeOutage = null;
+  h.state.runtimeOutageKey = "";
+  h.state.s3Deletes.length = 0;
+  delete process.env.CODING_AGENT_RUNTIME_ARN;
 
   vi.stubGlobal("fetch", async (url) => {
     const u = String(url);
@@ -354,6 +383,81 @@ describe("preDispatchGuards (D1.5) — the Jira-webhook ready twin", () => {
     await handler({ source: "jira-webhook", ticketId: TICKET, newStatus: "ready", oldStatus: "todo" });
 
     expect(h.state.store.setResumeContext[0].note).toContain("PR #327 exists");
+    expect(h.state.store.claimInvocation).toContainEqual({ wfId: "wf_1", tid: TICKET });
+  });
+});
+
+// TEAM-3992 D4.2 — the runtime-health gate WIRED into the same pre-dispatch path.
+// The pure gate logic is exhaustively covered in runtime-health.test.mjs; these
+// prove the CALL exists at the ready dispatch boundary (same rationale as
+// gate-bypass-wiring: a correct module nobody invokes fixes nothing) and that it
+// gates ONLY coding-tooled agents. A pre-seeded outage object makes the refusal
+// deterministic with zero bedrock calls.
+describe("preDispatchGuards (D4.2) — coding-runtime health gate wiring", () => {
+  const CODING_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/coding-xyz";
+  const roster = (devTools) => [
+    { agentId: DEV, phase: "development", tools: devTools },
+    { agentId: "agentcore_hub_requirements_analyst", phase: "requirements", tools: [] },
+  ];
+  const outageObject = () => ({
+    runtimeArn: CODING_ARN, state: "outage", since: "2026-09-05T11:00:00Z",
+    probes: 2, backoffIdx: 0, nextProbeAt: "2026-09-05T11:05:00Z",
+    lastError: "probe failed", blockedTickets: [], outageEventId: "outage-x",
+  });
+
+  it("coding-tooled agent + open outage → refused runtime_outage, parked, NOT dispatched", async () => {
+    process.env.CODING_AGENT_RUNTIME_ARN = CODING_ARN;
+    await load();
+    h.state.roster = roster(["claude_code"]);
+    h.state.runtimeOutageKey = outageKey(CODING_ARN);
+    h.state.runtimeOutage = outageObject();
+
+    await handler({ Records: [readyRecord()] });
+
+    // No dispatch: the ticket was parked, not invoked.
+    expect(h.state.store.claimInvocation).toHaveLength(0);
+    expect(h.state.lambdaInvokes).toHaveLength(0);
+
+    const refused = eventsOfType("orchestrator.dispatch_refused");
+    expect(refused).toHaveLength(1);
+    expect(refused[0].detail.refused).toBe("runtime_outage");
+
+    // Parked blocked:runtime in DynamoDB…
+    const parked = h.state.ticketUpdates.find((u) => u.ExpressionAttributeValues?.[":br"] === "runtime");
+    expect(parked).toBeTruthy();
+    expect(parked.ExpressionAttributeValues[":s"]).toBe("blocked");
+    // …and recorded in the outage object via a CAS (PutObject IfMatch), no bedrock call.
+    const put = h.state.s3Puts.find((p) => p.Key === h.state.runtimeOutageKey);
+    expect(put?.IfMatch).toBe('"etag-outage"');
+  });
+
+  it("non-coding agent bypasses the probe entirely even during an open outage", async () => {
+    process.env.CODING_AGENT_RUNTIME_ARN = CODING_ARN;
+    await load();
+    h.state.roster = roster([]); // the dev agent shells no coding CLI here
+    h.state.runtimeOutageKey = outageKey(CODING_ARN);
+    h.state.runtimeOutage = outageObject();
+    h.state.prs = []; // the repo/PR guard finds nothing → dispatch proceeds
+
+    await handler({ Records: [readyRecord()] });
+
+    // The gate never consulted the outage object: no refusal, no runtime park.
+    expect(eventsOfType("orchestrator.dispatch_refused")).toHaveLength(0);
+    expect(h.state.ticketUpdates.find((u) => u.ExpressionAttributeValues?.[":br"] === "runtime")).toBeUndefined();
+    expect(h.state.store.claimInvocation).toContainEqual({ wfId: "wf_1", tid: TICKET });
+  });
+
+  it("no CODING_AGENT_RUNTIME_ARN → gate dark, coding agent dispatches normally", async () => {
+    // Env deliberately unset (beforeEach clears it).
+    await load();
+    h.state.roster = roster(["claude_code"]);
+    h.state.runtimeOutageKey = outageKey(CODING_ARN);
+    h.state.runtimeOutage = outageObject();
+    h.state.prs = [];
+
+    await handler({ Records: [readyRecord()] });
+
+    expect(eventsOfType("orchestrator.dispatch_refused")).toHaveLength(0);
     expect(h.state.store.claimInvocation).toContainEqual({ wfId: "wf_1", tid: TICKET });
   });
 });

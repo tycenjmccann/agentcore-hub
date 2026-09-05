@@ -23,7 +23,7 @@ import {
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
-import { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import {
   BedrockAgentRuntimeClient,
@@ -43,6 +43,7 @@ import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade, newMetrics as newCascadeMetrics } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
+import { createRuntimeHealth, outageKey as runtimeOutageKey } from "./runtime-health.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, fixVerificationGaps, openGateOf, parseCdEvidence, blockReasonWithGate, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, ACCEPTED_SHIP_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
@@ -127,6 +128,17 @@ const CASCADE_EXTENDED_STATES_MODE = resolveCascadeMode(process.env.CASCADE_EXTE
 // DDB reads/writes. shadow/enforce only when the operator explicitly sets the
 // var (deploy.sh forwards it only when set).
 const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
+
+// TEAM-3992 D4.2 — coding-runtime health gate. The fleet's coding agents delegate
+// claude_code/codex/kiro to the single coding-agent runtime; when it is wedged,
+// dispatching a coding ticket burns a full invoke to die mid-turn. CODING_AGENT_RUNTIME_ARN
+// is the ONLY thing that arms the gate — unset (the pre-D4.2 posture) fails open,
+// so nothing changes until an operator wires the runtime. The probe/confirm/backoff
+// knobs have code defaults (60s healthy cache, 2 consecutive fails to declare, 5/15/30m
+// backoff) resolved inside runtime-health.mjs; only forward explicit overrides.
+const CODING_AGENT_RUNTIME_ARN = process.env.CODING_AGENT_RUNTIME_ARN || "";
+// Roster tools that make an agent depend on the coding runtime (poll-probe gate).
+const CODING_RUNTIME_TOOLS = new Set(["claude_code", "codex", "kiro"]);
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -234,6 +246,10 @@ async function loadAgentRoster() {
       // software-delivery and bug-fix). workflowDefIds is the multi-def list;
       // fall back to the single workflowDefId shorthand.
       workflowDefIds: a.workflowDefIds?.length ? a.workflowDefIds : [a.workflowDefId || DEFAULT_WORKFLOW_DEF_ID],
+      // TEAM-3992 D4.2 — carried so the runtime-health gate can tell which agents
+      // actually shell a coding CLI (claude_code/codex/kiro) and therefore depend
+      // on the coding-agent runtime. Everything else bypasses the probe entirely.
+      tools: Array.isArray(a.tools) ? a.tools : [],
     }));
     console.log(`[orchestrator] Loaded ${_agentRoster.length} agents from S3 config`);
   } catch (err) {
@@ -420,8 +436,148 @@ function getReconcileSweep() {
       return gateBypassCheck(workflow, ticket, children);
     },
     retryEpicRollup: retryPendingEpicRollups,
+    // TEAM-3992 D4.2 — hold coding tickets while a coding-runtime outage object
+    // exists (one S3 head per sweep); the runtime-health recovery sweep owns
+    // their resume. Both no-ops when no runtime is configured.
+    runtimeOutageActive: async () => {
+      if (!CODING_AGENT_RUNTIME_ARN || !ARTIFACT_BUCKET) return false;
+      try {
+        await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: runtimeOutageKey(CODING_AGENT_RUNTIME_ARN) }));
+        return true;
+      } catch (err) {
+        if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) return false;
+        throw err;
+      }
+    },
+    isCodingTicket: (sibling) => agentUsesCodingRuntime(sibling?.assignee),
   });
   return _reconcileSweep;
+}
+
+// ─── Coding-runtime health gate (TEAM-3992 D4.2) ─────────────────────────────
+
+/** True when an agent shells a coding CLI and thus depends on the coding runtime. */
+function agentUsesCodingRuntime(assignee) {
+  const def = getAgentDef(assignee);
+  const tools = def?.tools || [];
+  return tools.some((t) => CODING_RUNTIME_TOOLS.has(t));
+}
+
+/**
+ * Park a coding ticket blocked:runtime — the coding runtime is unreachable, so
+ * the invoke would only die mid-turn. Provider-aware, best-effort (never throws).
+ * DynamoDB mode stamps blockReason="runtime" so the board can label it "Blocked:
+ * runtime outage"; Jira mode transitions to Blocked and leaves a [blocked:runtime]
+ * comment. This is a tickets-table write (the workflows-table write guard is not
+ * in play).
+ */
+async function blockTicketRuntime(ticketId) {
+  if (!ticketId) return;
+  try {
+    if (TICKET_PROVIDER === "jira") {
+      const moved = (await jiraTransition(ticketId, "Blocked")) || (await jiraTransition(ticketId, "To Do"));
+      if (!moved) console.warn(`[orchestrator] Could not park ${ticketId} on runtime outage`);
+      await jiraFetch(`/rest/api/3/issue/${ticketId}/comment`, "POST", {
+        body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "AgentCore Hub [blocked:runtime]: the coding-agent runtime is unreachable. This ticket will auto-resume when the runtime recovers." }] }] },
+      });
+    } else {
+      await ddb.send(new UpdateCommand({
+        TableName: TICKETS_TABLE,
+        Key: { ticketId },
+        UpdateExpression: "SET #s = :s, #br = :br, #u = :u",
+        ExpressionAttributeNames: { "#s": "status", "#br": "blockReason", "#u": "updatedAt" },
+        ExpressionAttributeValues: { ":s": "blocked", ":br": "runtime", ":u": new Date().toISOString() },
+      }));
+    }
+  } catch (err) {
+    console.warn(`[orchestrator] blockTicketRuntime(${ticketId}) failed: ${err.message}`);
+  }
+}
+
+// One shared runtime-health gate per warm container (same shape as the cascade /
+// detector singletons). The S3 seam is adapted to the ETag/IfNoneMatch/IfMatch
+// contract runtime-health.mjs expects; the InvokeAgentRuntime call is lazily
+// imported so warm containers that never probe don't construct the client.
+let _runtimeHealth = null;
+function getRuntimeHealth() {
+  if (_runtimeHealth) return _runtimeHealth;
+  _runtimeHealth = createRuntimeHealth({
+    env: {
+      CODING_AGENT_RUNTIME_ARN,
+      TICKET_PROVIDER,
+      RUNTIME_PROBE_CACHE_MS: process.env.RUNTIME_PROBE_CACHE_MS,
+      RUNTIME_PROBE_CONFIRM: process.env.RUNTIME_PROBE_CONFIRM,
+      RUNTIME_OUTAGE_BACKOFF_MIN: process.env.RUNTIME_OUTAGE_BACKOFF_MIN,
+    },
+    now: () => Date.now(),
+    publishEvent,
+    invokeRuntime: invokeCodingRuntimeProbe,
+    s3: {
+      getObject: async (key) => {
+        try {
+          const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+          return { body: await res.Body.transformToString(), etag: res.ETag };
+        } catch (err) {
+          if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) return null;
+          throw err;
+        }
+      },
+      putObject: async (key, body, opts = {}) => {
+        const res = await s3.send(new PutObjectCommand({
+          Bucket: ARTIFACT_BUCKET,
+          Key: key,
+          Body: body,
+          ContentType: "application/json",
+          ...(opts.ifNoneMatch ? { IfNoneMatch: opts.ifNoneMatch } : {}),
+          ...(opts.ifMatch ? { IfMatch: opts.ifMatch } : {}),
+        }));
+        return { etag: res.ETag };
+      },
+      deleteObject: async (key) => {
+        await s3.send(new DeleteObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+      },
+    },
+    blockTicketRuntime,
+    appendNotificationOnce: (workflowId, notification) => store.appendNotificationOnce(workflowId, notification),
+    cascade: getCascade(),
+    loadWorkflow: (workflowId) => store.getWorkflow(workflowId),
+    loadTicket: async (workflow, ticketId) => {
+      const children = await getChildTickets(workflow.epicId).catch(() => []);
+      return children.find((t) => t.ticketId === ticketId) || (await getTicket(ticketId));
+    },
+    log: (msg) => console.log(msg),
+  });
+  return _runtimeHealth;
+}
+
+/**
+ * Concrete InvokeAgentRuntime probe — the ONLY place a bedrock-agentcore client is
+ * constructed for the health gate. Mirrors the fleet's `_coding_invoke` shape
+ * (deploy/runtime-agent/main.py): agentRuntimeArn + runtimeSessionId + a JSON
+ * payload; the poll action is read-only on the runtime side. Returns
+ * { statusCode, json }. Connect/read timeouts keep a wedged runtime from hanging
+ * the 45s probe budget. Lazily imported so this is free on warm paths that never probe.
+ */
+async function invokeCodingRuntimeProbe({ arn, sessionId, payload }) {
+  const { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } = await import("@aws-sdk/client-bedrock-agentcore");
+  const { NodeHttpHandler } = await import("@smithy/node-http-handler");
+  const client = new BedrockAgentCoreClient({
+    region: REGION,
+    requestHandler: new NodeHttpHandler({ connectionTimeout: 5000, requestTimeout: 20000 }),
+  });
+  const resp = await client.send(new InvokeAgentRuntimeCommand({
+    agentRuntimeArn: arn,
+    runtimeSessionId: sessionId,
+    payload: new TextEncoder().encode(JSON.stringify(payload)),
+    accept: "application/json",
+  }));
+  const statusCode = resp?.statusCode ?? resp?.$metadata?.httpStatusCode ?? 0;
+  let json = null;
+  try {
+    const raw = resp?.response ? await resp.response.transformToString() : "";
+    json = raw ? JSON.parse(raw) : null;
+  } catch { json = null; }
+  return { statusCode, json };
 }
 
 // ─── Review-gate round cap (TEAM-3619 D2c) ───────────────────────────────────
@@ -518,6 +674,16 @@ export const handler = async (event) => {
   if (event?.source === "orchestrator.sweep" && event?.action === "reconcile_sweep") {
     console.log(`[orchestrator] reconcile sweep (mode=${RECONCILE_SWEEP_MODE})`);
     return getReconcileSweep().runSweep(RECONCILE_SWEEP_MODE);
+  }
+
+  // Scheduled coding-runtime recovery sweep (TEAM-3992 D4.2). Same sentinel-event
+  // pattern. Re-probes the coding runtime with backoff while an outage object
+  // exists and, on recovery, auto-resumes every parked ticket through the cascade.
+  // No-op (single S3 head) when no runtime is configured or no outage is open.
+  if (event?.source === "orchestrator.sweep" && event?.action === "runtime_health_sweep") {
+    if (!CODING_AGENT_RUNTIME_ARN) return { skipped: "no_runtime" };
+    console.log(`[orchestrator] runtime-health sweep`);
+    return getRuntimeHealth().runtimeHealthSweep();
   }
 
   // SQS FIFO command queue (R1 — docs/race-condition-study.md). One message
@@ -1091,6 +1257,22 @@ async function preDispatchGuards(workflow, ticket, { source = "dispatch" } = {})
   const ticketId = ticket?.ticketId || ticket?.id;
   if (!workflow?.id || !ticketId) return { ok: true };
   if (isHumanAssignee(ticket?.assignee)) return { ok: true };
+
+  // TEAM-3992 D4.2 — coding-runtime health gate. ONLY agents that shell a coding
+  // CLI depend on the coding runtime; everything else skips the probe. Runs
+  // BEFORE the repo/PAT early-return below because a coding runtime can be down
+  // regardless of repo config, and gates on its own S3 outage object + cheap
+  // poll-probe. Never throws (its own effects are best-effort); a refusal here
+  // parks the ticket blocked:runtime instead of dispatching it into a dead microVM.
+  if (CODING_AGENT_RUNTIME_ARN && agentUsesCodingRuntime(ticket?.assignee)) {
+    try {
+      const health = await getRuntimeHealth().runtimeHealthGuard(workflow, ticket);
+      if (!health.ok) return { ok: false, refused: health.reason, detail: health.detail || "coding runtime outage" };
+    } catch (err) {
+      console.warn(`[orchestrator] ${ticketId}: runtime-health gate skipped (non-fatal): ${err?.message || err}`);
+    }
+  }
+
   if (!workflow.repoConfig?.repos?.length || !process.env.GITHUB_PAT) return { ok: true };
 
   try {
