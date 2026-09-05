@@ -24,6 +24,12 @@ export default defineConfig({
     // at the module seam, so its voice/Transcribe contract is testable here too.
     include: [
       "src/**/*.test.ts",
+      // Config-evals battery (evals/battery/): runner math, scoring, gate rules
+      // — hermetic (mock transport, no Bedrock).
+      "evals/battery/**/*.test.ts",
+      // Deploy-guard tests: bash subprocess + fixture repos + PATH-shimmed
+      // fake gh — still hermetic (no AWS, no network).
+      "deploy/lib/__tests__/**/*.test.ts",
       "lambda/eval-packager/**/*.test.mjs",
       "deploy/telegram-bug-intake/**/*.test.mjs",
       // workflow-store is pure DDB-command construction — unit-testable with a

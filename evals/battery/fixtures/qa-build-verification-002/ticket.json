@@ -1,0 +1,13 @@
+{
+  "ticketId": "BATT-111",
+  "title": "QA verification: pagination fix branch",
+  "issueType": "Task",
+  "assignee": "agentcore_hub_qa_verifier",
+  "blockedBy": ["BATT-105"],
+  "acceptanceCriteria": [
+    "Page N of size S returns exactly S items except the final partial page (design contract)",
+    "Regression test pagination.test.ts covers an exact page-boundary count and fails on the pre-fix code",
+    "npm run test:unit, npx tsc --noEmit, and npm run build all exit 0 on the feature branch",
+    "No behavior change for out-of-range pages (empty items, correct total)"
+  ]
+}

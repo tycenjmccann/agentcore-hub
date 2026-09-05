@@ -1,11 +1,56 @@
 #!/bin/bash
 # Deploy a single agent to AgentCore Runtime
-# Usage: ./deploy-one.sh <agent_name>
+# Usage: ./deploy-one.sh [--force --force-reason "<why>"] <agent_name>
 
-AGENT_NAME=$1
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+usage() {
+  echo "Usage: deploy-one.sh [--force --force-reason \"<why>\"] <agent_name>"
+  echo ""
+  echo "Options:"
+  eval_gate_force_usage_lines
+}
+
+# Eval gate (FR-7): refuse to ship ungated prompt changes. No-ops when
+# deploy-fleet.sh already latched the gate token for this process tree.
+# Explicit-fail on source (TEAM-3388): the gate must never be skippable via a
+# failed source + command-not-found, even if set -e is ever removed above.
+# Sourced BEFORE arg parsing so a missing/broken gate helper is still the first
+# thing that kills the run — loading these files only defines functions.
+# shellcheck disable=SC1091 # resolved relative to this script at runtime
+source "$SCRIPT_DIR/../lib/check-eval-gate.sh" \
+  || { echo "FATAL: cannot load eval gate helper ($SCRIPT_DIR/../lib/check-eval-gate.sh) — refusing to deploy ungated" >&2; exit 1; }
+# --force / --force-reason parsing lives in one shared helper (TEAM-3426
+# FINDING 4) so this script and deploy.sh cannot drift. Before the fix, $1 was
+# assigned straight to AGENT_NAME, so `deploy-one.sh --force <agent>` silently
+# treated "--force" as the agent name and ran the normal gate.
+# shellcheck disable=SC1091 # resolved relative to this script at runtime
+source "$SCRIPT_DIR/../lib/parse-force-args.sh" \
+  || { echo "FATAL: cannot load arg parser ($SCRIPT_DIR/../lib/parse-force-args.sh) — refusing to deploy ungated" >&2; exit 1; }
+
+# Parse before any gate/deploy work: --force exports EVAL_GATE_OVERRIDE and
+# EVAL_GATE_OVERRIDE_REASON so require_eval_gate below takes the SAME audited
+# break-glass path as the env-var form. Unknown flags are rejected outright,
+# never misparsed as an agent name.
+parse_force_args "$@" || { usage >&2; exit 1; }
+if [ "${#FORCE_ARGS_POSITIONAL[@]}" -gt 0 ]; then
+  set -- "${FORCE_ARGS_POSITIONAL[@]}"
+else
+  set --
+fi
+if [ "$#" -ne 1 ]; then
+  echo "ERROR: expected exactly one agent name, got $# positional argument(s)." >&2
+  usage >&2
+  exit 1
+fi
+
+AGENT_NAME="$1"
 ROLE_ARN="${AGENTCORE_ROLE_ARN:?Set AGENTCORE_ROLE_ARN to your AgentCore execution role ARN}"
 REGION="${AWS_REGION:-us-east-1}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+require_eval_gate "deploy/runtime-agent/prompts/**"
 
 # DEPLOY_MODE selects between two deploy paths:
 #   lightweight (default) — CodeZip via the bedrock-agentcore-starter-toolkit.
@@ -41,7 +86,7 @@ if [ -z "${GITHUB_PAT:-}" ]; then
     "$SCRIPT_DIR/.env.local" \
     "$PWD/.env.local"; do
     if [ -f "$candidate" ]; then
-      GITHUB_PAT=$(grep "^GITHUB_PAT=" "$candidate" | cut -d= -f2-)
+      GITHUB_PAT=$(grep "^GITHUB_PAT=" "$candidate" | cut -d= -f2- || true)
       # apply-env.sh writes values double-quoted (GITHUB_PAT="ghp_..."). cut keeps
       # the quotes, which would bake a literal Bearer "ghp_..." header → GitHub MCP
       # 400. Strip one layer of surrounding single/double quotes to match what a
@@ -68,7 +113,7 @@ if [ -z "${FLEET_MEMORY_ID:-}" ]; then
     "$SCRIPT_DIR/.env.local" \
     "$PWD/.env.local"; do
     if [ -f "$candidate" ]; then
-      FLEET_MEMORY_ID=$(grep "^FLEET_MEMORY_ID=" "$candidate" | cut -d= -f2-)
+      FLEET_MEMORY_ID=$(grep "^FLEET_MEMORY_ID=" "$candidate" | cut -d= -f2- || true)
       FLEET_MEMORY_ID="${FLEET_MEMORY_ID%\"}"; FLEET_MEMORY_ID="${FLEET_MEMORY_ID#\"}"
       FLEET_MEMORY_ID="${FLEET_MEMORY_ID%\'}"; FLEET_MEMORY_ID="${FLEET_MEMORY_ID#\'}"
       if [ -n "$FLEET_MEMORY_ID" ]; then
@@ -91,7 +136,7 @@ if [ -z "${IOS_TEST_GATEWAY_URL:-}" ]; then
     "$SCRIPT_DIR/.env.local" \
     "$PWD/.env.local"; do
     if [ -f "$candidate" ]; then
-      IOS_TEST_GATEWAY_URL=$(grep "^IOS_TEST_GATEWAY_URL=" "$candidate" | cut -d= -f2-)
+      IOS_TEST_GATEWAY_URL=$(grep "^IOS_TEST_GATEWAY_URL=" "$candidate" | cut -d= -f2- || true)
       IOS_TEST_GATEWAY_URL="${IOS_TEST_GATEWAY_URL%\"}"; IOS_TEST_GATEWAY_URL="${IOS_TEST_GATEWAY_URL#\"}"
       IOS_TEST_GATEWAY_URL="${IOS_TEST_GATEWAY_URL%\'}"; IOS_TEST_GATEWAY_URL="${IOS_TEST_GATEWAY_URL#\'}"
       if [ -n "$IOS_TEST_GATEWAY_URL" ]; then
@@ -139,9 +184,6 @@ if [ ! -f "$PROMPT_FILE" ]; then
   exit 1
 fi
 
-PROMPT_SIZE=$(wc -c < "$PROMPT_FILE")
-PROMPT_S3_KEY=""
-
 # Always upload to S3 — inline env vars break on special chars in prompts
 PROMPT_S3_KEY="prompts/${AGENT_NAME}.txt"
 aws s3 cp "$PROMPT_FILE" "s3://${ARTIFACT_BUCKET}/${PROMPT_S3_KEY}" --region "$REGION" > /dev/null 2>&1
@@ -172,6 +214,7 @@ PROMPT_ENV="--env SYSTEM_PROMPT_S3_KEY=${PROMPT_S3_KEY}"
 # set DISABLE_ADOT_OBSERVABILITY: without ADOT the invoke_agent span is never
 # exported and eval batches score 0/10.
 run_deploy() {
+  # shellcheck disable=SC2086 # PROMPT_ENV/MCP_ENV deliberately word-split into --env args
   agentcore deploy \
     --auto-update-on-conflict \
     --env "BYPASS_TOOL_CONSENT=true" \
@@ -205,15 +248,16 @@ run_deploy() {
     ${MCP_ENV} 2>&1
 }
 
-OUTPUT=$(run_deploy)
-DEPLOY_EXIT=$?
+# A failed deploy must reach the FAIL handling below, not abort under set -e.
+DEPLOY_EXIT=0
+OUTPUT=$(run_deploy) || DEPLOY_EXIT=$?
 
 if [ $DEPLOY_EXIT -ne 0 ] && echo "$OUTPUT" | grep -qE "OperationAborted|conflicting conditional operation"; then
   # Concurrent toolkit bucket-create race; back off and retry once.
   sleep $((RANDOM % 5 + 3))
   echo "  Retrying $AGENT_NAME after S3 bucket-create race..." >&2
-  OUTPUT=$(run_deploy)
-  DEPLOY_EXIT=$?
+  DEPLOY_EXIT=0
+  OUTPUT=$(run_deploy) || DEPLOY_EXIT=$?
 fi
 
 # Check deploy exit code first, then verify via agentcore status
@@ -221,19 +265,20 @@ if [ $DEPLOY_EXIT -ne 0 ]; then
   # Check if it's a real error or just a non-zero exit with successful update
   if echo "$OUTPUT" | grep -qi "error\|failed\|exception"; then
     echo "FAIL $AGENT_NAME (deploy error, exit=$DEPLOY_EXIT)"
-    echo "$OUTPUT" | grep -i "error\|fail\|Exception" | tail -5 >&2
+    echo "$OUTPUT" | grep -i "error\|fail\|Exception" | tail -5 >&2 || true
     rm -rf "$DEPLOY_DIR"
     exit 1
   fi
 fi
 
-# Verify deployment via status (reliable regardless of deploy output format)
-STATUS_OUTPUT=$(agentcore status 2>&1)
+# Verify deployment via status (reliable regardless of deploy output format).
+# `|| true`: a non-zero status must reach the FAIL branch below, not abort here.
+STATUS_OUTPUT=$(agentcore status 2>&1) || true
 if echo "$STATUS_OUTPUT" | grep -q "READY\|CREATE_COMPLETE\|UPDATE_COMPLETE"; then
   # Try to extract ARN from status or deploy output
-  ARN=$(echo "$OUTPUT" | grep -o 'arn:aws:bedrock-agentcore:[^"]*runtime/[^"[:space:]]*' | head -1)
+  ARN=$(echo "$OUTPUT" | grep -o 'arn:aws:bedrock-agentcore:[^"]*runtime/[^"[:space:]]*' | head -1 || true)
   if [ -z "$ARN" ]; then
-    ARN=$(echo "$STATUS_OUTPUT" | grep -o 'arn:aws:bedrock-agentcore:[^"]*runtime/[^"[:space:]]*' | head -1)
+    ARN=$(echo "$STATUS_OUTPUT" | grep -o 'arn:aws:bedrock-agentcore:[^"]*runtime/[^"[:space:]]*' | head -1 || true)
   fi
 
   # Merge ARN into fleet-runtime-ids.json so re-runs are first-class.
@@ -245,11 +290,17 @@ if echo "$STATUS_OUTPUT" | grep -q "READY\|CREATE_COMPLETE\|UPDATE_COMPLETE"; th
     LOCK_DIR="$SCRIPT_DIR/.fleet-file.lock"
     for _ in $(seq 1 50); do
       if mkdir "$LOCK_DIR" 2>/dev/null; then
+        # A jq failure here must not abort under set -e (the merge is
+        # redundant during fleet deploys) and must never leave the lock held.
         if [ -f "$FLEET_FILE" ]; then
-          jq --arg name "$AGENT_NAME" --arg arn "$ARN" '. + {($name): $arn}' "$FLEET_FILE" > "$FLEET_FILE.tmp" \
-            && mv "$FLEET_FILE.tmp" "$FLEET_FILE"
+          if ! jq --arg name "$AGENT_NAME" --arg arn "$ARN" '. + {($name): $arn}' "$FLEET_FILE" > "$FLEET_FILE.tmp" \
+            || ! mv "$FLEET_FILE.tmp" "$FLEET_FILE"; then
+            rm -f "$FLEET_FILE.tmp"
+            echo "  WARNING: fleet-file merge failed for $AGENT_NAME" >&2
+          fi
         else
-          jq -n --arg name "$AGENT_NAME" --arg arn "$ARN" '{($name): $arn}' > "$FLEET_FILE"
+          jq -n --arg name "$AGENT_NAME" --arg arn "$ARN" '{($name): $arn}' > "$FLEET_FILE" \
+            || { rm -f "$FLEET_FILE"; echo "  WARNING: fleet-file write failed for $AGENT_NAME" >&2; }
         fi
         rmdir "$LOCK_DIR"
         break

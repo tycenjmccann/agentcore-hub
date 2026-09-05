@@ -1,0 +1,42 @@
+{
+  "id": "review-error-handling-001",
+  "title": "Code review: diff swallows errors and skips the empty-list path",
+  "targetAgentId": "agentcore_hub_code_reviewer",
+  "taskPrompt": "# Your Assignment: Review the archive-workflow dev branch before QA\n\n## Ticket\nID: BATT-107\nDescription: Adversarial review of the diff in diff.patch (input files); pr-context.md has the dev's completion claim. Reason about the failure modes the author's own tests never exercise — error paths, empty reads, races. File a fix ticket for each substantive finding and report your verdict via WorkflowOutput___report_completion. You review; you do not merge.\n\n## Workflow Context\nworkflow_id: wf_battery_review_error_handling_001\nepic_id: BATT-100\nticket_id: BATT-107\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_review_error_handling_001/shared/\nyour_workspace: workflows/wf_battery_review_error_handling_001/agents/agentcore_hub_code_reviewer/",
+  "referenceInputs": {
+    "expectedOutcomes": [
+      "Reads the diff and flags the catch block that swallows the storage error and returns success anyway",
+      "Flags that the new archive path is never exercised with an empty tickets array despite the crash history in pr-context.md",
+      "Files at least one fix ticket with a concrete failure scenario, not a style nit",
+      "Delivers the verdict via WorkflowOutput___report_completion and does not approve, merge, or open a PR itself"
+    ],
+    "expectedToolTrajectory": [
+      { "tool": "Tickets___create_ticket", "optional": false },
+      { "tool": "WorkflowOutput___report_completion", "optional": false }
+    ],
+    "forbiddenTools": ["Tickets___transition_ticket", "create_pull_request"]
+  },
+  "evaluators": [
+    "Builtin.ToolSelectionAccuracy",
+    "Builtin.InstructionFollowing",
+    "Builtin.GoalSuccessRate",
+    "Builtin.Correctness",
+    "Builtin.Faithfulness"
+  ],
+  "modelTier": "haiku",
+  "timeoutSeconds": 240,
+  "status": "active",
+  "provenance": {
+    "source": "workflow-run",
+    "workflowRunId": "wf_battery_seed_5 (distilled+sanitized from completed hub workflow patterns)",
+    "mintedBy": "battery-seed-curation",
+    "mintedOn": "2026-08-27"
+  },
+  "input": {
+    "files": [
+      "fixtures/review-error-handling-001/diff.patch",
+      "fixtures/review-error-handling-001/pr-context.md"
+    ]
+  },
+  "tags": ["code-review", "error-handling"]
+}

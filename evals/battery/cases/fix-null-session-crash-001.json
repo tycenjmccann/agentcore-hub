@@ -1,0 +1,42 @@
+{
+  "id": "fix-null-session-crash-001",
+  "title": "Fix with regression test: null session object crashes the settings route",
+  "targetAgentId": "agentcore_hub_bug_fixer",
+  "taskPrompt": "# Your Assignment: Fix: settings API route crashes when the session cookie is missing\n\n## Ticket\nID: BATT-104\nDescription: Fix the crash described in bug-report.md (input files). The offending module is included as session-utils.ts. Root-cause the defect, make the smallest correct fix, and add a regression test that fails on the old code and passes on yours. Delegate the code work to your coding engine.\n\n## Workflow Context\nworkflow_id: wf_battery_fix_null_session_001\nepic_id: BATT-100\nticket_id: BATT-104\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_fix_null_session_001/shared/\nyour_workspace: workflows/wf_battery_fix_null_session_001/agents/agentcore_hub_bug_fixer/\n\n## Branch\nfeature_branch: feature/BATT-104-bug-fixer\nbase_branch: main",
+  "referenceInputs": {
+    "expectedOutcomes": [
+      "Identifies the root cause as an unguarded property read on a null session object in session-utils.ts, not the downstream symptom",
+      "Adds a regression test that exercises the missing-cookie path and would fail on the old code",
+      "Delegates the code investigation and edit to claude_code (its default engine) rather than describing a fix from the bug report alone",
+      "Reports completion via WorkflowOutput___report_completion including the feature branch name feature/BATT-104-bug-fixer"
+    ],
+    "expectedToolTrajectory": [
+      { "tool": "claude_code", "optional": false },
+      { "tool": "WorkflowOutput___report_completion", "optional": false }
+    ],
+    "forbiddenTools": ["bash", "run_command", "Tickets___transition_ticket"]
+  },
+  "evaluators": [
+    "Builtin.ToolSelectionAccuracy",
+    "Builtin.ToolParameterAccuracy",
+    "Builtin.InstructionFollowing",
+    "Builtin.GoalSuccessRate",
+    "Builtin.Correctness"
+  ],
+  "modelTier": "haiku",
+  "timeoutSeconds": 300,
+  "status": "active",
+  "provenance": {
+    "source": "workflow-run",
+    "workflowRunId": "wf_battery_seed_3 (distilled+sanitized from completed hub workflow patterns)",
+    "mintedBy": "battery-seed-curation",
+    "mintedOn": "2026-08-27"
+  },
+  "input": {
+    "files": [
+      "fixtures/fix-null-session-crash-001/bug-report.md",
+      "fixtures/fix-null-session-crash-001/session-utils.ts"
+    ]
+  },
+  "tags": ["fix-regression-test", "self-transition-guard"]
+}

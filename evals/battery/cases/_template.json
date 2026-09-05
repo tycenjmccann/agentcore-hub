@@ -1,0 +1,55 @@
+{
+  "id": "template-copy-me-and-rename",
+  "title": "Template case — copy this file, rename, edit every field, then set status to active",
+  "targetAgentId": "agentcore_hub_backend_dev",
+  "taskPrompt": "Replace with the real task prompt (minLength 20). Runner preflight checks targetAgentId exists in src/config/agents.json.",
+  "referenceInputs": {
+    "expectedOutcomes": [
+      "Replace with at least one concrete expected outcome the judge should verify"
+    ],
+    "expectedToolTrajectory": [
+      {
+        "tool": "Tickets___create_ticket",
+        "argsSubset": {
+          "summary": "optional: subset of args this call must contain"
+        },
+        "optional": false
+      }
+    ],
+    "forbiddenTools": [
+      "shell"
+    ]
+  },
+  "evaluators": [
+    "Builtin.GoalSuccessRate",
+    "Builtin.ToolSelectionAccuracy",
+    "Builtin.InstructionFollowing"
+  ],
+  "modelTier": "haiku",
+  "timeoutSeconds": 180,
+  "status": "retired",
+  "retirement_reason": "template file — never runs; copy, edit, set status:active",
+  "provenance": {
+    "source": "synthetic",
+    "mintedBy": "replace-with-author-or-agent-id",
+    "mintedOn": "2026-08-27",
+    "tierJustification": "only required when modelTier is opus; delete otherwise"
+  },
+  "input": {
+    "transcript": "fixtures/template-copy-me-and-rename/transcript.json",
+    "files": [
+      "fixtures/template-copy-me-and-rename/example-input.txt"
+    ],
+    "repoFixture": "fixtures/template-copy-me-and-rename/repo",
+    "blueprints": [
+      "fixtures/template-copy-me-and-rename/backend-dev.md"
+    ]
+  },
+  "evaluator_floors": {
+    "Builtin.GoalSuccessRate": 40
+  },
+  "tags": [
+    "template",
+    "delete-or-replace-these-tags"
+  ]
+}

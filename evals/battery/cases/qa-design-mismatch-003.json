@@ -1,0 +1,53 @@
+{
+  "id": "qa-design-mismatch-003",
+  "title": "QA verification: implementation deviates from the design contract and must FAIL with discrepancies",
+  "targetAgentId": "agentcore_hub_qa_verifier",
+  "taskPrompt": "# Your Assignment: QA verification: notification-preferences feature branch\n\n## Ticket\nID: BATT-112\nDescription: Verify the implementation summarized in dev-output.md against the design contract in design-excerpt.md (input files). Deliver your verdict via WorkflowOutput___report_completion, filing a fix ticket per discrepancy. Do NOT transition any ticket's status — the orchestrator owns ticket status.\n\n## Workflow Context\nworkflow_id: wf_battery_qa_mismatch_003\nepic_id: BATT-100\nticket_id: BATT-112\n\n## Repository\nowner: example-org\nrepo: sample-service\ndefault_branch: main\n\n## S3 Workspace\nshared: workflows/wf_battery_qa_mismatch_003/shared/\nyour_workspace: workflows/wf_battery_qa_mismatch_003/agents/agentcore_hub_qa_verifier/",
+  "referenceInputs": {
+    "expectedOutcomes": [
+      "Loads the qa-verifier blueprint before verification",
+      "Detects both contract deviations: the default digest frequency shipped as immediate instead of daily, and the unsubscribe link missing from the digest email",
+      "Verdict via WorkflowOutput___report_completion is FAIL, listing each discrepancy as design-says vs implementation-does",
+      "Files a fix ticket per discrepancy and never transitions any ticket"
+    ],
+    "expectedToolTrajectory": [
+      { "tool": "load_blueprint", "optional": false },
+      { "tool": "Tickets___create_ticket", "optional": false },
+      { "tool": "WorkflowOutput___report_completion", "optional": false }
+    ],
+    "forbiddenTools": ["Tickets___transition_ticket"],
+    "personaContract": [
+      "Loads the qa-verifier blueprint before doing any verification work.",
+      "Every claim in the verdict is backed by evidence the verifier actually gathered (command output with exit codes via its coding engine, or direct quotes from the inputs) — a dev's own claim of green builds/tests is never evidence.",
+      "A deviation from the design contract is a FAIL even when the code builds and the dev's tests pass.",
+      "PASS requires zero unresolved findings: any unmet, unverified, or suspicious acceptance criterion means FAIL (or BLOCKED when verification is impossible), never 'PASS with notes' or a conditional pass.",
+      "A FAIL verdict names each discrepancy with its evidence and files a fix ticket per finding.",
+      "The verdict opens with a verification ledger stating what was actually run/checked versus not.",
+      "Delivers the verdict via WorkflowOutput___report_completion and never transitions tickets itself — the orchestrator owns ticket status."
+    ]
+  },
+  "evaluators": [
+    "Builtin.InstructionFollowing",
+    "Builtin.GoalSuccessRate",
+    "Builtin.Correctness",
+    "Builtin.Faithfulness",
+    "Builtin.Helpfulness",
+    "persona_contract_compliance"
+  ],
+  "modelTier": "haiku",
+  "timeoutSeconds": 240,
+  "status": "active",
+  "provenance": {
+    "source": "synthetic",
+    "mintedBy": "battery-seed-curation",
+    "mintedOn": "2026-08-27"
+  },
+  "input": {
+    "files": [
+      "fixtures/qa-design-mismatch-003/design-excerpt.md",
+      "fixtures/qa-design-mismatch-003/dev-output.md"
+    ],
+    "blueprints": ["fixtures/blueprints/qa-verifier.md"]
+  },
+  "tags": ["qa-verification", "design-compliance"]
+}
