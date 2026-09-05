@@ -15,6 +15,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { validateIntakeSources, getSourceValidationMode, shouldRejectSubmission } from "@/lib/workflow/intake";
+import { validateSourcesShape } from "@/lib/workflow/source-shape";
 import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure } from "@/lib/workflow/repo-check";
 import type { RepoCheck } from "@/lib/workflow/repo-check";
 import type { WorkflowInput } from "@/lib/workflow/types";
@@ -324,6 +325,17 @@ export async function POST(req: NextRequest) {
 
     if (!body.title) {
       return NextResponse.json({ error: "title is required" }, { status: 400 });
+    }
+
+    // TEAM-4078 F1: this route has no auth under AUTH_MODE=none and takes
+    // req.json() straight into WorkflowInput, so a malformed source used to be
+    // persisted verbatim ({ type: "upload", value: null } survives DynamoDB's
+    // removeUndefinedValues) and then crashed the workflow board on read.
+    // Reject the bad shape at the front door instead — mirrors the MCP
+    // IntakeSourceSchema, which is the other way in.
+    const sourcesShapeError = validateSourcesShape(body.sources);
+    if (sourcesShapeError) {
+      return NextResponse.json({ error: sourcesShapeError }, { status: 400 });
     }
 
     if (body.intakeChannel !== undefined && !/^[a-z][a-z0-9-]{1,31}$/.test(body.intakeChannel)) {
