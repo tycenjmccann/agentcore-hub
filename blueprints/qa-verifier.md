@@ -40,6 +40,11 @@ your primary value.
 
 **If `PIPELINE_ENABLED` is absent (no deployed pipeline):** run the build
 yourself as below.
+
+Also read `## Delivery Mode`: `CD_REGISTERED: false` means no ship phase follows
+you — after CI the orchestrator opens the unified PR and leaves it for the owning
+team. Never merge into the default branch or deploy; upload your evidence under
+`shared/qa-evidence/` so the PR reviewer can see it.
 Pass `repo` on your FIRST `claude_code` call so the workspace is cloned. Every
 claude_code call shares ONE workspace and ONE conversation — later calls
 remember this one and its files, so do NOT reference absolute paths like

@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import type { WorkflowInput, IntakeSource, RepoConfig, RepoLayout } from "@/lib/workflow/types";
+import type { CdRegistry, CdRegistryEntry } from "@/lib/cd-registry";
 import type { ModelOption, ModelsApiResponse } from "@/lib/workflow/model-config";
 import { modelOptionToOverride } from "@/lib/workflow/model-config";
 
@@ -35,6 +36,15 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
   const [repoLayout, setRepoLayout] = useState<RepoLayout>("monorepo");
   const [repoUrl, setRepoUrl] = useState("");
   const [defaultBranch, setDefaultBranch] = useState("main");
+  // CD registry: is this repo one the hub merges + deploys (full ship phase),
+  // or a HANDOFF (run ends at an open PR for the owning team)?
+  const [cdStatus, setCdStatus] = useState<{ repo: string | null; registered: boolean; entry: CdRegistryEntry | null } | null>(null);
+  const [cdRegistry, setCdRegistry] = useState<CdRegistry | null>(null);
+  const [showCdManager, setShowCdManager] = useState(false);
+  const [cdPipeline, setCdPipeline] = useState("");
+  const [cdBusy, setCdBusy] = useState(false);
+  const [cdError, setCdError] = useState<string | null>(null);
+
 
   // Workflow definition (shape) selection
   const [workflowDefs, setWorkflowDefs] = useState<WorkflowDefOption[]>([]);
@@ -55,6 +65,43 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
 
   const selectedDef = workflowDefs.find((w) => w.id === selectedDefId);
   const requiresRepo = selectedDef?.requiresRepo ?? true;
+
+  useEffect(() => {
+    if (!requiresRepo || !repoUrl.trim()) { setCdStatus(null); return; }
+    const ctrl = new AbortController();
+    const t = setTimeout(() => {
+      fetch(`/api/workflow/cd-registry?repo=${encodeURIComponent(repoUrl.trim())}`, { signal: ctrl.signal })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (d) setCdStatus({ repo: d.repo, registered: !!d.registered, entry: d.entry ?? null }); })
+        .catch(() => { /* status line is advisory */ });
+    }, 350);
+    return () => { clearTimeout(t); ctrl.abort(); };
+  }, [repoUrl, requiresRepo]);
+
+  const refreshCdRegistry = async () => {
+    try {
+      const r = await fetch("/api/workflow/cd-registry?fresh=1");
+      if (r.ok) setCdRegistry(await r.json());
+    } catch { /* advisory */ }
+  };
+  useEffect(() => { if (showCdManager) void refreshCdRegistry(); }, [showCdManager]);
+
+  const cdMutate = async (method: "POST" | "DELETE", body: Record<string, unknown>) => {
+    setCdBusy(true); setCdError(null);
+    try {
+      const r = await fetch("/api/workflow/cd-registry", { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d?.error || `HTTP ${r.status}`);
+      if (d.registry) setCdRegistry(d.registry);
+      if (repoUrl.trim()) {
+        const s = await fetch(`/api/workflow/cd-registry?repo=${encodeURIComponent(repoUrl.trim())}&fresh=1`);
+        if (s.ok) { const sd = await s.json(); setCdStatus({ repo: sd.repo, registered: !!sd.registered, entry: sd.entry ?? null }); }
+      }
+      setCdPipeline("");
+    } catch (err) {
+      setCdError(err instanceof Error ? err.message : "CD registry update failed");
+    } finally { setCdBusy(false); }
+  };
 
   // Model selection state
   const [models, setModels] = useState<ModelOption[]>([]);
@@ -351,6 +398,74 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
             className="w-24 px-3 py-2 bg-surface-1 border border-theme rounded-lg text-primary placeholder-muted text-sm focus:outline-none focus:border-brand-500"
           />
         </div>
+
+        {/* CD registry status — what happens at the end of this run */}
+        {repoUrl.trim() && cdStatus && (
+          <div className="mt-2 text-xs" data-testid="cd-registry-status">
+            {cdStatus.registered ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 font-medium">
+                  CD registered
+                </span>
+                <span className="text-secondary">
+                  The hub merges + deploys this repo after the Merge Approval gate
+                  {cdStatus.entry?.pipeline ? ` via ${cdStatus.entry.pipeline}` : " per its DEPLOY.md"}.
+                </span>
+                <button type="button" disabled={cdBusy} onClick={() => cdMutate("DELETE", { repo: cdStatus.repo })}
+                  className="text-muted hover:text-primary underline disabled:opacity-50">
+                  Unregister
+                </button>
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 font-medium">
+                  Handoff
+                </span>
+                <span className="text-secondary">
+                  Not in the CD registry: the run ends with an open PR after review, QA and CI — the owning team merges and deploys.
+                </span>
+                <input
+                  type="text"
+                  value={cdPipeline}
+                  onChange={(e) => setCdPipeline(e.target.value)}
+                  placeholder="pipeline name (optional)"
+                  className="w-44 px-2 py-1 bg-surface-1 border border-theme rounded text-primary placeholder-muted text-xs focus:outline-none focus:border-brand-500"
+                />
+                <button type="button" disabled={cdBusy || !cdStatus.repo} onClick={() => cdMutate("POST", { repo: cdStatus.repo, pipeline: cdPipeline })}
+                  className="px-2 py-1 rounded bg-brand-500/20 text-brand-300 hover:bg-brand-500/30 disabled:opacity-50">
+                  Register for CD
+                </button>
+              </div>
+            )}
+            {cdError && <div className="mt-1 text-red-400">{cdError}</div>}
+          </div>
+        )}
+
+        <button type="button" onClick={() => setShowCdManager((v) => !v)} className="mt-2 text-xs text-muted hover:text-primary underline">
+          {showCdManager ? "Hide CD registry" : "CD registry…"}
+        </button>
+        {showCdManager && (
+          <div className="mt-2 p-3 rounded-lg border border-theme bg-surface-1 text-xs" data-testid="cd-registry-manager">
+            <div className="text-secondary mb-2">
+              Repos the hub is allowed to <strong>merge and deploy</strong>. Every other repo is a handoff (PR left open).
+            </div>
+            {cdRegistry === null ? (
+              <div className="text-muted">Loading…</div>
+            ) : cdRegistry.repos.length === 0 ? (
+              <div className="text-muted">No repos registered — every run is a handoff.</div>
+            ) : (
+              <ul className="space-y-1">
+                {cdRegistry.repos.map((e) => (
+                  <li key={e.repo} className="flex items-center justify-between gap-2">
+                    <span className="font-mono text-primary">{e.repo}</span>
+                    <span className="text-muted flex-1 truncate">{e.pipeline ? `pipeline: ${e.pipeline}${e.region ? ` (${e.region})` : ""}` : `deploy doc: ${e.deployDoc || "DEPLOY.md"}`}</span>
+                    <button type="button" disabled={cdBusy} onClick={() => cdMutate("DELETE", { repo: e.repo })} className="text-muted hover:text-red-400 underline disabled:opacity-50">remove</button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
       </div>
       )}
 

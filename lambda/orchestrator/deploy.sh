@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs reconcile-sweep.mjs sweep-scan.mjs repo-check.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs repo-check.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -129,12 +129,8 @@ PIPELINE_VARS=""
 if [ -n "${PIPELINE_ENABLED:-}" ]; then
   PIPELINE_VARS=",PIPELINE_ENABLED=${PIPELINE_ENABLED}"
 fi
-# TEAM-4044: PIPELINE_REPOS scopes that block to the repos the pipeline actually
-# deploys (comma-separated owner/repo). A run on any other repo gets the legacy
-# (DEPLOY.md / self-run) path. Unset → every repo (single-repo installs).
-if [ -n "${PIPELINE_REPOS:-}" ]; then
-  PIPELINE_VARS="${PIPELINE_VARS},PIPELINE_REPOS=${PIPELINE_REPOS}"
-fi
+# Which repos the hub merges + deploys is the CD registry (config/cd-registry.json
+# in the artifact bucket, scripts/cd-registry.sh) — not an env var.
 
 # Level-triggered dispatch (TEAM-4060): off | shadow | enforce. When enforce, the
 # done-cascade invokes a newly-unblocked dependent IN-PROCESS instead of waiting
