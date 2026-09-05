@@ -169,7 +169,7 @@ export async function findTicketPullRequest(githubFetch, { owner, repo, base = "
  * Candidate branches: `feature/<ticketId>-<agentSlug>`, any `feature/<ticketId>-`
  * head found on a PR against the base, then the shared run branch.
  */
-export async function synthesizeCompletion({ workflow, ticket, agentSlug = "", deps = {} }) {
+export async function synthesizeCompletion({ workflow, ticket, agentSlug = "", baseBranch, deps = {} }) {
   const {
     githubFetch,
     s3Get,
@@ -193,7 +193,9 @@ export async function synthesizeCompletion({ workflow, ticket, agentSlug = "", d
 
     const { owner, repo } = parseRepo(workflow?.repoConfig);
     if (!owner || !repo) return { synthesized: false, reason: "no_repo" };
-    const base = workflow?.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    // Resolved default branch, passed by the caller (TEAM-3992 D4.1); the local
+    // repoConfig read is the fallback for callers that do not resolve it.
+    const base = baseBranch || workflow?.repoConfig?.repos?.[0]?.defaultBranch || "main";
 
     const candidates = [];
     if (agentSlug) candidates.push(`feature/${ticketId}-${agentSlug}`);

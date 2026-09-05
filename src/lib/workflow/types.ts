@@ -207,6 +207,7 @@ export interface RepoTarget {
   defaultBranch: string;         // "main"
   pathPrefix?: string;           // for monorepo: "ios/", "backend/", etc.
   platform: "ios" | "backend" | "android" | "shared";
+  fullName?: string;             // canonical owner/name from GitHub (TEAM-3992 D4.1)
 }
 
 // ─── Agent-to-Agent Messages ─────────────────────────────────────────────────

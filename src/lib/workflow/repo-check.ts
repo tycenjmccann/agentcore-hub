@@ -28,6 +28,10 @@ export interface RepoCheckResult {
   repo?: string;
   ownerExists?: boolean;
   suggestions?: string[];
+  /** GitHub "Get a repository" body — resolved once at intake (TEAM-3992 D4.1). */
+  defaultBranch?: string;
+  fullName?: string;
+  renamed?: boolean;
 }
 
 export interface RepoCheck {
@@ -63,7 +67,7 @@ function ghHeaders(token?: string): Record<string, string> {
 async function ghGet(
   path: string,
   opts: RepoCheckOptions
-): Promise<{ status: number; json: unknown }> {
+): Promise<{ status: number; json: unknown; url: string; redirected: boolean }> {
   const f = opts.fetchImpl ?? fetch;
   const res = await f(`${GITHUB_API}${path}`, {
     method: "GET",
@@ -76,7 +80,9 @@ async function ghGet(
   } catch {
     /* non-JSON body */
   }
-  return { status: res.status, json };
+  // res.url/res.redirected expose a followed 301 (renamed/transferred repo); fetch
+  // follows redirects by default, so the body's full_name is already canonical.
+  return { status: res.status, json, url: res.url, redirected: res.redirected };
 }
 
 async function suggestGitHub(
@@ -138,14 +144,33 @@ export async function checkRepoUrl(url: string, opts: RepoCheckOptions = {}): Pr
   }
 
   const { owner, repo } = gh;
-  let status: number;
+  let res: { status: number; json: unknown; url: string; redirected: boolean };
   try {
-    ({ status } = await ghGet(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, opts));
+    res = await ghGet(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, opts);
   } catch (err) {
     return { url, ok: false, definitive: false, status: null, owner, repo, reason: `GitHub unreachable: ${(err as Error).message}` };
   }
 
-  if (status === 200) return { url, ok: true, definitive: true, status, owner, repo, reason: "found" };
+  const { status, json } = res;
+  if (status === 200) {
+    // Keep the body: default_branch feeds resolveDefaultBranch (no more hardcoded
+    // "main"), and full_name is the canonical owner/name after any rename.
+    const body = json as { full_name?: unknown; default_branch?: unknown } | null;
+    const fullName = typeof body?.full_name === "string" ? body.full_name : undefined;
+    const defaultBranch = typeof body?.default_branch === "string" ? body.default_branch : undefined;
+    const canon = fullName && fullName.includes("/") ? { owner: fullName.split("/")[0], repo: fullName.split("/")[1] } : null;
+    const requested = `${owner}/${repo}`.toLowerCase();
+    const renamed = Boolean(res.redirected) || (fullName ? fullName.toLowerCase() !== requested : false);
+    return {
+      url, ok: true, definitive: true, status,
+      owner: canon?.owner ?? owner,
+      repo: canon?.repo ?? repo,
+      reason: "found",
+      ...(fullName ? { fullName } : {}),
+      ...(defaultBranch ? { defaultBranch } : {}),
+      renamed,
+    };
+  }
 
   if (status === 404) {
     const { ownerExists, suggestions } = await suggestGitHub(owner, repo, opts);

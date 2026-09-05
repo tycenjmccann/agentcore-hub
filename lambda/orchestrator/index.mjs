@@ -47,6 +47,7 @@ import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, fixVerificationGaps, openGateOf, parseCdEvidence, blockReasonWithGate, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, ACCEPTED_SHIP_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning, checkBranchProtection } from "./repo-check.mjs";
+import { parseRepoUrl, resolveDefaultBranch, resolveRepoIdentity } from "./default-branch.mjs";
 import { runGateBypassCheck, hasUnackedGateBypass } from "./gate-bypass.mjs";
 import {
   synthesizeCompletion,
@@ -851,6 +852,7 @@ async function gateBypassCheck(workflow, ticket, children) {
         publishEvent,
         addTicketComment,
         gatePhaseOf: makeGatePhaseResolver(kids),
+        baseBranch: resolveDefaultBranch(workflow),
         now: () => Date.now(),
         log: console,
       },
@@ -1041,9 +1043,9 @@ async function gateBypassBlocksCompletion(workflow) {
 async function ensureBranchProtectionCheck(workflow) {
   try {
     if (!workflow || workflow.branchProtectionCheck) return null;
-    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+    const { owner, repo } = resolveRepoIdentity(workflow);
     if (!owner || !repo) return null;
-    const branch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    const branch = resolveDefaultBranch(workflow);
     const result = await checkBranchProtection({ owner, repo, branch });
     const checkedAt = new Date().toISOString();
     workflow.branchProtectionCheck = { ...result, branch, checkedAt };
@@ -1092,12 +1094,12 @@ async function preDispatchGuards(workflow, ticket, { source = "dispatch" } = {})
   if (!workflow.repoConfig?.repos?.length || !process.env.GITHUB_PAT) return { ok: true };
 
   try {
-    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+    const { owner, repo } = resolveRepoIdentity(workflow);
     if (!owner || !repo) return { ok: true };
     const pr = await findTicketPullRequest((path) => githubApi(path), {
       owner,
       repo,
-      base: workflow.repoConfig.repos[0]?.defaultBranch || "main",
+      base: resolveDefaultBranch(workflow),
       ticketId,
       featureBranch: workflow.featureBranch || "",
     });
@@ -1187,6 +1189,7 @@ async function synthesizeCompletionFor(workflow, ticket) {
     workflow,
     ticket,
     agentSlug: agentBranchSlug(ticket?.assignee),
+    baseBranch: resolveDefaultBranch(workflow),
     deps: {
       githubFetch: (path) => githubApi(path),
       s3Get: async (key) => {
@@ -3652,8 +3655,8 @@ export async function completeWorkflow(workflow) {
   let prUrl = "";
   if (!defHasShip && workflow.featureBranch && workflow.repoConfig) {
     try {
-      const { owner, repo } = parseRepoUrl(workflow.repoConfig);
-      const baseBranch = workflow.repoConfig.repos?.[0]?.defaultBranch || "main";
+      const { owner, repo } = resolveRepoIdentity(workflow);
+      const baseBranch = resolveDefaultBranch(workflow);
       const prResult = await callGitHub("create_pr", {
         owner,
         repo,
@@ -4077,10 +4080,11 @@ async function buildAgentContext(ticket, workflow) {
     // persona on the run, ahead of the repo identity, so nobody burns coding
     // turns on a 404 clone and reports it as a runtime outage (2026-09-03).
     const repoCheck = await ensureRepoCheck(workflow, { store });
+    if (repoCheck) workflow.repoCheck = repoCheck; // so the resolvers below see it
     const warning = formatRepoCheckWarning(repoCheck);
     if (warning) context += warning;
-    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
-    const defaultBranch = workflow.repoConfig.repos[0]?.defaultBranch || "main";
+    const { owner, repo } = resolveRepoIdentity(workflow);
+    const defaultBranch = resolveDefaultBranch(workflow);
     context += `## Repository\nowner: ${owner}\nrepo: ${repo}\ndefault_branch: ${defaultBranch}\n\n`;
   }
 
@@ -4112,7 +4116,7 @@ async function buildAgentContext(ticket, workflow) {
 
   // Dev agents: branch identity (scope, not HOW)
   if (agentDef?.phase === "development") {
-    const baseBranch = workflow.featureBranch || workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    const baseBranch = workflow.featureBranch || resolveDefaultBranch(workflow);
     context += `## Branch\n`;
     context += `feature_branch: feature/${ticket.ticketId}-${agentBranchSlug(agentDef.agentId)}\n`;
     context += `base_branch: ${baseBranch}\n`;
@@ -4624,16 +4628,64 @@ async function readManifest(workflowId) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
+/**
+ * TEAM-3992 D4.1 — the once-per-run repo resolution. Runs the URL pre-flight
+ * (which also persists repoCheck via the store), stamps the resolved check back
+ * on the in-memory workflow so resolveDefaultBranch/resolveRepoIdentity see it,
+ * emits workflow.repo_resolved ONCE, and returns the manifest.repo{} block
+ * ({fullName, defaultBranch, url, owner, repo, resolvedAt}) or null. Never throws.
+ */
+async function resolveRepoAtIntake(workflow) {
+  if (!workflow.repoConfig?.repos?.length) return null;
+  try {
+    const check = await ensureRepoCheck(workflow, { store });
+    if (!check) return null;
+    workflow.repoCheck = check;
+    const primaryUrl = workflow.repoConfig.repos[0]?.url;
+    const results = check.results || [];
+    const match = results.find((r) => r?.url === primaryUrl && r?.ok) || results.find((r) => r?.ok);
+    const { owner, repo } = resolveRepoIdentity(workflow);
+    const fullName = match?.fullName || (owner && repo ? `${owner}/${repo}` : undefined);
+    const defaultBranch = resolveDefaultBranch(workflow);
+    const repoResolved = {
+      ...(fullName ? { fullName } : {}),
+      defaultBranch,
+      url: primaryUrl,
+      owner,
+      repo,
+      resolvedAt: new Date().toISOString(),
+    };
+    await publishEvent(workflow.epicId, "workflow.repo_resolved", {
+      workflowId: workflow.id,
+      fullName,
+      defaultBranch,
+      renamed: Boolean(match?.renamed),
+      requested: primaryUrl,
+    });
+    return repoResolved;
+  } catch (err) {
+    console.warn(`[orchestrator] repo resolve at intake skipped for ${workflow?.id}: ${err.message}`);
+    return null;
+  }
+}
+
 async function initManifestIfNeeded(workflow) {
   if (!ARTIFACT_BUCKET) return;
   const existing = await readManifest(workflow.id);
   if (existing) return; // Already initialized
+
+  // TEAM-3992 D4.1 — resolve the repo ONCE, here at intake: ask GitHub for the
+  // canonical full_name + default_branch, persist it on the run (repoCheck) and
+  // freeze it into manifest.repo{} so every downstream phase reads one resolved
+  // truth instead of re-deriving owner/repo/branch from the raw URL.
+  const repoResolved = await resolveRepoAtIntake(workflow);
 
   const manifest = {
     workflowId: workflow.id,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     repoConfig: workflow.repoConfig,
+    ...(repoResolved ? { repo: repoResolved } : {}),
     phases: { intake: [], requirements: [], design: [], development: [], verification: [], ship: [] },
   };
 
@@ -4694,8 +4746,15 @@ function buildManifestContext(manifest, agentPhase, workflow, ticket) {
 
   let ctx = `## Workflow Manifest — Upstream Artifacts\n\n`;
 
-  // Canonical repo info from manifest (single source of truth)
-  if (manifest.repoConfig?.repos?.length > 0) {
+  // Canonical repo info from manifest (single source of truth). Prefer the
+  // resolved manifest.repo{} block (TEAM-3992 D4.1) — it carries the canonical
+  // full_name and the branch GitHub actually reported; fall back to parsing the
+  // configured URL for manifests written before D4.1.
+  if (manifest.repo?.owner && manifest.repo?.repo) {
+    ctx += `### Repository\n`;
+    ctx += `- owner: "${manifest.repo.owner}"\n- repo: "${manifest.repo.repo}"\n`;
+    ctx += `- default_branch: "${manifest.repo.defaultBranch || "main"}"\n\n`;
+  } else if (manifest.repoConfig?.repos?.length > 0) {
     const url = manifest.repoConfig.repos[0].url || "";
     const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
     if (match) {
@@ -4801,8 +4860,8 @@ async function featureBranchUnmerged(workflow) {
  */
 async function featureBranchMergeProbe(workflow) {
   try {
-    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
-    const base = workflow.repoConfig.repos?.[0]?.defaultBranch || "main";
+    const { owner, repo } = resolveRepoIdentity(workflow);
+    const base = resolveDefaultBranch(workflow);
     const head = workflow.featureBranch;
 
     const prs = await githubApi(
@@ -4855,7 +4914,10 @@ async function callGitHub(toolName, args) {
   if (process.env.GITHUB_PAT) {
     if (toolName === "create_branch") {
       const { owner, repo, branch_name, from_branch } = args;
-      const base = await githubApi(`/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(from_branch)}`);
+      // No explicit source branch → resolve the repo's actual default branch from
+      // GitHub rather than assuming "main" (TEAM-3992 D4.1).
+      const fromBranch = from_branch || (await githubApi(`/repos/${owner}/${repo}`))?.default_branch || "main";
+      const base = await githubApi(`/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(fromBranch)}`);
       try {
         return await githubApi(`/repos/${owner}/${repo}/git/refs`, "POST", {
           ref: `refs/heads/${branch_name}`,
@@ -4938,8 +5000,8 @@ async function ensureFeatureBranch(workflow) {
   }
   if (!workflow.repoConfig?.repos?.length) return null;
   try {
-    const { owner, repo } = parseRepoUrl(workflow.repoConfig);
-    const baseBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    const { owner, repo } = resolveRepoIdentity(workflow);
+    const baseBranch = resolveDefaultBranch(workflow);
     const slug = (workflow.input?.title || workflow.id).toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40).replace(/-$/, "");
     const branchName = `feature/${workflow.epicId}-${slug}`;
     await callGitHub("create_branch", { owner, repo, branch_name: branchName, from_branch: baseBranch });
@@ -4999,11 +5061,9 @@ async function publishEvent(ticketId, detailType, detail) {
 
 // ─── Utilities ─────────────────────────────────────────────────────────────────
 
-function parseRepoUrl(repoConfig) {
-  const url = repoConfig?.repos?.[0]?.url || "";
-  const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
-  return match ? { owner: match[1], repo: match[2] } : { owner: "", repo: "" };
-}
+// parseRepoUrl / resolveDefaultBranch / resolveRepoIdentity live in the
+// side-effect-free default-branch.mjs (TEAM-3992 D4.1) so they can be unit-tested
+// without index.mjs's module-load AWS clients. Imported at the top of the file.
 
 /**
  * Resolve the target repo from a Jira ticket's labels. The repo rides on the

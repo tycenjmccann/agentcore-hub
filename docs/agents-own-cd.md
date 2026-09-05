@@ -58,6 +58,27 @@ run open) — a CD ticket marked done without a real merge can no longer
 false-complete a run. Best-effort: a GitHub/API failure never blocks a
 legitimate completion. Opt-out: `SHIP_MERGE_VERIFY=off`.
 
+## Resolved repo identity (`manifest.repo{}`)
+
+The repository is resolved **once, at intake** (TEAM-3992 D4.1). The URL
+pre-flight (`checkRepoUrl`) keeps GitHub's "Get a repository" body, so the
+stored `repoCheck` now carries `defaultBranch`, `fullName`, and `renamed` (a
+followed 301 or a `full_name` that differs from the requested owner/name). At
+first dispatch the orchestrator freezes this into
+`workflows/<wf>/shared/manifest.json` as:
+
+```
+repo: { fullName, defaultBranch, url, owner, repo, resolvedAt }
+```
+
+and emits `workflow.repo_resolved { workflowId, fullName, defaultBranch, renamed,
+requested }` once. Every base-branch decision (feature-branch creation, the
+merge-verify compare, PR base, branch-protection preflight, gate-bypass) reads
+`resolveDefaultBranch(workflow)` — `repoCheck.defaultBranch → repoConfig default
+→ "main"` — instead of assuming `main`, and owner/repo come from the canonical
+`full_name` when the repo was renamed. `resolveDefaultBranch`/`resolveRepoIdentity`
+live in the side-effect-free `lambda/orchestrator/default-branch.mjs`.
+
 ## Deploy-gate banner in the UI
 
 While a ship-phase run is active, the Workflow board polls

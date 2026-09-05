@@ -175,6 +175,11 @@ export default defineConfig({
       // (tickets-Lambda invoke / event / child read / def lookups mocked at the
       // seam), so the spawn dedupe + SHA-pinned re-arm logic runs with no AWS.
       "lambda/orchestrator/fix-rearm.test.mjs",
+      // default-branch (TEAM-3992 D4.1) — the base-branch + repo-identity
+      // resolvers that replace every hardcoded `|| "main"` in index.mjs. Pure
+      // functions in a side-effect-free module (pipeline-enabled.mjs pattern), so
+      // the repoCheck→repoConfig→"main" chain runs with no AWS.
+      "lambda/orchestrator/default-branch.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
