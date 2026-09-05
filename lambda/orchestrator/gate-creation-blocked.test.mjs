@@ -31,8 +31,13 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
  *   2. rework reopen guard: an upstream ticket whose own blockedBy contains a
  *      non-done ticket is not re-Readied (Jira) / not status-rewritten (DDB), and
  *      review.rejected.reopened reflects what actually happened.
- *   3. lease housekeeping: an agent ticket in_progress -> blocked releases the
- *      running claim so a later Ready dispatches normally.
+ *   3. lease housekeeping: an agent ticket in_progress -> blocked whose OWN
+ *      blockers are still open (the premature-dispatch signature) releases the
+ *      running claim through the stealClaim CAS so a later Ready dispatches
+ *      normally. TEAM-4071 F1: a ticket whose blockers are all resolved (or
+ *      empty) keeps its claim — the agent may be live. TEAM-4071 F2: the CAS is
+ *      asserted on its real shape, and a lost CAS
+ *      (ConditionalCheckFailedException) releases nothing.
  */
 
 const h = vi.hoisted(() => ({
@@ -47,6 +52,9 @@ const h = vi.hoisted(() => ({
     storeCalls: /** @type {any[]} */ ([]),
     enforce: /** @type {any} */ (null),
     jira: /** @type {any} */ (null),
+    // TEAM-4071 F2: when true, the workflows-table steal CAS (lease.mjs
+    // stealClaim) loses — a concurrent writer moved the claim generation.
+    failSteal: false,
   },
 }));
 
@@ -70,6 +78,9 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           if (name === "ScanCommand") return { Items: [] }; // findCodingSession -> none
           if (name === "UpdateCommand") {
             h.state.updates.push(cmd.input);
+            if (h.state.failSteal && cmd.input.UpdateExpression === "SET agentTasks.#tid.#st = :ready") {
+              throw Object.assign(new Error("The conditional request failed"), { name: "ConditionalCheckFailedException" });
+            }
             // Keep the in-memory tickets table honest for follow-up reads.
             const key = cmd.input.Key?.ticketId;
             const s = cmd.input.ExpressionAttributeValues?.[":s"];
@@ -303,9 +314,33 @@ const eventsOf = (type) => h.state.events.filter((e) => e.type === type);
 const statusWritesOn = (key) =>
   h.state.updates.filter((u) => u.Key?.ticketId === key && u.ExpressionAttributeValues?.[":s"] !== undefined);
 const isLiveClaim = (task) => !!task && ["running", "in_progress"].includes(task.status);
+// TEAM-4071 F2: the steal CAS as lease.mjs stealClaim actually builds it. The
+// harness leaves WORKFLOWS_TABLE unset, so index.mjs uses its default.
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
+const stealCommandsFor = (ticketId) =>
+  h.state.updates.filter(
+    (u) => u.TableName === WORKFLOWS_TABLE &&
+      u.ExpressionAttributeNames?.["#tid"] === ticketId &&
+      u.UpdateExpression === "SET agentTasks.#tid.#st = :ready"
+  );
+const expectStealCas = (ticketId, startedAt) => {
+  const steals = stealCommandsFor(ticketId);
+  expect(steals).toHaveLength(1);
+  const [steal] = steals;
+  expect(steal.Key).toEqual({ workflowId: "wf_1" });
+  expect(steal.ConditionExpression).toBe(
+    "agentTasks.#tid.#st IN (:running, :inprog) AND agentTasks.#tid.startedAt = :exp"
+  );
+  expect(steal.ExpressionAttributeNames).toEqual({ "#tid": ticketId, "#st": "status" });
+  expect(steal.ExpressionAttributeValues).toEqual({
+    ":ready": "ready", ":running": "running", ":inprog": "in_progress", ":exp": startedAt,
+  });
+};
+const STARTED_AT = "2026-09-05T04:00:00.000Z";
 
 let handler;
 let handleReviewRejection;
+let releaseClaimOnSelfPark;
 let storeMock;
 
 async function importIndex({ provider }) {
@@ -318,7 +353,7 @@ async function importIndex({ provider }) {
     delete process.env.TICKET_PROVIDER;
   }
   vi.resetModules();
-  ({ handler, handleReviewRejection } = await import("./index.mjs"));
+  ({ handler, handleReviewRejection, releaseClaimOnSelfPark } = await import("./index.mjs"));
   storeMock = await import("./workflow-store.mjs");
 }
 
@@ -345,6 +380,7 @@ beforeEach(() => {
   h.state.claimAttempts.length = 0;
   h.state.storeCalls.length = 0;
   h.state.jira = null;
+  h.state.failSteal = false;
   // Default cap verdict: not escalated, gating -> the rework reopen path.
   h.state.enforce = vi.fn(async () => ({ escalated: false, gated: true }));
   h.state.workflow = {
@@ -447,32 +483,40 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
     expect(h.state.enforce).toHaveBeenCalledTimes(1);
   });
 
-  describe("(e) agent ticket in_progress -> blocked releases the running claim", () => {
-    const seedRunningShip = () => {
+  describe("(e) agent ticket in_progress -> blocked releases the running claim ONLY while its own blockers are open", () => {
+    // The TEAM-4045 shape: Ship (TEAM-24) dispatched prematurely while its
+    // blocker CI (TEAM-23) is still Blocked; the agent self-parked.
+    const seedRunningShip = ({ ciStatus = "Blocked", shipBlockedBy = ["TEAM-23"] } = {}) => {
       installJiraRouter({
-        "TEAM-23": agentIssue("TEAM-23", CI, "Blocked", ["TEAM-22"], "CI"),
+        "TEAM-23": agentIssue("TEAM-23", CI, ciStatus, ["TEAM-22"], "CI"),
         // The agent self-parked: Jira already shows Blocked when the webhook lands.
-        "TEAM-24": agentIssue("TEAM-24", RM, "Blocked", ["TEAM-23"], "Ship"),
+        "TEAM-24": agentIssue("TEAM-24", RM, "Blocked", shipBlockedBy, "Ship"),
       });
       h.state.workflow.agentTasks["TEAM-24"] = {
-        id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: new Date().toISOString(),
+        id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: STARTED_AT,
       };
     };
+    const blockedWebhook = { source: "jira-webhook", ticketId: "TEAM-24", newStatus: "blocked", oldStatus: "in_progress" };
 
-    it("(e1) after the blocked webhook, agentTasks[ticket] no longer reads as a live running claim", async () => {
+    it("(e1) blocker open: after the blocked webhook, agentTasks[ticket] no longer reads as a live running claim — via ONE real stealClaim CAS", async () => {
       seedRunningShip();
 
-      await handler({ source: "jira-webhook", ticketId: "TEAM-24", newStatus: "blocked", oldStatus: "in_progress" });
+      await handler(blockedWebhook);
 
       expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
       // Housekeeping must not masquerade as completion or a rejection.
       expect(h.state.workflow.agentTasks["TEAM-24"].status).not.toBe("complete");
       expect(eventsOf("review.rejected")).toHaveLength(0);
+      // TEAM-4071 F2: the release IS the lease.mjs stealClaim CAS, on this generation.
+      expectStealCas("TEAM-24", STARTED_AT);
+      const released = eventsOf("orchestrator.claim_released");
+      expect(released).toHaveLength(1);
+      expect(released[0].detail).toMatchObject({ ticketId: "TEAM-24", agentId: RM, reason: "agent_self_park", claimStartedAt: STARTED_AT, blockedBy: ["TEAM-23"] });
     });
 
     it("(e2) a subsequent Ready for that ticket invokes the agent normally (not skipped as already claimed)", async () => {
       seedRunningShip();
-      await handler({ source: "jira-webhook", ticketId: "TEAM-24", newStatus: "blocked", oldStatus: "in_progress" });
+      await handler(blockedWebhook);
 
       // A human moves the parked ticket back to Ready (CI finished meanwhile).
       h.state.jira.issues["TEAM-23"].fields.status.name = "Done";
@@ -484,6 +528,43 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       expect(invoked[0].detail.agentId).toBe(RM);
       expect(h.state.lambdaInvokes.filter((i) => i.payload?.ticketId === "TEAM-24")).toHaveLength(1);
       expect(h.state.claimAttempts.filter((c) => c.ticketId === "TEAM-24" && c.ok)).toHaveLength(1);
+    });
+
+    it("(e3) TEAM-4071 F1: EMPTY blockedBy (legitimately dispatched, agent may be live) -> claim stays running, no steal, no event", async () => {
+      seedRunningShip({ shipBlockedBy: [] });
+
+      await handler(blockedWebhook);
+
+      expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("running");
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+      expect(stealCommandsFor("TEAM-24")).toEqual([]);
+      expect(h.state.updates.filter((u) => u.TableName === WORKFLOWS_TABLE)).toEqual([]);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+    });
+
+    it("(e4) TEAM-4071 F1: ALL blockers done (legitimately dispatched) -> claim stays running, no steal, no event", async () => {
+      seedRunningShip({ ciStatus: "Done" });
+
+      await handler(blockedWebhook);
+
+      expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("running");
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+      expect(stealCommandsFor("TEAM-24")).toEqual([]);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+    });
+
+    it("(e5) TEAM-4071 F2: the steal CAS loses (claim generation moved) -> nothing released, claim reads as it was, no event", async () => {
+      seedRunningShip();
+      h.state.failSteal = true;
+
+      await handler(blockedWebhook);
+
+      // The CAS was attempted exactly once, on this generation...
+      expectStealCas("TEAM-24", STARTED_AT);
+      // ...and lost: the in-memory task is NOT flipped and no event is published.
+      expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("running");
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
     });
   });
 
@@ -575,13 +656,20 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     expect(h.state.enforce.mock.calls[0][0].gateTicket.ticketId).toBe("TEAM-25");
   });
 
-  it("(e-DDB) agent ticket MODIFY in_progress -> blocked releases the running claim; a later ready dispatches", async () => {
+  const seedRunningShipTask = () => {
     h.state.workflow.agentTasks["TEAM-24"] = {
-      id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: new Date().toISOString(),
+      id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: STARTED_AT,
     };
+  };
+
+  it("(e-DDB) blocker open: MODIFY in_progress -> blocked releases the running claim via ONE real stealClaim CAS; a later ready dispatches", async () => {
+    seedRunningShipTask();
 
     await handler(record("MODIFY", shipImage("blocked"), shipImage("in_progress")));
     expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
+    expectStealCas("TEAM-24", STARTED_AT);
+    expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
+    expect(eventsOf("orchestrator.claim_released")[0].detail.blockedBy).toEqual(["TEAM-23"]);
 
     // CI lands; a human (or the cascade) marks the ship ticket ready again.
     h.state.tickets["TEAM-23"].status = "done";
@@ -591,6 +679,46 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     const invoked = eventsOf("agent.invoked").filter((e) => e.detail.ticketId === "TEAM-24");
     expect(invoked).toHaveLength(1);
     expect(h.state.lambdaInvokes.filter((i) => i.payload?.ticketId === "TEAM-24")).toHaveLength(1);
+  });
+
+  it("(e-DDB-2) TEAM-4071 F1: ALL blockers done -> claim stays running, no steal against the workflows table, no event", async () => {
+    seedRunningShipTask();
+    h.state.tickets["TEAM-23"].status = "done";
+
+    await handler(record("MODIFY", shipImage("blocked"), shipImage("in_progress")));
+
+    expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("running");
+    expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+    expect(h.state.updates.filter((u) => u.TableName === WORKFLOWS_TABLE)).toEqual([]);
+    expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+  });
+
+  it("(e-DDB-3) TEAM-4071 F1: image without blockedBy -> the ticket is READ (getTicket), not assumed; open blocker there still releases", async () => {
+    seedRunningShipTask();
+    const { blockedBy: _omit, ...imageNoBlockers } = shipImage("blocked");
+    const { blockedBy: _omit2, ...oldNoBlockers } = shipImage("in_progress");
+
+    await handler(record("MODIFY", imageNoBlockers, oldNoBlockers));
+
+    // h.state.tickets["TEAM-24"].blockedBy = ["TEAM-23"] (blocked) -> released.
+    expectStealCas("TEAM-24", STARTED_AT);
+    expect(eventsOf("orchestrator.claim_released")[0].detail.blockedBy).toEqual(["TEAM-23"]);
+  });
+
+  it("(e-DDB-4) TEAM-4071 F2: the steal CAS loses -> releaseClaimOnSelfPark returns false, claim stays running, no event", async () => {
+    seedRunningShipTask();
+    h.state.failSteal = true;
+
+    const released = await releaseClaimOnSelfPark(
+      { ticketId: "TEAM-24", assignee: RM, workflowId: "wf_1", parentId: "TEAM-1", blockedBy: ["TEAM-23"] },
+      "in_progress"
+    );
+
+    expect(released).toBe(false);
+    expectStealCas("TEAM-24", STARTED_AT); // attempted once, on this generation
+    expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("running");
+    expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+    expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
   });
 });
 

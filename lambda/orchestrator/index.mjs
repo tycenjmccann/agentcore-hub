@@ -777,23 +777,40 @@ async function isHumanRejectionTransition(oldStatus, gate) {
 }
 
 /**
- * TEAM-4045 — an AGENT ticket left in_progress for blocked while its invocation
- * claim is still `running`: the agent parked itself (release-manager.md, park
- * step e) and exited without report_completion. Left alone, the claim refuses
- * the human's later Blocked → Ready re-dispatch as "already claimed" until it
- * is 2× the lease TTL old. Release it through the ONE lease primitive
- * (stealClaim: CAS on running + this generation's startedAt → "ready"); never
- * a human gate, never a lease that is not running, never a completed task.
+ * TEAM-4045 / TEAM-4071 — an AGENT ticket left in_progress for blocked while
+ * its invocation claim is still `running` AND whose OWN blockedBy still holds an
+ * unresolved ticket. That pairing is the premature-dispatch signature of
+ * TEAM-4045: the agent was dispatched ahead of its dependencies (the release
+ * manager ran while CI was still open), could not do the work, parked its
+ * ticket (release-manager.md, park step e) and exited without
+ * report_completion — leaving a `running` claim that refuses the later
+ * Blocked → Ready re-dispatch as "already claimed" until it is 2× the lease TTL
+ * old (claimTicketInvocation's stale-claim hatch). Release it through the ONE
+ * lease primitive (stealClaim: CAS on running + this generation's startedAt →
+ * "ready"); never a human gate, never a lease that is not running, never a
+ * completed task.
  *
- * Accepted trade-off: if a human moves a GENUINELY live agent's ticket to
- * Blocked and then to Ready, the release lets a second session start — the
- * human chose it, the same trade the stale-claim escape hatch in
- * claimTicketInvocation already makes. The sweeps stay inert on the parked
- * ticket: the dead-session detector only inspects tickets that are in_progress
- * on the board, and the reconcile sweep only candidates a ticket whose
- * blockers are ALL resolved (a self-park with open blockers is never touched).
+ * What is NOT released, and why (TEAM-4071 F1): a ticket whose blockers are all
+ * resolved (or empty) was dispatched legitimately, so its `running` claim may
+ * belong to a LIVE agent. Third parties can move such a ticket in_progress →
+ * blocked while the agent works: the UI transition route, and the jira Lambda's
+ * create_ticket dedup path, which re-issues "Blocked" on an existing ticket
+ * regardless of its status. isLeaseLive treats only running/in_progress as
+ * live, so releasing here would drop the R1 duplicate-dispatch guard at claim
+ * age 0 — a human's Blocked → Ready, or the reconcile sweep (which candidates
+ * exactly the all-blockers-resolved tickets), would start a second concurrent
+ * session beside the live one. Those tickets keep today's protection unchanged:
+ * heartbeat/TTL liveness, then the 2×TTL stale-claim hatch. The accepted cost
+ * is that a legitimate self-park with all blockers resolved (e.g. the release
+ * manager parking on its own escalation gate) still waits for that hatch or a
+ * forced nudge, exactly as release-manager.md documents. The blocker-unresolved
+ * gate is also what keeps the reconcile sweep away from a released ticket: a
+ * ticket with an open blocker is never a sweep candidate.
+ *
+ * Exported solely so gate-creation-blocked.test.mjs can assert the CAS-lost
+ * return value directly (same convention as handleReviewRejection).
  */
-async function releaseClaimOnSelfPark(ticket, oldStatus) {
+export async function releaseClaimOnSelfPark(ticket, oldStatus) {
   if (oldStatus !== "in_progress") return false;
   const { ticketId, assignee, workflowId, parentId } = ticket || {};
   if (!ticketId || !assignee || isHumanAssignee(assignee) || !getAgentDef(assignee)) return false;
@@ -801,6 +818,17 @@ async function releaseClaimOnSelfPark(ticket, oldStatus) {
     const workflow = await resolveWorkflow(workflowId, parentId);
     const task = workflow?.agentTasks?.[ticketId];
     if (!task || task.status !== "running" || task.completedAt) return false;
+    // TEAM-4071 F1: release ONLY when the ticket's own blockers are still open
+    // (the premature-dispatch signature). The Jira path passes the mapped
+    // ticket (blockedBy from issuelinks); the stream path passes the image's
+    // blockedBy — when neither carries it, read the ticket rather than assume.
+    const blockedBy = Array.isArray(ticket.blockedBy)
+      ? ticket.blockedBy
+      : ((await getTicket(ticketId))?.blockedBy || []);
+    if (blockedBy.length === 0 || await checkAllBlockersResolved(blockedBy)) {
+      console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim, but its blockers are all resolved — the agent may be live; claim NOT released (lease TTL / stale-claim hatch / nudge apply)`);
+      return false;
+    }
     const released = await stealClaim(ddb, WORKFLOWS_TABLE, workflow.id, ticketId, task.startedAt || null);
     if (!released) {
       console.log(`[orchestrator] ${ticketId}: in_progress → blocked but the claim generation moved — nothing released`);
@@ -810,7 +838,7 @@ async function releaseClaimOnSelfPark(ticket, oldStatus) {
     console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim (agent self-park) — claim released so a later Ready can re-dispatch`);
     await publishEvent(ticketId, "orchestrator.claim_released", {
       ticketId, agentId: assignee, workflowId: workflow.id, reason: "agent_self_park",
-      claimStartedAt: task.startedAt || null,
+      claimStartedAt: task.startedAt || null, blockedBy,
     });
     return true;
   } catch (err) {
@@ -2313,6 +2341,7 @@ async function processRecord(record) {
           assignee: blockedAssignee,
           workflowId: unwrapDdbValue(newImage.workflowId),
           parentId: unwrapDdbValue(newImage.parentId),
+          blockedBy: unwrapDdbValue(newImage.blockedBy),
         }, oldStatus);
       }
       break;
