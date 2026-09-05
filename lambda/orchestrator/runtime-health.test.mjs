@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createRuntimeHealth, outageKey, probeSessionId, parseBackoffMinutes } from "./runtime-health.mjs";
+import { createRuntimeHealth, outageKey, probeSessionId, parseBackoffMinutes, classifyProbeError } from "./runtime-health.mjs";
 
 /**
  * TEAM-3992 D4.2 — the coding-runtime health gate + auto-resume.
@@ -49,7 +49,7 @@ function harness(overrides = {}) {
   const events = [];
   const publishEvent = vi.fn(async (subject, type, detail) => { events.push({ subject, type, detail }); });
   const blockTicketRuntime = vi.fn(async () => {});
-  const appendNotificationOnce = vi.fn(async () => true);
+  const appendNotificationOnce = overrides.appendNotificationOnce || vi.fn(async () => true);
   const invokeRuntime = overrides.invokeRuntime || vi.fn(async () => ({ statusCode: 200, json: { status: "unknown" } }));
   const cascade = overrides.cascade || {
     reconcileDependent: vi.fn(async () => ({ outcome: "redispatched", reason: "dispatchable" })),
@@ -481,5 +481,142 @@ describe("runtimeHealthSweep — F3 crash-safe recovery + backstop", () => {
     expect(v).toEqual({ ok: true });
     expect(h.blockTicketRuntime).not.toHaveBeenCalled();
     expect(h.invokeRuntime).not.toHaveBeenCalled(); // recovering ⇒ runtime is up
+  });
+});
+
+/**
+ * TEAM-4100 F4 (P2) — a misconfigured probe must not masquerade as an outage,
+ * and a hung probe must not hang the invocation.
+ *
+ * Under the old "any probe failure counts" rule a single IAM regression (missing
+ * bedrock-agentcore:InvokeAgentRuntime) or a stale ARN would confirm an "outage"
+ * and park EVERY coding ticket, with no auto-resume path (the runtime is healthy,
+ * so a re-probe stays broken forever). F4 classifies the failure: a misconfig
+ * signal fails OPEN (dispatch proceeds, ONE idempotent escalation, distinct
+ * event, NO park, NO confirm-count bump); throttling is transient (proceed, no
+ * park); only 5xx/network/timeout is an outage candidate. And every probe is
+ * bounded by an AbortController + rejecting timer so a wedged runtime can never
+ * hang the guard.
+ */
+describe("classifyProbeError — the classification table (F4)", () => {
+  it("throttling / 429 → transient", () => {
+    expect(classifyProbeError("ThrottlingException")).toBe("transient");
+    expect(classifyProbeError("TooManyRequestsException")).toBe("transient");
+    expect(classifyProbeError(null, 429)).toBe("transient");
+  });
+  it("auth / validation / not-found / bad-client / any non-throttling 4xx → probe_misconfigured", () => {
+    for (const n of ["AccessDeniedException", "ValidationException", "ResourceNotFoundException", "UnrecognizedClientException", "IncompleteSignatureException", "InvalidSignatureException"]) {
+      expect(classifyProbeError(n)).toBe("probe_misconfigured");
+    }
+    expect(classifyProbeError(null, 400)).toBe("probe_misconfigured");
+    expect(classifyProbeError(null, 403)).toBe("probe_misconfigured");
+  });
+  it("5xx / network / timeout / abort → outage", () => {
+    expect(classifyProbeError(null, 503)).toBe("outage");
+    expect(classifyProbeError(null, 500)).toBe("outage");
+    expect(classifyProbeError("AbortError")).toBe("outage");
+    expect(classifyProbeError("TimeoutError")).toBe("outage");
+    expect(classifyProbeError("ECONNREFUSED")).toBe("outage");
+    expect(classifyProbeError(null)).toBe("outage"); // nothing known → treat as outage
+  });
+});
+
+describe("runtimeHealthGuard — F4 probe-misconfiguration + transient classification", () => {
+  /** A stateful appendNotificationOnce: true the first time per id, false after. */
+  function onceStore() {
+    const seen = new Set();
+    return vi.fn(async (_wfId, n) => { if (seen.has(n.id)) return false; seen.add(n.id); return true; });
+  }
+  const namedErr = (name) => { const e = new Error(name); e.name = name; return e; };
+
+  it("AccessDenied → probe_misconfigured: fails OPEN, ONE escalation, distinct event, NO park, NO outage", async () => {
+    const appendNotificationOnce = onceStore();
+    const h = harness({ invokeRuntime: vi.fn(async () => { throw namedErr("AccessDeniedException"); }), appendNotificationOnce });
+
+    const v = await h.rh.runtimeHealthGuard(wf, ticket("T-1"));
+    expect(v).toEqual({ ok: true }); // fail-open — a broken probe must NOT park healthy work
+    expect(h.blockTicketRuntime).not.toHaveBeenCalled();
+    expect(h.outage()).toBeNull(); // no outage object created
+    expect(h.eventsOfType("runtime.outage")).toHaveLength(0);
+    expect(h.eventsOfType("runtime.probe_misconfigured")).toHaveLength(1);
+    expect(h.eventsOfType("runtime.probe_misconfigured")[0].detail).toMatchObject({ runtimeArn: ARN, errorName: "AccessDeniedException" });
+    expect(appendNotificationOnce).toHaveBeenCalledTimes(1);
+    expect(appendNotificationOnce.mock.calls[0][1]).toMatchObject({ id: expect.stringContaining("notif_runtime_probe_misconfigured_"), type: "manager_escalation" });
+    expect(appendNotificationOnce.mock.calls[0][1].details).toContain("bedrock-agentcore:InvokeAgentRuntime");
+  });
+
+  it("a second misconfigured probe does NOT raise a second escalation or event (idempotent)", async () => {
+    const appendNotificationOnce = onceStore();
+    const h = harness({ invokeRuntime: vi.fn(async () => { throw namedErr("AccessDeniedException"); }), appendNotificationOnce });
+    await h.rh.runtimeHealthGuard(wf, ticket("T-1"));
+    await h.rh.runtimeHealthGuard(wf, ticket("T-2")); // unhealthy cache expired → re-probes
+    expect(h.invokeRuntime).toHaveBeenCalledTimes(2); // it DID re-probe
+    expect(appendNotificationOnce).toHaveBeenCalledTimes(2); // both attempt the CAS
+    expect(h.eventsOfType("runtime.probe_misconfigured")).toHaveLength(1); // only the first won
+  });
+
+  it("ThrottlingException → transient: dispatch proceeds, NO park, NO outage, NO escalation", async () => {
+    const appendNotificationOnce = onceStore();
+    const h = harness({ invokeRuntime: vi.fn(async () => { throw namedErr("ThrottlingException"); }), appendNotificationOnce });
+    const v = await h.rh.runtimeHealthGuard(wf, ticket("T-1"));
+    expect(v).toEqual({ ok: true });
+    expect(h.blockTicketRuntime).not.toHaveBeenCalled();
+    expect(h.outage()).toBeNull();
+    expect(h.eventsOfType("runtime.outage")).toHaveLength(0);
+    expect(h.eventsOfType("runtime.probe_misconfigured")).toHaveLength(0);
+    expect(appendNotificationOnce).not.toHaveBeenCalled();
+  });
+
+  it("a 503 response is still an outage (classification does not soften genuine failures)", async () => {
+    const h = harness({ invokeRuntime: vi.fn(async () => ({ statusCode: 503, json: null })), env: { RUNTIME_PROBE_CONFIRM: "1" } });
+    const v = await h.rh.runtimeHealthGuard(wf, ticket("T-1"));
+    expect(v).toMatchObject({ ok: false, reason: "runtime_outage" });
+    expect(h.outage()).toMatchObject({ state: "outage" });
+    expect(h.eventsOfType("runtime.outage")).toHaveLength(1);
+  });
+});
+
+describe("probeRuntime — F4 abort + timer hygiene", () => {
+  it("passes an AbortSignal to the SDK invoke", async () => {
+    const h = harness();
+    await h.rh.probeRuntime({ arn: ARN });
+    expect(h.invokeRuntime.mock.calls[0][0].abortSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("a hanging probe is ABORTED at the budget and the guard rejects (never hangs)", async () => {
+    vi.useFakeTimers();
+    try {
+      let captured;
+      const invokeRuntime = vi.fn(({ abortSignal }) => new Promise((_, reject) => {
+        captured = abortSignal;
+        abortSignal.addEventListener("abort", () => reject(abortSignal.reason));
+      }));
+      const h = harness({ invokeRuntime, env: { RUNTIME_PROBE_TIMEOUT_MS: "1000" } });
+      const p = h.rh.probeRuntime({ arn: ARN });
+      await vi.advanceTimersByTimeAsync(1000); // fire the guard timer
+      const res = await p;
+      expect(captured.aborted).toBe(true); // the SDK request was told to tear down
+      expect(res.healthy).toBe(false);
+      expect(res.errorName).toBe("AbortError");
+      expect(res.classification).toBe("outage"); // a hang is an outage candidate
+      expect(vi.getTimerCount()).toBe(0); // timer cleared, none dangling
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the abort timer on a successful probe", async () => {
+    vi.useFakeTimers();
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout");
+    try {
+      const h = harness(); // default invokeRuntime resolves healthy
+      const res = await h.rh.probeRuntime({ arn: ARN });
+      expect(res.healthy).toBe(true);
+      expect(clearSpy).toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      clearSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

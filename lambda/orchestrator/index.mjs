@@ -798,6 +798,9 @@ function getRuntimeHealth() {
       RUNTIME_PROBE_CACHE_MS: process.env.RUNTIME_PROBE_CACHE_MS,
       RUNTIME_PROBE_CONFIRM: process.env.RUNTIME_PROBE_CONFIRM,
       RUNTIME_OUTAGE_BACKOFF_MIN: process.env.RUNTIME_OUTAGE_BACKOFF_MIN,
+      RUNTIME_PROBE_TIMEOUT_MS: process.env.RUNTIME_PROBE_TIMEOUT_MS,
+      RUNTIME_RECOVERING_STALE_MS: process.env.RUNTIME_RECOVERING_STALE_MS,
+      RUNTIME_RESUME_PERSIST_EVERY: process.env.RUNTIME_RESUME_PERSIST_EVERY,
     },
     now: () => Date.now(),
     publishEvent,
@@ -849,19 +852,24 @@ function getRuntimeHealth() {
  * { statusCode, json }. Connect/read timeouts keep a wedged runtime from hanging
  * the 45s probe budget. Lazily imported so this is free on warm paths that never probe.
  */
-async function invokeCodingRuntimeProbe({ arn, sessionId, payload }) {
+async function invokeCodingRuntimeProbe({ arn, sessionId, payload, abortSignal }) {
   const { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } = await import("@aws-sdk/client-bedrock-agentcore");
   const { NodeHttpHandler } = await import("@smithy/node-http-handler");
   const client = new BedrockAgentCoreClient({
     region: REGION,
     requestHandler: new NodeHttpHandler({ connectionTimeout: 5000, requestTimeout: 20000 }),
   });
-  const resp = await client.send(new InvokeAgentRuntimeCommand({
-    agentRuntimeArn: arn,
-    runtimeSessionId: sessionId,
-    payload: new TextEncoder().encode(JSON.stringify(payload)),
-    accept: "application/json",
-  }));
+  const resp = await client.send(
+    new InvokeAgentRuntimeCommand({
+      agentRuntimeArn: arn,
+      runtimeSessionId: sessionId,
+      payload: new TextEncoder().encode(JSON.stringify(payload)),
+      accept: "application/json",
+    }),
+    // F4 — the runtime-health guard's timer aborts this signal on budget-exceed so
+    // a wedged runtime tears its socket down instead of hanging the probe.
+    abortSignal ? { abortSignal } : {},
+  );
   const statusCode = resp?.statusCode ?? resp?.$metadata?.httpStatusCode ?? 0;
   let json = null;
   try {

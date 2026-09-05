@@ -102,20 +102,39 @@ function isPreconditionFailed(err) {
   return n === "PreconditionFailed" || err?.$metadata?.httpStatusCode === 412;
 }
 
-/** Promise.race a work promise against a rejecting timer; always clears the timer. */
-function withBudget(promise, ms) {
-  let timer;
-  const guard = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`probe exceeded ${ms}ms budget`)), ms);
-  });
-  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+/**
+ * F4 — classify a probe failure. The distinction matters because a MISCONFIGURED
+ * probe (bad IAM grant / bad ARN) looks identical to an outage under the old
+ * "any failure counts" rule, so a single IAM regression would park EVERY coding
+ * ticket while the runtime is perfectly healthy and never auto-resume.
+ *   - transient        : throttling / 429 — outage-ish but not proof; never park.
+ *   - probe_misconfigured : AccessDenied/Validation/NotFound/UnrecognizedClient or
+ *                        any non-throttling 4xx — the PROBE is broken, not the
+ *                        runtime; escalate once, do NOT park, do NOT count.
+ *   - outage           : 5xx / network / timeout / abort — a genuine outage candidate.
+ */
+export function classifyProbeError(errName, httpStatus) {
+  const name = errName || "";
+  const http = typeof httpStatus === "number" ? httpStatus : undefined;
+  if (name === "ThrottlingException" || name === "TooManyRequestsException" || http === 429) return "transient";
+  const MISCONFIG = new Set([
+    "AccessDeniedException",
+    "ValidationException",
+    "ResourceNotFoundException",
+    "UnrecognizedClientException",
+    "IncompleteSignatureException",
+    "InvalidSignatureException",
+  ]);
+  if (MISCONFIG.has(name)) return "probe_misconfigured";
+  if (http !== undefined && http >= 400 && http < 500) return "probe_misconfigured";
+  return "outage";
 }
 
 /**
  * Build a runtime-health gate bound to its dependencies.
  *
  * deps:
- *   invokeRuntime({ arn, sessionId, payload }) -> { statusCode, json } | throws
+ *   invokeRuntime({ arn, sessionId, payload, abortSignal }) -> { statusCode, json } | throws
  *   s3: { getObject(key)->{body,etag}|null, putObject(key,body,{ifNoneMatch?,ifMatch?})->{etag}|throws412, deleteObject(key) }
  *   publishEvent(subject, type, detail)
  *   now() -> epoch ms
@@ -160,23 +179,68 @@ export function createRuntimeHealth(deps) {
 
   // ── Probe ──────────────────────────────────────────────────────────────────
 
-  /** Single read-only poll probe. Never throws — a throw IS an unhealthy verdict. */
+  /**
+   * Single read-only poll probe. Never throws — a throw IS an unhealthy verdict.
+   * Returns { healthy, classification, latencyMs, status, errorName, error }.
+   *
+   * F4 — the SDK call is bounded by an AbortController + a rejecting timer (the
+   * NodeHttpHandler connect/read timeouts live at the index.mjs seam). On timeout
+   * the controller is ABORTED so a well-behaved request tears its socket down, and
+   * the guard promise rejects so we are never left hanging even if the SDK ignores
+   * the signal. The timer is always cleared. The budget is
+   * min(RUNTIME_PROBE_TIMEOUT_MS, 45s ceiling) — the Lambda invocation context is
+   * NOT plumbed to this deep call site (the guard runs inside handleTicketReady),
+   * so clamping to getRemainingTimeInMillis would require threading context through
+   * every dispatch path; the env-configurable budget under the 45s ceiling is the
+   * bound instead.
+   */
   async function probeRuntime({ arn }) {
     const t0 = now();
     const sessionId = probeSessionId(arn);
     const payload = { action: "poll", turn_id: `probe-${isoMinute(now())}`, session_id: sessionId };
+    const budget = Math.min(PROBE_OVERALL_BUDGET_MS, Number(env.RUNTIME_PROBE_TIMEOUT_MS) || PROBE_OVERALL_BUDGET_MS);
+    const controller = new AbortController();
+    let timer;
     try {
-      const res = await withBudget(invokeRuntime({ arn, sessionId, payload }), PROBE_OVERALL_BUDGET_MS);
+      const guard = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const e = new Error(`probe exceeded ${budget}ms budget`);
+          e.name = "AbortError";
+          controller.abort(e); // tear down a well-behaved SDK request...
+          reject(e); // ...and unblock us even if it ignores the signal
+        }, budget);
+      });
+      const res = await Promise.race([
+        invokeRuntime({ arn, sessionId, payload, abortSignal: controller.signal }),
+        guard,
+      ]);
       const status = res?.json?.status;
-      const healthy = res?.statusCode === 200 && VALID_POLL_STATUSES.includes(status);
+      const http = res?.statusCode;
+      const healthy = http === 200 && VALID_POLL_STATUSES.includes(status);
+      if (healthy) {
+        return { healthy: true, classification: "healthy", latencyMs: now() - t0, status, errorName: null, error: null };
+      }
+      // A response arrived but is not healthy — classify by HTTP status.
       return {
-        healthy,
+        healthy: false,
+        classification: classifyProbeError(null, http),
         latencyMs: now() - t0,
         status: status ?? null,
-        error: healthy ? null : `unexpected probe response (http=${res?.statusCode ?? "?"}, status=${status ?? "?"})`,
+        errorName: null,
+        error: `unexpected probe response (http=${http ?? "?"}, status=${status ?? "?"})`,
       };
     } catch (err) {
-      return { healthy: false, latencyMs: now() - t0, status: null, error: err?.message || String(err) };
+      const errName = err?.name || err?.code || null;
+      return {
+        healthy: false,
+        classification: classifyProbeError(errName, err?.$metadata?.httpStatusCode),
+        latencyMs: now() - t0,
+        status: null,
+        errorName: errName,
+        error: err?.message || String(err),
+      };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -233,6 +297,50 @@ export function createRuntimeHealth(deps) {
     });
   }
 
+  // ── Probe misconfiguration (F4) ──────────────────────────────────────────────
+
+  /**
+   * F4 — a probe that fails with a misconfiguration signal (bad IAM grant, bad/
+   * stale ARN, malformed request) is NOT an outage: the runtime may be perfectly
+   * healthy and every coding ticket would otherwise be parked with no path back.
+   * So we emit a DISTINCT `runtime.probe_misconfigured` event and raise ONE
+   * idempotent manager_escalation naming the concrete fix — gated on the store's
+   * appendNotificationOnce CAS so a broken probe across dozens of dispatches
+   * yields exactly one escalation, not one per ticket. We never park and never
+   * touch the outage confirm counter (the caller fails OPEN).
+   */
+  async function handleProbeMisconfigured(arn, workflowId, probe) {
+    const errName = probe?.errorName || "probe misconfigured";
+    let appended = false;
+    if (appendNotificationOnce && workflowId) {
+      appended = await appendNotificationOnce(workflowId, {
+        id: `notif_runtime_probe_misconfigured_${arnTag(arn)}`,
+        type: "manager_escalation",
+        title: "Coding-runtime probe is misconfigured — health gate is blind",
+        details:
+          `The coding-runtime health probe is failing with ${errName}. This is a PROBE ` +
+          `misconfiguration, not a runtime outage — coding tickets are NOT being parked and ` +
+          `will dispatch normally, but the health gate cannot protect them until this is fixed. ` +
+          `Check that the orchestrator role grants bedrock-agentcore:InvokeAgentRuntime on ` +
+          `CODING_AGENT_RUNTIME_ARN (${arn || "unset"}) and that the ARN is current.`,
+        reviewer: "runtime-health",
+        timestamp: new Date(now()).toISOString(),
+        acknowledged: false,
+      });
+    }
+    // Emit the distinct event only alongside a freshly-raised escalation so the
+    // event stream mirrors the once-only escalation (no per-ticket event spam).
+    if (appended || !workflowId) {
+      await publishEvent(`runtime:${arnTag(arn)}`, "runtime.probe_misconfigured", {
+        runtimeArn: arn,
+        workflowId: workflowId || null,
+        errorName: errName,
+        hint: "grant bedrock-agentcore:InvokeAgentRuntime on CODING_AGENT_RUNTIME_ARN and verify the ARN",
+      });
+    }
+    log(`[runtime-health] probe MISCONFIGURED (${errName}) — failing open, escalated=${appended}`);
+  }
+
   // ── Dispatch guard ───────────────────────────────────────────────────────────
 
   /**
@@ -277,8 +385,22 @@ export function createRuntimeHealth(deps) {
       return { ok: true };
     }
 
-    // 3. Unhealthy — CONFIRM consecutive failures before declaring an outage
-    //    (a single miss during the microVM's 5-20s cold start must not park work).
+    // F4 — a MISCONFIGURED probe (bad IAM grant / bad ARN) is NOT an outage: the
+    // runtime may be perfectly healthy. Do NOT park, do NOT touch the confirm
+    // counter, and raise ONE idempotent escalation naming the fix. Fail OPEN —
+    // blocking real work on a broken probe is the very failure this guards against.
+    if (probe.classification === "probe_misconfigured") {
+      await handleProbeMisconfigured(arn, workflowId, probe);
+      return { ok: true };
+    }
+    // F4 — throttling is transient (outage-ish but not proof); never park on it.
+    if (probe.classification === "transient") {
+      log(`[runtime-health] ${ticketId}: probe transient (${probe.errorName || "throttled"}) — dispatching, not an outage`);
+      return { ok: true };
+    }
+
+    // 3. Unhealthy (outage-candidate) — CONFIRM consecutive failures before declaring
+    //    an outage (a single miss during the microVM's 5-20s cold start must not park).
     const fails = (_failures.get(arn) || 0) + 1;
     _failures.set(arn, fails);
     if (fails < confirm) {
