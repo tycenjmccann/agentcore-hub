@@ -151,6 +151,8 @@
         "--exclude",
         "test_*.py",
         "--exclude",
+        "fixtures/*",
+        "--exclude",
         "*.pyc"
       ]
     },
