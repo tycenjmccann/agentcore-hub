@@ -126,10 +126,22 @@ vi.mock("@aws-sdk/client-lambda", () => ({
   },
   InvokeCommand: class { constructor(i) { this.input = i; } },
 }));
+// CD registry (main #369, TEAM-4044): a ship-phase agent ticket on a repo that
+// is NOT in the registry is resolved Done as a CD handoff instead of being
+// dispatched. The prod sequence this file pins is the hub's OWN registered
+// repo, so the fixtures' repo (o/r) is registered — the release manager's Ship
+// ticket must still dispatch when Readied ((e2), (e-DDB)). Same shape as the
+// sibling suites; an unregistered repo is covered by cd-handoff.test.mjs.
+const CD_REGISTRY = JSON.stringify({ version: 1, repos: [{ repo: "o/r" }] });
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
-      if (cmd.constructor.name === "GetObjectCommand") throw new Error("NoSuchKey");
+      if (cmd.constructor.name === "GetObjectCommand") {
+        if (cmd.input.Key === "config/cd-registry.json") {
+          return { Body: { transformToString: async () => CD_REGISTRY } };
+        }
+        throw Object.assign(new Error("The specified key does not exist."), { name: "NoSuchKey" });
+      }
       return {};
     }
   },
@@ -385,6 +397,11 @@ async function deliverQueuedWebhooks(max = 20) {
   }
 }
 
+// loadCdRegistry early-returns (EMPTY registry → HANDOFF) unless ARTIFACT_BUCKET
+// is set at import time; the roster/workflow-def reads then miss (NoSuchKey) and
+// fall back, exactly as in the sibling suites.
+process.env.ARTIFACT_BUCKET = "test-bucket";
+
 const ORIGINAL_FETCH = global.fetch;
 
 beforeEach(() => {
@@ -406,6 +423,8 @@ beforeEach(() => {
   h.state.workflow = {
     id: "wf_1", epicId: "TEAM-1", workflowDefId: "software-delivery", phase: "development",
     humanNotifications: [], resumeContexts: {}, agentTasks: {},
+    // Registered in the CD registry served by the S3 mock (see CD_REGISTRY).
+    repoConfig: { layout: "multi-repo", repos: [{ platform: "backend", url: "https://github.com/o/r", defaultBranch: "main" }] },
   };
   // Runtime ARNs so a dispatch reaches the agent-invoker instead of the
   // "no ARN" error branch (which would itself block the ticket).
