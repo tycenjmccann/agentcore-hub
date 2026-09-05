@@ -23,11 +23,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
  * the handler — this is how the chain test observes the downstream dispatch).
  *
  * Three fixes are pinned here (none implemented by this file):
- *   1. from-state guard: only in_review -> blocked (a real "Request changes")
- *      reaches handleReviewRejection — both entry points (processStatusChange +
- *      processRecord). A missing oldStatus fails CLOSED unless the orchestrator
- *      holds evidence the gate was under review (an unacknowledged review_needed
- *      notification for that gate).
+ *   1. from-state guard: a creation-time block (todo / new / missing from-state,
+ *      or a DDB INSERT) never reaches handleReviewRejection — both entry points
+ *      (processStatusChange + processRecord). Owned by TEAM-4044's
+ *      isCreationTimeBlock (main, #364); a PRESENTED gate (ready / in_progress /
+ *      in_review -> blocked) is honored as a rejection.
  *   2. rework reopen guard: an upstream ticket whose own blockedBy contains a
  *      non-done ticket is not re-Readied (Jira) / not status-rewritten (DDB), and
  *      review.rejected.reopened reflects what actually happened.
@@ -458,29 +458,21 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
     expect(eventsOf("review.rejected")).toHaveLength(1);
   });
 
-  it("oldStatus MISSING on a human gate -> blocked, no evidence of a review: fails CLOSED (no reopen)", async () => {
+  it("oldStatus MISSING on a human gate -> blocked: fails CLOSED (no reopen)", async () => {
     seedGateAndBlockedShip();
-    // No review_needed notification was ever recorded for this gate: the
-    // orchestrator never parked it for review, so there is nothing to reject.
-    h.state.workflow.humanNotifications = [];
+    // TEAM-4044 (main, #364) owns the from-state guard: a missing/empty
+    // from-state is a creation-time block, full stop — even with an open
+    // review_needed notification (the earlier evidence-based fallback on this
+    // branch was superseded by that guard and removed).
+    h.state.workflow.humanNotifications = [
+      { id: "n1", type: "review_needed", ticketId: "TEAM-25", reviewer: "engineer", acknowledged: false, timestamp: "2026-09-04T00:00:00.000Z" },
+    ];
 
     await handler({ source: "jira-webhook", ticketId: "TEAM-25", newStatus: "blocked" });
 
     expect(h.state.enforce).not.toHaveBeenCalled();
     expect(eventsOf("review.rejected")).toHaveLength(0);
     expect(transitionsOn("TEAM-24")).toEqual([]);
-  });
-
-  it("CONTROL: oldStatus MISSING but the gate has an open review_needed notification (it WAS under review) -> handler reached once", async () => {
-    seedGateAndBlockedShip();
-    h.state.workflow.humanNotifications = [
-      { id: "n1", type: "review_needed", ticketId: "TEAM-25", reviewer: "engineer", acknowledged: false, timestamp: "2026-09-04T00:00:00.000Z" },
-    ];
-    h.state.enforce = vi.fn(async () => ({ escalated: true, effectiveRounds: 3, maxRounds: 3 }));
-
-    await handler({ source: "jira-webhook", ticketId: "TEAM-25", newStatus: "blocked" });
-
-    expect(h.state.enforce).toHaveBeenCalledTimes(1);
   });
 
   describe("(e) agent ticket in_progress -> blocked releases the running claim ONLY while its own blockers are open", () => {

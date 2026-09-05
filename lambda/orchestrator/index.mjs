@@ -606,12 +606,10 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       }
       const rejected = await getTicket(ticketId);
       if (rejected && isHumanAssignee(rejected.assignee)) {
-        // TEAM-4045: only a real "Request changes" (in_review → blocked) is a
-        // rejection. The jira Lambda routes a NEW gate To Do → Blocked at
-        // creation; that hop must not re-open the gate's upstream work.
-        if (await isHumanRejectionTransition(oldStatus, rejected)) {
-          await handleReviewRejection(rejected);
-        }
+        // TEAM-4045: the from-state guard is isCreationTimeBlock above (TEAM-4044
+        // landed it first; a PRESENTED gate — ready/in_progress/in_review →
+        // blocked — is honored as a rejection).
+        await handleReviewRejection(rejected);
       } else if (rejected) {
         // TEAM-4045: an agent parked its own ticket — free its invocation claim.
         await releaseClaimOnSelfPark(rejected, oldStatus);
@@ -785,37 +783,6 @@ export async function handleTicketDoneUnified(ticketId) {
 /** Whether an assignee refers to a human reviewer (review gate) vs an agent. */
 function isHumanAssignee(assignee) {
   return typeof assignee === "string" && assignee.startsWith("human:");
-}
-
-/**
- * TEAM-4045 — is this human gate's move to "blocked" the reviewer's "Request
- * changes"? Only in_review → blocked is: in_review is the one state the
- * orchestrator parks a gate in for review (handleHumanReviewGate, also behind
- * parkGateForHuman and the cascade re-wake), and both ticket providers only
- * carry a rejection note out of in_review. Every other from-state is plumbing:
- * the jira Lambda's creation-time To Do → Blocked hop ("todo"), a
- * jira:issue_created delivery ("new"), a board drag off Ready. A MISSING
- * from-state (older command producers; a changelog item without fromString)
- * fails CLOSED unless the orchestrator's own record shows the gate was parked
- * for review — an unacknowledged review_needed notification for it.
- */
-async function isHumanRejectionTransition(oldStatus, gate) {
-  if (oldStatus === "in_review") return true;
-  if (oldStatus === undefined || oldStatus === null || oldStatus === "") {
-    const workflow = await resolveWorkflow(gate.workflowId, gate.parentId);
-    const underReview = (workflow?.humanNotifications || []).some(
-      (n) => n.ticketId === gate.ticketId && n.type === "review_needed" && !n.acknowledged
-    );
-    console.log(
-      `[orchestrator] ${gate.ticketId}: → blocked with no from-state — ` +
-      (underReview
-        ? "open review_needed notification found, treating as a review rejection"
-        : "no open review_needed notification, NOT a review rejection (fail closed)")
-    );
-    return underReview;
-  }
-  console.log(`[orchestrator] ${gate.ticketId}: ${oldStatus} → blocked on a human gate is not a review rejection (only in_review → blocked is) — skipping handleReviewRejection`);
-  return false;
 }
 
 /**
@@ -2376,16 +2343,10 @@ async function processRecord(record) {
       }
       const blockedAssignee = unwrapDdbValue(newImage.assignee);
       if (isHumanAssignee(blockedAssignee)) {
-        // TEAM-4045: an INSERT is creation (the tickets Lambda writes a gate
-        // with blockers as status "blocked" directly) — never a rejection.
-        if (eventName === "INSERT") {
-          console.log(`[orchestrator] ${ticketId}: human gate created as blocked — not a review rejection, skipping handleReviewRejection`);
-          break;
-        }
+        // (An INSERT has no OldImage → oldStatus null → isCreationTimeBlock
+        // above already returned; only a MODIFY from a presented state gets here.)
         const rejected = await getTicket(ticketId);
-        if (rejected && await isHumanRejectionTransition(oldStatus, rejected)) {
-          await handleReviewRejection(rejected);
-        }
+        if (rejected) await handleReviewRejection(rejected);
       } else if (eventName === "MODIFY") {
         // TEAM-4045: an agent parked its own ticket — free its invocation claim.
         await releaseClaimOnSelfPark({
