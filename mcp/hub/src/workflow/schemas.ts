@@ -21,9 +21,11 @@ export const RepoConfigSchema = z.object({
  * unbounded array is a request amplifier. This package is standalone (its own
  * tsconfig/node_modules, no @/* alias into src/), so the number is duplicated
  * rather than imported — keep it in step with MAX_INTAKE_SOURCES in
- * src/lib/workflow/source-shape.ts, which guards the REST route.
+ * src/lib/workflow/source-shape.ts, which guards the REST route. Exported so
+ * tools.ts can advertise the same cap in the MCP tool JSON schemas
+ * (maxItems) rather than drifting from this zod .max() (TEAM-4102).
  */
-const MAX_INTAKE_SOURCES = 32;
+export const MAX_INTAKE_SOURCES = 32;
 const MAX_SOURCES_MESSAGE = `sources must have at most ${MAX_INTAKE_SOURCES} items`;
 
 export const IntakeSourceSchema = z.object({
