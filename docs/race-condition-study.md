@@ -215,3 +215,34 @@ points at this workflowId, so a slow owner re-pointed away mid-flight loses the 
 coalesces rather than double-creating. Fence losers run compensating cleanup on the orphan epic
 they already created (Jira: delete; DynamoDB: cancel via terminal transition with an audit
 comment).
+
+## Addendum (2026-09-05): two R3 states that are neither live nor free — `parkClaim` and `gateBypassFlaggedAt`
+
+R3 said a claim is either LIVE (its lease is fresh — hands off) or STALE (stealable). TEAM-3991
+found two situations where that binary lies, both in `lambda/orchestrator/workflow-store.mjs` and
+both expressed as attributes on the claim rather than as new liveness rules — `lease.mjs` +
+`cascade.mjs reconcileDependent` remain the only implementations of liveness itself.
+
+**`parkClaim` — parked is not live, and that is the point.** When an agent files a fix ticket and
+its origin ticket goes `blocked`, the origin's claim is still sitting there with a fresh
+`startedAt`. Read as live, it froze the origin until the lease aged out (wf 1pl3h1: 30 minutes of
+nothing, then a human dispatched it by hand). Read as simply stale, a sweep would steal it and
+re-run an agent whose work is *waiting on a fix*, not dead. `parkClaim(workflowId, ticketId,
+expectedStartedAt)` moves the claim to a third state: the task is stamped parked (and its lease
+is no longer treated as fresh) with a CAS on the exact `startedAt` it read, so a claim that has
+since been re-issued to a different generation is never parked out from under its owner. A parked
+claim then passes the ordinary claim CAS — when the fix closes, `cascadeUnblock` readies the
+origin and the next dispatch takes it cleanly, with no steal and no human.
+
+**`gateBypassFlaggedAt` — a claim that must NOT be re-issued.** The merge-without-approval
+detector (D1.1) flags the offending task when it proves a PR merged before the gate that owed it
+an approval. That flag has to survive a re-dispatch, or the recovery machinery cheerfully hands
+the ticket to a fresh agent and the bypass is laundered into a normal-looking second attempt.
+So `claimInvocation` carries `attribute_not_exists(agentTasks.#tid.gateBypassFlaggedAt)` in its
+condition expression: the claim CAS itself REFUSES a flagged task. There is no separate check to
+forget to call, and it composes with the rest of R3 for free — every dispatch path already goes
+through that one CAS. Clearing the flag is a human act (acking the escalation), which is exactly
+where the authority for "yes, proceed anyway" belongs.
+
+The shape generalizes: when a claim needs a state other than live/stale, add an attribute and
+teach the ONE CAS about it — never a second liveness predicate.

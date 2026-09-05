@@ -57,6 +57,48 @@ export function evidenceFromBranchProbe({ branch = "", branchHead = null, compar
   };
 }
 
+/**
+ * TEAM-3991 D1.3/D1.4 — the PURE half of `featureBranchMergeProbe`, shared with
+ * the console twin (src/lib/workflow/merge-probe.ts) and pinned by
+ * src/lib/workflow/completion-evidence-parity.test.ts.
+ *
+ * `merged_at` is the ONLY authoritative merge signal on a pull request: `state`
+ * goes to "closed" for an abandoned PR too, and `merge_commit_sha` is populated on
+ * PRs that were never merged (GitHub keeps a test-merge sha there). Reading either
+ * of those as proof is how an unshipped run gets a green close, so this reduces the
+ * list on `merged_at` alone.
+ *
+ * Returns the proof, or null when NO pull request in the list has merged (the
+ * caller then asks `compare` — a squash/rebase merge can leave the branch behind
+ * the base with no merged PR attached to that head).
+ */
+export function mergeProbeFromPulls(prs) {
+  const list = Array.isArray(prs) ? prs : [];
+  const mergedPr = list.find((p) => p?.merged_at);
+  if (!mergedPr) return null;
+  return {
+    merged: true,
+    mergeCommit: mergedPr.merge_commit_sha || "",
+    prUrl: mergedPr.html_url || "",
+  };
+}
+
+/**
+ * The compare half: identical/behind ⇒ the branch's commits are already in the
+ * base (merged, however it landed); ahead/diverged ⇒ PROVABLY unmerged; anything
+ * else (unknown status, no response) ⇒ `{ merged: null }` — unknown, fail OPEN
+ * for the unmerged gate and NO proof for the shipped verdict.
+ */
+export function mergeProbeFromCompare(cmp, base = "main") {
+  if (cmp?.status === "identical" || cmp?.status === "behind") {
+    return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: "" };
+  }
+  if (cmp?.status === "ahead" || cmp?.status === "diverged") {
+    return { merged: false, reason: `branch ${cmp.ahead_by} commit(s) ahead of ${base} (status=${cmp.status})` };
+  }
+  return { merged: null };
+}
+
 /** First candidate branch with evidence, else `{ hasEvidence: false }`. */
 export async function probeTicketBranches(githubFetch, { owner, repo, base = "main", branches = [] } = {}) {
   const o = encodeURIComponent(owner);

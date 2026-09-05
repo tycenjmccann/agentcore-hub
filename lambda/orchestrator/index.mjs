@@ -48,7 +48,12 @@ import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets,
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning, checkBranchProtection } from "./repo-check.mjs";
 import { runGateBypassCheck, hasUnackedGateBypass } from "./gate-bypass.mjs";
-import { synthesizeCompletion, findTicketPullRequest } from "./evidence.mjs";
+import {
+  synthesizeCompletion,
+  findTicketPullRequest,
+  mergeProbeFromPulls,
+  mergeProbeFromCompare,
+} from "./evidence.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -4566,23 +4571,16 @@ async function featureBranchMergeProbe(workflow) {
     const prs = await githubApi(
       `/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(head)}&state=all&per_page=20`
     );
-    if (Array.isArray(prs) && prs.length > 0) {
-      const mergedPr = prs.find((p) => p.merged_at);
-      if (mergedPr) {
-        return { merged: true, mergeCommit: mergedPr.merge_commit_sha || "", prUrl: mergedPr.html_url || "" };
-      }
-    }
+    // The two result mappings live in evidence.mjs so the console twin
+    // (src/lib/workflow/merge-probe.ts) decides merge-proof identically — the
+    // parity test pins them against each other.
+    const fromPr = mergeProbeFromPulls(prs);
+    if (fromPr) return fromPr;
 
     const cmp = await githubApi(
       `/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`
     );
-    if (cmp?.status === "identical" || cmp?.status === "behind") {
-      return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: "" };
-    }
-    if (cmp?.status === "ahead" || cmp?.status === "diverged") {
-      return { merged: false, reason: `branch ${cmp.ahead_by} commit(s) ahead of ${base} (status=${cmp.status})` };
-    }
-    return { merged: null }; // unknown status — fail open, no proof
+    return mergeProbeFromCompare(cmp, base); // unknown status → { merged: null }, fail open
   } catch (err) {
     console.warn(`[orchestrator] merge-verify skipped for ${workflow.id}: ${err.message}`);
     return { merged: null }; // fail open, no proof

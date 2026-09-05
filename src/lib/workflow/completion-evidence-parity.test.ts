@@ -10,6 +10,11 @@ import {
   SHIP_PROVEN_OUTCOMES as PROVEN_TS,
   ACCEPTED_SHIP_OUTCOMES as ACCEPTED_TS,
 } from "./completion-evidence";
+import {
+  // TEAM-3991 D1.3 twins (the merge-probe result mappings).
+  mergeProbeFromPulls as mergeFromPullsTs,
+  mergeProbeFromCompare as mergeFromCompareTs,
+} from "./merge-probe";
 // The orchestrator (Lambda) port. Both copies MUST agree — a drift means the HTTP
 // complete route and the orchestrator twin disagree on whether a completions
 // record proves a deliverable, and a run closable from one surface would 409 on
@@ -24,6 +29,10 @@ import {
   SHIP_PROVEN_OUTCOMES as PROVEN_MJS,
   ACCEPTED_SHIP_OUTCOMES as ACCEPTED_MJS,
 } from "../../../lambda/orchestrator/completion.mjs";
+import {
+  mergeProbeFromPulls as mergeFromPullsMjs,
+  mergeProbeFromCompare as mergeFromCompareMjs,
+} from "../../../lambda/orchestrator/evidence.mjs";
 
 /**
  * TEAM-3976 parity contract: feed the SAME record × entry matrix through both
@@ -245,4 +254,70 @@ describe("TEAM-3991 D1.4 parity — blockReasonWithGate", () => {
       });
     }
   }
+});
+
+/**
+ * TEAM-3991 D1.3 parity — the merge-probe result mappings.
+ *
+ * The console twin (src/lib/workflow/merge-probe.ts) and the orchestrator
+ * (lambda/orchestrator/evidence.mjs, called by index.mjs featureBranchMergeProbe)
+ * must reduce the SAME GitHub payload to the same verdict. A drift here is the
+ * worst kind available on this path: one surface closes a run green while the other
+ * calls the very same branch unmerged.
+ */
+describe("TEAM-3991 D1.3 parity — mergeProbeFromPulls / mergeProbeFromCompare", () => {
+  const PR_LISTS: Array<[string, unknown]> = [
+    ["empty", []],
+    ["not an array", null],
+    ["undefined", undefined],
+    ["one open PR", [{ state: "open", html_url: "u1", merge_commit_sha: "test-merge-sha" }]],
+    // The trap: GitHub fills merge_commit_sha with a TEST-merge sha on unmerged PRs.
+    ["closed-but-never-merged with a merge_commit_sha", [{ state: "closed", merge_commit_sha: "deadbeef", html_url: "u2" }]],
+    ["one merged PR", [{ merged_at: "2026-09-01T10:00:00Z", merge_commit_sha: "abc123", html_url: "u3" }]],
+    ["merged PR missing its sha", [{ merged_at: "2026-09-01T10:00:00Z", html_url: "u4" }]],
+    ["merged PR missing its url", [{ merged_at: "2026-09-01T10:00:00Z", merge_commit_sha: "abc123" }]],
+    ["open first, merged second", [{ state: "open" }, { merged_at: "x", merge_commit_sha: "s2", html_url: "u5" }]],
+    ["two merged — first wins", [{ merged_at: "a", merge_commit_sha: "s1" }, { merged_at: "b", merge_commit_sha: "s2" }]],
+    ["null entries", [null, { merged_at: "a", merge_commit_sha: "s1" }]],
+    ["merged_at null", [{ merged_at: null, merge_commit_sha: "s1" }]],
+  ];
+  for (const [label, prs] of PR_LISTS) {
+    it(`agrees on pulls: ${label}`, () => {
+      expect(mergeFromPullsTs(prs)).toEqual(mergeFromPullsMjs(prs));
+    });
+  }
+
+  const COMPARES: Array<[string, unknown]> = [
+    ["identical", { status: "identical", base_commit: { sha: "base1" } }],
+    ["behind", { status: "behind", base_commit: { sha: "base2" } }],
+    ["behind with no base sha", { status: "behind" }],
+    ["ahead", { status: "ahead", ahead_by: 3 }],
+    ["diverged", { status: "diverged", ahead_by: 7 }],
+    ["ahead with no count", { status: "ahead" }],
+    ["unknown status", { status: "whatever" }],
+    ["no status", {}],
+    ["null", null],
+    ["undefined", undefined],
+  ];
+  for (const [label, cmp] of COMPARES) {
+    for (const base of ["main", "develop"]) {
+      it(`agrees on compare: ${label} vs ${base}`, () => {
+        expect(mergeFromCompareTs(cmp, base)).toEqual(mergeFromCompareMjs(cmp, base));
+      });
+    }
+  }
+
+  it("agrees on the default base", () => {
+    expect(mergeFromCompareTs({ status: "ahead", ahead_by: 1 })).toEqual(
+      mergeFromCompareMjs({ status: "ahead", ahead_by: 1 })
+    );
+  });
+
+  it("merged_at is the ONLY merge signal — a test-merge sha proves nothing", () => {
+    // Pinned explicitly, not just for parity: both twins must return null here, or
+    // an abandoned PR would stamp a merge proof onto an unshipped run.
+    const abandoned = [{ state: "closed", merge_commit_sha: "deadbeef", html_url: "u" }];
+    expect(mergeFromPullsTs(abandoned)).toBeNull();
+    expect(mergeFromPullsMjs(abandoned)).toBeNull();
+  });
 });

@@ -47,6 +47,11 @@ import {
   shipVerdictOf as classifyShipEntry,
   type OpenGate,
 } from "@/lib/workflow/completion-evidence";
+import {
+  featureBranchMergeProbe,
+  type MergeProbeInput,
+  type MergeProbeResult,
+} from "@/lib/workflow/merge-probe";
 import agentsConfig from "@/config/agents.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -461,6 +466,67 @@ async function closeBlocked(
 }
 
 /**
+ * TEAM-3991 D1.3 PARITY (mirrors the orchestrator's merge-proof stamp) — write
+ * GitHub's merge proof onto the ship tasks that self-reported nothing, so the
+ * re-judged verdict (and the dashboard) tell the truth.
+ *
+ * Two rules that are not negotiable here:
+ *  - A recorded BLOCK is never overwritten. An offender whose verdict is anything
+ *    other than "none" already said something; a merge does not un-block a
+ *    deploy-blocked ticket, and `blockReason` is never touched by this path.
+ *  - Scoped conditional write on the EXISTING entry only
+ *    (`attribute_exists(agentTasks.#tid)`), same shape as the cd-evidence stamp, so
+ *    a stale ticket id can never materialize a phantom task.
+ */
+async function stampMergeProof(
+  workflowId: string,
+  workflow: Record<string, unknown>,
+  verdict: ShipVerdict,
+  probe: MergeProbeResult,
+  agentTasks: Record<string, Record<string, unknown>>
+): Promise<void> {
+  for (const o of verdict.offenders) {
+    if (o.verdict && o.verdict !== "none") continue;
+    const fields: Record<string, unknown> = {
+      mergeCommit: probe.mergeCommit || `merged:${String(workflow.featureBranch || "")}`,
+      mergeVerifiedBy: "github",
+    };
+    if (probe.prUrl && !agentTasks[o.ticketId]?.prUrl) fields.prUrl = probe.prUrl;
+    const names: Record<string, string> = { "#tid": o.ticketId };
+    const values: Record<string, unknown> = {};
+    const sets: string[] = [];
+    let i = 0;
+    for (const [k, v] of Object.entries(fields)) {
+      names[`#f${i}`] = k;
+      values[`:v${i}`] = v;
+      sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
+      i++;
+    }
+    try {
+      await ddb.send(
+        new UpdateCommand({
+          TableName: WORKFLOWS_TABLE,
+          Key: { workflowId },
+          UpdateExpression: `SET ${sets.join(", ")}`,
+          ConditionExpression: "attribute_exists(agentTasks.#tid)",
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        })
+      );
+    } catch (err) {
+      if ((err as Error).name !== "ConditionalCheckFailedException") {
+        console.warn(`[complete] merge-proof stamp failed for ${o.ticketId}: ${(err as Error).message}`);
+      }
+    }
+    agentTasks[o.ticketId] = { ...(agentTasks[o.ticketId] || {}), ...fields };
+  }
+  console.log(
+    `[complete] ${workflowId}: GitHub proves ${String(workflow.featureBranch || "")} merged ` +
+      `(${probe.mergeCommit || "compare"}) — ship verdict taken from ground truth`
+  );
+}
+
+/**
  * TEAM-3991 D1.4 PARITY (mirrors the orchestrator's harvestCdEvidence) — the
  * run's OWN account of its deploy. The release manager writes
  * `workflows/<wf>/shared/cd-evidence/deploy-*.md` ("# DEPLOY SUCCEEDED …" /
@@ -858,11 +924,38 @@ export async function POST(
           if (cd?.outcome === "deployed") provenShipOutcome = "deployed";
         }
       }
-      const verdict = evaluateShipVerdict(
+      let verdict = evaluateShipVerdict(
         tickets,
         agentTasks as Record<string, ShipTaskLike>,
         requiredPhases
       );
+      // TEAM-3991 D1.3 — GitHub is the ground truth, and it is consulted BEFORE the
+      // verdict is acted on. The release manager's report_completion has no
+      // merge_commit field, so a merged run's self-report can never say "shipped";
+      // without this the route closed every deployed run static-ci-only and could
+      // not distinguish it from a run whose branch never landed. Three answers:
+      // proven merged → stamp the proof and re-judge; proven unmerged → the honest
+      // blocked close names it; unknown → self-report decides, untouched.
+      if (verdict.required && !verdict.shipped && shipPhases.length > 0) {
+        const probe = await featureBranchMergeProbe(workflow as MergeProbeInput);
+        if (probe.merged === true) {
+          await stampMergeProof(workflowId, workflow, verdict, probe, agentTasks);
+          verdict = evaluateShipVerdict(
+            tickets,
+            agentTasks as Record<string, ShipTaskLike>,
+            requiredPhases
+          );
+        } else if (probe.merged === false) {
+          console.error(
+            `[complete] ${workflowId}: feature branch ${String(workflow.featureBranch)} is NOT merged ` +
+              `(${probe.reason}) — refusing a green close.`
+          );
+          verdict = {
+            ...verdict,
+            blockReason: verdict.blockReason || `feature branch not merged: ${probe.reason}`,
+          };
+        }
+      }
       if (verdict.required && !verdict.shipped) {
         const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
         if (COMPLETION_EVIDENCE_REQUIRED) {

@@ -577,6 +577,25 @@ Write the full command transcript (deploy + smoke + any rollback) to
 merge SHA, environments deployed, smoke results table (check, expected,
 actual, pass/fail), evidence key, rollback status if invoked.
 
+**The evidence file's FIRST line is a machine contract.** It MUST be a heading
+whose text begins with exactly one of:
+
+```
+# DEPLOY SUCCEEDED …
+# DEPLOY BLOCKED …
+# PREFLIGHT BLOCKED …
+```
+
+`report_completion` has no outcome field, so this line is the ONLY place the
+run's deploy verdict exists — the orchestrator parses it (newest
+`deploy-*.md` wins) to decide whether the run closes `deployed`,
+`deploy-blocked`, or `static-ci-only`. A file that opens with anything else
+(`# CD run log`, a bare transcript) is unparseable: the run closes
+`static-ci-only` even though you deployed, and a real block goes unread and
+closes green. Put the reason on the same line after the verdict —
+`# PREFLIGHT BLOCKED: PR #274 is not merged` — it becomes the run's
+`blockReason`.
+
 ---
 
 ## Rules

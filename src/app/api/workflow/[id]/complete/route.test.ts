@@ -149,6 +149,9 @@ let POST: typeof import("./route").POST;
 
 const SAVED = [
   "COMPLETION_EVIDENCE_REQUIRED", "TICKET_PROVIDER", "ARTIFACT_BUCKET", "EPIC_ROLLUP_BACKOFF_MS",
+  // TEAM-3991 D1.3: the merge probe reads GITHUB_PAT at CALL time, so a suite can
+  // turn the probe on and off without reloading the route module.
+  "GITHUB_PAT",
 ] as const;
 const saved: Partial<Record<(typeof SAVED)[number], string | undefined>> = {};
 
@@ -176,6 +179,9 @@ beforeEach(() => {
   // at module load, so it must be set before every load()).
   process.env.ARTIFACT_BUCKET = "test-bucket";
   delete process.env.COMPLETION_EVIDENCE_REQUIRED;
+  // No PAT by default: every pre-D1.3 suite must keep behaving exactly as before,
+  // which means the merge probe answers { merged: null } without a single fetch.
+  delete process.env.GITHUB_PAT;
 });
 
 afterEach(() => {
@@ -1140,5 +1146,196 @@ describe("POST complete — CD evidence, open gates, atomic epic roll-up (TEAM-3
       error.mockRestore();
       warn.mockRestore();
     });
+  });
+});
+
+/**
+ * TEAM-3991 D1.3 — the GitHub merge probe on the complete route (parity with the
+ * orchestrator's SHIP_MERGE_VERIFY gate).
+ *
+ * The release manager's report_completion tool has no merge_commit field, so a
+ * merged-and-deployed run's self-reported ship verdict can NEVER read "shipped"
+ * (commitSha is the branch HEAD, deliberately not proof). Before this, the route
+ * closed every such run static-ci-only — and could not tell it apart from a run
+ * whose branch was never merged at all.
+ *
+ * The probe runs on the REAL module over a stubbed global fetch (no vi.mock of
+ * merge-probe.ts), so the URL shape, the merged_at-only reduction and the
+ * fail-open behaviour are all exercised end to end.
+ */
+describe("POST complete — GitHub merge probe (TEAM-3991 D1.3)", () => {
+  const EPIC = "TEAM-3990";
+  const shipTicket = {
+    ticketId: "T-4", type: "task", status: "done", phase: "ship",
+    assignee: "agentcore_hub_release_manager",
+  };
+  /** A run whose ship ticket is done with output but NO merge/deploy verdict. */
+  const shipRun = (ship: Record<string, unknown> = {}) => ({
+    workflowId: "wf_1",
+    phase: "ship",
+    workflowDefId: "software-delivery",
+    epicId: EPIC,
+    featureBranch: "feature/TEAM-3991",
+    repoConfig: { repos: [{ url: "https://github.com/acme/widgets.git", defaultBranch: "main" }] },
+    agentTasks: { "T-4": { ticketId: "T-4", output: "release summary written", ...ship } },
+  });
+
+  let fetchCalls: string[] = [];
+  /** Stub api.github.com: `routes` maps a path substring → JSON body. */
+  const stubGitHub = (routes: Array<[string, unknown]>) => {
+    vi.stubGlobal("fetch", async (url: string) => {
+      fetchCalls.push(String(url));
+      const hit = routes.find(([frag]) => String(url).includes(frag));
+      if (!hit) return { ok: false, status: 404, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => hit[1] };
+    });
+  };
+  const mergeStamp = () =>
+    h.state.updates.find(
+      (u) =>
+        u.ConditionExpression === "attribute_exists(agentTasks.#tid)" &&
+        Object.values((u.ExpressionAttributeNames as Record<string, string>) || {}).includes("mergeVerifiedBy")
+    );
+  const stampedFields = (u: Record<string, unknown>) =>
+    Object.entries((u.ExpressionAttributeNames as Record<string, string>) || {})
+      .filter(([k]) => k !== "#tid")
+      .map(([, v]) => v)
+      .sort();
+
+  beforeEach(() => {
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    process.env.GITHUB_PAT = "ghp_test";
+    h.state.tickets = [shipTicket];
+    fetchCalls = [];
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("merged PR → mergeCommit + mergeVerifiedBy stamped, and the run closes GREEN", async () => {
+    h.state.workflow = shipRun();
+    stubGitHub([
+      ["/pulls?head=", [{ merged_at: "2026-09-05T01:00:00Z", merge_commit_sha: "9f1c2ab", html_url: "https://github.com/acme/widgets/pull/274" }]],
+    ]);
+    await load();
+    const res = await post();
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+    const stamp = mergeStamp();
+    expect(stamp).toBeTruthy();
+    expect((stamp!.ExpressionAttributeNames as Record<string, string>)["#tid"]).toBe("T-4");
+    expect(stampedFields(stamp!)).toEqual(["mergeCommit", "mergeVerifiedBy", "prUrl"]);
+    expect(Object.values(stamp!.ExpressionAttributeValues as Record<string, unknown>)).toEqual(
+      expect.arrayContaining(["9f1c2ab", "github", "https://github.com/acme/widgets/pull/274"])
+    );
+    // One list call answers it — compare is only asked when no PR has merged.
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]).toContain("/repos/acme/widgets/pulls?head=acme%3Afeature%2FTEAM-3991&state=all&per_page=20");
+  });
+
+  it("compare says behind → merged with the base sha as proof (a squash merge leaves no merged PR)", async () => {
+    h.state.workflow = shipRun();
+    stubGitHub([
+      ["/pulls?head=", [{ state: "closed", merge_commit_sha: "test-merge-sha" }]], // never merged
+      ["/compare/", { status: "behind", base_commit: { sha: "base9" } }],
+    ]);
+    await load();
+    const res = await post();
+
+    expect((await res.json()).status).toBe("complete");
+    expect(Object.values(mergeStamp()!.ExpressionAttributeValues as Record<string, unknown>)).toEqual(
+      expect.arrayContaining(["base9", "github"])
+    );
+    // No prUrl to stamp in this shape — only what GitHub actually proved.
+    expect(stampedFields(mergeStamp()!)).toEqual(["mergeCommit", "mergeVerifiedBy"]);
+    expect(fetchCalls).toHaveLength(2);
+  });
+
+  it("compare says ahead → PROVABLY unmerged: honest blocked close naming the branch, no stamp", async () => {
+    h.state.workflow = shipRun();
+    stubGitHub([
+      ["/pulls?head=", []],
+      ["/compare/", { status: "ahead", ahead_by: 4 }],
+    ]);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    const body = await res.json();
+    expect(body.status).toBe("static-ci-only");
+    expect(body.reason).toContain("not merged");
+    expect(body.reason).toContain("4 commit(s) ahead of main");
+    expect(mergeStamp()).toBeUndefined();
+    // The work did not ship, so the epic must not be rolled up.
+    expect(h.state.updates.find((u) => u.TableName === "agentcore-hub-tickets")).toBeUndefined();
+    expect(h.state.events.some((e) => e.type === "workflow.complete")).toBe(false);
+    error.mockRestore();
+  });
+
+  it("GitHub unreachable → merged:null, self-reported evidence decides exactly as before", async () => {
+    h.state.workflow = shipRun();
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("ECONNRESET");
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    // Unchanged pre-D1.3 outcome: nothing recorded a ship, so static-ci-only.
+    expect((await res.json()).status).toBe("static-ci-only");
+    expect(mergeStamp()).toBeUndefined(); // an unreachable API proves nothing
+    error.mockRestore();
+    warn.mockRestore();
+  });
+
+  it("no PAT → no probe at all (not one fetch), verdict untouched", async () => {
+    delete process.env.GITHUB_PAT;
+    h.state.workflow = shipRun();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    expect((await res.json()).status).toBe("static-ci-only");
+    expect(fetchCalls).toEqual([]);
+    error.mockRestore();
+  });
+
+  it("SECURITY: a recorded BLOCK is never overwritten by a merge proof", async () => {
+    // A merge does not un-block a deploy-blocked ticket. The offender already said
+    // something, so it is skipped by the stamp and its blockReason survives.
+    h.state.workflow = shipRun({ outcome: "deploy-blocked", blockReason: "smoke tests failed in prod" });
+    stubGitHub([["/pulls?head=", [{ merged_at: "x", merge_commit_sha: "9f1c2ab", html_url: "u" }]]]);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    const body = await res.json();
+    expect(body.status).toBe("deploy-blocked");
+    expect(body.reason).toContain("smoke tests failed in prod");
+    expect(mergeStamp()).toBeUndefined();
+    error.mockRestore();
+  });
+
+  it("a ship ticket that already proved its merge is never probed", async () => {
+    h.state.workflow = shipRun({ mergeCommit: "already-proven" });
+    await load();
+    const res = await post();
+    expect((await res.json()).status).toBe("complete");
+    expect(fetchCalls).toEqual([]); // the probe only runs when the verdict is short
+  });
+
+  it("no repoConfig → no probe, and never a false 'unmerged' (nothing to probe proves nothing)", async () => {
+    const { repoConfig, ...noRepo } = shipRun();
+    void repoConfig;
+    h.state.workflow = noRepo;
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load();
+    const res = await post();
+    expect((await res.json()).status).toBe("static-ci-only");
+    expect(fetchCalls).toEqual([]);
+    error.mockRestore();
   });
 });
