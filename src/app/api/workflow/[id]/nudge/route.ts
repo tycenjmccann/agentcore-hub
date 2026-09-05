@@ -19,6 +19,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, UpdateCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { JiraClient, mapJiraStatusToInternal, blockersFromLinks } from "@/lib/workflow/jira-client";
 import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
+import { existingTicketPr, prExistsPayload, resumeNote, writeResumeContext } from "@/lib/workflow/pr-guard";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -274,11 +275,13 @@ export async function POST(
   // ticket to Ready. Bodyless POST keeps the original broad-scan behaviour.
   let targetTicketId: string | undefined;
   let force = false;
+  let resume = false;
   try {
     const body = await req.json();
     if (body && typeof body.ticketId === "string" && body.ticketId.trim()) {
       targetTicketId = body.ticketId.trim();
       force = body.force === true;
+      resume = body.resume === true;
     }
   } catch {
     /* no body — broad scan */
@@ -301,6 +304,23 @@ export async function POST(
     let result: { ticketsScanned: number; nudged: string[]; skipped?: string };
 
     if (targetTicketId) {
+      // TEAM-3991 D1.5 — PR-aware dispatch guard. A dispatch re-invokes the agent
+      // from a blank session; if a PR for this ticket already exists it would
+      // redo work that is already on GitHub. Refuse unless resume:true, and then
+      // leave a resume context pointing at the PR. The human-owned / terminal
+      // cases are refused further down by the dispatch paths themselves, and this
+      // guard fails open on any GitHub trouble.
+      const pr = await existingTicketPr(workflow, targetTicketId);
+      if (pr) {
+        if (!resume) {
+          return NextResponse.json(
+            { ...prExistsPayload(targetTicketId, pr), error: prExistsPayload(targetTicketId, pr).message },
+            { status: 409 }
+          );
+        }
+        await writeResumeContext(ddb, WORKFLOWS_TABLE, workflowId, targetTicketId, resumeNote(targetTicketId, pr));
+        console.log(`[nudge] ${targetTicketId}: resuming onto PR #${pr.number} (${pr.state})`);
+      }
       result = ticketProvider === "jira"
         ? await dispatchJira(targetTicketId, epicId, workflowId, force)
         : await dispatchDynamoDB(targetTicketId, workflowId, epicId, force);

@@ -2,6 +2,13 @@ import { describe, it, expect } from "vitest";
 import {
   completionRecordHasEvidence as hasEvidenceTs,
   evidenceBackfillFields as backfillTs,
+  // TEAM-3991 D1.4 twins.
+  openGateOf as openGateTs,
+  parseCdEvidence as parseCdTs,
+  blockReasonWithGate as blockReasonTs,
+  shipVerdictOf as shipVerdictTs,
+  SHIP_PROVEN_OUTCOMES as PROVEN_TS,
+  ACCEPTED_SHIP_OUTCOMES as ACCEPTED_TS,
 } from "./completion-evidence";
 // The orchestrator (Lambda) port. Both copies MUST agree — a drift means the HTTP
 // complete route and the orchestrator twin disagree on whether a completions
@@ -10,6 +17,12 @@ import {
 import {
   completionRecordHasEvidence as hasEvidenceMjs,
   evidenceBackfillFields as backfillMjs,
+  openGateOf as openGateMjs,
+  parseCdEvidence as parseCdMjs,
+  blockReasonWithGate as blockReasonMjs,
+  shipVerdictOf as shipVerdictMjs,
+  SHIP_PROVEN_OUTCOMES as PROVEN_MJS,
+  ACCEPTED_SHIP_OUTCOMES as ACCEPTED_MJS,
 } from "../../../lambda/orchestrator/completion.mjs";
 
 /**
@@ -110,4 +123,126 @@ describe("completion-evidence parity: completion-evidence.ts ≡ completion.mjs"
       expect(hasEvidenceTs(record), label).toBe(expected[label]);
     }
   });
+});
+
+/**
+ * TEAM-3991 D1.4 parity contract. These four functions decide, on BOTH surfaces,
+ * whether a run closes green or blocked and what the terminal event reports. A
+ * drift means the HTTP complete route and the orchestrator disagree about the same
+ * run — the exact split-brain that let wf 1pl3h1 close `complete` over an open
+ * escalation gate while the other twin would have refused.
+ */
+const CHILD_SETS: Array<[string, unknown]> = [
+  ["empty", []],
+  ["not an array", null],
+  ["undefined", undefined],
+  ["only agent tickets", [{ ticketId: "T-1", assignee: "agentcore_hub_backend_dev", status: "done" }]],
+  [
+    "agent ticket in_review (never a gate)",
+    [{ ticketId: "T-1", assignee: "agentcore_hub_ci_agent", status: "in_review" }],
+  ],
+  [
+    "escalation gate in_review",
+    [
+      { ticketId: "T-1", assignee: "agentcore_hub_backend_dev", status: "done" },
+      { ticketId: "TEAM-3757", assignee: "human:r@x", status: "in_review", title: "Escalation #1: ship-review not converging" },
+    ],
+  ],
+  ["merge gate todo", [{ ticketId: "TEAM-900", assignee: "human:r@x", status: "todo", title: "Merge Approval" }]],
+  ["merge gate blocked", [{ ticketId: "TEAM-900", assignee: "human:r@x", status: "blocked", title: "Merge Approval" }]],
+  ["gate done", [{ ticketId: "TEAM-900", assignee: "human:r@x", status: "done", title: "Merge Approval" }]],
+  ["gate cancelled", [{ ticketId: "TEAM-900", assignee: "human:r@x", status: "cancelled", title: "Merge Approval" }]],
+  ["human epic", [{ ticketId: "E-1", type: "epic", assignee: "human:r@x", status: "in_review" }]],
+  [
+    "two open gates (order must not matter)",
+    [
+      { ticketId: "TEAM-900", assignee: "human:r@x", status: "todo", title: "Merge Approval" },
+      { ticketId: "TEAM-100", assignee: "human:r@x", status: "in_review", title: "Escalation #2: x" },
+    ],
+  ],
+  ["gate with no title", [{ ticketId: "TEAM-901", assignee: "human:r@x", status: "in_review" }]],
+  ["status MiXeD case", [{ ticketId: "TEAM-902", assignee: "human:r@x", status: "In_Review", title: "Merge Approval" }]],
+  ["assignee not a string", [{ ticketId: "TEAM-903", assignee: 7, status: "in_review" }]],
+  ["null entry", [null, { ticketId: "TEAM-904", assignee: "human:r@x", status: "todo", title: "Merge Approval" }]],
+];
+
+const CD_FILES: Array<[string, unknown]> = [
+  ["deploy succeeded heading", "# DEPLOY SUCCEEDED - stack x\n\nbody"],
+  ["preflight blocked heading", "# PREFLIGHT BLOCKED: PR #274 is not merged\nmore"],
+  ["deploy blocked, no heading", "DEPLOY BLOCKED - CodeBuild denied"],
+  ["blocked then succeeded (first wins)", "# PREFLIGHT BLOCKED: unmerged\n\nlater: DEPLOY SUCCEEDED"],
+  ["succeeded then blocked (first wins)", "DEPLOY SUCCEEDED\nPREFLIGHT BLOCKED: ignore me"],
+  ["lowercase + leading blanks", "\n\n   ## deploy succeeded  \n"],
+  ["no verdict", "# CD run log\nramping traffic"],
+  ["empty", ""],
+  ["whitespace only", "   \n\t\n"],
+  ["undefined", undefined],
+  ["not a string", { outcome: "deployed" }],
+  ["CRLF line endings", "# PREFLIGHT BLOCKED: windows\r\nnext"],
+];
+
+const SHIP_ENTRIES: Array<[string, unknown]> = [
+  ["merge commit", { mergeCommit: "9f1c2ab" }],
+  ["blank merge commit", { mergeCommit: "   " }],
+  ["outcome shipped", { outcome: "shipped" }],
+  ["outcome deployed", { outcome: "deployed" }],
+  ["outcome DEPLOYED (case/space)", { outcome: "  DEPLOYED " }],
+  ["outcome deploy-blocked", { outcome: "deploy-blocked" }],
+  ["outcome static-ci-only", { outcome: "static-ci-only" }],
+  ["commitSha only (never proof)", { commitSha: "abc123" }],
+  ["output only", { output: "did the thing" }],
+  ["blocked outcome + merge commit", { outcome: "deploy-blocked", mergeCommit: "9f1c2ab" }],
+  ["empty", {}],
+  ["undefined", undefined],
+  ["null", null],
+  ["string", "shipped"],
+];
+
+describe("TEAM-3991 D1.4 parity — openGateOf", () => {
+  for (const [label, children] of CHILD_SETS) {
+    it(`agrees on ${label}`, () => {
+      expect(openGateTs(children)).toEqual(openGateMjs(children));
+    });
+  }
+});
+
+describe("TEAM-3991 D1.4 parity — parseCdEvidence", () => {
+  for (const [label, body] of CD_FILES) {
+    it(`agrees on ${label}`, () => {
+      expect(parseCdTs(body)).toEqual(parseCdMjs(body));
+    });
+  }
+});
+
+describe("TEAM-3991 D1.4 parity — shipVerdictOf", () => {
+  for (const [label, entry] of SHIP_ENTRIES) {
+    it(`agrees on ${label}`, () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(shipVerdictTs(entry as any)).toBe(shipVerdictMjs(entry));
+    });
+  }
+
+  it("both twins share the same accepted/proven outcome vocabulary", () => {
+    expect([...PROVEN_TS]).toEqual([...PROVEN_MJS]);
+    expect([...ACCEPTED_TS]).toEqual([...ACCEPTED_MJS]);
+  });
+});
+
+describe("TEAM-3991 D1.4 parity — blockReasonWithGate", () => {
+  const GATES = [
+    null,
+    undefined,
+    { ticketId: "TEAM-3757", kind: "escalation", status: "in_review", title: "" },
+    { ticketId: "TEAM-900", kind: "merge_gate", status: "todo", title: "Merge Approval" },
+    { ticketId: "", kind: "merge_gate", status: "todo", title: "" },
+  ];
+  const REASONS = ["PR #274 is not merged", "", "   ", null, undefined, 42];
+  for (const gate of GATES) {
+    for (const reason of REASONS) {
+      it(`agrees on ${JSON.stringify(reason)} × ${gate ? gate.ticketId || "(blank id)" : String(gate)}`, () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        expect(blockReasonTs(reason as any, gate as any)).toBe(blockReasonMjs(reason, gate));
+      });
+    }
+  }
 });
