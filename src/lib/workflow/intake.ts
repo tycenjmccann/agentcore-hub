@@ -10,6 +10,7 @@
  */
 
 import { isIPv4, isIPv6 } from "node:net";
+import { lookup as dnsLookup } from "node:dns/promises";
 import { S3Client, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import type { IntakeSource, SourceVerification } from "./types";
@@ -95,11 +96,22 @@ export interface SourceValidationResult {
 
 export type SourceValidationMode = "strict" | "lenient";
 
+/**
+ * A dns.lookup(hostname, { all: true }) seam so tests can inject resolved
+ * addresses without touching the network (mirrors the fetchImpl injection).
+ * The shape is the subset we use of Node's LookupAddress[].
+ */
+export type LookupImpl = (
+  hostname: string
+) => Promise<ReadonlyArray<{ address: string; family?: number }>>;
+
 export interface ValidateIntakeSourcesOptions {
   /** Injected for tests; defaults to a real S3Client in the resolved region. */
   s3Client?: AwsClientLike;
   /** Injected for tests; defaults to globalThis.fetch looked up at CALL time. */
   fetchImpl?: typeof fetch;
+  /** Injected for tests; defaults to dns.lookup(host, { all: true }). */
+  lookupImpl?: LookupImpl;
   env?: NodeJS.ProcessEnv;
   /** Skips hub-bucket resolution entirely (and therefore STS). */
   hubBucket?: string;
@@ -108,6 +120,13 @@ export interface ValidateIntakeSourcesOptions {
 }
 
 const URL_TIMEOUT_MS = 10_000;
+
+/**
+ * TEAM-4101 r2-F2: hard ceiling on the pre-fetch DNS lookup. A hung resolver
+ * must not eat into the 10s-per-source fetch budget; the lookup is a cheap gate,
+ * not the work. Same bounded-race-with-cleared-timer pattern as probeAccountId.
+ */
+export const DNS_LOOKUP_TIMEOUT_MS = 2_000;
 
 /** SOURCE_VALIDATION_MODE — anything that is not exactly "strict" is lenient. */
 export function getSourceValidationMode(env: NodeJS.ProcessEnv = process.env): SourceValidationMode {
@@ -366,7 +385,7 @@ async function checkS3Source(
   }
 }
 
-// ─── SSRF gate for the URL check (TEAM-4091 F1) ──────────────────────────────
+// ─── SSRF gate for the URL check (TEAM-4091 F1 + TEAM-4101 r2-F2) ────────────
 //
 // checkUrlSource issues a SERVER-SIDE GET to a caller-supplied URL and persists
 // the status code into verification.detail, which the submitter reads back. That
@@ -374,13 +393,21 @@ async function checkS3Source(
 // http://169.254.169.254/ (the instance metadata endpoint) and the VPC's private
 // ranges. The submission route has no auth under AUTH_MODE=none.
 //
-// SCOPE, EXPLICITLY: only LITERAL hosts are blocked. A hostname that RESOLVES to
-// a private address — DNS rebinding, or a public name with an RFC1918 A record —
-// is OUT OF SCOPE for this check, because fetch gives us no hook between
-// resolution and connect. This closes the trivially-typed oracle, not every SSRF
-// avenue. Note that WHATWG URL already normalizes the obfuscated numeric forms
-// (http://0x7f000001/ and http://127.1/ both give hostname "127.0.0.1"), so
-// testing url.hostname after parsing covers them.
+// SCOPE, EXPLICITLY:
+//  - LITERAL hosts are blocked outright by urlGate (127.0.0.1, [::1], fc00::/7,
+//    169.254.169.254, …). WHATWG URL already normalizes the obfuscated numeric
+//    forms (http://0x7f000001/ and http://127.1/ both give hostname "127.0.0.1"),
+//    so testing url.hostname after parsing covers them.
+//  - NON-literal hosts are now RESOLVED via dns.lookup (TEAM-4101 r2-F2) and
+//    rejected if ANY answer is private/link-local/loopback — a public name with an
+//    RFC1918/link-local A/AAAA record (or attacker-controlled DNS on this
+//    unauthenticated route) was otherwise a legal source and a blind oracle.
+//  - The ACCEPTED residual is DNS-rebinding TOCTOU: the record can change between
+//    our lookup and undici's own connect(), so a pinned attacker could still hit an
+//    internal address on the real GET. We accept it because the oracle is
+//    status-only — no body is read, no credential is sent — and truly closing it
+//    would require pinning the socket to the vetted address via a custom undici
+//    dispatcher, which is out of scope here.
 
 /** Blocked IPv4 range, or undefined for a routable literal. */
 function blockedIpv4Reason(host: string): string | undefined {
@@ -436,22 +463,32 @@ function blockedIpv6Reason(host: string): string | undefined {
 }
 
 /**
- * Refuse the URL before any socket is opened. Returns the Check to report, or
- * undefined when the URL is allowed. A URL we cannot even parse is definitive —
- * nothing downstream will ever fetch it — mirroring "Invalid S3 URI format".
+ * Result of the literal-host gate: either a Check to report (blocked / unparseable),
+ * or the canonical host to proceed with (`literal` distinguishes an already-vetted
+ * IP literal, which skips the resolver, from a name that still needs one).
  */
-function urlGate(value: string): Check | undefined {
+type UrlGateResult = { check: Check } | { host: string; literal: boolean };
+
+/**
+ * Refuse the URL on its LITERAL host before any socket is opened, and hand back
+ * the canonical host for the resolver step. A URL we cannot even parse is
+ * definitive — nothing downstream will ever fetch it — mirroring "Invalid S3 URI
+ * format".
+ */
+function urlGate(value: string): UrlGateResult {
   let url: URL;
   try {
     url = new URL(value);
   } catch {
-    return { outcome: "definitive", method: "parse", detail: `Invalid URL format: ${redactUrl(value)}` };
+    return { check: { outcome: "definitive", method: "parse", detail: `Invalid URL format: ${redactUrl(value)}` } };
   }
 
-  const blocked = (reason: string): Check => ({
-    outcome: "definitive",
-    method: "parse",
-    detail: `Blocked URL host — ${reason}: ${redactUrl(value)}`,
+  const blocked = (reason: string): UrlGateResult => ({
+    check: {
+      outcome: "definitive",
+      method: "parse",
+      detail: `Blocked URL host — ${reason}: ${redactUrl(value)}`,
+    },
   });
 
   if (url.protocol !== "http:" && url.protocol !== "https:") {
@@ -459,9 +496,84 @@ function urlGate(value: string): Check | undefined {
   }
   // URL.hostname brackets an IPv6 literal: "[::1]".
   const host = url.hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
-  if (host === "localhost" || host.endsWith(".localhost")) return blocked("loopback name localhost");
-  const reason = isIPv4(host) ? blockedIpv4Reason(host) : isIPv6(host) ? blockedIpv6Reason(host) : undefined;
-  return reason ? blocked(reason) : undefined;
+  // Canonicalize the trailing root dot(s) BEFORE any name/literal check (r2-F1):
+  // new URL("http://LOCALHOST./").hostname === "localhost." — neither the
+  // "localhost" nor the ".localhost" test matched, so the loopback NAME slipped
+  // straight through to a server-side GET. WHATWG already strips the dot for an
+  // IPv4 literal (new URL("http://127.0.0.1./").hostname === "127.0.0.1"), but
+  // net.isIPv4("127.0.0.1.") is false, so we strip defensively for every host —
+  // this canonical host is also what is later handed to the resolver (F2).
+  const canonicalHost = host.replace(/\.+$/, "");
+  if (!canonicalHost) return blocked("empty host");
+  if (canonicalHost === "localhost" || canonicalHost.endsWith(".localhost")) {
+    return blocked("loopback name localhost");
+  }
+  const literalV4 = isIPv4(canonicalHost);
+  const literalV6 = isIPv6(canonicalHost);
+  const reason = literalV4
+    ? blockedIpv4Reason(canonicalHost)
+    : literalV6
+      ? blockedIpv6Reason(canonicalHost)
+      : undefined;
+  if (reason) return blocked(reason);
+  return { host: canonicalHost, literal: literalV4 || literalV6 };
+}
+
+/**
+ * Resolve a NON-literal host and refuse it if ANY answer is a blocked address
+ * (r2-F2). Bounded by DNS_LOOKUP_TIMEOUT_MS with the same race-and-always-clear
+ * pattern as probeAccountId. Returns a Check to report, or undefined when every
+ * resolved address is routable — only then does the caller proceed to the GET.
+ *
+ * The resolved IP is NEVER put in the detail: the string is fixed and, like every
+ * other detail, goes through redactUrl.
+ */
+async function resolveHostGuard(host: string, value: string, lookupImpl: LookupImpl): Promise<Check | undefined> {
+  const transient = (reason: string): Check => ({
+    outcome: "transient",
+    method: "DNS",
+    detail: `URL unreachable — DNS -> ${reason}: ${redactUrl(value)}`,
+  });
+
+  const TIMED_OUT = Symbol("dns-timeout");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let addresses: ReadonlyArray<{ address: string; family?: number }>;
+  try {
+    const raced = await Promise.race([
+      lookupImpl(host),
+      new Promise<typeof TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), DNS_LOOKUP_TIMEOUT_MS);
+      }),
+    ]);
+    if (raced === TIMED_OUT) return transient("timeout");
+    addresses = raced;
+  } catch (err) {
+    const code = (err as { code?: string })?.code;
+    const name = (err as Error)?.name;
+    return transient(code || name || "Error");
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+
+  if (!addresses || addresses.length === 0) return transient("no addresses");
+
+  for (const { address } of addresses) {
+    // fe80::1%eth0 → fe80::1 — a scope/zone id is not part of the address.
+    const addr = address.replace(/%.*$/, "");
+    const reason = isIPv4(addr)
+      ? blockedIpv4Reason(addr)
+      : isIPv6(addr)
+        ? blockedIpv6Reason(addr)
+        : "non-IP DNS answer";
+    if (reason) {
+      return {
+        outcome: "definitive",
+        method: "parse",
+        detail: `Blocked URL host — resolves to a private/link-local address: ${redactUrl(value)}`,
+      };
+    }
+  }
+  return undefined;
 }
 
 /** Cancel the body without reading a byte of it. */
@@ -475,13 +587,22 @@ async function discardBody(res: Response): Promise<void> {
 
 async function checkUrlSource(
   value: string,
-  ctx: { fetchImpl: typeof fetch; env: NodeJS.ProcessEnv }
+  ctx: { fetchImpl: typeof fetch; lookupImpl: LookupImpl; env: NodeJS.ProcessEnv }
 ): Promise<Check> {
   // FIRST, before even the trusted-owner shortcut: a blocked literal host must
   // never be labelled "trusted" on the strength of a path that spells out
   // github.com/<owner>/.
   const gate = urlGate(value);
-  if (gate) return gate;
+  if ("check" in gate) return gate.check;
+
+  // THEN resolve a non-literal host and vet every answer — still BEFORE the
+  // trusted-owner shortcut and the GET, so a name that resolves into a private
+  // range can neither be labelled "trusted" nor reached. Literal hosts were
+  // already vetted above and skip the resolver entirely.
+  if (!gate.literal) {
+    const resolved = await resolveHostGuard(gate.host, value, ctx.lookupImpl);
+    if (resolved) return resolved;
+  }
 
   const trustedOwner = ctx.env.GITHUB_OWNER;
   if (trustedOwner && value.includes(`github.com/${trustedOwner}/`)) {
@@ -598,6 +719,8 @@ export async function validateIntakeSources(
   // Resolved at call time, not module load, so a test can stub global.fetch.
   const fetchImpl: typeof fetch =
     opts.fetchImpl ?? ((input, init) => globalThis.fetch(input as RequestInfo | URL, init));
+  // Same call-time resolution for the DNS seam (TEAM-4101 r2-F2).
+  const lookupImpl: LookupImpl = opts.lookupImpl ?? ((h) => dnsLookup(h, { all: true }));
 
   const checks = list.map(async (source): Promise<SourceCheckResult> => {
     const value = typeof source?.value === "string" ? source.value : "";
@@ -611,7 +734,7 @@ export async function validateIntakeSources(
     if (value.startsWith("s3://")) {
       check = await checkS3Source(value, { s3, hubBucket: hubBucketPromise });
     } else if (value.startsWith("http://") || value.startsWith("https://")) {
-      check = await checkUrlSource(value, { fetchImpl, env });
+      check = await checkUrlSource(value, { fetchImpl, lookupImpl, env });
     } else if (source?.type === "s3") {
       // Not an s3:// URI — checkS3Source's parse branch rejects it definitively
       // without touching the client.

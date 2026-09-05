@@ -5,11 +5,24 @@ import {
   shouldRejectSubmission,
   resolveHubBucket,
   HUB_BUCKET_PROBE_TIMEOUT_MS,
+  DNS_LOOKUP_TIMEOUT_MS,
   type SourceValidationResult,
   type SourceCheckResult,
 } from "./intake";
 import { redactUrl } from "./redact";
 import type { IntakeSource } from "./types";
+
+// TEAM-4101 r2-F2 added a pre-fetch dns.lookup on every non-literal URL host. The
+// DEFAULT resolver (used whenever a test does not inject lookupImpl) is stubbed
+// here to answer "a public address", so the pre-existing suite — which hits
+// example.com, slow.example.com, github.com, *.s3.amazonaws.com with only
+// fetchImpl mocked — stays hermetic and never touches real DNS (slow.example.com
+// is NXDOMAIN in the wild, which would otherwise turn a fetch-timeout assertion
+// into a DNS transient). Same specifier as intake.ts's import so vitest's builtin
+// mock intercepts it. The r2-F2 tests below inject lookupImpl explicitly.
+vi.mock("node:dns/promises", () => ({
+  lookup: vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]),
+}));
 
 /**
  * TEAM-4054 in miniature. Every submission carrying `sources` 422'd with
@@ -883,8 +896,10 @@ describe("validateIntakeSources — hub-bucket probe is bounded (F3)", () => {
  * the URL actually fetched was not the URL we inspected; and no host was ever
  * refused, so http://169.254.169.254/ was a legal "source".
  *
- * Only LITERAL hosts are checked. A public name that RESOLVES into a private
- * range (DNS rebinding) is out of scope — see the comment on urlGate.
+ * LITERAL hosts are blocked outright by urlGate; a NON-literal host is resolved
+ * (TEAM-4101 r2-F2) and rejected if any answer is private/link-local/loopback.
+ * The residual is DNS-rebinding TOCTOU (record changes between lookup and connect)
+ * — accepted because the oracle is status-only. See the comment on urlGate.
  */
 describe("validateIntakeSources — URL redirects are not followed (TEAM-4091 F1)", () => {
   it("a 302 on the ranged GET → transient 'URL redirected', with redirect:manual", async () => {
@@ -980,6 +995,37 @@ describe("validateIntakeSources — blocked URL hosts (TEAM-4091 F1)", () => {
     expect(shouldRejectSubmission(r, "strict").reject).toBe(true);
   });
 
+  // r2-F1: a trailing root dot survives WHATWG normalization for a NAME
+  // (new URL("http://LOCALHOST./").hostname === "localhost."), so the loopback
+  // name checks used to miss it and issue a server-side GET. urlGate now strips
+  // trailing dots before the name/literal checks — and does so BEFORE the
+  // resolver, so a blocked trailing-dot host never even looks up.
+  const TRAILING_DOT: Array<[string, string]> = [
+    ["localhost.", "loopback name localhost"],
+    ["LOCALHOST.", "loopback name localhost"],
+    ["foo.localhost.", "loopback name localhost"],
+    ["127.0.0.1.", "loopback address 127.0.0.0/8"],
+  ];
+
+  it.each(TRAILING_DOT)("%s (trailing dot) → definitive parse failure, no fetch, no DNS", async (host, reason) => {
+    const fetchImpl = neverFetch();
+    const lookupImpl = vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]);
+    const c = only(
+      await validateIntakeSources([src("url", `https://${host}/spec.md`)], {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        lookupImpl,
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    expect(c.detail!.startsWith("Blocked URL host")).toBe(true);
+    expect(c.detail).toContain(reason);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    // Blocked on the literal host — the resolver is never consulted.
+    expect(lookupImpl).not.toHaveBeenCalled();
+  });
+
   it("the obfuscated numeric forms are covered by WHATWG normalization", async () => {
     const fetchImpl = neverFetch();
     for (const host of ["0x7f000001", "127.1", "2130706433"]) {
@@ -1066,5 +1112,235 @@ describe("validateIntakeSources — blocked URL hosts (TEAM-4091 F1)", () => {
     expect(c.method).toBe("parse");
     expect(c.detail).toContain("Invalid URL format");
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+// ─── (h) TEAM-4101 r2-F2: block hostnames that RESOLVE to a private address ───
+
+/**
+ * A literal-only block leaves the oracle wide open: a public name (or attacker
+ * DNS on this unauthenticated route) with an A/AAAA record inside a private range
+ * — 10.x, 169.254.169.254, fd00::, … — was a legal source, and its status was
+ * persisted into verification.detail. checkUrlSource now resolves every
+ * non-literal host and refuses it if ANY answer is blocked, BEFORE the GET and
+ * before the trusted-owner shortcut. Literal hosts (already vetted by urlGate)
+ * skip the resolver. The residual is rebinding TOCTOU — accepted, status-only.
+ */
+describe("validateIntakeSources — resolved-address block (TEAM-4101 r2-F2)", () => {
+  const PRESIGNED_HOST = "agentcore-hub-artifacts-023392223961-us-east-1.s3.amazonaws.com";
+  const neverFetch = () =>
+    vi.fn(async () => ({ status: 206, ok: true, body: { cancel: async () => undefined } }) as unknown as Response);
+  /** A lookup that answers with the given addresses (family inferred from ":"). */
+  const lookupTo = (...addrs: string[]) =>
+    vi.fn(async () => addrs.map((address) => ({ address, family: address.includes(":") ? 6 : 4 })));
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("(a) a public name resolving to 10.0.0.5 is blocked before any fetch", async () => {
+    const fetchImpl = neverFetch();
+    const lookupImpl = lookupTo("10.0.0.5");
+    const r = await validateIntakeSources([src("url", "https://attacker.example/x")], {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      lookupImpl,
+      env: envOf({}),
+    });
+    const c = only(r);
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    expect(c.detail).toBe("Blocked URL host — resolves to a private/link-local address: https://attacker.example/x");
+    // The resolved IP is never disclosed in the detail.
+    expect(c.detail).not.toContain("10.0.0.5");
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(shouldRejectSubmission(r, "lenient").reject).toBe(true);
+  });
+
+  it("(b) a mix of public and private answers is blocked (any blocked address wins)", async () => {
+    const fetchImpl = neverFetch();
+    const c = only(
+      await validateIntakeSources([src("url", "https://attacker.example/x")], {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        lookupImpl: lookupTo("1.2.3.4", "127.0.0.1"),
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(c.detail).toContain("resolves to a private/link-local address");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("(c) an all-public answer proceeds to a byte-identical, unredirected GET", async () => {
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 206 }], calls);
+    const lookupImpl = lookupTo("93.184.216.34", "2606:4700::1");
+    const c = only(await validateIntakeSources([src("url", PRESIGNED)], { fetchImpl: impl, lookupImpl, env: envOf({}) }));
+    expect(c.outcome).toBe("verified");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(PRESIGNED);
+    expect(Object.keys(calls[0].headers)).toEqual(["Range"]);
+    expect(calls[0].redirect).toBe("manual");
+    // Resolved exactly once, with the parsed host.
+    expect(lookupImpl).toHaveBeenCalledTimes(1);
+    expect(lookupImpl).toHaveBeenCalledWith(PRESIGNED_HOST);
+  });
+
+  it("(d) a lookup that throws ENOTFOUND is transient (unverified), never fetched", async () => {
+    const fetchImpl = neverFetch();
+    const lookupImpl = vi.fn(async () => {
+      throw Object.assign(new Error("getaddrinfo ENOTFOUND attacker.example"), { code: "ENOTFOUND" });
+    });
+    const r = await validateIntakeSources([src("url", "https://attacker.example/x")], {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      lookupImpl,
+      env: envOf({}),
+    });
+    const c = only(r);
+    expect(c.outcome).toBe("transient");
+    expect(c.method).toBe("DNS");
+    expect(c.verification.status).toBe("unverified");
+    expect(c.detail).toContain("URL unreachable");
+    expect(c.detail).toContain("ENOTFOUND");
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(shouldRejectSubmission(r, "lenient").reject).toBe(false);
+    expect(shouldRejectSubmission(r, "strict").reject).toBe(true);
+  });
+
+  it("(d) a lookup returning zero addresses is transient, never fetched", async () => {
+    const fetchImpl = neverFetch();
+    const c = only(
+      await validateIntakeSources([src("url", "https://attacker.example/x")], {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        lookupImpl: vi.fn(async () => []),
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("transient");
+    expect(c.method).toBe("DNS");
+    expect(c.detail).toContain("no addresses");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("(d2) a lookup that never settles times out at DNS_LOOKUP_TIMEOUT_MS, never fetched", async () => {
+    const fetchImpl = neverFetch();
+    const lookupImpl = vi.fn(() => new Promise<never>(() => {})); // never resolves
+    vi.useFakeTimers();
+    const pending = validateIntakeSources([src("url", "https://attacker.example/x")], {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      lookupImpl: lookupImpl as unknown as typeof lookupImpl,
+      env: envOf({}),
+    });
+    await vi.advanceTimersByTimeAsync(DNS_LOOKUP_TIMEOUT_MS + 1);
+    const c = only(await pending);
+    expect(c.outcome).toBe("transient");
+    expect(c.method).toBe("DNS");
+    expect(c.detail).toContain("timeout");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("(e) literal IP hosts skip the resolver entirely", async () => {
+    for (const host of ["8.8.8.8", "[2606:4700::1]"]) {
+      const calls: FetchCall[] = [];
+      const { impl } = fakeFetch([{ status: 206 }], calls);
+      const lookupImpl = lookupTo("10.0.0.5"); // would block IF it were consulted
+      const c = only(
+        await validateIntakeSources([src("url", `https://${host}/x`)], { fetchImpl: impl, lookupImpl, env: envOf({}) })
+      );
+      expect(c.outcome).toBe("verified");
+      expect(calls).toHaveLength(1);
+      expect(lookupImpl).not.toHaveBeenCalled();
+    }
+  });
+
+  it("(e) a blocked literal IP is refused without consulting the resolver", async () => {
+    const fetchImpl = neverFetch();
+    const lookupImpl = lookupTo("93.184.216.34"); // public — would be allowed IF consulted
+    const c = only(
+      await validateIntakeSources([src("url", "https://127.0.0.1/x")], {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        lookupImpl,
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(c.detail).toContain("loopback address 127.0.0.0/8");
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(lookupImpl).not.toHaveBeenCalled();
+  });
+
+  it("(f) an IPv6 private/link-local answer is blocked, zone id stripped", async () => {
+    const fetchImpl = neverFetch();
+    for (const addr of ["fd00::1", "fe80::1%eth0", "::ffff:169.254.169.254"]) {
+      const c = only(
+        await validateIntakeSources([src("url", "https://attacker.example/x")], {
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          lookupImpl: lookupTo(addr),
+          env: envOf({}),
+        })
+      );
+      expect(c.outcome).toBe("definitive");
+      expect(c.detail).toContain("resolves to a private/link-local address");
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("(f2) a resolver answer that is not an IP address fails closed", async () => {
+    const fetchImpl = neverFetch();
+    const c = only(
+      await validateIntakeSources([src("url", "https://attacker.example/x")], {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        lookupImpl: lookupTo("not-an-ip-address"),
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(c.detail).toContain("resolves to a private/link-local address");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("(g) the GITHUB_OWNER shortcut does NOT skip the resolver", async () => {
+    const fetchImpl = neverFetch();
+    const lookupImpl = lookupTo("10.0.0.5");
+    const c = only(
+      await validateIntakeSources([src("url", "https://github.com/tycenjmccann/x/README.md")], {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        lookupImpl,
+        env: envOf({ GITHUB_OWNER: "tycenjmccann" }),
+      })
+    );
+    // Resolves to private → blocked, NOT labelled trusted-github.
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    expect(c.detail).toContain("resolves to a private/link-local address");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("(g) a trusted-github URL that resolves public is still skipped (resolver ran first)", async () => {
+    const fetchImpl = neverFetch();
+    const lookupImpl = lookupTo("93.184.216.34");
+    const c = only(
+      await validateIntakeSources([src("url", "https://github.com/tycenjmccann/x/README.md")], {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        lookupImpl,
+        env: envOf({ GITHUB_OWNER: "tycenjmccann" }),
+      })
+    );
+    expect(c.outcome).toBe("skipped");
+    expect(c.method).toBe("trusted-github");
+    expect(lookupImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("(h) the resolver's block detail still carries no presigned signature", async () => {
+    const c = only(
+      await validateIntakeSources([src("url", PRESIGNED)], {
+        fetchImpl: neverFetch() as unknown as typeof fetch,
+        lookupImpl: lookupTo("127.0.0.1"),
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(c.detail).toContain("X-Amz-Signature=REDACTED");
+    expect(c.detail).not.toContain("SECRETSIG");
   });
 });
