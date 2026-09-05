@@ -29,15 +29,21 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
  *      isCreationTimeBlock (main, #364); a PRESENTED gate (ready / in_progress /
  *      in_review -> blocked) is honored as a rejection.
  *   2. rework reopen guard: an upstream ticket whose own blockedBy contains a
- *      non-done ticket is not re-Readied (Jira) / not status-rewritten (DDB), and
- *      review.rejected.reopened reflects what actually happened.
+ *      non-done ticket is REOPENED but never Readied (TEAM-4085 F1): feedback
+ *      stashed, DDB `:s="todo"` write (the stream todo handler holds it), Jira
+ *      Done -> To Do hop only (none if already Blocked/To Do); cascadeUnblock
+ *      Readies it when the last blocker closes. review.rejected carries
+ *      `reopened` (to Ready), `deferred` (reopened short of Ready) and
+ *      `skipped` (a Jira hop that failed to land).
  *   3. lease housekeeping: an agent ticket in_progress -> blocked whose OWN
  *      blockers are still open (the premature-dispatch signature) releases the
  *      running claim through the stealClaim CAS so a later Ready dispatches
  *      normally. TEAM-4071 F1: a ticket whose blockers are all resolved (or
  *      empty) keeps its claim — the agent may be live. TEAM-4071 F2: the CAS is
  *      asserted on its real shape, and a lost CAS
- *      (ConditionalCheckFailedException) releases nothing.
+ *      (ConditionalCheckFailedException) releases nothing. TEAM-4085 F3: an
+ *      open blocker that COMPLETED and was then reopened (agentTasks[b].completedAt
+ *      set) means this ticket was dispatched legitimately -> no release either.
  */
 
 const h = vi.hoisted(() => ({
@@ -92,7 +98,14 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             return {};
           }
           if (name === "PutCommand") { h.state.events.push(cmd.input.Item); return {}; }
-          if (name === "QueryCommand") return { Items: [] };
+          if (name === "QueryCommand") {
+            // The cascade's getChildTickets reads the tickets parentId-index.
+            if (cmd.input.IndexName === "parentId-index") {
+              const pid = cmd.input.ExpressionAttributeValues?.[":pid"];
+              return { Items: Object.values(h.state.tickets).filter((t) => t.parentId === pid) };
+            }
+            return { Items: [] };
+          }
           return {};
         },
       }),
@@ -565,6 +578,20 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
       expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
     });
+
+    it("(e6) TEAM-4085 F3: open blocker was COMPLETED then reopened (agentTasks[b].completedAt set) -> legitimately dispatched, NO steal, claim stays running, no event", async () => {
+      seedRunningShip(); // TEAM-23 (CI) currently Blocked = reopened for rework...
+      h.state.workflow.agentTasks["TEAM-23"] = {
+        id: "t23", agentId: CI, ticketId: "TEAM-23", status: "complete", completedAt: "2026-09-05T03:00:00.000Z",
+      };
+
+      await handler(blockedWebhook);
+
+      expect(h.state.updates.filter((u) => u.TableName === WORKFLOWS_TABLE)).toEqual([]);
+      expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("running");
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+    });
   });
 
   it("(f) chain fix -> review -> QA -> CI -> ship -> human gate: creation-time todo -> blocked on the gate dispatches NOTHING", async () => {
@@ -719,47 +746,107 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
     expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
   });
+
+  it("(e-DDB-5) TEAM-4085 F3: open blocker was COMPLETED then reopened -> NO steal against the workflows table, claim stays running, no event", async () => {
+    seedRunningShipTask();
+    // TEAM-23 is `blocked` on the board (reopened) but has a completion on record.
+    h.state.workflow.agentTasks["TEAM-23"] = {
+      id: "t23", agentId: CI, ticketId: "TEAM-23", status: "complete", completedAt: "2026-09-05T03:00:00.000Z",
+    };
+
+    await handler(record("MODIFY", shipImage("blocked"), shipImage("in_progress")));
+
+    expect(h.state.updates.filter((u) => u.TableName === WORKFLOWS_TABLE)).toEqual([]);
+    expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("running");
+    expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+    expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+  });
 });
 
 // ─── (d) handleReviewRejection rework path: upstream blocker guard ───────────
 
-describe("handleReviewRejection (rework) — upstream with unresolved blockers is NOT reopened (TEAM-4045)", () => {
+describe("handleReviewRejection (rework) — upstream with unresolved blockers is reopened but NEVER Readied (TEAM-4045 / TEAM-4085 F1)", () => {
   const GATE = {
     ticketId: "TEAM-900", workflowId: "wf_1", parentId: "TEAM-1", assignee: "human:engineer",
     labels: ["human-review", "reviewer:engineer"], blockedBy: ["TEAM-10"], reviewComment: "please fix the null check",
   };
+  const readyWritesOn = (key) => statusWritesOn(key).filter((u) => u.ExpressionAttributeValues[":s"] === "ready");
 
   describe("DDB branch", () => {
     beforeEach(async () => {
       await importIndex({ provider: "dynamodb" });
       h.state.tickets = {
-        "TEAM-5": { ticketId: "TEAM-5", assignee: QA, type: "task", status: "in_progress", blockedBy: [] },
+        "TEAM-5": { ticketId: "TEAM-5", assignee: QA, type: "task", status: "in_progress", blockedBy: [], parentId: "TEAM-1", workflowId: "wf_1" },
         // The upstream the gate reviews — still blocked on TEAM-5 (never done).
-        "TEAM-10": { ticketId: "TEAM-10", assignee: API_DEV, type: "task", status: "blocked", blockedBy: ["TEAM-5"] },
-        "TEAM-11": { ticketId: "TEAM-11", assignee: BACKEND_DEV, type: "task", status: "done", blockedBy: [] },
+        "TEAM-10": { ticketId: "TEAM-10", assignee: API_DEV, type: "task", status: "blocked", blockedBy: ["TEAM-5"], parentId: "TEAM-1", workflowId: "wf_1", title: "Dev" },
+        "TEAM-11": { ticketId: "TEAM-11", assignee: BACKEND_DEV, type: "task", status: "done", blockedBy: [], parentId: "TEAM-1", workflowId: "wf_1" },
         "TEAM-900": { ...GATE, status: "blocked" },
       };
     });
 
-    it("(d) upstream blockedBy contains a non-done ticket -> no status write on it; review.rejected.reopened is []", async () => {
+    it("(d) upstream `blocked` with an open blocker -> the unconditional `:s=todo` write (matches main), feedback stashed, deferred, NOT in reopened", async () => {
       await handleReviewRejection(h.state.tickets["TEAM-900"]);
 
-      expect(statusWritesOn("TEAM-10")).toEqual([]);
+      // DDB decision: the todo write is fine for an already-blocked/todo upstream —
+      // the stream `todo` handler blocker-checks, so it is held, exactly as on main.
+      const writes = statusWritesOn("TEAM-10");
+      expect(writes).toHaveLength(1);
+      expect(writes[0].ExpressionAttributeValues[":s"]).toBe("todo");
+      expect(readyWritesOn("TEAM-10")).toEqual([]);
+      expect(h.state.workflow.resumeContexts["TEAM-10"]).toContain("please fix the null check");
       const rejected = eventsOf("review.rejected");
       expect(rejected).toHaveLength(1);
       expect(rejected[0].detail.reopened).toEqual([]);
+      expect(rejected[0].detail.deferred).toEqual(["TEAM-10"]);
+      expect(rejected[0].detail.skipped).toEqual([]);
+      expect(h.state.lambdaInvokes).toEqual([]);
     });
 
-    it("(d) mixed upstream: the done one is reopened, the still-blocked one is skipped; reopened lists only the first", async () => {
+    it("(d) mixed upstream: the done one is reopened, the still-blocked one is deferred; both stashed", async () => {
       h.state.tickets["TEAM-900"].blockedBy = ["TEAM-10", "TEAM-11"];
 
       await handleReviewRejection(h.state.tickets["TEAM-900"]);
 
-      expect(statusWritesOn("TEAM-10")).toEqual([]);
-      const reopen11 = statusWritesOn("TEAM-11");
-      expect(reopen11).toHaveLength(1);
-      expect(reopen11[0].ExpressionAttributeValues[":s"]).toBe("todo");
-      expect(eventsOf("review.rejected")[0].detail.reopened).toEqual(["TEAM-11"]);
+      expect(statusWritesOn("TEAM-10").map((u) => u.ExpressionAttributeValues[":s"])).toEqual(["todo"]);
+      expect(statusWritesOn("TEAM-11").map((u) => u.ExpressionAttributeValues[":s"])).toEqual(["todo"]);
+      expect(Object.keys(h.state.workflow.resumeContexts).sort()).toEqual(["TEAM-10", "TEAM-11"]);
+      const d = eventsOf("review.rejected")[0].detail;
+      expect(d.reopened).toEqual(["TEAM-11"]);
+      expect(d.deferred).toEqual(["TEAM-10"]);
+    });
+
+    it("(d-done) upstream `done` whose blocker is open -> reopened to `todo` (held), never Ready, stashed, no invoke; the blocker's done then Readies it via the REAL cascade", async () => {
+      // TEAM-10 completed earlier; its blocker TEAM-5 was since reopened for rework.
+      h.state.tickets["TEAM-10"].status = "done";
+      h.state.workflow.agentTasks["TEAM-10"] = { id: "t10", agentId: API_DEV, ticketId: "TEAM-10", status: "complete", completedAt: "2026-09-05T03:00:00.000Z" };
+      h.state.workflow.agentTasks["TEAM-5"] = { id: "t5", agentId: QA, ticketId: "TEAM-5", status: "running", startedAt: h.state.startedAt };
+
+      await handleReviewRejection(h.state.tickets["TEAM-900"]);
+
+      const writes = statusWritesOn("TEAM-10");
+      expect(writes).toHaveLength(1);
+      expect(writes[0].ExpressionAttributeValues[":s"]).toBe("todo");
+      expect(writes[0].ExpressionAttributeValues[":sb"]).toEqual({ kind: "review_fix", gateTicketId: "TEAM-900" });
+      expect(readyWritesOn("TEAM-10")).toEqual([]);
+      expect(h.state.tickets["TEAM-10"].status).toBe("todo"); // no longer stranded `done`
+      expect(storeMock.setResumeContext).toHaveBeenCalledWith("wf_1", "TEAM-10", expect.stringContaining("please fix the null check"));
+      expect(h.state.lambdaInvokes).toEqual([]);
+      expect(eventsOf("agent.invoked")).toEqual([]);
+      const d = eventsOf("review.rejected")[0].detail;
+      expect(d.reopened).toEqual([]);
+      expect(d.deferred).toEqual(["TEAM-10"]);
+
+      // The blocker completes → the REAL cascadeUnblock (via handleTicketDone,
+      // the DDB done path) sees TEAM-10 as a `todo` sibling with all blockers
+      // resolved and Readies it (DDB's Ready-equivalent is the cascade's own
+      // `todo` write + orchestrator.unblocked).
+      h.state.tickets["TEAM-5"].status = "done";
+      const S = (v) => ({ S: v });
+      const img = (status) => ({ ticketId: S("TEAM-5"), status: S(status), assignee: S(QA), parentId: S("TEAM-1"), workflowId: S("wf_1"), type: S("task") });
+      await handler({ Records: [{ eventName: "MODIFY", eventSource: "aws:dynamodb", dynamodb: { NewImage: img("done"), OldImage: img("in_progress") } }] });
+
+      expect(eventsOf("orchestrator.unblocked").map((e) => e.detail.ticketId)).toEqual(["TEAM-10"]);
+      expect(statusWritesOn("TEAM-10")).toHaveLength(2); // reopen write + the cascade's Ready-equivalent write
     });
   });
 
@@ -768,7 +855,7 @@ describe("handleReviewRejection (rework) — upstream with unresolved blockers i
       await importIndex({ provider: "jira" });
     });
 
-    it("(d) upstream blockedBy contains a non-done ticket -> zero transition POSTs on it (no To Do / Ready hop); reopened is []", async () => {
+    it("(d) upstream Blocked with an open blocker -> zero transition POSTs, feedback stashed, deferred, NOT in reopened", async () => {
       installJiraRouter({
         "TEAM-5": agentIssue("TEAM-5", QA, "In Progress", [], "QA"),
         "TEAM-10": agentIssue("TEAM-10", API_DEV, "Blocked", ["TEAM-5"], "Dev"),
@@ -777,11 +864,58 @@ describe("handleReviewRejection (rework) — upstream with unresolved blockers i
 
       await handleReviewRejection(GATE);
 
+      // Jira decision: already Blocked (cascade-eligible) → no transition at all.
       expect(transitionsOn("TEAM-10")).toEqual([]);
       expect(h.state.jira.issues["TEAM-10"].fields.status.name).toBe("Blocked");
+      expect(h.state.workflow.resumeContexts["TEAM-10"]).toContain("please fix the null check");
       const rejected = eventsOf("review.rejected");
       expect(rejected).toHaveLength(1);
       expect(rejected[0].detail.reopened).toEqual([]);
+      expect(rejected[0].detail.deferred).toEqual(["TEAM-10"]);
+      expect(rejected[0].detail.skipped).toEqual([]);
+      expect(h.state.lambdaInvokes).toEqual([]);
+    });
+
+    it("(d-done) upstream Done whose blocker is open -> exactly ONE `To Do` hop, zero `Ready`, stashed, no invoke; the blocker's done then Readies + dispatches it via the REAL cascade", async () => {
+      installJiraRouter({
+        "TEAM-5": agentIssue("TEAM-5", QA, "In Progress", [], "QA"),
+        // Completed earlier; its blocker TEAM-5 was since reopened for rework.
+        "TEAM-10": agentIssue("TEAM-10", API_DEV, "Done", ["TEAM-5"], "Dev"),
+        "TEAM-900": humanGateIssue("TEAM-900", "Blocked", ["TEAM-10"], ["please fix the null check"]),
+      });
+      h.state.workflow.agentTasks["TEAM-10"] = { id: "t10", agentId: API_DEV, ticketId: "TEAM-10", status: "complete", completedAt: "2026-09-05T03:00:00.000Z" };
+      h.state.workflow.agentTasks["TEAM-5"] = { id: "t5", agentId: QA, ticketId: "TEAM-5", status: "running", startedAt: h.state.startedAt };
+
+      await handleReviewRejection(GATE);
+
+      expect(transitionsOn("TEAM-10")).toEqual([{ key: "TEAM-10", from: "Done", to: "To Do" }]);
+      expect(h.state.jira.issues["TEAM-10"].fields.status.name).toBe("To Do");
+      expect(storeMock.setResumeContext).toHaveBeenCalledWith("wf_1", "TEAM-10", expect.stringContaining("please fix the null check"));
+      expect(h.state.lambdaInvokes).toEqual([]);
+      const d = eventsOf("review.rejected")[0].detail;
+      expect(d.reopened).toEqual([]);
+      expect(d.deferred).toEqual(["TEAM-10"]);
+      expect(d.skipped).toEqual([]);
+      // Jira fires a webhook for the To Do hop; in Jira mode the todo handler
+      // waits for the ticket Lambda / cascade — nothing is dispatched.
+      await deliverQueuedWebhooks();
+      expect(eventsOf("agent.invoked")).toEqual([]);
+
+      // The blocker completes → handleTicketDoneUnified → the REAL cascadeUnblock
+      // sees TEAM-10 as a `todo` sibling with all blockers resolved → Ready →
+      // Ready webhook → the agent is dispatched with the stashed feedback.
+      h.state.jira.issues["TEAM-5"].fields.status.name = "Done";
+      await handler({ source: "jira-webhook", ticketId: "TEAM-5", newStatus: "done", oldStatus: "in_progress" });
+      await deliverQueuedWebhooks();
+
+      expect(eventsOf("orchestrator.unblocked").map((e) => e.detail.ticketId)).toEqual(["TEAM-10"]);
+      expect(transitionsOn("TEAM-10").map((t) => t.to)).toEqual(["To Do", "Ready", "In Progress"]);
+      const invoked = eventsOf("agent.invoked").filter((e) => e.detail.ticketId === "TEAM-10");
+      expect(invoked).toHaveLength(1);
+      expect(h.state.lambdaInvokes.filter((i) => i.payload?.ticketId === "TEAM-10")).toHaveLength(1);
+      // The stashed feedback rides along on that dispatch (one-time use).
+      expect(h.state.lambdaInvokes[0].payload.prompt).toContain("please fix the null check");
+      expect(h.state.workflow.resumeContexts["TEAM-10"]).toBeUndefined();
     });
 
     it("CONTROL: upstream with all blockers done IS reopened via To Do -> Ready (existing rework behaviour preserved)", async () => {
@@ -794,7 +928,9 @@ describe("handleReviewRejection (rework) — upstream with unresolved blockers i
       await handleReviewRejection(GATE);
 
       expect(transitionsOn("TEAM-10").map((t) => t.to)).toEqual(["To Do", "Ready"]);
-      expect(eventsOf("review.rejected")[0].detail.reopened).toEqual(["TEAM-10"]);
+      const d = eventsOf("review.rejected")[0].detail;
+      expect(d.reopened).toEqual(["TEAM-10"]);
+      expect(d.deferred).toEqual([]);
     });
   });
 });
