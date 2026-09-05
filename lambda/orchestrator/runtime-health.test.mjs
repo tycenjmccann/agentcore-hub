@@ -275,7 +275,10 @@ describe("runtimeHealthSweep — backoff + recovery", () => {
     // Each parked ticket routed through the ONE cascade implementation, once.
     expect(h.cascade.reconcileDependent).toHaveBeenCalledTimes(2);
     expect(h.cascade.transitionToReady).toHaveBeenCalledTimes(2);
-    // Object deleted BEFORE resume so the guard can't re-park a freed ticket.
+    // Recovering-lease ordering (F3): the object is the recovery lease — it is
+    // flipped outage→recovering, drained one resumed ticket at a time, and only
+    // DELETEd once blockedTickets empties (here both resumed). So a healthy sweep
+    // that finishes ends with no object.
     expect(h.outage()).toBeNull();
   });
 

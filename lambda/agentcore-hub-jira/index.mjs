@@ -241,6 +241,13 @@ async function listReviewers(params = {}) {
 async function createTicket(params, { caller } = {}) {
   const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, phase } = params;
 
+  // TEAM-4100 F5 — a fix ticket's stable finding id (sha1(originTicketId+component)).
+  // Present only on orchestrator-spawned fix tickets; drives the finding-label dedupe.
+  const findingId =
+    spawned_by && typeof spawned_by === "object" && typeof spawned_by.findingId === "string" && spawned_by.findingId
+      ? spawned_by.findingId
+      : null;
+
   // Validate assignee against known roster — reject hallucinated agent names.
   // "human:<who>" assignees are human-review gates, not agents, and are always
   // allowed (the orchestrator parks them for a person instead of invoking).
@@ -266,6 +273,35 @@ async function createTicket(params, { caller } = {}) {
         `for ${workflow_id}. The plan authorizes: ${[...planSet].sort().join(", ")}. ` +
         `Update and resubmit the plan (submit_ticket_plan) before creating tickets for a new assignee.`
       );
+    }
+  }
+
+  // ─── F5: fix-ticket uniqueness on (workflow, findingId) ────────────────────
+  // Two verifier completions with the same finding can race spawnFixTicketsFromFindings
+  // and both reach create. Jira has NO conditional create (unlike the DynamoDB
+  // twin's atomic dedupe item), so the strongest available guarantee is a
+  // deterministic `finding:<fid>` label matched by search-before-create: it kills
+  // the fuzzy-summary false-negatives and makes any retry converge on the same
+  // ticket. A sub-second true race can still double-create under Jira's
+  // eventually-consistent search index — a documented Jira limitation, not the
+  // DynamoDB twin's behaviour. Checked first (more precise than summary matching).
+  if (findingId && workflow_id) {
+    try {
+      const jql =
+        `project = ${PROJECT_KEY} AND labels = "wf:${workflow_id}" AND labels = "finding:${findingId}" ORDER BY created ASC`;
+      const found = await jiraSearch(jql, ["summary", "status", "labels", "assignee", "issuetype", "parent"], 2);
+      const live = (found.issues || []).find((iss) => {
+        const internal = mapStatusToInternal(iss.fields?.status?.name || "");
+        return internal !== "done" && internal !== "closed";
+      });
+      if (live) {
+        const dupBlockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
+        await reconcileBlockersAndStatus(live.key, dupBlockers, assignee);
+        console.log(`[jira-tools] DEDUPED fix finding ${findingId} in ${workflow_id} → existing ${live.key} (reconciled)`);
+        return { ...mapIssue(live), deduped: true, deduplicated: true };
+      }
+    } catch (err) {
+      console.warn(`[jira-tools] finding dedupe check failed (proceeding to create): ${err.message}`);
     }
   }
 
@@ -334,6 +370,8 @@ async function createTicket(params, { caller } = {}) {
     labels.push(`agent:${assignee}`);
   }
   if (workflow_id) labels.push(`wf:${workflow_id}`);
+  // F5 — the deterministic dedupe key for fix tickets (see the finding guard above).
+  if (findingId) labels.push(`finding:${findingId}`);
 
   // Normalize common LLM variations of issue type names to Jira's canonical form
   const ISSUE_TYPE_ALIASES = {

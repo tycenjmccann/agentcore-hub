@@ -146,6 +146,14 @@ if [ -n "${CODING_AGENT_RUNTIME_ARN:-}" ]; then
   [ -n "${RUNTIME_PROBE_CACHE_MS:-}" ] && RUNTIME_HEALTH_VARS="${RUNTIME_HEALTH_VARS},RUNTIME_PROBE_CACHE_MS=${RUNTIME_PROBE_CACHE_MS}"
   [ -n "${RUNTIME_PROBE_CONFIRM:-}" ] && RUNTIME_HEALTH_VARS="${RUNTIME_HEALTH_VARS},RUNTIME_PROBE_CONFIRM=${RUNTIME_PROBE_CONFIRM}"
   [ -n "${RUNTIME_OUTAGE_BACKOFF_MIN:-}" ] && RUNTIME_HEALTH_VARS="${RUNTIME_HEALTH_VARS},RUNTIME_OUTAGE_BACKOFF_MIN=${RUNTIME_OUTAGE_BACKOFF_MIN}"
+  # TEAM-4100 F3/F4 tuning knobs — code defaults (probe abort budget min(knob,45000ms)
+  # ceiling, recovering-lease stale-reclaim 120000ms, resume-progress persist every
+  # 1 ticket) are safe;
+  # forward only explicit overrides. update-function-configuration REPLACES the env
+  # map, so an unforwarded var falls to its code default (acceptable for tuning).
+  [ -n "${RUNTIME_PROBE_TIMEOUT_MS:-}" ] && RUNTIME_HEALTH_VARS="${RUNTIME_HEALTH_VARS},RUNTIME_PROBE_TIMEOUT_MS=${RUNTIME_PROBE_TIMEOUT_MS}"
+  [ -n "${RUNTIME_RECOVERING_STALE_MS:-}" ] && RUNTIME_HEALTH_VARS="${RUNTIME_HEALTH_VARS},RUNTIME_RECOVERING_STALE_MS=${RUNTIME_RECOVERING_STALE_MS}"
+  [ -n "${RUNTIME_RESUME_PERSIST_EVERY:-}" ] && RUNTIME_HEALTH_VARS="${RUNTIME_HEALTH_VARS},RUNTIME_RESUME_PERSIST_EVERY=${RUNTIME_RESUME_PERSIST_EVERY}"
 fi
 
 # Stall soft-timeout OTEL confirmation (TEAM-3992 D4.3). The MODE flag is

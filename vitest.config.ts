@@ -163,6 +163,17 @@ export default defineConfig({
       // outside the plan is rejected TICKET_NOT_IN_PLAN; the orchestrator envelope,
       // human gates, and no-plan runs are exempt (layer 1 is the hard gate).
       "lambda/agentcore-hub-tickets/plan-gate.test.mjs",
+      // fix-dedupe (TEAM-4100 F5) — create-time (workflow, findingId) uniqueness
+      // for orchestrator fix tickets, in BOTH ticket providers. The DynamoDB twin
+      // is atomic (a dedupe#<wf>#finding#<fid> item written under
+      // attribute_not_exists BEFORE the real ticket, with a 60s stale-claim
+      // take-over for a crashed creator); the Jira twin is best-effort
+      // (deterministic finding:<fid> label + search-before-create, Jira has no
+      // CAS). Real handlers, stub DDB honouring the conditional put / stubbed
+      // Jira REST; the second concurrent create returns { deduped:true } with the
+      // winner's key so the orchestrator publishes exactly one fix_spawned event.
+      "lambda/agentcore-hub-tickets/fix-dedupe.test.mjs",
+      "lambda/agentcore-hub-jira/fix-dedupe.test.mjs",
       // agentcore-hub-pipeline-tools (TEAM-3822) — the CD tools Lambda: the
       // execution-scoped get_state race fix (matchesExecution), the
       // get_build_status scan clamp, and the start_deploy clientRequestToken

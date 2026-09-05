@@ -143,6 +143,54 @@ describe("spawnFixTicketsFromFindings (D3.1)", () => {
     expect(finderKind("agentcore_hub_codex")).toBe("codex_fix");
     expect(finderKind("agentcore_hub_backend_dev")).toBeNull();
   });
+
+  // TEAM-4100 F5 — the read-first sibling check (getChildTickets) is a best-effort
+  // fast path; it does NOT see an in-flight create, so two verifier completions
+  // reporting the SAME component race past it and both reach create_ticket. The
+  // atomic guarantee lives in the tickets Lambda (a conditional dedupe put); the
+  // orchestrator's contract is to treat a `deduped` response as success — return
+  // the winner's key WITHOUT publishing a second fix_spawned event.
+  it("two concurrent spawns for the same finding → one real ticket, one event, both callers get the same key", async () => {
+    // A tickets-Lambda double whose create_ticket enforces (workflow, findingId)
+    // uniqueness atomically (the DynamoDB twin's conditional put), shared across
+    // both spawn calls so the race is real.
+    const claimed = new Map();
+    const creates = [];
+    const events = [];
+    let n = 0;
+    const deps = {
+      creates, events,
+      invokeTickets: vi.fn(async (op, params) => {
+        if (op !== "create_ticket") return {};
+        const fid = params.spawned_by?.findingId;
+        const key = params.workflow_id && fid ? `${params.workflow_id}#${fid}` : null;
+        if (key && claimed.has(key)) return { deduped: true, ticket_id: claimed.get(key) };
+        const id = `NEW-${++n}`;
+        if (key) claimed.set(key, id);
+        creates.push({ id, params });
+        return { ticket_id: id };
+      }),
+      publishEvent: vi.fn(async (epicId, type, detail) => events.push({ epicId, type, detail })),
+      getChildTickets: vi.fn(async () => []), // neither racer sees the other's in-flight create
+      getWorkflowDef: vi.fn(() => DEF),
+      getAgentDef: vi.fn((id) => ({ phase: AGENT_PHASE[id] })),
+      resolveDevAssignee: vi.fn(() => "agentcore_hub_backend_dev"),
+      commitShaOf: vi.fn(() => null),
+    };
+    const completion = { findings: [{ component: "auth", summary: "null deref" }] };
+
+    const [a, b] = await Promise.all([
+      spawnFixTicketsFromFindings(WF, finder, completion, deps),
+      spawnFixTicketsFromFindings(WF, finder, completion, deps),
+    ]);
+
+    // Exactly one real ticket and one fix_spawned event survive the race.
+    expect(creates).toHaveLength(1);
+    expect(events.filter((e) => e.type === "orchestrator.fix_spawned")).toHaveLength(1);
+    // Both callers converge on the same key; exactly one is flagged deduped.
+    expect(a[0].ticketId).toBe(b[0].ticketId);
+    expect([a[0].deduped, b[0].deduped].filter(Boolean)).toHaveLength(1);
+  });
 });
 
 describe("rearmVerification (D3.2)", () => {
