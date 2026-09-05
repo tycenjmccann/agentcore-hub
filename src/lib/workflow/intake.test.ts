@@ -4,6 +4,7 @@ import {
   getSourceValidationMode,
   shouldRejectSubmission,
   resolveHubBucket,
+  HUB_BUCKET_PROBE_TIMEOUT_MS,
   type SourceValidationResult,
   type SourceCheckResult,
 } from "./intake";
@@ -419,6 +420,111 @@ describe("validateIntakeSources — caller-supplied verification", () => {
   });
 });
 
+// ─── TEAM-4079 F4: a locator-less value is classified by source.type ────────
+//
+// The final else-branch used to swallow ANY value without an s3:// / http(s)://
+// prefix, whatever `type` said. So {type:"url", value:"www.example.com/spec.pdf"}
+// and {type:"s3", value:"my-bucket/prd/spec.md"} were accepted in BOTH modes with
+// a detail that claimed "upload — in memory" (a lie) and verification.status
+// "skipped" — a status FR-4.4 reserves for uploads and the trusted-owner
+// shortcut. The intake agent then could not fetch either one.
+
+describe("validateIntakeSources — locator-less value classified by type (F4)", () => {
+  it("type url with a scheme-less value → definitive, no fetch attempted", async () => {
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 200 }], calls);
+    const s3 = { send: vi.fn() };
+    const r = await validateIntakeSources([src("url", "www.example.com/spec.pdf")], {
+      fetchImpl: impl,
+      s3Client: s3,
+      env: envOf({}),
+    });
+
+    const c = only(r);
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    expect(c.verification.status).toBe("unverified");
+    expect(c.detail).toContain("Unsupported URL scheme");
+    expect(c.detail).toContain("www.example.com/spec.pdf");
+    // No longer the false "in memory" claim.
+    expect(c.detail).not.toContain("in memory");
+    expect(r.definitiveErrors).toEqual([c.detail]);
+    // Nothing to fetch — a scheme-less value is not a request we can make.
+    expect(calls).toHaveLength(0);
+    expect(s3.send).not.toHaveBeenCalled();
+  });
+
+  it("type s3 with a bucket/key value (no s3:// scheme) → definitive, S3 client untouched", async () => {
+    const s3 = { send: vi.fn() };
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 200 }], calls);
+    const r = await validateIntakeSources([src("s3", "my-bucket/prd/spec.md")], {
+      s3Client: s3,
+      fetchImpl: impl,
+      env: envOf({}),
+    });
+
+    const c = only(r);
+    expect(c.outcome).toBe("definitive");
+    expect(c.verification.status).toBe("unverified");
+    expect(c.detail?.startsWith("Invalid S3 URI format")).toBe(true);
+    expect(c.detail).toContain("my-bucket/prd/spec.md");
+    expect(c.detail).not.toContain("in memory");
+    expect(r.definitiveErrors).toEqual([c.detail]);
+    expect(s3.send).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("GUARD: type upload is untouched — still skipped/in-memory", async () => {
+    const s3 = { send: vi.fn() };
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 200 }], calls);
+    const r = await validateIntakeSources([src("upload", "spec.pdf contents…")], {
+      s3Client: s3,
+      fetchImpl: impl,
+      env: envOf({}),
+    });
+
+    const c = only(r);
+    expect(c.outcome).toBe("skipped");
+    expect(c.method).toBe("none");
+    expect(c.verification.status).toBe("skipped");
+    expect(c.detail).toBe("upload — in memory, not network-validated");
+    expect(r.definitiveErrors).toEqual([]);
+    expect(r.transientErrors).toEqual([]);
+    expect(s3.send).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("a locator-carrying value still wins over the declared type", async () => {
+    // type "upload" but the value IS an s3:// URI — the value must be checked.
+    const s3 = { send: vi.fn(async () => ({ ContentLength: 1 })) };
+    const r = await validateIntakeSources([src("upload", "s3://hub-bucket/prd/spec.md")], {
+      s3Client: s3,
+      hubBucket: "hub-bucket",
+      env: envOf({}),
+    });
+    expect(only(r).outcome).toBe("verified");
+    expect(s3.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("both are rejected in LENIENT mode — a definitive negative is not a network opinion", async () => {
+    const s3 = { send: vi.fn() };
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 200 }], calls);
+    const r = await validateIntakeSources(
+      [src("url", "www.example.com/spec.pdf"), src("s3", "my-bucket/prd/spec.md"), src("upload", "inline.md")],
+      { s3Client: s3, fetchImpl: impl, env: envOf({}) }
+    );
+
+    expect(r.results.map((x) => x.outcome)).toEqual(["definitive", "definitive", "skipped"]);
+    const decision = shouldRejectSubmission(r, "lenient");
+    expect(decision.reject).toBe(true);
+    expect(decision.errors).toHaveLength(2);
+    expect(shouldRejectSubmission(r, "strict").reject).toBe(true);
+  });
+});
+
 // ─── (h) no-network paths ───────────────────────────────────────────────────
 
 describe("validateIntakeSources — sources with nothing to reach", () => {
@@ -549,5 +655,116 @@ describe("validateIntakeSources — mixed batch", () => {
     expect(r.definitiveErrors).toHaveLength(1);
     expect(r.transientErrors).toHaveLength(1);
     expect(shouldRejectSubmission(r, "lenient").errors).toEqual(r.definitiveErrors);
+  });
+});
+
+// ─── TEAM-4079 F3: the hub-bucket probe is bounded and never serializing ────
+//
+// The probe's ONLY product is the "(hub bucket)"/"(external bucket)" label in an
+// S3 detail string, yet it was awaited BEFORE the per-source map started, with a
+// default STSClient (3 attempts, no request timeout). An unreachable STS endpoint
+// therefore stalled every check — URL GETs and in-memory uploads included —
+// with nothing bounding it to the 10s/source budget.
+
+/** An STS client whose send() never settles — a hung endpoint, in one line. */
+const hangingSts = () => ({ send: vi.fn(() => new Promise<never>(() => {})) });
+
+describe("validateIntakeSources — hub-bucket probe is bounded (F3)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("(a) a hung STS probe cannot outlive the probe timeout", async () => {
+    vi.useFakeTimers();
+    const sts = hangingSts();
+    const s3 = { send: vi.fn(async () => ({ ContentLength: 12 })) };
+
+    const pending = validateIntakeSources([src("s3", "s3://some-bucket/prd/spec.md")], {
+      s3Client: s3,
+      stsClient: sts,
+      env: envOf({ AWS_REGION: "us-east-1" }),
+    });
+
+    // Nothing but the 2s probe timer stands between us and a result. On the base
+    // code this promise never settles and the test times out.
+    await vi.advanceTimersByTimeAsync(HUB_BUCKET_PROBE_TIMEOUT_MS + 1);
+    const r = await pending;
+
+    const c = only(r);
+    expect(c.outcome).toBe("verified");
+    // Probe timed out → no hub bucket known → the label degrades, it never fails.
+    expect(c.detail).toContain("(external bucket)");
+    expect(sts.send).toHaveBeenCalledTimes(1);
+    expect(s3.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("(a2) the timeout is well inside the 10s per-source budget in real time", async () => {
+    const sts = hangingSts();
+    const s3 = { send: vi.fn(async () => ({ ContentLength: 12 })) };
+    const started = Date.now();
+    const r = await validateIntakeSources([src("s3", "s3://some-bucket/prd/spec.md")], {
+      s3Client: s3,
+      stsClient: sts,
+      env: envOf({ AWS_REGION: "us-east-1" }),
+    });
+    const elapsed = Date.now() - started;
+
+    expect(only(r).outcome).toBe("verified");
+    expect(elapsed).toBeLessThan(5_000); // URL_TIMEOUT_MS is 10s; we are far under
+  });
+
+  it("(b) a URL check never waits on the STS probe", async () => {
+    const sts = hangingSts();
+    const s3 = { send: vi.fn(async () => ({ ContentLength: 12 })) };
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 206 }], calls);
+
+    vi.useFakeTimers();
+    const pending = validateIntakeSources(
+      [src("url", "https://example.com/spec.pdf"), src("s3", "s3://some-bucket/prd/spec.md")],
+      { s3Client: s3, stsClient: sts, fetchImpl: impl, env: envOf({ AWS_REGION: "us-east-1" }) }
+    );
+
+    // Flush microtasks only — the STS probe is still pending (its timer has not
+    // been advanced, and its send() never resolves at all).
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://example.com/spec.pdf");
+    expect(calls[0].method).toBe("GET");
+
+    // And the whole batch still completes once the probe timer fires.
+    await vi.advanceTimersByTimeAsync(HUB_BUCKET_PROBE_TIMEOUT_MS + 1);
+    const r = await pending;
+    expect(r.results.map((x) => x.outcome)).toEqual(["verified", "verified"]);
+  });
+
+  it("(b2) with NO s3 source the probe is never even started", async () => {
+    const sts = hangingSts();
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 206 }], calls);
+
+    const r = await validateIntakeSources(
+      [src("url", "https://example.com/spec.pdf"), src("upload", "inline.md")],
+      { stsClient: sts, fetchImpl: impl, env: envOf({ AWS_REGION: "us-east-1" }) }
+    );
+
+    expect(r.results.map((x) => x.outcome)).toEqual(["verified", "skipped"]);
+    expect(sts.send).not.toHaveBeenCalled();
+  });
+
+  it("an explicit opts.hubBucket short-circuits the probe entirely", async () => {
+    const sts = hangingSts();
+    const s3 = { send: vi.fn(async () => ({ ContentLength: 1 })) };
+    const r = await validateIntakeSources([src("s3", "s3://hub-bucket/prd/spec.md")], {
+      s3Client: s3,
+      stsClient: sts,
+      hubBucket: "hub-bucket",
+      env: envOf({}),
+    });
+    expect(only(r).detail).toContain("(hub bucket)");
+    expect(sts.send).not.toHaveBeenCalled();
   });
 });
