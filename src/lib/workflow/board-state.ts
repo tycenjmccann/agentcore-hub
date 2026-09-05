@@ -118,14 +118,48 @@ export function applyAgentComplete(
  */
 export function shouldForceTicketDone(
   task: { status?: string; completedAt?: string },
-  ticket: { status?: string; updatedAt?: string } | undefined
+  ticket: { status?: string; updatedAt?: string; blockReason?: string } | undefined
 ): boolean {
   if (task.status !== "complete") return false;
   if (!ticket || ticket.status === "done") return false;
+  // TEAM-3992 D4.2: a ticket the orchestrator parked blocked:runtime is waiting to
+  // be RESUMED, not finished. A stale completed agentTask (from before the outage)
+  // must never override that back to "done" — the recovery sweep re-drives it.
+  if (isRuntimeBlocked(ticket)) return false;
   const completedTs = Date.parse(task.completedAt || "");
   const updatedTs = Date.parse(ticket.updatedAt || "");
   if (Number.isFinite(completedTs) && Number.isFinite(updatedTs) && updatedTs > completedTs) {
     return false; // reopened after completion — rework in flight
   }
   return true;
+}
+
+/**
+ * TEAM-3992 D4.2 — a ticket parked by the coding-runtime health gate. Pure
+ * predicate over ticket shape so the board can special-case the runtime-outage
+ * park (label it, keep it out of the done-forcing path) without a status enum change.
+ */
+export function isRuntimeBlocked(
+  ticket: { status?: string; blockReason?: string } | undefined
+): boolean {
+  return !!ticket && ticket.status === "blocked" && ticket.blockReason === "runtime";
+}
+
+/** Human label for a machine block reason. "runtime" → the coding-runtime outage. */
+export function blockReasonLabel(reason: string | undefined | null): string | null {
+  if (!reason) return null;
+  if (reason === "runtime") return "runtime outage";
+  return reason;
+}
+
+/**
+ * The full board label for a blocked ticket: "Blocked: runtime outage" when a
+ * known blockReason applies, otherwise plain "Blocked". Non-blocked tickets → null.
+ */
+export function ticketBlockLabel(
+  ticket: { status?: string; blockReason?: string } | undefined
+): string | null {
+  if (!ticket || ticket.status !== "blocked") return null;
+  const reason = blockReasonLabel(ticket.blockReason);
+  return reason ? `Blocked: ${reason}` : "Blocked";
 }

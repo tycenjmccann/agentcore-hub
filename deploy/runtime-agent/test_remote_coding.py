@@ -241,6 +241,45 @@ class TestFailureExitsSurfaceAgentError(RemoteCodingTestCase):
         self.assertIn("workspace-fatal: clone failed", out)
         self._assert_agent_error_published(events_client, "workspace-fatal: clone failed")
 
+    def _last_agent_error_kind(self, events_client):
+        calls = [
+            c for c in events_client.put_item.call_args_list
+            if c.kwargs.get("Item", {}).get("type", {}).get("S") == "agent.error"
+        ]
+        self.assertTrue(calls, "no agent.error event was published")
+        return calls[-1].kwargs["Item"]["detail"]["M"].get("errorKind", {}).get("S")
+
+    def test_invoke_exception_is_tagged_runtime_unreachable(self):
+        # TEAM-3992 D4.2 — an exception ESCAPING submit+poll is an
+        # InvokeAgentRuntime-level (transport/SDK) failure: the coding runtime
+        # itself was unreachable, not a CLI error it reported back in-band. It
+        # must carry errorKind=runtime_unreachable so the orchestrator health
+        # gate can fold a burst of these into ONE outage.
+        events_client = mock.MagicMock()
+        with mock.patch.object(main.boto3, "client", return_value=mock.MagicMock()), \
+             mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main, "_submit_and_poll",
+                               side_effect=RuntimeError("connection reset by peer")):
+            main._remote_coding_turn("do the thing", "codex")
+
+        self.assertEqual(self._last_agent_error_kind(events_client),
+                         "runtime_unreachable")
+
+    def test_in_band_error_result_is_not_tagged_runtime_unreachable(self):
+        # Contrast: an {error} the runtime REPORTED (it was reachable — a CLI /
+        # setup failure) must NOT be tagged, so a real outage burst stays
+        # distinguishable from ordinary per-turn failures.
+        submit_client = mock.MagicMock()
+        submit_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
+            {"error": "workspace-fatal: clone failed"}
+        )
+        events_client = mock.MagicMock()
+        with mock.patch.object(main.boto3, "client", return_value=submit_client), \
+             mock.patch.object(main, "_ddb_events_client", events_client):
+            main._remote_coding_turn("do the thing", "claude")
+
+        self.assertIsNone(self._last_agent_error_kind(events_client))
+
 
 class TestHealthyTurnUnaffected(RemoteCodingTestCase):
     """Test C — the deadline must not preempt or noise up a healthy turn."""

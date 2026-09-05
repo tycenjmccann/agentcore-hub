@@ -1074,9 +1074,14 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         # Do NOT fall back to a local CLI run: the session's workspace lives on
         # the coding runtime, and a local run would fork it (split-brain).
         logger.warning(f"[remote-coding] turn failed: {str(e)[:300]}")
+        # An exception escaping submit/poll here is an InvokeAgentRuntime-level
+        # failure — the coding runtime itself was unreachable (transport/SDK), NOT
+        # a CLI error the runtime reported back in-band. Tag it so the orchestrator
+        # health gate can fold a burst into one outage.
         _publish_agent_error(_CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID,
                              f"remote {cli} turn failed: {str(e)[:300]}",
-                             ticket_id=_CURRENT_TICKET_ID)
+                             ticket_id=_CURRENT_TICKET_ID,
+                             error_kind="runtime_unreachable")
         return (f"ERROR: remote {cli} turn failed: {str(e)[:300]}. "
                 f"Retry this same {cli} call — the session workspace is preserved.")
 
@@ -2865,7 +2870,7 @@ _AGENT_ERROR_PUBLISH_BACKOFF_S = (0.5, 1.0)
 
 
 def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
-                         ticket_id: str = "") -> None:
+                         ticket_id: str = "", error_kind: str = "") -> None:
     """Surface a failure to the events table so the workflow board and nudge
     system can see it — a detached-run crash (a detached task has no caller to
     error to) or a failed nested coding-runtime handoff (TEAM-3119: those used
@@ -2897,6 +2902,13 @@ def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
                             "workflowId": {"S": workflow_id or "unknown"},
                             "ticketId": {"S": ticket_id or ""},
                             "error": {"S": (error or "")[:1000]},
+                            # TEAM-3992 D4.2: distinguish "the coding runtime was
+                            # unreachable" (an InvokeAgentRuntime SDK failure) from
+                            # an ordinary CLI failure, so the orchestrator's health
+                            # gate can correlate a burst of these to ONE outage
+                            # instead of N independent agent errors. Omitted when
+                            # empty so existing consumers are unaffected.
+                            **({"errorKind": {"S": error_kind}} if error_kind else {}),
                         }},
                         "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
                                       + f".{digits}Z"},
