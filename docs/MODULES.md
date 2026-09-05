@@ -56,7 +56,14 @@ The orchestration pipeline. Self-contained surface.
 - `src/lib/pipeline-config.ts`
 
 **Lambdas** (`lambda/`)
-- `orchestrator` — drives the pipeline state machine
+- `orchestrator` — drives the pipeline state machine. Internal modules (all
+  namespaced under `lambda/orchestrator/`, imported only by `index.mjs`): `dag.mjs`
+  (ticket-DAG expansion from a def's `ticketDag`), `fix-tickets.mjs` (fix-verification
+  re-arm gate), `default-branch.mjs` (resolve a repo's default branch at intake),
+  `runtime-health.mjs` (coding-runtime outage gate — TEAM-3992 D4.2), `otel-activity.mjs`
+  (CloudWatch Logs Insights span-confirmation probe for the stall soft-timeout —
+  TEAM-3992 D4.3). Any new `.mjs` here MUST be added to `deploy.sh`'s zip list and
+  pass `scripts/check-lambda-zip-manifest.sh`.
 - `agentcore-hub-jira` — Jira Cloud ticket tools (deployed when `TICKET_PROVIDER=jira`)
 - `agentcore-hub-tickets` — DynamoDB-backed ticket tools (deployed when `TICKET_PROVIDER=dynamodb`)
 - `workflow-output` — collects agent artifacts
@@ -74,6 +81,17 @@ The orchestration pipeline. Self-contained surface.
 **`agents.json` fields it reads**
 - `harnessName` — maps an agent to its AgentCore runtime via the `RUNTIME_ARN_<HARNESS_NAME_UPPER>` convention
 - `runtimeArn` — optional explicit ARN; when `null`, the orchestrator resolves the runtime from the env var above
+
+**Workflow-definition knobs** (per-def, read by the orchestrator)
+- `ticketDag` — declares the ticket dependency graph a run expands into (`dag.mjs`),
+  including `fixRearm` (which roles a fix ticket re-arms for SHA-pinned re-verification —
+  `fix-tickets.mjs`, gated by `FIX_VERIFICATION_REQUIRED`).
+- `stallSoftTimeoutMs` — per-def override of the activity-based stall soft-timeout
+  (TEAM-3992 D4.3), floored at 2× the resolved watchdog heartbeat interval so it can
+  never fire between two expected heartbeats; defaults to the shared
+  `lease-constants.json` value. Resolved by `watchdog.mjs` `resolveStallSoftTimeoutMs`.
+- `manifest.repo{}` — the run's resolved repo context (`full_name`, `default_branch`);
+  `default-branch.mjs` populates it at intake so no branch name is hardcoded.
 
 **Env vars** — `WORKFLOWS_TABLE`, `EVENTS_TABLE`, `TICKETS_TABLE`, `ARTIFACT_BUCKET`,
 `RUNTIME_ARN_<HARNESS>` (one per agent harness), `LAMBDA_ROLE_ARN`; performance card:

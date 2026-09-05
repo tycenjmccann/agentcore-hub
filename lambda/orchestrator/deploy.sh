@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs fix-tickets.mjs pipeline-enabled.mjs reconcile-sweep.mjs runtime-health.mjs sweep-scan.mjs repo-check.mjs default-branch.mjs gate-bypass.mjs evidence.mjs dag.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs fix-tickets.mjs pipeline-enabled.mjs reconcile-sweep.mjs runtime-health.mjs otel-activity.mjs sweep-scan.mjs repo-check.mjs default-branch.mjs gate-bypass.mjs evidence.mjs dag.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -153,7 +153,17 @@ if [ -n "${CODING_AGENT_RUNTIME_ARN:-}" ]; then
   [ -n "${RUNTIME_OUTAGE_BACKOFF_MIN:-}" ] && RUNTIME_HEALTH_VARS="${RUNTIME_HEALTH_VARS},RUNTIME_OUTAGE_BACKOFF_MIN=${RUNTIME_OUTAGE_BACKOFF_MIN}"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${GATE_BYPASS_VARS}${PIPELINE_VARS}${RUNTIME_HEALTH_VARS}}"
+# Stall soft-timeout OTEL confirmation (TEAM-3992 D4.3). All four knobs have code
+# defaults (OTEL_ACTIVITY_CONFIRM off, OTEL_SPANS_LOG_GROUP aws/spans, 15000ms,
+# budget 5), so the path ships dark and only explicit overrides are forwarded —
+# same posture as the RECONCILE/RUNTIME_HEALTH knobs above.
+OTEL_VARS=""
+[ -n "${OTEL_ACTIVITY_CONFIRM:-}" ] && OTEL_VARS="${OTEL_VARS},OTEL_ACTIVITY_CONFIRM=${OTEL_ACTIVITY_CONFIRM}"
+[ -n "${OTEL_SPANS_LOG_GROUP:-}" ] && OTEL_VARS="${OTEL_VARS},OTEL_SPANS_LOG_GROUP=${OTEL_SPANS_LOG_GROUP}"
+[ -n "${OTEL_QUERY_TIMEOUT_MS:-}" ] && OTEL_VARS="${OTEL_VARS},OTEL_QUERY_TIMEOUT_MS=${OTEL_QUERY_TIMEOUT_MS}"
+[ -n "${OTEL_QUERY_BUDGET_PER_SWEEP:-}" ] && OTEL_VARS="${OTEL_VARS},OTEL_QUERY_BUDGET_PER_SWEEP=${OTEL_QUERY_BUDGET_PER_SWEEP}"
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${GATE_BYPASS_VARS}${PIPELINE_VARS}${RUNTIME_HEALTH_VARS}${OTEL_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}}"
 

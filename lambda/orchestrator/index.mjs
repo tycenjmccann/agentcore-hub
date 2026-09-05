@@ -38,9 +38,11 @@ import {
   isLeaseLive,
   lastAgentActivity,
   stealClaim,
+  leaseVerdict,
 } from "./lease.mjs";
-import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
+import { resolveWatchdog, setWatchdogSource, resolveStallSoftTimeoutMs } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
+import { createOtelActivity } from "./otel-activity.mjs";
 import { createCascade, newMetrics as newCascadeMetrics } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createRuntimeHealth, outageKey as runtimeOutageKey } from "./runtime-health.mjs";
@@ -104,6 +106,10 @@ function parkNoteFingerprint(note) {
 // coerces anything not exactly off|shadow|enforce back to shadow, so a typo in
 // the env var can only ever DOWNGRADE to observe-only, never grant a rogue mode.
 const DEAD_SESSION_DETECTOR_MODE = process.env.DEAD_SESSION_DETECTOR_MODE || "shadow";
+// TEAM-3992 D4.3 — per-sweep OTEL span-confirmation query budget for the stall
+// soft-timeout path. Bounds Logs Insights fan-out per sweep (default 5); the
+// OTEL_ACTIVITY_CONFIRM flag itself (default off) is read inside otel-activity.mjs.
+const OTEL_QUERY_BUDGET_PER_SWEEP = Number(process.env.OTEL_QUERY_BUDGET_PER_SWEEP) || 5;
 // Cascade extended-states rollout flag (TEAM-3618 D3 commit 4b; tri-state as of
 // TEAM-3747 D1). off = the cascade only re-Readies {blocked, todo} dependents
 // (commit-4a behavior — the PRE-EPIC production path); shadow = evaluate the
@@ -365,7 +371,7 @@ function getDetector() {
     workflowsTable: WORKFLOWS_TABLE,
     eventsTable: EVENTS_TABLE,
     store,
-    lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
+    lease: { isLeaseLive, lastAgentActivity, stealClaim, leaseVerdict, LEASE_TTL_MS },
     getTicket,
     getAgentDef,
     publishEvent,
@@ -373,6 +379,14 @@ function getDetector() {
     blockTicket: blockTicketForFailedInvoke,
     // TEAM-3991 D1.2 — salvage a dead session that already delivered.
     synthesizeCompletion: synthesizeCompletionFor,
+    // TEAM-3992 D4.3 — the absolute stall soft-timeout path (dark until
+    // OTEL_ACTIVITY_CONFIRM=on for the OTEL confirm; the hard ceiling in
+    // leaseVerdict fires regardless once silence passes 2× the soft-timeout).
+    cascade: getCascade(),
+    otel: createOtelActivity({}),
+    resolveStallSoftTimeout: resolveStallSoftTimeoutMs,
+    loadWorkflowDef: getWorkflowDef,
+    otelBudgetPerSweep: OTEL_QUERY_BUDGET_PER_SWEEP,
   });
   return _detector;
 }

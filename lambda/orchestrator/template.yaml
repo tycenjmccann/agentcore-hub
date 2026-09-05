@@ -25,6 +25,10 @@ Globals:
         GATE_BYPASS_MODE: !Ref GateBypassMode
         FIX_VERIFICATION_REQUIRED: !Ref FixVerificationRequired
         CODING_AGENT_RUNTIME_ARN: !Ref CodingAgentRuntimeArn
+        OTEL_ACTIVITY_CONFIRM: !Ref OtelActivityConfirm
+        OTEL_SPANS_LOG_GROUP: !Ref OtelSpansLogGroup
+        OTEL_QUERY_TIMEOUT_MS: !Ref OtelQueryTimeoutMs
+        OTEL_QUERY_BUDGET_PER_SWEEP: !Ref OtelQueryBudgetPerSweep
 
 Parameters:
   TicketsTableName:
@@ -130,6 +134,43 @@ Parameters:
       dark and dispatch behaves exactly as pre-D4.2. No hardcoded ARN/account:
       supply via CODING_AGENT_RUNTIME_ARN from deploy/config.sh.
 
+  OtelActivityConfirm:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: >
+      OTEL span-confirmation for the dead-session detector's stall soft-timeout
+      (TEAM-3992 D4.3). off (default) = the detector never queries CloudWatch Logs
+      Insights: a soft-stale claim is only ever stolen once its silence passes the
+      absolute hard ceiling (2× the soft-timeout) — the 4v1ykk TEAM-2609 class. on
+      = below the hard ceiling the detector confirms death against aws/spans before
+      stealing, so a genuinely-working agent whose stream heartbeats lapsed is not
+      recovered mid-turn. Ships off — the hard ceiling alone is the safe backstop.
+
+  OtelSpansLogGroup:
+    Type: String
+    Default: aws/spans
+    Description: >
+      CloudWatch Logs group holding the fleet's OTEL spans, queried by the stall
+      soft-timeout confirmation probe (TEAM-3992 D4.3). Default aws/spans matches
+      the group the runtime + traces already emit to.
+
+  OtelQueryTimeoutMs:
+    Type: String
+    Default: "15000"
+    Description: >
+      Per-query wall-clock budget (ms) for the OTEL span-confirmation Logs Insights
+      poll (TEAM-3992 D4.3). A query that has not reached Complete by then yields
+      the "unknown" sentinel, which NEVER escalates a soft-stale to a steal.
+
+  OtelQueryBudgetPerSweep:
+    Type: String
+    Default: "5"
+    Description: >
+      Maximum OTEL confirmation queries a single dead-session sweep may issue
+      (TEAM-3992 D4.3), bounding Logs Insights fan-out when many claims go
+      soft-stale at once. Over budget yields the "unknown" sentinel (no steal).
+
 Conditions:
   # The coding-runtime health gate's InvokeAgentRuntime grant is only added when a
   # runtime ARN is supplied — an empty Resource would be an invalid IAM policy,
@@ -196,6 +237,23 @@ Resources:
                   - !Ref CodingAgentRuntimeArn
                   - !Sub "${CodingAgentRuntimeArn}/runtime-endpoint/*"
           - !Ref AWS::NoValue
+        # TEAM-3992 D4.3 — the stall soft-timeout's OTEL span-confirmation probe
+        # runs a CloudWatch Logs Insights query over the aws/spans log group.
+        # StartQuery/StopQuery accept resource-level scoping (the aws/spans group);
+        # GetQueryResults does NOT support resource-level permissions and must be
+        # granted on "*" (see the CloudWatch Logs IAM reference — it is keyed by
+        # queryId, not log group). The probe is dark unless OTEL_ACTIVITY_CONFIRM=on,
+        # but the grant is always present so enabling the flag needs no redeploy.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:StartQuery
+                - logs:StopQuery
+              Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*"
+            - Effect: Allow
+              Action:
+                - logs:GetQueryResults
+              Resource: "*"  # GetQueryResults has no resource-level permission support
       Events:
         DynamoDBStream:
           Type: DynamoDB
