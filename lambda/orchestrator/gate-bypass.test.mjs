@@ -20,6 +20,8 @@ import {
   gateBypassMode,
   runGateBypassCheck,
   hasUnackedGateBypass,
+  ackedGateBypasses,
+  gateBypassBlockReason,
   GATE_BYPASS_GRACE_MS,
 } from "./gate-bypass.mjs";
 
@@ -42,10 +44,23 @@ function makeStore() {
   const merges = [];
   const statuses = [];
   const notifications = [];
+  const claims = [];
+  const held = new Set();
   return {
     merges,
     statuses,
     notifications,
+    claims,
+    // Mirrors claimGateBypassFlag's contract (TEAM-4099 F2): the conditional
+    // stamp admits exactly ONE winner per (workflow, ticket, scope). The check
+    // and the insert are synchronous, so two concurrent callers really do race.
+    claimGateBypassFlag: async (wf, tid, opts = {}) => {
+      claims.push({ wf, tid, ...opts });
+      const key = `${wf}/${tid}/${opts.shadow ? "shadow" : "flag"}`;
+      if (held.has(key)) return { won: false };
+      held.add(key);
+      return { won: true };
+    },
     setTaskStatus: async (wf, tid, status) => { statuses.push({ wf, tid, status }); },
     mergeTaskMetadataOrTrack: async (wf, tid, fields, seed) => { merges.push({ wf, tid, fields, seed }); return true; },
     // Mirrors appendNotificationOnce's contract: appends only for a new id.
@@ -378,7 +393,7 @@ describe("runGateBypassCheck", () => {
 
   it("enforce: event + in_review + gateBypassFlaggedAt + one escalation + a comment", async () => {
     const { result, events, comments, store } = await run();
-    expect(result).toMatchObject({ checked: true, bypasses: 1, deferred: 0 });
+    expect(result).toMatchObject({ checked: true, bypasses: 1, deferred: 0, flagged: true });
 
     expect(events).toHaveLength(1);
     expect(events[0].type).toBe("workflow.gate_bypass");
@@ -395,20 +410,46 @@ describe("runGateBypassCheck", () => {
     });
 
     expect(store.statuses).toEqual([{ wf: WF_ID, tid: DEV, status: "in_review" }]);
-    expect(store.merges).toHaveLength(1);
-    expect(store.merges[0].fields).toEqual({
-      gateBypassFlaggedAt: iso(NOW),
-      gateBypassMergeCommit: "sha1",
-    });
+    // TEAM-4099 F2: the flag is stamped by the CAS (claimGateBypassFlag), not by
+    // an unconditional metadata merge — and it is the FIRST write on the path.
+    expect(store.merges).toEqual([]);
+    expect(store.claims).toEqual([
+      { wf: WF_ID, tid: DEV, mergeCommit: "sha1", flaggedAt: iso(NOW), shadow: false },
+    ]);
     expect(store.notifications).toHaveLength(1);
     expect(store.notifications[0]).toMatchObject({
       id: `notif_gate_bypass_${WF_ID}_sha1`,
-      kind: "manager_escalation",
+      type: "manager_escalation",
+      acknowledged: false,
       ticketId: DEV,
       mergeCommit: "sha1",
     });
     expect(comments).toHaveLength(1);
     expect(comments[0].text).toContain("Merge without approval");
+  });
+
+  // TEAM-4099 F1: the escalation used to carry `kind`, but every consumer — the
+  // console escalations route, the Telegram intake, the WM watch gate — selects
+  // on `type === "manager_escalation"`. A notification nobody can see is a
+  // notification nobody can ACK, and an unacked gate bypass blocks completion
+  // forever, so the shape is load-bearing, not cosmetic.
+  it("the escalation is shaped so the escalations route can list AND ack it (F1)", async () => {
+    const { store } = await run();
+    const n = store.notifications[0];
+    expect(n).toMatchObject({
+      type: "manager_escalation",
+      title: "Merge without approval (gate bypass)",
+      reviewer: "gate-bypass",
+      acknowledged: false,
+    });
+    expect(n.details).toContain("Merge without approval");
+    expect(typeof n.timestamp).toBe("string");
+    expect(n.id).toBe(`notif_gate_bypass_${WF_ID}_sha1`); // still the idempotent id (F9)
+    // Replicated verbatim from src/app/api/workflow/[id]/escalations/route.ts
+    // (GET filter, line 40; PATCH skip, line 67) — the predicate that decides
+    // whether a human ever sees this row.
+    expect(n.type === "manager_escalation").toBe(true);
+    expect(!(n.type !== "manager_escalation" || n.acknowledged)).toBe(true);
   });
 
   it("a second run for the SAME merge commit adds no duplicate escalation (F9)", async () => {
@@ -419,7 +460,71 @@ describe("runGateBypassCheck", () => {
     expect(store.notifications[0].id).toBe(`notif_gate_bypass_${WF_ID}_sha1`);
   });
 
-  it("shadow: the event only — no status change, no flag, no escalation, no comment", async () => {
+  // TEAM-4099 F2: the event was published BEFORE any conditional write, so a
+  // re-Done (or the sweep racing a live cascade) re-announced a bypass a human
+  // was already handling and re-parked the ticket. The claim CAS is now the
+  // barrier for the whole side-effect set.
+  it("a re-run of an already-flagged ticket is a total no-op — no second event, flip or escalation", async () => {
+    const store = makeStore();
+    const first = await run({ store });
+    expect(first.events).toHaveLength(1);
+
+    const second = await run({ store });
+    expect(second.result).toMatchObject({ bypasses: 1, flagged: true, alreadyFlagged: true });
+    expect(second.events).toEqual([]);
+    expect(second.comments).toEqual([]);
+    expect(store.statuses).toHaveLength(1);
+    expect(store.notifications).toHaveLength(1);
+  });
+
+  it("two concurrent checks race the claim: exactly ONE event, flip and escalation (F2)", async () => {
+    const store = makeStore();
+    const [a, b] = await Promise.all([run({ store }), run({ store })]);
+    const events = [...a.events, ...b.events];
+    expect(events.filter((e) => e.type === "workflow.gate_bypass")).toHaveLength(1);
+    expect(store.statuses).toHaveLength(1);
+    expect(store.notifications).toHaveLength(1);
+    expect([a.result.alreadyFlagged, b.result.alreadyFlagged].filter(Boolean)).toHaveLength(1);
+    expect(store.claims).toHaveLength(2); // both tried; the CAS admitted one
+  });
+
+  it("an already-flagged task WITH its escalation on record short-circuits before GitHub is called", async () => {
+    const calls = [];
+    const gh = fakeGithub({ "&head=": [], "&base=main": [ghPr(1, iso(NOW - 900_000))] }, calls);
+    const { result, events, store } = await run({
+      gh,
+      workflow: workflow({
+        agentTasks: { [DEV]: { ticketId: DEV, gateBypassFlaggedAt: iso(NOW - 60_000) } },
+        humanNotifications: [{ id: `notif_gate_bypass_${WF_ID}_sha1`, type: "manager_escalation", ticketId: DEV }],
+      }),
+    });
+    expect(result).toEqual({ checked: false, reason: "already_flagged", flagged: true, alreadyFlagged: true });
+    expect(calls).toEqual([]);
+    expect(events).toEqual([]);
+    expect(store.claims).toEqual([]);
+  });
+
+  // The flag is written BEFORE the escalation, so a Lambda that dies in between
+  // leaves a flagged task nothing is holding open. The next pass must self-heal the
+  // escalation (id-idempotent) — but still not re-announce or re-flip.
+  it("flagged but NOT escalated: the escalation is re-appended, with no second event or flip", async () => {
+    const store = makeStore();
+    store.claimGateBypassFlag = async (wf, tid, opts) => {
+      store.claims.push({ wf, tid, ...opts });
+      return { won: false }; // the dead flagger already holds it
+    };
+    const { result, events, comments } = await run({
+      store,
+      workflow: workflow({ agentTasks: { [DEV]: { ticketId: DEV, gateBypassFlaggedAt: iso(NOW - 60_000) } } }),
+    });
+    expect(result).toMatchObject({ checked: true, bypasses: 1, alreadyFlagged: true });
+    expect(events).toEqual([]);
+    expect(store.statuses).toEqual([]);
+    expect(comments).toEqual([]);
+    expect(store.notifications.map((n) => n.id)).toEqual([`notif_gate_bypass_${WF_ID}_sha1`]);
+  });
+
+  it("shadow: the event only — no status change, no enforcement flag, no escalation, no comment", async () => {
     const { result, events, comments, store } = await run({ mode: "shadow" });
     expect(result).toMatchObject({ checked: true, bypasses: 1 });
     expect(events[0].detail.mode).toBe("shadow");
@@ -427,6 +532,20 @@ describe("runGateBypassCheck", () => {
     expect(store.merges).toEqual([]);
     expect(store.notifications).toEqual([]);
     expect(comments).toEqual([]);
+    // The shadow claim exists (so measurement isn't double-counted on a re-run)
+    // but is SHADOW-SCOPED: writing gateBypassFlaggedAt here would trip the F8
+    // claimInvocation veto and make "measure only" un-reclaimable in practice.
+    expect(store.claims).toEqual([
+      { wf: WF_ID, tid: DEV, mergeCommit: "sha1", flaggedAt: iso(NOW), shadow: true },
+    ]);
+  });
+
+  it("shadow re-run: the shadow claim suppresses a duplicate measurement event", async () => {
+    const store = makeStore();
+    await run({ store, mode: "shadow" });
+    const { events, result } = await run({ store, mode: "shadow" });
+    expect(events).toEqual([]);
+    expect(result).toMatchObject({ alreadyFlagged: true });
   });
 
   it("off: fully inert", async () => {
@@ -617,7 +736,7 @@ describe("wf sffzti replay — 4 PRs merged before any approval", () => {
 
 describe("hasUnackedGateBypass", () => {
   it("true while a gate-bypass escalation is unacked, false once acked", () => {
-    const notif = (id, acknowledged) => ({ id, kind: "manager_escalation", acknowledged });
+    const notif = (id, acknowledged) => ({ id, type: "manager_escalation", acknowledged });
     expect(hasUnackedGateBypass({ humanNotifications: [notif("notif_gate_bypass_wf1_sha1")] })).toBe(true);
     expect(hasUnackedGateBypass({ humanNotifications: [notif("notif_gate_bypass_wf1_sha1", true)] })).toBe(false);
   });
@@ -627,5 +746,45 @@ describe("hasUnackedGateBypass", () => {
     expect(hasUnackedGateBypass({ humanNotifications: [] })).toBe(false);
     expect(hasUnackedGateBypass({})).toBe(false);
     expect(hasUnackedGateBypass(null)).toBe(false);
+  });
+
+  // The completion-blocked escalation is NOT a gate-bypass escalation: it is the
+  // guard's own "this run cannot close" note. If the prefix matched it too, acking
+  // the bypass would never be enough to release the run (and vice versa).
+  it("the completion-blocked escalation is not itself a gate-bypass escalation", () => {
+    const wf = { humanNotifications: [{ id: "notif_completion_gate_bypass_wf1", type: "manager_escalation" }] };
+    expect(hasUnackedGateBypass(wf)).toBe(false);
+    expect(ackedGateBypasses(wf)).toEqual([]);
+  });
+});
+
+// ─── the accepted-bypass state (TEAM-4099 F1) ─────────────────────────────────
+
+describe("ackedGateBypasses + gateBypassBlockReason", () => {
+  const notif = (sha, acknowledged) => ({
+    id: `notif_gate_bypass_wf1_${sha}`,
+    type: "manager_escalation",
+    mergeCommit: sha,
+    prUrl: `https://github.com/o/r/pull/9`,
+    acknowledged,
+  });
+
+  it("collects only the ACKED gate-bypass escalations", () => {
+    const wf = { humanNotifications: [notif("aaa1111bbbb", true), notif("ccc2222dddd", false)] };
+    expect(ackedGateBypasses(wf).map((n) => n.mergeCommit)).toEqual(["aaa1111bbbb"]);
+    expect(ackedGateBypasses({})).toEqual([]);
+    expect(ackedGateBypasses(null)).toEqual([]);
+  });
+
+  it("the blockReason names the PR and the short merge commit — never a green close", () => {
+    expect(gateBypassBlockReason([notif("aaa1111bbbb", true)])).toBe(
+      "gate bypass accepted: PR https://github.com/o/r/pull/9 merged aaa1111 before approval"
+    );
+    expect(gateBypassBlockReason([notif("aaa1111bbbb", true), notif("ccc2222dddd", true)])).toContain(
+      "(+1 more merge(s))"
+    );
+    // Degenerate rows still produce a legible reason rather than "undefined".
+    expect(gateBypassBlockReason([{}])).toBe("gate bypass accepted: PR unknown PR merged unknown commit before approval");
+    expect(gateBypassBlockReason()).toContain("unknown PR");
   });
 });

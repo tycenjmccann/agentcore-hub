@@ -233,7 +233,20 @@ vi.mock("./workflow-store.mjs", () => ({
     h.state.notifications.push({ id, n });
     return true;
   }),
-  ackNotifications: vi.fn(async () => 0),
+  // TEAM-4099 F1 — the ack has to be observable, because "acked" is now a THIRD
+  // completion state (accepted bypass → honest blocked close), not just the
+  // absence of a block. Applies to the fresh snapshot, like mergeTaskMetadata.
+  ackNotifications: vi.fn(async (id, predicate) => {
+    const wf = h.state.freshWorkflow?.id === id ? h.state.freshWorkflow : null;
+    if (!wf || !Array.isArray(wf.humanNotifications)) return 0;
+    let acked = 0;
+    wf.humanNotifications = wf.humanNotifications.map((n) => {
+      if (n.acknowledged || !predicate(n)) return n;
+      acked++;
+      return { ...n, acknowledged: true, acknowledgedAt: "2026-09-05T13:00:00Z" };
+    });
+    return acked;
+  }),
 }));
 
 // Set before importing index.mjs: the roster/def loaders early-return to the
@@ -1520,5 +1533,123 @@ describe("completeWorkflow — SHA-pinned fix-verification gate (TEAM-3992 Q4, w
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions.length).toBe(1);
     expect(ebTypes().includes("workflow.completion_blocked")).toBe(false);
+  });
+});
+
+/**
+ * TEAM-4099 F1 — the gate-bypass completion gate is TRI-state.
+ *
+ * Before: an unacked `notif_gate_bypass_*` escalation blocked completeWorkflow,
+ * and the escalation the detector wrote carried `kind` instead of `type` — so the
+ * console/Telegram surfaces never listed it and the PATCH route could never ack
+ * it. The run was wedged permanently, and the only way out (ack) would have let it
+ * close GREEN over a merge nobody approved. Now: unacked → still refused; ACKED →
+ * the block lifts but the run closes `deploy-blocked` with a blockReason naming
+ * the PR and the merge commit. Never `complete`.
+ *
+ * The detector-side half of the story (a re-Done of a flagged ticket re-publishing
+ * nothing) is pinned in gate-bypass-wiring.test.mjs, which drives the real handlers.
+ */
+describe("completeWorkflow — accepted gate bypass closes blocked (TEAM-4099 F1)", () => {
+  const MERGE_COMMIT = "cafebabe1234567";
+  const PR_URL = "https://github.com/o/r/pull/327";
+  const bypassNotif = (acknowledged = false) => ({
+    id: `notif_gate_bypass_wf_1_${MERGE_COMMIT}`,
+    type: "manager_escalation",
+    title: "Merge without approval (gate bypass)",
+    details: "Merge without approval: PR #327 merged before the Merge Approval gate recorded an APPROVE.",
+    reviewer: "gate-bypass",
+    timestamp: "2026-09-05T12:00:00Z",
+    acknowledged,
+    ticketId: "T-1",
+    mergeCommit: MERGE_COMMIT,
+    prUrl: PR_URL,
+  });
+
+  /** Evidence on every done ticket, so only the bypass gate is under test. */
+  const wfWithNotifs = (humanNotifications) => ({
+    id: "wf_1",
+    agentTasks: {
+      "T-1": { ticketId: "T-1", output: "implemented" },
+      "T-2": { ticketId: "T-2", output: "verified" },
+      "T-3": { ticketId: "T-3", output: "ci green" },
+    },
+    humanNotifications,
+  });
+
+  /**
+   * Acknowledge through the SAME predicate the console PATCH route uses
+   * (src/app/api/workflow/[id]/escalations/route.ts:67 — `n.type !==
+   * "manager_escalation" || n.acknowledged` skips the row). Replicated rather
+   * than imported because the route is a Next handler, not a module export; that
+   * is exactly why the notification's `type` field is load-bearing.
+   */
+  async function ackViaEscalationsRoute(workflowId, notificationId) {
+    const routeSelects = (n) => !(n?.type !== "manager_escalation" || n.acknowledged);
+    const store = await import("./workflow-store.mjs");
+    return store.ackNotifications(workflowId, (n) => routeSelects(n) && (!notificationId || n.id === notificationId));
+  }
+
+  it("unacked: completion is refused, nothing terminal is claimed, and the block is announced once", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = wfWithNotifs([bypassNotif(false)]);
+    await load();
+    await completeWorkflow({ ...WF });
+
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.terminalClaims).toHaveLength(0);
+    const blocked = ebEventsOfType("workflow.completion_blocked");
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({ workflowId: "wf_1", reason: "gate_bypass_unacked", ticketIds: ["T-1"] });
+    expect(h.state.notifications.map((n) => n.n.id)).toEqual(["notif_completion_gate_bypass_wf_1"]);
+    warn.mockRestore();
+  });
+
+  it("acked through the escalations-route predicate: closes deploy-blocked, blockReason names the PR", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = wfWithNotifs([bypassNotif(false)]);
+    await load();
+
+    // A human resolves the escalation — only possible because the notification
+    // carries `type: "manager_escalation"` (the F1 fix).
+    expect(await ackViaEscalationsRoute("wf_1", `notif_gate_bypass_wf_1_${MERGE_COMMIT}`)).toBe(1);
+
+    await completeWorkflow({ ...WF });
+
+    // Never green: no completion claim, one terminal deploy-blocked claim.
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.terminalClaims).toEqual([
+      {
+        id: "wf_1",
+        outcome: "deploy-blocked",
+        ts: expect.any(String),
+        reason: `gate bypass accepted: PR ${PR_URL} merged cafebab before approval`,
+      },
+    ]);
+    const closed = ebEventsOfType("workflow.deploy_blocked");
+    expect(closed).toHaveLength(1);
+    expect(closed[0]).toMatchObject({ workflowId: "wf_1", outcome: "deploy-blocked", offenders: [] });
+    expect(closed[0].reason).toContain(PR_URL);
+    expect(ebEventsOfType("workflow.complete")).toHaveLength(0);
+    expect(h.state.finalized).toEqual(["wf_1"]);
+    // No second "cannot close" escalation: the block is resolved, not re-raised.
+    expect(h.state.notifications.some((n) => n.n.id === "notif_completion_gate_bypass_wf_1")).toBe(false);
+    error.mockRestore();
+  });
+
+  it("a run that never bypassed anything is untouched by the gate (control)", async () => {
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = wfWithNotifs([
+      // An acked escalation of a DIFFERENT kind must not divert the close.
+      { id: "notif_epic_rollup_wf_1", type: "manager_escalation", acknowledged: true },
+    ]);
+    await load();
+    await completeWorkflow({ ...WF });
+
+    expect(h.state.storeCompletions).toHaveLength(1);
+    expect(h.state.terminalClaims).toHaveLength(0);
+    expect(ebEventsOfType("workflow.complete")).toHaveLength(1);
   });
 });

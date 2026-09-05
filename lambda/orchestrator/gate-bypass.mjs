@@ -235,11 +235,14 @@ async function collectMergedPrs(githubFetch, { owner, repo, base, featureBranch,
  * def declares a Merge Approval gate (F7 — scope is the def's gate, not
  * `phase === "development"`).
  *
- * enforce: EventBridge `workflow.gate_bypass` + task back to `in_review` +
- *          `gateBypassFlaggedAt` (which F8 makes un-reclaimable) + ONE
- *          `manager_escalation` notification per offending mergeCommit (F9) +
- *          a ticket comment.
- * shadow:  the event only — measure before enforcing.
+ * enforce: `store.claimGateBypassFlag` (the CAS that stamps `gateBypassFlaggedAt`,
+ *          which F8 makes un-reclaimable) and THEN, only for the caller that won
+ *          it, EventBridge `workflow.gate_bypass` + task back to `in_review` +
+ *          ONE `manager_escalation` notification per offending mergeCommit (F9) +
+ *          a ticket comment. A caller that loses the CAS is a no-op
+ *          (`alreadyFlagged`) — TEAM-4099 F2.
+ * shadow:  the event only — measure before enforcing (its claim stamps the
+ *          shadow-scoped fields, so shadow never trips the F8 veto).
  * off:     inert.
  *
  * Never throws: a detector that can break the cascade is worse than no detector.
@@ -261,6 +264,18 @@ export async function runGateBypassCheck({ workflow, ticket, children, workflowD
   try {
     if (mode === "off") return { checked: false, reason: "mode_off" };
     if (isHuman(ticket?.assignee)) return { checked: false, reason: "human_ticket" };
+    // TEAM-4099 F1/F2 — an already-flagged ticket with its escalation on record is
+    // settled: a human owns it. Re-Doning it (the flag flips the task to in_review,
+    // so the done-cascade dedup guard no longer short-circuits and any later "Done"
+    // re-enters this path) must not re-publish the event or re-park the ticket.
+    // Cheap short-circuit ahead of the GitHub calls; claimGateBypassFlag below is
+    // the actual barrier for concurrent callers. The escalation half of the
+    // condition matters: flagged-but-not-escalated (a flagger that died mid-way) has
+    // to fall through, or nothing would ever hold the run open.
+    if (mode === "enforce" && workflow?.agentTasks?.[ticketId]?.gateBypassFlaggedAt &&
+        hasGateBypassEscalationFor(workflow, ticketId)) {
+      return { checked: false, reason: "already_flagged", flagged: true, alreadyFlagged: true };
+    }
 
     const found = findMergeApprovalGate(children, workflowDef, { gatePhaseOf });
     if (!found) return { checked: false, reason: "no_merge_gate" };
@@ -288,68 +303,132 @@ export async function runGateBypassCheck({ workflow, ticket, children, workflowD
     const decisions = approvalsFor(workflow, found.ticket);
     const verdicts = evaluateGateBypass({ mergedPrs: merged, decisions, nowMs, graceMs });
 
-    let bypasses = 0;
-    let deferred = 0;
-    for (const v of verdicts) {
-      if (v.verdict === "clean") continue;
+    const bypassing = verdicts.filter((v) => v.verdict === "bypass");
+    const deferrals = verdicts.filter((v) => v.verdict === "deferred");
+    const summary = { checked: true, verdicts, bypasses: bypassing.length, deferred: deferrals.length };
 
-      if (v.verdict === "deferred") {
-        deferred++;
-        // F10: re-checked synchronously inside completeWorkflow once the window
-        // has passed, so a truly-unapproved merge can't slip out on a deferral.
-        await store?.mergeTaskMetadataOrTrack?.(workflow.id, ticketId, {
-          gateBypassCheckAt: new Date(nowMs + graceMs).toISOString(),
-          gateBypassMergeCommit: v.mergeCommit,
-        });
-        continue;
-      }
-
-      bypasses++;
-      await publishEvent?.(ticketId, "workflow.gate_bypass", {
-        workflowId: workflow.id,
-        ticketId,
-        mergeCommit: v.mergeCommit,
-        prUrl: v.prUrl,
-        mergedAt: v.mergedAt,
-        gateTicketId,
-        approvedAt: null,
-        approvalSource: v.approvalSource,
-        mode,
-      });
-      if (mode !== "enforce") continue;
-
-      const flaggedAt = new Date(nowMs).toISOString();
-      await store.setTaskStatus(workflow.id, ticketId, "in_review");
-      await store.mergeTaskMetadataOrTrack(workflow.id, ticketId, {
-        gateBypassFlaggedAt: flaggedAt,
+    for (const v of deferrals) {
+      // F10: re-checked synchronously inside completeWorkflow once the window
+      // has passed, so a truly-unapproved merge can't slip out on a deferral.
+      await store?.mergeTaskMetadataOrTrack?.(workflow.id, ticketId, {
+        gateBypassCheckAt: new Date(nowMs + graceMs).toISOString(),
         gateBypassMergeCommit: v.mergeCommit,
       });
+    }
+    if (bypassing.length === 0) return summary;
+
+    // TEAM-4099 F2 — the flag claim is the idempotency barrier for the WHOLE
+    // side-effect set (event, status flip, escalation, comment), so it lands
+    // FIRST, before anything observable. Scope is the ticket, not the merge
+    // commit: a re-Done of an already-flagged ticket loses the CAS and returns
+    // silently instead of re-publishing `workflow.gate_bypass` and re-parking a
+    // ticket a human is already looking at. Shadow keeps its own (harmless)
+    // stamp so measurement isn't double-counted either — see claimGateBypassFlag.
+    const flaggedAt = new Date(nowMs).toISOString();
+    const claim = await store?.claimGateBypassFlag?.(workflow.id, ticketId, {
+      mergeCommit: bypassing[0].mergeCommit,
+      flaggedAt,
+      shadow: mode !== "enforce",
+    });
+    // A store without the fn (or a caller that injects a partial one) keeps the
+    // pre-TEAM-4099 behaviour rather than silently going dark.
+    const won = !claim || claim.won !== false;
+    if (!won) log.log?.(`[gate-bypass] ${workflow.id}/${ticketId}: already flagged — no re-announce`);
+
+    for (const v of bypassing) {
+      if (won) {
+        await publishEvent?.(ticketId, "workflow.gate_bypass", {
+          workflowId: workflow.id,
+          ticketId,
+          mergeCommit: v.mergeCommit,
+          prUrl: v.prUrl,
+          mergedAt: v.mergedAt,
+          gateTicketId,
+          approvedAt: null,
+          approvalSource: v.approvalSource,
+          mode,
+        });
+      }
+      if (mode !== "enforce") continue;
+
+      // Once per invocation, not once per PR: the task has one status.
+      if (won && v === bypassing[0]) await store.setTaskStatus(workflow.id, ticketId, "in_review");
       const message =
         `Merge without approval: PR #${v.number} (${v.prUrl || "no url"}) merged at ${v.mergedAt} ` +
         `as ${v.mergeCommit || "unknown commit"}, but the Merge Approval gate` +
         `${gateTicketId ? ` (${gateTicketId})` : ""} has no APPROVE recorded at or before that time.`;
+      // F1 (TEAM-4099): `type`, not `kind` — the escalations route, the Telegram
+      // intake and the WM watch gate all select on `type === "manager_escalation"`,
+      // so a `kind`-shaped notification was invisible and could never be acked,
+      // which left `hasUnackedGateBypass` blocking completion forever.
+      //
+      // This runs even for a caller that LOST the claim: it is id-idempotent
+      // (appendNotificationOnce stands down on a duplicate), and the escalation is
+      // the thing that holds the run open — a winner that died between its claim
+      // and this append would otherwise leave a flagged run with nothing to block
+      // it, i.e. a green close over an unapproved merge. Nothing else re-runs.
       await store.appendNotificationOnce(workflow.id, {
         id: `notif_gate_bypass_${workflow.id}_${v.mergeCommit}`,
-        kind: "manager_escalation",
+        type: "manager_escalation",
+        title: "Merge without approval (gate bypass)",
+        details: message,
+        reviewer: "gate-bypass",
+        timestamp: flaggedAt,
+        acknowledged: false,
         ticketId,
         mergeCommit: v.mergeCommit,
         prUrl: v.prUrl,
-        message,
-        createdAt: flaggedAt,
       });
-      await addTicketComment?.(ticketId, `[gate-bypass] ${message}`);
+      if (won) await addTicketComment?.(ticketId, `[gate-bypass] ${message}`);
     }
 
-    return { checked: true, verdicts, bypasses, deferred };
+    return won
+      ? { ...summary, flagged: mode === "enforce" }
+      : { ...summary, flagged: true, alreadyFlagged: true };
   } catch (err) {
     log.warn?.(`[gate-bypass] ${workflow?.id}/${ticketId}: check failed — ${err?.message || err}`);
     return { checked: false, reason: "error" };
   }
 }
 
+const isGateBypassNotif = (n) => typeof n?.id === "string" && n.id.startsWith("notif_gate_bypass_");
+
+/**
+ * Is this ticket's bypass already ON RECORD for a human (acked or not)? The flag
+ * stamp alone is not enough: it is written first (TEAM-4099 F2), so a flagger that
+ * died in between leaves a flagged task with no escalation, and it is the
+ * escalation — not the stamp — that holds the run open.
+ */
+export function hasGateBypassEscalationFor(workflow, ticketId) {
+  return (workflow?.humanNotifications || []).some((n) => isGateBypassNotif(n) && n.ticketId === ticketId);
+}
+
 /** True while any gate-bypass escalation is still un-acked (blocks a clean close). */
 export function hasUnackedGateBypass(workflow) {
-  return (workflow?.humanNotifications || []).some(
-    (n) => typeof n?.id === "string" && n.id.startsWith("notif_gate_bypass_") && !n.acknowledged
-  );
+  return (workflow?.humanNotifications || []).some((n) => isGateBypassNotif(n) && !n.acknowledged);
+}
+
+/**
+ * TEAM-4099 F1 — the ACCEPTED-bypass state.
+ *
+ * An unacked gate-bypass escalation holds the run open (that is the point). But
+ * acking it must MEAN something: before, ack simply removed the block and the run
+ * closed GREEN over a merge nobody approved, while an escalation that could never
+ * be acked (the `kind`-shaped notification) deadlocked the run forever. The third
+ * state is: a human saw the bypass and accepted it — the code IS merged, so the
+ * run is finished, but it closes on an honest blocked outcome that names the PR,
+ * never `complete`.
+ */
+export function ackedGateBypasses(workflow) {
+  return (workflow?.humanNotifications || []).filter((n) => isGateBypassNotif(n) && n.acknowledged);
+}
+
+/** The blockReason for an accepted bypass: names the PR and the merge commit. */
+export function gateBypassBlockReason(notifications = []) {
+  const list = Array.isArray(notifications) ? notifications : [];
+  const first = list[0] || {};
+  const sha7 = String(first.mergeCommit || "").slice(0, 7) || "unknown commit";
+  const pr = first.prUrl || "unknown PR";
+  const more = list.length > 1 ? ` (+${list.length - 1} more merge(s))` : "";
+  return `gate bypass accepted: PR ${pr} merged ${sha7} before approval${more}`;
 }

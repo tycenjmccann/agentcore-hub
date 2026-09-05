@@ -30,6 +30,8 @@ import {
   parkClaim,
   setProtectionCheck,
   setDagAudit,
+  // TEAM-4099 F2
+  claimGateBypassFlag,
 } from "./workflow-store.mjs";
 import { isLeaseLive } from "./lease.mjs";
 
@@ -43,6 +45,9 @@ import { isLeaseLive } from "./lease.mjs";
 
 const sent = [];
 let failNextCondition = false;
+// Some ops make TWO conditional attempts internally (claimGateBypassFlag: stamp,
+// then track, then re-stamp), so the loser cases need more than one failure.
+let failConditionCount = 0;
 
 const stubDdb = {
   async send(cmd) {
@@ -65,8 +70,9 @@ const stubDdb = {
       }
     }
     sent.push({ type: cmd.constructor.name, input: cmd.input });
-    if (failNextCondition && cmd.input.ConditionExpression) {
+    if ((failNextCondition || failConditionCount > 0) && cmd.input.ConditionExpression) {
       failNextCondition = false;
+      if (failConditionCount > 0) failConditionCount -= 1;
       const err = new Error("conditional check failed");
       err.name = "ConditionalCheckFailedException";
       throw err;
@@ -78,6 +84,7 @@ const stubDdb = {
 beforeEach(() => {
   sent.length = 0;
   failNextCondition = false;
+  failConditionCount = 0;
   initWorkflowStore(stubDdb, "workflows-test");
 });
 
@@ -246,6 +253,65 @@ describe("mergeTaskMetadataOrTrack", () => {
   it("never seeds an entry when there are no fields to write", async () => {
     expect(await mergeTaskMetadataOrTrack("wf_1", "TEAM-99", { output: undefined })).toBe(false);
     expect(writes()).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4099 F2 — the gate-bypass flag claim: the FIRST write on the flag path,
+ * so the detector's event/status-flip/escalation happen at most once no matter how
+ * many cascades observe the same unapproved merge.
+ */
+describe("claimGateBypassFlag", () => {
+  it("stamps only when the entry exists and is not already flagged", async () => {
+    const res = await claimGateBypassFlag("wf_1", "TEAM-2", {
+      mergeCommit: "cafebabe",
+      flaggedAt: "2026-09-05T12:00:00Z",
+    });
+    expect(res).toEqual({ won: true });
+    expect(writes()).toHaveLength(1);
+    const { input } = writes()[0];
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#at)"
+    );
+    expect(input.UpdateExpression).toBe("SET agentTasks.#tid.#at = :ts, agentTasks.#tid.#sha = :sha");
+    expect(input.ExpressionAttributeNames).toEqual({
+      "#tid": "TEAM-2",
+      "#at": "gateBypassFlaggedAt",
+      "#sha": "gateBypassMergeCommit",
+    });
+    expect(input.ExpressionAttributeValues).toEqual({ ":ts": "2026-09-05T12:00:00Z", ":sha": "cafebabe" });
+  });
+
+  it("shadow mode stamps SHADOW-scoped fields — never the F8 veto field", async () => {
+    expect(await claimGateBypassFlag("wf_1", "TEAM-2", { mergeCommit: "cafebabe", shadow: true })).toEqual({ won: true });
+    const { input } = writes()[0];
+    expect(input.ExpressionAttributeNames["#at"]).toBe("gateBypassShadowAt");
+    expect(input.ExpressionAttributeNames["#sha"]).toBe("gateBypassShadowCommit");
+    // claimInvocation's veto keys off gateBypassFlaggedAt: writing it in shadow
+    // would make a merely-measured ticket permanently un-reclaimable.
+    expect(JSON.stringify(input)).not.toContain("gateBypassFlaggedAt");
+  });
+
+  it("a second claimant loses: no stamp, and the caller is told to stand down", async () => {
+    // Both the stamp AND the seeding track fail — the entry exists and is stamped.
+    failConditionCount = 2;
+    expect(await claimGateBypassFlag("wf_1", "TEAM-2", { mergeCommit: "cafebabe" })).toEqual({ won: false });
+    const stamps = writes().filter((c) => String(c.input.UpdateExpression).includes("#at"));
+    expect(stamps).toHaveLength(1); // tried once, refused, never retried
+  });
+
+  it("an UNTRACKED ticket is seeded first-writer-wins, then stamped", async () => {
+    failConditionCount = 1; // only the first stamp fails (no entry yet)
+    expect(await claimGateBypassFlag("wf_1", "TEAM-99", { mergeCommit: "cafebabe" })).toEqual({ won: true });
+    const seed = writes().find((c) => c.input.ConditionExpression === "attribute_not_exists(agentTasks.#tid)");
+    expect(seed.input.ExpressionAttributeValues[":task"]).toMatchObject({ ticketId: "TEAM-99", status: "pending" });
+    const stamps = writes().filter((c) => String(c.input.UpdateExpression).includes("#at"));
+    expect(stamps).toHaveLength(2); // refused, seeded, then stamped
+  });
+
+  it("a non-conditional DDB failure propagates (never a silent 'won')", async () => {
+    initWorkflowStore({ async send() { throw new Error("throughput exceeded"); } }, "workflows-test");
+    await expect(claimGateBypassFlag("wf_1", "TEAM-2", {})).rejects.toThrow("throughput exceeded");
   });
 });
 

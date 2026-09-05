@@ -260,6 +260,60 @@ export async function setTaskStatus(workflowId, ticketId, status) {
 }
 
 /**
+ * TEAM-4099 F2 — claim the right to flag ONE ticket for gate bypass.
+ *
+ * The detector used to publish `workflow.gate_bypass`, flip the task to
+ * `in_review` and escalate BEFORE any conditional write, so two concurrent
+ * cascades (the original done racing a re-Done, or the reconcile sweep racing a
+ * live cascade) each published the event and each re-flipped the task. This is
+ * now the FIRST write on the flag path: stamp `gateBypassFlaggedAt` ONLY IF the
+ * entry exists and is not already stamped. Losing the CAS means another actor
+ * already owns the flag, so the caller returns without side effects.
+ *
+ * `shadow: true` stamps observation-only fields instead
+ * (`gateBypassShadowAt`/`gateBypassShadowCommit`): shadow mode must NEVER write
+ * `gateBypassFlaggedAt`, because claimInvocation's veto (F8) makes a stamped
+ * ticket permanently un-claimable — that is enforcement, not measurement.
+ *
+ * A ticket whose agent died before any claim landed has no agentTasks entry at
+ * all, and DynamoDB cannot distinguish "no entry" from "already stamped". So,
+ * mirroring mergeTaskMetadataOrTrack: on a lost CAS seed the entry via
+ * trackTicket (first-writer-wins) and retry ONLY when this call created it —
+ * otherwise the entry existed, which means the stamp was already there.
+ * Returns { won } — true when THIS caller owns the flag.
+ */
+export async function claimGateBypassFlag(workflowId, ticketId, { mergeCommit = "", flaggedAt, shadow = false } = {}) {
+  const stampedAt = shadow ? "gateBypassShadowAt" : "gateBypassFlaggedAt";
+  const commitField = shadow ? "gateBypassShadowCommit" : "gateBypassMergeCommit";
+  const ts = flaggedAt || new Date().toISOString();
+  const stamp = async () => {
+    try {
+      await _ddb.send(new UpdateCommand({
+        TableName: _table,
+        Key: { workflowId },
+        UpdateExpression: "SET agentTasks.#tid.#at = :ts, agentTasks.#tid.#sha = :sha",
+        ConditionExpression: "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#at)",
+        ExpressionAttributeNames: { "#tid": ticketId, "#at": stampedAt, "#sha": commitField },
+        ExpressionAttributeValues: { ":ts": ts, ":sha": mergeCommit },
+      }));
+      return true;
+    } catch (err) {
+      if (err.name === "ConditionalCheckFailedException") return false;
+      throw err;
+    }
+  };
+
+  if (await stamp()) return { won: true };
+  const created = await trackTicket(workflowId, ticketId, {
+    ticketId,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+  });
+  if (!created) return { won: false };
+  return { won: await stamp() };
+}
+
+/**
  * TEAM-3991 D2.2 — park an agent's live claim because its ticket was blocked
  * (a fix ticket was filed against it, or a reviewer requested changes). "parked"
  * is deliberately NOT in lease-constants `liveClaimStatuses`, so a parked claim

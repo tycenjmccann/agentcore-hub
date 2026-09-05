@@ -241,8 +241,26 @@ the ticket to a fresh agent and the bypass is laundered into a normal-looking se
 So `claimInvocation` carries `attribute_not_exists(agentTasks.#tid.gateBypassFlaggedAt)` in its
 condition expression: the claim CAS itself REFUSES a flagged task. There is no separate check to
 forget to call, and it composes with the rest of R3 for free — every dispatch path already goes
-through that one CAS. Clearing the flag is a human act (acking the escalation), which is exactly
-where the authority for "yes, proceed anyway" belongs.
+through that one CAS.
+
+TEAM-4099 closed the two holes that left in the FLAGGING path itself. First, the flag is now
+claimed, not merely written: `claimGateBypassFlag(workflowId, ticketId, {mergeCommit, flaggedAt,
+shadow})` stamps it under `attribute_exists(agentTasks.#tid) AND
+attribute_not_exists(agentTasks.#tid.gateBypassFlaggedAt)` and is the FIRST write on the path, so
+the detector's announcement (`workflow.gate_bypass`), the `in_review` flip and the escalation all
+hang off ONE winner. They previously ran before any conditional write, so a re-Done of the flagged
+ticket — which the flip itself invites, since the task is no longer `complete` and the done-cascade
+dedup guard therefore lets it through — re-announced a bypass a human was already handling. Shadow
+mode claims a shadow-scoped attribute instead, because writing the real one would trip the veto
+above and quietly turn "measure only" into enforcement.
+
+Second, the flag is never cleared, and acking the escalation does not clear it: the authority a
+human exercises by acking is "yes, I accept that this merged unapproved", not "pretend it didn't".
+So the run does not resume and does not close green — `completeWorkflow` closes it `deploy-blocked`
+with a blockReason naming the PR and merge commit. Before that third state existed, an acked bypass
+either deadlocked the run forever (the escalation carried `kind` instead of `type`, so no surface
+could list it and no route could ack it) or, once ackable, would have closed it `complete` over a
+merge nobody approved.
 
 The shape generalizes: when a claim needs a state other than live/stale, add an attribute and
 teach the ONE CAS about it — never a second liveness predicate.

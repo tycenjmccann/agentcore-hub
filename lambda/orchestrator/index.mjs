@@ -52,7 +52,12 @@ import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets,
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning, checkBranchProtection } from "./repo-check.mjs";
 import { parseRepoUrl, resolveDefaultBranch, resolveRepoIdentity } from "./default-branch.mjs";
-import { runGateBypassCheck, hasUnackedGateBypass } from "./gate-bypass.mjs";
+import {
+  runGateBypassCheck,
+  hasUnackedGateBypass,
+  ackedGateBypasses,
+  gateBypassBlockReason,
+} from "./gate-bypass.mjs";
 import {
   synthesizeCompletion,
   findTicketPullRequest,
@@ -1083,9 +1088,13 @@ async function gateBypassCheck(workflow, ticket, children) {
  *   (a) re-evaluate every merge that was DEFERRED inside its grace window (by
  *       completion time the window has long elapsed, so a real bypass can't slip
  *       out on a deferral);
- *   (b) refuse to close GREEN while any gate-bypass escalation is unacked.
- * Returns true when completion must NOT proceed. A bypass is a human-ack
- * condition, not a terminal outcome — the run stays open, no fabricated close.
+ *   (b) while any gate-bypass escalation is unacked → `{ blocked: true }`:
+ *       completion must NOT proceed. A bypass is a human-ack condition, not a
+ *       terminal outcome — the run stays open, no fabricated close.
+ *   (c) TEAM-4099 F1 — once a human HAS acked it → `{ accepted, notifications }`:
+ *       the block lifts, but the run may never close green over a merge nobody
+ *       approved. The caller closes it BLOCKED, naming the PR.
+ * Never throws: fails open (`{}`) so a transient can't stall a legitimate close.
  */
 /**
  * The def's review-gate entry a human gate ticket guards, resolved by GUARDED
@@ -1195,7 +1204,7 @@ async function recomputeRun(workflow, epicId, trigger) {
   }
 }
 
-async function gateBypassBlocksCompletion(workflow) {
+async function gateBypassCompletionVerdict(workflow) {
   try {
     let fresh = (await store.getWorkflow(workflow.id)) || workflow;
     const deferred = Object.entries(fresh.agentTasks || {}).filter(([, e]) => e?.gateBypassCheckAt);
@@ -1208,7 +1217,11 @@ async function gateBypassBlocksCompletion(workflow) {
       }
       fresh = (await store.getWorkflow(workflow.id)) || fresh;
     }
-    if (!hasUnackedGateBypass(fresh)) return false;
+    if (!hasUnackedGateBypass(fresh)) {
+      // TEAM-4099 F1: acked ⇒ accepted, NOT forgiven. The caller closes blocked.
+      const acked = ackedGateBypasses(fresh);
+      return acked.length > 0 ? { accepted: true, notifications: acked } : {};
+    }
 
     const open = (fresh.humanNotifications || []).filter(
       (n) => typeof n?.id === "string" && n.id.startsWith("notif_gate_bypass_") && !n.acknowledged
@@ -1237,11 +1250,11 @@ async function gateBypassBlocksCompletion(workflow) {
     console.warn(
       `[orchestrator] ${fresh.id}: completion refused — ${open.length} unacked gate-bypass escalation(s) (${ticketIds.join(", ")})`
     );
-    return true;
+    return { blocked: true, notifications: open };
   } catch (err) {
     // Fail OPEN: never turn a legitimate completion into a stall on a transient.
     console.warn(`[orchestrator] gate-bypass completion guard skipped for ${workflow?.id}: ${err?.message || err}`);
-    return false;
+    return {};
   }
 }
 
@@ -3830,7 +3843,17 @@ export async function completeWorkflow(workflow) {
   // can PROVE the branch is unmerged. Opt-out: SHIP_MERGE_VERIFY=off.
   // TEAM-3991 D1.1 (F10) — re-evaluate deferred merges and refuse a GREEN close
   // while a merge-without-approval escalation is unacked. The run stays open.
-  if (await gateBypassBlocksCompletion(workflow)) return;
+  // TEAM-4099 F1 — and when a human HAS acked it, the run closes on an honest
+  // blocked outcome naming the PR instead of either deadlocking forever (the
+  // escalation used to be un-ackable) or closing green over an unapproved merge.
+  const gateBypass = await gateBypassCompletionVerdict(workflow);
+  if (gateBypass.blocked) return;
+  if (gateBypass.accepted) {
+    const blockReason = gateBypassBlockReason(gateBypass.notifications);
+    console.error(`[orchestrator] ${workflow.id}: closing deploy-blocked — ${blockReason}`);
+    await closeWorkflowBlocked(workflow, { outcome: "deploy-blocked", blockReason, offenders: [], openGate: null });
+    return;
+  }
 
   // TEAM-3991 D1.4 — LAST gate before any green close: is a human gate still open?
   // wf 1pl3h1 closed `complete` with TEAM-3757 ("Escalation #1 …") sitting

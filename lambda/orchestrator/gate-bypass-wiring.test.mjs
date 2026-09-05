@@ -27,6 +27,8 @@ const h = vi.hoisted(() => ({
     ebEvents: /** @type {any[]} */ ([]),
     statuses: /** @type {any[]} */ ([]),
     merges: /** @type {any[]} */ ([]),
+    claims: /** @type {any[]} */ ([]),
+    flagsHeld: /** @type {Set<string>} */ (new Set()),
     notifications: /** @type {any[]} */ ([]),
     // GitHub: `GET <path>` per call, and the merged-PR list served to the
     // `head=`/`base=` closed-PR queries.
@@ -115,8 +117,25 @@ vi.mock("./workflow-store.mjs", () => ({
   // The detector's write seam: the task entry may predate the run's agentTasks
   // map, so it uses the track-or-merge variant (R2 — named store fn per attribute).
   mergeTaskMetadataOrTrack: vi.fn(async (wfId, tid, fields) => { h.state.merges.push({ wfId, tid, fields, via: "orTrack" }); }),
+  // TEAM-4099 F2 — the CAS that must land BEFORE any observable side effect.
+  // One winner per (workflow, ticket, scope); `h.state.flagsHeld` survives across
+  // handler calls within a test so a re-Done really loses the claim.
+  claimGateBypassFlag: vi.fn(async (wfId, tid, opts = {}) => {
+    h.state.claims.push({ wfId, tid, ...opts });
+    const key = `${wfId}/${tid}/${opts.shadow ? "shadow" : "flag"}`;
+    if (h.state.flagsHeld.has(key)) return { won: false };
+    h.state.flagsHeld.add(key);
+    return { won: true };
+  }),
   setTaskStatus: vi.fn(async (wfId, tid, status) => { h.state.statuses.push({ wfId, tid, status }); }),
-  appendNotificationOnce: vi.fn(async (wfId, n) => { h.state.notifications.push({ wfId, n }); return true; }),
+  // Mirrors the real contract: id-idempotent while the row is unacked, and only
+  // the caller that actually appended gets `true` (TEAM-4099 leans on this — the
+  // escalation append is the one step a CAS loser is allowed to retry).
+  appendNotificationOnce: vi.fn(async (wfId, n) => {
+    if (h.state.notifications.some((x) => x.n?.id === n.id && !x.n?.acknowledged)) return false;
+    h.state.notifications.push({ wfId, n });
+    return true;
+  }),
   appendNotification: vi.fn(async (wfId, n) => { h.state.notifications.push({ wfId, n }); }),
   appendReviewNotificationOnce: vi.fn(async () => true),
   ackNotifications: vi.fn(async () => {}),
@@ -230,6 +249,8 @@ beforeEach(() => {
   h.state.statuses.length = 0;
   h.state.merges.length = 0;
   h.state.notifications.length = 0;
+  h.state.claims.length = 0;
+  h.state.flagsHeld.clear();
   h.state.ghCalls.length = 0;
   h.state.headPrs = [];
   h.state.basePrs = [];
@@ -272,20 +293,24 @@ describe("done cascade runs the gate-bypass detector (D1.1 wiring)", () => {
       mode: "enforce",
     });
 
-    // enforce: the task goes back to in_review and is flagged un-reclaimable (F8).
+    // enforce: the task goes back to in_review and is flagged un-reclaimable (F8),
+    // the flag landing through the TEAM-4099 F2 claim CAS rather than a blind merge.
     expect(h.state.statuses).toEqual([{ wfId: "wf_1", tid: DEV_TICKET, status: "in_review" }]);
-    const flag = h.state.merges.find((m) => m.fields.gateBypassFlaggedAt);
-    expect(flag).toMatchObject({ wfId: "wf_1", tid: DEV_TICKET, via: "orTrack" });
-    expect(flag.fields.gateBypassMergeCommit).toBe(MERGE_COMMIT);
+    expect(h.state.merges.some((m) => m.fields.gateBypassFlaggedAt)).toBe(false);
+    expect(h.state.claims).toEqual([
+      { wfId: "wf_1", tid: DEV_TICKET, mergeCommit: MERGE_COMMIT, flaggedAt: expect.any(String), shadow: false },
+    ]);
 
-    // One escalation per offending merge commit (F9), through the CAS-guarded seam.
+    // One escalation per offending merge commit (F9), through the CAS-guarded seam,
+    // in the shape every escalation consumer selects on (TEAM-4099 F1).
     expect(h.state.notifications).toHaveLength(1);
     expect(h.state.notifications[0].n).toMatchObject({
       id: `notif_gate_bypass_wf_1_${MERGE_COMMIT}`,
-      kind: "manager_escalation",
+      type: "manager_escalation",
+      acknowledged: false,
       ticketId: DEV_TICKET,
     });
-    expect(h.state.notifications[0].n.message).toMatch(/no APPROVE recorded/);
+    expect(h.state.notifications[0].n.details).toMatch(/no APPROVE recorded/);
 
     // The work DID happen — the completion is still announced, but marked.
     const complete = eventsOfType("agent.complete");
@@ -329,6 +354,55 @@ describe("done cascade runs the gate-bypass detector (D1.1 wiring)", () => {
     expect(eventsOfType("workflow.gate_bypass")).toHaveLength(1);
   });
 
+  // TEAM-4099 F1/F2 — the flag flips the task to in_review, so the ticket can be
+  // Done again (and the reconcile sweep re-drives done tickets), which re-entered
+  // this path and re-published everything. Whether or not the caller's snapshot
+  // already shows the flag, the second pass must be silent.
+  it("re-Done of an already-flagged ticket: no second event, no second flip, no second escalation", async () => {
+    await load();
+    h.state.headPrs = [mergedPr()];
+
+    await handleTicketDoneUnified(DEV_TICKET);
+    expect(eventsOfType("workflow.gate_bypass")).toHaveLength(1);
+    // What the flag left behind, as the next read would see it: the task is back
+    // in_review (so the "already complete" dedup guard no longer short-circuits
+    // the cascade — this is exactly why a re-Done reaches the detector again) and
+    // carries the flag stamp.
+    Object.assign(h.state.workflow.agentTasks[DEV_TICKET], {
+      status: "in_review",
+      gateBypassFlaggedAt: "2026-09-01T10:05:00Z",
+      gateBypassMergeCommit: MERGE_COMMIT,
+    });
+    h.state.workflow.humanNotifications = h.state.notifications.map((n) => n.n);
+    h.state.ebEvents.length = 0;
+
+    await handleTicketDoneUnified(DEV_TICKET);
+
+    expect(eventsOfType("workflow.gate_bypass")).toHaveLength(0);
+    expect(h.state.statuses).toHaveLength(1);
+    expect(h.state.notifications).toHaveLength(1);
+    // The completion is still announced — the work really did happen.
+    expect(eventsOfType("agent.complete")).toHaveLength(1);
+  });
+
+  it("re-Done on a STALE snapshot (flag not yet visible): the claim CAS still stops it", async () => {
+    await load();
+    h.state.headPrs = [mergedPr()];
+
+    await handleTicketDoneUnified(DEV_TICKET);
+    h.state.ebEvents.length = 0;
+    // The status flip is visible (the dedup guard lets the cascade through) but
+    // the flag stamp is NOT: the caller's snapshot predates it, so the cheap
+    // short-circuit misses and only claimGateBypassFlag can stop the re-publish.
+    h.state.workflow.agentTasks[DEV_TICKET].status = "in_review";
+    await handleTicketDoneUnified(DEV_TICKET);
+
+    expect(eventsOfType("workflow.gate_bypass")).toHaveLength(0);
+    expect(h.state.claims).toHaveLength(2); // both passes tried the CAS
+    expect(h.state.statuses).toHaveLength(1);
+    expect(h.state.notifications).toHaveLength(1);
+  });
+
   it("shadow mode: the event only — zero writes to the task or the run", async () => {
     process.env.GATE_BYPASS_MODE = "shadow";
     await load();
@@ -340,6 +414,11 @@ describe("done cascade runs the gate-bypass detector (D1.1 wiring)", () => {
     expect(h.state.statuses).toHaveLength(0);
     expect(h.state.merges.some((m) => m.fields.gateBypassFlaggedAt)).toBe(false);
     expect(h.state.notifications).toHaveLength(0);
+    // TEAM-4099 F2: shadow's claim is SHADOW-scoped — writing gateBypassFlaggedAt
+    // here would trip the F8 claimInvocation veto, i.e. shadow would enforce.
+    expect(h.state.claims).toEqual([
+      { wfId: "wf_1", tid: DEV_TICKET, mergeCommit: MERGE_COMMIT, flaggedAt: expect.any(String), shadow: true },
+    ]);
     // Still announced as complete, still marked (the merge is real either way).
     expect(eventsOfType("agent.complete")[0].detail.gateBypass).toBe(true);
   });
