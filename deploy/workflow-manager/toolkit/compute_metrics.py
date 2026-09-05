@@ -215,6 +215,47 @@ def compute_tokens(events, missing):
     return {"totalInput": total_in, "totalOutput": total_out, "byAgent": by_agent}
 
 
+def compute_interventions_by_type(events):
+    """TEAM-3991 D2.4 — split every intervention into MANUAL vs AUTOMATIC.
+
+    `managerInterventions` already lists what a human (or the Workflow Manager on
+    their behalf) did, but the run analysis had no way to see the other half: the
+    recoveries the orchestrator performed by itself. Those two numbers together are
+    the actual health signal. A run that finished with 6 manual interventions is a
+    pipeline that cannot self-heal; a run that finished with 6 automatic ones and 0
+    manual is the same pipeline working as designed. Reporting only the manual side
+    made every self-healed run look untouched, and every fragile run look like an
+    operator problem.
+
+    `manual` is keyed by the intervention's own action (dispatch/unstick/retry/
+    mark_done/...), so a new toolkit verb appears without a change here.
+    """
+    manual = {}
+    for e in events_of(events, "manager.intervention"):
+        action = detail(e).get("action") or "unknown"
+        manual[action] = manual.get(action, 0) + 1
+
+    # Automatic recoveries, one bucket per mechanism (the same vocabulary the
+    # orchestrator publishes):
+    #   unblocked   — the cascade released a dependent when its blocker closed
+    #   recompute    — a whole-run re-evaluation found work that was runnable
+    #   redispatch   — a dead session was detected and the ticket re-driven
+    #   synthesized  — an agent died after shipping; its evidence was harvested
+    #   gate_bypass  — a merge without approval was caught
+    redispatch = len([
+        e for e in events_of(events, "agent.error", "error")
+        if str(detail(e).get("reason") or detail(e).get("error") or "").find("dead_session") >= 0
+    ]) + len(events_of(events, "agent.stalled"))
+    automatic = {
+        "unblocked": len(events_of(events, "orchestrator.unblocked")),
+        "recompute": len(events_of(events, "orchestrator.recompute")),
+        "redispatch": redispatch,
+        "synthesized": len(events_of(events, "agent.completion_synthesized")),
+        "gate_bypass": len(events_of(events, "workflow.gate_bypass")),
+    }
+    return {"manual": manual, "automatic": automatic}
+
+
 def compute_metrics(dossier):
     workflow = dossier.get("workflow") or {}
     tickets = dossier.get("tickets") or []
@@ -244,6 +285,7 @@ def compute_metrics(dossier):
         "fixTickets": {"count": len(fix_ids), "ticketIds": fix_ids},
         "nudgeCount": len(events_of(events, "workflow.nudge", "nudge")),
         "managerInterventions": interventions,
+        "interventionsByType": compute_interventions_by_type(events),
         "errors": [
             {"agentId": detail(e).get("agentId"), "error": detail(e).get("error"),
              "at": e.get("timestamp")}

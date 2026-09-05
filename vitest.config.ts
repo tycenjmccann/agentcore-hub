@@ -154,6 +154,11 @@ export default defineConfig({
       // idempotency. AWS SDK clients mocked at the module seam, same shape as
       // agent-invoker-retry.
       "lambda/agentcore-hub-pipeline-tools/index.test.mjs",
+      // workflow-output report_completion (TEAM-3991 F17/F18) — the ownership
+      // guard and the server-stamped `source`. Drives the real handler with the
+      // S3/Lambda/DDB clients mocked at the module seam, same shape as
+      // agentcore-hub-pipeline-tools/index.test.mjs.
+      "lambda/workflow-output/report-completion.test.mjs",
       // pipeline-enabled (TEAM-3738, same defect class as TEAM-3723) — the
       // orchestrator's PIPELINE_ENABLED predicate that gates the "## Pipeline
       // Mode" context block. Lives in its own side-effect-free pipeline-enabled.mjs

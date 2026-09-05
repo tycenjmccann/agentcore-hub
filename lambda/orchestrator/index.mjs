@@ -383,6 +383,16 @@ function getReconcileSweep() {
     cascade: getCascade(),
     getChildTickets,
     leaseTtlMs: LEASE_TTL_MS,
+    // TEAM-3991 D2.3 — the two extra sweep steps. Both are INJECTED so the sweep
+    // module stays AWS-free and testable, and both are single calls into logic
+    // that already exists here (never a re-implementation).
+    gateBypassRecheck: async (workflow, ticketId) => {
+      const children = await getChildTickets(workflow.epicId);
+      const ticket = children.find((t) => t.ticketId === ticketId) || (await getTicket(ticketId));
+      if (!ticket) return null;
+      return gateBypassCheck(workflow, ticket, children);
+    },
+    retryEpicRollup: retryPendingEpicRollups,
   });
   return _reconcileSweep;
 }

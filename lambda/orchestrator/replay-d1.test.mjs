@@ -221,3 +221,106 @@ describe("AC-D1.2 replay — xm2bmz (5 mixed tickets, correct per-class handling
     expect(manualEvents(publishEvent)).toHaveLength(0);
   });
 });
+
+/**
+ * TEAM-3991 D2.2 replay — 1pl3h1 (a parked origin whose FIX closes).
+ *
+ * The D2.2 edge in the other direction. When an agent files a fix ticket and
+ * parks, the origin becomes `blockedBy` its own fix (tickets-edge.test.mjs pins
+ * the write side). In prod 1pl3h1 that edge did not exist, so when the fixes
+ * TEAM-3744/TEAM-3745 closed, nothing linked them back to the parked origins —
+ * TEAM-3727 (twice, it parked in two separate rounds) and TEAM-3726 sat blocked
+ * until a human dispatched them by hand, three times.
+ *
+ * With the edge in place the fixes' own done events are ordinary cascade input:
+ * each origin is `blocked` with all blockers resolved, so the commit-4a path
+ * transitions it to Ready and journals orchestrator.unblocked. The assertion that
+ * matters is the same one as every other replay here — ZERO manager dispatches.
+ *
+ * The companion sffzti replay (TEAM-3799 re-driven by the escalation-decision
+ * recompute) lives in recompute-park.test.mjs — "sffzti shape: a decided
+ * escalation gate re-drives TEAM-3799 through the cascade, with ZERO manager
+ * dispatches" — because it needs the REAL index.mjs handler, not this DI harness.
+ */
+describe("D2.2 replay — 1pl3h1 (parked origins re-woken by their fix tickets, 0 manual)", () => {
+  const FIXES = { "TEAM-3744": "TEAM-3727", "TEAM-3745": "TEAM-3726" };
+
+  // The fixes themselves are freshly-claimed work (an agent is on them right
+  // now), so the sweep must not treat them as candidates either.
+  const FRESH = new Date(NOW - 30 * 1000).toISOString();
+
+  /** Origins parked blocked on their fix; the named fix already closed. */
+  const snapshotWith = (closedFix) => [
+    { ticketId: "TEAM-3744", title: "Fix: build breaks on the dev branch", type: "task", assignee: "dev",
+      status: closedFix === "TEAM-3744" ? "done" : "in_progress", spawnedBy: "TEAM-3727", updatedAt: FRESH },
+    { ticketId: "TEAM-3745", title: "Fix: contract mismatch in the API stub", type: "task", assignee: "dev",
+      status: closedFix === "TEAM-3745" ? "done" : "in_progress", spawnedBy: "TEAM-3726", updatedAt: FRESH },
+    { ticketId: "TEAM-3727", status: "blocked", assignee: "dev", type: "task", blockedBy: ["TEAM-3744"], updatedAt: STALE },
+    { ticketId: "TEAM-3726", status: "blocked", assignee: "dev", type: "task", blockedBy: ["TEAM-3745"], updatedAt: STALE },
+  ];
+
+  const workflow = { id: "1pl3h1", workflowId: "1pl3h1", epicId: "EPIC-1PL", phase: "development", updatedAt: STALE };
+
+  it("each fix's done re-wakes exactly its own origin — no cross-talk, no manual dispatch", async () => {
+    for (const [fix, origin] of Object.entries(FIXES)) {
+      const { cascade, publishEvent } = makeCascade({ siblings: snapshotWith(fix), workflow });
+
+      const unblocked = await cascade.cascadeUnblock(fix, "EPIC-1PL", workflow);
+
+      // Only this fix's origin moves; the other origin's blocker is still open.
+      expect(unblocked).toEqual([origin]);
+      const events = eventsOfType(publishEvent, "orchestrator.unblocked");
+      expect(events).toHaveLength(1);
+      expect(events[0][2]).toMatchObject({ ticketId: origin, unblockedBy: fix, workflowId: "1pl3h1" });
+      expect(manualEvents(publishEvent)).toHaveLength(0);
+    }
+  });
+
+  it("TEAM-3727's SECOND park round re-wakes the same way — the recovery is not one-shot", async () => {
+    // It parked twice in prod; the second round is the one a human had already
+    // learned to expect. Same edge, same automatic recovery.
+    const round2 = [
+      { ticketId: "TEAM-3746", title: "Fix: flaky integration test", type: "task", assignee: "dev", status: "done", spawnedBy: "TEAM-3727" },
+      { ticketId: "TEAM-3727", status: "blocked", assignee: "dev", type: "task", blockedBy: ["TEAM-3744", "TEAM-3746"], updatedAt: STALE },
+    ];
+    const { cascade, publishEvent } = makeCascade({
+      siblings: [...round2, { ticketId: "TEAM-3744", status: "done", type: "task" }],
+      workflow,
+    });
+
+    expect(await cascade.cascadeUnblock("TEAM-3746", "EPIC-1PL", workflow)).toEqual(["TEAM-3727"]);
+    expect(manualEvents(publishEvent)).toHaveLength(0);
+  });
+
+  it("the sweep is a no-op safety net here — it never re-dispatches a still-blocked origin", async () => {
+    // Both fixes still open: every origin has an unresolved blocker, so the sweep
+    // must leave them alone and SAY so (blockers_pending), not dispatch over a
+    // fix that hasn't landed.
+    const { runSweep, redispatch } = makeSweep({ workflow, siblings: snapshotWith(null) });
+
+    const m = await runSweep("enforce");
+
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(m.skipped.blockers_pending).toBe(2);
+    expect(m.acted).toBe(0);
+    expect(m.scanned).toBe(Object.values(m.skipped).reduce((a, b) => a + b, 0));
+  });
+
+  it("once a fix lands, the sweep alone recovers the origin (missed-event path)", async () => {
+    // The belt to the cascade's braces: if the fix's done event is lost, the
+    // origin is a plain blocked-with-resolved-blockers candidate and the sweep
+    // readies it.
+    const { runSweep, publishEvent, redispatch, lease } = makeSweep({ workflow, siblings: snapshotWith("TEAM-3744") });
+
+    const m = await runSweep("enforce");
+
+    // blocked-with-resolved-blockers goes straight through the claim CAS — there
+    // is no live claim to steal, so the origin is dispatched, not stolen.
+    expect(redispatch.mock.calls.map((c) => c[1].ticketId)).toEqual(["TEAM-3727"]);
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(m.acted).toBe(1);
+    expect(m.redispatched).toBe(1);
+    expect(m.skipped.blockers_pending).toBe(1); // TEAM-3726, its fix still open
+    expect(manualEvents(publishEvent)).toHaveLength(0);
+  });
+});
