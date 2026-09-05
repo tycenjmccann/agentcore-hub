@@ -1,0 +1,299 @@
+import { describe, it, expect } from "vitest";
+import { validateSourcesShape, formatSourceDisplay, sourcesForDisplay, MAX_INTAKE_SOURCES } from "./source-shape";
+
+/**
+ * TEAM-4078 regression suite.
+ *
+ * F1: POST /api/workflow/start accepted `sources:[{ type:"upload", value:null }]`
+ *     (no shape check on req.json()), persisted it verbatim, and the workflow
+ *     board then threw "Cannot read properties of null (reading 'length')"
+ *     reading src.value.length. A non-string `type` threw "Objects are not valid
+ *     as a React child".
+ * F2: the board built its visible text from the RAW value —
+ *     slice(0,40)+"…"+slice(-23) — so the last 23 characters of a presigned URL
+ *     (the tail of X-Amz-Signature) were rendered, and a URL of ≤64 chars was
+ *     rendered whole.
+ *
+ * The board itself is not rendered here: vitest runs environment:"node" with no
+ * jsdom and no @testing-library/react in the repo (see vitest.config.ts), so the
+ * render logic lives in formatSourceDisplay and is pinned directly.
+ */
+
+// A realistic presigned URL. SECRETSIG… is the signature; SIGHEX is the tail
+// slice(-23) used to lift out of the raw string.
+const SIGNATURE = "SECRETSIG0123456789abcdef";
+const PRESIGNED =
+  "https://b.s3.amazonaws.com/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=" + SIGNATURE;
+
+describe("validateSourcesShape — the start-route front door (F1a)", () => {
+  it("accepts an absent sources field (the route coalesces it to [])", () => {
+    expect(validateSourcesShape(undefined)).toBeNull();
+    expect(validateSourcesShape(null)).toBeNull();
+    expect(validateSourcesShape([])).toBeNull();
+  });
+
+  it("accepts the shapes the MCP IntakeSourceSchema accepts", () => {
+    expect(
+      validateSourcesShape([
+        { type: "url", value: "https://example.com/x" },
+        { type: "s3", value: "s3://bucket/key", label: "spec", contentType: "application/json" },
+        // verification is output-only; the server discards it, so any shape is fine here.
+        { type: "upload", value: "upload-1", verification: { status: "verified" } },
+      ])
+    ).toBeNull();
+  });
+
+  it("rejects a non-array sources", () => {
+    expect(validateSourcesShape("not-an-array")).toMatch(/must be an array/);
+    expect(validateSourcesShape({ type: "url", value: "https://x/y" })).toMatch(/must be an array/);
+    expect(validateSourcesShape(7)).toMatch(/must be an array/);
+  });
+
+  it("rejects a null value — the exact payload that crashed the board", () => {
+    const err = validateSourcesShape([{ type: "upload", value: null }]);
+    expect(err).toBe('sources[0].value must be a non-empty string');
+  });
+
+  it("rejects an empty-string value (mirrors z.string().min(1))", () => {
+    expect(validateSourcesShape([{ type: "url", value: "" }])).toMatch(/non-empty string/);
+  });
+
+  it("rejects a non-string value of any other type", () => {
+    for (const value of [0, 42, true, {}, [], undefined]) {
+      expect(validateSourcesShape([{ type: "url", value }])).toMatch(/sources\[0\]\.value/);
+    }
+  });
+
+  it("rejects a non-string type — the 'Objects are not valid as a React child' payload", () => {
+    expect(validateSourcesShape([{ type: {}, value: "https://x/y" }])).toMatch(/sources\[0\]\.type/);
+    expect(validateSourcesShape([{ value: "https://x/y" }])).toMatch(/sources\[0\]\.type/);
+  });
+
+  it("rejects a type outside the enum, mirroring z.enum(['url','upload','s3'])", () => {
+    const err = validateSourcesShape([{ type: "ftp", value: "ftp://x/y" }]);
+    expect(err).toBe('sources[0].type must be one of "url" | "upload" | "s3"');
+  });
+
+  it("rejects a non-object item", () => {
+    expect(validateSourcesShape(["https://example.com/x"])).toMatch(/sources\[0\] must be an object/);
+    expect(validateSourcesShape([null])).toMatch(/sources\[0\] must be an object/);
+    expect(validateSourcesShape([["url", "https://x/y"]])).toMatch(/sources\[0\] must be an object/);
+  });
+
+  it("rejects non-string optional fields", () => {
+    expect(validateSourcesShape([{ type: "url", value: "https://x/y", label: {} }])).toMatch(/label/);
+    expect(validateSourcesShape([{ type: "url", value: "https://x/y", contentType: 5 }])).toMatch(/contentType/);
+  });
+
+  it("names the offending index so a batch submission is debuggable", () => {
+    const err = validateSourcesShape([
+      { type: "url", value: "https://ok/1" },
+      { type: "url", value: "https://ok/2" },
+      { type: "upload", value: null },
+    ]);
+    expect(err).toMatch(/^sources\[2\]\./);
+  });
+
+  // TEAM-4091 F3: validateIntakeSources fans every source out CONCURRENTLY, each
+  // costing up to two 10s outbound GETs or an S3 HeadObject, on a route with no
+  // auth — so the count itself has to be bounded at the front door.
+  it("rejects more than MAX_INTAKE_SOURCES sources, even when every one is well-formed", () => {
+    const sources = Array.from({ length: MAX_INTAKE_SOURCES + 1 }, (_, i) => ({
+      type: "url",
+      value: `https://example.com/${i}`,
+    }));
+    expect(validateSourcesShape(sources)).toBe(`sources must have at most ${MAX_INTAKE_SOURCES} items`);
+  });
+
+  it("accepts exactly MAX_INTAKE_SOURCES sources", () => {
+    const sources = Array.from({ length: MAX_INTAKE_SOURCES }, (_, i) => ({
+      type: "url",
+      value: `https://example.com/${i}`,
+    }));
+    expect(validateSourcesShape(sources)).toBeNull();
+  });
+
+  it("reports the count before the per-item scan, so an oversized batch fails fast", () => {
+    // Item 0 is also malformed; the length message wins because the cap is
+    // checked first (nothing here should walk 10k items to find that out).
+    const sources = [{ type: "upload", value: null }, ...Array.from({ length: 10_000 }, () => ({}))];
+    expect(validateSourcesShape(sources)).toBe(`sources must have at most ${MAX_INTAKE_SOURCES} items`);
+  });
+});
+
+describe("formatSourceDisplay — the board read path (F1b + F2)", () => {
+  it("(i) value:null does not throw and renders a placeholder", () => {
+    const d = formatSourceDisplay({ type: "upload", value: null });
+    expect(d.text).toBe("(invalid)");
+    expect(d.full).toBe("(invalid)");
+    expect(typeof d.text).toBe("string");
+  });
+
+  it("(i) an entirely missing/garbage source does not throw", () => {
+    for (const src of [undefined, null, {}, 5, "x", []]) {
+      expect(() => formatSourceDisplay(src)).not.toThrow();
+      expect(typeof formatSourceDisplay(src).text).toBe("string");
+    }
+  });
+
+  it("(ii) type:{} does not throw and yields a string, never an object", () => {
+    const d = formatSourceDisplay({ type: {}, value: "s3://b/k" });
+    expect(typeof d.type).toBe("string");
+    expect(d.type).toBe("[object Object]");
+  });
+
+  it("(ii) a missing type still yields a string", () => {
+    expect(formatSourceDisplay({ value: "s3://b/k" }).type).toBe("undefined");
+  });
+
+  it("(iii) a presigned URL never puts the signature on screen or in an attribute", () => {
+    const d = formatSourceDisplay({ type: "url", value: PRESIGNED });
+
+    // The whole display object is what reaches the DOM (text + every title=).
+    const rendered = JSON.stringify(d);
+    expect(rendered).not.toContain("SECRETSIG");
+    expect(rendered).not.toContain(SIGNATURE);
+    // ...including the tail the old slice(-23) exposed.
+    expect(rendered).not.toContain(PRESIGNED.slice(-23));
+
+    // Parameter NAMES survive — "it was presigned" is the useful diagnostic.
+    expect(d.full).toContain("X-Amz-Signature=REDACTED");
+    expect(d.full).toContain("X-Amz-Algorithm=REDACTED");
+    expect(d.full).toContain("https://b.s3.amazonaws.com/k");
+  });
+
+  it("(iii) a SHORT presigned URL (≤64 chars) is redacted too — the old code printed it whole", () => {
+    const short = "https://b.s3.aws/k?X-Amz-Signature=" + SIGNATURE;
+    expect(short.length).toBeLessThanOrEqual(64); // the old untruncated branch
+    const d = formatSourceDisplay({ type: "url", value: short });
+    expect(d.text).not.toContain("SECRETSIG");
+    expect(d.text).toBe("https://b.s3.aws/k?X-Amz-Signature=REDACTED");
+  });
+
+  it("(iii) a redacted verification detail carries no signature either", () => {
+    const d = formatSourceDisplay({
+      type: "url",
+      value: PRESIGNED,
+      verification: { status: "unverified", detail: `URL unreachable — GET -> 403: ${PRESIGNED}` },
+    });
+    expect(d.unverified).toBe(true);
+    expect(d.detail).toBeDefined();
+    expect(d.detail).not.toContain("SECRETSIG");
+  });
+
+  it("(iv) a long value is truncated AFTER redaction", () => {
+    const long =
+      "https://bucket.s3.us-east-1.amazonaws.com/very/deep/path/to/a/design/document/spec.pdf" +
+      "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=" + SIGNATURE;
+    const d = formatSourceDisplay({ type: "url", value: long });
+
+    expect(d.text).toContain("…");
+    expect(d.text.length).toBeLessThan(long.length);
+    expect(d.text).not.toContain("SECRETSIG");
+    // The head is the identifying part of the URL; the tail can only ever be a
+    // slice of "…X-Amz-Signature=REDACTED".
+    expect(d.text.startsWith("https://bucket.s3.us-east-1.amazonaws.co")).toBe(true);
+    expect(d.text.endsWith("REDACTED")).toBe(true);
+    // full is the untruncated-but-redacted string behind the tooltip.
+    expect(d.full).toContain("X-Amz-Signature=REDACTED");
+    expect(d.full).not.toContain("…");
+  });
+
+  it("(iv) a value at the truncation boundary is left whole", () => {
+    const v = "s3://bucket/" + "a".repeat(52); // exactly 64
+    expect(v).toHaveLength(64);
+    expect(formatSourceDisplay({ type: "s3", value: v }).text).toBe(v);
+  });
+
+  it("(v) a plain non-URL value passes through unchanged", () => {
+    for (const v of [
+      "s3://agentcore-hub-artifacts-838829463875-us-east-1/uploads/spec.pdf",
+      "designs/mockup.png",
+      "upload-7f3a9c",
+      "a plain sentence with an = sign & an ampersand",
+    ]) {
+      const d = formatSourceDisplay({ type: "s3", value: v });
+      expect(d.full).toBe(v);
+      if (v.length <= 64) expect(d.text).toBe(v);
+    }
+  });
+
+  it("flags unverified only on the exact marker, and redacts the label", () => {
+    expect(formatSourceDisplay({ type: "s3", value: "s3://b/k" }).unverified).toBe(false);
+    expect(
+      formatSourceDisplay({ type: "s3", value: "s3://b/k", verification: { status: "verified" } }).unverified
+    ).toBe(false);
+
+    const labelled = formatSourceDisplay({ type: "url", value: "https://x/y", label: `see ${PRESIGNED}` });
+    expect(labelled.label).not.toContain("SECRETSIG");
+    // A non-string label must not reach a title attribute.
+    expect(formatSourceDisplay({ type: "url", value: "https://x/y", label: {} }).label).toBeUndefined();
+    expect(formatSourceDisplay({ type: "url", value: "https://x/y" }).label).toBeUndefined();
+  });
+
+  it("a non-string verification.detail is dropped rather than rendered", () => {
+    const d = formatSourceDisplay({ type: "url", value: "https://x/y", verification: { status: "unverified", detail: {} } });
+    expect(d.unverified).toBe(true);
+    expect(d.detail).toBeUndefined();
+  });
+});
+
+/**
+ * TEAM-4090 regression suite.
+ *
+ * The board's container check was `(state.input?.sources?.length ?? 0) > 0`,
+ * followed by `state.input.sources.map(...)`. A persisted `input.sources` of a
+ * non-empty STRING or an array-like OBJECT ({ length: 1, 0: {...} }) has a
+ * truthy `.length`, so it passed that guard and then threw
+ * "sources.map is not a function" — blanking the whole board, not just one row.
+ * Only Array.isArray tells `.map` is safe.
+ */
+describe("sourcesForDisplay — the board's array guard on input.sources (TEAM-4090)", () => {
+  it("returns [] for undefined, null, and non-object input", () => {
+    for (const input of [undefined, null, "abc", 5, true]) {
+      expect(sourcesForDisplay(input)).toEqual([]);
+    }
+  });
+
+  it("returns [] when input has no sources field", () => {
+    expect(sourcesForDisplay({})).toEqual([]);
+    expect(sourcesForDisplay({ title: "x" })).toEqual([]);
+  });
+
+  it("returns [] for a non-empty STRING sources — the .map is not a function payload", () => {
+    expect(sourcesForDisplay({ sources: "abc" })).toEqual([]);
+  });
+
+  it("returns [] for an array-like OBJECT sources", () => {
+    expect(sourcesForDisplay({ sources: { length: 1, 0: { type: "url", value: "x" } } })).toEqual([]);
+  });
+
+  it("returns [] for sources = {}", () => {
+    expect(sourcesForDisplay({ sources: {} })).toEqual([]);
+  });
+
+  it("returns the SAME array reference for a real array, including an empty one", () => {
+    const empty: unknown[] = [];
+    expect(sourcesForDisplay({ sources: empty })).toBe(empty);
+
+    const populated = [{ type: "url", value: "https://x/y" }];
+    expect(sourcesForDisplay({ sources: populated })).toBe(populated);
+  });
+
+  it("fail-on-base evidence: the OLD `.length > 0` guard is true for exactly the inputs Array.isArray rejects", () => {
+    const oldGuard = (input: unknown): boolean => {
+      const rec = input as { sources?: { length?: number } } | null | undefined;
+      return ((rec?.sources?.length as number | undefined) ?? 0) > 0;
+    };
+
+    const stringSources = { sources: "abc" };
+    const arrayLikeSources = { sources: { length: 1, 0: { type: "url", value: "x" } } };
+
+    for (const input of [stringSources, arrayLikeSources]) {
+      expect(oldGuard(input)).toBe(true);
+      expect(Array.isArray((input as { sources: unknown }).sources)).toBe(false);
+      // This is the exact condition under which the old code proceeded to call
+      // .sources.map(...) on a non-array and threw.
+    }
+  });
+});

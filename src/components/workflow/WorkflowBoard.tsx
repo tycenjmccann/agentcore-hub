@@ -15,6 +15,9 @@ import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
 import { applyAgentStatus, applyAgentComplete, shouldForceTicketDone } from "@/lib/workflow/board-state";
 import { isLivenessEvent, isDispatchEvent, computeStaleAgentIds, isStaleEligibleStatus, seedLastActivityByAgent, seedLastToolByAgent, staleThresholdFor } from "@/lib/workflow/stale";
+// source-shape.ts (which depends only on redact.ts), not intake.ts — intake.ts
+// pulls in @aws-sdk/client-s3 and must stay out of the client bundle.
+import { formatSourceDisplay, sourcesForDisplay } from "@/lib/workflow/source-shape";
 import { Square, ClipboardCheck } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
@@ -1465,6 +1468,48 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             </button>
           )}
         </div>
+
+        {/* Intake sources (TEAM-4054). A source that could not be reached at
+            submit is accepted but stamped verification.status="unverified" — the
+            amber badge is the only place an operator sees that a reference the
+            requirements agent was handed may not actually be readable. */}
+        {(() => {
+          // TEAM-4090: input.sources itself is untrusted — a non-array (a
+          // string, an array-like object) passed the old `.length > 0` guard
+          // and then threw "sources.map is not a function". sourcesForDisplay
+          // is the Array.isArray-checked read.
+          const sources = sourcesForDisplay(state.input);
+          return sources.length > 0 && (
+            <div className="flex flex-col gap-1 px-3 pb-2">
+              {sources.map((src, i) => {
+                // TEAM-4078: never touch src.value/src.type directly here. The row
+                // is untrusted input (see source-shape.ts) and the display text
+                // must be REDACTED before it is truncated — the old
+                // slice(-23) of a raw presigned URL was the tail of
+                // X-Amz-Signature.
+                const display = formatSourceDisplay(src);
+                return (
+                  <div key={`intake-source-${i}`} className="flex items-center gap-2 text-[11px] text-zinc-400">
+                    <span className="px-1.5 py-0.5 rounded bg-zinc-700/40 text-zinc-300 font-medium uppercase tracking-wide">
+                      {display.type}
+                    </span>
+                    <span className="truncate font-mono" title={display.label}>
+                      {display.text}
+                    </span>
+                    {display.unverified && (
+                      <span
+                        className="shrink-0 px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-400 bg-amber-500/10 font-medium"
+                        title={display.detail}
+                      >
+                        unverified
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })()}
 
         {/* Canvas */}
         <div className="pipeline-canvas" ref={pipelineRef}>

@@ -14,7 +14,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
-import { validateIntakeSources } from "@/lib/workflow/intake";
+import { validateIntakeSources, getSourceValidationMode, shouldRejectSubmission } from "@/lib/workflow/intake";
+import { validateSourcesShape } from "@/lib/workflow/source-shape";
 import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure } from "@/lib/workflow/repo-check";
 import type { RepoCheck } from "@/lib/workflow/repo-check";
 import type { WorkflowInput } from "@/lib/workflow/types";
@@ -326,6 +327,17 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "title is required" }, { status: 400 });
     }
 
+    // TEAM-4078 F1: this route has no auth under AUTH_MODE=none and takes
+    // req.json() straight into WorkflowInput, so a malformed source used to be
+    // persisted verbatim ({ type: "upload", value: null } survives DynamoDB's
+    // removeUndefinedValues) and then crashed the workflow board on read.
+    // Reject the bad shape at the front door instead — mirrors the MCP
+    // IntakeSourceSchema, which is the other way in.
+    const sourcesShapeError = validateSourcesShape(body.sources);
+    if (sourcesShapeError) {
+      return NextResponse.json({ error: sourcesShapeError }, { status: 400 });
+    }
+
     if (body.intakeChannel !== undefined && !/^[a-z][a-z0-9-]{1,31}$/.test(body.intakeChannel)) {
       return NextResponse.json({ error: "intakeChannel must match ^[a-z][a-z0-9-]{1,31}$" }, { status: 400 });
     }
@@ -427,12 +439,29 @@ export async function POST(req: NextRequest) {
     if (!body.sources) body.sources = [];
     if (!body.description) body.description = "";
 
-    // Validate sources are reachable
+    // Validate sources are reachable. TEAM-4054: only DEFINITIVE negatives
+    // (malformed s3://, S3 404/NoSuchKey, URL 404/410) reject — a 403/timeout/5xx
+    // is evidence about the validator's IAM identity or the network, not about
+    // the source, and rejecting on it 422'd every sourced submission. Those ride
+    // along stamped verification.status="unverified" so the operator and the
+    // agents can see what was never confirmed. SOURCE_VALIDATION_MODE=strict
+    // restores the old block-on-anything behavior.
     if (body.sources.length > 0) {
-      const errors = await validateIntakeSources(body.sources);
-      if (errors.length > 0) {
-        return NextResponse.json({ error: "Source validation failed", details: errors }, { status: 422 });
+      const validation = await validateIntakeSources(body.sources);
+      const mode = getSourceValidationMode();
+      const decision = shouldRejectSubmission(validation, mode);
+      if (decision.reject) {
+        return NextResponse.json({ error: "Source validation failed", details: decision.errors, mode }, { status: 422 });
       }
+      if (validation.transientErrors.length > 0) {
+        console.warn(
+          `[start] ${validation.transientErrors.length} intake source(s) could not be verified — ` +
+            `accepted as unverified (SOURCE_VALIDATION_MODE=lenient): ${validation.transientErrors.join("; ")}`
+        );
+      }
+      // Persisted with the verification markers — both backends store
+      // `input: { ...body }`, so stamping body.sources is what reaches the row.
+      body.sources = validation.sources;
     }
 
     // TEAM-3619 D4b: idempotency on (sourceTicket, defId). Only requests that

@@ -3299,6 +3299,39 @@ async function blockTicketForFailedInvoke(ticketId, reason) {
 
 // ─── Context Builder ───────────────────────────────────────────────────────────
 
+/**
+ * TEAM-4093 (ship-review F2) — render ONE "## Input Sources" line for an intake
+ * source, carrying its intake-time verification verdict into the agent's prompt.
+ *
+ * PR #371 (TEAM-4054) made SOURCE_VALIDATION_MODE=lenient the default: a source
+ * whose reachability check fails no longer rejects the submit — it is accepted
+ * and persisted with `verification.status="unverified"` plus an already-redacted
+ * `detail`. For a cross-account s3:// source that detail carries the
+ * ACCESS_DENIED_HINT naming the bucket-policy grant the hub-account runtime
+ * agents need. That verdict never reached the intake agent, so a paid run began
+ * with the agent believing every source was readable — and the actionable grant
+ * hint was dropped. Surface it inline.
+ *
+ * `detail` is ALREADY redacted upstream (src/lib/workflow/intake.ts → redactUrl)
+ * — do NOT re-redact or reshape it here. Missing/empty/non-string detail falls
+ * back to a generic phrase so an older row can never print "undefined". Sources
+ * with no `verification` field at all (every row written before TEAM-4054), and
+ * verified sources, render exactly as they did before.
+ */
+export function formatSourceLine(source) {
+  const src = source ?? {};
+  let line = `- [${src.type}] ${src.label || src.value}`;
+  const status = src.verification?.status;
+  if (status === "unverified") {
+    const detail = src.verification?.detail;
+    const text = typeof detail === "string" && detail.trim() ? detail : "reachability check failed";
+    line += ` — UNVERIFIED at intake: ${text}`;
+  } else if (status === "skipped") {
+    line += ` — not network-validated`;
+  }
+  return line;
+}
+
 // Exported solely for cd-handoff.test.mjs (Delivery Mode / roster / gates block).
 export async function buildAgentContext(ticket, workflow) {
   await loadCdRegistry(); // the Delivery Mode block below reads it
@@ -3506,7 +3539,7 @@ export async function buildAgentContext(ticket, workflow) {
     if (workflow.input.sources?.length > 0) {
       context += `## Input Sources\n`;
       for (const src of workflow.input.sources) {
-        context += `- [${src.type}] ${src.label || src.value}\n`;
+        context += `${formatSourceLine(src)}\n`;
       }
       context += "\n";
     }

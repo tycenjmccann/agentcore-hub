@@ -234,11 +234,26 @@ export interface AgentMessage {
 
 export type IntakeSourceType = "url" | "upload" | "s3";
 
+/**
+ * Submit-time reachability check on one intake source (TEAM-4054). OUTPUT-ONLY:
+ * validateIntakeSources overwrites whatever a caller sends, so "verified" cannot
+ * be forged. "unverified" means the check did not come back clean but the
+ * failure was not definitive (403 / timeout / 5xx) — the submission was accepted
+ * anyway and the pipeline agents may or may not be able to read it.
+ */
+export interface SourceVerification {
+  status: "verified" | "unverified" | "skipped";
+  method?: string;               // "HeadObject", "GET (Range 0-0)", "none", …
+  detail?: string;               // human-readable outcome, query strings redacted
+  checkedAt?: string;            // ISO timestamp
+}
+
 export interface IntakeSource {
   type: IntakeSourceType;
   value: string;                 // URL, file path, or s3://bucket/key
   contentType?: string;          // MIME type hint
   label?: string;                // user-provided label
+  verification?: SourceVerification; // set by the server; never trusted from input
 }
 
 export interface ModelOverride {

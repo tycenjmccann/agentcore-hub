@@ -79,7 +79,8 @@ The orchestration pipeline. Self-contained surface.
 
 **Env vars** — `WORKFLOWS_TABLE`, `EVENTS_TABLE`, `TICKETS_TABLE`, `ARTIFACT_BUCKET`,
 `RUNTIME_ARN_<HARNESS>` (one per agent harness), `LAMBDA_ROLE_ARN`; performance card:
-`PERFORMANCE_INDEX_KEY` (default `performance/index.json`), `PUBLISH_CW_METRICS`, `INFRA_REGION`.
+`PERFORMANCE_INDEX_KEY` (default `performance/index.json`), `PUBLISH_CW_METRICS`, `INFRA_REGION`;
+intake source validation: `SOURCE_VALIDATION_MODE` (`lenient` default | `strict`, see `src/lib/workflow/intake.ts`).
 
 Fleet runtime agents (`deploy/runtime-agent`, see `DEPLOY.md`) additionally read:
 - `PERSONA_PROMPT_CACHE` — `1` (default on); Bedrock prompt caching for the persona system prompt + tools, set `0` to disable
