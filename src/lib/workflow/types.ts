@@ -373,6 +373,9 @@ export type WorkflowEvent = (
   | { type: "agent_output"; agentId: string; chunk: string; ticketId?: string }
   | { type: "tool_use"; agentId: string; toolName: string }
   | { type: "tool_end"; agentId: string; toolName: string; durationMs?: number }
+  // TEAM-4100 F6 — coding-runtime liveness heartbeat: advances the per-agent idle
+  // clock (stale detection) but carries no renderable payload (not transcript text).
+  | { type: "agent_heartbeat"; agentId: string; ticketId?: string }
   | { type: "token_usage"; agentId: string; inputTokens: number; outputTokens: number }
   | { type: "agent_complete"; agentId: string; output: string; branch?: string; commitSha?: string }
   | { type: "message"; message: AgentMessage }

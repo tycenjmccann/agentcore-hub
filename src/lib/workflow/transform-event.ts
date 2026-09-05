@@ -36,6 +36,17 @@ export function transformEvent(
       if (subType === "trace") {
         return base({ type: "tool_use", agentId, toolName: detail.toolName, timestamp });
       }
+      if (subType === "heartbeat") {
+        // TEAM-4100 F6 — a coding runtime emits an agent.streaming heartbeat while
+        // a long silent claude_code/codex turn polls (main.py _publish_coding_
+        // heartbeat). The orchestrator's lease counts ANY agent.streaming row, so a
+        // heartbeat renews the backend lease; the UI must see the SAME signal or it
+        // paints STUCK (and exposes the manual Restart → duplicate session, D1.5)
+        // while the backend still holds a live lease. Map it to a liveness-only
+        // event: it advances the idle clock (stale.ts LIVENESS_EVENT_TYPES) but is
+        // NOT rendered as transcript text (no chunk; WorkflowBoard has no case).
+        return base({ type: "agent_heartbeat", agentId, ticketId: detail.ticketId, timestamp });
+      }
       return null;
     }
 
