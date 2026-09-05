@@ -1121,6 +1121,54 @@ async function scanDeployApprovals() {
   }
 }
 
+// An agent-run PR body LEADS with process chatter — the ship-review round, a
+// "Do NOT merge by hand" warning, CD-ticket instructions — before it ever says
+// what the change does. Those lines are noise to a human approving the deploy.
+// Skip them; pull the actual Summary section instead. (This is why the old
+// "first non-heading line" grabbed "Status: SHIP REVIEW ROUND 3 …".)
+const PROCESS_LINE =
+  /^(status\b|do not\b|don't\b|note:|warning:|caution:|awaiting\b|cd ticket\b|ship review\b|merge approval\b|round\b|head\b|[-*] \[[ x]\]|🤖|co-authored|generated with|(closes?|fixes?|resolves?)\s+#\d)/i;
+const SUMMARY_HEADING =
+  /^\s*(?:#{1,4}\s*|\*\*)?(?:summary|what(?:'s| is| this does| changed)?|overview|why|problem|the change|tl;?dr)\b/i;
+
+function isProseLine(l) {
+  if (!l) return false;
+  if (/^[#|>]|^<!--|^!\[/.test(l)) return false;          // heading / table / quote / comment / image
+  if (PROCESS_LINE.test(l)) return false;                 // status / instruction boilerplate
+  if (/^\[?[A-Z][A-Z0-9]+-\d+\]?[:.\s]*$/.test(l)) return false; // bare ticket ref
+  if (/^https?:\/\/\S+$/.test(l)) return false;           // bare url
+  return true;
+}
+
+// One-line "what this does" from a PR body: prose under a Summary/What/Overview
+// heading if present, else the first prose line that isn't process boilerplate.
+// Strips leading bullet/emphasis markers. null if the body is all boilerplate.
+function extractPrSummary(body) {
+  const lines = String(body || "").split("\n").map((l) => l.trim());
+  const clean = (l) => l.replace(/^[*\-•\s>]+/, "").replace(/\*\*/g, "").trim().slice(0, 220);
+  for (let i = 0; i < lines.length; i++) {
+    if (!SUMMARY_HEADING.test(lines[i])) continue;
+    const inline = lines[i].replace(SUMMARY_HEADING, "").replace(/^[:\s*#]+/, "").trim();
+    if (inline && isProseLine(inline)) return clean(inline);
+    for (let j = i + 1; j < lines.length && j < i + 8; j++) {
+      if (!lines[j]) continue;
+      if (/^#{1,4}\s/.test(lines[j])) break;              // hit next heading, no prose here
+      if (isProseLine(lines[j])) return clean(lines[j]);
+    }
+  }
+  const first = lines.find(isProseLine);
+  return first ? clean(first) : null;
+}
+
+// PR/commit titles carry a trailing " (TEAM-1234)" workflow key we already show
+// as its own bullet — and slicing raw at 140 chars kept cutting it mid-token
+// ("… (TEAM-"). Drop the trailing key, then clip on a word boundary.
+function cleanSubject(title) {
+  let t = String(title || "").replace(/\s*\(([A-Z][A-Z0-9]+-\d+)\)\s*$/, "").trim();
+  if (t.length > 140) t = t.slice(0, 140).replace(/\s+\S*$/, "").trimEnd() + "…";
+  return t || null;
+}
+
 /**
  * Build a rich "what's shipping" brief for the deploy-approval ping from the
  * commit being deployed: the commit subject, its associated PR (title + body),
@@ -1155,7 +1203,7 @@ async function buildDeployBrief(commitSha) {
   // Commit → subject + file scope.
   try {
     const commit = await gh(`/commits/${commitSha}`);
-    brief.commitSubject = (commit.commit?.message || "").split("\n")[0].slice(0, 140) || null;
+    brief.commitSubject = cleanSubject((commit.commit?.message || "").split("\n")[0]);
     const stats = commit.stats || {};
     const files = Array.isArray(commit.files) ? commit.files.length : null;
     if (files != null) {
@@ -1169,7 +1217,7 @@ async function buildDeployBrief(commitSha) {
     const prs = await gh(`/commits/${commitSha}/pulls`);
     const pr = Array.isArray(prs) && prs[0];
     if (pr) {
-      brief.prTitle = (pr.title || "").slice(0, 140) || null;
+      brief.prTitle = cleanSubject(pr.title);
       brief.prUrl = pr.html_url || null;
       // Workflow/epic key: TEAM-#### from the PR title or body.
       const key = (pr.title + " " + (pr.body || "")).match(/\b([A-Z][A-Z0-9]+-\d+)\b/);
@@ -1178,12 +1226,9 @@ async function buildDeployBrief(commitSha) {
         : /dead.?code|sweep/i.test(pr.title) ? "dead-code"
         : "SDLC";
       if (key) brief.workflowLine = `Workflow: ${key[1]} (${typeHint})`;
-      // One-line summary: first non-empty, non-heading line of the PR body.
-      const bodyLine = (pr.body || "")
-        .split("\n")
-        .map((l) => l.trim())
-        .find((l) => l && !l.startsWith("#") && !l.startsWith("<!--") && !l.startsWith("|"));
-      if (bodyLine) brief.summary = bodyLine.replace(/^[*\-\s]+/, "").slice(0, 200);
+      // One-line "what this does" — the Summary section, not the ship-review
+      // status line the body opens with.
+      brief.summary = extractPrSummary(pr.body);
     }
   } catch (e) { /* PR optional — commit subject already covers the headline */ }
 
