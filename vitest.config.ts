@@ -73,6 +73,10 @@ export default defineConfig({
       // publisher + fake clock), so the union + extended-state logic is
       // unit-testable with no AWS.
       "lambda/orchestrator/cascade.test.mjs",
+      // level-trigger-dispatch (TEAM-4060) — DI coverage for the dead-zone fix:
+      // off|shadow|enforce, the already-Ready in-process dispatch, and non-fatal
+      // isolation when dispatchReady (the claim-CAS webhook path) loses a race.
+      "lambda/orchestrator/level-trigger-dispatch.test.mjs",
       // done-handlers-cascade (TEAM-3688 F3) — HANDLER-level cascade coverage.
       // Invokes the REAL handleTicketDoneUnified + handleTicketDone from index.mjs
       // through the REAL cascade (cascade.mjs/lease.mjs unmocked; only AWS/store
@@ -151,6 +155,14 @@ export default defineConfig({
       // (TEAM-3744) so this test never imports index.mjs's module-load AWS
       // client construction; isPipelineEnabled is pure, no I/O.
       "lambda/orchestrator/pipeline-enabled.test.mjs",
+      // cd-registry.mjs — pure registry parsing / repo matching / ship-phase
+      // stripping (which repos the hub merges + deploys); no I/O.
+      "lambda/orchestrator/cd-registry.test.mjs",
+      // cd-handoff — index.mjs REAL, AWS/store seams mocked: an unregistered
+      // repo gets no ship phase (Ship/CD tickets + Merge Approval gate resolved,
+      // never dispatched/paged; intake context stops the chain at CI; completion
+      // opens the handoff PR), a registered one keeps the full ship phase.
+      "lambda/orchestrator/cd-handoff.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

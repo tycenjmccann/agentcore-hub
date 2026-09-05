@@ -167,6 +167,15 @@ phases:
         aws s3 sync blueprints/ "s3://$ARTIFACT_BUCKET/blueprints/"
         aws s3 sync deploy/runtime-agent/prompts/ "s3://$ARTIFACT_BUCKET/prompts/" || true
         aws s3 cp src/config/workflows.json "s3://$ARTIFACT_BUCKET/config/workflows.json"
+        # CD registry (which repos the hub merges + deploys): the S3 copy is the
+        # LIVE document (edited in the UI / scripts/cd-registry.sh) — only seed it
+        # when absent, never clobber it. Absent + unseeded = every repo is HANDOFF.
+        if aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key config/cd-registry.json --region "$AWS_REGION_HUB" >/dev/null 2>&1; then
+          echo "  cd-registry.json present in S3 — left as-is (live registry)"
+        else
+          aws s3 cp src/config/cd-registry.json "s3://$ARTIFACT_BUCKET/config/cd-registry.json" --only-show-errors
+          echo "  seeded config/cd-registry.json (no repos registered — register with scripts/cd-registry.sh add)"
+        fi
         aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" /tmp/agents-s3.json
         python3 deploy/pipeline/merge-agents-json.py /tmp/agents-s3.json src/config/agents.json /tmp/agents-merged.json
         aws s3 cp /tmp/agents-merged.json "s3://$ARTIFACT_BUCKET/config/agents.json"

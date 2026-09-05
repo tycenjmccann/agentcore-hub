@@ -1818,6 +1818,34 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             the cost-report Lambda when the run reaches a terminal phase */}
         {isTerminalPhase(state.phase) && <RunPerformanceCard workflowId={workflowId} />}
 
+        {/* Delivery — how the run ended: merged + deployed by the hub (CD
+            registry) or handed off as an open PR for the owning team */}
+        {isTerminalPhase(state.phase) && state.delivery && (
+          <div className="flex flex-wrap items-center gap-2 text-xs" data-testid="delivery-badge">
+            {state.delivery.mode === "handoff" ? (
+              <>
+                <span className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 font-medium">Handoff</span>
+                <span className="text-secondary">
+                  Repo is not in the CD registry — the hub did not merge or deploy. PR left open for the owning team
+                  {state.delivery.prUrl ? ": " : "."}
+                </span>
+                {state.delivery.prUrl && (
+                  <a href={state.delivery.prUrl} target="_blank" rel="noreferrer" className="text-sky-400 hover:text-sky-300 underline">
+                    {state.delivery.prUrl.replace(/^https:\/\/github\.com\//, "")}
+                  </a>
+                )}
+              </>
+            ) : (
+              <>
+                <span className="px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 font-medium">CD</span>
+                <span className="text-secondary">
+                  Merged + deployed by the hub{state.delivery.pipeline ? ` via ${state.delivery.pipeline}` : ""}.
+                </span>
+              </>
+            )}
+          </div>
+        )}
+
         {(isComplete || state.phase === "cancelled" || state.phase === "error") && (
           <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} />
         )}

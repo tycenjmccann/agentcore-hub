@@ -47,6 +47,7 @@ The orchestration pipeline. Self-contained surface.
 
 **API routes**
 - `src/app/api/workflow/` — start/state/list/events/stream/cancel/retry/artifacts/webhook/agent-output/complete/nudge/performance (plus definitions, tickets, watch, escalations, analysis under `[id]/`)
+- `src/app/api/workflow/cd-registry/` — the **CD registry** (which repos the hub merges + deploys): GET list / `?repo=` lookup, POST upsert, DELETE remove → `s3://ARTIFACT_BUCKET/config/cd-registry.json`
 - `src/app/api/jira/` — Jira webhook + metrics
 - `src/app/api/models/` — model picker (used only by the workflow intake form)
 
@@ -54,6 +55,7 @@ The orchestration pipeline. Self-contained surface.
 - `src/components/workflow/`
 - `src/lib/workflow/` (~30 modules: types, ticket providers (`ticket-provider*.ts`), board state, leases, ship-review, event transforms, jira-client, model-config, watchdog, performance (fleet performance card — see `docs/performance-card.md`), …)
 - `src/lib/pipeline-config.ts`
+- `src/lib/cd-registry.ts` (core lib, no module imports) + `src/config/cd-registry.json` (first-deploy seed; ships empty) — mirror of `lambda/orchestrator/cd-registry.mjs`. Unregistered repo = **handoff**: no Ship / Merge Approval / CD tickets, the orchestrator opens the unified PR at completion and leaves it open for the owning team (`workflow.delivery = { mode: "handoff", prUrl }`). Registered = full ship phase; an entry with a `pipeline` also turns on Pipeline Mode for that repo's agents.
 
 **Lambdas** (`lambda/`)
 - `orchestrator` — drives the pipeline state machine
@@ -308,6 +310,12 @@ CloudWatch Logs. Deploy role is deliberately narrow (Lambda code-only, no
 - `NEXT_PUBLIC_PIPELINE_ENABLED=1` — shows the `/pipeline` nav entry + tab (app).
 - `PIPELINE_ENABLED=1` — on the fleet/orchestrator context: CI/QA/release-manager
   blueprints read pipeline results instead of shelling builds.
+- The **CD registry** (Workflow module, `config/cd-registry.json` in the artifact
+  bucket) scopes that signal: a run gets the `## Pipeline Mode` block (with
+  `pipeline_name`) only when its repo is registered with a `pipeline`. A registered
+  repo without one takes the legacy DEPLOY.md path; an unregistered repo is a
+  handoff (no ship phase at all). `CD_REGISTRY_TTL_MS` (orchestrator, default 60000)
+  is the re-read interval.
 - `PIPELINE_TOOLS_LAMBDA` — fleet runtime: name of the tools Lambda (default
   `agentcore-hub-pipeline-tools`).
 - `PIPELINE_NAME` / `BUILD_PROJECT` / `CI_PROJECT` — on the tools Lambda

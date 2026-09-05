@@ -520,6 +520,64 @@ const ESCALATION_GATE_TITLE = /^Escalation #\d+: ship-review not converging/i;
 const CHAT_KEY_PREFIX = "chat#";
 const REJECT_KEY_PREFIX = "rej#";
 
+// ─── Executive gate-ping formatting ──────────────────────────────────────────
+// Every human decision ping (review gate, ship-review escalation, manager
+// escalation, deploy approval) renders through ONE shape so Telegram reads at
+// the same altitude as the hub's review view — verdict first, then substance,
+// then the ask:
+//   *KICKER*            what decision is this
+//   subject             which run / PR
+//   summary             one line: what changed & why
+//   *What changed*      optional bullet list (key changes / findings / scope)
+//   • …
+//   meta                compact status line (reviewer · ticket · scope)
+//   _ask_               the decision to make
+// Free text (subject/summary/bullets) is esc()'d for legacy Markdown. `meta`
+// entries are pre-built, link-safe strings and are NOT re-escaped.
+function execPing({ kicker, subject, summary, bullets = [], meta = [], ask }) {
+  const lines = [`*${kicker}*`];
+  if (subject) lines.push(esc(String(subject)));
+  if (summary && String(summary).trim()) lines.push("", esc(String(summary).trim()));
+  const bl = (bullets || []).filter((b) => typeof b === "string" && b.trim()).slice(0, 6);
+  if (bl.length) {
+    lines.push("", "*What changed*");
+    for (const b of bl) lines.push(`• ${esc(b.trim().slice(0, 200))}`);
+  }
+  const ml = (meta || []).filter(Boolean);
+  if (ml.length) lines.push("", ml.join("  ·  "));
+  if (ask) lines.push("", `_${esc(String(ask))}_`);
+  return lines.join("\n");
+}
+
+// Flatten an agent-written ticket description into one phone-readable line:
+// drop code fences, turn [label](url) into label, strip bare workflows/…md
+// paths and Markdown syntax noise, collapse whitespace, clip. (The old code
+// dropped the description entirely because those raw paths rendered as broken
+// links — cleaning them lets us keep the actual prose.)
+function cleanDesc(s) {
+  if (typeof s !== "string") return "";
+  return s
+    .replace(/```[\s\S]*?```/g, " ")         // fenced code blocks
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")  // [label](url) → label
+    .replace(/\bworkflows\/\S+/g, "")         // bare in-run artifact paths
+    .replace(/[#>*_`]/g, "")                  // residual Markdown syntax
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
+}
+
+// Short executive label for a review-gate kicker. Prefer the review-package
+// phase (spec/plan/design/dev/qa/ship); fall back to the gate ticket title.
+function gateLabel(gate, title) {
+  const g = String(gate || "").toLowerCase();
+  const map = [
+    ["requirement", "SPEC"], ["spec", "SPEC"], ["plan", "PLAN"],
+    ["design", "DESIGN"], ["dev", "CODE"], ["qa", "QA"], ["ship", "SHIP"],
+  ];
+  for (const [k, v] of map) if (g.includes(k)) return v;
+  return String(title || "REVIEW").toUpperCase().slice(0, 24);
+}
+
 async function scanReviewGates() {
   const res = await fetch(`${HUB_API_URL}/api/workflow/list`);
   if (!res.ok) throw new Error(`workflow/list ${res.status}`);
@@ -555,37 +613,66 @@ async function scanReviewGates() {
         continue;
       }
 
-      // Pull the gate ticket for its title only — it names the gate (e.g.
-      // "Spec Approval"). We deliberately do NOT surface the ticket description:
-      // agents write ad-hoc prose with raw workflows/…md paths that render as
-      // broken links in Telegram. The canonical link to the deliverable is the
-      // doc button below; the ping stays on a fixed template.
+      // Pull the whole ticket set so the ping is SELF-CONTAINED — the reviewer
+      // decides from Telegram without opening the hub. From it we take: the gate
+      // ticket's title + cleaned description, and the titles of the UPSTREAM work
+      // it blocks on (blockedBy) — i.e. exactly what is being reviewed.
       let title = notif.ticketId;
+      let gateTicket = null;
+      let upstreamTitles = [];
       try {
         const tRes = await fetch(`${HUB_API_URL}/api/workflow/${wf.workflowId}/tickets`);
         if (tRes.ok) {
           const { tickets = [] } = await tRes.json();
-          const t = tickets.find((x) => x.ticketId === notif.ticketId);
-          if (t?.title) title = t.title;
+          gateTicket = tickets.find((x) => x.ticketId === notif.ticketId) || null;
+          if (gateTicket?.title) title = gateTicket.title;
+          const byId = new Map(tickets.map((x) => [x.ticketId, x]));
+          upstreamTitles = (gateTicket?.blockedBy || [])
+            .map((id) => byId.get(id)?.title)
+            .filter(Boolean)
+            .slice(0, 5);
         }
       } catch { /* ping still goes out with the id */ }
 
       const reviewer = notif.reviewer || "reviewer";
-      // TEAM-3971: a release-manager escalation gate needs a DECISION, not a
-      // bare approve — a bare approve used to park the release manager forever.
-      // Offer the three decisions as buttons; each records the DECISION line.
       const isEscalation = ESCALATION_GATE_TITLE.test(title);
-      const head =
-        `📋 Run: ${esc(wf.input?.title || wf.workflowId)}\n` +
-        `👤 Awaiting: \`${reviewer}\`\n` +
-        `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})\n\n`;
+      const gateName = gateLabel(notif.gate, title);
+      const ticketLink = `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`;
+      // Body content, best source first: the closing agent's curated review
+      // package (summary/bullets), else the gate ticket's own description, else
+      // the list of upstream items under review. The ping is never empty.
+      const pkgSummary = typeof notif.summary === "string" ? notif.summary.trim() : "";
+      const desc = cleanDesc(gateTicket?.description);
+      const summary =
+        pkgSummary ||
+        desc ||
+        (upstreamTitles.length
+          ? `Reviewing ${upstreamTitles.length} completed item${upstreamTitles.length === 1 ? "" : "s"} before this phase proceeds.`
+          : `${title} is ready for your review.`);
+      const bullets =
+        (Array.isArray(notif.bullets) && notif.bullets.length)
+          ? notif.bullets
+          : upstreamTitles; // the actual work under review = "What changed"
+      // TEAM-3971: a ship-review escalation needs a DECISION, not a bare approve
+      // (a bare approve used to park the release manager forever). Offer the
+      // three decisions as buttons; each records a `DECISION:` line on the gate.
       const text = isEscalation
-        ? `🚨 *Ship-review escalation — ${esc(title)}*\n` + head +
-          `The review loop hit its round cap. Read the escalation digest below, then pick ONE decision. ` +
-          `It is recorded on the gate as a \`DECISION:\` line and the release manager resumes on its own.`
-        : `🚦 *Review gate — ${esc(title)}*\n` + head +
-          `Open the document below to review, then *Approve* or *Request changes*. ` +
-          `The pipeline is paused on you.`;
+        ? execPing({
+            kicker: `🚨 SHIP-REVIEW ESCALATION — ${gateName}`,
+            subject: wf.input?.title || wf.workflowId,
+            summary: summary || "The ship-review loop hit its round cap and needs a human call.",
+            bullets,
+            meta: [`👤 ${esc(reviewer)}`, ticketLink],
+            ask: "Pick ONE decision below — it is recorded as a DECISION line and the release manager resumes on its own.",
+          })
+        : execPing({
+            kicker: `🚦 ${gateName} REVIEW GATE — approval needed`,
+            subject: wf.input?.title || wf.workflowId,
+            summary: summary || `${title} is ready for your review.`,
+            bullets,
+            meta: [`👤 ${esc(reviewer)}`, ticketLink, "⏸ pipeline paused on you"],
+            ask: "Approve to continue, or Request changes to send it back.",
+          });
       const keyboard = { inline_keyboard: isEscalation
         ? [
             [{ text: "✅ Merge with known findings", callback_data: `gdc|m|${notif.ticketId}|${wf.workflowId}` }],
@@ -599,36 +686,26 @@ async function scanReviewGates() {
             { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
           ]] };
 
-      // Direct jump to the gate ticket's review view in the hub — the one
-      // screen with the full formatted breakout (review package + Merge
-      // Brief) and the approve controls.
+      // Consistent artifact set for EVERY review gate: the hub approval view is
+      // always the primary link (the one screen with the full review package +
+      // Merge Brief and the approve controls), followed by the review package's
+      // CURATED deliverables. Those links are authored by the agent that closed
+      // the phase (loadReviewPackage), so they are deterministic and gate-scoped
+      // — unlike the old "freshest 3 markdown files" scan, which surfaced a
+      // different, often-irrelevant set on every ping.
       keyboard.inline_keyboard.push([{
         text: "📱 Open approval in hub",
         url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&ticket=${encodeURIComponent(notif.ticketId)}`,
       }]);
-
-      // Deep-link the deliverables under review: the freshest markdown artifacts
-      // open straight into the hub's artifact viewer (read/edit/save), so the
-      // reviewer can read the actual spec/plan from their phone before tapping
-      // Approve. Best-effort — the ping goes out without buttons if the list 404s.
-      try {
-        const aRes = await fetch(
-          `${HUB_API_URL}/api/workflow/artifacts?workflowId=${encodeURIComponent(wf.workflowId)}`
-        );
-        if (aRes.ok) {
-          const { artifacts = [] } = await aRes.json();
-          const docs = artifacts
-            .filter((a) => a.filename?.toLowerCase().endsWith(".md"))
-            .sort((a, b) => new Date(b.lastModified || 0) - new Date(a.lastModified || 0))
-            .slice(0, 3);
-          for (const doc of docs) {
-            keyboard.inline_keyboard.push([{
-              text: `📄 ${doc.filename}`,
-              url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&artifact=${encodeURIComponent(doc.key)}`,
-            }]);
-          }
-        }
-      } catch { /* buttons are a bonus, never block the ping */ }
+      for (const l of (Array.isArray(notif.links) ? notif.links : []).slice(0, 4)) {
+        if (!l || !l.label) continue;
+        const url = l.url
+          ? l.url
+          : l.artifactKey
+            ? `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&artifact=${encodeURIComponent(l.artifactKey)}`
+            : null;
+        if (url) keyboard.inline_keyboard.push([{ text: `📄 ${l.label}`.slice(0, 60), url }]);
+      }
 
       let delivered = 0;
       for (const chatId of chats) {
@@ -820,11 +897,13 @@ async function scanManagerEscalations() {
 
       const details = String(notif.details || notif.message || "").trim();
       const clipped = details.length > ESC_DETAIL_MAX ? `${details.slice(0, ESC_DETAIL_MAX)}…` : details;
-      const text =
-        `🚨 *Workflow Manager escalation*\n` +
-        `📋 Run: ${esc(wf.input?.title || wf.workflowId)}\n` +
-        `⏸ The run is *parked* until you tap Resolved — the watch scheduler skips it while this is open.\n\n` +
-        `${esc(clipped)}`;
+      const text = execPing({
+        kicker: "🚨 WORKFLOW MANAGER ESCALATION",
+        subject: wf.input?.title || wf.workflowId,
+        summary: clipped,
+        meta: ["⏸ run parked until you resolve"],
+        ask: "Tap Resolved once handled — the watch scheduler skips this run while the escalation is open.",
+      });
       const keyboard = { inline_keyboard: [
         [{ text: "✅ Resolved — resume watching", callback_data: `eok|${wf.workflowId}` }],
         [{ text: "📱 Open run in hub", url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}` }],
@@ -994,27 +1073,29 @@ async function scanDeployApprovals() {
       return null;
     });
 
-    const header = `🚀 *Deploy approval — ${esc(DEPLOY_PIPELINE_NAME)}*`;
-    const body = brief
-      ? [
-          header,
-          brief.prTitle ? `*${esc(brief.prTitle)}*` : (brief.commitSubject ? `*${esc(brief.commitSubject)}*` : ""),
-          brief.workflowLine ? brief.workflowLine : "",       // e.g. "Workflow: TEAM-3721 (bug-fix)"
-          brief.summary ? esc(brief.summary) : "",            // one-line what/why from the PR body
-          brief.scopeLine ? brief.scopeLine : "",             // e.g. "Scope: 8 files (+147/-4)"
-          brief.commitLine ? brief.commitLine : "",           // e.g. "Commit: a1b2c3d"
-          "",
-          `This is the *irreversible production deploy* — the merge was already approved.`,
-          `*Approve* to ship or *Reject* to stop.`,
-        ].filter((l) => l !== "").join("\n")
-      : [
-          header,
-          `The build passed every gate and is waiting on you to ship it to prod. ` +
-            `This is the irreversible production deploy — the merge was already approved.`,
-          ``,
-          `Review the built commit, then *Approve* to deploy or *Reject* to stop.`,
-        ].join("\n");
-    const text = body;
+    const deployAsk =
+      "This is the irreversible production deploy — the merge is already approved. " +
+      "Approve to ship, or Reject to stop.";
+    const text = brief
+      ? execPing({
+          kicker: "🚀 PRODUCTION DEPLOY — approval needed",
+          subject: brief.prTitle || brief.commitSubject || DEPLOY_PIPELINE_NAME,
+          summary: brief.summary || "",                       // one-line what/why from the PR body
+          bullets: [
+            brief.workflowLine,                               // "Workflow: TEAM-3721 (bug-fix)"
+            brief.scopeLine,                                  // "Scope: 8 files (+147/-4)"
+            brief.commitLine && brief.commitLine.replace(/`/g, ""), // "Commit: a1b2c3d"
+          ].filter(Boolean),
+          meta: [`🏷 ${esc(DEPLOY_PIPELINE_NAME)}`],
+          ask: deployAsk,
+        })
+      : execPing({
+          kicker: "🚀 PRODUCTION DEPLOY — approval needed",
+          subject: DEPLOY_PIPELINE_NAME,
+          summary: "The build passed every gate and is waiting on you to ship it to prod.",
+          meta: [`🏷 ${esc(DEPLOY_PIPELINE_NAME)}`],
+          ask: deployAsk,
+        });
 
     const rows = [[
       { text: "🚀 Approve deploy", callback_data: `dok|${claimed.key}` },

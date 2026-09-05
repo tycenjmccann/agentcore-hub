@@ -191,6 +191,13 @@ export interface WorkflowState {
   cancelledAt?: string;
   /** Phase the workflow was in before cancellation (for audit) */
   previousPhase?: WorkflowPhase;
+  /**
+   * How the run was delivered, written by the orchestrator at completion.
+   * "cd" — the repo is in the CD registry: the ship phase merged + deployed.
+   * "handoff" — the repo is NOT registered: the hub opened `prUrl` and left it
+   * open for the owning team to merge and deploy (see src/lib/cd-registry.ts).
+   */
+  delivery?: { mode: "cd" | "handoff"; prUrl?: string; pipeline?: string; at?: string };
 }
 
 // ─── Repo Configuration ──────────────────────────────────────────────────────

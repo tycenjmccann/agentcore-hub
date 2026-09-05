@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { isPipelineEnabled } from "./pipeline-enabled.mjs";
+import {
+  isPipelineEnabled,
+} from "./pipeline-enabled.mjs";
 
 /**
  * TEAM-3738 (same defect class as TEAM-3723): deploy.sh forwards PIPELINE_ENABLED
@@ -24,3 +26,6 @@ describe("isPipelineEnabled", () => {
     expect(isPipelineEnabled(input)).toBe(expected);
   });
 });
+
+// Repo scoping of the Pipeline Mode block (TEAM-4044) lives in the CD registry —
+// see cd-registry.test.mjs / cd-handoff.test.mjs.

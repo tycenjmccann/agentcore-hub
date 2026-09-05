@@ -714,3 +714,18 @@ export async function claimFinalization(workflowId, staleBefore) {
     throw err;
   }
 }
+
+/**
+ * Record how a run was delivered at completion: { mode: "cd" | "handoff",
+ * pipeline?, prUrl?, at }. "handoff" = the repo is outside the CD registry, so
+ * the hub opened the PR and left it for the owning team; "cd" = the ship phase
+ * merged + deployed. Plain overwrite — written once by the completer.
+ */
+export async function setDelivery(workflowId, delivery) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET delivery = :d",
+    ExpressionAttributeValues: { ":d": delivery },
+  }));
+}
