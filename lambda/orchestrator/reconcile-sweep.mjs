@@ -365,9 +365,10 @@ export function createReconcileSweep(deps) {
 
     // D2.3 extra step (b) — discharge outstanding epic roll-ups. These runs are in
     // phase `complete`, so the scan above cannot see them (by design); the debt
-    // list is its own narrow scan. The dep takes over through the same
-    // claimFinalization CAS the completion path uses, so a sweep and a live
-    // completer can never both roll the epic.
+    // list is its own narrow scan. The dep takes the debt under a roll-up LEASE
+    // (TEAM-4099 F5), so two sweeps can never retry the same run at once and — the
+    // point of the lease over the old finalization claim — a FAILED retry leaves
+    // the row still matching this scan instead of vanishing from it forever.
     if (mode === "enforce" && retryEpicRollup) {
       try {
         const pending = await scanPendingRollups();

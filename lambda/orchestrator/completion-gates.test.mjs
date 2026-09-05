@@ -94,6 +94,11 @@ const h = vi.hoisted(() => ({
     epicTransitionThrows: false,
     ticketUpdates: /** @type {any[]} */ ([]),
     finalizationClaimWins: false,
+    // TEAM-4099 F5: the roll-up retry LEASE. `rollupLeases` is the row attribute
+    // (`epicRollupClaimedAt`) the conditional claim reads and writes; `rollupClaims`
+    // records every attempt so the concurrency test can prove both callers tried.
+    rollupLeases: /** @type {Record<string, string>} */ ({}),
+    rollupClaims: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -227,7 +232,24 @@ vi.mock("./workflow-store.mjs", () => ({
   // TEAM-3991 D1.4 — the epic roll-up obligation created atomically with the
   // terminal claim. finalizeWithEpicRollUp clears it on success and escalates
   // once (appendNotificationOnce, id-idempotent) on failure.
-  clearEpicRollupPending: vi.fn(async (id) => { h.state.rollupCleared.push(id); }),
+  clearEpicRollupPending: vi.fn(async (id) => {
+    h.state.rollupCleared.push(id);
+    delete h.state.rollupLeases[id]; // the lease goes with the discharged debt
+  }),
+  /**
+   * TEAM-4099 F5 — the retry lease, mirroring claimEpicRollupRetry's conditional
+   * write: the row must still owe the debt (not cleared), must not be finalized, and
+   * any existing lease must have aged out. Check-and-set with no await in between,
+   * so two concurrent callers genuinely race for one winner.
+   */
+  claimEpicRollupRetry: vi.fn(async (id, { now = new Date().toISOString(), leaseMs = 10 * 60 * 1000 } = {}) => {
+    h.state.rollupClaims.push({ id, now, leaseMs });
+    if (h.state.rollupCleared.includes(id) || h.state.finalized.includes(id)) return { won: false };
+    const held = h.state.rollupLeases[id];
+    if (held && Date.parse(now) - Date.parse(held) < leaseMs) return { won: false };
+    h.state.rollupLeases[id] = now;
+    return { won: true };
+  }),
   appendNotificationOnce: vi.fn(async (id, n) => {
     if (h.state.notifications.some((x) => x.n?.id === n.id && !x.n?.acknowledged)) return false;
     h.state.notifications.push({ id, n });
@@ -320,6 +342,8 @@ beforeEach(() => {
   h.state.ticketUpdates.length = 0;
   h.state.epicTransitionThrows = false;
   h.state.finalizationClaimWins = false;
+  h.state.rollupLeases = {};
+  h.state.rollupClaims.length = 0;
   // No real sleeping in the roll-up retry budget.
   process.env.EPIC_ROLLUP_BACKOFF_MS = "0";
   delete process.env.COMPLETION_EVIDENCE_REQUIRED;
@@ -1220,6 +1244,24 @@ describe("completeWorkflow — open gate, CD evidence, atomic epic roll-up (TEAM
     // no evidence — stamping phase:"ship" on it would make the F3 gate demand one.
   };
   const CD_KEY = "workflows/wf_1/shared/cd-evidence/deploy-20260905T0100Z.md";
+  /** A run that closed green and still owes its epic roll-up (TEAM-4099 F5). */
+  const PENDING_ROLLUP = { id: "wf_1", epicId: "EPIC-1", phase: "complete", epicRollupPending: true };
+
+  /**
+   * The REAL debt filter, captured from sweep-scan.mjs rather than restated here —
+   * "the row still matches the sweep filter" is only worth asserting against the
+   * expression the sweep actually sends.
+   */
+  async function pendingRollupFilterExpression() {
+    const { createPendingRollupScan } = await import("./sweep-scan.mjs");
+    let captured = null;
+    const scan = createPendingRollupScan({
+      ddb: { send: async (cmd) => { captured = cmd.input; return { Items: [] }; } },
+      workflowsTable: "workflows",
+    });
+    await scan();
+    return String(captured.FilterExpression);
+  }
 
   // The cd-evidence harvest is gated on ARTIFACT_BUCKET, read at module load —
   // and the suites above delete it in their afterEach, so re-assert it here.
@@ -1351,14 +1393,12 @@ describe("completeWorkflow — open gate, CD evidence, atomic epic roll-up (TEAM
     warn.mockRestore();
   });
 
-  it("retryPendingEpicRollups: the sweep takes over through the SAME finalization CAS and recovers", async () => {
-    h.state.finalizationClaimWins = true;
+  it("retryPendingEpicRollups: the sweep takes the debt under a roll-up LEASE and recovers", async () => {
     const mod = await load();
-    const res = await mod.retryPendingEpicRollups({
-      id: "wf_1", epicId: "EPIC-1", phase: "complete", epicRollupPending: true,
-    });
+    const res = await mod.retryPendingEpicRollups(PENDING_ROLLUP);
 
     expect(res).toMatchObject({ claimed: true, ok: true, attempts: 1 });
+    expect(h.state.rollupClaims).toHaveLength(1);
     expect(h.state.rollupCleared).toEqual(["wf_1"]);
     expect(ebEventsOfType("workflow.epic_rolled_up")).toHaveLength(1);
     expect(ebEventsOfType("workflow.epic_rolled_up")[0]).toMatchObject({
@@ -1367,16 +1407,92 @@ describe("completeWorkflow — open gate, CD evidence, atomic epic roll-up (TEAM
     expect(h.state.finalized).toEqual(["wf_1"]); // finalized at last
   });
 
-  it("retryPendingEpicRollups declines a run that owes nothing, one already finalized, and a lost CAS", async () => {
+  it("retryPendingEpicRollups declines a run that owes nothing, one already finalized, and a leased one", async () => {
     const mod = await load();
-    const pending = { id: "wf_1", epicId: "EPIC-1", phase: "complete", epicRollupPending: true };
+    const pending = PENDING_ROLLUP;
     expect(await mod.retryPendingEpicRollups({ ...pending, epicRollupPending: false })).toMatchObject({ reason: "not_pending" });
     expect(await mod.retryPendingEpicRollups({ ...pending, phase: "review" })).toMatchObject({ reason: "not_pending" });
     expect(await mod.retryPendingEpicRollups({ ...pending, finalizedAt: "2026-09-05T00:00:00Z" })).toMatchObject({ reason: "not_pending" });
-    // Pending, but a concurrent owner holds the claim → hands off, touches nothing.
+    // Pending, but a concurrent sweep holds a live lease → hands off, touches nothing.
+    h.state.rollupLeases.wf_1 = new Date().toISOString();
     expect(await mod.retryPendingEpicRollups(pending)).toMatchObject({ claimed: false, reason: "claim_lost" });
     expect(h.state.rollupCleared).toHaveLength(0);
     expect(h.state.finalized).toHaveLength(0);
+  });
+
+  /**
+   * TEAM-4099 F5 — the retry used to take the debt via `claimFinalization`, which
+   * SETs `finalizedAt`, and `finalizedAt` is precisely the attribute the debt scan
+   * excludes on (sweep-scan.mjs createPendingRollupScan). So ONE failed retry marked
+   * the run "every side effect ran" and removed it from every future sweep while
+   * `epicRollupPending` was still true: the epic stayed open on the board forever,
+   * with nothing left that would ever look at it again.
+   */
+  it("a FAILED retry finalizes nothing and leaves the row exactly as the debt scan wants it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.epicTransitionThrows = true;
+    const mod = await load();
+    const res = await mod.retryPendingEpicRollups(PENDING_ROLLUP);
+
+    expect(res).toMatchObject({ claimed: true, ok: false });
+    expect(res.reason).toContain("epic write rejected");
+    // The two writes that would have stranded it: neither happened.
+    expect(h.state.finalized).toHaveLength(0);   // finalizedAt still absent
+    expect(h.state.rollupCleared).toHaveLength(0); // epicRollupPending still set
+    expect(ebEventsOfType("workflow.epic_rolled_up")).toHaveLength(0);
+
+    // …and those are exactly the two attributes the sweep filter reads. The lease it
+    // DID take is invisible to that filter, which is what makes it safe to hold.
+    const filter = await pendingRollupFilterExpression();
+    expect(filter).toContain("attribute_exists(epicRollupPending)");
+    expect(filter).toContain("attribute_not_exists(finalizedAt)");
+    expect(filter).not.toContain("epicRollupClaimedAt");
+    warn.mockRestore();
+  });
+
+  it("the next sweep, once the lease ages out, discharges the debt: cleared, acked, finalized", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.epicTransitionThrows = true;
+    const mod = await load();
+    await mod.retryPendingEpicRollups(PENDING_ROLLUP);
+
+    // Same sweep window: the lease this attempt still holds keeps a second pass out
+    // (rollUpEpic already burned its own 3-attempt budget — no point re-burning it).
+    expect(await mod.retryPendingEpicRollups(PENDING_ROLLUP)).toMatchObject({ reason: "claim_lost" });
+
+    // A later sweep, past the lease: the epic write works this time.
+    h.state.rollupLeases.wf_1 = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    h.state.epicTransitionThrows = false;
+    // The escalation the failed completion filed is what a human would be looking at;
+    // a recovered roll-up has to take it back down.
+    h.state.freshWorkflow = {
+      ...PENDING_ROLLUP,
+      humanNotifications: [{ id: "notif_epic_rollup_wf_1", type: "manager_escalation", acknowledged: false }],
+    };
+    const res = await mod.retryPendingEpicRollups(PENDING_ROLLUP);
+
+    expect(res).toMatchObject({ claimed: true, ok: true });
+    expect(h.state.rollupCleared).toEqual(["wf_1"]);
+    expect(h.state.freshWorkflow.humanNotifications[0].acknowledged).toBe(true);
+    expect(h.state.finalized).toEqual(["wf_1"]);
+    warn.mockRestore();
+  });
+
+  it("two sweeps racing the same debt: one lease wins, ONE roll-up runs", async () => {
+    const mod = await load();
+    const [a, b] = await Promise.all([
+      mod.retryPendingEpicRollups(PENDING_ROLLUP),
+      mod.retryPendingEpicRollups(PENDING_ROLLUP),
+    ]);
+
+    expect(h.state.rollupClaims).toHaveLength(2); // both tried…
+    expect([a, b].filter((r) => r.claimed)).toHaveLength(1); // …one owns it
+    expect([a, b].filter((r) => r.reason === "claim_lost")).toHaveLength(1);
+    // One epic Done write, one announcement, one finalize.
+    expect(h.state.ticketUpdates.filter((u) => u.Key?.ticketId === "EPIC-1")).toHaveLength(1);
+    expect(ebEventsOfType("workflow.epic_rolled_up")).toHaveLength(1);
+    expect(h.state.rollupCleared).toEqual(["wf_1"]);
+    expect(h.state.finalized).toEqual(["wf_1"]);
   });
 });
 

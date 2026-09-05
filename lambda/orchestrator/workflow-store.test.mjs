@@ -26,6 +26,8 @@ import {
   appendGateDecision,
   appendNotificationOnce,
   clearEpicRollupPending,
+  claimEpicRollupRetry,
+  EPIC_ROLLUP_RETRY_LEASE_MS,
   mergeTaskMetadataOrTrack,
   parkClaim,
   setProtectionCheck,
@@ -718,10 +720,13 @@ describe("completeWorkflow", () => {
 });
 
 describe("clearEpicRollupPending (TEAM-3991 D1.4)", () => {
-  it("REMOVEs the flag under attribute_exists, with no ExpressionAttributeValues", async () => {
+  it("REMOVEs the flag AND the retry lease under attribute_exists, with no ExpressionAttributeValues", async () => {
     expect(await clearEpicRollupPending("wf_1")).toBe(true);
     const w = writes()[0];
-    expect(w.input.UpdateExpression).toBe("REMOVE epicRollupPending");
+    // TEAM-4099 F5: the lease goes with the debt — a discharged obligation has
+    // nothing left to lease, and REMOVE of an absent attribute is a no-op, so the
+    // completion-path winner (which never took a lease) is unaffected.
+    expect(w.input.UpdateExpression).toBe("REMOVE epicRollupPending, epicRollupClaimedAt");
     expect(w.input.ConditionExpression).toBe("attribute_exists(epicRollupPending)");
     expect(w.input.ExpressionAttributeValues).toBeUndefined();
   });
@@ -729,6 +734,45 @@ describe("clearEpicRollupPending (TEAM-3991 D1.4)", () => {
   it("returns false when the flag is already gone (sweep retry racing the winner)", async () => {
     failNextCondition = true;
     expect(await clearEpicRollupPending("wf_1")).toBe(false);
+  });
+});
+
+/**
+ * TEAM-4099 F5 — the roll-up retry lease.
+ *
+ * The sweep used to take the debt with `claimFinalization`, which SETs `finalizedAt`
+ * — the very attribute createPendingRollupScan excludes on. One failed retry then
+ * removed the run from every future sweep while `epicRollupPending` stayed true, so
+ * the epic sat open forever with nobody responsible. This claim stamps an attribute
+ * NO scan filter reads, and it stamps nothing else.
+ */
+describe("claimEpicRollupRetry (TEAM-4099 F5)", () => {
+  it("SETs only epicRollupClaimedAt, under a still-owed + unfinalized + lease-expired CAS", async () => {
+    const res = await claimEpicRollupRetry("wf_1", { now: "2026-09-05T12:00:00.000Z" });
+    expect(res).toEqual({ won: true });
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("SET epicRollupClaimedAt = :now");
+    // Never finalizedAt: that is the whole bug.
+    expect(w.input.UpdateExpression).not.toContain("finalizedAt");
+    expect(w.input.ConditionExpression).toContain("attribute_exists(epicRollupPending)");
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(finalizedAt)");
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(epicRollupClaimedAt)");
+    expect(w.input.ConditionExpression).toContain("epicRollupClaimedAt < :staleBefore");
+    expect(w.input.ExpressionAttributeValues[":now"]).toBe("2026-09-05T12:00:00.000Z");
+    // The lease window, computed off the caller's clock.
+    expect(w.input.ExpressionAttributeValues[":staleBefore"]).toBe(
+      new Date(Date.parse("2026-09-05T12:00:00.000Z") - EPIC_ROLLUP_RETRY_LEASE_MS).toISOString()
+    );
+  });
+
+  it("honours an explicit leaseMs", async () => {
+    await claimEpicRollupRetry("wf_1", { now: "2026-09-05T12:00:00.000Z", leaseMs: 60_000 });
+    expect(writes()[0].input.ExpressionAttributeValues[":staleBefore"]).toBe("2026-09-05T11:59:00.000Z");
+  });
+
+  it("the loser of the race gets { won: false } and never throws", async () => {
+    failNextCondition = true;
+    expect(await claimEpicRollupRetry("wf_1", { now: "2026-09-05T12:00:00.000Z" })).toEqual({ won: false });
   });
 });
 

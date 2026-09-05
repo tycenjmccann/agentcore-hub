@@ -144,6 +144,13 @@ export default defineConfig({
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.
       "lambda/agentcore-hub-tickets/index.test.mjs",
+      // transition-authz (TEAM-4099 F3) — the authz floor on human-review-gate
+      // decisions, in BOTH ticket providers. `transition_ticket` is an agent tool
+      // with no caller identity, so an agent could move its own merge gate to done
+      // and have gate-bypass.mjs read that status as the approval. Real handlers,
+      // stub DDB / stubbed global fetch; the two files are parity twins.
+      "lambda/agentcore-hub-tickets/transition-authz.test.mjs",
+      "lambda/agentcore-hub-jira/transition-authz.test.mjs",
       // tickets-edge (TEAM-3991 D2.2) — the reverse half of that marker: the
       // ORIGIN ticket becomes blockedBy its fix, which is what turns the fix's
       // completion into an unblock event for the parked origin (wf 1pl3h1).

@@ -197,6 +197,13 @@ export async function POST(
 
   const payload = {
     tool_name: "Tickets___transition_ticket",
+    // TEAM-4099 F3 — the capability marker that lets the tickets/Jira Lambda accept
+    // a human-gate DECISION (approve / request changes / skip). The tool path has no
+    // caller identity, so without this the Lambda cannot tell this route from a dev
+    // agent forging its own reviewer's sign-off. Set here and not in the body: this
+    // is the route that also writes the gate ledger row below, which is what makes
+    // the decision auditable. Telegram's gate buttons come through this same route.
+    _caller: "console",
     parameters: {
       ticket_id: ticketId,
       transition_id: targetStatus,

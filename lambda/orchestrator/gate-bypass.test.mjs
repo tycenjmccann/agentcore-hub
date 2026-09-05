@@ -22,7 +22,10 @@ import {
   hasUnackedGateBypass,
   ackedGateBypasses,
   gateBypassBlockReason,
+  gateDoneWithoutLedger,
+  gateLedgerEpoch,
   GATE_BYPASS_GRACE_MS,
+  GATE_LEDGER_EPOCH_DEFAULT,
 } from "./gate-bypass.mjs";
 
 // ─── harness ──────────────────────────────────────────────────────────────────
@@ -82,6 +85,13 @@ const pr = (number, mergedAt, extra = {}) => ({
   ...extra,
 });
 const decision = (verdict, ms, extra = {}) => ({ decision: verdict, decidedAt: iso(ms), ...extra });
+
+/**
+ * A run old enough to predate the gate ledger (TEAM-4099 F3): created before
+ * GATE_LEDGER_EPOCH and carrying no `reviewGateHistory` attribute at all. Only such
+ * a run may treat a `done` gate ticket as the approval.
+ */
+const PRE_LEDGER_WF = { createdAt: "2026-09-01T00:00:00Z" };
 
 const GATE_DEF = {
   reviewGates: [
@@ -238,16 +248,95 @@ describe("approvalsFor", () => {
     expect(rows.every((r) => r.approvalSource === "ledger")).toBe(true);
   });
 
-  it("empty ledger + gate ticket done → one legacy_status APPROVE at updatedAt", () => {
-    const rows = approvalsFor({}, { ticketId: "TEAM-9", status: "done", updatedAt: iso(NOW - 900_000) });
+  it("empty ledger + gate ticket done on a PRE-LEDGER run → one legacy_status APPROVE at updatedAt", () => {
+    const rows = approvalsFor(PRE_LEDGER_WF, { ticketId: "TEAM-9", status: "done", updatedAt: iso(NOW - 900_000) });
     expect(rows).toEqual([
       { decision: "APPROVE", decidedAt: iso(NOW - 900_000), approvalSource: "legacy_status" },
     ]);
   });
 
   it("empty ledger + gate ticket still open → no approvals", () => {
-    expect(approvalsFor({}, { ticketId: "TEAM-9", status: "in_review" })).toEqual([]);
-    expect(approvalsFor({}, null)).toEqual([]);
+    expect(approvalsFor(PRE_LEDGER_WF, { ticketId: "TEAM-9", status: "in_review" })).toEqual([]);
+    expect(approvalsFor(PRE_LEDGER_WF, null)).toEqual([]);
+  });
+});
+
+// ─── the legacy_status fence (TEAM-4099 F3) ───────────────────────────────────
+
+/**
+ * F3, second half: `legacy_status` was a forgeable approval. `transition_ticket`
+ * is an ordinary agent tool with no caller identity, so an agent could move its own
+ * merge gate to `done` and have the detector read that board status as the APPROVE
+ * that certified the merge it had just performed. The stand-in is now fenced to runs
+ * that provably predate the ledger; for everything else a `done` gate with no
+ * APPROVE row is simply no approval.
+ */
+describe("legacy_status is fenced to pre-ledger runs", () => {
+  const savedEpoch = process.env.GATE_LEDGER_EPOCH;
+  afterEach(() => {
+    if (savedEpoch === undefined) delete process.env.GATE_LEDGER_EPOCH;
+    else process.env.GATE_LEDGER_EPOCH = savedEpoch;
+  });
+
+  const doneGate = { ticketId: "TEAM-9", status: "done", updatedAt: iso(NOW - 900_000) };
+
+  it("a NEW run (created after the epoch) gets NO approval from a done gate", () => {
+    const wf = { createdAt: iso(NOW - 3_600_000) }; // 2026-09-05T11:00Z, post-epoch
+    expect(approvalsFor(wf, doneGate)).toEqual([]);
+    expect(gateDoneWithoutLedger(wf, doneGate)).toBe(true);
+  });
+
+  // A run with the attribute demonstrably had a ledger to write to, so an empty one
+  // is a real absence of decisions — not the pre-ledger blind spot.
+  it("a run that HAS a reviewGateHistory attribute is never eligible, however old", () => {
+    for (const history of [{}, { "TEAM-9": {} }, { "TEAM-9": { decisions: [] } }]) {
+      const wf = { createdAt: "2026-08-01T00:00:00Z", reviewGateHistory: history };
+      expect(approvalsFor(wf, doneGate)).toEqual([]);
+      expect(gateDoneWithoutLedger(wf, doneGate)).toBe(true);
+    }
+  });
+
+  // A run that cannot prove it predates the ledger does not get the ledger's
+  // exemption — absent/garbage createdAt is not evidence of age.
+  it("an absent or unparseable createdAt is not evidence of age", () => {
+    for (const wf of [{}, { createdAt: null }, { createdAt: "last tuesday" }]) {
+      expect(approvalsFor(wf, doneGate)).toEqual([]);
+      expect(gateDoneWithoutLedger(wf, doneGate)).toBe(true);
+    }
+  });
+
+  it("an OLD run with no ledger attribute keeps the legacy stand-in", () => {
+    expect(approvalsFor(PRE_LEDGER_WF, doneGate)[0]).toMatchObject({ approvalSource: "legacy_status" });
+    expect(gateDoneWithoutLedger(PRE_LEDGER_WF, doneGate)).toBe(false);
+  });
+
+  it("a real ledger APPROVE always wins, on either side of the epoch", () => {
+    const wf = {
+      createdAt: iso(NOW - 3_600_000),
+      reviewGateHistory: { "TEAM-9": { decisions: [decision("APPROVE", NOW - 1_800_000)] } },
+    };
+    expect(approvalsFor(wf, doneGate)).toEqual([
+      { decision: "APPROVE", decidedAt: iso(NOW - 1_800_000), approvalSource: "ledger" },
+    ]);
+    expect(gateDoneWithoutLedger(wf, doneGate)).toBe(false);
+  });
+
+  it("gateDoneWithoutLedger only speaks about DONE gates", () => {
+    expect(gateDoneWithoutLedger({}, { ticketId: "TEAM-9", status: "in_review" })).toBe(false);
+    expect(gateDoneWithoutLedger({}, null)).toBe(false);
+  });
+
+  it("GATE_LEDGER_EPOCH overrides the default for a later deploy", () => {
+    delete process.env.GATE_LEDGER_EPOCH;
+    expect(gateLedgerEpoch()).toBe(GATE_LEDGER_EPOCH_DEFAULT);
+    process.env.GATE_LEDGER_EPOCH = "not a date";
+    expect(gateLedgerEpoch()).toBe(GATE_LEDGER_EPOCH_DEFAULT); // garbage never widens the fence
+
+    // An operator who shipped the ledger later moves the fence forward: a run this
+    // default would call "new" is legacy again under their own epoch.
+    process.env.GATE_LEDGER_EPOCH = "2026-10-01T00:00:00Z";
+    const wf = { createdAt: iso(NOW - 3_600_000) };
+    expect(approvalsFor(wf, doneGate)[0]).toMatchObject({ approvalSource: "legacy_status" });
   });
 });
 
@@ -406,6 +495,9 @@ describe("runGateBypassCheck", () => {
       gateTicketId: GATE,
       approvedAt: null,
       approvalSource: null,
+      // The gate is still in_review here, so "no approval yet" needs no explanation
+      // beyond the missing ledger row (contrast the F3 done-gate case below).
+      reason: null,
       mode: "enforce",
     });
 
@@ -701,15 +793,15 @@ describe("wf sffzti replay — 4 PRs merged before any approval", () => {
     expect(store.notifications).toEqual([]);
   });
 
-  it("control: the gate ticket merely being done (legacy, no ledger) approves at ITS timestamp", async () => {
-    // A legacy run whose gate ticket closed AFTER the merges is still a bypass —
-    // "the gate is done now" was exactly the check that let sffzti through.
+  /** The same replay with the gate ticket already CLOSED (no ledger row). */
+  async function replayWithDoneGate(workflowExtra) {
     const events = [];
     const store = makeStore();
     const result = await runGateBypassCheck({
       workflow: {
         id: WF_ID,
         repoConfig: { repos: [{ url: "https://github.com/o/r", defaultBranch: "main" }] },
+        ...workflowExtra,
       },
       ticket: { ticketId: DEV, assignee: "agentcore_hub_release_manager", status: "done" },
       children: [
@@ -727,8 +819,29 @@ describe("wf sffzti replay — 4 PRs merged before any approval", () => {
         mode: "enforce",
       },
     });
+    return { result, events, store };
+  }
+
+  it("control: on a PRE-LEDGER run the gate ticket merely being done approves at ITS timestamp", async () => {
+    // A legacy run whose gate ticket closed AFTER the merges is still a bypass —
+    // "the gate is done now" was exactly the check that let sffzti through.
+    const { result, events } = await replayWithDoneGate(PRE_LEDGER_WF);
     expect(result.bypasses).toBe(4);
     expect(events).toHaveLength(4);
+    expect(events.every((e) => e.detail.reason === null)).toBe(true);
+  });
+
+  // TEAM-4099 F3: the same fixture on a CURRENT run. The gate is done, the merges
+  // came before it, and there is no ledger row — so the status is not an approval at
+  // all and the escalation says which.
+  it("on a NEW run a done gate with no ledger row is no approval: reason=gate_done_without_ledger", async () => {
+    const { result, events, store } = await replayWithDoneGate({ createdAt: iso(NOW - 7_200_000) });
+    expect(result.bypasses).toBe(4);
+    expect(result.verdicts.every((v) => v.verdict === "bypass")).toBe(true);
+    expect(result.verdicts.every((v) => v.approvalSource === "none")).toBe(true);
+    expect(events.every((e) => e.detail.reason === "gate_done_without_ledger")).toBe(true);
+    expect(events.every((e) => e.detail.approvalSource === "none")).toBe(true);
+    expect(store.notifications[0].details).toContain("a board status is not an approval");
   });
 });
 

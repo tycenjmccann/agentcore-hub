@@ -264,3 +264,54 @@ merge nobody approved.
 
 The shape generalizes: when a claim needs a state other than live/stale, add an attribute and
 teach the ONE CAS about it — never a second liveness predicate.
+
+## Addendum (2026-09-05): a claim must not be borrowed from a scan it is filtered on — `epicRollupClaimedAt`
+
+TEAM-4099 F5. The epic roll-up debt (`epicRollupPending`, created atomically with the terminal
+claim — D1.4) is retried by the reconcile sweep, which finds it with a narrowly-filtered scan:
+`#p = :complete AND attribute_exists(epicRollupPending) AND attribute_not_exists(finalizedAt)`
+(`sweep-scan.mjs createPendingRollupScan`). The retry path reused `claimFinalization` to take the
+debt — and `claimFinalization` SETs `finalizedAt`, the exact attribute that scan excludes on. So a
+single failed retry removed the run from every future sweep while `epicRollupPending` was still
+true: the epic sat open on the board forever with nobody left responsible for it, which is the
+same wf 7ef4fp symptom D1.4 existed to fix, now with a claim on top of it.
+
+`claimEpicRollupRetry(workflowId, {now, leaseMs})` is a lease on an attribute NO scan filter reads:
+`SET epicRollupClaimedAt = :now` under `attribute_exists(epicRollupPending) AND
+attribute_not_exists(finalizedAt) AND (attribute_not_exists(epicRollupClaimedAt) OR
+epicRollupClaimedAt < :staleBefore)`. Nothing on the retry path touches `finalizedAt` until the
+roll-up has actually landed, so a failed attempt leaves the row exactly as the debt scan wants to
+find it. The lease is deliberately NOT released on failure: `rollUpEpic` already burns three
+attempts with backoff internally, so one retry per ~10-minute window is the back-pressure we want,
+and the lease expiring on its own is what makes the next sweep window retry. `rollUpEpic` is
+idempotent (Done → Done is a success), so a live completer racing a sweep costs a duplicate event,
+never corruption.
+
+Generalized: a claim attribute is part of the query surface. Before reusing an existing claim for
+a new obligation, check what SCANS filter on it — a claim that writes an attribute its own
+discovery query excludes on makes failure permanent rather than retryable.
+
+## Addendum (2026-09-05): a board status is not an authorization — the gate-ledger epoch
+
+TEAM-4099 F3, adjacent to the claim work above rather than a race. The bypass detector compared
+each merge against the gate LEDGER (`reviewGateHistory[gate].decisions`), but fell back to
+synthesizing an APPROVE (`approvalSource: "legacy_status"`) whenever the ledger was empty and the
+gate ticket merely sat in `done`. `Tickets___transition_ticket` is an ordinary agent tool, the tool
+path carries no caller identity, and `in_review → done` was a legal transition on it — so a dev or
+fix agent could move its own Merge Approval gate to `done` and have the detector then certify the
+merge it had just performed as `clean`. A forgeable approval is worse than no approval, because it
+reads as evidence.
+
+Both halves are now closed. In the two ticket Lambdas, a human-review gate (`human:*` assignee /
+`reviewer:*` label) can only be moved out of review, or to a terminal `done`, by a caller carrying
+an explicit `_caller` marker read from the invocation ENVELOPE — `console` | `telegram` |
+`orchestrator`, set by the console transition route (which is also what Telegram's gate buttons
+drive, and the only writer of ledger rows) and the orchestrator's own tool invokes. An agent owns
+the arguments object, never the envelope, so the marker cannot be forged from inside `parameters`.
+In `gate-bypass.mjs`, `legacy_status` is fenced to runs that provably predate the ledger: no
+`reviewGateHistory` attribute at all AND `createdAt < GATE_LEDGER_EPOCH` (default
+`2026-09-05T02:10:25Z`, the commit that first wrote a human decision to the ledger; env-overridable
+for a later deploy). For any current run a `done` gate with no APPROVE row is simply no approval —
+verdict `bypass`, `approvalSource: "none"`, reason `gate_done_without_ledger`. A defence that lives
+in only one Lambda is not an authz floor: the fence also covers a status set before the guard
+shipped, or set by a future writer that forgets it.

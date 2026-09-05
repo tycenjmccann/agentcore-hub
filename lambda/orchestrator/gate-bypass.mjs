@@ -19,6 +19,29 @@
 
 export const GATE_BYPASS_GRACE_MS = 180000; // 3 min — clock skew between GitHub and the ledger
 
+/**
+ * TEAM-4099 F3 — when the gate-decision ledger began recording human approvals.
+ *
+ * Derived from b56f1ae (2026-09-05T02:10:25Z), the commit that added
+ * `recordGateDecision` to the console transition route — the first point at which
+ * a human APPROVE could be written to `reviewGateHistory[gate].decisions` at all.
+ * (`reviewGateHistory` itself predates it, shipping on main in dc39094 with
+ * `rounds`/`escalations`/`authorizations` only — no `decisions`.) Runs created
+ * before this could not possibly carry a decision row, so for them a gate ticket
+ * sitting in `done` is the only surviving evidence of an approval. Runs created
+ * after it have no such excuse.
+ *
+ * `GATE_LEDGER_EPOCH` overrides it — an operator who deploys the ledger later than
+ * it was committed must be able to say so, or the detector would judge their real
+ * legacy runs as bypasses.
+ */
+export const GATE_LEDGER_EPOCH_DEFAULT = "2026-09-05T02:10:25Z";
+
+export function gateLedgerEpoch() {
+  const raw = String(process.env.GATE_LEDGER_EPOCH || "").trim();
+  return Number.isFinite(Date.parse(raw)) ? raw : GATE_LEDGER_EPOCH_DEFAULT;
+}
+
 const APPROVE = "APPROVE";
 const REJECT_RE = /^(REQUEST_CHANGES|REJECT|REJECTED)$/i;
 
@@ -77,20 +100,63 @@ export function findMergeApprovalGate(children, workflowDef, { gatePhaseOf } = {
 }
 
 /**
+ * TEAM-4099 F3 — is a `done` gate ticket with no ledger row allowed to STAND IN
+ * for an approval on this run?
+ *
+ * Only for runs that predate the ledger. The board status of a ticket is not an
+ * authorization: `Tickets___transition_ticket` is an ordinary agent tool, it carries
+ * no caller identity, and `in_review → done` was a legal transition on it — so any
+ * dev or fix agent could move its own merge gate to `done` and have this detector
+ * then certify the merge it had just performed as `clean`. (The tool path is now
+ * closed too — see the trusted-caller guard in the tickets/Jira Lambdas — but a
+ * defence that lives only in one Lambda is not an authz floor: this is the second
+ * half, and it is the half that also covers a status set before that guard shipped,
+ * or set by any future writer that forgets it.)
+ *
+ * "Predates the ledger" is deliberately strict on BOTH counts: the run must carry
+ * no `reviewGateHistory` attribute at all (a run with a ledger demonstrably had one
+ * available to write to), AND have been created before `GATE_LEDGER_EPOCH`.
+ */
+export function gateDoneWithoutLedger(workflow, gateTicket, { epoch = gateLedgerEpoch() } = {}) {
+  if (!gateTicket || String(gateTicket.status || "").toLowerCase() !== "done") return false;
+  const gateId = ticketIdOf(gateTicket);
+  if ((workflow?.reviewGateHistory?.[gateId]?.decisions || []).length > 0) return false;
+  return !legacyStatusEligible(workflow, { epoch });
+}
+
+function legacyStatusEligible(workflow, { epoch = gateLedgerEpoch() } = {}) {
+  if (workflow?.reviewGateHistory !== undefined && workflow?.reviewGateHistory !== null) return false;
+  const createdMs = Date.parse(workflow?.createdAt || "");
+  const epochMs = Date.parse(epoch);
+  // An unparseable/absent createdAt is NOT evidence of age — a run that cannot
+  // prove it predates the ledger does not get the ledger's exemption.
+  return Number.isFinite(createdMs) && Number.isFinite(epochMs) && createdMs < epochMs;
+}
+
+/**
  * The ordered gate decisions for a gate ticket.
  *
  * Runs that predate the ledger (TEAM-3987) have no `reviewGateHistory` rows at
  * all — for those a gate ticket sitting in `done` IS the approval, stamped
  * `approvalSource: "legacy_status"` so the escalation can say so honestly.
  * Anything else carries `approvalSource: "ledger"`.
+ *
+ * TEAM-4099 F3: the `legacy_status` stand-in is fenced to those runs only (see
+ * gateDoneWithoutLedger). On a post-epoch run a `done` gate with no APPROVE row is
+ * simply no approval — which is what makes the merge it was supposed to authorize
+ * a bypass.
  */
-export function approvalsFor(workflow, gateTicket) {
+export function approvalsFor(workflow, gateTicket, { epoch = gateLedgerEpoch() } = {}) {
   const gateId = ticketIdOf(gateTicket);
   const rows = (gateId && workflow?.reviewGateHistory?.[gateId]?.decisions) || [];
   if (Array.isArray(rows) && rows.length > 0) {
     return rows.map((r) => ({ ...r, approvalSource: r.approvalSource || "ledger" }));
   }
-  if (gateTicket && String(gateTicket.status || "").toLowerCase() === "done") {
+  if (
+    gateTicket &&
+    String(gateTicket.status || "").toLowerCase() === "done" &&
+    legacyStatusEligible(workflow, { epoch })
+  ) {
     return [{
       decision: APPROVE,
       decidedAt: gateTicket.updatedAt || gateTicket.completedAt || null,
@@ -109,7 +175,17 @@ export function approvalsFor(workflow, gateTicket) {
  *              ledger row may still be in flight. Re-evaluated later (F10).
  *   bypass   — merged with no standing approval. Everything else.
  */
-export function evaluateGateBypass({ mergedPrs = [], decisions = [], nowMs = Date.now(), graceMs = GATE_BYPASS_GRACE_MS } = {}) {
+export function evaluateGateBypass({
+  mergedPrs = [],
+  decisions = [],
+  nowMs = Date.now(),
+  graceMs = GATE_BYPASS_GRACE_MS,
+  // TEAM-4099 F3 — why there is no approval, when we know: `gate_done_without_ledger`
+  // means the gate ticket IS `done` but nobody recorded a decision, on a run new
+  // enough that its status cannot stand in for one. Provenance only; a bypass is a
+  // bypass either way.
+  noApprovalReason = null,
+} = {}) {
   const rows = (Array.isArray(decisions) ? decisions : [])
     .map((d) => ({ ...d, ms: Date.parse(d?.decidedAt || "") }))
     .filter((d) => Number.isFinite(d.ms));
@@ -144,7 +220,8 @@ export function evaluateGateBypass({ mergedPrs = [], decisions = [], nowMs = Dat
       ...base,
       verdict: "bypass",
       approvedAt: null,
-      approvalSource: approve ? approve.approvalSource || "ledger" : null,
+      approvalSource: approve ? approve.approvalSource || "ledger" : noApprovalReason ? "none" : null,
+      ...(approve ? {} : noApprovalReason ? { reason: noApprovalReason } : {}),
     };
   });
 }
@@ -301,7 +378,11 @@ export async function runGateBypassCheck({ workflow, ticket, children, workflowD
     const nowMs = now();
     const gateTicketId = ticketIdOf(found.ticket);
     const decisions = approvalsFor(workflow, found.ticket);
-    const verdicts = evaluateGateBypass({ mergedPrs: merged, decisions, nowMs, graceMs });
+    // TEAM-4099 F3: a `done` gate on a post-epoch run with no decision row is not
+    // an approval — record WHY the merge is unapproved so the escalation can say
+    // "the gate is done but nobody signed it" rather than "nobody touched it".
+    const noApprovalReason = gateDoneWithoutLedger(workflow, found.ticket) ? "gate_done_without_ledger" : null;
+    const verdicts = evaluateGateBypass({ mergedPrs: merged, decisions, nowMs, graceMs, noApprovalReason });
 
     const bypassing = verdicts.filter((v) => v.verdict === "bypass");
     const deferrals = verdicts.filter((v) => v.verdict === "deferred");
@@ -346,6 +427,7 @@ export async function runGateBypassCheck({ workflow, ticket, children, workflowD
           gateTicketId,
           approvedAt: null,
           approvalSource: v.approvalSource,
+          reason: v.reason || null,
           mode,
         });
       }
@@ -356,7 +438,13 @@ export async function runGateBypassCheck({ workflow, ticket, children, workflowD
       const message =
         `Merge without approval: PR #${v.number} (${v.prUrl || "no url"}) merged at ${v.mergedAt} ` +
         `as ${v.mergeCommit || "unknown commit"}, but the Merge Approval gate` +
-        `${gateTicketId ? ` (${gateTicketId})` : ""} has no APPROVE recorded at or before that time.`;
+        `${gateTicketId ? ` (${gateTicketId})` : ""} has no APPROVE recorded at or before that time.` +
+        // TEAM-4099 F3: name the "done but unsigned" shape explicitly — a gate whose
+        // board status says approved while the ledger says nobody decided is the exact
+        // thing a forged transition looks like, and the human needs to hear it.
+        (v.reason === "gate_done_without_ledger"
+          ? ` The gate ticket is marked done, but no human decision was recorded for it — a board status is not an approval.`
+          : "");
       // F1 (TEAM-4099): `type`, not `kind` — the escalations route, the Telegram
       // intake and the WM watch gate all select on `type === "manager_escalation"`,
       // so a `kind`-shaped notification was invisible and could never be acked,

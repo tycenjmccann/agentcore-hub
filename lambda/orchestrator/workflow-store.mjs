@@ -958,18 +958,74 @@ export async function claimTerminalOutcome(workflowId, outcome, completedAt, rea
  * stamped by the completeWorkflow CAS is discharged. Scoped REMOVE; a run whose
  * flag is already gone (a sweep retry that raced the winner) returns false
  * instead of throwing.
+ *
+ * TEAM-4099 F5: the retry lease goes with the debt — a discharged obligation has
+ * nothing left to lease, and REMOVE of an absent attribute is a no-op, so the
+ * completion-path winner (which never took a lease) is unaffected.
  */
 export async function clearEpicRollupPending(workflowId) {
   try {
     await _ddb.send(new UpdateCommand({
       TableName: _table,
       Key: { workflowId },
-      UpdateExpression: "REMOVE epicRollupPending",
+      UpdateExpression: "REMOVE epicRollupPending, epicRollupClaimedAt",
       ConditionExpression: "attribute_exists(epicRollupPending)",
     }));
     return true;
   } catch (err) {
     if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/** How long one epic-roll-up retry owns the debt before another sweep may take it. */
+export const EPIC_ROLLUP_RETRY_LEASE_MS = 10 * 60 * 1000;
+
+/**
+ * TEAM-4099 F5 — claim ONE attempt at an outstanding epic roll-up.
+ *
+ * The sweep used to take the debt via `claimFinalization`, which SETs
+ * `finalizedAt`. That is fatal on failure: `finalizedAt` is exactly the attribute
+ * the pending-roll-up scan excludes on (sweep-scan.mjs
+ * `attribute_exists(epicRollupPending) AND attribute_not_exists(finalizedAt)`), so
+ * one failed retry marked the run "every side effect ran" while `epicRollupPending`
+ * was still true — and no future sweep could ever see it again. The epic stayed
+ * open forever with nobody responsible, the precise failure mode D1.4's
+ * obligation flag exists to prevent.
+ *
+ * So the retry takes a LEASE instead of a completion marker: `epicRollupClaimedAt`
+ * is not read by any scan filter, so a failed attempt leaves the row still
+ * matching the debt list. `finalizedAt` is written only by `markFinalized`, after
+ * the roll-up actually lands.
+ *
+ * The lease doubles as back-pressure: it is deliberately NOT released on failure,
+ * so a run whose epic write keeps being rejected is retried once per lease window
+ * rather than once per sweep (rollUpEpic already burns 3 attempts with backoff
+ * inside a single call). An owner that dies mid-attempt is covered by the same
+ * expiry.
+ *
+ * Mutual exclusion is between RETRIES. A live completer mid-roll-up is not
+ * excluded (there is no marker for its in-flight window) — that is intentional:
+ * rollUpEpic is idempotent by construction (a Done epic transitioned to Done again
+ * is a success), so a duplicate roll-up costs a duplicate event, whereas the old
+ * exclusion cost a permanently stranded epic.
+ */
+export async function claimEpicRollupRetry(workflowId, { now = new Date().toISOString(), leaseMs = EPIC_ROLLUP_RETRY_LEASE_MS } = {}) {
+  const nowMs = Date.parse(now);
+  const staleBefore = new Date((Number.isFinite(nowMs) ? nowMs : Date.now()) - leaseMs).toISOString();
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET epicRollupClaimedAt = :now",
+      ConditionExpression:
+        "attribute_exists(epicRollupPending) AND attribute_not_exists(finalizedAt) AND " +
+        "(attribute_not_exists(epicRollupClaimedAt) OR epicRollupClaimedAt < :staleBefore)",
+      ExpressionAttributeValues: { ":now": now, ":staleBefore": staleBefore },
+    }));
+    return { won: true };
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return { won: false };
     throw err;
   }
 }

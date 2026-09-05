@@ -535,7 +535,7 @@ async function addBlockers(params) {
   return { status: "ok", ticket_id, added };
 }
 
-async function transitionTicket(params) {
+async function transitionTicket(params, { caller = null } = {}) {
   const { ticket_id, transition_id, reason } = params;
 
   const targetStatus = transition_id;
@@ -545,14 +545,41 @@ async function transitionTicket(params) {
   const isSkip = targetStatus === "skip";
   const effectiveStatus = isSkip ? "Done" : jiraStatusName;
 
+  // One read serves both gate checks: `labels` says whether this is a human-review
+  // gate, `status` says whether we are taking it out of In Review. Skipped entirely
+  // for a trusted caller that is not targeting In Review, so the common
+  // agent transition (its own ticket → Done) still costs no extra Jira call.
+  const targetsInReview = jiraStatusName.toLowerCase() === "in review";
+  let gateLabels = [];
+  let currentStatusName = "";
+  if (targetsInReview || !caller) {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,status`);
+    gateLabels = issue?.fields?.labels || [];
+    currentStatusName = String(issue?.fields?.status?.name || "");
+  }
+  const isHumanGate = gateLabels.some((l) => l.startsWith("reviewer:"));
+
   // in_review is reserved for human-review-gate tickets (reviewer:<who> label).
   // An agent ticket parked there is never invoked → the workflow stalls. Reject.
-  if (jiraStatusName.toLowerCase() === "in review") {
-    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels`);
-    const labels = issue?.fields?.labels || [];
-    if (!labels.some((l) => l.startsWith("reviewer:"))) {
-      throw new Error(`Cannot move ${ticket_id} to In Review: only human-review tickets can be sent to review.`);
-    }
+  if (targetsInReview && !isHumanGate) {
+    throw new Error(`Cannot move ${ticket_id} to In Review: only human-review tickets can be sent to review.`);
+  }
+
+  // TEAM-4099 F3 — authz floor, mirror of the dynamodb twin
+  // (lambda/agentcore-hub-tickets/index.mjs). Moving a human-review gate OUT of In
+  // Review, or to a terminal Done (including `skip`), IS the reviewer's decision.
+  // The tool path has no caller identity, so without a trusted marker any agent
+  // could sign off its own merge gate — and gate-bypass.mjs would then read that
+  // status as the approval. Gate decisions come from the console/Telegram only,
+  // where they are also written to the gate ledger.
+  if (isHumanGate && !caller &&
+      (currentStatusName.toLowerCase() === "in review" || effectiveStatus.toLowerCase() === "done")) {
+    throw new Error(
+      `Cannot transition ${ticket_id}: it is a human-review gate (${gateLabels.filter((l) => l.startsWith("reviewer:")).join(", ")}) ` +
+      `and "${transition_id}" is that reviewer's decision to make. Gate decisions are only accepted from the ` +
+      `console or Telegram, where they are recorded in the gate ledger. Report your work and leave the gate alone — ` +
+      `moving it yourself does not approve anything.`
+    );
   }
 
   // Add the reason as a comment BEFORE the transition. The transition fires the
@@ -844,6 +871,20 @@ const TOOLS = {
   JiraIntegration___list_reviewers: listReviewers,
 };
 
+/**
+ * TEAM-4099 F3 — the callers allowed to DECIDE a human-review gate. Twin of the
+ * dynamodb Lambda's guard (lambda/agentcore-hub-tickets/index.mjs); see the long
+ * rationale there. Read from the event ROOT and only when the tool arguments came
+ * in NESTED under `parameters`, which is the only shape this handler accepts — an
+ * agent owns the argument object, never the envelope around it.
+ */
+const TRUSTED_CALLERS = new Set(["console", "telegram", "orchestrator"]);
+
+function trustedCallerOf(event) {
+  if (!event?.parameters || typeof event.parameters !== "object") return null;
+  return TRUSTED_CALLERS.has(event?._caller) ? event._caller : null;
+}
+
 export const handler = async (event) => {
   // Load roster from S3 on first invocation (cached for warm starts)
   await loadValidAssignees();
@@ -860,7 +901,7 @@ export const handler = async (event) => {
   }
 
   try {
-    const result = await fn(params);
+    const result = await fn(params, { caller: trustedCallerOf(event) });
     console.log(`[jira-tools] tool=${toolName} result=${JSON.stringify(result).slice(0, 500)}`);
     return result;
   } catch (err) {

@@ -3516,16 +3516,24 @@ async function finalizeWithEpicRollUp(workflow, completeDetail) {
  * this (the scan wiring itself lands with D2.3); exported so that step is a
  * one-line addition rather than a re-implementation.
  *
- * Takes over via the SAME claimFinalization CAS the completion path uses, so a
- * sweep and a live completer can never both roll the epic.
+ * TEAM-4099 F5 — takes a roll-up LEASE (`store.claimEpicRollupRetry`), not the
+ * finalization claim. `claimFinalization` SETs `finalizedAt`, and `finalizedAt` is
+ * what the pending-roll-up scan excludes on: a single failed retry therefore
+ * removed the run from every future sweep while `epicRollupPending` was still set,
+ * stranding the epic open forever. Nothing on this path touches `finalizedAt`
+ * until the roll-up has actually landed — a failed attempt leaves the row exactly
+ * as the debt scan wants to find it, and only the lease (which no scan filter
+ * reads) is held, expiring on its own so the next sweep window retries.
  */
 export async function retryPendingEpicRollups(workflow) {
   if (!workflow?.epicRollupPending || workflow.phase !== "complete" || workflow.finalizedAt) {
     return { claimed: false, ok: false, reason: "not_pending" };
   }
-  const takeover = await store.claimFinalization(workflow.id, new Date().toISOString());
-  if (!takeover) return { claimed: false, ok: false, reason: "claim_lost" };
+  const lease = await store.claimEpicRollupRetry(workflow.id, { now: new Date().toISOString() });
+  if (!lease?.won) return { claimed: false, ok: false, reason: "claim_lost" };
   const result = await rollUpEpic(workflow);
+  // Failure keeps BOTH the debt and the un-finalized row: still pending, still
+  // unfinalized, so `scanPendingRollups` matches it again once the lease ages out.
   if (!result.ok) return { claimed: true, ok: false, reason: result.lastError };
   await store.clearEpicRollupPending(workflow.id);
   await store.ackNotifications(workflow.id, (n) => n.id === `notif_epic_rollup_${workflow.id}`);
@@ -4684,7 +4692,12 @@ async function invokeTicketsOp(op, params) {
   }
   const res = await lambda.send(new InvokeCommand({
     FunctionName: TICKET_TOOLS_LAMBDA,
-    Payload: JSON.stringify({ tool_name: `Tickets___${op}`, parameters }),
+    // TEAM-4099 F3 — server-side invoker marker (see the tickets Lambda's
+    // trustedCallerOf). The orchestrator does not transition human gates through the
+    // tool path at all (it uses jiraTransition / a scoped tickets-table write), so
+    // this grants nothing today; it keeps this seam usable if a transition op is ever
+    // added to it.
+    Payload: JSON.stringify({ tool_name: `Tickets___${op}`, _caller: "orchestrator", parameters }),
   }));
   let payload = JSON.parse(new TextDecoder().decode(res.Payload));
   // Some ops return the MCP { content:[{text}] } envelope — unwrap a JSON body.

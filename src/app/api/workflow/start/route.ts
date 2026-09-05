@@ -726,6 +726,12 @@ async function invokeTicketLambda(toolName: string, params: Record<string, unkno
     InvocationType: "RequestResponse",
     Payload: Buffer.from(JSON.stringify({
       tool_name: toolName,
+      // TEAM-4099 F3 — server-side invoker (see the tickets Lambda's trustedCallerOf).
+      // This route's transitions are epic lifecycle moves (in_progress on start, done
+      // on dedup-fence cleanup), never human-gate decisions, so the marker changes
+      // nothing today; it is here so a future epic-level guard does not silently
+      // break start.
+      _caller: "console",
       parameters: params,
     })),
   }));
