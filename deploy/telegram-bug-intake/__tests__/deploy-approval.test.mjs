@@ -95,6 +95,12 @@ function makeNet(ctx, overrides = {}) {
   const net = { ctx, polls: 0, batches: [], afterPoll: [], workflows: [], sent: [], answered: [], edited: [], ...overrides };
   net.fetch = async (url, opts) => {
     const u = String(url);
+    // GitHub enrichment for buildDeployBrief — served from net.github when set.
+    if (u.startsWith("https://api.github.com/")) {
+      if (u.includes("/pulls")) return jsonRes(net.github?.pulls ?? []);
+      if (u.includes("/commits/")) return jsonRes(net.github?.commit ?? {});
+      return jsonRes({});
+    }
     if (u === `${HUB}/api/workflow/list`) return jsonRes({ workflows: net.workflows });
     if (u.endsWith("/getUpdates")) {
       const i = net.polls++;
@@ -242,6 +248,54 @@ describe("deploy-approval bridge", () => {
 
     expect(cp.approvals.length, "unauthorized chat must not approve a deploy").toBe(0);
     expect(net2.answered[0].text).toMatch(/not authorized/i);
+  });
+
+  it("brief summary = the Summary section, not the ship-review status line; subject not cut mid-key", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    // A pending approval whose Source revision is a real SHA → buildDeployBrief runs.
+    const st = pendingState();
+    st.stageStates[0].actionStates[0].currentRevision = { revisionId: "0cf3f09abc123" };
+    cp.state = st;
+
+    const ctx = makeCtx(100_000);
+    const net = makeNet(ctx, {
+      batches: [[]],
+      github: {
+        commit: { commit: { message: "fix(workflow): submit_workflow source validation (TEAM-4054)" },
+          stats: { additions: 3415, deletions: 74 }, files: new Array(24).fill({}) },
+        pulls: [{
+          number: 512,
+          title: "fix(workflow): submit_workflow source validation — real S3 HeadObject errors, GET-signed presigned URL check, lenient unverified mode (TEAM-4054)",
+          html_url: "https://github.com/o/r/pull/512",
+          body: [
+            "Status: SHIP REVIEW ROUND 3 (head `45694ddc`) = PASS — awaiting the human Merge Approval gate (TEAM-4067).",
+            "Do NOT merge by hand; CD ticket TEAM-4068 performs the squash-merge + `agentcore-hub-deploy`.",
+            "",
+            "## Summary",
+            "Validates the submit_workflow source ref against S3 before a run starts, surfacing the real HeadObject error instead of a generic failure, and adds a lenient unverified mode for presigned URLs.",
+            "",
+            "## Testing",
+            "- [x] unit",
+          ].join("\n"),
+        }],
+      },
+    });
+    global.fetch = net.fetch;
+    await handler({}, ctx);
+
+    expect(net.sent.length).toBe(1);
+    const text = net.sent[0].text;
+    // The human-meaningful summary is present… (esc() escapes _, so match a
+    // substring free of Markdown-escaped chars).
+    expect(text).toMatch(/source ref against S3 before a run starts/);
+    // …and the process/status chatter is NOT the summary.
+    expect(text).not.toMatch(/SHIP REVIEW ROUND 3/);
+    expect(text).not.toMatch(/Do NOT merge by hand/);
+    // Subject dropped the trailing (TEAM-4054) and never cut mid-token "(TEAM-".
+    expect(text).not.toMatch(/\(TEAM-\s|\(TEAM-$|\(TEAM-\n/);
+    expect(text).toMatch(/Workflow: TEAM-4054/);
+    expect(text).toMatch(/Scope: 24 files \(\+3415\/-74\)/);
   });
 
   it("DEPLOY_PIPELINE_NAME unset → no pipeline calls, no ping", async () => {
