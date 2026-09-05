@@ -180,6 +180,11 @@ export default defineConfig({
       // functions in a side-effect-free module (pipeline-enabled.mjs pattern), so
       // the repoCheck→repoConfig→"main" chain runs with no AWS.
       "lambda/orchestrator/default-branch.test.mjs",
+      // runtime-health (TEAM-3992 D4.2) — the coding-runtime health gate +
+      // auto-resume. Fully dependency-injected (fake InvokeAgentRuntime, in-memory
+      // S3 honoring ETag/IfNoneMatch/IfMatch, fake publishEvent + clock), so the
+      // probe/confirm/CAS-outage/backoff/recovery logic runs with no AWS.
+      "lambda/orchestrator/runtime-health.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

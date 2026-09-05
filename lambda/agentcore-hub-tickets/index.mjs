@@ -775,6 +775,16 @@ async function transitionIssue(args) {
     exprValues[":bb"] = blockerList;
   }
 
+  // TEAM-3992 D4.2 — a "block" transition may carry a machine-readable
+  // `block_reason` (e.g. "runtime" when the coding-agent runtime is unreachable),
+  // persisted as `blockReason` so the board can label WHY a ticket is blocked
+  // ("Blocked: runtime outage") and the recovery sweep can find its own parks.
+  if (transition.to === "blocked" && args.block_reason) {
+    updateExpr += ", #brs = :brs";
+    exprNames["#brs"] = "blockReason";
+    exprValues[":brs"] = String(args.block_reason).slice(0, 200);
+  }
+
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE_NAME,

@@ -266,3 +266,45 @@ describe("add_blockers (D3.2)", () => {
     expect(res.content[0].text).toMatch(/done — cannot add blockers to a closed ticket/);
   });
 });
+
+/**
+ * TEAM-3992 D4.2 — a `block` transition may carry a machine-readable
+ * `block_reason`, persisted as the `blockReason` attribute. The orchestrator's
+ * runtime-health gate parks a coding ticket with block_reason:"runtime" so the
+ * board can label WHY it is blocked ("Blocked: runtime outage") and the recovery
+ * sweep can find its own parks. Only a `block` transition consults it.
+ */
+describe("transition_ticket block_reason → blockReason (D4.2)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const upd = () => h.state.edges[0]; // the transition's UpdateCommand (not the counter)
+
+  it("a block transition with block_reason 'runtime' persists blockReason", async () => {
+    h.state.getItem = { ticketId: "TEAM-7", status: "in_progress", assignee: "agentcore_hub_backend_dev" };
+    const res = await transition({ ticket_id: "TEAM-7", transition_id: "block", block_reason: "runtime" });
+    expect(res).toMatchObject({ status: "transitioned", to: "blocked" });
+    expect(upd().Key).toEqual({ ticketId: "TEAM-7" });
+    expect(upd().ExpressionAttributeNames["#brs"]).toBe("blockReason");
+    expect(upd().ExpressionAttributeValues[":brs"]).toBe("runtime");
+    expect(upd().UpdateExpression).toContain("#brs = :brs");
+  });
+
+  it("a block transition WITHOUT block_reason writes no blockReason (unchanged)", async () => {
+    h.state.getItem = { ticketId: "TEAM-7", status: "in_progress", assignee: "agentcore_hub_backend_dev" };
+    await transition({ ticket_id: "TEAM-7", transition_id: "block" });
+    expect(upd().ExpressionAttributeValues[":brs"]).toBeUndefined();
+    expect(upd().UpdateExpression).not.toContain("blockReason");
+  });
+
+  it("a NON-block transition ignores block_reason entirely", async () => {
+    h.state.getItem = { ticketId: "TEAM-7", status: "ready", assignee: "agentcore_hub_backend_dev" };
+    const res = await transition({ ticket_id: "TEAM-7", transition_id: "start", block_reason: "runtime" });
+    expect(res).toMatchObject({ status: "transitioned", to: "in_progress" });
+    expect(upd().ExpressionAttributeValues[":brs"]).toBeUndefined();
+  });
+
+  it("clamps an oversized block_reason to 200 chars (no unbounded attribute)", async () => {
+    h.state.getItem = { ticketId: "TEAM-7", status: "in_progress", assignee: "agentcore_hub_backend_dev" };
+    await transition({ ticket_id: "TEAM-7", transition_id: "block", block_reason: "x".repeat(500) });
+    expect(upd().ExpressionAttributeValues[":brs"].length).toBe(200);
+  });
+});

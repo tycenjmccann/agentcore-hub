@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs fix-tickets.mjs pipeline-enabled.mjs reconcile-sweep.mjs sweep-scan.mjs repo-check.mjs default-branch.mjs gate-bypass.mjs evidence.mjs dag.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs fix-tickets.mjs pipeline-enabled.mjs reconcile-sweep.mjs runtime-health.mjs sweep-scan.mjs repo-check.mjs default-branch.mjs gate-bypass.mjs evidence.mjs dag.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -140,7 +140,20 @@ if [ -n "${PIPELINE_ENABLED:-}" ]; then
   PIPELINE_VARS=",PIPELINE_ENABLED=${PIPELINE_ENABLED}"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${GATE_BYPASS_VARS}${PIPELINE_VARS}}"
+# Coding-runtime health gate (TEAM-3992 D4.2). CODING_AGENT_RUNTIME_ARN is the
+# ONLY thing that arms the gate — unset leaves the orchestrator's pre-D4.2
+# behaviour (fail open, no probe). The probe/confirm/backoff knobs have code
+# defaults; only forward explicit overrides. Sourced from deploy/config.sh
+# (already exported there for the fleet's remote-coding delegation).
+RUNTIME_HEALTH_VARS=""
+if [ -n "${CODING_AGENT_RUNTIME_ARN:-}" ]; then
+  RUNTIME_HEALTH_VARS=",CODING_AGENT_RUNTIME_ARN=${CODING_AGENT_RUNTIME_ARN}"
+  [ -n "${RUNTIME_PROBE_CACHE_MS:-}" ] && RUNTIME_HEALTH_VARS="${RUNTIME_HEALTH_VARS},RUNTIME_PROBE_CACHE_MS=${RUNTIME_PROBE_CACHE_MS}"
+  [ -n "${RUNTIME_PROBE_CONFIRM:-}" ] && RUNTIME_HEALTH_VARS="${RUNTIME_HEALTH_VARS},RUNTIME_PROBE_CONFIRM=${RUNTIME_PROBE_CONFIRM}"
+  [ -n "${RUNTIME_OUTAGE_BACKOFF_MIN:-}" ] && RUNTIME_HEALTH_VARS="${RUNTIME_HEALTH_VARS},RUNTIME_OUTAGE_BACKOFF_MIN=${RUNTIME_OUTAGE_BACKOFF_MIN}"
+fi
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${GATE_BYPASS_VARS}${PIPELINE_VARS}${RUNTIME_HEALTH_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}}"
 
@@ -298,10 +311,10 @@ echo "  ✓ Rule $SWEEP_RULE upserted (rate(5 minutes))"
 # targets on the one rule — the dead-session sweep and the reconcile sweep.
 aws events put-targets \
   --rule "$SWEEP_RULE" \
-  --targets '[{"Id":"orchestrator","Arn":"'"$ORCH_ARN"'","Input":"{\"source\":\"orchestrator.sweep\",\"action\":\"dead_session_sweep\"}"},{"Id":"reconcile","Arn":"'"$ORCH_ARN"'","Input":"{\"source\":\"orchestrator.sweep\",\"action\":\"reconcile_sweep\"}"}]' \
+  --targets '[{"Id":"orchestrator","Arn":"'"$ORCH_ARN"'","Input":"{\"source\":\"orchestrator.sweep\",\"action\":\"dead_session_sweep\"}"},{"Id":"reconcile","Arn":"'"$ORCH_ARN"'","Input":"{\"source\":\"orchestrator.sweep\",\"action\":\"reconcile_sweep\"}"},{"Id":"runtimehealth","Arn":"'"$ORCH_ARN"'","Input":"{\"source\":\"orchestrator.sweep\",\"action\":\"runtime_health_sweep\"}"}]' \
   --region "$AWS_REGION" \
   --output text --query 'FailedEntryCount' >/dev/null
-echo "  ✓ Targets orchestrator (dead_session_sweep + reconcile_sweep) attached to $SWEEP_RULE"
+echo "  ✓ Targets orchestrator (dead_session_sweep + reconcile_sweep + runtime_health_sweep) attached to $SWEEP_RULE"
 
 SWEEP_RULE_ARN="arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:rule/${SWEEP_RULE}"
 SWEEP_PERM_SID="agentcore-hub-orchestrator-dead-session-sweep"
