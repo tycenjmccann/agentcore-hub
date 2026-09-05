@@ -90,6 +90,36 @@ async function loadValidAgents() {
   return VALID_AGENTS;
 }
 
+/**
+ * TEAM-4100 F2 (layer 2, best-effort create-time check) — the set of assignees a
+ * validated ticket plan authorized for a workflow. The plan is persisted by
+ * workflow-output submitTicketPlan (only AFTER it validates against the def's
+ * ticketDag in enforce/shadow mode) at shared/ticket-plan.json in the SAME
+ * bucket this Lambda already reads the roster from — one cheap GetObject, no new
+ * IAM. Returns null when no plan exists or on any read/parse failure: the check
+ * fails OPEN because the orchestrator's realized-graph gate (layer 1) is the
+ * hard gate. Layer 2 only tightens the analyst's create path when it provably can.
+ */
+async function planAssigneeSet(workflowId) {
+  if (!workflowId || !ARTIFACT_BUCKET) return null;
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: `workflows/${workflowId}/shared/ticket-plan.json`,
+    }));
+    const plan = JSON.parse(await res.Body.transformToString());
+    const tickets = Array.isArray(plan?.tickets) ? plan.tickets : [];
+    const set = new Set();
+    for (const t of tickets) {
+      const a = typeof t?.assignee === "string" ? t.assignee.trim() : "";
+      if (a) set.add(a);
+    }
+    return set.size > 0 ? set : null;
+  } catch {
+    return null; // no plan persisted / unreadable → no create-time check
+  }
+}
+
 // TEAM-3686: known workflow phases, for validating the `phase` stamp on
 // fix-kind tickets. completion.mjs's open-fix gate matches fix tickets
 // per-phase (`phaseOf(t) === p` for each required phase p), so a fix ticket
@@ -236,7 +266,7 @@ export const handler = async (event) => {
   try {
     switch (toolName) {
       case "create_ticket":
-        return await createTicket(args);
+        return await createTicket(args, { caller: trustedCallerOf(event) });
       case "get_issue":
         return await getIssue(args);
       case "edit_issue":
@@ -419,7 +449,7 @@ async function addBlockers(args) {
   return { status: "ok", ticket_id: ticketId, added };
 }
 
-async function createTicket(args) {
+async function createTicket(args, { caller } = {}) {
   const { summary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase } = args;
   if (!summary) return textResult("Error: 'summary' is required");
 
@@ -455,6 +485,24 @@ async function createTicket(args) {
       `Error: Invalid assignee "${assignee}". Valid agents are: ${[...VALID_AGENTS].join(", ")}. ` +
       `Note: There is NO "agentcore_hub_ios_dev" agent. iOS/SwiftUI development goes to "agentcore_hub_frontend_dev".`
     );
+  }
+
+  // TEAM-4100 F2 (layer 2) — when a validated plan exists for this workflow, the
+  // analyst may only create AGENT tickets for assignees the plan authorized.
+  // Trusted server-side callers (orchestrator fix/re-verify spawns, console,
+  // telegram) bypass — the orchestrator's tickets are created AFTER the plan and
+  // are exempt from the topology contract (see enforceRealizedGraphGate). Human
+  // gates (human:*) and no-plan runs are not checked. Layer 1 remains the hard
+  // gate; this only tightens the create path when a plan is provably present.
+  if (!caller && assignee && !isHumanReviewer) {
+    const planSet = await planAssigneeSet(workflow_id);
+    if (planSet && !planSet.has(assignee)) {
+      return textResult(
+        `Error: TICKET_NOT_IN_PLAN — assignee "${assignee}" is not in the validated ticket plan ` +
+        `for ${workflow_id}. The plan authorizes: ${[...planSet].sort().join(", ")}. ` +
+        `Update and resubmit the plan (submit_ticket_plan) before creating tickets for a new assignee.`
+      );
+    }
   }
 
   const ticketId = await nextTicketId(project_key);

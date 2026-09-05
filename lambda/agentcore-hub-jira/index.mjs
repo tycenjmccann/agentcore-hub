@@ -71,6 +71,35 @@ async function loadValidAssignees() {
   return VALID_ASSIGNEES;
 }
 
+/**
+ * TEAM-4100 F2 (layer 2, best-effort create-time check) — the set of assignees a
+ * validated ticket plan authorized for a workflow. Twin of the DynamoDB tickets
+ * Lambda's planAssigneeSet: the plan is persisted by workflow-output
+ * submitTicketPlan at shared/ticket-plan.json in the SAME bucket this Lambda
+ * already reads the roster from (one cheap GetObject, no new IAM). Returns null
+ * when no plan exists or on any read/parse failure — fails OPEN because the
+ * orchestrator's realized-graph gate (layer 1) is the hard gate.
+ */
+async function planAssigneeSet(workflowId) {
+  if (!workflowId || !ARTIFACT_BUCKET) return null;
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: `workflows/${workflowId}/shared/ticket-plan.json`,
+    }));
+    const plan = JSON.parse(await res.Body.transformToString());
+    const tickets = Array.isArray(plan?.tickets) ? plan.tickets : [];
+    const set = new Set();
+    for (const t of tickets) {
+      const a = typeof t?.assignee === "string" ? t.assignee.trim() : "";
+      if (a) set.add(a);
+    }
+    return set.size > 0 ? set : null;
+  } catch {
+    return null; // no plan persisted / unreadable → no create-time check
+  }
+}
+
 // ─── Status Mapping ──────────────────────────────────────────────────────────
 
 const INTERNAL_TO_JIRA = {
@@ -209,7 +238,7 @@ async function listReviewers(params = {}) {
 
 // ─── Tool Implementations ────────────────────────────────────────────────────
 
-async function createTicket(params) {
+async function createTicket(params, { caller } = {}) {
   const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, phase } = params;
 
   // Validate assignee against known roster — reject hallucinated agent names.
@@ -222,6 +251,22 @@ async function createTicket(params) {
       `Invalid assignee "${assignee}". Valid agents: ${valid}. ` +
       `Note: There is NO "agentcore_hub_ios_dev" agent. ALL iOS/SwiftUI/Android/Web development goes to "agentcore_hub_frontend_dev".`
     );
+  }
+
+  // TEAM-4100 F2 (layer 2) — when a validated plan exists for this workflow, the
+  // analyst may only create AGENT tickets for assignees the plan authorized.
+  // Trusted server-side callers (orchestrator fix/re-verify spawns, console,
+  // telegram) bypass; human gates (human:*) and no-plan runs are not checked.
+  // Layer 1 (the orchestrator realized-graph gate) remains the hard gate.
+  if (!caller && assignee && !isHumanReviewer) {
+    const planSet = await planAssigneeSet(workflow_id);
+    if (planSet && !planSet.has(assignee)) {
+      throw new Error(
+        `TICKET_NOT_IN_PLAN — assignee "${assignee}" is not in the validated ticket plan ` +
+        `for ${workflow_id}. The plan authorizes: ${[...planSet].sort().join(", ")}. ` +
+        `Update and resubmit the plan (submit_ticket_plan) before creating tickets for a new assignee.`
+      );
+    }
   }
 
   // ─── Idempotency guard ───────────────────────────────────────────────────

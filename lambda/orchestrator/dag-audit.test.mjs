@@ -212,6 +212,10 @@ const readyRecord = () => ({
 let handler;
 async function load() {
   process.env.TICKET_PROVIDER = "dynamodb";
+  // TEAM-4100 F2 — auditRealizedGraphOnce is now the SHADOW/OFF advisory path;
+  // enforce mode runs the HARD gate instead (see dag-enforce-gate.test.mjs).
+  // These tests pin the advisory audit, so run them under shadow.
+  process.env.DAG_VALIDATION_MODE = "shadow";
   vi.resetModules();
   ({ handler } = await import("./index.mjs"));
 }
