@@ -94,6 +94,11 @@ const h = vi.hoisted(() => ({
     epicTransitionThrows: false,
     ticketUpdates: /** @type {any[]} */ ([]),
     finalizationClaimWins: false,
+    // TEAM-4099 F5: the roll-up retry LEASE. `rollupLeases` is the row attribute
+    // (`epicRollupClaimedAt`) the conditional claim reads and writes; `rollupClaims`
+    // records every attempt so the concurrency test can prove both callers tried.
+    rollupLeases: /** @type {Record<string, string>} */ ({}),
+    rollupClaims: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -227,13 +232,43 @@ vi.mock("./workflow-store.mjs", () => ({
   // TEAM-3991 D1.4 — the epic roll-up obligation created atomically with the
   // terminal claim. finalizeWithEpicRollUp clears it on success and escalates
   // once (appendNotificationOnce, id-idempotent) on failure.
-  clearEpicRollupPending: vi.fn(async (id) => { h.state.rollupCleared.push(id); }),
+  clearEpicRollupPending: vi.fn(async (id) => {
+    h.state.rollupCleared.push(id);
+    delete h.state.rollupLeases[id]; // the lease goes with the discharged debt
+  }),
+  /**
+   * TEAM-4099 F5 — the retry lease, mirroring claimEpicRollupRetry's conditional
+   * write: the row must still owe the debt (not cleared), must not be finalized, and
+   * any existing lease must have aged out. Check-and-set with no await in between,
+   * so two concurrent callers genuinely race for one winner.
+   */
+  claimEpicRollupRetry: vi.fn(async (id, { now = new Date().toISOString(), leaseMs = 10 * 60 * 1000 } = {}) => {
+    h.state.rollupClaims.push({ id, now, leaseMs });
+    if (h.state.rollupCleared.includes(id) || h.state.finalized.includes(id)) return { won: false };
+    const held = h.state.rollupLeases[id];
+    if (held && Date.parse(now) - Date.parse(held) < leaseMs) return { won: false };
+    h.state.rollupLeases[id] = now;
+    return { won: true };
+  }),
   appendNotificationOnce: vi.fn(async (id, n) => {
     if (h.state.notifications.some((x) => x.n?.id === n.id && !x.n?.acknowledged)) return false;
     h.state.notifications.push({ id, n });
     return true;
   }),
-  ackNotifications: vi.fn(async () => 0),
+  // TEAM-4099 F1 — the ack has to be observable, because "acked" is now a THIRD
+  // completion state (accepted bypass → honest blocked close), not just the
+  // absence of a block. Applies to the fresh snapshot, like mergeTaskMetadata.
+  ackNotifications: vi.fn(async (id, predicate) => {
+    const wf = h.state.freshWorkflow?.id === id ? h.state.freshWorkflow : null;
+    if (!wf || !Array.isArray(wf.humanNotifications)) return 0;
+    let acked = 0;
+    wf.humanNotifications = wf.humanNotifications.map((n) => {
+      if (n.acknowledged || !predicate(n)) return n;
+      acked++;
+      return { ...n, acknowledged: true, acknowledgedAt: "2026-09-05T13:00:00Z" };
+    });
+    return acked;
+  }),
 }));
 
 // Set before importing index.mjs: the roster/def loaders early-return to the
@@ -307,6 +342,8 @@ beforeEach(() => {
   h.state.ticketUpdates.length = 0;
   h.state.epicTransitionThrows = false;
   h.state.finalizationClaimWins = false;
+  h.state.rollupLeases = {};
+  h.state.rollupClaims.length = 0;
   // No real sleeping in the roll-up retry budget.
   process.env.EPIC_ROLLUP_BACKOFF_MS = "0";
   delete process.env.COMPLETION_EVIDENCE_REQUIRED;
@@ -1207,6 +1244,24 @@ describe("completeWorkflow — open gate, CD evidence, atomic epic roll-up (TEAM
     // no evidence — stamping phase:"ship" on it would make the F3 gate demand one.
   };
   const CD_KEY = "workflows/wf_1/shared/cd-evidence/deploy-20260905T0100Z.md";
+  /** A run that closed green and still owes its epic roll-up (TEAM-4099 F5). */
+  const PENDING_ROLLUP = { id: "wf_1", epicId: "EPIC-1", phase: "complete", epicRollupPending: true };
+
+  /**
+   * The REAL debt filter, captured from sweep-scan.mjs rather than restated here —
+   * "the row still matches the sweep filter" is only worth asserting against the
+   * expression the sweep actually sends.
+   */
+  async function pendingRollupFilterExpression() {
+    const { createPendingRollupScan } = await import("./sweep-scan.mjs");
+    let captured = null;
+    const scan = createPendingRollupScan({
+      ddb: { send: async (cmd) => { captured = cmd.input; return { Items: [] }; } },
+      workflowsTable: "workflows",
+    });
+    await scan();
+    return String(captured.FilterExpression);
+  }
 
   // The cd-evidence harvest is gated on ARTIFACT_BUCKET, read at module load —
   // and the suites above delete it in their afterEach, so re-assert it here.
@@ -1338,14 +1393,12 @@ describe("completeWorkflow — open gate, CD evidence, atomic epic roll-up (TEAM
     warn.mockRestore();
   });
 
-  it("retryPendingEpicRollups: the sweep takes over through the SAME finalization CAS and recovers", async () => {
-    h.state.finalizationClaimWins = true;
+  it("retryPendingEpicRollups: the sweep takes the debt under a roll-up LEASE and recovers", async () => {
     const mod = await load();
-    const res = await mod.retryPendingEpicRollups({
-      id: "wf_1", epicId: "EPIC-1", phase: "complete", epicRollupPending: true,
-    });
+    const res = await mod.retryPendingEpicRollups(PENDING_ROLLUP);
 
     expect(res).toMatchObject({ claimed: true, ok: true, attempts: 1 });
+    expect(h.state.rollupClaims).toHaveLength(1);
     expect(h.state.rollupCleared).toEqual(["wf_1"]);
     expect(ebEventsOfType("workflow.epic_rolled_up")).toHaveLength(1);
     expect(ebEventsOfType("workflow.epic_rolled_up")[0]).toMatchObject({
@@ -1354,16 +1407,92 @@ describe("completeWorkflow — open gate, CD evidence, atomic epic roll-up (TEAM
     expect(h.state.finalized).toEqual(["wf_1"]); // finalized at last
   });
 
-  it("retryPendingEpicRollups declines a run that owes nothing, one already finalized, and a lost CAS", async () => {
+  it("retryPendingEpicRollups declines a run that owes nothing, one already finalized, and a leased one", async () => {
     const mod = await load();
-    const pending = { id: "wf_1", epicId: "EPIC-1", phase: "complete", epicRollupPending: true };
+    const pending = PENDING_ROLLUP;
     expect(await mod.retryPendingEpicRollups({ ...pending, epicRollupPending: false })).toMatchObject({ reason: "not_pending" });
     expect(await mod.retryPendingEpicRollups({ ...pending, phase: "review" })).toMatchObject({ reason: "not_pending" });
     expect(await mod.retryPendingEpicRollups({ ...pending, finalizedAt: "2026-09-05T00:00:00Z" })).toMatchObject({ reason: "not_pending" });
-    // Pending, but a concurrent owner holds the claim → hands off, touches nothing.
+    // Pending, but a concurrent sweep holds a live lease → hands off, touches nothing.
+    h.state.rollupLeases.wf_1 = new Date().toISOString();
     expect(await mod.retryPendingEpicRollups(pending)).toMatchObject({ claimed: false, reason: "claim_lost" });
     expect(h.state.rollupCleared).toHaveLength(0);
     expect(h.state.finalized).toHaveLength(0);
+  });
+
+  /**
+   * TEAM-4099 F5 — the retry used to take the debt via `claimFinalization`, which
+   * SETs `finalizedAt`, and `finalizedAt` is precisely the attribute the debt scan
+   * excludes on (sweep-scan.mjs createPendingRollupScan). So ONE failed retry marked
+   * the run "every side effect ran" and removed it from every future sweep while
+   * `epicRollupPending` was still true: the epic stayed open on the board forever,
+   * with nothing left that would ever look at it again.
+   */
+  it("a FAILED retry finalizes nothing and leaves the row exactly as the debt scan wants it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.epicTransitionThrows = true;
+    const mod = await load();
+    const res = await mod.retryPendingEpicRollups(PENDING_ROLLUP);
+
+    expect(res).toMatchObject({ claimed: true, ok: false });
+    expect(res.reason).toContain("epic write rejected");
+    // The two writes that would have stranded it: neither happened.
+    expect(h.state.finalized).toHaveLength(0);   // finalizedAt still absent
+    expect(h.state.rollupCleared).toHaveLength(0); // epicRollupPending still set
+    expect(ebEventsOfType("workflow.epic_rolled_up")).toHaveLength(0);
+
+    // …and those are exactly the two attributes the sweep filter reads. The lease it
+    // DID take is invisible to that filter, which is what makes it safe to hold.
+    const filter = await pendingRollupFilterExpression();
+    expect(filter).toContain("attribute_exists(epicRollupPending)");
+    expect(filter).toContain("attribute_not_exists(finalizedAt)");
+    expect(filter).not.toContain("epicRollupClaimedAt");
+    warn.mockRestore();
+  });
+
+  it("the next sweep, once the lease ages out, discharges the debt: cleared, acked, finalized", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.epicTransitionThrows = true;
+    const mod = await load();
+    await mod.retryPendingEpicRollups(PENDING_ROLLUP);
+
+    // Same sweep window: the lease this attempt still holds keeps a second pass out
+    // (rollUpEpic already burned its own 3-attempt budget — no point re-burning it).
+    expect(await mod.retryPendingEpicRollups(PENDING_ROLLUP)).toMatchObject({ reason: "claim_lost" });
+
+    // A later sweep, past the lease: the epic write works this time.
+    h.state.rollupLeases.wf_1 = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    h.state.epicTransitionThrows = false;
+    // The escalation the failed completion filed is what a human would be looking at;
+    // a recovered roll-up has to take it back down.
+    h.state.freshWorkflow = {
+      ...PENDING_ROLLUP,
+      humanNotifications: [{ id: "notif_epic_rollup_wf_1", type: "manager_escalation", acknowledged: false }],
+    };
+    const res = await mod.retryPendingEpicRollups(PENDING_ROLLUP);
+
+    expect(res).toMatchObject({ claimed: true, ok: true });
+    expect(h.state.rollupCleared).toEqual(["wf_1"]);
+    expect(h.state.freshWorkflow.humanNotifications[0].acknowledged).toBe(true);
+    expect(h.state.finalized).toEqual(["wf_1"]);
+    warn.mockRestore();
+  });
+
+  it("two sweeps racing the same debt: one lease wins, ONE roll-up runs", async () => {
+    const mod = await load();
+    const [a, b] = await Promise.all([
+      mod.retryPendingEpicRollups(PENDING_ROLLUP),
+      mod.retryPendingEpicRollups(PENDING_ROLLUP),
+    ]);
+
+    expect(h.state.rollupClaims).toHaveLength(2); // both tried…
+    expect([a, b].filter((r) => r.claimed)).toHaveLength(1); // …one owns it
+    expect([a, b].filter((r) => r.reason === "claim_lost")).toHaveLength(1);
+    // One epic Done write, one announcement, one finalize.
+    expect(h.state.ticketUpdates.filter((u) => u.Key?.ticketId === "EPIC-1")).toHaveLength(1);
+    expect(ebEventsOfType("workflow.epic_rolled_up")).toHaveLength(1);
+    expect(h.state.rollupCleared).toEqual(["wf_1"]);
+    expect(h.state.finalized).toEqual(["wf_1"]);
   });
 });
 
@@ -1520,5 +1649,123 @@ describe("completeWorkflow — SHA-pinned fix-verification gate (TEAM-3992 Q4, w
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions.length).toBe(1);
     expect(ebTypes().includes("workflow.completion_blocked")).toBe(false);
+  });
+});
+
+/**
+ * TEAM-4099 F1 — the gate-bypass completion gate is TRI-state.
+ *
+ * Before: an unacked `notif_gate_bypass_*` escalation blocked completeWorkflow,
+ * and the escalation the detector wrote carried `kind` instead of `type` — so the
+ * console/Telegram surfaces never listed it and the PATCH route could never ack
+ * it. The run was wedged permanently, and the only way out (ack) would have let it
+ * close GREEN over a merge nobody approved. Now: unacked → still refused; ACKED →
+ * the block lifts but the run closes `deploy-blocked` with a blockReason naming
+ * the PR and the merge commit. Never `complete`.
+ *
+ * The detector-side half of the story (a re-Done of a flagged ticket re-publishing
+ * nothing) is pinned in gate-bypass-wiring.test.mjs, which drives the real handlers.
+ */
+describe("completeWorkflow — accepted gate bypass closes blocked (TEAM-4099 F1)", () => {
+  const MERGE_COMMIT = "cafebabe1234567";
+  const PR_URL = "https://github.com/o/r/pull/327";
+  const bypassNotif = (acknowledged = false) => ({
+    id: `notif_gate_bypass_wf_1_${MERGE_COMMIT}`,
+    type: "manager_escalation",
+    title: "Merge without approval (gate bypass)",
+    details: "Merge without approval: PR #327 merged before the Merge Approval gate recorded an APPROVE.",
+    reviewer: "gate-bypass",
+    timestamp: "2026-09-05T12:00:00Z",
+    acknowledged,
+    ticketId: "T-1",
+    mergeCommit: MERGE_COMMIT,
+    prUrl: PR_URL,
+  });
+
+  /** Evidence on every done ticket, so only the bypass gate is under test. */
+  const wfWithNotifs = (humanNotifications) => ({
+    id: "wf_1",
+    agentTasks: {
+      "T-1": { ticketId: "T-1", output: "implemented" },
+      "T-2": { ticketId: "T-2", output: "verified" },
+      "T-3": { ticketId: "T-3", output: "ci green" },
+    },
+    humanNotifications,
+  });
+
+  /**
+   * Acknowledge through the SAME predicate the console PATCH route uses
+   * (src/app/api/workflow/[id]/escalations/route.ts:67 — `n.type !==
+   * "manager_escalation" || n.acknowledged` skips the row). Replicated rather
+   * than imported because the route is a Next handler, not a module export; that
+   * is exactly why the notification's `type` field is load-bearing.
+   */
+  async function ackViaEscalationsRoute(workflowId, notificationId) {
+    const routeSelects = (n) => !(n?.type !== "manager_escalation" || n.acknowledged);
+    const store = await import("./workflow-store.mjs");
+    return store.ackNotifications(workflowId, (n) => routeSelects(n) && (!notificationId || n.id === notificationId));
+  }
+
+  it("unacked: completion is refused, nothing terminal is claimed, and the block is announced once", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = wfWithNotifs([bypassNotif(false)]);
+    await load();
+    await completeWorkflow({ ...WF });
+
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.terminalClaims).toHaveLength(0);
+    const blocked = ebEventsOfType("workflow.completion_blocked");
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({ workflowId: "wf_1", reason: "gate_bypass_unacked", ticketIds: ["T-1"] });
+    expect(h.state.notifications.map((n) => n.n.id)).toEqual(["notif_completion_gate_bypass_wf_1"]);
+    warn.mockRestore();
+  });
+
+  it("acked through the escalations-route predicate: closes deploy-blocked, blockReason names the PR", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = wfWithNotifs([bypassNotif(false)]);
+    await load();
+
+    // A human resolves the escalation — only possible because the notification
+    // carries `type: "manager_escalation"` (the F1 fix).
+    expect(await ackViaEscalationsRoute("wf_1", `notif_gate_bypass_wf_1_${MERGE_COMMIT}`)).toBe(1);
+
+    await completeWorkflow({ ...WF });
+
+    // Never green: no completion claim, one terminal deploy-blocked claim.
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.terminalClaims).toEqual([
+      {
+        id: "wf_1",
+        outcome: "deploy-blocked",
+        ts: expect.any(String),
+        reason: `gate bypass accepted: PR ${PR_URL} merged cafebab before approval`,
+      },
+    ]);
+    const closed = ebEventsOfType("workflow.deploy_blocked");
+    expect(closed).toHaveLength(1);
+    expect(closed[0]).toMatchObject({ workflowId: "wf_1", outcome: "deploy-blocked", offenders: [] });
+    expect(closed[0].reason).toContain(PR_URL);
+    expect(ebEventsOfType("workflow.complete")).toHaveLength(0);
+    expect(h.state.finalized).toEqual(["wf_1"]);
+    // No second "cannot close" escalation: the block is resolved, not re-raised.
+    expect(h.state.notifications.some((n) => n.n.id === "notif_completion_gate_bypass_wf_1")).toBe(false);
+    error.mockRestore();
+  });
+
+  it("a run that never bypassed anything is untouched by the gate (control)", async () => {
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = wfWithNotifs([
+      // An acked escalation of a DIFFERENT kind must not divert the close.
+      { id: "notif_epic_rollup_wf_1", type: "manager_escalation", acknowledged: true },
+    ]);
+    await load();
+    await completeWorkflow({ ...WF });
+
+    expect(h.state.storeCompletions).toHaveLength(1);
+    expect(h.state.terminalClaims).toHaveLength(0);
+    expect(ebEventsOfType("workflow.complete")).toHaveLength(1);
   });
 });

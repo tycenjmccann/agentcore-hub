@@ -29,10 +29,13 @@
  *        generation-CAS steal, so a second sweep over an already-recovered
  *        ticket loses that CAS harmlessly (a no-op).
  *
- * Modes (RECONCILE_SWEEP_MODE): off = skip; shadow (default) = full scan +
- * logs/metrics of what WOULD be re-driven, but ZERO writes; enforce = re-drive
- * for real. Fails SAFE: the value is trimmed + lowercased and anything that is
- * not exactly off|shadow|enforce is coerced to shadow with a loud warning.
+ * Modes (RECONCILE_SWEEP_MODE): off = skip; shadow = full scan + logs/metrics of
+ * what WOULD be re-driven, but ZERO writes; enforce = re-drive for real. The
+ * DEPLOYED default is enforce (TEAM-4099 F8: index.mjs + template.yaml +
+ * deploy.sh); `runSweep(mode = "shadow")`'s parameter default stays shadow so a
+ * direct call with no argument can only ever observe. Fails SAFE: the value is
+ * trimmed + lowercased and anything that is not exactly off|shadow|enforce is
+ * coerced to shadow with a loud warning.
  *
  * Testability: all effects (ddb, cascade, getChildTickets, clock) are injected
  * via `deps`, so the sweep runs against stubs with no AWS — same DI shape as the
@@ -240,6 +243,12 @@ export function createReconcileSweep(deps) {
     };
 
     if (mode === "off") {
+      // TEAM-4099 F8 — still emit the metrics record. `ReconcileMode` is the only
+      // way a dashboard can tell "the sweep is off" from "the sweep is broken",
+      // and a dark sweep is exactly the state that needs to be visible. One EMF
+      // log line, zero DynamoDB reads: the off contract is untouched.
+      m.durationMs = now() - startedAtMs;
+      emitReconcileMetrics(m);
       log(`reconcile sweep skipped (mode=off)`);
       return m;
     }
@@ -365,9 +374,10 @@ export function createReconcileSweep(deps) {
 
     // D2.3 extra step (b) — discharge outstanding epic roll-ups. These runs are in
     // phase `complete`, so the scan above cannot see them (by design); the debt
-    // list is its own narrow scan. The dep takes over through the same
-    // claimFinalization CAS the completion path uses, so a sweep and a live
-    // completer can never both roll the epic.
+    // list is its own narrow scan. The dep takes the debt under a roll-up LEASE
+    // (TEAM-4099 F5), so two sweeps can never retry the same run at once and — the
+    // point of the lease over the old finalization claim — a FAILED retry leaves
+    // the row still matching this scan instead of vanishing from it forever.
     if (mode === "enforce" && retryEpicRollup) {
       try {
         const pending = await scanPendingRollups();

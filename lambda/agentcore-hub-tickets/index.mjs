@@ -190,6 +190,34 @@ const TRANSITIONS = {
   ],
 };
 
+/**
+ * TEAM-4099 F3 — the callers allowed to DECIDE a human-review gate.
+ *
+ * The tool path carries no caller identity: `_invoke_lambda` in
+ * deploy/runtime-agent/main.py sends only `{name, tool_name, arguments,
+ * parameters}`, so this Lambda cannot tell a dev agent from the console. That made
+ * `in_review → done` on a `human:*` gate ticket forgeable by any agent — and a
+ * forged gate `done` is not just a wrong board state: gate-bypass.mjs used to read
+ * a `done` gate with no ledger row as a `legacy_status` APPROVE, so an agent could
+ * merge unapproved and then certify its own merge as clean.
+ *
+ * With no identity to authenticate, the floor is a capability marker that only
+ * SERVER-SIDE invokers set. It is read from the event ROOT and only when the tool
+ * arguments arrived NESTED (`parameters`/`arguments`/`input`), which every gateway
+ * and main.py shape does — an agent controls the argument object, never the
+ * envelope around it. When args are at the root (the `|| event` fallback in the
+ * handler) the whole event is agent-supplied and nothing in it is trustworthy.
+ *
+ * Kept in lock-step with the Jira twin (lambda/agentcore-hub-jira/index.mjs).
+ */
+const TRUSTED_CALLERS = new Set(["console", "telegram", "orchestrator"]);
+
+function trustedCallerOf(event) {
+  const nested = event?.parameters || event?.arguments || event?.input;
+  if (!nested || typeof nested !== "object") return null;
+  return TRUSTED_CALLERS.has(event?._caller) ? event._caller : null;
+}
+
 export const handler = async (event) => {
   console.log("Jira MCP invoked:", JSON.stringify(event));
 
@@ -219,7 +247,7 @@ export const handler = async (event) => {
         return await listTickets(args);
       case "transition_issue":
       case "transition_ticket":
-        return await transitionIssue(args);
+        return await transitionIssue(args, { caller: trustedCallerOf(event) });
       case "get_transitions":
         return await getTransitions(args);
       case "add_comment":
@@ -709,7 +737,7 @@ async function listTickets(args) {
   return formatSearchResults(items);
 }
 
-async function transitionIssue(args) {
+async function transitionIssue(args, { caller = null } = {}) {
   const issueKey = args.issue_key || args.ticket_id;
   const transitionId = args.transition_id || args.to_status;
   if (!issueKey) return textResult("Error: 'issue_key' is required");
@@ -739,9 +767,24 @@ async function transitionIssue(args) {
   // "in_review" is a human-review-gate state. Only tickets assigned to a human
   // reviewer (assignee "human:*") may enter it — an agent ticket parked there
   // would never be invoked and would stall forever.
-  if (transition.to === "in_review" && !String(current.Item.assignee || "").startsWith("human:")) {
+  const isHumanGate = String(current.Item.assignee || "").startsWith("human:");
+  if (transition.to === "in_review" && !isHumanGate) {
     return textResult(
       `Cannot move ${issueKey} to in_review: only human-review tickets (assignee "human:*") can be sent to review.`
+    );
+  }
+
+  // TEAM-4099 F3 — the other direction, and the one that actually matters: moving a
+  // human gate OUT of in_review (approve/request-changes) or to a terminal done
+  // (including `skip`) IS the gate decision. Only a trusted server-side caller may
+  // record one, so the decision also lands in the gate ledger; an agent doing it
+  // from the tool path is forging its reviewer's signature.
+  if (isHumanGate && !caller && (currentStatus === "in_review" || transition.to === "done")) {
+    return textResult(
+      `Cannot transition ${issueKey}: it is assigned to ${current.Item.assignee}, a human-review gate, ` +
+      `and "${transition.id}" (→ ${transition.to}) is that reviewer's decision to make. Gate decisions are ` +
+      `only accepted from the console or Telegram, where they are recorded in the gate ledger. ` +
+      `Report your work and leave the gate alone — moving it yourself does not approve anything.`
     );
   }
 

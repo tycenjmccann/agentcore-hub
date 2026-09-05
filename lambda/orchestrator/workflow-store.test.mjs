@@ -26,10 +26,18 @@ import {
   appendGateDecision,
   appendNotificationOnce,
   clearEpicRollupPending,
+  claimEpicRollupRetry,
+  EPIC_ROLLUP_RETRY_LEASE_MS,
   mergeTaskMetadataOrTrack,
   parkClaim,
   setProtectionCheck,
   setDagAudit,
+  // TEAM-4099 F2
+  claimGateBypassFlag,
+  // TEAM-4099 F4
+  claimCompletionSynthesis,
+  setSynthesizedEvidence,
+  releaseCompletionSynthesisClaim,
 } from "./workflow-store.mjs";
 import { isLeaseLive } from "./lease.mjs";
 
@@ -43,6 +51,9 @@ import { isLeaseLive } from "./lease.mjs";
 
 const sent = [];
 let failNextCondition = false;
+// Some ops make TWO conditional attempts internally (claimGateBypassFlag: stamp,
+// then track, then re-stamp), so the loser cases need more than one failure.
+let failConditionCount = 0;
 
 const stubDdb = {
   async send(cmd) {
@@ -65,8 +76,9 @@ const stubDdb = {
       }
     }
     sent.push({ type: cmd.constructor.name, input: cmd.input });
-    if (failNextCondition && cmd.input.ConditionExpression) {
+    if ((failNextCondition || failConditionCount > 0) && cmd.input.ConditionExpression) {
       failNextCondition = false;
+      if (failConditionCount > 0) failConditionCount -= 1;
       const err = new Error("conditional check failed");
       err.name = "ConditionalCheckFailedException";
       throw err;
@@ -78,6 +90,7 @@ const stubDdb = {
 beforeEach(() => {
   sent.length = 0;
   failNextCondition = false;
+  failConditionCount = 0;
   initWorkflowStore(stubDdb, "workflows-test");
 });
 
@@ -245,6 +258,197 @@ describe("mergeTaskMetadataOrTrack", () => {
 
   it("never seeds an entry when there are no fields to write", async () => {
     expect(await mergeTaskMetadataOrTrack("wf_1", "TEAM-99", { output: undefined })).toBe(false);
+    expect(writes()).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4099 F2 — the gate-bypass flag claim: the FIRST write on the flag path,
+ * so the detector's event/status-flip/escalation happen at most once no matter how
+ * many cascades observe the same unapproved merge.
+ */
+describe("claimGateBypassFlag", () => {
+  it("stamps only when the entry exists and is not already flagged", async () => {
+    const res = await claimGateBypassFlag("wf_1", "TEAM-2", {
+      mergeCommit: "cafebabe",
+      flaggedAt: "2026-09-05T12:00:00Z",
+    });
+    expect(res).toEqual({ won: true });
+    expect(writes()).toHaveLength(1);
+    const { input } = writes()[0];
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#at)"
+    );
+    expect(input.UpdateExpression).toBe("SET agentTasks.#tid.#at = :ts, agentTasks.#tid.#sha = :sha");
+    expect(input.ExpressionAttributeNames).toEqual({
+      "#tid": "TEAM-2",
+      "#at": "gateBypassFlaggedAt",
+      "#sha": "gateBypassMergeCommit",
+    });
+    expect(input.ExpressionAttributeValues).toEqual({ ":ts": "2026-09-05T12:00:00Z", ":sha": "cafebabe" });
+  });
+
+  it("shadow mode stamps SHADOW-scoped fields — never the F8 veto field", async () => {
+    expect(await claimGateBypassFlag("wf_1", "TEAM-2", { mergeCommit: "cafebabe", shadow: true })).toEqual({ won: true });
+    const { input } = writes()[0];
+    expect(input.ExpressionAttributeNames["#at"]).toBe("gateBypassShadowAt");
+    expect(input.ExpressionAttributeNames["#sha"]).toBe("gateBypassShadowCommit");
+    // claimInvocation's veto keys off gateBypassFlaggedAt: writing it in shadow
+    // would make a merely-measured ticket permanently un-reclaimable.
+    expect(JSON.stringify(input)).not.toContain("gateBypassFlaggedAt");
+  });
+
+  it("a second claimant loses: no stamp, and the caller is told to stand down", async () => {
+    // Both the stamp AND the seeding track fail — the entry exists and is stamped.
+    failConditionCount = 2;
+    expect(await claimGateBypassFlag("wf_1", "TEAM-2", { mergeCommit: "cafebabe" })).toEqual({ won: false });
+    const stamps = writes().filter((c) => String(c.input.UpdateExpression).includes("#at"));
+    expect(stamps).toHaveLength(1); // tried once, refused, never retried
+  });
+
+  it("an UNTRACKED ticket is seeded first-writer-wins, then stamped", async () => {
+    failConditionCount = 1; // only the first stamp fails (no entry yet)
+    expect(await claimGateBypassFlag("wf_1", "TEAM-99", { mergeCommit: "cafebabe" })).toEqual({ won: true });
+    const seed = writes().find((c) => c.input.ConditionExpression === "attribute_not_exists(agentTasks.#tid)");
+    expect(seed.input.ExpressionAttributeValues[":task"]).toMatchObject({ ticketId: "TEAM-99", status: "pending" });
+    const stamps = writes().filter((c) => String(c.input.UpdateExpression).includes("#at"));
+    expect(stamps).toHaveLength(2); // refused, seeded, then stamped
+  });
+
+  it("a non-conditional DDB failure propagates (never a silent 'won')", async () => {
+    initWorkflowStore({ async send() { throw new Error("throughput exceeded"); } }, "workflows-test");
+    await expect(claimGateBypassFlag("wf_1", "TEAM-2", {})).rejects.toThrow("throughput exceeded");
+  });
+});
+
+/**
+ * TEAM-4099 F4 — synthesized completion evidence is a CLAIMED, conditional write.
+ * Four trigger paths can call the synthesizer; the claim makes exactly one of them
+ * the owner, and both follow-up writes refuse to overwrite real evidence.
+ */
+describe("claimCompletionSynthesis (TEAM-4099 F4)", () => {
+  it("claims only an existing, output-free, unclaimed entry", async () => {
+    const res = await claimCompletionSynthesis("wf_1", "TEAM-2", { now: "2026-09-05T12:00:00Z" });
+    expect(res).toEqual({ won: true, claimedAt: "2026-09-05T12:00:00Z" });
+    expect(writes()).toHaveLength(1);
+    const { input } = writes()[0];
+    expect(input.UpdateExpression).toBe("SET agentTasks.#tid.#sc = :ts");
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#out) " +
+      "AND attribute_not_exists(agentTasks.#tid.#sc)"
+    );
+    expect(input.ExpressionAttributeNames).toEqual({
+      "#tid": "TEAM-2", "#sc": "synthesisClaimedAt", "#out": "output",
+    });
+    expect(input.ExpressionAttributeValues).toEqual({ ":ts": "2026-09-05T12:00:00Z" });
+  });
+
+  it("defaults the claim stamp to now when the caller passes none", async () => {
+    const res = await claimCompletionSynthesis("wf_1", "TEAM-2");
+    expect(res.won).toBe(true);
+    expect(Date.parse(res.claimedAt)).toBeGreaterThan(0);
+  });
+
+  it("a second claimant loses: one attempt, no retry, no claimedAt handed back", async () => {
+    failConditionCount = 2; // stamp refused AND the seeding track refused → entry exists
+    expect(await claimCompletionSynthesis("wf_1", "TEAM-2", { now: "t0" })).toEqual({ won: false });
+    const stamps = writes().filter((c) => String(c.input.UpdateExpression).includes("#sc"));
+    expect(stamps).toHaveLength(1);
+  });
+
+  it("an UNTRACKED ticket is seeded first-writer-wins (with the assignee), then claimed", async () => {
+    failConditionCount = 1; // only the first stamp fails — no entry yet
+    const res = await claimCompletionSynthesis("wf_1", "TEAM-99", {
+      now: "t0", seed: { agentId: "agentcore_hub_backend_dev" },
+    });
+    expect(res).toEqual({ won: true, claimedAt: "t0" });
+    const seed = writes().find((c) => c.input.ConditionExpression === "attribute_not_exists(agentTasks.#tid)");
+    expect(seed.input.ExpressionAttributeValues[":task"]).toMatchObject({
+      ticketId: "TEAM-99", status: "pending", agentId: "agentcore_hub_backend_dev",
+    });
+    expect(writes().filter((c) => String(c.input.UpdateExpression).includes("#sc"))).toHaveLength(2);
+  });
+
+  it("a non-conditional DDB failure propagates (never a silent 'won')", async () => {
+    initWorkflowStore({ async send() { throw new Error("throughput exceeded"); } }, "workflows-test");
+    await expect(claimCompletionSynthesis("wf_1", "TEAM-2", {})).rejects.toThrow("throughput exceeded");
+  });
+});
+
+describe("setSynthesizedEvidence (TEAM-4099 F4)", () => {
+  const FIELDS = {
+    output: "[synthesized] 3 commit(s) on feature/x; PR none",
+    branch: "feature/x",
+    commitSha: "ccc333",
+    evidenceSource: "synthesized",
+    synthesizedAt: "2026-09-05T12:00:00Z",
+  };
+
+  it("writes per-field SETs, conditional on no output AND our claim generation", async () => {
+    const res = await setSynthesizedEvidence("wf_1", "TEAM-2", FIELDS, { claimedAt: "2026-09-05T12:00:00Z" });
+    expect(res).toEqual({ applied: true });
+    expect(writes()).toHaveLength(1);
+    const { input } = writes()[0];
+    // Scoped per-field SETs — never a whole-entry replacement (R2).
+    expect(input.UpdateExpression).toMatch(/^SET agentTasks\.#tid\.#f1 = :v1(, agentTasks\.#tid\.#f\d+ = :v\d+)+$/);
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#out) " +
+      "AND agentTasks.#tid.#sc = :claimed"
+    );
+    expect(input.ExpressionAttributeNames["#out"]).toBe("output");
+    expect(input.ExpressionAttributeNames["#sc"]).toBe("synthesisClaimedAt");
+    expect(input.ExpressionAttributeValues[":claimed"]).toBe("2026-09-05T12:00:00Z");
+    expect(Object.values(input.ExpressionAttributeValues)).toContain(FIELDS.output);
+  });
+
+  it("without a claim generation the no-output condition still holds", async () => {
+    expect(await setSynthesizedEvidence("wf_1", "TEAM-2", FIELDS)).toEqual({ applied: true });
+    const { input } = writes()[0];
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#out)"
+    );
+    expect(JSON.stringify(input)).not.toContain("synthesisClaimedAt");
+  });
+
+  it("real evidence landing first wins the CAS — { applied: false }, and NO trackTicket resurrection", async () => {
+    failNextCondition = true;
+    expect(await setSynthesizedEvidence("wf_1", "TEAM-2", FIELDS, { claimedAt: "t0" }))
+      .toEqual({ applied: false, reason: "condition_failed" });
+    expect(writes()).toHaveLength(1); // unlike mergeTaskMetadataOrTrack: no seed + retry
+  });
+
+  it("nothing settable is a no-op, not a write", async () => {
+    expect(await setSynthesizedEvidence("wf_1", "TEAM-2", { output: undefined }, { claimedAt: "t0" }))
+      .toEqual({ applied: false, reason: "nothing_to_set" });
+    expect(writes()).toHaveLength(0);
+  });
+
+  it("a non-conditional DDB failure propagates", async () => {
+    initWorkflowStore({ async send() { throw new Error("throughput exceeded"); } }, "workflows-test");
+    await expect(setSynthesizedEvidence("wf_1", "TEAM-2", FIELDS, {})).rejects.toThrow("throughput exceeded");
+  });
+});
+
+describe("releaseCompletionSynthesisClaim (TEAM-4099 F4)", () => {
+  it("removes ONLY our claim generation, and only while there is still no output", async () => {
+    expect(await releaseCompletionSynthesisClaim("wf_1", "TEAM-2", "t0")).toBe(true);
+    const { input } = writes()[0];
+    expect(input.UpdateExpression).toBe("REMOVE agentTasks.#tid.#sc");
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(agentTasks.#tid) AND agentTasks.#tid.#sc = :claimed " +
+      "AND attribute_not_exists(agentTasks.#tid.#out)"
+    );
+    expect(input.ExpressionAttributeValues).toEqual({ ":claimed": "t0" });
+  });
+
+  it("a stale generation (or landed output) loses the CAS — false, no other write", async () => {
+    failNextCondition = true;
+    expect(await releaseCompletionSynthesisClaim("wf_1", "TEAM-2", "t0")).toBe(false);
+    expect(writes()).toHaveLength(1);
+  });
+
+  it("no generation to release is a no-op", async () => {
+    expect(await releaseCompletionSynthesisClaim("wf_1", "TEAM-2", null)).toBe(false);
     expect(writes()).toHaveLength(0);
   });
 });
@@ -652,10 +856,13 @@ describe("completeWorkflow", () => {
 });
 
 describe("clearEpicRollupPending (TEAM-3991 D1.4)", () => {
-  it("REMOVEs the flag under attribute_exists, with no ExpressionAttributeValues", async () => {
+  it("REMOVEs the flag AND the retry lease under attribute_exists, with no ExpressionAttributeValues", async () => {
     expect(await clearEpicRollupPending("wf_1")).toBe(true);
     const w = writes()[0];
-    expect(w.input.UpdateExpression).toBe("REMOVE epicRollupPending");
+    // TEAM-4099 F5: the lease goes with the debt — a discharged obligation has
+    // nothing left to lease, and REMOVE of an absent attribute is a no-op, so the
+    // completion-path winner (which never took a lease) is unaffected.
+    expect(w.input.UpdateExpression).toBe("REMOVE epicRollupPending, epicRollupClaimedAt");
     expect(w.input.ConditionExpression).toBe("attribute_exists(epicRollupPending)");
     expect(w.input.ExpressionAttributeValues).toBeUndefined();
   });
@@ -663,6 +870,45 @@ describe("clearEpicRollupPending (TEAM-3991 D1.4)", () => {
   it("returns false when the flag is already gone (sweep retry racing the winner)", async () => {
     failNextCondition = true;
     expect(await clearEpicRollupPending("wf_1")).toBe(false);
+  });
+});
+
+/**
+ * TEAM-4099 F5 — the roll-up retry lease.
+ *
+ * The sweep used to take the debt with `claimFinalization`, which SETs `finalizedAt`
+ * — the very attribute createPendingRollupScan excludes on. One failed retry then
+ * removed the run from every future sweep while `epicRollupPending` stayed true, so
+ * the epic sat open forever with nobody responsible. This claim stamps an attribute
+ * NO scan filter reads, and it stamps nothing else.
+ */
+describe("claimEpicRollupRetry (TEAM-4099 F5)", () => {
+  it("SETs only epicRollupClaimedAt, under a still-owed + unfinalized + lease-expired CAS", async () => {
+    const res = await claimEpicRollupRetry("wf_1", { now: "2026-09-05T12:00:00.000Z" });
+    expect(res).toEqual({ won: true });
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("SET epicRollupClaimedAt = :now");
+    // Never finalizedAt: that is the whole bug.
+    expect(w.input.UpdateExpression).not.toContain("finalizedAt");
+    expect(w.input.ConditionExpression).toContain("attribute_exists(epicRollupPending)");
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(finalizedAt)");
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(epicRollupClaimedAt)");
+    expect(w.input.ConditionExpression).toContain("epicRollupClaimedAt < :staleBefore");
+    expect(w.input.ExpressionAttributeValues[":now"]).toBe("2026-09-05T12:00:00.000Z");
+    // The lease window, computed off the caller's clock.
+    expect(w.input.ExpressionAttributeValues[":staleBefore"]).toBe(
+      new Date(Date.parse("2026-09-05T12:00:00.000Z") - EPIC_ROLLUP_RETRY_LEASE_MS).toISOString()
+    );
+  });
+
+  it("honours an explicit leaseMs", async () => {
+    await claimEpicRollupRetry("wf_1", { now: "2026-09-05T12:00:00.000Z", leaseMs: 60_000 });
+    expect(writes()[0].input.ExpressionAttributeValues[":staleBefore"]).toBe("2026-09-05T11:59:00.000Z");
+  });
+
+  it("the loser of the race gets { won: false } and never throws", async () => {
+    failNextCondition = true;
+    expect(await claimEpicRollupRetry("wf_1", { now: "2026-09-05T12:00:00.000Z" })).toEqual({ won: false });
   });
 });
 

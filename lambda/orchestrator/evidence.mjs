@@ -15,6 +15,13 @@
  * NEVER FABRICATE: no branch and no PR ⇒ `{ synthesized: false }` and ZERO
  * writes. A synthesized record is always stamped `source: "synthesized"` /
  * `evidenceSource: "synthesized"` so no reader mistakes it for an agent report.
+ *
+ * NEVER CLOBBER (TEAM-4099 F4): synthesis is a CLAIMED, conditionally-written
+ * operation — one owner across all four trigger paths
+ * (`store.claimCompletionSynthesis`), and both writes refuse to overwrite real
+ * evidence (`deps.s3PutIfAbsent` is a conditional create; the row write goes
+ * through `store.setSynthesizedEvidence`). Real evidence beats synthesized in
+ * every direction; see synthesizeCompletion for the exact ordering.
  */
 
 function ticketIdOf(ticket) {
@@ -168,12 +175,34 @@ export async function findTicketPullRequest(githubFetch, { owner, repo, base = "
  * — otherwise the agent (or the webhook) already spoke and we defer to it.
  * Candidate branches: `feature/<ticketId>-<agentSlug>`, any `feature/<ticketId>-`
  * head found on a PR against the base, then the shared run branch.
+ *
+ * TEAM-4099 F4 — the precondition read above is NOT a guard on its own: four
+ * trigger paths call this (detector stall + dead-session, the invoke-failure
+ * catch, the prGuard salvage) and the agent's own report_completion can land at
+ * any point during the seconds-long GitHub probe. So every write is ordered and
+ * conditional:
+ *
+ *   1. precondition read (cheap, avoids the claim write in the common case)
+ *   2. store.claimCompletionSynthesis — CAS; the LOSER returns with zero writes,
+ *      so exactly one trigger synthesizes and exactly one done-cascade follows
+ *   3. GitHub harvest (winner only)
+ *   4. s3PutIfAbsent — conditional create of the durable record FIRST, so a real
+ *      report_completion that landed after the claim wins (`record_exists`)
+ *   5. store.setSynthesizedEvidence — row write conditional on there still being
+ *      no `output`, so real evidence is never overwritten (`real_evidence_won`)
+ *   6. provider transition to done, then `agent.completion_synthesized`
+ *
+ * Claim disposition on abort: RELEASED when the abort left no durable evidence
+ * (`no_evidence`, `error` before the record write) so a later sweep can salvage
+ * the run once the branch appears; KEPT when evidence now exists (`success`,
+ * `record_exists`, `real_evidence_won`), where the stamp doubles as the
+ * "synthesis is settled here" marker.
  */
 export async function synthesizeCompletion({ workflow, ticket, agentSlug = "", baseBranch, deps = {} }) {
   const {
     githubFetch,
     s3Get,
-    s3Put,
+    s3PutIfAbsent,
     store,
     transitionTicket,
     publishEvent,
@@ -182,6 +211,13 @@ export async function synthesizeCompletion({ workflow, ticket, agentSlug = "", b
   } = deps;
   const ticketId = ticketIdOf(ticket);
   const key = `completions/${ticketId}.json`;
+  let claimedAt = null;
+  let recordWritten = false;
+  const release = async () => {
+    if (!claimedAt) return;
+    await attempt(() => store.releaseCompletionSynthesisClaim(workflow?.id, ticketId, claimedAt));
+    claimedAt = null;
+  };
 
   try {
     if (!ticketId) return { synthesized: false, reason: "no_ticket" };
@@ -189,13 +225,22 @@ export async function synthesizeCompletion({ workflow, ticket, agentSlug = "", b
     // A throwing s3Get is the 404/NoSuchKey shape — treat as absent.
     const existing = await attempt(() => s3Get(key));
     if (existing) return { synthesized: false, reason: "evidence_exists" };
-    if (workflow?.agentTasks?.[ticketId]?.output) return { synthesized: false, reason: "evidence_exists" };
+    if (workflow?.agentTasks?.[ticketId]?.output) return { synthesized: false, reason: "has_output" };
 
     const { owner, repo } = parseRepo(workflow?.repoConfig);
     if (!owner || !repo) return { synthesized: false, reason: "no_repo" };
     // Resolved default branch, passed by the caller (TEAM-3992 D4.1); the local
     // repoConfig read is the fallback for callers that do not resolve it.
     const base = baseBranch || workflow?.repoConfig?.repos?.[0]?.defaultBranch || "main";
+
+    // Single owner across all four trigger paths — before the first GitHub call,
+    // so a loser spends nothing and writes nothing.
+    const claim = await store.claimCompletionSynthesis(workflow?.id, ticketId, {
+      now: new Date(now()).toISOString(),
+      seed: { agentId: ticket?.assignee },
+    });
+    if (!claim?.won) return { synthesized: false, reason: "claimed" };
+    claimedAt = claim.claimedAt;
 
     const candidates = [];
     if (agentSlug) candidates.push(`feature/${ticketId}-${agentSlug}`);
@@ -213,26 +258,21 @@ export async function synthesizeCompletion({ workflow, ticket, agentSlug = "", b
     if (workflow?.featureBranch) candidates.push(workflow.featureBranch);
 
     const ev = await probeTicketBranches(githubFetch, { owner, repo, base, branches: candidates });
-    if (!ev.hasEvidence) return { synthesized: false, reason: "no_evidence" };
+    if (!ev.hasEvidence) {
+      // Nothing durable was written — hand the claim back so a later sweep can
+      // salvage this run once the branch/PR shows up.
+      await release();
+      return { synthesized: false, reason: "no_evidence" };
+    }
 
     const synthesizedAt = new Date(now()).toISOString();
     const summary = `[synthesized] ${ev.aheadBy} commit(s) on ${ev.branch}; PR ${ev.prUrl || "none"}`;
 
-    await store.mergeTaskMetadataOrTrack(
-      workflow.id,
-      ticketId,
-      {
-        output: summary,
-        branch: ev.branch,
-        commitSha: ev.commitSha,
-        prUrl: ev.prUrl,
-        evidenceSource: "synthesized",
-        synthesizedAt,
-      },
-      { agentId: ticket?.assignee }
-    );
-
-    await s3Put(
+    // The durable record FIRST, created only if absent: a real report_completion
+    // that landed while we were probing GitHub owns this key, and synthesized
+    // evidence must never clobber real evidence. Claim KEPT — real evidence
+    // exists now, so re-synthesis must not happen.
+    const put = await s3PutIfAbsent(
       key,
       JSON.stringify(
         {
@@ -250,6 +290,26 @@ export async function synthesizeCompletion({ workflow, ticket, agentSlug = "", b
         2
       )
     );
+    if (!put?.written) return { synthesized: false, reason: "record_exists" };
+    recordWritten = true;
+
+    // Row write, conditional on the row still being evidence-free and on OUR
+    // claim generation. Losing it means the agent's real completion landed in the
+    // gap — leave it alone.
+    const row = await store.setSynthesizedEvidence(
+      workflow.id,
+      ticketId,
+      {
+        output: summary,
+        branch: ev.branch,
+        commitSha: ev.commitSha,
+        prUrl: ev.prUrl,
+        evidenceSource: "synthesized",
+        synthesizedAt,
+      },
+      { claimedAt }
+    );
+    if (!row?.applied) return { synthesized: false, reason: "real_evidence_won" };
 
     if (String(ticket?.status || "").toLowerCase() !== "done") {
       await transitionTicket(ticketId, "done");
@@ -278,6 +338,9 @@ export async function synthesizeCompletion({ workflow, ticket, agentSlug = "", b
     };
   } catch (err) {
     log.warn?.(`[evidence] synthesize failed for ${workflow?.id}/${ticketId}: ${err?.message || err}`);
+    // A throw before the record write leaves no evidence behind, so the claim
+    // goes back; after it, the record stands and the claim stays put.
+    if (!recordWritten) await release();
     return { synthesized: false, reason: "error" };
   }
 }

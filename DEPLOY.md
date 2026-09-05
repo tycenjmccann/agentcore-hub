@@ -224,6 +224,14 @@ aws sqs get-queue-attributes \
   --attribute-names ApproximateNumberOfMessages \
   --query 'Attributes.ApproximateNumberOfMessages' --output text   # expect: 0
 
+# Rollout mode flags are present AND enforcing (TEAM-4099 F8). --environment
+# REPLACES the whole env map, so a flag MISSING here means the function silently
+# fell back to its code default — see docs/orchestration-tracing-guide.md
+# "Operator parameters - effective modes"
+aws lambda get-function-configuration --function-name agentcore-hub-orchestrator \
+  --query 'Environment.Variables.[DEAD_SESSION_DETECTOR_MODE,RECONCILE_SWEEP_MODE,GATE_BYPASS_MODE,FIX_VERIFICATION_REQUIRED]' \
+  --output text                                                    # expect: enforce enforce enforce enforce
+
 # Config landed with ARNs intact (never null after a merge)
 aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" - | \
   python3 -c "import json,sys; a=json.load(sys.stdin); assert all(x.get('runtimeArn') for x in a['agents'] if x.get('type')=='runtime'), 'null runtimeArn — config merge clobbered ARNs'; print('config ok')"

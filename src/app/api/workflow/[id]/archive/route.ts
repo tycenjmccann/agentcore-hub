@@ -7,7 +7,8 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { setArchived } from "@/lib/workflow/workflow-store";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
@@ -56,17 +57,7 @@ export async function PATCH(
 
     // 3. Set archived = true, archivedAt = ISO timestamp (idempotent)
     const archivedAt = new Date().toISOString();
-    await ddb.send(
-      new UpdateCommand({
-        TableName: WORKFLOWS_TABLE,
-        Key: { workflowId },
-        UpdateExpression: "SET archived = :true, archivedAt = :ts",
-        ExpressionAttributeValues: {
-          ":true": true,
-          ":ts": archivedAt,
-        },
-      })
-    );
+    await setArchived(workflowId, archivedAt);
 
     return NextResponse.json({ status: "archived", archivedAt }, { status: 200 });
   } catch (err) {

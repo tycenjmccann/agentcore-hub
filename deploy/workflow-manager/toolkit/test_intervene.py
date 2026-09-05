@@ -416,6 +416,59 @@ def test_mark_done_surfaces_409_no_evidence(rec, no_ddb, monkeypatch):
     assert rec.posts == []
 
 
+def test_mark_done_omits_force_unless_asked(rec, no_ddb, monkeypatch):
+    """TEAM-4099 F6 — the default mark-done is FILL-ONLY: no `force` key, so the
+    server's `attribute_not_exists(output)` condition protects the agent's own
+    report. An accidental clobber must require typing the flag."""
+    monkeypatch.setattr(intervene, "api_post", lambda path, body=None: (
+        rec.posts.append((path, body)) or {"ok": True, "evidenceSource": "manager"}
+    ))
+
+    run(["mark-done", "wf_1", "TEAM-7", "--evidence", "streamed PASS"])
+
+    _, body = only_post(rec)
+    assert "force" not in body
+    assert "forced" not in rec.events[-1][2]
+
+
+def test_mark_done_force_sends_the_override_and_records_it(rec, no_ddb, monkeypatch):
+    """--force is the deliberate override: it reaches the endpoint as
+    `force: true`, and the intervention event is marked `forced` so a replay can
+    tell an override apart from a fill."""
+    monkeypatch.setattr(intervene, "api_post", lambda path, body=None: (
+        rec.posts.append((path, body)) or {"ok": True, "evidenceSource": "manager", "forced": True}
+    ))
+
+    run(["mark-done", "wf_1", "TEAM-7", "--evidence", "the recorded output is from the wrong run",
+         "--force"])
+
+    path, body = only_post(rec)
+    assert path == "/api/workflow/wf_1/tickets/mark-done"
+    assert body["force"] is True
+    assert rec.events[-1][1] == "mark_done"
+    assert rec.events[-1][2]["forced"] is True
+
+
+def test_mark_done_evidence_exists_409_names_both_ways_out(capsys):
+    """api_post's typed-409 handling for EVIDENCE_EXISTS: it must name the kept
+    source, and point at the transition endpoint for a stale board vs --force for
+    a genuine override — the JSON `{ force: true }` in the server message is not
+    something an operator can type."""
+    err = _http_error(409, {
+        "code": "EVIDENCE_EXISTS",
+        "error": "TEAM-7 already carries evidence",
+        "evidenceSource": "record",
+    })
+    with mock.patch.object(intervene.urllib.request, "urlopen", side_effect=err):
+        with pytest.raises(SystemExit) as exc:
+            intervene.api_post("/api/workflow/wf_1/tickets/mark-done", {"ticketId": "TEAM-7"})
+    msg = str(exc.value)
+    assert "already carries evidence" in msg
+    assert "evidenceSource=record" in msg
+    assert "--force" in msg
+    assert "Transition the ticket" in msg
+
+
 def test_mark_done_no_evidence_409_is_reported_as_a_refusal(capsys):
     """api_post's typed-409 handling for the server's NO_EVIDENCE code."""
     err = _http_error(409, {"code": "NO_EVIDENCE", "error": "nothing to prove TEAM-7 shipped"})

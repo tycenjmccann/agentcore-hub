@@ -13,10 +13,10 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
   GetCommand,
-  PutCommand,
   QueryCommand,
   BatchWriteCommand,
 } from "@aws-sdk/lib-dynamodb";
+import { tombstoneWorkflow } from "@/lib/workflow/workflow-store";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
@@ -106,22 +106,17 @@ export async function DELETE(
     //    deliberately dropped: the epicId-index GSI is sparse, so omitting it
     //    keeps tombstones out of epic→workflow lookups (bug re-filing
     //    idempotency, orchestrator findWorkflowByEpic).
-    await ddb.send(
-      new PutCommand({
-        TableName: WORKFLOWS_TABLE,
-        Item: {
-          workflowId,
-          id: workflowId,
-          deleted: true,
-          deletedAt: new Date().toISOString(),
-          phase: workflow.phase,
-          workflowDefId: workflow.workflowDefId,
-          startedAt: workflow.startedAt,
-          completedAt: workflow.completedAt,
-          ...(workflow.humanReviewMs !== undefined ? { humanReviewMs: workflow.humanReviewMs } : {}),
-        },
-      })
-    );
+    await tombstoneWorkflow({
+      workflowId,
+      id: workflowId,
+      deleted: true,
+      deletedAt: new Date().toISOString(),
+      phase: workflow.phase,
+      workflowDefId: workflow.workflowDefId,
+      startedAt: workflow.startedAt,
+      completedAt: workflow.completedAt,
+      ...(workflow.humanReviewMs !== undefined ? { humanReviewMs: workflow.humanReviewMs } : {}),
+    });
 
     return NextResponse.json(
       { deleted: true, workflowId, eventsDeleted },

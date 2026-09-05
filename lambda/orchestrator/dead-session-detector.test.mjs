@@ -5,6 +5,9 @@ import { SWEEP_ROTATION_QUANTUM_MS } from "./sweep-scan.mjs";
 // leaseVerdict (which composes the real isLeaseLive internally), never a stub.
 import { leaseVerdict as realLeaseVerdict } from "./lease.mjs";
 import { resolveStallSoftTimeoutMs } from "./watchdog.mjs";
+// TEAM-4099 F4: the synthesis claim lives INSIDE evidence.mjs, so proving the
+// detector's two trigger paths are covered means wiring the REAL synthesizer.
+import { synthesizeCompletion as realSynthesizeCompletion } from "./evidence.mjs";
 
 /**
  * TEAM-3618 D1.2 — the orchestrator dead-session sweep. Every effect is
@@ -1504,5 +1507,131 @@ describe("D4.3 stall soft-timeout", () => {
     expect(m.stalled).toBe(0);
     expect(lease.stealClaim).not.toHaveBeenCalled();
     expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * TEAM-4099 F4 — the detector has TWO synthesis trigger paths (the stall branch
+ * and the dead-session branch), and index.mjs has two more (the invoke-failure
+ * catch and the prGuard salvage). None of them coordinated: each read "no
+ * evidence" and then wrote unconditionally, so two triggers could both
+ * synthesize (two done-cascades) or overwrite an agent's real report_completion.
+ *
+ * The fix is a single claim INSIDE evidence.mjs, which every path funnels
+ * through — so these tests wire the REAL synthesizeCompletion behind the
+ * detector's dep and assert the claim is the FIRST write on both paths, ahead of
+ * the S3 record and the row.
+ */
+describe("synthesis claim covers both detector trigger paths (TEAM-4099 F4)", () => {
+  const REPO_CONFIG = { repos: [{ url: "https://github.com/o/r", defaultBranch: "main" }] };
+  const BRANCH = "feature/TEAM-2-dev";
+
+  /** Evidence exists on GitHub: the branch is 2 commits ahead with an open PR. */
+  const githubFetch = async (path) => {
+    if (path.includes("/pulls?state=all")) {
+      return [{ number: 7, state: "open", merged_at: null, html_url: "https://github.com/o/r/pull/7", head: { ref: BRANCH, sha: "aaa111" } }];
+    }
+    if (path.includes("/branches/")) return { name: BRANCH, commit: { sha: "ccc333" } };
+    if (path.includes("/compare/")) return { ahead_by: 2, status: "ahead" };
+    return [];
+  };
+
+  /** The real synthesizer behind the detector's (workflow, ticket) dep shape. */
+  function wireRealSynthesis({ claimWins = true } = {}) {
+    const trace = [];
+    const transitions = [];
+    const store = {
+      claimCompletionSynthesis: vi.fn(async (id, tid, opts) => {
+        trace.push("claim");
+        return claimWins ? { won: true, claimedAt: opts?.now } : { won: false };
+      }),
+      setSynthesizedEvidence: vi.fn(async () => { trace.push("row"); return { applied: true }; }),
+      releaseCompletionSynthesisClaim: vi.fn(async () => { trace.push("release"); return true; }),
+    };
+    const s3PutIfAbsent = vi.fn(async () => { trace.push("put"); return { written: true }; });
+    const synthesizeCompletion = vi.fn((workflow, ticket) => realSynthesizeCompletion({
+      workflow, ticket, agentSlug: "dev",
+      deps: {
+        githubFetch,
+        s3Get: async () => { throw new Error("NoSuchKey"); },
+        s3PutIfAbsent,
+        store,
+        transitionTicket: async (tid, status) => { transitions.push({ tid, status }); },
+        publishEvent: async () => {},
+        now: () => NOW,
+        log: { warn: () => {} },
+      },
+    }));
+    return { trace, store, s3PutIfAbsent, synthesizeCompletion, transitions };
+  }
+
+  it("dead-session path: claim FIRST, then the S3 record, then the row — one cascade, no retry", async () => {
+    const synth = wireRealSynthesis();
+    const wf = makeWorkflow({ repoConfig: REPO_CONFIG });
+    const { deps, store } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }),
+      synthesizeCompletion: synth.synthesizeCompletion,
+    });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(synth.store.claimCompletionSynthesis).toHaveBeenCalledTimes(1);
+    expect(synth.store.claimCompletionSynthesis.mock.calls[0].slice(0, 2)).toEqual(["wf_1", "TEAM-2"]);
+    expect(synth.trace).toEqual(["claim", "put", "row"]);
+    expect(synth.transitions).toEqual([{ tid: "TEAM-2", status: "done" }]);
+    // Salvaged ⇒ the detector spends no retry and pages nobody (D1.2).
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(m.retries).toBe(0);
+  });
+
+  it("stall path: same single owner — claim before any S3 put", async () => {
+    const SOFT = 600_000;
+    const synth = wireRealSynthesis();
+    const wf = makeWorkflow({
+      repoConfig: REPO_CONFIG,
+      agentTasks: { "TEAM-2": { ...deadTask, startedAt: new Date(NOW - (SOFT + 1000)).toISOString() } },
+    });
+    const { deps, lease } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }),
+      synthesizeCompletion: synth.synthesizeCompletion,
+    });
+    lease.isLeaseLive.mockReturnValue(true);   // inside the TTL — the stall branch
+    lease.leaseVerdict = realLeaseVerdict;     // R3: the real decision
+    deps.cascade = { reconcileDependent: vi.fn(async () => ({ outcome: "redispatched" })) };
+    deps.resolveStallSoftTimeout = () => SOFT;
+    deps.otel = { lastOtelActivity: vi.fn(async () => null) }; // confirmed silent
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.stalled).toBe(1);
+    expect(synth.store.claimCompletionSynthesis).toHaveBeenCalledTimes(1);
+    expect(synth.trace).toEqual(["claim", "put", "row"]);
+    expect(synth.trace.indexOf("claim")).toBeLessThan(synth.trace.indexOf("put"));
+    expect(deps.cascade.reconcileDependent).not.toHaveBeenCalled(); // salvaged, not re-driven
+  });
+
+  it("another trigger already owns the claim → the detector's synth writes nothing and the retry path resumes", async () => {
+    const synth = wireRealSynthesis({ claimWins: false });
+    const wf = makeWorkflow({ repoConfig: REPO_CONFIG });
+    const { deps, store } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }),
+      synthesizeCompletion: synth.synthesizeCompletion,
+    });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(synth.trace).toEqual(["claim"]);       // zero writes past the CAS
+    expect(synth.s3PutIfAbsent).not.toHaveBeenCalled();
+    expect(synth.store.setSynthesizedEvidence).not.toHaveBeenCalled();
+    expect(synth.transitions).toEqual([]);
+    // No salvage from THIS path, so the normal retry still happens — a lost claim
+    // must never strand the ticket.
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(m.retries).toBe(1);
   });
 });

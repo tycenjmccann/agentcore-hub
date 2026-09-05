@@ -1,18 +1,24 @@
 /**
- * TEAM-3763 F2 + F6 — index.mjs-level rollout-mode DEFAULTS for the two sweeps
- * whose safe default is "dark".
+ * TEAM-3763 F2 + F6, as amended by TEAM-4099 F8 — the index.mjs-level rollout-mode
+ * DEFAULTS for the reconcile sweep and the cascade's extended states.
  *
  * The reconcile sweep's own coercion (unknown→shadow, off→no-scan) is pinned in
  * reconcile-sweep.test.mjs, and the cascade's normalizeExtendedMode in
  * cascade.test.mjs. What lives ONLY in index.mjs is the value each env var
  * resolves to before it is handed down:
- *   F2 — RECONCILE_SWEEP_MODE unset → "off"  (`process.env.RECONCILE_SWEEP_MODE || "off"`)
- *   F6 — CASCADE_EXTENDED_STATES unset → "off" (resolveCascadeMode)
+ *   F2/F8 — RECONCILE_SWEEP_MODE unset → "enforce" (`… || "enforce"`)
+ *   F6    — CASCADE_EXTENDED_STATES unset → "off"  (resolveCascadeMode)
  *
- * Both must default DARK: the reconcile sweep is now SCHEDULED (deploy.sh wires a
- * reconcile_sweep EventBridge target — F2), and shadow is NOT byte-identical to
- * off (it issues extra DDB reads). A fresh deploy that omits the vars must run
- * zero extra reads/writes.
+ * They now differ deliberately. F2 shipped the sweep DARK because it had just
+ * become scheduled and nothing yet depended on it. F8 flipped it: dark by default
+ * also disabled FR-D1.3's 2-minute ready SLA, D2.3's epic roll-up retry, and F7's
+ * "the remainder is left to the sweep" bound — a backstop that is off by default is
+ * not a backstop, and every write it makes is already lease-guarded and scoped.
+ * CASCADE_EXTENDED_STATES stays dark: its shadow path is NOT read-free (blocker-
+ * confirm + lease reads happen before the no-write check), and the enforcing sweep
+ * now covers the same stalled dependents under the same lease floor. The full
+ * three-layer default agreement (code / template.yaml / deploy.sh) is pinned in
+ * mode-defaults.test.mjs.
  *
  * Driving the handler with the reconcile_sweep sentinel exercises BOTH defaults
  * in one call: the handler's reconcile branch calls getReconcileSweep(), whose
@@ -87,33 +93,34 @@ beforeEach(() => {
   delete process.env.CASCADE_EXTENDED_STATES;
 });
 
-describe("F2 — RECONCILE_SWEEP_MODE default (index.mjs reconcile dispatch)", () => {
-  it("UNSET → the reconcile sweep runs in off (dark by default — the scheduled sentinel is handled)", async () => {
+describe("F2/F8 — RECONCILE_SWEEP_MODE default (index.mjs reconcile dispatch)", () => {
+  it("UNSET → the reconcile sweep runs in ENFORCE (the scheduled backstop actually backstops)", async () => {
     const handler = await loadHandler();
     const result = await handler({ ...RECONCILE_EVENT });
-    // off → runSweep short-circuits before its first ScanCommand: zero reads.
-    expect(h.sweepModes).toEqual(["off"]);
-    expect(result.mode).toBe("off");
+    // TEAM-4099 F8: off made every 5-minute invocation short-circuit before its
+    // first scan, so the SLA/roll-up-retry ACs were unmet in a default deploy.
+    expect(h.sweepModes).toEqual(["enforce"]);
+    expect(result.mode).toBe("enforce");
   });
 
-  it("empty string → falsy → coalesces to off", async () => {
+  it("empty string → falsy → coalesces to enforce (same as unset)", async () => {
     process.env.RECONCILE_SWEEP_MODE = "";
     const handler = await loadHandler();
     await handler({ ...RECONCILE_EVENT });
-    expect(h.sweepModes).toEqual(["off"]);
+    expect(h.sweepModes).toEqual(["enforce"]);
   });
 
-  it('explicit "shadow" / "enforce" are passed through verbatim (opt-in only)', async () => {
+  it('explicit "shadow" / "off" are passed through verbatim (the opt-OUTs still work)', async () => {
     process.env.RECONCILE_SWEEP_MODE = "shadow";
     let handler = await loadHandler();
     await handler({ ...RECONCILE_EVENT });
     expect(h.sweepModes).toEqual(["shadow"]);
 
     h.sweepModes = [];
-    process.env.RECONCILE_SWEEP_MODE = "enforce";
+    process.env.RECONCILE_SWEEP_MODE = "off";
     handler = await loadHandler();
     await handler({ ...RECONCILE_EVENT });
-    expect(h.sweepModes).toEqual(["enforce"]);
+    expect(h.sweepModes).toEqual(["off"]);
   });
 });
 

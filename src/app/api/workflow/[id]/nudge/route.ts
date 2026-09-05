@@ -20,6 +20,7 @@ import { DynamoDBDocumentClient, ScanCommand, UpdateCommand, GetCommand, PutComm
 import { JiraClient, mapJiraStatusToInternal, blockersFromLinks } from "@/lib/workflow/jira-client";
 import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
 import { existingTicketPr, prExistsPayload, resumeNote, writeResumeContext } from "@/lib/workflow/pr-guard";
+import { setTaskStatus } from "@/lib/workflow/workflow-store";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -175,14 +176,7 @@ async function releaseInvocationClaim(
   }
 
   try {
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: "SET #at.#tid.#s = :s",
-      ExpressionAttributeNames: { "#at": "agentTasks", "#tid": ticketId, "#s": "status" },
-      ExpressionAttributeValues: { ":s": "ready" },
-      ConditionExpression: "attribute_exists(#at.#tid)",
-    }));
+    await setTaskStatus(workflowId, ticketId, "ready");
   } catch { /* no claim to release */ }
 }
 
@@ -318,7 +312,7 @@ export async function POST(
             { status: 409 }
           );
         }
-        await writeResumeContext(ddb, WORKFLOWS_TABLE, workflowId, targetTicketId, resumeNote(targetTicketId, pr));
+        await writeResumeContext(workflowId, targetTicketId, resumeNote(targetTicketId, pr));
         console.log(`[nudge] ${targetTicketId}: resuming onto PR #${pr.number} (${pr.state})`);
       }
       result = ticketProvider === "jira"

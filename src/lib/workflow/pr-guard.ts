@@ -20,9 +20,8 @@
  * (dispatch path) over the same `findTicketPullRequest` — see evidence-parity.test.ts.
  */
 
-import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { findTicketPullRequest, githubApi, parseRepo, type TicketPullRequest } from "./evidence";
+import { setResumeContext } from "./workflow-store";
 
 /** The PR already open/merged for this ticket, or null (⇒ dispatch freely). */
 export async function existingTicketPr(
@@ -78,37 +77,20 @@ export function resumeNote(ticketId: string, pr: TicketPullRequest): string {
 
 /**
  * Persist the resume context the orchestrator's `consumeResumeContext` reads
- * (`resumeContexts.<ticketId>` on the workflow row). Hand-port of
- * workflow-store.mjs setResumeContext: seed the map, then a scoped SET of the one
- * key — never a whole-map rewrite, so two concurrent resumes cannot clobber each
- * other. Best-effort: a failure means the agent starts cold, not that the
- * human's dispatch dies.
+ * (`resumeContexts.<ticketId>` on the workflow row). The write itself lives in
+ * workflow-store.setResumeContext (TEAM-4099 F6 moved it there, so every
+ * workflows-table write from the app tier is in one auditable module): seed the
+ * map, then a scoped SET of the one key — never a whole-map rewrite, so two
+ * concurrent resumes cannot clobber each other. Best-effort: a failure means the
+ * agent starts cold, not that the human's dispatch dies.
  */
 export async function writeResumeContext(
-  ddb: DynamoDBDocumentClient,
-  table: string,
   workflowId: string,
   ticketId: string,
   note: string
 ): Promise<boolean> {
   try {
-    await ddb.send(
-      new UpdateCommand({
-        TableName: table,
-        Key: { workflowId },
-        UpdateExpression: "SET resumeContexts = if_not_exists(resumeContexts, :empty)",
-        ExpressionAttributeValues: { ":empty": {} },
-      })
-    );
-    await ddb.send(
-      new UpdateCommand({
-        TableName: table,
-        Key: { workflowId },
-        UpdateExpression: "SET resumeContexts.#k = :note",
-        ExpressionAttributeNames: { "#k": ticketId },
-        ExpressionAttributeValues: { ":note": note },
-      })
-    );
+    await setResumeContext(workflowId, ticketId, note);
     return true;
   } catch (err) {
     console.warn(`[pr-guard] ${workflowId}/${ticketId}: resume context write failed: ${(err as Error).message}`);

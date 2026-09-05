@@ -260,6 +260,190 @@ export async function setTaskStatus(workflowId, ticketId, status) {
 }
 
 /**
+ * TEAM-4099 F2 — claim the right to flag ONE ticket for gate bypass.
+ *
+ * The detector used to publish `workflow.gate_bypass`, flip the task to
+ * `in_review` and escalate BEFORE any conditional write, so two concurrent
+ * cascades (the original done racing a re-Done, or the reconcile sweep racing a
+ * live cascade) each published the event and each re-flipped the task. This is
+ * now the FIRST write on the flag path: stamp `gateBypassFlaggedAt` ONLY IF the
+ * entry exists and is not already stamped. Losing the CAS means another actor
+ * already owns the flag, so the caller returns without side effects.
+ *
+ * `shadow: true` stamps observation-only fields instead
+ * (`gateBypassShadowAt`/`gateBypassShadowCommit`): shadow mode must NEVER write
+ * `gateBypassFlaggedAt`, because claimInvocation's veto (F8) makes a stamped
+ * ticket permanently un-claimable — that is enforcement, not measurement.
+ *
+ * A ticket whose agent died before any claim landed has no agentTasks entry at
+ * all, and DynamoDB cannot distinguish "no entry" from "already stamped". So,
+ * mirroring mergeTaskMetadataOrTrack: on a lost CAS seed the entry via
+ * trackTicket (first-writer-wins) and retry ONLY when this call created it —
+ * otherwise the entry existed, which means the stamp was already there.
+ * Returns { won } — true when THIS caller owns the flag.
+ */
+export async function claimGateBypassFlag(workflowId, ticketId, { mergeCommit = "", flaggedAt, shadow = false } = {}) {
+  const stampedAt = shadow ? "gateBypassShadowAt" : "gateBypassFlaggedAt";
+  const commitField = shadow ? "gateBypassShadowCommit" : "gateBypassMergeCommit";
+  const ts = flaggedAt || new Date().toISOString();
+  const stamp = async () => {
+    try {
+      await _ddb.send(new UpdateCommand({
+        TableName: _table,
+        Key: { workflowId },
+        UpdateExpression: "SET agentTasks.#tid.#at = :ts, agentTasks.#tid.#sha = :sha",
+        ConditionExpression: "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#at)",
+        ExpressionAttributeNames: { "#tid": ticketId, "#at": stampedAt, "#sha": commitField },
+        ExpressionAttributeValues: { ":ts": ts, ":sha": mergeCommit },
+      }));
+      return true;
+    } catch (err) {
+      if (err.name === "ConditionalCheckFailedException") return false;
+      throw err;
+    }
+  };
+
+  if (await stamp()) return { won: true };
+  const created = await trackTicket(workflowId, ticketId, {
+    ticketId,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+  });
+  if (!created) return { won: false };
+  return { won: await stamp() };
+}
+
+/**
+ * TEAM-4099 F4 — claim the right to SYNTHESIZE completion evidence for ONE ticket.
+ *
+ * Four independent paths call synthesizeCompletion (dead-session detector's stall
+ * and dead-session branches, the invoke-failure catch, and the prGuard's
+ * merged-PR salvage). Each used to read "no evidence yet" and then write
+ * unconditionally, so two triggers could both synthesize (two done-cascades) and
+ * either could land AFTER the agent's real report_completion and overwrite real
+ * evidence with `evidenceSource: "synthesized"`. D1.2 says never fabricate
+ * evidence; clobbering real evidence is worse.
+ *
+ * This is the FIRST write on the synthesis path: stamp `synthesisClaimedAt` ONLY
+ * IF the entry exists, carries no `output` yet (a real report_completion having
+ * landed is disqualifying), and is not already claimed. Losing the CAS means
+ * another actor owns the synthesis — or real output arrived — so the caller
+ * returns with zero writes.
+ *
+ * A ticket whose agent died before any claim landed has no agentTasks entry at
+ * all, and DynamoDB cannot distinguish "no entry" from "already claimed". So,
+ * mirroring claimGateBypassFlag / mergeTaskMetadataOrTrack: on a lost CAS seed
+ * the entry via trackTicket (first-writer-wins) and retry ONLY when this call
+ * created it. Returns { won, claimedAt } — `claimedAt` is the claim GENERATION,
+ * passed back to setSynthesizedEvidence / releaseCompletionSynthesisClaim so
+ * those writes can prove they own the claim they are acting on.
+ */
+export async function claimCompletionSynthesis(workflowId, ticketId, { now: claimedAt, seed = {} } = {}) {
+  const ts = claimedAt || new Date().toISOString();
+  const stamp = async () => {
+    try {
+      await _ddb.send(new UpdateCommand({
+        TableName: _table,
+        Key: { workflowId },
+        UpdateExpression: "SET agentTasks.#tid.#sc = :ts",
+        ConditionExpression:
+          "attribute_exists(agentTasks.#tid) AND attribute_not_exists(agentTasks.#tid.#out) " +
+          "AND attribute_not_exists(agentTasks.#tid.#sc)",
+        ExpressionAttributeNames: { "#tid": ticketId, "#sc": "synthesisClaimedAt", "#out": "output" },
+        ExpressionAttributeValues: { ":ts": ts },
+      }));
+      return true;
+    } catch (err) {
+      if (err.name === "ConditionalCheckFailedException") return false;
+      throw err;
+    }
+  };
+
+  if (await stamp()) return { won: true, claimedAt: ts };
+  const created = await trackTicket(workflowId, ticketId, {
+    ticketId,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+    ...seed,
+  });
+  if (!created) return { won: false };
+  return (await stamp()) ? { won: true, claimedAt: ts } : { won: false };
+}
+
+/**
+ * TEAM-4099 F4 — write synthesized evidence onto a task row, but ONLY while it
+ * is still evidence-free.
+ *
+ * The synthesizer's GitHub probe takes seconds; the agent's real
+ * report_completion can land in that window (the S3 record write is conditional
+ * for the same reason). `attribute_not_exists(output)` makes the row write lose
+ * that race by design — real evidence is never overwritten by synthesized. When
+ * a claim generation is supplied, the write also proves ownership of the claim
+ * it was authorized by, so a released-and-reclaimed synthesis can't be finished
+ * by the stale loser. Deliberately does NOT trackTicket on a missing entry: the
+ * claim already established the entry, and resurrecting a vanished row here
+ * would recreate the unconditional write this replaces. Returns { applied }.
+ */
+export async function setSynthesizedEvidence(workflowId, ticketId, fields, { claimedAt } = {}) {
+  const update = taskMetadataUpdate(ticketId, fields);
+  if (!update) return { applied: false, reason: "nothing_to_set" };
+  const names = { ...update.ExpressionAttributeNames, "#out": "output" };
+  const values = { ...update.ExpressionAttributeValues };
+  let condition = `${update.ConditionExpression} AND attribute_not_exists(agentTasks.#tid.#out)`;
+  if (claimedAt) {
+    names["#sc"] = "synthesisClaimedAt";
+    values[":claimed"] = claimedAt;
+    condition += " AND agentTasks.#tid.#sc = :claimed";
+  }
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: update.UpdateExpression,
+      ConditionExpression: condition,
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+    }));
+    return { applied: true };
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return { applied: false, reason: "condition_failed" };
+    throw err;
+  }
+}
+
+/**
+ * TEAM-4099 F4 — drop OUR synthesis claim after an abort that left no durable
+ * evidence behind (no repo, no branch/PR yet, or a thrown probe).
+ *
+ * A sticky claim is not harmless: claimCompletionSynthesis refuses an already
+ * claimed ticket forever, so a run whose branch appears minutes after the first
+ * failed probe could never be salvaged — exactly the stranded-run bug D1.2
+ * exists to fix. Generation-scoped (`synthesisClaimedAt = :claimed`) so we only
+ * ever release the claim we took, and refused once real `output` exists (the
+ * claim has become a permanent "synthesis is settled" marker at that point).
+ * Returns true when the claim was released.
+ */
+export async function releaseCompletionSynthesisClaim(workflowId, ticketId, claimedAt) {
+  if (!claimedAt) return false;
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE agentTasks.#tid.#sc",
+      ConditionExpression:
+        "attribute_exists(agentTasks.#tid) AND agentTasks.#tid.#sc = :claimed " +
+        "AND attribute_not_exists(agentTasks.#tid.#out)",
+      ExpressionAttributeNames: { "#tid": ticketId, "#sc": "synthesisClaimedAt", "#out": "output" },
+      ExpressionAttributeValues: { ":claimed": claimedAt },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
  * TEAM-3991 D2.2 — park an agent's live claim because its ticket was blocked
  * (a fix ticket was filed against it, or a reviewer requested changes). "parked"
  * is deliberately NOT in lease-constants `liveClaimStatuses`, so a parked claim
@@ -904,18 +1088,74 @@ export async function claimTerminalOutcome(workflowId, outcome, completedAt, rea
  * stamped by the completeWorkflow CAS is discharged. Scoped REMOVE; a run whose
  * flag is already gone (a sweep retry that raced the winner) returns false
  * instead of throwing.
+ *
+ * TEAM-4099 F5: the retry lease goes with the debt — a discharged obligation has
+ * nothing left to lease, and REMOVE of an absent attribute is a no-op, so the
+ * completion-path winner (which never took a lease) is unaffected.
  */
 export async function clearEpicRollupPending(workflowId) {
   try {
     await _ddb.send(new UpdateCommand({
       TableName: _table,
       Key: { workflowId },
-      UpdateExpression: "REMOVE epicRollupPending",
+      UpdateExpression: "REMOVE epicRollupPending, epicRollupClaimedAt",
       ConditionExpression: "attribute_exists(epicRollupPending)",
     }));
     return true;
   } catch (err) {
     if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/** How long one epic-roll-up retry owns the debt before another sweep may take it. */
+export const EPIC_ROLLUP_RETRY_LEASE_MS = 10 * 60 * 1000;
+
+/**
+ * TEAM-4099 F5 — claim ONE attempt at an outstanding epic roll-up.
+ *
+ * The sweep used to take the debt via `claimFinalization`, which SETs
+ * `finalizedAt`. That is fatal on failure: `finalizedAt` is exactly the attribute
+ * the pending-roll-up scan excludes on (sweep-scan.mjs
+ * `attribute_exists(epicRollupPending) AND attribute_not_exists(finalizedAt)`), so
+ * one failed retry marked the run "every side effect ran" while `epicRollupPending`
+ * was still true — and no future sweep could ever see it again. The epic stayed
+ * open forever with nobody responsible, the precise failure mode D1.4's
+ * obligation flag exists to prevent.
+ *
+ * So the retry takes a LEASE instead of a completion marker: `epicRollupClaimedAt`
+ * is not read by any scan filter, so a failed attempt leaves the row still
+ * matching the debt list. `finalizedAt` is written only by `markFinalized`, after
+ * the roll-up actually lands.
+ *
+ * The lease doubles as back-pressure: it is deliberately NOT released on failure,
+ * so a run whose epic write keeps being rejected is retried once per lease window
+ * rather than once per sweep (rollUpEpic already burns 3 attempts with backoff
+ * inside a single call). An owner that dies mid-attempt is covered by the same
+ * expiry.
+ *
+ * Mutual exclusion is between RETRIES. A live completer mid-roll-up is not
+ * excluded (there is no marker for its in-flight window) — that is intentional:
+ * rollUpEpic is idempotent by construction (a Done epic transitioned to Done again
+ * is a success), so a duplicate roll-up costs a duplicate event, whereas the old
+ * exclusion cost a permanently stranded epic.
+ */
+export async function claimEpicRollupRetry(workflowId, { now = new Date().toISOString(), leaseMs = EPIC_ROLLUP_RETRY_LEASE_MS } = {}) {
+  const nowMs = Date.parse(now);
+  const staleBefore = new Date((Number.isFinite(nowMs) ? nowMs : Date.now()) - leaseMs).toISOString();
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET epicRollupClaimedAt = :now",
+      ConditionExpression:
+        "attribute_exists(epicRollupPending) AND attribute_not_exists(finalizedAt) AND " +
+        "(attribute_not_exists(epicRollupClaimedAt) OR epicRollupClaimedAt < :staleBefore)",
+      ExpressionAttributeValues: { ":now": now, ":staleBefore": staleBefore },
+    }));
+    return { won: true };
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return { won: false };
     throw err;
   }
 }

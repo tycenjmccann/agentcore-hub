@@ -35,6 +35,10 @@ const h = vi.hoisted(() => ({
       claimInvocation: /** @type {any[]} */ ([]),
       setResumeContext: /** @type {any[]} */ ([]),
       mergeOrTrack: /** @type {any[]} */ ([]),
+      // TEAM-4099 F4 — the synthesis claim + conditional row write.
+      synthClaims: /** @type {any[]} */ ([]),
+      synthRows: /** @type {any[]} */ ([]),
+      synthReleases: /** @type {any[]} */ ([]),
     },
     /** PRs the repo's base branch returns. */
     prs: /** @type {any[]} */ ([]),
@@ -133,6 +137,18 @@ vi.mock("./workflow-store.mjs", () => ({
   setResumeContext: vi.fn(async (wfId, tid, note) => { h.state.store.setResumeContext.push({ wfId, tid, note }); }),
   removeResumeContext: vi.fn(async () => {}),
   mergeTaskMetadataOrTrack: vi.fn(async (wfId, tid, fields) => { h.state.store.mergeOrTrack.push({ wfId, tid, fields }); }),
+  claimCompletionSynthesis: vi.fn(async (wfId, tid, opts) => {
+    h.state.store.synthClaims.push({ wfId, tid, opts });
+    return { won: true, claimedAt: opts?.now };
+  }),
+  setSynthesizedEvidence: vi.fn(async (wfId, tid, fields, opts) => {
+    h.state.store.synthRows.push({ wfId, tid, fields, opts });
+    return { applied: true };
+  }),
+  releaseCompletionSynthesisClaim: vi.fn(async (wfId, tid, claimedAt) => {
+    h.state.store.synthReleases.push({ wfId, tid, claimedAt });
+    return true;
+  }),
   mergeTaskMetadata: vi.fn(async () => {}),
   completeTaskEntry: vi.fn(async () => {}),
   setTaskStatus: vi.fn(async () => {}),
@@ -220,6 +236,9 @@ beforeEach(() => {
   h.state.store.claimInvocation.length = 0;
   h.state.store.setResumeContext.length = 0;
   h.state.store.mergeOrTrack.length = 0;
+  h.state.store.synthClaims.length = 0;
+  h.state.store.synthRows.length = 0;
+  h.state.store.synthReleases.length = 0;
   h.state.prs = [];
   h.state.branchAhead = 3;
   h.state.ghStatus = 200;
@@ -284,9 +303,15 @@ describe("preDispatchGuards (D1.5) — DDB-stream ready path", () => {
     const synth = eventsOfType("agent.completion_synthesized");
     expect(synth).toHaveLength(1);
     expect(synth[0].detail).toMatchObject({ ticketId: TICKET, aheadBy: 3 });
-    expect(h.state.store.mergeOrTrack[0].fields).toMatchObject({ evidenceSource: "synthesized" });
-    // The SAME key harvestCompletionEvidence / the completion gate read.
+    // TEAM-4099 F4: claimed once, then written conditionally — never unconditionally.
+    expect(h.state.store.synthClaims).toHaveLength(1);
+    expect(h.state.store.synthRows[0].fields).toMatchObject({ evidenceSource: "synthesized" });
+    expect(h.state.store.synthRows[0].opts.claimedAt).toBe(h.state.store.synthClaims[0].opts.now);
+    expect(h.state.store.mergeOrTrack).toHaveLength(0); // superseded by setSynthesizedEvidence
+    // The SAME key harvestCompletionEvidence / the completion gate read, created
+    // conditionally so a real report_completion can never be clobbered.
     expect(h.state.s3Puts[0].Key).toBe(`completions/${TICKET}.json`);
+    expect(h.state.s3Puts[0].IfNoneMatch).toBe("*");
   });
 
   it("MERGED PR but NOTHING harvestable → dispatch proceeds (never refuse on a hunch)", async () => {

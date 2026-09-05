@@ -329,6 +329,15 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   };
   if (verified) report.verification = verified;
   if (findingsList) report.findings = findingsList;
+  // TEAM-4099 F4 — deliberately UNCONDITIONAL, the one direction that is allowed
+  // to overwrite: real evidence beats synthesized. The orchestrator's synthesizer
+  // creates this key with `IfNoneMatch: "*"` so it can never clobber an agent's
+  // record; here the reverse is intended — an agent reporting after the salvage
+  // path guessed replaces `source: "synthesized"` with its own report (and the
+  // done-cascade's harvest then promotes the task row's evidenceSource to
+  // "agent"). An existing `source: "agent"` record means the same agent is
+  // re-reporting (a retried session, a corrected summary); last write wins, as it
+  // always has.
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,

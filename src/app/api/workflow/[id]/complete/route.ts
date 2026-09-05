@@ -36,7 +36,13 @@ import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
-import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
+import {
+  TERMINAL_PHASES,
+  claimTerminalOutcome,
+  clearEpicRollupPending,
+  completeWorkflow,
+  mergeTaskMetadata,
+} from "@/lib/workflow/workflow-store";
 import {
   resolveMissingEvidenceFromRecords,
   // TEAM-3991 D1.4 — the pure twins, shared with lambda/orchestrator/completion.mjs
@@ -102,33 +108,11 @@ const AGENT_PHASE_BY_ID: Record<string, string> = Object.fromEntries(
 
 // TEAM-3747 D2: the lifecycle-integrity ship outcomes are ALSO terminal — a run
 // closed deploy-blocked / static-ci-only cannot be re-"completed" out from under
-// its honest verdict (the early guard below returns 409). Additive: legacy runs
-// never carry these phases, so their behavior is unchanged.
-const TERMINAL_PHASES = ["complete", "error", "cancelled", ...SHIP_BLOCKED_OUTCOMES] as const;
+// its honest verdict (the early guard below returns 409). The list, and the
+// derived CAS guard both terminal writes share, live in workflow-store
+// (TEAM-4099 F6) alongside the writes themselves; PARITY with
+// notTerminalPhaseGuard in lambda/orchestrator/completion.mjs.
 const DONE_STATUSES = new Set(["done", "cancelled"]);
-
-/**
- * TEAM-3755 F2 — build the "not already terminal" half of a terminal-claim
- * ConditionExpression from the ONE list above, so both of this route's terminal
- * writes (the green complete and closeBlocked) refuse the SAME five phases.
- *
- * The bug: the complete write listed only complete/error/cancelled by hand, so a
- * completion racing in behind an honest deploy-blocked / static-ci-only close
- * overwrote it with "complete" and destroyed the FR-D2.2 evidence. PARITY with
- * notTerminalPhaseGuard in lambda/orchestrator/completion.mjs.
- *
- * Placeholders are positional (:tp0…) so they cannot collide with a caller's SET
- * values, and each declared value IS referenced — DynamoDB rejects unused ones.
- */
-function terminalPhaseGuard(): { condition: string; values: Record<string, string> } {
-  const values: Record<string, string> = {};
-  const condition = TERMINAL_PHASES.map((phase, i) => {
-    const key = `:tp${i}`;
-    values[key] = phase;
-    return `#phase <> ${key}`;
-  }).join(" AND ");
-  return { condition, values };
-}
 // PARITY with lambda/orchestrator/completion.mjs SHIP_PHASES — the phases whose
 // done tickets owe a merge/deploy verdict rather than mere output.
 const SHIP_PHASES = new Set(["ship"]);
@@ -393,38 +377,20 @@ async function closeBlocked(
   const completedAt = new Date().toISOString();
   const blockReason = blockReasonWithGate(verdict.blockReason || reason || null, openGate);
   const compacted = compactNotifications((workflow.humanNotifications as Notification[]) || []);
-  // TEAM-3755 F2: same derived guard as the green complete write above — one list,
-  // both terminal writes.
-  const guard = terminalPhaseGuard();
-  try {
-    await ddb.send(
-      new UpdateCommand({
-        TableName: WORKFLOWS_TABLE,
-        Key: { workflowId },
-        UpdateExpression:
-          "SET #phase = :outcome, completedAt = :ts, previousPhase = :prev, managerWatch = :false, humanNotifications = :notifs" +
-          (blockReason ? ", blockReason = :reason" : ""),
-        ConditionExpression: `${guard.condition} AND attribute_not_exists(cancelledAt)`,
-        ExpressionAttributeNames: { "#phase": "phase" },
-        ExpressionAttributeValues: {
-          ":outcome": outcome,
-          ":ts": completedAt,
-          ":prev": workflow.phase,
-          ":false": false,
-          ":notifs": compacted,
-          ...guard.values,
-          ...(blockReason ? { ":reason": blockReason } : {}),
-        },
-      })
+  // TEAM-3755 F2: the same CAS the green complete write uses — one list, both
+  // terminal writes (workflow-store claimTerminalOutcome / completeWorkflow).
+  const claimed = await claimTerminalOutcome(workflowId, {
+    outcome,
+    completedAt,
+    previousPhase: workflow.phase,
+    notifications: compacted,
+    blockReason,
+  });
+  if (!claimed) {
+    return NextResponse.json(
+      { error: "Workflow already in terminal state", phase: workflow.phase },
+      { status: 409 }
     );
-  } catch (err: unknown) {
-    if ((err as { name?: string }).name === "ConditionalCheckFailedException") {
-      return NextResponse.json(
-        { error: "Workflow already in terminal state", phase: workflow.phase },
-        { status: 409 }
-      );
-    }
-    throw err;
   }
 
   const detailType = outcome === "deploy-blocked" ? "workflow.deploy_blocked" : "workflow.static_ci_only";
@@ -505,31 +471,12 @@ async function stampMergeProof(
       mergeVerifiedBy: "github",
     };
     if (probe.prUrl && !agentTasks[o.ticketId]?.prUrl) fields.prUrl = probe.prUrl;
-    const names: Record<string, string> = { "#tid": o.ticketId };
-    const values: Record<string, unknown> = {};
-    const sets: string[] = [];
-    let i = 0;
-    for (const [k, v] of Object.entries(fields)) {
-      names[`#f${i}`] = k;
-      values[`:v${i}`] = v;
-      sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
-      i++;
-    }
     try {
-      await ddb.send(
-        new UpdateCommand({
-          TableName: WORKFLOWS_TABLE,
-          Key: { workflowId },
-          UpdateExpression: `SET ${sets.join(", ")}`,
-          ConditionExpression: "attribute_exists(agentTasks.#tid)",
-          ExpressionAttributeNames: names,
-          ExpressionAttributeValues: values,
-        })
-      );
+      // Scoped per-field merge on the existing entry only (a missing entry is
+      // dropped, never materialized) — workflow-store mergeTaskMetadata.
+      await mergeTaskMetadata(workflowId, o.ticketId, fields);
     } catch (err) {
-      if ((err as Error).name !== "ConditionalCheckFailedException") {
-        console.warn(`[complete] merge-proof stamp failed for ${o.ticketId}: ${(err as Error).message}`);
-      }
+      console.warn(`[complete] merge-proof stamp failed for ${o.ticketId}: ${(err as Error).message}`);
     }
     agentTasks[o.ticketId] = { ...(agentTasks[o.ticketId] || {}), ...fields };
   }
@@ -583,31 +530,10 @@ async function harvestCdEvidence(
     for (const ticketId of shipTicketIds) {
       // Scoped conditional write on the existing entry only — same shape as the
       // evidence backfill above (never materializes a phantom task).
-      const names: Record<string, string> = { "#tid": ticketId };
-      const values: Record<string, unknown> = {};
-      const sets: string[] = [];
-      let i = 0;
-      for (const [k, v] of Object.entries(fields)) {
-        names[`#f${i}`] = k;
-        values[`:v${i}`] = v;
-        sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
-        i++;
-      }
       try {
-        await ddb.send(
-          new UpdateCommand({
-            TableName: WORKFLOWS_TABLE,
-            Key: { workflowId },
-            UpdateExpression: `SET ${sets.join(", ")}`,
-            ConditionExpression: "attribute_exists(agentTasks.#tid)",
-            ExpressionAttributeNames: names,
-            ExpressionAttributeValues: values,
-          })
-        );
+        await mergeTaskMetadata(workflowId, ticketId, fields);
       } catch (err) {
-        if ((err as Error).name !== "ConditionalCheckFailedException") {
-          console.warn(`[complete] cd-evidence stamp failed for ${ticketId}: ${(err as Error).message}`);
-        }
+        console.warn(`[complete] cd-evidence stamp failed for ${ticketId}: ${(err as Error).message}`);
       }
       agentTasks[ticketId] = { ...(agentTasks[ticketId] || {}), ...fields };
     }
@@ -820,36 +746,12 @@ export async function POST(
               throw err; // logged by the resolver; offender stays
             }
           },
-          // Hand-port of lambda/orchestrator/workflow-store.mjs mergeTaskMetadata:
+          // Twin of lambda/orchestrator/workflow-store.mjs mergeTaskMetadata:
           // field-scoped SET on the existing entry only (attribute_exists guard),
-          // a missing entry is dropped rather than materialized.
+          // a missing entry is dropped rather than materialized. A lost condition
+          // is a false return, not a throw; anything else still propagates.
           backfill: async (ticketId, fields) => {
-            const names: Record<string, string> = { "#tid": ticketId };
-            const values: Record<string, unknown> = {};
-            const sets: string[] = [];
-            let i = 0;
-            for (const [k, v] of Object.entries(fields)) {
-              if (v === undefined || v === null) continue;
-              names[`#f${i}`] = k;
-              values[`:v${i}`] = v;
-              sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
-              i++;
-            }
-            if (!sets.length) return;
-            try {
-              await ddb.send(
-                new UpdateCommand({
-                  TableName: WORKFLOWS_TABLE,
-                  Key: { workflowId },
-                  UpdateExpression: `SET ${sets.join(", ")}`,
-                  ConditionExpression: "attribute_exists(agentTasks.#tid)",
-                  ExpressionAttributeNames: names,
-                  ExpressionAttributeValues: values,
-                })
-              );
-            } catch (err) {
-              if ((err as Error).name !== "ConditionalCheckFailedException") throw err;
-            }
+            await mergeTaskMetadata(workflowId, ticketId, { ...fields });
           },
           log: console.warn,
         });
@@ -1054,75 +956,52 @@ export async function POST(
     const compacted = compactNotifications(
       (workflow.humanNotifications as Notification[]) || []
     );
-    const completeGuard = terminalPhaseGuard();
-    try {
-      await ddb.send(
-        new UpdateCommand({
-          TableName: WORKFLOWS_TABLE,
-          Key: { workflowId },
-          UpdateExpression:
-            "SET #phase = :complete, completedAt = :ts, previousPhase = :prev, managerWatch = :false, " +
-            // TEAM-3991 D1.4: the epic roll-up obligation is created ATOMICALLY with
-            // the terminal claim (parity with workflow-store.mjs completeWorkflow), so
-            // exactly one caller owns it and a crash leaves a flag the sweep retries —
-            // there is no window where the run is complete with nobody responsible.
-            (workflow.epicId ? "epicRollupPending = :pending, " : "") +
-            "humanNotifications = :notifs" +
-            (reason ? ", completeReason = :reason" : ""),
-          // TEAM-3686: also CAS-guard on cancelledAt — a cancel landing between
-          // the pre-read above (which serves the friendly 409) and this write
-          // stamps cancelledAt before phase flips, and must not be overwritten
-          // to complete. Mirrors workflow-store.mjs completeWorkflow.
-          // TEAM-3755 F2: the phase half of the guard now covers ALL FIVE
-          // terminal phases (it omitted the D2 blocked outcomes), derived from
-          // TERMINAL_PHASES so it cannot drift from closeBlocked's guard.
-          ConditionExpression: `${completeGuard.condition} AND attribute_not_exists(cancelledAt)`,
-          ExpressionAttributeNames: { "#phase": "phase" },
-          ExpressionAttributeValues: {
-            ":complete": "complete",
-            ...(workflow.epicId ? { ":pending": true } : {}),
-            ":ts": completedAt,
-            ":prev": workflow.phase,
-            ":false": false,
-            ":notifs": compacted,
-            ...completeGuard.values,
-            ...(reason ? { ":reason": reason } : {}),
-          },
-        })
-      );
-    } catch (err: unknown) {
-      if ((err as { name?: string }).name === "ConditionalCheckFailedException") {
-        // Distinguish a cancel that raced in after our pre-read from a phase
-        // that was already terminal — the caller needs workflow_cancelled to
-        // know completion lost to cancellation, not that it double-completed.
-        try {
-          const recheck = await ddb.send(
-            new GetCommand({
-              TableName: WORKFLOWS_TABLE,
-              Key: { workflowId },
-              ConsistentRead: true,
-            })
-          );
-          if (recheck.Item?.cancelledAt) {
-            return NextResponse.json(
-              {
-                error: "workflow_cancelled",
-                cancelledAt: recheck.Item.cancelledAt,
-                detail:
-                  "cancellation precedes completion; a cancelled run cannot be completed",
-              },
-              { status: 409 }
-            );
-          }
-        } catch {
-          /* best-effort recheck — fall through to the generic 409 */
-        }
-        return NextResponse.json(
-          { error: "Workflow already in terminal state", phase: workflow.phase },
-          { status: 409 }
+    // TEAM-3991 D1.4: the epic roll-up obligation is created ATOMICALLY with the
+    // terminal claim (workflow-store completeWorkflow, twin of the orchestrator's),
+    // so exactly one caller owns it and a crash leaves a flag the sweep retries —
+    // there is no window where the run is complete with nobody responsible.
+    // TEAM-3686: the CAS also guards on cancelledAt — a cancel landing between the
+    // pre-read above (which serves the friendly 409) and this write stamps
+    // cancelledAt before phase flips, and must not be overwritten to complete.
+    // TEAM-3755 F2: the phase half covers ALL FIVE terminal phases, derived from
+    // TERMINAL_PHASES so it cannot drift from closeBlocked's guard.
+    const completed = await completeWorkflow(workflowId, {
+      completedAt,
+      previousPhase: workflow.phase,
+      notifications: compacted,
+      epicRollupPending: Boolean(workflow.epicId),
+      completeReason: reason,
+    });
+    if (!completed) {
+      // Distinguish a cancel that raced in after our pre-read from a phase
+      // that was already terminal — the caller needs workflow_cancelled to
+      // know completion lost to cancellation, not that it double-completed.
+      try {
+        const recheck = await ddb.send(
+          new GetCommand({
+            TableName: WORKFLOWS_TABLE,
+            Key: { workflowId },
+            ConsistentRead: true,
+          })
         );
+        if (recheck.Item?.cancelledAt) {
+          return NextResponse.json(
+            {
+              error: "workflow_cancelled",
+              cancelledAt: recheck.Item.cancelledAt,
+              detail:
+                "cancellation precedes completion; a cancelled run cannot be completed",
+            },
+            { status: 409 }
+          );
+        }
+      } catch {
+        /* best-effort recheck — fall through to the generic 409 */
       }
-      throw err;
+      return NextResponse.json(
+        { error: "Workflow already in terminal state", phase: workflow.phase },
+        { status: 409 }
+      );
     }
 
     // 4b. TEAM-3991 D1.4 — discharge the roll-up obligation this claim created.
@@ -1136,18 +1015,9 @@ export async function POST(
       epicRolledUp = rollup.ok;
       if (rollup.ok) {
         try {
-          await ddb.send(
-            new UpdateCommand({
-              TableName: WORKFLOWS_TABLE,
-              Key: { workflowId },
-              UpdateExpression: "REMOVE epicRollupPending",
-              ConditionExpression: "attribute_exists(epicRollupPending)",
-            })
-          );
+          await clearEpicRollupPending(workflowId);
         } catch (err) {
-          if ((err as Error).name !== "ConditionalCheckFailedException") {
-            console.warn(`[complete] clearing epicRollupPending failed: ${(err as Error).message}`);
-          }
+          console.warn(`[complete] clearing epicRollupPending failed: ${(err as Error).message}`);
         }
       } else {
         console.error(

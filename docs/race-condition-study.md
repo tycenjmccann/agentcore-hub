@@ -140,6 +140,14 @@ agentId keying (ticketId everywhere; the invoke chain already carries ticketId e
 Move the manifest's `sessions` + phase-artifact index into the workflow row (per-key updates)
 or S3 conditional writes (If-Match); the manifest stays as a rendered artifact, not a store.
 
+**As shipped (TEAM-4099 F6):** R2 has TWO stores, one per runtime — the orchestrator's
+`lambda/orchestrator/workflow-store.mjs` and the app tier's `src/lib/workflow/workflow-store.ts`
+(Next.js route handlers + `src/lib`). Same rule in both: named intent-level ops, each a scoped
+conditional write; no raw `Put`/`Update`/`Delete`/`TransactWrite` against the workflows table
+anywhere else. `scripts/check-workflow-writes.sh` now scans both trees (tests excluded) and
+allowlists exactly two files — `lease.mjs` and `lease.ts`, each holding only `stealClaim`'s CAS,
+the R3 primitive that is deliberately never re-implemented in a store.
+
 ### R3 — Leases instead of silence-guessing
 Agent invocation writes a lease: `agentTasks[ticketId] = {status: running, leaseUntil}`;
 the runtime heartbeats (it already streams events — piggyback: any agent event extends the
@@ -241,8 +249,188 @@ the ticket to a fresh agent and the bypass is laundered into a normal-looking se
 So `claimInvocation` carries `attribute_not_exists(agentTasks.#tid.gateBypassFlaggedAt)` in its
 condition expression: the claim CAS itself REFUSES a flagged task. There is no separate check to
 forget to call, and it composes with the rest of R3 for free — every dispatch path already goes
-through that one CAS. Clearing the flag is a human act (acking the escalation), which is exactly
-where the authority for "yes, proceed anyway" belongs.
+through that one CAS.
+
+TEAM-4099 closed the two holes that left in the FLAGGING path itself. First, the flag is now
+claimed, not merely written: `claimGateBypassFlag(workflowId, ticketId, {mergeCommit, flaggedAt,
+shadow})` stamps it under `attribute_exists(agentTasks.#tid) AND
+attribute_not_exists(agentTasks.#tid.gateBypassFlaggedAt)` and is the FIRST write on the path, so
+the detector's announcement (`workflow.gate_bypass`), the `in_review` flip and the escalation all
+hang off ONE winner. They previously ran before any conditional write, so a re-Done of the flagged
+ticket — which the flip itself invites, since the task is no longer `complete` and the done-cascade
+dedup guard therefore lets it through — re-announced a bypass a human was already handling. Shadow
+mode claims a shadow-scoped attribute instead, because writing the real one would trip the veto
+above and quietly turn "measure only" into enforcement.
+
+Second, the flag is never cleared, and acking the escalation does not clear it: the authority a
+human exercises by acking is "yes, I accept that this merged unapproved", not "pretend it didn't".
+So the run does not resume and does not close green — `completeWorkflow` closes it `deploy-blocked`
+with a blockReason naming the PR and merge commit. Before that third state existed, an acked bypass
+either deadlocked the run forever (the escalation carried `kind` instead of `type`, so no surface
+could list it and no route could ack it) or, once ackable, would have closed it `complete` over a
+merge nobody approved.
 
 The shape generalizes: when a claim needs a state other than live/stale, add an attribute and
 teach the ONE CAS about it — never a second liveness predicate.
+
+## Addendum (2026-09-05): a claim must not be borrowed from a scan it is filtered on — `epicRollupClaimedAt`
+
+TEAM-4099 F5. The epic roll-up debt (`epicRollupPending`, created atomically with the terminal
+claim — D1.4) is retried by the reconcile sweep, which finds it with a narrowly-filtered scan:
+`#p = :complete AND attribute_exists(epicRollupPending) AND attribute_not_exists(finalizedAt)`
+(`sweep-scan.mjs createPendingRollupScan`). The retry path reused `claimFinalization` to take the
+debt — and `claimFinalization` SETs `finalizedAt`, the exact attribute that scan excludes on. So a
+single failed retry removed the run from every future sweep while `epicRollupPending` was still
+true: the epic sat open on the board forever with nobody left responsible for it, which is the
+same wf 7ef4fp symptom D1.4 existed to fix, now with a claim on top of it.
+
+`claimEpicRollupRetry(workflowId, {now, leaseMs})` is a lease on an attribute NO scan filter reads:
+`SET epicRollupClaimedAt = :now` under `attribute_exists(epicRollupPending) AND
+attribute_not_exists(finalizedAt) AND (attribute_not_exists(epicRollupClaimedAt) OR
+epicRollupClaimedAt < :staleBefore)`. Nothing on the retry path touches `finalizedAt` until the
+roll-up has actually landed, so a failed attempt leaves the row exactly as the debt scan wants to
+find it. The lease is deliberately NOT released on failure: `rollUpEpic` already burns three
+attempts with backoff internally, so one retry per ~10-minute window is the back-pressure we want,
+and the lease expiring on its own is what makes the next sweep window retry. `rollUpEpic` is
+idempotent (Done → Done is a success), so a live completer racing a sweep costs a duplicate event,
+never corruption.
+
+Generalized: a claim attribute is part of the query surface. Before reusing an existing claim for
+a new obligation, check what SCANS filter on it — a claim that writes an attribute its own
+discovery query excludes on makes failure permanent rather than retryable.
+
+## Addendum (2026-09-05): a board status is not an authorization — the gate-ledger epoch
+
+TEAM-4099 F3, adjacent to the claim work above rather than a race. The bypass detector compared
+each merge against the gate LEDGER (`reviewGateHistory[gate].decisions`), but fell back to
+synthesizing an APPROVE (`approvalSource: "legacy_status"`) whenever the ledger was empty and the
+gate ticket merely sat in `done`. `Tickets___transition_ticket` is an ordinary agent tool, the tool
+path carries no caller identity, and `in_review → done` was a legal transition on it — so a dev or
+fix agent could move its own Merge Approval gate to `done` and have the detector then certify the
+merge it had just performed as `clean`. A forgeable approval is worse than no approval, because it
+reads as evidence.
+
+Both halves are now closed. In the two ticket Lambdas, a human-review gate (`human:*` assignee /
+`reviewer:*` label) can only be moved out of review, or to a terminal `done`, by a caller carrying
+an explicit `_caller` marker read from the invocation ENVELOPE — `console` | `telegram` |
+`orchestrator`, set by the console transition route (which is also what Telegram's gate buttons
+drive, and the only writer of ledger rows) and the orchestrator's own tool invokes. An agent owns
+the arguments object, never the envelope, so the marker cannot be forged from inside `parameters`.
+In `gate-bypass.mjs`, `legacy_status` is fenced to runs that provably predate the ledger: no
+`reviewGateHistory` attribute at all AND `createdAt < GATE_LEDGER_EPOCH` (default
+`2026-09-05T02:10:25Z`, the commit that first wrote a human decision to the ledger; env-overridable
+for a later deploy). For any current run a `done` gate with no APPROVE row is simply no approval —
+verdict `bypass`, `approvalSource: "none"`, reason `gate_done_without_ledger`. A defence that lives
+in only one Lambda is not an authz floor: the fence also covers a status set before the guard
+shipped, or set by a future writer that forgets it.
+
+## Addendum (2026-09-05): synthesized evidence must never outrank real evidence — the synthesis claim
+
+TEAM-4099 F4. The D1.2 salvage path (`evidence.mjs synthesizeCompletion`) harvests GitHub for an
+agent that pushed a branch and died before `report_completion`. It read "no evidence" — no
+`completions/<tid>.json`, no `agentTasks[tid].output` — and then wrote both records
+UNCONDITIONALLY. Four independent triggers reach it: the dead-session detector's stall branch and
+its dead-session branch, the invoke-failure catch, and the prGuard's merged-PR salvage. None of
+them coordinated, and the GitHub probe between the read and the writes takes seconds.
+
+Two failure modes fell out of that. Two triggers firing in the same window both passed the read and
+both synthesized — two S3 records, two row writes, two `done` transitions, two done-cascades. And a
+trigger that read "no evidence" before the agent's own `report_completion` landed then overwrote the
+real record with `source: "synthesized"` and the real row with the `[synthesized] N commit(s)`
+summary. D1.2's rule is never fabricate evidence; clobbering real evidence with a guess is strictly
+worse, because a fabricated summary is at least honest about being one.
+
+The synthesis is now a claimed, conditionally-written operation, and the whole ordering is chosen so
+that every race resolves toward real evidence:
+
+1. precondition read (cheap; keeps the common "already reported" case at zero writes)
+2. `store.claimCompletionSynthesis` — `SET agentTasks.#tid.synthesisClaimedAt` under
+   `attribute_exists(entry) AND attribute_not_exists(output) AND attribute_not_exists(claim)`. First
+   write on the path, before any GitHub call, so a loser spends nothing. Untracked legacy rows are
+   handled the `claimGateBypassFlag` way: seed via `trackTicket`, retry the stamp only if this call
+   created the entry.
+3. GitHub harvest — winner only.
+4. `IfNoneMatch: "*"` create of `completions/<tid>.json`. The durable record goes FIRST because it is
+   what every reader trusts; a real `report_completion` that landed after the claim owns the key and
+   the 412 aborts the synthesis (`record_exists`).
+5. `store.setSynthesizedEvidence` — per-field SETs under `attribute_not_exists(output) AND
+   synthesisClaimedAt = :claimed`. Losing it means real evidence arrived in the gap
+   (`real_evidence_won`); the row is left alone.
+6. only then the provider `done` transition and `agent.completion_synthesized`.
+
+The claim's disposition on abort is the part worth spelling out, because "hold the claim forever" is
+its own bug. It is RELEASED (generation-scoped REMOVE, refused once `output` exists) when the abort
+left nothing durable behind — `no_evidence`, or a throw before the record write — because a sticky
+claim would make the ticket permanently un-synthesizable and a branch that appears ten minutes later
+could never be salvaged, which is the stranded-run bug D1.2 exists to fix. It is KEPT on success and
+on the two terminal aborts (`record_exists`, `real_evidence_won`), where evidence now exists and
+re-synthesis must never happen: there the stamp doubles as a "synthesis is settled here" marker.
+
+The reverse direction is deliberately left unconditional. `lambda/workflow-output`'s real
+`report_completion` still overwrites `completions/<tid>.json` outright — real beats synthesized, and
+an existing `source: "agent"` record means the same agent is re-reporting. The orchestrator's
+`harvestCompletionEvidence` needed the matching fix: a synthesized row carries both `output` and
+`commitSha`, so it satisfied the `hasEvidence && hasShipSignal` short-circuit and permanently blocked
+a later real record from ever reaching the row — the run kept `evidenceSource: "synthesized"` and the
+agent's own summary was never promoted. A synthesized row now counts as NOT having evidence there,
+and a real record overwrites it, carrying its own provenance (`agent`, or `manager` from the
+mark-done override).
+
+`@aws-sdk/client-s3` is now pinned in `lambda/orchestrator/package.json`. `IfNoneMatch` on PutObject
+needs SDK >= 3.6xx (Aug 2024) and an older client drops the unknown parameter SILENTLY — the
+conditional create would degrade into exactly the unconditional overwrite it replaces. A correctness
+guarantee cannot rest on whichever SDK version the managed runtime happens to bundle.
+
+Generalized, alongside R2's "scoped conditional write": a write that INFERS state must be
+conditional on the state it inferred still holding, and the conditional writes must be ordered so
+that the authoritative record is the first thing contended for. Every actor that can perform the
+same inference needs one claim between them, and that claim needs an explicit release policy —
+released while the obligation is still outstanding, kept once it is discharged.
+
+## Addendum (2026-09-05): a backstop needs a budget — bounding the sibling recompute
+
+TEAM-4099 F7. D2.1's `recomputeRun` re-asks the dispatch invariant of EVERY sibling of a run
+whenever something terminal happens (`agent.complete`, `review.approved`, an escalation decision).
+That is the right question to ask; the cost of asking it was unbounded in three separate dimensions,
+inside an invocation that is not free to spend.
+
+The budget it spends against: `template.yaml`'s `OrchestratorFunction` has `Timeout: 60` (the
+`Globals` 900 is overridden) and `MemorySize: 256`, and the DDB-stream trigger has `BatchSize: 10`.
+So one invocation can carry ten terminal records, and each of them already owns a done-cascade, a
+completion check, fix verification and the gate-bypass check *before* the recompute runs. The
+recompute is the last thing in that chain and the only part with no natural ceiling.
+
+What was unbounded, and what bounds it now:
+
+1. **Reads.** Every still-open sibling with blockers cost one serial `getTicket` PER BLOCKER
+   (`checkAllBlockersResolved`), for information the sibling rows already carried. Measured on a
+   100-sibling epic with 5 blockers each: **500 single-ticket reads** before, **0** after. Blockers
+   now resolve against a `Map` built once from the single `getChildTickets` query; only a blocker
+   MISSING from that snapshot (cross-epic, or deleted) falls back to a `getTicket`, memoized per id,
+   so the read count is at most the number of DISTINCT foreign blockers.
+   Note what was *not* done: putting a `Limit` on the child query. That query is shared with the
+   cascade and the sweep, and a `Limit` would silently shorten *their* view of the run — a
+   correctness change dressed as a bound. (Its real latent gap is the missing `LastEvaluatedKey`
+   pagination past 1 MB, which is a separate issue.) The bound belongs at the candidate level.
+2. **Candidates.** `RECOMPUTE_MAX_CANDIDATES` (default 50) reconciles at most that many siblings.
+3. **Wall clock.** `RECOMPUTE_BUDGET_MS` (default 20000 — a third of the timeout) is checked before
+   each `reconcileDependent`.
+
+Both bounds are per INVOCATION, not per call: they live in module scope (the Node Lambda runtime
+runs one invocation at a time per container, so module scope *is* invocation scope) and are reset at
+the top of `handler`. A per-call budget would have been useless here — ten records would stack ten
+budgets and run 200 seconds inside a 60-second function. For the same reason a `(workflow, trigger)`
+pair recomputes once per invocation: a batch carrying two terminal records for the same run used to
+run the identical whole-run backstop twice, and the second record's own cascade still fans out
+normally.
+
+Hitting either bound is not silent — `orchestrator.recompute` carries `truncated: true` / `cap`, or
+`budgetExceeded: true` / `budgetMs`, and the event is published even when nothing was reconciled,
+because "part of this run was left to the sweep" is exactly what an operator needs to see. Leaving
+the remainder to the reconcile sweep is safe by construction: the sweep asks the same question
+through the same `cascade.reconcileDependent` (R3), on a 5-minute schedule, which is what it is for.
+
+Generalized: a backstop that runs on every signal is a load amplifier. It needs a per-invocation
+budget stated against the function's actual timeout, a bound on work rather than on the shared query
+it borrows, and an event that admits when it stopped early — a backstop that silently does less than
+it claims is worse than one that is honest about its ceiling.
