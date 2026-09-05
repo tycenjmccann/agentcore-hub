@@ -136,28 +136,73 @@ function resolveRegion(env: NodeJS.ProcessEnv): string {
   return env.AWS_REGION || env.AWS_DEFAULT_REGION || "us-east-1";
 }
 
+/**
+ * TEAM-4079 F3: hard ceiling on the account-id probe. Its ONLY product is the
+ * "(hub bucket)" / "(external bucket)" label in an S3 detail string, so it has
+ * no claim on the 10s-per-source budget — an unreachable STS endpoint used to
+ * hang every source check (URL fetches included) behind SDK defaults of 3
+ * attempts with no request timeout.
+ */
+export const HUB_BUCKET_PROBE_TIMEOUT_MS = 2_000;
+
 /** Memoized only for the DEFAULT (non-injected) STS client, so tests that pass
- *  their own stub always get a fresh call. */
+ *  their own stub always get a fresh call. SUCCESSES ONLY — see probeAccountId. */
 let defaultAccountIdProbe: Promise<string | undefined> | null = null;
+
+/** TEST-ONLY. Drops the memoized default-path probe so a test starts cold.
+ *  Nothing in the app should call this. */
+export function __resetHubBucketProbeCacheForTests(): void {
+  defaultAccountIdProbe = null;
+}
 
 async function probeAccountId(
   region: string,
   stsClient?: AwsClientLike
 ): Promise<string | undefined> {
   const run = async (client: AwsClientLike) => {
+    // Race the call against a hard timer: an injected stub or a hung endpoint
+    // must not outlive HUB_BUCKET_PROBE_TIMEOUT_MS. The timer is always cleared
+    // so a settled probe can never hold the event loop open.
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const res = (await client.send(new GetCallerIdentityCommand({}))) as { Account?: string };
-      return res?.Account || undefined;
+      return await Promise.race([
+        client
+          .send(new GetCallerIdentityCommand({}))
+          .then((res) => ((res as { Account?: string })?.Account as string | undefined) || undefined),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), HUB_BUCKET_PROBE_TIMEOUT_MS);
+        }),
+      ]);
     } catch {
       // No credentials / no sts:GetCallerIdentity / network. The hub bucket is
       // then simply unknown — that only costs us the "(hub bucket)" label, it
       // must never fail a submission.
       return undefined;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   };
   if (stsClient) return run(stsClient);
   if (!defaultAccountIdProbe) {
-    defaultAccountIdProbe = run(new STSClient({ region }));
+    // maxAttempts:1 + a bounded requestHandler so the transport agrees with the
+    // race above instead of retrying underneath it.
+    const pending = run(
+      new STSClient({
+        region,
+        maxAttempts: 1,
+        requestHandler: {
+          requestTimeout: HUB_BUCKET_PROBE_TIMEOUT_MS,
+          connectionTimeout: HUB_BUCKET_PROBE_TIMEOUT_MS,
+        },
+      })
+    );
+    defaultAccountIdProbe = pending;
+    // NEVER cache a failure. One transient STS blip at cold start used to cost
+    // the label for the whole process lifetime; only a real account id sticks.
+    // (run() never rejects, so this handler needs no catch.)
+    void pending.then((account) => {
+      if (!account && defaultAccountIdProbe === pending) defaultAccountIdProbe = null;
+    });
   }
   return defaultAccountIdProbe;
 }
@@ -209,14 +254,15 @@ const ACCESS_DENIED_HINT =
 
 async function checkS3Source(
   value: string,
-  ctx: { s3: AwsClientLike | undefined; hubBucket?: string }
+  // hubBucket is a PROMISE (TEAM-4079 F3): it is awaited lazily, only on the one
+  // path that prints the label, so nothing here queues behind the STS probe.
+  ctx: { s3: AwsClientLike | undefined; hubBucket: Promise<string | undefined> }
 ): Promise<Check> {
   const match = value.match(/^s3:\/\/([^/]+)\/(.+)$/);
   if (!match) {
     return { outcome: "definitive", method: "parse", detail: `Invalid S3 URI format: ${redactUrl(value)}` };
   }
   const [, bucket, key] = match;
-  const scope = ctx.hubBucket && bucket === ctx.hubBucket ? "hub bucket" : "external bucket";
 
   if (!ctx.s3) {
     // Only reachable if a caller passes an s3:// source with a hand-built ctx.
@@ -227,7 +273,13 @@ async function checkS3Source(
     // ALWAYS a real HeadObject, hub bucket included. The old "trust our own
     // bucket" short-circuit meant a wrong key in our own bucket sailed through
     // to an agent that then could not read it.
-    await ctx.s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    // The label resolves CONCURRENTLY with the HeadObject, and only the success
+    // branch needs it — an error detail never mentions the scope.
+    const [, hubBucket] = await Promise.all([
+      ctx.s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key })),
+      ctx.hubBucket,
+    ]);
+    const scope = hubBucket && bucket === hubBucket ? "hub bucket" : "external bucket";
     return {
       outcome: "verified",
       method: "HeadObject",
@@ -369,8 +421,17 @@ export async function validateIntakeSources(
   const region = resolveRegion(env);
   const s3 = hasS3 ? opts.s3Client ?? new S3Client({ region }) : undefined;
   // STS is only worth a round-trip when an s3:// source is actually present.
-  const hubBucket =
-    opts.hubBucket ?? (hasS3 ? await resolveHubBucket({ env, stsClient: opts.stsClient }) : undefined);
+  // STARTED, NEVER AWAITED HERE (TEAM-4079 F3): awaiting it before the map meant
+  // every check — URL GETs and in-memory uploads included — sat behind STS. The
+  // .catch keeps it non-rejecting even when no s3:// source ever consumes it, so
+  // an unconsumed probe can't surface as an unhandled rejection.
+  const hubBucketPromise: Promise<string | undefined> = (
+    opts.hubBucket !== undefined
+      ? Promise.resolve(opts.hubBucket)
+      : hasS3
+        ? resolveHubBucket({ env, stsClient: opts.stsClient })
+        : Promise.resolve(undefined)
+  ).catch(() => undefined);
   // Resolved at call time, not module load, so a test can stub global.fetch.
   const fetchImpl: typeof fetch =
     opts.fetchImpl ?? ((input, init) => globalThis.fetch(input as RequestInfo | URL, init));
@@ -378,10 +439,26 @@ export async function validateIntakeSources(
   const checks = list.map(async (source): Promise<SourceCheckResult> => {
     const value = typeof source?.value === "string" ? source.value : "";
     let check: Check;
+    // The VALUE's locator wins, so an s3:// or http(s):// value is checked
+    // whatever `type` claims. Only when the value carries no locator does the
+    // declared type decide (TEAM-4079 F4) — it used to fall straight through to
+    // "upload — in memory", which told the operator a flat lie about a
+    // "www.example.com/spec.pdf" the intake agent could never fetch, and marked
+    // it "skipped" (a status reserved for uploads and the trust shortcut).
     if (value.startsWith("s3://")) {
-      check = await checkS3Source(value, { s3, hubBucket });
+      check = await checkS3Source(value, { s3, hubBucket: hubBucketPromise });
     } else if (value.startsWith("http://") || value.startsWith("https://")) {
       check = await checkUrlSource(value, { fetchImpl, env });
+    } else if (source?.type === "s3") {
+      // Not an s3:// URI — checkS3Source's parse branch rejects it definitively
+      // without touching the client.
+      check = await checkS3Source(value, { s3, hubBucket: hubBucketPromise });
+    } else if (source?.type === "url") {
+      check = {
+        outcome: "definitive",
+        method: "parse",
+        detail: `Unsupported URL scheme — expected http(s)://: ${redactUrl(value)}`,
+      };
     } else {
       // type "upload" (or anything without a network locator) — the content is
       // already in memory; there is nothing to reach out to.
