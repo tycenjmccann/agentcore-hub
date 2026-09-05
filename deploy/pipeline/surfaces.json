@@ -294,6 +294,7 @@
     "deploy/runtime-agent/verify-fleet-invoke.py": "Fleet smoke tool; run by hand.",
     "deploy/runtime-agent/verify-fleet.sh": "Fleet smoke tool; run by hand.",
     "deploy/runtime-agent/local-ab-test.py": "Local prompt A/B harness; dev-only.",
-    "deploy/coding-agent-runtime/invoke.py": "Manual invoke/smoke tool; not deployed."
+    "deploy/coding-agent-runtime/invoke.py": "Manual invoke/smoke tool; not deployed.",
+    "deploy/lib": "Sourced shell helpers for the opt-in config-evals deploy guard (require_eval_gate, --force parsing). Library code consumed by the deploy scripts at run time — nothing to deploy."
   }
 }
