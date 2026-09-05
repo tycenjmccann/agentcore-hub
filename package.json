@@ -10,6 +10,11 @@
     "start": "next start",
     "lint": "next lint",
     "test:unit": "vitest run",
+    "battery:lint": "node evals/battery/lint-fixtures.mjs",
+    "battery:run": "node evals/battery/run-battery.mjs",
+    "battery:dry-run": "node evals/battery/run-battery.mjs --dry-run",
+    "battery:mock": "node evals/battery/run-battery.mjs --mock --results /tmp/battery-mock-results.json",
+    "battery:baseline": "node evals/battery/run-battery.mjs --baseline-mode --repeat 3 --out evals/battery/baseline.json",
     "test:cloud-code": "playwright test tests/cloud-code-ui.spec.ts",
     "test": "npx playwright test tests/tab-*.spec.ts tests/e2e-api-routes.spec.ts",
     "test:full": "./tests/run-all.sh --full"
@@ -69,6 +74,7 @@
     "tailwindcss": "^3.4.0",
     "ts-prune": "^0.10.3",
     "typescript": "^5.4.0",
-    "vitest": "^2.1.9"
+    "vitest": "^2.1.9",
+    "yaml": "^2.9.0"
   }
 }

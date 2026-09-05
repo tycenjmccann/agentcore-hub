@@ -110,6 +110,19 @@ function resolveAgentId(logGroup, agentList) {
   return match?.agentId || null;
 }
 
+/**
+ * TEAM-3090 defense-in-depth: config-evals battery sessions are hermetic
+ * (direct Bedrock Converse calls — they emit no OTEL and never reach these
+ * log groups by design), but if a battery-shaped session id ever shows up it
+ * must never be buffered to DynamoDB, batched to S3, or counted toward the
+ * improver flush. Battery session ids are `battery-<runId>-<caseId>`
+ * (evals/battery/lib/agent-runner.mjs). Exported pure so it is unit-testable
+ * without AWS mocks.
+ */
+export function isBatterySession(sessionId) {
+  return typeof sessionId === 'string' && sessionId.startsWith('battery-');
+}
+
 // ─── Handler ────────────────────────────────────────────────────────────────
 export const handler = async (event) => {
   // Decode CloudWatch Logs payload
@@ -126,23 +139,36 @@ export const handler = async (event) => {
   }
   console.log(`[eval-packager] Processing event for agent: ${agentId}`);
 
-  // 2. Read agent config from DynamoDB
+  // 2. Extract session data from log events (enriched with parsed evaluator
+  //    results). Runs BEFORE any DynamoDB access: if the battery guard filters
+  //    every record (TEAM-3427 / NFR-1.3), an all-battery delivery must produce
+  //    zero DDB calls of any kind — no config read, no buffer append.
+  const sessionData = extractSessionData(parsed);
+  if (sessionData.evaluatorResults.length === 0 && sessionData.sessionIds.length === 0) {
+    console.log(
+      '[eval-packager] delivery retained zero records after battery filtering — skipping all DDB writes'
+    );
+    return { statusCode: 200, body: 'battery-filtered' };
+  }
+
+  // 3. Read agent config from DynamoDB
   const config = await getAgentConfig(agentId);
   if (!config) {
     console.log(`[eval-packager] No config found for agent: ${agentId}. Skipping.`);
     return { statusCode: 200, body: 'no-config' };
   }
 
-  // 3. Check enabled flag
+  // 4. Check enabled flag
   if (config.enabled === false) {
     console.log(`[eval-packager] Agent ${agentId} is disabled. Skipping.`);
     return { statusCode: 200, body: 'disabled' };
   }
 
-  // Extract session data from log events (enriched with parsed evaluator results).
-  // Done BEFORE the sample-rate gate below: telemetry health (span_missing) must
-  // be measured on ALL deliveries, not just the sampled subset that gets buffered.
-  const sessionData = extractSessionData(parsed);
+  // sessionData was already extracted at step 2 — BEFORE any DDB access, so an
+  // all-battery delivery returns without touching DynamoDB (TEAM-3427 /
+  // NFR-1.3) — and still before the sample-rate gate below: telemetry health
+  // (span_missing) must be measured on ALL deliveries, not just the sampled
+  // subset that gets buffered.
 
   // TEAM-3376: cross-delivery/concurrent dedup CHECK runs BEFORE classification,
   // aggregation and buffering — everything downstream sees the filtered view.
@@ -259,7 +285,7 @@ export const handler = async (event) => {
   // query grouped by logStream (docs/eval-infrastructure-reliability-design.md).
   await aggregateScoresToDdb(agentId, sessionData.evaluatorResults);
 
-  // 6. Append to sessionBuffer, counting distinct runs toward batchSize
+  // 8. Append to sessionBuffer, counting distinct runs toward batchSize
   const batchSize = config.batchSize || 10;
   const appended = await appendToBuffer(agentId, sessionData, batchSize);
 
@@ -670,6 +696,12 @@ export function extractSessionData(parsed) {
       // batch counts RUNS, not log deliveries.
       const attrs = parsedMessage.attributes || {};
       const sid = attrs['session.id'] || parsedMessage['session.id'] || null;
+      // TEAM-3090: earliest-possible skip for battery sessions — the record
+      // never enters the buffer and never counts toward the improver flush.
+      if (isBatterySession(sid)) {
+        console.log(`[eval-packager] Skipping battery session ${sid} (config-evals battery guard)`);
+        continue;
+      }
       if (sid) sessionIds.add(sid);
       // Eval results are OTEL log records: everything lives in attributes under
       // gen_ai.* keys, NOT top-level fields. Reading parsedMessage.score/.evidence
@@ -1306,9 +1338,28 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
 // so tests stay deterministic and fast.
 const AGG_RETRY = { maxAttempts: 3, baseDelayMs: 25 };
 
-async function aggregateScoresToDdb(agentId, entries = []) {
+// Exported (TEAM-3427) so the config-evals battery suite can exercise the
+// guard hermetically with a mocked DDB client.
+export async function aggregateScoresToDdb(agentId, entries = []) {
   const sessions = new Set();
   const scoreDeltas = {}; // { evaluatorName: { sum, count } }
+
+  // TEAM-3390 defense-in-depth: the handler path never gets here with a
+  // battery row (extractSessionData drops them, and its entry.sessionId is
+  // resolved from attributes OR the legacy top-level session.id, so a
+  // top-level battery id can't slip past as an empty string — TEAM-3427
+  // finding 6), but any other caller passing unfiltered entries must not let
+  // battery sessions pollute the per-agent session total, the evaluator score
+  // aggregates, the status tally, or the last-error breadcrumb the dashboard
+  // reads. Filtered ONCE here so every use of `entries` below sees only
+  // retained rows.
+  entries = entries.filter((r) => {
+    if (isBatterySession(r.sessionId)) {
+      console.log(`[eval-packager] Skipping battery session ${r.sessionId} in score aggregation (config-evals battery guard)`);
+      return false;
+    }
+    return true;
+  });
 
   for (const r of entries) {
     if (r.parseError) continue;

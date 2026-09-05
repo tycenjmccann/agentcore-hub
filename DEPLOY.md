@@ -45,6 +45,23 @@ NOT rewritten by the commands below. That is deliberate:
   set — it rewrites function env vars and would blank prod Jira credentials.**
   The staging deploy below is code-only for exactly this reason.
 
+## Config evals (optional)
+
+Prompt, blueprint, and agent/workflow config changes can be scored by the
+config-evals battery — see [`evals/battery/README.md`](evals/battery/README.md).
+It is **opt-in** and no step below depends on it:
+
+- Local: `npm run battery:run -- --case <id> --report-only` (one case, scores
+  only) or `npm run battery:run -- --base-ref origin/main` (full gate math).
+- CI: add the `config-evals` label to a PR to run the gate on it, or dispatch
+  the "Config Evals Run" workflow against any ref. Set the repo variable
+  `CONFIG_EVALS_GATE=always` to restore always-on gating for every PR.
+- Deploy guard: the deploy scripts source `deploy/lib/check-eval-gate.sh` but
+  `require_eval_gate` is a no-op unless `EVAL_GATE=enforce` is exported. With it
+  set, a commit touching gated paths must carry a verified `config-evals-gate`
+  PASS check; break-glass is `EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON="..."`
+  (or `--force --force-reason "..."` on the runtime-agent deploy scripts).
+
 ## Staging deploy
 
 The hub has no separate staging account; "staging" = deploying code-only

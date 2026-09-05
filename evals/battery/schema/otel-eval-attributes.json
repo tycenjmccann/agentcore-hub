@@ -1,0 +1,9 @@
+{
+  "comment": "Contract fixture: OTEL GenAI evaluation attribute keys as read by lambda/eval-packager/index.mjs (attrs['gen_ai.evaluation.*']). The Lambda is the source of truth — if it changes, this fixture and the battery runner constants must change with it. A runner unit test asserts the runner's constants match this file exactly.",
+  "attributes": {
+    "evaluationName": "gen_ai.evaluation.name",
+    "scoreValue": "gen_ai.evaluation.score.value",
+    "scoreLabel": "gen_ai.evaluation.score.label",
+    "explanation": "gen_ai.evaluation.explanation"
+  }
+}

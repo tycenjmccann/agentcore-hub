@@ -80,3 +80,12 @@ workflow-spans.json
 # CI/CD pipeline module CDK synth output
 deploy/pipeline/cdk.out/
 deploy/pipeline/node_modules/
+
+# Eval-gate break-glass audit log (local copy; canonical record is in S3)
+.eval-gate-overrides.log
+
+# Config-evals battery local run artifacts (results/progress/flake ledger written next to --results)
+evals/battery/battery-results.json
+evals/battery/battery-progress.jsonl
+evals/battery/flake-ledger.jsonl
+evals/battery/check-summary.md

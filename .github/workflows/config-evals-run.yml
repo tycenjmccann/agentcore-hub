@@ -1,0 +1,89 @@
+# Config Evals Run — on-demand battery run against any ref (workflow_dispatch).
+#
+# The standalone companion to config-evals-gate.yml: no PR, no check run, no
+# baseline write. It scores the checked-out ref's prompts/blueprints/config with
+# the battery and publishes the check summary to the job summary + an artifact.
+# Credentials come from the same OIDC role as the gate (environment
+# config-evals is in the role's trust policy, so any branch can dispatch).
+name: Config Evals Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: "Comma-separated case ids (empty = every active case)"
+        required: false
+        default: ""
+      report_only:
+        description: "Exit 0 even when the gate verdict is FAIL (scores only)"
+        type: boolean
+        default: true
+      base_ref:
+        description: "Gate mode: compare against this ref's rules/baseline (empty = report on the ref's own baseline)"
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: config-evals-run-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  battery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    environment: config-evals
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Assume eval-gate role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_EVAL_GATE_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: gha-run-${{ github.run_id }}-${{ github.actor }}
+
+      - name: Run battery
+        env:
+          CASES: ${{ inputs.cases }}
+          REPORT_ONLY: ${{ inputs.report_only }}
+          BASE_REF: ${{ inputs.base_ref }}
+          BATTERY_RUN_DEADLINE_SECONDS: "1500"
+        run: |
+          set -euo pipefail
+          args=(--results "$RUNNER_TEMP/battery-results/battery-results.json")
+          mkdir -p "$RUNNER_TEMP/battery-results"
+          IFS=',' read -ra ids <<< "$CASES"
+          for id in "${ids[@]}"; do
+            id="$(echo "$id" | xargs)"; [ -n "$id" ] && args+=(--case "$id")
+          done
+          [ "$REPORT_ONLY" = "true" ] && args+=(--report-only)
+          [ -n "$BASE_REF" ] && args+=(--base-ref "$BASE_REF")
+          node evals/battery/run-battery.mjs "${args[@]}"
+
+      - name: Publish summary
+        if: always()
+        run: |
+          f="$RUNNER_TEMP/battery-results/check-summary.md"
+          if [ -f "$f" ]; then cat "$f" >> "$GITHUB_STEP_SUMMARY"; else echo "no check-summary.md produced" >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: battery-results
+          path: ${{ runner.temp }}/battery-results
+          if-no-files-found: warn

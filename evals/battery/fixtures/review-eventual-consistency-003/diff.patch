@@ -1,0 +1,43 @@
+diff --git a/src/lib/artifacts/list-with-latest.ts b/src/lib/artifacts/list-with-latest.ts
+new file mode 100644
+index 0000000..b2c3d4e
+--- /dev/null
++++ b/src/lib/artifacts/list-with-latest.ts
+@@ -0,0 +1,26 @@
++import { artifactClient } from "./client";
++
++export interface ArtifactListing {
++  keys: string[];
++  latestKey: string;
++}
++
++// Writes the new artifact, then returns the refreshed listing for the panel.
++// The UI highlights `latestKey`, so it must be present in `keys`.
++export async function writeAndList(
++  prefix: string,
++  name: string,
++  content: string
++): Promise<ArtifactListing> {
++  const key = `${prefix}${name}`;
++  await artifactClient.putObject(key, content);
++  const keys = await artifactClient.listKeys(prefix);
++  const latestKey = keys.find((k) => k === key)!;
++  return { keys, latestKey };
++}
+diff --git a/src/lib/artifacts/list-with-latest.test.ts b/src/lib/artifacts/list-with-latest.test.ts
+new file mode 100644
+index 0000000..c3d4e5f
+--- /dev/null
++++ b/src/lib/artifacts/list-with-latest.test.ts
+@@ -0,0 +1,13 @@
++import { describe, it, expect } from "vitest";
++import { writeAndList } from "./list-with-latest";
++
++describe("writeAndList", () => {
++  it("returns the new key in the listing", async () => {
++    // in-memory fake client: put() is immediately visible to listKeys()
++    const result = await writeAndList("shared/", "notes.md", "hello");
++    expect(result.latestKey).toBe("shared/notes.md");
++    expect(result.keys).toContain("shared/notes.md");
++  });
++});

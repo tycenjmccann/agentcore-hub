@@ -1,0 +1,30 @@
+[
+  {
+    "role": "user",
+    "content": "The dashboard tab just goes completely blank for me. It started this morning."
+  },
+  {
+    "role": "assistant",
+    "content": "Does it happen every time you open the dashboard, or only after doing something specific?"
+  },
+  {
+    "role": "user",
+    "content": "Only after I delete a workflow. I deleted an old test workflow from the list, and right after that the whole dashboard went white. Refreshing fixes it until I delete another one."
+  },
+  {
+    "role": "assistant",
+    "content": "Did you catch anything in the browser console when it went blank?"
+  },
+  {
+    "role": "user",
+    "content": "There was a red error, something about reading 'status' of undefined. I copied part of it into a text file, attaching it. It mentioned MetricsPanel."
+  },
+  {
+    "role": "assistant",
+    "content": "Thanks — one more thing: does the blank screen happen if the deleted workflow was NOT visible in the metrics panel's time window?"
+  },
+  {
+    "role": "user",
+    "content": "Good question. The test workflow I deleted was definitely in this week's window, it was showing in the chart. A teammate deleted a months-old workflow yesterday and said nothing broke for them."
+  }
+]
