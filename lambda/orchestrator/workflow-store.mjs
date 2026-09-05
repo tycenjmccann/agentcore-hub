@@ -77,6 +77,12 @@ async function ensureAgentTasksMap(workflowId) {
  *
  * `staleBefore`: a claim whose startedAt is older is a crashed session — a
  * human re-Readying the ticket must be able to re-dispatch past it.
+ *
+ * TEAM-3991 SECURITY F8: a ticket flagged for merge-gate bypass
+ * (`gateBypassFlaggedAt`) can NEVER be re-claimed. A fresh claim replaces the
+ * whole entry, so re-dispatching a flagged ticket would erase the flag AND the
+ * evidence (branch/commit/prUrl/output) a human needs to judge the bypass. The
+ * flag is cleared only from a human-authenticated path.
  */
 export async function claimInvocation(workflowId, ticketId, entry, staleBefore) {
   await ensureAgentTasksMap(workflowId);
@@ -95,8 +101,11 @@ export async function claimInvocation(workflowId, ticketId, entry, staleBefore) 
       TableName: _table,
       Key: { workflowId },
       UpdateExpression: "SET agentTasks.#tid = :task",
+      // The parentheses matter: the three stale/free alternatives are ORed, and
+      // the bypass flag vetoes ALL of them.
       ConditionExpression:
-        "attribute_not_exists(agentTasks.#tid) OR agentTasks.#tid.#st <> :running OR agentTasks.#tid.startedAt < :staleBefore",
+        "(attribute_not_exists(agentTasks.#tid) OR agentTasks.#tid.#st <> :running OR agentTasks.#tid.startedAt < :staleBefore)" +
+        " AND attribute_not_exists(agentTasks.#tid.gateBypassFlaggedAt)",
       ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
       ExpressionAttributeValues: {
         ":task": task,
@@ -168,34 +177,74 @@ export async function completeTaskEntry(workflowId, ticketId, seedEntry) {
   }
 }
 
-/** Merge metadata fields (branch/commit/prUrl/output) into one task entry. */
-export async function mergeTaskMetadata(workflowId, ticketId, fields) {
+/**
+ * Per-field SET paths for one task entry — never a whole-entry replacement, so
+ * a metadata merge can't erase a concurrent claim/complete write. Returns null
+ * when there is nothing settable (every value undefined/null).
+ */
+function taskMetadataUpdate(ticketId, fields) {
   const names = { "#tid": ticketId };
   const values = {};
   const sets = [];
   let i = 0;
-  for (const [k, v] of Object.entries(fields)) {
+  for (const [k, v] of Object.entries(fields || {})) {
     if (v === undefined || v === null) continue;
     i++;
     names[`#f${i}`] = k;
     values[`:v${i}`] = v;
     sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
   }
-  if (!sets.length) return;
+  if (!sets.length) return null;
+  return {
+    UpdateExpression: `SET ${sets.join(", ")}`,
+    ConditionExpression: "attribute_exists(agentTasks.#tid)",
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values,
+  };
+}
+
+/**
+ * Merge metadata fields (branch/commit/prUrl/output) into one task entry.
+ * Returns true when the merge landed, false when there was no tracked entry to
+ * merge into (or nothing to set) — see mergeTaskMetadataOrTrack for the callers
+ * that must not lose the metadata.
+ */
+export async function mergeTaskMetadata(workflowId, ticketId, fields) {
+  const update = taskMetadataUpdate(ticketId, fields);
+  if (!update) return false;
   try {
-    await _ddb.send(new UpdateCommand({
-      TableName: _table,
-      Key: { workflowId },
-      UpdateExpression: `SET ${sets.join(", ")}`,
-      ConditionExpression: "attribute_exists(agentTasks.#tid)",
-      ExpressionAttributeNames: names,
-      ExpressionAttributeValues: values,
-    }));
+    await _ddb.send(new UpdateCommand({ TableName: _table, Key: { workflowId }, ...update }));
+    return true;
   } catch (err) {
     if (err.name !== "ConditionalCheckFailedException") throw err;
     // No tracked entry to merge into — drop the metadata rather than
     // materializing a partial entry the claim/complete paths don't own.
+    return false;
   }
+}
+
+/**
+ * TEAM-3991 D1.2 — merge metadata into a task entry, CREATING the entry first
+ * when it was never tracked.
+ *
+ * mergeTaskMetadata deliberately drops on a missing entry, which is right for
+ * the harvest paths (they only decorate work the orchestrator already owns) but
+ * wrong for synthesized/manager evidence: a ticket whose agent died before any
+ * claim landed has no agentTasks entry at all, and dropping the evidence there
+ * is exactly the stranded-run bug. Seed via trackTicket (first-writer-wins, so
+ * a concurrent tracker is harmless) and re-merge. Returns true when the fields
+ * landed.
+ */
+export async function mergeTaskMetadataOrTrack(workflowId, ticketId, fields, seed = {}) {
+  if (!taskMetadataUpdate(ticketId, fields)) return false;
+  if (await mergeTaskMetadata(workflowId, ticketId, fields)) return true;
+  await trackTicket(workflowId, ticketId, {
+    ticketId,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+    ...seed,
+  });
+  return await mergeTaskMetadata(workflowId, ticketId, fields);
 }
 
 /** Set one task's status (claim release on failed invoke, re-dispatch, …). */
@@ -208,6 +257,46 @@ export async function setTaskStatus(workflowId, ticketId, status) {
     ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
     ExpressionAttributeValues: { ":s": status },
   }));
+}
+
+/**
+ * TEAM-3991 D2.2 — park an agent's live claim because its ticket was blocked
+ * (a fix ticket was filed against it, or a reviewer requested changes). "parked"
+ * is deliberately NOT in lease-constants `liveClaimStatuses`, so a parked claim
+ * stops holding the lease and the reconcile sweep can re-drive the ticket once
+ * its blockers clear — without the dead-session detector having to declare the
+ * session dead first.
+ *
+ * Generation-scoped: only the exact claim generation the caller observed is
+ * parked (same startedAt — or, mirroring markDeadSessionDetected/stealClaim,
+ * still no startedAt at all for a legacy task). Losing the CAS means the claim
+ * already moved on (re-claimed, completed, stolen) and is not ours to park.
+ * Returns true when this caller parked the claim.
+ */
+export async function parkClaim(workflowId, ticketId, expectedStartedAt) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET agentTasks.#tid.#st = :parked",
+      ConditionExpression:
+        "(agentTasks.#tid.#st = :running OR agentTasks.#tid.#st = :inprog) AND " +
+        (expectedStartedAt
+          ? "agentTasks.#tid.startedAt = :expected"
+          : "attribute_not_exists(agentTasks.#tid.startedAt)"),
+      ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
+      ExpressionAttributeValues: {
+        ":parked": "parked",
+        ":running": "running",
+        ":inprog": "in_progress",
+        ...(expectedStartedAt ? { ":expected": expectedStartedAt } : {}),
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
 }
 
 /**
@@ -389,6 +478,20 @@ export async function setRepoCheck(workflowId, repoCheck) {
   }));
 }
 
+/**
+ * TEAM-3991 D1.1 — persist the branch-protection pre-flight result (see
+ * repo-check.mjs checkBranchProtection). Advisory data for humans and for the
+ * gate-bypass escalation text; scoped SET of one attribute.
+ */
+export async function setProtectionCheck(workflowId, protectionCheck) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET branchProtectionCheck = :pc",
+    ExpressionAttributeValues: { ":pc": protectionCheck },
+  }));
+}
+
 /** Remove one resume context (one-time use). No-op if absent. */
 export async function removeResumeContext(workflowId, ticketId) {
   try {
@@ -497,6 +600,35 @@ export async function appendReviewAuthorization(workflowId, gateTicketId, author
 }
 
 /**
+ * TEAM-3991 D1.1 — append one human gate DECISION to a gate's ledger. This is
+ * the AUTHORITATIVE record of merge authority: gate-bypass detection compares
+ * `mergedAt` against these rows, not against the ticket's board status.
+ *
+ * SECURITY F6: only human-authenticated paths may call this — the console
+ * transition route (actor from the middleware identity, never from the request
+ * body) and the Telegram gate-decision path. The orchestrator's done handlers
+ * CONSUME this ledger and must never append an APPROVE row, or the bypass check
+ * would approve on the agent's behalf and detect nothing.
+ *
+ * list_append, never a whole-array rewrite: two decisions landing at once (a
+ * console click and a Telegram reply) must both be recorded. Returns the gate's
+ * post-write decisions array so the caller can act on the merged view.
+ */
+export async function appendGateDecision(workflowId, gateTicketId, decision) {
+  await ensureReviewGateLedger(workflowId, gateTicketId);
+  const res = await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression:
+      "SET reviewGateHistory.#g.decisions = list_append(if_not_exists(reviewGateHistory.#g.decisions, :empty), :d)",
+    ExpressionAttributeNames: { "#g": gateTicketId },
+    ExpressionAttributeValues: { ":empty": [], ":d": [decision] },
+    ReturnValues: "ALL_NEW",
+  }));
+  return res.Attributes?.reviewGateHistory?.[gateTicketId]?.decisions || null;
+}
+
+/**
  * Append a human notification atomically (no full-array rewrite). Bumps
  * notifVersion in the same write so a concurrent ackNotifications CAS that
  * read the pre-append list fails and re-reads instead of overwriting the
@@ -560,6 +692,57 @@ export async function appendReviewNotificationOnce(workflowId, ticketId, notific
 }
 
 /**
+ * TEAM-3991 — append ANY notification at most once while one is still open,
+ * keyed on the notification's own `id` (the generalization of
+ * appendReviewNotificationOnce, which is keyed on ticketId + "review_needed").
+ *
+ * Callers mint a deterministic id per offending fact so a re-delivered stream
+ * record / a second cascade / a sweep re-check can't multiply escalations:
+ *   - gate bypass:  notif_gate_bypass_<workflowId>_<mergeCommit>   (SECURITY F9)
+ *   - epic roll-up: notif_epic_rollup_<workflowId>
+ * The in-memory `humanNotifications.some(...)` pre-check callers used before is
+ * NOT enough — two concurrent invocations both hold pre-append snapshots. Same
+ * optimistic notifVersion CAS as ackNotifications: read fresh → if an
+ * unacknowledged notification with this id already exists, stand down → else
+ * append under `notifVersion = :cur`.
+ *
+ * Once a human acknowledges it, a later recurrence notifies again (the same
+ * acknowledged-based open/closed lifecycle as the review notification).
+ * `opts.isDuplicate(n)` overrides the id predicate. Returns true ONLY when THIS
+ * caller appended.
+ */
+export async function appendNotificationOnce(workflowId, notification, opts = {}) {
+  const maxAttempts = opts.maxAttempts || 3;
+  const isDuplicate =
+    opts.isDuplicate || ((n) => n.id === notification.id && !n.acknowledged);
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const wf = await getWorkflow(workflowId);
+    if (!wf) return false;
+    const list = Array.isArray(wf.humanNotifications) ? wf.humanNotifications : [];
+    if (list.some(isDuplicate)) return false;
+    try {
+      await _ddb.send(new UpdateCommand({
+        TableName: _table,
+        Key: { workflowId },
+        UpdateExpression: "SET humanNotifications = :n, notifVersion = :next",
+        ConditionExpression: "attribute_not_exists(notifVersion) OR notifVersion = :cur",
+        ExpressionAttributeValues: {
+          ":n": [...list, notification],
+          ":next": (wf.notifVersion || 0) + 1,
+          ":cur": wf.notifVersion || 0,
+        },
+      }));
+      return true;
+    } catch (err) {
+      if (err.name !== "ConditionalCheckFailedException") throw err;
+      // Concurrent append/ack — re-read, re-check the duplicate guard.
+    }
+  }
+  console.warn(`[workflow-store] appendNotificationOnce(${workflowId}, ${notification?.id}): CAS retries exhausted`);
+  return false;
+}
+
+/**
  * Acknowledge matching notifications. DynamoDB can't update list items by
  * predicate, so this is the one unavoidable read-modify-write — guarded by an
  * optimistic version CAS with bounded retry.
@@ -614,6 +797,13 @@ export async function ackNotifications(workflowId, predicate, maxAttempts = 3) {
  * completion.mjs), not just complete/cancelled/error. It previously omitted
  * "deploy-blocked" / "static-ci-only", so a completion racing in behind an
  * honest blocked close overwrote it with "complete".
+ *
+ * TEAM-3991 D1.4: the SAME write stamps `epicRollupPending`, so the roll-up
+ * obligation is created ATOMICALLY with the terminal claim and belongs to
+ * exactly one invocation — the CAS winner. A winner that dies before rolling
+ * the root epic leaves the flag set, and the reconcile sweep retries it; there
+ * is no window in which the run is "complete" with nobody owning the roll-up.
+ * The winner clears it with clearEpicRollupPending.
  */
 export async function completeWorkflow(workflowId, completedAt) {
   const guard = notTerminalPhaseGuard("phase");
@@ -621,11 +811,12 @@ export async function completeWorkflow(workflowId, completedAt) {
     await _ddb.send(new UpdateCommand({
       TableName: _table,
       Key: { workflowId },
-      UpdateExpression: "SET phase = :complete, completedAt = :ts",
+      UpdateExpression: "SET phase = :complete, completedAt = :ts, epicRollupPending = :pending",
       ConditionExpression: `${guard.condition} AND attribute_not_exists(cancelledAt)`,
       ExpressionAttributeValues: {
         ":complete": "complete",
         ":ts": completedAt,
+        ":pending": true,
         ...guard.values,
       },
     }));
@@ -672,6 +863,27 @@ export async function claimTerminalOutcome(workflowId, outcome, completedAt, rea
       console.log(`[workflow-store] claimTerminalOutcome(${workflowId}, ${outcome}): CAS lost — already terminal, no-op.`);
       return false;
     }
+    throw err;
+  }
+}
+
+/**
+ * TEAM-3991 D1.4 — the root epic was rolled up to done, so the obligation
+ * stamped by the completeWorkflow CAS is discharged. Scoped REMOVE; a run whose
+ * flag is already gone (a sweep retry that raced the winner) returns false
+ * instead of throwing.
+ */
+export async function clearEpicRollupPending(workflowId) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE epicRollupPending",
+      ConditionExpression: "attribute_exists(epicRollupPending)",
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
     throw err;
   }
 }
