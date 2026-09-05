@@ -169,6 +169,25 @@ describe("not mergeable / head drift → no PUT", () => {
     expect(records.find((x) => "MergeOnGreenHeadDrift" in x)?.MergeOnGreenHeadDrift).toBe(1);
   });
 
+  it("reads mergeable_state from the SINGLE-PR endpoint, not the list (real GitHub shape)", async () => {
+    // Real GitHub `GET /pulls?head=` list items carry NO mergeable_state — it is
+    // computed on demand and returned ONLY by `GET /pulls/{n}`. This fixture
+    // mirrors that: the list item omits the field entirely; the single-PR read is
+    // the only place "clean" appears. Old code (reading the list item) returned
+    // not-mergeable -> no-op; the fix fetches the PR by number and merges.
+    const githubApi = vi.fn(async (path, method) => {
+      if (method === "PUT") return { sha: "m-single" };
+      if (/\/pulls\?/.test(path)) return [{ number: 7, merged_at: null, html_url: "http://pr/7", head: { sha: "abc123" } }];
+      if (/\/pulls\/\d+$/.test(path)) return { number: 7, mergeable_state: "clean", html_url: "http://pr/7", head: { sha: "abc123" } };
+      return {};
+    });
+    const { deps } = makeDeps({ mode: "enforce", githubApi });
+    const r = await createMergeOnGreen(deps).mergeApprovedGreenPr(workflow, { merged: false });
+    expect(r.outcome).toBe("merged");
+    expect(githubApi.mock.calls.some((c) => /\/pulls\/7$/.test(c[0]))).toBe(true);
+    expect(putCalls(githubApi)).toHaveLength(1);
+  });
+
   it("re-polls while mergeable_state is unknown, then merges once clean", async () => {
     let n = 0;
     const githubApi = vi.fn(async (path, method) => {

@@ -146,7 +146,13 @@ export function createMergeOnGreen(deps) {
         return { outcome: "no-open-pr" };
       }
 
-      let state = pr.mergeable_state;
+      // The LIST endpoint (`GET /pulls?head=`) never populates `mergeable`/
+      // `mergeable_state` — GitHub computes those on demand and returns them ONLY
+      // on the single-PR read (`GET /pulls/{n}`). Always fetch by number first so
+      // `state` is authoritative; the first single read can still be "unknown"
+      // while GitHub computes, so the bounded re-poll below handles that too.
+      pr = await githubApi(`/repos/${owner}/${repo}/pulls/${pr.number}`);
+      let state = pr?.mergeable_state;
       for (let i = 0; state === "unknown" && i < mergeablePolls; i++) {
         await sleep(mergeablePollMs);
         pr = await githubApi(`/repos/${owner}/${repo}/pulls/${pr.number}`);
