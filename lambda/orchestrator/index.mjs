@@ -749,6 +749,41 @@ async function blockTicketRuntime(ticketId) {
   }
 }
 
+/**
+ * TEAM-4100 F3 backstop — find coding tickets parked `blocked:runtime` that have
+ * NO outage object driving their recovery (a prior recovery deleted the object
+ * before resuming the remainder, or a park outlived its outage). There is no
+ * status/blockReason GSI on the tickets table, so this is a bounded FilterExpression
+ * SCAN: at most RUNTIME_BACKSTOP_SCAN_PAGES DynamoDB pages, capped at
+ * RUNTIME_BACKSTOP_CAP matches. It runs from the 5-minute sweep ONLY when no outage
+ * object exists, so the scan is not on any hot path. DynamoDB provider only — Jira
+ * parks via a status transition + comment with no queryable blockReason, and the
+ * outage-object recovery path (shared by both providers) is the primary mechanism.
+ */
+const RUNTIME_BACKSTOP_SCAN_PAGES = Number(process.env.RUNTIME_BACKSTOP_SCAN_PAGES) || 10;
+const RUNTIME_BACKSTOP_CAP = Number(process.env.RUNTIME_BACKSTOP_CAP) || 200;
+async function findRuntimeBlockedTickets() {
+  if (TICKET_PROVIDER === "jira") return [];
+  const found = [];
+  let lastKey;
+  for (let page = 0; page < RUNTIME_BACKSTOP_SCAN_PAGES; page++) {
+    const res = await ddb.send(new ScanCommand({
+      TableName: TICKETS_TABLE,
+      FilterExpression: "#s = :blocked AND #br = :runtime",
+      ExpressionAttributeNames: { "#s": "status", "#br": "blockReason" },
+      ExpressionAttributeValues: { ":blocked": "blocked", ":runtime": "runtime" },
+      ExclusiveStartKey: lastKey,
+    }));
+    for (const t of res.Items || []) {
+      if (t.ticketId && t.workflowId) found.push({ workflowId: t.workflowId, ticketId: t.ticketId });
+      if (found.length >= RUNTIME_BACKSTOP_CAP) return found;
+    }
+    lastKey = res.LastEvaluatedKey;
+    if (!lastKey) break;
+  }
+  return found;
+}
+
 // One shared runtime-health gate per warm container (same shape as the cascade /
 // detector singletons). The S3 seam is adapted to the ETag/IfNoneMatch/IfMatch
 // contract runtime-health.mjs expects; the InvokeAgentRuntime call is lazily
@@ -800,6 +835,7 @@ function getRuntimeHealth() {
       const children = await getChildTickets(workflow.epicId).catch(() => []);
       return children.find((t) => t.ticketId === ticketId) || (await getTicket(ticketId));
     },
+    findRuntimeBlockedTickets,
     log: (msg) => console.log(msg),
   });
   return _runtimeHealth;
