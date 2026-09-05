@@ -82,6 +82,12 @@ export default defineConfig({
       // off, byte-identical), gate-must-be-done, mergeable_state:"clean" only,
       // exact-head-SHA merge, and non-fatal GitHub-refusal handling.
       "lambda/orchestrator/merge-on-green.test.mjs",
+      // ship-head-stability.mjs (TEAM-4111) — DI coverage for the dispatch-time
+      // head-stability gate: off (no probe, byte-identical) | shadow (measures
+      // would-defer, always dispatches) | enforce (defer until head quiet +
+      // CI green on that exact head). CI-red passes through, probe-throw and
+      // maxDeferrals both fail open, unknown mode fails safe to off.
+      "lambda/orchestrator/ship-head-stability.test.mjs",
       // done-handlers-cascade (TEAM-3688 F3) — HANDLER-level cascade coverage.
       // Invokes the REAL handleTicketDoneUnified + handleTicketDone from index.mjs
       // through the REAL cascade (cascade.mjs/lease.mjs unmocked; only AWS/store

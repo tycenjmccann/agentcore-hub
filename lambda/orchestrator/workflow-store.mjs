@@ -389,6 +389,31 @@ export async function setRepoCheck(workflowId, repoCheck) {
   }));
 }
 
+/**
+ * Ship-head stability deferral bookkeeping (TEAM-4111). Scoped SET of two
+ * attributes the gate + its reconcile-tick re-drive read: the consecutive
+ * deferral count (bounds the deadlock fail-open) and the deferred ship
+ * ticket id (so the re-drive knows which ticket to re-evaluate). count <= 0
+ * REMOVEs both — a dispatched run carries no ship-head state. Never a full-row
+ * put; never touches a sibling key.
+ */
+export async function setShipHeadDeferrals(workflowId, count, ticketId) {
+  if (!count || count <= 0) {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE shipHeadDeferrals, shipHeadTicketId",
+    }));
+    return;
+  }
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET shipHeadDeferrals = :n, shipHeadTicketId = :t",
+    ExpressionAttributeValues: { ":n": count, ":t": ticketId },
+  }));
+}
+
 /** Remove one resume context (one-time use). No-op if absent. */
 export async function removeResumeContext(workflowId, ticketId) {
   try {

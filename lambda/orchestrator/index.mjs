@@ -44,6 +44,7 @@ import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { createMergeOnGreen } from "./merge-on-green.mjs";
+import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stability.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
@@ -124,6 +125,9 @@ const LEVEL_TRIGGER_DISPATCH = process.env.LEVEL_TRIGGER_DISPATCH || "off";
 // has no consumer today). off is byte-identical to pre-4110. Normalized in
 // merge-on-green.mjs (reuses normalizeExtendedMode: garbage → shadow, never merge).
 const MERGE_ON_GREEN = process.env.MERGE_ON_GREEN || "off";
+// ship-head-stability.mjs (STRICT allow-list: garbage / legacy "on" → off, never
+// wedge ship). off = byte-identical (no GitHub probe, no metrics, always dispatch).
+const SHIP_HEAD_STABILITY = process.env.SHIP_HEAD_STABILITY || "off";
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -496,6 +500,65 @@ function getMergeOnGreen() {
   return _mergeOnGreen;
 }
 
+// ─── Ship-head stability (TEAM-4111) ─────────────────────────────────────────
+// Keeps the release_manager off a moving branch head: at ship-ticket
+// (re)dispatch time, dispatch only when the PR head has been quiet >= stableMs
+// AND CI is green on THAT exact head; otherwise defer (re-queue). Fires only
+// when SHIP_HEAD_STABILITY != off. The injected githubProbe reads the open PR's
+// head SHA, its commit time, and the aggregate check-runs conclusion.
+let _shipHeadGate = null;
+function getShipHeadGate() {
+  if (_shipHeadGate) return _shipHeadGate;
+  _shipHeadGate = createShipHeadGate({
+    githubProbe: createGitHubShipHeadProbe({ githubApi, parseRepoUrl }),
+    log: (msg) => console.log(`[orchestrator] ${msg}`),
+    mode: SHIP_HEAD_STABILITY,
+  });
+  return _shipHeadGate;
+}
+
+/**
+ * Re-drive ship tickets this run deferred for head instability (TEAM-4111).
+ * A deferred ship ticket stays Ready and idle — nothing edge-triggers it again
+ * (the reconcile sweep's redispatch bypasses handleTicketReadyUnified, so it
+ * would skip this gate). This runs on the reconcile-sweep tick: for every
+ * non-terminal workflow carrying shipHeadDeferrals, re-invoke the SAME Ready
+ * handler so the gate re-evaluates the (now hopefully quiet) head — dispatching
+ * when stable-green, re-deferring otherwise, and force-dispatching at the
+ * deadlock cap. No-op when SHIP_HEAD_STABILITY=off (byte-identical) and inert in
+ * shadow (which never defers, so nothing carries the marker).
+ */
+async function redriveDeferredShipHeads() {
+  if (SHIP_HEAD_STABILITY === "off") return { rechecked: 0, redriven: 0 };
+  let workflows = [];
+  try {
+    ({ workflows } = await getReconcileSweep().scanNonTerminalWorkflows());
+  } catch (err) {
+    console.warn(`[orchestrator] ship-head re-drive scan failed (non-fatal): ${err?.message || err}`);
+    return { rechecked: 0, redriven: 0 };
+  }
+  let rechecked = 0;
+  let redriven = 0;
+  for (const wf of workflows) {
+    const tid = wf?.shipHeadTicketId;
+    if (!tid || (Number(wf?.shipHeadDeferrals) || 0) <= 0) continue;
+    rechecked++;
+    try {
+      const fresh = await getTicket(tid);
+      // Only re-drive a ticket still resting in Ready — a claimed/moved ticket
+      // is being handled elsewhere and the marker will clear on its next
+      // dispatch/defer decision.
+      if (!fresh || String(fresh.status).toLowerCase() !== "ready") continue;
+      await handleTicketReadyUnified(tid, fresh);
+      redriven++;
+    } catch (err) {
+      console.warn(`[orchestrator] ship-head re-drive ${tid} failed (non-fatal): ${err?.message || err}`);
+    }
+  }
+  if (rechecked) console.log(`[orchestrator] ship-head re-drive — rechecked=${rechecked} redriven=${redriven}`);
+  return { rechecked, redriven };
+}
+
 /**
  * Hand an escalated review gate to a human: owned by `assignee`, parked in
  * in_review, with the decision instructions on the ticket.
@@ -571,7 +634,12 @@ export const handler = async (event) => {
   // action: "reconcile_sweep" }. Branch BEFORE any stream/webhook parsing.
   if (event?.source === "orchestrator.sweep" && event?.action === "reconcile_sweep") {
     console.log(`[orchestrator] reconcile sweep (mode=${RECONCILE_SWEEP_MODE})`);
-    return getReconcileSweep().runSweep(RECONCILE_SWEEP_MODE);
+    const reconcileResult = await getReconcileSweep().runSweep(RECONCILE_SWEEP_MODE);
+    // TEAM-4111 — re-evaluate ship tickets deferred for head instability on the
+    // same tick. No-op when SHIP_HEAD_STABILITY=off; inert in shadow.
+    try { await redriveDeferredShipHeads(); }
+    catch (err) { console.warn(`[orchestrator] ship-head re-drive failed (non-fatal): ${err?.message || err}`); }
+    return reconcileResult;
   }
 
   // SQS FIFO command queue (R1 — docs/race-condition-study.md). One message
@@ -2177,6 +2245,28 @@ async function handleTicketReadyUnified(ticketId, ticket) {
 
   // ─── CD HANDOFF GUARD: no ship-phase work on a repo the hub does not deploy ───
   if (await skipShipTicketForHandoff(ticketId, agentDef, workflow)) return;
+
+  // ─── SHIP-HEAD STABILITY GATE (TEAM-4111) — keep the RM off a moving head ───
+  // Ship-phase tickets only. Default off = byte-identical (no probe, no metrics,
+  // always falls through). On defer we persist the consecutive-deferral count +
+  // this ticket id and RETURN without claiming; the reconcile-tick re-drive
+  // (redriveDeferredShipHeads) re-enters this handler when the head may have
+  // settled. On dispatch we clear any prior marker so the deadlock cap resets.
+  if (SHIP_HEAD_STABILITY !== "off" && SHIP_PHASES.has(agentDef.phase)) {
+    const verdict = await getShipHeadGate().evaluate(workflow, ticket);
+    if (verdict.action === "defer") {
+      const n = (Number(workflow.shipHeadDeferrals) || 0) + 1;
+      try { await store.setShipHeadDeferrals(workflow.id, n, ticketId); }
+      catch (err) { console.warn(`[orchestrator] ship-head deferral persist failed (non-fatal): ${err?.message || err}`); }
+      console.log(`[orchestrator] ship-head defer ${ticketId} (${verdict.reason}) — deferral ${n} — not dispatching`);
+      return;
+    }
+    if ((Number(workflow.shipHeadDeferrals) || 0) > 0) {
+      try { await store.setShipHeadDeferrals(workflow.id, 0); }
+      catch (err) { console.warn(`[orchestrator] ship-head deferral clear failed (non-fatal): ${err?.message || err}`); }
+      workflow.shipHeadDeferrals = 0;
+    }
+  }
 
   // Idempotency claim — ATOMIC, backend-agnostic. The workflow row lives in
   // DynamoDB in BOTH modes, so a conditional write on agentTasks[ticketId].status

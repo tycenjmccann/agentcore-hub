@@ -22,6 +22,7 @@ import {
   appendReviewRound,
   appendReviewCapEscalation,
   appendReviewAuthorization,
+  setShipHeadDeferrals,
 } from "./workflow-store.mjs";
 
 /**
@@ -617,5 +618,27 @@ describe("setRepoCheck (repo URL pre-flight)", () => {
     expect(sent[0].input.UpdateExpression).toBe("SET repoCheck = :rc");
     expect(sent[0].input.ExpressionAttributeValues[":rc"]).toEqual(rc);
     expect(sent[0].input.Key).toEqual({ workflowId: "wf_1" });
+  });
+});
+
+
+describe("setShipHeadDeferrals (ship-head stability, TEAM-4111)", () => {
+  it("count > 0 → scoped SET of the two attrs, no full-row put", async () => {
+    initWorkflowStore(stubDdb, "wf");
+    sent.length = 0;
+    await setShipHeadDeferrals("wf_1", 2, "TEAM-SHIP");
+    expect(sent.length).toBe(1);
+    expect(sent[0].input.UpdateExpression).toBe("SET shipHeadDeferrals = :n, shipHeadTicketId = :t");
+    expect(sent[0].input.ExpressionAttributeValues).toEqual({ ":n": 2, ":t": "TEAM-SHIP" });
+    expect(sent[0].input.Key).toEqual({ workflowId: "wf_1" });
+  });
+
+  it("count <= 0 → REMOVEs both attrs (dispatched run carries no ship-head state)", async () => {
+    initWorkflowStore(stubDdb, "wf");
+    sent.length = 0;
+    await setShipHeadDeferrals("wf_1", 0);
+    expect(sent.length).toBe(1);
+    expect(sent[0].input.UpdateExpression).toBe("REMOVE shipHeadDeferrals, shipHeadTicketId");
+    expect(sent[0].input.ExpressionAttributeValues).toBeUndefined();
   });
 });
