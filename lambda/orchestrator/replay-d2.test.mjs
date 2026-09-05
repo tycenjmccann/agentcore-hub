@@ -137,6 +137,10 @@ vi.mock("./workflow-store.mjs", () => ({
     return first; // CAS: only the first claim flips a non-terminal row
   }),
   mergeTaskMetadata: vi.fn(async () => {}),
+  // TEAM-3991 D1.4 — finalization now also discharges the epic roll-up.
+  clearEpicRollupPending: vi.fn(async () => {}),
+  appendNotificationOnce: vi.fn(async () => true),
+  ackNotifications: vi.fn(async () => 0),
 }));
 
 // The ship-phase def only exists in the S3 config (the hardcoded fallback def has

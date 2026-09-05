@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade, newMetrics as newCascadeMetrics } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, openGateOf, parseCdEvidence, blockReasonWithGate, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, ACCEPTED_SHIP_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning, checkBranchProtection } from "./repo-check.mjs";
 import { runGateBypassCheck, hasUnackedGateBypass } from "./gate-bypass.mjs";
@@ -1391,7 +1391,10 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     if (record.merge_commit && !entry?.mergeCommit) fields.mergeCommit = record.merge_commit;
     if (typeof record.outcome === "string" && !entry?.outcome) {
       const oc = record.outcome.trim().toLowerCase();
-      if (SHIP_BLOCKED_OUTCOMES.includes(oc) || oc === "shipped") fields.outcome = oc;
+      // TEAM-3991 D1.4: `deployed` is now accepted too (ACCEPTED_SHIP_OUTCOMES) —
+      // it was silently dropped here, so a run the CD agent reported as deployed
+      // reached the ship gate with NO outcome and closed static-ci-only (sffzti).
+      if (ACCEPTED_SHIP_OUTCOMES.includes(oc)) fields.outcome = oc;
     }
     if (record.block_reason && !entry?.blockReason) {
       fields.blockReason = String(record.block_reason).slice(0, 500);
@@ -2997,6 +3000,179 @@ async function notifyCompletionBlockedOnce(workflow, offenders) {
   }
 }
 
+/**
+ * TEAM-3991 D1.4 — the run's OWN account of its deploy, harvested from S3.
+ *
+ * The release manager writes `workflows/<wf>/shared/cd-evidence/deploy-*.md`
+ * ("# DEPLOY SUCCEEDED …" / "# PREFLIGHT BLOCKED …") but its report_completion
+ * tool has no outcome field, so the ship gate saw a done CD ticket carrying no
+ * verdict at all and closed every deployed run `static-ci-only` (wf sffzti) —
+ * while wf 1pl3h1's "PREFLIGHT BLOCKED" file went unread and the run closed
+ * `complete`. Read the file the agent already wrote.
+ *
+ * Newest file wins (LastModified, key as tiebreak): a re-run's second attempt is
+ * the current truth. Stamps the parsed verdict onto every ship ticket that lacks
+ * an outcome, so the existing ship-verdict ladder decides as usual. Best-effort:
+ * no bucket, no prefix, an unparseable file or any S3 error ⇒ null and the ladder
+ * runs on self-reported evidence exactly as before.
+ */
+async function harvestCdEvidence(workflow, shipTicketIds) {
+  if (!ARTIFACT_BUCKET || !workflow?.id || shipTicketIds.length === 0) return null;
+  try {
+    const Prefix = `workflows/${workflow.id}/shared/cd-evidence/`;
+    const listed = await s3.send(new ListObjectsV2Command({ Bucket: ARTIFACT_BUCKET, Prefix }));
+    const files = (listed?.Contents || [])
+      .filter((o) => /\/deploy-[^/]*\.md$/i.test(String(o?.Key || "")))
+      .sort((a, b) => {
+        const at = Date.parse(a.LastModified || "") || 0;
+        const bt = Date.parse(b.LastModified || "") || 0;
+        return bt - at || String(b.Key).localeCompare(String(a.Key));
+      });
+    if (files.length === 0) return null;
+    const evidenceKey = files[0].Key;
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: evidenceKey }));
+    const parsed = parseCdEvidence(await res.Body.transformToString());
+    if (!parsed) {
+      console.log(`[orchestrator] ${workflow.id}: cd-evidence ${evidenceKey} declares no verdict`);
+      return null;
+    }
+    const fields = { outcome: parsed.outcome, evidenceKey };
+    if (parsed.blockReason) fields.blockReason = String(parsed.blockReason).slice(0, 500);
+    for (const ticketId of shipTicketIds) {
+      try { await store.mergeTaskMetadata(workflow.id, ticketId, fields); }
+      catch (err) { console.warn(`[orchestrator] cd-evidence stamp failed for ${ticketId}: ${err?.message || err}`); }
+    }
+    console.log(`[orchestrator] ${workflow.id}: cd-evidence ${evidenceKey} → outcome ${parsed.outcome}`);
+    return { ...parsed, evidenceKey };
+  } catch (err) {
+    console.warn(`[orchestrator] cd-evidence harvest skipped for ${workflow.id}: ${err?.message || err}`);
+    return null;
+  }
+}
+
+// Epic roll-up retry budget. The backoff is env-tunable so tests pin it to 0 —
+// a real retry sleeps 1/2/4s inside the same invocation.
+const EPIC_ROLLUP_RETRIES = Number(process.env.EPIC_ROLLUP_RETRIES) || 3;
+const EPIC_ROLLUP_BACKOFF_MS = Number(process.env.EPIC_ROLLUP_BACKOFF_MS ?? 1000);
+
+/**
+ * TEAM-3991 D1.4 — roll the root epic to Done, with retries.
+ *
+ * Before, this was one inline best-effort `jiraTransition` with NO DynamoDB path
+ * at all: on the dynamodb provider the epic simply never closed, so a finished
+ * run sat on the board looking open forever and the watch loop kept picking it
+ * up. The obligation is now created atomically with the terminal claim
+ * (store.completeWorkflow SETs `epicRollupPending` in the same CAS), so exactly
+ * one invocation owns it and a crashed owner leaves a flag the sweep can retry —
+ * there is no window where the run is complete with nobody responsible.
+ *
+ * Idempotent by construction: a Done epic transitioned to Done again is a
+ * success, not an error. Returns `{ ok, attempts, lastError }`; never throws.
+ */
+async function rollUpEpic(workflow) {
+  const epicId = workflow?.epicId;
+  if (!epicId) return { ok: true, attempts: 0, lastError: null, skipped: true };
+  let lastError = null;
+  for (let attempt = 1; attempt <= EPIC_ROLLUP_RETRIES; attempt++) {
+    try {
+      // transitionTicketToDone is the provider-aware helper (Jira transition vs a
+      // scoped UpdateCommand on the tickets table) — one writer, both providers.
+      const rolled = await transitionTicketToDone(epicId);
+      if (rolled) return { ok: true, attempts: attempt, lastError: null };
+      // A falsy Jira result means "no Done transition available from here". If the
+      // epic is already Done that is success; anything else is a real failure.
+      const epic = await getTicket(epicId);
+      if (String(epic?.status || "").toLowerCase() === "done") {
+        return { ok: true, attempts: attempt, lastError: null };
+      }
+      lastError = "no Done transition available";
+    } catch (err) {
+      lastError = err?.message || String(err);
+    }
+    console.warn(`[orchestrator] epic ${epicId} roll-up attempt ${attempt}/${EPIC_ROLLUP_RETRIES} failed: ${lastError}`);
+    if (attempt < EPIC_ROLLUP_RETRIES && EPIC_ROLLUP_BACKOFF_MS > 0) {
+      await new Promise((r) => setTimeout(r, EPIC_ROLLUP_BACKOFF_MS * 2 ** (attempt - 1)));
+    }
+  }
+  return { ok: false, attempts: EPIC_ROLLUP_RETRIES, lastError };
+}
+
+/**
+ * TEAM-3991 D1.4 — the roll-up half of finalization, run by whoever owns it.
+ *
+ * Success → clear the flag, announce `epicRolledUp: true`, and only THEN mark the
+ * run finalized. Failure → keep the flag (so the sweep retries), escalate once
+ * under an idempotent id, announce `epicRolledUp: false`, and deliberately do NOT
+ * markFinalized: the finalized marker means "every side effect ran", and lying
+ * about it is what would strand the epic permanently.
+ *
+ * Never un-completes the run. The work IS done; only the board label is missing.
+ */
+async function finalizeWithEpicRollUp(workflow, completeDetail) {
+  const result = await rollUpEpic(workflow);
+  if (result.ok) {
+    await store.clearEpicRollupPending(workflow.id);
+    await publishEvent(workflow.epicId, "workflow.complete", { ...completeDetail, epicRolledUp: true });
+    await store.markFinalized(workflow.id);
+    return true;
+  }
+  console.error(`[orchestrator] epic ${workflow.epicId} roll-up FAILED after ${result.attempts} attempts: ${result.lastError}`);
+  await publishEvent(workflow.epicId, "workflow.epic_rollup_failed", {
+    workflowId: workflow.id,
+    epicId: workflow.epicId,
+    attempts: result.attempts,
+    lastError: result.lastError,
+  });
+  await store.appendNotificationOnce(
+    workflow.id,
+    {
+      id: `notif_epic_rollup_${workflow.id}`,
+      type: "manager_escalation",
+      title: `Run finished but epic ${workflow.epicId} is still open`,
+      details:
+        `The run completed, but transitioning epic ${workflow.epicId} to Done failed ${result.attempts}x ` +
+        `(${result.lastError}). The delivery is real — only the board label is missing. Close the epic by hand, ` +
+        `or let the reconcile sweep retry it (the run carries epicRollupPending until it succeeds).`,
+      reviewer: "completion-gate",
+      timestamp: new Date().toISOString(),
+      acknowledged: false,
+    }
+    // Default isDuplicate is exactly "same id, still unacked" — one escalation per
+    // run until a human (or the sweep's ack) clears it.
+  );
+  await publishEvent(workflow.epicId, "workflow.complete", { ...completeDetail, epicRolledUp: false });
+  return false;
+}
+
+/**
+ * TEAM-3991 D1.4 — retry ONE run's outstanding epic roll-up. The reconcile sweep
+ * scans for `epicRollupPending && phase === "complete" && !finalizedAt` and calls
+ * this (the scan wiring itself lands with D2.3); exported so that step is a
+ * one-line addition rather than a re-implementation.
+ *
+ * Takes over via the SAME claimFinalization CAS the completion path uses, so a
+ * sweep and a live completer can never both roll the epic.
+ */
+export async function retryPendingEpicRollups(workflow) {
+  if (!workflow?.epicRollupPending || workflow.phase !== "complete" || workflow.finalizedAt) {
+    return { claimed: false, ok: false, reason: "not_pending" };
+  }
+  const takeover = await store.claimFinalization(workflow.id, new Date().toISOString());
+  if (!takeover) return { claimed: false, ok: false, reason: "claim_lost" };
+  const result = await rollUpEpic(workflow);
+  if (!result.ok) return { claimed: true, ok: false, reason: result.lastError };
+  await store.clearEpicRollupPending(workflow.id);
+  await store.ackNotifications(workflow.id, (n) => n.id === `notif_epic_rollup_${workflow.id}`);
+  await publishEvent(workflow.epicId, "workflow.epic_rolled_up", {
+    workflowId: workflow.id,
+    epicId: workflow.epicId,
+    attempts: result.attempts,
+    recoveredBy: "retryPendingEpicRollups",
+  });
+  await store.markFinalized(workflow.id);
+  return { claimed: true, ok: true, attempts: result.attempts };
+}
+
 export async function completeWorkflow(workflow) {
   if (workflow.phase === "complete") return;
   // TEAM-3987-adjacent hygiene: a run that is ALREADY terminal (cancelled,
@@ -3168,6 +3344,9 @@ export async function completeWorkflow(workflow) {
     if (probe.merged === true) mergeProof = probe;
   }
 
+  // TEAM-3991 D1.4 — what the terminal event REPORTS. A run whose CD evidence
+  // says DEPLOY SUCCEEDED is `deployed`, not the CI-only default.
+  let provenShipOutcome = null;
   try {
     const wfDef = getWorkflowDef(workflow?.workflowDefId);
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
@@ -3176,6 +3355,29 @@ export async function completeWorkflow(workflow) {
       const children = await getChildTickets(workflow.epicId);
       let freshWf = await store.getWorkflow(workflow.id);
       const shipOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
+      // TEAM-3991 D1.4: before judging, read the CD agent's own deploy evidence for
+      // any ship ticket that reported no outcome — its report_completion tool has no
+      // outcome field, so the file on S3 is the only place the verdict exists.
+      const tasksNow = freshWf?.agentTasks || workflow.agentTasks || {};
+      const outcomeless = children
+        .filter(
+          (t) =>
+            t.type !== "epic" &&
+            String(t.status || "").toLowerCase() === "done" &&
+            !isHumanAssignee(t.assignee) &&
+            shipPhases.includes(
+              typeof t.phase === "string" && t.phase ? t.phase : getAgentDef(t.assignee)?.phase
+            ) &&
+            !tasksNow[String(t.ticketId)]?.outcome
+        )
+        .map((t) => String(t.ticketId));
+      if (outcomeless.length > 0) {
+        const cd = await harvestCdEvidence(workflow, outcomeless);
+        if (cd) {
+          if (cd.outcome === "deployed") provenShipOutcome = "deployed";
+          freshWf = await store.getWorkflow(workflow.id);
+        }
+      }
       let verdict = evaluateShipVerdict(
         children, freshWf?.agentTasks || workflow.agentTasks || {}, shipPhases, shipOpts
       );
@@ -3201,7 +3403,15 @@ export async function completeWorkflow(workflow) {
       if (verdict.required && !verdict.shipped) {
         const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
         if (COMPLETION_EVIDENCE_REQUIRED) {
-          await closeWorkflowBlocked(workflow, verdict);
+          // TEAM-3991 D1.4: name the human gate that still owes a decision. wf
+          // 1pl3h1 closed on a bare "preflight blocked" while TEAM-3757 sat
+          // in_review — the reason has to say whose move it is.
+          const openGate = openGateOf(children);
+          await closeWorkflowBlocked(workflow, {
+            ...verdict,
+            blockReason: blockReasonWithGate(verdict.blockReason, openGate),
+            openGate,
+          });
           return;
         }
         console.warn(
@@ -3228,6 +3438,40 @@ export async function completeWorkflow(workflow) {
   // TEAM-3991 D1.1 (F10) — re-evaluate deferred merges and refuse a GREEN close
   // while a merge-without-approval escalation is unacked. The run stays open.
   if (await gateBypassBlocksCompletion(workflow)) return;
+
+  // TEAM-3991 D1.4 — LAST gate before any green close: is a human gate still open?
+  // wf 1pl3h1 closed `complete` with TEAM-3757 ("Escalation #1 …") sitting
+  // in_review — the merge authority the whole gate exists to require was never
+  // exercised, so "complete" was a lie about who approved what. A run with an
+  // unexercised gate closes BLOCKED, naming the gate. Placed after the ship gate
+  // so a run that already has an honest ship verdict keeps it (the outcome below
+  // reuses that verdict when there is one), and before the terminal claim so no
+  // green CAS can win first. Best-effort read: a children fetch that fails must
+  // never block a legitimate completion, so this only tightens when it can prove.
+  try {
+    const gateChildren = await getChildTickets(workflow.epicId);
+    const openGate = openGateOf(gateChildren);
+    if (openGate) {
+      console.error(
+        `[orchestrator] ${workflow.id}: refusing green close — ${openGate.kind} ${openGate.ticketId} is ${openGate.status}`
+      );
+      await closeWorkflowBlocked(workflow, {
+        // NOT the literal "blocked" the brief sketches: TERMINAL_WORKFLOW_PHASES
+        // (TEAM-3755 F2) is the closed set every terminal CAS refuses to overwrite,
+        // and a phase outside it could be silently overwritten by a later
+        // completion — destroying this very verdict. static-ci-only is the honest
+        // in-set value (CI ran, authority was never granted); `openGate` +
+        // blockReason carry the specific why.
+        outcome: "static-ci-only",
+        blockReason: blockReasonWithGate(`gate ${openGate.ticketId} (${openGate.title || openGate.kind}) is ${openGate.status}`, openGate),
+        offenders: [],
+        openGate,
+      });
+      return;
+    }
+  } catch (err) {
+    console.warn(`[orchestrator] open-gate check skipped for ${workflow.id}: ${err?.message || err}`);
+  }
 
   const completedAt = new Date().toISOString();
   const won = await store.completeWorkflow(workflow.id, completedAt);
@@ -3274,24 +3518,22 @@ export async function completeWorkflow(workflow) {
 
   // Roll the epic ticket up so the board reflects the closure. Without this the
   // run shows phase=complete while its epic sits in To Do/In Progress forever —
-  // the exact gap that leaves runs "open" and drives the watch loop. Best-effort:
-  // a board with no Done transition just logs and moves on.
-  if (TICKET_PROVIDER === "jira" && workflow.epicId) {
-    const rolled = await jiraTransition(workflow.epicId, "Done");
-    if (!rolled) {
-      console.warn(`[orchestrator] epic ${workflow.epicId} roll-up to Done skipped (no transition)`);
-    }
-  }
-
-  await publishEvent(workflow.epicId, "workflow.complete", {
+  // the exact gap that leaves runs "open" and drives the watch loop.
+  //
+  // TEAM-3991 D1.4: this used to be an inline best-effort `jiraTransition` with NO
+  // dynamodb path, so on the DDB provider the epic never closed at all. It now
+  // runs both providers with retries, and it OWNS finalization: markFinalized
+  // happens only when the roll-up actually succeeded (the flag stamped by
+  // store.completeWorkflow's CAS survives otherwise, for the sweep to retry).
+  // `workflow.complete` is published either way — the delivery is real; only the
+  // board label may be missing — and says which happened via `epicRolledUp`.
+  await finalizeWithEpicRollUp(workflow, {
     workflowId: workflow.id,
     featureBranch: workflow.featureBranch,
     prUrl,
+    // TEAM-3991 D1.4: a deployed run reports `deployed`, not the CI-only default.
+    ...(provenShipOutcome ? { outcome: provenShipOutcome } : {}),
   });
-
-  // Durable marker that the side effects above all ran — the takeover path's
-  // claim checks this so a completer killed mid-finalization gets resumed.
-  await store.markFinalized(workflow.id);
 }
 
 /**
@@ -3352,6 +3594,10 @@ async function closeWorkflowBlocked(workflow, verdict) {
       offenders: verdict.offenders,
       prUrl,
       featureBranch: workflow.featureBranch,
+      // TEAM-3991 D1.4: the human gate that still owes a decision, when there is
+      // one. Consumers (dashboard, WM, Telegram) can link straight to the ticket
+      // instead of making someone hunt the board for what "blocked" meant.
+      openGate: verdict.openGate || null,
     }
   );
 

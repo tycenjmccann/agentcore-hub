@@ -11,6 +11,11 @@ import {
   completionRecordHasEvidence,
   evidenceBackfillFields,
   resolveMissingEvidenceFromRecords,
+  openGateOf,
+  parseCdEvidence,
+  blockReasonWithGate,
+  SHIP_PROVEN_OUTCOMES,
+  ACCEPTED_SHIP_OUTCOMES,
 } from "./completion.mjs";
 
 /**
@@ -722,5 +727,152 @@ describe("completion-record fallback (TEAM-3976)", () => {
       );
       expect(remaining).toEqual([{ ticketId: "T-2", phase: "verification" }]);
     });
+  });
+});
+
+/**
+ * TEAM-3991 D1.4 — the pure half of the honest close.
+ *
+ * PARITY: these four helpers are the ones the HTTP complete route's twin must
+ * mirror byte-for-byte (src/app/api/workflow/[id]/complete/route.ts), so they are
+ * pinned here rather than only through the index harness.
+ *
+ * Why they exist: wf 1pl3h1 closed `complete` while escalation gate TEAM-3757 sat
+ * in_review over an unmerged PR #274, and wf sffzti closed `static-ci-only` after
+ * actually deploying — because the CD agent's evidence file says "DEPLOY
+ * SUCCEEDED", a word no accepted-outcome list contained.
+ */
+describe("openGateOf — the human who still owes this run a decision", () => {
+  const AGENT_DONE = { ticketId: "T-1", assignee: "agentcore_hub_backend_dev", status: "done" };
+
+  it("returns the open escalation gate, classified by its title", () => {
+    expect(
+      openGateOf([
+        AGENT_DONE,
+        {
+          ticketId: "TEAM-3757",
+          assignee: "human:reviewer@example.com",
+          status: "in_review",
+          title: "Escalation #1: ship-review not converging",
+        },
+      ])
+    ).toEqual({
+      ticketId: "TEAM-3757",
+      title: "Escalation #1: ship-review not converging",
+      status: "in_review",
+      kind: "escalation",
+    });
+  });
+
+  it("a human gate that is not an escalation is a merge_gate", () => {
+    expect(
+      openGateOf([{ ticketId: "TEAM-900", assignee: "human:x", status: "todo", title: "Merge Approval" }])
+    ).toMatchObject({ kind: "merge_gate", status: "todo" });
+  });
+
+  it("todo / in_review / blocked all count as open; done does not", () => {
+    for (const status of ["todo", "in_review", "blocked"]) {
+      expect(openGateOf([{ ticketId: "G", assignee: "human:x", status, title: "Merge Approval" }])).not.toBeNull();
+    }
+    expect(openGateOf([{ ticketId: "G", assignee: "human:x", status: "done", title: "Merge Approval" }])).toBeNull();
+  });
+
+  it("an AGENT ticket is never a gate, whatever its status (only humans hold authority)", () => {
+    expect(openGateOf([{ ticketId: "T-9", assignee: "agentcore_hub_ci_agent", status: "in_review" }])).toBeNull();
+  });
+
+  it("the epic itself is not a gate", () => {
+    expect(openGateOf([{ ticketId: "E-1", type: "epic", assignee: "human:x", status: "in_review" }])).toBeNull();
+  });
+
+  it("two open gates → the lowest ticket id wins, so the choice is deterministic", () => {
+    const pick = (order) =>
+      openGateOf(order.map((id) => ({ ticketId: id, assignee: "human:x", status: "todo", title: "Merge Approval" })))
+        .ticketId;
+    expect(pick(["TEAM-900", "TEAM-100"])).toBe("TEAM-100");
+    expect(pick(["TEAM-100", "TEAM-900"])).toBe("TEAM-100");
+  });
+
+  it("no children / not an array → null (never throws its caller into a green close)", () => {
+    expect(openGateOf([])).toBeNull();
+    expect(openGateOf(undefined)).toBeNull();
+    expect(openGateOf(null)).toBeNull();
+  });
+});
+
+describe("parseCdEvidence — reading the file the CD agent already wrote", () => {
+  it("DEPLOY SUCCEEDED heading → deployed", () => {
+    expect(parseCdEvidence("# DEPLOY SUCCEEDED - stack agentcore-hub-pipeline\n\nDetails...")).toEqual({
+      outcome: "deployed",
+    });
+  });
+
+  it("PREFLIGHT BLOCKED heading → deploy-blocked, carrying that heading as the reason", () => {
+    expect(parseCdEvidence("# PREFLIGHT BLOCKED: PR #274 is not merged\nmore prose")).toEqual({
+      outcome: "deploy-blocked",
+      blockReason: "PREFLIGHT BLOCKED: PR #274 is not merged",
+    });
+  });
+
+  it("DEPLOY BLOCKED is the same verdict as PREFLIGHT BLOCKED", () => {
+    expect(parseCdEvidence("DEPLOY BLOCKED - CodeBuild denied")).toMatchObject({ outcome: "deploy-blocked" });
+  });
+
+  it("the FIRST verdict line wins — a later contradiction cannot upgrade a block", () => {
+    expect(
+      parseCdEvidence("# PREFLIGHT BLOCKED: unmerged\n\nafter the fix: DEPLOY SUCCEEDED")
+    ).toMatchObject({ outcome: "deploy-blocked" });
+  });
+
+  it("blank leading lines are skipped, matching is case-insensitive", () => {
+    expect(parseCdEvidence("\n\n   ## deploy succeeded  \n")).toEqual({ outcome: "deployed" });
+  });
+
+  it("a file with no verdict, or no file at all, declares nothing — never a guess", () => {
+    expect(parseCdEvidence("# CD run log\nramping traffic")).toBeNull();
+    expect(parseCdEvidence("")).toBeNull();
+    expect(parseCdEvidence(undefined)).toBeNull();
+  });
+});
+
+describe("blockReasonWithGate — the blocked close names the person it is waiting on", () => {
+  const GATE = { ticketId: "TEAM-3757", kind: "escalation", status: "in_review" };
+
+  it("prefixes the reason with the gate kind and id", () => {
+    expect(blockReasonWithGate("PR #274 is not merged", GATE)).toBe(
+      "awaiting escalation TEAM-3757: PR #274 is not merged"
+    );
+  });
+
+  it("no reason → the gate alone is the reason", () => {
+    expect(blockReasonWithGate("", GATE)).toBe("awaiting escalation TEAM-3757");
+    expect(blockReasonWithGate(null, GATE)).toBe("awaiting escalation TEAM-3757");
+  });
+
+  it("no gate → the reason passes through untouched (null when there is none)", () => {
+    expect(blockReasonWithGate("static CI only", null)).toBe("static CI only");
+    expect(blockReasonWithGate(null, null)).toBeNull();
+  });
+});
+
+describe("shipVerdictOf — `deployed` is proof of the same strength as `shipped`", () => {
+  it("outcome deployed with no merge commit is shipped, not blocked", () => {
+    expect(shipVerdictOf({ outcome: "deployed" })).toBe("shipped");
+  });
+
+  it("SHIP_PROVEN_OUTCOMES is exactly shipped+deployed, and both are accepted outcomes", () => {
+    expect(SHIP_PROVEN_OUTCOMES).toEqual(["shipped", "deployed"]);
+    for (const oc of [...SHIP_PROVEN_OUTCOMES, ...SHIP_BLOCKED_OUTCOMES]) {
+      expect(ACCEPTED_SHIP_OUTCOMES).toContain(oc);
+    }
+  });
+
+  it("the blocked outcomes are unchanged by the addition", () => {
+    expect(shipVerdictOf({ outcome: "deploy-blocked" })).toBe("deploy-blocked");
+    expect(shipVerdictOf({ outcome: "static-ci-only" })).toBe("static-ci-only");
+  });
+
+  it("a bare commitSha is still not a verdict (TEAM-3747 — commitSha excluded)", () => {
+    expect(shipVerdictOf({ commitSha: "abc123" })).toBeNull();
   });
 });
