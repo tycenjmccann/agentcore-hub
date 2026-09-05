@@ -949,7 +949,15 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       }
       const rejected = await getTicket(ticketId);
       if (rejected && isHumanAssignee(rejected.assignee)) {
+        // TEAM-4045 / TEAM-4080: the ONE from-state policy is isCreationTimeBlock
+        // above (see its docblock): a PRESENTED gate — ready / in_progress /
+        // in_review → blocked — is a rejection; todo / new / missing is not, with
+        // no evidence-based fallback. Fix 2's blocker guard inside
+        // handleReviewRejection is the second line of defence.
         await handleReviewRejection(rejected);
+      } else if (rejected) {
+        // TEAM-4045: an agent parked its own ticket — free its invocation claim.
+        await releaseClaimOnSelfPark(rejected, oldStatus);
       }
       break;
     }
@@ -1123,6 +1131,106 @@ export async function handleTicketDoneUnified(ticketId) {
 /** Whether an assignee refers to a human reviewer (review gate) vs an agent. */
 function isHumanAssignee(assignee) {
   return typeof assignee === "string" && assignee.startsWith("human:");
+}
+
+/**
+ * TEAM-4045 / TEAM-4071 — an AGENT ticket left in_progress for blocked while
+ * its invocation claim is still `running` AND whose OWN blockedBy still holds an
+ * unresolved ticket. That pairing is the premature-dispatch signature of
+ * TEAM-4045: the agent was dispatched ahead of its dependencies (the release
+ * manager ran while CI was still open), could not do the work, parked its
+ * ticket (release-manager.md, park step e) and exited without
+ * report_completion — leaving a `running` claim that refuses the later
+ * Blocked → Ready re-dispatch as "already claimed" until it is 2× the lease TTL
+ * old (claimTicketInvocation's stale-claim hatch). Release it through the ONE
+ * lease primitive (stealClaim: CAS on running + this generation's startedAt →
+ * "ready"); never a human gate, never a lease that is not running, never a
+ * completed task.
+ *
+ * What is NOT released, and why (TEAM-4071 F1): a ticket whose blockers are all
+ * resolved (or empty) was dispatched legitimately, so its `running` claim may
+ * belong to a LIVE agent. Third parties can move such a ticket in_progress →
+ * blocked while the agent works: the UI transition route, and the jira Lambda's
+ * create_ticket dedup path, which re-issues "Blocked" on an existing ticket
+ * regardless of its status. isLeaseLive treats only running/in_progress as
+ * live, so releasing here would drop the R1 duplicate-dispatch guard at claim
+ * age 0 — a human's Blocked → Ready, or the reconcile sweep (which candidates
+ * exactly the all-blockers-resolved tickets), would start a second concurrent
+ * session beside the live one. Those tickets keep today's protection unchanged:
+ * heartbeat/TTL liveness, then the 2×TTL stale-claim hatch. The accepted cost
+ * is that a legitimate self-park with all blockers resolved (e.g. the release
+ * manager parking on its own escalation gate) still waits for that hatch or a
+ * forced nudge, exactly as release-manager.md documents. The blocker-unresolved
+ * gate is also what keeps the reconcile sweep away from a released ticket: a
+ * ticket with an open blocker is never a sweep candidate.
+ *
+ * TEAM-4085 F3 — an OPEN blocker comes in two kinds, and only one is the
+ * premature-dispatch signature:
+ *   (i)  the blocker NEVER completed (no agentTasks[blocker].completedAt): this
+ *        ticket can only have been dispatched ahead of it → release.
+ *   (ii) the blocker COMPLETED and was later reopened for rework (completedAt
+ *        is set; the reopen paths never clear it): this ticket was dispatched
+ *        legitimately after that completion, so its running claim may be a
+ *        live agent's — a third-party in_progress → blocked must NOT release
+ *        it, or the next Ready duplicate-dispatches beside the running agent.
+ *        No release; heartbeat/TTL and the 2×TTL hatch apply as for F1.
+ *
+ * Exported solely so gate-creation-blocked.test.mjs can assert the CAS-lost
+ * return value directly (same convention as handleReviewRejection).
+ */
+export async function releaseClaimOnSelfPark(ticket, oldStatus) {
+  if (oldStatus !== "in_progress") return false;
+  const { ticketId, assignee, workflowId, parentId } = ticket || {};
+  if (!ticketId || !assignee || isHumanAssignee(assignee) || !getAgentDef(assignee)) return false;
+  try {
+    const workflow = await resolveWorkflow(workflowId, parentId);
+    const task = workflow?.agentTasks?.[ticketId];
+    if (!task || task.status !== "running" || task.completedAt) return false;
+    // TEAM-4071 F1: release ONLY when the ticket's own blockers are still open
+    // (the premature-dispatch signature). The Jira path passes the mapped
+    // ticket (blockedBy from issuelinks); the stream path passes the image's
+    // blockedBy — when neither carries it, read the ticket rather than assume.
+    const blockedBy = Array.isArray(ticket.blockedBy)
+      ? ticket.blockedBy
+      : ((await getTicket(ticketId))?.blockedBy || []);
+    // Same terminal predicate as checkAllBlockersResolved (done / cancelled),
+    // inlined so the open set is known for the completedAt check below.
+    const openBlockers = [];
+    for (const bid of blockedBy) {
+      const blocker = await getTicket(bid);
+      if (!blocker || (blocker.status !== "done" && blocker.status !== "cancelled")) openBlockers.push(bid);
+    }
+    if (openBlockers.length === 0) {
+      console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim, but its blockers are all resolved — the agent may be live; claim NOT released (lease TTL / stale-claim hatch / nudge apply)`);
+      return false;
+    }
+    // TEAM-4085 F3: "currently open" is not enough. A blocker that COMPLETED
+    // and was later reopened (rework) means this ticket was dispatched
+    // legitimately after that completion, so its running claim may be a LIVE
+    // agent's. Only a blocker with NO completion on record proves premature
+    // dispatch. agentTasks[blocker].completedAt is written on completion and
+    // never cleared by a reopen (the workflow record is already in hand).
+    const reopenedBlockers = openBlockers.filter((bid) => workflow.agentTasks?.[bid]?.completedAt);
+    if (reopenedBlockers.length > 0) {
+      console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim; open blocker(s) [${reopenedBlockers.join(", ")}] were completed then reopened — this ticket was dispatched legitimately, the agent may be live; claim NOT released (lease TTL / stale-claim hatch / nudge apply)`);
+      return false;
+    }
+    const released = await stealClaim(ddb, WORKFLOWS_TABLE, workflow.id, ticketId, task.startedAt || null);
+    if (!released) {
+      console.log(`[orchestrator] ${ticketId}: in_progress → blocked but the claim generation moved — nothing released`);
+      return false;
+    }
+    task.status = "ready";
+    console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim (agent self-park) — claim released so a later Ready can re-dispatch`);
+    await publishEvent(ticketId, "orchestrator.claim_released", {
+      ticketId, agentId: assignee, workflowId: workflow.id, reason: "agent_self_park",
+      claimStartedAt: task.startedAt || null, blockedBy,
+    });
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] ${ticketId}: claim release after self-park failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
 }
 
 // Release-manager convergence escalation gate. The summary shape is fixed by
@@ -2305,8 +2413,30 @@ export async function handleReviewRejection(gateTicket) {
 
   // Persist each ticket's feedback atomically (per-key, no full-row put) BEFORE
   // reopening, so a fast re-invocation always finds its resume context.
-  const reopened = [];
+  const reopened = []; // moved to Ready — the agent re-runs now
+  const deferred = []; // reopened short of Ready — waits on cascadeUnblock
+  const skipped = [];  // untouched: a Jira hop that never landed
+  // TEAM-4045 / TEAM-4085 F1: an upstream whose OWN blockers are still open
+  // must never be Readied — that dispatches its agent ahead of its
+  // dependencies (prod: the release manager ran while review/QA/CI were still
+  // blocked). But it must still be REOPENED, or the rejection is silently
+  // dropped: cascadeUnblock only Readies `blocked`/`todo` siblings (a `done`
+  // upstream whose blocker was reopened by another rejection, a board move or a
+  // redelivery would otherwise sit `done` forever), and the reconcile sweep
+  // never candidates `done`. So: stash the feedback for EVERY upstream, and
+  // for an open-blocker upstream reopen it only as far as `todo` — DDB: the
+  // same `:s="todo"` write main always made (the stream `todo` handler
+  // blocker-checks, so it is held); Jira: the Done → To Do hop only, and no
+  // transition at all if it already sits in Blocked/To Do (both
+  // cascade-eligible). cascadeUnblock Readies it when its last blocker closes.
+  const plan = [];
   for (const up of upstream) {
+    const upBlockers = up.blockedBy || [];
+    const blockersOpen = upBlockers.length > 0 && !(await checkAllBlockersResolved(upBlockers));
+    if (blockersOpen) {
+      console.log(`[orchestrator] Review gate ${gateTicket.ticketId}: upstream ${up.ticketId} still has unresolved blockers [${upBlockers.join(", ")}] — reopening WITHOUT Ready (cascade Readies it when they close)`);
+    }
+    plan.push({ up, blockersOpen });
     // Surface the agent's prior coding session so it can CHOOSE to continue
     // that conversation (claude_code/codex resume_session=...) instead of
     // rebuilding context. Scope, not a command — the resume decision is the
@@ -2319,7 +2449,6 @@ export async function handleReviewRejection(gateTicket) {
       : "";
     const resumeNote = `## Review feedback (changes requested)\n${feedback}\n\nAddress this feedback and redo your work.${sessionHint}`;
     await store.setResumeContext(workflow.id, up.ticketId, resumeNote);
-    reopened.push(up.ticketId);
   }
 
   // Re-open each upstream ticket so its agent re-runs. Done has no direct path to
@@ -2342,10 +2471,29 @@ export async function handleReviewRejection(gateTicket) {
   // (Jira tickets can't carry arbitrary columns; the reopen path re-derives
   // phase from the assignee and the workflow row records the round, so the DDB
   // stamp is where this metadata lands.)
+  //
+  // TEAM-4045: `reopened` records what actually happened — a Jira reopen that
+  // never reached Ready (jiraReopenToReady false) is not advertised as reopened.
+  // TEAM-4085 F1: an open-blocker upstream lands in `deferred` (reopened to
+  // `todo` / left in Blocked or To Do, feedback stashed, waiting on cascade);
+  // `skipped` is now only a Jira hop that failed to land. Invariant: nothing in
+  // `deferred` was moved to Ready or invoked.
   const spawnedBy = { gateTicketId: gateTicket.ticketId, kind: "review_fix" };
-  for (const up of upstream) {
+  for (const { up, blockersOpen } of plan) {
     if (TICKET_PROVIDER === "jira") {
-      await jiraReopenToReady(up.ticketId);
+      if (blockersOpen) {
+        if (up.status === "blocked" || up.status === "todo") {
+          deferred.push(up.ticketId); // already cascade-eligible — no transition
+        } else if (await jiraReopenToTodo(up.ticketId)) {
+          deferred.push(up.ticketId);
+        } else {
+          skipped.push(up.ticketId);
+        }
+      } else if (await jiraReopenToReady(up.ticketId)) {
+        reopened.push(up.ticketId);
+      } else {
+        skipped.push(up.ticketId);
+      }
     } else {
       await ddb.send(new UpdateCommand({
         TableName: TICKETS_TABLE,
@@ -2363,11 +2511,12 @@ export async function handleReviewRejection(gateTicket) {
           ...(gatePhase ? { ":ph": gatePhase } : {}),
         },
       }));
+      (blockersOpen ? deferred : reopened).push(up.ticketId);
     }
   }
-  console.log(`[orchestrator] Review gate ${gateTicket.ticketId} rejected (rework) — re-opened: [${reopened.join(", ")}]`);
+  console.log(`[orchestrator] Review gate ${gateTicket.ticketId} rejected (rework) — re-opened: [${reopened.join(", ")}]${deferred.length ? ` deferred (blockers open, not Readied): [${deferred.join(", ")}]` : ""}${skipped.length ? ` skipped (hop failed): [${skipped.join(", ")}]` : ""}`);
   await publishEvent(gateTicket.ticketId, "review.rejected", {
-    ticketId: gateTicket.ticketId, onReject, reopened, workflowId: workflow.id,
+    ticketId: gateTicket.ticketId, onReject, reopened, deferred, skipped, workflowId: workflow.id,
   });
 }
 
@@ -2582,17 +2731,7 @@ async function jiraTransition(issueKey, targetStatusName) {
  * true once the ticket is Ready. Avoids a silent stall when the 2nd hop fails.
  */
 async function jiraReopenToReady(issueKey) {
-  // Hop 1: Done → To Do. Retry a couple times in case the transition list is
-  // momentarily stale right after the gate's own transition.
-  let toTodo = false;
-  for (let i = 0; i < 3 && !toTodo; i++) {
-    toTodo = await jiraTransition(issueKey, "To Do");
-    if (!toTodo) await new Promise((r) => setTimeout(r, 1000));
-  }
-  if (!toTodo) {
-    console.error(`[orchestrator] Reopen ${issueKey}: could not reach To Do — ticket left as-is.`);
-    return false;
-  }
+  if (!(await jiraReopenToTodo(issueKey))) return false;
   // Hop 2: To Do → Ready. This fires the "ready" webhook that re-invokes the agent.
   let toReady = false;
   for (let i = 0; i < 3 && !toReady; i++) {
@@ -2601,6 +2740,26 @@ async function jiraReopenToReady(issueKey) {
   }
   if (!toReady) {
     console.error(`[orchestrator] Reopen ${issueKey}: reached To Do but not Ready — STALLED, manual nudge needed.`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Hop 1 of a Jira reopen: Done → To Do (Reopen). Retry a couple times in case
+ * the transition list is momentarily stale right after the gate's own
+ * transition. Used alone (TEAM-4085 F1) for an upstream whose own blockers are
+ * still open: it is reopened but NOT Readied — cascadeUnblock issues the
+ * To Do → Ready hop when the last blocker closes. Returns true once in To Do.
+ */
+async function jiraReopenToTodo(issueKey) {
+  let toTodo = false;
+  for (let i = 0; i < 3 && !toTodo; i++) {
+    toTodo = await jiraTransition(issueKey, "To Do");
+    if (!toTodo) await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (!toTodo) {
+    console.error(`[orchestrator] Reopen ${issueKey}: could not reach To Do — ticket left as-is.`);
     return false;
   }
   return true;
@@ -2686,8 +2845,23 @@ async function processRecord(record) {
       }
       const blockedAssignee = unwrapDdbValue(newImage.assignee);
       if (isHumanAssignee(blockedAssignee)) {
+        // TEAM-4045 / TEAM-4080: same ONE from-state policy as the Jira twin —
+        // isCreationTimeBlock above (see its docblock). An INSERT has no
+        // OldImage → oldStatus null → already returned; only a MODIFY from a
+        // presented state (ready / in_progress / in_review) gets here, with no
+        // evidence-based fallback. Fix 2's blocker guard inside
+        // handleReviewRejection is the second line of defence.
         const rejected = await getTicket(ticketId);
         if (rejected) await handleReviewRejection(rejected);
+      } else if (eventName === "MODIFY") {
+        // TEAM-4045: an agent parked its own ticket — free its invocation claim.
+        await releaseClaimOnSelfPark({
+          ticketId,
+          assignee: blockedAssignee,
+          workflowId: unwrapDdbValue(newImage.workflowId),
+          parentId: unwrapDdbValue(newImage.parentId),
+          blockedBy: unwrapDdbValue(newImage.blockedBy),
+        }, oldStatus);
       }
       break;
     }
@@ -2699,6 +2873,21 @@ async function processRecord(record) {
  * creation-time dependency block (blocked_by set at creation), never a human
  * review rejection. A rejection always comes from a presented gate — any other
  * prior status (ready / in_progress / in_review / …) is honored as before.
+ *
+ * TEAM-4045 / TEAM-4080 — this is the ONE from-state policy for a `human:*`
+ * gate entering blocked, applied identically at both entry points
+ * (processStatusChange for Jira webhooks, processRecord for DDB streams):
+ *   (a) ready / in_progress / in_review → blocked IS a rejection. The gate was
+ *       presented, and the human may park it from any presented state.
+ *       handleReviewRejection's reopen loop is the second line of defence for
+ *       this branch (fix 2): an upstream whose own blockedBy is still open is
+ *       never re-Readied (checkAllBlockersResolved), so a rejection from a
+ *       presented state can not dispatch an agent ahead of its dependencies.
+ *   (b) a missing / empty from-state, "new", "todo", or a DDB INSERT (no
+ *       OldImage → oldStatus null) is NEVER a rejection. There is deliberately
+ *       NO evidence-based fallback (e.g. an open review_needed notification):
+ *       the decision is made on the transition alone, before any I/O, and a
+ *       missing from-state fails closed.
  */
 export function isCreationTimeBlock(oldStatus) {
   const prev = String(oldStatus ?? "").trim().toLowerCase();

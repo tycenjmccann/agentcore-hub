@@ -138,6 +138,12 @@ export default defineConfig({
       // review cap: escalation short-circuit + the review_fix reopen stamp.
       // index.mjs imported for real with its AWS/store/cap seams mocked.
       "lambda/orchestrator/review-rejection.test.mjs",
+      // gate-creation-blocked (TEAM-4045 / TEAM-4047) — a freshly created human
+      // merge-approval gate routed To Do -> Blocked by the ticket Lambda must
+      // NOT be read as "Request changes": from-state guard on both blocked entry
+      // points, blocker guard on the rework reopen, lease release on an agent
+      // ticket's in_progress -> blocked. Same harness as review-rejection.
+      "lambda/orchestrator/gate-creation-blocked.test.mjs",
       // completion-gates (TEAM-3686 F3/F4) — the orchestrator's evidence gate
       // in completeWorkflow and the fix-spawn completion re-check. Same harness
       // as review-rejection: index.mjs real, AWS/store seams mocked.
