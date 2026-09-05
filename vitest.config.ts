@@ -188,6 +188,11 @@ export default defineConfig({
       // TEAM-3992 D4.3 — the OTEL span confirmation probe (sentinel contract +
       // flag/budget cost guards) behind injected startQuery/getQueryResults.
       "lambda/orchestrator/otel-activity.test.mjs",
+      // dag-audit (TEAM-3992 D3.4) — the one-shot realized-graph audit wired at
+      // the first development-phase dispatch (validateRealizedGraph → non-fatal
+      // workflow.dag_violation → store.setDagAudit). §3(a) shape: real index.mjs
+      // + real dag.mjs, I/O seams mocked, def served from S3 workflows.json.
+      "lambda/orchestrator/dag-audit.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

@@ -42,6 +42,7 @@ import {
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource, resolveStallSoftTimeoutMs } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
+import { validateRealizedGraph } from "./dag.mjs";
 import { createOtelActivity } from "./otel-activity.mjs";
 import { createCascade, newMetrics as newCascadeMetrics } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
@@ -339,6 +340,40 @@ export async function loadWorkflowDefs() {
 function getWorkflowDef(id) {
   const defs = _workflowDefs || { [DEFAULT_WORKFLOW_DEF_ID]: FALLBACK_WORKFLOW_DEF };
   return defs[id] || defs[DEFAULT_WORKFLOW_DEF_ID] || FALLBACK_WORKFLOW_DEF;
+}
+
+/**
+ * TEAM-3992 D3.4 — one-shot realized-graph audit (design Q2). At the first
+ * development-phase dispatch, validate the run's realized child-ticket graph
+ * (assignees + blocked_by edges) against the def's declared `ticketDag` using
+ * the pure validator in dag.mjs, and record the outcome exactly once via
+ * store.setDagAudit (whose `attribute_not_exists(dagAudit)` condition is the
+ * authoritative idempotency guard — R2). A non-empty violation set surfaces a
+ * NON-FATAL `workflow.dag_violation` event, emitted only on the write that
+ * actually recorded the audit so it fires at most once per run. This is
+ * advisory only: it NEVER blocks dispatch. No-op when the def declares no
+ * ticketDag, and short-circuits in-memory once this container has audited.
+ */
+async function auditRealizedGraphOnce(workflow, wfDef) {
+  try {
+    if (!wfDef?.ticketDag) return; // def declares no DAG → nothing to audit
+    if (workflow.dagAudit) return; // already audited (in-memory short-circuit)
+    const children = await getChildTickets(workflow.epicId);
+    const roster = await loadAgentRoster();
+    const violations = validateRealizedGraph(children, wfDef.ticketDag, roster) || [];
+    const audit = { at: new Date().toISOString(), violationCount: violations.length, violations };
+    const recorded = await store.setDagAudit(workflow.id, audit);
+    workflow.dagAudit = { at: audit.at, violationCount: audit.violationCount };
+    if (recorded && violations.length > 0) {
+      await publishEvent(workflow.epicId, "workflow.dag_violation", {
+        workflowId: workflow.id,
+        defId: workflow.workflowDefId,
+        violations: violations.slice(0, 20),
+      });
+    }
+  } catch (err) {
+    console.warn(`[orchestrator] realized-graph audit failed (non-fatal): ${err.message}`);
+  }
 }
 
 // ─── Dead-session detector (TEAM-3618 D1.2) ──────────────────────────────────
@@ -2749,6 +2784,9 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     }
 
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
+
+    // TEAM-3992 D3.4 — one-shot realized-graph audit on development-phase entry.
+    if (agentDef.phase === "development") await auditRealizedGraphOnce(workflow, wfDef);
   }
 
   // Build context and invoke — SAME buildAgentContext for both paths
@@ -3155,6 +3193,9 @@ async function handleTicketReady(ticketId, image) {
     }
 
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
+
+    // TEAM-3992 D3.4 — one-shot realized-graph audit on development-phase entry.
+    if (agentDef.phase === "development") await auditRealizedGraphOnce(workflow, wfDef);
   }
 
   // Build context and invoke agent

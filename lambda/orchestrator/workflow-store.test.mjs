@@ -29,6 +29,7 @@ import {
   mergeTaskMetadataOrTrack,
   parkClaim,
   setProtectionCheck,
+  setDagAudit,
 } from "./workflow-store.mjs";
 import { isLeaseLive } from "./lease.mjs";
 
@@ -285,6 +286,26 @@ describe("parkClaim", () => {
     const startedAt = "2026-09-01T11:59:00Z"; // one minute ago — well inside any TTL
     expect(isLeaseLive({ status: "running", startedAt }, null, now)).toBe(true);
     expect(isLeaseLive({ status: "parked", startedAt }, null, now)).toBe(false);
+  });
+});
+
+describe("setDagAudit", () => {
+  it("records the audit once via attribute_not_exists(dagAudit), capping violations to 20", async () => {
+    const violations = Array.from({ length: 25 }, (_, i) => ({ code: "unmapped_ticket", ticket: `T-${i}` }));
+    const won = await setDagAudit("wf_1", { at: "2026-09-05T00:00:00Z", violationCount: 25, violations });
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("SET dagAudit = :a");
+    expect(w.input.ConditionExpression).toBe("attribute_not_exists(dagAudit)");
+    const stored = w.input.ExpressionAttributeValues[":a"];
+    expect(stored.at).toBe("2026-09-05T00:00:00Z");
+    expect(stored.violationCount).toBe(25);
+    expect(stored.violations).toHaveLength(20); // capped for the row-size budget
+  });
+
+  it("returns false when the run was already audited (the CAS lost → one-shot)", async () => {
+    failNextCondition = true;
+    expect(await setDagAudit("wf_1", { at: "x", violationCount: 0, violations: [] })).toBe(false);
   });
 });
 
