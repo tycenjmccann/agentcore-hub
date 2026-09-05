@@ -15,6 +15,17 @@ export const RepoConfigSchema = z.object({
   repos: z.array(RepoTargetSchema),
 });
 
+/**
+ * TEAM-4091 F3: cap the per-submission source count. Each source costs the
+ * server up to two outbound 10s GETs or an S3 HeadObject, all concurrent, so an
+ * unbounded array is a request amplifier. This package is standalone (its own
+ * tsconfig/node_modules, no @/* alias into src/), so the number is duplicated
+ * rather than imported — keep it in step with MAX_INTAKE_SOURCES in
+ * src/lib/workflow/source-shape.ts, which guards the REST route.
+ */
+const MAX_INTAKE_SOURCES = 32;
+const MAX_SOURCES_MESSAGE = `sources must have at most ${MAX_INTAKE_SOURCES} items`;
+
 export const IntakeSourceSchema = z.object({
   type: z.enum(["url", "upload", "s3"]),
   value: z.string().min(1),
@@ -58,7 +69,7 @@ export const WorkflowInputSchema = z.object({
   title: z.string().min(1),
   description: z.string().min(1),
   repoConfig: RepoConfigSchema,
-  sources: z.array(IntakeSourceSchema).optional().default([]),
+  sources: z.array(IntakeSourceSchema).max(MAX_INTAKE_SOURCES, MAX_SOURCES_MESSAGE).optional().default([]),
   modelOverride: ModelOverrideSchema,
   // TEAM-3832: workflowType is a DEPRECATED back-compat alias — workflowDefId
   // is the pipeline selector. Without workflowDefId the API maps "bug" → the
@@ -126,7 +137,7 @@ export const RoutineInputTemplateSchema = z.object({
       ),
     })
     .optional(),
-  sources: z.array(IntakeSourceSchema).optional(),
+  sources: z.array(IntakeSourceSchema).max(MAX_INTAKE_SOURCES, MAX_SOURCES_MESSAGE).optional(),
   connectors: z.array(z.string()).optional(),
 });
 

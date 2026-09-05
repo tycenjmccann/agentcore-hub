@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateSourcesShape, formatSourceDisplay, sourcesForDisplay } from "./source-shape";
+import { validateSourcesShape, formatSourceDisplay, sourcesForDisplay, MAX_INTAKE_SOURCES } from "./source-shape";
 
 /**
  * TEAM-4078 regression suite.
@@ -92,6 +92,32 @@ describe("validateSourcesShape — the start-route front door (F1a)", () => {
       { type: "upload", value: null },
     ]);
     expect(err).toMatch(/^sources\[2\]\./);
+  });
+
+  // TEAM-4091 F3: validateIntakeSources fans every source out CONCURRENTLY, each
+  // costing up to two 10s outbound GETs or an S3 HeadObject, on a route with no
+  // auth — so the count itself has to be bounded at the front door.
+  it("rejects more than MAX_INTAKE_SOURCES sources, even when every one is well-formed", () => {
+    const sources = Array.from({ length: MAX_INTAKE_SOURCES + 1 }, (_, i) => ({
+      type: "url",
+      value: `https://example.com/${i}`,
+    }));
+    expect(validateSourcesShape(sources)).toBe(`sources must have at most ${MAX_INTAKE_SOURCES} items`);
+  });
+
+  it("accepts exactly MAX_INTAKE_SOURCES sources", () => {
+    const sources = Array.from({ length: MAX_INTAKE_SOURCES }, (_, i) => ({
+      type: "url",
+      value: `https://example.com/${i}`,
+    }));
+    expect(validateSourcesShape(sources)).toBeNull();
+  });
+
+  it("reports the count before the per-item scan, so an oversized batch fails fast", () => {
+    // Item 0 is also malformed; the length message wins because the cap is
+    // checked first (nothing here should walk 10k items to find that out).
+    const sources = [{ type: "upload", value: null }, ...Array.from({ length: 10_000 }, () => ({}))];
+    expect(validateSourcesShape(sources)).toBe(`sources must have at most ${MAX_INTAKE_SOURCES} items`);
   });
 });
 

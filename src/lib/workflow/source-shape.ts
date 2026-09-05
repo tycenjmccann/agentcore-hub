@@ -29,6 +29,20 @@ import { redactUrl } from "./redact";
 export const INTAKE_SOURCE_TYPES = ["url", "upload", "s3"] as const;
 
 /**
+ * Ceiling on how many sources one submission may carry (TEAM-4091 F3).
+ *
+ * validateIntakeSources checks every source CONCURRENTLY, and each one can cost
+ * up to two outbound GETs of URL_TIMEOUT_MS (10s) each, or an S3 HeadObject. An
+ * unauthenticated caller could otherwise turn a single POST into an unbounded
+ * fan-out of server-side requests. 32 is far above any real submission (the
+ * board shows a handful of design references) and far below a useful amplifier.
+ *
+ * Mirrored by the zod `.max()` on both MCP front doors — see
+ * mcp/hub/src/workflow/schemas.ts.
+ */
+export const MAX_INTAKE_SOURCES = 32;
+
+/**
  * Validate the SHAPE of a submitted `sources` value — a mirror of
  * IntakeSourceSchema (type enum, value non-empty string, optional string
  * contentType/label) for the REST route, which has no zod layer.
@@ -43,6 +57,9 @@ export function validateSourcesShape(sources: unknown): string | null {
   if (sources === undefined || sources === null) return null;
   if (!Array.isArray(sources)) {
     return 'sources must be an array of { type, value } objects';
+  }
+  if (sources.length > MAX_INTAKE_SOURCES) {
+    return `sources must have at most ${MAX_INTAKE_SOURCES} items`;
   }
 
   for (let i = 0; i < sources.length; i++) {
