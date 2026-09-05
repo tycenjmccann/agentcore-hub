@@ -31,13 +31,27 @@ import {
   PutCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
-import { resolveMissingEvidenceFromRecords } from "@/lib/workflow/completion-evidence";
+import {
+  resolveMissingEvidenceFromRecords,
+  // TEAM-3991 D1.4 — the pure twins, shared with lambda/orchestrator/completion.mjs
+  // through completion-evidence-parity.test.ts.
+  openGateOf,
+  parseCdEvidence,
+  blockReasonWithGate,
+  shipVerdictOf as classifyShipEntry,
+  type OpenGate,
+} from "@/lib/workflow/completion-evidence";
+import {
+  featureBranchMergeProbe,
+  type MergeProbeInput,
+  type MergeProbeResult,
+} from "@/lib/workflow/merge-probe";
 import agentsConfig from "@/config/agents.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -105,6 +119,13 @@ function terminalPhaseGuard(): { condition: string; values: Record<string, strin
 // PARITY with lambda/orchestrator/completion.mjs SHIP_PHASES — the phases whose
 // done tickets owe a merge/deploy verdict rather than mere output.
 const SHIP_PHASES = new Set(["ship"]);
+// TEAM-3991 D1.4: the epic roll-up is now a retried obligation, not a one-shot
+// best effort, and it works on BOTH providers (before, the dynamodb path simply
+// never closed the epic — wf 7ef4fp finished with its epic open on the board).
+// The backoff is env-tunable so tests pin it to 0; a real retry sleeps 1/2/4s.
+const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
+const EPIC_ROLLUP_RETRIES = Number(process.env.EPIC_ROLLUP_RETRIES) || 3;
+const EPIC_ROLLUP_BACKOFF_MS = Number(process.env.EPIC_ROLLUP_BACKOFF_MS ?? 1000);
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
@@ -241,14 +262,14 @@ interface ShipVerdict {
  * onto every dev/ship completion record, so accepting it returned "shipped" for
  * unmerged work and let the gate close a run "complete" over an unshipped branch
  * (the 29g73c failure; FR-D2.2 / AC-D2.4).
+ *
+ * TEAM-3991 D1.4: the implementation now lives in completion-evidence.ts next to
+ * its parity test, and accepts `deployed` as proof of the same strength as
+ * `shipped` (wf sffzti deployed and was filed static-ci-only because no accepted
+ * outcome spelled the word the CD agent's own evidence uses).
  */
 function shipVerdictOf(entry: ShipTaskLike | undefined): string | null {
-  if (!entry || typeof entry !== "object") return null;
-  const outcome = typeof entry.outcome === "string" ? entry.outcome.trim().toLowerCase() : "";
-  if ((SHIP_BLOCKED_OUTCOMES as readonly string[]).includes(outcome)) return outcome;
-  const merged = typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0;
-  if (merged || outcome === "shipped") return "shipped";
-  return null;
+  return classifyShipEntry(entry);
 }
 
 /**
@@ -348,11 +369,16 @@ async function closeBlocked(
   workflowId: string,
   workflow: Record<string, unknown>,
   verdict: ShipVerdict,
-  reason: string | undefined
+  reason: string | undefined,
+  // TEAM-3991 D1.4: the human gate this run is actually waiting on, if any. It
+  // goes into the blockReason AND the terminal event, so a reader can link
+  // straight to the ticket instead of re-deriving it (wf 1pl3h1 closed with no
+  // mention of escalation TEAM-3757, the one thing a human had to act on).
+  openGate: OpenGate | null = null
 ): Promise<NextResponse> {
   const outcome = verdict.outcome as string; // a SHIP_BLOCKED_OUTCOMES value
   const completedAt = new Date().toISOString();
-  const blockReason = verdict.blockReason || reason || null;
+  const blockReason = blockReasonWithGate(verdict.blockReason || reason || null, openGate);
   const compacted = compactNotifications((workflow.humanNotifications as Notification[]) || []);
   // TEAM-3755 F2: same derived guard as the green complete write above — one list,
   // both terminal writes.
@@ -397,6 +423,7 @@ async function closeBlocked(
     closedBy: "workflow-manager",
     reason: blockReason,
     offenders: verdict.offenders,
+    openGate: openGate || null,
   };
   try {
     await eventBridge.send(
@@ -436,6 +463,225 @@ async function closeBlocked(
     { status: outcome, completedAt, outcome, offenders: verdict.offenders, ...(blockReason ? { reason: blockReason } : {}) },
     { status: 200 }
   );
+}
+
+/**
+ * TEAM-3991 D1.3 PARITY (mirrors the orchestrator's merge-proof stamp) — write
+ * GitHub's merge proof onto the ship tasks that self-reported nothing, so the
+ * re-judged verdict (and the dashboard) tell the truth.
+ *
+ * Two rules that are not negotiable here:
+ *  - A recorded BLOCK is never overwritten. An offender whose verdict is anything
+ *    other than "none" already said something; a merge does not un-block a
+ *    deploy-blocked ticket, and `blockReason` is never touched by this path.
+ *  - Scoped conditional write on the EXISTING entry only
+ *    (`attribute_exists(agentTasks.#tid)`), same shape as the cd-evidence stamp, so
+ *    a stale ticket id can never materialize a phantom task.
+ */
+async function stampMergeProof(
+  workflowId: string,
+  workflow: Record<string, unknown>,
+  verdict: ShipVerdict,
+  probe: MergeProbeResult,
+  agentTasks: Record<string, Record<string, unknown>>
+): Promise<void> {
+  for (const o of verdict.offenders) {
+    if (o.verdict && o.verdict !== "none") continue;
+    const fields: Record<string, unknown> = {
+      mergeCommit: probe.mergeCommit || `merged:${String(workflow.featureBranch || "")}`,
+      mergeVerifiedBy: "github",
+    };
+    if (probe.prUrl && !agentTasks[o.ticketId]?.prUrl) fields.prUrl = probe.prUrl;
+    const names: Record<string, string> = { "#tid": o.ticketId };
+    const values: Record<string, unknown> = {};
+    const sets: string[] = [];
+    let i = 0;
+    for (const [k, v] of Object.entries(fields)) {
+      names[`#f${i}`] = k;
+      values[`:v${i}`] = v;
+      sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
+      i++;
+    }
+    try {
+      await ddb.send(
+        new UpdateCommand({
+          TableName: WORKFLOWS_TABLE,
+          Key: { workflowId },
+          UpdateExpression: `SET ${sets.join(", ")}`,
+          ConditionExpression: "attribute_exists(agentTasks.#tid)",
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        })
+      );
+    } catch (err) {
+      if ((err as Error).name !== "ConditionalCheckFailedException") {
+        console.warn(`[complete] merge-proof stamp failed for ${o.ticketId}: ${(err as Error).message}`);
+      }
+    }
+    agentTasks[o.ticketId] = { ...(agentTasks[o.ticketId] || {}), ...fields };
+  }
+  console.log(
+    `[complete] ${workflowId}: GitHub proves ${String(workflow.featureBranch || "")} merged ` +
+      `(${probe.mergeCommit || "compare"}) — ship verdict taken from ground truth`
+  );
+}
+
+/**
+ * TEAM-3991 D1.4 PARITY (mirrors the orchestrator's harvestCdEvidence) — the
+ * run's OWN account of its deploy. The release manager writes
+ * `workflows/<wf>/shared/cd-evidence/deploy-*.md` ("# DEPLOY SUCCEEDED …" /
+ * "# PREFLIGHT BLOCKED …") but its report_completion tool has no outcome field,
+ * so the ship gate saw a done CD ticket carrying no verdict at all and closed
+ * every deployed run static-ci-only (wf sffzti) — while wf 1pl3h1's
+ * "PREFLIGHT BLOCKED" file went unread and the run closed `complete`.
+ *
+ * Newest file wins (LastModified, key as tiebreak). Stamps the parsed verdict
+ * onto every passed ship ticket AND onto the in-memory agentTasks, so the ship
+ * ladder below decides on it exactly as if the agent had self-reported it.
+ * Best-effort: no bucket, no file, an unparseable file or any S3 error ⇒ null.
+ */
+async function harvestCdEvidence(
+  workflowId: string,
+  shipTicketIds: string[],
+  agentTasks: Record<string, Record<string, unknown>>
+): Promise<{ outcome: string; blockReason?: string; evidenceKey: string } | null> {
+  if (!ARTIFACT_BUCKET || shipTicketIds.length === 0) return null;
+  try {
+    const listed = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: ARTIFACT_BUCKET,
+        Prefix: `workflows/${workflowId}/shared/cd-evidence/`,
+      })
+    );
+    const files = (listed?.Contents || [])
+      .filter((o) => /\/deploy-[^/]*\.md$/i.test(String(o?.Key || "")))
+      .sort((a, b) => {
+        const at = Date.parse(String(a.LastModified || "")) || 0;
+        const bt = Date.parse(String(b.LastModified || "")) || 0;
+        return bt - at || String(b.Key).localeCompare(String(a.Key));
+      });
+    if (files.length === 0) return null;
+    const evidenceKey = String(files[0].Key);
+    const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: evidenceKey }));
+    const parsed = parseCdEvidence(await obj.Body?.transformToString());
+    if (!parsed) return null;
+    const fields: Record<string, unknown> = { outcome: parsed.outcome, evidenceKey };
+    if (parsed.blockReason) fields.blockReason = String(parsed.blockReason).slice(0, 500);
+    for (const ticketId of shipTicketIds) {
+      // Scoped conditional write on the existing entry only — same shape as the
+      // evidence backfill above (never materializes a phantom task).
+      const names: Record<string, string> = { "#tid": ticketId };
+      const values: Record<string, unknown> = {};
+      const sets: string[] = [];
+      let i = 0;
+      for (const [k, v] of Object.entries(fields)) {
+        names[`#f${i}`] = k;
+        values[`:v${i}`] = v;
+        sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
+        i++;
+      }
+      try {
+        await ddb.send(
+          new UpdateCommand({
+            TableName: WORKFLOWS_TABLE,
+            Key: { workflowId },
+            UpdateExpression: `SET ${sets.join(", ")}`,
+            ConditionExpression: "attribute_exists(agentTasks.#tid)",
+            ExpressionAttributeNames: names,
+            ExpressionAttributeValues: values,
+          })
+        );
+      } catch (err) {
+        if ((err as Error).name !== "ConditionalCheckFailedException") {
+          console.warn(`[complete] cd-evidence stamp failed for ${ticketId}: ${(err as Error).message}`);
+        }
+      }
+      agentTasks[ticketId] = { ...(agentTasks[ticketId] || {}), ...fields };
+    }
+    console.log(`[complete] ${workflowId}: cd-evidence ${evidenceKey} → outcome ${parsed.outcome}`);
+    return { ...parsed, evidenceKey };
+  } catch (err) {
+    console.warn(`[complete] cd-evidence harvest skipped for ${workflowId}: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+/** Move the epic to Done through whichever backend is configured. */
+async function transitionEpicToDone(epicId: string): Promise<void> {
+  if (TICKET_PROVIDER === "jira") {
+    await JiraClient.fromEnv().transitionIssue(epicId, "Done");
+    return;
+  }
+  // PARITY with the orchestrator's transitionTicketToDone: a scoped write on the
+  // TICKETS table (not the workflows table, so the single-writer rule is intact).
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TICKETS_TABLE,
+      Key: { ticketId: epicId },
+      UpdateExpression: "SET #s = :s, #u = :u",
+      ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+      ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
+    })
+  );
+}
+
+/**
+ * TEAM-3991 D1.4 PARITY (mirrors rollUpEpic in lambda/orchestrator/index.mjs) —
+ * roll the root epic to Done with retries. Idempotent by construction: a Done
+ * epic transitioned to Done again is a success, not an error. Never throws.
+ */
+async function rollUpEpic(epicId: string): Promise<{ ok: boolean; attempts: number; lastError: string | null }> {
+  let lastError: string | null = null;
+  for (let attempt = 1; attempt <= EPIC_ROLLUP_RETRIES; attempt++) {
+    try {
+      await transitionEpicToDone(epicId);
+      return { ok: true, attempts: attempt, lastError: null };
+    } catch (err) {
+      lastError = (err as Error).message || String(err);
+    }
+    console.warn(`[complete] epic ${epicId} roll-up attempt ${attempt}/${EPIC_ROLLUP_RETRIES} failed: ${lastError}`);
+    if (attempt < EPIC_ROLLUP_RETRIES && EPIC_ROLLUP_BACKOFF_MS > 0) {
+      await new Promise((r) => setTimeout(r, EPIC_ROLLUP_BACKOFF_MS * 2 ** (attempt - 1)));
+    }
+  }
+  return { ok: false, attempts: EPIC_ROLLUP_RETRIES, lastError };
+}
+
+/** Publish to both sinks (EventBridge + the events table). Both non-fatal. */
+async function publishBoth(workflowId: string, type: string, detail: Record<string, unknown>): Promise<void> {
+  const timestamp = new Date().toISOString();
+  try {
+    await eventBridge.send(
+      new PutEventsCommand({
+        Entries: [
+          {
+            Source: "agentcore-hub.orchestrator",
+            DetailType: type,
+            Detail: JSON.stringify({ ...detail, timestamp }),
+            EventBusName: EVENT_BUS,
+          },
+        ],
+      })
+    );
+  } catch (err) {
+    console.warn(`[complete] EventBridge publish failed: ${(err as Error).message}`);
+  }
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: EVENTS_TABLE,
+        Item: {
+          workflowId,
+          eventId: `${Date.now()}-${type}-${Math.random().toString(36).slice(2, 6)}`,
+          timestamp,
+          type,
+          detail,
+        },
+      })
+    );
+  } catch {
+    /* event publish is non-fatal */
+  }
 }
 
 export async function POST(
@@ -641,6 +887,10 @@ export async function POST(
       console.warn(`[complete] required-phase check skipped: ${(err as Error).message}`);
     }
 
+    // TEAM-3991 D1.4 — what the terminal event REPORTS. A run whose CD evidence
+    // says DEPLOY SUCCEEDED is `deployed`, not the CI-only default.
+    let provenShipOutcome: string | null = null;
+
     // 2c. TEAM-3747 D2 — ship/CD merge-verdict gate ("no green close over
     //     unshipped work"), PARITY with the orchestrator's completeWorkflow. If the
     //     def has a ship phase, a done ship ticket must carry a merge/deploy verdict
@@ -652,15 +902,64 @@ export async function POST(
     try {
       const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
       const requiredPhases = def?.completionRequiresAgentPhases || [];
-      const verdict = evaluateShipVerdict(
+      const agentTasks = (workflow.agentTasks as Record<string, Record<string, unknown>>) || {};
+      // TEAM-3991 D1.4: before judging, read the CD agent's own deploy evidence for
+      // any done ship ticket that reported NO outcome — its report_completion tool
+      // has no outcome field, so the file on S3 is the only place the verdict
+      // exists. `deployed` is what the terminal event must then REPORT.
+      const shipPhases = requiredPhases.filter((ph) => SHIP_PHASES.has(ph));
+      if (shipPhases.length > 0) {
+        const outcomeless = tickets
+          .filter(
+            (t) =>
+              t.type !== "epic" &&
+              String(t.status || "").toLowerCase() === "done" &&
+              !String(t.assignee || "").startsWith("human:") &&
+              shipPhases.includes(phaseOfTicket(t) as string) &&
+              !agentTasks[String(t.ticketId)]?.outcome
+          )
+          .map((t) => String(t.ticketId));
+        if (outcomeless.length > 0) {
+          const cd = await harvestCdEvidence(workflowId, outcomeless, agentTasks);
+          if (cd?.outcome === "deployed") provenShipOutcome = "deployed";
+        }
+      }
+      let verdict = evaluateShipVerdict(
         tickets,
-        (workflow.agentTasks as Record<string, ShipTaskLike>) || {},
+        agentTasks as Record<string, ShipTaskLike>,
         requiredPhases
       );
+      // TEAM-3991 D1.3 — GitHub is the ground truth, and it is consulted BEFORE the
+      // verdict is acted on. The release manager's report_completion has no
+      // merge_commit field, so a merged run's self-report can never say "shipped";
+      // without this the route closed every deployed run static-ci-only and could
+      // not distinguish it from a run whose branch never landed. Three answers:
+      // proven merged → stamp the proof and re-judge; proven unmerged → the honest
+      // blocked close names it; unknown → self-report decides, untouched.
+      if (verdict.required && !verdict.shipped && shipPhases.length > 0) {
+        const probe = await featureBranchMergeProbe(workflow as MergeProbeInput);
+        if (probe.merged === true) {
+          await stampMergeProof(workflowId, workflow, verdict, probe, agentTasks);
+          verdict = evaluateShipVerdict(
+            tickets,
+            agentTasks as Record<string, ShipTaskLike>,
+            requiredPhases
+          );
+        } else if (probe.merged === false) {
+          console.error(
+            `[complete] ${workflowId}: feature branch ${String(workflow.featureBranch)} is NOT merged ` +
+              `(${probe.reason}) — refusing a green close.`
+          );
+          verdict = {
+            ...verdict,
+            blockReason: verdict.blockReason || `feature branch not merged: ${probe.reason}`,
+          };
+        }
+      }
       if (verdict.required && !verdict.shipped) {
         const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
         if (COMPLETION_EVIDENCE_REQUIRED) {
-          return await closeBlocked(workflowId, workflow, verdict, reason);
+          return await closeBlocked(workflowId, workflow, verdict, reason, openGateOf(tickets));
         }
         console.warn(
           `[complete] ${workflowId} would close as ${verdict.outcome} (shadow opt-out) — ship verdict missing: ${offenders}`
@@ -672,19 +971,38 @@ export async function POST(
       console.warn(`[complete] ship-verdict check skipped: ${(err as Error).message}`);
     }
 
-    const completedAt = new Date().toISOString();
-
-    // 3. Roll the epic up in Jira so the board reflects the closure. Best-effort:
-    //    a board without a Done transition (or DynamoDB mode) just skips this.
-    let epicRolledUp = false;
-    if (TICKET_PROVIDER === "jira" && workflow.epicId) {
-      try {
-        await JiraClient.fromEnv().transitionIssue(String(workflow.epicId), "Done");
-        epicRolledUp = true;
-      } catch (err) {
-        console.warn(`[complete] epic ${workflow.epicId} roll-up skipped: ${(err as Error).message}`);
-      }
+    // 2d. TEAM-3991 D1.4 — an OPEN human gate forbids a green close, whatever the
+    //     ship verdict says. wf 1pl3h1 closed `complete` while escalation gate
+    //     TEAM-3757 sat in_review over unmerged PR #274: every agent ticket was
+    //     done, so every gate above passed, and the one person who still owed the
+    //     run a decision was never mentioned. Close honestly and NAME the gate.
+    //
+    //     The outcome is `static-ci-only`, deliberately NOT a literal "blocked"
+    //     phase: TERMINAL_PHASES is the closed set both terminal writes refuse to
+    //     overwrite, so a phase outside it could be silently clobbered by a later
+    //     completion CAS (the TEAM-3755 F2 class). The specifics travel in
+    //     `openGate` + the blockReason.
+    const openGate = openGateOf(tickets);
+    if (openGate) {
+      console.error(
+        `[complete] ${workflowId}: refusing green close — ${openGate.kind} ${openGate.ticketId} is ${openGate.status}`
+      );
+      return await closeBlocked(
+        workflowId,
+        workflow,
+        {
+          required: true,
+          shipped: false,
+          outcome: "static-ci-only",
+          blockReason: `gate ${openGate.ticketId} (${openGate.title || openGate.kind}) is ${openGate.status}`,
+          offenders: [],
+        },
+        reason,
+        openGate
+      );
     }
+
+    const completedAt = new Date().toISOString();
 
     // 4. Conditional write — set terminal phase, stamp completion, stop the
     //    watch, AND compact runaway escalation noise in the SAME write so the
@@ -701,7 +1019,13 @@ export async function POST(
           TableName: WORKFLOWS_TABLE,
           Key: { workflowId },
           UpdateExpression:
-            "SET #phase = :complete, completedAt = :ts, previousPhase = :prev, managerWatch = :false, humanNotifications = :notifs" +
+            "SET #phase = :complete, completedAt = :ts, previousPhase = :prev, managerWatch = :false, " +
+            // TEAM-3991 D1.4: the epic roll-up obligation is created ATOMICALLY with
+            // the terminal claim (parity with workflow-store.mjs completeWorkflow), so
+            // exactly one caller owns it and a crash leaves a flag the sweep retries —
+            // there is no window where the run is complete with nobody responsible.
+            (workflow.epicId ? "epicRollupPending = :pending, " : "") +
+            "humanNotifications = :notifs" +
             (reason ? ", completeReason = :reason" : ""),
           // TEAM-3686: also CAS-guard on cancelledAt — a cancel landing between
           // the pre-read above (which serves the friendly 409) and this write
@@ -714,6 +1038,7 @@ export async function POST(
           ExpressionAttributeNames: { "#phase": "phase" },
           ExpressionAttributeValues: {
             ":complete": "complete",
+            ...(workflow.epicId ? { ":pending": true } : {}),
             ":ts": completedAt,
             ":prev": workflow.phase,
             ":false": false,
@@ -758,6 +1083,43 @@ export async function POST(
       throw err;
     }
 
+    // 4b. TEAM-3991 D1.4 — discharge the roll-up obligation this claim created.
+    //     Success → clear the flag, then announce epicRolledUp:true. Failure → keep
+    //     the flag (so the sweep retries), announce the failure observably and say
+    //     epicRolledUp:false. The run is NEVER un-completed: the delivery is real,
+    //     only the board label is missing. PARITY: finalizeWithEpicRollUp.
+    let epicRolledUp = false;
+    if (workflow.epicId) {
+      const rollup = await rollUpEpic(String(workflow.epicId));
+      epicRolledUp = rollup.ok;
+      if (rollup.ok) {
+        try {
+          await ddb.send(
+            new UpdateCommand({
+              TableName: WORKFLOWS_TABLE,
+              Key: { workflowId },
+              UpdateExpression: "REMOVE epicRollupPending",
+              ConditionExpression: "attribute_exists(epicRollupPending)",
+            })
+          );
+        } catch (err) {
+          if ((err as Error).name !== "ConditionalCheckFailedException") {
+            console.warn(`[complete] clearing epicRollupPending failed: ${(err as Error).message}`);
+          }
+        }
+      } else {
+        console.error(
+          `[complete] epic ${workflow.epicId} roll-up FAILED after ${rollup.attempts} attempts: ${rollup.lastError}`
+        );
+        await publishBoth(workflowId, "workflow.epic_rollup_failed", {
+          workflowId,
+          epicId: String(workflow.epicId),
+          attempts: rollup.attempts,
+          lastError: rollup.lastError,
+        });
+      }
+    }
+
     // 5. Publish workflow.complete. Two sinks, matching the orchestrator's
     //    publishEvent: EventBridge (source agentcore-hub.orchestrator, detail
     //    type workflow.complete) drives the ANALYZE trigger; the events-table
@@ -769,6 +1131,8 @@ export async function POST(
       previousPhase: workflow.phase,
       closedBy: "workflow-manager",
       epicRolledUp,
+      // TEAM-3991 D1.4: a deployed run reports `deployed`, not the CI-only default.
+      ...(provenShipOutcome ? { outcome: provenShipOutcome } : {}),
       ...(reason ? { reason } : {}),
     };
     try {
@@ -808,7 +1172,13 @@ export async function POST(
       `[complete] Workflow ${workflowId} completed (was: ${workflow.phase}, epicRolledUp=${epicRolledUp})`
     );
     return NextResponse.json(
-      { status: "complete", completedAt, epicRolledUp, ...(reason ? { reason } : {}) },
+      {
+        status: "complete",
+        completedAt,
+        epicRolledUp,
+        ...(provenShipOutcome ? { outcome: provenShipOutcome } : {}),
+        ...(reason ? { reason } : {}),
+      },
       { status: 200 }
     );
   } catch (err) {

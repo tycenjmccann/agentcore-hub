@@ -22,6 +22,7 @@ Globals:
         DEAD_SESSION_DETECTOR_MODE: !Ref DeadSessionDetectorMode
         CASCADE_EXTENDED_STATES: !Ref CascadeExtendedStates
         RECONCILE_SWEEP_MODE: !Ref ReconcileSweepMode
+        GATE_BYPASS_MODE: !Ref GateBypassMode
 
 Parameters:
   TicketsTableName:
@@ -86,6 +87,21 @@ Parameters:
       dependents. Default "off" matches the code's unset default, so the backstop
       ships dark — same rollout posture as deploy.sh (TEAM-3763 F2), which only
       forwards RECONCILE_SWEEP_MODE when explicitly set.
+
+  GateBypassMode:
+    Type: String
+    Default: enforce
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Merge-without-approval detection (TEAM-3991 D1.1). off = skip the check
+      entirely; shadow = detect + publish workflow.gate_bypass, no writes to the
+      ticket or the run; enforce = additionally flag the task
+      (gateBypassFlaggedAt, which also blocks re-claim), push the ticket back to
+      in_review, raise one manager_escalation per offending merge commit, and
+      hold the run open at completion until a human acks. Default "enforce"
+      matches the code default in gate-bypass.mjs gateBypassMode() — unlike the
+      sweeps this ships ON, because the failure it catches (a run closing green
+      over an unapproved merge) is exactly what it must not miss.
 
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────

@@ -37,6 +37,105 @@ const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
 export const SHIP_BLOCKED_OUTCOMES = ["deploy-blocked", "static-ci-only"];
 
 /**
+ * TEAM-3991 D1.4 — the outcomes that PROVE the work landed, and the only ones a
+ * harvest may accept alongside SHIP_BLOCKED_OUTCOMES.
+ *
+ * `deployed` joins `shipped` because the CD agent's own evidence file says
+ * "DEPLOY SUCCEEDED", not "shipped": wf sffzti merged 4 PRs and deployed, then
+ * closed `static-ci-only` because no harvested field ever spelled the word
+ * `shipped`. Both mean the same thing to the ship gate; they differ only in what
+ * the terminal event REPORTS, so a deployed run is not filed as CI-only.
+ *
+ * PARITY MIRROR: src/lib/workflow/types.ts / the complete route's twin.
+ */
+export const SHIP_PROVEN_OUTCOMES = ["shipped", "deployed"];
+
+/** Every outcome value a completion record may legitimately carry. */
+export const ACCEPTED_SHIP_OUTCOMES = Object.freeze([
+  ...SHIP_PROVEN_OUTCOMES,
+  ...SHIP_BLOCKED_OUTCOMES,
+]);
+
+/** Human-gate statuses that mean "a person still owes this run a decision". */
+const OPEN_GATE_STATUSES = new Set(["in_review", "todo", "blocked"]);
+const ESCALATION_TITLE = /^Escalation #\d+/i;
+
+/**
+ * TEAM-3991 D1.4 — the human gate still standing between this run and a green
+ * close, or null.
+ *
+ * wf 1pl3h1 is the failure: PR #274 was never merged, the preflight came back
+ * BLOCKED, and TEAM-3757 ("Escalation #1 …") sat `in_review` waiting for a
+ * person — yet the run closed `complete`. A run whose merge authority is still
+ * unexercised has not finished, and saying so must NAME the gate, because
+ * "blocked" without a ticket id is what sent humans hunting through the board.
+ *
+ * Human-assigned (`human:*`) children only: an agent ticket in `todo` is ordinary
+ * unstarted work, not withheld authority. `blocked` counts — a rejected gate is
+ * emphatically not an approval. Deterministic by ticketId so two callers looking
+ * at the same board name the same gate.
+ */
+export function openGateOf(children) {
+  if (!Array.isArray(children)) return null;
+  const open = children
+    .filter(
+      (t) =>
+        t &&
+        t.type !== "epic" &&
+        isHuman(t.assignee) &&
+        OPEN_GATE_STATUSES.has(String(t.status || "").toLowerCase())
+    )
+    .sort((a, b) => String(a.ticketId || "").localeCompare(String(b.ticketId || "")));
+  if (open.length === 0) return null;
+  const gate = open[0];
+  const title = String(gate.title || "");
+  return {
+    ticketId: String(gate.ticketId || ""),
+    title,
+    status: String(gate.status || "").toLowerCase(),
+    kind: ESCALATION_TITLE.test(title) ? "escalation" : "merge_gate",
+  };
+}
+
+/**
+ * TEAM-3991 D1.4 — read the CD agent's deploy evidence file (S3
+ * `workflows/<wf>/shared/cd-evidence/deploy-*.md`) for a ship verdict.
+ *
+ * The release manager writes this markdown whether or not it remembers to stamp
+ * an `outcome` on its completion record — and in wf sffzti and wf 1pl3h1 it wrote
+ * the file and stamped nothing, so the run's own account of itself was the only
+ * honest evidence available and nobody read it. Only the FIRST matching line is
+ * consulted: the heading is the verdict, and a later "blocked" mention inside the
+ * body (a resolved preflight note, a quoted log) must not overturn it.
+ *
+ * Returns `{ outcome, blockReason? }` or null — never throws, never guesses.
+ */
+export function parseCdEvidence(markdown) {
+  const text = typeof markdown === "string" ? markdown : "";
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/DEPLOY SUCCEEDED/i.test(line)) return { outcome: "deployed" };
+    if (/(DEPLOY|PREFLIGHT) BLOCKED/i.test(line)) {
+      return { outcome: "deploy-blocked", blockReason: line.replace(/^#+\s*/, "").trim() };
+    }
+  }
+  return null;
+}
+
+/**
+ * TEAM-3991 D1.4 — prefix a block reason with the gate that owes the decision.
+ * `awaiting escalation TEAM-3757: <reason>` reads as an action for a human, where
+ * a bare "preflight blocked" reads as a dead end.
+ */
+export function blockReasonWithGate(reason, openGate) {
+  const base = typeof reason === "string" && reason.trim() ? reason.trim() : "";
+  if (!openGate?.ticketId) return base || null;
+  const head = `awaiting ${openGate.kind} ${openGate.ticketId}`;
+  return base ? `${head}: ${base}` : head;
+}
+
+/**
  * TEAM-3755 F2 — the ONE list of phases a run can already be closed on. Every
  * terminal-claim CAS must refuse ALL of them, or a later write can overwrite an
  * earlier honest verdict.
@@ -376,7 +475,11 @@ export function shipVerdictOf(entry) {
   // commitSha is NOT consulted (see the F1 note above) — it is the unmerged
   // branch HEAD and is present on every completion record.
   const merged = typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0;
-  if (merged || outcome === "shipped") return "shipped";
+  // TEAM-3991 D1.4: "deployed" is proof of exactly the same strength as "shipped"
+  // — it is the word the CD agent's own evidence uses. Both collapse to "shipped"
+  // here so evaluateShipVerdict's ladder is unchanged; which of the two a run
+  // actually achieved is reported by the terminal event, not by this classifier.
+  if (merged || SHIP_PROVEN_OUTCOMES.includes(outcome)) return "shipped";
   return null;
 }
 

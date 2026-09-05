@@ -1161,3 +1161,87 @@ describe("TEAM-3756 F5 — the detector's workflow scan excludes EVERY terminal 
     expect(m.candidates).toBe(1);
   });
 });
+
+/**
+ * TEAM-3991 D1.2 trigger (a): a dead session that already delivered. The agent
+ * pushed the branch / opened the PR and then died before report_completion —
+ * spending a retry (or, worse, escalating to a human) re-runs work that already
+ * exists. When the injected synthesizeCompletion harvests GitHub evidence, the
+ * ticket is transitioned by THAT path (which drives the normal done cascade) and
+ * the detector must stop: no retry, no escalation, no re-dispatch. The dep is
+ * optional, so an unwired detector keeps the pre-3991 behaviour exactly.
+ */
+describe("synthesized completion (D1.2 trigger a)", () => {
+  it("evidence found → agent.error still announced, but NO retry/escalate/re-dispatch", async () => {
+    const synthesizeCompletion = vi.fn(async () => ({ synthesized: true, branch: "feature/TEAM-2-dev", prUrl: "https://github.com/o/r/pull/9" }));
+    const { deps, store, lease } = makeDeps({ synthesizeCompletion });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    // The steal still happens — the claim IS dead, and the synthesize path needs
+    // the entry released before it can transition the ticket.
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(1);
+    expect(synthesizeCompletion).toHaveBeenCalledTimes(1);
+    expect(synthesizeCompletion.mock.calls[0][0]).toMatchObject({ id: "wf_1" });
+    expect(synthesizeCompletion.mock.calls[0][1]).toMatchObject({ ticketId: "TEAM-2" });
+    // The whole point: the retry budget is untouched and no human is paged.
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(store.appendNotification).not.toHaveBeenCalled();
+    expect(deps.blockTicket).not.toHaveBeenCalled();
+    expect(m.fired).toBe(1);
+    expect(m.retries).toBe(0);
+    expect(m.escalations).toBe(0);
+  });
+
+  it("no evidence → the retry path is unchanged", async () => {
+    const synthesizeCompletion = vi.fn(async () => ({ synthesized: false, reason: "no_branch" }));
+    const { deps, store } = makeDeps({ synthesizeCompletion });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(synthesizeCompletion).toHaveBeenCalledTimes(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(m.retries).toBe(1);
+  });
+
+  it("evidence found on the LAST retry → escalation suppressed too (a delivered ticket is not a failure)", async () => {
+    const synthesizeCompletion = vi.fn(async () => ({ synthesized: true, branch: "feature/TEAM-2-dev" }));
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), synthesizeCompletion });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(deps.blockTicket).not.toHaveBeenCalled();
+    expect(m.escalations).toBe(0);
+  });
+
+  it("a throwing synthesize never breaks the sweep — falls through to retry", async () => {
+    const synthesizeCompletion = vi.fn(async () => { throw new Error("s3 down"); });
+    const { deps } = makeDeps({ synthesizeCompletion });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(m.retries).toBe(1);
+  });
+
+  it("shadow mode never asks GitHub (observe-only means zero side effects)", async () => {
+    const synthesizeCompletion = vi.fn(async () => ({ synthesized: true }));
+    const { deps } = makeDeps({ synthesizeCompletion });
+    const { runSweep } = createDetector(deps);
+
+    await runSweep("shadow");
+
+    expect(synthesizeCompletion).not.toHaveBeenCalled();
+  });
+});

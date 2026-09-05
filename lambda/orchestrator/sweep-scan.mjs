@@ -35,6 +35,39 @@ const WORKFLOW_SCAN_PAGES = 20;       // bound the workflows scan
 export const SWEEP_ROTATION_QUANTUM_MS = 10 * 60 * 1000;
 
 /**
+ * TEAM-3991 D2.3 — the OTHER bounded scan the reconcile sweep needs: runs that
+ * closed green but whose epic roll-up never landed (`epicRollupPending` still set,
+ * `finalizedAt` still absent). Those rows are in phase `complete`, so the
+ * open-workflow scan above filters them OUT by design — a terminal run owes no
+ * dependent reconciliation. The roll-up debt is the one exception, hence a second
+ * narrowly-filtered read. Reads ONLY: the recovery writes all happen inside the
+ * injected dep (index.mjs retryPendingEpicRollups → store fns), so R2 holds.
+ *
+ * No rotation: the filter is an outstanding-debt list that empties as the sweep
+ * discharges it, so plain newest-page-first truncation cannot starve anything.
+ */
+export function createPendingRollupScan({ ddb, workflowsTable, cap = SWEEP_CAP }) {
+  return async function scanPendingRollups() {
+    const matched = [];
+    let lastKey;
+    for (let page = 0; page < WORKFLOW_SCAN_PAGES; page++) {
+      const res = await ddb.send(new ScanCommand({
+        TableName: workflowsTable,
+        FilterExpression:
+          "#p = :complete AND attribute_exists(epicRollupPending) AND attribute_not_exists(finalizedAt)",
+        ExpressionAttributeNames: { "#p": "phase" },
+        ExpressionAttributeValues: { ":complete": "complete" },
+        ExclusiveStartKey: lastKey,
+      }));
+      for (const w of res.Items || []) matched.push(w);
+      lastKey = res.LastEvaluatedKey;
+      if (!lastKey || matched.length >= cap) break;
+    }
+    return { workflows: matched.slice(0, cap), matched: matched.length };
+  };
+}
+
+/**
  * Build the scan bound to its dependencies. Returns an async function yielding
  * { workflows, matched, rotation, pages } so the caller can flag truncation
  * (and log which rotating window this sweep inspected).

@@ -119,7 +119,79 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
   };
 }
 
+/**
+ * TEAM-3991 F17 — look up the ticket this report claims to be closing.
+ *
+ * Reuses the SAME Tickets Lambda invoke the transition below uses, so this works
+ * against whichever provider is configured and needs no new IAM or table access.
+ * Returns the ticket-ish shape, or `null` when the lookup is unavailable
+ * (Lambda unreachable, tool error, ticket absent) — the caller then skips the
+ * ownership check rather than blocking a legitimate completion on an infra blip.
+ */
+async function lookupTicketOwner(ticket_id) {
+  try {
+    const resp = await lambda.send(new InvokeCommand({
+      FunctionName: TICKET_TOOLS_LAMBDA,
+      InvocationType: "RequestResponse",
+      Payload: Buffer.from(JSON.stringify({
+        tool_name: "Tickets___get_issue",
+        parameters: { ticket_id },
+      })),
+    }));
+    const payload = JSON.parse(new TextDecoder().decode(resp.Payload));
+    if (!payload || payload.error) return null;
+    // The tickets Lambda answers in the Jira issue shape; a "not found" comes back
+    // as a plain text result with no fields.
+    const assignee = payload.fields?.assignee?.displayName ?? payload.assignee ?? null;
+    const status = payload.fields?.status?.name ?? payload.status ?? null;
+    if (assignee === null && status === null) return null;
+    return { assignee: assignee ? String(assignee) : "", status: status ? String(status) : "" };
+  } catch (err) {
+    console.warn(`[report_completion] ticket lookup failed for ${ticket_id}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * TEAM-3991 F17/F18 — an agent reporting its OWN ticket's completion.
+ *
+ * Two things were trust-by-default here and are now enforced:
+ *
+ *  F18 `source` is SERVER-STAMPED as "agent". The completion record is the
+ *      evidence a later gate reads, and `source` is what distinguishes an agent's
+ *      own deliverable from a human manager's mark-done. A caller that could set
+ *      `source: "manager"` could launder its own claim into an operator's
+ *      attestation, so the field is overwritten, never merged.
+ *
+ *  F17 The report must come from the ticket's OWN assignee. Without this, any
+ *      agent holding this tool could close ANY ticket in the run — including a
+ *      `human:*` review gate, which is precisely the false-green the gate exists
+ *      to prevent. Two refusals, both before any write or transition:
+ *        - the ticket is assigned to a human → refuse outright;
+ *        - `agent_id` is present and differs from the assignee → refuse.
+ *      An ABSENT `agent_id` is allowed (older fleet callers omit it) but logged:
+ *      it cannot be checked, so it must at least be visible.
+ */
 async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id }) {
+  const owner = await lookupTicketOwner(ticket_id);
+  if (!owner) {
+    console.warn(`[report_completion] ownership_unverified — could not read ${ticket_id}; proceeding without the assignee check`);
+  } else if (owner.assignee.startsWith("human:")) {
+    throw new Error(
+      `REFUSED: ${ticket_id} is assigned to ${owner.assignee} — a human review gate. ` +
+      `Only a human can close it; report_completion cannot. If your work is what the gate is ` +
+      `waiting on, say so in a comment and let the reviewer decide.`
+    );
+  } else if (agent_id && owner.assignee && String(agent_id) !== owner.assignee) {
+    throw new Error(
+      `REFUSED: ${ticket_id} is assigned to ${owner.assignee}, not ${agent_id}. ` +
+      `An agent may only report completion for its OWN ticket — closing someone else's ` +
+      `would mark work done that you did not do.`
+    );
+  } else if (!agent_id) {
+    console.warn(`[report_completion] ownership_unverified — no agent_id supplied for ${ticket_id} (assignee ${owner.assignee || "none"}); cannot verify the caller`);
+  }
+
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -129,6 +201,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     commit_sha: commit_sha || null,
     pr_url: pr_url || null,
     completed_at: new Date().toISOString(),
+    // Server-stamped, LAST, so a caller-supplied `source` cannot survive (F18).
+    source: "agent",
+    reported_by: agent_id || null,
   };
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,

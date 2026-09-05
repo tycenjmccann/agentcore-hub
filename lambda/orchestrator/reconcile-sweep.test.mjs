@@ -97,7 +97,13 @@ function makeSweep(overrides = {}) {
     getChildTickets,
     leaseTtlMs: overrides.leaseTtlMs !== undefined ? overrides.leaseTtlMs : TTL_MS,
     now: overrides.now || (() => NOW),
-    log: () => {},
+    log: overrides.log || (() => {}),
+    // TEAM-3991 D2.3 — the ready-SLA floor and the two extra sweep steps. Left
+    // undefined by default so every pre-D2.3 test still exercises the env/default
+    // path and the extra steps stay off.
+    readySlaMs: overrides.readySlaMs,
+    gateBypassRecheck: overrides.gateBypassRecheck,
+    retryEpicRollup: overrides.retryEpicRollup,
   });
   return { ...sweep, ddb, getChildTickets, cascade, publishEvent, lease, redispatch, reawakenGate,
     store: overrides.store, blockTicket: overrides.blockTicket };
@@ -717,5 +723,328 @@ describe("TEAM-3973 — an escalated ticket is HELD for the human in every statu
 
     expect(m.escalationHeld).toBe(0);
     expect(m.escalated).toBe(1); // second death → escalate, unchanged (TEAM-3969)
+  });
+});
+
+/**
+ * TEAM-3991 D2.3 — the split floor, mandatory skip reasons, and the two extra
+ * sweep steps.
+ *
+ * Prod shape driving this (sffzti TEAM-3970): the ticket sat READY and
+ * un-dispatched from 20:56Z. Nothing was holding a claim on it — there was no
+ * claim — but the sweep held it to the in_progress STEAL floor (the 30-minute
+ * lease TTL), so the first sweep allowed to touch it ran at 21:26Z. Half an hour
+ * of dead air on a ticket that only ever needed a dispatch. The steal floor itself
+ * is correct and must not move: stealing a claim needs proof the session is dead.
+ */
+describe("D2.3 — the ready SLA is split from the steal floor", () => {
+  const T = "TEAM-3970";
+  const PARKED_AT = "2026-09-01T20:56:00Z";
+  const at = (iso) => Date.parse(iso);
+
+  /** The prod shape: blockers all done, no claim, just never dispatched. */
+  const readySiblings = (status = "ready", extra = {}) => [
+    { ticketId: DONE, status: "done", type: "task" },
+    { ticketId: T, status, assignee: "dev", type: "task", blockedBy: [DONE], updatedAt: PARKED_AT, ...extra },
+  ];
+
+  const readyWorkflow = () => ({
+    id: "wf_sffzti", workflowId: "wf_sffzti", epicId: PARENT, phase: "development",
+    updatedAt: PARKED_AT, agentTasks: {},
+  });
+
+  it("sffzti TEAM-3970: one minute after parking it is too recent to touch", async () => {
+    const s = makeSweep({
+      workflows: [readyWorkflow()], siblings: readySiblings(), now: () => at("2026-09-01T20:57:00Z"),
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(0);
+    expect(m.skipped.parked_too_recently).toBe(1);
+    expect(s.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("sffzti TEAM-3970: EIGHT minutes later the same sweep dispatches it (old floor: 30 min)", async () => {
+    const s = makeSweep({
+      workflows: [readyWorkflow()], siblings: readySiblings(), now: () => at("2026-09-01T21:04:00Z"),
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(m.redispatched).toBe(1);
+    expect(m.acted).toBe(1);
+    expect(m.skipped.parked_too_recently).toBe(0);
+    expect(s.redispatch).toHaveBeenCalledTimes(1);
+    expect(s.redispatch.mock.calls[0][1].ticketId).toBe(T);
+    // No claim existed, so nothing was stolen — this is a missed DISPATCH.
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+  });
+
+  it("the 2-minute floor applies to todo and blocked-with-satisfied-blockers too", async () => {
+    for (const status of ["todo", "blocked"]) {
+      const s = makeSweep({
+        workflows: [readyWorkflow()], siblings: readySiblings(status), now: () => at("2026-09-01T21:04:00Z"),
+      });
+      const m = await s.runSweep("enforce");
+      expect(m.redispatched, status).toBe(1);
+    }
+  });
+
+  it("the in_progress STEAL floor is UNCHANGED at the lease TTL — 8 minutes is still too soon", async () => {
+    const s = makeSweep({
+      workflows: [readyWorkflow()], siblings: readySiblings("in_progress"), now: () => at("2026-09-01T21:04:00Z"),
+    });
+
+    const m = await s.runSweep("enforce");
+
+    // 8 min < 30 min TTL → the steal candidate is held back exactly as before.
+    expect(m.candidates).toBe(0);
+    expect(m.skipped.parked_too_recently).toBe(1);
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    // ... and it becomes eligible only once past the TTL.
+    const later = makeSweep({
+      workflows: [readyWorkflow()], siblings: readySiblings("in_progress"), now: () => at("2026-09-01T21:27:00Z"),
+    });
+    expect((await later.runSweep("enforce")).candidates).toBe(1);
+    expect(later.lease.stealClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it("a LIVE lease is a lease_live skip, never a steal (R3 unchanged)", async () => {
+    const s = makeSweep({
+      workflows: [readyWorkflow()],
+      siblings: readySiblings("in_progress", { updatedAt: STALE_STARTED }),
+      lease: { isLeaseLive: vi.fn(() => true) },
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(m.skipped.lease_live).toBe(1);
+    expect(m.acted).toBe(0);
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    expect(s.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("RECONCILE_READY_SLA_MS overrides the default, and a factory opt overrides the env", async () => {
+    const saved = process.env.RECONCILE_READY_SLA_MS;
+    try {
+      // 1 hour via env → the 8-minutes-parked ticket is NOT yet eligible.
+      process.env.RECONCILE_READY_SLA_MS = String(60 * 60 * 1000);
+      const envSweep = makeSweep({
+        workflows: [readyWorkflow()], siblings: readySiblings(), now: () => at("2026-09-01T21:04:00Z"),
+      });
+      expect(envSweep.readySlaMs).toBe(60 * 60 * 1000);
+      expect((await envSweep.runSweep("enforce")).skipped.parked_too_recently).toBe(1);
+
+      // An explicit factory opt wins over the env var.
+      const optSweep = makeSweep({
+        workflows: [readyWorkflow()], siblings: readySiblings(),
+        now: () => at("2026-09-01T21:04:00Z"), readySlaMs: 60 * 1000,
+      });
+      expect(optSweep.readySlaMs).toBe(60 * 1000);
+      expect((await optSweep.runSweep("enforce")).redispatched).toBe(1);
+    } finally {
+      if (saved === undefined) delete process.env.RECONCILE_READY_SLA_MS;
+      else process.env.RECONCILE_READY_SLA_MS = saved;
+    }
+  });
+
+  it("defaults to two minutes when neither the env var nor the opt is set", async () => {
+    const saved = process.env.RECONCILE_READY_SLA_MS;
+    delete process.env.RECONCILE_READY_SLA_MS;
+    try {
+      expect(makeSweep({}).readySlaMs).toBe(120000);
+    } finally {
+      if (saved !== undefined) process.env.RECONCILE_READY_SLA_MS = saved;
+    }
+  });
+});
+
+describe("D2.3 — every scanned ticket yields an action or a NAMED reason", () => {
+  const at = (iso) => Date.parse(iso);
+  const NOW_LATE = at("2026-09-01T21:04:00Z");
+
+  // Seven tickets, one per skip reason the scan itself can produce, none of which
+  // the sweep should act on.
+  const MIXED = [
+    { ticketId: DONE, status: "done", type: "task" },                                                     // terminal
+    { ticketId: "EPIC-1", status: "in_progress", assignee: "pm", type: "epic" },                          // epic
+    { ticketId: "TEAM-A", status: "ready", type: "task", updatedAt: STALE_STARTED },                       // no_assignee
+    { ticketId: "TEAM-B", status: "cancelled", assignee: "dev", type: "task" },                            // terminal
+    { ticketId: "TEAM-C", status: "ready", assignee: "human:lead@example.com", type: "task", updatedAt: STALE_STARTED }, // human_assigned
+    { ticketId: "TEAM-D", status: "ready", assignee: "dev", type: "task", blockedBy: ["TEAM-OPEN"], updatedAt: STALE_STARTED }, // blockers_pending
+    { ticketId: "TEAM-OPEN", status: "in_progress", assignee: "dev", type: "task", updatedAt: "2026-09-01T21:03:00Z" }, // parked_too_recently
+    { ticketId: "TEAM-E", status: "ready", assignee: "dev", type: "task", updatedAt: "2026-09-01T21:03:30Z" }, // parked_too_recently
+  ];
+
+  it("a sweep that acts on nothing still reports sum(skipped) === scanned", async () => {
+    const s = makeSweep({
+      workflows: [workflow({ agentTasks: {} })], siblings: MIXED, now: () => NOW_LATE,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.acted).toBe(0);
+    const sum = Object.values(m.skipped).reduce((a, b) => a + b, 0);
+    expect(sum).toBe(m.scanned);
+    expect(m.scanned).toBe(MIXED.length);
+  });
+
+  it("names each reason exactly, including human_assigned", async () => {
+    const s = makeSweep({
+      workflows: [workflow({ agentTasks: {} })], siblings: MIXED, now: () => NOW_LATE,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.skipped.epic).toBe(1);
+    expect(m.skipped.no_assignee).toBe(1);
+    expect(m.skipped.terminal).toBe(2);
+    expect(m.skipped.human_assigned).toBe(1);
+    expect(m.skipped.blockers_pending).toBe(1);
+    expect(m.skipped.parked_too_recently).toBe(2);
+    // A human's ticket is never handed to an agent by a sweep.
+    expect(s.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("logs one structured reconcile.skip record per skipped ticket", async () => {
+    const records = [];
+    const s = makeSweep({
+      workflows: [workflow({ agentTasks: {} })], siblings: MIXED, now: () => NOW_LATE,
+      log: (msg) => { if (typeof msg === "object" && msg.type === "reconcile.skip") records.push(msg); },
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(records).toHaveLength(m.scanned);
+    expect(records.every((r) => r.workflowId === "wf_1" && r.ticketId && r.reason)).toBe(true);
+    expect(records.map((r) => r.reason)).toContain("human_assigned");
+  });
+
+  it("emits a ReconcileSkipped_<reason> count for EVERY reason, zeros included", async () => {
+    const cap = captureMetrics();
+    try {
+      const s = makeSweep({
+        workflows: [workflow({ agentTasks: {} })], siblings: MIXED, now: () => NOW_LATE, log: () => {},
+      });
+      await s.runSweep("enforce");
+      const rec = cap.records().at(-1);
+      expect(rec.ReconcileSkipped_human_assigned).toBe(1);
+      expect(rec.ReconcileSkipped_parked_too_recently).toBe(2);
+      expect(rec.ReconcileSkipped_escalation_held).toBe(0);
+      // Reserved-but-unused reasons are still emitted, so adding the detector
+      // later is not a metric migration.
+      expect(rec.ReconcileSkipped_runtime_outage).toBe(0);
+      expect(rec.ReconcileSweepScanned).toBe(MIXED.length);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it("an in_review gate the cascade leaves alone is counted as in_review, not silence", async () => {
+    const s = makeSweep({
+      workflows: [workflow({ agentTasks: {} })],
+      siblings: [
+        { ticketId: DONE, status: "done", type: "task" },
+        { ticketId: "TEAM-G", status: "in_review", assignee: "reviewer", type: "task", blockedBy: [DONE], updatedAt: STALE_STARTED },
+      ],
+      // reawakenGate declining ⇒ the cascade's "review-noop" ⇒ reason in_review.
+      reawakenGate: vi.fn(async () => false),
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(m.skipped.in_review + m.skipped.escalation_held).toBe(1);
+    expect(m.acted).toBe(0);
+  });
+});
+
+describe("D2.3 — the two extra sweep steps", () => {
+  const at = (iso) => Date.parse(iso);
+  const NOW_LATE = at("2026-09-01T21:04:00Z");
+
+  it("re-runs a DEFERRED gate-bypass check once its grace has elapsed", async () => {
+    const gateBypassRecheck = vi.fn(async () => ({ flagged: true }));
+    const s = makeSweep({
+      workflows: [workflow({
+        agentTasks: {
+          "TEAM-DUE": { ticketId: "TEAM-DUE", gateBypassCheckAt: "2026-09-01T21:00:00Z" },   // due
+          "TEAM-LATER": { ticketId: "TEAM-LATER", gateBypassCheckAt: "2026-09-01T23:00:00Z" }, // not yet
+          "TEAM-NONE": { ticketId: "TEAM-NONE", status: "done" },                              // never deferred
+        },
+      })],
+      siblings: [], now: () => NOW_LATE, gateBypassRecheck,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(gateBypassRecheck).toHaveBeenCalledTimes(1);
+    expect(gateBypassRecheck.mock.calls[0][1]).toBe("TEAM-DUE");
+    expect(m.bypassRechecked).toBe(1);
+  });
+
+  it("shadow mode re-checks nothing (zero writes) and a throwing re-check cannot kill the sweep", async () => {
+    const tasks = { "TEAM-DUE": { gateBypassCheckAt: "2026-09-01T21:00:00Z" } };
+    const shadow = makeSweep({
+      workflows: [workflow({ agentTasks: tasks })], siblings: [], now: () => NOW_LATE,
+      gateBypassRecheck: vi.fn(async () => {}),
+    });
+    await shadow.runSweep("shadow");
+    expect(shadow.cascade).toBeTruthy();
+
+    const boom = vi.fn(async () => { throw new Error("github 502"); });
+    const s = makeSweep({
+      workflows: [workflow({ agentTasks: tasks })], siblings: [], now: () => NOW_LATE, gateBypassRecheck: boom,
+    });
+    const m = await s.runSweep("enforce");
+    expect(boom).toHaveBeenCalledTimes(1);
+    expect(m.bypassRechecked).toBe(0);
+    expect(m.candidateErrors).toBe(1);
+  });
+
+  it("retries an outstanding epic roll-up found by its OWN scan (complete runs are invisible to the main scan)", async () => {
+    const pendingRun = {
+      id: "wf_rollup", workflowId: "wf_rollup", epicId: "EPIC-9",
+      phase: "complete", epicRollupPending: true, agentTasks: {},
+    };
+    // Two scans, two filters — the open-workflow scan must not see the complete
+    // run, and the rollup scan must not see the open one.
+    const ddb = {
+      send: vi.fn(async (cmd) => {
+        if (cmd.constructor.name !== "ScanCommand") return {};
+        return String(cmd.input.FilterExpression).includes("epicRollupPending")
+          ? { Items: [pendingRun] }
+          : { Items: [workflow({ agentTasks: {} })] };
+      }),
+    };
+    const retryEpicRollup = vi.fn(async () => ({ claimed: true, ok: true, attempts: 1 }));
+
+    const s = makeSweep({ ddb, siblings: [], now: () => NOW_LATE, retryEpicRollup });
+    const m = await s.runSweep("enforce");
+
+    expect(retryEpicRollup).toHaveBeenCalledTimes(1);
+    expect(retryEpicRollup.mock.calls[0][0].id).toBe("wf_rollup");
+    expect(m.rollupsRetried).toBe(1);
+    expect(m.rollupsRecovered).toBe(1);
+  });
+
+  it("a roll-up whose claim was lost counts as retried but NOT recovered, and shadow retries nothing", async () => {
+    const pendingRun = { id: "wf_rollup", epicId: "EPIC-9", phase: "complete", epicRollupPending: true, agentTasks: {} };
+    const ddb = {
+      send: vi.fn(async (cmd) => (cmd.constructor.name === "ScanCommand"
+        ? { Items: String(cmd.input.FilterExpression).includes("epicRollupPending") ? [pendingRun] : [] }
+        : {})),
+    };
+    const lost = vi.fn(async () => ({ claimed: false, ok: false, reason: "claim_lost" }));
+    const m = await makeSweep({ ddb, siblings: [], retryEpicRollup: lost }).runSweep("enforce");
+    expect(m.rollupsRetried).toBe(1);
+    expect(m.rollupsRecovered).toBe(0);
+
+    const shadowDep = vi.fn(async () => ({ ok: true }));
+    await makeSweep({ ddb, siblings: [], retryEpicRollup: shadowDep }).runSweep("shadow");
+    expect(shadowDep).not.toHaveBeenCalled();
   });
 });

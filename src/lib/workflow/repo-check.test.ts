@@ -6,6 +6,9 @@ import {
   definitiveFailures,
   describeRepoCheckFailure,
   formatRepoCheckWarning,
+  classifyProtection,
+  checkBranchProtection,
+  PROTECTION_REQUIREMENTS,
 } from "./repo-check";
 
 /**
@@ -132,5 +135,84 @@ describe("checkRepoConfig / helpers", () => {
     expect(w).toMatch(/NOT a coding-runtime outage/);
     expect(w).toMatch(/https:\/\/github.com\/tycenjmccann\/agentcore-hub/);
     expect(w).toMatch(/STOP\. Block your ticket/);
+  });
+});
+
+/**
+ * TEAM-3991 D1.1: the same branch-protection preflight the orchestrator runs
+ * (lambda/orchestrator/repo-check.mjs). classifyProtection parity with the .mjs
+ * copy is pinned separately by repo-check-parity.test.ts; these pin the
+ * behaviour both copies must have — in particular that an unreadable answer
+ * (403/timeout) is never reported as "not protected", because that would put a
+ * false "your default branch is wide open" warning on every run.
+ */
+const FULL_PROTECTION = {
+  required_pull_request_reviews: { required_approving_review_count: 1 },
+  enforce_admins: { enabled: true },
+  allow_force_pushes: { enabled: false },
+};
+
+describe("classifyProtection", () => {
+  it("protection 200, fully configured → protected via source 'protection'", () => {
+    expect(classifyProtection({ protectionStatus: 200, protectionJson: FULL_PROTECTION })).toEqual({
+      protected: true,
+      requiresPr: true,
+      requiredApprovals: 1,
+      enforceAdmins: true,
+      source: "protection",
+      missing: [],
+    });
+  });
+
+  it("PR required but zero approvals → not protected", () => {
+    const r = classifyProtection({
+      protectionStatus: 200,
+      protectionJson: { required_pull_request_reviews: { required_approving_review_count: 0 } },
+    });
+    expect(r.protected).toBe(false);
+    expect(r.missing).toEqual(["required_approvals", "enforce_admins", "block_force_push"]);
+  });
+
+  it("rulesets fallback: 404 protection + a pull_request rule → source 'rules'", () => {
+    const r = classifyProtection({
+      protectionStatus: 404,
+      rulesStatus: 200,
+      rulesJson: [{ type: "pull_request", parameters: { required_approving_review_count: 1 } }, { type: "non_fast_forward" }, { type: "deletion" }],
+    });
+    expect(r).toMatchObject({ source: "rules", protected: true, requiredApprovals: 1, missing: ["enforce_admins"] });
+  });
+
+  it("empty rules array → 'none' with every requirement missing; 403s → 'unreadable'", () => {
+    expect(classifyProtection({ protectionStatus: 404, rulesStatus: 200, rulesJson: [] })).toMatchObject({
+      source: "none",
+      protected: false,
+      missing: [...PROTECTION_REQUIREMENTS],
+    });
+    expect(classifyProtection({ protectionStatus: 403, rulesStatus: 403 })).toMatchObject({ source: "unreadable", protected: false });
+  });
+});
+
+describe("checkBranchProtection", () => {
+  const target = { owner: "tycenjmccann", repo: "agentcore-hub", branch: "main" };
+
+  it("prefers classic protection and skips the rules call", async () => {
+    const calls: string[] = [];
+    const r = await checkBranchProtection(target, {
+      token: "t",
+      fetchImpl: fakeFetch({ "/branches/main/protection": { status: 200, json: FULL_PROTECTION } }, calls),
+    });
+    expect(r).toMatchObject({ source: "protection", protected: true, protectionStatus: 200, rulesStatus: null });
+    expect(calls.length).toBe(1);
+  });
+
+  it("never throws: a dead fetch is 'unreadable', not 'unprotected'", async () => {
+    const r = await checkBranchProtection(target, { token: "t", fetchImpl: (async () => { throw new Error("ETIMEDOUT"); }) as unknown as typeof fetch });
+    expect(r).toMatchObject({ source: "unreadable", protected: false, error: "ETIMEDOUT" });
+  });
+
+  it("encodes every path segment", async () => {
+    const calls: string[] = [];
+    await checkBranchProtection({ owner: "own er", repo: "re/po", branch: "feature/x..y" }, { token: "t", fetchImpl: fakeFetch({}, calls) });
+    expect(calls[0]).toContain("/repos/own%20er/re%2Fpo/branches/feature%2Fx..y/protection");
   });
 });

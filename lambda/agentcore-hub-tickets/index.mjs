@@ -253,6 +253,8 @@ export const handler = async (event) => {
 // completion.mjs's FIX_KINDS and index.mjs:816's review_fix shape.
 const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
 const SPAWN_ORIGIN_KEYS = ["gateTicketId", "qaTicketId", "codexTicketId"];
+// TEAM-3991 D2.2 — non-origin provenance fields (never used to resolve an edge).
+const SPAWN_META_KEYS = ["by", "findingId"];
 
 /**
  * Normalize an agent-supplied `spawned_by` marker. Returns { value } for a clean
@@ -273,7 +275,56 @@ function sanitizeSpawnedBy(raw) {
   for (const k of SPAWN_ORIGIN_KEYS) {
     if (typeof raw[k] === "string" && raw[k]) value[k] = raw[k];
   }
+  // TEAM-3991 D2.2 — allowlist extension only: `by` (which agent filed the fix)
+  // and `findingId` (which finding it answers) so the parked→fix edge and the
+  // metrics bucketing can attribute a fix without parsing its title.
+  for (const k of SPAWN_META_KEYS) {
+    if (typeof raw[k] === "string" && raw[k]) value[k] = raw[k];
+  }
   return { value };
+}
+
+/**
+ * Make the ORIGIN ticket blockedBy the fix ticket that answers it.
+ *
+ * Best-effort and idempotent: the condition refuses when the edge already exists
+ * (a retried create) or when the origin is already closed (nothing to gate), and
+ * a ConditionalCheckFailed is a no-op, never an error — a create must not fail
+ * because its edge was redundant.
+ */
+async function linkFixToOrigin(fixTicketId, spawnedBy, nowIso) {
+  const originId = spawnedBy
+    ? SPAWN_ORIGIN_KEYS.map((k) => spawnedBy[k]).find((v) => typeof v === "string" && v)
+    : null;
+  if (!originId || originId === fixTicketId) return false;
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { ticketId: originId },
+      UpdateExpression:
+        "SET blockedBy = list_append(if_not_exists(blockedBy, :empty), :fixList), updatedAt = :now",
+      ConditionExpression:
+        "(attribute_not_exists(blockedBy) OR NOT contains(blockedBy, :fixId)) AND #s <> :done AND #s <> :cancelled",
+      ExpressionAttributeNames: { "#s": "status" },
+      ExpressionAttributeValues: {
+        ":empty": [],
+        ":fixList": [fixTicketId],
+        ":fixId": fixTicketId,
+        ":now": nowIso,
+        ":done": "done",
+        ":cancelled": "cancelled",
+      },
+    }));
+    console.log(`[tickets] ${originId} now blockedBy ${fixTicketId} (${spawnedBy.kind})`);
+    return true;
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") {
+      console.log(`[tickets] ${originId} blockedBy ${fixTicketId} skipped (already linked or origin closed)`);
+      return false;
+    }
+    console.warn(`[tickets] blockedBy edge ${originId} → ${fixTicketId} failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
 }
 
 async function createTicket(args) {
@@ -345,6 +396,14 @@ async function createTicket(args) {
   };
 
   await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
+
+  // TEAM-3991 D2.2 — the parked→fix edge. A QA/review/codex fix ticket answers an
+  // ORIGIN ticket (the gate or the verification ticket that filed it), and until
+  // that origin actually blocks on the fix, the board shows an origin that looks
+  // dispatchable while its fix is still open — so the reconcile sweep re-drives
+  // the origin and the agent re-investigates a finding it already answered
+  // (prod 1pl3h1: TEAM-3727 re-dispatched twice with TEAM-3737 open).
+  await linkFixToOrigin(ticketId, spawn.value, now);
 
   return {
     key: ticketId,

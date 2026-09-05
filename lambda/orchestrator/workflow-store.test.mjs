@@ -22,7 +22,15 @@ import {
   appendReviewRound,
   appendReviewCapEscalation,
   appendReviewAuthorization,
+  // TEAM-3991 D1 foundation
+  appendGateDecision,
+  appendNotificationOnce,
+  clearEpicRollupPending,
+  mergeTaskMetadataOrTrack,
+  parkClaim,
+  setProtectionCheck,
 } from "./workflow-store.mjs";
+import { isLeaseLive } from "./lease.mjs";
 
 /**
  * R2 (docs/race-condition-study.md): every store op must be a SCOPED
@@ -128,6 +136,23 @@ describe("claimInvocation", () => {
     expect(claim.input.ExpressionAttributeValues[":task"].status).toBe("running");
   });
 
+  it("can NEVER re-claim a ticket flagged for merge-gate bypass (TEAM-3991 SECURITY F8)", async () => {
+    // A claim REPLACES the whole entry, so re-dispatching a flagged ticket would
+    // erase gateBypassFlaggedAt AND the branch/commit/prUrl evidence the human
+    // needs. The veto is ANDed onto the WHOLE stale/free disjunction — without
+    // the parentheses a stale claim would still satisfy the condition.
+    await claimInvocation("wf_1", "TEAM-2", entry, "2026-08-29T23:00:00Z");
+    const claim = writes().find((c) => c.input.ConditionExpression?.includes(":running"));
+    expect(claim.input.ConditionExpression).toContain(
+      "attribute_not_exists(agentTasks.#tid.gateBypassFlaggedAt)"
+    );
+    const [alternatives, veto] = claim.input.ConditionExpression.split(" AND ");
+    expect(alternatives.startsWith("(")).toBe(true);
+    expect(alternatives.endsWith(")")).toBe(true);
+    expect(alternatives).toContain(" OR ");
+    expect(veto).toBe("attribute_not_exists(agentTasks.#tid.gateBypassFlaggedAt)");
+  });
+
   it("loses to a live concurrent claim", async () => {
     failNextCondition = true;
     // first send is the ensure-map write (no condition) — make the claim fail
@@ -169,8 +194,97 @@ describe("mergeTaskMetadata", () => {
 
   it("drops metadata for an untracked entry instead of materializing one", async () => {
     failNextCondition = true;
-    await mergeTaskMetadata("wf_1", "TEAM-99", { branch: "b" });
-    // no throw = dropped
+    expect(await mergeTaskMetadata("wf_1", "TEAM-99", { branch: "b" })).toBe(false);
+    // no throw = dropped; the false return is what mergeTaskMetadataOrTrack acts on
+  });
+
+  it("reports true on a landed merge and false when there is nothing to set", async () => {
+    expect(await mergeTaskMetadata("wf_1", "TEAM-2", { branch: "b" })).toBe(true);
+    sent.length = 0;
+    expect(await mergeTaskMetadata("wf_1", "TEAM-2", { branch: undefined, prUrl: null })).toBe(false);
+    expect(writes()).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-3991 D1.2 — synthesized/manager evidence must survive a ticket whose
+ * agent died before any claim landed, i.e. one with NO agentTasks entry. Plain
+ * mergeTaskMetadata drops there (by design, for the harvest paths); dropping
+ * synthesized evidence is exactly the stranded-run bug this closes.
+ */
+describe("mergeTaskMetadataOrTrack", () => {
+  it("merges directly when the entry exists (no seeding write)", async () => {
+    expect(await mergeTaskMetadataOrTrack("wf_1", "TEAM-2", { output: "[synthesized] x" })).toBe(true);
+    expect(writes()).toHaveLength(1);
+    expect(writes()[0].input.UpdateExpression).toMatch(/agentTasks\.#tid\.#f1 = :v1/);
+  });
+
+  it("creates the entry via the first-writer-wins track, then re-merges the fields", async () => {
+    // First merge loses the attribute_exists condition (untracked), the seed is
+    // written under attribute_not_exists, then the fields land.
+    failNextCondition = true;
+    const ok = await mergeTaskMetadataOrTrack(
+      "wf_1",
+      "TEAM-99",
+      { output: "[synthesized] fix pushed", evidenceSource: "synthesized" },
+      { agentId: "agentcore_hub_backend_dev" }
+    );
+    expect(ok).toBe(true);
+    const seed = writes().find((c) => c.input.ConditionExpression === "attribute_not_exists(agentTasks.#tid)");
+    expect(seed.input.ExpressionAttributeValues[":task"]).toMatchObject({
+      ticketId: "TEAM-99",
+      status: "pending",
+      agentId: "agentcore_hub_backend_dev",
+    });
+    // The retry is a per-field merge, never a whole-entry replacement.
+    const retry = writes()[writes().length - 1];
+    expect(retry.input.UpdateExpression).toMatch(/agentTasks\.#tid\.#f1 = :v1/);
+    expect(retry.input.ConditionExpression).toBe("attribute_exists(agentTasks.#tid)");
+  });
+
+  it("never seeds an entry when there are no fields to write", async () => {
+    expect(await mergeTaskMetadataOrTrack("wf_1", "TEAM-99", { output: undefined })).toBe(false);
+    expect(writes()).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-3991 D2.2 — a blocked ticket's live claim is PARKED, not left running.
+ * "parked" is deliberately absent from lease-constants liveClaimStatuses, so the
+ * claim stops holding the lease and the sweep can re-drive the ticket once its
+ * blockers clear — no dead-session declaration needed.
+ */
+describe("parkClaim", () => {
+  it("parks only the exact claim generation, and only from a live status", async () => {
+    const won = await parkClaim("wf_1", "TEAM-2", "2026-08-30T00:00:00Z");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("SET agentTasks.#tid.#st = :parked");
+    expect(w.input.ConditionExpression).toBe(
+      "(agentTasks.#tid.#st = :running OR agentTasks.#tid.#st = :inprog) AND agentTasks.#tid.startedAt = :expected"
+    );
+    expect(w.input.ExpressionAttributeValues[":expected"]).toBe("2026-08-30T00:00:00Z");
+    expect(w.input.ExpressionAttributeValues[":parked"]).toBe("parked");
+  });
+
+  it("falls back to attribute_not_exists(startedAt) for a legacy claim (no dangling :expected)", async () => {
+    expect(await parkClaim("wf_1", "TEAM-2", undefined)).toBe(true);
+    const w = writes()[0];
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(agentTasks.#tid.startedAt)");
+    expect(w.input.ConditionExpression).not.toContain(":expected");
+    expect(w.input.ExpressionAttributeValues).not.toHaveProperty(":expected");
+  });
+
+  it("returns false when the claim already moved on (completed / re-claimed / stolen)", async () => {
+    failNextCondition = true;
+    expect(await parkClaim("wf_1", "TEAM-2", "x")).toBe(false);
+  });
+
+  it("a parked claim does not hold the lease (liveClaimStatuses pin)", async () => {
+    const now = Date.parse("2026-09-01T12:00:00Z");
+    const startedAt = "2026-09-01T11:59:00Z"; // one minute ago — well inside any TTL
+    expect(isLeaseLive({ status: "running", startedAt }, null, now)).toBe(true);
+    expect(isLeaseLive({ status: "parked", startedAt }, null, now)).toBe(false);
   });
 });
 
@@ -490,6 +604,45 @@ describe("completeWorkflow", () => {
     failNextCondition = true;
     expect(await completeWorkflow("wf_1", "x")).toBe(false);
   });
+
+  it("stamps epicRollupPending in the SAME CAS as the terminal claim (TEAM-3991 D1.4)", async () => {
+    // The roll-up obligation must be created atomically with the claim, so it
+    // belongs to exactly one invocation — the winner. A winner that dies before
+    // rolling the epic leaves the flag for the sweep; there is no window where
+    // the run is "complete" and nobody owns the roll-up.
+    await completeWorkflow("wf_1", "2026-08-30T00:00:00Z");
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe(
+      "SET phase = :complete, completedAt = :ts, epicRollupPending = :pending"
+    );
+    expect(w.input.ExpressionAttributeValues[":pending"]).toBe(true);
+    // …and the guard is unchanged by the extra SET.
+    expect(refusedPhases(w.input)).toEqual(ALL_TERMINAL_PHASES);
+    expect(w.input.ConditionExpression).toContain("attribute_not_exists(cancelledAt)");
+  });
+
+  it("the loser of the CAS stamps nothing at all (no orphan epicRollupPending)", async () => {
+    failNextCondition = true;
+    expect(await completeWorkflow("wf_1", "x")).toBe(false);
+    // One attempted write, and it was rejected wholesale — DynamoDB applies no
+    // partial update, so the flag cannot exist without a completion.
+    expect(writes()).toHaveLength(1);
+  });
+});
+
+describe("clearEpicRollupPending (TEAM-3991 D1.4)", () => {
+  it("REMOVEs the flag under attribute_exists, with no ExpressionAttributeValues", async () => {
+    expect(await clearEpicRollupPending("wf_1")).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("REMOVE epicRollupPending");
+    expect(w.input.ConditionExpression).toBe("attribute_exists(epicRollupPending)");
+    expect(w.input.ExpressionAttributeValues).toBeUndefined();
+  });
+
+  it("returns false when the flag is already gone (sweep retry racing the winner)", async () => {
+    failNextCondition = true;
+    expect(await clearEpicRollupPending("wf_1")).toBe(false);
+  });
 });
 
 /**
@@ -604,6 +757,191 @@ describe("review gate ledger (TEAM-3619 D2c)", () => {
     expect(writes()[2].input.UpdateExpression).toBe(
       "SET reviewGateHistory.#g.authorizations = list_append(if_not_exists(reviewGateHistory.#g.authorizations, :empty), :a)"
     );
+  });
+});
+
+/**
+ * TEAM-3991 D1.1 — the gate DECISION ledger is the authoritative record of merge
+ * authority. Gate-bypass detection compares merge timestamps against these rows,
+ * not against the gate ticket's board status, so the rows must be append-only
+ * (a console click and a Telegram reply landing together must both survive).
+ */
+describe("appendGateDecision", () => {
+  const decision = {
+    decision: "APPROVE",
+    decidedAt: "2026-09-05T10:00:00Z",
+    decidedBy: "someone@example.com",
+    source: "console",
+  };
+
+  it("seeds the gate ledger then list_appends the decision", async () => {
+    await appendGateDecision("wf_1", "TEAM-900", decision);
+    const w = writes();
+    expect(w[0].input.UpdateExpression).toContain("if_not_exists(reviewGateHistory, :empty)");
+    expect(w[1].input.UpdateExpression).toBe(
+      "SET reviewGateHistory.#g = if_not_exists(reviewGateHistory.#g, :seed)"
+    );
+    expect(w[2].input.UpdateExpression).toBe(
+      "SET reviewGateHistory.#g.decisions = list_append(if_not_exists(reviewGateHistory.#g.decisions, :empty), :d)"
+    );
+    expect(w[2].input.ExpressionAttributeNames["#g"]).toBe("TEAM-900");
+    expect(w[2].input.ExpressionAttributeValues[":d"]).toEqual([decision]);
+    expect(w[2].input.ReturnValues).toBe("ALL_NEW");
+  });
+
+  it("returns the POST-write decisions array so the caller sees a concurrent decision too", async () => {
+    const decisions = [decision, { ...decision, source: "telegram" }];
+    initWorkflowStore(
+      {
+        async send(cmd) {
+          sent.push({ type: cmd.constructor.name, input: cmd.input });
+          return cmd.input.ReturnValues === "ALL_NEW"
+            ? { Attributes: { workflowId: "wf_1", reviewGateHistory: { "TEAM-900": { decisions } } } }
+            : {};
+        },
+      },
+      "workflows-test"
+    );
+    expect(await appendGateDecision("wf_1", "TEAM-900", decision)).toEqual(decisions);
+  });
+
+  it("returns null when the row is gone rather than inventing an empty ledger", async () => {
+    // A caller must never read "no rows" out of a failed write and fall back to
+    // the legacy status heuristic — that would approve a bypass.
+    expect(await appendGateDecision("wf_1", "TEAM-900", decision)).toBeNull();
+  });
+});
+
+/**
+ * TEAM-3991 SECURITY F9 — one escalation per offending fact, forever. The
+ * in-memory `humanNotifications.some(...)` pre-check callers used before is not
+ * enough: two concurrent invocations both hold pre-append snapshots, so the
+ * dedupe has to ride the notifVersion CAS.
+ */
+describe("appendNotificationOnce", () => {
+  const notif = (id) => ({ id, type: "manager_escalation", title: "gate bypass", acknowledged: false });
+  const serveWorkflow = (item) => {
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      if (cmd.constructor.name === "GetCommand") return { Item: item };
+      return {};
+    };
+    return () => { stubDdb.send = origSend; };
+  };
+
+  it("appends under the notifVersion CAS when no open notification carries the id", async () => {
+    const restore = serveWorkflow({ workflowId: "wf_1", notifVersion: 2, humanNotifications: [] });
+    let appended;
+    try {
+      appended = await appendNotificationOnce("wf_1", notif("notif_gate_bypass_wf_1_abc123"));
+    } finally { restore(); }
+    expect(appended).toBe(true);
+    const w = sent.find((c) => c.type === "UpdateCommand");
+    expect(w.input.UpdateExpression).toBe("SET humanNotifications = :n, notifVersion = :next");
+    expect(w.input.ConditionExpression).toContain("notifVersion = :cur");
+    expect(w.input.ExpressionAttributeValues[":cur"]).toBe(2);
+    expect(w.input.ExpressionAttributeValues[":next"]).toBe(3);
+    expect(w.input.ExpressionAttributeValues[":n"]).toHaveLength(1);
+  });
+
+  it("is a no-op when an unacknowledged notification with the same id exists (no write)", async () => {
+    const restore = serveWorkflow({
+      workflowId: "wf_1",
+      notifVersion: 4,
+      humanNotifications: [notif("notif_gate_bypass_wf_1_abc123")],
+    });
+    let appended;
+    try {
+      appended = await appendNotificationOnce("wf_1", notif("notif_gate_bypass_wf_1_abc123"));
+    } finally { restore(); }
+    expect(appended).toBe(false);
+    expect(sent.filter((c) => c.type === "UpdateCommand")).toHaveLength(0);
+  });
+
+  it("still escalates a DIFFERENT offending merge commit (id is per mergeCommit)", async () => {
+    const restore = serveWorkflow({
+      workflowId: "wf_1",
+      notifVersion: 1,
+      humanNotifications: [notif("notif_gate_bypass_wf_1_abc123")],
+    });
+    let appended;
+    try {
+      appended = await appendNotificationOnce("wf_1", notif("notif_gate_bypass_wf_1_def456"));
+    } finally { restore(); }
+    expect(appended).toBe(true);
+    const w = sent.find((c) => c.type === "UpdateCommand");
+    expect(w.input.ExpressionAttributeValues[":n"]).toHaveLength(2);
+  });
+
+  it("re-notifies once the human acknowledged the previous one (recurrence)", async () => {
+    const restore = serveWorkflow({
+      workflowId: "wf_1",
+      notifVersion: 9,
+      humanNotifications: [{ ...notif("notif_epic_rollup_wf_1"), acknowledged: true }],
+    });
+    let appended;
+    try {
+      appended = await appendNotificationOnce("wf_1", notif("notif_epic_rollup_wf_1"));
+    } finally { restore(); }
+    expect(appended).toBe(true);
+    // History is retained — the append never rewrites the acked row away.
+    expect(sent.find((c) => c.type === "UpdateCommand").input.ExpressionAttributeValues[":n"]).toHaveLength(2);
+  });
+
+  it("honors a custom isDuplicate predicate", async () => {
+    const restore = serveWorkflow({
+      workflowId: "wf_1",
+      notifVersion: 0,
+      humanNotifications: [{ id: "other", type: "manager_escalation", mergeCommit: "abc123", acknowledged: false }],
+    });
+    let appended;
+    try {
+      appended = await appendNotificationOnce("wf_1", { ...notif("fresh"), mergeCommit: "abc123" }, {
+        isDuplicate: (n) => n.mergeCommit === "abc123" && !n.acknowledged,
+      });
+    } finally { restore(); }
+    expect(appended).toBe(false);
+  });
+
+  it("stands down on CAS loss when the re-read now shows a concurrent escalation", async () => {
+    let gets = 0, updates = 0;
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      if (cmd.constructor.name === "GetCommand") {
+        gets++;
+        return gets === 1
+          ? { Item: { workflowId: "wf_1", notifVersion: 5, humanNotifications: [] } }
+          : { Item: { workflowId: "wf_1", notifVersion: 6, humanNotifications: [notif("mine")] } };
+      }
+      updates++;
+      const err = new Error("cas"); err.name = "ConditionalCheckFailedException"; throw err;
+    };
+    let appended;
+    try {
+      appended = await appendNotificationOnce("wf_1", notif("mine"));
+    } finally { stubDdb.send = origSend; }
+    expect(appended).toBe(false);
+    expect(updates).toBe(1); // exactly one write attempt — never a duplicate escalation
+    expect(gets).toBe(2);
+  });
+
+  it("returns false when the workflow row is gone", async () => {
+    const restore = serveWorkflow(undefined);
+    try {
+      expect(await appendNotificationOnce("wf_1", notif("x"))).toBe(false);
+    } finally { restore(); }
+  });
+});
+
+describe("setProtectionCheck (branch-protection pre-flight)", () => {
+  it("is a scoped SET of the single branchProtectionCheck attribute — no full-row put", async () => {
+    const pc = { protected: false, requiresPr: false, requiredApprovals: 0, source: "none", missing: ["required_pull_request_reviews"] };
+    await setProtectionCheck("wf_1", pc);
+    expect(writes()).toHaveLength(1);
+    expect(writes()[0].input.UpdateExpression).toBe("SET branchProtectionCheck = :pc");
+    expect(writes()[0].input.ExpressionAttributeValues[":pc"]).toEqual(pc);
+    expect(writes()[0].input.Key).toEqual({ workflowId: "wf_1" });
   });
 });
 

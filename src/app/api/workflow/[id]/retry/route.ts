@@ -15,6 +15,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { JiraClient, mapJiraStatusToInternal } from "@/lib/workflow/jira-client";
 import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
+import { existingTicketPr, prExistsPayload, resumeNote, writeResumeContext } from "@/lib/workflow/pr-guard";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -146,6 +147,24 @@ async function retryDynamoDB(workflowId: string, agentId: string, agentTasks: Re
   return ticketId;
 }
 
+/**
+ * The ticket a retry would target: the agent's actively-running task. Same rule
+ * the two retry paths apply — read here so the PR guard can run BEFORE anything
+ * is stolen or transitioned.
+ */
+function activeTicketForAgent(
+  agentTasks: Record<string, Record<string, unknown>>,
+  agentId: string
+): string | undefined {
+  return Object.keys(agentTasks).find((key) => {
+    const t = agentTasks[key];
+    return (
+      (t.agentId === agentId || t.assignee === agentId) &&
+      (t.status === "running" || t.status === "in_progress")
+    );
+  });
+}
+
 // ─── Route Handler ──────────────────────────────────────────────────────────
 
 export async function POST(
@@ -153,7 +172,7 @@ export async function POST(
   { params }: { params: { id: string } }
 ) {
   const workflowId = params.id;
-  const { agentId, force } = await req.json();
+  const { agentId, force, resume } = await req.json();
 
   if (!agentId) {
     return NextResponse.json({ error: "agentId is required" }, { status: 400 });
@@ -172,6 +191,27 @@ export async function POST(
     const workflow = wfResult.Item;
     const ticketProvider = process.env.TICKET_PROVIDER || "dynamodb";
     const agentTasks = workflow.agentTasks || {};
+
+    // 1b. TEAM-3991 D1.5 — PR-aware guard. A retry restarts the agent from a
+    //     BLANK session, so if it already opened a PR for this ticket it will
+    //     re-investigate and re-implement work that is already on GitHub. Refuse
+    //     unless the caller says resume:true, and then hand the agent a resume
+    //     context instead of a cold start. Fails open (no repo/PAT/PR, or GitHub
+    //     unreachable ⇒ retry as before).
+    const targetTicket = activeTicketForAgent(agentTasks, agentId);
+    if (targetTicket && !String(agentTasks[targetTicket]?.assignee || "").startsWith("human:")) {
+      const pr = await existingTicketPr(workflow, targetTicket);
+      if (pr) {
+        if (resume !== true) {
+          return NextResponse.json(
+            { ...prExistsPayload(targetTicket, pr), agentId, error: prExistsPayload(targetTicket, pr).message },
+            { status: 409 }
+          );
+        }
+        await writeResumeContext(ddb, WORKFLOWS_TABLE, workflowId, targetTicket, resumeNote(targetTicket, pr));
+        console.log(`[retry] ${targetTicket}: resuming onto PR #${pr.number} (${pr.state})`);
+      }
+    }
 
     // 2. Execute retry based on TICKET_PROVIDER env var (set at deploy time)
     let ticketId: string;

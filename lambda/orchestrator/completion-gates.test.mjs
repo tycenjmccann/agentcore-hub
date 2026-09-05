@@ -85,6 +85,15 @@ const h = vi.hoisted(() => ({
     s3Objects: /** @type {Record<string, string>} */ ({}),
     s3Gets: /** @type {string[]} */ ([]),
     merges: /** @type {any[]} */ ([]),
+    // TEAM-3991 D1.4: cd-evidence listing (ListObjectsV2 Contents) + the ids of
+    // runs whose epicRollupPending was cleared. epicTransitionThrows makes the
+    // tickets-table Done write fail, which is how the roll-up failure path is
+    // driven on the dynamodb provider.
+    s3List: /** @type {any[]} */ ([]),
+    rollupCleared: /** @type {string[]} */ ([]),
+    epicTransitionThrows: false,
+    ticketUpdates: /** @type {any[]} */ ([]),
+    finalizationClaimWins: false,
   },
 }));
 
@@ -107,6 +116,15 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             h.state.queries += 1;
             return { Items: h.state.snapshots[i] || [] };
           }
+          if (name === "UpdateCommand") {
+            h.state.ticketUpdates.push(cmd.input);
+            // The epic roll-up's dynamodb path is a scoped Done write on the
+            // tickets table (transitionTicketToDone) — the only seam a test can
+            // fail to exercise rollUpEpic's retry budget.
+            if (h.state.epicTransitionThrows && cmd.input?.ExpressionAttributeValues?.[":s"] === "done") {
+              throw new Error("ConditionalCheckFailed: epic write rejected");
+            }
+          }
           return {}; // Put (events) / Update / Get — irrelevant here
         },
       }),
@@ -125,8 +143,22 @@ vi.mock("@aws-sdk/client-lambda", () => ({ LambdaClient: class {}, InvokeCommand
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
+      // TEAM-3991 D1.4: the cd-evidence listing. Contents are per-test
+      // (h.state.s3List); the file bodies come from s3Objects, keyed by S3 key.
+      if (cmd.constructor.name === "ListObjectsV2Command") {
+        return { Contents: h.state.s3List };
+      }
       const key = cmd?.input?.Key;
       h.state.s3Gets.push(key);
+      if (typeof key === "string" && key.includes("/cd-evidence/")) {
+        const raw = h.state.s3Objects[key];
+        if (raw === undefined) {
+          const e = new Error("The specified key does not exist.");
+          e.name = "NoSuchKey";
+          throw e;
+        }
+        return { Body: { transformToString: async () => raw } };
+      }
       if (typeof key === "string" && key.startsWith("completions/")) {
         // TEAM-3976: raw-string records (s3Objects) or object records
         // (s3Completions, TEAM-3985). Absent → the SDK's named NoSuchKey.
@@ -172,7 +204,9 @@ vi.mock("./workflow-store.mjs", () => ({
     h.state.storeCompletions.push({ id, ts });
     return true; // this caller wins the claim
   }),
-  claimFinalization: vi.fn(async () => false),
+  // Default false: the completion path's own finalization claim is not what these
+  // tests exercise. retryPendingEpicRollups (the D2.3 sweep entry point) flips it.
+  claimFinalization: vi.fn(async () => h.state.finalizationClaimWins),
   markFinalized: vi.fn(async (id) => { h.state.finalized.push(id); }),
   // TEAM-3747 D2 — closeWorkflowBlocked's atomic terminal claim. Without this the
   // ship gate would throw into its own catch and complete anyway, so its presence
@@ -190,6 +224,16 @@ vi.mock("./workflow-store.mjs", () => ({
     if (tasks) tasks[tid] = { ...(tasks[tid] || { ticketId: tid }), ...fields };
   }),
   appendNotification: vi.fn(async (id, n) => { h.state.notifications.push({ id, n }); }),
+  // TEAM-3991 D1.4 — the epic roll-up obligation created atomically with the
+  // terminal claim. finalizeWithEpicRollUp clears it on success and escalates
+  // once (appendNotificationOnce, id-idempotent) on failure.
+  clearEpicRollupPending: vi.fn(async (id) => { h.state.rollupCleared.push(id); }),
+  appendNotificationOnce: vi.fn(async (id, n) => {
+    if (h.state.notifications.some((x) => x.n?.id === n.id && !x.n?.acknowledged)) return false;
+    h.state.notifications.push({ id, n });
+    return true;
+  }),
+  ackNotifications: vi.fn(async () => 0),
 }));
 
 // Set before importing index.mjs: the roster/def loaders early-return to the
@@ -258,6 +302,13 @@ beforeEach(() => {
   h.state.merges.length = 0;
   h.state.s3Completions = {};
   h.state.notifications.length = 0;
+  h.state.s3List.length = 0;
+  h.state.rollupCleared.length = 0;
+  h.state.ticketUpdates.length = 0;
+  h.state.epicTransitionThrows = false;
+  h.state.finalizationClaimWins = false;
+  // No real sleeping in the roll-up retry budget.
+  process.env.EPIC_ROLLUP_BACKOFF_MS = "0";
   delete process.env.COMPLETION_EVIDENCE_REQUIRED;
 });
 
@@ -1119,4 +1170,199 @@ describe("completeWorkflow — an already-terminal run (fresh phase) is left alo
       error.mockRestore();
     });
   }
+});
+
+/**
+ * TEAM-3991 D1.4 — an honest terminal state, from the run's own evidence.
+ *
+ * Three production failures, one gate each:
+ *   - wf 1pl3h1 closed `complete` while escalation gate TEAM-3757 sat in_review
+ *     over unmerged PR #274, and its own "# PREFLIGHT BLOCKED" cd-evidence file
+ *     went unread. Two bugs: nobody read the file, and nobody checked the gate.
+ *   - wf sffzti merged 4 PRs and deployed, then closed `static-ci-only` — the CD
+ *     agent's evidence says "DEPLOY SUCCEEDED", a word no outcome list contained.
+ *   - wf 7ef4fp finished with its epic still open on the board: the roll-up was one
+ *     inline best-effort jiraTransition with no DynamoDB path and no retry.
+ *
+ * The epic roll-up is now an obligation created atomically with the terminal claim
+ * (store.completeWorkflow SETs epicRollupPending in the same CAS), discharged by
+ * exactly one owner, and retryable by the sweep if that owner dies.
+ */
+describe("completeWorkflow — open gate, CD evidence, atomic epic roll-up (TEAM-3991 D1.4)", () => {
+  const ESCALATION = {
+    ticketId: "TEAM-3757",
+    assignee: "human:reviewer@example.com",
+    type: "task",
+    status: "in_review",
+    title: "Escalation #1: ship-review not converging",
+    phase: "ship",
+  };
+  const GATE_DONE = {
+    ticketId: "TEAM-900",
+    assignee: "human:reviewer@example.com",
+    type: "task",
+    status: "done",
+    title: "Merge Approval",
+    // Deliberately no `phase`: a human gate is not an agent deliverable, so it owes
+    // no evidence — stamping phase:"ship" on it would make the F3 gate demand one.
+  };
+  const CD_KEY = "workflows/wf_1/shared/cd-evidence/deploy-20260905T0100Z.md";
+
+  // The cd-evidence harvest is gated on ARTIFACT_BUCKET, read at module load —
+  // and the suites above delete it in their afterEach, so re-assert it here.
+  beforeEach(() => { process.env.ARTIFACT_BUCKET = "test-bucket"; });
+
+  /** The release manager's own deploy note, where it really lands. */
+  function seedCdEvidence(body, key = CD_KEY) {
+    h.state.s3List = [{ Key: key, LastModified: "2026-09-05T01:00:00Z" }];
+    h.state.s3Objects[key] = body;
+  }
+
+  it("1pl3h1: PREFLIGHT BLOCKED evidence + an escalation in_review → blocked close that NAMES the gate", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [[...SHIP_DONE, ESCALATION]];
+    h.state.freshWorkflow = shipTasks({}); // done CD ticket, evidence present, NO outcome
+    seedCdEvidence("# PREFLIGHT BLOCKED: PR #274 is not merged into main\n\nrefusing to deploy\n");
+    await loadWithShipDef();
+    const wf = { ...WF };
+    await completeWorkflow(wf);
+
+    // The file the agent wrote was read and stamped onto the CD ticket…
+    expect(
+      h.state.merges.some(
+        (m) => m.tid === "T-4" && m.fields.outcome === "deploy-blocked" && m.fields.evidenceKey === CD_KEY
+      )
+    ).toBe(true);
+    // …so the ladder had a verdict, and the close is blocked — never green.
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(ebEventsOfType("workflow.complete")).toHaveLength(0);
+    expect(h.state.terminalClaims).toHaveLength(1);
+    expect(h.state.terminalClaims[0].outcome).toBe("deploy-blocked");
+    expect(h.state.terminalClaims[0].reason).toContain("PR #274 is not merged");
+
+    const events = ebEventsOfType("workflow.deploy_blocked");
+    expect(events).toHaveLength(1);
+    // The one thing a human needs to act: which gate, and whose it is.
+    expect(events[0].openGate).toMatchObject({ ticketId: "TEAM-3757", kind: "escalation", status: "in_review" });
+    expect(events[0].reason.startsWith("awaiting escalation TEAM-3757")).toBe(true);
+    expect(wf.blockReason.startsWith("awaiting escalation TEAM-3757")).toBe(true);
+    error.mockRestore();
+  });
+
+  it("an open TODO merge gate blocks a green close even when the ship verdict passes", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [[...SHIP_DONE, { ...GATE_DONE, status: "todo" }]];
+    h.state.freshWorkflow = shipTasks({ mergeCommit: "9f1c2ab" }); // provably merged
+    await loadWithShipDef();
+    const wf = { ...WF };
+    await completeWorkflow(wf);
+
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(ebEventsOfType("workflow.complete")).toHaveLength(0);
+    expect(h.state.terminalClaims).toHaveLength(1);
+    const events = ebEventsOfType("workflow.static_ci_only");
+    expect(events).toHaveLength(1);
+    expect(events[0].openGate).toMatchObject({ ticketId: "TEAM-900", kind: "merge_gate", status: "todo" });
+    expect(events[0].reason).toContain("awaiting merge_gate TEAM-900");
+    error.mockRestore();
+  });
+
+  it("sffzti: DEPLOY SUCCEEDED evidence → complete reported as `deployed`, epic rolled up, THEN finalized", async () => {
+    h.state.snapshots = [[...SHIP_DONE, GATE_DONE]];
+    h.state.freshWorkflow = shipTasks({}); // no self-reported outcome — only the file
+    seedCdEvidence("# DEPLOY SUCCEEDED - agentcore-hub-pipeline (4 PRs)\n");
+    await loadWithShipDef();
+    const wf = { ...WF };
+    await completeWorkflow(wf);
+
+    expect(h.state.merges.some((m) => m.tid === "T-4" && m.fields.outcome === "deployed")).toBe(true);
+    expect(h.state.terminalClaims).toHaveLength(0);
+    expect(h.state.storeCompletions).toHaveLength(1);
+    const events = ebEventsOfType("workflow.complete");
+    expect(events).toHaveLength(1);
+    // The regression this exists for: a deployed run filed as static-ci-only.
+    expect(events[0].outcome).toBe("deployed");
+    expect(events[0].epicRolledUp).toBe(true);
+    // The epic actually moved on the board (dynamodb provider = scoped Done write).
+    expect(
+      h.state.ticketUpdates.some(
+        (u) => u.Key?.ticketId === "EPIC-1" && u.ExpressionAttributeValues?.[":s"] === "done"
+      )
+    ).toBe(true);
+    expect(h.state.rollupCleared).toEqual(["wf_1"]);
+    expect(h.state.finalized).toEqual(["wf_1"]); // finalized ONLY after the roll-up
+  });
+
+  it("7ef4fp: a def with NO ship phase still rolls the epic up, and claims no deploy", async () => {
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = shipTasks({});
+    await load(); // fallback def: development/verification/review, no ship
+    await completeWorkflow({ ...WF });
+
+    expect(h.state.storeCompletions).toHaveLength(1);
+    const events = ebEventsOfType("workflow.complete");
+    expect(events).toHaveLength(1);
+    expect(events[0].epicRolledUp).toBe(true);
+    expect(events[0].outcome).toBeUndefined(); // nothing shipped, nothing claimed
+    expect(h.state.rollupCleared).toEqual(["wf_1"]);
+    expect(h.state.finalized).toEqual(["wf_1"]);
+  });
+
+  it("roll-up failure: escalated once, announced as epicRolledUp:false, and NOT finalized — never un-completed", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+    h.state.freshWorkflow = shipTasks({});
+    h.state.epicTransitionThrows = true;
+    await load();
+    await completeWorkflow({ ...WF });
+
+    // The delivery is real: the completion claim stands.
+    expect(h.state.storeCompletions).toHaveLength(1);
+    const failed = ebEventsOfType("workflow.epic_rollup_failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ workflowId: "wf_1", epicId: "EPIC-1", attempts: 3 });
+    expect(failed[0].lastError).toContain("epic write rejected");
+
+    // Exactly one escalation, under the run-idempotent id.
+    const notifs = h.state.notifications.filter((n) => n.n?.id === "notif_epic_rollup_wf_1");
+    expect(notifs).toHaveLength(1);
+    expect(notifs[0].n).toMatchObject({ type: "manager_escalation", acknowledged: false });
+
+    // Honest announcement, and NO finalized marker: the obligation is still open,
+    // so the flag stays and the sweep can retry it.
+    expect(ebEventsOfType("workflow.complete")[0].epicRolledUp).toBe(false);
+    expect(h.state.rollupCleared).toHaveLength(0);
+    expect(h.state.finalized).toHaveLength(0);
+    error.mockRestore();
+    warn.mockRestore();
+  });
+
+  it("retryPendingEpicRollups: the sweep takes over through the SAME finalization CAS and recovers", async () => {
+    h.state.finalizationClaimWins = true;
+    const mod = await load();
+    const res = await mod.retryPendingEpicRollups({
+      id: "wf_1", epicId: "EPIC-1", phase: "complete", epicRollupPending: true,
+    });
+
+    expect(res).toMatchObject({ claimed: true, ok: true, attempts: 1 });
+    expect(h.state.rollupCleared).toEqual(["wf_1"]);
+    expect(ebEventsOfType("workflow.epic_rolled_up")).toHaveLength(1);
+    expect(ebEventsOfType("workflow.epic_rolled_up")[0]).toMatchObject({
+      workflowId: "wf_1", epicId: "EPIC-1", recoveredBy: "retryPendingEpicRollups",
+    });
+    expect(h.state.finalized).toEqual(["wf_1"]); // finalized at last
+  });
+
+  it("retryPendingEpicRollups declines a run that owes nothing, one already finalized, and a lost CAS", async () => {
+    const mod = await load();
+    const pending = { id: "wf_1", epicId: "EPIC-1", phase: "complete", epicRollupPending: true };
+    expect(await mod.retryPendingEpicRollups({ ...pending, epicRollupPending: false })).toMatchObject({ reason: "not_pending" });
+    expect(await mod.retryPendingEpicRollups({ ...pending, phase: "review" })).toMatchObject({ reason: "not_pending" });
+    expect(await mod.retryPendingEpicRollups({ ...pending, finalizedAt: "2026-09-05T00:00:00Z" })).toMatchObject({ reason: "not_pending" });
+    // Pending, but a concurrent owner holds the claim → hands off, touches nothing.
+    expect(await mod.retryPendingEpicRollups(pending)).toMatchObject({ claimed: false, reason: "claim_lost" });
+    expect(h.state.rollupCleared).toHaveLength(0);
+    expect(h.state.finalized).toHaveLength(0);
+  });
 });

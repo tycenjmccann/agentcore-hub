@@ -132,6 +132,10 @@ vi.mock("./workflow-store.mjs", () => ({
   setTaskStatus: vi.fn(async () => {}),
   claimFinalization: vi.fn(async () => false),
   markFinalized: vi.fn(async () => {}),
+  // TEAM-3991 D1.4 — finalization now also discharges the epic roll-up.
+  clearEpicRollupPending: vi.fn(async () => {}),
+  appendNotificationOnce: vi.fn(async () => true),
+  ackNotifications: vi.fn(async () => 0),
 }));
 
 // The harvest is gated on ARTIFACT_BUCKET, and the config loaders need it too;

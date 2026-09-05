@@ -212,3 +212,145 @@ export function formatRepoCheckWarning(check: RepoCheck): string {
   ];
   return lines.join("\n") + "\n";
 }
+
+// ─── Branch-protection preflight (TEAM-3991 D1.1) ─────────────────────────────
+
+export type ProtectionSource = "protection" | "rules" | "none" | "unreadable";
+
+export interface ProtectionResult {
+  protected: boolean;
+  requiresPr: boolean;
+  requiredApprovals: number;
+  enforceAdmins: boolean;
+  source: ProtectionSource;
+  missing: string[];
+}
+
+export interface ProtectionProbe {
+  protectionStatus?: number | null;
+  protectionJson?: unknown;
+  rulesStatus?: number | null;
+  rulesJson?: unknown;
+}
+
+/**
+ * A Merge Approval gate is only as strong as the base branch. If `main` requires
+ * no PR and no approving review, the gate is advisory: an agent can push straight
+ * to it and the run's "approval" never happened.
+ *
+ * `protected` means specifically "merge-gate protected": a PR is required AND at
+ * least one approving review is. An UNREADABLE answer (token without admin
+ * scope) is never reported as protected — but it is not reported as unprotected
+ * either; `source` tells the caller which it is.
+ *
+ * Mirrored byte-for-byte in lambda/orchestrator/repo-check.mjs; the twins are
+ * pinned by repo-check-parity.test.ts.
+ */
+export const PROTECTION_REQUIREMENTS = ["require_pr", "required_approvals", "enforce_admins", "block_force_push"];
+
+export function classifyProtection({ protectionStatus, protectionJson, rulesStatus, rulesJson }: ProtectionProbe = {}): ProtectionResult {
+  const blank: ProtectionResult = {
+    protected: false,
+    requiresPr: false,
+    requiredApprovals: 0,
+    enforceAdmins: false,
+    source: "none",
+    missing: [...PROTECTION_REQUIREMENTS],
+  };
+
+  // Classic branch protection — the authoritative source when readable.
+  if (protectionStatus === 200 && protectionJson && typeof protectionJson === "object") {
+    const p = protectionJson as {
+      required_pull_request_reviews?: { required_approving_review_count?: number };
+      enforce_admins?: { enabled?: boolean };
+      allow_force_pushes?: { enabled?: boolean };
+    };
+    const reviews = p.required_pull_request_reviews;
+    const requiresPr = Boolean(reviews);
+    const requiredApprovals = Number(reviews?.required_approving_review_count) || 0;
+    const enforceAdmins = Boolean(p.enforce_admins?.enabled);
+    const blockForcePush = p.allow_force_pushes?.enabled === false;
+    const missing: string[] = [];
+    if (!requiresPr) missing.push("require_pr");
+    if (requiredApprovals < 1) missing.push("required_approvals");
+    if (!enforceAdmins) missing.push("enforce_admins");
+    if (!blockForcePush) missing.push("block_force_push");
+    return {
+      protected: requiresPr && requiredApprovals >= 1,
+      requiresPr,
+      requiredApprovals,
+      enforceAdmins,
+      source: "protection",
+      missing,
+    };
+  }
+
+  // Rulesets — what a repo on the newer model returns (and readable without
+  // admin scope). An empty array is a definite "no rules apply to this branch".
+  if (rulesStatus === 200 && Array.isArray(rulesJson)) {
+    const rules = rulesJson as Array<{ type?: string; parameters?: { required_approving_review_count?: number } }>;
+    if (rules.length === 0) return blank;
+    const prRule = rules.find((r) => r?.type === "pull_request");
+    const requiresPr = Boolean(prRule);
+    const requiredApprovals = Number(prRule?.parameters?.required_approving_review_count) || 0;
+    const nonFastForward = rules.some((r) => r?.type === "non_fast_forward");
+    const deletion = rules.some((r) => r?.type === "deletion");
+    const missing: string[] = [];
+    if (!requiresPr) missing.push("require_pr");
+    if (requiredApprovals < 1) missing.push("required_approvals");
+    // The rules endpoint reports the effective rules, not who may bypass them,
+    // so admin enforcement is unknowable here — reported as missing, honestly.
+    missing.push("enforce_admins");
+    if (!(nonFastForward && deletion)) missing.push("block_force_push");
+    return {
+      protected: requiresPr && requiredApprovals >= 1,
+      requiresPr,
+      requiredApprovals,
+      enforceAdmins: false,
+      source: "rules",
+      missing,
+    };
+  }
+
+  // 404 on both: the branch genuinely has neither protection nor rulesets.
+  if (protectionStatus === 404 && (rulesStatus === 404 || rulesStatus === 200)) return blank;
+  // Anything else (401/403, 5xx, no answer) — we simply do not know.
+  return { ...blank, source: "unreadable" };
+}
+
+/**
+ * Probe a branch's protection. Never throws: any transport failure degrades to
+ * source "unreadable" with the error attached.
+ */
+export async function checkBranchProtection(
+  { owner, repo, branch }: { owner: string; repo: string; branch: string },
+  opts: RepoCheckOptions = {}
+): Promise<ProtectionResult & { branch: string; protectionStatus: number | null; rulesStatus: number | null; error?: string }> {
+  const o = encodeURIComponent(owner || "");
+  const r = encodeURIComponent(repo || "");
+  const b = encodeURIComponent(branch || "");
+  const withToken: RepoCheckOptions = { ...opts, token: opts.token || process.env.GITHUB_PAT };
+  let protectionStatus: number | null = null;
+  let protectionJson: unknown = null;
+  let rulesStatus: number | null = null;
+  let rulesJson: unknown = null;
+  let error: string | undefined;
+  try {
+    ({ status: protectionStatus, json: protectionJson } = await ghGet(`/repos/${o}/${r}/branches/${b}/protection`, withToken));
+  } catch (err) {
+    error = err instanceof Error ? err.message : String(err);
+  }
+  if (protectionStatus !== 200) {
+    try {
+      ({ status: rulesStatus, json: rulesJson } = await ghGet(`/repos/${o}/${r}/rules/branches/${b}`, withToken));
+    } catch (err) {
+      error = error || (err instanceof Error ? err.message : String(err));
+    }
+  }
+  const result = classifyProtection({ protectionStatus, protectionJson, rulesStatus, rulesJson });
+  if (error && result.source === "none") {
+    result.source = "unreadable";
+    result.protected = false;
+  }
+  return { ...result, branch, protectionStatus, rulesStatus, ...(error ? { error } : {}) };
+}

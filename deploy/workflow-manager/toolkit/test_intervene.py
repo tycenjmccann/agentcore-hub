@@ -293,3 +293,241 @@ def test_file_bug_missing_title_or_description_refuses(rec, argv):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------------------------
+# mark-done (TEAM-3991 D1.3) — ONE call to the server-side endpoint that owns
+# the harvest, the evidence write and the transition.
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def no_ddb(monkeypatch):
+    """Neutralise the DynamoDB seams `mark-done` still touches for its LOCAL
+    human-gate guard, and record whether the command reached for the table at
+    all. The evidence write itself must never come from here: `markedDoneBy` is
+    stamped from the request identity server-side, which a direct table write
+    would silently bypass."""
+    calls = {"get_ticket": 0}
+
+    def fake_get_ticket(ticket_id):
+        calls["get_ticket"] += 1
+        return {"ticketId": ticket_id, "status": "in_progress", "assignee": "backend_dev"}
+
+    monkeypatch.setattr(intervene, "get_ticket", fake_get_ticket)
+    return calls
+
+
+def test_mark_done_posts_evidence_endpoint(rec, no_ddb, monkeypatch):
+    """The whole operation is ONE POST to /tickets/mark-done — not the old
+    comment-then-transition pair, which could half-fail and left the evidence in a
+    comment the orchestrator never reads."""
+    monkeypatch.setattr(intervene, "api_post", lambda path, body=None: (
+        rec.posts.append((path, body)) or
+        {"ok": True, "evidenceSource": "record", "branch": "feature/TEAM-7-backend-dev",
+         "commitSha": "abc1234", "prUrl": "https://github.com/acme/hub/pull/9"}
+    ))
+
+    run(["mark-done", "wf_1", "TEAM-7", "--evidence", "PR #9 is merged"])
+
+    path, body = only_post(rec)
+    assert path == "/api/workflow/wf_1/tickets/mark-done"
+    assert body == {"ticketId": "TEAM-7", "evidence": "PR #9 is merged"}
+    # The client never asks to transition, comment, or stamp an actor — the server
+    # owns all three (and takes `markedDoneBy` from the authenticated identity).
+    assert "targetStatus" not in body and "by" not in body and "markedDoneBy" not in body
+
+
+def test_mark_done_writes_evidence_from_text(rec, no_ddb, monkeypatch):
+    """The typed --evidence is the LAST-resort source; when the server reports it
+    used that text (evidenceSource "manager"), the operator sees so."""
+    monkeypatch.setattr(intervene, "api_post", lambda path, body=None: (
+        rec.posts.append((path, body)) or {"ok": True, "evidenceSource": "manager"}
+    ))
+
+    run(["mark-done", "wf_1", "TEAM-7", "--evidence", "streamed PASS verdict"])
+
+    _, body = only_post(rec)
+    assert body["evidence"] == "streamed PASS verdict"
+    # The source the server chose is carried into the intervention record, so the
+    # run analysis can tell a harvested deliverable from an operator's assertion.
+    assert rec.events[-1][1] == "mark_done"
+    assert rec.events[-1][2]["evidenceSource"] == "manager"
+
+
+def test_mark_done_never_touches_dynamodb_for_the_write(rec, no_ddb, monkeypatch):
+    """No boto3 table write anywhere in the path: a direct write would skip the
+    identity stamp AND the scoped conditional update the store owns (R2)."""
+    monkeypatch.setattr(intervene, "api_post", lambda path, body=None: (
+        rec.posts.append((path, body)) or {"ok": True, "evidenceSource": "branch"}
+    ))
+    table = mock.MagicMock()
+    monkeypatch.setattr(intervene.dynamodb, "Table", table)
+
+    run(["mark-done", "wf_1", "TEAM-7", "--evidence", "branch pushed"])
+
+    # publish_intervention is mocked, so the ONLY table use left would be a write
+    # by mark-done itself. There is none.
+    assert table.call_count == 0
+    assert only_post(rec)[0].endswith("/tickets/mark-done")
+
+
+def test_mark_done_refuses_human_gate(rec, monkeypatch):
+    """Client-side guard: a human review gate is refused BEFORE the network call,
+    so an operator pointed at the wrong ticket is told immediately."""
+    monkeypatch.setattr(intervene, "get_ticket",
+                        lambda tid: {"ticketId": tid, "status": "todo", "assignee": "human:lead@example.com"})
+
+    with pytest.raises(SystemExit) as exc:
+        run(["mark-done", "wf_1", "TEAM-GATE", "--evidence", "looks done to me"])
+
+    assert "human review gate" in str(exc.value)
+    assert rec.posts == []
+
+
+def test_mark_done_refuses_in_review(rec, monkeypatch):
+    monkeypatch.setattr(intervene, "get_ticket",
+                        lambda tid: {"ticketId": tid, "status": "in_review", "assignee": "qa"})
+
+    with pytest.raises(SystemExit) as exc:
+        run(["mark-done", "wf_1", "TEAM-R", "--evidence", "e"])
+
+    assert "in_review" in str(exc.value)
+    assert rec.posts == []
+
+
+def test_mark_done_surfaces_409_no_evidence(rec, no_ddb, monkeypatch):
+    """The server refuses when it can find NO evidence at all. That refusal must
+    reach the operator verbatim — it is the anti-false-green guard, not a glitch to
+    retry around."""
+    def refusing_post(path, body=None):
+        rec.posts.append((path, body))
+        raise SystemExit(
+            "REFUSED (NO_EVIDENCE): no completion record, no branch or PR, and no "
+            "usable evidence text for TEAM-7"
+        )
+
+    monkeypatch.setattr(intervene, "api_post", refusing_post)
+
+    with pytest.raises(SystemExit) as exc:
+        run(["mark-done", "wf_1", "TEAM-7", "--evidence", "   "])
+
+    # The local --evidence guard fires first for blank text (no POST at all).
+    assert "requires --evidence" in str(exc.value)
+    assert rec.posts == []
+
+
+def test_mark_done_no_evidence_409_is_reported_as_a_refusal(capsys):
+    """api_post's typed-409 handling for the server's NO_EVIDENCE code."""
+    err = _http_error(409, {"code": "NO_EVIDENCE", "error": "nothing to prove TEAM-7 shipped"})
+    with mock.patch.object(intervene.urllib.request, "urlopen", side_effect=err):
+        with pytest.raises(SystemExit) as exc:
+            intervene.api_post("/api/workflow/wf_1/tickets/mark-done", {"ticketId": "TEAM-7"})
+    assert "NO_EVIDENCE" in str(exc.value)
+    assert "nothing to prove TEAM-7 shipped" in str(exc.value)
+
+
+# --------------------------------------------------------------------------
+# --resume / PR_EXISTS (TEAM-3991 D1.5)
+# --------------------------------------------------------------------------
+
+def _http_error(code, payload):
+    """A urllib HTTPError whose body is the API's JSON refusal."""
+    import io
+    return intervene.urllib.error.HTTPError(
+        "http://test.local", code, "Conflict", {},
+        io.BytesIO(__import__("json").dumps(payload).encode()),
+    )
+
+
+PR_EXISTS_BODY = {
+    "code": "PR_EXISTS",
+    "number": 274,
+    "prUrl": "https://github.com/acme/hub/pull/274",
+    "state": "open",
+    "merged": False,
+    "ticketId": "TEAM-7",
+    "message": "PR #274 exists — resume, don't re-investigate.",
+}
+
+
+def test_dispatch_refuses_when_pr_exists(capsys, monkeypatch):
+    """A cold re-dispatch onto a ticket that already has a PR makes the agent redo
+    work that is on GitHub (prod TEAM-3790). Exit code 2 marks it as RESUMABLE, so
+    a caller can branch on it instead of parsing prose."""
+    monkeypatch.setattr(intervene, "get_ticket",
+                        lambda tid: {"ticketId": tid, "status": "in_progress", "assignee": "backend_dev"})
+    monkeypatch.setattr(intervene, "publish_intervention", lambda *a, **k: None)
+    with mock.patch.object(intervene.urllib.request, "urlopen",
+                           side_effect=_http_error(409, PR_EXISTS_BODY)):
+        with pytest.raises(SystemExit) as exc:
+            run(["dispatch", "wf_1", "TEAM-7"])
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "PR #274 exists — resume, don't re-investigate" in err
+    assert "https://github.com/acme/hub/pull/274" in err
+    assert "--resume" in err
+
+
+def test_retry_refuses_when_pr_exists(capsys, monkeypatch):
+    monkeypatch.setattr(intervene, "get_ticket",
+                        lambda tid: {"ticketId": tid, "status": "in_progress", "assignee": "backend_dev"})
+    monkeypatch.setattr(intervene, "publish_intervention", lambda *a, **k: None)
+    monkeypatch.setattr(intervene, "dynamodb", mock.MagicMock())
+    intervene.dynamodb.Table.return_value.get_item.return_value = {
+        "Item": {"workflowId": "wf_1", "agentTasks": {}}
+    }
+    with mock.patch.object(intervene.urllib.request, "urlopen",
+                           side_effect=_http_error(409, PR_EXISTS_BODY)):
+        with pytest.raises(SystemExit) as exc:
+            run(["retry", "wf_1", "backend_dev"])
+
+    assert exc.value.code == 2
+    assert "resume, don't re-investigate" in capsys.readouterr().err
+
+
+def test_dispatch_resume_flag_proceeds(rec, monkeypatch):
+    """--resume puts `resume: true` in the body; the endpoint then dispatches and
+    hands the agent a resume context pointing at the PR."""
+    monkeypatch.setattr(intervene, "get_ticket",
+                        lambda tid: {"ticketId": tid, "status": "in_progress", "assignee": "backend_dev"})
+
+    run(["dispatch", "wf_1", "TEAM-7", "--resume"])
+
+    _, body = only_post(rec)
+    assert body["resume"] is True
+    assert body["ticketId"] == "TEAM-7"
+
+
+def test_retry_resume_flag_proceeds(rec, monkeypatch):
+    monkeypatch.setattr(intervene, "dynamodb", mock.MagicMock())
+    intervene.dynamodb.Table.return_value.get_item.return_value = {
+        "Item": {"workflowId": "wf_1", "agentTasks": {}}
+    }
+
+    run(["retry", "wf_1", "backend_dev", "--resume"])
+
+    _, body = only_post(rec)
+    assert body["resume"] is True
+    assert body["agentId"] == "backend_dev"
+
+
+def test_dispatch_without_resume_sends_no_resume_key(rec, monkeypatch):
+    """The default is unchanged — no `resume` key at all, so the guard applies."""
+    monkeypatch.setattr(intervene, "get_ticket",
+                        lambda tid: {"ticketId": tid, "status": "in_progress", "assignee": "backend_dev"})
+
+    run(["dispatch", "wf_1", "TEAM-7"])
+
+    assert "resume" not in only_post(rec)[1]
+
+
+def test_lease_live_409_still_reported_as_lease_live(capsys):
+    """The typed-refusal refactor must not blur LEASE_LIVE into the generic path —
+    it is the one refusal with a --force escape."""
+    err = _http_error(409, {"code": "LEASE_LIVE", "error": "agent holds a live lease"})
+    with mock.patch.object(intervene.urllib.request, "urlopen", side_effect=err):
+        with pytest.raises(SystemExit) as exc:
+            intervene.api_post("/api/workflow/wf_1/retry", {"agentId": "dev"})
+    assert "lease live" in str(exc.value)
+    assert "--force" in str(exc.value)

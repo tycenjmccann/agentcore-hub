@@ -35,9 +35,16 @@ const h = vi.hoisted(() => {
     s3Objects: Record<string, string>;
     s3Gets: string[];
     s3Error: Error | null;
+    // TEAM-3991 D1.4: the cd-evidence listing (ListObjectsV2 on
+    // workflows/<wf>/shared/cd-evidence/), the captured events-table rows, and a
+    // switch that makes ONLY the tickets-table write fail (the epic roll-up).
+    s3List: Array<{ Key: string; LastModified?: string }>;
+    events: Array<Record<string, unknown>>;
+    epicUpdateThrows: string | null;
   } = {
     workflow: {}, tickets: [], def: {}, updates: [], updateError: null, workflowAfterFail: null,
     s3Objects: {}, s3Gets: [], s3Error: null,
+    s3List: [], events: [], epicUpdateThrows: null,
   };
   return { state };
 });
@@ -64,6 +71,12 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           const name = cmd.constructor.name;
           if (name === "GetCommand") return { Item: h.state.workflow };
           if (name === "UpdateCommand") {
+            // TEAM-3991 D1.4: the epic roll-up writes the TICKETS table; failing
+            // only that one is how the roll-up-failure path is driven without
+            // touching the workflow's terminal claim.
+            if (h.state.epicUpdateThrows && cmd.input.TableName === "agentcore-hub-tickets") {
+              throw new Error(h.state.epicUpdateThrows);
+            }
             if (h.state.updateError) {
               if (h.state.workflowAfterFail) h.state.workflow = h.state.workflowAfterFail;
               const e = new Error("conditional check failed");
@@ -73,7 +86,11 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             h.state.updates.push(cmd.input);
             return {};
           }
-          return {}; // PutCommand (events table) — non-fatal
+          if (name === "PutCommand") {
+            h.state.events.push(cmd.input.Item as Record<string, unknown>);
+            return {};
+          }
+          return {};
         },
       }),
     },
@@ -93,7 +110,11 @@ vi.mock("@aws-sdk/client-eventbridge", () => ({
 
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
-    async send(cmd: { input: { Key: string } }) {
+    async send(cmd: { constructor: { name: string }; input: { Key: string } }) {
+      if (cmd.constructor.name === "ListObjectsV2Command") {
+        if (h.state.s3Error) throw h.state.s3Error;
+        return { Contents: h.state.s3List };
+      }
       h.state.s3Gets.push(cmd.input.Key);
       if (h.state.s3Error) throw h.state.s3Error;
       const body = h.state.s3Objects[cmd.input.Key];
@@ -106,6 +127,9 @@ vi.mock("@aws-sdk/client-s3", () => ({
     }
   },
   GetObjectCommand: class {
+    constructor(public input: Record<string, unknown>) {}
+  },
+  ListObjectsV2Command: class {
     constructor(public input: Record<string, unknown>) {}
   },
 }));
@@ -123,7 +147,12 @@ vi.mock("@/lib/workflow/defs-loader", () => ({
 
 let POST: typeof import("./route").POST;
 
-const SAVED = ["COMPLETION_EVIDENCE_REQUIRED", "TICKET_PROVIDER", "ARTIFACT_BUCKET"] as const;
+const SAVED = [
+  "COMPLETION_EVIDENCE_REQUIRED", "TICKET_PROVIDER", "ARTIFACT_BUCKET", "EPIC_ROLLUP_BACKOFF_MS",
+  // TEAM-3991 D1.3: the merge probe reads GITHUB_PAT at CALL time, so a suite can
+  // turn the probe on and off without reloading the route module.
+  "GITHUB_PAT",
+] as const;
 const saved: Partial<Record<(typeof SAVED)[number], string | undefined>> = {};
 
 async function load() {
@@ -139,12 +168,20 @@ beforeEach(() => {
   h.state.s3Objects = {};
   h.state.s3Gets.length = 0;
   h.state.s3Error = null;
+  h.state.s3List.length = 0;
+  h.state.events.length = 0;
+  h.state.epicUpdateThrows = null;
   for (const k of SAVED) saved[k] = process.env[k];
+  // TEAM-3991 D1.4: no real sleeping between epic roll-up retries.
+  process.env.EPIC_ROLLUP_BACKOFF_MS = "0";
   process.env.TICKET_PROVIDER = "dynamodb";
   // TEAM-3976: the completions-record fallback is gated on ARTIFACT_BUCKET (read
   // at module load, so it must be set before every load()).
   process.env.ARTIFACT_BUCKET = "test-bucket";
   delete process.env.COMPLETION_EVIDENCE_REQUIRED;
+  // No PAT by default: every pre-D1.3 suite must keep behaving exactly as before,
+  // which means the merge probe answers { merged: null } without a single fetch.
+  delete process.env.GITHUB_PAT;
 });
 
 afterEach(() => {
@@ -791,5 +828,514 @@ describe("POST complete — completions-record fallback (TEAM-3976)", () => {
     expect(res.status).toBe(200);
     expect(h.state.s3Gets).toEqual([]);
     expect(h.state.updates.length).toBe(1); // only the green completion write
+  });
+});
+
+/**
+ * TEAM-3991 D1.4 — the three honesty gaps this route shared with the
+ * orchestrator, driven end-to-end:
+ *
+ *   1. wf sffzti DEPLOYED and closed `static-ci-only`. The release manager's
+ *      report_completion tool has no outcome field, so the only record of the
+ *      deploy is the `cd-evidence/deploy-*.md` file it wrote — unread until now.
+ *   2. wf 1pl3h1 closed `complete` while escalation gate TEAM-3757 sat in_review
+ *      over an unmerged PR. Its "PREFLIGHT BLOCKED" cd-evidence file went unread
+ *      too, and no close ever named the gate a human still owed a decision to.
+ *   3. wf 7ef4fp closed `complete` with its epic left in In Progress: the epic
+ *      roll-up was a separate best-effort write after the terminal claim, so a
+ *      failure (or a crash) left the run complete with nobody responsible for the
+ *      board. The obligation is now created ATOMICALLY with the terminal claim
+ *      (epicRollupPending) and only cleared once the epic really moved.
+ */
+describe("POST complete — CD evidence, open gates, atomic epic roll-up (TEAM-3991 D1.4)", () => {
+  const EPIC = "TEAM-3990";
+  const CD_KEY = "workflows/wf_1/shared/cd-evidence/deploy-20260905T0100Z.md";
+  const shipTicket = {
+    ticketId: "T-4", type: "task", status: "done", phase: "ship",
+    assignee: "agentcore_hub_release_manager",
+  };
+  const shipRun = (ship: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+    workflowId: "wf_1",
+    phase: "ship",
+    workflowDefId: "software-delivery",
+    epicId: EPIC,
+    agentTasks: { "T-4": { ticketId: "T-4", output: "release summary written", ...ship } },
+    ...extra,
+  });
+  const seedCd = (body: string, key = CD_KEY, LastModified = "2026-09-05T01:00:00Z") => {
+    h.state.s3List.push({ Key: key, LastModified });
+    h.state.s3Objects[key] = body;
+  };
+  const find = (pred: (u: Record<string, unknown>) => boolean) => h.state.updates.find(pred);
+  const epicUpdate = () => find((u) => u.TableName === "agentcore-hub-tickets");
+  const terminalUpdate = () => find((u) => String(u.ConditionExpression).includes("#phase <>"));
+  const rollupCleared = () => find((u) => String(u.UpdateExpression) === "REMOVE epicRollupPending");
+  const cdStamp = () =>
+    find(
+      (u) =>
+        u.ConditionExpression === "attribute_exists(agentTasks.#tid)" &&
+        Object.values((u.ExpressionAttributeNames as Record<string, string>) || {}).includes("outcome")
+    );
+
+  describe("manager-supplied evidence satisfies the deliverable gate (D1.3)", () => {
+    const doneDevTicket = {
+      ticketId: "T-1", type: "task", status: "done", phase: "development",
+      assignee: "agentcore_hub_backend_dev",
+    };
+    beforeEach(() => {
+      h.state.def = { completionRequiresAgentPhases: ["development"] };
+      h.state.tickets = [doneDevTicket];
+    });
+
+    it("evidence a human pasted in via mark_done (evidenceSource:manager, output only) is real evidence — no 409, no S3 read", async () => {
+      // The mark-done route writes output+evidenceSource:"manager" and nothing
+      // else — no branch, no commit, no PR (that is the whole point: a human is
+      // vouching). The gate must accept it exactly like an agent's own output,
+      // otherwise the run it just unblocked can never close.
+      h.state.workflow = {
+        workflowId: "wf_1",
+        phase: "development",
+        workflowDefId: "software-delivery",
+        agentTasks: {
+          "T-1": {
+            ticketId: "T-1", status: "complete",
+            output: "Verified by hand: endpoints live, screenshots in the ticket.",
+            evidenceSource: "manager", markedDoneBy: "alice@example.com",
+          },
+        },
+      };
+      await load();
+      const res = await post();
+      expect(res.status).toBe(200);
+      expect((await res.json()).status).toBe("complete");
+      expect(h.state.s3Gets).toEqual([]); // the happy path never reads S3
+      expect(h.state.updates.length).toBe(1);
+    });
+
+    it("a manager-written completions record (source:\"manager\") is re-harvested rather than 409'd", async () => {
+      // mark_done wrote the record but the agentTasks entry predates it (the run
+      // was closed out-of-band). source is "manager", not "agent" — accepted:
+      // what matters is that the record carries evidence, not who typed it.
+      h.state.workflow = {
+        workflowId: "wf_1",
+        phase: "development",
+        workflowDefId: "software-delivery",
+        agentTasks: { "T-1": { ticketId: "T-1", status: "complete" } },
+      };
+      h.state.s3Objects["completions/T-1.json"] = JSON.stringify({
+        source: "manager",
+        ticket_id: "T-1",
+        summary: "Verified by hand — merged in PR #274.",
+        pr_url: "https://github.com/x/y/pull/274",
+        marked_done_by: "alice@example.com",
+      });
+      await load();
+      const res = await post();
+      expect(res.status).toBe(200);
+      expect(h.state.s3Gets).toEqual(["completions/T-1.json"]);
+      const backfill = find((u) => u.ConditionExpression === "attribute_exists(agentTasks.#tid)");
+      expect(backfill).toBeTruthy();
+      const fields = Object.entries((backfill!.ExpressionAttributeNames as Record<string, string>) || {})
+        .filter(([k]) => k !== "#tid")
+        .map(([, v]) => v)
+        .sort();
+      expect(fields).toEqual(["output", "prUrl"]);
+      // SECURITY: a re-harvest never invents a merge verdict or an outcome.
+      expect(fields).not.toContain("mergeCommit");
+      expect(fields).not.toContain("outcome");
+    });
+  });
+
+  describe("cd-evidence gives the ship verdict a voice", () => {
+    beforeEach(() => {
+      // The suites above delete ARTIFACT_BUCKET in their afterEach and the bucket
+      // is read at module load — re-assert it before every load() here, or the
+      // whole cd-evidence harvest is inert.
+      process.env.ARTIFACT_BUCKET = "test-bucket";
+      h.state.tickets = [shipTicket];
+    });
+
+    it("wf sffzti: \"# DEPLOY SUCCEEDED\" turns a verdict-less ship ticket into outcome=deployed and closes GREEN", async () => {
+      h.state.workflow = shipRun({}); // no mergeCommit, no outcome — static-ci-only before D1.4
+      seedCd("# DEPLOY SUCCEEDED - staging + prod\n\nCodeBuild agentcore-hub-deploy #41 green.");
+      await load();
+      const res = await post();
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.status).toBe("complete");
+      // The run REPORTS what it actually did — not the CI-only default.
+      expect(body.outcome).toBe("deployed");
+      expect(body.epicRolledUp).toBe(true);
+      // The verdict is durable on the ship task, scoped to the existing entry.
+      const stamp = cdStamp();
+      expect(stamp).toBeTruthy();
+      expect((stamp!.ExpressionAttributeNames as Record<string, string>)["#tid"]).toBe("T-4");
+      expect(Object.values(stamp!.ExpressionAttributeValues as Record<string, unknown>)).toEqual(
+        expect.arrayContaining(["deployed", CD_KEY])
+      );
+      // …and the terminal event carries it, so a workflow.complete consumer can
+      // tell a deployed run from a merged-but-undeployed one.
+      const complete = h.state.events.find((e) => e.type === "workflow.complete");
+      expect((complete!.detail as Record<string, unknown>).outcome).toBe("deployed");
+      expect((complete!.detail as Record<string, unknown>).epicRolledUp).toBe(true);
+    });
+
+    it("newest cd-evidence file wins (a re-run supersedes an earlier blocked attempt)", async () => {
+      h.state.workflow = shipRun({});
+      seedCd(
+        "# PREFLIGHT BLOCKED: PR #274 is not merged",
+        "workflows/wf_1/shared/cd-evidence/deploy-20260904T0900Z.md",
+        "2026-09-04T09:00:00Z"
+      );
+      seedCd("# DEPLOY SUCCEEDED - after the merge landed");
+      await load();
+      const res = await post();
+      expect((await res.json()).outcome).toBe("deployed");
+      expect(h.state.s3Gets).toEqual([CD_KEY]); // only the newest file is read
+    });
+
+    it("wf 1pl3h1's unread file: \"# PREFLIGHT BLOCKED\" closes deploy-blocked with the reason — and the epic is NOT rolled up", async () => {
+      h.state.workflow = shipRun({});
+      seedCd("# PREFLIGHT BLOCKED: PR #274 is not merged\n\nRefusing to deploy an unmerged branch.");
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      await load();
+      const res = await post();
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.status).toBe("deploy-blocked");
+      expect(body.reason).toContain("PR #274 is not merged");
+      // The work did not ship, so the board must not say it did.
+      expect(epicUpdate()).toBeUndefined();
+      expect(h.state.events.some((e) => e.type === "workflow.complete")).toBe(false);
+      expect(h.state.events.some((e) => e.type === "workflow.deploy_blocked")).toBe(true);
+      error.mockRestore();
+    });
+
+    it("an unparseable cd-evidence file changes nothing — the pre-D1.4 verdict stands", async () => {
+      h.state.workflow = shipRun({});
+      seedCd("# CD run log\n\nramping traffic, nothing decided yet");
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      await load();
+      const res = await post();
+      const body = await res.json();
+      expect(body.status).toBe("static-ci-only");
+      expect(body.outcome).toBe("static-ci-only");
+      expect(cdStamp()).toBeUndefined(); // no verdict ⇒ nothing stamped
+      error.mockRestore();
+    });
+
+    it("a ship ticket that already reported an outcome is never re-judged by S3", async () => {
+      h.state.workflow = shipRun({ outcome: "shipped", mergeCommit: "9f1c2ab" });
+      seedCd("# PREFLIGHT BLOCKED: stale file from an earlier attempt");
+      await load();
+      const res = await post();
+      expect((await res.json()).status).toBe("complete");
+      expect(h.state.s3Gets).toEqual([]); // never listed, never read
+    });
+  });
+
+  describe("an open human gate forbids a green close (wf 1pl3h1)", () => {
+    it("escalation TEAM-3757 sitting in_review is REFUSED and named — the run never closes complete", async () => {
+      // Belt and braces: this route's open-children gate fires first (it counts an
+      // in_review human ticket as open, where the orchestrator's structural check
+      // only looks at agent phases — which is exactly how 1pl3h1 slipped through
+      // there). Either way the contract asserted here is the same: no green close,
+      // and the response NAMES the ticket the human still owes a decision to.
+      // openGateOf() then backs the same rule up inside the ship ladder.
+      h.state.workflow = shipRun({ mergeCommit: "9f1c2ab" });
+      h.state.tickets = [
+        shipTicket,
+        {
+          ticketId: "TEAM-3757", type: "task", status: "in_review",
+          assignee: "human:reviewer@example.com",
+          title: "Escalation #1: ship-review not converging",
+        },
+      ];
+      await load();
+      const res = await post();
+
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.openTickets).toEqual([
+        { ticketId: "TEAM-3757", status: "in_review", title: "Escalation #1: ship-review not converging" },
+      ]);
+      // Nothing was written and nothing was announced.
+      expect(h.state.updates).toEqual([]);
+      expect(h.state.events).toEqual([]);
+    });
+
+    it("the same gate DONE lets the run close green (control)", async () => {
+      h.state.workflow = shipRun({ mergeCommit: "9f1c2ab" });
+      h.state.tickets = [
+        shipTicket,
+        { ticketId: "TEAM-3757", type: "task", status: "done", assignee: "human:reviewer@example.com", title: "Merge Approval" },
+      ];
+      await load();
+      const res = await post();
+      expect((await res.json()).status).toBe("complete");
+    });
+  });
+
+  describe("atomic epic roll-up (wf 7ef4fp)", () => {
+    beforeEach(() => {
+      h.state.tickets = [shipTicket];
+      h.state.workflow = shipRun({ mergeCommit: "9f1c2ab" });
+    });
+
+    it("the roll-up obligation is created in the SAME write as the terminal claim, then discharged and cleared", async () => {
+      await load();
+      const res = await post();
+
+      expect(res.status).toBe(200);
+      expect((await res.json()).epicRolledUp).toBe(true);
+      // 1. One write claims the run AND records who owes the board a transition.
+      const terminal = terminalUpdate()!;
+      expect(String(terminal.UpdateExpression)).toContain("epicRollupPending = :pending");
+      expect((terminal.ExpressionAttributeValues as Record<string, unknown>)[":pending"]).toBe(true);
+      expect(refusedPhases(terminal)).toEqual(ALL_TERMINAL_PHASES);
+      // 2. The epic really moved (tickets table, scoped write — NOT the workflows
+      //    table, so the single-writer rule is intact).
+      const epic = epicUpdate()!;
+      expect(epic.Key).toEqual({ ticketId: EPIC });
+      expect((epic.ExpressionAttributeValues as Record<string, unknown>)[":s"]).toBe("done");
+      // 3. Only then is the obligation discharged, guarded on its own existence.
+      const cleared = rollupCleared()!;
+      expect(cleared.ConditionExpression).toBe("attribute_exists(epicRollupPending)");
+      expect(h.state.updates.indexOf(cleared)).toBeGreaterThan(h.state.updates.indexOf(epic));
+    });
+
+    it("a run with no epic neither claims nor clears the flag (no vacuous write)", async () => {
+      const noEpic = shipRun({ mergeCommit: "9f1c2ab" }) as Record<string, unknown>;
+      delete noEpic.epicId;
+      h.state.workflow = noEpic;
+      await load();
+      const res = await post();
+      expect((await res.json()).epicRolledUp).toBe(false);
+      expect(h.state.updates.length).toBe(1);
+      expect(String(h.state.updates[0].UpdateExpression)).not.toContain("epicRollupPending");
+    });
+
+    it("a failing roll-up LEAVES epicRollupPending set, announces workflow.epic_rollup_failed, and still completes the run", async () => {
+      // The delivery is real — the run must not be un-completed because a board
+      // write failed. But the flag stays, so the sweep retries and no human has to
+      // notice the epic silently stuck in In Progress (the 7ef4fp failure).
+      h.state.epicUpdateThrows = "ProvisionedThroughputExceededException";
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await load();
+      const res = await post();
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.status).toBe("complete");
+      expect(body.epicRolledUp).toBe(false);
+      expect(rollupCleared()).toBeUndefined(); // the obligation is still outstanding
+      const failure = h.state.events.find((e) => e.type === "workflow.epic_rollup_failed");
+      expect(failure).toBeTruthy();
+      expect(failure!.detail).toMatchObject({ workflowId: "wf_1", epicId: EPIC, attempts: 3 });
+      expect(String((failure!.detail as Record<string, unknown>).lastError)).toContain(
+        "ProvisionedThroughputExceeded"
+      );
+      // …and the completion event says so too, rather than implying a clean close.
+      const complete = h.state.events.find((e) => e.type === "workflow.complete");
+      expect((complete!.detail as Record<string, unknown>).epicRolledUp).toBe(false);
+      // It retried before giving up (3 attempts, one warn each).
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes("roll-up attempt")).length).toBe(3);
+      error.mockRestore();
+      warn.mockRestore();
+    });
+  });
+});
+
+/**
+ * TEAM-3991 D1.3 — the GitHub merge probe on the complete route (parity with the
+ * orchestrator's SHIP_MERGE_VERIFY gate).
+ *
+ * The release manager's report_completion tool has no merge_commit field, so a
+ * merged-and-deployed run's self-reported ship verdict can NEVER read "shipped"
+ * (commitSha is the branch HEAD, deliberately not proof). Before this, the route
+ * closed every such run static-ci-only — and could not tell it apart from a run
+ * whose branch was never merged at all.
+ *
+ * The probe runs on the REAL module over a stubbed global fetch (no vi.mock of
+ * merge-probe.ts), so the URL shape, the merged_at-only reduction and the
+ * fail-open behaviour are all exercised end to end.
+ */
+describe("POST complete — GitHub merge probe (TEAM-3991 D1.3)", () => {
+  const EPIC = "TEAM-3990";
+  const shipTicket = {
+    ticketId: "T-4", type: "task", status: "done", phase: "ship",
+    assignee: "agentcore_hub_release_manager",
+  };
+  /** A run whose ship ticket is done with output but NO merge/deploy verdict. */
+  const shipRun = (ship: Record<string, unknown> = {}) => ({
+    workflowId: "wf_1",
+    phase: "ship",
+    workflowDefId: "software-delivery",
+    epicId: EPIC,
+    featureBranch: "feature/TEAM-3991",
+    repoConfig: { repos: [{ url: "https://github.com/acme/widgets.git", defaultBranch: "main" }] },
+    agentTasks: { "T-4": { ticketId: "T-4", output: "release summary written", ...ship } },
+  });
+
+  let fetchCalls: string[] = [];
+  /** Stub api.github.com: `routes` maps a path substring → JSON body. */
+  const stubGitHub = (routes: Array<[string, unknown]>) => {
+    vi.stubGlobal("fetch", async (url: string) => {
+      fetchCalls.push(String(url));
+      const hit = routes.find(([frag]) => String(url).includes(frag));
+      if (!hit) return { ok: false, status: 404, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => hit[1] };
+    });
+  };
+  const mergeStamp = () =>
+    h.state.updates.find(
+      (u) =>
+        u.ConditionExpression === "attribute_exists(agentTasks.#tid)" &&
+        Object.values((u.ExpressionAttributeNames as Record<string, string>) || {}).includes("mergeVerifiedBy")
+    );
+  const stampedFields = (u: Record<string, unknown>) =>
+    Object.entries((u.ExpressionAttributeNames as Record<string, string>) || {})
+      .filter(([k]) => k !== "#tid")
+      .map(([, v]) => v)
+      .sort();
+
+  beforeEach(() => {
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    process.env.GITHUB_PAT = "ghp_test";
+    h.state.tickets = [shipTicket];
+    fetchCalls = [];
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("merged PR → mergeCommit + mergeVerifiedBy stamped, and the run closes GREEN", async () => {
+    h.state.workflow = shipRun();
+    stubGitHub([
+      ["/pulls?head=", [{ merged_at: "2026-09-05T01:00:00Z", merge_commit_sha: "9f1c2ab", html_url: "https://github.com/acme/widgets/pull/274" }]],
+    ]);
+    await load();
+    const res = await post();
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+    const stamp = mergeStamp();
+    expect(stamp).toBeTruthy();
+    expect((stamp!.ExpressionAttributeNames as Record<string, string>)["#tid"]).toBe("T-4");
+    expect(stampedFields(stamp!)).toEqual(["mergeCommit", "mergeVerifiedBy", "prUrl"]);
+    expect(Object.values(stamp!.ExpressionAttributeValues as Record<string, unknown>)).toEqual(
+      expect.arrayContaining(["9f1c2ab", "github", "https://github.com/acme/widgets/pull/274"])
+    );
+    // One list call answers it — compare is only asked when no PR has merged.
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]).toContain("/repos/acme/widgets/pulls?head=acme%3Afeature%2FTEAM-3991&state=all&per_page=20");
+  });
+
+  it("compare says behind → merged with the base sha as proof (a squash merge leaves no merged PR)", async () => {
+    h.state.workflow = shipRun();
+    stubGitHub([
+      ["/pulls?head=", [{ state: "closed", merge_commit_sha: "test-merge-sha" }]], // never merged
+      ["/compare/", { status: "behind", base_commit: { sha: "base9" } }],
+    ]);
+    await load();
+    const res = await post();
+
+    expect((await res.json()).status).toBe("complete");
+    expect(Object.values(mergeStamp()!.ExpressionAttributeValues as Record<string, unknown>)).toEqual(
+      expect.arrayContaining(["base9", "github"])
+    );
+    // No prUrl to stamp in this shape — only what GitHub actually proved.
+    expect(stampedFields(mergeStamp()!)).toEqual(["mergeCommit", "mergeVerifiedBy"]);
+    expect(fetchCalls).toHaveLength(2);
+  });
+
+  it("compare says ahead → PROVABLY unmerged: honest blocked close naming the branch, no stamp", async () => {
+    h.state.workflow = shipRun();
+    stubGitHub([
+      ["/pulls?head=", []],
+      ["/compare/", { status: "ahead", ahead_by: 4 }],
+    ]);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    const body = await res.json();
+    expect(body.status).toBe("static-ci-only");
+    expect(body.reason).toContain("not merged");
+    expect(body.reason).toContain("4 commit(s) ahead of main");
+    expect(mergeStamp()).toBeUndefined();
+    // The work did not ship, so the epic must not be rolled up.
+    expect(h.state.updates.find((u) => u.TableName === "agentcore-hub-tickets")).toBeUndefined();
+    expect(h.state.events.some((e) => e.type === "workflow.complete")).toBe(false);
+    error.mockRestore();
+  });
+
+  it("GitHub unreachable → merged:null, self-reported evidence decides exactly as before", async () => {
+    h.state.workflow = shipRun();
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("ECONNRESET");
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    // Unchanged pre-D1.3 outcome: nothing recorded a ship, so static-ci-only.
+    expect((await res.json()).status).toBe("static-ci-only");
+    expect(mergeStamp()).toBeUndefined(); // an unreachable API proves nothing
+    error.mockRestore();
+    warn.mockRestore();
+  });
+
+  it("no PAT → no probe at all (not one fetch), verdict untouched", async () => {
+    delete process.env.GITHUB_PAT;
+    h.state.workflow = shipRun();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    expect((await res.json()).status).toBe("static-ci-only");
+    expect(fetchCalls).toEqual([]);
+    error.mockRestore();
+  });
+
+  it("SECURITY: a recorded BLOCK is never overwritten by a merge proof", async () => {
+    // A merge does not un-block a deploy-blocked ticket. The offender already said
+    // something, so it is skipped by the stamp and its blockReason survives.
+    h.state.workflow = shipRun({ outcome: "deploy-blocked", blockReason: "smoke tests failed in prod" });
+    stubGitHub([["/pulls?head=", [{ merged_at: "x", merge_commit_sha: "9f1c2ab", html_url: "u" }]]]);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    const body = await res.json();
+    expect(body.status).toBe("deploy-blocked");
+    expect(body.reason).toContain("smoke tests failed in prod");
+    expect(mergeStamp()).toBeUndefined();
+    error.mockRestore();
+  });
+
+  it("a ship ticket that already proved its merge is never probed", async () => {
+    h.state.workflow = shipRun({ mergeCommit: "already-proven" });
+    await load();
+    const res = await post();
+    expect((await res.json()).status).toBe("complete");
+    expect(fetchCalls).toEqual([]); // the probe only runs when the verdict is short
+  });
+
+  it("no repoConfig → no probe, and never a false 'unmerged' (nothing to probe proves nothing)", async () => {
+    const { repoConfig, ...noRepo } = shipRun();
+    void repoConfig;
+    h.state.workflow = noRepo;
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load();
+    const res = await post();
+    expect((await res.json()).status).toBe("static-ci-only");
+    expect(fetchCalls).toEqual([]);
+    error.mockRestore();
   });
 });

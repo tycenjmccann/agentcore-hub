@@ -266,5 +266,69 @@ class ParkedAdvisory(unittest.TestCase):
         self.assertEqual(reviews[0]["outcome"], "unresolved")
 
 
+
+class InterventionsByType(unittest.TestCase):
+    """TEAM-3991 D2.4 — manual vs automatic interventions.
+
+    Reporting only the manual side made every self-healed run look untouched and
+    every fragile run look like an operator problem. The split is the actual health
+    signal: 6 automatic + 0 manual is the pipeline working; 6 manual is a pipeline
+    that cannot self-heal.
+    """
+
+    def test_interventions_by_type(self):
+        metrics = compute_metrics(dossier(
+            events=[
+                # manual — keyed by the toolkit verb, so a new verb needs no code change
+                ev(1, "manager.intervention", {"action": "dispatch", "ticketId": "TEAM-2"}),
+                ev(2, "manager.intervention", {"action": "dispatch", "ticketId": "TEAM-3"}),
+                ev(3, "manager.intervention", {"action": "mark_done", "ticketId": "TEAM-4"}),
+                ev(4, "manager.intervention", {"action": "retry", "agentId": "dev"}),
+                ev(5, "manager.intervention", {"action": "unstick"}),
+                # automatic — one bucket per orchestrator recovery mechanism
+                ev(6, "orchestrator.unblocked", {"workflowId": "wf-1", "unblocked": ["TEAM-5"]}),
+                ev(7, "orchestrator.unblocked", {"workflowId": "wf-1", "unblocked": ["TEAM-6"]}),
+                ev(8, "orchestrator.recompute", {"trigger": "gate-done", "candidates": ["TEAM-7"]}),
+                ev(9, "agent.error", {"agentId": "dev", "reason": "dead_session"}),
+                ev(10, "agent.stalled", {"agentId": "qa", "ticketId": "TEAM-8"}),
+                ev(11, "agent.completion_synthesized", {"ticketId": "TEAM-9"}),
+                ev(12, "workflow.gate_bypass", {"mergeCommit": "abc1234"}),
+            ],
+        ))
+
+        by_type = metrics["interventionsByType"]
+        self.assertEqual(by_type["manual"],
+                         {"dispatch": 2, "mark_done": 1, "retry": 1, "unstick": 1})
+        self.assertEqual(by_type["automatic"], {
+            "unblocked": 2, "recompute": 1, "redispatch": 2,
+            "synthesized": 1, "gate_bypass": 1,
+        })
+        # managerInterventions is UNCHANGED — the existing consumers keep working.
+        self.assertEqual(len(metrics["managerInterventions"]), 5)
+
+    def test_quiet_run_reports_explicit_zeros_not_a_missing_key(self):
+        """A healthy run must be distinguishable from a run whose metrics were
+        never computed, so every bucket is always present."""
+        by_type = compute_metrics(dossier())["interventionsByType"]
+        self.assertEqual(by_type["manual"], {})
+        self.assertEqual(sorted(by_type["automatic"]),
+                         ["gate_bypass", "recompute", "redispatch", "synthesized", "unblocked"])
+        self.assertEqual(set(by_type["automatic"].values()), {0})
+
+    def test_an_ordinary_agent_error_is_not_a_redispatch(self):
+        """Only a DEAD-SESSION error is a recovery. A plain agent failure is a
+        failure — counting it as a self-heal would inflate the health signal."""
+        by_type = compute_metrics(dossier(events=[
+            ev(1, "agent.error", {"agentId": "dev", "error": "TypeError: undefined is not a function"}),
+            ev(2, "agent.error", {"agentId": "qa", "reason": "dead_session detected by watchdog"}),
+        ]))["interventionsByType"]
+        self.assertEqual(by_type["automatic"]["redispatch"], 1)
+
+    def test_an_unlabelled_intervention_is_bucketed_as_unknown_not_dropped(self):
+        by_type = compute_metrics(dossier(events=[
+            ev(1, "manager.intervention", {"note": "no action field"}),
+        ]))["interventionsByType"]
+        self.assertEqual(by_type["manual"], {"unknown": 1})
+
 if __name__ == "__main__":
     unittest.main()

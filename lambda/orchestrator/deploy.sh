@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs reconcile-sweep.mjs sweep-scan.mjs repo-check.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs reconcile-sweep.mjs sweep-scan.mjs repo-check.mjs gate-bypass.mjs evidence.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -121,6 +121,16 @@ if [ -n "${RECONCILE_SWEEP_MODE:-}" ]; then
   RECONCILE_VARS=",RECONCILE_SWEEP_MODE=${RECONCILE_SWEEP_MODE}"
 fi
 
+# Gate-bypass detection rollout (TEAM-3991 D1.1). Tri-state off|shadow|enforce.
+# Unlike the sweeps this defaults to ENFORCE in code (gate-bypass.mjs
+# gateBypassMode()) and in template.yaml, so an unset value is already the safe
+# posture; only forward an explicit override (e.g. GATE_BYPASS_MODE=shadow to
+# observe first on a noisy repo).
+GATE_BYPASS_VARS=""
+if [ -n "${GATE_BYPASS_MODE:-}" ]; then
+  GATE_BYPASS_VARS=",GATE_BYPASS_MODE=${GATE_BYPASS_MODE}"
+fi
+
 # CI/CD pipeline mode (PR #263): when set, buildAgentContext surfaces a
 # "## Pipeline Mode" block so the CI/QA/release-manager blueprints read pipeline
 # results instead of shelling builds/deploys. Only forwarded when explicitly set;
@@ -130,7 +140,7 @@ if [ -n "${PIPELINE_ENABLED:-}" ]; then
   PIPELINE_VARS=",PIPELINE_ENABLED=${PIPELINE_ENABLED}"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}}"
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${GATE_BYPASS_VARS}${PIPELINE_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}}"
 

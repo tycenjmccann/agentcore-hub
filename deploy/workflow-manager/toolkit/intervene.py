@@ -27,9 +27,9 @@ The two stuck-agent decisions (the common case) are `retry` and `mark-done`:
 
 Usage:
   python3 intervene.py unstick   <workflowId> [--note "..."]
-  python3 intervene.py retry     <workflowId> <agentId> [--note "..."]
+  python3 intervene.py retry     <workflowId> <agentId> [--note "..."] [--resume]
   python3 intervene.py mark-done <workflowId> <ticketId> --evidence "PR #87 / s3 key / streamed PASS"
-  python3 intervene.py dispatch  <workflowId> <ticketId> [--note "..."]
+  python3 intervene.py dispatch  <workflowId> <ticketId> [--note "..."] [--resume]
   python3 intervene.py comment   <workflowId> <ticketId> <text>
   python3 intervene.py escalate  <workflowId> <message>
   python3 intervene.py complete  <workflowId> [--reason "..."]
@@ -99,21 +99,44 @@ def api_post(path, body=None):
             return json.loads(res.read().decode() or "{}")
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:500]
-        # Only a lease refusal carries code=LEASE_LIVE — other 409s (e.g.
-        # completing an already-terminal workflow) have no --force escape and
-        # must not be reported as one.
-        lease_live = False
+        # Refusals are TYPED by the API (`code`), so each one gets the operator
+        # note that actually resolves it. An untyped 409 (e.g. completing an
+        # already-terminal workflow) has no escape hatch and must not be dressed
+        # up as one.
+        payload = {}
         try:
-            lease_live = json.loads(detail).get("code") == "LEASE_LIVE"
-        except (ValueError, AttributeError):
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except ValueError:
             pass
-        if e.code == 409 and lease_live:
+        code = payload.get("code")
+        message = payload.get("message") or payload.get("error") or detail
+        if e.code == 409 and code == "LEASE_LIVE":
             # Live invocation lease (R3): the agent is likely still working.
             raise SystemExit(
                 f"REFUSED (lease live): {detail}\n"
                 "Verify death first (pull_dossier lastText / session logs). "
                 "If genuinely dead, re-run with --force."
             )
+        if e.code == 409 and code == "PR_EXISTS":
+            # TEAM-3991 D1.5 — the agent already has a PR for this ticket. A cold
+            # re-dispatch makes it re-investigate work that is already on GitHub
+            # (prod TEAM-3790). Exit 2 so a caller can branch on "resumable"
+            # rather than parsing prose.
+            print(
+                f"REFUSED (PR exists): PR #{payload.get('number')} exists — resume, don't re-investigate.\n"
+                f"{message}\n"
+                f"  PR:   {payload.get('prUrl')} ({payload.get('state')}"
+                f"{', merged' if payload.get('merged') else ''})\n"
+                "  Next: read the PR (and its review comments) first. If the agent should carry on "
+                "from it, re-run with --resume; the agent is then handed a resume context instead of "
+                "a blank session. If the PR already contains the work, `mark-done` it instead.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        if e.code == 409 and code:
+            raise SystemExit(f"REFUSED ({code}): {message}")
         raise SystemExit(f"API {e.code}: {detail}")
 
 
@@ -162,6 +185,12 @@ def cmd_retry(args):
     body = {"agentId": args.agent_id}
     if getattr(args, "force", False):
         body["force"] = True
+    # TEAM-3991 D1.5 — without --resume the endpoint refuses (409 PR_EXISTS) when
+    # the agent already has a PR for this ticket, because a cold restart makes it
+    # re-investigate work that is already on GitHub. With --resume it proceeds and
+    # the agent is handed a resume context pointing at that PR.
+    if getattr(args, "resume", False):
+        body["resume"] = True
     result = api_post(f"/api/workflow/{args.workflow_id}/retry", body)
     publish_intervention(args.workflow_id, "retry", {
         "agentId": args.agent_id, "ticketId": result.get("ticketId"), "note": args.note,
@@ -202,6 +231,9 @@ def cmd_dispatch(args):
     body = {"ticketId": args.ticket_id}
     if getattr(args, "force", False):
         body["force"] = True
+    # See cmd_retry — same PR-aware guard on the dispatch path (D1.5).
+    if getattr(args, "resume", False):
+        body["resume"] = True
     result = api_post(f"/api/workflow/{args.workflow_id}/nudge", body)
     publish_intervention(args.workflow_id, "dispatch", {
         "ticketId": args.ticket_id, "note": args.note,
@@ -238,7 +270,25 @@ def cmd_mark_done(args):
 
     The evidence is not optional — closing a ticket with no proof the work
     shipped is exactly the false-green this guards against. If you cannot cite
-    the deliverable, the work is NOT done: `retry` instead."""
+    the deliverable, the work is NOT done: `retry` instead.
+
+    TEAM-3991 D1.3 — this is now ONE call to
+    `POST /api/workflow/<id>/tickets/mark-done`, which owns the whole operation
+    server-side: it harvests evidence in priority order (the agent's own
+    `completions/<ticketId>.json` record → a GitHub branch/PR probe → the
+    `--evidence` text as a last resort), writes it onto the task entry stamped
+    `evidenceSource: "manager"`, then transitions. Two reasons the work moved
+    there and not here:
+
+      * the harvest can find REAL evidence (the record the agent wrote just
+        before dying, or the branch it pushed) and prefer it over the operator's
+        prose, so the run carries the agent's actual deliverable forward;
+      * `markedDoneBy` is taken from the authenticated request identity, not from
+        anything this client sends — an attribution the toolkit cannot forge.
+
+    The client-side human-gate guard below is kept deliberately: the server
+    refuses too (409 PROTECTED_TICKET), but refusing before the network call
+    means an operator pointed at a human review gate is told so immediately."""
     if not (args.evidence or "").strip():
         raise SystemExit(
             "REFUSED: mark-done requires --evidence citing the shipped deliverable "
@@ -247,25 +297,25 @@ def cmd_mark_done(args):
         )
     if TICKET_PROVIDER != "jira":
         refuse_if_protected(get_ticket(args.ticket_id))
-    # 1. Record the evidence as a comment BEFORE closing, so the audit trail
-    #    survives even if the transition half-fails.
-    comment = api_post(f"/api/workflow/{args.workflow_id}/tickets/comment", {
+    result = api_post(f"/api/workflow/{args.workflow_id}/tickets/mark-done", {
         "ticketId": args.ticket_id,
-        "author": "workflow-manager",
-        "content": f"[mark-done] Agent finished but never reported. Evidence work shipped: {args.evidence}",
-    })
-    # 2. Transition the single ticket to done → orchestrator cascades next phase.
-    result = api_post(f"/api/workflow/{args.workflow_id}/tickets/transition", {
-        "ticketId": args.ticket_id,
-        "targetStatus": "done",
-        "comment": f"Closed by Workflow Manager (agent finished, no report_completion). Evidence: {args.evidence}",
+        "evidence": args.evidence,
     })
     publish_intervention(args.workflow_id, "mark_done", {
         "ticketId": args.ticket_id, "evidence": args.evidence[:500],
+        "evidenceSource": result.get("evidenceSource"),
     })
+    # Which evidence the server actually recorded matters to the operator: a
+    # `manager` source means it fell back to the text they typed, while a branch /
+    # PR / record source means the agent's real deliverable was found and carried
+    # forward.
     print(json.dumps({
         "action": "mark_done", "ticketId": args.ticket_id,
-        "commented": comment.get("success", False), **result,
+        "evidenceSource": result.get("evidenceSource"),
+        "branch": result.get("branch"),
+        "commitSha": result.get("commitSha"),
+        "prUrl": result.get("prUrl"),
+        **result,
     }, indent=2))
 
 
@@ -474,6 +524,9 @@ def main():
     p.add_argument("--note", default="")
     p.add_argument("--force", action="store_true",
                    help="steal a LIVE lease — only with evidence the session is dead")
+    p.add_argument("--resume", action="store_true",
+                   help="proceed even though a PR for the ticket exists; the agent is "
+                        "handed a resume context pointing at it instead of starting cold")
     p.set_defaults(func=cmd_retry)
 
     p = sub.add_parser("dispatch")
@@ -482,6 +535,9 @@ def main():
     p.add_argument("--note", default="")
     p.add_argument("--force", action="store_true",
                    help="steal a LIVE lease — only with evidence the session is dead")
+    p.add_argument("--resume", action="store_true",
+                   help="proceed even though a PR for the ticket exists; the agent is "
+                        "handed a resume context pointing at it instead of starting cold")
     p.set_defaults(func=cmd_dispatch)
 
     p = sub.add_parser("comment")
