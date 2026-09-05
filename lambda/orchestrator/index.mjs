@@ -112,6 +112,10 @@ const CASCADE_EXTENDED_STATES_MODE = resolveCascadeMode(process.env.CASCADE_EXTE
 // DDB reads/writes. shadow/enforce only when the operator explicitly sets the
 // var (deploy.sh forwards it only when set).
 const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
+// Level-triggered dispatch (TEAM-4060): off | shadow | enforce, default off.
+// When enforce, the done-cascade invokes a newly-unblocked dependent in-process
+// instead of waiting for its Ready webhook — closes the dispatch dead-zone.
+const LEVEL_TRIGGER_DISPATCH = process.env.LEVEL_TRIGGER_DISPATCH || "off";
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -307,6 +311,22 @@ async function redispatchTicket(workflow, ticket) {
   return true;
 }
 
+/**
+ * Level-triggered dispatch (TEAM-4060). Invoke a now-dispatchable dependent
+ * IN-PROCESS instead of waiting for its provider Ready-status webhook. Routes
+ * through the SAME handler the webhook path uses (handleTicketReadyUnified), so
+ * every guard is reused for free — cancel-guard, human-gate parking, the claim
+ * CAS (sole dedup arbiter; a webhook that also fires no-ops), the In Progress
+ * transition, phase advancement, and feature-branch creation. Re-fetch the
+ * ticket so assignee/parent/status are authoritative (the cascade snapshot came
+ * off the eventually-consistent parentId GSI). Injected into the cascade as
+ * `dispatchReady`; the cascade wraps this in its own non-fatal try/catch.
+ */
+async function dispatchReadyDependent(_workflow, sibling) {
+  const fresh = (await getTicket(sibling.ticketId)) || sibling;
+  await handleTicketReadyUnified(sibling.ticketId, fresh);
+}
+
 // One detector per warm container so its per-agent median cache is reused
 // across the 5-minute sweeps (rebuilt from scratch on a cold start).
 let _detector = null;
@@ -344,6 +364,11 @@ function getCascade() {
     publishEvent,
     // Extended states (commit 4b) — off | shadow | enforce (TEAM-3747 D1).
     extendedStates: CASCADE_EXTENDED_STATES_MODE,
+    // Level-triggered dispatch (TEAM-4060) — off | shadow | enforce. When on,
+    // the cascade invokes newly-unblocked dependents in-process (dispatchReady)
+    // instead of waiting for the Ready webhook.
+    levelTriggerDispatch: LEVEL_TRIGGER_DISPATCH,
+    dispatchReady: dispatchReadyDependent,
     lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
     eventsTable: EVENTS_TABLE,
     workflowsTable: WORKFLOWS_TABLE,
