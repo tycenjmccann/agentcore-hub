@@ -69,6 +69,20 @@ export function validateSourcesShape(sources: unknown): string | null {
   return null;
 }
 
+/**
+ * TEAM-4090: a persisted row's `input.sources` is untrusted the same way any one
+ * source item is (see the file header) — a caller that skips the REST validator
+ * can persist `sources` as a non-empty STRING or an array-like OBJECT
+ * (`{ length: 1, 0: {...} }`), both of which pass a `.length > 0` guard and then
+ * throw "sources.map is not a function", blanking the whole board. Only
+ * Array.isArray proves `.map` is safe to call.
+ */
+export function sourcesForDisplay(input: unknown): unknown[] {
+  if (typeof input !== "object" || input === null) return [];
+  const sources = (input as Record<string, unknown>).sources;
+  return Array.isArray(sources) ? sources : [];
+}
+
 /** Everything the board needs to render one source, all of it already a string
  *  and already redacted. Nothing here may be interpolated into JSX raw. */
 export interface SourceDisplay {
