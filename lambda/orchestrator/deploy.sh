@@ -129,6 +129,12 @@ PIPELINE_VARS=""
 if [ -n "${PIPELINE_ENABLED:-}" ]; then
   PIPELINE_VARS=",PIPELINE_ENABLED=${PIPELINE_ENABLED}"
 fi
+# TEAM-4044: PIPELINE_REPOS scopes that block to the repos the pipeline actually
+# deploys (comma-separated owner/repo). A run on any other repo gets the legacy
+# (DEPLOY.md / self-run) path. Unset → every repo (single-repo installs).
+if [ -n "${PIPELINE_REPOS:-}" ]; then
+  PIPELINE_VARS="${PIPELINE_VARS},PIPELINE_REPOS=${PIPELINE_REPOS}"
+fi
 
 # Level-triggered dispatch (TEAM-4060): off | shadow | enforce. When enforce, the
 # done-cascade invokes a newly-unblocked dependent IN-PROCESS instead of waiting

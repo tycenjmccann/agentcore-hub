@@ -177,6 +177,7 @@ After all stages are complete, run the full verification suite:
 | `HARNESS_EXECUTION_ROLE_ARN` | IAM role for creating new harness agents (enables Deploy button on Build page) |
 | `MCP_SERVERS` | JSON array of MCP server configs for custom tooling beyond GitHub |
 | `PIPELINE_ENABLED` | Fleet/orchestrator context — CI/QA/release-manager blueprints read pipeline results instead of shelling builds |
+| `PIPELINE_REPOS` | Orchestrator — comma-separated `owner/repo` list the pipeline actually deploys; runs on any other repo take the legacy DEPLOY.md/self-run path. Unset = every repo |
 | `NEXT_PUBLIC_PIPELINE_ENABLED` | Build-time — shows the `/pipeline` tab (Pipeline module) |
 
 ## How It Works
