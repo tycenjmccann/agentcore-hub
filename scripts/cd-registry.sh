@@ -43,8 +43,8 @@ import json,sys
 d=json.load(sys.stdin); repos=d.get("repos",[])
 if not repos: print("(no repos registered — every run is a HANDOFF: PR left open, no merge/deploy)"); sys.exit(0)
 for e in repos:
-    how = f"pipeline={e['pipeline']}" + (f" ({e['region']})" if e.get("region") else "") if e.get("pipeline") else f"deploy-doc={e.get('deployDoc','DEPLOY.md')}"
-    print(f"{e['repo']:<45} {how}" + (f"  # {e['notes']}" if e.get("notes") else ""))'
+    how = ("pipeline=" + e["pipeline"] + (" (" + e["region"] + ")" if e.get("region") else "")) if e.get("pipeline") else "deploy-doc=" + e.get("deployDoc", "DEPLOY.md")
+    print(e["repo"].ljust(45), how, ("  # " + e["notes"]) if e.get("notes") else "")'
     ;;
   add)
     repo="${1:?owner/repo or GitHub URL required}"; shift
