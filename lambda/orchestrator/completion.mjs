@@ -23,7 +23,7 @@
  * a dev still gates the SHIP phase), else the assignee's roster phase.
  */
 
-const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
+export const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
 
 /**
  * TEAM-3747 D2 — lifecycle-integrity terminal outcomes ("no green close over

@@ -522,6 +522,80 @@ export async function appendReviewAuthorization(workflowId, gateTicketId, author
 }
 
 /**
+ * Rework-loop lineage ledger (TEAM-4113). Same two-write if_not_exists seed as
+ * ensureReviewGateLedger, but keyed by a `${workflowId}:${phase}` LINEAGE key
+ * (which spans distinct fix-ticket ids) instead of a single gate ticket id, so
+ * the per-phase rework count survives the loop hopping ticket ids — the exact
+ * blind spot the per-gate review-cap has. Concurrent fix-dones for the same
+ * lineage seed idempotently rather than clobbering each other's rounds.
+ */
+async function ensureReworkLineageLedger(workflowId, lineageKey) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET reworkLineage = if_not_exists(reworkLineage, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET reworkLineage.#k = if_not_exists(reworkLineage.#k, :seed)",
+    ExpressionAttributeNames: { "#k": lineageKey },
+    ExpressionAttributeValues: { ":seed": { rounds: [], authorizations: [], escalations: [] } },
+  }));
+}
+
+/**
+ * Append one rework round to a lineage ledger and return the POST-write ledger
+ * `{ rounds, authorizations, escalations }` so the caller counts a concurrent
+ * cycle's round too (list_append, never a whole-array rewrite — a lost round is
+ * a cap that trips late). Returns null when the row is gone (a caller must not
+ * read that as "zero rounds" and silently reset the cap).
+ */
+export async function appendReworkRound(workflowId, lineageKey, round) {
+  await ensureReworkLineageLedger(workflowId, lineageKey);
+  const res = await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression:
+      "SET reworkLineage.#k.rounds = list_append(if_not_exists(reworkLineage.#k.rounds, :empty), :r)",
+    ExpressionAttributeNames: { "#k": lineageKey },
+    ExpressionAttributeValues: { ":empty": [], ":r": [round] },
+    ReturnValues: "ALL_NEW",
+  }));
+  return res.Attributes?.reworkLineage?.[lineageKey] || null;
+}
+
+/** Record that a lineage hit its rework cap and was escalated. `decision:null`
+ * means the escalation is still open — the idempotency key that stops a
+ * subsequent fix-done from re-publishing rework.cap_reached. */
+export async function appendReworkEscalation(workflowId, lineageKey, escalation) {
+  await ensureReworkLineageLedger(workflowId, lineageKey);
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression:
+      "SET reworkLineage.#k.escalations = list_append(if_not_exists(reworkLineage.#k.escalations, :empty), :e)",
+    ExpressionAttributeNames: { "#k": lineageKey },
+    ExpressionAttributeValues: { ":empty": [], ":e": [escalation] },
+  }));
+}
+
+/** Append a human `DECISION: continue` authorization — resets the lineage
+ * count from `resetAtRound` (same contract as appendReviewAuthorization). */
+export async function appendReworkAuthorization(workflowId, lineageKey, authorization) {
+  await ensureReworkLineageLedger(workflowId, lineageKey);
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression:
+      "SET reworkLineage.#k.authorizations = list_append(if_not_exists(reworkLineage.#k.authorizations, :empty), :a)",
+    ExpressionAttributeNames: { "#k": lineageKey },
+    ExpressionAttributeValues: { ":empty": [], ":a": [authorization] },
+  }));
+}
+
+/**
  * Append a human notification atomically (no full-array rewrite). Bumps
  * notifVersion in the same write so a concurrent ackNotifications CAS that
  * read the pre-append list fails and re-reads instead of overwriting the

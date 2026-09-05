@@ -46,7 +46,8 @@ import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { createMergeOnGreen } from "./merge-on-green.mjs";
 import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stability.mjs";
 import { shouldGateShipDispatch, normalizeShipDispatchMode, emitShipDispatchMetrics } from "./ship-dispatch-gate.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
@@ -133,6 +134,13 @@ const SHIP_HEAD_STABILITY = process.env.SHIP_HEAD_STABILITY || "off";
 // truthy → off); default off = byte-identical (helper returns dispatch without
 // reading anything). Same fail-safe direction as SHIP_HEAD_STABILITY.
 const SHIP_DISPATCH_GATE = normalizeShipDispatchMode(process.env.SHIP_DISPATCH_GATE);
+// Default OFF (byte-identical) when UNSET; only a PRESENT-but-garbage value
+// fails safe to shadow (normalizeReworkLoopMode), never silently off — an
+// operator who typed a mode wanted at least observation, an operator who set
+// nothing wanted nothing.
+const REWORK_LOOP_CAP = process.env.REWORK_LOOP_CAP
+  ? normalizeReworkLoopMode(process.env.REWORK_LOOP_CAP)
+  : "off";
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -484,6 +492,75 @@ function getReviewCap() {
     log: (msg) => console.log(`[orchestrator] ${msg}`),
   });
   return _reviewCap;
+}
+
+// ─── Rework-loop cap (TEAM-4113) ─────────────────────────────────────────────
+// Per-(workflow,phase) lineage backstop on the review→rework loop: counts fix
+// tickets reaching Done PER PHASE (not per gate-ticket id, which the review-cap
+// keys on and which resets when the loop hops to a new ticket id). Fires only
+// when REWORK_LOOP_CAP != off; default off ⇒ getReworkLoopCap is never called.
+let _reworkLoopCap = null;
+function getReworkLoopCap() {
+  if (_reworkLoopCap) return _reworkLoopCap;
+  _reworkLoopCap = createReworkLoopCap({
+    store,
+    publishEvent,
+    // enforce-only, best-effort: parks the run's OPEN release-manager escalation
+    // gate if one exists; a gate-less phase degrades to the cap_reached signal.
+    parkRunEscalationGate,
+    fixKinds: FIX_KINDS,
+    mode: REWORK_LOOP_CAP,
+    log: (msg) => console.log(`[orchestrator] ${msg}`),
+  });
+  return _reworkLoopCap;
+}
+
+/**
+ * Best-effort park of the run's OPEN release-manager ship-review escalation
+ * gate (TEAM-4113 enforce). Only that gate has an unambiguous shape to park; a
+ * phase with no human gate (dev/QA) returns false and enforce relies on the
+ * rework.cap_reached signal instead (creating a per-phase gate is Phase-2).
+ * Never throws — the caller already fails open on any error.
+ */
+async function parkRunEscalationGate(workflow, _phase) {
+  try {
+    const epicId = workflow?.epicId || workflow?.parentId;
+    if (!epicId) return false;
+    const kids = (await getChildTickets(epicId)) || [];
+    const openGate = kids.find(
+      (t) =>
+        ESCALATION_GATE_TITLE.test(t?.title || t?.summary || "") &&
+        !["done", "cancelled"].includes(String(t?.status).toLowerCase())
+    );
+    if (!openGate) return false;
+    const gid = openGate.ticketId || openGate.id || openGate.key;
+    await parkGateForHuman(gid, openGate.assignee || "human:reviewer", workflow);
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] parkRunEscalationGate failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
+}
+
+/**
+ * Observe a just-completed ticket for the rework-loop cap (TEAM-4113). Called
+ * from BOTH done paths. Cheap + non-fatal: returns at once for a non-fix ticket
+ * or when REWORK_LOOP_CAP=off, and never lets a ledger/publish failure escape
+ * into the done cascade.
+ */
+async function observeReworkLoop(workflow, ticket) {
+  if (REWORK_LOOP_CAP === "off" || !ticket) return;
+  try {
+    const phase = ticket.phase || getAgentDef(ticket.assignee)?.phase;
+    await getReworkLoopCap().observe({
+      workflow,
+      ticket,
+      phase,
+      feedback: ticket.resolutionComment || ticket.description || "",
+    });
+  } catch (err) {
+    console.warn(`[orchestrator] rework-loop observe failed (non-fatal): ${err?.message || err}`);
+  }
 }
 
 // ─── Merge-on-green (TEAM-4110) ──────────────────────────────────────────────
@@ -1033,6 +1110,9 @@ export async function handleTicketDoneUnified(ticketId) {
   }
 
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
+
+  // TEAM-4113 — observe the per-phase rework loop (no-op when off / non-fix).
+  await observeReworkLoop(workflow, ticket);
 
   // Always check workflow completion — the last ticket to close triggers this
   if (await isWorkflowComplete(parentId, workflow, assignee)) {
@@ -2729,6 +2809,12 @@ export async function handleTicketDone(ticketId, image) {
 
   // Publish event for UI
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
+
+  // TEAM-4113 — observe the per-phase rework loop. The stream image is raw DDB,
+  // so fetch the normalized ticket (plain spawnedBy/phase); mode-gated read.
+  if (REWORK_LOOP_CAP !== "off") {
+    await observeReworkLoop(workflow, await getTicket(ticketId).catch(() => null));
+  }
 
   // Check if workflow is complete (all tickets done)
   if (unblocked.length === 0) {

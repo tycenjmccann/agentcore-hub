@@ -95,6 +95,18 @@ export default defineConfig({
       // never wedge, repairBlocker prefers verification/CI, and mode normalization
       // is the same strict allow-list as ship-head (legacy on/true/1 → off).
       "lambda/orchestrator/ship-dispatch-gate.test.mjs",
+      // rework-loop-cap.mjs (TEAM-4113) — the per-(workflow,phase) lineage
+      // backstop the per-gate review-cap can't provide: counts fix tickets per
+      // PHASE so a loop hopping ticket ids still accumulates. DI coverage of
+      // off|shadow|enforce (fail-safe to SHADOW, opposite of the ship gates),
+      // distinct-id round counting, DECISION: continue reset, idempotent
+      // escalation, and ledger-failure fail-open.
+      "lambda/orchestrator/rework-loop-cap.test.mjs",
+      // rework-loop-replay (TEAM-4113) — a 9-round QA→dev runaway that files a
+      // fresh fix ticket (new gate id) each round, replayed through the REAL
+      // cap: asserts the lineage cap trips at maxRounds and signals ONCE, while
+      // a per-gate-id ledger (the review-cap's keying) never reaches the cap.
+      "lambda/orchestrator/rework-loop-replay.test.mjs",
       // done-handlers-cascade (TEAM-3688 F3) — HANDLER-level cascade coverage.
       // Invokes the REAL handleTicketDoneUnified + handleTicketDone from index.mjs
       // through the REAL cascade (cascade.mjs/lease.mjs unmocked; only AWS/store
