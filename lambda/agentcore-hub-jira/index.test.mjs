@@ -14,7 +14,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { adfToText, getIssue } from "./index.mjs";
+import { adfToText, getIssue, handler } from "./index.mjs";
 
 // ─── Finding 1: adfToText ──────────────────────────────────────────────────────
 
@@ -197,6 +197,128 @@ test("getIssue: comment fetch failure returns the mapped issue with comments: []
     assert.equal(result.ticketId, "TEAM-2");
     assert.equal(result.title, "Another");
     assert.deepEqual(result.comments, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── createTicket dedupe: a resolved same-summary ticket is not a live duplicate ──
+
+test("createTicket: a Done same-summary ticket is NOT a duplicate — a new ticket is created", async () => {
+  const originalFetch = globalThis.fetch;
+  const posts = [];
+
+  const SUMMARY = "Escalation: ship-review not converging (TEAM-1)";
+
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    // Dedupe search — returns a prior gate with the SAME summary/labels, Done.
+    if (url.includes("/rest/api/3/search/jql")) {
+      return new Response(
+        JSON.stringify({
+          issues: [
+            {
+              key: "TEAM-10",
+              fields: { summary: SUMMARY, status: { name: "Done" }, labels: ["wf:run1"], issuetype: { name: "Task" } },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.endsWith("/rest/api/3/issue") && method === "POST") {
+      posts.push(url);
+      return new Response(JSON.stringify({ key: "TEAM-11" }), { status: 201 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+
+  try {
+    const result = await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { summary: SUMMARY, workflow_id: "run1" },
+    });
+    assert.equal(posts.length, 1, `expected one create POST, got ${posts.length}`);
+    assert.equal(result.ticketId, "TEAM-11");
+    assert.ok(!result.deduplicated, "a Done gate must not be returned as a dedupe hit");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("createTicket: a non-Done same-summary ticket IS still returned as a duplicate", async () => {
+  const originalFetch = globalThis.fetch;
+  const posts = [];
+
+  const SUMMARY = "Escalation: ship-review not converging (TEAM-1)";
+
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    if (url.includes("/rest/api/3/search/jql")) {
+      return new Response(
+        JSON.stringify({
+          issues: [
+            {
+              key: "TEAM-10",
+              fields: { summary: SUMMARY, status: { name: "To Do" }, labels: ["wf:run1"], issuetype: { name: "Task" } },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.endsWith("/rest/api/3/issue") && method === "POST") {
+      posts.push(url);
+      return new Response(JSON.stringify({ key: "TEAM-11" }), { status: 201 });
+    }
+    // reconcileBlockersAndStatus with no blockers/assignee makes no other calls.
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+
+  try {
+    const result = await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { summary: SUMMARY, workflow_id: "run1" },
+    });
+    assert.equal(posts.length, 0, "a live duplicate must not trigger a create");
+    assert.equal(result.ticketId, "TEAM-10");
+    assert.ok(result.deduplicated, "expected the live duplicate to be flagged deduplicated");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── getIssue accepts the gateway `ticket_id` param ──────────────────────────────
+
+test("handler(Tickets___get_issue) accepts ticket_id and hits Jira with the real key", async () => {
+  const originalFetch = globalThis.fetch;
+  const requested = [];
+
+  globalThis.fetch = async (url) => {
+    requested.push(url);
+    if (url.includes("/comment")) {
+      return new Response(JSON.stringify({ comments: [], total: 0, startAt: 0, maxResults: 50 }), { status: 200 });
+    }
+    return new Response(
+      JSON.stringify({
+        key: "TEAM-123",
+        fields: { summary: "Gateway direct", status: { name: "In Review" }, labels: ["wf:run9"], issuetype: { name: "Task" } },
+      }),
+      { status: 200 }
+    );
+  };
+
+  try {
+    const result = await handler({
+      tool_name: "Tickets___get_issue",
+      parameters: { ticket_id: "TEAM-123" },
+    });
+    const issueUrl = requested.find((u) => !u.includes("/comment"));
+    assert.ok(issueUrl.includes("/rest/api/3/issue/TEAM-123"), `expected TEAM-123 in issue URL, got ${issueUrl}`);
+    assert.ok(!/\/issue\/undefined/.test(issueUrl), `issue key must not be undefined: ${issueUrl}`);
+    assert.equal(result.ticketId, "TEAM-123");
+    assert.equal(result.title, "Gateway direct");
+    assert.ok(!result.error, `expected a result, got error: ${result.error}`);
   } finally {
     globalThis.fetch = originalFetch;
   }
