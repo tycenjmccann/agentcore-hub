@@ -201,6 +201,7 @@ function makeWorkflow() {
     epicId: PARENT,
     workflowDefId: "software-delivery",
     input: { title: "t" },
+    repoConfig: { layout: "multi-repo", repos: [{ platform: "backend", url: "https://github.com/o/r", defaultBranch: "main" }] },
     humanNotifications: [],
     agentTasks: Object.fromEntries([
       task("TEAM-1", DEV),
@@ -226,6 +227,8 @@ beforeEach(() => {
   h.state.s3Objects = {
     "config/agents.json": AGENTS_CONFIG,
     "config/workflows.json": WORKFLOWS_CONFIG,
+    // o/r is CD-registered → the ship phase under test is in force.
+    "config/cd-registry.json": JSON.stringify({ version: 1, repos: [{ repo: "o/r" }] }),
   };
   h.state.completions.length = 0;
   h.state.terminalClaims.length = 0;

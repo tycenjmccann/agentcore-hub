@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "description": "CD registry — the repos this hub is allowed to MERGE and DEPLOY. A workflow on a repo listed here runs the full ship phase (release manager reviews the final PR, a human approves the merge, the RM merges + deploys through `pipeline` via the Pipeline___* tools, or per the repo's DEPLOY.md when no pipeline is named). A workflow on any OTHER repo is a HANDOFF: it ends once review, QA and CI are done, the orchestrator opens the unified PR and leaves it OPEN for the owning team. This checked-in file only SEEDS s3://<ARTIFACT_BUCKET>/config/cd-registry.json on first deploy; the live registry is edited in the Workflow tab (Target Repository → CD registry) or with scripts/cd-registry.sh — never by re-copying this file. Entry shape: { \"repo\": \"owner/repo\", \"pipeline\": \"<CodePipeline name>\", \"region\": \"us-east-1\", \"deployDoc\": \"DEPLOY.md\", \"notes\": \"...\" } — only `repo` is required.",
+  "repos": []
+}

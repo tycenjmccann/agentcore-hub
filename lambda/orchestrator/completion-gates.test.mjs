@@ -142,6 +142,10 @@ vi.mock("@aws-sdk/client-s3", () => ({
       }
       const body = key === "config/agents.json" ? h.state.s3AgentsConfig
         : key === "config/workflows.json" ? (h.state.workflowsConfig || h.state.s3WorkflowsConfig)
+        // CD registry: the fixtures' repo (o/r) is registered, so the ship phase
+        // these suites exercise is in force (an unregistered repo is HANDOFF —
+        // no ship phase at all; covered by cd-handoff.test.mjs).
+        : key === "config/cd-registry.json" ? { version: 1, repos: [{ repo: "o/r" }] }
         : null;
       if (!body) throw new Error("NoSuchKey");
       return { Body: { transformToString: async () => JSON.stringify(body) } };
@@ -240,7 +244,7 @@ const WITH_FIX = [
   },
 ];
 
-const WF = { id: "wf_1", phase: "review", workflowDefId: "software-delivery", epicId: "EPIC-1", input: { title: "t" } };
+const WF = { id: "wf_1", phase: "review", workflowDefId: "software-delivery", epicId: "EPIC-1", input: { title: "t" }, repoConfig: { layout: "multi-repo", repos: [{ platform: "backend", url: "https://github.com/o/r", defaultBranch: "main" }] } };
 
 beforeEach(() => {
   h.state.snapshots = [];

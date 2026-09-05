@@ -177,7 +177,7 @@ After all stages are complete, run the full verification suite:
 | `HARNESS_EXECUTION_ROLE_ARN` | IAM role for creating new harness agents (enables Deploy button on Build page) |
 | `MCP_SERVERS` | JSON array of MCP server configs for custom tooling beyond GitHub |
 | `PIPELINE_ENABLED` | Fleet/orchestrator context — CI/QA/release-manager blueprints read pipeline results instead of shelling builds |
-| `PIPELINE_REPOS` | Orchestrator — comma-separated `owner/repo` list the pipeline actually deploys; runs on any other repo take the legacy DEPLOY.md/self-run path. Unset = every repo |
+| `CD_REGISTRY_TTL_MS` | Orchestrator — how often the CD registry (`config/cd-registry.json` in the artifact bucket) is re-read; default 60000. Which repos the hub merges + deploys is the registry, not an env var — see "CD registry" below |
 | `NEXT_PUBLIC_PIPELINE_ENABLED` | Build-time — shows the `/pipeline` tab (Pipeline module) |
 
 ## How It Works
@@ -409,6 +409,34 @@ How it works (reuses the existing ticket cascade — no new engine):
 - In the UI ticket modal, the reviewer clicks **Approve** (→ done, the cascade resumes) or **Request changes** (→ blocked; a required note is fed back to the reworked agents).
 - Works in both backends: Jira shows the **In Review** column with a `reviewer:<who>` label; DynamoDB uses the `in_review` status.
 - `flagged` gates are opt-in checkboxes on the intake form; `always` gates apply to every run.
+
+### CD registry — who merges and deploys
+
+The hub only merges and deploys repos that are in its **CD registry**
+(`s3://<ARTIFACT_BUCKET>/config/cd-registry.json`, seeded from
+`src/config/cd-registry.json`, which ships empty). The registry decides how every
+software-delivery / bug-fix run ends:
+
+| Repo in registry? | Run ends with | Who merges + deploys |
+|---|---|---|
+| **Yes** (CD) | the full ship phase: release manager reviews the final PR → human **Merge Approval** gate → merge → deploy via the entry's `pipeline` (`Pipeline___*` tools) or the repo's `DEPLOY.md` | the hub |
+| **No** (handoff) | review, QA and CI done; the orchestrator opens the unified PR against the default branch and **leaves it open** | the owning team |
+
+For a handoff run the intake agent plans no Ship / Merge Approval / CD tickets
+(and the orchestrator auto-resolves any that appear), the release manager is
+never dispatched, and the run's `delivery` is recorded as `handoff` with the PR
+URL. Register a repo from the Workflow tab (Target Repository → **CD registry…**),
+via `POST /api/workflow/cd-registry`, or headless:
+
+```bash
+scripts/cd-registry.sh list
+scripts/cd-registry.sh add owner/repo --pipeline my-deploy-pipeline --region us-east-1
+scripts/cd-registry.sh remove owner/repo
+```
+
+Changes apply within a minute (orchestrator re-read, `CD_REGISTRY_TTL_MS`) — no
+redeploy. The pipeline's deploy stage only *seeds* the S3 file when it is
+missing; it never overwrites the live registry.
 
 ### Jira Integration (Real Jira Cloud)
 

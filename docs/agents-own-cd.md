@@ -5,6 +5,31 @@ PIPELINE mode, and where the humans sit. Design + rationale:
 [`cicd-pipeline-module-design.md`](cicd-pipeline-module-design.md); stage
 walkthrough: [`pipeline-quickstart.md`](pipeline-quickstart.md).
 
+## Which repos the hub deploys at all — the CD registry
+
+Everything below applies only to repos in the hub's **CD registry**
+(`s3://<ARTIFACT_BUCKET>/config/cd-registry.json`; `scripts/cd-registry.sh`,
+`POST /api/workflow/cd-registry`, or Workflow tab → Target Repository → *CD
+registry…*). The orchestrator decides per run, from the run's repo URL:
+
+- **Registered → CD.** Full ship phase: RM reviews the final PR, a human approves
+  the Merge Approval gate, RM merges and deploys — in *Pipeline mode* through the
+  entry's `pipeline` (`## Pipeline Mode` carries `pipeline_name`; needs
+  `PIPELINE_ENABLED`), else in *legacy mode* per the repo's `DEPLOY.md`.
+- **Not registered → handoff.** The hub never merges or deploys the repo. The
+  effective workflow def drops the ship phase and its gate; intake is told
+  `CD_REGISTERED: false` and plans no Ship / Merge Approval / CD tickets (any that
+  exist anyway are resolved Done with a comment — `cd.handoff_skip` — never
+  dispatched or paged). The run completes after review/QA/CI, the orchestrator
+  opens the unified PR with a handoff description and leaves it open for the
+  owning team, and records `delivery: { mode: "handoff", prUrl }` on the run.
+
+Why: the hub's fleet works on several repos but its pipeline deploys exactly one.
+Before the registry, every repo was told a pipeline owned its deploy, and the RM
+on a foreign repo either chased the hub's own pipeline or blocked on a deploy it
+had no credentials for (TEAM-4044). Other teams own their merge + deploy; the hub
+hands them a reviewed, tested PR.
+
 ## The RM loop (trigger → watch → fix ticket → re-trigger)
 
 1. **Merge.** After the human merge gate approves, RM merges the PR

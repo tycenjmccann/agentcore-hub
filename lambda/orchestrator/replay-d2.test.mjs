@@ -107,6 +107,8 @@ vi.mock("@aws-sdk/client-s3", () => ({
       const key = cmd?.input?.Key;
       const body = key === "config/agents.json" ? h.state.s3AgentsConfig
         : key === "config/workflows.json" ? h.state.s3WorkflowsConfig
+        // o/r is CD-registered → the replayed runs keep their ship phase.
+        : key === "config/cd-registry.json" ? { version: 1, repos: [{ repo: "o/r" }] }
         : null;
       if (!body) throw new Error("NoSuchKey");
       return { Body: { transformToString: async () => JSON.stringify(body) } };
@@ -214,6 +216,7 @@ function fixture(id, shipEntry, { shipTicketId = "SHIP-1" } = {}) {
     workflowDefId: "software-delivery",
     epicId: `EPIC-${id}`,
     featureBranch: `feature/${id}`,
+    repoConfig: { layout: "multi-repo", repos: [{ platform: "backend", url: "https://github.com/o/r", defaultBranch: "main" }] },
     input: { title: `replay ${id}` },
   };
 }

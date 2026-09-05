@@ -92,10 +92,12 @@ Env (all optional except the owner; defaults derive from `deploy/config.sh`):
    - Blueprints: set `PIPELINE_ENABLED=1` on the fleet/orchestrator context —
      the CI, QA, and release-manager blueprints then read pipeline results
      instead of shelling builds. Unset → they behave exactly as before.
-     If the fleet ships more than one repo, also set `PIPELINE_REPOS=owner/repo`
-     to the repo this pipeline deploys — runs on other repos then keep the
-     legacy DEPLOY.md / self-run path instead of being pointed at a pipeline
-     that does not deploy them.
+     Then register the repo this pipeline deploys in the hub's **CD registry**
+     with its pipeline name (`scripts/cd-registry.sh add owner/repo --pipeline
+     agentcore-hub-deploy --region us-east-1`, or Workflow tab → CD registry…).
+     Pipeline Mode is emitted only for a registered repo whose entry names a
+     pipeline; a repo that is not registered at all is a HANDOFF (the run ends
+     with an open PR — the hub never merges or deploys it).
 
 ## Removing / not using it
 
