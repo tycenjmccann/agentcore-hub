@@ -193,6 +193,19 @@ export default defineConfig({
       // cd-registry.mjs — pure registry parsing / repo matching / ship-phase
       // stripping (which repos the hub merges + deploys); no I/O.
       "lambda/orchestrator/cd-registry.test.mjs",
+      // event-id.mjs (TEAM-4120 FR-2) — the deterministic event id that collapses
+      // the events table's EventBridge/direct double-write. Pure (node:crypto
+      // only): determinism, the 13-digit-ms id shape the anomaly-watcher's
+      // eventId range query depends on, byte-for-byte agreement with the
+      // cost-report consumer-side dedupe key, and the fail-safe directions
+      // (strict mode allow-list, agent.streaming + bad timestamp → random).
+      "lambda/orchestrator/event-id.test.mjs",
+      // events-writer (TEAM-4120 FR-2) — the EventBridge-fan-out half of the
+      // double-write. Drives the REAL handler with a stub DDB doc client,
+      // reloaded per EVENT_DEDUPE_MODE, to prove that under enforce its row key
+      // equals the publisher's (so the Put overwrites instead of doubling) and
+      // that off is byte-identical (base36 monotonic ids).
+      "lambda/orchestrator/events-writer.test.mjs",
       // cd-handoff — index.mjs REAL, AWS/store seams mocked: an unregistered
       // repo gets no ship phase (Ship/CD tickets + Merge Approval gate resolved,
       // never dispatched/paged; intake context stops the chain at CI; completion

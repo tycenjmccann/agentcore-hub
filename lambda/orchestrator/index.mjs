@@ -51,6 +51,7 @@ import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets,
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
+import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -141,6 +142,14 @@ const SHIP_DISPATCH_GATE = normalizeShipDispatchMode(process.env.SHIP_DISPATCH_G
 const REWORK_LOOP_CAP = process.env.REWORK_LOOP_CAP
   ? normalizeReworkLoopMode(process.env.REWORK_LOOP_CAP)
   : "off";
+// Events-table double-write collapse (TEAM-4120 FR-2): off | enforce, default
+// off (byte-identical — publishEvent keeps its random eventId). When enforce,
+// the eventId is derived from the event's content, so the EventBridge copy
+// written by events-writer.mjs lands on the SAME (workflowId, eventId) and
+// overwrites the direct copy instead of doubling it. STRICT allow-list (garbage
+// and "shadow" → off; see event-id.mjs). Instant rollback = set off. Must agree
+// across all three writers, which is why deploy.sh forwards it to all three.
+const EVENT_DEDUPE_MODE = normalizeEventDedupeMode(process.env.EVENT_DEDUPE_MODE);
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -4629,6 +4638,9 @@ async function publishEvent(ticketId, detailType, detail) {
   // dedupes the EventBridge copy against the direct copy by
   // (workflowId, type, timestamp, ticketId, agentId) — two generated
   // timestamps would give the copies different keys and double every sample.
+  // TEAM-4120: that same shared timestamp is also what makes the deterministic
+  // eventId below reproducible from BOTH writers, so under EVENT_DEDUPE_MODE=
+  // enforce the two copies collapse onto one row instead of needing a dedupe.
   const timestamp = new Date().toISOString();
   const stamped = { ...detail, ticketId, timestamp };
   try {
@@ -4651,7 +4663,7 @@ async function publishEvent(ticketId, detailType, detail) {
         TableName: EVENTS_TABLE,
         Item: {
           workflowId: detail.workflowId || ticketId,
-          eventId: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          eventId: eventIdFor(EVENT_DEDUPE_MODE, detailType, stamped, () => `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`),
           type: detailType,
           detail: stamped,
           timestamp,

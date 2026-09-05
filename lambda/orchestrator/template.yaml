@@ -22,6 +22,10 @@ Globals:
         DEAD_SESSION_DETECTOR_MODE: !Ref DeadSessionDetectorMode
         CASCADE_EXTENDED_STATES: !Ref CascadeExtendedStates
         RECONCILE_SWEEP_MODE: !Ref ReconcileSweepMode
+        # Globals reaches all three writers (orchestrator, agent-invoker,
+        # events-writer) in one place, which is exactly the requirement: the
+        # double-write only collapses when all three agree on the mode.
+        EVENT_DEDUPE_MODE: !Ref EventDedupeMode
 
 Parameters:
   TicketsTableName:
@@ -86,6 +90,23 @@ Parameters:
       dependents. Default "off" matches the code's unset default, so the backstop
       ships dark — same rollout posture as deploy.sh (TEAM-3763 F2), which only
       forwards RECONCILE_SWEEP_MODE when explicitly set.
+
+  EventDedupeMode:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "enforce"]
+    Description: >
+      Events-table double-write collapse (TEAM-4120 FR-2). Every event is stored
+      TWICE today — once by the publisher's direct Put, once by the events-writer
+      fan-out of the same EventBridge event, under two different eventIds. off =
+      byte-identical to pre-4120 (random / base36 eventIds; consumers keep
+      deduping by content); enforce = every writer derives the eventId from the
+      event's CONTENT, so the fan-out Put lands on the same (workflowId, eventId)
+      and overwrites the direct copy — one row per event. Default "off" matches
+      the code's unset default, and deploy.sh only forwards EVENT_DEDUPE_MODE
+      when explicitly set, so a fresh deploy is byte-identical. Instant rollback
+      = set off. There is deliberately no "shadow": nothing is observable
+      without changing the write.
 
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────
