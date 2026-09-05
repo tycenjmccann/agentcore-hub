@@ -191,6 +191,88 @@ describe("spawnFixTicketsFromFindings (D3.1)", () => {
     expect(a[0].ticketId).toBe(b[0].ticketId);
     expect([a[0].deduped, b[0].deduped].filter(Boolean)).toHaveLength(1);
   });
+
+  // TEAM-4100 F5b — the F5 test above leans on the tickets Lambda's OWN dedupe.
+  // Under TICKET_PROVIDER=jira there is no atomic create (search-before-create is
+  // eventually consistent — two racing creates both see zero results) and the Jira
+  // Lambda has no DynamoDB access, so the guard cannot live there. The orchestrator
+  // is the sole caller passing findingId, so a CAS on the workflows table
+  // (claimFindingSpawn/finalizeFindingSpawn) closes the race for BOTH providers.
+  // These model the Jira twin: create_ticket NEVER dedupes; the CAS is all that stands.
+  function makeSpawnClaims() {
+    const claims = new Map();
+    return {
+      claims,
+      // Synchronous body (no internal await) → the check-and-set is atomic under
+      // JS's single thread, exactly like the DynamoDB conditional put it stands in for.
+      claimFindingSpawn: vi.fn(async (_wf, fid) => {
+        const cur = claims.get(fid);
+        if (!cur) { claims.set(fid, { status: "pending" }); return { won: true }; }
+        return { won: false, ticketId: cur.ticketId || null, status: cur.status };
+      }),
+      finalizeFindingSpawn: vi.fn(async (_wf, fid, ticketId) => {
+        claims.set(fid, { status: "created", ticketId });
+        return true;
+      }),
+    };
+  }
+
+  function makeJiraDeps(cas) {
+    const creates = [];
+    const events = [];
+    let n = 0;
+    return {
+      creates, events,
+      // Jira twin: no conditional create — a concurrent create always mints a NEW issue.
+      invokeTickets: vi.fn(async (op, params) => {
+        if (op !== "create_ticket") return {};
+        const id = `NEW-${++n}`;
+        creates.push({ id, params });
+        return { ticket_id: id };
+      }),
+      publishEvent: vi.fn(async (epicId, type, detail) => events.push({ epicId, type, detail })),
+      getChildTickets: vi.fn(async () => []), // neither racer sees the other's in-flight create
+      getWorkflowDef: vi.fn(() => DEF),
+      getAgentDef: vi.fn((id) => ({ phase: AGENT_PHASE[id] })),
+      resolveDevAssignee: vi.fn(() => "agentcore_hub_backend_dev"),
+      commitShaOf: vi.fn(() => null),
+      ...cas,
+    };
+  }
+
+  it("Jira twin (no atomic create): the orchestrator CAS still yields exactly one create + one event", async () => {
+    const deps = makeJiraDeps(makeSpawnClaims());
+    const completion = { findings: [{ component: "auth", summary: "null deref" }] };
+
+    const [a, b] = await Promise.all([
+      spawnFixTicketsFromFindings(WF, finder, completion, deps),
+      spawnFixTicketsFromFindings(WF, finder, completion, deps),
+    ]);
+
+    // Without the CAS both Jira creates would land; the CAS admits exactly one.
+    expect(deps.creates).toHaveLength(1);
+    expect(deps.events.filter((e) => e.type === "orchestrator.fix_spawned")).toHaveLength(1);
+    // Exactly one caller is the deduped loser; the winner carries the real key.
+    expect([a[0].deduped, b[0].deduped].filter(Boolean)).toHaveLength(1);
+    const winner = a[0].deduped ? b[0] : a[0];
+    expect(winner.ticketId).toBe("NEW-1");
+  });
+
+  it("Jira twin: a later re-report converges on the FINALIZED winner's key, spawning nothing new", async () => {
+    const deps = makeJiraDeps(makeSpawnClaims());
+    const completion = { findings: [{ component: "auth", summary: "null deref" }] };
+
+    const first = await spawnFixTicketsFromFindings(WF, finder, completion, deps);
+    expect(first[0].ticketId).toBe("NEW-1");
+    expect(first[0].deduped).toBeFalsy();
+
+    // A second verifier re-reports the same finding after the winner finalized: the
+    // loser reads the winner's key from the claim and creates/publishes nothing.
+    const second = await spawnFixTicketsFromFindings(WF, finder, completion, deps);
+    expect(second[0]).toMatchObject({ ticketId: "NEW-1", deduped: true });
+    expect(deps.creates).toHaveLength(1);
+    expect(deps.events.filter((e) => e.type === "orchestrator.fix_spawned")).toHaveLength(1);
+  });
 });
 
 describe("rearmVerification (D3.2)", () => {

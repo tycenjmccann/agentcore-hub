@@ -38,6 +38,10 @@ import {
   claimCompletionSynthesis,
   setSynthesizedEvidence,
   releaseCompletionSynthesisClaim,
+  // TEAM-4100 F5b
+  claimFindingSpawn,
+  finalizeFindingSpawn,
+  FINDING_SPAWN_STALE_MS,
 } from "./workflow-store.mjs";
 import { isLeaseLive } from "./lease.mjs";
 
@@ -967,6 +971,99 @@ describe("claimFinalization", () => {
   it("returns false when another retry already claimed finalization", async () => {
     failNextCondition = true;
     expect(await claimFinalization("wf_1", "x")).toBe(false);
+  });
+});
+
+/**
+ * TEAM-4100 F5b — the provider-independent fix-spawn dedupe. F5 gave the DynamoDB
+ * tickets Lambda an atomic create-time CAS, but the Jira twin has no conditional
+ * create (search-before-create is read-then-create) and the Jira Lambda has no
+ * DynamoDB access at all. The orchestrator is the ONE caller that passes findingId,
+ * so this CAS on the workflows table closes the race for BOTH ticket providers.
+ * Mint-pending-first, finalize with the ticketId, so a losing racer converges on
+ * the winner's key once it lands.
+ */
+describe("claimFindingSpawn (TEAM-4100 F5b)", () => {
+  it("ensures the spawnClaims map, then CASes a fresh-or-stale-pending claim (mint pending)", async () => {
+    const res = await claimFindingSpawn("wf_1", "fid1", { now: "2026-09-05T12:00:00.000Z" });
+    expect(res).toEqual({ won: true });
+    // Two writes: seed the map (single expression can't create AND index it), then the CAS.
+    expect(writes()[0].input.UpdateExpression).toContain("if_not_exists(spawnClaims, :empty)");
+    const cas = writes()[1];
+    expect(cas.input.UpdateExpression).toBe("SET spawnClaims.#fid = :claim");
+    expect(cas.input.ConditionExpression).toBe(
+      "attribute_not_exists(spawnClaims.#fid) OR " +
+      "(spawnClaims.#fid.#st = :pending AND spawnClaims.#fid.claimedAt < :staleBefore)"
+    );
+    expect(cas.input.ExpressionAttributeNames).toEqual({ "#fid": "fid1", "#st": "status" });
+    expect(cas.input.ExpressionAttributeValues[":claim"]).toEqual({ status: "pending", claimedAt: "2026-09-05T12:00:00.000Z" });
+    expect(cas.input.ExpressionAttributeValues[":pending"]).toBe("pending");
+    // Stale takeover window: now - one stale interval (matches the DDB twin's DEDUPE_STALE_MS).
+    expect(cas.input.ExpressionAttributeValues[":staleBefore"]).toBe(
+      new Date(Date.parse("2026-09-05T12:00:00.000Z") - FINDING_SPAWN_STALE_MS).toISOString()
+    );
+  });
+
+  it("honours a custom staleMs", async () => {
+    await claimFindingSpawn("wf_1", "fid1", { now: "2026-09-05T12:00:00.000Z", staleMs: 5000 });
+    expect(writes()[1].input.ExpressionAttributeValues[":staleBefore"]).toBe("2026-09-05T11:59:55.000Z");
+  });
+
+  it("a loser reads the winner's FINALIZED ticketId — both callers converge on one key", async () => {
+    initWorkflowStore(
+      {
+        async send(cmd) {
+          if (cmd.constructor.name === "GetCommand") {
+            return { Item: { workflowId: "wf_1", spawnClaims: { fid1: { status: "created", ticketId: "NEW-1" } } } };
+          }
+          if (cmd.input.ConditionExpression) {
+            const err = new Error("held"); err.name = "ConditionalCheckFailedException"; throw err;
+          }
+          return {}; // the ensure-map write
+        },
+      },
+      "workflows-test"
+    );
+    expect(await claimFindingSpawn("wf_1", "fid1")).toEqual({ won: false, ticketId: "NEW-1", status: "created" });
+  });
+
+  it("a loser racing a still-PENDING winner gets no key yet (caller skips + publishes nothing)", async () => {
+    initWorkflowStore(
+      {
+        async send(cmd) {
+          if (cmd.constructor.name === "GetCommand") {
+            return { Item: { workflowId: "wf_1", spawnClaims: { fid1: { status: "pending" } } } };
+          }
+          if (cmd.input.ConditionExpression) {
+            const err = new Error("held"); err.name = "ConditionalCheckFailedException"; throw err;
+          }
+          return {};
+        },
+      },
+      "workflows-test"
+    );
+    expect(await claimFindingSpawn("wf_1", "fid1")).toEqual({ won: false, ticketId: null, status: "pending" });
+  });
+
+  it("a non-conditional DDB failure propagates (never a silent 'won')", async () => {
+    initWorkflowStore({ async send() { throw new Error("throughput exceeded"); } }, "workflows-test");
+    await expect(claimFindingSpawn("wf_1", "fid1")).rejects.toThrow("throughput exceeded");
+  });
+});
+
+describe("finalizeFindingSpawn (TEAM-4100 F5b)", () => {
+  it("stamps status=created + the ticketId under attribute_exists on the claim key", async () => {
+    expect(await finalizeFindingSpawn("wf_1", "fid1", "NEW-1")).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("SET spawnClaims.#fid.#st = :created, spawnClaims.#fid.ticketId = :tid");
+    expect(w.input.ConditionExpression).toBe("attribute_exists(spawnClaims.#fid)");
+    expect(w.input.ExpressionAttributeNames).toEqual({ "#fid": "fid1", "#st": "status" });
+    expect(w.input.ExpressionAttributeValues).toEqual({ ":created": "created", ":tid": "NEW-1" });
+  });
+
+  it("a vanished claim loses the CAS gracefully (false, never throws)", async () => {
+    failNextCondition = true;
+    expect(await finalizeFindingSpawn("wf_1", "fid1", "NEW-1")).toBe(false);
   });
 });
 

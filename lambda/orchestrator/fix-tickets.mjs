@@ -65,7 +65,11 @@ function roleAgentId(def, role) {
  *
  * deps: { invokeTickets(op, params)->result, publishEvent(id,type,detail),
  *         getChildTickets(epicId)->[tickets], getWorkflowDef(defId)->def,
- *         resolveDevAssignee(workflow, children)->agentId }
+ *         resolveDevAssignee(workflow, children)->agentId,
+ *         claimFindingSpawn(workflowId, findingId)->{won,ticketId,status}?  (F5b CAS),
+ *         finalizeFindingSpawn(workflowId, findingId, ticketId)? }
+ * The two CAS deps are optional: when absent (older callers/tests) the read-first
+ * `existing` check is the only dedupe, matching pre-F5b behavior.
  */
 export async function spawnFixTicketsFromFindings(workflow, finderTicket, completion, deps) {
   const findings = Array.isArray(completion?.findings) ? completion.findings : [];
@@ -97,6 +101,21 @@ export async function spawnFixTicketsFromFindings(workflow, finderTicket, comple
     const fid = findingId(originTicketId, component);
     if (existing.has(fid)) continue; // already spawned on a prior report
 
+    // TEAM-4100 F5b — provider-independent create-time dedupe. The `existing`
+    // read above misses an in-flight concurrent spawn, and the Jira twin has no
+    // conditional create (its finding:<fid> label is only a secondary marker). The
+    // orchestrator is the sole caller passing findingId, so a CAS on the workflows
+    // table closes the race for BOTH ticket providers. Loser skips the create and
+    // reports the winner's key (once finalized); a still-pending winner yields no
+    // key yet, and the loser publishes no second fix_spawned event either way.
+    if (deps.claimFindingSpawn) {
+      const claim = await deps.claimFindingSpawn(workflow.id, fid);
+      if (!claim.won) {
+        created.push({ ticketId: claim.ticketId || null, component, kind, findingId: fid, assignee, deduped: true });
+        continue;
+      }
+    }
+
     const severity = group.find((g) => g.severity)?.severity || "";
     const summary = group.map((g) => g.summary).filter(Boolean).join("; ").slice(0, 500) || component;
     const files = [...new Set(group.flatMap((g) => (Array.isArray(g.files) ? g.files : [])))];
@@ -121,11 +140,14 @@ export async function spawnFixTicketsFromFindings(workflow, finderTicket, comple
     try {
       const res = await deps.invokeTickets("create_ticket", params);
       const ticketId = res?.ticket_id || res?.ticketId || res?.key || null;
-      // TEAM-4100 F5 — the tickets Lambda enforces (workflow, findingId) uniqueness
-      // at create time. A `deduped` response means a concurrent verifier already
-      // spawned this exact fix ticket (the cheap read-first check above missed the
-      // in-flight create): return the same key so the caller is consistent, but do
-      // NOT publish a second fix_spawned event — the winner already did.
+      // TEAM-4100 F5b — record the winner's key on the claim so a concurrent loser
+      // reports the same ticket. TEAM-4100 F5: the DDB tickets Lambda also enforces
+      // (workflow, findingId) uniqueness at create time (defense-in-depth); a
+      // `deduped` response means a concurrent create beat us at the Lambda — return
+      // the same key but do NOT publish a second fix_spawned event.
+      if (deps.finalizeFindingSpawn && ticketId) {
+        await deps.finalizeFindingSpawn(workflow.id, fid, ticketId);
+      }
       const deduped = !!(res?.deduped || res?.deduplicated);
       created.push({ ticketId, component, kind, findingId: fid, assignee, deduped });
       if (!deduped) {

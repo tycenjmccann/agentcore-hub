@@ -5153,6 +5153,11 @@ async function runFixTicketMachinery(workflow, ticket) {
     getWorkflowDef,
     getAgentDef,
     resolveDevAssignee,
+    // TEAM-4100 F5b — provider-independent (workflow, findingId) CAS on the
+    // workflows table, so the fix-spawn race is closed even under TICKET_PROVIDER=jira
+    // (whose Lambda has no conditional create / no DynamoDB access).
+    claimFindingSpawn: store.claimFindingSpawn,
+    finalizeFindingSpawn: store.finalizeFindingSpawn,
     commitShaOf: (tid) =>
       (record && record.commit_sha) || workflow.agentTasks?.[tid]?.commitSha || "",
   };
