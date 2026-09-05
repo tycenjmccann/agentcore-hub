@@ -99,7 +99,17 @@ vi.mock("@aws-sdk/client-lambda", () => {
   return { LambdaClient, InvokeCommand };
 });
 
-vi.mock("@/lib/workflow/intake", () => ({ validateIntakeSources: vi.fn(async () => []) }));
+vi.mock("@/lib/workflow/intake", () => ({
+  // TEAM-4054 contract: a structured result + the two pure decision helpers.
+  validateIntakeSources: vi.fn(async (sources: unknown[] = []) => ({
+    results: [],
+    definitiveErrors: [],
+    transientErrors: [],
+    sources,
+  })),
+  getSourceValidationMode: vi.fn(() => "lenient" as const),
+  shouldRejectSubmission: vi.fn(() => ({ reject: false, errors: [] as string[] })),
+}));
 
 vi.mock("@/lib/workflow/ticket-provider-jira", () => ({
   JiraCloudProvider: class {

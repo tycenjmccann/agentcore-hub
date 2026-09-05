@@ -20,6 +20,17 @@ export const IntakeSourceSchema = z.object({
   value: z.string().min(1),
   contentType: z.string().optional(),
   label: z.string().optional(),
+  // TEAM-4054: output-only. Accepted so a source read back from a workflow can be
+  // resubmitted verbatim, but the server OVERWRITES whatever a caller sends —
+  // "verified" is not forgeable from the client side.
+  verification: z
+    .object({
+      status: z.enum(["verified", "unverified", "skipped"]),
+      method: z.string().optional(),
+      detail: z.string().optional(),
+      checkedAt: z.string().optional(),
+    })
+    .optional(),
 });
 
 export const ModelOverrideSchema = z.object({
