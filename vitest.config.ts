@@ -265,6 +265,29 @@ export default defineConfig({
       // unrecognized evidence_kind is dropped with a warning, never stored). REAL
       // handler, AWS SDK mocked at the module seam.
       "lambda/workflow-output/index.test.mjs",
+      // live-reverify (TEAM-4121 FR-9), unit level — the module is fully DI'd, so
+      // this drives the REAL decision logic with hand-built deps and asserts the
+      // CALLS: exactly one `Re-verify (QA): <fix> @ <sha7>` per (fix, head) with
+      // the exact params, the independent `verification: "unverified"` mark when a
+      // "live" fix closes with no live artifact, ship tickets blocked only while
+      // open, shadow writing nothing, and the STRICT mode allow-list (garbage →
+      // off, unlike every other flag) that keeps a typo from minting tickets.
+      "lambda/orchestrator/live-reverify.test.mjs",
+      // yteqfl loop 2 replay (TEAM-4121 FR-9) — the real prod failure this FR
+      // exists for, from the dossier fixture: TEAM-4089 closed claiming live
+      // evidence with none, QA re-verify TEAM-4092 caught it 48m later and filed
+      // TEAM-4105 as a fresh loop. Under enforce the re-verification is filed at
+      // Done (sha 0949f9d), the fix is marked unverified, the open ship ticket
+      // TEAM-4066 is blocked, and re-running the trigger is `already` — so
+      // TEAM-4105's loop never starts. Off mode reproduces prod byte-identically.
+      "lambda/orchestrator/replay-yteqfl-reverify.test.mjs",
+      // `## Unverified Fixes` ship context (TEAM-4121 FR-9) — REAL buildAgentContext
+      // from index.mjs: the block renders for a ship-phase agent under enforce with
+      // the ticket id, sha7, re-verify id and a SANITIZED repro (it is another
+      // agent's claim, so backticks/newlines are stripped and it is labelled as one),
+      // and is absent for non-ship agents, for mode off, and when nothing is
+      // unverified — the "off costs nothing in the prompt" half of the flag.
+      "lambda/orchestrator/unverified-fixes-context.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
