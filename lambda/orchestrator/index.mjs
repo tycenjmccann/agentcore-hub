@@ -2595,15 +2595,17 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   const phaseOrder = wfDef.phaseOrder;
   const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
+  // Shared feature branch on the def's branch phase (repo-backed workflows only).
+  // Independent of the phase ADVANCE below: the playbook def's branch phase is
+  // "requirements" — the run's INITIAL phase — so gating this on an advance
+  // meant the spec author was dispatched with no branch to commit the chain to
+  // (first sdlc-playbook run, 2026-09-05). ensureFeatureBranch persists itself.
+  if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
+    workflow.featureBranch = await ensureFeatureBranch(workflow);
+  }
   if (agentPhaseIdx > currentPhaseIdx) {
     workflow.phase = agentDef.phase;
     await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
-
-    // Feature branch on the def's branch phase entry (repo-backed workflows only)
-    if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
-      workflow.featureBranch = await ensureFeatureBranch(workflow);
-    }
-
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
@@ -2999,15 +3001,14 @@ async function handleTicketReady(ticketId, image) {
   const phaseOrder = wfDef.phaseOrder;
   const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
+  // Shared feature branch on the def's branch phase — independent of the phase
+  // advance (see handleTicketReadyUnified for why). ensureFeatureBranch persists itself.
+  if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
+    workflow.featureBranch = await ensureFeatureBranch(workflow);
+  }
   if (agentPhaseIdx > currentPhaseIdx) {
     workflow.phase = agentDef.phase;
     await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
-
-    // Create shared feature branch on the def's branch phase (repo-backed workflows only)
-    if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
-      workflow.featureBranch = await ensureFeatureBranch(workflow);
-    }
-
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
