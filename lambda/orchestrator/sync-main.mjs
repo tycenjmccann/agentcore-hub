@@ -221,17 +221,25 @@ export async function syncBeforeCi(workflow, ticket, deps = {}) {
     }
     if (!baseHeadSha) return await skip("base_head_unavailable", { base, head });
 
+    // ── idempotency: this CI ticket, against this default-branch head ─────────
+    // The claim does NOT protect this. On a conflict we RELEASE the claim (the
+    // CI agent is not running), so a stream redelivery or a webhook twin re-claims
+    // cleanly and walks straight back in here.
     const prior = workflow?.syncMain;
-    if (
-      prior &&
-      prior.ciTicketId === ticketId &&
-      prior.baseHeadSha === baseHeadSha &&
-      (prior.status === "synced" || prior.status === "noop")
-    ) {
+    const samePrior = !!prior && prior.ciTicketId === ticketId && prior.baseHeadSha === baseHeadSha;
+    if (samePrior && (prior.status === "synced" || prior.status === "noop")) {
       // Zero writes, no event: a redelivery of an already-synced dispatch is not
       // news, and an event per redelivery would drown the run's timeline.
       return { outcome: "skipped", reason: "already_synced", baseHeadSha };
     }
+    // A recorded conflict against THIS head, on the other hand, is NOT a reason
+    // to stop: the ordinary unblock is the dev resolving it and CI re-dispatching
+    // against the same main head, so short-circuiting here would wedge the run
+    // permanently. Re-attempt the merge — but remember the ticket we already
+    // filed, so a redelivery (or the re-dispatch of a still-conflicting branch)
+    // can never produce a SECOND identical fix ticket for the dev to look at.
+    const knownFixTicketId =
+      samePrior && prior.status === "conflict" ? prior.fixTicketId || null : null;
 
     // Same encoding as index.mjs's ship merge-verify compare (percent-encoded
     // refs, literal `...`), on top of the charset validation above.
@@ -312,6 +320,21 @@ export async function syncBeforeCi(workflow, ticket, deps = {}) {
     }
 
     async function handleConflict() {
+      // Already ticketed against this same head: reuse the ticket and the file
+      // list persisted with it, which also spares two more compares.
+      if (knownFixTicketId) {
+        await blockOnFix(knownFixTicketId);
+        const files = prior?.files || [];
+        await emit("workflow.sync_conflict", {
+          ticketId, fixTicketId: knownFixTicketId, files, base, head, baseHeadSha, alreadyTicketed: true,
+        });
+        await persist({
+          at: now().toISOString(), baseHeadSha, status: "conflict",
+          ciTicketId: ticketId, fixTicketId: knownFixTicketId, files,
+        });
+        return { outcome: "conflict", fixTicketId: knownFixTicketId, baseHeadSha, files, reason: "already_ticketed" };
+      }
+
       const { files, truncated } = await conflictCandidates();
       const n = files.length;
       const summary = `Fix (sync-main): merge conflict with ${head} in ${n ? `${n} file(s)` : "unknown files"}`;
@@ -360,23 +383,34 @@ export async function syncBeforeCi(workflow, ticket, deps = {}) {
         return await skip("conflict_unticketed", { base, head, baseHeadSha, files });
       }
 
+      await blockOnFix(fixTicketId);
+      await emit("workflow.sync_conflict", { ticketId, fixTicketId, files, base, head, baseHeadSha });
+      // `files` is persisted so a redelivery can answer with the same candidate
+      // list without paying two more compares.
+      await persist({ at: now().toISOString(), baseHeadSha, status: "conflict", ciTicketId: ticketId, fixTicketId, files });
+      return { outcome: "conflict", fixTicketId, baseHeadSha, files };
+    }
+
+    /**
+     * Block the CI ticket on the fix and release the CI ticket's claim. Both are
+     * idempotent (a repeated blocker is a no-op, a repeated status write is the
+     * same value), which is what lets the redelivery path re-run them.
+     *
+     * The claim release matters: the caller took it before this ran and the CI
+     * agent is NOT being invoked, so without this the entry stays "running" and
+     * the cascade's re-dispatch (once the fix closes) is rejected as a duplicate.
+     * "ready" is the value lease.mjs's stealClaim writes for a released claim;
+     * "error" is reserved for a FAILED INVOKE and is read as an escalation hold
+     * (cascade.mjs escalationHeld) plus rendered as "agent encountered an error"
+     * in the UI — neither is true here, the agent never ran.
+     */
+    async function blockOnFix(fixTicketId) {
       try { await addBlockers?.(ticketId, [fixTicketId]); }
       catch (err) { warn(`addBlockers(${ticketId} ← ${fixTicketId}) failed: ${err?.message || err}`); }
-
-      // Release the invocation claim. The caller took it before this ran, and the
-      // CI agent is NOT being invoked — without this the entry stays "running" and
-      // the cascade's re-dispatch (once the fix closes) is rejected as a duplicate.
-      // "ready" is the same value lease.mjs's stealClaim writes for a released
-      // claim; "error" is reserved for a failed invoke and feeds the error
-      // escalation surfaces, which this is not.
       try { await store?.setTaskStatus?.(workflowId, ticketId, "ready"); }
       catch (err) { warn(`releasing the claim on ${ticketId} failed: ${err?.message || err}`); }
       const entry = workflow?.agentTasks?.[ticketId];
       if (entry) entry.status = "ready";
-
-      await emit("workflow.sync_conflict", { ticketId, fixTicketId, files, base, head, baseHeadSha });
-      await persist({ at: now().toISOString(), baseHeadSha, status: "conflict", ciTicketId: ticketId, fixTicketId });
-      return { outcome: "conflict", fixTicketId, baseHeadSha, files };
     }
 
     /**

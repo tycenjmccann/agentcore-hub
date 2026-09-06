@@ -313,6 +313,25 @@ export default defineConfig({
       // shadow never writes, and the human merge gate's ping/comment/package
       // carries the ⚠ CI UNCERTIFIABLE prefix.
       "lambda/orchestrator/ci-check-context.test.mjs",
+      // sync-main.mjs (TEAM-4122 FR-6) — merge the default branch INTO the run's
+      // integration branch before CI certifies its head. Fully DI'd (plain deps +
+      // a recording GitHub fake keyed by `METHOD path`), which is what makes the
+      // dangerous matrix cheap to pin: the F9 direction lock (base is always the
+      // feature branch, so this can never push to main) and its refusals, the
+      // percent-encoding of every path segment, the merge-head idempotency key,
+      // 201/204/409 and the fail-OPEN behaviour of every other status, and the
+      // 409 path end to end — one sync_fix ticket whose fix_contract is checked
+      // with the tickets Lambda's own validateFixContract.
+      "lambda/orchestrator/sync-main.test.mjs",
+      // pre-CI sync replay (TEAM-4122 FR-6 acceptance) — index.mjs REAL on its
+      // Jira-webhook entry (handleTicketReadyUnified), only fetch/AWS/store
+      // mocked, driven with the wf_1788582225496_yteqfl loop-6 fixture where the
+      // run's CI agent had to file TEAM-4106 ("merge origin/main into
+      // feature/TEAM-4054…") by hand. Under enforce a conflict files EXACTLY ONE
+      // sync_fix ticket, blocks TEAM-4065 on it and never reaches the agent-invoke
+      // seam (no green certification of a SHA that would not land); a webhook
+      // REDELIVERY files no second ticket; landing the fix dispatches CI once.
+      "lambda/orchestrator/replay-yteqfl-sync-main.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
