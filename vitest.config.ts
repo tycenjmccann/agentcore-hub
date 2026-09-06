@@ -184,6 +184,13 @@ export default defineConfig({
       // idempotency. AWS SDK clients mocked at the module seam, same shape as
       // agent-invoker-retry.
       "lambda/agentcore-hub-pipeline-tools/index.test.mjs",
+      // setup-pipeline-tools-lambda (TEAM-4122 FR-4) — the IAM policy as DATA:
+      // buildInlinePolicy is pure, so the blast radius of PIPELINE_CI_START_BUILD
+      // (StartBuild on the ONE validated PR-check ARN, never a deploy project,
+      // never PutApprovalResult) is asserted rather than reviewed. Also pins the
+      // byte-duplicated validateCiProjectName against the Lambda's copy. Import
+      // is inert — main() is behind the argv guard.
+      "deploy/setup-pipeline-tools-lambda.test.mjs",
       // pipeline-enabled (TEAM-3738, same defect class as TEAM-3723) — the
       // orchestrator's PIPELINE_ENABLED predicate that gates the "## Pipeline
       // Mode" context block. Lives in its own side-effect-free pipeline-enabled.mjs

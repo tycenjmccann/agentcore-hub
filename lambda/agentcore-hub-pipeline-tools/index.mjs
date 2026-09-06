@@ -16,21 +16,41 @@
  *   - get_build_log:  For a Failed Build stage — the CodeBuild build's phase
  *                     contexts + a tail of its CloudWatch log, so RM can file a
  *                     precise fix ticket (it does NOT hand-fix).
+ *   - start_ci_build: (TEAM-4122 FR-4) Start the PR-CHECK build for one commit,
+ *                     so the CI agent can re-run CI on a head it just pushed
+ *                     instead of waiting for a webhook that may never fire. The
+ *                     project is ALWAYS CI_PROJECT — never a caller argument —
+ *                     and the StartBuild input is an allow-list of three keys,
+ *                     so no override (buildspec/env/image/privileged/role/source)
+ *                     can ride in from the agent's args.
+ *   - capabilities:   What this Lambda will actually do in THIS deployment, so an
+ *                     agent can branch without probing with a real StartBuild.
  *
  * DELIBERATELY ABSENT: PutApprovalResult. The in-pipeline ManualApproval (deploy
  * gate) is a HUMAN decision, bridged to Telegram (telegram-bug-intake). An agent
- * must never approve its own deploy. This Lambda is read + trigger only.
+ * must never approve its own deploy. This Lambda is read + trigger only. Still
+ * true after FR-4: start_ci_build starts a PR CHECK, which deploys nothing, and
+ * capabilities reports approveDeploy:false unconditionally.
  *
  * Env:
  *   PIPELINE_NAME       default "agentcore-hub-deploy"  (the CodePipeline)
  *   BUILD_PROJECT       default "agentcore-hub-build"
- *   CI_PROJECT          default "agentcore-hub-ci"
+ *   CI_PROJECT          default "agentcore-hub-ci" — the PR-check project, and the
+ *                       ONLY project start_ci_build can ever start. Validated at
+ *                       module load (validateCiProjectName): a wildcard, or a name
+ *                       that collides with the build/deploy/runtime-image project
+ *                       or the pipeline, disables start_ci_build rather than
+ *                       pointing agent-triggerable StartBuild at a deploy
+ *   PIPELINE_CI_START_BUILD  "1" iff the deploy granted codebuild:StartBuild on
+ *                       CI_PROJECT. Read ONLY to advertise the capability — the
+ *                       IAM grant is the actual gate, so a lie in either
+ *                       direction cannot start (or block) a build by itself
  *   DEPLOY_PROJECT      set on this Lambda by deploy/setup-pipeline-tools-lambda.mjs
- *                       (which also uses it for IAM scoping) but NOT read by this
- *                       code — to reach the Deploy stage's CodeBuild project
- *                       (same name as the pipeline, different resource kind),
- *                       callers pass project="agentcore-hub-deploy" explicitly
- *                       to get_build_log
+ *                       (which also uses it for IAM scoping); read here ONLY to
+ *                       refuse a CI_PROJECT that names it. To reach the Deploy
+ *                       stage's CodeBuild project (same name as the pipeline,
+ *                       different resource kind), callers pass
+ *                       project="agentcore-hub-deploy" explicitly to get_build_log
  *   REGION              default from AWS_REGION
  */
 
@@ -44,6 +64,7 @@ import {
   CodeBuildClient,
   BatchGetBuildsCommand,
   ListBuildsForProjectCommand,
+  StartBuildCommand,
 } from "@aws-sdk/client-codebuild";
 import {
   CloudWatchLogsClient,
@@ -54,20 +75,98 @@ const REGION = process.env.AWS_REGION || "us-east-1";
 const PIPELINE_NAME = process.env.PIPELINE_NAME || "agentcore-hub-deploy";
 const BUILD_PROJECT = process.env.BUILD_PROJECT || "agentcore-hub-build";
 const CI_PROJECT = process.env.CI_PROJECT || "agentcore-hub-ci";
+const DEPLOY_PROJECT = process.env.DEPLOY_PROJECT || "agentcore-hub-deploy";
+
+// A CodeBuild project that deploys, but is not the pipeline's Deploy stage, so
+// the DEPLOY_PROJECT/PIPELINE_NAME comparisons below would not catch it.
+const RESERVED_CI_PROJECTS = ["agentcore-hub-runtime-image-deploy"];
+
+/**
+ * TEAM-4122 FR-4 (security review F2/F3) — is `name` safe to hand to
+ * codebuild:StartBuild on an AGENT's behalf?
+ *
+ * start_ci_build never accepts a project argument, so this is the only thing
+ * standing between "the CI agent re-runs the PR check" and "the CI agent starts a
+ * deploy": if CI_PROJECT is misconfigured to name the build/deploy/runtime-image
+ * project or the pipeline, the tool refuses instead of starting it. A wildcard is
+ * rejected separately from the charset because `*` in a project name is how an
+ * over-broad IAM Resource gets copied into config by mistake.
+ *
+ * Pure and side-effect free: byte-duplicated in
+ * deploy/setup-pipeline-tools-lambda.mjs (the Lambda zip is index.mjs only, and
+ * importing this module would construct AWS clients in the deploy script), and
+ * the two copies are pinned against each other on a shared matrix by
+ * deploy/setup-pipeline-tools-lambda.test.mjs.
+ *
+ * @returns {{ok: boolean, reason: string|null}}
+ */
+export function validateCiProjectName(name, opts = {}) {
+  const { buildProject, deployProject, pipelineName } = opts;
+  const value = typeof name === "string" ? name : "";
+  if (!value) return { ok: false, reason: "CI_PROJECT is empty" };
+  if (value.includes("*") || value.includes("?")) {
+    return { ok: false, reason: `CI_PROJECT "${value}" contains a wildcard` };
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{1,254}$/.test(value)) {
+    return {
+      ok: false,
+      reason: `CI_PROJECT "${value}" is not a valid CodeBuild project name (2-255 chars of [A-Za-z0-9_-], starting alphanumeric)`,
+    };
+  }
+  for (const [label, other] of [
+    ["BUILD_PROJECT", buildProject],
+    ["DEPLOY_PROJECT", deployProject],
+    ["PIPELINE_NAME", pipelineName],
+    ...RESERVED_CI_PROJECTS.map((p) => ["a reserved deploy project", p]),
+  ]) {
+    if (other && value === other) {
+      return {
+        ok: false,
+        reason: `CI_PROJECT "${value}" is ${label} — start_ci_build may only start the PR-check project`,
+      };
+    }
+  }
+  return { ok: true, reason: null };
+}
+
+// Validated ONCE at module load, but never thrown: get_state/get_build_log/
+// get_build_status are read-only and must keep working on a deployment whose
+// CI_PROJECT is wrong. Only start_ci_build (and the capability it advertises)
+// depends on this verdict.
+const CI_PROJECT_CHECK = validateCiProjectName(CI_PROJECT, {
+  buildProject: BUILD_PROJECT,
+  deployProject: DEPLOY_PROJECT,
+  pipelineName: PIPELINE_NAME,
+});
+if (!CI_PROJECT_CHECK.ok) {
+  console.warn(`start_ci_build disabled: ${CI_PROJECT_CHECK.reason}`);
+}
 
 const cp = new CodePipelineClient({ region: REGION });
 const cb = new CodeBuildClient({ region: REGION });
 const logs = new CloudWatchLogsClient({ region: REGION });
 
 export const handler = async (event) => {
-  console.log("Pipeline tools invoked:", JSON.stringify(event));
-
   let toolName =
     event._tool_name || event.tool_name || event.name || "";
   if (toolName && toolName.includes("___")) {
     toolName = toolName.split("___").pop();
   }
   const args = event.parameters || event.arguments || event.input || event;
+
+  // start_ci_build's args can carry attacker-shaped override keys (buildspec-
+  // Override, environmentVariablesOverride, …). They are dropped rather than
+  // forwarded — and not echoed into CloudWatch either, so a log reader is never
+  // shown a payload that looks like it was honored. Its allow-listed inputs are
+  // logged from inside startCiBuild once they have been validated.
+  if (toolName === "start_ci_build") {
+    console.log(
+      "Pipeline tools invoked: start_ci_build",
+      JSON.stringify({ argKeys: Object.keys(args || {}).sort() })
+    );
+  } else {
+    console.log("Pipeline tools invoked:", JSON.stringify(event));
+  }
 
   try {
     switch (toolName) {
@@ -79,8 +178,12 @@ export const handler = async (event) => {
         return await getBuildLog(args);
       case "get_build_status":
         return await getBuildStatus(args);
+      case "start_ci_build":
+        return await startCiBuild(args);
+      case "capabilities":
+        return capabilities();
       default: {
-        const message = `Unknown tool: "${toolName}". Available: get_state, start_deploy, get_build_log, get_build_status`;
+        const message = `Unknown tool: "${toolName}". Available: get_state, start_deploy, get_build_log, get_build_status, start_ci_build, capabilities`;
         return { error: message, content: [{ text: message }] };
       }
     }
@@ -368,6 +471,204 @@ async function getBuildStatus(args = {}) {
     match,
     succeededForCommit: !!(match && match.buildStatus === "SUCCEEDED"),
     builds: rows,
+  });
+}
+
+// ─── start_ci_build ───────────────────────────────────────────────────────────
+// TEAM-4122 FR-4 — run the PR check for ONE commit. The CI agent calls this after
+// it pushes a mechanical auto-fix, because the push may not re-trigger CI (the
+// webhook is repo-side and not guaranteed) and "no build" is indistinguishable
+// from "build pending" to get_build_status.
+//
+// Three invariants, in the order they are enforced:
+//   1. The project is CI_PROJECT — an env value, validated at module load. args
+//      .project is IGNORED, not rejected: a fix-then-retry loop must not learn
+//      that naming a different project is even a category of request (F2/F3).
+//   2. commit_sha is REQUIRED. It is what makes this tool idempotent — it is both
+//      the dedupe key against builds already running and the StartBuild
+//      idempotencyToken. A sourceVersion-only call (a branch name) can name a
+//      moving target, so "did I already build this?" would be unanswerable (F1).
+//   3. The StartBuild input is an ALLOW-LIST of exactly three keys. CodeBuild's
+//      *Override inputs can replace the buildspec, the image, the service role and
+//      privileged mode — i.e. turn a PR check into arbitrary privileged execution.
+//      They are never read from args at all.
+async function startCiBuild(args = {}) {
+  if (!CI_PROJECT_CHECK.ok) {
+    return jsonResult({
+      ok: false,
+      reason: "ci_project_invalid",
+      detail: CI_PROJECT_CHECK.reason,
+    });
+  }
+
+  const rawSha = String(args.commit_sha ?? "").trim();
+  if (!rawSha) {
+    return jsonResult({
+      ok: false,
+      reason: "missing_commit_sha",
+      detail: "commit_sha is required — it is the dedupe + idempotency key. Pass the exact head SHA you want CI to prove.",
+    });
+  }
+  if (!/^[0-9a-f]{7,40}$/i.test(rawSha)) {
+    return jsonResult({
+      ok: false,
+      reason: "invalid_commit_sha",
+      detail: "commit_sha must be 7-40 hex characters (a git SHA or its short form).",
+    });
+  }
+  const sha = rawSha.toLowerCase();
+
+  const rawSourceVersion = String(args.source_version ?? "").trim();
+  const sourceVersion = rawSourceVersion || sha;
+  if (!isAllowedSourceVersion(sourceVersion)) {
+    return jsonResult({
+      ok: false,
+      reason: "invalid_source_version",
+      detail: 'source_version must be "pr/<number>", a 40-hex commit SHA, or a plain branch name (no refs/ prefix, no "..").',
+    });
+  }
+
+  // Dedupe BEFORE starting: the same head can be pushed once and re-checked by
+  // several agents (CI agent + release manager both watch it), and a duplicate
+  // build costs minutes of pipeline time and produces a second, racing verdict
+  // for one commit.
+  const existing = await findRecentBuildForCommit(CI_PROJECT, sha, 30);
+  if (existing) {
+    console.log(
+      "start_ci_build: reusing build",
+      JSON.stringify({
+        project: CI_PROJECT,
+        buildId: existing.id,
+        buildStatus: existing.buildStatus,
+      })
+    );
+    return jsonResult({
+      ok: true,
+      reused: true,
+      buildId: existing.id,
+      buildStatus: existing.buildStatus,
+      resolvedSourceVersion: existing.resolvedSourceVersion || null,
+      project: CI_PROJECT,
+    });
+  }
+
+  // The allow-list. Do not spread args into this object, ever.
+  const input = {
+    projectName: CI_PROJECT,
+    sourceVersion,
+    idempotencyToken: `ci-${sha}`.slice(0, 64),
+  };
+
+  let res;
+  try {
+    res = await cb.send(new StartBuildCommand(input));
+  } catch (err) {
+    // The IAM grant is the real gate on this tool (PIPELINE_CI_START_BUILD only
+    // decides whether the deploy adds the statement), so a denial is a normal,
+    // expected answer — reported structurally so the agent can fall back to
+    // waiting on the webhook instead of retrying a call it can never make.
+    if (err?.name === "AccessDeniedException") {
+      return jsonResult({
+        ok: false,
+        reason: "start_build_not_granted",
+        project: CI_PROJECT,
+        detail: "This Lambda's role has no codebuild:StartBuild on the CI project. Deploy with PIPELINE_CI_START_BUILD=1 to grant it.",
+      });
+    }
+    if (err?.name === "ResourceNotFoundException") {
+      return jsonResult({ ok: false, reason: "project_not_found", project: CI_PROJECT });
+    }
+    if (err?.name === "InvalidInputException") {
+      // CodeBuild rejects a source version this Lambda's shape check accepted
+      // (e.g. a branch that does not exist) — same reason code, so the caller
+      // has one thing to fix.
+      return jsonResult({
+        ok: false,
+        reason: "invalid_source_version",
+        project: CI_PROJECT,
+        sourceVersion,
+        detail: err.message,
+      });
+    }
+    throw err; // unexpected → the generic handler error path
+  }
+
+  const build = res?.build || {};
+  console.log(
+    "start_ci_build: started",
+    JSON.stringify({ project: CI_PROJECT, sourceVersion, buildId: build.id || null })
+  );
+  return jsonResult({
+    ok: true,
+    started: true,
+    buildId: build.id || null,
+    arn: build.arn || null,
+    project: CI_PROJECT,
+    sourceVersion,
+    // Null on a fresh start (CodeBuild has not resolved the ref yet) — poll
+    // get_build_status to prove the build belongs to this commit.
+    resolvedSourceVersion: build.resolvedSourceVersion || null,
+    buildStatus: build.buildStatus || null,
+  });
+}
+
+/** Allowed source_version shapes. A `refs/...` value or a `..` range is refused
+ * outright: both are ways to make one ref name resolve to something other than
+ * the branch it appears to name. */
+function isAllowedSourceVersion(value) {
+  if (/^pr\/\d{1,7}$/.test(value)) return true;
+  if (/^[0-9a-f]{40}$/i.test(value)) return true;
+  if (value.startsWith("refs/")) return false;
+  if (value.includes("..")) return false;
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(value);
+}
+
+/** Is `resolved` (a build's resolvedSourceVersion) the commit `sha` names? Same
+ * prefix rule get_build_status matches on, but restricted to hex values so a
+ * short branch name can never prefix-match a SHA. */
+function commitMatches(resolved, sha) {
+  const r = String(resolved || "").toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(r)) return false;
+  return r === sha || r.startsWith(sha) || sha.startsWith(r);
+}
+
+/** The newest IN_PROGRESS-or-SUCCEEDED build of `project` for `sha`, or null.
+ * Reuses the ListBuildsForProject → BatchGetBuilds scan get_build_status does;
+ * BatchGetBuilds does not promise input order, so the ids (which ARE newest-first)
+ * drive the walk. A FAILED build is NOT a reuse — re-running a red build for the
+ * same commit is exactly what the CI agent calls this tool to do. */
+async function findRecentBuildForCommit(project, sha, scan = 30) {
+  const list = await cb.send(
+    new ListBuildsForProjectCommand({ projectName: project, sortOrder: "DESCENDING" })
+  );
+  const ids = (list.ids || []).slice(0, scan);
+  if (ids.length === 0) return null;
+
+  const { builds } = await cb.send(new BatchGetBuildsCommand({ ids }));
+  const byId = new Map((builds || []).filter((b) => b?.id).map((b) => [b.id, b]));
+  for (const id of ids) {
+    const build = byId.get(id);
+    if (!build || !commitMatches(build.resolvedSourceVersion, sha)) continue;
+    if (build.buildStatus === "IN_PROGRESS" || build.buildStatus === "SUCCEEDED") {
+      return build;
+    }
+  }
+  return null;
+}
+
+// ─── capabilities ─────────────────────────────────────────────────────────────
+// What this DEPLOYMENT will do, so an agent can branch without probing with a
+// real StartBuild (whose only failure signal would be an AccessDenied it cannot
+// distinguish from a transient error). approveDeploy is a hard false: there is no
+// PutApprovalResult in this Lambda and there is not going to be one.
+function capabilities() {
+  return jsonResult({
+    startCiBuild: process.env.PIPELINE_CI_START_BUILD === "1" && CI_PROJECT_CHECK.ok,
+    ciProject: CI_PROJECT,
+    buildProject: BUILD_PROJECT,
+    deployPipeline: PIPELINE_NAME,
+    approveDeploy: false,
+    version: 2,
   });
 }
 
