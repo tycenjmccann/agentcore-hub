@@ -643,16 +643,19 @@ async function scanReviewGates() {
       // the list of upstream items under review. The ping is never empty.
       const pkgSummary = typeof notif.summary === "string" ? notif.summary.trim() : "";
       const desc = cleanDesc(gateTicket?.description);
-      const summary =
+      // TEAM-4158: redact every free-text field before it enters the ping.
+      // pkgSummary/notif.bullets are agent-authored and the description +
+      // upstream titles echo user input, all of which can carry a leaked token.
+      const summary = redactText(
         pkgSummary ||
         desc ||
         (upstreamTitles.length
           ? `Reviewing ${upstreamTitles.length} completed item${upstreamTitles.length === 1 ? "" : "s"} before this phase proceeds.`
-          : `${title} is ready for your review.`);
+          : `${title} is ready for your review.`));
       const bullets =
         (Array.isArray(notif.bullets) && notif.bullets.length)
-          ? notif.bullets
-          : upstreamTitles; // the actual work under review = "What changed"
+          ? notif.bullets.map((b) => redactText(String(b)))
+          : upstreamTitles.map((t) => redactText(String(t))); // the actual work under review = "What changed"
       // TEAM-3971: a ship-review escalation needs a DECISION, not a bare approve
       // (a bare approve used to park the release manager forever). Offer the
       // three decisions as buttons; each records a `DECISION:` line on the gate.
@@ -864,6 +867,74 @@ const ESC_DETAIL_MAX = 700;
 // claimTerminalOutcome: complete / cancelled / deploy-blocked / static-ci-only.
 const TERMINAL_PHASES = new Set(["complete", "completed", "cancelled", "canceled", "failed", "deploy-blocked", "static-ci-only"]);
 
+// ─── byte-identical copy — parity test in deploy/telegram-bug-intake/redact-parity.test.mjs ───
+// Copied VERBATIM from lambda/orchestrator/dead-session-escalation.mjs. The page
+// already carries a redacted `lastText`, but this Lambda re-redacts before it
+// leaves the account: a legacy row (written before FR-3) is raw, and Telegram is
+// off-account, so the last line of defense belongs here. Do NOT "improve" one
+// copy — the parity test asserts the two function bodies are byte-equal.
+function clipText(s, n) {
+  const str = typeof s === "string" ? s : "";
+  if (n <= 0) return "";
+  return str.length > n ? `${str.slice(0, Math.max(0, n - 1))}…` : str;
+}
+
+function redactText(s) {
+  let t = typeof s === "string" ? s : "";
+  if (!t) return "";
+  const R = "[REDACTED]";
+
+  // Private keys first — the multi-line blob would otherwise be shredded by the
+  // whitespace collapse below and never match.
+  t = t.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, R);
+
+  // Presigned-URL query strings: keep the path (it identifies the artifact),
+  // redact every value (SigV4 signature/credential live here).
+  t = t.replace(/([a-zA-Z][\w+.-]*:\/\/[^\s?]+\?)([^\s]*)/g, (_m, head, qs) =>
+    head + qs.replace(/([^&=]+)=([^&]*)/g, (__, k) => `${k}=${R}`)
+  );
+  // …and bare SigV4 params that arrive without a host (log lines, curl echoes).
+  // The value stops at `&` so a param list keeps every KEY NAME visible instead
+  // of a single greedy match swallowing the rest of the query.
+  t = t.replace(/X-Amz-(Signature|Credential|Security-Token|Algorithm|Date|Expires|SignedHeaders)=[^\s&]+/gi,
+    (_m, p) => `X-Amz-${p}=${R}`);
+
+  // Provider tokens — longest/most specific patterns first.
+  t = t.replace(/github_pat_[A-Za-z0-9_]{20,}/g, R);
+  t = t.replace(/ghp_[A-Za-z0-9]{36}/g, R);
+  t = t.replace(/gh[osur]_[A-Za-z0-9]{36}/g, R);
+  t = t.replace(/(?:AKIA|ASIA)[0-9A-Z]{16}/g, R);
+  t = t.replace(/aws_secret_access_key\s*[=:]\s*\S+/gi, `aws_secret_access_key=${R}`);
+  t = t.replace(/xox[abprs]-[A-Za-z0-9-]+/g, R);
+  t = t.replace(/hooks\.slack\.com\/services\/\S+/g, `hooks.slack.com/services/${R}`);
+  t = t.replace(/eyJ[\w-]+\.[\w-]+\.[\w-]+/g, R);              // JWT
+  t = t.replace(/\b\d{8,10}:[A-Za-z0-9_-]{35}\b/g, R);          // Telegram bot token
+  t = t.replace(/sk-ant-[A-Za-z0-9_-]{20,}/g, R);
+  t = t.replace(/sk-[A-Za-z0-9]{20,}/g, R);
+  t = t.replace(/ATATT[A-Za-z0-9_-]{20,}/g, R);                 // Jira API token
+  t = t.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, `Bearer ${R}`);
+  // `Authorization: <scheme> <credential>` — the scheme name is not the secret,
+  // so step OVER a known one and redact what follows. A bare `Authorization: xyz`
+  // (no scheme) still matches via the optional group.
+  t = t.replace(/Authorization:\s*(?:(Bearer|Basic|Token|Digest|AWS4-HMAC-SHA256)\s+)?\S+/gi,
+    (_m, scheme) => `Authorization: ${scheme ? `${scheme} ` : ""}${R}`);
+
+  // Generic key=value — keep the KEY NAME (it tells the human what leaked) and
+  // redact the value. Runs last so the specific patterns above win.
+  t = t.replace(/(api[_-]?key|password|passwd|secret|token)(\s*[=:]\s*)(\S+)/gi,
+    (_m, k, sep) => `${k}${sep}${R}`);
+
+  // Emails: a page goes to a chat channel, so PII gets a placeholder, not [REDACTED].
+  t = t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "<email>");
+
+  // Finally make it one readable line: drop ANSI + code fences/backticks, collapse
+  // whitespace. (After redaction, so a fence can't hide a pattern boundary.)
+  // eslint-disable-next-line no-control-regex
+  t = t.replace(/\[[0-9;]*[A-Za-z]/g, "");
+  t = t.replace(/```+/g, " ").replace(/`/g, "");
+  return t.replace(/\s+/g, " ").trim();
+}
+
 async function scanManagerEscalations() {
   const res = await fetch(`${HUB_API_URL}/api/workflow/list`);
   if (!res.ok) throw new Error(`workflow/list ${res.status}`);
@@ -896,7 +967,10 @@ async function scanManagerEscalations() {
       }
 
       const details = String(notif.details || notif.message || "").trim();
-      const clipped = details.length > ESC_DETAIL_MAX ? `${details.slice(0, ESC_DETAIL_MAX)}…` : details;
+      // Redact BEFORE clipping: a clip that lands mid-token must never expose a
+      // secret prefix. Telegram is off-account, and any producer can put agent-
+      // streamed text / error headers / presigned URLs into details|message.
+      const clipped = clipText(redactText(details), ESC_DETAIL_MAX);
       const text = execPing({
         kicker: "🚨 WORKFLOW MANAGER ESCALATION",
         subject: wf.input?.title || wf.workflowId,
@@ -1079,8 +1153,10 @@ async function scanDeployApprovals() {
     const text = brief
       ? execPing({
           kicker: "🚀 PRODUCTION DEPLOY — approval needed",
-          subject: brief.prTitle || brief.commitSubject || DEPLOY_PIPELINE_NAME,
-          summary: brief.summary || "",                       // one-line what/why from the PR body
+          // TEAM-4158: prTitle/commitSubject/summary come from the PR body + commit
+          // message (user-authored, off-account Telegram) — redact before sending.
+          subject: redactText(brief.prTitle || brief.commitSubject || "") || DEPLOY_PIPELINE_NAME,
+          summary: redactText(brief.summary || ""),           // one-line what/why from the PR body
           bullets: [
             brief.workflowLine,                               // "Workflow: TEAM-3721 (bug-fix)"
             brief.scopeLine,                                  // "Scope: 8 files (+147/-4)"
