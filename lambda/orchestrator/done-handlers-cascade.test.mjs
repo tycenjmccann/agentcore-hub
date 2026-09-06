@@ -555,7 +555,7 @@ describe("live-reverify hook gating in both done twins (TEAM-4121 FR-9)", () => 
 // (ticketId/assignee/title — everything the gate consumes), symmetric with the
 // webhook twin. This proves the gate itself still bounces a missing artifact.
 describe("artifact-chain gate — stream twin builds the ticket from the image (TEAM-4155)", () => {
-  const INTAKE = "agentcore_hub_requirements_analyst"; // owes intent.md + spec.md on sdlc-playbook
+  const INTAKE = "agentcore_hub_requirements_analyst"; // owes intent.md + spec.md on a playbook run
   const SPEC = "TEAM-7001"; // the intake ticket that just closed
   let realFetch;
 
@@ -567,11 +567,13 @@ describe("artifact-chain gate — stream twin builds the ticket from the image (
     // before load() and serve the real config to the S3 mock.
     process.env.ARTIFACT_BUCKET = "test-bucket";
     h.state.s3Objects["config/workflows.json"] = workflowsConfig;
-    // A playbook run: sdlc-playbook declares the artifact chain, on a real repo
-    // with a shared feature branch so the gate can actually probe GitHub.
+    // A playbook run: software-delivery with the "playbook" framework overlay
+    // (which declares the artifact chain), on a real repo with a shared feature
+    // branch so the gate can actually probe GitHub.
     h.state.workflow = {
       id: "wf_1", workflowId: "wf_1", epicId: PARENT,
-      workflowDefId: "sdlc-playbook",
+      workflowDefId: "software-delivery",
+      sdlcFramework: "playbook",
       featureBranch: "feature/wf_1-shared",
       repoConfig: { repos: [{ url: "https://github.com/acme/widgets" }] },
       input: { title: "t" }, humanNotifications: [], agentTasks: {},
