@@ -107,6 +107,12 @@ const CLOSED = new Set(["done", "cancelled"]);
 const isClosed = (t) => CLOSED.has(String(t?.status || "").toLowerCase());
 const idOf = (t) => t?.ticketId || t?.id || t?.key || null;
 
+// TEAM-4130 F1 — a ship ticket in one of these is LIVE: an agent (in_progress)
+// or a human (in_review) is working it right now, and its own transition to Done
+// must keep working. addBlockers adds the blocker edge without touching the
+// status for these; everything else open (todo/ready/blocked) is parked.
+export const LIVE_SHIP_STATUSES = ["in_progress", "in_review"];
+
 export function createLiveReverify(deps = {}) {
   const {
     mode = "off",
@@ -301,6 +307,19 @@ export function createLiveReverify(deps = {}) {
       // Block the run's OPEN ship tickets on it, so a release manager cannot
       // ship past a live fix whose re-verification hasn't landed. Only open ones
       // — blocking a Done ship ticket would reopen a finished phase.
+      //
+      // TEAM-4130 F1: the edge is the point, the status flip is not. A ship
+      // ticket sitting in ready/todo IS flipped to blocked (cascadeUnblock
+      // re-readies it the moment the re-verify closes). A LIVE one — in_progress
+      // (a release manager mid-run) or in_review (a human gate) — gets the edge
+      // ONLY: its status is left exactly where it is, so the agent's own
+      // report_completion still reaches Done through the real `done` transition
+      // instead of being stranded in `blocked`, whose only route to done is the
+      // `skip` alias. Nothing ships early as a result: the still-open re-verify
+      // holds PHASE completion via completion.mjs's open-fix gate (the re-verify
+      // carries spawned_by.kind "qa_fix"), and its Done is what the ship review /
+      // human merge gate consumes. The decision is made inside addBlockers'
+      // conditional write, so this loop never reads the status itself.
       const shipTickets = siblings.filter(
         (t) => shipPhases.has(getAgentDef?.(t?.assignee)?.phase) && !isClosed(t)
       );
@@ -308,7 +327,11 @@ export function createLiveReverify(deps = {}) {
       for (const ship of shipTickets) {
         const sid = idOf(ship);
         if (!sid) continue;
-        const added = await safe("addBlockers(ship)", () => addBlockers?.(sid, [reverifyTicketId]), []);
+        const added = await safe(
+          "addBlockers(ship)",
+          () => addBlockers?.(sid, [reverifyTicketId], { preserveStatusIf: LIVE_SHIP_STATUSES }),
+          []
+        );
         if (added?.length) blocked.push(sid);
       }
 

@@ -21,6 +21,7 @@ import {
   createLiveReverify,
   hasLiveArtifact,
   normalizeLiveReverifyMode,
+  LIVE_SHIP_STATUSES,
 } from "./live-reverify.mjs";
 import { isReworkFix } from "./rework-loop-cap.mjs";
 
@@ -70,7 +71,8 @@ function harness({ mode = "enforce", children = [], record = liveRecord(), tasks
     // gate's assignee has no agent def, exactly as in the real roster.
     getAgentDef: (assignee) => (phases[assignee] ? { agentId: assignee, phase: phases[assignee] } : null),
     shipPhases: new Set(["ship"]),
-    addBlockers: vi.fn(async (ticketId, ids) => { calls.addBlockers.push({ ticketId, ids }); return ids; }),
+    // TEAM-4130 F1: the third arg is the whole point of the option — record it.
+    addBlockers: vi.fn(async (ticketId, ids, opts) => { calls.addBlockers.push({ ticketId, ids, opts }); return ids; }),
     publishEvent: vi.fn(async (ticketId, type, detail) => { calls.events.push({ ticketId, type, detail }); }),
     log: { warn: (m) => calls.warns.push(m), log: () => {} },
   };
@@ -266,6 +268,7 @@ describe("enforce — originQa comes from the fix's own lineage", () => {
 
 describe("enforce — blocking the run's OPEN ship tickets", () => {
   const ship = (over = {}) => ({ ticketId: SHIP, assignee: "agentcore_hub_release_manager", status: "in_progress", ...over });
+  const PRESERVE = ["in_progress", "in_review"];
 
   it("blocks an open ship-phase sibling", async () => {
     const { onFixDone, calls, workflow, record } = harness({
@@ -275,8 +278,48 @@ describe("enforce — blocking the run's OPEN ship tickets", () => {
 
     await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: record });
 
-    expect(calls.addBlockers).toEqual([{ ticketId: SHIP, ids: [REVERIFY] }]);
+    expect(calls.addBlockers).toEqual([{ ticketId: SHIP, ids: [REVERIFY], opts: { preserveStatusIf: PRESERVE } }]);
     expect(eventsOfType(calls, "fix.reverify_created")[0].detail.blockedShipTickets).toEqual([SHIP]);
+  });
+
+  /**
+   * TEAM-4130 F1 — the option is passed UNCONDITIONALLY, for every open ship
+   * ticket regardless of the status the sibling snapshot happens to show. The
+   * park-or-preserve decision belongs to addBlockers' conditional write, because
+   * this snapshot can be seconds stale relative to the agent's own transition.
+   */
+  it("passes preserveStatusIf for a LIVE (in_progress) ship ticket", async () => {
+    const { onFixDone, calls, workflow, record } = harness({
+      children: [ship({ status: "in_progress" })],
+      phases: { agentcore_hub_release_manager: "ship" },
+    });
+
+    await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: record });
+
+    expect(calls.addBlockers[0].opts).toEqual({ preserveStatusIf: ["in_progress", "in_review"] });
+    expect(calls.addBlockers[0].opts.preserveStatusIf).toEqual(LIVE_SHIP_STATUSES);
+  });
+
+  it("passes the SAME option for a ready ship ticket — the decision is not made here", async () => {
+    const { onFixDone, calls, workflow, record } = harness({
+      children: [ship({ status: "ready" })],
+      phases: { agentcore_hub_release_manager: "ship" },
+    });
+
+    await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: record });
+
+    expect(calls.addBlockers).toEqual([{ ticketId: SHIP, ids: [REVERIFY], opts: { preserveStatusIf: PRESERVE } }]);
+  });
+
+  it("an in_review human gate on a ship phase is blocked, not parked", async () => {
+    const { onFixDone, calls, workflow, record } = harness({
+      children: [ship({ ticketId: "TEAM-4067", status: "in_review" })],
+      phases: { agentcore_hub_release_manager: "ship" },
+    });
+
+    await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: record });
+
+    expect(calls.addBlockers[0]).toEqual({ ticketId: "TEAM-4067", ids: [REVERIFY], opts: { preserveStatusIf: PRESERVE } });
   });
 
   it.each([["done"], ["cancelled"], ["DONE"]])("does not reopen a %s ship ticket", async (status) => {
@@ -299,8 +342,8 @@ describe("enforce — blocking the run's OPEN ship tickets", () => {
     await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: record });
 
     expect(calls.addBlockers).toEqual([
-      { ticketId: SHIP, ids: [REVERIFY] },
-      { ticketId: "TEAM-4068", ids: [REVERIFY] },
+      { ticketId: SHIP, ids: [REVERIFY], opts: { preserveStatusIf: PRESERVE } },
+      { ticketId: "TEAM-4068", ids: [REVERIFY], opts: { preserveStatusIf: PRESERVE } },
     ]);
   });
 
@@ -316,6 +359,76 @@ describe("enforce — blocking the run's OPEN ship tickets", () => {
     await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: record });
 
     expect(deps.addBlockers).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * TEAM-4130 F1, end to end — the same flow with an addBlockers fake that HONOURS
+ * preserveStatusIf against a board, so the observable is the board rather than
+ * the call log. (That the two DDB conditions actually implement this contract is
+ * proven against evaluated ConditionExpressions in ticket-blockers.test.mjs.)
+ */
+describe("enforce — the board after a live fix blocks the ship tickets (TEAM-4130 F1)", () => {
+  /** addBlockers over a `{ ticketId: row }` board, per its documented contract. */
+  function boardHarness(rows) {
+    const board = Object.fromEntries(rows.map((r) => [r.ticketId, { ...r }]));
+    const addBlockers = vi.fn(async (ticketId, ids, opts = {}) => {
+      const row = board[ticketId];
+      if (!row) return [];
+      const preserve = opts.preserveStatusIf ?? [];
+      const added = [];
+      for (const id of ids) {
+        if ((row.blockedBy ?? []).includes(id)) continue; // idempotent per edge
+        row.blockedBy = [...(row.blockedBy ?? []), id];
+        if (!preserve.includes(row.status)) row.status = "blocked";
+        added.push(id);
+      }
+      return added;
+    });
+    const h = harness({
+      children: Object.values(board),
+      phases: { agentcore_hub_release_manager: "ship" },
+    });
+    h.deps.addBlockers = addBlockers;
+    // Rebuild with the board-backed dep in place.
+    const { onFixDone } = createLiveReverify(h.deps);
+    return { onFixDone, board, workflow: h.workflow, record: h.record, calls: h.calls };
+  }
+
+  const shipRow = (over = {}) => ({
+    ticketId: SHIP, assignee: "agentcore_hub_release_manager", status: "in_progress", ...over,
+  });
+
+  it("a release manager mid-run keeps in_progress and gains the edge", async () => {
+    const { onFixDone, board, workflow, record, calls } = boardHarness([shipRow()]);
+
+    await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: record });
+
+    expect(board[SHIP].status).toBe("in_progress"); // report_completion can still reach done
+    expect(board[SHIP].blockedBy).toEqual([REVERIFY]);
+    expect(eventsOfType(calls, "fix.reverify_created")[0].detail.blockedShipTickets).toEqual([SHIP]);
+  });
+
+  it("a ready ship ticket IS parked to blocked (cascadeUnblock re-readies it)", async () => {
+    const { onFixDone, board, workflow, record } = boardHarness([shipRow({ status: "ready" })]);
+
+    await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: record });
+
+    expect(board[SHIP].status).toBe("blocked");
+    expect(board[SHIP].blockedBy).toEqual([REVERIFY]);
+  });
+
+  it("a mixed ship phase: the live one is preserved, the queued one is parked", async () => {
+    const { onFixDone, board, workflow, record } = boardHarness([
+      shipRow(),
+      shipRow({ ticketId: "TEAM-4068", status: "todo" }),
+    ]);
+
+    await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: record });
+
+    expect(board[SHIP].status).toBe("in_progress");
+    expect(board["TEAM-4068"].status).toBe("blocked");
+    expect(board["TEAM-4068"].blockedBy).toEqual([REVERIFY]);
   });
 });
 

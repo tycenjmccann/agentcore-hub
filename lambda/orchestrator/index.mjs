@@ -59,6 +59,7 @@ import { syncBeforeCi, normalizeSyncMode } from "./sync-main.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 import { createDeadSessionEscalation, normalizeEscalationMode } from "./dead-session-escalation.mjs";
+import { applyBlockerEdge, normalizePreserveStatuses } from "./ticket-blockers.mjs";
 // TEAM-4121 FR-8: the fix-ticket contract lives in a zero-import module that is
 // byte-identical across the orchestrator + both ticket Lambdas (CI cmp's them).
 // The orchestrator only READS contracts — it maps a Jira issue's labels and
@@ -1090,14 +1091,28 @@ async function blockShipOnPrereq(ticketId, shipTicket, blockerId) {
  * per-blocker list_append, so concurrent writers can't clobber each other's
  * edges the way a whole-array rewrite does; CCFE means "already linked" → skip.
  *
+ * TEAM-4130 F1 — `opts.preserveStatusIf`: statuses whose ticket must KEEP its
+ * status while still gaining the edge. Default `[]` = the pre-4130 behaviour,
+ * byte for byte, which is what the dead-session escalation (its held ticket is
+ * already board-`blocked`) and sync-main's `blockOnFix` (its CI ticket IS
+ * `in_progress` at call time and RELIES on the flip to park it) both want.
+ * live-reverify opts in with ["in_progress","in_review"], because a release
+ * manager mid-run whose status is yanked to `blocked` can no longer reach Done
+ * through the tickets Lambda's real `done` transition — TRANSITIONS.blocked has
+ * no `done` row, so `to_status:"done"` would only resolve through the `skip`
+ * row's `to` alias and record a SKIP where a completion belongs. The decision is
+ * made inside the conditional write (see ticket-blockers.mjs), never by a
+ * read-then-write that would race the agent's own transition.
+ *
  * NOTE: this is a deliberate, acknowledged duplicate of the tickets-Lambda
  * `add_blockers` op added in PR #380, which main does not yet carry. When #380
  * merges, replace the body with invokeTickets("add_blockers", …) so the board
  * write lives in exactly one place again.
  */
-async function addBlockers(ticketId, ids) {
+async function addBlockers(ticketId, ids, opts = {}) {
   const blockers = (Array.isArray(ids) ? ids : [ids]).filter(Boolean);
   if (!ticketId || !blockers.length) return [];
+  const preserveStatusIf = normalizePreserveStatuses(opts.preserveStatusIf);
   const added = [];
   if (TICKET_PROVIDER === "jira") {
     for (const id of blockers) {
@@ -1112,31 +1127,54 @@ async function addBlockers(ticketId, ids) {
         console.warn(`[orchestrator] addBlockers: link ${id} → ${ticketId} failed (non-fatal): ${err?.message || err}`);
       }
     }
-    if (added.length) await jiraTransition(ticketId, "Blocked");
+    if (added.length && !(await jiraStatusIsPreserved(ticketId, preserveStatusIf))) {
+      await jiraTransition(ticketId, "Blocked");
+    }
     return added;
   }
   for (const id of blockers) {
-    try {
-      await ddb.send(new UpdateCommand({
-        TableName: TICKETS_TABLE,
-        Key: { ticketId },
-        UpdateExpression:
-          "SET blockedBy = list_append(if_not_exists(blockedBy, :empty), :one), #s = :blocked, #u = :now",
-        ConditionExpression: "attribute_not_exists(blockedBy) OR NOT contains(blockedBy, :id)",
-        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-        ExpressionAttributeValues: {
-          ":empty": [], ":one": [id], ":id": id,
-          ":blocked": "blocked", ":now": new Date().toISOString(),
-        },
-      }));
-      added.push(id);
-    } catch (err) {
-      if (err?.name !== "ConditionalCheckFailedException") {
-        console.warn(`[orchestrator] addBlockers: ${ticketId} += ${id} failed (non-fatal): ${err?.message || err}`);
-      }
+    const outcome = await applyBlockerEdge({
+      send: (input) => ddb.send(new UpdateCommand(input)),
+      table: TICKETS_TABLE,
+      ticketId,
+      blockerId: id,
+      preserveStatusIf,
+      now: new Date().toISOString(),
+      warn: (msg) => console.warn(msg),
+    });
+    if (outcome === "preserved") {
+      console.log(`[orchestrator] addBlockers: ${ticketId} += ${id} (edge only — status preserved, TEAM-4130 F1)`);
     }
+    if (outcome === "blocked" || outcome === "preserved") added.push(id);
   }
   return added;
+}
+
+/**
+ * TEAM-4130 F1 (Jira half) — is this issue in one of the statuses the caller
+ * asked to preserve? Reads the issue's CURRENT status rather than trusting the
+ * sibling snapshot the caller was handed, which may be seconds stale. Jira has
+ * no conditional write, so this is a read-then-write and cannot be made atomic;
+ * the fail-safe direction is today's behaviour — an unreadable status returns
+ * false, i.e. we still transition to Blocked (an unnecessary park is recoverable
+ * by the unblock cascade; a missed park would let a run ship past a live fix).
+ */
+async function jiraStatusIsPreserved(issueKey, preserveStatusIf) {
+  if (!preserveStatusIf?.length) return false;
+  try {
+    const issue = await jiraFetch(`/rest/api/3/issue/${issueKey}?fields=status`);
+    const name = issue?.fields?.status?.name;
+    if (!name) throw new Error("no fields.status.name in the issue response");
+    const current = mapJiraStatus(name);
+    if (preserveStatusIf.includes(current)) {
+      console.log(`[orchestrator] addBlockers: ${issueKey} left in ${current} (no Blocked hop, TEAM-4130 F1)`);
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.warn(`[orchestrator] addBlockers: could not read ${issueKey}'s status (${err?.message || err}) — falling back to the Blocked transition`);
+    return false;
+  }
 }
 
 /**
