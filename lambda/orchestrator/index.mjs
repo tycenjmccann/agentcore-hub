@@ -1628,14 +1628,26 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
  * (shared/review-package-<phase>.json). The gate's phase comes from the agent
  * tickets it is blockedBy — same resolution as handleReviewRejection. Returns
  * a validated {gate, summary, bullets, links} or null; never throws.
+ *
+ * Exported solely so review-package-phase.test.mjs can drive it (same convention
+ * as handleReviewRejection).
  */
-async function loadReviewPackage(workflow, gateTicketId) {
+export async function loadReviewPackage(workflow, gateTicketId) {
   try {
     const gateTicket = await getTicket(gateTicketId);
-    // Playbook gates first: the Plan Approval gate is blocked by a DEV ticket
-    // (phase "development") but reads the plan package; the Intent Acceptance
-    // gate has no agent blockers at all (the hub created it).
-    let phase = fallbackReviewPackagePhase(gateTicket);
+    // Phase resolution, in the ONE order that holds for both def families
+    // (TEAM-4159). `fallbackReviewPackagePhase` is title-driven: it answers
+    // "plan" for any /plan approval/i gate and "intake" for any gate with no
+    // blockers, neither of which is true outside a playbook def. So it may
+    // influence `phase` ONLY when the def actually has an artifact chain —
+    // including the SEED value, which is what PR #399 left unguarded:
+    // software-delivery's opt-in "Plan Approval" gate (afterPhase design) seeded
+    // phase="plan", so the blocker walk below was skipped and the run listed a
+    // review-package-plan prefix no designer ever writes → bare template ping
+    // instead of the merged designer packages.
+    const wfDef = getEffectiveWorkflowDef(workflow);
+    const isPlaybook = !!chainFor(wfDef);
+    let phase = isPlaybook ? fallbackReviewPackagePhase(gateTicket) : undefined;
     if (phase === undefined || phase === "intake") {
       for (const upId of gateTicket?.blockedBy || []) {
         const up = await getTicket(upId);
@@ -1643,12 +1655,17 @@ async function loadReviewPackage(workflow, gateTicketId) {
         if (def?.phase) { phase = def.phase; break; }
       }
     }
-    // Playbook defs ONLY: the Plan Approval gate is blocked by a DEV ticket
-    // (phase "development") but reads the plan package, and the Intent
-    // Acceptance gate has no agent blockers at all (the hub created it). Other
-    // defs keep the blocker walk untouched — software-delivery's opt-in "Plan
-    // Approval" gate (after design) must still merge the designer packages.
-    if (chainFor(getEffectiveWorkflowDef(workflow))) {
+    // Playbook defs ONLY, re-asserted AFTER the walk: their Plan Approval gate is
+    // blocked by a DEV ticket (phase "development") yet reads the plan package,
+    // so the title must win over the walk; and their Intent Acceptance gate has
+    // no agent blockers at all (the hub created it), so "intake" fills a phase
+    // the walk could not resolve. Non-chain defs resolve from the walk alone.
+    //
+    // Given the seed above this is a no-op today (the walk only runs when `phase`
+    // is undefined/"intake" and only ever ASSIGNS a phase it found, so it can
+    // never clobber "plan"). Kept because it states the invariant independently of
+    // the walk's guard condition — the exact coupling PR #399 tripped over.
+    if (isPlaybook) {
       const fallback = fallbackReviewPackagePhase(gateTicket);
       if (fallback === "plan" || (fallback === "intake" && !phase)) phase = fallback;
     }

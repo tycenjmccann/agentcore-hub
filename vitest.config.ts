@@ -141,6 +141,11 @@ export default defineConfig({
       // review cap: escalation short-circuit + the review_fix reopen stamp.
       // index.mjs imported for real with its AWS/store/cap seams mocked.
       "lambda/orchestrator/review-rejection.test.mjs",
+      // review-package-phase (TEAM-4159) — which phase loadReviewPackage reads
+      // the gate's package from: blocker walk only for non-chain defs, title /
+      // zero-blocker fallbacks for playbook defs. Same harness as
+      // review-rejection, plus a ListObjectsV2 mock that records the Prefix.
+      "lambda/orchestrator/review-package-phase.test.mjs",
       // completion-gates (TEAM-3686 F3/F4) — the orchestrator's evidence gate
       // in completeWorkflow and the fix-spawn completion re-check. Same harness
       // as review-rejection: index.mjs real, AWS/store seams mocked.
