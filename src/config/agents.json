@@ -54,12 +54,19 @@
       ],
       "blueprints": [
         "requirements-analyst",
-        "bug-fix-requirements"
+        "bug-fix-requirements",
+        "spec-author",
+        "policy-security",
+        "policy-compliance",
+        "policy-brand",
+        "policy-ux",
+        "review-package"
       ],
       "workflowDefIds": [
         "software-delivery",
         "bug-fix",
-        "dead-code-sweep"
+        "dead-code-sweep",
+        "sdlc-playbook"
       ]
     },
     {
@@ -565,7 +572,12 @@
         "aws-serverless-backend"
       ],
       "blueprints": [
-        "backend-dev"
+        "backend-dev",
+        "playbook-build"
+      ],
+      "workflowDefIds": [
+        "software-delivery",
+        "sdlc-playbook"
       ]
     },
     {
@@ -621,7 +633,12 @@
         "api-design-reviewer"
       ],
       "blueprints": [
-        "api-dev"
+        "api-dev",
+        "playbook-build"
+      ],
+      "workflowDefIds": [
+        "software-delivery",
+        "sdlc-playbook"
       ]
     },
     {
@@ -678,7 +695,12 @@
         "frontend-design"
       ],
       "blueprints": [
-        "frontend-dev"
+        "frontend-dev",
+        "playbook-build"
+      ],
+      "workflowDefIds": [
+        "software-delivery",
+        "sdlc-playbook"
       ]
     },
     {
@@ -707,6 +729,7 @@
         "browser",
         "calculator",
         "claude_code",
+        "codex",
         "code_interpreter",
         "create_branch",
         "create_or_update_file",
@@ -739,7 +762,8 @@
       "workflowDefIds": [
         "software-delivery",
         "bug-fix",
-        "dead-code-sweep"
+        "dead-code-sweep",
+        "sdlc-playbook"
       ]
     },
     {
@@ -800,7 +824,8 @@
       "workflowDefIds": [
         "software-delivery",
         "bug-fix",
-        "dead-code-sweep"
+        "dead-code-sweep",
+        "sdlc-playbook"
       ]
     },
     {
@@ -867,7 +892,8 @@
       "workflowDefIds": [
         "software-delivery",
         "bug-fix",
-        "dead-code-sweep"
+        "dead-code-sweep",
+        "sdlc-playbook"
       ]
     },
     {
@@ -932,7 +958,8 @@
       "workflowDefIds": [
         "software-delivery",
         "bug-fix",
-        "dead-code-sweep"
+        "dead-code-sweep",
+        "sdlc-playbook"
       ]
     },
     {
