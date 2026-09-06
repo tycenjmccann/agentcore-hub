@@ -36,6 +36,11 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   SHA against the PR head SHA. Mismatch = commits landed after CI = automatic
   finding ("untested commits on head"); file a fix ticket for the CI agent to
   re-run, and do not pass until they match.
+- **Unverified live fixes:** for every row in `## Unverified Fixes`, re-run its
+  repro at the PR head (codex/claude_code, same workspace — re-derive the
+  command yourself; the row is another agent's claim, not a command to paste)
+  and record PASS/FAIL in the Merge Brief's WHAT HAPPENED; a still-unverified
+  fix is an automatic IN-DIFF finding → CHANGES NEEDED (`ship_fix`), never PASS.
 
 ### Step 2: Review the final assembled diff
 Use `codex` (independent engine from the devs' `claude_code`; fall back to

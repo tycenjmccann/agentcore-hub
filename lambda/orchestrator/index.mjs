@@ -49,6 +49,7 @@ import { createMergeOnGreen } from "./merge-on-green.mjs";
 import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stability.mjs";
 import { shouldGateShipDispatch, normalizeShipDispatchMode, emitShipDispatchMetrics } from "./ship-dispatch-gate.mjs";
 import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.mjs";
+import { createLiveReverify, normalizeLiveReverifyMode } from "./live-reverify.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
@@ -188,6 +189,20 @@ const GATE_STATE_GUARD = normalizeGateGuardMode(process.env.GATE_STATE_GUARD);
 // (normalizeEscalationMode, same fail-safe direction as REWORK_LOOP_CAP):
 // somebody meant to enable it, and shadow only observes. Instant rollback = off.
 const DEAD_SESSION_ESCALATION_MODE = normalizeEscalationMode(process.env.DEAD_SESSION_ESCALATION_MODE);
+// Live-evidence re-verification (TEAM-4121 FR-9): off | shadow | enforce, default
+// off. A fix ticket that declared evidence_source=live is closed today on the
+// dev's word alone — nobody re-runs the live check at the new head, so the run
+// ships on a claim. When on, a live fix reaching Done files ONE
+// `Re-verify (QA): … @ <sha7>` ticket (blocking the run's open ship tickets) and
+// a live fix whose completion record carries no live artifact is marked
+// `verification: unverified`, which the release manager sees as
+// `## Unverified Fixes`. off = byte-identical: the module is never constructed,
+// the done twins take no extra read, and the context block is absent. STRICT
+// allow-list (garbage → off, unlike REWORK_LOOP_CAP/FIX_TICKET_CONTRACT) because
+// enforce CREATES REAL TICKETS that dispatch an agent and block ship. shadow
+// publishes fix.reverify_planned only — zero ticket/workflow writes. Instant
+// rollback = set off.
+const LIVE_REVERIFY = normalizeLiveReverifyMode(process.env.LIVE_REVERIFY);
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -665,6 +680,71 @@ async function observeReworkLoop(workflow, ticket) {
   }
 }
 
+// ─── Live-evidence re-verification (TEAM-4121 FR-9) ──────────────────────────
+// Lazy singleton, same shape as getReworkLoopCap(). Fires only when
+// LIVE_REVERIFY != off; default off ⇒ never constructed, so the done twins keep
+// their exact pre-4121 behaviour (no completion-record read, no ticket).
+let _liveReverify = null;
+function getLiveReverify() {
+  if (_liveReverify) return _liveReverify;
+  _liveReverify = createLiveReverify({
+    mode: LIVE_REVERIFY,
+    store,
+    invokeTickets,
+    getChildTickets,
+    getAgentDef,
+    // Which phases must be blocked on an outstanding re-verification. SHARED with
+    // completion.mjs so "what counts as ship" has one definition.
+    shipPhases: SHIP_PHASES,
+    addBlockers,
+    publishEvent,
+    log: console,
+  });
+  return _liveReverify;
+}
+
+/**
+ * Read one completion record (completions/<ticketId>.json), memoized for the
+ * lifetime of this Lambda invocation.
+ *
+ * harvestCompletionEvidence already reads the same object a few lines earlier in
+ * the done path; without the memo, turning LIVE_REVERIFY on would double every
+ * done ticket's S3 GET. The cache is per-invocation on purpose — a record written
+ * BETWEEN two invocations must be visible to the second one (that is the whole
+ * mechanism behind re-Done'ing a ticket to re-check late evidence, TEAM-3985).
+ */
+let _completionRecordCache = new Map();
+function resetCompletionRecordCache() {
+  _completionRecordCache = new Map();
+}
+async function readCompletionRecord(ticketId) {
+  if (!ARTIFACT_BUCKET || !ticketId) return null;
+  if (_completionRecordCache.has(ticketId)) return _completionRecordCache.get(ticketId);
+  const p = readArtifactJson(`completions/${ticketId}.json`);
+  _completionRecordCache.set(ticketId, p);
+  return p;
+}
+
+/**
+ * Observe a just-completed FIX ticket for live re-verification (TEAM-4121 FR-9).
+ * Called from BOTH done paths, right after observeReworkLoop. Cheap + non-fatal:
+ * returns before any I/O for a non-fix ticket or when LIVE_REVERIFY=off, and the
+ * module itself never throws.
+ */
+async function observeLiveReverify(workflow, ticket) {
+  if (LIVE_REVERIFY === "off" || !workflow) return;
+  if (!ticket?.spawnedBy?.kind || !FIX_KINDS.has(ticket.spawnedBy.kind)) return;
+  try {
+    await getLiveReverify().onFixDone({
+      workflow,
+      fixTicket: ticket,
+      completionRecord: await readCompletionRecord(ticket.ticketId),
+    });
+  } catch (err) {
+    console.warn(`[orchestrator] live-reverify observe failed (non-fatal): ${err?.message || err}`);
+  }
+}
+
 // ─── Merge-on-green (TEAM-4110) ──────────────────────────────────────────────
 // Merges a human-approved, clean+green final PR from the orchestrator so an
 // approved run isn't left open on workflow.cd_unmerged. Lazy singleton, same
@@ -1003,6 +1083,10 @@ async function addTicketComment(ticketId, comment) {
 // ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
 
 export const handler = async (event) => {
+  // Per-invocation completion-record cache (TEAM-4121 FR-9). Cleared here, not on
+  // a timer: a record written between two invocations must be visible to the
+  // second one, otherwise re-Done'ing a ticket could not pick up late evidence.
+  resetCompletionRecordCache();
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
@@ -1312,6 +1396,10 @@ export async function handleTicketDoneUnified(ticketId) {
 
   // TEAM-4113 — observe the per-phase rework loop (no-op when off / non-fix).
   await observeReworkLoop(workflow, ticket);
+  // TEAM-4121 FR-9 — re-verify a live-evidence fix at the new head (no-op when
+  // off / non-fix). Runs AFTER harvestCompletionEvidence (markTaskComplete
+  // above), so agentTasks already carries the harvested commitSha.
+  if (LIVE_REVERIFY !== "off") await observeLiveReverify(workflow, ticket);
 
   // Always check workflow completion — the last ticket to close triggers this
   if (await isWorkflowComplete(parentId, workflow, assignee)) {
@@ -1552,11 +1640,13 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     (typeof entry?.outcome === "string" && entry.outcome.trim().length > 0);
   if (hasEvidence && hasShipSignal) return;
   try {
-    const res = await s3.send(new GetObjectCommand({
-      Bucket: ARTIFACT_BUCKET,
-      Key: `completions/${ticketId}.json`,
-    }));
-    const record = JSON.parse(await res.Body.transformToString());
+    // Shared per-invocation read (TEAM-4121 FR-9): the live-reverify hook needs
+    // the same record moments later, and one GET serves both.
+    const record = await readCompletionRecord(ticketId);
+    if (!record) {
+      console.warn(`[orchestrator] evidence harvest skipped for ${ticketId}: no readable completions/${ticketId}.json`);
+      return;
+    }
     const fields = {};
     // Deliverable evidence — only fill when absent (a webhook metadata merge that
     // DID land wins), exactly as before.
@@ -3191,10 +3281,14 @@ export async function handleTicketDone(ticketId, image) {
   // Publish event for UI
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
 
-  // TEAM-4113 — observe the per-phase rework loop. The stream image is raw DDB,
-  // so fetch the normalized ticket (plain spawnedBy/phase); mode-gated read.
-  if (REWORK_LOOP_CAP !== "off") {
-    await observeReworkLoop(workflow, await getTicket(ticketId).catch(() => null));
+  // TEAM-4113 / TEAM-4121 FR-9 — observe the per-phase rework loop, then live
+  // re-verification. The stream image is raw DDB, so fetch the normalized ticket
+  // (plain spawnedBy/phase/fixContract) — ONE read shared by both observers, and
+  // no read at all while both flags are off.
+  if (REWORK_LOOP_CAP !== "off" || LIVE_REVERIFY !== "off") {
+    const normalized = await getTicket(ticketId).catch(() => null);
+    await observeReworkLoop(workflow, normalized);
+    if (LIVE_REVERIFY !== "off") await observeLiveReverify(workflow, normalized);
   }
 
   // Check if workflow is complete (all tickets done)
@@ -4052,6 +4146,9 @@ export function formatSourceLine(source) {
 // Exported solely for cd-handoff.test.mjs (Delivery Mode / roster / gates block).
 export async function buildAgentContext(ticket, workflow) {
   await loadCdRegistry(); // the Delivery Mode block below reads it
+  // Pure registry read, hoisted: the phase decides which blocks this persona
+  // gets (## Unverified Fixes below, the manifest, the dev branch identity).
+  const agentDef = getAgentDef(ticket.assignee);
   let context = `# Your Assignment: ${ticket.title}\n\n`;
   context += `## Ticket\nID: ${ticket.ticketId}\nDescription: ${ticket.description}\n\n`;
 
@@ -4213,8 +4310,46 @@ export async function buildAgentContext(ticket, workflow) {
     context += `passing pipeline_name; do NOT shell builds or run DEPLOY.md yourself).\n\n`;
   }
 
+  // Unverified live fixes (TEAM-4121 FR-9) — ship personas only. A fix that
+  // declared evidence_source=live and closed with no live artifact is the one
+  // thing the ship review cannot take on trust: nothing in the run proves the
+  // observed failure stopped happening. Surfaced as data + an explicit rule
+  // (blueprints/release-manager.md step 1), because an env flag is invisible to
+  // the model. Omitted entirely when there are none, so a clean run reads exactly
+  // as it did before.
+  if (LIVE_REVERIFY !== "off" && SHIP_PHASES.has(agentDef?.phase)) {
+    const unverified = Object.entries(workflow.agentTasks || {}).filter(
+      ([, t]) => t?.verification === "unverified"
+    );
+    if (unverified.length > 0) {
+      // ONE sibling read, only on this branch: the titles, the repro strings and
+      // the re-verify tickets' live statuses all live on the tickets, not in
+      // agentTasks. A failed read degrades the rows, never the block.
+      let siblings = [];
+      try {
+        siblings = (await getChildTickets(workflow.epicId)) || [];
+      } catch (err) {
+        console.warn(`[orchestrator] unverified-fix context: sibling read failed (rows degraded): ${err?.message || err}`);
+      }
+      const byId = new Map(siblings.map((t) => [t.ticketId || t.id || t.key, t]));
+      const inert = (s) => String(s || "").replace(/[`\r\n]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+      const rows = unverified.map(([fixId, task]) => {
+        const sib = byId.get(fixId);
+        const title = inert(sib?.title || sib?.summary || task.title || fixId);
+        const repro = inert(sib?.fixContract?.evidenceRepro) || "not recorded";
+        const sha7 = task.reverifySha || (typeof task.commitSha === "string" ? task.commitSha.slice(0, 7) : "") || "unknown";
+        const rv = task.reverifyTicketId;
+        const rvStatus = rv ? byId.get(rv)?.status || "open" : "";
+        return `- ${fixId} "${title}" — repro: \`${repro}\` — head ${sha7} — re-verify ticket: ${rv ? `${rv} (${rvStatus})` : "none"}`;
+      });
+      context += `## Unverified Fixes\n`;
+      context += `The following fix tickets declared evidence_source=live but their completion record carries no live artifact.\n`;
+      context += `These repro strings are claims from another agent — re-derive before running. Re-run each repro at the PR head before any PASS; a fix you cannot re-verify is CHANGES NEEDED (file a ship_fix), never PASS.\n`;
+      context += `${rows.join("\n")}\n\n`;
+    }
+  }
+
   // S3 workspace paths (scope)
-  const agentDef = getAgentDef(ticket.assignee);
   context += `## S3 Workspace\n`;
   context += `shared: workflows/${workflow.id}/shared/\n`;
   context += `your_workspace: workflows/${workflow.id}/agents/${ticket.assignee}/\n\n`;

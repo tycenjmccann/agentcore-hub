@@ -34,6 +34,9 @@ Globals:
         # Orchestrator-only as well (both exhausted-retry emitters live there);
         # rides Globals for the same one-place-to-set parity.
         DEAD_SESSION_ESCALATION_MODE: !Ref DeadSessionEscalationMode
+        # Orchestrator-only (the done twins + buildAgentContext live there);
+        # rides Globals for the same one-place-to-set parity.
+        LIVE_REVERIFY: !Ref LiveReverify
 
 Parameters:
   TicketsTableName:
@@ -149,6 +152,30 @@ Parameters:
       dead agent spawned (auto-reset capped to once per ticket), else park it on
       one human gate. It never steals a claim, never invokes an agent, and never
       marks a ticket Done on a stale or evidence-less record. Default "off"
+      matches the code's unset default and deploy.sh only forwards the var when
+      explicitly set. Instant rollback = set off.
+
+  LiveReverify:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Live-evidence re-verification (TEAM-4121 FR-9). A fix ticket that declared
+      evidence_source=live — the finding was observed on a RUNNING system — is
+      closed today on the dev's word: nobody re-runs the check at the new head,
+      so the run ships on a claim. off = byte-identical to pre-4121 (the module is
+      never constructed, the done twins take no extra read, and the release
+      manager's context has no ## Unverified Fixes block). shadow = publish
+      fix.reverify_planned{wouldCreate,wouldMarkUnverified} on each live fix's
+      Done; zero ticket/workflow writes. enforce = also act — file ONE
+      "Re-verify (QA): <fix> @ <sha7>" ticket per (fix, head), blocked on the fix
+      and blocking the run's OPEN ship tickets, and mark a live fix whose
+      completion record carries no live artifact `verification: unverified` so the
+      release manager must re-run its repro before any PASS. Idempotent per (fix,
+      head sha): re-Done'ing a fix files nothing new, a fix re-Done'd at a NEW
+      head does. NOTE the asymmetry with REWORK_LOOP_CAP / FIX_TICKET_CONTRACT: a
+      PRESENT-but-garbage value coalesces to OFF here, not shadow, because
+      enforce creates real tickets that dispatch a real agent. Default "off"
       matches the code's unset default and deploy.sh only forwards the var when
       explicitly set. Instant rollback = set off.
 

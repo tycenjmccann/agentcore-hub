@@ -258,6 +258,13 @@ export default defineConfig({
       // creation twins — the DDB-stream INSERT and the Jira webhook's todo — and
       // never fails to ROUTE the ticket when that advisory can't be published.
       "lambda/orchestrator/contract-warning.test.mjs",
+      // workflow-output report_completion (TEAM-4121 FR-9) — the completion record
+      // is what live-reverify.mjs reads to decide whether a "live" fix actually
+      // produced live evidence, so the two new fields must be additive (a record
+      // written without them keeps EXACTLY the pre-4121 key set) and closed (an
+      // unrecognized evidence_kind is dropped with a warning, never stored). REAL
+      // handler, AWS SDK mocked at the module seam.
+      "lambda/workflow-output/index.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

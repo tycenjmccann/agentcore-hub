@@ -1759,7 +1759,7 @@ def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: 
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "") -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -1769,14 +1769,30 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         branch: Git branch name (for dev agents)
         commit_sha: Git commit SHA (for dev agents)
         pr_url: Pull request URL (for dev agents)
+        evidence_kind: how you know the work is done — "static" (read the code) |
+            "unit" (a test/command proves it) | "live" (you ran the system / UI /
+            integration). QA verifiers MUST pass "live" when they actually ran the
+            system; a fix filed with evidence_source=live whose completion record
+            says otherwise is marked UNVERIFIED and re-verified at the PR head.
+        evidence_keys: comma-separated S3 keys holding that evidence (screenshots,
+            HAR/log captures, test output) — use the qa-evidence/ prefix. Pass these
+            together with evidence_kind="live" whenever you ran the system.
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
-    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", {
+    payload = {
         "ticket_id": ticket_id, "summary": summary,
         "artifacts": artifacts, "branch": branch, "commit_sha": commit_sha, "pr_url": pr_url,
         "workflow_id": _CURRENT_WORKFLOW_ID,
         "agent_id": _CURRENT_AGENT_ID,
-    })
+    }
+    # TEAM-4121 FR-9: sent only when the agent supplied them, so a record written
+    # without them is byte-identical to before (the orchestrator's live-reverify
+    # check treats absent as "no live evidence", which is the honest reading).
+    if evidence_kind.strip():
+        payload["evidence_kind"] = evidence_kind.strip().lower()
+    if evidence_keys.strip():
+        payload["evidence_keys"] = evidence_keys.strip()
+    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", payload)
 
 
 @tool
