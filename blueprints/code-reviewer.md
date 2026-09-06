@@ -123,7 +123,7 @@ latency, a profile — real numbers), that is an automatic finding: "unverified
 performance claim". A perf change nobody measured is unreviewed by definition.
 
 ### Step 3b: Playbook runs — review the diff AGAINST the plan (MANDATORY when `## SDLC Framework` is in your context)
-On an `sdlc-playbook` run the branch carries the artifact chain under
+On a playbook run (software-delivery with the playbook framework) the branch carries the artifact chain under
 `artifact_dir` (`.sdlc/<workflow_id>/`): `intent.md`, `spec.md`, `plan.md`.
 The engineer approved plan.md; the dev implemented against it. Your job adds a
 compliance pass on top of the adversarial one:

@@ -26,12 +26,28 @@ claude_code(
 ### Step 3: Review & Deliver
 - Verify against requirements and mockups
 - `WorkflowOutput___save_design_doc`
-- If a Plan Approval gate follows the design phase (see `## Human Review
+- If a human review gate (Plan Approval or Design Approval) follows the design phase (see `## Human Review
   Gates` in your Workflow Context): `load_blueprint("review-package")` and
   write `workflows/{workflow_id}/shared/review-package-design.{your_agent_id}.json`
   per its `design` template — your own file, never edit another designer's;
   the hub merges them at gate time
 - `WorkflowOutput___report_completion`
+
+## Playbook runs (when `## SDLC Framework` is in your context)
+The run commits an artifact chain to `artifact_branch` under `artifact_dir`
+(`.sdlc/<workflow_id>/`). Before you start, read `<artifact_dir>/intent.md` and
+`<artifact_dir>/spec.md` there (also mirrored in `shared/`) — the spec's
+`## Design brief` and `## Policy answers` are your constraints. Before
+`report_completion`, have `claude_code` (pass `repo`; same workspace) check out
+`artifact_branch` and commit your deliverable as
+`<artifact_dir>/design/android-designer.md` — the same content as your S3 document — with any
+mockup / diagram files beside it under `<artifact_dir>/design/`, message
+`design: <your agent> (<workflow_id>)`, then push. Your S3 deliverables and
+review package are still required; the committed copy is the audit trail. The
+orchestrator verifies the file exists on the branch when your ticket closes and
+sends the ticket back to Blocked if it does not. Findings that FAIL the design
+still go in your document AND as rows appended to the spec's Concerns list in
+your document (owner = the policy owner); do not edit spec.md itself.
 
 ## Rules
 - Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.

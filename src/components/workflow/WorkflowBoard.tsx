@@ -129,8 +129,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // run that isn't already terminal (the deploy gate only exists after merge).
   // One poll on mount + every 20s; clears when nothing awaits.
   const defHasShip = useMemo(
-    () => (getWorkflowDef(workflowDefId).completionRequiresAgentPhases || []).includes("ship"),
-    [workflowDefId]
+    () => (getWorkflowDef(workflowDefId, fw).completionRequiresAgentPhases || []).includes("ship"),
+    [workflowDefId, fw]
   );
   // TEAM-3767 F8: use the shared terminal predicate so the epic's HONEST
   // ship-blocked terminals (deploy-blocked / static-ci-only) stop polling and
@@ -1267,7 +1267,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // guards (def.reviewGates.afterPhase → pipeline phase id), so the signal is
   // local to the step. Any gate we can't map to a visible phase falls back to a
   // top banner so it's never hidden.
-  const reviewGates = getWorkflowDef(workflowDefId).reviewGates || [];
+  const reviewGates = getWorkflowDef(workflowDefId, fw).reviewGates || [];
   const pendingReviews = Object.entries(ticketStatusMap)
     .filter(([, t]) => t.status === "in_review" && (t.assignee || "").startsWith("human:"))
     .map(([ticketId, t]) => {
