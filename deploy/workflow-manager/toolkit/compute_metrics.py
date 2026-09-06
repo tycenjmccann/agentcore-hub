@@ -87,6 +87,31 @@ TAG_STOPWORDS = frozenset(
     {"a", "an", "the", "and", "or", "of", "in", "on", "to", "for", "fix", "findings", "finding"}
 )
 
+# The PRIMARY resurfacing signal is "the same place", i.e. the same cited path.
+# A run that predates the fix contract has no citedLocation at all — but its
+# agents name the place in the TITLE anyway ("Fix (QA): intake.ts — …",
+# "Fix (ship-review r1): WorkflowBoard — …"), so the title is where a path lives
+# for those runs. title_paths() extracts only CODE-SHAPED identifiers: a filename
+# with a source extension, or a PascalCase symbol. Plain lowercase words are
+# never included — two fixes both saying "handler" or "sources" are not evidence
+# of the same defect, which is exactly the mistake prose similarity makes.
+SOURCE_EXT = "ts|tsx|js|jsx|mjs|cjs|py|sh|json|ya?ml|md|sql|go|rs"
+TITLE_FILE = re.compile(rf"[\w./-]*\w\.(?:{SOURCE_EXT})\b(?::\d+(?:-\d+)?)?", re.I)
+# ≥2 humps and ≥6 chars: "WorkflowBoard", "ShipDispatchGate". One hump ("Array",
+# "Unknown") is ordinary prose with a capital letter, and ALL-CAPS ("MCP",
+# "JSON", "SSRF") is a vocabulary word, not a location.
+TITLE_PASCAL = re.compile(r"\b(?:[A-Z][a-z0-9]+){2,}\b")
+# Capitalized compounds that are products/prose, not places in this repo. A
+# PascalCase English word with two humps is rare, so this is mostly service
+# names — two fixes both mentioning CloudWatch are not the same defect.
+PASCAL_PROSE = frozenset(
+    {
+        "github", "gitlab", "cloudwatch", "cloudfront", "cloudformation", "codebuild",
+        "codepipeline", "eventbridge", "javascript", "typescript", "nodejs", "openapi",
+        "agentcore", "bedrock", "somebody", "something", "someone",
+    }
+)
+
 # ── Business hours (TEAM-4121 FR-10) ────────────────────────────────────────
 # A 7-hour merge-approval wait that started at 23:40 on a Friday is not the same
 # finding as a 7-hour wait that started at 09:00 on a Tuesday, and the WM was
@@ -431,6 +456,29 @@ def cited_paths(contract):
     return paths
 
 
+def title_paths(title):
+    """The code locations a fix TITLE names — the pre-contract stand-in for
+    cited_paths(). Two variants are kept for every filename, the relative path
+    and the basename, so "src/lib/intake.ts" and "intake.ts" (the same file,
+    named by two agents at two levels of detail) intersect.
+
+    Ticket keys go first: "Fix (QA): TEAM-4089 — …" cites the ticket being redone,
+    not a place. Lowercase words never qualify (see TITLE_PASCAL/SOURCE_EXT)."""
+    text = TICKET_KEY_IN_TEXT.sub(" ", str(title or ""))
+    paths = set()
+    for m in TITLE_FILE.finditer(text):
+        path = m.group(0).split(":")[0].strip().lower().lstrip("./")
+        if not path:
+            continue
+        paths.add(path)
+        paths.add(path.rsplit("/", 1)[-1])
+    for m in TITLE_PASCAL.finditer(text):
+        symbol = m.group(0).lower()
+        if len(symbol) >= 6 and symbol not in PASCAL_PROSE:
+            paths.add(symbol)
+    return paths
+
+
 def norm_invariant(contract):
     inv = str(contract.get("invariant") or "").strip().lower()
     return re.sub(r"\s+", " ", inv)
@@ -517,13 +565,20 @@ def compute_fix_tickets(tickets, events, epic_id):
         key = (kind, origin)
         rounds[key] = rounds.get(key, 0) + 1
 
+        # The contract wins when it is there; the title is the fallback for the
+        # runs that predate it. `hasContract` keeps the two apart, because the
+        # prose-similarity rule below is only ever allowed to speak when NEITHER
+        # side of a pair carried a contract.
+        contract_paths = cited_paths(contract)
+        invariant = norm_invariant(contract)
         fingerprint = {
-            "paths": cited_paths(contract),
-            "invariant": norm_invariant(contract),
+            "paths": contract_paths or title_paths(title),
+            "invariant": invariant,
             "slot": title_slot_tokens(title),
+            "hasContract": bool(contract_paths or invariant),
         }
 
-        tag = "new"
+        tag, signal = "new", None
         if kind in ENVIRONMENTAL_KINDS:
             tag = "environmental"
         else:
@@ -536,21 +591,32 @@ def compute_fix_tickets(tickets, events, epic_id):
             if (blockers & earlier_ids) or REGRESSION_MARKER in marker_text:
                 tag = "fix-induced"
             else:
+                # Rule order, strongest evidence first, so `resurfacingSignal`
+                # says WHICH rule fired and a reader can audit the call:
+                #   path       the same place (cited path, or the path the title
+                #              names when there is no contract)
+                #   invariant  the same stated property, wherever it surfaced
+                #   title      prose similarity — pre-contract pairs only
                 for prev in prints:
-                    same_place = bool(fingerprint["paths"] and prev["paths"]
-                                      and fingerprint["paths"] & prev["paths"])
-                    same_invariant = bool(fingerprint["invariant"]
-                                          and fingerprint["invariant"] == prev["invariant"])
-                    # Title similarity is the PRE-CONTRACT fallback only: once
-                    # either side carries a contract, the contract is the answer
-                    # and a prose coincidence must not override it.
-                    pre_contract = not (fingerprint["paths"] or fingerprint["invariant"]
-                                        or prev["paths"] or prev["invariant"])
-                    same_words = pre_contract and jaccard(
-                        fingerprint["slot"], prev["slot"]) >= TITLE_SIMILARITY
-                    if same_place or same_invariant or same_words:
-                        tag = "resurfacing"
+                    if fingerprint["paths"] and fingerprint["paths"] & prev["paths"]:
+                        signal = "path"
                         break
+                if signal is None and fingerprint["invariant"]:
+                    for prev in prints:
+                        if fingerprint["invariant"] == prev["invariant"]:
+                            signal = "invariant"
+                            break
+                if signal is None:
+                    for prev in prints:
+                        # Once either side carries a contract, the contract is the
+                        # answer and a prose coincidence must not override it.
+                        if fingerprint["hasContract"] or prev["hasContract"]:
+                            continue
+                        if jaccard(fingerprint["slot"], prev["slot"]) >= TITLE_SIMILARITY:
+                            signal = "title"
+                            break
+                if signal:
+                    tag = "resurfacing"
 
         entry = {
             "ticketId": tid,
@@ -558,6 +624,11 @@ def compute_fix_tickets(tickets, events, epic_id):
             "originTicketId": origin,
             "round": rounds[key],
             "tag": tag,
+            # Which rule made it "resurfacing" (None for every other tag), and
+            # the fingerprint it matched on — the tag is an accusation ("an
+            # earlier fix did not hold"), so the evidence travels with it.
+            "resurfacingSignal": signal,
+            "paths": sorted(fingerprint["paths"]),
             "createdAt": ticket.get("createdAt"),
             "title": title,
         }

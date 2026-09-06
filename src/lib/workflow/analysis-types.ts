@@ -70,6 +70,12 @@ export interface FixTicketEntry {
   originTicketId: string | null;
   round: number;
   tag: "new" | "resurfacing" | "fix-induced" | "environmental";
+  /** Which rule tagged it `resurfacing` — the cited/named path, the stated
+   * invariant, or (pre-contract runs only) title similarity. null otherwise. */
+  resurfacingSignal?: "path" | "invariant" | "title" | null;
+  /** The code locations this fix was fingerprinted by: the contract's cited
+   * paths, or the paths/symbols its title named when there is no contract. */
+  paths?: string[];
   createdAt: string | null;
   title: string;
   reverify?: boolean;

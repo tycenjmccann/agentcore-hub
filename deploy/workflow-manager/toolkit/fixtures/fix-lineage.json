@@ -15,15 +15,20 @@
       "LIN-14": "sync_fix (branch drifted from main) → environmental; shares ciTicketId with ci_fix but is its own round key",
       "LIN-15": "ship_fix whose origin LIN-7 was blockedBy the earlier fix LIN-11, AND whose cited path repeats LIN-10's → fix-induced WINS over resurfacing (tag precedence)",
       "LIN-16": "Re-verify (QA) @ abc1234 — qa_fix with reverify:true (a check re-run, not a redo)",
-      "LIN-17": "pre-contract, title only → new",
-      "LIN-18": "pre-contract, title only, ~0.89 title-slot Jaccard against LIN-17 → resurfacing",
-      "LIN-19": "pre-contract, title only, Jaccard 0.0 against every earlier fix → new (the negative case that keeps the fallback honest)",
-      "LIN-21": "legacy 'Fix:' created AFTER intake completed → still counted, kind 'unknown'"
+      "LIN-17": "pre-contract, title only, names WorkflowBoard → new (first fix at that place)",
+      "LIN-18": "pre-contract, same PascalCase identifier in the title as LIN-17 → resurfacing, signal 'path' (the title is where a pre-contract run's location lives; its 0.80 title-slot Jaccard would also have caught it, but the stronger signal answers first)",
+      "LIN-19": "pre-contract, title only, no code-shaped token and Jaccard 0.0 against every earlier fix → new (the negative case that keeps the fallback honest)",
+      "LIN-21": "legacy 'Fix:' created AFTER intake completed → still counted, kind 'unknown'",
+      "LIN-22": "pre-contract, title names src/api/handler.ts → new",
+      "LIN-23": "pre-contract, title names the SAME file as LIN-22 but describes a different symptom (Jaccard 0.33, well under the 0.60 floor) → resurfacing, signal 'path'. This is the pair the title-Jaccard fallback alone cannot see.",
+      "LIN-24": "pre-contract, shares only the LOWERCASE word 'handler' with LIN-22/LIN-23 → new (a word is not a place)",
+      "LIN-25": "pre-contract, shares only the lowercase word 'handler' with LIN-24 → new (the negative that keeps title_paths from degrading into prose matching)",
+      "LIN-26": "pre-contract, no code-shaped token at all, 0.88 title-slot Jaccard against LIN-19 → resurfacing, signal 'title' (the fallback still fires when there is no path to be had)"
     },
     "expected": {
-      "count": 11,
-      "byKind": { "codex_fix": 2, "qa_fix": 5, "ci_fix": 1, "sync_fix": 1, "ship_fix": 1, "unknown": 1 },
-      "byTag": { "new": 5, "resurfacing": 3, "fix-induced": 1, "environmental": 2 }
+      "count": 16,
+      "byKind": { "codex_fix": 3, "qa_fix": 9, "ci_fix": 1, "sync_fix": 1, "ship_fix": 1, "unknown": 1 },
+      "byTag": { "new": 8, "resurfacing": 5, "fix-induced": 1, "environmental": 2 }
     }
   },
   "workflowId": "wf_fixlineage",
@@ -276,6 +281,61 @@
       "title": "Fix: flaky pricing unit test",
       "createdAt": "2026-07-02T15:30:00.000Z",
       "updatedAt": "2026-07-02T15:40:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-22",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_backend_dev",
+      "status": "done",
+      "title": "Fix (QA): src/api/handler.ts — the 404 branch returns an empty body",
+      "createdAt": "2026-07-02T15:35:00.000Z",
+      "updatedAt": "2026-07-02T15:38:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-23",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_backend_dev",
+      "status": "done",
+      "title": "Fix (review): src/api/handler.ts — timeouts are reported as 200",
+      "createdAt": "2026-07-02T15:40:00.000Z",
+      "updatedAt": "2026-07-02T15:44:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-24",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_frontend_dev",
+      "status": "done",
+      "title": "Fix (QA): the handler for a cancelled run leaves the board spinning",
+      "createdAt": "2026-07-02T15:45:00.000Z",
+      "updatedAt": "2026-07-02T15:48:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-25",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_frontend_dev",
+      "status": "done",
+      "title": "Fix (QA): the handler cache is never invalidated after a rename",
+      "createdAt": "2026-07-02T15:50:00.000Z",
+      "updatedAt": "2026-07-02T15:53:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-26",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_frontend_dev",
+      "status": "done",
+      "title": "Fix (QA): telemetry dashboard token chart still mislabels the cache column",
+      "createdAt": "2026-07-02T15:55:00.000Z",
+      "updatedAt": "2026-07-02T15:58:00.000Z",
       "blockedBy": []
     }
   ],

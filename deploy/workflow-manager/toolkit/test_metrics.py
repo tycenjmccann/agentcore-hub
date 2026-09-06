@@ -20,6 +20,7 @@ from compute_metrics import (  # noqa: E402
     is_outside_hours,
     jaccard,
     title_fix_kind,
+    title_paths,
     title_slot_tokens,
 )
 from events import dedupe_events  # noqa: E402
@@ -457,10 +458,11 @@ class FixLineage(unittest.TestCase):
         cls.entries = {e["ticketId"]: e for e in cls.fix["entries"]}
 
     def test_count_and_ids_in_creation_order(self):
-        self.assertEqual(self.fix["count"], 11)
+        self.assertEqual(self.fix["count"], 16)
         self.assertEqual(self.fix["ticketIds"], [
             "LIN-10", "LIN-11", "LIN-12", "LIN-13", "LIN-14",
             "LIN-15", "LIN-16", "LIN-17", "LIN-18", "LIN-19", "LIN-21",
+            "LIN-22", "LIN-23", "LIN-24", "LIN-25", "LIN-26",
         ])
 
     def test_matches_the_fixture_expectation(self):
@@ -502,7 +504,9 @@ class FixLineage(unittest.TestCase):
                 "LIN-10": "codex_fix", "LIN-11": "codex_fix", "LIN-12": "qa_fix",
                 "LIN-13": "ci_fix", "LIN-14": "sync_fix", "LIN-15": "ship_fix",
                 "LIN-16": "qa_fix", "LIN-17": "qa_fix", "LIN-18": "qa_fix",
-                "LIN-19": "qa_fix", "LIN-21": "unknown",
+                "LIN-19": "qa_fix", "LIN-21": "unknown", "LIN-22": "qa_fix",
+                "LIN-23": "codex_fix", "LIN-24": "qa_fix", "LIN-25": "qa_fix",
+                "LIN-26": "qa_fix",
             },
         )
 
@@ -516,17 +520,22 @@ class FixLineage(unittest.TestCase):
         # LIN-17..LIN-19 are pre-contract, so the origin is the finder's ticket —
         # the QA verifier's last completion before the fix was filed. It agrees
         # with what spawnedBy says for the same run's later fixes.
-        for tid in ("LIN-17", "LIN-18", "LIN-19"):
+        for tid in ("LIN-17", "LIN-18", "LIN-19", "LIN-22", "LIN-24", "LIN-25", "LIN-26"):
             self.assertEqual(self.entries[tid]["originTicketId"], "LIN-5", tid)
+        # LIN-23 is a "Fix (review)" title, so its finder is the code reviewer.
+        self.assertEqual(self.entries["LIN-23"]["originTicketId"], "LIN-4")
         # No kind → no finder → no origin invented.
         self.assertIsNone(self.entries["LIN-21"]["originTicketId"])
 
     def test_rounds_count_per_kind_and_origin(self):
-        self.assertEqual([self.entries[t]["round"] for t in ("LIN-10", "LIN-11")], [1, 2])
-        # (qa_fix, LIN-5) is the busy lineage: five fixes against one QA ticket.
         self.assertEqual(
-            [self.entries[t]["round"] for t in ("LIN-12", "LIN-16", "LIN-17", "LIN-18", "LIN-19")],
-            [1, 2, 3, 4, 5],
+            [self.entries[t]["round"] for t in ("LIN-10", "LIN-11", "LIN-23")], [1, 2, 3])
+        # (qa_fix, LIN-5) is the busy lineage: nine fixes against one QA ticket.
+        self.assertEqual(
+            [self.entries[t]["round"] for t in (
+                "LIN-12", "LIN-16", "LIN-17", "LIN-18", "LIN-19",
+                "LIN-22", "LIN-24", "LIN-25", "LIN-26")],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9],
         )
         # sync_fix shares ciTicketId with ci_fix but is a different lineage, so
         # both are round 1 — a stale branch is not round two of a red build.
@@ -545,13 +554,102 @@ class FixLineage(unittest.TestCase):
                 "LIN-15": "fix-induced",
                 "LIN-16": "new",
                 "LIN-17": "new",
-                "LIN-18": "resurfacing",     # title-slot Jaccard 0.80
+                "LIN-18": "resurfacing",     # same PascalCase name in the title
                 "LIN-19": "new",
                 "LIN-21": "new",
+                "LIN-22": "new",
+                "LIN-23": "resurfacing",     # same FILE named in the title
+                "LIN-24": "new",             # shares only a lowercase word
+                "LIN-25": "new",
+                "LIN-26": "resurfacing",     # no path anywhere — prose fallback
             },
         )
         self.assertEqual(self.fix["byTag"],
-                         {"new": 5, "resurfacing": 3, "fix-induced": 1, "environmental": 2})
+                         {"new": 8, "resurfacing": 5, "fix-induced": 1, "environmental": 2})
+
+    def test_every_resurfacing_says_which_signal_fired(self):
+        """The tag is an accusation — "an earlier fix did not hold" — so the
+        entry carries the evidence: which rule matched, and the fingerprint it
+        matched on. Everything else records None."""
+        self.assertEqual(
+            {t: e["resurfacingSignal"] for t, e in self.entries.items() if e["resurfacingSignal"]},
+            {"LIN-11": "path", "LIN-12": "invariant", "LIN-18": "path",
+             "LIN-23": "path", "LIN-26": "title"},
+        )
+        for tid, entry in self.entries.items():
+            with self.subTest(ticket=tid):
+                self.assertEqual(entry["tag"] == "resurfacing",
+                                 entry["resurfacingSignal"] is not None)
+        # `paths` is the fingerprint, sorted so a diff of two runs is readable.
+        self.assertEqual(self.entries["LIN-10"]["paths"], ["src/lib/intake.ts"])
+        self.assertEqual(self.entries["LIN-22"]["paths"],
+                         ["handler.ts", "src/api/handler.ts"])
+        self.assertEqual(self.entries["LIN-26"]["paths"], [])
+
+    def test_a_pre_contract_title_that_names_a_file_is_a_path_match(self):
+        """The point of the whole rule: LIN-22 and LIN-23 describe DIFFERENT
+        symptoms (title-slot Jaccard 0.33, half the floor) at the same file. The
+        prose fallback cannot see that pair; the path they both name can."""
+        titles = {t["ticketId"]: t["title"] for t in self.dossier["tickets"]}
+        self.assertLess(
+            jaccard(title_slot_tokens(titles["LIN-22"]), title_slot_tokens(titles["LIN-23"])),
+            0.6,
+        )
+        self.assertIn("src/api/handler.ts", title_paths(titles["LIN-23"]))
+        self.assertEqual(self.entries["LIN-23"]["resurfacingSignal"], "path")
+
+    def test_sharing_a_lowercase_word_is_not_sharing_a_place(self):
+        """LIN-24/LIN-25 both say "handler", as does LIN-22's path. A word is not
+        a location — if it were, "the handler for a cancelled run" would be
+        judged a failed fix of "src/api/handler.ts"."""
+        titles = {t["ticketId"]: t["title"] for t in self.dossier["tickets"]}
+        for tid in ("LIN-24", "LIN-25"):
+            with self.subTest(ticket=tid):
+                self.assertIn("handler", titles[tid])
+                self.assertEqual(title_paths(titles[tid]), set())
+                self.assertEqual(self.entries[tid]["tag"], "new")
+
+    def test_title_paths_extracts_only_code_shaped_identifiers(self):
+        cases = {
+            # filename → both the relative path and the basename, so two agents
+            # naming the same file at different detail still meet.
+            "Fix (QA): src/lib/intake.ts — the probe is unbounded":
+                {"src/lib/intake.ts", "intake.ts"},
+            "Fix (review): intake.ts:120-140 leaks the placeholder name":
+                {"intake.ts"},
+            "Fix (CI): npm run test:unit is red (gate-hardening.test.ts)":
+                {"gate-hardening.test.ts"},
+            "Fix (sync-main): merge origin/main into feature/LIN-1-source-validation":
+                set(),
+            # PascalCase symbols, ≥2 humps and ≥6 chars.
+            "Fix (ship-review r1): WorkflowBoard — Array.isArray guard on input.sources":
+                {"workflowboard"},
+            "Fix (QA): ShipDispatchGate writes the blockedBy edge twice":
+                {"shipdispatchgate"},
+            # ALL-CAPS vocabulary, one-hump prose, service names, ticket keys and
+            # bare lowercase words are all NOT locations.
+            "Fix (ship-review r2): MCP tool JSON schemas — expose the 32-source cap":
+                set(),
+            "Fix (QA): the error detail still says Unknown for a bodiless 403":
+                set(),
+            "Fix (CI): the CloudWatch subscription filter never matched":
+                set(),
+            "Re-verify (QA): TEAM-4089 — re-run the live probe @ 0949f9d":
+                set(),
+            "Fix (QA): the handler cache is never invalidated after a rename":
+                set(),
+        }
+        for title, expected in cases.items():
+            with self.subTest(title=title):
+                self.assertEqual(title_paths(title), expected)
+
+    def test_a_contract_path_is_never_overridden_by_a_title(self):
+        """LIN-12 cites route.ts and its TITLE names no file; LIN-10 cites
+        intake.ts. Contract paths win wherever they exist, so the pair meets on
+        the invariant (the real relationship) and not on a prose coincidence."""
+        self.assertEqual(self.entries["LIN-12"]["paths"],
+                         ["src/app/api/workflow/start/route.ts"])
+        self.assertEqual(self.entries["LIN-12"]["resurfacingSignal"], "invariant")
 
     def test_resurfacing_matches_on_path_not_on_line(self):
         """Line numbers move when the first fix lands, so the fingerprint is the
@@ -615,34 +713,36 @@ class FixLineage(unittest.TestCase):
 
     # ── The real run (yteqfl loop-2), TEAM-4121's motivating example ─────────
     #
-    # ticketId   kind        origin     round  tag            title
-    # TEAM-4078  codex_fix   None       1      new            Fix (review): WorkflowBoard sources list + start-route input shape — 2 findings
-    # TEAM-4079  codex_fix   None       2      new            Fix (review): intake.ts source validator — 2 findings (unbounded STS probe, …)
-    # TEAM-4089  qa_fix      None       1      new            Fix (QA): intake.ts — real SDK bodiless-403 message "Unknown" leaks into S3 …
-    # TEAM-4090  ship_fix    None       1      new            Fix (ship-review r1): WorkflowBoard — Array.isArray guard on input.sources …
-    # TEAM-4091  ship_fix    None       2      new            Fix (ship-review r1): intake.ts URL check SSRF hardening (redirect:manual …)
-    # TEAM-4101  ship_fix    None       3      new            Fix (ship-review r2): intake.ts urlGate — trailing-dot host canonicalization …
-    # TEAM-4102  ship_fix    None       4      new            Fix (ship-review r2): MCP tool JSON schemas — expose the 32-source cap …
-    # TEAM-4105  qa_fix      TEAM-4064  1      new (reverify) Fix (QA re-verify): intake.ts checkS3Source — SDK placeholder name …
-    # TEAM-4106  ci_fix      TEAM-4065  1      environmental  Fix (CI): merge origin/main (≥ 10955cd0) into feature/TEAM-4054-… — PR #371 …
+    # ticketId   kind       origin     rnd tag           signal paths           title
+    # TEAM-4078  codex_fix  None       1   new           —      workflowboard   Fix (review): WorkflowBoard sources list + start-route input shape — 2 findings
+    # TEAM-4079  codex_fix  None       2   new           —      intake.ts       Fix (review): intake.ts source validator — 2 findings (unbounded STS probe, …)
+    # TEAM-4089  qa_fix     None       1   resurfacing   path   intake.ts       Fix (QA): intake.ts — real SDK bodiless-403 message "Unknown" leaks into S3 …
+    # TEAM-4090  ship_fix   None       1   resurfacing   path   workflowboard   Fix (ship-review r1): WorkflowBoard — Array.isArray guard on input.sources …
+    # TEAM-4091  ship_fix   None       2   resurfacing   path   intake.ts       Fix (ship-review r1): intake.ts URL check SSRF hardening (redirect:manual …)
+    # TEAM-4101  ship_fix   None       3   resurfacing   path   intake.ts       Fix (ship-review r2): intake.ts urlGate — trailing-dot host canonicalization …
+    # TEAM-4102  ship_fix   None       4   new           —      (none)          Fix (ship-review r2): MCP tool JSON schemas — expose the 32-source cap …
+    # TEAM-4105  qa_fix     TEAM-4064  1   resurfacing   path   intake.ts       Fix (QA re-verify): intake.ts checkS3Source — SDK placeholder name … (reverify)
+    # TEAM-4106  ci_fix     TEAM-4065  1   environmental —      gate-hardening.test.ts  Fix (CI): merge origin/main (≥ 10955cd0) into feature/TEAM-4054-… — PR #371 …
     #
-    # count 9 (PRD: 9 ✓). byTag {new: 8, resurfacing: 0, fix-induced: 0,
-    # environmental: 1} — the PRD expected resurfacing 3, and it does NOT come
-    # out. The three pairs the PRD was counting are visible in the table
-    # (4089→4105 the same "Unknown" leak, 4091→4101 the same urlGate hardening,
-    # 4078→4090 the same WorkflowBoard sources list), but this run predates the
-    # fix contract, so the only fingerprint available is the TITLE — and their
-    # title-slot Jaccard scores are 0.375 / 0.333 / 0.231, all far below the 0.60
-    # floor. Those three scores are asserted below so the reason is checked, not
-    # remembered: a resurfacing fix describes the SAME defect in NEW words
-    # ("bodiless-403 message" → "placeholder name … via the rawName path"), which
-    # is exactly what prose similarity cannot see. The floor is NOT lowered to
-    # manufacture the 3: reaching them needs ≤0.23, which would tag almost any
-    # two fixes in one file as the same defect, and a false "resurfacing" accuses
-    # an agent of not fixing what it said it fixed. What WOULD catch all three is
-    # the contract (every pair shares one file), which is why FR-8 exists — and
-    # the follow-up worth filing is a path-shaped fallback for pre-contract runs
-    # (pull "intake.ts"/"WorkflowBoard" out of the title), not a lower threshold.
+    # count 9 (PRD: 9 ✓). byTag {new: 3, resurfacing: 5, fix-induced: 0,
+    # environmental: 1}. The PRD guessed resurfacing 3; the computed answer is 5,
+    # and the difference is a counting convention, not a disagreement about the
+    # run. All three pairs the PRD had in mind ARE tagged (4078→4090 the
+    # WorkflowBoard sources list, 4091→4101 the urlGate hardening, 4089→4105 the
+    # "Unknown" leak — asserted below); the PRD counted PAIRS by hand, while the
+    # metric tags every fix that lands where an earlier fix already landed. Nine
+    # fixes touched two places: intake.ts five times (4079 first, then 4089/4091/
+    # 4101/4105 = 4 resurfacing) and WorkflowBoard twice (4078, then 4090 = 1).
+    # 4 + 1 = 5. The per-fix reading is the one the WM needs — "five of nine
+    # fixes were re-touching two files" is the finding.
+    #
+    # This is what the PATH rule bought. Title-slot Jaccard alone saw NONE of the
+    # three pairs (0.375 / 0.333 / 0.231 — still asserted below, since the reason
+    # the floor stays at 0.60 is exactly that a resurfacing fix re-describes the
+    # same defect in new words: "bodiless-403 message" → "placeholder name … via
+    # the rawName path"). Lowering the floor to 0.23 would have tagged almost any
+    # two fixes in one file as the same defect; extracting the PLACE the title
+    # names is a different, stronger signal, and it needs no threshold at all.
 
     def test_yteqfl_count_and_kinds(self):
         with open(FIXTURES / "yteqfl-dossier.json") as f:
@@ -662,13 +762,50 @@ class FixLineage(unittest.TestCase):
         with open(FIXTURES / "yteqfl-dossier.json") as f:
             fix = compute_metrics(json.load(f))["fixTickets"]
         self.assertEqual(fix["byTag"],
-                         {"new": 8, "resurfacing": 0, "fix-induced": 0, "environmental": 1})
-        self.assertEqual([e["ticketId"] for e in fix["entries"]
-                          if e["tag"] == "environmental"], ["TEAM-4106"])
-        self.assertEqual([e["ticketId"] for e in fix["entries"]
-                          if e.get("reverify")], ["TEAM-4105"])
+                         {"new": 3, "resurfacing": 5, "fix-induced": 0, "environmental": 1})
+        entries = {e["ticketId"]: e for e in fix["entries"]}
+        self.assertEqual([t for t, e in entries.items() if e["tag"] == "new"],
+                         ["TEAM-4078", "TEAM-4079", "TEAM-4102"])
+        self.assertEqual([t for t, e in entries.items() if e["tag"] == "environmental"],
+                         ["TEAM-4106"])
+        self.assertEqual([t for t, e in entries.items() if e.get("reverify")], ["TEAM-4105"])
+        # Every resurfacing call on this run is a PATH match — the run predates
+        # the fix contract, so each path came out of the ticket's own title.
+        self.assertEqual(
+            {t: e["resurfacingSignal"] for t, e in entries.items() if e["tag"] == "resurfacing"},
+            {"TEAM-4089": "path", "TEAM-4090": "path", "TEAM-4091": "path",
+             "TEAM-4101": "path", "TEAM-4105": "path"},
+        )
 
-    def test_yteqfl_the_three_prd_pairs_score_below_the_floor(self):
+    def test_yteqfl_the_three_prd_pairs_meet_on_a_path_from_the_title(self):
+        """The PRD's three pairs, each pinned with the place they share. This is
+        the assertion the previous revision could not make: before the path rule,
+        all three were tagged "new"."""
+        with open(FIXTURES / "yteqfl-dossier.json") as f:
+            dossier = json.load(f)
+        titles = {t["ticketId"]: t["title"] for t in dossier["tickets"]}
+        entries = {e["ticketId"]: e
+                   for e in compute_metrics(dossier)["fixTickets"]["entries"]}
+        pairs = {
+            ("TEAM-4078", "TEAM-4090"): "workflowboard",  # the sources list
+            ("TEAM-4091", "TEAM-4101"): "intake.ts",      # the urlGate hardening
+            ("TEAM-4089", "TEAM-4105"): "intake.ts",      # the "Unknown" leak
+        }
+        for (first, again), place in pairs.items():
+            with self.subTest(pair=f"{first}/{again}"):
+                self.assertIn(place, title_paths(titles[first]))
+                self.assertIn(place, title_paths(titles[again]))
+                self.assertEqual(entries[again]["tag"], "resurfacing")
+                self.assertEqual(entries[again]["resurfacingSignal"], "path")
+                self.assertIn(place, entries[again]["paths"])
+        # The FIRST fix at each place is not itself resurfacing.
+        self.assertEqual(entries["TEAM-4078"]["tag"], "new")
+        self.assertEqual(entries["TEAM-4079"]["tag"], "new")
+
+    def test_yteqfl_the_three_prd_pairs_score_below_the_title_floor(self):
+        """Why the path rule had to exist, kept as an assertion: prose similarity
+        scores all three pairs at 0.23–0.38, so no defensible floor would have
+        found them. The floor stays 0.60."""
         with open(FIXTURES / "yteqfl-dossier.json") as f:
             titles = {t["ticketId"]: t["title"] for t in json.load(f)["tickets"]}
         slot = {t: title_slot_tokens(x) for t, x in titles.items()}

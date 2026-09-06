@@ -13,7 +13,7 @@
 // The two implementations are in different languages and cannot share code, so
 // they share a FIXTURE: deploy/workflow-manager/toolkit/fixtures/fix-lineage.json
 // (its `_fixture.cases` explains every ticket). test_metrics.py's FixLineage
-// asserts the same 11 ids from Python; the list below is copied from there
+// asserts the same 16 ids from Python; the list below is copied from there
 // deliberately, so a change on either side fails on the other.
 //
 // The JS side stops at the predicate: the card reports a NUMBER, so nothing here
@@ -42,6 +42,7 @@ const dossier = JSON.parse(readFileSync(FIXTURE, "utf8"));
 const EXPECTED_IDS = [
   "LIN-10", "LIN-11", "LIN-12", "LIN-13", "LIN-14",
   "LIN-15", "LIN-16", "LIN-17", "LIN-18", "LIN-19", "LIN-21",
+  "LIN-22", "LIN-23", "LIN-24", "LIN-25", "LIN-26",
 ];
 
 /**
