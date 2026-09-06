@@ -291,6 +291,12 @@ export default defineConfig({
       // park-it and preserve-the-status conditions are mutually exclusive and
       // jointly exhaustive, which a read-then-write could not be.
       "lambda/orchestrator/ticket-blockers.test.mjs",
+      // awaited-ids.mjs (TEAM-4166 D1) — the awaited-ids re-wake decision module.
+      // Fully DI'd (no AWS): mode normalization, the off/shadow/enforce write
+      // rules, the addBlockers seam contract (both return shapes), the
+      // preconditionUnmet stamp, the once-only await-timeout CAS, and the EMF
+      // record — all asserted under a jira == dynamodb provider parity loop.
+      "lambda/orchestrator/awaited-ids.test.mjs",
       // yteqfl loop 2 replay (TEAM-4121 FR-9) — the real prod failure this FR
       // exists for, from the dossier fixture: TEAM-4089 closed claiming live
       // evidence with none, QA re-verify TEAM-4092 caught it 48m later and filed
