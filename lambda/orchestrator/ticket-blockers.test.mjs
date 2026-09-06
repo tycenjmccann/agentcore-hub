@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { buildAddBlockerUpdates, normalizePreserveStatuses, applyBlockerEdge } from "./ticket-blockers.mjs";
+import { buildAddBlockerUpdates, normalizePreserveStatuses, applyBlockerEdge, createdTicketId } from "./ticket-blockers.mjs";
 
 /**
  * TEAM-4130 F1 — the blocker-edge write, the one place that decides whether
@@ -248,5 +248,70 @@ describe("applyBlockerEdge — a non-conditional failure never throws", () => {
       ...edge(), send: async () => { throw new Error("boom"); },
     });
     expect(out).toBe("error");
+  });
+});
+
+// ─── TEAM-4156 F1 ────────────────────────────────────────────────────────────
+
+/**
+ * The accessor exists because the two ticket backends have always disagreed about
+ * what a created ticket looks like, and every producer in the orchestrator read
+ * only the DynamoDB spelling. Under TICKET_PROVIDER=jira (what `.env.example` and
+ * the Dockerfile ship) that read null for a ticket that really existed, and each
+ * caller then took its fail-open branch: sync-main let CI certify an unmergeable
+ * branch, live-reverify handed back its CAS slot, dead-session-escalation opened
+ * no gate.
+ *
+ * It lives in this module for one reason: zero imports, so all three producers can
+ * share it with no chance of a cycle.
+ */
+describe("createdTicketId — one reader for both providers' create_ticket answers", () => {
+  it("reads the dynamodb shapes", () => {
+    // lambda/agentcore-hub-tickets/index.mjs answers both spellings at once.
+    expect(createdTicketId({ key: "TEAM-1", status: "created", ticket: { key: "TEAM-1" } })).toBe("TEAM-1");
+    expect(createdTicketId({ key: "TEAM-1" })).toBe("TEAM-1");
+    expect(createdTicketId({ ticket: { key: "TEAM-1" } })).toBe("TEAM-1");
+    expect(createdTicketId({ ticket: { ticketId: "TEAM-1" } })).toBe("TEAM-1");
+  });
+
+  it("reads the jira shapes — a fresh create AND a summary-dedupe hit", () => {
+    // Fresh: `{ ticketId, status, message }`. Dedupe: `{ ...mapIssue(dup),
+    // deduplicated: true }`, which is also ticketId-spelled. Both are real tickets
+    // that something must block on.
+    expect(createdTicketId({ ticketId: "TEAM-1", status: "todo", message: "Created TEAM-1: x" })).toBe("TEAM-1");
+    expect(createdTicketId({ ticketId: "TEAM-1", title: "x", status: "in_progress", deduplicated: true })).toBe("TEAM-1");
+  });
+
+  it("`key` wins over `ticketId` — the seam normalizes onto `key`, so they agree by construction", () => {
+    expect(createdTicketId({ key: "TEAM-1", ticketId: "TEAM-1" })).toBe("TEAM-1");
+  });
+
+  it("no id at all → null, which is every caller's fail-open input", () => {
+    for (const v of [null, undefined, {}, [], "TEAM-1", 7, { error: "Unknown tool: Tickets___create_ticket" }, { content: [{ text: "boom" }] }]) {
+      expect(createdTicketId(v)).toBeNull();
+    }
+  });
+
+  it("a non-string id is NOT an id — it must never reach a blocker edge or a record", () => {
+    // `addBlockers(ci, [{value:…}])` would write a corrupt edge that nothing can
+    // ever resolve, which is strictly worse than the fail-open path.
+    expect(createdTicketId({ key: 500 })).toBeNull();
+    expect(createdTicketId({ key: { value: "TEAM-1" } })).toBeNull();
+    expect(createdTicketId({ ticketId: ["TEAM-1"] })).toBeNull();
+    expect(createdTicketId({ key: "" })).toBeNull();
+    expect(createdTicketId({ key: "   " })).toBeNull();
+    // …but a garbage `key` next to a usable `ticketId` still yields the ticket:
+    // the point is to find the id, not to punish the provider.
+    expect(createdTicketId({ key: 500, ticketId: "TEAM-1" })).toBe("TEAM-1");
+    expect(createdTicketId({ key: "", ticket: { key: "TEAM-1" } })).toBe("TEAM-1");
+  });
+
+  it("trims — a padded id would not match any ticket read back by key", () => {
+    expect(createdTicketId({ key: " TEAM-1 " })).toBe("TEAM-1");
+  });
+
+  it("never throws, whatever it is handed", () => {
+    expect(() => createdTicketId(Object.create(null))).not.toThrow();
+    expect(createdTicketId(new Error("boom"))).toBeNull();
   });
 });

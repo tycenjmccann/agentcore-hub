@@ -31,6 +31,39 @@
  * loads in isolation.
  */
 
+/**
+ * ─── The id of a ticket we just created, under EITHER provider (TEAM-4156 F1) ──
+ *
+ * It lives in this module because this module has zero imports, so all three
+ * create_ticket producers (sync-main.mjs, live-reverify.mjs,
+ * dead-session-escalation.mjs) can share it with no chance of an import cycle —
+ * they have no other module in common. It is a ticket-shape reader rather than a
+ * blocker-edge builder, but every one of its callers is about to hand the result
+ * to `addBlockers`, which is what this module is for.
+ *
+ * The two ticket backends have ALWAYS answered create_ticket differently:
+ *   DynamoDB (lambda/agentcore-hub-tickets) → `{ key, ticket: { key } }`
+ *   Jira     (lambda/agentcore-hub-jira)    → `{ ticketId }` on a fresh create,
+ *      and `{ ...mapIssue(dup), deduplicated: true }` — also `ticketId` — when it
+ *      dedupes against an existing summary.
+ * Every producer read `res?.key || res?.ticket?.key`, so under
+ * TICKET_PROVIDER=jira (what `.env.example` and the Dockerfile ship) all three
+ * read `null` and took their fail-open branch: the ticket really existed on the
+ * board, but nothing blocked on it and nothing said why.
+ *
+ * Strings only. A provider answering `{ key: { value: "X" } }` or
+ * `{ ticketId: 42 }` has given us something that is not a ticket id, and putting
+ * it into a blocker edge or a `syncMain` record would corrupt the run — so a
+ * non-string candidate is skipped rather than trusted, and an object with no
+ * usable id at all reads null (which every caller already handles).
+ */
+export function createdTicketId(res) {
+  for (const v of [res?.key, res?.ticketId, res?.ticket?.key, res?.ticket?.ticketId]) {
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
 /** Statuses, normalized the way the board stores them (lowercase, deduped). */
 export function normalizePreserveStatuses(statuses) {
   if (!Array.isArray(statuses)) return [];

@@ -58,6 +58,8 @@
  */
 
 import { KIND_TO_ORIGIN_KEY } from "./fix-contract.mjs";
+// The one provider-agnostic reader of a create_ticket response (TEAM-4156 F1).
+import { createdTicketId } from "./ticket-blockers.mjs";
 
 const MODES = new Set(["off", "shadow", "enforce"]);
 
@@ -349,7 +351,11 @@ export function createLiveReverify(deps = {}) {
             sibling_scope: contract?.siblingScope,
           },
         });
-        return res?.key || res?.ticket?.key || null;
+        // Both providers' shapes, one accessor (TEAM-4156 F1). Reading `key` alone
+        // meant that under TICKET_PROVIDER=jira this was ALWAYS null: the re-verify
+        // ticket was filed, and then the branch below handed the CAS slot back and
+        // reported the ticket as never created.
+        return createdTicketId(res);
       }, null);
 
       if (!reverifyTicketId) {
