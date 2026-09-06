@@ -47,6 +47,13 @@ jobs:
       - name: Jira ticket-tools lambda unit tests (node --test)
         run: node --test lambda/agentcore-hub-jira
 
+      # The anomaly-watcher Lambda has a node:test suite (TEAM-4120 FR-2 cursor
+      # ordering — a base36 events-writer id sorting against a decimal cursor —
+      # plus dropStaleItems). Same rationale as cost-report/Jira above:
+      # standalone `node --test`, not in the vitest include list.
+      - name: Anomaly-watcher lambda unit tests (node --test)
+        run: node --test lambda/anomaly-watcher
+
       # R2 (docs/race-condition-study.md): the workflows table may only be
       # written through lambda/orchestrator/workflow-store.mjs — ad-hoc writes
       # are the read-modify-write clobber class behind most workflow races.

@@ -20,6 +20,11 @@ import {
 // terminal" guard from the ONE list in completion.mjs. completion.mjs is pure
 // (no store import), so this cannot cycle.
 import { notTerminalPhaseGuard } from "./completion.mjs";
+// TEAM-4129 F2: markGateRejectedFromLegacy's CAS is the STORE-SIDE MIRROR of the
+// guard's own `legacyFallback` test (`!GATE_STATES.includes(state)`), so both are
+// derived from the one list instead of hand-spelled twice. gate-state.mjs is pure
+// (zero imports), so this cannot cycle either.
+import { GATE_STATES } from "./gate-state.mjs";
 
 let _ddb = null;
 let _table = null;
@@ -758,6 +763,90 @@ export async function markGateRejected(workflowId, gateTicketId, at, { requested
     return res.Attributes?.gateStates?.[gateTicketId] || null;
   } catch (err) {
     if (err.name === "ConditionalCheckFailedException") return null;
+    throw err;
+  }
+}
+
+/**
+ * "This gate has NO usable recorded state" as a ConditionExpression fragment —
+ * the store-side mirror of the guard's `!GATE_STATES.includes(gateState?.state)`.
+ * True for the `state: "none"` seed, for a row that somehow carries no `state` at
+ * all, and for any unrecognized value; false for requested / rejected / approved.
+ *
+ * Derived from GATE_STATES so adding a fourth real state cannot leave the two
+ * halves disagreeing — the direction that matters, since a state this fragment
+ * wrongly accepted would let a legacy converge overwrite a live cycle.
+ * Placeholders are positional (:gs0…), so tests assert the SEMANTICS (which
+ * states are refused) rather than the spelling.
+ */
+function noUsableGateStateGuard() {
+  const values = {};
+  const clauses = GATE_STATES.map((state, i) => {
+    values[`:gs${i}`] = state;
+    return `gateStates.#g.#st <> :gs${i}`;
+  });
+  return {
+    expression: `(attribute_not_exists(gateStates.#g.#st) OR (${clauses.join(" AND ")}))`,
+    values,
+  };
+}
+
+/**
+ * Converge a LEGACY gate row to `rejected` (TEAM-4129 F2).
+ *
+ * The problem: on a run that predates the ledger (no gateStates entry, or the
+ * `state: "none"` seed) the guard admits a `→ blocked` on the strength of the
+ * run's review_needed notification — correctly, that is the fail-open path. But
+ * markGateRejected's CAS is `state = "requested"`, which such a row can NEVER
+ * satisfy, and nothing else ever writes `requested`/`rejected` for it. So the
+ * ledger never converged, every redelivery re-classified as "presented", and
+ * enforce gave those runs ZERO duplicate protection: handleReviewRejection ran
+ * again and reopened the upstream work a second time.
+ *
+ * This CAS is the missing convergence: it accepts exactly the rows the guard
+ * calls legacy (see noUsableGateStateGuard) and closes them as rejected, so the
+ * NEXT delivery reads `rejected` and classifies "duplicate".
+ *
+ * Returns true when THIS call converged the row, false on a lost condition —
+ * which now carries real information: some other deliverer (the twin, or a
+ * redelivery racing us) moved the row off "no usable state" first, so the caller
+ * is the loser of a duplicate race. Anything other than the lost condition is
+ * rethrown, matching markGateRejected: a failed write must never be read as
+ * "already recorded".
+ *
+ * The cycle it appends carries `requestedAt: null` (a legacy row genuinely has no
+ * recorded request time — inventing `at` would fake a zero-length human wait) and
+ * `source: "legacy"`, so converged-from-legacy cycles stay distinguishable from
+ * the ones that ran a full requested → rejected round trip.
+ */
+export async function markGateRejectedFromLegacy(workflowId, gateTicketId, at) {
+  // Same two-write seed as every other gate setter: DynamoDB rejects
+  // `SET gateStates.#g.#st` when `gateStates.#g` is missing, so the absent-row
+  // case is handled by CREATING the row here rather than by an
+  // attribute_not_exists disjunct in the condition (which the seed makes
+  // unreachable, and which could not save the nested SET anyway).
+  await ensureGateState(workflowId, gateTicketId);
+  const guard = noUsableGateStateGuard();
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression:
+        "SET gateStates.#g.#st = :rej, gateStates.#g.resolvedAt = :at, " +
+        "gateStates.#g.cycles = list_append(if_not_exists(gateStates.#g.cycles, :empty), :cycle)",
+      ConditionExpression: guard.expression,
+      ExpressionAttributeNames: { "#g": gateTicketId, "#st": "state" },
+      ExpressionAttributeValues: {
+        ...guard.values,
+        ":rej": "rejected",
+        ":at": at,
+        ":empty": [],
+        ":cycle": [{ requestedAt: null, resolvedAt: at, outcome: "rejected", source: "legacy" }],
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
     throw err;
   }
 }

@@ -326,6 +326,113 @@ describe("selectChildren", () => {
   });
 });
 
+// ─── 3b. the blocker-cycle invariant (TEAM-4129 F1) ───────────────────────────
+
+/**
+ * A dead-session-held ticket can never be blocked on a ticket that transitively
+ * depends on it. The pre-4129 rule was one level deep — it asked whether each
+ * blocker was IN THE WINDOW, not whether the blocker was itself SELECTED — so a
+ * transitive dependent of the held ticket got in, enforce path (b) called
+ * addBlockers(held, [dependent]), and the resulting cycle could never be released
+ * by reconcileDependent. Path (b) also parks nothing and pages nobody, so the run
+ * wedged silently: exactly the failure these cases pin shut.
+ */
+describe("selectChildren — no blocker cycle with the held ticket", () => {
+  const inWin = (over) => ({ createdAt: new Date(NOW - 60_000).toISOString(), status: "todo", ...over });
+  const select = (siblings, over = {}) =>
+    selectChildren({ siblings, ticketId: TID, claim: claim(), now: NOW, ...over });
+
+  it("2 hops: QA-1 blockedBy [held], DEV-1 blockedBy [QA-1] → neither selected", () => {
+    // QA-1 is dropped because the held ticket is not in the window. Pre-4129,
+    // DEV-1 was still admitted (QA-1 *was* in the window) → TEAM-1 → DEV-1 →
+    // QA-1 → TEAM-1.
+    const got = select([
+      inWin({ ticketId: "QA-1", blockedBy: [TID] }),
+      inWin({ ticketId: "DEV-1", blockedBy: ["QA-1"] }),
+    ]);
+    expect(got).toEqual([]);
+    expect(got).not.toContain("DEV-1");
+  });
+
+  it("3 hops: DEV-2 blockedBy [DEV-1] is excluded too (disqualification propagates)", () => {
+    const got = select([
+      inWin({ ticketId: "QA-1", blockedBy: [TID] }),
+      inWin({ ticketId: "DEV-1", blockedBy: ["QA-1"] }),
+      inWin({ ticketId: "DEV-2", blockedBy: ["DEV-1"] }),
+    ]);
+    expect(got).toEqual([]);
+  });
+
+  it("declaration order does not matter — the closure is a fixpoint, not one pass", () => {
+    // Deepest first: a single forward pass over this list would admit nothing on
+    // the way down and everything on a naive second look. The fixpoint admits the
+    // clean roots only.
+    const got = select([
+      inWin({ ticketId: "DEV-2", blockedBy: ["DEV-1"] }),
+      inWin({ ticketId: "DEV-1", blockedBy: ["QA-1"] }),
+      inWin({ ticketId: "QA-1", blockedBy: [TID] }),
+      inWin({ ticketId: "CLEAN-2", blockedBy: ["CLEAN-1"] }),
+      inWin({ ticketId: "CLEAN-1", blockedBy: [] }),
+    ]);
+    expect(got).toEqual(["CLEAN-2", "CLEAN-1"]);
+  });
+
+  it("POSITIVE CONTROL: A (no blockers) and B blockedBy [A] are both selected", () => {
+    // The fix must not degenerate into the literal "empty blockedBy" rule the
+    // module comment explicitly rejects.
+    expect(select([
+      inWin({ ticketId: "A", blockedBy: [] }),
+      inWin({ ticketId: "B", blockedBy: ["A"] }),
+    ])).toEqual(["A", "B"]);
+  });
+
+  it("a chain that reaches the held ticket through a PRE-WINDOW sibling is excluded", () => {
+    // OLD-1 was created before the claim, so it is not a window candidate at all,
+    // yet it is the hop that closes the cycle: NEW-1 → OLD-1 → TEAM-1.
+    const got = select([
+      { ticketId: "OLD-1", createdAt: "2020-01-01T00:00:00Z", status: "todo", blockedBy: [TID] },
+      inWin({ ticketId: "NEW-1", blockedBy: ["OLD-1"] }),
+      inWin({ ticketId: "SAFE", blockedBy: [] }),
+    ]);
+    expect(got).toEqual(["SAFE"]);
+  });
+
+  it("a cycle among the siblings themselves does not hang the walk", () => {
+    // X ↔ Y is already corrupt data; the visited set means we terminate and
+    // simply admit neither (each is waiting on something unadmitted).
+    expect(select([
+      inWin({ ticketId: "X", blockedBy: ["Y"] }),
+      inWin({ ticketId: "Y", blockedBy: ["X"] }),
+      inWin({ ticketId: "SELF", blockedBy: ["SELF"] }),
+      inWin({ ticketId: "OK", blockedBy: [] }),
+    ])).toEqual(["OK"]);
+  });
+
+  it("PRIMARY provenance is guarded too: a spawned child that blocks on the held ticket is dropped", () => {
+    // Barrier 2 does not depend on the claim window, so the same invariant holds
+    // on the spawnedBy path where no window rule applies.
+    expect(select([
+      { ticketId: "G1", spawnedBy: { gateTicketId: TID }, blockedBy: [TID] },
+      { ticketId: "G2", spawnedBy: { gateTicketId: TID }, blockedBy: [] },
+    ])).toEqual(["G2"]);
+  });
+
+  it("the yteqfl closure is unchanged by the fix (regression guard)", () => {
+    // The real slice has no dependent of TEAM-4066 inside the window, so both
+    // barriers are no-ops there and the chain 4101→4102→4103→4104 plus 4105/4106
+    // still lands — the behaviour the module comment describes.
+    const got = selectChildren({
+      siblings: YTEQFL.tickets,
+      ticketId: "TEAM-4066",
+      claim: { startedAt: "2026-09-05T06:51:10.346Z" },
+      now: Date.parse("2026-09-05T07:36:10.154Z"),
+    });
+    expect([...got].sort()).toEqual(
+      ["TEAM-4101", "TEAM-4102", "TEAM-4103", "TEAM-4104", "TEAM-4105", "TEAM-4106"]
+    );
+  });
+});
+
 // ─── 4. decision order (enforce) ──────────────────────────────────────────────
 
 const evidenceRecord = (over = {}) => ({
@@ -461,6 +568,64 @@ describe("enforce — decision order", () => {
     expect(store.mergeTaskMetadata).not.toHaveBeenCalled();
     expect(store.resetDeadSessionRetry).not.toHaveBeenCalled();
     expect(d.addBlockers).toHaveBeenCalledWith(TID, ["TEAM-99"]);
+  });
+
+  it("F1: a cycle-only child set parks instead of blocking the held ticket on it", async () => {
+    // The whole point of the selection fix, end to end. Both in-window tickets
+    // (transitively) depend on TEAM-1, so `children` is empty, canSynthesize is
+    // false, and the tree falls to path (c) — which is what a human needs, since
+    // path (b) would have written the cycle and paged nobody.
+    const { d, store } = deps({
+      getChildTickets: vi.fn(async () => [
+        { ticketId: "QA-1", createdAt: new Date(NOW - 90_000).toISOString(), status: "todo", blockedBy: [TID] },
+        { ticketId: "DEV-1", createdAt: new Date(NOW - 60_000).toISOString(), status: "todo", blockedBy: ["QA-1"] },
+      ]),
+    });
+    const res = await run(d);
+
+    expect(res.children).toEqual([]);
+    expect(res.disposition).toBe("parked");
+    expect(res.gateTicketId).toBe("TEAM-99");
+
+    // The gate exists and is the ONLY blocker written.
+    expect(d.invokeTickets).toHaveBeenCalledWith("create_ticket", expect.objectContaining({
+      summary: `Escalation: dead session on ${TID} (${AGENT})`,
+      assignee: "human:engineer",
+    }));
+    expect(d.addBlockers.mock.calls).toEqual([[TID, ["TEAM-99"]]]);
+    expect(d.addBlockers).not.toHaveBeenCalledWith(TID, expect.arrayContaining(["DEV-1"]));
+    expect(d.addBlockers).not.toHaveBeenCalledWith(TID, expect.arrayContaining(["QA-1"]));
+    expect(d.parkGateForHuman).toHaveBeenCalledWith("TEAM-99", "human:engineer", expect.objectContaining({ id: "wf_1" }));
+
+    // Not the synthesis path at all: no CAS spend, no retry-budget give-back.
+    expect(store.claimDeadSessionSynthesis).not.toHaveBeenCalled();
+    expect(store.mergeTaskMetadata).not.toHaveBeenCalled();
+    expect(store.resetDeadSessionRetry).not.toHaveBeenCalled();
+    expect(d.transitionTicket).not.toHaveBeenCalled();
+
+    // …and the human is actually told there was nothing to block on.
+    expect(notif(store).disposition).toBe("parked");
+    expect(notif(store).children).toEqual([]);
+    expect(notif(store).details).toContain("Spawned nothing");
+  });
+
+  it("F1: the clean members of a mixed set still synthesize, without the cyclic one", async () => {
+    const { d, store } = deps({
+      getChildTickets: vi.fn(async () => [
+        { ticketId: "QA-1", createdAt: new Date(NOW - 90_000).toISOString(), status: "todo", blockedBy: [TID] },
+        { ticketId: "DEV-1", createdAt: new Date(NOW - 80_000).toISOString(), status: "todo", blockedBy: ["QA-1"] },
+        { ticketId: "FIX-1", createdAt: new Date(NOW - 70_000).toISOString(), status: "todo", blockedBy: [] },
+        { ticketId: "FIX-2", createdAt: new Date(NOW - 60_000).toISOString(), status: "todo", blockedBy: ["FIX-1"] },
+      ]),
+    });
+    const res = await run(d);
+
+    expect(res.disposition).toBe("synthesized_children");
+    expect(d.addBlockers).toHaveBeenCalledWith(TID, ["FIX-1", "FIX-2"]);
+    expect(store.mergeTaskMetadata).toHaveBeenCalledWith("wf_1", TID, {
+      synthesized: true, evidenceSource: "children", children: ["FIX-1", "FIX-2"],
+    });
+    expect(d.invokeTickets).not.toHaveBeenCalled(); // no gate needed, there IS evidence
   });
 
   it("no evidence at all → park", async () => {
