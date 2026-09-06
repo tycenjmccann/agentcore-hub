@@ -4659,7 +4659,14 @@ export async function buildAgentContext(ticket, workflow) {
         const sha7 = task.reverifySha || (typeof task.commitSha === "string" ? task.commitSha.slice(0, 7) : "") || "unknown";
         const rv = task.reverifyTicketId;
         const rvStatus = rv ? byId.get(rv)?.status || "open" : "";
-        return `- ${fixId} "${title}" — repro: \`${repro}\` — head ${sha7} — re-verify ticket: ${rv ? `${rv} (${rvStatus})` : "none"}`;
+        // TEAM-4130 F2: reverifySha WITHOUT a ticket id is a CAS claim whose
+        // create_ticket has not landed yet — a re-verification that is coming,
+        // not one that is missing. Saying "none" there would invite the release
+        // manager to treat the fix as unverifiable and file a ship_fix over a
+        // ticket that appears seconds later.
+        const pending = !rv && Boolean(task.reverifySha);
+        const rvCell = rv ? `${rv} (${rvStatus})` : pending ? "pending (being filed)" : "none";
+        return `- ${fixId} "${title}" — repro: \`${repro}\` — head ${sha7} — re-verify ticket: ${rvCell}`;
       });
       context += `## Unverified Fixes\n`;
       context += `The following fix tickets declared evidence_source=live but their completion record carries no live artifact.\n`;

@@ -292,6 +292,23 @@ describe("enforce + a ship-phase agent", () => {
     expect(block).toContain("head 0949f9d"); // falls back to the task's commitSha
   });
 
+  it("says 'pending (being filed)' for a claim whose ticket has not landed yet (TEAM-4130 F2)", async () => {
+    await load("enforce");
+    const wf = unverifiedWorkflow();
+    // The state a CAS claim leaves between claimReverifySlot and create_ticket:
+    // sha claimed, ticket id not written yet.
+    delete wf.agentTasks[FIX].reverifyTicketId;
+    h.state.workflow = wf;
+
+    const block = blockOf(await buildAgentContext(shipTicket(), h.state.workflow));
+
+    expect(block).toContain("re-verify ticket: pending (being filed)");
+    // NOT "none" — that would read as "nobody is going to re-verify this".
+    expect(block).not.toContain("re-verify ticket: none");
+    // And never as verified: the fix is still on the unverified list.
+    expect(block).toContain(`- ${FIX} `);
+  });
+
   it("lists every unverified fix", async () => {
     await load("enforce");
     const wf = unverifiedWorkflow();

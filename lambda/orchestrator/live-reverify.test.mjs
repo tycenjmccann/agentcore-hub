@@ -42,8 +42,66 @@ const CONTRACT = {
   siblingScope: "none",
 };
 
+/**
+ * The store double for the (fix, sha7) re-verify slot (TEAM-4130 F2).
+ *
+ * It enforces the REAL CAS semantics against a per-(workflowId, ticketId) map,
+ * because a recorder would prove nothing here: the whole finding is that the
+ * LOSER of a race must be told "taken", and that only means something if the
+ * fake can actually make one of two callers lose. mergeTaskMetadata writes into
+ * the same map, so a redelivery that arrives after the winner persisted sees the
+ * linked ticket id exactly as it would in DynamoDB.
+ *
+ *   cas: false     — a pre-F2 store (older dep, an older test double): the two
+ *                    functions are ABSENT, which must degrade to the old
+ *                    best-effort sibling scan rather than crash.
+ *   untracked: true — the workflow row has no task entry to claim on, so the CAS
+ *                    is unavailable and the module fails OPEN.
+ */
+function slotStore(calls, { cas = true, untracked = false, staleAfterMs = 10 * 60 * 1000 } = {}) {
+  const slots = new Map();   // `${wfId}::${tid}` → { reverifySha, reverifyClaimedAt, reverifyTicketId }
+  const keyOf = (wfId, tid) => `${wfId}::${tid}`;
+  const store = {
+    slots,
+    mergeTaskMetadata: vi.fn(async (wfId, tid, fields) => {
+      calls.mergeTaskMetadata.push({ wfId, tid, fields });
+      // The real one swallows its own CCFE when there is no entry to merge into.
+      if (untracked) return;
+      const key = keyOf(wfId, tid);
+      slots.set(key, { ...(slots.get(key) || {}), ...fields });
+    }),
+  };
+  if (!cas) return store;
+  const write = (key, held, sha7, nowIso) => {
+    const next = { ...(held || {}), reverifySha: sha7, reverifyClaimedAt: nowIso };
+    delete next.reverifyTicketId;   // the REMOVE in the real UpdateExpression
+    slots.set(key, next);
+  };
+  store.claimReverifySlot = vi.fn(async (wfId, tid, sha7, nowIso) => {
+    calls.claims.push({ wfId, tid, sha7, nowIso });
+    if (untracked) return "untracked";
+    const key = keyOf(wfId, tid);
+    const held = slots.get(key);
+    if (!held || held.reverifySha !== sha7) { write(key, held, sha7, nowIso); return "claimed"; }
+    if (held.reverifyTicketId) return "taken";                 // the winner filed it
+    const age = Date.parse(nowIso || "") - Date.parse(held.reverifyClaimedAt || "");
+    if (!(age >= staleAfterMs)) return "taken";                // still in flight
+    write(key, held, sha7, nowIso);                            // stale takeover
+    return "claimed";
+  });
+  store.releaseReverifySlot = vi.fn(async (wfId, tid, sha7) => {
+    calls.releases.push({ wfId, tid, sha7 });
+    const held = slots.get(keyOf(wfId, tid));
+    if (!held || held.reverifySha !== sha7 || held.reverifyTicketId) return false;
+    delete held.reverifySha;
+    delete held.reverifyClaimedAt;
+    return true;
+  });
+  return store;
+}
+
 /** Deps + a call log. Each dep records rather than acts, so order is assertable. */
-function harness({ mode = "enforce", children = [], record = liveRecord(), tasks, phases = { [SHIP]: "ship" } } = {}) {
+function harness({ mode = "enforce", children = [], record = liveRecord(), tasks, phases = { [SHIP]: "ship" }, cas, untracked } = {}) {
   const calls = {
     mergeTaskMetadata: [],
     invokeTickets: [],
@@ -51,6 +109,8 @@ function harness({ mode = "enforce", children = [], record = liveRecord(), tasks
     events: [],
     childReads: 0,
     warns: [],
+    claims: [],
+    releases: [],
   };
   const workflow = {
     id: WF,
@@ -59,9 +119,7 @@ function harness({ mode = "enforce", children = [], record = liveRecord(), tasks
   };
   const deps = {
     mode,
-    store: {
-      mergeTaskMetadata: vi.fn(async (wfId, tid, fields) => { calls.mergeTaskMetadata.push({ wfId, tid, fields }); }),
-    },
+    store: slotStore(calls, { cas, untracked }),
     invokeTickets: vi.fn(async (tool, params) => {
       calls.invokeTickets.push({ tool, params });
       return { key: REVERIFY };
@@ -98,6 +156,12 @@ const fixTicket = (over = {}) => ({
 
 const eventsOfType = (calls, type) => calls.events.filter((e) => e.type === type);
 const created = (calls) => calls.invokeTickets.filter((c) => c.tool === "create_ticket");
+/**
+ * Every create_ticket ATTEMPT, including ones whose implementation a test
+ * replaced with mockResolvedValueOnce/mockRejectedValueOnce (which bypasses the
+ * recorder inside the default implementation).
+ */
+const createAttempts = (deps) => deps.invokeTickets.mock.calls.filter(([tool]) => tool === "create_ticket");
 
 describe("normalizeLiveReverifyMode — STRICT allow-list (garbage → off)", () => {
   it.each([
@@ -484,6 +548,177 @@ describe("enforce — idempotent per (fix, head sha)", () => {
     expect(second.action).toBe("created");
     expect(second.sha7).toBe("9ca1963");
     expect(created(calls)).toHaveLength(2);
+  });
+});
+
+describe("enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2)", () => {
+  /** A re-verify ticket as it appears on the board once filed. */
+  const reverifyChild = (headSha = SHA, id = REVERIFY) => ({
+    ticketId: id,
+    assignee: "agentcore_hub_qa_verifier",
+    status: "todo",
+    spawnedBy: { kind: "qa_fix", reverify: true, rearmOf: FIX, headSha },
+  });
+
+  it("two concurrent Dones for the same fix file exactly ONE re-verify ticket", async () => {
+    const { onFixDone, calls, workflow } = harness();
+    // Two invocations of the same Lambda: they share DynamoDB (the store fake)
+    // but NOT the in-memory workflow row, which is how a stream redelivery and
+    // its webhook twin actually arrive.
+    const [a, b] = await Promise.all([
+      onFixDone({ workflow: structuredClone(workflow), fixTicket: fixTicket(), completionRecord: liveRecord() }),
+      onFixDone({ workflow: structuredClone(workflow), fixTicket: fixTicket(), completionRecord: liveRecord() }),
+    ]);
+
+    expect(created(calls)).toHaveLength(1);
+    expect(calls.claims).toHaveLength(2);
+    const [winner, loser] = a.action === "created" ? [a, b] : [b, a];
+    expect(winner).toEqual({ action: "created", reverifyTicketId: REVERIFY, sha7: SHA7, unverified: false });
+    expect(loser.action).toBe("already");
+    // The loser knows the ticket is still in flight, so it neither invents an id
+    // nor blocks ship tickets on one — the winner does both.
+    expect(loser.pendingClaim).toBe(true);
+    expect(calls.addBlockers).toHaveLength(0);   // no ship tickets in this fixture
+  });
+
+  it("a redelivery after the winner persisted returns the winner's ticket, not a new one", async () => {
+    const children = [];
+    const { onFixDone, calls, workflow } = harness({ children });
+
+    const first = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: liveRecord() });
+    expect(first.action).toBe("created");
+    children.push(reverifyChild());   // the winner's ticket is now on the board
+
+    // A cold invocation: fresh in-memory row, so the free check cannot help.
+    const second = await onFixDone({
+      workflow: { id: WF, epicId: EPIC, agentTasks: { [FIX]: { commitSha: SHA } } },
+      fixTicket: fixTicket(),
+      completionRecord: liveRecord(),
+    });
+
+    expect(second).toEqual({ action: "already", reverifyTicketId: REVERIFY, sha7: SHA7, unverified: false, pendingClaim: false });
+    expect(created(calls)).toHaveLength(1);
+  });
+
+  it("a re-Done at a NEW head takes the slot from the previous head (documented behaviour)", async () => {
+    const NEW = "9ca1963427719c57232c8962815728f460c1a82a";
+    const { onFixDone, deps, calls, workflow } = harness();
+    await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: liveRecord() });
+
+    deps.invokeTickets.mockResolvedValueOnce({ key: "TEAM-4201" });
+    workflow.agentTasks[FIX].commitSha = NEW;
+    const second = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: { ...liveRecord(), commit_sha: NEW } });
+
+    expect(second).toEqual({ action: "created", reverifyTicketId: "TEAM-4201", sha7: "9ca1963", unverified: false });
+    expect(createAttempts(deps)).toHaveLength(2);
+    // The new claim must have dropped the OLD head's ticket id, or the next
+    // reader would treat this head as already re-verified.
+    const slot = deps.store.slots.get(`${WF}::${FIX}`);
+    expect(slot.reverifySha).toBe("9ca1963");
+    expect(slot.reverifyTicketId).toBe("TEAM-4201");
+  });
+
+  it("a failed create_ticket RELEASES the slot, so the next Done can file it", async () => {
+    const { onFixDone, deps, calls, workflow } = harness();
+    deps.invokeTickets.mockRejectedValueOnce(new Error("tickets lambda 500"));
+
+    const first = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: liveRecord() });
+    expect(first.action).toBe("no-sha");
+    expect(calls.releases).toEqual([{ wfId: WF, tid: FIX, sha7: SHA7 }]);
+    expect(deps.store.slots.get(`${WF}::${FIX}`).reverifySha).toBeUndefined();
+
+    // Without the release this retry would sit behind our own dead claim until
+    // staleAfterMs — with the run's ship tickets waiting on a ticket that does
+    // not exist.
+    const second = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: liveRecord() });
+    expect(second).toEqual({ action: "created", reverifyTicketId: REVERIFY, sha7: SHA7, unverified: false });
+    expect(createAttempts(deps)).toHaveLength(2);   // one rejected, one that landed
+  });
+
+  it("'taken' with no sibling on the board yet creates nothing and blocks nothing", async () => {
+    const { onFixDone, deps, calls, workflow } = harness();
+    // Someone else holds a fresh claim for this exact head.
+    deps.store.slots.set(`${WF}::${FIX}`, { reverifySha: SHA7, reverifyClaimedAt: new Date().toISOString() });
+
+    const result = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: liveRecord() });
+
+    expect(result).toEqual({ action: "already", reverifyTicketId: undefined, sha7: SHA7, unverified: false, pendingClaim: true });
+    expect(created(calls)).toHaveLength(0);
+    expect(deps.addBlockers).not.toHaveBeenCalled();
+  });
+
+  it("a PENDING claim in memory no longer short-circuits (sha alone is not evidence)", async () => {
+    // Pre-F2 the in-memory check was `reverifySha === sha7`, which a claim now
+    // also satisfies — short-circuiting on it would drop the re-verification.
+    const { onFixDone, deps, workflow } = harness({
+      tasks: { [FIX]: { commitSha: SHA, reverifySha: SHA7 } },   // no ticket id
+    });
+
+    const result = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: liveRecord() });
+
+    expect(deps.store.claimReverifySlot).toHaveBeenCalledWith(WF, FIX, SHA7, expect.any(String));
+    expect(result.action).toBe("created");
+  });
+
+  it("a store without claimReverifySlot degrades to the pre-F2 behaviour", async () => {
+    const { onFixDone, calls, workflow } = harness({ cas: false });
+
+    const result = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: liveRecord() });
+
+    expect(result.action).toBe("created");
+    expect(created(calls)).toHaveLength(1);
+    expect(calls.warns.join("\n")).toMatch(/falling back to the best-effort sibling scan/);
+  });
+
+  it("an untracked task entry fails OPEN: the CAS is skipped, the ticket is still filed", async () => {
+    const { onFixDone, calls, workflow } = harness({ untracked: true });
+
+    const result = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: liveRecord() });
+
+    expect(result.action).toBe("created");
+    expect(calls.warns.join("\n")).toMatch(/no tracked task entry to claim the \(fix, 0949f9d\) re-verify slot on/);
+    expect(calls.releases).toHaveLength(0);   // nothing was claimed, nothing to release
+  });
+
+  it("a claim that finds a pre-F2 ticket links it instead of filing a second one", async () => {
+    const { onFixDone, calls, workflow } = harness({ children: [reverifyChild()] });
+
+    const result = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: liveRecord() });
+
+    expect(result).toEqual({ action: "already", reverifyTicketId: REVERIFY, sha7: SHA7, unverified: false });
+    expect(created(calls)).toHaveLength(0);
+    // Linked, so the pending claim the CAS just wrote does not read as wedged.
+    expect(calls.mergeTaskMetadata.at(-1).fields).toEqual({ reverifyTicketId: REVERIFY, reverifySha: SHA7 });
+    expect(workflow.agentTasks[FIX].reverifyTicketId).toBe(REVERIFY);
+  });
+
+  it("a claim failure (ddb down) degrades to the best-effort path, never to silence", async () => {
+    const { onFixDone, deps, calls, workflow } = harness();
+    deps.store.claimReverifySlot.mockRejectedValueOnce(new Error("ddb down"));
+
+    const result = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: liveRecord() });
+
+    expect(result.action).toBe("created");
+    expect(calls.warns.join("\n")).toMatch(/claimReverifySlot failed \(non-fatal\)/);
+  });
+
+  it("board-level: the winner's re-verify blocks the run's open ship tickets, the loser touches nothing", async () => {
+    const children = [
+      { ticketId: SHIP, assignee: "agentcore_hub_release_manager", status: "in_progress" },
+    ];
+    const { onFixDone, calls, workflow } = harness({ children, phases: { agentcore_hub_release_manager: "ship" } });
+
+    const [a, b] = await Promise.all([
+      onFixDone({ workflow: structuredClone(workflow), fixTicket: fixTicket(), completionRecord: liveRecord() }),
+      onFixDone({ workflow: structuredClone(workflow), fixTicket: fixTicket(), completionRecord: liveRecord() }),
+    ]);
+
+    expect([a.action, b.action].sort()).toEqual(["already", "created"]);
+    // ONE edge on the ship ticket, added once, with F1's preserve option intact.
+    expect(calls.addBlockers).toEqual([
+      { ticketId: SHIP, ids: [REVERIFY], opts: { preserveStatusIf: LIVE_SHIP_STATUSES } },
+    ]);
+    expect(eventsOfType(calls, "fix.reverify_created")).toHaveLength(1);
   });
 });
 

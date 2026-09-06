@@ -215,6 +215,147 @@ export async function setTaskStatus(workflowId, ticketId, status) {
   }));
 }
 
+// ─── Re-verify slot (TEAM-4130 F2) ────────────────────────────────────────────
+//
+// live-reverify.mjs used to dedupe its `Re-verify (QA): <fix> @ <sha7>` ticket
+// with an in-memory check plus a sibling scan, then call create_ticket. Neither
+// is a mutex: DynamoDB Streams are at-least-once, the Jira webhook and the
+// stream are twins, and the dedupe evidence (reverifyTicketId) is only written
+// AFTER the ticket exists. Two concurrent Dones for the same fix therefore both
+// scanned, both found nothing, and both filed a re-verify ticket — each of which
+// blocks the run's ship tickets and dispatches the QA verifier.
+//
+// So the (fixTicketId, sha7) slot is now CAS-claimed before create_ticket. The
+// claim writes reverifySha and clears any stale reverifyTicketId, so the pair
+// (reverifySha set, reverifyTicketId absent) means exactly "a claim is held and
+// its ticket has not landed yet" — a state every reader must treat as pending,
+// not as verified (index.mjs's `## Unverified Fixes` block renders it as such).
+
+/** The whole task entry, projected out of the row. Used only on a lost CAS. */
+async function readTaskEntry(workflowId, ticketId) {
+  const res = await _ddb.send(new GetCommand({
+    TableName: _table,
+    Key: { workflowId },
+    ConsistentRead: true,
+    // A ProjectionExpression does not reduce the RCU DynamoDB charges (it bills
+    // the whole item either way), so projecting the ONE entry buys transfer and
+    // parse cost only — which is still the right trade against reading a
+    // 14-task workflow row to answer a question about one task.
+    ProjectionExpression: "agentTasks.#tid",
+    ExpressionAttributeNames: { "#tid": ticketId },
+  }));
+  return res?.Item?.agentTasks?.[ticketId];
+}
+
+/**
+ * Claim the (fix ticket, head sha7) re-verify slot. Returns a TRI-state, because
+ * the caller's three actions are genuinely different:
+ *
+ *   "claimed"   — this caller owns the slot and must file the ticket;
+ *   "taken"     — someone else owns it (in flight, or already filed): never file;
+ *   "untracked" — there is no agentTasks entry to hold a claim on, so the CAS is
+ *                 unavailable and the caller falls back to its best-effort
+ *                 sibling scan. Fail-OPEN on purpose: a fix whose task entry was
+ *                 lost must still get re-verified.
+ *
+ * The `reverifySha <> :sha` arm is load-bearing DOCUMENTED behaviour, not
+ * laxness: re-Done'ing a fix at a NEW head is a genuinely different claim
+ * (TEAM-4121 FR-9) and gets a fresh ticket, so the slot is per-sha, not per-fix.
+ * The REMOVE in the same expression is what makes that safe — the previous head's
+ * reverifyTicketId cannot survive into the new claim and be read as this head's.
+ *
+ * Not `ReturnValuesOnConditionCheckFailure: "ALL_OLD"`: lambda/orchestrator/
+ * package.json does not declare @aws-sdk/lib-dynamodb at all (the orchestrator
+ * uses the Lambda runtime's bundled SDK, whose version we do not pin), so
+ * whether the failed-condition item comes back — and comes back unmarshalled
+ * through the DocumentClient — is not something this code can rely on. One
+ * projected read on the LOSING path only is the version-independent equivalent.
+ *
+ * `opts.staleAfterMs` (default 10 min) covers the one state the CAS alone cannot
+ * distinguish: a winner that claimed and then died before create_ticket would
+ * otherwise wedge the slot forever, and this fix's whole point is that the run's
+ * ship tickets wait on that ticket.
+ */
+export async function claimReverifySlot(workflowId, fixTicketId, sha7, nowIso, { staleAfterMs = 10 * 60 * 1000 } = {}) {
+  // ONE expression for both the fresh claim and the stale takeover: the state
+  // they leave behind must be identical, or a takeover would look different to
+  // every reader than the claim it replaced.
+  const claimWrite =
+    "SET agentTasks.#tid.reverifySha = :sha, agentTasks.#tid.reverifyClaimedAt = :now" +
+    " REMOVE agentTasks.#tid.reverifyTicketId";
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: claimWrite,
+      ConditionExpression:
+        "attribute_exists(agentTasks.#tid) AND (attribute_not_exists(agentTasks.#tid.reverifySha)" +
+        " OR agentTasks.#tid.reverifySha <> :sha)",
+      ExpressionAttributeNames: { "#tid": fixTicketId },
+      ExpressionAttributeValues: { ":sha": sha7, ":now": nowIso },
+    }));
+    return "claimed";
+  } catch (err) {
+    if (err?.name !== "ConditionalCheckFailedException") throw err;
+  }
+
+  // Lost the CAS. By the condition above that means either no entry at all, or
+  // this exact sha is already claimed — one read tells them apart.
+  const entry = await readTaskEntry(workflowId, fixTicketId);
+  if (!entry) return "untracked";
+  if (entry.reverifySha !== sha7) return "taken";   // raced onto a third sha
+  if (entry.reverifyTicketId) return "taken";       // the winner already filed
+
+  // Same sha, no ticket: an in-flight winner (leave it alone) or a dead one.
+  const claimedAt = Date.parse(entry.reverifyClaimedAt || "");
+  const nowMs = Date.parse(nowIso || "");
+  const ageMs = Number.isFinite(claimedAt) && Number.isFinite(nowMs) ? nowMs - claimedAt : NaN;
+  if (!(ageMs >= staleAfterMs)) return "taken";
+
+  // Stale takeover, itself a CAS on the exact generation we just read — so two
+  // sweepers racing to take over a dead claim still produce one winner.
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: claimWrite,
+      ConditionExpression:
+        "agentTasks.#tid.reverifySha = :sha AND attribute_not_exists(agentTasks.#tid.reverifyTicketId)" +
+        " AND agentTasks.#tid.reverifyClaimedAt = :oldClaimedAt",
+      ExpressionAttributeNames: { "#tid": fixTicketId },
+      ExpressionAttributeValues: { ":sha": sha7, ":now": nowIso, ":oldClaimedAt": entry.reverifyClaimedAt },
+    }));
+    return "claimed";
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return "taken";
+    throw err;
+  }
+}
+
+/**
+ * Give the (fix, sha7) slot back after a create_ticket that failed. Conditioned
+ * on still holding THIS sha with no ticket id, so it can never erase a claim
+ * someone else took over or a link the winner just wrote. Returns true when the
+ * slot was actually released; a lost CAS is normal, not an error.
+ */
+export async function releaseReverifySlot(workflowId, fixTicketId, sha7) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE agentTasks.#tid.reverifySha, agentTasks.#tid.reverifyClaimedAt",
+      ConditionExpression:
+        "agentTasks.#tid.reverifySha = :sha AND attribute_not_exists(agentTasks.#tid.reverifyTicketId)",
+      ExpressionAttributeNames: { "#tid": fixTicketId },
+      ExpressionAttributeValues: { ":sha": sha7 },
+    }));
+    return true;
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
 /**
  * Sweep idempotency for the dead-session detector (TEAM-3618 D1.2). Stamp
  * deadSessionDetectedAt on the task ONLY IF the entry still holds the exact

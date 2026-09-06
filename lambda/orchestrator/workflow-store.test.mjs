@@ -11,6 +11,8 @@ import {
   clearDeadSessionDetected,
   incrementDeadSessionRetry,
   claimDeadSessionSynthesis,
+  claimReverifySlot,
+  releaseReverifySlot,
   advancePhase,
   setResumeContext,
   setRepoCheck,
@@ -46,6 +48,20 @@ import { GATE_STATES } from "./gate-state.mjs";
 
 const sent = [];
 let failNextCondition = false;
+/**
+ * The row a GetCommand sees. Only the re-verify-slot CAS reads back (on a LOST
+ * condition, to tell "no task entry" from "this sha is already claimed"), so
+ * everything else leaves this null and never notices.
+ */
+let stubItem = null;
+/**
+ * Per-conditional-write outcomes, consumed in order — `failNextCondition` is a
+ * one-shot, and claimReverifySlot's stale takeover issues TWO conditional writes
+ * around a read, so some tests must say "fail, then fail again".
+ */
+const condOutcomes = [];
+/** A non-CCFE error to raise once, for the rethrow path. */
+let throwOnce = null;
 
 const stubDdb = {
   async send(cmd) {
@@ -68,12 +84,22 @@ const stubDdb = {
       }
     }
     sent.push({ type: cmd.constructor.name, input: cmd.input });
-    if (failNextCondition && cmd.input.ConditionExpression) {
-      failNextCondition = false;
-      const err = new Error("conditional check failed");
-      err.name = "ConditionalCheckFailedException";
+    if (throwOnce) {
+      const err = throwOnce;
+      throwOnce = null;
       throw err;
     }
+    if (cmd.input.ConditionExpression) {
+      const forced = condOutcomes.length ? condOutcomes.shift() : null;
+      const fail = forced === null ? failNextCondition : forced === "fail";
+      if (forced === null) failNextCondition = false;
+      if (fail) {
+        const err = new Error("conditional check failed");
+        err.name = "ConditionalCheckFailedException";
+        throw err;
+      }
+    }
+    if (cmd.constructor.name === "GetCommand") return { Item: stubItem };
     return {};
   },
 };
@@ -81,6 +107,9 @@ const stubDdb = {
 beforeEach(() => {
   sent.length = 0;
   failNextCondition = false;
+  condOutcomes.length = 0;
+  stubItem = null;
+  throwOnce = null;
   initWorkflowStore(stubDdb, "workflows-test");
 });
 
@@ -1023,5 +1052,121 @@ describe("gate state machine (TEAM-4120 FR-1)", () => {
         "ProvisionedThroughputExceededException"
       );
     });
+  });
+});
+
+describe("re-verify slot CAS (TEAM-4130 F2)", () => {
+  const SHA = "abc1234";
+  const NOW = "2026-09-06T12:00:00.000Z";
+  const FIX = "TEAM-4130-7";
+  /** A row whose one task entry holds whatever slot state a test needs. */
+  const rowWith = (entry) => ({ workflowId: "wf_1", agentTasks: { [FIX]: entry } });
+
+  it("claims a free slot with a scoped CAS that also clears any stale ticket id", async () => {
+    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("claimed");
+    expect(writes()).toHaveLength(1);
+    const { input } = writes()[0];
+    expect(input.UpdateExpression).toContain("SET agentTasks.#tid.reverifySha = :sha");
+    expect(input.UpdateExpression).toContain("agentTasks.#tid.reverifyClaimedAt = :now");
+    // Without the REMOVE, the PREVIOUS head's ticket id would survive into this
+    // head's claim and read as if this head were already filed.
+    expect(input.UpdateExpression).toContain("REMOVE agentTasks.#tid.reverifyTicketId");
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(agentTasks.#tid) AND (attribute_not_exists(agentTasks.#tid.reverifySha)" +
+      " OR agentTasks.#tid.reverifySha <> :sha)"
+    );
+    expect(input.ExpressionAttributeNames["#tid"]).toBe(FIX);
+    expect(input.ExpressionAttributeValues).toEqual({ ":sha": SHA, ":now": NOW });
+    // No read on the winning path — the CAS is the whole decision.
+    expect(sent.filter((c) => c.type === "GetCommand")).toHaveLength(0);
+  });
+
+  it("returns taken when the winner has already filed the ticket", async () => {
+    condOutcomes.push("fail");
+    stubItem = rowWith({ reverifySha: SHA, reverifyTicketId: "TEAM-4130-9", reverifyClaimedAt: NOW });
+    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("taken");
+    expect(writes()).toHaveLength(1);   // no takeover attempted
+  });
+
+  it("returns taken while another caller's claim is still fresh", async () => {
+    condOutcomes.push("fail");
+    stubItem = rowWith({ reverifySha: SHA, reverifyClaimedAt: "2026-09-06T11:59:00.000Z" });
+    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("taken");
+    expect(writes()).toHaveLength(1);
+  });
+
+  it("returns taken when the slot raced onto a third sha", async () => {
+    condOutcomes.push("fail");
+    stubItem = rowWith({ reverifySha: "deadbee", reverifyClaimedAt: NOW });
+    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("taken");
+  });
+
+  it("returns untracked (fail-open) when there is no task entry to claim on", async () => {
+    condOutcomes.push("fail");
+    stubItem = { workflowId: "wf_1", agentTasks: {} };
+    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("untracked");
+    expect(sent.filter((c) => c.type === "GetCommand")).toHaveLength(1);
+    expect(sent.find((c) => c.type === "GetCommand").input.ProjectionExpression)
+      .toBe("agentTasks.#tid");
+  });
+
+  it("takes over a claim whose winner died, conditioned on the generation it read", async () => {
+    const stale = "2026-09-06T11:40:00.000Z";   // 20 min old, past the 10 min default
+    condOutcomes.push("fail", "ok");
+    stubItem = rowWith({ reverifySha: SHA, reverifyClaimedAt: stale });
+    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("claimed");
+    const takeover = writes()[1].input;
+    expect(takeover.ConditionExpression).toBe(
+      "agentTasks.#tid.reverifySha = :sha AND attribute_not_exists(agentTasks.#tid.reverifyTicketId)" +
+      " AND agentTasks.#tid.reverifyClaimedAt = :oldClaimedAt"
+    );
+    expect(takeover.ExpressionAttributeValues[":oldClaimedAt"]).toBe(stale);
+    // The takeover must leave the SAME state as a fresh claim, or readers would
+    // have to distinguish two shapes of "claim held".
+    expect(takeover.UpdateExpression).toBe(writes()[0].input.UpdateExpression);
+  });
+
+  it("yields to whoever else took over the same stale claim", async () => {
+    condOutcomes.push("fail", "fail");
+    stubItem = rowWith({ reverifySha: SHA, reverifyClaimedAt: "2026-09-06T11:00:00.000Z" });
+    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("taken");
+    expect(writes()).toHaveLength(2);
+  });
+
+  it("honours an explicit staleAfterMs", async () => {
+    condOutcomes.push("fail", "ok");
+    stubItem = rowWith({ reverifySha: SHA, reverifyClaimedAt: "2026-09-06T11:59:00.000Z" });
+    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW, { staleAfterMs: 30_000 })).toBe("claimed");
+  });
+
+  it("rethrows a non-CCFE claim error instead of guessing", async () => {
+    const boom = new Error("throttled");
+    boom.name = "ProvisionedThroughputExceededException";
+    throwOnce = boom;
+    await expect(claimReverifySlot("wf_1", FIX, SHA, NOW)).rejects.toThrow("throttled");
+  });
+
+  it("releases the slot after a failed create so it is not wedged", async () => {
+    expect(await releaseReverifySlot("wf_1", FIX, SHA)).toBe(true);
+    const { input } = writes()[0];
+    expect(input.UpdateExpression).toBe(
+      "REMOVE agentTasks.#tid.reverifySha, agentTasks.#tid.reverifyClaimedAt"
+    );
+    expect(input.ConditionExpression).toBe(
+      "agentTasks.#tid.reverifySha = :sha AND attribute_not_exists(agentTasks.#tid.reverifyTicketId)"
+    );
+    expect(input.ExpressionAttributeValues).toEqual({ ":sha": SHA });
+  });
+
+  it("refuses to release once a ticket id is linked (CCFE is normal, not an error)", async () => {
+    condOutcomes.push("fail");
+    expect(await releaseReverifySlot("wf_1", FIX, SHA)).toBe(false);
+  });
+
+  it("rethrows a non-CCFE release error", async () => {
+    const boom = new Error("network");
+    boom.name = "TimeoutError";
+    throwOnce = boom;
+    await expect(releaseReverifySlot("wf_1", FIX, SHA)).rejects.toThrow("network");
   });
 });

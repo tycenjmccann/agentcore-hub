@@ -189,6 +189,22 @@ export interface AgentTask {
   startedAt?: string;
   completedAt?: string;
   error?: string;
+
+  // Live-evidence re-verification (TEAM-4121 FR-9), written by the orchestrator
+  // on a fix ticket's Done. `verification: "unverified"` means the fix declared
+  // evidence_source=live and closed with no live artifact.
+  //
+  // reverifySha/reverifyTicketId are a SLOT, CAS-claimed per (fix, head sha7)
+  // before the ticket is filed (TEAM-4130 F2), so the three states are:
+  //   neither set                     — nothing scheduled;
+  //   reverifySha only                — a claim is held, the ticket is being
+  //                                     filed. NOT "verified", NOT "none": any
+  //                                     reader must render it as pending;
+  //   both set                        — the re-verify ticket exists.
+  verification?: "unverified";
+  reverifySha?: string;
+  reverifyTicketId?: string;
+  reverifyClaimedAt?: string;
 }
 
 export interface StoredEvent {
