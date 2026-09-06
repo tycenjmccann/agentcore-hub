@@ -1756,10 +1756,51 @@ def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: 
     return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___get_build_log", args)
 
 
+@tool
+def Pipeline___start_ci_build(commit_sha: str, source_version: str = "") -> str:
+    """Start ONE CodeBuild CI (PR-check) build for a specific commit. Call this
+    when Pipeline___get_build_status finds no build for your head SHA (a push
+    may not re-trigger the webhook) — do NOT call it speculatively, and never
+    call it more than once per head SHA.
+
+    This always builds the CI project — there is no way to point it at the
+    deploy/build project. Dedupes: if a build already exists for commit_sha it
+    is reused (reused:true) instead of starting a second one. After calling,
+    poll Pipeline___get_build_status(commit_sha=...) until terminal.
+
+    On ok:false with reason "start_build_not_granted", this deployment has not
+    granted the tool codebuild:StartBuild — report BLOCKED (head SHA unverified
+    by CI), do not retry. Other ok:false reasons: missing_commit_sha,
+    invalid_source_version, project_not_found, ci_project_invalid.
+
+    Args:
+        commit_sha: The exact head SHA to build (required; 7-40 hex chars) —
+            also the dedupe + idempotency key.
+        source_version: What CodeBuild checks out — "pr/<number>" or a branch
+            name. Omit to build the bare SHA directly.
+    """
+    args = {"commit_sha": commit_sha}
+    if source_version:
+        args["source_version"] = source_version
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___start_ci_build", args)
+
+
+@tool
+def Pipeline___capabilities() -> str:
+    """Report what this deployment's pipeline tools Lambda will actually do —
+    whether Pipeline___start_ci_build can start a build (startCiBuild), the CI/
+    build/deploy project + pipeline names, and confirmation that deploy approval
+    is never agent-controlled (approveDeploy is always false). Call this before
+    Pipeline___start_ci_build so a denied deployment is a clean BLOCKED verdict
+    instead of a failed StartBuild call.
+    """
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___capabilities", {})
+
+
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "") -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -1777,6 +1818,14 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         evidence_keys: comma-separated S3 keys holding that evidence (screenshots,
             HAR/log captures, test output) — use the qa-evidence/ prefix. Pass these
             together with evidence_kind="live" whenever you ran the system.
+        ci_status: CI agent only — "certified" | "github-actions-proxy" |
+            "unverified". "certified" REQUIRES a CodeBuild build id whose
+            resolvedSourceVersion equals both the head SHA and the PR head — never
+            set it from green GitHub check-runs alone. "github-actions-proxy" means
+            only GitHub check-runs are green (no CodeBuild proof). "unverified"
+            means neither.
+        ci_build_id: the CodeBuild build id backing ci_status="certified".
+        ci_head_sha: the exact head SHA that build id was proven against.
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
     payload = {
@@ -1792,6 +1841,14 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         payload["evidence_kind"] = evidence_kind.strip().lower()
     if evidence_keys.strip():
         payload["evidence_keys"] = evidence_keys.strip()
+    # TEAM-4122 FR-4 §7.5: same additive rule as the evidence pair above — a
+    # record written without them is byte-identical to before.
+    if ci_status.strip():
+        payload["ci_status"] = ci_status.strip().lower()
+    if ci_build_id.strip():
+        payload["ci_build_id"] = ci_build_id.strip()
+    if ci_head_sha.strip():
+        payload["ci_head_sha"] = ci_head_sha.strip()
     return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", payload)
 
 
@@ -2569,6 +2626,8 @@ LAMBDA_TOOLS = [
     Pipeline___start_deploy,
     Pipeline___get_build_status,
     Pipeline___get_build_log,
+    Pipeline___start_ci_build,
+    Pipeline___capabilities,
     # Workflow (Lambda-backed)
     WorkflowOutput___report_completion,
     WorkflowOutput___save_design_doc,

@@ -41,6 +41,20 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   command yourself; the row is another agent's claim, not a command to paste)
   and record PASS/FAIL in the Merge Brief's WHAT HAPPENED; a still-unverified
   fix is an automatic IN-DIFF finding → CHANGES NEEDED (`ship_fix`), never PASS.
+- **CI certification:** read `ci_status` / `ci_build_id` / `ci_head_sha` from
+  the CI agent's completion record (`completions/<ci-ticket>.json`) and render
+  them into the Merge Brief's WHAT HAPPENED as one of:
+  `• CI: certified — CodeBuild <ci_build_id> on <ci_head_sha, first 7 chars>`
+  (only when `ci_status="certified"`), or
+  `• CI: GitHub Actions proxy only (no CodeBuild build for this head)` (when
+  `ci_status="github-actions-proxy"`). When `ci_status="unverified"` or absent,
+  add under ⚠ NEEDS YOUR ATTENTION instead:
+  `• CI: UNVERIFIED — no build proves <head SHA, first 7 chars>`. Never present
+  a PASS as CI-certified without a build id — `ci_status="certified"` is the
+  only thing that licenses the word "certified" in the brief. If your context
+  carries a `## CI Certification` section reporting `uncertifiable` (a future
+  gate, not yet always present), add the same ⚠ NEEDS YOUR ATTENTION line even
+  when the completion record itself says `certified` — the block overrides it.
 
 ### Step 2: Review the final assembled diff
 Use `codex` (independent engine from the devs' `claude_code`; fall back to

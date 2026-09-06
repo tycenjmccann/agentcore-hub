@@ -30,8 +30,13 @@ The build is not yours to run; it is authoritative and already done. Do this:
 
 ### P1: Read the CI result for the branch head
 1. Identify the run's SHARED integration branch (`feature/{EPIC}-...`) and its
-   head SHA (`git rev-parse` via `claude_code` is fine, or the dev completion
-   records).
+   head SHA. Record the head SHA AFTER the orchestrator's sync commit — read it
+   fresh at the START of your work (`git rev-parse origin/<feature_branch>` via
+   `claude_code`, or `git rev-parse HEAD` right after checkout), NOT from the
+   dev completion records: a sync-to-main commit can move the branch head
+   after a dev agent's completion record was already written, so a stale SHA
+   from that record can name a commit that is no longer the head you must
+   verify.
 2. Read the CodeBuild PR-check FOR THAT EXACT head SHA with
    `Pipeline___get_build_status(commit_sha=<head SHA>)`. It scans recent CI builds
    and matches on `resolvedSourceVersion` (the real git commit CodeBuild built —
@@ -45,6 +50,24 @@ The build is not yours to run; it is authoritative and already done. Do this:
 - **CodeBuild `SUCCEEDED` for the head SHA → PASS.** Record the tested head SHA
   in your completion record (the release manager cross-checks it against the
   final PR head — a PASS without the SHA is unusable). Do NOT re-run the build.
+  Pass `ci_status="certified"`, `ci_build_id=<the CodeBuild build id>`,
+  `ci_head_sha=<the head SHA>` to `WorkflowOutput___report_completion` — every
+  PASS you report MUST carry these three, not just the SHA.
+
+**The `ci_status` completion-record field** is `certified | github-actions-proxy
+| unverified`:
+- `certified` requires a CodeBuild build id whose `resolvedSourceVersion`
+  equals the head SHA — i.e. you actually confirmed `succeededForCommit` for
+  that exact commit, either from an existing build or one you started. This is
+  the ONLY value that means "CI proved this SHA compiles/tests green".
+- `github-actions-proxy` means only GitHub check-runs are green on the head —
+  no CodeBuild build proves it. Green check-runs, `ship-head-stability`, or any
+  other GitHub-side signal NEVER upgrade a report to `certified` — that
+  upgrade only ever comes from a real CodeBuild build id matched to the head.
+- `unverified` means neither is true.
+Always pass `ci_status`, `ci_build_id`, `ci_head_sha` to
+`WorkflowOutput___report_completion` on every verdict, not only PASS — the
+release manager's Merge Brief reads all three off your completion record.
 - **`FAILED` / `FAULT` / `TIMED_OUT` → classify the failure first (P2a).** Pull
   the CloudWatch build log (`logs.deepLink` or `aws logs filter-log-events` on the
   CI log group), read the actual failing phase/command, and split the failures
@@ -76,8 +99,25 @@ The build is not yours to run; it is authoritative and already done. Do this:
       them (optional — a build/deploy phase failure often has none).
     - `sibling_scope`: the other components this fix must NOT touch (or `"none"`).
 - **No build found for the head SHA** (commits landed after the last CI run, or
-  the PR check never fired) → **BLOCKED**, not PASS: state that the head SHA is
-  unverified by CI and needs a build. Do not wave it through.
+  the PR check never fired): call `Pipeline___capabilities` first.
+  - `startCiBuild: true` → call `Pipeline___start_ci_build(commit_sha=<head
+    SHA>, source_version=<pr/<n> when a PR exists for this branch, else the
+    branch name>)`. Start **at most ONE build per head SHA** — never call it a
+    second time for the same SHA, whether it started or was reused. Then poll
+    `Pipeline___get_build_status(commit_sha=<head SHA>)` every 60s, for at most
+    25 polls (the CI project's build timeout is 30 minutes).
+    - `succeededForCommit: true` → **PASS**, with `ci_status="certified"`.
+    - `FAILED` → fall through to the P2a mechanical/logic classification above.
+    - Still not terminal after the last poll → **BLOCKED**: state that the
+      build is still running and could not be confirmed in time.
+  - `startCiBuild: false`, or `Pipeline___start_ci_build` itself returns
+    `reason: "start_build_not_granted"` → **BLOCKED**: state plainly that the
+    head SHA is unverified by CI and this deployment cannot start a build for
+    it. Check the head's GitHub check-runs: if they are all green, report
+    `ci_status="github-actions-proxy"` in your completion record — but this
+    NEVER upgrades the verdict past BLOCKED; CodeBuild certification and a
+    green check-run are different claims, and only the former is "certified".
+  - Do not wave a SHA with no proof of either kind through as PASS.
 
 ### P2a: Auto-remediate the mechanical lane (self-fix, don't ticket)
 Real CI/CD auto-fixes the deterministic, zero-judgment class (formatters, linters,
@@ -170,8 +210,9 @@ npm run lint 2>/dev/null
 npm test 2>/dev/null
 # Note: if test infrastructure isn't set up, mark as SKIPPED (pre-existing)
 
-# 6. Check for regressions vs base branch
-git diff --stat origin/clean-main..HEAD
+# 6. Check for regressions vs base branch (the `## Repository` section of your
+# context gives owner/repo and the default branch)
+git diff --stat origin/<default_branch>..HEAD
 # Verify only expected files were changed
 ```
 
