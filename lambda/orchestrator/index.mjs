@@ -3639,8 +3639,12 @@ export async function handleTicketDone(ticketId, image) {
     return;
   }
 
-  // Playbook artifact-chain gate (see handleTicketDoneUnified).
-  if (await enforceArtifactChain(await getTicket(ticketId).catch(() => null), workflow)) return;
+  // Playbook artifact-chain gate (see handleTicketDoneUnified). The gate consumes
+  // only ticketId/assignee/title — all present on the DDB stream image — so build
+  // the ticket in-hand instead of re-reading it. Symmetric with the webhook twin,
+  // and (TEAM-4155 / TEAM-4121 FR-9) no extra ticket read while the observer flags
+  // are off; the sole guarded getTicket below stays the only read on this path.
+  if (await enforceArtifactChain({ ticketId, assignee, title: unwrapDdbValue(image.title) }, workflow)) return;
 
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);

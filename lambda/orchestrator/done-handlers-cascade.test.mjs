@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import workflowsConfig from "../../src/config/workflows.json";
 
 /**
  * TEAM-3688 (QA finding F3) — HANDLER-LEVEL cascade coverage.
@@ -543,5 +544,72 @@ describe("live-reverify hook gating in both done twins (TEAM-4121 FR-9)", () => 
       // And the cascade the rest of this file covers is untouched.
       expectStaleLeaseRedispatch();
     });
+  });
+});
+
+// TEAM-4155 — the stream twin's artifact-chain gate must (1) still enforce for a
+// playbook run and (2) do so WITHOUT re-reading the ticket: the pre-fix code fed
+// the gate `await getTicket(ticketId)`, an unconditional tickets-table read that
+// broke the TEAM-4121 FR-9 "never re-read while observers are off" invariant even
+// when the gate fired. The fix builds the gate's ticket from the DDB stream image
+// (ticketId/assignee/title — everything the gate consumes), symmetric with the
+// webhook twin. This proves the gate itself still bounces a missing artifact.
+describe("artifact-chain gate — stream twin builds the ticket from the image (TEAM-4155)", () => {
+  const INTAKE = "agentcore_hub_requirements_analyst"; // owes intent.md + spec.md on sdlc-playbook
+  const SPEC = "TEAM-7001"; // the intake ticket that just closed
+  let realFetch;
+
+  beforeEach(async () => {
+    realFetch = global.fetch;
+    process.env.GITHUB_PAT = "test-pat";
+    // loadWorkflowDefs early-returns unless ARTIFACT_BUCKET is set (read at module
+    // load), and it reads the def from config/workflows.json — so set the bucket
+    // before load() and serve the real config to the S3 mock.
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    h.state.s3Objects["config/workflows.json"] = workflowsConfig;
+    // A playbook run: sdlc-playbook declares the artifact chain, on a real repo
+    // with a shared feature branch so the gate can actually probe GitHub.
+    h.state.workflow = {
+      id: "wf_1", workflowId: "wf_1", epicId: PARENT,
+      workflowDefId: "sdlc-playbook",
+      featureBranch: "feature/wf_1-shared",
+      repoConfig: { repos: [{ url: "https://github.com/acme/widgets" }] },
+      input: { title: "t" }, humanNotifications: [], agentTasks: {},
+    };
+    await load();
+    // getEffectiveWorkflowDef reads the memoized _workflowDefs; nothing on the
+    // done path loads it, so seed it explicitly (same seam completion-gates uses).
+    const mod = await import("./index.mjs");
+    await mod.loadWorkflowDefs();
+  });
+
+  afterEach(() => {
+    global.fetch = realFetch;
+    delete process.env.GITHUB_PAT;
+    delete process.env.ARTIFACT_BUCKET;
+  });
+
+  it("bounces the intake ticket to Blocked when its artifacts are missing, with zero ticket re-reads", async () => {
+    // Every contents-API probe 404s → intent.md/spec.md are not on the branch.
+    global.fetch = vi.fn(async () => ({
+      ok: false, status: 404, text: async () => JSON.stringify({ message: "Not Found" }),
+    }));
+
+    await handleTicketDone(SPEC, { parentId: PARENT, workflowId: "wf_1", assignee: INTAKE, title: "Author the spec" });
+
+    // (1) Gate fired: the early return preempted markTaskComplete (no completeTaskEntry),
+    // and it published artifact_chain.missing naming both owed artifacts.
+    expect(h.state.store.completeTaskEntry).toEqual([]);
+    const missing = h.state.events.find((e) => e.type === "artifact_chain.missing");
+    expect(missing).toBeTruthy();
+    expect(missing.detail.missing).toEqual(["intent.md", "spec.md"]);
+    // …and it re-opened the ticket to blocked.
+    expect(h.state.updates.some((u) =>
+      u.Key?.ticketId === SPEC && u.ExpressionAttributeValues?.[":s"] === "blocked")).toBe(true);
+    // (2) The gate used the in-hand image — no tickets-table GET at all (the FR-9
+    // invariant holds even on the path where the gate DOES fire).
+    expect(h.state.ticketGets).toEqual([]);
+    // It probed GitHub for the two owed artifacts and nothing else.
+    expect(global.fetch).toHaveBeenCalledTimes(2);
   });
 });
