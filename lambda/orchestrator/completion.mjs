@@ -23,7 +23,26 @@
  * a dev still gates the SHIP phase), else the assignee's roster phase.
  */
 
-export const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
+/**
+ * TEAM-4121 FR-8 — PARITY MIRROR of FIX_KINDS in lambda/orchestrator/fix-contract.mjs
+ * (and its byte-identical copies in both ticket Lambdas), the kind union in
+ * src/lib/workflow/types.ts, and the origin map in deploy/runtime-agent/main.py.
+ * Kept as a literal Set because scripts/check-fix-kinds-parity.sh greps the
+ * literal from each location — importing it would defeat the check (and this
+ * module is loaded by callers that don't ship fix-contract.mjs in tests).
+ * Add a kind in EVERY place listed above or CI fails.
+ */
+export const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix", "ship_fix", "ci_fix", "sync_fix"]);
+
+/**
+ * The subset that represents a HUMAN-authored rework round. ci_fix and sync_fix
+ * are environmental (a red build, a branch out of sync) — they are real fix
+ * tickets, so the open-fix completion gate must wait on them, but they must NOT
+ * count toward the rework-loop cap's human escalation: a flaky pipeline would
+ * otherwise escalate a run that nobody is looping on.
+ * PARITY MIRROR of REWORK_FIX_KINDS in fix-contract.mjs.
+ */
+export const REWORK_FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix", "ship_fix"]);
 
 /**
  * TEAM-3747 D2 — lifecycle-integrity terminal outcomes ("no green close over
@@ -260,9 +279,72 @@ export async function resolveMissingEvidenceFromRecords(missing, agentTasks, dep
   return remaining;
 }
 
+// ─── TEAM-4122 FR-7: advisory tickets ────────────────────────────────────────
+
+/**
+ * ADVISORY_ROUTING mode — two values, no shadow:
+ *   "off"     — an "advisory" label means nothing to the orchestrator (today).
+ *   "enforce" — an advisory-labelled ticket is BACKLOG: invisible to every
+ *               completion gate here, and (index.mjs) branched from / PR'd
+ *               against the repo default branch instead of the run's shared
+ *               integration branch.
+ *
+ * Garbage coalesces to "off", matching the discipline of every other flag that
+ * changes what the run waits on (CI_CHECK_MODE, SYNC_MAIN_BEFORE_CI,
+ * LIVE_REVERIFY): a typo must never silently start dropping tickets out of the
+ * completion guard.
+ */
+export function normalizeAdvisoryRoutingMode(v) {
+  return String(v || "").trim().toLowerCase() === "enforce" ? "enforce" : "off";
+}
+
 const isDone = (t) => t.status === "done";
 const isOpen = (t) => t.status !== "done" && t.status !== "cancelled";
 const isHuman = (a) => typeof a === "string" && a.startsWith("human:");
+
+/**
+ * TEAM-4131 F2 — the ticket shapes that can NEVER be advisory, whatever their
+ * labels say.
+ *
+ * `advisory` means "backlog this run does not wait on", so under enforce the
+ * label removes a child from every gate below. On a FIX ticket that is a bypass
+ * of the exact gate the fix exists to hold: `labels: ["advisory"]` on a real
+ * qa_fix let the run finalize with the fix open. The label reaches a ticket
+ * through create_ticket's user-supplied `labels`, which any persona (or a
+ * prompt-injected one) can set, and main.py exposes `labels` to all of them.
+ *
+ * fix-contract.mjs now refuses to STORE the word on these shapes, which is the
+ * write-side half. This is the read-side half, and it is the one that must hold:
+ * it covers tickets stored before that guard existed, a hand-edited board, and
+ * any future writer that forgets to pass the ticket shape to sanitizeUserLabels.
+ * A human gate is included for the same reason — being waited on is its entire
+ * function.
+ */
+export function advisoryNeverApplies(t) {
+  if (t?.spawnedBy && FIX_KINDS.has(t.spawnedBy.kind)) return true;
+  return isHuman(t?.assignee);
+}
+
+/**
+ * Is this ticket ADVISORY — filed as backlog that the run does not wait on? The
+ * marker is the literal label `advisory` (case- and whitespace-insensitive, but
+ * an EXACT word: "advisory-ish" is not advisory), written by the requirements
+ * analyst / release manager through create_ticket's `labels` param. Anything
+ * that is not an array of labels is simply not advisory.
+ *
+ * A fix ticket or a human gate is never advisory no matter what it is labelled
+ * (advisoryNeverApplies, TEAM-4131 F2).
+ */
+export function isAdvisoryTicket(t) {
+  if (!Array.isArray(t?.labels)) return false;
+  if (!t.labels.some((l) => String(l).trim().toLowerCase() === "advisory")) return false;
+  return !advisoryNeverApplies(t);
+}
+
+/** The children a completion gate may consider: everything that is not advisory. */
+export function nonAdvisory(children) {
+  return Array.isArray(children) ? children.filter((t) => !isAdvisoryTicket(t)) : children;
+}
 
 /**
  * @param children  the epic's child tickets
@@ -271,6 +353,9 @@ const isHuman = (a) => typeof a === "string" && a.startsWith("human:");
  *   getAgentPhase(assignee) → agent phase for a ticket's assignee (undefined for humans/unknowns)
  *   gatePhaseOf(ticket)     → the phase a human-assignee gate ticket guards (undefined if unknown)
  *   requestedGates          → workflow.input.reviewGates (activates "flagged" gates)
+ *   advisoryRouting         → ADVISORY_ROUTING ("enforce" drops advisory-labelled
+ *                             tickets out of every gate below; anything else, incl.
+ *                             absent, leaves the decision byte-identical to pre-FR-7)
  */
 export function isWorkflowComplete(children, wfDef, opts = {}) {
   if (!Array.isArray(children) || children.length === 0) return false;
@@ -284,6 +369,16 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
     typeof t.phase === "string" && t.phase ? t.phase : getAgentPhase(t.assignee);
 
   const required = (wfDef && wfDef.completionRequiresAgentPhases) || [];
+
+  // TEAM-4122 FR-7 — under enforce, advisory tickets are backlog and simply do
+  // not exist for completion purposes. Filtering ONCE here covers every gate in
+  // both branches below in one place: the legacy every-child-done heuristic, the
+  // has-done-agent check, the open-agent integrity check, the open-fix (FIX_KINDS)
+  // gate and gate-ticket matching. With the flag off (or absent) `children` is
+  // untouched, so this function is byte-identical to its pre-FR-7 self.
+  if (normalizeAdvisoryRoutingMode(opts.advisoryRouting) === "enforce") {
+    children = nonAdvisory(children);
+  }
 
   // ── Legacy branch — preserved verbatim in spirit (suffix heuristic + all done).
   if (required.length === 0) {

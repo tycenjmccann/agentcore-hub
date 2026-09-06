@@ -1449,7 +1449,7 @@ def S3Storage___list_objects(prefix: str = "", bucket: str = "") -> str:
 # ─── Ticket Tools ────────────────────────────────────────────────────────────
 
 @tool
-def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "") -> str:
+def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "") -> str:
     """Create a new ticket in the project tracker.
 
     MANDATORY TICKETS (create these for EVERY workflow, no exceptions):
@@ -1488,10 +1488,21 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
             so the run's completion guard keeps that phase open until the fix closes.
             Leave "" for ordinary phase tickets.
         spawned_by_kind: ONLY for a fix ticket. One of "qa_fix" (you are the QA verifier),
-            "codex_fix" (you are the code reviewer), or "review_fix". Leave "" otherwise.
+            "codex_fix" (you are the code reviewer), "review_fix", "ship_fix" (you are the
+            release manager), "ci_fix" or "sync_fix" (you are the CI agent). Leave "" otherwise.
         spawned_by_origin_id: The ticket ID this fix originates from — your own QA ticket
             (qa_fix), review ticket (codex_fix), or gate ticket (review_fix). Required when
             spawned_by_kind is set.
+        invariant: REQUIRED on a fix ticket. One sentence stating what must hold after the fix.
+        evidence_source: "static" (read the code) | "unit" (a test/command proves it) | "live"
+            (ran the system / UI / integration).
+        evidence_repro: the command that reproduces the finding, or the S3 artifact key holding
+            the evidence (required for unit|live). Single line.
+        cited_location: comma-separated path:line (or path:start-end) list, e.g.
+            "src/a.ts:12,src/b.ts:40-58".
+        sibling_scope: other tickets/components this fix must NOT touch (or "none").
+        labels: comma-separated free labels (e.g. "advisory"). System prefixes (fix:, origin:,
+            phase:, …) are dropped.
     """
     blockers = [b.strip() for b in blocked_by.split(",") if b.strip()] if blocked_by else []
     # Auto-inject workflow_id from invocation context if agent didn't pass one —
@@ -1507,15 +1518,44 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
     # TEAM-3619 D4c: assemble the fix-ticket provenance marker the lambda validates
     # and completion re-verify reads. The origin id maps to the kind-specific key.
     if spawned_by_kind.strip():
+        # TEAM-4121 FR-8: a fix ticket without an origin id is unusable for lineage —
+        # completion's re-verify can't find the ticket to re-arm and the orchestrator
+        # can't map it back to a phase. The Lambda only rejects this under
+        # FIX_TICKET_CONTRACT=enforce; the harness has no flag to read, so it refuses
+        # unconditionally rather than minting a dangling fix ticket.
+        if not spawned_by_origin_id.strip():
+            return "Error: spawned_by_origin_id is required when spawned_by_kind is set"
         origin_key = {
             "qa_fix": "qaTicketId",
             "codex_fix": "codexTicketId",
             "review_fix": "gateTicketId",
+            "ship_fix": "shipTicketId",
+            "ci_fix": "ciTicketId",
+            "sync_fix": "ciTicketId",
         }.get(spawned_by_kind.strip())
         spawned_by = {"kind": spawned_by_kind.strip()}
-        if origin_key and spawned_by_origin_id.strip():
+        if origin_key:
             spawned_by[origin_key] = spawned_by_origin_id.strip()
         payload["spawned_by"] = spawned_by
+    # TEAM-4121 FR-8: the fix contract. Sent only when the agent supplied at least one
+    # field — an empty contract would make the tickets Lambda report every field missing
+    # on a plain (non-fix) ticket. Validation lives in the Lambda's fix-contract.mjs;
+    # the harness only shapes what the agent typed.
+    contract_fields = [invariant, evidence_source, evidence_repro, cited_location, sibling_scope]
+    if any(f.strip() for f in contract_fields):
+        payload["fix_contract"] = {
+            "invariant": invariant.strip(),
+            "evidence_source": evidence_source.strip(),
+            "evidence_repro": evidence_repro.strip(),
+            "cited_location": [c.strip() for c in cited_location.split(",") if c.strip()],
+            "sibling_scope": sibling_scope.strip(),
+        }
+    # Split first, THEN test: a string of nothing but separators ("  ,  ") is
+    # truthy after strip() but yields no labels, and sending labels: [] would
+    # make a plain ticket look like it had labels refused.
+    free_labels = [l.strip() for l in labels.split(",") if l.strip()]
+    if free_labels:
+        payload["labels"] = free_labels
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___create_ticket", payload)
 
 
@@ -1716,10 +1756,51 @@ def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: 
     return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___get_build_log", args)
 
 
+@tool
+def Pipeline___start_ci_build(commit_sha: str, source_version: str = "") -> str:
+    """Start ONE CodeBuild CI (PR-check) build for a specific commit. Call this
+    when Pipeline___get_build_status finds no build for your head SHA (a push
+    may not re-trigger the webhook) — do NOT call it speculatively, and never
+    call it more than once per head SHA.
+
+    This always builds the CI project — there is no way to point it at the
+    deploy/build project. Dedupes: if a build already exists for commit_sha it
+    is reused (reused:true) instead of starting a second one. After calling,
+    poll Pipeline___get_build_status(commit_sha=...) until terminal.
+
+    On ok:false with reason "start_build_not_granted", this deployment has not
+    granted the tool codebuild:StartBuild — report BLOCKED (head SHA unverified
+    by CI), do not retry. Other ok:false reasons: missing_commit_sha,
+    invalid_source_version, project_not_found, ci_project_invalid.
+
+    Args:
+        commit_sha: The exact head SHA to build (required; 7-40 hex chars) —
+            also the dedupe + idempotency key.
+        source_version: What CodeBuild checks out — "pr/<number>" or a branch
+            name. Omit to build the bare SHA directly.
+    """
+    args = {"commit_sha": commit_sha}
+    if source_version:
+        args["source_version"] = source_version
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___start_ci_build", args)
+
+
+@tool
+def Pipeline___capabilities() -> str:
+    """Report what this deployment's pipeline tools Lambda will actually do —
+    whether Pipeline___start_ci_build can start a build (startCiBuild), the CI/
+    build/deploy project + pipeline names, and confirmation that deploy approval
+    is never agent-controlled (approveDeploy is always false). Call this before
+    Pipeline___start_ci_build so a denied deployment is a clean BLOCKED verdict
+    instead of a failed StartBuild call.
+    """
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___capabilities", {})
+
+
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "") -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -1729,14 +1810,46 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         branch: Git branch name (for dev agents)
         commit_sha: Git commit SHA (for dev agents)
         pr_url: Pull request URL (for dev agents)
+        evidence_kind: how you know the work is done — "static" (read the code) |
+            "unit" (a test/command proves it) | "live" (you ran the system / UI /
+            integration). QA verifiers MUST pass "live" when they actually ran the
+            system; a fix filed with evidence_source=live whose completion record
+            says otherwise is marked UNVERIFIED and re-verified at the PR head.
+        evidence_keys: comma-separated S3 keys holding that evidence (screenshots,
+            HAR/log captures, test output) — use the qa-evidence/ prefix. Pass these
+            together with evidence_kind="live" whenever you ran the system.
+        ci_status: CI agent only — "certified" | "github-actions-proxy" |
+            "unverified". "certified" REQUIRES a CodeBuild build id whose
+            resolvedSourceVersion equals both the head SHA and the PR head — never
+            set it from green GitHub check-runs alone. "github-actions-proxy" means
+            only GitHub check-runs are green (no CodeBuild proof). "unverified"
+            means neither.
+        ci_build_id: the CodeBuild build id backing ci_status="certified".
+        ci_head_sha: the exact head SHA that build id was proven against.
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
-    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", {
+    payload = {
         "ticket_id": ticket_id, "summary": summary,
         "artifacts": artifacts, "branch": branch, "commit_sha": commit_sha, "pr_url": pr_url,
         "workflow_id": _CURRENT_WORKFLOW_ID,
         "agent_id": _CURRENT_AGENT_ID,
-    })
+    }
+    # TEAM-4121 FR-9: sent only when the agent supplied them, so a record written
+    # without them is byte-identical to before (the orchestrator's live-reverify
+    # check treats absent as "no live evidence", which is the honest reading).
+    if evidence_kind.strip():
+        payload["evidence_kind"] = evidence_kind.strip().lower()
+    if evidence_keys.strip():
+        payload["evidence_keys"] = evidence_keys.strip()
+    # TEAM-4122 FR-4 §7.5: same additive rule as the evidence pair above — a
+    # record written without them is byte-identical to before.
+    if ci_status.strip():
+        payload["ci_status"] = ci_status.strip().lower()
+    if ci_build_id.strip():
+        payload["ci_build_id"] = ci_build_id.strip()
+    if ci_head_sha.strip():
+        payload["ci_head_sha"] = ci_head_sha.strip()
+    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", payload)
 
 
 @tool
@@ -2513,6 +2626,8 @@ LAMBDA_TOOLS = [
     Pipeline___start_deploy,
     Pipeline___get_build_status,
     Pipeline___get_build_log,
+    Pipeline___start_ci_build,
+    Pipeline___capabilities,
     # Workflow (Lambda-backed)
     WorkflowOutput___report_completion,
     WorkflowOutput___save_design_doc,

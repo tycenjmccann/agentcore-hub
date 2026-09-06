@@ -26,6 +26,12 @@
  *     verdict. Now: terminal requires a whole-pipeline disposition (all stages
  *     match, or a matching stage Failed/Stopped), scoped status is stage-level
  *     only, and execution_id is String()-coerced.
+ *
+ * TEAM-4122 FR-4 adds start_ci_build + capabilities. Those tests assert the
+ * SHAPE OF THE REQUEST, not just the answer: the StartBuild input is deep-equal
+ * to a three-key allow-list, because every defect this tool could have is a key
+ * that reached CodeBuild — an override that replaces the buildspec, or a project
+ * name that came from an agent's args instead of from env.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -37,6 +43,14 @@ const h = vi.hoisted(() => ({
     listActionExecutionsImpl: async () => ({ actionExecutionDetails: [] }),
     startPipelineExecutionImpl: async () => ({ pipelineExecutionId: "exec-new" }),
     listBuildsImpl: async () => ({ ids: [] }),
+    startBuildImpl: async () => ({
+      build: {
+        id: "agentcore-hub-ci:11111111-2222-3333-4444-555555555555",
+        arn: "arn:aws:codebuild:us-east-1:111122223333:build/agentcore-hub-ci:11111111",
+        buildStatus: "IN_PROGRESS",
+        resolvedSourceVersion: undefined,
+      },
+    }),
     batchGetBuildsImpl: async (input) => ({
       builds: (input.ids || []).map((id) => ({
         id,
@@ -72,11 +86,13 @@ vi.mock("@aws-sdk/client-codebuild", () => ({
       h.state.cbCalls.push({ type, input: cmd.input });
       if (type === "ListBuildsForProject") return h.state.listBuildsImpl(cmd.input);
       if (type === "BatchGetBuilds") return h.state.batchGetBuildsImpl(cmd.input);
+      if (type === "StartBuild") return h.state.startBuildImpl(cmd.input);
       return {};
     }
   },
   ListBuildsForProjectCommand: class { constructor(i) { this.input = i; this.__type = "ListBuildsForProject"; } },
   BatchGetBuildsCommand: class { constructor(i) { this.input = i; this.__type = "BatchGetBuilds"; } },
+  StartBuildCommand: class { constructor(i) { this.input = i; this.__type = "StartBuild"; } },
 }));
 
 vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
@@ -86,7 +102,11 @@ vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
   GetLogEventsCommand: class { constructor(i) { this.input = i; } },
 }));
 
-const { handler } = await import("./index.mjs");
+const { handler, validateCiProjectName } = await import("./index.mjs");
+
+/** The hoisted default BatchGetBuilds stub, so a suite that installs its own can
+ * be restored between tests. */
+const DEFAULT_BATCH_GET = h.state.batchGetBuildsImpl;
 
 /** Invoke the handler the way the runtime's _invoke_lambda does and parse the
  * jsonResult text payload back into an object. */
@@ -112,6 +132,46 @@ function allGreenStages(executionId) {
   };
 }
 
+/** Invoke a specific handler instance (see withEnv) the same way. */
+async function invokeOn(handlerFn, tool, args = {}) {
+  const res = await handlerFn({ name: `Pipeline___${tool}`, arguments: args });
+  return JSON.parse(res.content[0].text);
+}
+
+/**
+ * Re-import index.mjs with `env` applied, for the values it reads ONCE at module
+ * load (CI_PROJECT and its validation verdict). The AWS mocks are re-created by
+ * vitest but still close over this file's `h`, so calls land in h.state as usual.
+ * Env and the module registry are both restored afterwards, so the top-level
+ * `handler` other suites use is untouched.
+ */
+async function withEnv(env, fn) {
+  const saved = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  vi.resetModules();
+  try {
+    const mod = await import("./index.mjs");
+    return await fn(mod);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    vi.resetModules();
+  }
+}
+
+const DEFAULT_START_BUILD = () => ({
+  build: {
+    id: "agentcore-hub-ci:11111111-2222-3333-4444-555555555555",
+    arn: "arn:aws:codebuild:us-east-1:111122223333:build/agentcore-hub-ci:11111111",
+    buildStatus: "IN_PROGRESS",
+  },
+});
+
 beforeEach(() => {
   h.state.cpCalls = [];
   h.state.cbCalls = [];
@@ -119,6 +179,9 @@ beforeEach(() => {
   h.state.listActionExecutionsImpl = async () => ({ actionExecutionDetails: [] });
   h.state.startPipelineExecutionImpl = async () => ({ pipelineExecutionId: "exec-new" });
   h.state.listBuildsImpl = async () => ({ ids: [] });
+  h.state.batchGetBuildsImpl = DEFAULT_BATCH_GET;
+  h.state.startBuildImpl = async () => DEFAULT_START_BUILD();
+  delete process.env.PIPELINE_CI_START_BUILD;
 });
 
 // ─── 1. Execution-scoped get_state ───────────────────────────────────────────
@@ -450,5 +513,388 @@ describe("start_deploy clientRequestToken idempotency", () => {
     await invoke("start_deploy", { commit_sha: "///+++" });
 
     expect(startCall().input).not.toHaveProperty("clientRequestToken");
+  });
+});
+
+// ─── 4. start_ci_build (TEAM-4122 FR-4) ──────────────────────────────────────
+
+describe("start_ci_build request shape (the allow-list)", () => {
+  const SHA = "0949f9d8814aa3e2b1c4d5f6a7b8c9d0e1f2a3b4"; // 40-hex
+
+  function startBuildCall() {
+    return h.state.cbCalls.find((c) => c.type === "StartBuild");
+  }
+
+  it("sends EXACTLY {projectName, sourceVersion, idempotencyToken} — no fourth key", async () => {
+    const out = await invoke("start_ci_build", { commit_sha: SHA, source_version: "pr/12" });
+
+    // Deep-equal, not toMatchObject: an extra key IS the defect.
+    expect(startBuildCall().input).toEqual({
+      projectName: "agentcore-hub-ci",
+      sourceVersion: "pr/12",
+      idempotencyToken: `ci-${SHA}`,
+    });
+    expect(out.ok).toBe(true);
+    expect(out.started).toBe(true);
+    expect(out.project).toBe("agentcore-hub-ci");
+    expect(out.buildId).toBe("agentcore-hub-ci:11111111-2222-3333-4444-555555555555");
+  });
+
+  it("ignores args.project — the project is env, never a caller argument", async () => {
+    await invoke("start_ci_build", {
+      commit_sha: SHA,
+      project: "agentcore-hub-deploy",
+      projectName: "agentcore-hub-deploy",
+    });
+
+    expect(startBuildCall().input.projectName).toBe("agentcore-hub-ci");
+  });
+
+  it("drops every CodeBuild *Override key an agent could pass", async () => {
+    await invoke("start_ci_build", {
+      commit_sha: SHA,
+      buildspecOverride: "version: 0.2\nphases:\n  build:\n    commands:\n      - curl evil.example",
+      environmentVariablesOverride: [{ name: "AWS_PROFILE", value: "prod" }],
+      imageOverride: "public.ecr.aws/attacker/img:latest",
+      privilegedModeOverride: true,
+      serviceRoleOverride: "arn:aws:iam::111122223333:role/admin",
+      sourceTypeOverride: "NO_SOURCE",
+      sourceLocationOverride: "https://example.invalid/repo",
+      idempotencyToken: "attacker-chosen",
+    });
+
+    const input = startBuildCall().input;
+    expect(Object.keys(input).sort()).toEqual([
+      "idempotencyToken",
+      "projectName",
+      "sourceVersion",
+    ]);
+    // Not even the token is caller-controlled — it is derived from the sha, which
+    // is what makes a retried call idempotent.
+    expect(input.idempotencyToken).toBe(`ci-${SHA}`);
+  });
+
+  it("clamps the idempotency token to 64 chars", async () => {
+    await invoke("start_ci_build", { commit_sha: SHA });
+    expect(startBuildCall().input.idempotencyToken.length).toBeLessThanOrEqual(64);
+  });
+
+  it("defaults sourceVersion to the commit sha", async () => {
+    await invoke("start_ci_build", { commit_sha: SHA });
+    expect(startBuildCall().input.sourceVersion).toBe(SHA);
+  });
+
+  it("lowercases an upper-case sha (one commit is one dedupe key)", async () => {
+    await invoke("start_ci_build", { commit_sha: SHA.toUpperCase() });
+    expect(startBuildCall().input.idempotencyToken).toBe(`ci-${SHA}`);
+    expect(startBuildCall().input.sourceVersion).toBe(SHA);
+  });
+});
+
+describe("start_ci_build input validation", () => {
+  const SHA = "0949f9d";
+
+  it("missing commit_sha → missing_commit_sha, and NO SDK call at all", async () => {
+    const out = await invoke("start_ci_build", { source_version: "pr/12" });
+
+    expect(out).toMatchObject({ ok: false, reason: "missing_commit_sha" });
+    expect(h.state.cbCalls).toEqual([]);
+  });
+
+  it("a non-sha commit_sha → invalid_commit_sha, no SDK call", async () => {
+    for (const bad of ["main", "0949f9", "zzzzzzz", "0949f9d8814aa3e2b1c4d5f6a7b8c9d0e1f2a3b4c5", "12345 67"]) {
+      h.state.cbCalls = [];
+      const out = await invoke("start_ci_build", { commit_sha: bad });
+      expect(out.reason, bad).toBe("invalid_commit_sha");
+      expect(h.state.cbCalls, bad).toEqual([]);
+    }
+  });
+
+  it("rejects the source_version shapes that can resolve to something else", async () => {
+    for (const bad of [
+      "refs/pull/1/head", // a ref, not a branch — resolves via the remote's namespace
+      "refs/heads/main",
+      "a..b",             // a range
+      "*",                // a wildcard
+      "-startsWithDash",
+      `${"b".repeat(201)}`,
+    ]) {
+      h.state.cbCalls = [];
+      const out = await invoke("start_ci_build", { commit_sha: SHA, source_version: bad });
+      expect(out, bad).toMatchObject({ ok: false, reason: "invalid_source_version" });
+      expect(h.state.cbCalls, bad).toEqual([]);
+    }
+  });
+
+  it("accepts pr/<n>, a 40-hex sha, and a plain branch name", async () => {
+    for (const good of [
+      "pr/1",
+      "pr/1234567",
+      "0949f9d8814aa3e2b1c4d5f6a7b8c9d0e1f2a3b4",
+      "feature/TEAM-4122-backend-dev",
+      "main",
+      // Not a PR number, so it is read as a BRANCH named "pr/…" — a legal branch
+      // name that simply may not exist. CodeBuild's own InvalidInputException is
+      // the right place for "no such ref", not a shape rule that would also
+      // reject someone's real `pr/hotfix` branch.
+      "pr/12345678",
+      "pr/abc",
+    ]) {
+      h.state.cbCalls = [];
+      const out = await invoke("start_ci_build", { commit_sha: SHA, source_version: good });
+      expect(out, good).toMatchObject({ ok: true, started: true });
+      expect(h.state.cbCalls.find((c) => c.type === "StartBuild").input.sourceVersion).toBe(good);
+    }
+  });
+
+  it("an invalid CI_PROJECT disables the tool — refused, with NO SDK call", async () => {
+    // The whole point of F2/F3: if config points CI at a deploy project, the tool
+    // must refuse rather than start it.
+    for (const bad of ["agentcore-hub-deploy", "agentcore-hub-build", "agentcore-hub-runtime-image-deploy", "agentcore-hub-*", "a"]) {
+      h.state.cbCalls = [];
+      await withEnv({ CI_PROJECT: bad }, async ({ handler: h2 }) => {
+        const out = await invokeOn(h2, "start_ci_build", { commit_sha: SHA });
+        expect(out, bad).toMatchObject({ ok: false, reason: "ci_project_invalid" });
+        expect(out.detail, bad).toBeTruthy();
+      });
+      expect(h.state.cbCalls, bad).toEqual([]);
+    }
+  });
+
+  it("the read-only tools keep working when CI_PROJECT is invalid (no cold-start crash)", async () => {
+    await withEnv({ CI_PROJECT: "agentcore-hub-deploy" }, async ({ handler: h2 }) => {
+      h.state.getPipelineStateImpl = async () => allGreenStages("OLD");
+      const out = await invokeOn(h2, "get_state", {});
+      expect(out.configured).toBe(true);
+    });
+  });
+});
+
+describe("start_ci_build dedupe (one build per commit)", () => {
+  const SHA = "0949f9d8814aa3e2b1c4d5f6a7b8c9d0e1f2a3b4";
+
+  /** A project whose recent builds are exactly `rows` (newest first). */
+  function recentBuilds(rows) {
+    h.state.listBuildsImpl = async () => ({ ids: rows.map((r) => r.id) });
+    h.state.batchGetBuildsImpl = async (input) => ({
+      // Returned in a DIFFERENT order than requested on purpose: BatchGetBuilds
+      // makes no ordering promise, so "newest" must come from the id list.
+      builds: [...rows].reverse().filter((r) => input.ids.includes(r.id)),
+    });
+  }
+
+  it("an IN_PROGRESS build for the same commit is reused — no second StartBuild", async () => {
+    recentBuilds([
+      { id: "b-2", buildStatus: "IN_PROGRESS", resolvedSourceVersion: SHA },
+      { id: "b-1", buildStatus: "FAILED", resolvedSourceVersion: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
+    ]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(out).toMatchObject({
+      ok: true,
+      reused: true,
+      buildId: "b-2",
+      buildStatus: "IN_PROGRESS",
+      resolvedSourceVersion: SHA,
+      project: "agentcore-hub-ci",
+    });
+    expect(out.started).toBeUndefined();
+    expect(h.state.cbCalls.find((c) => c.type === "StartBuild")).toBeUndefined();
+  });
+
+  it("a SUCCEEDED build for the same commit is reused too (CI already proved this head)", async () => {
+    recentBuilds([{ id: "b-9", buildStatus: "SUCCEEDED", resolvedSourceVersion: SHA }]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(out).toMatchObject({ ok: true, reused: true, buildId: "b-9" });
+    expect(h.state.cbCalls.find((c) => c.type === "StartBuild")).toBeUndefined();
+  });
+
+  it("a short commit_sha matches a full resolvedSourceVersion by prefix", async () => {
+    recentBuilds([{ id: "b-3", buildStatus: "IN_PROGRESS", resolvedSourceVersion: SHA }]);
+
+    const out = await invoke("start_ci_build", { commit_sha: "0949F9D" });
+
+    expect(out).toMatchObject({ reused: true, buildId: "b-3" });
+  });
+
+  it("a FAILED build for the same commit is NOT a reuse — re-running red CI is the use case", async () => {
+    recentBuilds([{ id: "b-4", buildStatus: "FAILED", resolvedSourceVersion: SHA }]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(out).toMatchObject({ ok: true, started: true });
+    expect(h.state.cbCalls.find((c) => c.type === "StartBuild")).toBeDefined();
+  });
+
+  it("a build for a DIFFERENT commit never dedupes this one", async () => {
+    recentBuilds([
+      { id: "b-5", buildStatus: "IN_PROGRESS", resolvedSourceVersion: "1111111111111111111111111111111111111111" },
+      { id: "b-6", buildStatus: "SUCCEEDED", resolvedSourceVersion: null },
+      // A non-hex resolvedSourceVersion (a branch) must not prefix-match a sha.
+      { id: "b-7", buildStatus: "SUCCEEDED", resolvedSourceVersion: "main" },
+    ]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(out).toMatchObject({ ok: true, started: true });
+  });
+
+  it("scans the 30 most recent builds only", async () => {
+    recentBuilds(
+      Array.from({ length: 60 }, (_, i) => ({
+        id: `b-${i}`,
+        buildStatus: "SUCCEEDED",
+        resolvedSourceVersion: `2222222222222222222222222222222222222${String(i).padStart(3, "0")}`,
+      }))
+    );
+
+    await invoke("start_ci_build", { commit_sha: SHA });
+
+    const batch = h.state.cbCalls.find((c) => c.type === "BatchGetBuilds");
+    expect(batch.input.ids.length).toBe(30);
+    expect(batch.input.ids[0]).toBe("b-0");
+  });
+});
+
+describe("start_ci_build error mapping (a denial is an answer, not a crash)", () => {
+  const SHA = "0949f9d";
+
+  function throwing(name, message = name) {
+    return async () => {
+      const err = new Error(message);
+      err.name = name;
+      throw err;
+    };
+  }
+
+  it("AccessDenied → start_build_not_granted, structured, no throw", async () => {
+    h.state.startBuildImpl = throwing("AccessDeniedException", "not authorized to perform: codebuild:StartBuild");
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "start_build_not_granted",
+      project: "agentcore-hub-ci",
+    });
+    // The IAM message itself is not echoed — only the actionable remediation.
+    expect(out.detail).toContain("PIPELINE_CI_START_BUILD=1");
+  });
+
+  it("ResourceNotFound → project_not_found", async () => {
+    h.state.startBuildImpl = throwing("ResourceNotFoundException");
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(out).toMatchObject({ ok: false, reason: "project_not_found", project: "agentcore-hub-ci" });
+  });
+
+  it("InvalidInput → invalid_source_version (CodeBuild refused a shape we allowed)", async () => {
+    h.state.startBuildImpl = throwing("InvalidInputException", "Unable to resolve version: pr/999");
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA, source_version: "pr/999" });
+
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "invalid_source_version",
+      sourceVersion: "pr/999",
+    });
+  });
+
+  it("an unexpected error falls through to the generic handler error path", async () => {
+    h.state.startBuildImpl = throwing("ThrottlingException", "Rate exceeded");
+
+    const res = await handler({
+      name: "Pipeline___start_ci_build",
+      arguments: { commit_sha: SHA },
+    });
+
+    // textResult, not jsonResult — the agent sees a retryable error, not ok:false.
+    expect(res.content[0].text).toContain("ThrottlingException");
+    expect(res.content[0].text).toContain("Rate exceeded");
+  });
+});
+
+// ─── 5. capabilities (TEAM-4122 FR-4) ────────────────────────────────────────
+
+describe("capabilities", () => {
+  it("startCiBuild:true only when PIPELINE_CI_START_BUILD=1", async () => {
+    process.env.PIPELINE_CI_START_BUILD = "1";
+    expect((await invoke("capabilities")).startCiBuild).toBe(true);
+
+    for (const value of [undefined, "0", "", "true", "yes", "1 "]) {
+      if (value === undefined) delete process.env.PIPELINE_CI_START_BUILD;
+      else process.env.PIPELINE_CI_START_BUILD = value;
+      expect((await invoke("capabilities")).startCiBuild, String(value)).toBe(false);
+    }
+  });
+
+  it("startCiBuild:false when CI_PROJECT is invalid EVEN WITH the flag on", async () => {
+    await withEnv(
+      { CI_PROJECT: "agentcore-hub-deploy", PIPELINE_CI_START_BUILD: "1" },
+      async ({ handler: h2 }) => {
+        const out = await invokeOn(h2, "capabilities");
+        expect(out.startCiBuild).toBe(false);
+        expect(out.ciProject).toBe("agentcore-hub-deploy");
+      }
+    );
+  });
+
+  it("approveDeploy is an unconditional false, flag or no flag", async () => {
+    process.env.PIPELINE_CI_START_BUILD = "1";
+    expect((await invoke("capabilities")).approveDeploy).toBe(false);
+    delete process.env.PIPELINE_CI_START_BUILD;
+    expect((await invoke("capabilities")).approveDeploy).toBe(false);
+  });
+
+  it("reports the projects it is wired to, and its version", async () => {
+    const out = await invoke("capabilities");
+
+    expect(out).toMatchObject({
+      ciProject: "agentcore-hub-ci",
+      buildProject: "agentcore-hub-build",
+      deployPipeline: "agentcore-hub-deploy",
+      version: 2,
+    });
+    // Read-only: capabilities never talks to AWS.
+    expect(h.state.cpCalls).toEqual([]);
+    expect(h.state.cbCalls).toEqual([]);
+  });
+
+  it("the unknown-tool message lists both new tools", async () => {
+    const res = await handler({ name: "Pipeline___approve_deploy", arguments: {} });
+    expect(res.error).toContain("start_ci_build");
+    expect(res.error).toContain("capabilities");
+    expect(res.error).not.toContain("PutApprovalResult");
+  });
+});
+
+// ─── 6. validateCiProjectName, directly ──────────────────────────────────────
+
+describe("validateCiProjectName", () => {
+  it("accepts an ordinary PR-check project name", () => {
+    const out = validateCiProjectName("agentcore-hub-ci", {
+      buildProject: "agentcore-hub-build",
+      deployProject: "agentcore-hub-deploy",
+      pipelineName: "agentcore-hub-deploy",
+    });
+    expect(out).toEqual({ ok: true, reason: null });
+  });
+
+  it("names a reason for every refusal (the tool surfaces it as `detail`)", () => {
+    const opts = {
+      buildProject: "agentcore-hub-build",
+      deployProject: "agentcore-hub-deploy",
+      pipelineName: "agentcore-hub-deploy",
+    };
+    for (const bad of ["", "*", "ci-*", "ci?", "a", "-ci", "ci build", "agentcore-hub-build", "agentcore-hub-deploy", "agentcore-hub-runtime-image-deploy", null, undefined, 7]) {
+      const out = validateCiProjectName(bad, opts);
+      expect(out.ok, String(bad)).toBe(false);
+      expect(typeof out.reason, String(bad)).toBe("string");
+      expect(out.reason.length, String(bad)).toBeGreaterThan(0);
+    }
   });
 });

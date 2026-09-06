@@ -119,7 +119,23 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
   };
 }
 
-async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id }) {
+// TEAM-4121 FR-9 — how the agent knows the work is done. "live" is the one the
+// orchestrator acts on (live-reverify.mjs): a fix that claimed live evidence and
+// closed without it is re-verified at the PR head. Anything else is dropped
+// rather than stored, so a downstream reader never has to guess what a novel
+// value meant.
+const EVIDENCE_KINDS = ["static", "unit", "live"];
+
+// TEAM-4122 FR-4 §7.5 — how the CI agent's completion record proves a head SHA
+// was actually built. "certified" requires a real CodeBuild build id proven
+// against the head (Pipeline___get_build_status / start_ci_build); it must
+// never be set from GitHub check-runs alone. Same drop-rather-than-store rule
+// as EVIDENCE_KINDS, for the same reason: a downstream reader (release manager,
+// orchestrator) must never have to guess what a novel value meant.
+const CI_STATUSES = ["certified", "github-actions-proxy", "unverified"];
+const CI_FIELD_MAX_LEN = 128;
+
+async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha }) {
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -130,6 +146,29 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     pr_url: pr_url || null,
     completed_at: new Date().toISOString(),
   };
+  // Additive and only when supplied: a record written without them keeps exactly
+  // the pre-4121 key set, so every existing consumer is unaffected.
+  const kind = typeof evidence_kind === "string" ? evidence_kind.trim().toLowerCase() : "";
+  if (kind) {
+    if (EVIDENCE_KINDS.includes(kind)) report.evidence_kind = kind;
+    else console.warn(`[report_completion] dropping unknown evidence_kind "${kind}" (expected ${EVIDENCE_KINDS.join("|")})`);
+  }
+  const keys = typeof evidence_keys === "string" ? evidence_keys.trim() : Array.isArray(evidence_keys) ? evidence_keys.join(",") : "";
+  if (keys) report.evidence_keys = keys;
+
+  // TEAM-4122 FR-4: same additive-only rule as the evidence pair above.
+  const status = typeof ci_status === "string" ? ci_status.trim().toLowerCase() : "";
+  if (status) {
+    if (CI_STATUSES.includes(status)) report.ci_status = status;
+    else console.warn(`[report_completion] dropping unknown ci_status "${status}" (expected ${CI_STATUSES.join("|")})`);
+  }
+  const buildId = typeof ci_build_id === "string" ? ci_build_id.trim() : "";
+  if (buildId && buildId.length <= CI_FIELD_MAX_LEN) report.ci_build_id = buildId;
+  else if (buildId) console.warn(`[report_completion] dropping oversized ci_build_id (${buildId.length} chars)`);
+  const headSha = typeof ci_head_sha === "string" ? ci_head_sha.trim() : "";
+  if (headSha && headSha.length <= CI_FIELD_MAX_LEN) report.ci_head_sha = headSha;
+  else if (headSha) console.warn(`[report_completion] dropping oversized ci_head_sha (${headSha.length} chars)`);
+
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,

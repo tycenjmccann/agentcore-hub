@@ -15,6 +15,9 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+// Pure (node:crypto only) — safe to import alongside the mocked AWS seams.
+import { deterministicEventId } from "./event-id.mjs";
+
 // Shared mutable state the mocked AWS seams write into. Hoisted so it survives
 // vi.resetModules() (which only cache-busts the module graph, not this object).
 const h = vi.hoisted(() => ({
@@ -140,6 +143,8 @@ beforeEach(() => {
   process.env.AGENT_INVOKE_BACKOFF_BASE_MS = "0";
   process.env.AGENT_INVOKE_BACKOFF_MAX_MS = "0";
   delete process.env.USE_RUNTIME;
+  // TEAM-4120: read at module load, so it must be clear before every loadHandler().
+  delete process.env.EVENT_DEDUPE_MODE;
 });
 
 describe("AC-D4.2(a) — transient 5xx fails twice then succeeds", () => {
@@ -270,6 +275,30 @@ describe("D4.3 liveness — publishAgentEvent dual-writes + threads ticketId", (
     expect(errPuts).toHaveLength(1);
     // Item.workflowId = workflowId || agentId.
     expect(errPuts[0].Item.workflowId).toBe("agentcore_hub_api_dev");
+  });
+
+  // TEAM-4120 FR-2 — the OTHER half of the same dual-write: the EventBridge copy
+  // is re-written to the SAME table by events-writer.mjs, so under
+  // EVENT_DEDUPE_MODE=enforce this direct row's eventId must be the content-
+  // derived id the events-writer will independently compute (asserted from the
+  // events-writer's side in events-writer.test.mjs). Default off keeps the
+  // random suffix, which the two cases above still cover.
+  it("EVENT_DEDUPE_MODE=enforce: the direct row's eventId is the deterministic content id", async () => {
+    process.env.EVENT_DEDUPE_MODE = "enforce";
+    h.state.invokeImpl = async () => { throw makeErr({ message: "Runtime returned 400", statusCode: 400 }); };
+
+    const handler = await loadHandler();
+    await handler({ ...HARNESS_EVENT });
+
+    const errPuts = h.state.puts.filter((p) => p.Item?.type === "agent.error");
+    expect(errPuts).toHaveLength(1);
+    const { eventId, detail } = errPuts[0].Item;
+    // `detail` IS the stamped detail publishAgentEvent hashed and published.
+    expect(eventId).toBe(deterministicEventId("agent.error", detail));
+    expect(eventId).toMatch(/^\d{13}-[0-9a-f]{8}$/);
+    // The EventBridge copy carries the identical detail, so events-writer.mjs
+    // derives the identical key from it.
+    expect(JSON.parse(errorEntries()[0].Detail)).toEqual(detail);
   });
 });
 

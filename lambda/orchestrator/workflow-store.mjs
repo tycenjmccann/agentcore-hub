@@ -20,6 +20,11 @@ import {
 // terminal" guard from the ONE list in completion.mjs. completion.mjs is pure
 // (no store import), so this cannot cycle.
 import { notTerminalPhaseGuard } from "./completion.mjs";
+// TEAM-4129 F2: markGateRejectedFromLegacy's CAS is the STORE-SIDE MIRROR of the
+// guard's own `legacyFallback` test (`!GATE_STATES.includes(state)`), so both are
+// derived from the one list instead of hand-spelled twice. gate-state.mjs is pure
+// (zero imports), so this cannot cycle either.
+import { GATE_STATES } from "./gate-state.mjs";
 
 let _ddb = null;
 let _table = null;
@@ -210,6 +215,147 @@ export async function setTaskStatus(workflowId, ticketId, status) {
   }));
 }
 
+// ─── Re-verify slot (TEAM-4130 F2) ────────────────────────────────────────────
+//
+// live-reverify.mjs used to dedupe its `Re-verify (QA): <fix> @ <sha7>` ticket
+// with an in-memory check plus a sibling scan, then call create_ticket. Neither
+// is a mutex: DynamoDB Streams are at-least-once, the Jira webhook and the
+// stream are twins, and the dedupe evidence (reverifyTicketId) is only written
+// AFTER the ticket exists. Two concurrent Dones for the same fix therefore both
+// scanned, both found nothing, and both filed a re-verify ticket — each of which
+// blocks the run's ship tickets and dispatches the QA verifier.
+//
+// So the (fixTicketId, sha7) slot is now CAS-claimed before create_ticket. The
+// claim writes reverifySha and clears any stale reverifyTicketId, so the pair
+// (reverifySha set, reverifyTicketId absent) means exactly "a claim is held and
+// its ticket has not landed yet" — a state every reader must treat as pending,
+// not as verified (index.mjs's `## Unverified Fixes` block renders it as such).
+
+/** The whole task entry, projected out of the row. Used only on a lost CAS. */
+async function readTaskEntry(workflowId, ticketId) {
+  const res = await _ddb.send(new GetCommand({
+    TableName: _table,
+    Key: { workflowId },
+    ConsistentRead: true,
+    // A ProjectionExpression does not reduce the RCU DynamoDB charges (it bills
+    // the whole item either way), so projecting the ONE entry buys transfer and
+    // parse cost only — which is still the right trade against reading a
+    // 14-task workflow row to answer a question about one task.
+    ProjectionExpression: "agentTasks.#tid",
+    ExpressionAttributeNames: { "#tid": ticketId },
+  }));
+  return res?.Item?.agentTasks?.[ticketId];
+}
+
+/**
+ * Claim the (fix ticket, head sha7) re-verify slot. Returns a TRI-state, because
+ * the caller's three actions are genuinely different:
+ *
+ *   "claimed"   — this caller owns the slot and must file the ticket;
+ *   "taken"     — someone else owns it (in flight, or already filed): never file;
+ *   "untracked" — there is no agentTasks entry to hold a claim on, so the CAS is
+ *                 unavailable and the caller falls back to its best-effort
+ *                 sibling scan. Fail-OPEN on purpose: a fix whose task entry was
+ *                 lost must still get re-verified.
+ *
+ * The `reverifySha <> :sha` arm is load-bearing DOCUMENTED behaviour, not
+ * laxness: re-Done'ing a fix at a NEW head is a genuinely different claim
+ * (TEAM-4121 FR-9) and gets a fresh ticket, so the slot is per-sha, not per-fix.
+ * The REMOVE in the same expression is what makes that safe — the previous head's
+ * reverifyTicketId cannot survive into the new claim and be read as this head's.
+ *
+ * Not `ReturnValuesOnConditionCheckFailure: "ALL_OLD"`: lambda/orchestrator/
+ * package.json does not declare @aws-sdk/lib-dynamodb at all (the orchestrator
+ * uses the Lambda runtime's bundled SDK, whose version we do not pin), so
+ * whether the failed-condition item comes back — and comes back unmarshalled
+ * through the DocumentClient — is not something this code can rely on. One
+ * projected read on the LOSING path only is the version-independent equivalent.
+ *
+ * `opts.staleAfterMs` (default 10 min) covers the one state the CAS alone cannot
+ * distinguish: a winner that claimed and then died before create_ticket would
+ * otherwise wedge the slot forever, and this fix's whole point is that the run's
+ * ship tickets wait on that ticket.
+ */
+export async function claimReverifySlot(workflowId, fixTicketId, sha7, nowIso, { staleAfterMs = 10 * 60 * 1000 } = {}) {
+  // ONE expression for both the fresh claim and the stale takeover: the state
+  // they leave behind must be identical, or a takeover would look different to
+  // every reader than the claim it replaced.
+  const claimWrite =
+    "SET agentTasks.#tid.reverifySha = :sha, agentTasks.#tid.reverifyClaimedAt = :now" +
+    " REMOVE agentTasks.#tid.reverifyTicketId";
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: claimWrite,
+      ConditionExpression:
+        "attribute_exists(agentTasks.#tid) AND (attribute_not_exists(agentTasks.#tid.reverifySha)" +
+        " OR agentTasks.#tid.reverifySha <> :sha)",
+      ExpressionAttributeNames: { "#tid": fixTicketId },
+      ExpressionAttributeValues: { ":sha": sha7, ":now": nowIso },
+    }));
+    return "claimed";
+  } catch (err) {
+    if (err?.name !== "ConditionalCheckFailedException") throw err;
+  }
+
+  // Lost the CAS. By the condition above that means either no entry at all, or
+  // this exact sha is already claimed — one read tells them apart.
+  const entry = await readTaskEntry(workflowId, fixTicketId);
+  if (!entry) return "untracked";
+  if (entry.reverifySha !== sha7) return "taken";   // raced onto a third sha
+  if (entry.reverifyTicketId) return "taken";       // the winner already filed
+
+  // Same sha, no ticket: an in-flight winner (leave it alone) or a dead one.
+  const claimedAt = Date.parse(entry.reverifyClaimedAt || "");
+  const nowMs = Date.parse(nowIso || "");
+  const ageMs = Number.isFinite(claimedAt) && Number.isFinite(nowMs) ? nowMs - claimedAt : NaN;
+  if (!(ageMs >= staleAfterMs)) return "taken";
+
+  // Stale takeover, itself a CAS on the exact generation we just read — so two
+  // sweepers racing to take over a dead claim still produce one winner.
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: claimWrite,
+      ConditionExpression:
+        "agentTasks.#tid.reverifySha = :sha AND attribute_not_exists(agentTasks.#tid.reverifyTicketId)" +
+        " AND agentTasks.#tid.reverifyClaimedAt = :oldClaimedAt",
+      ExpressionAttributeNames: { "#tid": fixTicketId },
+      ExpressionAttributeValues: { ":sha": sha7, ":now": nowIso, ":oldClaimedAt": entry.reverifyClaimedAt },
+    }));
+    return "claimed";
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return "taken";
+    throw err;
+  }
+}
+
+/**
+ * Give the (fix, sha7) slot back after a create_ticket that failed. Conditioned
+ * on still holding THIS sha with no ticket id, so it can never erase a claim
+ * someone else took over or a link the winner just wrote. Returns true when the
+ * slot was actually released; a lost CAS is normal, not an error.
+ */
+export async function releaseReverifySlot(workflowId, fixTicketId, sha7) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE agentTasks.#tid.reverifySha, agentTasks.#tid.reverifyClaimedAt",
+      ConditionExpression:
+        "agentTasks.#tid.reverifySha = :sha AND attribute_not_exists(agentTasks.#tid.reverifyTicketId)",
+      ExpressionAttributeNames: { "#tid": fixTicketId },
+      ExpressionAttributeValues: { ":sha": sha7 },
+    }));
+    return true;
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
 /**
  * Sweep idempotency for the dead-session detector (TEAM-3618 D1.2). Stamp
  * deadSessionDetectedAt on the task ONLY IF the entry still holds the exact
@@ -330,6 +476,41 @@ export async function incrementDeadSessionRetry(workflowId, ticketId) {
 }
 
 /**
+ * TEAM-4120 FR-3 — claim the ONE automatic children-synthesis a ticket ever
+ * gets. The children-only branch of the escalation tree blocks the held ticket
+ * on the tickets its dead agent spawned and hands back the retry budget; without
+ * a cap, a ticket that keeps dying is re-blocked on a fresh child set every
+ * sweep and never reaches a human (the same runaway the retry budget itself
+ * exists to prevent). Returns false when the synthesis was already spent.
+ *
+ * Two-step seed for the same reason ensureGateState/incrementDeadSessionRetry
+ * need one: DynamoDB rejects `SET a.b = …` when `a` is missing. The seed is
+ * unconditional (idempotent), the leaf write carries the CAS.
+ */
+export async function claimDeadSessionSynthesis(workflowId, ticketId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET deadSessionSynthesized = if_not_exists(deadSessionSynthesized, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET deadSessionSynthesized.#tid = :one",
+      ConditionExpression: "attribute_not_exists(deadSessionSynthesized.#tid)",
+      ExpressionAttributeNames: { "#tid": ticketId },
+      ExpressionAttributeValues: { ":one": 1 },
+    }));
+    return true;
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
  * Advance the workflow phase, optionally pinning the shared feature branch.
  * if_not_exists on the branch keeps the first winner under concurrent
  * same-phase claims; the monotonic phase check happened caller-side against a
@@ -386,6 +567,37 @@ export async function setRepoCheck(workflowId, repoCheck) {
     Key: { workflowId },
     UpdateExpression: "SET repoCheck = :rc",
     ExpressionAttributeValues: { ":rc": repoCheck },
+  }));
+}
+
+/**
+ * Persist the CI reachability pre-flight result (see ci-check.mjs). Scoped SET
+ * of one attribute — never touches the rest of the row. The stored record is
+ * booleans + strings only: F10 forbids the raw CodeBuild project (webhook.url,
+ * webhook.secret, env vars) from ever reaching this table.
+ */
+export async function setCiCheck(workflowId, ciCheck) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET ciCheck = :cc",
+    ExpressionAttributeValues: { ":cc": ciCheck },
+  }));
+}
+
+/**
+ * Persist the pre-CI default-branch sync result (see sync-main.mjs). Scoped SET
+ * of one attribute — never touches the rest of the row. The record is the
+ * idempotency key for the sync ({ at, sha, baseHeadSha, status, ciTicketId,
+ * fixTicketId }): a redelivered CI dispatch against the same default-branch head
+ * reads it and does nothing rather than pushing a second merge commit.
+ */
+export async function setSyncMain(workflowId, syncMain) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET syncMain = :sm",
+    ExpressionAttributeValues: { ":sm": syncMain },
   }));
 }
 
@@ -593,6 +805,229 @@ export async function appendReworkAuthorization(workflowId, lineageKey, authoriz
     ExpressionAttributeNames: { "#k": lineageKey },
     ExpressionAttributeValues: { ":empty": [], ":a": [authorization] },
   }));
+}
+
+/**
+ * Human review-gate state machine (TEAM-4120 FR-1).
+ *
+ * Row shape: `gateStates[gateTicketId] = { state, requestedAt, resolvedAt?,
+ * cycles: [{ requestedAt, resolvedAt, outcome }] }` where `cycles` holds only
+ * CLOSED cycles — the OPEN one is the top-level `requestedAt` plus
+ * `state: "requested"`, so "is a review pending right now" is one attribute
+ * read, not a list scan.
+ *
+ * Same two-write if_not_exists seed as ensureReviewGateLedger (DynamoDB rejects
+ * `SET a.b.c` when `a.b` is missing) with a `state: "none"` seed. "none" is
+ * deliberately NOT one of the real GATE_STATES: a seeded-but-never-requested
+ * gate must classify as "no usable state", not as a pending review.
+ */
+async function ensureGateState(workflowId, gateTicketId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET gateStates = if_not_exists(gateStates, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET gateStates.#g = if_not_exists(gateStates.#g, :seed)",
+    ExpressionAttributeNames: { "#g": gateTicketId },
+    ExpressionAttributeValues: { ":seed": { state: "none", cycles: [] } },
+  }));
+}
+
+/**
+ * Record that a gate has been PRESENTED to a human (parked for review).
+ *
+ * Returns false when the gate is ALREADY `requested` — the CAS
+ * (`state <> "requested"`) makes the re-park idempotent, so a cascade re-wake or
+ * a webhook redelivery cannot overwrite the original requestedAt and restart the
+ * human's clock. Returns true when this call opened the cycle. Any error other
+ * than the lost condition is rethrown: a caller must not read a failed write as
+ * "already requested".
+ */
+export async function markGateRequested(workflowId, gateTicketId, at) {
+  await ensureGateState(workflowId, gateTicketId);
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET gateStates.#g.#st = :req, gateStates.#g.requestedAt = :at",
+      ConditionExpression: "gateStates.#g.#st <> :req",
+      ExpressionAttributeNames: { "#g": gateTicketId, "#st": "state" },
+      ExpressionAttributeValues: { ":req": "requested", ":at": at },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * Close a gate's open cycle as REJECTED ("Request changes") and return the gate's
+ * post-write state row, or null when the CAS was lost.
+ *
+ * The condition is `state = "requested"`: exactly one caller can convert a
+ * pending review into a rejection, which is what makes the guard idempotent
+ * across the Jira-webhook and DDB-stream twins firing for the SAME transition
+ * (both see `in_review → blocked`; the loser gets null and stands down).
+ *
+ * A null return therefore means "somebody else already recorded this" OR "there
+ * was no pending review" — the caller distinguishes those by what it read before
+ * the write, and must never treat null as a reason to drop a rejection on a run
+ * that has no ledger yet (a pre-guard run seeds "none" and always loses).
+ */
+export async function markGateRejected(workflowId, gateTicketId, at, { requestedAt } = {}) {
+  await ensureGateState(workflowId, gateTicketId);
+  try {
+    const res = await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression:
+        "SET gateStates.#g.#st = :rej, gateStates.#g.resolvedAt = :at, " +
+        "gateStates.#g.cycles = list_append(if_not_exists(gateStates.#g.cycles, :empty), :cycle)",
+      ConditionExpression: "gateStates.#g.#st = :req",
+      ExpressionAttributeNames: { "#g": gateTicketId, "#st": "state" },
+      ExpressionAttributeValues: {
+        ":rej": "rejected",
+        ":req": "requested",
+        ":at": at,
+        ":empty": [],
+        // `?? null`, never undefined: the DocumentClient strips undefined values,
+        // which would drop the key and lose the cycle's duration.
+        ":cycle": [{ requestedAt: requestedAt ?? null, resolvedAt: at, outcome: "rejected" }],
+      },
+      ReturnValues: "ALL_NEW",
+    }));
+    return res.Attributes?.gateStates?.[gateTicketId] || null;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return null;
+    throw err;
+  }
+}
+
+/**
+ * "This gate has NO usable recorded state" as a ConditionExpression fragment —
+ * the store-side mirror of the guard's `!GATE_STATES.includes(gateState?.state)`.
+ * True for the `state: "none"` seed, for a row that somehow carries no `state` at
+ * all, and for any unrecognized value; false for requested / rejected / approved.
+ *
+ * Derived from GATE_STATES so adding a fourth real state cannot leave the two
+ * halves disagreeing — the direction that matters, since a state this fragment
+ * wrongly accepted would let a legacy converge overwrite a live cycle.
+ * Placeholders are positional (:gs0…), so tests assert the SEMANTICS (which
+ * states are refused) rather than the spelling.
+ */
+function noUsableGateStateGuard() {
+  const values = {};
+  const clauses = GATE_STATES.map((state, i) => {
+    values[`:gs${i}`] = state;
+    return `gateStates.#g.#st <> :gs${i}`;
+  });
+  return {
+    expression: `(attribute_not_exists(gateStates.#g.#st) OR (${clauses.join(" AND ")}))`,
+    values,
+  };
+}
+
+/**
+ * Converge a LEGACY gate row to `rejected` (TEAM-4129 F2).
+ *
+ * The problem: on a run that predates the ledger (no gateStates entry, or the
+ * `state: "none"` seed) the guard admits a `→ blocked` on the strength of the
+ * run's review_needed notification — correctly, that is the fail-open path. But
+ * markGateRejected's CAS is `state = "requested"`, which such a row can NEVER
+ * satisfy, and nothing else ever writes `requested`/`rejected` for it. So the
+ * ledger never converged, every redelivery re-classified as "presented", and
+ * enforce gave those runs ZERO duplicate protection: handleReviewRejection ran
+ * again and reopened the upstream work a second time.
+ *
+ * This CAS is the missing convergence: it accepts exactly the rows the guard
+ * calls legacy (see noUsableGateStateGuard) and closes them as rejected, so the
+ * NEXT delivery reads `rejected` and classifies "duplicate".
+ *
+ * Returns true when THIS call converged the row, false on a lost condition —
+ * which now carries real information: some other deliverer (the twin, or a
+ * redelivery racing us) moved the row off "no usable state" first, so the caller
+ * is the loser of a duplicate race. Anything other than the lost condition is
+ * rethrown, matching markGateRejected: a failed write must never be read as
+ * "already recorded".
+ *
+ * The cycle it appends carries `requestedAt: null` (a legacy row genuinely has no
+ * recorded request time — inventing `at` would fake a zero-length human wait) and
+ * `source: "legacy"`, so converged-from-legacy cycles stay distinguishable from
+ * the ones that ran a full requested → rejected round trip.
+ */
+export async function markGateRejectedFromLegacy(workflowId, gateTicketId, at) {
+  // Same two-write seed as every other gate setter: DynamoDB rejects
+  // `SET gateStates.#g.#st` when `gateStates.#g` is missing, so the absent-row
+  // case is handled by CREATING the row here rather than by an
+  // attribute_not_exists disjunct in the condition (which the seed makes
+  // unreachable, and which could not save the nested SET anyway).
+  await ensureGateState(workflowId, gateTicketId);
+  const guard = noUsableGateStateGuard();
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression:
+        "SET gateStates.#g.#st = :rej, gateStates.#g.resolvedAt = :at, " +
+        "gateStates.#g.cycles = list_append(if_not_exists(gateStates.#g.cycles, :empty), :cycle)",
+      ConditionExpression: guard.expression,
+      ExpressionAttributeNames: { "#g": gateTicketId, "#st": "state" },
+      ExpressionAttributeValues: {
+        ...guard.values,
+        ":rej": "rejected",
+        ":at": at,
+        ":empty": [],
+        ":cycle": [{ requestedAt: null, resolvedAt: at, outcome: "rejected", source: "legacy" }],
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * Close a gate's cycle as APPROVED (the human Done'd it) and return the
+ * post-write state row, or null when the CAS was lost.
+ *
+ * Accepts `requested` OR `rejected` as the prior state: TEAM-3974 pins that a
+ * human RE-deciding a gate is legitimate (Done after a Request-changes, a second
+ * approval), so an approval must be able to close a cycle the reject path
+ * already closed. `approved → approved` loses the CAS and is a no-op, which is
+ * what keeps the done-cascade's repeated acks from appending endless cycles.
+ */
+export async function markGateApproved(workflowId, gateTicketId, at, { requestedAt } = {}) {
+  await ensureGateState(workflowId, gateTicketId);
+  try {
+    const res = await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression:
+        "SET gateStates.#g.#st = :app, gateStates.#g.resolvedAt = :at, " +
+        "gateStates.#g.cycles = list_append(if_not_exists(gateStates.#g.cycles, :empty), :cycle)",
+      ConditionExpression: "gateStates.#g.#st IN (:req, :rej)",
+      ExpressionAttributeNames: { "#g": gateTicketId, "#st": "state" },
+      ExpressionAttributeValues: {
+        ":app": "approved",
+        ":req": "requested",
+        ":rej": "rejected",
+        ":at": at,
+        ":empty": [],
+        ":cycle": [{ requestedAt: requestedAt ?? null, resolvedAt: at, outcome: "approved" }],
+      },
+      ReturnValues: "ALL_NEW",
+    }));
+    return res.Attributes?.gateStates?.[gateTicketId] || null;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return null;
+    throw err;
+  }
 }
 
 /**

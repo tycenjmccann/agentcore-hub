@@ -46,6 +46,18 @@ phases:
       - "npm run lint"
       - "npx tsc --noEmit"
       - "npm run test:unit"
+      # cost-report / Jira ticket-tools / anomaly-watcher each ship a node:test
+      # suite standalone next to their code (not in the vitest include list), so
+      # `npm run test:unit` never runs them — mirrors .github/workflows/ci.yml's
+      # three matching steps (TEAM-4129 F3).
+      - "node --test lambda/cost-report"
+      - "node --test lambda/agentcore-hub-jira"
+      - "node --test lambda/anomaly-watcher"
+      # The fix-kind set is duplicated across seven places that cannot import each
+      # other (two ticket Lambdas, the orchestrator, types.ts, main.py,
+      # compute_metrics.py); a kind forgotten in one fails SILENTLY. Mirrors
+      # .github/workflows/ci.yml's "Fix-kinds parity guard" step (TEAM-4130 F3).
+      - "./scripts/check-fix-kinds-parity.sh"
       - "./scripts/check-workflow-writes.sh"
       # Every lambda/* and deploy/* surface must be in the Deploy stage's manifest
       # (or explicitly handoff/excluded) — otherwise it silently drifts behind main.

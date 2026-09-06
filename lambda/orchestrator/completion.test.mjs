@@ -11,6 +11,12 @@ import {
   completionRecordHasEvidence,
   evidenceBackfillFields,
   resolveMissingEvidenceFromRecords,
+  FIX_KINDS,
+  REWORK_FIX_KINDS,
+  isAdvisoryTicket,
+  advisoryNeverApplies,
+  nonAdvisory,
+  normalizeAdvisoryRoutingMode,
 } from "./completion.mjs";
 
 /**
@@ -119,6 +125,40 @@ describe("isWorkflowComplete — spawned-fix routing (AC-D4.3)", () => {
     const children = doneRun([{ ticketId: "L-1", assignee: "rm", status: "done" }]);
     expect(isWorkflowComplete(children, DEF, opts)).toBe(true);
   });
+
+  /**
+   * TEAM-4121 FR-8 — the two kind sets are PARITY MIRRORS of fix-contract.mjs
+   * (this file cannot import it: completion.mjs is loaded by the orchestrator
+   * bundle and by the tests, but the kinds must also be known to two ticket
+   * Lambdas that ship separately). check-fix-kinds-parity.sh guards the copies;
+   * this pins the semantics of the split.
+   */
+  it("FIX_KINDS gates completion for all six kinds; REWORK_FIX_KINDS escalates for only four", () => {
+    expect([...FIX_KINDS]).toEqual(["review_fix", "qa_fix", "codex_fix", "ship_fix", "ci_fix", "sync_fix"]);
+    expect([...REWORK_FIX_KINDS]).toEqual(["review_fix", "qa_fix", "codex_fix", "ship_fix"]);
+    // The difference is exactly the environmental pair — the kinds a run must
+    // wait for but must not be escalated to a human over.
+    expect([...FIX_KINDS].filter((k) => !REWORK_FIX_KINDS.has(k))).toEqual(["ci_fix", "sync_fix"]);
+  });
+
+  it("an open ci_fix holds the gate even though it never trips the rework cap", () => {
+    const open = doneRun([
+      { ticketId: "F-3", assignee: "dev", phase: "review", status: "todo", spawnedBy: { kind: "ci_fix", ciTicketId: "T-9" } },
+    ]);
+    expect(isWorkflowComplete(open, DEF, opts)).toBe(false);
+
+    const done = doneRun([
+      { ticketId: "F-3", assignee: "dev", phase: "review", status: "done", spawnedBy: { kind: "ci_fix", ciTicketId: "T-9" } },
+    ]);
+    expect(isWorkflowComplete(done, DEF, opts)).toBe(true);
+  });
+
+  it("an open sync_fix holds the gate too", () => {
+    const open = doneRun([
+      { ticketId: "F-4", assignee: "dev", phase: "ship", status: "in_progress", spawnedBy: { kind: "sync_fix", ciTicketId: "T-9" } },
+    ]);
+    expect(isWorkflowComplete(open, DEF, opts)).toBe(false);
+  });
 });
 
 describe("isWorkflowComplete — legacy heuristic (no completionRequiresAgentPhases)", () => {
@@ -149,6 +189,157 @@ describe("isWorkflowComplete — legacy heuristic (no completionRequiresAgentPha
 describe("isWorkflowComplete — guards", () => {
   it("returns false for an empty child list", () => {
     expect(isWorkflowComplete([], DEF, opts)).toBe(false);
+  });
+});
+
+/**
+ * TEAM-4122 FR-7 — ADVISORY_ROUTING. An advisory ticket is out-of-scope work the
+ * reviewers filed as backlog; the blueprints promise the run does not wait on it.
+ * Under enforce the completion decision stops seeing it at all; with the flag off
+ * (or absent, or garbage) every one of these fixtures behaves exactly as it did
+ * before FR-7 — which is what the paired "off" assertions pin.
+ */
+describe("isWorkflowComplete — advisory tickets (TEAM-4122 FR-7)", () => {
+  const ENFORCE = { ...opts, advisoryRouting: "enforce" };
+  const ADVISORY = { ticketId: "A-1", assignee: "dev", status: "in_progress", labels: ["advisory"] };
+
+  it("(a) an OPEN advisory ticket in a required phase does not block completion (config branch)", () => {
+    const children = doneRun([ADVISORY]);
+    expect(isWorkflowComplete(children, DEF, ENFORCE)).toBe(true);
+  });
+
+  it("(b) …and does not block the legacy every-child-done heuristic either", () => {
+    const children = [
+      { ticketId: "T-1", assignee: "agentcore_hub_backend_dev", status: "done" },
+      { ticketId: "A-1", assignee: "agentcore_hub_backend_dev", status: "in_progress", labels: ["advisory"] },
+    ];
+    expect(isWorkflowComplete(children, { completionRequiresAgentPhases: [] }, { advisoryRouting: "enforce" })).toBe(true);
+  });
+
+  it("(c) TEAM-4131 F2 — an advisory-labelled FIX ticket still holds the open-fix gate: the FIX STAMP WINS", () => {
+    // REVERSED by TEAM-4131 F2. This used to assert "the label wins over the
+    // (contradictory) fix stamp", which made the label a completion BYPASS: a QA
+    // agent (or a prompt-injected one) filing a real qa_fix with
+    // labels: ["advisory"] let the run finalize with the fix wide open, and the
+    // whole point of a fix ticket is that the run waits for it.
+    //
+    // The direction that is safe to be wrong in is the other one: a genuinely
+    // out-of-scope ticket that is mislabelled as a fix merely delays a run, and a
+    // human sees it. A real fix that is silently dropped ships the bug.
+    const children = doneRun([
+      { ticketId: "A-2", assignee: "dev", status: "todo", labels: ["advisory"], spawnedBy: { kind: "review_fix" } },
+    ]);
+    expect(FIX_KINDS.has("review_fix")).toBe(true);
+    expect(isWorkflowComplete(children, DEF, ENFORCE)).toBe(false);
+    // …and it is not merely "some open ticket blocks": closing the fix completes.
+    const closed = doneRun([
+      { ticketId: "A-2", assignee: "dev", status: "done", labels: ["advisory"], spawnedBy: { kind: "review_fix" } },
+    ]);
+    expect(isWorkflowComplete(closed, DEF, ENFORCE)).toBe(true);
+  });
+
+  it("(c2) every fix kind is covered, and a HUMAN GATE labelled advisory is still waited on", () => {
+    for (const kind of FIX_KINDS) {
+      const children = doneRun([
+        { ticketId: "A-2", assignee: "dev", status: "todo", labels: ["advisory"], spawnedBy: { kind } },
+      ]);
+      expect(isWorkflowComplete(children, DEF, ENFORCE), kind).toBe(false);
+    }
+    // A human gate's entire function is to be waited on, so the label can never
+    // excuse it either — an un-approved blocking Merge Approval labelled advisory
+    // would otherwise auto-approve itself out of the gate check.
+    const openGate = [
+      { ticketId: "T-1", assignee: "dev", status: "done" },
+      { ticketId: "T-2", assignee: "qa", status: "done" },
+      { ticketId: "T-3", assignee: "ci", status: "done" },
+      { ticketId: "T-4", assignee: "rm", status: "done" },
+      { ticketId: "G-1", assignee: "human:reviewer", phase: "ship", status: "in_progress", labels: ["advisory"] },
+    ];
+    expect(isWorkflowComplete(openGate, DEF, ENFORCE)).toBe(false);
+  });
+
+  it("(c3) a PLAIN advisory backlog ticket is still excluded — the fix is narrow, not a rollback of FR-7", () => {
+    // The regression this guards: hardening the filter by simply ignoring the
+    // label would have re-wedged every legitimately-advisory backlog ticket.
+    expect(isWorkflowComplete(doneRun([ADVISORY]), DEF, ENFORCE)).toBe(true);
+    expect(isWorkflowComplete(doneRun([
+      { ticketId: "A-3", assignee: "dev", status: "todo", labels: ["advisory"], spawnedBy: null },
+    ]), DEF, ENFORCE)).toBe(true);
+    // An unknown/misspelled kind is not a fix kind, so it is still advisory.
+    expect(isWorkflowComplete(doneRun([
+      { ticketId: "A-4", assignee: "dev", status: "todo", labels: ["advisory"], spawnedBy: { kind: "qa_fixx" } },
+    ]), DEF, ENFORCE)).toBe(true);
+  });
+
+  it("(d) with routing off — or garbage, or absent — the very same fixtures BLOCK (legacy behaviour)", () => {
+    const openAdvisory = doneRun([ADVISORY]);
+    const advisoryFix = doneRun([
+      { ticketId: "A-2", assignee: "dev", status: "todo", labels: ["advisory"], spawnedBy: { kind: "review_fix" } },
+    ]);
+    const legacyChildren = [
+      { ticketId: "T-1", assignee: "agentcore_hub_backend_dev", status: "done" },
+      { ticketId: "A-1", assignee: "agentcore_hub_backend_dev", status: "in_progress", labels: ["advisory"] },
+    ];
+    for (const mode of [undefined, "off", "shadow", "ENFORCE_", "1"]) {
+      expect(isWorkflowComplete(openAdvisory, DEF, { ...opts, advisoryRouting: mode })).toBe(false);
+      expect(isWorkflowComplete(advisoryFix, DEF, { ...opts, advisoryRouting: mode })).toBe(false);
+      expect(
+        isWorkflowComplete(legacyChildren, { completionRequiresAgentPhases: [] }, { advisoryRouting: mode })
+      ).toBe(false);
+    }
+    // …and the flag cannot make a genuinely unfinished run complete: a NON-advisory
+    // open ticket still blocks under enforce.
+    expect(
+      isWorkflowComplete(doneRun([{ ticketId: "T-9", assignee: "dev", status: "in_progress" }]), DEF, ENFORCE)
+    ).toBe(false);
+  });
+
+  it("(e) isAdvisoryTicket: the exact label word, any case/whitespace — nothing else", () => {
+    expect(isAdvisoryTicket({ labels: ["Advisory"] })).toBe(true);
+    expect(isAdvisoryTicket({ labels: [" advisory "] })).toBe(true);
+    expect(isAdvisoryTicket({ labels: ["human-review", "ADVISORY"] })).toBe(true);
+    expect(isAdvisoryTicket({ labels: ["advisory-ish"] })).toBe(false);
+    expect(isAdvisoryTicket({ labels: ["ci:uncertifiable"] })).toBe(false);
+    expect(isAdvisoryTicket({ labels: [] })).toBe(false);
+    expect(isAdvisoryTicket({ labels: "advisory" })).toBe(false); // a string is not a label list
+    expect(isAdvisoryTicket({})).toBe(false);
+    expect(isAdvisoryTicket(null)).toBe(false);
+    expect(isAdvisoryTicket(undefined)).toBe(false);
+  });
+
+  it("(f) TEAM-4131 F2 — advisoryNeverApplies / isAdvisoryTicket on the reserved shapes", () => {
+    for (const kind of FIX_KINDS) {
+      expect(advisoryNeverApplies({ spawnedBy: { kind } }), kind).toBe(true);
+      expect(isAdvisoryTicket({ labels: ["advisory"], spawnedBy: { kind } }), kind).toBe(false);
+    }
+    expect(advisoryNeverApplies({ assignee: "human:reviewer" })).toBe(true);
+    expect(isAdvisoryTicket({ labels: ["ADVISORY"], assignee: "human:approver" })).toBe(false);
+    // …and nothing else is reserved: an ordinary ticket is unaffected.
+    expect(advisoryNeverApplies({ assignee: "dev" })).toBe(false);
+    expect(advisoryNeverApplies({ spawnedBy: { kind: "review_fixx" } })).toBe(false);
+    expect(advisoryNeverApplies({ spawnedBy: "review_fix" })).toBe(false); // not an object
+    expect(advisoryNeverApplies({})).toBe(false);
+    expect(advisoryNeverApplies(null)).toBe(false);
+    expect(isAdvisoryTicket({ labels: ["advisory"], assignee: "dev" })).toBe(true);
+  });
+
+  it("nonAdvisory filters advisory children and leaves a non-array alone", () => {
+    const children = [{ ticketId: "T-1" }, { ticketId: "A-1", labels: ["advisory"] }];
+    expect(nonAdvisory(children).map((t) => t.ticketId)).toEqual(["T-1"]);
+    expect(nonAdvisory(undefined)).toBeUndefined();
+    // A labelled fix ticket survives the filter — this is the function index.mjs
+    // uses for the gate children and the advisory dev-branch routing, so the
+    // hardening lands on all three call sites at once.
+    const withFix = [{ ticketId: "F-1", labels: ["advisory"], spawnedBy: { kind: "qa_fix" } }];
+    expect(nonAdvisory(withFix).map((t) => t.ticketId)).toEqual(["F-1"]);
+  });
+
+  it("normalizeAdvisoryRoutingMode: only an explicit enforce enables it, garbage is off", () => {
+    expect(normalizeAdvisoryRoutingMode("enforce")).toBe("enforce");
+    expect(normalizeAdvisoryRoutingMode(" ENFORCE ")).toBe("enforce");
+    for (const v of [undefined, null, "", "off", "shadow", "enfroce", "true", "1", 0, {}]) {
+      expect(normalizeAdvisoryRoutingMode(v)).toBe("off");
+    }
   });
 });
 

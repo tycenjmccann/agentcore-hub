@@ -97,9 +97,12 @@ aws iam put-role-policy --role-name agentcore-hub-lambda-role \
 echo "✓ IAM: WorkflowManagerAccess policy on agentcore-hub-lambda-role"
 
 # ─── Toolkit sync (updates take effect on the next harness session) ──────────
+# fixtures/ is test-only (real reduced dossiers the unit tests assert against) —
+# it is hundreds of KB the harness never reads. Keep this exclude list identical
+# to the toolkit s3 surface in deploy/pipeline/surfaces.json.
 aws s3 sync "${REPO_ROOT}/deploy/workflow-manager/toolkit/" \
   "s3://${BUCKET}/workflow-manager/toolkit/" \
-  --exclude "test_*.py" --exclude "*.pyc" --delete --quiet
+  --exclude "test_*.py" --exclude "fixtures/*" --exclude "*.pyc" --delete --quiet
 echo "✓ Toolkit: s3://${BUCKET}/workflow-manager/toolkit/"
 
 # ─── Skills sync (harness skills[] resolves these S3 URIs on demand) ─────────

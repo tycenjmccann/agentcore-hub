@@ -24,6 +24,7 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, UpdateCommand, GetCommand, QueryCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
+import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -36,6 +37,13 @@ const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows"
 // as the orchestrator's EVENTS_TABLE so both halves land in one place.
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
+// Events-table double-write collapse (TEAM-4120 FR-2): off (default,
+// byte-identical) | enforce. Same flag, same strict allow-list, as the
+// orchestrator and events-writer — all three must agree for the EventBridge
+// copy to overwrite the direct copy rather than double it. Instant rollback =
+// set off. agent.streaming keeps random ids (RANDOM_ID_TYPES in event-id.mjs):
+// its chunks share a content key and collapsing them would drop heartbeats.
+const EVENT_DEDUPE_MODE = normalizeEventDedupeMode(process.env.EVENT_DEDUPE_MODE);
 
 // ─── Bounded transient-failure retry (FR-D4.2) ──────────────────────────────
 // A transient Bedrock/AgentCore fault (5xx / ServiceUnavailable / Throttling /
@@ -752,7 +760,7 @@ async function publishAgentEvent(workflowId, agentId, detailType, detail) {
       TableName: EVENTS_TABLE,
       Item: {
         workflowId: workflowId || agentId,
-        eventId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        eventId: eventIdFor(EVENT_DEDUPE_MODE, detailType, stamped, () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`),
         type: detailType,
         detail: stamped,
         timestamp,

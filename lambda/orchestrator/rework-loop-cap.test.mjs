@@ -88,6 +88,26 @@ describe("isReworkFix", () => {
   it("honors a custom fixKinds set", () => {
     expect(isReworkFix({ spawnedBy: { kind: "qa_fix" } }, new Set(["review_fix"]))).toBe(false);
   });
+
+  // TEAM-4121 FR-8 — the six-kind roster reaches this default set as FOUR: the
+  // two environmental kinds are excluded on purpose (below).
+  it("false for a re-verification or a re-arm (the same finding, not a new round)", () => {
+    expect(isReworkFix({ spawnedBy: { kind: "qa_fix", reverify: true } })).toBe(false);
+    expect(isReworkFix({ spawnedBy: { kind: "qa_fix", rearmOf: "TEAM-9" } })).toBe(false);
+  });
+
+  it("false for the environmental kinds ci_fix / sync_fix", () => {
+    // These are filed by the CI agent off a red build or an unmergeable branch,
+    // not off a human's rejection of the work. They still gate completion (see
+    // completion.mjs FIX_KINDS), but counting them here would escalate a run to a
+    // human for what is a flaky pipeline or a moved base branch.
+    expect(isReworkFix({ spawnedBy: { kind: "ci_fix", ciTicketId: "TEAM-70" } })).toBe(false);
+    expect(isReworkFix({ spawnedBy: { kind: "sync_fix", ciTicketId: "TEAM-70" } })).toBe(false);
+  });
+
+  it("true for ship_fix (a human reviewer's rejection of the final diff)", () => {
+    expect(isReworkFix({ spawnedBy: { kind: "ship_fix", shipTicketId: "TEAM-50" } })).toBe(true);
+  });
 });
 
 describe("effectiveReworkRounds", () => {

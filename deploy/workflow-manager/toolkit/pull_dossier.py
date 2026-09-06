@@ -35,6 +35,14 @@ from decimal import Decimal
 import boto3
 from boto3.dynamodb.conditions import Key
 
+# Sibling module in this same toolkit dir. Running as a script already puts that
+# dir on sys.path; the explicit insert keeps the import working if this module is
+# ever imported by name instead. content_key is the SAME key dedupe_events uses,
+# so the collection-time collapse below and compute_metrics' read-time collapse
+# can never drift apart.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from events import content_key  # noqa: E402
+
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 ARTIFACT_BUCKET = os.environ["ARTIFACT_BUCKET"]
 WORKFLOWS_TABLE = os.environ.get("WORKFLOWS_TABLE", "agentcore-hub-workflows")
@@ -187,6 +195,16 @@ def get_events(workflow_id, epic_id, ticket_ids):
     # and how long it has been silent.
     stream_text = {}
     last_stream_ts = {}
+    # Every event is in this table TWICE — the publisher's direct PutItem plus the
+    # EventBridge fan-out copy written by events-writer.mjs, under a different
+    # eventId and sometimes a different workflowId PK, so the old
+    # (workflowId, eventId) dedupe could not see the two as one. Collapse on
+    # CONTENT before anything counts a row: otherwise every stream count doubles,
+    # every human review is counted twice and every task looks reworked. Done as
+    # we page rather than over a buffered list, so a run with tens of thousands of
+    # streaming chunks costs a set of keys, not a second copy of every row.
+    # See events.py.
+    seen = set()
     pks = [workflow_id] + ([epic_id] if epic_id else []) + list(ticket_ids)
     for pk in dict.fromkeys(pks):
         kwargs = {"KeyConditionExpression": Key("workflowId").eq(pk)}
@@ -194,6 +212,15 @@ def get_events(workflow_id, epic_id, ticket_ids):
             page = table.query(**kwargs)
             for item in page.get("Items", []):
                 etype = item.get("type", "")
+                if etype != "agent.streaming" and not etype.startswith(SIGNIFICANT_PREFIXES):
+                    continue
+                # undecimal before the key: content_key stringifies detail on the
+                # no-ticketId branch and must never meet a Decimal.
+                item = undecimal(item)
+                key = content_key(item)
+                if key in seen:
+                    continue
+                seen.add(key)
                 if etype == "agent.streaming":
                     detail = item.get("detail", {}) or {}
                     agent = detail.get("agentId", "unknown")
@@ -212,13 +239,11 @@ def get_events(workflow_id, epic_id, ticket_ids):
                     continue
                 if etype == "agent.started" and not (item.get("detail") or {}).get("workflowId"):
                     item["_pkNote"] = "ticket-keyed"
-                if etype.startswith(SIGNIFICANT_PREFIXES):
-                    events.append(undecimal(item))
+                events.append(item)
             if "LastEvaluatedKey" not in page:
                 break
             kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
-    dedup = {(e.get("workflowId"), e.get("eventId")): e for e in events}
-    events = sorted(dedup.values(), key=lambda e: (e.get("timestamp", ""), e.get("eventId", "")))
+    events = sorted(events, key=lambda e: (e.get("timestamp", ""), e.get("eventId", "")))
     # Fold the tail + silence timestamp into the per-agent stream summary so the
     # dossier carries "what the agent last said" next to "how much it streamed".
     for agent, counts in stream_counts.items():

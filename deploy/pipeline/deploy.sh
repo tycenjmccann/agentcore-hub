@@ -13,6 +13,11 @@
 #     (default agentcore-hub), PIPELINE_BRANCH (default main),
 #     PIPELINE_CONNECTION_ARN (reuse an existing CodeConnections link),
 #     PIPELINE_APPROVAL_EMAILS, PIPELINE_APPROVAL_SNS_ARN, ECS_SERVICE_ARN.
+#   - PIPELINE_CI_WEBHOOK=1 (off by default) turns on the CodeBuild PR-check
+#     webhook here; requires the GitHub App to have webhook permission.
+#     PIPELINE_CI_START_BUILD=1 (off by default, the fallback when the webhook
+#     can't be installed) is a separate flag read by
+#     deploy/setup-pipeline-tools-lambda.mjs, not by this stack.
 #
 # Usage:
 #   PIPELINE_GITHUB_OWNER=tycenjmccann ./deploy/pipeline/deploy.sh

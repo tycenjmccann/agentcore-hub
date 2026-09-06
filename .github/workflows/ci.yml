@@ -47,11 +47,26 @@ jobs:
       - name: Jira ticket-tools lambda unit tests (node --test)
         run: node --test lambda/agentcore-hub-jira
 
+      # The anomaly-watcher Lambda has a node:test suite (TEAM-4120 FR-2 cursor
+      # ordering — a base36 events-writer id sorting against a decimal cursor —
+      # plus dropStaleItems). Same rationale as cost-report/Jira above:
+      # standalone `node --test`, not in the vitest include list.
+      - name: Anomaly-watcher lambda unit tests (node --test)
+        run: node --test lambda/anomaly-watcher
+
       # R2 (docs/race-condition-study.md): the workflows table may only be
       # written through lambda/orchestrator/workflow-store.mjs — ad-hoc writes
       # are the read-modify-write clobber class behind most workflow races.
       - name: Workflow-table write guard
         run: ./scripts/check-workflow-writes.sh
+
+      # TEAM-4121 FR-8: the fix-kind set is duplicated across two ticket Lambdas,
+      # the orchestrator, types.ts and main.py (none can import the others). A
+      # kind forgotten in one place fails silently — the completion gate stops
+      # waiting on that fix, or the harness drops its origin id. Also byte-compares
+      # the three fix-contract.mjs copies.
+      - name: Fix-kinds parity guard
+        run: ./scripts/check-fix-kinds-parity.sh
 
       # Every lambda/* and deploy/* surface must be in the pipeline's deploy
       # manifest (deploy/pipeline/surfaces.json) — or explicitly handoff/excluded —
@@ -96,6 +111,11 @@ jobs:
       # sys.modules before importing save_analysis. This finally executes
       # test_metrics.py — which had no CI job at all — and the new
       # test_save_analysis.py (AC-D2.5 RunOutcome mapping).
+      # TEAM-4120: test_events.py (the content dedupe) and test_metrics's real
+      # dossier fixtures are hermetic for the same reason — events.py is stdlib
+      # only, and the fixtures are files in toolkit/fixtures/. test_pull_dossier
+      # stubs boto3 in sys.modules like test_save_analysis does and feeds
+      # get_events canned DynamoDB pages.
       - name: Python unit tests (hermetic — no AWS)
         run: >
           pytest -q

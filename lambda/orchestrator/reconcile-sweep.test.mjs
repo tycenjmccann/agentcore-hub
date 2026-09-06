@@ -82,6 +82,9 @@ function makeCascade(overrides = {}) {
     reawakenGate,
     ...(overrides.store ? { store: overrides.store } : {}),
     ...(overrides.blockTicket ? { blockTicket: overrides.blockTicket } : {}),
+    // TEAM-4120 FR-3: unwired by default, exactly as production is with
+    // DEAD_SESSION_ESCALATION_MODE off, so every existing case is unchanged.
+    ...(overrides.escalate ? { escalate: overrides.escalate } : {}),
   });
   return { cascade, publishEvent, lease, redispatch, reawakenGate };
 }
@@ -618,6 +621,35 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
     expect(notif.type).toBe("manager_escalation");
     expect(notif.ticketId).toBe("TEAM-2");
     expect(notif.acknowledged).toBe(false);
+  });
+
+  it("TEAM-4120 FR-3: hands the page to the escalation tree when wired, steps 1-3 intact", async () => {
+    const store = makeStore();
+    const blockTicket = vi.fn(async () => {});
+    const escalate = vi.fn(async () => ({ disposition: "synthesized_children" }));
+    const s = makeSweep({
+      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
+      siblings: inProgressStale, store, blockTicket, escalate,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.escalated).toBe(1);
+    expect(eventsOfType(s.publishEvent, "agent.escalated")).toHaveLength(1);
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+    expect(blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    expect(escalate).toHaveBeenCalledTimes(1);
+    // The source distinguishes this emitter from the detector twin on the page.
+    expect(escalate.mock.calls[0][0]).toMatchObject({
+      ticketId: "TEAM-2",
+      agentId: "dev",
+      claim: { source: "reconcile-sweep", startedAt: STALE_STARTED, lastHeartbeatAt: null },
+    });
+    expect(escalate.mock.calls[0][0].workflow.id).toBe("wf_1");
+    // The tree owns the page now — appending here too would double-page.
+    expect(store.appendNotification).not.toHaveBeenCalled();
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    expect(s.redispatch).not.toHaveBeenCalled();
   });
 
   it("second death in shadow mode: observe only, zero writes", async () => {

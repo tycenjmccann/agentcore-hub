@@ -53,11 +53,64 @@ export interface JiraTicket {
    * lambda-side, see agentcore-hub-tickets sanitizeSpawnedBy).
    */
   spawnedBy?: {
-    kind: "review_fix" | "qa_fix" | "codex_fix";
+    /**
+     * TEAM-4121 FR-8 — PARITY MIRROR of FIX_KINDS. The same six kinds must appear
+     * in lambda/orchestrator/fix-contract.mjs (and its byte-identical copies in
+     * both ticket Lambdas), lambda/orchestrator/completion.mjs, and the origin map
+     * in deploy/runtime-agent/main.py. scripts/check-fix-kinds-parity.sh fails CI
+     * on any divergence. "ship_fix" is filed by the release manager against its
+     * own ship-review ticket; "ci_fix"/"sync_fix" by the CI agent (both keyed on
+     * ciTicketId) and are ENVIRONMENTAL — they gate completion but never count as
+     * a rework round (see REWORK_FIX_KINDS).
+     */
+    kind: "review_fix" | "qa_fix" | "codex_fix" | "ship_fix" | "ci_fix" | "sync_fix";
     gateTicketId?: string;
     qaTicketId?: string;
     codexTicketId?: string;
+    shipTicketId?: string;
+    ciTicketId?: string;
+    /** TEAM-4121 FR-8: this fix is a RE-verification of an already-counted fix, */
+    reverify?: boolean;
+    /** …and this is the fix ticket id it re-arms. Together they exempt it from the rework-loop cap. */
+    rearmOf?: string;
+    /** The commit the finding was observed at, when the producer knows it. */
+    headSha?: string;
+    /**
+     * TEAM-4131 F1: the earlier fix ticket this one supersedes because it was
+     * CLOSED without resolving the finding, and which attempt this is (1-based).
+     * Used by sync-main's conflict rounds; `round` is capped by the filer.
+     */
+    priorFixTicketId?: string;
+    round?: number;
   };
+  /**
+   * TEAM-4121 FR-8: the fix contract — what must hold after the fix, and the
+   * evidence the filer actually has. Present only on fix tickets, and only when
+   * the ticket Lambda ran with FIX_TICKET_CONTRACT != off. In Jira mode it is
+   * reconstructed from the `origin:`/`evidence:`/`contract:incomplete` labels plus
+   * the `# fix-contract v1` block in the description (mapJiraIssueToTicket).
+   */
+  fixContract?: FixContract;
+  /** Free-form labels the filer supplied, after system-prefix sanitization. */
+  labels?: string[];
+}
+
+/**
+ * TEAM-4121 FR-8 — the validated fix contract as persisted by the ticket Lambdas.
+ * Every field but `version` is optional because FIX_TICKET_CONTRACT=shadow accepts
+ * an incomplete contract and records what is missing in `warnings`; under
+ * `enforce` a stored contract always has invariant + evidenceSource (+ evidenceRepro
+ * for unit|live) and no warnings. Shape mirrors validateFixContract's return in
+ * lambda/orchestrator/fix-contract.mjs.
+ */
+export interface FixContract {
+  version: number;
+  invariant?: string;
+  evidenceSource?: "static" | "unit" | "live";
+  evidenceRepro?: string | null;
+  citedLocation?: string[];
+  siblingScope?: string | null;
+  warnings?: string[];
 }
 
 export interface JiraComment {
@@ -143,6 +196,22 @@ export interface AgentTask {
   startedAt?: string;
   completedAt?: string;
   error?: string;
+
+  // Live-evidence re-verification (TEAM-4121 FR-9), written by the orchestrator
+  // on a fix ticket's Done. `verification: "unverified"` means the fix declared
+  // evidence_source=live and closed with no live artifact.
+  //
+  // reverifySha/reverifyTicketId are a SLOT, CAS-claimed per (fix, head sha7)
+  // before the ticket is filed (TEAM-4130 F2), so the three states are:
+  //   neither set                     — nothing scheduled;
+  //   reverifySha only                — a claim is held, the ticket is being
+  //                                     filed. NOT "verified", NOT "none": any
+  //                                     reader must render it as pending;
+  //   both set                        — the re-verify ticket exists.
+  verification?: "unverified";
+  reverifySha?: string;
+  reverifyTicketId?: string;
+  reverifyClaimedAt?: string;
 }
 
 export interface StoredEvent {

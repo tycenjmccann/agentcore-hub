@@ -12,6 +12,7 @@
  *   - transition_issue: Move issue to new status
  *   - get_transitions: Get available transitions for an issue
  *   - add_comment: Add a comment to an issue
+ *   - labels_add: Additively append labels to an issue (idempotent)
  *   - list_projects: List projects (returns our single project)
  *   - get_project_issue_types: Get issue types for a project
  *   - lookup_user: Look up agents by name
@@ -32,6 +33,15 @@ import {
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+// TEAM-4121 FR-8: the shared fix-ticket contract. Duplicated byte-for-byte into
+// the jira Lambda + orchestrator (each ships as a self-contained zip, so they
+// cannot share a file); CI byte-compares the copies. Edit one, `cp` the others.
+import {
+  sanitizeSpawnedBy,
+  validateFixContract,
+  normalizeContractMode,
+  sanitizeUserLabels,
+} from "./fix-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TABLE_NAME = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -224,6 +234,8 @@ export const handler = async (event) => {
         return await getTransitions(args);
       case "add_comment":
         return await addComment(args);
+      case "labels_add":
+        return await addLabels(args);
       case "list_projects":
         return await listProjects();
       case "get_project_issue_types":
@@ -234,7 +246,7 @@ export const handler = async (event) => {
         // Return an `error` field so callers (e.g. workflow-output) can tell a
         // no-op from a real result. Without this, an unrecognized tool name
         // looked like success and silently stalled the pipeline.
-        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, list_projects, get_project_issue_types, lookup_user`;
+        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, labels_add, list_projects, get_project_issue_types, lookup_user`;
         return { error: message, content: [{ text: message }] };
       }
     }
@@ -247,37 +259,18 @@ export const handler = async (event) => {
 // ─── Tool Implementations ──────────────────────────────────────────────────
 
 // TEAM-3619 D4c: the fix-ticket kinds the completion re-verify (completion.mjs
-// condition iii) recognizes, and the origin-id keys each may carry. A fix ticket
-// created by the QA verifier / code reviewer stamps this so an in-flight fix
-// keeps the run from being declared complete. Kept in lockstep with
-// completion.mjs's FIX_KINDS and index.mjs:816's review_fix shape.
-const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
-const SPAWN_ORIGIN_KEYS = ["gateTicketId", "qaTicketId", "codexTicketId"];
+// condition iii) recognizes, the origin-id keys each may carry, and the
+// spawned_by sanitizer all moved to fix-contract.mjs (TEAM-4121 FR-8) so the
+// jira Lambda and the orchestrator validate against the SAME definitions
+// instead of three drifting copies.
 
-/**
- * Normalize an agent-supplied `spawned_by` marker. Returns { value } for a clean
- * marker, { error } for a malformed one (unknown kind / not an object), or {}
- * when absent (backward-compatible — no field written). Only the known `kind`
- * and origin-id keys survive; arbitrary extra keys are dropped so agents can't
- * write junk onto the ticket record.
- */
-function sanitizeSpawnedBy(raw) {
-  if (raw === undefined || raw === null) return {};
-  if (typeof raw !== "object" || Array.isArray(raw)) {
-    return { error: "'spawned_by' must be an object like { kind: 'qa_fix', qaTicketId: 'TEAM-42' }" };
-  }
-  if (!FIX_KINDS.has(raw.kind)) {
-    return { error: `'spawned_by.kind' must be one of: ${[...FIX_KINDS].join(", ")}` };
-  }
-  const value = { kind: raw.kind };
-  for (const k of SPAWN_ORIGIN_KEYS) {
-    if (typeof raw[k] === "string" && raw[k]) value[k] = raw[k];
-  }
-  return { value };
-}
+// TEAM-4121 FR-8: off = fix-contract fields are ignored (byte-identical to
+// pre-feature behavior); shadow = validate + accept + warn; enforce = reject an
+// incomplete contract. Read once at module load — a mode change is a deploy.
+const FIX_TICKET_CONTRACT = normalizeContractMode(process.env.FIX_TICKET_CONTRACT);
 
 async function createTicket(args) {
-  const { summary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase } = args;
+  const { summary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase, fix_contract, labels } = args;
   if (!summary) return textResult("Error: 'summary' is required");
 
   // TEAM-3619 D4c: optional fix-ticket provenance. Validate before minting so a
@@ -302,6 +295,47 @@ async function createTicket(args) {
       );
     }
   }
+
+  // TEAM-4121 FR-8: the fix contract. Evaluated only for fix tickets (a plain
+  // ticket is never subject to it) and only when the flag is on, so mode=off is
+  // byte-identical to before: nothing validated, nothing stored, the
+  // fix_contract arg ignored entirely.
+  let contract = null;          // what gets persisted as item.fixContract
+  let contractWarning = null;   // shadow-mode advisory returned to the caller
+  if (spawn.value && FIX_TICKET_CONTRACT !== "off") {
+    const fc = validateFixContract({ spawnedBy: spawn.value, ...(fix_contract || {}) });
+    const detail = [
+      fc.missing.length ? `missing: ${fc.missing.join(", ")}` : null,
+      fc.invalid.length ? `invalid: ${fc.invalid.join(", ")}` : null,
+    ].filter(Boolean).join("; ");
+    if (!fc.ok && FIX_TICKET_CONTRACT === "enforce") {
+      // Mint NOTHING — the ticket id counter is not even touched. An agent that
+      // gets this back has everything it needs to retry correctly, which is the
+      // whole point of rejecting instead of filing an unactionable fix.
+      const firstProblem = fc.missing[0] || fc.invalid[0];
+      return textResult(`Error: '${firstProblem}' is required on a fix ticket (${detail})`);
+    }
+    if (!fc.ok) {
+      // shadow — accept, but persist the warnings alongside whatever parsed so
+      // the incomplete fix tickets are findable before enforce is switched on.
+      const warnings = [...fc.missing, ...fc.invalid];
+      contract = fc.contract ? { ...fc.contract, warnings } : { version: 1, warnings };
+      contractWarning = `WARNING: fix contract incomplete (${detail})`;
+      console.warn(`[agentcore-hub-tickets] fix contract incomplete (shadow, accepting): ${detail}`);
+    } else {
+      contract = fc.contract;
+    }
+  }
+
+  // Caller-supplied labels are sanitized independently of the contract flag —
+  // dropping a label that squats a system namespace (fix:/wf:/agent:/…) is a
+  // provenance-forgery guard, not a contract rule.
+  //
+  // TEAM-4131 F2: the ticket's SHAPE goes in too, so `advisory` is refused on a
+  // fix ticket or a human gate — on those, the label is a completion-gate bypass
+  // (see RESERVED_ADVISORY_LABEL), not a routing hint. `spawn.value` is the
+  // already-sanitized marker, so a junk kind cannot buy the exemption.
+  const userLabels = sanitizeUserLabels(labels, { spawnedBy: spawn.value, assignee });
 
   // Validate assignee against known agent roster. "human:<who>" assignees are
   // human-review gates — not agents — and are always allowed (the orchestrator
@@ -342,6 +376,10 @@ async function createTicket(args) {
     // so a plain ticket is byte-for-byte what it was before.
     ...(spawn.value ? { spawnedBy: spawn.value } : {}),
     ...(phaseStamp ? { phase: phaseStamp } : {}),
+    // TEAM-4121 FR-8: the fix contract (absent entirely under mode=off, or on a
+    // plain ticket) and the caller's sanitized labels.
+    ...(contract ? { fixContract: contract } : {}),
+    ...(userLabels.labels.length > 0 ? { labels: userLabels.labels } : {}),
   };
 
   await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
@@ -350,6 +388,12 @@ async function createTicket(args) {
     key: ticketId,
     self: `https://your-domain.atlassian.net/browse/${ticketId}`,
     status: "created",
+    // TEAM-4121 FR-8: the caller learns what was refused. `warning` says the
+    // ticket was FILED with an incomplete contract (shadow only — enforce
+    // returns an error instead); `droppedLabels` says a label was refused, so
+    // an agent isn't left wondering why its own filter finds nothing.
+    ...(contractWarning ? { warning: contractWarning } : {}),
+    ...(userLabels.dropped.length > 0 ? { droppedLabels: userLabels.dropped } : {}),
     ticket: {
       key: ticketId,
       summary,
@@ -363,6 +407,8 @@ async function createTicket(args) {
       created: now,
       ...(spawn.value ? { spawned_by: spawn.value } : {}),
       ...(phaseStamp ? { phase: phaseStamp } : {}),
+      ...(contract ? { fix_contract: contract } : {}),
+      ...(userLabels.labels.length > 0 ? { labels: userLabels.labels } : {}),
     },
   };
 }
@@ -473,6 +519,100 @@ async function editIssue(args) {
       priority: { name: ticket.priority },
       updated: ticket.updatedAt,
     },
+  };
+}
+
+/**
+ * Normalize a SYSTEM label (TEAM-4122 FR-5). Deliberately NOT sanitizeUserLabels:
+ * that one maps ":" → "-" and refuses the reserved namespaces, which is exactly
+ * right for an agent-supplied label and exactly wrong for `ci:uncertifiable`,
+ * which the orchestrator owns. The one hard rule both providers share is
+ * Jira's: a label may not contain whitespace. Returns "" for anything unusable.
+ *
+ * Kept local to each ticket Lambda rather than added to fix-contract.mjs — that
+ * module is byte-compared across three copies by CI, and `labels_add` needs no
+ * cross-Lambda contract, only the same behaviour.
+ */
+function normalizeSystemLabel(label) {
+  if (typeof label !== "string") return "";
+  const lowered = label.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9._:-]{0,63}$/.test(lowered)) return "";
+  return lowered;
+}
+
+/**
+ * Additively append labels to a ticket — the DynamoDB twin of Jira's
+ * `update: { labels: [{ add }] }`. ADDITIVE and IDEMPOTENT by construction: one
+ * conditional `list_append` per label, guarded by `NOT contains(labels, :l)`, so
+ * a redelivered call (stream re-poll, retried invocation) cannot duplicate an
+ * entry and a concurrent writer's labels are never clobbered. Never a full-list
+ * SET — that would silently drop a label another writer added.
+ */
+async function addLabels(args) {
+  const issueKey = args.issue_key || args.ticket_id;
+  if (!issueKey) return textResult("Error: 'issue_key' is required");
+
+  const raw = Array.isArray(args.labels)
+    ? args.labels
+    : typeof args.labels === "string"
+      ? args.labels.split(",")
+      : args.labels
+        ? [args.labels]
+        : [];
+  const wanted = [];
+  const dropped = [];
+  for (const item of raw) {
+    const norm = normalizeSystemLabel(item);
+    if (!norm) {
+      if (item !== undefined && item !== null && String(item).trim() !== "") dropped.push(String(item));
+      continue;
+    }
+    if (!wanted.includes(norm)) wanted.push(norm);
+  }
+  if (wanted.length === 0) return textResult("Error: no valid labels to add");
+
+  const added = [];
+  const alreadyPresent = [];
+  for (const label of wanted) {
+    try {
+      await ddb.send(
+        new UpdateCommand({
+          TableName: TABLE_NAME,
+          Key: { ticketId: issueKey },
+          UpdateExpression: "SET #l = list_append(if_not_exists(#l, :empty), :one), #u = :u",
+          // attribute_exists(ticketId) keeps this from CREATING a row for a
+          // typo'd key (an Update with no condition is an upsert).
+          ConditionExpression:
+            "attribute_exists(ticketId) AND (attribute_not_exists(#l) OR NOT contains(#l, :label))",
+          ExpressionAttributeNames: { "#l": "labels", "#u": "updatedAt" },
+          ExpressionAttributeValues: {
+            ":empty": [],
+            ":one": [label],
+            ":label": label,
+            ":u": new Date().toISOString(),
+          },
+        })
+      );
+      added.push(label);
+    } catch (err) {
+      if (err.name === "ConditionalCheckFailedException") {
+        // Either the label is already there (the idempotent case) or the ticket
+        // does not exist. Distinguish, so a bad key is not reported as success.
+        const existing = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+        if (!existing.Item) return textResult(`Error: ticket ${issueKey} not found`);
+        alreadyPresent.push(label);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  return {
+    key: issueKey,
+    status: "labels_added",
+    added,
+    alreadyPresent,
+    ...(dropped.length > 0 ? { dropped } : {}),
   };
 }
 

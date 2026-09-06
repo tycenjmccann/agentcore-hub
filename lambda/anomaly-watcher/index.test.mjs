@@ -31,9 +31,12 @@ import {
   allowedFilings,
   bucketKeyOf,
   cycleLabel,
+  dropStaleItems,
+  epochMsOf,
   filingFailedMarker,
   INTAKE_CHANNEL,
   INTAKE_INDEX,
+  LATE_EVENT_TOLERANCE_MS,
   loadBands,
   metricWindows,
   openCountFrom,
@@ -1428,4 +1431,62 @@ test("TEAM-3966 F6: review.parked_advisory is a verified event type and validate
   const res = validateBands(yaml.load(text));
   assert.ok(res.ok, `expected valid, got: ${(res.errors || []).join(" | ")}`);
   assert.deepEqual(res.config.metrics[0].source.numeratorTypes, ["review.rejected", "review.parked_advisory"]);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TEAM-4120 FR-2 — the ingest cursor vs. the NEW deterministic eventId format.
+//
+// event-id.mjs mints ids as `<13-digit decimal ms>-<8 hex>` precisely so they
+// stay in the same lexicographic ordering class as the pre-4120 direct-write ids
+// (`${Date.now()}-${random}`), which readEvents' `eventId > :cursor`
+// KeyConditionExpression compares as STRINGS. These tests document that the new
+// format cursors correctly — and re-document the pre-existing blind spot the
+// deterministic format does NOT fix: the events-writer's base36 ids
+// (`<ms base36 padStart 9>-<counter>`) start with a letter for every plausible
+// timestamp, so they sort AFTER any decimal id and a decimal cursor never
+// advances past them. dropStaleItems (§4.4) is the guard that keeps that
+// mismatch from folding a stale row into a bucket days in the past.
+// Pure helpers only — no AWS wiring is touched.
+// ═════════════════════════════════════════════════════════════════════════════
+
+const DECIMAL_CURSOR_ID = "1757040000000-ab12";        // legacy direct-write id
+const DECIMAL_CURSOR_TS = "2026-09-05T12:00:00.000Z";  // in-window
+const DETERMINISTIC_ID = "1757040000500-1a2b3c4d";     // TEAM-4120 id, 500ms later
+
+test("TEAM-4120: a deterministic eventId sorts AFTER a legacy decimal cursor (same 13-digit prefix class)", () => {
+  // What readEvents' `eventId > :c` evaluates to inside DynamoDB.
+  assert.ok(DETERMINISTIC_ID > DECIMAL_CURSOR_ID, "new id is strictly greater as a string");
+  // Same prefix width is what makes string compare == time order.
+  assert.equal(DECIMAL_CURSOR_ID.split("-")[0].length, 13);
+  assert.equal(DETERMINISTIC_ID.split("-")[0].length, 13);
+  assert.ok(Number(DETERMINISTIC_ID.split("-")[0]) > Number(DECIMAL_CURSOR_ID.split("-")[0]));
+});
+
+test("TEAM-4120: dropStaleItems KEEPS a deterministic-id item whose timestamp is inside the tolerance", () => {
+  const cursor = { lastEventId: DECIMAL_CURSOR_ID, lastTimestamp: DECIMAL_CURSOR_TS };
+  const item = { eventId: DETERMINISTIC_ID, timestamp: "2026-09-05T12:00:00.500Z", type: "agent.complete" };
+  assert.deepEqual(dropStaleItems([item], cursor), [item]);
+
+  // Boundary: exactly at the floor is kept, one ms before it is dropped.
+  const floorMs = epochMsOf(DECIMAL_CURSOR_TS) - LATE_EVENT_TOLERANCE_MS;
+  const atFloor = { eventId: "1757040000001-deadbeef", timestamp: new Date(floorMs).toISOString() };
+  const belowFloor = { eventId: "1757040000002-deadbeef", timestamp: new Date(floorMs - 1).toISOString() };
+  assert.deepEqual(dropStaleItems([atFloor, belowFloor], cursor), [atFloor]);
+});
+
+test("TEAM-4120: a base36 events-writer id sorts BEFORE any decimal cursor — the pre-existing blind spot", () => {
+  const base36 = "0lq7k2x00-0001";
+  // Digits sort before letters, but this id is zero-padded to 9 chars, so it is
+  // "0lq…" vs "175…": '0' < '1', hence it can NEVER exceed a decimal cursor.
+  assert.ok(base36 < DECIMAL_CURSOR_ID, "base36 id is below the decimal cursor as a string");
+  // Un-padded (>= 1985 in base36 ms) it starts with a letter and would sort
+  // AFTER instead — the two formats are simply not mutually ordered, which is
+  // §4.4's whole premise and why dropStaleItems exists.
+  assert.ok("lq7k2x00-0001" > DECIMAL_CURSOR_ID);
+  // dropStaleItems is what keeps such a row from being folded days in the past.
+  const stale = { eventId: base36, timestamp: "2026-08-01T00:00:00.000Z" };
+  const cursor = { lastEventId: DECIMAL_CURSOR_ID, lastTimestamp: DECIMAL_CURSOR_TS };
+  assert.deepEqual(dropStaleItems([stale], cursor), [], "far-behind format artefact is ignored");
+  // Under EVENT_DEDUPE_MODE=enforce the events-writer stops minting base36 ids
+  // for non-streaming events, so this class of row simply stops appearing.
 });

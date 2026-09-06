@@ -49,7 +49,10 @@ export const REWORK_LOOP_CAP_DEFAULT_MAX = 4;
 
 const MODES = new Set(["off", "shadow", "enforce"]);
 const LEGACY_ENFORCE = new Set(["on", "true", "1", "yes", "enabled"]);
-const DEFAULT_FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
+// TEAM-4121 FR-8: the REWORK kinds only. ci_fix/sync_fix are environmental (red
+// build, branch drift) and must not trip the human escalation — see
+// REWORK_FIX_KINDS in completion.mjs / fix-contract.mjs.
+const DEFAULT_FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix", "ship_fix"]);
 
 /**
  * Mode normalization — fail-safe to SHADOW (observe-only), never off. Legacy
@@ -71,7 +74,13 @@ const idOf = (t) => t?.ticketId || t?.id || t?.key || null;
 /** A rework round = a completed fix ticket (spawnedBy.kind is a fix kind). */
 export function isReworkFix(ticket, fixKinds = DEFAULT_FIX_KINDS) {
   const kind = ticket?.spawnedBy?.kind;
-  return typeof kind === "string" && fixKinds.has(kind);
+  if (typeof kind !== "string" || !fixKinds.has(kind)) return false;
+  // TEAM-4121 FR-8: a RE-VERIFICATION is not a new rework round. When a fix is
+  // re-armed (reverify/rearmOf), the loop has not advanced — the same finding is
+  // being checked again — so counting it would burn the cap toward a human
+  // escalation for work the loop already accounted for.
+  if (ticket.spawnedBy.reverify === true || ticket.spawnedBy.rearmOf) return false;
+  return true;
 }
 
 /**

@@ -69,6 +69,11 @@ export function parseCdRegistry(raw) {
       if (pipeline) entry.pipeline = pipeline;
       const region = typeof e.region === "string" ? e.region.trim() : "";
       if (region) entry.region = region;
+      // Optional (TEAM-4122 FR-5): this repo's CodeBuild PR-check PROJECT — a
+      // different thing from `pipeline` above, which names a CodePipeline. Read
+      // by ci-check.mjs; absent → CI_PROJECT_NAME, then agentcore-hub-ci.
+      const ciProject = typeof e.ciProject === "string" ? e.ciProject.trim() : "";
+      if (ciProject) entry.ciProject = ciProject;
       const deployDoc = typeof e.deployDoc === "string" ? e.deployDoc.trim() : "";
       if (deployDoc) entry.deployDoc = deployDoc;
       const notes = typeof e.notes === "string" ? e.notes.trim() : "";

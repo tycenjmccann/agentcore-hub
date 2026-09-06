@@ -804,7 +804,7 @@ async function readEvents(ctx, workflowId, cursor) {
  * format artefact, not a late write, and is ignored rather than folded into a
  * bucket days in the past.
  */
-function dropStaleItems(items, cursor) {
+export function dropStaleItems(items, cursor) {
   if (!cursor?.lastTimestamp) return items;
   let floor;
   try {

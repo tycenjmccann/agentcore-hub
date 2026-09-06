@@ -77,6 +77,8 @@ Env (all optional except the owner; defaults derive from `deploy/config.sh`):
 | `ECS_SERVICE_ARN` | (skip app roll) | the ECS Express service the Deploy stage rolls |
 | `PIPELINE_APPROVAL_SNS_ARN` | (mint new) | reuse an SNS topic (e.g. Telegram-bridged) |
 | `PIPELINE_APPROVAL_EMAILS` | — | comma-separated email approvers |
+| `PIPELINE_CI_WEBHOOK` | off | `1` enables the CodeBuild PR-check webhook + commit status. PREREQ: the CodeConnections GitHub App must be installed on the repo WITH webhook permission — a repo-level step done AFTER the OAuth handshake in "One-time after first deploy" below. Without it, `CreateWebhook` fails the deploy. |
+| `PIPELINE_CI_START_BUILD` | off | `1` grants the pipeline-tools Lambda `codebuild:StartBuild` on the CI project ONLY (via `node deploy/setup-pipeline-tools-lambda.mjs`, NOT this CDK stack). The fallback for when the webhook cannot be installed: agents can trigger CI builds themselves, bounded by `concurrentBuildLimit` on the CI project and the calling agent's poll cap. |
 
 ### One-time after first deploy
 

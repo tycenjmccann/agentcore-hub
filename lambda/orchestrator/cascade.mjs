@@ -127,6 +127,9 @@ export function createCascade(deps) {
     // uncapped steal, so existing callers and tests are byte-identical.
     store,
     blockTicket,
+    // TEAM-4120 FR-3 — optional dead-session escalation tree (page → synthesize
+    // → park). Unwired = the bare manager_escalation notification, as before.
+    escalate,
   } = deps;
 
   // One normalization per cascade instance. The commit-4a union (blocked/todo →
@@ -598,16 +601,30 @@ export function createCascade(deps) {
     });
     await store.setTaskStatus(workflow.id, ticketId, "error");
     if (blockTicket) await blockTicket(ticketId, "dead_session_retry_exhausted");
-    await store.appendNotification(workflow.id, {
-      id: `notif_dead_session_${ticketId}_${at}`,
-      type: "manager_escalation",
-      title: `Dead session (retry exhausted): ${ticketId}`,
-      details: `Agent ${agentId} went silent past the lease TTL twice on ${ticketId} (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human.`,
-      reviewer: "reconcile-sweep",
-      ticketId,
-      timestamp: at,
-      acknowledged: false,
-    });
+    // TEAM-4120 FR-3 — same hook as the detector's twin: with the escalation tree
+    // wired, IT writes the notification (with evidence + a resume path);
+    // unwired (the default) this is byte-identical to pre-4120.
+    if (escalate) {
+      await escalate({
+        workflow, ticketId, agentId,
+        claim: {
+          startedAt: workflow?.agentTasks?.[ticketId]?.startedAt,
+          lastHeartbeatAt: null,
+          source: "reconcile-sweep",
+        },
+      });
+    } else {
+      await store.appendNotification(workflow.id, {
+        id: `notif_dead_session_${ticketId}_${at}`,
+        type: "manager_escalation",
+        title: `Dead session (retry exhausted): ${ticketId}`,
+        details: `Agent ${agentId} went silent past the lease TTL twice on ${ticketId} (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human.`,
+        reviewer: "reconcile-sweep",
+        ticketId,
+        timestamp: at,
+        acknowledged: false,
+      });
+    }
     m.escalated = (m.escalated || 0) + 1;
     log(`[orchestrator] reconcile escalate — ${ticketId} agent=${agentId} retry exhausted`);
     return "escalated";
