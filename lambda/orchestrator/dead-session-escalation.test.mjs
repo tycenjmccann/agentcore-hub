@@ -832,3 +832,101 @@ describe("resilience — no dep can make escalateExhausted reject", () => {
     expect(d.getChildTickets).not.toHaveBeenCalled();
   });
 });
+
+// ─── 8. TEAM-4156 — the escalation gate's id is read under BOTH providers ──────
+
+/**
+ * The park branch is the third create_ticket producer in the orchestrator, and it
+ * read `res?.key || res?.ticket?.key` too. Under TICKET_PROVIDER=jira that is
+ * always null: the gate ticket really lands on the board, `park` then reports it
+ * missing, nothing blocks on it, it is never handed to a human, and the run's
+ * disposition degrades to "shadow" — the exact signature of a gate that "did
+ * nothing" while the board says otherwise.
+ *
+ * `deps()`'s defaults are the no-evidence-anywhere set, so every case below takes
+ * the park branch with the only variable being the shape the tickets Lambda
+ * answered with.
+ */
+describe("TEAM-4156 — the escalation gate's id is read under BOTH providers", () => {
+  const GATE = "TEAM-99";
+
+  /** Every provider shape must reach the SAME parked end state. */
+  async function expectGatedOnHuman(reply) {
+    const warns = [];
+    const { d, store } = deps({
+      invokeTickets: vi.fn(async () => reply),
+      log: { log: () => {}, warn: (m) => warns.push(String(m)) },
+    });
+    const res = await run(d);
+
+    expect(res.disposition).toBe("parked");
+    expect(res.gateTicketId).toBe(GATE);
+    // Filed exactly once, with the human-owned summary the page refers to.
+    expect(d.invokeTickets).toHaveBeenCalledTimes(1);
+    expect(d.invokeTickets).toHaveBeenCalledWith("create_ticket", expect.objectContaining({
+      summary: `Escalation: dead session on ${TID} (${AGENT})`,
+      assignee: "human:engineer",
+      parent_key: "EPIC-1",
+      workflow_id: "wf_1",
+    }));
+    // The held ticket blocks on the gate, so the gate's own done cascade resumes it.
+    expect(d.addBlockers.mock.calls).toEqual([[TID, [GATE]]]);
+    expect(d.parkGateForHuman).toHaveBeenCalledWith(GATE, "human:engineer", expect.objectContaining({ id: "wf_1" }));
+    // And the page names the gate, so the human has something to open.
+    expect(notif(store).disposition).toBe("parked");
+    expect(notif(store).gateTicketId).toBe(GATE);
+    expect(warns.join("\n")).not.toMatch(/could not create the escalation gate/);
+  }
+
+  it("DynamoDB's { key } reply parks on the gate (unchanged)", async () => {
+    await expectGatedOnHuman({ key: GATE, status: "created" });
+  });
+
+  it("JIRA's fresh-create reply ({ ticketId }) parks on the gate", async () => {
+    await expectGatedOnHuman({ ticketId: GATE, status: "created", message: `Created ${GATE}` });
+  });
+
+  it("JIRA's summary-dedupe reply ({ ticketId, deduplicated }) parks on the EXISTING gate", async () => {
+    await expectGatedOnHuman({
+      ticketId: GATE,
+      title: `Escalation: dead session on ${TID} (${AGENT})`,
+      status: "To Do",
+      deduplicated: true,
+    });
+  });
+
+  it("DynamoDB's nested { ticket: { key } } reply parks on the gate", async () => {
+    await expectGatedOnHuman({ ticket: { key: GATE, status: "todo" } });
+  });
+
+  /** No usable id → the pre-TEAM-4156 fail-open, which must stay exactly as it was. */
+  async function expectNoGate(invokeTickets) {
+    const warns = [];
+    const { d, store } = deps({
+      invokeTickets,
+      log: { log: () => {}, warn: (m) => warns.push(String(m)) },
+    });
+    const res = await run(d);
+
+    expect(res.disposition).toBe("shadow"); // nothing was actually done
+    expect(res.gateTicketId).toBeNull(); // park() said "no gate", not "some gate"
+    expect(d.addBlockers).not.toHaveBeenCalled();
+    expect(d.parkGateForHuman).not.toHaveBeenCalled();
+    expect(store.appendNotification).toHaveBeenCalledTimes(1); // the page still lands
+    expect(warns.join("\n")).toMatch(/could not create the escalation gate/);
+  }
+
+  it("a resolved { error } is NOT a ticket — defence in depth behind the seam's throw", async () => {
+    await expectNoGate(vi.fn(async () => ({ error: "boom" })));
+  });
+
+  it("the seam throwing on { error } leaves no half-parked gate", async () => {
+    await expectNoGate(vi.fn(async () => { throw new Error("Tickets___create_ticket: boom"); }));
+  });
+
+  it("a non-string id is never used as a gate", async () => {
+    for (const reply of [{ key: 42 }, { ticketId: { value: GATE } }, { key: "   " }, {}, null]) {
+      await expectNoGate(vi.fn(async () => reply));
+    }
+  });
+});

@@ -51,6 +51,10 @@
  * testable with plain objects (same split as repo-check.mjs / ci-check.mjs).
  */
 
+// The one provider-agnostic reader of a create_ticket response (TEAM-4156 F1).
+// ticket-blockers.mjs has zero imports of its own, so this cannot cycle.
+import { createdTicketId } from "./ticket-blockers.mjs";
+
 const MODES = ["off", "shadow", "enforce"];
 
 /**
@@ -121,6 +125,17 @@ function recordedRound(record) {
   const n = Number(record?.round);
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
 }
+
+/**
+ * A ticket ROW's id, under any provider's spelling — the DynamoDB list answers
+ * `ticketId`, Jira's mapIssue answers `ticketId` too but a raw issue carries
+ * `key`. Same shape-tolerant helper live-reverify.mjs and
+ * dead-session-escalation.mjs use for their own sibling scans.
+ */
+const idOf = (t) => t?.ticketId || t?.key || t?.id || null;
+
+/** The board's status of a ticket row, folded the way CLOSED_FIX_STATUSES stores it. */
+const statusOf = (t) => (typeof t?.status === "string" ? t.status.trim().toLowerCase() : "");
 
 function safeRef(ref) {
   const s = String(ref ?? "").trim();
@@ -228,6 +243,12 @@ export async function syncBeforeCi(workflow, ticket, deps = {}) {
     // is provider-agnostic (Jira's REST GET is already authoritative). Omitted =
     // "cannot tell", which fails open to the pre-4131 reuse behaviour.
     getTicketStatus,
+    // TEAM-4156 F2 — (epicId) => Promise<ticket[]>: every ticket under the run's
+    // epic. Used ONLY on the 409 path with no recorded fix ticket, to notice a
+    // sync_fix that is already on the board (the record write can fail, or a
+    // container can die, AFTER create_ticket succeeded). Omitted = "cannot tell",
+    // which fails open to the pre-4156 behaviour: file a fresh ticket.
+    getChildTickets,
     maxSyncFixRounds = MAX_SYNC_FIX_ROUNDS,
     now = () => new Date(),
     mode = "off",
@@ -410,10 +431,21 @@ export async function syncBeforeCi(workflow, ticket, deps = {}) {
 
     // ── helpers that close over the validated refs ───────────────────────────
 
+    /**
+     * @returns {Promise<boolean>} whether the DURABLE write landed. Still
+     *   best-effort — a failed record must never change the outcome — but the
+     *   conflict path now reports the failure instead of only warning about it
+     *   (TEAM-4156 F2): the record is the only pointer from this run back to the
+     *   fix ticket, so losing it is what makes a redelivery file a duplicate.
+     *   No store seam wired at all counts as "nothing to lose" → true.
+     */
     async function persist(record) {
       if (workflow) workflow.syncMain = record; // keep this container's snapshot honest
-      try { await store?.setSyncMain?.(workflowId, record); }
-      catch (err) { warn(`setSyncMain(${workflowId}) failed: ${err?.message || err}`); }
+      try { await store?.setSyncMain?.(workflowId, record); return true; }
+      catch (err) {
+        warn(`setSyncMain(${workflowId}) failed: ${err?.message || err}`);
+        return false;
+      }
     }
 
     async function handleConflict() {
@@ -425,6 +457,7 @@ export async function syncBeforeCi(workflow, ticket, deps = {}) {
       // straight back here — an invisible loop that files nothing and says nothing.
       let reuseFixTicketId = null;
       let reusedUnverified = false;
+      let reusedFromSibling = false;
       let closedFixTicketId = null;
       let closedFixStatus = null;
       if (knownFixTicketId) {
@@ -444,24 +477,55 @@ export async function syncBeforeCi(workflow, ticket, deps = {}) {
         }
       }
 
+      // ── the record is not the only witness (TEAM-4156 F2) ────────────────────
+      // `fixTicketId` is written AFTER create_ticket, so every failure between the
+      // two — a throttled `setSyncMain`, a container that dies, a stream redelivery
+      // that overlaps — loses the only pointer we had to a ticket that really
+      // exists on the board. The old code then filed a second identical ticket at
+      // the same dev, every redelivery, and blocked CI on the newest one while the
+      // earlier ones sat open forever.
+      //
+      // So ask the board. Provenance match (`spawnedBy`), never summary text, and
+      // only an OPEN sibling is reusable — reusing a CLOSED one is exactly the
+      // permanent wedge TEAM-4131 F1 fixed, so a closed sibling is ignored here and
+      // the ordinary round-1 create below files the ticket the dev can actually
+      // work. Same scan live-reverify.mjs runs before its own create.
+      if (!reuseFixTicketId && !closedFixTicketId) {
+        const sibling = await findOpenSyncFixSibling();
+        if (sibling) {
+          reuseFixTicketId = sibling;
+          reusedFromSibling = true;
+          warn(`${workflowId}: no recorded sync_fix for ${ticketId}, but ${sibling} is already on the board — reusing it`);
+        }
+      }
+
       // Already ticketed against this same head, and still open: reuse the ticket
       // and the file list persisted with it, which also spares two more compares.
       if (reuseFixTicketId) {
-        await blockOnFix(reuseFixTicketId);
         const files = prior?.files || [];
+        // A sibling found by the scan is round 1 as far as anyone can tell — the
+        // record that would have said otherwise is the thing that went missing.
+        const round = knownFixTicketId ? knownRound : 1;
+        const marks = {
+          ...(reusedUnverified ? { reusedUnverified: true } : {}),
+          ...(reusedFromSibling ? { reusedFromSibling: true } : {}),
+        };
+        // Persist FIRST on the sibling-reuse path for the same reason as the create
+        // path below: this may be the only chance to record the pointer.
+        const persisted = await persist({
+          at: now().toISOString(), baseHeadSha, status: "conflict",
+          ciTicketId: ticketId, fixTicketId: reuseFixTicketId, files, round,
+          ...marks,
+        });
+        await blockOnFix(reuseFixTicketId);
         await emit("workflow.sync_conflict", {
           ticketId, fixTicketId: reuseFixTicketId, files, base, head, baseHeadSha, alreadyTicketed: true,
-          round: knownRound, reusedUnverified,
-        });
-        await persist({
-          at: now().toISOString(), baseHeadSha, status: "conflict",
-          ciTicketId: ticketId, fixTicketId: reuseFixTicketId, files, round: knownRound,
-          ...(reusedUnverified ? { reusedUnverified: true } : {}),
+          round, reusedUnverified, ...marks,
+          ...(persisted ? {} : { persistFailed: true }),
         });
         return {
           outcome: "conflict", fixTicketId: reuseFixTicketId, baseHeadSha, files,
-          reason: "already_ticketed", round: knownRound,
-          ...(reusedUnverified ? { reusedUnverified: true } : {}),
+          reason: "already_ticketed", round, ...marks,
         };
       }
 
@@ -524,7 +588,11 @@ export async function syncBeforeCi(workflow, ticket, deps = {}) {
             sibling_scope: "conflict resolution only",
           },
         });
-        fixTicketId = created?.key || created?.ticket?.key || null;
+        // Both providers' shapes, one accessor (TEAM-4156 F1). Reading `key` alone
+        // meant that under TICKET_PROVIDER=jira this was ALWAYS null: the ticket was
+        // filed, and the fail-open branch below then let CI certify a branch that
+        // provably cannot merge.
+        fixTicketId = createdTicketId(created);
       } catch (err) {
         warn(`${workflowId}: could not file the sync_fix ticket: ${err?.message || err}`);
       }
@@ -544,17 +612,26 @@ export async function syncBeforeCi(workflow, ticket, deps = {}) {
         return await skip("conflict_unticketed", { base, head, baseHeadSha, files });
       }
 
+      // Record the ticket BEFORE the blocker edge and the event (TEAM-4156 F2).
+      // Ordering is the whole fix: the write that says "this run already has a
+      // sync_fix" has to be attempted at the first possible moment, because
+      // everything after it can throw, time out, or be interrupted by the stream
+      // redelivering this same event. `files` is persisted so a redelivery can
+      // answer with the same candidate list without paying two more compares, and
+      // `round` because this record is the only place the count lives — the next
+      // redelivery reads it back.
+      const persisted = await persist({
+        at: now().toISOString(), baseHeadSha, status: "conflict", ciTicketId: ticketId, fixTicketId, files, round,
+        ...(closedFixTicketId ? { priorFixTicketId: closedFixTicketId } : {}),
+      });
       await blockOnFix(fixTicketId);
       await emit("workflow.sync_conflict", {
         ticketId, fixTicketId, files, base, head, baseHeadSha, round,
         ...(closedFixTicketId ? { priorFixTicketId: closedFixTicketId, priorStatus: closedFixStatus } : {}),
-      });
-      // `files` is persisted so a redelivery can answer with the same candidate
-      // list without paying two more compares. `round` is persisted because it is
-      // the only place the count lives — the next redelivery reads it back.
-      await persist({
-        at: now().toISOString(), baseHeadSha, status: "conflict", ciTicketId: ticketId, fixTicketId, files, round,
-        ...(closedFixTicketId ? { priorFixTicketId: closedFixTicketId } : {}),
+        // The ticket exists but this run may not remember it. The sibling scan
+        // above is the recovery path; this flag is how a human (or the anomaly
+        // watcher) sees that it was needed.
+        ...(persisted ? {} : { persistFailed: true }),
       });
       return {
         outcome: "conflict", fixTicketId, baseHeadSha, files, round,
@@ -615,6 +692,45 @@ export async function syncBeforeCi(workflow, ticket, deps = {}) {
         warn(`getTicketStatus(${id}) failed: ${err?.message || err}`);
         return { known: false, status: null };
       }
+    }
+
+    /**
+     * An OPEN `sync_fix` ticket already on the board for THIS CI ticket, or null
+     * (TEAM-4156 F2).
+     *
+     * Matched on `spawnedBy` provenance — `{kind:"sync_fix", ciTicketId}` is what
+     * this module sends as `spawned_by`, both providers persist it, and it is
+     * exact. Never on summary text: round 2's summary differs by design, and the
+     * Jira provider's own summary dedupe is a different mechanism with a different
+     * (per-epic) scope.
+     *
+     * Degrades to null on ANY problem — no seam, a throw, a non-array answer. This
+     * is a duplicate-suppression optimisation on a fail-open path; refusing to
+     * file the ticket because the scan failed would be strictly worse than filing
+     * a second one.
+     */
+    async function findOpenSyncFixSibling() {
+      if (typeof getChildTickets !== "function") return null;
+      let siblings;
+      try {
+        siblings = await getChildTickets(workflow?.epicId);
+      } catch (err) {
+        warn(`getChildTickets(${workflow?.epicId}) failed: ${err?.message || err}`);
+        return null;
+      }
+      if (!Array.isArray(siblings)) return null;
+      for (const t of siblings) {
+        if (t?.spawnedBy?.kind !== "sync_fix") continue;
+        if (t?.spawnedBy?.ciTicketId !== ticketId) continue;
+        const id = idOf(t);
+        // A closed sibling is deliberately NOT reusable (TEAM-4131 F1): it can
+        // never fire another `done`, so a blocker edge onto it never clears. An
+        // UNKNOWN status ("" / missing) is treated as open, matching
+        // readFixStatus's fail-open direction.
+        if (!id || CLOSED_FIX_STATUSES.has(statusOf(t))) continue;
+        return id;
+      }
+      return null;
     }
 
     /**

@@ -131,7 +131,17 @@ function fixTicketAtDone() {
  * agentTasks entry is the real one, so `commitSha` — the sha the re-verification
  * pins to — is production's own value, not a literal typed here.
  */
-function world({ mode = "enforce", shipStatus = "in_progress", completionRecord = fixtureCompletion(FIX) } = {}) {
+function world({
+  mode = "enforce",
+  shipStatus = "in_progress",
+  completionRecord = fixtureCompletion(FIX),
+  // What the tickets Lambda answers create_ticket with. DynamoDB's shape by
+  // default (this replay is a dynamodb-mode run); `jira` answers `{ ticketId }`
+  // (TEAM-4156). This suite injects `invokeTickets` directly rather than mocking
+  // the Lambda boundary, so the shape swap exercises live-reverify's own reader,
+  // not index.mjs's normalization.
+  createReply = () => ({ key: REVERIFY }),
+} = {}) {
   const calls = { merges: [], creates: [], blockers: [], events: [], warns: [] };
 
   const workflow = {
@@ -160,7 +170,7 @@ function world({ mode = "enforce", shipStatus = "in_progress", completionRecord 
     },
     invokeTickets: async (tool, params) => {
       calls.creates.push({ tool, params });
-      return { key: REVERIFY };
+      return createReply(params);
     },
     getChildTickets: async (epicId) => (epicId === EPIC ? siblings : []),
     getAgentDef: (assignee) => (AGENT_PHASES[assignee] ? { agentId: assignee, phase: AGENT_PHASES[assignee] } : null),
@@ -350,6 +360,28 @@ describe("yteqfl loop 2 under LIVE_REVERIFY=enforce", () => {
     // Still re-verified at the head: the artifact proves the ORIGINAL observation,
     // not the state after the fix — which is exactly what prod got wrong.
     expect(created(calls)).toHaveLength(1);
+  });
+
+  it("this same run under TICKET_PROVIDER=jira reaches the identical end state (TEAM-4156)", async () => {
+    // yteqfl ran in dynamodb mode, but `.env.example` and the Dockerfile ship
+    // jira — where create_ticket answers `{ ticketId }`, not `{ key }`. Before
+    // TEAM-4156 that read null here, so TEAM-4066 shipped over an unverified fix
+    // with a re-verify ticket sitting on the board that nothing pointed at.
+    const { onFixDone, workflow, calls, completionRecord } = world({
+      createReply: () => ({ ticketId: REVERIFY, status: "created", message: `Created ${REVERIFY}` }),
+    });
+
+    const result = await onFixDone({ workflow, fixTicket: fixTicketAtDone(), completionRecord });
+
+    expect(result).toEqual({ action: "created", reverifyTicketId: REVERIFY, sha7: HEAD7, unverified: true });
+    expect(created(calls)).toHaveLength(1);
+    expect(calls.blockers).toEqual([{ ticketId: SHIP, ids: [REVERIFY] }]);
+    expect(calls.merges[1].fields).toEqual({ reverifyTicketId: REVERIFY, reverifySha: HEAD7 });
+    expect(workflow.agentTasks[FIX].reverifyTicketId).toBe(REVERIFY);
+    expect(calls.events.map((e) => e.type)).toEqual(["fix.unverified", "fix.reverify_created"]);
+    // The only warn is the pre-existing CAS-slot one this fixture always emits;
+    // the id was read fine, so nothing complains about the ticket.
+    expect(calls.warns.join("\n")).not.toMatch(/could not create the re-verify ticket/);
   });
 });
 

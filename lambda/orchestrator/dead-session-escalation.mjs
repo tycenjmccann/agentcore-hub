@@ -42,6 +42,8 @@
  */
 
 import { completionRecordHasEvidence } from "./completion.mjs";
+// The one provider-agnostic reader of a create_ticket response (TEAM-4156 F1).
+import { createdTicketId } from "./ticket-blockers.mjs";
 
 const MODES = new Set(["off", "shadow", "enforce"]);
 
@@ -551,7 +553,10 @@ export function createDeadSessionEscalation(deps = {}) {
         workflow_id: workflow.id,
         blocked_by: [],
       });
-      return res?.key || res?.ticket?.key || null;
+      // Both providers' shapes, one accessor (TEAM-4156 F1). Reading `key` alone
+      // meant that under TICKET_PROVIDER=jira this was ALWAYS null: the escalation
+      // ticket was filed and then reported as missing, so nothing gated on it.
+      return createdTicketId(res);
     }, null);
     if (!gateId) {
       warn(`${ticketId}: could not create the escalation gate — the ticket stays in error for the existing manager_escalation page`);

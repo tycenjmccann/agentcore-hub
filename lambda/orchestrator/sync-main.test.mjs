@@ -1063,3 +1063,335 @@ describe("outer safety — a bug in here can never wedge the CI dispatch", () =>
     expect(r.outcome).toBe("skipped");
   });
 });
+
+// ─── TEAM-4156 ───────────────────────────────────────────────────────────────
+
+describe("TEAM-4156 — the fix ticket is found and held onto under BOTH providers", () => {
+  /**
+   * The finding, in two halves.
+   *
+   * F1: the two ticket backends answer create_ticket differently and always have —
+   * DynamoDB `{ key }`, Jira `{ ticketId }` — and this module read `key` only. So
+   * in PROD (TICKET_PROVIDER=jira is what .env.example and the Dockerfile ship)
+   * every 409 filed a real sync_fix ticket, read the id as null, and then took the
+   * `conflict_unticketed` FAIL-OPEN branch: CI certified a branch that provably
+   * cannot merge, nothing was blocked, and the ticket sat on the board unblocked-on
+   * and unexplained. Note that every fake in this file used the DynamoDB shape, so
+   * the whole suite was green on a path that never worked in production.
+   *
+   * F2: the `fixTicketId` record is written AFTER create_ticket, so any failure
+   * between the two loses the only pointer to a ticket that really exists — and the
+   * next stream redelivery filed a SECOND identical ticket at the same dev.
+   *
+   * The assertions here are deliberately about the BLOCKER EDGE and the CREATE
+   * COUNT, not about the return value: `fixTicketId` in the result is cosmetic,
+   * whereas `addBlockers(CI, [FIX])` is what actually holds CI, and one create per
+   * conflict is what keeps the dev's board readable.
+   */
+  const conflictRoutes = () => ({
+    [`GET ${branchesPath()}`]: { status: 200, body: { commit: { sha: MAIN_SHA } } },
+    [`POST ${mergesPath()}`]: { status: 409, body: { message: "Merge conflict" } },
+    [`GET ${comparePath(BASE, HEAD)}`]: { status: 200, body: { files: [{ filename: "a.ts" }] } },
+    [`GET ${comparePath(HEAD, BASE)}`]: { status: 200, body: { files: [{ filename: "a.ts" }] } },
+  });
+  const runningCi = () => ({ [CI]: { agentId: "agentcore_hub_ci_agent", status: "running" } });
+  /** every id ever passed to addBlockers, flattened */
+  const blockedOn = (deps) => deps.addBlockers.mock.calls.flatMap(([, ids]) => ids);
+
+  /** The hold is what matters: the edge, the released claim, the persisted pointer. */
+  function expectHeldOn(deps, wf, fixId) {
+    expect(deps.addBlockers).toHaveBeenCalledWith(CI, [fixId]);
+    expect(deps.store.setTaskStatus).toHaveBeenCalledWith(WF, CI, "ready");
+    expect(wf.agentTasks[CI].status).toBe("ready");
+    expect(deps.store.setSyncMain.mock.calls.at(-1)[1]).toMatchObject({
+      status: "conflict", fixTicketId: fixId, ciTicketId: CI, baseHeadSha: MAIN_SHA,
+    });
+  }
+
+  // ── F1: both providers' create_ticket shapes ───────────────────────────────
+
+  it("JIRA fresh create ({ ticketId }) holds CI — the shape that was silently failing in prod", async () => {
+    const { deps, event } = makeDeps(conflictRoutes(), {
+      invokeTickets: vi.fn(async () => ({ ticketId: FIX_ID, status: "todo", message: `Created ${FIX_ID}: x` })),
+    });
+    const wf = makeWorkflow({ agentTasks: runningCi() });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    expect(r).toMatchObject({ outcome: "conflict", fixTicketId: FIX_ID, round: 1 });
+    expect(deps.invokeTickets).toHaveBeenCalledTimes(1);
+    expectHeldOn(deps, wf, FIX_ID);
+    expect(event("workflow.sync_conflict")[0].detail).toMatchObject({ fixTicketId: FIX_ID });
+    expect(event("workflow.sync_skipped")).toHaveLength(0);
+  });
+
+  it("JIRA summary-dedupe hit ({ ticketId, deduplicated }) holds CI on the EXISTING ticket", async () => {
+    // The jira Lambda answers a create for an existing summary with mapIssue(dup) +
+    // deduplicated:true. That ticket is exactly the one CI must wait on: refusing it
+    // would fail open on a conflict that is already ticketed.
+    const { deps } = makeDeps(conflictRoutes(), {
+      invokeTickets: vi.fn(async () => ({
+        ticketId: FIX_ID, title: "Fix (sync-main): merge conflict with main in 1 file(s)",
+        status: "in_progress", assignee: "agentcore_hub_backend_dev", deduplicated: true,
+      })),
+    });
+    const wf = makeWorkflow({ agentTasks: runningCi() });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    expect(r).toMatchObject({ outcome: "conflict", fixTicketId: FIX_ID });
+    expectHeldOn(deps, wf, FIX_ID);
+  });
+
+  it("DYNAMODB ({ key, ticket: { key } }) is unchanged — and the nested key alone is enough", async () => {
+    for (const shape of [{ key: FIX_ID }, { ticket: { key: FIX_ID } }, { status: "created", ticket: { ticketId: FIX_ID } }]) {
+      const { deps } = makeDeps(conflictRoutes(), { invokeTickets: vi.fn(async () => shape) });
+      const wf = makeWorkflow({ agentTasks: runningCi() });
+      expect(await syncBeforeCi(wf, ciTicket(), deps)).toMatchObject({ outcome: "conflict", fixTicketId: FIX_ID });
+      expectHeldOn(deps, wf, FIX_ID);
+    }
+  });
+
+  it("create_ticket REJECTING still fails open: conflict_unticketed, nothing blocked, no round burned", async () => {
+    const { deps, event } = makeDeps(conflictRoutes(), {
+      invokeTickets: vi.fn(async () => { throw new Error("Tickets___create_ticket: jira 400"); }),
+    });
+    const wf = makeWorkflow({ agentTasks: runningCi() });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    expect(r).toMatchObject({ outcome: "skipped", reason: "conflict_unticketed" });
+    expect(deps.addBlockers).not.toHaveBeenCalled();
+    expect(deps.store.setTaskStatus).not.toHaveBeenCalled();
+    expect(event("workflow.sync_conflict")).toHaveLength(0);
+    const record = deps.store.setSyncMain.mock.calls.at(-1)[1];
+    expect(record).toMatchObject({ status: "conflict", fixTicketId: null });
+    expect(record.round).toBeUndefined();
+  });
+
+  it("a bare { error } that RESOLVES is no more a ticket than a throw is", async () => {
+    // index.mjs's invokeTickets turns this into a throw at the seam (TEAM-4156 F1),
+    // but this module must not depend on that: an id it cannot read is no ticket.
+    const { deps } = makeDeps(conflictRoutes(), { invokeTickets: vi.fn(async () => ({ error: "Unknown tool: Tickets___create_ticket" })) });
+    const r = await syncBeforeCi(makeWorkflow({ agentTasks: runningCi() }), ciTicket(), deps);
+    expect(r).toMatchObject({ outcome: "skipped", reason: "conflict_unticketed" });
+    expect(deps.addBlockers).not.toHaveBeenCalled();
+  });
+
+  it("a non-string id is garbage, not an id — it must never reach a blocker edge", async () => {
+    for (const shape of [{ key: 500 }, { ticketId: { value: FIX_ID } }, { key: "   " }, {}, null]) {
+      const { deps } = makeDeps(conflictRoutes(), { invokeTickets: vi.fn(async () => shape) });
+      const r = await syncBeforeCi(makeWorkflow({ agentTasks: runningCi() }), ciTicket(), deps);
+      expect(r).toMatchObject({ outcome: "skipped", reason: "conflict_unticketed" });
+      expect(deps.addBlockers).not.toHaveBeenCalled();
+    }
+  });
+
+  // ── F2: the record is not the only witness ─────────────────────────────────
+
+  it("persist runs BEFORE the blocker edge and the event — the pointer is written first", async () => {
+    const order = [];
+    const { deps } = makeDeps(conflictRoutes(), {
+      store: {
+        setSyncMain: vi.fn(async (_wf, rec) => { order.push(`setSyncMain:${rec.fixTicketId}`); }),
+        setTaskStatus: vi.fn(async () => { order.push("setTaskStatus"); }),
+      },
+      addBlockers: vi.fn(async () => { order.push("addBlockers"); }),
+      publishEvent: vi.fn(async (_t, type) => { order.push(`event:${type}`); }),
+      invokeTickets: vi.fn(async () => { order.push("create_ticket"); return { ticketId: FIX_ID }; }),
+    });
+
+    await syncBeforeCi(makeWorkflow({ agentTasks: runningCi() }), ciTicket(), deps);
+
+    // Everything after the create can throw or be interrupted; the record is what a
+    // redelivery reads, so it goes first.
+    expect(order).toEqual([
+      "create_ticket",
+      `setSyncMain:${FIX_ID}`,
+      "addBlockers",
+      "setTaskStatus",
+      "event:workflow.sync_conflict",
+    ]);
+  });
+
+  it("the record write FAILING is reported on the event rather than only warned about", async () => {
+    const { deps, event } = makeDeps(conflictRoutes(), {
+      store: { setSyncMain: vi.fn(async () => { throw new Error("ProvisionedThroughputExceeded"); }), setTaskStatus: vi.fn(async () => {}) },
+      invokeTickets: vi.fn(async () => ({ ticketId: FIX_ID })),
+    });
+    const wf = makeWorkflow({ agentTasks: runningCi() });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    // The outcome is unchanged — a lost record must not un-hold CI.
+    expect(r).toMatchObject({ outcome: "conflict", fixTicketId: FIX_ID });
+    expect(deps.addBlockers).toHaveBeenCalledWith(CI, [FIX_ID]);
+    expect(event("workflow.sync_conflict")[0].detail).toMatchObject({ fixTicketId: FIX_ID, persistFailed: true });
+  });
+
+  it("REDELIVERY after a lost record files NO second ticket — the sibling scan sees the first one", async () => {
+    // The prod sequence this reproduces: 409 → create_ticket OK → setSyncMain fails
+    // → the stream redelivers the same ready event. Before F2 the second pass filed
+    // an identical ticket at the same dev and blocked CI on the newer one, leaving
+    // the first open forever.
+    const board = [];
+    const { deps } = makeDeps(conflictRoutes(), {
+      store: { setSyncMain: vi.fn(async () => { throw new Error("ddb down"); }), setTaskStatus: vi.fn(async () => {}) },
+      invokeTickets: vi.fn(async (_op, params) => {
+        board.push({ ticketId: FIX_ID, status: "To Do", spawnedBy: params.spawned_by });
+        return { ticketId: FIX_ID };
+      }),
+      getChildTickets: vi.fn(async () => board),
+    });
+    const wf = makeWorkflow({ agentTasks: runningCi() });
+
+    const first = await syncBeforeCi(wf, ciTicket(), deps);
+    // The record never landed, so the second pass starts with no memory of FIX_ID.
+    delete wf.syncMain;
+    wf.agentTasks[CI].status = "running";
+    const second = await syncBeforeCi(wf, ciTicket(), deps);
+
+    expect(deps.invokeTickets).toHaveBeenCalledTimes(1);
+    expect(first).toMatchObject({ outcome: "conflict", fixTicketId: FIX_ID });
+    expect(second).toMatchObject({ outcome: "conflict", fixTicketId: FIX_ID, reason: "already_ticketed", reusedFromSibling: true, round: 1 });
+    // Both passes hold CI on the SAME ticket.
+    expect(blockedOn(deps)).toEqual([FIX_ID, FIX_ID]);
+    expect(wf.agentTasks[CI].status).toBe("ready");
+  });
+
+  it("the scan matches on spawnedBy provenance, not on summary text or epic membership", async () => {
+    const siblings = [
+      { ticketId: "TEAM-600", status: "todo", title: "Fix (sync-main): merge conflict with main in 1 file(s)" }, // no spawnedBy
+      { ticketId: "TEAM-601", status: "todo", spawnedBy: { kind: "review_fix", gateTicketId: CI } },             // wrong kind
+      { ticketId: "TEAM-602", status: "todo", spawnedBy: { kind: "sync_fix", ciTicketId: "TEAM-OTHER" } },       // another CI ticket
+      { ticketId: FIX_ID, status: "todo", spawnedBy: { kind: "sync_fix", ciTicketId: CI } },                     // ← this one
+    ];
+    const { deps } = makeDeps(conflictRoutes(), {
+      getChildTickets: vi.fn(async () => siblings),
+      invokeTickets: vi.fn(async () => ({ ticketId: "TEAM-999" })),
+    });
+    const wf = makeWorkflow({ agentTasks: runningCi() });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    expect(deps.invokeTickets).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ outcome: "conflict", fixTicketId: FIX_ID, reusedFromSibling: true });
+    expect(deps.getChildTickets).toHaveBeenCalledWith(EPIC);
+    expect(blockedOn(deps)).toEqual([FIX_ID]);
+  });
+
+  it("a CLOSED sync_fix sibling is NEVER reused (TEAM-4131 F1) — the next ticket is filed instead", async () => {
+    // Same wedge as a closed RECORDED ticket: a closed ticket fires no further
+    // `done`, so a blocker edge onto it never clears.
+    for (const closed of ["done", "Done", "cancelled", "skipped"]) {
+      const { deps } = makeDeps(conflictRoutes(), {
+        getChildTickets: vi.fn(async () => [{ ticketId: FIX_ID, status: closed, spawnedBy: { kind: "sync_fix", ciTicketId: CI } }]),
+        invokeTickets: vi.fn(async () => ({ ticketId: "TEAM-501" })),
+      });
+      const wf = makeWorkflow({ agentTasks: runningCi() });
+
+      const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+      expect(deps.invokeTickets).toHaveBeenCalledTimes(1);
+      expect(r).toMatchObject({ outcome: "conflict", fixTicketId: "TEAM-501" });
+      // The corpse is never blocked on.
+      expect(blockedOn(deps)).toEqual(["TEAM-501"]);
+    }
+  });
+
+  it("an OPEN sibling in every other status IS reused, and an unknown status counts as open", async () => {
+    for (const open of ["todo", "in_progress", "in_review", "blocked", "ready", "", undefined]) {
+      const { deps } = makeDeps(conflictRoutes(), {
+        getChildTickets: vi.fn(async () => [{ ticketId: FIX_ID, status: open, spawnedBy: { kind: "sync_fix", ciTicketId: CI } }]),
+      });
+      const r = await syncBeforeCi(makeWorkflow({ agentTasks: runningCi() }), ciTicket(), deps);
+      expect(deps.invokeTickets).not.toHaveBeenCalled();
+      expect(r).toMatchObject({ fixTicketId: FIX_ID, reusedFromSibling: true });
+    }
+  });
+
+  it("the RECORDED ticket still wins — a run that remembers its fix never lists the epic", async () => {
+    const { deps } = makeDeps(conflictRoutes(), {
+      getTicketStatus: vi.fn(async () => "in_progress"),
+      getChildTickets: vi.fn(async () => { throw new Error("must not be called"); }),
+    });
+    const wf = makeWorkflow({
+      syncMain: { ciTicketId: CI, baseHeadSha: MAIN_SHA, status: "conflict", fixTicketId: FIX_ID, files: ["b.ts"] },
+      agentTasks: runningCi(),
+    });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    expect(deps.getChildTickets).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ outcome: "conflict", fixTicketId: FIX_ID, reason: "already_ticketed", files: ["b.ts"] });
+    expect(r.reusedFromSibling).toBeUndefined();
+  });
+
+  it("a CLOSED recorded ticket goes to round 2 without consulting the scan", async () => {
+    // The scan could only find the same closed ticket (or an unrelated open one) and
+    // would undo the round escalation TEAM-4131 F1 exists for.
+    const { deps } = makeDeps(conflictRoutes(), {
+      getTicketStatus: vi.fn(async () => "done"),
+      getChildTickets: vi.fn(async () => [{ ticketId: FIX_ID, status: "done", spawnedBy: { kind: "sync_fix", ciTicketId: CI } }]),
+      invokeTickets: vi.fn(async () => ({ ticketId: "TEAM-501" })),
+    });
+    const wf = makeWorkflow({
+      syncMain: { ciTicketId: CI, baseHeadSha: MAIN_SHA, status: "conflict", fixTicketId: FIX_ID, round: 1 },
+      agentTasks: runningCi(),
+    });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    expect(deps.getChildTickets).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ outcome: "conflict", fixTicketId: "TEAM-501", round: 2, priorFixTicketId: FIX_ID });
+    expect(deps.invokeTickets.mock.calls[0][1].summary).toContain("(round 2)");
+  });
+
+  it("the scan failing, answering garbage, or not being wired at all degrades to a create", async () => {
+    for (const getChildTickets of [
+      vi.fn(async () => { throw new Error("ddb down"); }),
+      vi.fn(async () => null),
+      vi.fn(async () => ({ items: [] })),
+      vi.fn(async () => [null, undefined, "TEAM-600", 7]),
+      undefined,
+    ]) {
+      const { deps } = makeDeps(conflictRoutes(), {
+        getChildTickets,
+        invokeTickets: vi.fn(async () => ({ ticketId: FIX_ID })),
+      });
+      const wf = makeWorkflow({ agentTasks: runningCi() });
+
+      // Suppressing the duplicate is an optimisation on a fail-open path: a scan we
+      // cannot trust must never stop the ticket from being filed.
+      const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+      expect(deps.invokeTickets).toHaveBeenCalledTimes(1);
+      expect(r).toMatchObject({ outcome: "conflict", fixTicketId: FIX_ID });
+      expectHeldOn(deps, wf, FIX_ID);
+    }
+  });
+
+  it("a sibling row with no readable id is skipped rather than blocked on", async () => {
+    const { deps } = makeDeps(conflictRoutes(), {
+      getChildTickets: vi.fn(async () => [
+        { status: "todo", spawnedBy: { kind: "sync_fix", ciTicketId: CI } },      // no id at all
+        { key: FIX_ID, status: "todo", spawnedBy: { kind: "sync_fix", ciTicketId: CI } }, // `key`-spelled
+      ]),
+    });
+    const r = await syncBeforeCi(makeWorkflow({ agentTasks: runningCi() }), ciTicket(), deps);
+    expect(r).toMatchObject({ fixTicketId: FIX_ID, reusedFromSibling: true });
+    expect(deps.addBlockers).toHaveBeenCalledWith(CI, [FIX_ID]);
+  });
+
+  it("the scan is 409-only: a clean sync never lists the epic", async () => {
+    const { deps } = makeDeps(
+      {
+        [`GET ${branchesPath()}`]: { status: 200, body: { commit: { sha: MAIN_SHA } } },
+        [`POST ${mergesPath()}`]: { status: 201, body: { sha: MERGE_SHA } },
+      },
+      { getChildTickets: vi.fn(async () => []) }
+    );
+    expect(await syncBeforeCi(makeWorkflow(), ciTicket(), deps)).toMatchObject({ outcome: "synced" });
+    expect(deps.getChildTickets).not.toHaveBeenCalled();
+  });
+});

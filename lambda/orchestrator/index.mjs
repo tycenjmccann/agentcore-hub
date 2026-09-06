@@ -656,6 +656,12 @@ function syncDeps() {
     // exactly the wrong read. Both syncBeforeCi call sites (the unified ready path
     // and the DDB ready path) share this one memoized object.
     getTicketStatus: async (id) => (await getTicketConsistent(id))?.status ?? null,
+    // TEAM-4156 F2: the 409 path's duplicate guard. The `syncMain` record is
+    // written after create_ticket, so a lost record used to mean a second
+    // identical sync_fix ticket at the same dev on every redelivery. One list of
+    // the epic's children — the same seam live-reverify uses for its own sibling
+    // scan — sees the ticket the record forgot.
+    getChildTickets,
     now: () => new Date(),
     mode: SYNC_MAIN_BEFORE_CI,
     log: console,
@@ -1203,6 +1209,25 @@ async function jiraStatusIsPreserved(issueKey, preserveStatusIf) {
  * addTicketComment's fire-and-forget invoke this one reads the response). Both
  * provider Lambdas expose the identical `Tickets___*` interface, so the caller
  * never learns which backend is live.
+ *
+ * "Identical interface" was only true of the INPUTS, though — the two Lambdas
+ * disagree on both halves of the answer (TEAM-4156 F1), and this seam is where
+ * that is reconciled, once, so no caller has to know:
+ *
+ *   failures — the dynamodb Lambda answers a textResult envelope
+ *     (`{content:[{text}]}`); the jira Lambda's handler catch-all and its
+ *     unknown-tool path answer a BARE `{ error }`. Only the first was detected, so
+ *     a jira failure came back as a truthy "result" and every caller read it as
+ *     success. Both are now throws — a create that did not happen must never look
+ *     like one that did.
+ *   create_ticket's id — dynamodb answers `{ key, ticket:{key} }`, jira answers
+ *     `{ ticketId }` (fresh) or `{ ...mapIssue(dup), deduplicated:true }` (summary
+ *     dedupe), also `ticketId`. Normalized to `key` here, in place, keeping every
+ *     other field (`deduplicated`, `warning`, `ticket`, …) so a caller can still
+ *     see a dedupe hit. Callers ALSO read the id through
+ *     ticket-blockers.mjs's `createdTicketId`, which handles both spellings on its
+ *     own — belt and braces, because agents reach the same providers through paths
+ *     that do not come through here.
  */
 async function invokeTickets(toolName, parameters) {
   const res = await lambda.send(new InvokeCommand({
@@ -1213,10 +1238,20 @@ async function invokeTickets(toolName, parameters) {
   if (!raw) return null;
   let parsed = JSON.parse(raw);
   if (typeof parsed === "string") parsed = JSON.parse(parsed);
-  // Errors come back as a textResult envelope ({ content: [{ text }] }); the
-  // create/transition ops return their object directly.
-  if (parsed?.content?.[0]?.text && !parsed.key) {
-    throw new Error(`Tickets___${toolName}: ${String(parsed.content[0].text).slice(0, 300)}`);
+  const obj = parsed && typeof parsed === "object" ? parsed : null;
+  // An id under EITHER provider's spelling means the op produced a real ticket,
+  // whatever else rides along with it. Checked before both error shapes so a
+  // legitimate ticket that happens to carry an `error`/`content` field is never
+  // thrown away.
+  const hasId = !!obj && (typeof obj.key === "string" || typeof obj.ticketId === "string");
+  if (obj && !hasId && typeof obj.error === "string") {
+    throw new Error(`Tickets___${toolName}: ${obj.error.slice(0, 300)}`);
+  }
+  if (obj?.content?.[0]?.text && !hasId) {
+    throw new Error(`Tickets___${toolName}: ${String(obj.content[0].text).slice(0, 300)}`);
+  }
+  if (toolName === "create_ticket" && obj && typeof obj.key !== "string" && typeof obj.ticketId === "string") {
+    obj.key = obj.ticketId;
   }
   return parsed;
 }
@@ -1300,10 +1335,11 @@ async function labelEpicUncertifiable(workflow, ciCheck) {
   try {
     const res = await invokeTickets("labels_add", { ticket_id: epicId, issue_key: epicId, labels: ["ci:uncertifiable"] });
     // The jira Lambda's failure envelope is a BARE `{ error }` with no `content`
-    // field, so invokeTickets' textResult check cannot see it and returns
-    // normally. Unchecked, a 400 from Jira would be recorded as a successful
-    // label — suppressing both the comment fallback and (via labeled:true) every
-    // later retry. Check the payload, not just the throw.
+    // field. invokeTickets now throws on it (TEAM-4156 F1) and the catch below
+    // does the right thing, so this check is redundant — kept because it is the
+    // cheap, local guarantee that a 400 from Jira can never be recorded as a
+    // successful label, which would suppress both the comment fallback and (via
+    // labeled:true) every later retry. Check the payload, not just the throw.
     if (res?.error) throw new Error(String(res.error).slice(0, 300));
     labeled = true;
   } catch (err) {
