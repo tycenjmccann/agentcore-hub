@@ -14,13 +14,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { validateIntakeSources, getSourceValidationMode, shouldRejectSubmission } from "@/lib/workflow/intake";
 import { validateSourcesShape } from "@/lib/workflow/source-shape";
 import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure } from "@/lib/workflow/repo-check";
 import type { RepoCheck } from "@/lib/workflow/repo-check";
 import type { WorkflowInput } from "@/lib/workflow/types";
 import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
-import { workflowTypeForDef } from "@/lib/workflow/workflow-defs";
+import { workflowTypeForDef, sdlcFrameworkForDef } from "@/lib/workflow/workflow-defs";
+import { intentGateFor, renderIntentMarkdown, intentReviewPackage, intentGateDescription } from "@/lib/workflow/intent";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -29,6 +31,7 @@ const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows"
 const PROJECT_KEY = process.env.JIRA_PROJECT_KEY || process.env.PROJECT_KEY || "TEAM";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || "agentcore-hub-tickets";
+const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 
 // TEAM-3335 F1: intakeChannel values reserved for internal callers. The
 // anomaly-watcher Lambda counts its fleet-wide open-filing cap via a GSI on
@@ -44,6 +47,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
   marshallOptions: { removeUndefinedValues: true },
 });
 const lambda = new LambdaClient({ region: REGION });
+const s3 = new S3Client({ region: REGION });
 
 const TERMINAL_PHASES = new Set(["complete", "error", "cancelled"]);
 
@@ -530,7 +534,7 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
     // TEAM-3886: persist the NORMALIZED input — dashboards (WorkflowBoard) pick
     // rendered phases from input.workflowDefId, so a type-only submission must
     // carry the resolved def id, matching the top-level row field.
-    input: { ...body, workflowDefId: def.id },
+    input: { ...body, workflowDefId: def.id, sdlcFramework: sdlcFrameworkForDef(def) },
     agentTasks: {},
     messages: [],
     humanNotifications: [],
@@ -539,6 +543,8 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
     // TEAM-3832 FR2: derived from the resolved def — never from caller input.
     workflowType: workflowTypeForDef(def),
     workflowDefId: def.id,
+    // Playbook runs stamp their framework so the board badge is the truth.
+    sdlcFramework: sdlcFrameworkForDef(def),
     ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
   }, markerId);
 
@@ -572,21 +578,48 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
   //    the same window: a ticket that never goes Ready never fires the webhook,
   //    which is the same stillborn state.
   try {
+    // Playbook defs: the hub itself creates the Intent Acceptance gate (a human
+    // ticket, Ready now) and the intake ticket waits behind it. The product
+    // owner's approval — not the submit — is what starts the first agent.
+    const intentGate = intentGateFor(def, body.reviewGates || []);
+    let gateTicketId: string | undefined;
+    if (intentGate) {
+      const intentMd = await writeIntentArtifacts(workflowId, body);
+      const gate = await jira.createTicket({
+        parentId: epicId,
+        title: `${intentGate.name || "Intent Acceptance"}: ${body.title}`,
+        description: intentGateDescription(intentMd, workflowId),
+        assignee: intentGate.assignee || "human:product-owner",
+        blockedBy: [],
+        extraLabels: [`wfdef:${def.id}`],
+      }, workflowId);
+      gateTicketId = gate.id;
+      await jira.transitionTo(gate.id, "Ready");
+      console.log(`[start/jira] ${workflowId}: Intent Acceptance gate ${gate.id} → Ready (playbook).`);
+    }
+
     const reqTicket = await jira.createTicket({
       parentId: epicId,
       title: `${def.phases.find((p) => p.type === "agent")?.name || "Intake"}: ${def.intakeAgentId} — ${body.title}`,
-      description: `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
+      description: intentGate
+        ? `Turn the accepted intent (workflows/${workflowId}/shared/intent.md) into the spec and the ticket plan. Blocked until the product owner approves the Intent Acceptance gate ${gateTicketId}.\n\nTitle: ${body.title}`
+        : `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
       assignee: def.intakeAgentId,
-      blockedBy: [],
+      blockedBy: gateTicketId ? [gateTicketId] : [],
       // wfdef stamp keeps the ticket classifiable on the dashboard even if the
       // workflow row is later deleted.
       extraLabels: [`wfdef:${def.id}`],
     }, workflowId);
 
-    // Requirements ticket has no blockers — transition to "Ready" so the webhook fires
-    // and the orchestrator invokes the agent (same flow as all other tickets in the pipeline)
-    await jira.transitionTo(reqTicket.id, "Ready");
-    console.log(`[start/jira] Workflow ${workflowId} created. Epic: ${epicId}. Req ticket: ${reqTicket.id} → Ready.`);
+    if (gateTicketId) {
+      // Blocked behind the human gate — the cascade moves it to Ready on approval.
+      console.log(`[start/jira] Workflow ${workflowId} created. Epic: ${epicId}. Intake ticket ${reqTicket.id} waits on gate ${gateTicketId}.`);
+    } else {
+      // Requirements ticket has no blockers — transition to "Ready" so the webhook fires
+      // and the orchestrator invokes the agent (same flow as all other tickets in the pipeline)
+      await jira.transitionTo(reqTicket.id, "Ready");
+      console.log(`[start/jira] Workflow ${workflowId} created. Epic: ${epicId}. Req ticket: ${reqTicket.id} → Ready.`);
+    }
   } catch (err) {
     await markWorkflowStartError(workflowId, err);
     throw err;
@@ -641,7 +674,7 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
     // TEAM-3886: persist the NORMALIZED input — dashboards (WorkflowBoard) pick
     // rendered phases from input.workflowDefId, so a type-only submission must
     // carry the resolved def id, matching the top-level row field.
-    input: { ...body, workflowDefId: def.id },
+    input: { ...body, workflowDefId: def.id, sdlcFramework: sdlcFrameworkForDef(def) },
     agentTasks: {},
     messages: [],
     humanNotifications: [],
@@ -649,6 +682,8 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
     // TEAM-3832 FR2: derived from the resolved def — never from caller input.
     workflowType: workflowTypeForDef(def),
     workflowDefId: def.id,
+    // Playbook runs stamp their framework so the board badge is the truth.
+    sdlcFramework: sdlcFrameworkForDef(def),
     ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
   }, markerId);
 
@@ -710,13 +745,32 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
   //    future trigger onto a stillborn run with zero tickets.
   let reqResult: Record<string, unknown>;
   try {
+    // Playbook defs: hub-created Intent Acceptance gate first (see startWithJira).
+    const intentGate = intentGateFor(def, body.reviewGates || []);
+    let gateTicketId: string | undefined;
+    if (intentGate) {
+      const intentMd = await writeIntentArtifacts(workflowId, body);
+      const gateResult = await invokeTicketLambda("Tickets___create_ticket", {
+        summary: `${intentGate.name || "Intent Acceptance"}: ${body.title}`,
+        description: intentGateDescription(intentMd, workflowId),
+        issue_type: "Task",
+        parent_key: epicId,
+        assignee: intentGate.assignee || "human:product-owner",
+        workflow_id: workflowId,
+      });
+      if (gateResult.error) throw new Error(`Failed to create Intent Acceptance gate: ${gateResult.error}`);
+      gateTicketId = (gateResult.key || gateResult.ticketId) as string;
+    }
     reqResult = await invokeTicketLambda("Tickets___create_ticket", {
       summary: `${intakePhaseName}: ${def.intakeAgentId} — ${body.title}`,
-      description: `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
+      description: intentGate
+        ? `Turn the accepted intent (workflows/${workflowId}/shared/intent.md) into the spec and the ticket plan. Blocked until the product owner approves the Intent Acceptance gate ${gateTicketId}.\n\nTitle: ${body.title}`
+        : `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
       issue_type: "Task",
       parent_key: epicId,
       assignee: def.intakeAgentId,
       workflow_id: workflowId,
+      ...(gateTicketId ? { blocked_by: [gateTicketId] } : {}),
     });
   } catch (err) {
     await markWorkflowStartError(workflowId, err);
@@ -737,6 +791,42 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Playbook PLAN stage: render the originator's words into intent.md and the
+ * Intent Acceptance review package, and store both in the run's shared S3
+ * workspace. Returns the markdown (it is also the gate ticket's body). The S3
+ * write is best-effort for the ticket body — a bucket hiccup must not lose the
+ * run — but it is logged loudly because the gate ping and the spec author both
+ * read the file.
+ */
+async function writeIntentArtifacts(workflowId: string, body: WorkflowInput): Promise<string> {
+  const intentMd = renderIntentMarkdown({ workflowId, input: body });
+  if (!ARTIFACT_BUCKET) {
+    console.warn(`[start] ${workflowId}: ARTIFACT_BUCKET unset — intent.md not persisted to S3`);
+    return intentMd;
+  }
+  const pkg = intentReviewPackage({ workflowId, input: body });
+  const puts = [
+    s3.send(new PutObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: `workflows/${workflowId}/shared/intent.md`,
+      Body: intentMd,
+      ContentType: "text/markdown; charset=utf-8",
+    })),
+    s3.send(new PutObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: `workflows/${workflowId}/shared/review-package-intake.json`,
+      Body: JSON.stringify(pkg, null, 2),
+      ContentType: "application/json",
+    })),
+  ];
+  const results = await Promise.allSettled(puts);
+  for (const r of results) {
+    if (r.status === "rejected") console.error(`[start] ${workflowId}: intent artifact write failed: ${(r.reason as Error)?.message || r.reason}`);
+  }
+  return intentMd;
+}
 
 async function invokeTicketLambda(toolName: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
   const resp = await lambda.send(new InvokeCommand({

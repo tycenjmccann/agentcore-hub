@@ -67,6 +67,18 @@ export const PortedSessionSchema = z.object({
   branch: z.string().min(1),
 });
 
+// Playbook PLAN stage: the originator's intent in their own words. The hub
+// renders it verbatim into intent.md; the product owner accepts it at the
+// Intent Acceptance gate before any agent runs.
+export const IntentBriefSchema = z.object({
+  problem: z.string().min(1),
+  who: z.string().optional(),
+  successCriteria: z.string().min(1),
+  constraints: z.string().optional(),
+  outOfScope: z.string().optional(),
+  originator: z.string().optional(),
+});
+
 export const WorkflowInputSchema = z.object({
   title: z.string().min(1),
   description: z.string().min(1),
@@ -80,6 +92,7 @@ export const WorkflowInputSchema = z.object({
   workflowType: z.enum(["feature", "bug"]).optional(),
   workflowDefId: z.string().optional(),
   reviewGates: z.array(z.string()).optional(),
+  intent: IntentBriefSchema.optional(),
   portedSession: PortedSessionSchema.optional(),
   // Waive the submit-time GitHub pre-flight on a repoConfig URL that
   // definitively does not exist; the intake agent then hunts for the right

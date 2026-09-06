@@ -22,6 +22,9 @@ export async function GET() {
       description: w.description,
       icon: w.icon,
       requiresRepo: w.requiresRepo,
+      // Playbook defs switch the intake form into intent-template mode.
+      sdlcFramework: w.sdlcFramework || "standard",
+      artifactChain: w.artifactChain,
       phases: w.phases.map((p) => ({ id: p.id, name: p.name, type: p.type })),
       // Surface flagged review gates so the intake form can offer them as opt-ins.
       reviewGates: (w.reviewGates || []).map((g) => ({

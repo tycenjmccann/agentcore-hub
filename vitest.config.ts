@@ -43,6 +43,9 @@ export default defineConfig({
       // Its parity with src/lib/workflow/lease.ts is asserted by the auto-
       // included src/lib/workflow/lease-parity.test.ts.
       "lambda/orchestrator/lease.test.mjs",
+      // artifact-chain.mjs — the playbook's committed-artifact chain (pure
+      // helpers: owed artifacts per ticket, context block, gate overrides).
+      "lambda/orchestrator/artifact-chain.test.mjs",
       // watchdog.mjs mirrors the TS watchdog resolver (TEAM-3618 D1.1) — pure
       // config resolution, unit-testable via setWatchdogSource().
       "lambda/orchestrator/watchdog.test.mjs",

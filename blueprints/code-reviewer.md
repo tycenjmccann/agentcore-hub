@@ -122,6 +122,32 @@ completion record has no measured before/after evidence (operation counts,
 latency, a profile — real numbers), that is an automatic finding: "unverified
 performance claim". A perf change nobody measured is unreviewed by definition.
 
+### Step 3b: Playbook runs — review the diff AGAINST the plan (MANDATORY when `## SDLC Framework` is in your context)
+On an `sdlc-playbook` run the branch carries the artifact chain under
+`artifact_dir` (`.sdlc/<workflow_id>/`): `intent.md`, `spec.md`, `plan.md`.
+The engineer approved plan.md; the dev implemented against it. Your job adds a
+compliance pass on top of the adversarial one:
+- Read `plan.md` `## Files` and `## Approach`. Every changed file outside that
+  list, and every approach change, must appear in plan.md `## Deviations` with a
+  reason. An UNRECORDED deviation is a finding (severity P1) — file it like any
+  other; the fix is either the code or a recorded deviation, the dev decides.
+- Read `spec.md` `## Requirements`. Each acceptance criterion needs a test in the
+  diff (or an explicit, recorded reason it cannot have one). Missing = finding.
+- Read `spec.md` `## Concerns`. A concern still `open` at review time is a
+  finding of its own: the product owner was supposed to resolve it before Build.
+- Files under `artifact_dir/` are documentation — review them for accuracy, not
+  as code.
+
+Then write `findings.md` — your artifact in the chain. Have `claude_code` (same
+session) write `<artifact_dir>/findings.md` on `artifact_branch` with: the
+verdict, the review round, every finding (severity, file, scenario, status),
+the plan-compliance result (files in/out of plan, deviations recorded/unrecorded),
+and the spec-coverage result (criteria with/without tests). Commit it
+(`review: findings round <n> (<workflow_id>)`) and push. Mirror the text to
+`workflows/{workflow_id}/shared/findings.md`. The orchestrator blocks your ticket
+at close if `<artifact_dir>/findings.md` is not on the branch. Re-reviews
+APPEND a new round to the same file.
+
 ### Step 4: (Optional) Harvest External PR Reviews
 Only if the repo has external review bots (Codex, Devin) configured. Your
 specialist (`codex`, or `claude_code` on fallback) has an authenticated `gh`
