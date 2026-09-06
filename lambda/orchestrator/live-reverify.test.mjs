@@ -964,3 +964,125 @@ describe("mode off (the default) — the module is inert even if it is construct
     // done-handlers-cascade.test.mjs is what proves off costs nothing there.
   });
 });
+
+// ─── TEAM-4156 ───────────────────────────────────────────────────────────────
+
+/**
+ * The `Re-verify (QA)` producer reads the created ticket's id out of whatever the
+ * tickets Lambda answered — and the two providers have never agreed on that:
+ * dynamodb answers `{ key, ticket:{key} }`, jira answers `{ ticketId }` on a fresh
+ * create and `{ ...mapIssue(dup), deduplicated:true }` (also `ticketId`) when it
+ * dedupes on summary. This module read `key` only.
+ *
+ * Under TICKET_PROVIDER=jira — what `.env.example` and the Dockerfile ship — that
+ * made EVERY re-verification a no-op with a real ticket left behind: the id read
+ * null, so the CAS slot was handed back, no ship ticket was blocked, no marker was
+ * written, and the release manager shipped past an unverified live fix while an
+ * orphan `Re-verify (QA)` ticket sat on the board assigned to QA. The suite did not
+ * notice because every fake here answered `{ key }`.
+ *
+ * The TEAM-4130 F2 slot semantics are unchanged and are what the failure cases pin:
+ * an id we cannot read must still release the slot, or the run's own dead claim
+ * blocks every retry for staleAfterMs.
+ */
+describe("TEAM-4156 — the re-verify ticket's id is read under BOTH providers", () => {
+  const ship = (over = {}) => ({ ticketId: SHIP, assignee: "agentcore_hub_release_manager", status: "in_progress", ...over });
+  const PRESERVE = ["in_progress", "in_review"];
+  const withShip = () => harness({
+    children: [ship()],
+    phases: { agentcore_hub_release_manager: "ship" },
+  });
+
+  /** Everything the re-verification is FOR, once an id is in hand. */
+  async function expectFiledAndBlocking(reply) {
+    const { onFixDone, deps, calls, workflow, record } = withShip();
+    deps.invokeTickets.mockResolvedValueOnce(reply);
+
+    const result = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: record });
+
+    expect(result).toEqual({ action: "created", reverifyTicketId: REVERIFY, sha7: SHA7, unverified: false });
+    expect(createAttempts(deps)).toHaveLength(1);
+    // (1) the marker — both the durable write and this container's snapshot, which
+    // is what makes the next Done for the same (fix, head) idempotent.
+    expect(calls.mergeTaskMetadata).toEqual([
+      { wfId: WF, tid: FIX, fields: { reverifyTicketId: REVERIFY, reverifySha: SHA7 } },
+    ]);
+    expect(workflow.agentTasks[FIX].reverifyTicketId).toBe(REVERIFY);
+    // (2) the hold — the release manager cannot ship past the re-verification.
+    expect(calls.addBlockers).toEqual([{ ticketId: SHIP, ids: [REVERIFY], opts: { preserveStatusIf: PRESERVE } }]);
+    expect(eventsOfType(calls, "fix.reverify_created")[0].detail.blockedShipTickets).toEqual([SHIP]);
+    // (3) the slot stays HELD: it is the winner's claim, and releasing it here
+    // would let a redelivery file a second ticket for the same (fix, head).
+    expect(calls.releases).toEqual([]);
+    expect(deps.store.slots.get(`${WF}::${FIX}`)).toMatchObject({ reverifyTicketId: REVERIFY, reverifySha: SHA7 });
+    return { calls, deps };
+  }
+
+  it("DYNAMODB { key } — the shape this suite has always used", async () => {
+    await expectFiledAndBlocking({ key: REVERIFY });
+  });
+
+  it("JIRA fresh create { ticketId, status } — the shape that silently no-op'd in prod", async () => {
+    await expectFiledAndBlocking({ ticketId: REVERIFY, status: "created" });
+  });
+
+  it("JIRA summary-dedupe hit { ticketId, deduplicated } — the existing ticket is the one to block on", async () => {
+    // A dedupe hit means the ticket the CAS slot was claimed for already exists (a
+    // retried create, an overlapping redelivery). Blocking ship on it is exactly
+    // right; treating it as "no ticket" would ship past a live fix nobody re-ran.
+    await expectFiledAndBlocking({
+      ticketId: REVERIFY, title: `Re-verify (QA): ${fixTicket().title} @ ${SHA7}`,
+      status: "todo", assignee: "agentcore_hub_qa_verifier", deduplicated: true,
+    });
+  });
+
+  it("the nested dynamodb shapes are read too ({ ticket: { key } } / { ticket: { ticketId } })", async () => {
+    await expectFiledAndBlocking({ status: "created", ticket: { key: REVERIFY } });
+    await expectFiledAndBlocking({ status: "created", ticket: { ticketId: REVERIFY } });
+  });
+
+  /** No id in hand: the slot MUST come back, or every retry is blocked by our corpse. */
+  async function expectSlotHandedBack(setup, warnRe) {
+    const { onFixDone, deps, calls, workflow, record } = withShip();
+    setup(deps);
+
+    const result = await onFixDone({ workflow, fixTicket: fixTicket(), completionRecord: record });
+
+    // The live record means the fix is not marked unverified — the only signal left
+    // is the ship-context block, which is why the slot release matters so much.
+    expect(result).toEqual({ action: "no-sha", sha7: SHA7, unverified: false });
+    expect(calls.releases).toEqual([{ wfId: WF, tid: FIX, sha7: SHA7 }]);
+    expect(deps.store.slots.get(`${WF}::${FIX}`)?.reverifySha).toBeUndefined();
+    expect(calls.mergeTaskMetadata).toEqual([]); // no marker → the next Done retries
+    expect(deps.addBlockers).not.toHaveBeenCalled();
+    expect(calls.warns.join("\n")).toMatch(warnRe);
+  }
+
+  it("a bare { error } that RESOLVES is not a ticket — defence in depth behind the seam's throw", async () => {
+    // index.mjs's invokeTickets turns the jira Lambda's `{ error }` into a throw
+    // (TEAM-4156 F1). This module must not depend on that: an answer it cannot read
+    // an id out of is no ticket, whatever else is in it.
+    await expectSlotHandedBack(
+      (deps) => deps.invokeTickets.mockResolvedValueOnce({ error: "Jira 400: Field 'parent' cannot be set" }),
+      /could not create the re-verify ticket/,
+    );
+  });
+
+  it("a REJECTED create (the seam's throw) hands the slot back the same way", async () => {
+    await expectSlotHandedBack(
+      (deps) => deps.invokeTickets.mockRejectedValueOnce(new Error("Tickets___create_ticket: Jira 400")),
+      /create_ticket\(re-verify\) failed/,
+    );
+  });
+
+  it("a non-string id is garbage, not an id — it must never reach a blocker edge", async () => {
+    // `addBlockers(ship, [{value:…}])` would write an edge nothing can ever resolve,
+    // which is strictly worse than releasing the slot and retrying.
+    for (const reply of [{ key: 4200 }, { ticketId: { value: REVERIFY } }, { key: "  " }, {}]) {
+      await expectSlotHandedBack(
+        (deps) => deps.invokeTickets.mockResolvedValueOnce(reply),
+        /could not create the re-verify ticket/,
+      );
+    }
+  });
+});

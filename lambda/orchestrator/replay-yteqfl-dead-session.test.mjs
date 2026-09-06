@@ -110,7 +110,14 @@ const LAST_TEXT = `merging PR #371 for TEAM-4054 with token=ghp_${"a".repeat(36)
  * is the mode-off regression (escalate unwired, exactly as production is with
  * DEAD_SESSION_ESCALATION_MODE unset).
  */
-function makeWorld({ children = IN_WINDOW, wireEscalation = true } = {}) {
+// What the tickets Lambda answers create_ticket with. DynamoDB's shape by default
+// (yteqfl was a dynamodb-mode run); jira answers `{ ticketId }` (TEAM-4156). This
+// suite injects `invokeTickets` directly rather than mocking the Lambda boundary,
+// so swapping the shape exercises dead-session-escalation's own reader, not
+// index.mjs's normalization.
+const DDB_CREATE_REPLY = () => ({ key: "TEAM-NEVER" });
+
+function makeWorld({ children = IN_WINDOW, wireEscalation = true, createReply = DDB_CREATE_REPLY } = {}) {
   let clock = Date.parse(ESCALATED_AT);
   const nowIso = () => new Date(clock).toISOString();
 
@@ -189,7 +196,7 @@ function makeWorld({ children = IN_WINDOW, wireEscalation = true } = {}) {
   const blockTicket = vi.fn(async (ticketId) => { if (tickets[ticketId]) tickets[ticketId].status = "blocked"; });
   const redispatchedIds = [];
   const redispatch = vi.fn(async (_wf, sibling) => { redispatchedIds.push(sibling.ticketId); return true; });
-  const invokeTickets = vi.fn(async () => ({ key: "TEAM-NEVER" }));
+  const invokeTickets = vi.fn(async (_tool, params) => createReply(params));
   const parkGateForHuman = vi.fn(async () => {});
   const transitionTicket = vi.fn(async () => {});
   const s3Get = vi.fn(async () => null);
@@ -426,6 +433,31 @@ describe("fixture B — the full real slice (all six in-window tickets)", () => 
     });
     expect(w.parkGateForHuman).toHaveBeenCalledWith("TEAM-NEVER", "human:engineer", w.wf);
     expect(w.notifications()).toHaveLength(2);
+    expect(w.notifications()[1]).toMatchObject({ disposition: "parked", gateTicketId: "TEAM-NEVER" });
+  });
+
+  it("the same park under TICKET_PROVIDER=jira still gates on the human (TEAM-4156)", async () => {
+    // jira's create_ticket answers `{ ticketId }`. Before TEAM-4156 the park read
+    // `key` only, so in jira mode the gate ticket landed on the board and was then
+    // reported missing: no blocker on TEAM-4066, nothing handed to a human, and the
+    // disposition degraded to "shadow" — prod's stall with extra bookkeeping.
+    const w = makeWorld({
+      createReply: () => ({ ticketId: "TEAM-NEVER", status: "created", message: "Created TEAM-NEVER" }),
+    });
+    await w.tick();
+
+    w.wf.agentTasks[HELD] = { agentId: RM, ticketId: HELD, status: "running", startedAt: "2026-09-05T09:30:00.000Z" };
+    w.wf.deadSessionRetries[HELD] = 1;
+    w.tickets[HELD].status = "in_progress";
+    for (const id of IN_WINDOW) w.markDone(id);
+
+    const m = await w.tick("2026-09-05T10:15:00Z");
+
+    expect(m.escalated).toBe(1);
+    expect(w.invokeTickets).toHaveBeenCalledTimes(1);
+    expect(w.parkGateForHuman).toHaveBeenCalledWith("TEAM-NEVER", "human:engineer", w.wf);
+    // The gate is in the held ticket's blockedBy, so its own done cascade resumes it.
+    expect(w.tickets[HELD].blockedBy).toContain("TEAM-NEVER");
     expect(w.notifications()[1]).toMatchObject({ disposition: "parked", gateTicketId: "TEAM-NEVER" });
   });
 });

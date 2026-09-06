@@ -69,6 +69,14 @@ const h = vi.hoisted(() => ({
     taskStatus: /** @type {any[]} */ ([]),
     syncMains: /** @type {any[]} */ ([]),
     createdFixKey: "TEAM-4200",
+    /**
+     * What the tickets/jira Lambda answers `Tickets___create_ticket` with
+     * (TEAM-4156). A seam because the TWO providers answer differently and always
+     * have — `{ key }` (dynamodb) vs `{ ticketId }` (jira) — and index.mjs's real
+     * `invokeTickets` is what reconciles them. That reconciliation is only
+     * observable here, where the Lambda boundary is the mock.
+     */
+    ticketsCreateReply: /** @type {(params:any) => any} */ (() => null),
   },
 }));
 
@@ -110,7 +118,7 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       try { payload = JSON.parse(cmd.input.Payload); } catch { /* not json */ }
       const reply = (obj) => ({ Payload: new TextEncoder().encode(JSON.stringify(obj)) });
       if (payload.tool_name === "Tickets___create_ticket") {
-        return reply({ key: h.state.createdFixKey, status: "created" });
+        return reply(h.state.ticketsCreateReply(payload.parameters));
       }
       return reply({ statusCode: 200, body: "{}" });
     }
@@ -389,6 +397,8 @@ beforeEach(() => {
   h.state.taskStatus.length = 0;
   h.state.syncMains.length = 0;
   h.state.createdFixKey = FIX;
+  // The dynamodb provider's shape, which is what this suite has always replayed.
+  h.state.ticketsCreateReply = () => ({ key: h.state.createdFixKey, status: "created" });
   h.state.workflow = makeWorkflow();
   h.state.jiraIssues = {
     [CI]: {
@@ -530,6 +540,99 @@ describe("enforce — main moved and the merge conflicts (the TEAM-4106 case)", 
     expect(h.state.syncMains[0].sm).toMatchObject({ status: "synced", sha: MERGE_SHA, ciTicketId: CI });
     // The claim stays taken — the agent IS running now.
     expect(h.state.taskStatus).toHaveLength(0);
+  });
+
+  // ── TEAM-4156: the answer the tickets Lambda actually gives ────────────────
+  //
+  // This run is `ticketProvider: "jira"` — the real one, and what .env.example and
+  // the Dockerfile ship — so the create_ticket reply is `{ ticketId }`, NOT the
+  // `{ key }` this suite replayed. Reading `key` alone meant the id came back null
+  // for a ticket the Lambda really minted, and sync-main then took its
+  // `conflict_unticketed` fail-open branch: no blocker, no hold, and CI dispatched
+  // against a head that provably cannot merge — the exact regression FR-6 exists to
+  // prevent, in the ONLY provider mode we run in production.
+  //
+  // These live here rather than in sync-main.test.mjs because index.mjs's real
+  // `invokeTickets` is the thing under test: the module-level tests mock that seam
+  // out, so a normalization bug in it is invisible to them.
+
+  /** The end state a filed-and-held conflict must reach, whatever the reply shape. */
+  function expectHeldOnFix() {
+    expect(createTicketCalls()).toHaveLength(1);
+    expect(blockerLinks()).toHaveLength(1);
+    expect(blockerLinks()[0].body).toEqual({
+      type: { name: "Blocks" }, inwardIssue: { key: FIX }, outwardIssue: { key: CI },
+    });
+    expect(agentInvokes()).toHaveLength(0);
+    const conflict = eventsOf("workflow.sync_conflict");
+    expect(conflict).toHaveLength(1);
+    expect(conflict[0].detail?.fixTicketId ?? conflict[0].fixTicketId).toBe(FIX);
+    expect(eventsOf("workflow.sync_skipped")).toHaveLength(0);
+    expect(h.state.taskStatus).toEqual([{ wfId: WF, tid: CI, status: "ready" }]);
+    expect(h.state.syncMains).toHaveLength(1);
+    expect(h.state.syncMains[0].sm).toMatchObject({
+      status: "conflict", ciTicketId: CI, fixTicketId: FIX, baseHeadSha: MAIN_SHA_NEW,
+    });
+  }
+
+  it("JIRA's fresh-create reply ({ ticketId, status, message }) reaches the identical end state", async () => {
+    // Byte-for-byte what lambda/agentcore-hub-jira/index.mjs returns on a create.
+    h.state.ticketsCreateReply = (params) => ({
+      ticketId: FIX, status: "todo", message: `Created ${FIX}: ${params.summary}`,
+    });
+    await load("enforce");
+    await handler(readyWebhook());
+    expectHeldOnFix();
+  });
+
+  it("JIRA's summary-dedupe reply ({ ticketId, deduplicated }) holds CI on the EXISTING ticket", async () => {
+    // The jira Lambda answers a create for an already-present summary with
+    // mapIssue(dup) + deduplicated:true. That IS the ticket CI must wait on — a
+    // redelivery whose record was lost lands here, and refusing it would fail open
+    // on a conflict that is already ticketed.
+    h.state.ticketsCreateReply = (params) => ({
+      ticketId: FIX, title: params.summary, status: "in_progress",
+      assignee: BUG_FIXER, issueType: "Task", parentKey: EPIC, workflowId: WF,
+      labels: ["fix:sync_fix", `origin:${CI}`], deduplicated: true,
+    });
+    await load("enforce");
+    await handler(readyWebhook());
+    expectHeldOnFix();
+  });
+
+  it("a bare { error } reply is a FAILURE: invokeTickets throws, sync-main fails open, and the text is logged", async () => {
+    // The jira Lambda's handler catch-all answers `{ error: msg }` with no `content`
+    // envelope, so the old textResult check could not see it: a 400 from Jira came
+    // back as a truthy "ticket" whose id read null. Indistinguishable from "the
+    // Lambda is down" at the call site, and silent in the log.
+    const warns = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((...a) => { warns.push(a.join(" ")); });
+    try {
+      h.state.ticketsCreateReply = () => ({ error: "Jira 400: Field 'parent' cannot be set" });
+      await load("enforce");
+      await handler(readyWebhook());
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    // The create was attempted and produced no ticket, so fail open: CI is NOT
+    // held (there is nothing to block on and nobody assigned) and the event says so.
+    expect(createTicketCalls()).toHaveLength(1);
+    expect(blockerLinks()).toHaveLength(0);
+    expect(eventsOf("workflow.sync_conflict")).toHaveLength(0);
+    const skipped = eventsOf("workflow.sync_skipped");
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0].detail?.reason ?? skipped[0].reason).toBe("conflict_unticketed");
+    expect(h.state.syncMains[0].sm).toMatchObject({ status: "conflict", fixTicketId: null });
+    // Fail-open means CI still runs against the un-synced head (pre-FR-6 behaviour).
+    expect(agentInvokes()).toHaveLength(1);
+
+    // …and the reason is in the log rather than swallowed. This is the whole value
+    // of throwing at the seam: without it the warn line does not exist at all.
+    const line = warns.find((w) => w.includes("could not file the sync_fix ticket"));
+    expect(line).toBeTruthy();
+    expect(line).toContain("Tickets___create_ticket");
+    expect(line).toContain("Jira 400: Field 'parent' cannot be set");
   });
 });
 
