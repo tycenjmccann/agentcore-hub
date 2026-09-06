@@ -75,7 +75,45 @@ export interface ReviewGate {
   regressionCountsDouble?: boolean;
   /** Behavior at the cap. Only "escalate" is defined: emit review.cap_reached, reassign the gate ticket to a human, stop the rework loop. Default "escalate". */
   onCapReached?: "escalate";
+  /**
+   * Playbook defs: a gate that guards ONE ticket inside a phase rather than the
+   * whole phase (e.g. "plan" = the Plan ticket of the development phase).
+   */
+  scope?: "plan";
+  /**
+   * Verbatim instruction handed to the intake agent instead of the generated
+   * "create a ticket blocked_by ALL <phase> tickets" line. Used when the gate
+   * is created by the hub itself (Intent Acceptance) or guards one ticket.
+   */
+  instructions?: string;
 }
+
+/** One committed artifact in a playbook run's chain (see WorkflowDef.artifactChain). */
+export interface ArtifactChainEntry {
+  /** File name inside the chain dir, e.g. "spec.md". */
+  name: string;
+  /**
+   * Who produces it: "intake" (the hub, from the originator's words),
+   * an agent phase ("requirements", "review"), or "plan" (the Plan ticket).
+   */
+  owner: string;
+  /** The human gate that accepts it, if any. */
+  gate?: string;
+}
+
+/**
+ * The committed-artifact chain of a playbook run. Every artifact is committed
+ * to `dir` on the run's shared feature branch before the producing ticket may
+ * close; the orchestrator verifies the file exists on the branch.
+ */
+export interface ArtifactChain {
+  /** Directory in the target repo; "{workflowId}" is substituted. */
+  dir: string;
+  artifacts: ArtifactChainEntry[];
+}
+
+/** Which SDLC methodology a def implements. Drives the board badge and the artifact chain. */
+export type SdlcFramework = "standard" | "playbook" | "aidlc";
 
 /** Defaults for the convergence-cap fields of {@link ReviewGate}. */
 export const REVIEW_GATE_CAP_DEFAULTS: {
@@ -155,6 +193,10 @@ export interface WorkflowDef {
   completionRequiresAgentPhases: string[];
   /** Optional human-review gates keyed by the agent phase they guard. */
   reviewGates?: ReviewGate[];
+  /** SDLC methodology this def implements. Absent → "standard". */
+  sdlcFramework?: SdlcFramework;
+  /** Playbook defs only: the committed artifact chain (intent → spec → plan → findings). */
+  artifactChain?: ArtifactChain;
   phases: WorkflowDefPhase[];
 }
 
@@ -189,6 +231,11 @@ export function workflowTypeForDef(def: WorkflowDef): "feature" | "bug" {
   return def.type === "bug" ? "bug" : "feature";
 }
 
+
+/** The SDLC framework a def runs under ("standard" when the def does not say). */
+export function sdlcFrameworkForDef(def: WorkflowDef): SdlcFramework {
+  return def.sdlcFramework === "playbook" || def.sdlcFramework === "aidlc" ? def.sdlcFramework : "standard";
+}
 
 /** Whether a ticket assignee refers to a human reviewer rather than an agent. */
 export function isHumanAssignee(assignee?: string | null): boolean {

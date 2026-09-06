@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import type { WorkflowInput, IntakeSource, RepoConfig, RepoLayout } from "@/lib/workflow/types";
+import type { WorkflowInput, IntakeSource, RepoConfig, RepoLayout, IntentBrief } from "@/lib/workflow/types";
 import type { CdRegistry, CdRegistryEntry } from "@/lib/cd-registry";
 import type { ModelOption, ModelsApiResponse } from "@/lib/workflow/model-config";
 import { modelOptionToOverride } from "@/lib/workflow/model-config";
@@ -19,9 +19,13 @@ interface WorkflowDefOption {
   description: string;
   icon: string;
   requiresRepo: boolean;
+  /** "playbook" switches the form into intent-template mode (see IntentFields). */
+  sdlcFramework?: "standard" | "playbook" | "aidlc";
   phases: { id: string; name: string; type: string }[];
   reviewGates?: ReviewGateOption[];
 }
+
+const EMPTY_INTENT: IntentBrief = { problem: "", who: "", successCriteria: "", constraints: "", outOfScope: "", originator: "" };
 
 interface IntakeFormProps {
   onSubmit: (input: WorkflowInput) => void;
@@ -51,6 +55,9 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
   const [selectedDefId, setSelectedDefId] = useState<string>("");
   // Phases the requester opted into a human-review gate for (flagged gates).
   const [enabledGatePhases, setEnabledGatePhases] = useState<string[]>([]);
+  // Playbook intent template — the originator's own words, rendered verbatim
+  // into intent.md by the server (never paraphrased).
+  const [intent, setIntent] = useState<IntentBrief>(EMPTY_INTENT);
 
   useEffect(() => {
     fetch("/api/workflow/definitions")
@@ -65,6 +72,8 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
 
   const selectedDef = workflowDefs.find((w) => w.id === selectedDefId);
   const requiresRepo = selectedDef?.requiresRepo ?? true;
+  const isPlaybook = selectedDef?.sdlcFramework === "playbook";
+  const intentValid = !isPlaybook || (intent.problem.trim().length > 0 && intent.successCriteria.trim().length > 0);
 
   useEffect(() => {
     if (!requiresRepo || !repoUrl.trim()) { setCdStatus(null); return; }
@@ -168,11 +177,21 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
     const selectedModel = models.find((m) => m.id === selectedModelId);
     const modelOverride = modelOptionToOverride(selectedModel);
 
+    // Playbook: the free-text description is optional; the structured brief is
+    // the request. Keep whatever the originator typed — the server renders both
+    // into intent.md word for word.
+    const playbookDescription = description.trim() || `${intent.problem.trim()}\n\nSuccess criteria: ${intent.successCriteria.trim()}`;
+
     onSubmit({
       title: title.trim(),
-      description: description.trim(),
+      description: isPlaybook ? playbookDescription : description.trim(),
       repoConfig,
       sources,
+      ...(isPlaybook && {
+        intent: Object.fromEntries(
+          Object.entries(intent).map(([k, v]) => [k, (v ?? "").trim()]).filter(([, v]) => v)
+        ) as unknown as IntentBrief,
+      }),
       // Only include modelOverride if a non-default model is selected
       ...(modelOverride && { modelOverride }),
       ...(selectedDefId && { workflowDefId: selectedDefId }),
@@ -236,7 +255,18 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
       {/* Human review gates — opt-in for any "flagged" gates the selected def offers */}
       {(() => {
         const flaggedGates = (selectedDef?.reviewGates || []).filter((g) => g.condition === "flagged");
-        if (flaggedGates.length === 0) return null;
+        const alwaysGates = (selectedDef?.reviewGates || []).filter((g) => g.condition === "always");
+        if (flaggedGates.length === 0) {
+          if (!isPlaybook || alwaysGates.length === 0) return null;
+          return (
+            <div data-testid="playbook-gates">
+              <label className="block text-sm font-medium text-secondary mb-1">Human gates (always on)</label>
+              <p className="text-xs text-muted">
+                {alwaysGates.map((g) => g.name || g.afterPhase).join(" → ")}. A person approves each one; none can be switched off per run.
+              </p>
+            </div>
+          );
+        }
         return (
           <div>
             <label className="block text-sm font-medium text-secondary mb-1">
@@ -290,7 +320,53 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
         />
       </div>
 
-      {/* Description */}
+      {/* Playbook: intent template (PLAN stage). Standard: free-text description / PRD. */}
+      {isPlaybook ? (
+        <div className="space-y-4" data-testid="intent-template">
+          <div className="rounded-lg border border-theme bg-surface-1 px-3 py-2 text-xs text-secondary">
+            <span className="font-medium text-primary">Playbook run.</span> Your words below become{" "}
+            <span className="font-mono">intent.md</span> exactly as typed. The product owner accepts it before any agent starts;
+            then one spec author writes <span className="font-mono">spec.md</span> under the org policies, a dev writes{" "}
+            <span className="font-mono">plan.md</span> before code, and each step is a human gate: Intent Acceptance → Spec Approval → Plan Approval → Merge Approval.
+          </div>
+          {(
+            [
+              ["problem", "What is the problem?", "What is wrong or missing today, and for whom. Plain words - no solution yet.", true, 4],
+              ["who", "Who is affected?", "Users, roles, teams - and how they experience it.", false, 2],
+              ["successCriteria", "How will we know it worked?", "Observable outcomes, not implementation. What you would check to say 'done'.", true, 3],
+              ["constraints", "Constraints", "Deadlines, compliance, platforms, budgets, things that must not break.", false, 2],
+              ["outOfScope", "Out of scope", "What this request explicitly does NOT include.", false, 2],
+              ["originator", "Who is asking?", "Your name / role / team - recorded on intent.md for the audit trail.", false, 1],
+            ] as [keyof IntentBrief, string, string, boolean, number][]
+          ).map(([key, label, hint, required, rows]) => (
+            <div key={key}>
+              <label className="block text-sm font-medium text-secondary mb-1">
+                {label}{required && <span className="text-red-400"> *</span>}
+              </label>
+              <textarea
+                value={intent[key] ?? ""}
+                onChange={(e) => setIntent((prev) => ({ ...prev, [key]: e.target.value }))}
+                placeholder={hint}
+                rows={rows}
+                data-testid={`intent-${key}`}
+                className="w-full px-3 py-2 bg-surface-1 border border-theme rounded-lg text-primary placeholder-muted text-sm focus:outline-none focus:border-brand-500 resize-y"
+              />
+            </div>
+          ))}
+          <div>
+            <label className="block text-sm font-medium text-secondary mb-1">
+              Anything else (optional)
+            </label>
+            <textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Links, background, a pasted brief - kept verbatim under 'Original request'."
+              rows={3}
+              className="w-full px-3 py-2 bg-surface-1 border border-theme rounded-lg text-primary placeholder-muted text-sm focus:outline-none focus:border-brand-500 resize-y"
+            />
+          </div>
+        </div>
+      ) : (
       <div>
         <label className="block text-sm font-medium text-secondary mb-1">
           Description / PRD
@@ -303,6 +379,7 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
           className="w-full px-3 py-2 bg-surface-1 border border-theme rounded-lg text-primary placeholder-muted focus:outline-none focus:border-brand-500 resize-y"
         />
       </div>
+      )}
 
       {/* Input Sources */}
       <div>
@@ -531,7 +608,7 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
       {/* Submit */}
       <button
         type="submit"
-        disabled={!title.trim() || isLoading}
+        disabled={!title.trim() || !intentValid || isLoading}
         className="w-full px-4 py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
       >
         {isLoading ? "Starting workflow..." : "Start Team Workflow"}

@@ -69,6 +69,16 @@ import { applyBlockerEdge, normalizePreserveStatuses } from "./ticket-blockers.m
 // key into an unquoted `parent = …` operand, which escaping cannot make safe —
 // it is shape-checked and refused instead. See getChildTicketsFromJira.)
 import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE } from "./fix-contract.mjs";
+import {
+  normalizeChainGateMode, chainFor, chainDir, requiredArtifactsForTicket, sdlcFrameworkContext,
+  gateInstructionOverride, fallbackReviewPackagePhase, artifactRepoPath, missingArtifactNote,
+} from "./artifact-chain.mjs";
+
+// Playbook artifact-chain gate (sdlc-playbook def): a ticket that owes a chain
+// artifact (spec.md / plan.md / findings.md) may not cascade until the file is
+// on the shared branch. Only defs that declare `artifactChain` are affected;
+// ARTIFACT_CHAIN_GATE=off disables the check for all of them.
+const ARTIFACT_CHAIN_GATE = normalizeChainGateMode(process.env.ARTIFACT_CHAIN_GATE);
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -464,6 +474,10 @@ export async function loadWorkflowDefs() {
         completionRequiresAgentPhases: w.completionRequiresAgentPhases || [],
         reviewGates: w.reviewGates || [],
         phaseOrder: order,
+        // Playbook defs: methodology + committed artifact chain (artifact-chain.mjs).
+        sdlcFramework: w.sdlcFramework || "standard",
+        artifactChain: w.artifactChain || null,
+        phases: (w.phases || []).map((p) => ({ id: p.id, name: p.name, agentPhase: p.agentPhase })),
       };
     }
     console.log(`[orchestrator] Loaded ${Object.keys(_workflowDefs).length} workflow definitions from S3`);
@@ -1575,6 +1589,10 @@ export async function handleTicketDoneUnified(ticketId) {
     return;
   }
 
+  // Playbook artifact-chain gate — the file must be on the branch before the
+  // next stage may start. Returns true when the ticket was sent back.
+  if (await enforceArtifactChain(ticket, workflow)) return;
+
   // Dedup guard: if we already processed this ticket's completion, skip cascade.
   // Protects against double-transition (agent calls transition_ticket AND report_completion).
   if (workflow.agentTasks?.[ticketId]?.status === "complete") {
@@ -2052,6 +2070,77 @@ async function gatePhaseOf(gateTicketId) {
   return undefined;
 }
 
+/**
+ * Playbook artifact-chain gate. For a ticket that owes a chain artifact
+ * (artifact-chain.mjs requiredArtifactsForTicket) verify each file exists on the
+ * run's shared feature branch via the GitHub contents API. Missing → the ticket
+ * is moved back to Blocked with a comment naming the path, a resume note is
+ * stashed for the re-dispatch, and `artifact_chain.missing` is published; the
+ * cascade does NOT run. Fail-open on GitHub errors other than 404 (a rate limit
+ * must not wedge a run), and a no-op for defs without a chain, for runs with no
+ * shared branch yet, and when ARTIFACT_CHAIN_GATE=off. Returns true when the
+ * caller must stop (ticket sent back).
+ */
+async function enforceArtifactChain(ticket, workflow) {
+  if (ARTIFACT_CHAIN_GATE === "off" || !ticket || !workflow) return false;
+  const wfDef = getEffectiveWorkflowDef(workflow);
+  if (!chainFor(wfDef)) return false;
+  const agentDef = getAgentDef(ticket.assignee);
+  const required = requiredArtifactsForTicket({ def: wfDef, ticket, agentDef, intakeAgentId: wfDef.intakeAgentId });
+  if (required.length === 0) return false;
+  const branch = workflow.featureBranch;
+  if (!branch || !workflow.repoConfig?.repos?.length) {
+    console.warn(`[orchestrator] artifact-chain: ${ticket.ticketId} owes ${required.join(",")} but the run has no shared branch — cannot verify, passing.`);
+    return false;
+  }
+  let owner, repo;
+  try { ({ owner, repo } = parseRepoUrl(workflow.repoConfig)); } catch { return false; }
+  const missing = [];
+  for (const name of required) {
+    const path = artifactRepoPath(wfDef, workflow.id, name);
+    try {
+      await githubApi(`/repos/${owner}/${repo}/contents/${path}?ref=${encodeURIComponent(branch)}`);
+    } catch (err) {
+      if (err?.status === 404) { missing.push(name); continue; }
+      console.warn(`[orchestrator] artifact-chain: GitHub check failed for ${path}@${branch} (${err?.message}) — passing open.`);
+    }
+  }
+  if (missing.length === 0) {
+    await publishEvent(ticket.ticketId, "artifact_chain.verified", {
+      ticketId: ticket.ticketId, workflowId: workflow.id, artifacts: required, branch,
+    });
+    return false;
+  }
+  const dir = chainDir(wfDef, workflow.id);
+  const note = missingArtifactNote({ missing, dir, branch });
+  console.warn(`[orchestrator] artifact-chain: ${ticket.ticketId} missing ${missing.join(",")} on ${branch} — sending back.`);
+  try { await store.setResumeContext(workflow.id, ticket.ticketId, note); } catch (err) { console.warn(`[orchestrator] artifact-chain: resume note failed: ${err.message}`); }
+  try { await commentOnTicket(ticket.ticketId, note); } catch (err) { console.warn(`[orchestrator] artifact-chain: comment failed: ${err.message}`); }
+  try {
+    if (TICKET_PROVIDER === "jira") {
+      const moved = (await jiraTransition(ticket.ticketId, "Blocked")) || (await jiraTransition(ticket.ticketId, "To Do"));
+      if (!moved) console.warn(`[orchestrator] artifact-chain: could not re-open ${ticket.ticketId}`);
+    } else {
+      await ddb.send(new UpdateCommand({
+        TableName: TICKETS_TABLE,
+        Key: { ticketId: ticket.ticketId },
+        UpdateExpression: "SET #s = :s, #u = :u",
+        ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
+        ExpressionAttributeValues: { ":s": "blocked", ":u": new Date().toISOString() },
+      }));
+    }
+  } catch (err) {
+    console.warn(`[orchestrator] artifact-chain: re-open failed for ${ticket.ticketId}: ${err.message}`);
+  }
+  // Release the invocation claim so the re-dispatch (Blocked → Ready) can claim
+  // again: claimInvocation's CAS admits any status other than "running".
+  try { await store.setTaskStatus(workflow.id, ticket.ticketId, "blocked"); } catch { /* entry may not exist yet */ }
+  await publishEvent(ticket.ticketId, "artifact_chain.missing", {
+    ticketId: ticket.ticketId, workflowId: workflow.id, missing, branch, dir, assignee: ticket.assignee,
+  });
+  return true;
+}
+
 async function handleHumanReviewGate(ticketId, assignee, workflow) {
   const reviewer = assignee.slice("human:".length);
 
@@ -2161,11 +2250,16 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
 async function loadReviewPackage(workflow, gateTicketId) {
   try {
     const gateTicket = await getTicket(gateTicketId);
-    let phase;
-    for (const upId of gateTicket?.blockedBy || []) {
-      const up = await getTicket(upId);
-      const def = up && getAgentDef(up.assignee);
-      if (def?.phase) { phase = def.phase; break; }
+    // Playbook gates first: the Plan Approval gate is blocked by a DEV ticket
+    // (phase "development") but reads the plan package; the Intent Acceptance
+    // gate has no agent blockers at all (the hub created it).
+    let phase = fallbackReviewPackagePhase(gateTicket);
+    if (phase === undefined || phase === "intake") {
+      for (const upId of gateTicket?.blockedBy || []) {
+        const up = await getTicket(upId);
+        const def = up && getAgentDef(up.assignee);
+        if (def?.phase) { phase = def.phase; break; }
+      }
     }
     if (!phase || !ARTIFACT_BUCKET) return null;
 
@@ -3222,15 +3316,17 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   const phaseOrder = wfDef.phaseOrder;
   const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
+  // Shared feature branch on the def's branch phase (repo-backed workflows only).
+  // Independent of the phase ADVANCE below: the playbook def's branch phase is
+  // "requirements" — the run's INITIAL phase — so gating this on an advance
+  // meant the spec author was dispatched with no branch to commit the chain to
+  // (first sdlc-playbook run, 2026-09-05). ensureFeatureBranch persists itself.
+  if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
+    workflow.featureBranch = await ensureFeatureBranch(workflow);
+  }
   if (agentPhaseIdx > currentPhaseIdx) {
     workflow.phase = agentDef.phase;
     await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
-
-    // Feature branch on the def's branch phase entry (repo-backed workflows only)
-    if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
-      workflow.featureBranch = await ensureFeatureBranch(workflow);
-    }
-
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
@@ -3543,6 +3639,13 @@ export async function handleTicketDone(ticketId, image) {
     return;
   }
 
+  // Playbook artifact-chain gate (see handleTicketDoneUnified). The gate consumes
+  // only ticketId/assignee/title — all present on the DDB stream image — so build
+  // the ticket in-hand instead of re-reading it. Symmetric with the webhook twin,
+  // and (TEAM-4155 / TEAM-4121 FR-9) no extra ticket read while the observer flags
+  // are off; the sole guarded getTicket below stays the only read on this path.
+  if (await enforceArtifactChain({ ticketId, assignee, title: unwrapDdbValue(image.title) }, workflow)) return;
+
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);
   await ackApprovedGateNotification(workflow, ticketId, assignee);
@@ -3663,15 +3766,14 @@ async function handleTicketReady(ticketId, image) {
   const phaseOrder = wfDef.phaseOrder;
   const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
+  // Shared feature branch on the def's branch phase — independent of the phase
+  // advance (see handleTicketReadyUnified for why). ensureFeatureBranch persists itself.
+  if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
+    workflow.featureBranch = await ensureFeatureBranch(workflow);
+  }
   if (agentPhaseIdx > currentPhaseIdx) {
     workflow.phase = agentDef.phase;
     await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
-
-    // Create shared feature branch on the def's branch phase (repo-backed workflows only)
-    if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
-      workflow.featureBranch = await ensureFeatureBranch(workflow);
-    }
-
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
@@ -4533,6 +4635,9 @@ export async function buildAgentContext(ticket, workflow) {
     if (activeGates.length > 0) {
       const gateLines = [];
       for (const g of activeGates) {
+        // Hub-created or single-ticket gates carry their own wording (playbook).
+        const override = gateInstructionOverride(g);
+        if (override) { gateLines.push(override); continue; }
         const block = g.blocking ? "BLOCKING (next phase waits for approval)" : "advisory (non-blocking)";
         // Pull the domain-appropriate reviewer roster from Jira (by project role).
         // The agent CHOOSES one — like it chooses agents from ## Available Agents.
@@ -4600,6 +4705,22 @@ export async function buildAgentContext(ticket, workflow) {
       repo: repoRef,
       defaultBranch: workflow.repoConfig?.repos?.[0]?.defaultBranch || "main",
     });
+  }
+
+  // Playbook runs: the committed artifact chain — what this persona owes, where
+  // it goes, and the rule the orchestrator enforces at ticket close. The intake
+  // agent (spec author) additionally gets intent.md inline: it is the run's
+  // source of truth and must be committed unchanged.
+  if (chainFor(wfDef)) {
+    context += sdlcFrameworkContext({
+      def: wfDef, workflow, ticket, agentDef: getAgentDef(ticket.assignee), intakeAgentId: wfDef.intakeAgentId,
+    });
+    if (ticket.assignee === wfDef.intakeAgentId) {
+      try {
+        const intentMd = await readS3Artifact(workflow.id, "shared/intent.md");
+        if (intentMd) context += `## Intent\n${intentMd.slice(0, 12000)}\n\n`;
+      } catch { /* the request block below still carries the words */ }
+    }
   }
 
   // CI/CD pipeline mode signal (PR #263). The CI/QA/release-manager blueprints

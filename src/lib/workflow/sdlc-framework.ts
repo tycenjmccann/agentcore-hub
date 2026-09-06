@@ -6,14 +6,18 @@
  * this module — no branching on the raw value anywhere else.
  */
 
-export type SdlcFramework = "playbook" | "aidlc";
+export type SdlcFramework = "standard" | "playbook" | "aidlc";
 
 /**
- * Normalizes any raw value. undefined | null | "" | unrecognized | non-string
- * → "playbook". Only the exact string "aidlc" returns "aidlc".
+ * Normalizes any raw value. Only the exact strings "playbook" and "aidlc"
+ * select those frameworks; undefined | null | "" | unrecognized | non-string
+ * → "standard" (the classic requirements → design → dev → QA pipeline). The
+ * value is stamped on the workflow row at start from the def's sdlcFramework,
+ * so legacy rows without it are, correctly, standard runs.
  */
 export function resolveSdlcFramework(value: unknown): SdlcFramework {
-  return value === "aidlc" ? "aidlc" : "playbook";
+  if (value === "playbook" || value === "aidlc") return value;
+  return "standard";
 }
 
 export const SDLC_BADGE_META: Record<
@@ -25,6 +29,13 @@ export const SDLC_BADGE_META: Record<
     listClassName: string;
   }
 > = {
+  standard: {
+    label: "STANDARD",
+    tooltip: "Standard pipeline — requirements, parallel design, development, QA and ship.",
+    boardClassName: "sdlc-badge sdlc-badge--standard",
+    listClassName:
+      "text-[9px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wider whitespace-nowrap flex-shrink-0 text-[var(--color-text-muted)] bg-[var(--color-bg-tertiary)] border-current",
+  },
   playbook: {
     label: "PLAYBOOK",
     tooltip: "Playbook framework — expect intent, spec, and plan artifacts.",

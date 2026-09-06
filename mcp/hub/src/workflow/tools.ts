@@ -55,7 +55,9 @@ export const WORKFLOW_TOOLS = [
     description:
       "Submit a new workflow for processing. Requires a title, description, and repository configuration. " +
       "workflowDefId is the pipeline selector — pick an id from list_workflow_definitions (e.g. 'bug-fix' for bug runs; " +
-      "omitted → the default 'software-delivery' pipeline). workflowType is a DEPRECATED back-compat alias: without " +
+      "omitted → the default 'software-delivery' pipeline; 'sdlc-playbook' for the AI-native SDLC loop: intent.md accepted by the " +
+      "product owner → spec.md → plan.md → reviewed diff → PR, every stage a human gate). For 'sdlc-playbook' pass `intent` — " +
+      "interview the requester first and fill it in THEIR words (the hub writes intent.md verbatim, never paraphrased). workflowType is a DEPRECATED back-compat alias: without " +
       "workflowDefId it maps to a def ('bug' → 'bug-fix', 'feature' → 'software-delivery'); when both are supplied the " +
       "def wins and the run's stored type is derived from it. Sources and model override are optional. " +
       "Every repoConfig URL is verified against GitHub at submit: a URL that definitively does not exist is " +
@@ -70,6 +72,21 @@ export const WORKFLOW_TOOLS = [
       properties: {
         title: { type: "string", minLength: 1 },
         description: { type: "string", minLength: 1 },
+        intent: {
+          type: "object",
+          description:
+            "Playbook runs (workflowDefId 'sdlc-playbook'): the originator's intent, captured once in their own words. " +
+            "Rendered verbatim into intent.md and accepted by the product owner at the Intent Acceptance gate before any agent runs.",
+          required: ["problem", "successCriteria"],
+          properties: {
+            problem: { type: "string", minLength: 1, description: "What is wrong or missing today, and for whom." },
+            who: { type: "string", description: "Who is affected and how they experience it." },
+            successCriteria: { type: "string", minLength: 1, description: "Observable outcomes that prove it worked." },
+            constraints: { type: "string", description: "Deadlines, compliance, platforms, must-not-break." },
+            outOfScope: { type: "string", description: "Explicitly not part of this request." },
+            originator: { type: "string", description: "Who is asking (name / role / channel)." },
+          },
+        },
         allowUnresolvedRepo: {
           type: "boolean",
           description: "Submit even though a repoConfig URL failed the GitHub pre-flight (default false → 422).",
