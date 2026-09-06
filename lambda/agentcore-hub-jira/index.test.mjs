@@ -702,3 +702,86 @@ test("F6: lookup_user escapes the agent query inside its quoted JQL literal", as
     globalThis.fetch = originalFetch;
   }
 });
+
+// ─── TEAM-4122 FR-5: labels_add, the op name the orchestrator sends ────────────
+
+/**
+ * `Tickets___labels_add` is how the orchestrator marks a CI-uncertifiable run's
+ * epic, and it does not know which provider is deployed — so this op name and
+ * this parameter envelope (`ticket_id` AND `issue_key`, both spelled out) must
+ * work identically here and in the dynamodb Lambda, whose index.test.mjs
+ * asserts the twin.
+ *
+ * The invariant that matters is the VERB: `update: {labels:[{add}]}`, never
+ * `fields: {labels:[…]}` — the field form is a whole-list replace that would
+ * drop every label the pipeline already set (`wf:`, `phase:`, `human-review`…).
+ */
+test("labels_add: PUTs the additive update verb for ci:uncertifiable", async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    calls.push({ url: String(url), opts });
+    return new Response(null, { status: 204 });
+  };
+  try {
+    const result = await handler({
+      tool_name: "Tickets___labels_add",
+      parameters: { ticket_id: "EPIC-1", issue_key: "EPIC-1", labels: ["ci:uncertifiable"] },
+    });
+
+    assert.equal(result.error, undefined, "the op must be dispatched, not fall through to unknown-tool");
+    assert.deepEqual(result, { ticketId: "EPIC-1", status: "labels_added", added: ["ci:uncertifiable"] });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].opts.method, "PUT");
+    assert.ok(calls[0].url.endsWith("/rest/api/3/issue/EPIC-1"), `wrong path: ${calls[0].url}`);
+    const body = JSON.parse(calls[0].opts.body);
+    assert.deepEqual(body, { update: { labels: [{ add: "ci:uncertifiable" }] } });
+    // A whole-list replace would silently drop concurrent labels.
+    assert.equal(body.fields, undefined, "must not use the fields form (whole-list replace)");
+    // Jira rejects a label containing whitespace and fails the WHOLE PUT, so the
+    // prose form of this warning is not a legal label on either provider.
+    assert.ok(!/\s/.test(body.update.labels[0].add));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("labels_add: issue_key alone is accepted (the dynamodb spelling)", async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => { calls.push({ url: String(url), opts }); return new Response(null, { status: 204 }); };
+  try {
+    const result = await handler({
+      tool_name: "Tickets___labels_add",
+      parameters: { issue_key: "EPIC-9", labels: ["ci:uncertifiable"] },
+    });
+    assert.equal(result.ticketId, "EPIC-9");
+    assert.ok(calls[0].url.endsWith("/rest/api/3/issue/EPIC-9"));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+/**
+ * The failure envelope the orchestrator has to recognize: a rejected label comes
+ * back as a BARE `{ error }` with no `content` field, which is why
+ * labelEpicUncertifiable inspects the payload rather than trusting a clean
+ * return (ci-check-context.test.mjs asserts the orchestrator half).
+ */
+test("labels_add: a rejected PUT surfaces as a bare { error }, and nothing is reported added", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ errorMessages: ["label is not valid"] }), { status: 400 });
+  try {
+    const result = await handler({
+      tool_name: "Tickets___labels_add",
+      parameters: { ticket_id: "EPIC-1", labels: ["ci:uncertifiable"] },
+    });
+    assert.ok(result.error, `expected an error field, got ${JSON.stringify(result)}`);
+    assert.equal(result.status, undefined);
+    assert.equal(result.content, undefined, "no content field — this is the shape the orchestrator must check for");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

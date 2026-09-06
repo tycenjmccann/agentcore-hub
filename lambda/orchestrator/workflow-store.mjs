@@ -425,6 +425,37 @@ export async function setRepoCheck(workflowId, repoCheck) {
 }
 
 /**
+ * Persist the CI reachability pre-flight result (see ci-check.mjs). Scoped SET
+ * of one attribute — never touches the rest of the row. The stored record is
+ * booleans + strings only: F10 forbids the raw CodeBuild project (webhook.url,
+ * webhook.secret, env vars) from ever reaching this table.
+ */
+export async function setCiCheck(workflowId, ciCheck) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET ciCheck = :cc",
+    ExpressionAttributeValues: { ":cc": ciCheck },
+  }));
+}
+
+/**
+ * Persist the pre-CI default-branch sync result (see sync-main.mjs). Scoped SET
+ * of one attribute — never touches the rest of the row. The record is the
+ * idempotency key for the sync ({ at, sha, baseHeadSha, status, ciTicketId,
+ * fixTicketId }): a redelivered CI dispatch against the same default-branch head
+ * reads it and does nothing rather than pushing a second merge commit.
+ */
+export async function setSyncMain(workflowId, syncMain) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET syncMain = :sm",
+    ExpressionAttributeValues: { ":sm": syncMain },
+  }));
+}
+
+/**
  * Ship-head stability deferral bookkeeping (TEAM-4111). Scoped SET of two
  * attributes the gate + its reconcile-tick re-drive read: the consecutive
  * deferral count (bounds the deadlock fail-open) and the deferred ship

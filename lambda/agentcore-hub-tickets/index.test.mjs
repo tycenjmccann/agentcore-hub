@@ -22,6 +22,12 @@ const h = vi.hoisted(() => ({
     // ARTIFACT_BUCKET (the default here) the lambda never reads S3 and falls
     // back to the hardcoded roster/phase sets, matching the pre-existing tests.
     s3: /** @type {Record<string, unknown>} */ ({}),
+    // TEAM-4122 FR-5: labels_add writes (one conditional UpdateCommand per
+    // label), the rows GetCommand can see, and the labels whose conditional
+    // write should fail — the "already present OR no such ticket" branch.
+    labelUpdates: /** @type {any[]} */ ([]),
+    items: /** @type {Record<string, any>} */ ({}),
+    condFail: /** @type {string[]} */ ([]),
   },
 }));
 
@@ -50,10 +56,21 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
         send: async (cmd) => {
           const name = cmd.constructor.name;
           if (name === "UpdateCommand") {
-            // nextTicketId's counter bump.
+            const label = cmd.input.ExpressionAttributeValues?.[":label"];
+            if (label !== undefined) {
+              // A labels_add conditional append, not nextTicketId's counter bump.
+              h.state.labelUpdates.push(cmd.input);
+              if (h.state.condFail.includes(label)) {
+                const err = new Error("The conditional request failed");
+                err.name = "ConditionalCheckFailedException";
+                throw err;
+              }
+              return {};
+            }
             h.state.counter += 1;
             return { Attributes: { nextNum: h.state.counter } };
           }
+          if (name === "GetCommand") return { Item: h.state.items[cmd.input.Key.ticketId] };
           if (name === "PutCommand") { h.state.puts.push(cmd.input.Item); return {}; }
           return {};
         },
@@ -72,6 +89,9 @@ beforeEach(async () => {
   h.state.puts.length = 0;
   h.state.counter = 0;
   h.state.s3 = {};
+  h.state.labelUpdates.length = 0;
+  h.state.condFail.length = 0;
+  h.state.items = {};
   delete process.env.ARTIFACT_BUCKET;
   vi.resetModules();
   ({ handler } = await import("./index.mjs"));
@@ -473,5 +493,70 @@ describe("create_ticket — fix contract (TEAM-4121 FR-8)", () => {
       expect("labels" in h.state.puts[0]).toBe(false);
       expect("droppedLabels" in res).toBe(false);
     });
+  });
+});
+
+/**
+ * TEAM-4122 FR-5 — `Tickets___labels_add`, invoked with the EXACT envelope the
+ * orchestrator sends (`{ tool_name, parameters }`, both `ticket_id` and
+ * `issue_key` spelled out) when a run is CI-uncertifiable. The same op name and
+ * the same params must work on the jira Lambda — index.test.mjs there asserts
+ * the twin — because the orchestrator does not know which provider is deployed.
+ *
+ * The invariant under test is ADDITIVITY: this is the DynamoDB stand-in for
+ * Jira's `update: { labels: [{ add }] }`, so it must be a conditional
+ * `list_append` per label, never a whole-list SET (which would silently drop
+ * `human-review` / `reviewer:*` labels another writer put there).
+ */
+describe("labels_add — the op name + envelope the orchestrator sends (TEAM-4122 FR-5)", () => {
+  const invoke = (parameters) => handler({ tool_name: "Tickets___labels_add", parameters });
+
+  it("appends ci:uncertifiable additively and reports it added", async () => {
+    const res = await invoke({ ticket_id: "EPIC-1", issue_key: "EPIC-1", labels: ["ci:uncertifiable"] });
+
+    expect(res).toEqual({ key: "EPIC-1", status: "labels_added", added: ["ci:uncertifiable"], alreadyPresent: [] });
+    expect(res.error).toBeUndefined(); // NOT the unknown-tool envelope
+    expect(h.state.labelUpdates).toHaveLength(1);
+    const u = h.state.labelUpdates[0];
+    expect(u.Key).toEqual({ ticketId: "EPIC-1" });
+    expect(u.UpdateExpression).toContain("list_append");
+    expect(u.UpdateExpression).not.toMatch(/SET #l = :l\b/); // never a whole-list replace
+    expect(u.ExpressionAttributeValues[":one"]).toEqual(["ci:uncertifiable"]);
+    // attribute_exists keeps a typo'd key from CREATING a row (Update upserts).
+    expect(u.ConditionExpression).toContain("attribute_exists(ticketId)");
+    expect(u.ConditionExpression).toContain("NOT contains(#l, :label)");
+  });
+
+  it("the label is legal as sent: the system-namespace form survives verbatim", async () => {
+    const res = await invoke({ ticket_id: "EPIC-1", labels: ["ci:uncertifiable"] });
+    // `ci:` is a reserved prefix a CALLER may not use, but the system's own
+    // labels_add path must still be able to write it.
+    expect(res.added).toEqual(["ci:uncertifiable"]);
+    expect(res.dropped).toBeUndefined();
+    // No whitespace: jira rejects it outright, so the two providers must agree.
+    expect(res.added[0]).not.toMatch(/\s/);
+  });
+
+  it("ticket_id alone is accepted (issue_key is the jira spelling)", async () => {
+    const res = await invoke({ ticket_id: "EPIC-9", labels: ["ci:uncertifiable"] });
+    expect(res.key).toBe("EPIC-9");
+    expect(h.state.labelUpdates[0].Key).toEqual({ ticketId: "EPIC-9" });
+  });
+
+  it("re-labelling an already-labelled epic is idempotent, not an error", async () => {
+    h.state.items["EPIC-1"] = { ticketId: "EPIC-1", labels: ["ci:uncertifiable"] };
+    h.state.condFail.push("ci:uncertifiable");
+
+    const res = await invoke({ ticket_id: "EPIC-1", labels: ["ci:uncertifiable"] });
+
+    expect(res.status).toBe("labels_added");
+    expect(res.added).toEqual([]);
+    expect(res.alreadyPresent).toEqual(["ci:uncertifiable"]);
+  });
+
+  it("a ticket that does not exist is an ERROR, not a silent success", async () => {
+    h.state.condFail.push("ci:uncertifiable"); // no row → the same conditional failure
+    const res = await invoke({ ticket_id: "NOPE-1", labels: ["ci:uncertifiable"] });
+    expect(res.content[0].text).toBe("Error: ticket NOPE-1 not found");
   });
 });

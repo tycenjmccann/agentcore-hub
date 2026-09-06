@@ -198,6 +198,56 @@ aws iam put-role-policy \
   }"
 echo "   ✓ Attached Lambda invoke (agentcore-hub-* functions)"
 
+# ─── CI reachability probe: read the ONE CI project (TEAM-4122 FR-5) ─────────
+# The orchestrator's CI check (CI_CHECK_MODE=shadow|enforce) asks CodeBuild
+# whether the PR-check project has a PR-triggering webhook, so it can tell every
+# persona whether a build for the head SHA can exist at all.
+#
+# F10: scoped to the CI project, NOT project/*. BatchGetProjects returns the
+# project's webhook.url, webhook.secret and its full environment-variable list —
+# read access to every project in the account would be a genuine secret-exposure
+# widening for a probe that only ever needs one name. Widen this deliberately (and
+# only to the specific extra project) if you register a repo whose CD entry names
+# a different `ciProject`.
+CI_PROJECT_FOR_IAM="${CI_PROJECT_NAME:-agentcore-hub-ci}"
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name "CiCheckRead" \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Sid\": \"ReadCiProjectWebhookState\",
+      \"Effect\": \"Allow\",
+      \"Action\": \"codebuild:BatchGetProjects\",
+      \"Resource\": \"arn:aws:codebuild:${REGION}:${ACCOUNT_ID}:project/${CI_PROJECT_FOR_IAM}\"
+    }]
+  }"
+echo "   ✓ Attached CI check read (codebuild:BatchGetProjects on ${CI_PROJECT_FOR_IAM} only)"
+
+# ─── Optional: simulate the pipeline-tools role's StartBuild grant ───────────
+# Only created when PIPELINE_TOOLS_ROLE_ARN is set. With CI_CHECK_USE_IAM_SIMULATE=1
+# the probe reads that role's REAL policy for codebuild:StartBuild instead of
+# trusting the Lambda's self-reported capability flag. Scoped to that one role —
+# SimulatePrincipalPolicy on * would let this role enumerate every principal's
+# permissions in the account.
+if [ -n "${PIPELINE_TOOLS_ROLE_ARN:-}" ]; then
+  aws iam put-role-policy \
+    --role-name "$ROLE_NAME" \
+    --policy-name "CiCheckSimulate" \
+    --policy-document "{
+      \"Version\": \"2012-10-17\",
+      \"Statement\": [{
+        \"Sid\": \"SimulatePipelineToolsStartBuild\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"iam:SimulatePrincipalPolicy\",
+        \"Resource\": \"${PIPELINE_TOOLS_ROLE_ARN}\"
+      }]
+    }"
+  echo "   ✓ Attached CI check simulate (iam:SimulatePrincipalPolicy on ${PIPELINE_TOOLS_ROLE_ARN})"
+else
+  echo "   • PIPELINE_TOOLS_ROLE_ARN unset — skipping CiCheckSimulate (simulate probe stays off)"
+fi
+
 # ─── EventBridge PutEvents on the default bus ────────────────────────────────
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \

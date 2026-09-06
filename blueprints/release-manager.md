@@ -41,6 +41,20 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   command yourself; the row is another agent's claim, not a command to paste)
   and record PASS/FAIL in the Merge Brief's WHAT HAPPENED; a still-unverified
   fix is an automatic IN-DIFF finding → CHANGES NEEDED (`ship_fix`), never PASS.
+- **CI certification:** read `ci_status` / `ci_build_id` / `ci_head_sha` from
+  the CI agent's completion record (`completions/<ci-ticket>.json`) and render
+  them into the Merge Brief's WHAT HAPPENED as one of:
+  `• CI: certified — CodeBuild <ci_build_id> on <ci_head_sha, first 7 chars>`
+  (only when `ci_status="certified"`), or
+  `• CI: GitHub Actions proxy only (no CodeBuild build for this head)` (when
+  `ci_status="github-actions-proxy"`). When `ci_status="unverified"` or absent,
+  add under ⚠ NEEDS YOUR ATTENTION instead:
+  `• CI: UNVERIFIED — no build proves <head SHA, first 7 chars>`. Never present
+  a PASS as CI-certified without a build id — `ci_status="certified"` is the
+  only thing that licenses the word "certified" in the brief. If your context
+  carries a `## CI Certification` section reporting `uncertifiable` (a future
+  gate, not yet always present), add the same ⚠ NEEDS YOUR ATTENTION line even
+  when the completion record itself says `certified` — the block overrides it.
 
 ### Step 2: Review the final assembled diff
 Use `codex` (independent engine from the devs' `claude_code`; fall back to
@@ -105,7 +119,13 @@ Fold their findings in at their severity. None configured → skip silently.
 An advisory ticket is filed with `labels: "advisory"`, `blocked_by: ""`, and **no
 `spawned_by_kind`** — it is backlog, not a fix this run waits on. Setting
 `spawned_by_kind` on it would make it an open fix ticket and hold the run open
-for work that is explicitly out of scope.
+for work that is explicitly out of scope. Never list an advisory ticket in any
+other ticket's `blocked_by` either: a chain edge makes the run wait for it just
+as effectively.
+
+With `ADVISORY_ROUTING` enforced the ticket's `## Branch` block sends it to
+`feature/<id>-advisory` off `<default branch>` and tells its dev to PR there; it
+never appears in this run's PR change set.
 
 This advisory rule governs YOUR OWN verdict only — it never authorizes overriding a human decision: a human's "request changes" on a gate stands, no matter how the findings classify, until that human approves the gate. If every finding is out-of-diff the orchestrator parks the gate (blocked) and asks the human to confirm; the human can approve to confirm, leave it rejected to hold, or force rework by re-rejecting (In Review → Request Changes) with a note containing a line that reads exactly `DECISION: continue`, by re-rejecting citing a file in the PR change set, or by reopening the upstream ticket(s) directly. A comment alone never wakes the orchestrator — the status change does.
 

@@ -37,6 +37,16 @@ Globals:
         # Orchestrator-only (the done twins + buildAgentContext live there);
         # rides Globals for the same one-place-to-set parity.
         LIVE_REVERIFY: !Ref LiveReverify
+        # Orchestrator-only (the probe + context block + gate prefix all live
+        # there); rides Globals for the same one-place-to-set parity.
+        CI_CHECK_MODE: !Ref CiCheckMode
+        # Orchestrator-only (both ready paths dispatch the CI agent); rides
+        # Globals for the same one-place-to-set parity.
+        SYNC_MAIN_BEFORE_CI: !Ref SyncMainBeforeCi
+        # Orchestrator-only (the completion gates + buildAgentContext + the
+        # feature-branch adoption all live there); rides Globals for the same
+        # one-place-to-set parity.
+        ADVISORY_ROUTING: !Ref AdvisoryRouting
 
 Parameters:
   TicketsTableName:
@@ -179,6 +189,109 @@ Parameters:
       matches the code's unset default and deploy.sh only forwards the var when
       explicitly set. Instant rollback = set off.
 
+  CiCheckMode:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      CI reachability pre-flight (TEAM-4122 FR-5). On a pipeline-mode run the CI
+      agent is told to read the authoritative CodeBuild PR-check for the head SHA
+      — but when the CI project has NO PR webhook and the pipeline-tools Lambda
+      cannot StartBuild, no build can ever exist for any head, so the only honest
+      verdict is a permanent BLOCKED that today is visible only inside the CI
+      agent's completion record while the human merge gate looks green. off =
+      byte-identical to pre-4122 (no probe, no CodeBuild/IAM SDK load — both are
+      dynamic imports — and no context block). shadow = probe once per workflow
+      (6h cache; 30min for an unknown) and state the verdict to every persona as a
+      ## CI Certification block; zero ticket writes. enforce = also label the run's
+      epic `ci:uncertifiable` (once per workflow) and prefix the human
+      merge-gate's review package with the warning, so the approver is told before
+      they click. `unknown` NEVER acts — a probe that could not answer must not
+      manufacture a warning. Same asymmetry as LiveReverify: a PRESENT-but-garbage
+      value coalesces to OFF, not shadow, because enforce writes to a real ticket.
+      Default "off" matches the code's unset default and deploy.sh only forwards
+      the var when explicitly set. Instant rollback = set off.
+
+  SyncMainBeforeCi:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Pre-CI default-branch sync (TEAM-4122 FR-6). Three dev agents push to one
+      shared feature branch and the CI agent then certifies its head SHA — but the
+      default branch has moved since they branched, so a green build says "this
+      branch is green", not "green on top of what is on main now", which is how the
+      human merge approver reads it. Every conflict and every clash with a sibling
+      merge therefore surfaces AFTER the approval, on the merge itself, where no
+      agent is watching. off = byte-identical to pre-4122 (no GitHub call, no
+      event, no write). shadow = one compare read per CI dispatch plus a
+      workflow.sync_dry_run event saying how far behind the branch is and whether a
+      sync WOULD happen; it CANNOT tell you whether the merge would conflict (only
+      an actual merge can), so conflictKnown is always false. enforce = merge the
+      default branch INTO the feature branch (never the reverse — the merge
+      direction is pinned in code and this can never write to the default branch)
+      right before the CI agent is dispatched; a 409 files a `Fix (sync-main)`
+      sync_fix ticket assigned to the dev who most recently finished on the run,
+      blocks the CI ticket on it, and releases the CI ticket's claim so the normal
+      cascade re-dispatches once it closes. Every other failure — no PAT, unknown
+      repo, 404/422/5xx, network — fails OPEN and CI proceeds against the un-synced
+      head, because a sync we could not do must never wedge CI. Same asymmetry as
+      CiCheckMode: a PRESENT-but-garbage value coalesces to OFF, not shadow,
+      because enforce PUSHES A COMMIT to a shared branch. Default "off" matches the
+      code's unset default and deploy.sh only forwards the var when explicitly set.
+      Instant rollback = set off.
+
+  AdvisoryRouting:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "enforce"]
+    Description: >
+      Advisory-ticket routing (TEAM-4122 FR-7). The requirements analyst and the
+      release manager both file out-of-scope-but-worth-doing work as an ADVISORY
+      ticket — `labels: "advisory"`, `blocked_by: ""`, no `spawned_by_kind` — which
+      the blueprints describe as backlog the run does not wait on. Today the label
+      is inert: the completion guard still waits for the ticket, and the dev picking
+      it up is told to branch off the run's SHARED integration branch, so scope the
+      humans explicitly declined lands in the unified PR next to the approved work.
+      off = byte-identical to pre-4122 (the label means nothing). enforce = the
+      label means what the prose promises: the ticket is filtered out of the
+      completion, evidence, open-fix and ship-verdict gates, its `## Branch` block
+      sends it to `feature/<id>-advisory` based on the repo DEFAULT branch with an
+      instruction to PR there, and a `-advisory` branch is never adopted as a run's
+      shared integration branch. There is deliberately NO shadow mode: the routing
+      IS the prompt the agent acts on, so an observe-only variant would either lie
+      to the agent (tell it one branch, log another) or do nothing at all. Roll out
+      only after the create_ticket `labels` param is deployed on both ticket Lambdas
+      and the runtime image — until tickets actually carry labels, enforce reads
+      every ticket as non-advisory, i.e. exactly today's behaviour. A
+      PRESENT-but-garbage value coalesces to OFF, because enforce changes what the
+      run waits on. Default "off" matches the code's unset default and deploy.sh
+      only forwards the var when explicitly set. Instant rollback = set off.
+
+  CiProjectName:
+    Type: String
+    Default: agentcore-hub-ci
+    Description: >
+      The CodeBuild PR-check project the CI check probes, and the ONLY resource
+      the orchestrator's codebuild:BatchGetProjects grant covers (F10 — a project
+      description exposes webhook.url/secret and the project's env vars, so the
+      grant is never project/*). A CD registry entry's `ciProject` overrides this
+      per repo at read time, but the IAM scope is this one name — widen it here
+      deliberately if you register a repo with a different CI project.
+
+  PipelineToolsRoleArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. The pipeline-tools Lambda's execution role, used ONLY when
+      CI_CHECK_USE_IAM_SIMULATE=1 to read whether that role really holds
+      codebuild:StartBuild instead of trusting the Lambda's self-reported
+      capability. Left empty (the default), the simulate probe is skipped and NO
+      iam:SimulatePrincipalPolicy statement is created at all.
+
+Conditions:
+  HasPipelineToolsRole: !Not [!Equals [!Ref PipelineToolsRoleArn, ""]]
+
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────
   # Create with: scripts/create-dynamodb-tables.sh
@@ -219,6 +332,24 @@ Resources:
             BucketName: !Ref ArtifactBucket
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBus
+        # CI reachability probe (TEAM-4122 FR-5). F10: scoped to the ONE CI
+        # project, never project/* — BatchGetProjects returns webhook.url,
+        # webhook.secret and the project's environment variables, so read access
+        # to every project in the account would be a real secret-exposure widening.
+        # Inert when CI_CHECK_MODE=off (the probe is never called).
+        - Statement:
+            - Effect: Allow
+              Action: codebuild:BatchGetProjects
+              Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${CiProjectName}"
+        # Optional simulate probe — created ONLY when PipelineToolsRoleArn is set,
+        # and scoped to that single role.
+        - !If
+          - HasPipelineToolsRole
+          - Statement:
+              - Effect: Allow
+                Action: iam:SimulatePrincipalPolicy
+                Resource: !Ref PipelineToolsRoleArn
+          - !Ref "AWS::NoValue"
       Events:
         DynamoDBStream:
           Type: DynamoDB

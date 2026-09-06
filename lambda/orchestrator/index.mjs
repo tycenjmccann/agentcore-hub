@@ -50,10 +50,12 @@ import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stabi
 import { shouldGateShipDispatch, normalizeShipDispatchMode, emitShipDispatchMetrics } from "./ship-dispatch-gate.mjs";
 import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.mjs";
 import { createLiveReverify, normalizeLiveReverifyMode } from "./live-reverify.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
+import { ensureCiCheck, formatCiCheckBlock, prefixCiWarning, normalizeCiCheckMode } from "./ci-check.mjs";
+import { syncBeforeCi, normalizeSyncMode } from "./sync-main.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 import { createDeadSessionEscalation, normalizeEscalationMode } from "./dead-session-escalation.mjs";
@@ -203,6 +205,57 @@ const DEAD_SESSION_ESCALATION_MODE = normalizeEscalationMode(process.env.DEAD_SE
 // publishes fix.reverify_planned only — zero ticket/workflow writes. Instant
 // rollback = set off.
 const LIVE_REVERIFY = normalizeLiveReverifyMode(process.env.LIVE_REVERIFY);
+// CI reachability pre-flight (TEAM-4122 FR-5): off | shadow | enforce, default
+// off. On a pipeline-mode run the CI agent is told to read the authoritative
+// CodeBuild PR-check for the head SHA — but if the project has no PR webhook AND
+// the pipeline-tools Lambda cannot StartBuild, no build can EVER exist, so the
+// only honest verdict is a permanent BLOCKED that today reaches the human merge
+// gate looking green. shadow = probe + state it in `## CI Certification` context
+// (observe-only); enforce = additionally label the epic `ci:uncertifiable` and
+// prefix the merge-gate package so the approver is told before they click.
+// off = byte-identical: no probe, no CodeBuild/IAM SDK import, no context block,
+// no label, no gate rewrite. STRICT allow-list (garbage → off, like
+// LIVE_REVERIFY) because enforce WRITES to a real ticket. Instant rollback = off.
+const CI_CHECK_MODE = normalizeCiCheckMode(process.env.CI_CHECK_MODE);
+
+// Pre-CI default-branch sync (TEAM-4122 FR-6): off | shadow | enforce. The CI
+// agent certifies the integration branch's head SHA, but `main` has moved since
+// the devs branched — so a green build certifies code that is NOT what would
+// land, and every conflict surfaces after the human merge approval instead of
+// before it. shadow = one compare read + a `workflow.sync_dry_run` event (it
+// CANNOT tell whether the merge would conflict — only a merge can); enforce =
+// merge the default branch into the feature branch right before the CI agent is
+// dispatched, and on a 409 file a `Fix (sync-main)` sync_fix ticket that blocks
+// the CI ticket. off = byte-identical: no GitHub call, no event, no write.
+// STRICT allow-list (garbage → off) because enforce PUSHES A COMMIT to a shared
+// branch. Instant rollback = set off.
+const SYNC_MAIN_BEFORE_CI = normalizeSyncMode(process.env.SYNC_MAIN_BEFORE_CI);
+
+// Advisory-ticket routing (TEAM-4122 FR-7): off | enforce, default off. An
+// "advisory" ticket is out-of-scope-but-worth-doing work the reviewers file as
+// backlog (requirements analyst Step 2 / release manager Step 4). Today it still
+// rides the run: the completion guard waits on it and the dev is told to branch
+// off the shared integration branch, so its files land in the run's unified PR —
+// scope the humans explicitly declined. enforce makes the label mean what the
+// blueprints already promise: excluded from every completion/open-fix gate, and
+// branched from + PR'd against the repo DEFAULT branch, never adopted as the
+// integration branch. There is deliberately NO shadow: the routing is what the
+// agent is TOLD to do (a branch name in its prompt), so "observe-only" would
+// either lie to the agent or do nothing at all. STRICT allow-list (garbage → off)
+// because enforce changes what the run waits on. Instant rollback = set off.
+const ADVISORY_ROUTING = normalizeAdvisoryRoutingMode(process.env.ADVISORY_ROUTING);
+/**
+ * The children a completion GATE may consider (TEAM-4122 FR-7). Under enforce an
+ * advisory ticket owes the run nothing — no deliverable evidence, no merge
+ * verdict — so it must be invisible to the evidence and ship-verdict gates the
+ * same way isWorkflowComplete's own filter makes it invisible to the phase gates.
+ * Off returns the array untouched (identity), so nothing changes without the flag.
+ */
+const gateChildren = (children) => (ADVISORY_ROUTING === "enforce" ? nonAdvisory(children) : children);
+
+// The one persona whose dispatch the sync gates on — it is the agent that reads
+// and certifies the branch head. Matches the roster entry below.
+const CI_AGENT_ID = "agentcore_hub_ci_agent";
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -504,6 +557,89 @@ function getDeadSessionEscalation() {
     transitionTicket: transitionTicketStatus,
   });
   return _deadSessionEscalation;
+}
+
+// ─── CI reachability probe deps (TEAM-4122 FR-5) ─────────────────────────────
+// Lazy singleton, one per warm container. The CodeBuild and IAM SDK clients are
+// loaded by DYNAMIC import, so CI_CHECK_MODE=off never pays their module-load
+// cost — the orchestrator's cold start is unchanged on a plain install. iam is
+// imported only under CI_CHECK_USE_IAM_SIMULATE=1; `githubApi` is omitted
+// without a PAT (probe 3 is then skipped, never fatal); the Lambda client is the
+// existing shared one.
+// A failed import returns null (not a throw): @aws-sdk/client-codebuild is not
+// in this Lambda's package.json — it comes from the runtime-bundled SDK — so a
+// runtime that ever stops shipping it must degrade to "no CI block", never to a
+// dispatch-breaking throw inside buildAgentContext.
+let _ciCheckDeps = null;
+async function ciCheckDeps() {
+  if (CI_CHECK_MODE === "off") return null;
+  if (_ciCheckDeps) return _ciCheckDeps;
+  let CodeBuildClient, BatchGetProjectsCommand;
+  try {
+    ({ CodeBuildClient, BatchGetProjectsCommand } = await import("@aws-sdk/client-codebuild"));
+  } catch (err) {
+    console.warn(`[ci-check] @aws-sdk/client-codebuild unavailable — CI check skipped: ${err.message}`);
+    return null;
+  }
+  const codebuild = new CodeBuildClient({ region: REGION });
+  const deps = {
+    codebuildSend: (input) => codebuild.send(new BatchGetProjectsCommand(input)),
+    // The pipeline-tools handler reads event.tool_name + event.parameters and
+    // replies with the standard { content: [{ text: <json> }] } envelope, which
+    // ci-check.mjs unwraps.
+    invokeLambda: async (functionName, payload) => {
+      const res = await lambda.send(new InvokeCommand({
+        FunctionName: functionName,
+        Payload: JSON.stringify(payload),
+      }));
+      const raw = res.Payload ? new TextDecoder().decode(res.Payload) : "";
+      if (!raw) return null;
+      let parsed = JSON.parse(raw);
+      if (typeof parsed === "string") parsed = JSON.parse(parsed);
+      return parsed;
+    },
+    githubApi: process.env.GITHUB_PAT ? githubApi : undefined,
+  };
+  if (process.env.CI_CHECK_USE_IAM_SIMULATE === "1") {
+    // Optional probe: a missing client leaves iamSimulate undefined (ci-check
+    // then skips the simulate), it does not disable the whole check.
+    try {
+      const { IAMClient, SimulatePrincipalPolicyCommand } = await import("@aws-sdk/client-iam");
+      const iam = new IAMClient({ region: REGION });
+      deps.iamSimulate = (input) => iam.send(new SimulatePrincipalPolicyCommand(input));
+    } catch (err) {
+      console.warn(`[ci-check] @aws-sdk/client-iam unavailable — simulate probe skipped: ${err.message}`);
+    }
+  }
+  _ciCheckDeps = deps;
+  return _ciCheckDeps;
+}
+
+/**
+ * Seams for sync-main.mjs (TEAM-4122 FR-6). One object per warm container; every
+ * member is an existing orchestrator helper, so the module itself does no I/O of
+ * its own and the whole matrix is testable with plain objects.
+ *
+ * githubApi/githubApiRaw are omitted without a PAT — sync-main then returns
+ * `skipped: no_pat` and CI dispatches exactly as it does today.
+ */
+let _syncDeps = null;
+function syncDeps() {
+  if (SYNC_MAIN_BEFORE_CI === "off") return null;
+  if (_syncDeps) return _syncDeps;
+  _syncDeps = {
+    githubApi: process.env.GITHUB_PAT ? githubApi : undefined,
+    githubApiRaw: process.env.GITHUB_PAT ? githubRequestRaw : undefined,
+    store,
+    invokeTickets,
+    addBlockers,
+    publishEvent,
+    getAgentDef,
+    now: () => new Date(),
+    mode: SYNC_MAIN_BEFORE_CI,
+    log: console,
+  };
+  return _syncDeps;
 }
 
 // One detector per warm container so its per-agent median cache is reused
@@ -1078,6 +1214,60 @@ async function addTicketComment(ticketId, comment) {
     console.warn(`[orchestrator] addTicketComment(${ticketId}) failed: ${err.message}`);
     return false;
   }
+}
+
+/**
+ * Enforce-mode side effect of an `uncertifiable` CI check (TEAM-4122 FR-5): mark
+ * the run's epic so the state is visible on the BOARD, not only inside one
+ * agent's context. The label is what makes it filterable after the fact ("which
+ * runs shipped with no CI?") — a comment scrolls away, a label does not.
+ *
+ * Label is `ci:uncertifiable` with NO SPACE: Jira rejects whitespace in labels
+ * outright (the whole PUT 400s), so the prose form "ci: uncertifiable" seen in
+ * ticket text is not a legal label. `ci:` is already a reserved system prefix in
+ * fix-contract.mjs, so no agent can squat it.
+ *
+ * Written at most ONCE per workflow: `ciCheck.labeled` is persisted immediately
+ * after a successful write and survives every re-probe, so a warm container
+ * dispatching ten tickets cannot label ten times. Best-effort and NEVER throws —
+ * a provider that lacks labels_add, or a permissions gap, must not stop the
+ * agent this context was being built for. Falls back to a comment.
+ */
+async function labelEpicUncertifiable(workflow, ciCheck) {
+  const epicId = workflow?.epicId || workflow?.parentId;
+  if (!epicId) return false;
+  const note = `⚠ CI UNCERTIFIABLE: ${ciCheck?.reason || "no CodeBuild build can exist for this head."}`;
+  let labeled = false;
+  let commented = false;
+  try {
+    const res = await invokeTickets("labels_add", { ticket_id: epicId, issue_key: epicId, labels: ["ci:uncertifiable"] });
+    // The jira Lambda's failure envelope is a BARE `{ error }` with no `content`
+    // field, so invokeTickets' textResult check cannot see it and returns
+    // normally. Unchecked, a 400 from Jira would be recorded as a successful
+    // label — suppressing both the comment fallback and (via labeled:true) every
+    // later retry. Check the payload, not just the throw.
+    if (res?.error) throw new Error(String(res.error).slice(0, 300));
+    labeled = true;
+  } catch (err) {
+    console.warn(`[ci-check] labels_add on ${epicId} failed: ${err.message} — falling back to a comment`);
+    // Comment fallback is jira-only (addTicketComment no-ops in dynamodb mode);
+    // in that mode the `## CI Certification` context block + the merge-gate
+    // prefix remain the surfaces that carry the warning.
+    commented = await addTicketComment(epicId, note);
+  }
+  // `labeled` is the "stop trying" flag, so only set it once the warning really
+  // reached the board (label or comment). A failure that reached NEITHER leaves
+  // it unset so the next dispatch on this run retries — bounded by the run's
+  // ticket count, and far better than silently losing the only board-visible
+  // record of an uncertifiable run.
+  if (labeled || commented) {
+    try {
+      await store.setCiCheck(workflow.id, { ...ciCheck, labeled: true });
+    } catch (err) {
+      console.warn(`[ci-check] could not persist labeled flag for ${workflow.id}: ${err.message}`);
+    }
+  }
+  return labeled;
 }
 
 // ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
@@ -1854,7 +2044,17 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
     // Review package: the upstream agent that closed the phase wrote a curated
     // summary/bullets/links file (blueprints/review-package.md). Best-effort —
     // a missing or malformed package must never delay the gate ping.
-    const pkg = await loadReviewPackage(workflow, ticketId);
+    let pkg = await loadReviewPackage(workflow, ticketId);
+
+    // CI uncertifiable (TEAM-4122 FR-5, enforce only): the approver about to
+    // click Merge is the LAST person who can catch "no CodeBuild build ever
+    // existed for this head". Prefixing the package here reaches all three
+    // surfaces at once — the phone notification (`details` is pkg.summary), the
+    // in-app card, and the comment mirrored onto the gate ticket below. Pure
+    // rewrite, no extra call: the verdict was already probed at dispatch.
+    if (CI_CHECK_MODE === "enforce" && workflow?.ciCheck?.verdict === "uncertifiable") {
+      pkg = prefixCiWarning(pkg, workflow.ciCheck);
+    }
 
     const notification = {
       id: `notif_${ticketId}_${new Date().toISOString()}`,
@@ -2971,6 +3171,22 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
+  // ─── PRE-CI SYNC (TEAM-4122 FR-6) ───
+  // Merge the repo's default branch into the integration branch BEFORE the CI
+  // agent reads its head, so the SHA it certifies is the SHA that would land.
+  // Deliberately AFTER the claim: the claim is what serializes two concurrent
+  // deliveries of this ticket, and two of these running at once would push two
+  // merge commits. `conflict` is the only outcome that stops the dispatch — the
+  // CI ticket is blocked on a sync_fix ticket and its claim is released inside,
+  // so the cascade re-dispatches once the dev resolves it. off → not reached.
+  if (SYNC_MAIN_BEFORE_CI !== "off" && agentDef?.agentId === CI_AGENT_ID && workflow.featureBranch) {
+    const sync = await syncBeforeCi(workflow, ticket, syncDeps());
+    if (sync.outcome === "conflict") {
+      console.log(`[orchestrator] ${ticketId} held: ${workflow.featureBranch} cannot merge the default branch — blocked on ${sync.fixTicketId}`);
+      return;
+    }
+  }
+
   // Build context and invoke — SAME buildAgentContext for both paths
   let context = await buildAgentContext(ticket, workflow);
 
@@ -3391,6 +3607,20 @@ async function handleTicketReady(ticketId, image) {
 
   // Build context and invoke agent
   const ticket = await getTicket(ticketId);
+
+  // ─── PRE-CI SYNC (TEAM-4122 FR-6) ───
+  // Same hook as handleTicketReadyUnified, placed after getTicket because this
+  // path only binds `ticket` here. See the unified path for the rationale; the
+  // one behavioural note is that `conflict` returns BEFORE buildAgentContext, so
+  // no context is built and no agent is invoked. off → not reached.
+  if (SYNC_MAIN_BEFORE_CI !== "off" && agentDef?.agentId === CI_AGENT_ID && workflow.featureBranch) {
+    const sync = await syncBeforeCi(workflow, ticket, syncDeps());
+    if (sync.outcome === "conflict") {
+      console.log(`[orchestrator] ${ticketId} held: ${workflow.featureBranch} cannot merge the default branch — blocked on ${sync.fixTicketId}`);
+      return;
+    }
+  }
+
   let context = await buildAgentContext(ticket, workflow);
 
   // Prepend resume context on re-run: retry endpoint (ticket.resumeContext) or
@@ -3483,6 +3713,9 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
     getAgentPhase: (assignee) => getAgentDef(assignee)?.phase,
     gatePhaseOf,
     requestedGates: workflow?.input?.reviewGates || [],
+    // TEAM-4122 FR-7: completion.mjs reads no env (it is a pure module), so the
+    // flag arrives as an option — "off" leaves its decision untouched.
+    advisoryRouting: ADVISORY_ROUTING,
   });
 }
 
@@ -3579,7 +3812,7 @@ export async function completeWorkflow(workflow) {
     const wfDef = getEffectiveWorkflowDef(workflow);
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     if (requiredPhases.length > 0) {
-      const children = await getChildTickets(workflow.epicId);
+      const children = gateChildren(await getChildTickets(workflow.epicId));
       const evidenceOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
       let freshWf = await store.getWorkflow(workflow.id);
       let missing = missingEvidenceTickets(
@@ -3733,7 +3966,7 @@ export async function completeWorkflow(workflow) {
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     const shipPhases = requiredPhases.filter((p) => SHIP_PHASES.has(p));
     if (shipPhases.length > 0) {
-      const children = await getChildTickets(workflow.epicId);
+      const children = gateChildren(await getChildTickets(workflow.epicId));
       let freshWf = await store.getWorkflow(workflow.id);
       const shipOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
       let verdict = evaluateShipVerdict(
@@ -4308,6 +4541,35 @@ export async function buildAgentContext(ticket, workflow) {
     context += `deterministic build/test/deploy. Follow the PIPELINE_ENABLED path `;
     context += `in your blueprint (read CI/pipeline results via the Pipeline___* tools, `;
     context += `passing pipeline_name; do NOT shell builds or run DEPLOY.md yourself).\n\n`;
+
+    // CI reachability (TEAM-4122 FR-5). Pipeline Mode above tells the CI agent to
+    // read "the authoritative CodeBuild PR-check for the head SHA" — this says
+    // whether such a build can exist at all. Without it an uncertifiable repo
+    // produces a permanent BLOCKED that only the CI agent's completion record
+    // records, and the merge gate looks green. Probed once per workflow (TTL
+    // cached), stated to EVERY persona, and in enforce mode also written onto the
+    // epic + the merge-gate package. CI_CHECK_MODE=off → not reached at all: zero
+    // extra calls, no SDK load, byte-identical context.
+    if (CI_CHECK_MODE !== "off") {
+      // No deps (the CodeBuild client could not be loaded) → say nothing rather
+      // than emit an `unknown` block the probe never actually ran.
+      const ciDeps = await ciCheckDeps();
+      if (ciDeps) {
+        const repoForCi = workflow.repoConfig?.repos?.length > 0 ? parseRepoUrl(workflow.repoConfig) : null;
+        const ciCheck = await ensureCiCheck(workflow, {
+          store,
+          deps: ciDeps,
+          delivery: deliveryForContext,
+          mode: CI_CHECK_MODE,
+          repo: repoForCi,
+        });
+        context += formatCiCheckBlock(ciCheck, CI_CHECK_MODE);
+        // enforce only: shadow observes, it never touches a ticket.
+        if (CI_CHECK_MODE === "enforce" && ciCheck?.verdict === "uncertifiable" && !ciCheck.labeled) {
+          await labelEpicUncertifiable(workflow, ciCheck);
+        }
+      }
+    }
   }
 
   // Unverified live fixes (TEAM-4121 FR-9) — ship personas only. A fix that
@@ -4364,11 +4626,21 @@ export async function buildAgentContext(ticket, workflow) {
 
   // Dev agents: branch identity (scope, not HOW)
   if (agentDef?.phase === "development") {
-    const baseBranch = workflow.featureBranch || workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    // TEAM-4122 FR-7: an advisory ticket is work the humans explicitly declined
+    // for THIS run, so it must not enter the shared integration branch — its
+    // files would otherwise appear in the unified PR's change set and land with
+    // the approved scope. Under enforce it gets its own branch off the repo
+    // default and PRs there; the release manager never reviews it in this run.
+    const advisory = ADVISORY_ROUTING === "enforce" && isAdvisoryTicket(ticket);
+    const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    const baseBranch = advisory ? defaultBranch : workflow.featureBranch || defaultBranch;
+    const slug = agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-");
     context += `## Branch\n`;
-    context += `feature_branch: feature/${ticket.ticketId}-${agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-")}\n`;
+    context += `feature_branch: feature/${ticket.ticketId}-${advisory ? "advisory" : slug}\n`;
     context += `base_branch: ${baseBranch}\n`;
-    if (workflow.featureBranch) {
+    if (advisory) {
+      context += `NOTE: ADVISORY ticket. Branch from ${defaultBranch} and open your PR against ${defaultBranch}. It is NOT part of this run's shared integration branch or its unified PR; the release manager will not review it in this run.\n`;
+    } else if (workflow.featureBranch) {
       context += `NOTE: base_branch is this run's SHARED integration branch. Branch from it, target your PR at it (never the repo default branch), and merge your PR into it when your evidence is complete — one unified PR to the default branch is opened by the orchestrator at run completion.\n`;
     }
     context += `\n`;
@@ -5076,6 +5348,37 @@ async function featureBranchMergeProbe(workflow) {
   }
 }
 
+/**
+ * The same request githubApi makes, but returning `{ status, body }` instead of
+ * throwing on a non-2xx — for the callers that have to DISTINGUISH statuses that
+ * githubApi's contract erases:
+ *   - 201 (a merge commit was created) vs 204 (already up to date), which both
+ *     resolve to a value there (an object vs null);
+ *   - 409 (merge conflict), which is an EXPECTED outcome for a merge, not an
+ *     error to be thrown.
+ * githubApi's own semantics are unchanged — every existing caller still gets
+ * "parsed JSON or throw".
+ */
+async function githubRequestRaw(path, method = "GET", body = null) {
+  const pat = process.env.GITHUB_PAT;
+  if (!pat) throw new Error("GITHUB_PAT not configured on orchestrator");
+  const resp = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${pat}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "agentcore-hub-orchestrator",
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await resp.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON */ }
+  return { status: resp.status, body: json };
+}
+
 async function githubApi(path, method = "GET", body = null) {
   const pat = process.env.GITHUB_PAT;
   if (!pat) throw new Error("GITHUB_PAT not configured on orchestrator");
@@ -5177,8 +5480,16 @@ async function ensureFeatureBranch(workflow) {
   // branch — ADOPT it as the run's shared integration branch so the pipeline
   // builds on the requester's work (and the final PR carries it) instead of
   // starting a parallel branch off the default.
+  //
+  // TEAM-4122 FR-7: never adopt an ADVISORY branch. `feature/<id>-advisory` is
+  // where an advisory ticket's out-of-scope work lives, deliberately outside this
+  // run — adopting it as the shared integration branch would pull exactly the
+  // scope the humans declined into every dev's base and into the unified PR, the
+  // inverse of what the routing exists to prevent. The name is the contract (see
+  // the `## Branch` block above), so the name is what is refused; a refused
+  // branch just falls through to normal creation off the default branch.
   const ported = workflow.input?.portedSession;
-  if (ported?.branch) {
+  if (ported?.branch && !/-advisory$/.test(ported.branch)) {
     try {
       await store.adoptFeatureBranch(workflow.id, ported.branch);
       console.log(`[orchestrator] Adopted ported-session branch as shared feature branch: ${ported.branch}`);
@@ -5187,6 +5498,10 @@ async function ensureFeatureBranch(workflow) {
       console.error(`[orchestrator] failed to adopt ported branch ${ported.branch}: ${err.message}`);
       // fall through to normal creation
     }
+  } else if (ported?.branch) {
+    console.warn(
+      `[orchestrator] refusing to adopt advisory branch ${ported.branch} as the shared integration branch for ${workflow.id} — creating a fresh branch off the default instead`
+    );
   }
   if (!workflow.repoConfig?.repos?.length) return null;
   try {

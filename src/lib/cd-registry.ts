@@ -23,6 +23,13 @@ export interface CdRegistryEntry {
   pipeline?: string;
   /** Region of that pipeline. */
   region?: string;
+  /**
+   * CodeBuild PR-check PROJECT for this repo (TEAM-4122 FR-5) — a different
+   * resource from `pipeline`, which names a CodePipeline. Read by the
+   * orchestrator's CI reachability check; absent → CI_PROJECT_NAME →
+   * `agentcore-hub-ci`.
+   */
+  ciProject?: string;
   /** Path of the deploy contract the release manager follows when no pipeline is named. */
   deployDoc?: string;
   notes?: string;
@@ -73,7 +80,7 @@ export function parseCdRegistry(raw: unknown): CdRegistry {
     const entry: CdRegistryEntry = { repo: key };
     if (e && typeof e === "object") {
       const o = e as Record<string, unknown>;
-      for (const f of ["pipeline", "region", "deployDoc", "notes"] as const) {
+      for (const f of ["pipeline", "region", "ciProject", "deployDoc", "notes"] as const) {
         const v = typeof o[f] === "string" ? (o[f] as string).trim() : "";
         if (v) entry[f] = v;
       }
@@ -102,7 +109,7 @@ export function upsertCdEntry(registry: CdRegistry, input: Partial<Omit<CdRegist
   const existing = registry.repos.find((e) => e.repo === key);
   const merged: CdRegistryEntry = { ...(existing || {}), ...clean, repo: key, addedAt: existing?.addedAt || new Date().toISOString() };
   // An explicitly blank field clears it (the UI sends "" to unset a pipeline).
-  for (const f of ["pipeline", "region", "deployDoc", "notes"] as const) {
+  for (const f of ["pipeline", "region", "ciProject", "deployDoc", "notes"] as const) {
     if (typeof input[f] === "string" && !(input[f] as string).trim()) delete merged[f];
   }
   return { version: registry.version || 1, repos: [...registry.repos.filter((e) => e.repo !== key), merged].sort((a, b) => a.repo.localeCompare(b.repo)) };

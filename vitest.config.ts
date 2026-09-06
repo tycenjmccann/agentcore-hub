@@ -184,6 +184,13 @@ export default defineConfig({
       // idempotency. AWS SDK clients mocked at the module seam, same shape as
       // agent-invoker-retry.
       "lambda/agentcore-hub-pipeline-tools/index.test.mjs",
+      // setup-pipeline-tools-lambda (TEAM-4122 FR-4) — the IAM policy as DATA:
+      // buildInlinePolicy is pure, so the blast radius of PIPELINE_CI_START_BUILD
+      // (StartBuild on the ONE validated PR-check ARN, never a deploy project,
+      // never PutApprovalResult) is asserted rather than reviewed. Also pins the
+      // byte-duplicated validateCiProjectName against the Lambda's copy. Import
+      // is inert — main() is behind the argv guard.
+      "deploy/setup-pipeline-tools-lambda.test.mjs",
       // pipeline-enabled (TEAM-3738, same defect class as TEAM-3723) — the
       // orchestrator's PIPELINE_ENABLED predicate that gates the "## Pipeline
       // Mode" context block. Lives in its own side-effect-free pipeline-enabled.mjs
@@ -288,6 +295,54 @@ export default defineConfig({
       // and is absent for non-ship agents, for mode off, and when nothing is
       // unverified — the "off costs nothing in the prompt" half of the flag.
       "lambda/orchestrator/unverified-fixes-context.test.mjs",
+      // ci-check.mjs (TEAM-4122 FR-5) — the dispatch-time "can a CodeBuild build
+      // for this head SHA exist at all?" probe. Fully DI'd (plain deps + fake
+      // clock + stub store), so every branch runs with no AWS: the strict mode
+      // allow-list (garbage → off, because enforce labels a real epic), the
+      // never-warn-on-unknown direction, the 6h/30min TTL cache that keeps a
+      // 14-ticket run to one probe, and the F10 boundary — a project description
+      // carries webhook.url/secret + every env var, and the assertion is on
+      // JSON.stringify(result) because that record is persisted, logged AND
+      // rendered into every agent's prompt.
+      "lambda/orchestrator/ci-check.test.mjs",
+      // ci-check wiring (TEAM-4122 FR-5) — index.mjs REAL, AWS/store seams
+      // mocked: the ## CI Certification block only appears on a pipeline-mode
+      // run, mode off does ZERO extra I/O (asserted as zero calls on the
+      // codebuild/lambda/setCiCheck seams, i.e. byte-identical to pre-4122),
+      // enforce labels the epic ci:uncertifiable exactly ONCE per workflow while
+      // shadow never writes, and the human merge gate's ping/comment/package
+      // carries the ⚠ CI UNCERTIFIABLE prefix.
+      "lambda/orchestrator/ci-check-context.test.mjs",
+      // sync-main.mjs (TEAM-4122 FR-6) — merge the default branch INTO the run's
+      // integration branch before CI certifies its head. Fully DI'd (plain deps +
+      // a recording GitHub fake keyed by `METHOD path`), which is what makes the
+      // dangerous matrix cheap to pin: the F9 direction lock (base is always the
+      // feature branch, so this can never push to main) and its refusals, the
+      // percent-encoding of every path segment, the merge-head idempotency key,
+      // 201/204/409 and the fail-OPEN behaviour of every other status, and the
+      // 409 path end to end — one sync_fix ticket whose fix_contract is checked
+      // with the tickets Lambda's own validateFixContract.
+      "lambda/orchestrator/sync-main.test.mjs",
+      // pre-CI sync replay (TEAM-4122 FR-6 acceptance) — index.mjs REAL on its
+      // Jira-webhook entry (handleTicketReadyUnified), only fetch/AWS/store
+      // mocked, driven with the wf_1788582225496_yteqfl loop-6 fixture where the
+      // run's CI agent had to file TEAM-4106 ("merge origin/main into
+      // feature/TEAM-4054…") by hand. Under enforce a conflict files EXACTLY ONE
+      // sync_fix ticket, blocks TEAM-4065 on it and never reaches the agent-invoke
+      // seam (no green certification of a SHA that would not land); a webhook
+      // REDELIVERY files no second ticket; landing the fix dispatches CI once.
+      "lambda/orchestrator/replay-yteqfl-sync-main.test.mjs",
+      // ADVISORY_ROUTING wiring (TEAM-4122 FR-7) — index.mjs REAL, AWS/store/cap
+      // seams mocked. completion.test.mjs owns the pure filter; what only shows
+      // up here is the plumbing: the `## Branch` block an advisory ticket's dev
+      // is handed (`feature/<id>-advisory` off the DEFAULT branch, advisory NOTE,
+      // no shared-integration NOTE) versus a non-advisory block asserted
+      // BYTE-IDENTICAL to mode off by string comparison, the refusal to ever adopt
+      // a `-advisory` branch as a run's shared integration branch (the ported-
+      // session path, the one place a branch name comes from outside), and that
+      // the ship review's change set enumerates its own PR's files only — so an
+      // advisory branch's files cannot enter the reviewed diff.
+      "lambda/orchestrator/advisory-routing.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

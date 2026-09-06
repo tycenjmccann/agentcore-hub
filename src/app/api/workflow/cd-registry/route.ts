@@ -44,7 +44,7 @@ export async function POST(req: NextRequest) {
   if (!normalizeRepoKey(body.repo)) {
     return NextResponse.json({ error: "repo must be owner/repo or a GitHub URL" }, { status: 400 });
   }
-  for (const f of ["pipeline", "region", "deployDoc", "notes"]) {
+  for (const f of ["pipeline", "region", "ciProject", "deployDoc", "notes"]) {
     if (body[f] !== undefined && typeof body[f] !== "string") {
       return NextResponse.json({ error: `${f} must be a string` }, { status: 400 });
     }

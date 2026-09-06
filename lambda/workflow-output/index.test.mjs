@@ -111,3 +111,46 @@ describe("report_completion — evidence_kind / evidence_keys", () => {
     expect(record().evidence_keys).toBe("qa-evidence/a.png,qa-evidence/b.har");
   });
 });
+
+// TEAM-4122 FR-4 §7.5 — the CI agent's proof that a head SHA was actually built,
+// same additive-and-closed contract as evidence_kind above.
+describe("report_completion — ci_status / ci_build_id / ci_head_sha", () => {
+  it("persists all three when the CI agent supplies them", async () => {
+    await report({ ci_status: "certified", ci_build_id: "agentcore-hub-ci:abc123", ci_head_sha: "deadbeef" });
+    const r = record();
+    expect(r.ci_status).toBe("certified");
+    expect(r.ci_build_id).toBe("agentcore-hub-ci:abc123");
+    expect(r.ci_head_sha).toBe("deadbeef");
+  });
+
+  it("a record written without them keeps exactly the pre-4122 key set", async () => {
+    await report({});
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS].sort());
+  });
+
+  it("accepts the other two statuses and normalizes case/whitespace", async () => {
+    await report({ ci_status: "  GITHUB-ACTIONS-PROXY  " });
+    expect(record().ci_status).toBe("github-actions-proxy");
+    h.puts.length = 0;
+    await report({ ci_status: "unverified" });
+    expect(record().ci_status).toBe("unverified");
+  });
+
+  it("drops an unknown status with a warning instead of storing it", async () => {
+    await report({ ci_status: "definitely-passed", ci_build_id: "abc123" });
+    const r = record();
+    expect("ci_status" in r).toBe(false);
+    // The build id still lands — it's the weaker signal, but it's real.
+    expect(r.ci_build_id).toBe("abc123");
+    expect(h.warns.join("\n")).toMatch(/unknown ci_status "definitely-passed"/);
+  });
+
+  it("drops an oversized build id / head sha with a warning instead of storing it", async () => {
+    await report({ ci_build_id: "x".repeat(129), ci_head_sha: "y".repeat(129) });
+    const r = record();
+    expect("ci_build_id" in r).toBe(false);
+    expect("ci_head_sha" in r).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/oversized ci_build_id/);
+    expect(h.warns.join("\n")).toMatch(/oversized ci_head_sha/);
+  });
+});

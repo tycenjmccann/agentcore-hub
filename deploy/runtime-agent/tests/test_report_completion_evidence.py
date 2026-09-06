@@ -153,3 +153,37 @@ def test_lambda_and_tool_name_unchanged():
     assert len(calls) == 1
     assert calls[0][0] == "agentcore-hub-workflow-output"
     assert calls[0][1] == TOOL_NAME
+
+
+# ─── TEAM-4122 FR-4 §7.5: ci_status / ci_build_id / ci_head_sha ───────────────
+
+def test_ci_fields_forwarded():
+    _, payload = _payload(
+        ci_status="certified",
+        ci_build_id="agentcore-hub-ci:abc123",
+        ci_head_sha="deadbeef",
+    )
+    assert payload["ci_status"] == "certified"
+    assert payload["ci_build_id"] == "agentcore-hub-ci:abc123"
+    assert payload["ci_head_sha"] == "deadbeef"
+
+
+@pytest.mark.parametrize("status", ["certified", "github-actions-proxy", "unverified"])
+def test_all_three_statuses_pass_through(status):
+    _, payload = _payload(ci_status=status)
+    assert payload["ci_status"] == status
+
+
+def test_ci_status_normalized_to_lowercase_and_trimmed():
+    _, payload = _payload(ci_status="  CERTIFIED  ")
+    assert payload["ci_status"] == "certified"
+
+
+def test_ci_fields_omitted_give_the_pre_4122_payload_exactly():
+    _, payload = _payload()
+    assert payload == PRE_4121_PAYLOAD
+
+
+def test_ci_fields_blank_are_the_same_as_omitted():
+    _, payload = _payload(ci_status="   ", ci_build_id="", ci_head_sha="")
+    assert payload == PRE_4121_PAYLOAD
