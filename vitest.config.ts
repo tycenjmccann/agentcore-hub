@@ -251,6 +251,13 @@ export default defineConfig({
       // ONE reconcile tick re-drives it when the last child lands — versus mode
       // off, where escalationHeld reproduces the 3h26m stall prod actually took.
       "lambda/orchestrator/replay-yteqfl-dead-session.test.mjs",
+      // contract-warning (TEAM-4121 FR-8) — index.mjs REAL, AWS/store seams
+      // mocked: a fix ticket filed under FIX_TICKET_CONTRACT=shadow republishes
+      // its incompleteness as ONE `ticket.contract_warning` event on the run's own
+      // stream (so shadow is measurable before enforce is switched on), in both
+      // creation twins — the DDB-stream INSERT and the Jira webhook's todo — and
+      // never fails to ROUTE the ticket when that advisory can't be published.
+      "lambda/orchestrator/contract-warning.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
