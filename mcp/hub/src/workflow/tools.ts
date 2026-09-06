@@ -55,8 +55,9 @@ export const WORKFLOW_TOOLS = [
     description:
       "Submit a new workflow for processing. Requires a title, description, and repository configuration. " +
       "workflowDefId is the pipeline selector — pick an id from list_workflow_definitions (e.g. 'bug-fix' for bug runs; " +
-      "omitted → the default 'software-delivery' pipeline; 'sdlc-playbook' for the AI-native SDLC loop: intent.md accepted by the " +
-      "product owner → spec.md → plan.md → reviewed diff → PR, every stage a human gate). For 'sdlc-playbook' pass `intent` — " +
+      "omitted → the default 'software-delivery' pipeline). sdlcFramework selects a framework overlay on that pipeline: " +
+      "'playbook' = the AI-native SDLC loop (intent.md accepted by the product owner → spec.md → design/ → plan.md → " +
+      "reviewed diff → PR, every artifact committed to the branch, every stage a human gate). With 'playbook' pass `intent` — " +
       "interview the requester first and fill it in THEIR words (the hub writes intent.md verbatim, never paraphrased). workflowType is a DEPRECATED back-compat alias: without " +
       "workflowDefId it maps to a def ('bug' → 'bug-fix', 'feature' → 'software-delivery'); when both are supplied the " +
       "def wins and the run's stored type is derived from it. Sources and model override are optional. " +
@@ -75,7 +76,7 @@ export const WORKFLOW_TOOLS = [
         intent: {
           type: "object",
           description:
-            "Playbook runs (workflowDefId 'sdlc-playbook'): the originator's intent, captured once in their own words. " +
+            "Playbook runs (sdlcFramework 'playbook'): the originator's intent, captured once in their own words. " +
             "Rendered verbatim into intent.md and accepted by the product owner at the Intent Acceptance gate before any agent runs.",
           required: ["problem", "successCriteria"],
           properties: {
@@ -90,6 +91,11 @@ export const WORKFLOW_TOOLS = [
         allowUnresolvedRepo: {
           type: "boolean",
           description: "Submit even though a repoConfig URL failed the GitHub pre-flight (default false → 422).",
+        },
+        sdlcFramework: {
+          type: "string",
+          enum: ["standard", "playbook"],
+          description: "Framework overlay on the selected pipeline. 'playbook' commits intent/spec/design/plan/findings to the branch and turns every gate on (requires `intent`). Default standard.",
         },
         repoConfig: {
           type: "object",

@@ -13,14 +13,23 @@ interface ReviewGateOption {
   condition: "always" | "flagged";
 }
 
+interface FrameworkOption {
+  label: string;
+  description?: string;
+  artifactChain?: unknown;
+  reviewGates?: ReviewGateOption[];
+}
+
 interface WorkflowDefOption {
   id: string;
   name: string;
   description: string;
   icon: string;
   requiresRepo: boolean;
-  /** "playbook" switches the form into intent-template mode (see IntentFields). */
+  /** The def's own framework when no overlay is selected. */
   sdlcFramework?: "standard" | "playbook" | "aidlc";
+  /** Selectable overlays (e.g. { playbook: {...} }) — rendered as a Standard / <label> toggle. */
+  frameworks?: Record<string, FrameworkOption>;
   phases: { id: string; name: string; type: string }[];
   reviewGates?: ReviewGateOption[];
 }
@@ -55,6 +64,8 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
   const [selectedDefId, setSelectedDefId] = useState<string>("");
   // Phases the requester opted into a human-review gate for (flagged gates).
   const [enabledGatePhases, setEnabledGatePhases] = useState<string[]>([]);
+  // SDLC framework overlay for the selected def ("standard" = the def as written).
+  const [selectedFramework, setSelectedFramework] = useState<string>("standard");
   // Playbook intent template — the originator's own words, rendered verbatim
   // into intent.md by the server (never paraphrased).
   const [intent, setIntent] = useState<IntentBrief>(EMPTY_INTENT);
@@ -72,7 +83,11 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
 
   const selectedDef = workflowDefs.find((w) => w.id === selectedDefId);
   const requiresRepo = selectedDef?.requiresRepo ?? true;
-  const isPlaybook = selectedDef?.sdlcFramework === "playbook";
+  const frameworkOptions = selectedDef?.frameworks ? Object.entries(selectedDef.frameworks) : [];
+  const activeOverlay = selectedFramework !== "standard" ? selectedDef?.frameworks?.[selectedFramework] : undefined;
+  // Intent-template mode: the run commits an artifact chain (playbook overlay or a playbook-native def).
+  const isPlaybook = selectedFramework === "playbook" || (!activeOverlay && selectedDef?.sdlcFramework === "playbook");
+  const effectiveGates: ReviewGateOption[] = activeOverlay?.reviewGates ?? selectedDef?.reviewGates ?? [];
   const intentValid = !isPlaybook || (intent.problem.trim().length > 0 && intent.successCriteria.trim().length > 0);
 
   useEffect(() => {
@@ -195,6 +210,7 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
       // Only include modelOverride if a non-default model is selected
       ...(modelOverride && { modelOverride }),
       ...(selectedDefId && { workflowDefId: selectedDefId }),
+      ...(selectedFramework !== "standard" && { sdlcFramework: selectedFramework as WorkflowInput["sdlcFramework"] }),
       ...(enabledGatePhases.length > 0 && { reviewGates: enabledGatePhases }),
     });
   };
@@ -229,7 +245,7 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
                 <button
                   key={def.id}
                   type="button"
-                  onClick={() => { setSelectedDefId(def.id); setEnabledGatePhases([]); }}
+                  onClick={() => { setSelectedDefId(def.id); setEnabledGatePhases([]); setSelectedFramework("standard"); }}
                   data-testid={`workflow-def-${def.id}`}
                   className={`text-left px-3 py-2.5 rounded-lg border transition-colors ${
                     active
@@ -252,23 +268,49 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
         </div>
       )}
 
-      {/* Human review gates — opt-in for any "flagged" gates the selected def offers */}
+      {/* SDLC framework toggle — Standard (def as written) vs an overlay like Playbook */}
+      {frameworkOptions.length > 0 && (
+        <div data-testid="framework-toggle">
+          <label className="block text-sm font-medium text-secondary mb-1">Framework</label>
+          <p className="text-xs text-muted mb-2">Same pipeline and personas; the framework sets which artifacts are committed and which humans approve.</p>
+          <div className="flex gap-2">
+            {[["standard", "Standard", "Requirements → design → dev → QA as configured; gates as the workflow defines them."] as [string, string, string | undefined],
+              ...frameworkOptions.map(([id, o]) => [id, o.label, o.description] as [string, string, string | undefined])].map(([id, label, desc]) => {
+              const active = selectedFramework === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  title={desc}
+                  data-testid={`framework-${id}`}
+                  onClick={() => { setSelectedFramework(id); setEnabledGatePhases([]); }}
+                  className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${active ? "border-brand-500 bg-blue-600/10 text-primary" : "border-theme bg-surface-1 text-secondary hover:border-brand-500/40"}`}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+          {activeOverlay?.description && <p className="text-xs text-muted mt-2">{activeOverlay.description}</p>}
+        </div>
+      )}
+
+      {/* Human review gates — opt-in for any "flagged" gates the selected framework offers */}
       {(() => {
-        const flaggedGates = (selectedDef?.reviewGates || []).filter((g) => g.condition === "flagged");
-        const alwaysGates = (selectedDef?.reviewGates || []).filter((g) => g.condition === "always");
-        if (flaggedGates.length === 0) {
-          if (!isPlaybook || alwaysGates.length === 0) return null;
-          return (
-            <div data-testid="playbook-gates">
-              <label className="block text-sm font-medium text-secondary mb-1">Human gates (always on)</label>
-              <p className="text-xs text-muted">
-                {alwaysGates.map((g) => g.name || g.afterPhase).join(" → ")}. A person approves each one; none can be switched off per run.
-              </p>
-            </div>
-          );
-        }
+        const flaggedGates = effectiveGates.filter((g) => g.condition === "flagged");
+        const alwaysGates = effectiveGates.filter((g) => g.condition === "always");
+        const alwaysNote = isPlaybook && alwaysGates.length > 0 ? (
+          <div data-testid="playbook-gates" className="mb-3">
+            <label className="block text-sm font-medium text-secondary mb-1">Human gates (always on)</label>
+            <p className="text-xs text-muted">
+              {alwaysGates.map((g) => g.name || g.afterPhase).join(" → ")}. A person approves each one; none can be switched off per run.
+            </p>
+          </div>
+        ) : null;
+        if (flaggedGates.length === 0) return alwaysNote;
         return (
           <div>
+            {alwaysNote}
             <label className="block text-sm font-medium text-secondary mb-1">
               Human review gates
             </label>

@@ -72,12 +72,13 @@ import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE } from "./fix-
 import {
   normalizeChainGateMode, chainFor, chainDir, requiredArtifactsForTicket, sdlcFrameworkContext,
   gateInstructionOverride, fallbackReviewPackagePhase, artifactRepoPath, missingArtifactNote,
+  applyFramework, frameworkOfWorkflow,
 } from "./artifact-chain.mjs";
 
-// Playbook artifact-chain gate (sdlc-playbook def): a ticket that owes a chain
-// artifact (spec.md / plan.md / findings.md) may not cascade until the file is
-// on the shared branch. Only defs that declare `artifactChain` are affected;
-// ARTIFACT_CHAIN_GATE=off disables the check for all of them.
+// Playbook artifact-chain gate (framework overlay): a ticket that owes a chain
+// artifact (spec.md / design/<agent>.md / plan.md / findings.md) may not cascade
+// until the file is on the shared branch. Only runs whose effective def carries
+// `artifactChain` are affected; ARTIFACT_CHAIN_GATE=off disables the check.
 const ARTIFACT_CHAIN_GATE = normalizeChainGateMode(process.env.ARTIFACT_CHAIN_GATE);
 
 // ─── Config ────────────────────────────────────────────────────────────────────
@@ -374,8 +375,14 @@ export async function loadCdRegistry({ force = false } = {}) {
 }
 
 /** The def a run FOLLOWS: registered repo → as written; else ship phase stripped. */
+// The def a run actually follows: the configured def, with the run's SDLC
+// framework overlay applied (e.g. software-delivery + "playbook" → artifact
+// chain, always-on gates, branch at requirements), then the CD-registry handoff
+// strip. Every gate/artifact/branch decision reads THIS, never the raw def.
 function getEffectiveWorkflowDef(workflow) {
-  return effectiveWorkflowDef(getWorkflowDef(workflow?.workflowDefId), _cdRegistry, workflow?.repoConfig, SHIP_PHASES);
+  const base = getWorkflowDef(workflow?.workflowDefId);
+  const framed = applyFramework(base, frameworkOfWorkflow(base, workflow));
+  return effectiveWorkflowDef(framed, _cdRegistry, workflow?.repoConfig, SHIP_PHASES);
 }
 
 function getDelivery(workflow) {
@@ -474,9 +481,11 @@ export async function loadWorkflowDefs() {
         completionRequiresAgentPhases: w.completionRequiresAgentPhases || [],
         reviewGates: w.reviewGates || [],
         phaseOrder: order,
-        // Playbook defs: methodology + committed artifact chain (artifact-chain.mjs).
+        // SDLC framework: the def's own methodology, its committed artifact
+        // chain, and the selectable overlays (artifact-chain.mjs applyFramework).
         sdlcFramework: w.sdlcFramework || "standard",
         artifactChain: w.artifactChain || null,
+        frameworks: w.frameworks || null,
         phases: (w.phases || []).map((p) => ({ id: p.id, name: p.name, agentPhase: p.agentPhase })),
       };
     }
@@ -3357,7 +3366,7 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   }
 
   // Phase advancement (workflow-def driven, with software-delivery fallback)
-  const wfDef = getWorkflowDef(workflow.workflowDefId);
+  const wfDef = getEffectiveWorkflowDef(workflow); // framework overlay decides featureBranchPhase
   const phaseOrder = wfDef.phaseOrder;
   const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
@@ -3365,7 +3374,7 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   // Independent of the phase ADVANCE below: the playbook def's branch phase is
   // "requirements" — the run's INITIAL phase — so gating this on an advance
   // meant the spec author was dispatched with no branch to commit the chain to
-  // (first sdlc-playbook run, 2026-09-05). ensureFeatureBranch persists itself.
+  // (first playbook run, 2026-09-05). ensureFeatureBranch persists itself.
   if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
     workflow.featureBranch = await ensureFeatureBranch(workflow);
   }
@@ -3807,7 +3816,7 @@ async function handleTicketReady(ticketId, image) {
   }
 
   // Advance phase if needed (workflow-def driven, with software-delivery fallback)
-  const wfDef = getWorkflowDef(workflow.workflowDefId);
+  const wfDef = getEffectiveWorkflowDef(workflow); // framework overlay decides featureBranchPhase
   const phaseOrder = wfDef.phaseOrder;
   const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);

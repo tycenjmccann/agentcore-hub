@@ -1,6 +1,6 @@
 # Blueprint: Playbook Build (plan.md before code)
 
-Loaded by dev agents on `sdlc-playbook` runs. Your ticket description says
+Loaded by dev agents on playbook runs (software-delivery with the playbook framework). Your ticket description says
 which section applies: **PLAN TICKET** or **IMPLEMENTATION TICKET**. Your
 `## SDLC Framework` context names `artifact_dir` (`.sdlc/<workflow_id>`) and
 `artifact_branch` (the run's shared feature branch). Your `## Branch` context

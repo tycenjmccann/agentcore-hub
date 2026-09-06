@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { renderIntentMarkdown, intentReviewPackage, intentGateFor, artifactChainDir, intentGateDescription } from "@/lib/workflow/intent";
-import { getWorkflowDef } from "@/lib/workflow/workflow-defs";
+import { getWorkflowDef, applyFramework, resolveFramework } from "@/lib/workflow/workflow-defs";
 import type { WorkflowInput } from "@/lib/workflow/types";
 
 const base: WorkflowInput = {
@@ -46,17 +46,24 @@ describe("intent.md rendering (playbook PLAN stage)", () => {
   });
 });
 
-describe("intent gate + chain dir resolution from the def", () => {
-  it("sdlc-playbook has an always-on intent gate and a chain dir", () => {
-    const def = getWorkflowDef("sdlc-playbook");
-    expect(def.id).toBe("sdlc-playbook");
+describe("intent gate + chain dir resolution from the effective def", () => {
+  it("software-delivery + playbook overlay has an always-on intent gate and a chain dir", () => {
+    const def = getWorkflowDef("software-delivery", "playbook");
+    expect(def.id).toBe("software-delivery");
+    expect(def.sdlcFramework).toBe("playbook");
     expect(intentGateFor(def)?.name).toBe("Intent Acceptance");
     expect(intentGateFor(def)?.assignee).toBe("human:product-owner");
     expect(artifactChainDir(def, "wf_5")).toBe(".sdlc/wf_5");
+    expect(def.featureBranchPhase).toBe("requirements");
   });
-  it("software-delivery has neither", () => {
+  it("software-delivery standard has neither, and the overlay never mutates the bundled def", () => {
     const def = getWorkflowDef("software-delivery");
     expect(intentGateFor(def)).toBeNull();
     expect(artifactChainDir(def, "wf_5")).toBeNull();
+    expect(def.featureBranchPhase).toBe("development");
+    expect(applyFramework(def, "standard")).toBe(def);
+    expect(resolveFramework(def, "playbook")).toBe("playbook");
+    expect(resolveFramework(def, "aidlc")).toBe("standard"); // not offered by this def
+    expect(resolveFramework(getWorkflowDef("legal"), "playbook")).toBe("standard");
   });
 });
