@@ -54,6 +54,25 @@ export interface HumanReviewMetric {
   waitMs: number | null;
   outcome: "approved" | "rejected" | "unresolved";
   cycle: number;
+  /** TEAM-4121 FR-10 — the human was ASKED outside WM_BUSINESS_HOURS/TZ (weekend
+   * or outside the local window). Optional: metrics.json files written before
+   * that change do not carry it. */
+  outsideHours?: boolean | null;
+}
+
+/** TEAM-4121 FR-10 — one fix ticket's lineage. `tag` is why the run filed it:
+ * `new` (a defect nobody had filed for), `resurfacing` (same place/invariant as
+ * an earlier fix — an earlier fix did not hold), `fix-induced` (a previous fix
+ * broke it), `environmental` (red build / stale branch, nobody's disagreement). */
+export interface FixTicketEntry {
+  ticketId: string;
+  kind: string;
+  originTicketId: string | null;
+  round: number;
+  tag: "new" | "resurfacing" | "fix-induced" | "environmental";
+  createdAt: string | null;
+  title: string;
+  reverify?: boolean;
 }
 
 export interface ChangeRequestCycle {
@@ -79,7 +98,17 @@ export interface WorkflowMetrics {
   humanReviews: HumanReviewMetric[];
   humanWaitTotalMs: number;
   changeRequests: { count: number; cycles: ChangeRequestCycle[] };
-  fixTickets: { count: number; ticketIds: string[] };
+  /** count/ticketIds are unchanged; entries/byKind/byTag are FR-10 additions and
+   * absent from metrics.json files written before it. */
+  fixTickets: {
+    count: number;
+    ticketIds: string[];
+    entries?: FixTicketEntry[];
+    byKind?: Record<string, number>;
+    byTag?: Record<"new" | "resurfacing" | "fix-induced" | "environmental", number>;
+  };
+  /** How many human reviews were requested outside business hours (FR-10). */
+  humanReviewsOutsideHours?: number;
   nudgeCount: number;
   managerInterventions: ManagerIntervention[];
   errors: Array<{ agentId: string | null; error: string; at: string }>;
