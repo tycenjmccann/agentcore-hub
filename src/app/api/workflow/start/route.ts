@@ -21,7 +21,7 @@ import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure } from "@
 import type { RepoCheck } from "@/lib/workflow/repo-check";
 import type { WorkflowInput } from "@/lib/workflow/types";
 import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
-import { workflowTypeForDef, sdlcFrameworkForDef } from "@/lib/workflow/workflow-defs";
+import { workflowTypeForDef, resolveFramework, applyFramework } from "@/lib/workflow/workflow-defs";
 import { intentGateFor, renderIntentMarkdown, intentReviewPackage, intentGateDescription } from "@/lib/workflow/intent";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 
@@ -393,6 +393,15 @@ export async function POST(req: NextRequest) {
     // workflowType alongside workflowDefId, the def wins and the response says
     // so instead of silently mislabeling the run.
     const derivedWorkflowType = workflowTypeForDef(def);
+
+    // SDLC framework overlay (e.g. software-delivery + "playbook"): the run's
+    // requested framework selects the def's overlay — different artifacts and
+    // gates on the same pipeline. Resolved once here; the effective def is what
+    // every step below (intent gate, tickets, row) reads, and the framework is
+    // stamped on the row and the input so the board badge is the truth.
+    const framework = resolveFramework(def, body.sdlcFramework);
+    def = applyFramework(def, framework);
+    body.sdlcFramework = framework;
     const responseMeta: StartResponseMeta =
       body.workflowType !== undefined && body.workflowType !== derivedWorkflowType
         ? {
@@ -534,7 +543,7 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
     // TEAM-3886: persist the NORMALIZED input — dashboards (WorkflowBoard) pick
     // rendered phases from input.workflowDefId, so a type-only submission must
     // carry the resolved def id, matching the top-level row field.
-    input: { ...body, workflowDefId: def.id, sdlcFramework: sdlcFrameworkForDef(def) },
+    input: { ...body, workflowDefId: def.id },
     agentTasks: {},
     messages: [],
     humanNotifications: [],
@@ -543,8 +552,8 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
     // TEAM-3832 FR2: derived from the resolved def — never from caller input.
     workflowType: workflowTypeForDef(def),
     workflowDefId: def.id,
-    // Playbook runs stamp their framework so the board badge is the truth.
-    sdlcFramework: sdlcFrameworkForDef(def),
+    // Stamped from the resolved framework overlay so the board badge is the truth.
+    sdlcFramework: body.sdlcFramework || "standard",
     ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
   }, markerId);
 
@@ -674,7 +683,7 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
     // TEAM-3886: persist the NORMALIZED input — dashboards (WorkflowBoard) pick
     // rendered phases from input.workflowDefId, so a type-only submission must
     // carry the resolved def id, matching the top-level row field.
-    input: { ...body, workflowDefId: def.id, sdlcFramework: sdlcFrameworkForDef(def) },
+    input: { ...body, workflowDefId: def.id },
     agentTasks: {},
     messages: [],
     humanNotifications: [],
@@ -682,8 +691,8 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
     // TEAM-3832 FR2: derived from the resolved def — never from caller input.
     workflowType: workflowTypeForDef(def),
     workflowDefId: def.id,
-    // Playbook runs stamp their framework so the board badge is the truth.
-    sdlcFramework: sdlcFrameworkForDef(def),
+    // Stamped from the resolved framework overlay so the board badge is the truth.
+    sdlcFramework: body.sdlcFramework || "standard",
     ...(body.intakeChannel ? { intakeChannel: body.intakeChannel } : {}),
   }, markerId);
 

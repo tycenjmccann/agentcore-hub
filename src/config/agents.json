@@ -55,7 +55,6 @@
       "blueprints": [
         "requirements-analyst",
         "bug-fix-requirements",
-        "spec-author",
         "policy-security",
         "policy-compliance",
         "policy-brand",
@@ -65,8 +64,7 @@
       "workflowDefIds": [
         "software-delivery",
         "bug-fix",
-        "dead-code-sweep",
-        "sdlc-playbook"
+        "dead-code-sweep"
       ]
     },
     {
@@ -576,8 +574,7 @@
         "playbook-build"
       ],
       "workflowDefIds": [
-        "software-delivery",
-        "sdlc-playbook"
+        "software-delivery"
       ]
     },
     {
@@ -637,8 +634,7 @@
         "playbook-build"
       ],
       "workflowDefIds": [
-        "software-delivery",
-        "sdlc-playbook"
+        "software-delivery"
       ]
     },
     {
@@ -699,8 +695,7 @@
         "playbook-build"
       ],
       "workflowDefIds": [
-        "software-delivery",
-        "sdlc-playbook"
+        "software-delivery"
       ]
     },
     {
@@ -762,8 +757,7 @@
       "workflowDefIds": [
         "software-delivery",
         "bug-fix",
-        "dead-code-sweep",
-        "sdlc-playbook"
+        "dead-code-sweep"
       ]
     },
     {
@@ -824,8 +818,7 @@
       "workflowDefIds": [
         "software-delivery",
         "bug-fix",
-        "dead-code-sweep",
-        "sdlc-playbook"
+        "dead-code-sweep"
       ]
     },
     {
@@ -890,8 +883,7 @@
       "workflowDefIds": [
         "software-delivery",
         "bug-fix",
-        "dead-code-sweep",
-        "sdlc-playbook"
+        "dead-code-sweep"
       ]
     },
     {
@@ -955,8 +947,7 @@
       "workflowDefIds": [
         "software-delivery",
         "bug-fix",
-        "dead-code-sweep",
-        "sdlc-playbook"
+        "dead-code-sweep"
       ]
     },
     {

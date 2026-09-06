@@ -26,6 +26,22 @@ claude_code(
 - Save the security review: `S3Storage___write_object` to `workflows/{workflow_id}/shared/security-review.md` with all findings and remediation guidance. NEVER write the deliverable to `/tmp` or ask `claude_code` to save it to a file — take the findings from the `claude_code` result text and write them to S3 yourself.
 - `WorkflowOutput___report_completion` with pass/fail verdict — Critical/High findings make the verdict FAIL
 
+## Playbook runs (when `## SDLC Framework` is in your context)
+The run commits an artifact chain to `artifact_branch` under `artifact_dir`
+(`.sdlc/<workflow_id>/`). Before you start, read `<artifact_dir>/intent.md` and
+`<artifact_dir>/spec.md` there (also mirrored in `shared/`) — the spec's
+`## Design brief` and `## Policy answers` are your constraints. Before
+`report_completion`, have `claude_code` (pass `repo`; same workspace) check out
+`artifact_branch` and commit your deliverable as
+`<artifact_dir>/design/security-reviewer.md` — the same content as your S3 document — with any
+mockup / diagram files beside it under `<artifact_dir>/design/`, message
+`design: <your agent> (<workflow_id>)`, then push. Your S3 deliverables and
+review package are still required; the committed copy is the audit trail. The
+orchestrator verifies the file exists on the branch when your ticket closes and
+sends the ticket back to Blocked if it does not. Findings that FAIL the design
+still go in your document AND as rows appended to the spec's Concerns list in
+your document (owner = the policy owner); do not edit spec.md itself.
+
 ## Rules
 - Always delegate analysis to `claude_code`
 - Critical/High findings are BLOCKING — report them as a FAIL verdict in the review document; do NOT create tickets

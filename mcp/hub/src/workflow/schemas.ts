@@ -93,6 +93,7 @@ export const WorkflowInputSchema = z.object({
   workflowDefId: z.string().optional(),
   reviewGates: z.array(z.string()).optional(),
   intent: IntentBriefSchema.optional(),
+  sdlcFramework: z.enum(["standard", "playbook", "aidlc"]).optional(),
   portedSession: PortedSessionSchema.optional(),
   // Waive the submit-time GitHub pre-flight on a repoConfig URL that
   // definitively does not exist; the intake agent then hunts for the right

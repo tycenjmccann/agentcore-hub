@@ -1,20 +1,53 @@
 /**
  * Artifact chain — the playbook's committed audit trail.
  *
- * A def that declares `artifactChain` (workflows.json, sdlc-playbook) runs the
- * AI-native SDLC loop: every stage ends by committing an artifact to the run's
- * shared feature branch, and the next stage starts by reading it:
+ * A run whose EFFECTIVE def declares `artifactChain` (a framework overlay such
+ * as software-delivery's "playbook", selected per run by input.sdlcFramework)
+ * runs the AI-native SDLC loop: every stage ends by committing an artifact to
+ * the run's shared feature branch, and the next stage starts by reading it:
  *
- *   intent.md  (hub, from the originator's words; product owner accepts)
- *   spec.md    (spec author = the intake agent; product owner signs off)
- *   plan.md    (the "Plan:" dev ticket; engineer approves)
- *   findings.md (code reviewer, diff checked against the plan)
+ *   intent.md          (hub, from the originator's words; product owner accepts)
+ *   spec.md            (requirements analyst; product owner signs off)
+ *   design/<agent>.md  (each design-phase persona; role leads + product owner)
+ *   plan.md            (the "Plan:" dev ticket; engineer approves)
+ *   findings.md        (code reviewer, diff checked against the plan)
  *
  * Pure helpers only — the orchestrator (index.mjs) owns S3/GitHub/ticket I/O.
  * Same split as cd-registry.mjs so this file is unit-testable in isolation.
  */
 
 export const ARTIFACT_CHAIN_GATE_MODES = new Set(["enforce", "off"]);
+
+/**
+ * The framework a run follows: the requested overlay when the def offers it,
+ * else the def's own `sdlcFramework`, else "standard". Twin of
+ * src/lib/workflow/workflow-defs.ts resolveFramework.
+ */
+export function resolveFramework(def, requested) {
+  if (typeof requested === "string" && requested !== "standard" && def?.frameworks && requested in def.frameworks) {
+    return requested;
+  }
+  const own = def?.sdlcFramework;
+  return own === "playbook" || own === "aidlc" ? own : "standard";
+}
+
+/**
+ * The effective def for a framework: overlay fields (featureBranchPhase,
+ * artifactChain, reviewGates, completionRequiresAgentPhases) laid over the def,
+ * `sdlcFramework` stamped. Unknown / "standard" → the def unchanged. Twin of
+ * workflow-defs.ts applyFramework; phaseOrder and every other field survive.
+ */
+export function applyFramework(def, framework) {
+  const overlay = framework && framework !== "standard" ? def?.frameworks?.[framework] : undefined;
+  if (!overlay) return def;
+  const { label: _label, description: _description, ...fields } = overlay;
+  return { ...def, ...fields, sdlcFramework: framework };
+}
+
+/** The framework a stored workflow row runs under (row stamp, else input, else def). */
+export function frameworkOfWorkflow(def, workflow) {
+  return resolveFramework(def, workflow?.sdlcFramework || workflow?.input?.sdlcFramework);
+}
 
 /** ARTIFACT_CHAIN_GATE env → "enforce" (default) | "off". Only applies to defs with a chain. */
 export function normalizeChainGateMode(raw) {
@@ -39,6 +72,11 @@ export function chainDir(def, workflowId) {
 export const CODE_REVIEWER_AGENT = "agentcore_hub_code_reviewer";
 export const PLAN_TICKET_TITLE = /^\s*plan\s*:/i;
 
+/** design/<agent>.md — the design-phase persona's committed section. */
+export function designArtifactName(agentId) {
+  return `design/${String(agentId || "").replace(/^agentcore_hub_/, "").replace(/_/g, "-")}.md`;
+}
+
 /**
  * Which chain artifacts a ticket must have committed before it may close.
  *   intake agent ticket          → intent.md + spec.md (it commits both)
@@ -60,6 +98,10 @@ export function requiredArtifactsForTicket({ def, ticket, agentDef, intakeAgentI
   }
   if (agentDef?.phase === "development" && PLAN_TICKET_TITLE.test(String(ticket.title || ""))) {
     if (names.has("plan.md")) want.push("plan.md");
+    return want;
+  }
+  if (agentDef?.phase === "design" && names.has("design/<agent>.md")) {
+    want.push(designArtifactName(assignee));
     return want;
   }
   if (assignee === CODE_REVIEWER_AGENT && names.has("findings.md")) {
@@ -102,6 +144,10 @@ export function sdlcFrameworkContext({ def, workflow, ticket, agentDef, intakeAg
     );
     if (plan) {
       lines.push(`This is the PLAN ticket: write plan.md ONLY — do not implement. load_blueprint("playbook-build") and follow its "Plan ticket" section.`);
+    } else if (agentDef?.phase === "design") {
+      lines.push(`Design-phase persona: commit your design doc as ${owed[0]} (mockups/diagrams alongside it under ${dir}/design/) on ${branch}, in addition to your normal S3 deliverables. Read ${dir}/spec.md first — it is the spec you design against.`);
+    } else if (agentDef?.phase === "requirements") {
+      lines.push(`Follow the "Playbook mode" section of your blueprint: spec.md (requirements + design brief + policy answers + Concerns) is the artifact; keep the standard designer tiers; add the Plan ticket + Plan Approval gate before implementation.`);
     }
   } else if (agentDef?.phase === "development") {
     lines.push(`your_artifact: none — implement per ${dir}/plan.md. load_blueprint("playbook-build") and follow its "Implementation ticket" section. Record any deviation from the plan in plan.md under "## Deviations" and commit it.`);

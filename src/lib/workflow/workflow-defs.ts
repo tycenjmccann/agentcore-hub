@@ -112,8 +112,26 @@ export interface ArtifactChain {
   artifacts: ArtifactChainEntry[];
 }
 
-/** Which SDLC methodology a def implements. Drives the board badge and the artifact chain. */
+/** Which SDLC methodology a run follows. Drives the board badge and the artifact chain. */
 export type SdlcFramework = "standard" | "playbook" | "aidlc";
+
+/**
+ * A framework OVERLAY on a def (e.g. software-delivery's "playbook"): the same
+ * phases and personas, but different committed artifacts and human gates. A run
+ * selects it with `input.sdlcFramework`; `applyFramework` produces the
+ * effective def every consumer (start route, board, orchestrator) reads.
+ * Fields present in the overlay REPLACE the def's (gates are a full set, not a
+ * merge) so a flavor is readable in one place.
+ */
+export interface FrameworkOverlay {
+  /** Short label for the intake toggle, e.g. "Playbook". */
+  label?: string;
+  description?: string;
+  featureBranchPhase?: string | null;
+  artifactChain?: ArtifactChain;
+  reviewGates?: ReviewGate[];
+  completionRequiresAgentPhases?: string[];
+}
 
 /** Defaults for the convergence-cap fields of {@link ReviewGate}. */
 export const REVIEW_GATE_CAP_DEFAULTS: {
@@ -193,10 +211,12 @@ export interface WorkflowDef {
   completionRequiresAgentPhases: string[];
   /** Optional human-review gates keyed by the agent phase they guard. */
   reviewGates?: ReviewGate[];
-  /** SDLC methodology this def implements. Absent → "standard". */
+  /** SDLC methodology this def implements when no overlay is selected. Absent → "standard". */
   sdlcFramework?: SdlcFramework;
-  /** Playbook defs only: the committed artifact chain (intent → spec → plan → findings). */
+  /** The committed artifact chain (set by a framework overlay, e.g. playbook). */
   artifactChain?: ArtifactChain;
+  /** Selectable framework overlays keyed by SdlcFramework id (e.g. { playbook: {...} }). */
+  frameworks?: Partial<Record<SdlcFramework, FrameworkOverlay>>;
   phases: WorkflowDefPhase[];
 }
 
@@ -215,9 +235,33 @@ export const WORKFLOW_DEFS: WorkflowDef[] = CONFIG.workflows;
  * Resolve a workflow definition by id. Falls back to the default definition
  * when the id is missing or unknown, so legacy/unspecified runs keep working.
  */
-export function getWorkflowDef(id?: string | null): WorkflowDef {
+export function getWorkflowDef(id?: string | null, framework?: string | null): WorkflowDef {
   const found = id ? WORKFLOW_DEFS.find((w) => w.id === id) : undefined;
-  return found || WORKFLOW_DEFS.find((w) => w.id === DEFAULT_WORKFLOW_DEF_ID) || WORKFLOW_DEFS[0];
+  const def = found || WORKFLOW_DEFS.find((w) => w.id === DEFAULT_WORKFLOW_DEF_ID) || WORKFLOW_DEFS[0];
+  return framework ? applyFramework(def, framework) : def;
+}
+
+/**
+ * The framework a run follows: the requested overlay when the def offers it,
+ * else the def's own framework, else "standard". Never throws on junk input.
+ */
+export function resolveFramework(def: WorkflowDef, requested?: unknown): SdlcFramework {
+  if (typeof requested === "string" && requested !== "standard" && def.frameworks && requested in def.frameworks) {
+    return requested as SdlcFramework;
+  }
+  return sdlcFrameworkForDef(def);
+}
+
+/**
+ * The effective def for a framework: the def with the overlay's fields laid on
+ * top and `sdlcFramework` set. Unknown / "standard" → the def unchanged (same
+ * object, so identity checks and bundled-def tests keep working).
+ */
+export function applyFramework(def: WorkflowDef, framework?: string | null): WorkflowDef {
+  const overlay = framework && framework !== "standard" ? def.frameworks?.[framework as SdlcFramework] : undefined;
+  if (!overlay) return def;
+  const { label: _label, description: _description, ...fields } = overlay;
+  return { ...def, ...fields, sdlcFramework: framework as SdlcFramework };
 }
 
 /**

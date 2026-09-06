@@ -86,124 +86,107 @@
           ]
         }
       ],
-      "sdlcFramework": "standard"
-    },
-    {
-      "id": "sdlc-playbook",
-      "type": "feature",
-      "name": "SDLC Playbook",
-      "displayName": "PLAYBOOK",
-      "description": "AI-native SDLC loop: the request is captured verbatim as intent.md and accepted by the product owner; one spec author turns it into spec.md under the org's policy skills and the product owner signs off; a dev writes plan.md before any code and an engineer approves it; implementation is reviewed against the plan; QA, CI, then the PR. Every stage commits its artifact to the feature branch. Every gate is a human.",
-      "icon": "BookOpen",
-      "intakeAgentId": "agentcore_hub_requirements_analyst",
-      "requiresRepo": true,
-      "featureBranchPhase": "requirements",
-      "createsPullRequest": true,
-      "sdlcFramework": "playbook",
-      "artifactChain": {
-        "dir": ".sdlc/{workflowId}",
-        "artifacts": [
-          {
-            "name": "intent.md",
-            "owner": "intake",
-            "gate": "Intent Acceptance"
+      "sdlcFramework": "standard",
+      "frameworks": {
+        "playbook": {
+          "label": "Playbook",
+          "description": "AI-native SDLC loop on the same pipeline: the request is captured verbatim as intent.md and accepted by the product owner before any agent runs; the analyst writes spec.md under the org's policy skills; designers commit their sections and mockups; a dev writes plan.md before any code and an engineer approves it; the reviewer checks the diff against the plan. Every artifact is committed to the feature branch; every gate is a human.",
+          "featureBranchPhase": "requirements",
+          "artifactChain": {
+            "dir": ".sdlc/{workflowId}",
+            "artifacts": [
+              {
+                "name": "intent.md",
+                "owner": "intake",
+                "gate": "Intent Acceptance"
+              },
+              {
+                "name": "spec.md",
+                "owner": "requirements",
+                "gate": "Spec Approval"
+              },
+              {
+                "name": "design/<agent>.md",
+                "owner": "design",
+                "gate": "Design Approval"
+              },
+              {
+                "name": "plan.md",
+                "owner": "plan",
+                "gate": "Plan Approval"
+              },
+              {
+                "name": "findings.md",
+                "owner": "review"
+              }
+            ]
           },
-          {
-            "name": "spec.md",
-            "owner": "requirements",
-            "gate": "Spec Approval"
-          },
-          {
-            "name": "plan.md",
-            "owner": "plan",
-            "gate": "Plan Approval"
-          },
-          {
-            "name": "findings.md",
-            "owner": "review"
-          }
-        ]
-      },
-      "completionRequiresAgentPhases": [
-        "development",
-        "verification",
-        "review",
-        "ship"
-      ],
-      "reviewGates": [
-        {
-          "afterPhase": "intake",
-          "name": "Intent Acceptance",
-          "blocking": true,
-          "condition": "always",
-          "onReject": "hold",
-          "reviewerRole": "Product Owner",
-          "assignee": "human:product-owner",
-          "instructions": "Created by the hub at intake (not by you): the Intent Acceptance ticket already exists and your own ticket is blocked by it."
-        },
-        {
-          "afterPhase": "requirements",
-          "name": "Spec Approval",
-          "blocking": true,
-          "condition": "always",
-          "onReject": "rework",
-          "reviewerRole": "Product Owner",
-          "assignee": "human:product-owner"
-        },
-        {
-          "afterPhase": "development",
-          "scope": "plan",
-          "name": "Plan Approval",
-          "blocking": true,
-          "condition": "always",
-          "onReject": "rework",
-          "reviewerRole": "Engineer",
-          "assignee": "human:engineer",
-          "instructions": "After the 'Plan:' ticket ONLY (not the implementation tickets): create a \"Plan Approval\" ticket assigned to \"human:engineer\", blocked_by the Plan ticket. Every implementation, review, QA and CI ticket must be blocked_by this gate (directly or through the chain)."
-        },
-        {
-          "afterPhase": "ship",
-          "name": "Merge Approval",
-          "blocking": true,
-          "condition": "always",
-          "onReject": "rework",
-          "reviewerRole": "Code Owner",
-          "assignee": "human:engineer",
-          "maxRounds": 3,
-          "regressionCountsDouble": true,
-          "onCapReached": "escalate"
-        }
-      ],
-      "phases": [
-        {
-          "id": "intake",
-          "name": "Intent",
-          "type": "app",
-          "agentPhase": "intake"
-        },
-        {
-          "id": "spec",
-          "name": "Spec",
-          "type": "agent",
-          "agentPhase": "requirements"
-        },
-        {
-          "id": "build",
-          "name": "Build",
-          "type": "agent",
-          "agentPhase": "development"
-        },
-        {
-          "id": "qa",
-          "name": "QA & Ship",
-          "type": "agent",
-          "agentPhase": "verification",
-          "extraAgentPhases": [
-            "review",
-            "ship"
+          "reviewGates": [
+            {
+              "afterPhase": "intake",
+              "name": "Intent Acceptance",
+              "blocking": true,
+              "condition": "always",
+              "onReject": "hold",
+              "reviewerRole": "Product Owner",
+              "assignee": "human:product-owner",
+              "instructions": "Created by the hub at intake (not by you): the Intent Acceptance ticket already exists and your own ticket was blocked by it."
+            },
+            {
+              "afterPhase": "requirements",
+              "name": "Spec Approval",
+              "blocking": true,
+              "condition": "always",
+              "onReject": "rework",
+              "reviewerRole": "Product Owner",
+              "assignee": "human:product-owner"
+            },
+            {
+              "afterPhase": "design",
+              "scope": "role",
+              "name": "Design Review",
+              "blocking": true,
+              "condition": "flagged",
+              "onReject": "rework",
+              "reviewerRole": "Designer",
+              "assignee": "human:design-lead",
+              "instructions": "Per-role design review (this run opted in): for EACH Tier 1 designer ticket you create, also create one \"<Surface> Design Review\" ticket (e.g. \"iOS Design Review\") assigned to \"human:<surface>-lead\" (ios-lead, android-lead, web-lead, backend-lead), blocked_by that designer's ticket. The Design Approval gate below must be blocked_by every one of these review tickets as well."
+            },
+            {
+              "afterPhase": "design",
+              "name": "Design Approval",
+              "blocking": true,
+              "condition": "always",
+              "onReject": "rework",
+              "reviewerRole": "Product Owner",
+              "assignee": "human:product-owner"
+            },
+            {
+              "afterPhase": "development",
+              "scope": "plan",
+              "name": "Plan Approval",
+              "blocking": true,
+              "condition": "always",
+              "onReject": "rework",
+              "reviewerRole": "Engineer",
+              "assignee": "human:engineer",
+              "instructions": "After the 'Plan:' ticket ONLY (not the implementation tickets): create a \"Plan Approval\" ticket assigned to \"human:engineer\", blocked_by the Plan ticket. Every implementation, review, QA and CI ticket must be blocked_by this gate (directly or through the chain)."
+            },
+            {
+              "afterPhase": "ship",
+              "name": "Merge Approval",
+              "blocking": true,
+              "condition": "always",
+              "onReject": "rework",
+              "reviewerRole": "Code Owner",
+              "assignee": "human:engineer",
+              "maxRounds": 3,
+              "regressionCountsDouble": true,
+              "onCapReached": "escalate"
+            }
           ]
         }
-      ]
+      }
     },
     {
       "id": "bug-fix",

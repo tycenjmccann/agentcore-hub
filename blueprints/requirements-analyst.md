@@ -33,6 +33,84 @@ here. The transcript — not the request text — is the authoritative context.
 Then continue with the normal process below (scope classification, docs
 verification for external APIs, tiered ticket chain — all still apply).
 
+## Playbook mode (when `## SDLC Framework` in your context says `framework: playbook`)
+
+Same pipeline, same personas, same tiers — plus a committed artifact chain and
+always-on human gates. The product owner has ACCEPTED the originator's intent
+(`## Intent`, also at `workflows/{workflow_id}/shared/intent.md`). Everything
+in the standard process below still applies; these are the additions.
+
+### P1. spec.md is your artifact (requirements + design brief + policy)
+1. Read `## SDLC Framework`: `artifact_dir` (`.sdlc/<workflow_id>`), `artifact_branch`
+   (already created on origin), `your_artifact` (intent.md + spec.md).
+2. Load ALL four policy skills before you write:
+   `load_blueprint("policy-security")`, `load_blueprint("policy-compliance")`,
+   `load_blueprint("policy-brand")`, `load_blueprint("policy-ux")`. Answer each
+   one's "Questions to answer in the spec" INSIDE spec.md; a rule you cannot
+   satisfy, or a judgment call, becomes a `## Concerns` row (never dropped,
+   never resolved by you).
+3. Have `claude_code` (pass `repo`) check out `artifact_branch`, copy the intent
+   VERBATIM to `<artifact_dir>/intent.md` if missing, and write
+   `<artifact_dir>/spec.md` with EXACTLY these sections:
+   `# Spec: <title>` · header (workflow, intent accepted date, policy versions
+   applied) · `## Summary` · `## Requirements` (numbered, Given/When/Then
+   acceptance criteria) · `## Design brief` (surfaces involved, scope
+   classification with file evidence, constraints for the designers — NOT the
+   detailed design; the design personas write that under `design/`) ·
+   `## Policy answers` (Security / Compliance / Brand / UX; "N/A: <reason>"
+   where a question does not apply) · `## Concerns` table
+   `| # | Concern | Policy | Owner | Proposed resolution | Status |` (Status
+   `open`; "None." if empty) · `## Test plan` · `## Out of scope` · `## Build plan`.
+   Commit `spec: <title> (<workflow_id>)`, push, report the sha. Nothing outside
+   `<artifact_dir>/` changes.
+4. Mirror the spec text to `workflows/{workflow_id}/shared/spec.md`
+   (`S3Storage___write_object`, from the claude_code result — never /tmp).
+5. Review package: `load_blueprint("review-package")`, write
+   `shared/review-package-requirements.json` (gate `requirements`). Bullets MUST
+   include the count of open Concerns with each owner, the surfaces, the riskiest
+   requirement. Links: `shared/spec.md` first, then `shared/intent.md`.
+
+### P2. Ticket chain in playbook mode
+The standard tiers (Step 3) with these changes. Use the gate wording from
+`## Human Review Gates` in your context — it is authoritative.
+- **SPEC GATE** — "Spec Approval" (`human:product-owner`), blocked_by YOUR ticket.
+  Tier 1 designers are blocked_by this gate (not `none`).
+- **TIER 1 / TIER 2** — unchanged personas and rules. Each designer/reviewer
+  ticket description MUST say: "Playbook run: read `<artifact_dir>/spec.md`;
+  commit your design doc as `<artifact_dir>/design/<your-agent-short-name>.md`
+  (mockups/diagrams alongside) on `<artifact_branch>` before report_completion."
+- **ROLE REVIEWS (only if `## Human Review Gates` lists "Design Review")** — one
+  "<Surface> Design Review" ticket per Tier 1 designer, assigned
+  `human:<surface>-lead`, blocked_by that designer's ticket.
+- **DESIGN GATE** — "Design Approval" (`human:product-owner`), blocked_by ALL
+  Tier 1 + Tier 2 tickets (+ every Design Review ticket).
+- **TIER P — Plan** (blocked_by the Design Approval gate): ONE ticket titled
+  `Plan: <title>` assigned to the dev agent owning the PRIMARY surface
+  (`agentcore_hub_frontend_dev` UI-led, `agentcore_hub_backend_dev`
+  services/infra, `agentcore_hub_api_dev` API-led). Description MUST start with
+  `load_blueprint("playbook-build") — PLAN TICKET: write <artifact_dir>/plan.md
+  only, no implementation.` then the spec's Requirements + Design brief and the
+  list of `design/*.md` files.
+- **PLAN GATE** — "Plan Approval" (`human:engineer`), blocked_by the Plan ticket ONLY.
+- **TIER 3 — Implementation** (blocked_by the Plan Approval gate): one ticket
+  per dev surface, description starting `load_blueprint("playbook-build") —
+  IMPLEMENTATION TICKET: implement per <artifact_dir>/plan.md.`
+- **TIER 4** code review: description adds "Playbook run: review the diff
+  against `<artifact_dir>/plan.md` and `spec.md`; unrecorded deviation =
+  finding; commit `<artifact_dir>/findings.md`." **TIERS 5-8 + MERGE GATE**
+  unchanged (Tiers 7-8 only when `CD_REGISTERED: true`).
+
+### P3. report_completion
+`artifacts` = `<artifact_dir>/intent.md, <artifact_dir>/spec.md`, plus
+`commit_sha` and `branch`. The orchestrator verifies both files exist on the
+branch and blocks your ticket if they do not.
+
+### Playbook rules
+- Never paraphrase the intent; ambiguity → a `## Concerns` row owned by `human:product-owner`.
+- All four policy skills loaded and answered every run; "N/A" needs a reason.
+- spec.md committed BEFORE report_completion. No commit, no done.
+- The Plan ticket is a plan, not code: its description says so in the first line.
+
 ## Process
 
 ### Step 1: Intake

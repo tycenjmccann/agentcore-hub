@@ -22,9 +22,23 @@ export async function GET() {
       description: w.description,
       icon: w.icon,
       requiresRepo: w.requiresRepo,
-      // Playbook defs switch the intake form into intent-template mode.
       sdlcFramework: w.sdlcFramework || "standard",
       artifactChain: w.artifactChain,
+      // Framework overlays the intake form offers as a toggle (Standard / Playbook).
+      // Each carries its own gate set so the form shows the right opt-ins.
+      frameworks: Object.fromEntries(
+        Object.entries(w.frameworks || {}).map(([id, o]) => [
+          id,
+          {
+            label: o?.label || id,
+            description: o?.description,
+            artifactChain: o?.artifactChain,
+            reviewGates: (o?.reviewGates || []).map((g) => ({
+              afterPhase: g.afterPhase, name: g.name, blocking: g.blocking, condition: g.condition,
+            })),
+          },
+        ])
+      ),
       phases: w.phases.map((p) => ({ id: p.id, name: p.name, type: p.type })),
       // Surface flagged review gates so the intake form can offer them as opt-ins.
       reviewGates: (w.reviewGates || []).map((g) => ({

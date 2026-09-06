@@ -2,37 +2,60 @@ import { describe, it, expect } from "vitest";
 import {
   normalizeChainGateMode, chainFor, chainDir, requiredArtifactsForTicket, sdlcFrameworkContext,
   gateInstructionOverride, fallbackReviewPackagePhase, artifactRepoPath, missingArtifactNote, isPlanTicket,
+  applyFramework, resolveFramework, frameworkOfWorkflow, designArtifactName,
 } from "./artifact-chain.mjs";
 import workflows from "../../src/config/workflows.json";
 
-const playbook = workflows.workflows.find((w) => w.id === "sdlc-playbook");
 const standard = workflows.workflows.find((w) => w.id === "software-delivery");
+// The playbook is an OVERLAY on software-delivery, selected per run.
+const playbook = applyFramework(standard, "playbook");
+const ios = { agentId: "agentcore_hub_ios_designer", phase: "design" };
 const INTAKE = "agentcore_hub_requirements_analyst";
 const dev = { agentId: "agentcore_hub_frontend_dev", phase: "development" };
 const reviewer = { agentId: "agentcore_hub_code_reviewer", phase: "review" };
 const ci = { agentId: "agentcore_hub_ci_agent", phase: "review" };
 
-describe("artifact chain — def shape (workflows.json)", () => {
-  it("sdlc-playbook declares the intent → spec → plan → findings chain", () => {
-    expect(chainFor(playbook)).not.toBeNull();
-    expect(playbook.artifactChain.artifacts.map((a) => a.name)).toEqual(["intent.md", "spec.md", "plan.md", "findings.md"]);
-    expect(chainDir(playbook, "wf_1")).toBe(".sdlc/wf_1");
-  });
-  it("software-delivery has no chain (standard pipeline is untouched)", () => {
+describe("framework overlay (software-delivery + playbook)", () => {
+  it("software-delivery itself has no chain and is standard", () => {
     expect(chainFor(standard)).toBeNull();
     expect(chainDir(standard, "wf_1")).toBeNull();
     expect(standard.sdlcFramework).toBe("standard");
+    expect(standard.featureBranchPhase).toBe("development");
   });
-  it("every playbook gate is always-on and human-assigned", () => {
+  it("the playbook overlay keeps the def identity and phases, replaces gates/chain/branch phase", () => {
+    expect(playbook.id).toBe("software-delivery");
+    expect(playbook.phases).toBe(standard.phases);
+    expect(playbook.sdlcFramework).toBe("playbook");
+    expect(playbook.featureBranchPhase).toBe("requirements");
+    expect(playbook.artifactChain.artifacts.map((a) => a.name)).toEqual(["intent.md", "spec.md", "design/<agent>.md", "plan.md", "findings.md"]);
+    expect(chainDir(playbook, "wf_1")).toBe(".sdlc/wf_1");
+    expect(playbook.label).toBeUndefined(); // overlay-only presentation fields do not leak onto the def
+  });
+  it("every playbook gate is human-assigned; all but the per-role Design Review are always-on", () => {
     for (const g of playbook.reviewGates) {
-      expect(g.condition).toBe("always");
       expect(g.blocking).toBe(true);
       expect(g.assignee.startsWith("human:")).toBe(true);
+      expect(g.condition).toBe(g.scope === "role" ? "flagged" : "always");
     }
-    expect(playbook.reviewGates.map((g) => g.name)).toEqual(["Intent Acceptance", "Spec Approval", "Plan Approval", "Merge Approval"]);
+    expect(playbook.reviewGates.map((g) => g.name)).toEqual([
+      "Intent Acceptance", "Spec Approval", "Design Review", "Design Approval", "Plan Approval", "Merge Approval",
+    ]);
   });
-  it("the spec author is dispatched onto the shared branch (branch created at requirements)", () => {
-    expect(playbook.featureBranchPhase).toBe("requirements");
+  it("resolveFramework / applyFramework / frameworkOfWorkflow", () => {
+    expect(resolveFramework(standard, "playbook")).toBe("playbook");
+    expect(resolveFramework(standard, "standard")).toBe("standard");
+    expect(resolveFramework(standard, "nope")).toBe("standard");
+    expect(resolveFramework(standard, undefined)).toBe("standard");
+    expect(applyFramework(standard, "standard")).toBe(standard);
+    expect(applyFramework(standard, "nope")).toBe(standard);
+    expect(applyFramework(standard, undefined)).toBe(standard);
+    expect(frameworkOfWorkflow(standard, { sdlcFramework: "playbook" })).toBe("playbook");
+    expect(frameworkOfWorkflow(standard, { input: { sdlcFramework: "playbook" } })).toBe("playbook");
+    expect(frameworkOfWorkflow(standard, {})).toBe("standard");
+    // a def without overlays ignores the request
+    const legal = workflows.workflows.find((w) => w.id === "legal");
+    expect(resolveFramework(legal, "playbook")).toBe("standard");
+    expect(applyFramework(legal, "playbook")).toBe(legal);
   });
 });
 
@@ -49,6 +72,11 @@ describe("requiredArtifactsForTicket", () => {
       .toEqual([]);
     expect(isPlanTicket({ title: "  plan: x" }, dev)).toBe(true);
     expect(isPlanTicket({ title: "Plan: x" }, reviewer)).toBe(false);
+  });
+  it("design-phase personas owe design/<agent>.md", () => {
+    expect(requiredArtifactsForTicket({ def: playbook, ticket: { assignee: ios.agentId, title: "iOS design" }, agentDef: ios, intakeAgentId: INTAKE }))
+      .toEqual(["design/ios-designer.md"]);
+    expect(designArtifactName("agentcore_hub_security_reviewer")).toBe("design/security-reviewer.md");
   });
   it("code reviewer owes findings.md; CI agent (same phase) owes nothing", () => {
     expect(requiredArtifactsForTicket({ def: playbook, ticket: { assignee: reviewer.agentId, title: "Review" }, agentDef: reviewer, intakeAgentId: INTAKE }))
@@ -82,10 +110,18 @@ describe("context + gate helpers", () => {
     expect(sdlcFrameworkContext({ def: standard, workflow: wf, ticket: {}, agentDef: dev, intakeAgentId: INTAKE })).toBe("");
   });
   it("gate instruction override only for gates that carry instructions", () => {
-    expect(gateInstructionOverride(playbook.reviewGates[0])).toContain("Intent Acceptance");
-    expect(gateInstructionOverride(playbook.reviewGates[2])).toContain("Plan Approval");
-    expect(gateInstructionOverride(playbook.reviewGates[1])).toBeNull();
+    const byName = Object.fromEntries(playbook.reviewGates.map((g) => [g.name, g]));
+    expect(gateInstructionOverride(byName["Intent Acceptance"])).toContain("Intent Acceptance");
+    expect(gateInstructionOverride(byName["Plan Approval"])).toContain("Plan Approval");
+    expect(gateInstructionOverride(byName["Design Review"])).toContain("Design Review");
+    expect(gateInstructionOverride(byName["Spec Approval"])).toBeNull();
+    expect(gateInstructionOverride(byName["Design Approval"])).toBeNull();
     expect(gateInstructionOverride(null)).toBeNull();
+  });
+  it("design persona context names its owed design file", () => {
+    const ctx = sdlcFrameworkContext({ def: playbook, workflow: wf, ticket: { assignee: ios.agentId, title: "iOS design" }, agentDef: ios, intakeAgentId: INTAKE });
+    expect(ctx).toContain("your_artifact: design/ios-designer.md");
+    expect(ctx).toContain("Design-phase persona");
   });
   it("review-package phase fallbacks: plan by title, intake when no agent blockers", () => {
     expect(fallbackReviewPackagePhase({ title: "Plan Approval: x", blockedBy: ["T-1"] })).toBe("plan");
