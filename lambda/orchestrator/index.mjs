@@ -1643,6 +1643,15 @@ async function loadReviewPackage(workflow, gateTicketId) {
         if (def?.phase) { phase = def.phase; break; }
       }
     }
+    // Playbook defs ONLY: the Plan Approval gate is blocked by a DEV ticket
+    // (phase "development") but reads the plan package, and the Intent
+    // Acceptance gate has no agent blockers at all (the hub created it). Other
+    // defs keep the blocker walk untouched — software-delivery's opt-in "Plan
+    // Approval" gate (after design) must still merge the designer packages.
+    if (chainFor(getEffectiveWorkflowDef(workflow))) {
+      const fallback = fallbackReviewPackagePhase(gateTicket);
+      if (fallback === "plan" || (fallback === "intake" && !phase)) phase = fallback;
+    }
     if (!phase || !ARTIFACT_BUCKET) return null;
 
     // Parallel pre-gate agents (design) each write their own
