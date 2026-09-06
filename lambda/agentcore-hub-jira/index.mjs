@@ -741,6 +741,66 @@ async function updateTicket(params) {
   return { ticketId: ticket_id, message: "Updated" };
 }
 
+/**
+ * Normalize a SYSTEM label (TEAM-4122 FR-5). Deliberately NOT sanitizeUserLabels:
+ * that one maps ":" → "-" and refuses the reserved namespaces, which is exactly
+ * right for an agent-supplied label and exactly wrong for `ci:uncertifiable`,
+ * which the orchestrator owns. The one hard rule is Jira's: a label may not
+ * contain whitespace (the API rejects the whole PUT). Returns "" when unusable.
+ *
+ * Kept local rather than added to fix-contract.mjs — that module is byte-compared
+ * across three copies by CI, and `labels_add` needs no cross-Lambda contract.
+ */
+function normalizeSystemLabel(label) {
+  if (typeof label !== "string") return "";
+  const lowered = label.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9._:-]{0,63}$/.test(lowered)) return "";
+  return lowered;
+}
+
+/**
+ * Additively append labels to an issue. Uses Jira's `update: {labels:[{add}]}`
+ * verb, NOT `fields: {labels: [...]}` — the field form is a whole-list REPLACE
+ * that would drop every label the pipeline already set (`wf:`, `phase:`,
+ * `fix:`…). `add` is idempotent server-side: adding a label the issue already
+ * carries is a no-op, so a redelivered call is harmless.
+ */
+async function addLabels(params) {
+  const ticketId = params.ticket_id || params.issue_key;
+  if (!ticketId) throw new Error("'ticket_id' is required");
+
+  const raw = Array.isArray(params.labels)
+    ? params.labels
+    : typeof params.labels === "string"
+      ? params.labels.split(",")
+      : params.labels
+        ? [params.labels]
+        : [];
+  const wanted = [];
+  const dropped = [];
+  for (const item of raw) {
+    const norm = normalizeSystemLabel(item);
+    if (!norm) {
+      if (item !== undefined && item !== null && String(item).trim() !== "") dropped.push(String(item));
+      continue;
+    }
+    if (!wanted.includes(norm)) wanted.push(norm);
+  }
+  if (wanted.length === 0) throw new Error("no valid labels to add");
+
+  await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
+    method: "PUT",
+    body: JSON.stringify({ update: { labels: wanted.map((add) => ({ add })) } }),
+  });
+
+  return {
+    ticketId,
+    status: "labels_added",
+    added: wanted,
+    ...(dropped.length > 0 ? { dropped } : {}),
+  };
+}
+
 async function listTickets(params) {
   const { parent_id } = params;
   // F6: `parent_id` lands UNQUOTED in the JQL (it is an issue key, not a string
@@ -965,6 +1025,7 @@ const TOOLS = {
   Tickets___create_ticket: createTicket,
   Tickets___transition_ticket: transitionTicket,
   Tickets___update_ticket: updateTicket,
+  Tickets___labels_add: addLabels,
   Tickets___list_tickets: listTickets,
   Tickets___add_comment: addComment,
   Tickets___search_issues: searchIssues,

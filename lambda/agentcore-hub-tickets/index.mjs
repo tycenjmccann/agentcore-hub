@@ -12,6 +12,7 @@
  *   - transition_issue: Move issue to new status
  *   - get_transitions: Get available transitions for an issue
  *   - add_comment: Add a comment to an issue
+ *   - labels_add: Additively append labels to an issue (idempotent)
  *   - list_projects: List projects (returns our single project)
  *   - get_project_issue_types: Get issue types for a project
  *   - lookup_user: Look up agents by name
@@ -233,6 +234,8 @@ export const handler = async (event) => {
         return await getTransitions(args);
       case "add_comment":
         return await addComment(args);
+      case "labels_add":
+        return await addLabels(args);
       case "list_projects":
         return await listProjects();
       case "get_project_issue_types":
@@ -243,7 +246,7 @@ export const handler = async (event) => {
         // Return an `error` field so callers (e.g. workflow-output) can tell a
         // no-op from a real result. Without this, an unrecognized tool name
         // looked like success and silently stalled the pipeline.
-        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, list_projects, get_project_issue_types, lookup_user`;
+        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, labels_add, list_projects, get_project_issue_types, lookup_user`;
         return { error: message, content: [{ text: message }] };
       }
     }
@@ -511,6 +514,100 @@ async function editIssue(args) {
       priority: { name: ticket.priority },
       updated: ticket.updatedAt,
     },
+  };
+}
+
+/**
+ * Normalize a SYSTEM label (TEAM-4122 FR-5). Deliberately NOT sanitizeUserLabels:
+ * that one maps ":" → "-" and refuses the reserved namespaces, which is exactly
+ * right for an agent-supplied label and exactly wrong for `ci:uncertifiable`,
+ * which the orchestrator owns. The one hard rule both providers share is
+ * Jira's: a label may not contain whitespace. Returns "" for anything unusable.
+ *
+ * Kept local to each ticket Lambda rather than added to fix-contract.mjs — that
+ * module is byte-compared across three copies by CI, and `labels_add` needs no
+ * cross-Lambda contract, only the same behaviour.
+ */
+function normalizeSystemLabel(label) {
+  if (typeof label !== "string") return "";
+  const lowered = label.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9._:-]{0,63}$/.test(lowered)) return "";
+  return lowered;
+}
+
+/**
+ * Additively append labels to a ticket — the DynamoDB twin of Jira's
+ * `update: { labels: [{ add }] }`. ADDITIVE and IDEMPOTENT by construction: one
+ * conditional `list_append` per label, guarded by `NOT contains(labels, :l)`, so
+ * a redelivered call (stream re-poll, retried invocation) cannot duplicate an
+ * entry and a concurrent writer's labels are never clobbered. Never a full-list
+ * SET — that would silently drop a label another writer added.
+ */
+async function addLabels(args) {
+  const issueKey = args.issue_key || args.ticket_id;
+  if (!issueKey) return textResult("Error: 'issue_key' is required");
+
+  const raw = Array.isArray(args.labels)
+    ? args.labels
+    : typeof args.labels === "string"
+      ? args.labels.split(",")
+      : args.labels
+        ? [args.labels]
+        : [];
+  const wanted = [];
+  const dropped = [];
+  for (const item of raw) {
+    const norm = normalizeSystemLabel(item);
+    if (!norm) {
+      if (item !== undefined && item !== null && String(item).trim() !== "") dropped.push(String(item));
+      continue;
+    }
+    if (!wanted.includes(norm)) wanted.push(norm);
+  }
+  if (wanted.length === 0) return textResult("Error: no valid labels to add");
+
+  const added = [];
+  const alreadyPresent = [];
+  for (const label of wanted) {
+    try {
+      await ddb.send(
+        new UpdateCommand({
+          TableName: TABLE_NAME,
+          Key: { ticketId: issueKey },
+          UpdateExpression: "SET #l = list_append(if_not_exists(#l, :empty), :one), #u = :u",
+          // attribute_exists(ticketId) keeps this from CREATING a row for a
+          // typo'd key (an Update with no condition is an upsert).
+          ConditionExpression:
+            "attribute_exists(ticketId) AND (attribute_not_exists(#l) OR NOT contains(#l, :label))",
+          ExpressionAttributeNames: { "#l": "labels", "#u": "updatedAt" },
+          ExpressionAttributeValues: {
+            ":empty": [],
+            ":one": [label],
+            ":label": label,
+            ":u": new Date().toISOString(),
+          },
+        })
+      );
+      added.push(label);
+    } catch (err) {
+      if (err.name === "ConditionalCheckFailedException") {
+        // Either the label is already there (the idempotent case) or the ticket
+        // does not exist. Distinguish, so a bad key is not reported as success.
+        const existing = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+        if (!existing.Item) return textResult(`Error: ticket ${issueKey} not found`);
+        alreadyPresent.push(label);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  return {
+    key: issueKey,
+    status: "labels_added",
+    added,
+    alreadyPresent,
+    ...(dropped.length > 0 ? { dropped } : {}),
   };
 }
 

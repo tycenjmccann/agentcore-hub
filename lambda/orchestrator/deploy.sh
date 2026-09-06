@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs fix-contract.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs ci-check.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs fix-contract.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -238,7 +238,50 @@ if [ -n "${REPO_CHECK_MODE:-}" ]; then
   echo "  REPO_CHECK_MODE=${REPO_CHECK_MODE} forwarded to orchestrator"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}${REPO_CHECK_MODE_VARS}}"
+# CI reachability pre-flight (TEAM-4122 FR-5): off | shadow | enforce. shadow
+# probes CodeBuild + the pipeline-tools Lambda once per workflow and states the
+# verdict in every persona's `## CI Certification` context; enforce additionally
+# labels the epic `ci:uncertifiable` and prefixes the human merge-gate package.
+# Forwarded ONLY when explicitly set, so a plain install stays default off —
+# byte-identical: no probe, no CodeBuild/IAM SDK load (dynamic import), no
+# context block. STRICT allow-list in code (garbage → off, not shadow) because
+# enforce WRITES to a real ticket. The companions are only meaningful with a
+# mode set, so they ride the same forward-when-set rule:
+#   CI_CHECK_TTL_MS          override the 6h settled-verdict cache (unknown is
+#                            always re-probed after 30min)
+#   CI_CHECK_USE_IAM_SIMULATE=1  read the pipeline-tools ROLE's real policy for
+#                            codebuild:StartBuild instead of trusting its
+#                            self-reported capability. Needs the optional
+#                            CiCheckSimulate grant (deploy/setup-lambda-role.sh).
+#   CI_PROJECT_NAME          the CodeBuild PR-check project when it is not
+#                            `agentcore-hub-ci` and the CD registry entry carries
+#                            no `ciProject`.
+#   PIPELINE_TOOLS_ROLE_ARN  the simulate target — without it simulate is skipped.
+#   PIPELINE_TOOLS_LAMBDA    the capabilities probe target (default
+#                            agentcore-hub-pipeline-tools).
+# Instant rollback = set off (or unset and redeploy).
+CI_CHECK_VARS=""
+if [ -n "${CI_CHECK_MODE:-}" ]; then
+  CI_CHECK_VARS=",CI_CHECK_MODE=${CI_CHECK_MODE}"
+  echo "  CI_CHECK_MODE=${CI_CHECK_MODE} forwarded to orchestrator"
+fi
+if [ -n "${CI_CHECK_TTL_MS:-}" ]; then
+  CI_CHECK_VARS="${CI_CHECK_VARS},CI_CHECK_TTL_MS=${CI_CHECK_TTL_MS}"
+fi
+if [ -n "${CI_CHECK_USE_IAM_SIMULATE:-}" ]; then
+  CI_CHECK_VARS="${CI_CHECK_VARS},CI_CHECK_USE_IAM_SIMULATE=${CI_CHECK_USE_IAM_SIMULATE}"
+fi
+if [ -n "${CI_PROJECT_NAME:-}" ]; then
+  CI_CHECK_VARS="${CI_CHECK_VARS},CI_PROJECT_NAME=${CI_PROJECT_NAME}"
+fi
+if [ -n "${PIPELINE_TOOLS_ROLE_ARN:-}" ]; then
+  CI_CHECK_VARS="${CI_CHECK_VARS},PIPELINE_TOOLS_ROLE_ARN=${PIPELINE_TOOLS_ROLE_ARN}"
+fi
+if [ -n "${PIPELINE_TOOLS_LAMBDA:-}" ]; then
+  CI_CHECK_VARS="${CI_CHECK_VARS},PIPELINE_TOOLS_LAMBDA=${PIPELINE_TOOLS_LAMBDA}"
+fi
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}${REPO_CHECK_MODE_VARS}${CI_CHECK_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${EVENT_DEDUPE_VARS}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}${EVENT_DEDUPE_VARS}}"
 

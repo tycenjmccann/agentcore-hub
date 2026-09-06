@@ -54,6 +54,7 @@ import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets,
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
+import { ensureCiCheck, formatCiCheckBlock, prefixCiWarning, normalizeCiCheckMode } from "./ci-check.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 import { createDeadSessionEscalation, normalizeEscalationMode } from "./dead-session-escalation.mjs";
@@ -203,6 +204,18 @@ const DEAD_SESSION_ESCALATION_MODE = normalizeEscalationMode(process.env.DEAD_SE
 // publishes fix.reverify_planned only — zero ticket/workflow writes. Instant
 // rollback = set off.
 const LIVE_REVERIFY = normalizeLiveReverifyMode(process.env.LIVE_REVERIFY);
+// CI reachability pre-flight (TEAM-4122 FR-5): off | shadow | enforce, default
+// off. On a pipeline-mode run the CI agent is told to read the authoritative
+// CodeBuild PR-check for the head SHA — but if the project has no PR webhook AND
+// the pipeline-tools Lambda cannot StartBuild, no build can EVER exist, so the
+// only honest verdict is a permanent BLOCKED that today reaches the human merge
+// gate looking green. shadow = probe + state it in `## CI Certification` context
+// (observe-only); enforce = additionally label the epic `ci:uncertifiable` and
+// prefix the merge-gate package so the approver is told before they click.
+// off = byte-identical: no probe, no CodeBuild/IAM SDK import, no context block,
+// no label, no gate rewrite. STRICT allow-list (garbage → off, like
+// LIVE_REVERIFY) because enforce WRITES to a real ticket. Instant rollback = off.
+const CI_CHECK_MODE = normalizeCiCheckMode(process.env.CI_CHECK_MODE);
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -504,6 +517,46 @@ function getDeadSessionEscalation() {
     transitionTicket: transitionTicketStatus,
   });
   return _deadSessionEscalation;
+}
+
+// ─── CI reachability probe deps (TEAM-4122 FR-5) ─────────────────────────────
+// Lazy singleton, one per warm container. The CodeBuild and IAM SDK clients are
+// loaded by DYNAMIC import, so CI_CHECK_MODE=off never pays their module-load
+// cost — the orchestrator's cold start is unchanged on a plain install. iam is
+// imported only under CI_CHECK_USE_IAM_SIMULATE=1; `githubApi` is omitted
+// without a PAT (probe 3 is then skipped, never fatal); the Lambda client is the
+// existing shared one.
+let _ciCheckDeps = null;
+async function ciCheckDeps() {
+  if (CI_CHECK_MODE === "off") return null;
+  if (_ciCheckDeps) return _ciCheckDeps;
+  const { CodeBuildClient, BatchGetProjectsCommand } = await import("@aws-sdk/client-codebuild");
+  const codebuild = new CodeBuildClient({ region: REGION });
+  const deps = {
+    codebuildSend: (input) => codebuild.send(new BatchGetProjectsCommand(input)),
+    // The pipeline-tools handler reads event.tool_name + event.parameters and
+    // replies with the standard { content: [{ text: <json> }] } envelope, which
+    // ci-check.mjs unwraps.
+    invokeLambda: async (functionName, payload) => {
+      const res = await lambda.send(new InvokeCommand({
+        FunctionName: functionName,
+        Payload: JSON.stringify(payload),
+      }));
+      const raw = res.Payload ? new TextDecoder().decode(res.Payload) : "";
+      if (!raw) return null;
+      let parsed = JSON.parse(raw);
+      if (typeof parsed === "string") parsed = JSON.parse(parsed);
+      return parsed;
+    },
+    githubApi: process.env.GITHUB_PAT ? githubApi : undefined,
+  };
+  if (process.env.CI_CHECK_USE_IAM_SIMULATE === "1") {
+    const { IAMClient, SimulatePrincipalPolicyCommand } = await import("@aws-sdk/client-iam");
+    const iam = new IAMClient({ region: REGION });
+    deps.iamSimulate = (input) => iam.send(new SimulatePrincipalPolicyCommand(input));
+  }
+  _ciCheckDeps = deps;
+  return _ciCheckDeps;
 }
 
 // One detector per warm container so its per-agent median cache is reused
@@ -1078,6 +1131,46 @@ async function addTicketComment(ticketId, comment) {
     console.warn(`[orchestrator] addTicketComment(${ticketId}) failed: ${err.message}`);
     return false;
   }
+}
+
+/**
+ * Enforce-mode side effect of an `uncertifiable` CI check (TEAM-4122 FR-5): mark
+ * the run's epic so the state is visible on the BOARD, not only inside one
+ * agent's context. The label is what makes it filterable after the fact ("which
+ * runs shipped with no CI?") — a comment scrolls away, a label does not.
+ *
+ * Label is `ci:uncertifiable` with NO SPACE: Jira rejects whitespace in labels
+ * outright (the whole PUT 400s), so the prose form "ci: uncertifiable" seen in
+ * ticket text is not a legal label. `ci:` is already a reserved system prefix in
+ * fix-contract.mjs, so no agent can squat it.
+ *
+ * Written at most ONCE per workflow: `ciCheck.labeled` is persisted immediately
+ * after a successful write and survives every re-probe, so a warm container
+ * dispatching ten tickets cannot label ten times. Best-effort and NEVER throws —
+ * a provider that lacks labels_add, or a permissions gap, must not stop the
+ * agent this context was being built for. Falls back to a comment.
+ */
+async function labelEpicUncertifiable(workflow, ciCheck) {
+  const epicId = workflow?.epicId || workflow?.parentId;
+  if (!epicId) return false;
+  const note = `⚠ CI UNCERTIFIABLE: ${ciCheck?.reason || "no CodeBuild build can exist for this head."}`;
+  let labeled = false;
+  try {
+    await invokeTickets("labels_add", { ticket_id: epicId, issue_key: epicId, labels: ["ci:uncertifiable"] });
+    labeled = true;
+  } catch (err) {
+    console.warn(`[ci-check] labels_add on ${epicId} failed: ${err.message} — falling back to a comment`);
+    // Comment fallback is jira-only (addTicketComment no-ops in dynamodb mode);
+    // in that mode the `## CI Certification` context block + the merge-gate
+    // prefix remain the surfaces that carry the warning.
+    await addTicketComment(epicId, note);
+  }
+  try {
+    await store.setCiCheck(workflow.id, { ...ciCheck, labeled: true });
+  } catch (err) {
+    console.warn(`[ci-check] could not persist labeled flag for ${workflow.id}: ${err.message}`);
+  }
+  return labeled;
 }
 
 // ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
@@ -1854,7 +1947,17 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
     // Review package: the upstream agent that closed the phase wrote a curated
     // summary/bullets/links file (blueprints/review-package.md). Best-effort —
     // a missing or malformed package must never delay the gate ping.
-    const pkg = await loadReviewPackage(workflow, ticketId);
+    let pkg = await loadReviewPackage(workflow, ticketId);
+
+    // CI uncertifiable (TEAM-4122 FR-5, enforce only): the approver about to
+    // click Merge is the LAST person who can catch "no CodeBuild build ever
+    // existed for this head". Prefixing the package here reaches all three
+    // surfaces at once — the phone notification (`details` is pkg.summary), the
+    // in-app card, and the comment mirrored onto the gate ticket below. Pure
+    // rewrite, no extra call: the verdict was already probed at dispatch.
+    if (CI_CHECK_MODE === "enforce" && workflow?.ciCheck?.verdict === "uncertifiable") {
+      pkg = prefixCiWarning(pkg, workflow.ciCheck);
+    }
 
     const notification = {
       id: `notif_${ticketId}_${new Date().toISOString()}`,
@@ -4308,6 +4411,30 @@ export async function buildAgentContext(ticket, workflow) {
     context += `deterministic build/test/deploy. Follow the PIPELINE_ENABLED path `;
     context += `in your blueprint (read CI/pipeline results via the Pipeline___* tools, `;
     context += `passing pipeline_name; do NOT shell builds or run DEPLOY.md yourself).\n\n`;
+
+    // CI reachability (TEAM-4122 FR-5). Pipeline Mode above tells the CI agent to
+    // read "the authoritative CodeBuild PR-check for the head SHA" — this says
+    // whether such a build can exist at all. Without it an uncertifiable repo
+    // produces a permanent BLOCKED that only the CI agent's completion record
+    // records, and the merge gate looks green. Probed once per workflow (TTL
+    // cached), stated to EVERY persona, and in enforce mode also written onto the
+    // epic + the merge-gate package. CI_CHECK_MODE=off → not reached at all: zero
+    // extra calls, no SDK load, byte-identical context.
+    if (CI_CHECK_MODE !== "off") {
+      const repoForCi = workflow.repoConfig?.repos?.length > 0 ? parseRepoUrl(workflow.repoConfig) : null;
+      const ciCheck = await ensureCiCheck(workflow, {
+        store,
+        deps: (await ciCheckDeps()) || {},
+        delivery: deliveryForContext,
+        mode: CI_CHECK_MODE,
+        repo: repoForCi,
+      });
+      context += formatCiCheckBlock(ciCheck, CI_CHECK_MODE);
+      // enforce only: shadow observes, it never touches a ticket.
+      if (CI_CHECK_MODE === "enforce" && ciCheck?.verdict === "uncertifiable" && !ciCheck.labeled) {
+        await labelEpicUncertifiable(workflow, ciCheck);
+      }
+    }
   }
 
   // Unverified live fixes (TEAM-4121 FR-9) — ship personas only. A fix that

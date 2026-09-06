@@ -37,6 +37,9 @@ Globals:
         # Orchestrator-only (the done twins + buildAgentContext live there);
         # rides Globals for the same one-place-to-set parity.
         LIVE_REVERIFY: !Ref LiveReverify
+        # Orchestrator-only (the probe + context block + gate prefix all live
+        # there); rides Globals for the same one-place-to-set parity.
+        CI_CHECK_MODE: !Ref CiCheckMode
 
 Parameters:
   TicketsTableName:
@@ -179,6 +182,53 @@ Parameters:
       matches the code's unset default and deploy.sh only forwards the var when
       explicitly set. Instant rollback = set off.
 
+  CiCheckMode:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      CI reachability pre-flight (TEAM-4122 FR-5). On a pipeline-mode run the CI
+      agent is told to read the authoritative CodeBuild PR-check for the head SHA
+      — but when the CI project has NO PR webhook and the pipeline-tools Lambda
+      cannot StartBuild, no build can ever exist for any head, so the only honest
+      verdict is a permanent BLOCKED that today is visible only inside the CI
+      agent's completion record while the human merge gate looks green. off =
+      byte-identical to pre-4122 (no probe, no CodeBuild/IAM SDK load — both are
+      dynamic imports — and no context block). shadow = probe once per workflow
+      (6h cache; 30min for an unknown) and state the verdict to every persona as a
+      ## CI Certification block; zero ticket writes. enforce = also label the run's
+      epic `ci:uncertifiable` (once per workflow) and prefix the human
+      merge-gate's review package with the warning, so the approver is told before
+      they click. `unknown` NEVER acts — a probe that could not answer must not
+      manufacture a warning. Same asymmetry as LiveReverify: a PRESENT-but-garbage
+      value coalesces to OFF, not shadow, because enforce writes to a real ticket.
+      Default "off" matches the code's unset default and deploy.sh only forwards
+      the var when explicitly set. Instant rollback = set off.
+
+  CiProjectName:
+    Type: String
+    Default: agentcore-hub-ci
+    Description: >
+      The CodeBuild PR-check project the CI check probes, and the ONLY resource
+      the orchestrator's codebuild:BatchGetProjects grant covers (F10 — a project
+      description exposes webhook.url/secret and the project's env vars, so the
+      grant is never project/*). A CD registry entry's `ciProject` overrides this
+      per repo at read time, but the IAM scope is this one name — widen it here
+      deliberately if you register a repo with a different CI project.
+
+  PipelineToolsRoleArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. The pipeline-tools Lambda's execution role, used ONLY when
+      CI_CHECK_USE_IAM_SIMULATE=1 to read whether that role really holds
+      codebuild:StartBuild instead of trusting the Lambda's self-reported
+      capability. Left empty (the default), the simulate probe is skipped and NO
+      iam:SimulatePrincipalPolicy statement is created at all.
+
+Conditions:
+  HasPipelineToolsRole: !Not [!Equals [!Ref PipelineToolsRoleArn, ""]]
+
 Resources:
   # ─── Tables are pre-existing (not managed by this stack) ───────────────────────
   # Create with: scripts/create-dynamodb-tables.sh
@@ -219,6 +269,24 @@ Resources:
             BucketName: !Ref ArtifactBucket
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref EventBus
+        # CI reachability probe (TEAM-4122 FR-5). F10: scoped to the ONE CI
+        # project, never project/* — BatchGetProjects returns webhook.url,
+        # webhook.secret and the project's environment variables, so read access
+        # to every project in the account would be a real secret-exposure widening.
+        # Inert when CI_CHECK_MODE=off (the probe is never called).
+        - Statement:
+            - Effect: Allow
+              Action: codebuild:BatchGetProjects
+              Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${CiProjectName}"
+        # Optional simulate probe — created ONLY when PipelineToolsRoleArn is set,
+        # and scoped to that single role.
+        - !If
+          - HasPipelineToolsRole
+          - Statement:
+              - Effect: Allow
+                Action: iam:SimulatePrincipalPolicy
+                Resource: !Ref PipelineToolsRoleArn
+          - !Ref "AWS::NoValue"
       Events:
         DynamoDBStream:
           Type: DynamoDB
