@@ -28,6 +28,20 @@
  * ticket, but a fix re-Done'd at a NEW head is a genuinely different claim and
  * does get a fresh one.
  *
+ * That idempotence is enforced by a CAS CLAIM on the (fix, sha7) slot
+ * (store.claimReverifySlot, TEAM-4130 F2), taken BEFORE create_ticket. The old
+ * in-memory check plus sibling scan could not hold: DynamoDB Streams are
+ * at-least-once, the Jira webhook and the stream are twins, and the dedupe
+ * evidence (reverifyTicketId) was only written AFTER the ticket existed — so two
+ * concurrent Dones for the same fix both scanned, both found nothing, and both
+ * filed a re-verify ticket, each blocking the run's ship tickets and dispatching
+ * the QA verifier. Now the loser is told the slot is "taken" and files nothing.
+ * The claim is released if create_ticket then fails, and a claim whose holder
+ * died is taken over after staleAfterMs, so the slot cannot wedge a run whose
+ * ship tickets are waiting on that ticket. A workflow with no task entry to
+ * claim on returns "untracked" and falls back to the old best-effort scan —
+ * fail-OPEN, because a fix whose entry was lost must still be re-verified.
+ *
  * The repro string is DATA, never a command we run: it was typed by another
  * agent, so it is rendered inert (single line, no backticks) and every consumer
  * — this module's ticket body and the ship context block — says out loud that it
@@ -106,6 +120,12 @@ function inertOneLine(value, max = 500) {
 const CLOSED = new Set(["done", "cancelled"]);
 const isClosed = (t) => CLOSED.has(String(t?.status || "").toLowerCase());
 const idOf = (t) => t?.ticketId || t?.id || t?.key || null;
+
+// TEAM-4130 F1 — a ship ticket in one of these is LIVE: an agent (in_progress)
+// or a human (in_review) is working it right now, and its own transition to Done
+// must keep working. addBlockers adds the blocker edge without touching the
+// status for these; everything else open (todo/ready/blocked) is parked.
+export const LIVE_SHIP_STATUSES = ["in_progress", "in_review"];
 
 export function createLiveReverify(deps = {}) {
   const {
@@ -238,18 +258,62 @@ export function createLiveReverify(deps = {}) {
         return { action: !live ? "unverified-only" : "no-sha", unverified: !live };
       }
 
-      // Idempotent per (fix, head): free in-memory check first…
-      if (entry?.reverifySha === sha7) {
+      // Idempotent per (fix, head sha7). Three layers, cheapest first.
+      //
+      // 1. The free in-memory check — which since TEAM-4130 F2 needs the TICKET
+      //    ID too, not just the sha: `reverifySha` alone can now be a PENDING
+      //    CLAIM (someone is mid-create) rather than proof a ticket exists, and
+      //    short-circuiting on it would silently drop the re-verification.
+      if (entry?.reverifySha === sha7 && entry?.reverifyTicketId) {
         return { action: "already", reverifyTicketId: entry.reverifyTicketId, sha7, unverified: !live };
       }
-      // …then the authoritative one, because the metadata write can have been
-      // lost (untracked entry) while the ticket itself exists.
+
+      // 2. The CAS claim — the ONLY real mutex, and the reason a redelivered or
+      //    twinned Done cannot file a second ticket. `?? "untracked"` also covers
+      //    a store built before F2 (older dep / a test double), which degrades to
+      //    exactly the pre-4130 best-effort behaviour rather than crashing.
+      const claim = await safe(
+        "claimReverifySlot",
+        async () =>
+          (await store?.claimReverifySlot?.(workflow.id, fixId, sha7, new Date(now()).toISOString())) ??
+          "untracked",
+        "untracked"
+      );
+      if (claim === "untracked") {
+        warn(`${fixId}: no tracked task entry to claim the (fix, ${sha7}) re-verify slot on — falling back to the best-effort sibling scan, which can duplicate under a concurrent Done`);
+      }
+
+      // 3. The sibling scan — still run on EVERY branch, because it is the only
+      //    thing that sees a ticket filed before F2 existed, or one whose
+      //    metadata write was lost. Also the source of the ship tickets below.
       const siblings = (await safe("getChildTickets", () => getChildTickets?.(workflow.epicId), [])) || [];
       const existing = siblings.find(
         (t) => t?.spawnedBy?.rearmOf === fixId && t?.spawnedBy?.headSha === headSha
       );
+
+      if (claim === "taken") {
+        // Another invocation owns this exact (fix, sha7) slot. NEVER create:
+        // either its ticket is already on the board (existing) or it is about to
+        // be (pendingClaim) — and its own ship-blocking runs there, not here.
+        return {
+          action: "already",
+          reverifyTicketId: existing ? idOf(existing) : entry?.reverifyTicketId,
+          sha7,
+          unverified: !live,
+          pendingClaim: !existing,
+        };
+      }
+
       if (existing) {
-        return { action: "already", reverifyTicketId: idOf(existing), sha7, unverified: !live };
+        // We hold the claim (or none was available) but the ticket is already
+        // there. Link it, so the slot is not left looking pending forever and the
+        // free check short-circuits next time.
+        const existingId = idOf(existing);
+        await safe("mergeTaskMetadata(reverify-existing)", () =>
+          store?.mergeTaskMetadata?.(workflow.id, fixId, { reverifyTicketId: existingId, reverifySha: sha7 })
+        );
+        if (entry) Object.assign(entry, { reverifyTicketId: existingId, reverifySha: sha7 });
+        return { action: "already", reverifyTicketId: existingId, sha7, unverified: !live };
       }
 
       const kind = contract?.kind || fixTicket?.spawnedBy?.kind || "qa_fix";
@@ -289,10 +353,18 @@ export function createLiveReverify(deps = {}) {
       }, null);
 
       if (!reverifyTicketId) {
+        // Hand the slot back. Otherwise our own dead claim blocks every retry
+        // (stream redelivery, the human's re-Done lever) for staleAfterMs, while
+        // the run's ship tickets wait on a ticket that will never exist.
+        if (claim === "claimed") {
+          await safe("releaseReverifySlot", () => store?.releaseReverifySlot?.(workflow.id, fixId, sha7));
+        }
         warn(`${fixId}: could not create the re-verify ticket — the fix stays ${live ? "unmarked" : "marked unverified"} and the ship context is the only signal`);
         return { action: !live ? "unverified-only" : "no-sha", sha7, unverified: !live };
       }
 
+      // Turns the pending claim into a completed one (reverifySha was already
+      // written by the CAS; the ticket id is the part readers wait for).
       await safe("mergeTaskMetadata(reverify)", () =>
         store?.mergeTaskMetadata?.(workflow.id, fixId, { reverifyTicketId, reverifySha: sha7 })
       );
@@ -301,6 +373,19 @@ export function createLiveReverify(deps = {}) {
       // Block the run's OPEN ship tickets on it, so a release manager cannot
       // ship past a live fix whose re-verification hasn't landed. Only open ones
       // — blocking a Done ship ticket would reopen a finished phase.
+      //
+      // TEAM-4130 F1: the edge is the point, the status flip is not. A ship
+      // ticket sitting in ready/todo IS flipped to blocked (cascadeUnblock
+      // re-readies it the moment the re-verify closes). A LIVE one — in_progress
+      // (a release manager mid-run) or in_review (a human gate) — gets the edge
+      // ONLY: its status is left exactly where it is, so the agent's own
+      // report_completion still reaches Done through the real `done` transition
+      // instead of being stranded in `blocked`, whose only route to done is the
+      // `skip` alias. Nothing ships early as a result: the still-open re-verify
+      // holds PHASE completion via completion.mjs's open-fix gate (the re-verify
+      // carries spawned_by.kind "qa_fix"), and its Done is what the ship review /
+      // human merge gate consumes. The decision is made inside addBlockers'
+      // conditional write, so this loop never reads the status itself.
       const shipTickets = siblings.filter(
         (t) => shipPhases.has(getAgentDef?.(t?.assignee)?.phase) && !isClosed(t)
       );
@@ -308,7 +393,11 @@ export function createLiveReverify(deps = {}) {
       for (const ship of shipTickets) {
         const sid = idOf(ship);
         if (!sid) continue;
-        const added = await safe("addBlockers(ship)", () => addBlockers?.(sid, [reverifyTicketId]), []);
+        const added = await safe(
+          "addBlockers(ship)",
+          () => addBlockers?.(sid, [reverifyTicketId], { preserveStatusIf: LIVE_SHIP_STATUSES }),
+          []
+        );
         if (added?.length) blocked.push(sid);
       }
 

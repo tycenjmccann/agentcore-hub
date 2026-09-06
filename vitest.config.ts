@@ -280,6 +280,14 @@ export default defineConfig({
       // open, shadow writing nothing, and the STRICT mode allow-list (garbage →
       // off, unlike every other flag) that keeps a typo from minting tickets.
       "lambda/orchestrator/live-reverify.test.mjs",
+      // ticket-blockers.mjs (TEAM-4130 F1) — the blocker-edge write extracted out
+      // of index.mjs's addBlockers so its two-attempt conditional write is
+      // testable at all. Zero imports (the AWS command is constructed by the
+      // caller and handed in as `send`), so the test's fake actually EVALUATES
+      // the ConditionExpression against a row — the only way to assert that the
+      // park-it and preserve-the-status conditions are mutually exclusive and
+      // jointly exhaustive, which a read-then-write could not be.
+      "lambda/orchestrator/ticket-blockers.test.mjs",
       // yteqfl loop 2 replay (TEAM-4121 FR-9) — the real prod failure this FR
       // exists for, from the dossier fixture: TEAM-4089 closed claiming live
       // evidence with none, QA re-verify TEAM-4092 caught it 48m later and filed

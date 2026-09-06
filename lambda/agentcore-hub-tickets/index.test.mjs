@@ -28,6 +28,9 @@ const h = vi.hoisted(() => ({
     labelUpdates: /** @type {any[]} */ ([]),
     items: /** @type {Record<string, any>} */ ({}),
     condFail: /** @type {string[]} */ ([]),
+    // TEAM-4130 F1: transition_ticket's status write (`SET #s = :s, …`), so the
+    // status a transition actually persists is assertable, not just its envelope.
+    statusUpdates: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -67,6 +70,11 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               }
               return {};
             }
+            if (cmd.input.ExpressionAttributeValues?.[":s"] !== undefined) {
+              // A transitionIssue status write, not nextTicketId's counter bump.
+              h.state.statusUpdates.push(cmd.input);
+              return {};
+            }
             h.state.counter += 1;
             return { Attributes: { nextNum: h.state.counter } };
           }
@@ -91,6 +99,7 @@ beforeEach(async () => {
   h.state.s3 = {};
   h.state.labelUpdates.length = 0;
   h.state.condFail.length = 0;
+  h.state.statusUpdates.length = 0;
   h.state.items = {};
   delete process.env.ARTIFACT_BUCKET;
   vi.resetModules();
@@ -98,6 +107,8 @@ beforeEach(async () => {
 });
 
 const BASE = { summary: "Fix null check", assignee: "agentcore_hub_backend_dev" };
+// TEAM-4130 F1: the run's ship ticket, the one a blocker edge must not strand.
+const SHIP = "TEAM-4066";
 
 describe("create_ticket — spawnedBy/phase pass-through (D4c)", () => {
   it("persists a valid qa_fix marker + phase in the shape completion.mjs reads", async () => {
@@ -558,5 +569,72 @@ describe("labels_add — the op name + envelope the orchestrator sends (TEAM-412
     h.state.condFail.push("ci:uncertifiable"); // no row → the same conditional failure
     const res = await invoke({ ticket_id: "NOPE-1", labels: ["ci:uncertifiable"] });
     expect(res.content[0].text).toBe("Error: ticket NOPE-1 not found");
+  });
+});
+
+/**
+ * TEAM-4130 F1 — the refutation this ticket turns on. `addBlockers` used to set
+ * `status = "blocked"` on every ticket it added an edge to, including a release
+ * manager that was already `in_progress`. These two tests pin what that costs by
+ * pinning the CURRENT transition table exactly as it is (TRANSITIONS is NOT
+ * changed by this ticket):
+ *
+ *   (i)  from `in_progress`, `done` resolves through the REAL `done` row — a
+ *        clean completion, which is what report_completion needs;
+ *   (ii) from `blocked` there is no `done` row at all, so the same call only
+ *        resolves because the matcher also matches on `t.to`, and the row it
+ *        lands on is `skip` — the ticket closes labelled a SKIP, and with a
+ *        `reason` it even records a skipReason. Not an error, which is exactly
+ *        why the clobber was invisible in production.
+ */
+describe("transition_ticket — reaching done from in_progress vs from blocked (TEAM-4130 F1)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+
+  it("(i) done from in_progress resolves through the real `done` transition", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", from: "in_progress", to: "done" });
+    expect(res.transition).toBe("Done"); // the real completion row, NOT "Skip"
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("done");
+    expect(h.state.statusUpdates[0].UpdateExpression).not.toContain("skipReason");
+  });
+
+  it("(ii) done from blocked resolves through the `skip` row's `to` alias", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "blocked", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    // It SUCCEEDS — and that is the problem: the run's ship ticket is recorded
+    // as Skipped, not Completed.
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", from: "blocked", to: "done" });
+    expect(res.transition).toBe("Skip");
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("done");
+  });
+
+  it("(ii, cont.) …and with a reason it stamps skipReason on a completed ticket", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "blocked", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done", reason: "PR merged, deploy triggered" });
+
+    expect(res.skipReason).toBe("PR merged, deploy triggered");
+    expect(h.state.statusUpdates[0].UpdateExpression).toContain("#sr = :sr");
+    expect(h.state.statusUpdates[0].ExpressionAttributeNames["#sr"]).toBe("skipReason");
+  });
+
+  it("blocked offers no `done` transition id — only `skip` reaches done", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "blocked", assignee: "agentcore_hub_release_manager" };
+
+    const res = await handler({ name: "Tickets___get_transitions", arguments: { ticket_id: SHIP } });
+
+    expect(res.currentStatus).toBe("blocked");
+    expect(res.transitions.map((t) => t.id)).not.toContain("done");
+    expect(res.transitions.filter((t) => t.to === "done").map((t) => t.id)).toEqual(["skip"]);
+    // in_progress, by contrast, has the real one.
+    h.state.items[SHIP].status = "in_progress";
+    const live = await handler({ name: "Tickets___get_transitions", arguments: { ticket_id: SHIP } });
+    expect(live.transitions.map((t) => t.id)).toContain("done");
   });
 });
