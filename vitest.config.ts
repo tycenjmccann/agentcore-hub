@@ -295,6 +295,24 @@ export default defineConfig({
       // and is absent for non-ship agents, for mode off, and when nothing is
       // unverified — the "off costs nothing in the prompt" half of the flag.
       "lambda/orchestrator/unverified-fixes-context.test.mjs",
+      // ci-check.mjs (TEAM-4122 FR-5) — the dispatch-time "can a CodeBuild build
+      // for this head SHA exist at all?" probe. Fully DI'd (plain deps + fake
+      // clock + stub store), so every branch runs with no AWS: the strict mode
+      // allow-list (garbage → off, because enforce labels a real epic), the
+      // never-warn-on-unknown direction, the 6h/30min TTL cache that keeps a
+      // 14-ticket run to one probe, and the F10 boundary — a project description
+      // carries webhook.url/secret + every env var, and the assertion is on
+      // JSON.stringify(result) because that record is persisted, logged AND
+      // rendered into every agent's prompt.
+      "lambda/orchestrator/ci-check.test.mjs",
+      // ci-check wiring (TEAM-4122 FR-5) — index.mjs REAL, AWS/store seams
+      // mocked: the ## CI Certification block only appears on a pipeline-mode
+      // run, mode off does ZERO extra I/O (asserted as zero calls on the
+      // codebuild/lambda/setCiCheck seams, i.e. byte-identical to pre-4122),
+      // enforce labels the epic ci:uncertifiable exactly ONCE per workflow while
+      // shadow never writes, and the human merge gate's ping/comment/package
+      // carries the ⚠ CI UNCERTIFIABLE prefix.
+      "lambda/orchestrator/ci-check-context.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

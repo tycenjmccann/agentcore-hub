@@ -526,11 +526,21 @@ function getDeadSessionEscalation() {
 // imported only under CI_CHECK_USE_IAM_SIMULATE=1; `githubApi` is omitted
 // without a PAT (probe 3 is then skipped, never fatal); the Lambda client is the
 // existing shared one.
+// A failed import returns null (not a throw): @aws-sdk/client-codebuild is not
+// in this Lambda's package.json — it comes from the runtime-bundled SDK — so a
+// runtime that ever stops shipping it must degrade to "no CI block", never to a
+// dispatch-breaking throw inside buildAgentContext.
 let _ciCheckDeps = null;
 async function ciCheckDeps() {
   if (CI_CHECK_MODE === "off") return null;
   if (_ciCheckDeps) return _ciCheckDeps;
-  const { CodeBuildClient, BatchGetProjectsCommand } = await import("@aws-sdk/client-codebuild");
+  let CodeBuildClient, BatchGetProjectsCommand;
+  try {
+    ({ CodeBuildClient, BatchGetProjectsCommand } = await import("@aws-sdk/client-codebuild"));
+  } catch (err) {
+    console.warn(`[ci-check] @aws-sdk/client-codebuild unavailable — CI check skipped: ${err.message}`);
+    return null;
+  }
   const codebuild = new CodeBuildClient({ region: REGION });
   const deps = {
     codebuildSend: (input) => codebuild.send(new BatchGetProjectsCommand(input)),
@@ -551,9 +561,15 @@ async function ciCheckDeps() {
     githubApi: process.env.GITHUB_PAT ? githubApi : undefined,
   };
   if (process.env.CI_CHECK_USE_IAM_SIMULATE === "1") {
-    const { IAMClient, SimulatePrincipalPolicyCommand } = await import("@aws-sdk/client-iam");
-    const iam = new IAMClient({ region: REGION });
-    deps.iamSimulate = (input) => iam.send(new SimulatePrincipalPolicyCommand(input));
+    // Optional probe: a missing client leaves iamSimulate undefined (ci-check
+    // then skips the simulate), it does not disable the whole check.
+    try {
+      const { IAMClient, SimulatePrincipalPolicyCommand } = await import("@aws-sdk/client-iam");
+      const iam = new IAMClient({ region: REGION });
+      deps.iamSimulate = (input) => iam.send(new SimulatePrincipalPolicyCommand(input));
+    } catch (err) {
+      console.warn(`[ci-check] @aws-sdk/client-iam unavailable — simulate probe skipped: ${err.message}`);
+    }
   }
   _ciCheckDeps = deps;
   return _ciCheckDeps;
@@ -1155,20 +1171,34 @@ async function labelEpicUncertifiable(workflow, ciCheck) {
   if (!epicId) return false;
   const note = `⚠ CI UNCERTIFIABLE: ${ciCheck?.reason || "no CodeBuild build can exist for this head."}`;
   let labeled = false;
+  let commented = false;
   try {
-    await invokeTickets("labels_add", { ticket_id: epicId, issue_key: epicId, labels: ["ci:uncertifiable"] });
+    const res = await invokeTickets("labels_add", { ticket_id: epicId, issue_key: epicId, labels: ["ci:uncertifiable"] });
+    // The jira Lambda's failure envelope is a BARE `{ error }` with no `content`
+    // field, so invokeTickets' textResult check cannot see it and returns
+    // normally. Unchecked, a 400 from Jira would be recorded as a successful
+    // label — suppressing both the comment fallback and (via labeled:true) every
+    // later retry. Check the payload, not just the throw.
+    if (res?.error) throw new Error(String(res.error).slice(0, 300));
     labeled = true;
   } catch (err) {
     console.warn(`[ci-check] labels_add on ${epicId} failed: ${err.message} — falling back to a comment`);
     // Comment fallback is jira-only (addTicketComment no-ops in dynamodb mode);
     // in that mode the `## CI Certification` context block + the merge-gate
     // prefix remain the surfaces that carry the warning.
-    await addTicketComment(epicId, note);
+    commented = await addTicketComment(epicId, note);
   }
-  try {
-    await store.setCiCheck(workflow.id, { ...ciCheck, labeled: true });
-  } catch (err) {
-    console.warn(`[ci-check] could not persist labeled flag for ${workflow.id}: ${err.message}`);
+  // `labeled` is the "stop trying" flag, so only set it once the warning really
+  // reached the board (label or comment). A failure that reached NEITHER leaves
+  // it unset so the next dispatch on this run retries — bounded by the run's
+  // ticket count, and far better than silently losing the only board-visible
+  // record of an uncertifiable run.
+  if (labeled || commented) {
+    try {
+      await store.setCiCheck(workflow.id, { ...ciCheck, labeled: true });
+    } catch (err) {
+      console.warn(`[ci-check] could not persist labeled flag for ${workflow.id}: ${err.message}`);
+    }
   }
   return labeled;
 }
@@ -4421,18 +4451,23 @@ export async function buildAgentContext(ticket, workflow) {
     // epic + the merge-gate package. CI_CHECK_MODE=off → not reached at all: zero
     // extra calls, no SDK load, byte-identical context.
     if (CI_CHECK_MODE !== "off") {
-      const repoForCi = workflow.repoConfig?.repos?.length > 0 ? parseRepoUrl(workflow.repoConfig) : null;
-      const ciCheck = await ensureCiCheck(workflow, {
-        store,
-        deps: (await ciCheckDeps()) || {},
-        delivery: deliveryForContext,
-        mode: CI_CHECK_MODE,
-        repo: repoForCi,
-      });
-      context += formatCiCheckBlock(ciCheck, CI_CHECK_MODE);
-      // enforce only: shadow observes, it never touches a ticket.
-      if (CI_CHECK_MODE === "enforce" && ciCheck?.verdict === "uncertifiable" && !ciCheck.labeled) {
-        await labelEpicUncertifiable(workflow, ciCheck);
+      // No deps (the CodeBuild client could not be loaded) → say nothing rather
+      // than emit an `unknown` block the probe never actually ran.
+      const ciDeps = await ciCheckDeps();
+      if (ciDeps) {
+        const repoForCi = workflow.repoConfig?.repos?.length > 0 ? parseRepoUrl(workflow.repoConfig) : null;
+        const ciCheck = await ensureCiCheck(workflow, {
+          store,
+          deps: ciDeps,
+          delivery: deliveryForContext,
+          mode: CI_CHECK_MODE,
+          repo: repoForCi,
+        });
+        context += formatCiCheckBlock(ciCheck, CI_CHECK_MODE);
+        // enforce only: shadow observes, it never touches a ticket.
+        if (CI_CHECK_MODE === "enforce" && ciCheck?.verdict === "uncertifiable" && !ciCheck.labeled) {
+          await labelEpicUncertifiable(workflow, ciCheck);
+        }
       }
     }
   }
