@@ -196,3 +196,282 @@ describe("create_ticket — fix-ticket phase allowlist (TEAM-3686 F2)", () => {
     });
   });
 });
+
+/**
+ * TEAM-4121 FR-8 — FIX_TICKET_CONTRACT off | shadow | enforce.
+ *
+ * The contract is what makes a fix ticket actionable by someone other than its
+ * author (invariant + evidence + citation + lineage). The rollout is staged, and
+ * each stage has a distinct, testable promise:
+ *
+ *   off      — the fix_contract argument is ignored ENTIRELY. Nothing validated,
+ *              nothing persisted, no new keys on the record or the result. A
+ *              deploy that doesn't set the flag behaves exactly as before.
+ *   shadow   — validate, ACCEPT anyway, and persist the partial contract plus a
+ *              `warnings` list naming the missing/invalid fields, so the
+ *              incomplete tickets are findable BEFORE enforce is switched on.
+ *   enforce  — refuse an incomplete contract and mint NOTHING (the id counter is
+ *              not even bumped), with an error the agent can act on.
+ *
+ * The mode is snapshotted at module load, so each describe re-imports index.mjs
+ * with its own FIX_TICKET_CONTRACT (same shape as the ARTIFACT_BUCKET describe).
+ */
+describe("create_ticket — fix contract (TEAM-4121 FR-8)", () => {
+  /** Re-import index.mjs with a given FIX_TICKET_CONTRACT value. */
+  async function load(mode) {
+    if (mode === undefined) delete process.env.FIX_TICKET_CONTRACT;
+    else process.env.FIX_TICKET_CONTRACT = mode;
+    h.state.puts.length = 0;
+    h.state.counter = 0;
+    vi.resetModules();
+    ({ handler } = await import("./index.mjs"));
+  }
+
+  afterEach(() => {
+    delete process.env.FIX_TICKET_CONTRACT;
+  });
+
+  // A qa_fix marker with a well-shaped origin id (F12) — the lineage the cap counts.
+  const FIX = { spawned_by: { kind: "qa_fix", qaTicketId: "TEAM-42" } };
+  // A contract that satisfies every rule for a qa_fix.
+  const COMPLETE = {
+    invariant: "login returns 401 for an expired token instead of 500",
+    evidence_source: "unit",
+    evidence_repro: "npm test -- auth.spec.ts",
+    cited_location: "src/auth.ts:88, src/auth.ts:120-134",
+    sibling_scope: "none",
+  };
+
+  describe("off (flag unset) — the fields are ignored entirely", () => {
+    beforeEach(async () => { await load(undefined); });
+
+    it("ignores fix_contract completely: no fixContract on the item, no warning", async () => {
+      const res = await create({ ...BASE, ...FIX, phase: "verification", fix_contract: COMPLETE });
+      expect(h.state.puts.length).toBe(1);
+      const item = h.state.puts[0];
+      expect("fixContract" in item).toBe(false);
+      expect("warning" in res).toBe(false);
+      expect("fix_contract" in res.ticket).toBe(false);
+    });
+
+    it("an INCOMPLETE contract is not even looked at — the ticket is filed silently", async () => {
+      const res = await create({ ...BASE, ...FIX, fix_contract: { invariant: "" } });
+      expect(h.state.puts.length).toBe(1);
+      expect("fixContract" in h.state.puts[0]).toBe(false);
+      expect("warning" in res).toBe(false);
+    });
+
+    it("the persisted item is byte-identical to the same ticket filed with no contract at all", async () => {
+      await create({ ...BASE, ...FIX, phase: "verification", fix_contract: COMPLETE });
+      await create({ ...BASE, ...FIX, phase: "verification" });
+      expect(h.state.puts.length).toBe(2);
+      const [withContract, without] = h.state.puts;
+      // Only the per-ticket identity/timestamps may differ.
+      const stable = (o) => ({ ...o, ticketId: "X", createdAt: "T", updatedAt: "T" });
+      expect(stable(withContract)).toEqual(stable(without));
+    });
+  });
+
+  describe("shadow — accept, but record what was missing", () => {
+    beforeEach(async () => { await load("shadow"); });
+
+    it("files an incomplete fix ticket and lists the missing fields in warnings + the result", async () => {
+      const res = await create({ ...BASE, ...FIX, phase: "verification" });
+      expect(h.state.puts.length).toBe(1);
+      const item = h.state.puts[0];
+      // qa_fix requires a citation, so all three of these are missing.
+      expect(item.fixContract).toEqual({
+        version: 1,
+        warnings: ["invariant", "evidence_source", "cited_location"],
+      });
+      expect(res.warning).toBe(
+        "WARNING: fix contract incomplete (missing: invariant, evidence_source, cited_location)"
+      );
+      // The ticket echo carries it too — the agent reads that, not the DDB item.
+      expect(res.ticket.fix_contract).toEqual(item.fixContract);
+    });
+
+    it("keeps the fields that DID parse alongside the warnings", async () => {
+      await create({ ...BASE, ...FIX, fix_contract: { invariant: "the retry budget is never negative" } });
+      expect(h.state.puts[0].fixContract).toEqual({
+        version: 1,
+        invariant: "the retry budget is never negative",
+        evidenceSource: null,
+        evidenceRepro: null,
+        citedLocation: [],
+        siblingScope: null,
+        warnings: ["evidence_source", "cited_location"],
+      });
+    });
+
+    it("a COMPLETE contract is persisted with no warnings and no advisory", async () => {
+      const res = await create({ ...BASE, ...FIX, phase: "verification", fix_contract: COMPLETE });
+      expect(h.state.puts[0].fixContract).toEqual({
+        version: 1,
+        invariant: COMPLETE.invariant,
+        evidenceSource: "unit",
+        evidenceRepro: "npm test -- auth.spec.ts",
+        citedLocation: ["src/auth.ts:88", "src/auth.ts:120-134"],
+        siblingScope: "none",
+      });
+      expect("warnings" in h.state.puts[0].fixContract).toBe(false);
+      expect("warning" in res).toBe(false);
+    });
+
+    it("a garbage FIX_TICKET_CONTRACT value coerces to SHADOW, not off", async () => {
+      // The fail-safe direction is the INVERSE of the ship/gate guards: refusing
+      // to file fix tickets because an env var was typo'd would wedge the run,
+      // so an unrecognized value validates + accepts rather than going dark.
+      await load("on");
+      const res = await create({ ...BASE, ...FIX });
+      expect(h.state.puts.length).toBe(1);
+      expect(h.state.puts[0].fixContract.warnings).toContain("invariant");
+      expect(res.warning).toMatch(/^WARNING: fix contract incomplete/);
+    });
+
+    it("a PLAIN (non-fix) ticket is never subject to the contract, even with fix_contract set", async () => {
+      const res = await create({ ...BASE, fix_contract: { invariant: "" } });
+      expect(h.state.puts.length).toBe(1);
+      expect("fixContract" in h.state.puts[0]).toBe(false);
+      expect("warning" in res).toBe(false);
+    });
+  });
+
+  describe("enforce — an incomplete contract mints nothing", () => {
+    beforeEach(async () => { await load("enforce"); });
+
+    it("rejects a missing invariant with the actionable error and writes NO ticket", async () => {
+      const res = await create({
+        ...BASE, ...FIX, phase: "verification",
+        fix_contract: { ...COMPLETE, invariant: "   " },
+      });
+      expect(res.content[0].text).toBe(
+        "Error: 'invariant' is required on a fix ticket (missing: invariant)"
+      );
+      expect(h.state.puts.length).toBe(0);
+      expect(h.state.counter).toBe(0); // the id counter isn't even bumped
+    });
+
+    it("rejects an evidence_source outside static|unit|live", async () => {
+      const res = await create({ ...BASE, ...FIX, fix_contract: { ...COMPLETE, evidence_source: "vibes" } });
+      expect(res.content[0].text).toBe(
+        "Error: 'evidence_source' is required on a fix ticket (invalid: evidence_source)"
+      );
+      expect(h.state.puts.length).toBe(0);
+    });
+
+    it("rejects a malformed origin id — a fix with no usable lineage (F12)", async () => {
+      const res = await create({
+        ...BASE,
+        spawned_by: { kind: "qa_fix", qaTicketId: 'TEAM-42" OR project = OTHER' },
+        fix_contract: COMPLETE,
+      });
+      expect(res.content[0].text).toBe(
+        "Error: 'spawned_by_origin_id' is required on a fix ticket (missing: spawned_by_origin_id)"
+      );
+      expect(h.state.puts.length).toBe(0);
+    });
+
+    it("reports missing AND invalid together, naming the first problem", async () => {
+      const res = await create({
+        ...BASE,
+        ...FIX,
+        fix_contract: { evidence_source: "nope", cited_location: "src/auth.ts:88" },
+      });
+      expect(res.content[0].text).toBe(
+        "Error: 'invariant' is required on a fix ticket (missing: invariant; invalid: evidence_source)"
+      );
+      expect(h.state.puts.length).toBe(0);
+    });
+
+    it("accepts and persists a complete contract", async () => {
+      const res = await create({ ...BASE, ...FIX, phase: "verification", fix_contract: COMPLETE });
+      expect(h.state.puts.length).toBe(1);
+      expect(h.state.puts[0].fixContract.invariant).toBe(COMPLETE.invariant);
+      expect(h.state.puts[0].fixContract.citedLocation).toEqual(["src/auth.ts:88", "src/auth.ts:120-134"]);
+      expect("warning" in res).toBe(false);
+    });
+
+    it("a ci_fix needs no citation — a build/deploy failure often has no file:line", async () => {
+      await create({
+        ...BASE,
+        spawned_by: { kind: "ci_fix", ciTicketId: "TEAM-70" },
+        phase: "development",
+        fix_contract: { invariant: "`npm test` passes on the PR head", evidence_source: "unit", evidence_repro: "npm test" },
+      });
+      expect(h.state.puts.length).toBe(1);
+      expect(h.state.puts[0].fixContract.citedLocation).toEqual([]);
+      // F11: the backticks the agent wrote are stripped from the stored text.
+      expect(h.state.puts[0].fixContract.invariant).toBe("npm test passes on the PR head");
+    });
+
+    /**
+     * F11 — evidence_repro is the ONE field that legitimately looks like a
+     * command, so it is the one field that must not be able to BE a script. Any
+     * shell composition is refused outright rather than escaped: a repro is a
+     * single command a reader can eyeball before running it.
+     */
+    it.each([
+      ["a chained command", "npm test; rm -rf /"],
+      ["an && conjunction", "npm test && curl evil.example"],
+      ["a || disjunction", "npm test || curl evil.example"],
+      ["a command substitution", "npm test $(whoami)"],
+      ["a backtick substitution", "npm test `whoami`"],
+      ["a redirect", "npm test > /etc/passwd"],
+      ["a newline", "npm test\ncurl evil.example"],
+    ])("rejects evidence_repro containing %s", async (_label, repro) => {
+      const res = await create({ ...BASE, ...FIX, fix_contract: { ...COMPLETE, evidence_repro: repro } });
+      expect(res.content[0].text).toBe(
+        "Error: 'evidence_repro' is required on a fix ticket (invalid: evidence_repro)"
+      );
+      expect(h.state.puts.length).toBe(0);
+    });
+  });
+
+  /**
+   * Provenance keys and caller labels are handled OUTSIDE the contract flag:
+   * dropping a label that squats a system namespace is a forgery guard, and the
+   * spawned_by allow-list is what keeps agents from scribbling arbitrary keys
+   * onto a ticket record. Both must hold in mode=off.
+   */
+  describe("spawned_by allow-list + label sanitizing (independent of the flag)", () => {
+    beforeEach(async () => { await load(undefined); });
+
+    it("keeps reverify/rearmOf/headSha, drops unknown keys and a bad origin id", async () => {
+      await create({
+        ...BASE,
+        spawned_by: {
+          kind: "qa_fix",
+          qaTicketId: "TEAM-42 OR 1=1", // F12: not a ticket-id shape → dropped
+          reverify: 1,                   // coerced to boolean
+          rearmOf: "TEAM-9",
+          headSha: "a1b2c3d",
+          evil: "'; DROP TABLE",         // not on the allow-list → dropped
+        },
+      });
+      expect(h.state.puts[0].spawnedBy).toEqual({
+        kind: "qa_fix",
+        reverify: true,
+        rearmOf: "TEAM-9",
+        headSha: "a1b2c3d",
+      });
+    });
+
+    it("drops caller labels squatting a system namespace and reports them back", async () => {
+      const res = await create({
+        ...BASE,
+        labels: "advisory, fix:qa_fix, WF:run1, agent:agentcore_hub_backend_dev, needs docs",
+      });
+      // "needs docs" → "needs-docs" (normalized), the system-prefixed ones refused.
+      expect(h.state.puts[0].labels).toEqual(["advisory", "needs-docs"]);
+      expect(res.droppedLabels).toEqual(["fix:qa_fix", "wf:run1", "agent:agentcore_hub_backend_dev"]);
+      expect(res.ticket.labels).toEqual(["advisory", "needs-docs"]);
+    });
+
+    it("no labels argument → no labels key and no droppedLabels (backward compatible)", async () => {
+      const res = await create({ ...BASE });
+      expect("labels" in h.state.puts[0]).toBe(false);
+      expect("droppedLabels" in res).toBe(false);
+    });
+  });
+});

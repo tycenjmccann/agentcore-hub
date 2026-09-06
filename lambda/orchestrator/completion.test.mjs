@@ -11,6 +11,8 @@ import {
   completionRecordHasEvidence,
   evidenceBackfillFields,
   resolveMissingEvidenceFromRecords,
+  FIX_KINDS,
+  REWORK_FIX_KINDS,
 } from "./completion.mjs";
 
 /**
@@ -118,6 +120,40 @@ describe("isWorkflowComplete — spawned-fix routing (AC-D4.3)", () => {
   it("tolerates legacy tickets with no spawnedBy", () => {
     const children = doneRun([{ ticketId: "L-1", assignee: "rm", status: "done" }]);
     expect(isWorkflowComplete(children, DEF, opts)).toBe(true);
+  });
+
+  /**
+   * TEAM-4121 FR-8 — the two kind sets are PARITY MIRRORS of fix-contract.mjs
+   * (this file cannot import it: completion.mjs is loaded by the orchestrator
+   * bundle and by the tests, but the kinds must also be known to two ticket
+   * Lambdas that ship separately). check-fix-kinds-parity.sh guards the copies;
+   * this pins the semantics of the split.
+   */
+  it("FIX_KINDS gates completion for all six kinds; REWORK_FIX_KINDS escalates for only four", () => {
+    expect([...FIX_KINDS]).toEqual(["review_fix", "qa_fix", "codex_fix", "ship_fix", "ci_fix", "sync_fix"]);
+    expect([...REWORK_FIX_KINDS]).toEqual(["review_fix", "qa_fix", "codex_fix", "ship_fix"]);
+    // The difference is exactly the environmental pair — the kinds a run must
+    // wait for but must not be escalated to a human over.
+    expect([...FIX_KINDS].filter((k) => !REWORK_FIX_KINDS.has(k))).toEqual(["ci_fix", "sync_fix"]);
+  });
+
+  it("an open ci_fix holds the gate even though it never trips the rework cap", () => {
+    const open = doneRun([
+      { ticketId: "F-3", assignee: "dev", phase: "review", status: "todo", spawnedBy: { kind: "ci_fix", ciTicketId: "T-9" } },
+    ]);
+    expect(isWorkflowComplete(open, DEF, opts)).toBe(false);
+
+    const done = doneRun([
+      { ticketId: "F-3", assignee: "dev", phase: "review", status: "done", spawnedBy: { kind: "ci_fix", ciTicketId: "T-9" } },
+    ]);
+    expect(isWorkflowComplete(done, DEF, opts)).toBe(true);
+  });
+
+  it("an open sync_fix holds the gate too", () => {
+    const open = doneRun([
+      { ticketId: "F-4", assignee: "dev", phase: "ship", status: "in_progress", spawnedBy: { kind: "sync_fix", ciTicketId: "T-9" } },
+    ]);
+    expect(isWorkflowComplete(open, DEF, opts)).toBe(false);
   });
 });
 

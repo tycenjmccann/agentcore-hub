@@ -301,7 +301,7 @@ async function buildCard(workflowId, workflow, pricing) {
   // a change request. Deliberately NOT in computeHumanWait's resolution set: a
   // parked gate is not resolved.
   const changeRequests = count("review.rejected") + count("review.parked_advisory");
-  const fixTickets = countFixTickets(events, agentTasks);
+  const fixTickets = countFixTickets(events, agentTasks, workflow);
   const gates = computeGateRounds(workflow);
   const reworkRounds = aiTasks.reduce((s, t) => s + t.reworkRounds, 0);
   const tasksCompleted = aiTasks.filter((t) => t.status === "complete" || t.status === "done").length;
@@ -1043,13 +1043,98 @@ function computeAgentTasks(workflow, events) {
   return tasks;
 }
 
-function countFixTickets(events, agentTasks) {
-  const ids = new Set();
+/**
+ * TEAM-4121 FR-10 — what counts as a fix ticket.
+ *
+ * Kept deliberately identical to the Workflow Manager toolkit's predicate
+ * (deploy/workflow-manager/toolkit/compute_metrics.py: FIX_TITLE / is_fix_ticket),
+ * because the two numbers are shown side by side: the performance card's "Fix
+ * tickets" row and the WM's `fixTickets.count` for the same run. They disagreed
+ * for the same two reasons on both sides — the agents standardized on
+ * "Fix (review):" / "Fix (QA):" / "Fix (ship-review r2):" / "Fix (CI):" (none of
+ * which starts with "Fix:"), while a bug-fix run's own intake-planned
+ * "Fix: <the feature>" ticket was counted as a rework loop. A shared fixture
+ * (deploy/workflow-manager/toolkit/fixtures/fix-lineage.json) pins the agreement
+ * from both languages; see index.test.mjs.
+ */
+export const FIX_TITLE_RE = /^(Fix \((review|QA|qa|ship-review r\d+|CI|sync-main|[^)]+)\)|Re-verify \()/i;
+const INTAKE_AGENT_ID = "agentcore_hub_requirements_analyst";
+const TERMINAL_TASK_EVENTS = new Set(["agent.complete", "workflow.report_completion"]);
+
+/**
+ * When intake finished planning: everything it planned was created before this
+ * instant, every fix an agent filed against the pipeline after it. Falls back to
+ * the first-created task completing, then to null (no exclusion — overcounting
+ * by one beats dropping a real fix).
+ */
+export function intakeCompletedAt(events, workflow = {}) {
+  let earliest = null;
   for (const e of events) {
-    if (e.type === "ticket.created" && String(e.detail?.ticket?.title || "").startsWith("Fix:")) ids.add(e.detail.ticket.id || e.detail.ticketId);
+    if (!TERMINAL_TASK_EVENTS.has(e.type) || e.detail?.agentId !== INTAKE_AGENT_ID) continue;
+    const ts = Date.parse(e.timestamp);
+    if (Number.isFinite(ts) && (earliest === null || ts < earliest)) earliest = ts;
   }
-  for (const t of agentTasks) if (String(t.title || "").startsWith("Fix:")) ids.add(t.ticketId);
-  return ids.size;
+  if (earliest !== null) return earliest;
+  const firstTask = Object.entries(workflow.agentTasks || {})
+    .map(([ticketId, t]) => ({ ticketId, at: Date.parse(t.createdAt || "") }))
+    .filter((t) => Number.isFinite(t.at))
+    .sort((a, b) => a.at - b.at || a.ticketId.localeCompare(b.ticketId))[0];
+  if (!firstTask) return null;
+  for (const e of events) {
+    if (!TERMINAL_TASK_EVENTS.has(e.type) || e.detail?.ticketId !== firstTask.ticketId) continue;
+    const ts = Date.parse(e.timestamp);
+    if (Number.isFinite(ts) && (earliest === null || ts < earliest)) earliest = ts;
+  }
+  return earliest;
+}
+
+/** `spawnedBy.kind` (machine-stamped, most trusted) → title shape → legacy "Fix:" minus intake's own. */
+export function isFixTicket(ticket, intakeAt = null) {
+  if (ticket?.spawnedBy?.kind) return true;
+  const title = String(ticket?.title || "");
+  if (FIX_TITLE_RE.test(title)) return true;
+  if (!title.startsWith("Fix:")) return false;
+  const created = Date.parse(ticket?.createdAt || "");
+  return !(intakeAt !== null && Number.isFinite(created) && created < intakeAt);
+}
+
+/**
+ * Fix ticket ids for a run, in creation order. Three sources, merged by id: the
+ * `ticket.created` events (the only place a ticket's title appears for a run
+ * whose workflow row was trimmed), workflow.agentTasks (the only place
+ * `spawnedBy` and `createdAt` appear), and the computed task rows (titles
+ * computeAgentTasks already resolved).
+ */
+export function fixTicketIds(events, agentTasks = [], workflow = {}) {
+  const candidates = new Map();
+  const upsert = (id, fields) => {
+    if (!id) return;
+    const cur = candidates.get(id) || { ticketId: id };
+    for (const [k, v] of Object.entries(fields)) if (cur[k] == null && v != null) cur[k] = v;
+    candidates.set(id, cur);
+  };
+  for (const e of events) {
+    if (e.type !== "ticket.created") continue;
+    const t = e.detail?.ticket || {};
+    upsert(t.id || e.detail?.ticketId, {
+      title: t.title, spawnedBy: t.spawnedBy, createdAt: t.createdAt || e.timestamp,
+    });
+  }
+  for (const [id, t] of Object.entries(workflow.agentTasks || {})) {
+    upsert(id, { title: t.title, spawnedBy: t.spawnedBy, createdAt: t.createdAt });
+  }
+  for (const t of agentTasks) upsert(t.ticketId, { title: t.title });
+
+  const intakeAt = intakeCompletedAt(events, workflow);
+  return [...candidates.values()]
+    .filter((t) => isFixTicket(t, intakeAt))
+    .sort((a, b) => (Date.parse(a.createdAt || "") || 0) - (Date.parse(b.createdAt || "") || 0)
+      || String(a.ticketId).localeCompare(String(b.ticketId)))
+    .map((t) => t.ticketId);
+}
+
+function countFixTickets(events, agentTasks, workflow) {
+  return fixTicketIds(events, agentTasks, workflow).length;
 }
 
 /** reviewGateHistory[ticket].rounds[] — one round per review request. */

@@ -266,12 +266,17 @@ console.log(
 // ============================================================
 console.log("\n3/5 Deploying Lambda function...");
 
-// Zip the Lambda code (per-provider source dir)
+// Zip the Lambda code (per-provider source dir). fix-contract.mjs (TEAM-4121
+// FR-8) is a local import of index.mjs in BOTH providers — omitting it kills the
+// function at cold start with ERR_MODULE_NOT_FOUND.
 const lambdaDir = join(__dirname, "..", "lambda", LAMBDA_SOURCE_DIR);
 const zipPath = `/tmp/${LAMBDA_NAME}.zip`;
-execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs`, { stdio: "pipe" });
+execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs`, { stdio: "pipe" });
 const zipBuffer = readFileSync(zipPath);
 
+// FIX_TICKET_CONTRACT is forwarded ONLY when set in the deploying shell, so an
+// existing install that has never heard of it keeps the code default (off) and
+// its config is unchanged by a redeploy.
 const lambdaEnvVars =
   TICKET_PROVIDER === "jira"
     ? {
@@ -281,12 +286,14 @@ const lambdaEnvVars =
         JIRA_PROJECT_KEY: PROJECT_KEY,
         AWS_REGION_OVERRIDE: REGION,
         ...(ARTIFACT_BUCKET && { ARTIFACT_BUCKET }),
+        ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
       }
     : {
         TICKETS_TABLE: TABLE_NAME,
         PROJECT_KEY,
         AWS_REGION_OVERRIDE: REGION,
         ...(ARTIFACT_BUCKET && { ARTIFACT_BUCKET }),
+        ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
       };
 
 const lambdaDescription =

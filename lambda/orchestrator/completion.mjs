@@ -23,7 +23,26 @@
  * a dev still gates the SHIP phase), else the assignee's roster phase.
  */
 
-export const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix"]);
+/**
+ * TEAM-4121 FR-8 — PARITY MIRROR of FIX_KINDS in lambda/orchestrator/fix-contract.mjs
+ * (and its byte-identical copies in both ticket Lambdas), the kind union in
+ * src/lib/workflow/types.ts, and the origin map in deploy/runtime-agent/main.py.
+ * Kept as a literal Set because scripts/check-fix-kinds-parity.sh greps the
+ * literal from each location — importing it would defeat the check (and this
+ * module is loaded by callers that don't ship fix-contract.mjs in tests).
+ * Add a kind in EVERY place listed above or CI fails.
+ */
+export const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix", "ship_fix", "ci_fix", "sync_fix"]);
+
+/**
+ * The subset that represents a HUMAN-authored rework round. ci_fix and sync_fix
+ * are environmental (a red build, a branch out of sync) — they are real fix
+ * tickets, so the open-fix completion gate must wait on them, but they must NOT
+ * count toward the rework-loop cap's human escalation: a flaky pipeline would
+ * otherwise escalate a run that nobody is looping on.
+ * PARITY MIRROR of REWORK_FIX_KINDS in fix-contract.mjs.
+ */
+export const REWORK_FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix", "ship_fix"]);
 
 /**
  * TEAM-3747 D2 — lifecycle-integrity terminal outcomes ("no green close over

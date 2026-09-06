@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs repo-check.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs fix-contract.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -212,7 +212,21 @@ if [ -n "${DEAD_SESSION_ESCALATION_MODE:-}" ]; then
   echo "  DEAD_SESSION_ESCALATION_MODE=${DEAD_SESSION_ESCALATION_MODE} forwarded to orchestrator"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}}"
+# Live-evidence re-verification (TEAM-4121 FR-9) — files a Re-verify (QA)
+# ticket per live-evidence fix at its head sha and marks a live fix with no live
+# artifact `unverified` for the release manager's ## Unverified Fixes block.
+# Forwarded ONLY when explicitly set, so a plain install stays default off
+# (byte-identical: the module is never constructed and the done twins take no
+# extra read). STRICT allow-list in code — a garbage value coalesces to OFF, not
+# shadow, because enforce CREATES REAL TICKETS that dispatch an agent and block
+# the run's ship tickets. Instant rollback = set off.
+LIVE_REVERIFY_VARS=""
+if [ -n "${LIVE_REVERIFY:-}" ]; then
+  LIVE_REVERIFY_VARS=",LIVE_REVERIFY=${LIVE_REVERIFY}"
+  echo "  LIVE_REVERIFY=${LIVE_REVERIFY} forwarded to orchestrator"
+fi
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${EVENT_DEDUPE_VARS}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}${EVENT_DEDUPE_VARS}}"
 

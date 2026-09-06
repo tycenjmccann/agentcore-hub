@@ -48,6 +48,15 @@ Determine if this is:
 
 Use `search_code` or `get_file_contents` to prove your classification.
 
+**Out-of-scope-but-worth-doing work becomes an ADVISORY ticket, never a blocker.**
+When your reading turns up real improvements that are outside what was asked for,
+do not fold them into the run's scope and do not drop them. File each as its own
+ticket with `labels: "advisory"`, `blocked_by: ""`, and **no `spawned_by_kind`** —
+that combination makes it backlog for the owning agent, visible to humans, and
+invisible to the run's completion guard. Anything carrying a `spawned_by_kind` is
+an open fix ticket that holds the whole run open, so an advisory that sets it
+would block delivery on work nobody asked for.
+
 ### Step 2b: Resolve AUTHORITATIVE docs for any external API / SDK / vendor service (MANDATORY)
 If the work integrates a third-party API, SDK, protocol, or vendor service, the dev
 team must NOT be left to guess the contract. Before you write tickets you MUST find

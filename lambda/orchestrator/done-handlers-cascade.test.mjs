@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 /**
  * TEAM-3688 (QA finding F3) — HANDLER-LEVEL cascade coverage.
@@ -37,11 +37,18 @@ const h = vi.hoisted(() => ({
     ebEvents: /** @type {any[]} */ ([]),
     events: /** @type {any[]} */ ([]), // events-table Put items (parsed detail)
     updates: /** @type {any[]} */ ([]), // ticket/workflow UpdateCommand inputs
+    // TEAM-4121 FR-9: S3 objects the mock will serve, and every S3 command it
+    // saw. The GetObject count is the assertion that turning LIVE_REVERIFY on
+    // does not add a second `completions/<id>.json` read to the done path.
+    s3Objects: /** @type {Record<string, any>} */ ({}),
+    s3Cmds: /** @type {{op: string, key: string}[]} */ ([]),
+    ticketGets: /** @type {string[]} */ ([]), // GetCommand ticketIds (tickets table)
     store: {
       completeTaskEntry: /** @type {any[]} */ ([]),
       claimInvocation: /** @type {any[]} */ ([]),
       appendReviewNotificationOnce: /** @type {any[]} */ ([]),
       ackNotifications: /** @type {any[]} */ ([]),
+      mergeTaskMetadata: /** @type {any[]} */ ([]),
     },
   },
 }));
@@ -62,6 +69,7 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           const name = cmd.constructor.name;
           const table = cmd.input.TableName;
           if (name === "GetCommand") {
+            h.state.ticketGets.push(cmd.input.Key.ticketId);
             return { Item: h.state.tickets[cmd.input.Key.ticketId] || null };
           }
           if (name === "QueryCommand") {
@@ -84,11 +92,38 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
 // The agent invoker: invokeAgent fires the async Lambda InvokeCommand. Capturing
 // its input IS how we prove a re-dispatch reached the gate ticket.
 vi.mock("@aws-sdk/client-lambda", () => ({
-  LambdaClient: class { async send(cmd) { h.state.lambdaInvokes.push(cmd.input); return {}; } },
+  LambdaClient: class {
+    async send(cmd) {
+      h.state.lambdaInvokes.push(cmd.input);
+      // invokeTickets READS the response (it needs the new key back), so the
+      // tickets-tools Lambda has to answer or every create_ticket looks failed.
+      let payload = null;
+      try { payload = JSON.parse(cmd.input?.Payload || "{}"); } catch { /* agent invokes */ }
+      if (typeof payload?.tool_name === "string" && payload.tool_name.startsWith("Tickets___create_ticket")) {
+        return { Payload: new TextEncoder().encode(JSON.stringify({ key: "TEAM-4200" })) };
+      }
+      return {};
+    }
+  },
   InvokeCommand: class { constructor(i) { this.input = i; } },
 }));
+// Serves h.state.s3Objects and counts every command. Empty by default, and a
+// miss throws NoSuchKey — the same non-fatal outcome as the previous no-send
+// stub, so every pre-4121 test in this file is unaffected.
 vi.mock("@aws-sdk/client-s3", () => ({
-  S3Client: class {}, // no send → context-builder S3 reads are caught + non-fatal
+  S3Client: class {
+    async send(cmd) {
+      const key = cmd.input?.Key || "";
+      h.state.s3Cmds.push({ op: cmd.constructor.name, key });
+      if (cmd.constructor.name !== "GetObjectCommand" || !(key in h.state.s3Objects)) {
+        const err = new Error(`NoSuchKey: ${key}`);
+        err.name = "NoSuchKey";
+        throw err;
+      }
+      const body = h.state.s3Objects[key];
+      return { Body: { transformToString: async () => (typeof body === "string" ? body : JSON.stringify(body)) } };
+    }
+  },
   GetObjectCommand: class { constructor(i) { this.input = i; } },
   PutObjectCommand: class { constructor(i) { this.input = i; } },
 }));
@@ -114,6 +149,15 @@ vi.mock("./workflow-store.mjs", () => ({
   setTaskStatus: vi.fn(async () => {}), // only touched on an invoke failure
   // TEAM-3966: a human gate going done (approve) must ack its review_needed.
   ackNotifications: vi.fn(async (wfId, predicate) => { h.state.store.ackNotifications.push({ wfId, predicate }); }),
+  // TEAM-4121 FR-9: the scoped task-metadata merge behind harvestCompletionEvidence
+  // and the live-reverify markers. Applied to the in-memory row like the real
+  // store does, so the assertions can read agentTasks rather than a call log.
+  mergeTaskMetadata: vi.fn(async (wfId, tid, fields) => {
+    h.state.store.mergeTaskMetadata.push({ wfId, tid, fields });
+    if (h.state.workflow?.id === wfId && h.state.workflow.agentTasks?.[tid]) {
+      Object.assign(h.state.workflow.agentTasks[tid], fields);
+    }
+  }),
 }));
 
 // cascade.mjs and lease.mjs are deliberately NOT mocked — the point of these
@@ -184,6 +228,10 @@ beforeEach(async () => {
   h.state.store.claimInvocation.length = 0;
   h.state.store.appendReviewNotificationOnce.length = 0;
   h.state.store.ackNotifications.length = 0;
+  h.state.store.mergeTaskMetadata.length = 0;
+  h.state.s3Cmds.length = 0;
+  h.state.ticketGets.length = 0;
+  h.state.s3Objects = {};
   await load();
 });
 
@@ -338,5 +386,162 @@ describe("human gate approved (gate → done) acks its review_needed (TEAM-3966)
     inReviewChildren();
     await handleTicketDoneUnified(DONE); // DONE is assigned to DEV
     expect(h.state.store.ackNotifications).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4121 FR-9 — the live-reverify hook's GATING in both done twins.
+ *
+ * live-reverify.test.mjs pins the module's decisions and
+ * replay-yteqfl-reverify.test.mjs replays the real failure through it; neither
+ * proves the hook is wired into the REAL handlers, nor — the part that decides
+ * whether this flag is safe to ship dark — that an unset LIVE_REVERIFY costs
+ * NOTHING. "Nothing" is measurable here: the done path already reads
+ * `completions/<id>.json` once for harvestCompletionEvidence, so the flag must
+ * not add a second GET (index.mjs memoizes the record per invocation), and a
+ * non-fix ticket must not reach the module at all even under enforce.
+ */
+describe("live-reverify hook gating in both done twins (TEAM-4121 FR-9)", () => {
+  const FIX = "TEAM-9089";
+  const HEAD = "0949f9d881423ac7fe00a70e23d60fff5654078c";
+  const COMPLETIONS_KEY = `completions/${FIX}.json`;
+
+  /** Reload index.mjs with the flag set (both are read at module load). */
+  async function loadWithLiveReverify(mode) {
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    if (mode === undefined) delete process.env.LIVE_REVERIFY;
+    else process.env.LIVE_REVERIFY = mode;
+    await load();
+  }
+
+  afterEach(() => {
+    delete process.env.LIVE_REVERIFY;
+    delete process.env.ARTIFACT_BUCKET;
+  });
+
+  /**
+   * A qa_fix that declared live evidence and closed with a prose-only completion
+   * record — the exact shape the FR fires on. Seeded on the board (the stream
+   * twin re-reads the normalized row) and in S3.
+   */
+  function liveFixFixture() {
+    h.state.tickets[FIX] = {
+      ticketId: FIX, parentId: PARENT, workflowId: "wf_1", assignee: DEV, status: "done",
+      title: "Fix (QA): the 403 detail leaks the SDK placeholder name",
+      phase: "development",
+      spawnedBy: { kind: "qa_fix", qaTicketId: "TEAM-9064" },
+      fixContract: {
+        invariant: "the error detail never contains the placeholder name",
+        evidenceSource: "live",
+        evidenceRepro: "POST /api/workflow/start with an unreadable s3:// source",
+        citedLocation: ["src/lib/workflow/intake.ts:212"],
+        siblingScope: "none",
+      },
+    };
+    h.state.children = [{ ...h.state.tickets[FIX], type: "task" }];
+    // The fix's own task row, so harvestCompletionEvidence has somewhere to land
+    // the commit sha the re-verification pins to.
+    h.state.workflow.agentTasks[FIX] = {
+      id: "task_fix", agentId: DEV, ticketId: FIX, status: "running", startedAt: STALE_STARTED,
+    };
+    h.state.s3Objects[COMPLETIONS_KEY] = {
+      ticket_id: FIX, summary: "Filtered the placeholder and added a regression test.",
+      commit_sha: HEAD, branch: `feature/${FIX}-bug-fixer`,
+    };
+  }
+
+  const getsOf = (key) => h.state.s3Cmds.filter((c) => c.op === "GetObjectCommand" && c.key === key);
+  const fixEvents = () => h.state.events.filter((e) => String(e.type || "").startsWith("fix."));
+  const createTicketInvokes = () =>
+    h.state.lambdaInvokes.filter((i) => {
+      try { return String(JSON.parse(i.Payload).tool_name || "").startsWith("Tickets___create_ticket"); }
+      catch { return false; }
+    });
+
+  describe("unset (the shipped default) — byte-identical", () => {
+    it.each([
+      ["webhook twin", (id) => handleTicketDoneUnified(id)],
+      ["stream twin", (id) => handleTicketDone(id, { parentId: PARENT, workflowId: "wf_1", assignee: DEV })],
+    ])("%s: a live fix closes with ONE completions read and no live-reverify effect", async (_label, run) => {
+      await loadWithLiveReverify(undefined);
+      liveFixFixture();
+
+      await run(FIX);
+
+      // The one read harvestCompletionEvidence always did — and no second one.
+      expect(getsOf(COMPLETIONS_KEY)).toHaveLength(1);
+      expect(fixEvents()).toEqual([]);
+      expect(createTicketInvokes()).toEqual([]);
+      expect(h.state.events.some((e) => e.detail?.ticketId === FIX && e.type === "agent.complete")).toBe(true);
+      // Harvest still landed the sha, so the ONLY difference under enforce is the
+      // re-verification itself, not the evidence bookkeeping.
+      expect(h.state.workflow.agentTasks[FIX].commitSha).toBe(HEAD);
+      expect(h.state.workflow.agentTasks[FIX].verification).toBeUndefined();
+    });
+
+    it("stream twin: with both observer flags off the normalized ticket is never re-read", async () => {
+      await loadWithLiveReverify(undefined);
+      liveFixFixture();
+
+      await handleTicketDone(FIX, { parentId: PARENT, workflowId: "wf_1", assignee: DEV });
+
+      // The stream path works off the DDB image; the extra getTicket exists only
+      // to give the two observers a normalized row (index.mjs guards it with
+      // `REWORK_LOOP_CAP !== "off" || LIVE_REVERIFY !== "off"`).
+      expect(h.state.ticketGets.filter((id) => id === FIX)).toEqual([]);
+    });
+  });
+
+  describe("enforce", () => {
+    it.each([
+      ["webhook twin", (id) => handleTicketDoneUnified(id)],
+      ["stream twin", (id) => handleTicketDone(id, { parentId: PARENT, workflowId: "wf_1", assignee: DEV })],
+    ])("%s: the hook fires and still reads completions/ exactly ONCE", async (_label, run) => {
+      await loadWithLiveReverify("enforce");
+      liveFixFixture();
+
+      await run(FIX);
+
+      // The point of the per-invocation memo: harvest and the hook share one GET.
+      expect(getsOf(COMPLETIONS_KEY)).toHaveLength(1);
+
+      // The hook actually reached the module through the real handler.
+      expect(fixEvents().map((e) => e.type)).toEqual(["fix.unverified", "fix.reverify_created"]);
+      expect(createTicketInvokes()).toHaveLength(1);
+      const params = JSON.parse(createTicketInvokes()[0].Payload).parameters;
+      expect(params.summary).toBe(`Re-verify (QA): ${h.state.tickets[FIX].title} @ 0949f9d`);
+      expect(params.blocked_by).toEqual([FIX]);
+      expect(params.assignee).toBe("agentcore_hub_qa_verifier");
+      // The workflow row carries both markers: the one the ship context renders
+      // from, and the one that makes a re-Done at this head a no-op.
+      expect(h.state.workflow.agentTasks[FIX]).toMatchObject({
+        commitSha: HEAD,
+        verification: "unverified",
+        reverifyTicketId: "TEAM-4200",
+        reverifySha: "0949f9d",
+      });
+      // …and the done cascade still finished.
+      expect(h.state.events.some((e) => e.detail?.ticketId === FIX && e.type === "agent.complete")).toBe(true);
+    });
+
+    it.each([
+      ["webhook twin", (id) => handleTicketDoneUnified(id)],
+      ["stream twin", (id) => handleTicketDone(id, streamImage())],
+    ])("%s: a NON-fix ticket never reaches the module", async (_label, run) => {
+      await loadWithLiveReverify("enforce");
+      inProgressChildren();
+      // The ordinary dev ticket of the (a) scenario: no spawnedBy, no contract.
+      h.state.s3Objects[`completions/${DONE}.json`] = { ticket_id: DONE, summary: "shipped", commit_sha: HEAD };
+
+      await run(DONE);
+
+      expect(fixEvents()).toEqual([]);
+      expect(createTicketInvokes()).toEqual([]);
+      // Still just the harvest read — observeLiveReverify returns on the
+      // FIX_KINDS check, BEFORE readCompletionRecord.
+      expect(getsOf(`completions/${DONE}.json`)).toHaveLength(1);
+      // And the cascade the rest of this file covers is untouched.
+      expectStaleLeaseRedispatch();
+    });
   });
 });

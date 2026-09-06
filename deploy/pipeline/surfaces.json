@@ -55,7 +55,8 @@
       "function": "agentcore-hub-jira",
       "dir": "lambda/agentcore-hub-jira",
       "files": [
-        "index.mjs"
+        "index.mjs",
+        "fix-contract.mjs"
       ],
       "npm": false,
       "note": "Only @aws-sdk/client-s3 is declared, which the nodejs20.x runtime provides \u2014 deploy/setup-tickets-lambda.mjs ships index.mjs alone too."
@@ -64,7 +65,8 @@
       "function": "agentcore-hub-tickets",
       "dir": "lambda/agentcore-hub-tickets",
       "files": [
-        "index.mjs"
+        "index.mjs",
+        "fix-contract.mjs"
       ],
       "npm": false,
       "optional": true,

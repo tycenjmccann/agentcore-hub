@@ -1,0 +1,481 @@
+{
+  "_fixture": {
+    "ticket": "TEAM-4121 FR-10",
+    "what": "Hand-built dossier for fixTickets v2 lineage. NOT a captured run — every ticket exists to pin one branch of the predicate or one tag, which no single real run does.",
+    "readBy": [
+      "deploy/workflow-manager/toolkit/test_metrics.py (class FixLineage) — count, ticketIds, entries (kind/origin/round/tag), byKind, byTag",
+      "lambda/cost-report/index.test.mjs — the SAME count and ticketIds through the JS predicate, so the performance card and the WM cannot disagree about what a fix ticket is"
+    ],
+    "cases": {
+      "LIN-3": "intake-planned legacy 'Fix:' (createdAt 10:10 < intake completion 10:15) — EXCLUDED; it is the work the run exists to do, not a rework loop. Its exclusion also keeps LIN-10/LIN-11 off the fix-induced branch (LIN-4.blockedBy cites LIN-3).",
+      "LIN-10": "codex_fix, spawnedBy + full contract, first fix at src/lib/intake.ts → new",
+      "LIN-11": "codex_fix, same origin, DIFFERENT line of the SAME cited path → resurfacing, round 2",
+      "LIN-12": "qa_fix, different path but the SAME invariant as LIN-10 (case/whitespace differ) → resurfacing",
+      "LIN-13": "ci_fix (a red build) → environmental, never resurfacing",
+      "LIN-14": "sync_fix (branch drifted from main) → environmental; shares ciTicketId with ci_fix but is its own round key",
+      "LIN-15": "ship_fix whose origin LIN-7 was blockedBy the earlier fix LIN-11, AND whose cited path repeats LIN-10's → fix-induced WINS over resurfacing (tag precedence)",
+      "LIN-16": "Re-verify (QA) @ abc1234 — qa_fix with reverify:true (a check re-run, not a redo)",
+      "LIN-17": "pre-contract, title only, names WorkflowBoard → new (first fix at that place)",
+      "LIN-18": "pre-contract, same PascalCase identifier in the title as LIN-17 → resurfacing, signal 'path' (the title is where a pre-contract run's location lives; its 0.80 title-slot Jaccard would also have caught it, but the stronger signal answers first)",
+      "LIN-19": "pre-contract, title only, no code-shaped token and Jaccard 0.0 against every earlier fix → new (the negative case that keeps the fallback honest)",
+      "LIN-21": "legacy 'Fix:' created AFTER intake completed → still counted, kind 'unknown'",
+      "LIN-22": "pre-contract, title names src/api/handler.ts → new",
+      "LIN-23": "pre-contract, title names the SAME file as LIN-22 but describes a different symptom (Jaccard 0.33, well under the 0.60 floor) → resurfacing, signal 'path'. This is the pair the title-Jaccard fallback alone cannot see.",
+      "LIN-24": "pre-contract, shares only the LOWERCASE word 'handler' with LIN-22/LIN-23 → new (a word is not a place)",
+      "LIN-25": "pre-contract, shares only the lowercase word 'handler' with LIN-24 → new (the negative that keeps title_paths from degrading into prose matching)",
+      "LIN-26": "pre-contract, no code-shaped token at all, 0.88 title-slot Jaccard against LIN-19 → resurfacing, signal 'title' (the fallback still fires when there is no path to be had)"
+    },
+    "expected": {
+      "count": 16,
+      "byKind": { "codex_fix": 3, "qa_fix": 9, "ci_fix": 1, "sync_fix": 1, "ship_fix": 1, "unknown": 1 },
+      "byTag": { "new": 8, "resurfacing": 5, "fix-induced": 1, "environmental": 2 }
+    }
+  },
+  "workflowId": "wf_fixlineage",
+  "workflowDefId": "software-delivery",
+  "epicId": "LIN-1",
+  "ticketProvider": "dynamodb",
+  "workflow": {
+    "id": "wf_fixlineage",
+    "startedAt": "2026-07-02T10:00:00.000Z",
+    "completedAt": "2026-07-02T16:00:00.000Z",
+    "phase": "ship",
+    "epicId": "LIN-1",
+    "humanNotifications": []
+  },
+  "tickets": [
+    {
+      "ticketId": "LIN-1",
+      "parentId": null,
+      "type": "epic",
+      "assignee": null,
+      "status": "done",
+      "title": "source validation rejects valid S3 and presigned-URL sources",
+      "createdAt": "2026-07-02T09:59:00.000Z",
+      "updatedAt": "2026-07-02T16:00:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-2",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_requirements_analyst",
+      "status": "done",
+      "title": "Triage: agentcore_hub_requirements_analyst — source validation",
+      "createdAt": "2026-07-02T10:00:00.000Z",
+      "updatedAt": "2026-07-02T10:15:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-3",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_bug_fixer",
+      "status": "done",
+      "title": "Fix: source validation rejects valid S3 sources (HeadObject surfacing, presigned GET check)",
+      "createdAt": "2026-07-02T10:10:00.000Z",
+      "updatedAt": "2026-07-02T10:40:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-4",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_code_reviewer",
+      "status": "done",
+      "title": "Review: source validation fix",
+      "createdAt": "2026-07-02T10:11:00.000Z",
+      "updatedAt": "2026-07-02T10:45:00.000Z",
+      "blockedBy": ["LIN-3"]
+    },
+    {
+      "ticketId": "LIN-5",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_qa_verifier",
+      "status": "done",
+      "title": "QA: verify source validation accepts s3:// and presigned GET",
+      "createdAt": "2026-07-02T10:12:00.000Z",
+      "updatedAt": "2026-07-02T10:50:00.000Z",
+      "blockedBy": ["LIN-4"]
+    },
+    {
+      "ticketId": "LIN-6",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_ci_agent",
+      "status": "done",
+      "title": "CI: validate build and tests for the source validation fix",
+      "createdAt": "2026-07-02T10:13:00.000Z",
+      "updatedAt": "2026-07-02T11:10:00.000Z",
+      "blockedBy": ["LIN-5"]
+    },
+    {
+      "ticketId": "LIN-7",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_release_manager",
+      "status": "done",
+      "title": "Ship: source validation fix",
+      "createdAt": "2026-07-02T10:14:00.000Z",
+      "updatedAt": "2026-07-02T15:00:00.000Z",
+      "blockedBy": ["LIN-6", "LIN-11"]
+    },
+    {
+      "ticketId": "LIN-10",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_backend_dev",
+      "status": "done",
+      "title": "Fix (review): intake.ts source validator — unbounded STS probe (1 finding)",
+      "createdAt": "2026-07-02T11:00:00.000Z",
+      "updatedAt": "2026-07-02T11:20:00.000Z",
+      "blockedBy": [],
+      "spawnedBy": { "kind": "codex_fix", "codexTicketId": "LIN-4" },
+      "fixContract": {
+        "version": 1,
+        "invariant": "The S3 probe is bounded by a 3s timeout",
+        "evidenceSource": "unit",
+        "evidenceRepro": "npx vitest run src/lib/workflow/intake.test.ts -t probe-timeout",
+        "citedLocation": ["src/lib/intake.ts:120-140"]
+      }
+    },
+    {
+      "ticketId": "LIN-11",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_backend_dev",
+      "status": "done",
+      "title": "Fix (review): the unbounded probe is still reachable through the presigned branch",
+      "createdAt": "2026-07-02T11:30:00.000Z",
+      "updatedAt": "2026-07-02T11:55:00.000Z",
+      "blockedBy": ["LIN-10"],
+      "spawnedBy": { "kind": "codex_fix", "codexTicketId": "LIN-4" },
+      "fixContract": {
+        "version": 1,
+        "invariant": "the presigned branch also bounds its probe",
+        "evidenceSource": "unit",
+        "evidenceRepro": "npx vitest run src/lib/workflow/intake.test.ts -t presigned-timeout",
+        "citedLocation": ["src/lib/intake.ts:210"]
+      }
+    },
+    {
+      "ticketId": "LIN-12",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_backend_dev",
+      "status": "done",
+      "title": "Fix (QA): start route returns 500 when the probe times out",
+      "createdAt": "2026-07-02T12:00:00.000Z",
+      "updatedAt": "2026-07-02T12:25:00.000Z",
+      "blockedBy": [],
+      "spawnedBy": { "kind": "qa_fix", "qaTicketId": "LIN-5" },
+      "fixContract": {
+        "version": 1,
+        "invariant": "the s3 probe   is bounded BY a 3s timeout",
+        "evidenceSource": "live",
+        "evidenceRepro": "POST /api/workflow/start with source s3://bucket/slow.md",
+        "citedLocation": ["src/app/api/workflow/start/route.ts:44"]
+      }
+    },
+    {
+      "ticketId": "LIN-13",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_backend_dev",
+      "status": "done",
+      "title": "Fix (CI): npm run test:unit is red on the feature head (gate-hardening.test.ts)",
+      "createdAt": "2026-07-02T12:30:00.000Z",
+      "updatedAt": "2026-07-02T12:40:00.000Z",
+      "blockedBy": [],
+      "spawnedBy": { "kind": "ci_fix", "ciTicketId": "LIN-6" }
+    },
+    {
+      "ticketId": "LIN-14",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_backend_dev",
+      "status": "done",
+      "title": "Fix (sync-main): merge origin/main into feature/LIN-1-source-validation",
+      "createdAt": "2026-07-02T12:45:00.000Z",
+      "updatedAt": "2026-07-02T12:50:00.000Z",
+      "blockedBy": [],
+      "spawnedBy": { "kind": "sync_fix", "ciTicketId": "LIN-6" }
+    },
+    {
+      "ticketId": "LIN-15",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_backend_dev",
+      "status": "done",
+      "title": "Fix (ship-review r1): intake.ts — the timeout guard rejects a valid 0-byte object",
+      "createdAt": "2026-07-02T13:00:00.000Z",
+      "updatedAt": "2026-07-02T13:20:00.000Z",
+      "blockedBy": [],
+      "spawnedBy": { "kind": "ship_fix", "shipTicketId": "LIN-7" },
+      "fixContract": {
+        "version": 1,
+        "invariant": "a 0-byte object still passes the probe",
+        "evidenceSource": "unit",
+        "evidenceRepro": "npx vitest run src/lib/workflow/intake.test.ts -t zero-byte",
+        "citedLocation": ["src/lib/intake.ts:305"]
+      }
+    },
+    {
+      "ticketId": "LIN-16",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_qa_verifier",
+      "status": "done",
+      "title": "Re-verify (QA): LIN-12 — re-run the live probe against the current head @ abc1234",
+      "createdAt": "2026-07-02T13:30:00.000Z",
+      "updatedAt": "2026-07-02T13:45:00.000Z",
+      "blockedBy": [],
+      "spawnedBy": {
+        "kind": "qa_fix",
+        "qaTicketId": "LIN-5",
+        "reverify": true,
+        "rearmOf": "LIN-12",
+        "headSha": "abc1234"
+      }
+    },
+    {
+      "ticketId": "LIN-17",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_frontend_dev",
+      "status": "done",
+      "title": "Fix (QA): WorkflowBoard sources list renders undefined when input.sources is absent",
+      "createdAt": "2026-07-02T14:00:00.000Z",
+      "updatedAt": "2026-07-02T14:20:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-18",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_frontend_dev",
+      "status": "done",
+      "title": "Fix (QA): WorkflowBoard sources list still renders undefined when input.sources absent",
+      "createdAt": "2026-07-02T14:30:00.000Z",
+      "updatedAt": "2026-07-02T14:50:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-19",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_frontend_dev",
+      "status": "done",
+      "title": "Fix (QA): telemetry dashboard token chart mislabels the cache column",
+      "createdAt": "2026-07-02T15:00:00.000Z",
+      "updatedAt": "2026-07-02T15:15:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-21",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_backend_dev",
+      "status": "done",
+      "title": "Fix: flaky pricing unit test",
+      "createdAt": "2026-07-02T15:30:00.000Z",
+      "updatedAt": "2026-07-02T15:40:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-22",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_backend_dev",
+      "status": "done",
+      "title": "Fix (QA): src/api/handler.ts — the 404 branch returns an empty body",
+      "createdAt": "2026-07-02T15:35:00.000Z",
+      "updatedAt": "2026-07-02T15:38:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-23",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_backend_dev",
+      "status": "done",
+      "title": "Fix (review): src/api/handler.ts — timeouts are reported as 200",
+      "createdAt": "2026-07-02T15:40:00.000Z",
+      "updatedAt": "2026-07-02T15:44:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-24",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_frontend_dev",
+      "status": "done",
+      "title": "Fix (QA): the handler for a cancelled run leaves the board spinning",
+      "createdAt": "2026-07-02T15:45:00.000Z",
+      "updatedAt": "2026-07-02T15:48:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-25",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_frontend_dev",
+      "status": "done",
+      "title": "Fix (QA): the handler cache is never invalidated after a rename",
+      "createdAt": "2026-07-02T15:50:00.000Z",
+      "updatedAt": "2026-07-02T15:53:00.000Z",
+      "blockedBy": []
+    },
+    {
+      "ticketId": "LIN-26",
+      "parentId": "LIN-1",
+      "type": "task",
+      "assignee": "agentcore_hub_frontend_dev",
+      "status": "done",
+      "title": "Fix (QA): telemetry dashboard token chart still mislabels the cache column",
+      "createdAt": "2026-07-02T15:55:00.000Z",
+      "updatedAt": "2026-07-02T15:58:00.000Z",
+      "blockedBy": []
+    }
+  ],
+  "events": [
+    {
+      "workflowId": "wf_fixlineage",
+      "eventId": "000001",
+      "type": "workflow.phase_change",
+      "timestamp": "2026-07-02T10:05:00.000Z",
+      "detail": { "phase": "development", "workflowId": "wf_fixlineage" }
+    },
+    {
+      "workflowId": "wf_fixlineage",
+      "eventId": "000002",
+      "type": "ticket.created",
+      "timestamp": "2026-07-02T10:10:00.000Z",
+      "detail": {
+        "workflowId": "wf_fixlineage",
+        "ticket": {
+          "id": "LIN-3",
+          "title": "Fix: source validation rejects valid S3 sources (HeadObject surfacing, presigned GET check)",
+          "status": "todo",
+          "assignee": "agentcore_hub_bug_fixer",
+          "parent": "LIN-1",
+          "type": "task"
+        }
+      }
+    },
+    {
+      "workflowId": "wf_fixlineage",
+      "eventId": "000003",
+      "type": "workflow.report_completion",
+      "timestamp": "2026-07-02T10:15:00.000Z",
+      "detail": {
+        "workflowId": "wf_fixlineage",
+        "ticketId": "LIN-2",
+        "agentId": "agentcore_hub_requirements_analyst"
+      }
+    },
+    {
+      "workflowId": "wf_fixlineage",
+      "eventId": "000004",
+      "type": "agent.complete",
+      "timestamp": "2026-07-02T10:16:00.000Z",
+      "detail": {
+        "workflowId": "wf_fixlineage",
+        "ticketId": "LIN-2",
+        "agentId": "agentcore_hub_requirements_analyst"
+      }
+    },
+    {
+      "workflowId": "wf_fixlineage",
+      "eventId": "000005",
+      "type": "agent.complete",
+      "timestamp": "2026-07-02T10:45:00.000Z",
+      "detail": {
+        "workflowId": "wf_fixlineage",
+        "ticketId": "LIN-4",
+        "agentId": "agentcore_hub_code_reviewer"
+      }
+    },
+    {
+      "workflowId": "wf_fixlineage",
+      "eventId": "000006",
+      "type": "agent.complete",
+      "timestamp": "2026-07-02T10:50:00.000Z",
+      "detail": {
+        "workflowId": "wf_fixlineage",
+        "ticketId": "LIN-5",
+        "agentId": "agentcore_hub_qa_verifier"
+      }
+    },
+    {
+      "workflowId": "wf_fixlineage",
+      "eventId": "000007",
+      "type": "ticket.created",
+      "timestamp": "2026-07-02T11:00:00.000Z",
+      "detail": {
+        "workflowId": "wf_fixlineage",
+        "ticket": {
+          "id": "LIN-10",
+          "title": "Fix (review): intake.ts source validator — unbounded STS probe (1 finding)",
+          "status": "todo",
+          "assignee": "agentcore_hub_backend_dev",
+          "parent": "LIN-1",
+          "type": "task"
+        }
+      }
+    },
+    {
+      "workflowId": "wf_fixlineage",
+      "eventId": "000008",
+      "type": "agent.complete",
+      "timestamp": "2026-07-02T11:10:00.000Z",
+      "detail": {
+        "workflowId": "wf_fixlineage",
+        "ticketId": "LIN-6",
+        "agentId": "agentcore_hub_ci_agent"
+      }
+    },
+    {
+      "workflowId": "wf_fixlineage",
+      "eventId": "000009",
+      "type": "ticket.created",
+      "timestamp": "2026-07-02T12:30:00.000Z",
+      "detail": {
+        "workflowId": "wf_fixlineage",
+        "ticket": {
+          "id": "LIN-13",
+          "title": "Fix (CI): npm run test:unit is red on the feature head (gate-hardening.test.ts)",
+          "status": "todo",
+          "assignee": "agentcore_hub_backend_dev",
+          "parent": "LIN-1",
+          "type": "task"
+        }
+      }
+    },
+    {
+      "workflowId": "wf_fixlineage",
+      "eventId": "000010",
+      "type": "workflow.phase_change",
+      "timestamp": "2026-07-02T14:55:00.000Z",
+      "detail": { "phase": "ship", "workflowId": "wf_fixlineage" }
+    },
+    {
+      "workflowId": "wf_fixlineage",
+      "eventId": "000011",
+      "type": "agent.complete",
+      "timestamp": "2026-07-02T15:00:00.000Z",
+      "detail": {
+        "workflowId": "wf_fixlineage",
+        "ticketId": "LIN-7",
+        "agentId": "agentcore_hub_release_manager"
+      }
+    }
+  ],
+  "streamCounts": {},
+  "completions": {},
+  "artifacts": [],
+  "evalSummaries": [],
+  "priorAnalyses": [],
+  "missingSignals": []
+}

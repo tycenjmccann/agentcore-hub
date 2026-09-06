@@ -119,7 +119,14 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
   };
 }
 
-async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id }) {
+// TEAM-4121 FR-9 — how the agent knows the work is done. "live" is the one the
+// orchestrator acts on (live-reverify.mjs): a fix that claimed live evidence and
+// closed without it is re-verified at the PR head. Anything else is dropped
+// rather than stored, so a downstream reader never has to guess what a novel
+// value meant.
+const EVIDENCE_KINDS = ["static", "unit", "live"];
+
+async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys }) {
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -130,6 +137,15 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     pr_url: pr_url || null,
     completed_at: new Date().toISOString(),
   };
+  // Additive and only when supplied: a record written without them keeps exactly
+  // the pre-4121 key set, so every existing consumer is unaffected.
+  const kind = typeof evidence_kind === "string" ? evidence_kind.trim().toLowerCase() : "";
+  if (kind) {
+    if (EVIDENCE_KINDS.includes(kind)) report.evidence_kind = kind;
+    else console.warn(`[report_completion] dropping unknown evidence_kind "${kind}" (expected ${EVIDENCE_KINDS.join("|")})`);
+  }
+  const keys = typeof evidence_keys === "string" ? evidence_keys.trim() : Array.isArray(evidence_keys) ? evidence_keys.join(",") : "";
+  if (keys) report.evidence_keys = keys;
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,

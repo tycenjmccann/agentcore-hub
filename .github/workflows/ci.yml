@@ -53,6 +53,14 @@ jobs:
       - name: Workflow-table write guard
         run: ./scripts/check-workflow-writes.sh
 
+      # TEAM-4121 FR-8: the fix-kind set is duplicated across two ticket Lambdas,
+      # the orchestrator, types.ts and main.py (none can import the others). A
+      # kind forgotten in one place fails silently — the completion gate stops
+      # waiting on that fix, or the harness drops its origin id. Also byte-compares
+      # the three fix-contract.mjs copies.
+      - name: Fix-kinds parity guard
+        run: ./scripts/check-fix-kinds-parity.sh
+
       # Every lambda/* and deploy/* surface must be in the pipeline's deploy
       # manifest (deploy/pipeline/surfaces.json) — or explicitly handoff/excluded —
       # otherwise merged code never reaches prod and drifts behind main.

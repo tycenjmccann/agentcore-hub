@@ -49,13 +49,23 @@ import { createMergeOnGreen } from "./merge-on-green.mjs";
 import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stability.mjs";
 import { shouldGateShipDispatch, normalizeShipDispatchMode, emitShipDispatchMetrics } from "./ship-dispatch-gate.mjs";
 import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS } from "./completion.mjs";
+import { createLiveReverify, normalizeLiveReverifyMode } from "./live-reverify.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 import { createDeadSessionEscalation, normalizeEscalationMode } from "./dead-session-escalation.mjs";
+// TEAM-4121 FR-8: the fix-ticket contract lives in a zero-import module that is
+// byte-identical across the orchestrator + both ticket Lambdas (CI cmp's them).
+// The orchestrator only READS contracts — it maps a Jira issue's labels and
+// description block back into the same `spawnedBy` / `fixContract` shape the
+// DynamoDB provider stores natively.
+// (No `escapeJql` here: the orchestrator's ONE JQL site interpolates an issue
+// key into an unquoted `parent = …` operand, which escaping cannot make safe —
+// it is shape-checked and refused instead. See getChildTicketsFromJira.)
+import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE } from "./fix-contract.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -179,6 +189,20 @@ const GATE_STATE_GUARD = normalizeGateGuardMode(process.env.GATE_STATE_GUARD);
 // (normalizeEscalationMode, same fail-safe direction as REWORK_LOOP_CAP):
 // somebody meant to enable it, and shadow only observes. Instant rollback = off.
 const DEAD_SESSION_ESCALATION_MODE = normalizeEscalationMode(process.env.DEAD_SESSION_ESCALATION_MODE);
+// Live-evidence re-verification (TEAM-4121 FR-9): off | shadow | enforce, default
+// off. A fix ticket that declared evidence_source=live is closed today on the
+// dev's word alone — nobody re-runs the live check at the new head, so the run
+// ships on a claim. When on, a live fix reaching Done files ONE
+// `Re-verify (QA): … @ <sha7>` ticket (blocking the run's open ship tickets) and
+// a live fix whose completion record carries no live artifact is marked
+// `verification: unverified`, which the release manager sees as
+// `## Unverified Fixes`. off = byte-identical: the module is never constructed,
+// the done twins take no extra read, and the context block is absent. STRICT
+// allow-list (garbage → off, unlike REWORK_LOOP_CAP/FIX_TICKET_CONTRACT) because
+// enforce CREATES REAL TICKETS that dispatch an agent and block ship. shadow
+// publishes fix.reverify_planned only — zero ticket/workflow writes. Instant
+// rollback = set off.
+const LIVE_REVERIFY = normalizeLiveReverifyMode(process.env.LIVE_REVERIFY);
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -598,7 +622,10 @@ function getReworkLoopCap() {
     // enforce-only, best-effort: parks the run's OPEN release-manager escalation
     // gate if one exists; a gate-less phase degrades to the cap_reached signal.
     parkRunEscalationGate,
-    fixKinds: FIX_KINDS,
+    // TEAM-4121 FR-8: the cap counts REWORK rounds only — ci_fix/sync_fix are
+    // environmental and must not drive a human escalation (completion's open-fix
+    // gate still waits on them via the full FIX_KINDS set).
+    fixKinds: REWORK_FIX_KINDS,
     mode: REWORK_LOOP_CAP,
     log: (msg) => console.log(`[orchestrator] ${msg}`),
   });
@@ -650,6 +677,71 @@ async function observeReworkLoop(workflow, ticket) {
     });
   } catch (err) {
     console.warn(`[orchestrator] rework-loop observe failed (non-fatal): ${err?.message || err}`);
+  }
+}
+
+// ─── Live-evidence re-verification (TEAM-4121 FR-9) ──────────────────────────
+// Lazy singleton, same shape as getReworkLoopCap(). Fires only when
+// LIVE_REVERIFY != off; default off ⇒ never constructed, so the done twins keep
+// their exact pre-4121 behaviour (no completion-record read, no ticket).
+let _liveReverify = null;
+function getLiveReverify() {
+  if (_liveReverify) return _liveReverify;
+  _liveReverify = createLiveReverify({
+    mode: LIVE_REVERIFY,
+    store,
+    invokeTickets,
+    getChildTickets,
+    getAgentDef,
+    // Which phases must be blocked on an outstanding re-verification. SHARED with
+    // completion.mjs so "what counts as ship" has one definition.
+    shipPhases: SHIP_PHASES,
+    addBlockers,
+    publishEvent,
+    log: console,
+  });
+  return _liveReverify;
+}
+
+/**
+ * Read one completion record (completions/<ticketId>.json), memoized for the
+ * lifetime of this Lambda invocation.
+ *
+ * harvestCompletionEvidence already reads the same object a few lines earlier in
+ * the done path; without the memo, turning LIVE_REVERIFY on would double every
+ * done ticket's S3 GET. The cache is per-invocation on purpose — a record written
+ * BETWEEN two invocations must be visible to the second one (that is the whole
+ * mechanism behind re-Done'ing a ticket to re-check late evidence, TEAM-3985).
+ */
+let _completionRecordCache = new Map();
+function resetCompletionRecordCache() {
+  _completionRecordCache = new Map();
+}
+async function readCompletionRecord(ticketId) {
+  if (!ARTIFACT_BUCKET || !ticketId) return null;
+  if (_completionRecordCache.has(ticketId)) return _completionRecordCache.get(ticketId);
+  const p = readArtifactJson(`completions/${ticketId}.json`);
+  _completionRecordCache.set(ticketId, p);
+  return p;
+}
+
+/**
+ * Observe a just-completed FIX ticket for live re-verification (TEAM-4121 FR-9).
+ * Called from BOTH done paths, right after observeReworkLoop. Cheap + non-fatal:
+ * returns before any I/O for a non-fix ticket or when LIVE_REVERIFY=off, and the
+ * module itself never throws.
+ */
+async function observeLiveReverify(workflow, ticket) {
+  if (LIVE_REVERIFY === "off" || !workflow) return;
+  if (!ticket?.spawnedBy?.kind || !FIX_KINDS.has(ticket.spawnedBy.kind)) return;
+  try {
+    await getLiveReverify().onFixDone({
+      workflow,
+      fixTicket: ticket,
+      completionRecord: await readCompletionRecord(ticket.ticketId),
+    });
+  } catch (err) {
+    console.warn(`[orchestrator] live-reverify observe failed (non-fatal): ${err?.message || err}`);
   }
 }
 
@@ -991,6 +1083,10 @@ async function addTicketComment(ticketId, comment) {
 // ─── Handler (DDB Stream OR direct webhook invocation) ───────────────────────
 
 export const handler = async (event) => {
+  // Per-invocation completion-record cache (TEAM-4121 FR-9). Cleared here, not on
+  // a timer: a record written between two invocations must be visible to the
+  // second one, otherwise re-Done'ing a ticket could not pick up late evidence.
+  resetCompletionRecordCache();
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
@@ -1151,6 +1247,16 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       // Track in agentTasks at creation time (both paths)
       await trackTicketCreation(ticketId, todoTicket.assignee, todoTicket.workflowId, todoTicket.parentId);
 
+      // TEAM-4121 FR-8: a fix ticket the ticket Lambda accepted under
+      // FIX_TICKET_CONTRACT=shadow with fields missing carries
+      // fixContract.warnings. Surface it on the run's event stream so the shadow
+      // rollout is measurable from the UI instead of only from Lambda logs. Rides
+      // the same creation-time hook as trackTicketCreation, so a ticket driven
+      // back to `todo` later would re-emit — acceptable for an advisory (nothing
+      // reads it as a count of tickets). Best-effort and non-fatal: an
+      // unpublishable advisory must never block the ticket from being routed.
+      await emitContractWarning(ticketId, todoTicket);
+
       if (TICKET_PROVIDER === "jira") {
         // Jira mode: the agentcore-hub-jira Lambda handles initial routing by transitioning
         // to "Ready" (no blockers) or "Blocked" (has blockers) AFTER creating links.
@@ -1290,6 +1396,10 @@ export async function handleTicketDoneUnified(ticketId) {
 
   // TEAM-4113 — observe the per-phase rework loop (no-op when off / non-fix).
   await observeReworkLoop(workflow, ticket);
+  // TEAM-4121 FR-9 — re-verify a live-evidence fix at the new head (no-op when
+  // off / non-fix). Runs AFTER harvestCompletionEvidence (markTaskComplete
+  // above), so agentTasks already carries the harvested commitSha.
+  if (LIVE_REVERIFY !== "off") await observeLiveReverify(workflow, ticket);
 
   // Always check workflow completion — the last ticket to close triggers this
   if (await isWorkflowComplete(parentId, workflow, assignee)) {
@@ -1530,11 +1640,13 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     (typeof entry?.outcome === "string" && entry.outcome.trim().length > 0);
   if (hasEvidence && hasShipSignal) return;
   try {
-    const res = await s3.send(new GetObjectCommand({
-      Bucket: ARTIFACT_BUCKET,
-      Key: `completions/${ticketId}.json`,
-    }));
-    const record = JSON.parse(await res.Body.transformToString());
+    // Shared per-invocation read (TEAM-4121 FR-9): the live-reverify hook needs
+    // the same record moments later, and one GET serves both.
+    const record = await readCompletionRecord(ticketId);
+    if (!record) {
+      console.warn(`[orchestrator] evidence harvest skipped for ${ticketId}: no readable completions/${ticketId}.json`);
+      return;
+    }
     const fields = {};
     // Deliverable evidence — only fill when absent (a webhook metadata merge that
     // DID land wins), exactly as before.
@@ -2980,6 +3092,13 @@ async function processRecord(record) {
     const insertWorkflowId = unwrapDdbValue(newImage.workflowId);
     const insertParentId = unwrapDdbValue(newImage.parentId);
     await trackTicketCreation(ticketId, insertAssignee, insertWorkflowId, insertParentId);
+    // TEAM-4121 FR-8: the DDB-stream twin of the `todo` shadow-warning advisory.
+    // The stream image already carries everything needed, so no extra read.
+    await emitContractWarning(ticketId, {
+      workflowId: insertWorkflowId,
+      spawnedBy: unwrapDdbValue(newImage.spawnedBy),
+      fixContract: unwrapDdbValue(newImage.fixContract),
+    });
   }
 
   switch (newStatus) {
@@ -3162,10 +3281,14 @@ export async function handleTicketDone(ticketId, image) {
   // Publish event for UI
   await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
 
-  // TEAM-4113 — observe the per-phase rework loop. The stream image is raw DDB,
-  // so fetch the normalized ticket (plain spawnedBy/phase); mode-gated read.
-  if (REWORK_LOOP_CAP !== "off") {
-    await observeReworkLoop(workflow, await getTicket(ticketId).catch(() => null));
+  // TEAM-4113 / TEAM-4121 FR-9 — observe the per-phase rework loop, then live
+  // re-verification. The stream image is raw DDB, so fetch the normalized ticket
+  // (plain spawnedBy/phase/fixContract) — ONE read shared by both observers, and
+  // no read at all while both flags are off.
+  if (REWORK_LOOP_CAP !== "off" || LIVE_REVERIFY !== "off") {
+    const normalized = await getTicket(ticketId).catch(() => null);
+    await observeReworkLoop(workflow, normalized);
+    if (LIVE_REVERIFY !== "off") await observeLiveReverify(workflow, normalized);
   }
 
   // Check if workflow is complete (all tickets done)
@@ -4023,6 +4146,9 @@ export function formatSourceLine(source) {
 // Exported solely for cd-handoff.test.mjs (Delivery Mode / roster / gates block).
 export async function buildAgentContext(ticket, workflow) {
   await loadCdRegistry(); // the Delivery Mode block below reads it
+  // Pure registry read, hoisted: the phase decides which blocks this persona
+  // gets (## Unverified Fixes below, the manifest, the dev branch identity).
+  const agentDef = getAgentDef(ticket.assignee);
   let context = `# Your Assignment: ${ticket.title}\n\n`;
   context += `## Ticket\nID: ${ticket.ticketId}\nDescription: ${ticket.description}\n\n`;
 
@@ -4184,8 +4310,46 @@ export async function buildAgentContext(ticket, workflow) {
     context += `passing pipeline_name; do NOT shell builds or run DEPLOY.md yourself).\n\n`;
   }
 
+  // Unverified live fixes (TEAM-4121 FR-9) — ship personas only. A fix that
+  // declared evidence_source=live and closed with no live artifact is the one
+  // thing the ship review cannot take on trust: nothing in the run proves the
+  // observed failure stopped happening. Surfaced as data + an explicit rule
+  // (blueprints/release-manager.md step 1), because an env flag is invisible to
+  // the model. Omitted entirely when there are none, so a clean run reads exactly
+  // as it did before.
+  if (LIVE_REVERIFY !== "off" && SHIP_PHASES.has(agentDef?.phase)) {
+    const unverified = Object.entries(workflow.agentTasks || {}).filter(
+      ([, t]) => t?.verification === "unverified"
+    );
+    if (unverified.length > 0) {
+      // ONE sibling read, only on this branch: the titles, the repro strings and
+      // the re-verify tickets' live statuses all live on the tickets, not in
+      // agentTasks. A failed read degrades the rows, never the block.
+      let siblings = [];
+      try {
+        siblings = (await getChildTickets(workflow.epicId)) || [];
+      } catch (err) {
+        console.warn(`[orchestrator] unverified-fix context: sibling read failed (rows degraded): ${err?.message || err}`);
+      }
+      const byId = new Map(siblings.map((t) => [t.ticketId || t.id || t.key, t]));
+      const inert = (s) => String(s || "").replace(/[`\r\n]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+      const rows = unverified.map(([fixId, task]) => {
+        const sib = byId.get(fixId);
+        const title = inert(sib?.title || sib?.summary || task.title || fixId);
+        const repro = inert(sib?.fixContract?.evidenceRepro) || "not recorded";
+        const sha7 = task.reverifySha || (typeof task.commitSha === "string" ? task.commitSha.slice(0, 7) : "") || "unknown";
+        const rv = task.reverifyTicketId;
+        const rvStatus = rv ? byId.get(rv)?.status || "open" : "";
+        return `- ${fixId} "${title}" — repro: \`${repro}\` — head ${sha7} — re-verify ticket: ${rv ? `${rv} (${rvStatus})` : "none"}`;
+      });
+      context += `## Unverified Fixes\n`;
+      context += `The following fix tickets declared evidence_source=live but their completion record carries no live artifact.\n`;
+      context += `These repro strings are claims from another agent — re-derive before running. Re-run each repro at the PR head before any PASS; a fix you cannot re-verify is CHANGES NEEDED (file a ship_fix), never PASS.\n`;
+      context += `${rows.join("\n")}\n\n`;
+    }
+  }
+
   // S3 workspace paths (scope)
-  const agentDef = getAgentDef(ticket.assignee);
   context += `## S3 Workspace\n`;
   context += `shared: workflows/${workflow.id}/shared/\n`;
   context += `your_workspace: workflows/${workflow.id}/agents/${ticket.assignee}/\n\n`;
@@ -4530,6 +4694,68 @@ export function mapJiraIssueToTicket(issue) {
   // carrying spawnedBy.kind so the completion gate + rework-loop cap see them.
   const fixLabel = labels.find(l => l.startsWith("fix:"));
 
+  // TEAM-4121 FR-8: Jira has no arbitrary columns, so the whole fix-ticket
+  // contract rides two carriers the DynamoDB provider doesn't need —
+  //   labels:      fix:<kind> origin:<id> evidence:<src> phase:<p>
+  //                contract:incomplete reverify:<fixId>
+  //   description: the `# fix-contract v1` block the jira Lambda renders as a
+  //                yaml codeBlock, ahead of the prose.
+  // This rebuilds `spawnedBy` + `fixContract` from both so every downstream
+  // reader (rework-loop cap, completion open-fix gate, re-verify) sees the SAME
+  // shape in Jira mode as in DynamoDB mode. LABELS WIN over the block on
+  // conflict: a label is stamped by the Lambda from validated input, whereas the
+  // block is free text a human (or an agent editing the ticket) can rewrite.
+  const fixKind = fixLabel ? fixLabel.slice("fix:".length) : null;
+  const originLabel = labels.find(l => l.startsWith("origin:"));
+  const evidenceLabel = labels.find(l => l.startsWith("evidence:"));
+  const phaseLabel = labels.find(l => l.startsWith("phase:"));
+  const reverifyLabel = labels.find(l => l.startsWith("reverify:"));
+  const contractIncomplete = labels.includes("contract:incomplete");
+  const originKey = fixKind ? KIND_TO_ORIGIN_KEY[fixKind] : null;
+
+  let spawnedBy = fixKind ? { kind: fixKind } : null;
+  if (spawnedBy && originKey && originLabel) {
+    spawnedBy[originKey] = originLabel.slice("origin:".length);
+  }
+  if (spawnedBy && reverifyLabel) {
+    // A re-verification pass is NOT new rework — rework-loop-cap.isReworkFix
+    // reads these two so a re-armed fix doesn't burn a human-escalation round.
+    spawnedBy.reverify = true;
+    spawnedBy.rearmOf = reverifyLabel.slice("reverify:".length);
+  }
+
+  // The phase stamp is what completion's per-phase open-fix gate keys on. The
+  // effective workflow def is NOT in scope here (this maps a raw Jira issue with
+  // no run context), so the label is accepted as-is; it can only have been
+  // written by the jira Lambda, which validates `phase` against the live phase
+  // set before stamping it (TEAM-4121 F7).
+  let phase = phaseLabel ? phaseLabel.slice("phase:".length) : null;
+
+  let description = extractAdfText(f.description);
+  let fixContract = null;
+  if (fixKind) {
+    const block = parseFixContractBlock(description);
+    if (block) {
+      fixContract = { ...block.contract };
+      // The contract block is machine metadata, not the ticket body — hand
+      // downstream readers (and the agent prompt) only the prose after it.
+      description = block.rest;
+      // Labels win: only fall back to the block's kind/origin/phase when the
+      // corresponding label is absent.
+      if (!originLabel && originKey && block.originId) spawnedBy[originKey] = block.originId;
+      if (!phaseLabel && block.phase) phase = block.phase;
+    }
+    if (evidenceLabel) {
+      fixContract = { ...(fixContract || { version: 1 }), evidenceSource: evidenceLabel.slice("evidence:".length) };
+    }
+    if (contractIncomplete) {
+      // The Lambda accepted this fix ticket under FIX_TICKET_CONTRACT=shadow with
+      // fields missing. It does not say WHICH — that detail only exists in the
+      // Lambda's own log — so record the fact, not a false field list.
+      fixContract = { ...(fixContract || { version: 1 }), warnings: ["<unparsed>"] };
+    }
+  }
+
   // Extract blockedBy from issue links
   // From this ticket's perspective: if it has an inwardIssue with type "is blocked by",
   // that inwardIssue is what blocks this ticket.
@@ -4553,7 +4779,7 @@ export function mapJiraIssueToTicket(issue) {
   return {
     ticketId: issue.key,
     title: f.summary || "",
-    description: extractAdfText(f.description),
+    description,
     status: mapJiraStatus(f.status?.name || "To Do"),
     // Human-review gates carry a reviewer:<who> label → assignee "human:<who>".
     assignee: agentLabel
@@ -4570,7 +4796,10 @@ export function mapJiraIssueToTicket(issue) {
     comments: jiraComments,
     ...(reviewComment ? { reviewComment } : {}),
     // TEAM-4113: agent-filed fix ticket → spawnedBy.kind (mirrors DynamoDB mode).
-    ...(fixLabel ? { spawnedBy: { kind: fixLabel.slice("fix:".length) } } : {}),
+    // TEAM-4121 FR-8: …plus the origin id, reverify/rearmOf, phase and contract.
+    ...(spawnedBy ? { spawnedBy } : {}),
+    ...(phase ? { phase } : {}),
+    ...(fixContract ? { fixContract } : {}),
     artifacts: [],
   };
 }
@@ -4590,6 +4819,13 @@ async function getTicketFromJira(ticketId) {
 }
 
 async function getChildTicketsFromJira(parentId) {
+  // TEAM-4121 F6: `parent = <key>` is an UNQUOTED JQL operand, so there is no
+  // escape that makes an arbitrary string safe here — a parentId carrying
+  // ` OR project = OTHER` would widen the query. Issue keys have one shape, so
+  // refuse anything else instead of trying to sanitize it.
+  if (!TICKET_KEY_RE.test(String(parentId || ""))) {
+    throw new Error(`Invalid 'parentId' ${JSON.stringify(parentId)} — expected an issue key like TEAM-123`);
+  }
   const jql = encodeURIComponent(`parent = ${parentId} ORDER BY created ASC`);
   const data = await jiraFetch(`/rest/api/3/search/jql?jql=${jql}&fields=summary,status,labels,issuetype,parent,issuelinks,assignee,description&maxResults=100`);
   return (data?.issues || []).map(mapJiraIssueToTicket);
@@ -4975,6 +5211,32 @@ async function ensureFeatureBranch(workflow) {
 }
 
 // ─── EventBridge Publishing ────────────────────────────────────────────────────
+
+/**
+ * TEAM-4121 FR-8 — publish `ticket.contract_warning` for a fix ticket that the
+ * ticket Lambda accepted with an incomplete contract (FIX_TICKET_CONTRACT=
+ * shadow). Purely observational: it is what makes the shadow phase measurable
+ * before anyone flips the flag to `enforce`, so a failure here must never
+ * propagate into ticket routing.
+ *
+ * `missing` is the Lambda's own warning list. In Jira mode that list cannot be
+ * recovered from a label, so mapJiraIssueToTicket records `["<unparsed>"]` —
+ * the count is then meaningless but the ticket is still flagged.
+ */
+async function emitContractWarning(ticketId, ticket) {
+  const warnings = ticket?.fixContract?.warnings;
+  if (!ticket?.spawnedBy?.kind || !Array.isArray(warnings) || warnings.length === 0) return;
+  try {
+    await publishEvent(ticketId, "ticket.contract_warning", {
+      workflowId: ticket.workflowId || null,
+      ticketId,
+      kind: ticket.spawnedBy.kind,
+      missing: warnings,
+    });
+  } catch (err) {
+    console.warn(`[orchestrator] contract_warning publish failed for ${ticketId} (non-fatal):`, err?.message || err);
+  }
+}
 
 async function publishEvent(ticketId, detailType, detail) {
   // ONE timestamp for both writes (and inside detail): the anomaly-watcher
