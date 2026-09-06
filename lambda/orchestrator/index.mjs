@@ -636,6 +636,12 @@ function syncDeps() {
     addBlockers,
     publishEvent,
     getAgentDef,
+    // TEAM-4131 F1: sync-main must never block CI on a fix ticket that is already
+    // closed. getTicketConsistent, not getTicket — this decides whether a blocker
+    // edge is about to point at a corpse, so the eventually-consistent snapshot is
+    // exactly the wrong read. Both syncBeforeCi call sites (the unified ready path
+    // and the DDB ready path) share this one memoized object.
+    getTicketStatus: async (id) => (await getTicketConsistent(id))?.status ?? null,
     now: () => new Date(),
     mode: SYNC_MAIN_BEFORE_CI,
     log: console,
@@ -3239,7 +3245,14 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   if (SYNC_MAIN_BEFORE_CI !== "off" && agentDef?.agentId === CI_AGENT_ID && workflow.featureBranch) {
     const sync = await syncBeforeCi(workflow, ticket, syncDeps());
     if (sync.outcome === "conflict") {
-      console.log(`[orchestrator] ${ticketId} held: ${workflow.featureBranch} cannot merge the default branch — blocked on ${sync.fixTicketId}`);
+      // TEAM-4131 F1: reason "round_cap" has NO fix ticket by design (the run is
+      // parked for a human), so do not claim it is blocked on one.
+      console.log(
+        `[orchestrator] ${ticketId} held: ${workflow.featureBranch} cannot merge the default branch — ` +
+        (sync.fixTicketId
+          ? `blocked on ${sync.fixTicketId}`
+          : `PARKED for a human after ${sync.round ?? "?"} sync_fix round(s) (${sync.reason || "conflict"})`)
+      );
       return;
     }
   }
@@ -3673,7 +3686,14 @@ async function handleTicketReady(ticketId, image) {
   if (SYNC_MAIN_BEFORE_CI !== "off" && agentDef?.agentId === CI_AGENT_ID && workflow.featureBranch) {
     const sync = await syncBeforeCi(workflow, ticket, syncDeps());
     if (sync.outcome === "conflict") {
-      console.log(`[orchestrator] ${ticketId} held: ${workflow.featureBranch} cannot merge the default branch — blocked on ${sync.fixTicketId}`);
+      // TEAM-4131 F1: reason "round_cap" has NO fix ticket by design (the run is
+      // parked for a human), so do not claim it is blocked on one.
+      console.log(
+        `[orchestrator] ${ticketId} held: ${workflow.featureBranch} cannot merge the default branch — ` +
+        (sync.fixTicketId
+          ? `blocked on ${sync.fixTicketId}`
+          : `PARKED for a human after ${sync.round ?? "?"} sync_fix round(s) (${sync.reason || "conflict"})`)
+      );
       return;
     }
   }

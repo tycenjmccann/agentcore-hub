@@ -298,28 +298,53 @@ export function normalizeAdvisoryRoutingMode(v) {
   return String(v || "").trim().toLowerCase() === "enforce" ? "enforce" : "off";
 }
 
+const isDone = (t) => t.status === "done";
+const isOpen = (t) => t.status !== "done" && t.status !== "cancelled";
+const isHuman = (a) => typeof a === "string" && a.startsWith("human:");
+
+/**
+ * TEAM-4131 F2 — the ticket shapes that can NEVER be advisory, whatever their
+ * labels say.
+ *
+ * `advisory` means "backlog this run does not wait on", so under enforce the
+ * label removes a child from every gate below. On a FIX ticket that is a bypass
+ * of the exact gate the fix exists to hold: `labels: ["advisory"]` on a real
+ * qa_fix let the run finalize with the fix open. The label reaches a ticket
+ * through create_ticket's user-supplied `labels`, which any persona (or a
+ * prompt-injected one) can set, and main.py exposes `labels` to all of them.
+ *
+ * fix-contract.mjs now refuses to STORE the word on these shapes, which is the
+ * write-side half. This is the read-side half, and it is the one that must hold:
+ * it covers tickets stored before that guard existed, a hand-edited board, and
+ * any future writer that forgets to pass the ticket shape to sanitizeUserLabels.
+ * A human gate is included for the same reason — being waited on is its entire
+ * function.
+ */
+export function advisoryNeverApplies(t) {
+  if (t?.spawnedBy && FIX_KINDS.has(t.spawnedBy.kind)) return true;
+  return isHuman(t?.assignee);
+}
+
 /**
  * Is this ticket ADVISORY — filed as backlog that the run does not wait on? The
  * marker is the literal label `advisory` (case- and whitespace-insensitive, but
  * an EXACT word: "advisory-ish" is not advisory), written by the requirements
  * analyst / release manager through create_ticket's `labels` param. Anything
  * that is not an array of labels is simply not advisory.
+ *
+ * A fix ticket or a human gate is never advisory no matter what it is labelled
+ * (advisoryNeverApplies, TEAM-4131 F2).
  */
 export function isAdvisoryTicket(t) {
-  return (
-    Array.isArray(t?.labels) &&
-    t.labels.some((l) => String(l).trim().toLowerCase() === "advisory")
-  );
+  if (!Array.isArray(t?.labels)) return false;
+  if (!t.labels.some((l) => String(l).trim().toLowerCase() === "advisory")) return false;
+  return !advisoryNeverApplies(t);
 }
 
 /** The children a completion gate may consider: everything that is not advisory. */
 export function nonAdvisory(children) {
   return Array.isArray(children) ? children.filter((t) => !isAdvisoryTicket(t)) : children;
 }
-
-const isDone = (t) => t.status === "done";
-const isOpen = (t) => t.status !== "done" && t.status !== "cancelled";
-const isHuman = (a) => typeof a === "string" && a.startsWith("human:");
 
 /**
  * @param children  the epic's child tickets

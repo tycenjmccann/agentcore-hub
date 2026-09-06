@@ -473,7 +473,9 @@ async function createTicket(params) {
   }
   // Caller-supplied labels last, and only after the system namespaces are
   // stripped out of them — an agent must not be able to forge `fix:`/`wf:`.
-  const userLabels = sanitizeUserLabels(labels);
+  // TEAM-4131 F2: `advisory` is likewise refused on a fix ticket / human gate —
+  // the twins must reach the same decision, or the hole just moves provider.
+  const userLabels = sanitizeUserLabels(labels, { spawnedBy: spawn.value, assignee });
   issueLabels.push(...userLabels.labels);
   if (userLabels.dropped.length > 0) {
     console.warn(`[jira-tools] dropped ${userLabels.dropped.length} label(s) squatting a system namespace: ${userLabels.dropped.join(", ")}`);

@@ -504,6 +504,86 @@ describe("create_ticket — fix contract (TEAM-4121 FR-8)", () => {
       expect("labels" in h.state.puts[0]).toBe(false);
       expect("droppedLabels" in res).toBe(false);
     });
+
+    /**
+     * TEAM-4131 F2 — `advisory` is RESERVED on a fix ticket and on a human gate.
+     *
+     * Under ADVISORY_ROUTING=enforce the orchestrator treats an advisory-labelled
+     * child as backlog the run does not wait on. `labels` is a caller-supplied
+     * string that main.py exposes to every persona, so a QA agent (or a
+     * prompt-injected one) filing a REAL qa_fix with labels="advisory" made the run
+     * finalize with the fix open. completion.mjs holds the read-side floor; this is
+     * the write side — the word never reaches the record in the first place.
+     *
+     * It is deliberately NOT in SYSTEM_LABEL_PREFIXES: `advisory` is a legitimate
+     * user label on an ordinary backlog ticket (the test above pins that), so it is
+     * reserved per-ticket-SHAPE rather than globally.
+     */
+    it.each([
+      ["qa_fix", { kind: "qa_fix", qaTicketId: "TEAM-42" }],
+      ["review_fix", { kind: "review_fix", gateTicketId: "TEAM-42" }],
+      ["codex_fix", { kind: "codex_fix", codexTicketId: "TEAM-42" }],
+      ["ship_fix", { kind: "ship_fix", shipTicketId: "TEAM-42" }],
+      ["ci_fix", { kind: "ci_fix", ciTicketId: "TEAM-42" }],
+      ["sync_fix", { kind: "sync_fix", ciTicketId: "TEAM-42" }],
+    ])("a %s ticket cannot be labelled advisory — dropped and reported", async (_kind, spawned_by) => {
+      const res = await create({ ...BASE, spawned_by, labels: "Advisory, needs docs" });
+      // The ticket is still filed (dropping a label is not a rejection) …
+      expect(h.state.puts.length).toBe(1);
+      expect(h.state.puts[0].labels).toEqual(["needs-docs"]);
+      // … and the drop is REPORTED, so the Lambda logs it and the caller can see
+      // its label was refused rather than silently honoured.
+      expect(res.droppedLabels).toEqual(["advisory"]);
+      expect(res.ticket.labels).toEqual(["needs-docs"]);
+      expect(h.state.puts[0].spawnedBy.kind).toBe(spawned_by.kind);
+    });
+
+    it("a HUMAN GATE ticket cannot be labelled advisory either — being waited on is its function", async () => {
+      const res = await create({ summary: "Merge Approval", assignee: "human:reviewer", labels: "advisory" });
+      expect(res.droppedLabels).toEqual(["advisory"]);
+      expect("labels" in h.state.puts[0]).toBe(false); // the only label was dropped
+    });
+
+    it("a NON-fix, non-human ticket keeps `advisory` — the guard is narrow by design", async () => {
+      const res = await create({ ...BASE, labels: "advisory, needs docs" });
+      expect(h.state.puts[0].labels).toEqual(["advisory", "needs-docs"]);
+      expect("droppedLabels" in res).toBe(false);
+      // An unknown kind is not a fix kind. (It is also rejected as a marker, so
+      // the ticket carries no spawnedBy — the label decision must not depend on
+      // the raw argument, only on what was actually accepted.)
+      const bad = await create({ ...BASE, spawned_by: { kind: "qa_fixx" }, labels: "advisory" });
+      expect(bad.content?.[0]?.text || "").toMatch(/^Error:/);
+    });
+
+    it("the reserved word is matched exactly — 'advisory-followup' is a normal label on a fix ticket", async () => {
+      const res = await create({
+        ...BASE, spawned_by: { kind: "qa_fix", qaTicketId: "TEAM-42" }, labels: "advisory-followup, ADVISORY ",
+      });
+      expect(h.state.puts[0].labels).toEqual(["advisory-followup"]);
+      expect(res.droppedLabels).toEqual(["advisory"]); // case- and whitespace-insensitive
+    });
+
+    /**
+     * TEAM-4131 F1 — the sync-main conflict rounds ride on spawned_by, and
+     * sanitizeSpawnedBy drops any key that is not allow-listed WITHOUT a word. A
+     * dropped `round` would silently un-cap the human escalation.
+     */
+    it("keeps priorFixTicketId + round on a sync_fix, and refuses a garbage round", async () => {
+      await create({
+        ...BASE,
+        spawned_by: { kind: "sync_fix", ciTicketId: "TEAM-9", priorFixTicketId: "TEAM-500", round: "2" },
+      });
+      expect(h.state.puts[0].spawnedBy).toEqual({
+        kind: "sync_fix", ciTicketId: "TEAM-9", priorFixTicketId: "TEAM-500", round: 2,
+      });
+
+      h.state.puts.length = 0;
+      await create({
+        ...BASE,
+        spawned_by: { kind: "sync_fix", ciTicketId: "TEAM-9", priorFixTicketId: "TEAM-500 OR 1=1", round: 1e6 },
+      });
+      expect(h.state.puts[0].spawnedBy).toEqual({ kind: "sync_fix", ciTicketId: "TEAM-9" });
+    });
   });
 });
 

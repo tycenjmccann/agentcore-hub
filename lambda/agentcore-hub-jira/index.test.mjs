@@ -620,12 +620,56 @@ test("FR-8: caller labels are sanitized — a forged system label never reaches 
       parameters: { ...SHIP_FIX, labels: "advisory, fix:review_fix, WF:other, needs docs" },
     });
     const labels = cap.fields.labels;
-    assert.ok(labels.includes("advisory"));
     assert.ok(labels.includes("needs-docs"), `expected the normalized label, got ${JSON.stringify(labels)}`);
     // The forged provenance labels are gone; the Lambda's own stay.
     assert.ok(!labels.includes("fix:review_fix"), JSON.stringify(labels));
     assert.ok(labels.includes("fix:ship_fix"));
     assert.deepEqual(labels.filter((l) => l.startsWith("wf:")), ["wf:run1"]);
+    // TEAM-4131 F2: this is a ship_fix, so `advisory` is RESERVED and dropped —
+    // it would otherwise remove the fix from every completion gate under
+    // ADVISORY_ROUTING=enforce. Both provider twins must reach the same decision,
+    // so the byte-identical assertion lives in the DynamoDB Lambda's suite too.
+    assert.ok(!labels.includes("advisory"), JSON.stringify(labels));
+  } finally {
+    cap.restore();
+  }
+});
+
+test("TEAM-4131 F2: `advisory` survives on a NON-fix ticket — the guard is per ticket shape, not global", async () => {
+  const { handler: h } = await loadWithMode("enforce");
+  const cap = captureCreate();
+  try {
+    await h({
+      tool_name: "Tickets___create_ticket",
+      parameters: {
+        summary: "Rename the legacy columns",
+        workflow_id: "run1",
+        assignee: "agentcore_hub_backend_dev",
+        phase: "development",
+        labels: "advisory, needs docs",
+      },
+    });
+    assert.ok(cap.fields.labels.includes("advisory"), JSON.stringify(cap.fields.labels));
+  } finally {
+    cap.restore();
+  }
+});
+
+test("TEAM-4131 F2: a HUMAN GATE ticket cannot be labelled advisory", async () => {
+  const { handler: h } = await loadWithMode("enforce");
+  const cap = captureCreate();
+  try {
+    await h({
+      tool_name: "Tickets___create_ticket",
+      parameters: {
+        summary: "Merge Approval",
+        workflow_id: "run1",
+        assignee: "human:reviewer",
+        phase: "ship",
+        labels: "advisory",
+      },
+    });
+    assert.ok(!cap.fields.labels.includes("advisory"), JSON.stringify(cap.fields.labels));
   } finally {
     cap.restore();
   }
