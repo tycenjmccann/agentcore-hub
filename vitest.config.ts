@@ -332,6 +332,17 @@ export default defineConfig({
       // seam (no green certification of a SHA that would not land); a webhook
       // REDELIVERY files no second ticket; landing the fix dispatches CI once.
       "lambda/orchestrator/replay-yteqfl-sync-main.test.mjs",
+      // ADVISORY_ROUTING wiring (TEAM-4122 FR-7) — index.mjs REAL, AWS/store/cap
+      // seams mocked. completion.test.mjs owns the pure filter; what only shows
+      // up here is the plumbing: the `## Branch` block an advisory ticket's dev
+      // is handed (`feature/<id>-advisory` off the DEFAULT branch, advisory NOTE,
+      // no shared-integration NOTE) versus a non-advisory block asserted
+      // BYTE-IDENTICAL to mode off by string comparison, the refusal to ever adopt
+      // a `-advisory` branch as a run's shared integration branch (the ported-
+      // session path, the one place a branch name comes from outside), and that
+      // the ship review's change set enumerates its own PR's files only — so an
+      // advisory branch's files cannot enter the reviewed diff.
+      "lambda/orchestrator/advisory-routing.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

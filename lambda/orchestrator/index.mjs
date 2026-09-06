@@ -50,7 +50,7 @@ import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stabi
 import { shouldGateShipDispatch, normalizeShipDispatchMode, emitShipDispatchMetrics } from "./ship-dispatch-gate.mjs";
 import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.mjs";
 import { createLiveReverify, normalizeLiveReverifyMode } from "./live-reverify.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
@@ -230,6 +230,29 @@ const CI_CHECK_MODE = normalizeCiCheckMode(process.env.CI_CHECK_MODE);
 // STRICT allow-list (garbage → off) because enforce PUSHES A COMMIT to a shared
 // branch. Instant rollback = set off.
 const SYNC_MAIN_BEFORE_CI = normalizeSyncMode(process.env.SYNC_MAIN_BEFORE_CI);
+
+// Advisory-ticket routing (TEAM-4122 FR-7): off | enforce, default off. An
+// "advisory" ticket is out-of-scope-but-worth-doing work the reviewers file as
+// backlog (requirements analyst Step 2 / release manager Step 4). Today it still
+// rides the run: the completion guard waits on it and the dev is told to branch
+// off the shared integration branch, so its files land in the run's unified PR —
+// scope the humans explicitly declined. enforce makes the label mean what the
+// blueprints already promise: excluded from every completion/open-fix gate, and
+// branched from + PR'd against the repo DEFAULT branch, never adopted as the
+// integration branch. There is deliberately NO shadow: the routing is what the
+// agent is TOLD to do (a branch name in its prompt), so "observe-only" would
+// either lie to the agent or do nothing at all. STRICT allow-list (garbage → off)
+// because enforce changes what the run waits on. Instant rollback = set off.
+const ADVISORY_ROUTING = normalizeAdvisoryRoutingMode(process.env.ADVISORY_ROUTING);
+/**
+ * The children a completion GATE may consider (TEAM-4122 FR-7). Under enforce an
+ * advisory ticket owes the run nothing — no deliverable evidence, no merge
+ * verdict — so it must be invisible to the evidence and ship-verdict gates the
+ * same way isWorkflowComplete's own filter makes it invisible to the phase gates.
+ * Off returns the array untouched (identity), so nothing changes without the flag.
+ */
+const gateChildren = (children) => (ADVISORY_ROUTING === "enforce" ? nonAdvisory(children) : children);
+
 // The one persona whose dispatch the sync gates on — it is the agent that reads
 // and certifies the branch head. Matches the roster entry below.
 const CI_AGENT_ID = "agentcore_hub_ci_agent";
@@ -3690,6 +3713,9 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
     getAgentPhase: (assignee) => getAgentDef(assignee)?.phase,
     gatePhaseOf,
     requestedGates: workflow?.input?.reviewGates || [],
+    // TEAM-4122 FR-7: completion.mjs reads no env (it is a pure module), so the
+    // flag arrives as an option — "off" leaves its decision untouched.
+    advisoryRouting: ADVISORY_ROUTING,
   });
 }
 
@@ -3786,7 +3812,7 @@ export async function completeWorkflow(workflow) {
     const wfDef = getEffectiveWorkflowDef(workflow);
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     if (requiredPhases.length > 0) {
-      const children = await getChildTickets(workflow.epicId);
+      const children = gateChildren(await getChildTickets(workflow.epicId));
       const evidenceOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
       let freshWf = await store.getWorkflow(workflow.id);
       let missing = missingEvidenceTickets(
@@ -3940,7 +3966,7 @@ export async function completeWorkflow(workflow) {
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     const shipPhases = requiredPhases.filter((p) => SHIP_PHASES.has(p));
     if (shipPhases.length > 0) {
-      const children = await getChildTickets(workflow.epicId);
+      const children = gateChildren(await getChildTickets(workflow.epicId));
       let freshWf = await store.getWorkflow(workflow.id);
       const shipOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
       let verdict = evaluateShipVerdict(
@@ -4600,11 +4626,21 @@ export async function buildAgentContext(ticket, workflow) {
 
   // Dev agents: branch identity (scope, not HOW)
   if (agentDef?.phase === "development") {
-    const baseBranch = workflow.featureBranch || workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    // TEAM-4122 FR-7: an advisory ticket is work the humans explicitly declined
+    // for THIS run, so it must not enter the shared integration branch — its
+    // files would otherwise appear in the unified PR's change set and land with
+    // the approved scope. Under enforce it gets its own branch off the repo
+    // default and PRs there; the release manager never reviews it in this run.
+    const advisory = ADVISORY_ROUTING === "enforce" && isAdvisoryTicket(ticket);
+    const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    const baseBranch = advisory ? defaultBranch : workflow.featureBranch || defaultBranch;
+    const slug = agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-");
     context += `## Branch\n`;
-    context += `feature_branch: feature/${ticket.ticketId}-${agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-")}\n`;
+    context += `feature_branch: feature/${ticket.ticketId}-${advisory ? "advisory" : slug}\n`;
     context += `base_branch: ${baseBranch}\n`;
-    if (workflow.featureBranch) {
+    if (advisory) {
+      context += `NOTE: ADVISORY ticket. Branch from ${defaultBranch} and open your PR against ${defaultBranch}. It is NOT part of this run's shared integration branch or its unified PR; the release manager will not review it in this run.\n`;
+    } else if (workflow.featureBranch) {
       context += `NOTE: base_branch is this run's SHARED integration branch. Branch from it, target your PR at it (never the repo default branch), and merge your PR into it when your evidence is complete — one unified PR to the default branch is opened by the orchestrator at run completion.\n`;
     }
     context += `\n`;
@@ -5444,8 +5480,16 @@ async function ensureFeatureBranch(workflow) {
   // branch — ADOPT it as the run's shared integration branch so the pipeline
   // builds on the requester's work (and the final PR carries it) instead of
   // starting a parallel branch off the default.
+  //
+  // TEAM-4122 FR-7: never adopt an ADVISORY branch. `feature/<id>-advisory` is
+  // where an advisory ticket's out-of-scope work lives, deliberately outside this
+  // run — adopting it as the shared integration branch would pull exactly the
+  // scope the humans declined into every dev's base and into the unified PR, the
+  // inverse of what the routing exists to prevent. The name is the contract (see
+  // the `## Branch` block above), so the name is what is refused; a refused
+  // branch just falls through to normal creation off the default branch.
   const ported = workflow.input?.portedSession;
-  if (ported?.branch) {
+  if (ported?.branch && !/-advisory$/.test(ported.branch)) {
     try {
       await store.adoptFeatureBranch(workflow.id, ported.branch);
       console.log(`[orchestrator] Adopted ported-session branch as shared feature branch: ${ported.branch}`);
@@ -5454,6 +5498,10 @@ async function ensureFeatureBranch(workflow) {
       console.error(`[orchestrator] failed to adopt ported branch ${ported.branch}: ${err.message}`);
       // fall through to normal creation
     }
+  } else if (ported?.branch) {
+    console.warn(
+      `[orchestrator] refusing to adopt advisory branch ${ported.branch} as the shared integration branch for ${workflow.id} — creating a fresh branch off the default instead`
+    );
   }
   if (!workflow.repoConfig?.repos?.length) return null;
   try {

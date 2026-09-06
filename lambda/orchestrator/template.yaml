@@ -43,6 +43,10 @@ Globals:
         # Orchestrator-only (both ready paths dispatch the CI agent); rides
         # Globals for the same one-place-to-set parity.
         SYNC_MAIN_BEFORE_CI: !Ref SyncMainBeforeCi
+        # Orchestrator-only (the completion gates + buildAgentContext + the
+        # feature-branch adoption all live there); rides Globals for the same
+        # one-place-to-set parity.
+        ADVISORY_ROUTING: !Ref AdvisoryRouting
 
 Parameters:
   TicketsTableName:
@@ -236,6 +240,33 @@ Parameters:
       because enforce PUSHES A COMMIT to a shared branch. Default "off" matches the
       code's unset default and deploy.sh only forwards the var when explicitly set.
       Instant rollback = set off.
+
+  AdvisoryRouting:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "enforce"]
+    Description: >
+      Advisory-ticket routing (TEAM-4122 FR-7). The requirements analyst and the
+      release manager both file out-of-scope-but-worth-doing work as an ADVISORY
+      ticket — `labels: "advisory"`, `blocked_by: ""`, no `spawned_by_kind` — which
+      the blueprints describe as backlog the run does not wait on. Today the label
+      is inert: the completion guard still waits for the ticket, and the dev picking
+      it up is told to branch off the run's SHARED integration branch, so scope the
+      humans explicitly declined lands in the unified PR next to the approved work.
+      off = byte-identical to pre-4122 (the label means nothing). enforce = the
+      label means what the prose promises: the ticket is filtered out of the
+      completion, evidence, open-fix and ship-verdict gates, its `## Branch` block
+      sends it to `feature/<id>-advisory` based on the repo DEFAULT branch with an
+      instruction to PR there, and a `-advisory` branch is never adopted as a run's
+      shared integration branch. There is deliberately NO shadow mode: the routing
+      IS the prompt the agent acts on, so an observe-only variant would either lie
+      to the agent (tell it one branch, log another) or do nothing at all. Roll out
+      only after the create_ticket `labels` param is deployed on both ticket Lambdas
+      and the runtime image — until tickets actually carry labels, enforce reads
+      every ticket as non-advisory, i.e. exactly today's behaviour. A
+      PRESENT-but-garbage value coalesces to OFF, because enforce changes what the
+      run waits on. Default "off" matches the code's unset default and deploy.sh
+      only forwards the var when explicitly set. Instant rollback = set off.
 
   CiProjectName:
     Type: String

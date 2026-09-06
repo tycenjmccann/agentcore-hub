@@ -299,7 +299,26 @@ if [ -n "${SYNC_MAIN_BEFORE_CI:-}" ]; then
   echo "  SYNC_MAIN_BEFORE_CI=${SYNC_MAIN_BEFORE_CI} forwarded to orchestrator"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}${REPO_CHECK_MODE_VARS}${CI_CHECK_VARS}${SYNC_MAIN_BEFORE_CI_VARS}}"
+# Advisory-ticket routing (TEAM-4122 FR-7): off | enforce. An "advisory" ticket is
+# out-of-scope-but-worth-doing work the reviewers file as backlog. enforce makes
+# the label mean what the blueprints promise: the ticket is excluded from every
+# completion/open-fix gate, its dev is told to branch from and PR against the repo
+# DEFAULT branch (`feature/<id>-advisory`), and such a branch is never adopted as
+# a run's shared integration branch — so declined scope cannot ride into the
+# unified PR. There is NO shadow: the routing IS the prompt the agent acts on, so
+# observe-only would either lie to the agent or do nothing. Needs the `labels`
+# param deployed on both ticket Lambdas and the runtime image (a run whose tickets
+# carry no labels reads as non-advisory, i.e. exactly today's behaviour).
+# Forwarded ONLY when explicitly set, so a plain install stays default off —
+# byte-identical. STRICT allow-list in code (garbage → off).
+# Instant rollback = set off (or unset and redeploy).
+ADVISORY_ROUTING_VARS=""
+if [ -n "${ADVISORY_ROUTING:-}" ]; then
+  ADVISORY_ROUTING_VARS=",ADVISORY_ROUTING=${ADVISORY_ROUTING}"
+  echo "  ADVISORY_ROUTING=${ADVISORY_ROUTING} forwarded to orchestrator"
+fi
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}${REPO_CHECK_MODE_VARS}${CI_CHECK_VARS}${SYNC_MAIN_BEFORE_CI_VARS}${ADVISORY_ROUTING_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${EVENT_DEDUPE_VARS}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}${EVENT_DEDUPE_VARS}}"
 

@@ -279,6 +279,44 @@ export async function resolveMissingEvidenceFromRecords(missing, agentTasks, dep
   return remaining;
 }
 
+// ─── TEAM-4122 FR-7: advisory tickets ────────────────────────────────────────
+
+/**
+ * ADVISORY_ROUTING mode — two values, no shadow:
+ *   "off"     — an "advisory" label means nothing to the orchestrator (today).
+ *   "enforce" — an advisory-labelled ticket is BACKLOG: invisible to every
+ *               completion gate here, and (index.mjs) branched from / PR'd
+ *               against the repo default branch instead of the run's shared
+ *               integration branch.
+ *
+ * Garbage coalesces to "off", matching the discipline of every other flag that
+ * changes what the run waits on (CI_CHECK_MODE, SYNC_MAIN_BEFORE_CI,
+ * LIVE_REVERIFY): a typo must never silently start dropping tickets out of the
+ * completion guard.
+ */
+export function normalizeAdvisoryRoutingMode(v) {
+  return String(v || "").trim().toLowerCase() === "enforce" ? "enforce" : "off";
+}
+
+/**
+ * Is this ticket ADVISORY — filed as backlog that the run does not wait on? The
+ * marker is the literal label `advisory` (case- and whitespace-insensitive, but
+ * an EXACT word: "advisory-ish" is not advisory), written by the requirements
+ * analyst / release manager through create_ticket's `labels` param. Anything
+ * that is not an array of labels is simply not advisory.
+ */
+export function isAdvisoryTicket(t) {
+  return (
+    Array.isArray(t?.labels) &&
+    t.labels.some((l) => String(l).trim().toLowerCase() === "advisory")
+  );
+}
+
+/** The children a completion gate may consider: everything that is not advisory. */
+export function nonAdvisory(children) {
+  return Array.isArray(children) ? children.filter((t) => !isAdvisoryTicket(t)) : children;
+}
+
 const isDone = (t) => t.status === "done";
 const isOpen = (t) => t.status !== "done" && t.status !== "cancelled";
 const isHuman = (a) => typeof a === "string" && a.startsWith("human:");
@@ -290,6 +328,9 @@ const isHuman = (a) => typeof a === "string" && a.startsWith("human:");
  *   getAgentPhase(assignee) → agent phase for a ticket's assignee (undefined for humans/unknowns)
  *   gatePhaseOf(ticket)     → the phase a human-assignee gate ticket guards (undefined if unknown)
  *   requestedGates          → workflow.input.reviewGates (activates "flagged" gates)
+ *   advisoryRouting         → ADVISORY_ROUTING ("enforce" drops advisory-labelled
+ *                             tickets out of every gate below; anything else, incl.
+ *                             absent, leaves the decision byte-identical to pre-FR-7)
  */
 export function isWorkflowComplete(children, wfDef, opts = {}) {
   if (!Array.isArray(children) || children.length === 0) return false;
@@ -303,6 +344,16 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
     typeof t.phase === "string" && t.phase ? t.phase : getAgentPhase(t.assignee);
 
   const required = (wfDef && wfDef.completionRequiresAgentPhases) || [];
+
+  // TEAM-4122 FR-7 — under enforce, advisory tickets are backlog and simply do
+  // not exist for completion purposes. Filtering ONCE here covers every gate in
+  // both branches below in one place: the legacy every-child-done heuristic, the
+  // has-done-agent check, the open-agent integrity check, the open-fix (FIX_KINDS)
+  // gate and gate-ticket matching. With the flag off (or absent) `children` is
+  // untouched, so this function is byte-identical to its pre-FR-7 self.
+  if (normalizeAdvisoryRoutingMode(opts.advisoryRouting) === "enforce") {
+    children = nonAdvisory(children);
+  }
 
   // ── Legacy branch — preserved verbatim in spirit (suffix heuristic + all done).
   if (required.length === 0) {
