@@ -40,6 +40,9 @@ Globals:
         # Orchestrator-only (the probe + context block + gate prefix all live
         # there); rides Globals for the same one-place-to-set parity.
         CI_CHECK_MODE: !Ref CiCheckMode
+        # Orchestrator-only (both ready paths dispatch the CI agent); rides
+        # Globals for the same one-place-to-set parity.
+        SYNC_MAIN_BEFORE_CI: !Ref SyncMainBeforeCi
 
 Parameters:
   TicketsTableName:
@@ -204,6 +207,35 @@ Parameters:
       value coalesces to OFF, not shadow, because enforce writes to a real ticket.
       Default "off" matches the code's unset default and deploy.sh only forwards
       the var when explicitly set. Instant rollback = set off.
+
+  SyncMainBeforeCi:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Pre-CI default-branch sync (TEAM-4122 FR-6). Three dev agents push to one
+      shared feature branch and the CI agent then certifies its head SHA — but the
+      default branch has moved since they branched, so a green build says "this
+      branch is green", not "green on top of what is on main now", which is how the
+      human merge approver reads it. Every conflict and every clash with a sibling
+      merge therefore surfaces AFTER the approval, on the merge itself, where no
+      agent is watching. off = byte-identical to pre-4122 (no GitHub call, no
+      event, no write). shadow = one compare read per CI dispatch plus a
+      workflow.sync_dry_run event saying how far behind the branch is and whether a
+      sync WOULD happen; it CANNOT tell you whether the merge would conflict (only
+      an actual merge can), so conflictKnown is always false. enforce = merge the
+      default branch INTO the feature branch (never the reverse — the merge
+      direction is pinned in code and this can never write to the default branch)
+      right before the CI agent is dispatched; a 409 files a `Fix (sync-main)`
+      sync_fix ticket assigned to the dev who most recently finished on the run,
+      blocks the CI ticket on it, and releases the CI ticket's claim so the normal
+      cascade re-dispatches once it closes. Every other failure — no PAT, unknown
+      repo, 404/422/5xx, network — fails OPEN and CI proceeds against the un-synced
+      head, because a sync we could not do must never wedge CI. Same asymmetry as
+      CiCheckMode: a PRESENT-but-garbage value coalesces to OFF, not shadow,
+      because enforce PUSHES A COMMIT to a shared branch. Default "off" matches the
+      code's unset default and deploy.sh only forwards the var when explicitly set.
+      Instant rollback = set off.
 
   CiProjectName:
     Type: String

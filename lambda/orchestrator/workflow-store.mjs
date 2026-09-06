@@ -440,6 +440,22 @@ export async function setCiCheck(workflowId, ciCheck) {
 }
 
 /**
+ * Persist the pre-CI default-branch sync result (see sync-main.mjs). Scoped SET
+ * of one attribute — never touches the rest of the row. The record is the
+ * idempotency key for the sync ({ at, sha, baseHeadSha, status, ciTicketId,
+ * fixTicketId }): a redelivered CI dispatch against the same default-branch head
+ * reads it and does nothing rather than pushing a second merge commit.
+ */
+export async function setSyncMain(workflowId, syncMain) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET syncMain = :sm",
+    ExpressionAttributeValues: { ":sm": syncMain },
+  }));
+}
+
+/**
  * Ship-head stability deferral bookkeeping (TEAM-4111). Scoped SET of two
  * attributes the gate + its reconcile-tick re-drive read: the consecutive
  * deferral count (bounds the deadlock fail-open) and the deferred ship

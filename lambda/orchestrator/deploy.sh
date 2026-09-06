@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs ci-check.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs fix-contract.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs ci-check.mjs sync-main.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs fix-contract.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -281,7 +281,25 @@ if [ -n "${PIPELINE_TOOLS_LAMBDA:-}" ]; then
   CI_CHECK_VARS="${CI_CHECK_VARS},PIPELINE_TOOLS_LAMBDA=${PIPELINE_TOOLS_LAMBDA}"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}${REPO_CHECK_MODE_VARS}${CI_CHECK_VARS}}"
+# Pre-CI default-branch sync (TEAM-4122 FR-6): off | shadow | enforce. The CI
+# agent certifies the integration branch's head SHA, but the default branch has
+# moved since the devs branched — so a green build certifies code that is not
+# what would land. shadow = one compare read + a `workflow.sync_dry_run` event
+# (it CANNOT tell whether the merge would conflict — only a merge can); enforce
+# = merge the default branch INTO the feature branch immediately before the CI
+# agent is dispatched, and on a 409 file a `Fix (sync-main)` sync_fix ticket that
+# blocks the CI ticket until a dev resolves it. Needs GITHUB_PAT (no PAT = no-op).
+# Forwarded ONLY when explicitly set, so a plain install stays default off —
+# byte-identical: no GitHub call, no event, no write. STRICT allow-list in code
+# (garbage → off, not shadow) because enforce PUSHES A COMMIT to a shared branch.
+# Instant rollback = set off (or unset and redeploy).
+SYNC_MAIN_BEFORE_CI_VARS=""
+if [ -n "${SYNC_MAIN_BEFORE_CI:-}" ]; then
+  SYNC_MAIN_BEFORE_CI_VARS=",SYNC_MAIN_BEFORE_CI=${SYNC_MAIN_BEFORE_CI}"
+  echo "  SYNC_MAIN_BEFORE_CI=${SYNC_MAIN_BEFORE_CI} forwarded to orchestrator"
+fi
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}${REPO_CHECK_MODE_VARS}${CI_CHECK_VARS}${SYNC_MAIN_BEFORE_CI_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${EVENT_DEDUPE_VARS}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}${EVENT_DEDUPE_VARS}}"
 

@@ -55,6 +55,7 @@ import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 import { ensureCiCheck, formatCiCheckBlock, prefixCiWarning, normalizeCiCheckMode } from "./ci-check.mjs";
+import { syncBeforeCi, normalizeSyncMode } from "./sync-main.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 import { createDeadSessionEscalation, normalizeEscalationMode } from "./dead-session-escalation.mjs";
@@ -216,6 +217,22 @@ const LIVE_REVERIFY = normalizeLiveReverifyMode(process.env.LIVE_REVERIFY);
 // no label, no gate rewrite. STRICT allow-list (garbage → off, like
 // LIVE_REVERIFY) because enforce WRITES to a real ticket. Instant rollback = off.
 const CI_CHECK_MODE = normalizeCiCheckMode(process.env.CI_CHECK_MODE);
+
+// Pre-CI default-branch sync (TEAM-4122 FR-6): off | shadow | enforce. The CI
+// agent certifies the integration branch's head SHA, but `main` has moved since
+// the devs branched — so a green build certifies code that is NOT what would
+// land, and every conflict surfaces after the human merge approval instead of
+// before it. shadow = one compare read + a `workflow.sync_dry_run` event (it
+// CANNOT tell whether the merge would conflict — only a merge can); enforce =
+// merge the default branch into the feature branch right before the CI agent is
+// dispatched, and on a 409 file a `Fix (sync-main)` sync_fix ticket that blocks
+// the CI ticket. off = byte-identical: no GitHub call, no event, no write.
+// STRICT allow-list (garbage → off) because enforce PUSHES A COMMIT to a shared
+// branch. Instant rollback = set off.
+const SYNC_MAIN_BEFORE_CI = normalizeSyncMode(process.env.SYNC_MAIN_BEFORE_CI);
+// The one persona whose dispatch the sync gates on — it is the agent that reads
+// and certifies the branch head. Matches the roster entry below.
+const CI_AGENT_ID = "agentcore_hub_ci_agent";
 
 /**
  * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
@@ -573,6 +590,33 @@ async function ciCheckDeps() {
   }
   _ciCheckDeps = deps;
   return _ciCheckDeps;
+}
+
+/**
+ * Seams for sync-main.mjs (TEAM-4122 FR-6). One object per warm container; every
+ * member is an existing orchestrator helper, so the module itself does no I/O of
+ * its own and the whole matrix is testable with plain objects.
+ *
+ * githubApi/githubApiRaw are omitted without a PAT — sync-main then returns
+ * `skipped: no_pat` and CI dispatches exactly as it does today.
+ */
+let _syncDeps = null;
+function syncDeps() {
+  if (SYNC_MAIN_BEFORE_CI === "off") return null;
+  if (_syncDeps) return _syncDeps;
+  _syncDeps = {
+    githubApi: process.env.GITHUB_PAT ? githubApi : undefined,
+    githubApiRaw: process.env.GITHUB_PAT ? githubRequestRaw : undefined,
+    store,
+    invokeTickets,
+    addBlockers,
+    publishEvent,
+    getAgentDef,
+    now: () => new Date(),
+    mode: SYNC_MAIN_BEFORE_CI,
+    log: console,
+  };
+  return _syncDeps;
 }
 
 // One detector per warm container so its per-agent median cache is reused
@@ -3104,6 +3148,22 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
+  // ─── PRE-CI SYNC (TEAM-4122 FR-6) ───
+  // Merge the repo's default branch into the integration branch BEFORE the CI
+  // agent reads its head, so the SHA it certifies is the SHA that would land.
+  // Deliberately AFTER the claim: the claim is what serializes two concurrent
+  // deliveries of this ticket, and two of these running at once would push two
+  // merge commits. `conflict` is the only outcome that stops the dispatch — the
+  // CI ticket is blocked on a sync_fix ticket and its claim is released inside,
+  // so the cascade re-dispatches once the dev resolves it. off → not reached.
+  if (SYNC_MAIN_BEFORE_CI !== "off" && agentDef?.agentId === CI_AGENT_ID && workflow.featureBranch) {
+    const sync = await syncBeforeCi(workflow, ticket, syncDeps());
+    if (sync.outcome === "conflict") {
+      console.log(`[orchestrator] ${ticketId} held: ${workflow.featureBranch} cannot merge the default branch — blocked on ${sync.fixTicketId}`);
+      return;
+    }
+  }
+
   // Build context and invoke — SAME buildAgentContext for both paths
   let context = await buildAgentContext(ticket, workflow);
 
@@ -3524,6 +3584,20 @@ async function handleTicketReady(ticketId, image) {
 
   // Build context and invoke agent
   const ticket = await getTicket(ticketId);
+
+  // ─── PRE-CI SYNC (TEAM-4122 FR-6) ───
+  // Same hook as handleTicketReadyUnified, placed after getTicket because this
+  // path only binds `ticket` here. See the unified path for the rationale; the
+  // one behavioural note is that `conflict` returns BEFORE buildAgentContext, so
+  // no context is built and no agent is invoked. off → not reached.
+  if (SYNC_MAIN_BEFORE_CI !== "off" && agentDef?.agentId === CI_AGENT_ID && workflow.featureBranch) {
+    const sync = await syncBeforeCi(workflow, ticket, syncDeps());
+    if (sync.outcome === "conflict") {
+      console.log(`[orchestrator] ${ticketId} held: ${workflow.featureBranch} cannot merge the default branch — blocked on ${sync.fixTicketId}`);
+      return;
+    }
+  }
+
   let context = await buildAgentContext(ticket, workflow);
 
   // Prepend resume context on re-run: retry endpoint (ticket.resumeContext) or
@@ -5236,6 +5310,37 @@ async function featureBranchMergeProbe(workflow) {
     console.warn(`[orchestrator] merge-verify skipped for ${workflow.id}: ${err.message}`);
     return { merged: null }; // fail open, no proof
   }
+}
+
+/**
+ * The same request githubApi makes, but returning `{ status, body }` instead of
+ * throwing on a non-2xx — for the callers that have to DISTINGUISH statuses that
+ * githubApi's contract erases:
+ *   - 201 (a merge commit was created) vs 204 (already up to date), which both
+ *     resolve to a value there (an object vs null);
+ *   - 409 (merge conflict), which is an EXPECTED outcome for a merge, not an
+ *     error to be thrown.
+ * githubApi's own semantics are unchanged — every existing caller still gets
+ * "parsed JSON or throw".
+ */
+async function githubRequestRaw(path, method = "GET", body = null) {
+  const pat = process.env.GITHUB_PAT;
+  if (!pat) throw new Error("GITHUB_PAT not configured on orchestrator");
+  const resp = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${pat}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "agentcore-hub-orchestrator",
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await resp.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON */ }
+  return { status: resp.status, body: json };
 }
 
 async function githubApi(path, method = "GET", body = null) {

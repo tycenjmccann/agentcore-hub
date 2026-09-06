@@ -15,6 +15,7 @@ import {
   setResumeContext,
   setRepoCheck,
   setCiCheck,
+  setSyncMain,
   appendNotification,
   appendReviewNotificationOnce,
   ackNotifications,
@@ -669,6 +670,25 @@ describe("setCiCheck (CI reachability pre-flight, TEAM-4122)", () => {
     expect(sent.length).toBe(1);
     expect(sent[0].input.UpdateExpression).toBe("SET ciCheck = :cc");
     expect(sent[0].input.ExpressionAttributeValues[":cc"]).toEqual(cc);
+    expect(sent[0].input.Key).toEqual({ workflowId: "wf_1" });
+  });
+});
+
+describe("setSyncMain (pre-CI default-branch sync, TEAM-4122)", () => {
+  it("is a scoped SET of the single syncMain attribute — no full-row put", async () => {
+    initWorkflowStore(stubDdb, "wf");
+    sent.length = 0;
+    const sm = {
+      at: "2026-09-06T00:00:00Z",
+      sha: "abc1234",
+      baseHeadSha: "def5678",
+      status: "synced",
+      ciTicketId: "TEAM-9",
+    };
+    await setSyncMain("wf_1", sm);
+    expect(sent.length).toBe(1);
+    expect(sent[0].input.UpdateExpression).toBe("SET syncMain = :sm");
+    expect(sent[0].input.ExpressionAttributeValues[":sm"]).toEqual(sm);
     expect(sent[0].input.Key).toEqual({ workflowId: "wf_1" });
   });
 });

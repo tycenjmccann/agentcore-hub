@@ -36,7 +36,13 @@ The build is not yours to run; it is authoritative and already done. Do this:
    dev completion records: a sync-to-main commit can move the branch head
    after a dev agent's completion record was already written, so a stale SHA
    from that record can name a commit that is no longer the head you must
-   verify.
+   verify. When `SYNC_MAIN_BEFORE_CI=enforce`, that sync commit is made by the
+   orchestrator immediately before you are dispatched and is recorded as a
+   `workflow.branch_synced` event on the run — so the head you read at the start
+   of your work is the default branch merged in, which is the whole point: the
+   SHA you certify is the SHA that would land. If the merge conflicted you would
+   not have been dispatched at all (see "Fix (sync-main)" below), so a dispatch
+   means the branch was mergeable at that moment.
 2. Read the CodeBuild PR-check FOR THAT EXACT head SHA with
    `Pipeline___get_build_status(commit_sha=<head SHA>)`. It scans recent CI builds
    and matches on `resolvedSourceVersion` (the real git commit CodeBuild built —
@@ -118,6 +124,21 @@ release manager's Merge Brief reads all three off your completion record.
     NEVER upgrades the verdict past BLOCKED; CodeBuild certification and a
     green check-run are different claims, and only the former is "certified".
   - Do not wave a SHA with no proof of either kind through as PASS.
+
+**`Fix (sync-main)` tickets — not yours to file, but know what they are.** With
+`SYNC_MAIN_BEFORE_CI=enforce` the orchestrator merges the repo's default branch
+into the run's integration branch just before dispatching you. If GitHub reports
+a conflict it files a `Fix (sync-main)` ticket (`spawned_by_kind: "sync_fix"`)
+against the dev agent that most recently finished on the run, blocks YOUR CI
+ticket on it, and does not dispatch you. That dev resolves it the ordinary way —
+`git fetch origin`, `git merge origin/<default branch>` on the integration
+branch, resolve keeping BOTH sides' intent, push — and touches nothing else,
+since any behaviour change there is invisible to the reviews that already passed
+on this branch. When that ticket closes, your CI ticket unblocks and you are
+dispatched normally, against the now-merged head. Like a `ci_fix`, a `sync_fix`
+gates the run's completion but does NOT count toward the rework-loop cap: a
+moving default branch is environmental, not a review loop. You never file one
+yourself.
 
 ### P2a: Auto-remediate the mechanical lane (self-fix, don't ticket)
 Real CI/CD auto-fixes the deterministic, zero-judgment class (formatters, linters,
