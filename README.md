@@ -362,12 +362,13 @@ Without `BUILDER_AGENT_ID`, the Build page falls back to a direct Converse API c
 The Workflow tab runs config-driven multi-agent pipelines. A pipeline's **shape**
 (ordered phases, intake agent, completion criteria, review gates) is defined in
 `src/config/workflows.json`; the **agent roster** is derived from
-`src/config/agents.json` (each agent tagged with `workflowDefId` + `phase`). Six
+`src/config/agents.json` (each agent tagged with `workflowDefId` + `phase`). Seven
 workflows ship by default:
 
 | Workflow | Intake → phases | Output |
 |----------|-----------------|--------|
 | **Software Delivery** | requirements → design → development → QA | a pull request |
+| **SDLC Playbook** | intent (product owner accepts) → spec (one author, org policies applied while writing) → plan.md before code (engineer approves) → build → review against the plan → QA | a pull request whose branch carries `.sdlc/<run>/{intent,spec,plan,findings}.md` |
 | **Bug Fix** | intake → triage → fix → QA | a fix PR |
 | **Dead Code Sweep** | intake → sweep → QA | a cleanup PR |
 | **Marketing Campaign** | strategy → creative (social/blog/ads) → assets → brand QA → scheduling | a launched campaign |
@@ -409,6 +410,25 @@ How it works (reuses the existing ticket cascade — no new engine):
 - In the UI ticket modal, the reviewer clicks **Approve** (→ done, the cascade resumes) or **Request changes** (→ blocked; a required note is fed back to the reworked agents).
 - Works in both backends: Jira shows the **In Review** column with a `reviewer:<who>` label; DynamoDB uses the `in_review` status.
 - `flagged` gates are opt-in checkboxes on the intake form; `always` gates apply to every run.
+
+### SDLC Playbook (AI-native loop)
+
+`sdlc-playbook` is the same ticket cascade run the way the AI-native SDLC
+playbook describes it: every stage ends by committing an artifact, the next
+stage starts by reading it, and every judgment call is a human gate.
+
+| Stage | Artifact (committed to the feature branch under `.sdlc/<workflowId>/`) | Gate |
+|-------|--------------------------------------------------------------------------|------|
+| Plan | `intent.md` — the request in the originator's own words (intake form template or MCP `intent`), never paraphrased | **Intent Acceptance** (`human:product-owner`) — created by the hub; nothing runs until approved |
+| Design | `spec.md` — one spec author (the requirements agent with `blueprints/spec-author.md`) writes requirements + design in one session, answering the four policy skills (`blueprints/policy-{security,compliance,brand,ux}.md`); unresolved rules land in a `## Concerns` table with the policy owner | **Spec Approval** (`human:product-owner`) |
+| Build | `plan.md` — a `Plan:` dev ticket writes the plan first (files, "what could this break?", tests, rollback); implementation tickets are blocked behind the gate and record deviations in the plan | **Plan Approval** (`human:engineer`) |
+| Test / Deploy | `findings.md` — the code reviewer diffs the branch against `plan.md` and `spec.md`; unrecorded deviation = finding | **Merge Approval** (CD-registered repos) or handoff PR |
+
+The orchestrator enforces the chain: a ticket that owes an artifact is sent
+back to Blocked (with the missing path) if the file is not on the branch when
+it closes (`lambda/orchestrator/artifact-chain.mjs`; `ARTIFACT_CHAIN_GATE=off`
+disables). The board's framework badge (STANDARD / PLAYBOOK) is stamped from
+the def at start.
 
 ### CD registry — who merges and deploys
 

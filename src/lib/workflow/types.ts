@@ -170,8 +170,8 @@ export interface WorkflowState {
   error?: string;
   /** Workflow classification — "feature" (default) or "bug" */
   workflowType?: WorkflowType;
-  /** SDLC framework the run follows — "playbook" (default) or "aidlc" */
-  sdlcFramework?: "playbook" | "aidlc";
+  /** SDLC framework the run follows — stamped from the def at start ("standard" | "playbook" | "aidlc"). */
+  sdlcFramework?: "standard" | "playbook" | "aidlc";
   /** Shared feature branch — all dev agents commit to this single branch */
   featureBranch?: string;
   /** QA verification retry counter (max 3 fix cycles before human escalation) */
@@ -261,6 +261,25 @@ export interface ModelOverride {
   openAiModelConfig?: { modelId: string; apiKeyArn: string };
 }
 
+/**
+ * The intent template (playbook PLAN stage). Every field is the originator's
+ * own words; the hub renders them into intent.md without rewriting.
+ */
+export interface IntentBrief {
+  /** What is wrong / missing today, and for whom. */
+  problem: string;
+  /** Who is affected (users, roles, teams) and how they experience it. */
+  who?: string;
+  /** How we will know it worked — observable outcomes, not implementation. */
+  successCriteria: string;
+  /** Hard constraints: deadlines, compliance, platforms, budgets, must-not-break. */
+  constraints?: string;
+  /** Explicitly not part of this request. */
+  outOfScope?: string;
+  /** Who is asking (name / role / channel), for the audit trail. */
+  originator?: string;
+}
+
 export interface WorkflowInput {
   title: string;
   description: string;
@@ -273,8 +292,14 @@ export interface WorkflowInput {
   connectors?: string[];
   /** Workflow classification — "feature" (default) or "bug" */
   workflowType?: WorkflowType;
-  /** SDLC framework the run follows — "playbook" (default) or "aidlc" */
-  sdlcFramework?: "playbook" | "aidlc";
+  /** SDLC framework the run follows — stamped from the def at start ("standard" | "playbook" | "aidlc"). */
+  sdlcFramework?: "standard" | "playbook" | "aidlc";
+  /**
+   * Playbook runs: the originator's intent, captured once in their own words.
+   * Rendered verbatim into intent.md (never paraphrased) and accepted by the
+   * product owner at the Intent Acceptance gate before any agent runs.
+   */
+  intent?: IntentBrief;
   /**
    * Which workflow definition (shape) to run. Resolved against workflows.json.
    * Absent → default ("software-delivery"), preserving legacy behavior.

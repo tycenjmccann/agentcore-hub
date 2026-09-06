@@ -17,28 +17,34 @@ describe('SDLC framework helper (TEAM-3048)', () => {
       expect(resolveSdlcFramework('aidlc')).toBe('aidlc');
     });
 
-    it('defaults undefined to "playbook"', () => {
-      expect(resolveSdlcFramework(undefined)).toBe('playbook');
+    it('returns "standard" for the exact string "standard"', () => {
+      expect(resolveSdlcFramework('standard')).toBe('standard');
     });
 
-    it('defaults null to "playbook"', () => {
-      expect(resolveSdlcFramework(null)).toBe('playbook');
+    // The framework is stamped from the def at start, so a row without one is a
+    // legacy standard run — it must NOT masquerade as a playbook run.
+    it('defaults undefined to "standard"', () => {
+      expect(resolveSdlcFramework(undefined)).toBe('standard');
     });
 
-    it('defaults empty string to "playbook"', () => {
-      expect(resolveSdlcFramework('')).toBe('playbook');
+    it('defaults null to "standard"', () => {
+      expect(resolveSdlcFramework(null)).toBe('standard');
     });
 
-    it('defaults unrecognized strings to "playbook"', () => {
-      expect(resolveSdlcFramework('some-future-value')).toBe('playbook');
-      expect(resolveSdlcFramework('AIDLC')).toBe('playbook');
-      expect(resolveSdlcFramework('ai-dlc')).toBe('playbook');
+    it('defaults empty string to "standard"', () => {
+      expect(resolveSdlcFramework('')).toBe('standard');
     });
 
-    it('defaults non-strings to "playbook"', () => {
-      expect(resolveSdlcFramework(42)).toBe('playbook');
-      expect(resolveSdlcFramework({})).toBe('playbook');
-      expect(resolveSdlcFramework(true)).toBe('playbook');
+    it('defaults unrecognized strings to "standard"', () => {
+      expect(resolveSdlcFramework('some-future-value')).toBe('standard');
+      expect(resolveSdlcFramework('AIDLC')).toBe('standard');
+      expect(resolveSdlcFramework('ai-dlc')).toBe('standard');
+    });
+
+    it('defaults non-strings to "standard"', () => {
+      expect(resolveSdlcFramework(42)).toBe('standard');
+      expect(resolveSdlcFramework({})).toBe('standard');
+      expect(resolveSdlcFramework(true)).toBe('standard');
     });
   });
 
@@ -46,6 +52,7 @@ describe('SDLC framework helper (TEAM-3048)', () => {
 
   describe('SDLC_BADGE_META', () => {
     it('has the correct labels', () => {
+      expect(SDLC_BADGE_META.standard.label).toBe('STANDARD');
       expect(SDLC_BADGE_META.playbook.label).toBe('PLAYBOOK');
       expect(SDLC_BADGE_META.aidlc.label).toBe('AI-DLC');
     });
@@ -102,9 +109,15 @@ describe('SDLC framework helper (TEAM-3048)', () => {
       expect(SDLC_BADGE_META[fw].label).toBe('AI-DLC');
     });
 
-    it('a state without the field compiles and defaults to the PLAYBOOK label', () => {
+    it('a state without the field compiles and defaults to the STANDARD label', () => {
       const withoutField: WorkflowState = { ...base };
       const fw = resolveSdlcFramework(withoutField.sdlcFramework ?? withoutField.input?.sdlcFramework);
+      expect(SDLC_BADGE_META[fw].label).toBe('STANDARD');
+    });
+
+    it('a state with sdlcFramework: "playbook" yields the PLAYBOOK label', () => {
+      const playbook: WorkflowState = { ...base, sdlcFramework: 'playbook' };
+      const fw = resolveSdlcFramework(playbook.sdlcFramework ?? playbook.input?.sdlcFramework);
       expect(SDLC_BADGE_META[fw].label).toBe('PLAYBOOK');
     });
   });
