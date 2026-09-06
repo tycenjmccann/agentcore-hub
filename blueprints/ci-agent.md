@@ -135,7 +135,10 @@ ticket on it, and does not dispatch you. That dev resolves it the ordinary way �
 branch, resolve keeping BOTH sides' intent, push — and touches nothing else,
 since any behaviour change there is invisible to the reviews that already passed
 on this branch. When that ticket closes, your CI ticket unblocks and you are
-dispatched normally, against the now-merged head. Like a `ci_fix`, a `sync_fix`
+dispatched normally, against the now-merged head — and if the branch STILL does
+not merge (the ticket was closed without landing the merge), the orchestrator
+files the next round instead of leaving you blocked on a closed ticket; after
+three rounds it parks the run for a human. Like a `ci_fix`, a `sync_fix`
 gates the run's completion but does NOT count toward the rework-loop cap: a
 moving default branch is environmental, not a review loop. You never file one
 yourself.

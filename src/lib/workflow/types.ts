@@ -75,6 +75,13 @@ export interface JiraTicket {
     rearmOf?: string;
     /** The commit the finding was observed at, when the producer knows it. */
     headSha?: string;
+    /**
+     * TEAM-4131 F1: the earlier fix ticket this one supersedes because it was
+     * CLOSED without resolving the finding, and which attempt this is (1-based).
+     * Used by sync-main's conflict rounds; `round` is capped by the filer.
+     */
+    priorFixTicketId?: string;
+    round?: number;
   };
   /**
    * TEAM-4121 FR-8: the fix contract — what must hold after the fix, and the

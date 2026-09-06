@@ -87,8 +87,15 @@ export const SPAWN_ORIGIN_KEYS = ["gateTicketId", "qaTicketId", "codexTicketId",
 
 // Allow-listed non-origin `spawned_by` keys: reverify (boolean — this fix is a
 // re-verification of an earlier one), rearmOf (the ticket whose gate is being
-// re-armed), headSha (the commit the evidence was gathered against).
-export const SPAWN_EXTRA_KEYS = ["reverify", "rearmOf", "headSha"];
+// re-armed), headSha (the commit the evidence was gathered against),
+// priorFixTicketId + round (TEAM-4131 F1 — the fix ticket THIS one supersedes and
+// which attempt this is, for the sync-main conflict rounds; the origin key stays
+// ciTicketId, `priorFixTicketId` is lineage, not an origin).
+export const SPAWN_EXTRA_KEYS = ["reverify", "rearmOf", "headSha", "priorFixTicketId", "round"];
+
+// `round` is the one numeric member of a spawned_by marker. Capped so a hostile
+// or buggy caller cannot write an arbitrary number onto the ticket record.
+const MAX_SPAWN_ROUND = 99;
 
 export const EVIDENCE_SOURCES = ["static", "unit", "live"];
 
@@ -112,6 +119,23 @@ export const SYSTEM_LABEL_PREFIXES = [
   "human-review",
   "ci:",
 ];
+
+// TEAM-4131 F2 — labels that are RESERVED on some tickets rather than globally.
+//
+// `advisory` is read by the orchestrator as "backlog the run does not wait on":
+// under ADVISORY_ROUTING=enforce, completion.mjs drops an advisory-labelled child
+// out of EVERY completion gate. It is a legitimate user label on an ordinary
+// backlog ticket, which is why it is not in SYSTEM_LABEL_PREFIXES. But on a FIX
+// ticket it is a bypass: any agent (or a prompt-injected one) filing a real
+// qa_fix with labels="advisory" would make the run finalize with that fix still
+// open — the exact gate the fix exists to hold. Same for a `human:` gate ticket,
+// whose whole purpose is to be waited on.
+//
+// So the word is dropped (and REPORTED as dropped) on those two ticket shapes,
+// and passes through untouched everywhere else. This is the write-side half of a
+// defense in depth: completion.mjs refuses to honour the label on those shapes
+// even if one is already stored from before this guard existed.
+export const RESERVED_ADVISORY_LABEL = "advisory";
 
 export const TICKET_KEY_RE = /^[A-Z][A-Z0-9]+-\d+$/;
 
@@ -471,6 +495,20 @@ export function contractLabels(contract, meta = {}) {
 }
 
 /**
+ * Is `advisory` a forbidden label on THIS ticket? True for any fix ticket (a
+ * sanitized spawned_by with a known kind) and any human-review gate. See
+ * RESERVED_ADVISORY_LABEL for why.
+ *
+ * Takes the ALREADY-SANITIZED spawnedBy (sanitizeSpawnedBy's `value`) so a caller
+ * cannot reserve/unreserve the word with a junk kind, but also accepts the raw
+ * marker shape defensively — the only thing that matters is a known kind.
+ */
+export function advisoryIsReserved({ spawnedBy, assignee } = {}) {
+  if (spawnedBy && typeof spawnedBy === "object" && FIX_KINDS.includes(spawnedBy.kind)) return true;
+  return typeof assignee === "string" && assignee.startsWith("human:");
+}
+
+/**
  * Normalize caller-supplied labels and drop any that squat a system namespace.
  * Returns { labels, dropped } — `dropped` is reported back to the caller rather
  * than silently swallowed, so an agent learns its label was refused instead of
@@ -479,8 +517,13 @@ export function contractLabels(contract, meta = {}) {
  * The namespace check runs on the lowercased/trimmed input BEFORE character
  * substitution: normalization maps ":" → "-", so checking afterwards would let
  * "fix:qa_fix" through as "fix-qa_fix" and defeat the point.
+ *
+ * TEAM-4131 F2 — the optional second argument carries the ticket's SHAPE
+ * ({ spawnedBy, assignee }). With it, `advisory` is additionally dropped on a fix
+ * ticket or a human gate. Omitted (the ordinary backlog-ticket call), behaviour
+ * is byte-identical to before: `advisory` is a perfectly good user label there.
  */
-export function sanitizeUserLabels(labels) {
+export function sanitizeUserLabels(labels, shape = {}) {
   const raw = labels === undefined || labels === null
     ? []
     : Array.isArray(labels)
@@ -492,6 +535,7 @@ export function sanitizeUserLabels(labels) {
   const out = [];
   const dropped = [];
   const seen = new Set();
+  const noAdvisory = advisoryIsReserved(shape);
 
   for (const item of raw) {
     if (typeof item !== "string") {
@@ -501,6 +545,13 @@ export function sanitizeUserLabels(labels) {
     const lowered = item.trim().toLowerCase();
     if (lowered === "") continue;
     if (SYSTEM_LABEL_PREFIXES.some((p) => lowered.startsWith(p))) {
+      dropped.push(lowered);
+      continue;
+    }
+    // EXACT word only, like completion.mjs's reader: "advisory-ish" is a real
+    // label and stays. Checked on the trimmed/lowercased input for the same
+    // reason the namespace check is.
+    if (noAdvisory && lowered === RESERVED_ADVISORY_LABEL) {
       dropped.push(lowered);
       continue;
     }
@@ -551,6 +602,13 @@ export function sanitizeSpawnedBy(raw) {
     if (raw[k] === undefined || raw[k] === null) continue;
     if (k === "reverify") {
       value.reverify = Boolean(raw.reverify);
+      continue;
+    }
+    if (k === "round") {
+      // Accept the string form too: agents fill this from a prompt, and "2" is
+      // the shape a JSON-ish tool call most often produces.
+      const n = Number(raw.round);
+      if (Number.isFinite(n) && n >= 1 && n <= MAX_SPAWN_ROUND) value.round = Math.floor(n);
       continue;
     }
     if (typeof raw[k] === "string" && BARE_ID_RE.test(raw[k])) value[k] = raw[k];

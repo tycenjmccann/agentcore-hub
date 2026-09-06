@@ -330,7 +330,12 @@ async function createTicket(args) {
   // Caller-supplied labels are sanitized independently of the contract flag —
   // dropping a label that squats a system namespace (fix:/wf:/agent:/…) is a
   // provenance-forgery guard, not a contract rule.
-  const userLabels = sanitizeUserLabels(labels);
+  //
+  // TEAM-4131 F2: the ticket's SHAPE goes in too, so `advisory` is refused on a
+  // fix ticket or a human gate — on those, the label is a completion-gate bypass
+  // (see RESERVED_ADVISORY_LABEL), not a routing hint. `spawn.value` is the
+  // already-sanitized marker, so a junk kind cannot buy the exemption.
+  const userLabels = sanitizeUserLabels(labels, { spawnedBy: spawn.value, assignee });
 
   // Validate assignee against known agent roster. "human:<who>" assignees are
   // human-review gates — not agents — and are always allowed (the orchestrator

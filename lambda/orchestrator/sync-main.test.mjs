@@ -705,6 +705,272 @@ describe("enforce — 409 conflict files ONE sync_fix ticket and holds CI", () =
 
 // ─── other merge failures ────────────────────────────────────────────────────
 
+// ─── TEAM-4131 F1 ────────────────────────────────────────────────────────────
+
+describe("TEAM-4131 F1 — a CLOSED fix ticket is never reused, and the rounds are capped", () => {
+  /**
+   * The finding: the reuse decision only looked at the RECORD, never at the fix
+   * ticket. A dev who closes the sync_fix without landing the merge left CI
+   * blocked on a ticket that can never fire another `done` event — a permanent
+   * wedge, or (with the reconcile sweep re-readying CI) an invisible loop that
+   * files nothing and says nothing.
+   *
+   * So the assertions here are mostly NEGATIVE and they are about the BLOCKER
+   * EDGE, not the return value: `addBlockers` must never be handed the closed id.
+   * A test that only checked `fixTicketId` in the result would pass while still
+   * pointing the edge at the corpse.
+   */
+  const FIX2 = "TEAM-501";
+  const conflictRoutes = () => ({
+    [`GET ${branchesPath()}`]: { status: 200, body: { commit: { sha: MAIN_SHA } } },
+    [`POST ${mergesPath()}`]: { status: 409, body: { message: "Merge conflict" } },
+    [`GET ${comparePath(HEAD, BASE)}`]: { status: 200, body: { files: [{ filename: "a.ts" }] } },
+    [`GET ${comparePath(BASE, HEAD)}`]: { status: 200, body: { files: [{ filename: "a.ts" }] } },
+  });
+  const priorConflict = (over = {}) => ({
+    ciTicketId: CI, baseHeadSha: MAIN_SHA, status: "conflict", fixTicketId: FIX_ID, files: ["b.ts"], ...over,
+  });
+  const runningCi = () => ({ [CI]: { agentId: "agentcore_hub_ci_agent", status: "running" } });
+  /** every id ever passed to addBlockers, flattened */
+  const blockedOn = (deps) => deps.addBlockers.mock.calls.flatMap(([, ids]) => ids);
+
+  it("(a) prior fix is DONE and the branch still conflicts → a round-2 ticket, and the closed id is never blocked on", async () => {
+    const { deps, event } = makeDeps(conflictRoutes(), {
+      getTicketStatus: vi.fn(async () => "done"),
+      invokeTickets: vi.fn(async () => ({ key: FIX2 })),
+    });
+    const wf = makeWorkflow({ syncMain: priorConflict(), agentTasks: runningCi() });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    expect(deps.getTicketStatus).toHaveBeenCalledWith(FIX_ID);
+    expect(r).toMatchObject({ outcome: "conflict", fixTicketId: FIX2, round: 2, priorFixTicketId: FIX_ID });
+
+    expect(deps.invokeTickets).toHaveBeenCalledTimes(1);
+    const [tool, payload] = deps.invokeTickets.mock.calls[0];
+    expect(tool).toBe("create_ticket");
+    expect(payload.spawned_by).toEqual({ kind: "sync_fix", ciTicketId: CI, priorFixTicketId: FIX_ID, round: 2 });
+    // …and the lineage SURVIVES the tickets Lambda: sanitizeSpawnedBy drops any
+    // key that is not allow-listed, silently, so the round would otherwise be
+    // written by the orchestrator and thrown away on arrival.
+    expect(sanitizeSpawnedBy(payload.spawned_by).value).toEqual(payload.spawned_by);
+    // Round 1 and round 2 would otherwise have byte-identical summaries.
+    expect(payload.summary).toContain("(round 2)");
+    expect(payload.description).toContain(FIX_ID);
+    expect(payload.description).toContain("round 2");
+
+    expect(deps.addBlockers).toHaveBeenCalledTimes(1);
+    expect(deps.addBlockers).toHaveBeenCalledWith(CI, [FIX2]);
+    expect(blockedOn(deps)).not.toContain(FIX_ID); // the whole point of the finding
+    expect(deps.store.setSyncMain).toHaveBeenCalledWith(WF, expect.objectContaining({
+      status: "conflict", fixTicketId: FIX2, round: 2, priorFixTicketId: FIX_ID,
+    }));
+    expect(event("workflow.sync_conflict")[0].detail).toMatchObject({
+      fixTicketId: FIX2, round: 2, priorFixTicketId: FIX_ID, priorStatus: "done",
+    });
+  });
+
+  it("every closed status counts, case-folded — and `cancelled` is not special-cased away", async () => {
+    for (const status of ["done", "Done", " CANCELLED ", "cancelled", "skipped"]) {
+      const { deps } = makeDeps(conflictRoutes(), {
+        getTicketStatus: vi.fn(async () => status),
+        invokeTickets: vi.fn(async () => ({ key: FIX2 })),
+      });
+      const wf = makeWorkflow({ syncMain: priorConflict(), agentTasks: runningCi() });
+      const r = await syncBeforeCi(wf, ciTicket(), deps);
+      expect(r, `status ${JSON.stringify(status)}`).toMatchObject({ fixTicketId: FIX2, round: 2 });
+      expect(blockedOn(deps), `status ${JSON.stringify(status)}`).toEqual([FIX2]);
+    }
+  });
+
+  it("a pre-TEAM-4131 record has no `round` — one filed ticket IS round 1, so the closed one becomes round 2", async () => {
+    const { deps } = makeDeps(conflictRoutes(), {
+      getTicketStatus: vi.fn(async () => "done"),
+      invokeTickets: vi.fn(async () => ({ key: FIX2 })),
+    });
+    // No `round` key at all: the record was written by the code this fix replaces.
+    const wf = makeWorkflow({ syncMain: priorConflict(), agentTasks: runningCi() });
+    expect(await syncBeforeCi(wf, ciTicket(), deps)).toMatchObject({ round: 2 });
+  });
+
+  it("(b) prior fix is still OPEN → reuse exactly as before, no second ticket", async () => {
+    for (const status of ["ready", "in_progress", "blocked", "in_review"]) {
+      const { deps, event } = makeDeps(conflictRoutes(), { getTicketStatus: vi.fn(async () => status) });
+      const wf = makeWorkflow({ syncMain: priorConflict({ round: 1 }), agentTasks: runningCi() });
+
+      const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+      expect(r, status).toMatchObject({
+        outcome: "conflict", fixTicketId: FIX_ID, reason: "already_ticketed", round: 1, files: ["b.ts"],
+      });
+      expect(r.reusedUnverified, status).toBeUndefined();
+      expect(deps.invokeTickets, status).not.toHaveBeenCalled();
+      expect(blockedOn(deps), status).toEqual([FIX_ID]);
+      expect(event("workflow.sync_conflict")[0].detail).toMatchObject({ alreadyTicketed: true, reusedUnverified: false });
+    }
+  });
+
+  it("(c) the status lookup THROWS → reuse, marked unverified, never a duplicate ticket", async () => {
+    const { deps, event } = makeDeps(conflictRoutes(), {
+      getTicketStatus: vi.fn(async () => { throw new Error("dynamodb down"); }),
+    });
+    const wf = makeWorkflow({ syncMain: priorConflict({ round: 2 }), agentTasks: runningCi() });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    // Fail OPEN to the pre-4131 behaviour: a ticket-store blip must not start
+    // filing duplicate tickets at a dev. The marker is how the timeline says the
+    // reuse was never confirmed.
+    expect(r).toMatchObject({ outcome: "conflict", fixTicketId: FIX_ID, reason: "already_ticketed", reusedUnverified: true });
+    expect(deps.invokeTickets).not.toHaveBeenCalled();
+    expect(blockedOn(deps)).toEqual([FIX_ID]);
+    expect(event("workflow.sync_conflict")[0].detail).toMatchObject({ reusedUnverified: true, round: 2 });
+    expect(deps.store.setSyncMain).toHaveBeenCalledWith(WF, expect.objectContaining({ reusedUnverified: true }));
+  });
+
+  it("a MISSING ticket (null) is unknown, not closed — the fail-open direction is 'keep today's behaviour'", async () => {
+    const { deps } = makeDeps(conflictRoutes(), { getTicketStatus: vi.fn(async () => null) });
+    const wf = makeWorkflow({ syncMain: priorConflict(), agentTasks: runningCi() });
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+    expect(r).toMatchObject({ fixTicketId: FIX_ID, reason: "already_ticketed", reusedUnverified: true });
+    expect(deps.invokeTickets).not.toHaveBeenCalled();
+  });
+
+  it("no getTicketStatus seam wired at all → reuse unverified (an older deps object must not change behaviour)", async () => {
+    const { deps } = makeDeps(conflictRoutes());
+    const wf = makeWorkflow({ syncMain: priorConflict(), agentTasks: runningCi() });
+    expect(await syncBeforeCi(wf, ciTicket(), deps)).toMatchObject({
+      fixTicketId: FIX_ID, reason: "already_ticketed", reusedUnverified: true,
+    });
+  });
+
+  it("(d) the round cap parks the run: no new ticket, and NOTHING is blocked on the closed id", async () => {
+    const { deps, event } = makeDeps(conflictRoutes(), {
+      getTicketStatus: vi.fn(async () => "done"),
+      maxSyncFixRounds: 3,
+    });
+    const wf = makeWorkflow({ syncMain: priorConflict({ round: 3 }), agentTasks: runningCi() });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    expect(r).toMatchObject({
+      outcome: "conflict", reason: "round_cap", round: 3, priorFixTicketId: FIX_ID, parked: true,
+    });
+    expect(r.fixTicketId).toBeUndefined(); // there is nothing to wait on, by design
+    expect(deps.invokeTickets).not.toHaveBeenCalled();
+    expect(deps.addBlockers).not.toHaveBeenCalled();
+    expect(event("workflow.sync_conflict_parked")[0].detail).toMatchObject({
+      ticketId: CI, base: BASE, head: HEAD, priorFixTicketId: FIX_ID, priorStatus: "done", round: 3, maxRounds: 3,
+    });
+    expect(deps.store.setSyncMain).toHaveBeenCalledWith(WF, expect.objectContaining({
+      status: "parked", fixTicketId: null, priorFixTicketId: FIX_ID, round: 3,
+    }));
+    // The claim IS released: leaving the entry "running" forever is the other
+    // shape of the same wedge. A re-dispatch is harmless — see the next test.
+    expect(deps.store.setTaskStatus).toHaveBeenCalledWith(WF, CI, "ready");
+    expect(wf.agentTasks[CI].status).toBe("ready");
+    // outcome conflict ⇒ the caller does not dispatch CI.
+    expect(r.outcome).toBe("conflict");
+  });
+
+  it("a PARKED record short-circuits every redelivery: no merge, no ticket, no blocker, no record write", async () => {
+    const { deps, gh: g } = makeDeps(conflictRoutes(), { getTicketStatus: vi.fn(async () => "done") });
+    const wf = makeWorkflow({
+      syncMain: { ciTicketId: CI, baseHeadSha: MAIN_SHA, status: "parked", fixTicketId: null, priorFixTicketId: FIX_ID, round: 3, files: ["b.ts"] },
+      agentTasks: runningCi(),
+    });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    expect(r).toMatchObject({ outcome: "conflict", reason: "round_cap", round: 3, priorFixTicketId: FIX_ID, parked: true, files: ["b.ts"] });
+    // Only the idempotency-key read. No POST /merges — a parked run must not keep
+    // re-attempting a merge that provably conflicts.
+    expect(g.keys()).toEqual([`GET ${branchesPath()}`]);
+    expect(deps.getTicketStatus).not.toHaveBeenCalled();
+    expect(deps.invokeTickets).not.toHaveBeenCalled();
+    expect(deps.addBlockers).not.toHaveBeenCalled();
+    expect(deps.store.setSyncMain).not.toHaveBeenCalled();
+    // The claim IS released on every redelivery — the caller took it BEFORE
+    // calling syncBeforeCi, so without this the entry reads "running" forever
+    // with no agent ever invoked. The write is idempotent (same "ready" value
+    // every time), so a redelivery is still a near no-op — just not a claim leak.
+    expect(deps.store.setTaskStatus).toHaveBeenCalledWith(WF, CI, "ready");
+    expect(wf.agentTasks[CI].status).toBe("ready");
+    expect(deps.publishEvent).not.toHaveBeenCalled(); // one parked event, not one per redelivery
+  });
+
+  it("main MOVING un-parks the run — a new baseHeadSha is a new conflict, so the rounds start over", async () => {
+    const { deps } = makeDeps(conflictRoutes(), {
+      getTicketStatus: vi.fn(async () => "done"),
+      invokeTickets: vi.fn(async () => ({ key: FIX2 })),
+    });
+    const wf = makeWorkflow({
+      syncMain: { ciTicketId: CI, baseHeadSha: "0".repeat(40), status: "parked", priorFixTicketId: FIX_ID, round: 3 },
+      agentTasks: runningCi(),
+    });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    expect(r).toMatchObject({ outcome: "conflict", fixTicketId: FIX2, round: 1 });
+    expect(deps.getTicketStatus).not.toHaveBeenCalled(); // no prior fix for THIS head
+    expect(deps.invokeTickets.mock.calls[0][1].spawned_by).toEqual({ kind: "sync_fix", ciTicketId: CI });
+  });
+
+  it("maxSyncFixRounds is overridable: with a cap of 1, one closed ticket parks immediately", async () => {
+    const { deps } = makeDeps(conflictRoutes(), {
+      getTicketStatus: vi.fn(async () => "done"),
+      maxSyncFixRounds: 1,
+    });
+    const wf = makeWorkflow({ syncMain: priorConflict({ round: 1 }), agentTasks: runningCi() });
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+    expect(r).toMatchObject({ reason: "round_cap", round: 1 });
+    expect(deps.invokeTickets).not.toHaveBeenCalled();
+  });
+
+  it("a garbage cap falls back to the default rather than parking on round 1", async () => {
+    for (const cap of [0, -3, NaN, "three", null]) {
+      const { deps } = makeDeps(conflictRoutes(), {
+        getTicketStatus: vi.fn(async () => "done"),
+        invokeTickets: vi.fn(async () => ({ key: FIX2 })),
+        maxSyncFixRounds: cap,
+      });
+      const wf = makeWorkflow({ syncMain: priorConflict({ round: 1 }), agentTasks: runningCi() });
+      // round 2 <= the default 3 → still ticketed, not parked.
+      expect(await syncBeforeCi(wf, ciTicket(), deps), String(cap)).toMatchObject({ fixTicketId: FIX2, round: 2 });
+    }
+  });
+
+  it("the round-2 fix contract still passes the tickets Lambda's own validateFixContract", async () => {
+    const { deps } = makeDeps(conflictRoutes(), {
+      getTicketStatus: vi.fn(async () => "done"),
+      invokeTickets: vi.fn(async () => ({ key: FIX2 })),
+    });
+    const wf = makeWorkflow({ syncMain: priorConflict(), agentTasks: runningCi() });
+    await syncBeforeCi(wf, ciTicket(), deps);
+    const { fix_contract } = deps.invokeTickets.mock.calls[0][1];
+    expect(validateFixContract(fix_contract, { kind: "sync_fix" }).ok).toBe(true);
+  });
+
+  it("create_ticket failing on a round-2 attempt fails OPEN and burns no round", async () => {
+    const { deps } = makeDeps(conflictRoutes(), {
+      getTicketStatus: vi.fn(async () => "done"),
+      invokeTickets: vi.fn(async () => { throw new Error("tickets lambda down"); }),
+    });
+    const wf = makeWorkflow({ syncMain: priorConflict({ round: 2 }), agentTasks: runningCi() });
+
+    const r = await syncBeforeCi(wf, ciTicket(), deps);
+
+    // CI dispatches un-synced (pre-FR-6 behaviour) rather than being held on a
+    // closed ticket, and the persisted record carries NO round: nothing was filed,
+    // so nothing may be counted against the human-escalation budget.
+    expect(r).toMatchObject({ outcome: "skipped", reason: "conflict_unticketed" });
+    expect(deps.addBlockers).not.toHaveBeenCalled();
+    const [, record] = deps.store.setSyncMain.mock.calls.at(-1);
+    expect(record).toMatchObject({ status: "conflict", fixTicketId: null, priorFixTicketId: FIX_ID });
+    expect(record.round).toBeUndefined();
+  });
+});
+
 describe("every other merge failure fails OPEN", () => {
   for (const status of [404, 422, 500, 502]) {
     it(`${status} → skipped with the status, sync_skipped, no ticket, no setSyncMain`, async () => {
