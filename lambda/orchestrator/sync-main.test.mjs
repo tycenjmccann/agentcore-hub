@@ -873,7 +873,7 @@ describe("TEAM-4131 F1 — a CLOSED fix ticket is never reused, and the rounds a
     expect(r.outcome).toBe("conflict");
   });
 
-  it("a PARKED record short-circuits every redelivery: no merge, no ticket, no blocker, no write", async () => {
+  it("a PARKED record short-circuits every redelivery: no merge, no ticket, no blocker, no record write", async () => {
     const { deps, gh: g } = makeDeps(conflictRoutes(), { getTicketStatus: vi.fn(async () => "done") });
     const wf = makeWorkflow({
       syncMain: { ciTicketId: CI, baseHeadSha: MAIN_SHA, status: "parked", fixTicketId: null, priorFixTicketId: FIX_ID, round: 3, files: ["b.ts"] },
@@ -890,7 +890,12 @@ describe("TEAM-4131 F1 — a CLOSED fix ticket is never reused, and the rounds a
     expect(deps.invokeTickets).not.toHaveBeenCalled();
     expect(deps.addBlockers).not.toHaveBeenCalled();
     expect(deps.store.setSyncMain).not.toHaveBeenCalled();
-    expect(deps.store.setTaskStatus).not.toHaveBeenCalled();
+    // The claim IS released on every redelivery — the caller took it BEFORE
+    // calling syncBeforeCi, so without this the entry reads "running" forever
+    // with no agent ever invoked. The write is idempotent (same "ready" value
+    // every time), so a redelivery is still a near no-op — just not a claim leak.
+    expect(deps.store.setTaskStatus).toHaveBeenCalledWith(WF, CI, "ready");
+    expect(wf.agentTasks[CI].status).toBe("ready");
     expect(deps.publishEvent).not.toHaveBeenCalled(); // one parked event, not one per redelivery
   });
 

@@ -304,14 +304,19 @@ export async function syncBeforeCi(workflow, ticket, deps = {}) {
     // WHAT UNBLOCKS A PARKED RUN: a human. Either they merge `head` into the
     // feature branch by hand (which makes the next dispatch a 204/noop and the
     // record converge on its own), or they move `main` (a new baseHeadSha makes
-    // `samePrior` false and the rounds start over), or they cancel the run. The
-    // CI ticket is left un-dispatched but NOT blocked and NOT claimed, so nothing
-    // has to be un-wound first.
+    // `samePrior` false and the rounds start over), or they cancel the run.
+    //
+    // The CI ticket is left un-dispatched and NOT blocked, but its claim IS
+    // released on every redelivery (an idempotent write of the same "ready"
+    // value) — the caller takes the claim BEFORE calling syncBeforeCi, so without
+    // this the entry would read "running" forever with no agent ever invoked,
+    // exactly the misleading state blockOnFix's own comment warns about.
     if (samePrior && prior.status === "parked") {
       warn(
         `${workflowId}: ${ticketId} is PARKED on the ${base} ↔ ${head} conflict after ` +
         `${recordedRound(prior)} sync_fix round(s) — a human must merge ${head} by hand`
       );
+      await releaseClaim();
       return {
         outcome: "conflict", reason: "round_cap", baseHeadSha,
         round: recordedRound(prior),
