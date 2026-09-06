@@ -40,6 +40,9 @@ const h = vi.hoisted(() => ({
     // markGateRejected's CAS outcome: true → this caller claimed the rejection,
     // false → another deliverer already closed it (ConditionalCheckFailed).
     rejectClaims: true,
+    // markGateRejectedFromLegacy's CAS outcome (TEAM-4129 F2). false = a
+    // concurrent deliverer converged the legacy row first.
+    legacyClaims: true,
     // Make the ledger write throw, to exercise the guard's fail-open catch.
     gateWriteThrows: false,
   },
@@ -122,6 +125,24 @@ vi.mock("./workflow-store.mjs", () => {
     markGateRequested: ledger("requested", true),
     markGateRejected: ledger("rejected", () => (h.state.rejectClaims ? { state: "rejected", cycles: [{}] } : null)),
     markGateApproved: ledger("approved", () => ({ state: "approved", cycles: [{}] })),
+    // TEAM-4129 F2 — the legacy converge. A REAL store CAS leaves the row in
+    // `rejected`, so this fake mutates the in-memory workflow the same way: the
+    // next delivery must read the converged state, which is the entire point.
+    markGateRejectedFromLegacy: vi.fn(async (wfId, ticketId, at) => {
+      h.state.gateWrites.push({ op: "rejected_legacy", wfId, ticketId, at });
+      if (h.state.gateWriteThrows) throw new Error("ledger unavailable");
+      if (!h.state.legacyClaims) return false; // a concurrent twin got there first
+      const wf = h.state.workflow;
+      if (wf) {
+        wf.gateStates = wf.gateStates || {};
+        wf.gateStates[ticketId] = {
+          state: "rejected",
+          resolvedAt: at,
+          cycles: [{ requestedAt: null, resolvedAt: at, outcome: "rejected", source: "legacy" }],
+        };
+      }
+      return true;
+    }),
   };
 });
 
@@ -201,6 +222,7 @@ beforeEach(() => {
   h.state.gateWrites.length = 0;
   h.state.workflowReads = 0;
   h.state.rejectClaims = true;
+  h.state.legacyClaims = true;
   h.state.gateWriteThrows = false;
   // escalated:true short-circuits handleReviewRejection before the re-open loop —
   // all we need to know is whether the handler was reached.
@@ -332,8 +354,12 @@ describe("GATE_STATE_GUARD=enforce — the DDB-stream twin", () => {
 
     expect(h.state.enforce).toHaveBeenCalledTimes(1);
     expect(ignored()).toEqual([]);
-    expect(writesOfOp("rejected")).toHaveLength(1);
-    expect(writesOfOp("rejected")[0].opts).toEqual({ requestedAt: undefined });
+    // TEAM-4129 F2: the LEGACY CAS, and only it — markGateRejected's
+    // `state = "requested"` can never hold on such a row, so attempting it was a
+    // guaranteed-lost write that also left the ledger unconverged.
+    expect(writesOfOp("rejected_legacy")).toHaveLength(1);
+    expect(writesOfOp("rejected_legacy")[0]).toMatchObject({ wfId: "wf_1", ticketId: GATE });
+    expect(writesOfOp("rejected")).toHaveLength(0);
   });
 
   it("an acknowledged review_needed still fails open (both conclusions ack it)", async () => {
@@ -354,19 +380,21 @@ describe("GATE_STATE_GUARD=enforce — the DDB-stream twin", () => {
     expect(ignored()[0]).toMatchObject({ reason: "unrequested", legacyFallback: true });
   });
 
-  it("on a legacy run a LOST CAS is never read as a duplicate — the rejection still lands", async () => {
+  it("a `none`-seeded row is legacy too: admitted via the legacy CAS, not the requested one", async () => {
     // The reason legacyFallback is `state not in GATE_STATES` and not `!gateState`:
-    // a seeded-but-never-requested row exists as an object, and its CAS ALWAYS
-    // fails (state "none" ≠ "requested"). Reading that as "already rejected"
-    // would silently swallow a real human Request-changes.
+    // a seeded-but-never-requested row exists as an object, and markGateRejected's
+    // CAS can never hold on it (state "none" ≠ "requested"). Losing THAT write was
+    // never a duplicate — which is why the legacy row gets its own CAS.
     setWorkflow({ gateState: "none", notifications: [reviewNeeded()] });
-    h.state.rejectClaims = false;
+    h.state.rejectClaims = false; // the requested-CAS outcome is now irrelevant here
 
     await handler(streamEvent());
 
     expect(h.state.enforce).toHaveBeenCalledTimes(1);
     expect(eventsOfType("review.rejected")).toHaveLength(1);
     expect(ignored()).toEqual([]);
+    expect(writesOfOp("rejected_legacy")).toHaveLength(1);
+    expect(writesOfOp("rejected")).toHaveLength(0);
   });
 
   it("a creation-time `todo → blocked` never reaches the guard at all", async () => {
@@ -402,6 +430,142 @@ describe("GATE_STATE_GUARD=enforce — the DDB-stream twin", () => {
     // handed on exactly as it was before the guard existed.
     expect(h.state.gateWrites).toEqual([]);
     expect(ignored()).toEqual([]);
+  });
+});
+
+/**
+ * TEAM-4129 F2 — a legacy row must CONVERGE, or enforce protects nothing on any
+ * run that predates the flag.
+ *
+ * Before the fix: the legacy admit ran markGateRejected, whose CAS
+ * (`state = "requested"`) can never hold on an absent / `none` row, so the ledger
+ * stayed unconverged; `|| legacyFallback` then re-admitted every redelivery, and
+ * handleReviewRejection reopened the same upstream work again. The state the fake
+ * store flips here is exactly what the real CAS leaves behind.
+ */
+describe("legacy rows converge to `rejected` (TEAM-4129 F2)", () => {
+  const legacy = () => setWorkflow({ notifications: [reviewNeeded()] }); // no gateStates at all
+
+  it("enforce: two identical deliveries → the FIRST is admitted, the second is a duplicate", async () => {
+    await load("enforce");
+    legacy();
+
+    await handler(streamEvent());
+    expect(h.state.enforce).toHaveBeenCalledTimes(1);
+    expect(eventsOfType("review.rejected")).toHaveLength(1);
+    expect(writesOfOp("rejected_legacy")).toHaveLength(1);
+    // The ledger no longer lies about this gate.
+    expect(h.state.workflow.gateStates[GATE].state).toBe("rejected");
+
+    // The SAME transition again (webhook redelivery, or the stream twin).
+    await handler(streamEvent());
+
+    expect(h.state.enforce).toHaveBeenCalledTimes(1); // NOT reopened twice
+    expect(eventsOfType("review.rejected")).toHaveLength(1);
+    // Classified off the converged row, so no second CAS is even attempted.
+    expect(writesOfOp("rejected_legacy")).toHaveLength(1);
+    expect(writesOfOp("rejected")).toHaveLength(0);
+    expect(ignored()).toEqual([{
+      workflowId: "wf_1", ticketId: GATE, reason: "duplicate", oldStatus: "in_review",
+      // The converged state is what the second delivery reads — legacyFallback is
+      // false NOW, which is the whole point of converging.
+      gateState: "rejected", legacyFallback: false, wouldDrop: true, mode: "enforce",
+      timestamp: expect.any(String),
+    }]);
+  });
+
+  it("shadow: both deliveries run, but the ledger converges and the second reports wouldDrop", async () => {
+    await load("shadow");
+    legacy();
+
+    await handler(streamEvent());
+    expect(h.state.enforce).toHaveBeenCalledTimes(1);
+    // Shadow's job IS to populate the ledger, so it converges like enforce.
+    expect(writesOfOp("rejected_legacy")).toHaveLength(1);
+    expect(h.state.workflow.gateStates[GATE].state).toBe("rejected");
+    expect(ignored()).toEqual([]);
+
+    await handler(streamEvent());
+
+    expect(h.state.enforce).toHaveBeenCalledTimes(2); // shadow drops NOTHING
+    expect(eventsOfType("review.rejected")).toHaveLength(2);
+    expect(ignored()).toHaveLength(1);
+    expect(ignored()[0]).toMatchObject({
+      reason: "duplicate", gateState: "rejected", legacyFallback: false,
+      wouldDrop: true, mode: "shadow",
+    });
+  });
+
+  it("enforce: a LOST legacy CAS on the first delivery IS the duplicate (the twin won the race)", async () => {
+    // Both twins read the same unconverged snapshot; exactly one converges it.
+    // The loser dropping is the entire reason the CAS is the admit decision — and
+    // the deliberate exception to the guard's fail-open posture, since the
+    // alternative is reopening the upstream work twice on every legacy run.
+    await load("enforce");
+    legacy();
+    h.state.legacyClaims = false;
+
+    await handler(streamEvent());
+
+    expect(h.state.enforce).not.toHaveBeenCalled();
+    expect(eventsOfType("review.rejected")).toHaveLength(0);
+    expect(writesOfOp("rejected_legacy")).toHaveLength(1);
+    expect(ignored()[0]).toMatchObject({
+      reason: "duplicate", gateState: null, legacyFallback: true,
+      wouldDrop: true, mode: "enforce",
+    });
+  });
+
+  it("shadow: a lost legacy CAS still runs (shadow never manufactures a drop)", async () => {
+    await load("shadow");
+    legacy();
+    h.state.legacyClaims = false;
+
+    await handler(streamEvent());
+
+    expect(h.state.enforce).toHaveBeenCalledTimes(1);
+    expect(ignored()).toEqual([]);
+  });
+
+  it("off: no converge write at all — still byte-identical", async () => {
+    await load(undefined);
+    legacy();
+
+    await handler(streamEvent());
+    await handler(streamEvent());
+
+    // Twice reopened, exactly as before the guard existed, and zero ledger writes.
+    expect(h.state.enforce).toHaveBeenCalledTimes(2);
+    expect(h.state.gateWrites).toEqual([]);
+    expect(h.state.workflow.gateStates).toBeUndefined();
+    expect(ignored()).toEqual([]);
+  });
+
+  it("a broken ledger write still fails OPEN on a legacy row", async () => {
+    await load("enforce");
+    legacy();
+    h.state.gateWriteThrows = true;
+
+    await handler(streamEvent());
+
+    // The throw is caught by the guard's own catch → admit. A ledger outage must
+    // never be how a human's Request-changes gets swallowed.
+    expect(h.state.enforce).toHaveBeenCalledTimes(1);
+    expect(ignored()).toEqual([]);
+  });
+
+  it("a gate that was never presented is STILL unrequested — no converge write", async () => {
+    // Only the `presented` classification converges: an absent row with no
+    // review_needed must not be marked rejected, or a later real park/reject cycle
+    // would read a rejection nobody ever made.
+    await load("enforce");
+    setWorkflow(); // no gateStates, no notifications
+
+    await handler(streamEvent());
+
+    expect(h.state.enforce).not.toHaveBeenCalled();
+    expect(h.state.gateWrites).toEqual([]);
+    expect(ignored()[0]).toMatchObject({ reason: "unrequested", legacyFallback: true });
   });
 });
 

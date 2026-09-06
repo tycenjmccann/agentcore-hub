@@ -31,8 +31,10 @@ import {
   appendReworkAuthorization,
   markGateRequested,
   markGateRejected,
+  markGateRejectedFromLegacy,
   markGateApproved,
 } from "./workflow-store.mjs";
+import { GATE_STATES } from "./gate-state.mjs";
 
 /**
  * R2 (docs/race-condition-study.md): every store op must be a SCOPED
@@ -892,6 +894,97 @@ describe("gate state machine (TEAM-4120 FR-1)", () => {
     it("rethrows anything that is not a lost condition", async () => {
       throwing();
       await expect(markGateRejected("wf_1", "TEAM-900", AT, {})).rejects.toThrow(
+        "ProvisionedThroughputExceededException"
+      );
+    });
+  });
+
+  describe("markGateRejectedFromLegacy (TEAM-4129 F2)", () => {
+    /**
+     * The stub client never evaluates ConditionExpressions, so pin the SEMANTICS
+     * the way DynamoDB would read them: the expression must have the shape
+     *   (attribute_not_exists(<path>) OR (<path> <> :a AND <path> <> :b …))
+     * and "which states does it admit" then follows from the refused values.
+     * Placeholder spellings stay an implementation detail (they are generated
+     * from GATE_STATES), exactly like refusedPhases above.
+     */
+    const legacyCas = (input) => {
+      const expr = String(input.ConditionExpression);
+      const m = expr.match(/^\(attribute_not_exists\((.+?)\) OR \((.+)\)\)$/);
+      if (!m) throw new Error(`unexpected legacy CAS shape: ${expr}`);
+      const [, path, conjunction] = m;
+      const clause = new RegExp(`^${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} <> (:[A-Za-z0-9_]+)$`);
+      const refused = conjunction.split(" AND ").map((c) => {
+        const cm = c.trim().match(clause);
+        if (!cm) throw new Error(`unexpected clause: ${c}`);
+        return input.ExpressionAttributeValues[cm[1]];
+      });
+      return {
+        path,
+        refused,
+        /** @param {string|undefined} state the row's recorded gate state */
+        admits: (state) => state === undefined || !refused.includes(state),
+      };
+    };
+
+    it("seeds the row, then CASes on 'no usable recorded state'", async () => {
+      expect(await markGateRejectedFromLegacy("wf_1", "TEAM-900", AT)).toBe(true);
+      const w = writes();
+      // Same two-write seed as every other gate setter: DynamoDB rejects a nested
+      // SET when gateStates.#g is missing, so the ABSENT-row case is handled by
+      // creating the row, not by a condition disjunct that could not save the SET.
+      expect(w).toHaveLength(3);
+      expect(w[0].input.UpdateExpression).toBe("SET gateStates = if_not_exists(gateStates, :empty)");
+      expect(w[1].input.UpdateExpression).toBe("SET gateStates.#g = if_not_exists(gateStates.#g, :seed)");
+      expect(w[1].input.ExpressionAttributeValues[":seed"]).toEqual({ state: "none", cycles: [] });
+      // The write itself is markGateRejected's, minus the requestedAt it has no
+      // way of knowing.
+      expect(w[2].input.UpdateExpression).toBe(
+        "SET gateStates.#g.#st = :rej, gateStates.#g.resolvedAt = :at, " +
+          "gateStates.#g.cycles = list_append(if_not_exists(gateStates.#g.cycles, :empty), :cycle)"
+      );
+      expect(w[2].input.ExpressionAttributeNames).toEqual({ "#g": "TEAM-900", "#st": "state" });
+      expect(w[2].input.ExpressionAttributeValues[":rej"]).toBe("rejected");
+      expect(w[2].input.Key).toEqual({ workflowId: "wf_1" });
+      expect(legacyCas(w[2].input).path).toBe("gateStates.#g.#st");
+    });
+
+    it("the condition ACCEPTS the 'none' seed and an absent state, and REFUSES every real state", async () => {
+      // This is the whole fix: markGateRejected's `state = "requested"` can never
+      // hold for a legacy row, so the ledger never converged and the duplicate
+      // guard never fired. The refused set is GATE_STATES itself, derived from the
+      // one list the guard's own legacyFallback test uses.
+      await markGateRejectedFromLegacy("wf_1", "TEAM-900", AT);
+      const cas = legacyCas(writes()[2].input);
+
+      expect([...cas.refused].sort()).toEqual([...GATE_STATES].sort());
+      expect(cas.admits("none")).toBe(true);
+      expect(cas.admits(undefined)).toBe(true);
+      expect(cas.admits("requested")).toBe(false);
+      expect(cas.admits("rejected")).toBe(false);
+      expect(cas.admits("approved")).toBe(false);
+      // An unrecognized value is "no usable state" for the guard too, so the two
+      // halves agree by construction rather than by coincidence.
+      expect(cas.admits("bogus")).toBe(true);
+    });
+
+    it("records the cycle as legacy-sourced with a null requestedAt", async () => {
+      // A legacy row genuinely has no recorded request time; stamping `at` would
+      // fake a zero-length human wait in the cycle history.
+      await markGateRejectedFromLegacy("wf_1", "TEAM-900", AT);
+      expect(writes()[2].input.ExpressionAttributeValues[":cycle"]).toEqual([
+        { requestedAt: null, resolvedAt: AT, outcome: "rejected", source: "legacy" },
+      ]);
+    });
+
+    it("returns false on a lost CAS — another deliverer converged the row first", async () => {
+      failNextCondition = true;
+      expect(await markGateRejectedFromLegacy("wf_1", "TEAM-900", AT)).toBe(false);
+    });
+
+    it("rethrows anything that is not a lost condition", async () => {
+      throwing();
+      await expect(markGateRejectedFromLegacy("wf_1", "TEAM-900", AT)).rejects.toThrow(
         "ProvisionedThroughputExceededException"
       );
     });

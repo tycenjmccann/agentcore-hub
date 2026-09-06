@@ -2444,8 +2444,13 @@ function isHumanReviewGate(ticket) {
  *   - workflow unresolvable, or any thrown error → true (logged). A bug in this
  *     guard must never be how a human's Request-changes gets swallowed.
  *   - a run with no recorded state (pre-guard, or the "none" seed) → the
- *     review_needed notification decides, and a lost CAS on such a run is NOT
- *     read as a duplicate.
+ *     review_needed notification decides whether a human was ever asked.
+ *     Admitting such a run CONVERGES its ledger row to `rejected`
+ *     (markGateRejectedFromLegacy, TEAM-4129 F2) so its redelivery classifies as
+ *     a duplicate like any other run's. A LOST legacy CAS therefore is a
+ *     duplicate — another deliverer converged the row first — which is the one
+ *     place this guard is deliberately NOT fail-open, because the alternative is
+ *     reopening the same upstream work twice on every legacy run.
  *   - shadow → always true, but the state IS recorded and the would-be drop is
  *     published as gate.reject_ignored{wouldDrop:true} so the drop rate is
  *     measurable on live traffic before anyone enforces.
@@ -2477,18 +2482,32 @@ async function gateRejectionAdmitted(gateTicket, oldStatus) {
       // Claim the rejection. Shadow writes too — the ledger has to be populated
       // (and its CAS exercised) before an operator flips enforce, so shadow is
       // NOT byte-identical, same as REWORK_LOOP_CAP's shadow.
-      const claimed = await store.markGateRejected(workflow.id, ticketId, new Date().toISOString(), {
-        requestedAt: gateState?.requestedAt,
-      });
-      if (claimed || legacyFallback || GATE_STATE_GUARD !== "enforce") {
+      //
+      // TEAM-4129 F2: WHICH CAS depends on what we read. A legacy row (no usable
+      // state — see legacyFallback) can never satisfy markGateRejected's
+      // `state = "requested"`, so before this it lost every time, the ledger never
+      // converged, and `|| legacyFallback` re-admitted every redelivery forever:
+      // enforce protected nothing on any run predating the flag. The legacy CAS
+      // accepts exactly that row and closes it as rejected, so the NEXT delivery
+      // reads `rejected` and classifies "duplicate".
+      //
+      // Either way the admit decision now comes from the CAS RESULT, never from
+      // legacyFallback: a lost legacy CAS means another deliverer converged the
+      // row first, which is precisely the duplicate this guard exists to drop.
+      const claimed = legacyFallback
+        ? await store.markGateRejectedFromLegacy(workflow.id, ticketId, new Date().toISOString())
+        : await store.markGateRejected(workflow.id, ticketId, new Date().toISOString(), {
+            requestedAt: gateState?.requestedAt,
+          });
+      if (claimed || GATE_STATE_GUARD !== "enforce") {
         console.log(
           `[gate-state] ${ticketId}: ${oldStatus || "NEW"} → blocked admitted as a rejection ` +
             `(state=${gateState?.state ?? "none"}${legacyFallback ? ", legacy fallback" : ""}, mode=${GATE_STATE_GUARD})`
         );
         return true;
       }
-      // Enforce + a real pending state we did NOT get to close = another
-      // deliverer (the other twin, or a redelivery) already recorded it.
+      // Enforce + a pending row we did NOT get to close = another deliverer (the
+      // other twin, or a redelivery) already recorded it.
       verdict = "duplicate";
     }
 
