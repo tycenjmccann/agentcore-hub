@@ -266,12 +266,16 @@ export class JiraCloudProvider implements TicketProvider {
       );
     }
 
-    // Some endpoints (204 No Content) return no body
+    // Some endpoints return no body: 204 No Content, and POST /issueLink
+    // answers 201 Created with an EMPTY body. Parse from text so an empty
+    // success never throws "Unexpected end of JSON input" (that error aborted
+    // the first sdlc-playbook start at the gate → intake-ticket link).
     if (response.status === 204) {
       return {};
     }
-
-    return (await response.json()) as Record<string, unknown>;
+    const text = await response.text();
+    if (!text.trim()) return {};
+    return JSON.parse(text) as Record<string, unknown>;
   }
 
   private async getIssue(issueKey: string): Promise<Record<string, unknown>> {
