@@ -216,7 +216,20 @@ PASS on that dimension. Do not describe a code-read as if it were a test run.
   `spawned_by_kind="qa_fix"`, `spawned_by_origin_id=<your QA ticket ID>`, and
   `phase=<the upstream phase being re-verified>` (usually `"development"`) — this
   is what keeps the run's completion guard from declaring the workflow done while
-  a QA fix is still open.
+  a QA fix is still open. Also set the **fix contract** on every fix ticket — it
+  states what "fixed" means, so a dev cannot close the ticket without your
+  failure actually going away:
+  - `invariant`: ONE sentence — the property that must hold after the fix (e.g.
+    "the login form submits and lands on /dashboard in Chrome and Safari"), not
+    the edit you have in mind.
+  - `evidence_source`: `"live"` whenever the finding came from RUNNING the app,
+    the UI, or an integration — which for you is nearly always. Use `"unit"` when
+    it's a test suite failure, and `"static"` only for something you read rather
+    than ran (which cannot be a FAIL on the test row).
+  - `evidence_repro`: required for `"live"` and `"unit"` — the `qa-evidence/…` S3
+    key holding the screenshot/log, or the exact command that reproduces it.
+  - `cited_location`: the `file:line`(s) implicated, comma-separated.
+  - `sibling_scope`: the components/tickets this fix must NOT touch (or `"none"`).
 - **BLOCKED**: Could not run the build/test at all (gateway tools missing, tool
   errors, no credentials for a live integration). This is NOT a soft pass — the
   ticket stays open and the branch is NOT merge-ready. State precisely what was

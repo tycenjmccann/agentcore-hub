@@ -49,13 +49,22 @@ import { createMergeOnGreen } from "./merge-on-green.mjs";
 import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stability.mjs";
 import { shouldGateShipDispatch, normalizeShipDispatchMode, emitShipDispatchMetrics } from "./ship-dispatch-gate.mjs";
 import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 import { createDeadSessionEscalation, normalizeEscalationMode } from "./dead-session-escalation.mjs";
+// TEAM-4121 FR-8: the fix-ticket contract lives in a zero-import module that is
+// byte-identical across the orchestrator + both ticket Lambdas (CI cmp's them).
+// The orchestrator only READS contracts — it maps a Jira issue's labels and
+// description block back into the same `spawnedBy` / `fixContract` shape the
+// DynamoDB provider stores natively.
+// (No `escapeJql` here: the orchestrator's ONE JQL site interpolates an issue
+// key into an unquoted `parent = …` operand, which escaping cannot make safe —
+// it is shape-checked and refused instead. See getChildTicketsFromJira.)
+import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE } from "./fix-contract.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -598,7 +607,10 @@ function getReworkLoopCap() {
     // enforce-only, best-effort: parks the run's OPEN release-manager escalation
     // gate if one exists; a gate-less phase degrades to the cap_reached signal.
     parkRunEscalationGate,
-    fixKinds: FIX_KINDS,
+    // TEAM-4121 FR-8: the cap counts REWORK rounds only — ci_fix/sync_fix are
+    // environmental and must not drive a human escalation (completion's open-fix
+    // gate still waits on them via the full FIX_KINDS set).
+    fixKinds: REWORK_FIX_KINDS,
     mode: REWORK_LOOP_CAP,
     log: (msg) => console.log(`[orchestrator] ${msg}`),
   });
@@ -1150,6 +1162,16 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
 
       // Track in agentTasks at creation time (both paths)
       await trackTicketCreation(ticketId, todoTicket.assignee, todoTicket.workflowId, todoTicket.parentId);
+
+      // TEAM-4121 FR-8: a fix ticket the ticket Lambda accepted under
+      // FIX_TICKET_CONTRACT=shadow with fields missing carries
+      // fixContract.warnings. Surface it on the run's event stream so the shadow
+      // rollout is measurable from the UI instead of only from Lambda logs. Rides
+      // the same creation-time hook as trackTicketCreation, so a ticket driven
+      // back to `todo` later would re-emit — acceptable for an advisory (nothing
+      // reads it as a count of tickets). Best-effort and non-fatal: an
+      // unpublishable advisory must never block the ticket from being routed.
+      await emitContractWarning(ticketId, todoTicket);
 
       if (TICKET_PROVIDER === "jira") {
         // Jira mode: the agentcore-hub-jira Lambda handles initial routing by transitioning
@@ -2980,6 +3002,13 @@ async function processRecord(record) {
     const insertWorkflowId = unwrapDdbValue(newImage.workflowId);
     const insertParentId = unwrapDdbValue(newImage.parentId);
     await trackTicketCreation(ticketId, insertAssignee, insertWorkflowId, insertParentId);
+    // TEAM-4121 FR-8: the DDB-stream twin of the `todo` shadow-warning advisory.
+    // The stream image already carries everything needed, so no extra read.
+    await emitContractWarning(ticketId, {
+      workflowId: insertWorkflowId,
+      spawnedBy: unwrapDdbValue(newImage.spawnedBy),
+      fixContract: unwrapDdbValue(newImage.fixContract),
+    });
   }
 
   switch (newStatus) {
@@ -4530,6 +4559,68 @@ export function mapJiraIssueToTicket(issue) {
   // carrying spawnedBy.kind so the completion gate + rework-loop cap see them.
   const fixLabel = labels.find(l => l.startsWith("fix:"));
 
+  // TEAM-4121 FR-8: Jira has no arbitrary columns, so the whole fix-ticket
+  // contract rides two carriers the DynamoDB provider doesn't need —
+  //   labels:      fix:<kind> origin:<id> evidence:<src> phase:<p>
+  //                contract:incomplete reverify:<fixId>
+  //   description: the `# fix-contract v1` block the jira Lambda renders as a
+  //                yaml codeBlock, ahead of the prose.
+  // This rebuilds `spawnedBy` + `fixContract` from both so every downstream
+  // reader (rework-loop cap, completion open-fix gate, re-verify) sees the SAME
+  // shape in Jira mode as in DynamoDB mode. LABELS WIN over the block on
+  // conflict: a label is stamped by the Lambda from validated input, whereas the
+  // block is free text a human (or an agent editing the ticket) can rewrite.
+  const fixKind = fixLabel ? fixLabel.slice("fix:".length) : null;
+  const originLabel = labels.find(l => l.startsWith("origin:"));
+  const evidenceLabel = labels.find(l => l.startsWith("evidence:"));
+  const phaseLabel = labels.find(l => l.startsWith("phase:"));
+  const reverifyLabel = labels.find(l => l.startsWith("reverify:"));
+  const contractIncomplete = labels.includes("contract:incomplete");
+  const originKey = fixKind ? KIND_TO_ORIGIN_KEY[fixKind] : null;
+
+  let spawnedBy = fixKind ? { kind: fixKind } : null;
+  if (spawnedBy && originKey && originLabel) {
+    spawnedBy[originKey] = originLabel.slice("origin:".length);
+  }
+  if (spawnedBy && reverifyLabel) {
+    // A re-verification pass is NOT new rework — rework-loop-cap.isReworkFix
+    // reads these two so a re-armed fix doesn't burn a human-escalation round.
+    spawnedBy.reverify = true;
+    spawnedBy.rearmOf = reverifyLabel.slice("reverify:".length);
+  }
+
+  // The phase stamp is what completion's per-phase open-fix gate keys on. The
+  // effective workflow def is NOT in scope here (this maps a raw Jira issue with
+  // no run context), so the label is accepted as-is; it can only have been
+  // written by the jira Lambda, which validates `phase` against the live phase
+  // set before stamping it (TEAM-4121 F7).
+  let phase = phaseLabel ? phaseLabel.slice("phase:".length) : null;
+
+  let description = extractAdfText(f.description);
+  let fixContract = null;
+  if (fixKind) {
+    const block = parseFixContractBlock(description);
+    if (block) {
+      fixContract = { ...block.contract };
+      // The contract block is machine metadata, not the ticket body — hand
+      // downstream readers (and the agent prompt) only the prose after it.
+      description = block.rest;
+      // Labels win: only fall back to the block's kind/origin/phase when the
+      // corresponding label is absent.
+      if (!originLabel && originKey && block.originId) spawnedBy[originKey] = block.originId;
+      if (!phaseLabel && block.phase) phase = block.phase;
+    }
+    if (evidenceLabel) {
+      fixContract = { ...(fixContract || { version: 1 }), evidenceSource: evidenceLabel.slice("evidence:".length) };
+    }
+    if (contractIncomplete) {
+      // The Lambda accepted this fix ticket under FIX_TICKET_CONTRACT=shadow with
+      // fields missing. It does not say WHICH — that detail only exists in the
+      // Lambda's own log — so record the fact, not a false field list.
+      fixContract = { ...(fixContract || { version: 1 }), warnings: ["<unparsed>"] };
+    }
+  }
+
   // Extract blockedBy from issue links
   // From this ticket's perspective: if it has an inwardIssue with type "is blocked by",
   // that inwardIssue is what blocks this ticket.
@@ -4553,7 +4644,7 @@ export function mapJiraIssueToTicket(issue) {
   return {
     ticketId: issue.key,
     title: f.summary || "",
-    description: extractAdfText(f.description),
+    description,
     status: mapJiraStatus(f.status?.name || "To Do"),
     // Human-review gates carry a reviewer:<who> label → assignee "human:<who>".
     assignee: agentLabel
@@ -4570,7 +4661,10 @@ export function mapJiraIssueToTicket(issue) {
     comments: jiraComments,
     ...(reviewComment ? { reviewComment } : {}),
     // TEAM-4113: agent-filed fix ticket → spawnedBy.kind (mirrors DynamoDB mode).
-    ...(fixLabel ? { spawnedBy: { kind: fixLabel.slice("fix:".length) } } : {}),
+    // TEAM-4121 FR-8: …plus the origin id, reverify/rearmOf, phase and contract.
+    ...(spawnedBy ? { spawnedBy } : {}),
+    ...(phase ? { phase } : {}),
+    ...(fixContract ? { fixContract } : {}),
     artifacts: [],
   };
 }
@@ -4590,6 +4684,13 @@ async function getTicketFromJira(ticketId) {
 }
 
 async function getChildTicketsFromJira(parentId) {
+  // TEAM-4121 F6: `parent = <key>` is an UNQUOTED JQL operand, so there is no
+  // escape that makes an arbitrary string safe here — a parentId carrying
+  // ` OR project = OTHER` would widen the query. Issue keys have one shape, so
+  // refuse anything else instead of trying to sanitize it.
+  if (!TICKET_KEY_RE.test(String(parentId || ""))) {
+    throw new Error(`Invalid 'parentId' ${JSON.stringify(parentId)} — expected an issue key like TEAM-123`);
+  }
   const jql = encodeURIComponent(`parent = ${parentId} ORDER BY created ASC`);
   const data = await jiraFetch(`/rest/api/3/search/jql?jql=${jql}&fields=summary,status,labels,issuetype,parent,issuelinks,assignee,description&maxResults=100`);
   return (data?.issues || []).map(mapJiraIssueToTicket);
@@ -4975,6 +5076,32 @@ async function ensureFeatureBranch(workflow) {
 }
 
 // ─── EventBridge Publishing ────────────────────────────────────────────────────
+
+/**
+ * TEAM-4121 FR-8 — publish `ticket.contract_warning` for a fix ticket that the
+ * ticket Lambda accepted with an incomplete contract (FIX_TICKET_CONTRACT=
+ * shadow). Purely observational: it is what makes the shadow phase measurable
+ * before anyone flips the flag to `enforce`, so a failure here must never
+ * propagate into ticket routing.
+ *
+ * `missing` is the Lambda's own warning list. In Jira mode that list cannot be
+ * recovered from a label, so mapJiraIssueToTicket records `["<unparsed>"]` —
+ * the count is then meaningless but the ticket is still flagged.
+ */
+async function emitContractWarning(ticketId, ticket) {
+  const warnings = ticket?.fixContract?.warnings;
+  if (!ticket?.spawnedBy?.kind || !Array.isArray(warnings) || warnings.length === 0) return;
+  try {
+    await publishEvent(ticketId, "ticket.contract_warning", {
+      workflowId: ticket.workflowId || null,
+      ticketId,
+      kind: ticket.spawnedBy.kind,
+      missing: warnings,
+    });
+  } catch (err) {
+    console.warn(`[orchestrator] contract_warning publish failed for ${ticketId} (non-fatal):`, err?.message || err);
+  }
+}
 
 async function publishEvent(ticketId, detailType, detail) {
   // ONE timestamp for both writes (and inside detail): the anomaly-watcher

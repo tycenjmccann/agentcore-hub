@@ -1449,7 +1449,7 @@ def S3Storage___list_objects(prefix: str = "", bucket: str = "") -> str:
 # ─── Ticket Tools ────────────────────────────────────────────────────────────
 
 @tool
-def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "") -> str:
+def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "") -> str:
     """Create a new ticket in the project tracker.
 
     MANDATORY TICKETS (create these for EVERY workflow, no exceptions):
@@ -1488,10 +1488,21 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
             so the run's completion guard keeps that phase open until the fix closes.
             Leave "" for ordinary phase tickets.
         spawned_by_kind: ONLY for a fix ticket. One of "qa_fix" (you are the QA verifier),
-            "codex_fix" (you are the code reviewer), or "review_fix". Leave "" otherwise.
+            "codex_fix" (you are the code reviewer), "review_fix", "ship_fix" (you are the
+            release manager), "ci_fix" or "sync_fix" (you are the CI agent). Leave "" otherwise.
         spawned_by_origin_id: The ticket ID this fix originates from — your own QA ticket
             (qa_fix), review ticket (codex_fix), or gate ticket (review_fix). Required when
             spawned_by_kind is set.
+        invariant: REQUIRED on a fix ticket. One sentence stating what must hold after the fix.
+        evidence_source: "static" (read the code) | "unit" (a test/command proves it) | "live"
+            (ran the system / UI / integration).
+        evidence_repro: the command that reproduces the finding, or the S3 artifact key holding
+            the evidence (required for unit|live). Single line.
+        cited_location: comma-separated path:line (or path:start-end) list, e.g.
+            "src/a.ts:12,src/b.ts:40-58".
+        sibling_scope: other tickets/components this fix must NOT touch (or "none").
+        labels: comma-separated free labels (e.g. "advisory"). System prefixes (fix:, origin:,
+            phase:, …) are dropped.
     """
     blockers = [b.strip() for b in blocked_by.split(",") if b.strip()] if blocked_by else []
     # Auto-inject workflow_id from invocation context if agent didn't pass one —
@@ -1507,15 +1518,44 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
     # TEAM-3619 D4c: assemble the fix-ticket provenance marker the lambda validates
     # and completion re-verify reads. The origin id maps to the kind-specific key.
     if spawned_by_kind.strip():
+        # TEAM-4121 FR-8: a fix ticket without an origin id is unusable for lineage —
+        # completion's re-verify can't find the ticket to re-arm and the orchestrator
+        # can't map it back to a phase. The Lambda only rejects this under
+        # FIX_TICKET_CONTRACT=enforce; the harness has no flag to read, so it refuses
+        # unconditionally rather than minting a dangling fix ticket.
+        if not spawned_by_origin_id.strip():
+            return "Error: spawned_by_origin_id is required when spawned_by_kind is set"
         origin_key = {
             "qa_fix": "qaTicketId",
             "codex_fix": "codexTicketId",
             "review_fix": "gateTicketId",
+            "ship_fix": "shipTicketId",
+            "ci_fix": "ciTicketId",
+            "sync_fix": "ciTicketId",
         }.get(spawned_by_kind.strip())
         spawned_by = {"kind": spawned_by_kind.strip()}
-        if origin_key and spawned_by_origin_id.strip():
+        if origin_key:
             spawned_by[origin_key] = spawned_by_origin_id.strip()
         payload["spawned_by"] = spawned_by
+    # TEAM-4121 FR-8: the fix contract. Sent only when the agent supplied at least one
+    # field — an empty contract would make the tickets Lambda report every field missing
+    # on a plain (non-fix) ticket. Validation lives in the Lambda's fix-contract.mjs;
+    # the harness only shapes what the agent typed.
+    contract_fields = [invariant, evidence_source, evidence_repro, cited_location, sibling_scope]
+    if any(f.strip() for f in contract_fields):
+        payload["fix_contract"] = {
+            "invariant": invariant.strip(),
+            "evidence_source": evidence_source.strip(),
+            "evidence_repro": evidence_repro.strip(),
+            "cited_location": [c.strip() for c in cited_location.split(",") if c.strip()],
+            "sibling_scope": sibling_scope.strip(),
+        }
+    # Split first, THEN test: a string of nothing but separators ("  ,  ") is
+    # truthy after strip() but yields no labels, and sending labels: [] would
+    # make a plain ticket look like it had labels refused.
+    free_labels = [l.strip() for l in labels.split(",") if l.strip()]
+    if free_labels:
+        payload["labels"] = free_labels
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___create_ticket", payload)
 
 

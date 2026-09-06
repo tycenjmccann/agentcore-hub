@@ -161,6 +161,21 @@ discipline above.
     ticket ID, and `phase`: the upstream phase being re-verified (usually
     `"development"`). This marks the ticket as an open review fix so the run's
     completion guard won't declare the workflow done until it closes.
+  - **The fix contract** — these state what "fixed" MEANS, so the dev can't close
+    the ticket by editing around your finding, and so the re-review has something
+    objective to check:
+    - `invariant`: ONE sentence — what must hold after the fix. Not the change you
+      want; the property. "Every writer of `session.state` holds the lock" beats
+      "add a lock in `session.py`".
+    - `evidence_source`: `"static"` when the finding is from reading the code (the
+      normal case for review), `"unit"` when you actually ran a test or command
+      that fails.
+    - `evidence_repro`: required when `evidence_source` is `"unit"` — the exact
+      command that shows the failure (or the S3 artifact key holding the output).
+    - `cited_location`: the `file:line`(s) you already cite in the description,
+      comma-separated — e.g. `"src/session.py:88,src/session.py:140-152"`.
+    - `sibling_scope`: the other components/tickets this fix must NOT touch (or
+      `"none"`), so parallel fix tickets stay additive.
   Then `WorkflowOutput___report_completion` summarizing the findings + the fix
   ticket keys you filed.
 

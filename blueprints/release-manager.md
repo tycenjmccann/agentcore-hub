@@ -97,6 +97,11 @@ Fold their findings in at their severity. None configured → skip silently.
 ### Step 4: Verdict — diff-scoped, with convergence accounting
 **DIFF-SCOPED GATE: any finding whose cited files are ALL within the PR change set (the --name-status file list from Step 1's diff) = CHANGES NEEDED, at any severity. A finding citing any file OUTSIDE the change set is ADVISORY: file it as a backlog ticket labelled "advisory" (one per finding group, assigned to the owning dev, NOT blocked_by-chained into this run) and do not count it toward the verdict. Never let an advisory finding flip PASS to CHANGES NEEDED.**
 
+An advisory ticket is filed with `labels: "advisory"`, `blocked_by: ""`, and **no
+`spawned_by_kind`** — it is backlog, not a fix this run waits on. Setting
+`spawned_by_kind` on it would make it an open fix ticket and hold the run open
+for work that is explicitly out of scope.
+
 This advisory rule governs YOUR OWN verdict only — it never authorizes overriding a human decision: a human's "request changes" on a gate stands, no matter how the findings classify, until that human approves the gate. If every finding is out-of-diff the orchestrator parks the gate (blocked) and asks the human to confirm; the human can approve to confirm, leave it rejected to hold, or force rework by re-rejecting (In Review → Request Changes) with a note containing a line that reads exactly `DECISION: continue`, by re-rejecting citing a file in the PR change set, or by reopening the upstream ticket(s) directly. A comment alone never wakes the orchestrator — the status change does.
 
 This rule is backed by a deterministic function, not only by your compliance with
@@ -130,9 +135,11 @@ Classify EVERY finding before you count anything:
 - **ADVISORY** — it cites at least one file outside the change set. Real, still
   worth filing, but not this run's gate: pre-existing code you happened to read
   is not a regression this PR introduced. Prove-or-file still applies — you file
-  it, you just file it as backlog. Advisory tickets get the label `advisory`,
-  no `blocked_by` into this run, and never appear in the effective round count.
-  List them in the summary under "Advisory (not gating)" so the human sees them.
+  it, you just file it as backlog. File it with `labels: "advisory"`,
+  `blocked_by: ""`, and NO `spawned_by_kind` (a `spawned_by_kind` would make it an
+  open fix ticket that holds this run open for out-of-scope work). Advisory
+  tickets never appear in the effective round count. List them in the summary
+  under "Advisory (not gating)" so the human sees them.
 
 The convergence knobs come from the workflow definition's `reviewGate` config
 for this gate (`src/config/workflows.json`, the gate whose `afterPhase` is
@@ -191,9 +198,26 @@ missing = empty state, round 1):
      findings by component, ONE fix ticket per component assigned to the owning
      dev (same parent as your ticket; `ticket_type: "subtask"` if the parent is
      a Bug, else `"task"`; chain same-file tickets serially via `blocked_by`;
-     regression tickets reference the reverted fix per Step 2). Record the
-     fix-ticket keys in the round entry, write the ledger, and put your own
-     ticket back to `in_progress` — you re-review after the fixes merge to the
+     regression tickets reference the reverted fix per Step 2). On EVERY such fix
+     ticket set:
+     - `title`: `Fix (ship-review r<N>): {component} — {M} findings` (N = this
+       round number, M = the findings for that component)
+     - `spawned_by_kind`: `"ship_fix"`, `spawned_by_origin_id`: your own
+       ship-review ticket ID, `phase`: `"ship"` — this is what keeps the run's
+       completion guard from closing the run over an open ship fix.
+     - `invariant`: ONE sentence — the property that must hold after the fix, not
+       the edit you want.
+     - `evidence_source`: `"static"` for a finding from reading the diff (the
+       normal case), `"unit"` when you ran a command/test that fails.
+     - `evidence_repro`: required when `evidence_source` is `"unit"` — the exact
+       command, or the S3 key of the output.
+     - `cited_location`: the in-diff `file:line`(s) you cite, comma-separated.
+       These are the same locations the diff-scope gate classified as IN-DIFF.
+     - `sibling_scope`: the other components this fix must NOT touch (or
+       `"none"`) — grouping only stays additive if each dev honours its bounds.
+
+     Record the fix-ticket keys in the round entry, write the ledger, and put your
+     own ticket back to `in_progress` — you re-review after the fixes merge to the
      shared branch, starting again from Step 1's SHA cross-check.
    - **CHANGES NEEDED, effective count >= `maxRounds` — ESCALATE. Do NOT spawn
      this round's fix tickets.** The loop stops here; leave the round's

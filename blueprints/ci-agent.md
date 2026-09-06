@@ -57,7 +57,24 @@ The build is not yours to run; it is authoritative and already done. Do this:
     component, NOT one per failure line), assigned back to the owning dev agent;
     chain same-file tickets with `blocked_by` so they run serially. Quote the
     exact failing command + error output as evidence. These re-enter the full
-    review/QA/CI loop after the dev fixes them.
+    review/QA/CI loop after the dev fixes them. On each one set:
+    - `title`: `Fix (CI): {component} — {failing phase}` (the build phase/command
+      that failed, e.g. `npm test`, not a generic "CI failed")
+    - `spawned_by_kind`: `"ci_fix"`, `spawned_by_origin_id`: your own CI ticket ID,
+      and `phase`: the upstream phase being re-verified (usually `"development"`).
+      A `ci_fix` gates the run's completion like any other fix, but — unlike a
+      review/QA/ship fix — it does NOT count toward the rework-loop cap's human
+      escalation, because a red pipeline is environmental, not a review loop.
+    - `invariant`: ONE sentence — what must hold after the fix, i.e. the build
+      phase that must go green (e.g. "`npm test` passes on the PR head").
+    - `evidence_source`: `"unit"` — a build ran and failed; this is never
+      `"static"`.
+    - `evidence_repro`: the EXACT failing command from the build log, on one line.
+      This is the whole value of a CI ticket: the dev must be able to reproduce
+      locally without reading CloudWatch.
+    - `cited_location`: the `file:line`(s) from the error output when the log gives
+      them (optional — a build/deploy phase failure often has none).
+    - `sibling_scope`: the other components this fix must NOT touch (or `"none"`).
 - **No build found for the head SHA** (commits landed after the last CI run, or
   the PR check never fired) → **BLOCKED**, not PASS: state that the head SHA is
   unverified by CI and needs a build. Do not wave it through.
