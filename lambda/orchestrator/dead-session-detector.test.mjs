@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createDetector } from "./dead-session-detector.mjs";
+import { createAwaitedIds } from "./awaited-ids.mjs";
 import { SWEEP_ROTATION_QUANTUM_MS } from "./sweep-scan.mjs";
 
 /**
@@ -1188,5 +1189,150 @@ describe("TEAM-3756 F5 — the detector's workflow scan excludes EVERY terminal 
     const m = await runSweep("enforce");
 
     expect(m.candidates).toBe(1);
+  });
+});
+
+/**
+ * TEAM-4166 D2 §2.3 — the evidence-gated escalation guard. When the retry budget
+ * is spent (deadSessionRetries ≥ 1) the pre-4166 detector escalated
+ * unconditionally. A session that genuinely completed, or a ticket parked clean
+ * (preconditionUnmet stamped), is NOT dead — the guard re-wakes it capped on
+ * cleanExitRedispatches (NEVER touching deadSessionRetries) and reserves
+ * escalation for the genuinely silent. The guard engages ONLY when the store
+ * exposes incrementCleanExitRedispatch — an old store keeps the pre-4166 escalate
+ * (every test above uses such a store, so they are byte-identical).
+ */
+describe("TEAM-4166 D2 §2.3 — evidence-gated escalation guard", () => {
+  const FIX = "FIX-1";
+
+  // The default store PLUS the clean-exit CAS that arms the guard.
+  function guardStore(overrides = {}) {
+    return {
+      markDeadSessionDetected: vi.fn(async () => true),
+      clearDeadSessionDetected: vi.fn(async () => true),
+      incrementDeadSessionRetry: vi.fn(async () => 1),
+      incrementCleanExitRedispatch: vi.fn(async () => true),
+      markAwaitTimeoutEmitted: vi.fn(async () => true),
+      setTaskStatus: vi.fn(async () => {}),
+      appendNotification: vi.fn(async () => {}),
+      getWorkflow: vi.fn(async () => null),
+      ...overrides,
+    };
+  }
+
+  function makeAwaited(publishEvent, { mode = "enforce", timeoutMinutes = 120, store } = {}) {
+    return createAwaitedIds({
+      addBlockers: vi.fn(async () => []),
+      annotatePreconditionUnmet: vi.fn(async () => {}),
+      publishEvent,
+      getTicket: vi.fn(async () => null),
+      store: store || { markAwaitTimeoutEmitted: vi.fn(async () => true) },
+      now: () => NOW,
+      mode,
+      timeoutMinutes,
+    });
+  }
+
+  const parkedTicket = { ticketId: "TEAM-2", type: "task", status: "in_progress", assignee: "dev",
+    preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T09:00:00Z" } };
+
+  it("parked clean + budget spent → clean re-wake 'exited-ok': incrementCleanExitRedispatch once, deadSessionRetries untouched, no escalate", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.exitedOk).toBe(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    // The clean path NEVER burns the dead-session retry budget or errors the task.
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(deps.blockTicket).not.toHaveBeenCalled();
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(m.escalations).toBe(0);
+  });
+
+  it("re-woken to the clean-exit cap → 'awaiting' + advisory await_timeout, NO escalation, NO redispatch", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, cleanExitRedispatches: { "TEAM-2": 3 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const awaitedIds = makeAwaited(deps.publishEvent, { store });
+    const { runSweep } = createDetector({ ...deps, awaitedIds, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.awaiting).toBe(1);
+    expect(m.escalations).toBe(0);
+    expect(store.incrementCleanExitRedispatch).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    // Advisory event only — never a manager_escalation (the parkedOnHuman trap).
+    expect(eventsOfType(deps.publishEvent, "orchestrator.await_timeout")).toHaveLength(1);
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(store.appendNotification).not.toHaveBeenCalled();
+  });
+
+  it("no evidence (not completed, not parked clean) → the EXISTING escalate, now carrying six evidence fields", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const store = guardStore();
+    const getLastStreamAt = vi.fn(async () => "2026-09-01T05:00:00Z");
+    // Default getTicket → leafTicket (no preconditionUnmet); no completion events.
+    const { deps } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), store });
+    const { runSweep } = createDetector({ ...deps, getLastStreamAt, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.escalations).toBe(1);
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+    // The guard did NOT re-wake this one.
+    expect(store.incrementCleanExitRedispatch).not.toHaveBeenCalled();
+    const esc = eventsOfType(deps.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    const { evidence } = esc[0][2];
+    for (const k of ["lastSpanAt", "lastSpanStatus", "lastStreamAt", "completedAt", "preconditionAt", "exitReason"]) {
+      expect(Object.prototype.hasOwnProperty.call(evidence, k)).toBe(true);
+    }
+    // On the dead path: no "ok" span status, no completion/precondition, no exit reason.
+    expect(evidence.lastSpanStatus).toBeNull();
+    expect(evidence.completedAt).toBeNull();
+    expect(evidence.preconditionAt).toBeNull();
+    expect(evidence.exitReason).toBeNull();
+    expect(evidence.lastStreamAt).toBe("2026-09-01T05:00:00Z");
+  });
+
+  it("an OLD store (no incrementCleanExitRedispatch) keeps the pre-4166 unconditional escalate", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    // makeDeps' default store has NO incrementCleanExitRedispatch → canGuard false.
+    const { deps, store } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }),
+      getTicket: vi.fn(async () => parkedTicket), // even parked, the guard can't engage
+    });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.escalations).toBe(1);
+    expect(m.exitedOk).toBeFalsy();
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+  });
+
+  it("emits explicit zeros for DetectorExitedOk / DetectorAwaiting on a healthy sweep", async () => {
+    const { deps } = makeDeps();
+    const { runSweep } = createDetector(deps);
+
+    const { emf } = await captureEmf(() => runSweep("enforce"));
+
+    expect(emf.DetectorExitedOk).toBe(0);
+    expect(emf.DetectorAwaiting).toBe(0);
   });
 });

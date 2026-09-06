@@ -44,6 +44,7 @@ import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
+import { createAwaitedIds, normalizeAwaitedIdsMode } from "./awaited-ids.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { createMergeOnGreen } from "./merge-on-green.mjs";
 import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stability.mjs";
@@ -146,6 +147,26 @@ const CASCADE_EXTENDED_STATES_MODE = resolveCascadeMode(process.env.CASCADE_EXTE
 // DDB reads/writes. shadow/enforce only when the operator explicitly sets the
 // var (deploy.sh forwards it only when set).
 const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
+// Awaited-ids re-wake (TEAM-4166 D1): off | shadow | enforce, default off. When
+// a tool reports report_precondition_unmet, the orchestrator writes the awaited
+// sibling ids as real blockedBy edges (preserving an in-flight status) so the
+// parked ticket re-wakes through the SAME unblock cascade once every awaited fix
+// closes — no bespoke wait path. off = byte-identical (no edge writes, no derived
+// hook, no level-triggered pickup); the module mutates ticket state, so it stays
+// dark until an operator opts in. Garbage fails safe to off (normalizeAwaitedIdsMode).
+const AWAITED_IDS_MODE = normalizeAwaitedIdsMode(process.env.AWAITED_IDS_MODE);
+// The wait-SLA (D1 §5): once a ticket has awaited its open fixes longer than this,
+// the sweep/detector emit ONE advisory orchestrator.await_timeout (an event, never
+// a humanNotification). Default 120 minutes.
+const AWAITED_IDS_TIMEOUT_MINUTES = Number.parseInt(process.env.AWAITED_IDS_TIMEOUT_MINUTES || "", 10) > 0
+  ? Number.parseInt(process.env.AWAITED_IDS_TIMEOUT_MINUTES, 10)
+  : 120;
+// D2 §2.3 clean-exit re-wake cap: how many times a cleanly-parked/completed ticket
+// may be automatically re-woken before the wait-SLA takes over (NEVER escalated as
+// a dead session). Positive integer; default 3.
+const CLEAN_EXIT_REDISPATCH_CAP = Number.parseInt(process.env.CLEAN_EXIT_REDISPATCH_CAP || "", 10) > 0
+  ? Number.parseInt(process.env.CLEAN_EXIT_REDISPATCH_CAP, 10)
+  : 3;
 // Level-triggered dispatch (TEAM-4060): off | shadow | enforce, default off.
 // When enforce, the done-cascade invokes a newly-unblocked dependent in-process
 // instead of waiting for its Ready webhook — closes the dispatch dead-zone.
@@ -678,6 +699,60 @@ function syncDeps() {
   return _syncDeps;
 }
 
+// ─── Awaited-ids re-wake (TEAM-4166 D1) ──────────────────────────────────────
+
+/**
+ * Last agent.streaming timestamp for a ticket's current claim, for the D2
+ * escalation-evidence payload (null when there is no claim/agent or nothing
+ * streamed). Only ever called on the rare escalate path, so the one extra
+ * workflow read to resolve the agentId is cheap. Reuses lease.lastAgentActivity
+ * (the SAME last-activity read the liveness gate uses) rather than re-scanning.
+ */
+async function lastStreamAtForTicket(workflowId, ticketId) {
+  try {
+    const wf = await store.getWorkflow(workflowId);
+    const agentId = wf?.agentTasks?.[ticketId]?.agentId;
+    if (!agentId) return null;
+    return (await lastAgentActivity(ddb, EVENTS_TABLE, workflowId, agentId, ticketId)) || null;
+  } catch {
+    return null;
+  }
+}
+
+// One awaited-ids surface per warm container (mirrors getCascade()/getDetector()).
+// The board write goes through the SAME provider-aware addBlockers seam the rest
+// of the orchestrator uses (preserveStatusIf keeps a parked agent in_progress),
+// and the preconditionUnmet stamp through the identical Tickets___* tool the
+// workflow-output channel writes, so provider parity is free.
+let _awaitedIds = null;
+function getAwaitedIds() {
+  if (_awaitedIds) return _awaitedIds;
+  _awaitedIds = createAwaitedIds({
+    send: (input) => ddb.send(input),
+    ticketsTable: TICKETS_TABLE,
+    provider: TICKET_PROVIDER,
+    getChildTickets,
+    leaseTtlMs: LEASE_TTL_MS,
+    // Adapter: forward the awaited-edge write to the existing provider-aware seam,
+    // threading preserveStatusIf (so the parked agent is never yanked to Blocked).
+    addBlockers: (ticketId, ids, opts = {}) =>
+      addBlockers(ticketId, ids, { preserveStatusIf: opts.preserveStatusIf, source: opts.source }),
+    // Adapter: stamp the origin's preconditionUnmet through the SAME Tickets___*
+    // tool as the report_precondition_unmet channel (provider-agnostic).
+    annotatePreconditionUnmet: (originId, { awaitingIds, source, reportedAt }) =>
+      invokeTickets("annotate_precondition_unmet", {
+        ticket_id: originId, awaitingIds, source, reportedAt,
+      }),
+    publishEvent,
+    getTicket: getTicketConsistent,
+    store,
+    mode: AWAITED_IDS_MODE,
+    timeoutMinutes: AWAITED_IDS_TIMEOUT_MINUTES,
+    log: (msg) => console.log(`[orchestrator] ${msg}`),
+  });
+  return _awaitedIds;
+}
+
 // One detector per warm container so its per-agent median cache is reused
 // across the 5-minute sweeps (rebuilt from scratch on a cold start).
 let _detector = null;
@@ -697,6 +772,12 @@ function getDetector() {
     // TEAM-4120 FR-3 — undefined when DEAD_SESSION_ESCALATION_MODE=off (default),
     // which keeps the exhausted-retry page byte-identical.
     escalate: getDeadSessionEscalation()?.escalateExhausted,
+    // TEAM-4166 D2 §2.3 — the evidence-gated escalation guard. The guard engages
+    // only when the store exposes incrementCleanExitRedispatch, so an unwired
+    // store keeps the pre-4166 unconditional escalate.
+    awaitedIds: getAwaitedIds(),
+    cleanExitRedispatchCap: CLEAN_EXIT_REDISPATCH_CAP,
+    getLastStreamAt: lastStreamAtForTicket,
   });
   return _detector;
 }
@@ -737,6 +818,12 @@ function getCascade() {
     blockTicket: blockTicketForFailedInvoke,
     // TEAM-4120 FR-3 — same hook as the detector; undefined when off.
     escalate: getDeadSessionEscalation()?.escalateExhausted,
+    // TEAM-4166 D1/D2 — the awaited-ids surface (union blocker predicate +
+    // wait-SLA timeout) and the §2.3 evidence-gated escalation guard. Guard
+    // engages only when store.incrementCleanExitRedispatch exists.
+    awaitedIds: getAwaitedIds(),
+    cleanExitRedispatchCap: CLEAN_EXIT_REDISPATCH_CAP,
+    getLastStreamAt: lastStreamAtForTicket,
   });
   return _cascade;
 }
@@ -757,6 +844,10 @@ function getReconcileSweep() {
     cascade: getCascade(),
     getChildTickets,
     leaseTtlMs: LEASE_TTL_MS,
+    // TEAM-4166 D1/D2 — the awaited-ids backstop (edge backfill + wait-SLA). The
+    // §2.3 evidence guard itself lives in the cascade's reconcileDependent, which
+    // this sweep routes every candidate through.
+    awaitedIds: getAwaitedIds(),
   });
   return _reconcileSweep;
 }
@@ -1538,7 +1629,7 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       }
 
       // Track in agentTasks at creation time (both paths)
-      await trackTicketCreation(ticketId, todoTicket.assignee, todoTicket.workflowId, todoTicket.parentId);
+      await trackTicketCreation(ticketId, todoTicket.assignee, todoTicket.workflowId, todoTicket.parentId, todoTicket.spawnedBy);
 
       // TEAM-4121 FR-8: a fix ticket the ticket Lambda accepted under
       // FIX_TICKET_CONTRACT=shadow with fields missing carries
@@ -3517,6 +3608,29 @@ async function processRecord(record) {
   // Skip counter item
   if (ticketId === "__COUNTER__") return;
 
+  // TEAM-4166 D1 §1.4 — LEVEL-TRIGGERED pickup of a tool-reported precondition.
+  // report_precondition_unmet stamps preconditionUnmet.awaitingIds WITHOUT
+  // changing status (it's an annotation, not a transition), so that write would
+  // fall through the status-change early-return just below. Pick it up HERE and
+  // write the awaited ids as real blockedBy edges, so the parked ticket re-wakes
+  // through the normal unblock cascade once its fixes close. Idempotent
+  // (applyBlockerEdge answers "present" on a re-run), gated on mode (off →
+  // no-op), and never fatal — an awaited edge is advisory bookkeeping.
+  if (AWAITED_IDS_MODE !== "off") {
+    const pu = unwrapDdbValue(newImage.preconditionUnmet);
+    const awaitingIds = Array.isArray(pu?.awaitingIds) ? pu.awaitingIds : null;
+    if (awaitingIds?.length) {
+      const existingEdges = new Set(unwrapDdbValue(newImage.blockedBy) || []);
+      if (awaitingIds.some((id) => !existingEdges.has(id))) {
+        try {
+          await getAwaitedIds().applyAwaitedEdges(ticketId, awaitingIds, "tool");
+        } catch (err) {
+          console.warn(`[orchestrator] awaited-ids pickup failed for ${ticketId} (non-fatal): ${err?.message || err}`);
+        }
+      }
+    }
+  }
+
   // Only react to status changes (or new inserts with actionable status)
   if (eventName === "MODIFY" && newStatus === oldStatus) return;
 
@@ -3527,7 +3641,7 @@ async function processRecord(record) {
     const insertAssignee = unwrapDdbValue(newImage.assignee);
     const insertWorkflowId = unwrapDdbValue(newImage.workflowId);
     const insertParentId = unwrapDdbValue(newImage.parentId);
-    await trackTicketCreation(ticketId, insertAssignee, insertWorkflowId, insertParentId);
+    await trackTicketCreation(ticketId, insertAssignee, insertWorkflowId, insertParentId, unwrapDdbValue(newImage.spawnedBy));
     // TEAM-4121 FR-8: the DDB-stream twin of the `todo` shadow-warning advisory.
     // The stream image already carries everything needed, so no extra read.
     await emitContractWarning(ticketId, {
@@ -3621,7 +3735,7 @@ export function isCreationTimeBlock(oldStatus) {
  *
  * Called from both Jira and DynamoDB paths when a ticket first appears.
  */
-async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
+async function trackTicketCreation(ticketId, assignee, workflowId, parentId, spawnedBy) {
   if (!assignee || !parentId) return;
 
   // Skip epics — they're containers, not agent tasks
@@ -3665,6 +3779,21 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
     });
   } catch (err) {
     console.warn(`[orchestrator] ticket.created publish failed for ${ticketId}:`, err.message);
+  }
+
+  // TEAM-4166 D1 §1.4 — DERIVED awaited-ids hook. A freshly-created FIX ticket
+  // whose spawnedBy points back to an origin (KIND_TO_ORIGIN_KEY[kind]) means the
+  // origin is waiting on THIS fix: write the awaited edge on the origin now, so a
+  // release manager parked on a sub-cap CHANGES-NEEDED re-wakes when the fix
+  // closes even if the tool never explicitly reported the precondition. Idempotent
+  // with the tool-report pickup (both converge on the same edge), mode-gated
+  // (off → no-op before any I/O), and never fatal — must not fail ticket creation.
+  if (AWAITED_IDS_MODE !== "off" && spawnedBy?.kind && KIND_TO_ORIGIN_KEY[spawnedBy.kind]) {
+    try {
+      await getAwaitedIds().applyAwaitedEdgesForSpawn(ticketId, spawnedBy, "spawnedBy");
+    } catch (err) {
+      console.warn(`[orchestrator] awaited-ids derived hook failed for ${ticketId} (non-fatal): ${err?.message || err}`);
+    }
   }
 }
 

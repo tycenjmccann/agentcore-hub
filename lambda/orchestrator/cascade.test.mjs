@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createCascade, normalizeExtendedMode, newMetrics } from "./cascade.mjs";
+import { createCascade, normalizeExtendedMode, newMetrics, blockerUnion, unionBlockersResolved } from "./cascade.mjs";
+import { createAwaitedIds } from "./awaited-ids.mjs";
 
 /**
  * TEAM-3618 D3 — the shared unblock cascade. Both "ticket done" paths
@@ -1100,5 +1101,171 @@ describe("TEAM-3755 F9 — blockers are confirmed by consistent point-read befor
     expect(getTicketConsistent).not.toHaveBeenCalled();
     expect(lease.stealClaim).toHaveBeenCalledTimes(1);
     expect(redispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── TEAM-4166 D1 — union blocker predicate (pure) ───────────────────────────
+describe("TEAM-4166 D1 — blockerUnion / unionBlockersResolved (pure)", () => {
+  it("blockerUnion is blockedBy ∪ preconditionUnmet.awaitingIds, deduped", () => {
+    expect(blockerUnion({ blockedBy: ["A", "B"], preconditionUnmet: { awaitingIds: ["B", "C"] } }))
+      .toEqual(["A", "B", "C"]);
+    expect(blockerUnion({ blockedBy: ["A"] })).toEqual(["A"]);
+    expect(blockerUnion({ preconditionUnmet: { awaitingIds: ["X"] } })).toEqual(["X"]);
+    expect(blockerUnion({})).toEqual([]);
+  });
+
+  it("unionBlockersResolved is true only when EVERY union id is terminal", () => {
+    const ticket = { blockedBy: ["A"], preconditionUnmet: { awaitingIds: ["B"] } };
+    // B still open → not resolved.
+    expect(unionBlockersResolved(ticket, [
+      { ticketId: "A", status: "done" }, { ticketId: "B", status: "in_progress" },
+    ])).toBe(false);
+    // Both terminal → resolved.
+    expect(unionBlockersResolved(ticket, [
+      { ticketId: "A", status: "done" }, { ticketId: "B", status: "cancelled" },
+    ])).toBe(true);
+    // No snapshot → vacuously true (defense-in-depth; caller already gated).
+    expect(unionBlockersResolved(ticket, undefined)).toBe(true);
+  });
+});
+
+// ─── TEAM-4166 D2 §2.3 — evidence-gated escalation guard (reconcileDependent) ──
+describe("TEAM-4166 D2 §2.3 — evidence-gated escalation guard", () => {
+  const FIX = "FIX-1";
+
+  function makeStore(overrides = {}) {
+    return {
+      incrementCleanExitRedispatch: vi.fn(async () => true),
+      incrementDeadSessionRetry: vi.fn(async () => true),
+      setTaskStatus: vi.fn(async () => {}),
+      appendNotification: vi.fn(async () => {}),
+      markAwaitTimeoutEmitted: vi.fn(async () => true),
+      ...overrides,
+    };
+  }
+
+  function setup({ getLastStreamAt, storeOverrides } = {}) {
+    const store = makeStore(storeOverrides);
+    const base = makeExtDeps({ extendedStates: "enforce" });
+    const awaited = createAwaitedIds({
+      addBlockers: vi.fn(async () => []),
+      annotatePreconditionUnmet: vi.fn(async () => {}),
+      publishEvent: base.publishEvent,
+      getTicket: vi.fn(async () => null),
+      store,
+      now: () => NOW,
+      mode: "enforce",
+    });
+    const deps = {
+      ...base.deps,
+      store,
+      awaitedIds: awaited,
+      cleanExitRedispatchCap: 3,
+      getLastStreamAt: getLastStreamAt || vi.fn(async () => "2026-09-01T05:00:00Z"),
+    };
+    const cascade = createCascade(deps);
+    return { cascade, store, ...base };
+  }
+
+  // priorRetries === 1 → the retry budget is spent (the guard branch).
+  const budgetSpentWorkflow = (task, extra = {}) => ({
+    id: "wf_1", workflowId: "wf_1",
+    deadSessionRetries: { "TEAM-2": 1 },
+    agentTasks: { "TEAM-2": { id: "t2", agentId: "dev", ticketId: "TEAM-2", ...task } },
+    ...extra,
+  });
+
+  it("clean park + awaited blockers still OPEN → 'awaiting', no escalate, deadSessionRetries untouched", async () => {
+    const { cascade, store, publishEvent, lease, redispatch } = setup();
+    const sibling = {
+      ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [],
+      preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T11:00:00Z" },
+    };
+    const siblings = [{ ticketId: FIX, status: "in_progress" }, sibling];
+    const wf = budgetSpentWorkflow({ status: "running", startedAt: STALE_STARTED });
+    const m = newMetrics();
+
+    const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", wf, m, "enforce", siblings);
+
+    expect(outcome).toBe("awaiting");
+    expect(m.awaiting).toBe(1);
+    expect(eventsOfType(publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(store.incrementCleanExitRedispatch).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+  });
+
+  it("genuinely completed (completedOk) + blockers resolved → 'exited-ok', incrementCleanExitRedispatch once, deadSessionRetries untouched", async () => {
+    const { cascade, store, publishEvent, lease, redispatch } = setup();
+    const sibling = { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] };
+    const siblings = [{ ticketId: DONE, status: "done" }, sibling];
+    const wf = budgetSpentWorkflow({ status: "running", startedAt: STALE_STARTED, completedAt: "2026-09-01T06:00:00Z" });
+    const m = newMetrics();
+
+    const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", wf, m, "enforce", siblings);
+
+    expect(outcome).toBe("exited-ok");
+    expect(m.exitedOk).toBe(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    // The clean path NEVER burns the dead-session retry budget.
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(redispatch).toHaveBeenCalledTimes(1);
+    expect(eventsOfType(publishEvent, "agent.escalated")).toHaveLength(0);
+  });
+
+  it("clean park re-woken to the cap → emitAwaitTimeoutOnce (advisory), NO escalation, NO redispatch", async () => {
+    const { cascade, store, publishEvent, redispatch } = setup();
+    const sibling = {
+      ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [],
+      preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T09:00:00Z" },
+    };
+    // The awaited fix is DONE, but we have already re-woken to the cap (3).
+    const siblings = [{ ticketId: FIX, status: "done" }, sibling];
+    const wf = budgetSpentWorkflow(
+      { status: "running", startedAt: STALE_STARTED },
+      { cleanExitRedispatches: { "TEAM-2": 3 } },
+    );
+    const m = newMetrics();
+
+    const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", wf, m, "enforce", siblings);
+
+    expect(outcome).toBe("awaiting");
+    expect(m.awaiting).toBe(1);
+    // Advisory wait-SLA event only — never a manager_escalation (parkedOnHuman trap).
+    expect(eventsOfType(publishEvent, "orchestrator.await_timeout")).toHaveLength(1);
+    expect(eventsOfType(publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(store.incrementCleanExitRedispatch).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+  });
+
+  it("no evidence (not completed, not parked clean) → the EXISTING escalate, now carrying six evidence fields", async () => {
+    const { cascade, store, publishEvent } = setup({ getLastStreamAt: vi.fn(async () => "2026-09-01T05:00:00Z") });
+    const sibling = { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] };
+    const siblings = [{ ticketId: DONE, status: "done" }, sibling];
+    const wf = budgetSpentWorkflow({ status: "running", startedAt: STALE_STARTED });
+    const m = newMetrics();
+
+    const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", wf, m, "enforce", siblings);
+
+    expect(outcome).toBe("escalated");
+    expect(m.escalated).toBe(1);
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    const esc = eventsOfType(publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    const { evidence } = esc[0][2];
+    expect(evidence).toBeTruthy();
+    for (const k of ["lastSpanAt", "lastSpanStatus", "lastStreamAt", "completedAt", "preconditionAt", "exitReason"]) {
+      expect(Object.prototype.hasOwnProperty.call(evidence, k)).toBe(true);
+    }
+    // On the dead path: no "ok" span status, no completion/precondition, no exit reason.
+    expect(evidence.lastSpanStatus).toBeNull();
+    expect(evidence.completedAt).toBeNull();
+    expect(evidence.preconditionAt).toBeNull();
+    expect(evidence.exitReason).toBeNull();
+    expect(evidence.lastStreamAt).toBe("2026-09-01T05:00:00Z");
   });
 });
