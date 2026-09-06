@@ -160,24 +160,80 @@ const idOf = (t) => t?.ticketId || t?.key || t?.id || null;
  * the claim window. Not the design's literal "blockedBy is empty" rule: on the
  * real yteqfl slice that rule yields {TEAM-4101, TEAM-4105} and MISSES TEAM-4102
  * (blockedBy [TEAM-4101]) — i.e. it drops the chain the dead release manager had
- * just built, which is exactly the evidence a human needs. The closure rule
- * (blockedBy empty, or every blocker is itself an in-window ticket) yields the
+ * just built, which is exactly the evidence a human needs. The closure yields the
  * whole chain 4101→4102→4103→4104 plus 4105/4106, the fixes concurrent QA/CI
  * agents filed in the same window. Including those is correct rather than sloppy:
  * all of them must reach done before the Ship ticket may resume, which is the
  * Workflow Manager's own stated resume condition for that run — so blocking the
  * held ticket on the closure is the resume condition, not an over-approximation.
  *
+ * HARD INVARIANT (TEAM-4129 F1): a dead-session-held ticket can NEVER be blocked
+ * on a ticket that transitively depends on it. The caller's enforce path (b) does
+ * addBlockers(ticketId, children) with no park and no human page, so one bad
+ * member of this set is a permanent blocker cycle that reconcileDependent can
+ * never release. Two independent barriers, because the cost of a miss is a wedged
+ * run and the cost of a false exclusion is only a narrower page:
+ *
+ *   1. A REAL closure, iterated to a fixpoint: a candidate is admitted only when
+ *      every one of its blockers is ITSELF an admitted candidate (empty blockedBy
+ *      is the base case). The pre-4129 rule only asked whether each blocker was
+ *      in the window, which is one level deep: with held TEAM-1, QA-1 blockedBy
+ *      [TEAM-1] is correctly dropped (TEAM-1 is not in the window) but DEV-1
+ *      blockedBy [QA-1] was still admitted, giving TEAM-1→DEV-1→QA-1→TEAM-1.
+ *      Under the fixpoint, QA-1's disqualification propagates to DEV-1 and to
+ *      anything that depends on DEV-1.
+ *   2. An explicit transitive-reachability check over ALL siblings (not just the
+ *      in-window ones, and cycle-guarded by a visited set): any candidate whose
+ *      blockedBy graph reaches ticketId is dropped. Barrier 1 already implies
+ *      this today — an admitted candidate's whole transitive blocker set is
+ *      in-window and admitted, and the held ticket is never in the window — but
+ *      barrier 2 does not depend on the window rule, so the invariant survives
+ *      any future loosening of it, and it also covers the PRIMARY provenance path
+ *      where no window rule applies at all.
+ *
+ * If both barriers empty the set, selectChildren returns [] — escalateExhausted's
+ * `children.length > 0` is then false, so it falls through to path (c) PARK and a
+ * human gets paged. That flow needs no other change.
+ *
  * createdAt is parsed with Date.parse because real tickets carry offsets
  * (`…T04:38:39.251-0700`), not just Z.
  */
 export function selectChildren({ siblings, ticketId, claim, now } = {}) {
   const all = Array.isArray(siblings) ? siblings : [];
+
+  // Blocker adjacency over EVERY sibling, so barrier 2 can walk a chain that
+  // leaves the claim window (a pre-window ticket) and still reaches the held one.
+  const byId = new Map();
+  for (const s of all) {
+    const sid = idOf(s);
+    if (sid && !byId.has(sid)) byId.set(sid, s);
+  }
+  const blockersOf = (id) => {
+    const b = byId.get(id)?.blockedBy;
+    return Array.isArray(b) ? b : [];
+  };
+  /** Barrier 2: does startId's transitive blockedBy reach the held ticket? */
+  const dependsOnHeld = (startId) => {
+    const seen = new Set();
+    const stack = [startId];
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || seen.has(cur)) continue; // visited set = cycle guard
+      seen.add(cur);
+      for (const b of blockersOf(cur)) {
+        if (b === ticketId) return true;
+        stack.push(b);
+      }
+    }
+    return false;
+  };
+
   const primary = all.filter((s) => {
     const sid = idOf(s);
     if (!sid || sid === ticketId) return false;
     const sp = s.spawnedBy;
-    return !!sp && SPAWN_ORIGIN_KEYS.some((k) => sp[k] === ticketId);
+    if (!sp || !SPAWN_ORIGIN_KEYS.some((k) => sp[k] === ticketId)) return false;
+    return !dependsOnHeld(sid);
   });
   if (primary.length) return primary.map(idOf).filter(Boolean);
 
@@ -192,12 +248,28 @@ export function selectChildren({ siblings, ticketId, claim, now } = {}) {
     const created = msOf(s.createdAt);
     return created !== null && created >= from && created <= to;
   });
-  const windowIds = new Set(inWindow.map(idOf));
-  const closed = inWindow.filter((s) => {
-    const blockers = Array.isArray(s.blockedBy) ? s.blockedBy : [];
-    return blockers.every((b) => windowIds.has(b));
-  });
-  return closed.map(idOf).filter(Boolean);
+
+  // Barrier 1: fixpoint closure. Start from the tickets with no blockers at all
+  // and keep admitting candidates whose blockers are already admitted, until a
+  // pass admits nothing. Anything left out is (transitively) waiting on something
+  // outside the window — the held ticket included.
+  const admitted = new Set();
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const s of inWindow) {
+      const sid = idOf(s);
+      if (!sid || admitted.has(sid)) continue;
+      const blockers = Array.isArray(s.blockedBy) ? s.blockedBy : [];
+      if (blockers.every((b) => admitted.has(b))) {
+        admitted.add(sid);
+        changed = true;
+      }
+    }
+  }
+
+  return inWindow
+    .map(idOf)
+    .filter((sid) => sid && admitted.has(sid) && !dependsOnHeld(sid));
 }
 
 // ─── The tree ─────────────────────────────────────────────────────────────────
