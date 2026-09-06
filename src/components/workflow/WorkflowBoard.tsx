@@ -2050,7 +2050,7 @@ export const PIPELINE_STYLES = `
 .sdlc-badge{position:absolute;right:calc(100% + 10px);top:50%;transform:translateY(-50%);font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;line-height:1;padding:3px 8px;border-radius:5px;border:1px solid currentColor;white-space:nowrap;transition:none}
 .sdlc-badge--playbook{color:var(--accent-fg);background:var(--accent-subtle)}
 .sdlc-badge--aidlc{color:var(--violet-fg);background:var(--violet-subtle)}
-.sdlc-badge--standard{color:var(--color-text-tertiary);background:var(--color-bg-tertiary)}
+.sdlc-badge--standard{color:var(--color-text-muted);background:var(--color-bg-tertiary)}
 
 .pipeline-canvas{position:relative;width:1720px;min-height:840px;margin-inline:auto}
 .pipeline-connectors{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10}

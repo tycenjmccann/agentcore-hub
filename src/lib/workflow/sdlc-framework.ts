@@ -34,7 +34,7 @@ export const SDLC_BADGE_META: Record<
     tooltip: "Standard pipeline — requirements, parallel design, development, QA and ship.",
     boardClassName: "sdlc-badge sdlc-badge--standard",
     listClassName:
-      "text-[9px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wider whitespace-nowrap flex-shrink-0 text-[var(--color-text-tertiary)] bg-[var(--color-bg-tertiary)] border-current",
+      "text-[9px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wider whitespace-nowrap flex-shrink-0 text-[var(--color-text-muted)] bg-[var(--color-bg-tertiary)] border-current",
   },
   playbook: {
     label: "PLAYBOOK",
