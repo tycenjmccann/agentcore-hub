@@ -184,7 +184,10 @@ STOP and file a dev ticket instead):**
 
 Mechanical fully resolved + build green → treat as PASS (record the new head SHA).
 Mechanical mixed with logic failures → auto-fix the mechanical, file dev tickets
-for the logic, verdict FAIL until the dev tickets land.
+for the logic, verdict FAIL until the dev tickets land. When you FAIL and file
+fix tickets, call `WorkflowOutput___report_precondition_unmet(ticket_id=<your CI ticket>, awaiting_ids=<the ci_fix keys you filed>)`
+so the orchestrator re-wakes you to re-certify when those fixes close — do not
+report_completion (that would Done your ticket unverified).
 
 ### P3: Report
 Report a short table: head SHA, CodeBuild build id, status, log link. On any

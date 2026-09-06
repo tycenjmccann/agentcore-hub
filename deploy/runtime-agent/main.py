@@ -1853,6 +1853,33 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
 
 
 @tool
+def WorkflowOutput___report_precondition_unmet(ticket_id: str, awaiting_ids: str, note: str = "") -> str:
+    """Report that you CANNOT finish yet because your ticket depends on sibling
+    work that is not done — instead of falsely calling report_completion (which
+    would mark your ticket Done) or spinning. This does NOT transition your
+    ticket: it records the ids you are waiting on so the orchestrator re-wakes
+    you when they complete. Use this whenever you discover a hard dependency on
+    another ticket's output that isn't ready.
+
+    Args:
+        ticket_id: Your assigned ticket ID.
+        awaiting_ids: The ticket id(s) you are waiting on — comma- or
+            space-separated (e.g. "TEAM-4156, TEAM-4157").
+        note: Optional one-line reason describing what you are waiting for.
+    """
+    # workflow_id / agent_id come from invocation context (not exposed to agent),
+    # exactly like report_completion.
+    payload = {
+        "ticket_id": ticket_id,
+        "awaiting_ids": awaiting_ids,
+        "note": note,
+        "workflow_id": _CURRENT_WORKFLOW_ID,
+        "agent_id": _CURRENT_AGENT_ID,
+    }
+    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_precondition_unmet", payload)
+
+
+@tool
 def WorkflowOutput___save_design_doc(workflow_id: str, agent_id: str, content: str, doc_type: str = "design") -> str:
     """Save a design document or artifact for the workflow.
 
@@ -2630,6 +2657,7 @@ LAMBDA_TOOLS = [
     Pipeline___capabilities,
     # Workflow (Lambda-backed)
     WorkflowOutput___report_completion,
+    WorkflowOutput___report_precondition_unmet,
     WorkflowOutput___save_design_doc,
     WorkflowOutput___submit_ticket_plan,
     # Blueprint (Lambda-backed) — process/workflow instructions for the agent's role

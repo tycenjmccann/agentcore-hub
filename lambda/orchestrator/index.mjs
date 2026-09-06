@@ -5306,6 +5306,31 @@ export function mapJiraIssueToTicket(issue) {
   }));
   const reviewComment = jiraComments.length ? jiraComments[jiraComments.length - 1].content : undefined;
 
+  // TEAM-4166 §1.2: reconstruct preconditionUnmet from the `awaiting:<id>` labels
+  // the jira Lambda stamps, enriched by the `<!-- precondition-unmet {...} -->`
+  // comment marker when comments are in scope (it carries reportedAt/agentId/
+  // source — the D2 liveness clock reads reportedAt). Labels are the durable
+  // index; the marker only enriches. Mirrors the spawnedBy-from-labels rebuild
+  // above so a Jira-mode ticket carries the same field DynamoDB mode stores.
+  const awaitingLabelIds = labels
+    .filter((l) => l.startsWith("awaiting:"))
+    .map((l) => l.slice("awaiting:".length))
+    .filter(Boolean);
+  const preconditionMarker = parsePreconditionMarker(jiraComments);
+  let preconditionUnmet = null;
+  if (awaitingLabelIds.length > 0 || preconditionMarker) {
+    const ids = [];
+    for (const id of [...(preconditionMarker?.awaitingIds || []), ...awaitingLabelIds]) {
+      if (typeof id === "string" && id && !ids.includes(id)) ids.push(id);
+    }
+    preconditionUnmet = {
+      awaitingIds: ids,
+      ...(preconditionMarker?.reportedAt ? { reportedAt: preconditionMarker.reportedAt } : {}),
+      ...(preconditionMarker?.agentId !== undefined ? { agentId: preconditionMarker.agentId } : {}),
+      source: preconditionMarker?.source || "label",
+    };
+  }
+
   const rawIssueType = f.issuetype?.name || "Task";
   return {
     ticketId: issue.key,
@@ -5331,8 +5356,21 @@ export function mapJiraIssueToTicket(issue) {
     ...(spawnedBy ? { spawnedBy } : {}),
     ...(phase ? { phase } : {}),
     ...(fixContract ? { fixContract } : {}),
+    ...(preconditionUnmet ? { preconditionUnmet } : {}),
     artifacts: [],
   };
+}
+
+// TEAM-4166 §1.2: pull the newest structured precondition marker out of a comment
+// thread. Newest wins — an agent may re-report an updated awaited set. Returns the
+// parsed marker JSON ({ awaitingIds, reportedAt, agentId, source }) or null.
+function parsePreconditionMarker(comments) {
+  for (let i = (comments || []).length - 1; i >= 0; i--) {
+    const m = /<!-- precondition-unmet (\{.*?\}) -->/.exec(comments[i]?.content || "");
+    if (!m) continue;
+    try { return JSON.parse(m[1]); } catch { return null; }
+  }
+  return null;
 }
 
 function extractAdfText(adf) {

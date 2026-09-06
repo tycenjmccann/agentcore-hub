@@ -243,7 +243,10 @@ missing = empty state, round 1):
 
      Record the fix-ticket keys in the round entry, write the ledger, and put your
      own ticket back to `in_progress` — you re-review after the fixes merge to the
-     shared branch, starting again from Step 1's SHA cross-check.
+     shared branch, starting again from Step 1's SHA cross-check. Then call
+     `WorkflowOutput___report_precondition_unmet(ticket_id=<your ticket>, awaiting_ids=<the fix-ticket keys you filed>)`
+     so the orchestrator re-wakes you automatically when those fixes close — do not
+     rely on a human to re-dispatch.
    - **CHANGES NEEDED, effective count >= `maxRounds` — ESCALATE. Do NOT spawn
      this round's fix tickets.** The loop stops here; leave the round's
      `fixTickets` empty, then:

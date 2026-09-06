@@ -297,6 +297,21 @@ export default defineConfig({
       // preconditionUnmet stamp, the once-only await-timeout CAS, and the EMF
       // record — all asserted under a jira == dynamodb provider parity loop.
       "lambda/orchestrator/awaited-ids.test.mjs",
+      // report_precondition_unmet channel (TEAM-4166 §1.2) — the non-terminal
+      // twin of report_completion. workflow-output/precondition-unmet: the REAL
+      // handler's ONLY side effects are the annotate invoke + the journey event
+      // (never a transition, never a completions/<id>.json write); parse/dedup/
+      // cap/self-drop and the inferToolFromArgs routing that keeps awaiting_ids
+      // off the completion path. The two annotate-precondition files pin each
+      // ticket Lambda's action in isolation (DDB column merge / Jira labels +
+      // marker + the label→awaitingIds round-trip). precondition-contract drives
+      // BOTH ticket Lambdas under a `for (provider of [dynamodb, jira])` loop to
+      // prove the SAME `{ ticketId, preconditionUnmet }` shape and that NEITHER
+      // transitions — the parity workflow-output relies on to stay backend-blind.
+      "lambda/workflow-output/precondition-unmet.test.mjs",
+      "lambda/agentcore-hub-tickets/annotate-precondition.test.mjs",
+      "lambda/agentcore-hub-jira/annotate-precondition.test.mjs",
+      "lambda/agentcore-hub-jira/precondition-contract.test.mjs",
       // yteqfl loop 2 replay (TEAM-4121 FR-9) — the real prod failure this FR
       // exists for, from the dossier fixture: TEAM-4089 closed claiming live
       // evidence with none, QA re-verify TEAM-4092 caught it 48m later and filed

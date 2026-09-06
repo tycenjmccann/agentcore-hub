@@ -836,6 +836,70 @@ async function addComment(params) {
   return { ticketId: ticket_id, message: "Comment added" };
 }
 
+/**
+ * TEAM-4166 §1.2 — stamp the non-terminal "precondition unmet" record in Jira.
+ * Jira has no structured record, so the LABELS are the index: one `awaiting:<id>`
+ * label per awaited sibling, which mapIssue (and the orchestrator's
+ * mapJiraIssueToTicket) parse back into `ticket.preconditionUnmet`. A structured
+ * comment marker carries the richer fields (reportedAt/agentId/source) for a
+ * reader that fetches comments. Deliberately NO transition — this is an
+ * annotation, not a status change; the awaited-edge write is the orchestrator's.
+ * `update.labels[{add}]` (not a whole-list `fields` replace) is additive and
+ * idempotent server-side, so a re-report unions rather than duplicating.
+ */
+async function annotatePreconditionUnmet(params) {
+  const ticketId = params.ticket_id || params.issue_key;
+  if (!ticketId) throw new Error("'ticket_id' is required");
+
+  const incoming = Array.isArray(params.awaitingIds)
+    ? params.awaitingIds
+    : params.awaitingIds
+      ? [params.awaitingIds]
+      : [];
+  const awaitingIds = [];
+  for (const id of incoming) {
+    const s = typeof id === "string" ? id.trim() : "";
+    if (s && !awaitingIds.includes(s)) awaitingIds.push(s);
+  }
+
+  const reportedAt = params.reportedAt || new Date().toISOString();
+  const agentId = params.agentId || null;
+  const source = params.source || "tool";
+  const note = typeof params.note === "string" ? params.note : "";
+  const preconditionUnmet = { awaitingIds, note, reportedAt, agentId, source };
+
+  // Machine-readable marker (parsed back by parsePreconditionMarker) + a human
+  // line. The marker JSON omits `note` — the human line already carries it, and
+  // labels are the field the orchestrator actually reads.
+  const marker = `<!-- precondition-unmet ${JSON.stringify({ awaitingIds, reportedAt, agentId, source })} -->`;
+  const humanLine = `Precondition unmet — awaiting ${awaitingIds.join(", ")}${note ? `: ${note}` : ""}`;
+  await jiraFetch(`/rest/api/3/issue/${ticketId}/comment`, {
+    method: "POST",
+    body: JSON.stringify({
+      body: {
+        type: "doc",
+        version: 1,
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: humanLine }] },
+          { type: "paragraph", content: [{ type: "text", text: marker }] },
+        ],
+      },
+    }),
+  });
+
+  // NOT lowercased — the id must survive as a real ticket key so mapIssue reads
+  // it back as TEAM-1234, not team-1234.
+  const labelAdds = awaitingIds.map((id) => `awaiting:${id}`);
+  if (labelAdds.length > 0) {
+    await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
+      method: "PUT",
+      body: JSON.stringify({ update: { labels: labelAdds.map((add) => ({ add })) } }),
+    });
+  }
+
+  return { ticketId, preconditionUnmet };
+}
+
 async function searchIssues(params) {
   // Accept `jql` as an alias — agents regularly pass it and used to get an
   // opaque 400 (empty jql param) back.
@@ -1009,6 +1073,15 @@ function mapIssue(issue) {
     ? `human:${reviewerLabel.replace("reviewer:", "")}`
     : fields.assignee?.displayName || null;
 
+  // TEAM-4166 §1.2: reconstruct preconditionUnmet from the `awaiting:<id>` labels
+  // annotatePreconditionUnmet writes. mapIssue sees only fields (no comments), so
+  // the richer marker fields aren't available here — source:"label" says so; a
+  // reader with comment access can prefer the marker JSON.
+  const awaitingIds = labels
+    .filter((l) => l.startsWith("awaiting:"))
+    .map((l) => l.slice("awaiting:".length))
+    .filter(Boolean);
+
   return {
     ticketId: issue.key,
     title: fields.summary || "",
@@ -1018,6 +1091,7 @@ function mapIssue(issue) {
     parentKey: fields.parent?.key || null,
     workflowId: wfLabel ? wfLabel.replace("wf:", "") : null,
     labels,
+    ...(awaitingIds.length > 0 ? { preconditionUnmet: { awaitingIds, source: "label" } } : {}),
   };
 }
 
@@ -1030,6 +1104,7 @@ const TOOLS = {
   Tickets___labels_add: addLabels,
   Tickets___list_tickets: listTickets,
   Tickets___add_comment: addComment,
+  Tickets___annotate_precondition_unmet: annotatePreconditionUnmet,
   Tickets___search_issues: searchIssues,
   Tickets___get_issue: getIssue,
   Tickets___get_transitions: getTransitions,
@@ -1043,6 +1118,7 @@ const TOOLS = {
   JiraIntegration___update_ticket: updateTicket,
   JiraIntegration___list_tickets: listTickets,
   JiraIntegration___add_comment: addComment,
+  JiraIntegration___annotate_precondition_unmet: annotatePreconditionUnmet,
   JiraIntegration___search_issues: searchIssues,
   JiraIntegration___get_issue: getIssue,
   JiraIntegration___get_transitions: getTransitions,
