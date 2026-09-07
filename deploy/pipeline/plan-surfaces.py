@@ -28,8 +28,16 @@ Rules:
     first.
 
 `--check` mode (scripts/check-deploy-surfaces.sh) verifies the manifest covers
-every tracked file under lambda/ and deploy/ — a new Lambda or deploy script
-that nobody added to surfaces.json fails CI instead of silently drifting.
+every tracked file under lambda/ and deploy/ PLUS every tracked src/config/*.json
+— a new Lambda, deploy script or live S3 config file that nobody added to
+surfaces.json fails CI instead of silently drifting. The src/config/*.json files
+are deploy INPUTS: cp'd to the artifact bucket (pricing.json, workflows.json),
+merged onto the S3 copy (agents.json) or baked into a Lambda zip
+(lease-constants.json). Only .json is in scope — modules.ts / brand.ts there are
+app source, compiled into the container image by Target 3. TEAM-4259:
+workflows.json deployed via a hardcoded `aws s3 cp` in buildspec-deploy.yml with
+no manifest entry, and this check — walking only lambda/ and deploy/ — was
+structurally unable to see it.
 """
 from __future__ import annotations
 
@@ -41,6 +49,9 @@ import sys
 from pathlib import Path
 
 SENTINEL = "deploy/runtime-agent/FORCE-UNKNOWN-RANGE"
+# Config files that are deploy INPUTS rather than app source (see the docstring).
+# Only *.json directly under this dir is in --check's scope.
+CONFIG_DIR = "src/config"
 HERE = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = HERE / "surfaces.json"
 
@@ -120,17 +131,23 @@ def plan(changed_files: list[str], manifest: dict, force_all: bool = False) -> l
     return actions
 
 
-# ─── --check: manifest coverage of lambda/ and deploy/ ───────────────────────
+# ─── --check: coverage of lambda/, deploy/ and src/config/*.json ─────────────
+
+def _config_json(f: str) -> bool:
+    return f.startswith(CONFIG_DIR + "/") and f.endswith(".json")
+
 
 def _tracked_files(root: Path) -> list[str]:
     try:
         out = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "lambda", "deploy"],
+            ["git", "-C", str(root), "ls-files", "lambda", "deploy", CONFIG_DIR],
             check=True, capture_output=True, text=True,
         ).stdout
         files = [l for l in out.splitlines() if l.strip()]
         if files:
-            return files
+            # src/config carries app source (.ts) next to the deploy inputs (.json);
+            # only the latter has to be a manifest surface.
+            return [f for f in files if not f.startswith(CONFIG_DIR + "/") or _config_json(f)]
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
     files = []
@@ -139,6 +156,9 @@ def _tracked_files(root: Path) -> list[str]:
             dirnames[:] = [d for d in dirnames if d not in ("node_modules", "__pycache__", "cdk.out")]
             for fn in filenames:
                 files.append(os.path.relpath(os.path.join(dirpath, fn), root))
+    # Same scope as the git path above: *.json only, non-recursive.
+    for p in (root / CONFIG_DIR).glob("*.json"):
+        files.append(os.path.relpath(p, root))
     return sorted(files)
 
 
@@ -182,13 +202,14 @@ def main(argv: list[str]) -> int:
         manifest = load_manifest()
         missing = check(root, manifest)
         if missing:
-            print("FAIL: files under lambda/ or deploy/ not covered by deploy/pipeline/surfaces.json:", file=sys.stderr)
+            print("FAIL: files under lambda/, deploy/ or src/config/*.json not covered by "
+                  "deploy/pipeline/surfaces.json:", file=sys.stderr)
             for f in missing:
                 print(f"  - {f}", file=sys.stderr)
             print("Add the surface (lambdas / s3 / harnesses), list it under handoff (infra script), "
                   "or add it to excluded with a reason.", file=sys.stderr)
             return 1
-        print(f"deploy-surface manifest covers lambda/ and deploy/ "
+        print(f"deploy-surface manifest covers lambda/, deploy/ and src/config/*.json "
               f"({len(manifest.get('lambdas', []))} lambdas, {len(manifest.get('harnesses', []))} harnesses, "
               f"{len(manifest.get('s3', []))} s3 surfaces)")
         return 0

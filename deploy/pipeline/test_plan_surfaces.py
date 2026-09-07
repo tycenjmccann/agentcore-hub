@@ -1,4 +1,5 @@
 """Hermetic tests for plan-surfaces.py (no AWS). Run with pytest from repo root."""
+import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -85,6 +86,14 @@ def test_pricing_json_is_an_s3_cp():
     assert kinds(actions, "S3CP") == [["S3CP", "src/config/pricing.json", "config/pricing.json"]]
 
 
+def test_workflows_json_is_an_s3_cp():
+    # TEAM-4259: workflows.json used to ship via a hardcoded `aws s3 cp` in
+    # buildspec-deploy.yml Target 2, outside the manifest. It is a plain S3CP
+    # surface now, exactly like pricing.json above.
+    actions = ps.plan(["src/config/workflows.json"], MANIFEST)
+    assert kinds(actions, "S3CP") == [["S3CP", "src/config/workflows.json", "config/workflows.json"]]
+
+
 def test_model_catalog_change_updates_builder_harness():
     actions = ps.plan(["src/lib/models/harness-models.json"], MANIFEST)
     assert [a[1] for a in kinds(actions, "HARNESS")] == ["agentcore_hub_builder"]
@@ -151,6 +160,24 @@ def test_app_only_change_yields_empty_plan():
 def test_manifest_covers_repo():
     root = HERE.parent.parent
     assert ps.check(root, MANIFEST) == []
+
+
+def test_check_would_catch_an_unmanifested_src_config_json():
+    # The TEAM-4259 drift itself: workflows.json deployed via a hardcoded cp in
+    # buildspec-deploy.yml with no manifest entry, and --check walked only lambda/
+    # + deploy/ so it could not see it. Drop the entry → the guard must report it.
+    root = HERE.parent.parent
+    m = copy.deepcopy(MANIFEST)
+    m["s3"] = [s for s in m["s3"] if s["src"] != "src/config/workflows.json"]
+    assert "src/config/workflows.json" in ps.check(root, m)
+
+
+def test_check_covers_json_under_src_config_but_not_ts():
+    # .ts in src/config is app source (compiled into the image by Target 3), not a
+    # deploy surface — widening the guard must not demand a manifest entry for it.
+    tracked = ps._tracked_files(HERE.parent.parent)
+    assert "src/config/workflows.json" in tracked and "src/config/agents.json" in tracked
+    assert [f for f in tracked if f.startswith("src/config/") and not f.endswith(".json")] == []
 
 
 def test_every_lambda_dir_is_a_surface_or_excluded():

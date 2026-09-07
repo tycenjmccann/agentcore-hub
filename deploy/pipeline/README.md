@@ -31,8 +31,9 @@ re-zip and `update-function-code`, which S3 toolkits/skills/config to sync, and
 which harness prompts/models to `UpdateHarness` (each harness's own setup script
 run with `PIPELINE_MODE=1`). Live code and harness config are snapshotted first;
 `rollback.sh` restores them on any failure. `scripts/check-deploy-surfaces.sh`
-(CI gate) fails when a file under `lambda/` or `deploy/` is covered by no
-manifest entry, so a new surface cannot silently fall outside the pipeline.
+(CI gate) fails when a file under `lambda/`, `deploy/`, or any `src/config/*.json`
+(the live S3 config surfaces) is covered by no manifest entry, so a new surface
+cannot silently fall outside the pipeline.
 
 What the narrow Deploy role deliberately cannot do stays a **handoff**: runtime
 images (`deploy/runtime-agent/`, `deploy/coding-agent-runtime/`) and infra
