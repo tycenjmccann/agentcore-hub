@@ -2336,6 +2336,10 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
       details: pkg?.summary || `Ticket ${ticketId} is awaiting review by ${reviewer}.`,
       ticketId,
       reviewer,
+      // TEAM-4166 §2.4: the FULL human:* assignee, so the analyzer's parkedOnHuman
+      // parks on this gate only when a human genuinely owns it (a bare agent-side
+      // notification lacking a human assignee must not silence the watchdog).
+      humanAssignee: assignee,
       ...(pkg ? { summary: pkg.summary, bullets: pkg.bullets, links: pkg.links, gate: pkg.gate } : {}),
       timestamp: new Date().toISOString(),
       acknowledged: false,

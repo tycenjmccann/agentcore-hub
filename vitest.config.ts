@@ -388,6 +388,12 @@ export default defineConfig({
       // once the stamp is gone (D1 off).
       "lambda/orchestrator/replay-f50ucz-ship-rewake.test.mjs",
       "lambda/orchestrator/replay-f50ucz-liveness.test.mjs",
+      // TEAM-4166 D2 — the analyzer liveness clock: mode normalization (garbage →
+      // shadow, never off), per-phase thresholds + the span-fresh proof-of-life
+      // override, buildLivenessTickets bucketing, decideWatch worst-ticket pick,
+      // phaseForAgent mapping, EMF zeros, the §2.5/§2.1 sync invariants vs the
+      // lease TTL + src/lib/workflow/stale.ts, and the §2.4 parkedOnHuman gate.
+      "lambda/workflow-analyzer/liveness.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
