@@ -418,6 +418,31 @@ export async function markAwaitTimeoutEmitted(workflowId, ticketId, at) {
 }
 
 /**
+ * TEAM-4167 D3 (FR-3.3) — claim the ONE initial-phase `workflow.phase_change`
+ * emit a run ever gets. When the first agent of the run's initial phase is
+ * dispatched there is no phase ADVANCE (the row was created already at that
+ * phase), so the emit can't be gated on an advance; a top-level
+ * `attribute_not_exists(announcedInitialPhase)` CAS (same shape as
+ * markDeadSessionDetected) makes it exactly-once across concurrent deliveries
+ * and re-dispatches. Returns true when this caller won the stamp; false on CCFE.
+ */
+export async function markInitialPhaseAnnounced(workflowId, phase) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET announcedInitialPhase = :p",
+      ConditionExpression: "attribute_not_exists(announcedInitialPhase)",
+      ExpressionAttributeValues: { ":p": phase },
+    }));
+    return true;
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
  * TEAM-4166 D2 — increment the per-ticket clean-exit re-dispatch counter, scoped
  * to the top-level cleanExitRedispatches map so it never touches
  * deadSessionRetries or a sibling. This is the D2 evidence guard's OWN budget:

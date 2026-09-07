@@ -37,13 +37,13 @@ const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows"
 // as the orchestrator's EVENTS_TABLE so both halves land in one place.
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
-// Events-table double-write collapse (TEAM-4120 FR-2): off (default,
-// byte-identical) | enforce. Same flag, same strict allow-list, as the
+// Events-table double-write collapse (TEAM-4120 FR-2 / TEAM-4167 D3 FR-3.4):
+// off | enforce, DEFAULT enforce. Same flag, same strict allow-list, as the
 // orchestrator and events-writer — all three must agree for the EventBridge
 // copy to overwrite the direct copy rather than double it. Instant rollback =
 // set off. agent.streaming keeps random ids (RANDOM_ID_TYPES in event-id.mjs):
 // its chunks share a content key and collapsing them would drop heartbeats.
-const EVENT_DEDUPE_MODE = normalizeEventDedupeMode(process.env.EVENT_DEDUPE_MODE);
+const EVENT_DEDUPE_MODE = normalizeEventDedupeMode(process.env.EVENT_DEDUPE_MODE, "enforce");
 
 // ─── Bounded transient-failure retry (FR-D4.2) ──────────────────────────────
 // A transient Bedrock/AgentCore fault (5xx / ServiceUnavailable / Throttling /

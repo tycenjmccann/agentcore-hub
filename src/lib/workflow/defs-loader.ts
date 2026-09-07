@@ -40,6 +40,10 @@ export async function loadWorkflowDefs(): Promise<WorkflowDef[]> {
   // below is deliberately OUTSIDE this catch so a dishonest ship gate throws
   // instead of being swallowed into a silent bundled fallback.
   let defs: WorkflowDef[];
+  // Only a successful S3 load is cached. The fetch-FAILURE fallback stays
+  // UNCACHED (as before this change) so the next call retries S3 rather than
+  // serving bundled for the whole TTL after one transient blip.
+  let cacheable = true;
   if (!ARTIFACT_BUCKET) {
     defs = WORKFLOW_DEFS;
   } else {
@@ -56,6 +60,7 @@ export async function loadWorkflowDefs(): Promise<WorkflowDef[]> {
       // S3 unavailable → bundled defs so checked-in workflows still resolve.
       // S3-only routine defs will be absent → the caller 400s (correct).
       defs = WORKFLOW_DEFS;
+      cacheable = false;
     }
   }
 
@@ -64,7 +69,7 @@ export async function loadWorkflowDefs(): Promise<WorkflowDef[]> {
   // fails loudly at load. Throws; not caught by the fetch fallback above.
   for (const d of defs) lintWorkflowDefShape(d);
 
-  _cache = { defs, at: now };
+  if (cacheable) _cache = { defs, at: now };
   return defs;
 }
 

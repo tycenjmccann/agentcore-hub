@@ -92,10 +92,44 @@ describe("stripShipPhases / effectiveWorkflowDef", () => {
     expect(SHIP_DEF.completionRequiresAgentPhases).toContain("ship");
     expect(SHIP_DEF.reviewGates).toHaveLength(2);
   });
+  it("drops a condition:\"cdRegistered\" gate on handoff even when it does NOT guard the ship phase", () => {
+    // "cdRegistered" means "present only when the repo is registered"; this is
+    // the not-registered path, so such a gate is auto-absent regardless of the
+    // phase it guards — the D3a honest declaration for any CD-only gate.
+    const def = {
+      ...SHIP_DEF,
+      completionRequiresAgentPhases: ["development", "verification"],
+      reviewGates: [
+        { afterPhase: "requirements", name: "Spec Approval", blocking: true, condition: "flagged" },
+        { afterPhase: "development", name: "CD-only Gate", blocking: true, condition: "cdRegistered" },
+      ],
+    };
+    const eff = stripShipPhases(def, new Set(["ship"]));
+    expect(eff.reviewGates.map((g) => g.afterPhase)).toEqual(["requirements"]);
+    expect(eff.cdHandoff).toBe(true);
+  });
+  it("strips a def whose ONLY droppable gate is a cdRegistered gate (no ship phase to trigger the early return)", () => {
+    const def = {
+      ...SHIP_DEF,
+      completionRequiresAgentPhases: ["development"],
+      reviewGates: [{ afterPhase: "development", name: "CD-only Gate", blocking: true, condition: "cdRegistered" }],
+    };
+    const eff = stripShipPhases(def, new Set(["ship"]));
+    expect(eff).not.toBe(def);
+    expect(eff.reviewGates).toEqual([]);
+    expect(eff.cdHandoff).toBe(true);
+  });
   it("returns the def itself when there is nothing to strip", () => {
     const noShip = { ...SHIP_DEF, completionRequiresAgentPhases: ["development"], reviewGates: [] };
     expect(stripShipPhases(noShip)).toBe(noShip);
     expect(stripShipPhases(undefined)).toBeUndefined();
+  });
+  it("keeps a cdRegistered gate on a REGISTERED repo (effectiveWorkflowDef identity)", () => {
+    const def = {
+      ...SHIP_DEF,
+      reviewGates: [{ afterPhase: "development", name: "CD-only Gate", blocking: true, condition: "cdRegistered" }],
+    };
+    expect(effectiveWorkflowDef(def, REG, HUB, new Set(["ship"]))).toBe(def);
   });
   it("effectiveWorkflowDef: registered → identity; unregistered → stripped", () => {
     expect(effectiveWorkflowDef(SHIP_DEF, REG, HUB)).toBe(SHIP_DEF);

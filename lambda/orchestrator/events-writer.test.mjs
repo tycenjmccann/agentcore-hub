@@ -69,14 +69,27 @@ beforeEach(() => {
   delete process.env.EVENT_DEDUPE_MODE;
 });
 
-describe("EVENT_DEDUPE_MODE unset/off — byte-identical to pre-4120", () => {
-  it.each([undefined, "off", "shadow", "on", "garbage"])("mode %j → the base36 monotonic id", async (mode) => {
-    const handler = await loadHandler(mode);
+describe("EVENT_DEDUPE_MODE — only an EXACT \"off\" keeps the pre-4120 base36 id", () => {
+  // TEAM-4167 D3 FR-3.4 flipped the default: the writer passes defaultMode
+  // "enforce", so an unset var (and every non-"off" spelling) collapses the twin
+  // write. Only a deliberate "off" rolls back to the legacy monotonic id.
+  it("mode \"off\" → the base36 monotonic id (rollback path)", async () => {
+    const handler = await loadHandler("off");
     await handler(EB_EVENT);
 
     expect(h.puts).toHaveLength(1);
     expect(h.puts[0].Item.eventId).toMatch(BASE36_RE);
     expect(h.puts[0].Item.eventId).not.toMatch(DETERMINISTIC_RE);
+  });
+
+  it.each([undefined, "shadow", "on", "garbage"])("mode %j → the deterministic id (defaults to enforce)", async (mode) => {
+    const handler = await loadHandler(mode);
+    await handler(EB_EVENT);
+
+    expect(h.puts).toHaveLength(1);
+    expect(h.puts[0].Item.eventId).toMatch(DETERMINISTIC_RE);
+    expect(h.puts[0].Item.eventId).not.toMatch(BASE36_RE);
+    expect(h.puts[0].Item.eventId).toBe(deterministicEventId("agent.complete", EB_EVENT.detail));
   });
 
   it("keeps the base36 ids monotonic within a warm container (the counter still advances)", async () => {

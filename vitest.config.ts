@@ -203,6 +203,11 @@ export default defineConfig({
       // cd-registry.mjs — pure registry parsing / repo matching / ship-phase
       // stripping (which repos the hub merges + deploys); no I/O.
       "lambda/orchestrator/cd-registry.test.mjs",
+      // review-resolved.mjs (TEAM-4167 D3 FR-3.2) — the canonical review.resolved
+      // detail builder every human gate emits at completion; pure, no I/O. The
+      // .mjs↔.ts honesty-lint/validate parity is asserted separately by the
+      // auto-included src/lib/workflow/workflow-def-validate-parity.test.ts.
+      "lambda/orchestrator/review-resolved.test.mjs",
       // event-id.mjs (TEAM-4120 FR-2) — the deterministic event id that collapses
       // the events table's EventBridge/direct double-write. Pure (node:crypto
       // only): determinism, the 13-digit-ms id shape the anomaly-watcher's

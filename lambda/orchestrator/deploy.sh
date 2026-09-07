@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs ci-check.mjs sync-main.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs ticket-blockers.mjs fix-contract.mjs artifact-chain.mjs awaited-ids.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs workflow-def-validate.mjs review-resolved.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs ci-check.mjs sync-main.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs ticket-blockers.mjs fix-contract.mjs artifact-chain.mjs awaited-ids.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -193,17 +193,16 @@ if [ -n "${REWORK_LOOP_CAP:-}" ]; then
   REWORK_LOOP_CAP_VARS=",REWORK_LOOP_CAP=${REWORK_LOOP_CAP}"
 fi
 
-# Events-table double-write collapse (TEAM-4120 FR-2): only forwarded when
-# explicitly set, so a plain install stays default off (byte-identical; instant
-# rollback = set off). Strict allow-list in code — garbage / "shadow" → off.
-# Forwarded to ALL THREE writers: the overwrite only happens when the
+# Events-table double-write collapse (TEAM-4120 FR-2 / TEAM-4167 D3 FR-3.4):
+# the DEFAULT is now "enforce" (unset → enforce; leaving the twin write live
+# double-counts every consumer that reads events-table row counts). Instant
+# rollback = set EVENT_DEDUPE_MODE=off. Strict allow-list in code — garbage /
+# "shadow" → the default (enforce). Forwarded EXPLICITLY to ALL THREE writers so
+# the deployed config is self-describing: the overwrite only happens when the
 # orchestrator, the agent-invoker and the events-writer agree on the mode (one
 # writer left in off would keep writing its own second row).
-EVENT_DEDUPE_VARS=""
-if [ -n "${EVENT_DEDUPE_MODE:-}" ]; then
-  EVENT_DEDUPE_VARS=",EVENT_DEDUPE_MODE=${EVENT_DEDUPE_MODE}"
-  echo "  EVENT_DEDUPE_MODE=${EVENT_DEDUPE_MODE} forwarded to orchestrator+agent-invoker+events-writer"
-fi
+EVENT_DEDUPE_VARS=",EVENT_DEDUPE_MODE=${EVENT_DEDUPE_MODE:-enforce}"
+echo "  EVENT_DEDUPE_MODE=${EVENT_DEDUPE_MODE:-enforce} forwarded to orchestrator+agent-invoker+events-writer"
 
 # Review-gate state machine (TEAM-4120 FR-1): only forwarded when explicitly
 # set, so a plain install stays default off (byte-identical — the guard returns
