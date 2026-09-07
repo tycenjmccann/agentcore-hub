@@ -207,7 +207,7 @@ const REWORK_LOOP_CAP = process.env.REWORK_LOOP_CAP
 // the eventId is derived from the event's content, so the EventBridge copy
 // written by events-writer.mjs lands on the SAME (workflowId, eventId) and
 // overwrites the direct copy instead of doubling it. STRICT allow-list (garbage
-// and "shadow" → off; see event-id.mjs). Instant rollback = set off. Must agree
+// and "shadow" → the default; see event-id.mjs). Instant rollback = set off. Must agree
 // across all three writers, which is why deploy.sh forwards it to all three.
 // TEAM-4167 D3 (FR-3.4): default ENFORCE. Leaving the twin write uncollapsed
 // silently double-counts every consumer that reads events-table row counts;
