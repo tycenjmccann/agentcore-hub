@@ -66,7 +66,7 @@ import { applyBlockerEdge, normalizePreserveStatuses } from "./ticket-blockers.m
 // a dynamic import would leave the new deploy.sh zip entry unenforced. The
 // module is pure (no clock, no AWS, no env beyond one normalizer), so importing it
 // with all three flags off costs a parse and nothing else.
-import { normalizeVerdictMode } from "./verdict-contract.mjs";
+import { normalizeVerdictMode, GATE_PERSONAS, resolveVerdict, resolveTestedHead, enrichCompleteDetail } from "./verdict-contract.mjs";
 // TEAM-4121 FR-8: the fix-ticket contract lives in a zero-import module that is
 // byte-identical across the orchestrator + both ticket Lambdas (CI cmp's them).
 // The orchestrator only READS contracts — it maps a Jira issue's labels and
@@ -783,6 +783,26 @@ function getCascade() {
     blockTicket: blockTicketForFailedInvoke,
     // TEAM-4120 FR-3 — same hook as the detector; undefined when off.
     escalate: getDeadSessionEscalation()?.escalateExhausted,
+    // TEAM-4246 D1 — the verdict gate. `verdictGateMode` is read unconditionally
+    // (cascade.mjs itself normalizes off|shadow|enforce), but `verdictGate` stays
+    // null under "off" so an off deployment calls the resolver ZERO times — byte
+    // for byte the pre-4246 cascade, not just an early return inside it.
+    verdictGateMode: VERDICT_GATE,
+    ...(VERDICT_GATE !== "off"
+      ? {
+          verdictGate: (args) =>
+            resolveVerdictInfo({
+              ticketId: args?.ticketId,
+              workflow: args?.workflow,
+              siblings: args?.siblings,
+              parentId: args?.workflow?.epicId || args?.workflow?.parentId,
+            }),
+          // Same factory as observeLiveReverify's kind:"ship" path — one memo,
+          // one idempotency store, whichever kind asks first.
+          reverify: (args) => getLiveReverify().reverify(args),
+          addBlockers,
+        }
+      : { verdictGate: null }),
   });
   return _cascade;
 }
@@ -941,6 +961,102 @@ async function readCompletionRecord(ticketId) {
   const p = readArtifactJson(`completions/${ticketId}.json`);
   _completionRecordCache.set(ticketId, p);
   return p;
+}
+
+// ─── Gate-persona verdicts (TEAM-4246 D1) ────────────────────────────────────
+
+/**
+ * The fix tickets a gate persona filed DURING this task: its own children on the
+ * board, matched through the same `spawnedBy` origin key the fix contract writes
+ * (`review_fix` → `gateTicketId`, `qa_fix` → `qaTicketId`, …).
+ *
+ * Two exclusions, both load-bearing:
+ *   - re-verify tickets (`spawnedBy.reverify` / `rearmOf`) are ORCHESTRATOR-filed,
+ *     not persona-filed. Counting one would let a prior round's re-verify come back
+ *     as a blocker for the next round, and would report the orchestrator's own
+ *     bookkeeping as the reviewer's findings.
+ *   - closed ones. The list is used as the successor's blockers, and a done fix is
+ *     not something to wait on. (`isOpen` mirrors completion.mjs's module-private
+ *     predicate of the same name — same two terminal statuses.)
+ */
+function spawnedFixIdsFor(ticketId, siblings) {
+  const isOpen = (t) => t?.status !== "done" && t?.status !== "cancelled";
+  const out = [];
+  for (const t of Array.isArray(siblings) ? siblings : []) {
+    const kind = t?.spawnedBy?.kind;
+    if (!kind || !FIX_KINDS.has(kind)) continue;
+    if (t.spawnedBy.reverify === true || t.spawnedBy.rearmOf) continue;
+    const originKey = KIND_TO_ORIGIN_KEY[kind];
+    if (!originKey || t.spawnedBy[originKey] !== ticketId) continue;
+    if (!isOpen(t)) continue;
+    const id = t.ticketId || t.key;
+    if (id && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/**
+ * What a just-completed persona actually DECIDED — the ONE resolver behind both
+ * the cascade's verdict gate (cascade.mjs `verdictGate` dep) and the two
+ * `agent.complete` twins, so "what did this ticket decide" cannot answer two
+ * different things inside a single invocation.
+ *
+ * Inputs, in order of what they cost:
+ *   - the completion record, memoized above. harvestCompletionEvidence already
+ *     fetched it a few lines earlier on both done paths, so this is a cache hit,
+ *     not a second S3 GET.
+ *   - the sibling snapshot. The cascade HAS one and passes it; the twins do not, so
+ *     for a gate persona this reads the children once (a GSI query, or the same JQL
+ *     the cascade just ran) and memoizes the answer. Deliberately paid regardless
+ *     of VERDICT_GATE: the `agent.complete` detail must be identical whatever the
+ *     flag says (verdict-contract.mjs enrichCompleteDetail, replay criterion (e)),
+ *     and resolving spawnedTickets only when the gate is on would make it differ.
+ *     Non-gate personas return before any I/O at all.
+ *
+ * Never throws, and a record it cannot read yields a null verdict — which by
+ * contract holds nothing. That is the same outcome as a persona who stated nothing
+ * the ladder recognizes, and it is the only safe reading: the record is the sole
+ * input, so there is no second opinion to fall back to, and holding every successor
+ * over a transient S3 error would stall runs instead of gating them.
+ */
+let _verdictInfoCache = new Map();
+function resetVerdictInfoCache() {
+  _verdictInfoCache = new Map();
+}
+function resolveVerdictInfo({ ticketId, assignee, workflow, parentId, siblings } = {}) {
+  if (!ticketId) return Promise.resolve(NO_VERDICT_INFO);
+  if (_verdictInfoCache.has(ticketId)) return _verdictInfoCache.get(ticketId);
+  const p = computeVerdictInfo({ ticketId, assignee, workflow, parentId, siblings });
+  _verdictInfoCache.set(ticketId, p);
+  return p;
+}
+const NO_VERDICT_INFO = { isGatePersona: false, verdict: null, verdictSource: null, spawnedTickets: [], testedHead: "" };
+async function computeVerdictInfo({ ticketId, assignee, workflow, parentId, siblings }) {
+  try {
+    const agentId =
+      assignee ||
+      (Array.isArray(siblings) ? siblings.find((t) => (t?.ticketId || t?.key) === ticketId)?.assignee : null) ||
+      workflow?.agentTasks?.[ticketId]?.agentId ||
+      null;
+    if (!GATE_PERSONAS.has(agentId)) return NO_VERDICT_INFO;
+    const record = await readCompletionRecord(ticketId);
+    const { verdict, verdictSource } = resolveVerdict(record, agentId);
+    const children =
+      Array.isArray(siblings) ? siblings : await getChildTickets(parentId || workflow?.epicId).catch(() => []);
+    return {
+      isGatePersona: true,
+      verdict,
+      verdictSource,
+      // Structured fields only, record first: the S3 record carries tested_head /
+      // ci_head_sha, and agentTasks is the fallback because the harvested commitSha
+      // is what every gate persona has always reported.
+      testedHead: resolveTestedHead(record) || resolveTestedHead(workflow?.agentTasks?.[ticketId]) || "",
+      spawnedTickets: spawnedFixIdsFor(ticketId, children),
+    };
+  } catch (err) {
+    console.warn(`[verdict] could not resolve ${ticketId}'s verdict (non-fatal): ${err?.message || err}`);
+    return { ...NO_VERDICT_INFO, isGatePersona: true, verdictSource: "none" };
+  }
 }
 
 /**
@@ -1426,6 +1542,9 @@ export const handler = async (event) => {
   // a timer: a record written between two invocations must be visible to the
   // second one, otherwise re-Done'ing a ticket could not pick up late evidence.
   resetCompletionRecordCache();
+  // Same per-invocation reasoning, same reason (TEAM-4246 D1) — a verdict decided
+  // between two invocations must be re-read, not replayed from a warm container.
+  resetVerdictInfoCache();
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
@@ -1735,7 +1854,18 @@ export async function handleTicketDoneUnified(ticketId) {
     console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
   }
 
-  await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
+  // TEAM-4246 D1 — enrichCompleteDetail is the ONE place that decides what a
+  // gate persona's completion carries. Both agent.complete twins call it with
+  // the same argument shape so the detail cannot differ depending on which path
+  // a ticket happened to close on (replay criterion (e)).
+  await publishEvent(
+    ticketId,
+    "agent.complete",
+    enrichCompleteDetail(
+      { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id },
+      await resolveVerdictInfo({ ticketId, assignee, workflow, parentId })
+    )
+  );
 
   // TEAM-4113 — observe the per-phase rework loop (no-op when off / non-fix).
   await observeReworkLoop(workflow, ticket);
@@ -3767,8 +3897,16 @@ export async function handleTicketDone(ticketId, image) {
     console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
   }
 
-  // Publish event for UI
-  await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
+  // Publish event for UI. TEAM-4246 D1 — enrichCompleteDetail, same call shape
+  // as the webhook twin (handleTicketDoneUnified); see the comment there.
+  await publishEvent(
+    ticketId,
+    "agent.complete",
+    enrichCompleteDetail(
+      { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id },
+      await resolveVerdictInfo({ ticketId, assignee, workflow, parentId })
+    )
+  );
 
   // TEAM-4113 / TEAM-4121 FR-9 — observe the per-phase rework loop, then live
   // re-verification. The stream image is raw DDB, so fetch the normalized ticket

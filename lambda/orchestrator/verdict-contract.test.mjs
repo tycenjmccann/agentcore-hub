@@ -449,3 +449,41 @@ describe("verdict-contract — spawnedTickets sanitisation", () => {
     expect(once).toEqual(["TEAM-4183", "TEAM-4184"]);
   });
 });
+
+describe("verdict-contract — the agent.complete twins stay identical (TEAM-4246 D1)", () => {
+  // index.mjs has two "ticket done" paths (handleTicketDoneUnified for the Jira
+  // webhook, handleTicketDone for the DDB stream) that must publish the SAME
+  // agent.complete detail for the same input, or a run's UI/cost-report reading
+  // could see a different shape depending on which path happened to close a
+  // ticket. Both literal base objects below are copied verbatim from the two
+  // publishEvent call sites in index.mjs — if either site's literal drifts, this
+  // test's copy goes stale FIRST, which is why the source-grep test below it pins
+  // that both sites still route through enrichCompleteDetail at all.
+  const webhookTwinBase = { ticketId: "TEAM-4181", assignee: "agentcore_hub_qa_verifier", agentId: "agentcore_hub_qa_verifier", unblocked: ["TEAM-4182"], workflowId: "wf_1788731227559_dowtdh" };
+  const streamTwinBase = { ticketId: "TEAM-4181", assignee: "agentcore_hub_qa_verifier", agentId: "agentcore_hub_qa_verifier", unblocked: ["TEAM-4182"], workflowId: "wf_1788731227559_dowtdh" };
+
+  it("produce byte-identical agent.complete details for the same input", () => {
+    const info = { isGatePersona: true, verdict: "FAIL", verdictSource: "declared", spawnedTickets: ["TEAM-4183"], testedHead: "933ea6f1234" };
+    expect(enrichCompleteDetail(webhookTwinBase, info)).toEqual(enrichCompleteDetail(streamTwinBase, info));
+  });
+
+  it("both agent.complete publish sites in index.mjs route through enrichCompleteDetail", () => {
+    // Whitespace-tolerant on purpose: this must still catch drift after a
+    // reformat, not just before one. Each "agent.complete" occurrence is a
+    // publishEvent call site (there are exactly two — the webhook twin
+    // handleTicketDoneUnified and the DDB-stream twin handleTicketDone); the
+    // 200 chars following it must reach an enrichCompleteDetail( call before
+    // the statement closes, and that call must resolve through
+    // resolveVerdictInfo — not a bespoke inline lookup.
+    const src = readFileSync(fileURLToPath(new URL("./index.mjs", import.meta.url)), "utf8");
+    const marker = '"agent.complete"';
+    const sites = [];
+    for (let i = src.indexOf(marker); i !== -1; i = src.indexOf(marker, i + 1)) sites.push(i);
+    expect(sites.length).toBe(2);
+    for (const at of sites) {
+      const window = src.slice(at, at + 200);
+      expect(window).toContain("enrichCompleteDetail(");
+      expect(window).toContain("resolveVerdictInfo(");
+    }
+  });
+});
