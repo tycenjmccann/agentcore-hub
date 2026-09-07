@@ -363,6 +363,14 @@ export default defineConfig({
       // from a structured field — dowtdh TEAM-4180's prose holds five SHAs and
       // the first one is not the head it reviewed.
       "lambda/orchestrator/verdict-contract.test.mjs",
+      // fix-before-verify (TEAM-4246 D1, FR-D1.7) — the creation-time half of the
+      // verdict hole: dowtdh filed fix TEAM-4183 with `blockedBy: []` and invoked QA
+      // TEAM-4181 78 seconds later, against code the fix had not landed on. Pins the
+      // pure target selection (including the CYCLE guard — two fix tickets in one
+      // stream batch must not block each other) and then the real handler on a real
+      // INSERT record: enforce writes one preserving edge per open verifier, shadow
+      // publishes only, off never reads the board, and no failure rejects the record.
+      "lambda/orchestrator/fix-before-verify.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

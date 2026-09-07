@@ -49,7 +49,10 @@ import { createMergeOnGreen } from "./merge-on-green.mjs";
 import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stability.mjs";
 import { shouldGateShipDispatch, normalizeShipDispatchMode, emitShipDispatchMetrics } from "./ship-dispatch-gate.mjs";
 import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.mjs";
-import { createLiveReverify, normalizeLiveReverifyMode } from "./live-reverify.mjs";
+// LIVE_SHIP_STATUSES: the statuses a blocker edge must never yank a ticket out of.
+// Imported (as cascade.mjs does) rather than re-listed, so "what is mid-flight" has
+// one definition across the live re-verify, the verdict hold and FR-D1.7.
+import { createLiveReverify, normalizeLiveReverifyMode, LIVE_SHIP_STATUSES } from "./live-reverify.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
@@ -66,7 +69,7 @@ import { applyBlockerEdge, normalizePreserveStatuses } from "./ticket-blockers.m
 // a dynamic import would leave the new deploy.sh zip entry unenforced. The
 // module is pure (no clock, no AWS, no env beyond one normalizer), so importing it
 // with all three flags off costs a parse and nothing else.
-import { normalizeVerdictMode, GATE_PERSONAS, resolveVerdict, resolveTestedHead, enrichCompleteDetail } from "./verdict-contract.mjs";
+import { normalizeVerdictMode, GATE_PERSONAS, resolveVerdict, resolveTestedHead, enrichCompleteDetail, selectFixBeforeVerifyTargets } from "./verdict-contract.mjs";
 // TEAM-4121 FR-8: the fix-ticket contract lives in a zero-import module that is
 // byte-identical across the orchestrator + both ticket Lambdas (CI cmp's them).
 // The orchestrator only READS contracts — it maps a Jira issue's labels and
@@ -1076,6 +1079,58 @@ async function observeLiveReverify(workflow, ticket) {
     });
   } catch (err) {
     console.warn(`[orchestrator] live-reverify observe failed (non-fatal): ${err?.message || err}`);
+  }
+}
+
+/**
+ * Fix before verify (TEAM-4246 D1, FR-D1.7) — the CREATION-time half of the
+ * verdict hole the cascade gate closes at completion time.
+ *
+ * dowtdh: TEAM-4183 (`Fix (review): ActivityFeed clear/undo — 3 findings`) was
+ * created at 23:18:03 with `blockedBy: []`, and QA TEAM-4181 was dispatched 78
+ * seconds later — against code the fix had not landed on. Waiting for the next
+ * cascade cannot fix that: by then the verifier has already run. So the edge is
+ * written when the fix ticket appears.
+ *
+ * Cheap and dark by default: returns before any I/O for a non-fix ticket or when
+ * FIX_BEFORE_VERIFY=off, publishes-and-writes-nothing under shadow, and the whole
+ * body sits in a non-throwing boundary — a stream record must never be retried
+ * (or a ticket never routed) because an advisory blocker edge could not be
+ * written. Idempotent on twin/redelivered INSERTs: a target already carrying
+ * `fixId` in blockedBy is not a target, so the second delivery selects nothing
+ * and publishes nothing.
+ */
+async function observeFixBeforeVerify(fixId, { workflowId, parentId, spawnedBy } = {}) {
+  if (FIX_BEFORE_VERIFY === "off" || !fixId || !parentId) return [];
+  if (!spawnedBy?.kind || !FIX_KINDS.has(spawnedBy.kind)) return [];
+  try {
+    const siblings = (await getChildTickets(parentId)) || [];
+    const targets = selectFixBeforeVerifyTargets({
+      fixId,
+      siblings,
+      isFixKind: (kind) => FIX_KINDS.has(kind),
+      isAdvisory: isAdvisoryTicket,
+      // Board field first, roster second: a ticket the tickets Lambda stamped with
+      // an explicit phase means it, and the roster is the fallback for one that
+      // did not (and the reason ci_agent is ALSO matched by explicit id).
+      phaseOf: (t) => t?.phase || getAgentDef(t?.assignee)?.phase || null,
+    });
+    // Nothing to hold: publish nothing. An event per fix ticket saying "no open
+    // verifiers" would bury the ones that matter.
+    if (targets.length === 0) return [];
+
+    if (FIX_BEFORE_VERIFY === "enforce") {
+      for (const target of targets) {
+        await addBlockers(target, [fixId], { preserveStatusIf: LIVE_SHIP_STATUSES });
+      }
+      await publishEvent(fixId, "orchestrator.fix_before_verify_observed", { workflowId: workflowId || null, fixId, blocked: targets });
+    } else {
+      await publishEvent(fixId, "orchestrator.fix_before_verify_observed", { workflowId: workflowId || null, fixId, wouldBlock: targets });
+    }
+    return targets;
+  } catch (err) {
+    console.warn(`[orchestrator] fix-before-verify observe failed (non-fatal): ${err?.message || err}`);
+    return [];
   }
 }
 
@@ -3710,6 +3765,14 @@ async function processRecord(record) {
       workflowId: insertWorkflowId,
       spawnedBy: unwrapDdbValue(newImage.spawnedBy),
       fixContract: unwrapDdbValue(newImage.fixContract),
+    });
+    // TEAM-4246 D1 FR-D1.7 — a new fix ticket blocks the run's open verifiers
+    // (dowtdh dispatched QA 78s after a fix was filed). Same creation-time hook,
+    // same stream image, no extra ticket read; inert when FIX_BEFORE_VERIFY=off.
+    await observeFixBeforeVerify(ticketId, {
+      workflowId: insertWorkflowId,
+      parentId: insertParentId,
+      spawnedBy: unwrapDdbValue(newImage.spawnedBy),
     });
   }
 

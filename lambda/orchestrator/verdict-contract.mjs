@@ -261,6 +261,68 @@ export function evaluateGate({ assignee, verdict, spawnedTickets, mode } = {}) {
 }
 
 /**
+ * The personas a fresh fix ticket must land BEFORE (FR-D1.7).
+ *
+ * An EXPLICIT id set, for exactly the reason GATE_PERSONAS is one: agents.json puts
+ * ci_agent in the `review` phase, so "the verification-phase tickets" silently omits
+ * the CI agent. code_reviewer is deliberately ABSENT — a review fix is filed BY the
+ * reviewer, and blocking the reviewer's own open ticket on its own fix would park the
+ * persona that has to re-verify it. release_manager is absent for the same reason
+ * ship-phase ordering is already the live re-verify's job (live-reverify.mjs).
+ */
+export const FIX_BEFORE_VERIFY_PERSONAS = new Set([
+  "agentcore_hub_qa_verifier",
+  "agentcore_hub_ci_agent",
+]);
+
+/**
+ * Which of a run's tickets must wait for a just-created fix ticket (FR-D1.7).
+ *
+ * dowtdh is the case, verbatim: TEAM-4183 `Fix (review): ActivityFeed clear/undo — 3
+ * findings` was created with `blockedBy: []` at 23:18:03, and QA TEAM-4181 was
+ * dispatched 78 seconds later against code the fix had not touched yet. The fix
+ * existing is not the fix landing, so every open verifier downstream of it has to
+ * gain a real blocker edge at creation time — not at the next cascade, which is
+ * already too late.
+ *
+ * Pure, and every impure predicate is injected, so this is unit-testable with plain
+ * objects and stays zero-import like the rest of this module:
+ *   isFixKind(kind)  → is this ticket ITSELF a fix ticket (FIX_KINDS, completion.mjs)
+ *   isAdvisory(t)    → isAdvisoryTicket (completion.mjs) — backlog the run never waits on
+ *   phaseOf(t)       → the ticket's phase, board field first then the roster
+ *
+ * FIVE exclusions, each one a way this could wedge a run instead of gating it:
+ *   1. the fix itself — a ticket may not block itself.
+ *   2. closed tickets (done/cancelled) — nothing waits on a finished verifier, and an
+ *      edge onto one is a permanent lie in the dependency graph.
+ *   3. advisory tickets — by definition the run does not wait on them.
+ *   4. OTHER FIX TICKETS. Two fix tickets arriving in one stream batch would each
+ *      block the other and neither could ever start. This is the cycle guard, and it
+ *      is why the check is on the target's own spawnedBy rather than on its phase.
+ *   5. targets already carrying this fix in blockedBy — makes twin stream delivery a
+ *      no-op instead of a duplicate write.
+ */
+export function selectFixBeforeVerifyTargets({ fixId, siblings, isFixKind, isAdvisory, phaseOf } = {}) {
+  if (typeof fixId !== "string" || !fixId || !Array.isArray(siblings)) return [];
+  const isFix = typeof isFixKind === "function" ? isFixKind : () => false;
+  const advisory = typeof isAdvisory === "function" ? isAdvisory : () => false;
+  const phase = typeof phaseOf === "function" ? phaseOf : (t) => t?.phase;
+  const out = [];
+  for (const t of siblings) {
+    const id = t?.ticketId || t?.key;
+    if (!id || id === fixId || out.includes(id)) continue;
+    if (!FIX_BEFORE_VERIFY_PERSONAS.has(t?.assignee) && phase(t) !== "verification") continue;
+    const status = String(t?.status || "").trim().toLowerCase();
+    if (status === "done" || status === "cancelled") continue;
+    if (advisory(t)) continue;
+    if (isFix(t?.spawnedBy?.kind)) continue;
+    if ((Array.isArray(t?.blockedBy) ? t.blockedBy : []).includes(fixId)) continue;
+    out.push(id);
+  }
+  return out;
+}
+
+/**
  * The verdict fields on an `agent.complete` event detail.
  *
  * All four keys are ALWAYS present, with explicit off-defaults, rather than
