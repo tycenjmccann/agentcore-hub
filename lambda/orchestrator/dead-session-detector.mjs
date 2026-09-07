@@ -50,6 +50,10 @@ import { QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 // capped window ROTATES across sweeps (TEAM-3764 F5) so >SWEEP_CAP open
 // workflows can never permanently starve the older tail.
 import { SWEEP_CAP, createOpenWorkflowScan } from "./sweep-scan.mjs";
+// TEAM-4166 §0 — the ONE union-blocker predicate the cascade / reconcile-sweep
+// use, so the detector's clean-park anti-thrash decides identically (blockedBy ∪
+// preconditionUnmet.awaitingIds, all terminal in the sibling snapshot). Pure.
+import { unionBlockersResolved } from "./cascade.mjs";
 
 // Sweep bounds and threshold knobs. The silence threshold is derived per-agent
 // from its own recent run durations; these frame that derivation.
@@ -96,9 +100,30 @@ export function createDetector(deps) {
     // (DEAD_SESSION_ESCALATION_MODE=off, the default) the exhausted-retry path
     // appends the bare manager_escalation notification exactly as before.
     escalate,
+    // TEAM-4166 D2 §2.3 — the evidence-gated escalation guard. All optional, so
+    // unwired = byte-identical to pre-4166: the retry-exhausted branch escalates
+    // exactly as before. The guard engages only when the store exposes the new
+    // incrementCleanExitRedispatch CAS (the counter that bounds clean re-wakes
+    // WITHOUT burning deadSessionRetries). `awaitedIds` supplies the once-only
+    // wait-SLA timeout at the cap; `getLastStreamAt` feeds the escalation
+    // evidence payload (null when absent).
+    awaitedIds,
+    cleanExitRedispatchCap = 3,
+    getLastStreamAt,
+    // TEAM-4166 §0 — OPTIONAL sibling reader (the same getChildTickets the
+    // cascade / reconcile-sweep use). When wired, the clean-park guard checks the
+    // union blockers before re-dispatching a parked ticket, so it never thrashes
+    // a release manager that is legitimately still waiting on open fixes. When
+    // absent the guard keeps its pre-4166 capped-redispatch behavior (the detector
+    // has no sibling snapshot of its own, so it cannot see the awaited edges).
+    getChildTickets,
     now = () => Date.now(),
     log = (msg) => console.log(`[orchestrator] ${msg}`),
   } = deps;
+
+  const cleanExitCap = Number.isInteger(cleanExitRedispatchCap) && cleanExitRedispatchCap > 0
+    ? cleanExitRedispatchCap
+    : 3;
 
   // agentId → { medianMs, sampleCount, computedAt }. Refreshed once per sweep
   // interval; a busy fleet reuses one median across the whole sweep.
@@ -221,6 +246,33 @@ export function createDetector(deps) {
   }
 
   /**
+   * TEAM-4166 D2 §2.3 — the evidence block attached to an agent.escalated event
+   * so an operator can see WHY the orchestrator concluded a session was dead
+   * rather than cleanly parked. lastSpanAt/lastStreamAt come from the injected
+   * getLastStreamAt dep (null when unwired); lastSpanStatus is "ok" only when the
+   * task genuinely completed (never true on this dead escalate path); exitReason
+   * is null on the dead path.
+   */
+  async function buildEscalationEvidence(workflow, ticket, { completedOk = false, exitReason = null } = {}) {
+    const ticketId = ticket?.ticketId;
+    let lastStreamAt = null;
+    try {
+      lastStreamAt = getLastStreamAt ? await getLastStreamAt(workflow?.id, ticketId) : null;
+    } catch {
+      lastStreamAt = null;
+    }
+    const task = workflow?.agentTasks?.[ticketId];
+    return {
+      lastSpanAt: lastStreamAt,
+      lastSpanStatus: completedOk ? "ok" : null,
+      lastStreamAt,
+      completedAt: task?.completedAt || null,
+      preconditionAt: ticket?.preconditionUnmet?.reportedAt || null,
+      exitReason: exitReason ?? null,
+    };
+  }
+
+  /**
    * Steps 4/5 of the enforce path: retry ONCE, else escalate. The pre-read
    * retry-counter snapshot decides; markDeadSessionDetected admits one
    * decision per claim generation. Deliberately idempotent so the stolen-task
@@ -243,10 +295,77 @@ export function createDetector(deps) {
         log(`detector.retry_claim_lost — ${ticketId} lost the re-dispatch claim CAS (sweep ${sweepId})`);
       }
     } else {
-      // Second death for this ticket — escalate, don't loop.
+      // TEAM-4166 D2 §2.3 — EVIDENCE GUARD. The retry budget is spent, so the
+      // pre-4166 code escalated unconditionally here. But a session that
+      // genuinely completed (agent.complete since the claim start), or a release
+      // manager that parked itself clean (preconditionUnmet stamped), is NOT a
+      // dead session — escalating it appends a manager_escalation that trips
+      // parkedOnHuman and freezes the run (the f50ucz false positive). Re-wake it
+      // instead, capped by cleanExitRedispatches (NOT deadSessionRetries, which
+      // is never touched on this clean path); escalation is reserved for the
+      // genuinely dead. Engages only when the store exposes the clean-exit CAS —
+      // an old store keeps the pre-4166 unconditional escalate.
+      const canGuard = typeof store.incrementCleanExitRedispatch === "function";
+      const claimStartedAt = workflow.agentTasks?.[ticketId]?.startedAt || detectorMeta?.claimStartedAt || null;
+      const completedOk = canGuard && await hasCompletionSince(workflow.id, ticketId, claimStartedAt);
+      const parkedClean = canGuard && !!ticket?.preconditionUnmet?.awaitingIds?.length;
+      if (canGuard && (completedOk || parkedClean)) {
+        // TEAM-4166 §0 ANTI-THRASH. A cleanly-parked ticket is still legitimately
+        // waiting until its awaited fixes close. The cascade guards this with the
+        // sibling snapshot it already holds; the detector has none, so — only when
+        // a sibling reader is wired — fetch the closure and evaluate the SAME
+        // union predicate (blockedBy ∪ preconditionUnmet.awaitingIds). If any
+        // awaited id is still non-terminal, touch nothing (no redispatch, no
+        // budget, no clean-exit counter): the ordinary cascade re-drives it when
+        // the last blocker closes. Reader absent → fall through to the capped
+        // re-wake below (today's behavior — the detector can't see the edges).
+        if (parkedClean && getChildTickets && workflow?.epicId) {
+          let siblings = null;
+          try {
+            siblings = await getChildTickets(workflow.epicId);
+          } catch (err) {
+            siblings = null;
+            log(`detector.awaited_siblings_error — ${ticketId}: ${err?.message || err} (sweep ${sweepId})`);
+          }
+          if (Array.isArray(siblings) && !unionBlockersResolved(ticket, siblings)) {
+            m.awaiting = (m.awaiting || 0) + 1;
+            log(`detector.awaiting — ${ticketId} clean park, awaited blockers still open (sweep ${sweepId})`);
+            return;
+          }
+        }
+        const cleanRedispatches = workflow?.cleanExitRedispatches?.[ticketId] || 0;
+        if (cleanRedispatches >= cleanExitCap) {
+          // Re-woken to the cap without landing — advisory wait-SLA timeout ONLY,
+          // never a manager_escalation (that is the parkedOnHuman trap this fix
+          // removes). An event, not a humanNotification.
+          if (awaitedIds?.emitAwaitTimeoutOnce) {
+            const to = awaitedIds.checkAwaitTimeout?.(ticket, [], now());
+            await awaitedIds.emitAwaitTimeoutOnce(
+              workflow, ticketId,
+              to?.awaitingIds || ticket.preconditionUnmet?.awaitingIds || [],
+              to?.waitedMs ?? 0, "dead-session-detector");
+          }
+          m.awaiting = (m.awaiting || 0) + 1;
+          log(`detector.awaiting — ${ticketId} clean park/exit at clean-exit cap ${cleanExitCap} (sweep ${sweepId})`);
+          return;
+        }
+        // A clean re-wake: count it on cleanExitRedispatches, re-dispatch through
+        // the normal claim CAS, and leave deadSessionRetries untouched.
+        await store.incrementCleanExitRedispatch(workflow.id, ticketId);
+        const redispatched = await redispatch(workflow, ticket);
+        m.exitedOk = (m.exitedOk || 0) + 1;
+        log(redispatched
+          ? `detector.exited_ok — ${ticketId} clean park/exit re-woken (not dead) (sweep ${sweepId})`
+          : `detector.exited_ok_claim_lost — ${ticketId} clean re-wake lost the claim CAS (sweep ${sweepId})`);
+        return;
+      }
+
+      // Genuinely dead — escalate, don't loop. Now carries the §2.3 evidence.
+      const evidence = await buildEscalationEvidence(workflow, ticket);
       await publishEvent(ticketId, "agent.escalated", {
         workflowId: workflow.id, ticketId, agentId,
         reason: "dead_session_retry_exhausted", detectorMeta,
+        evidence,
       });
       await store.setTaskStatus(workflow.id, ticketId, "error");
       await blockTicket(ticketId, "dead_session_retry_exhausted");
@@ -315,6 +434,10 @@ export function createDetector(deps) {
       escalations: 0,
       candidateErrors: 0,
       truncated: false,
+      // TEAM-4166 D2 §2.3 — evidence-gated outcomes: a clean re-wake (exitedOk)
+      // or a held clean park at the cap (awaiting), NEITHER an escalation.
+      exitedOk: 0,
+      awaiting: 0,
     };
 
     if (mode === "off") {
@@ -544,7 +667,7 @@ export function createDetector(deps) {
 
     m.durationMs = now() - startedAtMs;
     emitMetrics(m);
-    log(`dead-session sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} fired=${m.fired} hungToolCalls=${m.hungToolCalls} retries=${m.retries} escalations=${m.escalations} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
+    log(`dead-session sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} fired=${m.fired} hungToolCalls=${m.hungToolCalls} retries=${m.retries} escalations=${m.escalations} exitedOk=${m.exitedOk} awaiting=${m.awaiting} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
     return m;
   }
 
@@ -574,6 +697,9 @@ export function emitMetrics(m) {
           { Name: "DetectorEscalations", Unit: "Count" },
           { Name: "DetectorCandidateErrors", Unit: "Count" },
           { Name: "DetectorSweepTruncated", Unit: "Count" },
+          // TEAM-4166 D2 §2.3 — evidence-gated re-wake outcomes.
+          { Name: "DetectorExitedOk", Unit: "Count" },
+          { Name: "DetectorAwaiting", Unit: "Count" },
         ],
       }],
     },
@@ -587,5 +713,7 @@ export function emitMetrics(m) {
     DetectorEscalations: m.escalations,
     DetectorCandidateErrors: m.candidateErrors || 0,
     DetectorSweepTruncated: m.truncated ? 1 : 0,
+    DetectorExitedOk: m.exitedOk || 0,
+    DetectorAwaiting: m.awaiting || 0,
   }));
 }

@@ -1,0 +1,1178 @@
+{
+ "_provenance": {
+  "sourceS3Key": "workflows/wf_1788672380233_ymo7dm/analysis/<analysisId>/dossier.json",
+  "reducedBy": "TEAM-4166 backend-dev (requirements \u00a75 reduction rules)",
+  "note": "Analyzer liveness slice 06:18Z-06:39Z (TEAM-4153 QA verifier). Source dossier has NO agent.streaming rows; manager.intervention 06:31Z documents '40 OTEL spans' on the live QA session -> synthesize 20s heartbeats from streamHeartbeats. Doubled events (with/without source) RETAINED as in the source."
+ },
+ "workflowId": "wf_1788672380233_ymo7dm",
+ "workflowDefId": "sdlc-playbook",
+ "epicId": "TEAM-4138",
+ "ticketProvider": "jira",
+ "workflow": {
+  "id": "wf_1788672380233_ymo7dm",
+  "workflowId": "wf_1788672380233_ymo7dm",
+  "phase": "complete",
+  "startedAt": "2026-09-06T05:26:21.514Z",
+  "completedAt": "2026-09-06T06:43:01.694Z",
+  "workflowDefId": "sdlc-playbook",
+  "epicId": "TEAM-4138",
+  "featureBranch": "feature/TEAM-4138-persist-the-email-notifications-setting",
+  "delivery": {
+   "prUrl": "https://github.com/tycenjmccann/demo-app/pull/44",
+   "at": "2026-09-06T06:43:01.694Z",
+   "mode": "handoff"
+  },
+  "ticketProvider": "jira",
+  "deadSessionRetries": null,
+  "humanNotifications": [
+   {
+    "id": "notif_TEAM-4139_2026-09-06T05:26:25.390Z",
+    "type": "review_needed",
+    "ticketId": "TEAM-4139",
+    "timestamp": "2026-09-06T05:26:25.390Z",
+    "acknowledged": true,
+    "reviewer": "product-owner",
+    "gate": "intake",
+    "title": "Review needed: TEAM-4139"
+   },
+   {
+    "id": "notif_TEAM-4148_2026-09-06T05:45:51.044Z",
+    "type": "review_needed",
+    "ticketId": "TEAM-4148",
+    "timestamp": "2026-09-06T05:45:51.044Z",
+    "acknowledged": true,
+    "reviewer": "product-owner",
+    "gate": "requirements",
+    "title": "Review needed: TEAM-4148"
+   },
+   {
+    "id": "notif_TEAM-4150_2026-09-06T05:55:13.312Z",
+    "type": "review_needed",
+    "ticketId": "TEAM-4150",
+    "timestamp": "2026-09-06T05:55:13.312Z",
+    "acknowledged": true,
+    "reviewer": "engineer",
+    "gate": "plan",
+    "title": "Review needed: TEAM-4150"
+   }
+  ],
+  "agentTasks": {
+   "TEAM-4139": {
+    "ticketId": "TEAM-4139",
+    "createdAt": "2026-09-06T05:29:29.000Z",
+    "completedAt": "2026-09-06T05:29:29.000Z",
+    "id": "task_1788672569000_human:product-owner",
+    "agentId": "human:product-owner",
+    "status": "complete"
+   },
+   "TEAM-4148": {
+    "id": "task_1788673649754_human:product-owner",
+    "createdAt": "2026-09-06T05:47:29.754Z",
+    "completedAt": "2026-09-06T05:47:29.754Z",
+    "ticketId": "TEAM-4148",
+    "status": "complete",
+    "agentId": "human:product-owner"
+   },
+   "TEAM-4150": {
+    "ticketId": "TEAM-4150",
+    "createdAt": "2026-09-06T05:56:28.786Z",
+    "id": "task_1788674188786_human:engineer",
+    "status": "complete",
+    "agentId": "human:engineer",
+    "completedAt": "2026-09-06T05:56:28.786Z"
+   },
+   "TEAM-4152": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "branch": "feature/TEAM-4138-persist-the-email-notifications-setting",
+    "commitSha": "8d1b4fcd1c3d815b60ee845bcaee9951682af37c",
+    "completedAt": "2026-09-06T06:18:47.218Z",
+    "createdAt": "2026-09-06T05:44:50.465Z",
+    "id": "task_1788673490465_agentcore_hub_code_reviewer",
+    "prUrl": "https://github.com/tycenjmccann/demo-app/pull/43",
+    "startedAt": "2026-09-06T06:09:07.368Z",
+    "status": "complete",
+    "ticketId": "TEAM-4152"
+   },
+   "TEAM-4153": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "branch": "feature/TEAM-4138-persist-the-email-notifications-setting",
+    "commitSha": "2b47d14e1e570de0a2d3fc34177ba5ddc11a0f98",
+    "completedAt": "2026-09-06T06:38:50.436Z",
+    "createdAt": "2026-09-06T05:45:12.833Z",
+    "id": "task_1788673512833_agentcore_hub_qa_verifier",
+    "prUrl": "https://github.com/tycenjmccann/demo-app/pull/43",
+    "startedAt": "2026-09-06T06:18:48.470Z",
+    "status": "complete",
+    "ticketId": "TEAM-4153"
+   },
+   "TEAM-4154": {
+    "agentId": "agentcore_hub_ci_agent",
+    "branch": "feature/TEAM-4138-persist-the-email-notifications-setting",
+    "commitSha": "2b47d14e1e570de0a2d3fc34177ba5ddc11a0f98",
+    "completedAt": "2026-09-06T06:42:58.955Z",
+    "createdAt": "2026-09-06T05:45:25.814Z",
+    "id": "task_1788673525814_agentcore_hub_ci_agent",
+    "startedAt": "2026-09-06T06:38:51.697Z",
+    "status": "complete",
+    "ticketId": "TEAM-4154"
+   }
+  },
+  "wmLastWatchAt": "2026-09-06T06:29:44.932Z"
+ },
+ "tickets": [
+  {
+   "ticketId": "TEAM-4139",
+   "status": "done",
+   "assignee": "human:product-owner",
+   "blockedBy": [],
+   "updatedAt": "2026-09-05T22:29:27.953-0700",
+   "title": "Intent Acceptance: Persist the Email notifications setting across reloads",
+   "type": "task",
+   "parentId": "TEAM-4138",
+   "createdAt": "2026-09-05T22:26:21.944-0700"
+  },
+  {
+   "ticketId": "TEAM-4148",
+   "status": "done",
+   "assignee": "human:product-owner",
+   "blockedBy": [
+    "TEAM-4140"
+   ],
+   "updatedAt": "2026-09-05T22:47:28.682-0700",
+   "title": "Spec Approval: Persist the Email notifications setting across reloads",
+   "type": "task",
+   "parentId": "TEAM-4138",
+   "createdAt": "2026-09-05T22:43:10.807-0700"
+  },
+  {
+   "ticketId": "TEAM-4150",
+   "status": "done",
+   "assignee": "human:engineer",
+   "blockedBy": [
+    "TEAM-4149"
+   ],
+   "updatedAt": "2026-09-05T22:56:27.766-0700",
+   "title": "Plan Approval: Persist the Email notifications setting across reloads",
+   "type": "task",
+   "parentId": "TEAM-4138",
+   "createdAt": "2026-09-05T22:44:01.839-0700"
+  },
+  {
+   "ticketId": "TEAM-4152",
+   "status": "done",
+   "assignee": "agentcore_hub_code_reviewer",
+   "blockedBy": [
+    "TEAM-4151"
+   ],
+   "updatedAt": "2026-09-05T23:18:45.718-0700",
+   "title": "Review: Persist the Email notifications setting across reloads",
+   "type": "task",
+   "parentId": "TEAM-4138",
+   "createdAt": "2026-09-05T22:44:49.145-0700"
+  },
+  {
+   "ticketId": "TEAM-4153",
+   "status": "done",
+   "assignee": "agentcore_hub_qa_verifier",
+   "blockedBy": [
+    "TEAM-4152"
+   ],
+   "updatedAt": "2026-09-05T23:38:49.269-0700",
+   "title": "QA: Verify Persist the Email notifications setting across reloads",
+   "type": "task",
+   "parentId": "TEAM-4138",
+   "createdAt": "2026-09-05T22:45:09.232-0700"
+  },
+  {
+   "ticketId": "TEAM-4154",
+   "status": "done",
+   "assignee": "agentcore_hub_ci_agent",
+   "blockedBy": [
+    "TEAM-4153"
+   ],
+   "updatedAt": "2026-09-05T23:42:57.982-0700",
+   "title": "CI: Validate build and tests for Persist the Email notifications setting across reloads",
+   "type": "task",
+   "parentId": "TEAM-4138",
+   "createdAt": "2026-09-05T22:45:24.236-0700"
+  },
+  {
+   "ticketId": "TEAM-4138",
+   "status": "done",
+   "blockedBy": [],
+   "updatedAt": "2026-09-05T23:43:03.534-0700",
+   "title": "Persist the Email notifications setting across reloads",
+   "type": "epic",
+   "createdAt": "2026-09-05T22:26:20.618-0700"
+  }
+ ],
+ "events": [
+  {
+   "eventId": "0mtpdcuji-0000",
+   "type": "review.needed",
+   "timestamp": "2026-09-06T05:26:25.816Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4139",
+    "reviewer": "product-owner",
+    "timestamp": "2026-09-06T05:26:25.816Z",
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "1788672385868-24hm",
+   "type": "review.needed",
+   "timestamp": "2026-09-06T05:26:25.816Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "reviewer": "product-owner",
+    "ticketId": "TEAM-4139",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T05:26:25.816Z"
+   }
+  },
+  {
+   "eventId": "0mtpdgwd4-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T05:29:34.940Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4139",
+    "unblocked": [
+     "TEAM-4140"
+    ],
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "agentId": "human:product-owner",
+    "assignee": "human:product-owner",
+    "timestamp": "2026-09-06T05:29:34.940Z"
+   }
+  },
+  {
+   "eventId": "1788672574960-hxka",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T05:29:34.940Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "assignee": "human:product-owner",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T05:29:34.940Z",
+    "ticketId": "TEAM-4139",
+    "unblocked": [
+     "TEAM-4140"
+    ],
+    "agentId": "human:product-owner"
+   }
+  },
+  {
+   "eventId": "1788672580319-skia",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T05:29:40Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T05:29:40Z",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "agentId": "agentcore_hub_requirements_analyst"
+   }
+  },
+  {
+   "eventId": "0mtpe0iic-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T05:44:50.658Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4152",
+    "timestamp": "2026-09-06T05:44:50.658Z"
+   }
+  },
+  {
+   "eventId": "1788673490721-2jcs",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T05:44:50.658Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4152",
+    "timestamp": "2026-09-06T05:44:50.658Z"
+   }
+  },
+  {
+   "eventId": "0mtpe100c-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T05:45:13.213Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T05:45:13.213Z",
+    "ticketId": "TEAM-4153"
+   }
+  },
+  {
+   "eventId": "1788673513413-pr9z",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T05:45:13.213Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T05:45:13.213Z",
+    "ticketId": "TEAM-4153"
+   }
+  },
+  {
+   "eventId": "0mtpe19v8-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T05:45:26.158Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4154",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T05:45:26.158Z"
+   }
+  },
+  {
+   "eventId": "1788673526218-sm5o",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T05:45:26.158Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T05:45:26.158Z",
+    "ticketId": "TEAM-4154"
+   }
+  },
+  {
+   "eventId": "0mtpe1tgi-0000",
+   "type": "review.needed",
+   "timestamp": "2026-09-06T05:45:51.489Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4148",
+    "reviewer": "product-owner",
+    "timestamp": "2026-09-06T05:45:51.489Z",
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "1788673551501-qx1l",
+   "type": "review.needed",
+   "timestamp": "2026-09-06T05:45:51.489Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4148",
+    "reviewer": "product-owner",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T05:45:51.489Z"
+   }
+  },
+  {
+   "eventId": "0mtpe1tdx-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T05:45:51.506Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "unblockedBy": "TEAM-4140",
+    "ticketId": "TEAM-4148",
+    "timestamp": "2026-09-06T05:45:51.506Z"
+   }
+  },
+  {
+   "eventId": "1788673551518-3dke",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T05:45:51.506Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "unblockedBy": "TEAM-4140",
+    "ticketId": "TEAM-4148",
+    "timestamp": "2026-09-06T05:45:51.506Z"
+   }
+  },
+  {
+   "eventId": "0mtpe3zms-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T05:47:32.713Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "agentId": "human:product-owner",
+    "timestamp": "2026-09-06T05:47:32.713Z",
+    "ticketId": "TEAM-4148",
+    "unblocked": [
+     "TEAM-4149"
+    ],
+    "assignee": "human:product-owner",
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "1788673652753-0syg",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T05:47:32.713Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T05:47:32.713Z",
+    "assignee": "human:product-owner",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4148",
+    "agentId": "human:product-owner",
+    "unblocked": [
+     "TEAM-4149"
+    ]
+   }
+  },
+  {
+   "eventId": "1788673656831-hqtb",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T05:47:36Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "agentId": "agentcore_hub_frontend_dev",
+    "timestamp": "2026-09-06T05:47:36Z"
+   }
+  },
+  {
+   "eventId": "0mtpedv7e-0000",
+   "type": "review.needed",
+   "timestamp": "2026-09-06T05:55:13.725Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "reviewer": "engineer",
+    "ticketId": "TEAM-4150",
+    "timestamp": "2026-09-06T05:55:13.725Z"
+   }
+  },
+  {
+   "eventId": "1788674113736-jllt",
+   "type": "review.needed",
+   "timestamp": "2026-09-06T05:55:13.725Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "reviewer": "engineer",
+    "timestamp": "2026-09-06T05:55:13.725Z",
+    "ticketId": "TEAM-4150"
+   }
+  },
+  {
+   "eventId": "0mtpedv89-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T05:55:13.751Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4150",
+    "unblockedBy": "TEAM-4149",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T05:55:13.751Z"
+   }
+  },
+  {
+   "eventId": "1788674113765-3g41",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T05:55:13.751Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "unblockedBy": "TEAM-4149",
+    "timestamp": "2026-09-06T05:55:13.751Z",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4150"
+   }
+  },
+  {
+   "eventId": "0mtpefj1u-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T05:56:31.265Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T05:56:31.265Z",
+    "ticketId": "TEAM-4150",
+    "agentId": "human:engineer",
+    "assignee": "human:engineer",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "unblocked": [
+     "TEAM-4151"
+    ]
+   }
+  },
+  {
+   "eventId": "1788674191285-yqun",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T05:56:31.265Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4150",
+    "timestamp": "2026-09-06T05:56:31.265Z",
+    "assignee": "human:engineer",
+    "unblocked": [
+     "TEAM-4151"
+    ],
+    "agentId": "human:engineer"
+   }
+  },
+  {
+   "eventId": "1788674194181-fork",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T05:56:34Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T05:56:34Z",
+    "agentId": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "eventId": "0mtpevrpv-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T06:09:08.314Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "assignee": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4152",
+    "timestamp": "2026-09-06T06:09:08.314Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "phase": "review"
+   }
+  },
+  {
+   "eventId": "1788674948366-icmz",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T06:09:08.314Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T06:09:08.314Z",
+    "assignee": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4152",
+    "agentId": "agentcore_hub_code_reviewer",
+    "phase": "review",
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "0mtpevrpc-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T06:09:08.431Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T06:09:08.431Z",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4152",
+    "agentId": "agentcore_hub_code_reviewer"
+   }
+  },
+  {
+   "eventId": "1788674948440-zs2h",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T06:09:08.431Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4152",
+    "timestamp": "2026-09-06T06:09:08.431Z"
+   }
+  },
+  {
+   "eventId": "0mtpevrrs-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T06:09:08.505Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4152",
+    "unblockedBy": "TEAM-4151",
+    "timestamp": "2026-09-06T06:09:08.505Z"
+   }
+  },
+  {
+   "eventId": "1788674948523-rdye",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T06:09:08.505Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4152",
+    "unblockedBy": "TEAM-4151",
+    "timestamp": "2026-09-06T06:09:08.505Z",
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "0mtpevsgv-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:09:09.415Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4152",
+   "detail": {
+    "ticketId": "TEAM-4152",
+    "timestamp": "2026-09-06T06:09:09.415Z",
+    "assignee": "agentcore_hub_code_reviewer",
+    "agentId": "agentcore_hub_code_reviewer"
+   }
+  },
+  {
+   "eventId": "1788674949428-1lpw",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:09:09.415Z",
+   "source": null,
+   "workflowId": "TEAM-4152",
+   "detail": {
+    "assignee": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4152",
+    "agentId": "agentcore_hub_code_reviewer",
+    "timestamp": "2026-09-06T06:09:09.415Z"
+   }
+  },
+  {
+   "eventId": "1788674951442-gyqt",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:09:11Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T06:09:11Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "1788675524877-4vr5",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T06:18:44.878Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4152",
+    "branch": "feature/TEAM-4138-persist-the-email-notifications-setting",
+    "pr_url": "https://github.com/tycenjmccann/demo-app/pull/43"
+   }
+  },
+  {
+   "eventId": "0mtpf87hn-0000",
+   "type": "workflow.phase_change",
+   "timestamp": "2026-09-06T06:18:49.249Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4153",
+    "phase": "verification",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T06:18:49.249Z"
+   }
+  },
+  {
+   "eventId": "1788675529258-9pc1",
+   "type": "workflow.phase_change",
+   "timestamp": "2026-09-06T06:18:49.249Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T06:18:49.249Z",
+    "ticketId": "TEAM-4153",
+    "phase": "verification",
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "0mtpf87x7-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T06:18:49.511Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T06:18:49.511Z",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4153",
+    "assignee": "agentcore_hub_qa_verifier",
+    "phase": "verification",
+    "agentId": "agentcore_hub_qa_verifier"
+   }
+  },
+  {
+   "eventId": "1788675529530-e4k8",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T06:18:49.511Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4153",
+    "phase": "verification",
+    "agentId": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-09-06T06:18:49.511Z",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "assignee": "agentcore_hub_qa_verifier"
+   }
+  },
+  {
+   "eventId": "0mtpf87u1-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T06:18:49.593Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4153",
+    "agentId": "agentcore_hub_qa_verifier",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T06:18:49.593Z"
+   }
+  },
+  {
+   "eventId": "1788675529604-72mg",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T06:18:49.593Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "agentId": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-09-06T06:18:49.593Z",
+    "ticketId": "TEAM-4153"
+   }
+  },
+  {
+   "eventId": "0mtpf87vv-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T06:18:49.707Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4153",
+    "unblockedBy": "TEAM-4152",
+    "timestamp": "2026-09-06T06:18:49.707Z"
+   }
+  },
+  {
+   "eventId": "1788675529730-00hk",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T06:18:49.707Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "unblockedBy": "TEAM-4152",
+    "ticketId": "TEAM-4153",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T06:18:49.707Z"
+   }
+  },
+  {
+   "eventId": "0mtpf88br-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T06:18:49.770Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "assignee": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4152",
+    "agentId": "agentcore_hub_code_reviewer",
+    "timestamp": "2026-09-06T06:18:49.770Z",
+    "unblocked": [
+     "TEAM-4153"
+    ]
+   }
+  },
+  {
+   "eventId": "1788675529810-agrr",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T06:18:49.770Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "assignee": "agentcore_hub_code_reviewer",
+    "unblocked": [
+     "TEAM-4153"
+    ],
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T06:18:49.770Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4152"
+   }
+  },
+  {
+   "eventId": "0mtpf88ij-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:18:50.619Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4153",
+   "detail": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "ticketId": "TEAM-4153",
+    "assignee": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-09-06T06:18:50.619Z"
+   }
+  },
+  {
+   "eventId": "1788675530629-3rup",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:18:50.619Z",
+   "source": null,
+   "workflowId": "TEAM-4153",
+   "detail": {
+    "assignee": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-09-06T06:18:50.619Z",
+    "ticketId": "TEAM-4153",
+    "agentId": "agentcore_hub_qa_verifier"
+   }
+  },
+  {
+   "eventId": "1788675534378-eqnp",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:18:54Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-09-06T06:18:54Z",
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "1788676274680-wm-rt8q",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T06:31:14.680767Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "action": "comment",
+    "ticketId": "TEAM-4153",
+    "by": "workflow-manager",
+    "note": "Watch-triage 06:31Z: watchdog fired on 11 min event silence. Liveness check \u2014 QA verifier session TEAM-4153_\u2026-1788675529549 is ALIVE: 40 OTEL spans, last span 06:29:28Z (InvokeAgentRuntime, no error), last stream 06:23:1"
+   }
+  },
+  {
+   "eventId": "1788676545997-err-540999",
+   "type": "agent.error",
+   "timestamp": "2026-09-06T06:35:45.540999Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "error": "remote claude turn failed: claude exited -9: ",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4153"
+   }
+  },
+  {
+   "eventId": "1788676726781-volp",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T06:38:46.781Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "branch": "feature/TEAM-4138-persist-the-email-notifications-setting",
+    "pr_url": "https://github.com/tycenjmccann/demo-app/pull/43",
+    "ticketId": "TEAM-4153",
+    "agentId": "agentcore_hub_qa_verifier"
+   }
+  },
+  {
+   "eventId": "0mtpfy0lr-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T06:38:52.682Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4154",
+    "agentId": "agentcore_hub_ci_agent",
+    "phase": "review",
+    "assignee": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T06:38:52.682Z"
+   }
+  },
+  {
+   "eventId": "1788676732722-ho1h",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T06:38:52.682Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "phase": "review",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "ticketId": "TEAM-4154",
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-06T06:38:52.682Z",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "eventId": "0mtpfy0l0-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T06:38:52.774Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T06:38:52.774Z",
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4154",
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "1788676732785-aj6i",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T06:38:52.774Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T06:38:52.774Z",
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4154"
+   }
+  },
+  {
+   "eventId": "0mtpfy0qf-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T06:38:52.875Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4154",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "unblockedBy": "TEAM-4153",
+    "timestamp": "2026-09-06T06:38:52.875Z"
+   }
+  },
+  {
+   "eventId": "1788676732886-dh6x",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T06:38:52.875Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "unblockedBy": "TEAM-4153",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T06:38:52.875Z",
+    "ticketId": "TEAM-4154"
+   }
+  },
+  {
+   "eventId": "0mtpfy0ra-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T06:38:52.916Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T06:38:52.916Z",
+    "ticketId": "TEAM-4153",
+    "assignee": "agentcore_hub_qa_verifier",
+    "unblocked": [
+     "TEAM-4154"
+    ],
+    "agentId": "agentcore_hub_qa_verifier",
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "1788676732927-6llk",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T06:38:52.916Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4153",
+    "unblocked": [
+     "TEAM-4154"
+    ],
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T06:38:52.916Z",
+    "assignee": "agentcore_hub_qa_verifier",
+    "agentId": "agentcore_hub_qa_verifier"
+   }
+  },
+  {
+   "eventId": "0mtpfy15r-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:38:53.675Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4154",
+   "detail": {
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-06T06:38:53.675Z",
+    "ticketId": "TEAM-4154",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "eventId": "1788676733686-63pm",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:38:53.675Z",
+   "source": null,
+   "workflowId": "TEAM-4154",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-06T06:38:53.675Z",
+    "ticketId": "TEAM-4154"
+   }
+  },
+  {
+   "eventId": "1788676735021-qzeo",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:38:55Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "timestamp": "2026-09-06T06:38:55Z",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "eventId": "1788676977458-wdi7",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T06:42:57.459Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4154",
+    "agentId": "agentcore_hub_ci_agent",
+    "pr_url": null,
+    "branch": "feature/TEAM-4138-persist-the-email-notifications-setting"
+   }
+  },
+  {
+   "eventId": "0mtpg3ajv-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T06:42:59.325Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "ticketId": "TEAM-4154",
+    "agentId": "agentcore_hub_ci_agent",
+    "unblocked": [],
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-06T06:42:59.325Z",
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "1788676979378-u1yw",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T06:42:59.325Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T06:42:59.325Z",
+    "agentId": "agentcore_hub_ci_agent",
+    "assignee": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4154",
+    "unblocked": [],
+    "workflowId": "wf_1788672380233_ymo7dm"
+   }
+  },
+  {
+   "eventId": "0mtpg3dsj-0000",
+   "type": "workflow.complete",
+   "timestamp": "2026-09-06T06:43:03.806Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "timestamp": "2026-09-06T06:43:03.806Z",
+    "delivery": "handoff",
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "featureBranch": "feature/TEAM-4138-persist-the-email-notifications-setting",
+    "prUrl": "https://github.com/tycenjmccann/demo-app/pull/44",
+    "ticketId": "TEAM-4138"
+   }
+  },
+  {
+   "eventId": "1788676983816-2pxh",
+   "type": "workflow.complete",
+   "timestamp": "2026-09-06T06:43:03.806Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "workflowId": "wf_1788672380233_ymo7dm",
+    "prUrl": "https://github.com/tycenjmccann/demo-app/pull/44",
+    "timestamp": "2026-09-06T06:43:03.806Z",
+    "delivery": "handoff",
+    "featureBranch": "feature/TEAM-4138-persist-the-email-notifications-setting",
+    "ticketId": "TEAM-4138"
+   }
+  },
+  {
+   "eventId": "evt_1788676989932_performance",
+   "type": "workflow.performance",
+   "timestamp": "2026-09-06T06:43:09.932Z",
+   "source": null,
+   "workflowId": "wf_1788672380233_ymo7dm",
+   "detail": {
+    "loops": 0,
+    "reworkRounds": 0,
+    "anomalies": [],
+    "activeMs": 4302,
+    "humanWaitMs": 4595878,
+    "errors": 1,
+    "reportKey": "workflows/wf_1788672380233_ymo7dm/shared/performance-card.json",
+    "tasks": 6,
+    "tokens": {
+     "input": 8320636,
+     "output": 405367,
+     "cached": 7445255,
+     "total": 16584465,
+     "cacheRead": 7445255,
+     "cacheWrite": 413207
+    },
+    "agentWorkMs": 4222446,
+    "totalCostUsd": 191.211,
+    "personaUsd": 185.5174,
+    "nudges": 0,
+    "codingUsd": 5.6935,
+    "ticketId": "TEAM-4138",
+    "timestamp": "2026-09-06T06:43:09.932Z",
+    "wallMs": 4600180,
+    "status": "insufficient"
+   }
+  }
+ ],
+ "completions": {
+  "TEAM-4152": {},
+  "TEAM-4153": {},
+  "TEAM-4154": {}
+ },
+ "streamHeartbeats": {
+  "TEAM-4153": {
+   "from": "2026-09-06T06:18:48.470Z",
+   "to": "2026-09-06T06:38:50.436Z",
+   "intervalSec": 20,
+   "agentId": "agentcore_hub_qa_verifier",
+   "evidence": "manager.intervention 06:31Z: QA verifier session ALIVE: 40 OTEL spans"
+  }
+ }
+}

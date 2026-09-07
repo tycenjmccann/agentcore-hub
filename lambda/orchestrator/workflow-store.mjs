@@ -391,6 +391,63 @@ export async function markDeadSessionDetected(workflowId, ticketId, expectedStar
 }
 
 /**
+ * TEAM-4166 D1 — claim the ONE `orchestrator.await_timeout` emit a ticket ever
+ * gets. Mirrors markDeadSessionDetected: a scoped conditional SET on the task's
+ * own map key, guarded `attribute_not_exists`, so racing sweeps / redeliveries
+ * that all observe the same breached await converge on exactly one emitter.
+ * Unlike the dead-session stamp this is NOT anchored to a claim generation — an
+ * await timeout is a property of the parked ticket, not of a running claim (the
+ * parked agent may have exited cleanly long ago), so the sole guard is "not
+ * already emitted". Returns true when this caller won the stamp; false on CCFE.
+ */
+export async function markAwaitTimeoutEmitted(workflowId, ticketId, at) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET agentTasks.#tid.awaitTimeoutEmittedAt = :at",
+      ConditionExpression: "attribute_not_exists(agentTasks.#tid.awaitTimeoutEmittedAt)",
+      ExpressionAttributeNames: { "#tid": ticketId },
+      ExpressionAttributeValues: { ":at": at || new Date().toISOString() },
+    }));
+    return true;
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * TEAM-4166 D2 — increment the per-ticket clean-exit re-dispatch counter, scoped
+ * to the top-level cleanExitRedispatches map so it never touches
+ * deadSessionRetries or a sibling. This is the D2 evidence guard's OWN budget:
+ * when a parked ticket exited cleanly (or carries an unresolved precondition) the
+ * guard re-dispatches it instead of escalating, and this cap (CLEAN_EXIT_REDISPATCH_CAP)
+ * stops a ticket that keeps cleanly-exiting-then-reparking from thrashing forever
+ * — the clean-exit twin of deadSessionRetries. Two-step seed+bump for the same
+ * reason incrementDeadSessionRetry needs it (DynamoDB rejects `SET a.b = …` when
+ * `a` is missing): the seed is unconditional/idempotent, the leaf bump reads the
+ * new count. Returns the new count.
+ */
+export async function incrementCleanExitRedispatch(workflowId, ticketId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET cleanExitRedispatches = if_not_exists(cleanExitRedispatches, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  const res = await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET cleanExitRedispatches.#tid = if_not_exists(cleanExitRedispatches.#tid, :zero) + :one",
+    ExpressionAttributeNames: { "#tid": ticketId },
+    ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
+    ReturnValues: "UPDATED_NEW",
+  }));
+  return res.Attributes?.cleanExitRedispatches?.[ticketId];
+}
+
+/**
  * Un-stamp a dead-session detection (TEAM-3698). The detector stamps BEFORE its
  * TOCTOU lease re-check; when that re-check finds the agent resurrected
  * (heartbeated after the stamp), the stamp comes back off so the generation
@@ -1061,8 +1118,19 @@ export async function appendNotification(workflowId, notification) {
  * Reuses the existing acknowledged-based open/closed lifecycle, so a gate that
  * was reviewed (notification acked) and later reopened re-notifies correctly.
  * Returns true only when THIS caller appended the notification.
+ *
+ * TEAM-4166 D2 §2.4 — the optional `humanAssignee` is persisted ADDITIVELY onto
+ * the appended notification when it is a non-empty string. parkedOnHuman (the
+ * analyzer's always-on suppression) only treats an unacknowledged review_needed
+ * as human-parked when it carries a `human:*` assignee, so recording it here is
+ * what lets a review gate suppress the liveness watchdog without a legacy row's
+ * missing field silencing it. Existing callers (which pass no assignee) are
+ * byte-identical: the field is simply absent, exactly as before.
  */
-export async function appendReviewNotificationOnce(workflowId, ticketId, notification, maxAttempts = 3) {
+export async function appendReviewNotificationOnce(workflowId, ticketId, notification, maxAttempts = 3, humanAssignee = undefined) {
+  const enriched = typeof humanAssignee === "string" && humanAssignee
+    ? { ...notification, humanAssignee }
+    : notification;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const wf = await getWorkflow(workflowId);
     if (!wf) return false;
@@ -1078,7 +1146,7 @@ export async function appendReviewNotificationOnce(workflowId, ticketId, notific
         UpdateExpression: "SET humanNotifications = :n, notifVersion = :next",
         ConditionExpression: "attribute_not_exists(notifVersion) OR notifVersion = :cur",
         ExpressionAttributeValues: {
-          ":n": [...list, notification],
+          ":n": [...list, enriched],
           ":next": (wf.notifVersion || 0) + 1,
           ":cur": wf.notifVersion || 0,
         },

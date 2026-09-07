@@ -27,6 +27,17 @@ import {
   ScanCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
+// TEAM-4166 D2 — the pure liveness clock (per-phase thresholds + span-fresh
+// override). No AWS: all effects stay here, the module only DECIDES.
+import {
+  normalizeLivenessMode,
+  thresholdsFromEnv,
+  buildLivenessTickets,
+  decideWatch,
+  phaseForAgent,
+  emitLivenessMetrics,
+  isParkedOnHuman,
+} from "./liveness.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOW_MANAGER_ARN = process.env.WORKFLOW_MANAGER_ARN;
@@ -36,6 +47,13 @@ const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const STALE_MS = Number(process.env.WM_STALE_MINUTES || 10) * 60_000;
 const COOLDOWN_MS = Number(process.env.WM_WATCH_COOLDOWN_MINUTES || 15) * 60_000;
 const ANALYZE_DELAY_MS = Number(process.env.WM_ANALYZE_DELAY_MS || 30_000);
+
+// TEAM-4166 D2 — the liveness clock, read ONCE at module load. Mode fail-safes
+// to SHADOW (compute + log + metrics, zero intervention), never off. In off the
+// legacy WM_STALE_MINUTES event-age window is the sole decision (no new compute);
+// shadow logs where the two disagree; enforce lets liveness drive the invoke.
+const LIVENESS_MODE = normalizeLivenessMode(process.env.WM_LIVENESS_MODE);
+const LIVENESS_THRESHOLDS = thresholdsFromEnv();
 
 // TEAM-3747 D2: includes the lifecycle-integrity ship outcomes so a blocked run
 // is recorded HONESTLY (the dossier carries phase deploy-blocked / static-ci-only,
@@ -301,11 +319,13 @@ async function releaseAutoClaim(workflowId) {
  * transitions, manager_escalation by the human via the Telegram resolve button
  * (PATCH /api/workflow/[id]/escalations) — watching resumes on the ack.
  */
-function parkedOnHuman(wf) {
-  return (wf.humanNotifications || []).some(
-    (n) => !n?.acknowledged && (n?.type === "review_needed" || n?.type === "manager_escalation")
-  );
-}
+// TEAM-4166 §2.4 (ALWAYS-ON, independent of WM_LIVENESS_MODE): park ONLY on a
+// gate a human genuinely owns. The f50ucz freeze was a bare manager_escalation
+// (no gateTicketId) parking a whole run against a human nudge that never came —
+// isParkedOnHuman requires a real human assignee (review_needed) or a non-empty
+// gateTicketId (manager_escalation), so an agent-side escalation no longer
+// silences the watchdog. See lambda/workflow-analyzer/liveness.mjs.
+const parkedOnHuman = isParkedOnHuman;
 
 async function watchScan() {
   const now = Date.now();
@@ -314,7 +334,12 @@ async function watchScan() {
   do {
     const page = await ddb.send(new ScanCommand({
       TableName: WORKFLOWS_TABLE,
-      ProjectionExpression: "workflowId, phase, archived, managerWatch, wmLastWatchAt, startedAt, workflowDefId, humanNotifications",
+      // TEAM-4166 D2: agentTasks joins the projection — the liveness clock buckets
+      // per running/parked claim. `phase` was already read here unescaped, so the
+      // added attribute needs no ExpressionAttributeNames (agentTasks is not a
+      // DynamoDB reserved word).
+      ProjectionExpression:
+        "workflowId, phase, archived, managerWatch, wmLastWatchAt, startedAt, workflowDefId, humanNotifications, agentTasks",
       ExclusiveStartKey,
     }));
     active.push(...(page.Items || []).filter(
@@ -323,16 +348,54 @@ async function watchScan() {
     ExclusiveStartKey = page.LastEvaluatedKey;
   } while (ExclusiveStartKey);
 
+  // TEAM-4166 D2 — one EMF record per scan; explicit zeros so a healthy scan is
+  // distinguishable from a silent one.
+  const lm = { mode: LIVENESS_MODE, staleTickets: 0, watchFired: 0, spanFreshSkips: 0, shadowDivergence: 0 };
+
   const watched = [];
   for (const wf of active) {
     const lastWatch = wf.wmLastWatchAt ? Date.parse(wf.wmLastWatchAt) : 0;
     if (now - lastWatch < COOLDOWN_MS) continue;
 
-    const lastEventAge = await lastSignificantEventAge(wf.workflowId, now);
-    // Age used to decide staleness AND to report in the prompt: event age when we
-    // have events, else time since the run started (0 if we know neither).
-    const staleAge = lastEventAge ?? (wf.startedAt ? now - Date.parse(wf.startedAt) : 0);
-    if (staleAge < STALE_MS) continue;
+    // ── LEGACY decision (WM_STALE_MINUTES event-age window) — the sole driver in
+    //    off + shadow. Age used to decide AND to report: event age when we have
+    //    events, else time since the run started (0 if we know neither). ──
+    const events = await recentEvents(wf.workflowId);
+    const lastEventAge = significantEventAge(events, now);
+    const legacyAge = lastEventAge ?? (wf.startedAt ? now - Date.parse(wf.startedAt) : 0);
+    const legacyFire = legacyAge >= STALE_MS;
+
+    // ── LIVENESS decision (per-phase clock). Skipped entirely in off mode so it
+    //    is provably zero-effect there. ──
+    let livenessFire = false;
+    let livenessAgeMs = 0;
+    let livenessReason = null;
+    if (LIVENESS_MODE !== "off") {
+      const tickets = buildLivenessTickets({
+        agentTasks: wf.agentTasks,
+        events,
+        nowMs: now,
+        phaseOf: (_tid, task) => phaseForAgent(task?.agentId, wf.phase),
+      });
+      const decision = decideWatch(wf, tickets, now, LIVENESS_MODE, LIVENESS_THRESHOLDS);
+      livenessFire = decision.fire;
+      livenessAgeMs = decision.staleAgeMs;
+      livenessReason = decision.reason;
+      lm.staleTickets += decision.verdicts.filter((v) => v.stale).length;
+      lm.spanFreshSkips += decision.verdicts.filter((v) => v.spanFresh).length;
+      if (LIVENESS_MODE === "shadow" && legacyFire !== livenessFire) {
+        lm.shadowDivergence++;
+        console.log(`[analyzer] liveness.shadow_divergence ${JSON.stringify({
+          workflowId: wf.workflowId, legacyFire, livenessFire, reason: livenessReason,
+          ticketId: decision.ticketId, staleAgeMs: livenessAgeMs,
+        })}`);
+      }
+    }
+
+    // enforce → liveness drives; off | shadow → legacy drives.
+    const fire = LIVENESS_MODE === "enforce" ? livenessFire : legacyFire;
+    const reportAgeMs = LIVENESS_MODE === "enforce" ? livenessAgeMs : legacyAge;
+    if (!fire) continue;
 
     // Claim the watch slot BEFORE invoking — prevents intervention loops even
     // if the harness invocation itself is slow or this Lambda retries.
@@ -345,36 +408,48 @@ async function watchScan() {
 
     const prompt =
       `WATCH ${wf.workflowId} (defId=${wf.workflowDefId || "software-delivery"}, phase=${wf.phase})\n` +
-      `No significant events for ${Math.round(staleAge / 60000)} minutes. ` +
+      `No significant events for ${Math.round(reportAgeMs / 60000)} minutes. ` +
       `Diagnose and unstick if warranted.`;
     try {
       const result = await invokeHarness(prompt, sessionId("wmwatch", wf.workflowId));
       console.log(`[analyzer] WATCH ${wf.workflowId} stopReason=${result.stopReason}`);
       watched.push(wf.workflowId);
+      lm.watchFired++;
     } catch (err) {
       console.error(`[analyzer] WATCH ${wf.workflowId} failed:`, err.message);
     }
   }
-  console.log(`[analyzer] watch scan: ${active.length} active, ${watched.length} watched`);
+  emitLivenessMetrics(lm);
+  console.log(`[analyzer] watch scan: ${active.length} active, ${watched.length} watched (liveness=${LIVENESS_MODE})`);
   return { active: active.length, watched };
 }
 
-/** Age in ms of the newest non-streaming event, or null if none. */
 // Not agent activity: streaming chunks are too chatty to mean anything alone,
 // and orchestrator.nudge is a housekeeping event the orchestrator publishes
 // itself (a live lease it chose not to steal) — counting either keeps a run
 // looking fresh no matter what the agent is doing (TEAM-3969).
 const NON_SIGNIFICANT_EVENT_TYPES = new Set(["agent.streaming", "orchestrator.nudge"]);
 
-async function lastSignificantEventAge(workflowId, now) {
+/**
+ * The newest events for a workflow, newest first. TEAM-4166 D2 raised the Limit
+ * from 25 to 50: the liveness clock needs enough recent rows to find the newest
+ * agent.streaming per ticket (the span-fresh proof-of-life), which the chatty
+ * streaming rows can otherwise push past a 25-row window.
+ */
+async function recentEvents(workflowId) {
   const page = await ddb.send(new QueryCommand({
     TableName: EVENTS_TABLE,
     KeyConditionExpression: "workflowId = :w",
     ExpressionAttributeValues: { ":w": workflowId },
     ScanIndexForward: false,
-    Limit: 25,
+    Limit: 50,
   }));
-  const item = (page.Items || []).find((e) => !NON_SIGNIFICANT_EVENT_TYPES.has(e.type)) || (page.Items || [])[0];
+  return page.Items || [];
+}
+
+/** Age in ms of the newest non-streaming event in `items`, or null if none. */
+function significantEventAge(items, now) {
+  const item = (items || []).find((e) => !NON_SIGNIFICANT_EVENT_TYPES.has(e.type)) || (items || [])[0];
   if (!item?.timestamp) return null;
   return now - Date.parse(item.timestamp);
 }

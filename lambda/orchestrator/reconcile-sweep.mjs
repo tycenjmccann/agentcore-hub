@@ -39,7 +39,7 @@
  * detector and the cascade.
  */
 
-import { newMetrics as newCascadeMetrics } from "./cascade.mjs";
+import { newMetrics as newCascadeMetrics, blockerUnion } from "./cascade.mjs";
 // The ONE open-workflow scan, shared with dead-session-detector.mjs
 // (TEAM-3839). Carries the TEAM-3764 F5 rotating window and the TEAM-3755
 // F8-derived terminal-phase filter. SWEEP_ROTATION_QUANTUM_MS is re-exported
@@ -71,6 +71,10 @@ export function createReconcileSweep(deps) {
     cascade,          // createCascade(...) instance — exposes reconcileDependent
     getChildTickets,  // (parentId) → sibling ticket rows (same source as the cascade)
     leaseTtlMs,       // used to floor the min-parked window (R3 alignment)
+    // TEAM-4166 D1/D2 — optional awaited-ids module. When absent the sweep behaves
+    // exactly as pre-4166 (the backstop + wait-SLA blocks below are simply
+    // skipped), so existing tests stay green.
+    awaitedIds,
     now = () => Date.now(),
     log = (msg) => console.log(`[orchestrator] ${msg}`),
   } = deps;
@@ -97,7 +101,9 @@ export function createReconcileSweep(deps) {
    * a stalled no-blocker todo/ready is a missed DISPATCH, still worth reconciling.
    */
   function allBlockersResolved(ticket, snapshot) {
-    return (ticket.blockedBy || []).every((bid) => {
+    // TEAM-4166 D1 — the UNION of blockedBy edges and preconditionUnmet.awaitingIds
+    // (a tool-reported id that hasn't been edge-written yet still gates re-dispatch).
+    return blockerUnion(ticket).every((bid) => {
       const blocker = snapshot.find((s) => s.ticketId === bid);
       return blocker && TERMINAL_TICKET_STATUSES.has(blocker.status);
     });
@@ -108,6 +114,48 @@ export function createReconcileSweep(deps) {
     const updated = ticket.updatedAt ? Date.parse(ticket.updatedAt) : NaN;
     if (!Number.isFinite(updated)) return true; // no timestamp → it's been around
     return nowMs - updated >= minParkedMs;
+  }
+
+  /**
+   * TEAM-4166 D1/D2 — the awaited-ids backstop, run for every non-terminal child
+   * carrying preconditionUnmet.awaitingIds, INDEPENDENT of the candidate gate
+   * (a child still awaiting open fixes never passes allBlockersResolved, but its
+   * edges still need backfilling and its wait still needs an SLA):
+   *   1. Backfill: any awaited id that never became a blockedBy edge (the tool
+   *      report landed but the level-triggered pickup was missed) is written now
+   *      — idempotent via applyBlockerEdge "present".
+   *   2. Wait-SLA: once the wait exceeds AWAITED_IDS_TIMEOUT_MINUTES, emit the
+   *      once-only advisory orchestrator.await_timeout — an event, never a
+   *      humanNotification (so it can't trip parkedOnHuman).
+   * Both are writes, so they run only in an enforce sweep; shadow logs the intent.
+   */
+  async function handleAwaitedChild(sibling, siblings, workflow, m, mode, sweepId) {
+    const awaitingIds = sibling.preconditionUnmet?.awaitingIds;
+    if (!Array.isArray(awaitingIds) || !awaitingIds.length) return;
+
+    const edges = new Set(sibling.blockedBy || []);
+    const missingEdge = awaitingIds.some((id) => !edges.has(id));
+
+    if (mode !== "enforce") {
+      if (missingEdge) log(`reconcile.would_backfill_awaited (shadow) — ${sibling.ticketId} awaiting=[${awaitingIds.join(", ")}] (sweep ${sweepId})`);
+      return;
+    }
+
+    if (missingEdge) {
+      try {
+        await awaitedIds.applyAwaitedEdges(sibling.ticketId, awaitingIds, "tool");
+        log(`reconcile.awaited_backfill — ${sibling.ticketId} awaiting=[${awaitingIds.join(", ")}] (sweep ${sweepId})`);
+      } catch (err) {
+        log(`reconcile.awaited_backfill_error — ${sibling.ticketId}: ${err?.message || err} (sweep ${sweepId})`);
+      }
+    }
+
+    const to = awaitedIds.checkAwaitTimeout?.(sibling, siblings, now());
+    if (to?.timedOut) {
+      const emitted = await awaitedIds.emitAwaitTimeoutOnce(
+        workflow, sibling.ticketId, to.awaitingIds, to.waitedMs, "reconcile-sweep");
+      if (emitted) m.awaitTimeouts++;
+    }
   }
 
   /**
@@ -138,6 +186,10 @@ export function createReconcileSweep(deps) {
       noop: 0,
       candidateErrors: 0,
       truncated: false,
+      // TEAM-4166 D2 §2.3 — evidence-gated outcomes + the D1 wait-SLA timeout.
+      exitedOk: 0,
+      awaiting: 0,
+      awaitTimeouts: 0,
     };
 
     if (mode === "off") {
@@ -174,6 +226,15 @@ export function createReconcileSweep(deps) {
           if (!sibling || sibling.type === "epic") continue;
           if (!sibling.assignee) continue;
           if (!CANDIDATE_STATUSES.has(sibling.status)) continue;
+
+          // TEAM-4166 D1/D2 — the awaited-ids backstop runs BEFORE the
+          // candidate gate: a child still awaiting open fixes never passes
+          // allBlockersResolved, but its edges still need backfilling and its
+          // wait still needs an SLA. No-op when the awaited module is unwired.
+          if (awaitedIds && !TERMINAL_TICKET_STATUSES.has(sibling.status)) {
+            await handleAwaitedChild(sibling, siblings, workflow, m, mode, sweepId);
+          }
+
           if (!allBlockersResolved(sibling, siblings)) continue;
           if (!parkedLongEnough(sibling, startedAtMs)) continue;
 
@@ -182,14 +243,14 @@ export function createReconcileSweep(deps) {
           if (mode === "shadow") {
             // Observe only — run the same routing to learn the outcome shape,
             // but reconcileDependent honors shadow mode and performs no writes.
-            const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "shadow");
+            const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "shadow", siblings);
             tally(m, outcome);
             log(`reconcile.would_recover (shadow) — ${sibling.ticketId} status=${sibling.status} → ${outcome} (sweep ${sweepId})`);
             continue;
           }
 
           // enforce — re-drive through the ONE implementation of the invariant.
-          const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "enforce");
+          const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "enforce", siblings);
           tally(m, outcome);
           log(`reconcile.recover — ${sibling.ticketId} status=${sibling.status} → ${outcome} (sweep ${sweepId})`);
         } catch (err) {
@@ -233,6 +294,13 @@ function tally(m, outcome) {
     case "review-reawakened":
       m.reviewReawakened++;
       break;
+    // TEAM-4166 D2 §2.3 — evidence-gated clean-exit re-wake vs. still-awaiting.
+    case "exited-ok":
+      m.exitedOk++;
+      break;
+    case "awaiting":
+      m.awaiting++;
+      break;
     case "would-redispatch":
     case "would-steal":
     case "would-review":
@@ -271,6 +339,10 @@ export function emitReconcileMetrics(m) {
           { Name: "ReconcileNoop", Unit: "Count" },
           { Name: "ReconcileCandidateErrors", Unit: "Count" },
           { Name: "ReconcileSweepTruncated", Unit: "Count" },
+          // TEAM-4166 D2 §2.3 — evidence-gated re-wake outcomes + D1 wait-SLA.
+          { Name: "ReconcileExitedOk", Unit: "Count" },
+          { Name: "ReconcileAwaiting", Unit: "Count" },
+          { Name: "ReconcileAwaitTimeouts", Unit: "Count" },
         ],
       }],
     },
@@ -286,5 +358,8 @@ export function emitReconcileMetrics(m) {
     ReconcileNoop: m.noop,
     ReconcileCandidateErrors: m.candidateErrors || 0,
     ReconcileSweepTruncated: m.truncated ? 1 : 0,
+    ReconcileExitedOk: m.exitedOk || 0,
+    ReconcileAwaiting: m.awaiting || 0,
+    ReconcileAwaitTimeouts: m.awaitTimeouts || 0,
   }));
 }

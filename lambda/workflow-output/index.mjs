@@ -211,6 +211,81 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   };
 }
 
+// TEAM-4166 §1.2 — the structured "I can't finish yet" channel. An agent that
+// finds its ticket blocked on sibling work that isn't done reports the ids it is
+// waiting on instead of either lying via report_completion (which would Done the
+// ticket) or spinning silently. This is a NON-terminal signal: it stamps
+// preconditionUnmet on the ticket — the evidence the orchestrator's D1 re-wake
+// and D2 liveness clock read — via the SAME tickets-Lambda invoke path
+// report_completion uses, but with the annotate action, which NEVER transitions
+// the ticket and NEVER writes a completions/<id>.json record.
+const TICKET_KEY_RE = /^[A-Z][A-Z0-9]+-\d+$/;
+const AWAITING_CAP = 20;
+const NOTE_MAX = 2000;
+
+async function reportPreconditionUnmet({ ticket_id, awaiting_ids, note = "", workflow_id, agent_id }) {
+  const self = typeof ticket_id === "string" ? ticket_id.trim() : "";
+  if (!TICKET_KEY_RE.test(self)) {
+    return { status: "error", message: "invalid ticket_id" };
+  }
+  // Split on whitespace OR commas (agents pass "TEAM-1, TEAM-2" or "TEAM-1 TEAM-2"),
+  // keep only ticket-shaped ids that aren't the reporter itself, dedupe, cap.
+  const raw = Array.isArray(awaiting_ids)
+    ? awaiting_ids
+    : typeof awaiting_ids === "string"
+      ? awaiting_ids.split(/[\s,]+/)
+      : [];
+  const awaitingIds = [];
+  for (const item of raw) {
+    const id = typeof item === "string" ? item.trim() : "";
+    if (!TICKET_KEY_RE.test(id) || id === self || awaitingIds.includes(id)) continue;
+    awaitingIds.push(id);
+    if (awaitingIds.length >= AWAITING_CAP) break;
+  }
+  if (awaitingIds.length === 0) {
+    return { status: "error", message: "no valid awaiting_ids" };
+  }
+
+  const noteText = typeof note === "string" ? note.slice(0, NOTE_MAX) : "";
+  const reportedAt = new Date().toISOString();
+  const agentId = agent_id || null;
+
+  // Same LambdaClient.invoke path report_completion uses for the Done transition,
+  // but the annotate action only STAMPS preconditionUnmet — no status change.
+  if (self && !self.startsWith("HEALTHCHECK-") && !self.startsWith("TEST-")) {
+    try {
+      const resp = await lambda.send(new InvokeCommand({
+        FunctionName: TICKET_TOOLS_LAMBDA,
+        InvocationType: "RequestResponse",
+        Payload: Buffer.from(JSON.stringify({
+          tool_name: "Tickets___annotate_precondition_unmet",
+          parameters: { ticket_id: self, awaitingIds, note: noteText, reportedAt, agentId, source: "tool" },
+        })),
+      }));
+      const payload = JSON.parse(new TextDecoder().decode(resp.Payload));
+      if (payload.error) {
+        console.error(`[report_precondition_unmet] annotate failed for ${self}:`, payload.error);
+      } else {
+        console.log(`[report_precondition_unmet] ${self} awaiting ${awaitingIds.join(", ")}`);
+      }
+    } catch (err) {
+      console.error(`[report_precondition_unmet] Error annotating ${self}:`, err.message);
+    }
+  }
+
+  // Journey log: dossier-only. The derivation trigger is the ticket stamp above
+  // (read by the orchestrator), NOT this event.
+  await publishJourneyEvent(workflow_id || self, "agent.precondition_unmet", {
+    workflowId: workflow_id || null, ticketId: self, awaitingIds, note: noteText, agentId, reportedAt,
+  });
+
+  return {
+    status: "waiting",
+    message: `precondition unmet; awaiting ${awaitingIds.join(", ")}`,
+    awaitingIds,
+  };
+}
+
 // ─── Manifest Updates ──────────────────────────────────────────────────────────
 
 const PHASE_MAP = {
@@ -329,10 +404,12 @@ const TOOLS = {
   submit_ticket_plan: submitTicketPlan,
   save_design_doc: saveDesignDoc,
   report_completion: reportCompletion,
+  report_precondition_unmet: reportPreconditionUnmet,
   // Full prefixed names (sent by main.py @tool functions)
   "WorkflowOutput___submit_ticket_plan": submitTicketPlan,
   "WorkflowOutput___save_design_doc": saveDesignDoc,
   "WorkflowOutput___report_completion": reportCompletion,
+  "WorkflowOutput___report_precondition_unmet": reportPreconditionUnmet,
   // S3 storage tools (folded in from defunct agentcore-hub-s3-tools)
   "S3Storage___read_object": s3ReadObject,
   "S3Storage___write_object": s3WriteObject,
@@ -346,6 +423,9 @@ const TOOLS = {
 function inferToolFromArgs(args) {
   if (args.requirements && args.tickets) return "submit_ticket_plan";
   if (args.title && args.content && args.agent_id) return "save_design_doc";
+  // awaiting_ids is the discriminant for the non-terminal precondition channel —
+  // checked BEFORE report_completion so a call carrying both never Dones the ticket.
+  if (args.ticket_id && args.awaiting_ids) return "report_precondition_unmet";
   if (args.ticket_id && args.summary) return "report_completion";
   if (args.tickets) return "submit_ticket_plan";
   if (args.content && args.workflow_id) return "save_design_doc";

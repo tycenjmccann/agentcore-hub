@@ -116,11 +116,22 @@ echo "✓ Skills: s3://${BUCKET}/workflow-manager/skills/"
 
 # ─── Trigger Lambda ───────────────────────────────────────────────────────────
 LAMBDA_NAME="agentcore-hub-workflow-analyzer"
-ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},WM_STALE_MINUTES=${WM_STALE_MINUTES:-10},WM_WATCH_COOLDOWN_MINUTES=${WM_WATCH_COOLDOWN_MINUTES:-15},HUB_REPO_URL=${HUB_REPO_URL:-},SI_BATCH_SIZE=${SI_BATCH_SIZE:-5},SI_COOLDOWN_HOURS=${SI_COOLDOWN_HOURS:-12}}"
+# TEAM-4166 D2 — the liveness clock. WM_LIVENESS_MODE ships SHADOW (compute +
+# log + metrics, zero intervention) so the per-phase clock rides alongside the
+# legacy WM_STALE_MINUTES window and we can compare before flipping to enforce.
+# The per-phase minute knobs default to src/config/liveness-constants.json; the
+# legacy WM_STALE_MINUTES is retained (it still drives off + shadow).
+ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},WM_STALE_MINUTES=${WM_STALE_MINUTES:-10},WM_WATCH_COOLDOWN_MINUTES=${WM_WATCH_COOLDOWN_MINUTES:-15},WM_LIVENESS_MODE=${WM_LIVENESS_MODE:-shadow},WM_LIVENESS_DEV_MINUTES=${WM_LIVENESS_DEV_MINUTES:-45},WM_LIVENESS_VERIFY_MINUTES=${WM_LIVENESS_VERIFY_MINUTES:-20},WM_LIVENESS_SHIP_MINUTES=${WM_LIVENESS_SHIP_MINUTES:-12},WM_LIVENESS_SPAN_FRESH_MINUTES=${WM_LIVENESS_SPAN_FRESH_MINUTES:-2},WM_LIVENESS_DEFAULT_MINUTES=${WM_LIVENESS_DEFAULT_MINUTES:-10},HUB_REPO_URL=${HUB_REPO_URL:-},SI_BATCH_SIZE=${SI_BATCH_SIZE:-5},SI_COOLDOWN_HOURS=${SI_COOLDOWN_HOURS:-12}}"
 
 cd "${REPO_ROOT}/lambda/workflow-analyzer" && rm -f function.zip
+# TEAM-4166: the liveness constants are the src/config JSON single source of
+# truth (same TS-imports / Lambda-reads pattern as lease-constants.json). Copy it
+# in beside the module so liveness-constants.mjs resolves its LOCAL ./ candidate
+# in the deployed Lambda; remove the copy after zipping (it is not committed here).
+cp "${REPO_ROOT}/src/config/liveness-constants.json" liveness-constants.json
 npm install --omit=dev --no-audit --no-fund --silent
-zip -rq function.zip index.mjs package.json node_modules/
+zip -rq function.zip index.mjs liveness.mjs liveness-constants.mjs liveness-constants.json package.json node_modules/
+rm -f liveness-constants.json
 if aws lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
   aws lambda update-function-code --function-name "$LAMBDA_NAME" \
     --zip-file fileb://function.zip --output text >/dev/null
