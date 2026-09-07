@@ -54,7 +54,7 @@ import { createLiveReverify, normalizeLiveReverifyMode } from "./live-reverify.m
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
-import { validateEffectiveDef } from "./workflow-def-validate.mjs";
+import { validateEffectiveDef, validateDefForCreation } from "./workflow-def-validate.mjs";
 import { buildReviewResolved } from "./review-resolved.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 import { ensureCiCheck, formatCiCheckBlock, prefixCiWarning, normalizeCiCheckMode } from "./ci-check.mjs";
@@ -460,12 +460,21 @@ function getDelivery(workflow) {
  *     phase and advancePhase, exactly as the two inline blocks did before.
  *   - the FIRST agent ticket of the run's INITIAL agent phase, where
  *     agentPhaseIdx === currentPhaseIdx (the run was created already at that
- *     phase, so there is no ">" advance to hang the event on). Consumers still
- *     need the "requirements" phase_change here; a once-only store CAS
- *     (markInitialPhaseAnnounced) guarantees exactly one such emit per run even
- *     across concurrent deliveries and re-dispatches.
+ *     phase, so there is no ">" advance to hang the event on). Here we emit BOTH
+ *     the opening "intake" row AND the initial agent phase, in that order.
+ *
+ * CALL 6 F1: the "intake" phase_change is emitted HERE, not at a creation site.
+ * There are two creation paths — the app start route (src/app/api/workflow/
+ * start/route.ts, a direct PutCommand with NO event path) and bug bootstrap —
+ * and only this dispatch site is common to both, so anchoring the single
+ * intake emit here is what makes EVERY run (app-started ymo7dm-class included)
+ * get its intake row. A once-only store CAS (markInitialPhaseAnnounced)
+ * guarantees exactly one intake+initial pair per run across concurrent
+ * deliveries and re-dispatches; both emits sit behind that one CAS. The intake
+ * row is anchored at workflow.startedAt (publishEvent honors a valid ISO
+ * detail.timestamp) so the opening phase's duration measures from run start.
  */
-async function announcePhaseTransition(workflow, wfDef, agentDef, ticketId) {
+export async function announcePhaseTransition(workflow, wfDef, agentDef, ticketId) {
   const phaseOrder = Array.isArray(wfDef?.phaseOrder) ? wfDef.phaseOrder : [];
   const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
@@ -479,6 +488,11 @@ async function announcePhaseTransition(workflow, wfDef, agentDef, ticketId) {
   const firstAgentPhaseIdx = phaseOrder.findIndex((p) => p !== "intake");
   if (agentPhaseIdx >= 0 && agentPhaseIdx === currentPhaseIdx && agentPhaseIdx === firstAgentPhaseIdx) {
     if (await store.markInitialPhaseAnnounced(workflow.id, agentDef.phase)) {
+      // Two lifecycle rows behind the ONE CAS this run ever wins, in order:
+      // the run opened at "intake" (anchored at run start), then the initial
+      // agent phase (now). workflow.startedAt is the run's own creation stamp;
+      // if it is somehow absent publishEvent falls back to now.
+      await publishEvent(ticketId, "workflow.phase_change", { phase: "intake", workflowId: workflow.id, timestamp: workflow.startedAt });
       await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
     }
   }
@@ -5347,16 +5361,22 @@ async function bootstrapBugWorkflow(bugTicket) {
   // BEFORE creating the workflow row. Unlike the in-flight getEffectiveWorkflowDef
   // path (warn-only), run creation REFUSES an invalid def — a phantom ship gate
   // on a handoff repo would wedge the run forever, so it must never be created.
-  try {
-    await loadWorkflowDefs();
-    const registry = await loadCdRegistry();
-    const base = getWorkflowDef(workflow.workflowDefId);
-    const framed = applyFramework(base, frameworkOfWorkflow(base, workflow));
-    validateEffectiveDef(framed, { cdRegistered: isCdRegistered(registry, repoConfig) });
-  } catch (err) {
-    console.error(`[orchestrator] workflow_def.invalid — refusing to create bug workflow ${workflowId}: ${err.message}`);
+  //
+  // CALL 6 F2: the loaders run OUTSIDE the validate try/catch. A transient S3
+  // failure in loadWorkflowDefs/loadCdRegistry is an infra blip, not a
+  // misconfigured def — it must PROPAGATE (the trigger redelivers) exactly as it
+  // did before D3, never be laundered into a "your workflow is misconfigured"
+  // comment that fails bug intake closed. Only the pure validation verdict is
+  // caught and turned into the refusal.
+  await loadWorkflowDefs();
+  const registry = await loadCdRegistry();
+  const base = getWorkflowDef(workflow.workflowDefId);
+  const framed = applyFramework(base, frameworkOfWorkflow(base, workflow));
+  const verdict = validateDefForCreation(framed, isCdRegistered(registry, repoConfig));
+  if (!verdict.ok) {
+    console.error(`[orchestrator] workflow_def.invalid — refusing to create bug workflow ${workflowId}: ${verdict.message}`);
     emitWorkflowDefInvalid(workflow.workflowDefId || "unknown");
-    await commentOnBug(bugKey, `AgentCore Hub: this run's workflow definition is misconfigured and cannot start — ${err.message}`);
+    await commentOnBug(bugKey, `AgentCore Hub: this run's workflow definition is misconfigured and cannot start — ${verdict.message}`);
     return;
   }
 
@@ -5368,10 +5388,12 @@ async function bootstrapBugWorkflow(bugTicket) {
     return;
   }
 
-  // TEAM-4167 D3 (FR-3.3): the run's lifecycle begins at "intake" — emit the
-  // phase_change once, right after the row is created (this is the only
-  // in-orchestrator creation path; the start route emits its own).
-  await publishEvent(bugKey, "workflow.phase_change", { phase: "intake", workflowId });
+  // TEAM-4167 D3 (FR-3.3), CALL 6 F1: the run's opening "intake" phase_change is
+  // NOT emitted here. Both creation paths (this bug bootstrap and the app start
+  // route, which has no event path at all) converge on the first agent dispatch,
+  // where announcePhaseTransition emits the intake+initial pair behind ONE CAS —
+  // so every run gets exactly one intake row, anchored at startedAt. Emitting a
+  // second one here would give a bug run two intake rows with different stamps.
 
   // 2. Label the Bug ticket itself with `wf:<id>` so future webhooks can resolve the workflow
   try {
@@ -6149,7 +6171,19 @@ async function publishEvent(ticketId, detailType, detail) {
   // TEAM-4120: that same shared timestamp is also what makes the deterministic
   // eventId below reproducible from BOTH writers, so under EVENT_DEDUPE_MODE=
   // enforce the two copies collapse onto one row instead of needing a dedupe.
-  const timestamp = new Date().toISOString();
+  //
+  // TEAM-4167 D3 (CALL 6 F1): almost always "now", but a caller may ANCHOR an
+  // event at an earlier moment — the initial "intake" phase_change is stamped at
+  // the run's startedAt so the opening (requirements) phase's duration measures
+  // from run start, not from whenever the first agent happened to dispatch.
+  // Honor a valid ISO detail.timestamp; otherwise stamp now. deterministicEventId
+  // keys off this SAME stamped.timestamp (both writers see it via the EventBridge
+  // detail), so an anchored event still collapses onto one row.
+  const suppliedTs =
+    typeof detail?.timestamp === "string" && !Number.isNaN(Date.parse(detail.timestamp))
+      ? detail.timestamp
+      : null;
+  const timestamp = suppliedTs || new Date().toISOString();
   const stamped = { ...detail, ticketId, timestamp };
   try {
     await events.send(new PutEventsCommand({

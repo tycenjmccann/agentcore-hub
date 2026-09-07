@@ -117,3 +117,25 @@ export function validateEffectiveDef(def, { cdRegistered } = {}) {
 
   return { warnings };
 }
+
+/**
+ * Run-CREATION guard (TEAM-4167 D3 CALL 6 F2). Wraps validateEffectiveDef and
+ * returns a VERDICT ({ ok, message }) instead of throwing, so the caller can
+ * cleanly separate a genuinely misconfigured def (refuse the run, tell the
+ * reporter) from an infra error in whatever loaded the def/registry — those
+ * reads must stay OUTSIDE this call so a transient S3 blip propagates and is
+ * retried, never laundered into a "your workflow is misconfigured" refusal.
+ *
+ * Pure: no I/O. `framed` is the already-framed def; `cdRegistered` is the
+ * caller's resolved delivery mode. On the valid path returns { ok: true } and
+ * drops the soft warnings (creation cares only about the hard reject — the
+ * in-flight path is where warnings are surfaced).
+ */
+export function validateDefForCreation(framed, cdRegistered) {
+  try {
+    validateEffectiveDef(framed, { cdRegistered });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, message: err?.message || String(err) };
+  }
+}

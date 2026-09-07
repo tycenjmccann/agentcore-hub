@@ -11,6 +11,7 @@ import {
   clearDeadSessionDetected,
   incrementDeadSessionRetry,
   markAwaitTimeoutEmitted,
+  markInitialPhaseAnnounced,
   incrementCleanExitRedispatch,
   claimDeadSessionSynthesis,
   claimReverifySlot,
@@ -318,6 +319,25 @@ describe("markAwaitTimeoutEmitted (TEAM-4166 D1)", () => {
   it("returns false when another writer already emitted (CCFE), never throws", async () => {
     failNextCondition = true;
     await expect(markAwaitTimeoutEmitted("wf_1", "TEAM-2", "x")).resolves.toBe(false);
+  });
+});
+
+describe("markInitialPhaseAnnounced (TEAM-4167 D3 FR-3.3)", () => {
+  it("claims the emit under a top-level attribute_not_exists CAS (once-only)", async () => {
+    const won = await markInitialPhaseAnnounced("wf_1", "requirements");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("SET announcedInitialPhase = :p");
+    expect(w.input.ConditionExpression).toBe("attribute_not_exists(announcedInitialPhase)");
+    expect(w.input.ExpressionAttributeValues[":p"]).toBe("requirements");
+    // Row-level claim, not anchored to any per-task generation.
+    expect(w.input.ConditionExpression).not.toContain("startedAt");
+    expect(w.input.ConditionExpression).not.toContain("agentTasks");
+  });
+
+  it("returns false when the initial phase was already announced (CCFE), never throws", async () => {
+    failNextCondition = true;
+    await expect(markInitialPhaseAnnounced("wf_1", "requirements")).resolves.toBe(false);
   });
 });
 

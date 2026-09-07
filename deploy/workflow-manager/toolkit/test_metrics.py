@@ -133,6 +133,47 @@ class HappyPath(unittest.TestCase):
                             for s in self.metrics["dataQuality"]["missingSignals"]))
 
 
+def intake_requirements_dossier():
+    """TEAM-4167 D3 CALL 6 F1 — the shape EVERY run now produces once the
+    orchestrator emits the intake row (anchored at startedAt) + the initial
+    agent phase from the single markInitialPhaseAnnounced CAS site. The first
+    logged phase_change is "intake" AT startedAt, so compute_phases has a real
+    opening row and never synthesizes a `derived: "run-start"` reconstruction."""
+    return dossier(
+        tickets=[ticket("TEAM-2", "dev_agent", "done", updatedAt=ts(90))],
+        events=[
+            # intake stamped AT the run's startedAt (T0 == minute 0).
+            ev(0, "workflow.phase_change", {"phase": "intake", "workflowId": "wf-1"}),
+            ev(10, "workflow.phase_change", {"phase": "requirements", "workflowId": "wf-1"}),
+            ev(30, "workflow.phase_change", {"phase": "development", "workflowId": "wf-1"}),
+            ev(11, "agent.invoked", {"ticketId": "TEAM-2", "agentId": "dev_agent",
+                                     "phase": "requirements", "workflowId": "wf-1"}),
+            ev(90, "workflow.phase_change", {"phase": "verification", "workflowId": "wf-1"}),
+            ev(115, "workflow.complete", {"workflowId": "wf-1"}),
+        ],
+    )
+
+
+class IntakeAnchoredPhases(unittest.TestCase):
+    """A dossier with real intake+requirements phase_change rows produces NO
+    reconstructed run-start row and still fully partitions the run."""
+
+    def setUp(self):
+        self.metrics = compute_metrics(intake_requirements_dossier())
+
+    def test_no_run_start_reconstruction(self):
+        phases = self.metrics["phases"]
+        self.assertEqual(phases[0]["phase"], "intake")
+        # The intake row was LOGGED (anchored at startedAt), not reconstructed.
+        self.assertIsNone(phases[0]["derived"])
+        self.assertTrue(all(p.get("derived") != "run-start" for p in phases))
+
+    def test_phases_sum_to_total_duration(self):
+        total = self.metrics["totalDurationMs"]
+        self.assertEqual(total, 120 * 60 * 1000)
+        self.assertEqual(sum(p["durationMs"] for p in self.metrics["phases"]), total)
+
+
 def rejection_rework_dossier():
     return dossier(
         tickets=[

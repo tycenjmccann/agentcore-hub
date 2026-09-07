@@ -11,6 +11,7 @@ import {
 import {
   lintWorkflowDefShape as lintMjs,
   validateEffectiveDef as validateMjs,
+  validateDefForCreation,
 } from "../../../lambda/orchestrator/workflow-def-validate.mjs";
 
 /**
@@ -114,5 +115,29 @@ describe("workflow-def-validate parity: workflow-defs.ts ≡ workflow-def-valida
       expect(ts).toBe(mjs);
       expect(ts).toContain('afterPhase="nope"');
     }
+  });
+});
+
+/**
+ * TEAM-4167 D3 CALL 6 F2: validateDefForCreation is the run-CREATION guard the
+ * bug-bootstrap path uses — it turns validateEffectiveDef's throw into a verdict
+ * so the caller can refuse a genuinely-misconfigured def (and comment on the bug)
+ * while a transient loader error stays OUTSIDE this call and propagates. Pure,
+ * so it is unit-testable directly here.
+ */
+describe("validateDefForCreation (run-creation verdict, never throws)", () => {
+  it("returns { ok: true } (no message) on a valid def", () => {
+    const verdict = validateDefForCreation(alwaysShipDef() as never, true);
+    expect(verdict).toEqual({ ok: true });
+  });
+
+  it("returns { ok: false, message } — the SAME message validateEffectiveDef would throw — on an invalid def", () => {
+    const def = alwaysShipDef();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const thrown = thrownMessage(() => validateMjs(def as any, { cdRegistered: false }));
+    const verdict = validateDefForCreation(def as never, false);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.message).toBe(thrown);
+    expect(verdict.message).toContain("Merge Approval");
   });
 });

@@ -202,17 +202,62 @@ Unit-tested by `lambda/orchestrator/review-resolved.test.mjs` (`buildReviewResol
 
 ## 7. FR-3.3 — workflow.phase_change (intake + initial phase, exactly-once)
 
-`workflow.phase_change` producers in `lambda/orchestrator/index.mjs`:
-- intake open: `:5374` (`phase: "intake"` on bug-fix row create)
-- initial-phase dispatch: `:474` / `:482`, gated by the store CAS
-  `store.markInitialPhaseAnnounced(workflow.id, agentDef.phase)` (`:481`).
+**CALL 6 F1 — one CAS-gated site covers EVERY creation path.** There are two
+ways a run is created: the app start route (`src/app/api/workflow/start/
+route.ts`, a direct `PutCommand` with NO event-publishing path) and bug
+bootstrap. The earlier design emitted the opening `intake` row at a creation
+site, so it only fired for bug-bootstrapped runs — app-started (ymo7dm-class)
+runs never got an intake row. The single site common to BOTH paths is the first
+agent dispatch, so the intake emit now lives there.
+
+`announcePhaseTransition` (`lambda/orchestrator/index.mjs:477`, now exported)
+emits, behind the ONE store CAS a run ever wins:
+
+- `:495` — `workflow.phase_change {phase:"intake"}`, **anchored at
+  `workflow.startedAt`** so the opening phase's duration measures from run start,
+  not from whenever the first agent happened to dispatch;
+- `:496` — `workflow.phase_change {phase:<initial agent phase>}` (stamped now);
+
+both gated by `store.markInitialPhaseAnnounced(workflow.id, agentDef.phase)`
+(`:490`). A genuine forward advance (`agentPhaseIdx > currentPhaseIdx`) emits a
+single phase row + `advancePhase` at `:483`.
+
+`publishEvent` (`:6166`) now honors a caller-supplied valid ISO
+`detail.timestamp` (else stamps now); `deterministicEventId` keys off that SAME
+stamped timestamp, so an anchored intake event still collapses both writers onto
+one row under `EVENT_DEDUPE_MODE=enforce`.
 
 The store method `markInitialPhaseAnnounced`
 (`lambda/orchestrator/workflow-store.mjs:429`) claims the ONE initial-phase emit
 with a top-level `attribute_not_exists(announcedInitialPhase)` CAS (same shape
 as `markDeadSessionDetected`) — exactly-once across concurrent deliveries and
 re-dispatches, since the run row is CREATED at its initial phase (there is no
-ADVANCE to gate the emit on).
+ADVANCE to gate the emit on). The separate intake emit in `bootstrapBugWorkflow`
+was REMOVED (`:5394` carries the explanatory comment).
+
+Tests:
+- `lambda/orchestrator/phase-change-lifecycle.test.mjs` drives the REAL exported
+  `announcePhaseTransition` (AWS/store seams mocked): the intake→initial
+  two-event sequence in order, intake `timestamp == workflow.startedAt`, a lost
+  CAS emits nothing, once-only across a second dispatch, and a forward advance
+  emits one row + calls `advancePhase`.
+- `lambda/orchestrator/workflow-store.test.mjs` → `markInitialPhaseAnnounced`
+  (top-level `attribute_not_exists(announcedInitialPhase)` CAS, win → true,
+  CCFE → false, never throws).
+- `deploy/workflow-manager/toolkit/test_metrics.py` → `IntakeAnchoredPhases`: a
+  synthetic dossier with real intake+requirements phase_change rows produces NO
+  `derived: "run-start"` reconstruction and its phases still sum to
+  `totalDurationMs`.
+
+**CALL 6 F2 — narrowed `bootstrapBugWorkflow` def-validate catch.** The def/
+registry loads now sit OUTSIDE the try (a transient S3 blip propagates and is
+retried, never laundered into a "your workflow is misconfigured" refusal); only
+the validate is wrapped, via the pure `validateDefForCreation(framed,
+cdRegistered)` helper (`lambda/orchestrator/workflow-def-validate.mjs:134`) that
+returns `{ ok, message }` instead of throwing. Unit-tested in
+`src/lib/workflow/workflow-def-validate-parity.test.ts` (`validateDefForCreation`
+returns `{ok:true}` on a valid def and `{ok:false, message}` — the SAME message
+`validateEffectiveDef` would throw — on an invalid one).
 
 ---
 
