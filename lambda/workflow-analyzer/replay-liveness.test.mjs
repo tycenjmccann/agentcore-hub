@@ -8,6 +8,14 @@ import {
   thresholdsFromEnv,
   normalizeLivenessMode,
   isParkedOnHuman,
+  // TEAM-4186 F6/F7 — the legacy clock's own function (no more private
+  // re-implementation here) and the pure half of the bounded window read.
+  legacySignificantEventAge,
+  LEGACY_EVENT_WINDOW,
+  activeTicketIds,
+  maxThresholdMs,
+  eventsWindowFloor,
+  livenessWindowSatisfied,
 } from "./liveness.mjs";
 
 /**
@@ -36,10 +44,6 @@ const SCAN_INTERVAL_MS = 5 * 60_000;
 const COOLDOWN_MS = 15 * 60_000;
 const LEGACY_STALE_MS = 10 * 60_000; // the pre-4166 WM_STALE_MINUTES window
 const TH = thresholdsFromEnv({}); // 45/20/12/2/10 min defaults
-
-// Legacy clock: newest event that is NOT streaming/nudge (the analyzer's
-// NON_SIGNIFICANT_EVENT_TYPES) is the only proof-of-life it recognized.
-const NON_SIGNIFICANT = new Set(["agent.streaming", "orchestrator.nudge"]);
 
 const ms = (iso) => Date.parse(iso);
 const load = (rel) =>
@@ -81,23 +85,31 @@ function rewindTasks(agentTasks, t) {
   return out;
 }
 
-/** The legacy 10-min event-age verdict at t (age since newest significant event). */
-function legacyFiresAt(events, t, startedAtMs) {
-  let newest = null;
-  for (const e of events) {
-    if (NON_SIGNIFICANT.has(e.type)) continue;
-    const et = ms(e.timestamp);
-    if (et <= t && (newest == null || et > newest)) newest = et;
-  }
-  const age = newest == null ? (startedAtMs != null ? t - startedAtMs : 0) : t - newest;
+/**
+ * The legacy 10-min event-age verdict at t, via the REAL legacySignificantEventAge
+ * (TEAM-4186 F6) — not a private re-implementation. Models the actual DynamoDB
+ * read exactly: events as of t, newest-first, sliced to `limit` rows — i.e. what
+ * a `Limit: <limit>, ScanIndexForward: false` Query would have returned if `t`
+ * were "now". `limit` defaults to the real LEGACY_EVENT_WINDOW (25); the one
+ * F6-regression comparison below passes 50 on purpose, to replay the TEAM-4166
+ * bug itself against this same real event stream.
+ */
+function legacyFiresAt(events, t, startedAtMs, limit = LEGACY_EVENT_WINDOW) {
+  const windowed = events
+    .filter((e) => ms(e.timestamp) <= t)
+    .sort((a, b) => ms(b.timestamp) - ms(a.timestamp))
+    .slice(0, limit);
+  const age = legacySignificantEventAge(windowed, t) ?? (startedAtMs != null ? t - startedAtMs : 0);
   return age >= LEGACY_STALE_MS;
 }
 
 /**
  * Replay one window at the scan interval. Returns raw firing-tick counts + the
  * cooldown-gated intervention counts for both the new and legacy clocks.
+ * `legacyWindowLimit` forwards to legacyFiresAt (see above) — left at the real
+ * default everywhere except the one F6-regression comparison.
  */
-function replayWindow({ fixture, agentTasks, workflowPhase, fromIso, toIso, mode = "enforce" }) {
+function replayWindow({ fixture, agentTasks, workflowPhase, fromIso, toIso, mode = "enforce", legacyWindowLimit }) {
   const heartbeats = synthHeartbeats(fixture.streamHeartbeats);
   const allEvents = [...(fixture.events || []), ...heartbeats];
   const startedAtMs = fixture.workflow?.startedAt ? ms(fixture.workflow.startedAt) : null;
@@ -133,7 +145,7 @@ function replayWindow({ fixture, agentTasks, workflowPhase, fromIso, toIso, mode
         lastNew = t;
       }
     }
-    if (legacyFiresAt(allEvents, t, startedAtMs)) {
+    if (legacyFiresAt(allEvents, t, startedAtMs, legacyWindowLimit)) {
       legacyRaw++;
       if (t - lastLegacy >= COOLDOWN_MS) {
         legacyInterventions++;
@@ -145,7 +157,7 @@ function replayWindow({ fixture, agentTasks, workflowPhase, fromIso, toIso, mode
 }
 
 describe("FR-2.3 — f50ucz 21:13Z→04:34Z: the dev window no longer thrashes", () => {
-  it("the new per-phase clock fires ≤2 (streaming devs stay fresh) where legacy fired ≥10", () => {
+  it("the new per-phase clock and the RESTORED legacy clock both stay calm on continuous streaming", () => {
     // Dev A/B/C = TEAM-4120/4121/4122 (backend_dev → phaseForAgent "development"),
     // streaming ~continuously 21:07→04:34 with only ~2s handoff seams. The whole
     // fixture roster is rewound each tick — only the streaming devs are active in
@@ -166,14 +178,36 @@ describe("FR-2.3 — f50ucz 21:13Z→04:34Z: the dev window no longer thrashes",
     expect(r.newRaw).toBeLessThanOrEqual(2);
     expect(r.newInterventions).toBeLessThanOrEqual(2);
 
-    // LEGACY clock: the same fixture reproduces the OLD thrash — the 10-min
-    // event-age window has no streaming to reset it, so it trips repeatedly (the
-    // real run logged 13 manager interventions across this window). Raw firing
-    // ticks (observed 41) and cooldown-gated interventions (observed 24) both
-    // clear the ≥10 floor; the point is legacy >> new on the identical input.
-    expect(r.legacyRaw).toBeGreaterThanOrEqual(10);
-    expect(r.legacyInterventions).toBeGreaterThanOrEqual(10);
-    expect(r.newRaw).toBeLessThan(r.legacyRaw);
+    // TEAM-4186 F6 — this is the corrected expectation, replayed through the REAL
+    // legacySignificantEventAge (Limit 25) rather than the private unbounded
+    // re-implementation this test used before: on THIS fixture, continuous
+    // per-dev streaming every 20s keeps the workflow-wide 25-row window's newest
+    // significant row recent even though the legacy check is not per-ticket, so
+    // the byte-identical pre-epic algorithm never crosses STALE_MS here either.
+    // (The historical prod thrash that motivated this whole epic must have come
+    // from real streaming gaps the reconstructed heartbeats — only counts were
+    // persisted, see _provenance.note — cannot capture; it was not a defect in
+    // the pre-epic algorithm itself.)
+    expect(r.legacyRaw).toBe(0);
+    expect(r.legacyInterventions).toBe(0);
+
+    // What DOES thrash on this exact real event stream is the TEAM-4166 F6
+    // REGRESSION itself (Limit 50 instead of 25) — replayed here as direct
+    // evidence for why the fix matters, on the same fixture rather than a
+    // synthetic one.
+    const regressed = replayWindow({
+      fixture: F50,
+      agentTasks: F50.workflow.agentTasks,
+      workflowPhase: "development",
+      fromIso: "2026-09-05T21:13:00Z",
+      toIso: "2026-09-06T04:34:00Z",
+      mode: "enforce",
+      legacyWindowLimit: 50,
+    });
+    expect(regressed.legacyRaw).toBeGreaterThanOrEqual(10);
+    expect(regressed.legacyInterventions).toBeGreaterThanOrEqual(10);
+    expect(regressed.legacyRaw).toBeGreaterThan(r.legacyRaw);
+    expect(r.newRaw).toBeLessThan(regressed.legacyRaw);
 
     expect(typeof F50._provenance?.note).toBe("string");
     expect(F50._provenance.note.length).toBeGreaterThan(0);
@@ -280,6 +314,76 @@ describe("FR-2.5 — parkedOnHuman gates the watchdog only on a real human gate"
     expect(isParkedOnHuman(viaTask)).toBe(true);
     // The fixture's own row is acknowledged → never parks.
     expect(isParkedOnHuman({ humanNotifications: [base] })).toBe(false);
+  });
+});
+
+describe("TEAM-4186 F7 — a streaming burst must not starve a sibling", () => {
+  const MIN = 60_000;
+  const now = 10_000 * MIN;
+  const iso = (t) => new Date(t).toISOString();
+  const DEV = () => "development";
+
+  // A: 60 agent.streaming rows over the last 10s of a claude_code generation.
+  const burstStart = now - 10_000;
+  const aBurst = Array.from({ length: 60 }, (_, i) => ({
+    type: "agent.streaming",
+    timestamp: iso(burstStart + Math.round((i * 10_000) / 59)),
+    detail: { ticketId: "T-A", agentId: "agentcore_hub_backend_dev" },
+  }));
+  // B: its last heartbeat landed 30s BEFORE A's burst even starts — legitimately
+  // alive (40s silence, well under spanFreshMs), but oldest in the merged table.
+  const bHeartbeat = {
+    type: "agent.streaming",
+    timestamp: iso(burstStart - 30_000),
+    detail: { ticketId: "T-B", agentId: "agentcore_hub_backend_dev" },
+  };
+  // Newest-first — exactly the ScanIndexForward:false ordering DynamoDB returns.
+  const allEvents = [...aBurst, bHeartbeat].sort((x, y) => ms(y.timestamp) - ms(x.timestamp));
+  const agentTasks = {
+    "T-A": { agentId: "agentcore_hub_backend_dev", ticketId: "T-A", status: "running", startedAt: iso(now - 3 * 60 * MIN) },
+    "T-B": { agentId: "agentcore_hub_backend_dev", ticketId: "T-B", status: "running", startedAt: iso(now - 3 * 60 * MIN) },
+  };
+  const ids = activeTicketIds({ agentTasks });
+
+  it("(a) the first 50-row page holds only A's rows; WITHOUT the fix (no windowFloorMs) B is falsely stale", () => {
+    const page1 = allEvents.slice(0, 50);
+    expect(page1.every((e) => e.detail.ticketId === "T-A")).toBe(true); // B's row is #51 — the oldest
+    // No windowFloorMs — the pre-F7 call shape — reproduces the historical bug.
+    const tickets = buildLivenessTickets({ agentTasks, events: page1, nowMs: now, phaseOf: DEV });
+    const b = tickets.find((t) => t.ticketId === "T-B");
+    expect(b.lastStreamAt).toBeNull();
+    expect(b.windowFloorAt).toBeNull();
+    const d = decideWatch({}, tickets, now, "enforce", TH);
+    expect(d.fire).toBe(true);
+    expect(d.ticketId).toBe("T-B"); // stale off its 3h-old startedAt — the false positive
+  });
+
+  it("(b) livenessWindowSatisfied is false at 50 rows (B still missing) and true once B's row is read", () => {
+    const page1 = allEvents.slice(0, 50);
+    expect(livenessWindowSatisfied({
+      activeTicketIds: ids, events: page1, nowMs: now, maxThresholdMs: maxThresholdMs(TH),
+    })).toBe(false);
+    expect(livenessWindowSatisfied({
+      activeTicketIds: ids, events: allEvents, nowMs: now, maxThresholdMs: maxThresholdMs(TH),
+    })).toBe(true);
+  });
+
+  it("(c) with the full paged event set B is NOT stale, A is span-fresh, decideWatch fires on nobody", () => {
+    const tickets = buildLivenessTickets({
+      agentTasks, events: allEvents, nowMs: now, phaseOf: DEV, windowFloorMs: eventsWindowFloor(allEvents),
+    });
+    const d = decideWatch({}, tickets, now, "enforce", TH);
+    expect(d.fire).toBe(false);
+    const byId = Object.fromEntries(d.verdicts.map((v) => [v.ticketId, v]));
+    expect(byId["T-A"].spanFresh).toBe(true);
+    expect(byId["T-B"].stale).toBe(false);
+  });
+
+  it("(d) the legacy 25-row window is unchanged by the deeper read (F6 leak guard)", () => {
+    const page1 = allEvents.slice(0, 50);
+    const fromAll = legacySignificantEventAge(allEvents.slice(0, LEGACY_EVENT_WINDOW), now);
+    const fromPage1 = legacySignificantEventAge(page1.slice(0, LEGACY_EVENT_WINDOW), now);
+    expect(fromAll).toBe(fromPage1);
   });
 });
 

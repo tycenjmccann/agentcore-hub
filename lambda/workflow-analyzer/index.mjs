@@ -470,14 +470,14 @@ async function watchScan() {
 // ticket (the span-fresh proof-of-life), which the chatty streaming rows can
 // otherwise push past a 25-row window. The LEGACY decision is deliberately NOT
 // widened with it — see LEGACY_EVENT_WINDOW in liveness.mjs (TEAM-4186 F6).
-const LIVENESS_EVENT_PAGE = 50;
+export const LIVENESS_EVENT_PAGE = 50;
 
 // Hard ceiling on the paged window: 10 × 50 = 500 rows per workflow per scan.
 // A runaway streaming agent must not be able to turn one WATCH scan into an
 // unbounded table read, so the loop always stops — and when it stops early the
 // verdict stays sound because a starved ticket is anchored at the window floor
 // (liveness.mjs computeSilenceMs), never at its hours-old startedAt.
-const MAX_EVENT_PAGES = 10;
+export const MAX_EVENT_PAGES = 10;
 
 /**
  * The newest events for a workflow, newest first, read deep enough to DECIDE.
@@ -494,7 +494,7 @@ const MAX_EVENT_PAGES = 10;
  * (TEAM-4186 F6). In `off` mode this is the PRE-EPIC read — one Query, Limit 25,
  * no paging, not one extra consumed capacity unit: the clock never runs there.
  */
-async function recentEventsPaged({ workflowId, activeTicketIds: ids, nowMs, maxThresholdMs: maxMs }) {
+export async function recentEventsPaged({ workflowId, activeTicketIds: ids, nowMs, maxThresholdMs: maxMs }) {
   const queryFor = (Limit, ExclusiveStartKey) => new QueryCommand({
     TableName: EVENTS_TABLE,
     KeyConditionExpression: "workflowId = :w",

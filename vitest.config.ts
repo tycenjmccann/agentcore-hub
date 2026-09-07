@@ -453,6 +453,9 @@ export default defineConfig({
       // no longer thrash), FR-2.4 (the genuinely idle RM still fires stale:ship),
       // FR-2.5 (the bare manager_escalation does not park), + shadow safety.
       "lambda/workflow-analyzer/replay-liveness.test.mjs",
+      // TEAM-4186 F7 — recentEventsPaged's AWS-facing read: mocked ddb.send, real
+      // pagination/stop/legacy-window-leak-guard behavior.
+      "lambda/workflow-analyzer/event-window.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
