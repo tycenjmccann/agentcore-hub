@@ -1,0 +1,5 @@
+RUN 13 mcp-hub-build: npm --prefix mcp/hub run build
+
+> @agentcore-hub/hub-mcp@0.1.0 build
+> tsc
+

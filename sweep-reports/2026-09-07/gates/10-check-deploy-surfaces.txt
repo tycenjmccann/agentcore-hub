@@ -1,0 +1,2 @@
+RUN 10 check-deploy-surfaces: ./scripts/check-deploy-surfaces.sh
+deploy-surface manifest covers lambda/ and deploy/ (13 lambdas, 3 harnesses, 4 s3 surfaces)

@@ -1,0 +1,6 @@
+RUN 09 check-fix-kinds-parity: ./scripts/check-fix-kinds-parity.sh
+fix-kinds parity guard: OK
+  FIX_KINDS        = ci_fix,codex_fix,qa_fix,review_fix,ship_fix,sync_fix  (6 locations in agreement)
+  REWORK_FIX_KINDS = codex_fix,qa_fix,review_fix,ship_fix
+  origin-key map   = ci_fix=ciTicketId,codex_fix=codexTicketId,qa_fix=qaTicketId,review_fix=gateTicketId,ship_fix=shipTicketId,sync_fix=ciTicketId  (3 locations in agreement)
+  fix-contract.mjs = 3 byte-identical copies

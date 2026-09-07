@@ -1,0 +1,8 @@
+pkill command: pkill -f "next start" || true
+server command: nohup npm run start -- -p 3737 > .sweep-output/gates/14b-server.log 2>&1 &
+wait command: curl -sf -o /dev/null http://localhost:3737/api/health (max 60s)
+test command: PLAYWRIGHT_BASE_URL=http://localhost:3737 npm run test:cloud-code -- --trace retain-on-failure > .sweep-output/gates/14b-test-cloud-code.txt 2>&1
+server_pid=19739
+health_ready=0 after_seconds=3
+test_exit=0
+server_killed=1

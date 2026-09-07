@@ -1,0 +1,401 @@
+playwright.config.ts:40 - default
+vitest.config.ts:14 - default
+demo/playwright.config.ts:14 - default
+src/middleware.ts:56 - middleware
+src/middleware.ts:87 - config
+demo/playwright/playwright.config.ts:3 - default
+lambda/orchestrator/completion.mjs:92 - notTerminalPhaseGuard
+lambda/orchestrator/completion.mjs:116 - notTerminalPhaseFilter
+lambda/orchestrator/completion.mjs:147 - missingEvidenceTickets
+lambda/orchestrator/completion.mjs:243 - resolveMissingEvidenceFromRecords
+lambda/orchestrator/completion.mjs:297 - normalizeAdvisoryRoutingMode (used in module)
+lambda/orchestrator/completion.mjs:323 - advisoryNeverApplies (used in module)
+lambda/orchestrator/completion.mjs:338 - isAdvisoryTicket (used in module)
+lambda/orchestrator/completion.mjs:345 - nonAdvisory (used in module)
+lambda/orchestrator/completion.mjs:360 - isWorkflowComplete
+lambda/orchestrator/completion.mjs:466 - shipVerdictOf (used in module)
+lambda/orchestrator/completion.mjs:498 - evaluateShipVerdict
+lambda/orchestrator/completion.mjs:35 - FIX_KINDS (used in module)
+lambda/orchestrator/completion.mjs:45 - REWORK_FIX_KINDS
+lambda/orchestrator/completion.mjs:56 - SHIP_BLOCKED_OUTCOMES (used in module)
+lambda/orchestrator/completion.mjs:75 - TERMINAL_WORKFLOW_PHASES (used in module)
+lambda/orchestrator/completion.mjs:131 - SHIP_PHASES
+lambda/orchestrator/lease.mjs:83 - lastAgentActivity
+lambda/orchestrator/lease.mjs:133 - lastStreamedText
+lambda/orchestrator/lease.mjs:178 - hasAgentErrorSince
+lambda/orchestrator/lease.mjs:214 - stealClaim
+lambda/orchestrator/lease.mjs:42 - DEFAULT_TTL_MINUTES
+lambda/orchestrator/lease.mjs:43 - STALE_CLAIM_MULTIPLIER
+lambda/orchestrator/lease.mjs:51 - LEASE_TTL_MS (used in module)
+lambda/orchestrator/review-cap.mjs:119 - fingerprintFinding (used in module)
+lambda/orchestrator/review-cap.mjs:146 - roundContentFingerprint (used in module)
+lambda/orchestrator/review-cap.mjs:164 - openEscalation (used in module)
+lambda/orchestrator/review-cap.mjs:192 - parseDecision (used in module)
+lambda/orchestrator/review-cap.mjs:300 - buildRoundRecord (used in module)
+lambda/orchestrator/review-cap.mjs:396 - emitReviewCapMetrics (used in module)
+lambda/orchestrator/review-cap.mjs:435 - emitReviewCapFailOpenMetrics (used in module)
+lambda/orchestrator/review-cap.mjs:471 - createReviewCap
+lambda/orchestrator/review-cap.mjs:469 - REVIEW_CAP_FAIL_OPEN_LIMIT (used in module)
+src/app/layout.tsx:18 - default
+src/app/layout.tsx:13 - metadata
+src/app/page.tsx:58 - default
+src/config/modules.ts:28 - ModuleId (used in module)
+src/config/modules.ts:39 - NavItem (used in module)
+src/lib/agentcore-sdk.ts:94 - getMemoryMapping (used in module)
+src/lib/agentcore-sdk.ts:152 - DiscoveredAgent (used in module)
+src/lib/agentcore-sdk.ts:169 - DiscoveredMemory (used in module)
+src/lib/agentcore-sdk.ts:510 - PayloadFormat (used in module)
+src/lib/agentcore-sdk.ts:910 - RegistryAuthorizerType (used in module)
+src/lib/agentcore-sdk.ts:912 - Registry (used in module)
+src/lib/agentcore-sdk.ts:925 - RegistryRecord (used in module)
+src/lib/agentcore-sdk.ts:939 - RegistryRecordDetail (used in module)
+src/lib/agentcore-sdk.ts:946 - CreateRegistryInput (used in module)
+src/lib/agentcore-sdk.ts:955 - CreateRegistryRecordInput (used in module)
+src/lib/agentcore-stream.ts:19 - StreamRequest (used in module)
+src/lib/agentcore-stream.ts:43 - BuilderStreamRequest (used in module)
+src/lib/cd-registry.ts:44 - DeliveryMode (used in module)
+src/lib/cd-registry.ts:46 - CD_REGISTRY_KEY (used in module)
+src/lib/client-cache.ts:75 - invalidateCache
+src/lib/pipeline-config.ts:83 - TOOL_ICON_MAP (used in module)
+src/lib/pipeline-config.ts:93 - PipelinePhaseId (used in module)
+src/lib/pipeline-config.ts:99 - PipelineIdentityItem (used in module)
+src/lib/pipeline-config.ts:104 - PipelineConfigItem (used in module)
+src/lib/pipeline-config.ts:109 - PipelineDisplayItem (used in module)
+src/lib/pipeline-config.ts:126 - PHASE_DISPLAY_META (used in module)
+src/lib/pipeline-config.ts:244 - PipelineAgentConfig (used in module)
+src/lib/pipeline-config.ts:447 - PIPELINE_PHASES
+src/lib/utils.ts:8 - formatDuration
+src/lib/utils.ts:15 - truncate
+demo/playwright/v4/playwright-v4.config.ts:3 - default
+deploy/runtime-agent/healthcheck-fixtures/buggy-component.tsx:7 - ThemeToggle
+deploy/runtime-agent/healthcheck-fixtures/fixed-component.tsx:7 - ThemeToggle
+evals/battery/lib/agent-runner.mjs:22 - PRICING_PER_MTOK (used in module)
+evals/battery/lib/agent-runner.mjs:37 - MAX_TURNS (used in module)
+evals/battery/lib/agent-runner.mjs:46 - MAX_TRANSPORT_RETRIES (used in module)
+evals/battery/lib/agent-runner.mjs:85 - INFRA_RETRY_DELAY_MS (used in module)
+evals/battery/lib/cases.mjs:87 - loadCaseValidator (used in module)
+evals/battery/lib/cases.mjs:100 - loadBattery (used in module)
+evals/battery/lib/cases.mjs:133 - duplicateCaseIds (used in module)
+evals/battery/lib/cases.mjs:276 - defaultGitShow (used in module)
+evals/battery/lib/cases.mjs:12 - PERSONA_EVALUATOR_ID (used in module)
+evals/battery/lib/cases.mjs:13 - SCORING_BACKEND (used in module)
+evals/battery/lib/cases.mjs:15 - batteryDir (used in module)
+evals/battery/lib/mock-transport.mjs:25 - MOCK_DEFAULT (used in module)
+evals/battery/lib/mock-transport.mjs:28 - SENSITIVE_EVALUATORS (used in module)
+evals/battery/lib/redact.mjs:14 - GITHUB_OWNER_ALLOWLIST (used in module)
+evals/battery/lib/scoring.mjs:83 - builtinInstruction
+evals/battery/lib/scoring.mjs:98 - createConverseTransport
+evals/battery/lib/scoring.mjs:15 - SCORING_BACKEND
+evals/battery/lib/scoring.mjs:19 - JUDGE_MAX_TOKENS (used in module)
+evals/battery/lib/scoring.mjs:21 - CUSTOM_EVALUATOR_ID (used in module)
+evals/battery/lib/scoring.mjs:92 - HTTP_CONNECTION_TIMEOUT_MS (used in module)
+evals/battery/lib/scoring.mjs:93 - HTTP_REQUEST_TIMEOUT_MS (used in module)
+evals/battery/lib/scoring.mjs:94 - SDK_MAX_ATTEMPTS (used in module)
+evals/battery/lib/thresholds.mjs:5 - SCALE (used in module)
+src/app/agents/page.tsx:57 - default
+src/app/build/page.tsx:17 - default
+src/app/cloud-code/page.tsx:49 - default
+src/app/connectors/page.tsx:22 - default
+src/app/evaluations/page.tsx:113 - default
+src/app/invoke/page.tsx:27 - default
+src/app/pipeline/page.tsx:38 - default
+src/app/registry/page.tsx:80 - default
+src/app/routines/page.tsx:19 - default
+src/app/tickets/page.tsx:118 - default
+src/app/workflow/page.tsx:36 - default
+src/components/cloud-code/CliBrand.tsx:9 - CLI_BRAND (used in module)
+src/components/workflow/ArtifactViewer.tsx:20 - ArtifactKind (used in module)
+src/components/workflow/PipelineVisualization.tsx:333 - default
+src/components/workflow/useWorkflowStream.ts:6 - StreamStatus (used in module)
+src/components/workflow/useWorkflowStream.ts:8 - UseWorkflowStreamOptions (used in module)
+src/components/workflow/useWorkflowStream.ts:26 - UseWorkflowStreamReturn (used in module)
+src/lib/auth/identity.ts:50 - authDisabled (used in module)
+src/lib/auth/resolver.ts:14 - authMode (used in module)
+src/lib/cloud-code/config-store.ts:47 - DEFAULT_SCOPE (used in module)
+src/lib/cloud-code/config-store.ts:52 - UserConfig (used in module)
+src/lib/cloud-code/github-store.ts:31 - GithubConnection (used in module)
+src/lib/cloud-code/runtime.ts:36 - CodingTurnResult (used in module)
+src/lib/cloud-code/runtime.ts:47 - CodingTurnParams (used in module)
+src/lib/cloud-code/shell-protocol.ts:21 - DecodedFrame (used in module)
+src/lib/cloud-code/use-voice-input.ts:49 - VoiceInput (used in module)
+src/lib/connectors/secrets.ts:17 - secretIdFor (used in module)
+src/lib/connectors/store.ts:23 - readRegistry (used in module)
+src/lib/connectors/types.ts:33 - ConnectorStatus (used in module)
+src/lib/metrics/gate-dwell.ts:15 - StatusTransition (used in module)
+src/lib/metrics/throughput.ts:10 - WorkflowDuration (used in module)
+src/lib/models/harness-models.ts:32 - BedrockApiFormat (used in module)
+src/lib/models/harness-models.ts:33 - OpenAiApiFormat (used in module)
+src/lib/models/harness-models.ts:36 - HarnessModelConfig (used in module)
+src/lib/models/harness-models.ts:51 - ModelProvider (used in module)
+src/lib/models/harness-models.ts:53 - HarnessModelOption (used in module)
+src/lib/pipeline/status.ts:23 - CiBuildSummary (used in module)
+src/lib/pipeline/status.ts:32 - StageState (used in module)
+src/lib/pipeline/status.ts:44 - PipelineStatus (used in module)
+src/lib/routines/schedule.ts:40 - scheduleNameFor (used in module)
+src/lib/routines/store.ts:37 - getRoutine (used in module)
+src/lib/routines/store.ts:23 - DEFAULT_USER_ID
+src/lib/routines/store.ts:23 - DEFAULT_TENANT_ID (used in module)
+src/lib/routines/types.ts:19 - RoutineRepoConfig (used in module)
+src/lib/routines/types.ts:48 - RoutineLastRun (used in module)
+src/lib/workflow/analysis-types.ts:13 - AnalysisTrigger (used in module)
+src/lib/workflow/analysis-types.ts:19 - FindingKind (used in module)
+src/lib/workflow/analysis-types.ts:20 - FindingSeverity (used in module)
+src/lib/workflow/analysis-types.ts:21 - RecommendationPriority (used in module)
+src/lib/workflow/analysis-types.ts:22 - RecommendationType (used in module)
+src/lib/workflow/analysis-types.ts:29 - PhaseMetric (used in module)
+src/lib/workflow/analysis-types.ts:37 - AgentTaskMetric (used in module)
+src/lib/workflow/analysis-types.ts:48 - HumanReviewMetric (used in module)
+src/lib/workflow/analysis-types.ts:67 - FixTicketEntry (used in module)
+src/lib/workflow/analysis-types.ts:84 - ChangeRequestCycle (used in module)
+src/lib/workflow/analysis-types.ts:91 - ManagerIntervention (used in module)
+src/lib/workflow/analysis-types.ts:98 - WorkflowMetrics (used in module)
+src/lib/workflow/analysis-types.ts:139 - AnalysisScores (used in module)
+src/lib/workflow/analysis-types.ts:165 - AnalysisTrend (used in module)
+src/lib/workflow/command-queue.ts:23 - WorkflowCommand
+src/lib/workflow/completion-evidence.ts:21 - CompletionRecord (used in module)
+src/lib/workflow/completion-evidence.ts:32 - EvidenceEntryLike (used in module)
+src/lib/workflow/completion-evidence.ts:41 - MissingEvidenceTicket (used in module)
+src/lib/workflow/completion-evidence.ts:46 - BackfillFields (used in module)
+src/lib/workflow/completion-evidence.ts:53 - ResolveEvidenceDeps (used in module)
+src/lib/workflow/intake.ts:19 - redactUrl (used in module)
+src/lib/workflow/intake.ts:75 - SourceOutcome (used in module)
+src/lib/workflow/intake.ts:97 - SourceValidationMode (used in module)
+src/lib/workflow/intake.ts:104 - LookupImpl (used in module)
+src/lib/workflow/intake.ts:108 - ValidateIntakeSourcesOptions (used in module)
+src/lib/workflow/jira-client.ts:11 - JIRA_STATUS_TO_INTERNAL (used in module)
+src/lib/workflow/jira-client.ts:25 - INTERNAL_STATUS_TO_JIRA (used in module)
+src/lib/workflow/jira-client.ts:60 - JiraClientConfig (used in module)
+src/lib/workflow/jira-client.ts:66 - JiraIssue (used in module)
+src/lib/workflow/jira-client.ts:91 - JiraTransition (used in module)
+src/lib/workflow/jira-client.ts:97 - JiraSearchResult (used in module)
+src/lib/workflow/lease.ts:42 - AgentTaskEntry (used in module)
+src/lib/workflow/model-config.ts:18 - ModelProvider (used in module)
+src/lib/workflow/model-config.ts:26 - ModelOptionBase (used in module)
+src/lib/workflow/model-config.ts:44 - BedrockModelOption (used in module)
+src/lib/workflow/model-config.ts:52 - OpenAIModelOption (used in module)
+src/lib/workflow/performance.ts:113 - quantile (used in module)
+src/lib/workflow/performance.ts:154 - getPath (used in module)
+src/lib/workflow/performance.ts:217 - isValidCard (used in module)
+src/lib/workflow/performance.ts:45 - InfraSnapshot (used in module)
+src/lib/workflow/performance.ts:70 - KpiDef (used in module)
+src/lib/workflow/performance.ts:83 - FLEET_KPIS (used in module)
+src/lib/workflow/performance.ts:101 - BASELINE_DAYS (used in module)
+src/lib/workflow/performance.ts:102 - BASELINE_MIN (used in module)
+src/lib/workflow/performance.ts:125 - Band (used in module)
+src/lib/workflow/performance.ts:161 - KpiStat (used in module)
+src/lib/workflow/performance.ts:174 - AgentAgg (used in module)
+src/lib/workflow/repo-check.ts:21 - RepoCheckResult (used in module)
+src/lib/workflow/repo-check.ts:38 - RepoCheckOptions (used in module)
+src/lib/workflow/roster-loader.ts:22 - loadRoster (used in module)
+src/lib/workflow/roster-loader.ts:12 - RosterAgent (used in module)
+src/lib/workflow/sdlc-framework.ts:9 - SdlcFramework (used in module)
+src/lib/workflow/ship-review.ts:18 - ShipFindingLike (used in module)
+src/lib/workflow/ship-review.ts:52 - EffectiveRoundCountOpts (used in module)
+src/lib/workflow/source-shape.ts:29 - INTAKE_SOURCE_TYPES (used in module)
+src/lib/workflow/source-shape.ts:105 - SourceDisplay (used in module)
+src/lib/workflow/transform-event.ts:11 - TransformOptions (used in module)
+src/lib/workflow/types.ts:106 - FixContract (used in module)
+src/lib/workflow/types.ts:134 - AgentPhase
+src/lib/workflow/types.ts:217 - StoredEvent (used in module)
+src/lib/workflow/types.ts:222 - WorkflowType (used in module)
+src/lib/workflow/types.ts:281 - RepoTarget (used in module)
+src/lib/workflow/types.ts:290 - MessageType (used in module)
+src/lib/workflow/types.ts:292 - AgentMessage (used in module)
+src/lib/workflow/types.ts:304 - IntakeSourceType (used in module)
+src/lib/workflow/types.ts:412 - PortedSession (used in module)
+src/lib/workflow/types.ts:427 - NotificationType (used in module)
+src/lib/workflow/types.ts:436 - ReviewPackageLink (used in module)
+src/lib/workflow/watchdog.ts:27 - WatchdogConfig (used in module)
+src/lib/workflow/watchdog.ts:34 - PartialWatchdog (used in module)
+src/lib/workflow/workflow-defs.ts:280 - sdlcFrameworkForDef (used in module)
+src/lib/workflow/workflow-defs.ts:285 - isHumanAssignee
+src/lib/workflow/workflow-defs.ts:20 - WorkflowPhaseType (used in module)
+src/lib/workflow/workflow-defs.ts:22 - WorkflowDefPhase (used in module)
+src/lib/workflow/workflow-defs.ts:92 - ArtifactChainEntry (used in module)
+src/lib/workflow/workflow-defs.ts:109 - ArtifactChain (used in module)
+src/lib/workflow/workflow-defs.ts:116 - SdlcFramework (used in module)
+src/lib/workflow/workflow-defs.ts:126 - FrameworkOverlay (used in module)
+src/lib/workflow/workspace.ts:36 - writeArtifact
+evals/battery/fixtures/fix-null-session-crash-001/session-utils.ts:10 - parseSession
+evals/battery/fixtures/fix-null-session-crash-001/session-utils.ts:26 - getTenantScope
+evals/battery/fixtures/fix-null-session-crash-001/session-utils.ts:4 - Session (used in module)
+evals/battery/fixtures/fix-pagination-offbyone-002/pagination.ts:10 - paginate
+evals/battery/fixtures/fix-pagination-offbyone-002/pagination.ts:3 - Page (used in module)
+evals/battery/fixtures/fix-race-condition-cas-003/store.ts:5 - ConversationRecord (used in module)
+evals/battery/fixtures/fix-race-condition-cas-003/store.ts:19 - ConversationStore
+src/app/agents/[id]/page.tsx:60 - default
+src/app/api/connectors/route.ts:27 - GET
+src/app/api/connectors/route.ts:37 - POST
+src/app/api/connectors/route.ts:25 - dynamic
+src/app/api/evaluations/route.ts:42 - GET
+src/app/api/evaluations/route.ts:14 - dynamic
+src/app/api/evaluations/route.ts:15 - revalidate
+src/app/api/evaluations/route.ts:16 - fetchCache
+src/app/api/health/route.ts:3 - GET
+src/app/api/models/route.ts:40 - GET
+src/app/api/routines/route.ts:22 - GET
+src/app/api/routines/route.ts:36 - POST
+src/app/api/routines/route.ts:20 - dynamic
+src/app/evaluations/config/page.tsx:85 - default
+src/app/api/agentcore/agents/route.ts:11 - GET
+src/app/api/agentcore/builder/route.ts:13 - POST
+src/app/api/agentcore/deploy/route.ts:12 - POST
+src/app/api/agentcore/invoke/route.ts:9 - POST
+src/app/api/agentcore/metrics/route.ts:94 - GET
+src/app/api/agentcore/metrics/route.ts:3 - dynamic
+src/app/api/agentcore/payload-format/route.ts:8 - GET
+src/app/api/agentcore/payload-format/route.ts:21 - POST
+src/app/api/agentcore/region/route.ts:19 - GET
+src/app/api/agentcore/region/route.ts:31 - POST
+src/app/api/agentcore/registry/route.ts:10 - GET
+src/app/api/agentcore/registry/route.ts:26 - POST
+src/app/api/agentcore/registry/route.ts:4 - dynamic
+src/app/api/agentcore/traces/route.ts:71 - GET
+src/app/api/agentcore/traces/route.ts:126 - POST
+src/app/api/cloud-code/config/route.ts:37 - GET
+src/app/api/cloud-code/config/route.ts:43 - POST
+src/app/api/cloud-code/config/route.ts:106 - PUT
+src/app/api/cloud-code/config/route.ts:30 - dynamic
+src/app/api/cloud-code/config/route.ts:31 - maxDuration
+src/app/api/cloud-code/github/route.ts:16 - GET
+src/app/api/cloud-code/github/route.ts:43 - DELETE
+src/app/api/cloud-code/github/route.ts:14 - dynamic
+src/app/api/cloud-code/sessions/route.ts:14 - GET
+src/app/api/cloud-code/sessions/route.ts:35 - POST
+src/app/api/cloud-code/sessions/route.ts:12 - dynamic
+src/app/api/connectors/[id]/route.ts:16 - GET
+src/app/api/connectors/[id]/route.ts:23 - PATCH
+src/app/api/connectors/[id]/route.ts:64 - DELETE
+src/app/api/connectors/[id]/route.ts:14 - dynamic
+src/app/api/evaluations/agents/route.ts:6 - GET
+src/app/api/evaluations/agents/route.ts:4 - dynamic
+src/app/api/evaluations/loop/route.ts:55 - GET
+src/app/api/evaluations/loop/route.ts:75 - POST
+src/app/api/evaluations/loop/route.ts:15 - dynamic
+src/app/api/jira/metrics/route.ts:546 - GET
+src/app/api/jira/metrics/route.ts:6 - dynamic
+src/app/api/pipeline/status/route.ts:9 - GET
+src/app/api/pipeline/status/route.ts:7 - dynamic
+src/app/api/routines/[id]/route.ts:20 - GET
+src/app/api/routines/[id]/route.ts:31 - PATCH
+src/app/api/routines/[id]/route.ts:86 - DELETE
+src/app/api/routines/[id]/route.ts:18 - dynamic
+src/app/api/routines/chat/route.ts:38 - POST
+src/app/api/routines/chat/route.ts:21 - runtime
+src/app/api/routines/chat/route.ts:22 - dynamic
+src/app/api/routines/definitions/route.ts:29 - GET
+src/app/api/routines/definitions/route.ts:13 - dynamic
+src/app/api/workflow/[id]/route.ts:33 - DELETE
+src/app/api/workflow/[id]/route.ts:31 - dynamic
+src/app/api/workflow/artifacts/route.ts:4 - GET
+src/app/api/workflow/cd-registry/route.ts:27 - GET
+src/app/api/workflow/cd-registry/route.ts:41 - POST
+src/app/api/workflow/cd-registry/route.ts:62 - DELETE
+src/app/api/workflow/cd-registry/route.ts:25 - dynamic
+src/app/api/workflow/definitions/route.ts:15 - GET
+src/app/api/workflow/definitions/route.ts:13 - dynamic
+src/app/api/workflow/list/route.ts:6 - GET
+src/app/api/workflow/list/route.ts:4 - dynamic
+src/app/api/workflow/performance/route.ts:47 - GET
+src/app/api/workflow/performance/route.ts:19 - dynamic
+src/app/api/workflow/state/route.ts:9 - GET
+src/app/api/workflow/webhook/route.ts:21 - POST
+src/app/api/workflow-manager/chat/route.ts:97 - POST
+src/app/api/workflow-manager/chat/route.ts:24 - runtime
+src/app/api/workflow-manager/chat/route.ts:25 - dynamic
+src/app/api/agentcore/memory/events/route.ts:26 - GET
+src/app/api/agentcore/memory/events/route.ts:114 - POST
+src/app/api/agentcore/memory/mapping/route.ts:14 - GET
+src/app/api/agentcore/memory/mapping/route.ts:28 - POST
+src/app/api/agentcore/memory/sessions/route.ts:24 - GET
+src/app/api/agentcore/registry/[registryId]/route.ts:12 - GET
+src/app/api/agentcore/registry/[registryId]/route.ts:28 - PATCH
+src/app/api/agentcore/registry/[registryId]/route.ts:44 - DELETE
+src/app/api/agentcore/registry/[registryId]/route.ts:4 - dynamic
+src/app/api/agentcore/traces/health/route.ts:51 - GET
+src/app/api/agentcore/traces/health/route.ts:17 - TraceHealthIssue (used in module)
+src/app/api/agentcore/traces/health/route.ts:30 - TraceHealth (used in module)
+src/app/api/agentcore/traces/sessions/route.ts:27 - GET
+src/app/api/cloud-code/github/callback/route.ts:30 - GET
+src/app/api/cloud-code/github/callback/route.ts:24 - dynamic
+src/app/api/cloud-code/github/install/route.ts:21 - GET
+src/app/api/cloud-code/github/install/route.ts:15 - dynamic
+src/app/api/cloud-code/github/manifest/route.ts:30 - GET
+src/app/api/cloud-code/github/manifest/route.ts:24 - dynamic
+src/app/api/cloud-code/sessions/[id]/route.ts:61 - PATCH
+src/app/api/cloud-code/sessions/[id]/route.ts:87 - GET
+src/app/api/cloud-code/sessions/[id]/route.ts:104 - DELETE
+src/app/api/cloud-code/sessions/[id]/route.ts:19 - dynamic
+src/app/api/cloud-code/sessions/port/route.ts:137 - POST
+src/app/api/cloud-code/sessions/port/route.ts:48 - dynamic
+src/app/api/connectors/[id]/credentials/route.ts:17 - POST
+src/app/api/connectors/[id]/credentials/route.ts:15 - dynamic
+src/app/api/evaluations/agents/[agentId]/route.ts:45 - PUT
+src/app/api/evaluations/agents/[agentId]/route.ts:4 - dynamic
+src/app/api/routines/[id]/run/route.ts:17 - POST
+src/app/api/routines/[id]/run/route.ts:15 - dynamic
+src/app/api/workflow/[id]/agent-output/route.ts:73 - GET
+src/app/api/workflow/[id]/agent-output/route.ts:32 - dynamic
+src/app/api/workflow/[id]/analyze/route.ts:27 - POST
+src/app/api/workflow/[id]/analyze/route.ts:25 - dynamic
+src/app/api/workflow/[id]/archive/route.ts:21 - PATCH
+src/app/api/workflow/[id]/archive/route.ts:19 - dynamic
+src/app/api/workflow/[id]/escalations/route.ts:32 - GET
+src/app/api/workflow/[id]/escalations/route.ts:45 - PATCH
+src/app/api/workflow/[id]/escalations/route.ts:23 - dynamic
+src/app/api/workflow/[id]/events/route.ts:22 - GET
+src/app/api/workflow/[id]/events/route.ts:13 - dynamic
+src/app/api/workflow/[id]/message/route.ts:30 - POST
+src/app/api/workflow/[id]/message/route.ts:19 - dynamic
+src/app/api/workflow/[id]/nudge/route.ts:267 - POST
+src/app/api/workflow/[id]/nudge/route.ts:32 - dynamic
+src/app/api/workflow/[id]/retry/route.ts:151 - POST
+src/app/api/workflow/[id]/retry/route.ts:73 - dynamic
+src/app/api/workflow/[id]/state/route.ts:35 - GET
+src/app/api/workflow/[id]/state/route.ts:4 - dynamic
+src/app/api/workflow/[id]/stream/route.ts:29 - GET
+src/app/api/workflow/[id]/stream/route.ts:17 - runtime
+src/app/api/workflow/[id]/stream/route.ts:18 - dynamic
+src/app/api/workflow/[id]/tickets/route.ts:9 - GET
+src/app/api/workflow/[id]/tickets/route.ts:5 - dynamic
+src/app/api/workflow/[id]/watch/route.ts:23 - GET
+src/app/api/workflow/[id]/watch/route.ts:33 - PATCH
+src/app/api/workflow/[id]/watch/route.ts:21 - dynamic
+src/app/api/workflow/artifacts/content/route.ts:51 - GET
+src/app/api/workflow/artifacts/content/route.ts:93 - PUT
+src/app/api/workflow/artifacts/download/route.ts:11 - GET
+src/app/api/agentcore/registry/[registryId]/records/route.ts:18 - GET
+src/app/api/agentcore/registry/[registryId]/records/route.ts:43 - POST
+src/app/api/agentcore/registry/[registryId]/records/route.ts:10 - dynamic
+src/app/api/agentcore/registry/[registryId]/search/route.ts:17 - POST
+src/app/api/agentcore/registry/[registryId]/search/route.ts:8 - dynamic
+src/app/api/cloud-code/sessions/[id]/artifacts/route.ts:61 - GET
+src/app/api/cloud-code/sessions/[id]/artifacts/route.ts:121 - POST
+src/app/api/cloud-code/sessions/[id]/artifacts/route.ts:24 - dynamic
+src/app/api/cloud-code/sessions/[id]/checkpoint/route.ts:30 - POST
+src/app/api/cloud-code/sessions/[id]/checkpoint/route.ts:23 - dynamic
+src/app/api/cloud-code/sessions/[id]/checkpoint/route.ts:24 - maxDuration
+src/app/api/cloud-code/sessions/[id]/message/route.ts:55 - POST
+src/app/api/cloud-code/sessions/[id]/message/route.ts:20 - dynamic
+src/app/api/cloud-code/sessions/[id]/message/route.ts:22 - maxDuration
+src/app/api/cloud-code/sessions/[id]/shell/route.ts:32 - POST
+src/app/api/cloud-code/sessions/[id]/shell/route.ts:22 - dynamic
+src/app/api/cloud-code/sessions/[id]/shell/route.ts:26 - maxDuration
+src/app/api/cloud-code/sessions/[id]/stop/route.ts:42 - POST
+src/app/api/cloud-code/sessions/[id]/stop/route.ts:35 - dynamic
+src/app/api/cloud-code/sessions/[id]/stop/route.ts:36 - maxDuration
+src/app/api/cloud-code/sessions/[id]/warm/route.ts:21 - POST
+src/app/api/cloud-code/sessions/[id]/warm/route.ts:18 - dynamic
+src/app/api/cloud-code/sessions/[id]/warm/route.ts:19 - maxDuration
+src/app/api/evaluations/agents/[agentId]/flush/route.ts:17 - POST
+src/app/api/evaluations/agents/[agentId]/flush/route.ts:15 - dynamic
+src/app/api/workflow/[id]/tickets/comment/route.ts:29 - POST
+src/app/api/workflow/[id]/tickets/comment/route.ts:27 - dynamic
+src/app/api/workflow/[id]/tickets/transition/route.ts:24 - POST
+src/app/api/workflow/[id]/tickets/transition/route.ts:7 - dynamic
+src/app/api/agentcore/registry/[registryId]/records/[recordId]/route.ts:17 - GET
+src/app/api/agentcore/registry/[registryId]/records/[recordId]/route.ts:34 - PATCH
+src/app/api/agentcore/registry/[registryId]/records/[recordId]/route.ts:67 - DELETE
+src/app/api/agentcore/registry/[registryId]/records/[recordId]/route.ts:9 - dynamic
+src/app/api/agentcore/registry/[registryId]/records/[recordId]/approval/route.ts:24 - POST
+src/app/api/agentcore/registry/[registryId]/records/[recordId]/approval/route.ts:9 - dynamic

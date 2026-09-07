@@ -1,0 +1,2 @@
+RUN 12 lambda-zip-manifest: bash scripts/check-lambda-zip-manifest.sh
+lambda zip manifest guard: OK (29 modules in closure, all present in zip manifest line in lambda/orchestrator/deploy.sh)

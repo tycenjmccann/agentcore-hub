@@ -1,0 +1,18 @@
+gate | command | exit code
+--- | --- | ---
+01-npm-ci | npm ci | 0
+02-lint | npm run lint | 0
+03-tsc | npx tsc --noEmit | 0
+04-test-unit | npm run test:unit | 1
+05-cost-report | node --test lambda/cost-report | 0
+06-agentcore-hub-jira | node --test lambda/agentcore-hub-jira | 0
+07-anomaly-watcher | node --test lambda/anomaly-watcher | 0
+08-check-workflow-writes | ./scripts/check-workflow-writes.sh | 0
+09-check-fix-kinds-parity | ./scripts/check-fix-kinds-parity.sh | 0
+10-check-deploy-surfaces | ./scripts/check-deploy-surfaces.sh | 0
+11-build | npm run build | 0
+12-lambda-zip-manifest | bash scripts/check-lambda-zip-manifest.sh | 0
+13-mcp-hub-build | npm --prefix mcp/hub run build | 0
+14-test-cloud-code | start server on 3737; wait health; PLAYWRIGHT_BASE_URL=http://localhost:3737 npm run test:cloud-code; kill server | 1
+15-npm-test | timeout 600 npm test | 1
+16-test-full | timeout 600 npm run test:full | 1

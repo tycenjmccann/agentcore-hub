@@ -1,0 +1,811 @@
+RUN 15b test-full: timeout 120 npm run test:full
+
+> agentcore-hub@1.0.0 test:full
+> ./tests/run-all.sh --full
+
+=== AgentCore Hub Playwright Test Suite ===
+
+--- Running Tab Tests (UI validation) ---
+
+Running 32 tests using 1 worker
+
+  ✘   1 [chromium] › tests/tab-agents.spec.ts:8:7 › Agents Tab › renders agents page (236ms)
+  ✘   2 [chromium] › tests/tab-agents.spec.ts:15:7 › Agents Tab › shows agent cards when discovery completes (215ms)
+  ✘   3 [chromium] › tests/tab-agents.spec.ts:32:7 › Agents Tab › agent card is clickable (241ms)
+  ✘   4 [chromium] › tests/tab-agents.spec.ts:44:7 › Agents Tab › agent detail page shows chat interface (227ms)
+  ✘   5 [chromium] › tests/tab-build.spec.ts:8:7 › Build Tab › renders builder chat interface (232ms)
+  ✘   6 [chromium] › tests/tab-build.spec.ts:12:7 › Build Tab › shows harness mode indicator (219ms)
+  ✘   7 [chromium] › tests/tab-build.spec.ts:16:7 › Build Tab › description input is visible and accepts text (218ms)
+  ✘   8 [chromium] › tests/tab-build.spec.ts:23:7 › Build Tab › submit button is visible and enabled after input (245ms)
+  ✘   9 [chromium] › tests/tab-build.spec.ts:31:7 › Build Tab › deploy button is present (257ms)
+  ✘  10 [chromium] › tests/tab-build.spec.ts:35:7 › Build Tab › chat area is present for conversation (236ms)
+  ✘  11 [chromium] › tests/tab-dashboard.spec.ts:8:7 › Dashboard Tab › renders header with configured branding (226ms)
+  ✘  12 [chromium] › tests/tab-dashboard.spec.ts:16:7 › Dashboard Tab › shows all navigation items (252ms)
+  ✘  13 [chromium] › tests/tab-dashboard.spec.ts:24:7 › Dashboard Tab › displays agent activity metrics (228ms)
+  ✘  14 [chromium] › tests/tab-dashboard.spec.ts:33:7 › Dashboard Tab › shows agent performance table with live data (255ms)
+  ✘  15 [chromium] › tests/tab-dashboard.spec.ts:41:7 › Dashboard Tab › region selector shows us-east-1 (246ms)
+  ✘  16 [chromium] › tests/tab-dashboard.spec.ts:45:7 › Dashboard Tab › sidebar collapse/expand works (240ms)
+  ✘  17 [chromium] › tests/tab-tickets.spec.ts:8:7 › Ticket History Tab › renders ticket history page (239ms)
+  ✘  18 [chromium] › tests/tab-tickets.spec.ts:15:7 › Ticket History Tab › shows ticket table or list (224ms)
+  ✘  19 [chromium] › tests/tab-tickets.spec.ts:24:7 › Ticket History Tab › ticket entries show status information (226ms)
+  ✘  20 [chromium] › tests/tab-tickets.spec.ts:34:7 › Ticket History Tab › page responds to search or filter if available (206ms)
+  ✘  21 [chromium] › tests/tab-workflow.spec.ts:38:7 › Workflow Page — basics › page loads with sidebar and main area (239ms)
+  ✘  22 [chromium] › tests/tab-workflow.spec.ts:45:7 › Workflow Page — basics › workflow list loads from API (242ms)
+  ✘  23 [chromium] › tests/tab-workflow.spec.ts:54:7 › Workflow Page — basics › history sidebar toggle works (241ms)
+  ✘  24 [chromium] › tests/tab-workflow.spec.ts:90:7 › Workflow Page — intake form › clicking new opens intake form with all fields (234ms)
+  ✘  25 [chromium] › tests/tab-workflow.spec.ts:105:7 › Workflow Page — intake form › intake form accepts input and shows model selector (212ms)
+  ✘  26 [chromium] › tests/tab-workflow.spec.ts:149:7 › Workflow Page — selected workflow interactions › status header reflects phase (197ms)
+  ✘  27 [chromium] › tests/tab-workflow.spec.ts:157:7 › Workflow Page — selected workflow interactions › five phase boxes render (216ms)
+  ✘  28 [chromium] › tests/tab-workflow.spec.ts:163:7 › Workflow Page — selected workflow interactions › agent item click expands AgentOutputPanel (193ms)
+  ✘  29 [chromium] › tests/tab-workflow.spec.ts:182:7 › Workflow Page — selected workflow interactions › ticket pill click opens TicketDetailModal (198ms)
+  ✘  30 [chromium] › tests/tab-workflow.spec.ts:201:7 › Workflow Page — selected workflow interactions › S3 output click opens S3ArtifactsModal (188ms)
+  ✘  31 [chromium] › tests/tab-workflow.spec.ts:220:7 › Workflow Page — cancel flow › cancel button + modal flow on a fresh workflow (187ms)
+  ✘  32 [chromium] › tests/tab-workflow.spec.ts:287:7 › Workflow Page — replay scrubber › scrubber controls render for completed workflow with events (192ms)
+
+
+  1) [chromium] › tests/tab-agents.spec.ts:8:7 › Agents Tab › renders agents page ──────────────────
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/agents
+    Call log:
+    [2m  - navigating to "http://localhost:3000/agents", waiting until "load"[22m
+
+
+      3 | test.describe("Agents Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/agents");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders agents page", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-agents.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-agents-Agents-Tab-renders-agents-page-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-agents-Agents-Tab-renders-agents-page-chromium/error-context.md
+
+  2) [chromium] › tests/tab-agents.spec.ts:15:7 › Agents Tab › shows agent cards when discovery completes 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/agents
+    Call log:
+    [2m  - navigating to "http://localhost:3000/agents", waiting until "load"[22m
+
+
+      3 | test.describe("Agents Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/agents");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders agents page", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-agents.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-agents-Agents-Tab-show-dbad3-ds-when-discovery-completes-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-agents-Agents-Tab-show-dbad3-ds-when-discovery-completes-chromium/error-context.md
+
+  3) [chromium] › tests/tab-agents.spec.ts:32:7 › Agents Tab › agent card is clickable ─────────────
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/agents
+    Call log:
+    [2m  - navigating to "http://localhost:3000/agents", waiting until "load"[22m
+
+
+      3 | test.describe("Agents Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/agents");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders agents page", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-agents.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-agents-Agents-Tab-agent-card-is-clickable-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-agents-Agents-Tab-agent-card-is-clickable-chromium/error-context.md
+
+  4) [chromium] › tests/tab-agents.spec.ts:44:7 › Agents Tab › agent detail page shows chat interface 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/agents
+    Call log:
+    [2m  - navigating to "http://localhost:3000/agents", waiting until "load"[22m
+
+
+      3 | test.describe("Agents Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/agents");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders agents page", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-agents.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-agents-Agents-Tab-agent-detail-page-shows-chat-interface-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-agents-Agents-Tab-agent-detail-page-shows-chat-interface-chromium/error-context.md
+
+  5) [chromium] › tests/tab-build.spec.ts:8:7 › Build Tab › renders builder chat interface ─────────
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/build
+    Call log:
+    [2m  - navigating to "http://localhost:3000/build", waiting until "load"[22m
+
+
+      3 | test.describe("Build Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/build");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders builder chat interface", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-build.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-build-Build-Tab-renders-builder-chat-interface-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-build-Build-Tab-renders-builder-chat-interface-chromium/error-context.md
+
+  6) [chromium] › tests/tab-build.spec.ts:12:7 › Build Tab › shows harness mode indicator ──────────
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/build
+    Call log:
+    [2m  - navigating to "http://localhost:3000/build", waiting until "load"[22m
+
+
+      3 | test.describe("Build Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/build");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders builder chat interface", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-build.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-build-Build-Tab-shows-harness-mode-indicator-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-build-Build-Tab-shows-harness-mode-indicator-chromium/error-context.md
+
+  7) [chromium] › tests/tab-build.spec.ts:16:7 › Build Tab › description input is visible and accepts text 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/build
+    Call log:
+    [2m  - navigating to "http://localhost:3000/build", waiting until "load"[22m
+
+
+      3 | test.describe("Build Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/build");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders builder chat interface", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-build.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-build-Build-Tab-descri-1cb6b-is-visible-and-accepts-text-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-build-Build-Tab-descri-1cb6b-is-visible-and-accepts-text-chromium/error-context.md
+
+  8) [chromium] › tests/tab-build.spec.ts:23:7 › Build Tab › submit button is visible and enabled after input 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/build
+    Call log:
+    [2m  - navigating to "http://localhost:3000/build", waiting until "load"[22m
+
+
+      3 | test.describe("Build Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/build");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders builder chat interface", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-build.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-build-Build-Tab-submit-5e0d2-ble-and-enabled-after-input-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-build-Build-Tab-submit-5e0d2-ble-and-enabled-after-input-chromium/error-context.md
+
+  9) [chromium] › tests/tab-build.spec.ts:31:7 › Build Tab › deploy button is present ──────────────
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/build
+    Call log:
+    [2m  - navigating to "http://localhost:3000/build", waiting until "load"[22m
+
+
+      3 | test.describe("Build Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/build");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders builder chat interface", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-build.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-build-Build-Tab-deploy-button-is-present-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-build-Build-Tab-deploy-button-is-present-chromium/error-context.md
+
+  10) [chromium] › tests/tab-build.spec.ts:35:7 › Build Tab › chat area is present for conversation 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/build
+    Call log:
+    [2m  - navigating to "http://localhost:3000/build", waiting until "load"[22m
+
+
+      3 | test.describe("Build Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/build");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders builder chat interface", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-build.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-build-Build-Tab-chat-area-is-present-for-conversation-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-build-Build-Tab-chat-area-is-present-for-conversation-chromium/error-context.md
+
+  11) [chromium] › tests/tab-dashboard.spec.ts:8:7 › Dashboard Tab › renders header with configured branding 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/
+    Call log:
+    [2m  - navigating to "http://localhost:3000/", waiting until "load"[22m
+
+
+      3 | test.describe("Dashboard Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders header with configured branding", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-dashboard.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-dashboard-Dashboard-Ta-6be62-er-with-configured-branding-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-dashboard-Dashboard-Ta-6be62-er-with-configured-branding-chromium/error-context.md
+
+  12) [chromium] › tests/tab-dashboard.spec.ts:16:7 › Dashboard Tab › shows all navigation items ───
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/
+    Call log:
+    [2m  - navigating to "http://localhost:3000/", waiting until "load"[22m
+
+
+      3 | test.describe("Dashboard Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders header with configured branding", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-dashboard.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-dashboard-Dashboard-Tab-shows-all-navigation-items-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-dashboard-Dashboard-Tab-shows-all-navigation-items-chromium/error-context.md
+
+  13) [chromium] › tests/tab-dashboard.spec.ts:24:7 › Dashboard Tab › displays agent activity metrics 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/
+    Call log:
+    [2m  - navigating to "http://localhost:3000/", waiting until "load"[22m
+
+
+      3 | test.describe("Dashboard Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders header with configured branding", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-dashboard.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-dashboard-Dashboard-Tab-displays-agent-activity-metrics-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-dashboard-Dashboard-Tab-displays-agent-activity-metrics-chromium/error-context.md
+
+  14) [chromium] › tests/tab-dashboard.spec.ts:33:7 › Dashboard Tab › shows agent performance table with live data 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/
+    Call log:
+    [2m  - navigating to "http://localhost:3000/", waiting until "load"[22m
+
+
+      3 | test.describe("Dashboard Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders header with configured branding", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-dashboard.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-dashboard-Dashboard-Ta-a0a66-rmance-table-with-live-data-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-dashboard-Dashboard-Ta-a0a66-rmance-table-with-live-data-chromium/error-context.md
+
+  15) [chromium] › tests/tab-dashboard.spec.ts:41:7 › Dashboard Tab › region selector shows us-east-1 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/
+    Call log:
+    [2m  - navigating to "http://localhost:3000/", waiting until "load"[22m
+
+
+      3 | test.describe("Dashboard Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders header with configured branding", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-dashboard.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-dashboard-Dashboard-Tab-region-selector-shows-us-east-1-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-dashboard-Dashboard-Tab-region-selector-shows-us-east-1-chromium/error-context.md
+
+  16) [chromium] › tests/tab-dashboard.spec.ts:45:7 › Dashboard Tab › sidebar collapse/expand works 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/
+    Call log:
+    [2m  - navigating to "http://localhost:3000/", waiting until "load"[22m
+
+
+      3 | test.describe("Dashboard Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders header with configured branding", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-dashboard.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-dashboard-Dashboard-Tab-sidebar-collapse-expand-works-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-dashboard-Dashboard-Tab-sidebar-collapse-expand-works-chromium/error-context.md
+
+  17) [chromium] › tests/tab-tickets.spec.ts:8:7 › Ticket History Tab › renders ticket history page 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/tickets
+    Call log:
+    [2m  - navigating to "http://localhost:3000/tickets", waiting until "load"[22m
+
+
+      3 | test.describe("Ticket History Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/tickets");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders ticket history page", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-tickets.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-tickets-Ticket-History-Tab-renders-ticket-history-page-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-tickets-Ticket-History-Tab-renders-ticket-history-page-chromium/error-context.md
+
+  18) [chromium] › tests/tab-tickets.spec.ts:15:7 › Ticket History Tab › shows ticket table or list 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/tickets
+    Call log:
+    [2m  - navigating to "http://localhost:3000/tickets", waiting until "load"[22m
+
+
+      3 | test.describe("Ticket History Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/tickets");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders ticket history page", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-tickets.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-tickets-Ticket-History-Tab-shows-ticket-table-or-list-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-tickets-Ticket-History-Tab-shows-ticket-table-or-list-chromium/error-context.md
+
+  19) [chromium] › tests/tab-tickets.spec.ts:24:7 › Ticket History Tab › ticket entries show status information 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/tickets
+    Call log:
+    [2m  - navigating to "http://localhost:3000/tickets", waiting until "load"[22m
+
+
+      3 | test.describe("Ticket History Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/tickets");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders ticket history page", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-tickets.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-tickets-Ticket-History-59f55-ies-show-status-information-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-tickets-Ticket-History-59f55-ies-show-status-information-chromium/error-context.md
+
+  20) [chromium] › tests/tab-tickets.spec.ts:34:7 › Ticket History Tab › page responds to search or filter if available 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/tickets
+    Call log:
+    [2m  - navigating to "http://localhost:3000/tickets", waiting until "load"[22m
+
+
+      3 | test.describe("Ticket History Tab", () => {
+      4 |   test.beforeEach(async ({ page }) => {
+    > 5 |     await page.goto("/tickets");
+        |                ^
+      6 |   });
+      7 |
+      8 |   test("renders ticket history page", async ({ page }) => {
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-tickets.spec.ts:5:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-tickets-Ticket-History-d6177-arch-or-filter-if-available-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-tickets-Ticket-History-d6177-arch-or-filter-if-available-chromium/error-context.md
+
+  21) [chromium] › tests/tab-workflow.spec.ts:38:7 › Workflow Page — basics › page loads with sidebar and main area 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/workflow
+    Call log:
+    [2m  - navigating to "http://localhost:3000/workflow", waiting until "load"[22m
+
+
+      37 | test.describe("Workflow Page — basics", () => {
+      38 |   test("page loads with sidebar and main area", async ({ page }) => {
+    > 39 |     await page.goto("/workflow");
+         |                ^
+      40 |     await page.waitForLoadState("networkidle");
+      41 |     await expect(page.locator("body")).toContainText(/workflow|pipeline|new|history/i);
+      42 |     await page.screenshot({ path: `${SCREENSHOT_DIR}/01-page-loaded.png`, fullPage: true });
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:39:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-c0c40--with-sidebar-and-main-area-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-c0c40--with-sidebar-and-main-area-chromium/error-context.md
+
+  22) [chromium] › tests/tab-workflow.spec.ts:45:7 › Workflow Page — basics › workflow list loads from API 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/workflow
+    Call log:
+    [2m  - navigating to "http://localhost:3000/workflow", waiting until "load"[22m
+
+
+      44 |
+      45 |   test("workflow list loads from API", async ({ page }) => {
+    > 46 |     await page.goto("/workflow");
+         |                ^
+      47 |     const listRes = await page.request.get("/api/workflow/list");
+      48 |     expect(listRes.ok()).toBeTruthy();
+      49 |     const data = await listRes.json();
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:46:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-d27f9-orkflow-list-loads-from-API-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-d27f9-orkflow-list-loads-from-API-chromium/error-context.md
+
+  23) [chromium] › tests/tab-workflow.spec.ts:54:7 › Workflow Page — basics › history sidebar toggle works 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/workflow
+    Call log:
+    [2m  - navigating to "http://localhost:3000/workflow", waiting until "load"[22m
+
+
+      53 |
+      54 |   test("history sidebar toggle works", async ({ page }) => {
+    > 55 |     await page.goto("/workflow");
+         |                ^
+      56 |     await page.waitForLoadState("networkidle");
+      57 |     // Look for the chevron toggle near the sidebar
+      58 |     const toggleBtn = page.locator("button").filter({ has: page.locator("svg.lucide-chevron-left, svg.lucide-chevron-right") }).first();
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:55:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-07022-istory-sidebar-toggle-works-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-07022-istory-sidebar-toggle-works-chromium/error-context.md
+
+  24) [chromium] › tests/tab-workflow.spec.ts:90:7 › Workflow Page — intake form › clicking new opens intake form with all fields 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/workflow
+    Call log:
+    [2m  - navigating to "http://localhost:3000/workflow", waiting until "load"[22m
+
+
+      89 | test.describe("Workflow Page — intake form", () => {
+      90 |   test("clicking new opens intake form with all fields", async ({ page }) => {
+    > 91 |     await page.goto("/workflow");
+         |                ^
+      92 |     await page.waitForLoadState("networkidle");
+      93 |
+      94 |     await openIntakeForm(page);
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:91:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-25df9-intake-form-with-all-fields-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-25df9-intake-form-with-all-fields-chromium/error-context.md
+
+  25) [chromium] › tests/tab-workflow.spec.ts:105:7 › Workflow Page — intake form › intake form accepts input and shows model selector 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/workflow
+    Call log:
+    [2m  - navigating to "http://localhost:3000/workflow", waiting until "load"[22m
+
+
+      104 |
+      105 |   test("intake form accepts input and shows model selector", async ({ page }) => {
+    > 106 |     await page.goto("/workflow");
+          |                ^
+      107 |     await page.waitForLoadState("networkidle");
+      108 |
+      109 |     await openIntakeForm(page);
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:106:16
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-631c0-ut-and-shows-model-selector-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-631c0-ut-and-shows-model-selector-chromium/error-context.md
+
+  26) [chromium] › tests/tab-workflow.spec.ts:149:7 › Workflow Page — selected workflow interactions › status header reflects phase 
+
+    Error: apiRequestContext.get: connect ECONNREFUSED 127.0.0.1:3000
+    Call log:
+    [2m  - → GET http://localhost:3000/api/workflow/list[22m
+    [2m    - user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/148.0.7778.0 Safari/537.36[22m
+    [2m    - accept: */*[22m
+    [2m    - accept-encoding: gzip,deflate,br[22m
+
+
+      28 | // Helper: pick a recent completed workflow id for read-only interactions
+      29 | async function pickCompleteWorkflow(page: Page): Promise<string | null> {
+    > 30 |   const res = await page.request.get("/api/workflow/list");
+         |                                  ^
+      31 |   if (!res.ok()) return null;
+      32 |   const { workflows } = await res.json();
+      33 |   const complete = (workflows || []).find((w: { phase: string }) => w.phase === "complete");
+        at pickCompleteWorkflow (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:30:34)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:138:24
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-94245-tatus-header-reflects-phase-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-94245-tatus-header-reflects-phase-chromium/error-context.md
+
+  27) [chromium] › tests/tab-workflow.spec.ts:157:7 › Workflow Page — selected workflow interactions › five phase boxes render 
+
+    Error: apiRequestContext.get: connect ECONNREFUSED 127.0.0.1:3000
+    Call log:
+    [2m  - → GET http://localhost:3000/api/workflow/list[22m
+    [2m    - user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/148.0.7778.0 Safari/537.36[22m
+    [2m    - accept: */*[22m
+    [2m    - accept-encoding: gzip,deflate,br[22m
+
+
+      28 | // Helper: pick a recent completed workflow id for read-only interactions
+      29 | async function pickCompleteWorkflow(page: Page): Promise<string | null> {
+    > 30 |   const res = await page.request.get("/api/workflow/list");
+         |                                  ^
+      31 |   if (!res.ok()) return null;
+      32 |   const { workflows } = await res.json();
+      33 |   const complete = (workflows || []).find((w: { phase: string }) => w.phase === "complete");
+        at pickCompleteWorkflow (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:30:34)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:138:24
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-d8e78-ons-five-phase-boxes-render-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-d8e78-ons-five-phase-boxes-render-chromium/error-context.md
+
+  28) [chromium] › tests/tab-workflow.spec.ts:163:7 › Workflow Page — selected workflow interactions › agent item click expands AgentOutputPanel 
+
+    Error: apiRequestContext.get: connect ECONNREFUSED 127.0.0.1:3000
+    Call log:
+    [2m  - → GET http://localhost:3000/api/workflow/list[22m
+    [2m    - user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/148.0.7778.0 Safari/537.36[22m
+    [2m    - accept: */*[22m
+    [2m    - accept-encoding: gzip,deflate,br[22m
+
+
+      28 | // Helper: pick a recent completed workflow id for read-only interactions
+      29 | async function pickCompleteWorkflow(page: Page): Promise<string | null> {
+    > 30 |   const res = await page.request.get("/api/workflow/list");
+         |                                  ^
+      31 |   if (!res.ok()) return null;
+      32 |   const { workflows } = await res.json();
+      33 |   const complete = (workflows || []).find((w: { phase: string }) => w.phase === "complete");
+        at pickCompleteWorkflow (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:30:34)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:138:24
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-bbca2-ck-expands-AgentOutputPanel-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-bbca2-ck-expands-AgentOutputPanel-chromium/error-context.md
+
+  29) [chromium] › tests/tab-workflow.spec.ts:182:7 › Workflow Page — selected workflow interactions › ticket pill click opens TicketDetailModal 
+
+    Error: apiRequestContext.get: connect ECONNREFUSED 127.0.0.1:3000
+    Call log:
+    [2m  - → GET http://localhost:3000/api/workflow/list[22m
+    [2m    - user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/148.0.7778.0 Safari/537.36[22m
+    [2m    - accept: */*[22m
+    [2m    - accept-encoding: gzip,deflate,br[22m
+
+
+      28 | // Helper: pick a recent completed workflow id for read-only interactions
+      29 | async function pickCompleteWorkflow(page: Page): Promise<string | null> {
+    > 30 |   const res = await page.request.get("/api/workflow/list");
+         |                                  ^
+      31 |   if (!res.ok()) return null;
+      32 |   const { workflows } = await res.json();
+      33 |   const complete = (workflows || []).find((w: { phase: string }) => w.phase === "complete");
+        at pickCompleteWorkflow (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:30:34)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:138:24
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-2f99d-ick-opens-TicketDetailModal-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-2f99d-ick-opens-TicketDetailModal-chromium/error-context.md
+
+  30) [chromium] › tests/tab-workflow.spec.ts:201:7 › Workflow Page — selected workflow interactions › S3 output click opens S3ArtifactsModal 
+
+    Error: apiRequestContext.get: connect ECONNREFUSED 127.0.0.1:3000
+    Call log:
+    [2m  - → GET http://localhost:3000/api/workflow/list[22m
+    [2m    - user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/148.0.7778.0 Safari/537.36[22m
+    [2m    - accept: */*[22m
+    [2m    - accept-encoding: gzip,deflate,br[22m
+
+
+      28 | // Helper: pick a recent completed workflow id for read-only interactions
+      29 | async function pickCompleteWorkflow(page: Page): Promise<string | null> {
+    > 30 |   const res = await page.request.get("/api/workflow/list");
+         |                                  ^
+      31 |   if (!res.ok()) return null;
+      32 |   const { workflows } = await res.json();
+      33 |   const complete = (workflows || []).find((w: { phase: string }) => w.phase === "complete");
+        at pickCompleteWorkflow (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:30:34)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:138:24
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-546e2-lick-opens-S3ArtifactsModal-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-546e2-lick-opens-S3ArtifactsModal-chromium/error-context.md
+
+  31) [chromium] › tests/tab-workflow.spec.ts:220:7 › Workflow Page — cancel flow › cancel button + modal flow on a fresh workflow 
+
+    Error: apiRequestContext.post: connect ECONNREFUSED 127.0.0.1:3000
+    Call log:
+    [2m  - → POST http://localhost:3000/api/workflow/start[22m
+    [2m    - user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/148.0.7778.0 Safari/537.36[22m
+    [2m    - accept: */*[22m
+    [2m    - accept-encoding: gzip,deflate,br[22m
+    [2m    - content-type: application/json[22m
+    [2m    - content-length: 194[22m
+
+
+      223 |     // Create a new throwaway workflow to test cancel
+      224 |     // Payload must match WorkflowInput shape (top-level: title, description, repoConfig, sources)
+    > 225 |     const startRes = await page.request.post("/api/workflow/start", {
+          |                                         ^
+      226 |       data: {
+      227 |         title: "[E2E-CANCEL] Test cancel flow",
+      228 |         description: "Workflow created solely to test the cancel UI; will be cancelled immediately.",
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:225:41
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-57f66-al-flow-on-a-fresh-workflow-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-57f66-al-flow-on-a-fresh-workflow-chromium/error-context.md
+
+  32) [chromium] › tests/tab-workflow.spec.ts:287:7 › Workflow Page — replay scrubber › scrubber controls render for completed workflow with events 
+
+    Error: apiRequestContext.get: connect ECONNREFUSED 127.0.0.1:3000
+    Call log:
+    [2m  - → GET http://localhost:3000/api/workflow/list[22m
+    [2m    - user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/148.0.7778.0 Safari/537.36[22m
+    [2m    - accept: */*[22m
+    [2m    - accept-encoding: gzip,deflate,br[22m
+
+
+      28 | // Helper: pick a recent completed workflow id for read-only interactions
+      29 | async function pickCompleteWorkflow(page: Page): Promise<string | null> {
+    > 30 |   const res = await page.request.get("/api/workflow/list");
+         |                                  ^
+      31 |   if (!res.ok()) return null;
+      32 |   const { workflows } = await res.json();
+      33 |   const complete = (workflows || []).find((w: { phase: string }) => w.phase === "complete");
+        at pickCompleteWorkflow (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:30:34)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/tab-workflow.spec.ts:288:30
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-Workflow-Page-611d3-pleted-workflow-with-events-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-Workflow-Page-611d3-pleted-workflow-with-events-chromium/error-context.md
+
+  32 failed
+    [chromium] › tests/tab-agents.spec.ts:8:7 › Agents Tab › renders agents page ───────────────────
+    [chromium] › tests/tab-agents.spec.ts:15:7 › Agents Tab › shows agent cards when discovery completes 
+    [chromium] › tests/tab-agents.spec.ts:32:7 › Agents Tab › agent card is clickable ──────────────
+    [chromium] › tests/tab-agents.spec.ts:44:7 › Agents Tab › agent detail page shows chat interface 
+    [chromium] › tests/tab-build.spec.ts:8:7 › Build Tab › renders builder chat interface ──────────
+    [chromium] › tests/tab-build.spec.ts:12:7 › Build Tab › shows harness mode indicator ───────────
+    [chromium] › tests/tab-build.spec.ts:16:7 › Build Tab › description input is visible and accepts text 
+    [chromium] › tests/tab-build.spec.ts:23:7 › Build Tab › submit button is visible and enabled after input 
+    [chromium] › tests/tab-build.spec.ts:31:7 › Build Tab › deploy button is present ───────────────
+    [chromium] › tests/tab-build.spec.ts:35:7 › Build Tab › chat area is present for conversation ──
+    [chromium] › tests/tab-dashboard.spec.ts:8:7 › Dashboard Tab › renders header with configured branding 
+    [chromium] › tests/tab-dashboard.spec.ts:16:7 › Dashboard Tab › shows all navigation items ─────
+    [chromium] › tests/tab-dashboard.spec.ts:24:7 › Dashboard Tab › displays agent activity metrics 
+    [chromium] › tests/tab-dashboard.spec.ts:33:7 › Dashboard Tab › shows agent performance table with live data 
+    [chromium] › tests/tab-dashboard.spec.ts:41:7 › Dashboard Tab › region selector shows us-east-1 
+    [chromium] › tests/tab-dashboard.spec.ts:45:7 › Dashboard Tab › sidebar collapse/expand works ──
+    [chromium] › tests/tab-tickets.spec.ts:8:7 › Ticket History Tab › renders ticket history page ──
+    [chromium] › tests/tab-tickets.spec.ts:15:7 › Ticket History Tab › shows ticket table or list ──
+    [chromium] › tests/tab-tickets.spec.ts:24:7 › Ticket History Tab › ticket entries show status information 
+    [chromium] › tests/tab-tickets.spec.ts:34:7 › Ticket History Tab › page responds to search or filter if available 
+    [chromium] › tests/tab-workflow.spec.ts:38:7 › Workflow Page — basics › page loads with sidebar and main area 
+    [chromium] › tests/tab-workflow.spec.ts:45:7 › Workflow Page — basics › workflow list loads from API 
+    [chromium] › tests/tab-workflow.spec.ts:54:7 › Workflow Page — basics › history sidebar toggle works 
+    [chromium] › tests/tab-workflow.spec.ts:90:7 › Workflow Page — intake form › clicking new opens intake form with all fields 
+    [chromium] › tests/tab-workflow.spec.ts:105:7 › Workflow Page — intake form › intake form accepts input and shows model selector 
+    [chromium] › tests/tab-workflow.spec.ts:149:7 › Workflow Page — selected workflow interactions › status header reflects phase 
+    [chromium] › tests/tab-workflow.spec.ts:157:7 › Workflow Page — selected workflow interactions › five phase boxes render 
+    [chromium] › tests/tab-workflow.spec.ts:163:7 › Workflow Page — selected workflow interactions › agent item click expands AgentOutputPanel 
+    [chromium] › tests/tab-workflow.spec.ts:182:7 › Workflow Page — selected workflow interactions › ticket pill click opens TicketDetailModal 
+    [chromium] › tests/tab-workflow.spec.ts:201:7 › Workflow Page — selected workflow interactions › S3 output click opens S3ArtifactsModal 
+    [chromium] › tests/tab-workflow.spec.ts:220:7 › Workflow Page — cancel flow › cancel button + modal flow on a fresh workflow 
+    [chromium] › tests/tab-workflow.spec.ts:287:7 › Workflow Page — replay scrubber › scrubber controls render for completed workflow with events 

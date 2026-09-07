@@ -1,0 +1,40 @@
+  files: false,
+    files: true,
+  isFixFiles: undefined,
+  isReportFiles: true,
+  isUseTscFiles: undefined,
+    workspaces: {
+      'mcp/hub': { entry: [ 'src/index.ts' ], project: [ 'src/**/*.ts' ] }
+    files: 'error',
+  workspace: [ 'mcp/hub' ],
+  workspaces: []
+  files: true,
+[*] Parsed gitignore files
+{ gitignoreFiles: [ '.git/info/exclude', '.gitignore' ] }
+[*] Included workspaces
+[*] Included workspace configs
+      ignoreFiles: [],
+    name: 'mcp/hub',
+      ignoreFiles: [],
+    'vitest.{workspace,projects}.{js,mjs,ts,cjs,mts,cts,json}',
+  ignore: [ '**/node_modules', '.git/!(hooks)', 'mcp/hub/**' ],
+    'vitest.{workspace,projects}.{js,mjs,ts,cjs,mts,cts,json}',
+    '**/.local-workspace'
+    '**/.local-workspace',
+    'mcp/hub/**'
+    '**/.local-workspace',
+    'mcp/hub/**'
+    '/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/src/lib/workflow/workspace.ts',
+[mcp/hub] Finding entry paths from package.json
+    '/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/mcp/hub/src/index.{js,mjs,cjs,jsx,ts,tsx,mts,cts}'
+    '**/.local-workspace'
+    '/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/mcp/hub/src/index.ts'
+[mcp/hub] Source mapping (package.json) (1)
+  '/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/mcp/hub/src/index.ts'
+[mcp/hub] Enabled plugins
+[mcp/hub] Finding config file
+    'mcp/hub/package.json',
+    'mcp/hub/.eslintrc.{yml,yaml}',
+    'mcp/hub/.eslintrc.{js,json,cjs}',
+    'mcp/hub/.eslintrc',
+    'mcp/hub/eslint.config.{js,cjs,mjs,ts,cts,mts}'

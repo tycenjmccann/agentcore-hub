@@ -1,0 +1,30 @@
+Unused exports (19)
+DEFAULT_FILE_CAP_BYTES                mcp/hub/src/cloud-code/artifacts.ts:41:14 
+DEFAULT_TOTAL_CAP_BYTES               mcp/hub/src/cloud-code/artifacts.ts:42:14 
+DEFAULT_FILE_COUNT_CAP                mcp/hub/src/cloud-code/artifacts.ts:43:14 
+safeRelPath                 function  mcp/hub/src/cloud-code/artifacts.ts:370:17
+parseRepo                   function  mcp/hub/src/cloud-code/git.ts:53:17       
+normalizeCloneUrl           function  mcp/hub/src/cloud-code/git.ts:65:17       
+canPushToOrigin             function  mcp/hub/src/cloud-code/git.ts:106:23      
+slugForPath                 function  mcp/hub/src/cloud-code/transcript.ts:18:17
+projectDirFor               function  mcp/hub/src/cloud-code/transcript.ts:22:23
+localTranscriptPath         function  mcp/hub/src/cloud-code/transcript.ts:52:23
+RepoTargetSchema                      mcp/hub/src/workflow/schemas.ts:3:14      
+RepoConfigSchema                      mcp/hub/src/workflow/schemas.ts:10:14     
+IntakeSourceSchema                    mcp/hub/src/workflow/schemas.ts:31:14     
+ModelOverrideSchema                   mcp/hub/src/workflow/schemas.ts:49:14     
+PortedSessionSchema                   mcp/hub/src/workflow/schemas.ts:62:14     
+IntentBriefSchema                     mcp/hub/src/workflow/schemas.ts:73:14     
+WorkflowInputSchema                   mcp/hub/src/workflow/schemas.ts:82:14     
+RoutineScheduleSchema                 mcp/hub/src/workflow/schemas.ts:132:14    
+RoutineInputTemplateSchema            mcp/hub/src/workflow/schemas.ts:140:14    
+Unused exported types (5)
+ArtifactKind       type       mcp/hub/src/cloud-code/artifacts.ts:45:13 
+ArtifactCandidate  interface  mcp/hub/src/cloud-code/artifacts.ts:47:18 
+ServerCategory     type       mcp/hub/src/cloud-code/cli-config.ts:26:13
+ServerTransport    type       mcp/hub/src/cloud-code/cli-config.ts:27:13
+ClassifiedServer   interface  mcp/hub/src/cloud-code/cli-config.ts:36:18
+Duplicate exports (1)
+WorkflowInputSchema|SubmitWorkflowInputSchema  mcp/hub/src/workflow/schemas.ts
+Configuration hints (1)
+src/index.ts  mcp/hub  knip.json  Remove redundant entry pattern

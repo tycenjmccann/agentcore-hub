@@ -1,0 +1,246 @@
+Unused files (40)
+demo/playwright.config.ts                                         
+demo/playwright/playwright.config.ts                              
+demo/playwright/test-popup.spec.ts                                
+demo/playwright/test-s3-modal.spec.ts                             
+demo/playwright/v4/check-layout.spec.ts                           
+demo/playwright/v4/playwright-v4.config.ts                        
+demo/playwright/v4/record-demo-v4.spec.ts                         
+demo/playwright/v4/test-agent-streaming.spec.ts                   
+demo/playwright/v4/test-lambda-orchestration.spec.ts              
+demo/record.spec.ts                                               
+deploy/pipeline/bin/pipeline.ts                                   
+deploy/pipeline/harness-snapshot.mjs                              
+deploy/pipeline/lib/pipeline-stack.ts                             
+deploy/pipeline/restore-harness.mjs                               
+deploy/routine-builder/setup-routine-builder.mjs                  
+deploy/runtime-agent/healthcheck-fixtures/buggy-component.tsx     
+deploy/runtime-agent/healthcheck-fixtures/fixed-component.tsx     
+deploy/setup-builder-agent.mjs                                    
+deploy/setup-tickets-lambda.mjs                                   
+deploy/workflow-manager/setup-workflow-manager.mjs                
+evals/battery/fixtures/fix-null-session-crash-001/session-utils.ts
+evals/battery/fixtures/fix-pagination-offbyone-002/pagination.ts  
+evals/battery/fixtures/fix-race-condition-cas-003/store.ts        
+lambda/agentcore-hub-jira/index.test.mjs                          
+lambda/anomaly-watcher/detect.test.mjs                            
+lambda/anomaly-watcher/index.test.mjs                             
+lambda/builder-tools/index.mjs                                    
+lambda/cost-report/index.test.mjs                                 
+lambda/cost-report/pricing.test.mjs                               
+lambda/orchestrator/model-router.mjs                              
+lambda/orchestrator/model-router.test.mjs                         
+lambda/prd-submitter/index.mjs                                    
+lambda/routines-runner/index.mjs                                  
+lambda/routines-runner/index.test.mjs                             
+lambda/token-aggregator/index.mjs                                 
+lambda/workflow-analyzer/index.mjs                                
+scripts/backfill-workflow-tombstones.mjs                          
+scripts/migrate-default-identity.mjs                              
+src/components/workflow/PipelineVisualization.tsx                 
+src/lib/models/harness-models.ts                                  
+Unused devDependencies (2)
+depcheck  package.json:69:6
+ts-prune  package.json:75:6
+Unlisted dependencies (4)
+ajv/dist/2020              evals/battery/lib/cases.mjs:91:29           
+ajv/dist/2020              evals/battery/lint-fixtures.mjs:53:27       
+js-yaml                    lambda/anomaly-watcher/index.mjs:627:31     
+@smithy/node-http-handler  lambda/orchestrator/agent-invoker.mjs:150:11
+Unlisted binaries (2)
+script  deploy/lib/__tests__/check-eval-gate.test.ts
+setsid  deploy/lib/__tests__/check-eval-gate.test.ts
+Unused exports (123)
+PRICING_PER_MTOK                                          evals/battery/lib/agent-runner.mjs:22:14            
+MAX_TURNS                                                 evals/battery/lib/agent-runner.mjs:37:14            
+INFRA_RETRY_DELAY_MS                                      evals/battery/lib/agent-runner.mjs:85:14            
+PERSONA_EVALUATOR_ID                                      evals/battery/lib/cases.mjs:12:14                   
+batteryDir                                                evals/battery/lib/cases.mjs:15:14                   
+loadCaseValidator                               function  evals/battery/lib/cases.mjs:87:17                   
+loadBattery                                     function  evals/battery/lib/cases.mjs:100:17                  
+defaultGitShow                                  function  evals/battery/lib/cases.mjs:276:17                  
+MOCK_DEFAULT                                              evals/battery/lib/mock-transport.mjs:25:14          
+SENSITIVE_EVALUATORS                                      evals/battery/lib/mock-transport.mjs:28:14          
+GITHUB_OWNER_ALLOWLIST                                    evals/battery/lib/redact.mjs:14:14                  
+JUDGE_MAX_TOKENS                                          evals/battery/lib/scoring.mjs:19:14                 
+CUSTOM_EVALUATOR_ID                                       evals/battery/lib/scoring.mjs:21:14                 
+builtinInstruction                              function  evals/battery/lib/scoring.mjs:83:17                 
+HTTP_CONNECTION_TIMEOUT_MS                                evals/battery/lib/scoring.mjs:92:14                 
+HTTP_REQUEST_TIMEOUT_MS                                   evals/battery/lib/scoring.mjs:93:14                 
+SDK_MAX_ATTEMPTS                                          evals/battery/lib/scoring.mjs:94:14                 
+SCALE                                                     evals/battery/lib/thresholds.mjs:5:14               
+REWORK_FIX_KINDS              jiraCopy                    lambda/agentcore-hub-jira/fix-contract.mjs:72:14    
+SPAWN_ORIGIN_KEYS             jiraCopy                    lambda/agentcore-hub-jira/fix-contract.mjs:86:14    
+SPAWN_EXTRA_KEYS              jiraCopy                    lambda/agentcore-hub-jira/fix-contract.mjs:94:14    
+EVIDENCE_SOURCES              jiraCopy                    lambda/agentcore-hub-jira/fix-contract.mjs:100:14   
+CONTRACT_VERSION              jiraCopy                    lambda/agentcore-hub-jira/fix-contract.mjs:102:14   
+SYSTEM_LABEL_PREFIXES         jiraCopy                    lambda/agentcore-hub-jira/fix-contract.mjs:109:14   
+RESERVED_ADVISORY_LABEL       jiraCopy                    lambda/agentcore-hub-jira/fix-contract.mjs:138:14   
+parseFixContractBlock         jiraCopy          function  lambda/agentcore-hub-jira/fix-contract.mjs:395:17   
+advisoryIsReserved            jiraCopy          function  lambda/agentcore-hub-jira/fix-contract.mjs:506:17   
+FIX_KINDS                     ticketsCopy                 lambda/agentcore-hub-tickets/fix-contract.mjs:66:14 
+REWORK_FIX_KINDS              ticketsCopy                 lambda/agentcore-hub-tickets/fix-contract.mjs:72:14 
+KIND_TO_ORIGIN_KEY            ticketsCopy                 lambda/agentcore-hub-tickets/fix-contract.mjs:76:14 
+SPAWN_ORIGIN_KEYS             ticketsCopy                 lambda/agentcore-hub-tickets/fix-contract.mjs:86:14 
+SPAWN_EXTRA_KEYS              ticketsCopy                 lambda/agentcore-hub-tickets/fix-contract.mjs:94:14 
+EVIDENCE_SOURCES              ticketsCopy                 lambda/agentcore-hub-tickets/fix-contract.mjs:100:14
+CONTRACT_VERSION              ticketsCopy                 lambda/agentcore-hub-tickets/fix-contract.mjs:102:14
+SYSTEM_LABEL_PREFIXES         ticketsCopy                 lambda/agentcore-hub-tickets/fix-contract.mjs:109:14
+RESERVED_ADVISORY_LABEL       ticketsCopy                 lambda/agentcore-hub-tickets/fix-contract.mjs:138:14
+TICKET_KEY_RE                 ticketsCopy                 lambda/agentcore-hub-tickets/fix-contract.mjs:140:14
+renderFixContractBlock        ticketsCopy       function  lambda/agentcore-hub-tickets/fix-contract.mjs:347:17
+parseFixContractBlock         ticketsCopy       function  lambda/agentcore-hub-tickets/fix-contract.mjs:395:17
+contractLabels                ticketsCopy       function  lambda/agentcore-hub-tickets/fix-contract.mjs:482:17
+advisoryIsReserved            ticketsCopy       function  lambda/agentcore-hub-tickets/fix-contract.mjs:506:17
+escapeJql                     ticketsCopy       function  lambda/agentcore-hub-tickets/fix-contract.mjs:574:17
+VERIFIED_EVENT_TYPES                                      lambda/anomaly-watcher/bands-schema.mjs:28:14       
+MAX_OPEN_PAIRS                                            lambda/anomaly-watcher/detect.mjs:30:14             
+MAX_CONTRIBUTORS                                          lambda/anomaly-watcher/detect.mjs:32:14             
+hourBucket                                      function  lambda/anomaly-watcher/detect.mjs:75:17             
+ARTIFACT_CHAIN_GATE_MODES                                 lambda/orchestrator/artifact-chain.mjs:19:14        
+CODE_REVIEWER_AGENT                                       lambda/orchestrator/artifact-chain.mjs:72:14        
+PLAN_TICKET_TITLE                                         lambda/orchestrator/artifact-chain.mjs:73:14        
+hasCascadeActivity                              function  lambda/orchestrator/cascade.mjs:685:17              
+emitCascadeMetrics                              function  lambda/orchestrator/cascade.mjs:700:17              
+emitMetrics                                     function  lambda/orchestrator/dead-session-detector.mjs:560:17
+FIX_KINDS                     orchestratorCopy            lambda/orchestrator/fix-contract.mjs:66:14          
+REWORK_FIX_KINDS              orchestratorCopy            lambda/orchestrator/fix-contract.mjs:72:14          
+SPAWN_ORIGIN_KEYS             orchestratorCopy            lambda/orchestrator/fix-contract.mjs:86:14          
+SPAWN_EXTRA_KEYS              orchestratorCopy            lambda/orchestrator/fix-contract.mjs:94:14          
+EVIDENCE_SOURCES              orchestratorCopy            lambda/orchestrator/fix-contract.mjs:100:14         
+CONTRACT_VERSION              orchestratorCopy            lambda/orchestrator/fix-contract.mjs:102:14         
+SYSTEM_LABEL_PREFIXES         orchestratorCopy            lambda/orchestrator/fix-contract.mjs:109:14         
+RESERVED_ADVISORY_LABEL       orchestratorCopy            lambda/orchestrator/fix-contract.mjs:138:14         
+normalizeContractMode         orchestratorCopy  function  lambda/orchestrator/fix-contract.mjs:173:17         
+contractLabels                orchestratorCopy  function  lambda/orchestrator/fix-contract.mjs:482:17         
+advisoryIsReserved            orchestratorCopy  function  lambda/orchestrator/fix-contract.mjs:506:17         
+sanitizeUserLabels            orchestratorCopy  function  lambda/orchestrator/fix-contract.mjs:526:17         
+escapeJql                     orchestratorCopy  function  lambda/orchestrator/fix-contract.mjs:574:17         
+emitReconcileMetrics                            function  lambda/orchestrator/reconcile-sweep.mjs:255:17      
+checkRepoConfig                                 function  lambda/orchestrator/repo-check.mjs:100:23           
+emitReviewCapMetrics                            function  lambda/orchestrator/review-cap.mjs:396:17           
+emitReviewCapFailOpenMetrics                    function  lambda/orchestrator/review-cap.mjs:435:17           
+MAX_SYNC_FIX_ROUNDS                                       lambda/orchestrator/sync-main.mjs:102:14            
+_getWatchdogSource                              function  lambda/orchestrator/watchdog.mjs:45:17              
+DEFAULT_FILE_CAP_BYTES                                    mcp/hub/src/cloud-code/artifacts.ts:41:14           
+DEFAULT_TOTAL_CAP_BYTES                                   mcp/hub/src/cloud-code/artifacts.ts:42:14           
+DEFAULT_FILE_COUNT_CAP                                    mcp/hub/src/cloud-code/artifacts.ts:43:14           
+safeRelPath                                     function  mcp/hub/src/cloud-code/artifacts.ts:370:17          
+parseRepo                                       function  mcp/hub/src/cloud-code/git.ts:53:17                 
+normalizeCloneUrl                               function  mcp/hub/src/cloud-code/git.ts:65:17                 
+canPushToOrigin                                 function  mcp/hub/src/cloud-code/git.ts:106:23                
+slugForPath                                     function  mcp/hub/src/cloud-code/transcript.ts:18:17          
+projectDirFor                                   function  mcp/hub/src/cloud-code/transcript.ts:22:23          
+localTranscriptPath                             function  mcp/hub/src/cloud-code/transcript.ts:52:23          
+RepoTargetSchema                                          mcp/hub/src/workflow/schemas.ts:3:14                
+RepoConfigSchema                                          mcp/hub/src/workflow/schemas.ts:10:14               
+IntakeSourceSchema                                        mcp/hub/src/workflow/schemas.ts:31:14               
+ModelOverrideSchema                                       mcp/hub/src/workflow/schemas.ts:49:14               
+PortedSessionSchema                                       mcp/hub/src/workflow/schemas.ts:62:14               
+IntentBriefSchema                                         mcp/hub/src/workflow/schemas.ts:73:14               
+WorkflowInputSchema                                       mcp/hub/src/workflow/schemas.ts:82:14               
+RoutineScheduleSchema                                     mcp/hub/src/workflow/schemas.ts:132:14              
+RoutineInputTemplateSchema                                mcp/hub/src/workflow/schemas.ts:140:14              
+CLI_BRAND                                                 src/components/cloud-code/CliBrand.tsx:9:14         
+getMemoryMapping                                function  src/lib/agentcore-sdk.ts:94:17                      
+getLogsClient                                   function  src/lib/agentcore-sdk.ts:141:17                     
+authDisabled                                    function  src/lib/auth/identity.ts:50:17                      
+authMode                                        function  src/lib/auth/resolver.ts:14:17                      
+CD_REGISTRY_KEY                                           src/lib/cd-registry.ts:46:14                        
+invalidateCache                                 function  src/lib/client-cache.ts:75:17                       
+DEFAULT_SCOPE                                             src/lib/cloud-code/config-store.ts:47:14            
+secretIdFor                                     function  src/lib/connectors/secrets.ts:17:17                 
+readRegistry                                    function  src/lib/connectors/store.ts:23:23                   
+TOOL_ICON_MAP                                             src/lib/pipeline-config.ts:83:14                    
+PHASE_DISPLAY_META                                        src/lib/pipeline-config.ts:126:14                   
+PIPELINE_PHASES                                           src/lib/pipeline-config.ts:447:14                   
+scheduleNameFor                                 function  src/lib/routines/schedule.ts:40:17                  
+DEFAULT_USER_ID                                           src/lib/routines/store.ts:23:10                     
+DEFAULT_TENANT_ID                                         src/lib/routines/store.ts:23:27                     
+getRoutine                                      function  src/lib/routines/store.ts:37:23                     
+formatDuration                                  function  src/lib/utils.ts:8:17                               
+truncate                                        function  src/lib/utils.ts:15:17                              
+redactUrl                                                 src/lib/workflow/intake.ts:19:10                    
+JIRA_STATUS_TO_INTERNAL                                   src/lib/workflow/jira-client.ts:11:14               
+INTERNAL_STATUS_TO_JIRA                                   src/lib/workflow/jira-client.ts:25:14               
+FLEET_KPIS                                                src/lib/workflow/performance.ts:83:14               
+BASELINE_DAYS                                             src/lib/workflow/performance.ts:101:14              
+BASELINE_MIN                                              src/lib/workflow/performance.ts:102:14              
+quantile                                        function  src/lib/workflow/performance.ts:113:17              
+getPath                                         function  src/lib/workflow/performance.ts:154:17              
+isValidCard                                     function  src/lib/workflow/performance.ts:217:17              
+loadRoster                                      function  src/lib/workflow/roster-loader.ts:22:23             
+INTAKE_SOURCE_TYPES                                       src/lib/workflow/source-shape.ts:29:14              
+sdlcFrameworkForDef                             function  src/lib/workflow/workflow-defs.ts:280:17            
+isHumanAssignee                                 function  src/lib/workflow/workflow-defs.ts:285:17            
+writeArtifact                                   function  src/lib/workflow/workspace.ts:36:23                 
+Unused exported types (63)
+ArtifactKind            type       mcp/hub/src/cloud-code/artifacts.ts:45:13        
+ArtifactCandidate       interface  mcp/hub/src/cloud-code/artifacts.ts:47:18        
+ServerCategory          type       mcp/hub/src/cloud-code/cli-config.ts:26:13       
+ServerTransport         type       mcp/hub/src/cloud-code/cli-config.ts:27:13       
+ClassifiedServer        interface  mcp/hub/src/cloud-code/cli-config.ts:36:18       
+StreamStatus            type       src/components/workflow/useWorkflowStream.ts:6:13
+ModuleId                type       src/config/modules.ts:28:13                      
+RegistryAuthorizerType  type       src/lib/agentcore-sdk.ts:910:13                  
+ConnectorStatus         type       src/lib/connectors/types.ts:33:13                
+PipelinePhaseId         type       src/lib/pipeline-config.ts:93:13                 
+PipelineIdentityItem    interface  src/lib/pipeline-config.ts:99:18                 
+PipelineConfigItem      interface  src/lib/pipeline-config.ts:104:18                
+PipelineDisplayItem     interface  src/lib/pipeline-config.ts:109:18                
+PipelineAgentConfig     interface  src/lib/pipeline-config.ts:244:18                
+CiBuildSummary          interface  src/lib/pipeline/status.ts:23:18                 
+StageState              interface  src/lib/pipeline/status.ts:32:18                 
+RoutineRepoConfig       interface  src/lib/routines/types.ts:19:18                  
+RoutineLastRun          interface  src/lib/routines/types.ts:48:18                  
+AnalysisTrigger         type       src/lib/workflow/analysis-types.ts:13:13         
+FindingKind             type       src/lib/workflow/analysis-types.ts:19:13         
+FindingSeverity         type       src/lib/workflow/analysis-types.ts:20:13         
+RecommendationPriority  type       src/lib/workflow/analysis-types.ts:21:13         
+RecommendationType      type       src/lib/workflow/analysis-types.ts:22:13         
+PhaseMetric             interface  src/lib/workflow/analysis-types.ts:29:18         
+AgentTaskMetric         interface  src/lib/workflow/analysis-types.ts:37:18         
+HumanReviewMetric       interface  src/lib/workflow/analysis-types.ts:48:18         
+FixTicketEntry          interface  src/lib/workflow/analysis-types.ts:67:18         
+ChangeRequestCycle      interface  src/lib/workflow/analysis-types.ts:84:18         
+ManagerIntervention     interface  src/lib/workflow/analysis-types.ts:91:18         
+WorkflowMetrics         interface  src/lib/workflow/analysis-types.ts:98:18         
+AnalysisScores          interface  src/lib/workflow/analysis-types.ts:139:18        
+AnalysisTrend           interface  src/lib/workflow/analysis-types.ts:165:18        
+WorkflowCommand         interface  src/lib/workflow/command-queue.ts:23:18          
+CompletionRecord        interface  src/lib/workflow/completion-evidence.ts:21:18    
+SourceOutcome           type       src/lib/workflow/intake.ts:75:13                 
+LookupImpl              type       src/lib/workflow/intake.ts:104:13                
+ModelProvider           type       src/lib/workflow/model-config.ts:18:13           
+ModelOptionBase         interface  src/lib/workflow/model-config.ts:26:18           
+BedrockModelOption      interface  src/lib/workflow/model-config.ts:44:18           
+OpenAIModelOption       interface  src/lib/workflow/model-config.ts:52:18           
+InfraSnapshot           interface  src/lib/workflow/performance.ts:45:18            
+KpiDef                  interface  src/lib/workflow/performance.ts:70:18            
+KpiStat                 interface  src/lib/workflow/performance.ts:161:18           
+AgentAgg                interface  src/lib/workflow/performance.ts:174:18           
+RosterAgent             interface  src/lib/workflow/roster-loader.ts:12:18          
+ShipFindingLike         interface  src/lib/workflow/ship-review.ts:18:18            
+FixContract             interface  src/lib/workflow/types.ts:106:18                 
+AgentPhase              type       src/lib/workflow/types.ts:134:13                 
+WorkflowPhase           type       src/lib/workflow/types.ts:153:13                 
+StoredEvent             interface  src/lib/workflow/types.ts:217:18                 
+WorkflowType            type       src/lib/workflow/types.ts:222:13                 
+RepoTarget              interface  src/lib/workflow/types.ts:281:18                 
+MessageType             type       src/lib/workflow/types.ts:290:13                 
+AgentMessage            interface  src/lib/workflow/types.ts:292:18                 
+IntakeSourceType        type       src/lib/workflow/types.ts:304:13                 
+PortedSession           interface  src/lib/workflow/types.ts:412:18                 
+NotificationType        type       src/lib/workflow/types.ts:427:13                 
+ReviewPackageLink       interface  src/lib/workflow/types.ts:436:18                 
+WorkflowPhaseType       type       src/lib/workflow/workflow-defs.ts:20:13          
+WorkflowDefPhase        interface  src/lib/workflow/workflow-defs.ts:22:18          
+ArtifactChainEntry      interface  src/lib/workflow/workflow-defs.ts:92:18          
+ArtifactChain           interface  src/lib/workflow/workflow-defs.ts:109:18         
+FrameworkOverlay        interface  src/lib/workflow/workflow-defs.ts:126:18         
+Duplicate exports (1)
+WorkflowInputSchema|SubmitWorkflowInputSchema  mcp/hub/src/workflow/schemas.ts
+Configuration hints (3)
+[src/app/**/page.tsx, …]           knip.json  Remove, or move unused top-level entry to one of "workspaces"  
+[src/**/*.{ts,tsx}, …]             knip.json  Remove, or move unused top-level project to one of "workspaces"
+src/index.ts              mcp/hub  knip.json  Remove redundant entry pattern                                 

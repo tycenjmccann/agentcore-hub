@@ -1,0 +1,244 @@
+RUN 14a playwright-install: npx playwright install chromium
+Downloading Chrome for Testing 148.0.7778.96 (playwright chromium v1223)[2m from https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/1223/chromium-linux-arm64.zip[22m
+|                                                                                |   0% of 185.7 MiB
+|■■■■■■■■                                                                        |  10% of 185.7 MiB
+|■■■■■■■■■■■■■■■■                                                                |  20% of 185.7 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■                                                        |  30% of 185.7 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                                |  40% of 185.7 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                        |  50% of 185.7 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                |  60% of 185.7 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                        |  70% of 185.7 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                |  80% of 185.7 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■        |  90% of 185.7 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■| 100% of 185.7 MiB
+Chrome for Testing 148.0.7778.96 (playwright chromium v1223) downloaded to /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium-1223
+Downloading FFmpeg (playwright ffmpeg v1011)[2m from https://cdn.playwright.dev/dbazure/download/playwright/builds/ffmpeg/1011/ffmpeg-linux-arm64.zip[22m
+|                                                                                |   0% of 1.6 MiB
+|■■■■■■■■                                                                        |  10% of 1.6 MiB
+|■■■■■■■■■■■■■■■■                                                                |  20% of 1.6 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■                                                        |  30% of 1.6 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                                |  40% of 1.6 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                        |  50% of 1.6 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                |  60% of 1.6 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                        |  70% of 1.6 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                |  80% of 1.6 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■        |  90% of 1.6 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■| 100% of 1.6 MiB
+FFmpeg (playwright ffmpeg v1011) downloaded to /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/ffmpeg-1011
+Downloading Chrome Headless Shell 148.0.7778.96 (playwright chromium-headless-shell v1223)[2m from https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/1223/chromium-headless-shell-linux-arm64.zip[22m
+|                                                                                |   0% of 109.4 MiB
+|■■■■■■■■                                                                        |  10% of 109.4 MiB
+|■■■■■■■■■■■■■■■■                                                                |  20% of 109.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■                                                        |  30% of 109.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                                |  40% of 109.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                        |  50% of 109.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                |  60% of 109.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                        |  70% of 109.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                |  80% of 109.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■        |  90% of 109.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■| 100% of 109.4 MiB
+Chrome Headless Shell 148.0.7778.96 (playwright chromium-headless-shell v1223) downloaded to /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223
+
+RUN 14b server: PORT=3737 npm run start -- -p 3737
+server_pid=12635
+{"status":"ok","timestamp":"2026-09-07T11:30:17.248Z","uptime":5.963076625}
+server_ready_exit=0 after_seconds=2
+/ 200 curl_exit=0
+/workflow 200 curl_exit=0
+/cloud-code 200 curl_exit=0
+/registry 200 curl_exit=0
+/agents 200 curl_exit=0
+/pipeline 200 curl_exit=0
+/api/pipeline/status 200 curl_exit=0
+/api/workflow/cd-registry 200 curl_exit=0
+/api/workflow/list 500 curl_exit=0
+
+RUN 14c test-cloud-code: npm run test:cloud-code
+
+> agentcore-hub@1.0.0 test:cloud-code
+> playwright test tests/cloud-code-ui.spec.ts
+
+
+Running 7 tests using 1 worker
+
+  ✘  1 [chromium] › tests/cloud-code-ui.spec.ts:99:7 › Cloud Code UI (mocked) › composer swaps mic ⇄ send by draft content (345ms)
+  ✘  2 [chromium] › tests/cloud-code-ui.spec.ts:117:7 › Cloud Code UI (mocked) › send → stop button appears mid-stream, then clears on stop (293ms)
+  ✘  3 [chromium] › tests/cloud-code-ui.spec.ts:167:7 › Cloud Code UI (mocked) › Artifacts tab renders the gallery from the list payload (258ms)
+  ✘  4 [chromium] › tests/cloud-code-ui.spec.ts:194:7 › Cloud Code UI (mocked) › Artifacts tab shows the empty state with no artifacts (279ms)
+  ✘  5 [chromium] › tests/cloud-code-ui.spec.ts:204:7 › Cloud Code UI (mocked) › pull-to-laptop button copies the exact MCP slash command (276ms)
+  ✘  6 [chromium] › tests/cloud-code-ui.spec.ts:215:7 › Cloud Code UI (mocked) › GitHub section: Connect when app configured but not connected (281ms)
+  ✘  7 [chromium] › tests/cloud-code-ui.spec.ts:226:7 › Cloud Code UI (mocked) › GitHub section: shows account + Disconnect when connected (260ms)
+
+
+  1) [chromium] › tests/cloud-code-ui.spec.ts:99:7 › Cloud Code UI (mocked) › composer swaps mic ⇄ send by draft content 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/cloud-code
+    Call log:
+    [2m  - navigating to "http://localhost:3000/cloud-code", waiting until "load"[22m
+
+
+      87 |
+      88 | async function openSession(page: Page) {
+    > 89 |   await page.goto("/cloud-code");
+         |              ^
+      90 |   await page.getByTestId("cc-session-row").first().click();
+      91 |   await expect(page.getByTestId("cc-message-input")).toBeVisible({ timeout: 10_000 });
+      92 | }
+        at openSession (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:89:14)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:101:11
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-code-ui-Cloud-Code-U-11998-mic-⇄-send-by-draft-content-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-11998-mic-⇄-send-by-draft-content-chromium/error-context.md
+
+  2) [chromium] › tests/cloud-code-ui.spec.ts:117:7 › Cloud Code UI (mocked) › send → stop button appears mid-stream, then clears on stop 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/cloud-code
+    Call log:
+    [2m  - navigating to "http://localhost:3000/cloud-code", waiting until "load"[22m
+
+
+      87 |
+      88 | async function openSession(page: Page) {
+    > 89 |   await page.goto("/cloud-code");
+         |              ^
+      90 |   await page.getByTestId("cc-session-row").first().click();
+      91 |   await expect(page.getByTestId("cc-message-input")).toBeVisible({ timeout: 10_000 });
+      92 | }
+        at openSession (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:89:14)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:152:11
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-code-ui-Cloud-Code-U-f4dda--stream-then-clears-on-stop-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-f4dda--stream-then-clears-on-stop-chromium/error-context.md
+
+  3) [chromium] › tests/cloud-code-ui.spec.ts:167:7 › Cloud Code UI (mocked) › Artifacts tab renders the gallery from the list payload 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/cloud-code
+    Call log:
+    [2m  - navigating to "http://localhost:3000/cloud-code", waiting until "load"[22m
+
+
+      87 |
+      88 | async function openSession(page: Page) {
+    > 89 |   await page.goto("/cloud-code");
+         |              ^
+      90 |   await page.getByTestId("cc-session-row").first().click();
+      91 |   await expect(page.getByTestId("cc-message-input")).toBeVisible({ timeout: 10_000 });
+      92 | }
+        at openSession (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:89:14)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:185:11
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-code-ui-Cloud-Code-U-198e9-llery-from-the-list-payload-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-198e9-llery-from-the-list-payload-chromium/error-context.md
+
+  4) [chromium] › tests/cloud-code-ui.spec.ts:194:7 › Cloud Code UI (mocked) › Artifacts tab shows the empty state with no artifacts 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/cloud-code
+    Call log:
+    [2m  - navigating to "http://localhost:3000/cloud-code", waiting until "load"[22m
+
+
+      87 |
+      88 | async function openSession(page: Page) {
+    > 89 |   await page.goto("/cloud-code");
+         |              ^
+      90 |   await page.getByTestId("cc-session-row").first().click();
+      91 |   await expect(page.getByTestId("cc-message-input")).toBeVisible({ timeout: 10_000 });
+      92 | }
+        at openSession (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:89:14)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:199:11
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-code-ui-Cloud-Code-U-57412-pty-state-with-no-artifacts-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-57412-pty-state-with-no-artifacts-chromium/error-context.md
+
+  5) [chromium] › tests/cloud-code-ui.spec.ts:204:7 › Cloud Code UI (mocked) › pull-to-laptop button copies the exact MCP slash command 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/cloud-code
+    Call log:
+    [2m  - navigating to "http://localhost:3000/cloud-code", waiting until "load"[22m
+
+
+      87 |
+      88 | async function openSession(page: Page) {
+    > 89 |   await page.goto("/cloud-code");
+         |              ^
+      90 |   await page.getByTestId("cc-session-row").first().click();
+      91 |   await expect(page.getByTestId("cc-message-input")).toBeVisible({ timeout: 10_000 });
+      92 | }
+        at openSession (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:89:14)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:207:11
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-code-ui-Cloud-Code-U-a56aa-the-exact-MCP-slash-command-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-a56aa-the-exact-MCP-slash-command-chromium/error-context.md
+
+  6) [chromium] › tests/cloud-code-ui.spec.ts:215:7 › Cloud Code UI (mocked) › GitHub section: Connect when app configured but not connected 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/cloud-code
+    Call log:
+    [2m  - navigating to "http://localhost:3000/cloud-code", waiting until "load"[22m
+
+
+      87 |
+      88 | async function openSession(page: Page) {
+    > 89 |   await page.goto("/cloud-code");
+         |              ^
+      90 |   await page.getByTestId("cc-session-row").first().click();
+      91 |   await expect(page.getByTestId("cc-message-input")).toBeVisible({ timeout: 10_000 });
+      92 | }
+        at openSession (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:89:14)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:217:11
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-code-ui-Cloud-Code-U-32317-onfigured-but-not-connected-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-32317-onfigured-but-not-connected-chromium/error-context.md
+
+  7) [chromium] › tests/cloud-code-ui.spec.ts:226:7 › Cloud Code UI (mocked) › GitHub section: shows account + Disconnect when connected 
+
+    Error: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/cloud-code
+    Call log:
+    [2m  - navigating to "http://localhost:3000/cloud-code", waiting until "load"[22m
+
+
+      87 |
+      88 | async function openSession(page: Page) {
+    > 89 |   await page.goto("/cloud-code");
+         |              ^
+      90 |   await page.getByTestId("cc-session-row").first().click();
+      91 |   await expect(page.getByTestId("cc-message-input")).toBeVisible({ timeout: 10_000 });
+      92 | }
+        at openSession (/mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:89:14)
+        at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/tests/cloud-code-ui.spec.ts:243:11
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-code-ui-Cloud-Code-U-e08f9-t-Disconnect-when-connected-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-e08f9-t-Disconnect-when-connected-chromium/error-context.md
+
+  7 failed
+    [chromium] › tests/cloud-code-ui.spec.ts:99:7 › Cloud Code UI (mocked) › composer swaps mic ⇄ send by draft content 
+    [chromium] › tests/cloud-code-ui.spec.ts:117:7 › Cloud Code UI (mocked) › send → stop button appears mid-stream, then clears on stop 
+    [chromium] › tests/cloud-code-ui.spec.ts:167:7 › Cloud Code UI (mocked) › Artifacts tab renders the gallery from the list payload 
+    [chromium] › tests/cloud-code-ui.spec.ts:194:7 › Cloud Code UI (mocked) › Artifacts tab shows the empty state with no artifacts 
+    [chromium] › tests/cloud-code-ui.spec.ts:204:7 › Cloud Code UI (mocked) › pull-to-laptop button copies the exact MCP slash command 
+    [chromium] › tests/cloud-code-ui.spec.ts:215:7 › Cloud Code UI (mocked) › GitHub section: Connect when app configured but not connected 
+    [chromium] › tests/cloud-code-ui.spec.ts:226:7 › Cloud Code UI (mocked) › GitHub section: shows account + Disconnect when connected 
+
+RUN 14d module-error-grep
+Terminated

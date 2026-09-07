@@ -1,0 +1,526 @@
+RUN 16 test-full: timeout 600 npm run test:full
+
+> agentcore-hub@1.0.0 test:full
+> ./tests/run-all.sh --full
+
+=== AgentCore Hub Playwright Test Suite ===
+
+--- Running Tab Tests (UI validation) ---
+
+Running 32 tests using 1 worker
+
+  ✘   1 [chromium] › tests/tab-agents.spec.ts:8:7 › Agents Tab › renders agents page (5ms)
+  ✘   2 [chromium] › tests/tab-agents.spec.ts:15:7 › Agents Tab › shows agent cards when discovery completes (6ms)
+  ✘   3 [chromium] › tests/tab-agents.spec.ts:32:7 › Agents Tab › agent card is clickable (6ms)
+  ✘   4 [chromium] › tests/tab-agents.spec.ts:44:7 › Agents Tab › agent detail page shows chat interface (5ms)
+  ✘   5 [chromium] › tests/tab-build.spec.ts:8:7 › Build Tab › renders builder chat interface (6ms)
+  ✘   6 [chromium] › tests/tab-build.spec.ts:12:7 › Build Tab › shows harness mode indicator (6ms)
+  ✘   7 [chromium] › tests/tab-build.spec.ts:16:7 › Build Tab › description input is visible and accepts text (6ms)
+  ✘   8 [chromium] › tests/tab-build.spec.ts:23:7 › Build Tab › submit button is visible and enabled after input (5ms)
+  ✘   9 [chromium] › tests/tab-build.spec.ts:31:7 › Build Tab › deploy button is present (5ms)
+  ✘  10 [chromium] › tests/tab-build.spec.ts:35:7 › Build Tab › chat area is present for conversation (5ms)
+  ✘  11 [chromium] › tests/tab-dashboard.spec.ts:8:7 › Dashboard Tab › renders header with configured branding (5ms)
+  ✘  12 [chromium] › tests/tab-dashboard.spec.ts:16:7 › Dashboard Tab › shows all navigation items (5ms)
+  ✘  13 [chromium] › tests/tab-dashboard.spec.ts:24:7 › Dashboard Tab › displays agent activity metrics (5ms)
+  ✘  14 [chromium] › tests/tab-dashboard.spec.ts:33:7 › Dashboard Tab › shows agent performance table with live data (5ms)
+  ✘  15 [chromium] › tests/tab-dashboard.spec.ts:41:7 › Dashboard Tab › region selector shows us-east-1 (5ms)
+  ✘  16 [chromium] › tests/tab-dashboard.spec.ts:45:7 › Dashboard Tab › sidebar collapse/expand works (5ms)
+  ✘  17 [chromium] › tests/tab-tickets.spec.ts:8:7 › Ticket History Tab › renders ticket history page (5ms)
+  ✘  18 [chromium] › tests/tab-tickets.spec.ts:15:7 › Ticket History Tab › shows ticket table or list (6ms)
+  ✘  19 [chromium] › tests/tab-tickets.spec.ts:24:7 › Ticket History Tab › ticket entries show status information (5ms)
+  ✘  20 [chromium] › tests/tab-tickets.spec.ts:34:7 › Ticket History Tab › page responds to search or filter if available (5ms)
+  ✘  21 [chromium] › tests/tab-workflow.spec.ts:38:7 › Workflow Page — basics › page loads with sidebar and main area (5ms)
+  ✘  22 [chromium] › tests/tab-workflow.spec.ts:45:7 › Workflow Page — basics › workflow list loads from API (5ms)
+  ✘  23 [chromium] › tests/tab-workflow.spec.ts:54:7 › Workflow Page — basics › history sidebar toggle works (5ms)
+  ✘  24 [chromium] › tests/tab-workflow.spec.ts:90:7 › Workflow Page — intake form › clicking new opens intake form with all fields (5ms)
+  ✘  25 [chromium] › tests/tab-workflow.spec.ts:105:7 › Workflow Page — intake form › intake form accepts input and shows model selector (5ms)
+  ✘  26 [chromium] › tests/tab-workflow.spec.ts:149:7 › Workflow Page — selected workflow interactions › status header reflects phase (5ms)
+  ✘  27 [chromium] › tests/tab-workflow.spec.ts:157:7 › Workflow Page — selected workflow interactions › five phase boxes render (6ms)
+  ✘  28 [chromium] › tests/tab-workflow.spec.ts:163:7 › Workflow Page — selected workflow interactions › agent item click expands AgentOutputPanel (5ms)
+  ✘  29 [chromium] › tests/tab-workflow.spec.ts:182:7 › Workflow Page — selected workflow interactions › ticket pill click opens TicketDetailModal (5ms)
+  ✘  30 [chromium] › tests/tab-workflow.spec.ts:201:7 › Workflow Page — selected workflow interactions › S3 output click opens S3ArtifactsModal (5ms)
+  ✘  31 [chromium] › tests/tab-workflow.spec.ts:220:7 › Workflow Page — cancel flow › cancel button + modal flow on a fresh workflow (5ms)
+  ✘  32 [chromium] › tests/tab-workflow.spec.ts:287:7 › Workflow Page — replay scrubber › scrubber controls render for completed workflow with events (5ms)
+
+
+  1) [chromium] › tests/tab-agents.spec.ts:8:7 › Agents Tab › renders agents page ──────────────────
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-agents-Agents-Tab-renders-agents-page-chromium/error-context.md
+
+  2) [chromium] › tests/tab-agents.spec.ts:15:7 › Agents Tab › shows agent cards when discovery completes 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-agents-Agents-Tab-show-dbad3-ds-when-discovery-completes-chromium/error-context.md
+
+  3) [chromium] › tests/tab-agents.spec.ts:32:7 › Agents Tab › agent card is clickable ─────────────
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-agents-Agents-Tab-agent-card-is-clickable-chromium/error-context.md
+
+  4) [chromium] › tests/tab-agents.spec.ts:44:7 › Agents Tab › agent detail page shows chat interface 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-agents-Agents-Tab-agent-detail-page-shows-chat-interface-chromium/error-context.md
+
+  5) [chromium] › tests/tab-build.spec.ts:8:7 › Build Tab › renders builder chat interface ─────────
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-build-Build-Tab-renders-builder-chat-interface-chromium/error-context.md
+
+  6) [chromium] › tests/tab-build.spec.ts:12:7 › Build Tab › shows harness mode indicator ──────────
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-build-Build-Tab-shows-harness-mode-indicator-chromium/error-context.md
+
+  7) [chromium] › tests/tab-build.spec.ts:16:7 › Build Tab › description input is visible and accepts text 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-build-Build-Tab-descri-1cb6b-is-visible-and-accepts-text-chromium/error-context.md
+
+  8) [chromium] › tests/tab-build.spec.ts:23:7 › Build Tab › submit button is visible and enabled after input 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-build-Build-Tab-submit-5e0d2-ble-and-enabled-after-input-chromium/error-context.md
+
+  9) [chromium] › tests/tab-build.spec.ts:31:7 › Build Tab › deploy button is present ──────────────
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-build-Build-Tab-deploy-button-is-present-chromium/error-context.md
+
+  10) [chromium] › tests/tab-build.spec.ts:35:7 › Build Tab › chat area is present for conversation 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-build-Build-Tab-chat-area-is-present-for-conversation-chromium/error-context.md
+
+  11) [chromium] › tests/tab-dashboard.spec.ts:8:7 › Dashboard Tab › renders header with configured branding 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-dashboard-Dashboard-Ta-6be62-er-with-configured-branding-chromium/error-context.md
+
+  12) [chromium] › tests/tab-dashboard.spec.ts:16:7 › Dashboard Tab › shows all navigation items ───
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-dashboard-Dashboard-Tab-shows-all-navigation-items-chromium/error-context.md
+
+  13) [chromium] › tests/tab-dashboard.spec.ts:24:7 › Dashboard Tab › displays agent activity metrics 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-dashboard-Dashboard-Tab-displays-agent-activity-metrics-chromium/error-context.md
+
+  14) [chromium] › tests/tab-dashboard.spec.ts:33:7 › Dashboard Tab › shows agent performance table with live data 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-dashboard-Dashboard-Ta-a0a66-rmance-table-with-live-data-chromium/error-context.md
+
+  15) [chromium] › tests/tab-dashboard.spec.ts:41:7 › Dashboard Tab › region selector shows us-east-1 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-dashboard-Dashboard-Tab-region-selector-shows-us-east-1-chromium/error-context.md
+
+  16) [chromium] › tests/tab-dashboard.spec.ts:45:7 › Dashboard Tab › sidebar collapse/expand works 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-dashboard-Dashboard-Tab-sidebar-collapse-expand-works-chromium/error-context.md
+
+  17) [chromium] › tests/tab-tickets.spec.ts:8:7 › Ticket History Tab › renders ticket history page 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-tickets-Ticket-History-Tab-renders-ticket-history-page-chromium/error-context.md
+
+  18) [chromium] › tests/tab-tickets.spec.ts:15:7 › Ticket History Tab › shows ticket table or list 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-tickets-Ticket-History-Tab-shows-ticket-table-or-list-chromium/error-context.md
+
+  19) [chromium] › tests/tab-tickets.spec.ts:24:7 › Ticket History Tab › ticket entries show status information 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-tickets-Ticket-History-59f55-ies-show-status-information-chromium/error-context.md
+
+  20) [chromium] › tests/tab-tickets.spec.ts:34:7 › Ticket History Tab › page responds to search or filter if available 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-tickets-Ticket-History-d6177-arch-or-filter-if-available-chromium/error-context.md
+
+  21) [chromium] › tests/tab-workflow.spec.ts:38:7 › Workflow Page — basics › page loads with sidebar and main area 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-c0c40--with-sidebar-and-main-area-chromium/error-context.md
+
+  22) [chromium] › tests/tab-workflow.spec.ts:45:7 › Workflow Page — basics › workflow list loads from API 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-d27f9-orkflow-list-loads-from-API-chromium/error-context.md
+
+  23) [chromium] › tests/tab-workflow.spec.ts:54:7 › Workflow Page — basics › history sidebar toggle works 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-07022-istory-sidebar-toggle-works-chromium/error-context.md
+
+  24) [chromium] › tests/tab-workflow.spec.ts:90:7 › Workflow Page — intake form › clicking new opens intake form with all fields 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-25df9-intake-form-with-all-fields-chromium/error-context.md
+
+  25) [chromium] › tests/tab-workflow.spec.ts:105:7 › Workflow Page — intake form › intake form accepts input and shows model selector 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-631c0-ut-and-shows-model-selector-chromium/error-context.md
+
+  26) [chromium] › tests/tab-workflow.spec.ts:149:7 › Workflow Page — selected workflow interactions › status header reflects phase 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-94245-tatus-header-reflects-phase-chromium/error-context.md
+
+  27) [chromium] › tests/tab-workflow.spec.ts:157:7 › Workflow Page — selected workflow interactions › five phase boxes render 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-d8e78-ons-five-phase-boxes-render-chromium/error-context.md
+
+  28) [chromium] › tests/tab-workflow.spec.ts:163:7 › Workflow Page — selected workflow interactions › agent item click expands AgentOutputPanel 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-bbca2-ck-expands-AgentOutputPanel-chromium/error-context.md
+
+  29) [chromium] › tests/tab-workflow.spec.ts:182:7 › Workflow Page — selected workflow interactions › ticket pill click opens TicketDetailModal 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-2f99d-ick-opens-TicketDetailModal-chromium/error-context.md
+
+  30) [chromium] › tests/tab-workflow.spec.ts:201:7 › Workflow Page — selected workflow interactions › S3 output click opens S3ArtifactsModal 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-546e2-lick-opens-S3ArtifactsModal-chromium/error-context.md
+
+  31) [chromium] › tests/tab-workflow.spec.ts:220:7 › Workflow Page — cancel flow › cancel button + modal flow on a fresh workflow 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-57f66-al-flow-on-a-fresh-workflow-chromium/error-context.md
+
+  32) [chromium] › tests/tab-workflow.spec.ts:287:7 › Workflow Page — replay scrubber › scrubber controls render for completed workflow with events 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/tab-workflow-Workflow-Page-611d3-pleted-workflow-with-events-chromium/error-context.md
+
+  32 failed
+    [chromium] › tests/tab-agents.spec.ts:8:7 › Agents Tab › renders agents page ───────────────────
+    [chromium] › tests/tab-agents.spec.ts:15:7 › Agents Tab › shows agent cards when discovery completes 
+    [chromium] › tests/tab-agents.spec.ts:32:7 › Agents Tab › agent card is clickable ──────────────
+    [chromium] › tests/tab-agents.spec.ts:44:7 › Agents Tab › agent detail page shows chat interface 
+    [chromium] › tests/tab-build.spec.ts:8:7 › Build Tab › renders builder chat interface ──────────
+    [chromium] › tests/tab-build.spec.ts:12:7 › Build Tab › shows harness mode indicator ───────────
+    [chromium] › tests/tab-build.spec.ts:16:7 › Build Tab › description input is visible and accepts text 
+    [chromium] › tests/tab-build.spec.ts:23:7 › Build Tab › submit button is visible and enabled after input 
+    [chromium] › tests/tab-build.spec.ts:31:7 › Build Tab › deploy button is present ───────────────
+    [chromium] › tests/tab-build.spec.ts:35:7 › Build Tab › chat area is present for conversation ──
+    [chromium] › tests/tab-dashboard.spec.ts:8:7 › Dashboard Tab › renders header with configured branding 
+    [chromium] › tests/tab-dashboard.spec.ts:16:7 › Dashboard Tab › shows all navigation items ─────
+    [chromium] › tests/tab-dashboard.spec.ts:24:7 › Dashboard Tab › displays agent activity metrics 
+    [chromium] › tests/tab-dashboard.spec.ts:33:7 › Dashboard Tab › shows agent performance table with live data 
+    [chromium] › tests/tab-dashboard.spec.ts:41:7 › Dashboard Tab › region selector shows us-east-1 
+    [chromium] › tests/tab-dashboard.spec.ts:45:7 › Dashboard Tab › sidebar collapse/expand works ──
+    [chromium] › tests/tab-tickets.spec.ts:8:7 › Ticket History Tab › renders ticket history page ──
+    [chromium] › tests/tab-tickets.spec.ts:15:7 › Ticket History Tab › shows ticket table or list ──
+    [chromium] › tests/tab-tickets.spec.ts:24:7 › Ticket History Tab › ticket entries show status information 
+    [chromium] › tests/tab-tickets.spec.ts:34:7 › Ticket History Tab › page responds to search or filter if available 
+    [chromium] › tests/tab-workflow.spec.ts:38:7 › Workflow Page — basics › page loads with sidebar and main area 
+    [chromium] › tests/tab-workflow.spec.ts:45:7 › Workflow Page — basics › workflow list loads from API 
+    [chromium] › tests/tab-workflow.spec.ts:54:7 › Workflow Page — basics › history sidebar toggle works 
+    [chromium] › tests/tab-workflow.spec.ts:90:7 › Workflow Page — intake form › clicking new opens intake form with all fields 
+    [chromium] › tests/tab-workflow.spec.ts:105:7 › Workflow Page — intake form › intake form accepts input and shows model selector 
+    [chromium] › tests/tab-workflow.spec.ts:149:7 › Workflow Page — selected workflow interactions › status header reflects phase 
+    [chromium] › tests/tab-workflow.spec.ts:157:7 › Workflow Page — selected workflow interactions › five phase boxes render 
+    [chromium] › tests/tab-workflow.spec.ts:163:7 › Workflow Page — selected workflow interactions › agent item click expands AgentOutputPanel 
+    [chromium] › tests/tab-workflow.spec.ts:182:7 › Workflow Page — selected workflow interactions › ticket pill click opens TicketDetailModal 
+    [chromium] › tests/tab-workflow.spec.ts:201:7 › Workflow Page — selected workflow interactions › S3 output click opens S3ArtifactsModal 
+    [chromium] › tests/tab-workflow.spec.ts:220:7 › Workflow Page — cancel flow › cancel button + modal flow on a fresh workflow 
+    [chromium] › tests/tab-workflow.spec.ts:287:7 › Workflow Page — replay scrubber › scrubber controls render for completed workflow with events 

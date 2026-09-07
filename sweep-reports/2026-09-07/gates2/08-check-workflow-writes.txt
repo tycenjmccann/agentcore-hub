@@ -1,0 +1,2 @@
+RUN 08 check-workflow-writes: ./scripts/check-workflow-writes.sh
+workflow-write guard: OK

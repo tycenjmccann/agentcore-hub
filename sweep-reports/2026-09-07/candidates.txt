@@ -1,0 +1,552 @@
+1. knip-root | Unused files | demo/playwright.config.ts | demo/playwright.config.ts |
+2. knip-root | Unused files | demo/playwright/playwright.config.ts | demo/playwright/playwright.config.ts |
+3. knip-root | Unused files | demo/playwright/test-popup.spec.ts | demo/playwright/test-popup.spec.ts |
+4. knip-root | Unused files | demo/playwright/test-s3-modal.spec.ts | demo/playwright/test-s3-modal.spec.ts |
+5. knip-root | Unused files | demo/playwright/v4/check-layout.spec.ts | demo/playwright/v4/check-layout.spec.ts |
+6. knip-root | Unused files | demo/playwright/v4/playwright-v4.config.ts | demo/playwright/v4/playwright-v4.config.ts |
+7. knip-root | Unused files | demo/playwright/v4/record-demo-v4.spec.ts | demo/playwright/v4/record-demo-v4.spec.ts |
+8. knip-root | Unused files | demo/playwright/v4/test-agent-streaming.spec.ts | demo/playwright/v4/test-agent-streaming.spec.ts |
+9. knip-root | Unused files | demo/playwright/v4/test-lambda-orchestration.spec.ts | demo/playwright/v4/test-lambda-orchestration.spec.ts |
+10. knip-root | Unused files | demo/record.spec.ts | demo/record.spec.ts |
+11. knip-root | Unused files | deploy/pipeline/bin/pipeline.ts | deploy/pipeline/bin/pipeline.ts |
+12. knip-root | Unused files | deploy/pipeline/harness-snapshot.mjs | deploy/pipeline/harness-snapshot.mjs |
+13. knip-root | Unused files | deploy/pipeline/lib/pipeline-stack.ts | deploy/pipeline/lib/pipeline-stack.ts |
+14. knip-root | Unused files | deploy/pipeline/restore-harness.mjs | deploy/pipeline/restore-harness.mjs |
+15. knip-root | Unused files | deploy/routine-builder/setup-routine-builder.mjs | deploy/routine-builder/setup-routine-builder.mjs |
+16. knip-root | Unused files | deploy/runtime-agent/healthcheck-fixtures/buggy-component.tsx | deploy/runtime-agent/healthcheck-fixtures/buggy-component.tsx |
+17. knip-root | Unused files | deploy/runtime-agent/healthcheck-fixtures/fixed-component.tsx | deploy/runtime-agent/healthcheck-fixtures/fixed-component.tsx |
+18. knip-root | Unused files | deploy/setup-builder-agent.mjs | deploy/setup-builder-agent.mjs |
+19. knip-root | Unused files | deploy/setup-tickets-lambda.mjs | deploy/setup-tickets-lambda.mjs |
+20. knip-root | Unused files | deploy/workflow-manager/setup-workflow-manager.mjs | deploy/workflow-manager/setup-workflow-manager.mjs |
+21. knip-root | Unused files | evals/battery/fixtures/fix-null-session-crash-001/session-utils.ts | evals/battery/fixtures/fix-null-session-crash-001/session-utils.ts |
+22. knip-root | Unused files | evals/battery/fixtures/fix-pagination-offbyone-002/pagination.ts | evals/battery/fixtures/fix-pagination-offbyone-002/pagination.ts |
+23. knip-root | Unused files | evals/battery/fixtures/fix-race-condition-cas-003/store.ts | evals/battery/fixtures/fix-race-condition-cas-003/store.ts |
+24. knip-root | Unused files | lambda/agentcore-hub-jira/index.test.mjs | lambda/agentcore-hub-jira/index.test.mjs |
+25. knip-root | Unused files | lambda/anomaly-watcher/detect.test.mjs | lambda/anomaly-watcher/detect.test.mjs |
+26. knip-root | Unused files | lambda/anomaly-watcher/index.test.mjs | lambda/anomaly-watcher/index.test.mjs |
+27. knip-root | Unused files | lambda/builder-tools/index.mjs | lambda/builder-tools/index.mjs |
+28. knip-root | Unused files | lambda/cost-report/index.test.mjs | lambda/cost-report/index.test.mjs |
+29. knip-root | Unused files | lambda/cost-report/pricing.test.mjs | lambda/cost-report/pricing.test.mjs |
+30. knip-root | Unused files | lambda/orchestrator/model-router.mjs | lambda/orchestrator/model-router.mjs |
+31. knip-root | Unused files | lambda/orchestrator/model-router.test.mjs | lambda/orchestrator/model-router.test.mjs |
+32. knip-root | Unused files | lambda/prd-submitter/index.mjs | lambda/prd-submitter/index.mjs |
+33. knip-root | Unused files | lambda/routines-runner/index.mjs | lambda/routines-runner/index.mjs |
+34. knip-root | Unused files | lambda/routines-runner/index.test.mjs | lambda/routines-runner/index.test.mjs |
+35. knip-root | Unused files | lambda/token-aggregator/index.mjs | lambda/token-aggregator/index.mjs |
+36. knip-root | Unused files | lambda/workflow-analyzer/index.mjs | lambda/workflow-analyzer/index.mjs |
+37. knip-root | Unused files | scripts/backfill-workflow-tombstones.mjs | scripts/backfill-workflow-tombstones.mjs |
+38. knip-root | Unused files | scripts/migrate-default-identity.mjs | scripts/migrate-default-identity.mjs |
+39. knip-root | Unused files | src/components/workflow/PipelineVisualization.tsx | src/components/workflow/PipelineVisualization.tsx |
+40. knip-root | Unused files | src/lib/models/harness-models.ts | src/lib/models/harness-models.ts |
+41. knip-root | Unused devDependencies | package.json:69:6 | depcheck |
+42. knip-root | Unused devDependencies | package.json:75:6 | ts-prune |
+43. knip-root | Unlisted dependencies | evals/battery/lib/cases.mjs:91:29 | ajv/dist/2020 |
+44. knip-root | Unlisted dependencies | evals/battery/lint-fixtures.mjs:53:27 | ajv/dist/2020 |
+45. knip-root | Unlisted dependencies | lambda/anomaly-watcher/index.mjs:627:31 | js-yaml |
+46. knip-root | Unlisted dependencies | lambda/orchestrator/agent-invoker.mjs:150:11 | @smithy/node-http-handler |
+47. knip-root | Unlisted binaries | deploy/lib/__tests__/check-eval-gate.test.ts | script |
+48. knip-root | Unlisted binaries | deploy/lib/__tests__/check-eval-gate.test.ts | setsid |
+49. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/agent-runner.mjs:22:14 | PRICING_PER_MTOK | (used in module)
+50. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/agent-runner.mjs:37:14 | MAX_TURNS | (used in module)
+51. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/agent-runner.mjs:85:14 | INFRA_RETRY_DELAY_MS | (used in module)
+52. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/cases.mjs:12:14 | PERSONA_EVALUATOR_ID | (used in module)
+53. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/cases.mjs:15:14 | batteryDir | (used in module)
+54. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/cases.mjs:87:17 | loadCaseValidator | (used in module)
+55. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/cases.mjs:100:17 | loadBattery | (used in module)
+56. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/cases.mjs:276:17 | defaultGitShow | (used in module)
+57. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/mock-transport.mjs:25:14 | MOCK_DEFAULT | (used in module)
+58. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/mock-transport.mjs:28:14 | SENSITIVE_EVALUATORS | (used in module)
+59. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/redact.mjs:14:14 | GITHUB_OWNER_ALLOWLIST | (used in module)
+60. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/scoring.mjs:19:14 | JUDGE_MAX_TOKENS | (used in module)
+61. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/scoring.mjs:21:14 | CUSTOM_EVALUATOR_ID | (used in module)
+62. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/scoring.mjs:83:17 | builtinInstruction |
+63. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/scoring.mjs:92:14 | HTTP_CONNECTION_TIMEOUT_MS | (used in module)
+64. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/scoring.mjs:93:14 | HTTP_REQUEST_TIMEOUT_MS | (used in module)
+65. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/scoring.mjs:94:14 | SDK_MAX_ATTEMPTS | (used in module)
+66. knip-root, ts-prune-root | Unused exports, Unused export | evals/battery/lib/thresholds.mjs:5:14 | SCALE | (used in module)
+67. knip-root | Unused exports | lambda/agentcore-hub-jira/fix-contract.mjs:72:14 | REWORK_FIX_KINDS |
+68. knip-root | Unused exports | lambda/agentcore-hub-jira/fix-contract.mjs:86:14 | SPAWN_ORIGIN_KEYS |
+69. knip-root | Unused exports | lambda/agentcore-hub-jira/fix-contract.mjs:94:14 | SPAWN_EXTRA_KEYS |
+70. knip-root | Unused exports | lambda/agentcore-hub-jira/fix-contract.mjs:100:14 | EVIDENCE_SOURCES |
+71. knip-root | Unused exports | lambda/agentcore-hub-jira/fix-contract.mjs:102:14 | CONTRACT_VERSION |
+72. knip-root | Unused exports | lambda/agentcore-hub-jira/fix-contract.mjs:109:14 | SYSTEM_LABEL_PREFIXES |
+73. knip-root | Unused exports | lambda/agentcore-hub-jira/fix-contract.mjs:138:14 | RESERVED_ADVISORY_LABEL |
+74. knip-root | Unused exports | lambda/agentcore-hub-jira/fix-contract.mjs:395:17 | parseFixContractBlock |
+75. knip-root | Unused exports | lambda/agentcore-hub-jira/fix-contract.mjs:506:17 | advisoryIsReserved |
+76. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:66:14 | FIX_KINDS |
+77. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:72:14 | REWORK_FIX_KINDS |
+78. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:76:14 | KIND_TO_ORIGIN_KEY |
+79. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:86:14 | SPAWN_ORIGIN_KEYS |
+80. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:94:14 | SPAWN_EXTRA_KEYS |
+81. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:100:14 | EVIDENCE_SOURCES |
+82. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:102:14 | CONTRACT_VERSION |
+83. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:109:14 | SYSTEM_LABEL_PREFIXES |
+84. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:138:14 | RESERVED_ADVISORY_LABEL |
+85. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:140:14 | TICKET_KEY_RE |
+86. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:347:17 | renderFixContractBlock |
+87. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:395:17 | parseFixContractBlock |
+88. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:482:17 | contractLabels |
+89. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:506:17 | advisoryIsReserved |
+90. knip-root | Unused exports | lambda/agentcore-hub-tickets/fix-contract.mjs:574:17 | escapeJql |
+91. knip-root | Unused exports | lambda/anomaly-watcher/bands-schema.mjs:28:14 | VERIFIED_EVENT_TYPES |
+92. knip-root | Unused exports | lambda/anomaly-watcher/detect.mjs:30:14 | MAX_OPEN_PAIRS |
+93. knip-root | Unused exports | lambda/anomaly-watcher/detect.mjs:32:14 | MAX_CONTRIBUTORS |
+94. knip-root | Unused exports | lambda/anomaly-watcher/detect.mjs:75:17 | hourBucket |
+95. knip-root | Unused exports | lambda/orchestrator/artifact-chain.mjs:19:14 | ARTIFACT_CHAIN_GATE_MODES |
+96. knip-root | Unused exports | lambda/orchestrator/artifact-chain.mjs:72:14 | CODE_REVIEWER_AGENT |
+97. knip-root | Unused exports | lambda/orchestrator/artifact-chain.mjs:73:14 | PLAN_TICKET_TITLE |
+98. knip-root | Unused exports | lambda/orchestrator/cascade.mjs:685:17 | hasCascadeActivity |
+99. knip-root | Unused exports | lambda/orchestrator/cascade.mjs:700:17 | emitCascadeMetrics |
+100. knip-root | Unused exports | lambda/orchestrator/dead-session-detector.mjs:560:17 | emitMetrics |
+101. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:66:14 | FIX_KINDS |
+102. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:72:14 | REWORK_FIX_KINDS |
+103. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:86:14 | SPAWN_ORIGIN_KEYS |
+104. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:94:14 | SPAWN_EXTRA_KEYS |
+105. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:100:14 | EVIDENCE_SOURCES |
+106. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:102:14 | CONTRACT_VERSION |
+107. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:109:14 | SYSTEM_LABEL_PREFIXES |
+108. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:138:14 | RESERVED_ADVISORY_LABEL |
+109. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:173:17 | normalizeContractMode |
+110. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:482:17 | contractLabels |
+111. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:506:17 | advisoryIsReserved |
+112. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:526:17 | sanitizeUserLabels |
+113. knip-root | Unused exports | lambda/orchestrator/fix-contract.mjs:574:17 | escapeJql |
+114. knip-root | Unused exports | lambda/orchestrator/reconcile-sweep.mjs:255:17 | emitReconcileMetrics |
+115. knip-root | Unused exports | lambda/orchestrator/repo-check.mjs:100:23 | checkRepoConfig |
+116. knip-root, ts-prune-root | Unused exports, Unused export | lambda/orchestrator/review-cap.mjs:396:17 | emitReviewCapMetrics | (used in module)
+117. knip-root, ts-prune-root | Unused exports, Unused export | lambda/orchestrator/review-cap.mjs:435:17 | emitReviewCapFailOpenMetrics | (used in module)
+118. knip-root | Unused exports | lambda/orchestrator/sync-main.mjs:102:14 | MAX_SYNC_FIX_ROUNDS |
+119. knip-root | Unused exports | lambda/orchestrator/watchdog.mjs:45:17 | _getWatchdogSource |
+120. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/cloud-code/artifacts.ts:41:14 | DEFAULT_FILE_CAP_BYTES | (used in module)
+121. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/cloud-code/artifacts.ts:42:14 | DEFAULT_TOTAL_CAP_BYTES | (used in module)
+122. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/cloud-code/artifacts.ts:43:14 | DEFAULT_FILE_COUNT_CAP | (used in module)
+123. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/cloud-code/artifacts.ts:370:17 | safeRelPath | (used in module)
+124. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/cloud-code/git.ts:53:17 | parseRepo | (used in module)
+125. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/cloud-code/git.ts:65:17 | normalizeCloneUrl | (used in module)
+126. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/cloud-code/git.ts:106:23 | canPushToOrigin | (used in module)
+127. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/cloud-code/transcript.ts:18:17 | slugForPath | (used in module)
+128. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/cloud-code/transcript.ts:22:23 | projectDirFor | (used in module)
+129. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/cloud-code/transcript.ts:52:23 | localTranscriptPath | (used in module)
+130. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/workflow/schemas.ts:3:14 | RepoTargetSchema | (used in module)
+131. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/workflow/schemas.ts:10:14 | RepoConfigSchema | (used in module)
+132. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/workflow/schemas.ts:31:14 | IntakeSourceSchema | (used in module)
+133. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/workflow/schemas.ts:49:14 | ModelOverrideSchema | (used in module)
+134. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/workflow/schemas.ts:62:14 | PortedSessionSchema | (used in module)
+135. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/workflow/schemas.ts:73:14 | IntentBriefSchema | (used in module)
+136. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/workflow/schemas.ts:82:14 | WorkflowInputSchema | (used in module)
+137. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/workflow/schemas.ts:132:14 | RoutineScheduleSchema | (used in module)
+138. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exports, Unused export | mcp/hub/src/workflow/schemas.ts:140:14 | RoutineInputTemplateSchema | (used in module)
+139. knip-root, ts-prune-root | Unused exports, Unused export | src/components/cloud-code/CliBrand.tsx:9:14 | CLI_BRAND | (used in module)
+140. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/agentcore-sdk.ts:94:17 | getMemoryMapping | (used in module)
+141. knip-root | Unused exports | src/lib/agentcore-sdk.ts:141:17 | getLogsClient |
+142. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/auth/identity.ts:50:17 | authDisabled | (used in module)
+143. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/auth/resolver.ts:14:17 | authMode | (used in module)
+144. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/cd-registry.ts:46:14 | CD_REGISTRY_KEY | (used in module)
+145. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/client-cache.ts:75:17 | invalidateCache |
+146. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/cloud-code/config-store.ts:47:14 | DEFAULT_SCOPE | (used in module)
+147. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/connectors/secrets.ts:17:17 | secretIdFor | (used in module)
+148. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/connectors/store.ts:23:23 | readRegistry | (used in module)
+149. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/pipeline-config.ts:83:14 | TOOL_ICON_MAP | (used in module)
+150. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/pipeline-config.ts:126:14 | PHASE_DISPLAY_META | (used in module)
+151. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/pipeline-config.ts:447:14 | PIPELINE_PHASES |
+152. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/routines/schedule.ts:40:17 | scheduleNameFor | (used in module)
+153. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/routines/store.ts:23:10 | DEFAULT_USER_ID |
+154. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/routines/store.ts:23:27 | DEFAULT_TENANT_ID | (used in module)
+155. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/routines/store.ts:37:23 | getRoutine | (used in module)
+156. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/utils.ts:8:17 | formatDuration |
+157. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/utils.ts:15:17 | truncate |
+158. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/intake.ts:19:10 | redactUrl | (used in module)
+159. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/jira-client.ts:11:14 | JIRA_STATUS_TO_INTERNAL | (used in module)
+160. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/jira-client.ts:25:14 | INTERNAL_STATUS_TO_JIRA | (used in module)
+161. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/performance.ts:83:14 | FLEET_KPIS | (used in module)
+162. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/performance.ts:101:14 | BASELINE_DAYS | (used in module)
+163. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/performance.ts:102:14 | BASELINE_MIN | (used in module)
+164. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/performance.ts:113:17 | quantile | (used in module)
+165. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/performance.ts:154:17 | getPath | (used in module)
+166. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/performance.ts:217:17 | isValidCard | (used in module)
+167. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/roster-loader.ts:22:23 | loadRoster | (used in module)
+168. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/source-shape.ts:29:14 | INTAKE_SOURCE_TYPES | (used in module)
+169. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/workflow-defs.ts:280:17 | sdlcFrameworkForDef | (used in module)
+170. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/workflow-defs.ts:285:17 | isHumanAssignee |
+171. knip-root, ts-prune-root | Unused exports, Unused export | src/lib/workflow/workspace.ts:36:23 | writeArtifact |
+172. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exported types, Unused export | mcp/hub/src/cloud-code/artifacts.ts:45:13 | ArtifactKind | (used in module)
+173. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exported types, Unused export | mcp/hub/src/cloud-code/artifacts.ts:47:18 | ArtifactCandidate | (used in module)
+174. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exported types, Unused export | mcp/hub/src/cloud-code/cli-config.ts:26:13 | ServerCategory | (used in module)
+175. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exported types, Unused export | mcp/hub/src/cloud-code/cli-config.ts:27:13 | ServerTransport | (used in module)
+176. knip-root, knip-mcp-hub, ts-prune-mcp-hub | Unused exported types, Unused export | mcp/hub/src/cloud-code/cli-config.ts:36:18 | ClassifiedServer | (used in module)
+177. knip-root, ts-prune-root | Unused exported types, Unused export | src/components/workflow/useWorkflowStream.ts:6:13 | StreamStatus | (used in module)
+178. knip-root, ts-prune-root | Unused exported types, Unused export | src/config/modules.ts:28:13 | ModuleId | (used in module)
+179. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/agentcore-sdk.ts:910:13 | RegistryAuthorizerType | (used in module)
+180. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/connectors/types.ts:33:13 | ConnectorStatus | (used in module)
+181. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/pipeline-config.ts:93:13 | PipelinePhaseId | (used in module)
+182. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/pipeline-config.ts:99:18 | PipelineIdentityItem | (used in module)
+183. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/pipeline-config.ts:104:18 | PipelineConfigItem | (used in module)
+184. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/pipeline-config.ts:109:18 | PipelineDisplayItem | (used in module)
+185. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/pipeline-config.ts:244:18 | PipelineAgentConfig | (used in module)
+186. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/pipeline/status.ts:23:18 | CiBuildSummary | (used in module)
+187. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/pipeline/status.ts:32:18 | StageState | (used in module)
+188. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/routines/types.ts:19:18 | RoutineRepoConfig | (used in module)
+189. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/routines/types.ts:48:18 | RoutineLastRun | (used in module)
+190. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:13:13 | AnalysisTrigger | (used in module)
+191. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:19:13 | FindingKind | (used in module)
+192. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:20:13 | FindingSeverity | (used in module)
+193. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:21:13 | RecommendationPriority | (used in module)
+194. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:22:13 | RecommendationType | (used in module)
+195. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:29:18 | PhaseMetric | (used in module)
+196. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:37:18 | AgentTaskMetric | (used in module)
+197. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:48:18 | HumanReviewMetric | (used in module)
+198. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:67:18 | FixTicketEntry | (used in module)
+199. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:84:18 | ChangeRequestCycle | (used in module)
+200. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:91:18 | ManagerIntervention | (used in module)
+201. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:98:18 | WorkflowMetrics | (used in module)
+202. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:139:18 | AnalysisScores | (used in module)
+203. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/analysis-types.ts:165:18 | AnalysisTrend | (used in module)
+204. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/command-queue.ts:23:18 | WorkflowCommand |
+205. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/completion-evidence.ts:21:18 | CompletionRecord | (used in module)
+206. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/intake.ts:75:13 | SourceOutcome | (used in module)
+207. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/intake.ts:104:13 | LookupImpl | (used in module)
+208. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/model-config.ts:18:13 | ModelProvider | (used in module)
+209. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/model-config.ts:26:18 | ModelOptionBase | (used in module)
+210. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/model-config.ts:44:18 | BedrockModelOption | (used in module)
+211. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/model-config.ts:52:18 | OpenAIModelOption | (used in module)
+212. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/performance.ts:45:18 | InfraSnapshot | (used in module)
+213. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/performance.ts:70:18 | KpiDef | (used in module)
+214. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/performance.ts:161:18 | KpiStat | (used in module)
+215. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/performance.ts:174:18 | AgentAgg | (used in module)
+216. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/roster-loader.ts:12:18 | RosterAgent | (used in module)
+217. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/ship-review.ts:18:18 | ShipFindingLike | (used in module)
+218. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/types.ts:106:18 | FixContract | (used in module)
+219. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/types.ts:134:13 | AgentPhase |
+220. knip-root | Unused exported types | src/lib/workflow/types.ts:153:13 | WorkflowPhase |
+221. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/types.ts:217:18 | StoredEvent | (used in module)
+222. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/types.ts:222:13 | WorkflowType | (used in module)
+223. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/types.ts:281:18 | RepoTarget | (used in module)
+224. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/types.ts:290:13 | MessageType | (used in module)
+225. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/types.ts:292:18 | AgentMessage | (used in module)
+226. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/types.ts:304:13 | IntakeSourceType | (used in module)
+227. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/types.ts:412:18 | PortedSession | (used in module)
+228. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/types.ts:427:13 | NotificationType | (used in module)
+229. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/types.ts:436:18 | ReviewPackageLink | (used in module)
+230. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/workflow-defs.ts:20:13 | WorkflowPhaseType | (used in module)
+231. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/workflow-defs.ts:22:18 | WorkflowDefPhase | (used in module)
+232. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/workflow-defs.ts:92:18 | ArtifactChainEntry | (used in module)
+233. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/workflow-defs.ts:109:18 | ArtifactChain | (used in module)
+234. knip-root, ts-prune-root | Unused exported types, Unused export | src/lib/workflow/workflow-defs.ts:126:18 | FrameworkOverlay | (used in module)
+235. knip-root, knip-mcp-hub | Duplicate exports | mcp/hub/src/workflow/schemas.ts | WorkflowInputSchema|SubmitWorkflowInputSchema |
+236. knip-root | Configuration hints | knip.json | [src/app/**/page.tsx, …]           knip.json  Remove, or move unused top-level entry to one of "workspaces" |
+237. knip-root | Configuration hints | knip.json | [src/**/*.{ts,tsx}, …]             knip.json  Remove, or move unused top-level project to one of "workspaces" |
+238. knip-root | Configuration hints | knip.json | src/index.ts              mcp/hub  knip.json  Remove redundant entry pattern |
+239. knip-mcp-hub | Configuration hints | knip.json | src/index.ts  mcp/hub  knip.json  Remove redundant entry pattern |
+240. ts-prune-root | Unused export | playwright.config.ts:40 | default |
+241. ts-prune-root | Unused export | vitest.config.ts:14 | default |
+242. ts-prune-root | Unused export | demo/playwright.config.ts:14 | default |
+243. ts-prune-root | Unused export | src/middleware.ts:56 | middleware |
+244. ts-prune-root | Unused export | src/middleware.ts:87 | config |
+245. ts-prune-root | Unused export | demo/playwright/playwright.config.ts:3 | default |
+246. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:92 | notTerminalPhaseGuard |
+247. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:116 | notTerminalPhaseFilter |
+248. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:147 | missingEvidenceTickets |
+249. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:243 | resolveMissingEvidenceFromRecords |
+250. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:297 | normalizeAdvisoryRoutingMode | (used in module)
+251. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:323 | advisoryNeverApplies | (used in module)
+252. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:338 | isAdvisoryTicket | (used in module)
+253. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:345 | nonAdvisory | (used in module)
+254. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:360 | isWorkflowComplete |
+255. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:466 | shipVerdictOf | (used in module)
+256. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:498 | evaluateShipVerdict |
+257. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:35 | FIX_KINDS | (used in module)
+258. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:45 | REWORK_FIX_KINDS |
+259. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:56 | SHIP_BLOCKED_OUTCOMES | (used in module)
+260. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:75 | TERMINAL_WORKFLOW_PHASES | (used in module)
+261. ts-prune-root | Unused export | lambda/orchestrator/completion.mjs:131 | SHIP_PHASES |
+262. ts-prune-root | Unused export | lambda/orchestrator/lease.mjs:83 | lastAgentActivity |
+263. ts-prune-root | Unused export | lambda/orchestrator/lease.mjs:133 | lastStreamedText |
+264. ts-prune-root | Unused export | lambda/orchestrator/lease.mjs:178 | hasAgentErrorSince |
+265. ts-prune-root | Unused export | lambda/orchestrator/lease.mjs:214 | stealClaim |
+266. ts-prune-root | Unused export | lambda/orchestrator/lease.mjs:42 | DEFAULT_TTL_MINUTES |
+267. ts-prune-root | Unused export | lambda/orchestrator/lease.mjs:43 | STALE_CLAIM_MULTIPLIER |
+268. ts-prune-root | Unused export | lambda/orchestrator/lease.mjs:51 | LEASE_TTL_MS | (used in module)
+269. ts-prune-root | Unused export | lambda/orchestrator/review-cap.mjs:119 | fingerprintFinding | (used in module)
+270. ts-prune-root | Unused export | lambda/orchestrator/review-cap.mjs:146 | roundContentFingerprint | (used in module)
+271. ts-prune-root | Unused export | lambda/orchestrator/review-cap.mjs:164 | openEscalation | (used in module)
+272. ts-prune-root | Unused export | lambda/orchestrator/review-cap.mjs:192 | parseDecision | (used in module)
+273. ts-prune-root | Unused export | lambda/orchestrator/review-cap.mjs:300 | buildRoundRecord | (used in module)
+274. ts-prune-root | Unused export | lambda/orchestrator/review-cap.mjs:471 | createReviewCap |
+275. ts-prune-root | Unused export | lambda/orchestrator/review-cap.mjs:469 | REVIEW_CAP_FAIL_OPEN_LIMIT | (used in module)
+276. ts-prune-root | Unused export | src/app/layout.tsx:18 | default |
+277. ts-prune-root | Unused export | src/app/layout.tsx:13 | metadata |
+278. ts-prune-root | Unused export | src/app/page.tsx:58 | default |
+279. ts-prune-root | Unused export | src/config/modules.ts:39 | NavItem | (used in module)
+280. ts-prune-root | Unused export | src/lib/agentcore-sdk.ts:152 | DiscoveredAgent | (used in module)
+281. ts-prune-root | Unused export | src/lib/agentcore-sdk.ts:169 | DiscoveredMemory | (used in module)
+282. ts-prune-root | Unused export | src/lib/agentcore-sdk.ts:510 | PayloadFormat | (used in module)
+283. ts-prune-root | Unused export | src/lib/agentcore-sdk.ts:912 | Registry | (used in module)
+284. ts-prune-root | Unused export | src/lib/agentcore-sdk.ts:925 | RegistryRecord | (used in module)
+285. ts-prune-root | Unused export | src/lib/agentcore-sdk.ts:939 | RegistryRecordDetail | (used in module)
+286. ts-prune-root | Unused export | src/lib/agentcore-sdk.ts:946 | CreateRegistryInput | (used in module)
+287. ts-prune-root | Unused export | src/lib/agentcore-sdk.ts:955 | CreateRegistryRecordInput | (used in module)
+288. ts-prune-root | Unused export | src/lib/agentcore-stream.ts:19 | StreamRequest | (used in module)
+289. ts-prune-root | Unused export | src/lib/agentcore-stream.ts:43 | BuilderStreamRequest | (used in module)
+290. ts-prune-root | Unused export | src/lib/cd-registry.ts:44 | DeliveryMode | (used in module)
+291. ts-prune-root | Unused export | demo/playwright/v4/playwright-v4.config.ts:3 | default |
+292. ts-prune-root | Unused export | deploy/runtime-agent/healthcheck-fixtures/buggy-component.tsx:7 | ThemeToggle |
+293. ts-prune-root | Unused export | deploy/runtime-agent/healthcheck-fixtures/fixed-component.tsx:7 | ThemeToggle |
+294. ts-prune-root | Unused export | evals/battery/lib/agent-runner.mjs:46 | MAX_TRANSPORT_RETRIES | (used in module)
+295. ts-prune-root | Unused export | evals/battery/lib/cases.mjs:133 | duplicateCaseIds | (used in module)
+296. ts-prune-root | Unused export | evals/battery/lib/cases.mjs:13 | SCORING_BACKEND | (used in module)
+297. ts-prune-root | Unused export | evals/battery/lib/scoring.mjs:98 | createConverseTransport |
+298. ts-prune-root | Unused export | evals/battery/lib/scoring.mjs:15 | SCORING_BACKEND |
+299. ts-prune-root | Unused export | src/app/agents/page.tsx:57 | default |
+300. ts-prune-root | Unused export | src/app/build/page.tsx:17 | default |
+301. ts-prune-root | Unused export | src/app/cloud-code/page.tsx:49 | default |
+302. ts-prune-root | Unused export | src/app/connectors/page.tsx:22 | default |
+303. ts-prune-root | Unused export | src/app/evaluations/page.tsx:113 | default |
+304. ts-prune-root | Unused export | src/app/invoke/page.tsx:27 | default |
+305. ts-prune-root | Unused export | src/app/pipeline/page.tsx:38 | default |
+306. ts-prune-root | Unused export | src/app/registry/page.tsx:80 | default |
+307. ts-prune-root | Unused export | src/app/routines/page.tsx:19 | default |
+308. ts-prune-root | Unused export | src/app/tickets/page.tsx:118 | default |
+309. ts-prune-root | Unused export | src/app/workflow/page.tsx:36 | default |
+310. ts-prune-root | Unused export | src/components/workflow/ArtifactViewer.tsx:20 | ArtifactKind | (used in module)
+311. ts-prune-root | Unused export | src/components/workflow/PipelineVisualization.tsx:333 | default |
+312. ts-prune-root | Unused export | src/components/workflow/useWorkflowStream.ts:8 | UseWorkflowStreamOptions | (used in module)
+313. ts-prune-root | Unused export | src/components/workflow/useWorkflowStream.ts:26 | UseWorkflowStreamReturn | (used in module)
+314. ts-prune-root | Unused export | src/lib/cloud-code/config-store.ts:52 | UserConfig | (used in module)
+315. ts-prune-root | Unused export | src/lib/cloud-code/github-store.ts:31 | GithubConnection | (used in module)
+316. ts-prune-root | Unused export | src/lib/cloud-code/runtime.ts:36 | CodingTurnResult | (used in module)
+317. ts-prune-root | Unused export | src/lib/cloud-code/runtime.ts:47 | CodingTurnParams | (used in module)
+318. ts-prune-root | Unused export | src/lib/cloud-code/shell-protocol.ts:21 | DecodedFrame | (used in module)
+319. ts-prune-root | Unused export | src/lib/cloud-code/use-voice-input.ts:49 | VoiceInput | (used in module)
+320. ts-prune-root | Unused export | src/lib/metrics/gate-dwell.ts:15 | StatusTransition | (used in module)
+321. ts-prune-root | Unused export | src/lib/metrics/throughput.ts:10 | WorkflowDuration | (used in module)
+322. ts-prune-root | Unused export | src/lib/models/harness-models.ts:32 | BedrockApiFormat | (used in module)
+323. ts-prune-root | Unused export | src/lib/models/harness-models.ts:33 | OpenAiApiFormat | (used in module)
+324. ts-prune-root | Unused export | src/lib/models/harness-models.ts:36 | HarnessModelConfig | (used in module)
+325. ts-prune-root | Unused export | src/lib/models/harness-models.ts:51 | ModelProvider | (used in module)
+326. ts-prune-root | Unused export | src/lib/models/harness-models.ts:53 | HarnessModelOption | (used in module)
+327. ts-prune-root | Unused export | src/lib/pipeline/status.ts:44 | PipelineStatus | (used in module)
+328. ts-prune-root | Unused export | src/lib/workflow/completion-evidence.ts:32 | EvidenceEntryLike | (used in module)
+329. ts-prune-root | Unused export | src/lib/workflow/completion-evidence.ts:41 | MissingEvidenceTicket | (used in module)
+330. ts-prune-root | Unused export | src/lib/workflow/completion-evidence.ts:46 | BackfillFields | (used in module)
+331. ts-prune-root | Unused export | src/lib/workflow/completion-evidence.ts:53 | ResolveEvidenceDeps | (used in module)
+332. ts-prune-root | Unused export | src/lib/workflow/intake.ts:97 | SourceValidationMode | (used in module)
+333. ts-prune-root | Unused export | src/lib/workflow/intake.ts:108 | ValidateIntakeSourcesOptions | (used in module)
+334. ts-prune-root | Unused export | src/lib/workflow/jira-client.ts:60 | JiraClientConfig | (used in module)
+335. ts-prune-root | Unused export | src/lib/workflow/jira-client.ts:66 | JiraIssue | (used in module)
+336. ts-prune-root | Unused export | src/lib/workflow/jira-client.ts:91 | JiraTransition | (used in module)
+337. ts-prune-root | Unused export | src/lib/workflow/jira-client.ts:97 | JiraSearchResult | (used in module)
+338. ts-prune-root | Unused export | src/lib/workflow/lease.ts:42 | AgentTaskEntry | (used in module)
+339. ts-prune-root | Unused export | src/lib/workflow/performance.ts:125 | Band | (used in module)
+340. ts-prune-root | Unused export | src/lib/workflow/repo-check.ts:21 | RepoCheckResult | (used in module)
+341. ts-prune-root | Unused export | src/lib/workflow/repo-check.ts:38 | RepoCheckOptions | (used in module)
+342. ts-prune-root | Unused export | src/lib/workflow/sdlc-framework.ts:9 | SdlcFramework | (used in module)
+343. ts-prune-root | Unused export | src/lib/workflow/ship-review.ts:52 | EffectiveRoundCountOpts | (used in module)
+344. ts-prune-root | Unused export | src/lib/workflow/source-shape.ts:105 | SourceDisplay | (used in module)
+345. ts-prune-root | Unused export | src/lib/workflow/transform-event.ts:11 | TransformOptions | (used in module)
+346. ts-prune-root | Unused export | src/lib/workflow/watchdog.ts:27 | WatchdogConfig | (used in module)
+347. ts-prune-root | Unused export | src/lib/workflow/watchdog.ts:34 | PartialWatchdog | (used in module)
+348. ts-prune-root | Unused export | src/lib/workflow/workflow-defs.ts:116 | SdlcFramework | (used in module)
+349. ts-prune-root | Unused export | evals/battery/fixtures/fix-null-session-crash-001/session-utils.ts:10 | parseSession |
+350. ts-prune-root | Unused export | evals/battery/fixtures/fix-null-session-crash-001/session-utils.ts:26 | getTenantScope |
+351. ts-prune-root | Unused export | evals/battery/fixtures/fix-null-session-crash-001/session-utils.ts:4 | Session | (used in module)
+352. ts-prune-root | Unused export | evals/battery/fixtures/fix-pagination-offbyone-002/pagination.ts:10 | paginate |
+353. ts-prune-root | Unused export | evals/battery/fixtures/fix-pagination-offbyone-002/pagination.ts:3 | Page | (used in module)
+354. ts-prune-root | Unused export | evals/battery/fixtures/fix-race-condition-cas-003/store.ts:5 | ConversationRecord | (used in module)
+355. ts-prune-root | Unused export | evals/battery/fixtures/fix-race-condition-cas-003/store.ts:19 | ConversationStore |
+356. ts-prune-root | Unused export | src/app/agents/[id]/page.tsx:60 | default |
+357. ts-prune-root | Unused export | src/app/api/connectors/route.ts:27 | GET |
+358. ts-prune-root | Unused export | src/app/api/connectors/route.ts:37 | POST |
+359. ts-prune-root | Unused export | src/app/api/connectors/route.ts:25 | dynamic |
+360. ts-prune-root | Unused export | src/app/api/evaluations/route.ts:42 | GET |
+361. ts-prune-root | Unused export | src/app/api/evaluations/route.ts:14 | dynamic |
+362. ts-prune-root | Unused export | src/app/api/evaluations/route.ts:15 | revalidate |
+363. ts-prune-root | Unused export | src/app/api/evaluations/route.ts:16 | fetchCache |
+364. ts-prune-root | Unused export | src/app/api/health/route.ts:3 | GET |
+365. ts-prune-root | Unused export | src/app/api/models/route.ts:40 | GET |
+366. ts-prune-root | Unused export | src/app/api/routines/route.ts:22 | GET |
+367. ts-prune-root | Unused export | src/app/api/routines/route.ts:36 | POST |
+368. ts-prune-root | Unused export | src/app/api/routines/route.ts:20 | dynamic |
+369. ts-prune-root | Unused export | src/app/evaluations/config/page.tsx:85 | default |
+370. ts-prune-root | Unused export | src/app/api/agentcore/agents/route.ts:11 | GET |
+371. ts-prune-root | Unused export | src/app/api/agentcore/builder/route.ts:13 | POST |
+372. ts-prune-root | Unused export | src/app/api/agentcore/deploy/route.ts:12 | POST |
+373. ts-prune-root | Unused export | src/app/api/agentcore/invoke/route.ts:9 | POST |
+374. ts-prune-root | Unused export | src/app/api/agentcore/metrics/route.ts:94 | GET |
+375. ts-prune-root | Unused export | src/app/api/agentcore/metrics/route.ts:3 | dynamic |
+376. ts-prune-root | Unused export | src/app/api/agentcore/payload-format/route.ts:8 | GET |
+377. ts-prune-root | Unused export | src/app/api/agentcore/payload-format/route.ts:21 | POST |
+378. ts-prune-root | Unused export | src/app/api/agentcore/region/route.ts:19 | GET |
+379. ts-prune-root | Unused export | src/app/api/agentcore/region/route.ts:31 | POST |
+380. ts-prune-root | Unused export | src/app/api/agentcore/registry/route.ts:10 | GET |
+381. ts-prune-root | Unused export | src/app/api/agentcore/registry/route.ts:26 | POST |
+382. ts-prune-root | Unused export | src/app/api/agentcore/registry/route.ts:4 | dynamic |
+383. ts-prune-root | Unused export | src/app/api/agentcore/traces/route.ts:71 | GET |
+384. ts-prune-root | Unused export | src/app/api/agentcore/traces/route.ts:126 | POST |
+385. ts-prune-root | Unused export | src/app/api/cloud-code/config/route.ts:37 | GET |
+386. ts-prune-root | Unused export | src/app/api/cloud-code/config/route.ts:43 | POST |
+387. ts-prune-root | Unused export | src/app/api/cloud-code/config/route.ts:106 | PUT |
+388. ts-prune-root | Unused export | src/app/api/cloud-code/config/route.ts:30 | dynamic |
+389. ts-prune-root | Unused export | src/app/api/cloud-code/config/route.ts:31 | maxDuration |
+390. ts-prune-root | Unused export | src/app/api/cloud-code/github/route.ts:16 | GET |
+391. ts-prune-root | Unused export | src/app/api/cloud-code/github/route.ts:43 | DELETE |
+392. ts-prune-root | Unused export | src/app/api/cloud-code/github/route.ts:14 | dynamic |
+393. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/route.ts:14 | GET |
+394. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/route.ts:35 | POST |
+395. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/route.ts:12 | dynamic |
+396. ts-prune-root | Unused export | src/app/api/connectors/[id]/route.ts:16 | GET |
+397. ts-prune-root | Unused export | src/app/api/connectors/[id]/route.ts:23 | PATCH |
+398. ts-prune-root | Unused export | src/app/api/connectors/[id]/route.ts:64 | DELETE |
+399. ts-prune-root | Unused export | src/app/api/connectors/[id]/route.ts:14 | dynamic |
+400. ts-prune-root | Unused export | src/app/api/evaluations/agents/route.ts:6 | GET |
+401. ts-prune-root | Unused export | src/app/api/evaluations/agents/route.ts:4 | dynamic |
+402. ts-prune-root | Unused export | src/app/api/evaluations/loop/route.ts:55 | GET |
+403. ts-prune-root | Unused export | src/app/api/evaluations/loop/route.ts:75 | POST |
+404. ts-prune-root | Unused export | src/app/api/evaluations/loop/route.ts:15 | dynamic |
+405. ts-prune-root | Unused export | src/app/api/jira/metrics/route.ts:546 | GET |
+406. ts-prune-root | Unused export | src/app/api/jira/metrics/route.ts:6 | dynamic |
+407. ts-prune-root | Unused export | src/app/api/pipeline/status/route.ts:9 | GET |
+408. ts-prune-root | Unused export | src/app/api/pipeline/status/route.ts:7 | dynamic |
+409. ts-prune-root | Unused export | src/app/api/routines/[id]/route.ts:20 | GET |
+410. ts-prune-root | Unused export | src/app/api/routines/[id]/route.ts:31 | PATCH |
+411. ts-prune-root | Unused export | src/app/api/routines/[id]/route.ts:86 | DELETE |
+412. ts-prune-root | Unused export | src/app/api/routines/[id]/route.ts:18 | dynamic |
+413. ts-prune-root | Unused export | src/app/api/routines/chat/route.ts:38 | POST |
+414. ts-prune-root | Unused export | src/app/api/routines/chat/route.ts:21 | runtime |
+415. ts-prune-root | Unused export | src/app/api/routines/chat/route.ts:22 | dynamic |
+416. ts-prune-root | Unused export | src/app/api/routines/definitions/route.ts:29 | GET |
+417. ts-prune-root | Unused export | src/app/api/routines/definitions/route.ts:13 | dynamic |
+418. ts-prune-root | Unused export | src/app/api/workflow/[id]/route.ts:33 | DELETE |
+419. ts-prune-root | Unused export | src/app/api/workflow/[id]/route.ts:31 | dynamic |
+420. ts-prune-root | Unused export | src/app/api/workflow/artifacts/route.ts:4 | GET |
+421. ts-prune-root | Unused export | src/app/api/workflow/cd-registry/route.ts:27 | GET |
+422. ts-prune-root | Unused export | src/app/api/workflow/cd-registry/route.ts:41 | POST |
+423. ts-prune-root | Unused export | src/app/api/workflow/cd-registry/route.ts:62 | DELETE |
+424. ts-prune-root | Unused export | src/app/api/workflow/cd-registry/route.ts:25 | dynamic |
+425. ts-prune-root | Unused export | src/app/api/workflow/definitions/route.ts:15 | GET |
+426. ts-prune-root | Unused export | src/app/api/workflow/definitions/route.ts:13 | dynamic |
+427. ts-prune-root | Unused export | src/app/api/workflow/list/route.ts:6 | GET |
+428. ts-prune-root | Unused export | src/app/api/workflow/list/route.ts:4 | dynamic |
+429. ts-prune-root | Unused export | src/app/api/workflow/performance/route.ts:47 | GET |
+430. ts-prune-root | Unused export | src/app/api/workflow/performance/route.ts:19 | dynamic |
+431. ts-prune-root | Unused export | src/app/api/workflow/state/route.ts:9 | GET |
+432. ts-prune-root | Unused export | src/app/api/workflow/webhook/route.ts:21 | POST |
+433. ts-prune-root | Unused export | src/app/api/workflow-manager/chat/route.ts:97 | POST |
+434. ts-prune-root | Unused export | src/app/api/workflow-manager/chat/route.ts:24 | runtime |
+435. ts-prune-root | Unused export | src/app/api/workflow-manager/chat/route.ts:25 | dynamic |
+436. ts-prune-root | Unused export | src/app/api/agentcore/memory/events/route.ts:26 | GET |
+437. ts-prune-root | Unused export | src/app/api/agentcore/memory/events/route.ts:114 | POST |
+438. ts-prune-root | Unused export | src/app/api/agentcore/memory/mapping/route.ts:14 | GET |
+439. ts-prune-root | Unused export | src/app/api/agentcore/memory/mapping/route.ts:28 | POST |
+440. ts-prune-root | Unused export | src/app/api/agentcore/memory/sessions/route.ts:24 | GET |
+441. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/route.ts:12 | GET |
+442. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/route.ts:28 | PATCH |
+443. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/route.ts:44 | DELETE |
+444. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/route.ts:4 | dynamic |
+445. ts-prune-root | Unused export | src/app/api/agentcore/traces/health/route.ts:51 | GET |
+446. ts-prune-root | Unused export | src/app/api/agentcore/traces/health/route.ts:17 | TraceHealthIssue | (used in module)
+447. ts-prune-root | Unused export | src/app/api/agentcore/traces/health/route.ts:30 | TraceHealth | (used in module)
+448. ts-prune-root | Unused export | src/app/api/agentcore/traces/sessions/route.ts:27 | GET |
+449. ts-prune-root | Unused export | src/app/api/cloud-code/github/callback/route.ts:30 | GET |
+450. ts-prune-root | Unused export | src/app/api/cloud-code/github/callback/route.ts:24 | dynamic |
+451. ts-prune-root | Unused export | src/app/api/cloud-code/github/install/route.ts:21 | GET |
+452. ts-prune-root | Unused export | src/app/api/cloud-code/github/install/route.ts:15 | dynamic |
+453. ts-prune-root | Unused export | src/app/api/cloud-code/github/manifest/route.ts:30 | GET |
+454. ts-prune-root | Unused export | src/app/api/cloud-code/github/manifest/route.ts:24 | dynamic |
+455. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/route.ts:61 | PATCH |
+456. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/route.ts:87 | GET |
+457. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/route.ts:104 | DELETE |
+458. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/route.ts:19 | dynamic |
+459. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/port/route.ts:137 | POST |
+460. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/port/route.ts:48 | dynamic |
+461. ts-prune-root | Unused export | src/app/api/connectors/[id]/credentials/route.ts:17 | POST |
+462. ts-prune-root | Unused export | src/app/api/connectors/[id]/credentials/route.ts:15 | dynamic |
+463. ts-prune-root | Unused export | src/app/api/evaluations/agents/[agentId]/route.ts:45 | PUT |
+464. ts-prune-root | Unused export | src/app/api/evaluations/agents/[agentId]/route.ts:4 | dynamic |
+465. ts-prune-root | Unused export | src/app/api/routines/[id]/run/route.ts:17 | POST |
+466. ts-prune-root | Unused export | src/app/api/routines/[id]/run/route.ts:15 | dynamic |
+467. ts-prune-root | Unused export | src/app/api/workflow/[id]/agent-output/route.ts:73 | GET |
+468. ts-prune-root | Unused export | src/app/api/workflow/[id]/agent-output/route.ts:32 | dynamic |
+469. ts-prune-root | Unused export | src/app/api/workflow/[id]/analyze/route.ts:27 | POST |
+470. ts-prune-root | Unused export | src/app/api/workflow/[id]/analyze/route.ts:25 | dynamic |
+471. ts-prune-root | Unused export | src/app/api/workflow/[id]/archive/route.ts:21 | PATCH |
+472. ts-prune-root | Unused export | src/app/api/workflow/[id]/archive/route.ts:19 | dynamic |
+473. ts-prune-root | Unused export | src/app/api/workflow/[id]/escalations/route.ts:32 | GET |
+474. ts-prune-root | Unused export | src/app/api/workflow/[id]/escalations/route.ts:45 | PATCH |
+475. ts-prune-root | Unused export | src/app/api/workflow/[id]/escalations/route.ts:23 | dynamic |
+476. ts-prune-root | Unused export | src/app/api/workflow/[id]/events/route.ts:22 | GET |
+477. ts-prune-root | Unused export | src/app/api/workflow/[id]/events/route.ts:13 | dynamic |
+478. ts-prune-root | Unused export | src/app/api/workflow/[id]/message/route.ts:30 | POST |
+479. ts-prune-root | Unused export | src/app/api/workflow/[id]/message/route.ts:19 | dynamic |
+480. ts-prune-root | Unused export | src/app/api/workflow/[id]/nudge/route.ts:267 | POST |
+481. ts-prune-root | Unused export | src/app/api/workflow/[id]/nudge/route.ts:32 | dynamic |
+482. ts-prune-root | Unused export | src/app/api/workflow/[id]/retry/route.ts:151 | POST |
+483. ts-prune-root | Unused export | src/app/api/workflow/[id]/retry/route.ts:73 | dynamic |
+484. ts-prune-root | Unused export | src/app/api/workflow/[id]/state/route.ts:35 | GET |
+485. ts-prune-root | Unused export | src/app/api/workflow/[id]/state/route.ts:4 | dynamic |
+486. ts-prune-root | Unused export | src/app/api/workflow/[id]/stream/route.ts:29 | GET |
+487. ts-prune-root | Unused export | src/app/api/workflow/[id]/stream/route.ts:17 | runtime |
+488. ts-prune-root | Unused export | src/app/api/workflow/[id]/stream/route.ts:18 | dynamic |
+489. ts-prune-root | Unused export | src/app/api/workflow/[id]/tickets/route.ts:9 | GET |
+490. ts-prune-root | Unused export | src/app/api/workflow/[id]/tickets/route.ts:5 | dynamic |
+491. ts-prune-root | Unused export | src/app/api/workflow/[id]/watch/route.ts:23 | GET |
+492. ts-prune-root | Unused export | src/app/api/workflow/[id]/watch/route.ts:33 | PATCH |
+493. ts-prune-root | Unused export | src/app/api/workflow/[id]/watch/route.ts:21 | dynamic |
+494. ts-prune-root | Unused export | src/app/api/workflow/artifacts/content/route.ts:51 | GET |
+495. ts-prune-root | Unused export | src/app/api/workflow/artifacts/content/route.ts:93 | PUT |
+496. ts-prune-root | Unused export | src/app/api/workflow/artifacts/download/route.ts:11 | GET |
+497. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/records/route.ts:18 | GET |
+498. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/records/route.ts:43 | POST |
+499. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/records/route.ts:10 | dynamic |
+500. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/search/route.ts:17 | POST |
+501. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/search/route.ts:8 | dynamic |
+502. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/artifacts/route.ts:61 | GET |
+503. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/artifacts/route.ts:121 | POST |
+504. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/artifacts/route.ts:24 | dynamic |
+505. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/checkpoint/route.ts:30 | POST |
+506. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/checkpoint/route.ts:23 | dynamic |
+507. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/checkpoint/route.ts:24 | maxDuration |
+508. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/message/route.ts:55 | POST |
+509. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/message/route.ts:20 | dynamic |
+510. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/message/route.ts:22 | maxDuration |
+511. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/shell/route.ts:32 | POST |
+512. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/shell/route.ts:22 | dynamic |
+513. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/shell/route.ts:26 | maxDuration |
+514. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/stop/route.ts:42 | POST |
+515. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/stop/route.ts:35 | dynamic |
+516. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/stop/route.ts:36 | maxDuration |
+517. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/warm/route.ts:21 | POST |
+518. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/warm/route.ts:18 | dynamic |
+519. ts-prune-root | Unused export | src/app/api/cloud-code/sessions/[id]/warm/route.ts:19 | maxDuration |
+520. ts-prune-root | Unused export | src/app/api/evaluations/agents/[agentId]/flush/route.ts:17 | POST |
+521. ts-prune-root | Unused export | src/app/api/evaluations/agents/[agentId]/flush/route.ts:15 | dynamic |
+522. ts-prune-root | Unused export | src/app/api/workflow/[id]/tickets/comment/route.ts:29 | POST |
+523. ts-prune-root | Unused export | src/app/api/workflow/[id]/tickets/comment/route.ts:27 | dynamic |
+524. ts-prune-root | Unused export | src/app/api/workflow/[id]/tickets/transition/route.ts:24 | POST |
+525. ts-prune-root | Unused export | src/app/api/workflow/[id]/tickets/transition/route.ts:7 | dynamic |
+526. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/records/[recordId]/route.ts:17 | GET |
+527. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/records/[recordId]/route.ts:34 | PATCH |
+528. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/records/[recordId]/route.ts:67 | DELETE |
+529. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/records/[recordId]/route.ts:9 | dynamic |
+530. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/records/[recordId]/approval/route.ts:24 | POST |
+531. ts-prune-root | Unused export | src/app/api/agentcore/registry/[registryId]/records/[recordId]/approval/route.ts:9 | dynamic |
+532. ts-prune-mcp-hub | Unused export | mcp/hub/src/auth.ts:109 | ClientResult | (used in module)
+533. ts-prune-mcp-hub | Unused export | mcp/hub/src/cloud-code/artifacts.ts:56 | DetectResult | (used in module)
+534. ts-prune-mcp-hub | Unused export | mcp/hub/src/cloud-code/artifacts.ts:181 | DetectOptions | (used in module)
+535. ts-prune-mcp-hub | Unused export | mcp/hub/src/cloud-code/cli-config.ts:44 | GatherResult | (used in module)
+536. ts-prune-mcp-hub | Unused export | mcp/hub/src/cloud-code/git.ts:44 | GitState | (used in module)
+537. ts-prune-mcp-hub | Unused export | mcp/hub/src/cloud-code/git.ts:113 | GitHandoff | (used in module)
+538. depcheck-root | Unused dependencies | - | @aws-sdk/client-bedrock-agent-runtime |
+539. depcheck-root | Unused devDependencies | - | autoprefixer |
+540. depcheck-root | Unused devDependencies | - | depcheck |
+541. depcheck-root | Unused devDependencies | - | knip |
+542. depcheck-root | Unused devDependencies | - | postcss |
+543. depcheck-root | Unused devDependencies | - | ts-prune |
+544. depcheck-root | Missing dependencies | ./evals/battery/lint-fixtures.mjs | ajv |
+---COUNTS---
+knip-root: 238
+knip-mcp-hub: 26
+ts-prune-root: 401
+ts-prune-mcp-hub: 30
+depcheck-root: 7
+depcheck-mcp-hub: 0
+deduplicated: 544

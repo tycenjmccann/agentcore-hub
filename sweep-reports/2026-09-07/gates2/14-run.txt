@@ -1,0 +1,6 @@
+RUN 14 server: nohup npm run start -- -p 3737 > .sweep-output/gates2/14-server.log 2>&1 &
+server_pid=32203
+health_ready=0 after_seconds=3
+RUN 14 test-cloud-code: PLAYWRIGHT_BASE_URL=http://localhost:3737 npm run test:cloud-code
+test_exit=1
+server_killed=1

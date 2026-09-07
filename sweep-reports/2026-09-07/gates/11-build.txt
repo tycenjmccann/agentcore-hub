@@ -1,0 +1,182 @@
+RUN 11 build: npm run build
+
+> agentcore-hub@1.0.0 build
+> next build
+
+ ⚠ Invalid next.config.mjs options detected: 
+ ⚠     Unrecognized key(s) in object: 'outputFileTracingIncludes', 'serverExternalPackages'
+ ⚠ See more info here: https://nextjs.org/docs/messages/invalid-next-config
+  ▲ Next.js 14.2.35
+
+   Creating an optimized production build ...
+ ✓ Compiled successfully
+   Linting and checking validity of types ...
+
+./src/app/agents/[id]/page.tsx
+653:6  Warning: React Hook useCallback has a missing dependency: 'fetchOtelTraces'. Either include it or remove the dependency array.  react-hooks/exhaustive-deps
+
+./src/app/build/page.tsx
+101:6  Warning: React Hook useCallback has missing dependencies: 'config' and 'messages'. Either include them or remove the dependency array.  react-hooks/exhaustive-deps
+
+./src/components/cloud-code/ShellTerminal.tsx
+181:6  Warning: React Hook useEffect has missing dependencies: 'onSeedConsumed' and 'resumeFirstPrompt'. Either include them or remove the dependency array. If 'onSeedConsumed' changes too often, find the parent component that defines it and wrap that definition in useCallback.  react-hooks/exhaustive-deps
+
+./src/components/workflow/CancelConfirmationModal.tsx
+47:6  Warning: React Hook useEffect has a missing dependency: 'handleClose'. Either include it or remove the dependency array.  react-hooks/exhaustive-deps
+
+./src/components/workflow/MarkdownRenderer.tsx
+64:15  Warning: Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+./src/components/workflow/PipelineVisualization.tsx
+422:11  Warning: Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+426:11  Warning: Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+430:11  Warning: Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+434:11  Warning: Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+438:11  Warning: Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+523:29  Warning: Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+563:31  Warning: Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+./src/components/workflow/WorkflowBoard.tsx
+427:6  Warning: React Hook useEffect has missing dependencies: 'catchingUp' and 'replayMode'. Either include them or remove the dependency array.  react-hooks/exhaustive-deps
+474:6  Warning: React Hook useEffect has a missing dependency: 'state.agentTasks'. Either include it or remove the dependency array.  react-hooks/exhaustive-deps
+495:6  Warning: React Hook useEffect has a missing dependency: 'state'. Either include it or remove the dependency array.  react-hooks/exhaustive-deps
+1104:6  Warning: React Hook useEffect has a missing dependency: 'state'. Either include it or remove the dependency array.  react-hooks/exhaustive-deps
+1681:31  Warning: Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+1750:31  Warning: Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+1798:31  Warning: Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+info  - Need to disable some ESLint rules? Learn more here: https://nextjs.org/docs/basic-features/eslint#disabling-rules
+   Collecting page data ...
+(node:12437) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:12437) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+   Generating static pages (0/37) ...
+   Generating static pages (9/37) 
+   Generating static pages (18/37) 
+   Generating static pages (27/37) 
+ ✓ Generating static pages (37/37)
+   Finalizing page optimization ...
+   Collecting build traces ...
+
+Route (app)                                                           Size     First Load JS
+┌ ○ /                                                                 6.23 kB         103 kB
+├ ○ /_not-found                                                       880 B            89 kB
+├ ○ /agents                                                           3.9 kB          101 kB
+├ ƒ /agents/[id]                                                      11.2 kB         152 kB
+├ ƒ /api/agentcore/agents                                             0 B                0 B
+├ ƒ /api/agentcore/builder                                            0 B                0 B
+├ ƒ /api/agentcore/deploy                                             0 B                0 B
+├ ƒ /api/agentcore/invoke                                             0 B                0 B
+├ ƒ /api/agentcore/memory/events                                      0 B                0 B
+├ ƒ /api/agentcore/memory/mapping                                     0 B                0 B
+├ ƒ /api/agentcore/memory/sessions                                    0 B                0 B
+├ ƒ /api/agentcore/metrics                                            0 B                0 B
+├ ƒ /api/agentcore/payload-format                                     0 B                0 B
+├ ƒ /api/agentcore/region                                             0 B                0 B
+├ ƒ /api/agentcore/registry                                           0 B                0 B
+├ ƒ /api/agentcore/registry/[registryId]                              0 B                0 B
+├ ƒ /api/agentcore/registry/[registryId]/records                      0 B                0 B
+├ ƒ /api/agentcore/registry/[registryId]/records/[recordId]           0 B                0 B
+├ ƒ /api/agentcore/registry/[registryId]/records/[recordId]/approval  0 B                0 B
+├ ƒ /api/agentcore/registry/[registryId]/search                       0 B                0 B
+├ ƒ /api/agentcore/traces                                             0 B                0 B
+├ ƒ /api/agentcore/traces/health                                      0 B                0 B
+├ ƒ /api/agentcore/traces/sessions                                    0 B                0 B
+├ ƒ /api/bugs                                                         0 B                0 B
+├ ƒ /api/cloud-code/config                                            0 B                0 B
+├ ƒ /api/cloud-code/github                                            0 B                0 B
+├ ƒ /api/cloud-code/github/callback                                   0 B                0 B
+├ ƒ /api/cloud-code/github/install                                    0 B                0 B
+├ ƒ /api/cloud-code/github/manifest                                   0 B                0 B
+├ ƒ /api/cloud-code/sessions                                          0 B                0 B
+├ ƒ /api/cloud-code/sessions/[id]                                     0 B                0 B
+├ ƒ /api/cloud-code/sessions/[id]/artifacts                           0 B                0 B
+├ ƒ /api/cloud-code/sessions/[id]/checkpoint                          0 B                0 B
+├ ƒ /api/cloud-code/sessions/[id]/message                             0 B                0 B
+├ ƒ /api/cloud-code/sessions/[id]/shell                               0 B                0 B
+├ ƒ /api/cloud-code/sessions/[id]/stop                                0 B                0 B
+├ ƒ /api/cloud-code/sessions/[id]/warm                                0 B                0 B
+├ ƒ /api/cloud-code/sessions/port                                     0 B                0 B
+├ ƒ /api/connectors                                                   0 B                0 B
+├ ƒ /api/connectors/[id]                                              0 B                0 B
+├ ƒ /api/connectors/[id]/credentials                                  0 B                0 B
+├ ƒ /api/evaluations                                                  0 B                0 B
+├ ƒ /api/evaluations/agents                                           0 B                0 B
+├ ƒ /api/evaluations/agents/[agentId]                                 0 B                0 B
+├ ƒ /api/evaluations/agents/[agentId]/flush                           0 B                0 B
+├ ƒ /api/evaluations/loop                                             0 B                0 B
+├ ○ /api/health                                                       0 B                0 B
+├ ƒ /api/jira/metrics                                                 0 B                0 B
+├ ƒ /api/jira/webhook                                                 0 B                0 B
+├ ○ /api/models                                                       0 B                0 B
+├ ƒ /api/pipeline/status                                              0 B                0 B
+├ ƒ /api/routines                                                     0 B                0 B
+├ ƒ /api/routines/[id]                                                0 B                0 B
+├ ƒ /api/routines/[id]/run                                            0 B                0 B
+├ ƒ /api/routines/chat                                                0 B                0 B
+├ ƒ /api/routines/definitions                                         0 B                0 B
+├ ƒ /api/workflow-manager/chat                                        0 B                0 B
+├ ƒ /api/workflow/[id]                                                0 B                0 B
+├ ƒ /api/workflow/[id]/agent-output                                   0 B                0 B
+├ ƒ /api/workflow/[id]/analysis                                       0 B                0 B
+├ ƒ /api/workflow/[id]/analyze                                        0 B                0 B
+├ ƒ /api/workflow/[id]/archive                                        0 B                0 B
+├ ƒ /api/workflow/[id]/cancel                                         0 B                0 B
+├ ƒ /api/workflow/[id]/complete                                       0 B                0 B
+├ ƒ /api/workflow/[id]/escalations                                    0 B                0 B
+├ ƒ /api/workflow/[id]/events                                         0 B                0 B
+├ ƒ /api/workflow/[id]/message                                        0 B                0 B
+├ ƒ /api/workflow/[id]/nudge                                          0 B                0 B
+├ ƒ /api/workflow/[id]/retry                                          0 B                0 B
+├ ƒ /api/workflow/[id]/state                                          0 B                0 B
+├ ƒ /api/workflow/[id]/stream                                         0 B                0 B
+├ ƒ /api/workflow/[id]/tickets                                        0 B                0 B
+├ ƒ /api/workflow/[id]/tickets/comment                                0 B                0 B
+├ ƒ /api/workflow/[id]/tickets/transition                             0 B                0 B
+├ ƒ /api/workflow/[id]/watch                                          0 B                0 B
+├ ƒ /api/workflow/artifacts                                           0 B                0 B
+├ ƒ /api/workflow/artifacts/content                                   0 B                0 B
+├ ƒ /api/workflow/artifacts/download                                  0 B                0 B
+├ ƒ /api/workflow/cd-registry                                         0 B                0 B
+├ ƒ /api/workflow/definitions                                         0 B                0 B
+├ ƒ /api/workflow/list                                                0 B                0 B
+├ ƒ /api/workflow/performance                                         0 B                0 B
+├ ƒ /api/workflow/start                                               0 B                0 B
+├ ○ /api/workflow/state                                               0 B                0 B
+├ ƒ /api/workflow/webhook                                             0 B                0 B
+├ ○ /build                                                            5.49 kB         137 kB
+├ ○ /cloud-code                                                       16.2 kB         148 kB
+├ ○ /connectors                                                       5.14 kB        93.2 kB
+├ ○ /evaluations                                                      4.71 kB         107 kB
+├ ○ /evaluations/config                                               4.56 kB         106 kB
+├ ○ /invoke                                                           530 B          88.6 kB
+├ ○ /pipeline                                                         2.94 kB          91 kB
+├ ○ /registry                                                         9.58 kB        97.7 kB
+├ ○ /routines                                                         10.1 kB         141 kB
+├ ○ /tickets                                                          6.05 kB        94.1 kB
+└ ○ /workflow                                                         172 kB          318 kB
++ First Load JS shared by all                                         88.1 kB
+  ├ chunks/117-e29de626b606e368.js                                    31.9 kB
+  ├ chunks/fd9d1056-020831d0fb8a00ca.js                               53.7 kB
+  └ other shared chunks (total)                                       2.52 kB
+
+
+ƒ Middleware                                                          33.9 kB
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+

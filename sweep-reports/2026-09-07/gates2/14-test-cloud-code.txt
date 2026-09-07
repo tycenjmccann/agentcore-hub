@@ -1,0 +1,122 @@
+
+> agentcore-hub@1.0.0 test:cloud-code
+> playwright test tests/cloud-code-ui.spec.ts
+
+
+Running 7 tests using 1 worker
+
+  ✘  1 [chromium] › tests/cloud-code-ui.spec.ts:99:7 › Cloud Code UI (mocked) › composer swaps mic ⇄ send by draft content (5ms)
+  ✘  2 [chromium] › tests/cloud-code-ui.spec.ts:117:7 › Cloud Code UI (mocked) › send → stop button appears mid-stream, then clears on stop (5ms)
+  ✘  3 [chromium] › tests/cloud-code-ui.spec.ts:167:7 › Cloud Code UI (mocked) › Artifacts tab renders the gallery from the list payload (5ms)
+  ✘  4 [chromium] › tests/cloud-code-ui.spec.ts:194:7 › Cloud Code UI (mocked) › Artifacts tab shows the empty state with no artifacts (5ms)
+  ✘  5 [chromium] › tests/cloud-code-ui.spec.ts:204:7 › Cloud Code UI (mocked) › pull-to-laptop button copies the exact MCP slash command (5ms)
+  ✘  6 [chromium] › tests/cloud-code-ui.spec.ts:215:7 › Cloud Code UI (mocked) › GitHub section: Connect when app configured but not connected (7ms)
+  ✘  7 [chromium] › tests/cloud-code-ui.spec.ts:226:7 › Cloud Code UI (mocked) › GitHub section: shows account + Disconnect when connected (6ms)
+
+
+  1) [chromium] › tests/cloud-code-ui.spec.ts:99:7 › Cloud Code UI (mocked) › composer swaps mic ⇄ send by draft content 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-11998-mic-⇄-send-by-draft-content-chromium/error-context.md
+
+  2) [chromium] › tests/cloud-code-ui.spec.ts:117:7 › Cloud Code UI (mocked) › send → stop button appears mid-stream, then clears on stop 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-f4dda--stream-then-clears-on-stop-chromium/error-context.md
+
+  3) [chromium] › tests/cloud-code-ui.spec.ts:167:7 › Cloud Code UI (mocked) › Artifacts tab renders the gallery from the list payload 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-198e9-llery-from-the-list-payload-chromium/error-context.md
+
+  4) [chromium] › tests/cloud-code-ui.spec.ts:194:7 › Cloud Code UI (mocked) › Artifacts tab shows the empty state with no artifacts 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-57412-pty-state-with-no-artifacts-chromium/error-context.md
+
+  5) [chromium] › tests/cloud-code-ui.spec.ts:204:7 › Cloud Code UI (mocked) › pull-to-laptop button copies the exact MCP slash command 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-a56aa-the-exact-MCP-slash-command-chromium/error-context.md
+
+  6) [chromium] › tests/cloud-code-ui.spec.ts:215:7 › Cloud Code UI (mocked) › GitHub section: Connect when app configured but not connected 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-32317-onfigured-but-not-connected-chromium/error-context.md
+
+  7) [chromium] › tests/cloud-code-ui.spec.ts:226:7 › Cloud Code UI (mocked) › GitHub section: shows account + Disconnect when connected 
+
+    Error: browserType.launch: Executable doesn't exist at /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium_headless_shell-1223/chrome-linux/headless_shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     npx playwright install                                 ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: test-results/cloud-code-ui-Cloud-Code-U-e08f9-t-Disconnect-when-connected-chromium/error-context.md
+
+  7 failed
+    [chromium] › tests/cloud-code-ui.spec.ts:99:7 › Cloud Code UI (mocked) › composer swaps mic ⇄ send by draft content 
+    [chromium] › tests/cloud-code-ui.spec.ts:117:7 › Cloud Code UI (mocked) › send → stop button appears mid-stream, then clears on stop 
+    [chromium] › tests/cloud-code-ui.spec.ts:167:7 › Cloud Code UI (mocked) › Artifacts tab renders the gallery from the list payload 
+    [chromium] › tests/cloud-code-ui.spec.ts:194:7 › Cloud Code UI (mocked) › Artifacts tab shows the empty state with no artifacts 
+    [chromium] › tests/cloud-code-ui.spec.ts:204:7 › Cloud Code UI (mocked) › pull-to-laptop button copies the exact MCP slash command 
+    [chromium] › tests/cloud-code-ui.spec.ts:215:7 › Cloud Code UI (mocked) › GitHub section: Connect when app configured but not connected 
+    [chromium] › tests/cloud-code-ui.spec.ts:226:7 › Cloud Code UI (mocked) › GitHub section: shows account + Disconnect when connected 

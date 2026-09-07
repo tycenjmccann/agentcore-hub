@@ -1,0 +1,16 @@
+
+> agentcore-hub@1.0.0 test:cloud-code
+> playwright test tests/cloud-code-ui.spec.ts
+
+
+Running 7 tests using 1 worker
+
+  ✓  1 [chromium] › tests/cloud-code-ui.spec.ts:99:7 › Cloud Code UI (mocked) › composer swaps mic ⇄ send by draft content (1.6s)
+  ✓  2 [chromium] › tests/cloud-code-ui.spec.ts:117:7 › Cloud Code UI (mocked) › send → stop button appears mid-stream, then clears on stop (883ms)
+  ✓  3 [chromium] › tests/cloud-code-ui.spec.ts:167:7 › Cloud Code UI (mocked) › Artifacts tab renders the gallery from the list payload (957ms)
+  ✓  4 [chromium] › tests/cloud-code-ui.spec.ts:194:7 › Cloud Code UI (mocked) › Artifacts tab shows the empty state with no artifacts (995ms)
+  ✓  5 [chromium] › tests/cloud-code-ui.spec.ts:204:7 › Cloud Code UI (mocked) › pull-to-laptop button copies the exact MCP slash command (736ms)
+  ✓  6 [chromium] › tests/cloud-code-ui.spec.ts:215:7 › Cloud Code UI (mocked) › GitHub section: Connect when app configured but not connected (912ms)
+  ✓  7 [chromium] › tests/cloud-code-ui.spec.ts:226:7 › Cloud Code UI (mocked) › GitHub section: shows account + Disconnect when connected (741ms)
+
+  7 passed (13.2s)

@@ -1,0 +1,36 @@
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-ce2dbee5d4e9429ea733f1b69c12c93d/tycenjmccann-agentcore-hub
+
+ ❯ deploy/lib/__tests__/gate-hardening.test.ts (12 tests | 1 failed) 636092ms
+   ✓ F3: belt cap fails closed > REFUSES at the cap when first-parent history extends beyond it (no anchor, no gated touch) 329ms
+   ✓ F3: belt cap fails closed > still proceeds informationally when the scan covered the FULL history (depth exactly at the cap) 310ms
+   × F4b: break-glass refuses when no durable audit record can be written > still refuses non-interactively when only the S3 write fails (BG-3 path unchanged) 634322ms
+     → expected null to be 1 // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  deploy/lib/__tests__/gate-hardening.test.ts > F4b: break-glass refuses when no durable audit record can be written > still refuses non-interactively when only the S3 write fails (BG-3 path unchanged)
+AssertionError: expected null to be 1 // Object.is equality
+
+- Expected: 
+1
+
++ Received: 
+null
+
+ ❯ deploy/lib/__tests__/gate-hardening.test.ts:339:22
+    337|       AWS_S3_EXIT: "1",
+    338|     });
+    339|     expect(r.status).toBe(1);
+       |                      ^
+    340|     expect(r.out).toContain("non-interactive and the S3 audit failed");
+    341|     expect(r.out).not.toContain("no durable audit record");
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 11 passed (12)
+   Start at  13:21:06
+   Duration  638.40s (transform 92ms, setup 0ms, collect 85ms, tests 636.09s, environment 0ms, prepare 115ms)
+
