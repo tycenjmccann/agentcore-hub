@@ -387,6 +387,14 @@ export default defineConfig({
       // shape has to equal the shape the dossier's own events record, because "off
       // changes nothing" is the only claim that cannot be verified in production.
       "lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs",
+      // replay-f50ucz-ship-review-regression (TEAM-4246 D1 acceptance, FR-D1.13) —
+      // the other half of the acceptance argument. dowtdh proves D1 changes the
+      // wrong outcome; f50ucz is a run whose ship path CONVERGED (r1 CHANGES-NEEDED
+      // → 2 fixes + a CI re-cert → r2 PASS → merge approval → CD), and this replay
+      // pins that the ship-review round arithmetic, the ship verdict and the whole
+      // ship cascade are identical with the gate armed. A gate that perturbed a
+      // converging ship review would be worse than the hole it closes.
+      "lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
