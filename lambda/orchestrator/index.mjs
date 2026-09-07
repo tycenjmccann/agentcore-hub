@@ -53,7 +53,7 @@ import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.
 // Imported (as cascade.mjs does) rather than re-listed, so "what is mid-flight" has
 // one definition across the live re-verify, the verdict hold and FR-D1.7.
 import { createLiveReverify, normalizeLiveReverifyMode, LIVE_SHIP_STATUSES } from "./live-reverify.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, evaluateVerifiedHeads, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, evaluateVerifiedHeads, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, NO_OP_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
@@ -1957,8 +1957,8 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
             console.error(`[orchestrator] GUARD: Failed to resolve workflow for ticket ${ticketId}:`, err);
             return; // Fail closed
           }
-          if (!guardWorkflow || guardWorkflow.phase === "cancelled") {
-            console.log(`[orchestrator] GUARD: ${ticketId} unblocked but workflow ${guardWorkflow?.id || "unknown"} is cancelled — skipping`);
+          if (!guardWorkflow || isDispatchRefusedPhase(guardWorkflow.phase)) {
+            console.log(`[orchestrator] GUARD: ${ticketId} unblocked but workflow ${guardWorkflow?.id || "unknown"} is ${guardWorkflow?.phase || "missing"} — skipping`);
             return;
           }
           // ─── END CANCEL GUARD ───
@@ -1979,8 +1979,8 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
         console.error(`[orchestrator] GUARD: Failed to resolve workflow for ticket ${ticketId}:`, err);
         return; // Fail closed
       }
-      if (!guardWorkflow || guardWorkflow.phase === "cancelled") {
-        console.log(`[orchestrator] GUARD: Jira webhook for ${ticketId} ignored — workflow ${guardWorkflow?.id || "unknown"} is cancelled`);
+      if (!guardWorkflow || isDispatchRefusedPhase(guardWorkflow.phase)) {
+        console.log(`[orchestrator] GUARD: Jira webhook for ${ticketId} ignored — workflow ${guardWorkflow?.id || "unknown"} is ${guardWorkflow?.phase || "missing"}`);
         return;
       }
       // ─── END CANCEL GUARD ───
@@ -3741,6 +3741,26 @@ async function consumeResumeContext(workflow, ticketId) {
 }
 
 /**
+ * TEAM-4247 D2 — the phases on which the six dispatch guards below REFUSE to
+ * invoke an agent: "cancelled" (as before) plus every NO_OP_OUTCOMES phase.
+ *
+ * Closing a zero-yield sweep as `nothing-to-remove` skips the cascade for the
+ * detection ticket, but the cascade is not the only path to a dispatch: the
+ * reconcile sweep, a late Jira webhook, or a stream redelivery can each find the
+ * reviewer ticket's blocker already done and re-ready it on a later Lambda hop.
+ * The guards therefore have to refuse on the RUN's phase too, or D2's acceptance
+ * criterion ("no reviewer / QA / CI agent is ever dispatched after a no-op
+ * close") holds only for the immediate hop.
+ *
+ * Deliberately NOT widened to SHIP_BLOCKED_OUTCOMES: those runs produced a
+ * branch and a PR, and whether they should keep dispatching is a pre-existing
+ * question this helper does not answer.
+ */
+function isDispatchRefusedPhase(phase) {
+  return phase === "cancelled" || NO_OP_OUTCOMES.includes(phase);
+}
+
+/**
  * Unified "ticket ready" handler — works with both backends.
  * Called from processStatusChange (Jira webhook path).
  */
@@ -3756,7 +3776,7 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   // Human-review gate: park for a person instead of invoking an agent.
   if (isHumanAssignee(assignee)) {
     const gateWorkflow = await resolveWorkflow(workflowId, parentId);
-    if (gateWorkflow && gateWorkflow.phase === "cancelled") return;
+    if (gateWorkflow && isDispatchRefusedPhase(gateWorkflow.phase)) return;
     await handleHumanReviewGate(ticketId, assignee, gateWorkflow);
     return;
   }
@@ -3774,8 +3794,8 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   }
 
   // ─── CANCEL GUARD (defense-in-depth) ───
-  if (workflow.phase === "cancelled") {
-    console.log(`[orchestrator] GUARD (handleTicketReadyUnified): workflow ${workflow.id} is cancelled — not invoking ${assignee}`);
+  if (isDispatchRefusedPhase(workflow.phase)) {
+    console.log(`[orchestrator] GUARD (handleTicketReadyUnified): workflow ${workflow.id} is ${workflow.phase} — not invoking ${assignee}`);
     return;
   }
   // ─── END CANCEL GUARD ───
@@ -4028,8 +4048,8 @@ async function processRecord(record) {
             console.error(`[orchestrator] GUARD: Failed to resolve workflow for ticket ${ticketId}:`, err);
             return; // Fail closed — do not invoke if we can't verify state
           }
-          if (!guardWorkflow || guardWorkflow.phase === "cancelled") {
-            console.log(`[orchestrator] GUARD: Skipping invocation for ${ticketId} — workflow ${guardWorkflow?.id || "unknown"} is cancelled or not found`);
+          if (!guardWorkflow || isDispatchRefusedPhase(guardWorkflow.phase)) {
+            console.log(`[orchestrator] GUARD: Skipping invocation for ${ticketId} — workflow ${guardWorkflow?.id || "unknown"} is ${guardWorkflow?.phase || "not found"}`);
             return;
           }
         }
@@ -4255,7 +4275,7 @@ async function handleTicketReady(ticketId, image) {
   // Human-review gate: park for a person instead of invoking an agent.
   if (isHumanAssignee(assignee)) {
     const gateWorkflow = await resolveWorkflow(workflowId, parentId);
-    if (gateWorkflow && gateWorkflow.phase === "cancelled") return;
+    if (gateWorkflow && isDispatchRefusedPhase(gateWorkflow.phase)) return;
     await handleHumanReviewGate(ticketId, assignee, gateWorkflow);
     return;
   }

@@ -43,6 +43,7 @@ const h = vi.hoisted(() => ({
   state: {
     tickets: /** @type {Record<string, any>} */ ({}),
     children: /** @type {any[]} */ ([]),
+    scanRows: /** @type {any[]} */ ([]), // rows the reconcile sweep's Scan may see
     workflow: /** @type {any} */ (null),
     s3Objects: /** @type {Record<string, any>} */ ({}),
     s3Gets: /** @type {string[]} */ ([]),
@@ -81,7 +82,17 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           }
           if (name === "UpdateCommand") { h.state.updates.push(cmd.input); return {}; }
           if (name === "PutCommand") { h.state.events.push(cmd.input.Item); return {}; }
-          if (name === "ScanCommand") return { Items: [] };
+          if (name === "ScanCommand") {
+            // The reconcile sweep's open-workflow scan (sweep-scan.mjs) filters on
+            // NOT (#p IN (:tp0…)), derived from TERMINAL_WORKFLOW_PHASES. Evaluate
+            // that filter for REAL against `scanRows` so "a closed run is never
+            // swept" is a property of the expression the code builds, not of the
+            // mock. Empty by default → every other test is unaffected.
+            const excluded = Object.entries(cmd.input.ExpressionAttributeValues || {})
+              .filter(([k]) => k.startsWith(":tp"))
+              .map(([, v]) => v);
+            return { Items: (h.state.scanRows || []).filter((r) => !excluded.includes(r.phase)) };
+          }
           return {};
         },
       }),
@@ -268,6 +279,7 @@ beforeEach(() => {
     [DETECT]: { ticketId: DETECT, parentId: EPIC, workflowId: WF, assignee: SWEEPER, phase: "detection", status: "done" },
   };
   h.state.children = board();
+  h.state.scanRows = [];
   h.state.workflow = makeWorkflow();
   h.state.s3Objects = {
     "config/workflows.json": { workflows: [sweepDefWithDetection()] },
@@ -569,5 +581,95 @@ describe("the detection required-phase strip (config can be synced at any time)"
     await load("shadow");
     const other = { id: "software-delivery", completionRequiresAgentPhases: ["development"] };
     expect(stripUnenforcedDetectionPhase(other)).toBe(other);
+  });
+});
+
+/**
+ * TEAM-4247 D2 — the close skips the cascade, but the cascade is not the only way
+ * a successor gets dispatched.
+ *
+ * D2's acceptance criterion is that a code reviewer / QA verifier / CI agent is
+ * NEVER dispatched after a nothing-to-remove close — not merely "not on the hop
+ * that closed the run". Dispatch is level-triggered: the reconcile sweep re-drives
+ * any dependent whose blockers all read done, a late Jira webhook or a redelivered
+ * stream record re-enters the Ready handler, and the reviewer's only blocker (the
+ * detection ticket) IS done. So the guards have to refuse on the RUN's phase.
+ *
+ * Both halves are asserted against the same board with only `workflow.phase`
+ * differing, so neither assertion can pass vacuously.
+ */
+describe("no dispatch AFTER the close (the level-trigger paths)", () => {
+  beforeEach(async () => {
+    process.env.RECONCILE_SWEEP_MODE = "enforce";
+    await load("enforce");
+    // The reviewer ticket has to be readable: the stream guard re-reads the ticket
+    // before resolving its workflow.
+    h.state.tickets[REVIEW] = {
+      ticketId: REVIEW, parentId: EPIC, workflowId: WF,
+      assignee: "agentcore_hub_code_reviewer", status: "todo", blockedBy: [DETECT],
+    };
+  });
+
+  afterEach(() => { delete process.env.RECONCILE_SWEEP_MODE; });
+
+  /** A stream MODIFY that re-readies the reviewer, its blocker already done. */
+  const readyRecord = (status) => ({
+    eventName: "MODIFY",
+    dynamodb: {
+      OldImage: { ticketId: { S: REVIEW }, status: { S: "blocked" } },
+      NewImage: {
+        ticketId: { S: REVIEW },
+        status: { S: status },
+        assignee: { S: "agentcore_hub_code_reviewer" },
+        parentId: { S: EPIC },
+        workflowId: { S: WF },
+        blockedBy: { L: [{ S: DETECT }] },
+        title: { S: "Review the sweep" },
+      },
+    },
+  });
+
+  /** Everything an agent dispatch would leave behind, on any path. */
+  const dispatchTraces = () => ({
+    invokes: h.state.lambdaInvokes.length,
+    invokedEvents: eventsOfType("orchestrator.agent_invoked").length + eventsOfType("agent.started").length,
+    claimed: statusWrites().filter(([id, s]) => id === REVIEW && s === "in_progress").length,
+  });
+
+  for (const status of ["ready", "todo"]) {
+    it(`refuses a late "${status}" delivery for the reviewer once the run is closed`, async () => {
+      await handleTicketDoneUnified(DETECT);
+      expectClosedNothingToRemove();
+      // What the winning CAS wrote — claimTerminalOutcome is mocked, so model it.
+      h.state.workflow.phase = "nothing-to-remove";
+      h.state.events.length = 0;
+      h.state.updates.length = 0;
+      h.state.lambdaInvokes.length = 0;
+
+      await handler({ Records: [readyRecord(status)] });
+
+      expect(dispatchTraces()).toEqual({ invokes: 0, invokedEvents: 0, claimed: 0 });
+    });
+  }
+
+  it("DOES dispatch the same delivery while the run is open (the guard is the only difference)", async () => {
+    await handler({ Records: [readyRecord("ready")] });
+    // phase is still "detection" — an ordinary open run, so the reviewer runs.
+    const t = dispatchTraces();
+    expect(t.invokes + t.invokedEvents + t.claimed).toBeGreaterThan(0);
+  });
+
+  it("the reconcile sweep does not even SEE a closed run (the scan's terminal filter)", async () => {
+    h.state.scanRows = [{ ...makeWorkflow({ phase: "nothing-to-remove" }) }];
+    const result = await handler({ source: "orchestrator.sweep", action: "reconcile_sweep" });
+
+    expect(result).toMatchObject({ mode: "enforce", candidates: 0, redispatched: 0 });
+    expect(dispatchTraces()).toEqual({ invokes: 0, invokedEvents: 0, claimed: 0 });
+  });
+
+  it("…and DOES see the same run while it is open (non-vacuous)", async () => {
+    h.state.scanRows = [{ ...makeWorkflow() }]; // phase: "detection"
+    const result = await handler({ source: "orchestrator.sweep", action: "reconcile_sweep" });
+    expect(result.candidates).toBeGreaterThan(0);
   });
 });
