@@ -1241,6 +1241,63 @@ describe("TEAM-4166 D2 §2.3 — evidence-gated escalation guard", () => {
     expect(redispatch).not.toHaveBeenCalled();
   });
 
+  /**
+   * TEAM-4184 F2 (review finding of TEAM-4168) — the cap-path payload used to be
+   * a lie. It fell back to the RAW stamp (`preconditionUnmet.awaitingIds`) with
+   * `waitedMs: 0`, and the cap path is only reachable once the union has resolved
+   * — so every id it printed was already `done`, and the operator it paged was
+   * pointed at closed tickets with an impossible wait of zero.
+   */
+  it("TEAM-4184 F2: at the cap with the awaited work all landed → EMPTY awaitingIds, reason clean_exit_cap, a real waitedMs", async () => {
+    const { cascade, store, publishEvent } = setup();
+    const sibling = {
+      ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE],
+      preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T09:00:00Z" },
+    };
+    // Everything awaited has landed — which is exactly why the cap path is reached.
+    const siblings = [{ ticketId: FIX, status: "done" }, { ticketId: DONE, status: "done" }, sibling];
+    const wf = budgetSpentWorkflow(
+      { status: "running", startedAt: STALE_STARTED },
+      { cleanExitRedispatches: { "TEAM-2": 3 } },
+    );
+
+    await cascade.reconcileDependent(sibling, "reconcile-sweep", wf, newMetrics(), "enforce", siblings);
+
+    const [ev] = eventsOfType(publishEvent, "orchestrator.await_timeout");
+    expect(ev).toBeTruthy();
+    const detail = ev[2];
+    expect(detail.awaitingIds).toEqual([]);          // nothing is awaited — say so
+    expect(detail.reason).toBe("clean_exit_cap");     // …and say WHY the list is empty
+    expect(detail.waitedMs).toBe(NOW - Date.parse("2026-09-01T09:00:00Z")); // 3h, not 0
+    expect(detail.source).toBe("reconcile-sweep");
+    // Still exactly one CAS-gated advisory event, still no page.
+    expect(store.markAwaitTimeoutEmitted).toHaveBeenCalledTimes(1);
+    expect(store.appendNotification).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "agent.escalated")).toHaveLength(0);
+  });
+
+  it("TEAM-4184 F2: with NO sibling snapshot the un-provable ids are still reported (reason await_timeout)", async () => {
+    // reconcileDependent may be called without a snapshot; unionBlockersResolved is
+    // then vacuously true, so the cap path is reached with nothing PROVEN closed.
+    // The conservative direction for a wait SLA is to report those ids.
+    const { cascade, publishEvent } = setup();
+    const sibling = {
+      ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [],
+      preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T09:00:00Z" },
+    };
+    const wf = budgetSpentWorkflow(
+      { status: "running", startedAt: STALE_STARTED },
+      { cleanExitRedispatches: { "TEAM-2": 3 } },
+    );
+
+    await cascade.reconcileDependent(sibling, "reconcile-sweep", wf, newMetrics(), "enforce", undefined);
+
+    const detail = eventsOfType(publishEvent, "orchestrator.await_timeout")[0][2];
+    expect(detail.awaitingIds).toEqual([FIX]);
+    expect(detail.reason).toBe("await_timeout");
+    expect(detail.waitedMs).toBe(NOW - Date.parse("2026-09-01T09:00:00Z"));
+  });
+
   it("no evidence (not completed, not parked clean) → the EXISTING escalate, now carrying six evidence fields", async () => {
     const { cascade, store, publishEvent } = setup({ getLastStreamAt: vi.fn(async () => "2026-09-01T05:00:00Z") });
     const sibling = { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] };

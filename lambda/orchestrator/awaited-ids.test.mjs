@@ -4,6 +4,10 @@ import {
   normalizeAwaitedIdsMode,
   AWAITED_IDS_MODES,
   tallyBlockerResult,
+  parkEvidence,
+  isStampCurrent,
+  nonTerminalAwaitedIds,
+  awaitedWaitedMs,
 } from "./awaited-ids.mjs";
 import { normalizeSyncMode } from "./sync-main.mjs";
 import { KIND_TO_ORIGIN_KEY } from "./fix-contract.mjs";
@@ -245,6 +249,22 @@ for (const provider of ["dynamodb", "jira"]) {
         expect(m.derived).toBe(1);
       });
 
+      /**
+       * TEAM-4184 — the stamp's `source` must survive the write. It was hardcoded
+       * "derived" for every caller, so an agent's own `Tickets___report_precondition`
+       * report (source "tool") was persisted as an orchestrator-derived guess; the
+       * tickets Lambda's monotonic merge then had nothing to rank, and the more
+       * authoritative source was lost.
+       */
+      it("stamps the caller's source: tool stays tool, spawnedBy stays derived", async () => {
+        const h = makeDeps({ provider, mode: "enforce" });
+        const ai = createAwaitedIds(h.deps);
+        ai.newMetrics();
+        await ai.applyAwaitedEdges("TEAM-4126", ["TEAM-4156"], "tool");
+        await ai.applyAwaitedEdges("TEAM-4126", ["TEAM-4157"], "spawnedBy");
+        expect(h._annotateCalls.map((c) => c.payload.source)).toEqual(["tool", "derived"]);
+      });
+
       it("dedupes, drops self-reference, and caps at 20 ids", async () => {
         const h = makeDeps({ provider, mode: "enforce" });
         const ai = createAwaitedIds(h.deps);
@@ -309,6 +329,27 @@ for (const provider of ["dynamodb", "jira"]) {
         expect(m.timeouts).toBe(1);
       });
 
+      // TEAM-4184 F2 — the event now says WHY it fired, because the D2 cap path can
+      // legitimately emit it with an EMPTY awaitingIds (nothing is awaited any
+      // more; the ticket simply ran out of automatic re-wakes).
+      it("carries the reason through to the payload, defaulting to await_timeout", async () => {
+        const h = makeDeps({ provider, mode: "enforce", casResults: [true] });
+        const ai = createAwaitedIds(h.deps);
+        ai.newMetrics();
+        await ai.emitAwaitTimeoutOnce({ id: "wf_1" }, "TEAM-4126", [], 3 * 3600_000, "dead-session-detector", { reason: "clean_exit_cap" });
+        expect(h._events[0].detail).toMatchObject({
+          awaitingIds: [], waitedMs: 3 * 3600_000, source: "dead-session-detector", reason: "clean_exit_cap",
+        });
+      });
+
+      it("the pre-4184 5-argument call still emits reason await_timeout", async () => {
+        const h = makeDeps({ provider, mode: "enforce", casResults: [true] });
+        const ai = createAwaitedIds(h.deps);
+        ai.newMetrics();
+        await ai.emitAwaitTimeoutOnce({ id: "wf_1" }, "TEAM-4126", ["TEAM-4156"], 99, "reconcile-sweep");
+        expect(h._events[0].detail.reason).toBe("await_timeout");
+      });
+
       it("shadow logs the decision but writes no store row and emits no event", async () => {
         const marked = [];
         const h = makeDeps({
@@ -349,3 +390,230 @@ for (const provider of ["dynamodb", "jira"]) {
     });
   });
 }
+
+/**
+ * TEAM-4184 F1 — the D2 evidence predicate, the ONE thing cascade.mjs and
+ * dead-session-detector.mjs both ask "is this preconditionUnmet stamp evidence
+ * about the CLAIM I am inspecting, or residue from an earlier one?".
+ *
+ * The bug it replaces tested mere PRESENCE of the stamp. Since nothing ever clears
+ * preconditionUnmet, a ticket that parked once could never be escalated again: its
+ * correct clean re-wake burned the cap, and the re-woken session — however dead —
+ * kept reading "parked clean" off the original stamp. §2.3 always specified an
+ * UNRESOLVED stamp; these are the three ways a stamp is still unresolved.
+ */
+describe("parkEvidence / isStampCurrent / nonTerminalAwaitedIds (TEAM-4184 F1)", () => {
+  const SHIP = "TEAM-4126";
+  const CLAIM = "2026-09-06T07:43:10.259Z";      // the claim under inspection
+  const BEFORE_CLAIM = "2026-09-06T07:07:00.000Z"; // the stamp the RM wrote earlier
+  const AFTER_CLAIM = "2026-09-06T09:10:00.000Z";  // a re-park inside this claim
+
+  const ticketWith = (reportedAt, awaitingIds = ["TEAM-4156", "TEAM-4157"]) => ({
+    ticketId: SHIP,
+    status: "in_progress",
+    blockedBy: ["TEAM-4125", ...awaitingIds],
+    ...(awaitingIds ? { preconditionUnmet: { awaitingIds, source: "tool", ...(reportedAt ? { reportedAt } : {}) } } : {}),
+  });
+  const board = (statuses) => Object.entries(statuses).map(([ticketId, status]) => ({ ticketId, status }));
+  const ALL_DONE = board({ "TEAM-4125": "done", "TEAM-4156": "done", "TEAM-4157": "done" });
+  const ONE_OPEN = board({ "TEAM-4125": "done", "TEAM-4156": "done", "TEAM-4157": "in_progress" });
+
+  describe("nonTerminalAwaitedIds", () => {
+    it("is the union of awaitingIds and blockedBy, minus what the snapshot proves terminal", () => {
+      expect(nonTerminalAwaitedIds(ticketWith(BEFORE_CLAIM), ONE_OPEN)).toEqual(["TEAM-4157"]);
+      expect(nonTerminalAwaitedIds(ticketWith(BEFORE_CLAIM), ALL_DONE)).toEqual([]);
+    });
+
+    it("counts an id ABSENT from the snapshot as non-terminal (it cannot be proven closed)", () => {
+      expect(nonTerminalAwaitedIds(ticketWith(BEFORE_CLAIM), board({ "TEAM-4125": "done" })))
+        .toEqual(["TEAM-4156", "TEAM-4157"]);
+    });
+
+    it("never counts the ticket itself, and ignores cancelled as terminal", () => {
+      const t = { ticketId: SHIP, blockedBy: [SHIP], preconditionUnmet: { awaitingIds: ["TEAM-4156"] } };
+      expect(nonTerminalAwaitedIds(t, board({ [SHIP]: "in_progress", "TEAM-4156": "cancelled" }))).toEqual([]);
+    });
+
+    it("drops ids that are not ticket-shaped rather than treating junk as an open blocker", () => {
+      const t = { ticketId: SHIP, blockedBy: ["", "not a ticket", null], preconditionUnmet: { awaitingIds: ["nope"] } };
+      expect(nonTerminalAwaitedIds(t, [])).toEqual([]);
+    });
+
+    it("with NO snapshot returns [] — 'nothing provably open', not 'everything open'", () => {
+      // Same direction cascade.unionBlockersResolved(t, undefined) fails in
+      // (resolved): a caller without a snapshot must not have the open-work term
+      // decide for it.
+      expect(nonTerminalAwaitedIds(ticketWith(BEFORE_CLAIM), undefined)).toEqual([]);
+      expect(nonTerminalAwaitedIds(ticketWith(BEFORE_CLAIM), null)).toEqual([]);
+    });
+  });
+
+  describe("isStampCurrent", () => {
+    it("true at or after the claim start, false before it", () => {
+      expect(isStampCurrent({ reportedAt: AFTER_CLAIM }, CLAIM)).toBe(true);
+      expect(isStampCurrent({ reportedAt: CLAIM }, CLAIM)).toBe(true); // boundary: same instant counts
+      expect(isStampCurrent({ reportedAt: BEFORE_CLAIM }, CLAIM)).toBe(false);
+    });
+
+    it("no parseable claimStartedAt → TRUE (staleness cannot be proven, so nothing becomes escalatable)", () => {
+      expect(isStampCurrent({ reportedAt: BEFORE_CLAIM }, null)).toBe(true);
+      expect(isStampCurrent({ reportedAt: BEFORE_CLAIM }, "not-a-date")).toBe(true);
+    });
+
+    it("no parseable reportedAt → FALSE (not provably current; the other terms still hold it)", () => {
+      // The jira shape before TEAM-4184's precondition-at label existed.
+      expect(isStampCurrent({ awaitingIds: ["TEAM-4156"], source: "label" }, CLAIM)).toBe(false);
+      expect(isStampCurrent({ reportedAt: "" }, CLAIM)).toBe(false);
+      expect(isStampCurrent(undefined, CLAIM)).toBe(false);
+    });
+  });
+
+  describe("parkEvidence", () => {
+    it("no stamp → not parked clean (the FR-2.1c control: a genuinely dead session)", () => {
+      expect(parkEvidence({ ticketId: SHIP, blockedBy: ["TEAM-4125"] }, { siblings: ALL_DONE, claimStartedAt: CLAIM }))
+        .toEqual({ parkedClean: false, reason: "no-stamp", awaitingIds: [] });
+      // An empty awaitingIds array is not a stamp either.
+      expect(parkEvidence({ ticketId: SHIP, preconditionUnmet: { awaitingIds: [] } }, { claimStartedAt: CLAIM }).reason)
+        .toBe("no-stamp");
+    });
+
+    it("awaited-open: something is still open → parked clean, whatever the stamp's age (FR-2.1)", () => {
+      const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+        siblings: ONE_OPEN, claimStartedAt: CLAIM, cleanRedispatches: 2,
+      });
+      expect(ev).toEqual({ parkedClean: true, reason: "awaited-open", awaitingIds: ["TEAM-4157"] });
+    });
+
+    it("stamp-current: a RE-PARK inside this claim is parked clean even with everything closed", () => {
+      const ev = parkEvidence(ticketWith(AFTER_CLAIM), {
+        siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 1,
+      });
+      expect(ev).toEqual({ parkedClean: true, reason: "stamp-current", awaitingIds: [] });
+    });
+
+    it("unconsumed-stamp: an older stamp not yet acted on still earns the re-wake (FR-2.1b)", () => {
+      const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+        siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 0,
+      });
+      expect(ev).toEqual({ parkedClean: true, reason: "unconsumed-stamp", awaitingIds: [] });
+    });
+
+    it("stale-stamp: acted on, everything closed, stamp predates the claim → NOT parked clean", () => {
+      // THE FIX. This is the state a re-woken session that then died leaves
+      // behind, and it used to read "parked clean" forever.
+      const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+        siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 1,
+      });
+      expect(ev).toEqual({ parkedClean: false, reason: "stale-stamp", awaitingIds: [] });
+    });
+
+    it("a clock-less stamp (jira before the precondition-at label) is held by the budget term, then goes stale", () => {
+      const noClock = ticketWith(null);
+      expect(parkEvidence(noClock, { siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 0 }).reason)
+        .toBe("unconsumed-stamp");
+      expect(parkEvidence(noClock, { siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 1 }).reason)
+        .toBe("stale-stamp");
+      // …but open awaited work still wins, on any provider.
+      expect(parkEvidence(noClock, { siblings: ONE_OPEN, claimStartedAt: CLAIM, cleanRedispatches: 1 }).reason)
+        .toBe("awaited-open");
+    });
+
+    it("defaults are safe: no options at all → no-snapshot short-circuit, not stale-stamp", () => {
+      // No `siblings` key at all is the SAME "can't see the board" case as an
+      // explicit undefined/null (TEAM-4184) — it must never fall through to a
+      // claim-currency/budget verdict it has no evidence for.
+      expect(parkEvidence(ticketWith(BEFORE_CLAIM))).toEqual({
+        parkedClean: true, reason: "awaited-open", awaitingIds: ["TEAM-4156", "TEAM-4157", "TEAM-4125"],
+      });
+    });
+
+    /**
+     * TEAM-4184 (review finding of TEAM-4168): the guard's own no-siblings
+     * default used to be nonTerminalAwaitedIds(ticket, siblings) — [] for any
+     * non-array `siblings` — which is the RIGHT polarity for checkAwaitTimeout
+     * (advisory only) but the WRONG one here. An unwired reader, or a fetch
+     * that failed and degraded to null (dead-session-detector.mjs's own
+     * catch block), then read as "nothing is open", and a stamp older than the
+     * claim with a spent clean-exit budget fell through to stale-stamp: a
+     * transient DDB/Jira read error escalating a live, legitimately parked
+     * ticket — the exact false-positive class TEAM-4184 F1 exists to prevent,
+     * just triggered by infra flakiness instead of stale data.
+     */
+    it("no snapshot at all (fetch failed/unwired) is scored as unproven, NOT as resolved — even with a stale stamp and a spent budget", () => {
+      for (const siblings of [undefined, null]) {
+        const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+          siblings, claimStartedAt: CLAIM, cleanRedispatches: 1,
+        });
+        expect(ev.parkedClean).toBe(true);
+        expect(ev.reason).toBe("awaited-open");
+        expect(ev.reason).not.toBe("stale-stamp");
+      }
+    });
+
+    it("a REAL empty snapshot (parent genuinely has no other children) is NOT the same code path as no snapshot, but lands on the same verdict", () => {
+      // [] is an array — Array.isArray([]) is true — so this takes the NORMAL
+      // nonTerminalAwaitedIds path, not the no-snapshot short-circuit; every
+      // awaited id is simply absent from it and so still counted non-terminal
+      // (nonTerminalAwaitedIds's own "absent = unproven" rule). Same reason,
+      // same ids, reached by the already-correct existing path — confirming
+      // the new short-circuit only changes behavior when siblings ISN'T an
+      // array at all.
+      const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+        siblings: [], claimStartedAt: CLAIM, cleanRedispatches: 1,
+      });
+      expect(ev).toEqual({
+        parkedClean: true, reason: "awaited-open", awaitingIds: ["TEAM-4156", "TEAM-4157", "TEAM-4125"],
+      });
+    });
+
+    it("a non-numeric cleanRedispatches is treated as unspent, not as a spent budget", () => {
+      for (const v of [undefined, null, "", NaN, "1"]) {
+        const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+          siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: v,
+        });
+        // "1" coerces to a real spent budget; the empty/absent forms do not.
+        expect(ev.reason).toBe(v === "1" ? "stale-stamp" : "unconsumed-stamp");
+      }
+    });
+
+    it("is PURE — it never touches the ticket it is handed", () => {
+      const t = ticketWith(BEFORE_CLAIM);
+      const before = JSON.stringify(t);
+      parkEvidence(t, { siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 1 });
+      expect(JSON.stringify(t)).toBe(before);
+    });
+  });
+});
+
+/**
+ * TEAM-4184 F2 — the wait itself, factored out of checkAwaitTimeout so the D2 cap
+ * path can report a real wait even when NOTHING is awaited any more (which is the
+ * only way the cap path is reached). It used to hard-code `waitedMs: 0` there.
+ */
+describe("awaitedWaitedMs (TEAM-4184 F2)", () => {
+  const NOW_MS = Date.parse("2026-09-06T12:00:00.000Z");
+
+  it("measures from preconditionUnmet.reportedAt when there is a stamp", () => {
+    const t = { ticketId: "TEAM-4126", updatedAt: "2026-09-06T11:59:00.000Z",
+      preconditionUnmet: { awaitingIds: ["TEAM-4156"], reportedAt: "2026-09-06T09:00:00.000Z" } };
+    expect(awaitedWaitedMs(t, NOW_MS)).toBe(3 * 3600_000); // the stamp wins over updatedAt
+  });
+
+  it("falls back to updatedAt when the stamp carries no clock (the legacy jira shape)", () => {
+    const t = { ticketId: "TEAM-4126", updatedAt: "2026-09-06T10:30:00.000Z",
+      preconditionUnmet: { awaitingIds: ["TEAM-4156"], source: "label" } };
+    expect(awaitedWaitedMs(t, NOW_MS)).toBe(90 * 60_000);
+  });
+
+  it("0 when neither timestamp is parseable — an unknown wait is never invented", () => {
+    expect(awaitedWaitedMs({ ticketId: "TEAM-4126" }, NOW_MS)).toBe(0);
+    expect(awaitedWaitedMs({ ticketId: "TEAM-4126", updatedAt: "whenever" }, NOW_MS)).toBe(0);
+    expect(awaitedWaitedMs(null, NOW_MS)).toBe(0);
+    expect(awaitedWaitedMs({ updatedAt: "2026-09-06T09:00:00.000Z" }, NaN)).toBe(0);
+  });
+
+  it("never negative — a stamp in the future reads as no wait, not a negative one", () => {
+    const t = { preconditionUnmet: { reportedAt: "2026-09-06T13:00:00.000Z" } };
+    expect(awaitedWaitedMs(t, NOW_MS)).toBe(0);
+  });
+});

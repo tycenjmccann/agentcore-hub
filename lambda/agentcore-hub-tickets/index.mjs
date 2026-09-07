@@ -41,6 +41,7 @@ import {
   validateFixContract,
   normalizeContractMode,
   sanitizeUserLabels,
+  maxReportedAt,
 } from "./fix-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -898,6 +899,14 @@ async function addComment(args) {
  * ticket can accumulate siblings across several agent reports rather than having
  * the latest report clobber the earlier ones.
  */
+/**
+ * How authoritative a preconditionUnmet `source` is (TEAM-4184): an agent's own
+ * tool report beats an orchestrator-derived spawn edge, which beats a stamp
+ * reconstructed from Jira labels. Unknown/absent ranks lowest, so any real source
+ * wins over a row that never carried one.
+ */
+const SOURCE_RANK = (source) => ({ tool: 3, derived: 2, label: 1 })[source] || 0;
+
 async function annotatePreconditionUnmet(args) {
   const issueKey = args.issue_key || args.ticket_id;
   if (!issueKey) return textResult("Error: 'issue_key' is required");
@@ -922,12 +931,26 @@ async function annotatePreconditionUnmet(args) {
   }
 
   const now = new Date().toISOString();
+  // TEAM-4184 — the merge is MONOTONIC in the two fields the D2 evidence guard
+  // reasons about, because re-reports are not ordered. The orchestrator's
+  // level-triggered pickup re-annotates from the persisted row with a
+  // spawn-derived stamp, which can land AFTER the agent's own tool report: a
+  // last-writer-wins merge would then walk `reportedAt` backwards (making a
+  // current stamp look like a previous claim's residue) and downgrade `source`
+  // tool -> derived. The awaited ids already union for the same reason.
+  const incomingReportedAt = args.reportedAt || now;
+  const reportedAt = maxReportedAt(current.Item.preconditionUnmet?.reportedAt, incomingReportedAt)
+    || incomingReportedAt;
+  const incomingSource = args.source || "tool";
+  const source = SOURCE_RANK(current.Item.preconditionUnmet?.source) > SOURCE_RANK(incomingSource)
+    ? current.Item.preconditionUnmet.source
+    : incomingSource;
   const preconditionUnmet = {
     awaitingIds,
     note: typeof args.note === "string" ? args.note : "",
-    reportedAt: args.reportedAt || now,
+    reportedAt,
     agentId: args.agentId || null,
-    source: args.source || "tool",
+    source,
   };
 
   await ddb.send(

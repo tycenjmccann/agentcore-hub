@@ -71,7 +71,13 @@ import { applyBlockerEdge, normalizePreserveStatuses } from "./ticket-blockers.m
 // (No `escapeJql` here: the orchestrator's ONE JQL site interpolates an issue
 // key into an unquoted `parent = …` operand, which escaping cannot make safe —
 // it is shape-checked and refused instead. See getChildTicketsFromJira.)
-import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE } from "./fix-contract.mjs";
+import {
+  KIND_TO_ORIGIN_KEY,
+  parseFixContractBlock,
+  TICKET_KEY_RE,
+  reportedAtFromLabels,
+  maxReportedAt,
+} from "./fix-contract.mjs";
 import {
   normalizeChainGateMode, chainFor, chainDir, requiredArtifactsForTicket, sdlcFrameworkContext,
   gateInstructionOverride, fallbackReviewPackagePhase, artifactRepoPath, missingArtifactNote,
@@ -159,7 +165,10 @@ const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
 const AWAITED_IDS_MODE = normalizeAwaitedIdsMode(process.env.AWAITED_IDS_MODE);
 // The wait-SLA (D1 §5): once a ticket has awaited its open fixes longer than this,
 // the sweep/detector emit ONE advisory orchestrator.await_timeout (an event, never
-// a humanNotification). Default 120 minutes.
+// a humanNotification). Default 120 minutes. The event lists only ids still proven
+// non-terminal, and carries reason=await_timeout (a real SLA breach) or
+// reason=clean_exit_cap (re-woken to the D2 cap with nothing left awaited, so
+// awaitingIds is empty) — TEAM-4184 F2.
 const AWAITED_IDS_TIMEOUT_MINUTES = Number.parseInt(process.env.AWAITED_IDS_TIMEOUT_MINUTES || "", 10) > 0
   ? Number.parseInt(process.env.AWAITED_IDS_TIMEOUT_MINUTES, 10)
   : 120;
@@ -5625,6 +5634,13 @@ export function mapJiraIssueToTicket(issue) {
   // source — the D2 liveness clock reads reportedAt). Labels are the durable
   // index; the marker only enriches. Mirrors the spawnedBy-from-labels rebuild
   // above so a Jira-mode ticket carries the same field DynamoDB mode stores.
+  //
+  // TEAM-4184: reportedAt now comes off the `precondition-at:<epochMs>` LABEL as
+  // well, and the two carriers are combined with max(). That matters because the
+  // read the D2 evidence guard actually runs on siblings
+  // (getChildTicketsFromJira) requests no `comment` field at all, and where
+  // comments ARE in scope Jira caps them at the 20 OLDEST — so the marker can be
+  // absent or stale while the label is neither. Max, not marker-precedence.
   const awaitingLabelIds = labels
     .filter((l) => l.startsWith("awaiting:"))
     .map((l) => l.slice("awaiting:".length))
@@ -5636,9 +5652,10 @@ export function mapJiraIssueToTicket(issue) {
     for (const id of [...(preconditionMarker?.awaitingIds || []), ...awaitingLabelIds]) {
       if (typeof id === "string" && id && !ids.includes(id)) ids.push(id);
     }
+    const reportedAt = maxReportedAt(preconditionMarker?.reportedAt, reportedAtFromLabels(labels));
     preconditionUnmet = {
       awaitingIds: ids,
-      ...(preconditionMarker?.reportedAt ? { reportedAt: preconditionMarker.reportedAt } : {}),
+      ...(reportedAt ? { reportedAt } : {}),
       ...(preconditionMarker?.agentId !== undefined ? { agentId: preconditionMarker.agentId } : {}),
       source: preconditionMarker?.source || "label",
     };

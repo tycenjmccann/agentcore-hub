@@ -4,6 +4,13 @@ import { fileURLToPath } from "node:url";
 import { createAwaitedIds } from "./awaited-ids.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
+import {
+  PRECONDITION_AT_PREFIX,
+  preconditionAtLabel,
+  preconditionAtMsFromLabels,
+  reportedAtFromLabels,
+  maxReportedAt,
+} from "./fix-contract.mjs";
 
 /**
  * TEAM-4166 — the shared in-memory harness for the two f50ucz acceptance replays
@@ -129,24 +136,69 @@ export function makeWorld({
 
   // ── the preconditionUnmet stamp, through the SAME Tickets___* tool shape the
   //    report_precondition_unmet channel uses. Merges ids; returns the real
-  //    annotate Lambda shape { ticketId, preconditionUnmet } (TEAM-4156 contract). ──
+  //    annotate Lambda shape { ticketId, preconditionUnmet } (TEAM-4156 contract).
+  //
+  //    PROVIDER-AWARE (TEAM-4184): in jira mode there is no structured record —
+  //    the stamp IS labels (`awaiting:<id>` + the monotonic
+  //    `precondition-at:<epochMs>` clock), and the READ path reconstructs
+  //    preconditionUnmet from them (projectRead below), exactly as
+  //    annotatePreconditionUnmet + mapJiraIssueToTicket do. So a jira-mode world
+  //    exercises the real label round trip, including its lossiness. ──
   const annotatePreconditionUnmet = vi.fn(async (originId, { awaitingIds, source, reportedAt }) => {
     const t = tickets[originId];
-    const prior = t?.preconditionUnmet?.awaitingIds || [];
+    const prior = projectRead(t)?.preconditionUnmet?.awaitingIds || [];
     const merged = [...new Set([...prior, ...awaitingIds])];
-    const preconditionUnmet = { awaitingIds: merged, source, reportedAt };
-    if (t) t.preconditionUnmet = preconditionUnmet;
+    // The real tool's MONOTONIC merge (TEAM-4184): reportedAt never moves
+    // backwards and source is never downgraded tool -> derived.
+    const priorPu = provider === "jira" ? projectRead(t)?.preconditionUnmet : t?.preconditionUnmet;
+    const rank = (src) => ({ tool: 3, derived: 2, label: 1 })[src] || 0;
+    const preconditionUnmet = {
+      awaitingIds: merged,
+      source: rank(priorPu?.source) > rank(source) ? priorPu.source : source,
+      reportedAt: maxReportedAt(priorPu?.reportedAt, reportedAt) || reportedAt,
+    };
+    if (t && provider === "jira") {
+      const labels = [...(t.labels || [])];
+      for (const id of merged) {
+        if (!labels.includes(`awaiting:${id}`)) labels.push(`awaiting:${id}`);
+      }
+      const atLabel = preconditionAtLabel(reportedAt);
+      const existingMs = preconditionAtMsFromLabels(labels);
+      const incomingMs = preconditionAtMsFromLabels([atLabel].filter(Boolean));
+      t.labels = atLabel && (existingMs === null || incomingMs > existingMs)
+        ? [...labels.filter((l) => !l.startsWith(PRECONDITION_AT_PREFIX)), atLabel] // newest wins
+        : labels;                                                                   // never backwards
+    } else if (t) {
+      t.preconditionUnmet = preconditionUnmet;
+    }
     return { ticketId: originId, preconditionUnmet };
   });
+
+  /**
+   * The jira read path: rebuild preconditionUnmet from the labels (the mapper's
+   * job — orchestrator index.mjs mapJiraIssueToTicket). A DynamoDB-mode row is
+   * returned untouched, since there the field is stored natively.
+   */
+  function projectRead(t) {
+    if (!t || provider !== "jira") return t;
+    const labels = t.labels || [];
+    const awaitingIds = labels
+      .filter((l) => l.startsWith("awaiting:"))
+      .map((l) => l.slice("awaiting:".length))
+      .filter(Boolean);
+    if (!awaitingIds.length) return t;
+    const reportedAt = reportedAtFromLabels(labels);
+    return { ...t, preconditionUnmet: { awaitingIds, ...(reportedAt ? { reportedAt } : {}), source: "label" } };
+  }
 
   // ── effects ──
   const events = [];
   const publishEvent = vi.fn(async (ticketId, type, detail) => { events.push({ ticketId, type, detail }); });
   const getChildTickets = vi.fn(async (parentId) => {
     syncClock();
-    return Object.values(tickets).filter((t) => t.parentId === parentId);
+    return Object.values(tickets).filter((t) => t.parentId === parentId).map(projectRead);
   });
-  const getTicket = vi.fn(async (id) => { syncClock(); return tickets[id] || null; });
+  const getTicket = vi.fn(async (id) => { syncClock(); return projectRead(tickets[id]) || null; });
 
   // ── the in-memory workflow store (R2). markAwaitTimeoutEmitted + the clean-exit
   //    CAS are the D1/D2 additions; the rest is what the cascade touches. ──
@@ -193,6 +245,9 @@ export function makeWorld({
   });
 
   const getLastStreamAt = vi.fn(async () => null);
+  // The dead-escalate branch's ticket-side effect (index.mjs blockTicket), kept as
+  // a named seam so the replays can assert it fired.
+  const blockTicket = vi.fn(async () => {});
 
   const awaited = createAwaitedIds({
     addBlockers,
@@ -222,7 +277,7 @@ export function makeWorld({
     redispatch,
     reawakenGate: vi.fn(async () => true),
     store,
-    blockTicket: vi.fn(async () => {}),
+    blockTicket,
     awaitedIds: awaited,
     cleanExitRedispatchCap: 3,
     getLastStreamAt,
@@ -237,9 +292,9 @@ export function makeWorld({
   const advanceTo = (iso) => { clock = Math.max(clock + 1, Date.parse(iso)); syncClock(); };
 
   return {
-    wf, tickets, awaited, cascade, sweep, store, lease, deadClaims,
+    wf, tickets, awaited, cascade, sweep, store, lease, deadClaims, projectRead,
     addBlockers, annotatePreconditionUnmet, publishEvent, getChildTickets,
-    redispatch, redispatchedIds, redispatchedBlockedBy, issueLinks,
+    redispatch, redispatchedIds, redispatchedBlockedBy, issueLinks, blockTicket,
     events, at: () => nowIso(), advanceTo,
     eventsOfType: (type) => events.filter((e) => e.type === type),
     // Apply the derived spawn edges for the two ship fixes + the CI fix, exactly

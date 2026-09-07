@@ -24,6 +24,10 @@ import {
   contractLabels,
   renderFixContractBlock,
   escapeJql,
+  PRECONDITION_AT_PREFIX,
+  preconditionAtLabel,
+  preconditionAtMsFromLabels,
+  reportedAtFromLabels,
 } from "./fix-contract.mjs";
 
 // ─── Jira Config ─────────────────────────────────────────────────────────────
@@ -922,11 +926,42 @@ async function annotatePreconditionUnmet(params) {
 
   // NOT lowercased — the id must survive as a real ticket key so mapIssue reads
   // it back as TEAM-1234, not team-1234.
-  const labelAdds = awaitingIds.map((id) => `awaiting:${id}`);
-  if (labelAdds.length > 0) {
+  const labelOps = awaitingIds.map((id) => ({ add: `awaiting:${id}` }));
+
+  // TEAM-4184 — the reportedAt CLOCK rides a `precondition-at:<epochMs>` label
+  // too, because the marker comment above does not reach the reader that needs
+  // it (see PRECONDITION_AT_PREFIX). MONOTONIC: an older re-report never moves
+  // the clock backwards, and the superseded labels are removed in this same PUT
+  // so only the max survives. Readers take the max regardless, so a removal that
+  // fails is a hygiene miss, not a correctness one.
+  const atLabel = preconditionAtLabel(reportedAt);
+  if (atLabel) {
+    let existingLabels = [];
+    try {
+      const current = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=labels`);
+      existingLabels = current?.fields?.labels || [];
+    } catch (err) {
+      // Fail SAFE toward writing the clock: add without pruning. An un-pruned
+      // older sibling label is harmless (max-wins), a missing clock is not.
+      console.warn(`[jira-tools] precondition-at label read failed for ${ticketId}, adding without pruning: ${err?.message || err}`);
+    }
+    const existingMs = preconditionAtMsFromLabels(existingLabels);
+    const incomingMs = preconditionAtMsFromLabels([atLabel]);
+    if (existingMs === null || incomingMs > existingMs) {
+      labelOps.push({ add: atLabel });
+      for (const label of existingLabels) {
+        if (typeof label === "string" && label.startsWith(PRECONDITION_AT_PREFIX) && label !== atLabel) {
+          labelOps.push({ remove: label });
+        }
+      }
+    }
+    // else: a NEWER clock is already on the issue — leave it, prune nothing.
+  }
+
+  if (labelOps.length > 0) {
     await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
       method: "PUT",
-      body: JSON.stringify({ update: { labels: labelAdds.map((add) => ({ add })) } }),
+      body: JSON.stringify({ update: { labels: labelOps } }),
     });
   }
 
@@ -1114,6 +1149,10 @@ function mapIssue(issue) {
     .filter((l) => l.startsWith("awaiting:"))
     .map((l) => l.slice("awaiting:".length))
     .filter(Boolean);
+  // TEAM-4184: …and the reportedAt clock from the `precondition-at:<epochMs>`
+  // label, so the D2 evidence guard's liveness comparison works off a fields-only
+  // read (no comment fetch).
+  const awaitingReportedAt = reportedAtFromLabels(labels);
 
   return {
     ticketId: issue.key,
@@ -1124,7 +1163,15 @@ function mapIssue(issue) {
     parentKey: fields.parent?.key || null,
     workflowId: wfLabel ? wfLabel.replace("wf:", "") : null,
     labels,
-    ...(awaitingIds.length > 0 ? { preconditionUnmet: { awaitingIds, source: "label" } } : {}),
+    ...(awaitingIds.length > 0
+      ? {
+          preconditionUnmet: {
+            awaitingIds,
+            ...(awaitingReportedAt ? { reportedAt: awaitingReportedAt } : {}),
+            source: "label",
+          },
+        }
+      : {}),
   };
 }
 

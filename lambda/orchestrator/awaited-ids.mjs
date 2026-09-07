@@ -31,6 +31,15 @@
  * the ticket-id shape (TICKET_KEY_RE) — the same shape the fix-ticket origin ids
  * are validated against.
  *
+ * Event contract — `orchestrator.await_timeout`
+ * `{workflowId, ticketId, awaitingIds, waitedMs, timestamp, source, reason}`,
+ * emitted at most once per ticket (store CAS) and NEVER accompanied by a
+ * humanNotification (that would trip parkedOnHuman). `awaitingIds` lists only ids
+ * PROVEN still non-terminal in the caller's sibling snapshot, `waitedMs` is the
+ * real wait since the stamp (or the row's updatedAt), and `reason` is
+ * "await_timeout" for a wait-SLA breach or "clean_exit_cap" for a ticket re-woken
+ * to the clean-exit cap with nothing left awaited (empty `awaitingIds`) — TEAM-4184 F2.
+ *
  * Modes (AWAITED_IDS_MODE): off (DEFAULT — this mutates ticket state, so a fresh
  * deploy changes nothing) = no-op; shadow = compute + log + EMF metrics, ZERO
  * writes; enforce = write the edge + stamp preconditionUnmet. Garbage coerces to
@@ -121,6 +130,150 @@ export function tallyBlockerResult(res, requestedIds) {
   }
 
   return { written, present };
+}
+
+/**
+ * PURE. The raw awaited union — preconditionUnmet.awaitingIds ∪ blockedBy, minus
+ * the ticket itself — with no notion of siblings/status at all. The one place
+ * the union's SHAPE is defined; both nonTerminalAwaitedIds (below) and
+ * parkEvidence's no-snapshot branch build off it.
+ */
+function awaitedUnion(ticket) {
+  const union = new Set();
+  const pu = ticket?.preconditionUnmet;
+  if (pu && Array.isArray(pu.awaitingIds)) for (const id of pu.awaitingIds) if (isTicketId(id)) union.add(id.trim());
+  if (Array.isArray(ticket?.blockedBy)) for (const id of ticket.blockedBy) if (isTicketId(id)) union.add(id.trim());
+  return [...union].filter((id) => id !== ticket?.ticketId);
+}
+
+/**
+ * PURE. The awaited union restricted to ids PROVEN still non-terminal in
+ * `siblings`. An id absent from the snapshot counts as non-terminal (we cannot
+ * prove it closed), so a caller that has no snapshot at all must get none back:
+ * a non-array `siblings` yields [] rather than "everything is open", mirroring
+ * the direction cascade.unionBlockersResolved(t, undefined) already fails in
+ * (resolved). checkAwaitTimeout reads it here — its no-snapshot behaviour
+ * (report nothing awaited) is exactly this contract.
+ *
+ * parkEvidence does NOT reuse this for its own no-snapshot case (TEAM-4184): its
+ * decision is escalate/don't-escalate, and "can't see the board" must fail
+ * toward NOT escalating — the opposite of "nothing is open". See its own
+ * docblock.
+ */
+export function nonTerminalAwaitedIds(ticket, siblings) {
+  if (!ticket || typeof ticket !== "object") return [];
+  if (!Array.isArray(siblings)) return [];
+  const statusOf = (id) => {
+    const s = siblings.find((x) => x && x.ticketId === id);
+    return s ? s.status : undefined;
+  };
+  return awaitedUnion(ticket).filter((id) => !TERMINAL_TICKET_STATUSES.has(statusOf(id)));
+}
+
+/**
+ * PURE. Was this preconditionUnmet stamp written by the claim generation that is
+ * under inspection — i.e. is it evidence about THIS session, or a leftover from a
+ * previous one?
+ *
+ * Fail-safe directions, both chosen to preserve the pre-TEAM-4184 behaviour when
+ * the comparison cannot be made:
+ *   - no parseable claimStartedAt → TRUE. We cannot prove the stamp is stale, and
+ *     a legacy/odd task row must not become escalatable just because its claim
+ *     lacks a timestamp.
+ *   - no parseable reportedAt → FALSE. Not provably current (jira rows stamped
+ *     before the precondition-at label existed land here). Those are still held
+ *     by parkEvidence's other two terms, so a stamp is never judged stale on the
+ *     strength of a missing clock alone.
+ */
+export function isStampCurrent(preconditionUnmet, claimStartedAt) {
+  const claimMs = Date.parse(claimStartedAt ?? "");
+  if (!Number.isFinite(claimMs)) return true;
+  const stampMs = Date.parse(preconditionUnmet?.reportedAt ?? "");
+  if (!Number.isFinite(stampMs)) return false;
+  return stampMs >= claimMs;
+}
+
+/**
+ * PURE. How long this ticket has been waiting, in ms: since the stamp's
+ * `reportedAt` when it has one, else since the row's `updatedAt` (the D1 §5 SLA
+ * definition). 0 when neither is parseable — an unknown wait is reported as no
+ * wait rather than as an invented one — and never negative (a clock skew that puts
+ * the stamp in the future is 0, not a negative "wait").
+ *
+ * TEAM-4184 F2: the cap path needs this WITHOUT checkAwaitTimeout, because when
+ * every awaited id has already landed checkAwaitTimeout returns null (nothing is
+ * awaited) and the caller still has a real wait to report.
+ */
+export function awaitedWaitedMs(ticket, nowMs) {
+  const pu = ticket?.preconditionUnmet;
+  const since = Date.parse((pu && pu.reportedAt) || ticket?.updatedAt || "");
+  if (!Number.isFinite(since) || !Number.isFinite(nowMs)) return 0;
+  return Math.max(0, nowMs - since);
+}
+
+/**
+ * PURE. THE D2 evidence predicate (TEAM-4166 §2.3, corrected by TEAM-4184 F1):
+ * once a ticket's dead-session retry budget is spent, is its `preconditionUnmet`
+ * stamp live evidence that the session parked itself CLEANLY on work it is
+ * waiting for — in which case it gets re-woken, capped, never escalated — or is
+ * it stale residue from a claim that has since been re-dispatched and died?
+ *
+ * The bug this replaces tested mere PRESENCE of the stamp. Because nothing ever
+ * clears `preconditionUnmet`, a ticket that parked once could never again be
+ * escalated: after its awaited fixes closed and it was correctly re-woken, a
+ * genuinely dead re-woken session still read "parked clean" on the old stamp, so
+ * it burned the clean-exit cap and then reported "awaiting" forever — no
+ * escalation, no error status, no page. §2.3's timestamp rule always required an
+ * UNRESOLVED stamp; this is that rule.
+ *
+ * Three independent reasons a stamp is still live evidence, in order (plus a
+ * fourth, checked first: no sibling snapshot at all → `awaited-open` — an
+ * unwired reader or a failed fetch proves nothing closed, so it is scored the
+ * same as "something is still open", never falls through toward stale-stamp):
+ *   awaited-open      — something in the awaited union is still non-terminal.
+ *                       The ordinary "parked and waiting" case (FR-2.1), and the
+ *                       one that carries a legitimate RE-park on both providers.
+ *   stamp-current     — the stamp was written at/after this claim started, so it
+ *                       is this session's own report (a re-park whose awaited
+ *                       fixes happen to have closed already).
+ *   unconsumed-stamp  — no clean-exit re-dispatch has been spent on this ticket
+ *                       yet, so the stamp has not yet been acted on. This is the
+ *                       benefit of the doubt FR-2.1b requires, and it is what
+ *                       covers stamps written before a reportedAt was recorded.
+ * All three false → the stamp is spent evidence about a previous claim, and the
+ * caller falls through to its genuine dead-session branch.
+ *
+ * `cleanRedispatches` is the workflow row's cleanExitRedispatches[ticketId] — no
+ * new state: a clean re-dispatch mints a fresh claim (a new agentTasks[].startedAt),
+ * so the counter and claimStartedAt together already say "the stamp was used".
+ *
+ * Returns { parkedClean, reason, awaitingIds } — `reason` rides the escalation
+ * evidence block so an operator can see WHICH term decided.
+ */
+export function parkEvidence(ticket, { siblings, claimStartedAt, cleanRedispatches = 0 } = {}) {
+  const pu = ticket?.preconditionUnmet;
+  const hasStamp = !!(pu && Array.isArray(pu.awaitingIds) && pu.awaitingIds.length);
+  if (!hasStamp) return { parkedClean: false, reason: "no-stamp", awaitingIds: [] };
+
+  // TEAM-4184: an unavailable snapshot (unwired reader, or a failed fetch the
+  // caller degraded to null/undefined) proves NOTHING closed. That is the
+  // OPPOSITE polarity from nonTerminalAwaitedIds's own non-array contract,
+  // which exists for checkAwaitTimeout / unionBlockersResolved — callers that
+  // are safe treating "can't see the board" as "nothing to report" (advisory
+  // wait-SLA, or a resolution check that is defense-in-depth behind a gate
+  // that already ran). parkEvidence gates escalation itself: reading a fetch
+  // failure as "resolved" turns a transient DDB/Jira error into a false
+  // dead-session escalation of a legitimately parked ticket — the very bug
+  // class this predicate exists to prevent. Fail toward NOT escalating.
+  if (!Array.isArray(siblings)) {
+    return { parkedClean: true, reason: "awaited-open", awaitingIds: awaitedUnion(ticket) };
+  }
+
+  const awaitingIds = nonTerminalAwaitedIds(ticket, siblings);
+  if (awaitingIds.length) return { parkedClean: true, reason: "awaited-open", awaitingIds };
+  if (isStampCurrent(pu, claimStartedAt)) return { parkedClean: true, reason: "stamp-current", awaitingIds };
+  if (!(Number(cleanRedispatches) > 0)) return { parkedClean: true, reason: "unconsumed-stamp", awaitingIds };
+  return { parkedClean: false, reason: "stale-stamp", awaitingIds };
 }
 
 /**
@@ -238,7 +391,11 @@ export function createAwaitedIds(deps = {}) {
     try {
       await annotatePreconditionUnmet?.(originId, {
         awaitingIds: clean,
-        source: "derived",
+        // TEAM-4184 — honor the caller's source. This was hard-coded "derived",
+        // so an agent's OWN report (the level-triggered "tool" pickup) was
+        // recorded as an orchestrator inference, losing the distinction the
+        // provenance field exists to make.
+        source: isTool ? "tool" : "derived",
         reportedAt: new Date(now()).toISOString(),
       });
     } catch (err) {
@@ -282,21 +439,14 @@ export function createAwaitedIds(deps = {}) {
    */
   function checkAwaitTimeout(ticket, siblings, nowMs) {
     if (!ticket || typeof ticket !== "object") return null;
-    const statusOf = (id) => {
-      const s = (siblings || []).find((x) => x && x.ticketId === id);
-      return s ? s.status : undefined;
-    };
-    const union = new Set();
-    const pu = ticket.preconditionUnmet;
-    if (pu && Array.isArray(pu.awaitingIds)) for (const id of pu.awaitingIds) if (isTicketId(id)) union.add(id.trim());
-    if (Array.isArray(ticket.blockedBy)) for (const id of ticket.blockedBy) if (isTicketId(id)) union.add(id.trim());
-
-    const awaitingIds = [...union].filter((id) => id !== ticket.ticketId && !TERMINAL_TICKET_STATUSES.has(statusOf(id)));
+    // TEAM-4184: the union lives in the module-level nonTerminalAwaitedIds, shared
+    // with parkEvidence, so the two can never disagree about what "awaited" means.
+    // NOTE the deliberate `siblings || []` — a caller with no snapshot gets
+    // "nothing is provably terminal", the conservative direction for a wait SLA.
+    const awaitingIds = nonTerminalAwaitedIds(ticket, siblings || []);
     if (!awaitingIds.length) return null;
 
-    const reportedAt = pu && pu.reportedAt ? pu.reportedAt : ticket.updatedAt;
-    const since = Date.parse(reportedAt);
-    const waitedMs = Number.isFinite(since) ? nowMs - since : 0;
+    const waitedMs = awaitedWaitedMs(ticket, nowMs);
     return { timedOut: waitedMs >= timeoutMs, waitedMs, awaitingIds };
   }
 
@@ -307,11 +457,17 @@ export function createAwaitedIds(deps = {}) {
    * a genuinely-stuck await never trips parkedOnHuman. off → nothing; shadow →
    * log the decision, no store write, no event; enforce → CAS then event + metric.
    * Returns true only when THIS caller emitted.
+   *
+   * TEAM-4184 F2: `reason` distinguishes the two situations that share this event.
+   * "await_timeout" (default) = the wait SLA on ids that are genuinely still open.
+   * "clean_exit_cap" = a ticket re-woken to the clean-exit cap with NOTHING left
+   * awaited, so `awaitingIds` is legitimately empty; without the field an operator
+   * reading an empty list could not tell it from a malformed SLA breach.
    */
-  async function emitAwaitTimeoutOnce(workflow, ticketId, awaitingIds, waitedMs, source = "sweep") {
+  async function emitAwaitTimeoutOnce(workflow, ticketId, awaitingIds, waitedMs, source = "sweep", { reason = "await_timeout" } = {}) {
     if (mode === "off") return false;
     if (mode === "shadow") {
-      log(`awaited.await_timeout (shadow) — ${ticketId} awaiting=[${(awaitingIds || []).join(", ")}] waitedMs=${waitedMs}`);
+      log(`awaited.await_timeout (shadow) — ${ticketId} awaiting=[${(awaitingIds || []).join(", ")}] waitedMs=${waitedMs} reason=${reason}`);
       return false;
     }
     const at = new Date(now()).toISOString();
@@ -324,9 +480,10 @@ export function createAwaitedIds(deps = {}) {
       waitedMs,
       timestamp: at,
       source,
+      reason,
     });
     metrics.timeouts++;
-    log(`awaited.await_timeout — ${ticketId} awaiting=[${(awaitingIds || []).join(", ")}] waitedMs=${waitedMs} source=${source}`);
+    log(`awaited.await_timeout — ${ticketId} awaiting=[${(awaitingIds || []).join(", ")}] waitedMs=${waitedMs} source=${source} reason=${reason}`);
     return true;
   }
 
