@@ -808,6 +808,14 @@ async function transitionIssue(args) {
   // done (additive — never clobbers status/updatedAt). Parity with the Jira
   // provider, which sets a Jira `resolution`+resolvedAt on its Done transition;
   // both providers return resolvedAt so the caller reads it the same way.
+  //
+  // TEAM-4262 (r2-F3): the response also carries `resolutionSet`, and on THIS
+  // provider it is unconditionally true — the Lambda writes the resolvedAt column
+  // itself, so there is no screen that can reject it and nothing to read back. The
+  // field exists because the Jira provider's Done transition can fall back to a bare
+  // body when a project's transition screen omits `fields.resolution`, leaving the
+  // issue Done with no resolution; it reports resolutionSet:false there rather than
+  // claiming a resolution it never set. Response-only — the row write is unchanged.
   const isDone = transition.to === "done";
   if (isDone) {
     updateExpr += ", #ra = :ra";
@@ -832,7 +840,7 @@ async function transitionIssue(args) {
     to: transition.to,
     transition: transition.name,
     ...(reason ? { skipReason: reason } : {}),
-    ...(isDone ? { resolvedAt: now } : {}),
+    ...(isDone ? { resolvedAt: now, resolutionSet: true } : {}),
   };
 }
 
