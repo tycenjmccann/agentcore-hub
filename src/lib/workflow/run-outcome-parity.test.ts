@@ -38,8 +38,9 @@ import {
  *   - anomaly-watcher     : a missed value = a closed run is nudged/escalated, so a
  *                           human is paged about a run with no work in it.
  *   - cost-report         : a missed value = the run is never scanned or carded.
- *   - save_analysis.py    : a missed value = `else "complete"` rewrites the outcome,
- *                           and a no-op sweep enters the delivery baselines.
+ *   - run_outcomes.py     : the ONE Python copy (save_analysis.py imports it) — a
+ *                           missed value means `else "complete"` rewrites the
+ *                           outcome and a no-op sweep enters the baselines.
  *
  * Source-text assertions for the Python and the routes (no importable module /
  * mixed-shape literals); real imports wherever an import is possible.
@@ -143,23 +144,45 @@ describe("the .mjs literal mirrors ≡ types.ts", () => {
   }
 });
 
-describe("save_analysis.py RUN_OUTCOMES ≡ types.ts", () => {
-  const source = read("deploy/workflow-manager/toolkit/save_analysis.py");
+describe("the Python toolkit ≡ types.ts", () => {
+  const TOOLKIT = "deploy/workflow-manager/toolkit";
+  const outcomes = read(`${TOOLKIT}/run_outcomes.py`);
+  const saveAnalysis = read(`${TOOLKIT}/save_analysis.py`);
 
-  it("the accept-set holds every terminal outcome", () => {
-    const declared = source.match(/RUN_OUTCOMES = \{([^}]*)\}/)?.[1];
-    if (declared === undefined) throw new Error("RUN_OUTCOMES = {…} not found in save_analysis.py");
-    const values = declared
+  /** The values inside a `NAME = {…}` set or `NAME = (…)` tuple literal. */
+  function pyLiteral(source: string, name: string): string[] {
+    const declared = source.match(new RegExp(`^${name} = [{(]([^})]*)[})]`, "m"))?.[1];
+    if (declared === undefined) throw new Error(`${name} = … not found in run_outcomes.py`);
+    return declared
       .split(",")
       .map((v) => v.trim().replace(/^["']|["']$/g, ""))
       .filter(Boolean);
-    expect(values.sort()).toEqual([...TERMINAL_PHASES].sort());
+  }
+
+  it("run_outcomes.py holds every terminal outcome and the same no-op list", () => {
+    expect(pyLiteral(outcomes, "RUN_OUTCOMES").sort()).toEqual([...TERMINAL_PHASES].sort());
+    expect(pyLiteral(outcomes, "NO_OP_OUTCOMES")).toEqual([...NO_OP_OUTCOMES]);
+  });
+
+  it("run_outcomes.py imports nothing, so the pure toolkit can read it", () => {
+    // compute_metrics.py and its unit tests must stay importable with no boto3 and
+    // no AWS environment — which is why the shared list cannot live in
+    // save_analysis.py (it reads os.environ["ARTIFACT_BUCKET"] at module load).
+    expect(outcomes).not.toMatch(/^\s*(import|from)\s+\S/m);
+  });
+
+  it("save_analysis.py imports that list instead of re-declaring one", () => {
+    // The pre-D2 shape: this file owned the literal and compute_metrics.py had no
+    // notion of terminality at all. A second copy here is the drift this whole
+    // file exists to prevent.
+    expect(saveAnalysis).toMatch(/^from run_outcomes import .*\bRUN_OUTCOMES\b/m);
+    expect(saveAnalysis).not.toMatch(/^RUN_OUTCOMES = /m);
   });
 
   it("the phase→outcome mapping still falls back to complete only for UNKNOWN phases", () => {
     // The fallback is what a missing value costs: `phase if phase in RUN_OUTCOMES
     // else "complete"` turns an unlisted honest outcome into a fake delivery.
-    expect(source).toContain('run_outcome = phase if phase in RUN_OUTCOMES else "complete"');
+    expect(saveAnalysis).toContain('run_outcome = phase if phase in RUN_OUTCOMES else "complete"');
   });
 });
 

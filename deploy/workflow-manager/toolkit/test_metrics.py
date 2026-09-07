@@ -27,6 +27,13 @@ from compute_metrics import (  # noqa: E402
     title_slot_tokens,
 )
 from events import dedupe_events  # noqa: E402
+from run_outcomes import (  # noqa: E402
+    NO_OP_OUTCOMES,
+    RUN_OUTCOMES,
+    baseline_analyses,
+    is_no_op_outcome,
+    is_terminal_phase,
+)
 
 T0 = "2026-07-01T10:00:00Z"
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -1059,6 +1066,116 @@ class GateVerdicts(unittest.TestCase):
         ci = [ev(10, "agent.complete", {"ticketId": "T-1", "agentId": "agentcore_hub_ci_agent", "verdict": "FAIL"})]
         q = compute_gate_verdicts(ci, {})
         self.assertEqual((q["gateRounds"], q["reworkRounds"], q["firstPassYield"]), (1, 0, 0))
+
+
+
+class NoOpRunOutcomes(unittest.TestCase):
+    """TEAM-4247 D2 — "nothing-to-remove" is a finished run, and not a comparable.
+
+    wf_1788780725940_c2uqki is a REAL dead-code sweep on tycenjmccann/ember: it
+    detected candidates, verified them, removed code and opened PR #60. The fixture
+    is replayed here twice — once as it happened, and once with `workflow.phase`
+    rewritten to "nothing-to-remove", which is the run the sweeper would have
+    produced had every candidate turned out to be live. Everything that makes the
+    run READABLE has to survive the rewrite (it ended, it took as long as it took);
+    everything that makes it a BASELINE has to drop out.
+    """
+
+    def load(self, phase=None):
+        with open(FIXTURES / "c2uqki-dossier.json") as f:
+            d = json.load(f)
+        if phase is not None:
+            d["workflow"]["phase"] = phase
+        return d
+
+    def test_the_shared_lists_are_what_the_toolkit_thinks_they_are(self):
+        # One Python copy, imported by save_analysis (the write path) and
+        # compute_metrics (the numbers). Pinned here because everything below is
+        # vacuous if the no-op list is empty.
+        self.assertEqual(NO_OP_OUTCOMES, ("nothing-to-remove",))
+        self.assertTrue(NO_OP_OUTCOMES[0] in RUN_OUTCOMES)
+        self.assertTrue(is_terminal_phase("nothing-to-remove"))
+        self.assertTrue(is_no_op_outcome("nothing-to-remove"))
+        # A ship-blocked run DID the work and then failed to ship — still a comparable.
+        self.assertTrue(is_terminal_phase("deploy-blocked"))
+        self.assertFalse(is_no_op_outcome("deploy-blocked"))
+        # And a live run is neither.
+        self.assertFalse(is_terminal_phase("detection"))
+        self.assertFalse(is_no_op_outcome(None))
+
+    def test_nothing_to_remove_is_terminal_and_excluded_from_baselines(self):
+        real = compute_metrics(self.load())
+        noop = compute_metrics(self.load("nothing-to-remove"))
+
+        # TERMINAL: the run is bounded exactly as the real one is — same start, same
+        # end, same duration — because claimTerminalOutcome writes completedAt with
+        # the phase. A no-op close must not read as a run still in flight.
+        self.assertEqual(noop["runOutcome"], "nothing-to-remove")
+        self.assertEqual(real["runOutcome"], "complete")
+        self.assertEqual(noop["completedAt"], real["completedAt"])
+        self.assertEqual(noop["totalDurationMs"], real["totalDurationMs"])
+        self.assertGreater(noop["totalDurationMs"], 0)
+
+        # NOT A COMPARABLE: the flag the analysis and the trend both read.
+        self.assertTrue(noop["noOp"])
+        self.assertFalse(real["noOp"])
+
+        # EXCLUDED FROM BASELINES: this run's own five prior analyses are all real
+        # deliveries, so they all stay — the exclusion is about the runs being
+        # compared against, and it must not quietly shrink an honest sample.
+        self.assertEqual(len(self.load()["priorAnalyses"]), 5)
+        self.assertEqual(real["trendBaseline"]["priorRuns"], 5)
+        self.assertEqual(real["trendBaseline"]["excludedNoOp"], 0)
+
+        # Now the case D2 exists for: a repo swept on a cadence that keeps finding
+        # nothing. Two of the five priors closed nothing-to-remove, so the trend is
+        # cited over three — and says so, rather than reporting five.
+        d = self.load("nothing-to-remove")
+        for a in d["priorAnalyses"][:2]:
+            a["runOutcome"] = "nothing-to-remove"
+        m = compute_metrics(d)
+        self.assertEqual(m["trendBaseline"]["priorRuns"], 3)
+        self.assertEqual(m["trendBaseline"]["excludedNoOp"], 2)
+        self.assertNotIn(
+            d["priorAnalyses"][0]["workflowId"], m["trendBaseline"]["workflowIds"]
+        )
+        self.assertIn(d["priorAnalyses"][4]["workflowId"], m["trendBaseline"]["workflowIds"])
+
+    def test_baseline_analyses_keeps_everything_it_cannot_disqualify(self):
+        # An analysis written before runOutcome existed, or a malformed row, is not
+        # a no-op — dropping it would silently shrink the sample the verdict cites.
+        rows = [{"workflowId": "a"}, {"workflowId": "b", "runOutcome": "complete"},
+                {"workflowId": "c", "runOutcome": "nothing-to-remove"},
+                {"workflowId": "d", "runOutcome": "cancelled"}, None]
+        kept = baseline_analyses(rows)
+        self.assertEqual([r.get("workflowId") if isinstance(r, dict) else r for r in kept],
+                         ["a", "b", "d", None])
+        self.assertEqual(baseline_analyses(None), [])
+
+    def test_a_terminal_phase_change_ends_the_run_instead_of_billing_the_tail(self):
+        # No orchestrator path publishes a phase_change into a terminal outcome
+        # today, so this is a shape guarantee rather than a replay: if one ever
+        # does, the closing row must not be credited the rest of the run window.
+        d = self.load("nothing-to-remove")
+        last = max(e["timestamp"] for e in d["events"])
+        d["events"].append({
+            "workflowId": d["workflowId"],
+            "eventId": "evt_terminal_phase",
+            "type": "workflow.phase_change",
+            "timestamp": "2026-09-07T12:40:00.000Z",
+            "detail": {"phase": "nothing-to-remove", "workflowId": d["workflowId"]},
+        })
+        phases = compute_metrics(d)["phases"]
+        closing = phases[-1]
+        self.assertEqual(closing["phase"], "nothing-to-remove")
+        self.assertTrue(closing["terminal"])
+        self.assertEqual(closing["durationMs"], 0)
+        self.assertEqual(closing["enteredAt"], closing["exitedAt"])
+        # The phase before it still runs up to the terminal change, not past it.
+        self.assertEqual(phases[-2]["exitedAt"], closing["enteredAt"])
+        # A live phase never carries the flag.
+        self.assertNotIn("terminal", phases[-2])
+        self.assertLess(closing["enteredAt"], last)
 
 
 if __name__ == "__main__":

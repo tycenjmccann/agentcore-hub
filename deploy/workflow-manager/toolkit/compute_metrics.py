@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 # module is imported by name (the unit tests do exactly that).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from events import dedupe_events  # noqa: E402
+from run_outcomes import baseline_analyses, is_no_op_outcome, is_terminal_phase  # noqa: E402
 
 HUMAN_PREFIX = "human:"
 FIX_PREFIX = "Fix:"
@@ -196,6 +197,10 @@ def event_ticket(event):
 def run_bounds(workflow, events):
     started = parse_ts(workflow.get("startedAt"))
     ended = parse_ts(workflow.get("completedAt")) or parse_ts(workflow.get("cancelledAt"))
+    # TEAM-4247 D2: every terminal outcome writes completedAt alongside the phase
+    # (claimTerminalOutcome SETs both in one update), so a nothing-to-remove run is
+    # bounded exactly like a complete one. The last-event fallback stays for rows
+    # written before that and for a run still in flight.
     if ended is None and events:
         ended = parse_ts(events[-1].get("timestamp"))
     return started, ended
@@ -260,13 +265,21 @@ def compute_phases(events, started, ended, missing):
         entered = parse_ts(e.get("timestamp"))
         exited = parse_ts(changes[i + 1].get("timestamp")) if i + 1 < len(changes) else ended
         phase = detail(e).get("phase")
-        phases.append({
-            "phase": phase,
+        # TEAM-4247 D2: a phase_change INTO a terminal outcome ("nothing-to-remove",
+        # a cancel, an honest deploy-blocked close) is where the run ENDED, not a
+        # phase it spent time in. Closing it at its own timestamp keeps the tail of
+        # the run window from being billed as work after the last agent stopped.
+        row = {"phase": phase}
+        if is_terminal_phase(phase):
+            exited = entered
+            row["terminal"] = True
+        row.update({
             "enteredAt": iso(entered),
             "exitedAt": iso(exited),
             "durationMs": ms_between(entered, exited),
             "taskCount": invoked_by_phase.get(phase, 0),
         })
+        phases.append(row)
     return phases
 
 
@@ -845,10 +858,32 @@ def compute_metrics(dossier):
          "at": e.get("timestamp"), "note": detail(e).get("note")}
         for e in events_of(events, "manager.intervention")
     ]
+    # TEAM-4247 D2 — the run's own terminal outcome, read straight off the workflow
+    # row. No "else complete" fallback here: that mapping belongs to save_analysis's
+    # write path, and a run still in flight honestly has no outcome yet.
+    phase = workflow.get("phase")
+    outcome = phase if is_terminal_phase(phase) else None
+    prior = dossier.get("priorAnalyses") or []
+    comparable = baseline_analyses(prior)
     return {
         "startedAt": iso(started),
         "completedAt": iso(ended),
         "totalDurationMs": ms_between(started, ended),
+        "runOutcome": outcome,
+        # A no-op run did finish, and it is worth reading — it just is not a
+        # comparable of a delivery run. Flagged here so the analysis says so, and so
+        # the same predicate governs the trend baseline below.
+        "noOp": is_no_op_outcome(outcome),
+        # The prior runs the WM may compare this one against, with the no-op runs
+        # taken out: a sweep that removed nothing costs one detection agent, and
+        # left in the comparison it makes every real sweep look like a regression.
+        # `excludedNoOp` keeps the exclusion visible instead of silently shrinking
+        # the sample the verdict cites.
+        "trendBaseline": {
+            "priorRuns": len(comparable),
+            "excludedNoOp": len(prior) - len(comparable),
+            "workflowIds": [a.get("workflowId") for a in comparable if isinstance(a, dict)],
+        },
         "phases": compute_phases(events, started, ended, missing),
         "agentTasks": compute_agent_tasks(tickets, events),
         "humanReviews": reviews,

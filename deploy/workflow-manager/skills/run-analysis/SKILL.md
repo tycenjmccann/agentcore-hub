@@ -36,8 +36,15 @@ Read your knowledge file for this workflow definition:
   actually cover what the intake requested?
 - **Trend** — compare against `priorAnalyses` in the dossier and your own
   memory of this workflow def. One run is an anecdote; call trends only when
-  the data supports them.
+  the data supports them. Compare against `metrics.trendBaseline` (the priors
+  minus the no-op runs), not the raw list, and cite its `priorRuns` as
+  `trend.priorRunsCompared`; when `excludedNoOp` is non-zero, say so rather
+  than reporting a bigger sample than you used.
 - If the run was cancelled or errored: lead with why it stopped.
+- If `metrics.noOp` is true (a dead-code sweep that closed
+  `nothing-to-remove`): the run is a healthy no-op, not a failure. Judge
+  detection cost and whether the cadence should have skipped it — never its
+  delivery, and never against a baseline of runs that shipped.
 - If `metrics.managerInterventions` is non-empty, evaluate your own watch
   interventions: did they help?
 

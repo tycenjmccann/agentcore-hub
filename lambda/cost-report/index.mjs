@@ -78,6 +78,18 @@ const METRIC_MAX_AGE_MS = 13 * 86_400_000;
  *  other finished run. (Keeping it OUT of the performance baselines is a separate
  *  question, handled where the baselines are built, not here.) */
 const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only", "nothing-to-remove"]);
+/**
+ * Parity mirror of NO_OP_OUTCOMES in src/lib/workflow/types.ts (TEAM-4247 D2).
+ *
+ * A run with a no-op outcome DID happen and gets a card like any other terminal
+ * run — but it did no delivery work, so it is not a comparable of one. A
+ * dead-code sweep that verified nothing to remove costs one detection agent and
+ * produces one task; left in the baseline it drags the def's median cost, tokens,
+ * wall-clock and task count down, and then flags the NEXT real sweep as an
+ * anomaly. See isBaselineEligible / isNoOpOutcome below for the two places that
+ * matters.
+ */
+const NO_OP_OUTCOMES = new Set(["nothing-to-remove"]);
 
 const DEFAULT_PRICING = {
   models: {}, default: { input: 5.5, output: 27.5 }, cachedInputDiscount: 0.1,
@@ -157,7 +169,12 @@ export const handler = async (event) => {
   await maybeRefreshInfra(index, pricing);
   await saveIndex(index);
 
-  await Promise.all([publishMetrics(card), putPerformanceEvent(card, cardKey)]);
+  // TEAM-4247 D2: the card and the CloudWatch datapoints are written for every
+  // terminal run, but a no-op run publishes no workflow.performance event — that
+  // event IS the anomaly alerting's input, and a zero-yield sweep has no honest
+  // z-score to alert on (see shouldAlert).
+  await Promise.all([publishMetrics(card), shouldAlert(card) ? putPerformanceEvent(card, cardKey) : Promise.resolve()]);
+  if (!shouldAlert(card)) console.log(`${LOG} ${workflowId} outcome ${card.run?.outcome} — no workflow.performance event (no-op run)`);
 
   console.log(`${LOG} ${workflowId} → $${card.cost.totalUsd} ${card.bands.status} (${cardKey})`);
   return { workflowId, cardKey, totalCostUsd: card.cost.totalUsd, status: card.bands.status, anomalies: card.bands.anomalies };
@@ -488,6 +505,39 @@ export function bandFor(values, current, floor, direction = "upper") {
   };
 }
 
+/** Did this run produce a no-op outcome (TEAM-4247 D2)? Reads a card or a summary. */
+export function isNoOpOutcome(cardOrSummary) {
+  const outcome =
+    cardOrSummary?.run?.outcome ?? cardOrSummary?.quality?.outcome ?? cardOrSummary?.outcome ?? null;
+  return NO_OP_OUTCOMES.has(outcome);
+}
+
+/**
+ * May this fleet-index summary contribute to a performance baseline?
+ *
+ * Two disqualifiers: a zero total cost (a card built before its spans landed —
+ * pre-existing rule), and a no-op outcome (TEAM-4247 D2 — the run did no
+ * delivery work, so it is not a comparable of one).
+ */
+export function isBaselineEligible(summary) {
+  return (summary?.cost?.total ?? 0) > 0 && !isNoOpOutcome(summary);
+}
+
+/**
+ * Should this card raise an anomaly (band status + the workflow.performance
+ * event the alerting reads)?
+ *
+ * A no-op run cannot produce an honest z-score: one task and a few cents against
+ * a baseline of full sweeps is an "alert" on every KPI at once, which is noise,
+ * not a finding. The card is still written in full — the numbers stay visible —
+ * but its top-level status is forced non-alerting and no event is published.
+ * KNOWN CONSEQUENCE: anything counting runs by `workflow.performance` rows
+ * under-counts no-op sweeps, by design.
+ */
+export function shouldAlert(card) {
+  return !isNoOpOutcome(card);
+}
+
 /**
  * Baseline = same def's cards that completed within BASELINE_DAYS before this
  * card (strictly earlier, never itself) — so recomputing in any order converges.
@@ -500,7 +550,7 @@ export function computeBands(card, summaries) {
     s.workflowId !== card.workflowId &&
     s.workflowDefId === card.workflowDefId &&
     s.completedAt && Date.parse(s.completedAt) < endMs && Date.parse(s.completedAt) >= startMs &&
-    (s.cost?.total ?? 0) > 0);
+    isBaselineEligible(s));
 
   const kpis = {};
   const anomalies = [];
@@ -515,6 +565,20 @@ export function computeBands(card, summaries) {
       if (band.status === "alert" || worst === "ok") worst = band.status;
     }
   }
+  // TEAM-4247 D2: a no-op run's KPIs are still computed and shown (they are the
+  // honest numbers for that run), but it raises nothing: every KPI is low against
+  // a baseline of real runs, so the anomalies would all fire at once. `noOp: true`
+  // says WHY the status is ok, so a reader never mistakes it for "compared, fine".
+  if (!shouldAlert(card)) {
+    return {
+      baseline: { workflowDefId: card.workflowDefId, n: baseline.length, windowDays: BASELINE_DAYS, minSamples: BASELINE_MIN },
+      status: "ok",
+      noOp: true,
+      anomalies: [],
+      kpis,
+    };
+  }
+
   return {
     baseline: { workflowDefId: card.workflowDefId, n: baseline.length, windowDays: BASELINE_DAYS, minSamples: BASELINE_MIN },
     status: worst,

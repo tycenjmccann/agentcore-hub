@@ -30,7 +30,16 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { computeGateRounds, dedupeEvents, fixTicketIds, intakeCompletedAt, isFixTicket } from "./index.mjs";
+import {
+  computeBands,
+  computeGateRounds,
+  dedupeEvents,
+  fixTicketIds,
+  intakeCompletedAt,
+  isBaselineEligible,
+  isFixTicket,
+  shouldAlert,
+} from "./index.mjs";
 
 const FIXTURE = fileURLToPath(
   new URL("../../deploy/workflow-manager/toolkit/fixtures/fix-lineage.json", import.meta.url),
@@ -290,4 +299,129 @@ test("gateReworks stays review-request-derived even when verdicts are present", 
   const gates = computeGateRounds(workflow, DOWTDH_GATES);
   assert.equal(gates.gateRounds, 3);
   assert.equal(gates.gateReworks, 0);
+});
+
+// ─── TEAM-4247 D2: no-op sweeps stay out of the baselines ─────────────────────
+//
+// A dead-code sweep that verified nothing to remove is a real terminal run — it
+// gets a card — but it did no delivery work: one detection agent, a few cents,
+// one task. Left in the def's baseline it drags every median down and then flags
+// the NEXT real sweep as an anomaly, which is exactly backwards.
+
+/** A fleet-index summary with the KPIs computeBands reads. */
+function summaryOf(id, { cost, tokens, tasks, wall, outcome = "complete", at, cacheHitRate = 0.7 }) {
+  return {
+    workflowId: id,
+    workflowDefId: "dead-code-sweep",
+    outcome,
+    completedAt: at,
+    cost: { total: cost, persona: cost, coding: 0, tokens, personaCacheHitRate: cacheHitRate },
+    time: { wall, active: wall, agentWork: wall, humanWait: 0 },
+    quality: { tasks, reworkRounds: 0, loops: 0, nudges: 0, errors: 0, firstPassYield: 1 },
+  };
+}
+
+/**
+ * A card shaped like buildCard's output, with just the banded KPIs. `cacheHitRate`
+ * defaults to a cold 0 because that is the KPI a short run really does trip: it is
+ * banded "lower is worse", so a one-agent run against a baseline of full sweeps
+ * alerts on it — which is what makes the no-op suppression observable below.
+ */
+function cardOf(id, { cost, tokens, tasks, wall, outcome, at, cacheHitRate = 0 }) {
+  return {
+    workflowId: id,
+    workflowDefId: "dead-code-sweep",
+    generatedAt: at,
+    run: { phase: outcome, outcome, completedAt: at },
+    cost: { totalUsd: cost, personaUsd: cost, codingUsd: 0, tokens: { total: tokens }, personaCacheHitRate: cacheHitRate },
+    time: { wallMs: wall, activeMs: wall, agentWorkMs: wall, humanWaitMs: 0 },
+    quality: { outcome, tasks, reworkRounds: 0, loops: 0, nudges: 0, errors: 0, firstPassYield: 1 },
+  };
+}
+
+const DAY = 86_400_000;
+const T0 = Date.parse("2026-09-07T00:00:00.000Z");
+/** Six real sweeps at ~$120, spread over the baseline window. */
+const REAL_SWEEPS = [1, 2, 3, 4, 5, 6].map((i) =>
+  summaryOf(`wf_real_${i}`, {
+    cost: 120 + i, tokens: 4_000_000 + i, tasks: 14, wall: 7_200_000 + i,
+    at: new Date(T0 - i * DAY).toISOString(),
+  }),
+);
+
+test("a nothing-to-remove summary is not baseline-eligible; a complete one is", () => {
+  assert.equal(isBaselineEligible(REAL_SWEEPS[0]), true);
+  assert.equal(
+    isBaselineEligible(summaryOf("wf_noop", { cost: 5, tokens: 90_000, tasks: 1, wall: 300_000, outcome: "nothing-to-remove", at: new Date(T0 - DAY).toISOString() })),
+    false,
+  );
+  // The pre-existing zero-cost rule still applies (a card built before its spans landed).
+  assert.equal(isBaselineEligible(summaryOf("wf_zero", { cost: 0, tokens: 0, tasks: 3, wall: 10, at: new Date(T0).toISOString() })), false);
+});
+
+test("a $5 no-op sweep in the index does not move the next real sweep's medians", () => {
+  const noop = summaryOf("wf_noop", {
+    cost: 5, tokens: 90_000, tasks: 1, wall: 300_000, outcome: "nothing-to-remove",
+    at: new Date(T0 - 0.5 * DAY).toISOString(),
+  });
+  const card = cardOf("wf_next", { cost: 121, tokens: 4_100_000, tasks: 14, wall: 7_300_000, outcome: "complete", at: new Date(T0).toISOString(), cacheHitRate: 0.7 });
+
+  const without = computeBands(card, REAL_SWEEPS);
+  const with_ = computeBands(card, [...REAL_SWEEPS, noop]);
+
+  assert.equal(with_.baseline.n, without.baseline.n); // the no-op never joined
+  for (const kpi of ["cost.totalUsd", "cost.tokens.total", "time.wallMs", "quality.tasks"]) {
+    assert.equal(with_.kpis[kpi].median, without.kpis[kpi].median, `${kpi} median moved`);
+    assert.equal(with_.kpis[kpi].status, without.kpis[kpi].status, `${kpi} status moved`);
+  }
+  assert.equal(with_.status, without.status);
+  assert.deepEqual(with_.anomalies, without.anomalies);
+  assert.equal(with_.status, "ok"); // an ordinary sweep next to a no-op is still ordinary
+});
+
+test("without the exclusion the same no-op WOULD have moved the median (the test is not vacuous)", () => {
+  const asComplete = summaryOf("wf_noop_as_complete", {
+    cost: 5, tokens: 90_000, tasks: 1, wall: 300_000, outcome: "complete",
+    at: new Date(T0 - 0.5 * DAY).toISOString(),
+  });
+  const card = cardOf("wf_next", { cost: 121, tokens: 4_100_000, tasks: 14, wall: 7_300_000, outcome: "complete", at: new Date(T0).toISOString(), cacheHitRate: 0.7 });
+  const polluted = computeBands(card, [...REAL_SWEEPS, asComplete]);
+  const clean = computeBands(card, REAL_SWEEPS);
+  assert.equal(polluted.baseline.n, clean.baseline.n + 1);
+  assert.notEqual(polluted.kpis["cost.totalUsd"].median, clean.kpis["cost.totalUsd"].median);
+});
+
+test("the no-op run's OWN card raises nothing: status ok, noOp flagged, no anomalies, no alert", () => {
+  const noopCard = cardOf("wf_noop", {
+    cost: 5, tokens: 90_000, tasks: 1, wall: 300_000, outcome: "nothing-to-remove", at: new Date(T0).toISOString(),
+  });
+  const bands = computeBands(noopCard, REAL_SWEEPS);
+  assert.equal(bands.status, "ok");
+  assert.equal(bands.noOp, true);
+  assert.deepEqual(bands.anomalies, []);
+  // The numbers are still there — the card is honest, it just does not alert.
+  assert.equal(bands.kpis["cost.totalUsd"].value, 5);
+  assert.equal(bands.kpis["cost.personaCacheHitRate"].value, 0);
+  assert.equal(bands.baseline.n, REAL_SWEEPS.length);
+  // And the handler publishes no workflow.performance event for it.
+  assert.equal(shouldAlert(noopCard), false);
+  assert.equal(shouldAlert(cardOf("wf_real", { cost: 120, tokens: 1, tasks: 14, wall: 1, outcome: "complete", at: new Date(T0).toISOString() })), true);
+});
+
+test("the SAME numbers under a complete outcome DO alert (the gate is the outcome, not the size)", () => {
+  // Identical KPIs, only the outcome differs: a one-agent run's cold persona cache
+  // is 7 sigma below a baseline of full sweeps on a lower-is-worse KPI. That is a
+  // real finding on a run that claimed to ship, and noise on one that closed
+  // nothing-to-remove — which is exactly the distinction shouldAlert draws.
+  const tiny = cardOf("wf_tiny", {
+    cost: 5, tokens: 90_000, tasks: 1, wall: 300_000, outcome: "complete", at: new Date(T0).toISOString(),
+  });
+  const bands = computeBands(tiny, REAL_SWEEPS);
+  assert.equal(shouldAlert(tiny), true);
+  assert.equal(bands.noOp, undefined);
+  assert.equal(bands.status, "alert");
+  assert.deepEqual(
+    bands.anomalies.map((a) => a.kpi),
+    ["cost.personaCacheHitRate"],
+  );
 });

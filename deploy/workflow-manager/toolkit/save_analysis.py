@@ -23,6 +23,12 @@ from decimal import Decimal
 
 import boto3
 
+# Sibling module in this same toolkit dir (the idiom compute_metrics.py already
+# uses): running as a script puts that dir on sys.path, and the explicit insert
+# keeps the import working when this module is imported by name, as the tests do.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from run_outcomes import RUN_OUTCOMES  # noqa: E402
+
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 ARTIFACT_BUCKET = os.environ["ARTIFACT_BUCKET"]
 ANALYSES_TABLE = os.environ.get("ANALYSES_TABLE", "agentcore-hub-workflow-analyses")
@@ -34,16 +40,11 @@ SEVERITIES = {"critical", "high", "medium", "low"}
 PRIORITIES = {"P0", "P1", "P2"}
 REC_TYPES = {"workflow-def", "prompt", "gate-config", "process", "tooling"}
 SCORE_KEYS = {"overall", "planning", "execution", "reviewEfficiency", "reworkDiscipline"}
-# TEAM-3747 D2 — includes the lifecycle-integrity terminal outcomes so a run
-# closed as deploy-blocked / static-ci-only is recorded HONESTLY (mapping the
-# phase straight through below) instead of masquerading as "complete". PARITY:
-# src/lib/workflow/types.ts SHIP_BLOCKED_OUTCOMES + analysis-types.ts RunOutcome.
-# TEAM-4247 D2 adds "nothing-to-remove" on the same terms: a dead-code sweep that
-# verified its candidates and found none removable is a real terminal outcome, and
-# the `else "complete"` fallback below is exactly what used to record such a run as
-# a delivery. PARITY: types.ts NO_OP_OUTCOMES + completion.mjs NO_OP_OUTCOMES —
-# src/lib/workflow/run-outcome-parity.test.ts reads this literal and fails on drift.
-RUN_OUTCOMES = {"complete", "cancelled", "error", "deploy-blocked", "static-ci-only", "nothing-to-remove"}
+# RUN_OUTCOMES (imported above) is the accept set for `runOutcome`: a phase in it
+# is written through verbatim, and anything else falls back to "complete" below —
+# which is exactly how an honest terminal outcome used to be recorded as a
+# delivery. TEAM-4247 D2 moved the list into run_outcomes.py so this write path,
+# compute_metrics.py and pull_dossier.py read ONE copy; the parity notes live there.
 
 
 def fail(msg):
