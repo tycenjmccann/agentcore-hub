@@ -534,7 +534,7 @@
 "ticketId":"TEAM-3783",
 "workflowId":"wf_1788416098262_sffzti",
 "sessionId":"TEAM-3783_wf_1788416098262_sffzti-agentcore_hub_requirements_analyst-1788416105073",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "timestamp":"2026-09-03T06:15:05.105Z"
 },
 "workflowId":"wf_1788416098262_sffzti",
@@ -576,7 +576,7 @@
 "detail":{
 "ticketId":"TEAM-3783",
 "sessionId":"TEAM-3783_wf_1788416098262_sffzti-agentcore_hub_requirements_analyst-1788416105073",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "agentId":"agentcore_hub_requirements_analyst",
 "workflowId":"wf_1788416098262_sffzti",
 "timestamp":"2026-09-03T06:15:05.105Z"
@@ -716,7 +716,7 @@
 {
 "detail":{
 "timestamp":"2026-09-03T06:18:06.388Z",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "sessionId":"TEAM-3790_wf_1788416098262_sffzti-agentcore_hub_bug_fixer-1788416286331",
 "ticketId":"TEAM-3790",
 "agentId":"agentcore_hub_bug_fixer",
@@ -759,7 +759,7 @@
 "source":"agentcore-hub.orchestrator",
 "detail":{
 "timestamp":"2026-09-03T06:18:06.388Z",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "agentId":"agentcore_hub_bug_fixer",
 "sessionId":"TEAM-3790_wf_1788416098262_sffzti-agentcore_hub_bug_fixer-1788416286331",
 "workflowId":"wf_1788416098262_sffzti",
@@ -1003,7 +1003,7 @@
 "timestamp":"2026-09-03T06:19:33.988Z",
 "agentId":"agentcore_hub_release_manager",
 "sessionId":"TEAM-3799_wf_1788416098262_sffzti-agentcore_hub_release_manager-1788416373962",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "ticketId":"TEAM-3799"
 },
 "timestamp":"2026-09-03T06:19:33.988Z",
@@ -1030,7 +1030,7 @@
 "detail":{
 "ticketId":"TEAM-3799",
 "sessionId":"TEAM-3799_wf_1788416098262_sffzti-agentcore_hub_release_manager-1788416373962",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "agentId":"agentcore_hub_release_manager",
 "timestamp":"2026-09-03T06:19:33.988Z",
 "workflowId":"wf_1788416098262_sffzti"
@@ -1418,7 +1418,7 @@
 "detail":{
 "ticketId":"TEAM-3790",
 "agentId":"agentcore_hub_bug_fixer",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "timestamp":"2026-09-04T07:22:58.076Z",
 "sessionId":"TEAM-3790_wf_1788416098262_sffzti-agentcore_hub_bug_fixer-1788506577978",
 "workflowId":"wf_1788416098262_sffzti"
@@ -1447,7 +1447,7 @@
 "workflowId":"wf_1788416098262_sffzti",
 "agentId":"agentcore_hub_bug_fixer",
 "timestamp":"2026-09-04T07:22:58.076Z",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "sessionId":"TEAM-3790_wf_1788416098262_sffzti-agentcore_hub_bug_fixer-1788506577978"
 },
 "workflowId":"wf_1788416098262_sffzti",
@@ -1643,7 +1643,7 @@
 {
 "detail":{
 "agentId":"agentcore_hub_bug_fixer",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "ticketId":"TEAM-3790",
 "sessionId":"TEAM-3790_wf_1788416098262_sffzti-agentcore_hub_bug_fixer-1788549608854",
 "workflowId":"wf_1788416098262_sffzti",
@@ -1658,7 +1658,7 @@
 {
 "detail":{
 "ticketId":"TEAM-3790",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "agentId":"agentcore_hub_bug_fixer",
 "sessionId":"TEAM-3790_wf_1788416098262_sffzti-agentcore_hub_bug_fixer-1788549608854",
 "workflowId":"wf_1788416098262_sffzti",
@@ -1814,7 +1814,7 @@
 "sessionId":"TEAM-3792_wf_1788416098262_sffzti-agentcore_hub_code_reviewer-1788550661470",
 "workflowId":"wf_1788416098262_sffzti",
 "agentId":"agentcore_hub_code_reviewer",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "timestamp":"2026-09-04T19:37:41.510Z"
 },
 "type":"orchestrator.agent_invoked",
@@ -1829,7 +1829,7 @@
 "agentId":"agentcore_hub_code_reviewer",
 "ticketId":"TEAM-3792",
 "workflowId":"wf_1788416098262_sffzti",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO"
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
 },
 "type":"orchestrator.agent_invoked",
 "timestamp":"2026-09-04T19:37:41.510Z",
@@ -2043,7 +2043,7 @@
 "agentId":"agentcore_hub_bug_fixer",
 "workflowId":"wf_1788416098262_sffzti",
 "ticketId":"TEAM-3966",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO"
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
 },
 "timestamp":"2026-09-04T19:53:01.343Z",
 "type":"orchestrator.agent_invoked",
@@ -2055,7 +2055,7 @@
 "timestamp":"2026-09-04T19:53:01.343Z",
 "ticketId":"TEAM-3966",
 "sessionId":"TEAM-3966_wf_1788416098262_sffzti-agentcore_hub_bug_fixer-1788551581235",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "workflowId":"wf_1788416098262_sffzti",
 "agentId":"agentcore_hub_bug_fixer"
 },
@@ -2233,7 +2233,7 @@
 "sessionId":"TEAM-3794_wf_1788416098262_sffzti-agentcore_hub_qa_verifier-1788551629495",
 "timestamp":"2026-09-04T19:53:49.525Z",
 "workflowId":"wf_1788416098262_sffzti",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "ticketId":"TEAM-3794",
 "agentId":"agentcore_hub_qa_verifier"
 },
@@ -2248,7 +2248,7 @@
 "workflowId":"wf_1788416098262_sffzti",
 "agentId":"agentcore_hub_qa_verifier",
 "sessionId":"TEAM-3794_wf_1788416098262_sffzti-agentcore_hub_qa_verifier-1788551629495",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "timestamp":"2026-09-04T19:53:49.525Z"
 },
 "type":"orchestrator.agent_invoked",
@@ -2750,7 +2750,7 @@
 "detail":{
 "agentId":"agentcore_hub_ci_agent",
 "workflowId":"wf_1788416098262_sffzti",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "timestamp":"2026-09-04T20:18:07.123Z",
 "ticketId":"TEAM-3796",
 "sessionId":"TEAM-3796_wf_1788416098262_sffzti-agentcore_hub_ci_agent-1788553087022"
@@ -2766,7 +2766,7 @@
 "agentId":"agentcore_hub_ci_agent",
 "timestamp":"2026-09-04T20:18:07.123Z",
 "workflowId":"wf_1788416098262_sffzti",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "sessionId":"TEAM-3796_wf_1788416098262_sffzti-agentcore_hub_ci_agent-1788553087022"
 },
 "timestamp":"2026-09-04T20:18:07.123Z",
@@ -2845,7 +2845,7 @@
 "ticketId":"TEAM-3967",
 "agentId":"agentcore_hub_bug_fixer",
 "sessionId":"TEAM-3967_wf_1788416098262_sffzti-agentcore_hub_bug_fixer-1788553160908",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO"
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
 },
 "workflowId":"wf_1788416098262_sffzti",
 "source":"agentcore-hub.orchestrator",
@@ -2856,7 +2856,7 @@
 {
 "workflowId":"wf_1788416098262_sffzti",
 "detail":{
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "timestamp":"2026-09-04T20:19:20.932Z",
 "agentId":"agentcore_hub_bug_fixer",
 "workflowId":"wf_1788416098262_sffzti",
@@ -2984,7 +2984,7 @@
 "detail":{
 "agentId":"agentcore_hub_release_manager",
 "sessionId":"TEAM-3799_wf_1788416098262_sffzti-agentcore_hub_release_manager-1788553273928",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "workflowId":"wf_1788416098262_sffzti",
 "timestamp":"2026-09-04T20:21:14.051Z",
 "ticketId":"TEAM-3799"
@@ -2999,7 +2999,7 @@
 "sessionId":"TEAM-3799_wf_1788416098262_sffzti-agentcore_hub_release_manager-1788553273928",
 "agentId":"agentcore_hub_release_manager",
 "workflowId":"wf_1788416098262_sffzti",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "ticketId":"TEAM-3799",
 "timestamp":"2026-09-04T20:21:14.051Z"
 },
@@ -3216,7 +3216,7 @@
 "timestamp":"2026-09-04T20:39:16.279Z",
 "sessionId":"TEAM-3970_wf_1788416098262_sffzti-agentcore_hub_bug_fixer-1788554356146",
 "agentId":"agentcore_hub_bug_fixer",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO"
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
 },
 "timestamp":"2026-09-04T20:39:16.279Z",
 "type":"orchestrator.agent_invoked",
@@ -3225,7 +3225,7 @@
 {
 "workflowId":"wf_1788416098262_sffzti",
 "detail":{
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "timestamp":"2026-09-04T20:39:16.279Z",
 "agentId":"agentcore_hub_bug_fixer",
 "workflowId":"wf_1788416098262_sffzti",
@@ -3412,7 +3412,7 @@
 "detail":{
 "timestamp":"2026-09-04T21:14:18.339Z",
 "agentId":"agentcore_hub_release_manager",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "sessionId":"TEAM-3799_wf_1788416098262_sffzti-agentcore_hub_release_manager-1788556458222",
 "workflowId":"wf_1788416098262_sffzti",
 "ticketId":"TEAM-3799"
@@ -3425,7 +3425,7 @@
 "detail":{
 "ticketId":"TEAM-3799",
 "sessionId":"TEAM-3799_wf_1788416098262_sffzti-agentcore_hub_release_manager-1788556458222",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "timestamp":"2026-09-04T21:14:18.339Z",
 "agentId":"agentcore_hub_release_manager",
 "workflowId":"wf_1788416098262_sffzti"
@@ -3587,7 +3587,7 @@
 "workflowId":"wf_1788416098262_sffzti",
 "detail":{
 "timestamp":"2026-09-04T21:47:13.201Z",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "agentId":"agentcore_hub_release_manager",
 "workflowId":"wf_1788416098262_sffzti",
 "sessionId":"TEAM-3799_wf_1788416098262_sffzti-agentcore_hub_release_manager-1788558433119",
@@ -3606,7 +3606,7 @@
 "ticketId":"TEAM-3799",
 "sessionId":"TEAM-3799_wf_1788416098262_sffzti-agentcore_hub_release_manager-1788558433119",
 "workflowId":"wf_1788416098262_sffzti",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO"
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
 },
 "type":"orchestrator.agent_invoked",
 "timestamp":"2026-09-04T21:47:13.201Z",
@@ -3838,7 +3838,7 @@
 "ticketId":"TEAM-3803",
 "workflowId":"wf_1788416098262_sffzti",
 "sessionId":"TEAM-3803_wf_1788416098262_sffzti-agentcore_hub_release_manager-1788559419720",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "timestamp":"2026-09-04T22:03:39.834Z",
 "agentId":"agentcore_hub_release_manager"
 },
@@ -3853,7 +3853,7 @@
 "detail":{
 "agentId":"agentcore_hub_release_manager",
 "sessionId":"TEAM-3803_wf_1788416098262_sffzti-agentcore_hub_release_manager-1788559419720",
-"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+"runtimeArn":"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
 "ticketId":"TEAM-3803",
 "workflowId":"wf_1788416098262_sffzti",
 "timestamp":"2026-09-04T22:03:39.834Z"
@@ -4121,8 +4121,8 @@
 "priorAnalyses":[],
 "missingSignals":[],
 "_fixture":{
-"source":"s3://agentcore-hub-artifacts-838829463875-us-east-1/workflows/wf_1788416098262_sffzti/analysis/*/dossier.json",
-"reduced":"messages/resumeContexts/input, agentTasks.output, artifacts, evalSummaries, priorAnalyses, streamCounts dropped; long detail strings clipped to 200 chars; completions reduced to {ticket_id,completed_at,commit_sha,pr_url,branch}",
+"source":"s3://$ARTIFACT_BUCKET/workflows/wf_1788416098262_sffzti/analysis/*/dossier.json",
+"reduced":"messages/resumeContexts/input, agentTasks.output, artifacts, evalSummaries, priorAnalyses, streamCounts dropped; long detail strings clipped to 200 chars; completions reduced to {ticket_id,completed_at,commit_sha,pr_url,branch}; account id scrubbed to 000000000000 and bucket to $ARTIFACT_BUCKET (TEAM-4160 D2 advisory)",
 "capturedBy":"TEAM-4120 backend dev"
 }
 }
